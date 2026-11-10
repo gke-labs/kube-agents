@@ -700,9 +700,10 @@ what the renderer does with them.
   record) is the same note, and any other failure is the refusal line, as
   it is for the presubmit. A listing that hangs past `GCLOUD_TIMEOUT_S` is
   the refusal line either way, as for the nightly.
-- `--gitlab-nightly-prefix [<gs prefix>]` — the GitLab lane's nightly
-  periodic (`ci-kube-agents-eval-nightly-gitlab`, the lane's list once a
-  night), read as `--nightly-prefix` is (the prefix is its index, `pr`
+- `--gitlab-nightly-prefix [<gs prefix>]` — a GitLab nightly periodic's
+  prefix (the lane's retired today-mode `ci-kube-agents-eval-nightly-gitlab`;
+  the workflow no longer passes it, and the next-mode nightly comes in
+  through `--lane-nightly-prefix`), read as `--nightly-prefix` is (the prefix is its index, `pr`
   null, `log_url` set, the nightly's rule on a listing that fails) but
   tagged `tier: "gitlab"`, above that nightly job's own watermark: a
   lane's pull-request job and each of its nightlies are sources of one

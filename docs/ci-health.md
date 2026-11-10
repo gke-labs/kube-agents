@@ -254,8 +254,7 @@ towards a distinct-PR floor, and a nightly collapsing is a case's record on
 `main`, not a gate incident. It carries the forge lanes' runs too, one tier
 each (`tiers.FORGE_TIERS`): the GitLab lane (`pull-kube-agents-smoke-test-gitlab`, `tier: gitlab`), on a pull request the
 forge-grading cases of `hack/eval/gitlab-cases.txt` (registered cases, not only presubmit ones) against a pool project's
-GitLab repository, with its nightlies `ci-kube-agents-eval-nightly-gitlab` and `ci-kube-agents-eval-nightly-gitlab-next`
-running the same list; and the self-managed GHES and GitLab CE lanes (`pull-kube-agents-smoke-test-ghes`, `tier: ghes`;
+GitLab repository, with its next-mode nightly `ci-kube-agents-eval-nightly-gitlab-next` running the same list; and the self-managed GHES and GitLab CE lanes (`pull-kube-agents-smoke-test-ghes`, `tier: ghes`;
 `pull-kube-agents-smoke-test-gitlab-ce`, `tier: gitlab-ce`; `docs/ci-pool-projects.md` 5.8), each with a next-mode
 weekly job (`ci-kube-agents-eval-weekly-ghes-next`, `ci-kube-agents-eval-weekly-gitlab-ce-next`). The GitLab lane has a
 section of the Brief, its pull-request runs and then each nightly's nights; the GHES and GitLab CE lanes share one
