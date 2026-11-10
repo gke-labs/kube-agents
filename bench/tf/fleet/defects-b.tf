@@ -381,6 +381,64 @@ resource "kubernetes_validating_webhook_configuration_v1" "fail_closed_gate" {
   }
 }
 
+# Defect (upgrade readiness, certification): a fail-closed webhook whose dead
+# backend would refuse the CustomResourceDefinition writes GKE's control plane
+# makes at an upgrade, the capacitybuffers.autoscaling.x-k8s.io install among
+# them, so Cluster Autoscaler initialization hangs (#2567, item 1). The rule
+# names CRD creates and updates, which is the reach the check reads; the
+# clientConfig names a Service that does not exist, which is what makes it
+# fail closed for real; the 2-second timeout bounds the wait of any request
+# that ever reached it.
+#
+# The objectSelector is the one thing that keeps this gate off GKE's own CRD
+# writes: a CRD is cluster-scoped, so no namespaceSelector applies to it, and
+# the API server calls the gate only for a CRD that carries the fleet label on
+# its new or its old object. GKE's CRDs carry addonmanager labels only, and
+# this stack creates no CRD. A CRD given the fleet label by hand is refused on
+# create and on update, the un-labelling included, until this configuration
+# is deleted (a write in another group, which the rule does not reach). The
+# readiness grader reads rules and not selectors (upgrade_readiness.py, the
+# note on objectSelector above its scope constants), which is why the
+# selector does not hide the gate from the check this fixture waits for.
+#
+# Addressed by the readiness-crd-webhook role.
+resource "kubernetes_validating_webhook_configuration_v1" "crd_gate" {
+  provider = kubernetes.seeded_b
+
+  metadata {
+    name   = "seeded-crd-gate"
+    labels = local.fleet_labels
+  }
+
+  webhook {
+    name                      = "crd-gate.seeded.invalid"
+    side_effects              = "None"
+    admission_review_versions = ["v1"]
+    failure_policy            = "Fail"
+    timeout_seconds           = 2
+
+    client_config {
+      service {
+        name      = "nonexistent-crd-gate"
+        namespace = kubernetes_namespace_v1.seeded_upgrade.metadata[0].name
+        path      = "/validate"
+      }
+    }
+
+    object_selector {
+      match_labels = local.fleet_labels
+    }
+
+    rule {
+      api_groups   = ["apiextensions.k8s.io"]
+      api_versions = ["v1"]
+      operations   = ["CREATE", "UPDATE"]
+      resources    = ["customresourcedefinitions"]
+      scope        = "Cluster"
+    }
+  }
+}
+
 # Defect (upgrade readiness): the budget that makes the drain impossible, not
 # merely slow. `maxUnavailable: 0` means no pod this budget matches may ever be
 # evicted voluntarily, so `disruptionsAllowed` is 0 forever -- not because the

@@ -383,6 +383,19 @@ fixtures:
       alone is set by healthy webhooks. Selectors confine it so it rejects no
       other scenario's writes.
 
+  - role: readiness-crd-webhook
+    slot: b
+    available_from_day: 0
+    objects:
+      - validatingwebhookconfiguration/seeded-crd-gate
+    defect: >-
+      failurePolicy Fail with a 2-second timeout and one rule on
+      CustomResourceDefinition creates and updates, pointing at a Service
+      that does not exist: the fail-closed webhook that refuses the CRD
+      writes GKE's control plane makes at a 1.35+ upgrade. An objectSelector
+      on the fleet label keeps it off every real CRD; no namespaceSelector
+      applies to a cluster-scoped object.
+
   - role: node-local-state
     slot: a
     available_from_day: 0

@@ -461,6 +461,42 @@
         }
       ]
     },
+    "readiness-crd-webhook": {
+      "cluster_slot": "b",
+      "namespace": null,
+      "probes": ["validatingwebhookconfiguration/seeded-crd-gate"],
+      "fixture": "seeded-crd-gate ValidatingWebhookConfiguration: failurePolicy Fail with a 2-second timeout, one rule on CustomResourceDefinition creates and updates, pointing at a Service that does not exist -- the reach into the CRD writes GKE's control plane makes at a 1.35+ upgrade is the defect the upgrade audit should name -- kept off every real CRD by an objectSelector on the fleet label",
+      "state": [
+        {
+          "subject": "validatingwebhookconfiguration/seeded-crd-gate",
+          "path": "webhooks[*].failurePolicy",
+          "op": "any_eq",
+          "value": "Fail",
+          "why": "fail-closed is half the defect: the same webhook with failurePolicy Ignore refuses nothing, so a run that read it as Ignore would be asserting against an object that is no longer the fixture"
+        },
+        {
+          "subject": "validatingwebhookconfiguration/seeded-crd-gate",
+          "path": "webhooks[*].clientConfig.service.name",
+          "op": "any_eq",
+          "value": "nonexistent-crd-gate",
+          "why": "the other half: Fail onto a backend that cannot answer is what refuses the CRD install. Point the clientConfig at a Service that resolves and the fixture is healed while the policy and the rule still read as planted"
+        },
+        {
+          "subject": "validatingwebhookconfiguration/seeded-crd-gate",
+          "path": "webhooks[*].objectSelector.matchLabels.managed-by",
+          "op": "any_eq",
+          "value": "kube-agents-seeded-fleet",
+          "why": "the safety, not the defect: a CRD is cluster-scoped, so this selector is the one thing that keeps the gate off GKE's own CRD writes; without it every CRD create and update on the cluster waits two seconds and is refused"
+        },
+        {
+          "subject": "validatingwebhookconfiguration/seeded-crd-gate",
+          "path": "webhooks[0].rules[0].resources[0]",
+          "op": "eq",
+          "value": "customresourcedefinitions",
+          "why": "the reach is what the upgrade audit's check reads: a rule moved off CustomResourceDefinition writes is a dead webhook that blocks no system CRD, which is another scenario's fixture"
+        }
+      ]
+    },
     "readiness-drain-blocked": {
       "cluster_slot": "b",
       "namespace": "seeded-upgrade",

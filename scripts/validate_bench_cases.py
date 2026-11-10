@@ -374,6 +374,18 @@ FIXTURE_NOT_READY = {
         "fleet question reaches the ten-card fan-out bound; the seeded fleet and "
         "every dev install have five or fewer"
     ),
+    # Needs the seeded fleet's seeded-crd-gate on slot b (role
+    # readiness-crd-webhook, defects-b.tf), which the pull request that adds
+    # this entry plants in the stack; merging plants nothing, the reconcile's
+    # postsubmit does, and a role the runner cannot resolve is
+    # FleetRoleUnresolved, a rung-2 red on the certification lane. The
+    # un-park pull request cites the reconcile report that visited every pool
+    # project and the scan that reads the role healthy on each. The gap the
+    # case records is #2567 (item 1).
+    "upgrade-webhook-blocks-capacitybuffers-crd": (
+        "#2567 (item 1): waits for the fleet reconcile to plant seeded-crd-gate "
+        "(role readiness-crd-webhook) on every pool project and the scan to read it healthy"
+    ),
     "upgrades-readiness-lb-drain-timeout": (
         "#3524: needs bench/tf/fleet's drain-timeout backend service on seeded-b's default "
         "pool (the readiness-lb-drain-timeout role) applied to every pool project (fleet "
