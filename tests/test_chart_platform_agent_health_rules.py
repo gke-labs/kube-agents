@@ -191,16 +191,25 @@ class HealthRulesRenderTest(unittest.TestCase):
         job = f"{agent}-a2a-gateway-monitoring"
         self.assertIn(job, {d["metadata"]["name"] for d in docs if d.get("kind") == "PodMonitoring"})
         rule = _alerts(_rules(docs)[0])[_SLACK_ALERT]
-        self.assertEqual(f'max by (namespace, job) ({series}{{job="{job}"}}) == 0', rule["expr"])
-        self.assertEqual("7m", rule["for"])
+        self.assertEqual(f'max by (namespace, job) (max_over_time({series}{{job="{job}"}}[7m])) == 0', rule["expr"])
         self.assertIn("7m", rule["annotations"]["summary"])
+
+    # promtool is on neither the host nor the CI image, so the gappy series is
+    # held by the rule's text: the window carries the threshold and the `for`
+    # stays short, since a `for` over an instant value resets at every gap a
+    # crash-looping gateway leaves and never fires.
+    def test_the_slack_alert_survives_a_gappy_series(self):
+        rule = _alerts(_rules(_render(*_ON))[0])[_SLACK_ALERT]
+        self.assertIn("max_over_time(", rule["expr"])
+        self.assertIn("[5m]", rule["expr"])
+        self.assertEqual("1m", rule["for"])
 
     def test_a_thresholds_block_without_the_slack_window_still_renders(self):
         """What `--reuse-values` from an older release hands the template: the key
         absent. A null in --set deletes it from the merged values."""
         docs = _render(*_ON, "--set", "platformAgent.healthRules.thresholds.slackDisconnectedFor=null")
         rule = _alerts(_rules(docs)[0])[_SLACK_ALERT]
-        self.assertEqual("5m", rule["for"])
+        self.assertIn("[5m]", rule["expr"])
         self.assertEqual("5m", yaml.safe_load((_CHART / "values.yaml").read_text())["platformAgent"]["healthRules"]["thresholds"]["slackDisconnectedFor"], "the template's default and values.yaml's must agree")
 
     def test_vector_matching_names_the_agent_labels(self):

@@ -2953,8 +2953,10 @@ and from every `connecting` (each dial, the first and every reconnect) and 1 on 
 interactive envelope. Neither serves a sample until a Slack adapter runs, and both are disarmed
 when Run ends with its context, as it does on a replica that loses the lease, so a gateway on
 another backend and a standby add nothing to the chart's `KubeAgentsSlackDisconnected` alert,
-which reads the gauge's `max` by scrape job. A Run that ends in a failure (an `invalid_auth`)
-leaves the gauge at 0 until the process exits. The Slack connection does not feed `/readyz`: a
+which reads the gauge's `max_over_time` over `slackDisconnectedFor`, then its `max` by scrape job.
+A Run that ends in a failure (an `invalid_auth`) leaves the gauge at 0 until the process exits,
+and the gateway then crash-loops; the window's maximum still reads 0 across those gaps, where a
+`for` over the instant value would reset at each one and never fire. The Slack connection does not feed `/readyz`: a
 Slack outage would otherwise take the pod, which also serves the doors, out of Ready, the
 `PlatformAgent` with it, and the gateway's PodDisruptionBudget away, for no failover, since the
 lease rather than readiness picks the leader.
