@@ -16,19 +16,20 @@
 # and a finding on a healthy agent would be a false positive; the pull
 # request that lands both rewrites this objective and flips the marker in
 # the same diff. Until then the objective below is the form a finding would
-# take. The `fixtures:` role stands for slot a's shape, not for a plant; no
-# safeguard reads a fixture because none exists. Domain `fleet-audits` as the
+# take. `fixtures: []`: the run plants nothing and reads no fixture, so no
+# fixture's drift may excuse it; no safeguard reads a fixture because none
+# exists. Domain `fleet-audits` as the
 # other GCE compute cases.
 # Isolation class: fleet-read-only, GitOps-repo write (the audit's ledger).
 id: control-plane-konnectivity-agent-exhaustion
 name: "Konnectivity agent exhaustion (declared gap; nothing planted, a GKE-managed add-on; needs a clean-read objective)"
 domain: fleet-audits
 suite: certification
+certification_part: 2
 expected_fail: true
 audit_streams:
   - gce-compute-fleet-audit
-fixtures:
-  - default-pool-headroom
+fixtures: []
 prompt: >-
   Run the gce-compute-fleet-audit audit across the fleet, following the
   gce-compute-fleet-audit SOP.

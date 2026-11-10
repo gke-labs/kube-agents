@@ -16,20 +16,20 @@
 # controller's arguments for disabled rate limits (in this stream, or another,
 # which edits `audit:` and `finding_check` in the same diff) flips this case
 # once the shape is planted; a check that thresholds on an audit-log write
-# rate never flips it, because the shape writes nothing. The `fixtures:` role
-# stands for slot a's shape, not for a plant; no safeguard reads a fixture
-# because none exists yet. Domain `fleet-audits` as the other GCE compute
+# rate never flips it, because the shape writes nothing. `fixtures: []`: the run
+# plants nothing and reads no fixture, so no fixture's drift may excuse it; no
+# safeguard reads a fixture because none exists yet. Domain `fleet-audits` as the other GCE compute
 # cases.
 # Isolation class: fleet-read-only, GitOps-repo write (the audit's ledger).
 id: control-plane-configmap-lease-write-storm
 name: "ConfigMap and Lease write storm (declared gap; planted as a controller with rate limits disabled, writing nothing, when its check lands)"
 domain: fleet-audits
 suite: certification
+certification_part: 2
 expected_fail: true
 audit_streams:
   - gce-compute-fleet-audit
-fixtures:
-  - default-pool-headroom
+fixtures: []
 prompt: >-
   Run the gce-compute-fleet-audit audit across the fleet, following the
   gce-compute-fleet-audit SOP.

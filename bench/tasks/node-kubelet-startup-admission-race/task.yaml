@@ -15,19 +15,20 @@
 # audit, whose collector already dumps DaemonSets and pool taints; a landing
 # there edits `audit:` and `finding_check` in the same diff) flips this case
 # once the shape is planted; a check keyed on sandbox events on young nodes
-# reads nothing here. The `fixtures:` role stands for slot a's shape, not for
-# a plant; no safeguard reads a fixture because none exists yet. Domain
+# reads nothing here. `fixtures: []`: the run plants nothing and reads no
+# fixture, so no fixture's drift may excuse it; no safeguard reads a fixture
+# because none exists yet. Domain
 # `fleet-audits` as the other GCE compute cases.
 # Isolation class: fleet-read-only, GitOps-repo write (the audit's ledger).
 id: node-kubelet-startup-admission-race
 name: "Kubelet startup admission race (declared gap; planted as an init DaemonSet on a pool with no startup taint when its check lands)"
 domain: fleet-audits
 suite: certification
+certification_part: 2
 expected_fail: true
 audit_streams:
   - gce-compute-fleet-audit
-fixtures:
-  - default-pool-headroom
+fixtures: []
 prompt: >-
   Run the gce-compute-fleet-audit audit across the fleet, following the
   gce-compute-fleet-audit SOP.
@@ -43,8 +44,10 @@ validated: false
 
 verification_spec:
   # One finding must carry both the check and the shape's object, the
-  # DaemonSet or the pool. The three slugs are the names the case accepts; the
+  # DaemonSet or the pool. The two slugs are the names the case accepts; the
   # first is the one #5411 proposes.
+  # The branch's third slug, containerd-disk-error, is dropped: a disk-error
+  # check would flip a taint case.
   - name: ledger-files-the-startup-race-shape-on-the-daemonset-or-pool
     role: objective
     mode: assert

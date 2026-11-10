@@ -124,42 +124,39 @@
 # a ci-kube-agents-certification-2 periodic names this part.
 # Capability row: control plane, setup, cost and CLI; the GCE compute fleet
 # audit on a controller that writes a ConfigMap or Lease without client rate
-# limits (nothing planted; the shape lands with its check, slot a's
-# default-pool-headroom role stands for the slot). A declared gap,
+# limits (nothing planted and no fixture declared; the shape lands with
+# its check). A declared gap,
 # expected_fail: no check reads a controller's rate-limit arguments or a
 # write rate; the gap is #5412 (the reader is planned in #2581).
 ./tasks/control-plane-configmap-lease-write-storm/task.yaml
 # Capability row: control plane, setup, cost and CLI; the GCE compute fleet
-# audit on konnectivity-agent replicas against node count (nothing planted:
-# a GKE-managed add-on no fixture may edit; slot a's default-pool-headroom
-# role stands for the slot). A declared gap, expected_fail: no check reads
+# audit on konnectivity-agent replicas against node count (nothing planted and no
+# fixture declared: a GKE-managed add-on no fixture may edit). A declared gap, expected_fail: no check reads
 # the ratio and no objective type grades a clean read; the gap is #5415 (the
 # reader is planned in #2581).
 ./tasks/control-plane-konnectivity-agent-exhaustion/task.yaml
 # Capability row: control plane, setup, cost and CLI; the GCE compute fleet
-# audit on an unpaginated cluster-wide LIST caller (nothing planted; the
-# shape, a suspended CronJob, lands with its check, slot a's
-# default-pool-headroom role stands for the slot). A declared gap,
+# audit on an unpaginated cluster-wide LIST caller (nothing planted and no
+# fixture declared; the shape, a suspended CronJob, lands with its check). A declared gap,
 # expected_fail: no check reads a workload's list command; the gap is #5413.
 ./tasks/control-plane-unpaginated-heavy-list-oom/task.yaml
 # Capability row: node OS, kubelet and auto-repair; the GCE compute fleet
 # audit on a pool with an initialization DaemonSet and no startup taint or
-# readiness rule (nothing planted; the shape lands with its check, slot a's
-# default-pool-headroom role stands for the slot). A declared gap,
+# readiness rule (nothing planted and no fixture declared; the shape lands with
+# its check). A declared gap,
 # expected_fail: no check reads pool taints against an init DaemonSet; the
 # gap is #5411.
 ./tasks/node-kubelet-startup-admission-race/task.yaml
 # Capability row: node OS, kubelet and auto-repair; the GCE compute fleet
-# audit on a DaemonSet with host mount propagation (nothing planted; the
-# shape lands with its check, slot a's default-pool-headroom role stands for
-# the slot). A declared gap, expected_fail: no check reads a DaemonSet's
+# audit on a DaemonSet with host mount propagation (nothing planted and no
+# fixture declared; the shape lands with its check). A declared gap, expected_fail: no check reads a DaemonSet's
 # mount propagation or a node's mount count; the gap is #5408 (the reader is
 # planned in #2581).
 ./tasks/node-mount-table-leak-exhaustion/task.yaml
 # Capability row: node OS, kubelet and auto-repair; the GCE compute fleet
 # audit on a node's conntrack table at 80 percent of nf_conntrack_max
-# (nothing planted and no honest plant until a reader exists; slot a's
-# default-pool-headroom role stands for the slot). A declared gap,
+# (nothing planted, no fixture declared, and no honest plant until a
+# reader exists). A declared gap,
 # expected_fail: no stream reads node conntrack counts; the gap is #5409
 # (the reader is planned in #2581).
 ./tasks/node-nf-conntrack-table-saturation/task.yaml
