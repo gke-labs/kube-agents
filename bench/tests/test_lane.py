@@ -302,6 +302,34 @@ def test_the_requesting_list_is_read_and_gives_its_case_an_allowance(tmp_path):
     assert requested == 3
 
 
+def test_a_tasks_own_requested_pull_requests_key_sets_its_allowance(tmp_path):
+    """The task's top-level key is the count's home both the lane and the
+    pinned grader read; the largest of the key, the task's requesting leaves
+    and a `requesting:` entry is the allowance the copy carries."""
+    safeguards = lane.load_lane_safeguards(LANE_FILE)
+    source = load(TASKS / REQUESTING_CASE / "task.yaml")
+    own = lane.requested_pull_requests(source["verification_spec"])
+    declared = tmp_path / "declared" / REQUESTING_CASE / "task.yaml"
+    declared.parent.mkdir(parents=True)
+    declared.write_text(yaml.safe_dump({**source, lane.REQUESTED_KEY: own + 1}, sort_keys=False))
+    copy, requested = lane.copy_task(declared, safeguards, tmp_path / "out")
+    assert requested == own + 1
+    assert lane._leaves(load(copy)["verification_spec"][-1]["check"])[0][lane.REQUESTED_FIELD] == own + 1
+    _, requested = lane.copy_task(declared, safeguards, tmp_path / "out2", own + 3)
+    assert requested == own + 3
+    assert lane.declared_pull_requests(source) == 0
+
+
+@pytest.mark.parametrize("value", [True, "2", -1])
+def test_a_requested_pull_requests_key_that_is_not_a_count_is_refused_by_the_lane(tmp_path, value):
+    source = load(TASKS / READ_ONLY_CASE / "task.yaml")
+    bad = tmp_path / READ_ONLY_CASE / "task.yaml"
+    bad.parent.mkdir(parents=True)
+    bad.write_text(yaml.safe_dump({**source, lane.REQUESTED_KEY: value}, sort_keys=False))
+    with pytest.raises(lane.LaneSafeguardsError, match="must be a non-negative integer"):
+        lane.copy_task(bad, lane.load_lane_safeguards(LANE_FILE), tmp_path / "out")
+
+
 @pytest.mark.parametrize(
     "text, needle",
     [

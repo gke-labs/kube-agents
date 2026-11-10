@@ -876,6 +876,36 @@ class TestTheRulesReject(unittest.TestCase):
             with self.subTest(value=value):
                 self._only("is not a YAML boolean", expected_fail=value)
 
+    def test_a_requested_pull_requests_key_above_the_cases_own_leaves_passes(self):
+        spec = self._entry(check={"type": "pull_request_opened"})
+        self.assertEqual(self._validate(verification_spec=spec, requested_pull_requests=2), [])
+
+    def test_a_requested_pull_requests_key_the_cases_own_leaves_already_reach_is_rejected(self):
+        spec = self._entry(check={"type": "pull_request_opened"})
+        self._only("is not above the 1", verification_spec=spec, requested_pull_requests=1)
+
+    def test_a_requested_pull_requests_key_that_is_not_a_count_is_rejected(self):
+        for value in (True, "2", -1, 1.5):
+            with self.subTest(value=value):
+                self._only("is not a bare non-negative decimal", requested_pull_requests=value)
+
+    def test_a_requested_pull_requests_key_in_a_non_decimal_spelling_is_rejected(self):
+        # YAML reads `0x2` as 2 and `2#c` as the string '2#c'; the roster
+        # script's text read sees neither as the count, and the validator says
+        # so rather than crashing on the string.
+        text = yaml.safe_dump({**self.VALID, "verification_spec": self._entry(check={"type": "pull_request_opened"})})
+        for line in ("requested_pull_requests: 0x2\n", "requested_pull_requests: 2#c\n", "requested_pull_requests: +2\n"):
+            with self.subTest(line=line.strip()):
+                self._only("is not a bare non-negative decimal", text=text + line)
+
+    def test_a_key_line_inside_a_quoted_scalar_is_rejected(self):
+        # A continuation line of a multi-line quoted prompt can start at column
+        # 0; YAML folds it into the string, but a text read takes it for the key.
+        spec = {**self.VALID, "verification_spec": self._entry(check={"type": "pull_request_opened"})}
+        spec.pop("prompt", None)
+        text = yaml.safe_dump(spec) + 'prompt: "first line\nrequested_pull_requests: 5\nlast line"\n'
+        self._only("sits inside another value", text=text)
+
     def test_a_bare_boolean_expected_fail_passes(self):
         for value in (True, False):
             with self.subTest(value=value):
