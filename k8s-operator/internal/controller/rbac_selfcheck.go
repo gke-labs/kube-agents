@@ -148,10 +148,11 @@ var requiredPermissions = []requiredPermission{
 	// resourcequotas: the mode-next session-pod bound is rendered and removed
 	// by the operator, so this one is write rather than read.
 	{Group: "", Resources: []string{"resourcequotas"}, Verbs: rbacWriteVerbs},
-	// secrets: `get` for checkShellSandboxKeys; the rest for the mode-next A2A
-	// credential and config Secrets the operator generates. No list/watch --
-	// see tests/test_operator_secrets_grant.py.
-	{Group: "", Resources: []string{"secrets"}, Verbs: []string{"get", "create", "update", "patch", "delete"}},
+	// secrets: `get` for checkShellSandboxKeys and stampSecretEnvHash; write
+	// verbs for the mode-next A2A credential/config Secrets and kube-proxy TLS
+	// Secret; `list` and `watch` so `buildMinimalPlatformRole` passes RBAC
+	// escalation prevention. See tests/test_operator_secrets_grant.py.
+	{Group: "", Resources: []string{"secrets"}, Verbs: rbacWriteVerbs},
 	{Group: "metrics.k8s.io", Resources: []string{"nodes", "pods"}, Verbs: rbacReadVerbs},
 	{Group: "autoscaling", Resources: []string{"horizontalpodautoscalers"}, Verbs: rbacReadVerbs},
 	{Group: "batch", Resources: []string{"cronjobs"}, Verbs: rbacReadVerbs},

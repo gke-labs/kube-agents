@@ -135,6 +135,7 @@ def pool_note(verdict="BREACH", cause="CAPACITY", since="2026-09-04T09:00:00+00:
         "p95_s": 61 * 60,
         "waiting_longest_s": 40 * 60,
         "over_threshold": 2,
+        "waiting": 4,
         "threshold_p50_s": 15 * 60,
         "threshold_p95_s": 45 * 60,
         "free": 0,
@@ -362,6 +363,28 @@ class Shapes(RunHarness):
             "🟡 *Smoke gate: flaky* — quota storm 1:15 PM–2:25 PM ET hit 3 PRs.  Passing runs still count; if yours went red, retest after 2:55 PM ET.\n"
             f"{URL}#since=2026-09-03T18:30:00Z&view=gate",
         )
+
+    def test_storm_says_what_the_reps_said(self):
+        doc = storm()
+        doc["incident"]["causes"] = [["the executor's own failure (hermes-rate-limited)", 27], ["delegated worker hit infrastructure failure (rate_limit): card on board…", 1]]
+        self.tick(doc, T0)
+        self.assertTrue(self.opener.texts[0].startswith(
+            "🟡 *Smoke gate: flaky* — quota storm 1:15 PM–2:25 PM ET hit 3 PRs; reps: 27 hermes-rate-limited, 1 delegated worker hit infrastructure….  Passing runs still count;"
+        ), self.opener.texts[0])
+
+    def test_storm_names_four_phrasings_and_counts_the_rest(self):
+        # A short sentence is kept whole; past four phrasings the rest is a count.
+        doc = storm()
+        doc["incident"]["causes"] = [["the executor's own failure (hermes-rate-limited)", 9], ["the kanban board could not be read", 4], ["the executor's own failure (bridge-shutdown)", 3], ["no agent ever ran", 2], ["x", 1], ["y", 1]]
+        self.tick(doc, T0)
+        self.assertIn("; reps: 9 hermes-rate-limited, 4 the kanban board could not be read, 3 bridge-shutdown, 2 no agent ever ran, and 2 reps in 2 other phrasings.  Passing", self.opener.texts[0])
+
+    def test_storm_counts_by_the_form_the_reader_sees(self):
+        # Two phrasings the cut makes identical are one item with both counts.
+        doc = storm()
+        doc["incident"]["causes"] = [["the executor's own failure (hermes-rate-limited)", 5], ["the inject exchange on [run]/case-a/[rep] failed: URLError from http://10.0.0.1", 3], ["the inject exchange on [run]/case-b/[rep] failed: URLError from http://10.0.0.2", 2]]
+        self.tick(doc, T0)
+        self.assertTrue("; reps: 5 hermes-rate-limited, 5 the inject exchange on….  Passing" in self.opener.texts[0], self.opener.texts[0])
 
     def test_setup_deaths(self):
         self.tick(deaths(), T0)
@@ -651,7 +674,7 @@ class Digest(RunHarness):
         ]}
         lines = [text for text in post_health.render_digest(health("GREEN"), T14, data).splitlines() if text.startswith("🦊")]
         self.assertEqual(lines, [
-            "🦊 Forge lanes: GitLab today green · GitLab next red · GHES weekly, GitLab CE weekly no run on record"
+            "🦊 Forge lanes: GitLab next red · GitLab ci-kube-agents-eval-nightly-gitlab green · GHES weekly, GitLab CE weekly no run on record"
         ])
         self.assertFalse([t for t in post_health.render_digest(health("GREEN"), T14).splitlines() if t.startswith("🦊")], "no data.json, no line")
 
@@ -685,7 +708,7 @@ class Digest(RunHarness):
             # the nightly-red issues, so the one line stands and says why
             # (test_eval_dashboard_nightly_digest.py covers the section).
             "🌙 Nightly section skipped: no GitHub token to read the nightly-red issues.\n"
-            "🦊 Forge lanes: GitLab today, GitLab next, GHES weekly, GitLab CE weekly no run on record\n"
+            "🦊 Forge lanes: GitLab next, GHES weekly, GitLab CE weekly no run on record\n"
             f"{URL}#since=2026-09-04T03:30:00Z&view=agent",
         )
         self.assertEqual(post_health.NIGHTLY_URL, "https://storage.cloud.google.com/kube-agents-dashboards/evals/nightly.html")
@@ -974,7 +997,7 @@ class PoolNote(RunHarness):
             lines[1],
             "Last 3h: median wait 22 min against a 15 min limit; p95 61 min against 45.",
         )
-        self.assertEqual(lines[2], "2 runs waiting right now, past the 45 min p95 limit.")
+        self.assertEqual(lines[2], "2 of 4 waiting runs are past the 45 min p95 limit.")
         self.assertEqual(lines[3], "Runs still pass; /retest makes the queue longer.")
         self.assertEqual(lines[4], f"{URL}#view=agent")
 
@@ -993,7 +1016,7 @@ class PoolNote(RunHarness):
         # then there is no day's median to print -- only the live queue.
         self.tick(pooled(day=None, p50_s=None, p95_s=None, over_threshold=3), self.at(10))
         lines = self.first()
-        self.assertEqual(lines[1], "3 runs waiting right now, past the 45 min p95 limit.")
+        self.assertEqual(lines[1], "3 of 4 waiting runs are past the 45 min p95 limit.")
         self.assertEqual(lines[2], "Runs still pass; /retest makes the queue longer.")
 
     def test_a_breach_on_a_day_and_on_the_live_queue_reports_both(self):
@@ -1003,14 +1026,30 @@ class PoolNote(RunHarness):
             lines[1],
             "Last 3h: median wait 22 min against a 15 min limit; p95 61 min against 45.",
         )
-        self.assertEqual(lines[2], "1 run waiting right now, past the 45 min p95 limit.")
+        self.assertEqual(lines[2], "1 of 4 waiting runs is past the 45 min p95 limit.")
 
-    def test_the_cap_message_names_the_cap_and_the_pool_it_is_below(self):
-        self.tick(pooled(cause="CONCURRENCY_CAP", free=4, max_concurrency=26), self.at(10))
-        self.assertEqual(
-            self.first()[0],
-            "⏳ *Smoke gate: concurrency cap* — the pool has 30 projects but the concurrency cap is only 26. Raise the cap.",
-        )
+    def test_the_cap_message_says_the_wait_the_days_and_the_cap(self):
+        # A live queue: how many wait, how long, and the cap they wait at. The
+        # count under it is the part of those past the limit, not a second count.
+        self.tick(pooled(cause="CONCURRENCY_CAP", free=4, max_concurrency=26, waiting=6, waiting_longest_s=40 * 60), self.at(10))
+        lines = self.first()
+        self.assertEqual(lines[0], "⏳ *Smoke gate: queue* — 6 presubmit runs are waiting, longest 40 min; the presubmit is at its cap of 26 slots.")
+        self.assertEqual(lines[2], "2 of 6 waiting runs are past the 45 min p95 limit.")
+        # A note written before the live count was carried keeps the old line.
+        self.assertIn("2 runs waiting right now, past the 45 min p95 limit.", post_health.pool_numbers(pool_note(waiting=None)))
+        # Deck unread: the breached days and their longest wait, past tense,
+        # and no claim about now. This is the form Chat posts without a live
+        # queue; decide() withholds a breach whose queue was seen drained.
+        note = pool_note(cause="CONCURRENCY_CAP", free=5, max_concurrency=35, total=40, waiting=None, waiting_longest_s=None, over_threshold=0, worst_s=110 * 60, breached_days=["2026-11-05", "2026-11-06"])
+        self.assertEqual(post_health.pool_cause_text(note), "*Smoke gate: queue* — presubmit runs waited up to 110 min on 11-05 and 11-06; the presubmit was at its cap of 35 slots. The job could not read the queue, so this bot cannot say whether runs still wait.")
+        # Deck saw no run past the limit: the live count says whether the
+        # queue is empty or merely short.
+        note = pool_note(cause="CONCURRENCY_CAP", free=35, max_concurrency=35, total=40, waiting_now=False, waiting=0, over_threshold=0, waiting_longest_s=None, worst_s=110 * 60, breached_days=["2026-11-05", "2026-11-06"])
+        self.assertEqual(post_health.pool_cause_text(note), "*Smoke gate: queue* — presubmit runs waited up to 110 min on 11-05 and 11-06; the presubmit was at its cap of 35 slots. Nothing waits now.")
+        self.assertTrue(post_health.pool_cause_text(dict(note, waiting=3)).endswith("at its cap of 35 slots. 3 runs wait now, none past the limit."))
+        self.assertEqual(post_health.days_text(["2026-11-05"]), "11-05")
+        self.assertEqual(post_health.days_text(["2026-11-04", "2026-11-05", "2026-11-06"]), "11-04, 11-05 and 11-06")
+        self.assertEqual(post_health.days_text([]), "recent days")
 
     def test_the_control_plane_message_states_the_cause_and_names_the_build_cluster(self):
         # No hedge: decide() posts this only while runs are waiting, and the
@@ -1105,16 +1144,18 @@ class PoolNote(RunHarness):
         self.assertEqual(self.recorded()["pool_verdict"], "STALE")
 
     def test_a_cause_that_changes_inside_an_episode_is_told_again(self):
-        # The cause picks the remedy and is recomputed from live occupancy every
-        # hour, so a week-long breach switches from "onboard a project" to
-        # "raise the cap" with the verdict unchanged. Only this message carries
-        # a remedy; the digest line and the Brief sentence are cause-free.
+        # The cause picks the message and is recomputed from live occupancy
+        # every hour, so a week-long breach switches from "onboard a project"
+        # to the cap's wait-and-cap line with the verdict unchanged. Only this
+        # message names a cause; the digest line and the Brief sentence are
+        # cause-free.
         self.tick(pooled(), self.at(10))
         self.tick(pooled(cause="CONCURRENCY_CAP"), self.at(11))
         self.assertEqual(len(self.opener.requests), 2)
         self.assertIn("pool full", self.opener.texts[0])
-        self.assertIn("concurrency cap", self.opener.texts[1])
-        self.assertEqual(self.recorded()["pool_causes"], ["CAPACITY", "CONCURRENCY_CAP"])
+        self.assertIn("at its cap of", self.opener.texts[1])
+        # The live cap form covers the unread one, as the build cluster does.
+        self.assertEqual(self.recorded()["pool_causes"], ["CAPACITY", "CONCURRENCY_CAP", "CONCURRENCY_CAP:queue-unread"])
 
     def test_a_cause_the_episode_already_named_is_not_repeated(self):
         # Free projects cross zero repeatedly inside one episode, so CAPACITY
@@ -1134,7 +1175,7 @@ class PoolNote(RunHarness):
         self.tick(pooled(cause="CONCURRENCY_CAP"), self.at(10, 15))
         self.assertEqual(self.recorded()["pool_causes"], ["CAPACITY"], "the cap was never announced")
         self.tick(pooled(cause="CONCURRENCY_CAP"), self.at(10, 30))
-        self.assertEqual(self.recorded()["pool_causes"], ["CAPACITY", "CONCURRENCY_CAP"])
+        self.assertEqual(self.recorded()["pool_causes"], ["CAPACITY", "CONCURRENCY_CAP", "CONCURRENCY_CAP:queue-unread"])
         # Three attempts: the first note, the cap that 500'd, and its retry.
         self.assertEqual([text.split(" ")[0] for text in self.opener.texts], ["⏳", "⏳", "⏳"])
 
@@ -1241,6 +1282,18 @@ class PoolNote(RunHarness):
         self.tick(pooled(cause="CONTROL_PLANE", free=25, waiting_longest_s=None), self.at(11))
         self.assertEqual(len(self.opener.requests), 1)
         self.assertIn("Check the build cluster", self.opener.texts[0])
+
+    def test_the_caps_live_count_is_still_owed_after_an_unread_opening(self):
+        # Like CONTROL_PLANE: the two cap forms share a cause and say different
+        # things, so an episode that opens on an unread Deck still posts the
+        # live queue when Deck comes back, and the unread form is not owed
+        # again after the live one.
+        self.tick(pooled(cause="CONCURRENCY_CAP", free=5, waiting=None, waiting_longest_s=None, over_threshold=0, breached_days=["2026-09-03"], worst_s=50 * 60), self.at(10))
+        self.tick(pooled(cause="CONCURRENCY_CAP", free=5, waiting=9, waiting_longest_s=40 * 60), self.at(11))
+        self.tick(pooled(cause="CONCURRENCY_CAP", free=5, waiting=None, waiting_longest_s=None, over_threshold=0, breached_days=["2026-09-03"], worst_s=50 * 60), self.at(12))
+        self.assertEqual(len(self.opener.requests), 2)
+        self.assertIn("could not read the queue", self.opener.texts[0])
+        self.assertIn("9 presubmit runs are waiting", self.opener.texts[1])
 
     def test_a_new_episode_names_its_remedy_again(self):
         # The list is the episode's, not the channel's memory: the same cause a

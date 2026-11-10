@@ -2786,6 +2786,7 @@ class TestAuditCatalogue(unittest.TestCase):
                 "kanban-workspace-gc",
                 "session-retention",
                 "kanban-board-health",
+                "kanban-block-recheck",
                 "findings-morning-nudge",
                 "chat-delivery-watch",
                 "feedback-prompt",

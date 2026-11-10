@@ -42,6 +42,7 @@ rules:
       - limitranges
       - configmaps
       - serviceaccounts
+      - secrets
     verbs:
       - get
       - list
@@ -339,6 +340,11 @@ data:
       cron_mode: approve
     display: {}
     kanban:
+      admission:
+        fail_closed: true
+        memory_budget_mib: 4096
+        queue_bound_seconds: 600
+        worker_rss_cap_mib: 1536
       max_in_progress: 6
     model:
       api_key: none
@@ -1774,7 +1780,7 @@ spec:
               memory: 8Gi
             requests:
               cpu: "1"
-              memory: 2Gi
+              memory: 4Gi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

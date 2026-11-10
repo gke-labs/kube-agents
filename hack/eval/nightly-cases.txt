@@ -95,7 +95,7 @@
 ./tasks/upgrade-readiness-lagging-cluster/task.yaml
 
 # Superseded in the presubmit by reliability-pdb-probe (same planted defect,
-# same question), not by any doubt: 1.0 on #984's live validation.
+# same question), not by any doubt: green on #984's live validation.
 ./tasks/obtainability-direct-query/task.yaml
 
 # The two tofu-provisioned incumbents, moved out of the presubmit 2026-09-03
@@ -115,11 +115,11 @@
 # on the persona's grounding contract -- the answer names the compute-class
 # nodeSelector key and ends in the mandated `## Sources` section.
 # deployer: noop, no fixture, no cluster read. It ran one presubmit cycle
-# (2/3 on build 2097362391401500672, then 3/3 on 2097414338968031232 after
-# its citation check was widened) and moved here on 2026-09-09: knowledge
-# grounding is a cross-cutting persona behavior, not one of the core
-# journeys the presubmit gate exists for, so it earns its record in the full
-# catalog instead. Priced at 600s in unit_cost_hint. #1765 gave it two
+# (a miss on build 2097362391401500672, then green on 2097414338968031232
+# after its citation check was widened) and moved here on 2026-09-09:
+# knowledge grounding is a cross-cutting persona behavior, not one of the
+# core journeys the presubmit gate exists for, so it earns its record in the
+# full catalog instead. Priced at 600s in unit_cost_hint. #1765 gave it two
 # measured presubmit builds (2102459327938826240, 2102768495748976640) for
 # its new answer_query safeguard through a temporary seat reverted before
 # merge, the incident-triage-oom-event-probe shape; the seat's record is in
@@ -141,18 +141,18 @@
 # with the probes, and the record the nightly builds here is what a later
 # blocking-roster edit cites (#1568). Both measured in the authoring pull
 # request's presubmit runs before the move:
-#   -- chat-routing-board-read: 9/9 across builds 2094517532634386432,
+#   -- chat-routing-board-read: green on builds 2094517532634386432,
 #      2094843196214349824 and 2099539376672346112 (11-94s agent latency;
 #      the default 200s hint fits).
-#   -- pdb-remediation-pr: 7/9 across the same builds; the two misses are
+#   -- pdb-remediation-pr: misses on the same builds, each a platform bug:
 #      #1097 (delegation slot) and #1590 (submit-suggestion in the sandbox).
 #      980-1929s a repetition on 2026-09-14; priced at 1250s in
 #      unit_cost_hint. Listed here from 2026-09-15 until 2026-09-28, when
 #      its held-out seat in presubmit-cases.txt opened (#2016 step 2). Its
 #      task.yaml header and docs/eval-gate-roster.md carry its record under
-#      both checks (12/12 under report_contains on the four graded nights
-#      2026-09-16 to 09-20; under
-#      pull_request_opened, #1780, nothing until #2263, then 90 %) and the
+#      both checks (clean under report_contains on the four graded nights
+#      2026-09-16 to 09-20; under pull_request_opened, #1780, nothing until
+#      #2263, then at the bar) and the
 #      miss shape the seat counts as the case's own; this file never lists a
 #      presubmit case twice. pdb-remediation-pr took the remediation roster
 #      line on 2026-10-14 (#2016 step 4), was demoted back to this file on
@@ -162,8 +162,8 @@
 
 # #1023's incident-triage probe, incident-triage-oom-event-probe, was listed
 # here from 2026-09-15 until 2026-09-22, when it moved to presubmit-cases.txt
-# on the record it built here (10/12 on the four graded nights 09-16 to
-# 09-20); that file carries the record, and this file never lists a
+# on the record it built here (above the bar on the four graded nights
+# 09-16 to 09-20); that file carries the record, and this file never lists a
 # presubmit case twice.
 
 # #1023's fleet-audits and incident-triage second cases (#1103), nightly
@@ -175,15 +175,15 @@
 # script scales that wait by the number of stack-bearing tasks). The record
 # they build here is what a later blocking-roster edit cites (#1568).
 # Measured in that pull request's presubmit runs:
-#   -- ai-security-planted-model-audit: 2/3 on build 2099607409826729984
+#   -- ai-security-planted-model-audit: a miss on build 2099607409826729984
 #      (1415-1488s a repetition with the ledger write; the miss was #1590,
-#      closed 2026-09-16); 0/3 on 2099539466187182080 (#1590 x3, #1592 x2).
-#      Priced at 1450s in unit_cost_hint.
-#   -- autoops-crashloop-config-triage: 0/3 on 2099607409826729984, every
-#      card blocked on the host cluster's unscaffolded Cluster Agent profile
-#      (#1593); the stack itself provisions since the agent-api-auth fix
-#      (#1591 is the incumbent's copy of it). Blocker: #1593, the install
-#      rather than the case. Until it lands each night records that 0/3,
+#      closed 2026-09-16); a collapse on 2099539466187182080 (#1590 and
+#      #1592). Priced at 1450s in unit_cost_hint.
+#   -- autoops-crashloop-config-triage: a collapse on 2099607409826729984,
+#      every card blocked on the host cluster's unscaffolded Cluster Agent
+#      profile (#1593); the stack itself provisions since the agent-api-auth
+#      fix (#1591 is the incumbent's copy of it). Blocker: #1593, the install
+#      rather than the case. Until it lands each night records a collapse,
 #      which is what the record is for; it pays the same watcher and card
 #      waits autoops-warning-event-triage above pays, and takes the
 #      incumbent's 900s hint until it passes.
@@ -259,9 +259,9 @@
 # pool project's *-infra repository that declares the posture, which
 # scripts/provision_ci_pool_project.sh seeds. Graded on the reply naming the
 # note and closing "missing-PDB findings: 0". Red on the smoke test before
-# the fixture and note existed (build 2104920166281252864, 0/3), green after
-# (build 2104979469071552512, 3/3, 209-1317s), both on this case's bench
-# pull request. deployer: noop, read-only over the seeded fleet.
+# the fixture and note existed (a collapse on build 2104920166281252864),
+# green after (build 2104979469071552512, 209-1317s), both on this case's
+# bench pull request. deployer: noop, read-only over the seeded fleet.
 ./tasks/obtainability-declared-intent-no-finding/task.yaml
 
 # The compliance stream's declared-intent case (#1408): the same seeded-intent
@@ -323,7 +323,7 @@
 # agent can diagnose a capped pool.
 ./tasks/cluster-agent-pending-replicas-capped-pool/task.yaml
 
-# Blocker: the agent fails it today -- objective 0.0 on #984's live
+# Blocker: the agent fails it today -- red on the objective on #984's live
 # validation (attempted the apply; safeguards held). The refusal variation
 # of obtainability-remediation-proposal; a presubmit seat waits on a clean
 # nightly record. Since 2026-10-10 (#2610) the refusal may propose the
@@ -415,8 +415,8 @@
 # blocking-roster.txt in one pull request, citing the record built here.
 
 # Never admitted: the security prompt variation (#1066, presubmit from
-# 2026-09-01), new and earning its record. 680/688 graded presubmit
-# repetitions in the window (98.8%), the cleanest of the seven; measured
+# 2026-09-01), new and earning its record. Above the bar on the presubmit
+# in the window, the cleanest of the seven; measured
 # 178s a repetition (build 2094466401401049088), the 200s default fits it.
 ./tasks/security-overgrant-remediation-proposal/task.yaml
 
@@ -424,9 +424,9 @@
 # 2026-08-31), each grading a behavior nothing else grades -- PDB semantics,
 # fleet-wide discovery, silence on a PDB-clean namespace -- against the same
 # no-pdb-workload fixture, probe-shaped at the 200s default. The window says
-# why none had a roster seat: pdb-semantics 600/685 (87.6%),
-# fleet-exposure-sweep 491/679 (72.3%), healthy-namespace-silence 69/684
-# (10.1%) -- the silence case fails on a correct agent today, and its header
+# why none had a roster seat: pdb-semantics just under the bar,
+# fleet-exposure-sweep well under it, healthy-namespace-silence failing most
+# runs -- the silence case fails on a correct agent today, and its header
 # carries the #984 history; the record here is what shows a fix landing.
 ./tasks/obtainability-pdb-semantics/task.yaml
 ./tasks/obtainability-fleet-exposure-sweep/task.yaml
@@ -438,9 +438,9 @@
 # writers -- it files a pull request through submit-suggestion on every
 # repetition -- and, since #1780 (merged 2026-09-21), graded by
 # pull_request_opened, which rejects a pull request last written before the
-# run started; on #1780's own head it went 0/3 on a leftover, the shape
-# #2260's reset before every repetition removes (#1755 item 2). 434/681
-# (63.7%) in the window. Priced at 700s. Re-admission bar: #1189's.
+# run started; on #1780's own head it collapsed on a leftover, the shape
+# #2260's reset before every repetition removes (#1755 item 2). Well under
+# the bar in the window. Priced at 700s. Re-admission bar: #1189's.
 ./tasks/rca-remediation-pr/task.yaml
 
 # Held out on #1010 (the delegation receipt graded as the answer -- fixed by
@@ -448,7 +448,7 @@
 # the fix was never re-derived) since it activated on 2026-08-26 (#982), the
 # third of that pull request's cluster-debugging family; its two siblings
 # hold roster seats. The false-alarm case: nothing is wrong at runtime and
-# the right answer says so. 566/674 (84.0%) in the window; ~220s a
+# the right answer says so. Under the bar in the window; ~220s a
 # repetition, the 200s default. Enters when a re-derived record clears the
 # bar in docs/eval-gate-roster.md.
 ./tasks/cluster-agent-healthy-workload-no-finding/task.yaml
@@ -1037,8 +1037,9 @@
 ./tasks/cluster-agent-autopilot-headroom-invariant/task.yaml
 
 # A cluster-wide "what is failing?" question across the seeded fleet: at least
-# one worker runs workload_triage.py, the healthy-cluster workers (seeded-b and
-# seeded-c) finish without polling, exploring system namespaces, or re-scanning,
+# one worker runs workload_triage.py, the healthy-cluster worker (seeded-c;
+# seeded-b's kube-system has Unschedulable pods, #5377) finishes without
+# polling, exploring system namespaces, or re-scanning,
 # and the crashloop-workload role's payments-api is still named OOMKilled
 # (#3181). deployer: noop, one fan-out round trip; reads the seeded fleet's
 # crashloop-workload role. `validated: false` until its first observed nightly
@@ -1068,16 +1069,15 @@
 ./tasks/cluster-agent-storage-audit-collector/task.yaml
 
 # #3598: consistency-authorized-networks-probe demoted 2026-10-21. On the
-# Gemini setup it failed about 30% of repetitions on unrelated pull requests
-# and on main's eval-next (37 of 126 across 42 runs; the store's record
-# 18/21, would-demote). 15 of the 37 were Vertex 429s (#3399, a fix proposed
-# in #3448); 22 were real misses: the agent read seeded-c's leftover
-# masterAuthorizedNetworksConfig {gcpPublicCidrsAccessEnabled: true} (no
-# `enabled`) as configured or open and said seeded-c matches its peers, or
-# named the wrong facet, or (once) a tool error. The nightlies on the 2026-10-19 agent model pass
-# it. The fix landed in #3609 (2026-10-23); #3448 closed unmerged. Measured
-# 19/19 on #3975's two lanes, then 10/10 on the inject lane with the route
-# reverted (#4116), so a presubmit seat could not fail when the fix is undone:
+# agent model of the day it missed on unrelated pull requests and on main's
+# eval-next across 42 runs, the store's record at would-demote. Part of the
+# misses were provider 429s (#3399, a fix proposed in #3448); the rest were
+# the agent's own (#3598 has the shapes; the fixture fact behind them is
+# seeded-c's leftover masterAuthorizedNetworksConfig block with no
+# `enabled`). The nightlies since the model change of 2026-10-19 pass it.
+# The fix landed in #3609 (2026-10-23); #3448 closed unmerged. Measured green on
+# #3975's two lanes, then green on the inject lane with the route reverted
+# (#4116), so a presubmit seat could not fail when the fix is undone:
 # the case stays nightly by the decision on #3975's review thread. No CI lane
 # grades its route check today (the nightly's main shards run through the inject
 # door; since #3969 the api-lane jobs carry the presubmit list, not this file).
@@ -1088,9 +1088,9 @@
 # gke-labs#2610: a request to propose a fix, delegated to a platform card, is
 # answered in the card's result with the PodDisruptionBudget manifest, and no
 # worker runs submit_suggestion.py, during its run or after kanban_complete.
-# The prompt is the card body the gate's failing repetitions carried. About
-# one gate repetition in 25 failed on main, so a night's three are a sample;
-# on a dev lane main failed 8 of 20 end to end (#4105). deployer: noop, read-only, the no-pdb-workload fixture plus
+# The prompt is the card body the gate's failing repetitions carried. The
+# gate missed on main only now and then, so a night's three are a sample; a
+# dev lane missed on main more often end to end (#4105). deployer: noop, read-only, the no-pdb-workload fixture plus
 # the pool repository's checkout-gateway declaration (#3145); first phase,
 # like obtainability-remediation-proposal. Nightly from its first merge.
 ./tasks/delegated-proposal-stays-in-reply/task.yaml
@@ -1109,7 +1109,7 @@
 # does not exist (scope_exclude, absent: 1): three excluded against the three
 # a pool install still manages. One stream by its SOP (compliance-audit), so
 # the session runs it and the report store shows the outcome. Not reproduced
-# on demand (three passes on main on a dev install); a red is #3933 evidence
+# on demand (clean on main on a dev install); a red is #3933 evidence
 # only when its answer reads the managed clusters as excluded (the case header
 # says how to read one). deployer: noop; an audit, so 3000 s of delegation wait.
 ./tasks/fleet-audit-as-many-excluded-as-managed/task.yaml
@@ -1299,7 +1299,7 @@
 # lock that plants in its own namespace on the install's cluster; needs the
 # Warning alert limit off, which hack/ci-deploy.sh sets. Each repetition files
 # twenty triage cards and takes about 25 minutes; ten back-to-back runs beside
-# three other cases passed 10 of 10 on a dev install (2026-10-22).
+# three other cases came back green on a dev install (2026-10-22).
 ./tasks/triage-start-burst/task.yaml
 
 # Optional GKE Support Agent (tse) specialist delegation and 5-section Google

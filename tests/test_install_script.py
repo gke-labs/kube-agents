@@ -1392,7 +1392,7 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
             "MENU=(" + " ".join(quote(a) for a in menu_answers) + ")\nMENU_AT=0\n"
             'prompt_menu() { local v="${!#}"; echo "MENU: $*"; printf -v "$v" "%s" "${MENU[$MENU_AT]}"; MENU_AT=$((MENU_AT + 1)); }\n'
             "READ=(" + " ".join(quote(a) for a in read_answers) + ")\nREAD_AT=0\n"
-            'prompt_read() { echo "PROMPT: $1 default=[${3:-}]"; printf -v "$2" "%s" "${READ[$READ_AT]}"; READ_AT=$((READ_AT + 1)); }\n'
+            'prompt_read() { echo "PROMPT: $1 default=[${3:-}]"; local val="${READ[$READ_AT]}"; if [ -z "$val" ] && [ -n "${3:-}" ]; then val="$3"; fi; printf -v "$2" "%s" "$val"; READ_AT=$((READ_AT + 1)); }\n'
             + preset
             + "ask_gitops_forge\n"
             'echo "DECLINED=$GITOPS_INTERVIEW_DECLINED FORGE=$PARAM_GITOPS_FORGE HOST=[${PARAM_GITOPS_HOST:-}] CA=[${PARAM_GITOPS_CA_FILE:-}] MENUS=$MENU_AT READS=$READ_AT SECRET=[${PARAM_GITOPS_CA_SECRET:-}]"\n'
@@ -1433,14 +1433,60 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
                     proc = self._ask_gitops_forge(menus, reads)
                     self.assertEqual(proc.returncode, 0, proc.stderr)
                     self.assertIn(expected, proc.stdout, proc.stdout + proc.stderr)
-            # After a refusal the hostname prompt has no default: prompt_read
-            # substitutes a default for an empty answer, so a refused host
-            # offered again would make enter resubmit it rather than return
-            # to the menu, which INSTALL.md says an empty hostname does.
+            # After a refusal the hostname and CA prompts have no default: prompt_read
+            # substitutes a default for an empty answer, so a refused host or
+            # CA file offered again would make enter resubmit it.
             proc = self._ask_gitops_forge(["2", "2"], ["https://ghe.example.com", "", "ghe.example.com", ""])
             host_prompt = "PROMPT: GitHub Enterprise Server hostname (for example github.example.com) default=["
             self.assertEqual(proc.stdout.count(host_prompt + "]"), 2, proc.stdout)
             self.assertNotIn(host_prompt + "https://ghe.example.com]", proc.stdout)
+            # With an exported CA file, a refused host resets ghes_ca_file="" so
+            # the second attempt does not offer the CA file again as default. An
+            # empty answer on the second attempt clears the derived Secret name.
+            ca_refusal_preset = (
+                f'PARAM_GITOPS_HOST="ghe.example.com"\nPARAM_GITOPS_CA_FILE="{ca}"\n'
+                'PARAM_GITOPS_CA_SECRET="github-forge-ca"\n'
+            )
+            proc = self._ask_gitops_forge(
+                ["2", "2"],
+                ["https://ghe.example.com", "", "ghe.example.com", ""],
+                preset=ca_refusal_preset,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            ca_first_prompt = f"PROMPT: PEM CA file that signed the instance's certificate (empty keeps the file; a path replaces it) default=[{ca}]"
+            ca_second_prompt = "PROMPT: PEM CA file that signed the instance's certificate (empty if a public CA signed it) default=[]"
+            self.assertIn(ca_first_prompt, proc.stdout)
+            self.assertIn(ca_second_prompt, proc.stdout)
+            self.assertIn("DECLINED=false FORGE=github HOST=[ghe.example.com] CA=[] MENUS=2 READS=4 SECRET=[]", proc.stdout)
+            # An operator-named Secret exported alongside a CA file is restored
+            # if a subsequent attempt clears the default and is refused again.
+            operator_ca_preset = (
+                f'PARAM_GITOPS_HOST="ghe.example.com"\nPARAM_GITOPS_CA_FILE="{ca}"\n'
+                'PARAM_GITOPS_CA_SECRET="my-ca"\n'
+            )
+            proc = self._ask_gitops_forge(
+                ["2", "2", "2"],
+                ["https://ghe.example.com", "", "https://ghe.example.com", "", "ghe.example.com", str(ca)],
+                preset=operator_ca_preset,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn(
+                f"DECLINED=false FORGE=github HOST=[ghe.example.com] CA=[{ca}] MENUS=3 READS=6 SECRET=[my-ca]",
+                proc.stdout,
+                proc.stdout + proc.stderr,
+            )
+            # Typing a github.com spelling at option 2 drops an exported CA file and Secret name
+            # without prompting for a CA file (since github.com uses public CAs).
+            for g_host in ("github.com", "www.github.com", "ssh.github.com"):
+                with self.subTest(g_host):
+                    proc = self._ask_gitops_forge(
+                        ["2"],
+                        [g_host],
+                        preset=ca_refusal_preset,
+                    )
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertIn("DECLINED=false FORGE=github HOST=[] CA=[] MENUS=1 READS=1 SECRET=[]", proc.stdout)
+                    self.assertNotIn("PEM CA file", proc.stdout)
             # On a first install with GITOPS_HOST exported and --gitops-ca-file
             # given, the early flag check derives the CA Secret's name before
             # the menu. No repository drops the name with the file: nothing
@@ -1488,6 +1534,59 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
         self.assertIn("PROMPT: PEM CA file that signed the instance's certificate", proc.stdout)
         self.assertIn("Create the GitHub App on ghe.example.com, not on github.com", proc.stdout)
         self.assertIn("DECLINED=false FORGE=github HOST=[ghe.example.com] CA=[] MENUS=1 READS=2", proc.stdout)
+
+    def test_an_exported_ca_file_is_offered_as_option_2_default(self):
+        """On a first install with GITOPS_HOST and GITOPS_CA_FILE exported,
+        option 2 offers both as their prompt defaults and keeps the derived
+        CA Secret name. Before, option 2 cleared the CA file and skipped the
+        CA prompt because it read the derived name as a recorded Secret name,
+        leaving a host, no CA file, and an unfulfilled Secret name (#4018)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            ca = pathlib.Path(tmp) / "ca.pem"
+            ca.write_text("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n")
+            preset = (
+                f'PARAM_GITOPS_HOST="ghe.example.com"\nPARAM_GITOPS_CA_FILE="{ca}"\n'
+                'PARAM_GITOPS_CA_SECRET="github-forge-ca"\n'
+            )
+            # Enter at both prompts keeps the exported host and CA file defaults.
+            proc = self._ask_gitops_forge(["2"], ["", ""], preset=preset)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn(
+                f"PROMPT: PEM CA file that signed the instance's certificate (empty keeps the file; a path replaces it) default=[{ca}]",
+                proc.stdout,
+            )
+            self.assertIn(
+                f"DECLINED=false FORGE=github HOST=[ghe.example.com] CA=[{ca}] MENUS=1 READS=2 SECRET=[github-forge-ca]",
+                proc.stdout,
+                proc.stdout + proc.stderr,
+            )
+            # When only GITOPS_HOST is exported (no CA file), the CA prompt has an
+            # empty default and "(empty if a public CA signed it)". Enter leaves CA and Secret empty.
+            host_only_preset = 'PARAM_GITOPS_HOST="ghe.example.com"\n'
+            proc = self._ask_gitops_forge(["2"], ["", ""], preset=host_only_preset)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn(
+                "PROMPT: PEM CA file that signed the instance's certificate (empty if a public CA signed it) default=[]",
+                proc.stdout,
+            )
+            self.assertIn(
+                "DECLINED=false FORGE=github HOST=[ghe.example.com] CA=[] MENUS=1 READS=2 SECRET=[]",
+                proc.stdout,
+                proc.stdout + proc.stderr,
+            )
+            # An operator-named Secret exported with no CA file is preserved on Enter.
+            operator_secret_preset = 'PARAM_GITOPS_HOST="ghe.example.com"\nPARAM_GITOPS_CA_SECRET="operator-ca-secret"\n'
+            proc = self._ask_gitops_forge(["2"], ["", ""], preset=operator_secret_preset)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn(
+                "PROMPT: PEM CA file that signed the instance's certificate (empty keeps Secret 'operator-ca-secret'; a path replaces it) default=[]",
+                proc.stdout,
+            )
+            self.assertIn(
+                "DECLINED=false FORGE=github HOST=[ghe.example.com] CA=[] MENUS=1 READS=2 SECRET=[operator-ca-secret]",
+                proc.stdout,
+                proc.stdout + proc.stderr,
+            )
 
     def test_a_declined_forge_menu_skips_the_repository_menu_in_main(self):
         """main's step 8 does not ask the repository menu over an answer the
@@ -6664,6 +6763,41 @@ class AlertDailyLimitsRecordedInInstallEnvTest(unittest.TestCase):
         self.assertRegex(text, re.compile(r"^ALERT_DAILY_LIMIT_WARNING=''$", re.MULTILINE))
 
 
+class LitellmBudgetPersistsThroughInstallEnvTest(unittest.TestCase):
+    """The same walk for LITELLM_BUDGET_USD and LITELLM_BUDGET_PERIOD, which
+    have no flag: the first run records what the environment exported, the
+    next run's environment reads it back for the tfvars generator, and an
+    unset pair is recorded empty, which the generator turns into the defaults
+    (0, no ceiling; 1d)."""
+
+    _bootstrap_with_export = ModelMaxTokensPersistsThroughInstallEnvTest._bootstrap_with_export
+    _read_back = ModelMaxTokensPersistsThroughInstallEnvTest._read_back
+
+    @staticmethod
+    def _env(overrides):
+        # Both keys are in SEEDED_INSTALLER_ENV_KEYS, so a developer's own
+        # exported value never stands in for the file.
+        return get_isolated_test_env(overrides=overrides)
+
+    def test_the_first_run_records_the_export_and_the_next_run_reads_it_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = self._bootstrap_with_export(tmp, 'export LITELLM_BUDGET_USD="2.50" LITELLM_BUDGET_PERIOD="7d"')
+            text = dest.read_text()
+            self.assertIn("LITELLM_BUDGET_USD=2.50\n", text)
+            self.assertIn("LITELLM_BUDGET_PERIOD=7d\n", text)
+            out = self._read_back(dest, "bash -c 'echo \"USD=[$LITELLM_BUDGET_USD] PERIOD=[$LITELLM_BUDGET_PERIOD]\"'")
+            self.assertIn("USD=[2.50] PERIOD=[7d]", out)
+
+    def test_an_unset_pair_is_recorded_empty_and_reads_back_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = self._bootstrap_with_export(tmp, ":")
+            text = dest.read_text()
+            self.assertIn("LITELLM_BUDGET_USD=''\n", text)
+            self.assertIn("LITELLM_BUDGET_PERIOD=''\n", text)
+            out = self._read_back(dest, "bash -c 'echo \"USD=[$LITELLM_BUDGET_USD] PERIOD=[$LITELLM_BUDGET_PERIOD]\"'")
+            self.assertIn("USD=[] PERIOD=[]", out)
+
+
 class LitellmRedactionPersistsThroughInstallEnvTest(unittest.TestCase):
     """The same walk for the LITELLM_REDACTION_* keys: the first run records
     what main() exported, the next run's parameter block and environment read
@@ -11379,6 +11513,7 @@ class DomainScopedFlagsTest(unittest.TestCase):
         "--enable-hermes-dashboard": "PARAM_ENABLE_WEBUI",
         "--enable-web-console": "PARAM_ENABLE_WEB_CONSOLE",
         "--enable-gke-backup-plan": "PARAM_ENABLE_GKE_BACKUP_PLAN",
+        "--disallow-secrets-read": "PARAM_DISALLOW_SECRETS_READ",
         "--enable-pubsub-platform": "PARAM_ENABLE_PUBSUB_PLATFORM",
         "--enable-stockout-investigator": "PARAM_ENABLE_STOCKOUT_INVESTIGATOR",
         "--enable-drift-detector": "PARAM_ENABLE_DRIFT_DETECTOR",
@@ -13149,6 +13284,7 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
         "--enable-google-chat",
         "--enable-slack",
         "--enable-gke-backup-plan",
+        "--disallow-secrets-read",
         "--enable-pubsub-platform",
         "--enable-stockout-investigator",
         "--enable-drift-detector",
@@ -13205,6 +13341,7 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
         "--enable-google-chat": "GOOGLE_CHAT_ENABLED",
         "--enable-slack": "SLACK_ENABLED",
         "--enable-gke-backup-plan": "ENABLE_GKE_BACKUP_PLAN",
+        "--disallow-secrets-read": "DISALLOW_SECRETS_READ",
         "--enable-pubsub-platform": "ENABLE_PUBSUB_PLATFORM",
         "--enable-stockout-investigator": "ENABLE_STOCKOUT_INVESTIGATOR",
         "--enable-drift-detector": "ENABLE_DRIFT_DETECTOR",
@@ -13268,6 +13405,7 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
             "PARAM_ENABLE_GOOGLE_CHAT",
             "PARAM_ENABLE_SLACK",
             "PARAM_ENABLE_GKE_BACKUP_PLAN",
+            "PARAM_DISALLOW_SECRETS_READ",
             "PARAM_ENABLE_PUBSUB_PLATFORM",
             "PARAM_ENABLE_STOCKOUT_INVESTIGATOR",
             "PARAM_ENABLE_DRIFT_DETECTOR",

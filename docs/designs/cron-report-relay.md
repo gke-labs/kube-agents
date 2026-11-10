@@ -310,7 +310,9 @@ place of the final message. A read of the file
 that fails, rather than finding none, posts a second notice naming the failure,
 and leaves the run unposted. `[SILENT]` is unchanged: the scheduler drops a
 silent run before delivery. Only the scheduler's delivery leg is replaced: the relay plugin sends
-`also_delivered_to` on every delivery and `report_to_chat` never does, so a
+`also_delivered_to` on every delivery, as does onboarding's lost-summaries stage
+(`bootstrap_delivery.resend_lost_summaries`) when it re-posts a first-run audit
+that found no home channel, and `report_to_chat` never does, so a
 mid-run `report_to_chat` is posted as written.
 
 The scheduler's failure line names a CLI and a config file nobody in the

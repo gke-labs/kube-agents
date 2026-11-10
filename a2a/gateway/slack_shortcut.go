@@ -251,10 +251,19 @@ func (s *SlackAdapter) shortcut(ctx context.Context, raw json.RawMessage, handle
 	if p.User.ID == "" || p.Channel.ID == "" || p.Message.TS == "" || p.ActionTS == "" {
 		return
 	}
+	author := p.User.ID
 	if s.otherWorkspace(p.User.TeamID) || s.otherWorkspace(p.Team.ID) {
-		s.log.Info("slack: ignoring a shortcut from another workspace's member",
-			"userTeam", p.User.TeamID, "team", s.teamID, "channel", p.Channel.ID)
-		return
+		// The message path's rule (foreignSender), as a click takes it: a
+		// member of another workspace is admitted only when the allowlist
+		// names them by workspace, and their ask then carries the same
+		// "T…:U…" author. A refused one gets no reply, as before.
+		guest, ok := s.admitGuest(p.User.TeamID, p.Team.ID, p.User.ID)
+		if !ok {
+			s.log.Info("slack: ignoring a shortcut from another workspace's member",
+				"user", p.User.ID, "userTeam", p.User.TeamID, "team", s.teamID, "channel", p.Channel.ID)
+			return
+		}
+		author = guest
 	}
 	if s.alreadySeen("shortcut:" + p.Channel.ID + "/" + p.ActionTS) {
 		return
@@ -289,7 +298,7 @@ func (s *SlackAdapter) shortcut(ctx context.Context, raw json.RawMessage, handle
 	msg := InboundMessage{
 		Conversation: slackConversationID(channelType, p.Channel.ID, thread),
 		Kind:         kind,
-		AuthorID:     p.User.ID,
+		AuthorID:     author,
 		MessageID:    p.Message.TS,
 		Text: fmt.Sprintf(slackShortcutAsk, slackShortcutWhere(p.Channel.Name),
 			shortcutAskQuoted(s.shortcutAuthor(ctx, p.Message), quoted)),

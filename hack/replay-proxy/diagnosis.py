@@ -96,7 +96,7 @@ class DiagnosisHasher:
             raw = json.dumps(message, sort_keys=True, ensure_ascii=False)
             norm.now = self._first_seen(raw, now)
             norm.keep_ips = norm.keep_ips or normalizer.CIDR_RE.search(raw) is not None
-            value = norm.walk(message)
+            value = norm.walk_message(message)
             walked.append(value)
             hashes.append(normalizer.stable_hash(value)[: normalizer.MESSAGE_HASH_HEX_CHARS])
         return hashes, walked

@@ -246,6 +246,12 @@ under every primary alias the same way (the fallback alias carries
 On a Gemini 2.5 or 3.x model the gateway asks for the model's thoughts with a
 `thinking` key under every primary alias, which a `reasoningEffort` value replaces
 ([why](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#geminis-thoughts)).
+`litellm.budget.usd` (default `0`, meaning none) with `litellm.budget.period`
+(default `1d`) puts a spend ceiling on the gateway, LiteLLM's provider budget
+for the model's provider split evenly across `litellm.replicaCount`; a replica
+whose share is spent refuses model calls until the window ends, and exports the
+remaining share as `litellm_provider_remaining_budget_metric`
+([details](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#setting-a-spend-ceiling)).
 On a Claude model the gateway
 drops `temperature`, `top_p` and `top_k` from every request
 ([why](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#setting-the-default-model)),
@@ -1186,6 +1192,18 @@ Exactly one owner creates the broker's KSA, depending on
 - **No annotations**: the operator treats the named KSA as user-managed and
   does not create it — the **chart** renders it instead, so a default install
   still starts.
+
+### Secret metadata read access (`platformAgent.security.disallowSecretsRead`)
+
+`platformAgent.security.disallowSecretsRead` sets `spec.security.disallowSecretsRead` on the
+`PlatformAgent` CR. When unset (`null`, the default), a new install grants `get`, `list`, and
+`watch` on core `secrets` to `kubeagents:minimal:<ns>:<name>` so `<name>-kube-proxy` can serve
+redacted `Secret` metadata (`KUBE_PROXY_REDACT_SECRETS=true`), while an existing install keeps
+whatever `secrets` permission its `kubeagents:minimal:<ns>:<name>` `ClusterRole` already holds.
+Set `--set platformAgent.security.disallowSecretsRead=true` (or `--disallow-secrets-read=true` /
+`DISALLOW_SECRETS_READ=true` in `install.sh`) to omit `secrets` from the reader `ClusterRole`, or
+set `--set platformAgent.security.disallowSecretsRead=false` to grant `secrets` on an upgraded
+existing install.
 
 ### Admission policies
 
