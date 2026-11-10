@@ -450,7 +450,7 @@ def render_lost_pods_body(health: dict, when_text: str, window_text: str, brief_
         nodes="\n".join(f"- `{name}` ({count} {'run' if count == 1 else 'runs'})" for name, count in sorted(nodes.items())) or f"- {UNKNOWN_NODE}",
         window=window_text,
         window_iso=f"{incident.get('window_start') or '?'} – {incident.get('window_end') or '?'}",
-        pr_list=", ".join(f"#{pr}" for pr in prs) or "none recorded",
+        pr_list=", ".join(ghcli.pr_url(ghcli.SOURCE_REPO, pr) for pr in prs) or "none recorded",
         evidence="\n".join(evidence) or NO_EVIDENCE,
         brief=brief_link,
     )
@@ -476,7 +476,7 @@ def render_deadline_kill_body(health: dict, since_text: str, window_text: str, b
         minutes=DEADLINE_MINUTES,
         window=window_text,
         window_iso=f"{incident.get('window_start') or '?'} – {incident.get('window_end') or '?'}",
-        pr_list=", ".join(f"#{pr}" for pr in prs) or "none recorded",
+        pr_list=", ".join(ghcli.pr_url(ghcli.SOURCE_REPO, pr) for pr in prs) or "none recorded",
         evidence="\n".join(evidence) or NO_EVIDENCE,
         recovery=RECOVERY_RUNS,
         brief=brief_link,

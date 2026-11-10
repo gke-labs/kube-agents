@@ -40,8 +40,14 @@ import sys
 GH_BIN = "gh"
 SOURCE_REPO = "gke-labs/kube-agents"
 ISSUES_REPO_ENV = "KUBE_AGENTS_ISSUES_REPO"
-DEFAULT_REPO = os.environ.get(ISSUES_REPO_ENV) or SOURCE_REPO
+# What the variable may hold: owner/name, the shape the workflow's split
+# step checks too; anything else is a warning and SOURCE_REPO.
+REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+INVALID_REPO_WARNING = "warning: {env}={value!r} is not owner/name; the issues go to {repo}"
 ISSUE_URL = "https://github.com/{repo}/issues/{number}"
+# A pull request's page: pull requests stay in SOURCE_REPO, so a body that
+# may be filed elsewhere links them in full.
+PULL_URL = "https://github.com/{repo}/pull/{number}"
 # The two forms an issue reference takes: "#N", an issue of SOURCE_REPO (how
 # case-notes.yaml and the domains.yaml allowlist write theirs), or the full
 # URL the bots write. issue_key reads either to (repo, number), so a list
@@ -67,9 +73,31 @@ def log(message: str) -> None:
     print(message, file=sys.stderr)
 
 
+def issues_repo_setting(environ=os.environ) -> str:
+    """Where the bots file: the ISSUES_REPO_ENV value when it is owner/name,
+    else SOURCE_REPO (a malformed value is logged and treated as unset, as
+    the workflow's split step treats it)."""
+    value = environ.get(ISSUES_REPO_ENV) or ""
+    if not value:
+        return SOURCE_REPO
+    if not REPO_RE.match(value):
+        log(INVALID_REPO_WARNING.format(env=ISSUES_REPO_ENV, value=value, repo=SOURCE_REPO))
+        return SOURCE_REPO
+    return value
+
+
+# Read once at import, as every bot's `--repo` default.
+DEFAULT_REPO = issues_repo_setting()
+
+
 def issue_url(repo: str, number) -> str:
     """The issue's page, the one form of an issue reference the bots write."""
     return ISSUE_URL.format(repo=repo, number=number)
+
+
+def pr_url(repo: str, number) -> str:
+    """The pull request's page."""
+    return PULL_URL.format(repo=repo, number=number)
 
 
 def issue_key(ref) -> tuple[str, int] | None:

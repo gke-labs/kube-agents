@@ -11,8 +11,11 @@ import yaml
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci-health.yml"
 JOB = "refresh-and-adjudicate"
-VARIABLE = "${{ vars.KUBE_AGENTS_ISSUES_REPO }}"
+# Every consumer reads the variable only once the split step found it
+# owner/name; an invalid value is then exactly an unset one.
+VARIABLE = "${{ steps.issues_repo.outputs.valid == 'true' && vars.KUBE_AGENTS_ISSUES_REPO || '' }}"
 GUARD = "vars.KUBE_AGENTS_ISSUES_REPO != ''"
+MINT_GUARD = "steps.issues_repo.outputs.valid == 'true'"
 TOKEN = "${{ steps.issues_token.outputs.token || github.token }}"
 OWN_TOKEN = "${{ github.token }}"
 ISSUE_STEPS = (
@@ -50,7 +53,12 @@ class IssuesRepoWiringTest(unittest.TestCase):
     def test_the_token_step_is_guarded_pinned_and_scoped_to_the_named_repository(self):
         by_name = steps()
         split, mint = by_name["Split the issues repository into owner and name"], by_name["Mint a token for the issues repository"]
-        self.assertEqual((split.get("if"), mint.get("if")), (GUARD, GUARD))
+        self.assertEqual((split.get("if"), mint.get("if")), (GUARD, MINT_GUARD))
+        self.assertIs(split.get("continue-on-error"), True, "a malformed value must not stop the job")
+        self.assertIn("valid=false", split["run"])
+        self.assertIn("::warning::", split["run"])
+        self.assertIn("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", split["run"], "owner/name, anchored")
+        self.assertNotIn("exit 1", split["run"])
         self.assertEqual(mint.get("id"), "issues_token")
         self.assertRegex(mint["uses"], PINNED_ACTION)
         with_ = mint["with"]
@@ -59,7 +67,7 @@ class IssuesRepoWiringTest(unittest.TestCase):
         self.assertEqual((with_["owner"], with_["repositories"]), ("${{ steps.issues_repo.outputs.owner }}", "${{ steps.issues_repo.outputs.name }}"))
         self.assertEqual(with_.get("permission-issues"), "write")
         self.assertIs(mint.get("continue-on-error"), True, "a mint that fails must not cancel the dashboard, Chat and PR-comment steps")
-        self.assertIn("must be owner/name", split["run"], "the split refuses a value with no slash")
+        self.assertIn("must be owner/name", split["run"])
         names = list(steps())
         self.assertLess(names.index("Split the issues repository into owner and name"), names.index("Mint a token for the issues repository"))
         self.assertLess(names.index("Mint a token for the issues repository"), min(names.index(n) for n in ISSUE_STEPS), "minted before any step that uses it")

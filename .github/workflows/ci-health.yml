@@ -655,7 +655,7 @@ jobs:
       - name: Adjudicate
         env:
           # health.json records where the bots file (issues_repo).
-          KUBE_AGENTS_ISSUES_REPO: ${{ vars.KUBE_AGENTS_ISSUES_REPO }}
+          KUBE_AGENTS_ISSUES_REPO: ${{ steps.issues_repo.outputs.valid == 'true' && vars.KUBE_AGENTS_ISSUES_REPO || '' }}
         run: |
           # --posted-state is the poster's file, read for the tracking issue
           # the bot filed so health.json can cite it, and for the pool
@@ -730,21 +730,30 @@ jobs:
       # ISSUES_APP_PRIVATE_KEY), scoped to that one repository's issues. The
       # pull-request comment and the collect keep github.token: the pull
       # requests stay here.
+      # The step never fails the job: a value that is not owner/name is a
+      # warning in the log, `valid=false`, and every consumer below then
+      # behaves as if the variable were unset.
       - name: Split the issues repository into owner and name
         id: issues_repo
         if: vars.KUBE_AGENTS_ISSUES_REPO != ''
+        continue-on-error: true
         env:
           ISSUES_REPO: ${{ vars.KUBE_AGENTS_ISSUES_REPO }}
         run: |
-          case "$ISSUES_REPO" in */*) ;; *) echo "KUBE_AGENTS_ISSUES_REPO must be owner/name" >&2; exit 1;; esac
-          echo "owner=${ISSUES_REPO%%/*}" >> "$GITHUB_OUTPUT"
-          echo "name=${ISSUES_REPO#*/}" >> "$GITHUB_OUTPUT"
+          if printf '%s' "$ISSUES_REPO" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'; then
+            echo "valid=true" >> "$GITHUB_OUTPUT"
+            echo "owner=${ISSUES_REPO%%/*}" >> "$GITHUB_OUTPUT"
+            echo "name=${ISSUES_REPO#*/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::KUBE_AGENTS_ISSUES_REPO must be owner/name; the issues go to this repository this tick"
+            echo "valid=false" >> "$GITHUB_OUTPUT"
+          fi
       # Best-effort: a mint that fails must not cancel the dashboard, the Chat
       # post or the pull-request comments; the steps fall back to github.token
       # and their cross-repository writes fail one by one as warnings.
       - name: Mint a token for the issues repository
         id: issues_token
-        if: vars.KUBE_AGENTS_ISSUES_REPO != ''
+        if: steps.issues_repo.outputs.valid == 'true'
         continue-on-error: true
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
@@ -764,7 +773,7 @@ jobs:
         continue-on-error: true
         timeout-minutes: 2
         env:
-          KUBE_AGENTS_ISSUES_REPO: ${{ vars.KUBE_AGENTS_ISSUES_REPO }}
+          KUBE_AGENTS_ISSUES_REPO: ${{ steps.issues_repo.outputs.valid == 'true' && vars.KUBE_AGENTS_ISSUES_REPO || '' }}
           GH_TOKEN: ${{ steps.issues_token.outputs.token || github.token }}
         run: |
           store_args=()
@@ -828,7 +837,7 @@ jobs:
         # cancel the post after it (JOB_TAIL_S budgets this step too).
         timeout-minutes: 3
         env:
-          KUBE_AGENTS_ISSUES_REPO: ${{ vars.KUBE_AGENTS_ISSUES_REPO }}
+          KUBE_AGENTS_ISSUES_REPO: ${{ steps.issues_repo.outputs.valid == 'true' && vars.KUBE_AGENTS_ISSUES_REPO || '' }}
           GH_TOKEN: ${{ steps.issues_token.outputs.token || github.token }}
         run: |
           mode=--dry-run
@@ -847,7 +856,7 @@ jobs:
         continue-on-error: true
         timeout-minutes: 2
         env:
-          KUBE_AGENTS_ISSUES_REPO: ${{ vars.KUBE_AGENTS_ISSUES_REPO }}
+          KUBE_AGENTS_ISSUES_REPO: ${{ steps.issues_repo.outputs.valid == 'true' && vars.KUBE_AGENTS_ISSUES_REPO || '' }}
           GH_TOKEN: ${{ steps.issues_token.outputs.token || github.token }}
         run: |
           mode=--dry-run
@@ -874,7 +883,7 @@ jobs:
           CI_HEALTH_CHAT_TOKEN: ${{ steps.chat_token.outputs.token }}
           # For the tracking issue a new OUTAGE or lost_pods condition files
           # (header), and the digest's read of the nightly-red issues.
-          KUBE_AGENTS_ISSUES_REPO: ${{ vars.KUBE_AGENTS_ISSUES_REPO }}
+          KUBE_AGENTS_ISSUES_REPO: ${{ steps.issues_repo.outputs.valid == 'true' && vars.KUBE_AGENTS_ISSUES_REPO || '' }}
           GH_TOKEN: ${{ steps.issues_token.outputs.token || github.token }}
           # GitHub login -> Chat user id (JSON object) for the digest's
           # nightly section mentions; the ids are internal, so a secret. Empty
@@ -929,7 +938,7 @@ jobs:
         continue-on-error: true
         timeout-minutes: 3
         env:
-          KUBE_AGENTS_ISSUES_REPO: ${{ vars.KUBE_AGENTS_ISSUES_REPO }}
+          KUBE_AGENTS_ISSUES_REPO: ${{ steps.issues_repo.outputs.valid == 'true' && vars.KUBE_AGENTS_ISSUES_REPO || '' }}
           GH_TOKEN: ${{ steps.issues_token.outputs.token || github.token }}
         run: |
           store_args=()

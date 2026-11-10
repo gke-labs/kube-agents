@@ -149,7 +149,7 @@ class WorkflowTest(unittest.TestCase):
         self.assertTrue(step.get("continue-on-error"))
         self.assertLessEqual(step.get("timeout-minutes"), 3)
         self.assertLess(names.index(STEP_NAME), names.index(RENDER_STEP_NAME))
-        self.assertEqual(step["env"], {"KUBE_AGENTS_ISSUES_REPO": "${{ vars.KUBE_AGENTS_ISSUES_REPO }}", "GH_TOKEN": "${{ steps.issues_token.outputs.token || github.token }}"},
+        self.assertEqual(step["env"], {"KUBE_AGENTS_ISSUES_REPO": "${{ steps.issues_repo.outputs.valid == 'true' && vars.KUBE_AGENTS_ISSUES_REPO || '' }}", "GH_TOKEN": "${{ steps.issues_token.outputs.token || github.token }}"},
                          "the issues repository and its token, the workflow's own when unset (tests/test_ci_health_issues_repo.py)")
         self.assertNotIn("--live", step["run"])
 

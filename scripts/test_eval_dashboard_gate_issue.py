@@ -72,6 +72,19 @@ class CarriedIssueRepositoryTest(unittest.TestCase):
         self.assertEqual([m for m, _ in runner.calls], ["GET", "POST"], "comment only")
 
 
+class PullRequestLinksTest(unittest.TestCase):
+    def test_the_lost_pods_and_deadline_bodies_link_pull_requests_in_this_repository_in_full(self):
+        """A bare #N in an issue filed in the issues repository would resolve
+        there; the pull requests live in SOURCE_REPO."""
+        incident = {"prs": [2853, 2827], "runs": 2, "nodes": {"node-1": 2}, "window_start": "2026-10-09T00:00:00+00:00", "window_end": "2026-10-09T00:10:00+00:00"}
+        lost = gate_issue.render_lost_pods_body({"incident": incident, "evidence": []}, "Thu 8:00 PM ET", "8:00–8:10 PM ET", "brief")
+        killed = gate_issue.render_deadline_kill_body({"incident": incident, "evidence": [], "since": "2026-10-09T00:00:00+00:00"}, "Thu 8:00 PM ET", "8:00–8:10 PM ET", "brief")
+        for body in (lost, killed):
+            self.assertIn("**Affected PRs:** https://github.com/gke-labs/kube-agents/pull/2853, https://github.com/gke-labs/kube-agents/pull/2827.", body)
+            self.assertNotIn("#2853", body)
+        self.assertIn("none recorded", gate_issue.render_lost_pods_body({"incident": {"prs": []}, "evidence": []}, "x", "y", "z"))
+
+
 class BotFiledTest(unittest.TestCase):
     def test_the_bots_issue_is_known_by_its_body_whatever_token_filed_it(self):
         app_authored = {"number": 12, "state": "open", "user": {"login": "kube-agents-eval-triage[bot]"}, "body": BOT_BODY}

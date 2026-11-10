@@ -680,7 +680,7 @@ class WorkflowTest(unittest.TestCase):
         self.assertNotIn("if", step, "runs every tick, dry when unarmed")
         self.assertLessEqual(step.get("timeout-minutes"), 3)
         self.assertLess(names.index(STEP_NAME), names.index(POST_STEP_NAME))
-        self.assertEqual(step["env"], {"KUBE_AGENTS_ISSUES_REPO": "${{ vars.KUBE_AGENTS_ISSUES_REPO }}", "GH_TOKEN": "${{ steps.issues_token.outputs.token || github.token }}"},
+        self.assertEqual(step["env"], {"KUBE_AGENTS_ISSUES_REPO": "${{ steps.issues_repo.outputs.valid == 'true' && vars.KUBE_AGENTS_ISSUES_REPO || '' }}", "GH_TOKEN": "${{ steps.issues_token.outputs.token || github.token }}"},
                          "the issues repository and its token, the workflow's own when unset (tests/test_ci_health_issues_repo.py)")
         text = textwrap.dedent(WORKFLOW.read_text())
         self.assertNotIn("COVERAGE_GAPS_LIVE", text, "no switch of its own")

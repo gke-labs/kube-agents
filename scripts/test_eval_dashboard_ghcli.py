@@ -22,6 +22,17 @@ class IssuesRepoTest(unittest.TestCase):
         with unittest.mock.patch.dict(os.environ, {ghcli.ISSUES_REPO_ENV: ""}):
             self.assertEqual(importlib.reload(ghcli).DEFAULT_REPO, "gke-labs/kube-agents", "an empty variable is unset")
 
+    def test_a_malformed_value_is_a_warning_and_this_repository(self):
+        for bad in ("kube-agents-eval-triage", "https://github.com/o/r", "o/r/", "o/", "/r", "o/r name"):
+            with unittest.mock.patch.object(ghcli, "log") as log:
+                self.assertEqual(ghcli.issues_repo_setting({ghcli.ISSUES_REPO_ENV: bad}), "gke-labs/kube-agents", bad)
+                self.assertEqual(log.call_count, 1, bad)
+                self.assertIn("is not owner/name", log.call_args[0][0])
+        with unittest.mock.patch.object(ghcli, "log") as log:
+            self.assertEqual(ghcli.issues_repo_setting({ghcli.ISSUES_REPO_ENV: "gke-labs/kube-agents-eval-triage"}), "gke-labs/kube-agents-eval-triage")
+            self.assertEqual(ghcli.issues_repo_setting({}), "gke-labs/kube-agents")
+            log.assert_not_called()
+
     def test_issue_key_reads_both_forms_and_has_issue_matches_across_them(self):
         self.assertEqual(ghcli.issue_key("#1300"), ("gke-labs/kube-agents", 1300))
         self.assertEqual(ghcli.issue_key("https://github.com/gke-labs/kube-agents/issues/1300"), ("gke-labs/kube-agents", 1300))
@@ -47,6 +58,9 @@ class IssuesRepoTest(unittest.TestCase):
                          ("gke-labs/kube-agents", "gke-labs/kube-agents-eval-triage", "gke-labs/kube-agents", "gke-labs/kube-agents"))
         self.assertIsNone(ghcli.issue_tag({"url": "x"}))
         self.assertIsNone(ghcli.issue_tag("#1300"))
+
+    def test_pr_url_is_the_pull_requests_page(self):
+        self.assertEqual(ghcli.pr_url("gke-labs/kube-agents", 2853), "https://github.com/gke-labs/kube-agents/pull/2853")
 
     def test_issue_url_is_the_issues_page(self):
         self.assertEqual(ghcli.issue_url("gke-labs/kube-agents", 1278), "https://github.com/gke-labs/kube-agents/issues/1278")
