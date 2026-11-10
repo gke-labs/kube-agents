@@ -101,6 +101,15 @@
             }
           }
         },
+        "mcpServer": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          }
+        },
         "webhooks": {
           "type": "object",
           "additionalProperties": false,
@@ -431,7 +440,7 @@
               "properties": {
                 "kind": {
                   "type": "string",
-                  "enum": ["", "nightly", "presubmit"]
+                  "enum": ["", "nightly", "nightly-untrusted", "presubmit"]
                 },
                 "project": {
                   "type": "string"
@@ -474,7 +483,7 @@
                 "required": ["kind"],
                 "properties": {
                   "kind": {
-                    "enum": ["nightly", "presubmit"]
+                    "enum": ["nightly", "nightly-untrusted", "presubmit"]
                   }
                 }
               }
@@ -1029,7 +1038,7 @@
                   "items": {
                     "type": "string",
                     "maxLength": 253,
-                    "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+                    "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*|\\*(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)+)$"
                   }
                 }
               }
@@ -1634,6 +1643,9 @@
                 },
                 "mode": {
                   "type": "string"
+                },
+                "answerFeedback": {
+                  "type": "boolean"
                 }
               }
             },

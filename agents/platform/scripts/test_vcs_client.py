@@ -206,6 +206,27 @@ class ForgeCallTest(unittest.TestCase):
         self.assertEqual(caught.exception.revision, "a" * 40)
         self.assertEqual(caught.exception.as_json()["revision"], "a" * 40)
 
+    def test_a_snapshot_over_the_ceiling_keeps_its_entries_and_ceiling(self):
+        entries = [{"path": "clusters", "type": "tree", "manifests": 3, "bytes": 2048}]
+        error = vcs_client.credential_proxy_client.WorkspaceRequestError(
+            "refused",
+            payload={"error": "no", "code": "SNAPSHOT_TOO_LARGE", "entries": entries, "ceiling": 1024},
+        )
+        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:1"}), mock.patch.object(
+            vcs_client.credential_proxy_client, "vcs_call", side_effect=error
+        ):
+            with self.assertRaises(vcs_client.VcsError) as caught:
+                vcs_client.call("snapshot", {})
+        self.assertEqual((entries, 1024), (caught.exception.entries, caught.exception.ceiling))
+        # The listing is for the script that asked, not for the printed refusal.
+        self.assertEqual({"error": "no", "code": "SNAPSHOT_TOO_LARGE"}, caught.exception.as_json())
+
+    def test_a_refusal_without_a_listing_has_no_entries(self):
+        for payload in ({"error": "no"}, {"error": "no", "entries": "x", "ceiling": True}):
+            with self.subTest(payload=payload):
+                error = vcs_client.VcsError("no", entries=payload.get("entries"), ceiling=payload.get("ceiling"))
+                self.assertEqual((None, None), (error.entries, error.ceiling))
+
 
     def test_a_broker_too_old_for_a_verb_is_not_a_broker_that_is_down(self):
         """The shape an old credential-proxy actually answers with.
@@ -1018,7 +1039,8 @@ class SnapshotTest(unittest.TestCase):
         )
         answer = self.snapshot(tar, ref="main", paths=["manifests", "README.md", "link"])
         self.assertEqual(
-            [("snapshot", {"repository": "acme/infra", "ref": "main", "paths": ["manifests", "README.md", "link"]})],
+            [("snapshot", {"repository": "acme/infra", "maxBytes": vcs_client.SNAPSHOT_MAX_UNPACKED_BYTES,
+                           "ref": "main", "paths": ["manifests", "README.md", "link"]})],
             self.sent,
         )
         self.assertEqual("kind: app\n", (self.into / "manifests/app.yaml").read_text())
@@ -1039,6 +1061,19 @@ class SnapshotTest(unittest.TestCase):
 
     def test_no_ref_and_no_paths_send_neither(self):
         self.snapshot(build_tar(regular("a.txt")))
+        self.assertEqual(
+            [("snapshot", {"repository": "acme/infra", "maxBytes": vcs_client.SNAPSHOT_MAX_UNPACKED_BYTES})], self.sent
+        )
+
+    def test_the_unpack_bound_goes_to_the_broker_as_max_bytes(self):
+        # So the broker refuses past it with the entries below, rather than
+        # serving a tree this side would then refuse with none.
+        self.snapshot(build_tar(regular("a.txt")), max_bytes=4096)
+        self.assertEqual([("snapshot", {"repository": "acme/infra", "maxBytes": 4096})], self.sent)
+
+    def test_a_bound_below_zero_stays_on_this_side(self):
+        with self.assertRaises(vcs_client.VcsError):
+            self.snapshot(build_tar(regular("a.txt")), max_bytes=-1)
         self.assertEqual([("snapshot", {"repository": "acme/infra"})], self.sent)
 
     def test_a_destination_that_is_not_empty_is_refused_before_the_call(self):

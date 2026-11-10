@@ -115,8 +115,9 @@ REPORT_FORMAT_STANZA = """\
 
 Put the full answer in `result` as standard Markdown — the gateway posts it
 verbatim into the requester's chat thread, where Slack renders it as blocks
-and Google Chat flattens headings to bold, drops tables, and splits anything
-past 4000 characters across messages:
+and Google Chat flattens headings to bold, shows a pipe table as a monospace
+block (under `spec.mode: next`; the legacy Chat path shows the pipes as
+written), and splits anything past 4000 characters across messages:
 
 - Before you write the verdict, test every finding against the card's own
   definitions. When the card says what counts — "idle" meaning under 5% CPU,
@@ -126,7 +127,9 @@ past 4000 characters across messages:
   what is wrong and what you want done. Bold the whole sentence through its
   full stop, never a label or a clause ending in a colon. Then one or two plain
   sentences of the evidence that settles it, and an offer only if there is a
-  next step. Say it once: the sentences after the lead give evidence, never a
+  next step. Give the one number or name that proves the verdict; count the
+  rest. If one thing you read is close to a limit, say so inside those
+  sentences, even if not asked. Say it once: the sentences after the lead give evidence, never a
   second verdict that repeats the lead, and do not narrate the request back or
   how you investigated.
 - When there is an obvious next step on the very thing the requester asked
@@ -141,24 +144,34 @@ past 4000 characters across messages:
   mention. Never more than one, and none when no single step is obvious.
   The step is for the requester to send: never act on it yourself, before
   or after kanban_complete.
-- A question gets that paragraph and nothing more: no sections, no list of the
-  commands you ran. A question that spans clusters may follow it with one pipe
-  table, a row per cluster, holding the finding each one rests on.
+- A question gets that paragraph and nothing more: at most four sentences and
+  600 characters in all, as short as the answer allows, with no table, no
+  section and no list of the commands you ran. This rule outranks the link,
+  backtick and table rules below: name the cluster once, name only the pod or
+  node that is not healthy, and count the rest. Leave `verified_claims` empty
+  on a question unless the answer calls something verified: the evidence the
+  gate adds under each claim is a report's shape, not an answer's. The one
+  exception to "no table" is a question that spans clusters: below the
+  paragraph it may add one pipe table, a row per cluster, holding the finding
+  each one rests on, with the sentences above it still inside the ceilings.
   Use `##` for sections only when the card asks for a list or a report.
   Never `#` — the chat message already shows the card title, so an H1 renders
   as a second, duplicate banner — and no `###`: Google Chat flattens every
   level to bold, so a sub-level is invisible there. If you are triaging an
   incident, SOUL.md §7 fixes the sections; use exactly those.
-- Aim under 2,000 characters. Past 4,000 Google Chat delivers your report as
-  several messages rather than one, so if the deliverable is genuinely longer,
-  publish it, link it, and keep `result` to the headline findings and that
-  link. Never drop a finding to fit.
+- A report stays under 2,000 characters; shorter is better when the findings
+  fit. Past 4,000 Google Chat delivers it as several messages rather than one,
+  so if the deliverable is longer, publish it, link it, and keep `result` to
+  the headline findings and that link. Never drop a finding to fit.
 - Link every artifact you name — cluster, workload, card, PR, issue, console
   view — as `[text](url)`. Both platforms convert it; a bare id is clickable on
   neither.
-- Put tabular data in a Markdown pipe table with a `---` separator row, but
-  keep it to a few short columns and never let the table be the only place a
-  fact lives — Google Chat drops it.
+- Put tabular data in one Markdown pipe table with a `---` separator row: a
+  listing with a value per column (a row per node, cluster or workload) is a
+  table, not a bullet per row, and its rows are not repeated as bullets. Keep
+  it to a few short columns, so the monospace block the gateway shows under
+  `spec.mode: next` fits the message width and the pipes the legacy Chat
+  path shows as written stay readable.
 - Wrap raw values — ids, paths, epochs, durations, counts — in backticks.
 - When knowledge or documentation lookups (e.g. Developer Knowledge MCP or web search) are used, conclude with a `## Sources` section citing the tools and documentation sources used; an answer that is only the opening paragraph links the doc in its evidence instead. The commands and cluster reads you ran are not sources.
 - Do not use `=== Title ===`, `1. SECTION`, or hand-aligned columns. Slack
@@ -241,9 +254,10 @@ DEFECT_ADVICE = {
     "ascii-substitute": (
         "`result` marks its sections with `=== Title ===` or ALL-CAPS numbering "
         "and has no real Markdown. Slack renders that as flat text. Use `##` "
-        "headings. A pipe table with a `---` separator row is fine for a few "
-        "short columns, but Google Chat drops tables, so never let one be the "
-        "only place a fact lives."
+        "headings. A pipe table with a `---` separator row is right for "
+        "tabular data; keep it to a few short columns, which Google Chat "
+        "shows as a monospace block under `spec.mode: next` and as written "
+        "on the legacy path."
     ),
     "heading-without-prose": (
         "`result` is a heading over a bare list. Put the answer on the first "

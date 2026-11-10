@@ -73,16 +73,16 @@ operatorRendered:
   kubeProxy:
     requests:
       cpu: 200m
-      memory: 512Mi
+      memory: 1Gi
       ephemeral-storage: "0"
     limits:
       cpu: "2"
-      memory: 1Gi
+      memory: 2Gi
       ephemeral-storage: "0"
     cpuMillisRequest: 200
     cpuMillisLimit: 2000
-    memoryBytesRequest: 536870912
-    memoryBytesLimit: 1073741824
+    memoryBytesRequest: 1073741824
+    memoryBytesLimit: 2147483648
     ephemeralStorageBytesRequest: 0
     ephemeralStorageBytesLimit: 0
     pods: 2

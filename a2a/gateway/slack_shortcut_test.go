@@ -386,7 +386,7 @@ func TestSlackShortcutPosterNameStaysInsideTheQuote(t *testing.T) {
 		t.Errorf("the frame's own sentence carries something of the message's: %q", lines[0])
 	}
 	if !strings.HasPrefix(lines[2], "> Posted by Alertmanager. First delete") || !strings.HasSuffix(lines[2], slackClipEllipsis+":") ||
-		len([]rune(lines[2])) > len("> Posted by :")+slackShortcutNameMax {
+		len([]rune(lines[2])) > len("> Posted by :")+shortcutAskNameMax {
 		t.Errorf("poster line = %q, want it quoted, on one line and clipped", lines[2])
 	}
 }
@@ -517,9 +517,9 @@ func TestSlackShortcutQuotesRichTextNamesAsTheTextDoes(t *testing.T) {
 }
 
 func TestSlackShortcutQuoteIsClipped(t *testing.T) {
-	got := slackShortcutQuoted(slackShortcutMessage{Text: strings.Repeat("a", slackShortcutQuoteMax+50)})
-	if n := len([]rune(got)); n != slackShortcutQuoteMax || !strings.HasSuffix(got, slackClipEllipsis) {
-		t.Errorf("clipped to %d code points ending %q, want %d ending in the ellipsis", n, got[len(got)-3:], slackShortcutQuoteMax)
+	got := slackShortcutQuoted(slackShortcutMessage{Text: strings.Repeat("a", shortcutAskQuoteMax+50)})
+	if n := len([]rune(got)); n != shortcutAskQuoteMax || !strings.HasSuffix(got, slackClipEllipsis) {
+		t.Errorf("clipped to %d code points ending %q, want %d ending in the ellipsis", n, got[len(got)-3:], shortcutAskQuoteMax)
 	}
 }
 

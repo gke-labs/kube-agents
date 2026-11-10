@@ -28,14 +28,15 @@ import (
 // Role) and its own task records, which count chat turns, not the kanban
 // cards the script's tasks line counts; the line is labelled for that. No model is in the loop, and the block
 // names no cluster, project, namespace, task or person: the audit below
-// refuses a block that does, outside the model line, which is printed by design.
+// refuses a block that does, outside the model line and the proposals-by-origin
+// line, which are printed by design.
 
 const (
 	usageSummaryTitle = "kube-agents usage & feedback summary"
 	//: The block's line cap. The script's SUMMARY_MAX_LINES differs because each cap
 	//: matches its own block's shape (the script adds the performance figures and
 	//: task rows this block does not carry); nothing holds the two in step, by design.
-	usageSummaryMaxLines = 47
+	usageSummaryMaxLines = 53
 	hoursPerDay          = 24
 	//: The task roll-up's window, as the script's; the gateway clamps it to
 	//: SessionTTL, past which idle records (and their tasks) are deleted.
@@ -87,8 +88,13 @@ const (
 	//: a2aGatewayName); the resource name is what precedes the suffix.
 	a2aGatewayNameSuffix = "-a2a-gateway"
 	platformAgentNameEnv = "PLATFORM_AGENT_NAME"
-	//: The model line's start: the audit runs over the block without this one line.
+	//: The model line's start: the audit runs over the block without this line.
 	usageSummaryModelLinePrefix = "  model: "
+	//: The origin line's start: the audit runs over the block without this
+	//: line, which carries only fixed words and digits.
+	usageSummaryOriginLinePrefix = "  proposals by origin: "
+	//: What precedes the origin's name in its field.
+	usageSummaryOriginFieldPrefix = "proposalsFrom"
 	//: status.inference, the operator's reading of the install's default model.
 	inferenceStatusKey        = "inference"
 	inferenceProviderField    = "provider"
@@ -97,7 +103,77 @@ const (
 	usageNoReading            = "no reading"
 	usageForgeReadingSuffix   = " (as the forge reports)"
 	usageGatewayReadingSuffix = " (as the gateway reports)"
+	usageAgentReadingSuffix   = " (as the agent reports)"
+	//: status.usage.topTools: the operator's reading of the broker's five
+	//: most-invoked tool and subcommand pairs since the broker pod started,
+	//: and the row fields it carries. The script's TOP_TOOLS_* names.
+	usageTopToolsKey         = "topTools"
+	usageTopToolsShown       = 5
+	usageToolField           = "tool"
+	usageToolSubcommandField = "subcommand"
+	usageToolTotalField      = "total"
+	//: A bare tool's subcommand, printed as the tool alone; the pair's
+	//: separator otherwise. The broker's SUBCOMMAND_NONE and the script's NONE.
+	usageToolSubcommandNone = "none"
+	usageToolPairSeparator  = "/"
+	//: The broker's LABEL_OTHER: the tool it refused to run, and a word
+	//: outside a tool's vocabulary; the script's OTHER_BUCKET.
+	usageToolOther = "other"
+	//: The block's label, the script's line verbatim.
+	usageTopToolsLabel = "tools (top 5, since broker start)"
 )
+
+// : The broker's outcome vocabulary in the order a row prints its breakdown:
+// : the script's TOOL_STATUS_ORDER verbatim, and the status row's field names.
+var usageSummaryToolStatusOrder = []string{"success", "error", "blocked", "busy", "abandoned"}
+
+// : The broker's tool vocabulary and, per tool, its subcommand vocabulary:
+// : the script's BROKER_SUBCOMMANDS verbatim (GatewayCopyTest holds the two
+// : equal, and the script's to the broker's). Not a filter: the operator
+// : writes the status from its own copy. It is the block's vocabulary, so
+// : that an install whose spec spells one of these words (a cluster named
+// : "compute") is not refused for a row the broker's counter named.
+var usageSummaryBrokerSubcommands = map[string][]string{
+	"kubectl": {
+		"annotate", "api-resources", "api-versions", "apply", "attach", "auth",
+		"autoscale", "cluster-info", "config", "cordon", "cp", "create", "debug",
+		"delete", "describe", "diff", "drain", "edit", "events", "exec", "explain",
+		"expose", "get", "label", "logs", "patch", "port-forward", "proxy", "replace",
+		"rollout", "run", "scale", "set", "taint", "top", "uncordon", "version", "wait",
+	},
+	"gcloud": {
+		"artifacts", "asset", "auth", "billing", "components", "compute", "config",
+		"container", "iam", "info", "init", "logging", "monitoring", "projects",
+		"resource-manager", "services", "version",
+	},
+	"git": {
+		"add", "am", "apply", "archive", "blame", "branch", "bundle", "cat-file",
+		"checkout", "cherry-pick", "clean", "clone", "commit", "describe", "fetch",
+		"init", "log", "ls-files", "ls-remote", "ls-tree", "merge", "merge-base", "mv",
+		"pull", "push", "rebase", "remote", "reset", "restore", "rev-list", "rev-parse",
+		"revert", "rm", "show", "sparse-checkout", "stash", "status", "submodule",
+		"switch", "symbolic-ref", "tag", "update-ref", "version", "worktree",
+	},
+	"gh": {
+		"api", "auth", "browse", "gist", "issue", "label", "pr", "project", "release",
+		"repo", "run", "search", "secret", "ssh-key", "status", "variable", "version",
+		"workflow",
+	},
+	"feedback": {"submit"},
+}
+
+// : The words of the tools block beyond what the degraded render prints:
+// : the tools (the broker's own "other" included), every subcommand, the
+// : outcomes and the two fallback words. The script's TEMPLATE_EXTRA_TOKENS.
+var usageSummaryToolTokens = func() []string {
+	tokens := []string{usageToolOther, usageToolSubcommandNone}
+	for tool, subcommands := range usageSummaryBrokerSubcommands {
+		tokens = append(tokens, tool)
+		tokens = append(tokens, subcommands...)
+	}
+	tokens = append(tokens, usageSummaryToolStatusOrder...)
+	return tokens
+}()
 
 // : status.usage fields, in the order the block prints them; a missing counter
 // : prints 0, a missing reading (usageSummaryReadings) prints usageNoReading.
@@ -125,6 +201,17 @@ var usageSummaryReadings = map[string]string{
 	"peopleSeen7d":                    usageGatewayReadingSuffix,
 	"peopleSeen30d":                   usageGatewayReadingSuffix,
 }
+
+// : The nine status.usage proposal-origin readings, in the origin table's order
+// : (docs/designs/proposal-origin.md); the block prints them as one line. The
+// : script's USAGE_ORIGIN_FIELDS verbatim.
+var usageSummaryOriginFields = []string{
+	"proposalsFromChat", "proposalsFromConsole", "proposalsFromApi", "proposalsFromEvent", "proposalsFromDrift",
+	"proposalsFromAudit", "proposalsFromScheduled", "proposalsFromIssue", "proposalsFromOther",
+}
+
+// : The lines printed by design, each removed (its first occurrence) before the audit.
+var usageSummaryFixedLinePrefixes = []string{usageSummaryModelLinePrefix, usageSummaryOriginLinePrefix}
 
 // : The environment lines, in the order the block prints them: the script's
 // : ENVIRONMENT_KEYS verbatim.
@@ -178,6 +265,9 @@ var usageSummaryTemplateTokens = func() map[string]bool {
 		for _, tok := range usageSummaryToken.FindAllString(text, -1) {
 			tokens[tok] = true
 		}
+	}
+	for _, tok := range usageSummaryToolTokens {
+		tokens[tok] = true
 	}
 	return tokens
 }()
@@ -369,6 +459,34 @@ func inferenceModelLine(cr map[string]any) string {
 	return provider + inferenceSeparator + model
 }
 
+// usageSummaryOriginLine lists the origins whose reading is above zero in the
+// table's order, "none" when every reading is zero, and "no reading" when the
+// readings are absent. The operator writes all nine or none; a status carrying only
+// some of them, which no operator writes, lists the present non-zero ones and
+// ignores the rest.
+func usageSummaryOriginLine(usage map[string]any) string {
+	var parts []string
+	present := false
+	for _, field := range usageSummaryOriginFields {
+		value, ok := usage[field]
+		if !ok || value == nil {
+			continue
+		}
+		present = true
+		if n := asInt(value); n != 0 {
+			parts = append(parts, fmt.Sprintf("%s %d", strings.ToLower(strings.TrimPrefix(field, usageSummaryOriginFieldPrefix)), n))
+		}
+	}
+	shown := strings.Join(parts, ", ")
+	switch {
+	case !present:
+		shown = usageNoReading
+	case shown == "":
+		shown = usageSummaryNone
+	}
+	return usageSummaryOriginLinePrefix + shown + usageAgentReadingSuffix
+}
+
 // renderUsageSummary is the block: the script's shape, from what the gateway sees.
 func renderUsageSummary(now time.Time, cr map[string]any, serverVersion string, window time.Duration, tasks taskRollup, haveTasks bool) string {
 	usage, _ := nested(cr, "status", "usage").(map[string]any)
@@ -420,6 +538,7 @@ func renderUsageSummary(now time.Time, cr map[string]any, serverVersion string, 
 		}
 		lines = append(lines, fmt.Sprintf("  %s: %s%s", counter, shown, suffix))
 	}
+	lines = append(lines, usageSummaryOriginLine(usage))
 	last := asString(usage["lastActiveTime"])
 	if last == "" {
 		last = usageSummaryNever
@@ -429,6 +548,7 @@ func renderUsageSummary(now time.Time, cr map[string]any, serverVersion string, 
 		lastHuman = usageSummaryNever
 	}
 	lines = append(lines, "  lastActive: "+last, "  lastHumanActive: "+lastHuman)
+	lines = append(lines, renderTopTools(usage)...)
 	lines = append(lines, "performance: "+usageSummaryPerformanceNote)
 	days := windowDays(window)
 	if !haveTasks {
@@ -452,6 +572,48 @@ func renderUsageSummary(now time.Time, cr map[string]any, serverVersion string, 
 	lines = append(lines, usageSummaryFeedbackTemplate...)
 	lines = append(lines, usageSummaryFence)
 	return strings.Join(lines, "\n")
+}
+
+// renderTopTools is the tools block from status.usage.topTools, the script's
+// lines verbatim: the label and unavailable when the status carries no list
+// (the operator has no current reading of the broker, or the served CRD
+// predates the field), the label and none for an empty one, else the label
+// and one row per entry, in the status's order and at most usageTopToolsShown
+// of them: the tool, or tool/subcommand for a subcommand other than none, its
+// total, and in parentheses each outcome the row carries above zero, in
+// usageSummaryToolStatusOrder. The script renders the same list the same way
+// when it falls back to the status.
+func renderTopTools(usage map[string]any) []string {
+	raw, ok := usage[usageTopToolsKey].([]any)
+	if !ok {
+		return []string{usageTopToolsLabel + ": " + usageSummaryUnavailable}
+	}
+	var rows []string
+	for _, item := range raw {
+		entry, ok := item.(map[string]any)
+		if !ok || len(rows) >= usageTopToolsShown {
+			continue
+		}
+		pair := asString(entry[usageToolField])
+		if subcommand := asString(entry[usageToolSubcommandField]); subcommand != usageToolSubcommandNone {
+			pair += usageToolPairSeparator + subcommand
+		}
+		var parts []string
+		for _, status := range usageSummaryToolStatusOrder {
+			if n := asInt(entry[status]); n > 0 {
+				parts = append(parts, fmt.Sprintf("%s %d", status, n))
+			}
+		}
+		line := fmt.Sprintf("  %s: %d", pair, asInt(entry[usageToolTotalField]))
+		if len(parts) > 0 {
+			line += " (" + strings.Join(parts, ", ") + ")"
+		}
+		rows = append(rows, line)
+	}
+	if len(rows) == 0 {
+		return []string{usageTopToolsLabel + ": " + usageSummaryNone}
+	}
+	return append([]string{usageTopToolsLabel + ":"}, rows...)
 }
 
 func stringLeaves(v any, out *[]string) {
@@ -492,18 +654,22 @@ func usageIdentifiers(cr map[string]any) []string {
 	return ids
 }
 
-// usageSummaryWithoutModelLine is the block less its first model line, the one
-// line printed by design: a deployment name can carry a spec identifier as a
-// segment, and the line is never the reason a block is refused. Every other
-// line stays audited.
-func usageSummaryWithoutModelLine(text string) string {
+// usageSummaryWithoutFixedLines is the block less its first model line and its
+// first origin line, the lines printed by design: a deployment name can carry
+// a spec identifier as a segment, and the origin line prints origin words a
+// cluster may be named ("chat", "drift"). Neither line is the reason a block
+// is refused; every other line stays audited.
+func usageSummaryWithoutFixedLines(text string) string {
 	lines := strings.Split(text, "\n")
-	for i, line := range lines {
-		if strings.HasPrefix(line, usageSummaryModelLinePrefix) {
-			return strings.Join(append(lines[:i:i], lines[i+1:]...), "\n")
+	for _, prefix := range usageSummaryFixedLinePrefixes {
+		for i, line := range lines {
+			if strings.HasPrefix(line, prefix) {
+				lines = append(lines[:i:i], lines[i+1:]...)
+				break
+			}
 		}
 	}
-	return text
+	return strings.Join(lines, "\n")
 }
 
 // auditUsageSummary returns the identifiers that appear in text as whole
@@ -551,7 +717,7 @@ func (g *Gateway) feedbackSummary(ctx context.Context, rec *SessionRecord) {
 		g.log.Warn("feedback summary: task records unavailable", "err", err)
 	}
 	text := renderUsageSummary(now, cr, version, window, tasks, haveTasks)
-	if leaked := auditUsageSummary(usageSummaryWithoutModelLine(text), usageIdentifiers(cr)); len(leaked) > 0 {
+	if leaked := auditUsageSummary(usageSummaryWithoutFixedLines(text), usageIdentifiers(cr)); len(leaked) > 0 {
 		g.log.Warn("feedback summary refused: the block named identifiers of the install", "conversation", rec.Key, "count", len(leaked))
 		g.post(rec.Key, usageSummaryRefusedNotice)
 		return

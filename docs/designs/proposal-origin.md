@@ -1,9 +1,11 @@
 # Proposal origin: which feature opened each pull request
 
-**Status:** proposed, 2026-11-03. Workstream 3 of the telemetry epic that asked who starts the
-agent's pull requests. Lands after the second pull request of `human-interaction-readings.md`
-(the readings slot with a target per reading kind) and after `install-model-reading.md` (the
-summary audit that removes a fixed line); it builds on both. Builds on [`usage-counters-producer.md`](usage-counters-producer.md) (the
+**Status:** implemented, 2026-11-04: the first pull request landed the origin record, the
+claim token, the ledger and its series (2.1, 2.2); the second the operator's origins reading, the
+nine fields, their gauges and the summary line (2.3, 2.4). Proposed 2026-11-03. Workstream 3 of the
+telemetry epic that asked who starts the agent's pull requests. It follows the second pull request
+of `human-interaction-readings.md` (the readings slot with a target per reading kind) and
+`install-model-reading.md` (the summary audit that removes a fixed line). Builds on [`usage-counters-producer.md`](usage-counters-producer.md) (the
 status block, its fold rules, its gauges and its zero-PII contract),
 [`proposal-outcome-readings.md`](proposal-outcome-readings.md) (the broker's exact
 `proposal-create` count, which this design leaves alone) and
@@ -192,17 +194,30 @@ what that needs: it treats a process it has not seen as counting from zero and a
 sample, so a durable count served as a counter would be re-added in full on every gateway
 restart or pod roll. So the nine are **readings**, not counters, through the readings slot
 ([`proposal-outcome-readings.md`](proposal-outcome-readings.md) §6) as
-[`human-interaction-readings.md`](human-interaction-readings.md) §2.2 generalises it in its second pull request, a target per reading with the miss rule following the target, which this design depends on: a new reading kind, `origins`, on the chat plugin's target, present when all nine origins
-resolved from the body (the listener serves every origin's series, zero included, so the kind
-needs no age series, like the `people` kind), one miss per poll without them, cleared after
-two, the largest reading across pods, and its own pruning record ("the nine origin readings"),
-so a served CRD that predates them keeps the rest of the block landing.
+[`human-interaction-readings.md`](human-interaction-readings.md) §2.2 generalises it in its second pull request, a target per reading with the miss rule following the target, which this design depends on: a new reading kind, `origins`, on the chat plugin's target (its metrics listener, read on the pod
+that runs the gateway), present when all nine origins resolved from the body, each on at least
+one sample and summed over `platform` (the listener serves every origin's series, zero included,
+from its first ledger read), and the body carries `kubeagents_proposals_opened_read_age_seconds`,
+the seconds since the plugin's last successful ledger read, not above two poll intervals; one miss
+per poll without them, cleared after two, the largest reading across the bodies read, and its own
+pruning record ("the nine origin readings"), so a served CRD that predates them keeps the rest of
+the block landing. Presence does
+not prove freshness by itself: a failed ledger read still serves the last counts, which is why the
+plugin serves the read age and the presence rule requires it fresh, so stale counts clear like a
+miss two polls after its read age passes two poll intervals, about twenty minutes after the
+ledger stops answering.
 
 The fields, named like the block's other readings: `proposalsFromChat`,
 `proposalsFromConsole`, `proposalsFromApi`, `proposalsFromEvent`, `proposalsFromDrift`,
 `proposalsFromAudit`, `proposalsFromScheduled`, `proposalsFromIssue`, `proposalsFromOther`. Each
-is a pointer field: a 0 is a reading; absent until the first reading and while the served CRD
-predates it. They move neither `lastActiveTime` nor `lastHumanActiveTime`, as readings do not.
+is a pointer field: a 0 is a reading; absent until the first reading, after two polls in a row
+without one, and while the served CRD predates it. They move neither `lastActiveTime` nor `lastHumanActiveTime`, as readings do not.
+A ledger read that fails after the plugin's first success keeps serving the last counts, and the
+read age grows with each failed read. Once the age passes two poll intervals the poll is a miss,
+so the fields clear two polls later, as for any miss. A body with the counts and no age series, from a
+plugin older than the operator, keeps the old rule and is present: an agent image can be pinned apart
+from the operator, and nine fields absent with no cause would be worse than counts the plugin still
+vouches for.
 Each gets a row in the per-field gauge `kubeagents_platformagent_usage{field=...}`, so a shared
 Prometheus reads the split with one `sum by (field)`.
 
@@ -210,19 +225,21 @@ Prometheus reads the split with one `sum by (field)`.
 
 ### 2.4 The summary
 
-Both summary copies print one line after the proposal readings:
+Both summary copies print one line after the readings, before `lastActive`:
 `  proposals by origin: chat 3, event 1, audit 2 (as the agent reports)`, listing the origins
 whose reading is above zero in the table's order, `none` when every reading is zero, and
-`no reading` when they are absent. One line rather than nine reads as the answer to one
-question. The script's full block is at its forty-line cap today, and the people readings' pull request
-adds its own rows first, so both copies' caps rise by one from wherever that pull request leaves
-them, said in the commit body. The nine field names are a list pinned between the copies by the
-existing copy test, beside the counters and the readings. The privacy audit removes this line
-before it checks the block, the removal
+`no reading` when none is present. One line rather than nine reads as the answer to one
+question. Each copy's line cap rises by one: the script's `SUMMARY_MAX_LINES` from 43 to 44, the
+gateway's `usageSummaryMaxLines` from 41 to 42. The nine field names are a list pinned between the
+copies by the existing copy test, beside the counters and the readings. The privacy audit removes
+this line before it checks the block, the removal
 [`install-model-reading.md`](install-model-reading.md) §2.2 adds for the model line and this
-design depends on: the line carries only fixed text (its label, the nine origin words, `none`, `no reading`, the
-suffix) and digits, so nothing on it can leak, and a cluster or project named `chat` or `drift`
-is still refused anywhere else in the block.
+design depends on: the line carries only fixed text (its label, the nine origin words, `none`,
+`no reading`, the suffix) and digits, so nothing on it can leak. Its label and suffix join each
+copy's own vocabulary, which the audit never refuses. An identifier spelled like an origin word is
+still refused on every other line, except where that word is already the copy's own: the gateway's
+block prints `chat turns`, so the gateway never refuses `chat` on any line, while the script
+refuses it everywhere but the two removed lines.
 
 ### 2.5 Trust and privacy
 
@@ -263,10 +280,12 @@ holds as it stands.
   record line in every process (the forge check moves to the broker); the origin resolution in
   the order of §2.2; the ledger write.
 - **Chat metrics plugin** (`agents/chat/defaults/plugins/chat_metrics/metrics.py`): the
-  `kubeagents_proposals_opened{origin,platform}` gauge family, read from the ledger at scrape.
+  `kubeagents_proposals_opened{origin,platform}` gauge family, read from the ledger at scrape,
+  and `kubeagents_proposals_opened_read_age_seconds`, the seconds since the last successful read.
 - **Operator** (`usage_counters_scrape.go`, `usage_counters_poller.go`, `usage_gauges.go`,
   `common_types.go`, the CRD copies): the `origins` reading kind on the chat target, nine
-  specs, nine pointer fields, one pruning record, nine gauge rows.
+  specs, nine pointer fields, one pruning record, nine gauge rows, and the presence rule's
+  fresh-age requirement on `kubeagents_proposals_opened_read_age_seconds`.
 - **Summary** (`feedback_summary.py`, `a2a/gateway/feedback_summary.go`): the one line, the
   pinned field list, the audit's removal of the line, the caps.
 - **Docs**: the observability page (nine rows, the gauge, the one-line answer to "who started
@@ -292,7 +311,7 @@ A deterministic guard in the sense of `.agents/rules/eval_driven_development.md`
 record, a verified ledger, a reading and a status field, with no model call in any path. The one text the model sees change is a machine record line it already reads today, from which the hook now strips an opaque token field; no prompt, instruction, tool text or
 skill text changes, and a worker's output has the line removed exactly as today. Unit tests cover every origin's resolution, the inheritance through a
 card, a child card and a continuation, the `other` fallback, the ledger's once-per-url rule, the
-reading's presence rule and the summary line.
+reading's presence rule (the nine counts beside a fresh read age) and the summary line.
 
 ## 6. Left to the builder
 

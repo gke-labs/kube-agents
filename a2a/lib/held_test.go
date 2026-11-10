@@ -480,6 +480,57 @@ func TestSubscribeHeldWaitsForTheOperatorToCreateTheDurable(t *testing.T) {
 	}
 }
 
+// A caller's deadline that fires during a look-up, after the server has
+// answered an earlier attempt with a missing durable, ends the bind on an
+// error that carries both: the dispatcher's regrant reads a bare deadline as
+// a refused grant and reconnects again, where a missing durable is left to
+// the bind retries.
+func TestSubscribeHeldKeepsTheAnswerWhenTheDeadlineCutsARetryShort(t *testing.T) {
+	h, worker := newHeldHarness(t, "cutshort")
+	ctx, cancel := context.WithCancel(h.ctx)
+	defer cancel()
+	beforeBindAttempt = func(attempt int) {
+		if attempt == 2 {
+			cancel()
+		}
+	}
+	t.Cleanup(func() { beforeBindAttempt = nil })
+
+	_, err := worker.SubscribeHeld(ctx, h.cfg(), func(context.Context, Delivery) {})
+	if err == nil {
+		t.Fatal("SubscribeHeld on a durable nobody created = nil, want an error")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("SubscribeHeld = %v, want it to carry the context's error", err)
+	}
+	if !errors.Is(err, jetstream.ErrConsumerNotFound) {
+		t.Errorf("SubscribeHeld = %v, want it to carry the server's last answer, ErrConsumerNotFound", err)
+	}
+}
+
+// The pass-through: a bind whose first attempt is already cut short was
+// never answered, so it ends on the context's error alone, without a
+// consumer verdict the server never gave.
+func TestSubscribeHeldCutShortBeforeAnyAnswerReturnsTheContextError(t *testing.T) {
+	h, worker := newHeldHarness(t, "cutfirst")
+	ctx, cancel := context.WithCancel(h.ctx)
+	defer cancel()
+	beforeBindAttempt = func(attempt int) {
+		if attempt == 1 {
+			cancel()
+		}
+	}
+	t.Cleanup(func() { beforeBindAttempt = nil })
+
+	_, err := worker.SubscribeHeld(ctx, h.cfg(), func(context.Context, Delivery) {})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("SubscribeHeld on a cancelled context = %v, want the context's error", err)
+	}
+	if errors.Is(err, jetstream.ErrConsumerNotFound) {
+		t.Errorf("SubscribeHeld = %v, carries a consumer verdict the server never gave", err)
+	}
+}
+
 // The bind-only grant set is enough, and nothing more is needed: a worker
 // whose user may only look up the durable, fetch from it and ack binds, takes
 // a task and acks it, and cannot create a consumer. This is the grant the

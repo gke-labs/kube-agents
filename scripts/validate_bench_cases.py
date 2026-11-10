@@ -290,6 +290,15 @@ KNOWN_UNREGISTERED = {
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
 # later pull request that moves the case to the nightly file.
 FIXTURE_NOT_READY = {
+    # Needs a Standard seeded cluster with a manual node pool labelled for a
+    # ComputeClass whose auto-creation is off: the lane's Autopilot hosts
+    # refuse the shape, so it is a fleet fixture addressed by role, and
+    # #5143 plants it. #4943 is the sibling ComputeClass gap on the same
+    # host constraint.
+    "ccc-manual-pools-single-rule-unbacked": (
+        "#5143: needs a Standard seeded cluster with a manual node pool under a ComputeClass "
+        "whose auto-creation is off; the lane's host clusters are Autopilot"
+    ),
     # Needs Config Sync's RootSync CRD and one root-sync object reporting
     # Stalled=True on a seeded cluster. No pool project enables the GKE Hub
     # API, so Config Sync is installed nowhere, and the seeded fleet plants no
@@ -343,11 +352,6 @@ FIXTURE_NOT_READY = {
         "pool (the readiness-lb-drain-timeout role) applied to every pool project (fleet "
         "re-apply); no pool project has a backend service draining longer than the 600 s "
         "GKE waits per node"
-    ),
-    "networking-world-open-ingress": (
-        "#2682: bench/tf/fleet's world_open firewall rule and VM are applied; the "
-        "un-park cites a fixture-state scan that reads the world-open-ingress role "
-        "healthy on every pool project"
     ),
     "b-0011-gitops": (
         "#1307: the GitOps fix-cycle pilot; needs a leaderboard GitOps repository "
@@ -433,21 +437,14 @@ FIXTURE_NOT_READY = {
         "registers it, so the context check fails with the repository absent, "
         "which is broken rather than red"
     ),
-    "gce-startup-script-failure": (
-        "#2483: bench/tf/fleet's startup_fail VM is applied; the un-park cites a "
-        "fixture-state scan that reads the startup-fail-vm role healthy on every "
-        "pool project"
-    ),
-    "gce-chat-request-runs-collector": (
-        "#2483: bench/tf/fleet's startup_fail VM is applied, as for "
-        "gce-startup-script-failure; the un-park cites a fixture-state scan that "
-        "reads the startup-fail-vm role healthy on every pool project"
-    ),
-    "obtainability-pdb-kustomize-overlay": (
-        "#2686: bench/tf/prebuilt/kustomize-overlay-declaration plants the "
-        "Kustomize root for each run with the write token hack/ci-eval-pr.sh "
-        "mints for a stack that declares bench_gitops_write_token_file; the "
-        "un-park cites one pool run that shows the plant and the teardown work"
+    "remediation-context-repository-owns-the-fix": (
+        "#5213: needs the three-part fixture its fixture/README.md describes in each "
+        "pool install: a context repository holding the payments chart, registered "
+        "in context_repos at a pinned ref (the registration #4243 also waits for), "
+        "the clusters/<cluster>/demo-shop/payments/ HelmRelease directory on the "
+        "GitOps repository, and the rendered workload on the agent host; no pool "
+        "install carries them, so the objective fails with the chart repository "
+        "absent, which is broken rather than red"
     ),
     "obtainability-untargeted-compute-class-manifest": (
         "#2540: needs a ComputeClass cluster without default ComputeClass and with "
@@ -666,6 +663,12 @@ COMPOUND_TYPES = frozenset({"sequence", "parallel", "all", "any", "none"})
 #: The property checks whose `value` the upstream verifier compares raw, so
 #: a quoted boolean never equals the API's boolean.
 RESOURCE_PROPERTY_TYPES = frozenset({"resource_property", "fleet_resource_property"})
+# `ledger_issue_contains` under `scope: finding` reads the findings of the
+# check(s) `finding_check` names; the verifier's model refuses one without the
+# other, which in the lane is after the cluster lease.
+LEDGER_CHECK_TYPE = "ledger_issue_contains"
+LEDGER_FINDING_SCOPE = "finding"
+LEDGER_FINDING_CHECK_FIELD = "finding_check"
 EQUALITY_OPS = frozenset({"eq", "ne"})
 QUOTED_BOOLEANS = frozenset({"true", "false"})
 #: The (parent segment, field) pairs the Kubernetes and GKE APIs serve as
@@ -1107,6 +1110,28 @@ def _check_assertions(node: Any, where: str, problems: list[str]) -> None:
             f"{where}: check '{node_type}' populates none of "
             f"{list(fields)}, so it can only pass"
         )
+
+    # The same two rules the verifier's model applies after the cluster lease:
+    # the scope needs its check, a name or a list of names; the field is
+    # refused, blank or not, under any other scope.
+    if node_type == LEDGER_CHECK_TYPE:
+        scoped = node.get("scope") == LEDGER_FINDING_SCOPE
+        check_names = node.get(LEDGER_FINDING_CHECK_FIELD)
+        names = check_names if isinstance(check_names, list) else [check_names]
+        named = check_names is not None and all(isinstance(n, str) for n in names) and any(
+            n.strip() for n in names if isinstance(n, str)
+        )
+        if scoped and not named:
+            problems.append(
+                f"{where}: check '{node_type}' under scope '{LEDGER_FINDING_SCOPE}' "
+                f"names no '{LEDGER_FINDING_CHECK_FIELD}' (a check name, or a list of them), "
+                "the check whose findings it reads"
+            )
+        elif check_names is not None and not scoped:
+            problems.append(
+                f"{where}: check '{node_type}' sets '{LEDGER_FINDING_CHECK_FIELD}', "
+                f"which is read only under scope '{LEDGER_FINDING_SCOPE}'"
+            )
 
     # A quoted boolean against a boolean field never compares equal: the
     # verifier compares the value raw and the API holds a bool, so the check

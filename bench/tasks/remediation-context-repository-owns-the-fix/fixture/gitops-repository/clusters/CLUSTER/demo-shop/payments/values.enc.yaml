@@ -1,0 +1,30 @@
+# SOPS-encrypted. Edit with `sops values.enc.yaml` on a workstation that holds
+# the environment's PGP key, never by hand.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: payments-values
+  namespace: demo-shop
+type: Opaque
+stringData:
+  values.yaml: ENC[AES256_GCM,data:Qm9ndXMgZml4dHVyZSBjaXBoZXJ0ZXh0IGZvciBhIGJlbmNoIGNhc2UsIG5vdCBhIHJlYWwgc2VjcmV0Lg==,iv:ZmFrZS1pdi1mb3ItYS1iZW5jaC1maXh0dXJlLW9ubHk=,tag:bm90LWEtcmVhbC1hdXRoLXRhZw==,type:str]
+sops:
+  kms: []
+  gcp_kms: []
+  azure_kv: []
+  hc_vault: []
+  age: []
+  lastmodified: "2026-10-02T09:14:31Z"
+  mac: ENC[AES256_GCM,data:bm90LWEtcmVhbC1tYWMtZm9yLWEtYmVuY2gtZml4dHVyZQ==,iv:YW5vdGhlci1mYWtlLWl2LWZvci10aGUtbWFj,tag:bm90LWEtcmVhbC1tYWMtdGFn,type:str]
+  pgp:
+    - created_at: "2026-10-02T09:14:31Z"
+      enc: |
+        -----BEGIN PGP MESSAGE-----
+
+        hQEMA0JvZ3VzRml4dHVyZQEIAJvdCBhIHJlYWwgUEdQIG1lc3NhZ2U6IHRoaXMgYmxv
+        Y2sgaXMgZmlsbGVyIHNvIHRoZSBmaXh0dXJlIGxvb2tzIGxpa2UgYSBTT1BTIGZpbGUu
+        =AbCd
+        -----END PGP MESSAGE-----
+      fp: 7A1D4F09C3B2E8156D0A9F4C2B7E1D3A5C8F0B21
+  encrypted_regex: ^(data|stringData)$
+  version: 3.9.1

@@ -21,6 +21,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -179,6 +181,12 @@ func TestPodUsageSource_CountsTheWatchersClusterGauge(t *testing.T) {
 	if reading.Clusters == nil || reading.Clusters.Registered != 3 || reading.Clusters.Monitored != 2 {
 		t.Fatalf("clusters = %+v, want 3 registered and 2 monitored", reading.Clusters)
 	}
+	// The series' labels ride along as the triples, in body order, for the
+	// ScopeUndeclared condition.
+	wantRefs := []usageClusterRef{{Name: "a", Project: "p", Location: "l"}, {Name: "b", Project: "p", Location: "l"}, {Name: "c", Project: "p", Location: "l2"}}
+	if !slices.Equal(reading.Clusters.Refs, wantRefs) {
+		t.Fatalf("cluster refs = %+v, want %+v", reading.Clusters.Refs, wantRefs)
+	}
 
 	empty := serveBody(t, http.StatusOK, "# TYPE k8s_event_watcher_events_injected_total counter\n")
 	reading, err = newPodUsageSource().Scrape(context.Background(), empty, []string{usageCounterEventsIngested}, nil)
@@ -301,6 +309,10 @@ func TestPodUsageSource_ReadsTheBrokersReadings(t *testing.T) {
 		`kubeagents_vcs_readings_age_seconds{reading="details"} 340.000`,
 		"# TYPE kubeagents_vcs_readings_failures_total counter",
 		`kubeagents_vcs_readings_failures_total{reason="forge"} 3`,
+		// The chat plugin's ledger age, stale, which the broker's readings
+		// do not read.
+		"# TYPE kubeagents_proposals_opened_read_age_seconds gauge",
+		"kubeagents_proposals_opened_read_age_seconds 99999",
 		"# TYPE process_start_time_seconds gauge",
 		"process_start_time_seconds 1759400000.25",
 		"",
@@ -596,6 +608,11 @@ func TestPodUsageSource_ReadsTheSessionsFamiliesIntoTheChatSessions(t *testing.T
 	if reading.Samples[usageCounterChatMessagesInbound] != 9 || reading.Samples[usageCounterSessionsChat] != 3 || reading.Samples[usageCounterChatTurnsErrored] != 3 || reading.Samples[usageCounterBackgroundTasksGaveUp] != 2 || reading.Samples[usageCounterNegativeFeedback] != 2 {
 		t.Fatalf("chat samples = %v, want 9 messages, 3 sessions, 3 turns errored, 2 cards given up and 2 thumbs-downs", reading.Samples)
 	}
+	// The reaction hook counts no thumbs-up, so the chat listener is not
+	// asked for the positive counter.
+	if _, asked := reading.Samples[usageCounterPositiveFeedback]; asked {
+		t.Fatalf("the chat listener was asked for the thumbs-ups it never serves: %v", reading.Samples)
+	}
 	a2a := strings.Join([]string{
 		"# TYPE kubeagents_a2a_gateway_messages_inbound_total counter",
 		`kubeagents_a2a_gateway_messages_inbound_total{platform="discord"} 5`,
@@ -609,6 +626,11 @@ func TestPodUsageSource_ReadsTheSessionsFamiliesIntoTheChatSessions(t *testing.T
 		`kubeagents_a2a_gateway_task_terminals_total{state="failed",source="supervisor"} 1`,
 		`kubeagents_a2a_gateway_task_terminals_total{state="rejected",source="gateway"} 1`,
 		`kubeagents_a2a_gateway_task_terminals_total{state="canceled",source="gateway"} 4`,
+		"# TYPE kubeagents_a2a_gateway_answer_feedback_total counter",
+		`kubeagents_a2a_gateway_answer_feedback_total{platform="slack",rating="up"} 6`,
+		`kubeagents_a2a_gateway_answer_feedback_total{platform="slack",rating="down"} 2`,
+		`kubeagents_a2a_gateway_answer_feedback_total{platform="other",rating="down"} 1`,
+		`kubeagents_a2a_gateway_answer_feedback_total{platform="slack",rating="other"} 3`,
 		"",
 	}, "\n")
 	reading, err = newPodUsageSource().Scrape(context.Background(), serveBody(t, http.StatusOK, a2a), usageA2AChatCounters, nil)
@@ -624,10 +646,11 @@ func TestPodUsageSource_ReadsTheSessionsFamiliesIntoTheChatSessions(t *testing.T
 	if _, asked := reading.Samples[usageCounterBackgroundTasksGaveUp]; asked {
 		t.Fatalf("the A2A gateway was asked for the board's counter it never serves: %v", reading.Samples)
 	}
-	// The A2A gateway carries no reactions, so its target is not asked for the
-	// feedback counter: no sample, no idle baseline entry, no field in its Warning.
-	if _, asked := reading.Samples[usageCounterNegativeFeedback]; asked {
-		t.Fatalf("the A2A gateway was asked for the feedback counter it never serves: %v", reading.Samples)
+	// The answer ratings are the feedback counters' family on this pod: down
+	// into the thumbs-downs, up into the thumbs-ups, each over every
+	// platform; a rating outside the two counts into neither.
+	if reading.Samples[usageCounterNegativeFeedback] != 3 || reading.Samples[usageCounterPositiveFeedback] != 6 {
+		t.Fatalf("a2a samples = %v, want 3 thumbs-downs (2 + 1) and 6 thumbs-ups", reading.Samples)
 	}
 	if reading.Samples[usageCounterChatMessagesInbound] != 5 || reading.Samples[usageCounterSessionsChat] != 5 {
 		t.Fatalf("A2A samples = %v, want 5 messages and 5 sessions", reading.Samples)
@@ -1025,5 +1048,287 @@ func TestPodUsageSource_ASingleSampleReadingTakesTheLargestOfARepeatedLabelSet(t
 		if got := reading.Readings[field]; got != want {
 			t.Errorf("%s = %d, want %d", field, got, want)
 		}
+	}
+}
+
+// The broker's tool counter is also read by tool and subcommand into the
+// top-tools table, under the closed vocabularies: a listed pair under its own
+// words summed over the statuses the row carries, a bare tool under none, a
+// subcommand outside its tool's vocabulary (and any word under the broker's
+// other tool) under other, a sample whose tool or status is not in the
+// vocabulary left out, and the same samples still summed into the two
+// counters. A body not asked for the reading carries no table.
+func TestPodUsageSource_ReadsTheBrokersToolPairs(t *testing.T) {
+	body := strings.Join([]string{
+		"# TYPE kubeagents_tool_invocations_total counter",
+		`kubeagents_tool_invocations_total{status="success",subcommand="get",tool="kubectl"} 14500`,
+		`kubeagents_tool_invocations_total{status="error",subcommand="get",tool="kubectl"} 400`,
+		`kubeagents_tool_invocations_total{status="blocked",subcommand="delete",tool="kubectl"} 12`,
+		`kubeagents_tool_invocations_total{status="busy",subcommand="delete",tool="kubectl"} 2`,
+		`kubeagents_tool_invocations_total{status="abandoned",subcommand="delete",tool="kubectl"} 1`,
+		`kubeagents_tool_invocations_total{status="success",subcommand="none",tool="feedback"} 5`,
+		`kubeagents_tool_invocations_total{status="success",subcommand="prod-eu-1",tool="gcloud"} 7`,
+		`kubeagents_tool_invocations_total{status="success",subcommand="other",tool="gcloud"} 3`,
+		`kubeagents_tool_invocations_total{status="success",subcommand="other",tool="other"} 9`,
+		`kubeagents_tool_invocations_total{status="success",subcommand="get",tool="acme-cli"} 100`,
+		`kubeagents_tool_invocations_total{status="exploded",subcommand="get",tool="kubectl"} 100`,
+		`kubeagents_tool_invocations_total{status="success",tool="git"} 2`,
+		"# TYPE process_start_time_seconds gauge",
+		"process_start_time_seconds 1759400000.25",
+		"",
+	}, "\n")
+	addr := serveBody(t, http.StatusOK, body)
+	reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageBrokerCounters, []usageReadingKind{usageReadingOutcomes, usageReadingDetails, usageReadingTopTools})
+	if err != nil {
+		t.Fatalf("Scrape: %v", err)
+	}
+	want := map[usageToolPair]usageToolCounts{
+		{Tool: "kubectl", Subcommand: "get"}:    {"success": 14500, "error": 400},
+		{Tool: "kubectl", Subcommand: "delete"}: {"blocked": 12, "busy": 2, "abandoned": 1},
+		{Tool: "feedback", Subcommand: "none"}:  {"success": 5},
+		{Tool: "gcloud", Subcommand: "other"}:   {"success": 10},
+		{Tool: "other", Subcommand: "other"}:    {"success": 9},
+		{Tool: "git", Subcommand: "none"}:       {"success": 2},
+	}
+	if len(reading.ToolPairs) != len(want) {
+		t.Fatalf("pairs = %v, want %v", reading.ToolPairs, want)
+	}
+	for pair, counts := range want {
+		got := reading.ToolPairs[pair]
+		if len(got) != len(counts) {
+			t.Errorf("%v = %v, want %v", pair, got, counts)
+			continue
+		}
+		for status, n := range counts {
+			if got[status] != n {
+				t.Errorf("%v %s = %d, want %d", pair, status, got[status], n)
+			}
+		}
+	}
+	if !reading.ReadingsPresent[usageReadingTopTools] {
+		t.Errorf("present = %v, want the top tools present", reading.ReadingsPresent)
+	}
+	if reading.ReadingsPresent[usageReadingOutcomes] {
+		t.Errorf("present = %v, want no outcomes reading from a body without the age series", reading.ReadingsPresent)
+	}
+	// The same lines still feed the counters, the unlisted tool and status
+	// included: the counters' filter is the status alone.
+	if got := reading.Samples[usageCounterToolExecutions]; got != 15026 {
+		t.Errorf("toolExecutionsTotal = %d, want 15026", got)
+	}
+	if got := reading.Samples[usageCounterToolExecutionsBlocked]; got != 15 {
+		t.Errorf("toolExecutionsBlockedTotal = %d, want 15", got)
+	}
+
+	plain, err := newPodUsageSource().Scrape(context.Background(), addr, usageBrokerCounters, []usageReadingKind{usageReadingOutcomes, usageReadingDetails})
+	if err != nil {
+		t.Fatalf("Scrape without the reading: %v", err)
+	}
+	if plain.ToolPairs != nil || plain.ReadingsPresent[usageReadingTopTools] {
+		t.Errorf("a body not asked for the top tools carried %v (present %v)", plain.ToolPairs, plain.ReadingsPresent[usageReadingTopTools])
+	}
+}
+
+// A broker that has run nothing serves the family with no sample, or not at
+// all: the reading is present and the table empty, which the poll projects as
+// an absent field, not as a miss.
+func TestPodUsageSource_AnIdleBrokerCarriesAnEmptyToolTable(t *testing.T) {
+	addr := serveBody(t, http.StatusOK, "# TYPE kubeagents_tool_invocations_total counter\n# TYPE process_start_time_seconds gauge\nprocess_start_time_seconds 1759400000.25\n")
+	reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageBrokerCounters, []usageReadingKind{usageReadingTopTools})
+	if err != nil {
+		t.Fatalf("Scrape: %v", err)
+	}
+	if !reading.ReadingsPresent[usageReadingTopTools] {
+		t.Fatalf("present = %v, want the top tools present on an idle broker", reading.ReadingsPresent)
+	}
+	if reading.ToolPairs == nil || len(reading.ToolPairs) != 0 {
+		t.Fatalf("pairs = %v, want an empty table", reading.ToolPairs)
+	}
+}
+
+// The vocabulary the fold reads the tool counter under is closed on every
+// label: the tools are the broker's, the status order is the two status sets
+// together, and the broker's other tool lists no subcommand.
+func TestToolInvocationsVocabularyIsClosed(t *testing.T) {
+	statuses := map[string]bool{}
+	for _, status := range toolInvocationsStatusOrder {
+		statuses[status] = true
+	}
+	for status := range toolInvocationsCountedStatuses {
+		if !statuses[status] {
+			t.Errorf("counted status %s is not in the status order", status)
+		}
+	}
+	for status := range toolInvocationsRefusedStatuses {
+		if !statuses[status] {
+			t.Errorf("refused status %s is not in the status order", status)
+		}
+	}
+	if len(statuses) != len(toolInvocationsCountedStatuses)+len(toolInvocationsRefusedStatuses) {
+		t.Errorf("status order %v is not the two sets together", toolInvocationsStatusOrder)
+	}
+	if subcommands, ok := toolInvocationsSubcommands[toolLabelOther]; !ok || len(subcommands) != 0 {
+		t.Errorf("the other tool lists %v, want an empty vocabulary", subcommands)
+	}
+	for tool, subcommands := range toolInvocationsSubcommands {
+		if slices.Contains(subcommands, toolSubcommandNone) || slices.Contains(subcommands, toolLabelOther) {
+			t.Errorf("%s lists a fallback word among its subcommands: %v", tool, subcommands)
+		}
+	}
+}
+
+// usageOriginsAge is the ledger read age line the chat plugin serves beside
+// its rows, at age seconds.
+func usageOriginsAge(age string) []string {
+	return []string{
+		"# TYPE kubeagents_proposals_opened_read_age_seconds gauge",
+		"kubeagents_proposals_opened_read_age_seconds " + age,
+	}
+}
+
+// usageOriginsFresh is the nine origins' rows with a fresh read age.
+func usageOriginsFresh(rows ...string) []string {
+	return append(slices.Clone(rows), usageOriginsAge("0.000")...)
+}
+
+// usageOriginsBody is the chat metrics listener's text exposition: the chat
+// counters' families and the start time, with the proposals ledger's rows
+// appended.
+func usageOriginsBody(rows ...string) string {
+	lines := []string{
+		"# TYPE kubeagents_chat_messages_inbound_total counter",
+		`kubeagents_chat_messages_inbound_total{platform="googlechat"} 9`,
+		"# TYPE kubeagents_chat_sessions_total counter",
+		`kubeagents_chat_sessions_total{platform="googlechat"} 2`,
+		"# TYPE process_start_time_seconds gauge",
+		"process_start_time_seconds 1759400000.25",
+	}
+	if len(rows) > 0 {
+		lines = append(lines, "# TYPE kubeagents_proposals_opened gauge")
+		lines = append(lines, rows...)
+	}
+	return strings.Join(append(lines, ""), "\n")
+}
+
+// usageOriginsRows is one ledger row per origin, chat split over two
+// platforms, every other origin under the empty platform, and a row for an
+// origin outside the nine, which resolves no field.
+var usageOriginsRows = []string{
+	`kubeagents_proposals_opened{origin="chat",platform="googlechat"} 4`,
+	`kubeagents_proposals_opened{origin="chat",platform="slack"} 3`,
+	`kubeagents_proposals_opened{origin="console",platform=""} 1`,
+	`kubeagents_proposals_opened{origin="robot",platform=""} 40`,
+	`kubeagents_proposals_opened{origin="api",platform=""} 0`,
+	`kubeagents_proposals_opened{origin="event",platform=""} 5`,
+	`kubeagents_proposals_opened{origin="drift",platform=""} 2`,
+	`kubeagents_proposals_opened{origin="audit",platform=""} 6`,
+	`kubeagents_proposals_opened{origin="scheduled",platform=""} 8`,
+	`kubeagents_proposals_opened{origin="issue",platform=""} 9`,
+	`kubeagents_proposals_opened{origin="other",platform=""} 10`,
+}
+
+// The chat listener's ledger series lands in the nine origin fields, chat
+// summed over its platforms, a zero as a zero, an unknown origin ignored, and
+// marks the origins reading present beside a read age of 0. The chat
+// counters read beside it are the body's, as without it.
+func TestPodUsageSource_ReadsTheNineOriginReadingsFromTheChatBody(t *testing.T) {
+	addr := serveBody(t, http.StatusOK, usageOriginsBody(usageOriginsFresh(usageOriginsRows...)...))
+	reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageChatCounters, []usageReadingKind{usageReadingOrigins})
+	if err != nil {
+		t.Fatalf("Scrape: %v", err)
+	}
+	want := map[string]int64{
+		"proposalsFromChat": 7, "proposalsFromConsole": 1, "proposalsFromApi": 0,
+		"proposalsFromEvent": 5, "proposalsFromDrift": 2, "proposalsFromAudit": 6,
+		"proposalsFromScheduled": 8, "proposalsFromIssue": 9, "proposalsFromOther": 10,
+	}
+	if len(reading.Readings) != len(want) {
+		t.Fatalf("readings = %v, want %v", reading.Readings, want)
+	}
+	for field, value := range want {
+		if got, ok := reading.Readings[field]; !ok || got != value {
+			t.Errorf("%s = %d (present %v), want %d", field, got, ok, value)
+		}
+	}
+	if !reading.ReadingsPresent[usageReadingOrigins] || len(reading.ReadingsPresent) != 1 {
+		t.Errorf("present = %v, want the origins reading alone", reading.ReadingsPresent)
+	}
+	if reading.Samples[usageCounterChatMessagesInbound] != 9 || reading.Samples[usageCounterSessionsChat] != 2 {
+		t.Errorf("chat samples = %v, want 9 messages and 2 sessions", reading.Samples)
+	}
+	if reading.StartTime == nil || *reading.StartTime != 1759400000.25 {
+		t.Errorf("start time = %v, want the listener's", reading.StartTime)
+	}
+}
+
+// The listener serves no ledger family before its first ledger read, and a
+// row per origin after; a body missing an origin, or without the family, is
+// no origins reading, and an origin outside the nine resolves no field. Each
+// body but the first carries a fresh read age, so the origins alone decide.
+func TestPodUsageSource_AMissingOriginIsNotPresent(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		rows []string
+	}{
+		{"no ledger family", nil},
+		{"the other origin missing", usageOriginsFresh(usageOriginsRows[:len(usageOriginsRows)-1]...)},
+		{"the chat origin missing", usageOriginsFresh(usageOriginsRows[2:]...)},
+		{"an unknown origin in place of other", usageOriginsFresh(append(slices.Clone(usageOriginsRows[:len(usageOriginsRows)-1]), `kubeagents_proposals_opened{origin="robot",platform=""} 10`)...)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			addr := serveBody(t, http.StatusOK, usageOriginsBody(tc.rows...))
+			reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageChatCounters, []usageReadingKind{usageReadingOrigins})
+			if err != nil {
+				t.Fatalf("Scrape: %v", err)
+			}
+			if reading.ReadingsPresent[usageReadingOrigins] || len(reading.Readings) != 0 {
+				t.Errorf("present %v, readings %v; want no origins reading", reading.ReadingsPresent, reading.Readings)
+			}
+			if reading.Samples[usageCounterChatMessagesInbound] != 9 {
+				t.Errorf("chat samples = %v, want the counters read beside it", reading.Samples)
+			}
+		})
+	}
+}
+
+// The origins reading is present only beside a read age at or below
+// proposalsReadAgeLimit: the plugin keeps serving its last counts while its
+// ledger reads fail, and a plugin from before the age serves the counts with
+// no age at all. The age alone, with no counts, is no reading either.
+func TestPodUsageSource_TheOriginsReadingNeedsAFreshReadAge(t *testing.T) {
+	limit := strconv.FormatFloat(proposalsReadAgeLimit.Seconds(), 'f', 3, 64)
+	if limit != "600.000" {
+		t.Fatalf("the limit is %s seconds, want two five-minute poll intervals", limit)
+	}
+	for _, tc := range []struct {
+		name    string
+		rows    []string
+		present bool
+	}{
+		{"an age at the limit", append(slices.Clone(usageOriginsRows), usageOriginsAge(limit)...), true},
+		{"an age past the limit", append(slices.Clone(usageOriginsRows), usageOriginsAge("600.001")...), false},
+		{"a repeated age, one sample past the limit", append(append(slices.Clone(usageOriginsRows), usageOriginsAge("600.001")...), usageOriginsAge("0.000")[1]), false},
+		{"the counts with no age series keep the old rule", usageOriginsRows, true},
+		{"the age series with no counts", usageOriginsAge("0.000"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			addr := serveBody(t, http.StatusOK, usageOriginsBody(tc.rows...))
+			reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageChatCounters, []usageReadingKind{usageReadingOrigins})
+			if err != nil {
+				t.Fatalf("Scrape: %v", err)
+			}
+			if got := reading.ReadingsPresent[usageReadingOrigins]; got != tc.present {
+				t.Fatalf("present = %v, want %v (readings %v)", got, tc.present, reading.Readings)
+			}
+			if tc.present && (len(reading.Readings) != 9 || reading.Readings[usageExportProposalsFromChat] != 7) {
+				t.Errorf("readings = %v, want the nine origins, chat 7", reading.Readings)
+			}
+			if !tc.present && len(reading.Readings) != 0 {
+				t.Errorf("readings = %v, want none", reading.Readings)
+			}
+			if reading.Samples[usageCounterChatMessagesInbound] != 9 {
+				t.Errorf("chat samples = %v, want the counters read beside it", reading.Samples)
+			}
+		})
 	}
 }

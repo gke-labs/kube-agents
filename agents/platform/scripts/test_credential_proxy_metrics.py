@@ -386,7 +386,6 @@ def _budgeted_executor(case, admits, metrics, max_output_bytes=1024):
     )
     limit = (
         credential_proxy.BROKER_RESIDENT_RESERVE_BYTES
-        + credential_proxy.CONTENT_WORKSPACE_RESERVE_BYTES
         + admits * per_request
     )
     floor = min(admits, credential_proxy.BUDGET_MINIMUM_ADMITTED_REQUESTS)
@@ -880,10 +879,9 @@ class BrokerFailureCountingTest(_BrokerFixture):
             ("/v1/chat/post", "502", None),
             ("/v1/chat/api/x", "500", None),
             ("/v1/chat/a2a/events", "502", None),
-            ("/v1/workspace/lease", "500", "other_failed"),
             ("/v1/feedback/report", "502", "other_failed"),
             ("/no/such/route", "500", "other_failed"),
-            ("/v1/workspace/lease", "404", None),
+            ("/no/such/route", "404", None),
         ]
         for path, status, want in cases:
             with self.subTest(path=path, status=status):
@@ -1686,7 +1684,6 @@ class LabelDerivationTest(unittest.TestCase):
             "/v1/watcher/gcp/pubsub.googleapis.com/v1/projects/p/subscriptions/s:pull": "/v1/watcher/gcp",
             "/v1/pubsub/gcp/pubsub.googleapis.com/v1/projects/p/subscriptions/s:pull": "/v1/pubsub/gcp",
             "/v1/vcs/push": "/v1/vcs",
-            "/v1/workspace/acquire": "/v1/workspace",
             "/v1/forge/refresh": "/v1/forge",
             "/healthz": "/healthz",
             "/metrics": "other",
@@ -1876,11 +1873,9 @@ class PolicyReadCoverageTest(unittest.TestCase):
         self.assertFalse(vocabulary & command_policy._GCLOUD_RELEASE_TRACKS, "a release track is never a label")
 
     def test_every_git_verb_a_gate_reads_labels_as_itself(self):
-        # The lease gate's list and the workspace's list are the vocabulary's
+        # The lease gate's list and the vcs door's list are the vocabulary's
         # sources, so a verb either refuses or runs under its own name.
-        import content_workspace
-
-        verbs = (credential_proxy.GIT_MUTATING_SUBCOMMANDS | content_workspace.WORKSPACE_GIT_SUBCOMMANDS
+        verbs = (credential_proxy.GIT_MUTATING_SUBCOMMANDS
                  | credential_proxy.VCS_GIT_SUBCOMMANDS | credential_proxy.GIT_READ_SUBCOMMANDS)
         for verb in sorted(verbs):
             with self.subTest(verb=verb):

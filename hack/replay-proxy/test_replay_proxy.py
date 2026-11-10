@@ -43,6 +43,8 @@ class FakeLiteLLM(BaseHTTPRequestHandler):
     calls = []
     fallbacks = "0"
     model_group = "model-default"
+    # More response headers, on every answer (a test sets and resets them).
+    extra_headers = {}
     # "normal", "stall_reset" (one chunk, a pause, then a TCP reset),
     # "early_close" (two chunks, then the connection closes without the last
     # chunk), "short_body" (a non-streamed answer cut short of its
@@ -79,12 +81,15 @@ class FakeLiteLLM(BaseHTTPRequestHandler):
         task = body["messages"][-1]["content"].split()[-1]
         # A fixed value, not the request's `model`: a response header is never
         # built from request data, even in this fake.
-        headers = {"x-litellm-model-group": self.model_group, "x-litellm-attempted-fallbacks": self.fallbacks}
+        headers = {"x-litellm-model-group": self.model_group, "x-litellm-attempted-fallbacks": self.fallbacks,
+                   **self.extra_headers}
         if not body.get("stream") and self.custom_body is not None:
             data = self.custom_body
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
+            for key, value in self.extra_headers.items():
+                self.send_header(key, value)
             self.end_headers()
             self.wfile.write(data)
             return
@@ -185,6 +190,30 @@ class ProxyTestCase(unittest.TestCase):
     # Set to a subdirectory name to write segment files there (REPLAY_LOG_DIR).
     log_subdir = None
     data_max_bytes = replay_proxy.DEFAULT_DATA_MAX_BYTES
+    mode = "shadow"
+
+    def config(self, **overrides):
+        values = dict(
+            listen_port=0, upstream_host="127.0.0.1", upstream_port=self.upstream.server_address[1],
+            store_dir=self.store, redactor_path=self.redactor_path, transcript_rules_path=RULES,
+            upstream_timeout_seconds=self.upstream_timeout,
+            litellm_config_checksum="abc123", litellm_image="ghcr.io/berriai/litellm:v1",
+            job_kind="presubmit", job_project="pool-1", job_build="42", job_pr="4700",
+            mode=self.mode, cache_dir=self.cache_dir,
+            log_dir=self.log_dir, data_max_bytes=self.data_max_bytes,
+        )
+        values.update(overrides)
+        return replay_proxy.Config(**values)
+
+    def start_proxy(self, **overrides):
+        """Another proxy on the same upstream; returns (proxy, port, output)."""
+        out = io.StringIO()
+        server = replay_proxy.make_server(self.config(**overrides), host="127.0.0.1", out=out)
+        self.addCleanup(server.proxy.close)
+        threading.Thread(target=server.serve_forever, args=(POLL_SECONDS,), daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server.proxy, server.server_address[1], out
 
     def setUp(self):
         FakeLiteLLM.calls = []
@@ -201,17 +230,10 @@ class ProxyTestCase(unittest.TestCase):
             self.store = os.path.join(temp, "a-file")  # no directory can be made under a file
             with open(self.store, "w"):
                 pass
+        self.cache_dir = os.path.join(temp, "cache")
         self.out = io.StringIO()
         self.log_dir = os.path.join(temp, self.log_subdir) if self.log_subdir else replay_proxy.UNSET
-        config = replay_proxy.Config(
-            listen_port=0, upstream_host="127.0.0.1", upstream_port=self.upstream.server_address[1],
-            store_dir=self.store, redactor_path=self.redactor_path, transcript_rules_path=RULES,
-            upstream_timeout_seconds=self.upstream_timeout,
-            model_behaviour_checksum="abc123", litellm_image="ghcr.io/berriai/litellm:v1",
-            job_kind="presubmit", job_project="pool-1", job_build="42", job_pr="4700",
-            log_dir=self.log_dir, data_max_bytes=self.data_max_bytes,
-        )
-        self.server = replay_proxy.make_server(config, host="127.0.0.1", out=self.out)
+        self.server = replay_proxy.make_server(self.config(), host="127.0.0.1", out=self.out)
         self.proxy = self.server.proxy
         # Registered first, so it runs last: after a test's own cleanups have
         # released anything holding the worker.
@@ -225,8 +247,8 @@ class ProxyTestCase(unittest.TestCase):
         self.server.server_close()
         self.upstream.server_close()
 
-    def request(self, method, path, body=None):
-        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=LOG_WAIT_SECONDS)
+    def request(self, method, path, body=None, port=None):
+        conn = http.client.HTTPConnection("127.0.0.1", port or self.port, timeout=LOG_WAIT_SECONDS)
         data = json.dumps(body).encode() if isinstance(body, dict) else body
         conn.request(method, path, body=data, headers={"Content-Type": "application/json"} if data else {})
         resp = conn.getresponse()
@@ -238,14 +260,15 @@ class ProxyTestCase(unittest.TestCase):
         conn.close()
         return resp.status, headers, payload
 
-    def lines(self, count):
+    def lines(self, count, out=None):
+        out = out or self.out
         deadline = time.monotonic() + LOG_WAIT_SECONDS
         while time.monotonic() < deadline:
-            lines = [json.loads(l) for l in self.out.getvalue().splitlines() if l]
+            lines = [json.loads(l) for l in out.getvalue().splitlines() if l]
             if len(lines) >= count:
                 return lines
             time.sleep(POLL_SECONDS)
-        self.fail(f"expected {count} log lines, got: {self.out.getvalue()!r}")
+        self.fail(f"expected {count} log lines, got: {out.getvalue()!r}")
 
 
 class PassThroughTest(ProxyTestCase):
@@ -736,7 +759,7 @@ class LogLineTest(ProxyTestCase):
         self.assertEqual(line["roles"], ["system", "user"])
         self.assertEqual(line["litellm_model_group"], "model-default")
         self.assertEqual(line["litellm_attempted_fallbacks"], "0")
-        self.assertEqual(line["model_behaviour_checksum"], "abc123")
+        self.assertEqual(line["litellm_config_checksum"], "abc123")
         self.assertEqual(line["litellm_image"], "ghcr.io/berriai/litellm:v1")
         self.assertIsInstance(line["latency_ms"], int)
         self.assertTrue(line["answer_hash"])
@@ -800,12 +823,32 @@ class LogLineTest(ProxyTestCase):
         plain = {"role": "assistant", "content": "notes written"}
         self.assertNotIn("repeats_swapped_date", replay_proxy.unstorable_reasons(body, 200, plain, headers, mapping, scrubber))
 
+    def test_an_identifier_holding_the_prompt_date_is_not_a_repeated_date(self):
+        # The date guard reads the answer after the swap: a session id is served
+        # with this run's value, so the date inside it doesn't repeat the day.
+        session = "20261104_002640_791a68"
+        body = {"model": "model-default", "messages": [
+            {"role": "system", "content": "Conversation started: Wednesday, November 04, 2026 (UTC, UTC+00:00)"},
+            {"role": "user", "content": f"resume ~/.hermes/sessions/{session}/"}]}
+        mapping = replay_proxy.normalizer.normalize_request(body, time.time()).mapping
+        scrubber = replay_proxy.request_store.Scrubber(REDACTOR, RULES)
+        headers = {"x-litellm-model-group": "model-default", "x-litellm-attempted-fallbacks": "0"}
+        answer = {"role": "assistant", "content": f"Reading ~/.hermes/sessions/{session}/state.json"}
+        self.assertTrue(mapping.answer_repeats_date(answer["content"]), "the raw text does name the day")
+        self.assertEqual(replay_proxy.unstorable_reasons(body, 200, answer, headers, mapping, scrubber), [])
+
     def test_fallback_answer_is_marked_unstorable(self):
         FakeLiteLLM.fallbacks = "1"
         self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=False))
         line = self.lines(1)[0]
         self.assertEqual(line["litellm_attempted_fallbacks"], "1")
         self.assertIn("fallback_attempted", line["unstorable"])
+
+    def test_an_answer_from_another_model_group_is_marked_unstorable(self):
+        FakeLiteLLM.model_group = "model-backup"
+        self.addCleanup(setattr, FakeLiteLLM, "model_group", "model-default")
+        self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=False))
+        self.assertIn("answered_by_other_model_group", self.lines(1)[0]["unstorable"])
 
     def test_scrubbed_text_is_stored(self):
         self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=False))
@@ -838,14 +881,83 @@ class FailClosedProxyTest(ProxyTestCase):
 class ConfigTest(unittest.TestCase):
     def test_from_env(self):
         config = replay_proxy.Config.from_env({
-            "REPLAY_UPSTREAM_HOST": "up", "REPLAY_UPSTREAM_PORT": "4000", "REPLAY_MODEL_BEHAVIOUR_CHECKSUM": "c",
+            "REPLAY_UPSTREAM_HOST": "up", "REPLAY_UPSTREAM_PORT": "4000", "REPLAY_LITELLM_CONFIG_CHECKSUM": "c",
             "REPLAY_LITELLM_IMAGE": "img", "REPLAY_STORE_DIR": "/s", "REPLAY_JOB_KIND": "nightly",
         })
         self.assertEqual((config.upstream_host, config.upstream_port), ("up", 4000))
-        self.assertEqual((config.model_behaviour_checksum, config.litellm_image, config.store_dir), ("c", "img", "/s"))
+        self.assertEqual((config.litellm_config_checksum, config.litellm_image, config.store_dir), ("c", "img", "/s"))
         self.assertEqual(config.job_kind, "nightly")
         self.assertGreaterEqual(replay_proxy.Config.from_env({}).upstream_timeout_seconds, 600)
 
+
+class LiteLLMAccountingTest(ProxyTestCase):
+    """Reasoning and cache-write tokens, the real model, LiteLLM's retries and its cost."""
+
+    MODEL_NAME = "vertex_ai/gemini-3.1-pro-preview"
+
+    def answer_with(self, headers, usage=None, stream=False):
+        FakeLiteLLM.extra_headers = headers
+        self.addCleanup(setattr, FakeLiteLLM, "extra_headers", {})
+        if usage is not None:
+            message = {"role": "assistant", "content": "ok"}
+            if stream:
+                FakeLiteLLM.custom_body = sse(json.dumps(
+                    {"choices": [{"index": 0, "delta": message, "finish_reason": "stop"}], "usage": usage}))
+            else:
+                FakeLiteLLM.custom_body = json.dumps(
+                    {"choices": [{"index": 0, "message": message}], "usage": usage}).encode()
+        self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=stream))
+        return self.lines(1)[0]
+
+    def test_non_streamed_reads_the_headers_and_the_usage_details(self):
+        line = self.answer_with(
+            {"x-litellm-model-name": self.MODEL_NAME, "x-litellm-attempted-retries": "2",
+             "x-litellm-response-cost": "0.0123"},
+            usage={"prompt_tokens": 600, "completion_tokens": 59, "cache_creation_input_tokens": 40,
+                   "completion_tokens_details": {"reasoning_tokens": 57, "text_tokens": 2}},
+        )
+        self.assertEqual(line["litellm_model_name"], self.MODEL_NAME)
+        self.assertEqual(line["litellm_attempted_retries"], 2)
+        self.assertEqual(line["litellm_cost_usd"], 0.0123)
+        self.assertEqual((line["reasoning_tokens"], line["cache_write_tokens"]), (57, 40))
+
+    def test_usage_cost_wins_over_the_header(self):
+        line = self.answer_with({"x-litellm-response-cost": "0.5"},
+                                usage={"prompt_tokens": 6, "completion_tokens": 1, "cost": 0.25})
+        self.assertEqual(line["litellm_cost_usd"], 0.25)
+
+    def test_a_streams_zero_cost_header_is_not_a_cost(self):
+        line = self.answer_with({"x-litellm-model-name": self.MODEL_NAME, "x-litellm-attempted-retries": "0",
+                                 "x-litellm-response-cost": "0.0"}, stream=True)
+        self.assertIsNone(line["litellm_cost_usd"])
+        self.assertEqual(line["litellm_model_name"], self.MODEL_NAME)
+        self.assertEqual(line["litellm_attempted_retries"], 0)
+        self.assertEqual(line["prompt_tokens"], 2000)
+
+    def test_a_streams_final_usage_carries_the_cost(self):
+        line = self.answer_with(
+            {"x-litellm-response-cost": "0.0"},
+            usage={"prompt_tokens": 6, "completion_tokens": 61, "cost": 0.000744,
+                   "completion_tokens_details": {"reasoning_tokens": 61, "text_tokens": 0}},
+            stream=True,
+        )
+        self.assertEqual(line["litellm_cost_usd"], 0.000744)
+        self.assertEqual(line["reasoning_tokens"], 61)
+
+    def test_absent_or_unreadable_values_are_null_or_as_sent(self):
+        line = self.answer_with({"x-litellm-attempted-retries": "two", "x-litellm-response-cost": "free"})
+        self.assertEqual(line["litellm_attempted_retries"], "two")
+        self.assertIsNone(line["litellm_cost_usd"])
+        for name in ("litellm_model_name", "reasoning_tokens", "cache_write_tokens"):
+            self.assertIsNone(line[name], name)
+
+    def test_cost_helpers(self):
+        self.assertIsNone(replay_proxy.litellm_cost({"cost": True}, {}, streamed=False))
+        self.assertIsNone(replay_proxy.litellm_cost({"cost": -1}, {}, streamed=False))
+        self.assertIsNone(replay_proxy.litellm_cost(None, {"x-litellm-response-cost": "nan"}, streamed=False))
+        self.assertEqual(replay_proxy.litellm_cost(None, {"x-litellm-response-cost": "0.0"}, streamed=False), 0.0)
+        self.assertIsNone(replay_proxy.litellm_cost(None, {"x-litellm-response-cost": "0.3"}, streamed=True))
+        self.assertEqual(replay_proxy.attempted_retries({}), None)
 
 
 class ShutdownTest(unittest.TestCase):

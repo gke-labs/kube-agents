@@ -935,14 +935,15 @@ github_app_id         = "12"
 
 The composition declares the github forge at `gitops_host` in `spec.integration.forges`, with the owner as its namespace and `caBundleRef` from `github_ca_secret_name`, and no `github` alias. The chart points the minter at `https://<host>/api/v3` and mounts the CA. In this order:
 
-1. **Create the Cloud KMS key and import the App's private key.** The minter is not Ready until the key holds an `ENABLED` version, and the apply waits for every Deployment, so import the key before the apply. Use the composition's default names and the cluster's region (for a zonal cluster, the region that contains the zone). The import calls only Cloud KMS.
+1. **Create the Cloud KMS key and import the App's private key.** The minter is not Ready until the key holds an `ENABLED` version, and the apply waits for every Deployment, so import the key before the apply. Use the composition's default names and the cluster's region (for a zonal cluster, the region that contains the zone). The labels name this install as the key's owner: `make tf-apply` adopts a key it doesn't hold only when they do. The import calls only Cloud KMS.
 
    ```bash
    gcloud services enable cloudkms.googleapis.com --project=PROJECT_ID
    gcloud kms keyrings create github-token-minter-keyring --location=REGION --project=PROJECT_ID
    gcloud kms keys create github-token-minter-key --keyring=github-token-minter-keyring --location=REGION \
      --purpose=asymmetric-signing --default-algorithm=rsa-sign-pkcs1-2048-sha256 \
-     --import-only --skip-initial-version-creation --protection-level=software --project=PROJECT_ID
+     --import-only --skip-initial-version-creation --protection-level=software \
+     --labels=kube-agents-cluster=CLUSTER_NAME,kube-agents-namespace=kubeagents-system --project=PROJECT_ID
    git clone --depth 1 --branch v2.7.1 https://github.com/abcxyz/github-token-minter.git ~/minty
    (cd ~/minty && go run ./cmd/minty tools import-pk -project-id=PROJECT_ID -location=REGION \
      -key-ring=github-token-minter-keyring -key=github-token-minter-key -private-key=@/path/to/app.pem)
@@ -1207,13 +1208,16 @@ at nothing and the policies silently inert:
 # the chart, which checks the version itself, this apply will fail there.
 kubectl apply -f config/admission/agent-rbac-policy.yaml
 kubectl apply -f config/admission/a2a-gateway-pod-policy.yaml
+kubectl apply -f config/admission/a2a-dispatcher-job-policy.yaml
 ```
 
 [Method 1](#method-1-the-install-engine--terraform--helm) gets these from the chart and needs no
 such step. Skipping it here leaves agent RBAC without its admission backstop, and leaves the
 pods the A2A gateway creates under `spec.mode: next` free to run as any ServiceAccount in the
 namespace. The operator on this path does not get the chart's `A2A_GATEWAY_POD_POLICY` signal, so
-an operator feature that needs the second policy stays off. Read each file's header for what the
+an operator feature that needs the second policy stays off. Likewise `A2A_DISPATCHER_JOB_POLICY`:
+without it the operator runs no dispatcher Job mode, and unattended profile tasks have no worker
+and are refused at admission (`no-worker`); set it on the operator only once the third policy is applied. Read each file's header for what the
 policies do and do not enforce — notably, the agent-RBAC policies cannot check the rules of a role
 that a binding merely _references_.
 
@@ -1659,7 +1663,7 @@ On Google Chat the gateway posts a status line for every task ([what a task look
      ```bash
      kubectl logs -n kubeagents-system deploy/platform-agent-a2a-gateway | grep -E 'chat.notify|notify'
      ```
-     `notify refused` with `not a live conversation with that context` means the gateway has no session record for the conversation the report named, the record carries another context, or the record could not be read (logged first as `notify: session record unreadable`).
+     `notify refused` with `not a live conversation with that context` means the gateway has no session record for the conversation the report named, the record carries another context, or the record doesn't decode (logged first as `notify: session record unreadable`). A record that couldn't be read in time gets `the conversation's record couldn't be read in time; not posted` instead, which the sender retries.
   2. The bridge recorded where the conversation is. If it could not, it logs `conversation route not recorded; a card this task files cannot report back`, and the answer itself ends `(If this turn filed a card, its answer cannot be posted back to this conversation: the conversation's route could not be recorded.)`.
      ```bash
      kubectl logs -n kubeagents-system deploy/platform-agent-gateway -c hermes-bridge | grep 'conversation route'

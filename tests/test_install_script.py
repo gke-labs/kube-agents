@@ -126,6 +126,175 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         )
         return _run_installer_bash(setup, full_env, cwd=cwd or _REPO_ROOT)
 
+    # apply_minter_name_defaults (#3504): a name the operator gave wins; the
+    # rest come from minter_name_defaults, stubbed here to known values.
+    _MINTER_STUB = "minter_name_defaults() { printf 'derived-ring|derived-key|derived-gsa\\n'; }"
+    _MINTER_SHOW = 'echo "ring=$PARAM_KMS_KEYRING key=$PARAM_KMS_KEY gsa=$GITHUB_MINTER_GSA_NAME"'
+
+    def _apply_minter_names(self, env=None):
+        return self._run_install_func(
+            f"{self._MINTER_STUB}; apply_minter_name_defaults test-project ka-today-1; {self._MINTER_SHOW}", env=env)
+
+    def test_a_new_install_naming_nothing_gets_the_per_install_names(self):
+        proc = self._apply_minter_names()
+        self.assertIn("ring=derived-ring key=derived-key gsa=derived-gsa", proc.stdout, proc.stderr)
+
+    def test_minter_names_the_operator_gave_are_kept(self):
+        """install.env or the environment naming them: never replaced, so an
+        install that recorded its names keeps them."""
+        proc = self._apply_minter_names(env={
+            "KMS_KEYRING": "github-token-minter-keyring",
+            "KMS_KEY": "github-token-minter-key",
+            "GITHUB_MINTER_GSA_NAME": "kubeagents-github-minter-gsa",
+        })
+        self.assertIn("ring=github-token-minter-keyring key=github-token-minter-key gsa=kubeagents-github-minter-gsa",
+                      proc.stdout, proc.stderr)
+
+    def test_a_partly_named_minter_keeps_what_was_named(self):
+        proc = self._apply_minter_names(env={"KMS_KEYRING": "my-ring"})
+        self.assertIn("ring=my-ring key=derived-key gsa=derived-gsa", proc.stdout, proc.stderr)
+
+    # confirm_minter_key_owner (#3504), with the state read and the owner read stubbed.
+    def _confirm_owner(self, owner, owner_rc=0, state_names="", env=None, answer=None):
+        script = (
+            f"tf_state_minter_names() {{ printf '{state_names}'; }}; "
+            f"minter_key_owner() {{ printf '%s' '{owner}'; return {owner_rc}; }}; "
+            + ("has_controlling_tty() { return 0; }; PARAM_NON_INTERACTIVE=false; "
+               f"prompt_read() {{ printf -v \"$2\" '%s' '{answer}'; }}; " if answer is not None else
+               "PARAM_NON_INTERACTIVE=true; ")
+            # In an `if`, as the call site's `|| exit 1` is: install.sh's ERR trap
+            # would otherwise abort the shell on the refusal's return 1.
+            + 'if confirm_minter_key_owner ring key us-central1 p cluster-b; then rc=0; else rc=1; fi; '
+            + 'echo "rc=$rc shared=${MINTER_SHARED_KEY:-} adopt=${MINTER_ADOPT_KEY:-}"'
+        )
+        return self._run_install_func(script, env=env)
+
+    def test_this_installs_own_key_needs_no_question(self):
+        proc = self._confirm_owner("cluster-b/kubeagents-system")
+        self.assertIn("rc=0 shared=", proc.stdout, proc.stderr)
+
+    def test_another_installs_key_is_refused_without_a_terminal(self):
+        proc = self._confirm_owner("cluster-a/kubeagents-system")
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("belongs to install cluster-a/kubeagents-system", proc.stdout + proc.stderr)
+
+    def test_an_unlabelled_key_is_refused_without_a_terminal(self):
+        proc = self._confirm_owner("")
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("carries no owner labels", proc.stdout + proc.stderr)
+
+    def test_a_yes_at_the_terminal_shares_exactly_that_key(self):
+        proc = self._confirm_owner("cluster-a/kubeagents-system", answer="y")
+        self.assertIn("rc=0 shared=ring/key", proc.stdout, proc.stderr)
+
+    def test_a_no_at_the_terminal_stops_the_install(self):
+        proc = self._confirm_owner("", answer="n")
+        self.assertIn("rc=1 shared=", proc.stdout, proc.stderr)
+
+    def test_a_key_already_in_this_state_needs_no_question(self):
+        proc = self._confirm_owner("cluster-a/kubeagents-system", state_names="ring|key|gsa")
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+
+    def test_an_unlabelled_key_named_explicitly_is_adopted_as_this_installs_own(self):
+        """Naming the key is a choice, not the silent default adoption: adopted, and labelled at the apply."""
+        proc = self._confirm_owner("", env={"KMS_KEYRING": "ring", "KMS_KEY": "key"})
+        self.assertIn("rc=0 shared= adopt=ring/key", proc.stdout, proc.stderr)
+
+    def test_labels_win_over_an_explicit_name(self):
+        proc = self._confirm_owner("cluster-a/kubeagents-system", env={"KMS_KEYRING": "ring", "KMS_KEY": "key"})
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertNotIn("adopt=ring/key", proc.stdout)
+
+    def test_half_a_name_is_not_an_explicit_choice(self):
+        proc = self._confirm_owner("", env={"KMS_KEYRING": "ring"})
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+
+    def test_an_environment_rebuild_adopts_its_own_unlabelled_key(self):
+        """rc and nightly: uninstall, then install.sh -y with the names in the environment.
+
+        provision_environment.sh exports the project-wide names it gets from
+        minter_environment_names.sh. The state holds no minter after the
+        uninstall, and the key has no labels from before them; named explicitly
+        in the environment, it is adopted.
+        """
+        proc = self._run_install_func(
+            "tf_state_minter_names() { printf '||'; }; "
+            "minter_key_owner() { return 0; }; PARAM_NON_INTERACTIVE=true; "
+            'if confirm_minter_key_owner "$KMS_KEYRING" "$KMS_KEY" us-central1 p cluster-b; then rc=0; else rc=1; fi; '
+            'echo "rc=$rc adopt=${MINTER_ADOPT_KEY:-}"',
+            env={"KMS_KEYRING": "github-token-minter-keyring", "KMS_KEY": "github-token-minter-key",
+                 "GITHUB_APP_ID": "12345"})
+        self.assertIn("rc=0 adopt=github-token-minter-keyring/github-token-minter-key", proc.stdout, proc.stderr)
+
+    def _minter_names_given(self, file_text, env=None):
+        install_env = self._empty_install_env.parent / "minter-given.env"
+        install_env.write_text(file_text)
+        return self._run_install_func(
+            'echo "ring_given=$PARAM_KMS_KEYRING_GIVEN key_given=$PARAM_KMS_KEY_GIVEN"',
+            env={"KUBE_AGENTS_INSTALL_ENV": str(install_env), **(env or {})})
+
+    def test_an_old_install_env_s_default_names_are_not_an_explicit_choice(self):
+        """Written before per-install names, with no minter: turning one on must not adopt the shared default key."""
+        proc = self._minter_names_given(
+            "PROJECT_ID=p\nKMS_KEYRING=github-token-minter-keyring\nKMS_KEY=github-token-minter-key\n")
+        self.assertIn("ring_given=false key_given=false", proc.stdout, proc.stderr)
+
+    def test_with_no_defaults_file_a_recorded_name_waits_for_them(self):
+        """A first curl | bash run has no install.defaults.env yet: a name the file records fails closed, not open."""
+        script = ('minter_name_given my-ring "" true && echo given || echo not-given; '
+                  'minter_name_given github-token-minter-keyring "" true && echo given || echo not-given; '
+                  'minter_name_given my-ring "" false && echo given || echo not-given')
+        proc = self._run_install_func(script)
+        self.assertEqual(proc.stdout.split()[-3:], ["not-given", "not-given", "given"], proc.stderr)
+
+    def test_names_the_file_records_are_settled_once_the_defaults_load(self):
+        """curl | bash from outside the checkout: no defaults at source time, so the first reading failed closed."""
+        script = ('PARAM_KMS_KEYRING=my-ring PARAM_KMS_KEY=my-key PARAM_KMS_KEYRING_GIVEN=false PARAM_KMS_KEY_GIVEN=false '
+                  'INSTALL_ENV_RECORDS_KMS_KEYRING=true INSTALL_ENV_RECORDS_KMS_KEY=true INSTALL_ENV_RECORDS_GITHUB_APP=false; '
+                  'settle_minter_names_given; '
+                  'echo "ring_given=$PARAM_KMS_KEYRING_GIVEN key_given=$PARAM_KMS_KEY_GIVEN"; '
+                  'PARAM_KMS_KEYRING=github-token-minter-keyring PARAM_KMS_KEYRING_GIVEN=false; '
+                  'settle_minter_names_given; echo "default_given=$PARAM_KMS_KEYRING_GIVEN"')
+        proc = self._run_install_func(script)
+        self.assertIn("ring_given=true key_given=true", proc.stdout, proc.stderr)
+        # The old project-wide default from the file still isn't a choice.
+        self.assertIn("default_given=false", proc.stdout, proc.stderr)
+        # And resolve_shared_defaults settles them before it fills the defaults in.
+        text = _INSTALL_SH.read_text()
+        body = text[text.index("resolve_shared_defaults() {"):]
+        self.assertLess(body.index("settle_minter_names_given"),
+                        body.index('PARAM_KMS_KEYRING="${PARAM_KMS_KEYRING:-$DEFAULT_KMS_KEYRING}"'))
+
+    def test_a_recorded_app_does_not_make_the_file_s_default_names_a_choice(self):
+        """An older install turning the minter on by adding GITHUB_APP_ID to its install.env by hand."""
+        proc = self._minter_names_given(
+            "GITHUB_APP_ID=12345\nKMS_KEYRING=github-token-minter-keyring\nKMS_KEY=github-token-minter-key\n")
+        self.assertIn("ring_given=false key_given=false", proc.stdout, proc.stderr)
+
+    def test_names_of_its_own_or_from_the_environment_are_explicit(self):
+        proc = self._minter_names_given("KMS_KEYRING=my-ring\nKMS_KEY=my-key\n")
+        self.assertIn("ring_given=true key_given=true", proc.stdout, proc.stderr)
+        # An environment rebuild names the defaults in the environment, not the file.
+        proc = self._minter_names_given(
+            "PROJECT_ID=p\n", env={"KMS_KEYRING": "github-token-minter-keyring", "KMS_KEY": "github-token-minter-key"})
+        self.assertIn("ring_given=true key_given=true", proc.stdout, proc.stderr)
+
+    def test_both_interview_arms_check_the_key_owner(self):
+        """A -y run takes the non-interactive arm, which must refuse another install's key too."""
+        text = _INSTALL_SH.read_text()
+        start = text.index('validate_non_interactive_minter_config "$github_app_id"')
+        arm = text[start:text.index("# 9. Agent Permissions", start)]
+        self.assertIn("confirm_minter_key_owner ", arm)
+        self.assertEqual(text.count("confirm_minter_key_owner \"$kms_keyring\" \"$kms_key\""), 2)
+
+    def test_a_key_already_named_as_shared_needs_no_question(self):
+        proc = self._confirm_owner("cluster-a/kubeagents-system", env={"MINTER_SHARED_KEY": "ring/key"})
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+
+    def test_an_absent_or_undescribable_key_is_left_to_the_apply(self):
+        proc = self._confirm_owner("", owner_rc=1)
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+
     def test_validate_immutable_ref_accepts_valid_refs(self):
         for ref in VALID_IMMUTABLE_REFS:
             with self.subTest(ref=ref):
@@ -1504,6 +1673,14 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
         proc4 = self._run_install_func(cmd4)
         self.assertEqual(proc4.returncode, 1, proc4.stderr)
         self.assertIn("provided in non-interactive mode, but no ENABLED KMS key exists", proc4.stdout + proc4.stderr)
+        # Names this run didn't give: maybe an earlier run's default names, which
+        # install.env doesn't keep as a choice (#3504). Named by flag, no such hint.
+        self.assertIn("pass both again", proc4.stdout + proc4.stderr)
+        proc4g = self._run_install_func(
+            f'{_SOURCE_INSTALLER_COMMON}kms_key_enabled_version() {{ echo ""; }}; '
+            'PARAM_KMS_KEYRING_GIVEN=true PARAM_KMS_KEY_GIVEN=true; '
+            'validate_non_interactive_minter_config "12345" "" "ring" "key" "us-central1" "p1" "my-org"')
+        self.assertNotIn("pass both again", proc4g.stdout + proc4g.stderr)
 
         # 4b. The same, but the key's versions are scheduled for destruction -> the
         # restore is named instead of the import, and the run still stops.
@@ -2877,6 +3054,8 @@ print_generate_only_handoff "/tmp/test-repo" "test-proj" "test-cluster" "us-cent
         self.assertIn("GitHub App PEM Import (before apply, when GitOps minter is enabled):", out)
         self.assertIn("gcloud kms keyrings create github-token-minter-keyring --location=us-central1 --project=test-proj", out)
         self.assertIn("gcloud kms keys create github-token-minter-key --keyring=github-token-minter-keyring", out)
+        # Labelled for this install, or the handoff's lifecycle.sh apply refuses to adopt it (#3504).
+        self.assertIn("--labels=kube-agents-cluster=test-cluster,kube-agents-namespace=kubeagents-system", out)
         self.assertIn("--purpose=asymmetric-signing", out)
         self.assertIn("--import-only --skip-initial-version-creation", out)
         self.assertIn("git clone --depth 1 --branch v2.7.1 https://github.com/abcxyz/github-token-minter.git /tmp/minty", out)
@@ -5172,7 +5351,8 @@ class ImportGithubPemKmsKeyTest(unittest.TestCase):
     """
 
     def _run(self, creates_fail=False, describe_fails=True, go_version=None, git_clone_fails=False,
-             keyrings_fail_first=0, keys_fail_first=0, keys_describe_fail_first=0, fail_msg=None, env_overrides=None):
+             keyrings_fail_first=0, keys_fail_first=0, keys_describe_fail_first=0, fail_msg=None, env_overrides=None,
+             cluster=""):
         """import_github_pem against a stub gcloud that records every call.
 
         By default the stub reports no ENABLED key version, so the import is
@@ -5274,7 +5454,7 @@ class ImportGithubPemKmsKeyTest(unittest.TestCase):
                 f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
                 f'source "{_INSTALLER_COMMON}"\n'
                 "GITOPS_ORG=an-org GITOPS_REPO=a-repo GITHUB_APP_ID=12345 "
-                f'GITHUB_PEM_PATH="{pem}" import_github_pem a-project us-central1-a\n'
+                f'GITHUB_PEM_PATH="{pem}" import_github_pem a-project us-central1-a {cluster}\n'
             )
             merged_env = {"KMS_API_PROPAGATION_WAIT_SECONDS": "0"}
             if env_overrides:
@@ -5293,6 +5473,14 @@ class ImportGithubPemKmsKeyTest(unittest.TestCase):
             )
             calls = log.read_text().splitlines() if log.exists() else []
             return proc, calls
+
+    def test_the_key_is_created_with_this_installs_owner_labels(self):
+        """The apply's adoption step refuses an unlabelled key it doesn't hold (#3504)."""
+        proc, calls = self._run(cluster="ka-today-1")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        creates = [c for c in calls if "kms keys create" in c]
+        self.assertEqual(len(creates), 1, calls)
+        self.assertIn("--labels=kube-agents-cluster=ka-today-1,kube-agents-namespace=kubeagents-system", creates[0])
 
     def test_the_import_only_key_is_created_skipping_the_initial_version(self):
         proc, calls = self._run()
@@ -5558,7 +5746,7 @@ class ImportGithubPemKmsKeyTest(unittest.TestCase):
         """
         body = _INSTALL_SH.read_text()
         self.assertIn(
-            'import_github_pem "$project_id" "$region" || exit 1',
+            'import_github_pem "$project_id" "$region" "$cluster_name" || exit 1',
             body,
             "a failed PEM import must stop the run before terraform apply",
         )
@@ -7134,7 +7322,7 @@ class PlatformAgentModeTest(unittest.TestCase):
             'ensure_existing_cluster_network_policy "$project_id"',
             'ensure_existing_cluster_workload_identity "$project_id"',
             'ensure_existing_cluster_cmek "$project_id"',
-            'import_github_pem "$project_id" "$region" || exit 1',
+            'import_github_pem "$project_id" "$region" "$cluster_name" || exit 1',
             'minter_enabled_version="$(kms_key_enabled_version',
             "or unset GITHUB_APP_ID to install without the minter.\"\n    exit 1\n",
             'clear_failed_initial_helm_release "$KUBE_AGENTS_HELM_RELEASE"',
@@ -9809,7 +9997,7 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
         )
         step_12 = text.index('print_step "12. Applying the Install', main_start)
         for gate in (
-            'import_github_pem "$project_id" "$region" || exit 1',
+            'import_github_pem "$project_id" "$region" "$cluster_name" || exit 1',
             'clear_failed_initial_helm_release "$KUBE_AGENTS_HELM_RELEASE"',
             'apply_crd_upgrades "$repo_dir"',
         ):
@@ -10888,19 +11076,32 @@ class PtyChildTestMixin:
     def _watch_pty_child(self, pid, fd):
         drain = threading.Thread(target=self._drain, args=(fd,), daemon=True)
         drain.start()
-        self.addCleanup(self._cleanup_pty, pid, fd)
+        self.addCleanup(self._cleanup_pty, pid)
 
     @staticmethod
     def _drain(fd):
+        """Read the pty until the child's side closes, then close the descriptor.
+
+        Only this thread closes the descriptor. If the cleanup closes it, its
+        number is free while this thread can still be between two reads. On a
+        loaded runner the scheduler can hold this thread there until a later
+        test runs. This thread's next read then takes bytes from the file that
+        the later test opened with the same number. For install.sh it takes all
+        of them, and the later test's read_text() returns an empty string.
+        """
         while True:
             try:
                 if not os.read(fd, 4096):
-                    return
+                    break
             except OSError:
-                return
+                break
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
     @staticmethod
-    def _cleanup_pty(pid, fd):
+    def _cleanup_pty(pid):
         for killer in (lambda: os.killpg(os.getpgid(pid), signal.SIGKILL), lambda: os.kill(pid, signal.SIGKILL)):
             try:
                 killer()
@@ -10908,10 +11109,6 @@ class PtyChildTestMixin:
                 pass
         try:
             os.waitpid(pid, 0)
-        except OSError:
-            pass
-        try:
-            os.close(fd)
         except OSError:
             pass
 
@@ -10922,6 +11119,55 @@ class PtyChildTestMixin:
                 return path.read_text().strip()
             time.sleep(self._POLL_INTERVAL_SECS)
         self.fail(f"timed out after {self._READY_TIMEOUT_SECS}s waiting for {what} at {path}")
+
+
+@unittest.skipUnless(hasattr(pty, "fork"), "the mixin under test forks a child under a pty")
+class PtyChildDrainClosesThePtyTest(PtyChildTestMixin, unittest.TestCase):
+    """The drain thread closes the pty descriptor, and the cleanup does not.
+
+    This test holds the drain thread between two reads, as a loaded runner can,
+    and runs the cleanup. The descriptor must still name the pty after the
+    cleanup, so that no file a later test opens can get its number.
+    """
+
+    def test_a_drain_held_between_reads_keeps_the_pty_open_through_the_cleanup(self):
+        pid, fd = pty.fork()
+        if pid == 0:  # pragma: no cover - runs in the forked child
+            try:
+                os.write(pty.STDOUT_FILENO, b"ready\n")
+                time.sleep(self._READY_TIMEOUT_SECS)
+            finally:
+                os._exit(0)
+        held, release = threading.Event(), threading.Event()
+        test_thread = threading.current_thread()
+        drain_reads = []
+        real_read = os.read
+
+        def read(read_fd, size):
+            # Holds the drain thread before its second read of the pty.
+            if read_fd == fd and threading.current_thread() is not test_thread:
+                drain_reads.append(threading.current_thread())
+                if len(drain_reads) == 2:
+                    held.set()
+                    release.wait(self._READY_TIMEOUT_SECS)
+            return real_read(read_fd, size)
+
+        with mock.patch.object(os, "read", read):
+            self._watch_pty_child(pid, fd)
+            try:
+                self.assertTrue(held.wait(self._READY_TIMEOUT_SECS), "the drain thread did not come back for a second read")
+                self.doCleanups()
+                try:
+                    still_the_pty = stat.S_ISCHR(os.fstat(fd).st_mode)
+                except OSError:
+                    still_the_pty = False
+            finally:
+                release.set()
+            drain_reads[0].join(self._READY_TIMEOUT_SECS)
+        self.assertTrue(still_the_pty, "the cleanup closed the pty while the drain thread could still read it")
+        self.assertFalse(drain_reads[0].is_alive(), "the drain thread did not stop after the child was gone")
+        with self.assertRaises(OSError, msg="the drain thread left the pty open"):
+            os.fstat(fd)
 
 
 @unittest.skipUnless(hasattr(pty, "fork"), "run_with_spinner's terminal branch needs a pty")

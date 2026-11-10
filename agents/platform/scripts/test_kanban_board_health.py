@@ -886,6 +886,14 @@ class DataVolumeTests(unittest.TestCase):
                          " or ask an admin to raise spec.storage.size on the PlatformAgent.")
         self.assertIn("Board invariant violations", "\n".join(lines[1:]))
 
+    def test_the_warn_line_is_inclusive(self):
+        """At or above the line, so a volume at exactly 90% is past it."""
+        with tempfile.TemporaryDirectory() as d:
+            make_board(Path(d), tasks=[{"id": "t_ghost", "status": "ready", "claim_lock": "host:9"}])
+            with unittest.mock.patch.object(kbh.os, "statvfs", fake_statvfs(90)):
+                _tasks, lines = kbh.report(Path(d), runner=self.clean_runner, binary="/x/hermes", env={})
+        self.assertTrue(lines[0].startswith("The agent's data volume is 90% full"), lines)
+
     def test_a_full_volume_alone_says_nothing(self):
         """The Session KV server's once-per-crossing warning is the alert; alone, the
         line here would repeat it daily and cost a stuck-tasks report its card."""
@@ -929,8 +937,9 @@ class DataVolumeTests(unittest.TestCase):
 
     def test_another_board_error_keeps_the_plain_line(self):
         """Another error, or a disk I/O error while the volume is not full (it has
-        other causes), is said as before."""
-        for message, percent in (("unable to open database file", 100), ("disk I/O error", 40)):
+        other causes), is said as before; past the warn line the volume line
+        follows it, as a fact and not as the cause."""
+        for message, percent in (("unable to open database file", 100), ("disk I/O error", 40), ("disk I/O error", 92)):
             with self.subTest(message=message), tempfile.TemporaryDirectory() as d:
                 def boom(home, **kwargs):
                     raise sqlite3.OperationalError(message)
@@ -940,8 +949,14 @@ class DataVolumeTests(unittest.TestCase):
                         unittest.mock.patch.object(kbh.os, "statvfs", fake_statvfs(percent)), \
                         contextlib.redirect_stdout(buffer):
                     kbh.main(env={kbh.STATE_ENV: str(Path(d) / "state.json")})
-                self.assertIn("cannot read", buffer.getvalue())
+                out = buffer.getvalue().splitlines()
+                self.assertIn("cannot read", out[0])
                 self.assertNotIn("disk is full", buffer.getvalue())
+                if percent >= kbh.DATA_VOLUME_WARN_PERCENT:
+                    self.assertEqual(len(out), 2, out)
+                    self.assertTrue(out[1].startswith(f"The agent's data volume is {percent}% full"), out)
+                else:
+                    self.assertEqual(len(out), 1, out)
 
     def _main_output(self, message: str, percent: int) -> str:
         with tempfile.TemporaryDirectory() as d:
@@ -973,14 +988,6 @@ class DataVolumeTests(unittest.TestCase):
                                            max_chars=budget)
         self.assertTrue(lines[0].startswith("The agent's data volume is 95% full"))
         self.assertLessEqual(len("\n".join(lines)) + kbh.REPORT_HEADER_RESERVE, budget)
-
-    def test_the_line_and_text_match_the_session_kv_servers(self):
-        """The two say the same thing at the same point; the server is not imported here."""
-        source = (Path(__file__).resolve().parent / "session_kv_server.py").read_text()
-        self.assertIn(f"DATA_VOLUME_WARN_PERCENT = {kbh.DATA_VOLUME_WARN_PERCENT}\n", source)
-        start = source.index("DATA_VOLUME_WARNING = (")
-        block = source[start:source.index(")\n", start) + 2]
-        self.assertEqual(eval(block.split("=", 1)[1]), kbh.DATA_VOLUME_WARNING)  # noqa: S307 - a string literal from our own file
 
 
 class DeliveryFailureTests(unittest.TestCase):

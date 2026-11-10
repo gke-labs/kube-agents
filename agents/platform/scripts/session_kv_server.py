@@ -163,18 +163,22 @@ CLEANUP_TTL_DAYS = int(os.getenv("SESSION_KV_CLEANUP_TTL_DAYS", "14"))
 # with a bare `disk I/O error` and nothing in chat says why, so this server, the
 # one long-running process of the agent's that already posts to the home
 # channel, checks the volume and says so once per crossing: at
-# DATA_VOLUME_WARN_PERCENT used, and not again until usage has dropped below
-# DATA_VOLUME_REARM_PERCENT. The operator reports the same reading on the CR as
-# the DataVolumeNearlyFull condition; this is the half a chat user sees.
-DATA_VOLUME_PATH = os.getenv("PLATFORM_AGENT_HOME", "/opt/data")
+# kanban_board_health.DATA_VOLUME_WARN_PERCENT used, in that module's words, so
+# the board health report says the same line. Once usage has dropped below
+# DATA_VOLUME_REARM_PERCENT it says that too, and the warning is re-armed. The
+# operator reports the same reading on the CR as the DataVolumeNearlyFull
+# condition; this is the half a chat user sees.
+DATA_VOLUME_PATH = os.getenv("PLATFORM_AGENT_HOME") or "/opt/data"
 DATA_VOLUME_CHECK_INTERVAL_SECONDS = 300
-DATA_VOLUME_WARN_PERCENT = 90
 DATA_VOLUME_REARM_PERCENT = 85
-DATA_VOLUME_WARNING = (
-    "The agent's data volume is {percent}% full ({used:.1f} of {total:.1f} GiB). "
-    "Remove unused cluster profiles, or ask an admin to raise spec.storage.size on the PlatformAgent."
-)
-BYTES_PER_GIB = 1 << 30
+DATA_VOLUME_CLEARED = "The agent's data volume is back to {percent}% full ({used:.1f} of {total:.1f} GiB)."
+# The states the data_volume_warning row holds: armed for the next crossing; the
+# warning delivered and standing; or back below the lower line with the
+# all-clear not delivered yet, which a refill past the warn line drops, so the
+# refill is a new crossing rather than a silence.
+DATA_VOLUME_ARMED = 0
+DATA_VOLUME_WARNED = 1
+DATA_VOLUME_CLEAR_PENDING = 2
 
 # Bounds on the index `/v1/incidents/recent` returns. Both axes matter because
 # its caller prepends the result to messages that carry no report of their own,
@@ -989,6 +993,25 @@ DEPLOYMENT_POD_NAME_RE = re.compile(r"^(.*?)-[a-f0-9]{8,10}-[a-z0-9]{5}$")
 # name segments (`log-bd`) and fold different owners together; a missed fold
 # only announces an event, a wrong one silences it.
 POD_TEMPLATE_HASH_POD_RE = re.compile(r"^(.*?)-[4-9bcdf]{8,10}-[a-z0-9]{5}$")
+# The Pod's owning workload, as the watcher reads it from the Pod's controller
+# ownerReference (cmd/k8s-event-watcher/owner.go): `context.controller_ref`,
+# "<Kind>/<name>" in the event's namespace, or empty when the Pod has no
+# controller the watcher folds on or the lookup failed. A value of any other shape is ignored, and the Pod folds by
+# its name as before (_fold_key).
+PAYLOAD_CONTEXT_KEY = "context"
+CONTROLLER_REF_KEY = "controller_ref"
+CONTROLLER_REF_RE = re.compile(r"^([A-Z][A-Za-z0-9]*)/([a-z0-9](?:[-a-z0-9.]*[a-z0-9])?)$")
+# A Deployment's Pods fold on the bare Deployment name, the key the name
+# pattern gives them, so a Pod whose owner lookup failed and one whose lookup
+# answered still fold together, and so do rows written before the watcher sent
+# the field. Every other controller folds on "<Kind>/<name>".
+DEPLOYMENT_KIND = "Deployment"
+# The controllers whose Pods are one workload. A controller_ref of any other
+# kind is ignored: a static Pod's controller is its Node, and folding on it
+# would make every static Pod on a node one incident. The watcher sends a
+# Deployment's ReplicaSet as the Deployment and any other ReplicaSet as none,
+# so ReplicaSet is not one of them.
+FOLDABLE_CONTROLLER_KINDS = frozenset({DEPLOYMENT_KIND, "StatefulSet", "DaemonSet", "Job"})
 # The severity get_severity_details grades a blocker, which folds only into an
 # anchor of its own grade (_workload_incident_anchor).
 CRITICAL_SEVERITY = "Critical"
@@ -1743,8 +1766,8 @@ def init_db() -> None:
                 )
                 """
             )
-            # One row: whether the data volume warning has been posted for the
-            # current crossing. On this database rather than in memory so that a
+            # One row: where the current crossing stands (DATA_VOLUME_ARMED,
+            # _WARNED or _CLEAR_PENDING). On this database rather than in memory so that a
             # restart while the volume is still full does not post it again, and
             # on this database rather than the data volume, which is the one that
             # is full.
@@ -2484,18 +2507,39 @@ def mark_triage_not_started(event_row_id: Optional[int]) -> None:
         logger.error(f"Failed to release the fold anchor on ledger row {event_row_id}: {exc}")
 
 
-def _fold_key(object_kind: str, object_name: str) -> str:
+def _payload_controller_ref(payload: Dict[str, Any]) -> str:
+    """The event's `context.controller_ref` when it has the expected shape and a
+    kind in FOLDABLE_CONTROLLER_KINDS, else ""."""
+    context = payload.get(PAYLOAD_CONTEXT_KEY)
+    if not isinstance(context, dict):
+        return ""
+    ref = context.get(CONTROLLER_REF_KEY)
+    match = CONTROLLER_REF_RE.match(ref) if isinstance(ref, str) else None
+    return ref if match and match.group(1) in FOLDABLE_CONTROLLER_KINDS else ""
+
+
+def _fold_key(object_kind: str, object_name: str, controller_ref: str = "") -> str:
     """What an event folds on, or "" for an event that neither folds nor anchors.
 
-    A Deployment's pod (POD_TEMPLATE_HASH_POD_RE) folds on its workload. Any
-    other Pod name does not fold: a StatefulSet's `web-0` and `web-1` keep their
-    ordinals, a CronJob run's or a date-stamped Job's pod is not the same
-    workload as a same-named Deployment, and a DaemonSet's, a Job's or a bare
-    pod's last segment is not one workload's replica suffix. A non-Pod object
-    folds on its own name, which is exact.
+    A Pod with a controller_ref (_payload_controller_ref) folds on its owning
+    workload: the Pods of one Job, StatefulSet or DaemonSet are one incident, as
+    a Deployment's replicas are. A Deployment's folds on the bare Deployment
+    name (DEPLOYMENT_KIND), any other controller's on "<Kind>/<name>", so a
+    StatefulSet and a Deployment of the same name stay apart.
+
+    Without one, a Deployment's pod (POD_TEMPLATE_HASH_POD_RE) folds on its
+    workload by name, and any other Pod name does not fold: a StatefulSet's
+    `web-0` and `web-1` keep their ordinals, a CronJob run's or a date-stamped
+    Job's pod is not the same workload as a same-named Deployment, and a
+    DaemonSet's, a Job's or a bare pod's last segment is not one workload's
+    replica suffix. A non-Pod object folds on its own name, which is exact.
     """
     if object_kind.lower() != "pod":
         return object_name
+    ref = CONTROLLER_REF_RE.match(controller_ref or "")
+    if ref:
+        kind, name = ref.group(1), ref.group(2)
+        return name if kind == DEPLOYMENT_KIND else f"{kind}/{name}"
     m = POD_TEMPLATE_HASH_POD_RE.match(object_name)
     return m.group(1) if m else ""
 
@@ -3115,76 +3159,65 @@ def _claim_alert_quota(severity: str) -> tuple[bool, int]:
         return True, 0
 
 
-def _data_volume_usage(path: str) -> Optional[tuple[int, int]]:
-    """The volume holding `path` as (total, free) bytes, free being what a
-    non-root writer can still use; None when it cannot be read."""
-    try:
-        st = os.statvfs(path)
-    except OSError as exc:
-        logger.debug(f"Cannot read the data volume at {path}: {exc}")
-        return None
-    total = st.f_blocks * st.f_frsize
-    if total <= 0:
-        return None
-    return total, st.f_bavail * st.f_frsize
-
-
-def _data_volume_warned() -> bool:
+def _data_volume_state() -> int:
     with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=SQLITE_BUSY_TIMEOUT_SECONDS)) as conn:
         row = conn.execute("SELECT warned FROM data_volume_warning WHERE id = 1").fetchone()
-    return bool(row and row[0])
+    return row[0] if row else DATA_VOLUME_ARMED
 
 
-def _set_data_volume_warned(warned: bool) -> None:
-    """Set the flag to `warned`."""
+def _set_data_volume_state(state: int) -> None:
     with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=SQLITE_BUSY_TIMEOUT_SECONDS)) as conn:
         with conn:
             conn.execute("INSERT OR IGNORE INTO data_volume_warning (id, warned) VALUES (1, 0)")
-            conn.execute("UPDATE data_volume_warning SET warned = ? WHERE id = 1", (int(warned),))
+            conn.execute("UPDATE data_volume_warning SET warned = ? WHERE id = 1", (state,))
 
 
-def _post_data_volume_warning(message: str) -> bool:
-    """Post the warning to the home channel. True once it is delivered, or once
-    there is nowhere to deliver it, so the caller stops trying; False when every
-    enabled platform refused, so the next check tries again."""
+def _post_data_volume_warning(message: str, what: str = "warning") -> bool:
+    """Post the warning (or, as `what` says, the all-clear) to the home channel.
+    True once it is delivered, or once there is nowhere to deliver it, so the
+    caller stops trying; False when every enabled platform refused, so the next
+    check tries again."""
     platforms = enabled_chat_platforms()
     if platforms == [DEFAULT_CHAT_PLATFORM] and _chat_platforms_disabled():
-        logger.warning("No chat platform is enabled, so the data volume warning is in this log and nowhere else")
+        logger.warning(f"No chat platform is enabled, so the data volume {what} is in this log and nowhere else")
         return True
     for candidate in platforms:
         if _post_initial_alert(candidate, message):
             return True
     logger.warning(
-        "The data volume warning was not accepted by any enabled chat platform; "
+        f"The data volume {what} was not accepted by any enabled chat platform; "
         "check the home channel setting. It is tried again at the next check"
     )
     return False
 
 
 def check_data_volume() -> None:
-    """Post the data volume warning if the volume has crossed the line, and
-    re-arm it once usage is back below the lower one."""
-    usage = _data_volume_usage(DATA_VOLUME_PATH)
+    """Post the data volume warning if the volume has crossed the line, and the
+    all-clear once usage is back below the lower one, which re-arms it."""
+    usage = kanban_board_health.data_volume_usage(Path(DATA_VOLUME_PATH))
     if usage is None:
         return
     total, free = usage
-    percent = (total - free) * 100 // total
-    warned = _data_volume_warned()
-    if warned:
-        if percent < DATA_VOLUME_REARM_PERCENT:
-            _set_data_volume_warned(False)
-            logger.info(f"The data volume is back to {percent}% used; the full-volume warning is re-armed")
+    percent = kanban_board_health.data_volume_percent(total, free)
+    state = _data_volume_state()
+    if state != DATA_VOLUME_ARMED and percent < DATA_VOLUME_REARM_PERCENT:
+        message = kanban_board_health.data_volume_text(DATA_VOLUME_CLEARED, total, free)
+        logger.info(message)
+        # Re-armed only after the all-clear is delivered, for the reason the
+        # warning's state is set only after it is.
+        delivered = _post_data_volume_warning(message, "all-clear")
+        _set_data_volume_state(DATA_VOLUME_ARMED if delivered else DATA_VOLUME_CLEAR_PENDING)
         return
-    if percent < DATA_VOLUME_WARN_PERCENT:
+    if state == DATA_VOLUME_WARNED or percent < kanban_board_health.DATA_VOLUME_WARN_PERCENT:
         return
-    message = DATA_VOLUME_WARNING.format(
-        percent=percent, used=(total - free) / BYTES_PER_GIB, total=total / BYTES_PER_GIB
-    )
+    # Armed, or an undelivered all-clear that the refill has made untrue: a new
+    # crossing either way.
+    message = kanban_board_health.data_volume_text(kanban_board_health.DATA_VOLUME_WARNING, total, free)
     logger.warning(message)
     # Set only after the post is delivered. A process killed during the send
     # (a pod roll) then posts at the next check instead of never.
     if _post_data_volume_warning(message):
-        _set_data_volume_warned(True)
+        _set_data_volume_state(DATA_VOLUME_WARNED)
 
 
 def _data_volume_monitor() -> None:
@@ -3850,19 +3883,20 @@ def _post_triage_pull_request_note(start: _TriageStart, note: str) -> None:
         logger.error(f"Pull-request limit note for {start.session_id} was not delivered to '{notice.platform}'")
 
 
-def _incident_branch_workload(kind: str, raw_name: str) -> str:
+def _incident_branch_workload(kind: str, raw_name: str, controller_ref: str = "") -> str:
     """The workload name an incident's pull-request branch is keyed on.
 
-    The same identity the incident fold uses (`_fold_key`): a Deployment's pod
-    names its Deployment, so every replica's incident lands on one branch; any
-    other object keeps its own name. That leaves StatefulSet ordinals
-    (`web-0`, `web-1`), DaemonSet, Job and CronJob pods, and bare pods on a
-    branch per pod: their last name segment is not a replica suffix the name
-    can prove, and a wrong merge would put one object's fix on another's pull
-    request. The watcher sends no owner reference (`context.controller_ref` is
-    always empty), so the name is all there is to go on.
+    The same identity the incident fold uses (`_fold_key`): a Pod with a
+    controller_ref names its owning workload, so the incidents of one Job,
+    StatefulSet, DaemonSet or Deployment land on one branch; a Deployment's pod
+    without one still names its Deployment by the name pattern. Any other object
+    keeps its own name, which leaves StatefulSet ordinals (`web-0`, `web-1`),
+    DaemonSet, Job and CronJob pods and bare pods without a controller_ref on a
+    branch per pod: their last name segment is not a replica suffix the name can
+    prove, and a wrong merge would put one object's fix on another's pull
+    request.
     """
-    return _fold_key(kind or TRIAGE_DEFAULT_KIND, raw_name) or raw_name
+    return _fold_key(kind or TRIAGE_DEFAULT_KIND, raw_name, controller_ref) or raw_name
 
 
 def _incident_branch(session_id: str, payload: Dict[str, Any]) -> str:
@@ -3872,8 +3906,8 @@ def _incident_branch(session_id: str, payload: Dict[str, Any]) -> str:
     as ``_incident_branch_workload`` reads it, and reason) rather than the
     per-inject ``session_id``: the watcher mints a new ``k8s-evt-<hex>`` session
     whenever an incident's dedup window rolls over or its snapshot is lost, in
-    ``--mode=shared`` every incident shares one session, and a Deployment's
-    replicas share one branch the way they share one folded incident
+    ``--mode=shared`` every incident shares one session, and the pods of one
+    workload share one branch the way they share one folded incident
     (INCIDENT_WORKLOAD_DEDUP_SECONDS). ``session_id`` is used only when the
     payload carries no coordinates.
 
@@ -3887,7 +3921,7 @@ def _incident_branch(session_id: str, payload: Dict[str, Any]) -> str:
     raw_kind = str(payload.get("kind_of_object") or payload.get("kindOfObject") or "")
     raw_name = str(payload.get("name") or "")
     kind = raw_kind
-    workload = _incident_branch_workload(raw_kind, raw_name) if raw_name else ""
+    workload = _incident_branch_workload(raw_kind, raw_name, _payload_controller_ref(payload)) if raw_name else ""
     coords = (
         str(payload.get("cluster") or ""),
         str(payload.get("namespace") or ""),
@@ -7607,8 +7641,9 @@ def _dispatch_inject(
     suppressed_today = 0
     anchor_id = None
     held_for: Optional[FixPullRequest] = None
-    fold_key = _fold_key(object_kind, object_name)
-    workload_key = _incident_branch_workload(object_kind, object_name) if object_name else ""
+    controller_ref = _payload_controller_ref(payload)
+    fold_key = _fold_key(object_kind, object_name, controller_ref)
+    workload_key = _incident_branch_workload(object_kind, object_name, controller_ref) if object_name else ""
     fix: Optional[FixPullRequest] = None
     if (
         not suppressed

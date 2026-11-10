@@ -17,6 +17,10 @@ limitations under the License.
 package controller
 
 import (
+	"slices"
+	"sort"
+	"strings"
+
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
@@ -308,6 +312,51 @@ const (
 // publish for an addressee this grant does not name.
 const a2aBridgeAddressee = "platform"
 
+// a2aProfileSubmitSubjects is every AgentProfile's submission subject,
+// a2a.submit.<profile>.<tier>.<kind>.<task> (lib.TaskSubmitSubject), on the
+// PROFILE_SUBMITS stream. Publish only: the gateway holds no consumer or
+// stream right there, and its publish ack returns on _INBOX.gateway.>.
+const a2aProfileSubmitSubjects = "a2a.submit.*.*.*.*"
+
+// a2aDispatchStopSubjects is every profile task's stop record,
+// a2a.stop.<profile>.<task> (lib.DispatchStopSubject), on the DISPATCH_STOPS
+// stream. Publish only, like the submission: the gateway writes a record
+// beside each cancel it sends a profile task, and the dispatcher reads it.
+const a2aDispatchStopSubjects = "a2a.stop.*.*"
+
+// a2aGatewayUser is the gateway's NATS user.
+const a2aGatewayUser = "gateway"
+
+// a2aProfileSupervisorPrefix and a2aProfileSupervisorSuffix spell a profile's
+// supervisor subjects, a2a.tasks.<profile>.*.supervisor: where the dispatcher
+// writes a profile task's terminal failures (lib.TaskSupervisorSubject). The
+// gateway is denied each one (gatewayProfileSupervisorDeny).
+const (
+	a2aProfileSupervisorPrefix = "a2a.tasks."
+	a2aProfileSupervisorSuffix = ".*.supervisor"
+)
+
+// gatewayProfileSupervisorDeny is the gateway's publish deny for each bound
+// profile's supervisor subjects, in name order. The gateway's allow holds
+// a2a.tasks.*.*.supervisor for the sessions it spawns, whose names it mints
+// per incarnation and no grant can enumerate; NATS wildcards match whole
+// tokens, so the profiles are subtracted by name instead, which leaves the
+// dispatcher the one direct publisher there. The list rides nats.conf, so a
+// profile bound or unbound re-renders it and rolls the bus, whether or not the
+// dispatcher runs. A name that isn't one subject token addresses no task and
+// is skipped.
+func gatewayProfileSupervisorDeny(profiles []string) []string {
+	var out []string
+	for _, p := range profiles {
+		if p == "" || strings.ContainsAny(p, ".*> \t\r\n") {
+			continue
+		}
+		out = append(out, a2aProfileSupervisorPrefix+p+a2aProfileSupervisorSuffix)
+	}
+	sort.Strings(out)
+	return slices.Compact(out)
+}
+
 // The operator's own bus principal: its NATS user and inbox owner, and the
 // directory it writes AgentProfile cards to (agentprofile_card.go).
 const (
@@ -404,8 +453,11 @@ func a2aIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 }
 
 // gateway: task requester, chat-session supervisor, session-registry owner.
-// Production scopes supervisor publish to sessions the gateway spawned;
-// statically that collapses to the task-supervisor wildcard.
+// Its supervisor publish is the task-supervisor wildcard, for the sessions it
+// spawns: their names are minted per incarnation, one subject token each, so
+// no static grant can list them. The profiles' supervisor subjects are the
+// dispatcher's alone, and nats.conf denies the gateway each one by name
+// (gatewayProfileSupervisorDeny, applied in renderA2AStaticUsers).
 //
 // The supervisor's terminal goes on `…supervisor`, the executor's events on
 // `…events`, and the gateway holds publish on the first and not the second.
@@ -428,6 +480,15 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 	publish := []string{
 		"a2a.tasks.*.*.in",
 		"a2a.tasks.*.*.supervisor",
+		// A new task for an AgentProfile, on the profile's submission subject
+		// with its tier and kind (spec-profiles-dispatch.md, "Addressing").
+		// The gateway is the subject's one writer: the dispatcher reads it
+		// through its durables, and no worker or session holds it.
+		a2aProfileSubmitSubjects,
+		// A stop for a profile task, the record the dispatcher is to read in
+		// place of the task's `…in` (addendum 9 on #3655). The gateway is its
+		// one writer; the stream and the dispatcher's reader come later.
+		a2aDispatchStopSubjects,
 		// The session registry's data plane. The bucket is spelled here and
 		// named by constant inside the grant function; the two are held
 		// together by TestGatewayGrantNamesTheBucketItsDataPlaneWritesTo,
@@ -473,6 +534,14 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 		a2aBoardSubject,
 	}
 	publish = append(publish, a2aGatewayJetStreamGrants()...)
+	// The profile cards' start-up read (a2a/gateway/profiledir.go): the
+	// directory's subject list, then a direct get per profile. The live half
+	// is the a2a.agents.> subscription below. STREAM.INFO on DIRECTORY tells
+	// the gateway the profile names its subscription already shows it.
+	publish = append(publish,
+		"$JS.API.STREAM.INFO."+a2aDirectoryStream,
+		"$JS.API.DIRECT.GET."+a2aDirectoryStream+"."+a2aDirectorySubjectPrefix+"*",
+	)
 	publish = append(publish,
 		"$JS.ACK.TASKS.>",
 		"$JS.FC.>",
@@ -480,7 +549,7 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 	)
 
 	return a2aIdentity{
-		user:    "gateway",
+		user:    a2aGatewayUser,
 		account: a2aAccountControl,
 		comment: "task requester, chat-session supervisor, session-registry owner.\n" +
 			"STATIC, and this one is a sequencing fact rather than a property of\n" +
@@ -497,7 +566,8 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 			"So no STREAM.DELETE, PURGE,\n" +
 			"UPDATE or MSG.DELETE on any stream - one STREAM.DELETE.TASKS here\n" +
 			"used to destroy every task's history and the five consumers on it -\n" +
-			"no CONSUMER.DELETE on TASKS, and nothing at all on DIRECTORY, the\n" +
+			"no CONSUMER.DELETE on TASKS, nothing on DIRECTORY but its subject list\n" +
+			"and a direct get on the card subjects, and nothing at all on the\n" +
 			"topic streams or the runtime-state, cap and PROFILE_LEASES buckets.",
 		auth:     a2aAuthStatic,
 		credsKey: a2aGatewayPasswordKey,

@@ -82,6 +82,7 @@ type ToolDefinition struct {
 	Name        string         `json:"name"`
 	Description string         `json:"description"`
 	InputSchema map[string]any `json:"inputSchema"`
+	Meta        map[string]any `json:"_meta,omitempty"`
 }
 
 // TextContent is one content block of a tool result.
