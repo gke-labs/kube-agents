@@ -354,6 +354,7 @@ CRON_CADENCE = {
     "11 * * * *": "Hourly at :11",
     "25 * * * *": "Hourly at :25",
     "*/10 * * * *": "Every 10 minutes",
+    "7,22,37,52 * * * *": "Four times an hour (:07, :22, :37, :52)",
     "*/30 * * * *": "Every 30 minutes",
     "0 21 * * 1-5": "Weekdays 21:00",
     "0 6 * * 6": "Weekly, Saturday 06:00",

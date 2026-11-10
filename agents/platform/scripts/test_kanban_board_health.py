@@ -436,6 +436,48 @@ class StuckTasksTests(unittest.TestCase):
         tasks = {t["task_id"]: t["person"] for t in kbh.stuck_tasks(items, context)}
         self.assertEqual(tasks, {"a": True, "b": False, "c": False})
 
+    def test_a_re_checked_card_says_what_the_re_check_found(self):
+        """The row carries the re-check's result instead of a bare repeat (#5260)."""
+        now = 1_800_000_000
+        hour = 3600
+
+        def line(recheck):
+            context = {"a": {"title": "A", "kind": "transient", "recheck": recheck}}
+            tasks = kbh.stuck_tasks([("a", {"data": {"age_hours": 72}}, {})], context, now=now)
+            return kbh.stuck_rows(tasks)[1][0]["status"]
+
+        self.assertEqual(
+            line({"last_outcome": "still_blocked", "last_checked_at": now - 2 * hour, "check_after": now - 3 * hour, "expires_at": None}),
+            "Stopped 3 days ago before finishing. Re-checked 2 hours ago, still blocked.")
+        self.assertEqual(
+            line({"last_outcome": None, "last_checked_at": None, "check_after": now + 40 * 60, "expires_at": None}),
+            "Stopped 3 days ago before finishing. Retries automatically in 40 minutes.")
+        self.assertEqual(
+            line({"last_outcome": "expired", "last_checked_at": now - 25 * hour, "check_after": 1, "expires_at": 1}),
+            "Stopped 3 days ago before finishing. Re-checks ended 1 day ago, still blocked.")
+        self.assertEqual(
+            line({"last_outcome": "unknown", "last_checked_at": now - hour, "check_after": 1, "expires_at": None}),
+            "Stopped 3 days ago before finishing. Re-check 1 hour ago could not read the cluster.")
+        self.assertEqual(
+            line({"last_outcome": "retry_limit", "last_checked_at": now - 2 * hour, "check_after": 1, "expires_at": 1}),
+            "Stopped 3 days ago before finishing. Condition cleared 2 hours ago; already retried once, so it waits for someone.")
+        # Due but not yet run, and no record at all: the plain line.
+        self.assertEqual(line({"last_outcome": None, "last_checked_at": None, "check_after": now - 1, "expires_at": None}),
+                         "Stopped 3 days ago before finishing.")
+        self.assertEqual(line(None), "Stopped 3 days ago before finishing.")
+
+    def test_a_shared_row_carries_the_longest_waiting_card_s_re_check(self):
+        now = 1_800_000_000
+        context = {
+            "n": {"title": "Same", "kind": "transient",
+                  "recheck": {"last_outcome": "still_blocked", "last_checked_at": now - 3600, "check_after": 1, "expires_at": None}},
+            "o": {"title": "Same", "kind": "transient", "recheck": None},
+        }
+        items = [("n", {"data": {"age_hours": 30}}, {}), ("o", {"data": {"age_hours": 100}}, {})]
+        rows = kbh.stuck_rows(kbh.stuck_tasks(items, context, now=now))[1]
+        self.assertEqual(rows[0]["status"], "Stopped 4 days ago before finishing.")
+        self.assertEqual(rows[0]["tasks"], ["n", "o"])
+
     def test_the_board_title_wins_and_the_cli_title_is_the_fallback(self):
         items = [("t_1", {"data": {"age_hours": 30}}, {"title": "From the CLI"}),
                  ("t_2", {"data": {"age_hours": 30}}, {"title": "From the CLI"})]
@@ -677,7 +719,8 @@ class ReportTests(unittest.TestCase):
             tasks, lines = kbh.report(Path(d), runner=lambda argv, env, timeout: (0, STUCK_PAYLOAD, ""),
                                       binary="/x/hermes", env={})
         self.assertEqual(lines, [])
-        self.assertEqual(tasks, [{"task_id": "t_stuck", "title": "Triage x", "person": True, "age_hours": 456.2, "held": []}])
+        self.assertEqual(tasks, [{"task_id": "t_stuck", "title": "Triage x", "person": True, "age_hours": 456.2,
+                                  "held": [], "recheck": None}])
 
     def test_an_engine_that_did_not_answer_returns_no_stuck_tasks(self):
         with tempfile.TemporaryDirectory() as d:
@@ -1098,6 +1141,119 @@ class BlockedContextTests(unittest.TestCase):
             finally:
                 conn.close()
         self.assertEqual(context["t_b"]["kind"], "dependency")
+
+    def test_the_re_check_record_is_read_when_the_board_has_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = make_board(
+                Path(tmp),
+                tasks=[{"id": "t_b", "status": "blocked", "block_kind": "transient"},
+                       {"id": "t_c", "status": "blocked", "block_kind": "needs_input"}],
+            )
+            conn = sqlite3.connect(db)
+            conn.executescript(
+                "CREATE TABLE kanban_block_rechecks (task_id TEXT PRIMARY KEY, block_event_id INTEGER, kind TEXT,"
+                " condition TEXT, check_after INTEGER, expires_at INTEGER, checks INTEGER, last_checked_at INTEGER,"
+                " last_outcome TEXT, last_detail TEXT, created_at INTEGER);"
+                "INSERT INTO kanban_block_rechecks VALUES ('t_b', 1, 'transient', '{\"kind\": \"time\"}', 500, 500, 1, 600,"
+                " 'still_blocked', 'not Available', 400);"
+                "INSERT INTO kanban_block_rechecks VALUES ('t_gone', 1, 'transient', '{}', 1, 1, 0, NULL, NULL, NULL, 1);")
+            conn.commit(); conn.close()
+            conn = kbh.read_only_connection(db)
+            try:
+                context = kbh.blocked_context(conn)
+            finally:
+                conn.close()
+        self.assertEqual(context["t_b"]["recheck"],
+                         {"check_after": 500, "last_checked_at": 600, "last_outcome": "still_blocked"})
+        self.assertNotIn("recheck", context["t_c"])
+        self.assertNotIn("t_gone", context)
+
+
+class BreakerParkedTests(unittest.TestCase):
+    """A card the circuit breaker parked has no `blocked` event, so the engine's
+    rule never lists it; the report does, from the board."""
+
+    NOW = 1_800_000_000
+
+    def board(self, tmp, events):
+        return make_board(
+            Path(tmp),
+            tasks=[{"id": "t_g", "status": "blocked", "title": "Triage x"}, {"id": "t_d", "status": "done"}],
+            events=events,
+        )
+
+    def parked(self, db):
+        conn = kbh.read_only_connection(db)
+        try:
+            return kbh.breaker_parked(conn, self.NOW)
+        finally:
+            conn.close()
+
+    def test_a_day_old_breaker_trip_is_a_stuck_card(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self.board(tmp, [{"task_id": "t_g", "kind": "gave_up", "payload": {"failures": 2},
+                                   "created_at": self.NOW - 30 * 3600}])
+            items = self.parked(db)
+        self.assertEqual([(tid, diag["data"]["age_hours"], entry["title"]) for tid, diag, entry in items],
+                         [("t_g", 30.0, "Triage x")])
+
+    def test_a_fresh_trip_or_an_unblock_since_leaves_it_out(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self.board(tmp, [{"task_id": "t_g", "kind": "gave_up", "created_at": self.NOW - 30 * 3600},
+                                  {"task_id": "t_g", "kind": "unblocked", "created_at": self.NOW - 3600}])
+            self.assertEqual(self.parked(db), [])
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self.board(tmp, [{"task_id": "t_g", "kind": "gave_up", "created_at": self.NOW - 3600}])
+            self.assertEqual(self.parked(db), [])
+
+    def test_the_comment_the_harness_writes_after_the_trip_does_not_hide_it(self):
+        """A failed turn's charge and the budget hand-off both comment on the card
+        right after `gave_up`; the card is no less parked for it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self.board(tmp, [{"task_id": "t_g", "kind": "gave_up", "created_at": self.NOW - 30 * 3600},
+                                  {"task_id": "t_g", "kind": "commented", "payload": {"author": "platform"},
+                                   "created_at": self.NOW - 30 * 3600}])
+            self.assertEqual([tid for tid, _d, _e in self.parked(db)], ["t_g"])
+
+    def test_a_breaker_trip_after_a_question_reads_stopped_not_paused(self):
+        """`block_kind` survives an unblock, so the card's row keys off its newest
+        block event, a `gave_up`, the way the re-check job resolves it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = make_board(
+                Path(tmp),
+                tasks=[{"id": "t_g", "status": "blocked", "title": "Triage x", "block_kind": "needs_input"}],
+                events=[{"task_id": "t_g", "kind": "blocked", "payload": {"kind": "needs_input"}, "created_at": 1},
+                        {"task_id": "t_g", "kind": "unblocked", "created_at": 2},
+                        {"task_id": "t_g", "kind": "gave_up", "payload": {"failures": 2}, "created_at": 3}],
+            )
+            conn = kbh.read_only_connection(db)
+            try:
+                context = kbh.blocked_context(conn)
+            finally:
+                conn.close()
+        self.assertEqual(context["t_g"]["kind"], "gave_up")
+        tasks = kbh.stuck_tasks([("t_g", {"data": {"age_hours": 30}}, {})], context, now=self.NOW)
+        self.assertFalse(tasks[0]["person"])
+
+    def test_the_report_adds_it_once_beside_the_engine_s_cards(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            make_board(
+                home,
+                tasks=[{"id": "t_g", "status": "blocked", "title": "Breaker"},
+                       {"id": "t_stuck", "status": "blocked", "title": "Engine", "block_kind": "needs_input"}],
+                events=[{"task_id": "t_g", "kind": "gave_up", "created_at": self.NOW - 48 * 3600},
+                        {"task_id": "t_stuck", "kind": "gave_up", "created_at": self.NOW - 48 * 3600},
+                        {"task_id": "t_stuck", "kind": "blocked", "payload": {"kind": "needs_input"},
+                         "created_at": self.NOW - 47 * 3600}],
+            )
+            tasks, lines = kbh.report(home, runner=lambda argv, env, timeout: (0, STUCK_PAYLOAD, ""),
+                                      binary="/bin/true", now=self.NOW)
+        self.assertEqual(lines, [])
+        self.assertEqual(sorted(t["task_id"] for t in tasks), ["t_g", "t_stuck"])
+        rows = kbh.stuck_rows(tasks)[1]
+        self.assertEqual([(r["title"], r["status"]) for r in rows if r["title"] == "Breaker"],
+                         [("Breaker", "Stopped 2 days ago before finishing.")])
 
     def test_an_unmigrated_board_yields_no_context_rather_than_raising(self):
         with tempfile.TemporaryDirectory() as tmp:
