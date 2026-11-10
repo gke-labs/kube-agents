@@ -226,6 +226,8 @@ func TestRenderGchatChatPlanDrawsARunningNoteOnce(t *testing.T) {
 			"⚙️ reading dev\n  ✓ read prod"},
 		{"an open step the title does not show", chatmsg.PlanItem{ID: "a", Title: "Check channels", Status: chatmsg.StatusInProgress, Steps: []string{"read prod", "reading dev"}, Note: "read prod"},
 			"⚙️ Check channels\n  ✓ read prod\n  ◌ reading dev"},
+		{"a note with a newline, which the title keeps raw", chatmsg.PlanItem{ID: "a", Title: "two\nlines", Status: chatmsg.StatusInProgress, Steps: []string{"two lines"}, Note: "two lines"},
+			"⚙️ two lines"},
 		{"no note sent: the title is compared", chatmsg.PlanItem{ID: "a", Title: "reading dev", Status: chatmsg.StatusInProgress, Steps: []string{"read prod", "reading dev"}},
 			"⚙️ reading dev\n  ✓ read prod"},
 		{"no note sent and the title is the card's", chatmsg.PlanItem{ID: "a", Title: "Check channels", Status: chatmsg.StatusInProgress, Steps: []string{"read prod", "reading dev"}},

@@ -323,11 +323,16 @@ func gchatStepIsTheNote(item chatmsg.PlanItem) bool {
 		return false
 	}
 	last := item.Steps[len(item.Steps)-1]
-	shown := item.Title
+	// The title as drawn: the emitter folds the note into the title with its
+	// raw whitespace (a newline, a run of spaces) while it collapses the step
+	// and the note to one line, so the comparison reads the one-line title the
+	// member sees, not the raw field.
+	title := gchatOneLine(item.Title)
+	shown := title
 	if item.Note != "" {
 		shown = item.Note
 	}
-	return last == shown && strings.Contains(item.Title, last)
+	return last == shown && strings.Contains(title, last)
 }
 
 // gchatChatWidgets is the buttons as one accessory button list, choices
