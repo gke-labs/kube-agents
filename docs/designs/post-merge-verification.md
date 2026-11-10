@@ -43,8 +43,8 @@ clean merges, counting this check, so the outcome must be deterministic and hard
    Managed Prometheus is available.
 5. Re-check the one finding (#5353). `recheck.py` runs the collector's own check against the target
    only, in the caller's process; only the `kubectl get` of the target namespace goes through the
-   sandbox. The read names the finding's own cluster context, and a cluster outside the install's
-   declared scope is refused before any read. `blocking-pdb` and `pdb-overlapping` are narrowed to
+   sandbox. The read names the finding's own cluster context; a context naming another cluster, or a
+   cluster outside the install's declared scope, is refused before any read. `blocking-pdb` and `pdb-overlapping` are narrowed to
    the budgets covering the target's pods, so an unrelated budget cannot fail a correct fix.
 6. Report once, as a harness comment on the merged pull request and one line in the originating
    thread. A scheduled audit run has no thread: "verified fixed" goes on the pull request only, the
