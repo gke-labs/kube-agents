@@ -1357,6 +1357,10 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if a2aState.leaseRequeue > 0 {
 			requeue = min(requeue, a2aState.leaseRequeue)
 		}
+		// So can a pending bus reload's recheck (planA2ABusReload).
+		if a2aState.busReloadRequeue > 0 {
+			requeue = min(requeue, a2aState.busReloadRequeue)
+		}
 		return ctrl.Result{RequeueAfter: requeue}, nil
 	}
 

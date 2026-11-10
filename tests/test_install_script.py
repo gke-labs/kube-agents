@@ -7688,7 +7688,7 @@ class PlatformAgentModeTest(unittest.TestCase):
         warning = text.index('if [ "$platform_agent_mode" = "next" ] && [ -n "$third_party_registry_prefix" ]; then', main_start)
         self.assertLess(text.index('local third_party_registry_prefix=', main_start), warning)
         self.assertLess(exported, warning)
-        self.assertIn("A2A_NATS_IMAGE and A2A_PROVISION_IMAGE", text[warning : warning + 900])
+        self.assertIn("A2A_NATS_IMAGE, A2A_PROVISION_IMAGE and A2A_NATS_RELOADER_IMAGE", text[warning : warning + 900])
 
     def test_a_bad_value_from_the_shell_on_a_first_install_names_the_shell(self):
         with tempfile.TemporaryDirectory() as tmp:

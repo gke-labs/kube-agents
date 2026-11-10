@@ -103,8 +103,18 @@ func buildA2ANATSReloaderContainer() corev1.Container {
 			{Name: a2aNATSPIDVolume, MountPath: a2aNATSPIDMountDir, ReadOnly: true},
 		},
 		SecurityContext: hardenedSecurityContext(),
-		Resources:       a2aResources(a2aNATSReloaderCPURequest, a2aNATSReloaderMemoryRequest, a2aNATSReloaderCPULimit, a2aNATSReloaderMemoryLimit),
+		Resources:       a2aNATSReloaderResources(),
 	}
+}
+
+// a2aNATSReloaderResources adds an ephemeral-storage request and equal limit,
+// for the container's own log, to its CPU and memory. It writes nothing else:
+// its root filesystem is read-only and every mount is.
+func a2aNATSReloaderResources() corev1.ResourceRequirements {
+	resources := a2aResources(a2aNATSReloaderCPURequest, a2aNATSReloaderMemoryRequest, a2aNATSReloaderCPULimit, a2aNATSReloaderMemoryLimit)
+	resources.Requests[corev1.ResourceEphemeralStorage] = resource.MustParse(emptyDirLogsAllowance)
+	resources.Limits[corev1.ResourceEphemeralStorage] = resource.MustParse(emptyDirLogsAllowance)
+	return resources
 }
 
 func a2aNATSPIDVolumeSource() corev1.VolumeSource {

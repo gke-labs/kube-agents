@@ -159,8 +159,9 @@ const (
 	// agree, so they read from one name rather than four string literals.
 	a2aProvisionWritablePath = "/tmp"
 
-	// The two third-party pins. images.json carries both (as `nats` and
-	// `nats-box`), and hack/check-image-inventory.sh holds these constants
+	// Two of the three third-party pins; the bus reloader's is in
+	// platformagent_a2a_nats_reload.go. images.json carries these (as `nats`
+	// and `nats-box`), and hack/check-image-inventory.sh holds these constants
 	// to it on the normalised reference, so a bump starts there. The short
 	// Docker Hub spelling stays: it is the string the operator renders, and
 	// qualifying it to docker.io/library/... would change the pod template
@@ -2288,8 +2289,8 @@ max_control_line: 65536
 # the console server is encrypted and verified against the bus CA. The
 # Service is ClusterIP, so nothing OUTSIDE the cluster reaches this listener.
 # An ingress NetworkPolicy fences the pod network too: 4222 from the
-# enumerated bus clients, 9222 from the console server alone, and no
-# pod-network peer for 8222. The console server is admitted because it is the
+# enumerated bus clients, 9222 from the console server alone, and 8222 from
+# the operator's pod alone. The console server is admitted because it is the
 # page's proxy. A browser reaches it through a kubectl port-forward and it
 # forwards the websocket here over wss, with the browser's headers intact. It
 # is not an in-cluster door for anything else. A port-forward straight to

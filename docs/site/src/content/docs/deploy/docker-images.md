@@ -11,7 +11,7 @@ Every image an install pulls or a rebuild needs, and how their tags are managed.
 
 [`images.json`](https://github.com/gke-labs/kube-agents/blob/main/images.json) at the repository root is the source of truth for this list. It is what `make mirror-images` copies from, what the chart and the dev tooling resolve their third-party pins from, and what the table below is generated from — so there is one pin per image, not one per install path.
 
-The A2A `next` stack pulls NATS, nats-box, the gateway, the session worker, the auth callout,
+The A2A `next` stack pulls NATS, nats-box, the NATS config reloader, the gateway, the session worker, the auth callout,
 the capability verifier, the AgentProfile dispatcher, the console server and the Hermes bridge sidecar, and each is in the
 tables below. The first-party ones (`a2a-gateway`, `a2a-worker`, `a2a-authcallout`,
 `a2a-verifier`, `a2a-dispatcher`, `a2a-console`, `hermes-bridge`) are built and tagged with the rest of the
@@ -33,10 +33,11 @@ the agent image instead, and `A2A_BRIDGE_IMAGE` on the operator overrides it. A 
 that declares its own `hermes-bridge` sidecar keeps it, and that sidecar's image is whatever the
 resource names.
 
-NATS and nats-box are ordinary third-party pins, in the table as `nats` and `nats-box`, so
-`make mirror-images` copies them. The chart does not set their env vars, so a mirrored `next`
-install still points `A2A_NATS_IMAGE` and `A2A_PROVISION_IMAGE` at the copies itself, through the
-operator's environment
+NATS, nats-box and the NATS config reloader are ordinary third-party pins, in the table as `nats`,
+`nats-box` and `nats-server-config-reloader`, so `make mirror-images` copies them. The chart does
+not set their env vars, so a mirrored `next` install still points `A2A_NATS_IMAGE`,
+`A2A_PROVISION_IMAGE` and `A2A_NATS_RELOADER_IMAGE` at the copies itself, through the operator's
+environment
 ([Operator settings](/kube-agents/install/quickstart-gke/#operator-settings) shows how).
 
 The bases those images are built from are inventory entries too. `golang`, `node` and
