@@ -1290,7 +1290,9 @@ It also counts the standing pods the operator renders only behind an operator fl
 listed with their sizes in `files/flagged-pods.yaml`: the MCP server's pod when `A2A_MCP_DOOR`
 is `true` (set by `operator.mcpServer.enabled` or `operator.extraEnv`, the latter winning).
 The profile dispatcher runs by default under next, so it is in `footprint.yaml`, and switched off
-(`operator.profileDispatcher.enabled: false`) it is still counted. A flag set in a form the chart cannot read (a `valueFrom`, a non-string value) counts
+(`operator.profileDispatcher.enabled: false`) it is still counted. It has a ceiling of about 700
+AgentProfiles at two tiers: past it the operator runs no dispatcher, and the PlatformAgent's
+`DispatcherCeiling` condition says so (#5381 lifts the ceiling). A flag set in a form the chart cannot read (a `valueFrom`, a non-string value) counts
 as on. An operator test holds that file to the operator's own list and sizes. It counts the A2A gateway at two pods, the operator's default under its
 election, with one gateway pod of surge room for a rollout, unless `operator.extraEnv` sets
 `A2A_GATEWAY_ELECTION` to `false`. It also counts the

@@ -422,7 +422,11 @@ leave open:
   identity for one. Amended 11/10: on by default, at the release set's image (with
   `A2A_DISPATCHER_IMAGE` the override), and off only at `A2A_PROFILE_DISPATCHER=false`, which
   the chart sets from `operator.profileDispatcher.enabled`. Its identity-map entry grows with
-  the profile count and is one shard's worth near 700 profiles (#5381).
+  the profile count, and one entry can't be split across shards, so it fills one shard near 700
+  profiles at two tiers. The `DispatcherCeiling` condition warns at four fifths of the shard
+  budget, and past it the operator runs no dispatcher rather than write a map the API server
+  refuses. #5381 lifts the ceiling, by deriving the grants per connection as sessions are, and
+  blocks the 2,500-profile target.
 - **Terminal notice.** A task the dispatcher ends gets a final status on its `.supervisor`
   subject (`lib.TaskSupervisorSubject`, contract addendum 6), never its `.events`, which stays
   the executor's alone: `rejected` when it is refused at admission (nothing ran), `failed`

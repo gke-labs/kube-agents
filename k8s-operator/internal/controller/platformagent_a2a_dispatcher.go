@@ -826,7 +826,18 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcherDraining(ctx context.Con
 // since a step after the Jobs Role failing doesn't undo what the pass did to
 // it.
 func (r *PlatformAgentReconciler) reconcileA2ADispatcherWithJobMode(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, profileNamespaceReady bool, draining []a2aDispatchProfile) (jobModeVerdict *metav1.Condition, profileErr error, err error) {
-	if !a2aDispatcherEnabled() {
+	// Past the size one identity-map shard can carry, the map leaves the
+	// dispatcher's entry out, so it is torn down as though switched off; the
+	// DispatcherCeiling condition says why (gke-labs/kube-agents#5381).
+	overCeiling := false
+	if a2aDispatcherEnabled() {
+		_, over, cerr := a2aDispatcherCeiling(agent, profiles, draining)
+		if cerr != nil {
+			return nil, nil, cerr
+		}
+		overCeiling = over
+	}
+	if !a2aDispatcherEnabled() || overCeiling {
 		profileErr, err = r.removeA2ADispatcher(ctx, agent)
 		if profileErr == nil && err == nil {
 			jobModeVerdict = jobModeTornDown

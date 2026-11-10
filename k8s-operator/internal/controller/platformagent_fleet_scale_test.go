@@ -356,9 +356,12 @@ func TestTheMinterPolicyConfigMapAtFleetScale(t *testing.T) {
 // check. The shard count and the placement of the entries are
 // TestTheIdentityMapShardsStayUnderTheConfigMapLimitAtFleetScale's.
 func TestTheIdentityMapConfigMapAtFleetScale(t *testing.T) {
-	// The shipped shape: no install sets the dispatcher image today, and
-	// its identity would add every durable's name to the map on top.
-	t.Setenv(a2aDispatcherImageEnvVar, "")
+	// The shipped shape: the dispatcher on, as by default. At this many
+	// profiles its entry is past what one shard carries, so the map leaves it
+	// out and the operator runs no dispatcher (a2aDispatcherCeiling,
+	// gke-labs/kube-agents#5381); TestTheDispatcherCeiling holds the
+	// thresholds.
+	t.Setenv(a2aProfileDispatcherEnvVar, "")
 	agent := a2aTestAgent()
 	profiles := fleetScaleProfileFixtures(t, agent)
 

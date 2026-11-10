@@ -5902,6 +5902,9 @@ type a2aProvisionState struct {
 	// (reconcileA2ADispatcherWithJobMode), nil when it made nothing of it,
 	// for the DispatcherJobMode condition written on the way out.
 	dispatcherJobMode *metav1.Condition
+	// dispatcherCeiling is the DispatcherCeiling verdict, written on
+	// the way out (syncDispatcherCeiling).
+	dispatcherCeiling *metav1.Condition
 
 	// gatewayHeld reports that the gateway Deployment was withheld this
 	// pass because BusCredentialsReady is not yet true. It exists to make
@@ -6378,6 +6381,18 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// The dispatcher (platformagent_a2a_dispatcher.go), when this operator
 	// has an image for it. Its pod-read Role lives in the profile namespace,
 	// and a failure there follows the same rule as the quota's.
+	// Past the size one identity-map shard can carry, the dispatcher's entry
+	// is left out of the map, so it is torn down as though switched off, and
+	// the condition says why (a2aDispatcherCeiling, gke-labs/kube-agents#5381).
+	// The step itself tears the dispatcher down past the ceiling.
+	state.dispatcherCeiling = dispatcherCeilingRemoved
+	if a2aDispatcherEnabled() {
+		ceiling, _, cerr := a2aDispatcherCeiling(agent, profiles, draining)
+		if cerr != nil {
+			return state, cerr
+		}
+		state.dispatcherCeiling = &ceiling
+	}
 	jobMode, dispatcherProfileErr, err := r.reconcileA2ADispatcherWithJobMode(ctx, agent, profiles, profileFenced, draining)
 	state.dispatcherJobMode = jobMode
 	if err != nil {

@@ -119,6 +119,15 @@ func TestTheIdentityMapShardsStayUnderTheConfigMapLimitAtFleetScale(t *testing.T
 			users = append(users, id.User)
 		}
 	}
+	// The dispatcher is on by default, and at this many profiles past the
+	// ceiling, so it is refused cleanly: left out of the map, not written
+	// into a shard the API server would refuse (gke-labs/kube-agents#5381).
+	if slices.Contains(users, a2aDispatcherUser) {
+		t.Errorf("the dispatcher's entry is in the map at %d profiles, past the ceiling one shard can carry", profileCount)
+	}
+	if _, over, err := a2aDispatcherCeiling(agent, profiles, nil); err != nil || !over {
+		t.Errorf("at %d profiles the dispatcher reads as within the ceiling (%v); this test no longer covers the refusal", profileCount, err)
+	}
 	wantUsers := make([]string, 0, len(whole.Identities))
 	for _, id := range whole.Identities {
 		wantUsers = append(wantUsers, id.User)

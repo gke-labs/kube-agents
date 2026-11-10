@@ -102,6 +102,8 @@ The profile's ServiceAccounts live there too. While the namespace is missing, or
 
 The dispatcher, `<agent>-a2a-dispatcher`, reads the profiles' submissions and hands each to a ready worker. It is the only component that publishes directly to a profile task's supervisor subject, because the bus's config denies the A2A gateway each profile's by name. So binding or removing a profile, or one finishing its drain, changes that config and restarts the bus pod, whether or not the dispatcher runs. A session task running at that moment fails, as on any bus restart. A `mode: next` install runs it by default; the chart's `operator.profileDispatcher.enabled: false` switches it off.
 
+The dispatcher has a ceiling of about 700 profiles at two tiers. Its bus identity names every profile's durable, and the identity has to fit in one shard of the callout's identity map. The PlatformAgent's `DispatcherCeiling` condition warns at four fifths of that, with a Warning event, and past it the operator runs no dispatcher, so profile tasks aren't dispatched. The condition's message names the issue that tracks lifting it, by deriving the dispatcher's grants per connection.
+
 With the dispatcher on, each admitted profile also gets a warm pool for each of its interactive tiers: a Deployment `agentprofile-<profile>-<tier>` in the profile namespace, running `warmReplicas` worker pods plus one surge pod during a rollout. The profile quota budgets those pods. The pods hold the profile's bus and broker tokens, and the operator copies the bus CA bundle beside them. A worker empties its writable directories after every task, so nothing one task leaves reaches the next. Turning the dispatcher off, or removing or refusing the profile, removes its pools.
 
 ## Status

@@ -247,18 +247,20 @@ func renderA2AAuthMapDraining(agent *agentv1alpha1.PlatformAgent, profiles []age
 		})
 	}
 	identities = append(identities, agentProfileMapEntries(agent, profiles)...)
-	// The dispatcher, when this operator has an image for it. Its grants
-	// name each durable the operator creates, so it is built here, from the
-	// same profiles (platformagent_a2a_dispatcher.go).
+	// The dispatcher, unless it is switched off. Its grants name each
+	// durable the operator creates, so it is built here, from the same
+	// profiles (platformagent_a2a_dispatcher.go). Past the ceiling one shard
+	// can carry it is left out, and the operator runs no dispatcher
+	// (a2aDispatcherCeiling, gke-labs/kube-agents#5381).
 	if a2aDispatcherEnabled() {
-		names, durables := dispatcherGrantNames(agent, profiles, draining)
-		id := dispatcherIdentity(agent, agent.Namespace, names, durables)
-		identities = append(identities, a2aAuthMapIdentity{
-			ServiceAccount: id.serviceAccount,
-			User:           id.user,
-			Account:        id.account,
-			Grants:         a2aAuthMapGrants{Publish: id.publish, Subscribe: id.subscribe},
-		})
+		_, over, err := a2aDispatcherCeiling(agent, profiles, draining)
+		if err != nil {
+			return a2aAuthMapDocument{}, err
+		}
+		if !over {
+			entry, _ := a2aDispatcherMapEntry(agent, profiles, draining)
+			identities = append(identities, entry)
+		}
 	}
 
 	// Refuse here what the callout would refuse there.
@@ -313,17 +315,7 @@ func renderA2AAuthMapDraining(agent *agentv1alpha1.PlatformAgent, profiles []age
 // Greedy and in order, so the same identities always cut the same way and an
 // unchanged map never moves an entry between shards.
 func shardA2AAuthMap(doc a2aAuthMapDocument) ([]a2aAuthMapDocument, error) {
-	prefix := strings.Repeat(a2aAuthMapIndent, a2aAuthMapIdentityDepth)
-	// The bytes one identity adds to a shard's body: its indented encoding
-	// at the depth it is rendered, the indent before its first line, and
-	// the separator after it.
-	entryBytes := func(id a2aAuthMapIdentity) (int, error) {
-		body, err := encodeA2AJSONPrefixed(id, prefix, a2aAuthMapIndent)
-		if err != nil {
-			return 0, err
-		}
-		return len(prefix) + len(body) + len(",\n"), nil
-	}
+	entryBytes := a2aAuthMapEntryBytes
 
 	var cuts [][]a2aAuthMapIdentity
 	var current []a2aAuthMapIdentity
@@ -360,6 +352,19 @@ func shardA2AAuthMap(doc a2aAuthMapDocument) ([]a2aAuthMapDocument, error) {
 
 // buildA2AAuthMapConfigMaps renders the map into the shards the callout
 // watches, in index order, and returns the version it rendered.
+// a2aAuthMapEntryBytes is the bytes one identity adds to a shard's body: its
+// indented encoding at the depth it is rendered, the indent before its first
+// line, and the separator after it. The shard partition and the dispatcher's
+// ceiling (a2aDispatcherCeiling) measure with it.
+func a2aAuthMapEntryBytes(id a2aAuthMapIdentity) (int, error) {
+	prefix := strings.Repeat(a2aAuthMapIndent, a2aAuthMapIdentityDepth)
+	body, err := encodeA2AJSONPrefixed(id, prefix, a2aAuthMapIndent)
+	if err != nil {
+		return 0, err
+	}
+	return len(prefix) + len(body) + len(",\n"), nil
+}
+
 func buildA2AAuthMapConfigMaps(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, draining []a2aDispatchProfile) ([]*corev1.ConfigMap, string, error) {
 	doc, err := renderA2AAuthMapDraining(agent, profiles, draining)
 	if err != nil {
