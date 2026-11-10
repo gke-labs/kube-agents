@@ -173,13 +173,16 @@ Ready count.
 
 ### 3.5 Re-check the one finding
 
-The fleet audit re-derives one finding on demand: its check against its target only, run through
-the sandbox from the image's copy of the script, as `stall_watch.py` runs `stall_report.py`
-(`agents/platform/scripts/stall_watch.py:56-70`). The answer is "reproduces" or not, with the
-evidence excerpt the audit already renders, and `derive_finding_state` turns it into
-`resolved-merged` or `pr-merged-persists`. A check that judges the whole cluster is narrowed to the
-target: `blocking-pdb` is read for the new budget only, so an unrelated budget elsewhere cannot fail
-a correct fix.
+The fleet audit re-derives one finding on demand: its check against its target only, using the
+collector's own check functions (`agents/platform/skills/fleet-audit/scripts/recheck.py`, #5353).
+The logic runs in the caller's process; only the `kubectl get` of the target namespace goes through
+the sandbox, because `collect.py` cannot be piped into the sandbox on stdin the way `stall_watch.py`
+runs `stall_report.py`. The answer is "clean", "reproduces" or "unchecked", with the evidence
+excerpt the audit already renders, and `derive_finding_state` turns it into `resolved-merged` or
+`pr-merged-persists`. A check that judges the whole cluster is narrowed to the target:
+`blocking-pdb` and `pdb-overlapping` read only the budgets that cover the target's pods, so an
+unrelated budget elsewhere cannot fail a correct fix, and a second budget over the same pods cannot
+pass a wrong one.
 
 ### 3.6 Report once
 
@@ -274,10 +277,10 @@ revert pull requests. It needs a paragraph in the site's security reference besi
 
 T counts from the merge time. The window starts at `applied`.
 
-| Fix type                   | T (applied by) | Window                                                                                                    | Re-check                                                |
-| -------------------------- | -------------- | --------------------------------------------------------------------------------------------------------- | ------------------------------------------------------- |
-| Missing PDB                | 60 min         | 5 min: the budget predicate in §4.2, workload Ready count unchanged                                       | `no-pdb` clean; `blocking-pdb` clean for the new budget |
-| ComputeClass node selector | 60 min         | rollout complete within 30 min, then 15 min with no restart, no OOMKill, every pod on a node of the class | `untargeted-compute-class-workload` clean               |
+| Fix type                   | T (applied by) | Window                                                                                                    | Re-check                                                                                       |
+| -------------------------- | -------------- | --------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| Missing PDB                | 60 min         | 5 min: the budget predicate in §4.2, workload Ready count unchanged                                       | `no-pdb` clean; `blocking-pdb` and `pdb-overlapping` clean for the budgets covering the target |
+| ComputeClass node selector | 60 min         | rollout complete within 30 min, then 15 min with no restart, no OOMKill, every pod on a node of the class | `untargeted-compute-class-workload` clean                                                      |
 
 The deadlines are settings with these defaults. Argo polls its repository every three minutes by
 default and Config Sync every fifteen seconds, so an hour is a stuck sync rather than a slow one. A
