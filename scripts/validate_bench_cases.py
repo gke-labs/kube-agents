@@ -330,15 +330,6 @@ KNOWN_UNREGISTERED = {
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
 # later pull request that moves the case to the nightly file.
 FIXTURE_NOT_READY = {
-    # Needs a Standard seeded cluster with a manual node pool labelled for a
-    # ComputeClass whose auto-creation is off: the lane's Autopilot hosts
-    # refuse the shape, so it is a fleet fixture addressed by role, and
-    # #5143 plants it. #4943 is the sibling ComputeClass gap on the same
-    # host constraint.
-    "ccc-manual-pools-single-rule-unbacked": (
-        "#5143: needs a Standard seeded cluster with a manual node pool under a ComputeClass "
-        "whose auto-creation is off; the lane's host clusters are Autopilot"
-    ),
     # Needs a pool with a live node whose surge node, or green pool, draws more
     # of a regional quota than the project has left. GKE bounds the surge by
     # the pool's live nodes, so a zero-node pool is not a fixture; the suite's
