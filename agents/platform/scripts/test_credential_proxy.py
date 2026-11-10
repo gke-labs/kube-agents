@@ -8688,12 +8688,9 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
                 executor.refresh_forge_credential("github", "gke-agentic/infra")
         self.assertFalse(executor._refresh_lock.locked())
 
-    def _wait_until(self, condition, deadline_seconds=5):
-        deadline = time.monotonic() + deadline_seconds
-        while not condition():
-            if time.monotonic() > deadline:
-                self.fail("condition not reached before the deadline")
-            time.sleep(0.01)
+    def _wait_until(self, condition):
+        """The module's _wait_until at the close wait, for this class's callers."""
+        _wait_until(self, condition, lambda: "condition not reached before the deadline")
 
     def test_the_lock_is_held_while_its_holder_waits_for_the_budget_and_a_second_refresher_waits_on_it_unreserved(self):
         executor = self._budgeted_executor(admits=1)
@@ -15374,12 +15371,17 @@ _HEALTH_ANSWER_SECONDS = 1
 _REFUSAL_BURST = 3
 # The lag the stamped-late test puts between a refusal's 503, written on its
 # refusal thread, and the accept loop counting it, which is the stamp the
-# quiet interval is measured from. Wider than the few milliseconds by which the
-# saturation test's quiet-interval sleep used to lead that stamp: a refusal
-# helper that returned on the 503 alone starts the sleep before the stamp, and
-# the closed holder's handler then finds the interval unexpired and says
-# nothing, which is the shape a loaded runner produced without any lag added.
-_REFUSAL_STAMP_LAG_SECONDS = 0.03
+# quiet interval is measured from. A refusal helper that returned on the 503
+# alone starts the quiet-interval sleep before the stamp, and the closed
+# holder's handler then finds the interval unexpired and says nothing, which
+# is the shape a loaded runner produced with no lag added. The lag has to
+# outlast the work between the last refusal and that sleep (a health request
+# and a few assertions, milliseconds idle) on any runner for the red to hold,
+# so it is half the loaded-runner settle rather than a margin over the idle
+# figure; and it stays inside the shortened interval, so that a red is the
+# issue's shape (the handler finds the interval unexpired and says nothing)
+# and not a stamp landing after the sleep and a line with the wrong count.
+_REFUSAL_STAMP_LAG_SECONDS = _RESET_SETTLE_SECONDS / 2
 # The small cap the saturation test builds its server with.
 _SMALL_THREAD_CAP = 4
 _KEEPALIVE_REQUESTS = 5
@@ -15407,6 +15409,22 @@ _PARTIAL_REQUEST_LINE = b"GET /"
 # the wait counted from admission and the window from the request's first
 # byte): a queue refusal always lands after the request's read deadline.
 _SLOT_WAIT_PAST_THE_WINDOW_SECONDS = 2 * _SHORT_IDLE_SECONDS
+
+
+def _wait_until(case, condition, failure, deadline_seconds=_CLOSE_WAIT_SECONDS):
+    """Poll ``condition`` every _POLL_SECONDS until it holds; past ``deadline_seconds``, fail ``case`` with ``failure()``.
+
+    The one loop for a test waiting on a server thread's work (a line a
+    handler writes as it returns, a stamp the accept loop sets, a request
+    queued behind a budget), so the deadline arithmetic and the poll interval
+    are not kept in step by hand at each site. ``failure`` is called only on
+    the way out, so a message can carry what the wait saw.
+    """
+    deadline = time.monotonic() + deadline_seconds
+    while not condition():
+        if time.monotonic() > deadline:
+            case.fail(failure())
+        time.sleep(_POLL_SECONDS)
 
 
 def _drip(sock, data, stop):
@@ -15940,13 +15958,15 @@ class ThreadCapTest(_CredentialedUnixServer):
     def _refused(self):
         """Connect past the cap and return what the connection read.
 
-        Returns once the refusal is complete on both of the server's threads:
-        the refusal thread has written the 503 and closed, and the accept
-        loop has counted it. The count stamps the server's last refusal,
-        which connection_released measures the quiet interval from; a test
-        that timed that interval from the 503 alone would, when the accept
-        loop stamps late, close a holder whose handler finds the interval
-        unexpired and says nothing.
+        Returns once the connection has read the 503 and the close behind it,
+        both written on the refusal thread, and the accept loop has counted
+        the refusal. The count stamps the server's last refusal, which
+        connection_released measures the quiet interval from; a test that
+        timed that interval from the 503 alone would, when the accept loop
+        stamps late, close a holder whose handler finds the interval
+        unexpired and says nothing. Nothing here waits for the refusal
+        thread's drain to return or its slot to come back; a test that needs
+        the slot waits on _refusal_slots with _wait_for_a_free_slot.
         """
         before = self._last_refusal_stamp()
         extra = self.connect()
@@ -15955,11 +15975,10 @@ class ThreadCapTest(_CredentialedUnixServer):
         status, headers, body = self.response(extra)
         self.assertTrue(self.closed_by_server(extra), "the refused connection stayed open")
         extra.close()  # as Envoy does on reading the answer; the drain returns at once
-        deadline = time.monotonic() + _CLOSE_WAIT_SECONDS
-        while self._last_refusal_stamp() <= before:
-            if time.monotonic() > deadline:
-                self.fail(f"the accept loop did not count the refusal within {_CLOSE_WAIT_SECONDS}s")
-            time.sleep(_POLL_SECONDS)
+        _wait_until(
+            self, lambda: self._last_refusal_stamp() > before,
+            lambda: f"the accept loop did not count the refusal within {_CLOSE_WAIT_SECONDS}s",
+        )
         return status, headers, body
 
     def _last_refusal_stamp(self):
@@ -16039,11 +16058,10 @@ class ThreadCapTest(_CredentialedUnixServer):
             time.sleep(_RESET_SETTLE_SECONDS)
             with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
                 holders[0].close()
-                deadline = time.monotonic() + _CLOSE_WAIT_SECONDS
-                while not any("thread cap released" in line for line in logs.output):
-                    if time.monotonic() > deadline:
-                        self.fail(f"the closed holder's handler did not report the release: {logs.output}")
-                    time.sleep(_POLL_SECONDS)
+                _wait_until(
+                    self, lambda: any("thread cap released" in line for line in logs.output),
+                    lambda: f"the closed holder's handler did not report the release: {logs.output}",
+                )
             released = [line for line in logs.output if "thread cap released" in line]
             self.assertEqual(1, len(released), logs.output)
             self.assertIn(f"{_REFUSAL_BURST - 1} refused since the last line", released[0])
