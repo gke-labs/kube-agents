@@ -84,7 +84,7 @@ func a2aTestCreds() *corev1.Secret {
 func TestBuildA2ANATSConfig(t *testing.T) {
 	agent := a2aTestAgent()
 	keys := a2aTestCalloutKeys(t)
-	secret := buildA2ANATSConfigSecret(agent, a2aTestCreds(), keys)
+	secret := buildA2ANATSConfigSecret(agent, a2aTestCreds(), keys, nil)
 
 	if secret.Name != "test-agent-a2a-nats-config" {
 		t.Errorf("config secret name = %q", secret.Name)
@@ -280,7 +280,7 @@ func TestSystemUsersAckGrantsAreScopedPerStream(t *testing.T) {
 		}
 	}
 
-	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 	if strings.Contains(conf, `"$JS.ACK.>"`) {
 		t.Error("nats.conf still grants unscoped $JS.ACK.> to someone")
 	}
@@ -618,7 +618,7 @@ func TestHandleDeletionReapsOnlyTheLabeledJetStreamPVC(t *testing.T) {
 // reach beyond those. The read-only web rail is the consumer; kubectl
 // port-forward is the demo transport, which is why ClusterIP is enough.
 func TestBuildA2ANATSConfigWebsocketAndWebUser(t *testing.T) {
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 
 	if !strings.Contains(conf, "websocket {") {
 		t.Fatal("nats.conf has no websocket block")
@@ -718,7 +718,7 @@ func TestBuildA2ANATSConfigWebsocketAndWebUser(t *testing.T) {
 // EXACTLY for the same reason web's list is - the reach lives in request
 // bodies and wildcards, and a blocklist cannot see either.
 func TestBuildA2ANATSConfigConsoleUser(t *testing.T) {
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 
 	start := strings.Index(conf, "user: console")
 	if start < 0 {
@@ -3878,7 +3878,7 @@ func TestNoAgentSidePrincipalCanPublishToTheDirectory(t *testing.T) {
 	// Third argument is this branch's: the callout's NKey seeds. #1313 wrote
 	// this test against the two-argument signature on main.
 	agent := a2aTestAgent()
-	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 	doc, err := renderA2AAuthMap(agent, nil)
 	if err != nil {
 		t.Fatalf("rendering the auth map: %v", err)
@@ -3980,17 +3980,17 @@ func TestA2AConfigRolloutHashOmitsCredentialsAndTracksRotation(t *testing.T) {
 
 	// Guard against an inert test: if the two creds rendered the same conf,
 	// an equal hash below would prove nothing.
-	confA := string(buildA2ANATSConfigSecret(agent, credsA, keys).Data["nats.conf"])
-	confB := string(buildA2ANATSConfigSecret(agent, credsB, keys).Data["nats.conf"])
+	confA := string(buildA2ANATSConfigSecret(agent, credsA, keys, nil).Data["nats.conf"])
+	confB := string(buildA2ANATSConfigSecret(agent, credsB, keys, nil).Data["nats.conf"])
 	if confA == confB {
 		t.Fatal("the two creds Secrets render the same nats.conf; the omission check below is inert")
 	}
 
-	hashA := a2aConfigRolloutHash(agent, credsA, keys, "serving-a")
+	hashA := a2aConfigRolloutHash(agent, credsA, keys, "serving-a", nil)
 	if len(hashA) != a2aConfigHashLength {
 		t.Errorf("rollout hash is %d characters, want %d", len(hashA), a2aConfigHashLength)
 	}
-	if hashB := a2aConfigRolloutHash(agent, credsB, keys, "serving-a"); hashA != hashB {
+	if hashB := a2aConfigRolloutHash(agent, credsB, keys, "serving-a", nil); hashA != hashB {
 		t.Errorf("the rollout hash still tracks the password bytes: %q vs %q", hashA, hashB)
 	}
 
@@ -3998,14 +3998,14 @@ func TestA2AConfigRolloutHashOmitsCredentialsAndTracksRotation(t *testing.T) {
 	// Update on the same Secret, so the UID does not move and the
 	// resourceVersion is the only thing that says a credential changed.
 	rotated := a2aFullCreds("b", "4712")
-	if hashRotated := a2aConfigRolloutHash(agent, rotated, keys, "serving-a"); hashA == hashRotated {
+	if hashRotated := a2aConfigRolloutHash(agent, rotated, keys, "serving-a", nil); hashA == hashRotated {
 		t.Error("a credential rotation does not roll the bus: the hash ignores resourceVersion")
 	}
 
 	// A config change: the agent's name is rendered into server_name.
 	other := a2aTestAgent()
 	other.Name = "other-agent"
-	if hashOther := a2aConfigRolloutHash(other, credsA, keys, "serving-a"); hashA == hashOther {
+	if hashOther := a2aConfigRolloutHash(other, credsA, keys, "serving-a", nil); hashA == hashOther {
 		t.Error("a config change does not roll the bus: the hash ignores the render")
 	}
 
@@ -4014,14 +4014,14 @@ func TestA2AConfigRolloutHashOmitsCredentialsAndTracksRotation(t *testing.T) {
 	// what the new callout signs. If this does not move the hash, the
 	// StatefulSet is never rolled and the bus rejects every authorization.
 	rotatedKeys := a2aTestCalloutKeys(t)
-	if hashKeys := a2aConfigRolloutHash(agent, credsA, rotatedKeys, "serving-a"); hashA == hashKeys {
+	if hashKeys := a2aConfigRolloutHash(agent, credsA, rotatedKeys, "serving-a", nil); hashA == hashKeys {
 		t.Error("a callout keypair rotation does not roll the bus: the hash ignores the public keys")
 	}
 
 	// A serving-certificate renewal: the kubelet updates the mounted files in
 	// place, but nats-server reads its certificate at boot, so the bus has to
 	// roll or it keeps serving the old one until it expires.
-	if hashRenewed := a2aConfigRolloutHash(agent, credsA, keys, "serving-b"); hashA == hashRenewed {
+	if hashRenewed := a2aConfigRolloutHash(agent, credsA, keys, "serving-b", nil); hashA == hashRenewed {
 		t.Error("a serving-certificate renewal does not roll the bus: the hash ignores the fingerprint")
 	}
 }
@@ -4906,7 +4906,7 @@ func TestSeedGrantsAndProvisionScriptNameTheSameStreams(t *testing.T) {
 //     including the ones a2aSeedJetStreamGrants produced. That is the question
 //     the server asks, so a wildcard cannot grant a route without naming it.
 func TestSeedHoldsNoWholesaleJetStreamAPI(t *testing.T) {
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 
 	// Seed's publish allow-list exactly, not the span to the next user: the
 	// following block's explanatory comment names grants of its own, and a
@@ -5020,7 +5020,7 @@ func TestSeedHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 // (TestAgentHoldsOnlyTheBlackboard), and a change that gave either of them the
 // other's list would put `worker` back under a new name.
 func TestBridgeHoldsNoWholesaleJetStreamAPI(t *testing.T) {
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 	got := a2aGrantSubjects(t, conf, a2aBridgeUser, "publish")
 
 	if sub, want := a2aGrantSubjects(t, conf, a2aBridgeUser, "subscribe"), []string{
@@ -5337,7 +5337,7 @@ func TestBusGrantsNameStreamsTheProvisionScriptCreates(t *testing.T) {
 // $JS.API.STREAM.DELETE.TASKS, which the wildcard permitted and which was
 // measured deleting the stream on a live install.
 func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 	got := a2aGrantSubjects(t, conf, "gateway", "publish")
 
 	if sub, want := a2aGrantSubjects(t, conf, "gateway", "subscribe"), []string{
@@ -5530,7 +5530,7 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 // this one is the cheap version that fails in milliseconds and says which
 // caller lost its route.
 func TestGatewayGrantCoversEveryJetStreamSubjectItsCallersEmit(t *testing.T) {
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 	grants := a2aGrantSubjects(t, conf, "gateway", "publish")
 
 	// The generated tokens nats.go supplies: an ordered consumer's name is
@@ -5608,7 +5608,7 @@ func TestGatewayGrantCoversEveryJetStreamSubjectItsCallersEmit(t *testing.T) {
 // are: a grant naming a bucket nothing creates is a call that times out on a
 // real install and nowhere else.
 func TestGatewayGrantNamesTheBucketItsDataPlaneWritesTo(t *testing.T) {
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 	grants := a2aGrantSubjects(t, conf, "gateway", "publish")
 
 	known := []string{a2aTasksStream}
@@ -6067,7 +6067,7 @@ func checkA2AUserGrants(t a2aGrantReporter, user string, row a2aGrantRow, lists 
 // widening gets.
 func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 	agent := a2aTestAgent()
-	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 
 	const (
 		bareJetStreamAPI = "$JS.API.>"
@@ -8518,7 +8518,7 @@ func TestProvisionedJetStreamCapsFitTheStore(t *testing.T) {
 		}
 	}
 
-	conf := renderA2ANATSConf(agent, func(string) string { return "pw" }, &a2aCalloutKeys{IssuerPublic: "A", XKeyPublic: "X"})
+	conf := renderA2ANATSConf(agent, func(string) string { return "pw" }, &a2aCalloutKeys{IssuerPublic: "A", XKeyPublic: "X"}, nil)
 	m := regexp.MustCompile(`(?m)^\s*max_file_store:\s*(\d+)\s*$`).FindStringSubmatch(conf)
 	if m == nil {
 		t.Fatal("nats.conf renders no max_file_store")

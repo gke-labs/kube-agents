@@ -9427,9 +9427,12 @@ spec:
                             The watcher counts what the rules hold back in
                             k8s_event_watcher_events_filtered_total{gate="alert_excluded"}, and the
                             end-of-day recap states how many events and workloads they held back and
-                            names the noisiest workloads. A change rolls the gateway pod. When
-                            this list is set, it replaces a WATCHER_ALERT_EXCLUDE entry in
-                            spec.deployment.env.
+                            names the noisiest workloads. A change is in force within about two
+                            minutes, without a pod restart: the operator writes the list to a
+                            ConfigMap that the watcher reads again every minute. If the agent image
+                            is older than the operator, a change applies at the next pod restart.
+                            When this list is set, it replaces a WATCHER_ALERT_EXCLUDE entry in
+                            spec.deployment.env; a move between the two rolls the pod once.
                           items:
                             description: |-
                               EventWatcherAlertExcludeRule is one alertExclude entry. Every part is

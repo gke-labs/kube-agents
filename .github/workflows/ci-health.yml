@@ -235,9 +235,16 @@ env:
   # and until a writers build is on record any other listing failure but a
   # hang is a note too: it has a watermark of its own.
   NIGHTLY_WRITERS_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-writers/
-  # The periodic that runs the nightly main part's second half (main-b) when
-  # that part runs as two jobs, in the same bucket; read the same way.
+  # The periodics that run the nightly main part's other shards (main-b to
+  # main-e) when that part runs as five jobs, in the same bucket, and the
+  # writers part's other thirds (writers-b, writers-c) when it runs as three;
+  # read the same way.
   NIGHTLY_MAIN_B_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-main-b/
+  NIGHTLY_MAIN_C_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-main-c/
+  NIGHTLY_MAIN_D_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-main-d/
+  NIGHTLY_MAIN_E_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-main-e/
+  NIGHTLY_WRITERS_B_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-writers-b/
+  NIGHTLY_WRITERS_C_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-writers-c/
   # The GitLab lane's nightly (kube-agents#2832): the lane's list once a night,
   # tier gitlab with no pull request, listed under the Brief's GitLab section.
   GITLAB_NIGHTLY_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/
@@ -397,6 +404,11 @@ jobs:
             --nightly-prefix "$NIGHTLY_PREFIX" \
             --nightly-writers-prefix "$NIGHTLY_WRITERS_PREFIX" \
             --nightly-main-b-prefix "$NIGHTLY_MAIN_B_PREFIX" \
+            --nightly-main-c-prefix "$NIGHTLY_MAIN_C_PREFIX" \
+            --nightly-main-d-prefix "$NIGHTLY_MAIN_D_PREFIX" \
+            --nightly-main-e-prefix "$NIGHTLY_MAIN_E_PREFIX" \
+            --nightly-writers-b-prefix "$NIGHTLY_WRITERS_B_PREFIX" \
+            --nightly-writers-c-prefix "$NIGHTLY_WRITERS_C_PREFIX" \
             --gitlab-nightly-prefix "$GITLAB_NIGHTLY_PREFIX" \
             --lane-nightly-prefix "gitlab=$GITLAB_NIGHTLY_NEXT_PREFIX" \
             --lane-pr-glob "ghes=$GHES_PR_GLOB" \

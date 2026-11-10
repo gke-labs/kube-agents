@@ -145,7 +145,7 @@ func TestTheBusRendersAClusterByDefaultAndOneServerOnRequest(t *testing.T) {
 				}
 			}
 
-			conf := renderA2ANATSConf(agent, func(k string) string { return "pw-" + k }, &a2aCalloutKeys{IssuerPublic: "A", XKeyPublic: "X"})
+			conf := renderA2ANATSConf(agent, func(k string) string { return "pw-" + k }, &a2aCalloutKeys{IssuerPublic: "A", XKeyPublic: "X"}, nil)
 			if got := a2aClusterBlockRe.MatchString(conf); got != tc.wantCluster {
 				t.Errorf("cluster block present = %v, want %v", got, tc.wantCluster)
 			}
@@ -246,7 +246,7 @@ func TestTheBusFenceAdmitsRoutesFromItsOwnServersOnly(t *testing.T) {
 // every route once there is one), and renders no route user or password, in
 // the block or in the route URL.
 func TestTheRoutesAuthenticateByCertificateOnly(t *testing.T) {
-	conf := renderA2ANATSConf(a2aTestAgent(), func(k string) string { return "pw-" + k }, &a2aCalloutKeys{IssuerPublic: "A", XKeyPublic: "X"})
+	conf := renderA2ANATSConf(a2aTestAgent(), func(k string) string { return "pw-" + k }, &a2aCalloutKeys{IssuerPublic: "A", XKeyPublic: "X"}, nil)
 	block := a2aClusterBlockRe.FindString(conf)
 	for _, want := range []string{"tls {", "verify: true", `ca_file: "` + a2aNATSTLSMountDir + "/" + a2aNATSTLSCAKey + `"`, `cert_file: "` + a2aNATSTLSMountDir + "/" + a2aNATSTLSCertKey + `"`} {
 		if !strings.Contains(block, want) {
@@ -396,7 +396,7 @@ func TestEveryProvisionedStreamTakesTheConfiguredReplicaCount(t *testing.T) {
 func TestTheRenderedClusterFormsOverVerifiedRoutes(t *testing.T) {
 	agent := a2aTestAgent()
 	creds := a2aFullCreds("c", "1")
-	conf := string(buildA2ANATSConfigSecret(agent, creds, a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(agent, creds, a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 	if !a2aClusterBlockRe.MatchString(conf) {
 		t.Fatal("the default render has no cluster block")
 	}

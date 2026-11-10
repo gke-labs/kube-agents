@@ -335,7 +335,7 @@ func a2aProvisionLikeTheScript(t *testing.T, url, seedPassword string) {
 // reproduced on this server.
 func TestBridgeJetStreamGrantOnARealServer(t *testing.T) {
 	creds := a2aFullCreds("a", "1")
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 	bridgePW := string(creds.Data["bridge-password"])
 	seedPW := string(creds.Data["seed-password"])
 	gatewayPW := string(creds.Data["gateway-password"])
@@ -936,7 +936,7 @@ func TestBridgeJetStreamGrantOnARealServer(t *testing.T) {
 // re-verify back fails here with the subject named.
 func TestBridgeConsumersSurviveABusRestart(t *testing.T) {
 	creds := a2aFullCreds("a", "1")
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 	bridgePW := string(creds.Data["bridge-password"])
 	seedPW := string(creds.Data["seed-password"])
 	gatewayPW := string(creds.Data["gateway-password"])
@@ -1102,7 +1102,7 @@ func TestBridgeConsumersSurviveABusRestart(t *testing.T) {
 // all readable under the three-account layout (`TRUSTED`, `CONSOLE`, `APP`).
 func TestJetStreamStoreMigrationFromAPPToTRUSTED(t *testing.T) {
 	creds := a2aFullCreds("a", "1")
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 	seedPW := string(creds.Data["seed-password"])
 	gatewayPW := string(creds.Data["gateway-password"])
 	bridgePW := string(creds.Data["bridge-password"])

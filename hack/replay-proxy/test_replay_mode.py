@@ -72,7 +72,7 @@ class AnalyzeCase(unittest.TestCase):
         config = replay_proxy.Config(mode=mode, allow_serve=mode == "replay", cache_dir=self.cache_dir,
                                      store_dir=os.path.join(self.cache_dir, "store-" + build),
                                      redactor_path=REDACTOR, transcript_rules_path=RULES,
-                                     model_behaviour_checksum="abc", litellm_image="img", job_build=build)
+                                     litellm_config_checksum="abc", litellm_image="img", job_build=build)
         proxy = replay_proxy.ShadowProxy(config, out=io.StringIO())
         self.addCleanup(proxy.close)
         return proxy

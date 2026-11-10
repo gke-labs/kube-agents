@@ -290,7 +290,7 @@ func TestEveryRenderedBusClientTrustsTheBundle(t *testing.T) {
 // the block is there: TLS is required of the client listener.
 func TestTheBusServesTLSFromTheMountedPair(t *testing.T) {
 	agent := a2aTestAgent()
-	conf := renderA2ANATSConf(agent, func(string) string { return "pw" }, &a2aCalloutKeys{IssuerPublic: "A", XKeyPublic: "X"})
+	conf := renderA2ANATSConf(agent, func(string) string { return "pw" }, &a2aCalloutKeys{IssuerPublic: "A", XKeyPublic: "X"}, nil)
 	for _, want := range []string{
 		"tls {",
 		`cert_file: "` + a2aNATSTLSMountDir + "/" + a2aNATSTLSCertKey + `"`,
@@ -329,7 +329,7 @@ func TestTheBusServesTLSFromTheMountedPair(t *testing.T) {
 func TestTheCardPublishersTrustIsReadFromTheBundleOnEachHandshake(t *testing.T) {
 	agent := a2aTestAgent()
 	creds := a2aFullCreds("c", "1")
-	conf := string(buildA2ANATSConfigSecret(agent, creds, a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(agent, creds, a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 	s, _ := a2aStartRenderedServer(t, conf)
 	dir, _ := a2aTestTLSMaterial(t)
 	testCA, err := os.ReadFile(filepath.Join(dir, a2aNATSTLSCAKey))
