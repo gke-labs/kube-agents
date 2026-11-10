@@ -207,6 +207,44 @@ func TestProfileRouteForConfirmsAFolderMemberAgainstTheResolvedScope(t *testing.
 	}
 }
 
+// A project number in exclude.projects names a project the declaration can't
+// tie to an ID. With a selector, the resolved scope decides: the publisher
+// lists a member the number matched in excludedProjects, and a member it
+// didn't as a row. Without a selector, or for an explicit project, there is no
+// document to decide, so the target stays unconfirmed. Cluster exclusions
+// still apply first.
+func TestGatewayCheckScope_ANumberExclusionDefersToTheResolvedScope(t *testing.T) {
+	const scope = `{"present":true,"metricsScopes":["scope-p"],"projects":["p-explicit"],"exclude":{"projects":["123456789012"],"clusters":[{"projectId":"p-member","location":"l","clusterName":"dropped"}]}}`
+	decl := scopeFrom(t, scope)
+	member := clusterTarget{Project: "p-member", Location: "l", Cluster: "c"}
+	numbered := clusterTarget{Project: "p-numbered", Location: "l", Cluster: "c"}
+	now := time.Now().UTC().Format(time.RFC3339)
+	src := &fakeResolvedSource{doc: &resolvedScope{V: 1, ResolvedAt: now, MemberHash: memberHash(decl), State: "ok",
+		ExcludedProjects: []string{"p-numbered"},
+		Projects:         []resolvedRow{{ID: "p-member", Outcome: "ok", ConfirmedAt: now}}}}
+	g := &Gateway{cfg: &Config{}, log: slog.New(slog.NewTextHandler(io.Discard, nil)), resolvedScope: src}
+
+	if err := g.checkScope(decl, member); err != nil {
+		t.Fatalf("a member the number did not match: %v", err)
+	}
+	if err := g.checkScope(decl, numbered); err == nil || !strings.Contains(err.Error(), "excluded") {
+		t.Fatalf("the member the number matched: %v, want an excluded refusal", err)
+	}
+	if err := g.checkScope(decl, clusterTarget{Project: "p-member", Location: "l", Cluster: "dropped"}); err == nil ||
+		!strings.Contains(err.Error(), "excluded") {
+		t.Fatalf("an excluded cluster: %v, want an excluded refusal", err)
+	}
+	calls := src.calls
+	explicit := clusterTarget{Project: "p-explicit", Location: "l", Cluster: "c"}
+	if err := g.checkScope(decl, explicit); err == nil || !strings.Contains(err.Error(), "can't confirm") || src.calls != calls {
+		t.Fatalf("an explicit project: err=%v reads=%d, want can't confirm without a read", err, src.calls-calls)
+	}
+	noSelector := scopeFrom(t, `{"present":true,"projects":["p-explicit"],"exclude":{"projects":["123456789012"]}}`)
+	if err := g.checkScope(noSelector, member); err == nil || !strings.Contains(err.Error(), "can't confirm") {
+		t.Fatalf("no selector: %v, want can't confirm", err)
+	}
+}
+
 type fakeResolvedSource struct {
 	doc   *resolvedScope
 	err   error

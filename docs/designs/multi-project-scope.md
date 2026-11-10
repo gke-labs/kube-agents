@@ -396,10 +396,9 @@ fields the gateway does not read carry the rest of what the reconcile's own snap
 number-to-ID memo and the members counted against the cap that have no row. The operator starts
 it as a Job every 15 minutes, when the membership fields change, and at creation. The broker's
 `scope` caller role admits only the lookups' five argv shapes, each on an argument the broker's
-own copy of `scope.json` declares or an earlier lookup returned. The gateway's check of the
-document does not ship yet; it admits explicit projects and the management project from the
-declaration and its own environment. The reconcile, its snapshot and today-mode installs do not
-change.
+own copy of `scope.json` declares or an earlier lookup returned. The gateway checks a profile
+task's target against the document, as described below. The reconcile, its snapshot and today-mode
+installs do not change.
 
 Whether the snapshot should also be lifted into `.status` is open (§11). It would make `kubectl get
 platformagent -o yaml` answer "which projects does this install manage" without a pod exec, but the

@@ -381,6 +381,11 @@ func checkTargetScope(decl *scopeDeclaration, management string, t clusterTarget
 	// entry matching it is ignored, as the reconcile does. Its own
 	// clusters can still be excluded by name below.
 	isManagement := management != "" && t.Project == management
+	// A number entry also drops the project the number names, which the
+	// reconcile ties to an ID through Metrics Scope naming. The declaration
+	// has no number for an ID; the resolved scope does (its
+	// excludedProjects), so only a target it decides can be confirmed.
+	numberUnresolved := false
 	if !isManagement {
 		excluded, err := projectExcluded(t.Project, decl.Exclude.Projects)
 		if err != nil {
@@ -389,23 +394,21 @@ func checkTargetScope(decl *scopeDeclaration, management string, t clusterTarget
 		if excluded {
 			return refused(noticeTargetExcluded, t)
 		}
-		// A number entry also drops the project the number names, which the
-		// reconcile ties to an ID through Metrics Scope naming. The gateway
-		// has no number for an ID, so it can't confirm the target isn't the
-		// project excluded.
-		if !isProjectNumber(t.Project) && slices.ContainsFunc(decl.Exclude.Projects, isProjectNumber) {
-			return refused(noticeTargetUnconfirmed, t)
-		}
+		numberUnresolved = !isProjectNumber(t.Project) && slices.ContainsFunc(decl.Exclude.Projects, isProjectNumber)
 	}
 	for _, c := range decl.Exclude.Clusters {
 		if c.ProjectID == t.Project && c.Location == t.Location && c.ClusterName == t.Cluster {
 			return refused(noticeTargetExcluded, t)
 		}
 	}
+	explicit := slices.Contains(decl.Projects, t.Project)
+	if numberUnresolved && (!decl.Present || explicit || !declaresResolution(decl)) {
+		return refused(noticeTargetUnconfirmed, t)
+	}
 	if !decl.Present || isManagement {
 		return nil
 	}
-	if slices.Contains(decl.Projects, t.Project) {
+	if explicit {
 		return nil
 	}
 	if declaresResolution(decl) {
