@@ -32,11 +32,25 @@ the gateway is switched off on purpose. Its other rows stay.
 The script never mutates. It prints a table (or ``--json``) and always ends
 with ``stalled resources: <count>``, ``0`` on a healthy namespace.
 
+Cluster mode (``--namespaces``) is the stall watch's: it reads each kind once
+across every namespace, pages the kinds the credential broker lets a raw read
+page (``RAW_COLLECTIONS``: ``kubectl get --raw <collection>?limit=``, the
+reply bounded a page at a time) and the rest with one chunked ``kubectl get
+<kind> --all-namespaces``, splits what came back per namespace in Python, and
+prints one JSON report per named namespace, each the report the namespace
+read would have printed. A kind no cluster-wide read could read whole (the
+broker cut the reply at its output cap, the read failed, or a ``kind/name``
+that names one object) is listed under ``fallback`` and not analysed; the
+watch reads it per namespace as before. The Warning events are read the same
+way, and ``events_fallback`` says when they were not. A fleet of hundreds of
+namespaces costs kinds-plus-one reads per cluster rather than per namespace.
+
 Usage::
 
     stall_report.py --namespace payments
     stall_report.py --namespace payments --kind gateways,httproutes
     stall_report.py --namespace payments --threshold-minutes 60 --json
+    stall_report.py --namespaces payments,billing --kind deployments --extra-kinds billing=sqlinstances.sql.cnrm.cloud.google.com --json
 """
 
 from __future__ import annotations
@@ -45,6 +59,7 @@ import argparse
 import json
 import subprocess
 import sys
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 
 KUBECTL = "kubectl"
@@ -64,6 +79,96 @@ EVENTS_RESOURCE = "events"
 # rather than a List.
 RESOURCE_NAME_SEPARATOR = "/"
 WARNING_PREFIX = "warning: "
+
+# Cluster mode's vocabulary. A cluster-wide read is one of two shapes. The
+# kinds in RAW_COLLECTIONS are read through `kubectl get --raw
+# <collection>?limit=N`, following `metadata.continue`, which is how the
+# fleet collectors page a large kind: each reply is one page, so the broker's
+# output cap (CREDENTIAL_PROXY_MAX_OUTPUT_BYTES, 8 MiB as the operator deploys
+# it) bounds a page and never the kind. The table is the namespaced part of
+# the broker's own raw-path allowlist (command_policy.KUBECTL_RAW_COLLECTIONS,
+# less the resources a scan skips); a raw read of any other path is refused
+# there, so every other kind, a CRD or a Config Connector kind among them, is
+# read with one `kubectl get <kind> --all-namespaces --chunk-size=500`, where
+# kubectl pages its requests and prints one reply. That reply the broker can
+# cut, and a cut reply, or a failed read, sends the kind back to the
+# per-namespace path, so nothing is lost and a busy kind costs what it did.
+# The raw API returns `managedFields` without being asked and no `kind` on
+# an item, so items are stamped from the table.
+ALL_NAMESPACES_FLAG = "--all-namespaces"
+# The page size the fleet collectors read at (collector_run.PAGE_SIZE), and
+# kubectl's request page for the chunked read.
+PAGE_SIZE = 500
+CHUNK_SIZE_ARG = f"--chunk-size={PAGE_SIZE}"
+RAW_FLAG = "--raw"
+RAW_LIMIT_KEY = "limit"
+RAW_CONTINUE_KEY = "continue"
+RAW_FIELD_SELECTOR_KEY = "fieldSelector"
+RAW_QUERY_MARK = "?"
+# A page the broker cut is asked for again at half the size, down to this
+# floor; an object list too fat for a page of this many is left to the
+# per-namespace read.
+RAW_PAGE_SIZE_MIN = 25
+RAW_PAGE_HALVING = 2
+# A server that keeps handing out continue tokens is stopped here; the fleet
+# collectors stop at the same count.
+RAW_MAX_PAGES = 10000
+# The raw list's `kind` is the item kind with this suffix (`DeploymentList`).
+LIST_KIND_SUFFIX = "List"
+# A raw collection: its path, the item kind, the apiVersion the items carry.
+# Keyed by the bare plural and by the api-resources name with its group, the
+# two spellings a kind list carries.
+RAW_COLLECTIONS: dict[str, tuple[str, str, str]] = {
+    name: entry
+    for names, entry in (
+        (("pods",), ("/api/v1/pods", "Pod", "v1")),
+        (("services",), ("/api/v1/services", "Service", "v1")),
+        (("persistentvolumeclaims",), ("/api/v1/persistentvolumeclaims", "PersistentVolumeClaim", "v1")),
+        (("serviceaccounts",), ("/api/v1/serviceaccounts", "ServiceAccount", "v1")),
+        (("limitranges",), ("/api/v1/limitranges", "LimitRange", "v1")),
+        (("resourcequotas",), ("/api/v1/resourcequotas", "ResourceQuota", "v1")),
+        (("deployments", "deployments.apps"), ("/apis/apps/v1/deployments", "Deployment", "apps/v1")),
+        (("daemonsets", "daemonsets.apps"), ("/apis/apps/v1/daemonsets", "DaemonSet", "apps/v1")),
+        (("replicasets", "replicasets.apps"), ("/apis/apps/v1/replicasets", "ReplicaSet", "apps/v1")),
+        (("statefulsets", "statefulsets.apps"), ("/apis/apps/v1/statefulsets", "StatefulSet", "apps/v1")),
+        (
+            ("horizontalpodautoscalers", "horizontalpodautoscalers.autoscaling"),
+            ("/apis/autoscaling/v2/horizontalpodautoscalers", "HorizontalPodAutoscaler", "autoscaling/v2"),
+        ),
+        (("cronjobs", "cronjobs.batch"), ("/apis/batch/v1/cronjobs", "CronJob", "batch/v1")),
+        (("jobs", "jobs.batch"), ("/apis/batch/v1/jobs", "Job", "batch/v1")),
+        (("ingresses", "ingresses.networking.k8s.io"), ("/apis/networking.k8s.io/v1/ingresses", "Ingress", "networking.k8s.io/v1")),
+        (
+            ("networkpolicies", "networkpolicies.networking.k8s.io"),
+            ("/apis/networking.k8s.io/v1/networkpolicies", "NetworkPolicy", "networking.k8s.io/v1"),
+        ),
+        (("poddisruptionbudgets", "poddisruptionbudgets.policy"), ("/apis/policy/v1/poddisruptionbudgets", "PodDisruptionBudget", "policy/v1")),
+    )
+    for name in names
+}
+# The Warning events, cluster-wide: the raw collection, with the selector the
+# per-namespace read passes to kubectl as a query parameter.
+EVENTS_COLLECTION = ("/api/v1/events", "Event", "v1")
+# What the credential proxy shim prints on stderr, and exits with, when the
+# broker cut a reply at its output cap. An older shim exited as kubectl did,
+# so the text is read before the exit code (stall_watch.py names the same
+# text; this script runs alone in the sandbox and imports nothing).
+PROXY_TRUNCATED_TEXT = "credential proxy output truncated"
+EXIT_OUTPUT_TRUNCATED = 74
+# The referent listing cluster mode resolves names from: namespace and name
+# only, as `-o name` is per namespace, so Secret bodies never cross.
+NO_HEADERS_FLAG = "--no-headers"
+NAME_COLUMNS = "custom-columns=NAMESPACE:.metadata.namespace,NAME:.metadata.name"
+NAME_COLUMN_COUNT = 2
+# The cluster report's keys, read by stall_watch.py.
+REPORT_NAMESPACES_KEY = "namespaces"
+REPORT_FALLBACK_KEY = "fallback"
+REPORT_EVENTS_FALLBACK_KEY = "events_fallback"
+# `--extra-kinds <namespace>=<kinds>`: the kinds one namespace is asked about
+# beyond the list every namespace gets.
+EXTRA_KINDS_SEPARATOR = "="
+NAMESPACES_SEPARATOR = ","
+KINDS_SEPARATOR = ","
 
 # How long an object may sit without progress before it is a stall. One default
 # for every kind, with per-kind overrides where the API itself names a horizon:
@@ -856,13 +961,244 @@ def collect(namespace: str, kinds: str | None) -> tuple[list[dict], list[dict]]:
     return objects, list(events or [])
 
 
+# --------------------------------------------------------------------------
+# cluster mode
+# --------------------------------------------------------------------------
+
+
+def reply_cut(rc: int, stderr: str) -> bool:
+    """Whether the credential proxy cut this reply at its output cap."""
+    return PROXY_TRUNCATED_TEXT in (stderr or "") or rc == EXIT_OUTPUT_TRUNCATED
+
+
+def by_namespace(items: list[dict]) -> dict[str, list[dict]]:
+    split: dict[str, list[dict]] = {}
+    for item in items:
+        if isinstance(item, dict):
+            split.setdefault(str((item.get("metadata") or {}).get("namespace", "")), []).append(item)
+    return split
+
+
+def raw_pages(collection: tuple[str, str, str], field_selector: str | None = None) -> list[dict] | None:
+    """Every object of one raw collection, `PAGE_SIZE` a page, each item
+    stamped with its kind and apiVersion; None, with a warning, when a page
+    failed, could not be parsed, or was cut at the smallest page this script
+    asks for. A cut page is asked for again at half the size: the continue
+    token names where the page starts, not how long it is."""
+    path, kind, api_version = collection
+    items: list[dict] = []
+    token = ""
+    size = PAGE_SIZE
+    seen_tokens: set[str] = set()
+    for _ in range(RAW_MAX_PAGES):
+        params = {RAW_LIMIT_KEY: str(size)}
+        if field_selector:
+            params[RAW_FIELD_SELECTOR_KEY] = field_selector
+        if token:
+            params[RAW_CONTINUE_KEY] = token
+        url = f"{path}{RAW_QUERY_MARK}{urllib.parse.urlencode(params)}"
+        rc, stdout, stderr = run_kubectl([KUBECTL_GET, RAW_FLAG, url])
+        if reply_cut(rc, stderr):
+            if size // RAW_PAGE_HALVING >= RAW_PAGE_SIZE_MIN:
+                size //= RAW_PAGE_HALVING
+                continue
+            warn_lines(stderr)
+            sys.stderr.write(f"{WARNING_PREFIX}{path} cut at a page of {size}; read per namespace instead\n")
+            return None
+        if rc != 0 or not stdout.strip():
+            warn_lines(stderr)
+            sys.stderr.write(f"{WARNING_PREFIX}{path} page failed ({rc}); read per namespace instead\n")
+            return None
+        try:
+            page = json.loads(stdout)
+        except json.JSONDecodeError as exc:
+            sys.stderr.write(f"{WARNING_PREFIX}{path} page is not JSON ({exc}); read per namespace instead\n")
+            return None
+        page_items = page.get("items") if isinstance(page, dict) else None
+        if not isinstance(page_items, list):
+            sys.stderr.write(f"{WARNING_PREFIX}{path} page has no items list; read per namespace instead\n")
+            return None
+        for item in page_items:
+            if isinstance(item, dict):
+                item.setdefault("kind", kind)
+                item.setdefault("apiVersion", api_version)
+        items.extend(page_items)
+        metadata = page.get("metadata")
+        token = (metadata.get(RAW_CONTINUE_KEY) if isinstance(metadata, dict) else "") or ""
+        if not token:
+            return items
+        if token in seen_tokens:
+            sys.stderr.write(f"{WARNING_PREFIX}{path} repeated a continue token; read per namespace instead\n")
+            return None
+        seen_tokens.add(token)
+    sys.stderr.write(f"{WARNING_PREFIX}{path} ran past {RAW_MAX_PAGES} pages; read per namespace instead\n")
+    return None
+
+
+def chunked_listing(args: list[str]) -> list[dict] | None:
+    """One `kubectl get ... --all-namespaces --chunk-size=N -o json` reply's
+    items; None, with a warning, when the broker cut the reply or the read
+    failed. Partial output of a failed read is not kept: across every
+    namespace, the objects past the failure would read as absent."""
+    rc, stdout, stderr = run_kubectl([*args, OUTPUT_FLAG, OUTPUT_JSON])
+    if reply_cut(rc, stderr):
+        warn_lines(stderr)
+        sys.stderr.write(f"{WARNING_PREFIX}{args[1]} across every namespace was cut; read per namespace instead\n")
+        return None
+    if rc != 0 or not stdout.strip():
+        warn_lines(stderr)
+        sys.stderr.write(f"{WARNING_PREFIX}{args[1]} across every namespace failed ({rc}); read per namespace instead\n")
+        return None
+    try:
+        listing = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        sys.stderr.write(f"{WARNING_PREFIX}{args[1]} across every namespace returned unparseable output ({exc}); read per namespace instead\n")
+        return None
+    return list(listing.get("items") or []) if isinstance(listing, dict) else None
+
+
+def read_kind_cluster_wide(resource: str) -> dict[str, list[dict]] | None:
+    """Every object of one kind, by namespace; None when the kind is left to
+    the per-namespace read: a `kind/name` (one object, in one namespace), a
+    raw collection whose pages could not all be read, or a chunked read the
+    broker cut or that failed."""
+    if RESOURCE_NAME_SEPARATOR in resource:
+        return None
+    collection = RAW_COLLECTIONS.get(resource)
+    if collection is not None:
+        items = raw_pages(collection)
+        return None if items is None else by_namespace(items)
+    items = chunked_listing([KUBECTL_GET, resource, ALL_NAMESPACES_FLAG, CHUNK_SIZE_ARG, SHOW_MANAGED_FIELDS_FLAG])
+    return None if items is None else by_namespace(items)
+
+
+def read_warning_events_cluster_wide() -> dict[str, list[dict]] | None:
+    """Every Warning event, by namespace: the raw collection paged, else one
+    chunked read; None when neither could read them whole."""
+    items = raw_pages(EVENTS_COLLECTION, WARNING_EVENTS_SELECTOR)
+    if items is None:
+        items = chunked_listing([KUBECTL_GET, EVENTS_RESOURCE, ALL_NAMESPACES_FLAG, CHUNK_SIZE_ARG, FIELD_SELECTOR_FLAG, WARNING_EVENTS_SELECTOR])
+    return None if items is None else by_namespace(items)
+
+
+def kubectl_names_cluster_wide(resource: str) -> set[tuple[str, str]] | None:
+    """The (namespace, name) pairs of `resource` across every namespace, or
+    None when the API cannot be read or the reply was cut, since a cut
+    listing would report every reference past the cut as dangling. Names
+    only, as the per-namespace `-o name` is, so Secret bodies never cross."""
+    rc, stdout, stderr = run_kubectl([KUBECTL_GET, resource, ALL_NAMESPACES_FLAG, CHUNK_SIZE_ARG, NO_HEADERS_FLAG, OUTPUT_FLAG, NAME_COLUMNS])
+    if rc != 0 or reply_cut(rc, stderr):
+        sys.stderr.write(
+            f"{WARNING_PREFIX}cannot list {resource} across every namespace; references to "
+            f"{resource} are not checked: {stderr.strip()}\n"
+        )
+        return None
+    names: set[tuple[str, str]] = set()
+    for line in stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= NAME_COLUMN_COUNT:
+            names.add((parts[0], parts[1]))
+    return names
+
+
+class ClusterNameResolver(NameResolver):
+    """`NameResolver` over one listing per referent kind across every
+    namespace, so a cluster of hundreds of namespaces resolves its references
+    from at most one read per kind."""
+
+    def __init__(self, lister=kubectl_names_cluster_wide):
+        super().__init__()
+        self._cluster_lister = lister
+        self._names: dict[str, set[tuple[str, str]] | None] = {}
+
+    def exists(self, kind: str, namespace: str, name: str) -> bool | None:
+        resource = REFERENT_RESOURCES.get(kind)
+        if resource is None:
+            return None
+        if resource not in self._names:
+            self._names[resource] = self._cluster_lister(resource)
+        names = self._names[resource]
+        if names is None:
+            return None
+        return (namespace, name) in names
+
+
+def collect_cluster(kinds: list[str]) -> tuple[dict[str, dict[str, list[dict]]], dict[str, list[dict]] | None, list[str]]:
+    """Every object of every kind in `kinds`, by kind and namespace, the
+    Warning events by namespace (None when they could not be read whole),
+    and the kinds left to the per-namespace read."""
+    objects: dict[str, dict[str, list[dict]]] = {}
+    fallback: list[str] = []
+    for resource in kinds:
+        split = read_kind_cluster_wide(resource)
+        if split is None:
+            fallback.append(resource)
+        else:
+            objects[resource] = split
+    return objects, read_warning_events_cluster_wide(), fallback
+
+
+def parse_extra_kinds(values: list[str]) -> dict[str, list[str]]:
+    """`--extra-kinds <namespace>=<kinds>` values as {namespace: [kinds]}."""
+    extra: dict[str, list[str]] = {}
+    for value in values or []:
+        namespace, sep, kinds = value.partition(EXTRA_KINDS_SEPARATOR)
+        if not sep or not namespace:
+            raise ValueError(f"--extra-kinds takes <namespace>=<kinds>, got {value!r}")
+        extra.setdefault(namespace, []).extend(k for k in kinds.split(KINDS_SEPARATOR) if k)
+    return extra
+
+
+def report_cluster(
+    namespaces: list[str],
+    kinds: str | None,
+    extra: dict[str, list[str]],
+    now: datetime,
+    override_minutes: int | None = None,
+    resolver: NameResolver | None = None,
+    scale: ScaleResolver | None = None,
+) -> dict:
+    """The cluster report: per named namespace, the report the namespace
+    read gives for the kinds asked there (`kinds`, every namespaced kind
+    when None, plus the namespace's `extra`), from one cluster-wide read per
+    kind, and the kinds and events left to the per-namespace read."""
+    # None is every namespaced kind; an empty string is no kind, for a
+    # namespace list whose kinds are all in `extra`.
+    base = [r for r in (kinds.split(KINDS_SEPARATOR) if kinds is not None else namespaced_resources()) if r]
+    asked = {ns: list(dict.fromkeys(base + list(extra.get(ns) or []))) for ns in namespaces}
+    every = list(dict.fromkeys(r for ns in namespaces for r in asked[ns]))
+    objects, events, fallback = collect_cluster(every)
+    resolver = resolver or ClusterNameResolver()
+    scale = scale or ScaleResolver()
+    reports: dict[str, dict] = {}
+    for namespace in namespaces:
+        # The objects in the order the per-namespace read lists them: kind
+        # by kind as asked, each kind in the order the server gave.
+        here = [o for r in asked[namespace] if r in objects for o in objects[r].get(namespace, [])]
+        findings = analyze(here, events.get(namespace, []) if events is not None else [], resolver, now, override_minutes, scale)
+        reports[namespace] = {"namespace": namespace, "stalled_resources": stalled_object_count(findings), "findings": findings}
+    return {REPORT_NAMESPACES_KEY: reports, REPORT_FALLBACK_KEY: fallback, REPORT_EVENTS_FALLBACK_KEY: events is None}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--namespace", "-n", required=True, help="namespace to inspect")
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument("--namespace", "-n", help="namespace to inspect")
+    target.add_argument(
+        "--namespaces",
+        help="cluster mode: comma-separated namespaces to report on, each kind read once across "
+        "every namespace and split per namespace; prints one JSON report per namespace (needs --json)",
+    )
     parser.add_argument(
         "--kind",
         help="comma-separated kubectl resource names to inspect instead of every "
         "namespaced kind (e.g. deployments,gateways.gateway.networking.k8s.io)",
+    )
+    parser.add_argument(
+        "--extra-kinds",
+        action="append",
+        metavar="NAMESPACE=KINDS",
+        help="cluster mode: kinds one namespace is asked about beyond --kind; repeatable",
     )
     parser.add_argument(
         "--threshold-minutes",
@@ -872,6 +1208,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--json", action="store_true", help="emit JSON instead of a table")
     args = parser.parse_args(argv)
+
+    if args.namespaces is not None:
+        if not args.json:
+            parser.error("--namespaces prints one JSON report per namespace; pass --json")
+        namespaces = [n for n in args.namespaces.split(NAMESPACES_SEPARATOR) if n]
+        try:
+            extra = parse_extra_kinds(args.extra_kinds)
+            report = report_cluster(namespaces, args.kind, extra, datetime.now(timezone.utc), args.threshold_minutes)
+        except (RuntimeError, ValueError) as exc:
+            sys.stderr.write(f"error: {exc}\n")
+            return EXIT_ERROR
+        print(json.dumps(report, indent=2))
+        return EXIT_OK
+    if args.extra_kinds:
+        parser.error("--extra-kinds goes with --namespaces")
 
     try:
         objects, events = collect(args.namespace, args.kind)

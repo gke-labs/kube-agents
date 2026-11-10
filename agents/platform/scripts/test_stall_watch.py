@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """Tests for stall_watch.py: the fleet sweep is faked at the sandbox hop, the
 Session KV server at its routes and the board at the kanban command, with a
-real sqlite file for the card lookup by session."""
+real sqlite file for the card lookup by session.
+
+The sweep reads clusters SCAN_WORKERS at a time; `Base` pins the width to one
+so a test's fixed clock readings land where the test put them, and `Parallel`
+widens it and tests the width itself."""
 
 import http.client
 import io
@@ -143,7 +147,24 @@ class FakeFleet:
     exempt annotation's value a `kubectl get` of that object prints; an object
     not in it prints nothing, as a deleted one does."""
 
-    def __init__(self, fleet, namespaces_extra=(), listing_stderr="", hidden=(), served=None, sandbox_dies_at=None, api_resources_rc_one=False, namespaces_fail_once=(), listing_fails=(), listing_hangs=None, fetch_fails=(), annotations=None, namespaces_listing=None, object_annotations=None, objects=(), discovery=0):
+    def __init__(self, fleet, namespaces_extra=(), listing_stderr="", hidden=(), served=None, sandbox_dies_at=None, api_resources_rc_one=False, namespaces_fail_once=(), listing_fails=(), listing_hangs=None, fetch_fails=(), annotations=None, namespaces_listing=None, object_annotations=None, objects=(), discovery=0, fallback=(), events_fallback=False, cluster_read=None, hold=None, release_at=None, before_release=None):
+        # Cluster mode: the kinds the cluster-wide read reports as left to the
+        # per-namespace read, whether the events were, and what the cluster
+        # read itself does instead of answering: an exception to raise, an
+        # exit code, or the text it prints. `hold` is an Event every cluster
+        # read waits on before answering, for the tests about width.
+        self.fallback = list(fallback)
+        self.events_fallback = events_fallback
+        self.cluster_read = cluster_read
+        self.hold = hold
+        # With `hold`: the in-flight count that sets it, after `before_release` ran.
+        self.release_at = release_at
+        self.before_release = before_release
+        self.in_flight = 0
+        self.peak_in_flight = 0
+        self.flight_lock = threading.Lock()
+        # Every namespace a read covered, cluster-wide or on its own, in order.
+        self.scanned_log = []
         # The (namespace, Kind, apiVersion) rows a wildcard discovery prints,
         # on every cluster; `discovery` is its exit code (its output is kept on
         # a non-zero one, as kubectl keeps what it listed), or an exception.
@@ -238,10 +259,52 @@ class FakeFleet:
             served = self.served if self.served is not None else SERVED_DEFAULT
             rc = 1 if self.api_resources_rc_one else 0
             return completed(argv, "".join(f"{n}\n" for n in served), returncode=rc, stderr="error: unable to retrieve the complete list of server APIs: metrics.k8s.io/v1beta1" if rc else "")
+        if argv[:3] == [stall_watch.PYTHON_EXECUTABLE, stall_watch.PYTHON_ISOLATED_FLAG, stall_watch.STDIN_SCRIPT_ARG] and stall_watch.CLUSTER_NAMESPACES_FLAG in argv:
+            # The cluster read: one report per namespace with a list fixture,
+            # in the order asked. A namespace with any other fixture is left
+            # out of the report, which sends the watch to the per-namespace
+            # read, where the fixture answers as it always did.
+            cluster_name = self._cluster_from(kubeconfig)[1]
+            with self.flight_lock:
+                self.in_flight += 1
+                self.peak_in_flight = max(self.peak_in_flight, self.in_flight)
+                if self.hold is not None and self.release_at is not None and self.in_flight >= self.release_at:
+                    if self.before_release is not None:
+                        self.before_release()
+                    self.hold.set()
+            try:
+                if self.hold is not None:
+                    self.hold.wait()
+                if isinstance(self.cluster_read, Exception):
+                    raise self.cluster_read
+                if isinstance(self.cluster_read, int):
+                    return completed(argv, "", returncode=self.cluster_read, stderr="cluster mode fell over")
+                if isinstance(self.cluster_read, str):
+                    return completed(argv, self.cluster_read)
+                wanted = argv[argv.index(stall_watch.CLUSTER_NAMESPACES_FLAG) + 1].split(",")
+                reports = {}
+                for namespace in wanted:
+                    result = namespaces.get(namespace)
+                    if isinstance(result, list):
+                        self.scanned_log.append(namespace)
+                    if self.sandbox_dies_at == (cluster_name, namespace):
+                        raise stall_watch.sandbox_exec.SandboxUnavailable("ssh: connect to host sandbox port 22: Connection refused")
+                    if isinstance(result, list):
+                        reports[namespace] = {"namespace": namespace, "stalled_resources": len(result), "findings": result}
+                report = {
+                    stall_watch.CLUSTER_REPORT_NAMESPACES_KEY: reports,
+                    stall_watch.CLUSTER_REPORT_FALLBACK_KEY: list(self.fallback),
+                    stall_watch.CLUSTER_REPORT_EVENTS_FALLBACK_KEY: self.events_fallback,
+                }
+                return completed(argv, json.dumps(report))
+            finally:
+                with self.flight_lock:
+                    self.in_flight -= 1
         if argv[:3] == [stall_watch.PYTHON_EXECUTABLE, stall_watch.PYTHON_ISOLATED_FLAG, stall_watch.STDIN_SCRIPT_ARG]:
             namespace = argv[argv.index("--namespace") + 1]
             if self.sandbox_dies_at == (self._cluster_from(kubeconfig)[1], namespace):
                 raise stall_watch.sandbox_exec.SandboxUnavailable("ssh: connect to host sandbox port 22: Connection refused")
+            self.scanned_log.append(namespace)
             result = namespaces[namespace]
             if isinstance(result, Exception):
                 raise result
@@ -256,13 +319,47 @@ class FakeFleet:
         raise AssertionError(f"unexpected sandbox call {argv}")
 
     def scanned(self):
-        return [argv[argv.index("--namespace") + 1] for argv, _, _ in self.calls if argv[:1] == [stall_watch.PYTHON_EXECUTABLE]]
+        """Every namespace a read covered, in order: the cluster read's
+        namespaces as it listed them, then any read on its own."""
+        return list(self.scanned_log)
+
+    def cluster_reads(self):
+        """The cluster reads, as (namespaces asked, base kinds, {namespace: extra kinds})."""
+        reads = []
+        for argv, _, _ in self.calls:
+            if argv[:1] != [stall_watch.PYTHON_EXECUTABLE] or stall_watch.CLUSTER_NAMESPACES_FLAG not in argv:
+                continue
+            wanted = argv[argv.index(stall_watch.CLUSTER_NAMESPACES_FLAG) + 1].split(",")
+            base = argv[argv.index(stall_watch.CLUSTER_KIND_FLAG) + 1].split(",") if stall_watch.CLUSTER_KIND_FLAG in argv else None
+            extras = {}
+            for at, token in enumerate(argv):
+                if token == stall_watch.CLUSTER_EXTRA_KINDS_FLAG:
+                    namespace, _, kinds = argv[at + 1].partition(stall_watch.CLUSTER_EXTRA_KINDS_SEPARATOR)
+                    extras[namespace] = kinds.split(",")
+            reads.append((wanted, base, extras))
+        return reads
+
+    def namespace_scans(self):
+        """The reads of one namespace on their own, as (namespace, --kind list or None)."""
+        scans = []
+        for argv, _, _ in self.calls:
+            if argv[:1] == [stall_watch.PYTHON_EXECUTABLE] and "--namespace" in argv:
+                scans.append((argv[argv.index("--namespace") + 1], argv[argv.index("--kind") + 1].split(",") if "--kind" in argv else None))
+        return scans
 
     def kinds_asked(self, namespace):
-        """The --kind list the scan of `namespace` was given, or None."""
-        for argv, _, _ in self.calls:
-            if argv[:1] == [stall_watch.PYTHON_EXECUTABLE] and argv[argv.index("--namespace") + 1] == namespace:
-                return argv[argv.index("--kind") + 1].split(",") if "--kind" in argv else None
+        """The kinds `namespace` was asked about: the cluster read's base
+        list and the namespace's extras when a cluster read named it, else
+        the --kind list of its own read; None for every kind."""
+        for wanted, base, extras in self.cluster_reads():
+            if namespace in wanted:
+                if base is None:
+                    return None
+                # As join_kinds does: a plain kind the extras repeat is asked once.
+                return list(dict.fromkeys([k for k in base if k] + extras.get(namespace, [])))
+        for scanned, kinds in self.namespace_scans():
+            if scanned == namespace:
+                return kinds
         raise AssertionError(f"{namespace} was not scanned")
 
     def discoveries(self):
@@ -401,6 +498,11 @@ class Base(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         p = patch.object(stall_watch.sandbox_exec, "sandbox_enabled", return_value=False)
+        p.start()
+        self.addCleanup(p.stop)
+        # One cluster at a time, so a test's fixed clock readings land where
+        # the test put them; `Parallel` widens it and tests the width itself.
+        p = patch.object(stall_watch, "SCAN_WORKERS", 1)
         p.start()
         self.addCleanup(p.stop)
         p = patch.object(stall_watch, "dns_endpoint_args", return_value=[])
@@ -1329,11 +1431,13 @@ class Unreadable(Base):
     def test_a_scan_timeout_ends_that_clusters_sweep_for_the_tick(self):
         self.run_tick({"c": {"a": [], "b": [], "d": [dict(DEPLOYMENT_ROW, namespace="d")]}})
         scan_timeout = subprocess.TimeoutExpired("python3", stall_watch.NAMESPACE_SCAN_TIMEOUT_SECONDS)
-        lines, fake = self.run_tick({"c": {"a": [], "b": scan_timeout, "d": []}})
-        self.assertEqual(fake.scanned(), ["a", "b"], "the namespace after the timeout is not scanned")
+        # a comes back from the cluster read; b and d are left to their own
+        # reads, and b's times out, so d's is not attempted.
+        lines, fake = self.run_tick({"c": {"a": [], "b": scan_timeout, "d": stall_watch.REPORT_UNREADABLE_EXIT}})
+        self.assertEqual(fake.scanned(), ["a", "b"], "the per-namespace read after the timeout is not attempted")
         self.assertEqual(lines, [])
         self.assertIn("namespace b timed out after 300s", self.ledger()["unreadable"][f"{cid('c')}"])
-        self.assertEqual(len(self.ledger()["stalls"]), 1)
+        self.assertEqual(len(self.ledger()["stalls"]), 1, "d was not read, so its row is held")
 
     def test_an_api_resources_timeout_is_confined_to_its_cluster(self):
         self.run_tick({"a": {"ns": [DEPLOYMENT_ROW]}, "b": {"ns": []}})
@@ -1391,20 +1495,43 @@ class Unreadable(Base):
         self.assertEqual(len(self.ledger()["stalls"]), 1)
 
     def test_an_exhausted_sweep_resumes_where_it_stopped(self):
+        # The clock is read once before each cluster and once before its
+        # cluster read, so [0, 1, 2, over] reads a whole and stops before b.
         fleet = {"a": {"n1": [], "n2": []}, "b": {"n3": []}, "c": {"n4": [dict(DEPLOYMENT_ROW, namespace="n4")]}}
         over = stall_watch.TICK_BUDGET_SECONDS + 1
         with patch.object(stall_watch.time, "monotonic", side_effect=[0, 1, 2, over] + [over] * 8):
             _, fake = self.run_tick(fleet)
-        self.assertEqual(fake.scanned(), ["n1"])
-        self.assertEqual(self.ledger()[stall_watch.CURSOR_KEY], {"cluster": stall_watch.cluster_id(PROJECT, "a", LOCATION), "namespace": "n2"})
+        self.assertEqual(fake.scanned(), ["n1", "n2"], "a cluster read is whole: every namespace in one call")
+        self.assertEqual(self.ledger()[stall_watch.CURSOR_KEY], {"cluster": stall_watch.cluster_id(PROJECT, "b", LOCATION), "namespace": None})
         with patch.object(stall_watch.time, "monotonic", side_effect=[0, 1, 2, 3, 4, over] + [over] * 8):
             _, fake = self.run_tick(fleet)
-        self.assertEqual(fake.scanned(), ["n2", "n3"])
-        self.assertEqual(self.ledger()[stall_watch.CURSOR_KEY]["cluster"], stall_watch.cluster_id(PROJECT, "c", LOCATION))
+        self.assertEqual(fake.scanned(), ["n3", "n4"])
+        self.assertEqual(len(self.last_alerts), 1, "n4 was read this tick")
+        self.assertEqual(self.ledger()[stall_watch.CURSOR_KEY], {"cluster": stall_watch.cluster_id(PROJECT, "a", LOCATION), "namespace": None})
         lines, fake = self.run_tick(fleet)
-        self.assertEqual(fake.scanned(), ["n4", "n1", "n2", "n3"])
+        self.assertEqual(fake.scanned(), ["n1", "n2", "n3", "n4"])
         self.assertIsNone(self.ledger()[stall_watch.CURSOR_KEY])
+        self.assertEqual(self.last_alerts, [])
+
+    def test_a_cut_inside_a_cluster_resumes_at_the_namespace_on_the_per_namespace_path(self):
+        # The cluster read left deployments to the per-namespace read, so the
+        # namespaces are read one at a time after it, each behind a clock
+        # reading: 0 starts, 1 before a, 2 before its cluster read, 3 before
+        # n1, over before n2.
+        fleet = {"a": {"n1": [], "n2": [], "n3": [dict(DEPLOYMENT_ROW, namespace="n3")]}, "b": {"n4": []}}
+        over = stall_watch.TICK_BUDGET_SECONDS + 1
+        with patch.object(stall_watch.time, "monotonic", side_effect=[0, 1, 2, 3, over] + [over] * 8):
+            _, fake = self.run_tick(fleet, fallback=["deployments"])
+        self.assertEqual(fake.namespace_scans(), [("n1", ["deployments"])], "only the kind the cluster read could not read whole, and only until the budget")
+        self.assertEqual(self.ledger()[stall_watch.CURSOR_KEY], {"cluster": stall_watch.cluster_id(PROJECT, "a", LOCATION), "namespace": "n2"})
+        self.assertEqual(self.last_alerts, [], "n3 waits for the resume")
+        budget = self.ledger()["unreadable"][stall_watch.BUDGET_SCOPE]
+        self.assertIn(f"{stall_watch.cluster_label(stall_watch.cluster_id(PROJECT, 'a', LOCATION))} at namespace `n2`", budget)
+        _, fake = self.run_tick(fleet, fallback=["deployments"])
+        self.assertEqual(fake.cluster_reads()[0][0], ["n2", "n3"], "the cluster read resumes at the cursor too; n1 was read last tick")
+        self.assertEqual([ns for ns, _ in fake.namespace_scans()][:2], ["n2", "n3"], "the per-namespace reads resume at the cursor")
         self.assertEqual(len(self.last_alerts), 1)
+        self.assertIsNone(self.ledger()[stall_watch.CURSOR_KEY])
 
 
 class Credentials(Base):
@@ -1651,14 +1778,14 @@ class Coverage(Base):
         self.run_tick(fleet)
         over = stall_watch.TICK_BUDGET_SECONDS + 1
         # a read, down tried and failed, b's namespaces listed, then the budget
-        # runs out before b's first namespace: b counts as read, with the
-        # resume point inside it.
+        # runs out before b's cluster read: b counts as read, with the
+        # resume point at the cluster, since none of its namespaces was.
         with patch.object(stall_watch.time, "monotonic", side_effect=[0, 1, 2, 3, 4, over] + [over] * 12):
             lines, _ = self.run_tick(fleet)
         budget = self.ledger()["unreadable"][stall_watch.BUDGET_SCOPE]
         self.assertIn("read 2 of 4 clusters (1 namespaces)", budget, budget)
         self.assertIn("1 could not be read", budget)
-        self.assertIn(f"{stall_watch.cluster_label(stall_watch.cluster_id(PROJECT, 'b', LOCATION))} at namespace `ns`", budget)
+        self.assertTrue(budget.endswith(f"resumes at {stall_watch.cluster_label(stall_watch.cluster_id(PROJECT, 'b', LOCATION))}"), budget)
         self.assertNotIn("stopped", budget)
 
     def test_a_tick_that_fits_only_because_a_listing_failed_posts_no_recovery_and_keeps_the_flag(self):
@@ -1836,9 +1963,12 @@ class Timings(Base):
         fleet = {"a": {"ns": []}, "b": {"ns": [], "ns2": []}, "c": {"ns": []}}
         self.run_tick(fleet, now=self.NOW)
         over = stall_watch.TICK_BUDGET_SECONDS + 1
-        # a read in full, b cut before its second namespace, c never reached.
-        with patch.object(stall_watch.time, "monotonic", side_effect=[0, 1, 2, 3, 4, over] + [over] * 12):
-            self.run_tick(fleet, now=self.LATER)
+        # Deployments are left to the per-namespace read, so each namespace
+        # is behind a clock reading: a read in full (1 before it, 2 before
+        # its cluster read, 3 before ns), b cut before its second namespace
+        # (4, 5, 6, then over before ns2), c never reached.
+        with patch.object(stall_watch.time, "monotonic", side_effect=[0, 1, 2, 3, 4, 5, 6, over] + [over] * 12):
+            self.run_tick(fleet, now=self.LATER, fallback=["deployments"])
         timings = self.ledger()[stall_watch.CLUSTER_TIMINGS_KEY]
         self.assertEqual(timings[cid("a")][stall_watch.TIMING_AT_KEY], self.LATER)
         b = timings[cid("b")]
@@ -1867,6 +1997,203 @@ class Timings(Base):
         self.assertGreaterEqual(down[stall_watch.TIMING_SECONDS_KEY], 0)
         self.run_tick({"a": {"ns": []}}, now=self.LATER)
         self.assertEqual(sorted(self.ledger()[stall_watch.CLUSTER_TIMINGS_KEY]), [cid("a")])
+
+
+class ClusterRead(Base):
+    """One cluster read per cluster: every watched namespace in one call,
+    the served kinds, and the per-namespace read for what the cluster-wide
+    read could not read whole."""
+
+    def test_a_cluster_is_read_in_one_call_over_the_served_kinds_and_the_watched_namespaces(self):
+        certificate = finding("web", "Certificate/storefront-tls", "stale-condition", "Ready=False DoesNotExist")
+        fleet = {"c": {"checkout": [DEPLOYMENT_ROW], "payments": [], "web": [certificate], "load-test": [dict(DEPLOYMENT_ROW, namespace="load-test")]}}
+        with patch.dict(os.environ, {stall_watch.EXCLUDE_NAMESPACES_ENV: "load-test"}):
+            _, fake = self.run_tick(fleet, served=KCC_SERVED, objects=KCC_OBJECTS)
+        self.assertEqual(len(fake.cluster_reads()), 1, "one read for the cluster")
+        wanted, base, extras = fake.cluster_reads()[0]
+        self.assertEqual(wanted, ["checkout", "payments", "web"], "the excluded namespace is not asked for")
+        self.assertEqual(base, PLAIN_DEFAULT.split(","))
+        self.assertEqual(extras, {"payments": [KCC_SQL]}, "a Config Connector kind is asked only where discovery found it")
+        self.assertEqual(fake.namespace_scans(), [], "nothing is read per namespace")
+        self.assertEqual(sorted(e["object"] for e in self.ledger()["stalls"].values()), ["Certificate/storefront-tls", "Deployment/checkout-api"])
+        self.assertEqual(len(self.last_alerts), 2)
+        # The next tick's listing lacks cert-manager: the kind is not asked
+        # for, and the Certificate row is held rather than judged absent.
+        no_certs = [k for k in KCC_SERVED if k != "certificates.cert-manager.io"]
+        with patch.dict(os.environ, {stall_watch.EXCLUDE_NAMESPACES_ENV: "load-test"}):
+            lines, fake = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW], "payments": [], "web": [], "load-test": []}}, served=no_certs, objects=KCC_OBJECTS)
+        _, base, _ = fake.cluster_reads()[0]
+        self.assertNotIn("certificates.cert-manager.io", base, "a kind api-resources does not list is not read")
+        self.assertEqual(lines, [], "the Certificate row is held, not cleared")
+        self.assertEqual(sorted(e["object"] for e in self.ledger()["stalls"].values()), ["Certificate/storefront-tls", "Deployment/checkout-api"])
+        self.assertEqual(self.ledger()["unreadable"], {}, "a held unserved kind does not make the namespace unreadable")
+
+    def test_a_kind_the_cluster_read_could_not_read_whole_is_read_per_namespace(self):
+        fleet = {"c": {"checkout": [DEPLOYMENT_ROW], "web": []}}
+        _, fake = self.run_tick(fleet, fallback=["deployments"])
+        self.assertEqual(fake.namespace_scans(), [("checkout", ["deployments"]), ("web", ["deployments"])], "only the kind left over, in every namespace that asked for it")
+        self.assertEqual([e["object"] for e in self.ledger()["stalls"].values()], ["Deployment/checkout-api"])
+        self.assertEqual(sorted(self.ledger()["unreadable"]), [])
+        self.assertEqual(self.ledger()[stall_watch.CLUSTER_TIMINGS_KEY][cid("c")][stall_watch.TIMING_SCANS_KEY], 2)
+
+    def test_a_kind_left_over_that_no_namespace_asked_for_costs_no_read(self):
+        with patch.dict(os.environ, {stall_watch.KINDS_ENV: "deployments"}):
+            _, fake = self.run_tick({"c": {"payments": []}}, fallback=["gateways.gateway.networking.k8s.io"])
+        self.assertEqual(fake.namespace_scans(), [])
+        self.assertEqual(self.ledger()["unreadable"], {})
+
+    def test_events_the_cluster_read_could_not_read_whole_send_every_namespace_to_its_own_read(self):
+        _, fake = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW], "web": []}}, events_fallback=True)
+        self.assertEqual(fake.namespace_scans(), [("checkout", PLAIN_DEFAULT.split(",")), ("web", PLAIN_DEFAULT.split(","))])
+        self.assertEqual(len(self.last_alerts), 1)
+
+    def test_a_cluster_read_that_fails_or_prints_no_report_is_read_per_namespace_as_before(self):
+        for broken in (1, "not a report", "[]"):
+            with self.subTest(cluster_read=broken):
+                shutil.rmtree(self.home / stall_watch.PROFILES_DIR, ignore_errors=True)
+                self.state.unlink(missing_ok=True)
+                lines, fake = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW], "web": []}}, cluster_read=broken)
+                self.assertEqual(fake.namespace_scans(), [("checkout", PLAIN_DEFAULT.split(",")), ("web", PLAIN_DEFAULT.split(","))])
+                self.assertEqual(self.ledger()["unreadable"], {}, "the cluster-wide read never costs coverage")
+                self.assertEqual([e["object"] for e in self.ledger()["stalls"].values()], ["Deployment/checkout-api"])
+
+    def test_a_cluster_read_timeout_short_of_the_budget_is_read_per_namespace(self):
+        timeout = subprocess.TimeoutExpired("python3", stall_watch.CLUSTER_SCAN_TIMEOUT_SECONDS)
+        lines, fake = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}}, cluster_read=timeout)
+        self.assertEqual(fake.namespace_scans(), [("checkout", PLAIN_DEFAULT.split(","))])
+        self.assertEqual(self.ledger()["unreadable"], {})
+        self.assertIsNone(self.ledger()[stall_watch.CURSOR_KEY])
+        self.assertEqual(len(self.last_alerts), 1)
+
+    def test_a_cluster_read_timeout_at_the_budget_is_the_resume_point(self):
+        # 0 starts, 1 before c, 2 before its cluster read, which times out,
+        # and the reading after it is past the budget: the cut is the
+        # budget's, not the cluster's.
+        fleet = {"c": {"checkout": [DEPLOYMENT_ROW]}, "d": {"web": []}}
+        timeout = subprocess.TimeoutExpired("python3", 7)
+        over = stall_watch.TICK_BUDGET_SECONDS + 1
+        with patch.object(stall_watch.time, "monotonic", side_effect=[0, 1, 2, over] + [over] * 8):
+            lines, fake = self.run_tick(fleet, cluster_read=timeout)
+        self.assertEqual(fake.namespace_scans(), [])
+        self.assertEqual(self.ledger()[stall_watch.CURSOR_KEY], {"cluster": cid("c"), "namespace": None})
+        self.assertNotIn(cid("c"), self.ledger()["unreadable"], "a timeout at the budget is not a failed cluster")
+        # c's namespaces were listed, so it counts as read, with none of them scanned.
+        self.assertIn("read 1 of 2 clusters (0 namespaces)", self.ledger()["unreadable"][stall_watch.BUDGET_SCOPE])
+        self.assertTrue(self.ledger()[stall_watch.CLUSTER_TIMINGS_KEY][cid("c")][stall_watch.TIMING_CUT_KEY])
+
+    def test_the_cluster_reads_timeout_is_cut_to_the_budget_left(self):
+        seen = {}
+        real = stall_watch.scan_cluster
+
+        def record(kubeconfig, namespaces, source, kinds, extra_kinds, timeout, label):
+            seen["timeout"] = timeout
+            return real(kubeconfig, namespaces, source, kinds, extra_kinds, timeout, label)
+
+        left = 40
+        with patch.object(stall_watch, "scan_cluster", record), patch.object(stall_watch.time, "monotonic", side_effect=[0, 1, stall_watch.TICK_BUDGET_SECONDS - left] + [stall_watch.TICK_BUDGET_SECONDS - left] * 8):
+            self.run_tick({"c": {"payments": []}})
+        self.assertEqual(seen["timeout"], left)
+
+    def test_the_ledger_rows_are_the_same_whichever_path_read_them(self):
+        now = "2026-11-10T12:00:00+00:00"
+        rows = {"checkout": [DEPLOYMENT_ROW, finding("checkout", "Deployment/cart", "generation-lag", "generation 3, observedGeneration 2")], "storefront": GATEWAY_ROWS, "web": []}
+        self.run_tick({"c": rows}, now=now)
+        whole = self.ledger()["stalls"]
+        self.state.unlink()
+        self.run_tick({"c": rows}, now=now, fallback=PLAIN_DEFAULT.split(","), events_fallback=True)
+        self.assertEqual(self.ledger()["stalls"], whole)
+        self.assertEqual(len(whole), 4)
+
+
+class Parallel(Base):
+    """Clusters are read SCAN_WORKERS at a time, and the ledger does not
+    depend on the order they finish in."""
+
+    def setUp(self):
+        super().setUp()
+        p = patch.object(stall_watch, "SCAN_WORKERS", 4)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_clusters_are_read_scan_workers_at_a_time(self):
+        fleet = {name: {"ns": [dict(DEPLOYMENT_ROW, namespace="ns")] if name == "d" else []} for name in "abcdef"}
+        _, fake = self.run_tick(fleet, hold=threading.Event(), release_at=stall_watch.SCAN_WORKERS)
+        self.assertEqual(fake.peak_in_flight, stall_watch.SCAN_WORKERS)
+        self.assertEqual(len(fake.cluster_reads()), 6, "every cluster read once")
+        self.assertEqual(sorted(self.ledger()[stall_watch.CLUSTER_TIMINGS_KEY]), sorted(cid(n) for n in "abcdef"))
+        self.assertEqual(len(self.last_alerts), 1)
+        self.assertIsNone(self.ledger()[stall_watch.CURSOR_KEY])
+
+    def test_a_parallel_sweep_leaves_the_ledger_a_serial_sweep_leaves(self):
+        now = "2026-11-10T12:00:00+00:00"
+        fleet = {
+            "a": {"checkout": [DEPLOYMENT_ROW], "web": []},
+            "down": TIMEOUT,
+            "b": {"storefront": GATEWAY_ROWS, "checkout": stall_watch.REPORT_UNREADABLE_EXIT},
+            "c": {"ns": [], "load-test": [dict(DEPLOYMENT_ROW, namespace="load-test")]},
+            "d": {"ns": [(["x"][:0], NOT_SCANNED)]},
+        }
+
+        def ledger_without_clocks():
+            ledger = self.ledger()
+            for record in ledger[stall_watch.CLUSTER_TIMINGS_KEY].values():
+                record.pop(stall_watch.TIMING_SECONDS_KEY)
+            ledger.pop(stall_watch.TICK_TIMING_KEY)
+            return ledger
+
+        with patch.dict(os.environ, {stall_watch.EXCLUDE_NAMESPACES_ENV: "load-test"}):
+            with patch.object(stall_watch, "SCAN_WORKERS", 1):
+                self.run_tick(fleet, now=now, fallback=["jobs"])
+            serial = ledger_without_clocks()
+            self.state.unlink()
+            self.kv.alerts.clear()
+            self.board.cards.clear()
+            conn = sqlite3.connect(self.db)
+            conn.execute("DELETE FROM tasks")
+            conn.commit()
+            conn.close()
+            _, fake = self.run_tick(fleet, now=now, fallback=["jobs"], hold=threading.Event(), release_at=4)
+        self.assertEqual(fake.peak_in_flight, 4)
+        parallel = ledger_without_clocks()
+        for key in ("stalls", "unreadable", stall_watch.CREDENTIALS_KEY, stall_watch.CURSOR_KEY, stall_watch.BUDGET_EXHAUSTED_KEY):
+            self.assertEqual(parallel[key], serial[key], key)
+        self.assertEqual(
+            {k: {f: v for f, v in r.items()} for k, r in parallel[stall_watch.CLUSTER_TIMINGS_KEY].items()},
+            serial[stall_watch.CLUSTER_TIMINGS_KEY],
+        )
+        self.assertEqual(sorted(parallel[stall_watch.EPISODES_KEY]), sorted(serial[stall_watch.EPISODES_KEY]))
+
+    def test_clusters_no_worker_had_started_when_the_budget_ran_out_are_the_resume_point(self):
+        fleet = {name: {"ns": []} for name in "abcdef"}
+        real_monotonic = stall_watch.time.monotonic
+        jump = {"seconds": 0}
+
+        def exhaust():
+            # Four reads are in flight; the clock passes the budget before
+            # they are released, so e and f are never started.
+            jump["seconds"] = stall_watch.TICK_BUDGET_SECONDS + 1
+
+        with patch.object(stall_watch.time, "monotonic", lambda: real_monotonic() + jump["seconds"]):
+            lines, fake = self.run_tick(fleet, hold=threading.Event(), release_at=4, before_release=exhaust)
+        self.assertEqual(fake.peak_in_flight, 4)
+        self.assertEqual([w for w, _, _ in fake.cluster_reads()], [["ns"]] * 4)
+        self.assertEqual(self.ledger()[stall_watch.CURSOR_KEY], {"cluster": cid("e"), "namespace": None}, "the first cluster in sweep order no worker reached")
+        budget = self.ledger()["unreadable"][stall_watch.BUDGET_SCOPE]
+        self.assertIn("read 4 of 6 clusters (4 namespaces)", budget)
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].startswith(stall_watch.COVERAGE_EXHAUSTED_PREFIX))
+        _, fake = self.run_tick(fleet)
+        self.assertEqual([w for w, _, _ in fake.cluster_reads()][:2], [["ns"], ["ns"]])
+        self.assertEqual(self.ledger()[stall_watch.CLUSTER_TIMINGS_KEY][cid("e")][stall_watch.TIMING_AT_KEY], self.ledger()["updated_at"])
+        self.assertIsNone(self.ledger()[stall_watch.CURSOR_KEY])
+
+    def test_a_lost_sandbox_on_one_worker_is_one_sweep_failure(self):
+        fleet = {name: {"ns": []} for name in "abcdef"}
+        lines, _ = self.run_tick(fleet, sandbox_dies_at=("c", "ns"))
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].startswith(stall_watch.SWEEP_FAILED_PREFIX), lines[0])
+        lines, _ = self.run_tick(fleet)
+        self.assertEqual(lines, [stall_watch.SWEEP_RECOVERED_LINE])
 
 
 class Scope(Base):
