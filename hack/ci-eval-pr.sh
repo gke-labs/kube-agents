@@ -5618,7 +5618,9 @@ EOF_UNIT_QUEUE
     UNIT_SEQ=$((${UNIT_SEQ:-0} + 1))
     run_one_unit "${TASKS[IDX]}" "${TASK_NAMES[IDX]}" "${REP}" "${TASK_REUSE[IDX]}" "${TASK_HAS_STACK[IDX]}" "${UNIT_SEQ}" "${TASK_STREAMS[IDX]}" &
     task_jobs="${task_jobs} $!:${IDX}"
-    unit_takes_infra_lock "${IDX}" || FANOUT_STACKLESS_UNIT_PIDS="${FANOUT_STACKLESS_UNIT_PIDS:-} $!"
+    # A stack's unit, lock taker or exempt, is never killed (FANOUT_STACKLESS_UNIT_PIDS).
+    unit_takes_infra_lock "${IDX}" || infra_lock_exempt "${TASK_NAMES[IDX]}" \
+      || FANOUT_STACKLESS_UNIT_PIDS="${FANOUT_STACKLESS_UNIT_PIDS:-} $!"
     if [ "${counted}" = 1 ]; then
       infra_pids="${infra_pids} $!"
     fi

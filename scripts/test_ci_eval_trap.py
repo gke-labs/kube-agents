@@ -444,8 +444,11 @@ class CancelStopsModelCallsTest(unittest.TestCase):
     def test_launch_units_records_each_unit(self):
         body = self.lifted("launch_units")
         launch = body.index('run_one_unit "${TASKS[IDX]}"')
+        # TASK_HAS_STACK (unit_takes_infra_lock) is false for a stack exempt
+        # from the infra lock, so the exemption is checked too.
         self.assertIn(
-            'unit_takes_infra_lock "${IDX}" || FANOUT_STACKLESS_UNIT_PIDS="${FANOUT_STACKLESS_UNIT_PIDS:-} $!"',
+            'unit_takes_infra_lock "${IDX}" || infra_lock_exempt "${TASK_NAMES[IDX]}" \\\n'
+            '      || FANOUT_STACKLESS_UNIT_PIDS="${FANOUT_STACKLESS_UNIT_PIDS:-} $!"',
             body[launch:],
         )
 
