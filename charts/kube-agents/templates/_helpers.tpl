@@ -957,6 +957,49 @@ callbacks is the formatted list of LiteLLM callbacks, built by the caller.
 {{- if and (gt $retryAfter 0) (gt (add $gatewayHoldSeconds $firstChunkAllowanceSeconds) $workerStaleSeconds) -}}
 {{- fail (printf "litellm.fallback.numRetries %d with retryAfterSeconds %d holds a rate-limited call %ds at the gateway; with %ds for the model's first chunk that crosses the agents' %ds stale-stream bound (stale_timeout_seconds), and the agent would drop the stream before it sees the 429" $numRetries $retryAfter $gatewayHoldSeconds $firstChunkAllowanceSeconds $workerStaleSeconds) -}}
 {{- end -}}
+{{- /*
+  The spend ceiling, as router_settings.provider_budget_config for the one
+  provider every alias routes to. LiteLLM's router budget limiter
+  (litellm/router_strategy/budget_limiter.py, v1.106.0) adds each response's
+  cost to a per-provider counter in the router's cache, filters the provider's
+  deployments out once the counter reaches budget_limit, and lets the counter
+  expire time_period after the window opened (at router start for the first
+  window, at the first spend after expiry for the next); its spend comes from
+  the standard logging payload, so streamed calls count, and lands when a call
+  completes, so the calls in flight when the share is crossed are charged past
+  it. Chosen over
+  litellm_settings.max_budget, which without a database counts only
+  non-streamed calls, from the completion text alone, and exports nothing.
+  The cache is in-process (the chart runs no Redis), so the ceiling is split
+  evenly across the gateway's replicas: each replica refuses on its share, so
+  the install's spend per window is bounded by .budget.usd plus the in-flight
+  calls above, and a restarted pod starts its count over. The share is
+  rendered with four decimals, always with a
+  dot, so PyYAML reads a float; a share that rounds to 0 is refused, because
+  LiteLLM treats a budget_limit of 0 as no limit. The schema's floor of 0.01
+  (shared by the installer and the Terraform example, which refuse less before
+  any apply) keeps that out of reach up to 100 replicas; this is the backstop.
+*/}}
+{{- $budget := .budget | default dict -}}
+{{- $budgetUSD := float64 ($budget.usd | default 0) -}}
+{{- $budgetPeriod := $budget.period | default "" -}}
+{{- $budgetReplicas := max (int (.replicas | default 1)) 1 -}}
+{{- $budgetPeriodPattern := `^[1-9][0-9]*(s|m|h|d|w|mo)$` -}}
+{{- $budgetShareFormat := "%.4f" -}}
+{{- $budgetShareZero := "0.0000" -}}
+{{- $budgetShare := "" -}}
+{{- if lt $budgetUSD 0.0 -}}
+{{- fail (printf "litellm.budget.usd %v is negative; 0 turns the ceiling off" $budget.usd) -}}
+{{- end -}}
+{{- if gt $budgetUSD 0.0 -}}
+{{- if not (regexMatch $budgetPeriodPattern $budgetPeriod) -}}
+{{- fail (printf "litellm.budget.period %q is not a LiteLLM duration (a whole number and s, m, h, d, w or mo, such as 1d); litellm.budget.usd %v needs one" $budgetPeriod $budget.usd) -}}
+{{- end -}}
+{{- $budgetShare = printf $budgetShareFormat (divf $budgetUSD (float64 $budgetReplicas)) -}}
+{{- if eq $budgetShare $budgetShareZero -}}
+{{- fail (printf "litellm.budget.usd %v split across %d gateway replicas is under 0.0001 USD per replica, which LiteLLM reads as no ceiling; raise the budget or lower litellm.replicaCount" $budget.usd $budgetReplicas) -}}
+{{- end -}}
+{{- end -}}
 {{- $primaries := list "model-default" "hermes-agent" .model -}}
 {{- if and $fallbackName (has $fallbackName $primaries) -}}
 {{- fail (printf "litellm.fallback.modelName %q is already a primary alias (%s); a model cannot fall back to itself" $fallbackName (join ", " $primaries)) -}}
@@ -1024,7 +1067,7 @@ litellm_settings:
   only in its anthropic overlay; see that file for why the breakpoints live
   here rather than in the agent's own config.
 */}}
-{{- if or $claude $fallbackName (gt $timeout 0) (gt $numRetries 0) (gt $retryAfter 0) }}
+{{- if or $claude $fallbackName (gt $timeout 0) (gt $numRetries 0) (gt $retryAfter 0) $budgetShare }}
 router_settings:
   {{- if $fallbackName }}
   fallbacks:
@@ -1047,6 +1090,17 @@ router_settings:
   */}}
   {{- if gt $retryAfter 0 }}
   retry_after: {{ $retryAfter }}
+  {{- end }}
+  {{- /*
+    The spend ceiling's share for this replica; see the budget block above.
+    Keyed on the provider prefix every alias carries, which is what LiteLLM
+    resolves for the deployment and records on the logging payload.
+  */}}
+  {{- if $budgetShare }}
+  provider_budget_config:
+    {{ $litellmProvider }}:
+      budget_limit: {{ $budgetShare }}
+      time_period: {{ $budgetPeriod | quote }}
   {{- end }}
   {{- if $claude }}
   default_litellm_params:
