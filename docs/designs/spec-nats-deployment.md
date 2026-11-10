@@ -639,7 +639,9 @@ Layout:
   exporter and the janitor. The metrics scrape landed (amended 11/9, #4477) without a
   peer on 8222: a `prometheus-nats-exporter` sidecar in each NATS pod reads 8222 over
   loopback and serves on 7777, and a separate rule admits the managed collector's
-  namespace (`gke-gmp-system`) to 7777 and nothing else. The NATS pods' own route peer, which this list used to carry as owed, landed
+  namespace (`gke-gmp-system`) and the operator's own pod to 7777 and nothing else; the
+  operator reads the stream list there to notice a provisioned stream gone missing
+  (amended 11/10, #4290). The NATS pods' own route peer, which this list used to carry as owed, landed
   with the three-server default (amended 10/29, #3274): a separate rule admits 6222 from
   the bus's servers and nothing else, since a fence without it keeps the cluster from
   ever forming. The topic-grant corollary that two edits

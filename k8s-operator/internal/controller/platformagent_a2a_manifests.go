@@ -3361,12 +3361,15 @@ func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 				// gateway's metrics rule (buildA2AGatewayNetworkPolicy).
 				// The exporter reads 8222 over loopback, so this rule is
 				// what the scrape needs and 8222 stays without a peer.
+				// The operator's own pod is the other peer: the bus-stream
+				// check reads the stream list here (BusStreamPoller), as
+				// it has no other way to it.
 				Ports: []networkingv1.NetworkPolicyPort{tcpPort(a2aNATSMetricsPort)},
-				From: []networkingv1.NetworkPolicyPeer{{
+				From: append([]networkingv1.NetworkPolicyPeer{{
 					NamespaceSelector: &metav1.LabelSelector{
 						MatchLabels: map[string]string{labelMetadataName: gmpNamespace},
 					},
-				}},
+				}}, a2aOperatorNATSPeers()...),
 			}},
 		},
 	}

@@ -1,0 +1,670 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+)
+
+// The bus-stream check (#4290): the operator reads the exporter's stream list,
+// calls a provisioned stream missing only on evidence, and re-runs the
+// provision Job, within limits, when one is.
+
+// exporterBody renders what the exporter serves for one server: the
+// server-level series when jsz is true, a stream series per name, a consumer
+// series, comments, and an overlong line of another family, which the reader
+// must skip.
+func exporterBody(jsz bool, metaLeader string, streams ...string) string {
+	var b strings.Builder
+	b.WriteString("# HELP gnatsd_varz_connections connections\n# TYPE gnatsd_varz_connections gauge\n")
+	b.WriteString(`gnatsd_varz_connections{server_id="S1"} 4` + "\n")
+	if jsz {
+		labels := fmt.Sprintf(`server_id="S1",server_name="nats-0",cluster="bus",domain="",meta_leader=%q,is_meta_leader="false"`, metaLeader)
+		b.WriteString("# TYPE jetstream_server_total_streams gauge\n")
+		fmt.Fprintf(&b, "jetstream_server_total_streams{%s} %d\n", labels, len(streams))
+		fmt.Fprintf(&b, "jetstream_server_jetstream_disabled{%s} 0\n", labels)
+		for _, name := range streams {
+			fmt.Fprintf(&b, "jetstream_stream_total_bytes{%s,account=\"A2A\",account_name=\"A2A\",account_id=\"A2A\",stream_name=%q,stream_leader=\"nats-0\",is_stream_leader=\"true\",stream_raft_group=\"S-R3\"} 786\n", labels, name)
+			fmt.Fprintf(&b, "jetstream_consumer_num_pending{%s,stream_name=%q,consumer_name=\"c-%s\"} 0\n", labels, name, name)
+		}
+	}
+	b.WriteString("jetstream_consumer_desc{consumer_desc=\"" + strings.Repeat("x", busStreamsMaxLineBytes+10) + "\"} 1\n")
+	return b.String()
+}
+
+func TestTheExporterBodyIsReadForTheStreamList(t *testing.T) {
+	reading, err := foldBusStreamsBody(strings.NewReader(exporterBody(true, "nats-1", "TASKS", "KV_runtime-state")))
+	if err != nil {
+		t.Fatalf("fold: %v", err)
+	}
+	if !reading.jsz || reading.disabled || reading.metaLeader != "nats-1" {
+		t.Errorf("reading = %+v, want jsz read, enabled, meta leader nats-1", reading)
+	}
+	if len(reading.streams) != 2 || !reading.streams["TASKS"] || !reading.streams["KV_runtime-state"] {
+		t.Errorf("streams = %v, want TASKS and KV_runtime-state", reading.streams)
+	}
+}
+
+// The jsz collector writes nothing for a server whose /jsz read failed, so a
+// body with only the varz series has read no stream list: that must not read
+// as "every stream missing".
+func TestABodyWithoutTheServerSeriesHasNoStreamList(t *testing.T) {
+	reading, err := foldBusStreamsBody(strings.NewReader(exporterBody(false, "")))
+	if err != nil {
+		t.Fatalf("fold: %v", err)
+	}
+	if reading.jsz {
+		t.Errorf("reading = %+v, want no jsz", reading)
+	}
+	if v := busStreamsVerdictFor(1, []busServerReading{reading}); v.known {
+		t.Errorf("verdict = %+v, want unknown", v)
+	}
+}
+
+func TestADisabledServerIsRead(t *testing.T) {
+	body := strings.Replace(exporterBody(true, "", "TASKS"), "jetstream_server_jetstream_disabled{", "jetstream_server_jetstream_disabledX{", 1) +
+		`jetstream_server_jetstream_disabled{server_id="S1"} 1` + "\n"
+	reading, err := foldBusStreamsBody(strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("fold: %v", err)
+	}
+	if !reading.disabled {
+		t.Errorf("reading = %+v, want disabled", reading)
+	}
+}
+
+func TestAWantedLineThatIsTooLongOrBrokenFailsTheScrape(t *testing.T) {
+	for name, body := range map[string]string{
+		"too long": `jetstream_stream_total_bytes{stream_name="` + strings.Repeat("T", busStreamsMaxLineBytes) + `"} 1` + "\n",
+		"broken":   `jetstream_stream_total_bytes{stream_name="TASKS" 1` + "\n",
+	} {
+		if _, err := foldBusStreamsBody(strings.NewReader(body)); err == nil {
+			t.Errorf("%s: fold succeeded, want an error", name)
+		}
+	}
+}
+
+func readingOf(metaLeader string, streams ...string) busServerReading {
+	r := busServerReading{jsz: true, metaLeader: metaLeader, streams: map[string]bool{}}
+	for _, name := range streams {
+		r.streams[name] = true
+	}
+	return r
+}
+
+func allStreamsBut(drop ...string) []string {
+	var out []string
+	for _, name := range a2aProvisionedStreams {
+		if !slices.Contains(drop, name) {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+func TestTheVerdictCountsOnlyServersThatReadTheirStreamList(t *testing.T) {
+	all := a2aProvisionedStreams
+	for _, tc := range []struct {
+		name        string
+		replicas    int
+		readings    []busServerReading
+		wantKnown   bool
+		wantMissing []string
+	}{
+		{"one server, all there", 1, []busServerReading{readingOf("", all...)}, true, nil},
+		{"one server, one gone", 1, []busServerReading{readingOf("", allStreamsBut("KV_runtime-state")...)}, true, []string{"KV_runtime-state"}},
+		{"one server, every stream gone", 1, []busServerReading{readingOf("")}, true, slices.Sorted(slices.Values(all))},
+		{"one server, no answer", 1, nil, false, nil},
+		{"one server, JetStream off", 1, []busServerReading{{jsz: true, disabled: true}}, false, nil},
+		{"cluster, all answer", 3, []busServerReading{readingOf("n0", all...), readingOf("n0", all...), readingOf("n0", all...)}, true, nil},
+		{"cluster, one down", 3, []busServerReading{readingOf("n0", allStreamsBut("TASKS")...), readingOf("n0", allStreamsBut("TASKS")...)}, true, []string{"TASKS"}},
+		{"cluster, two down", 3, []busServerReading{readingOf("n0")}, false, nil},
+		{"cluster, a follower lacks one", 3, []busServerReading{readingOf("n0", all...), readingOf("n0", allStreamsBut("TASKS")...), readingOf("n0", all...)}, true, nil},
+		{"cluster, no meta leader", 3, []busServerReading{readingOf(""), readingOf(""), readingOf("n0", all...)}, false, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := busStreamsVerdictFor(tc.replicas, tc.readings)
+			if v.known != tc.wantKnown || !slices.Equal(v.missing, tc.wantMissing) {
+				t.Errorf("verdict = %+v, want known=%v missing=%v", v, tc.wantKnown, tc.wantMissing)
+			}
+		})
+	}
+}
+
+func TestTheReprovisionRecordRateLimits(t *testing.T) {
+	now := busStreamsTestNow
+	at := func(ago time.Duration) busReprovisionAttempt { return busReprovisionAttempt{At: now.Add(-ago)} }
+	for _, tc := range []struct {
+		name     string
+		attempts []busReprovisionAttempt
+		want     bool
+		next     time.Time
+	}{
+		{"none", nil, true, time.Time{}},
+		{"one inside the gap", []busReprovisionAttempt{at(10 * time.Minute)}, false, now.Add(5 * time.Minute)},
+		{"one past the gap", []busReprovisionAttempt{at(20 * time.Minute)}, true, time.Time{}},
+		{"three in the window", []busReprovisionAttempt{at(5 * time.Hour), at(3 * time.Hour), at(time.Hour)}, false, now.Add(time.Hour)},
+		{"three, one past the window", []busReprovisionAttempt{at(7 * time.Hour), at(3 * time.Hour), at(time.Hour)}, true, time.Time{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ok, next := busReprovisionRecord{Attempts: tc.attempts}.allows(now)
+			if ok != tc.want || !next.Equal(tc.next) {
+				t.Errorf("allows = %v, %v; want %v, %v", ok, next, tc.want, tc.next)
+			}
+		})
+	}
+}
+
+var busStreamsTestNow = time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+
+const busStreamsTestAgentUID = types.UID("agent-uid-1")
+
+// stubBusStreamSource answers every scrape from bodies, keyed by address; a
+// missing key is a failed scrape.
+type stubBusStreamSource struct {
+	bodies map[string]string
+	calls  int
+}
+
+func (s *stubBusStreamSource) Scrape(_ context.Context, addr string) (busServerReading, error) {
+	s.calls++
+	body, ok := s.bodies[addr]
+	if !ok {
+		return busServerReading{}, errors.New("connection refused")
+	}
+	return foldBusStreamsBody(strings.NewReader(body))
+}
+
+type busStreamsRig struct {
+	t        *testing.T
+	cl       client.Client
+	poller   *BusStreamPoller
+	source   *stubBusStreamSource
+	recorder *record.FakeRecorder
+	deleted  []string
+	now      time.Time
+}
+
+func busStreamsAgent(replicas int) *agentv1alpha1.PlatformAgent {
+	agent := a2aTestAgent()
+	agent.UID = busStreamsTestAgentUID
+	agent.Status.BusReplicas = int32(replicas)
+	agent.Status.Conditions = []metav1.Condition{{
+		Type: busProvisionedConditionType, Status: metav1.ConditionTrue, Reason: "ProvisionJobComplete",
+		LastTransitionTime: metav1.NewTime(busStreamsTestNow.Add(-24 * time.Hour)),
+	}}
+	return agent
+}
+
+func busStreamsJob(agent *agentv1alpha1.PlatformAgent, created time.Time, state batchv1.JobConditionType) *batchv1.Job {
+	job := buildA2AProvisionJob(agent)
+	job.UID = types.UID("job-" + created.Format("150405"))
+	job.CreationTimestamp = metav1.NewTime(created)
+	job.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion: agentv1alpha1.GroupVersion.String(), Kind: "PlatformAgent", Name: agent.Name,
+		UID: agent.UID, Controller: ptr.To(true),
+	}}
+	if state != "" {
+		job.Status.Conditions = []batchv1.JobCondition{{Type: state, Status: corev1.ConditionTrue}}
+	}
+	return job
+}
+
+func busStreamsStatefulSet(agent *agentv1alpha1.PlatformAgent, replicas int32, ready int32) *appsv1.StatefulSet {
+	return &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace, Generation: 2},
+		Spec:       appsv1.StatefulSetSpec{Replicas: ptr.To(replicas)},
+		Status: appsv1.StatefulSetStatus{
+			ObservedGeneration: 2, Replicas: replicas, ReadyReplicas: ready, UpdatedReplicas: replicas,
+			CurrentRevision: "r1", UpdateRevision: "r1",
+		},
+	}
+}
+
+func busStreamsPod(agent *agentv1alpha1.PlatformAgent, ordinal int) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: fmt.Sprintf("%s-%d", a2aNATSName(agent), ordinal), Namespace: agent.Namespace,
+			Labels: map[string]string{"app": a2aNATSName(agent)},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{
+			Name:  a2aNATSExporterContainerName,
+			Ports: []corev1.ContainerPort{{Name: a2aNATSMetricsPortName, ContainerPort: a2aNATSMetricsPort}},
+		}}},
+		Status: corev1.PodStatus{
+			PodIP:             fmt.Sprintf("10.0.0.%d", ordinal+1),
+			ContainerStatuses: []corev1.ContainerStatus{{Name: a2aNATSExporterContainerName, Ready: true}},
+		},
+	}
+}
+
+func busStreamsAddr(ordinal int) string { return fmt.Sprintf("10.0.0.%d:7777", ordinal+1) }
+
+func clientPod(agent *agentv1alpha1.PlatformAgent, name string, selector map[string]string) *corev1.Pod {
+	return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: agent.Namespace, Labels: selector, UID: types.UID(name)}}
+}
+
+func newBusStreamsRig(t *testing.T, replicas int, objs ...client.Object) *busStreamsRig {
+	t.Helper()
+	agent := busStreamsAgent(replicas)
+	rig := &busStreamsRig{t: t, recorder: record.NewFakeRecorder(32), now: busStreamsTestNow, source: &stubBusStreamSource{bodies: map[string]string{}}}
+	all := []client.Object{agent, busStreamsStatefulSet(agent, int32(replicas), int32(replicas))}
+	for i := 0; i < replicas; i++ {
+		all = append(all, busStreamsPod(agent, i))
+	}
+	all = append(all,
+		clientPod(agent, "test-agent-a2a-gateway-abc", a2aGatewayPodSelector(agent)),
+		clientPod(agent, "test-agent-gateway-xyz", gatewayPodSelector(agent)))
+	all = append(all, objs...)
+	rig.cl = fake.NewClientBuilder().
+		WithScheme(setupScheme()).
+		WithObjects(all...).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+				rig.deleted = append(rig.deleted, obj.GetName())
+				return c.Delete(ctx, obj, opts...)
+			},
+		}).
+		Build()
+	r := &PlatformAgentReconciler{Client: rig.cl, APIReader: rig.cl, Scheme: setupScheme(), Recorder: rig.recorder}
+	rig.poller = &BusStreamPoller{r: r, source: rig.source, now: func() time.Time { return rig.now },
+		streaks: map[types.UID]*busStreamStreak{}}
+	return rig
+}
+
+// serve sets what every server's exporter answers.
+func (rig *busStreamsRig) serve(replicas int, streams ...string) {
+	for i := 0; i < replicas; i++ {
+		leader := ""
+		if replicas > 1 {
+			leader = "nats-0"
+		}
+		rig.source.bodies[busStreamsAddr(i)] = exporterBody(true, leader, streams...)
+	}
+}
+
+func (rig *busStreamsRig) agent() *agentv1alpha1.PlatformAgent {
+	rig.t.Helper()
+	agent := &agentv1alpha1.PlatformAgent{}
+	if err := rig.cl.Get(context.Background(), types.NamespacedName{Namespace: "test-ns", Name: "test-agent"}, agent); err != nil {
+		rig.t.Fatalf("get agent: %v", err)
+	}
+	return agent
+}
+
+func (rig *busStreamsRig) poll() {
+	rig.t.Helper()
+	if err := rig.poller.pollAgent(context.Background(), rig.agent()); err != nil {
+		rig.t.Fatalf("poll: %v", err)
+	}
+	rig.now = rig.now.Add(busStreamsPollInterval)
+}
+
+func (rig *busStreamsRig) condition() *metav1.Condition {
+	return meta.FindStatusCondition(rig.agent().Status.Conditions, busStreamsPresentConditionType)
+}
+
+func (rig *busStreamsRig) jobExists() bool {
+	agent := rig.agent()
+	err := rig.cl.Get(context.Background(), types.NamespacedName{Namespace: agent.Namespace, Name: buildA2AProvisionJob(agent).Name}, &batchv1.Job{})
+	return err == nil
+}
+
+// recreateJob stands for the reconcile creating the Job again, and its run.
+func (rig *busStreamsRig) recreateJob(state batchv1.JobConditionType) {
+	rig.t.Helper()
+	if err := rig.cl.Create(context.Background(), busStreamsJob(rig.agent(), rig.now, state)); err != nil {
+		rig.t.Fatalf("recreate job: %v", err)
+	}
+}
+
+func (rig *busStreamsRig) events() []string {
+	var out []string
+	for {
+		select {
+		case e := <-rig.recorder.Events:
+			out = append(out, e)
+		default:
+			return out
+		}
+	}
+}
+
+func TestABusWithEveryStreamReadsPresent(t *testing.T) {
+	for _, replicas := range []int{1, 3} {
+		t.Run(fmt.Sprintf("busReplicas %d", replicas), func(t *testing.T) {
+			agent := busStreamsAgent(replicas)
+			rig := newBusStreamsRig(t, replicas, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+			rig.serve(replicas, a2aProvisionedStreams...)
+			rig.poll()
+			if c := rig.condition(); c == nil || c.Status != metav1.ConditionTrue || c.Reason != busStreamsReasonAllPresent {
+				t.Fatalf("condition = %+v, want True/AllPresent", c)
+			}
+			if len(rig.deleted) != 0 {
+				t.Errorf("deleted %v on a healthy bus", rig.deleted)
+			}
+		})
+	}
+}
+
+// The 10-29 case: a bus that lost a KV bucket after provisioning. Two polls
+// say nothing; the third deletes the completed Job, records the attempt, and
+// says so. No client is restarted: the bucket has no fixed durable.
+func TestAMissingBucketIsConfirmedOnThreePollsThenTheJobRunsAgain(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	rig.serve(1, allStreamsBut("KV_runtime-state")...)
+	rig.poll()
+	rig.poll()
+	if c := rig.condition(); c != nil || len(rig.deleted) != 0 {
+		t.Fatalf("after two polls: condition %+v, deleted %v; want neither", c, rig.deleted)
+	}
+	rig.poll()
+	if rig.jobExists() {
+		t.Fatalf("the completed provision Job is still there after a confirmed loss")
+	}
+	c := rig.condition()
+	if c == nil || c.Status != metav1.ConditionFalse || c.Reason != busStreamsReasonReprovisioning || !strings.Contains(c.Message, "KV_runtime-state") {
+		t.Fatalf("condition = %+v, want False/Reprovisioning naming KV_runtime-state", c)
+	}
+	record := readBusReprovisionRecord(rig.agent())
+	if len(record.Attempts) != 1 || !slices.Equal(record.Attempts[0].Missing, []string{"KV_runtime-state"}) {
+		t.Errorf("record = %+v, want one attempt for KV_runtime-state", record)
+	}
+	if events := rig.events(); len(events) != 1 || !strings.Contains(events[0], busStreamsMissingEventReason) {
+		t.Errorf("events = %v, want one %s", events, busStreamsMissingEventReason)
+	}
+
+	// The reconcile recreates the Job and it completes; the bucket is back.
+	rig.recreateJob(batchv1.JobComplete)
+	rig.serve(1, a2aProvisionedStreams...)
+	rig.poll()
+	if c := rig.condition(); c == nil || c.Status != metav1.ConditionTrue {
+		t.Fatalf("condition after the re-run = %+v, want True", c)
+	}
+	if slices.Contains(rig.deleted, "test-agent-a2a-gateway-abc") || slices.Contains(rig.deleted, "test-agent-gateway-xyz") {
+		t.Errorf("deleted %v: no client holds a durable on a KV bucket", rig.deleted)
+	}
+	if record := readBusReprovisionRecord(rig.agent()); !record.Attempts[0].Settled || record.Attempts[0].Restarted {
+		t.Errorf("record = %+v, want settled, not restarted", record)
+	}
+}
+
+// TASKS has the two fixed durables, so its recovery ends with the A2A gateway
+// and the agent pod restarted, once.
+func TestARecreatedTasksStreamRestartsItsClientsOnce(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	rig.serve(1, allStreamsBut("TASKS")...)
+	rig.poll()
+	rig.poll()
+	rig.poll()
+	rig.recreateJob(batchv1.JobComplete)
+	rig.serve(1, a2aProvisionedStreams...)
+	rig.events()
+	rig.poll()
+	for _, pod := range []string{"test-agent-a2a-gateway-abc", "test-agent-gateway-xyz"} {
+		if !slices.Contains(rig.deleted, pod) {
+			t.Errorf("deleted %v, want %s restarted", rig.deleted, pod)
+		}
+	}
+	before := len(rig.deleted)
+	rig.poll()
+	if len(rig.deleted) != before {
+		t.Errorf("a second healthy poll deleted %v", rig.deleted[before:])
+	}
+}
+
+// A re-run that completes without bringing the stream back stops the
+// re-runs: the condition says why, and the Job is left alone.
+func TestAReRunThatDoesNotRestoreStops(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	rig.serve(1, allStreamsBut("DIRECTORY")...)
+	rig.poll()
+	rig.poll()
+	rig.poll()
+	rig.recreateJob(batchv1.JobComplete)
+	for i := 0; i < 6; i++ {
+		rig.poll()
+	}
+	if !rig.jobExists() {
+		t.Fatalf("the Job was deleted again after a re-run that did not restore")
+	}
+	if c := rig.condition(); c == nil || c.Status != metav1.ConditionFalse || c.Reason != busStreamsReasonDidNotRestore {
+		t.Fatalf("condition = %+v, want False/%s", c, busStreamsReasonDidNotRestore)
+	}
+}
+
+func TestReRunsAreRateLimited(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	// An attempt ten minutes before the third poll, for another set, whose
+	// Job is older than it: the gap applies.
+	live := rig.agent()
+	live.Annotations = map[string]string{busStreamsReprovisionAnnotation: fmt.Sprintf(`{"attempts":[{"at":%q,"missing":["TOPICS-STATE"],"settled":true}]}`,
+		busStreamsTestNow.Add(-10*time.Minute).Format(time.RFC3339))}
+	if err := rig.cl.Update(context.Background(), live); err != nil {
+		t.Fatal(err)
+	}
+	rig.now = busStreamsTestNow.Add(-2 * busStreamsPollInterval)
+	rig.serve(1, allStreamsBut("PROFILE_SUBMITS")...)
+	rig.poll()
+	rig.poll()
+	rig.poll()
+	if !rig.jobExists() {
+		t.Fatalf("the Job was deleted inside the rate limit")
+	}
+	if c := rig.condition(); c == nil || c.Reason != busStreamsReasonMissing || !strings.Contains(c.Message, "next re-run is allowed") {
+		t.Errorf("condition = %+v, want StreamsMissing with the next allowed time", c)
+	}
+}
+
+func TestAFailedJobIsNotReRun(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobFailed))
+	rig.serve(1, allStreamsBut("TASKS")...)
+	rig.poll()
+	rig.poll()
+	rig.poll()
+	if !rig.jobExists() {
+		t.Fatalf("a failed Job was deleted")
+	}
+	if c := rig.condition(); c == nil || c.Status != metav1.ConditionFalse || c.Reason != busStreamsReasonMissing || !strings.Contains(c.Message, "failed") {
+		t.Errorf("condition = %+v, want False/StreamsMissing naming the failed Job", c)
+	}
+}
+
+// Missing sets that differ poll to poll confirm only what every poll found.
+func TestOnlyWhatEveryPollFoundMissingIsConfirmed(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	for _, gone := range [][]string{{"TASKS", "DIRECTORY"}, {"DIRECTORY"}, {"DIRECTORY", "KV_cap"}} {
+		rig.serve(1, allStreamsBut(gone...)...)
+		rig.poll()
+	}
+	record := readBusReprovisionRecord(rig.agent())
+	if len(record.Attempts) != 1 || !slices.Equal(record.Attempts[0].Missing, []string{"DIRECTORY"}) {
+		t.Errorf("record = %+v, want one attempt for DIRECTORY alone", record)
+	}
+}
+
+// No verdict while the bus rolls, converts or provisions, and the run starts
+// again afterwards: two misses, a rolling poll, two misses is not three.
+func TestNoVerdictWhileTheBusIsNotAtRest(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		upset func(rig *busStreamsRig)
+		reset func(rig *busStreamsRig)
+	}{
+		{"a server not ready", func(rig *busStreamsRig) {
+			rig.setStatefulSet(busStreamsStatefulSet(rig.agent(), 1, 0))
+		}, func(rig *busStreamsRig) {
+			rig.setStatefulSet(busStreamsStatefulSet(rig.agent(), 1, 1))
+		}},
+		{"converting to three servers", func(rig *busStreamsRig) {
+			agent := rig.agent()
+			agent.Status.BusReplicas = 3
+			if err := rig.cl.Status().Update(context.Background(), agent); err != nil {
+				rig.t.Fatal(err)
+			}
+		}, func(rig *busStreamsRig) {
+			agent := rig.agent()
+			agent.Status.BusReplicas = 1
+			if err := rig.cl.Status().Update(context.Background(), agent); err != nil {
+				rig.t.Fatal(err)
+			}
+		}},
+		{"the provision Job running", func(rig *busStreamsRig) {
+			rig.replaceJob(batchv1.JobConditionType(""))
+		}, func(rig *busStreamsRig) {
+			rig.replaceJob(batchv1.JobComplete)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := busStreamsAgent(1)
+			rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+			rig.serve(1, allStreamsBut("TASKS")...)
+			rig.poll()
+			rig.poll()
+			tc.upset(rig)
+			rig.poll()
+			tc.reset(rig)
+			rig.poll()
+			rig.poll()
+			if len(rig.deleted) != 0 {
+				t.Errorf("deleted %v across an interrupted run", rig.deleted)
+			}
+		})
+	}
+}
+
+func (rig *busStreamsRig) setStatefulSet(sts *appsv1.StatefulSet) {
+	rig.t.Helper()
+	live := &appsv1.StatefulSet{}
+	if err := rig.cl.Get(context.Background(), client.ObjectKeyFromObject(sts), live); err != nil {
+		rig.t.Fatal(err)
+	}
+	live.Status = sts.Status
+	if err := rig.cl.Status().Update(context.Background(), live); err != nil {
+		rig.t.Fatal(err)
+	}
+}
+
+func (rig *busStreamsRig) replaceJob(state batchv1.JobConditionType) {
+	rig.t.Helper()
+	agent := rig.agent()
+	existing := &batchv1.Job{}
+	if err := rig.cl.Get(context.Background(), types.NamespacedName{Namespace: agent.Namespace, Name: buildA2AProvisionJob(agent).Name}, existing); err != nil {
+		rig.t.Fatal(err)
+	}
+	existing.Status.Conditions = nil
+	if state != "" {
+		existing.Status.Conditions = []batchv1.JobCondition{{Type: state, Status: corev1.ConditionTrue}}
+	}
+	if err := rig.cl.Status().Update(context.Background(), existing); err != nil {
+		rig.t.Fatal(err)
+	}
+}
+
+func TestAnExporterThatWillNotAnswerReadsUnreachableOnTheThirdPoll(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	rig.source.bodies[busStreamsAddr(0)] = exporterBody(false, "")
+	rig.poll()
+	rig.poll()
+	if c := rig.condition(); c != nil {
+		t.Fatalf("condition after two polls = %+v, want none", c)
+	}
+	rig.poll()
+	if c := rig.condition(); c == nil || c.Status != metav1.ConditionUnknown || c.Reason != busStreamsReasonExporterUnreachable {
+		t.Fatalf("condition = %+v, want Unknown/%s", c, busStreamsReasonExporterUnreachable)
+	}
+	if len(rig.deleted) != 0 {
+		t.Errorf("deleted %v without a verdict", rig.deleted)
+	}
+}
+
+func TestAnOmittedExporterReadsDetectionUnavailableAndIsNotScraped(t *testing.T) {
+	t.Setenv(a2aNATSImageEnvVar, "mirror.example/nats:2.11")
+	t.Setenv(a2aNATSExporterImageEnvVar, "")
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	rig.serve(1)
+	rig.poll()
+	c := rig.condition()
+	if c == nil || c.Status != metav1.ConditionUnknown || c.Reason != busStreamsReasonDetectionUnavailable || !strings.Contains(c.Message, a2aNATSExporterImageEnvVar) {
+		t.Fatalf("condition = %+v, want Unknown/%s naming %s", c, busStreamsReasonDetectionUnavailable, a2aNATSExporterImageEnvVar)
+	}
+	if rig.source.calls != 0 || len(rig.deleted) != 0 {
+		t.Errorf("scraped %d times and deleted %v with the exporter omitted", rig.source.calls, rig.deleted)
+	}
+	if busStreamsMissingCondition(rig.agent()) != nil {
+		t.Errorf("an Unknown condition counts toward Degraded")
+	}
+}
+
+func TestTheConditionGoesWhenTheBusIsNotProvisioned(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	rig.serve(1, a2aProvisionedStreams...)
+	rig.poll()
+	live := rig.agent()
+	meta.RemoveStatusCondition(&live.Status.Conditions, busProvisionedConditionType)
+	if err := rig.cl.Status().Update(context.Background(), live); err != nil {
+		t.Fatal(err)
+	}
+	rig.poll()
+	if c := rig.condition(); c != nil {
+		t.Errorf("condition = %+v on an unprovisioned bus, want none", c)
+	}
+}
+
+func TestAFalseConditionMakesTheCRDegraded(t *testing.T) {
+	agent := busStreamsAgent(1)
+	agent.Status.Conditions = append(agent.Status.Conditions, metav1.Condition{
+		Type: busStreamsPresentConditionType, Status: metav1.ConditionFalse, Reason: busStreamsReasonMissing, Message: "Missing: TASKS",
+	})
+	if c := busStreamsMissingCondition(agent); c == nil || c.Message != "Missing: TASKS" {
+		t.Errorf("busStreamsMissingCondition = %+v, want the False condition", c)
+	}
+	agent.Spec.Mode = ptr.To("today")
+	if c := busStreamsMissingCondition(agent); c != nil {
+		t.Errorf("busStreamsMissingCondition = %+v under today, want nil", c)
+	}
+}

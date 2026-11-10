@@ -9092,10 +9092,16 @@ func TestTheNATSExporterIsHardened(t *testing.T) {
 // rule names a2aNATSMetricsPort, its one port is that TCP port, and its one
 // peer is every pod in the managed-Prometheus namespace, the selector the A2A
 // gateway's metrics rule uses.
-func TestTheBusFenceAdmitsTheCollectorOnTheExporterPortAlone(t *testing.T) {
-	for _, replicas := range []int{1, 3} {
-		t.Run(fmt.Sprintf("busReplicas %d", replicas), func(t *testing.T) {
-			np := buildA2ANATSNetworkPolicy(a2aTestAgentWithBusReplicas(replicas))
+func TestTheBusFenceAdmitsTheCollectorAndTheOperatorOnTheExporterPortAlone(t *testing.T) {
+	for _, tc := range []struct {
+		replicas     int
+		operatorNS   string
+		wantOperator bool
+	}{{1, "", false}, {3, "", false}, {1, "kube-agents-system", true}, {3, "kube-agents-system", true}} {
+		t.Run(fmt.Sprintf("busReplicas %d, operator namespace %q", tc.replicas, tc.operatorNS), func(t *testing.T) {
+			t.Setenv(operatorNamespaceEnvVar, tc.operatorNS)
+			t.Setenv(operatorServiceAccountEnvVar, "kube-agents-operator")
+			np := buildA2ANATSNetworkPolicy(a2aTestAgentWithBusReplicas(tc.replicas))
 			var rules []networkingv1.NetworkPolicyIngressRule
 			for _, rule := range np.Spec.Ingress {
 				for _, p := range rule.Ports {
@@ -9114,10 +9120,27 @@ func TestTheBusFenceAdmitsTheCollectorOnTheExporterPortAlone(t *testing.T) {
 				t.Errorf("the collector rule opens %+v, want TCP %d alone", rule.Ports, a2aNATSMetricsPort)
 			}
 			want := map[string]string{labelMetadataName: gmpNamespace}
-			if len(rule.From) != 1 || rule.From[0].PodSelector != nil || rule.From[0].IPBlock != nil ||
+			wantPeers := 1
+			if tc.wantOperator {
+				wantPeers = 2
+			}
+			if len(rule.From) != wantPeers || rule.From[0].PodSelector != nil || rule.From[0].IPBlock != nil ||
 				rule.From[0].NamespaceSelector == nil || len(rule.From[0].NamespaceSelector.MatchExpressions) != 0 ||
 				!reflect.DeepEqual(rule.From[0].NamespaceSelector.MatchLabels, want) {
-				t.Errorf("the collector rule's peers = %+v, want exactly the namespace %s", rule.From, gmpNamespace)
+				t.Fatalf("the exporter rule's peers = %+v, want the namespace %s first, and %d peers", rule.From, gmpNamespace, wantPeers)
+			}
+			if !tc.wantOperator {
+				return
+			}
+			// The operator's pod, by the namespace it runs in and the
+			// bus-client label its pod template carries: the bus-stream
+			// check's scrape (BusStreamPoller), and nothing wider.
+			operator := rule.From[1]
+			if operator.IPBlock != nil || operator.NamespaceSelector == nil || operator.PodSelector == nil ||
+				len(operator.NamespaceSelector.MatchExpressions) != 0 || len(operator.PodSelector.MatchExpressions) != 0 ||
+				!reflect.DeepEqual(operator.NamespaceSelector.MatchLabels, map[string]string{corev1.LabelMetadataName: tc.operatorNS}) ||
+				!reflect.DeepEqual(operator.PodSelector.MatchLabels, map[string]string{a2aOperatorBusClientLabel: a2aOperatorBusClientLabelValue}) {
+				t.Errorf("the exporter rule's operator peer = %+v, want the operator pod in %s alone", operator, tc.operatorNS)
 			}
 		})
 	}

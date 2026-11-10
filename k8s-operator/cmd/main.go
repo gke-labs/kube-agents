@@ -362,6 +362,12 @@ func main() {
 			os.Exit(1)
 		}
 	}
+	// The A2A bus-stream check, read from the bus's metrics exporter on the
+	// leader; see internal/controller/platformagent_a2a_bus_streams.go.
+	if err := mgr.Add(controller.NewBusStreamPoller(reconciler)); err != nil {
+		setupLog.Error(err, "Failed to add the bus stream poller to the manager")
+		os.Exit(1)
+	}
 
 	// The AgentProfile reconciler, when the CRD is installed. An operator
 	// upgraded ahead of its CRDs keeps running everything else. Only a real

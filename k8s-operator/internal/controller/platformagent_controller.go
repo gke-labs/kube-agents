@@ -4837,6 +4837,15 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		degradedStatus = metav1.ConditionTrue
 		degradedReason = conditionReasonMinterPruningHeld
 		degradedMsg = minterHeldMessage(agent.Name+gitopsStateConfigMapSuffix, minterHeld)
+	} else if busStreams := busStreamsMissingCondition(agent); busStreams != nil {
+		// Degraded only, as the held minter entry above: the bus-stream
+		// poller owns BusStreamsPresent and the recovery
+		// (platformagent_a2a_bus_streams.go); this names the loss on the
+		// condition a reader looks at first. Ahead of the resource
+		// refusals, because it reports lost function.
+		degradedStatus = metav1.ConditionTrue
+		degradedReason = conditionReasonA2ABusStreamsMissing
+		degradedMsg = busStreams.Message
 	} else if proxyResourcesRefusal != "" {
 		// Same shape as the git refusal above: the spec is read here, on
 		// every pass, rather than carried from reconcileCredentialProxy, so
