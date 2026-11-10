@@ -3119,21 +3119,22 @@ class GetCredentialsAnsweredInTheShimTest(unittest.TestCase):
     def run_shim(self, argv, status=200, body=None, raises=None, env=None):
         relay = Mock()
         if raises is not None:
-            relay.get.side_effect = raises
+            relay._get_once.side_effect = raises
         else:
             answer = {"name": "ka-a", "location": "us-central1-a", "status": "RUNNING"} if body is None else body
             read = Mock(side_effect=answer) if isinstance(answer, Exception) else Mock(return_value=answer)
-            relay.get.return_value = Mock(status_code=status, json=read)
+            relay._get_once.return_value = Mock(status_code=status, json=read)
         broker = Mock(return_value=RecordingResponse(json.dumps({"exitCode": 0}).encode("utf-8")))
         stderr = io.StringIO()
         landed = Mock()
         with patch.dict("os.environ", {**self.env, **(env or {})}, clear=False), \
-                patch.object(credential_proxy_client, "ApiSession", return_value=relay), \
+                patch.object(credential_proxy_client, "ApiSession", return_value=relay) as session, \
                 patch.object(credential_proxy_client, "open_broker_request", broker), \
                 patch.object(credential_proxy_client, "land_implicit_kubeconfig", landed), \
                 patch("sys.stdout", new=io.StringIO()), patch("sys.stderr", new=stderr):
             code = credential_proxy_client.execute(self.ENDPOINT, argv)
-        return {"code": code, "relay": relay, "broker": broker, "stderr": stderr.getvalue(), "landed": landed}
+        return {"code": code, "relay": relay, "session": session, "broker": broker,
+                "stderr": stderr.getvalue(), "landed": landed}
 
     def test_a_cluster_named_in_full_is_answered_without_the_broker(self):
         destination = self.directory / "out.yaml"
@@ -3141,15 +3142,27 @@ class GetCredentialsAnsweredInTheShimTest(unittest.TestCase):
                                           f"--kubeconfig={destination}"])
         self.assertEqual(0, sent["code"])
         sent["broker"].assert_not_called()
-        sent["relay"].get.assert_called_once()
+        sent["relay"]._get_once.assert_called_once()
         self.assertEqual(
             "https://container.googleapis.com/v1/projects/acme-prod/locations/us-central1-a/clusters/ka-a",
-            sent["relay"].get.call_args.args[0],
+            sent["relay"]._get_once.call_args.args[0],
         )
         self.assertEqual(
             "Fetching cluster endpoint and auth data.\nkubeconfig entry generated for ka-a.\n", sent["stderr"]
         )
         sent["landed"].assert_not_called()
+
+    def test_the_check_is_one_attempt_at_executes_broker(self):
+        # A named endpoint gives the session no fallback, and `_get_once` makes
+        # one attempt: a draining or busy refusal is not retried here, and the
+        # exec tier's fallback stays `execute`'s.
+        sent = self.run_shim(self.BASE + self.FULL)
+        sent["session"].assert_called_once_with(self.ENDPOINT)
+        sent["relay"].get.assert_not_called()
+        self.assertEqual(
+            credential_proxy_client.GET_CREDENTIALS_CHECK_TIMEOUT_SECONDS,
+            sent["relay"]._get_once.call_args.kwargs["timeout"],
+        )
 
     def test_the_kubeconfig_is_the_one_a_broker_answer_is_rewritten_to(self):
         broker_shaped = (
@@ -3213,6 +3226,7 @@ class GetCredentialsAnsweredInTheShimTest(unittest.TestCase):
         for name, kwargs in (
             ("not found", {"status": 404, "body": {"error": {"code": 404}}}),
             ("refused", {"status": 403}),
+            ("busy or draining", {"status": 503, "body": {"code": "CREDENTIAL_PROXY_BUSY", "bound": "draining"}}),
             ("upstream error", {"status": 500}),
             ("provisioning", {"body": {"name": "ka-a", "status": "PROVISIONING"}}),
             ("no status", {"body": {"name": "ka-a"}}),
@@ -3246,14 +3260,14 @@ class GetCredentialsAnsweredInTheShimTest(unittest.TestCase):
             with self.subTest(name):
                 sent = self.run_shim(argv, env=env)
                 sent["broker"].assert_called_once()
-                sent["relay"].get.assert_not_called()
+                sent["relay"]._get_once.assert_not_called()
 
     def test_a_profile_task_stays_with_the_broker(self):
         token = self.directory / "task-token"
         token.write_text("a.b.c", encoding="utf-8")
         sent = self.run_shim(self.BASE + self.FULL, env={credential_proxy_client.TASK_TOKEN_FILE_ENV: str(token)})
         sent["broker"].assert_called_once()
-        sent["relay"].get.assert_not_called()
+        sent["relay"]._get_once.assert_not_called()
 
 
 if __name__ == "__main__":

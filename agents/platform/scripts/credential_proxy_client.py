@@ -1431,7 +1431,9 @@ def get_credentials_local_target(argv: list[str]) -> ClusterTarget | None:
     return target
 
 
-def answer_get_credentials_locally(argv: list[str], destination: Path | None, implicit_destination: bool) -> int | None:
+def answer_get_credentials_locally(
+    argv: list[str], destination: Path | None, implicit_destination: bool, endpoint: str
+) -> int | None:
     """Answer a get-credentials without the broker when the kube-api proxy is in use.
 
     The kubeconfig the shim writes after a broker call is built from the
@@ -1444,6 +1446,11 @@ def answer_get_credentials_locally(argv: list[str], destination: Path | None, im
     in full (`get_credentials_local_target`), or the relay answers anything but
     a running cluster or cannot be reached. A 404 is one of those: gcloud's own
     error names the cluster and, for a wrong location, the right one.
+
+    The check is one attempt at `endpoint`, the broker `execute` sends the
+    command to: no retry of a busy or draining refusal and no fallback of its
+    own, so it costs at most GET_CREDENTIALS_CHECK_TIMEOUT_SECONDS before
+    `execute`'s own retries and fallback take the call.
     """
     if not os.environ.get("KUBE_PROXY_URL", "").strip():
         return None
@@ -1452,7 +1459,7 @@ def answer_get_credentials_locally(argv: list[str], destination: Path | None, im
         return None
     url = GET_CREDENTIALS_CHECK_URL.format(project=target.project, location=target.location, cluster=target.cluster)
     try:
-        response = ApiSession().get(url, timeout=GET_CREDENTIALS_CHECK_TIMEOUT_SECONDS)
+        response = ApiSession(endpoint)._get_once(url, timeout=GET_CREDENTIALS_CHECK_TIMEOUT_SECONDS)
         if response.status_code != http.HTTPStatus.OK:
             return None
         cluster = response.json()
@@ -1783,7 +1790,7 @@ def execute(
     # in full needs no broker call; a profile task's stays with the broker,
     # which holds the task's cluster.
     if get_credentials and not in_task:
-        answered = answer_get_credentials_locally(argv, destination, implicit_destination)
+        answered = answer_get_credentials_locally(argv, destination, implicit_destination, endpoint)
         if answered is not None:
             return answered
 
