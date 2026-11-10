@@ -76,12 +76,16 @@ BUILD_CHECK_TERMINAL = {
     "ssh_port": 2222,
     "ssh_key": "/etc/sandbox-ssh/id_ed25519",
     "lifetime_seconds": 2592000,
+    "timeout": 180,
     "workspace_root": "/opt/data",
 }
 BUILD_CHECK_OTHER_LINE = "KUBECONFIG=/opt/data/kube/config\n"
+# The line Hermes' first boot seeds into $HERMES_HOME/.env from its .env.example (stage2-hook.sh's
+# seed_one), which would otherwise hold every install's terminal at 60s; the copy has to replace it.
+BUILD_CHECK_SEEDED_LINE = "TERMINAL_TIMEOUT=60\n"
 # A profile config.yaml from before the terminal pin, whose backend the copy has to delete.
 BUILD_CHECK_KEPT_LINE = "# unrelated settings survive the delete\n"
-BUILD_CHECK_KEPT_SETTING = "  timeout: 60\n"
+BUILD_CHECK_KEPT_SETTING = "  persistent_shell: true\n"
 BUILD_CHECK_PROFILE_CONFIG = BUILD_CHECK_KEPT_LINE + "terminal:\n  backend: local\n" + BUILD_CHECK_KEPT_SETTING
 # A named profile the sweep has to find. profile_homes imports private Hermes names that no
 # other build step touches, and a pod whose sweep cannot import them does not start.
@@ -455,8 +459,8 @@ def terminal_default_mismatch(root: pathlib.Path | None = None) -> str | None:
 
 def build_check() -> int:
     """Against a throwaway managed dir and profile: the copy must make Hermes resolve ssh,
-    including over a backend the profile's config.yaml still sets, and the sweep must find a
-    named profile.
+    including over a backend the profile's config.yaml still sets, and the managed timeout over
+    the TERMINAL_TIMEOUT line Hermes seeds into .env, and the sweep must find a named profile.
 
     Also asks Hermes before the copy. If it already resolves ssh, a Hermes release has
     started applying the managed scope to the profile terminal scope itself, and this module
@@ -468,7 +472,7 @@ def build_check() -> int:
         managed.mkdir()
         home.mkdir()
         (managed / CONFIG_NAME).write_text(yaml.safe_dump({TERMINAL_SECTION: BUILD_CHECK_TERMINAL}))
-        (home / ENV_FILE_NAME).write_text(BUILD_CHECK_OTHER_LINE)
+        (home / ENV_FILE_NAME).write_text(BUILD_CHECK_OTHER_LINE + BUILD_CHECK_SEEDED_LINE)
         os.environ[MANAGED_DIR_ENV] = str(managed)
         os.environ[HERMES_HOME_ENV] = str(home)
         try:
