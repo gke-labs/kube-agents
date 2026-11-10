@@ -4,7 +4,7 @@
 The pull sweep and the seeded-fleet reconciles run on the build cluster and
 report nowhere but TestGrid. This module reads each one's latest finished build
 from the bucket it logs to, gs://kube-agents-periodic-logs for the pool jobs and
-the nightlies' bucket for the certification slice, each entry's `logs_root`
+the nightlies' bucket for the certification slice and the replay lane, each entry's `logs_root`
 (`latest-build.txt`, then `finished.json`, then the report the job wrote and any
 extra report the entry names, on every finished build) and turns a failed or overdue run into
 a note health.py carries and post_health.py posts once, with the job's history
@@ -43,8 +43,8 @@ except ImportError:  # run as a script: python3 scripts/eval_dashboard/periodics
 # own identities, which cannot write gs://kube-agents-prow.
 LOGS_ROOT = "gs://kube-agents-periodic-logs/logs"
 # Where the eval lanes that share the nightlies' decoration log: the
-# certification slice job writes there, beside the nightlies, not to the
-# periodic-logs bucket the other watched jobs use.
+# certification slice and the replay lane write there, beside the nightlies,
+# not to the periodic-logs bucket the other watched jobs use.
 EVAL_NIGHTLY_LOGS_ROOT = collect.NIGHTLY_LOGS_ROOT
 # Deck's job-history page for a logs root: the gs:// prefix becomes a path
 # under this host, so a job logged in another bucket links to its own page.
@@ -222,6 +222,10 @@ CERTIFICATION_SLICE_JOB = "ci-kube-agents-certification-1"
 # A week between runs, plus a day: a Saturday run that never started (no
 # cron fire, no lease) reads STALE on the Sunday, one tick after the slot.
 CERTIFICATION_STALE_AFTER = timedelta(days=8)
+# The inference-replay lane (oss-test-infra: kube-agents-periodics.yaml),
+# daily at 06:00 UTC; a day and a half, as for the daily reconcile.
+REPLAY_LANE_JOB = "ci-kube-agents-eval-replay-lane"
+REPLAY_LANE_STALE_AFTER = timedelta(hours=36)
 RECONCILE_POSTSUBMIT_JOB = "post-kube-agents-fleet-reconcile"
 # A watched job whose failed build is retired by another job's later pass:
 # the postsubmit has no window, and the daily that followed it did its work.
@@ -369,6 +373,17 @@ WATCHED = (
         "runs weekly on Saturday 14:00 UTC and on Rerun, grading part 1 of the certification suite (the task files carrying suite: certification) at 60 repetitions against the newest GA release on a leased pool project",
         "the certified-capabilities page's suite tests stop accruing runs, and a forbidden write or an unrun check on the lane is a failed build nobody reads.",
         f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#59-the-certification-lane",
+        logs_root=EVAL_NIGHTLY_LOGS_ROOT,
+    ),
+    # The inference-replay lane: it gates nothing and publishes no dashboard
+    # data, so a red run (nothing to replay, a refused key, a proxy pod that
+    # did not take the cache) reaches a person only through this note.
+    Periodic(
+        REPLAY_LANE_JOB, "inference replay lane", REPLAY_LANE_STALE_AFTER, None,
+        "Inference replay lane", "the replay lane is not measuring replay", "the replay lane is measuring replay again",
+        "runs daily at 06:00 UTC and replays the next-mode nightlies' recorded model answers on main, reporting the served share and verdict agreement under replay-shadow/replay-lane/",
+        "the served share and verdict agreement go unmeasured until the lane runs green again.",
+        f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#511-the-replay-lane",
         logs_root=EVAL_NIGHTLY_LOGS_ROOT,
     ),
 )

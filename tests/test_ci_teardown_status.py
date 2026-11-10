@@ -38,7 +38,7 @@ if [[ "$1 $2" == "config current-context" ]]; then
   echo "{EXPECTED_CONTEXT}"; exit 0
 fi
 if [[ "$1" == "get" ]]; then
-  exit 0  # empty read: no Helm release records survive Step 1
+  exit 0  # empty read: no Helm release records survive Step 2
 fi
 if [[ "$KUBECTL_MODE" == "incident" ]]; then
   if [[ "$1" == "delete" && "$2" == "-f" ]]; then
@@ -231,7 +231,7 @@ class CiTeardownStatusTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("401", result.stdout)
         self.assertIn("no longer this run's lease", result.stdout)
-        self.assertNotIn("Step 1: Uninstalling", result.stdout)
+        self.assertNotIn("Step 2: Uninstalling", result.stdout)
         self.assertNotIn("Cleanup Complete", result.stdout)
         self.assertNotIn("helm uninstall", self._calls())
         self.assertNotIn("kubectl delete", self._calls())
@@ -253,7 +253,7 @@ class CiTeardownStatusTest(unittest.TestCase):
         result = self._run("ok", self._prow_env())
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("beats: 503 401", result.stdout)
-        self.assertNotIn("Step 1: Uninstalling", result.stdout)
+        self.assertNotIn("Step 2: Uninstalling", result.stdout)
         self.assertNotIn("helm uninstall", self._calls())
         self.assertNotIn("kubectl delete", self._calls())
 
@@ -262,7 +262,7 @@ class CiTeardownStatusTest(unittest.TestCase):
         _FakeBoskos.scripted = [503]
         result = self._run("ok", self._prow_env())
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("Step 1: Uninstalling", result.stdout)
+        self.assertIn("Step 2: Uninstalling", result.stdout)
         self.assertIn("helm uninstall", self._calls())
 
     def test_no_definitive_answer_within_the_budget_refuses(self):
@@ -270,7 +270,7 @@ class CiTeardownStatusTest(unittest.TestCase):
         result = self._run("ok", self._prow_env(CI_TEARDOWN_LEASE_CHECK_WAIT_SECONDS="2"))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("no definitive answer", result.stdout)
-        self.assertNotIn("Step 1: Uninstalling", result.stdout)
+        self.assertNotIn("Step 2: Uninstalling", result.stdout)
         self.assertNotIn("helm uninstall", self._calls())
 
     def test_the_lease_check_outlasts_the_wrappers_heartbeat(self):
@@ -297,7 +297,7 @@ class CiTeardownStatusTest(unittest.TestCase):
             },
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("Step 1: Uninstalling", result.stdout)
+        self.assertIn("Step 2: Uninstalling", result.stdout)
         self.assertIn("Cleanup Complete", result.stdout)
         self.assertIn("helm uninstall", self._calls())
 

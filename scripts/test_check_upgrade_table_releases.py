@@ -123,7 +123,7 @@ class CheckUpgradeTableReleasesTest(unittest.TestCase):
     def test_the_failure_names_the_release_to_relabel_with(self):
         self.repo.mislabel()
         _, err = self.repo.check(GITHUB_EVENT_NAME="push")
-        self.assertIn("Relabel it as the next release, which will contain it.", err)
+        self.assertIn("Relabel it as pending: no release contains it yet.", err)
         self.repo.tag("1.1.0")
         self.repo.tag("1.2.0")
         _, err = self.repo.check(GITHUB_EVENT_NAME="push")
@@ -135,6 +135,66 @@ class CheckUpgradeTableReleasesTest(unittest.TestCase):
         code, err = self.repo.check()
         self.assertEqual(code, 1)
         self.assertIn('"change c"', err)
+
+    def test_a_pending_row_no_release_contains_passes(self):
+        self.repo.commit("feat: p", row=row("pending", "change p"))
+        self.assertEqual(self.repo.check(GITHUB_EVENT_NAME="push"), (0, ""))
+        code, err = self.repo.check()
+        self.assertEqual(code, 0)
+        self.assertNotIn("pending", err)
+
+    def test_a_pending_row_a_release_contains_fails_and_names_it(self):
+        added = self.repo.commit("feat: p", row=row("pending", "change p"))
+        self.repo.tag("1.0.0")
+        code, err = self.repo.check(GITHUB_EVENT_NAME="push")
+        self.assertEqual(code, 1)
+        self.assertIn(f'the row "change p" is labelled pending, but 1.0.0 contains {added[:12]}', err)
+        self.assertIn("Relabel it as 1.0.0.", err)
+        self.assertIn("Relabel a pending row before you reword it", err)
+
+    def test_a_pending_row_names_the_first_release_in_version_order(self):
+        self.repo.commit("feat: p", row=row("pending", "change p"))
+        self.repo.tag("1.9.0")
+        self.repo.tag("1.10.0")
+        _, err = self.repo.check(GITHUB_EVENT_NAME="push")
+        self.assertIn("Relabel it as 1.9.0.", err)
+
+    def test_a_pending_row_cherry_picked_into_a_release_fails_and_names_it(self):
+        base = self.repo.commit("feat: before the branch point")
+        self.repo.commit("feat: p", row=row("pending", "change p"))
+        self.repo.git("checkout", "-q", "-b", "release", base)
+        self.repo.write_page()  # the same row, cherry-picked to the release branch
+        self.repo.commit("feat: p, cherry-picked")
+        self.repo.tag("1.0.0")
+        self.repo.git("checkout", "-q", "main")
+        code, err = self.repo.check(GITHUB_EVENT_NAME="push")
+        self.assertEqual(code, 1)
+        self.assertIn("but 1.0.0 contains the row in its own copy of the table. Relabel it as 1.0.0.", err)
+
+    def test_a_pending_row_no_commit_adds_is_reported(self):
+        self.repo.tag("1.0.0")
+        self.repo.rows.insert(0, row("pending", "change w"))
+        self.repo.write_page()  # in the working tree only
+        code, err = self.repo.check(GITHUB_EVENT_NAME="push")
+        self.assertEqual(code, 1)
+        self.assertIn('no commit in this history adds the row "change w", so its pending label cannot be checked', err)
+
+    def test_a_misspelt_release_cell_fails(self):
+        for cell in ("`pending`", "Pending", "next"):
+            self.repo.rows = [r for r in self.repo.rows if "change m" not in r]
+            self.repo.commit("feat: m", row=row(cell, "change m"))
+            code, err = self.repo.check(GITHUB_EVENT_NAME="push")
+            self.assertEqual(code, 1, cell)
+            self.assertIn(f'the Release cell "{cell}" is neither a release number nor pending', err)
+
+    def test_a_contained_pending_row_warns_a_pull_request_that_leaves_it_alone(self):
+        self.repo.commit("feat: p", row=row("pending", "change p"))
+        self.repo.tag("1.0.0")
+        self.repo.pull_request(page=False)
+        code, err = self.repo.check(GITHUB_EVENT_NAME="pull_request")
+        self.assertEqual(code, 0)
+        self.assertIn('warning: docs/site/src/content/docs/install/upgrade.md', err)
+        self.assertIn("labelled pending, but 1.0.0 contains", err)
 
     def test_a_relabelled_row_passes(self):
         base = self.repo.commit("feat: before the branch point")
