@@ -103,7 +103,10 @@ archive alongside until that leaves the window; the pool-pressure check and step
 read the new bucket only, so a green from before the move is not reused and the pool gauge's window
 fills over its first week. A run in that bucket records where it lives (`runs[].gcs_base`), and
 the dashboard's and the health bot's build links open that directory in the Cloud Console for a
-project reader; a run in the old bucket keeps its Prow link, which still renders it. The nightly's
+project reader; a run in the old bucket keeps its Prow link, which still renders it. The
+release-candidate lane moves to the same bucket under `logs/`; the collector reads its old archive in
+`gs://kube-agents-prow` alongside until the newest `--rc-limit` builds are all in the new one, and a
+release read from the new one records `releases[].gcs_base` and links the Console the same way. The nightly's
 bucket (`gs://kube-agents-evals-nightly-logs`) is private the same way, so the Nightly report's
 and the nightly issues' run and transcript links open the Console too; for a record whose Prow
 link points into it, the Nightly report, the nightly issues and the lane rows link the Console

@@ -236,8 +236,9 @@ SCHEMA_VERSION = 1
 # A periodic's log prefix holds one directory per build and a
 # latest-build.txt, so listing it is the directory index; there is no
 # pointer object to follow. The bucket is the nightly's own, not the
-# cluster default gs://kube-agents-prow the RC lane logs to (the presubmit
-# has its own as well): the nightly runs as an identity that cannot write that one (night one
+# cluster default gs://kube-agents-prow (the presubmit has its own as well,
+# and the RC lane moves from the cluster default into that one, under
+# logs/): the nightly runs as an identity that cannot write that one (night one
 # died in initupload on a 403), so its job overrides the bucket and
 # github-actions@kube-agents-prow reads it as objectViewer. Only the bucket
 # differs; Prow's path strategy still puts a periodic under logs/<job>/.
@@ -575,8 +576,10 @@ _FINAL_VERDICT = re.compile(
 #   Tier:        nightly
 #   Verdict:     GREEN (GREEN promotes this candidate to staging)
 #   Artifacts:   https://oss.gprow.dev/view/gs/kube-agents-prow/logs/<job>/<build>
-# The Artifacts line is absent when the driver ran outside Prow (no JOB_NAME
-# or BUILD_ID), so it is optional here. The whole banner is absent when the
+# The Artifacts line is the Console's bucket browser instead for a build in a
+# private bucket (links.py); either way it is one token, taken as it is. It
+# is absent when the driver ran outside Prow (no JOB_NAME or BUILD_ID), so it
+# is optional here. The whole banner is absent when the
 # driver exited on one of its early guards, which build_release reports as a
 # release with no verdict rather than dropping -- a resolver that has been
 # broken for a month must not read as a month with no releases.
@@ -2080,9 +2083,15 @@ def releases_from_gcs(
     """
     releases = []
     for glob in rc_globs:
-        listing = _gcloud_storage(["ls", glob], gcloud)
+        listing, stderr = _gcloud_storage_call(["ls", glob], gcloud)
         if listing is None:
-            print(f"warning: gcloud storage ls failed for {glob}; skipping", file=sys.stderr)
+            # An empty prefix is the lane's archive before its first build
+            # lands there, or the old one once its builds are reaped: a
+            # note, not a failed listing.
+            if _NO_OBJECTS.search(stderr or ""):
+                print(f"note: {glob}: no release-candidate builds listed", file=sys.stderr)
+            else:
+                print(f"warning: gcloud storage ls failed for {glob}; skipping", file=sys.stderr)
             continue
         dirs = sorted(_build_dirs(listing), key=lambda d: int(d[0]), reverse=True)
         if len(dirs) > limit:
@@ -2102,6 +2111,12 @@ def releases_from_gcs(
             if release is None:
                 print(f"note: rc build {build_id}: no finished.json; skipping", file=sys.stderr)
                 continue
+            # Where the build lives, by the same rule as runs[] (SCHEMA.md,
+            # releases[].gcs_base): only for a bucket Deck cannot read, so the
+            # Brief's row links the Console; a release in the old bucket
+            # keeps its Spyglass artifacts_url, which still renders it.
+            if records_location(line):
+                release["gcs_base"] = line
             releases.append(release)
     return releases
 
@@ -3025,7 +3040,9 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         default=[],
         metavar="GS_GLOB",
-        help="gs:// glob of release-candidate build dirs, e.g."
+        help="gs:// glob of release-candidate build dirs:"
+        " gs://kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/*"
+        " (the lane's bucket) and, for the builds from before it moved there,"
         " gs://kube-agents-prow/logs/post-kube-agents-eval-rc/* . Collected"
         " into releases[], never into runs[]: a candidate is judged against"
         " main's window, not added to it (repeatable)",

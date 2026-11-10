@@ -928,6 +928,9 @@ class ReconcileTest(unittest.TestCase):
 # replacing the last two digits with the run number.
 STEP5_BUILD = "1985733102944374784"
 SPYGLASS = "https://oss.gprow.dev/view/gs/kube-agents-prow/logs/post-kube-agents-eval-rc/"
+# The poller's link once the lane logs to the private bucket: the Console's
+# bucket browser (staging-red-step5-console.log is the same night in that form).
+CONSOLE = "https://console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/"
 SHA_31 = "e1ab9e5" + "1" * 33
 SHA_32 = "0cc8ee5" + "2" * 33
 SHA_33 = "3a8ba90" + "3" * 33
@@ -1461,6 +1464,17 @@ class StalledChainTest(unittest.TestCase):
         self.assertEqual(github.writes, [])
         self.assertEqual(chat.posted, [])
         self.assertIn("closed #3999", err)
+
+    def test_a_console_link_in_the_verdict_line_is_read_and_linked_as_is(self):
+        """Once the lane logs to the private bucket the poller's line carries
+        the Console's bucket-browser URL; the notifier reads the link as one
+        token and links it verbatim, so the row opens the build a project
+        reader can see rather than a Spyglass page that denies everyone."""
+        text = fixture("staging-red-step5-console.log")
+        self.assertEqual(notifier.extract_red_verdict_build(text), (STEP5_BUILD, CONSOLE + STEP5_BUILD))
+        self.assertEqual(notifier.extract_red_cases(text), {"cases": CASE_1104, "partial": False})
+        row = notifier.stall_row(REPO, {"run": run_like(44, night_run_id(44)), "candidate": {"sha": SHA_31}, "build": (STEP5_BUILD, CONSOLE + STEP5_BUILD), "cases_cell": CELL_1104})
+        self.assertIn(f"[{STEP5_BUILD}]({CONSOLE}{STEP5_BUILD})", row)
 
     def test_the_poller_verdict_line_format_is_what_the_notifier_parses(self):
         line = poller.VERDICT_LINE_FORMAT.format(verdict=poller.VERDICT_RED, settled=poller.SETTLED_TRUE, build_id=build_of(40), url=SPYGLASS + build_of(40))
