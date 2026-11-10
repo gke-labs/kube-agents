@@ -974,13 +974,13 @@ func TestYAMLUnescape_EscapeOutOfRuneRangeIsNotRead(t *testing.T) {
 	}
 }
 
-// A state word or placeholder under a JSON key that names a credential
-// (password: disabled) is not tracked, so the answer's ordinary use of the
-// word stays.
+// A state word or an upper-case env var reference, the whole of a JSON
+// string under a key that names a credential (password: disabled), is not
+// tracked, so the answer's ordinary use of the word stays.
 func TestSeenSecrets_AStateWordUnderACredentialJSONKeyIsNotTracked(t *testing.T) {
 	var s seenSecrets
-	s.collectToolResult(terminalResult(t, `{"password": "disabled", "token": "required", "api_key": "configured", "clientSecret": "now-expired", "db_password": "${DB_PASSWORD}", "access_token": "`+synthSecretPlain+`"}`))
-	for _, w := range []string{"disabled", "required", "configured", "now-expired", "${DB_PASSWORD}"} {
+	s.collectToolResult(terminalResult(t, `{"password": "disabled", "token": "required", "api_key": "configured", "clientSecret": "Plaintext", "db_password": "${DB_PASSWORD}", "admin_password": "$ADMIN_PASSWORD", "access_token": "`+synthSecretPlain+`"}`))
+	for _, w := range []string{"disabled", "required", "configured", "Plaintext", "${DB_PASSWORD}", "$ADMIN_PASSWORD"} {
 		if s.has(w) {
 			t.Errorf("the set tracks %q, a state word or placeholder", w)
 		}
@@ -1007,5 +1007,19 @@ func TestSeenSecrets_AnExactJSONValueKeepsItsTrailingPunctuation(t *testing.T) {
 	}
 	if got := scrubAnswerText("Encoded it is "+b64(bang)+" and plain "+bang+" works", &s); got != "Encoded it is [redacted] and plain [redacted] works" {
 		t.Errorf("answer = %q, want both forms redacted whole", got)
+	}
+}
+
+// A JSON credential value that only looks like a placeholder (a command
+// substitution, an angle-bracketed word, a mixed-case $name), or a state
+// word with more around it, is tracked as it is: its edges are exact.
+func TestSeenSecrets_APlaceholderShapedJSONCredentialIsTracked(t *testing.T) {
+	vals := []string{"$(synthpass-0001)", "<synthpass-0002>", "$Synth_Pass_0003", "disabled-synth-0004"}
+	var s seenSecrets
+	s.collectToolResult(terminalResult(t, `{"password": "`+vals[0]+`", "token": "`+vals[1]+`", "api_key": "`+vals[2]+`", "db_password": "`+vals[3]+`"}`))
+	for _, v := range vals {
+		if !s.has(v) {
+			t.Errorf("the set does not track %q", v)
+		}
 	}
 }

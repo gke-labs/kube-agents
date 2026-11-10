@@ -411,9 +411,7 @@ func (c *toolResultCollector) value(v any, depth int) {
 			if secret && (k == "data" || k == "stringData") {
 				continue // read above
 			}
-			// A state word or placeholder (password: disabled) is not a
-			// value, as the shape rules say (valueNotASecret).
-			if sv, ok := x.(string); ok && keyClearlyNamesSecret(k) && !valueNotASecret(trimValueEdges(sv)) {
+			if sv, ok := x.(string); ok && keyClearlyNamesSecret(k) && !jsonValueNotASecret(sv) {
 				c.exactCaught(sv)
 			}
 			c.value(x, depth)
@@ -423,6 +421,22 @@ func (c *toolResultCollector) value(v any, depth int) {
 			c.value(x, depth)
 		}
 	}
+}
+
+// envVarReferencePattern is a value that is wholly an upper-case
+// environment variable reference ($DB_PASSWORD, ${DB_PASSWORD}).
+var envVarReferencePattern = regexp.MustCompile(`^\$\{?[A-Z_][A-Z0-9_]*\}?$`)
+
+// jsonValueNotASecret says a decoded JSON string under a credential key is
+// plainly not a value: the whole of it, as decoded, is a state word
+// (credentialStateWords, credentialWholeValueWords: password: disabled) or
+// an upper-case environment variable reference. A narrower test than the
+// free-text valueNotASecret on purpose: the value's edges are exact, so it
+// is not trimmed, and a value that only looks like a placeholder ($(...),
+// <...>, a mixed-case $name) can be a credential and is tracked.
+func jsonValueNotASecret(v string) bool {
+	lower := strings.ToLower(v)
+	return credentialStateWords[lower] || credentialWholeValueWords[lower] || envVarReferencePattern.MatchString(v)
 }
 
 // secretObject adds a decoded Secret object's values, but for the keys
