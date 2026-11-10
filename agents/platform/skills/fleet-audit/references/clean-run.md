@@ -78,7 +78,9 @@ Two rules follow, and they are the whole rule:
   this run opened. A `NO_FORGE` run has no `issue_url`; its report is `summary` (see
   [No forge configured](finish.md#no-forge-configured)). A `STORE_LEDGER` run has no `issue_url`
   either; its report is `summary`, with the pull request links (see
-  [A forge with no issue tracker](finish.md#a-forge-with-no-issue-tracker)).
+  [A forge with no issue tracker](finish.md#a-forge-with-no-issue-tracker)). Every report also
+  relays each entry of `notes` on the JSON line ([`finish`](finish.md)); a run that answers
+  `[SILENT]` does not.
 - **An on-demand run is never silent.** `silent_ok` is the _scheduled_ verdict — it answers "would a
   channel want this?". `finish` returns `true` only when it gets `--scheduled`, and only the cron
   prompt tells you to pass that flag. If someone dispatched this job, from a kanban card or straight

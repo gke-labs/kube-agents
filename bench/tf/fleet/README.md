@@ -56,11 +56,13 @@ pool's replace on a minor roll, the scaled-zero gateway's status writer and seed
 entries in `oss-test-infra` run `main` only: a postsubmit on every merge that changes the stack's files
 here, and a daily pass at 08:30 UTC (`docs/ci-pool-projects.md` §6.2, which says which files, and states
 the rule for a fixture pull request and for proving a branch on one leased project). After each
-project whose state it read or tried to read, whatever the plan outcome, the script also resets the `startup-fail` VM
+project whose state it read, whatever the plan outcome, the script also resets the `startup-fail` VM
 (`gcloud compute instances reset`, on the one instance the state records at
 `google_compute_instance.startup_fail`), so the guest prints the startup-script failure line again:
 it prints it once per boot, and the serial buffer of about 1 MiB rotates it out within about three
-weeks. A reset that fails is a warning on that project's outcome, not a failure;
+weeks. A state read that fails is recorded as `startup_fail_reset` with result `failed`, and no reset
+is tried; an interrupted project is not reset. A reset that fails is a warning on that project's
+outcome, not a failure;
 `--no-fixture-refresh` turns it off. A hand
 run goes through the script too (`--project <id>`), never `tofu apply` from a branch, and
 never from a laptop while a run holds the project. The four hand recoveries (`seeded_b`'s
