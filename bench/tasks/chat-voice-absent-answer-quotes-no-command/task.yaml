@@ -1,0 +1,122 @@
+# Registered in hack/eval/nightly-cases.txt. Not on the blocking roster: a
+# presubmit seat is a later pull request that cites this case's nightly record.
+#
+# Domain: chat and routing. What it grades is the voice of a presence answer:
+# the user asks whether a namespace is on a named cluster, the front door
+# routes the ask to that cluster's Cluster Agent (agents/chat/SOUL.md §2 step
+# 2, a named cluster), the namespace is not there, and the card's `result` is
+# posted into the thread verbatim (agents/chat/SOUL.md §2 step 5). The Cluster
+# Agent persona's presence rule ("Absent is an answer when presence was the
+# question", agents/cluster/SOUL.md) told the worker to make the absence its
+# one-line finding and to quote the command that showed it, so the answer the
+# user read carried a `kubectl get ...` line: plumbing under
+# .agents/rules/chat_ux.md, "No plumbing in user text" (#5094). The intended
+# answer names what was looked for and the cluster it was looked for on, and
+# no command: "no namespace ledger-archive on seeded-b".
+#
+# None of the other chat-voice-* cases reach the presence path: their asks are
+# about things that exist. fanout-absent-cluster-cards-complete reaches it on
+# a fan-out's children and grades that the cards completed, not how the answer
+# reads.
+#
+# The namespace name is invented, so it is absent by construction on every
+# pool project: nothing under bench/tf/fleet/ creates a `ledger-archive`
+# namespace, and the fleet is read-only (bench/tasks/DRAFTS.md). The slot b
+# role below stands for its cluster rather than for a planted defect
+# (docs/designs/bench-case-format.md, `fixtures`): `fixture_roles` grounds
+# the objective in the runner having reached slot b, and `{cluster:b}` is
+# that cluster's recorded name, so an answer that names it in full passes
+# the same as one that says seeded-b.
+#
+# The check measures the whole delivered result, the evidence section
+# kanban_complete renders below the worker's text included: a `$ kubectl`
+# fence there is a quoted command the user reads, the same defect in the
+# tool's rendering. report_contains normalizes backticks away, so a fenced
+# command and an inline one read the same to the patterns.
+#
+# The worker-scope objective pins the path: the card completed on the
+# seeded-b Cluster Agent, not on `platform` (which has its own absent-target
+# rule, agents/platform/SOUL.md §0). The inject lane sets worker-scope checks
+# aside on every record (bench/kube_agents_bench/cases.py,
+# WORKER_BLIND_CHECK_TYPES and `tool_called` in the workers scope), so on the
+# presubmit lane this case grades the answer alone; on the api lanes it also
+# grades who answered.
+#
+# Planted defect required: none. Isolation class: read-only. deployer: noop,
+# one front-door turn plus the card round trip. No safeguard of its own: the
+# ask reads one namespace, and both lanes append the GitHub-write safeguard.
+id: chat-voice-absent-answer-quotes-no-command
+name: A presence answer names the missing namespace and the cluster, not the command that showed it
+prompt: >-
+  Is there a namespace called ledger-archive on the seeded-b cluster?
+expected_output: >-
+  The front door files a card for seeded-b's Cluster Agent and acks it. The
+  answer that comes back is one line saying there is no namespace
+  ledger-archive on seeded-b, in words: it names the namespace and the
+  cluster, and it carries no kubectl or gcloud command, no command fence and
+  no exit code. It does not ask which cluster is meant.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml: the front door's reply to a routed ask.
+domain: chat-and-routing
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: bradhoekstra
+
+# The slot b role stands for its cluster: nothing here reads the version
+# laggard itself. Listed so the fleet owner replacing seeded-b finds this case.
+fixtures:
+  - version-laggard
+
+verification_spec:
+  # assert, not the converge default: the transcript is immutable once the
+  # run ends, so polling a failed check would only wait out the timeout.
+  #
+  # The answer says what is absent and where: the namespace by name, the
+  # cluster by its recorded name or its short form, and a negation (the
+  # text is lowercased before the patterns run; `n't` covers "isn't" and
+  # "doesn't", and the apostrophe is normalized to the straight one). No
+  # question back about which cluster is meant.
+  - name: the-answer-names-the-missing-namespace-and-the-cluster
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["ledger-archive"]
+      any_of_patterns:
+        - "{cluster:b}"
+        - '\bseeded-b\b'
+      required_patterns:
+        - '\b(?:no|not|none|absent|missing)\b|n''t\b'
+      forbidden_patterns:
+        - '(?i)\bwhich cluster\b'
+      fixture_roles:
+        - version-laggard
+  # The defect: a command in the answer. `kubectl` is the one the presence
+  # rule produced; `gcloud` is the same defect through the other CLI the
+  # worker has; a line opening on `$ ` is a quoted shell command whatever the
+  # tool, and the shape kanban_complete's evidence section renders.
+  - name: the-answer-quotes-no-command
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns:
+        - '\bkubectl\b'
+        - '\bgcloud\b'
+        - '(?m)^\s*\$ \S'
+  # The path: the seeded-b Cluster Agent completed the card. The agent
+  # pattern anchors on the cluster name between dashes, so seeded-b cannot
+  # match a profile named for seeded-bb. Set aside on the inject lane (see
+  # the header); graded on the api lanes.
+  - name: the-seeded-b-cluster-agent-completed-the-card
+    role: objective
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["kanban_complete"]
+      scope: workers
+      agent: "cluster-.*-seeded-b-.*"
+      require_success: true
