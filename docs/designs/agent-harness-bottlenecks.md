@@ -172,6 +172,9 @@ Each operation runs against the factors that load it, not against every factor. 
 
 Phase 1 ran from 2026-10-22 to 2026-10-24; its results are under Phase 1 results below. Phase 2, from 2026-10-26 to 2026-10-27, measured the points the Phase 1 data pointed at. Phase 3, from 2026-10-27 to 2026-10-28, measured the cluster levels again in 30-minute windows.
 
+The phases are one-off runs. [`sized-test-fleet.md`](sized-test-fleet.md) designs the recurring
+form: fixed S, M and L fleets on real nodes, M measured five nights a week and L once.
+
 ## Phase 1: two data points per factor
 
 Each factor is measured at the base and at one higher level, the one the known issues point at:
