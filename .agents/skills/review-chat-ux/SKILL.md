@@ -48,8 +48,8 @@ below say where violations hide; the paragraph is the test.
 - **No plumbing in user text**: Flag task ids, card ids, session keys, file paths, tool names,
   JSON, CLI flags, exit codes and roster ids used as names. Allow a cluster, a workload, a linked
   pull request, a specialist's name where `SOUL.md` asks for attribution, a board read's short
-  task id, and the evidence section `kanban_complete` renders from `verified_claims` below the
-  worker's text.
+  task id, and the command and output fences of the evidence section `kanban_complete` renders
+  from `verified_claims`.
 - **Choices are buttons**: Flag a choice offered without buttons, a button that does not send its
   answer, "reply X", "type X" or "say X" in a message body; flag more than 5 buttons in one row.
   Allow the text fallback listing the options.
