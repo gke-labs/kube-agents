@@ -458,6 +458,14 @@ _INJECT_DEFAULT_TIMEOUT = "1800"
 # the marker above; ``test_scoring.py`` asserts the two strings agree.
 DELEGATION_CEILING_MARKER = "KUBE_AGENTS_DELEGATION_CEILING"
 
+# The note on a record's errors when the session store could not be read and the
+# delegation wait fell back to the trajectory's cards, so the record may hold the
+# acknowledgement in place of the delegated answer. ``scoring.py`` matches it to
+# excuse the write safeguard's charge of the requested pull request on such a
+# record, and duplicates the literal for the reason the markers above give;
+# ``test_scoring.py`` asserts the two agree.
+DELEGATION_FALLBACK_NOTE = "the delegation wait fell back to the trajectory's cards"
+
 # Where hermes keeps per-card state in the agent's data volume. A card's
 # attachments hold the files its worker produced -- the deliverable itself on a
 # task that asks for a written report -- and its log holds the worker's whole
@@ -4282,8 +4290,8 @@ class KubeAgentsHarness(AgentHarness):
         if read is None:
             result.errors.append(
                 f"the session store for {session_id} could not be read "
-                f"{_MAX_TRANSPORT_FAILURES} times running; the delegation wait fell back to the "
-                "trajectory's cards, so a delegated answer may be graded on the acknowledgement"
+                f"{_MAX_TRANSPORT_FAILURES} times running; {DELEGATION_FALLBACK_NOTE}, so a "
+                "delegated answer may be graded on the acknowledgement"
             )
             return False
         if not read.session_found or not read.card_ids:
