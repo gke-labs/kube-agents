@@ -639,7 +639,9 @@ string matching the token-shaped subset of `AuditRedactor`'s patterns, with
 that rule — the ranges, the shapes, the skip list, the marker, and what review covers that
 the scan cannot. The scan is tree-level rather than per case, like the fixture-catalogue
 drift check, so `validate_all()` does not carry it; the lint asserts on
-`sanitization_findings()` in its own right.
+`sanitization_findings()` in its own right. The same way, it rejects any file committed under
+a case's `evidence/` directory (`committed_run_records()`): a run's record stays in the bucket
+or on the dev install, and the case cites the run by its directory name or build id.
 
 `scripts/test_task_registration.py` calls the same module in CI and asserts that it
 returned no findings at all, so the fast local check and the gating lint cannot disagree.
