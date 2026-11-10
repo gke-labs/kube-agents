@@ -125,9 +125,11 @@ verification_spec:
       required_patterns:
         - '(?m)^(?=.*\bledger-archive\b)(?=.*(?:\bno (?:namespace|such)\b|\bnot (?:on|in|among|present|found|there)\b|\b(?:isn''t|is not|doesn''t exist|does not exist|not exist|none|absent|missing)\b)).*$'
       forbidden_patterns:
-        # A question back, in any wording: a presence finding asks nothing,
-        # so no line ends on a question mark, and none says "did you mean".
-        - '(?m)^.*\?\s*$'
+        # A question back, in any wording: a line that asks about a cluster
+        # or a project, or says "did you mean". A finding may end on an
+        # offer ("Want me to check the other clusters?"), so a bare question
+        # mark is not enough; the stall names what it cannot pick.
+        - '(?im)^.*\b(?:which|cluster|project)\b.*\?\s*$'
         - '(?im)^.*\bdid you mean\b.*$'
         # A failure to check: a modal or ability negation, then within three
         # words a checking verb ("couldn't confirm", "was not able to

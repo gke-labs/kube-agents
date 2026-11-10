@@ -116,6 +116,9 @@ GREEN_FINDINGS = (
     "(`default`, `seeded-upgrade`, and 9 system namespaces).",
     "**No namespace `ledger-archive` on seeded-b.** seeded-b has 11 namespaces, none of which exist on the cluster "
     "under that name, and ledger-archive is not among them.",
+    # A finding that ends on an offer is not a question back (a reviewer's
+    # note: agents write these, and a green run of another case ended on one).
+    "**No namespace `ledger-archive` on seeded-b.** Want me to check the other clusters?",
 )
 # What the automated review found would pass: a failure to check that repeats
 # the prompt's terms, and a question back in other words than "which cluster".
