@@ -176,6 +176,15 @@ def test_a_single_quoted_lookalike_of_a_substitution_is_exempt():
         # `$_` spelled through an ANSI-C escape, or read through another variable.
         pytest.param(f"grep -rq 'curl -s -X POST {URL}' eval $'\\x24_'", id="ansi-c-quote"),
         pytest.param(f"grep -rq 'curl {URL}' ${{!x}}", id="indirect-expansion"),
+        # A quote or a backslash after `$_` ends the name in bash, then glues text on.
+        pytest.param(f"grep -rq 'curl -s -X POST {URL} -s' $_'S'", id="last-argument-quote-glued"),
+        pytest.param(f'grep -rq \'curl {URL}\' "$_"S', id="last-argument-double-quote-glued"),
+        pytest.param(f"grep -rq 'curl {URL}' $_\\S", id="last-argument-backslash-glued"),
+        # An indirect assignment, and an assignment nested in a default.
+        pytest.param(f'grep "${{!USER:=curl {URL}}}" SKILL.md $hermes', id="indirect-assignment"),
+        pytest.param(f'grep "${{X:-${{Y:=curl {URL}}}}}" SKILL.md $Y', id="assignment-in-a-default"),
+        # A line continuation inside `$'…'`, which bash removes first.
+        pytest.param(f"grep -rq {URL} SKILL.md $\\\n'\\x24_'", id="ansi-c-quote-across-a-continuation"),
         # An arithmetic assignment is a substitution, which the exemption already refuses.
         pytest.param(f"grep -rq $((N=1)){URL} SKILL.md", id="arithmetic-assignment"),
     ],
@@ -193,6 +202,7 @@ def test_a_plain_expansion_or_a_lookalike_variable_stays_exempt():
         f'grep -rn "${{HOME}}{ROUTE}" SKILL.md',
         f'grep -rn {ROUTE} "${{DIR:-.}}"',
         f"grep -rn {ROUTE} $_dir/SKILL.md",
+        f'grep -rn {ROUTE} "${{_DIR}}"',
         f"grep -rn '{ROUTE}$' SKILL.md",
         f'grep -rn {ROUTE} "$\'" SKILL.md',
     ):

@@ -2793,14 +2793,16 @@ class WorkerCommandsVerifier(BaseVerifier):
     and a long option with a separate value is read as a flag, so its value is
     taken as the pattern and the real one is graded. A card log row that joined
     a second typed line onto a grep is one row to it, so the exemption refuses a
-    row on which a later word could read the removed word back: a pattern that
-    assigns a variable as it expands (``${NAME:=…}``, ``${NAME=…}``) or
-    expands an array element at all (``${NAME[…]…}``, whose subscript can
-    nest; an arithmetic ``$((NAME=…))`` is a substitution),
-    another word that reads the last argument (``$_``, ``${_}``) or a
-    variable through another (``${!NAME}``), or an ANSI-C quote (``$'…'``)
-    anywhere, whose escapes can spell either. The words are read with their
-    quotes off, so a single-quoted lookalike is refused too. Another way to
+    row on which a later word could read the removed word back: a braced
+    expansion other than a plain name or a default that assigns nothing
+    (``${HOME}``, ``${DIR:-.}``; ``${X:=…}``, ``${A[i]=…}`` and
+    ``${!X:=…}`` can assign; an arithmetic ``$((X=…))`` is a substitution),
+    a read of the last argument (``$_``, ``${_}``) or of a variable through
+    another (``${!NAME}``), or an ANSI-C quote (``$'…'``), whose escapes can
+    spell either. These read the whole line as the shell reader keeps it,
+    quotes in place and line continuations gone, so a quote that ends a name
+    in bash (``$_'S'``) ends it here too; a single-quoted lookalike is refused
+    as well. Another way to
     read the word back from a joined line (``declare -p``, ``history``) is
     not seen.
     ``required_runs``: each names a script (by basename, or module stem under

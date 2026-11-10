@@ -85,10 +85,10 @@
 #     `&>/dev/null` trailer, which a typed card keeps.
 #   - A card log row joins a second typed line onto the grep with a space, so
 #     a second line could read the removed pattern back from the shell. The
-#     grep is graded whole when its pattern assigns a variable as it expands
-#     (`${X:=...}`) or expands an array element (`${A[...]...}`), when
-#     another word on the row reads the last argument (`$_`) or a variable
-#     through another (`${!x}`), or when the row holds an ANSI-C quote
+#     grep is graded whole when the row holds a braced expansion other than
+#     `${NAME}` or `${NAME:-...}` (one can assign: `${X:=...}`, `${A[i]=...}`,
+#     `${!X:=...}`), reads the last argument (`$_`, also as `$_'S'`) or a
+#     variable through another (`${!x}`), or holds an ANSI-C quote
 #     (`$'...'`). A single-quoted lookalike is graded whole too, and another
 #     read-back (`declare -p`, `history`) is not seen.
 #   - The required run also reads each card's tagged call as typed, so a
