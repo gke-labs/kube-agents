@@ -15372,6 +15372,14 @@ _DOOR_IDLE_SECONDS = 4 * _RESET_SETTLE_SECONDS
 _HEALTH_ANSWER_SECONDS = 1
 # Refusals made in quick succession, to show the cap writes one line for them.
 _REFUSAL_BURST = 3
+# The lag the stamped-late test puts between a refusal's 503, written on its
+# refusal thread, and the accept loop counting it, which is the stamp the
+# quiet interval is measured from. Wider than the few milliseconds by which the
+# saturation test's quiet-interval sleep used to lead that stamp: a refusal
+# helper that returned on the 503 alone starts the sleep before the stamp, and
+# the closed holder's handler then finds the interval unexpired and says
+# nothing, which is the shape a loaded runner produced without any lag added.
+_REFUSAL_STAMP_LAG_SECONDS = 0.03
 # The small cap the saturation test builds its server with.
 _SMALL_THREAD_CAP = 4
 _KEEPALIVE_REQUESTS = 5
@@ -15930,14 +15938,34 @@ class ThreadCapTest(_CredentialedUnixServer):
         return _SMALL_THREAD_CAP
 
     def _refused(self):
-        """Connect past the cap and return what the connection read."""
+        """Connect past the cap and return what the connection read.
+
+        Returns once the refusal is complete on both of the server's threads:
+        the refusal thread has written the 503 and closed, and the accept
+        loop has counted it. The count stamps the server's last refusal,
+        which connection_released measures the quiet interval from; a test
+        that timed that interval from the 503 alone would, when the accept
+        loop stamps late, close a holder whose handler finds the interval
+        unexpired and says nothing.
+        """
+        before = self._last_refusal_stamp()
         extra = self.connect()
         with contextlib.suppress(BrokenPipeError, ConnectionResetError):
             self.send(extra, "GET", "/healthz")
         status, headers, body = self.response(extra)
         self.assertTrue(self.closed_by_server(extra), "the refused connection stayed open")
         extra.close()  # as Envoy does on reading the answer; the drain returns at once
+        deadline = time.monotonic() + _CLOSE_WAIT_SECONDS
+        while self._last_refusal_stamp() <= before:
+            if time.monotonic() > deadline:
+                self.fail(f"the accept loop did not count the refusal within {_CLOSE_WAIT_SECONDS}s")
+            time.sleep(_POLL_SECONDS)
         return status, headers, body
+
+    def _last_refusal_stamp(self):
+        """When the server last counted a refusal, read under the lock the count writes it under."""
+        with self.server._refused_lock:
+            return self.server._last_refusal_at
 
     def _wait_for_a_free_slot(self, slots):
         """Block until a closed connection's thread has given one of ``slots`` back; fail at _CLOSE_WAIT_SECONDS."""
@@ -15945,6 +15973,34 @@ class ThreadCapTest(_CredentialedUnixServer):
         slots.release()
 
     def test_the_connection_past_the_cap_reads_503_and_eof_while_health_answers(self):
+        self._burst_is_one_line_and_a_quiet_interval_ends_the_episode()
+
+    def test_the_release_line_is_written_when_the_accept_loop_counts_the_refusal_late(self):
+        # The refusal thread writes the 503 before the accept loop counts the
+        # refusal, and the count is the stamp the quiet interval is measured
+        # from. Here every count lands _REFUSAL_STAMP_LAG_SECONDS after its
+        # answer, as a loaded runner once arranged on its own: a refusal
+        # helper that returned on the 503 alone would start the quiet-interval
+        # sleep ahead of the last stamp, and the closed holder's handler would
+        # find the interval unexpired, say nothing, and leave no later handler
+        # to say it. The helper waits for the stamp, so the scenario holds.
+        count = self.server._count_refusal
+
+        def lagged_count(answered):
+            time.sleep(_REFUSAL_STAMP_LAG_SECONDS)
+            count(answered)
+
+        with mock.patch.object(self.server, "_count_refusal", lagged_count):
+            self._burst_is_one_line_and_a_quiet_interval_ends_the_episode()
+
+    def _burst_is_one_line_and_a_quiet_interval_ends_the_episode(self):
+        """Saturate the cap, refuse a burst, free one holder after a quiet interval.
+
+        The body of two tests: the burst is one ALERT line and the health
+        listener answers meanwhile; the first holder closed after an interval
+        with no refusal has its handler write the release line; the freed
+        slot serves the next connection.
+        """
         health = credential_proxy.start_health_listener("127.0.0.1", 0)
         self.addCleanup(health.server_close)
         self.addCleanup(health.shutdown)
@@ -15975,6 +16031,10 @@ class ThreadCapTest(_CredentialedUnixServer):
         # over only once an interval has passed with no refusal. The closed
         # holder's handler writes that line as it returns, so the test waits
         # for the line, inside the shortened interval, rather than sleeping.
+        # The sleep is one interval measured from after the last refusal's
+        # stamp (_refused returns only once the accept loop has written it),
+        # and the handler measures the interval after the sleep ends, so the
+        # handler always finds it elapsed.
         with mock.patch.object(credential_proxy, "THREAD_CAP_LOG_INTERVAL_SECONDS", _RESET_SETTLE_SECONDS):
             time.sleep(_RESET_SETTLE_SECONDS)
             with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
