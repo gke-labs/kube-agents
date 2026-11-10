@@ -171,12 +171,26 @@ class AcceptTest(GateTestCase):
         _, _, metadata = run_rules(CARD, [GOOD], "r", None)
         self.assertEqual(metadata[kvc.METADATA_KEY][0]["ran_at"], "1970-01-01T00:01:00Z")
 
-    def test_a_failed_command_is_cited_with_its_exit_code(self):
-        record(command="kubectl get ns ghost", exit_code=1, output='Error from server (NotFound): namespaces "ghost" not found')
+    def test_a_backed_claim_is_tagged_with_its_exit_code_and_time(self):
+        record(exit_code=0, now=0)
+        _, result, _ = run_rules(CARD, [GOOD], "r", None)
+        self.assertIn("\n\nnode-b is NotReady. (exit 0, 1970-01-01T00:00:00Z)\n\n```\n$ ", result)
+
+    def test_a_failed_command_is_cited_with_its_exit_code_and_no_verdict(self):
+        # A by-name read of something absent exits 1 with NotFound, and that is the
+        # finding: the tag states the exit code and does not call the work failed.
+        record(command="kubectl get ns ghost", exit_code=1, output='Error from server (NotFound): namespaces "ghost" not found', now=0)
         claim = {"claim": "ghost does not exist.", "command": "kubectl get ns ghost", "excerpt": "(NotFound)"}
         _, result, metadata = run_rules(CARD, [claim], "r", None)
         self.assertEqual(metadata[kvc.METADATA_KEY][0]["exit_code"], 1)
-        self.assertIn("(exit 1, the command failed,", result)
+        self.assertIn("\n\nghost does not exist. (exit 1, 1970-01-01T00:00:00Z)\n\n```\n$ ", result)
+        self.assertNotIn("failed", result)
+
+    def test_the_section_heading_is_unchanged(self):
+        record(now=0)
+        _, result, _ = run_rules(CARD, [GOOD], "r", None)
+        self.assertEqual(kvc.EVIDENCE_HEADING, "**Evidence for verified claims**")
+        self.assertTrue(result.startswith("r\n\n**Evidence for verified claims**\n\nnode-b is NotReady. (exit 0, "), result)
 
     def test_stored_text_is_redacted(self):
         record()

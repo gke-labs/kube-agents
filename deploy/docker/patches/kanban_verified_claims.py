@@ -104,7 +104,7 @@ Limits
   rules, not this gate, cover that. A card that quotes a child card's result
   carries that child's real heading, so the heading alone proves nothing.
 - A claim backed by a command that failed is accepted, since "not found" is
-  evidence, and renders as ``exit N, the command failed``.
+  evidence, and renders with its exit code like any other (:data:`CLAIM_TAG`).
 """
 
 from __future__ import annotations
@@ -173,6 +173,15 @@ QUOTE_CHARS = 80
 TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 EVIDENCE_HEADING = "**Evidence for verified claims**"
+#: The line above each claim's two fences: the claim, then what the gate
+#: copied from the recorded call. The tag states the exit code and never reads
+#: it: a by-name read of something that is not there (``kubectl get namespace
+#: ledger-archive``) exits 1 with ``NotFound``, and that is the finding, so
+#: "the command failed" beside it told the reader the work had failed. What
+#: backs the claim is the excerpt, which the gate matched against the output;
+#: a claim whose command failed says so itself (:data:`PARAM_DESCRIPTION`).
+#: ``where`` is empty, or ``, on card <id>`` for a claim relayed from a child.
+CLAIM_TAG = "{claim} (exit {exit_code}, {ran_at}{where})"
 #: ``slack_moments.NEXT_STEP_LINE``: a line of its own reading ``[next: <label>]``,
 #: the one next step an answer declares, which Slack draws as a button only
 #: when it is the answer's last and only step line.
@@ -419,8 +428,7 @@ def render_evidence(claims: list) -> str:
     parts = [EVIDENCE_HEADING]
     for claim in claims:
         where = f", on card {claim['card']}" if claim.get("card") else ""
-        failed = ", the command failed" if claim["exit_code"] not in (0, None) else ""
-        parts.append(f"{claim['claim']} (exit {claim['exit_code']}{failed}, {claim['ran_at']}{where})")
+        parts.append(CLAIM_TAG.format(claim=claim["claim"], exit_code=claim["exit_code"], ran_at=claim["ran_at"], where=where))
         parts.append(f"{FENCE}\n$ {claim['command']}\n{FENCE}\n{FENCE}\n{claim['excerpt']}\n{FENCE}")
     return "\n\n".join(parts)
 
