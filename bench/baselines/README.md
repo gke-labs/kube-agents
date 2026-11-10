@@ -149,7 +149,8 @@ directory.
 
 The local backend is the default and stays the default: the store travels with
 the checkout, so running the gate needs no credential and no network, and every
-unit test is hermetic.
+unit test is hermetic. The committed copy of this directory stays empty but for
+`VERSIONS.json`; the bucket is the record.
 
 GCS is the intended production home for one reason — on the local backend
 something has to _commit_ the file, and the CI job that measures the
