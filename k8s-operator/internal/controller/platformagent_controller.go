@@ -1545,6 +1545,10 @@ func pluginStatusNeedsRecheck(plugins []*agentv1alpha1.AgentPlugin, agentReady b
 
 func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (ctrl.Result, error) {
 	if controllerutil.ContainsFinalizer(agent, platformAgentFinalizer) {
+		// The self-check stops probing this agent's namespace: once the agent
+		// is gone its RoleBinding may go too, and that must not stand as a
+		// denial on the agents that remain.
+		r.RBAC.Forget(agent.Namespace)
 		// Delete the credential broker's TokenReview grant, if the split ever
 		// created one. cleanupAgentRBAC's label-driven pass also reaps it under
 		// deleteAll, but only when the grant carries the instance labels — one
