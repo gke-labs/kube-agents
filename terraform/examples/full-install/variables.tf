@@ -353,6 +353,20 @@ variable "github_minter_service_account_id" {
   default     = null
 }
 
+variable "github_minter_ksa_name" {
+  description = "Kubernetes ServiceAccount the GitHub token minter runs as, and the KSA half of its Workload Identity binding. The Workload Identity member is project/namespace/KSA with no cluster in it, so installs in one project that share the namespace and this name can each act as the other's minter GSA, however differently the GSAs are named. The installer gives a new install <cluster>-github-minter and records it as GITHUB_MINTER_KSA_NAME in install.env. One variable feeds both consumers, the github-minter module's ksa_name and the chart's githubMinter.ksaName, so the binding and the pod cannot name different KSAs. The default is the name both used before this variable existed, so an install that never sets it does not move. Distinct names stop accidental cross-use only: anyone who can create a ServiceAccount in this namespace on any cluster in the project can still create one by this name, so the boundary between installs that must not trust each other is a project of their own."
+  type        = string
+  nullable    = false
+  default     = "kubeagents-github-minter"
+
+  # A label, as agent_ksa_name is: the value is interpolated into the Workload
+  # Identity member string.
+  validation {
+    condition     = can(regex("^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$", var.github_minter_ksa_name))
+    error_message = "github_minter_ksa_name must be a DNS-1123 label: lowercase letters, digits and hyphens, 1-63 characters, starting and ending with a letter or digit."
+  }
+}
+
 variable "litellm_service_account_id" {
   description = "IAM service account ID for the LiteLLM gateway's Vertex AI GSA (model_provider = vertex_ai only). One fixed name per project, so a second Vertex install in the same project must set its own. A real default rather than null: the module it reaches (kube-agents-iam) defaults to the AGENT's name, which a null would select."
   type        = string

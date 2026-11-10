@@ -548,6 +548,12 @@ if [ -n "${GITHUB_MINTER_GSA_NAME:-}" ]; then
 else
   export GITHUB_MINTER_GSA_NAME_GIVEN="false"
 fi
+# And its KSA (#5282).
+if [ -n "${GITHUB_MINTER_KSA_NAME:-}" ]; then
+  export GITHUB_MINTER_KSA_NAME_GIVEN="true"
+else
+  export GITHUB_MINTER_KSA_NAME_GIVEN="false"
+fi
 # GitLab: the forge, a self-managed host, the Secret's name, and a FILE the
 # token is read from. There is deliberately no token-value input: a value in
 # argv or the environment is a value in `ps`, shell history and CI logs.
@@ -2322,7 +2328,7 @@ record_github_gitops_keys() {
   # cluster rather than defaulted, so a file that doesn't record them would
   # send the next upgrade.sh back to the project-wide names. And the key it
   # shares on purpose, when it does.
-  for key in KMS_KEYRING KMS_KEY GITHUB_MINTER_GSA_NAME MINTER_SHARED_KEY; do
+  for key in KMS_KEYRING KMS_KEY GITHUB_MINTER_GSA_NAME GITHUB_MINTER_KSA_NAME MINTER_SHARED_KEY; do
     [ -n "${!key:-}" ] && keys+=("$key")
   done
   for key in "${keys[@]}"; do
@@ -3115,7 +3121,7 @@ bootstrap_install_env_file() {
   # NAMESPACE is not in that list, and is handled separately below: the
   # ambient variable must not be frozen, but a flag must be.
   local identity_key
-  for identity_key in PLATFORM_AGENT_GSA_NAME GITHUB_MINTER_GSA_NAME LITELLM_GSA_NAME GKE_DB_KMS_KEYRING GKE_DB_KMS_KEY; do
+  for identity_key in PLATFORM_AGENT_GSA_NAME GITHUB_MINTER_GSA_NAME GITHUB_MINTER_KSA_NAME LITELLM_GSA_NAME GKE_DB_KMS_KEYRING GKE_DB_KMS_KEY; do
     if [ -n "${!identity_key:-}" ]; then
       write_env_var "$tmp" "$identity_key" "${!identity_key}"
     fi
@@ -3424,21 +3430,25 @@ source_provisioning_helpers() {
 # living next to the code that reads it, and two copies drift. It also reads
 # as though the value might legitimately be unset at that point, which it
 # cannot be: this runs in step 2, before the interview.
-# Gives the token minter this install's own key ring, key and GSA names where
-# the operator named none (#3504): the names its state holds on an install
-# that already has a minter, else names derived from the cluster
+# Gives the token minter this install's own key ring, key, GSA and KSA names
+# where the operator named none (#3504, #5282): the names its state holds on an
+# install that already has a minter, else names derived from the cluster
 # (minter_derived_names). Called once project and cluster are settled and
 # before anything reads the names: the PEM decision, the interview's
-# defaults, and the KMS_KEYRING, KMS_KEY and GITHUB_MINTER_GSA_NAME this run
-# records in install.env, which keep a new install's names on later runs.
+# defaults, and the KMS_KEYRING, KMS_KEY, GITHUB_MINTER_GSA_NAME and
+# GITHUB_MINTER_KSA_NAME this run records in install.env, which keep a new
+# install's names on later runs.
 apply_minter_name_defaults() {
-  local project=$1 cluster=$2 names ring key gsa
+  local project=$1 cluster=$2 names ring key gsa ksa
   names="$(minter_name_defaults "$project" "$cluster")"
-  IFS='|' read -r ring key gsa <<<"$names"
+  IFS='|' read -r ring key gsa ksa <<<"$names"
   [ "${PARAM_KMS_KEYRING_GIVEN:-false}" = "true" ] || PARAM_KMS_KEYRING="$ring"
   [ "${PARAM_KMS_KEY_GIVEN:-false}" = "true" ] || PARAM_KMS_KEY="$key"
   if [ "${GITHUB_MINTER_GSA_NAME_GIVEN:-false}" != "true" ]; then
     export GITHUB_MINTER_GSA_NAME="$gsa"
+  fi
+  if [ "${GITHUB_MINTER_KSA_NAME_GIVEN:-false}" != "true" ]; then
+    export GITHUB_MINTER_KSA_NAME="$ksa"
   fi
 }
 

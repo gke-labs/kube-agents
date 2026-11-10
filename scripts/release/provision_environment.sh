@@ -440,13 +440,16 @@ fi
 # The minter's names: the state holds no minter after the teardown above, so
 # install.sh would derive per-install names with no key behind them. An
 # environment with the minter names the project-wide ones instead, by the rule
-# render_install_env.sh applies too. install.sh reads all three from the
+# render_install_env.sh applies too. install.sh reads them from the
 # environment and counts them as given.
 # shellcheck source=scripts/release/minter_environment_names.sh
 . "$(dirname "${BASH_SOURCE[0]}")/minter_environment_names.sh"
 minter_environment_names
 if [ -n "${MINTER_ENVIRONMENT_GSA_NAME:-}" ]; then
   export GITHUB_MINTER_GSA_NAME="${GITHUB_MINTER_GSA_NAME:-$MINTER_ENVIRONMENT_GSA_NAME}"
+fi
+if [ -n "${MINTER_ENVIRONMENT_KSA_NAME:-}" ]; then
+  export GITHUB_MINTER_KSA_NAME="${GITHUB_MINTER_KSA_NAME:-$MINTER_ENVIRONMENT_KSA_NAME}"
 fi
 
 # Memory mode mapping: kube_agents_memory/hindsight -> hindsight, none/off -> off, else -> file

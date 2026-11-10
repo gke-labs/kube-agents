@@ -11,20 +11,25 @@
 # key it is named explicitly as this install's own, and the apply labels it.
 #
 # Sets and exports KMS_KEYRING and KMS_KEY when unset, and sets
-# MINTER_ENVIRONMENT_GSA_NAME to the project-wide GSA name, for the caller to
-# hand on in its own way. Does nothing for an environment without the minter.
+# MINTER_ENVIRONMENT_GSA_NAME and MINTER_ENVIRONMENT_KSA_NAME to the
+# project-wide GSA and KSA names (#5282: the KSA its Workload Identity binding
+# was made with), for the caller to hand on in its own way. Does nothing for an
+# environment without the minter.
 minter_environment_names() {
   [ -n "${GITHUB_APP_ID:-}" ] || return 0
-  local defaults ring key gsa
+  local defaults ring key gsa ksa
   defaults="$(dirname "${BASH_SOURCE[0]}")/../../install.defaults.env"
-  IFS='|' read -r ring key gsa < <(
+  IFS='|' read -r ring key gsa ksa < <(
     # shellcheck source=/dev/null
     . "$defaults"
-    printf '%s|%s|%s\n' "$DEFAULT_KMS_KEYRING" "$DEFAULT_KMS_KEY" "$DEFAULT_GITHUB_MINTER_GSA_NAME"
+    printf '%s|%s|%s|%s\n' "$DEFAULT_KMS_KEYRING" "$DEFAULT_KMS_KEY" "$DEFAULT_GITHUB_MINTER_GSA_NAME" \
+      "$DEFAULT_GITHUB_MINTER_KSA_NAME"
   )
   KMS_KEYRING="${KMS_KEYRING:-$ring}"
   KMS_KEY="${KMS_KEY:-$key}"
   # shellcheck disable=SC2034 # read by the caller
   MINTER_ENVIRONMENT_GSA_NAME="$gsa"
+  # shellcheck disable=SC2034 # read by the caller
+  MINTER_ENVIRONMENT_KSA_NAME="$ksa"
   export KMS_KEYRING KMS_KEY
 }

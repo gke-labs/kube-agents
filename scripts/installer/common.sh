@@ -64,16 +64,17 @@ readonly DEV_ARTIFACT_REGISTRY_REPO_DEFAULT="kube-agents"
 # ─── Identity names ───────────────────────────────────────────────────────────
 # The Kubernetes service accounts are the chart's and the operator's to name:
 # nothing the installer configures changes them, so they are constants here,
-# read by the kustomize dev path's envsubst (the minter's and LiteLLM's) or by
+# read by the kustomize dev path's envsubst (LiteLLM's) or by
 # the docs terminology check (the agent's; the controller's is the kustomize
 # namePrefix applied to its base). The GCP service accounts and the namespace
 # are install configuration -- install.env can set them, and their defaults
 # live in install.defaults.env with the rest -- so export_identity_names fills
-# each in only when nothing loaded before it did. No controller GSA: no
-# install path creates one.
+# each in only when nothing loaded before it did. The minter's KSA is one of
+# those now (#5282): a new install's is named after its cluster, and the
+# kustomize dev path's envsubst reads it. No controller GSA: no install path
+# creates one.
 readonly PLATFORM_AGENT_KSA_NAME_FIXED="kubeagents-platform-agent"
 readonly CONTROLLER_KSA_NAME_FIXED="kubeagents-controller"
-readonly GITHUB_MINTER_KSA_NAME_FIXED="kubeagents-github-minter"
 readonly LITELLM_KSA_NAME_FIXED="kubeagents-litellm"
 
 export_identity_names() {
@@ -81,9 +82,9 @@ export_identity_names() {
   export PLATFORM_AGENT_GSA_NAME="${PLATFORM_AGENT_GSA_NAME:-$DEFAULT_PLATFORM_AGENT_GSA_NAME}"
   export GITHUB_MINTER_GSA_NAME="${GITHUB_MINTER_GSA_NAME:-$DEFAULT_GITHUB_MINTER_GSA_NAME}"
   export LITELLM_GSA_NAME="${LITELLM_GSA_NAME:-$DEFAULT_LITELLM_GSA_NAME}"
+  export GITHUB_MINTER_KSA_NAME="${GITHUB_MINTER_KSA_NAME:-$DEFAULT_GITHUB_MINTER_KSA_NAME}"
   export PLATFORM_AGENT_KSA_NAME="$PLATFORM_AGENT_KSA_NAME_FIXED"
   export CONTROLLER_KSA_NAME="$CONTROLLER_KSA_NAME_FIXED"
-  export GITHUB_MINTER_KSA_NAME="$GITHUB_MINTER_KSA_NAME_FIXED"
   export LITELLM_KSA_NAME="$LITELLM_KSA_NAME_FIXED"
 }
 

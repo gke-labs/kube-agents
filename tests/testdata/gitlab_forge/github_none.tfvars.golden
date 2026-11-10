@@ -10,6 +10,8 @@ namespace    = "kubeagents-system"
 agent_service_account_id         = "kubeagents-platform-gsa"
 github_minter_service_account_id = "kubeagents-github-minter-gsa"
 litellm_service_account_id       = "kubeagents-litellm-gsa"
+# The minter's KSA, the other half of its Workload Identity binding.
+github_minter_ksa_name           = "kubeagents-github-minter"
 
 # GKE database encryption. install.sh's existing-cluster step reads the
 # same two keys, so a create and an adoption encrypt with one key.

@@ -304,8 +304,10 @@ done
 
 # MEMORY is derived above rather than mapped, so it is emitted on its own.
 emit MEMORY "${MEMORY}"
-# So is the minter's GSA name, set above only for an environment with the minter.
+# So are the minter's GSA and KSA names, set above only for an environment with
+# the minter.
 emit GITHUB_MINTER_GSA_NAME "${MINTER_ENVIRONMENT_GSA_NAME:-}"
+emit GITHUB_MINTER_KSA_NAME "${MINTER_ENVIRONMENT_KSA_NAME:-}"
 
 chmod 600 "$OUT_PATH"
 

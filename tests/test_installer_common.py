@@ -3108,12 +3108,23 @@ class InstallerCommonTest(unittest.TestCase):
          "name": "minter", "instances": [{"attributes": {"name": "github-token-minter-key"}}]},
         {"module": "module.github_minter[0]", "mode": "managed", "type": "google_service_account",
          "name": "minter", "instances": [{"attributes": {"account_id": "kubeagents-github-minter-gsa"}}]},
+        {"module": "module.github_minter[0]", "mode": "managed", "type": "google_service_account_iam_member",
+         "name": "workload_identity", "instances": [{"attributes": {
+             "member": "serviceAccount:test-project.svc.id.goog[kubeagents-system/kubeagents-github-minter]"}}]},
     ]
+    _EXISTING = ["github-token-minter-keyring", "github-token-minter-key", "kubeagents-github-minter-gsa",
+                 "kubeagents-github-minter"]
 
     def test_minter_derived_names_follow_the_cluster(self):
         proc = self._run('minter_derived_names ka-today-1')
         self.assertEqual(proc.stdout.strip().split("|"),
-                         ["ka-today-1-minter-keyring", "ka-today-1-minter-key", "ka-today-1-minter"])
+                         ["ka-today-1-minter-keyring", "ka-today-1-minter-key", "ka-today-1-minter",
+                          "ka-today-1-github-minter"])
+
+    def test_the_longest_cluster_name_still_gives_a_valid_ksa_name(self):
+        """A GKE cluster name is at most 40 characters; the KSA must stay a DNS-1123 label."""
+        ksa = self._run(f"minter_derived_names {'a' * 40}").stdout.strip().split("|")[3]
+        self.assertRegex(ksa, r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$")
 
     def test_a_long_cluster_name_still_gives_a_valid_distinct_gsa_id(self):
         """A GSA id is 6-30 characters; two long names sharing a prefix stay apart."""
@@ -3124,27 +3135,34 @@ class InstallerCommonTest(unittest.TestCase):
             ids.append(gsa)
         self.assertNotEqual(ids[0], ids[1])
 
-    def test_tf_state_minter_names_reads_the_three_names(self):
+    def test_tf_state_minter_names_reads_the_four_names(self):
+        """The KSA is the one the Workload Identity member names."""
         proc = self._run('tf_state_minter_names; echo "rc=$?"', gcloud_stdout=_state_doc(self._MINTER_STATE))
-        self.assertIn("github-token-minter-keyring|github-token-minter-key|kubeagents-github-minter-gsa", proc.stdout)
+        self.assertIn("|".join(self._EXISTING), proc.stdout)
         self.assertIn("rc=0", proc.stdout)
 
     def test_an_install_with_a_minter_in_state_keeps_its_names(self):
         """The existing install: the names its state holds, whatever the cluster is called."""
         proc = self._run("minter_name_defaults test-project ka-today-1", gcloud_stdout=_state_doc(self._MINTER_STATE))
-        self.assertEqual(proc.stdout.strip().split("|"),
-                         ["github-token-minter-keyring", "github-token-minter-key", "kubeagents-github-minter-gsa"])
+        self.assertEqual(proc.stdout.strip().split("|"), self._EXISTING)
+
+    def test_an_install_keeps_the_ksa_its_binding_names(self):
+        """A KSA set on an earlier run is read back from the binding, not re-derived."""
+        state = self._MINTER_STATE[:3] + [dict(self._MINTER_STATE[3], instances=[{"attributes": {
+            "member": "serviceAccount:test-project.svc.id.goog[kubeagents-system/c1-github-minter]"}}])]
+        proc = self._run("minter_name_defaults test-project ka-today-1", gcloud_stdout=_state_doc(state))
+        self.assertEqual(proc.stdout.strip().split("|")[3], "c1-github-minter")
 
     def test_a_state_holding_only_some_minter_names_keeps_each_in_its_place(self):
         """An interrupted destroy leaves only the GSA: the empty ring and key fields stay empty."""
         proc = self._run("minter_name_defaults test-project ka-today-1",
-                         gcloud_stdout=_state_doc(self._MINTER_STATE[2:]))
-        self.assertEqual(proc.stdout.strip().split("|"),
-                         ["github-token-minter-keyring", "github-token-minter-key", "kubeagents-github-minter-gsa"])
+                         gcloud_stdout=_state_doc(self._MINTER_STATE[2:3]))
+        self.assertEqual(proc.stdout.strip().split("|"), self._EXISTING)
         custom_gsa = [dict(self._MINTER_STATE[2], instances=[{"attributes": {"account_id": "my-minter"}}])]
         proc = self._run("minter_name_defaults test-project ka-today-1", gcloud_stdout=_state_doc(custom_gsa))
         self.assertEqual(proc.stdout.strip().split("|"),
-                         ["github-token-minter-keyring", "github-token-minter-key", "my-minter"])
+                         ["github-token-minter-keyring", "github-token-minter-key", "my-minter",
+                          "kubeagents-github-minter"])
 
     def test_an_install_without_a_minter_in_state_derives_its_names(self):
         proc = self._run("minter_name_defaults test-project ka-today-1", gcloud_stdout=_state_doc([]))
@@ -3158,8 +3176,7 @@ class InstallerCommonTest(unittest.TestCase):
         """Not knowing whether this install has a minter, it must not rename one."""
         proc = self._run('print_warning() { echo "WARN: $*"; }; minter_name_defaults test-project ka-today-1',
                          gcloud_exit=1, gcloud_stderr="ERROR: 503 Service Unavailable")
-        self.assertEqual(proc.stdout.strip().splitlines()[-1].split("|"),
-                         ["github-token-minter-keyring", "github-token-minter-key", "kubeagents-github-minter-gsa"])
+        self.assertEqual(proc.stdout.strip().splitlines()[-1].split("|"), self._EXISTING)
         self.assertIn("keeps the project-wide default names", proc.stderr + proc.stdout)
 
     def _key_owner(self, describe_rc=0, labels="", labels_rc=0):

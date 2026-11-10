@@ -4152,15 +4152,20 @@ sys.exit(0)
 # ─── The minter's per-install names (#3504) ──────────────────────────────────
 # The token minter's key ring, key and GSA used to default to one fixed name
 # per project, so a second install that took the defaults adopted the first
-# install's App key. A new install now derives them from its cluster. An
-# install whose state already holds a minter keeps the names in its state: a
-# KMS key ring or key cannot be deleted, and renaming one plans a replacement
-# that would leave the old key and its versions behind.
+# install's App key. A new install now derives them from its cluster, and its
+# KSA too (#5282): Workload Identity's member names the project, namespace and
+# KSA but no cluster, so with one KSA name every install in a project could act
+# as every install's minter GSA. An install whose state already holds a
+# minter keeps the names in its state: a KMS key ring or key cannot be deleted,
+# and renaming one plans a replacement that would leave the old key and its
+# versions behind.
 
 # The names a new install derives from its cluster, separated by |: key ring,
-# key, GSA. A GSA id is 6-30 characters, so a cluster name too long for
+# key, GSA, KSA. A GSA id is 6-30 characters, so a cluster name too long for
 # "<cluster>-minter" keeps its first 18 characters and gains four hex
 # characters of its hash, which keeps two long names that share a prefix apart.
+# The KSA needs no such cut: a GKE cluster name is at most 40 characters, so
+# "<cluster>-github-minter" fits a 63-character DNS label.
 minter_derived_names() {
   local cluster=$1 gsa prefix hash
   gsa="${cluster}-minter"
@@ -4172,28 +4177,37 @@ minter_derived_names() {
     prefix="${prefix%-}"
     gsa="${prefix}-${hash}-minter"
   fi
-  printf '%s|%s|%s\n' "${cluster}-minter-keyring" "${cluster}-minter-key" "$gsa"
+  printf '%s|%s|%s|%s\n' "${cluster}-minter-keyring" "${cluster}-minter-key" "$gsa" "${cluster}-github-minter"
 }
 
-# The minter's key ring, key and GSA names as this install's state records
-# them (module.github_minter[0]), separated by |; a field the state doesn't
-# hold is empty, and all three are when there is no minter in state or no
-# state. tf_state_read's return code when the state could not be read.
+# The minter's key ring, key, GSA and KSA names as this install's state
+# records them (module.github_minter[0]; the KSA is the one its Workload
+# Identity member names), separated by |; a field the state doesn't hold is
+# empty, and all four are when there is no minter in state or no state.
+# tf_state_read's return code when the state could not be read.
 # shellcheck disable=SC2120
 tf_state_minter_names() {
   trap - ERR
   local state
   state=$(tf_state_read "$@") || return $?
   printf '%s' "$state" | python3 -c '
-import json, sys
+import json, re, sys
 try:
     doc = json.load(sys.stdin)
 except Exception:
     sys.exit(int(sys.argv[1]))
 want = {"google_kms_key_ring": "name", "google_kms_crypto_key": "name", "google_service_account": "account_id"}
 found = {}
+ksa = ""
 for r in doc.get("resources", []):
     if r.get("module") != "module.github_minter[0]" or r.get("mode") != "managed":
+        continue
+    if r.get("type") == "google_service_account_iam_member" and r.get("name") == "workload_identity":
+        for i in r.get("instances", []):
+            # serviceAccount:<project>.svc.id.goog[<namespace>/<ksa>]
+            m = re.search(r"\[[^/\]]+/([^\]]+)\]$", (i.get("attributes") or {}).get("member") or "")
+            if m:
+                ksa = m.group(1)
         continue
     attr = want.get(r.get("type"))
     if not attr or r.get("name") != "minter":
@@ -4202,7 +4216,7 @@ for r in doc.get("resources", []):
         value = (i.get("attributes") or {}).get(attr)
         if value:
             found[r["type"]] = value
-print("|".join(found.get(t, "") for t in want))
+print("|".join([found.get(t, "") for t in want] + [ksa]))
 ' "$TF_STATE_RC_UNREADABLE"
 }
 
@@ -4230,24 +4244,25 @@ minter_key_owner() {
   fi
 }
 
-# This install's default minter names, separated by |: key ring, key, GSA. An
-# install with a minter in its state gets the names it holds (a field the
-# state lacks falls back to the project-wide default it was created under). An
+# This install's default minter names, separated by |: key ring, key, GSA,
+# KSA. An install with a minter in its state gets the names it holds (a field
+# the state lacks falls back to the project-wide default it was created under). An
 # install with none gets the names derived from its cluster. When the state
 # can't be read, nothing can be said about which install this is, so it gets
 # the project-wide defaults an existing install was created with, and says so:
 # a new install there should set its names.
 minter_name_defaults() {
-  local project=$1 cluster=$2 names rc=0 ring="" key="" gsa=""
+  local project=$1 cluster=$2 names rc=0 ring="" key="" gsa="" ksa=""
   names="$(tf_state_minter_names "$project" "$cluster")" || rc=$?
   if [ "$rc" -eq "$TF_STATE_RC_UNREADABLE" ]; then
-    print_warning "Could not read this install's Terraform state, so the token minter keeps the project-wide default names (${DEFAULT_KMS_KEYRING}/${DEFAULT_KMS_KEY}, ${DEFAULT_GITHUB_MINTER_GSA_NAME}). On a new install, set KMS_KEYRING, KMS_KEY and GITHUB_MINTER_GSA_NAME to names of its own." >&2
-    printf '%s|%s|%s\n' "$DEFAULT_KMS_KEYRING" "$DEFAULT_KMS_KEY" "$DEFAULT_GITHUB_MINTER_GSA_NAME"
+    print_warning "Could not read this install's Terraform state, so the token minter keeps the project-wide default names (${DEFAULT_KMS_KEYRING}/${DEFAULT_KMS_KEY}, ${DEFAULT_GITHUB_MINTER_GSA_NAME}, KSA ${DEFAULT_GITHUB_MINTER_KSA_NAME}). On a new install, set KMS_KEYRING, KMS_KEY, GITHUB_MINTER_GSA_NAME and GITHUB_MINTER_KSA_NAME to names of its own." >&2
+    printf '%s|%s|%s|%s\n' "$DEFAULT_KMS_KEYRING" "$DEFAULT_KMS_KEY" "$DEFAULT_GITHUB_MINTER_GSA_NAME" "$DEFAULT_GITHUB_MINTER_KSA_NAME"
     return 0
   fi
-  IFS='|' read -r ring key gsa <<<"$names"
-  if [ -n "${ring}${key}${gsa}" ]; then
-    printf '%s|%s|%s\n' "${ring:-$DEFAULT_KMS_KEYRING}" "${key:-$DEFAULT_KMS_KEY}" "${gsa:-$DEFAULT_GITHUB_MINTER_GSA_NAME}"
+  IFS='|' read -r ring key gsa ksa <<<"$names"
+  if [ -n "${ring}${key}${gsa}${ksa}" ]; then
+    printf '%s|%s|%s|%s\n' "${ring:-$DEFAULT_KMS_KEYRING}" "${key:-$DEFAULT_KMS_KEY}" \
+      "${gsa:-$DEFAULT_GITHUB_MINTER_GSA_NAME}" "${ksa:-$DEFAULT_GITHUB_MINTER_KSA_NAME}"
     return 0
   fi
   minter_derived_names "$cluster"
@@ -5481,6 +5496,8 @@ write_tfvars_from_state() {
     echo "agent_service_account_id         = $(hcl_str "${PLATFORM_AGENT_GSA_NAME:-$DEFAULT_PLATFORM_AGENT_GSA_NAME}")"
     echo "github_minter_service_account_id = $(hcl_str "${GITHUB_MINTER_GSA_NAME:-$DEFAULT_GITHUB_MINTER_GSA_NAME}")"
     echo "litellm_service_account_id       = $(hcl_str "${LITELLM_GSA_NAME:-$DEFAULT_LITELLM_GSA_NAME}")"
+    echo "# The minter's KSA, the other half of its Workload Identity binding."
+    echo "github_minter_ksa_name           = $(hcl_str "${GITHUB_MINTER_KSA_NAME:-$DEFAULT_GITHUB_MINTER_KSA_NAME}")"
     echo ""
     echo "# GKE database encryption. install.sh's existing-cluster step reads the"
     echo "# same two keys, so a create and an adoption encrypt with one key."

@@ -67,11 +67,13 @@ class RecordGithubGitopsKeysTest(unittest.TestCase):
         dest.write_text("PROJECT_ID=p\nGITOPS_ORG=acme\nGITOPS_REPO=infra\nGITHUB_APP_ID=7\n")
         proc = self._bash("export GITOPS_ORG=acme GITOPS_REPO=infra GITHUB_APP_ID=7 "
                           "KMS_KEYRING=c1-minter-keyring KMS_KEY=c1-minter-key GITHUB_MINTER_GSA_NAME=c1-minter "
+                          "GITHUB_MINTER_KSA_NAME=c1-github-minter "
                           "MINTER_SHARED_KEY=\n"
                           f'record_github_gitops_keys "{dest}"\n')
         self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
         text = dest.read_text()
-        for line in ("KMS_KEYRING=c1-minter-keyring", "KMS_KEY=c1-minter-key", "GITHUB_MINTER_GSA_NAME=c1-minter"):
+        for line in ("KMS_KEYRING=c1-minter-keyring", "KMS_KEY=c1-minter-key", "GITHUB_MINTER_GSA_NAME=c1-minter",
+                     "GITHUB_MINTER_KSA_NAME=c1-github-minter"):
             self.assertIn(line + "\n", text)
         self.assertNotIn("MINTER_SHARED_KEY", text)
         # A key shared on purpose is kept beside them.

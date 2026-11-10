@@ -751,6 +751,7 @@ module "github_minter" {
   location           = var.location
   namespace          = var.namespace
   service_account_id = var.github_minter_service_account_id
+  ksa_name           = var.github_minter_ksa_name
   kms_keyring_name   = var.github_minter_kms_keyring
   kms_key_name       = var.github_minter_kms_key
   # The owning install, which lifecycle.sh's adoption step checks before it
@@ -1206,8 +1207,11 @@ resource "helm_release" "kube_agents" {
       # github_minter_service_account_id would create one GSA and have the pod
       # impersonate another. Only when the module exists: a null here would
       # be a Helm null, which deletes the chart default instead of keeping it.
+      # ksaName from the same variable as the module's ksa_name, so the
+      # binding and the pod name one KSA.
       var.enable_github_minter ? {
         gsaName = module.github_minter[0].service_account_id
+        ksaName = var.github_minter_ksa_name
       } : {}
     )
     # The browser chat page for installs with no chat platform. Its image
