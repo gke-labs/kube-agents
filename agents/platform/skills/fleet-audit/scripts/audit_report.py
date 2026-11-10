@@ -1978,7 +1978,6 @@ ALLOW_ALL_SHAPE_KIND = "NetworkPolicy"
 # it holds both `hpa-cannot-scale` shapes: it errs toward holding a finding
 # back, the join toward not silencing one.
 ZONE_ARM_CHECK = "single-zone-nodepool"
-ZONE_ARM_KIND = "NodePool"
 ZONE_LOCKED_ARM_MARK = "single-zone ("
 CEILING_ARM_MARK = "at its autoscaling ceiling:"
 # A roll-up names the scope it covers, not an object: the cost SOP's §5
@@ -13078,6 +13077,13 @@ def _render_declared_intent_search(data: dict) -> list[str]:
                     "",
                     f"_A dangling-target `{DUAL_SHAPE_CHECK}` is a fault, but it "
                     "shares its slug with the `min == max` posture and is held back "
+                    "with the postures._",
+                ]
+            if any(str(f.get("check", "")) == ZONE_ARM_CHECK and _is_ceiling_arm(f) for f in findings):
+                out += [
+                    "",
+                    f"_A `{ZONE_ARM_CHECK}` at its autoscaling ceiling is a fault, but it "
+                    "shares its slug with the zone-locked posture and is held back "
                     "with the postures._",
                 ]
         return out

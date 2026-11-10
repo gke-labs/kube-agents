@@ -7817,6 +7817,11 @@ class TestStockoutDeclaredShapes(HarnessTestCase):
         # postures, as it does for the hpa dangling-target fault.
         gap = audit_report._declared_intent_gap(doc)
         self.assertIn("single-zone-nodepool at its autoscaling ceiling shares its slug", gap)
+        # And the ledger body's rendering of the same gap carries the footnote,
+        # so an operator is not told the held-back fault is a posture.
+        body = "\n".join(audit_report._render_declared_intent_search(doc))
+        self.assertIn("`single-zone-nodepool` at its autoscaling ceiling is a fault", body)
+        self.assertIn("NodePool/regional-web", body)
 
     def test_the_validator_rejects_a_declared_fault_and_an_object_that_is_not_a_pool(self):
         doc = self._doc([])
