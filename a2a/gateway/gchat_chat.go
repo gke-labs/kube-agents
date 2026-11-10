@@ -88,16 +88,13 @@ var errGchatChatTooLarge = errors.New("the chat message is more than one Google 
 var errGchatChatEmpty = errors.New("the chat message lays nothing out")
 
 // gchatChatLayout is one rendered message: its text, and the accessory
-// widgets under it (empty when the message has no button).
+// widgets under it (empty when the message has no button). A row's place
+// in Text is not kept here: the row's buttons carry its line
+// (gchatBoardButtons), so a tap edits by it whether or not the layout was
+// remembered.
 type gchatChatLayout struct {
 	Text    string
 	Widgets []map[string]any
-	// RowsStart and RowsCount place the rows in Text, by line, when the
-	// message's rows carry Retry and Drop (gchat_board.go): a tap edits its
-	// row by them, so a numbered list in the detail or the fold is never
-	// taken for the rows. RowsCount is 0 when no row acts, or for a layout
-	// read back from a click's copy of the message.
-	RowsStart, RowsCount int
 }
 
 // renderGchatChat lays m out as a Chat text message with accessory buttons.
@@ -116,33 +113,28 @@ func renderGchatChat(m *chatmsg.Message) (gchatChatLayout, error) {
 	}
 	// The rows' buttons are drawn only where the rows are: a progress
 	// message's plan takes their place, and a button for a row not shown
-	// would name nothing.
+	// would name nothing. Each button carries its row's line in the text,
+	// so the rows' first line is settled before they are drawn: the rows
+	// begin after the sections so far (their last line is the count of
+	// breaks in them) and the gap's blank line.
 	var rowButtons []map[string]any
-	var rowsStart, rowsCount int
 	if m.Plan != nil && len(m.Plan.Items) > 0 {
 		add(gchatChatPlan(m.Plan))
 	} else {
-		rows := strings.TrimRight(gchatChatRows(m.Rows), "\n")
-		rowButtons = gchatBoardButtons(m.Rows)
-		if len(rowButtons) > 0 && strings.TrimSpace(rows) != "" {
-			// The rows begin after the sections so far (their last line is
-			// the count of breaks in them) and the gap's blank line.
-			if before := strings.Join(sections, gchatChatSectionGap); before != "" {
-				rowsStart = strings.Count(before, "\n") + strings.Count(gchatChatSectionGap, "\n")
-			}
-			rowsCount = strings.Count(rows, "\n") + 1
+		rowsStart := 0
+		if before := strings.Join(sections, gchatChatSectionGap); before != "" {
+			rowsStart = strings.Count(before, "\n") + strings.Count(gchatChatSectionGap, "\n")
 		}
-		add(rows)
+		rowButtons = gchatBoardButtons(m.Rows, rowsStart)
+		add(strings.TrimRight(gchatChatRows(m.Rows), "\n"))
 	}
 	add(gchatChatAfter(m.After))
 	if m.Fold != nil {
 		add(gchatChatFold(m.Fold))
 	}
 	layout := gchatChatLayout{
-		Text:      strings.Join(sections, gchatChatSectionGap),
-		Widgets:   gchatButtonList(append(gchatChatButtons(m.Choices, m.Links), rowButtons...)),
-		RowsStart: rowsStart,
-		RowsCount: rowsCount,
+		Text:    strings.Join(sections, gchatChatSectionGap),
+		Widgets: gchatButtonList(append(gchatChatButtons(m.Choices, m.Links), rowButtons...)),
 	}
 	if layout.Text == "" && len(layout.Widgets) == 0 {
 		return gchatChatLayout{}, errGchatChatEmpty

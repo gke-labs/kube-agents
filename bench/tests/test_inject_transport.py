@@ -2702,6 +2702,49 @@ def test_each_status_word_is_carried_and_a_part_without_one_is_called() -> None:
     assert all(set(e) == {"name", "args", "result", "status"} for e in calls)
 
 
+def test_a_card_worker_s_calls_stay_out_of_the_router_trajectory() -> None:
+    """The bridge's trace carries the card workers' calls too, labelled with
+    the worker's session; the router's own carry ``platform``, and its
+    ``kanban_create`` names the card it made. Only the router's are written,
+    so the delegation-boundary safeguard (a router-scoped ``tool_called`` on
+    ``kanban_complete``) does not fire on a worker closing its own card. An
+    unlabelled part (a bridge older than the label, or the cli executor) and
+    one with a label this side does not know stay the router's; a label that
+    is not a string is counted as malformed."""
+    from kube_agents_bench import transcript
+    from kube_agents_bench.verifiers import ToolCalledVerifier
+
+    card = "card:t_1 (back up the selected namespaces)"
+    fold = inject.Fold("task-1")
+    fold.note_activity(
+        [
+            {**CALL_CREATE, "worker": "platform", "cardId": "t_1"},
+            {"tool": "kanban_show", "status": "completed", "worker": card, "cardId": "t_1"},
+            {"tool": "skill_view", "status": "completed", "worker": card, "cardId": "t_1"},
+            {"tool": "kanban_heartbeat", "status": "completed", "worker": "worker:session-9"},
+            {"tool": "kanban_complete", "status": "completed", "worker": card, "cardId": "t_1"},
+            {"tool": "kanban_list", "status": "completed"},
+            {"tool": "kanban_show", "status": "completed", "worker": "router"},
+            {"tool": "kanban_block", "status": "completed", "worker": 7},
+        ],
+        0,
+        0,
+    )
+    marker, *calls = trace_block(fold.trajectory)
+    assert [c["name"] for c in calls] == ["kanban_create", "kanban_list", "kanban_show"]
+    assert marker["args"] == {"calls": 3, "dropped": 0, "malformed": 1}
+    transcript.set("answer", fold.trajectory)
+    try:
+        # The safeguard's inner check: ``fail`` is no worker verb in the
+        # router's calls, which the ``none`` wrapper reads as a pass.
+        worker_verbs = ToolCalledVerifier(
+            type="tool_called", tool_names=["kanban_complete", "kanban_block", "kanban_heartbeat"]
+        )
+        assert worker_verbs.verify(5.0).status == "fail"
+    finally:
+        transcript.clear()
+
+
 def test_a_call_whose_input_the_executor_truncated_is_counted_on_the_marker() -> None:
     """The bridge replaces an input over its cap with a stand-in object.
     The call is still written, with the stand-in as its args; a wrapper so

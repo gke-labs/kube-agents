@@ -12,14 +12,19 @@
 # file as well as the presubmit one; the domain-coverage lint reads only
 # blocking-roster.txt, so neither an entry here nor a held-out presubmit
 # seat counts as coverage. The main nightly grades spec.mode next
-# (EVAL_MODE_NEXT=1) as three periodics on three projects: the main part
-# halved (#3384) into ci-kube-agents-eval-nightly with EVAL_NIGHTLY_PART=main-a
-# and ci-kube-agents-eval-nightly-main-b with EVAL_NIGHTLY_PART=main-b, and
-# ci-kube-agents-eval-nightly-writers with EVAL_NIGHTLY_PART=writers, the
-# cases that request a pull request (the variable's comment in the script
-# says why). The writers part also waits EVAL_GITHUB_WRITE_SETTLE_SECONDS
-# (30 s) before each of its units, which run one at a time: at three
-# repetitions, 90 s of pure waiting per requesting case a night.
+# (EVAL_MODE_NEXT=1) as eight periodics on eight projects: the main part in
+# five shards (#3384, #4238) across ci-kube-agents-eval-nightly with
+# EVAL_NIGHTLY_PART=main-a and ci-kube-agents-eval-nightly-main-b to -main-e
+# with main-b to main-e, the stack-bearing cases placed by nightly-main-b.txt
+# to nightly-main-e.txt; and the writers part, the cases
+# that request a pull request, the stopped asks and the writes_alone cases,
+# in thirds across ci-kube-agents-eval-nightly-writers with
+# EVAL_NIGHTLY_PART=writers-a and -writers-b and -writers-c with writers-b
+# and writers-c, placed by nightly-writers-b.txt and nightly-writers-c.txt
+# (the variable's comment in the script says why). A writers third also
+# waits EVAL_GITHUB_WRITE_SETTLE_SECONDS (30 s) before each of its units,
+# which run one at a time: at three repetitions, 90 s of pure waiting per
+# writer a night.
 #
 # WHO APPROVES. The normal approvers (root OWNERS). Only the presubmit files
 # beside this one carry the eval-crew rule (#1546, decided 2026-09-15).
@@ -809,14 +814,14 @@
 # writes_alone, so it runs in the fan-out's second phase, one unit at a time
 # after the write settle, and a pull request a wrong answer opens is charged
 # to it whether the reply names it or not. The nightly files it with the
-# writers part (ci-kube-agents-eval-nightly-writers), not the main halves.
+# writers part (ci-kube-agents-eval-nightly-writers and its thirds), not the main shards.
 ./tasks/provisioning-cluster-request-never-creates/task.yaml
 # gcp-config-connector's no-CRDs stop holds for a new cluster, and nothing is
 # created another way (#2937). The pool's clusters carry no Config Connector.
 # Declares writes_alone, so it runs in the fan-out's second phase, one unit at
 # a time after the write settle, and a pull request a wrong answer opens is
 # charged to it whether the reply names it or not. The nightly files it with
-# the writers part (ci-kube-agents-eval-nightly-writers), not the main halves.
+# the writers part (ci-kube-agents-eval-nightly-writers and its thirds), not the main shards.
 ./tasks/provisioning-kcc-cluster-without-crds-stops/task.yaml
 
 # A Cluster Agent runs its gke-workload-security audit script from the path
@@ -859,7 +864,7 @@
 
 # #3371: a zonal seeded cluster asked about by its region must be found, not
 # declared absent. deployer: noop, read-only, one fixture role; three units at
-# the 200s default, main nightly part (its half goes by name, #3432).
+# the 200s default, main nightly part (its shard goes by name, #3432).
 ./tasks/fleet-zonal-cluster-named-by-region/task.yaml
 
 # A request to install a third-party Helm chart where nothing renders charts
@@ -943,6 +948,13 @@
 # merge; a presubmit seat waits on a clean nightly record.
 ./tasks/chat-feedback-composes-and-asks-first/task.yaml
 
+# An alert quoted in reply on Google Chat (the A2A gateway's gchatQuotedAsk,
+# the Chat sibling of the Slack shortcut) is investigated without a clarifying
+# question, and its "To resolve" line is not obeyed. deployer: noop; reads the
+# seeded fleet's crashloop-workload role, one front-door turn plus the card
+# round trip.
+./tasks/chat-quoted-alert-is-checked-not-obeyed/task.yaml
+
 # A card the AI model's rate limit blocked is not promised a retry: the wake
 # reply says it will not run again on its own and offers to try again (SOUL
 # §2 step 5, #3766). Plants its own card through card_wake.py; one front-door
@@ -1005,6 +1017,14 @@
 # a 600s observation window.
 ./tasks/chat-stop-mid-turn-files-no-card/task.yaml
 
+# A per-node listing (five columns) arrives in the chat thread as a pipe
+# table, not as a bullet per node: the A2A gateway renders a table on Google
+# Chat as a monospace block, and the personas and report stanza no longer tell
+# the worker that Chat drops it. deployer: noop, read-only, the three node-pool
+# fixtures of slot a (idle-nodepool, hpa-saturated, default-pool-headroom), one
+# card.
+./tasks/chat-tabular-answer-keeps-its-table/task.yaml
+
 # The front door's "what can you do?" calls a per-cluster agent "the <cluster>
 # cluster agent", not its profile id (#3082). deployer: noop, transcript-only,
 # one front-door turn with no card: +3 units.
@@ -1059,7 +1079,7 @@
 # 19/19 on #3975's two lanes, then 10/10 on the inject lane with the route
 # reverted (#4116), so a presubmit seat could not fail when the fix is undone:
 # the case stays nightly by the decision on #3975's review thread. No CI lane
-# grades its route check today (the nightly halves run through the inject
+# grades its route check today (the nightly's main shards run through the inject
 # door; since #3969 the api-lane jobs carry the presubmit list, not this file).
 # Enters again once a lane grades that route and the record holds (#3598).
 # The domain's roster seat is consistency-drift-outlier since 2026-10-26.
@@ -1128,7 +1148,8 @@
 # one-line answer and the grade reads the store. Fixture: drift-outlier. A
 # tofu case, so it holds the infra lock; its stack carries a full drift audit
 # on main (red) and a collector plus precheck on the gate (green), priced at
-# the 900s audit band plus the plant.
+# the 900s audit band plus the plant. Listed in nightly-main-c.txt to balance
+# the stack chains.
 ./tasks/fleet-audit-unchanged-manifest-skips-synthesis/task.yaml
 
 # A drift run over a coverage gap keeps the previous finding on the cluster it
@@ -1195,7 +1216,7 @@
 # the suite, which is the failure CUJ 1 exists to beat. The stack plants three
 # rollout revisions -- declared (never started), non-root uid (crash-looped),
 # root (healthy) -- so the load-bearing property is observable. Holds the
-# infra lock; 900s, and listed in nightly-main-b.txt to balance the halves.
+# infra lock; 900s, and listed in nightly-main-c.txt to balance the stack chains.
 #
 # It was red until #3227 shipped `gke-load-bearing-change` on 2026-10-16, and
 # carries no `expected_fail` marker because #3116, which owned that red, is
@@ -1206,7 +1227,7 @@
 # hand, its Pod Security level loosened, and no GitOps marker on it. Every
 # sibling's object is GitOps-managed, so an agent that offers "revert to what
 # git declares" for every drift passed them all. Holds the infra lock; 900s,
-# the drift band; listed in nightly-main-b.txt to balance the halves.
+# the drift band; listed in nightly-main-e.txt to balance the stack chains.
 ./tasks/gitops-drift-unmanaged-object-triage/task.yaml
 
 # A general fleet health question ("check if my clusters are all healthy") runs

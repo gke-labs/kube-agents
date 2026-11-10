@@ -82,12 +82,11 @@ route reach `refresh_forge_credential`, whose helper (`github_token_refresh.py`)
 federation is tried first and spawns nothing, so on a federated broker, where the operator sets
 the credential-file variables to the federation file it lays down, no `gcloud` runs; on an
 unfederated one it runs when a credential file is set or the metadata server yields no token.
-The content-workspace `open` and `commit`, and a vcs `snapshot` of a context repository, reach
+A vcs `snapshot` of a context repository reaches
 the same helper through `mint_read_credential` with its read-only flag, which prints a minted token and returns before any `gh`: at most that
 one `gcloud`, under the same conditions, and nothing else. Either way the vcs route can run a
 Python helper, a `gcloud` and a `gh` behind one `git`, which is what the single reserve has to
-hold; the mint path is lighter, and §2.1 below takes the workspace's call out of the
-per-request budget on other grounds; a `snapshot`'s call runs under that request's reservation. The reserve is sized for the
+hold; the mint path is lighter, and a `snapshot`'s call runs under that request's reservation. The reserve is sized for the
 tree a request spawns, not for one process: `gcloud` starts short-lived `gcloud` children of its
 own, which is why the sampler saw twelve processes for eight requests, and the figure that
 matters is the 102 MiB per request the eight listings summed to. The margin to 128 MiB covers
@@ -138,19 +137,9 @@ Where each route reserves, and why there:
   queued is dropped before the helper runs, and the route has a handler for that drop (a log line
   and no response, as the exec route has) beside the busy handler. Called from inside a vcs
   request, the function runs under that request's reservation and takes none; it reads the
-  coalesce cache without the lock, and otherwise waits for the lock as long as it takes; from the
-  content-workspace `open` and `commit`, through `mint_read_credential`, it runs under the store's fixed term.
+  coalesce cache without the lock, and otherwise waits for the lock as long as it takes.
   `mint_read_credential` called from a vcs `snapshot` runs under that request's reservation.
-- The content-workspace verbs take no reservation at all. The store serves one verb at a time
-  under its single lock, across every open workspace, so at most one of its process trees exists
-  at any moment, whatever the load; that is a fixed quantity, and the budget carries it as a
-  fixed term, `CONTENT_WORKSPACE_RESERVE_BYTES` (128 MiB, one request's worth), subtracted
-  alongside the resident reserve in §2.2. Nothing on the store's path waits for admission, so the
-  store's recorded reason for taking no slot (a wait while holding its lock would stall every
-  verb behind it, reads included) is left standing rather than reversed, and the two states in
-  which the budget is held for long, a listing burst and four long-running commands, cannot
-  stall a `read` or refuse a `publish`. The store's spawns stay uncounted individually but not
-  unbounded: the lock is the bound, and the reserve is its size. A slot-less request that does
+- A slot-less request that does
   reserve, which is the forge refresh route alone, joins the same arrival-order queue
   as a slot taker, may pass slot takers that only the slot cap holds (§2.3), and leaves it when
   it holds its reservation.
@@ -158,7 +147,7 @@ Where each route reserves, and why there:
 - The cold path reserves nothing of its own: it runs under its `kubectl` request's reservation,
   so nothing waits for admission under `_kubeconfig_lock`.
 
-Besides the store's (§2.1), two spawns stay outside the budget on purpose: the one-off bootstrap command at startup, which
+Two spawns stay outside the budget on purpose: the one-off bootstrap command at startup, which
 runs before the broker serves, and the `git config` read of a repository alias, which is a few
 hundred kilobytes and over in milliseconds.
 
@@ -169,7 +158,6 @@ At startup the broker computes what the children may hold together:
 ```
 children_budget(now) = memory_limit
                      - BROKER_RESIDENT_RESERVE_BYTES           (192 MiB: broker + Envoy, measured 168)
-                     - CONTENT_WORKSPACE_RESERVE_BYTES         (128 MiB: the store's one tree at a time, §2.1)
                      - OUTPUT_COPIES_PER_COMMAND * max_output_bytes * slots_in_use
 ```
 
@@ -178,13 +166,16 @@ test models, counted for the slots in use now rather than for the cap, so a brok
 requests in flight is not charged for eight. A request is admitted when a slot is free and the
 sum of live reservations plus its own fits `children_budget` with its slot counted.
 
-(The default limit is now 2Gi, raised when the kanban slot default rose to six: 1728 MiB after the reserves admits nine,
+The budget once also subtracted a fixed 128 MiB `CONTENT_WORKSPACE_RESERVE_BYTES` for the content
+workspace store; that term was removed with the workspace in #4243.
+
+(The default limit is now 2Gi, raised when the kanban slot default rose to six: 1856 MiB after the resident reserve admits ten,
 and the slot cap of eight binds. The figures below are the 1Gi limit this design was written
 against.)
 
 At the operator's defaults (1Gi limit, 8 MiB output cap) a request costs 128 MiB plus 48 MiB of
-output allowance, 176 MiB, against 704 MiB after the two fixed reserves: four requests that run
-commands are in flight at once (4 × 176 = 704), whatever order they arrive in, where the slot cap
+output allowance, 176 MiB, against 832 MiB after the resident reserve: four requests that run
+commands are in flight at once (4 × 176 = 704, and a fifth would need 880), whatever order they arrive in, where the slot cap
 alone admitted eight. The reconciler's and the stall watch's listing pools are four wide (§2.6),
 the admitted count; at eight wide each listing budget, sized for eight at a time, would have run
 out with about forty of a hundred projects unlisted at a 10-second listing. When the hourly
@@ -207,7 +198,7 @@ measure first if four proves tight. One install in this repository raised it whi
 was 1Gi: the smoke pipeline's (`hack/ci-deploy.sh`, `EVAL_CREDENTIAL_PROXY_MEMORY_LIMIT`), whose
 lanes of Platform Agents fanning Cluster Agents out over the seeded fleet queued behind four
 slots to median waits of 8 to 22 s and a longest wait inside the refusal bound, so it ran the
-proxy at 2Gi, where the budget admits nine and the slot cap binds again. The default is now 2Gi
+proxy at 2Gi, where the budget admits ten and the slot cap binds again. The default is now 2Gi
 too, and the pipeline keeps the figure as a pin.
 
 ### 2.3 Waiting, refusing, and the degenerate case
@@ -232,8 +223,7 @@ counted under `bound="pressure"`; the session role is the interactive class that
 (`docs/credential-isolation-design.md` has the thresholds and the routes). The
 forge refresh route takes no slot, and has its own busy handler answering the same 503, so a
 refusal does not reach its generic branch and read as a `FORGE_TOKEN_REFRESH_FAILED` 502; it
-also has the hang-up handler §2.1 names. The content-workspace route reserves nothing (§2.1) and
-needs neither. The sandbox shim, the `busy`
+also has the hang-up handler §2.1 names. The sandbox shim, the `busy`
 metric status, the audit record and the site's troubleshooting entry see the same signal as for a
 slot refusal, with a different sentence in it. A wait of a second or more logs, as a slot wait does:
 `request waited %dms for memory budget (… MiB in use of … MiB: … MiB reserved for children, … MiB of output allowance for … requests)`, the figure the admission check compares.
@@ -261,14 +251,14 @@ sizing test (§2.5) makes sure the operator's own numbers never reach it.
 
 A budget that would admit fewer than `BUDGET_MINIMUM_ADMITTED_REQUESTS` (two) requests at once is
 treated as absent: the broker logs one WARNING at startup naming the limit it read and the floor,
-`child_memory_budget_floor_bytes` (672 MiB at the 8 MiB output cap: the two fixed reserves plus two
+`child_memory_budget_floor_bytes` (544 MiB at the 8 MiB output cap: the resident reserve plus two
 requests' cost), and admits by slot alone. The case is real. GKE Autopilot without bursting sets a
 container's limits equal to its requests, so the proxy's limit there is its memory request. At
 the 512Mi the operator first declared, the budget would admit one request and serialise every
 brokered command; a listing phase that cannot run two at once costs more than the out-of-memory
 exposure the budget prevents. The operator now declares the request at 2Gi on Autopilot (and 1Gi
 on Standard, where the 2Gi limit stands), above the floor, so that the budget engages on Autopilot
-without bursting as well, admitting nine there, held to eight by the slot cap; the floor still
+without bursting as well, admitting ten there, held to eight by the slot cap; the floor still
 applies to a CR override whose `requests.memory` is smaller, and a `limits.memory` set alone below
 the default request lowers that request to it. The operator's sizing test
 holds its own limit to the same floor (`credentialProxyMinimumAdmittedRequests`) and its request
@@ -310,28 +300,28 @@ env list, as it does the two caps: a CR that could set it would detach the budge
 ### 2.5 The sizing test's child term
 
 `TestCredentialProxyOutputCapClearsTheLargestFleetDump` asserts
-`resting + output_burst(all slots) <= limit`, with the broker's two fixed reserves as the
+`resting + output_burst(all slots) <= limit`, with the broker's resident reserve as the
 resting term (the memory request no longer models it: on Autopilot it is 2Gi, equal to the limit,
 to sit on the band). It also makes a second assertion in the broker's own terms, with the same
-fixed reserves as the resting term, because those are the numbers the broker subtracts and so the budget the children
+resident reserve as the resting term, because those are the numbers the broker subtracts and so the budget the children
 see. A slot in use is a request holding a reservation, so the slot count and the reservation
 count are one variable, not two, and the assertion is the admission rule itself at a floor:
 the budget admits at least two requests at once, each with its output allowance, so a listing
 phase still parallelises at all:
 
 ```
-resident_reserve + workspace_reserve + 2 * (copies * output_cap + request_reserve) <= limit
+resident_reserve + 2 * (copies * output_cap + request_reserve) <= limit
 ```
 
-At the defaults that is 192 + 128 + 2 × 176 = 672 MiB against 2048 (1024 when this design was
+At the defaults that is 192 + 2 × 176 = 544 MiB against 2048 (1024 when this design was
 written). The test derives the count the rule admits from the rendered values,
-`floor((limit − reserves) / (copies × cap + reserve))`, nine at the 2Gi default (192 + 128 + 9 × 176
-= 1904 MiB against 2048; four at the original 1Gi), held to eight by the slot cap, names it in its
+`floor((limit − resident_reserve) / (copies × cap + request_reserve))`, ten at the 2Gi default (192 + 10 × 176
+= 1952 MiB against 2048; four at the original 1Gi), held to eight by the slot cap, names it in its
 failure message, and fails below two, so a future reduction of the
 limit or a raise of either cap has to argue with the number it prints. The slot cap does not
 enter the rule except as an upper bound, and the test says so where a reader would otherwise
 expect it to. The broker holds the six output copies as `OUTPUT_COPIES_PER_COMMAND` beside
-its other budget constants, and the two fixed reserves, the request reserve and the copies are
+its other budget constants, and the resident reserve, the request reserve and the copies are
 constants in `credential_proxy_manifests.go` that name their Python counterparts, so a change to
 one side has a name to search for on the other.
 
@@ -344,7 +334,7 @@ the broker budgeting against a stale number.
 The slot cap and output cap, their values and their reservation. The sandbox shim
 (`credential_proxy_client.py`): a 503 is still printed and exit 1 returned; with four heavy
 requests at once the eight-wide burst of both listing pools coinciding waits one listing, so no
-retry is added here. (Those are the 1Gi figures; at the 2Gi default the budget admits nine and
+retry is added here. (Those are the 1Gi figures; at the 2Gi default the budget admits ten and
 the slot cap of eight binds.) The proxy container's requests and limits, and so the
 chart's generated footprint and quota preflight (the request has since moved to 1Gi so that
 the budget runs on Autopilot without bursting, §2.3, and later to 2 CPU and 2Gi on Autopilot,
@@ -354,7 +344,7 @@ agent-visible behaviour: no eval case.
 The reconciler's and the stall watch's listing pools are the caller settings the change moved.
 The reconciler's had been eight at the default `maxProjects` cap and up to sixteen when the cap
 was raised; it is now four at every cap, the count §2.2 admitted at the original 1Gi limit (the 2Gi
-default admits nine, held to eight by the slot cap, so the four-wide pools now leave slots for
+default admits ten, held to eight by the slot cap, so the four-wide pools now leave slots for
 other callers), and its listing budget doubles to
 300 seconds at the default cap to keep the 12 seconds per listing the 150-second budget gave at
 eight wide, growing by that per default cap's worth of projects. The bootstrap gate's floor
@@ -430,8 +420,7 @@ still waiting at the bound raises `CommandSlotUnavailable` naming the budget, an
 and forge refresh routes each answer it with the existing 503 body, the vcs route before reading
 its body; the output term is charged for slots in use, not the cap; a
 `kubectl` request's cold-path `gcloud`s spawn under the request's reservation and take no second
-one; no content-workspace verb reserves and the store's fixed term is subtracted whether or not a
-workspace is open; a forge refresh that coalesces reserves nothing, one that runs the helper
+one; a forge refresh that coalesces reserves nothing, one that runs the helper
 reserves under the refresh lock, a refresher waiting on the lock holds no reservation and is
 refused at the bound with the budget on or off, and the route drops a caller that hangs up while
 queued and answers a refusal with the 503; a spawn on a thread with no reservation takes a transient one; the

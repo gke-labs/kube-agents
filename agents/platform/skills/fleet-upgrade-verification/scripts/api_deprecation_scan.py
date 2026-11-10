@@ -127,8 +127,9 @@ ENTRY_TREE = "tree"
 NARROW_PART_NAME = "part-{index}"
 CEILING_ENV = "CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES"
 # A part is sized to the lower of the broker's ceiling and vcs_client's own
-# unpack bound (SNAPSHOT_MAX_UNPACKED_BYTES): with the ceiling raised past it,
-# a part the broker serves would be refused by the client, with no entries.
+# unpack bound (SNAPSHOT_MAX_UNPACKED_BYTES). vcs_client sends that bound with
+# each snapshot, so the broker refuses past it with entries; a broker too old
+# to read it serves the part, and the client then refuses it with none.
 UNREAD_OVER_CEILING = (
     "a file over the {limit}-byte snapshot bound on its own "
     "(the lower of the broker's {env} and the client's unpack bound)"
@@ -139,6 +140,8 @@ UNREAD_NO_LISTING = "refused as too large, and the refusal named no entries belo
 # comes back with U+FFFD and names nothing when it is asked for.
 REPLACEMENT_CHARACTER = "\ufffd"
 UNREAD_NOT_UTF8 = "its name is not UTF-8, so the broker's listing could not name it to ask for"
+UNREAD_NO_MEASURE = "the broker's refusal gave no size for it, so it could not be put in a part"
+UNREAD_PART_ERROR = "its part could not be unpacked: {error}"
 
 # `[v]MAJOR.MINOR[.PATCH][-gke.BUILD]`: the GKE form Phase 1 prints, and the bare
 # minor the removal table and a human's `--target-version 1.27` use. Only the
@@ -488,6 +491,8 @@ def read_repo_in_parts(
     while pending and not read.stopped:
         for entry in list(pending):
             reason = _name_refusal(entry["path"])
+            if reason is None and (isinstance(entry.get("bytes"), bool) or not isinstance(entry.get("bytes"), int)):
+                reason = UNREAD_NO_MEASURE
             if reason is not None:
                 pending.remove(entry)
                 read.unread.append({"path": entry["path"], "reason": reason})
@@ -529,6 +534,14 @@ def read_repo_in_parts(
                     )
                 else:
                     read.unread.extend({"path": entry["path"], "reason": str(refused)} for entry in batch)
+                continue
+            except OSError as e:
+                # One part's unpack failing (a full scratch volume, say) loses
+                # that part, not the parts already read.
+                shutil.rmtree(part, ignore_errors=True)
+                read.unread.extend(
+                    {"path": entry["path"], "reason": UNREAD_PART_ERROR.format(error=e)} for entry in batch
+                )
                 continue
             if answer.get("revision") and answer["revision"] not in read.revisions:
                 read.revisions.append(answer["revision"])
