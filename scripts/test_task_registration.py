@@ -898,6 +898,21 @@ class TestTheRulesReject(unittest.TestCase):
             with self.subTest(line=line.strip()):
                 self._only("is not a bare non-negative decimal", text=text + line)
 
+    def test_a_draft_not_named_task_yaml_is_read_from_the_path_it_was_given(self):
+        # `validate_paths` accepts a scratch draft outside the tree; the key check
+        # reads that file, never a task.yaml rebuilt from the draft's name.
+        spec = {**self.VALID, "id": "draft", "verification_spec": self._entry(check={"type": "pull_request_opened"})}
+        with tempfile.TemporaryDirectory() as tmp:
+            draft = pathlib.Path(tmp) / "draft.yaml"
+            draft.write_text(yaml.safe_dump(spec))
+            self.assertEqual(validator.validate_case("draft", draft, registered={"draft"}), [])
+            draft.write_text(yaml.safe_dump({**spec, "requested_pull_requests": 2}))
+            self.assertEqual(validator.validate_case("draft", draft, registered={"draft"}), [])
+            draft.write_text(yaml.safe_dump({**spec, "requested_pull_requests": 1}))
+            problems = validator.validate_case("draft", draft, registered={"draft"})
+            self.assertEqual(len(problems), 1, problems)
+            self.assertIn("is not above the 1", problems[0])
+
     def test_a_key_line_inside_a_quoted_scalar_is_rejected(self):
         # A continuation line of a multi-line quoted prompt can start at column
         # 0; YAML folds it into the string, but a text read takes it for the key.

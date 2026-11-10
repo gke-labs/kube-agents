@@ -389,14 +389,19 @@ def runs_alone(case: str, tasks_dir: pathlib.Path = TASKS_DIR) -> bool:
     return is_stopped_ask(case, tasks_dir) or declares_writes_alone(case, tasks_dir)
 
 
-def declared_pull_requests(case: str, tasks_dir: pathlib.Path = TASKS_DIR) -> int:
-    """The count the case's task.yaml declares under ``requested_pull_requests``; 0 when absent."""
-    text = (tasks_dir / case / "task.yaml").read_text(encoding="utf-8")
+def declared_pull_requests_in(text: str) -> int:
+    """The count a task file's text declares under ``requested_pull_requests``
+    on a top-level line; 0 when no such line."""
     for line in text.splitlines():
         m = REQUESTED_PULL_REQUESTS_RE.match(line.split("#", 1)[0].rstrip())
         if m:
             return int(m.group(1))
     return 0
+
+
+def declared_pull_requests(case: str, tasks_dir: pathlib.Path = TASKS_DIR) -> int:
+    """The count the case's task.yaml declares under ``requested_pull_requests``; 0 when absent."""
+    return declared_pull_requests_in((tasks_dir / case / "task.yaml").read_text(encoding="utf-8"))
 
 
 def requests_a_pull_request(case: str, lane_requesting: dict[str, int], tasks_dir: pathlib.Path = TASKS_DIR) -> bool:

@@ -59,6 +59,16 @@ AUDIT_STREAMS_MODULE_NAME = "bench_audit_streams"
 # The runner's reader of `scope_exclude:` (hack/ci-eval-pr.sh), loaded the same way.
 SCOPE_EXCLUDE_FILE = REPO_ROOT / "bench" / "kube_agents_bench" / "scope_exclude.py"
 SCOPE_EXCLUDE_MODULE_NAME = "bench_scope_exclude"
+# The top-level key a case declares its total of requested pull requests under
+# (bench/kube_agents_bench/lane.py's REQUESTED_KEY); the check types that request a
+# pull request, as lane.py's REQUESTING_CHECK_TYPES names them; and the keys a check
+# nests children under, as lane.py's CHECK_CHILD_KEYS. scripts/test_eval_rosters.py
+# holds the types equal and `_requesting_leaves` to lane.requested_pull_requests on
+# every shipped case (test_the_validators_requesting_types_are_the_lanes). lane.py
+# imports its package, so it is not loaded by path the way the two readers above are.
+REQUESTED_PULL_REQUESTS_KEY = "requested_pull_requests"
+REQUESTING_CHECK_TYPES = frozenset({"pull_request_opened", "pull_request_diff_contains"})
+CHECK_CHILD_KEYS = ("checks", "check")
 TASKS_DIR = REPO_ROOT / "bench" / "tasks"
 # The tag PyYAML gives a `<<:` merge key; its pairs are merged in, not repeated.
 YAML_MERGE_TAG = "tag:yaml.org,2002:merge"
@@ -1174,12 +1184,6 @@ def _path_segments(path: Any) -> list[str]:
     return segments
 
 
-# The check types that request a pull request, as bench/kube_agents_bench/lane.py's
-# REQUESTING_CHECK_TYPES names them; scripts/test_eval_rosters.py holds the two equal,
-# and holds `_requesting_leaves` to lane.requested_pull_requests on every shipped case
-# (test_the_validators_requesting_types_are_the_lanes). lane.py imports its package,
-# so it is not loaded by path the way audit_streams.py and scope_exclude.py are.
-REQUESTING_CHECK_TYPES = frozenset({"pull_request_opened", "pull_request_diff_contains"})
 def _requesting_leaves(spec: Any) -> int:
     """How many of the spec's leaves request a pull request, under either of
     the child keys a check nests under (lane.py's `_leaves`: a child present
@@ -1190,7 +1194,7 @@ def _requesting_leaves(spec: Any) -> int:
             return [leaf for item in node for leaf in leaves(item)]
         if not isinstance(node, dict):
             return []
-        children = [node[key] for key in ("checks", "check") if node.get(key) is not None]
+        children = [node[key] for key in CHECK_CHILD_KEYS if node.get(key) is not None]
         return [leaf for child in children for leaf in leaves(child)] if children else [node]
 
     if not isinstance(spec, list):
@@ -1497,9 +1501,9 @@ def validate_case(
     # top-level line. The lane and the grader refuse a non-integer after the
     # lease; this says so first, and holds the spelling to the one every
     # reader agrees on.
-    text_count = eval_rosters.declared_pull_requests(name, path.parent.parent)
-    if "requested_pull_requests" in spec:
-        declared = spec["requested_pull_requests"]
+    text_count = eval_rosters.declared_pull_requests_in(path.read_text(encoding="utf-8"))
+    if REQUESTED_PULL_REQUESTS_KEY in spec:
+        declared = spec[REQUESTED_PULL_REQUESTS_KEY]
         if isinstance(declared, bool) or not isinstance(declared, int) or declared < 0 or declared != text_count:
             problems.append(
                 f"'requested_pull_requests:' {declared!r} is not a bare non-negative decimal "
