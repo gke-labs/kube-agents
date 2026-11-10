@@ -396,7 +396,7 @@ readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # the writers part's three thirds, writers-a, -b and -c), which grade the full
 # catalog under next (the nightly the dashboard and
 # the digest read); the GitLab lane's nightly under next (EVAL_FORGE=gitlab,
-# hack/eval/gitlab-cases.txt), beside its today-mode nightly; the GHES and
+# hack/eval/gitlab-cases.txt); the GHES and
 # GitLab CE lanes' weekly jobs (EVAL_FORGE=ghes, hack/eval/ghes-cases.txt;
 # EVAL_FORGE=gitlab-ce, hack/eval/gitlab-cases.txt); and the
 # release-candidate eval's postsubmit, which grades a candidate in the mode a
@@ -410,7 +410,7 @@ readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # one by the first on a batch Tide ran, the nightlies, the certification
 # lane's first slice (EVAL_TIER=certification), the RC
 # postsubmit and the replay lane only by the first -- and refuses it on any other Prow run, so
-# the flag leaking into the today-mode GitLab nightly's or another postsubmit's environment
+# the flag leaking into another periodic's or postsubmit's environment
 # still stops the deploy at second zero. The names are the jobs' own in
 # oss-test-infra (prow/prowjobs/gke-labs/kube-agents/); a rename there is a
 # one-line edit here. Admitting a job here never lets it write today's window:
@@ -1140,7 +1140,7 @@ fi
 # today's window (bench-gate reads the mode off the transport; hack/ci-eval-pr.sh
 # keeps the today lane out of the recorder, and bench-gate separately refuses
 # a pull request's sample, bench/baselines/README.md), so what the flag
-# mis-set on a job that is not the lane's -- the today-mode GitLab nightly, another
+# mis-set on a job that is not the lane's -- another periodic or
 # postsubmit -- would do is run that job in next mode and leave the
 # dashboard silently missing its today-mode run, its verdict measuring the
 # wrong stack. Keyed on the job's name rather than on PULL_NUMBER, so the lane's

@@ -101,8 +101,8 @@ _FLAG_UNSET_SPELLINGS = (None, "", "0", "true", "yes")
 # The Prow jobs (oss-test-infra) section 2b admits the flag on without a pull
 # request: the merge-blocking presubmit (in a batch Tide ran), the main
 # nightly's eight parts, the GitLab next nightly, the forge lanes' weekly
-# jobs and the certification lane's first slice; the today-mode GitLab nightly and a
-# made-up job stand for every other Prow run.
+# jobs and the certification lane's first slice; the retired today-mode GitLab
+# nightly's name and a made-up job stand for every other Prow run.
 _NEXT_LANE_JOB_NAMES = (
     "pull-kube-agents-smoke-test",
     "ci-kube-agents-eval-nightly",
