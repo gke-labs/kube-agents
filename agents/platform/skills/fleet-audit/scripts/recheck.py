@@ -3,7 +3,8 @@
 
 The fleet audit re-checks a merged fix only on its next scheduled run, at the
 stream's cadence, whenever that falls after the merge. The post-merge check
-(docs/designs/post-merge-verification.md §3.5) needs the answer on demand, for
+(the post-merge verification design, §3.5 "Re-check the one finding") needs the
+answer on demand, for
 one finding: run that finding's check against that finding's target and
 nothing else, and say whether it reproduces.
 
@@ -19,12 +20,14 @@ This reads one namespace with one `kubectl get`, runs the same check function
   system namespace). A caller reports this as "not re-checked", never as fixed.
 
 A check that judges the whole cluster is narrowed to the target, so an
-unrelated object elsewhere cannot fail a correct fix. For `no-pdb` that is
-`blocking-pdb`, read only for the budgets that select the target's pods (or
-only the one `--budget` names): the fix adds a budget, and a budget that
-permits no eviction would trade a missing-PDB finding for a drain-blocking one.
-The arithmetic still counts every workload in the namespace the budget selects,
-as the disruption controller does.
+unrelated object elsewhere cannot fail a correct fix. For `no-pdb` those are
+the two checks a new budget can trip: `pdb-overlapping` for the target workload
+only (a second budget over its pods makes the eviction API refuse them), and
+`blocking-pdb` for the budgets that select the target's pods, or only the one
+`--budget` names (a budget that permits no eviction blocks every drain). Either
+would trade a missing-PDB finding for a drain-blocking one. The arithmetic
+still counts every workload and budget in the namespace, as the disruption
+controller does.
 
 `derive_finding_state` (audit_report.py) turns the answer into the ledger's
 state: with a merged pull request, `reproduces` is `pr-merged-persists` and
@@ -45,8 +48,8 @@ collector check by id on it, narrow a cluster check to the objects that select
 it. Another check id joins `RECHECKS` as a new tuple of those steps, plus any
 new step it needs.
 
-Exit codes: 0 clean, 1 reproduces, 2 unchecked (or a usage error). The JSON on
-stdout carries the same answer.
+Exit codes: 0 clean, 1 reproduces, 2 unchecked (a failed read, a crash inside
+the re-check, or a usage error). The JSON on stdout carries the same answer.
 """
 
 from __future__ import annotations
@@ -99,8 +102,9 @@ class Subject:
     """What one re-check has read and narrowed so far, passed from step to step.
 
     `workload` is the target once `in_scope_workload` has found it; `selected`
-    is what a selecting step left for a narrowed cluster check, keyed by the
-    context key it replaces (`"pdbs"`); `notes` is copied onto the answer.
+    is what a selecting step left for a narrowed cluster check: the value that
+    replaces one context key (`"pdbs"`, `"workloads"`) for that check alone;
+    `notes` is copied onto the answer.
     """
 
     def __init__(self, target: Target, dump: dict) -> None:
@@ -109,7 +113,7 @@ class Subject:
         self.workloads = collect.normalize_workloads(dump)
         self.context = collect.build_context(dump, self.workloads)
         self.workload: dict | None = None
-        self.selected: dict[str, list[dict]] = {}
+        self.selected: dict = {}
         self.notes: dict = {}
 
 
@@ -225,22 +229,29 @@ def select_budgets(subject: Subject) -> Verdict | None:
                 ),
             )
         covering = named
-    subject.selected["pdbs"] = covering
+    subject.selected["pdbs"] = {namespace: covering}
     subject.notes["budgets"] = sorted(_name(p) for p in covering)
     return None
 
 
+def select_target_workload(subject: Subject) -> Verdict | None:
+    """Narrow a workload-anchored cluster check to the target alone."""
+    subject.selected["workloads"] = [subject.workload]
+    return None
+
+
 def narrowed_cluster_check(slug: str, context_key: str) -> Step:
-    """The collector's cluster-kind check `slug`, over only what a selecting
-    step left under `context_key`. Everything else in the namespace stays in
-    the context: `blocking-pdb` counts every pod a budget selects, not only
-    the target's."""
+    """The collector's cluster-kind check `slug`, with `context_key` replaced by
+    what a selecting step left there and everything else as read. The rest of
+    the namespace stays in the context on purpose: `blocking-pdb` counts every
+    pod a budget selects, and `pdb-overlapping` every budget over the target,
+    not only the target's or the fix's."""
     spec = _spec(slug)
     if spec.kind != "cluster":
         raise ValueError(f"{slug!r} is a {spec.kind} check; run it with workload_check")
 
     def step(subject: Subject) -> Verdict | None:
-        narrowed = {**subject.context, context_key: {subject.target.namespace: subject.selected.get(context_key, [])}}
+        narrowed = {**subject.context, context_key: subject.selected[context_key]}
         evidence = [_evidence(slug, subject.target, h["object"], h["excerpt"]) for h in spec.run(narrowed)]
         return Verdict(OUTCOME_REPRODUCES, evidence) if evidence else None
 
@@ -255,6 +266,10 @@ RECHECKS: dict[str, Recheck] = {
         (
             in_scope_workload,
             workload_check("no-pdb"),
+            # A second budget over the same pods makes the eviction API refuse
+            # them all, so a fix that adds one beside another is not clean.
+            select_target_workload,
+            narrowed_cluster_check("pdb-overlapping", "workloads"),
             select_budgets,
             narrowed_cluster_check("blocking-pdb", "pdbs"),
         ),
@@ -358,7 +373,15 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     target = Target(args.check, args.cluster, args.namespace, args.object, args.budget)
     pr = {"state": "MERGED"} if args.merged else None
-    answer = recheck(target, kubeconfig=args.kubeconfig, kube_context=args.kube_context, pr=pr)
+    try:
+        answer = recheck(target, kubeconfig=args.kubeconfig, kube_context=args.kube_context, pr=pr)
+    except Exception as exc:  # noqa: BLE001 -- a crash is no verdict, and exit 1 would read as one
+        answer = {
+            **target._asdict(),
+            "outcome": OUTCOME_UNCHECKED,
+            "evidence": [],
+            "reason": f"the re-check failed ({type(exc).__name__}: {exc}), so nothing was judged",
+        }
     print(json.dumps(answer, indent=2))
     return EXIT_BY_OUTCOME[answer["outcome"]]
 

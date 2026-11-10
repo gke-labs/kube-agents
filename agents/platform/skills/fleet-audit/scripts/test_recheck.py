@@ -110,14 +110,41 @@ class NoPdbTest(unittest.TestCase):
         blocking = collect.check_blocking_pdb(collect.build_context(dump, workloads))
         self.assertEqual([h["object"] for h in blocking], ["PodDisruptionBudget/cart-pdb"])
 
-    def test_budget_named_by_the_caller_narrows_to_it(self):
-        # Two budgets over the same pods: the named one is fine, the other
-        # blocks. Only the fix's own budget is the subject.
-        items = [deployment(), pdb(maxUnavailable=1), pdb("legacy", minAvailable=3)]
+    def test_a_second_budget_over_the_same_pods_reproduces_as_pdb_overlapping(self):
+        # Both budgets permit evictions, but the eviction API refuses a pod two
+        # budgets select. Named or not, the fix is not clean.
+        items = [deployment(), pdb(maxUnavailable=1), pdb("legacy", maxUnavailable=1)]
+        for budget in ("checkout-pdb", ""):
+            with self.subTest(budget=budget):
+                answer = recheck.recheck(target(budget), run=FakeRun(items), pr={"state": "MERGED"})
+                self.assertEqual(answer["outcome"], recheck.OUTCOME_REPRODUCES)
+                self.assertEqual(answer["state"], "pr-merged-persists")
+                [evidence] = answer["evidence"]
+                self.assertEqual((evidence["check"], evidence["object"]), ("pdb-overlapping", "Deployment/checkout"))
+
+    def test_an_overlap_on_another_workload_does_not_fail_a_correct_fix(self):
+        other = {"app": "cart"}
+        items = [
+            deployment(),
+            pdb(maxUnavailable=1),
+            deployment("cart", replicas=2, labels=other),
+            pdb("cart-a", labels=other, maxUnavailable=1),
+            pdb("cart-b", labels=other, maxUnavailable=1),
+        ]
         self.assertEqual(recheck.recheck(target("checkout-pdb"), run=FakeRun(items))["outcome"], recheck.OUTCOME_CLEAN)
-        unnamed = recheck.recheck(target(), run=FakeRun(items))
-        self.assertEqual(unnamed["outcome"], recheck.OUTCOME_REPRODUCES)
-        self.assertEqual([e["object"] for e in unnamed["evidence"]], ["PodDisruptionBudget/legacy"])
+
+    def test_budget_named_by_the_caller_narrows_blocking_pdb_to_it(self):
+        # The fix's budget is fine; a blocking budget elsewhere in the namespace
+        # is not over these pods, so it is not this finding's business.
+        other = {"app": "cart"}
+        items = [
+            deployment(),
+            pdb(maxUnavailable=1),
+            deployment("cart", labels=other),
+            pdb("cart-pdb", labels=other, minAvailable=3),
+        ]
+        answer = recheck.recheck(target("checkout-pdb"), run=FakeRun(items))
+        self.assertEqual((answer["outcome"], answer["budgets"]), (recheck.OUTCOME_CLEAN, ["checkout-pdb"]))
 
     def test_autoscaler_floor_is_what_the_budget_is_measured_against(self):
         items = [deployment(replicas=4), pdb(minAvailable=2), hpa(min_replicas=2)]
@@ -226,7 +253,9 @@ class AuditParityTest(unittest.TestCase):
         ]
         dump = {"items": items}
         workloads = collect.normalize_workloads(dump)
-        specs = tuple(s for s in collect.OBTAINABILITY_CHECKS if s.slug in ("no-pdb", "blocking-pdb"))
+        specs = tuple(
+            s for s in collect.OBTAINABILITY_CHECKS if s.slug in ("no-pdb", "blocking-pdb", "pdb-overlapping")
+        )
         collected = collect.CollectedContext(
             collect.build_context(dump, workloads), workloads, {s.slug: {} for s in specs}
         )
@@ -262,6 +291,24 @@ class MainTest(unittest.TestCase):
         self.assertEqual((rc, answer["outcome"], answer["state"]), (0, "clean", "resolved-merged"))
         rc, answer = self.run_main([])
         self.assertEqual((rc, answer["outcome"]), (2, "unchecked"))
+
+    def test_a_crash_inside_the_recheck_is_unchecked_not_reproduces(self):
+        def broken(subject):
+            raise TypeError("boom")
+
+        original = recheck.RECHECKS["no-pdb"]
+        buf = io.StringIO()
+        try:
+            recheck.RECHECKS["no-pdb"] = original._replace(steps=(broken,))
+            with mock.patch.object(collect, "default_run", FakeRun([deployment()])), redirect_stdout(buf):
+                rc = recheck.main(
+                    ["--check", "no-pdb", "--cluster", CLUSTER, "--namespace", NS, "--object", "Deployment/checkout"]
+                )
+        finally:
+            recheck.RECHECKS["no-pdb"] = original
+        answer = json.loads(buf.getvalue())
+        self.assertEqual((rc, answer["outcome"]), (2, "unchecked"))
+        self.assertIn("TypeError: boom", answer["reason"])
 
 
 if __name__ == "__main__":
