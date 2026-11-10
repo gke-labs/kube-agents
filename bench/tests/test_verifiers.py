@@ -5918,12 +5918,28 @@ def test_admits_disruption_fails_when_no_budget_was_written(token, github):
 def test_admits_disruption_reads_a_budget_beside_other_objects(token, github):
     """Any one good budget passes with quantifier any; all needs every budget good."""
     good = _pdb_yaml("  maxUnavailable: 1\n")
-    bad = _pdb_yaml("  maxUnavailable: 0\n")
+    bad = _pdb_yaml("  maxUnavailable: 1\n", "  selector:\n    matchLabels:\n      app: other\n")
     _content_pr(github, {f"{_PDB_DIR}/pdbs.yaml": f"kind: Service\nmetadata: {{name: s}}\n---\n{good}---\n{bad}"})
     assert _pr_check(content=[_pdb_check()]).verify(5.0).status == "fail"
     _content_pr(github, {f"{_PDB_DIR}/pdbs.yaml": f"kind: Service\nmetadata: {{name: s}}\n---\n{good}---\n{bad}"})
     res = _pr_check(content=[_pdb_check(quantifier="any")]).verify(5.0)
     assert res.status == "pass", res.reason
+
+
+def test_admits_disruption_fails_two_budgets_over_the_same_pods(token, github):
+    """The eviction API refuses a pod two budgets select, so each good alone is no pass."""
+    files = {f"{_PDB_DIR}/a.yaml": _pdb_yaml("  minAvailable: 1\n"), f"{_PDB_DIR}/b.yaml": _pdb_yaml("  maxUnavailable: 1\n")}
+    _content_pr(github, files)
+    res = _pr_check(content=[_pdb_check(quantifier="any")]).verify(5.0)
+    assert res.status == "fail"
+    assert "more than one budget selects" in res.reason
+
+
+def test_admits_disruption_grades_only_policy_v1():
+    for version in ("policy/v1beta1", None):
+        doc = yaml.load(_pdb_yaml("  minAvailable: 1\n"), Loader=verifiers._ContentLoader)
+        doc["apiVersion"] = version
+        assert "not policy/v1" in (verifiers._pdb_rejection(doc, 2, _PDB_LABELS) or "")
 
 
 @pytest.mark.parametrize(
@@ -5980,6 +5996,11 @@ def test_admits_disruption_refuses_budgets_that_block_or_bound_nothing(budget, r
         ("  selector:\n    matchExpressions:\n      - {key: app, operator: DoesNotExist}\n", "DoesNotExist"),
         ("  selector:\n    matchExpressions:\n      - {key: app, operator: Like, values: [x]}\n",
          "not a Kubernetes one"),
+        ("  selector:\n    matchExpressions:\n      - {key: app, operator: Exists, values: [x]}\n",
+         "the API server refuses"),
+        ("  selector:\n    matchExpressions:\n      - {key: tier, operator: NotIn, values: []}\n",
+         "the API server refuses"),
+        ("  selector:\n    matchExpressions:\n      - {operator: Exists}\n", "names no key"),
     ],
 )
 def test_admits_disruption_refuses_a_selector_that_misses_the_workload(selector, why):

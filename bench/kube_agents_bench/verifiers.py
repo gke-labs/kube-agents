@@ -2305,8 +2305,9 @@ _EMPTY_BLOB_SHA = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
 _PR_FILE_GONE_STATUSES = frozenset({"removed"})
 # Offending documents a failed content assertion names before counting the rest.
 _PR_CONTENT_MAX_NAMED = 5
-# The kind `admits_disruption` grades.
+# The kind `admits_disruption` grades, at the one version a cluster serves.
 _PDB_KIND = "PodDisruptionBudget"
+_PDB_API_VERSION = "policy/v1"
 
 _NO_PR_RUN_CLOCK_REASON = (
     "the run's transcript carries no start time (TranscriptSnapshot.started_at "
@@ -5438,6 +5439,15 @@ def _selector_rejection(selector: Any, pod_labels: dict[str, str]) -> str | None
         values = [] if _is_null(expression.get("values")) else expression.get("values")
         if not isinstance(values, list):
             return f"its selector's matchExpressions values for {key!r} is not a list"
+        if _is_null(key):
+            return "a matchExpressions requirement names no key, which the API server refuses"
+        if operator not in ("In", "NotIn", "Exists", "DoesNotExist"):
+            return f"its selector's matchExpressions operator {operator!r} is not a Kubernetes one"
+        if (operator in ("In", "NotIn")) != bool(values):
+            return (
+                f"its requirement {key} {operator} {values} is one the API server refuses: In and "
+                "NotIn need values, Exists and DoesNotExist take none"
+            )
         present = key in pod_labels
         if operator == "In":
             selected = present and pod_labels[key] in values
@@ -5445,10 +5455,8 @@ def _selector_rejection(selector: Any, pod_labels: dict[str, str]) -> str | None
             selected = not present or pod_labels[key] not in values
         elif operator == "Exists":
             selected = present
-        elif operator == "DoesNotExist":
-            selected = not present
         else:
-            return f"its selector's matchExpressions operator {operator!r} is not a Kubernetes one"
+            selected = not present
         if not selected:
             return f"its selector's requirement {key} {operator} {values} does not select the workload's pods ({shown})"
     return None
@@ -5473,12 +5481,17 @@ def _pdb_rejection(doc: dict, replicas: int, pod_labels: dict[str, str]) -> str 
     """Why a PodDisruptionBudget does not protect a workload of ``replicas``
     healthy pods labelled ``pod_labels`` while letting a node drain, or None.
 
-    It must select those pods, set exactly one of minAvailable and
+    It must be ``policy/v1``, select those pods, set exactly one of minAvailable and
     maxUnavailable, and allow between one and ``replicas - 1`` disruptions
     with every pod healthy, which is ``replicas - minAvailable`` or
     ``maxUnavailable``. Zero blocks every voluntary eviction, so no node
     holding one of the pods can drain; ``replicas`` or more bounds nothing.
     """
+    if doc.get("apiVersion") != _PDB_API_VERSION:
+        return (
+            f"its apiVersion is {_scalar_text(doc.get('apiVersion'))!r}, not {_PDB_API_VERSION}, the only "
+            "version a current cluster serves (policy/v1beta1 went in Kubernetes 1.25)"
+        )
     spec = doc.get("spec")
     if not isinstance(spec, dict):
         return "it has no spec"
@@ -5556,6 +5569,19 @@ def _content_rejection(check: PullRequestContentCheck, files: dict[str, str]) ->
         return hit if check.op == "matches" else (bool(filled) and not hit)
 
     if check.op == "admits_disruption":
+        # The eviction API refuses to evict a pod more than one budget selects,
+        # so two budgets over the workload block every drain however each
+        # reads alone, whatever the quantifier.
+        selecting = [
+            label for label, _ in kept
+            if isinstance(objects[label].get("spec"), dict)
+            and _selector_rejection(objects[label]["spec"].get("selector"), check.pod_labels) is None
+        ]
+        if len(selecting) > 1:
+            return (
+                f"{check.label()}: {', '.join(selecting[:_PR_CONTENT_MAX_NAMED])} all select the workload's "
+                "pods, and the eviction API refuses to evict a pod more than one budget selects"
+            )
         failing = []
         for label, _ in kept:
             why = _pdb_rejection(objects[label], check.replicas or 0, check.pod_labels)
