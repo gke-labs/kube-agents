@@ -1365,14 +1365,18 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sig := r.Header.Get(hookSignatureHeader)
-	run := b.runForSignature(sig, body)
+	run, decoded, runs := b.routeDelivery(sig, body)
 	if run == nil {
-		b.collectCardWorkerSecrets(sig, body)
+		if decoded != nil {
+			b.collectCardWorkerSecrets(runs, decoded)
+		}
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	var d hookDelivery
-	if err := json.Unmarshal(body, &d); err != nil {
+	if decoded != nil {
+		d = *decoded
+	} else if err := json.Unmarshal(body, &d); err != nil {
 		// Signed for this task and unreadable, and which event it was
 		// cannot be known: an unreadable pre costs the trace nothing (the
 		// post carries the record whole), an unreadable post leaves its
@@ -1419,8 +1423,17 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 // session id is read only after the signature verifies, so an unsigned body
 // cannot pick a task.
 func (b *Bridge) runForSignature(sig string, body []byte) *taskRun {
+	run, _, _ := b.routeDelivery(sig, body)
+	return run
+}
+
+// routeDelivery is runForSignature, also handing back what it read on the
+// way, so the door neither verifies nor decodes a body twice: the delivery,
+// when the pod's shared secret signed it and it decoded (nil otherwise),
+// and the snapshot of tasks it matched against.
+func (b *Bridge) routeDelivery(sig string, body []byte) (*taskRun, *hookDelivery, []*taskRun) {
 	if sig == "" {
-		return nil
+		return nil, nil, nil
 	}
 	b.mu.Lock()
 	runs := make([]*taskRun, 0, len(b.tasks))
@@ -1430,22 +1443,25 @@ func (b *Bridge) runForSignature(sig string, body []byte) *taskRun {
 	b.mu.Unlock()
 	for _, r := range runs {
 		if a := r.act.Load(); a != nil && a.signed(sig, body) {
-			return r
+			return r, nil, runs
 		}
 	}
 	if !hookSigned(b.cfg.ActivitySecret, sig, body) {
-		return nil
+		return nil, nil, runs
 	}
-	var d hookDelivery
-	if err := json.Unmarshal(body, &d); err != nil || d.SessionID == "" {
-		return nil
+	d := new(hookDelivery)
+	if err := json.Unmarshal(body, d); err != nil {
+		return nil, nil, runs
+	}
+	if d.SessionID == "" {
+		return nil, d, runs
 	}
 	for _, r := range runs {
 		if a := r.act.Load(); a != nil && a.sessionID == d.SessionID && (a.inTurn.Load() || a.waitingCard.Load()) {
-			return r
+			return r, d, runs
 		}
 	}
-	return matchWorkerDeliveryRun(runs, d)
+	return matchWorkerDeliveryRun(runs, *d), d, runs
 }
 
 // collectCardWorkerSecrets reads the Secret values of a post_tool_call
@@ -1454,22 +1470,13 @@ func (b *Bridge) runForSignature(sig string, body []byte) *taskRun {
 // while the coordinator's turn goes on), into the set of the task that
 // filed or tracks the card (cardWorkerRun), whose answer folds the card's
 // report in. Nothing else of the delivery is used: it stays out of the
-// trace, as before.
-func (b *Bridge) collectCardWorkerSecrets(sig string, body []byte) {
-	if sig == "" || !hookSigned(b.cfg.ActivitySecret, sig, body) {
+// trace, as before. d is the delivery routeDelivery verified and decoded,
+// and runs the tasks it matched against.
+func (b *Bridge) collectCardWorkerSecrets(runs []*taskRun, d *hookDelivery) {
+	if d.Event != hookPostToolCall || d.SessionID == "" {
 		return
 	}
-	var d hookDelivery
-	if err := json.Unmarshal(body, &d); err != nil || d.Event != hookPostToolCall || d.SessionID == "" {
-		return
-	}
-	b.mu.Lock()
-	runs := make([]*taskRun, 0, len(b.tasks))
-	for _, r := range b.tasks {
-		runs = append(runs, r)
-	}
-	b.mu.Unlock()
-	if run := cardWorkerRun(runs, d); run != nil {
+	if run := cardWorkerRun(runs, *d); run != nil {
 		run.act.Load().secrets.collectToolResult(d.Extra.Result)
 	}
 }

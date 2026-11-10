@@ -906,3 +906,44 @@ func TestSeenSecrets_ALineLeadingKeyWithLaterPairsIsTracked(t *testing.T) {
 		t.Errorf("scrubInlineSecrets = %q, want %q", got, want)
 	}
 }
+
+// The door verifies and decodes a pod-wide delivery once: routeDelivery
+// hands back the delivery it decoded and the tasks it matched against, and
+// the card-worker path reads those, so a signed delivery that matches no
+// trace feeds the card's task without a second check or decode. A body the
+// shared secret did not sign decodes to nothing.
+func TestActivity_RouteDeliveryHandsBackWhatItRead(t *testing.T) {
+	const secret = "pod-wide-shared-secret"
+	b := &Bridge{cfg: Config{ActivitySecret: secret, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, tasks: make(map[string]*taskRun)}
+	a := newActivityState(false)
+	a.sessionID = "a2a-coord-route"
+	a.inTurn.Store(true)
+	a.SyncKanbanCard("t_card77", "Check prod-b", "")
+	run := &taskRun{origin: &lib.Envelope{TaskID: "task-route"}, state: stateRunning}
+	run.act.Store(a)
+	b.tasks["task-route"] = run
+
+	body, _ := json.Marshal(map[string]any{
+		"hook_event_name": hookPostToolCall, "tool_name": "terminal", "session_id": "20990101_120002_worker",
+		"cwd": "/var/lib/hermes/kanban/workspaces/t_card77/repo", "delivery_id": nuid.Next(),
+		"extra": map[string]any{"tool_call_id": "w2", "status": "ok", "result": terminalResult(t, secretJSON(t, "Opaque", map[string]string{"password": synthSecretPlain}))},
+	})
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(body)
+	sig := hookSignaturePrefix + hex.EncodeToString(mac.Sum(nil))
+
+	got, d, runs := b.routeDelivery(sig, body)
+	if got != nil {
+		t.Fatalf("a worker delivery before the wait matched a trace: %+v", got)
+	}
+	if d == nil || d.SessionID != "20990101_120002_worker" || d.Event != hookPostToolCall || len(runs) != 1 || runs[0] != run {
+		t.Fatalf("routeDelivery handed back delivery %+v and %d runs, want the decoded delivery and the one task", d, len(runs))
+	}
+	b.collectCardWorkerSecrets(runs, d)
+	if !a.secrets.has(synthSecretPlain) {
+		t.Error("the card worker's Secret value did not reach the task's set from the decoded delivery")
+	}
+	if _, d, _ := b.routeDelivery(hookSignaturePrefix+strings.Repeat("0", 64), body); d != nil {
+		t.Error("a body the shared secret did not sign was decoded")
+	}
+}
