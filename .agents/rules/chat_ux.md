@@ -146,8 +146,8 @@ cluster.
 
 Today: [`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §1.6 ("state the resolved target back to
 them and wait for a yes") and §3's `/feedback` confirmation, which shows the exact submission and waits for a yes. In the
-gateway, `mayStop` in `a2a/gateway/stopgate.go` lets only a requester of the thread press Slack's
-Stop button; a typed `stop`, and Stop on other backends, are not gated.
+gateway, `mayStop` in `a2a/gateway/stopgate.go` lets only a requester of the thread press its Stop
+button, Slack's native one or the one drawn on Google Chat; a typed `stop` is not gated.
 
 ## Renderers never compose
 

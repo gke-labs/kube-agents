@@ -174,10 +174,10 @@ func TestMayStopOnSlackOnlyTheRequesters(t *testing.T) {
 	}
 }
 
-func TestMayStopOffSlackAndOnAnEmptyConversation(t *testing.T) {
+func TestMayStopOffTheGatedBackendsAndOnAnEmptyConversation(t *testing.T) {
 	alice := TaskRequester{Backend: slackBackend, Subject: "h-alice"}
 	rec := &SessionRecord{Tasks: []TaskRef{{ID: "task-1", Requester: &alice}}}
-	if !mayStop(rec, gchatBackend, TaskRequester{Backend: gchatBackend, Subject: "h-other"}) {
+	if !mayStop(rec, discordBackend, TaskRequester{Backend: discordBackend, Subject: "h-other"}) {
 		t.Error("the gate held a backend it does not cover")
 	}
 	if !mayStop(&SessionRecord{}, slackBackend, TaskRequester{Backend: slackBackend, Subject: "h-other"}) {

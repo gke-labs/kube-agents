@@ -1362,12 +1362,13 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		// chattext.IsStatusQuery is a phrase set, so a real question such
 		// as "how is the deploy doing" still starts a task.
 		g.post(rec.Key, topLevelNothingRunningNotice)
-	case stopping && isSlackStop(msg, backend) &&
+	case stopping && isStopPress(msg, backend) &&
 		!mayStop(rec, backend, TaskRequester{Backend: backend, Subject: requesterSubject(g.ps, backend, msg.AuthorID)}):
-		// Only the people who asked for work in a Slack thread may press
-		// its Stop button (stopgate.go). Anyone else's press cancels
-		// nothing and posts nothing. A typed `stop` keeps the rule below.
-		g.log.Info("slack stop refused: not a requester in this conversation", "conversation", rec.Key)
+		// Only the people who asked for work in a thread may press its Stop
+		// button, Slack's native one or the one drawn on Google Chat
+		// (stopgate.go). Anyone else's press cancels nothing and posts
+		// nothing. A typed `stop` keeps the rule below.
+		g.log.Info("stop press refused: not a requester in this conversation", "backend", backend, "conversation", rec.Key)
 	case stopping && isSlackStop(msg, backend) && g.cardStopWanted(rec, msg):
 		g.slackStop(ctx, rec, authority, backend)
 	case stopping && isChatStopPress(msg, backend) && msg.TaskID != "" && (active == nil || active.TaskID != msg.TaskID):

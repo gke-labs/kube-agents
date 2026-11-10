@@ -7,9 +7,11 @@ import (
 )
 
 // Google Chat's Stop button (gchat_stop.go) answers on the task's own line,
-// as Slack's answers with one reply of its own (slack_stop.go): a press
-// sends the cancel a typed stop sends, quietly (no "cancel sent" post, and
-// no "canceled" notice from the relay, TaskRef.QuietCancel), and edits the
+// as Slack's answers with one reply of its own (slack_stop.go). Both take a
+// press from a requester of the thread alone (stopgate.go); a press that
+// reaches here passed that gate. A press sends the cancel a typed stop
+// sends, quietly (no "cancel sent" post, and no "canceled" notice from the
+// relay, TaskRef.QuietCancel), and edits the
 // line to cancelSentNotice with the Stop control gone, so the line a person
 // pressed is the one that answers. The relay leaves the line so
 // (ActiveTask.LineClosed) until its terminal edit makes it "canceled". A
