@@ -700,24 +700,32 @@ func (p *BusStreamPoller) busSettled(ctx context.Context, agent *agentv1alpha1.P
 		sts.Status.CurrentRevision == sts.Status.UpdateRevision, nil
 }
 
-// scrapeServers reads the bus pods whose exporter is ready. A pod counts only
-// when the bus StatefulSet controls it (by UID), it runs the StatefulSet's
-// current revision, and it isn't on the host network: the label the list
-// selects by is one any pod in the namespace can carry, and what a pod serves
-// on the port decides whether the operator deletes the provision Job and
-// restarts the gateway pods. At most one reading per replica is kept. A pod
-// that can't be read gives no reading, which the verdict doesn't count.
+// scrapeServers reads each bus server's exporter. The pods are read by the
+// names the StatefulSet gives them, <name>-0 to <name>-(replicas-1), one per
+// ordinal, rather than listed by label: the label is one any pod in the
+// namespace can carry, and what a pod serves on the port decides whether the
+// operator deletes the provision Job and restarts the gateway pods. A name
+// can't be shared, so no other pod can stand in for a server or crowd one out.
+// A pod also counts only when the StatefulSet controls it (by UID), it runs
+// the StatefulSet's current revision, and it isn't on the host network. A pod
+// that is missing or can't be read gives no reading, which the verdict doesn't
+// count.
 func (p *BusStreamPoller) scrapeServers(ctx context.Context, agent *agentv1alpha1.PlatformAgent, sts *appsv1.StatefulSet) []busServerReading {
 	log := logf.FromContext(ctx).WithName(busStreamsPollerLogName)
-	var pods corev1.PodList
-	if err := p.r.podReader().List(ctx, &pods, client.InNamespace(agent.Namespace),
-		client.MatchingLabels{"app": a2aNATSName(agent)}); err != nil {
-		log.Error(err, "failed to list the A2A bus pods", "platformagent", client.ObjectKeyFromObject(agent))
-		return nil
+	replicas := int32(1)
+	if sts.Spec.Replicas != nil {
+		replicas = *sts.Spec.Replicas
 	}
 	var readings []busServerReading
-	for i := range pods.Items {
-		pod := &pods.Items[i]
+	for ordinal := int32(0); ordinal < replicas; ordinal++ {
+		pod := &corev1.Pod{}
+		name := fmt.Sprintf("%s-%d", sts.Name, ordinal)
+		if err := p.r.podReader().Get(ctx, types.NamespacedName{Namespace: sts.Namespace, Name: name}, pod); err != nil {
+			if !apierrors.IsNotFound(err) {
+				log.Error(err, "failed to read an A2A bus pod", "pod", name)
+			}
+			continue
+		}
 		if owner := metav1.GetControllerOf(pod); owner == nil || owner.UID != sts.UID {
 			continue
 		}
@@ -726,9 +734,6 @@ func (p *BusStreamPoller) scrapeServers(ctx context.Context, agent *agentv1alpha
 		}
 		if pod.DeletionTimestamp != nil || pod.Status.PodIP == "" || !usageContainerReady(pod, a2aNATSExporterContainerName) {
 			continue
-		}
-		if len(readings) >= int(sts.Status.Replicas) {
-			break
 		}
 		port, ok := usagePodPort(pod, a2aNATSExporterContainerName, a2aNATSMetricsPortName)
 		if !ok {

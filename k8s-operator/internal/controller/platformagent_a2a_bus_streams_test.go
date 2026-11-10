@@ -695,6 +695,8 @@ func TestOnlyTheBusStatefulSetsOwnPodsAreRead(t *testing.T) {
 		{"controlled by another StatefulSet", func(pod *corev1.Pod) { pod.OwnerReferences[0].UID = "other" }},
 		{"an old revision", func(pod *corev1.Pod) { pod.Labels[appsv1.ControllerRevisionHashLabelKey] = "r0" }},
 		{"on the host network", func(pod *corev1.Pod) { pod.Spec.HostNetwork = true }},
+		// Owner, revision and all copied: only the name gives it away.
+		{"a copy under another name", func(*corev1.Pod) {}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			agent := busStreamsAgent(1)
