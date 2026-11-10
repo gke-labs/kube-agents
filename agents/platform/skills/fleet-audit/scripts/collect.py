@@ -8,7 +8,7 @@ docs/designs/fleet-audit-collector-manifest.md, which `audit_report.py finish
 
 **Scope: three streams' check tables in full.** `obtainability-audit`'s
 twenty-four-check roster (§3.1–§3.24 of `governance/obtainability_audit_sop.md`),
-`compliance-audit`'s seventeen-check roster (§2.1–§2.17 of
+`compliance-audit`'s eighteen-check roster (§2.1–§2.18 of
 `governance/compliance_audit_sop.md`), and `ai-security-audit`'s six-check
 roster (§3.1–§3.6 of `governance/ai_security_audit_sop.md`). Every check the
 three SOPs define is mechanical — none needed a `needs_triage` judgment call
@@ -70,6 +70,7 @@ import datetime
 import errno
 import functools
 import hashlib
+import importlib
 import ipaddress
 import json
 import math
@@ -4329,7 +4330,7 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
 
 
 # --------------------------------------------------------------------------- #
-# compliance-audit: all seventeen checks of §2.
+# compliance-audit: all eighteen checks of §2.
 #
 # Unlike obtainability's Deployment/StatefulSet/DaemonSet templates, this
 # stream's workload dump includes bare Pods (owned ones excluded — audit the
@@ -7675,6 +7676,149 @@ def check_configsync_reconciler_stalled(context: dict) -> list[dict]:
     return sorted(hits, key=lambda h: (h["namespace"], h["object"]))
 
 
+# §2.18 `webhook-backend-unreachable`: a fail-closed admission webhook whose
+# backend the API server cannot reach. The predicate is the upgrade readiness
+# report's (`backend_problem` in the fleet-upgrade-verification skill: the
+# Service is missing, has no port equal to the webhook's, or has no ready
+# endpoint behind that port), imported from that skill's `scripts/`, which the
+# image and the repository lay out beside this one (`patch_readiness.py` reaches
+# the same directory for 3.11's reporter). The readiness report grades such a
+# webhook only when its rules reach the upgrade's path; this check names every
+# one, because a fail-closed webhook with a dead backend refuses every request
+# its rules match today, and a config-management system is the first caller to
+# find out. Both reads are best-effort, like `ccnp` above: a cluster whose
+# identity cannot list webhook configurations or EndpointSlices keeps its
+# other seventeen checks, and this one reads `Undetermined` there.
+WEBHOOK_DUMP_KINDS = "validatingwebhookconfigurations,mutatingwebhookconfigurations"
+ENDPOINTSLICE_DUMP_KINDS = "endpointslices"
+UPGRADE_READINESS_SCRIPTS = Path(__file__).resolve().parents[2] / "fleet-upgrade-verification" / "scripts"
+UPGRADE_READINESS_MODULE = "upgrade_readiness"
+# admissionregistration.k8s.io/v1 defaults `failurePolicy` to Fail: an absent
+# field reads as Fail, as the API server reads it.
+WEBHOOK_FAILURE_POLICY_FAIL = "Fail"
+# The namespaces whose writes a dead fail-closed webhook hurts most, judged for
+# severity: the platform's own controllers (`kube-system`) and the
+# config-management system (Config Sync's `config-management-system`). A webhook
+# whose `namespaceSelector` is absent, empty, or admits either is `critical`;
+# one that reaches neither is `major`, a real outage for whatever it does gate.
+# Each is judged on the Namespace object the read returned, or on the name label
+# every namespace carries when the read returned none (`config-management-system`
+# is absent on a cluster without Config Sync, and a selector on its name must
+# still read the way it would once it exists).
+WEBHOOK_SEVERITY_NAMESPACES = ("kube-system", "config-management-system")
+WEBHOOK_SEVERITY_REACHES = "critical"
+WEBHOOK_SEVERITY_OFF_PATH = "major"
+NAMESPACE_NAME_LABEL = "kubernetes.io/metadata.name"
+_GKE_COMPONENT_ANNOTATION = "components.gke.io/component-name"
+_WEBHOOK_RULE_CORE_GROUP = "core"
+_WEBHOOK_HIT_JOIN = " | "
+_IMPACT_WEBHOOK_BACKEND_UNREACHABLE = (
+    "This admission webhook fails closed and the API server cannot reach its backend, so "
+    "every request its rules match is refused until the backend answers again. A "
+    "config-management system or a controller that writes a matching object cannot apply, "
+    "and the cluster drifts from its repository while every object reads healthy."
+)
+
+
+@functools.lru_cache(maxsize=1)
+def _upgrade_readiness():
+    """The fleet-upgrade-verification skill's readiness module, imported once from the
+    `scripts/` directory beside this skill's. Imported on first use so this module's own
+    import stays as it was; a missing sibling raises ImportError to the caller, which
+    records the check as unevaluated rather than failing the cluster closed."""
+    scripts_dir = str(UPGRADE_READINESS_SCRIPTS)
+    if scripts_dir not in sys.path:
+        sys.path.append(scripts_dir)
+    return importlib.import_module(UPGRADE_READINESS_MODULE)
+
+
+def _webhook_rules_text(rules: list[dict]) -> str:
+    parts = []
+    for rule in rules:
+        groups = ",".join(g or _WEBHOOK_RULE_CORE_GROUP for g in rule.get("apiGroups") or ["*"])
+        resources = ",".join(rule.get("resources") or ["*"])
+        operations = "/".join(rule.get("operations") or ["*"])
+        parts.append(f"{operations} {resources} in {groups}")
+    return "; ".join(parts)
+
+
+def _webhook_severity_namespaces(context: dict) -> dict[str, dict]:
+    by_name: dict[str, dict] = {}
+    for item in context.get("namespaces") or []:
+        meta = item.get("metadata") or {}
+        name = meta.get("name", "")
+        by_name[name] = {**(meta.get("labels") or {}), NAMESPACE_NAME_LABEL: name}
+    return {name: by_name.get(name, {NAMESPACE_NAME_LABEL: name}) for name in WEBHOOK_SEVERITY_NAMESPACES}
+
+
+def check_webhook_backend_unreachable(context: dict) -> list[dict]:
+    """Cluster-scoped: a fail-closed admission webhook whose backend the API server cannot reach.
+
+    One hit per configuration, since the finding id is (check, cluster, namespace,
+    object): the excerpt names each failing webhook of it, its backend problem, its
+    rules, and whether its selector admits the severity namespaces. Skipped: a webhook
+    with `failurePolicy: Ignore` (admission skips it in silence; #4960 is that shape), one
+    whose backend is a URL (its reachability is not readable from the cluster), one with
+    no rules (the server never calls it), and a configuration carrying GKE's add-on
+    label or component annotation (the universal suppressions, which the webhook
+    configurations of GKE's own operators carry).
+    """
+    configurations = context.get("webhook_configurations") or []
+    if not configurations:
+        # Nothing to judge, and the one state the collector leaves when a read
+        # or the import failed (the check is then unevaluated): import nothing.
+        return []
+    readiness = _upgrade_readiness()
+    services = context.get("services") or []
+    slices = context.get("endpointslices") or []
+    severity_labels = _webhook_severity_namespaces(context)
+    hits = []
+    for config in configurations:
+        meta = config.get("metadata") or {}
+        if _ADDON_MANAGER_MODE_LABEL in (meta.get("labels") or {}):
+            continue
+        if (meta.get("annotations") or {}).get(_GKE_COMPONENT_ANNOTATION):
+            continue
+        lines, reaches = [], False
+        for hook in config.get("webhooks") or []:
+            if not isinstance(hook, dict):
+                continue
+            if hook.get("failurePolicy", WEBHOOK_FAILURE_POLICY_FAIL) != WEBHOOK_FAILURE_POLICY_FAIL:
+                continue
+            rules = [rule for rule in hook.get("rules") or [] if isinstance(rule, dict)]
+            if not rules:
+                continue
+            service_ref = (hook.get("clientConfig") or {}).get("service")
+            if not isinstance(service_ref, dict):
+                continue
+            problem = readiness.backend_problem(service_ref, services, slices)
+            if problem is None:
+                continue
+            admitted = [ns for ns, labels in severity_labels.items() if readiness.namespace_selector_reaches(hook, labels)]
+            reaches = reaches or bool(admitted)
+            reach = (
+                f"its namespaceSelector admits {', '.join(admitted)}"
+                if admitted
+                else f"its namespaceSelector admits neither {' nor '.join(WEBHOOK_SEVERITY_NAMESPACES)}"
+            )
+            lines.append(
+                f"{hook.get('name', '')}: failurePolicy Fail and {problem}; rules: {_webhook_rules_text(rules)}; {reach}"
+            )
+        if not lines:
+            continue
+        hits.append(
+            {
+                "namespace": "",
+                "object": f"{config.get('kind', '')}/{meta.get('name', '')}",
+                "excerpt": _WEBHOOK_HIT_JOIN.join(lines),
+                "severity": WEBHOOK_SEVERITY_REACHES if reaches else WEBHOOK_SEVERITY_OFF_PATH,
+                "reconciler": reconciler_of(meta),
+                "release": release_of(meta),
+            }
+        )
+    return hits
+
+
 COMPLIANCE_CHECKS: tuple[CheckSpec, ...] = (
     CheckSpec(
         "privileged-container",
@@ -7849,6 +7993,14 @@ COMPLIANCE_CHECKS: tuple[CheckSpec, ...] = (
         "something else, and every pull request merged for this cluster -- "
         "including a remediation this audit proposes -- changes nothing on it "
         "until the reconciler is unblocked.",
+    ),
+    CheckSpec(
+        "webhook-backend-unreachable",
+        "cluster",
+        check_webhook_backend_unreachable,
+        "critical",  # overridden per hit: major when the selector reaches no severity namespace
+        None,
+        _IMPACT_WEBHOOK_BACKEND_UNREACHABLE,
     ),
 )
 
@@ -8078,6 +8230,7 @@ _COMPLIANCE_CHECK_SOURCES: dict[str, tuple[str, ...]] = {
     "kcc-object-wedged": ("kcc",),
     "configsync-reconciler-stalled": ("configsync",),
     "lb-world-open": ("services",),
+    "webhook-backend-unreachable": ("webhooks", "services", "endpointslices"),
 }
 
 # The category Config Connector registers across every CRD it installs.
@@ -8315,6 +8468,52 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
         raise GateFailure(f"Service dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
     context["services"] = parsed.get("items", []) or []
     commands["lb-world-open"] = _record(paged_text(SERVICE_DUMP_KINDS), result)
+
+    # §2.18's two reads, best-effort like `ccnp` below: both APIs exist on
+    # every cluster, but an identity that cannot list them must not cost the
+    # cluster its other seventeen checks. A failed read leaves the check
+    # `Undetermined` on this cluster; the same disposition when the sibling
+    # skill's predicate cannot be imported, which is a packaging fault, not a
+    # clean cluster. The Services the check joins against are the read above.
+    context["webhook_configurations"], context["endpointslices"] = [], []
+    webhook_reads: list[tuple[str, dict | None, Run]] = []
+    for kinds in (WEBHOOK_DUMP_KINDS, ENDPOINTSLICE_DUMP_KINDS):
+        parsed, result = paged(kinds)
+        webhook_reads.append((kinds, parsed, result))
+    webhook_reason = ""
+    for kinds, parsed, result in webhook_reads:
+        if parsed is None:
+            stderr = result.stderr.strip()[:ERROR_EXCERPT_CHARS] or "no stderr"
+            webhook_reason = (
+                f"{UNDETERMINED_PREFIX} `kubectl get {kinds}` exited {result.rc} ({stderr}), so "
+                "whether a fail-closed webhook has a reachable backend was not established. "
+                "This check cleared nothing on this cluster."
+            )
+            break
+    if not webhook_reason:
+        try:
+            _upgrade_readiness()
+        except ImportError as exc:
+            webhook_reason = (
+                f"{UNDETERMINED_PREFIX} the readiness module this check reads its predicate from "
+                f"could not be imported ({exc}), so no webhook was judged. This check cleared "
+                "nothing on this cluster."
+            )
+    if webhook_reason:
+        context.setdefault("unevaluated", {})["webhook-backend-unreachable"] = webhook_reason
+    else:
+        context["webhook_configurations"] = webhook_reads[0][1].get("items", []) or []
+        context["endpointslices"] = webhook_reads[1][1].get("items", []) or []
+        commands["webhook-backend-unreachable"] = _record(
+            "; ".join(paged_text(kinds) for kinds, _, _ in webhook_reads),
+            Run(
+                [],
+                0,
+                "".join(result.stdout for _, _, result in webhook_reads),
+                "",
+                sum(result.duration_s for _, _, result in webhook_reads),
+            ),
+        )
 
     # A deliberate exception to "every read above raises": Dataplane V2's
     # `ClusterNetworkPolicy` CRD (§2.6's Do-NOT-flag case, `kubectl get ccnp

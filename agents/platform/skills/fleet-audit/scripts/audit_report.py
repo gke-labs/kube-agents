@@ -180,6 +180,7 @@ AUDITS: dict[str, AuditSpec] = {
             "lb-world-open",
             "anonymous-rbac-binding",
             "configsync-reconciler-stalled",
+            "webhook-backend-unreachable",
         ),
         # The two compliance checks that judge a posture an owner may choose:
         # a namespace that talks to nothing and so carries no NetworkPolicy
@@ -1176,6 +1177,7 @@ CHECK_PHRASES = {
     "lb-world-open": "{object} is a load balancer open to the internet",
     "anonymous-rbac-binding": "{object} grants access to anonymous users",
     "configsync-reconciler-stalled": "{object} is stuck in Config Sync",
+    "webhook-backend-unreachable": "{object} is a fail-closed webhook with no reachable backend",
     # Upgrade & Patch Readiness Audit
     "master-behind": "control plane is behind its release channel",
     "pool-skew": "{object} node pool lags the control plane",

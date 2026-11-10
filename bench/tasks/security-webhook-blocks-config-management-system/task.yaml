@@ -1,24 +1,21 @@
 # Security, Workload Identity, RBAC and CVEs (compliance-audit): the planted
 # ValidatingWebhookConfiguration has failurePolicy Fail and a backend the API
 # server cannot reach (its clientConfig.service names a Service that does not
-# exist), and no compliance check reads an admission webhook configuration.
-# A declared gap: expected_fail until the check lands
-# (gke-labs/kube-agents#5335). What the fixture plants versus the
-# customer failure: the fixture plants a fail-closed webhook on an inert API
-# group, scoped by selector to a bench label, whose backend Service does not
-# exist; the customer failure is the same fail-closed webhook on real
-# resources with no system-namespace exemption, which refuses every write
-# the config-management system makes. The plant's rule and selectors are
-# inert by design (the suite's fixture rules in bench/README.md), so the
-# check this case waits for reads backend reachability of any fail-closed
-# webhook, with the rules' reach as severity, never as the trigger. A check
-# that reads only the namespaceSelector exemption does not flip this case:
-# the planted selector excludes the system namespaces by construction.
+# exist). Check 2.18 (`webhook-backend-unreachable`) names it; the case was a
+# declared gap until that check landed (gke-labs/kube-agents#5335). What the
+# fixture plants versus the customer failure: the fixture plants a fail-closed
+# webhook on an inert API group, scoped by selector to a bench label, whose
+# backend Service does not exist; the customer failure is the same fail-closed
+# webhook on real resources with no system-namespace exemption, which refuses
+# every write the config-management system makes. The plant's rule and
+# selectors are inert by design (the suite's fixture rules in bench/README.md),
+# so the check reads backend reachability of any fail-closed webhook, with the
+# rules' reach as severity (`major` here: the selector admits neither
+# kube-system nor config-management-system), never as the trigger.
 id: security-webhook-blocks-config-management-system
 name: "Fail-Closed Admission Webhook Whose Backend Service Does Not Exist (webhook backend reachability check)"
 domain: security
 suite: certification
-expected_fail: true
 audit_streams:
   - compliance-audit
 fixtures: []
