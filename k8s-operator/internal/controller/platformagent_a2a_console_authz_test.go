@@ -250,7 +250,7 @@ func TestConsoleGrantOnARealServer(t *testing.T) {
 // inbox are refused.
 func TestConsoleMCPOffTheConfirmDoorOnARealServer(t *testing.T) {
 	creds := a2aFullCreds("d", "1")
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 	s, log := a2aStartRenderedServer(t, conf)
 	a2aProvisionLikeTheScript(t, s.ClientURL(), string(creds.Data["seed-password"]))
 	mcp, _ := a2aConnectAs(t, s.ClientURL(), a2aConsoleMCPUser, string(creds.Data[a2aConsoleMCPPasswordKey]))

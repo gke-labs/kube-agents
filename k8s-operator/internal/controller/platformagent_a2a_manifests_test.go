@@ -832,7 +832,7 @@ func TestBuildA2ANATSConfigConsoleUser(t *testing.T) {
 // confirm is the one way a task is granted the permit to make a change.
 // Pinned EXACTLY, for console's reason.
 func TestBuildA2ANATSConfigConsoleMCPUser(t *testing.T) {
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 
 	start := strings.Index(conf, "user: "+a2aConsoleMCPUser+"\n")
 	if start < 0 {
