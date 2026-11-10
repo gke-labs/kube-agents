@@ -28,6 +28,17 @@
 # that cluster's recorded name, so an answer that names it in full passes
 # the same as one that says seeded-b.
 #
+# The prompt names the project as well as the cluster, in the words
+# chat-tabular-answer-keeps-its-table uses ("in project {{PROJECT_ID}}";
+# the runner substitutes the placeholder in the prompt, bench/CUSTOM-TASKS.md
+# "Placeholders"). A CI pool project has one seeded-b, but an install whose
+# scope spans many pool projects has one per project: on such an install
+# (gkedemos, 41 projects) the front door answered an unqualified ask with
+# "which GCP project's seeded-b cluster did you mean?" and filed no card.
+# The question back is forbidden below in both of its forms, cluster and
+# project, so a run that stalls on it is red rather than vacuously green on
+# the no-command check.
+#
 # The check reads the worker's own finding: the delivered result up to the
 # first "Evidence for verified claims" header. That section is
 # kanban_complete's, not the worker's (deploy/docker/patches/
@@ -55,15 +66,17 @@
 id: chat-voice-absent-answer-quotes-no-command
 name: A presence answer names the missing namespace and the cluster, not the command that showed it
 prompt: >-
-  Is there a namespace called ledger-archive on the seeded-b cluster?
+  Is there a namespace called ledger-archive on the seeded-b cluster in
+  project {{PROJECT_ID}}?
 expected_output: >-
-  The front door files a card for seeded-b's Cluster Agent and acks it. The
-  answer that comes back is one line saying there is no namespace
+  The front door files a card for the Cluster Agent of seeded-b in the named
+  project and acks it, without asking which cluster or which project is
+  meant. The answer that comes back is one line saying there is no namespace
   ledger-archive on seeded-b, in words: it names the namespace and the
   cluster, and the finding itself carries no kubectl or gcloud command and
   no command fence. An evidence section kanban_complete renders below the
   finding, from the worker's verified_claims, is the tool's and may hold the
-  command. It does not ask which cluster is meant.
+  command.
 infrastructure:
   deployer: noop
 validated: false
@@ -87,7 +100,8 @@ verification_spec:
   # cluster by its recorded name or its short form, and a negation (the
   # text is lowercased before the patterns run; `n't` covers "isn't" and
   # "doesn't", and the apostrophe is normalized to the straight one). No
-  # question back about which cluster is meant.
+  # question back about which cluster, or which (GCP) project, is meant: the
+  # prompt names both.
   - name: the-answer-names-the-missing-namespace-and-the-cluster
     role: objective
     mode: assert
@@ -101,6 +115,7 @@ verification_spec:
         - '\b(?:no|not|none|absent|missing)\b|n''t\b'
       forbidden_patterns:
         - '(?i)\bwhich cluster\b'
+        - '(?i)\bwhich (?:gcp )?project\b'
       fixture_roles:
         - version-laggard
   # The defect: a command in the worker's own finding. `kubectl` is the one
