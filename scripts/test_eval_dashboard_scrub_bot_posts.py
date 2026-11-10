@@ -160,8 +160,36 @@ def issue(number, title, body, labels=("nightly-red",), user=BOT, pull_request=F
     return doc
 
 
-def comment(cid, body, user=BOT):
-    return {"id": cid, "html_url": f"https://github.com/gke-labs/kube-agents/issues/1#issuecomment-{cid}", "body": body, "user": user}
+def comment(cid, body, user=BOT, on=1):
+    return {"id": cid, "html_url": f"https://github.com/gke-labs/kube-agents/issues/{on}#issuecomment-{cid}", "body": body, "user": user,
+            "issue_url": f"https://api.github.com/repos/gke-labs/kube-agents/issues/{on}"}
+
+
+# The smoke-gate comment as gate_comment.py rendered it before the change
+# (the heading's count, the per-case table, the Reason line, the footer's
+# count) and as it renders it now.
+OLD_GATE_COMMENT = f"""\
+{gate_comment.MARKER}
+### ❌ Smoke gate: failed · 1 of 18 cases
+
+> 🟢 **Gate healthy.** `upgrades-lagging-master-probe` failed here and nothing on other PRs matches it yet; read the transcript. [Why this run failed →](https://storage.cloud.google.com/kube-agents-dashboards/evals/run.html#build=2098525469841297408)
+
+| Case | Result | Also failing on |
+| --- | --- | --- |
+| `upgrades-lagging-master-probe` | 0 / 3 reps | no other PR |
+
+Reason: `the-probe-identifies-the-version-lag: none of the alternative phrasings present`
+
+16 cases passed. Run 145 min on evals-23 · [build log](https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/1488/pull-kube-agents-smoke-test/2098525469841297408)
+"""
+CURRENT_GATE_COMMENT = f"""\
+{gate_comment.MARKER}
+### ❌ Smoke gate: failed
+
+> 🟢 **Gate healthy.** Part of what failed here matches nothing on other PRs yet; read the transcript. [Why this run failed →](https://storage.cloud.google.com/kube-agents-dashboards/evals/run.html#build=2098525469841297408)
+
+Run 145 min · [build log](https://console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/1488/pull-kube-agents-smoke-test/2098525469841297408)
+"""
 
 
 # The one percentage a coverage body may print is the roster's bar, a
@@ -183,12 +211,38 @@ class ConsoleLinkTest(unittest.TestCase):
 
 
 class GateCommentTest(unittest.TestCase):
-    def test_the_bots_gate_comment_is_deleted_and_nothing_else_is(self):
-        own = comment(7, gate_comment.MARKER + "\n### ❌ Smoke gate: failed\n3 of 3 reps")
-        self.assertEqual((scrub_bot_posts.plan_comment(own).verb, scrub_bot_posts.plan_comment(own).path), ("delete", "issues/comments/7"))
-        self.assertEqual(scrub_bot_posts.plan_comment(comment(8, gate_comment.MARKER + "\nquoted by a human", HUMAN)).verb, "skip")
+    def test_the_bots_old_gate_comment_on_a_closed_pull_request_is_deleted_and_nothing_else_is(self):
+        own = comment(7, OLD_GATE_COMMENT, on=1488)
+        action = scrub_bot_posts.plan_comment(own, frozenset({5004}))
+        self.assertEqual((action.verb, action.path), ("delete", "issues/comments/7"))
+        self.assertEqual(scrub_bot_posts.plan_comment(comment(8, OLD_GATE_COMMENT, HUMAN)).verb, "skip")
         self.assertEqual(scrub_bot_posts.plan_comment(comment(9, "LGTM")).verb, "skip")
         self.assertEqual(scrub_bot_posts.plan_comment(comment(9, "LGTM")).kind, scrub_bot_posts.KIND_OTHER)
+
+    def test_a_current_shape_comment_is_left_on_a_closed_pull_request(self):
+        action = scrub_bot_posts.plan_comment(comment(10, CURRENT_GATE_COMMENT, on=1488), frozenset())
+        self.assertEqual((action.verb, action.reason), ("skip", scrub_bot_posts.REASON_CURRENT))
+        # Every current wording template in gate_comment (the string constants with a
+        # space in them: the one-word ones are classify/health aliases and paths), its
+        # placeholders filled with a neutral word, reads as current, so the check follows
+        # the code; the old shapes do not.
+        class Neutral(dict):
+            def __missing__(self, key):
+                return "x"
+
+        templates = {name: value for name, value in vars(gate_comment).items() if name.isupper() and isinstance(value, str) and " " in value}
+        self.assertGreater(len(templates), 20)
+        for name, template in templates.items():
+            self.assertIsNone(scrub_bot_posts.OLD_GATE_COMMENT_RE.search(template.format_map(Neutral())), name)
+        for old in ("### ❌ Smoke gate: failed · 1 of 18 cases", "| Case | Result | Also failing on |", "| `x` | 0 / 3 reps | no other PR |", "Reason: `x`", "16 cases passed.",
+                    "`case-a`, `case-b` lost every repetition to infrastructure before the agent could be graded.",
+                    "`case-x` also failed every graded repetition here; read its transcript before retesting.",
+                    "**The run failed without a gate case failing all of its repetitions.**"):
+            self.assertIsNotNone(scrub_bot_posts.OLD_GATE_COMMENT_RE.search(old), old)
+
+    def test_a_comment_on_an_open_pull_request_is_left_whatever_its_shape(self):
+        action = scrub_bot_posts.plan_comment(comment(11, OLD_GATE_COMMENT, on=5004), frozenset({5004}))
+        self.assertEqual((action.verb, action.reason), ("skip", scrub_bot_posts.REASON_OPEN_PR))
 
 
 class NightlyIssueTest(unittest.TestCase):
@@ -330,8 +384,9 @@ class FakeRunner:
     """`gh api` as scrub_bot_posts reads it: the repository comments, the
     labelled issues and each issue's comments; every call recorded."""
 
-    def __init__(self, comments=(), issues=(), issue_comments=None):
+    def __init__(self, comments=(), issues=(), issue_comments=None, open_prs=()):
         self.comments, self.issues, self.issue_comments = list(comments), list(issues), issue_comments or {}
+        self.open_prs = list(open_prs)
         self.calls = []
 
     def __call__(self, argv, input=None, **kwargs):
@@ -348,6 +403,8 @@ class FakeRunner:
         elif "/issues?" in path:
             label = path.split("labels=")[1].split("&")[0]
             items = [i for i in self.issues if label in {lb["name"] for lb in i["labels"]}]
+        elif "/pulls?" in path:
+            items = [{"number": n} for n in self.open_prs]
         else:
             items = []
         start = (page - 1) * scrub_bot_posts.PAGE_SIZE
@@ -379,22 +436,29 @@ class ReadListTest(unittest.TestCase):
 class ApplyTest(unittest.TestCase):
     def setUp(self):
         self.runner = FakeRunner(
-            comments=[comment(7, gate_comment.MARKER + "\nred"), comment(8, "a human's")],
+            comments=[comment(7, OLD_GATE_COMMENT, on=1488), comment(8, "a human's"), comment(9, OLD_GATE_COMMENT, on=5004), comment(10, CURRENT_GATE_COMMENT, on=1500)],
+            open_prs=[5004],
             issues=[issue(3990, "Nightly: case-red fails every run, 3 nights in a row", OLD_RED_BODY), issue(1300, OLD_OUTAGE_TITLE, OLD_OUTAGE_BODY, labels=("presubmit-gate",))],
             issue_comments={3990: [comment(70, "<!-- kube-agents-bot:nightly-red-recovered case=case-red night=2026-10-18 -->\n`case-red` passed every graded repetition (3/3) on the 2026-10-18 nightly.")]},
         )
 
     def run_main(self, *args):
         out = io.StringIO()
-        with unittest.mock.patch.object(scrub_bot_posts.time, "sleep"), unittest.mock.patch("sys.stdout", out):
+        with unittest.mock.patch.object(scrub_bot_posts.time, "sleep") as sleep, unittest.mock.patch("sys.stdout", out):
             rc = scrub_bot_posts.main(list(args), gh_runner=self.runner)
+        self.sleep = sleep
         return rc, out.getvalue()
 
     def test_dry_run_prints_every_action_and_writes_nothing(self):
         rc, out = self.run_main()
         self.assertEqual(rc, 0)
         self.assertEqual(self.runner.writes(), [])
-        self.assertIn("would delete smoke-gate comment", out)
+        self.assertIn("would delete smoke-gate comment https://github.com/gke-labs/kube-agents/issues/1488#issuecomment-7", out)
+        self.assertIn(f"skip smoke-gate comment https://github.com/gke-labs/kube-agents/issues/5004#issuecomment-9: {scrub_bot_posts.REASON_OPEN_PR}", out)
+        self.assertIn(f"skip smoke-gate comment https://github.com/gke-labs/kube-agents/issues/1500#issuecomment-10: {scrub_bot_posts.REASON_CURRENT}", out)
+        self.assertIn(f"    1  smoke-gate comment: skip ({scrub_bot_posts.REASON_OPEN_PR})\n", out)
+        self.assertIn(f"    1  smoke-gate comment: skip ({scrub_bot_posts.REASON_CURRENT})\n", out)
+        self.assertIn("    1  smoke-gate comment: delete\n", out)
         self.assertIn("would edit nightly-red issue https://github.com/gke-labs/kube-agents/issues/3990\n  title: Nightly: case-red needs triage", out)
         self.assertIn("would edit outage issue", out)
         self.assertIn("would delete nightly issue comment", out)
@@ -402,15 +466,16 @@ class ApplyTest(unittest.TestCase):
         self.assertNotIn("a human's", out, "human posts are not listed")
 
     def test_live_performs_the_writes_paced_and_up_to_the_limit(self):
-        rc, out = self.run_main("--live", "--pace", "0", "--limit", "2")
+        rc, out = self.run_main("--live", "--pace", "0.5", "--limit", "2")
         self.assertEqual(rc, 0)
         self.assertEqual(self.runner.writes(), [("DELETE", "repos/gke-labs/kube-agents/issues/comments/7"), ("PATCH", "repos/gke-labs/kube-agents/issues/3990")])
         patched = next(body for m, p, body in self.runner.calls if m == "PATCH")
         self.assertEqual(patched["title"], "Nightly: case-red needs triage")
         self.assertIn("limit 2 reached", out)
+        self.assertEqual(self.sleep.call_args_list, [unittest.mock.call(0.5)], "one pause, between the two writes")
 
     def test_the_limit_is_checked_before_a_live_write_is_announced(self):
-        self.runner = FakeRunner(comments=[comment(i, gate_comment.MARKER + "\nred") for i in range(4)])
+        self.runner = FakeRunner(comments=[comment(i, OLD_GATE_COMMENT) for i in range(4)])
         rc, out = self.run_main("--live", "--pace", "0", "--limit", "2")
         self.assertEqual(rc, 0)
         self.assertEqual(len(self.runner.writes()), 2)
@@ -419,22 +484,37 @@ class ApplyTest(unittest.TestCase):
                          ["delete smoke-gate comment https://github.com/gke-labs/kube-agents/issues/1#issuecomment-0",
                           "delete smoke-gate comment https://github.com/gke-labs/kube-agents/issues/1#issuecomment-1"],
                          "exactly the two writes sent are announced; the third is not claimed")
-        self.assertIn("    2  delete smoke-gate comment", out)
+        self.assertIn("    2  smoke-gate comment: delete", out)
 
     def test_a_failed_write_is_counted_as_failed_and_three_in_a_row_stop_the_run(self):
         class Refusing(FakeRunner):
             def __call__(self, argv, input=None, **kwargs):
                 proc = super().__call__(argv, input, **kwargs)
                 return Proc("", returncode=1, stderr="HTTP 403") if argv[argv.index("-X") + 1] != "GET" else proc
-        many = [comment(i, gate_comment.MARKER + "\nred") for i in range(10)]
+        many = [comment(i, OLD_GATE_COMMENT) for i in range(10)]
         self.runner = Refusing(comments=many, issues=[issue(1300, OLD_OUTAGE_TITLE, OLD_OUTAGE_BODY, labels=("presubmit-gate",))])
         rc, out = self.run_main("--live", "--pace", "0")
         self.assertEqual(rc, 0)
         self.assertEqual(len(self.runner.writes()), scrub_bot_posts.MAX_CONSECUTIVE_FAILURES, "stopped after three failures in a row")
         self.assertIn("3 writes in a row failed", out)
-        self.assertIn("    3  failed smoke-gate comment", out)
-        self.assertNotIn("delete smoke-gate comment\n" + scrub_bot_posts.SUMMARY_HEADING, out)
+        self.assertIn("    3  smoke-gate comment: failed", out)
         self.assertNotIn(scrub_bot_posts.SUMMARY_HEADING, out, "no issue was edited, so none to list")
+
+    def test_failures_with_a_success_between_them_do_not_stop_the_run(self):
+        class Alternating(FakeRunner):
+            def __call__(self, argv, input=None, **kwargs):
+                proc = super().__call__(argv, input, **kwargs)
+                if argv[argv.index("-X") + 1] == "GET":
+                    return proc
+                return Proc("", returncode=1, stderr="HTTP 502") if int(argv[-1].rsplit("/", 1)[1]) % 2 else proc
+        many = [comment(i, OLD_GATE_COMMENT) for i in range(10)]
+        self.runner = Alternating(comments=many)
+        rc, out = self.run_main("--live", "--pace", "0")
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(self.runner.writes()), 10, "every write attempted: no three failed in a row")
+        self.assertIn("    5  smoke-gate comment: failed", out)
+        self.assertIn("    5  smoke-gate comment: delete", out)
+        self.assertNotIn("in a row failed", out)
 
     def test_a_dry_run_delete_never_reaches_gh(self):
         gh = ghcli.Gh("gke-labs/kube-agents", self.runner, dry_run=True)

@@ -11,7 +11,12 @@ BOT_MARKER and comment markers, coverage_gaps.MARKER, the outage title) and
 nothing else:
 
     a smoke-gate PR comment            -> deleted: the verdict lives in the
-                                          private bucket and the dashboard
+                                          private bucket and the dashboard;
+                                          one on an open pull request is
+                                          left (the next red tick rewrites
+                                          it, and the gate never reposts for
+                                          the same build), and so is one
+                                          already in the current shape
     a nightly-red or kept-case issue   -> title and body rewritten to what
                                           nightly_bugs.py renders now: the
                                           marker, domain and assignment
@@ -80,11 +85,12 @@ BOT_LOGINS = frozenset({"github-actions[bot]"})
 # comment listing starts here unless --since says otherwise.
 DEFAULT_SINCE = "2026-09-01T00:00:00Z"
 REPO_ENV = "GITHUB_REPOSITORY"
-# Live mode: the pause between two writes (GitHub's secondary limits allow
-# about 80 content-creating writes a minute and 500 an hour; two seconds
-# keeps a long run under both), and how many writes in a row may fail
-# before the run stops: a token without write access, or a rate limit,
-# fails every write the same way.
+# Live mode: the pause between two writes (two seconds respects GitHub's
+# secondary limit of about 80 content-creating writes a minute; the 500 an
+# hour is what --limit is for, a run of more than that is staged over
+# several), and how many writes in a row may fail before the run stops: a
+# token without write access, or a rate limit, fails every write the same
+# way.
 DEFAULT_PACE_S = 2.0
 MAX_CONSECUTIVE_FAILURES = 3
 # GitHub's largest page. The listings are read a page per call (``&page=N``)
@@ -96,6 +102,7 @@ PAGE_PARAM = "&page={page}"
 # REST paths, relative to the repository (ghcli.Gh.path prefixes it).
 COMMENTS_SINCE_PATH = "issues/comments?since={since}&sort=created&direction=asc&per_page=" + str(PAGE_SIZE)
 ISSUES_BY_LABEL_PATH = "issues?state=all&labels={label}&per_page=" + str(PAGE_SIZE)
+OPEN_PULLS_PATH = "pulls?state=open&per_page=" + str(PAGE_SIZE)
 ISSUE_COMMENTS_PATH = "issues/{number}/comments?per_page=" + str(PAGE_SIZE)
 ISSUE_PATH = "issues/{number}"
 COMMENT_PATH = "issues/comments/{comment_id}"
@@ -124,6 +131,22 @@ REASON_NO_MARKER = "no bot marker"
 REASON_UNPARSED = "could not read the old body: {what}"
 REASON_PULL_REQUEST = "a pull request, not an issue"
 REASON_BOT_COMMENT = "the bot's comment; the issue's nights list carries the dates and links"
+REASON_OPEN_PR = "open pull request; the next tick rewrites it"
+# What the smoke-gate comment carried before the change (gate_comment.py at
+# 9846f05c9: the heading "failed · N of M cases", the per-case table and its
+# "0 / 3 reps" cells, the "Reason:" line, the "N cases passed" footer, a
+# case id in backticks, and the repetition phrases "lost every repetition",
+# "failed every graded repetition" and "failing all of its repetitions")
+# and the current templates do not (the comment is caseless since #5066 and
+# says "could not be graded" / "went red on this run" since #5388): a comment
+# with none of these is current. The test sweeps every current template
+# against this pattern.
+OLD_GATE_COMMENT_RE = re.compile(
+    r"\d+ of \d+|\d+ / \d+|\d+/\d+|\bpassed\b|^\| Case \||^Reason:|`[a-z0-9][a-z0-9-]*`|every (graded )?repetition|lost every|all of its repetitions",
+    re.MULTILINE,
+)
+# A comment's issue_url ends in the pull request's (or issue's) number.
+ISSUE_NUMBER_RE = re.compile(r"/issues/(?P<number>\d+)$")
 
 # What the old bodies look like, from the templates before the change
 # (git show 9846f05c9:scripts/eval_dashboard/{nightly_bugs,coverage_gaps,gate_issue}.py).
@@ -245,13 +268,26 @@ def unchanged_or_edit(kind: str, payload: dict, path: str, title: str | None, bo
 # the smoke-gate PR comment
 
 
-def plan_comment(comment: dict) -> Action:
-    """A repository-wide issue comment: the smoke-gate comment is deleted."""
+def issue_number_of(comment: dict) -> int | None:
+    match = ISSUE_NUMBER_RE.search(comment.get("issue_url") or "")
+    return int(match["number"]) if match else None
+
+
+def plan_comment(comment: dict, open_prs: frozenset[int] = frozenset()) -> Action:
+    """A repository-wide issue comment: the bot's smoke-gate comment is
+    deleted, unless it sits on an open pull request (``open_prs``; the next
+    red tick rewrites it, and the gate never reposts for the same build) or
+    is already in the current shape (OLD_GATE_COMMENT_RE)."""
     path = COMMENT_PATH.format(comment_id=comment.get("id"))
-    if gate_comment.MARKER not in text_of(comment):
+    body = text_of(comment)
+    if gate_comment.MARKER not in body:
         return skip(KIND_OTHER, comment, REASON_NO_MARKER, path)
     if author_of(comment) not in BOT_LOGINS:
         return skip(KIND_GATE_COMMENT, comment, REASON_NOT_BOT, path)
+    if issue_number_of(comment) in open_prs:
+        return skip(KIND_GATE_COMMENT, comment, REASON_OPEN_PR, path)
+    if not OLD_GATE_COMMENT_RE.search(body):
+        return skip(KIND_GATE_COMMENT, comment, REASON_CURRENT, path)
     return Action(DELETE, KIND_GATE_COMMENT, path, comment.get("html_url") or "")
 
 
@@ -467,7 +503,8 @@ def read_list(gh: ghcli.Gh, suffix: str) -> list[dict]:
 
 
 def plan_all(gh: ghcli.Gh, since: str) -> list[Action]:
-    actions = [plan_comment(c) for c in read_list(gh, COMMENTS_SINCE_PATH.format(since=since))]
+    open_prs = frozenset(pull["number"] for pull in read_list(gh, OPEN_PULLS_PATH) if isinstance(pull.get("number"), int))
+    actions = [plan_comment(c, open_prs) for c in read_list(gh, COMMENTS_SINCE_PATH.format(since=since))]
     seen: set[int] = set()
     for label in ISSUE_LABELS:
         for issue in read_list(gh, ISSUES_BY_LABEL_PATH.format(label=label)):
@@ -492,11 +529,13 @@ def describe(action: Action, live: bool, show_bodies: bool) -> str:
     return text
 
 
-def apply(actions: list[Action], gh: ghcli.Gh, live: bool, pace_s: float = DEFAULT_PACE_S, limit: int | None = None, show_bodies: bool = False, sleep=time.sleep) -> dict:
+def apply(actions: list[Action], gh: ghcli.Gh, live: bool, pace_s: float = DEFAULT_PACE_S, limit: int | None = None, show_bodies: bool = False, sleep=None) -> dict:
     """Print every action; in live mode perform the writes, ``pace_s`` apart,
     at most ``limit`` of them, stopping after MAX_CONSECUTIVE_FAILURES in a
     row fail (ghcli logs each failure). Returns the counts per (kind, verb),
     a failed write under (kind, FAILED) rather than its verb."""
+    # Resolved here, not in the signature, so a test's patch of time.sleep is seen.
+    sleep = sleep or time.sleep
     counts: dict[tuple[str, str], int] = {}
     edited_issues: list[str] = []
     done = failed_in_a_row = 0
@@ -505,7 +544,8 @@ def apply(actions: list[Action], gh: ghcli.Gh, live: bool, pace_s: float = DEFAU
             continue
         if not action.is_write() or not live:
             print(describe(action, live, show_bodies))
-            counts[(action.kind, action.verb)] = counts.get((action.kind, action.verb), 0) + 1
+            key = (action.kind, f"{SKIP} ({action.reason})" if action.verb == SKIP else action.verb)
+            counts[key] = counts.get(key, 0) + 1
             if action.verb == EDIT:
                 edited_issues.append(action.url)
             continue
@@ -532,7 +572,7 @@ def apply(actions: list[Action], gh: ghcli.Gh, live: bool, pace_s: float = DEFAU
             print(f"{failed_in_a_row} writes in a row failed (the token's access, or a rate limit); stopping, the rest is left for the next run")
             break
     for (kind, verb), count in sorted(counts.items()):
-        print(f"{count:5d}  {verb:6s} {kind}")
+        print(f"{count:5d}  {kind}: {verb}")
     if edited_issues:
         print(SUMMARY_HEADING)
         for url in edited_issues:

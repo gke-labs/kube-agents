@@ -1167,7 +1167,9 @@ of about 80 content writes a minute and 500 an hour), `--limit` writes at most (
 `--since` bounding the repository-wide comment listing (default 2026-09-01), `--show-bodies`
 printing each edit's new body; it stops after three writes in a row fail. It plans one action
 per post from the post's own markers. Comments are deleted, issues are edited: the smoke-gate
-pull-request comments go (the verdict lives in the private bucket and on the dashboard), and
+pull-request comments go (the verdict lives in the private bucket and on the dashboard; one on
+an open pull request is left for the next red tick to rewrite, and so is one already in the
+current shape), and
 so do the bot's recovery and later-night comments on the nightly issues (an edited comment
 would keep its history, and the issue's nights list carries the dates and links); the
 nightly-red and kept-case issues are rewritten to the current templates with their run and
