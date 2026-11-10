@@ -1586,8 +1586,9 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 		// deleted next-mode agent leaks a 40Gi JetStream volume per server.
 		// Every ordinal the bus can have, not just the current replica count:
 		// claims can outlive their servers (a StatefulSet deleted with the
-		// CR's finalizer still pending, or one that predates the retention
-		// policy that deletes them on scale-down), so every ordinal is checked. Guarded by
+		// CR's finalizer still pending, or a scale-down, which keeps the claims
+		// it removes in this release: WhenScaled is Retain until #4225), so
+		// every ordinal is checked. Guarded by
 		// the instance label the claim template stamps, because a name is not
 		// ownership: a PVC squatting one of these names that this render did
 		// not create is left alone rather than destroyed.

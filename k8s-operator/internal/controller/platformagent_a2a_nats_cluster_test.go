@@ -1187,6 +1187,64 @@ func TestALoneClaimKeepsTheRecordedServerCount(t *testing.T) {
 	}
 }
 
+// With WhenScaled Retain, a single server scaled by hand to 3 keeps claims 1
+// and 2 after the scale is reverted. If the StatefulSet then goes, the record
+// still holds the bus at one server: read from the claims alone it would come
+// back as a cluster on server 0's standalone store, past the conversion gate.
+// With no claims left there is no bus, and the field (or the default) decides.
+func TestStrayClaimsDoNotOutvoteTheRecordedServerCount(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		recorded int32
+		claims   []int
+		spec     *int
+		want     int32
+	}{
+		{"one server, claims 0-2 from a hand scale", 1, []int{0, 1, 2}, nil, 1},
+		{"one server, claims 0-1 from a hand scale", 1, []int{0, 1}, nil, 1},
+		{"one server, claims 0-2, field asks 3", 1, []int{0, 1, 2}, ptr.To(3), 1},
+		{"three servers, claims 0-2", 3, []int{0, 1, 2}, nil, 3},
+		{"no record, claims 0-2", 0, []int{0, 1, 2}, nil, 3},
+		{"no record, claims 0-1", 0, []int{0, 1}, nil, 3},
+		{"one server recorded, no claims: a new bus", 1, nil, nil, 3},
+		{"one server recorded, no claims, field asks 1", 1, nil, ptr.To(1), 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := a2aTestAgent()
+			agent.Status.BusReplicas = tc.recorded
+			if tc.spec != nil {
+				agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: tc.spec}}
+			}
+			objs := []client.Object{agent}
+			labels := buildA2ANATSStatefulSet(agent, "h").Spec.VolumeClaimTemplates[0].Labels
+			for _, o := range tc.claims {
+				objs = append(objs, &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+					Name: a2aNATSDataClaimName(agent, o), Namespace: agent.Namespace, Labels: labels,
+				}})
+			}
+			rec := record.NewFakeRecorder(8)
+			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).Build(), Scheme: setupScheme(), Recorder: rec}
+			converting, err := r.resolveA2ABusReplicas(context.Background(), agent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if agent.Status.BusReplicas != tc.want || converting {
+				t.Errorf("status.busReplicas = %d converting = %v, want %d and no conversion", agent.Status.BusReplicas, converting, tc.want)
+			}
+			if tc.spec != nil && *tc.spec != int(tc.want) {
+				select {
+				case ev := <-rec.Events:
+					if !strings.Contains(ev, a2aBusConversionRefusedReason) {
+						t.Errorf("event %q, want the refusal", ev)
+					}
+				default:
+					t.Errorf("a field asking %d of a %d-server bus was not refused", *tc.spec, tc.want)
+				}
+			}
+		})
+	}
+}
+
 // Pods are not watched, so the short server's note follows its pod only if a
 // short bus requeues on a provisioned, Ready pass; and the note skips a pod
 // on its way out, which its successor replaces.

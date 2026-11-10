@@ -4672,11 +4672,12 @@ func a2aNATSReplicas(agent *agentv1alpha1.PlatformAgent) int {
 // shape the StatefulSet's template was rendered for. The live replica count
 // is never read: a StatefulSet scaled by hand, to any count, is a hand scale
 // the next apply reverts, not a new bus shape, so a scale between 1 and 3
-// cannot convert the bus past the gate. Failing a StatefulSet, the data
-// claims a bus left behind (a
-// StatefulSet deleted by hand keeps its claims, and the next one must come
-// back at their count, or it would convert them). The field decides only for a
-// bus that does not exist yet, and three when it is unset.
+// cannot convert the bus past the gate. Failing a StatefulSet, the record
+// again while the bus left data claims behind (a StatefulSet deleted by hand
+// keeps its claims, and the next one must come back at the bus's count, or it
+// would convert them), and with no record the count the claims imply. The
+// field decides only for a bus that does not exist yet, and three when it is
+// unset.
 //
 // A field that asks an existing bus for another count is refused unless
 // busConversionAllowed (which #4225 sets with the migration): the bus keeps
@@ -4713,17 +4714,22 @@ func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, age
 				return false, err
 			}
 		}
-		if running == 2 {
-			// Claims for ordinals 0 and 1 and not 2 are a three-server
-			// bus that lost one, not a two-server bus, which never existed.
-			running = 3
-		}
-		if running == 1 && agent.Status.BusReplicas == 3 {
-			// A cluster whose StatefulSet went before server 1 had its
-			// claim (OrderedReady creates them in turn) leaves the same
-			// lone claim as a single server; only the recorded count tells
-			// them apart. A flip to today clears it, so a bus coming back
-			// from today reads its claims.
+		switch {
+		case running != 0 && (recorded == 1 || recorded == 3):
+			// Claims left behind, and the count last resolved: the record,
+			// as with a StatefulSet. The claims alone can't tell a bus's
+			// shape: under WhenScaled Retain a single server scaled by hand
+			// to 3 keeps claims 1 and 2 after the scale is reverted, and a
+			// cluster whose StatefulSet went before server 1 had its claim
+			// (OrderedReady creates them in turn) leaves one claim, like a
+			// single server. With no claims there is no bus to keep, and
+			// the field decides below.
+			running = recorded
+		case running == 2:
+			// No record: claims for ordinals 0 and 1 and not 2 are a
+			// three-server bus that lost one, not a two-server bus, which
+			// never existed. A flip to today clears the record, so a bus
+			// coming back from today reads its claims.
 			running = 3
 		}
 	default:
