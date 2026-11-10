@@ -1678,7 +1678,7 @@ class TestRepoDerivedFacts(unittest.TestCase):
 
     def test_coverage_matches_domains_yaml(self):
         cov = collect.coverage()
-        self.assertEqual(cov["domains_total"], 13)
+        self.assertEqual(cov["domains_total"], 14)
         # 2026-09-22 (#1023): incident-triage-oom-event-probe, the non-tofu
         # probe, took a roster seat, closing the gap open since the tofu case
         # moved to the nightly tier on 2026-09-03 (#1202); the same day the
@@ -1706,9 +1706,11 @@ class TestRepoDerivedFacts(unittest.TestCase):
         # The canary took its roster line on 2026-11-02 (#2013 step 4, #4094),
         # covering fleet-audits, and monitoring-alert-policy-read took one the
         # same day (#4095), covering observability.
+        # harness-scale is a new row whose only case is parked until its
+        # fixture exists (#4896), so it starts on the allowlist.
         self.assertEqual(
             cov["uncovered"],
-            [],
+            ["harness-scale"],
         )
         self.assertEqual(cov["domains_covered"], cov["domains_total"] - len(cov["uncovered"]))
 

@@ -48,6 +48,17 @@ SANDBOX_IMAGE_TREES="${SANDBOX_IMAGE_TREES:-}"
 SANDBOX_MOUNTINFO="${SANDBOX_MOUNTINFO:-/proc/self/mountinfo}"
 IMAGE_TREES_READ_ONLY_MOUNTS="read-only-mounts"
 PREPARE_IMAGE_TREES_ARG="--prepare-image-trees"
+# The memory guard the image installs, and the pause before restarting it if
+# it exits.
+SHELL_MEMORY_GUARD="${SHELL_MEMORY_GUARD:-/usr/local/libexec/shell-memory-guard}"
+SHELL_MEMORY_GUARD_RESTART_SECONDS=5
+# What the kubectl admission (kubectl-admit.py) reads, root-owned so a session cannot
+# change it: the cost table's tier, the container's memory limit, and the state
+# directory every session user shares for its reservations.
+SANDBOX_KUBECTL_COST_TIER_FILE="/run/kube-agents-sandbox/kubectl-cost-tier"
+SANDBOX_MEMORY_LIMIT_FILE="/run/kube-agents-sandbox/memory-limit-bytes"
+SANDBOX_KUBECTL_ADMISSION_DIR="/run/kube-agents-sandbox/kubectl-admission"
+SANDBOX_KUBECTL_COST_TIER_DEFAULT="default"
 
 # The SQLite databases the agent pod keeps in each of those homes, which this
 # container has no copy of. Step 1b puts a directory at every one of them so a
@@ -774,6 +785,46 @@ if [ -n "${KUBE_PROXY_URL:-}" ] && id -u hermes >/dev/null 2>&1; then
   cp "$DATA/.kubeconfig" /home/hermes/.kube/config
   chown hermes:hermes /home/hermes/.kube/config
   chmod 0600 /home/hermes/.kube/config
+fi
+
+# The kubectl admission's inputs. The tier is a plain lowercase word or the
+# default (the operator already normalises it); the limit is the downward-API
+# figure, or nothing, and the admission then reads cgroup v2 memory.max. The
+# state directory is world-writable with the sticky bit, as /tmp is, so every
+# session user can book and release its own reservations and nobody else's.
+tier="${KUBEAGENTS_KUBECTL_COST_TIER:-$SANDBOX_KUBECTL_COST_TIER_DEFAULT}"
+case "$tier" in
+  # Character classes, not ranges: in some locales [a-z] also matches capitals.
+  [[:lower:]]*) case "$tier" in *[![:lower:][:digit:]-]*) tier="$SANDBOX_KUBECTL_COST_TIER_DEFAULT" ;; esac ;;
+  *) tier="$SANDBOX_KUBECTL_COST_TIER_DEFAULT" ;;
+esac
+printf '%s\n' "$tier" >"$SANDBOX_KUBECTL_COST_TIER_FILE"
+chmod 0644 "$SANDBOX_KUBECTL_COST_TIER_FILE"
+case "${SANDBOX_MEMORY_LIMIT_BYTES:-}" in
+  '' | *[!0-9]*) : >"$SANDBOX_MEMORY_LIMIT_FILE" ;;
+  *) printf '%s\n' "$SANDBOX_MEMORY_LIMIT_BYTES" >"$SANDBOX_MEMORY_LIMIT_FILE" ;;
+esac
+chmod 0644 "$SANDBOX_MEMORY_LIMIT_FILE"
+install -d -m 1777 "$SANDBOX_KUBECTL_ADMISSION_DIR" "$SANDBOX_KUBECTL_ADMISSION_DIR/reservations" \
+  "$SANDBOX_KUBECTL_ADMISSION_DIR/slots" "$SANDBOX_KUBECTL_ADMISSION_DIR/waiting"
+for state_file in ledger.lock events.log; do
+  : >"$SANDBOX_KUBECTL_ADMISSION_DIR/$state_file"
+  chmod 0666 "$SANDBOX_KUBECTL_ADMISSION_DIR/$state_file"
+done
+
+# The memory guard (shell-memory-guard.py), as root and before sshd, so the
+# sessions sshd starts cannot stop it. A loop restarts it if it ever exits;
+# without it one oversized command OOMKills the container and every session.
+# Not in the prepare step: that run exits before sshd starts.
+if [ -x "$SHELL_MEMORY_GUARD" ]; then
+  (
+    while true; do
+      python3 -I "$SHELL_MEMORY_GUARD" || log "shell memory guard exited with $?; restarting"
+      sleep "$SHELL_MEMORY_GUARD_RESTART_SECONDS"
+    done
+  ) &
+else
+  log "shell memory guard $SHELL_MEMORY_GUARD is missing; an oversized command can OOMKill this container"
 fi
 
 log "ready; starting $*"

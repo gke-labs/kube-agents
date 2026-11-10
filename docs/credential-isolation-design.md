@@ -123,9 +123,11 @@ cap on the profiles one Cluster Agent reconcile run creates, the `KUBEAGENTS_ROS
 roster count, the `CRON_IDLE_THROTTLE_DAYS` and `CRON_IDLE_HIBERNATE_DAYS` thresholds of the
 idle-install hold on model-run cron jobs, the `CRON_CATCH_UP_STAGGER_MINUTES` step of the
 catch-up policy on the same jobs, and the `KAGE_SLACK_UX` flag — but only as literal values; all `valueFrom` sources
-are rejected. One name goes to the shell Pod
+are rejected. Two names go to the shell Pod
 instead: `KUBEAGENTS_AUDIT_AUTO_PROMOTE`, the fleet audits' auto-promotion switch, which the
-operator normalises to `true` or `false` before it reaches that Pod. A name earns a
+operator normalises to `true` or `false`, and `KUBEAGENTS_KUBECTL_COST_TIER`, the column of the
+kubectl cost table the shell's admission charges, which the operator passes only as a short
+lowercase word, before either reaches that Pod. A name earns a
 place on that list only if an arbitrary value for it cannot redirect state,
 grant access, or run code the image does not already ship. The list is
 `safeSandboxEnvOverrides` in
@@ -296,17 +298,17 @@ than in the Pod's status.
 
 ## Credential Placement
 
-| Data                             | Sandbox                                                    | Credential runtime          |
-| -------------------------------- | ---------------------------------------------------------- | --------------------------- |
-| `spec.deployment.env`            | `KUBEAGENTS_AUDIT_AUTO_PROMOTE` only, as `true` or `false` | Yes                         |
-| Slack tokens                     | No                                                         | Yes, Secret-backed env      |
-| PlatformAgent external API key   | No                                                         | Yes, Secret-backed env      |
-| Session KV API key and HMAC salt | Yes, Secret-backed env                                     | Yes, API key only           |
-| Automatic KSA token mount        | Disabled                                                   | Disabled                    |
-| Explicit projected KSA token     | Broker audience only                                       | Read-only, one-hour token   |
-| gcloud/kubectl configuration     | No                                                         | Private `emptyDir`          |
-| GitHub installation token/cache  | No                                                         | Private `emptyDir`          |
-| Agent workspace                  | Yes                                                        | No, the broker owns its own |
+| Data                             | Sandbox                                                                                                            | Credential runtime          |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------------ | --------------------------- |
+| `spec.deployment.env`            | `KUBEAGENTS_AUDIT_AUTO_PROMOTE` as `true` or `false`, and `KUBEAGENTS_KUBECTL_COST_TIER` as a lowercase word, only | Yes                         |
+| Slack tokens                     | No                                                                                                                 | Yes, Secret-backed env      |
+| PlatformAgent external API key   | No                                                                                                                 | Yes, Secret-backed env      |
+| Session KV API key and HMAC salt | Yes, Secret-backed env                                                                                             | Yes, API key only           |
+| Automatic KSA token mount        | Disabled                                                                                                           | Disabled                    |
+| Explicit projected KSA token     | Broker audience only                                                                                               | Read-only, one-hour token   |
+| gcloud/kubectl configuration     | No                                                                                                                 | Private `emptyDir`          |
+| GitHub installation token/cache  | No                                                                                                                 | Private `emptyDir`          |
+| Agent workspace                  | Yes                                                                                                                | No, the broker owns its own |
 
 ### The loopback-only exception
 
@@ -1233,7 +1235,7 @@ needs the same treatment.
 CI and deployment tests should assert that:
 
 1. the sandbox has no `spec.deployment.env` (bar `KUBEAGENTS_AUDIT_AUTO_PROMOTE`,
-   normalised to `true` or `false`), secret volume, credential-state
+   normalised to `true` or `false`, and `KUBEAGENTS_KUBECTL_COST_TIER`, a lowercase word), secret volume, credential-state
    volume, and no Secret-backed env other than the two pod-scoped Session KV
    values named above — the assertion enumerates them, so a third one cannot
    be added without amending this list. The `platform-agent` container and the

@@ -232,6 +232,11 @@ logs=$(docker logs "$NAME" 2>&1)
 check "generated host keys on first start" "generating ed25519 host key" "$logs"
 check "reached exec" "ready; starting" "$logs"
 check "sshd is pid 1" "sshd" "$(docker exec "$NAME" ps -o comm= -p 1 2>&1)"
+# The memory guard runs as root beside sshd, and says on start whether it found a
+# limit (this container has none, so it reports itself disabled).
+check "the shell memory guard runs as root" "root" \
+  "$(docker exec "$NAME" ps -o user=,args= -C python3 2>&1 | grep shell-memory-guard)"
+check "the shell memory guard logged its start" '"component": "shell-memory-guard"' "$(docker logs "$NAME" 2>&1)"
 # From inside the container: the state directory is 0700 root:root, so listing it
 # from the host would fail for reasons unrelated to whether the keys are there.
 check "host keys landed on their volume" "ssh_host_ed25519_key" \

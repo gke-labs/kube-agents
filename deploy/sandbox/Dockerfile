@@ -123,7 +123,7 @@ RUN ARCH=$(dpkg --print-architecture) && \
       '    ;;' \
       '  esac' \
       'fi' \
-      'exec /usr/local/libexec/kubectl "$@"' \
+      'exec python3 -I /usr/local/libexec/kubectl-admit "$@"' \
       >/usr/local/bin/kubectl && \
     chmod 0755 /usr/local/bin/kubectl && \
     curl -sSLf --retry 5 --retry-all-errors -o /tmp/helm.tar.gz "https://get.helm.sh/helm-v3.15.2-linux-${ARCH}.tar.gz" && \
@@ -505,6 +505,17 @@ COPY --chmod=0755 deploy/sandbox/entrypoint.sh /usr/local/bin/sandbox-entrypoint
 # 0755: the model can run it and cannot rewrite it, which is the point, since
 # sshd runs it for every session that account opens.
 COPY --chmod=0755 deploy/sandbox/session-command.sh /usr/local/bin/sandbox-session-command
+# Started by the entrypoint as root before sshd: it stops the largest session
+# process when the container nears its memory limit, so one oversized command
+# fails instead of the container being OOMKilled with every session in it.
+# Root-owned under libexec, so a session can neither rewrite nor stop it.
+COPY --chmod=0755 deploy/sandbox/shell-memory-guard.py /usr/local/libexec/shell-memory-guard
+# The kubectl admission /usr/local/bin/kubectl execs: it charges a large `get` the
+# peak the cost table lists for it and refuses one the shell cannot hold, before
+# it starts. The table is profiled ahead of time
+# (.agents/skills/update-kubectl-cost-table); nothing is estimated at run time.
+COPY --chmod=0755 deploy/sandbox/kubectl-admit.py /usr/local/libexec/kubectl-admit
+COPY --chmod=0644 deploy/sandbox/kubectl-costs.json /usr/local/share/kube-agents/kubectl-costs.json
 
 # What the agent's shell actually reads and runs, staged at /opt/defaults for the
 # entrypoint to copy onto the volume (step 1a). Same two-part arrangement as the

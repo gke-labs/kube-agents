@@ -1319,6 +1319,11 @@ platformAgent:
     # opening remediation pull requests on their own; a `/remediate` on a
     # ledger still opens one. The operator forwards it to the shell sandbox,
     # where the audits run.
+    #
+    # KUBEAGENTS_KUBECTL_COST_TIER: the column of the shell's kubectl cost table
+    # (deploy/sandbox/kubectl-costs.json) its admission charges fleet-wide reads
+    # from; "fleet" for clusters of tens of thousands of Pods, unset for
+    # "default". Also forwarded to the shell sandbox only.
     env: []
     # The daily alert ceilings, one per bucket: critical, warning, info and
     # drift. Each key that you set becomes ALERT_DAILY_LIMIT_<KEY> in
