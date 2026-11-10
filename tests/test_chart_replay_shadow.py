@@ -46,7 +46,7 @@ _ON = (
 _PROXY = "inference-replay-shadow"
 # Every job kind the CI files under; tests/test_ci_replay_shadow.py holds the
 # other copies equal to this one.
-_JOB_KINDS = ("nightly", "nightly-untrusted", "presubmit")
+_JOB_KINDS = ("nightly", "nightly-untrusted", "presubmit", "replay-lane")
 _PROXY_CONTAINER = "replay-shadow-proxy"
 _LITELLM_CONTAINER = "litellm-container"
 _HELM_TIMEOUT_SECONDS = 120
@@ -278,7 +278,11 @@ class SchemaTest(unittest.TestCase):
     def test_every_kind_the_ci_files_under_renders_and_is_stamped(self):
         for kind in _JOB_KINDS:
             with self.subTest(kind=kind):
-                res = _render([*_ON, f"litellm.replayShadow.job.kind={kind}"], show_only="templates/litellm.yaml")
+                # The lane's kind renders only in replay mode, which takes both switches.
+                lane = ("litellm.replayShadow.mode=replay", "litellm.replayShadow.allowServe=true") \
+                    if kind == "replay-lane" else ()
+                res = _render([*_ON, f"litellm.replayShadow.job.kind={kind}", *lane],
+                              show_only="templates/litellm.yaml")
                 self.assertEqual(res.returncode, 0, res.stderr)
                 container = _find(_docs(res.stdout), "Deployment", _PROXY)["spec"]["template"]["spec"]["containers"][0]
                 self.assertEqual({e["name"]: e.get("value") for e in container["env"]}["REPLAY_JOB_KIND"], kind)
@@ -298,6 +302,91 @@ class SchemaTest(unittest.TestCase):
     def test_off_needs_neither(self):
         res = _render(["litellm.replayShadow.enabled=false"])
         self.assertEqual(res.returncode, 0, res.stderr)
+
+
+_RECORD = tuple(s for s in _ON if not s.startswith("litellm.replayShadow.job.kind")) + (
+    "litellm.replayShadow.job.kind=nightly", "litellm.replayShadow.mode=record")
+_REPLAY = tuple(s for s in _ON if not s.startswith("litellm.replayShadow.job.kind")) + (
+    "litellm.replayShadow.job.kind=replay-lane", "litellm.replayShadow.mode=replay",
+    "litellm.replayShadow.allowServe=true")
+_MODE_VARS = ("REPLAY_MODE", "REPLAY_CACHE_DIR", "REPLAY_ALLOW_SERVE")
+
+
+def _proxy_env(sets):
+    res = _render(sets, show_only="templates/litellm.yaml")
+    if res.returncode != 0:
+        raise AssertionError(res.stderr)
+    container = _find(_docs(res.stdout), "Deployment", _PROXY)["spec"]["template"]["spec"]["containers"][0]
+    return {e["name"]: e.get("value") for e in container["env"]}
+
+
+class ModesTest(unittest.TestCase):
+    """record and replay (values.yaml, replayShadow.mode): replay takes two switches; shadow is unchanged."""
+
+    def test_the_default_mode_renders_what_shadow_rendered_before_the_modes(self):
+        env = _proxy_env(_ON)
+        for name in _MODE_VARS:
+            self.assertNotIn(name, env)
+        self.assertEqual(env["REPLAY_DATA_MAX_BYTES"], "1610612736")
+        self.assertEqual(_proxy_env([*_ON, "litellm.replayShadow.mode=shadow"]), env)
+
+    def test_record_saves_under_the_cache_dir_and_never_serves(self):
+        env = _proxy_env(_RECORD)
+        self.assertEqual((env["REPLAY_MODE"], env["REPLAY_CACHE_DIR"]), ("record", "/data/replay-cache"))
+        self.assertNotIn("REPLAY_ALLOW_SERVE", env)
+        self.assertEqual(env["REPLAY_DATA_MAX_BYTES"], "1610612736", "the proxy counts the cache in the budget")
+
+    def test_replay_with_both_switches_serves(self):
+        env = _proxy_env(_REPLAY)
+        self.assertEqual((env["REPLAY_MODE"], env["REPLAY_ALLOW_SERVE"], env["REPLAY_JOB_KIND"]),
+                         ("replay", "yes", "replay-lane"))
+        self.assertEqual(env["REPLAY_DATA_MAX_BYTES"], "1073741824", "the seeded cache sits outside the budget")
+
+    def test_replay_without_allow_serve_or_allow_serve_without_replay_is_refused(self):
+        without = [s for s in _REPLAY if "allowServe" not in s]
+        alone = [*_ON, "litellm.replayShadow.allowServe=true"]
+        for sets in (without, [*without, "litellm.replayShadow.allowServe=false"], alone,
+                     [*_RECORD, "litellm.replayShadow.allowServe=true"]):
+            with self.subTest(sets=sets[-2:]):
+                res = _render(sets)
+                self.assertNotEqual(res.returncode, 0)
+                self.assertIn("/litellm/replayShadow", res.stderr)
+
+    def test_each_mode_is_held_to_its_job_kind(self):
+        for sets in ([*_RECORD, "litellm.replayShadow.job.kind=presubmit"],
+                     [*_REPLAY, "litellm.replayShadow.job.kind=nightly"],
+                     [*_REPLAY, "litellm.replayShadow.job.kind=presubmit"],
+                     [*_ON, "litellm.replayShadow.job.kind=replay-lane"]):
+            with self.subTest(sets=sets[-1]):
+                res = _render(sets)
+                self.assertNotEqual(res.returncode, 0)
+                self.assertIn("/litellm/replayShadow", res.stderr)
+
+    def test_the_cache_dir_is_one_directory_beside_logs_and_store(self):
+        for cache_dir in ("/data/logs", "/data/store", "/etc/cache", "/data/a/b", "/data/../x"):
+            with self.subTest(cache_dir=cache_dir):
+                res = _render([*_RECORD, f"litellm.replayShadow.cacheDir={cache_dir}"])
+                self.assertNotEqual(res.returncode, 0)
+                self.assertIn("/litellm/replayShadow/cacheDir", res.stderr)
+        self.assertEqual(_proxy_env([*_RECORD, "litellm.replayShadow.cacheDir=/data/answers"])["REPLAY_CACHE_DIR"],
+                         "/data/answers")
+
+    def test_an_unknown_mode_is_refused(self):
+        res = _render([*_ON, "litellm.replayShadow.mode=serve"])
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("/litellm/replayShadow/mode", res.stderr)
+
+
+class ModeValuesTextTest(unittest.TestCase):
+    """What values.yaml ships, read without helm: the default never serves."""
+
+    def test_the_defaults_are_shadow_and_no_serving(self):
+        values = yaml.safe_load((_CHART / "values.yaml").read_text())["litellm"]["replayShadow"]
+        self.assertEqual((values["mode"], values["allowServe"], values["cacheDir"]),
+                         ("shadow", False, "/data/replay-cache"))
+        cache_dir = re.search(r'readonly REPLAY_CACHE_POD_DIR="/data/\$\{REPLAY_CACHE_SUBDIR\}"', _CI_ENV.read_text())
+        self.assertIsNotNone(cache_dir, "hack/ci-env.sh sets the same cache directory the chart defaults to")
+        self.assertIn('readonly REPLAY_CACHE_SUBDIR="replay-cache"', _CI_ENV.read_text())
 
 
 class QuotaTest(unittest.TestCase):

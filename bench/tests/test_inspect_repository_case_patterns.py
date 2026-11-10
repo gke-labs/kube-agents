@@ -97,6 +97,13 @@ def test_no_clone_at_all_fails():
     assert not _passes("curl -s https://raw.githubusercontent.com/gke-labs/kube-agents/0.13.0/tags.env")
 
 
+def test_a_clone_chained_behind_an_exempt_grep_is_still_the_clone_run():
+    # A row with a chain on it is no lone grep, so the exemption leaves it
+    # whole and the clone behind the grep is credited.
+    assert _passes(f"grep -n clone SKILL.md && {CLONE_PUBLIC}")
+    assert _passes(f"grep -n clone SKILL.md; {CLONE_CONTEXT}")
+
+
 def test_a_quoted_path_or_a_continued_line_is_still_the_clone_run():
     # A quoted path is one word whichever quote it has. hermes joins a
     # backslash-newline with a space, so the row carries `\ clone`.

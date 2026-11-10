@@ -551,6 +551,22 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn("enable_drift_detector = true", content)
             self.assertNotIn("exported-project", content)
 
+    def test_tfvars_names_the_minter_key_to_adopt_and_to_share(self):
+        """MINTER_ADOPT_KEY (an explicitly named unlabelled key) and MINTER_SHARED_KEY reach lifecycle.sh (#3504)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = pathlib.Path(tmp) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "GITOPS_ORG": "o", "GITOPS_REPO": "r", "GITHUB_APP_ID": "7",
+                     "KMS_KEYRING": "ring", "KMS_KEY": "key", "MINTER_ADOPT_KEY": "ring/key",
+                     "MINTER_SHARED_KEY": "other-ring/other-key"},
+                describe_stub=_autopilot_describe_stub(),
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            content = dest.read_text()
+            self.assertIn('github_minter_adopt_unlabelled_kms_key = "ring/key"', content)
+            self.assertIn('github_minter_shared_kms_key = "other-ring/other-key"', content)
+
     # ── the web console switch ───────────────────────────────────────────────
 
     def test_tfvars_carries_the_web_console_switch(self):
@@ -787,6 +803,19 @@ class InstallerCommonTest(unittest.TestCase):
         self.assertIn("rc=1", proc.stdout, proc.stderr)
         self.assertIn("kubeagents-platform-gsa", proc.stderr)
         self.assertIn("PLATFORM_AGENT_GSA_NAME", proc.stderr)
+
+    def test_a_foreign_minter_gsa_is_named_by_its_owner(self):
+        """The minter GSA's description names the install that owns it (#3504)."""
+        stub = ('if [[ "$*" == *"value(description)"* ]]; then '
+                'echo "kube-agents GitHub token minter for install cluster-a/kubeagents-system"; fi; exit 0')
+        proc = self._run(
+            self._SHOW_REMEDY,
+            gcloud_exit=1,
+            sa_describe_stub=stub,
+            env={"TFVARS_ENABLE_GITHUB_MINTER": "true"},
+        )
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("Its description names its owner: kube-agents GitHub token minter for install cluster-a/kubeagents-system", proc.stderr)
 
     def test_service_account_ownership_stands_down_when_state_is_unreadable(self):
         # A transient GCS failure is not "no state": refusing on it would tell a
@@ -3011,6 +3040,89 @@ class InstallerCommonTest(unittest.TestCase):
         )
         self.assertIn("rc=0", proc.stdout, proc.stderr)
         self.assertIn("sub= rc=0", proc.stdout)
+
+    # The minter's per-install names (#3504).
+    _MINTER_STATE = [
+        {"module": "module.github_minter[0]", "mode": "managed", "type": "google_kms_key_ring",
+         "name": "minter", "instances": [{"attributes": {"name": "github-token-minter-keyring"}}]},
+        {"module": "module.github_minter[0]", "mode": "managed", "type": "google_kms_crypto_key",
+         "name": "minter", "instances": [{"attributes": {"name": "github-token-minter-key"}}]},
+        {"module": "module.github_minter[0]", "mode": "managed", "type": "google_service_account",
+         "name": "minter", "instances": [{"attributes": {"account_id": "kubeagents-github-minter-gsa"}}]},
+    ]
+
+    def test_minter_derived_names_follow_the_cluster(self):
+        proc = self._run('minter_derived_names ka-today-1')
+        self.assertEqual(proc.stdout.strip().split("|"),
+                         ["ka-today-1-minter-keyring", "ka-today-1-minter-key", "ka-today-1-minter"])
+
+    def test_a_long_cluster_name_still_gives_a_valid_distinct_gsa_id(self):
+        """A GSA id is 6-30 characters; two long names sharing a prefix stay apart."""
+        ids = []
+        for cluster in ("production-europe-west4-primary", "production-europe-west4-standby"):
+            gsa = self._run(f"minter_derived_names {cluster}").stdout.strip().split("|")[2]
+            self.assertRegex(gsa, r"^[a-z][-a-z0-9]{4,28}[a-z0-9]$")
+            ids.append(gsa)
+        self.assertNotEqual(ids[0], ids[1])
+
+    def test_tf_state_minter_names_reads_the_three_names(self):
+        proc = self._run('tf_state_minter_names; echo "rc=$?"', gcloud_stdout=_state_doc(self._MINTER_STATE))
+        self.assertIn("github-token-minter-keyring|github-token-minter-key|kubeagents-github-minter-gsa", proc.stdout)
+        self.assertIn("rc=0", proc.stdout)
+
+    def test_an_install_with_a_minter_in_state_keeps_its_names(self):
+        """The existing install: the names its state holds, whatever the cluster is called."""
+        proc = self._run("minter_name_defaults test-project ka-today-1", gcloud_stdout=_state_doc(self._MINTER_STATE))
+        self.assertEqual(proc.stdout.strip().split("|"),
+                         ["github-token-minter-keyring", "github-token-minter-key", "kubeagents-github-minter-gsa"])
+
+    def test_a_state_holding_only_some_minter_names_keeps_each_in_its_place(self):
+        """An interrupted destroy leaves only the GSA: the empty ring and key fields stay empty."""
+        proc = self._run("minter_name_defaults test-project ka-today-1",
+                         gcloud_stdout=_state_doc(self._MINTER_STATE[2:]))
+        self.assertEqual(proc.stdout.strip().split("|"),
+                         ["github-token-minter-keyring", "github-token-minter-key", "kubeagents-github-minter-gsa"])
+        custom_gsa = [dict(self._MINTER_STATE[2], instances=[{"attributes": {"account_id": "my-minter"}}])]
+        proc = self._run("minter_name_defaults test-project ka-today-1", gcloud_stdout=_state_doc(custom_gsa))
+        self.assertEqual(proc.stdout.strip().split("|"),
+                         ["github-token-minter-keyring", "github-token-minter-key", "my-minter"])
+
+    def test_an_install_without_a_minter_in_state_derives_its_names(self):
+        proc = self._run("minter_name_defaults test-project ka-today-1", gcloud_stdout=_state_doc([]))
+        self.assertEqual(proc.stdout.strip().split("|")[0], "ka-today-1-minter-keyring")
+
+    def test_a_first_install_with_no_state_derives_its_names(self):
+        proc = self._run("minter_name_defaults test-project ka-today-1", gcloud_exit=1)
+        self.assertEqual(proc.stdout.strip().split("|")[1], "ka-today-1-minter-key")
+
+    def test_unreadable_state_keeps_the_project_wide_names_and_says_so(self):
+        """Not knowing whether this install has a minter, it must not rename one."""
+        proc = self._run('print_warning() { echo "WARN: $*"; }; minter_name_defaults test-project ka-today-1',
+                         gcloud_exit=1, gcloud_stderr="ERROR: 503 Service Unavailable")
+        self.assertEqual(proc.stdout.strip().splitlines()[-1].split("|"),
+                         ["github-token-minter-keyring", "github-token-minter-key", "kubeagents-github-minter-gsa"])
+        self.assertIn("keeps the project-wide default names", proc.stderr + proc.stdout)
+
+    def _key_owner(self, describe_rc=0, labels="", labels_rc=0):
+        stub = (
+            'if [[ "$*" == *"kms keys describe"* && "$*" == *"value(labels)"* ]]; then '
+            f'echo "{labels}"; exit {labels_rc}; fi; '
+            f'if [[ "$*" == *"kms keys describe"* ]]; then exit {describe_rc}; fi'
+        )
+        return self._run('owner="$(minter_key_owner ring key us-central1 p)"; echo "owner=$owner rc=$?"',
+                         gcloud_extra_cases=f'  *"kms keys describe"*) {stub} ;;\n')
+
+    def test_minter_key_owner_reads_the_owner_labels(self):
+        proc = self._key_owner(labels="kube-agents-cluster=cluster-a;kube-agents-namespace=team-one")
+        self.assertIn("owner=cluster-a/team-one rc=0", proc.stdout, proc.stderr)
+
+    def test_minter_key_owner_is_empty_for_an_unlabelled_key(self):
+        proc = self._key_owner(labels="")
+        self.assertIn("owner= rc=0", proc.stdout, proc.stderr)
+
+    def test_minter_key_owner_returns_1_for_a_key_it_cannot_describe(self):
+        proc = self._key_owner(describe_rc=1)
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
 
     def test_minter_deferred_without_an_enabled_key_version(self):
         # A minter whose KMS key holds no ENABLED version never passes
@@ -6474,14 +6586,14 @@ class FootprintSummaryTest(unittest.TestCase):
         # Autopilot requests, 2 CPU and 2Gi, as the notes count it on such a cluster; on
         # standard the same tfvars sum footprint.yaml's 500m and 1Gi.
         self.assertIn("CPU requests:        5.900 cores", proc.stdout)
-        self.assertIn("Memory requests:     14.38 GiB", proc.stdout)
+        self.assertIn("Memory requests:     16.38 GiB", proc.stdout)
         standard = self._run(
             f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"',
             tfvars=_FOOTPRINT_TFVARS.replace('cluster_mode = "autopilot"', 'cluster_mode = "standard"'),
         )
         self.assertIn("rc=0", standard.stdout, standard.stderr)
         self.assertIn("CPU requests:        4.400 cores", standard.stdout)
-        self.assertIn("Memory requests:     13.38 GiB", standard.stdout)
+        self.assertIn("Memory requests:     15.38 GiB", standard.stdout)
         # The tfvars say next, so the installer prints the caveat the notes print.
         self.assertIn("Not counted: the session pods", proc.stdout)
         # Byte for byte what NOTES.txt prints for the same values: one arithmetic, one

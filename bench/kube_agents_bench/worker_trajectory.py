@@ -83,8 +83,10 @@ record is for; the gated judged rung compares ``OutcomeValidity`` only, which
 reads the answer, not the trace. And ``metadata["worker_trajectory"]`` on the
 ``AgentResult`` carries the card-to-session map the read used, for the harness
 log and the tests: devops-bench does not copy ``metadata`` into
-``results.json``, so on disk the entries themselves are the record and a read
-problem is a harness-log warning.
+``results.json``, so on disk the entries themselves are the record. A read
+problem is a harness-log warning, and a gap (:func:`gaps`) is also recorded on
+the trajectory as :data:`GAP_ENTRY`, so the scorer can tell an incomplete
+capture from a complete one.
 
 Capture is best effort in the same sense as the artifact read-back: a pod that
 cannot be reached costs the record its worker transcript, never the run. The
@@ -183,6 +185,19 @@ MAX_ARGS_CHARS = 2000
 TRUNCATED_GAP = "the read stopped at %d cards; later cards were not read" % MAX_CARDS
 CALL_CAP_GAP = "the read stopped at %d tool calls; later calls were not read" % MAX_CALLS
 CLIP_GAPS = {"cards": TRUNCATED_GAP, "calls": CALL_CAP_GAP}
+# The trajectory entry the harness writes when a capture has gaps
+# (``harness.KubeAgentsHarness._settle``), with what :func:`gaps` reported
+# under ``args.gaps``. devops-bench does not copy ``metadata`` into
+# ``results.json``, so this entry is how the scorer learns that a record's
+# worker entries are incomplete (``scoring._inject_lane_view``).
+GAP_ENTRY = "harness_worker_capture_gaps"
+# What the inject wait records under it when it keeps a turn's worker
+# entries off the trajectory (``harness.KubeAgentsHarness`` withholds them on
+# a turn whose door showed no trace).
+WITHHELD_ENTRIES_GAP = "the workers' entries were withheld: the door showed no trace"
+# What ``_settle`` records under it when the turn delegated and the read
+# itself did not complete (``capture`` returned ``None``).
+UNREAD_CAPTURE_GAP = "the worker read did not complete"
 # What the in-pod script puts in place of every result and argument when the
 # redactor will not load (a store without the shared rules module reads no
 # session at all). Named here too so a verifier can tell an unreadable capture
@@ -713,6 +728,11 @@ def gaps(summary: dict[str, Any] | None) -> list[str] | None:
     problems = [str(e) for e in summary.get("unread") or []]
     problems += [CLIP_GAPS[c] for c in summary.get("clipped") or [] if c in CLIP_GAPS]
     return problems
+
+
+def gap_entry(problems: list[str]) -> dict[str, Any]:
+    """The :data:`GAP_ENTRY` trajectory entry for a capture's gaps."""
+    return {"name": GAP_ENTRY, "args": {"gaps": list(problems)}, "status": "completed"}
 
 
 def parents(summary: dict[str, Any] | None) -> dict[str, str] | None:

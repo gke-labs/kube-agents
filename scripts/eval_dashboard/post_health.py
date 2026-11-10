@@ -188,19 +188,25 @@ DEFAULT_SLOW_BASELINE_DAYS = 7
 
 # pool-pressure.json's vocabulary (scripts/pool_pressure.py owns it), carried
 # through health.json's `pool` note. Copied rather than imported, and
-# test_integration_contracts.py fails if the copy drifts. The four causes have
-# four different remedies, one of which spends money, so the message branches
-# on them rather than printing the label.
+# test_integration_contracts.py fails if the copy drifts. The four causes call
+# for different things, one of which spends money, so the message branches on
+# them rather than printing the label.
 CAUSE_CAPACITY = "CAPACITY"
 CAUSE_CONCURRENCY_CAP = "CONCURRENCY_CAP"
 CAUSE_CONTROL_PLANE = "CONTROL_PLANE"
-# Not a cause the periodic emits: the key `pool_causes` records when
-# CONTROL_PLANE is announced without the queue, which says something different
-# and names no build cluster. See `pool_cause_key`.
-CAUSE_CONTROL_PLANE_UNREAD = "CONTROL_PLANE:queue-unread"
 # The periodic's own "I could not tell", distinct from a label added later that
 # this file has no remedy for. Both ask for nothing; only this one knows why.
 CAUSE_UNKNOWN = "UNKNOWN"
+# Not causes the periodic emits: the keys `pool_causes` records when one of
+# QUEUE_UNREAD_CAUSES is announced without the queue, which says something
+# different (no build cluster; no live count). See `pool_cause_key`.
+QUEUE_UNREAD_KEY_SUFFIX = ":queue-unread"
+QUEUE_UNREAD_CAUSES = (CAUSE_CONTROL_PLANE, CAUSE_CONCURRENCY_CAP)
+# The cap message names the days the periodic breached on as month-day,
+# "11-05 and 11-06": the digit span after the year in the artifact's ISO day.
+DAY_MONTH_DAY = slice(5, None)
+DAYS_JOIN = ", "
+DAYS_LAST_JOIN = " and "
 
 # The kinds of message this script sends.
 KIND_CHANGE = "change"  # a new state, condition or (in an OUTAGE) case list
@@ -469,23 +475,26 @@ def pool_cause_key(pool: dict) -> str | None:
 
     `pool_causes` is what this episode has already said, and CONTROL_PLANE says
     two things: the build cluster to go and check, or that the queue could not
-    be read so nothing can be blamed. Keyed on the cause alone, an hour of
-    unreadable Deck at the start of an episode would record the vague one as
-    the remedy and the remedy would never post.
+    be read so nothing can be blamed; CONCURRENCY_CAP likewise says the live
+    queue, or the past days with the queue unread. Keyed on the cause alone, an
+    hour of unreadable Deck at the start of an episode would record the vague
+    one as the remedy and the remedy would never post.
     """
-    if pool.get("cause") == CAUSE_CONTROL_PLANE and pool.get("waiting_now") is None:
-        return CAUSE_CONTROL_PLANE_UNREAD
-    return pool.get("cause")
+    cause = pool.get("cause")
+    if cause in QUEUE_UNREAD_CAUSES and pool.get("waiting_now") is None:
+        return cause + QUEUE_UNREAD_KEY_SUFFIX
+    return cause
 
 
 def pool_told_keys(pool: dict) -> list[str]:
     """The keys a sent ⏳ marks as told, which the diagnosis widens.
 
-    Once the build cluster has been named, the unread-queue message is less
-    than the reader already has, so it is not owed later in the same episode.
+    Once the build cluster or the live queue has been named, the unread-queue
+    message is less than the reader already has, so it is not owed later in
+    the same episode.
     """
     key = pool_cause_key(pool)
-    return [key, CAUSE_CONTROL_PLANE_UNREAD] if key == CAUSE_CONTROL_PLANE else [key]
+    return [key, key + QUEUE_UNREAD_KEY_SUFFIX] if key in QUEUE_UNREAD_CAUSES else [key]
 
 
 def decide(health: dict, prev: dict | None, now: datetime, digest_hour: int, tz=LOCAL_TZ) -> list[str]:
@@ -979,10 +988,16 @@ def pool_numbers(pool: dict) -> list[str]:
             f" against a {minutes_text(pool.get('threshold_p50_s'))} min limit;"
             f" p95 {wait_text(pool.get('p95_s'))} against {minutes_text(pool.get('threshold_p95_s'))}."
         )
-    waiting = pool.get("over_threshold") or 0
-    if waiting:
+    over = pool.get("over_threshold") or 0
+    waiting = pool.get("waiting")
+    if over and isinstance(waiting, int):
+        # The part of the live queue past the limit, against the whole of it;
+        # the cap's cause line has already said the whole.
+        lines.append(f"{over} of {waiting} waiting {plural(waiting, 'run')} {plural(over, 'is', 'are')} past the {minutes_text(pool.get('threshold_p95_s'))} min p95 limit.")
+    elif over:
+        # A note from before the live count was carried.
         lines.append(
-            f"{waiting} {plural(waiting, 'run')} waiting right now,"
+            f"{over} {plural(over, 'run')} waiting right now,"
             f" past the {minutes_text(pool.get('threshold_p95_s'))} min p95 limit."
         )
     if pool.get("lease_failures"):
@@ -998,10 +1013,21 @@ def pool_refusals(pool: dict) -> str:
     return f"{refused} {plural(refused, 'run')} refused a project{stretch}"
 
 
+def days_text(days) -> str:
+    """The artifact's ISO days as "11-05 and 11-06"; "recent days" when it
+    named none."""
+    names = [day[DAY_MONTH_DAY] for day in (days or []) if isinstance(day, str) and len(day) > DAY_MONTH_DAY.start]
+    if not names:
+        return "recent days"
+    if len(names) == 1:
+        return names[0]
+    return DAYS_JOIN.join(names[:-1]) + DAYS_LAST_JOIN + names[-1]
+
+
 def pool_cause_text(pool: dict) -> str:
-    """What to do, by cause. The four remedies differ and one of them spends
-    money, so an unrecognised cause falls through to the message that asks for
-    nothing."""
+    """What is wrong, by cause, and the remedy where there is one. The causes
+    call for different things and one of them spends money, so an unrecognised
+    cause falls through to the message that asks for nothing."""
     cause = pool.get("cause")
     if cause == CAUSE_CAPACITY:
         # The counts are this hour's Boskos reading and carry the remedy on
@@ -1023,9 +1049,33 @@ def pool_cause_text(pool: dict) -> str:
             f"{held}{queuing}. Consider onboarding a project."
         )
     if cause == CAUSE_CONCURRENCY_CAP:
+        # The presubmit sat at its own cap while runs queued. The pool is
+        # shared, so the cap's gap below the pool is the other jobs' share and
+        # the message gives no remedy: moving the cap is a human tradeoff.
+        cap = figure(pool.get("max_concurrency"))
+        live = pool.get("waiting_now")
+        if live:
+            waiting = pool.get("waiting")
+            count = f"{waiting} presubmit {plural(waiting, 'run is', 'runs are')}" if isinstance(waiting, int) else "presubmit runs are"
+            return (
+                f"*Smoke gate: queue* — {count} waiting, longest {wait_text(pool.get('waiting_longest_s'))};"
+                f" the presubmit is at its cap of {cap} slots."
+            )
+        worst = pool.get("worst_s")
+        waited = f"waited up to {wait_text(worst)}" if worst is not None else "waited past the limit"
+        # False is "no run past the p50 limit", not an empty queue: the live
+        # count says which. None is a queue Deck did not see, and "nothing
+        # waits" would assert what nothing measured.
+        waiting = pool.get("waiting")
+        if live is None or not isinstance(waiting, int):
+            now = " The job could not read the queue, so this bot cannot say whether runs still wait."
+        elif waiting:
+            now = f" {waiting} {plural(waiting, 'run waits', 'runs wait')} now, none past the limit."
+        else:
+            now = " Nothing waits now."
         return (
-            f"*Smoke gate: concurrency cap* — the pool has {figure(pool.get('total'))} projects"
-            f" but the concurrency cap is only {figure(pool.get('max_concurrency'))}. Raise the cap."
+            f"*Smoke gate: queue* — presubmit runs {waited} on {days_text(pool.get('breached_days'))};"
+            f" the presubmit was at its cap of {cap} slots.{now}"
         )
     if cause == CAUSE_CONTROL_PLANE:
         if pool.get("waiting_now") is None:

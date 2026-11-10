@@ -40,6 +40,9 @@ readonly EVAL_BLOCKING_ROSTER_FILE="eval/blocking-roster.txt"
 readonly EVAL_NIGHTLY_CASES_FILE="eval/nightly-cases.txt"
 readonly EVAL_GITLAB_CASES_FILE="eval/gitlab-cases.txt"
 readonly EVAL_GHES_CASES_FILE="eval/ghes-cases.txt"
+# What the replay lane runs (EVAL_REPLAY_LANE=true, hack/ci-env.sh): each entry
+# a registered case, replayed from the nightlies' recordings, gating nothing.
+readonly EVAL_REPLAY_LANE_CASES_FILE="eval/replay-lane-cases.txt"
 # The certification suite has no roster file: a case is on its lane when its
 # task file carries the bare line `suite: certification` (and in part N when
 # it carries `certification_part: N`; absent is part 1). The two line
@@ -707,6 +710,10 @@ publish_eval_dashboard() {
     echo "eval-dashboard publish skipped: EVAL_TIER=certification: the certification lane's record is its logs bucket, read by the certified-capabilities page, not the nightly dashboard"
     return 0
   fi
+  if [ "${EVAL_REPLAY_LANE:-}" = "true" ]; then
+    echo "eval-dashboard publish skipped: EVAL_REPLAY_LANE=true: replayed runs repeat the nightly's recordings, which is not main's live history"
+    return 0
+  fi
   if [ -z "${EVAL_DASHBOARD_TARGET:-}" ]; then
     echo "eval-dashboard publish skipped: EVAL_DASHBOARD_TARGET is not set (the Prow job config arms this later)"
     return 0
@@ -1178,6 +1185,10 @@ export AGENT_CLUSTER_CONTEXT="gke_${PROJECT_ID}_${REGION}_${HOST_CLUSTER_NAME}"
 # From here to the EXIT trap, a replaced agent pod or restarted container is
 # on record however early it happens (collect_agent_pod_diagnostics).
 start_agent_pod_watch
+# On the replay lane, the nightlies' recorded answers go into every proxy pod
+# before any case runs; with nothing to replay the lane stops here, having
+# measured nothing (hack/ci-env.sh). A no-op on every other run.
+prepare_replay_lane_cache || exit 1
 # Under EVAL_REPLAY_SHADOW=true, the shadow proxy's lines and stored text go
 # to the private bucket from here on, while the eval runs (hack/ci-env.sh).
 start_replay_shadow_collector
@@ -3121,6 +3132,45 @@ case "${EVAL_TIER}" in
     ;;
 esac
 
+# ─── The replay lane (examples/inference-replay/eval-design.md, Rollout 2) ───
+# EVAL_REPLAY_LANE=true replaces the matrix with hack/eval/replay-lane-cases.txt:
+# registered cases (a presubmit or nightly entry), each replayed from what the
+# nightlies recorded. The lane gates nothing and records nothing as main's
+# history (the recorder decision and the dashboard hook below both skip it);
+# its report is the collector's, in the private shadow bucket. It runs on the
+# presubmit tier's defaults and GitHub only.
+case "${EVAL_REPLAY_LANE:-false}" in
+  false) ;;
+  true)
+    if [ "${EVAL_TIER}" != "presubmit" ] || [ -n "${LANE_CASES_FILE}" ]; then
+      echo "ERROR: EVAL_REPLAY_LANE=true runs its own roster on GitHub; unset EVAL_TIER (${EVAL_TIER}) and EVAL_FORGE (${EVAL_FORGE})." >&2
+      exit 1
+    fi
+    REPLAY_LANE_CASES_FILE="${SCRIPT_DIR}/${EVAL_REPLAY_LANE_CASES_FILE}"
+    REPLAY_LANE_ENTRIES="$(roster_entries "${REPLAY_LANE_CASES_FILE}")"
+    REPLAY_LANE_TASKS=()
+    while IFS= read -r ENTRY; do
+      if [ -n "${ENTRY}" ]; then REPLAY_LANE_TASKS+=("${ENTRY}"); fi
+    done <<< "${REPLAY_LANE_ENTRIES}"
+    if [ "${#REPLAY_LANE_TASKS[@]}" -eq 0 ]; then
+      echo "ERROR: ${REPLAY_LANE_CASES_FILE} names no case; the replay lane would replay nothing." >&2
+      exit 1
+    fi
+    for ENTRY in "${REPLAY_LANE_TASKS[@]}"; do
+      if ! printf '%s\n' "${PRESUBMIT_ENTRIES}" "${NIGHTLY_ENTRIES}" | grep -qxF -- "${ENTRY}"; then
+        echo "ERROR: ${REPLAY_LANE_CASES_FILE}: '${ENTRY}' is in neither ${PRESUBMIT_CASES_FILE} nor ${NIGHTLY_CASES_FILE}; the lane replays what the nightly records." >&2
+        exit 1
+      fi
+    done
+    TASKS=("${REPLAY_LANE_TASKS[@]}")
+    echo "EVAL_REPLAY_LANE=true: the replay lane replays ${#TASKS[@]} case(s) (${EVAL_REPLAY_LANE_CASES_FILE}); nothing it grades is recorded or gates anything"
+    ;;
+  *)
+    echo "ERROR: EVAL_REPLAY_LANE must be 'true' or 'false', got '${EVAL_REPLAY_LANE}'." >&2
+    exit 1
+    ;;
+esac
+
 # Which part of the nightly matrix this run takes, so the nightly can run as
 # several periodics on leased projects of their own: the cases that request a pull request
 # run one unit at a time after every other unit (unit_phase, below), and on
@@ -4046,6 +4096,11 @@ BLOCKING_ROSTER_ON_LANE=""
 if [ "${EVAL_TIER}" = "certification" ]; then
   echo "EVAL_TIER=certification: no blocking-roster case is in the certification matrix, so rung 4 is disarmed on this lane (rungs 1-3 and rung 5 still red it)."
 fi
+# The replay lane gates nothing: no roster name is armed on it, whatever its
+# roster shares with the presubmit's.
+if [ "${EVAL_REPLAY_LANE:-}" = "true" ]; then
+  echo "EVAL_REPLAY_LANE=true: rung 4 is disarmed on the replay lane, which gates nothing."
+fi
 # Set when the inject lane's exclusion list drops a ROSTER case: what the
 # every-roster-case-excluded guard below tests, since an empty
 # BLOCKING_ROSTER_ON_LANE has a second cause on the GitLab lane.
@@ -4055,6 +4110,9 @@ while IFS= read -r NAME; do
   if ! grep -qxF -- "${NAME}" <<< "${PRESUBMIT_CASE_NAMES}"; then
     echo "ERROR: ${BLOCKING_ROSTER_FILE}: '${NAME}' is not a case in ${PRESUBMIT_CASES_FILE}; the blocking roster is a subset of the presubmit." >&2
     exit 1
+  fi
+  if [ "${EVAL_REPLAY_LANE:-}" = "true" ]; then
+    continue
   fi
   # A roster case the inject lane's exclusion step dropped from the matrix
   # (INJECT_LANE_DROPPED, empty on every other lane) leaves the export too:
@@ -4173,6 +4231,12 @@ if [ "${EVAL_FORGE:-github}" != "github" ]; then
   EVAL_IS_MAIN_RUN="false"
 fi
 if [ "${EVAL_ROLLBACK_LANE:-}" = "1" ]; then
+  EVAL_IS_MAIN_RUN="false"
+fi
+# The replay lane never appends: a replayed run repeats a recording that
+# passed, so its passes would inflate the very rates the gate admits on
+# (examples/inference-replay/eval-design.md, "A replay lane that gates nothing").
+if [ "${EVAL_REPLAY_LANE:-}" = "true" ]; then
   EVAL_IS_MAIN_RUN="false"
 fi
 # The certification lane never appends either: its record is the logs

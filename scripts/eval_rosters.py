@@ -12,7 +12,9 @@ The files under hack/eval/ hold what the eval gate runs and what blocks (#1546, 
   ``BOOTSTRAP_ADMITTED``;
 - the certification suite has no file: ``EVAL_TIER=certification`` runs every
   task file under ``bench/tasks/`` carrying the bare line ``suite: certification``,
-  in sections by its ``certification_part: N`` line, one periodic each.
+  in sections by its ``certification_part: N`` line, one periodic each;
+- ``hack/eval/replay-lane-cases.txt`` -- what ``EVAL_REPLAY_LANE=true`` replays
+  from the nightlies' recordings, registered cases, gating nothing.
 
 In every file ``#`` starts a comment and blank lines are skipped, which is
 exactly the ``sed | grep`` the script applies; this module is the Python copy
@@ -60,6 +62,9 @@ GHES_CASES_FILE = EVAL_DIR / "ghes-cases.txt"
 # task file whose YAML says the suite or the part in any other spelling, so
 # what this module lists is what the shell runs.
 CERTIFICATION_SUITE = "certification"
+# The replay lane's matrix (examples/inference-replay/eval-design.md, Rollout
+# step 2): registered cases, replayed from the nightlies' recordings.
+REPLAY_LANE_CASES_FILE = EVAL_DIR / "replay-lane-cases.txt"
 CERTIFICATION_SUITE_LINE_RE = re.compile(r"^suite: certification$", re.M)
 CERTIFICATION_PART_KEY = "certification_part"
 CERTIFICATION_PART_LINE_RE = re.compile(r"^certification_part: ([1-9][0-9]*)$", re.M)
@@ -186,6 +191,10 @@ def certification_part(text: str) -> int:
     ``certification_part: N`` line, CERTIFICATION_DEFAULT_PART without one."""
     match = CERTIFICATION_PART_LINE_RE.search(text)
     return int(match.group(1)) if match else CERTIFICATION_DEFAULT_PART
+
+
+def replay_lane_cases(path: pathlib.Path = REPLAY_LANE_CASES_FILE) -> list[str]:
+    return case_names(path.read_text(encoding="utf-8"))
 
 
 def certification_cases(tasks_dir: pathlib.Path | None = None) -> list[str]:
@@ -467,6 +476,7 @@ def summary(repetitions: int = 3) -> dict[str, int]:
         "presubmit units": len(presubmit) * repetitions,
         "gitlab lane cases": len(gitlab_cases()),
         "ghes lane cases": len(ghes_cases()),
+        "replay lane cases": len(replay_lane_cases()),
         "inject lane exclusions": len(inject_lane_exclusions()),
         "presubmit serial-phase cases": len(wall["requesting"]),
         "presubmit wall estimate, minutes": -(-wall["total"] // 60),
