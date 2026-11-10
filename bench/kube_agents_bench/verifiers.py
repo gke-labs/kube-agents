@@ -2305,6 +2305,13 @@ _EMPTY_BLOB_SHA = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
 _PR_FILE_GONE_STATUSES = frozenset({"removed"})
 # Offending documents a failed content assertion names before counting the rest.
 _PR_CONTENT_MAX_NAMED = 5
+# The kind `admits_disruption` grades, at the one version a cluster serves.
+_PDB_KIND = "PodDisruptionBudget"
+_PDB_API_VERSION = "policy/v1"
+# An IntOrString percentage, ASCII digits only (int() would take fullwidth
+# ones), and the most a budget's percentage may be.
+_PDB_PERCENT_RE = re.compile(r"([0-9]+)%")
+_PDB_MAX_PERCENT = 100
 
 _NO_PR_RUN_CLOCK_REASON = (
     "the run's transcript carries no start time (TranscriptSnapshot.started_at "
@@ -5233,6 +5240,13 @@ class PullRequestContentCheck(BaseModel):
       file that does not parse fails it when ``kind`` or ``field`` is set,
       since the object may be in it.
 
+    - ``admits_disruption``: the ``PodDisruptionBudget`` selects the pods
+      ``pod_labels`` describes and, against a workload of ``replicas`` healthy
+      pods, lets at least one and never all of them be evicted -- the
+      arithmetic the disruption controller does (see :func:`_pdb_rejection`).
+      No field match says this: ``minAvailable: 1`` is right for two replicas
+      and blocks every drain for one, and a percentage rounds up.
+
     Every op but ``absent`` needs at least one kept document, so a pull request
     that never wrote the object fails rather than passing vacuously, and
     ``quantifier`` says whether ``all`` kept documents (the default) or ``any``
@@ -5244,12 +5258,32 @@ class PullRequestContentCheck(BaseModel):
     paths: list[str] = Field(min_length=1)
     kind: str = ""
     field: str = ""
-    op: Literal["exists", "contains", "matches", "not_matches", "absent"]
+    op: Literal["exists", "contains", "matches", "not_matches", "absent", "admits_disruption"]
     value: str = ""
     quantifier: Literal["all", "any"] = "all"
+    # `admits_disruption` only: the workload the budget protects, as the case
+    # planted it. Given rather than read, because the workload's manifest is a
+    # file the pull request does not add, and reading it would need
+    # `contents: read`, which the grading mint does not grant.
+    replicas: int | None = Field(default=None, ge=2)
+    pod_labels: dict[str, str] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _value_fits_op(self):
+        if self.op == "admits_disruption":
+            if self.kind != _PDB_KIND:
+                raise ValueError(f"`admits_disruption` grades a budget, so it needs `kind: {_PDB_KIND}`")
+            if self.field or self.value:
+                raise ValueError("`admits_disruption` reads the whole budget, so it takes no `field` or `value`")
+            if self.replicas is None or not self.pod_labels:
+                raise ValueError(
+                    "`admits_disruption` needs the workload the budget protects: `replicas` "
+                    "(2 or more: against one replica no budget both keeps a pod up and lets "
+                    "a node drain) and `pod_labels`"
+                )
+            return self
+        if self.replicas is not None or self.pod_labels:
+            raise ValueError("`replicas` and `pod_labels` are read only by `admits_disruption`")
         if self.op in ("contains", "matches", "not_matches") and not self.value:
             raise ValueError(f"`{self.op}` needs a `value`")
         if self.op in ("exists", "absent") and self.value:
@@ -5267,6 +5301,12 @@ class PullRequestContentCheck(BaseModel):
 
     def label(self) -> str:
         what = self.kind or "document"
+        if self.op == "admits_disruption":
+            labels = ",".join(f"{k}={v}" for k, v in sorted(self.pod_labels.items()))
+            return (
+                f"{what} admits_disruption over {self.replicas} replicas labelled {labels} "
+                f"in {', '.join(self.paths)}"
+            )
         at = f".{self.field}" if self.field else ""
         tail = f" {self.value!r}" if self.value else ""
         return f"{what}{at} {self.op}{tail} in {', '.join(self.paths)}"
@@ -5473,11 +5513,136 @@ def _added_file_text(entry: dict) -> str | None:
     return "\n".join(lines) + "\n"
 
 
+def _is_null(value: Any) -> bool:
+    """Whether a text-loaded value is missing or a spelling of null."""
+    return value is None or (isinstance(value, str) and value.strip() in _YAML_NULL_SPELLINGS)
+
+
+def _selector_rejection(
+    selector: Any, pod_labels: dict[str, str], *, empty_selects: bool = False
+) -> str | None:
+    """Why a policy/v1 label selector does not select pods carrying
+    ``pod_labels``, or None when it does.
+
+    An absent or null selector selects no pods in policy/v1, and an empty one
+    selects every pod in the namespace: a budget over the whole namespace
+    counts other workloads' pods against this one's replicas, so neither is
+    the workload's budget. ``empty_selects`` asks only whether the pods are
+    selected, which an empty selector does.
+    """
+    shown = ",".join(f"{k}={v}" for k, v in sorted(pod_labels.items()))
+    if _is_null(selector):
+        return "it has no selector, which in policy/v1 selects no pods"
+    if not isinstance(selector, dict):
+        return "its selector is not a label selector"
+    match_labels = {} if _is_null(selector.get("matchLabels")) else selector.get("matchLabels")
+    expressions = [] if _is_null(selector.get("matchExpressions")) else selector.get("matchExpressions")
+    if not isinstance(match_labels, dict) or not isinstance(expressions, list):
+        return "its selector is not a label selector"
+    if not match_labels and not expressions:
+        if empty_selects:
+            return None
+        return "its selector is empty, which selects every pod in the namespace rather than the workload's"
+    for key, value in match_labels.items():
+        if pod_labels.get(key) != value:
+            return f"its selector's matchLabels {key}={value} does not select the workload's pods ({shown})"
+    for expression in expressions:
+        if not isinstance(expression, dict):
+            return "its selector's matchExpressions is not a list of requirements"
+        key, operator = expression.get("key"), expression.get("operator")
+        values = [] if _is_null(expression.get("values")) else expression.get("values")
+        if not isinstance(values, list):
+            return f"its selector's matchExpressions values for {key!r} is not a list"
+        # A label key and its values are strings; "" and "null" are values, so
+        # they are not read as null here.
+        if not isinstance(key, str) or _is_null(key):
+            return "a matchExpressions requirement names no key, which the API server refuses"
+        if not all(isinstance(item, str) for item in values):
+            return f"its selector's matchExpressions values for {key!r} are not all strings"
+        if operator not in (_SELECTOR_IN, _SELECTOR_NOT_IN, _SELECTOR_EXISTS, _SELECTOR_DOES_NOT_EXIST):
+            return f"its selector's matchExpressions operator {operator!r} is not a Kubernetes one"
+        if (operator in (_SELECTOR_IN, _SELECTOR_NOT_IN)) != bool(values):
+            return (
+                f"its requirement {key} {operator} {values} is one the API server refuses: In and "
+                "NotIn need values, Exists and DoesNotExist take none"
+            )
+        present = key in pod_labels
+        if operator == _SELECTOR_IN:
+            selected = present and pod_labels[key] in values
+        elif operator == _SELECTOR_NOT_IN:
+            selected = not present or pod_labels[key] not in values
+        elif operator == _SELECTOR_EXISTS:
+            selected = present
+        else:
+            selected = not present
+        if not selected:
+            return f"its selector's requirement {key} {operator} {values} does not select the workload's pods ({shown})"
+    return None
+
+
+def _scaled_count(value: Any, replicas: int) -> int | None:
+    """An IntOrString budget value as a pod count over ``replicas``, or None
+    when the API server would refuse it. A percentage rounds up, as the
+    disruption controller scales both minAvailable and maxUnavailable."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if _DIGITS_RE.fullmatch(text):
+        return int(text)
+    match = _PDB_PERCENT_RE.fullmatch(text)
+    if match and int(match[1]) <= _PDB_MAX_PERCENT:
+        return -(-int(match[1]) * replicas // _PDB_MAX_PERCENT)
+    return None
+
+
+def _pdb_rejection(doc: dict, replicas: int, pod_labels: dict[str, str]) -> str | None:
+    """Why a PodDisruptionBudget does not protect a workload of ``replicas``
+    healthy pods labelled ``pod_labels`` while letting a node drain, or None.
+
+    It must be ``policy/v1``, select those pods, set exactly one of minAvailable and
+    maxUnavailable, and allow between one and ``replicas - 1`` disruptions
+    with every pod healthy, which is ``replicas - minAvailable`` or
+    ``maxUnavailable``. Zero blocks every voluntary eviction, so no node
+    holding one of the pods can drain; ``replicas`` or more bounds nothing.
+    """
+    if doc.get("apiVersion") != _PDB_API_VERSION:
+        return (
+            f"its apiVersion is {_scalar_text(doc.get('apiVersion'))!r}, not {_PDB_API_VERSION}, the only "
+            "version a current cluster serves (policy/v1beta1 went in Kubernetes 1.25)"
+        )
+    spec = doc.get("spec")
+    if not isinstance(spec, dict):
+        return "it has no spec"
+    unselected = _selector_rejection(spec.get("selector"), pod_labels)
+    if unselected:
+        return unselected
+    set_keys = [key for key in ("minAvailable", "maxUnavailable") if not _is_null(spec.get(key))]
+    if len(set_keys) == 2:
+        return "it sets both minAvailable and maxUnavailable, which the API server refuses"
+    if not set_keys:
+        return "it sets neither minAvailable nor maxUnavailable, so it bounds nothing"
+    key = set_keys[0]
+    raw = spec[key]
+    count = _scaled_count(raw, replicas)
+    if count is None:
+        return f"its {key} {_scalar_text(raw)!r} is neither a whole number nor a percentage up to 100%"
+    allowed = max(0, replicas - count) if key == "minAvailable" else min(count, replicas)
+    if allowed < 1:
+        return (
+            f"{key} {raw} over {replicas} replicas allows 0 disruptions, so no node "
+            "running one of its pods can drain"
+        )
+    if allowed >= replicas:
+        return f"{key} {raw} over {replicas} replicas lets every pod be evicted at once, so it protects nothing"
+    return None
+
+
 def _content_rejection(check: PullRequestContentCheck, files: dict[str, str]) -> str | None:
     """Why ``files`` (path -> text at the head) fail ``check``, or None."""
     matched = {p: t for p, t in files.items() if any(fnmatch.fnmatchcase(p, g) for g in check.paths)}
     kept = []
     unparsed = []
+    objects: dict[str, Any] = {}
     for path, text in sorted(matched.items()):
         docs, parsed = _documents(path, text)
         if not parsed:
@@ -5485,6 +5650,7 @@ def _content_rejection(check: PullRequestContentCheck, files: dict[str, str]) ->
         for label, doc, doc_text in docs:
             if check.kind and (not isinstance(doc, dict) or doc.get("kind") != check.kind):
                 continue
+            objects[label] = doc
             if check.field:
                 values = _resolve_field(doc, check.field) if isinstance(doc, dict) else []
             else:
@@ -5520,7 +5686,29 @@ def _content_rejection(check: PullRequestContentCheck, files: dict[str, str]) ->
         # the check forbids.
         return hit if check.op == "matches" else (bool(filled) and not hit)
 
-    failing = [label for label, values in kept if not holds(values)]
+    if check.op == "admits_disruption":
+        # The eviction API refuses to evict a pod more than one budget selects,
+        # so two budgets over the workload block every drain however each
+        # reads alone, whatever the quantifier.
+        selecting = [
+            label for label, _ in kept
+            if isinstance(objects[label].get("spec"), dict)
+            and _selector_rejection(
+                objects[label]["spec"].get("selector"), check.pod_labels, empty_selects=True
+            ) is None
+        ]
+        if len(selecting) > 1:
+            return (
+                f"{check.label()}: {', '.join(selecting[:_PR_CONTENT_MAX_NAMED])} all select the workload's "
+                "pods, and the eviction API refuses to evict a pod more than one budget selects"
+            )
+        failing = []
+        for label, _ in kept:
+            why = _pdb_rejection(objects[label], check.replicas or 0, check.pod_labels)
+            if why:
+                failing.append(f"{label} ({why})")
+    else:
+        failing = [label for label, values in kept if not holds(values)]
     if check.quantifier == "any" and len(failing) < len(kept):
         return None
     if check.quantifier == "all" and not failing:
