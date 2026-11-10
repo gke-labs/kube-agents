@@ -216,9 +216,9 @@ spec:
     {{- end }}
     {{- $alertExcludeValues := .Values.platformAgent.harness.eventWatcher | default dict }}
     {{- /*
-      Rendered only when an install sets a rule: with none the operator writes
-      no WATCHER_ALERT_EXCLUDE, so an absent block and an empty list are the
-      same. The same CRD guard as stallWatch's above, one level down:
+      Rendered only when an install sets a rule: with none the operator
+      renders an empty rules file, so an absent block and an empty list are
+      the same. The same CRD guard as stallWatch's above, one level down:
       spec.harness.eventWatcher is older than its alertExclude field.
     */}}
     {{- if $alertExcludeValues.alertExclude }}

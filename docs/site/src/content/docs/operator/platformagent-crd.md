@@ -214,10 +214,15 @@ spec:
           name: inventory-api-*
 ```
 
-A change rolls the pod, as `enabled` does. What the rules hold back is counted in the watcher's
+A change is in force within about two minutes, without a pod restart: the operator writes the list
+to a ConfigMap, and the watcher reads it again every minute. If the agent image is older than the
+operator, a change applies at the next pod restart.
+
+What the rules hold back is counted in the watcher's
 `k8s_event_watcher_events_filtered_total{gate="alert_excluded"}`, and the end-of-day recap says how
 many events and workloads they held back and names the five noisiest workloads. While
-the list is set, it replaces a `WATCHER_ALERT_EXCLUDE` entry in `spec.deployment.env`. The chart
+the list is set, it replaces a `WATCHER_ALERT_EXCLUDE` entry in `spec.deployment.env`, and a move
+between the two rolls the pod once. The chart
 renders the list from `platformAgent.harness.eventWatcher.alertExclude`; a `helm upgrade` that
 removes the last rule removes the whole `eventWatcher` block from the CR, `enabled: false` with it,
 so set the emergency stop again after one.

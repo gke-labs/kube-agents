@@ -1025,6 +1025,11 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	// The event watcher's alert-exclude rules. In no pod-template hash: the
+	// watcher reads the mounted file again, so a change rolls nothing.
+	if err := r.reconcileEventWatcherAlertExcludeConfigMap(ctx, instance); err != nil {
+		return ctrl.Result{}, err
+	}
 	// The gateway's annotation leaves out what only the broker reads, so a
 	// forge configuration change rolls the broker and not the gateway.
 	gatewayPolicyHash, err := getConfigMapHash(gatewayPolicyView(buildCredentialProxyPolicyConfigMap(instance)))
@@ -1499,18 +1504,15 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 			return ctrl.Result{}, err
 		}
 		// The profile namespace's quota and fence carry no owner reference
-		// (agentprofile_namespace.go) and are not removed here yet: they stay
-		// until the chart's uninstall deletes the namespace. Removing the
-		// quota on deletion, and what a refused delete should do to the
-		// finalizer, is #3827.
+		// (agentprofile_namespace.go). The quota is removed last, below; the
+		// fence stays until the chart's uninstall deletes the namespace.
 		//
 		// The dispatcher's warm pools there go, with their CA bundle copy
 		// (their pods hold bus and broker tokens), and so does its pod-read
 		// binding, for the ClusterRoleBinding's reason above: left behind,
 		// anyone who later creates a ServiceAccount of the dispatcher's name
 		// inherits pod read in that namespace. A failure is logged and never
-		// holds the finalizer, under the profile-namespace rule (#3827
-		// settles what a refused delete should do).
+		// holds the finalizer, under the profile-namespace rule.
 		if err := r.deleteDispatcherPodsRBAC(ctx, agent); err != nil {
 			r.profileNamespaceFailure(ctx, agent, "delete the dispatcher's warm pools, bundle copy or pod-read Role on deletion", err)
 		}
@@ -1548,6 +1550,15 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 			}
 		case client.IgnoreNotFound(err) != nil:
 			return ctrl.Result{}, err
+		}
+
+		// The profile namespace's quota, left behind, caps a successor's
+		// profile pods. Last, so a refused delete held for its bounded retry
+		// (removeProfileQuotaOnDeletion) holds back nothing else, and the
+		// quota still caps the warm pools until they're gone; every step
+		// above is idempotent across the retries.
+		if wait := r.removeProfileQuotaOnDeletion(ctx, agent, time.Now()); wait > 0 {
+			return ctrl.Result{RequeueAfter: wait}, nil
 		}
 
 		// Resource is deleted. Safe to remove finalizer and update.
@@ -2631,6 +2642,14 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxyPolicyConfigMap(ctx co
 		return "", err
 	}
 	return getConfigMapHash(cm)
+}
+
+func (r *PlatformAgentReconciler) reconcileEventWatcherAlertExcludeConfigMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	cm := buildEventWatcherAlertExcludeConfigMap(agent)
+	if err := ctrl.SetControllerReference(agent, cm, r.Scheme); err != nil {
+		return err
+	}
+	return r.applyManaged(ctx, agent, cm)
 }
 
 func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, otlpEndpoint string, otlpDisabled bool) error {

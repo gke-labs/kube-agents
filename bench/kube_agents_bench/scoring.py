@@ -35,7 +35,9 @@ that reads what the record cannot show is set aside as not applicable
 before the rungs -- failed or errored, it is neither a graded failure nor a
 rung-2 block there -- and the rungs grade what remains (see
 ``_inject_lane_view``). A check that reads the delegated workers or a
-call's result is set aside on every inject record; any other router-scope
+call's result is set aside on every inject record that does not carry the
+workers' calls in full, and grades on one that does unless it also reads
+what that record cannot show; any other router-scope
 ``tool_called`` only on one from a door that showed no tool-call trace (no
 ``a2a.activity`` marker) or whose marker reports a loss, and it grades in
 full on one whose marker reports none, whether or not the persona made a
@@ -65,6 +67,7 @@ from typing import Any
 from kube_agents_bench import chat_shape
 from kube_agents_bench.cases import HARNESS_WRITTEN_ENTRIES, NOOP_DEPLOYER, CaseSpec
 from kube_agents_bench.fixture_drift import FIXTURE_DRIFT_LABEL
+from kube_agents_bench.worker_trajectory import GAP_ENTRY as WORKER_CAPTURE_GAP_ENTRY
 
 __all__ = [
     "DEFAULT_AGGREGATE_MARGIN",
@@ -273,9 +276,9 @@ A2A_STATE_WORKING = "working"
 #: while a check graded over a trace that lost calls could fail a call
 #: that happened, and a ``none``-wrapped safeguard could pass over one. A
 #: check that reads the delegated workers or a call's result is set aside
-#: on every inject record, marker or not: the trace carries no card ids,
-#: no worker's entries and no results (``cases.py``,
-#: ``worker_blind_checks``). The names are duplicated rather than imported,
+#: on every inject record that does not carry the workers' tagged entries
+#: in full, marker or not: the trace carries no card ids, no worker's
+#: entries and no results (``cases.py``, ``worker_blind_checks``). The names are duplicated rather than imported,
 #: like the status entry, and so are the marker's four loss arguments
 #: (``inject_transport.ACTIVITY_LOSS_ARGS``); ``test_scoring.py`` asserts
 #: each agrees with the transport's.
@@ -982,6 +985,21 @@ def _inject_trace_vouched(trajectory: list[Any]) -> bool:
     return markers > 0 and markers >= tasks
 
 
+def _inject_workers_carried(trajectory: list[Any]) -> bool:
+    """Whether an inject record carries the delegated workers' calls: it holds
+    at least one entry tagged with a worker's profile (``agent`` set), and no
+    :data:`WORKER_CAPTURE_GAP_ENTRY`, which the harness writes when the
+    capture could not read everything or a turn's worker entries were
+    withheld. A record from before the harness wrote that entry reads as a
+    complete capture. Cards the delegation wait did not follow (past its
+    cap, or missing from the board) are not a recorded gap, as on the api
+    transport."""
+    entries = [entry for entry in trajectory if isinstance(entry, dict)]
+    return any(entry.get("agent") for entry in entries) and not any(
+        entry.get("name") == WORKER_CAPTURE_GAP_ENTRY for entry in entries
+    )
+
+
 def _inject_blind(trajectory: list[Any]) -> bool:
     """Whether the trajectory is the inject transport's and cannot vouch for
     the delegating turn's tool calls.
@@ -1120,9 +1138,14 @@ def _inject_lane_view(spec: CaseSpec, record: RunRecord) -> _LaneView | None:
     on an inject record whose door showed no trace (:func:`_inject_blind`),
     and grades in full on one carrying the activity marker; a check that
     reads the delegated workers or a call's result
-    (:attr:`CaseSpec.worker_blind_checks`) is set aside on every inject
-    record (:func:`_inject_record`), marker or not, since the trace carries
-    no card ids, no worker's entries and no results. One
+    (:attr:`CaseSpec.worker_blind_checks`) is set aside on an inject record
+    that does not carry the workers (:func:`_inject_workers_carried`: no
+    tagged worker entry, or a capture gap), marker or not, since the trace
+    carries no card ids, no worker's entries and no results. On a record
+    that carries them it grades, except an entry that also reads the
+    router's calls (:attr:`CaseSpec.worker_router_checks`) on a record whose
+    door did not vouch for them, and an entry that reads what the trace
+    never carries (:attr:`CaseSpec.worker_untraced_checks`). One
     exception inside the first family: a ``none``-wrapped check
     (:attr:`CaseSpec.negated_trace_blind_checks`) that FAILED on a record
     whose door showed the trace stays graded even when the marker reports a
@@ -1136,8 +1159,14 @@ def _inject_lane_view(spec: CaseSpec, record: RunRecord) -> _LaneView | None:
     """
     if not spec.transport_blind_checks or not _inject_record(record.trajectory):
         return None
-    set_aside = set(spec.worker_blind_checks)
-    if _inject_blind(record.trajectory):
+    trace_blind = _inject_blind(record.trajectory)
+    if _inject_workers_carried(record.trajectory):
+        set_aside = set(spec.worker_untraced_checks)
+        if trace_blind:
+            set_aside |= spec.worker_router_checks
+    else:
+        set_aside = set(spec.worker_blind_checks)
+    if trace_blind:
         set_aside |= spec.trace_blind_checks
         if _inject_trace_shown(record.trajectory):
             # The door showed the trace and the marker reports a loss. A
