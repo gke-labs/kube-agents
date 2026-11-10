@@ -30,6 +30,7 @@ DISPATCHER_STUB = '''"""Embedded kanban dispatcher."""
 from __future__ import annotations
 
 import contextlib
+import os
 import time
 from dataclasses import asdict, dataclass
 from typing import Any, Optional
@@ -73,6 +74,42 @@ class _Dispatcher:
             if conn is not None:
                 with contextlib.suppress(Exception):
                     conn.close()
+
+    def _board_slugs(self):
+        return ["default"]
+
+    def ready_nonempty(self) -> bool:
+        kbd = _kbd()
+        for slug in self._board_slugs():
+            conn = None
+            try:
+                conn = _kbc().connect(board=slug)
+                if kbd.has_spawnable_ready(conn):
+                    return True
+            except Exception:
+                continue
+            finally:
+                if conn is not None:
+                    with contextlib.suppress(Exception):
+                        conn.close()
+        return False
+
+    def auto_decompose_tick(self, auto_decompose_per_tick: int) -> int:
+        with contextlib.nullcontext():
+            for slug in self._board_slugs():
+                prev_env = os.environ.get("HERMES_KANBAN_BOARD")
+                try:
+                    os.environ["HERMES_KANBAN_BOARD"] = slug
+                    try:
+                        triage_ids = []
+                    except Exception as exc:
+                        triage_ids = []
+                finally:
+                    if prev_env is None:
+                        os.environ.pop("HERMES_KANBAN_BOARD", None)
+                    else:
+                        os.environ["HERMES_KANBAN_BOARD"] = prev_env
+        return 0
 '''
 
 
@@ -111,10 +148,11 @@ class ApplierTest(unittest.TestCase):
         # The failure is recorded after the corrupt-board branch has returned.
         self.assertLess(source.index("is_corrupt_board_db_error(exc)"), source.index("record_tick(slug, exc)"))
         # The tick's start comes before connect(), and its end opens the finally block.
-        self.assertEqual(1, source.count("_kage_dispatch_failures.record_tick_start(slug)"))
-        self.assertEqual(1, source.count("_kage_dispatch_failures.record_tick_end(slug)"))
         self.assertLess(source.index("record_tick_start(slug)"), source.index("_kbc().connect(board=slug)"))
         self.assertIn("finally:\n            _kage_dispatch_failures.record_tick_end(slug)", source)
+        # The ready probe and auto-decompose mark their per-board connects as tries too.
+        self.assertEqual(3, source.count("_kage_dispatch_failures.record_tick_start(slug)"))
+        self.assertEqual(3, source.count("_kage_dispatch_failures.record_tick_end(slug)"))
         compile(source, str(self.dispatcher), "exec")
 
     def test_a_patched_tree_is_refused(self):
@@ -190,6 +228,17 @@ class PatchedTickTest(unittest.TestCase):
         with self.assertLogs("dispatcher-under-test", level=logging.ERROR):
             self.assertIsNone(self.dispatcher.tick_once_for_board("default"))
         self.assertEqual([("start", "default"), ("default", "OSError"), ("end", "default")], self.recorded)
+
+    def test_the_ready_probe_on_a_locked_board_is_a_try_with_no_failure(self):
+        self.outcome = OSError("database is locked")
+        connect = sys.modules["hermes_cli.kanban_db_connect"]
+        with mock.patch.object(connect, "connect", side_effect=OSError("database is locked")):
+            self.assertFalse(self.dispatcher.ready_nonempty())
+        self.assertEqual([("start", "default"), ("end", "default")], self.recorded)
+
+    def test_auto_decompose_marks_its_board_as_tried(self):
+        self.dispatcher.auto_decompose_tick(3)
+        self.assertEqual([("start", "default"), ("end", "default")], self.recorded)
 
     def test_the_corrupt_board_branch_records_no_failure_and_ends_its_tick(self):
         self.outcome = ValueError("database disk image is malformed")

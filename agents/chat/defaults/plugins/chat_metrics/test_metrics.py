@@ -233,6 +233,31 @@ class DispatcherFailedTicksTest(unittest.TestCase):
         self.assertEqual([("default", "OperationalError", "3")], _DISPATCH_LINE.findall(registry.render()))
         self.assertEqual([("default", "OperationalError", "1445")], _AGE_LINE.findall(registry.render()))
 
+    def test_a_locked_boards_whole_loop_keeps_one_streak(self):
+        # Each loop iteration tries the board three times (auto-decompose, the
+        # tick, the ready probe), each waiting about 12 minutes on a locked
+        # board; only the tick records a failure. Failures 36 minutes apart are
+        # still one streak, and the board never goes stale between them.
+        now = [100.0]
+        registry = metrics.ChatMetrics(clock=lambda: now[0])
+
+        def attempt(fail):
+            registry.record_dispatch_tick_start("default")
+            now[0] += 720
+            if fail:
+                registry.record_dispatch_tick("default", "OperationalError")
+            registry.record_dispatch_tick_end("default")
+
+        for _ in range(3):
+            attempt(False)   # auto-decompose: its failure is swallowed
+            attempt(True)    # the tick
+            if _ < 2:
+                attempt(False)   # the ready probe
+                self.assertEqual(1, len(_DISPATCH_LINE.findall(registry.render())))
+        self.assertEqual([("default", "OperationalError", "3")], _DISPATCH_LINE.findall(registry.render()))
+        # From the first failure (100 + 2 * 720) to now (100 + 8 * 720).
+        self.assertEqual([("default", "OperationalError", str(8 * 720 - 1440))], _AGE_LINE.findall(registry.render()))
+
     def test_a_tick_that_ends_with_no_result_leaves_the_board_quiet(self):
         # The corrupt-board branch ends its tick with no failure recorded: the
         # board is no longer being tried, so the quiet rules apply again.

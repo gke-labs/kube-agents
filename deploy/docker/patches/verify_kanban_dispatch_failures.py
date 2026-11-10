@@ -6,8 +6,9 @@ after ``apply_kanban_dispatch_failures.py``, from ``/opt/hermes`` so the
 gateway package imports. Two things are checked:
 
 1. The inserted statements. ``gateway/kanban_watchers_dispatcher.py`` carries
-   the four recording calls (the tick's start and end, a good and a failed
-   tick), and every name each reads is bound where it runs
+   the eight recording calls (start and end around the tick, the ready probe
+   and auto-decompose, and a good and a failed tick), and every name each reads
+   is bound where it runs
    (``patchlib.unbound``): the anchors pin a ``return`` line and a log line,
    not ``slug`` or ``exc``, so an upstream rename of one of those would pass
    the applier and raise ``NameError`` on every tick.
@@ -36,8 +37,9 @@ MARKER = "kube-agents patch: kanban-dispatch-failures"
 ALIAS = "_kage_dispatch_failures"
 DEFAULT_HERMES_ROOT = "/opt/hermes"
 DISPATCHER = "gateway/kanban_watchers_dispatcher.py"
-# The tick's start, the good tick's call, the failed tick's call and the tick's end.
-EXPECTED_INSERTS = 4
+# The tick's start and end, the good and the failed tick's calls, and the start and end around
+# ready_nonempty's and auto_decompose_tick's per-board connects.
+EXPECTED_INSERTS = 8
 HELPER_MODULE = "gateway.kanban_dispatch_failures"
 LOOKUP_MODULE = "gateway.chat_turn_metrics"
 PLUGIN_PACKAGE = "chat_metrics"
