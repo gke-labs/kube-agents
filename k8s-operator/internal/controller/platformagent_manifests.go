@@ -162,6 +162,20 @@ const (
 	// online, where the StorageClass allows expansion. install.defaults.env and
 	// the Terraform variable carry the same default, and a test pins them equal.
 	agentDataStorageSize = "50Gi"
+	// dataVolumeBaseSize and perClusterProfileStorage size the agent's data
+	// claim by spec.storage.expectedClusterProfiles: base + N x per-profile,
+	// rounded up to whole GiB (ResolveAgentDataStorageSize). Both are measured
+	// for Hermes' session store at the default 90-day retention
+	// (hack/session_retention_sim.py; results on gke-labs/kube-agents#3704):
+	//   - per profile: a fleet-average Cluster Agent profile's ceiling, 86 MiB of
+	//     live sessions x slack 4.0 = 345 MiB (measured settled: 291 MiB), plus
+	//     Hermes' log cap for two log names (40 MiB) and the scaffold, rounded up;
+	//   - base: the Platform Agent profile's ceiling (5.45 GiB, settled 3.47 GiB),
+	//     the machine home's store, kanban and caches (about 0.14 GiB measured),
+	//     plus 25%, rounded up.
+	// Re-measure both if the session store or the retention default changes.
+	dataVolumeBaseSize       = "8Gi"
+	perClusterProfileStorage = "400Mi"
 	credentialProxyPort  = 8765
 	// The Chat consumers' broker env: the project id both carry, the legacy
 	// consumer's subscription name, and the fully qualified subscription
@@ -2492,16 +2506,16 @@ func buildPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolumeClaim 
 			StorageClassName: storageClassName,
 			Resources: corev1.VolumeResourceRequirements{
 				Requests: corev1.ResourceList{
-					corev1.ResourceStorage: ResolveDataStorageSize(agent),
+					corev1.ResourceStorage: ResolveAgentDataStorageSize(agent),
 				},
 			},
 		},
 	}
 }
 
-// ResolveDataStorageSize is the size of the agent's data claim and of the
-// sandbox's data claim: spec.storage.size when it is set and above zero, and
-// agentDataStorageSize otherwise. The admission webhook refuses a value of zero
+// ResolveDataStorageSize is the size of the sandbox's data claim, and the floor
+// of the agent's (ResolveAgentDataStorageSize): spec.storage.size when it is
+// set and above zero, and agentDataStorageSize otherwise. The admission webhook refuses a value of zero
 // or less, but the chart ships the webhook off; the fallback keeps such a CR on
 // the default rather than on a claim the API server refuses to create.
 func ResolveDataStorageSize(agent *agentv1alpha1.PlatformAgent) resource.Quantity {
@@ -2509,6 +2523,28 @@ func ResolveDataStorageSize(agent *agentv1alpha1.PlatformAgent) resource.Quantit
 		return storage.Size.DeepCopy()
 	}
 	return resource.MustParse(agentDataStorageSize)
+}
+
+// ResolveAgentDataStorageSize is the size of the agent's own data claim:
+// ResolveDataStorageSize, raised to dataVolumeBaseSize + N x
+// perClusterProfileStorage (rounded up to whole GiB) when
+// spec.storage.expectedClusterProfiles sets N. It never comes out lower than
+// ResolveDataStorageSize, so the field can only grow the claim.
+func ResolveAgentDataStorageSize(agent *agentv1alpha1.PlatformAgent) resource.Quantity {
+	size := ResolveDataStorageSize(agent)
+	storage := agent.Spec.Storage
+	if storage == nil || storage.ExpectedClusterProfiles == nil || *storage.ExpectedClusterProfiles < 1 {
+		return size
+	}
+	base := resource.MustParse(dataVolumeBaseSize)
+	perProfile := resource.MustParse(perClusterProfileStorage)
+	need := base.Value() + int64(*storage.ExpectedClusterProfiles)*perProfile.Value()
+	const gib = int64(1) << 30
+	formula := resource.NewQuantity((need+gib-1)/gib*gib, resource.BinarySI)
+	if formula.Cmp(size) > 0 {
+		return *formula
+	}
+	return size
 }
 
 func buildSystemPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolumeClaim {

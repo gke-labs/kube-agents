@@ -1266,6 +1266,19 @@ The chart sets it from `platformAgent.storage.size`, the Terraform composition f
 `platform_agent_storage_size` and `install.sh` from `PLATFORM_AGENT_STORAGE_SIZE` in `install.env`.
 While the value is the default, the composition passes the chart nothing, so the CR carries no field.
 
+`expectedClusterProfiles` (1 to 20000) is how many Cluster Agent profiles the install is expected
+to hold, one per cluster in scope. It raises the agent's `<name>-data` claim, and not the sandbox's,
+to at least `8Gi` plus `400Mi` per profile, rounded up to whole GiB. That's the size the session
+stores settle at under the default 90-day retention
+([Fleet sizing → The data volume](/kube-agents/deploy/fleet-sizing/#the-data-volume)). The claim
+takes the larger of that and `size` (or the default), so the field only raises it, and the formula
+passes the `50Gi` default above 107 profiles.
+
+Raising it grows the existing claim online, as a
+raised `size` does, and the `DataVolumeNotExpanded` condition covers a class that can't expand it.
+The sandbox's claim holds no session stores; the copy it takes of the agent's working directories
+leaves them out. The chart sets it from `platformAgent.storage.expectedClusterProfiles`.
+
 ## `spec.telemetry`
 
 - `otlpEndpoint` — the OTLP/HTTP collector **base** URL (no `/v1/traces` suffix; the exporters append their own per-signal path). Up to 2048 characters, `http://` or `https://`.

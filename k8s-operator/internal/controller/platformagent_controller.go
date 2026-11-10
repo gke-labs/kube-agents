@@ -414,8 +414,9 @@ const (
 	dataVolumeExpansionBlockedReason = "StorageClassCannotExpand"
 	// dataVolumeExpansionMessageFormat takes the claim, its current request,
 	// the resolved size and one of the three sentences below that say why.
-	dataVolumeExpansionMessageFormat = "Claim %s requests %s, and the data volume size (spec.storage.size, or the " +
-		"operator default) is %s. %s The operator leaves the claim at its current size."
+	dataVolumeExpansionMessageFormat = "Claim %s requests %s, and the data volume size (spec.storage.size or the " +
+		"operator default, raised for spec.storage.expectedClusterProfiles on the agent's claim) is %s. %s The " +
+		"operator leaves the claim at its current size."
 	dataVolumeNoStorageClassReason  = "The claim names no StorageClass, so it cannot expand."
 	dataVolumeStorageClassGoneFmt   = "StorageClass %q does not exist, so the claim cannot expand."
 	dataVolumeStorageClassFixedFmt  = "StorageClass %q does not allow volume expansion. Set allowVolumeExpansion: true on the class to let the claim grow."
@@ -1650,14 +1651,16 @@ func (r *PlatformAgentReconciler) reconcilePVC(ctx context.Context, agent *agent
 			return err
 		}
 	}
-	// The data claim follows ResolveDataStorageSize on an existing install too.
+	// The data claim follows ResolveAgentDataStorageSize on an existing install too.
 	// reconcilePersistentVolumeClaim is create-only, so without this a size
 	// raised to stop the volume filling would reach new installs only, and
 	// every install that already had the problem would keep it.
 	//
 	// The sandbox's claim grows first. It is the destination of the mirror, so
-	// a park, an error or a refusal between the two grows leaves the sandbox
-	// claim the larger one, never the smaller. This also runs before
+	// a park, an error or a refusal between the two grows leaves it at its full
+	// size before the agent's grows. The agent's claim can be the larger one by
+	// spec.storage.expectedClusterProfiles: that budget is for the session
+	// stores, which the mirror does not copy. This also runs before
 	// reconcileShellSandbox applies the StatefulSet.
 	r.growShellSandboxDataClaim(ctx, agent)
 	key := client.ObjectKeyFromObject(dataClaim)
@@ -3009,7 +3012,9 @@ func (r *PlatformAgentReconciler) ungatedDNSClusterIPs(ctx context.Context, agen
 	return r.resolveNetpolProfile(ctx, ungated).DNSClusterIPs
 }
 
-// growShellSandboxDataClaim widens the sandbox's data claim to match the agent's.
+// growShellSandboxDataClaim widens the sandbox's data claim to ResolveDataStorageSize:
+// the agent's claim without the per-profile budget, which covers session stores
+// the mirror does not copy.
 //
 // A StatefulSet's volumeClaimTemplate sizes only the claims it creates, so an
 // install from before the current ResolveDataStorageSize keeps the size it was
@@ -3080,8 +3085,9 @@ func (r *PlatformAgentReconciler) forgetDataVolumeExpansion(agent *agentv1alpha1
 	}
 }
 
-// dataClaimKeys are the two claims ResolveDataStorageSize sizes: the agent's
-// own data claim and the sandbox's.
+// dataClaimKeys are the two data claims: the agent's own, which
+// ResolveAgentDataStorageSize sizes, and the sandbox's, which
+// ResolveDataStorageSize sizes.
 func dataClaimKeys(agent *agentv1alpha1.PlatformAgent) []client.ObjectKey {
 	return []client.ObjectKey{
 		client.ObjectKeyFromObject(buildPVC(agent)),

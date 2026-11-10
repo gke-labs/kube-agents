@@ -160,6 +160,43 @@ pressure, and the pod table's ephemeral figures plus the node's images have to f
 eviction threshold with room left. About $900 to $1,100 a month on demand at `us-central1` list
 prices, modeled.
 
+## The data volume
+
+The agent's `<name>-data` claim holds every profile's session store, and each Cluster Agent
+profile is one cluster in scope. Under the default 90-day session retention a store keeps
+growing well past the period: SQLite reuses the pages a prune frees only partly, so the file
+settles at a multiple of its live data. These settled sizes are **modeled**. They come from a
+simulation against the session store (`hack/session_retention_sim.py`), with inputs measured
+on a dev fleet:
+
+| Profile                                                        | 90-day retention | 7-day retention        |
+| -------------------------------------------------------------- | ---------------- | ---------------------- |
+| A Cluster Agent profile (10 cards a day, about 25 KB each)     | 291 MiB          | 18.6 MiB               |
+| The Platform Agent's own profile (18 cards a day, 220 KB each) | 3.47 GiB         | not settled by day 300 |
+
+**At the 50Gi default the claim fills at about 176 Cluster Agent profiles.** Set
+`platformAgent.storage.expectedClusterProfiles` (CR: `spec.storage.expectedClusterProfiles`)
+to the number of clusters you expect in scope, and the operator sizes the agent's claim to at
+least:
+
+```text
+8Gi + expectedClusterProfiles x 400Mi, rounded up to whole GiB
+```
+
+That is the Platform Agent's stores plus 25% for the base, and each Cluster Agent profile's
+ceiling (its live sessions at four times their size) plus Hermes' log cap per profile. The
+claim takes the larger of the formula and `platformAgent.storage.size`, or the 50Gi default,
+so the count only raises it. **The formula passes 50Gi above 107 profiles**, so an install
+of more than about 100 clusters on the default should set it. For example, 200 profiles is
+87Gi and 2,500 is 985Gi.
+
+Raising the count later expands the existing claim online where its StorageClass allows
+expansion. `standard-rwo` and `standard` do on GKE. Where a class doesn't, the
+`DataVolumeNotExpanded` condition says so, and the claim keeps its size. The shell sandbox's
+claim holds no session stores and stays at `size` or the default. A namespace
+`requests.storage` quota counts the raised agent claim, and the chart's quota preflight
+counts it the same way.
+
 ## The fleet values file
 
 [`charts/kube-agents/examples/values-fleet.yaml`](https://github.com/gke-labs/kube-agents/blob/main/charts/kube-agents/examples/values-fleet.yaml)
@@ -169,7 +206,9 @@ caveat beside it:
 - `operator.resources`: 1 GiB memory, request and limit alike, for a host cluster at or past
   50,000 objects. The chart's floor on the limit is 512 MiB.
 - `platformAgent.storage.size: 100Gi`: both data claims. A claim cannot shrink, and each GiB
-  counts twice against a namespace `requests.storage` quota.
+  counts twice against a namespace `requests.storage` quota. For a fleet of more than about 230
+  clusters, also set `platformAgent.storage.expectedClusterProfiles`
+  ([The data volume](#the-data-volume)), which raises the agent's claim alone.
 - `platformAgent.harness.tuning.maxInProgress: 3`: kanban workers at once, board-wide.
 - `platformAgent.deployment.credentialProxy.resources`: 4 vCPU and 8 GiB requests, 8 vCPU and
   8 GiB limits. The broker admits at most eight commands at once, a cap the operator fixes, and

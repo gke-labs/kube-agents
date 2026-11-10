@@ -708,11 +708,14 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 			// claims running throughout.
 			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
 				{
-					// Sized from the agent's own /opt/data claim, not independently.
+					// Sized like the agent's own /opt/data claim, not independently.
 					// sandbox_mirror.py copies a subset of that volume into this one
 					// on upgrade, so matching them makes the migration fit by
 					// construction — see agentDataStorageSize. spec.storage.size
-					// moves both, through ResolveDataStorageSize.
+					// moves both, through ResolveDataStorageSize. The agent's claim
+					// alone adds the per-profile budget for
+					// spec.storage.expectedClusterProfiles: it covers the session
+					// stores, which the mirror does not copy.
 					ObjectMeta: metav1.ObjectMeta{Name: shellSandboxDataVolume},
 					Spec: corev1.PersistentVolumeClaimSpec{
 						AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},

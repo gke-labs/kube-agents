@@ -72,6 +72,21 @@ type PlatformAgentStorageSpec struct {
 	// Removing the field never shrinks a claim.
 	// +optional
 	Size *resource.Quantity `json:"size,omitempty"`
+
+	// ExpectedClusterProfiles is how many Cluster Agent profiles the install is
+	// expected to hold, one per cluster in scope. It sizes the agent's own
+	// <name>-data claim to at least a base for the Platform Agent's stores plus
+	// a per-profile budget for each, measured at the default 90-day session
+	// retention (dataVolumeBaseSize and perClusterProfileStorage in the
+	// controller). The claim takes the larger of that and Size, or the operator
+	// default when Size is absent, so this only ever raises it. Raising it
+	// expands the existing claim online where the StorageClass allows. The
+	// shell sandbox's claim holds no session stores and keeps Size or the
+	// default. The formula passes the 50Gi default above 107 profiles.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=20000
+	// +optional
+	ExpectedClusterProfiles *int32 `json:"expectedClusterProfiles,omitempty"`
 }
 
 // ScopeSpec is the opt-in set of projects, folders and organisations, plus the Shared
