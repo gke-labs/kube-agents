@@ -6664,6 +6664,41 @@ class AlertDailyLimitsRecordedInInstallEnvTest(unittest.TestCase):
         self.assertRegex(text, re.compile(r"^ALERT_DAILY_LIMIT_WARNING=''$", re.MULTILINE))
 
 
+class LitellmBudgetPersistsThroughInstallEnvTest(unittest.TestCase):
+    """The same walk for LITELLM_BUDGET_USD and LITELLM_BUDGET_PERIOD, which
+    have no flag: the first run records what the environment exported, the
+    next run's environment reads it back for the tfvars generator, and an
+    unset pair is recorded empty, which the generator turns into the defaults
+    (0, no ceiling; 1d)."""
+
+    _bootstrap_with_export = ModelMaxTokensPersistsThroughInstallEnvTest._bootstrap_with_export
+    _read_back = ModelMaxTokensPersistsThroughInstallEnvTest._read_back
+
+    @staticmethod
+    def _env(overrides):
+        # Both keys are in SEEDED_INSTALLER_ENV_KEYS, so a developer's own
+        # exported value never stands in for the file.
+        return get_isolated_test_env(overrides=overrides)
+
+    def test_the_first_run_records_the_export_and_the_next_run_reads_it_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = self._bootstrap_with_export(tmp, 'export LITELLM_BUDGET_USD="2.50" LITELLM_BUDGET_PERIOD="7d"')
+            text = dest.read_text()
+            self.assertIn("LITELLM_BUDGET_USD=2.50\n", text)
+            self.assertIn("LITELLM_BUDGET_PERIOD=7d\n", text)
+            out = self._read_back(dest, "bash -c 'echo \"USD=[$LITELLM_BUDGET_USD] PERIOD=[$LITELLM_BUDGET_PERIOD]\"'")
+            self.assertIn("USD=[2.50] PERIOD=[7d]", out)
+
+    def test_an_unset_pair_is_recorded_empty_and_reads_back_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = self._bootstrap_with_export(tmp, ":")
+            text = dest.read_text()
+            self.assertIn("LITELLM_BUDGET_USD=''\n", text)
+            self.assertIn("LITELLM_BUDGET_PERIOD=''\n", text)
+            out = self._read_back(dest, "bash -c 'echo \"USD=[$LITELLM_BUDGET_USD] PERIOD=[$LITELLM_BUDGET_PERIOD]\"'")
+            self.assertIn("USD=[] PERIOD=[]", out)
+
+
 class LitellmRedactionPersistsThroughInstallEnvTest(unittest.TestCase):
     """The same walk for the LITELLM_REDACTION_* keys: the first run records
     what main() exported, the next run's parameter block and environment read

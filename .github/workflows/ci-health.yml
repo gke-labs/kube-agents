@@ -515,7 +515,7 @@ jobs:
 
       # The watched Prow periodics (scripts/eval_dashboard/periodics.py:
       # the pull sweep, the daily seeded-fleet reconcile and its postsubmit run,
-      # and the certification lane's weekly slice, read from the nightlies' bucket): their latest
+      # the certification lane's weekly slice and the replay lane, both read from the nightlies' bucket): their latest
       # finished build each, for the note health.py carries and the poster
       # sends once when one fails or stops running. Best-effort like the
       # read above: a job that has never run writes nothing, a denied read
