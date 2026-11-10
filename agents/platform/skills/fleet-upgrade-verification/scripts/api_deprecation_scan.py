@@ -507,6 +507,10 @@ def read_repo_in_parts(
     # else to ask for, so every batch and every subtree a refusal lists is
     # read first.
     halves: list[list[dict]] = []
+    requests: list[list[dict]] = []
+    # Each split entry's refusal, so one still queued when the scan stops is
+    # listed with it: the broker refused it once already.
+    refused_with: dict[str, str] = {}
     while (pending or halves) and not read.stopped:
         for entry in list(pending):
             reason = entry.get(ENTRY_UNNAMED) or _name_refusal(entry["path"])
@@ -535,6 +539,7 @@ def read_repo_in_parts(
             elif total_bytes >= max_bytes:
                 read.stopped = STOPPED_MAX_BYTES
             if read.stopped:
+                requests.insert(0, batch)
                 break
             if read.parts >= NARROW_SNAPSHOT_CAP:
                 read.unread.extend(
@@ -553,6 +558,7 @@ def read_repo_in_parts(
                 elif len(batch) > 1 and refused.code in (PATH_NOT_FOUND, vcs_client.SNAPSHOT_TOO_LARGE):
                     half = len(batch) // 2
                     halves.extend([batch[:half], batch[half:]])
+                    refused_with.update((entry["path"], str(refused)) for entry in batch)
                 elif refused.code == vcs_client.SNAPSHOT_TOO_LARGE and len(batch) == 1:
                     read.unread.append(
                         {"path": batch[0]["path"], "reason": UNREAD_NO_LISTING.format(refusal=refused)}
@@ -578,6 +584,13 @@ def read_repo_in_parts(
             total_bytes += sum(len(data) for data in got.files.values())
             read.skipped.extend(list(answer.get("skipped") or []) + got.skipped)
             read.stopped = got.stopped
+    if read.stopped:
+        read.unread.extend(
+            {"path": entry["path"], "reason": refused_with[entry["path"]]}
+            for batch in requests + halves
+            for entry in batch
+            if entry["path"] in refused_with
+        )
     # The section names a commit its files came from; the refused one only
     # when no part was read.
     read.sha = read.revisions[0] if read.revisions else read.refused_revision

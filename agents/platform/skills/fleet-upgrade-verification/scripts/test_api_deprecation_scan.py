@@ -705,6 +705,17 @@ class InPartsTest(unittest.TestCase):
         past = scan.UNREAD_PAST_CAP.format(cap=3)
         self.assertEqual([{"path": "a", "reason": past}, {"path": "b", "reason": past}], read.unread)
 
+    def test_halves_still_queued_when_the_scan_stops_are_listed_with_their_refusal(self):
+        # Two batches: (a, b) is refused for "a" and split; (c, d) fills the file cap.
+        fake = FakeParts(self.FOUR, {None: [entry("a", 400), entry("b", 400), entry("c", 400), entry("d", 400)]})
+        snapshot = self.refusing(fake, lambda paths: (
+            scan.vcs_client.VcsError("gone", code=scan.PATH_NOT_FOUND) if "a" in paths else None))
+        read = scan.read_repo_content("acme/infra", max_files=2, snapshot=snapshot)
+        self.assertEqual([None, ("a", "b"), ("c", "d")], fake.calls)
+        self.assertEqual(scan.STOPPED_MAX_FILES, read.stopped)
+        self.assertEqual(["c/three.yaml", "d/four.yaml"], sorted(read.files))
+        self.assertEqual([{"path": "a", "reason": "gone"}, {"path": "b", "reason": "gone"}], read.unread)
+
     def test_an_entry_the_broker_marks_as_unnamed_is_listed_with_its_reason_and_never_asked_for(self):
         why = "its name is not UTF-8, so a snapshot cannot ask for it"
         fake = FakeParts(self.TREE, {None: [
