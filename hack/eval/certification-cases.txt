@@ -46,6 +46,13 @@
 # (item 2).
 ./tasks/networking-ip-masq-agent-missing-ccc-toleration/task.yaml
 # Capability row: observability, logging and Managed Prometheus; the
+# obtainability audit on a Deployment whose container is throttled at its 50m
+# CPU limit with zero restarts (the planted fluent-bit in seeded-logging, a
+# busybox busy loop under equal requests and limits). A declared gap,
+# expected_fail: no audit reads a container's CPU usage against its CPU limit;
+# the gap is #2579, whose OOM half is observability-gmp-kube-state-metrics-oom.
+./tasks/observability-fluentbit-dcgm-cpu-throttling-oom/task.yaml
+# Capability row: observability, logging and Managed Prometheus; the
 # obtainability audit on a Deployment whose container is OOM-killed in a loop
 # (the planted kube-state-metrics in seeded-observability, busybox under a 64Mi
 # limit). A declared gap, expected_fail: no audit reads a container's OOMKilled
