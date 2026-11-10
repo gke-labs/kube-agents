@@ -105,9 +105,10 @@ set `FLEET_READONLY_SA=seeded-fleet-reader@<project>.iam.gserviceaccount.com` â€
 grants token-creator to the CI identities only, and `roles/owner` does not include it. Without the fleet the case
 fails every time with the fleet phrases absent, which is broken, not red.
 
-It must fail, and fail for the reason your change addresses. Keep the failing entry from
-`verification_report[]` in the run's `results.json` (its `status` and `reason`) and the line of the
-agent's report that shows the gap; the pull request quotes both. A case that passes before the
+It must fail, and fail for the reason your change addresses. Keep the run directory: its
+`results.json` carries the failing entry of `verification_report[]` and the agent's report. The pull
+request names the failing check and cites the run; it quotes neither
+([`public_surfaces.md`](public_surfaces.md)). A case that passes before the
 change proves nothing about it. A case that fails for an unrelated reason (a missing fixture, a
 token, a 429) is not red, it is broken; fix that first or pick another case.
 
@@ -168,9 +169,10 @@ Under **Testing â†’ Live validation** in the template, which for a change to age
 is this loop and nothing less, unless one of the two agent-behaviour exemptions applies:
 
 - the case id, and whether it is new or existing;
-- red: the install and the `main` commit it ran against, the failing check and its reason, one
-  line of the agent's report;
-- green: the three runs (directories or a one-line summary each) against the branch's build;
+- red: the install and the `main` commit it ran against, the failing check's name, and the run's
+  build id or directory path (the record stays in the run: [`public_surfaces.md`](public_surfaces.md);
+  a dev run's directory is shared with the reviewer who asks, off GitHub);
+- green: the three runs' build ids or directory paths against the branch's build;
 - where the case is registered, or the exemption (one line, or the fuller record the two
   agent-behaviour exemptions take).
 

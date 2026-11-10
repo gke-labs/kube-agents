@@ -1155,6 +1155,33 @@ eval crew approves every roster line. Locally,
 `python3 scripts/eval_dashboard/coverage_gaps.py --data data.json [--store store.json]`
 is a dry run; `--live` writes.
 
+## Scrubbing the bots' older posts
+
+The posts above carried pass ratios, repetition counts, failing-check reasons and, on the
+outage issue, the failing cases and the evidence lines until the bots stopped writing them.
+`scripts/eval_dashboard/scrub_bot_posts.py` is the one-off that brings the posts already on
+GitHub to the current shape, run by a person with a repository-write token (`GH_TOKEN`) against
+`--repo` (default `GITHUB_REPOSITORY`, else `gke-labs/kube-agents`): dry run by default and
+`--live` to write, `--pace` seconds between writes (default 2, under GitHub's secondary limits
+of about 80 content writes a minute and 500 an hour), `--limit` writes at most (default none),
+`--since` bounding the repository-wide comment listing (default 2026-09-01), `--show-bodies`
+printing each edit's new body; it stops after three writes in a row fail. It plans one action
+per post from the post's own markers. Comments are deleted, issues are edited: the smoke-gate
+pull-request comments go (the verdict lives in the private bucket and on the dashboard; one on
+an open pull request is left for the next red tick to rewrite, and so is one already in the
+current shape), and
+so do the bot's recovery and later-night comments on the nightly issues (an edited comment
+would keep its history, and the issue's nights list carries the dates and links); the
+nightly-red and kept-case issues are rewritten to the current templates with their run and
+transcript links in Console form, the lost-nights issues get the same links; a coverage-gap
+issue gets the current candidates sentence and the first column of its table; the outage
+issue is retitled and its body rewritten with the marker; the lost-pods, deadline,
+fixture-drift and pool-drift issues keep only their own evidence lines. A post already in the
+current shape plans as a skip, so a second run finds nothing to do. GitHub keeps an edited
+issue's revision history, which the script cannot clear: it prints the edited issues' URLs,
+and that step is done by hand in the web UI. Human posts and the review bot's comments are
+out of scope.
+
 ## The domain scorecard
 
 `scripts/eval_dashboard/understudies.py` writes one row per domain in

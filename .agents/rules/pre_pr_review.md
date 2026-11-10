@@ -114,6 +114,8 @@ in `AGENTS.md` under Pull Request Hygiene.
 - **If the change cannot reach a running installation** — docs-only, a CI workflow, a code path
   that needs infrastructure you do not have — write "Not live-tested" and say why. An empty
   section is not an answer.
+- **The section names the outcome and where the record is**, nothing from inside it:
+  [`public_surfaces.md`](public_surfaces.md).
 
 ## Keeping the sections current
 

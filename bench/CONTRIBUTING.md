@@ -165,8 +165,10 @@ refuses a roster name that is not a presubmit case, refuses a case listed in bot
 `scripts/test_eval_rosters.py` pins the two presubmit files as equal less those held-out seats —
 and cites the record:
 the verdict's **Record says** column once the store holds a full window (`would-admit`), or
-before that the nightly runs, what failed and why each failure was the case's own regression
-or an infrastructure class the harness already excludes. The roster page's hold-out entries
+before that the nightly runs, and the failed runs by build id, each classified as an agent
+regression (with its issue) or an infra class the harness already excludes (`rep_kind` in
+`scripts/eval_dashboard/classify.py`); no reasons, counts or ratios
+(`.agents/rules/public_surfaces.md`). The roster page's hold-out entries
 are the shape of the evidence a reviewer expects, and its "Admitted on the record since the
 split" entries are the shape of the admission itself. A seat also meets the five rules under
 "The five rules a seat meets" on that page; the pull request shows the red run and the
