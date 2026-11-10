@@ -19393,6 +19393,28 @@ def requested_generated_fixes(
     return fixes
 
 
+def _generated_fix_branches(
+    findings: list[dict], manifest: dict | None, generated: dict[str, UnwrittenFix], audit_id: str
+) -> set[str]:
+    """The branches the budgets in `generated` would be opened on, in both the
+    plain and the install-scoped spelling, as `plan_generated_fixes` names them."""
+    candidates = {_candidate_identity(entry, candidate): candidate for entry, candidate in _candidates(manifest)}
+    branches: set[str] = set()
+    for finding in findings:
+        fid = str(finding.get("id", ""))
+        fix = generated.get(fid)
+        built = _pdb_manifest(candidates.get(derive_finding_id(finding)) or {}, fid) if fix else None
+        if built is None:
+            continue
+        path = str(PurePosixPath(fix.path).parent / f"{built[0]}{GENERATED_PDB_EXTENSION}")
+        as_written = [{"id": fid, "remediation": {"kind": "manifest", "path": path}}]
+        branches.add(group_branch_for(audit_id, as_written))
+        scoped = scoped_group_branch_for(audit_id, as_written)
+        if scoped:
+            branches.add(scoped)
+    return branches
+
+
 def _delta_carried_fixes(prs: list[dict], *, open_only: bool = False) -> set[str]:
     """Every finding id that the delta block of a pull request names, when the
     harness did not close that pull request: open, merged, or closed by a person.
@@ -22722,15 +22744,16 @@ def handle_remediate(args: argparse.Namespace) -> None:
     # A budget the worker named at the workload's own declaration would replace
     # the Deployment on merge: demoted to `manual` as `finish` demotes it, so
     # the planner below writes it beside the declaration instead.
-    for fid in demote_fixes_over_declarations(findings, manifest):
-        if fid in args.finding:
-            log(
-                f"{fid} names its PodDisruptionBudget at the workload's own "
-                "declaration; the budget is written beside it instead."
-            )
+    on_declaration = demote_fixes_over_declarations(findings, manifest)
     # A declared budget the worker left `manual` for `finish` to write is
     # written here the same way, below, rather than refused.
     generated = requested_generated_fixes(findings, manifest, args.finding)
+    for fid in sorted(set(on_declaration) & set(generated)):
+        log(
+            f"{'DRY RUN: ' if args.dry_run else ''}{fid} names its PodDisruptionBudget at the "
+            "workload's own declaration; "
+            + ("the real run writes the budget beside it instead." if args.dry_run else "the budget is planned beside it instead.")
+        )
     not_manifest = [
         fid
         for fid in args.finding
@@ -22836,16 +22859,30 @@ def handle_remediate(args: argparse.Namespace) -> None:
     # `manifest` remediation. One the planner will not write is refused by
     # name with its reason, as an unwritten manifest is below.
     ungenerated: dict[str, str] = {}
+    # One probe for every repository question below, as in `finish`. The
+    # worker's budget is still in the declaration files it was demoted from;
+    # it names nothing the repository holds, so the name search reads past it.
+    probe = _RepositoryProbe(repo, root)
+    probe.ignored = set(on_declaration.values())
+    atexit.register(probe.close)
     if generated:
         skipped: dict[str, str] = {}
-        probe = _RepositoryProbe(repo, root)
-        try:
-            planned, answered = plan_generated_fixes(
-                findings, manifest, generated, {}, remediation_prs or [], root, probe, audit_id, skipped
-            )
-            write_generated_fixes(findings, planned, root)
-        finally:
-            probe.close()
+        # A pull request on the budget's own branch is this command's to judge,
+        # not the planner's: `promotion_candidates` below reports a human close
+        # as superseded and honours --override-human-close, as for any fix.
+        own = _generated_fix_branches(findings, manifest, generated, audit_id)
+        planned, answered = plan_generated_fixes(
+            findings,
+            manifest,
+            generated,
+            {},
+            [pr for pr in remediation_prs or [] if pr.get("headRefName") not in own],
+            root,
+            probe,
+            audit_id,
+            skipped,
+        )
+        write_generated_fixes(findings, planned, root)
         for fid in sorted(set(generated) - set(planned)):
             ungenerated[fid] = skipped.get(fid) or (
                 f"a {noun} the harness did not close already carries it"
@@ -22872,7 +22909,6 @@ def handle_remediate(args: argparse.Namespace) -> None:
         )
     # A new file its kustomization does not list renders nothing, so a pull
     # request for it is refused the same way: by name, with the rest kept.
-    probe = _RepositoryProbe(repo, root)
     try:
         unlisted = set(degrade_unlisted_kustomize_additions(findings, probe, noun))
         # A pull request that `remediate` opens carries the Config Connector

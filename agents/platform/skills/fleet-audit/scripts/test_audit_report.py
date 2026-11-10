@@ -38012,26 +38012,85 @@ class TestRemediateWritesTheGeneratedBudget(HarnessTestCase):
         self.assertEqual(self.harness.calls, [])
         self.assertFalse((self.stream_tree() / self.GENERATED).exists())
 
-    def test_a_budget_named_over_the_declaration_is_written_beside_it(self):
-        """The worker named the Deployment's own file as the budget's path: a
-        merge would replace the workload, so it is demoted and written beside,
-        as `finish` does."""
+    WORKER_BUDGET = (
+        "apiVersion: policy/v1\nkind: PodDisruptionBudget\nmetadata:\n"
+        "  name: checkout-gateway-pdb\n  namespace: payments\nspec:\n  maxUnavailable: 1\n"
+    )
+
+    def run_over_declaration(self, extra=()):
+        """The worker wrote its budget over the Deployment's own file, under the
+        conventional `<workload>-pdb` name, and named that file as the fix."""
+        declaration = self.stream_tree() / self.DECLARATION
+        declaration.parent.mkdir(parents=True, exist_ok=True)
+        declaration.write_text(self.WORKER_BUDGET, encoding="utf-8")
         finding = self.finding()
         finding["remediation"] = {"kind": "manifest", "path": self.DECLARATION, "note": "x"}
         self.record_run(context=["acme/fleet"])
         path = self.write_findings(searched_doc(findings=[finding]))
+        return self.run_main(
+            ["remediate", "--audit", self.STREAM, "--findings-file", path, "--finding", self.fid(),
+             "--manifest-file", self.manifest_file(), *extra]
+        )
+
+    def test_a_budget_named_over_the_declaration_is_written_beside_it(self):
+        """A merge of the worker's file would replace the workload, so it is
+        demoted and the budget written beside, as `finish` does. The name search
+        reads past the worker's file, which names nothing the repository holds."""
         self.harness.replies = {
             "issue-list": self.issue_list(),
             "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/9"),
         }
-        rc = self.run_main(
-            ["remediate", "--audit", self.STREAM, "--findings-file", path, "--finding", self.fid(),
-             "--manifest-file", self.manifest_file()]
-        )
+        rc = self.run_over_declaration()
         self.assertEqual(rc, 0, self.err)
-        self.assertIn("written beside it instead", self.err)
+        self.assertNotIn("already names an object", self.err)
+        self.assertIn("the budget is planned beside it instead", self.err)
+        self.assertEqual(self.stdout_json()["prs_opened"], ["https://github.com/acme/fleet/pull/9"])
         self.assertTrue((self.stream_tree() / self.GENERATED).is_file())
-        self.assertFalse((self.stream_tree() / self.DECLARATION).exists())
+
+    def test_the_dry_run_says_so_for_a_budget_over_the_declaration(self):
+        rc = self.run_over_declaration(["--dry-run"])
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn("DRY RUN: " + self.fid() + " names its PodDisruptionBudget", self.err)
+        self.assertNotIn("the budget is planned beside it instead", self.err)
+        self.assertFalse((self.stream_tree() / self.GENERATED).exists())
+
+    def test_a_withheld_selector_over_the_declaration_is_not_announced_as_written(self):
+        self.manifest_file = lambda real=self.manifest_file: real(pod_selector_withheld="other pods match")
+        self.assertEqual(self.run_over_declaration(), 2)
+        self.assertNotIn("beside it instead", self.err)
+
+    def human_closed_own_branch(self):
+        branch = audit_report.group_branch_for(
+            self.STREAM, [{"id": self.fid(), "remediation": {"kind": "manifest", "path": self.GENERATED}}]
+        )
+        return proposals_view(
+            [
+                {
+                    **pr(8, branch, state="CLOSED", body=audit_report.delta_block([self.fid()])),
+                    "closedAt": "2026-07-15T00:00:00Z",
+                    "labels": [],
+                }
+            ]
+        )
+
+    def test_a_human_close_on_the_budgets_own_branch_is_superseded(self):
+        self.harness.replies = {"issue-list": self.issue_list(), "proposal-list": self.human_closed_own_branch()}
+        rc = self.run_remediate(["--manifest-file", self.manifest_file()])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["superseded"], [self.fid()])
+        self.assertEqual(self.stdout_json()["refused"], [])
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+
+    def test_the_override_flag_revives_a_human_closed_budget(self):
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "proposal-list": self.human_closed_own_branch(),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/10"),
+        }
+        rc = self.run_remediate(["--manifest-file", self.manifest_file(), "--override-human-close"])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["superseded"], [])
+        self.assertEqual(self.stdout_json()["prs_opened"], ["https://github.com/acme/fleet/pull/10"], self.err)
 
     def test_a_withheld_selector_is_not_planned(self):
         manifest = json.loads(pathlib.Path(self.manifest_file(pod_selector_withheld="other pods match")).read_text())

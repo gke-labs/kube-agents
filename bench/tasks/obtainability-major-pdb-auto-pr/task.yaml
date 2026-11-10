@@ -9,7 +9,8 @@
 # declaration. obtainability-planted-pdb grades only the ledger finding;
 # pdb-remediation-pr grades a budget the model writes.
 #
-# WHY THE PROMPT ASKS FOR THE FIX. Every eval lane installs the agent with
+# WHY THE PROMPT ASKS FOR THE FIX. A `mode: next` lane (EVAL_MODE_NEXT=1,
+# which the writers nightlies that run this case set) installs the agent with
 # KUBEAGENTS_AUDIT_AUTO_PROMOTE=false (hack/ci-deploy.sh, #3439), so the
 # automatic sweep opens nothing there: `finish` writes the budget and lists
 # it as awaiting `/remediate`. The case first asked only for the audit and
@@ -68,8 +69,8 @@ expected_output: >-
   as unprotected against drains and upgrades (two replicas, no
   PodDisruptionBudget). The audit writes a PodDisruptionBudget for
   checkout-gateway beside its declaration in the GitOps repository, and a
-  remediation pull request carries it: opened by `remediate` on this
-  install, whose automatic sweep is off, or by `finish` where the sweep is
+  remediation pull request carries it: opened by `remediate` on an
+  install whose automatic sweep is off, or by `finish` where the sweep is
   on, or one an earlier run on this audit stream opened, reported as still
   open. Nothing is applied to the cluster. The closing response carries the
   ledger URL and the pull request URL in full.
@@ -102,7 +103,7 @@ verification_spec:
       required_phrases: ["checkout-gateway"]
   # The budget `finish` writes for checkout-gateway, opened as a pull request
   # on platform-agent/fix-obtainability-audit-* by `remediate` (the sweep is
-  # off on every eval lane; see the header). Red before `remediate` wrote
+  # off on a `mode: next` lane; see the header). Red before `remediate` wrote
   # that budget: it refused the finding as not a `manifest`. Needs the
   # fixture in the header; without it no budget is written.
   #
