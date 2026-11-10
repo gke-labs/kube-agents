@@ -768,7 +768,10 @@ resource "google_container_node_pool" "seeded_c_default" {
   # which stockout 3.12(b) would file on every project. One to one, so the
   # autoscaler can neither add a node nor remove the one. Drift's
   # pool-autoscaling facet flags only a cluster with LESS autoscaling than its
-  # peers (`_flag_less_only`), so the extra vote changes no finding.
+  # peers (`_flag_less_only`), so the extra vote changes no drift finding.
+  # The stockout audit's 3.9 `single-zone-nodepool` does read a zonal
+  # autoscaled pool with no fallback, as it reads pinned-inference-pool on
+  # slot a; README.md's accepted-background table declares it.
   autoscaling {
     min_node_count = 1
     max_node_count = 1
