@@ -559,7 +559,7 @@ lane's plumbing: the deploy refusing `EVAL_MODE_NEXT=1` because the job's name i
 that is also a presubmit or nightly case; a lease that never came (the pool reading in the job's pull request is why the slot is Saturday morning). An overdue note with no failed build means the
 Saturday run did not start: check the cron in the job and whether horologium created a run.
 
-### 5.10 The replay lane
+### 5.11 The replay lane
 
 `ci-kube-agents-eval-replay-lane` in `oss-test-infra` (`kube-agents-periodics.yaml`) runs daily at
 06:00 UTC with the nightlies' identity, decoration and log bucket
@@ -570,12 +570,15 @@ conversation's verdict against its recording's) is in the shadow bucket under
 `replay-shadow/replay-lane/<YYYY-MM-DD>/<build>/report/`, and its summary lines are in the job's
 `replay-shadow-collector.log`. ci-health watches the job
 ([the watched periodics](ci-health.md#the-watched-periodics)), so a failed or stale run is a
-health note and a digest line. It stops red before its cases when the cache gives it nothing: no
-answer arrived, a key was refused, the records could not be listed, or no live proxy pod took the
-cache. The download's summary line in the job log names which, and
+health note and a digest line. It stops red before its cases when no answer arrived, a key was
+refused or the records could not be listed (the download's summary line in the job log names
+which, by its error class), or when a proxy pod did not take the cache (the seed line above the
+error counts them).
 [`hack/replay-proxy/README.md`](../hack/replay-proxy/README.md#record-and-replay-the-replay-lane)
-explains each. A first red after a change to `hack/replay-proxy/normalizer.py` is expected until a
-nightly has recorded under the new normalizer version.
+explains each. Any edit to `hack/replay-proxy/normalizer.py` changes the cache's normalizer
+version, so a change that merges after the nightlies check out `main` (00:00 UTC) and before the
+lane does (06:00 UTC) leaves the lane nothing recorded under its version that morning: expect one
+red, cleared by the next night's recordings.
 
 ## 6. The seeded dirty fleet
 

@@ -4,7 +4,7 @@
 The pull sweep and the seeded-fleet reconciles run on the build cluster and
 report nowhere but TestGrid. This module reads each one's latest finished build
 from the bucket it logs to, gs://kube-agents-periodic-logs for the pool jobs and
-the nightlies' bucket for the certification slice, each entry's `logs_root`
+the nightlies' bucket for the certification slice and the replay lane, each entry's `logs_root`
 (`latest-build.txt`, then `finished.json`, then the report the job wrote and any
 extra report the entry names, on every finished build) and turns a failed or overdue run into
 a note health.py carries and post_health.py posts once, with the job's history
@@ -43,8 +43,8 @@ except ImportError:  # run as a script: python3 scripts/eval_dashboard/periodics
 # own identities, which cannot write gs://kube-agents-prow.
 LOGS_ROOT = "gs://kube-agents-periodic-logs/logs"
 # Where the eval lanes that share the nightlies' decoration log: the
-# certification slice job writes there, beside the nightlies, not to the
-# periodic-logs bucket the other watched jobs use.
+# certification slice and the replay lane write there, beside the nightlies,
+# not to the periodic-logs bucket the other watched jobs use.
 EVAL_NIGHTLY_LOGS_ROOT = collect.NIGHTLY_LOGS_ROOT
 # Deck's job-history page for a logs root: the gs:// prefix becomes a path
 # under this host, so a job logged in another bucket links to its own page.
@@ -382,8 +382,8 @@ WATCHED = (
         REPLAY_LANE_JOB, "inference replay lane", REPLAY_LANE_STALE_AFTER, None,
         "Inference replay lane", "the replay lane is not measuring replay", "the replay lane is measuring replay again",
         "runs daily at 06:00 UTC and replays the next-mode nightlies' recorded model answers on main, reporting the served share and verdict agreement under replay-shadow/replay-lane/",
-        "replay's hit rate and verdict agreement stop being measured, and a nightly that stopped recording, or a normalizer change no night has recorded under, goes unseen.",
-        f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#510-the-replay-lane",
+        "the served share and verdict agreement go unmeasured until the lane runs green again.",
+        f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#511-the-replay-lane",
         logs_root=EVAL_NIGHTLY_LOGS_ROOT,
     ),
 )
