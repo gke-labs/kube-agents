@@ -154,9 +154,18 @@ processes: `RssAnon` plus `RssShmem`, or `VmRSS` under gVisor, which reports no 
 `hermes gateway run` holds every chat turn and the default profile's cron jobs, and each profile's
 `hermes cron tick` runs its due jobs on a thread pool. An environment variable cannot separate them:
 it is global to the process. Their memory above their idle size is divided among the capabilities
-that had a live session in that process during the sample, in proportion to each one's tokens in
-that interval. This is an estimate, not a measurement, and the report shows it as a separate share
-inside each capability's row, so a reader can see how much of a figure is estimated.
+that had a live session in that process during the sample:
+
+- in equal shares among the live sessions, from the sessions' start and end times and their
+  messages' times in `state.db`. This needs no runtime change, so it is the rule from the first
+  build step;
+- in proportion to each session's tokens in the interval, once the per-call tag gives a timestamped
+  token series. An interval in which no live session finished a model call (a long tool run, a wait
+  on a card) falls back to equal shares;
+- a sample with no live session in the process leaves its memory above idle as Unattributed.
+
+This is an estimate, not a measurement, and the report shows it as a separate share inside each
+capability's row, so a reader can see how much of a figure is estimated.
 
 **Shared services**, the credential broker, the kube-proxy and LiteLLM, serve every capability.
 Their memory above idle is divided by each capability's share of their requests in the same minute.
@@ -164,9 +173,20 @@ The broker and the kube-proxy log each request; the shell's command wrappers add
 to it as a header.
 
 Process sizes count shared pages in each process that maps them, and include page cache in
-proportion, so their sum does not equal the container's figure. Each sample scales the tagged and
-estimated shares so that they and the platform base add up to the container's figure. A remainder
-with no process or rule to explain it is Unattributed, not platform base.
+proportion, so their sum does not equal the container's figure. Each sample fits them as follows:
+
+1. The target is the container's figure less its platform base, or zero if the figure is below the
+   base. A figure below the base is recorded, because it means the base measured at the start was
+   too high.
+2. The shares are the tagged processes' sizes, the estimated shares of the shared processes, and
+   the untagged share: the size of every other process of a non-root user, including a shell
+   command whose tag was removed or is not on the list.
+3. All shares are scaled by one factor so that they add up to the target. The untagged share,
+   after scaling, is Unattributed. When the container runs no non-root process at all, the whole
+   target is Unattributed.
+
+Unattributed memory is therefore the scaled size of what no tag explains, and it is not spread over
+the tagged capabilities.
 
 **Where the samplers run.** In the shell sandbox, the root memory guard proposed for the sandbox
 (`deploy/sandbox/shell-memory-guard.py`) walks `/proc` every 15 seconds and writes one log line
@@ -293,7 +313,8 @@ Each item is its own pull request, after this design merges and the sized test f
    carried over SSH and checked against the list; the shell sampler and the gateway sampler; the
    broker's and kube-proxy's tag on each request log line.
 3. **The memory report.** The fit to the container figures, the shared-process estimate, the two
-   checks, the monthly estimate and the cost, with unit tests on recorded samples.
+   checks, the monthly estimate and the cost, with unit tests on recorded samples. Its shared-process
+   estimate uses equal shares among live sessions, which needs only the session records.
 4. **The per-call token tag**, if the first step's Unattributed share needs it: the context
    variable, the request metadata patch, and the LiteLLM label or log line.
 5. **The nightly.** The sized test fleet's run calls the report after each window and keeps the
