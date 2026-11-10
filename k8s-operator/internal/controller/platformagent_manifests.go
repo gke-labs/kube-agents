@@ -812,6 +812,15 @@ func renderManagedEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agentPlugins
 	// (docs/designs/spec-mode-switch.md).
 	add(kubeagentsModeEnvKey, string(renderMode(agent, "settings")))
 
+	// The earned-autonomy switches, unconditional for the reason the chat keys
+	// are: a switch left out because it is off is one the agent could turn on
+	// with a line in the PVC .env. Normalised to a value the switch knows, else
+	// "off". Pinned here rather than on the container env, as the mode is, and
+	// read from this file by agents/platform/scripts/kubeagents_switches.py.
+	for _, name := range autonomySwitchNames {
+		add(name, autonomySwitchValue(agent, name))
+	}
+
 	// The scope path, pinned for the same reason as HERMES_HOME_MODE: the container env
 	// is the layer a line in the PVC .env outranks, and the reconcile is a cron script
 	// that inherits the gateway's environment after that file is applied. Without the

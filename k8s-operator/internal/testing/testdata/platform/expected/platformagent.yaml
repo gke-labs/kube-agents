@@ -407,6 +407,9 @@ data:
     API_SERVER_KEY=cluster-internal-trusted
     HERMES_HOME_MODE=2770
     KUBEAGENTS_MODE=today
+    KUBEAGENTS_POST_MERGE_CHECK=off
+    KUBEAGENTS_AUTOMERGE=off
+    KUBEAGENTS_DIAL=off
     KUBEAGENTS_SCOPE_FILE=/etc/kube-agents/scope.json
     RECONCILE_PROJECT=
     GKE_PROJECT_ID=example-project
