@@ -422,6 +422,19 @@ AUDITS: dict[str, AuditSpec] = {
             ),
             ("project", ("quota-exhaustion-risk", "reservation-mismatch-risk")),
         ),
+        # §4a of the SOP: the one check that judges a shape an owner chooses,
+        # a node pool kept in one zone on a cluster that is single-zone by
+        # design (3.9's zone-locked arm), and so the only one a repository
+        # declaration may keep off the ledger. The slug's other arm, a pool at
+        # its autoscaling ceiling, is the pool's live headroom and stays a
+        # finding; the join tells the arms apart by the collector's excerpt
+        # (`ZONE_LOCKED_ARM_MARK` opening it, `CEILING_ARM_MARK` absent), the
+        # validator cannot, and the SOP's step carries that distinction. The
+        # other eleven are capacity faults no
+        # declaration excuses: a quota near its limit, a ComputeClass with no
+        # fallback, a Spot shape that gets preempted, an autoscaler that
+        # already failed to add a node.
+        declarable=("single-zone-nodepool",),
     ),
     "gcp-networking-fabric-audit": AuditSpec(
         "GCP Networking Fabric & VPC IPAM Audit",
@@ -1950,6 +1963,23 @@ NAMESPACE_SHAPE_KIND = "Namespace"
 # The allow-all fault names the policy; the withhold publishes only that spelling
 # and holds every other, so an object it cannot classify errs toward holding.
 ALLOW_ALL_SHAPE_KIND = "NetworkPolicy"
+# Stockout 3.9 `single-zone-nodepool` names two arms under one slug and one
+# object kind: the zone-locked arm is the posture a declaration may move (a
+# pool kept in one zone on purpose), and the at-ceiling arm is the pool's live
+# headroom, which no declaration excuses. Neither the slug nor the object
+# tells them apart; the collector's excerpt does, and each arm's clause opens
+# with its prefix (`ZONE_LOCKED_ARM_PREFIX` and `CEILING_ARM_PREFIX` in
+# fleet_stockout.py, which `check_single_zone_nodepool` writes and
+# `adopt_collector_evidence` copies onto the finding; a test pins these two
+# copies to those). A declaration moves a finding whose excerpt carries the
+# zone-locked prefix and not the ceiling one: a pool matching both arms stays
+# a finding, and so does a hand-written excerpt that carries neither, since
+# nothing then says which arm the worker saw. The withhold holds both arms, as
+# it holds both `hpa-cannot-scale` shapes: it errs toward holding a finding
+# back, the join toward not silencing one.
+ZONE_ARM_CHECK = "single-zone-nodepool"
+ZONE_LOCKED_ARM_MARK = "single-zone ("
+CEILING_ARM_MARK = "at its autoscaling ceiling:"
 # A roll-up names the scope it covers, not an object: the cost SOP's §5
 # collapse gives one `Cluster/<name>` or `Namespace/<name>`, and its 3.5
 # ten-address roll-up `Project/<id>`. The cost stream refuses them the way
@@ -1978,6 +2008,20 @@ COST_DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
     "idle-namespace": frozenset({"namespace"}),
     "registry-no-cleanup": frozenset({"artifactregistryrepository"}),
 }
+# The stockout stream's one declarable check names a node pool and nothing
+# else: a `Cluster/` or a workload covers no pool's zone span. Folded as
+# `_object_kind_segment` folds kinds, like the cost table above.
+STOCKOUT_DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
+    ZONE_ARM_CHECK: frozenset({"nodepool"}),
+}
+# Every declarable check with fixed object kinds, across streams, for the one
+# lookup (`_rollup_scope_reason`) the validator, the join and the manifest
+# route share. The cost table stays its own name because `_is_cost_declarable`
+# reads it for the measured-size title, which a stockout row does not carry.
+DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
+    **COST_DECLARABLE_OBJECT_KINDS,
+    **STOCKOUT_DECLARABLE_OBJECT_KINDS,
+}
 # A cost declaration names the object and not its size, and every cost
 # finding is about a size, so the Declared intent row for one carries what
 # the collector measured and the grade it gave, `MAJOR` spelled out: a
@@ -1991,10 +2035,14 @@ COST_DECLARED_MINOR = "minor"
 # given a namespace may write it into the field, which would give the same
 # object a second identity, so the validator empties it on these checks before
 # the id is derived and the parser reads it as empty on a note item. Per check
-# and not per object kind: 3.9 files its pile as `Namespace/<ns>` with the
-# namespace set, and compliance 2.6 does too. Every slug here is the cost
-# stream's alone, so no stream test is needed where it is consulted.
-UNNAMESPACED_CHECKS = frozenset({"idle-namespace", "idle-nodepool", "unattached-disk", "idle-address", "registry-no-cleanup"})
+# and not per object kind: the cost stream's 3.9 files its pile as
+# `Namespace/<ns>` with the namespace set, and compliance 2.6 does too. The
+# stockout pool check (`ZONE_ARM_CHECK`) joins the five for the same reason:
+# its collector files `NodePool/<pool>` with no namespace, and a worker's
+# namespace on the finding would give the pool an identity no declaration and
+# no candidate matches. Every slug here belongs to one stream, so no stream
+# test is needed where it is consulted.
+UNNAMESPACED_CHECKS = frozenset({"idle-namespace", "idle-nodepool", "unattached-disk", "idle-address", "registry-no-cleanup", ZONE_ARM_CHECK})
 # 2.7 `default-sa-automount` is declared per workload and fixed per namespace
 # (one `default` ServiceAccount). A fix that merges for an undeclared sibling
 # would take the declared workload's token too, so a namespace holding a
@@ -2364,13 +2412,21 @@ KCC_READABLE_STATUSES = frozenset({"RUNNING", "RECONCILING"})
 KCC_DEPENDENCY_PATTERN = re.compile(
     r"\breference (?P<kind>[A-Za-z0-9]+) (?:(?P<namespace>[A-Za-z0-9.-]+)/)?(?P<name>[A-Za-z0-9.-]+) is not ready\b"
 )
+# How every first sentence of the Config Connector paragraph starts, in all
+# its forms. The strip-and-rewrite pattern and the log look for it.
+KCC_STALLED_MARK_PREFIX = "**Config Connector is not applying "
 # The note `disclose_stalled_kcc_remediations` adds after a `manifest` fix
 # whose file declares an object Config Connector does not apply. One line, so
-# `KCC_STALLED_NOTE_PATTERN` removes all of it.
-KCC_STALLED_NOTE_MARK = "**Config Connector is not applying this file.**"
+# `KCC_STALLED_NOTE_PATTERN` removes all of it. Only this form says "this
+# file": the fix edits the declaring file.
+KCC_STALLED_NOTE_MARK = KCC_STALLED_MARK_PREFIX + "this file.**"
 # Each paragraph is a core and a tail. The tail is the part a note can lose
 # when the core does not fit otherwise (`_fit_kcc_paragraph`).
-KCC_STALLED_NOTE_CORE = KCC_STALLED_NOTE_MARK + " When the audit ran, Config Connector reported {objects}."
+# What follows the first sentence in every paragraph `finish` writes, in each
+# form and at each step of `KCC_PARAGRAPH_STEPS`. The strip pattern requires
+# it, so a worker sentence that only starts like the paragraph stays.
+KCC_STALLED_CONTINUATION = " When the audit ran, Config Connector reported "
+KCC_STALLED_NOTE_CORE = KCC_STALLED_NOTE_MARK + KCC_STALLED_CONTINUATION + "{objects}."
 KCC_STALLED_NOTE_TAIL = (
     "The cloud resource does not change after the merge until Config Connector applies the object again. "
     "If the reason rejects the change in this file, correct the declaration. Otherwise the change takes "
@@ -2379,13 +2435,13 @@ KCC_STALLED_NOTE_TAIL = (
 KCC_STALLED_NOTE = KCC_STALLED_NOTE_CORE + " " + KCC_STALLED_NOTE_TAIL
 # The paragraph for any other fix of a finding whose own object Config
 # Connector does not apply: a `manual` or `gcloud` fix, a fix degraded to
-# `manual`, or a `manifest` fix to another file. When exactly one file in the
-# repository declares the object, the paragraph keeps the first sentence above
-# and names that file; otherwise it starts with `KCC_STALLED_OBJECT_MARK` and
-# names no file.
-KCC_STALLED_DECLARED_CORE = (
-    KCC_STALLED_NOTE_MARK + " The declaration is {path}. When the audit ran, Config Connector reported {objects}."
-)
+# `manual`, or a `manifest` fix to another file. The fix's file is not the
+# declaration, so the first sentence does not say "this file". When exactly
+# one file in the repository declares the object, the first sentence names
+# that file (`KCC_STALLED_DECLARED_MARK`); otherwise it is
+# `KCC_STALLED_OBJECT_MARK` and the paragraph names no file.
+KCC_STALLED_DECLARED_MARK = KCC_STALLED_MARK_PREFIX + "{path}.**"
+KCC_STALLED_DECLARED_CORE = KCC_STALLED_DECLARED_MARK + KCC_STALLED_CONTINUATION + "{objects}."
 KCC_STALLED_OBJECT_TAIL = (
     "Config Connector does not apply the object until that reason is gone, so a change to the declaration "
     "does not take effect before then, and this finding comes back on each run until then."
@@ -2393,8 +2449,8 @@ KCC_STALLED_OBJECT_TAIL = (
 KCC_STALLED_DECLARED_NOTE = (
     KCC_STALLED_DECLARED_CORE + " " + KCC_STALLED_OBJECT_TAIL + " If the reason rejects the declaration, correct it there."
 )
-KCC_STALLED_OBJECT_MARK = "**Config Connector is not applying the declaration of this object.**"
-KCC_STALLED_UNDECLARED_CORE = KCC_STALLED_OBJECT_MARK + " When the audit ran, Config Connector reported {objects}. {search}"
+KCC_STALLED_OBJECT_MARK = KCC_STALLED_MARK_PREFIX + "the declaration of this object.**"
+KCC_STALLED_UNDECLARED_CORE = KCC_STALLED_OBJECT_MARK + KCC_STALLED_CONTINUATION + "{objects}. {search}"
 # What the paragraph says when it names no file: that more than one file
 # declares the object, or only that it names none. It never says that no
 # file declares the object: a search can skip a file it cannot parse (a
@@ -2406,9 +2462,6 @@ KCC_STALLED_UNDECLARED_NOTE = (
 )
 # How the paragraph names a declaration in a context repository.
 KCC_DECLARATION_IN_REPO = "{path} in the repository {repo}"
-# The first sentences of both paragraphs, which the strip-and-rewrite pattern
-# and the log look for.
-KCC_STALLED_NOTE_MARKS = (KCC_STALLED_NOTE_MARK, KCC_STALLED_OBJECT_MARK)
 # The finding field that holds the paragraph of a `gcloud` fix: its note is
 # the command, which renders in a bash block, so the paragraph renders after
 # the block. Only `finish` writes it: `validate_findings` removes it.
@@ -2416,8 +2469,27 @@ KCC_STALLED_PARAGRAPH_FIELD = "kcc_stalled_paragraph"
 # An earlier copy of either paragraph, which a worker can copy from the
 # previous ledger. The pass removes it from every note and writes it again
 # when the stall is still there, as the route-note pass does with its notes.
+# Each first sentence is matched to its exact end ("this file.**", "the
+# declaration of this object.**", or a file in a code span, also with
+# " in the repository `<repo>`": `KCC_STALLED_DECLARED_MARK`,
+# `KCC_DECLARATION_IN_REPO`), and then the text every paragraph `finish`
+# writes goes on with (`KCC_STALLED_CONTINUATION`). So a worker sentence that
+# only starts the same way is not a copied paragraph. The rest of the
+# paragraph's line goes with it.
+# An earlier release wrote the paragraph for a fix of another file as "this
+# file.**" and then `KCC_STALLED_OLD_DECLARATION_SENTENCE`, which names the
+# file, before the continuation. A previous ledger can hold that form, and
+# `carry_unchanged_findings` copies it, so the pattern also accepts that
+# sentence between "this file.**" and the continuation.
+KCC_STALLED_OLD_DECLARATION_SENTENCE = r" The declaration is `[^`\n]+`(?: in the repository `[^`\n]+`)?\."
 KCC_STALLED_NOTE_PATTERN = re.compile(
-    r"[ \t]*(?:" + "|".join(re.escape(mark) for mark in KCC_STALLED_NOTE_MARKS) + r")[^\n]*"
+    r"[ \t]*"
+    + re.escape(KCC_STALLED_MARK_PREFIX)
+    + r"(?:this file\.\*\*(?:"
+    + KCC_STALLED_OLD_DECLARATION_SENTENCE
+    + r")?|the declaration of this object\.\*\*|`[^`\n]+`(?: in the repository `[^`\n]+`)?\.\*\*)"
+    + re.escape(KCC_STALLED_CONTINUATION)
+    + r"[^\n]*"
 )
 # What the merged-but-persisting line and comment say in place of the two
 # causes they guess at, when the finding's object is one of those objects.
@@ -8023,7 +8095,7 @@ def _strip_route_notes(remediation: object) -> None:
     # The Config Connector note is stripped and written again the same way
     # (`disclose_stalled_kcc_remediations`), so a carried note never keeps a
     # stall that this run's manifest does not show.
-    if any(mark in note for mark in KCC_STALLED_NOTE_MARKS):
+    if KCC_STALLED_NOTE_PATTERN.search(note):
         note = KCC_STALLED_NOTE_PATTERN.sub("", note).strip()
     if isinstance(uncut, str) or note != remediation.get("note"):
         remediation["note"] = note
@@ -8478,8 +8550,9 @@ def withhold_unsearched_postures(data: dict, record: dict | None) -> list[dict]:
     record names. A partial list is no search, per the SOP.
 
     What goes: every finding whose check is declarable, the dangling-target
-    `hpa-cannot-scale` fault included, because it shares its slug with the
-    `min == max` posture and this side cannot tell them apart; the allow-all
+    `hpa-cannot-scale` fault and the at-ceiling `single-zone-nodepool` arm
+    included, because each shares its slug with a posture and this side
+    does not read the excerpt to tell them apart; the allow-all
     `NetworkPolicy/` fault of `netpol-missing` stays, because its object does
     tell it apart (`_is_namespace_object`). What stays: the
     faults, and every `declared[]` entry, each of which cites the file it
@@ -8562,6 +8635,11 @@ def _declared_intent_gap(data: dict) -> str | None:
         tail = (
             f"; a dangling-target {DUAL_SHAPE_CHECK} shares its slug with the "
             "min == max posture and is held back with the postures"
+        )
+    if any(str(f.get("check", "")) == ZONE_ARM_CHECK and _is_ceiling_arm(f) for f in findings):
+        tail += (
+            f"; a {ZONE_ARM_CHECK} at its autoscaling ceiling shares its slug with the "
+            "zone-locked posture and is held back with the postures"
         )
     return f"declared intent: {what} — {where}{tail}"
 
@@ -9136,12 +9214,79 @@ def _declaration_lookup(declarations: list[dict]) -> tuple[dict, dict]:
     return scoped, fleet_wide
 
 
+def _item_excerpt(item: dict) -> str:
+    """The collector's excerpt on a finding (`evidence.excerpt`, either stored shape) or a candidate (`excerpt`)."""
+    return _evidence_excerpt(item) or str(item.get("excerpt") or "")
+
+
+def _is_ceiling_arm(item: dict) -> bool:
+    """Whether a `single-zone-nodepool` finding or candidate carries 3.9's at-ceiling arm.
+
+    Read off the excerpt the collector wrote (`CEILING_ARM_MARK`), the one field
+    that names the arm: a pool matching both arms carries the mark too and is
+    judged a fault, since the headroom it reports is live whatever the zone
+    span was chosen for.
+    """
+    return CEILING_ARM_MARK in _item_excerpt(item)
+
+
+def _is_zone_locked_arm(item: dict) -> bool:
+    """Whether a `single-zone-nodepool` finding or candidate is the zone-locked posture alone.
+
+    The excerpt opens with `ZONE_LOCKED_ARM_MARK` (the collector writes the
+    zone-locked clause first) and carries no at-ceiling clause anywhere. An
+    excerpt that opens any other way — a worker's own wording on a cluster
+    the collector could not read, even one that mentions a single zone later
+    on — names no arm, and a declaration moves nothing it cannot place: the
+    finding publishes.
+    """
+    return _item_excerpt(item).startswith(ZONE_LOCKED_ARM_MARK) and not _is_ceiling_arm(item)
+
+
+def reject_declared_ceiling_pools(data: dict, manifest: dict | None) -> None:
+    """Exit 2 on a worker-written `declared[]` entry for a pool the collector reports at its ceiling.
+
+    The validator holds a `declared[]` entry to the slug and the object kind
+    and no further: the entry carries no excerpt, so nothing on it says which
+    arm of 3.9 the worker moved. The manifest does. A candidate for the same
+    identity whose excerpt carries the at-ceiling clause is the fault, and a
+    declared fault exits 2 and publishes nothing (SOP §5) — the same door
+    `apply_declarations` shuts on a finding, held here for the entry the worker
+    wrote by hand, which would otherwise take the candidate's identity into
+    `known` and keep it off the ledger. Run with the manifest before the join,
+    by `finish` and `remediate` alike; without a manifest there is nothing to
+    hold the entry to, as for every other manifest cross-check.
+    """
+    if manifest is None:
+        return
+    declared_pools = {
+        derive_finding_id(entry): entry
+        for entry in data.get("declared") or []
+        if isinstance(entry, dict) and str(entry.get("check", "")) == ZONE_ARM_CHECK
+    }
+    if not declared_pools:
+        return
+    for entry, candidate in _candidates(manifest):
+        if str(candidate.get("check", "")) != ZONE_ARM_CHECK or not _is_ceiling_arm(candidate):
+            continue
+        own = declared_pools.get(_candidate_identity(entry, candidate))
+        if own is None:
+            continue
+        raise ValidationError(
+            f"declared[]: {own.get('object', '')} on {own.get('cluster', '')} is at its autoscaling "
+            f"ceiling in the collector's manifest (`{CEILING_ARM_MARK}` in its excerpt), and that arm "
+            f"of {ZONE_ARM_CHECK} is a fault no declaration excuses (SOP §4a); a declaration covers the "
+            "zone-locked arm alone. Write the pool under `findings` and let `finish` judge the note."
+        )
+
+
 def _declaration_covers(item: dict, scoped: dict, fleet_wide: dict, declarable) -> dict | None:
     """The declaration that justifies `item` (a finding or a collector candidate), or None.
 
     The dual-shape rules of `apply_declarations`, without its stderr lines: a
-    declaration moves only the `min == max` shape of `hpa-cannot-scale` and
-    only the `Namespace/` shape of `netpol-missing`.
+    declaration moves only the `min == max` shape of `hpa-cannot-scale`,
+    only the `Namespace/` shape of `netpol-missing`, and only the zone-locked
+    arm of `single-zone-nodepool`.
     """
     check = str(item.get("check", ""))
     if check not in declarable:
@@ -9154,6 +9299,8 @@ def _declaration_covers(item: dict, scoped: dict, fleet_wide: dict, declarable) 
     if check == DUAL_SHAPE_CHECK and str(item.get("severity", "")) != DUAL_SHAPE_POSTURE_SEVERITY:
         return None
     if check == NAMESPACE_SHAPE_CHECK and not _is_namespace_object(str(item.get("object", ""))):
+        return None
+    if check == ZONE_ARM_CHECK and not _is_zone_locked_arm(item):
         return None
     if _rollup_scope_reason(check, str(item.get("object", "")), str(item.get("namespace") or "")):
         return None
@@ -9261,12 +9408,13 @@ def fold_unnamespaced_check(entry: dict) -> None:
 def _rollup_scope_reason(check: str, obj: str, namespace: str = "") -> str | None:
     """Why `obj` is not an object `check` names — a roll-up's scope, or a kind the check never files — or None.
 
-    A cost check with fixed object kinds accepts only those
-    (`COST_DECLARABLE_OBJECT_KINDS`). The two controller checks file whatever
+    A check with fixed object kinds accepts only those
+    (`DECLARABLE_OBJECT_KINDS`: the cost checks and the stockout pool check).
+    The two controller checks file whatever
     kind owns the pod, so they refuse a namespace spelling always and a
     `Cluster/` or `Project/` only with an empty namespace, the roll-up's
     shape: a controller carries its namespace, a §5 collapse or the 3.5
-    roll-up does not. Another stream's check is not judged here.
+    roll-up does not. A check in neither table is not judged here.
     """
     kind = _object_kind_segment(obj)
     if check in COST_CONTROLLER_CHECKS:
@@ -9275,7 +9423,7 @@ def _rollup_scope_reason(check: str, obj: str, namespace: str = "") -> str | Non
         if kind in UNNAMESPACED_SCOPE_SPELLINGS and not str(namespace or "").strip():
             return f"names a roll-up's scope (`{kind}/` with no namespace), not a controller a {check} finding names"
         return None
-    allowed = COST_DECLARABLE_OBJECT_KINDS.get(check)
+    allowed = DECLARABLE_OBJECT_KINDS.get(check)
     if allowed is not None and kind not in allowed:
         return f"names a `{kind}/`, not one of the kinds a {check} finding names ({', '.join(sorted(allowed))})"
     return None
@@ -9385,6 +9533,26 @@ def apply_declarations(
                 f"DECLARATION NOT APPLIED: {finding.get('id', '')} — {check} on "
                 f"{finding.get('object', '')} is the allow-all fault (SOP §2.6), which no "
                 f"declaration excuses; the posture names `{NAMESPACE_SHAPE_KIND}/<ns>`. "
+                f"{match.get('repo', '')}:{match.get('path', '')} stands and the finding publishes."
+            )
+            match = None
+        if match is not None and check == ZONE_ARM_CHECK and not _is_zone_locked_arm(finding):
+            # The slug names a posture (a pool kept in one zone) and a fault (a
+            # pool at its autoscaling ceiling), told apart by the collector's
+            # excerpt; a declaration justifies only the posture, a pool
+            # matching both arms keeps the fault, and an excerpt that names
+            # neither arm — a worker's own wording — moves nothing.
+            why = (
+                f"carries the `{CEILING_ARM_MARK}` arm (SOP §3.9), the pool's live headroom, which no "
+                "declaration excuses; the posture is the zone-locked arm alone"
+                if _is_ceiling_arm(finding)
+                else f"has an excerpt that opens neither 3.9 arm (`{ZONE_LOCKED_ARM_MARK}` or "
+                f"`{CEILING_ARM_MARK}`, as the collector writes them), so nothing says it is the "
+                "zone-locked posture"
+            )
+            log(
+                f"DECLARATION NOT APPLIED: {finding.get('id', '')} — {check} on "
+                f"{finding.get('object', '')} {why}. "
                 f"{match.get('repo', '')}:{match.get('path', '')} stands and the finding publishes."
             )
             match = None
@@ -12933,6 +13101,13 @@ def _render_declared_intent_search(data: dict) -> list[str]:
                     "",
                     f"_A dangling-target `{DUAL_SHAPE_CHECK}` is a fault, but it "
                     "shares its slug with the `min == max` posture and is held back "
+                    "with the postures._",
+                ]
+            if any(str(f.get("check", "")) == ZONE_ARM_CHECK and _is_ceiling_arm(f) for f in findings):
+                out += [
+                    "",
+                    f"_A `{ZONE_ARM_CHECK}` at its autoscaling ceiling is a fault, but it "
+                    "shares its slug with the zone-locked posture and is held back "
                     "with the postures._",
                 ]
         return out
@@ -20796,7 +20971,7 @@ def kcc_stalled_objects(
 def _without_kcc_paragraph(note: str) -> str:
     """`note` with either paragraph of `disclose_stalled_kcc_remediations`
     removed."""
-    if any(mark in note for mark in KCC_STALLED_NOTE_MARKS):
+    if KCC_STALLED_NOTE_PATTERN.search(note):
         return KCC_STALLED_NOTE_PATTERN.sub("", note).strip()
     return note
 
@@ -20807,7 +20982,7 @@ def _strip_kcc_stalled_note(remediation: object) -> None:
     if not isinstance(remediation, dict):
         return
     note = str(remediation.get("note") or "")
-    if any(mark in note for mark in KCC_STALLED_NOTE_MARKS):
+    if KCC_STALLED_NOTE_PATTERN.search(note):
         remediation["note"] = _without_kcc_paragraph(note)
 
 
@@ -20819,12 +20994,12 @@ def _fit_kcc_paragraph(remediation: dict, paragraphs: list[str]) -> str:
     worker's own text and never the text `finish` wrote (the Kustomize note
     and its copied file, the closing text of `degrade_missing_remediations`,
     the note of `degrade_reverted_gcloud_remediations`, `GENERATED_FIX_NOTE`),
-    and never inside a code block. The route notes already on the note stay,
-    and a paragraph that would push out the reconciler note does not fit, so
-    the reconciler note is always shown. When even the core does not fit
-    beside the text `finish` wrote and the note carries the Kustomize note's
-    copied file, that block is made shorter by whole lines, with its fences
-    closed, to make room for the core and the reconciler note, as
+    and never inside a code block. Every route note already on the note
+    stays: a paragraph step that would push one out (a location note or the
+    reconciler note) does not fit. When even the core does not fit beside the
+    text `finish` wrote and the note carries the Kustomize note's copied file,
+    that block is made shorter by whole lines, with its fences closed, to make
+    room for the core and the route notes, as
     `_fit_route_notes` does for the reconciler note (`_sized_manifest_block`).
     Only when that does not fit either does the core go after the text
     `finish` wrote, past `MAX_NOTE_CHARS`. The worker's note before a cut goes
@@ -20838,7 +21013,6 @@ def _fit_kcc_paragraph(remediation: dict, paragraphs: list[str]) -> str:
     uncut = remediation.get(ROUTE_UNCUT_NOTE_FIELD)
     route = [found.group(0) for found in ROUTE_NOTE_PATTERN.finditer(note)]
     worker = uncut if isinstance(uncut, str) else ROUTE_NOTE_SPACED_PATTERN.sub("", note).strip()
-    reconciler = [text for text in route if text.startswith(RECONCILED_NOTE_LEDE)]
     fitted, added = _fit_route_notes(worker, route)
     outcome = KCC_FIT_PAST_CAP
     for step, paragraph in enumerate(paragraphs):
@@ -20846,12 +21020,14 @@ def _fit_kcc_paragraph(remediation: dict, paragraphs: list[str]) -> str:
         # strip of it (`KCC_STALLED_NOTE_PATTERN`) leaves them whole.
         shown = ROUTE_PARAGRAPH_BREAK + paragraph if route else paragraph
         candidate, candidate_added = _fit_route_notes(worker, [*route, shown])
-        if shown in candidate_added and all(text in candidate_added for text in reconciler):
+        # Every route note already on the note stays: a step that pushes one
+        # out (a location note or the reconciler note) does not fit.
+        if shown in candidate_added and all(text in candidate_added for text in route):
             fitted, added = candidate, candidate_added.replace(NOTE_SEPARATOR + ROUTE_PARAGRAPH_BREAK, ROUTE_PARAGRAPH_BREAK)
             outcome = KCC_FIT_WHOLE if step == 0 else KCC_FIT_SHORTER
             break
     else:
-        shortened = _kcc_core_with_shorter_block(worker, reconciler, paragraphs[-1])
+        shortened = _kcc_core_with_shorter_block(worker, route, paragraphs[-1])
         if shortened is not None:
             fitted, added = shortened
             outcome = KCC_FIT_SHORTER
@@ -20867,18 +21043,19 @@ def _fit_kcc_paragraph(remediation: dict, paragraphs: list[str]) -> str:
     return outcome
 
 
-def _kcc_core_with_shorter_block(worker: str, reconciler: list[str], core: str) -> "tuple[str, str] | None":
+def _kcc_core_with_shorter_block(worker: str, route: list[str], core: str) -> "tuple[str, str] | None":
     """The worker's note with its Kustomize copied file made shorter by whole
-    lines (`_sized_manifest_block`, fences closed) so that the reconciler
-    note and the paragraph's `core` fit `MAX_NOTE_CHARS`, as `(note, added)`;
+    lines (`_sized_manifest_block`, fences closed) so that every route note
+    already on the note (`route`) and the paragraph's `core` fit
+    `MAX_NOTE_CHARS`, as `(note, added)`;
     None when the note has no copied file or even an empty block leaves no
     room. Only the block is shortened; the Kustomize note's own text stays
     whole, and the worker's text after it is cut as needed."""
     head = _split_kustomize_head(worker)
     if head.lines is None:
         return None
-    shown = ROUTE_PARAGRAPH_BREAK + core if reconciler else core
-    added = NOTE_SEPARATOR.join([*reconciler, shown]).replace(NOTE_SEPARATOR + ROUTE_PARAGRAPH_BREAK, ROUTE_PARAGRAPH_BREAK)
+    shown = ROUTE_PARAGRAPH_BREAK + core if route else core
+    added = NOTE_SEPARATOR.join([*route, shown]).replace(NOTE_SEPARATOR + ROUTE_PARAGRAPH_BREAK, ROUTE_PARAGRAPH_BREAK)
     block = _sized_manifest_block(
         head.lines, head.whole, lambda shorter: _cut_worker_note(head.rest, "", added, head.prefix + shorter) is not None
     )
@@ -21019,7 +21196,7 @@ def disclose_stalled_kcc_and_log(
                 f"{prefix}WARNING: {fid}: Config Connector is not applying the finding's own object, and the "
                 "paragraph that says so does not fit beside the text the audit wrote; the renderer cuts its end."
             )
-        elif any(mark in note for mark in KCC_STALLED_NOTE_MARKS) or by_id[fid].get(KCC_STALLED_PARAGRAPH_FIELD):
+        elif KCC_STALLED_NOTE_PATTERN.search(note) or by_id[fid].get(KCC_STALLED_PARAGRAPH_FIELD):
             log(f"{prefix}{fid}: Config Connector is not applying the finding's own object; the fix says so.")
         else:
             log(f"{prefix}{fid}: removed a Config Connector note that its remediation copied from an earlier ledger.")
@@ -22638,6 +22815,13 @@ def handle_remediate(args: argparse.Namespace) -> None:
             "wrote; an empty path is not the same as running without one."
         )
     manifest = load_manifest(manifest_file, audit_id) if manifest_file is not None else None
+    if manifest is not None:
+        # The same order as `finish`: the join reads the excerpt for 3.9's arm,
+        # so it must read the collector's wording, not the worker's, and a
+        # hand-written `declared[]` entry for a pool at its ceiling is refused
+        # here as it is there.
+        adopt_collector_evidence(data["findings"], manifest)
+        reject_declared_ceiling_pools(data, manifest)
     declared_ids = set(join_harness_declarations(data, record, audit_id, repo_hint, manifest=manifest)[0])
     withheld_ids = set(finding_ids(withhold_unsearched_postures(data, record)))
     findings = list(data["findings"])
@@ -24849,6 +25033,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
                 f"evidence: adopted the collector's command and excerpt for "
                 f"{len(adopted)} of {len(data['findings'])} finding(s) — {shown}"
             )
+        # Before the join: a hand-written `declared[]` entry for a pool the
+        # collector reports at its ceiling is a declared fault, and exits 2.
+        reject_declared_ceiling_pools(data, manifest)
     # The marker lifts a coverage gap only as the collector's word, which only
     # `cross_check_manifest` can hold the document to; without a manifest it
     # would be the worker's own claim that the fleet holds no clusters.

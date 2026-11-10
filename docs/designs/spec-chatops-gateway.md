@@ -1428,6 +1428,27 @@ Where that operator never created the gateway, the condition clears on the first
 waits on the new gateway.
 The paragraphs above are the history._
 
+## Who may press Stop (added 11/9)
+
+Two backends have a Stop button: Slack's native Stop on an Agent Session's Working… line (the
+Slack adapter section) and the Stop button the Google Chat adapter draws under a task's line (the
+Google Chat adapter section, "The Stop button"). The rule is the same on both. Only a requester
+the conversation's record holds may press it: a task's requester or steer author, or a session
+author. Anyone else's press cancels nothing and posts nothing, and the gateway logs it
+(`mayStop` in `stopgate.go`, which holds the set of gated backends, `stopGatedBackends`). The
+presser is the message's author as the record stores a requester (`requesterSubject`: a Slack
+member id, a lowercased Google Chat email, pseudonymized under the install salt), so a Chat
+press compares against the record the same way a Chat ask was written to it. The gate reads the
+presser of a live task's button. A press on a task that is not the running one cancels nothing
+whoever presses it, so it is answered before the gate is read (`chatStopStale`), and anyone may
+heal a dead line to "this task has ended". A typed `stop` is not the button and keeps its rule on
+every backend: anyone the gateway answers in the conversation. So does a program's cancel through
+the A2A door: its backend is not a gated one, and it carries no click.
+
+A record that cannot tell who asked gates nobody: nothing ran, a requester was cleared past
+`AskTTL`, a steer or session author was dropped past its cap, or the history is at its cap
+(`cannotTellWhoAsked`). Refusing there would lock out the very requester whose copy was dropped.
+
 ## The Google Chat adapter (added 9/5)
 
 The first real adapter, and the production ingress. What makes it that is the identity
@@ -1638,7 +1659,8 @@ rather than lost. The agent-side callers
 (`agents/platform/scripts/chat_notify.py`) switch on `routed_platform()`, `A2A_NOTIFY_PLATFORM` when set, else the projected file; the env is what the operator
 renders exactly when `a2aChatArmed` holds and `homeChannel` is a space name, or is unset with
 Slack not enabled (`a2aGchatHomeRouted`), and send to every
-other platform through `hermes send` as before. The kanban notifier's report back to a gateway
+other platform through `hermes send` as before (a day on with no conversation to take onboarding's
+first report, that report is a ledger issue on GitHub and one home line linking it goes the same way). The kanban notifier's report back to a gateway
 conversation (below), and onboarding's first report into the conversation the user first wrote in,
 are armed by their own variable, `A2A_NOTIFY_CONVERSATIONS`, which the
 operator renders whenever the gateway arms the route: `homeChannel` unset (the route then
@@ -1938,7 +1960,7 @@ is still a turn, and the rewrite reads the message the event carries, its text a
 and the clicked button's label. A click on a button the adapter did not draw is
 logged and acked. A click on a rating button or the note card is never a turn ([Answer feedback](#answer-feedback-added-1016)).
 
-**The Stop button.** A task's live message, the "⏳ submitted…" line the gateway posts and edits as the task moves, arrives at the adapter with `OutMessage.Stop` while the task runs, and the adapter draws a `Stop` button under it: after the message's own buttons when the newest progress laid it out (a progress message's links), alone under the text otherwise. The terminal edit arrives without `Stop` and takes the button off, as any text edit does. Slack's Stop is native to Agent Sessions (the Slack adapter section); Chat has no such control, so this one is drawn, and a text line Chat refuses with the button is posted or patched once more without it, so the line itself never fails for the button; a laid-out line's refusal is the layout's, and the relay falls back to its text, which then takes the same path. A click on it arrives as a `CARD_CLICKED` interaction like a choice click, with the button's function `kage.stop` and two parameters: the conversation key the line was posted under, since the click's event names the surface the line is on, which is not the key a DM's thread-less line was posted under; and the task the line is for. The adapter turns it into `IntentCancel` with no text, marked a click, naming that task (`InboundMessage.TaskID`), from the clicker, bound to that conversation, which must be in the space the click came from, and handed over like a typed message, so the allowlist decides, for anyone it admits (the Slack button's requester gate, `stopgate.go`, is Slack's). The gateway sends the cancel a typed `stop` sends, quietly, as for Slack's button (`TaskRef.QuietCancel`: no "cancel sent" post, no "canceled" notice from the relay), and answers on the line itself (a task with no line, its placeholder post having failed, takes the typed stop's posts instead): edited to "🛑 cancel sent — the task ends when the executor confirms" with the control gone, left so by later progress (`ActiveTask.LineClosed`), and made "🛑 canceled" by the terminal edit; a second press, or one on a task a typed `stop` already detached, retries the closing edit when the first did not land, closes the pressed message too when it is not the task's own line (a delegating parent's line names the parent, whose press is the running child's cancel), and otherwise changes nothing; a press with the card stop armed takes the typed stop's path, cards and replies included, and its line loses the button at its next edit, as any detached task's does. A `stop` typed on Google Chat with a task running and a line takes the press's answer in turn (amended 11/6): the quiet cancel, the line closed on "cancel sent", and the terminal edit with no notice posted, so a DM whose thread-less key would put the line, the "cancel sent" post and the relay's "canceled" each in a message of its own gets the one line; a second typed `stop` edits the line to "🛑 cancel already sent — the task ends when the executor confirms"; a typed `stop` on a task with no line, or one the armed card stop answers (`cardStopWanted`, so not on the session route), keeps its posts. A redelivered click is a duplicate by its id, as a choice click is. Nothing is remembered for it: a line carries its conversation and its task in the button, and a press on a task that is not the running one cancels nothing, so a press is never a cancel of a task the presser did not see, and is answered by what the record knows (`chatStopStale`): a task the record does not know (one from before a restart) has the pressed line edited to "ℹ️ this task has ended" with the control gone; a task the record cancelled (a stopped task the next ask superseded, whose closing edit failed, since each closing edit is one unretried call) has its "🛑 canceled" line written again; any other task the record knows ended keeps the line its end wrote, since the heal or the relay may have written it a moment before the press. A task the heal ends has its line closed by the heal, and a stopped task the next ask supersedes before its terminal has its line closed as canceled by that turn, since the relay's terminal edit would find neither, so no line outlives its task with the button on it.
+**The Stop button.** A task's live message, the "⏳ submitted…" line the gateway posts and edits as the task moves, arrives at the adapter with `OutMessage.Stop` while the task runs, and the adapter draws a `Stop` button under it: after the message's own buttons when the newest progress laid it out (a progress message's links), alone under the text otherwise. The terminal edit arrives without `Stop` and takes the button off, as any text edit does. Slack's Stop is native to Agent Sessions (the Slack adapter section); Chat has no such control, so this one is drawn, and a text line Chat refuses with the button is posted or patched once more without it, so the line itself never fails for the button; a laid-out line's refusal is the layout's, and the relay falls back to its text, which then takes the same path. A click on it arrives as a `CARD_CLICKED` interaction like a choice click, with the button's function `kage.stop` and two parameters: the conversation key the line was posted under, since the click's event names the surface the line is on, which is not the key a DM's thread-less line was posted under; and the task the line is for. The adapter turns it into `IntentCancel` with no text, marked a click, naming that task (`InboundMessage.TaskID`), from the clicker, bound to that conversation, which must be in the space the click came from, and handed over like a typed message, so the allowlist decides, and then, for a press on the running task, the requester gate ("Who may press Stop", `stopgate.go`), as for Slack's button: a press from someone the record does not hold as a requester of the thread cancels nothing and edits no line. The gateway sends the cancel a typed `stop` sends, quietly, as for Slack's button (`TaskRef.QuietCancel`: no "cancel sent" post, no "canceled" notice from the relay), and answers on the line itself (a task with no line, its placeholder post having failed, takes the typed stop's posts instead): edited to "🛑 cancel sent — the task ends when the executor confirms" with the control gone, left so by later progress (`ActiveTask.LineClosed`), and made "🛑 canceled" by the terminal edit; a second press, or one on a task a typed `stop` already detached, retries the closing edit when the first did not land, closes the pressed message too when it is not the task's own line (a delegating parent's line names the parent, whose press is the running child's cancel), and otherwise changes nothing; a press with the card stop armed takes the typed stop's path, cards and replies included, and its line loses the button at its next edit, as any detached task's does. A `stop` typed on Google Chat with a task running and a line takes the press's answer in turn (amended 11/6): the quiet cancel, the line closed on "cancel sent", and the terminal edit with no notice posted, so a DM whose thread-less key would put the line, the "cancel sent" post and the relay's "canceled" each in a message of its own gets the one line; a second typed `stop` edits the line to "🛑 cancel already sent — the task ends when the executor confirms"; a typed `stop` on a task with no line, or one the armed card stop answers (`cardStopWanted`, so not on the session route), keeps its posts. A redelivered click is a duplicate by its id, as a choice click is. Nothing is remembered for it: a line carries its conversation and its task in the button, and a press on a task that is not the running one cancels nothing, so a press is never a cancel of a task the presser did not see, and is answered by what the record knows (`chatStopStale`): a task the record does not know (one from before a restart) has the pressed line edited to "ℹ️ this task has ended" with the control gone; a task the record cancelled (a stopped task the next ask superseded, whose closing edit failed, since each closing edit is one unretried call) has its "🛑 canceled" line written again; any other task the record knows ended keeps the line its end wrote, since the heal or the relay may have written it a moment before the press. A task the heal ends has its line closed by the heal, and a stopped task the next ask supersedes before its terminal has its line closed as canceled by that turn, since the relay's terminal edit would find neither, so no line outlives its task with the button on it.
 
 ## The Slack adapter (added 9/4)
 
@@ -2031,11 +2053,8 @@ carries, so the gateway tells the button from the word. The event names no team 
 the adapter checks the workspace itself: a member the allowed-users list names passes, anyone else
 must be in this workspace by `users.info` (cached per member for five minutes), and a lookup that
 fails, or a workspace auth.test never named, drops the press. Only a requester the conversation's record
-holds (a task's requester or steer author, or a session author) may press it; anyone else's press
-cancels nothing and posts nothing (`stopgate.go`), while typed `stop` keeps its rule. A record that
-cannot tell who asked gates nobody: nothing ran, a requester was cleared past `AskTTL`, a steer or
-session author was dropped past its cap, or the history is at its cap (`cannotTellWhoAsked`). With
-the card
+holds may press it, the rule both buttons share ("Who may press Stop"); anyone else's press
+cancels nothing and posts nothing, while typed `stop` keeps its rule. With the card
 stop armed the button cancels the turn without the `🛑` lines and sends the same control, and the
 gateway words the result as the Slack Stop's one reply (`slack_stop.go`); unarmed, it is a typed
 `stop`.
@@ -2147,22 +2166,30 @@ or a "why?" to its answer, so it gets the quote as context and no rule sentence.
 message this process remembers posting, on any surface, or in a DM a `REPLY` quote by an app,
 since the DM has one app in it: the read says the poster's kind, and the snapshot names the
 poster, who in a DM is the app when not the member. A quote this cannot place keeps the rule.
-A command the gateway answers without an agent, sent as a quote-reply to one of the bot's posts,
-is the command: the words go over unchanged, with no read and no frame, so `routeTurn`'s
-matchers see them. The set is `routeTurn`'s own (`gchatQuotedWordsAreACommand`): a stop, a bare
-`/feedback` and `/feedback summary`, `/session` bare or `off`, the exact status phrases, and a
-delegation with its task or as the bare word, which framed would read as a delegation of the
-frame. It is narrower than `chattext.IsCommand` on purpose: the wide status rule there would take
-"what is happening here?" over an alert, strip its quote, and reach no one, since `routeTurn`
-reads that form only on a running task. The read runs off the
-event pump under a ten-second budget, after the dedupe. A quote that yields nothing, the read
+The quote travels beside the words: the adapter hands the turn over with the member's words as
+typed on `InboundMessage.Text` (empty for a bare quote) and the composed ask on
+`InboundMessage.Quoted`, and the gateway's own routing decides what reaches an agent. `routeTurn`'s
+matchers read the words, so a command the gateway answers without an agent is answered on the
+words alone, a "stop" or a status ask quoted onto an alert included, under the conditions the
+router already has (a status phrase is answered without an agent only on a running task, or at the
+top of a DM with none); anything that reaches an agent, a task, a steer, a session's first turn or
+a delegation, carries the quote (`agentText`), with a command word a matcher took off the words
+("/session", "delegate") off the quoted ask's head too (`wordsAfter`). The adapter does not know
+the conversation's task state, so no gate in it re-spells that set; the one command it knows is a
+stop, which reaches no agent whatever is running and goes over inline with no read
+(`quotedReadNeeded`), so a cancel never waits on the relay. The read runs off the event pump
+under a ten-second budget, after the dedupe. A quote that yields nothing, the read
 refused or timed out or the message empty (a card or an image alone), is never silent for a
-sender the gateway admits: one line posts in the conversation, `I couldn't read the message you
-quoted, so I'm answering your words alone.` and the turn goes ahead on the words, or `I couldn't
-read the message you quoted. Paste its text, or ask again in a moment.` and no turn, logged with
-the reason. The adapter reads the gateway's admission gate for that (`SenderAdmission`, wired as
-the session lookup is) and posts nothing ahead of the gateway for a sender it would refuse: their
-words go over unchanged to the refusal any message gets, and their bare quote is dropped. A read
+sender the gateway admits when an agent would have read it: with words, the turn goes ahead on
+the words, marked (`InboundMessage.QuotedUnread`), and the router posts `I couldn't read the
+message you quoted, so I'm answering your words alone.` in the conversation as it hands them to
+an agent (`noteUnreadQuote`, at `startTask` and `steerTask`), so a "stop" or a status ask it
+answers itself gets no line about a quote it never needed; a bare quote is no turn, and the
+adapter posts `I couldn't read the message you quoted. Paste its text, or ask again in a moment.`
+and logs the reason. The adapter reads the gateway's admission gate for that line
+(`SenderAdmission`, wired as the session lookup is) and posts nothing ahead of the gateway for a
+sender it would refuse: their words go over to the refusal any message gets, and their bare quote
+is dropped. A read
 cut short by the gateway's shutdown posts no line and makes no turn: `quotedAsk` returns the
 shutdown reason when its context is cancelled on entry or when the cancel cut its read short, and
 `Run` drops a turn `quotedAsk` composed before the cancel with the same reason, so nothing is
@@ -2220,7 +2247,9 @@ write to this table grants a principal - it is an impersonation primitive, and i
 emails besides. Write access is the install admin's, through the install path. No
 product ServiceAccount (gateway, platform-agent, broker, session workers) gets write on
 it, so nothing an agent can be talked into doing edits its own identity table; the
-conformance suite's D1 holds that no Role the operator mints names `secrets`. A
+conformance suite's D1 holds that no Role the operator mints grants write verbs on
+`secrets` (only `kubeagents:minimal` holds read-only `get`/`list`/`watch` on `secrets` for
+`<agent>-kube-proxy`'s redacted metadata path). A
 `principalMapSecretRef` on `spec.integration.slack`, not built, would let an install bind
 another name and make write authority "may write the PlatformAgent CR", with changes in
 the API server audit log. Generating

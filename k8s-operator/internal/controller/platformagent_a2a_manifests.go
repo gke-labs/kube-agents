@@ -279,13 +279,14 @@ const (
 	a2aInjectBackendEnvVar = "A2A_INJECT_BACKEND"
 
 	// a2aSessionClusterViewEnvVar arms the session pods' temporary read-only
-	// cluster view: the pod becomes a caller of the credential broker with
-	// the broker's `session` role (kubectl and gcloud, read-only, nothing
-	// else). A demo aid until declarative profiles (spec-subagent-profiles)
-	// carry a session's identity and tools; the flag and everything it
-	// renders go when they do. Operator-level and off by default for the
-	// reason a2aInjectBackendEnvVar is: the pod executes model output, and
-	// what widens its fence is a property of who deployed the operator.
+	// cluster view: session pods route kubectl through <agent>-kube-proxy
+	// (read-only-dry-run with Secret redaction) and reach the credential
+	// broker's `session` role for read-only gcloud. A demo aid until
+	// declarative profiles (spec-subagent-profiles) carry a session's
+	// identity and tools; the flag and everything it renders go when they
+	// do. Operator-level and off by default for the reason
+	// a2aInjectBackendEnvVar is: the pod executes model output, and what
+	// widens its fence is a property of who deployed the operator.
 	a2aSessionClusterViewEnvVar = "A2A_SESSION_CLUSTER_VIEW"
 	// The platform agent's trusted-human allowlists, handed to the gateway
 	// so a session's request to delegate to the platform agent is checked
@@ -3045,8 +3046,9 @@ func a2aSessionNetpolName(agent *agentv1alpha1.PlatformAgent) string {
 // this is the pod that executes model output.
 //
 // A worker that needs the internet is a design change, not a policy widening:
-// the broker rule below is the one admitted widening, flag-gated, and it
-// reaches a pod that authenticates the caller rather than the internet.
+// the broker and kube-proxy rules below are the only admitted widenings,
+// flag-gated, and they reach pods that authenticate the caller rather than the
+// internet.
 //
 // PolicyTypes carries Ingress with no rules on purpose: nothing dials a
 // session pod, so a listener in a worker is an accident and an accident should
@@ -3089,22 +3091,23 @@ func buildA2ASessionNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluster
 		},
 	}
 	if a2aSessionClusterViewEnabled(agent) {
-		// The credential broker, under the cluster-view flag: the one
-		// widening of this fence, to the broker's pods on one port (the
-		// stateful broker, and the exec tier while it renders), and the pod on
-		// the other end authenticates the token and confers the session
-		// role. The API server stays unreachable from here; kubectl runs
-		// in the broker. Header comment: this IS the design change.
+		// The credential broker (and its exec tier while it renders) for gcloud,
+		// plus kube-proxy for kubectl, under the cluster-view flag. Both
+		// authenticate the session pod's projected token.
 		to := []networkingv1.NetworkPolicyPeer{namespacedPodPeer(agent.Namespace, credentialProxySelector(agent))}
-		// And the exec tier while it renders, on the same port, for the
-		// commands the session pod's shim sends there.
 		if credentialProxyExecTierEnabled(agent) {
 			to = append(to, namespacedPodPeer(agent.Namespace, credentialProxyExecTierSelector(agent)))
 		}
-		egress = append(egress, networkingv1.NetworkPolicyEgressRule{
-			Ports: []networkingv1.NetworkPolicyPort{tcpPort(credentialProxyPort)},
-			To:    to,
-		})
+		egress = append(egress,
+			networkingv1.NetworkPolicyEgressRule{
+				Ports: []networkingv1.NetworkPolicyPort{tcpPort(credentialProxyPort)},
+				To:    to,
+			},
+			networkingv1.NetworkPolicyEgressRule{
+				Ports: []networkingv1.NetworkPolicyPort{tcpPort(kubeProxyPort)},
+				To:    []networkingv1.NetworkPolicyPeer{namespacedPodPeer(agent.Namespace, kubeProxySelector(agent))},
+			},
+		)
 	}
 
 	return &networkingv1.NetworkPolicy{
@@ -6044,11 +6047,14 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	var clusterViewEnv []corev1.EnvVar
 	if a2aSessionClusterViewEnabled(agent) {
 		// The spawner's half of the cluster view: told, and told where the
-		// broker is. Both or neither - the gateway refuses the first
-		// without the second (a2a/gateway/config.go).
+		// broker and kube-proxy are. Both or neither - the gateway refuses the
+		// first without the broker URL (a2a/gateway/config.go).
 		clusterViewEnv = []corev1.EnvVar{
 			{Name: "A2A_SESSION_CLUSTER_VIEW", Value: "true"},
 			{Name: "A2A_CREDENTIAL_PROXY_URL", Value: credentialProxyBaseURL(agent)},
+			{Name: "A2A_KUBE_PROXY_URL", Value: kubeProxyURL(agent)},
+			{Name: "A2A_KUBE_PROXY_CA_CONFIGMAP", Value: kubeProxyCABundleName(agent)},
+			{Name: "A2A_KUBE_PROXY_HOST_CONTEXT", Value: hostClusterContextName(agent)},
 		}
 		// The exec tier's address, while it renders, for the session pods'
 		// commands; the spawner passes it on as CREDENTIAL_PROXY_EXEC_URL.
@@ -7421,12 +7427,13 @@ func (r *PlatformAgentReconciler) applyA2AInjectBackend(ctx context.Context, age
 // next install is the standing cost. Three are cached: Service, ConfigMap
 // and NetworkPolicy are Owns() kinds (see SetupWithManager), so their
 // informers exist. The Secret is NOT read through the cache, and this is
-// load-bearing rather than tidy: the operator ships secrets with get only,
-// and a cached Get of an unwatched kind starts a cluster-wide informer
-// whose LIST is then forbidden -- the call does not fail, it blocks in
-// WaitForCacheSync, and with one reconcile worker that is every
-// PlatformAgent in the cluster stopped (the same trap documented on the
-// gateway's own credential reads below). So the Secret goes through
+// load-bearing rather than tidy: the manager does not watch Secrets, and a
+// cached Get of an unwatched kind starts a cluster-wide Secret informer that
+// holds every Secret in the cluster in operator memory and blocks in
+// WaitForCacheSync wherever list/watch on secrets is trimmed -- with one
+// reconcile worker that stops every PlatformAgent in the cluster (the same
+// trap documented on the gateway's own credential reads below). So the Secret
+// goes through
 // a2aReader, the same uncached client the other A2A Secrets use, and the
 // entry list carries the reader beside each object so the choice is made
 // once, next to the object it is made for.

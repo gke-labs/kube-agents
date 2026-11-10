@@ -169,13 +169,15 @@ The paragraph goes on a fix whose finding's own object Config Connector does not
 
 The fix keeps its kind, and a `manifest` fix can still open a pull request, which carries the same paragraph. A `manual` fix, a `gcloud` fix (after its command), a fix that fell back to `manual`, and a `manifest` fix to another file get the paragraph too.
 
-For these fixes, the audit looks for the object's declaration in the `.yaml`, `.yml` and `.json` files of the GitOps repository. When exactly one file declares it, the paragraph names that file. Otherwise it starts "**Config Connector is not applying the declaration of this object.**" and says that more than one file declares the object, or that the audit names no declaration file. It never says that no file declares the object, because the search skips a file that it cannot parse, for example a template.
+For these fixes, the audit looks for the object's declaration in the `.yaml`, `.yml` and `.json` files of the GitOps repository. The fix's file is not the declaration, so the paragraph does not say "this file". When exactly one file declares the object, the paragraph starts with a sentence that names it ("**Config Connector is not applying `clusters/prod/provisioning/gpu-pool.yaml`.**"). Otherwise it starts "**Config Connector is not applying the declaration of this object.**" and says that more than one file declares the object, or that the audit names no declaration file. It never says that no file declares the object, because the search skips a file that it cannot parse, for example a template.
 
 The search reads one snapshot of the repository from the credential broker, 32 MiB at most by default. When the repository is larger, the paragraph names no declaration file and the `finish` log has a warning. To raise the limit, set `CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES` to a number of bytes in the chart value `platformAgent.deployment.env`, or in the `PlatformAgent` CR's `spec.deployment.env` on an install that no chart manages. A higher limit helps only up to 64 MiB of files, because the audit does not unpack a larger snapshot.
 
 The paragraph does not say that the change is correct: the reason can reject the change itself, for example a node pool change that sets both `spec.autoscaling.maxNodeCount` and `spec.autoscaling.totalMaxNodeCount`. When the reason is `DependencyNotReady`, the paragraph also names the unready object at the root of the chain.
 
-To fit the [note cap of 2,000 characters](#where-a-manual-fix-belongs), the audit cuts only the fix's own text, which then ends with `…(truncated)`. The text of a Kustomize note, a note that a fix fell back to `manual`, a note about a reverted `gcloud` command, and the reconciler note is never cut. When there is still no room, the paragraph becomes shorter, and the copy of the file in a Kustomize note can become shorter by whole lines. When even the shortest paragraph does not fit, it goes after the other text, past the cap, and the `finish` log has a warning. The next run after the stall clears shows the fix's whole text again.
+To fit the [note cap of 2,000 characters](#where-a-manual-fix-belongs), the audit cuts only the fix's own text, which then ends with `…(truncated)`. The text of a Kustomize note, a note that a fix fell back to `manual`, a note about a reverted `gcloud` command, and the reconciler note are never cut. The paragraph never pushes out a location note or reconciler note that is already on the fix.
+
+When there is still no room, the paragraph becomes shorter, and the copy of the file in a Kustomize note can become shorter by whole lines. When even the shortest paragraph does not fit, it goes after the other text, past the cap, and the `finish` log has a warning. The next run after the stall clears shows the fix's whole text again.
 
 The match must be certain, so some fixes get no paragraph. One case is the same object not ready on more than one cluster with nothing to tell them apart: Config Controller puts the objects of each instance in `config-control`. Another is a file that sets no namespace when more than one object fits. A third is an object whose known project differs from the project that the file or the finding gives.
 
@@ -250,7 +252,7 @@ Three properties follow from the script owning the artefacts rather than the mod
 
 - **No invented output.** The model never writes the title, body, commit message, or any timestamp — so two runs against an unchanged fleet produce an unchanged ledger.
 
-The `agent:audit` label is also what keeps the issue-writing jobs apart: the `github-issue-resolver` poll query excludes it, and `agent:delivery-watch` with it, so it never tries to "resolve" an audit ledger or the chat-delivery ledger.
+The `agent:audit` label is also what keeps the issue-writing jobs apart: the `github-issue-resolver` poll query excludes it, and `agent:delivery-watch` and `agent:onboarding` with it. So it never tries to "resolve" an audit ledger, the chat-delivery ledger, or the first-run inventory report onboarding files when no chat thread took it.
 
 `fleet-audit` shares `submit-suggestion`'s guardrails: same Minty token path, the same refusal of `git add .` / `git add -A`, and the same hard block on force-pushing `main`, `master`, or `production`.
 

@@ -237,8 +237,20 @@ _CREATED = "2026-08-21T14:47:09+00:00"
 _OPEN_BLOCK = {"enabled": True, "cidrBlocks": [{"displayName": "open-for-eval", "cidrBlock": "0.0.0.0/0"}]}
 
 
+# seeded-a's declared-zonal-pool as `clusters describe` reports it (bench/tf/fleet/main.tf):
+# autoscaling on, tainted, no node. The declared-single-zone-pool role reads it off the
+# cluster document; slot d's document carries it too, which no role on slot d reads.
+_DECLARED_ZONAL_POOL = {
+    "name": "declared-zonal-pool",
+    "status": "RUNNING",
+    "locations": ["us-central1-a"],
+    "autoscaling": {"enabled": True, "minNodeCount": 0, "maxNodeCount": 2},
+    "config": {"machineType": "e2-small", "taints": [{"key": "seeded-role", "value": "declared-zonal", "effect": "NO_SCHEDULE"}]},
+}
+
+
 def _peer():
-    return {"currentMasterVersion": "1.34.1-gke.1", "createTime": _CREATED, "masterAuthorizedNetworksConfig": _OPEN_BLOCK}
+    return {"currentMasterVersion": "1.34.1-gke.1", "createTime": _CREATED, "masterAuthorizedNetworksConfig": _OPEN_BLOCK, "nodePools": [_DECLARED_ZONAL_POOL]}
 
 
 def _cluster_c():
@@ -561,10 +573,10 @@ class HealthyScan(ScanHarness):
         self.assertEqual(set(self.states(doc).values()), {"healthy"})
         self.assertEqual(set(self.states(doc)), set(self.roles))
         entry = doc["projects"][PROJECT]
-        self.assertEqual(entry["summary"], {"healthy": 41, "drifted": 0, "absent": 0, "not_checked": 0})
+        self.assertEqual(entry["summary"], {"healthy": 42, "drifted": 0, "absent": 0, "not_checked": 0})
         self.assertEqual(entry["reader"], "seeded-fleet-reader@kube-agents-evals-2.iam.gserviceaccount.com")
         self.assertNotIn("error", entry)
-        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "absent_projects": 0, "healthy": 41, "drifted": 0, "absent": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "absent_projects": 0, "healthy": 42, "drifted": 0, "absent": 0, "not_checked": 0})
         self.assertEqual(doc["previous"], {"scanned_at": None, "drifted": {}})
         self.assertEqual(err, "")
 
@@ -618,7 +630,7 @@ class Drift(ScanHarness):
         doc, _ = self.scan(world, projects=(PROJECT, OTHER))
         self.assertEqual(set(self.states(doc, PROJECT).values()), {"healthy"})
         self.assertEqual(self.states(doc, OTHER)["crashloop-workload"], "drifted")
-        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "absent_projects": 0, "healthy": 81, "drifted": 1, "absent": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "absent_projects": 0, "healthy": 83, "drifted": 1, "absent": 0, "not_checked": 0})
 
 
 class NotChecked(ScanHarness):
