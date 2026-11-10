@@ -2783,12 +2783,16 @@ COLLECTED_OUTCOME = "collected"
 
 
 def automerge_switch() -> str:
-    """The install's auto-merge switch; "off" where the switch module is absent."""
+    """The install's auto-merge switch; "off" where the switch module is absent
+    or fails, so a broken switch neither turns the checks on nor stops a fix."""
     try:
         from kubeagents_switches import switch  # lazy, as gitops_workspace is
-    except ImportError:
+
+        return switch(AUTOMERGE_SWITCH)
+    except Exception as exc:  # noqa: BLE001 -- any failure reads as the default
+        if not isinstance(exc, ImportError):
+            log(f"WARNING: the {AUTOMERGE_SWITCH} switch could not be read ({type(exc).__name__}: {exc}); reading it as off")
         return SWITCH_OFF
-    return switch(AUTOMERGE_SWITCH)
 
 
 def pdb_safety_section(group: list[dict], snapshot: dict[str, bytes], manifest: dict | None, noun: str) -> str:
@@ -2839,7 +2843,7 @@ def pdb_safety_section(group: list[dict], snapshot: dict[str, bytes], manifest: 
         answers.append(answer)
     eligible = len(budgets) == len(group) and all(a["eligible"] for a in answers)
     log(f"SAFETY: {', '.join(a['finding_id'] for a in answers)}: auto-merge {'eligible' if eligible else 'not eligible'}")
-    return pdb_safety.render_section(answers, eligible=eligible, noun=noun)
+    return pdb_safety.render_section(answers, eligible=eligible, noun=noun, clean=publishable_text)
 
 
 def set_sweep_waived(waived: bool) -> None:

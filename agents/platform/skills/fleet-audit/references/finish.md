@@ -119,7 +119,9 @@ Add `--dry-run` to validate and print the rendered ledger body — and every PR 
 to stdout with **zero** git or forge side effects. It applies the same grouping and the same
 degradation as the real run, so the branch names it names are the branch names it would create,
 except a PodDisruptionBudget `finish` would write for a declared `no-pdb` finding, which only the
-real run plans. It
+real run plans. The `## Safety checks` section a `no-pdb` fix's body gets while
+`KUBEAGENTS_AUTOMERGE` is not `off` is also left out: it reads the cluster, and only the real run
+does. It
 resolves every `remediation.path` against the same `workspace` directory the real run uses, not against
 the directory you happen to be standing in, so "the manifest is missing" is a finding of the dry run
 and not a surprise at publish time. Use it whenever you are unsure your document is well formed.

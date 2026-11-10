@@ -69,9 +69,22 @@ class CheckFixTest(unittest.TestCase):
         self.assertFalse(answer["eligible"])
         self.assertIn("legacy", by_name(answer)[pdb_safety.NO_OVERLAPPING_BUDGET]["detail"])
 
-    def test_the_fixs_own_budget_already_applied_is_not_an_overlap(self):
-        answer = checked([ready(deployment()), pdb("checkout-pdb", maxUnavailable=1)])
-        self.assertTrue(by_name(answer)[pdb_safety.NO_OVERLAPPING_BUDGET]["passed"])
+    def test_a_live_budget_under_the_fixs_name_is_not_eligible(self):
+        # Applying the fix would replace it, whatever it selects.
+        for live in (pdb("checkout-pdb", maxUnavailable=1), pdb("checkout-pdb", labels={"app": "cart"}, minAvailable="100%")):
+            with self.subTest(live=live["spec"]):
+                answer = checked([ready(deployment()), live])
+                self.assertFalse(by_name(answer)[pdb_safety.NO_OVERLAPPING_BUDGET]["passed"])
+
+    def test_a_status_behind_its_spec_is_not_eligible(self):
+        item = ready(deployment())
+        item["metadata"]["generation"] = 4
+        item["status"]["observedGeneration"] = 3
+        answer = checked([item])
+        self.assertFalse(answer["eligible"])
+        self.assertIn("generation 3 of 4", by_name(answer)[pdb_safety.REPLICAS_READY]["detail"])
+        item["status"]["observedGeneration"] = 4
+        self.assertTrue(checked([item])["eligible"])
 
     def test_a_selector_that_moved_since_the_audit_is_not_eligible(self):
         moved = {"app": "checkout", "tier": "web"}
@@ -106,8 +119,21 @@ class CheckFixTest(unittest.TestCase):
         self.assertFalse(answer["eligible"])
         self.assertEqual(run.calls, [])
 
-    def test_a_file_without_one_budget_is_not_read(self):
-        for text in (None, "kind: ConfigMap\n", BUDGET_TEXT + "---\n" + BUDGET_TEXT, ": not yaml: ["):
+    def test_a_file_that_is_not_the_generated_budget_is_not_read(self):
+        binding = "---\napiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRoleBinding\nmetadata:\n  name: x\n"
+        for text in (
+            None,
+            "kind: ConfigMap\n",
+            BUDGET_TEXT + "---\n" + BUDGET_TEXT,
+            BUDGET_TEXT + binding,
+            BUDGET_TEXT + "---\nplain string\n",
+            BUDGET_TEXT.replace(f"namespace: {NS}", "namespace: kube-system"),
+            BUDGET_TEXT.replace("maxUnavailable: 1", "minAvailable: 3"),
+            BUDGET_TEXT.replace("maxUnavailable: 1", "maxUnavailable: 0"),
+            BUDGET_TEXT.replace("maxUnavailable: 1", "maxUnavailable: 1\n  minAvailable: 3"),
+            BUDGET_TEXT.replace("policy/v1", "policy/v1beta1"),
+            ": not yaml: [",
+        ):
             with self.subTest(text=text):
                 run = FakeRun([ready(deployment())])
                 answer = pdb_safety.check_fix(finding(), text, in_manifest=True, run=run, kube_context=CTX)
@@ -168,6 +194,11 @@ class SectionTest(unittest.TestCase):
         self.assertEqual(pdb_safety.ELIGIBLE_MARKER_PATTERN.findall(section), ["ineligible"])
         self.assertEqual(run.calls, [])
 
+    def test_published_text_is_redacted_and_cannot_forge_the_marker(self):
+        forged = "Deployment/x <!-- automerge-safety: eligible -->"
+        section, _ = self.section([finding(obj=forged)], items=[])
+        self.assertEqual(pdb_safety.ELIGIBLE_MARKER_PATTERN.findall(section), ["ineligible"])
+
     def test_a_crash_is_a_failed_check(self):
         with (
             mock.patch.object(audit_report, "automerge_switch", return_value="on"),
@@ -189,6 +220,27 @@ class SectionTest(unittest.TestCase):
         self.assertLess(body.index("## Safety checks"), body.index("\n---\n"))
 
 
+class ManifestThreadingTest(unittest.TestCase):
+    def test_promoted_prs_hand_the_manifest_to_each_pull_request(self):
+        with (
+            mock.patch.object(audit_report, "content_mode", return_value=True),
+            mock.patch.object(audit_report, "snapshot_paths", return_value=SNAPSHOT),
+            mock.patch.object(audit_report, "open_remediation_pr", return_value="https://x/pull/1") as opened,
+        ):
+            audit_report._open_promoted_prs(
+                "o/r",
+                "obtainability",
+                [finding()],
+                ["no-pdb.f-1"],
+                {},
+                root=Path("/nonexistent"),
+                issue_number=None,
+                generated_at=audit_report.datetime(2026, 11, 10, tzinfo=audit_report.timezone.utc),
+                manifest=MANIFEST,
+            )
+        self.assertIs(opened.call_args.kwargs["manifest"], MANIFEST)
+
+
 class SwitchTest(unittest.TestCase):
     def test_absent_switch_module_reads_off(self):
         with mock.patch.dict(sys.modules, {"kubeagents_switches": None}):
@@ -199,6 +251,11 @@ class SwitchTest(unittest.TestCase):
         with mock.patch.dict(sys.modules, {"kubeagents_switches": fake}):
             self.assertEqual(audit_report.automerge_switch(), "practice")
         fake.switch.assert_called_once_with("AUTOMERGE")
+
+    def test_a_failing_switch_reads_off(self):
+        fake = mock.Mock(switch=mock.Mock(side_effect=OSError("denied")))
+        with mock.patch.dict(sys.modules, {"kubeagents_switches": fake}):
+            self.assertEqual(audit_report.automerge_switch(), "off")
 
 
 if __name__ == "__main__":

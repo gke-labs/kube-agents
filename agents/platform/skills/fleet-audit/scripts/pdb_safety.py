@@ -1,15 +1,20 @@
 """pdb_safety.py - check a disruption-budget fix against its cluster before its pull request opens.
 
-A `no-pdb` fix adds one PodDisruptionBudget beside a workload. Whether that
-fix may merge without a person looking at it depends on the cluster as it is
-when the pull request opens, not as the audit read it hours earlier, so this
-reads the workload's namespace once more and answers three questions:
+A `no-pdb` fix adds one PodDisruptionBudget beside a workload. Only the
+budget `finish` generates is considered (`budget_from_text`): one `policy/v1`
+document in the finding's namespace with `maxUnavailable: 1` and a selector,
+and nothing else in the file. Whether that fix may merge without a person
+looking at it depends on the cluster as it is when the pull request opens, not
+as the audit read it hours earlier, so this reads the workload's namespace
+once more and answers three questions:
 
-- `replicas-ready`: the workload asks for at least two replicas and all of
-  them are Ready. A budget over one pod, or over pods that are not Ready,
-  permits no eviction and blocks every node drain.
-- `no-overlapping-budget`: no other PodDisruptionBudget already selects the
-  workload's pods. The eviction API refuses a pod two budgets select.
+- `replicas-ready`: the workload asks for at least two replicas, all of them
+  Ready, in a status that has caught up with its spec. With one replica the
+  budget leaves a drain taking the only pod, and pods that are not Ready count
+  as already disrupted, so the budget permits no eviction and blocks drains.
+- `no-overlapping-budget`: no live PodDisruptionBudget already selects the
+  workload's pods (the eviction API refuses a pod two budgets select), and
+  none already takes the fix's name (applying the fix would replace it).
 - `selector-matches`: the budget the fix writes selects the workload's pods,
   carries the workload's own live selector, and selects no other workload's.
 
@@ -19,8 +24,11 @@ opens, for a person to review. The answer is rendered into the body
 (`render_section`) and carried in a hidden marker the auto-merge path reads.
 
 The read is `recheck.read_target`, the on-demand re-check's own, pinned to the
-finding's cluster and the audit's scope; the workload is found by
-`recheck.in_scope_workload`, so the audit's scope filters (S1-S5) hold here too.
+finding's cluster. The install's declared scope is not re-applied there:
+the caller has no scope flags, so a cluster is read only when this run's
+collector manifest shows it read (`check_fix`'s `in_manifest`). The workload
+is found by `recheck.in_scope_workload`, so the audit's workload filters
+(S1-S5) hold here too.
 
 Nothing runs this unless the install's `KUBEAGENTS_AUTOMERGE` switch is not
 `off` (`audit_report.open_remediation_pr`).
@@ -48,8 +56,11 @@ SELECTOR_MATCHES = "selector-matches"
 CHECK_NAMES = (REPLICAS_READY, NO_OVERLAPPING_BUDGET, SELECTOR_MATCHES)
 MIN_REPLICAS = 2
 SECTION_HEADING = "## Safety checks"
-# Read by the auto-merge path. Written only by this harness into a body it
-# renders; a body anyone else wrote proves nothing by carrying it.
+# For the auto-merge path, which nothing reads yet. Written only by this
+# harness, last in its section, into a body it renders; the body's other
+# free text passes `publishable_text`, which cannot spell `<!--`. A body
+# anyone else wrote or edited proves nothing by carrying it, so a reader
+# trusts it only on a pull request this harness opened, or re-checks.
 ELIGIBLE_MARKER = "<!-- automerge-safety: {verdict} -->"
 ELIGIBLE = "eligible"
 INELIGIBLE = "ineligible"
@@ -64,21 +75,36 @@ def _unanswered(detail: str) -> list[dict]:
     return [_result(name, False, detail) for name in CHECK_NAMES]
 
 
-def budget_from_text(text: str) -> tuple[str, dict] | None:
-    """`(name, selector)` of the one PodDisruptionBudget in a fix's file, or
-    None when the file holds none, several, or one without a selector."""
+BUDGET_API_VERSION = "policy/v1"
+BUDGET_SPEC_KEYS = {"maxUnavailable", "selector"}
+BUDGET_MAX_UNAVAILABLE = 1
+
+
+def budget_from_text(text: str, namespace: str) -> tuple[str, dict] | None:
+    """`(name, selector)` of the budget in a fix's file, or None unless the
+    file holds exactly one document, a `policy/v1` PodDisruptionBudget in
+    `namespace` whose spec is `maxUnavailable: 1` and a selector -- the form
+    `finish` generates. Anything else in the file, another namespace, or a
+    `minAvailable` that could block every drain is a fix for a person to read."""
     import yaml
 
     try:
-        docs = [d for d in yaml.safe_load_all(text) if isinstance(d, dict)]
+        docs = [d for d in yaml.safe_load_all(text) if d is not None]
     except yaml.YAMLError:
         return None
-    budgets = [d for d in docs if d.get("kind") == "PodDisruptionBudget"]
-    if len(budgets) != 1:
+    if len(docs) != 1 or not isinstance(docs[0], dict) or docs[0].get("kind") != "PodDisruptionBudget" or docs[0].get("apiVersion") != BUDGET_API_VERSION:
         return None
-    name = str((budgets[0].get("metadata") or {}).get("name") or "")
-    selector = (budgets[0].get("spec") or {}).get("selector")
-    if not name or not isinstance(selector, dict):
+    metadata = docs[0].get("metadata") or {}
+    spec = docs[0].get("spec") or {}
+    name = str(metadata.get("name") or "")
+    selector = spec.get("selector")
+    if (
+        not name
+        or metadata.get("namespace") != namespace
+        or set(spec) != BUDGET_SPEC_KEYS
+        or spec.get("maxUnavailable") != BUDGET_MAX_UNAVAILABLE
+        or not isinstance(selector, dict)
+    ):
         return None
     return name, selector
 
@@ -104,33 +130,37 @@ def judge(target: recheck.Target, selector: dict, dump: dict) -> list[dict]:
     if missing is not None:
         return _unanswered(missing.reason)
     workload = subject.workload
-    status = _raw_item(dump, workload).get("status") or {}
+    raw = _raw_item(dump, workload)
+    status = raw.get("status") or {}
     wanted = workload["spec"].get("replicas", 1) or 1
     ready = int(status.get("readyReplicas") or 0)
+    generation = (raw.get("metadata") or {}).get("generation")
+    observed = status.get("observedGeneration")
+    # A status the controller has not caught up with describes the old spec.
+    stale = generation is not None and (observed is None or observed < generation)
     results = [
         _result(
             REPLICAS_READY,
-            wanted >= MIN_REPLICAS and ready >= wanted,
-            f"{target.object}: replicas={wanted}, ready={ready}",
+            wanted >= MIN_REPLICAS and ready >= wanted and not stale,
+            f"{target.object}: replicas={wanted}, ready={ready}"
+            + (f", status from generation {observed} of {generation}" if stale else ""),
         )
     ]
 
-    overlapping = sorted(
-        recheck._name(pdb)
-        for pdb in subject.context["pdbs"].get(target.namespace, [])
-        if recheck._name(pdb) != target.budget and recheck._selects(pdb, workload["pod_labels"])
-    )
+    live = subject.context["pdbs"].get(target.namespace, [])
+    overlapping = sorted(recheck._name(pdb) for pdb in live if recheck._selects(pdb, workload["pod_labels"]))
+    named = any(recheck._name(pdb) == target.budget for pdb in live)
+    if overlapping:
+        why = f"already selected by PodDisruptionBudget {', '.join(overlapping)}"
+    elif named:
+        why = f"PodDisruptionBudget {target.budget} already exists in {target.namespace}, and the fix would replace it"
+    else:
+        why = ""
     results.append(
-        _result(
-            NO_OVERLAPPING_BUDGET,
-            not overlapping,
-            f"already selected by PodDisruptionBudget {', '.join(overlapping)}"
-            if overlapping
-            else f"no other PodDisruptionBudget in {target.namespace} selects its pods",
-        )
+        _result(NO_OVERLAPPING_BUDGET, not why, why or f"no PodDisruptionBudget in {target.namespace} selects its pods")
     )
 
-    live = workload["spec"].get("selector")
+    own = workload["spec"].get("selector")
     others = sorted(
         f"{template['kind']}/{template['name']}"
         for template in subject.context.get("pod_templates", {}).get(target.namespace, [])
@@ -142,8 +172,8 @@ def judge(target: recheck.Target, selector: dict, dump: dict) -> list[dict]:
         why = "the budget's selector is empty and would select every pod in the namespace"
     elif not collect.selector_matches(selector, workload["pod_labels"]):
         why = "the budget's selector does not select the workload's pods"
-    elif selector != live:
-        why = f"the budget's selector differs from the workload's live selector {json.dumps(live, sort_keys=True)}"
+    elif selector != own:
+        why = f"the budget's selector differs from the workload's live selector {json.dumps(own, sort_keys=True)}"
     elif others:
         why = f"the budget's selector also selects {', '.join(others)}'s pods"
     else:
@@ -172,9 +202,12 @@ def check_fix(
     proof nothing is read and the fix is ineligible.
     """
     answer = {"finding_id": str(finding.get("id", "")), "command": "", "eligible": False}
-    budget = budget_from_text(file_text) if file_text else None
+    budget = budget_from_text(file_text, str(finding.get("namespace") or "")) if file_text else None
     if budget is None:
-        answer["checks"] = _unanswered("the fix's file does not hold exactly one PodDisruptionBudget with a selector")
+        answer["checks"] = _unanswered(
+            "the fix's file is not the budget the audit generates: one policy/v1 PodDisruptionBudget "
+            "in the finding's namespace, maxUnavailable: 1 and a selector, and nothing else"
+        )
         return answer
     name, selector = budget
     target = recheck.Target(
@@ -200,8 +233,12 @@ def check_fix(
     return answer
 
 
-def render_section(answers: list[dict], *, eligible: bool, noun: str) -> str:
-    """The body section for a group's answers, closed by the hidden marker."""
+def render_section(answers: list[dict], *, eligible: bool, noun: str, clean: Callable[[str], str] = str) -> str:
+    """The body section for a group's answers, closed by the hidden marker.
+
+    `clean` is applied to every detail and command, which carry cluster
+    names, stderr and exception text: the caller passes the redaction its
+    published bodies use."""
     out = [
         SECTION_HEADING,
         "",
@@ -211,11 +248,11 @@ def render_section(answers: list[dict], *, eligible: bool, noun: str) -> str:
         ),
     ]
     for answer in answers:
-        out += ["", f"**`{answer['finding_id']}`**", ""]
+        out += ["", f"**`{clean(answer['finding_id'])}`**", ""]
         for check in answer["checks"]:
-            out.append(f"- {'pass' if check['passed'] else 'FAIL'} `{check['name']}`: {check['detail']}")
+            out.append(f"- {'pass' if check['passed'] else 'FAIL'} `{check['name']}`: {clean(check['detail'])}")
         if answer["command"]:
-            out += ["", "Reproduce with (read-only):", "", "```bash", _shown_command(answer["command"]), "```"]
+            out += ["", "Reproduce with (read-only):", "", "```bash", clean(_shown_command(answer["command"])), "```"]
     out += [
         "",
         "**Auto-merge:** eligible."
