@@ -204,6 +204,13 @@ CI enforcement: `make docs-check` runs the same checks as
   (`Otherwise write "..."`), and no comment holds a line the description readers
   split a section on. The rule, and why the readers need it, is in
   `.agents/rules/pre_pr_review.md`.
+- `docs-check-upgrade-releases` — `scripts/check_upgrade_table_releases.py`;
+  once a release is tagged, every row of the upgrade page's breaking-changes
+  table labelled with it must come from a commit the tag contains (or sit in the
+  tag's own copy of the table). A wrong label fails a push to `main` and a pull
+  request that changes the page; on any other pull request it is a warning. It
+  reads the history and the release tags, so it fails on a shallow or tagless
+  clone; run `git fetch --tags --unshallow` first.
 
 ### Identifier sources
 

@@ -1143,6 +1143,11 @@ class GvisorFloorCannotBlockTheTeardownTest(unittest.TestCase):
         env_secret_at = text.find('export LITELLM_ENV_SECRET_NAME=""')
         self.assertNotEqual(env_secret_at, -1, "uninstall.sh must blank LITELLM_ENV_SECRET_NAME")
         self.assertLess(env_secret_at, call_at)
+        # The minter's adoption keys (#3504): terraform validates their shape,
+        # and an operator types them into install.env by hand.
+        minter_at = text.find('export MINTER_SHARED_KEY="" MINTER_ADOPT_KEY=""')
+        self.assertNotEqual(minter_at, -1, "uninstall.sh must blank MINTER_SHARED_KEY and MINTER_ADOPT_KEY")
+        self.assertLess(minter_at, call_at)
         provider_at = text.find('export MODEL_PROVIDER="$DEFAULT_MODEL_PROVIDER" MODEL_DEFAULT_NAME=""')
         self.assertNotEqual(provider_at, -1, "uninstall.sh must reset an openai_compatible provider")
         self.assertLess(provider_at, call_at)
