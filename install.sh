@@ -505,10 +505,14 @@ PARAM_KMS_KEY="${KMS_KEY:-}"
 # a default name the file records counts as given only when the file records a
 # GitHub App too. Otherwise an older install turning the minter on would
 # adopt, as its own, the unlabelled default key another install may hold.
+#
+# Fails closed when the default isn't known yet (a first curl | bash run, before
+# install.defaults.env is on disk): a name the file records then counts only
+# beside a recorded App.
 minter_name_given() {
   local value=$1 default=$2 file_records=$3
   [ -n "$value" ] || return 1
-  [ "$value" != "$default" ] && return 0
+  [ -n "$default" ] && [ "$value" != "$default" ] && return 0
   [ "$file_records" != "true" ] && return 0
   [ "${INSTALL_ENV_RECORDS_GITHUB_APP:-false}" = "true" ]
 }

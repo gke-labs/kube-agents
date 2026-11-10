@@ -244,6 +244,16 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
             "PROJECT_ID=p\nKMS_KEYRING=github-token-minter-keyring\nKMS_KEY=github-token-minter-key\n")
         self.assertIn("ring_given=false key_given=false", proc.stdout, proc.stderr)
 
+    def test_with_no_defaults_file_a_recorded_name_needs_a_recorded_app(self):
+        """A first curl | bash run has no install.defaults.env yet: fail closed, not open."""
+        script = ('minter_name_given github-token-minter-keyring "" true && echo given || echo not-given; '
+                  'INSTALL_ENV_RECORDS_GITHUB_APP=true; '
+                  'minter_name_given github-token-minter-keyring "" true && echo given || echo not-given; '
+                  'INSTALL_ENV_RECORDS_GITHUB_APP=false; '
+                  'minter_name_given my-ring "" false && echo given || echo not-given')
+        proc = self._run_install_func(script)
+        self.assertEqual(proc.stdout.split()[-3:], ["not-given", "given", "given"], proc.stderr)
+
     def test_default_names_beside_a_recorded_app_are_explicit(self):
         proc = self._minter_names_given(
             "GITHUB_APP_ID=12345\nKMS_KEYRING=github-token-minter-keyring\nKMS_KEY=github-token-minter-key\n")
