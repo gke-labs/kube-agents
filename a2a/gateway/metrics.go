@@ -94,6 +94,15 @@ const (
 	slackConnectedHelp = "1 while the Slack adapter's Socket Mode connection is up, 0 from a drop or a reconnect until it is up again; no sample unless a Slack adapter runs."
 	slackLastEventName = "slack_last_event_timestamp_seconds"
 	slackLastEventHelp = "When the Slack adapter last received an event or an interactive payload from Slack, in seconds since the unix epoch; no sample until the first."
+	// slackIngressLagName is how long a Slack message or click took to reach
+	// the gateway: its arrival time less the event's own timestamp (a
+	// message's event_ts, a click's action_ts), so a slow Socket Mode leg
+	// shows apart from the agent's own time. slackAPIDurationName times each
+	// Slack Web API call the adapter makes, by method and outcome, and
+	// slackRateLimitedName counts the ones Slack answered 429.
+	slackIngressLagName  = "slack_ingress_lag_seconds"
+	slackAPIDurationName = "slack_api_request_duration_seconds"
+	slackRateLimitedName = "slack_api_rate_limited_total"
 
 	// The label names. Every value under them comes from a closed list
 	// below, never from a task, a conversation or an executor's text, so
@@ -105,6 +114,14 @@ const (
 	labelRating   = "rating"
 	labelAnswer   = "answer"
 	labelWindow   = "window"
+	labelMethod   = "method"
+	// The Slack API outcomes: ok (a 2xx), rate_limited (a 429) and error
+	// (any other status, or no response at all). Slack answers most API
+	// errors 200 with ok false; those read ok here, as the call's latency
+	// is what this series is for.
+	slackAPIOK          = "ok"
+	slackAPIRateLimited = "rate_limited"
+	slackAPIError       = "error"
 	// The platform label's values: the chat backends, under the names the
 	// operator's activeInterfaces vocabulary and the chat_metrics plugin use
 	// for the ones they share, so one series name reads the same on either
@@ -201,6 +218,23 @@ var (
 		discordBackend: platformDiscord,
 		consoleBackend: platformConsole,
 	}
+	// metricsSlackAPIMethods are the Slack Web API methods the method label
+	// names; a call to any other (a response_url post, a method added later)
+	// is counted as other.
+	metricsSlackAPIMethods = []string{
+		"chat.postMessage", "chat.update", "chat.postEphemeral",
+		"reactions.add", "reactions.remove",
+		"views.publish", "views.open",
+		"users.info", "conversations.info", "conversations.members", "conversations.open",
+		"conversations.replies", "conversations.history",
+		"auth.test", "apps.connections.open", "assistant.threads.setSuggestedPrompts",
+		slackSessionsSetStatusMethod, slackSessionsRenameMethod,
+	}
+	// metricsSlackIngressBuckets reach from a Socket Mode delivery that is
+	// near instant to one a minute late; metricsSlackAPIBuckets from a fast
+	// Web API call to the client's 30-second bound (slackAPITimeout).
+	metricsSlackIngressBuckets = []float64{0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60}
+	metricsSlackAPIBuckets     = []float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30}
 )
 
 // Metrics is the gateway's counters and the private registry that serves
@@ -219,6 +253,9 @@ type Metrics struct {
 	messagesInbound     *prometheus.CounterVec
 	answerFeedback      *prometheus.CounterVec
 	sessions            *prometheus.CounterVec
+	slackIngressLag     *prometheus.HistogramVec
+	slackAPIDuration    *prometheus.HistogramVec
+	slackRateLimited    *prometheus.CounterVec
 	// processStart is processStartTimeName, set once in NewMetrics and constant
 	// for the life of the process by construction.
 	processStart prometheus.Gauge
@@ -356,6 +393,28 @@ func NewMetrics() *Metrics {
 			Name:      sessionsName,
 			Help:      "Conversations the gateway minted a session for, by the platform of the first message (googlechat, slack, discord, console, other); a conversation is counted once, and a door's are not chat and are not counted.",
 		}, []string{labelPlatform}),
+		slackIngressLag: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      slackIngressLagName,
+			Help:      "Seconds from a Slack message's event_ts, or a click's action_ts, to the gateway receiving it over Socket Mode; a negative lag (clock skew) is observed as 0. No sample until the first.",
+			Buckets:   metricsSlackIngressBuckets,
+			// No labels; a vec so the series appears with the first
+			// observation, and a gateway on another backend serves none.
+		}, nil),
+		slackAPIDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      slackAPIDurationName,
+			Help:      "Seconds each Slack Web API call the Slack adapter made took, by method (chat.postMessage, chat.update, reactions.add, ..., other) and outcome (ok, a 2xx including Slack's ok:false answers; rate_limited, a 429; error, any other status or no response).",
+			Buckets:   metricsSlackAPIBuckets,
+		}, []string{labelMethod, labelOutcome}),
+		slackRateLimited: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      slackRateLimitedName,
+			Help:      "Slack Web API calls Slack answered 429 (rate limited), by method (chat.postMessage, chat.update, reactions.add, ..., other).",
+		}, []string{labelMethod}),
 		processStart: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: processStartTimeName,
 			Help: "Start time of the process since unix epoch in seconds, captured once at start.",
@@ -371,7 +430,7 @@ func NewMetrics() *Metrics {
 		connected: prometheus.NewDesc(prometheus.BuildFQName(metricsNamespace, metricsSubsystem, slackConnectedName), slackConnectedHelp, nil, nil),
 		lastEvent: prometheus.NewDesc(prometheus.BuildFQName(metricsNamespace, metricsSubsystem, slackLastEventName), slackLastEventHelp, nil, nil),
 	}
-	m.registry.MustRegister(m.taskTerminals, m.gchatEventsReceived, m.gchatPulls, m.chatMessages, m.notifyMarksDropped, m.messagesInbound, m.answerFeedback, m.sessions, m.processStart, people, slackGauges)
+	m.registry.MustRegister(m.taskTerminals, m.gchatEventsReceived, m.gchatPulls, m.chatMessages, m.notifyMarksDropped, m.messagesInbound, m.answerFeedback, m.sessions, m.slackIngressLag, m.slackAPIDuration, m.slackRateLimited, m.processStart, people, slackGauges)
 	for _, outcome := range metricsChatOutcomes {
 		m.chatMessages.WithLabelValues(outcome)
 	}

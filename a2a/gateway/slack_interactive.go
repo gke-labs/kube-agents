@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/slack-go/slack"
@@ -421,6 +422,11 @@ func (s *SlackAdapter) interactive(raw json.RawMessage) (InboundMessage, bool) {
 		// action, not at the top as a shortcut's is; read without this, a
 		// real click has no timestamp and is dropped.
 		p.ActionTS = p.Actions[0].ActionTS
+	}
+	// Every block action, a turn or not: the lag is Slack's leg, whatever
+	// the click turns out to be.
+	if p.Type == slackBlockActions {
+		s.metrics.slackIngress(time.Now(), p.ActionTS)
 	}
 	if p.Type == slackViewSubmission {
 		// A 👎's note, sent from its modal: never a turn.

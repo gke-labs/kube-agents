@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -316,13 +317,20 @@ type SlackAdapter struct {
 	// Mode connection and each event it receives (SetMetrics); nil counts
 	// nothing.
 	metrics *Metrics
+	// apiMetrics is the same counters as the Web API client's transport reads
+	// them (slackAPITransport): the client is built before SetMetrics, so it
+	// holds this pointer rather than the counters. nil in a test adapter.
+	apiMetrics *atomic.Pointer[Metrics]
 }
 
 // SetMetrics gives the adapter the gateway's counters, so the Socket Mode
-// connection's state and the last event's time are served beside them.
-// Called once, before Run.
+// connection's state, the last event's time, the ingress lag and the Web API
+// calls are served beside them. Called once, before Run.
 func (s *SlackAdapter) SetMetrics(m *Metrics) {
 	s.metrics = m
+	if s.apiMetrics != nil {
+		s.apiMetrics.Store(m)
+	}
 }
 
 // slackLinkRE matches the markdown links the relay emits, for rewriteLinks
@@ -552,10 +560,12 @@ func newSlackAdapter(botToken, appToken string, log *slog.Logger, extra ...slack
 	// The bounded client goes LAST so nothing in extra can displace it:
 	// slack-go applies options in order, and a later OptionHTTPClient would
 	// silently put the unbounded default back under every Post and Edit.
+	apiMetrics := &atomic.Pointer[Metrics]{}
 	opts := append([]slack.Option{slack.OptionAppLevelToken(appToken)}, extra...)
-	opts = append(opts, slack.OptionHTTPClient(slackHTTPClient()))
+	opts = append(opts, slack.OptionHTTPClient(slackObservedHTTPClient(apiMetrics)))
 	api := slack.New(botToken, opts...)
 	return &SlackAdapter{
+		apiMetrics:       apiMetrics,
 		api:              api,
 		sm:               socketmode.New(api),
 		log:              log,
@@ -563,7 +573,7 @@ func newSlackAdapter(botToken, appToken string, log *slog.Logger, extra ...slack
 		sessionExpiresAt: map[string]time.Time{},
 		seen:             map[string]bool{},
 		now:              time.Now,
-		sessionsAPI:      slackSessionsClient{token: botToken, apiURL: slack.APIURL, http: slackHTTPClient()},
+		sessionsAPI:      slackSessionsClient{token: botToken, apiURL: slack.APIURL, http: slackObservedHTTPClient(apiMetrics)},
 		feedbackAPI:      api,
 	}
 }
@@ -804,6 +814,13 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 			}
 			switch inner := e.InnerEvent.Data.(type) {
 			case *slackevents.MessageEvent:
+				// event_ts is when Slack raised the event, which for an edit
+				// is the edit and not the original message's ts.
+				eventTS := inner.EventTimeStamp
+				if eventTS == "" {
+					eventTS = inner.TimeStamp
+				}
+				s.metrics.slackIngress(time.Now(), eventTS)
 				var parent string
 				if evt.Request != nil {
 					parent = slackParentUserID(evt.Request.Payload)

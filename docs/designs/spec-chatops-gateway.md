@@ -2957,7 +2957,19 @@ which reads the gauge's `max` by scrape job. A Run that ends in a failure (an `i
 leaves the gauge at 0 until the process exits. The Slack connection does not feed `/readyz`: a
 Slack outage would otherwise take the pod, which also serves the doors, out of Ready, the
 `PlatformAgent` with it, and the gateway's PodDisruptionBudget away, for no failover, since the
-lease rather than readiness picks the leader. A pull carries at most one event today, so `gchat_events_received_total`
+lease rather than readiness picks the leader.
+
+Three more Slack series time the legs the agent's own latency leaves out, each appearing with its
+first observation. `kubeagents_a2a_gateway_slack_ingress_lag_seconds`, unlabelled, is the arrival
+time less the event's own Slack timestamp: the pump reads a message's `event_ts` (its `ts` when
+absent) and `interactive` reads a block action's `action_ts`, clamped at 0 for clock skew.
+`kubeagents_a2a_gateway_slack_api_request_duration_seconds{method, outcome}` and
+`kubeagents_a2a_gateway_slack_api_rate_limited_total{method}` come from a transport on the Web API
+client (`slackAPITransport`), so slack-go, the Agent Sessions client and `apps.connections.open`
+are all timed without a call site changing. `method` is the URL's last segment when
+`metricsSlackAPIMethods` names it and `other` otherwise; `outcome` is `ok` for a 2xx, which
+includes Slack's `ok: false` answers, `rate_limited` for a 429, and `error` for any other status or
+no response. A pull carries at most one event today, so `gchat_events_received_total`
 equals `gchat_pulls_total{outcome="events"}`; they are separate so the first keeps its meaning if a
 pull ever returns more than one. An install that Chat publishes nothing to shows `empty` rising
 and `events` flat; a refused relay shows `failed` rising.
