@@ -1103,6 +1103,11 @@
 # destroy. No fixture; the host install only.
 ./tasks/findings-decision-leaves-unnamed-open/task.yaml
 
+# The first-install hello when the report was filed as a ledger issue before
+# anyone wrote (#4058): the greeting answers first and links the issue once,
+# never in front of the answer. Same seam, variant filed; no fixture.
+./tasks/first-install-hello-filed/task.yaml
+
 # A fleet audit on an install whose scope excludes as many clusters as it
 # manages runs, rather than cancelling with "every managed cluster is
 # excluded" (#3933). The runner excludes slots b and d plus one cluster that
