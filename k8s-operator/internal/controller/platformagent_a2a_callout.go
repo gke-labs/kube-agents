@@ -458,6 +458,12 @@ func a2aExecutorSidecarEnv(containers []corev1.Container) []corev1.Container {
 			{Name: a2aCapabilityRequiredEnvVar, Value: a2aCapabilityRequired()},
 			a2aNATSCAFileEnvVar(),
 		}
+		// A declared bridge binds its intake durable as the rendered one does:
+		// the provision Job creates it, and the bridge principal is refused
+		// creating it (#4173).
+		if a2aIsBridgeSidecar(c) {
+			switchOverride = append(switchOverride, corev1.EnvVar{Name: a2aBridgeDurablePrecreatedEnvVar, Value: "true"})
+		}
 		// mergeEnvVars' second argument wins, so the nesting IS the
 		// precedence: the container's own env beats the namespace default,
 		// and the switch beats both.

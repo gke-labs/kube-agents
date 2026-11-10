@@ -117,7 +117,7 @@ _DEFAULT_LIMITS_CPU_MILLIS = 13200
 # Memory and ephemeral storage are summed by the same helper as CPU but were asserted
 # nowhere, so a generator that stopped parsing them could be regenerated and committed
 # together with a green `--check` (both sides move at once) and nothing would catch it.
-_DEFAULT_REQUESTS_MEMORY_BYTES = 10048 * 1024**2
+_DEFAULT_REQUESTS_MEMORY_BYTES = 12096 * 1024**2
 _DEFAULT_LIMITS_MEMORY_BYTES = 25472 * 1024**2
 # Ephemeral-storage requests: the footprint's 11Gi (the agent pod's 3Gi and the credential
 # proxy's 8Gi), LiteLLM's 1280Mi per replica (its tmp emptyDir's sizeLimit plus logs) on two
@@ -1275,15 +1275,15 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         # Every spelling the Kubernetes quantity grammar admits raises it, not only the
         # common suffixes: a JSON number (a float that prints with an exponent), a leading
-        # "+", an exponent and a Pi suffix, each above the agent container's 2Gi memory.
+        # "+", an exponent and a Pi suffix, each above the agent container's 4Gi memory.
         cli_mem = yaml.safe_load(_FOOTPRINT.read_text())["nextMode"]["agentPod"]["hermesBridgeCli"][
             "memoryBytesRequest"
         ]
         base = self._requirements(["platformAgent.mode=next"])
         for written, want in (
-            ('{"requests": {"memory": 4294967296}}', 4294967296),
-            ('{"requests": {"memory": "+4Gi"}}', 4 * 1024**3),
-            ('{"requests": {"memory": "4e9"}}', 4 * 10**9),
+            ('{"requests": {"memory": 6442450944}}', 6442450944),
+            ('{"requests": {"memory": "+6Gi"}}', 6 * 1024**3),
+            ('{"requests": {"memory": "6e9"}}', 6 * 10**9),
             ('{"requests": {"memory": "1Pi"}}', 1024**5),
         ):
             with self.subTest(written):
@@ -2088,8 +2088,8 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small memory shorthand quota must fail")
         self.assertIn("  - memory:", res.stderr)
-        # The release's 10048Mi plus one LiteLLM surge Pod's 2Gi.
-        self.assertIn('"memory":"12096Mi"', res.stderr)
+        # The release's 12096Mi plus one LiteLLM surge Pod's 2Gi.
+        self.assertIn('"memory":"14144Mi"', res.stderr)
 
     def test_shorthand_ephemeral_storage_spelling_is_enforced(self) -> None:
         """`ephemeral-storage` is the shorthand spelling for `requests.ephemeral-storage`."""

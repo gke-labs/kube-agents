@@ -702,10 +702,22 @@ litellm:
     rollingUpdate:
       maxSurge: 1
       maxUnavailable: 0
+    # What the proxy does with answers (hack/replay-proxy/README.md, "Modes").
+    # shadow, the default, saves and serves nothing. record also saves each
+    # answer under cacheDir, for a trusted nightly (job.kind nightly) to
+    # publish. replay serves saved answers instead of calling the model, for
+    # the replay lane (job.kind replay-lane) only, and needs allowServe: true
+    # as well; the schema refuses either of those two without the other, so
+    # one value set by mistake can't serve an answer. hack/ci-env.sh decides
+    # the mode (resolve_replay_shadow). cacheDir is one directory in the data
+    # volume, beside the proxy's logs/ and store/.
+    mode: shadow
+    cacheDir: /data/replay-cache
+    allowServe: false
     # Stamped on every log line (REPLAY_JOB_*). kind is nightly,
-    # nightly-untrusted or presubmit (hack/ci-env.sh, resolve_replay_shadow),
-    # and is required when the proxy is on: an untagged line counts in no
-    # estimate.
+    # nightly-untrusted, presubmit or replay-lane (hack/ci-env.sh,
+    # resolve_replay_shadow), and is required when the proxy is on: an
+    # untagged line counts in no estimate.
     job:
       kind: ""
       project: ""
@@ -1215,6 +1227,18 @@ platformAgent:
       # first install: an existing bus keeps its count, and a different value is
       # refused rather than converting it.
       # busReplicas: 3
+      # admission is the memory admission the kanban dispatcher applies to its
+      # own workers, board-wide: past the budget it refuses a card rather than
+      # spawn a worker, blocking the card with kind "capacity" and telling its
+      # thread. memoryBudgetMiB defaults to the agent container's memory request
+      # in MiB (4096 at the default 4Gi), workerRssCapMiB to 1536,
+      # queueBoundSeconds to 600 and failClosed to true; the operator renders
+      # the block with those defaults when nothing is set here.
+      # admission:
+      #   memoryBudgetMiB: 3072
+      #   workerRssCapMiB: 1536
+      #   queueBoundSeconds: 600
+      #   failClosed: true
       # profiles sizes AgentProfile work on a "next" install: ceiling is the most
       # profile tasks running at once across every profile (default: maxInProgress,
       # 6 unless set), childReserve the share of it kept for child tasks (default

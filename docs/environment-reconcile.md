@@ -232,6 +232,13 @@ Optional, and copied through when set: `CLUSTER_MODE`, `MODEL_DEFAULT_NAME`,
 `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `SLACK_BOT_TOKEN`,
 `SLACK_APP_TOKEN`.
 
+With `GH_APP_ID` set and `KMS_KEYRING` or `KMS_KEY` unset, the rendered file
+names the project-wide minter key ring, key and GSA (`github-token-minter-keyring`,
+`github-token-minter-key`, `kubeagents-github-minter-gsa`), the names environments
+have always run on. A rebuild has no minter in its state, so the installer would
+otherwise derive per-install names. Named explicitly, a key with no owner labels
+is adopted as the environment's own and labelled at the apply.
+
 `HELM_UPGRADE_INSTALL=true` makes the composition create the `kube-agents` Helm
 release with `helm upgrade --install` (the release's `upgrade_install`). The Helm
 provider can drop a live release from state when a refresh lookup fails

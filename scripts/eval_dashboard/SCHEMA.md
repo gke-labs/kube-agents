@@ -1358,8 +1358,12 @@ deadline").
 pool"): `{since, verdict, breach_seen, measured_at}` always, plus `{day,
 window_hours, p50_s, p95_s, waiting_longest_s, waiting_now, waiting_since, over_threshold,
 threshold_p50_s, threshold_p95_s, free, total, lease_failures, lease_failures_hours,
-no_build_id, cause, max_concurrency}` when
-`verdict` is `BREACH` or `UNMEASURED`. `lease_failures` is how many runs Boskos
+no_build_id, cause, max_concurrency, breached_days, worst_s, waiting}` when
+`verdict` is `BREACH` or `UNMEASURED`. `breached_days` are the periodic's ISO days
+that breached, `worst_s` the longest wait among them (the window's when none is a
+day's), and `waiting` the live queue count (`null` when Deck was not read); the
+cap message quotes `waiting` while the queue is live and the other two when it
+is not. `lease_failures` is how many runs Boskos
 refused a project in the periodic's recent window of `lease_failures_hours`
 hours, and `no_build_id` how many projects are leased under an owner that is
 neither a Prow run nor a known job's fixed owner; `lease_failures` and
@@ -1372,7 +1376,8 @@ the p95 limit. `waiting_now` is whether that wait is past the p50 limit — a
 live backlog — and `null` when Deck was unread or no limit was given. A verdict
 lasts a week, so every present-tense reader asks it: the alert is withheld on
 `false` unless `lease_failures` is non-zero, `CONTROL_PLANE` drops its
-diagnosis on `null`, and the digest and Brief go past tense on either. `waiting_since` dates the backlog from its
+diagnosis on `null`, `CONCURRENCY_CAP` goes past tense on either and says
+nothing waits only on `false`, and the digest and Brief go past tense on either. `waiting_since` dates the backlog from its
 oldest queued run, and is `null` when there is none; the Brief's present-tense
 sentence prefers it to `since`, which can be days older.
 `breach_seen` says whether the open episode has ever measured a breach, and
