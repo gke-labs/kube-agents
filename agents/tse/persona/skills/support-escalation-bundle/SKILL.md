@@ -69,6 +69,8 @@ gcloud compute instances get-serial-port-output "${NODE_NAME}" \
   --port=1 | tail -n 100
 ```
 
+The serial-port read names the node's zone, and the credential broker holds a zonal read to a task whose location is that zone. On a regional cluster it is refused: name that gap in the bundle rather than retrying it another way.
+
 ---
 
 ## Step 2: Enforce Strict Redaction Rules

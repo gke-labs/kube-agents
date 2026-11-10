@@ -42,8 +42,10 @@ What it holds:
   the tools it grants (`read_file`, `shell`, `web_search` and the two servers);
 - [`instructions.md`](instructions.md): the instructions, from `SOUL.md`,
   `AGENTS.md` and `CAPABILITIES.md`;
-- [`mcp.yaml`](mcp.yaml): the `gke` and `developer_knowledge` servers on the
-  broker's relay, each limited to its read tools;
+- [`mcp.yaml`](mcp.yaml): the `developer_knowledge` server on the broker's
+  relay, limited to the two document reads a profile worker may use. The `gke`
+  server is left out: the broker refuses it to profile workers, whose `kubectl`
+  and `gcloud` reach the task's target instead;
 - the [`support-escalation-bundle`](skills/support-escalation-bundle/SKILL.md)
   skill: its `agents/tse/skills` source with only the edit
   `a2a/lib/persona/claudecode/tse_persona_test.go` lists (the bundle's

@@ -4,10 +4,12 @@
 # GKE support case deflection and structured incident triage (docs/designs/spec-subagent-profiles.md).
 #
 # Applied to a `mode: next` install, the operator renders this profile's
-# ServiceAccount, its bus identity, its agent card, and `KUBE_AGENTS_ENABLED_PROFILES=tse`
-# on the gateway Deployment so the entrypoint scaffolds `$HERMES_HOME/profiles/tse`
-# from `/opt/tse-template` and the kanban dispatcher can run `tse` tasks inside the
-# gateway pod until the per-profile Job dispatcher lands.
+# ServiceAccount, its bus identity and its agent card. Under the AgentProfile
+# dispatcher, a profile worker pod runs each task with the persona-tse image
+# mounted at /persona (agents/tse/persona). A task names its target cluster with
+# the project, location and cluster parameters, in the persona's order, and the
+# credential broker holds the task's kubectl and gcloud calls to it.
+# Project-wide questions wait on #5424.
 apiVersion: kubeagents.x-k8s.io/v1alpha1
 kind: AgentProfile
 metadata:
@@ -38,8 +40,16 @@ spec:
       - agent.platform.upgrade-readiness
 
   identity: {}
-    # Operator-created KSA with zero RoleBindings; read-only GKE/developer_knowledge
-    # MCP access is mediated via the credential broker and persona config.yaml.
+    # Operator-created KSA with zero RoleBindings; the worker's kubectl, gcloud
+    # and developer_knowledge reads go through the credential broker.
+
+  parameters:
+    - name: project
+      required: true
+    - name: cluster
+      required: true
+    - name: location
+      required: true
 
   lifecycle:
     activeDeadlineSeconds: 1800

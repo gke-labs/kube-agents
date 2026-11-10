@@ -57,12 +57,12 @@ func TestTheTsePersonaRendersWhole(t *testing.T) {
 	if err := json.Unmarshal([]byte(strings.Join(flagValue(t, out.Args, MCPConfigFlag), ",")), &cfg); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"gke", "developer_knowledge"} {
+	for _, name := range []string{"developer_knowledge"} {
 		if _, ok := cfg.MCPServers[name]; !ok {
 			t.Errorf("--mcp-config lacks %s", name)
 		}
 	}
-	for _, tool := range []string{"mcp__developer_knowledge__search_documents", "mcp__developer_knowledge__get_documents", "mcp__gke__get_cluster", "Bash", "Read", "WebSearch", "Skill"} {
+	for _, tool := range []string{"mcp__developer_knowledge__search_documents", "mcp__developer_knowledge__get_documents", "Bash", "Read", "WebSearch", "Skill"} {
 		if !slices.Contains(out.Allowed, tool) {
 			t.Errorf("%s is not granted: %v", tool, out.Allowed)
 		}
@@ -115,7 +115,7 @@ func TestTheTsePersonaStatesItsRedLines(t *testing.T) {
 	text := load(t, tsePersonaDir).Instructions
 	for what, phrase := range map[string]string{
 		"target cluster only":        "**The target cluster only.**",
-		"never wildcard the project": "`projects/-` is refused",
+		"never wildcard the project": "a wildcard or another project is refused",
 		"a denial is terminal":       "**A denial is terminal.**",
 		"no GitOps writes or PRs":    "Never open Pull Requests or push commits",
 		"negative proof":             "Never hallucinate Google tenant-project telemetry",
@@ -162,7 +162,7 @@ An investigation run against the wrong cluster produces a confident, wrong repor
 `
 	tseTargetOnlyRule = `- **The target cluster only.** Never query or reason about other clusters. If a request concerns another cluster, say in your answer that it is out of your scope.
 `
-	tseZeroAssumptionsRule = `- **Zero unverified internal assumptions.** Operate strictly on customer-visible telemetry: ` + "`" + `kubectl` + "`" + `, ` + "`" + `gcloud` + "`" + `, Cloud Logging, Cloud Monitoring, GCE serial port output, the ` + "`" + `gke` + "`" + ` and ` + "`" + `developer_knowledge` + "`" + ` MCP servers, and your skills. Never hallucinate Google tenant-project telemetry; instead, prove customer-side hypotheses are ruled out (negative proof) and package the escalation with the ` + "`" + `support-escalation-bundle` + "`" + ` skill.
+	tseZeroAssumptionsRule = `- **Zero unverified internal assumptions.** Operate strictly on customer-visible telemetry: ` + "`" + `kubectl` + "`" + `, ` + "`" + `gcloud` + "`" + `, Cloud Logging, Cloud Monitoring, GCE serial port output, the ` + "`" + `developer_knowledge` + "`" + ` MCP server, and your skills. Never hallucinate Google tenant-project telemetry; instead, prove customer-side hypotheses are ruled out (negative proof) and package the escalation with the ` + "`" + `support-escalation-bundle` + "`" + ` skill.
 `
 	tseFailLoudRule = `- **Fail loud, never silent.** If you cannot operate — the target is missing, the task's target and the request disagree, or the credential proxy will not serve the target (§1) — say exactly why in your answer before you stop.
 `
@@ -170,45 +170,41 @@ An investigation run against the wrong cluster produces a confident, wrong repor
 `
 )
 
-// The include lists keep the model's offer to the relay's read tools: gke's is
-// exactly agents/platform/scripts/mcp_policy.py's GKE_READ_TOOLS, and
-// developer_knowledge's is its DEVELOPER_KNOWLEDGE_READ_TOOLS less
-// answer_query, whose small daily quota every agent of an install shares. A
-// write tool such as update_cluster added to either fails here.
-func TestTheTsePersonaOffersOnlyTheRelaysReadTools(t *testing.T) {
+// The persona offers only what a profile worker may reach on the broker's MCP
+// relay: agents/platform/scripts/mcp_policy.py's PROFILE_SERVER_TOOLS, which
+// gives profile workers developer_knowledge's two document reads and no other
+// server. A gke server, or answer_query, added to mcp.yaml fails here: the
+// worker would be refused it.
+func TestTheTsePersonaOffersOnlyWhatAProfileWorkerMayReach(t *testing.T) {
 	src, err := os.ReadFile("../../../../agents/platform/scripts/mcp_policy.py")
 	if err != nil {
 		t.Fatal(err)
 	}
-	readTools := func(name string) []string {
-		m := regexp.MustCompile(`(?s)\n` + name + ` = frozenset\(\s*\{(.*?)\}`).FindSubmatch(src)
-		if m == nil {
-			t.Fatalf("mcp_policy.py has no %s frozenset", name)
-		}
+	block := regexp.MustCompile(`(?s)\nPROFILE_SERVER_TOOLS: [^=]*= \{(.*?)\n\}`).FindSubmatch(src)
+	if block == nil {
+		t.Fatal("mcp_policy.py has no PROFILE_SERVER_TOOLS table")
+	}
+	want := map[string][]string{}
+	for _, m := range regexp.MustCompile(`"([a-z_]+)": frozenset\(\{([^}]*)\}\)`).FindAllSubmatch(block[1], -1) {
 		var tools []string
-		for _, q := range regexp.MustCompile(`"([a-z_0-9]+)"`).FindAllSubmatch(m[1], -1) {
+		for _, q := range regexp.MustCompile(`"([a-z_0-9]+)"`).FindAllSubmatch(m[2], -1) {
 			tools = append(tools, string(q[1]))
 		}
-		if len(tools) == 0 {
-			t.Fatalf("read no tools from %s", name)
-		}
 		slices.Sort(tools)
-		return tools
+		want[string(m[1])] = tools
 	}
-	want := map[string][]string{
-		"gke": readTools("GKE_READ_TOOLS"),
-		"developer_knowledge": slices.DeleteFunc(readTools("DEVELOPER_KNOWLEDGE_READ_TOOLS"), func(s string) bool {
-			return s == "answer_query"
-		}),
+	if len(want) == 0 {
+		t.Fatal("read no servers from PROFILE_SERVER_TOOLS")
 	}
 	servers := load(t, tsePersonaDir).MCP.Servers
-	if len(servers) != len(want) {
-		t.Errorf("mcp.yaml has %d servers, want %d", len(servers), len(want))
-	}
-	for name, tools := range want {
-		got := slices.Sorted(slices.Values(servers[name].Include))
-		if !slices.Equal(got, tools) {
-			t.Errorf("%s's include list = %v, want the relay's read tools %v", name, got, tools)
+	for name, server := range servers {
+		tools, ok := want[name]
+		if !ok {
+			t.Errorf("mcp.yaml offers %s, which a profile worker is refused", name)
+			continue
+		}
+		if got := slices.Sorted(slices.Values(server.Include)); !slices.Equal(got, tools) {
+			t.Errorf("%s's include list = %v, want what a profile worker may reach %v", name, got, tools)
 		}
 	}
 }
@@ -228,12 +224,17 @@ var tseAllowedSkillEdits = map[string][]tseSkillEdit{
 		// The bundle's commands read shell variables; the persona sets them
 		// from the task's target.
 		{tseBundleLead, tseBundleLead + "\n" + tseBundleVars, 1},
+		// A zonal read under a regional task's target is refused by the
+		// broker's confinement (task_confinement.py), so the bundle names it.
+		{tseSerialPortTail, tseSerialPortTail + "\n" + tseSerialPortNote, 1},
 	},
 }
 
 const (
-	tseBundleLead = "needs to begin root-cause analysis immediately without round-trip clarification questions:\n"
-	tseBundleVars = `Set the variables from the task's target first: ` + "`" + `PROJECT_ID="$PROFILE_TASK_PROJECT"` + "`" + `, ` + "`" + `CLUSTER_NAME="$PROFILE_TASK_CLUSTER"` + "`" + ` and ` + "`" + `LOCATION="$PROFILE_TASK_LOCATION"` + "`" + `. ` + "`" + `NODE_NAME` + "`" + ` and ` + "`" + `NODE_ZONE` + "`" + ` come from your evidence.
+	tseSerialPortTail = "  --port=1 | tail -n 100\n```\n"
+	tseSerialPortNote = "The serial-port read names the node's zone, and the credential broker holds a zonal read to a task whose location is that zone. On a regional cluster it is refused: name that gap in the bundle rather than retrying it another way.\n"
+	tseBundleLead     = "needs to begin root-cause analysis immediately without round-trip clarification questions:\n"
+	tseBundleVars     = `Set the variables from the task's target first: ` + "`" + `PROJECT_ID="$PROFILE_TASK_PROJECT"` + "`" + `, ` + "`" + `CLUSTER_NAME="$PROFILE_TASK_CLUSTER"` + "`" + ` and ` + "`" + `LOCATION="$PROFILE_TASK_LOCATION"` + "`" + `. ` + "`" + `NODE_NAME` + "`" + ` and ` + "`" + `NODE_ZONE` + "`" + ` come from your evidence.
 `
 )
 

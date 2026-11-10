@@ -18,7 +18,6 @@ tools:
   - read_file
   - shell
   - web_search
-  - gke
   - developer_knowledge
 parameters:
   - name: project
