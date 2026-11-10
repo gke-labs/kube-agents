@@ -117,6 +117,20 @@ def test_a_chained_sleep_cut_at_60s_fails():
     assert _status(NOT_CUT, calls) == "fail"
 
 
+def test_a_table_of_counts_passes():
+    table = (
+        "**Here are the `kube-system` pod counts across the fleet.**\n\n"
+        "| Cluster | Running Pods in `kube-system` |\n| --- | --- |\n"
+        "| `platform-agent-host` | 82 |\n| `cluster-1` | 58 |\n| `autopilot-cluster-1` | 0 (19 Pending) |"
+    )
+    assert _status(COUNTS, _fanout(SLEPT), output=table) == "pass"
+
+
+def test_a_total_with_a_word_between_passes():
+    total = "**There are 140 running pods in the `kube-system` namespace across the 3 fleet clusters.**"
+    assert _status(COUNTS, _fanout(SLEPT), output=total) == "pass"
+
+
 def test_the_answer_needs_the_namespace_and_a_count():
     assert _status(COUNTS, _fanout(SLEPT)) == "pass"
     assert _status(COUNTS, _fanout(SLEPT), output="All clusters look fine.") == "fail"
