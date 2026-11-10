@@ -1362,6 +1362,13 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		// chattext.IsStatusQuery is a phrase set, so a real question such
 		// as "how is the deploy doing" still starts a task.
 		g.post(rec.Key, topLevelNothingRunningNotice)
+	case stopping && isChatStopPress(msg, backend) && msg.TaskID != "" && (active == nil || active.TaskID != msg.TaskID):
+		// Google Chat's Stop button names its task (gchat_stop.go): a
+		// press on a task that is not the running one is a stale button,
+		// answered on its own line, and cancels nothing. Read before the
+		// requester gate below: it cancels nothing, so anyone may heal a
+		// dead line.
+		g.chatStopStale(rec, msg)
 	case stopping && isStopPress(msg, backend) &&
 		!mayStop(rec, backend, TaskRequester{Backend: backend, Subject: requesterSubject(g.ps, backend, msg.AuthorID)}):
 		// Only the people who asked for work in a thread may press its Stop
@@ -1371,11 +1378,6 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		g.log.Info("stop press refused: not a requester in this conversation", "backend", backend, "conversation", rec.Key)
 	case stopping && isSlackStop(msg, backend) && g.cardStopWanted(rec, msg):
 		g.slackStop(ctx, rec, authority, backend)
-	case stopping && isChatStopPress(msg, backend) && msg.TaskID != "" && (active == nil || active.TaskID != msg.TaskID):
-		// Google Chat's Stop button names its task (gchat_stop.go): a
-		// press on a task that is not the running one is a stale button,
-		// answered on its own line, and cancels nothing.
-		g.chatStopStale(rec, msg)
 	case stopping && isChatStopPress(msg, backend) && msg.TaskID != "":
 		// A press on the running task answers on that task's own line, and
 		// posts nothing (chat_stop_press.go). With the card stop armed the

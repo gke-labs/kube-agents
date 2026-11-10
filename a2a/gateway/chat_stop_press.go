@@ -37,10 +37,9 @@ import (
 const staleStopNotice = "ℹ️ this task has ended"
 
 // isChatStopPress reports a stop from Google Chat's Stop button rather than
-// the word: the Google Chat adapter sets IntentCancel only on a kage.stop
-// click, which it marks as one.
+// the word, as stopGatedBackends describes Chat's press (stopgate.go).
 func isChatStopPress(msg InboundMessage, backend string) bool {
-	return backend == gchatBackend && msg.Intent == IntentCancel && msg.Click
+	return backend == gchatBackend && isStopPress(msg, backend)
 }
 
 // chatStopPress answers a Stop press on rec's active task: the quiet cancel,

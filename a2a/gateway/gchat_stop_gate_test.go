@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -11,59 +12,10 @@ import (
 // The requester gate on Google Chat's Stop button (stopgate.go): the rule
 // Slack's button has, on the button the Chat adapter draws. Only the people
 // who asked for work in the thread may press it; anyone else's press cancels
-// nothing and posts nothing, and a typed `stop` keeps its rule.
-
-func TestMayStopOnGoogleChatOnlyTheRequesters(t *testing.T) {
-	alice := TaskRequester{Backend: gchatBackend, Subject: "h-alice"}
-	bob := TaskRequester{Backend: gchatBackend, Subject: "h-bob"}
-	carol := TaskRequester{Backend: gchatBackend, Subject: "h-carol"}
-	dave := TaskRequester{Backend: gchatBackend, Subject: "h-dave"}
-	rec := &SessionRecord{
-		Tasks:          []TaskRef{{ID: "task-1", Requester: &alice, SteerAuthors: []TaskRequester{bob}}},
-		SessionAuthors: []TaskRequester{carol},
-	}
-	for _, who := range []TaskRequester{alice, bob, carol} {
-		if !mayStop(rec, gchatBackend, who) {
-			t.Errorf("%s asked for work here and was refused", who.Subject)
-		}
-	}
-	if mayStop(rec, gchatBackend, dave) {
-		t.Error("someone the allowlist admits, who asked for nothing here, may stop it")
-	}
-	if mayStop(rec, gchatBackend, TaskRequester{Backend: gchatBackend}) {
-		t.Error("an author with no subject may stop it")
-	}
-	// The same subject on another backend is another person.
-	if mayStop(rec, gchatBackend, TaskRequester{Backend: slackBackend, Subject: "h-alice"}) {
-		t.Error("a requester's subject on another backend was taken for theirs")
-	}
-}
-
-// When the record cannot tell who asked, anyone the gateway answers may press
-// Stop, on Google Chat as on Slack.
-func TestMayStopOnGoogleChatFailsOpenWhenTheRecordCannotTellWhoAsked(t *testing.T) {
-	bob := TaskRequester{Backend: gchatBackend, Subject: "h-bob"}
-	alice := TaskRequester{Backend: gchatBackend, Subject: "h-alice"}
-	full := make([]TaskRef, taskHistoryCap)
-	for i := range full {
-		full[i] = TaskRef{ID: "task", Requester: &bob}
-	}
-	for name, rec := range map[string]*SessionRecord{
-		"ran nothing":              {},
-		"every requester aged out": {Tasks: []TaskRef{{ID: "task-1"}, {ID: "task-2"}}},
-		"one requester pruned":     {Tasks: []TaskRef{{ID: "task-1"}, {ID: "task-2", Requester: &bob}}},
-		"steer authors overflowed": {Tasks: []TaskRef{{ID: "task-1", Requester: &bob, SteerAuthorsOverflow: true}}},
-		"session authors unknown":  {Tasks: []TaskRef{{ID: "task-1", Requester: &bob}}, SessionAuthorsUnknown: true},
-		"history at its cap":       {Tasks: full},
-	} {
-		if !mayStop(rec, gchatBackend, alice) {
-			t.Errorf("%s: the requester whose copy may be gone was refused", name)
-		}
-	}
-	if mayStop(&SessionRecord{Tasks: []TaskRef{{ID: "task-1", Requester: &bob}}}, gchatBackend, alice) {
-		t.Error("a complete record let a non-requester stop the thread")
-	}
-}
+// nothing and posts nothing, and a typed `stop` keeps its rule. The gate's
+// own rule is tested once per gated backend in slack_stop_test.go; this file
+// holds what is Chat's: the wire shape of a press, and the press through the
+// gateway.
 
 // isStopPress is the button and only the button: Slack's native Stop, and a
 // click on the Chat adapter's. A program's cancel on Chat (IntentCancel with
@@ -93,9 +45,9 @@ const (
 
 // gateChatRig is a Chat rig with two members admitted, the requester and
 // another, and a task of the requester's running with its working line.
-func gateChatRig(t *testing.T, conv string) (*rig, *lib.Envelope, string) {
+func gateChatRig(t *testing.T, conv string, opts ...func(*Config)) (*rig, *lib.Envelope, string) {
 	t.Helper()
-	r := startGchatRig(t, []string{gateRequester, gateOther}, false)
+	r := startGchatRig(t, []string{gateRequester, gateOther}, false, opts...)
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: gateRequester, MessageID: "spaces/S1/messages/M1", Text: "explain node upgrades"}
 	origin := r.awaitTask(t, "platform")
 	if err := r.execFor(t, origin, "platform").PublishStatus(context.Background(), lib.StateWorking, false); err != nil {
@@ -141,10 +93,11 @@ func steerAndWait(t *testing.T, r *rig, conv, who, id string, origin *lib.Envelo
 	})
 }
 
-// Another admitted member's press, on the running task or on a stale one,
-// cancels nothing, edits nothing and posts nothing. Their follow-up after it
-// is the sync point, and the requester's press on the same record then
-// cancels, so it was the presser that was refused and not the press.
+// Another admitted member's press on the running task cancels nothing,
+// edits nothing and posts nothing; their press on a stale line heals it, as
+// anyone's does, since it cancels nothing. Their follow-up after it is the
+// sync point, and the requester's press on the same record then cancels, so
+// it was the presser that was refused and not the press.
 func TestAChatStopPressFromAnotherMemberCancelsNothing(t *testing.T) {
 	conv := "gchat:spaces/S1/threads/T-gate-other"
 	r, origin, line := gateChatRig(t, conv)
@@ -157,12 +110,20 @@ func TestAChatStopPressFromAnotherMemberCancelsNothing(t *testing.T) {
 	if rec.ActiveTask.Detached || rec.ActiveTask.LineClosed {
 		t.Fatalf("another member's press cancelled the task: %+v", rec.ActiveTask)
 	}
-	// The steer's own acknowledgement is the one post since the ask; the
-	// press itself neither edits a line nor posts.
-	for _, e := range r.adapter.editTexts() {
-		if strings.Contains(e, "cancel") || strings.Contains(e, staleStopNotice) {
-			t.Fatalf("another member's press edited %q", e)
+	// The stale press's heal is the one edit, on the pressed line; the
+	// steer's own acknowledgement is the one post since the ask.
+	stale := false
+	r.adapter.mu.Lock()
+	for _, e := range r.adapter.edits {
+		if e.MessageID == "spaces/S1/messages/OLD-LINE" && e.Text == staleStopNotice {
+			stale = true
+		} else if strings.Contains(e.Text, "cancel") {
+			t.Errorf("another member's press edited %q", e.Text)
 		}
+	}
+	r.adapter.mu.Unlock()
+	if !stale {
+		t.Error("another member's stale press did not heal the dead line")
 	}
 	for _, p := range r.adapter.postTexts() {
 		if strings.Contains(p, "🛑") || strings.Contains(p, staleStopNotice) {
@@ -202,4 +163,50 @@ func TestATypedStopFromAnotherMemberOnChatKeepsItsRule(t *testing.T) {
 			t.Errorf("a typed stop with a line posted %q; the line is the reply", p)
 		}
 	}
+}
+
+// cardStopControlsOn is how many card-stop controls addressee's in subject
+// holds.
+func cardStopControlsOn(t *testing.T, r *rig, addressee string) int {
+	t.Helper()
+	n := 0
+	for _, e := range inSubjectEnvelopes(t, r.url, addressee) {
+		if e.Kind != lib.KindMessage {
+			continue
+		}
+		var m lib.Message
+		if err := json.Unmarshal(e.Payload, &m); err == nil && lib.CardStopRequested(m.Parts) {
+			n++
+		}
+	}
+	return n
+}
+
+// With the card stop armed (A2A_CARD_STOP=true) a press on the running task
+// is a typed stop, cards and all; the gate reads it before that. Another
+// member's press stops no cards and posts nothing; the requester's press
+// cancels the turn and sends the card-stop control.
+func TestAChatStopPressFromAnotherMemberStopsNoCards(t *testing.T) {
+	conv := "gchat:spaces/S1/threads/T-gate-cards"
+	r, origin, line := gateChatRig(t, conv, func(c *Config) { c.CardStop = true })
+
+	pressChatStop(r, conv, gateOther, line+"#t1", origin.TaskID)
+	steerAndWait(t, r, conv, gateOther, "spaces/S1/messages/M2", origin)
+
+	rec := waitForRecord(t, r, conv, "the record", func(rec *SessionRecord) bool { return rec.ActiveTask != nil })
+	if rec.ActiveTask.Detached || rec.CardStop != nil {
+		t.Fatalf("another member's press stopped the work: %+v", rec.ActiveTask)
+	}
+	if n := cardStopControlsOn(t, r, "platform"); n != 0 {
+		t.Fatalf("another member's press sent %d card-stop control(s)", n)
+	}
+	for _, p := range r.adapter.postTexts() {
+		if strings.Contains(p, "🛑") {
+			t.Fatalf("another member's press posted %q", p)
+		}
+	}
+
+	pressChatStop(r, conv, gateRequester, line+"#t2", origin.TaskID)
+	waitFor(t, "the requester's press to send the card-stop control", func() bool { return cardStopControlsOn(t, r, "platform") == 1 })
+	waitForRecord(t, r, conv, "the turn cancelled", func(rec *SessionRecord) bool { return rec.ActiveTask == nil || rec.ActiveTask.Detached })
 }
