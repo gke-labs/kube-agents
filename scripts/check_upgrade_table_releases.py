@@ -27,10 +27,15 @@ on any other change.
 
 A `pending` row passes while no release contains it, and fails once one does (its tag contains the
 commit that added the row, or its own copy of the table holds the row), naming the first such release
-to relabel it with. Known limit, which fails open: a `pending` row reworded after its release traces
-to the rewording commit, which no release contains, so it passes; relabel a `pending` row before you
-reword it, or name its shipped commit in TRACES_FILE. A `pending` row no commit can be found for is reported, as any row is. A Release
-cell that is neither a release number nor `pending` fails, so a misspelt label is not skipped.
+to relabel it with. A reworded row traces to the rewording commit, so a change that removes the text of
+a `pending` row a release already contains fails: to reword it, label the new text with the release
+and name its shipped commit in TRACES_FILE; to drop it, relabel it first and remove it in a later
+change. A push to main has no base to compare with, so this part runs on pull requests, merge groups
+and local runs only. Nor does it see a reword merged after a release's candidate was cut and before
+its tag: no release contains the row yet when the reword is checked. Each new row with a trace entry
+excuses one removed row of its release, so a new late row added in the same change as a removal also
+excuses it. A `pending` row no commit can be found for is reported, as any row is. A Release cell that is neither a release number nor `pending`
+fails, so a misspelt label is not skipped.
 
 The check needs the history and the release tags, so it fails on a shallow clone or one with no
 release tag rather than pass with nothing to compare.
@@ -60,7 +65,6 @@ TABLE_HEADING = "### Breaking changes in recent releases"
 # A table row: `| <release> | <change> | ...`. The change cell is the row's stable name.
 # A row whose change has not shipped yet is labelled `pending`; it fails once a release contains it.
 PENDING = "pending"
-PENDING_REWORD_NOTE = f" Relabel a {PENDING} row before you reword it: a reworded row traces to the rewording commit."
 ROW = re.compile(rf"^\| (?P<release>\d+\.\d+\.\d+|{PENDING})\s*\| (?P<change>[^|]+?)\s*\|", re.MULTILINE)
 # A table line in a diff: `git log -G` lists the commits that add or remove one. A commit counts as
 # adding a row only when one of its added lines is a release row (or one still labelled `pending`)
@@ -95,6 +99,8 @@ WARNING_NOTE = ("warning: this change does not add or relabel these rows, so the
 TRACES_FILE = "scripts/upgrade_table_traces.txt"
 TRACE_COMMENT = "#"
 TRACE_COMMIT = re.compile(r"^[0-9a-f]{40}$")
+PENDING_REWORD_NOTE = (f" To reword a {PENDING} row after its release, label the new text with the release and name "
+                       f"its shipped commit in {TRACES_FILE}.")
 TRACE_HINT = (f" If this row was reworded after its release shipped, or added after its release was tagged, "
               f"name the commit that shipped it in {TRACES_FILE} instead.")
 UNTAGGED_NOTE = ("note: rows labelled {releases} are not checked: no such tag is here. If a release is out, "
@@ -136,9 +142,9 @@ def oldest_adding(text: str) -> str | None:
 
 
 @cache
-def row_commits() -> list[str]:
-    """The commits in HEAD's history whose diff of the page adds or removes a table line, oldest first."""
-    return git("log", "--format=%H", "--reverse", "-G", DIFF_TABLE_LINE, "HEAD", "--", UPGRADE_PAGE).split()
+def row_commits(ref: str = "HEAD") -> list[str]:
+    """The commits in `ref`'s history whose diff of the page adds or removes a table line, oldest first."""
+    return git("log", "--format=%H", "--reverse", "-G", DIFF_TABLE_LINE, ref, "--", UPGRADE_PAGE).split()
 
 
 @cache
@@ -150,10 +156,10 @@ def holds(diff: list[str], sign: str, change: str) -> bool:
     return any(line.startswith(sign) and (m := TABLE_LINE.match(line[1:])) and m["change"] == change for line in diff)
 
 
-def row_commit(change: str) -> str | None:
+def row_commit(change: str, ref: str = "HEAD") -> str | None:
     """The oldest commit that adds a table row holding `change` since the last commit that removed it."""
     origin = None
-    for commit in row_commits():
+    for commit in row_commits(ref):
         diff = page_diff(commit)
         if holds(diff, ADDED, change):
             origin = origin or commit
@@ -171,6 +177,54 @@ def version_key(tag: str) -> tuple[int, ...]:
     return tuple(int(part) for part in tag.split("."))
 
 
+def shipping_release(change: str, commit: str | None, tags: set[str]) -> tuple[str, bool] | None:
+    """The first release, in version order, whose tag contains `commit` or whose own table holds a row with
+    `change`, and whether it was the commit; None when no release does."""
+    for tag in sorted(tags, key=version_key):
+        if commit and git_ok("merge-base", "--is-ancestor", commit, f"refs/tags/{tag}"):
+            return tag, True
+        if any(tagged.change == change for tagged in rows(page_at(tag))):
+            return tag, False
+    return None
+
+
+def removed_pending_problems(base: str, tags: set[str], traced: dict[str, str]) -> list[str]:
+    """The `pending` rows of the base page that a release already contains and that this change removes.
+
+    A reword of such a row would otherwise trace to the rewording commit and pass. The row is excused when
+    this change adds a row labelled with that release with a TRACES_FILE entry, which is how a reword is
+    recorded; the release-row check then requires the release to contain the entry's commit. Each such row
+    excuses one removed row, since the check cannot tell which new row an old one became.
+    """
+    found = []
+    current = page_rows()
+    texts = {row.change for row in current}
+    base_rows = rows(page_at(base))
+    base_texts = {row.change for row in base_rows}
+    # Rows this change adds with a trace entry: a recorded reword, if one is labelled with the release.
+    recorded = [row for row in current if row.change not in base_texts and row.change in traced]
+    for row in base_rows:
+        if row.release != PENDING or row.change in texts:
+            continue
+        commit = row_commit(row.change, base)
+        shipping = shipping_release(row.change, commit, tags)
+        if shipping is None:
+            continue
+        tag, by_commit = shipping
+        # Each recorded row excuses one removed row; the release-row check already requires that release
+        # to contain the new row's traced commit.
+        match = next((new for new in recorded if new.release == tag), None)
+        if match is not None:
+            recorded.remove(match)
+            continue
+        shipped = f"its commit ({commit})" if by_commit else f"the commit in {tag} that shipped it"
+        found.append(f"{UPGRADE_PAGE}: this change removes the {PENDING} row \"{row.change}\", which {tag} already "
+                     f"contains. If you reworded it, label the new row {tag} and name {shipped} for the new text in "
+                     f"{TRACES_FILE}. To drop a row an operator met in {tag}, relabel it as {tag} first and remove "
+                     "it in a later change.")
+    return found
+
+
 def pending_row_problem(row: Row, tags: set[str], traced: dict[str, str]) -> str | None:
     """Why a `pending` row must be relabelled, or None while no release contains it.
 
@@ -182,13 +236,10 @@ def pending_row_problem(row: Row, tags: set[str], traced: dict[str, str]) -> str
     commit = traced.get(row.change) or row_commit(row.change)
     named = f"the commit {TRACES_FILE} names for it" if row.change in traced else "the commit that added it"
     where = f"{UPGRADE_PAGE}:{row.line}"
-    for tag in sorted(tags, key=version_key):
-        if commit and git_ok("merge-base", "--is-ancestor", commit, f"refs/tags/{tag}"):
-            shipped = f"{commit[:12]}, {named}"
-        elif any(tagged.change == row.change for tagged in rows(page_at(tag))):
-            shipped = "the row in its own copy of the table"
-        else:
-            continue
+    shipping = shipping_release(row.change, commit, tags)
+    if shipping is not None:
+        tag, by_commit = shipping
+        shipped = f"{commit[:12]}, {named}" if by_commit else "the row in its own copy of the table"
         return (f"{where}: the row \"{row.change}\" is labelled {PENDING}, but {tag} contains {shipped}. "
                 f"Relabel it as {tag}." + PENDING_REWORD_NOTE)
     if commit is None:
@@ -387,9 +438,11 @@ def main() -> int:
         warned_traces, failed_traces = [], trace_problems
     for problem in warned_traces:
         print(WARNING_PREFIX + problem, file=sys.stderr)
-    for problem in failed + failed_traces + cells:
+    # A change that removes a shipped `pending` row's text fails; a push has no base, so it is not read there.
+    removed = removed_pending_problems(base, release_tags(), traced) if base is not None else []
+    for problem in failed + failed_traces + cells + removed:
         print(problem, file=sys.stderr)
-    return EXIT_FAILED if failed or failed_traces or cells else EXIT_OK
+    return EXIT_FAILED if failed or failed_traces or cells or removed else EXIT_OK
 
 
 if __name__ == "__main__":

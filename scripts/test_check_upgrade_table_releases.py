@@ -290,7 +290,7 @@ class CheckUpgradeTableReleasesTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn(f'the row "change p" is labelled pending, but 1.0.0 contains {added[:12]}', err)
         self.assertIn("Relabel it as 1.0.0.", err)
-        self.assertIn("Relabel a pending row before you reword it", err)
+        self.assertIn("To reword a pending row after its release, label the new text with the release", err)
 
     def test_a_pending_row_names_the_first_release_in_version_order(self):
         self.repo.commit("feat: p", row=row("pending", "change p"))
@@ -329,6 +329,115 @@ class CheckUpgradeTableReleasesTest(unittest.TestCase):
         code, err = self.repo.check(GITHUB_EVENT_NAME="push")
         self.assertEqual(code, 1)
         self.assertIn(f"but 1.0.0 contains {first[:12]}, the commit {TRACES} names for it. Relabel it as 1.0.0.", err)
+
+    def _shipped_pending_row(self):
+        """A `pending` row "change q" that 1.0.0 contains, with origin/main at it; returns its commit."""
+        first = self.repo.commit("feat: q", row=row("pending", "change q"))
+        self.repo.tag("1.0.0")
+        self.repo.git("update-ref", "refs/remotes/origin/main", first)
+        return first
+
+    def test_a_change_that_rewords_a_shipped_pending_row_fails(self):
+        first = self._shipped_pending_row()
+        self.repo.reword("change q", "change q, reworded")
+        self.repo.commit("docs: reword q", code=False)  # as on a pull request, HEAD holds the removal
+        code, err = self.repo.check()
+        self.assertEqual(code, 1)
+        self.assertIn(f'this change removes the pending row "change q", which 1.0.0 already contains. If you '
+                      f'reworded it, label the new row 1.0.0 and name its commit ({first})', err)
+        self.assertIn("relabel it as 1.0.0 first and remove it in a later change", err)
+
+    def test_a_change_that_rewords_an_unshipped_pending_row_passes(self):
+        first = self.repo.commit("feat: q", row=row("pending", "change q"))
+        self.repo.git("update-ref", "refs/remotes/origin/main", first)
+        self.repo.reword("change q", "change q, reworded")
+        self.repo.commit("docs: reword q", code=False)
+        self.assertEqual(self.repo.check(), (0, ""))
+
+    def test_a_change_that_relabels_a_shipped_pending_row_passes(self):
+        self._shipped_pending_row()
+        self.repo.relabel("change q", "1.0.0")
+        self.assertEqual(self.repo.check(), (0, ""))
+
+    def test_a_shipped_row_relabelled_first_can_be_removed_later(self):
+        self._shipped_pending_row()
+        self.repo.relabel("change q", "1.0.0")
+        relabelled = self.repo.commit("docs: label q", code=False)
+        self.repo.git("update-ref", "refs/remotes/origin/main", relabelled)
+        self.repo.rows = [r for r in self.repo.rows if "change q" not in r]
+        self.repo.write_page()
+        self.assertEqual(self.repo.check(), (0, ""))
+
+    def test_a_reword_of_a_shipped_pending_row_recorded_in_the_traces_passes(self):
+        first = self._shipped_pending_row()
+        self.repo.reword("change q", "change q, reworded")
+        self.repo.relabel("change q, reworded", "1.0.0")
+        self.repo.trace(f"{first} change q, reworded")
+        self.assertEqual(self.repo.check(), (0, ""))
+
+    def test_a_trace_for_another_row_does_not_excuse_a_removed_pending_row(self):
+        first = self.repo.commit("feat: q and r", row=row("pending", "change r"))
+        self.repo.rows.insert(0, row("pending", "change q"))
+        self.repo.write_page()
+        self.repo.git("commit", "-q", "--amend", "-a", "--no-edit")
+        first = self.repo.git("rev-parse", "HEAD").strip()
+        self.repo.tag("1.0.0")
+        self.repo.reword("change r", "change r2")
+        self.repo.relabel("change r2", "1.0.0")
+        self.repo.trace(f"{first} change r2")  # main already records the reword of r
+        base = self.repo.commit("docs: reword r", code=False)
+        self.repo.git("update-ref", "refs/remotes/origin/main", base)
+        self.repo.reword("change q", "change q2")  # this change rewords q and records nothing
+        self.repo.commit("docs: reword q", code=False)
+        code, err = self.repo.check()
+        self.assertEqual(code, 1)
+        self.assertIn('this change removes the pending row "change q"', err)
+
+    def test_one_recorded_reword_excuses_only_one_removed_row(self):
+        first = self.repo.commit("feat: q and s", row=row("pending", "change s"))
+        self.repo.rows.insert(0, row("pending", "change q"))
+        self.repo.write_page()
+        self.repo.git("commit", "-q", "--amend", "-a", "--no-edit")
+        first = self.repo.git("rev-parse", "HEAD").strip()
+        self.repo.tag("1.0.0")
+        self.repo.git("update-ref", "refs/remotes/origin/main", first)
+        self.repo.reword("change q", "change q2")
+        self.repo.relabel("change q2", "1.0.0")
+        self.repo.trace(f"{first} change q2")  # q's reword is recorded
+        self.repo.reword("change s", "change s2")  # s's reword stays pending and is not
+        self.repo.commit("docs: reword q and s", code=False)
+        code, err = self.repo.check()
+        self.assertEqual(code, 1)
+        self.assertEqual(err.count("this change removes the pending row"), 1)
+
+    def test_a_reword_labelled_with_a_later_release_is_not_excused(self):
+        first = self._shipped_pending_row()
+        self.repo.reword("change q", "change q2")
+        self.repo.relabel("change q2", "2.0.0")  # no tag yet, so the release-row check reads nothing
+        self.repo.trace(f"{first} change q2")
+        code, err = self.repo.check()
+        self.assertEqual(code, 1)
+        self.assertIn('this change removes the pending row "change q", which 1.0.0 already contains', err)
+
+    def test_a_reword_recorded_with_the_cherry_pick_passes(self):
+        base = self.repo.commit("feat: before the branch point")
+        self.repo.commit("feat: q", row=row("pending", "change q"))
+        self.repo.git("checkout", "-q", "-b", "release", base)
+        self.repo.write_page()
+        picked = self.repo.commit("feat: q, cherry-picked")
+        self.repo.tag("1.0.0")
+        self.repo.git("checkout", "-q", "main")
+        self.repo.git("update-ref", "refs/remotes/origin/main", "HEAD")
+        self.repo.reword("change q", "change q2")
+        self.repo.relabel("change q2", "1.0.0")
+        self.repo.trace(f"{picked} change q2")
+        self.assertEqual(self.repo.check(), (0, ""))
+
+    def test_a_push_does_not_read_a_removed_pending_row(self):
+        self._shipped_pending_row()
+        self.repo.reword("change q", "change q, reworded")
+        self.repo.commit("docs: reword q", code=False)
+        self.assertEqual(self.repo.check(GITHUB_EVENT_NAME="push"), (0, ""))  # the stated limit: no base
 
     def test_a_misspelt_release_cell_fails(self):
         for cell in ("`pending`", "Pending", "next"):
