@@ -764,12 +764,24 @@ class Collector:
         return True
 
     def seed_all(self) -> Tuple[int, int]:
-        """Seed every proxy pod not draining now; (those pods, pods that took it)."""
+        """Seed every proxy pod not draining now; (those pods, pods that took it).
+
+        A pod whose seed failed is listed again: one deleted while its copy ran
+        (an eviction, a node drain) is gone, not a pod that refused the cache,
+        so it leaves both counts. One still live counts as a failure.
+        """
         listed = self.pods()
         live = [pod.name for pod in listed if not pod.draining]
         if len(live) < len(listed):
             self.emit({"event": "seed_skipped_draining", "pods": len(listed) - len(live)})
-        return len(live), sum(1 for pod in live if self.seed(pod))
+        failed = [pod for pod in live if not self.seed(pod)]
+        if not failed:
+            return len(live), len(live)
+        still_live = {pod.name for pod in self.pods() if not pod.draining}
+        vanished = [pod for pod in failed if pod not in still_live]
+        if vanished:
+            self.emit({"event": "seed_skipped_vanished", "pods": len(vanished)})
+        return len(live) - len(vanished), len(live) - len(failed)
 
     def _publish(self, final: bool) -> None:
         try:
@@ -970,7 +982,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--eval-mode-next", default="", help="record and replay: EVAL_MODE_NEXT (1 is next mode)")
     parser.add_argument("--forge", default="", help="record and replay: EVAL_FORGE (empty is github)")
     parser.add_argument("--seed-dir", default="", help="replay: the cache fetch_cache.py filled, seeded into each pod")
-    parser.add_argument("--seed-once", action="store_true", help="replay: seed every pod, then exit")
+    parser.add_argument("--seed-once", action="store_true", help="replay: seed every live proxy pod, then exit")
     parser.add_argument("--nightly-runs", default="", help="replay: fetch_cache.py's runs per recording build")
     args = parser.parse_args(argv)
     if not CACHE_SUBDIR_RE.match(args.cache_subdir) or args.cache_subdir in (LOGS_DIR, STORE_DIR):

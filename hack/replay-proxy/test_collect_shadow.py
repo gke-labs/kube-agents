@@ -732,6 +732,28 @@ class ReplayModeTest(CollectorTestCase):
         self.assertEqual(self.collector.totals.errors, {})
         self.assertIn('"event": "seed_skipped_draining", "pods": 1', self.out.getvalue())
 
+    def test_a_pod_deleted_during_its_seed_leaves_both_counts(self):
+        # Live when listed, evicted while its copy ran: gone, not a refusal.
+        self.cluster.add_pod("proxy-b")
+        self.cluster.gone.add("proxy-b")
+        listing = self.collector.pods
+        calls = []
+
+        def pods():
+            calls.append(None)
+            found = listing()
+            return [pod for pod in found if pod.name != "proxy-b"] if len(calls) > 1 else found
+
+        self.collector.pods = pods
+        self.assertEqual(self.collector.seed_all(), (1, 1))
+        self.assertIn('"event": "seed_skipped_vanished", "pods": 1', self.out.getvalue())
+
+    def test_a_live_pod_that_refused_its_seed_still_counts(self):
+        self.cluster.add_pod("proxy-b")
+        self.cluster.gone.add("proxy-b")
+        self.assertEqual(self.collector.seed_all(), (2, 1))
+        self.assertNotIn("seed_skipped_vanished", self.out.getvalue())
+
     def test_a_pass_seeds_no_draining_pod_but_collects_its_lines(self):
         old = self.cluster.add_pod("proxy-old")
         self.cluster.draining.add("proxy-old")
