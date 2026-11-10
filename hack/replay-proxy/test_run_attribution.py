@@ -268,6 +268,48 @@ class DecisionTest(unittest.TestCase):
         self.world.request(other, "elsewhere", prior=("ctx-opening", "A"))
         self.assertEqual(self.world.decide(opening).decision, "ambiguous")
 
+    def _first_writer(self, writer_card, answers, outcomes):
+        """An answer saved by `writer_card`'s request, then the same request from runs' workers, unsaved."""
+        for rep, (answer, outcome) in enumerate(zip(answers, outcomes), start=1):
+            card = f"t_{rep:08x}"
+            self.world.run("case-a", rep, outcome, [card])
+            self.world.request(worker(card), "opening", answer=answer)
+        return self.world.request(worker(writer_card), "opening", recorded=True, answer="A")
+
+    def test_an_answer_saved_by_background_traffic_is_proven_by_a_passing_run_that_gave_it(self):
+        # The cache keeps the first answer to a fingerprint, so a run's worker
+        # opening that background traffic sent first is saved under the
+        # background card; the run's own line says it got exactly that answer.
+        saved = self._first_writer("t_99999999", ["A"], ["pass"])
+        attribution = self.world.attribution()
+        line = RA.Line.from_entry(saved)
+        self.assertEqual(attribution.decide(line).decision, "unattributed", "the saving line itself is no run's")
+        self.assertEqual(attribution.decide_answer(line).__dict__, {"decision": "pass", "runs": ("case-a#1",)})
+
+    def test_a_passing_run_that_gave_another_answer_is_no_evidence(self):
+        saved = self._first_writer("t_99999999", ["B"], ["pass"])
+        self.assertEqual(self.world.attribution().decide_answer(RA.Line.from_entry(saved)).decision, "unattributed")
+
+    def test_the_same_answer_given_to_a_failing_run_too_is_not_published(self):
+        saved = self._first_writer("t_99999999", ["A", "A"], ["pass", "fail"])
+        self.assertEqual(self.world.attribution().decide_answer(RA.Line.from_entry(saved)).decision, "unattributed")
+
+    def test_a_failing_runs_saved_answer_stays_a_fail_when_a_passing_run_gave_it_too(self):
+        saved = self._first_writer("t_00000002", ["A"], ["pass"])
+        self.world.run("case-a", 2, "fail", ["t_00000002"])
+        self.assertEqual(self.world.attribution().decide_answer(RA.Line.from_entry(saved)).decision, "fail")
+
+    def test_an_answer_proven_by_another_line_waits_for_the_last_call(self):
+        saved = self._first_writer("t_99999999", ["A"], ["pass"])
+        decision = self.world.attribution(final=False).decide_answer(RA.Line.from_entry(saved))
+        self.assertEqual(decision.decision, "pending", "the saving line's card may still be a running case's")
+
+    def test_a_saved_answer_without_an_answer_variant_takes_no_evidence_from_other_lines(self):
+        self.world.run("case-a", 1, "pass", ["t_00000001"])
+        self.world.request(worker("t_00000001"), "opening")
+        saved = self.world.request(worker("t_99999999"), "opening", recorded=True)
+        self.assertEqual(self.world.attribution().decide_answer(RA.Line.from_entry(saved)).decision, "unattributed")
+
     def test_load_runs_reads_no_relative_run_directory(self):
         self.world.run("case-a", 1, "pass", ["t_11111111"])
         path = os.path.join(self.world.verdicts, "case-case-a.json")

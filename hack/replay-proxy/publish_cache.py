@@ -259,7 +259,7 @@ def select(keep_dir: str, verdicts_dir: str, final: bool, state: Optional[State]
             if entry.get(replay_cache.ENTRY_NORMALIZER_VERSION) != version:
                 selection.count(VERSION_MISMATCH)
                 continue
-            decision = attribution.decide(line).decision
+            decision = attribution.decide_answer(line).decision
             selection.count(decision)
             if decision == RA.PASS:
                 selection.add(version, ANSWERS, name, path)
