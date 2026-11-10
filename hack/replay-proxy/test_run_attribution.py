@@ -299,6 +299,43 @@ class DecisionTest(unittest.TestCase):
         self.world.run("case-a", 2, "fail", ["t_00000002"])
         self.assertEqual(self.world.attribution().decide_answer(RA.Line.from_entry(saved)).decision, "fail")
 
+    def test_a_failing_runs_saving_line_beside_an_unworked_card_is_not_published(self):
+        # The saving line is a failing run's worker that also created a card no
+        # run worked (a run cut short), so it decides unattributed with that run.
+        self.world.run("case-a", 1, "pass", ["t_00000001"])
+        self.world.request(worker("t_00000001"), "opening", answer="A")
+        self.world.run("case-a", 2, "fail", ["t_00000002"])
+        saved = self.world.request(worker("t_00000002", *created("t_77777777")), "opening", recorded=True, answer="A")
+        attribution = self.world.attribution()
+        line = RA.Line.from_entry(saved)
+        self.assertEqual(attribution.decide(line).__dict__, {"decision": "unattributed", "runs": ("case-a#2",)})
+        self.assertEqual(attribution.decide_answer(line).decision, "unattributed")
+
+    def test_a_failing_run_beside_an_unworked_card_that_got_the_answer_blocks_it(self):
+        saved = self._first_writer("t_99999999", ["A"], ["pass"])
+        self.world.run("case-a", 2, "fail", ["t_00000002"])
+        self.world.request(worker("t_00000002", *created("t_88888888")), "opening", answer="A")
+        self.assertEqual(self.world.attribution().decide_answer(RA.Line.from_entry(saved)).decision, "unattributed")
+
+    def test_a_failing_run_hidden_behind_a_card_less_lines_pass_blocks_it(self):
+        # A card-less line that got the answer decides pass on its passing run
+        # and drops the failing one that went on from it too; the guard sees both.
+        saved = self.world.request(worker("t_99999999"), "r1", recorded=True, answer="A")
+        self.world.request(front(), "r1", answer="A")
+        for rep, outcome in ((1, "pass"), (2, "fail")):
+            card = f"t_{rep:08x}"
+            self.world.run("case-a", rep, outcome, [card])
+            self.world.request(front({"role": "assistant", "content": "A"}, *created(card, f"x{rep}")),
+                               f"r2-{rep}", prior=("ctx-r1", "A"))
+        self.assertEqual(self.world.attribution().decide_answer(RA.Line.from_entry(saved)).decision, "unattributed")
+
+    def test_a_passing_run_in_another_build_is_no_evidence(self):
+        self.world.run("case-a", 1, "pass", ["t_00000001"])
+        other = self.world.request(worker("t_00000001"), "opening", answer="A")
+        other["job"] = {"build": "1790000000000000001"}
+        saved = self.world.request(worker("t_99999999"), "opening", recorded=True, answer="A")
+        self.assertEqual(self.world.attribution().decide_answer(RA.Line.from_entry(saved)).decision, "unattributed")
+
     def test_an_answer_proven_by_another_line_waits_for_the_last_call(self):
         saved = self._first_writer("t_99999999", ["A"], ["pass"])
         decision = self.world.attribution(final=False).decide_answer(RA.Line.from_entry(saved))

@@ -6,13 +6,15 @@ eval runs, with the lines and the stored request text, into a directory on the
 job's own machine (`--keep-dir`), and calls this every few minutes and once at
 the end. Each call works out which run each recorded answer came from
 (run_attribution.py) against the cases graded so far (bench-gate's
-case-<name>.json under the artifacts directory), and uploads the answers whose
-runs all passed (examples/inference-replay/eval-design.md, "Only save answers
-from runs that passed").
+case-<name>.json under the artifacts directory), and uploads the answers
+passing runs got and no failing run did (examples/inference-replay/eval-design.md,
+"Only save answers from runs that passed").
 
 What goes up, under gs://<bucket>/replay-cache/<normalizer version>/:
 - `answers/<fingerprint>.json`: an answer, only when the request that saved it
-  belongs to runs that passed. The key already holds the normalizer version,
+  belongs to runs that passed, or, saved by a request no run owns, when a passing
+  run's request got that same answer and no failing run is tied to it
+  (run_attribution.Attribution.decide_answer). The key already holds the normalizer version,
   the LiteLLM config checksum and image, so answers no other run could hit
   cost space only; the version prefix lets a reader fetch only its own.
 - `slots/<slot key>.json`: a slot pointer, only to an answer that went up.

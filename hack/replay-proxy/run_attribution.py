@@ -41,9 +41,10 @@ Decisions, per logged request:
 - `unattributed`: once every case is graded, no stored text or a card no run worked;
 - `ambiguous`: no card of its own, and no graded run went on from its answer.
 
-A saved answer is decided by its recording line, or, when that line belongs to
-no graded run, by the other lines that sent the same request and got the same
-answer (Attribution.decide_answer).
+A saved answer is decided by its recording line, or, when that line is left
+unattributed or ambiguous on the last call, by the other lines that sent the
+same request and got the same answer, provided no failing run is tied to any of
+them (Attribution.decide_answer).
 """
 
 from __future__ import annotations
@@ -517,26 +518,43 @@ class Attribution:
         recording line. A line of the same build and fingerprint whose own
         answer is the saved one (`answer_variant`, the identity a
         continuation's `prior_answer` is checked against) proves its runs got
-        that answer to that request. Only a recording line no graded run owns
-        (unattributed or ambiguous, so every case is graded) takes that
-        evidence, and only when no line that got the same answer belongs to a
-        failing run.
+        that answer to that request. Only a recording line left unattributed or
+        ambiguous on the last call takes that evidence, and only when no failing
+        run is tied to the saved line or to any line that got the same answer
+        (`_tied_runs`), whatever those lines' own decisions say.
         """
         decision = self.decide(saved)
         if decision.decision not in (UNATTRIBUTED, AMBIGUOUS) or saved.answer_variant is None:
+            return decision
+        if self._any_failed(self._tied_runs(saved)):
             return decision
         passed: Set[str] = set()
         for other in self.by_fingerprint.get((saved.build, saved.fingerprint), []):
             if other.request_id == saved.request_id or other.answer_variant != saved.answer_variant:
                 continue
-            found = self.decide(other)
-            if found.decision == FAIL:
+            if self._any_failed(self._tied_runs(other)):
                 return decision
+            found = self.decide(other)
             if found.decision == PASS:
                 passed.update(found.runs)
         if passed:
             return Decision(PASS, tuple(sorted(passed)))
         return decision
+
+    def _tied_runs(self, line: Line) -> Set[str]:
+        """Every graded run a line is tied to: its own cards' runs, even beside a card no run worked,
+        and, with no card of its own, the runs seen going on from its answer. A decision keeps only
+        some of them (PASS drops a failing run that also went on), so the publish guard reads these."""
+        own = self._own(line)
+        if own is None:
+            return set()
+        runs, unknown = own
+        if runs or unknown:
+            return set(runs)
+        return self._went_on_from(line)
+
+    def _any_failed(self, runs: Set[str]) -> bool:
+        return any(not self.runs[run].passed for run in runs)
 
     def run_of(self, line: Line) -> Optional[str]:
         """The one run a request names by its own IDs, for the lane's per-run counts; None otherwise."""
