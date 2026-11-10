@@ -1590,10 +1590,14 @@ func scrubYAMLSecretBlocks(s string) string {
 // markdown around the noun and the value normalised away ("the
 // **password** is `x`").
 func scrubProseSecrets(s string, sink secretSink) string {
-	return scrubNormalized(s, sink, func(n string, rec func(lo, hi int, named bool)) {
+	return scrubNormalized(s, sink, func(n string, code [][2]int, rec func(lo, hi int, named bool)) {
 		for _, m := range proseSecretPattern.FindAllStringSubmatchIndex(n, -1) {
-			if n[m[4]:m[5]] != redactedValue && proseValueRedacted(n[m[4]:m[5]]) {
-				rec(m[4], m[5], clearSecretNounPattern.MatchString(n[m[2]:m[3]]))
+			lo, hi := m[4], m[5]
+			if end, ok := codeSpanEnd(code, lo); ok {
+				hi = end // a code-spanned value ends at its closing backtick
+			}
+			if n[lo:hi] != redactedValue && proseValueRedacted(n[lo:hi]) {
+				rec(lo, hi, clearSecretNounPattern.MatchString(n[m[2]:m[3]]))
 			}
 		}
 	})
@@ -1613,7 +1617,7 @@ func scrubInlineKVSecrets(s string, sink secretSink) string {
 
 // kvSecretSpans reports, through rec, the span of each value
 // scrubInlineKVSecrets redacts in s.
-func kvSecretSpans(s string, rec func(lo, hi int, named bool)) {
+func kvSecretSpans(s string, code [][2]int, rec func(lo, hi int, named bool)) {
 	pos := 0
 	for pos < len(s) {
 		loc := inlineKVSecretPattern.FindStringSubmatchIndex(s[pos:])
@@ -1639,6 +1643,7 @@ func kvSecretSpans(s string, rec func(lo, hi int, named bool)) {
 		if sep == '=' && !hadPreSepSpace && hadPostSepSpace && isFollowingKVAssignment(rest) {
 			continue
 		}
+		codeEnd, coded := codeSpanEnd(code, matchEnd)
 		if sloc := inlineAuthSchemePrefixPattern.FindStringSubmatchIndex(rest); sloc != nil {
 			matchEnd += sloc[1]
 			rest = rest[sloc[1]:]
@@ -1649,6 +1654,15 @@ func kvSecretSpans(s string, rec func(lo, hi int, named bool)) {
 		named := keyClearlyNamesSecret(key)
 		redacts := func(v, after string) bool {
 			return classValueRedacted(class, v, sep == ':' && runsOnAsSentence(after))
+		}
+		// A code-spanned value is bounded by its backticks, like a quoted
+		// one.
+		if coded && codeEnd > matchEnd {
+			if !strings.Contains(s[matchEnd:codeEnd], redactedValue) && redacts(s[matchEnd:codeEnd], "") {
+				rec(matchEnd, codeEnd, named)
+				pos = codeEnd
+			}
+			continue
 		}
 		if openQuote != "" && closeQuote == "" && sep == ':' && !strings.HasPrefix(rest, `"`) && !strings.HasPrefix(rest, `'`) && !strings.HasPrefix(rest, `\"`) && !strings.HasPrefix(rest, `\'`) {
 			var closeIdx int
@@ -2066,11 +2080,20 @@ func tableKeyNamed(s string, cell [2]int) bool {
 // value. idx maps each byte of the result to its byte in s; it is nil when
 // nothing changed.
 func normalizeMarkdown(s string) (string, []int) {
+	n, idx, _ := normalizeMarkdownSpans(s)
+	return n, idx
+}
+
+// normalizeMarkdownSpans is normalizeMarkdown, also saying where each code
+// span's content stands in the result (code, in order), so a value read
+// there is bounded by its backticks.
+func normalizeMarkdownSpans(s string) (string, []int, [][2]int) {
 	if !strings.ContainsAny(s, "*_`(\u2192\u21d2") && !strings.Contains(s, "->") && !strings.Contains(s, "=>") {
-		return s, nil
+		return s, nil, nil
 	}
 	drop := make([]bool, len(s))
 	colon := make([]bool, len(s))
+	var code [][2]int // in s
 	for lineStart := 0; lineStart <= len(s); {
 		lineEnd := strings.IndexByte(s[lineStart:], '\n')
 		if lineEnd < 0 {
@@ -2078,7 +2101,7 @@ func normalizeMarkdown(s string) (string, []int) {
 		} else {
 			lineEnd += lineStart
 		}
-		markPairedMarkdownRuns(s, lineStart, lineEnd, drop)
+		code = markPairedMarkdownRuns(s, lineStart, lineEnd, drop, code)
 		lineStart = lineEnd + 1
 	}
 	for _, m := range markdownKeyParenPattern.FindAllStringSubmatchIndex(s, -1) {
@@ -2105,8 +2128,10 @@ func normalizeMarkdown(s string) (string, []int) {
 	}
 	var sb strings.Builder
 	idx := make([]int, 0, len(s))
+	at := make([]int, len(s)+1) // each byte of s's place in the result
 	changed := false
 	for i := 0; i < len(s); i++ {
+		at[i] = sb.Len()
 		switch {
 		case drop[i]:
 			changed = true
@@ -2120,9 +2145,23 @@ func normalizeMarkdown(s string) (string, []int) {
 		idx = append(idx, i)
 	}
 	if !changed {
-		return s, nil
+		return s, nil, nil
 	}
-	return sb.String(), idx
+	at[len(s)] = sb.Len()
+	for k := range code {
+		code[k] = [2]int{at[code[k][0]], at[code[k][1]]}
+	}
+	return sb.String(), idx, code
+}
+
+// codeSpanEnd is where the code span whose content starts at p ends, when
+// one does.
+func codeSpanEnd(code [][2]int, p int) (int, bool) {
+	k := sort.Search(len(code), func(k int) bool { return code[k][0] >= p })
+	if k < len(code) && code[k][0] == p && code[k][1] > p {
+		return code[k][1], true
+	}
+	return 0, false
 }
 
 var (
@@ -2171,11 +2210,64 @@ func markdownParenKept(content, after string) bool {
 	return statusWords[c] || markdownTallyPattern.MatchString(c) || statusWords[a]
 }
 
-// markPairedMarkdownRuns marks in drop the emphasis and code-span runs of
-// s[lo:hi] (one line) that pair: a run of *, _ or ` (an emphasis run not
-// inside a word) is dropped when a later run of the same mark and length
-// closes it.
-func markPairedMarkdownRuns(s string, lo, hi int, drop []bool) {
+// markPairedMarkdownRuns marks in drop the code-span and emphasis runs of
+// s[lo:hi] (one line) that pair, and appends each code span's content to
+// code. A run of backticks opens a code span the next run of the same
+// length closes; what is inside one is literal. Outside them, a run of * or
+// _ not inside a word is dropped when a later run of the same mark and
+// length closes it.
+func markPairedMarkdownRuns(s string, lo, hi int, drop []bool, code [][2]int) [][2]int {
+	inCode := func(int) bool { return false }
+	first := len(code)
+	for i := lo; i < hi; {
+		if s[i] != '`' {
+			i++
+			continue
+		}
+		j := i
+		for j < hi && s[j] == '`' {
+			j++
+		}
+		n := j - i
+		closeAt := -1
+		for k := j; k < hi; {
+			if s[k] != '`' {
+				k++
+				continue
+			}
+			m := k
+			for m < hi && s[m] == '`' {
+				m++
+			}
+			if m-k == n {
+				closeAt = k
+				break
+			}
+			k = m
+		}
+		if closeAt < 0 {
+			i = j // a lone run stays: it may be part of a value
+			continue
+		}
+		for x := i; x < j; x++ {
+			drop[x] = true
+		}
+		for x := closeAt; x < closeAt+n; x++ {
+			drop[x] = true
+		}
+		code = append(code, [2]int{j, closeAt})
+		i = closeAt + n
+	}
+	if spans := code[first:]; len(spans) > 0 {
+		inCode = func(i int) bool {
+			for _, sp := range spans {
+				if i >= sp[0]-1 && i <= sp[1] {
+					return true
+				}
+			}
+			return false
+		}
+	}
 	type run struct {
 		at, n int
 		c     byte
@@ -2183,7 +2275,7 @@ func markPairedMarkdownRuns(s string, lo, hi int, drop []bool) {
 	var open []run
 	for i := lo; i < hi; {
 		c := s[i]
-		if c != '*' && c != '_' && c != '`' {
+		if c != '*' && c != '_' || inCode(i) {
 			i++
 			continue
 		}
@@ -2211,6 +2303,7 @@ func markPairedMarkdownRuns(s string, lo, hi int, drop []bool) {
 		}
 		open = open[:k]
 	}
+	return code
 }
 
 func isWordByte(c byte) bool {
@@ -2220,10 +2313,10 @@ func isWordByte(c byte) bool {
 // scrubNormalized runs find over s with its markdown normalised away
 // (normalizeMarkdown) and redacts each span find reports in s itself, so
 // the markdown around a redacted value stays.
-func scrubNormalized(s string, sink secretSink, find func(n string, rec func(lo, hi int, named bool))) string {
-	n, idx := normalizeMarkdown(s)
+func scrubNormalized(s string, sink secretSink, find func(n string, code [][2]int, rec func(lo, hi int, named bool))) string {
+	n, idx, code := normalizeMarkdownSpans(s)
 	var spans [][2]int
-	find(n, func(lo, hi int, named bool) {
+	find(n, code, func(lo, hi int, named bool) {
 		if hi <= lo {
 			return
 		}

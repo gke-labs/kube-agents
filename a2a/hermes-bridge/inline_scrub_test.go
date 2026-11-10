@@ -507,3 +507,31 @@ func TestScrubInlineSecretsTwoParentheticalLabelsOnALine(t *testing.T) {
 		}
 	}
 }
+
+// A code-spanned value is bounded by its backticks, not by the punctuation
+// or spaces inside it, in prose and after a key, and its whole span is
+// redacted; emphasis marks inside a code span are part of the value.
+func TestScrubInlineSecretsCodeSpannedValueIsBoundedByItsBackticks(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"The password is `Synth2026!prod`.", "The password is `[redacted]`."},
+		{"The password is `a!synthetic123`.", "The password is `[redacted]`."},
+		{"The password is `2026!SynthPass`.", "The password is `[redacted]`."},
+		{"The token is `v1.synthetic123`.", "The token is `[redacted]`."},
+		{"Decoded `password`: `correct horse battery`", "Decoded `password`: `[redacted]`"},
+		{"**password**: `p@ss{1}synthetic`", "**password**: `[redacted]`"},
+		{"**password**: `p@ss;word,2`", "**password**: `[redacted]`"},
+		{"**password**: `*synthetic123*`", "**password**: `[redacted]`"},
+		{"- `password` → `synth pass, 0001`", "- `password` → `[redacted]`"},
+	}
+	for _, tc := range cases {
+		if got := scrubInlineSecrets(tc.in); got != tc.want {
+			t.Errorf("scrubInlineSecrets(%q)\n got %q\nwant %q", tc.in, got, tc.want)
+		}
+	}
+	// The whole code-spanned value reaches the seen-values sink.
+	var got []string
+	scrubInlineSecretsTo("The password is `Synth2026!prod`.", func(v string) { got = append(got, v) })
+	if len(got) != 1 || got[0] != "Synth2026!prod" {
+		t.Errorf("sink got %q, want the whole value", got)
+	}
+}
