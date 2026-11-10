@@ -50,8 +50,8 @@ A run the suite itself could not evaluate (`runs[].eval_outcome`,
 SCHEMA.md: an admitted case, or every case, lost every repetition to
 infrastructure, so the job exited 2) is not a red either, whatever Prow's
 FAILURE and the final line's `Failed` word say: `is_red` is false for it,
-and it gets the same one-line shape: that some cases lost every repetition
-to infrastructure, that nothing was graded for them, that nothing about the
+and it gets the same one-line shape: that some cases could not be graded
+because infrastructure failed before the agent ran, that nothing about the
 change is implied, and to retest once the environment is healthy:
 
     ### ⚪ Smoke gate: run not evaluated
