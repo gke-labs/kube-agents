@@ -140,7 +140,8 @@ used, reserved and maximum, read from the server's monitor port over the pod's
 loopback. Like the A2A gateway's, the pods exist only under spec.mode next;
 elsewhere this selects no pod. The selector is the operator's app label for
 the bus's pods and the port is the exporter's; the operator's bus
-NetworkPolicy admits the collector on that port and on no other.
+NetworkPolicy admits the collector on that port and on no other, and the
+operator's own pod, whose bus-stream check reads the stream list there.
 */}}
 apiVersion: monitoring.googleapis.com/v1
 kind: PodMonitoring

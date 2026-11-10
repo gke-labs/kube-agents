@@ -217,6 +217,7 @@ type busStreamsRig struct {
 	recorder *record.FakeRecorder
 	deleted  []string
 	now      time.Time
+	patchErr error
 }
 
 func busStreamsAgent(replicas int) *agentv1alpha1.PlatformAgent {
@@ -230,9 +231,12 @@ func busStreamsAgent(replicas int) *agentv1alpha1.PlatformAgent {
 	return agent
 }
 
+var busStreamsJobSerial int
+
 func busStreamsJob(agent *agentv1alpha1.PlatformAgent, created time.Time, state batchv1.JobConditionType) *batchv1.Job {
 	job := buildA2AProvisionJob(agent)
-	job.UID = types.UID("job-" + created.Format("150405"))
+	busStreamsJobSerial++
+	job.UID = types.UID(fmt.Sprintf("job-%d", busStreamsJobSerial))
 	job.CreationTimestamp = metav1.NewTime(created)
 	job.OwnerReferences = []metav1.OwnerReference{{
 		APIVersion: agentv1alpha1.GroupVersion.String(), Kind: "PlatformAgent", Name: agent.Name,
@@ -292,6 +296,9 @@ func clientPod(agent *agentv1alpha1.PlatformAgent, name string, selector map[str
 
 func newBusStreamsRig(t *testing.T, replicas int, objs ...client.Object) *busStreamsRig {
 	t.Helper()
+	// The operator's own identity, which the fence admits it by.
+	t.Setenv(operatorNamespaceEnvVar, "kube-agents-system")
+	t.Setenv(operatorServiceAccountEnvVar, "kube-agents-operator")
 	agent := busStreamsAgent(replicas)
 	rig := &busStreamsRig{t: t, recorder: record.NewFakeRecorder(32), now: busStreamsTestNow, source: &stubBusStreamSource{bodies: map[string]string{}}}
 	all := []client.Object{agent, busStreamsStatefulSet(agent, int32(replicas), int32(replicas))}
@@ -310,6 +317,12 @@ func newBusStreamsRig(t *testing.T, replicas int, objs ...client.Object) *busStr
 			Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
 				rig.deleted = append(rig.deleted, obj.GetName())
 				return c.Delete(ctx, obj, opts...)
+			},
+			Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+				if rig.patchErr != nil {
+					return rig.patchErr
+				}
+				return c.Patch(ctx, obj, patch, opts...)
 			},
 		}).
 		Build()
@@ -847,5 +860,143 @@ func TestTheReconcileReportsMissingBusStreamsAsDegraded(t *testing.T) {
 	set(metav1.ConditionTrue, busStreamsReasonAllPresent, "All present.")
 	if c := degraded(); c != nil {
 		t.Errorf("Degraded = %+v after the streams came back, want none", c)
+	}
+}
+
+// A stream restored once and lost again later is re-provisioned again: the
+// stop applies to a re-run that did not restore, not to every later loss.
+func TestASecondLossAfterARestoreIsReProvisioned(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	rig.serve(1, allStreamsBut("TASKS")...)
+	rig.poll()
+	rig.poll()
+	rig.poll()
+	rig.recreateJob(batchv1.JobComplete)
+	rig.serve(1, a2aProvisionedStreams...)
+	rig.poll()
+	rig.now = rig.now.Add(7 * 24 * time.Hour)
+	rig.serve(1, allStreamsBut("TASKS")...)
+	rig.poll()
+	rig.poll()
+	rig.poll()
+	if rig.jobExists() {
+		t.Fatalf("the second loss was not re-provisioned; condition %+v", rig.condition())
+	}
+}
+
+// The re-run is the Job with another UID, however its creation time, which
+// the API server keeps in whole seconds, compares with the attempt's.
+func TestAReRunInTheSameSecondStillCounts(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	rig.serve(1, allStreamsBut("TASKS")...)
+	rig.poll()
+	rig.poll()
+	rig.now = rig.now.Add(700 * time.Millisecond)
+	rig.poll()
+	attemptAt := readBusReprovisionRecord(rig.agent()).Attempts[0].At
+	if err := rig.cl.Create(context.Background(), busStreamsJob(rig.agent(), attemptAt.Truncate(time.Second), batchv1.JobComplete)); err != nil {
+		t.Fatal(err)
+	}
+	rig.serve(1, a2aProvisionedStreams...)
+	rig.poll()
+	if !slices.Contains(rig.deleted, "test-agent-a2a-gateway-abc") {
+		t.Errorf("deleted %v: a re-run created in the attempt's second restarted nothing", rig.deleted)
+	}
+}
+
+// TASKS back while another stream isn't: its readers restart now, and the
+// other stream stops the re-runs.
+func TestTasksBackRestartsItsClientsEvenWithAnotherStreamStillMissing(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	rig.serve(1, allStreamsBut("TASKS", "KV_cap")...)
+	rig.poll()
+	rig.poll()
+	rig.poll()
+	rig.recreateJob(batchv1.JobComplete)
+	rig.serve(1, allStreamsBut("KV_cap")...)
+	rig.poll()
+	if !slices.Contains(rig.deleted, "test-agent-a2a-gateway-abc") || !slices.Contains(rig.deleted, "test-agent-gateway-xyz") {
+		t.Errorf("deleted %v, want both TASKS readers restarted", rig.deleted)
+	}
+	rig.poll()
+	rig.poll()
+	rig.poll()
+	if c := rig.condition(); c == nil || c.Reason != busStreamsReasonDidNotRestore || !strings.Contains(c.Message, busStreamsReprovisionAnnotation) {
+		t.Errorf("condition = %+v, want %s naming the annotation to clear", c, busStreamsReasonDidNotRestore)
+	}
+}
+
+// The record is written before the Job is deleted: a record that can't be
+// written leaves the Job alone, so the limits can't be lost.
+func TestARecordThatCannotBeWrittenLeavesTheJobAlone(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	rig.serve(1, allStreamsBut("TASKS")...)
+	rig.poll()
+	rig.poll()
+	rig.patchErr = errors.New("admission webhook refused the update")
+	if err := rig.poller.pollAgent(context.Background(), rig.agent()); err == nil {
+		t.Fatalf("poll succeeded with the record unwritable")
+	}
+	if !rig.jobExists() {
+		t.Errorf("the Job was deleted without a record of it")
+	}
+}
+
+func TestAnOperatorWithoutItsIdentityReadsDetectionUnavailable(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	t.Setenv(operatorNamespaceEnvVar, "")
+	rig.serve(1)
+	rig.poll()
+	if c := rig.condition(); c == nil || c.Reason != busStreamsReasonDetectionUnavailable || rig.source.calls != 0 {
+		t.Errorf("condition = %+v after %d scrapes, want DetectionUnavailable and none", c, rig.source.calls)
+	}
+}
+
+// Every half of "at rest" holds the verdict: the spec observed, every replica
+// updated, one revision.
+func TestNoVerdictUntilTheStatefulSetIsAtRest(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		alter func(sts *appsv1.StatefulSet)
+	}{
+		{"spec not observed", func(sts *appsv1.StatefulSet) { sts.Status.ObservedGeneration = 1 }},
+		{"a replica not updated", func(sts *appsv1.StatefulSet) { sts.Status.UpdatedReplicas = 0 }},
+		{"two revisions", func(sts *appsv1.StatefulSet) { sts.Status.CurrentRevision = "r0" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := busStreamsAgent(1)
+			rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+			sts := busStreamsStatefulSet(agent, 1, 1)
+			tc.alter(sts)
+			rig.setStatefulSet(sts)
+			rig.serve(1)
+			for i := 0; i < 4; i++ {
+				rig.poll()
+			}
+			if len(rig.deleted) != 0 || rig.source.calls != 0 {
+				t.Errorf("scraped %d times and deleted %v", rig.source.calls, rig.deleted)
+			}
+		})
+	}
+}
+
+// A judged poll ends a run of polls with nothing to judge by.
+func TestAJudgedPollRestartsTheUnreachableCount(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	rig.source.bodies[busStreamsAddr(0)] = exporterBody(false, "")
+	rig.poll()
+	rig.poll()
+	rig.serve(1, a2aProvisionedStreams...)
+	rig.poll()
+	rig.source.bodies[busStreamsAddr(0)] = exporterBody(false, "")
+	rig.poll()
+	if c := rig.condition(); c == nil || c.Reason != busStreamsReasonAllPresent {
+		t.Errorf("condition = %+v, want AllPresent still: the judged poll broke the run", c)
 	}
 }
