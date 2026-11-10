@@ -163,7 +163,7 @@ func reportAlertExclude(rules []alertExcludeRule, m *metrics) {
 // and a refused one leaves the watcher with no rules, as a refused
 // --alert-exclude does.
 func reloadAlertExcludeFile(path, seen string, f *filter, m *metrics) string {
-	raw, err := os.ReadFile(path)
+	raw, err := os.ReadFile(path) // #nosec G304 -- the operator-set --alert-exclude-file path, not event data
 	text := string(raw)
 	if err != nil {
 		text = alertExcludeReadErrorMark + err.Error()
