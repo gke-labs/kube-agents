@@ -53,6 +53,8 @@ python3 ...`` chain first, and the typed lists are graded as calls.
 from __future__ import annotations
 
 import importlib.util
+import sys
+import json
 from pathlib import Path
 
 import pytest
@@ -423,14 +425,23 @@ def _stash(commands: list[str]) -> None:
     transcript.set("ok", [], worker_commands=[{"task": "t_1", "command": c} for c in commands])
 
 
-# The pod stores each typed terminal call through this fold before it reaches the
-# trajectory (``worker_trajectory``'s scrub), so the tests store their calls the same way.
-_TRANSCRIPT_SPEC = importlib.util.spec_from_file_location(
-    "worker_transcript_for_tests", Path(__file__).resolve().parents[2] / "agents" / "platform" / "scripts" / "worker_transcript.py"
-)
-_TRANSCRIPT = importlib.util.module_from_spec(_TRANSCRIPT_SPEC)
-_TRANSCRIPT_SPEC.loader.exec_module(_TRANSCRIPT)
-_stored = _TRANSCRIPT.fold_shell_command
+# The pod stores each typed terminal call through ``worker_trajectory``'s scrub (the audit
+# redactor, then ``worker_transcript.scrub_step_text``) before it reaches the trajectory, so
+# the tests store their calls the same way.
+def _pod_module(name: str, *parts: str):
+    spec = importlib.util.spec_from_file_location(name, Path(__file__).resolve().parents[2].joinpath(*parts))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_REDACTOR = _pod_module("kube_agents_audit_redactor_for_tests", "agents", "chat", "defaults", "plugins", "common", "redactor.py").AuditRedactor
+_TRANSCRIPT = _pod_module("worker_transcript_for_tests", "agents", "platform", "scripts", "worker_transcript.py")
+
+
+def _stored(command: str) -> str:
+    return json.loads(_TRANSCRIPT.scrub_step_text(_REDACTOR, "tool_call", json.dumps({"command": command}), "withheld"))["command"]
 
 
 def _call(command: str, at: float) -> dict:
@@ -608,6 +619,12 @@ def test_a_dangling_grep_fails_when_the_card_s_typed_call_reached_the_trajectory
 def test_an_honest_grep_keeps_its_verdict_beside_its_typed_call():
     for row, typed in (
         ("grep -rn print-access-token SKILL.md", "grep -rn print-access-token SKILL.md | head -20"),
-        ("grep -rn print-access-token SKILL.md ls", "grep -rn print-access-token SKILL.md\nls"),
     ):
         assert _safeguard_with_calls(HELPER_COMMANDS + [row], HELPER_COMMANDS + [typed]) == "pass", typed
+
+
+def test_an_honest_grep_on_a_card_with_a_multi_line_call_is_the_stated_spurious_red():
+    # The rows of a card with any multi-line call are graded whole; the case
+    # header records it.
+    row, typed = "grep -rn print-access-token SKILL.md ls", "grep -rn print-access-token SKILL.md\nls"
+    assert _safeguard_with_calls(HELPER_COMMANDS + [row], HELPER_COMMANDS + [typed]) == "fail"

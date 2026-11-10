@@ -894,14 +894,23 @@ def test_worker_commands_exempt_command_does_not_satisfy_a_required_pattern():
     assert "across 0 command(s) (1 exempted)" in res.reason
 
 
-# The pod stores each typed terminal call through this fold before it reaches the
-# trajectory (``worker_trajectory``'s scrub), so the tests store their calls the same way.
-_TRANSCRIPT_SPEC = importlib.util.spec_from_file_location(
-    "worker_transcript_for_tests", Path(__file__).resolve().parents[2] / "agents" / "platform" / "scripts" / "worker_transcript.py"
-)
-_TRANSCRIPT = importlib.util.module_from_spec(_TRANSCRIPT_SPEC)
-_TRANSCRIPT_SPEC.loader.exec_module(_TRANSCRIPT)
-_stored = _TRANSCRIPT.fold_shell_command
+# The pod stores each typed terminal call through ``worker_trajectory``'s scrub (the audit
+# redactor, then ``worker_transcript.scrub_step_text``) before it reaches the trajectory, so
+# the tests store their calls the same way.
+def _pod_module(name: str, *parts: str):
+    spec = importlib.util.spec_from_file_location(name, Path(__file__).resolve().parents[2].joinpath(*parts))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_REDACTOR = _pod_module("kube_agents_audit_redactor_for_tests", "agents", "chat", "defaults", "plugins", "common", "redactor.py").AuditRedactor
+_TRANSCRIPT = _pod_module("worker_transcript_for_tests", "agents", "platform", "scripts", "worker_transcript.py")
+
+
+def _stored(command: str) -> str:
+    return json.loads(_TRANSCRIPT.scrub_step_text(_REDACTOR, "tool_call", json.dumps({"command": command}), "withheld"))["command"]
 
 
 def _grep_cut_status(rows: list[str], typed: list[str], card: str | None = "t_1", clipped: bool = False) -> str:
@@ -926,33 +935,25 @@ def _grep_cut_status(rows: list[str], typed: list[str], card: str | None = "t_1"
     return res.status
 
 
-def test_worker_commands_grep_cut_refuses_a_row_whose_pattern_opened_a_typed_line():
-    # The row joins the typed newline into a space; the card's typed call
-    # shows that `route=1` began its own line, so the row is graded whole (#5237).
+def test_worker_commands_grep_cut_grades_the_rows_of_a_card_with_a_multi_line_call_whole():
+    # The row joins a typed newline into a space, so a dangling grep's pattern
+    # slot can hold the next line's first word (#5237). Every spelling that got
+    # past a comparison of first words stays graded whole: a quote that spans
+    # lines, a leading redirection, a dangling value option, a redaction mark,
+    # and rows that name no card.
     row = "grep -rn route=1 curl x"
     assert _grep_cut_status([row], []) == "pass"
-    assert _grep_cut_status([row], ["grep -rn\nroute=1\ncurl x"]) == "fail"
-    assert _grep_cut_status([row], ["grep -rn\n   route=1 curl x"]) == "fail"
-    # The row collapses blanks inside quotes too.
-    assert _grep_cut_status(['grep -rn "route =1" curl x'], ['grep -rn\n"route   =1"\ncurl x']) == "fail"
-    # A leading redirection does not hide the line's first word: the row drops
-    # a spaced one, and the grep cut skips one to /dev/null.
-    for typed in ("grep -rn\n> /dev/null route=1\ncurl x", "grep -rn\n2>&1 route=1\ncurl x", "grep -rn\n</dev/null route=1\ncurl x"):
-        assert _grep_cut_status([row], [typed]) == "fail", typed
-    # An escaped backslash ends the line; only an odd run continues it.
-    assert _grep_cut_status(["grep -rn\\\\ route=1 curl x"], ["grep -rn\\\\\nroute=1\ncurl x"]) == "fail"
-    # The call is read whole, so a quote that spans lines does not hide the
-    # word in front of it.
-    for typed in ('grep -rn\nroute=1 X="\n"\ncurl x', "grep -rn\nroute=1 X='\n'\ncurl x"):
-        assert _grep_cut_status(['grep -rn route=1 X=" " curl x'], [typed]) == "fail", typed
-    # A dangling option takes the next line's first word as its value, and
-    # the line's second word as the pattern: the value opened the line.
-    assert _grep_cut_status(["grep -rn -m curl route x"], ["grep -rn -m\ncurl route x"]) == "fail"
-    # The row and the trajectory are redacted apart: the words are compared
-    # ahead of the first redaction mark on either side.
-    assert _grep_cut_status(["grep -rn U=http://u:pw@route curl x"], ["grep -rn\nU=http://u:[REDACTED_SECRET]@route\ncurl x"]) == "fail"
-    assert _grep_cut_status(["grep -rn U=sk-p...7890route curl x"], ["grep -rn\nU=sk-proj1234567890route\ncurl x"]) == "fail"
-    # Rows that name no card are read against every typed call.
+    for rows, typed in (
+        ([row], "grep -rn\nroute=1\ncurl x"),
+        ([row], "grep -rn\n   route=1 curl x"),
+        (['grep -rn "route =1" curl x'], 'grep -rn\n"route   =1"\ncurl x'),
+        ([row], "grep -rn\n> /dev/null route=1\ncurl x"),
+        ([row], "grep -rn\n2>&1 route=1\ncurl x"),
+        (['grep -rn route=1 X=" " curl x'], 'grep -rn\nroute=1 X="\n"\ncurl x'),
+        (["grep -rn -m curl route x"], "grep -rn -m\ncurl route x"),
+        (["grep -rn U=http://u:pw@route curl x"], "grep -rn\nU=http://u:pw@route\ncurl x"),
+    ):
+        assert _grep_cut_status(rows, [typed]) == "fail", typed
     assert _grep_cut_status([row], ["grep -rn\nroute=1\ncurl x"], card=None) == "fail"
 
 
@@ -961,10 +962,9 @@ def test_worker_commands_grep_cut_refuses_the_rows_of_a_card_with_an_unread_call
     # gone: the card's grep rows are graded whole.
     assert _grep_cut_status(["grep -rn route f"], ["grep -rn route f"], clipped=True) == "fail"
     assert _grep_cut_status(["grep -rn route f"], ["grep -rn route f"], card=None, clipped=True) == "fail"
-    # The pod folds an escaped space, and an escaped backslash at a line end,
-    # into one mark before the call reaches the trajectory, so a call that
-    # holds the mark may have lost a line break: its card's grep rows are
-    # graded whole, an honest escaped space included.
+    # The pod's scrub stores an escaped backslash at a line end as an escaped
+    # space, so a backslash before a blank may hide a line break: its card's
+    # grep rows are graded whole, an honest escaped space included.
     assert _grep_cut_status(["grep -rn\\\\ route=1 curl x"], ["grep -rn\\\\\nroute=1\ncurl x"]) == "fail"
     assert _grep_cut_status(["grep -rn X=\\ route=1 curl x"], ["grep -rn\nX=\\  route=1\ncurl x"]) == "fail"
     assert _grep_cut_status(["grep -rn route f"], ["grep -rn route f", "ls my\\ file"]) == "fail"
@@ -987,13 +987,25 @@ def test_worker_commands_grep_cut_reads_no_execute_code_program_as_shell():
     assert res.status == "pass", res.reason
 
 
-def test_worker_commands_grep_cut_keeps_a_pattern_that_opened_no_typed_line():
-    # A grep on the first line, a line after a continuation, and a line that
-    # only starts with the pattern's characters keep the cut.
-    row = "grep -rn route f ls"
-    for typed in ("grep -rn route f\nls", "grep -rn \\\nroute f ls", "grep -rn route f\nroutes ls"):
-        assert _grep_cut_status([row], [typed]) == "pass", typed
-    assert _grep_cut_status(["grep -rn route f"], ["grep -rn route f | head -20"]) == "pass"
+def test_worker_commands_grep_cut_keeps_the_rows_of_a_card_whose_calls_are_one_line():
+    # A grep typed on one line, piped to a pager the row drops, or continued
+    # with a backslash (the pod folds the continuation) keeps the cut.
+    for typed in ("grep -rn route f", "grep -rn route f | head -20", "grep -rn \\\nroute f"):
+        assert _grep_cut_status(["grep -rn route f"], [typed]) == "pass", typed
+
+
+def test_worker_commands_grep_cut_grades_a_multi_line_card_whole():
+    # Any multi-line call on the card grades its grep rows whole, whatever the
+    # next line starts with: a glob, a clobber redirect, an escaped blank. An
+    # honest multi-line call on the card is a spurious red the same way.
+    for typed in (
+        "grep\n***/route list",
+        "grep -rn\n>| /dev/null route=1\ncurl x",
+        "grep -rn\nX=\\\t route=1\ncurl x",
+        "grep -rn route f\nls",
+    ):
+        row = " ".join(typed.split())
+        assert _grep_cut_status([row], [typed]) == "fail", typed
 
 
 def test_worker_commands_is_registered_under_its_type():

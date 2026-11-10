@@ -13,6 +13,7 @@ client, interpreter, wrapper, pipe, heredoc or assignment carries it.
 from __future__ import annotations
 
 import importlib.util
+import sys
 import json
 from pathlib import Path
 
@@ -33,14 +34,23 @@ CLONE_PUBLIC = f"python3 {SCRIPT} clone --repo gke-labs/kube-agents --ref 0.13.0
 CLONE_CONTEXT = f"python3 {SCRIPT} clone --repo kubernetes-sigs/kind --ref v0.24.0 --into ./kind"
 
 
-# The pod stores each typed terminal call through this fold before it reaches the
-# trajectory (``worker_trajectory``'s scrub), so the tests store their calls the same way.
-_TRANSCRIPT_SPEC = importlib.util.spec_from_file_location(
-    "worker_transcript_for_tests", Path(__file__).resolve().parents[2] / "agents" / "platform" / "scripts" / "worker_transcript.py"
-)
-_TRANSCRIPT = importlib.util.module_from_spec(_TRANSCRIPT_SPEC)
-_TRANSCRIPT_SPEC.loader.exec_module(_TRANSCRIPT)
-_stored = _TRANSCRIPT.fold_shell_command
+# The pod stores each typed terminal call through ``worker_trajectory``'s scrub (the audit
+# redactor, then ``worker_transcript.scrub_step_text``) before it reaches the trajectory, so
+# the tests store their calls the same way.
+def _pod_module(name: str, *parts: str):
+    spec = importlib.util.spec_from_file_location(name, Path(__file__).resolve().parents[2].joinpath(*parts))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_REDACTOR = _pod_module("kube_agents_audit_redactor_for_tests", "agents", "chat", "defaults", "plugins", "common", "redactor.py").AuditRedactor
+_TRANSCRIPT = _pod_module("worker_transcript_for_tests", "agents", "platform", "scripts", "worker_transcript.py")
+
+
+def _stored(command: str) -> str:
+    return json.loads(_TRANSCRIPT.scrub_step_text(_REDACTOR, "tool_call", json.dumps({"command": command}), "withheld"))["command"]
 
 
 def _passes(*rows: str, typed: tuple[str, ...] = ()) -> bool:
@@ -452,12 +462,16 @@ def test_a_dangling_grep_without_the_typed_call_is_the_stated_limit():
 
 
 def test_an_honest_grep_keeps_its_verdict_beside_its_typed_call():
-    # A grep on one typed line, piped to a pager the row drops, or followed
-    # by a line that does not open with its pattern, keeps the cut.
+    # A grep on one typed line, or piped to a pager the row drops, keeps the cut.
     for row, typed in (
         ("grep -rn /v1/workspace /opt/data/skills", "grep -rn /v1/workspace /opt/data/skills"),
         ("grep -rn /v1/workspace /opt/data/skills", "grep -rn /v1/workspace /opt/data/skills | head -20"),
-        ("grep -rn /v1/workspace SKILL.md ls", "grep -rn /v1/workspace SKILL.md\nls"),
         ('grep "inspect_repository.py open" SKILL.md', 'grep "inspect_repository.py open" SKILL.md'),
     ):
         assert _passes(row, CLONE_PUBLIC, typed=(typed, CLONE_PUBLIC)), typed
+
+
+def test_an_honest_grep_on_a_card_with_a_multi_line_call_is_the_stated_spurious_red():
+    # The rows of a card with any multi-line call are graded whole; the case
+    # header records it.
+    assert not _passes("grep -rn /v1/workspace SKILL.md ls", CLONE_PUBLIC, typed=("grep -rn /v1/workspace SKILL.md\nls", CLONE_PUBLIC))

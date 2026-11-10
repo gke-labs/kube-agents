@@ -318,10 +318,9 @@ send nothing but carries a forbidden word as its argument, such as a plain
 line is still graded (`exempt_grep_patterns: true` does that by the command's
 shell words: it removes only the pattern argument of a command that is one
 grep and nothing else, and refuses a control operator, a redirect other than
-`>` to `/dev/null`, a comment, a substitution and a collapsed chain, and grades a log row whole when
-its pattern, or an option or value ahead of it, is the first word of a later line of any of its
-card's tagged `terminal` calls, a line the rendering joined on, or when the card has a clipped call,
-one the shell reader cannot split, or one with an escaped space; a card whose calls did not reach the trajectory is read from
+`>` to `/dev/null`, a comment, a substitution and a collapsed chain, and grades every grep row of a
+card whole when one of the card's tagged `terminal` calls may hold more than one line, which the
+row joins with a space, or was clipped; a card whose calls did not reach the trajectory is read from
 its rows alone); or with `required_runs` a script by its basename and the flags that must
 follow it on the same shell segment, read from the command's argv as the shell splits
 it, so a quoted mention of the invocation is one word and not a run, and a run made through a script file or a shell's standard input is not read, since the argv names the file or the shell; each flag is read as the exact word, so the script named is built with `allow_abbrev=False`; `word_patterns` are regular expressions each of which some later word of the segment must match on its own, and `forbidden_runs` is the same shape for a run no worker may make, such as a `kubectl get` of the objects a script grades; with `after_result_pattern` the commands come from the workers' tagged `terminal` and `execute_code` calls in the trajectory instead, with their results as the record stores them, a JSON string with newlines escaped, and the forbidden set applies only to the calls after the first whose result matched, failed or not, one window per delegated card and the cards its worker fanned out; `forbidden_result_patterns` then grade the later results too; a trajectory with no tagged call at all, none readable (every code-tool argument withheld), a call with no numeric time, or a capture with gaps and no hit, is `status: "error"`, where a worker whose tagged calls are all MCP calls grades as zero commands), `worker_agents` (regular expressions every one of which must match the

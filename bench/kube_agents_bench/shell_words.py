@@ -101,6 +101,9 @@ _GREP_OUTPUT_SINK = "/dev/null"
 # typed line onto it with a space, so a comment there would hide that line from the grading.
 _COMMENT_CHAR = "#"
 _COLLAPSED_CHAIN_RE = re.compile(r"\s\+\s\d+\scommand(?:s|\(s\))?\s*$")
+# A backslash before a blank in a stored typed call: an escaped space or tab, or what the pod's
+# scrub leaves of an escaped backslash at a line end (`worker_transcript.fold_shell_command`).
+_ESCAPED_BLANK_RE = re.compile(r"\\[ \t]")
 
 
 def _read_shell_line(command: str) -> tuple[str, list[str], list[str]]:
@@ -379,13 +382,20 @@ def _command_word_index(
     return None
 
 
+def _typed_call_may_join(command: str) -> bool:
+    """Whether a typed command, as the pod stores it, may hold more than one line, which a card
+    log row joins with a space: a newline outside quotes once the ends are trimmed, a backslash
+    before a blank (an escaped blank, or what the pod's scrub leaves of an escaped backslash at
+    a line end once it folds the continuation), or a line the shell reader cannot split."""
+    if _ESCAPED_BLANK_RE.search(command):
+        return True
+    words, _ = _shell_words_and_spans(command.strip())
+    if not words:
+        return bool(command.strip())
+    return any(isinstance(word, _ShellOperator) and word == _SHELL_LINE_END for word in words)
+
+
 def _without_grep_patterns(command: str) -> str | None:
-    """The command line as :func:`_grep_cut` leaves it; None when the line is not one such grep."""
-    cut = _grep_cut(command)
-    return None if cut is None else cut[0]
-
-
-def _grep_cut(command: str) -> tuple[str, list[str]] | None:
     """The command line as its shell words joined by spaces, with the grep's pattern argument
     removed (the first positional word, or each ``-e``/``--regexp=`` value when one is given);
     None when the line is not one such grep. The line is a ``grep``, ``egrep`` or ``fgrep`` named
@@ -398,9 +408,7 @@ def _grep_cut(command: str) -> tuple[str, list[str]] | None:
     onto the row. Quotes come off, as the shell reads the line; a line bash refuses yields None.
     A card log row that joined a second typed line onto the grep is one row here, so a line
     that reads the removed word back (``$_``, a variable the pattern assigned) is read as an
-    operand: the limit ``exempt_patterns`` had too. Second come the words from the first after
-    the program up to the last removed one, the options and their values included, as the shell
-    reads them: a card log row can have joined any of them on from the next typed line."""
+    operand: the limit ``exempt_patterns`` had too."""
     if _COLLAPSED_CHAIN_RE.search(command):
         return None
     # The reader keeps every quoted, escaped or in-word `#` and a span's text whole, so a `#` it
@@ -464,32 +472,4 @@ def _grep_cut(command: str) -> tuple[str, list[str]] | None:
     removed = set(patterns) if given else set(positionals[:1])
     if not removed:
         return None
-    return " ".join(word for k, word in enumerate(words) if k not in removed), list(words[1 : max(removed) + 1])
-
-
-def _typed_line_openings(command: str) -> list[str] | None:
-    """The first word of each line after the first of a typed command, as the shell reads it
-    and with its blanks collapsed as a card log row has them: the word a row joins onto the
-    line above it. The command is read whole, so a quote that spans lines, a line
-    continuation and an escaped backslash are read as bash reads them. Leading redirections
-    and their targets are skipped, since the row's rendering drops a spaced one and the grep
-    cut skips one to /dev/null. None when bash refuses the line (an open quote): it still
-    runs the lines before the error, and the lines are not known."""
-    words, _ = _shell_words_and_spans(command)
-    if not words:
-        return None if command.strip() else []
-    openings: list[str] = []
-    for index, word in enumerate(words):
-        if not (isinstance(word, _ShellOperator) and word == _SHELL_LINE_END):
-            continue
-        index += 1
-        while index < len(words):
-            if _is_redirect(words[index]):
-                index += 2
-            elif words[index].isdigit() and index + 1 < len(words) and _is_redirect(words[index + 1]):
-                index += 1
-            else:
-                break
-        if index < len(words) and not isinstance(words[index], _ShellOperator):
-            openings.append(" ".join(words[index].split()))
-    return openings
+    return " ".join(word for k, word in enumerate(words) if k not in removed)
