@@ -1730,7 +1730,7 @@ class ReportTest(_Harness):
         self.assertEqual(doc["roles"]["version-laggard"]["cluster_slot"], "b")
         self.assertEqual(doc["summary"], {"converged": 42, "drifted": 1, "unchecked": 4})
         self.assertEqual(doc["roles"]["startup-fail-vm"]["cluster_slot"], None)
-        self.assertIn("1 drifted, 2 not checked", done.stderr)
+        self.assertIn("1 drifted, 4 not checked", done.stderr)
 
     def test_without_the_flag_no_report_is_written(self):
         done = self.run_script(_healthy_world())
