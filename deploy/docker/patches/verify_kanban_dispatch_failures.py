@@ -6,7 +6,8 @@ after ``apply_kanban_dispatch_failures.py``, from ``/opt/hermes`` so the
 gateway package imports. Two things are checked:
 
 1. The inserted statements. ``gateway/kanban_watchers_dispatcher.py`` carries
-   the two recording calls, and every name each reads is bound where it runs
+   the four recording calls (the tick's start and end, a good and a failed
+   tick), and every name each reads is bound where it runs
    (``patchlib.unbound``): the anchors pin a ``return`` line and a log line,
    not ``slug`` or ``exc``, so an upstream rename of one of those would pass
    the applier and raise ``NameError`` on every tick.
@@ -35,8 +36,8 @@ MARKER = "kube-agents patch: kanban-dispatch-failures"
 ALIAS = "_kage_dispatch_failures"
 DEFAULT_HERMES_ROOT = "/opt/hermes"
 DISPATCHER = "gateway/kanban_watchers_dispatcher.py"
-# The good tick's call and the failed tick's call.
-EXPECTED_INSERTS = 2
+# The tick's start, the good tick's call, the failed tick's call and the tick's end.
+EXPECTED_INSERTS = 4
 HELPER_MODULE = "gateway.kanban_dispatch_failures"
 LOOKUP_MODULE = "gateway.chat_turn_metrics"
 PLUGIN_PACKAGE = "chat_metrics"
@@ -49,6 +50,10 @@ REGISTRY_STAND_IN = (
     "        self.seen = []\n"
     "    def record_dispatch_tick(self, board, error_class):\n"
     "        self.seen.append((board, error_class))\n"
+    "    def record_dispatch_tick_start(self, board):\n"
+    "        self.seen.append(('start', board))\n"
+    "    def record_dispatch_tick_end(self, board):\n"
+    "        self.seen.append(('end', board))\n"
     "REGISTRY = _R()\n"
 )
 BOARD = "default"
@@ -111,10 +116,12 @@ def check_helper(root: Path) -> None:
         sys.modules.pop(f"{PLUGIN_PACKAGE}.{PLUGIN_MODULE}", None)
         _reset(lookup, plugins)
         failure = type(FAILURE_CLASS, (Exception,), {})()
+        helper.record_tick_start(BOARD)
         helper.record_tick(BOARD, failure)
         helper.record_tick(BOARD)
+        helper.record_tick_end(BOARD)
         seen = getattr(lookup._registry, "seen", None)
-        want = [(BOARD, FAILURE_CLASS), (BOARD, "")]
+        want = [("start", BOARD), (BOARD, FAILURE_CLASS), (BOARD, ""), ("end", BOARD)]
         if seen != want:
             raise _fail(f"record_tick recorded {seen!r}, expected {want!r}")
     print("kanban-dispatch-failures verify: the helper records on a reachable registry and nothing without one")

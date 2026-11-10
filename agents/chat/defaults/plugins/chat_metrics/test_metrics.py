@@ -213,6 +213,37 @@ class DispatcherFailedTicksTest(unittest.TestCase):
             now[0] += 125
         self.assertEqual([("default", "OperationalError", "375")], _AGE_LINE.findall(registry.render()))
 
+    def test_a_locked_boards_long_ticks_keep_one_streak(self):
+        # On a locked board connect() waits the busy timeout once per statement,
+        # so each tick takes about 12 minutes: failures 720 s apart, each inside
+        # its own tick, still make one streak, and a render mid-tick keeps the
+        # board and its growing age.
+        now = [100.0]
+        registry = metrics.ChatMetrics(clock=lambda: now[0])
+        for tick in range(3):
+            registry.record_dispatch_tick_start("default")
+            now[0] += 700
+            if tick == 1:
+                self.assertEqual([("default", "OperationalError", "1")], _DISPATCH_LINE.findall(registry.render()))
+                self.assertEqual([("default", "OperationalError", "705")], _AGE_LINE.findall(registry.render()))
+            now[0] += 15
+            registry.record_dispatch_tick("default", "OperationalError")
+            registry.record_dispatch_tick_end("default")
+            now[0] += 5
+        self.assertEqual([("default", "OperationalError", "3")], _DISPATCH_LINE.findall(registry.render()))
+        self.assertEqual([("default", "OperationalError", "1445")], _AGE_LINE.findall(registry.render()))
+
+    def test_a_tick_that_ends_with_no_result_leaves_the_board_quiet(self):
+        # The corrupt-board branch ends its tick with no failure recorded: the
+        # board is no longer being tried, so the quiet rules apply again.
+        now = [100.0]
+        registry = metrics.ChatMetrics(clock=lambda: now[0])
+        registry.record_dispatch_tick("default", "OSError")
+        registry.record_dispatch_tick_start("default")
+        registry.record_dispatch_tick_end("default")
+        now[0] += metrics.DISPATCH_FAILURE_STALE_SECONDS + 1
+        self.assertEqual([], _DISPATCH_LINE.findall(registry.render()))
+
     def test_a_good_tick_or_a_stale_restart_starts_the_age_again(self):
         now = [100.0]
         registry = metrics.ChatMetrics(clock=lambda: now[0])

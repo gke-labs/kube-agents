@@ -137,18 +137,21 @@ ERROR_LABEL = "error"
 # kanbanDispatcherFailingSecondsSeries), so a locked board, whose ticks each
 # wait out the SQLite busy timeout, shows within about one poll.
 KANBAN_DISPATCHER_FAILING_SECONDS_METRIC = "kubeagents_kanban_dispatcher_failing_seconds"
-# A board whose last failure is older than this is dropped at render: the
-# dispatcher stopped ticking it (archived, quarantined as corrupt, or the
-# dispatcher paused), and no good tick will come to end its streak. A failing
-# tick can take Hermes' whole SQLite busy timeout (120 s, kanban_db_connect's
-# DEFAULT_BUSY_TIMEOUT_MS) on a locked board, plus the interval, so the window is
-# five of those: a live streak is never this old.
+# Both windows below count from the board's last failure, or from now while a
+# tick on it is in progress: the patch records each tick's start and end. On a
+# locked board one tick can take many minutes, because connect() waits the
+# SQLite busy timeout (120 s, kanban_db_connect's DEFAULT_BUSY_TIMEOUT_MS) once
+# per statement it runs; a board in a tick is being tried, so it neither goes
+# stale nor stops ageing, and a failure is matched against its own tick's start.
+#
+# A board with no tick in progress whose last failure is older than this is
+# dropped at render: the dispatcher stopped ticking it (archived, quarantined as
+# corrupt, or the dispatcher paused), and no good tick will come to end its
+# streak.
 DISPATCH_FAILURE_STALE_SECONDS = 600.0
-# The streak's age stops growing this long after its last failure: two ticks on
-# a locked board (the 120 s busy timeout and the 5 s interval, twice). A board
-# that keeps failing renews it with each failure; one the dispatcher stopped
-# ticking (archived, quarantined, paused) cannot age into the condition on a
-# few early failures before the stale window drops it.
+# The streak's age stops growing this long after its last failure while no tick
+# is in progress, so a board the dispatcher stopped ticking cannot age into the
+# condition on a few early failures before the stale window drops it.
 DISPATCH_FAILURE_AGE_GRACE_SECONDS = 250.0
 PROCESS_START_TIME_METRIC = "process_start_time_seconds"
 PROCESS_START_TIME_SECONDS = time.time()
@@ -342,6 +345,8 @@ class ChatMetrics:
         self._negative: dict[str, int] = {}
         # board -> (failed ticks in a row, last error class, last failure, first failure)
         self._dispatch_failures: dict[str, tuple[int, str, float, float]] = {}
+        # board -> when its in-progress tick began
+        self._dispatch_ticking: dict[str, float] = {}
 
     def prime(self) -> None:
         """Take the board's baseline now rather than at the first scrape."""
@@ -373,10 +378,23 @@ class ChatMetrics:
                 return
             now = self._clock()
             streak, _, at, began = self._dispatch_failures.get(board, (0, "", 0.0, now))
-            if now - at > DISPATCH_FAILURE_STALE_SECONDS:
+            # Matched against this tick's own start, which a locked board's long
+            # tick puts long after the previous failure.
+            tried = self._dispatch_ticking.get(board, now)
+            if tried - at > DISPATCH_FAILURE_STALE_SECONDS:
                 # A streak past the window ended unseen: render had not run to drop it.
                 streak, began = 0, now
             self._dispatch_failures[board] = (streak + 1, error_class, now, began)
+
+    def record_dispatch_tick_start(self, board: str) -> None:
+        """A dispatcher tick on ``board`` began."""
+        with self._lock:
+            self._dispatch_ticking[board] = self._clock()
+
+    def record_dispatch_tick_end(self, board: str) -> None:
+        """The tick on ``board`` ended, whichever way."""
+        with self._lock:
+            self._dispatch_ticking.pop(board, None)
 
     def record_negative_feedback(self, hermes_platform: str) -> None:
         label = platform_label(hermes_platform)
@@ -390,9 +408,11 @@ class ChatMetrics:
             errored = sorted(self._errored.items())
             negative = sorted(self._negative.items())
             now = self._clock()
-            for board in [b for b, (_, _, at, _) in self._dispatch_failures.items() if now - at > DISPATCH_FAILURE_STALE_SECONDS]:
+            for board in [b for b, (_, _, at, _) in self._dispatch_failures.items()
+                          if b not in self._dispatch_ticking and now - at > DISPATCH_FAILURE_STALE_SECONDS]:
                 del self._dispatch_failures[board]
             dispatch_failures = sorted(self._dispatch_failures.items())
+            ticking = set(self._dispatch_ticking)
         lines = [
             f"# HELP {CHAT_INBOUND_METRIC} Chat messages that reached the gateway's dispatch hook, by platform.",
             f"# TYPE {CHAT_INBOUND_METRIC} counter",
@@ -447,7 +467,7 @@ class ChatMetrics:
             f"# TYPE {KANBAN_DISPATCHER_FAILING_SECONDS_METRIC} gauge",
         ]
         for board, (_, error_class, at, began) in dispatch_failures:
-            age = min(now, at + DISPATCH_FAILURE_AGE_GRACE_SECONDS) - began
+            age = (now if board in ticking else min(now, at + DISPATCH_FAILURE_AGE_GRACE_SECONDS)) - began
             lines.append(f'{KANBAN_DISPATCHER_FAILING_SECONDS_METRIC}{{{BOARD_LABEL}="{_label_value(board)}",{ERROR_LABEL}="{_label_value(error_class)}"}} {int(max(0.0, age))}')
         lines += [
             f"# HELP {PROCESS_START_TIME_METRIC} Start time of the process since unix epoch in seconds, captured once at start.",

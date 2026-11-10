@@ -3,7 +3,7 @@
 
 Run by ``deploy/docker/Dockerfile`` against the Hermes tree, after
 ``kanban_dispatch_failures.py`` has been copied to ``gateway/`` and after
-``chat_turn_metrics.py``, whose registry lookup it uses. One file, two sites,
+``chat_turn_metrics.py``, whose registry lookup it uses. One file, four sites,
 one import, in ``gateway/kanban_watchers_dispatcher.py``'s
 ``tick_once_for_board``:
 
@@ -13,8 +13,13 @@ one import, in ``gateway/kanban_watchers_dispatcher.py``'s
    failed on board %s", slug)``, the tick is recorded with the exception, so
    the board's streak grows. The corrupt-board branch above it returns first
    and is not counted.
+3. The tick's start, after the quarantine check and before ``connect()``,
+   which on a locked board waits the busy timeout once per statement it runs.
+4. The tick's end, first in the ``finally`` block, on every way out.
 
-Each site calls ``_kage_dispatch_failures.record_tick``, which never raises
+The start and the end let the registry tell a board being tried (a locked
+board's tick can take many minutes) from one the dispatcher stopped ticking.
+Each site calls a ``_kage_dispatch_failures`` function, which never raises
 and records nothing when the ``chat_metrics`` plugin is absent. Anchors are
 derived against v2026.9.14; no other patch edits this file.
 
@@ -51,6 +56,19 @@ GOOD_TICK_PATCHED = (
 FAILED_TICK_ANCHOR = '            logger.exception("kanban dispatcher: tick failed on board %s", slug)\n'
 FAILED_TICK_PATCHED = FAILED_TICK_ANCHOR + f"            _kage_dispatch_failures.record_tick(slug, exc)  # {MARKER}\n"
 
+# The tick's start, after the quarantine check (a quarantined board's skipped tick is no try) and
+# before connect(), which on a locked board waits the busy timeout once per statement it runs.
+TICK_START_ANCHOR = '        kwargs = {k: v for k, v in asdict(self.settings).items() if k != "interval"}\n'
+TICK_START_PATCHED = f"        _kage_dispatch_failures.record_tick_start(slug)  # {MARKER}\n" + TICK_START_ANCHOR
+
+# The tick's end, on every way out (a good tick, a failure, the corrupt-board branch).
+TICK_END_ANCHOR = "        finally:\n            if conn is not None:\n"
+TICK_END_PATCHED = (
+    "        finally:\n"
+    f"            _kage_dispatch_failures.record_tick_end(slug)  # {MARKER}\n"
+    "            if conn is not None:\n"
+)
+
 
 def apply(root: Path) -> None:
     dispatcher = patchlib.Patch(root, DISPATCHER, prefix=PREFIX)
@@ -58,7 +76,9 @@ def apply(root: Path) -> None:
     dispatcher.substitute(IMPORT_ANCHOR, IMPORT_PATCHED, label="dispatcher import")
     dispatcher.substitute(GOOD_TICK_ANCHOR, GOOD_TICK_PATCHED, label="good tick")
     dispatcher.substitute(FAILED_TICK_ANCHOR, FAILED_TICK_PATCHED, label="failed tick")
-    dispatcher.commit("2 anchors, 1 import")
+    dispatcher.substitute(TICK_START_ANCHOR, TICK_START_PATCHED, label="tick start")
+    dispatcher.substitute(TICK_END_ANCHOR, TICK_END_PATCHED, label="tick end")
+    dispatcher.commit("4 anchors, 1 import")
 
 
 if __name__ == "__main__":
