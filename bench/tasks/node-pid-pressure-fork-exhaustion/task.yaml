@@ -22,7 +22,6 @@ id: node-pid-pressure-fork-exhaustion
 name: "Node PID exhaustion (declared gap; reads the fleet's multi-process workload on a pool with no pod PID limit)"
 domain: fleet-audits
 suite: certification
-certification_part: 2
 expected_fail: true
 audit_streams:
   - gce-compute-fleet-audit

@@ -25,7 +25,6 @@ id: control-plane-konnectivity-agent-exhaustion
 name: "Konnectivity agent exhaustion (declared gap; nothing planted, a GKE-managed add-on; needs a clean-read objective)"
 domain: fleet-audits
 suite: certification
-certification_part: 2
 expected_fail: true
 audit_streams:
   - gce-compute-fleet-audit

@@ -20,7 +20,6 @@ id: node-nf-conntrack-table-saturation
 name: "Node conntrack table saturation (declared gap; nothing planted until a reader of conntrack counts exists)"
 domain: fleet-audits
 suite: certification
-certification_part: 2
 expected_fail: true
 audit_streams:
   - gce-compute-fleet-audit
