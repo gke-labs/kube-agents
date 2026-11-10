@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -381,5 +384,42 @@ func TestChangeRequested_AConfirmFrameOnTheInSubjectNeverSetsIt(t *testing.T) {
 	env := submissionOn(t, r, "prod-east")
 	if found, got := submittedChange(t, env); got {
 		t.Fatalf("submission changeRequested = %v (part found %v), want false", got, found)
+	}
+}
+
+// The ingress line records whether a human's confirm asked for a change:
+// it's the gateway's own audit of what a task's submission may mint a
+// permit for, and the evidence a live run reads.
+func TestTheIngressLineRecordsChangeRequested(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		turn InboundMessage
+		want string
+	}{
+		{"typed", profileTurn("discord:ing/1", "cluster", targetParams("p1", "us-east1", "prod")), "changeRequested=false"},
+		{"confirm", confirmTurn("discord:ing/2", "cluster", targetParams("p1", "us-east1", "prod")), "changeRequested=true"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := &lockedBuffer{}
+			scope := filepath.Join(t.TempDir(), "scope.json")
+			if err := os.WriteFile(scope, []byte(`{"present":true,"projects":["p1"]}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			r := startRigWithLogger(t, func(c *Config) { c.ScopeFile = scope; c.Namespace = "kubeagents-system" },
+				slog.New(slog.NewTextHandler(logs, nil)))
+			r.g.profiles.put("cluster", &lib.AgentCard{Name: "cluster", Parameters: clusterParams})
+			r.g.profiles.put("prod-east", &lib.AgentCard{Name: "prod-east", Parameters: clusterParams,
+				ClusterRef: &lib.ClusterRef{ProjectID: "p1", Location: "us-east1", Cluster: "prod"}})
+			r.adapter.inbox <- tc.turn
+			_ = submissionOn(t, r, "prod-east")
+			waitFor(t, "the ingress line", func() bool {
+				for _, line := range strings.Split(logs.String(), "\n") {
+					if strings.Contains(line, "msg=ingress") && strings.Contains(line, tc.turn.Conversation) {
+						return strings.Contains(line, tc.want)
+					}
+				}
+				return false
+			})
+		})
 	}
 }

@@ -2924,7 +2924,10 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		"backendMessageId", ts.MessageID,
 		"principal", ts.Principal,
 		"conversation", rec.Key,
-		"addressee", rec.Addressee)
+		"addressee", rec.Addressee,
+		// Whether a human's structured confirm asked for a change: the
+		// audit record of what this task's submission may mint a permit for.
+		"changeRequested", ts.ChangeRequested)
 
 	// The root capability, minted before anything is published. The
 	// gateway allocates the taskId and the addressee in the same breath, so
