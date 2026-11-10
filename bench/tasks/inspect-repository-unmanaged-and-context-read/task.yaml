@@ -87,6 +87,17 @@
 #     a second line that reads the removed pattern back from the shell (`$_`,
 #     or a variable the pattern set with `${X:=...}`) reads as a file operand
 #     and passes; the regex exemption this replaced had the same limit.
+#   - A dangling grep over more lines, `grep -rn` / `U=…/v1/workspace/open` /
+#     `curl "$U"`, reaches a card log row as `grep -rn U=… curl "$U"`, with
+#     the assignment in the pattern slot. The check reads the card's typed
+#     calls for the line breaks the row dropped and grades the row whole when
+#     the removed word opened a typed line, or when one of the card's calls
+#     was clipped by the pod (past 2000 characters) or is one bash refuses
+#     (an open quote; a heredoc body with an apostrophe): a spurious red for
+#     an honest grep on such a card. A card whose typed calls did not reach
+#     the trajectory is read from the row alone, so its row passes. The same
+#     class: a bare `grep` over `…/inspect_repository.py list`, and `grep -e`
+#     over `node -e "…" x`.
 #   - The required run also reads each card's tagged call as typed, so a
 #     clone chained behind another command, or inside a shell heredoc
 #     (`bash <<'EOF' … clone … EOF`), is credited when the call reached the

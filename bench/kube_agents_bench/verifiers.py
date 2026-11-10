@@ -100,7 +100,7 @@ from kube_agents_bench import (
     worker_trajectory,
 )
 from kube_agents_bench.parsing import DELEGATION_TOOL
-from kube_agents_bench.shell_words import _INTERPRETER_RE, _command_word_index, _shell_argvs, _without_grep_patterns
+from kube_agents_bench.shell_words import _INTERPRETER_RE, _command_word_index, _grep_cut, _shell_argvs, _typed_line_openings
 from kube_agents_bench.fleet import (
     ROLE_PATTERN,
     FleetRoleUnresolved,
@@ -2533,6 +2533,8 @@ _TERMINAL_TOOL = "terminal"
 _CODE_TOOLS = frozenset({_TERMINAL_TOOL, "execute_code"})
 _CODE_ARG = "code"
 _COMMAND_ARG = "command"
+# The one key of an argument object the pod clipped: ``{"raw": text}``.
+_CLIPPED_ARGS_KEY = "raw"
 # The head of a ``"command"`` literal the pod clipped before its closing quote:
 # what is there is still the command's start, which is where its verb is.
 _CLIPPED_COMMAND_HEAD_RE = re.compile(r'"command"\s*:\s*"((?:[^"\\]|\\.)*)')
@@ -2687,6 +2689,20 @@ def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, float | Non
     return calls
 
 
+def _clipped_cards(trajectory: list[Any]) -> set[str]:
+    """The cards with a code-tool call whose arguments the pod clipped (``{"raw": text}``):
+    the lines the clip cut off are not in the typed text."""
+    return {
+        str(entry.get("task") or entry.get("session") or "")
+        for entry in trajectory
+        if isinstance(entry, dict)
+        and entry.get("agent")
+        and entry.get("name") in _CODE_TOOLS
+        and isinstance(entry.get("args"), dict)
+        and set(entry["args"]) == {_CLIPPED_ARGS_KEY}
+    }
+
+
 def _card_lineages(parents: dict[str, str], cards: list[str]) -> dict[str, str]:
     """Each card to the one name of the lineage it belongs to.
 
@@ -2794,7 +2810,15 @@ class WorkerCommandsVerifier(BaseVerifier):
     taken as the pattern and the real one is graded. A card log row that joined
     a second typed line onto a grep is one row to it, so a line that reads the
     removed word back (``$_``) is read as a file operand, as it was by the
-    regex exemptions this replaces.
+    regex exemptions this replaces. A dangling grep's pattern slot can also
+    hold the next typed line's first word (``grep -rn`` over ``U=<url>`` and
+    ``curl "$U"``), so a row whose removed word is the first word (leading
+    redirections skipped) of a later line of any of its card's tagged calls
+    keeps its grep and is graded whole (#5237), and so is every grep row of a
+    card with a call the pod clipped or one bash refuses (an open quote; a
+    heredoc body with an apostrophe is one: a spurious red when such a card
+    also greps for a forbidden word); a card whose calls did not reach the
+    trajectory is read from the row alone.
     ``required_runs``: each names a script (by basename, or module stem under
     ``-m``), flags and word patterns; some command's shell segment, read as an
     argv, must run it with those flags after it, a word matching each pattern,
@@ -2920,9 +2944,15 @@ class WorkerCommandsVerifier(BaseVerifier):
             raise ValueError("forbidden_result_patterns read results inside the window after_result_pattern opens; set both")
         return self
 
-    def _without_exempt_text(self, command: str) -> str:
+    def _without_exempt_text(self, command: str, opened: list[str] | tuple[()] | None = ()) -> str:
+        # ``opened``: the first words of the lines a log row's card typed after
+        # a first line, or None when a clip or an open quote left them unknown.
+        # A pattern that opens a line is a word the rendering joined on from the
+        # next line, so the row keeps its grep and is graded whole (#5237).
         if self.exempt_grep_patterns:
-            command = _without_grep_patterns(command) or command
+            cut = _grep_cut(command)
+            if cut is not None and opened is not None and not any(" ".join(word.split()) in opened for word in cut[1]):
+                command = cut[0]
         for pattern in self.exempt_patterns:
             command = re.sub(pattern, "", command)
         return command
@@ -2942,6 +2972,9 @@ class WorkerCommandsVerifier(BaseVerifier):
         result_hits: list[tuple[str, str]] = []
         # Logged cards' calls only the required checks read (see the log-row branch).
         beside_rows: list[str] = []
+        # Each log row to the first words of the lines its card typed after a
+        # first line, or None for a card whose lines are not known (see the grep cut).
+        typed_lines: dict[str, list[str] | None] = {}
         forbidding = bool(self.forbidden_patterns or self.forbidden_runs or self.forbidden_result_patterns)
         if self.after_result_pattern is None:
             # ``None`` stays an error even when the trajectory carries tagged calls: it
@@ -3005,6 +3038,30 @@ class WorkerCommandsVerifier(BaseVerifier):
                     joined.append(f"{count} tagged call{'' if count == 1 else 's'} of the logged cards, read by the required checks only")
                 if joined:
                     sources = f" ({len(logged_commands)} from the filed cards' logs, " + ", ".join(joined) + ")"
+            if self.exempt_grep_patterns:
+                # A row joins a typed newline into a space, so a dangling grep's
+                # pattern slot can hold the next line's first word. Where the
+                # card's typed calls reached the trajectory, their line breaks show
+                # it. A clip keeps a call's head only, and a call bash refuses has no
+                # lines to read, so a card with either keeps every grep row whole.
+                unread = _clipped_cards(snap.trajectory)
+                by_card: dict[str, list[str]] = {}
+                for card, _, command, _, _ in calls:
+                    openings = _typed_line_openings(command)
+                    if openings is None:
+                        unread.add(card)
+                    else:
+                        by_card.setdefault(card, []).extend(openings)
+                if "" in logged:
+                    every = None if unread else [word for openings in by_card.values() for word in openings]
+                    typed_lines = {row: every for row in logged_commands}
+                else:
+                    for row in snap.worker_commands:
+                        command, card = row.get("command", ""), str(row.get("task") or "")
+                        if card in unread or typed_lines.get(command, ()) is None:
+                            typed_lines[command] = None
+                        else:
+                            typed_lines.setdefault(command, []).extend(by_card.get(card, []))
             typed = logged_commands + children
             windowed = typed
         else:
@@ -3078,9 +3135,9 @@ class WorkerCommandsVerifier(BaseVerifier):
         # exemption touched is out of the required list. The forbidden list
         # reads the windowed commands (every command without a window).
         with_calls = typed + beside_rows
-        commands = [c for c in with_calls if self._without_exempt_text(c) == c]
+        commands = [c for c in with_calls if self._without_exempt_text(c, typed_lines.get(c, ())) == c]
         exempted = f" ({len(with_calls) - len(commands)} exempted)" if len(commands) < len(with_calls) else ""
-        graded = [(c, self._without_exempt_text(c)) for c in windowed]
+        graded = [(c, self._without_exempt_text(c, typed_lines.get(c, ()))) for c in windowed]
         missing = [p for p in self.required_patterns if not any(re.search(p, c) for c in commands)]
         hits = [(p, c, rest) for p in self.forbidden_patterns for c, rest in graded if re.search(p, rest)]
         hits += [(p, f"the result of {c[:_SHOWN_COMMAND_CHARS]}", f"the result of {c[:_SHOWN_COMMAND_CHARS]}") for p, c in result_hits]

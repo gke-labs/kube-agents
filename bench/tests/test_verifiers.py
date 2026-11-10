@@ -892,6 +892,69 @@ def test_worker_commands_exempt_command_does_not_satisfy_a_required_pattern():
     assert "across 0 command(s) (1 exempted)" in res.reason
 
 
+def _grep_cut_status(rows: list[str], typed: list[str], card: str | None = "t_1", clipped: bool = False) -> str:
+    """The verdict of a grep-cut check whose forbidden word is ``route``, on one card's rows
+    and typed calls; ``card=None`` stashes the rows with no card, as an older capture did,
+    and ``clipped`` sends each call as the pod sends one whose arguments it clipped."""
+    calls = [
+        {
+            "agent": "w",
+            "name": "terminal",
+            "task": "t_1",
+            "args": {"raw": json.dumps({"command": c})[:-2] + " ...[clipped 9 chars]"} if clipped else {"command": c},
+            "at": float(i),
+        }
+        for i, c in enumerate(typed)
+    ]
+    transcript.set("", calls, worker_commands=[{"task": card, "command": r} if card else {"command": r} for r in rows])
+    try:
+        res = WorkerCommandsVerifier(type="worker_commands", forbidden_patterns=["route"], exempt_grep_patterns=True).verify(5.0)
+    finally:
+        transcript.clear()
+    return res.status
+
+
+def test_worker_commands_grep_cut_refuses_a_row_whose_pattern_opened_a_typed_line():
+    # The row joins the typed newline into a space; the card's typed call
+    # shows that `route=1` began its own line, so the row is graded whole (#5237).
+    row = "grep -rn route=1 curl x"
+    assert _grep_cut_status([row], []) == "pass"
+    assert _grep_cut_status([row], ["grep -rn\nroute=1\ncurl x"]) == "fail"
+    assert _grep_cut_status([row], ["grep -rn\n   route=1 curl x"]) == "fail"
+    # The row collapses blanks inside quotes too.
+    assert _grep_cut_status(['grep -rn "route =1" curl x'], ['grep -rn\n"route   =1"\ncurl x']) == "fail"
+    # A leading redirection does not hide the line's first word: the row drops
+    # a spaced one, and the grep cut skips one to /dev/null.
+    for typed in ("grep -rn\n> /dev/null route=1\ncurl x", "grep -rn\n2>&1 route=1\ncurl x", "grep -rn\n</dev/null route=1\ncurl x"):
+        assert _grep_cut_status([row], [typed]) == "fail", typed
+    # An escaped backslash ends the line; only an odd run continues it.
+    assert _grep_cut_status(["grep -rn\\\\ route=1 curl x"], ["grep -rn\\\\\nroute=1\ncurl x"]) == "fail"
+    # The call is read whole, so a quote that spans lines does not hide the
+    # word in front of it.
+    for typed in ('grep -rn\nroute=1 X="\n"\ncurl x', "grep -rn\nroute=1 X='\n'\ncurl x"):
+        assert _grep_cut_status(['grep -rn route=1 X=" " curl x'], [typed]) == "fail", typed
+    # Rows that name no card are read against every typed call.
+    assert _grep_cut_status([row], ["grep -rn\nroute=1\ncurl x"], card=None) == "fail"
+
+
+def test_worker_commands_grep_cut_refuses_the_rows_of_a_card_with_an_unread_call():
+    # A clip keeps a call's head, so the lines that would show the join may be
+    # gone: the card's grep rows are graded whole.
+    assert _grep_cut_status(["grep -rn route f"], ["grep -rn route f"], clipped=True) == "fail"
+    assert _grep_cut_status(["grep -rn route f"], ["grep -rn route f"], card=None, clipped=True) == "fail"
+    # A call whose quotes do not balance has no lines to read either.
+    assert _grep_cut_status(["grep -rn route f"], ["grep -rn route f", "cat <<EOF\ndon't\nEOF"]) == "fail"
+
+
+def test_worker_commands_grep_cut_keeps_a_pattern_that_opened_no_typed_line():
+    # A grep on the first line, a line after a continuation, and a line that
+    # only starts with the pattern's characters keep the cut.
+    row = "grep -rn route f ls"
+    for typed in ("grep -rn route f\nls", "grep -rn \\\nroute f ls", "grep -rn route f\nroutes ls"):
+        assert _grep_cut_status([row], [typed]) == "pass", typed
+    assert _grep_cut_status(["grep -rn route f"], ["grep -rn route f | head -20"]) == "pass"
+
+
 def test_worker_commands_is_registered_under_its_type():
     assert "worker_commands" in VERIFIERS
 

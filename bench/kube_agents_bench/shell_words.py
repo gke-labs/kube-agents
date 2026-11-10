@@ -380,6 +380,12 @@ def _command_word_index(
 
 
 def _without_grep_patterns(command: str) -> str | None:
+    """The command line as :func:`_grep_cut` leaves it; None when the line is not one such grep."""
+    cut = _grep_cut(command)
+    return None if cut is None else cut[0]
+
+
+def _grep_cut(command: str) -> tuple[str, list[str]] | None:
     """The command line as its shell words joined by spaces, with the grep's pattern argument
     removed (the first positional word, or each ``-e``/``--regexp=`` value when one is given);
     None when the line is not one such grep. The line is a ``grep``, ``egrep`` or ``fgrep`` named
@@ -392,7 +398,8 @@ def _without_grep_patterns(command: str) -> str | None:
     onto the row. Quotes come off, as the shell reads the line; a line bash refuses yields None.
     A card log row that joined a second typed line onto the grep is one row here, so a line
     that reads the removed word back (``$_``, a variable the pattern assigned) is read as an
-    operand: the limit ``exempt_patterns`` had too."""
+    operand: the limit ``exempt_patterns`` had too. The removed words come second, as the shell
+    reads them."""
     if _COLLAPSED_CHAIN_RE.search(command):
         return None
     # The reader keeps every quoted, escaped or in-word `#` and a span's text whole, so a `#` it
@@ -456,4 +463,32 @@ def _without_grep_patterns(command: str) -> str | None:
     removed = set(patterns) if given else set(positionals[:1])
     if not removed:
         return None
-    return " ".join(word for k, word in enumerate(words) if k not in removed)
+    return " ".join(word for k, word in enumerate(words) if k not in removed), [words[k] for k in sorted(removed)]
+
+
+def _typed_line_openings(command: str) -> list[str] | None:
+    """The first word of each line after the first of a typed command, as the shell reads it
+    and with its blanks collapsed as a card log row has them: the word a row joins onto the
+    line above it. The command is read whole, so a quote that spans lines, a line
+    continuation and an escaped backslash are read as bash reads them. Leading redirections
+    and their targets are skipped, since the row's rendering drops a spaced one and the grep
+    cut skips one to /dev/null. None when bash refuses the line (an open quote): it still
+    runs the lines before the error, and the lines are not known."""
+    words, _ = _shell_words_and_spans(command)
+    if not words:
+        return None if command.strip() else []
+    openings: list[str] = []
+    for index, word in enumerate(words):
+        if not (isinstance(word, _ShellOperator) and word == _SHELL_LINE_END):
+            continue
+        index += 1
+        while index < len(words):
+            if _is_redirect(words[index]):
+                index += 2
+            elif words[index].isdigit() and index + 1 < len(words) and _is_redirect(words[index + 1]):
+                index += 1
+            else:
+                break
+        if index < len(words) and not isinstance(words[index], _ShellOperator):
+            openings.append(" ".join(words[index].split()))
+    return openings
