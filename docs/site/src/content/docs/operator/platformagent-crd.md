@@ -623,6 +623,12 @@ instead. That line is load, not a fault. The older
 `kanban dispatcher stuck: … Check profile health` warning now means what it says: slots were free
 and still nothing started.
 
+That warning waits for six ticks, so a short saturation would leave no trace. Each user card that
+waits therefore also writes one `kanban priority: <id> queued …` line to the gateway log on the tick
+it is queued. The line says how many user cards are ahead of it, names the cards that held the
+slots and ends with the same held-back clause, so the wait is readable back afterwards. The card's
+`queued` event on the board carries the holders' ids as well.
+
 The arithmetic behind `6`:
 
 - **Gateway memory.** One worker measured about 430 MiB on a live install: `hermes chat` 207 MiB,

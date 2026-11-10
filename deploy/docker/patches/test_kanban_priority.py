@@ -853,8 +853,16 @@ class SaturationAndQueuedTest(unittest.TestCase):
             spawned, res = b.tick(cap=2)
         self.assertEqual(spawned, [])
         self.assertEqual(res.queued_noticed, ["waiting"])
-        self.assertEqual(b.queued("waiting")[0][kp.HOLDERS_KEY], ["u-run"])
-        self.assertTrue(any("1/2 worker slots busy (0 background, 1 user: u-run" in line for line in logs.output), logs.output)
+        event = b.queued("waiting")[0]
+        self.assertEqual(event[kp.HOLDERS_KEY], ["u-run"])
+        self.assertEqual((event["reserved_user"], event["reserved_background"]), (1, 0))
+        lines = [line for line in logs.output if "waiting queued" in line]
+        self.assertEqual(len(lines), 1, logs.output)
+        self.assertIn("1/2 worker slots busy (0 background, 1 user: u-run", lines[0])
+        self.assertTrue(
+            lines[0].endswith("; 1 user card(s) held back because one slot is reserved for background triage"),
+            lines[0],
+        )
 
     def test_a_new_wait_after_a_claim_is_noticed_again(self):
         b = self._full()
