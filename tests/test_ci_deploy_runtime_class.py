@@ -52,7 +52,7 @@ class CiDeployRuntimeClassTest(unittest.TestCase):
 
 
 class HelmRendersWithoutRuntimeClassTest(unittest.TestCase):
-    """The override actually removes the field, rather than setting it to "".
+    """The override actually removes the field from the PlatformAgent, rather than setting it to "".
 
     `compactFields` drops an all-unset `availability` block, so the empty value
     has to reach the template as empty rather than as the string "gvisor" that
@@ -83,7 +83,11 @@ class HelmRendersWithoutRuntimeClassTest(unittest.TestCase):
             capture_output=True,
             text=True,
         ).stdout
-        self.assertNotIn("runtimeClassName", rendered)
+        # The PlatformAgent alone: the gateway pod admission policy's CEL names
+        # the field it refuses, and that text is not a pod's runtime class.
+        crs = [d for d in re.split(r"(?m)^---\s*$", rendered) if re.search(r"(?m)^kind: PlatformAgent\s*$", d)]
+        self.assertEqual(len(crs), 1, "the release renders one PlatformAgent")
+        self.assertNotIn("runtimeClassName", crs[0])
 
 
 if __name__ == "__main__":

@@ -512,23 +512,13 @@ Agents don't ask for a specific model. They send the name
 `model-default`, and LiteLLM decides which model that means and how hard it thinks. LiteLLM also
 edits requests with a few plugins (for example, one that strips old thinking text). So a pull
 request that changes any of that sends exactly the same requests as before, and without extra care
-it would get answers from the old setup. To stop that, the key also includes a fingerprint of
-LiteLLM's config, the LiteLLM image version, and the normalizer's version hash.
-
-The config fingerprint covers what changes the answer and leaves out how the request gets to the
-model. It covers the model name, the settings sent with each request (maximum tokens, thinking or
-reasoning effort, the backup model, which parameters are dropped), and the plugins that change what
-the model is sent or what comes back (the thinking-text and cache-marker strippers, and redaction
-with its rules). It treats LiteLLM's two routes to Google's Gemini models as one, so
-`vertex_ai/gemini-4-argon` and `gemini/gemini-4-argon` count as the same model; any other provider,
-and the server address of an OpenAI-compatible endpoint, stay in. It leaves out the gateway's
-timeout and retry settings and the plugins that only export telemetry, fetch a credential or pick a
-serving replica. The nightlies reach Gemini through the Gemini Developer API and the presubmits
-through Vertex AI; with the provider in the fingerprint, no presubmit could ever find a nightly's
-answer. Once both call the model through one API, the key goes back to the whole config, the
-`checksum/config` annotation that rolls the LiteLLM pods. The chart computes the fingerprint
-(`kube-agents.replayModelBehaviourChecksum` in `charts/kube-agents/templates/_helpers.tpl`) and
-gives it to the proxy as `REPLAY_MODEL_BEHAVIOUR_CHECKSUM`.
+it would get answers from the old setup. To stop that, the key also includes LiteLLM's config
+fingerprint (the chart already keeps one, in the `checksum/config` annotation), the LiteLLM image
+version, and the normalizer's version hash. The config includes the provider route, so moving a
+model between the Gemini Developer API and Vertex AI counts as a model change. The nightly and
+presubmit eval jobs each set their provider in their own Prow job config, kept equal by hand, so if
+the two ever diverge, their replay keys stop matching: that is safe, but replay then serves nothing
+across the lanes.
 
 **Backup-model answers are never saved.** LiteLLM can be set up with a backup it uses when the main
 model fails. The backup is the same model with less thinking, so the model name in the reply looks

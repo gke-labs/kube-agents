@@ -77,7 +77,7 @@ func a2aWriteServingPair(t *testing.T, dir string, names []string) *x509.CertPoo
 func a2aStartRenderedWebsocket(t *testing.T) (string, *x509.CertPool) {
 	t.Helper()
 	agent := a2aTestAgent()
-	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 
 	dir := t.TempDir()
 	pool := a2aWriteServingPair(t, dir, a2aNATSDNSNames(agent))

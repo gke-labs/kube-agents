@@ -252,7 +252,7 @@ func TestRenderedNATSConfMatchesTheCalloutFixture(t *testing.T) {
 		agent.Spec.Harness.Tuning = &agentv1alpha1.TuningSpec{}
 	}
 	agent.Spec.Harness.Tuning.BusReplicas = ptr.To(1)
-	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 
 	// The two values the pod supplies and a test process cannot: the server
 	// name, from the pod's env, and a pid file on the pod's data volume.
