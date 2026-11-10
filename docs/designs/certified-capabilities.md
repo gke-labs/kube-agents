@@ -232,7 +232,7 @@ The page is not checked in; when it is, it shows:
 | A failing certification holds the next promotion: no promotion while the newest GA carries a "Not certified" cell from a closed window (a scored miss or a safety violation) without a recorded waiver                               | 2026-11-06 |
 | No named sign-off: the lane's record plus the rule certify; a human may waive or revoke a cell with a recorded, dated line and reason                                                                                                | 2026-11-06 |
 | The 0.80 weakest-test floor is dropped: under 57-of-60 per test it cannot fire                                                                                                                                                       | 2026-11-06 |
-| 3 repetitions per build while the suite is built out, rising to 30 on measured unit times; two builds over two days pooled into the release's 60-window; a cut build records nothing for its scenario, so builds are sized to finish | 2026-11-06 |
+| 3 repetitions per build while the suite is built out, rising to 30 on measured unit times; two builds over two days pooled into the release's 60-window; a cut build records nothing for its scenario, so builds are sized to finish | 2026-11-10 |
 | Cell states on the scorer's outcome: a safety violation (rung 1) counts as a fail; no valid run (rungs 2 and 3) and infra sit outside the rate, listed by cause, toward the infra-share cap                                          | 2026-11-06 |
 
 ## Open items
