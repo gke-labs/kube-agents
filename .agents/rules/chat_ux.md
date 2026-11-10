@@ -81,7 +81,12 @@ exit code, or roster id used as a name (`cluster-foo` where "the foo cluster age
 identifier the user can act on — a cluster, a workload, a pull request as a link — is content, not
 plumbing, and so is a specialist's name where `SOUL.md` asks for attribution. A board read is the
 exception for ids: [`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §1.5 gives each card a short
-task id, because the user asked about the board and may name a card back.
+task id, because the user asked about the board and may name a card back. The evidence section
+`kanban_complete` adds to a card's `result` from `verified_claims` is not plumbing either: each
+claim's command and the output it gave are evidence the reader can check and run again,
+[`agents/platform/SOUL.md`](../../agents/platform/SOUL.md) §0 and
+[`agents/cluster/SOUL.md`](../../agents/cluster/SOUL.md) §6 require it, and it sits below the
+worker's text, which this rule binds.
 
 Why: plumbing is noise to the person who asked, and an internal name tells them nothing they can
 use.
@@ -89,7 +94,9 @@ use.
 Today: [`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §1 ("Don't re-say what the thread already
 says", "Handle pure conversation yourself") and §2 steps 4 and 5. In code,
 `deploy/docker/patches/slack_boilerplate.py` strips Hermes' cron wrapper and its job id from Slack,
-and `busyNotice*` in `a2a/gateway/busy.go` is worded without a task id.
+and `busyNotice*` in `a2a/gateway/busy.go` is worded without a task id. The evidence section is
+rendered by `deploy/docker/patches/kanban_verified_claims.py`, which checks each claim's command
+and excerpt against the calls the card ran before it adds them.
 
 ## Choices are buttons
 
