@@ -689,3 +689,39 @@ func TestAChatTypedStopWhoseCloseFailsPostsTheNotice(t *testing.T) {
 		}
 	}
 }
+
+// A Stop press on Google Chat from a member the allowlist does not admit
+// posts nothing: the press asked the bot for nothing, and the unverified
+// sender's notice, which names the presser, would land in a thread the
+// space reads. The task runs on. (A typed message from the same member
+// still gets the notice once.)
+func TestAChatStopPressFromAnUnlistedMemberPostsNoNotice(t *testing.T) {
+	r := startGchatRig(t, []string{"user@example.com"}, false)
+	conv := "gchat:spaces/S1/threads/T-unlisted-press"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "user@example.com", MessageID: "spaces/S1/messages/M1", Text: "explain node upgrades"}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	if err := exec.PublishStatus(context.Background(), lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the working line", func() bool {
+		lines := r.adapter.stopLinesCopy()
+		return len(lines) > 0 && strings.Contains(lines[len(lines)-1].Text, "working")
+	})
+	line := r.adapter.stopLinesCopy()[0].MessageID
+	before := len(r.adapter.postTextsFor(conv))
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "nobody@example.com", MessageID: line + "#t1", Intent: IntentCancel, TaskID: origin.TaskID, Click: true}
+	// The same member's typed message is handled after the press, in
+	// order, and gets the notice: once it is posted, the press is behind us.
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "nobody@example.com", MessageID: "spaces/S1/messages/M2", Text: "hello"}
+	awaitPostIn(t, r, "the typed message's unverified notice", conv, "I can't verify who you are")
+	posts := r.adapter.postTextsFor(conv)
+	if n := len(posts) - before; n != 1 {
+		t.Fatalf("the press and the message posted %d line(s): %q; want the message's notice alone", n, posts[before:])
+	}
+	if slices.ContainsFunc(inSubjectEnvelopes(t, r.url, "platform"), func(e *lib.Envelope) bool {
+		return e.TaskID == origin.TaskID && e.Kind == lib.KindCancel
+	}) {
+		t.Fatal("an unlisted member's press cancelled the task")
+	}
+}
