@@ -167,6 +167,34 @@ class PublishTest(unittest.TestCase):
         self.publisher.publish()
         self.assertEqual(json.loads(self.bucket.objects()[f"replay-cache/{VERSION}/slots/{fp(10)}.json"]), fp(2))
 
+    def test_a_pointer_whose_answer_is_already_up_wins_over_one_that_may_fail_to_go_up(self):
+        # The other pod's answer went up on an earlier call; the earlier pod's
+        # (sorting first) is graded only now, and its upload fails. The slot
+        # still goes up, with the pointer whose answer is in the bucket.
+        earlier = os.path.join(self.keep, "pods", EARLIER_POD)
+        mine = self.world.request(worker("t_11111111"), fp(1), recorded=True)
+        theirs = self.world.request(worker("t_22222222"), fp(2), recorded=True)
+        self.answer(1, pod_dir=earlier)
+        self.write_logs(pod_dir=earlier, lines=[mine])
+        self.world.run("case-a", 2, "pass", ["t_22222222"])
+        self.answer(2)
+        self.write_logs(lines=[theirs])
+        self.assertEqual(self.publisher.publish()["uploaded"], {"answers": 1})
+        self.cache_file(f"slots/{fp(10)}.json", json.dumps(fp(1)), pod_dir=earlier)
+        self.cache_file(f"slots/{fp(10)}.json", json.dumps(fp(2)))
+        self.world.run("case-a", 1, "pass", ["t_11111111"])
+        bucket = self.bucket
+
+        def answers_fail(kind, cmd, timeout, input=None, env=None):
+            if "/answers" in cmd[-1]:
+                bucket.calls.append((kind, list(cmd)))
+                return None
+            return bucket(kind, cmd, timeout, input=input, env=env)
+
+        self.publisher.run = answers_fail
+        self.publisher.publish(final=True)
+        self.assertEqual(json.loads(self.bucket.objects()[f"replay-cache/{VERSION}/slots/{fp(10)}.json"]), fp(2))
+
     def test_a_slot_kept_after_its_answer_went_up_follows_it(self):
         self.world.run("case-a", 1, "pass", ["t_11111111"])
         self.world.request(worker("t_11111111"), fp(1), recorded=True)

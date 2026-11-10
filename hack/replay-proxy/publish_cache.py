@@ -279,8 +279,13 @@ def select(keep_dir: str, verdicts_dir: str, final: bool, state: Optional[State]
                 slots.append((version, name, path, target))
     # A pointer is a candidate only once its answer is selected or already up,
     # so one to an answer that will not go up never takes the name from one
-    # whose answer will.
-    for version, name, path, target in slots:
+    # whose answer will. One whose answer is already up goes first: a failed
+    # answer upload in this call then cannot cost the slot.
+    def already_up(slot: Tuple[str, str, str, str]) -> bool:
+        version, _, _, target = slot
+        return (version, f"{ANSWERS}/{target}{JSON_SUFFIX}") in state.done
+
+    for version, name, path, target in sorted(slots, key=lambda slot: not already_up(slot)):
         answer = f"{ANSWERS}/{target}{JSON_SUFFIX}"
         if answer in selection.objects.get(version, {}).get(ANSWERS, {}) or (version, answer) in state.done:
             selection.add(version, SLOTS, name, path)
