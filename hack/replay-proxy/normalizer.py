@@ -688,9 +688,17 @@ class Mapping:
         for cls, pattern, group in ID_CLASSES:
             text = Normalizer.sub_group(pattern, group, lambda v: self.bound(v) or v, text)
         text = IPV4_RE.sub(lambda m: self.bound(m.group(0)) or m.group(0), text)
-        text = HEX_RUN_RE.sub(lambda m: self.bound_commit(m.group(0)) or m.group(0), text)
+        text = self.swap_bare_commits(text)
         for pattern in TIMESTAMP_PATTERNS:
             text = pattern.sub(lambda m: self.bound_time(m.group(0)) or m.group(0), text)
+        return self.swap_whole_tokens(text)
+
+    def swap_bare_commits(self, text: str) -> str:
+        """Swap each whole run of hex that is a bound commit for its placeholder."""
+        return HEX_RUN_RE.sub(lambda m: self.bound_commit(m.group(0)) or m.group(0), text)
+
+    def swap_whole_tokens(self, text: str) -> str:
+        """Swap each bound value where it is a whole token, longest first; a suffix class's may follow `-` or `_`."""
         for value, token in sorted(self.swappable_values().items(), key=lambda kv: len(kv[0]), reverse=True):
             if value not in text:
                 continue
@@ -848,6 +856,9 @@ class Normalizer:
         # Whether a value in any object or list enclosing the one being walked
         # holds a time of day (timed): then no date in it is day-counted.
         self.time_beside = False
+        # Whether the message being walked is an assistant message (walk_message):
+        # then text() also swaps bound values as Mapping.apply_to_answer does.
+        self.in_answer = False
         # Per-request caches: a string's parsed JSON document (nested_json),
         # whether a string or container holds a time of day (timed), and a
         # string's TimeIndex, so each is computed once however often it is asked.
@@ -879,6 +890,15 @@ class Normalizer:
                 return {item[1]: value for item, value in zip(items, walked)}
             return walked
         return obj
+
+    def walk_message(self, message: Any) -> Any:
+        """Walk one request message; an assistant message's text also gets the answer-only swaps (text)."""
+        outer = self.in_answer
+        self.in_answer = isinstance(message, dict) and message.get(ROLE_FIELD) == ASSISTANT_ROLE
+        try:
+            return self.walk(message)
+        finally:
+            self.in_answer = outer
 
     def replacement(self, obj: Any, key: Optional[str], in_tool_call: bool) -> Optional[Callable[[], Any]]:
         """What `walk` swaps `obj` for whole (a placeholder or token), as a call, or None when it walks into it."""
@@ -1057,7 +1077,19 @@ class Normalizer:
         return False
 
     def text(self, text: str, strip: bool = True) -> str:
-        """Normalize a string; `strip` False leaves a recent-work digest in (digest_guards reads one so)."""
+        """Normalize a string; `strip` False leaves a recent-work digest in (digest_guards reads one so).
+
+        In an assistant message (in_answer), the values bound so far are first
+        swapped as Mapping.apply_to_answer swaps them beyond the identifier
+        patterns: a bound commit as a bare run of hex, and a bound value as a
+        whole token outside its pattern (`clone-<tmpname>`). A served answer
+        comes back in the next request's history with this run's values where
+        the recording had its own, so both must key the same. Before the
+        identifier patterns, which would bind part of such a token afresh (the
+        uuid of `old_<operation>`); after the age columns, which read positions.
+        It binds nothing, and a value it swaps in a pattern's shape is the
+        placeholder that pattern would have given it.
+        """
         text = warnings_last(text)
         nested = self.nested_json(text)
         if nested is not None:
@@ -1066,6 +1098,8 @@ class Normalizer:
             self.digest_guards(text)
             text = strip_recent_work(text)
         text = self.age_columns(text)
+        if self.in_answer:
+            text = self.mapping.swap_whole_tokens(self.mapping.swap_bare_commits(text))
         for cls, pattern, group in ID_CLASSES:
             text = self.sub_group(pattern, group, lambda v, c=cls: self.mapping.placeholder(c, v), text)
         text = self.timestamps(text)
@@ -1349,7 +1383,7 @@ def normalize_request(body: Dict[str, Any], now: float) -> NormalizedRequest:
     # a slot blanks an answer's words, so a position counted there could shift.
     for message in raw_messages if isinstance(raw_messages, list) else []:
         normalizer.time_literals = []
-        messages.append(normalizer.walk(message))
+        messages.append(normalizer.walk_message(message))
         if not (isinstance(message, dict) and message.get(ROLE_FIELD) == ASSISTANT_ROLE):
             normalizer.mapping.time_occurrences += normalizer.time_literals
     history_mapping = normalizer.mapping.copy()
@@ -1454,7 +1488,7 @@ def answer_after(normalized: NormalizedRequest, answer: Any) -> str:
     walker = Normalizer(normalized.now, normalized.keep_ips)
     walker.mapping = normalized.history_mapping.copy()
     message = dict(answer, role=ASSISTANT_ROLE) if isinstance(answer, dict) else answer
-    return answer_identity(walker.walk(message))
+    return answer_identity(walker.walk_message(message))
 
 
 def answer_variant(normalized: NormalizedRequest, answer: Any, context: KeyContext) -> Tuple[str, str]:

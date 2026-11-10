@@ -167,7 +167,10 @@ The rules that keep this safe:
   `--id=t_…` or `~/.hermes/sessions/<session>/` in an answer is swapped wherever the key swapped
   it. A tool call's JSON arguments are read as the key reads them, parsed first. Anything else the
   request bound is swapped only where it is a whole token, and an unrelated `99` in an answer
-  never becomes this run's row id. Ages are never swapped into an answer (below).
+  never becomes this run's row id. Ages are never swapped into an answer (below). The key gives
+  each assistant message in a request's history the same whole-token and bare-commit swaps, with
+  the values bound before it, so a served answer that comes back on the next turn with this run's
+  values keys as the recording's did.
 - **An answer that would keep an identifier isn't saved.** After the rewrite, if the answer still
   holds an identifier or IP the request bound, anywhere, it isn't saved, because a replay would act
   on the recording's card or pod. Nor is one that names an identifier the request never bound, like
