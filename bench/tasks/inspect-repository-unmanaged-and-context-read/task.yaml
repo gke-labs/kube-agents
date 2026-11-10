@@ -85,12 +85,12 @@
 #     `&>/dev/null` trailer, which a typed card keeps.
 #   - A card log row joins a second typed line onto the grep with a space, so
 #     a second line could read the removed pattern back from the shell. The
-#     grep is graded whole when its pattern assigns a variable or an array
-#     element as it expands (`${X:=...}`, `${A[0]=...}`), when another word on
-#     the row reads the last argument (`$_`) or a variable through another
-#     (`${!x}`), or when the row holds an ANSI-C quote (`$'...'`). A
-#     single-quoted lookalike is graded whole too, and another read-back
-#     (`declare -p`, `history`) is not seen.
+#     grep is graded whole when its pattern assigns a variable as it expands
+#     (`${X:=...}`) or expands an array element (`${A[...]...}`), when
+#     another word on the row reads the last argument (`$_`) or a variable
+#     through another (`${!x}`), or when the row holds an ANSI-C quote
+#     (`$'...'`). A single-quoted lookalike is graded whole too, and another
+#     read-back (`declare -p`, `history`) is not seen.
 #   - The required run also reads each card's tagged call as typed, so a
 #     clone chained behind another command, or inside a shell heredoc
 #     (`bash <<'EOF' … clone … EOF`), is credited when the call reached the

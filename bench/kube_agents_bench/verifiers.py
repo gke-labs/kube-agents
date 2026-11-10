@@ -2794,8 +2794,9 @@ class WorkerCommandsVerifier(BaseVerifier):
     taken as the pattern and the real one is graded. A card log row that joined
     a second typed line onto a grep is one row to it, so the exemption refuses a
     row on which a later word could read the removed word back: a pattern that
-    assigns a variable or an array element as it expands (``${NAME:=…}``,
-    ``${NAME[0]=…}``; an arithmetic ``$((NAME=…))`` is a substitution),
+    assigns a variable as it expands (``${NAME:=…}``, ``${NAME=…}``) or
+    expands an array element at all (``${NAME[…]…}``, whose subscript can
+    nest; an arithmetic ``$((NAME=…))`` is a substitution),
     another word that reads the last argument (``$_``, ``${_}``) or a
     variable through another (``${!NAME}``), or an ANSI-C quote (``$'…'``)
     anywhere, whose escapes can spell either. The words are read with their

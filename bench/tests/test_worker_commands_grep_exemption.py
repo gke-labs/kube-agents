@@ -170,6 +170,9 @@ def test_a_single_quoted_lookalike_of_a_substitution_is_exempt():
         pytest.param(f'grep "${{X:=curl -s -X POST {URL}}}" SKILL.md $X', id="assigning-expansion"),
         pytest.param(f'grep "${{X=curl {URL}}}" SKILL.md', id="assigning-expansion-unset-only"),
         pytest.param(f'grep "${{A[0]:=curl -s -X POST {URL}}}" SKILL.md $A', id="assigning-array-element"),
+        # A subscript is arithmetic and can nest brackets or braces, so any is refused.
+        pytest.param(f'grep "${{A[a[0]]:=curl {URL}}}" SKILL.md $A', id="assigning-nested-subscript"),
+        pytest.param(f'grep "${{A[${{i}}]:=curl {URL}}}" SKILL.md $A', id="assigning-braced-subscript"),
         # `$_` spelled through an ANSI-C escape, or read through another variable.
         pytest.param(f"grep -rq 'curl -s -X POST {URL}' eval $'\\x24_'", id="ansi-c-quote"),
         pytest.param(f"grep -rq 'curl {URL}' ${{!x}}", id="indirect-expansion"),

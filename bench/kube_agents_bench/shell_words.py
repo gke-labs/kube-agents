@@ -101,9 +101,11 @@ _GREP_OUTPUT_SINK = "/dev/null"
 # typed line onto it with a space, so a comment there would hide that line from the grading.
 _COMMENT_CHAR = "#"
 _COLLAPSED_CHAIN_RE = re.compile(r"\s\+\s\d+\scommand(?:s|\(s\))?\s*$")
-# A pattern that assigns a variable or an array element as it expands (`${NAME=…}`,
-# `${NAME:=…}`, `${NAME[0]:=…}`): a word the rendering joined on from the next line can run it.
-_ASSIGNING_EXPANSION_RE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*(?:\[[^]]*\])?:?=")
+# A pattern that assigns a variable as it expands (`${NAME=…}`, `${NAME:=…}`), or expands an
+# array element at all (`${NAME[…]…}`): a word the rendering joined on from the next line can run
+# what it assigned. A subscript is an arithmetic expression that can nest brackets and braces
+# (`${A[a[0]]:=…}`, `${A[${i}]:=…}`), so any subscript is refused rather than parsed.
+_ASSIGNING_EXPANSION_RE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*(?::?=|\[)")
 # A word that reads the last argument of the command before it back (`$_`, `${_}`, `${_:…}`),
 # or reads a variable through another (`${!NAME}`), which can name `_`.
 _LAST_ARGUMENT_RE = re.compile(r"\$(?:_(?![A-Za-z0-9_])|\{_(?![A-Za-z0-9_])|\{!)")
@@ -419,7 +421,7 @@ def _without_grep_patterns(command: str) -> str | None:
     onto the row. Quotes come off, as the shell reads the line; a line bash refuses yields None.
     A card log row that joined a second typed line onto the grep is one row here, so the line
     is also refused when a later word could read the removed word back: a pattern that assigns
-    a variable as it expands, another word that reads the last argument (``$_``) or a variable
+    a variable as it expands or expands an array element, another word that reads the last argument (``$_``) or a variable
     through another (``${!NAME}``), or an ANSI-C quote (``$'…'``) anywhere, whose escapes can
     spell either."""
     if _COLLAPSED_CHAIN_RE.search(command):
