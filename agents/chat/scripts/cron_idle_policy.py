@@ -41,13 +41,18 @@ under the same ``.jobs.lock`` Hermes takes, before the ticker looks for due
 work. Held timestamps are computed with ``croniter`` on the expression's own
 lattice, in the zone Hermes evaluates the expression in (``HERMES_TIMEZONE``,
 else the profile's ``config.yaml`` ``timezone``, else UTC), so a held audit
-still fires at its usual hour; an ``interval`` schedule is held by its period
+still fires at its usual hour, and written in that zone, as Hermes writes
+its own (:func:`stamp`); an ``interval`` schedule is held by its period
 instead. Hermes leaves a stored ``next_run_at`` alone until the job is claimed
-or finishes, with one exception that matters here: its due scan re-arms a job
+or finishes, with two exceptions that matter here. Its due scan re-arms a job
 whose last run ended in ``error`` to the next legal slot when that is earlier
 than the stored one, which undoes a throttle hold on such a job every day. No
 extra run comes of it (the hold is written again before Hermes scans), but the
-hold line repeats daily and the release on wake finds nothing to rewind.
+hold line repeats daily and the release on wake finds nothing to rewind. And
+a due instant whose offset is not now's, with a wall clock later than now's,
+is moved to the next slot without a run, as a timezone migration: a UTC
+stamp in a zone west of UTC reads exactly like that when it comes due, so a
+hold written in UTC would cost the job one more period than the hold.
 
 **A run asked for by hand is not held.** ``hermes cron run <job-id>`` (and
 ``cron.jobs.trigger_job``, the call behind it and behind the first-run
@@ -440,6 +445,20 @@ def next_occurrence(
         return None
 
 
+def stamp(when: datetime, zone: tzinfo) -> str:
+    """``when`` as Hermes writes ``next_run_at``: in the profile's zone.
+
+    Hermes compares a due instant's stored offset with now's before it fires
+    and, when they differ and the stored wall clock reads later than now's,
+    re-anchors the job without firing (``_repair_timezone_shifted_cron``, a
+    timezone-migration repair). A UTC stamp in a zone west of UTC reads
+    exactly like that, so every slot this module and the catch-up policy
+    compute is written in the zone, with the slot's own offset on either
+    side of a DST change.
+    """
+    return when.astimezone(zone).isoformat()
+
+
 def marked_by_hand(job: dict) -> bool:
     """Whether the job's ``next_run_at`` is a request rather than a scheduled slot.
 
@@ -597,9 +616,9 @@ def _apply_locked(
                 else:
                     target = _release_target(job, now, zone)
                     if target is not None:
-                        job["next_run_at"] = target.isoformat()
+                        job["next_run_at"] = stamp(target, zone)
                         changed = True
-                        lines.append(f"{label}: released {job_id}; next run {target.isoformat()}")
+                        lines.append(f"{label}: released {job_id}; next run {job['next_run_at']}")
             continue
         if stage == STAGE_ACTIVE or not _due(job, now):
             continue
@@ -608,10 +627,10 @@ def _apply_locked(
         target = _hold_target(job, stage, now, throttle_days, zone)
         if target is None or target <= now:
             continue
-        job["next_run_at"] = target.isoformat()
-        held[job_id] = {"next_run_at": target.isoformat(), "stage": stage}
+        job["next_run_at"] = stamp(target, zone)
+        held[job_id] = {"next_run_at": job["next_run_at"], "stage": stage}
         changed = True
-        lines.append(f"{label}: held {job_id} until {target.isoformat()} ({stage})")
+        lines.append(f"{label}: held {job_id} until {job['next_run_at']} ({stage})")
 
     # A record for a job that left the roster, or was disabled, is history.
     for job_id in list(held):
