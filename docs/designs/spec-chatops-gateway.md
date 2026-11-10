@@ -2228,7 +2228,9 @@ write to this table grants a principal - it is an impersonation primitive, and i
 emails besides. Write access is the install admin's, through the install path. No
 product ServiceAccount (gateway, platform-agent, broker, session workers) gets write on
 it, so nothing an agent can be talked into doing edits its own identity table; the
-conformance suite's D1 holds that no Role the operator mints names `secrets`. A
+conformance suite's D1 holds that no Role the operator mints grants write verbs on
+`secrets` (only `kubeagents:minimal` holds read-only `get`/`list`/`watch` on `secrets` for
+`<agent>-kube-proxy`'s redacted metadata path). A
 `principalMapSecretRef` on `spec.integration.slack`, not built, would let an install bind
 another name and make write authority "may write the PlatformAgent CR", with changes in
 the API server audit log. Generating

@@ -4300,11 +4300,11 @@ class SessionRoleExecutableTest(unittest.TestCase):
     def test_the_shell_is_refused_kubectl_while_the_roleless_caller_passes_a_file_argument(self):
         with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
             status, body = self.post_as(
-                credential_proxy.CALLER_ROLE_SHELL, {"argv": ["kubectl", "get", "-f", "x.yaml"]}
+                credential_proxy.CALLER_ROLE_SHELL, {"argv": ["kubectl", "rollout", "history", "-f", "x.yaml"]}
             )
         self.assertEqual(403, status)
         self.assertEqual(credential_proxy.RULE_CALLER_EXECUTABLE, body["rule"])
-        status, body = self.post_as("", {"argv": ["kubectl", "get", "-f", "x.yaml"]})
+        status, body = self.post_as("", {"argv": ["kubectl", "rollout", "history", "-f", "x.yaml"]})
         self.assertEqual(200, status, body)
 
     def test_a_metrics_read_from_a_session_is_refused_as_a_flag_before_the_policy(self):
