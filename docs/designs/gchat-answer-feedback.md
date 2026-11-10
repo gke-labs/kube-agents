@@ -170,9 +170,10 @@ not remember. A tap older than the one that filled the buttons on record does no
 rewrite after a restart of a question the adapter
 no longer remembers takes its buttons from the event's copy of the message, for which the button
 struct also decodes `type` and `altText`. The rating memory starts empty after a restart, so
-the filled state then comes from the event's copy, and the bucket still holds the rating. The restart-recovery of a choice click's link
-buttons (`gchatMessageButtons`) tells the three kinds apart by function and link, not by index.
-Buttons are classified by `onClick.action.function` (`kage.choice`, `kage.feedback`,
+the filled state then comes from the event's copy, and the bucket still holds the rating. After a
+restart a choice click's rewrite takes every button from the event's copy of the message
+(`gchatEventLayout`), and `gchatMessageButtons` reads the clicked choice's label and the rating
+from it, telling the kinds apart by function and link, not by index. Buttons are classified by `onClick.action.function` (`kage.choice`, `kage.feedback`,
 `kage.feedback-note`) or `onClick.openLink`; a click on the Stop button's `kage.stop` never reaches
 this, since `classifyClick` dispatches it by that function first (spec-chatops-gateway.md "The Stop
 button").
