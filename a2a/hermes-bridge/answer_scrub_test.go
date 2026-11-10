@@ -1095,3 +1095,29 @@ func TestSeenSecrets_AnExactJSONValueAlsoTracksItsTrimmedForm(t *testing.T) {
 		}
 	}
 }
+
+// A failed CLI run's tails are scrubbed before they are cut to the size
+// the reason quotes: a private key whose header is further from the end
+// than that, and a labelled value that crosses the cut, are redacted.
+func TestFailureTailsAreScrubbedBeforeTheCut(t *testing.T) {
+	_, url := startServer(t)
+	startBridge(t, url, script(t, `echo "-----BEGIN RSA PRIVATE KEY-----"
+i=0
+while [ $i -lt 60 ]; do echo "SYNTHKEYBODYc3ludGhldGljLWtleS1ib2R5LWxpbmUtc3ludGhldGljLWtleS1i"; i=$((i+1)); done
+echo "-----END RSA PRIVATE KEY-----"
+{ printf 'password: Synth-'; head -c 3000 /dev/zero | tr '\0' 'q'; printf 'Z9tail\n'; } >&2
+exit 1`))
+	c := gatewayClient(t, url)
+	submit(t, c, "task-fail-cut", "doomed")
+	task := waitTerminal(t, c, "task-fail-cut")
+	reason := terminalReason(t, task)
+	if strings.Contains(reason, "SYNTHKEYBODY") || strings.Contains(reason, "qqqqZ9tail") {
+		t.Errorf("terminal reason = %q, want the key and the value redacted", reason)
+	}
+	if !strings.Contains(reason, "stdout tail: ") || !strings.Contains(reason, "stderr tail: ") || !strings.Contains(reason, "[redacted]") {
+		t.Errorf("terminal reason = %q, want both tails, scrubbed", reason)
+	}
+	if n := len(reason); n > stdoutTailBytes+stderrTailBytes+512 {
+		t.Errorf("terminal reason is %d bytes, want the tails still cut", n)
+	}
+}
