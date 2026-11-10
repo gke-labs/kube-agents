@@ -205,8 +205,9 @@ The rules that keep this safe:
   `kill 4821` after reading `pid 4821`), a later run would get the old number back. So the proxy checks each answer before
   saving it, and if it repeats any of those values, it doesn't save it. That request just goes to
   the model next time, which is always safe. A short swapped number (under 4 digits, like
-  `generation: 1` or a kanban `run_id: 190`) only counts as repeated next to its key
-  (`generation=1`, "the run_id is 190"): the dev-install dry run showed that counting any bare `1`
+  `generation: 1` or a kanban `run_id: 190`) only counts as repeated next to one of those keys
+  (`generation=1`, "the run_id is 190"), and a swapped `comment_id` next to the word "comment" too:
+  the dev-install dry run showed that counting any bare `1`
   (`2>&1`, "revision 1") marked about one answer in seven unsaveable.
 - **Hermes' recent-work digest is dropped from the key.** Every card view ends with
   `## Recent work by @<assignee>`, the assignee's last five runs on other cards, so the first

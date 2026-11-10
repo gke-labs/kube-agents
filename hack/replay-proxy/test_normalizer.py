@@ -1057,5 +1057,20 @@ class AnswerMappingTest(unittest.TestCase):
         for answer in ("41 pods are pending", "comments 41", "port 41", "comment_id 410", "commented 41 times"):
             self.assertFalse(mapping.answer_repeats_bare_number(answer), answer)
 
+    def test_the_word_comment_counts_only_against_a_comment_id(self):
+        # "comment" is an ordinary word: an answer putting another key's swapped
+        # number after it (a generation, a row id) is still stored.
+        tool = {"role": "tool", "tool_call_id": "call_1",
+                "content": json.dumps({"metadata": {"generation": 2, "id": 7}, "status": {"observedGeneration": 2}})}
+        mapping = normalizer.normalize_request({"model": "m", "messages": [tool]}, NOW).mapping
+        for answer in ("I left a comment: 2 pods are pending", "Here is the comment:\n\n2. Root cause",
+                       "comment (7)", "kubectl annotate deploy/web comment=2"):
+            self.assertFalse(mapping.answer_repeats_bare_number(answer), answer)
+        self.assertTrue(mapping.answer_repeats_bare_number("generation: 2"))
+        # The same word does count once a comment id was swapped, in text as in JSON.
+        text = {"role": "tool", "tool_call_id": "call_2", "content": "posted, comment_id: 2"}
+        mapping = normalizer.normalize_request({"model": "m", "messages": [text]}, NOW).mapping
+        self.assertTrue(mapping.answer_repeats_bare_number("I left a comment: 2 pods are pending"))
+
 if __name__ == "__main__":
     unittest.main()
