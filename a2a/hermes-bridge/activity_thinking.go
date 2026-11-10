@@ -2082,7 +2082,13 @@ func normalizeMarkdown(s string) (string, []int) {
 		lineStart = lineEnd + 1
 	}
 	for _, m := range markdownKeyParenPattern.FindAllStringSubmatchIndex(s, -1) {
-		if markdownParenKept(s[m[4]:m[5]], s[m[6]:m[7]]) {
+		// The text after the colon, to the cell or line end, read but not
+		// consumed: a later parenthetical label on the line is matched too.
+		after := s[m[1]:]
+		if end := strings.IndexAny(after, "|\r\n"); end >= 0 {
+			after = after[:end]
+		}
+		if markdownParenKept(s[m[4]:m[5]], after) {
 			continue
 		}
 		if m[2] > 0 && (isWordByte(s[m[2]-1]) || strings.IndexByte("*_`", s[m[2]-1]) >= 0) {
@@ -2124,7 +2130,7 @@ var (
 	// ("Password (decoded):", "**password** (prod):"), emphasis or a code
 	// span allowed between. normalizeMarkdown keeps one only in the
 	// non-secret shapes markdownParenKept names.
-	markdownKeyParenPattern = regexp.MustCompile(`([ \t]*\(([^()\r\n:]{1,40})\))[*_\x60 \t]*:([^|\r\n]*)`)
+	markdownKeyParenPattern = regexp.MustCompile(`([ \t]*\(([^()\r\n:]{1,40})\))[*_\x60 \t]*:`)
 	// markdownDecodedParenPattern is a parenthetical that says how the
 	// value is written: never kept.
 	markdownDecodedParenPattern = regexp.MustCompile(`(?i)\b(?:decoded|encoded|plain[ -]?text|base64|b64|raw|literal)\b`)

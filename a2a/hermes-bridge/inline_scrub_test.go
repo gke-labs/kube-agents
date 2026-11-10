@@ -482,3 +482,28 @@ func TestScrubInlineSecretsArgListFlagBeforeACredentialFlag(t *testing.T) {
 		}
 	}
 }
+
+// A line holding two parenthetical labels before their colons reads both:
+// a credential label after an earlier note on the same line still reads as
+// its key, and a status note stays.
+func TestScrubInlineSecretsTwoParentheticalLabelsOnALine(t *testing.T) {
+	const word = "quietpasture"
+	cases := []struct{ in, want string }{
+		{"User (default): app, Password (decoded): " + word, "User (default): app, Password (decoded): [redacted]"},
+		{"Rotated (2026-11-01): yes; Password (prod): " + word, "Rotated (2026-11-01): yes; Password (prod): [redacted]"},
+		{"Check (WARN): DB_PASSWORD (prod): " + word, "Check (WARN): DB_PASSWORD (prod): [redacted]"},
+		{"| Password (decoded): " + word + " | Token (prod): " + word + " |", "| Password (decoded): [redacted] | Token (prod): [redacted] |"},
+	}
+	for _, tc := range cases {
+		if got := scrubInlineSecrets(tc.in); got != tc.want {
+			t.Errorf("scrubInlineSecrets(%q)\n got %q\nwant %q", tc.in, got, tc.want)
+		}
+	}
+	for _, in := range []string{
+		"- **Binary Authorization (`WARN`):** `Binary Authorization is DISABLED`, Shielded Nodes (`OK`): enabled",
+	} {
+		if got := scrubInlineSecrets(in); got != in {
+			t.Errorf("scrubInlineSecrets(%q) = %q, want it unchanged", in, got)
+		}
+	}
+}
