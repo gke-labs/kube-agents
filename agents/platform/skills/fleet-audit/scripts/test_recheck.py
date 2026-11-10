@@ -309,6 +309,8 @@ class MainTest(unittest.TestCase):
         answer = json.loads(buf.getvalue())
         self.assertEqual((rc, answer["outcome"]), (2, "unchecked"))
         self.assertIn("TypeError: boom", answer["reason"])
+        self.assertEqual(answer["finding_id"], "no-pdb.proj-us-central1-fleet-1.shop.deployment-checkout")
+        self.assertNotIn("budget", answer)
 
 
 if __name__ == "__main__":

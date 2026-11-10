@@ -294,6 +294,16 @@ def read_argv(recheck: Recheck, namespace: str, kube_context: str = "") -> list[
     return argv
 
 
+def base_answer(target: Target) -> dict:
+    """The fields every answer carries, whatever the outcome: the finding's
+    identity, its published id, and the budget when one was named."""
+    finding = {"check": target.check, "cluster": target.cluster, "namespace": target.namespace, "object": target.object}
+    answer: dict = {**finding, "finding_id": audit_report.published_id(finding)}
+    if target.budget:
+        answer["budget"] = target.budget
+    return answer
+
+
 def recheck(
     target: Target,
     *,
@@ -310,10 +320,7 @@ def recheck(
     caller has it; with it the answer carries the ledger state
     `derive_finding_state` gives. Without `run`, the local `kubectl` reads.
     """
-    finding = {"check": target.check, "cluster": target.cluster, "namespace": target.namespace, "object": target.object}
-    answer: dict = {**finding, "finding_id": audit_report.published_id(finding)}
-    if target.budget:
-        answer["budget"] = target.budget
+    answer = base_answer(target)
     spec = RECHECKS.get(target.check)
     if spec is None:
         return {
@@ -377,7 +384,7 @@ def main(argv: list[str] | None = None) -> int:
         answer = recheck(target, kubeconfig=args.kubeconfig, kube_context=args.kube_context, pr=pr)
     except Exception as exc:  # noqa: BLE001 -- a crash is no verdict, and exit 1 would read as one
         answer = {
-            **target._asdict(),
+            **base_answer(target),
             "outcome": OUTCOME_UNCHECKED,
             "evidence": [],
             "reason": f"the re-check failed ({type(exc).__name__}: {exc}), so nothing was judged",
