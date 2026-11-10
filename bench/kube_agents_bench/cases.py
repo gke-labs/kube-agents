@@ -42,6 +42,9 @@ import yaml
 from devops_bench.tasks.schema import Task as DevopsBenchTask
 
 from kube_agents_bench import pushed_report, scope_exclude, stop_hook, worker_trajectory
+from kube_agents_bench.lane import REQUESTED_KEY as _REQUESTED_KEY
+from kube_agents_bench.lane import LaneSafeguardsError as _LaneSafeguardsError
+from kube_agents_bench.lane import declared_pull_requests as _lane_declared_pull_requests
 from kube_agents_bench.lane import requested_pull_requests as _lane_requested_pull_requests
 
 __all__ = [
@@ -70,7 +73,8 @@ __all__ = [
 # - this repository's: what this package and the case tooling read --
 #   ``domain``, ``fixtures``, ``owner``, ``expected_fail``,
 #   ``tool_calls_optional``, ``audit_streams``, ``scope_exclude`` (read by
-#   ``scope_exclude.py``), ``writes_alone`` (read by ``lane.py``), ``suite``
+#   ``scope_exclude.py``), ``writes_alone`` and ``requested_pull_requests``
+#   (read by ``lane.py`` and by ``load_case``), ``suite``
 #   (``certification``: the case runs on the certification lane only; the
 #   lane and scripts/validate_bench_cases.py read the bare line from the task
 #   file), ``certification_part`` (which section of that lane, default 1)
@@ -88,6 +92,7 @@ REPOSITORY_CASE_KEYS = frozenset(
         "domain", "fixtures", "owner", "expected_fail", "tool_calls_optional",
         "audit_streams", scope_exclude.KEY, "task_version", "writes_alone", "suite",
         "certification_part",
+        _REQUESTED_KEY,
     }
 )
 CASE_KEYS = DEVOPS_BENCH_CASE_KEYS | REPOSITORY_CASE_KEYS
@@ -279,15 +284,16 @@ class CaseSpec:
     Absent means False."""
 
     requested_pull_requests: int = 0
-    """How many pull requests the case's own requesting checks ask for (leaves
-    of a type in ``lane.REQUESTING_CHECK_TYPES``). The infra carve-out in
-    ``scoring.classify_rep`` fires only when this is non-zero: an empty report
-    on an infra-ended rep mischarges a *requested* pull request as unrequested,
-    but on a case that requested none a write is a genuine forbidden action and
-    still blocks. A case that requests a pull request only through the lane
-    ``requesting:`` listing (its own checks ask for none) is not distinguished
-    here: the scorer is pinned to the ``bench/`` tree and cannot read the lane
-    file, so its infra-ended rep still blocks (tracked in #4778)."""
+    """How many pull requests the case requests: the larger of what its own
+    requesting checks ask for (leaves of a type in
+    ``lane.REQUESTING_CHECK_TYPES``) and the count it declares at its top
+    level under ``requested_pull_requests``, for a case that opens more pull
+    requests by design than its checks grade. The write-safeguard carve-outs
+    in ``scoring.classify_rep`` fire only when this is non-zero, and hold the
+    charged writes to it: on a case that requested none a write is a genuine
+    forbidden action and still blocks. The lane file's ``requesting:`` map is
+    not read here -- the scorer is pinned to the ``bench/`` tree -- so a count
+    that lives only there is not seen; the task key is where it belongs."""
 
 
 def _leaves(node: Any) -> list[dict[str, Any]]:
@@ -455,9 +461,10 @@ def load_case(task_yaml: str | Path) -> CaseSpec:
     grade honestly — a missing file, a document that is not a mapping, or a
     declared id that disagrees with the directory.
 
-    The case's ``requested_pull_requests`` is the count of its own requesting
-    checks. A lane-only ``requesting:`` listing is not read here; see that
-    field's note.
+    The case's ``requested_pull_requests`` is the larger of the count of its
+    own requesting checks and the top-level ``requested_pull_requests`` key.
+    The lane file's ``requesting:`` map is not read here; see that field's
+    note.
     """
     path = Path(task_yaml)
     if not path.is_file():
@@ -513,6 +520,11 @@ def load_case(task_yaml: str | Path) -> CaseSpec:
     declares_spec = isinstance(spec, list) and len(spec) > 0
 
     expected_fail_raw = doc.get("expected_fail", False)
+    try:
+        declared = _lane_declared_pull_requests(doc, where=str(path))
+    except _LaneSafeguardsError as exc:
+        raise CaseSpecError(str(exc)) from exc
+
     expected_fail = _coerce_bool(expected_fail_raw, field="expected_fail", path=path)
     tool_calls_optional = _coerce_bool(
         doc.get("tool_calls_optional", False), field="tool_calls_optional", path=path
@@ -542,5 +554,5 @@ def load_case(task_yaml: str | Path) -> CaseSpec:
         worker_router_checks=worker_router,
         worker_untraced_checks=worker_untraced,
         tool_calls_optional=tool_calls_optional,
-        requested_pull_requests=_lane_requested_pull_requests(spec),
+        requested_pull_requests=max(_lane_requested_pull_requests(spec), declared),
     )

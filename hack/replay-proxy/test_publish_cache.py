@@ -110,6 +110,21 @@ class PublishTest(unittest.TestCase):
         self.assertNotIn(f"replay-cache/{VERSION}/answers/{fp(3)}.json", objects)
         self.assertEqual(report["decisions"], {"pass": 1, "fail": 1, "no_recording_line": 1})
 
+    def test_an_answer_saved_by_background_traffic_goes_up_when_a_passing_run_gave_it(self):
+        self.world.run("case-a", 1, "pass", ["t_11111111"])
+        self.world.request(worker("t_99999999"), fp(1), recorded=True, answer="A")
+        self.world.request(worker("t_11111111"), fp(1), answer="A")
+        self.world.request(worker("t_99999999"), fp(2), recorded=True, answer="A")
+        self.world.request(worker("t_11111111"), fp(2), answer="B")
+        self.answer(1)
+        self.answer(2)
+        self.write_logs()
+        report = self.publisher.publish(final=True)
+        objects = self.bucket.objects()
+        self.assertIn(f"replay-cache/{VERSION}/answers/{fp(1)}.json", objects)
+        self.assertNotIn(f"replay-cache/{VERSION}/answers/{fp(2)}.json", objects, "the run got another answer")
+        self.assertEqual(report["decisions"], {"pass": 1, "unattributed": 1})
+
     def test_a_slot_goes_up_only_with_its_answer_and_variants_go_up_flat(self):
         self.world.run("case-a", 1, "pass", ["t_11111111"])
         self.world.run("case-a", 2, "fail", ["t_22222222"])

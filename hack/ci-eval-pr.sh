@@ -3587,8 +3587,9 @@ fi
 export BENCH_GITOPS_REPO="${INJECT_LANE_REPO}"
 INJECT_LANE_TASKS_DIR="$(mktemp -d)"
 # One `<requested> <case> <copy>` line per task: how many pull requests
-# the case requests (its own checks, or the file's `requesting:` list for
-# a case the persona answers with one before its checks say so), the case,
+# the case requests (the largest of its own checks, its top-level
+# `requested_pull_requests` key, and the file's `requesting:` list for a
+# case the persona answers with one before its checks say so), the case,
 # and the copy's path. The cases with a non-zero count are the fan-out's
 # second phase (INJECT_LANE_REQUESTING, read where the unit queue is built):
 # they run only after every other unit has finished, so a repetition of a

@@ -980,11 +980,11 @@ class ApiLaneExclusionsTest(unittest.TestCase):
 INJECT_LANE_SAFEGUARDS = [
     "no-github-writes-the-case-did-not-request",  # #2079: a none-wrapped github_writes, catastrophic
 ]
-# The registered cases whose checks request a pull request, at the
-# safeguard's introduction: what hack/ci-eval-pr.sh runs in the fan-out's
-# second phase on both lanes, after every other unit has finished. A
-# new requesting case edits this set in the same pull request; the check
-# types that count are lane.REQUESTING_CHECK_TYPES.
+# The registered cases that request a pull request -- a check of a type in
+# lane.REQUESTING_CHECK_TYPES, a `requested_pull_requests:` key of their own,
+# or a `requesting:` entry in the lane file: what hack/ci-eval-pr.sh runs in
+# the fan-out's second phase on both lanes, after every other unit has
+# finished. A new requesting case edits this set in the same pull request.
 INJECT_LANE_REQUESTING = [
     "cluster-agent-crashloop-fix-request",
     # cluster-setting-request-proposes-pr: asked to turn on Binary Authorization, it
@@ -1102,15 +1102,20 @@ class InjectLaneSafeguardsTest(unittest.TestCase):
         from kube_agents_bench import lane
 
         listed = lane.load_lane_requesting(eval_rosters.INJECT_LANE_SAFEGUARDS_FILE)
-        requesting = [c for c in self.lane_cases() if lane.requested_pull_requests(self.task_spec(c)) > 0 or c in listed]
-        # A listed case is registered and on the lane, and its own checks do
-        # not yet request as many as it is allowed: once they do, the entry
-        # is a leftover.
+
+        def declared(case):
+            doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
+            return lane.declared_pull_requests(doc)
+
+        requesting = [c for c in self.lane_cases() if lane.requested_pull_requests(self.task_spec(c)) > 0 or declared(c) > 0 or c in listed]
+        # A listed case is registered and on the lane, and neither its own
+        # checks nor its own `requested_pull_requests:` key yet request as many
+        # as it is allowed: once they do, the entry is a leftover.
         for case, count in listed.items():
             with self.subTest(listed=case):
                 self.assertIn(case, self.lane_cases())
-                requested = lane.requested_pull_requests(self.task_spec(case))
-                self.assertLess(requested, count, f"{case}'s own checks request {requested} pull request(s) now, at least the {count} `requesting:` allows it; drop the entry")
+                requested = max(lane.requested_pull_requests(self.task_spec(case)), declared(case))
+                self.assertLess(requested, count, f"{case}'s own checks or key request {requested} pull request(s) now, at least the {count} `requesting:` allows it; drop the entry")
         self.assertEqual(sorted(requesting), INJECT_LANE_REQUESTING)
         # The plain leaf walk here agrees with the module's on every lane case.
         for case in self.lane_cases():
@@ -1391,6 +1396,28 @@ class SeatBarTest(unittest.TestCase):
         # Until the scan defines its repository subject, a catalog entry alone clears nothing.
         self.assertEqual(repository_asserted_roles(assertions, None), set())
 
+    def test_the_text_read_of_a_requested_pull_requests_key_agrees_with_the_lane_module(self):
+        """A case's own `requested_pull_requests:` places it in the serial phase
+        on the text read as it does through the lane module."""
+        import tempfile
+
+        import yaml
+
+        source = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / "agent-kanban-smoke" / "task.yaml").read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks = pathlib.Path(tmp)
+            (tasks / "declared-case").mkdir()
+            (tasks / "declared-case" / "task.yaml").write_text(
+                yaml.safe_dump({**source, "id": "declared-case", "requested_pull_requests": 1}, sort_keys=False), encoding="utf-8"
+            )
+            (tasks / "plain-case").mkdir()
+            (tasks / "plain-case" / "task.yaml").write_text(yaml.safe_dump({**source, "id": "plain-case"}, sort_keys=False), encoding="utf-8")
+            self.assertEqual(eval_rosters.declared_pull_requests("declared-case", tasks), 1)
+            self.assertTrue(eval_rosters.requests_a_pull_request("declared-case", {}, tasks))
+            self.assertFalse(eval_rosters.requests_a_pull_request("plain-case", {}, tasks))
+            doc = yaml.safe_load((tasks / "declared-case" / "task.yaml").read_text(encoding="utf-8"))
+            self.assertEqual(self.lane.declared_pull_requests(doc), 1)
+
     def test_the_text_read_of_requesting_agrees_with_the_lane_module(self):
         """eval_rosters is stdlib-only, so it reads a requesting check out of
         the text; hold it to lane.py's YAML read on every registered case."""
@@ -1403,7 +1430,25 @@ class SeatBarTest(unittest.TestCase):
             with self.subTest(case=case):
                 doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
                 self.assertEqual(eval_rosters.requests_a_pull_request(case, self.lane_requesting),
-                                 self.lane.requested_for(doc.get("verification_spec") or [], listed.get(case, 0)) > 0)
+                                 self.lane.requested_for(doc.get("verification_spec") or [],
+                                                         max(listed.get(case, 0), self.lane.declared_pull_requests(doc))) > 0)
+
+    def test_the_validators_requesting_types_are_the_lanes(self):
+        """scripts/validate_bench_cases.py counts a case's requesting leaves
+        with its own copy of the set, to hold `requested_pull_requests:` above
+        them; the copy must not drift from lane.py's."""
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("validate_bench_cases", REPO_ROOT / "scripts" / "validate_bench_cases.py")
+        validator = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(validator)
+        self.assertEqual(validator.REQUESTING_CHECK_TYPES, self.lane.REQUESTING_CHECK_TYPES)
+        # And its own leaf walk counts what the lane counts, on every shipped case.
+        for task_yaml in sorted((REPO_ROOT / "bench" / "tasks").glob("*/task.yaml")):
+            with self.subTest(case=task_yaml.parent.name):
+                doc = yaml.safe_load(task_yaml.read_text(encoding="utf-8")) or {}
+                spec = doc.get("verification_spec")
+                self.assertEqual(validator._requesting_leaves(spec), self.lane.requested_pull_requests(spec if isinstance(spec, list) else []))
 
 
 class PresubmitWallTimeTest(unittest.TestCase):

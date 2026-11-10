@@ -24,7 +24,7 @@ in silence — no error, no warning. The fields it reads are `id`, `name`, `prom
 means no coercion: `critical: yes` is a string, not a boolean, and fails validation.
 
 **This repository's lints** read the same file for fields devops-bench discards: `domain`,
-`fixtures`, `owner`, `expected_fail`, `tool_calls_optional`, `writes_alone`, `audit_streams` and `scope_exclude`. Those are ours. A typo in any of them cannot fail a run, which is
+`fixtures`, `owner`, `expected_fail`, `tool_calls_optional`, `writes_alone`, `requested_pull_requests`, `audit_streams`, `scope_exclude`, `suite` and `task_version`. Those are ours. A typo in any of them cannot fail a run, which is
 exactly why `scripts/validate_bench_cases.py` exists.
 
 ## The id key
@@ -150,6 +150,16 @@ the reply never names: the lane runs it alone in its second phase and marks the 
 safeguard's window exclusive, so any write in the window is charged to it
 (`bench/kube_agents_bench/lane.py`). A bare YAML boolean, `false` by default; devops-bench
 ignores the key.
+
+`requested_pull_requests` is for a case that opens more pull requests by design than its checks
+grade: the case's total, a bare decimal integer above the count of its `pull_request_opened` and
+`pull_request_diff_contains` leaves (the validator rejects a count those leaves already reach,
+and any other spelling, because the roster script reads the key off the text). The lane sets the
+write safeguard's allowance from the largest of the leaves, the key and any `requesting:` entry in
+`hack/eval/inject-lane-safeguards.yaml`, and the grader reads the leaves and the key, so the
+carve-out that excuses a requested pull request holds the case to its total
+(`bench/kube_agents_bench/lane.py`, `cases.py`). Absent means the leaves, and any lane entry,
+alone; devops-bench ignores the key.
 
 `tool_calls_optional` is for a case a correct agent can answer without calling a tool: a
 first-turn greeting, a reply that names a command. `bench-gate`'s rung 3 otherwise reads an empty
@@ -619,7 +629,8 @@ id that disagrees with its directory, a `domain:` that is missing or not in
 case that declares no `fixtures:` at all, a missing, empty or inline `verification_spec`,
 a check that carries no assertion and so can only pass, an `owner:` that is `maintainers`,
 written as a mention or not a login, an `expected_fail:`, `tool_calls_optional:` or `writes_alone:`
-that is not a bare YAML boolean, a `resource_property` or `fleet_resource_property` check that
+that is not a bare YAML boolean, a `requested_pull_requests:` that is not a bare decimal integer above
+the case's own requesting leaves, a `resource_property` or `fleet_resource_property` check that
 compares a known boolean field such as `spec.suspend` to the string `"true"` or `"false"` under
 `op: eq` or `ne` (the string never compares equal to the API's boolean, so the check asserts
 nothing; the judged fields are the validator's `BOOLEAN_FIELD_PAIRS` table, and a path with recursive

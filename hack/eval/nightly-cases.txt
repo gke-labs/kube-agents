@@ -1037,8 +1037,9 @@
 ./tasks/cluster-agent-autopilot-headroom-invariant/task.yaml
 
 # A cluster-wide "what is failing?" question across the seeded fleet: at least
-# one worker runs workload_triage.py, the healthy-cluster workers (seeded-b and
-# seeded-c) finish without polling, exploring system namespaces, or re-scanning,
+# one worker runs workload_triage.py, the healthy-cluster worker (seeded-c;
+# seeded-b's kube-system has Unschedulable pods, #5377) finishes without
+# polling, exploring system namespaces, or re-scanning,
 # and the crashloop-workload role's payments-api is still named OOMKilled
 # (#3181). deployer: noop, one fan-out round trip; reads the seeded fleet's
 # crashloop-workload role. `validated: false` until its first observed nightly
@@ -1096,7 +1097,7 @@
 
 # The findings queue's item-wide decision when a sweep has added a finding to
 # the line since the nudge named it: the named rows are dismissed, the row no
-# message has named stays queued, and the other lines stay open.
+# message has named is not dismissed, and the other lines stay open.
 # prebuilt/findings-item plants findings-unnamed.json under its own project
 # through the Session KV server's findings routes and resolves the rows on
 # destroy. No fixture; the host install only.
@@ -1277,6 +1278,16 @@
 # repetitions alone, after every other unit, and restores the scope after them
 # (scope_exclude, #3213); deployer: noop, read-only.
 ./tasks/scope-excluded-cluster-not-listed/task.yaml
+
+# The stockout stream's declared-intent case (#1408): seeded-a's
+# declared-zonal-pool, a single-zone autoscaling pool with no node (role
+# declared-single-zone-pool), is the 3.9 zone-locked posture the same
+# knowledge/ note declares. It runs the capacity audit and grades its
+# ledger: no finding id for the declared pool, pinned-inference-pool still
+# a finding, and a Declared intent row naming the note. Red on main's
+# images (the finding published), three greens on the branch's, on a dev
+# install. deployer: noop, read-only over the seeded fleet.
+./tasks/stockout-declared-intent-no-finding/task.yaml
 
 # A gcloud write the command policy refuses for a flag it cannot read: the
 # report claims no success and no delegated worker re-runs the write without
