@@ -115,11 +115,9 @@ BASE64_QUANTUM_CHARS = 4
 BASE64_PADDING_CHAR = "="
 BASE64_DECODED_TEXT_WHITESPACE = "\n\r\t"
 BASE64_DECODED_TEXT_ENCODING = "utf-8"
-# The separator a `NAME=value` token is rescanned on, the character the
-# shell continuation folds to, and the whitespace an indent or a line's tail
-# is made of.
+# The separator a `NAME=value` token is rescanned on, and the whitespace an
+# indent or a line's tail is made of.
 EQUALS_SEPARATOR = "="
-SHELL_CONTINUATION_FOLD = " "
 INDENT_CHAR = " "
 INLINE_WHITESPACE = " \t"
 LINE_BREAK = "\n"
@@ -287,13 +285,14 @@ SENSITIVE_KEY_SUFFIXES = (
 )
 BASE64_SECRET_VALUE_RE = re.compile(r"^[A-Za-z0-9+/]{4,}={0,2}$")
 INLINE_JSON_OBJECT_RE = re.compile(r"\{[^{}]+\}")
-# A shell joins a backslash-newline before it parses, so the detector folds
-# the continuation (and the indentation after it) to one space first; every
-# rule below is segment-bounded and would otherwise see two commands. Only an
-# odd run of backslashes ends in a continuation: in an even run each pair is
-# one literal backslash, and the newline still ends the command. The even
-# part before the continuation is kept (group 1).
-SHELL_CONTINUATION_RE = re.compile(r"(?<!\\)((?:\\\\)*)\\\r?\n[ \t]*")
+# A shell removes a backslash-newline before it parses, joining the two lines
+# with nothing between them, so the detector removes it first; every rule below
+# is segment-bounded and would otherwise see two commands. Only an odd run of
+# backslashes ends in a continuation: in an even run each pair is one literal
+# backslash, and the newline still ends the command. The even part before the
+# continuation is kept (group 1). A backslash before a CR escapes the CR, and
+# the LF after it still ends the command, so CRLF is no continuation either.
+SHELL_CONTINUATION_RE = re.compile(r"(?<!\\)((?:\\\\)*)\\\n")
 # The tool-call argument keys that carry a shell command, in the order
 # `is_secret_read_tool_call` and `scrub_step_text` read them.
 COMMAND_ARG_KEYS = ("command", "cmd")
@@ -1001,10 +1000,11 @@ def supplement_redact(
 
 
 def fold_shell_continuations(command: str) -> str:
-    """``command`` with each backslash-newline continuation (and the indentation
-    after it) folded to one space, as the shell joins it; an escaped backslash
-    before a newline is not a continuation."""
-    return SHELL_CONTINUATION_RE.sub(lambda match: match.group(1) + SHELL_CONTINUATION_FOLD, command)
+    """``command`` with each backslash-newline continuation removed, as the shell
+    removes it: ``kube\\<newline>ctl`` is one word, and the indentation after a
+    continuation stays as the blank between words. An escaped backslash before
+    a newline is not a continuation."""
+    return SHELL_CONTINUATION_RE.sub(lambda match: match.group(1), command)
 
 
 def fold_shell_command(command: str) -> str:

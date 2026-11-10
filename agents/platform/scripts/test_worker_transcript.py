@@ -152,18 +152,37 @@ class TestScrubStepText(unittest.TestCase):
         self.assertEqual(_scrub("tool_call", other_arg), other_arg)
 
     def test_only_an_odd_backslash_run_folds_as_a_continuation(self):
-        # Bash reads an odd run before a newline as a continuation and an even
-        # run as literal backslashes, so the newline still ends the command.
+        # Bash removes a backslash-newline and adds nothing; it reads an odd run
+        # before a newline as a continuation and an even run as literal
+        # backslashes, so the newline still ends the command. A backslash
+        # before a CR escapes the CR, so CRLF is no continuation.
         fold = worker_transcript.fold_shell_continuations
-        self.assertEqual(fold("a\\\n  b"), "a b")
+        self.assertEqual(fold("a\\\n  b"), "a  b")
+        self.assertEqual(fold("kube\\\nctl"), "kubectl")
         self.assertEqual(fold("a\\\\\n  b"), "a\\\\\n  b")
-        self.assertEqual(fold("a\\\\\\\n  b"), "a\\\\ b")
+        self.assertEqual(fold("a\\\\\\\n  b"), "a\\\\  b")
         self.assertEqual(fold("a\\\\\\\\\n  b"), "a\\\\\\\\\n  b")
-        self.assertEqual(fold("a\\\r\nb"), "a b")
-        self.assertEqual(fold("a\\\\\r\nb"), "a\\\\\r\nb")
+        self.assertEqual(fold("a\\\r\nb"), "a\\\r\nb")
         # A stored call keeps the line break after an even run.
         stored = json.loads(_scrub("tool_call", json.dumps({"command": "grep -rn\\\\\nU=x\ncurl \"$U\""})))["command"]
         self.assertEqual(stored, "grep -rn\\\\\nU=x\ncurl \"$U\"")
+
+    def test_a_continuation_inside_a_word_joins_the_word(self):
+        # The fold used to put a space where bash puts nothing, so a word split
+        # by a continuation hid a secret read or a credential flag.
+        for cmd in (
+            "kube\\\nctl get secret db -o yaml",
+            "kubectl get sec\\\nret db -o yaml",
+            "gcl\\\noud secrets versions access latest --secret=db",
+            "cat /var/run/sec\\\nrets/kubernetes.io/serviceaccount/token",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertTrue(worker_transcript.command_reads_a_secret(cmd))
+        for cmd in ("mysql --pass\\\nword=hunter2", "curl -u admin:hun\\\nter2 https://x"):
+            with self.subTest(cmd=cmd):
+                out = _scrub("tool_call", json.dumps({"command": cmd}))
+                self.assertNotIn("hunter2", out)
+                self.assertNotIn("ter2", out)
 
     def test_a_secret_read_after_an_even_backslash_run_is_detected(self):
         # The even run used to fold the newline, so the read joined the line
