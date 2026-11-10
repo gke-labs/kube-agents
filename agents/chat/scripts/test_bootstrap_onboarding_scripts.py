@@ -3547,6 +3547,20 @@ class FirstRunAuditsTest(unittest.TestCase):
                 self.assertEqual(bootstrap_delivery._resend_tries(state.get("x", {})), 0)
                 self.assertNotIn("fleet-wide-cost-analysis", state)
 
+    def test_an_audit_with_a_run_in_flight_is_not_re_sent(self):
+        # A new run reset the chat report record at its start; the relay would post its notice in place of
+        # the lost report, and mark the new run posted.
+        claimed = self._lost_first_run(age=900)
+        cron = self.d / oobe.PROFILES_DIR / oobe.PLATFORM_PROFILE / oobe.CRON_DIR
+        with sqlite3.connect(cron / oobe.EXECUTIONS_DB) as conn:
+            conn.execute("INSERT INTO executions VALUES (?, ?, ?, ?, ?)",
+                         ("fleet-wide-cost-analysis", "running",
+                          datetime.fromtimestamp(claimed + 600, timezone.utc).isoformat(), None, None))
+        self.assertEqual(self._resend("C0123"), [])
+        with sqlite3.connect(cron / oobe.EXECUTIONS_DB) as conn:
+            conn.execute("UPDATE executions SET status = 'completed', delivery_outcome = 'suppressed' WHERE status = 'running'")
+        self.assertEqual(len(self._resend("C0123")), 1)
+
     def test_a_posted_run_is_not_pending(self):
         claimed = self._lost_first_run()
         self._relay("fleet-wide-cost-analysis", claimed + 60)
@@ -3650,6 +3664,10 @@ class FirstRunAuditsTest(unittest.TestCase):
         for key in (bootstrap_delivery.REQUEST_JOB_KEY, bootstrap_delivery.REQUEST_PROFILE_KEY,
                     bootstrap_delivery.REQUEST_TITLE_KEY, bootstrap_delivery.REQUEST_REPORT_KEY):
             self.assertIn(f'request_data.get("{key}")', server)
+        # The relay answers within the wait its caller gives it; a shorter client wait asks again before the
+        # record exists and posts the report twice.
+        caller_wait = int(re.search(r"^CRON_RELAY_CALLER_TIMEOUT_S = (\d+)$", server, re.M).group(1))
+        self.assertGreater(bootstrap_delivery.RESEND_TIMEOUT_SECONDS, caller_wait)
 
     def test_the_request_covers_every_shipped_fleet_audit(self):
         # A fleet audit added to the roster, or to the first-run chain, needs a request the note can send.

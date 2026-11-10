@@ -283,8 +283,9 @@ times. It rides with the audits stage, whose eval case covers both.
   report after all once the operator projects a Slack home channel into the pod, by asking the chat
   relay to post it as a scheduled delivery would, while the run's claim is under
   `RESEND_WINDOW_SECONDS` (the relay posts a record older than two hours as a "did not finish" notice).
-  An audit outside the chain, a first mention later than that, today mode and Google Chat keep the
-  request sentence.
+  The onboarding report's note still names that audit with the request, since the note is built
+  before the channel exists; the summary then follows in the home channel. An audit outside the
+  chain, a first mention later than that, today mode and Google Chat are posted on request only.
 - **An install self-check.** Not asked for by any issue.
 
 ## 8. Build order and evaluation

@@ -78,7 +78,9 @@ was filed and whose summary was not posted, however its run started, with a requ
 reports (``_lost_audits``): an audit that finished before anyone opened the chat had no home channel
 to post to. A first-run audit's summary is posted after all by the ``oobe`` tick's last stage,
 ``resend_lost_summaries``, once the operator projects a home channel, while its run is inside
-``RESEND_WINDOW_SECONDS``; every other one keeps the request. The note is built before the claim. The
+``RESEND_WINDOW_SECONDS``. The note still names that audit with the request, since it is built before
+the channel exists; the summary then follows in the home channel. Every other lost summary is posted on
+request only. The note is built before the claim. The
 text path appends it to the report; the card paths print it on their own, since the card leaves
 closing lines out.
 
@@ -409,8 +411,11 @@ REQUEST_REPORT_KEY = "report"
 # relay that keeps refusing. A refusal while the gateway's projected copy of the home file still lags the
 # agent's (one kubelet refresh) costs one of these, and the gateway keeps that post for its digest.
 RESEND_MAX_ATTEMPTS = 5
-# One request to the relay, which posts synchronously and answers when the post has landed or failed.
-RESEND_TIMEOUT_SECONDS = 180
+# One request to the relay, which posts synchronously and answers when the post has landed or failed,
+# and writes its record only then. Above the wait the relay is built for (its caller's 360 seconds,
+# session_kv_server.CRON_RELAY_CALLER_TIMEOUT_S; a test pins it): a client that gives up first asks
+# again next tick before the record exists, and the report posts twice.
+RESEND_TIMEOUT_SECONDS = 420
 RELAY_ANSWER_MAX_CHARS = 300
 # ``audit -> {"tries": n, "posted": bool}``, beside the other markers; absent until the first try.
 RESENT_FILE = ".oobe_summaries_resent.json"
@@ -1402,12 +1407,12 @@ def _resend_tries(entry: dict) -> int:
     return tries if isinstance(tries, int) and not isinstance(tries, bool) else 0
 
 
-def _record_resend(data_dir: Path, audit: str, tried: bool, posted: bool) -> None:
+def _record_resend(data_dir: Path, audit: str, posted: bool) -> None:
     """Count a try and settle ``audit`` once the relay answered, replacing the file whole so a run killed
     mid-write leaves the previous one."""
     state = _resend_state(data_dir)
     entry = state.get(audit, {})
-    entry[RESENT_TRIES_KEY] = _resend_tries(entry) + (1 if tried else 0)
+    entry[RESENT_TRIES_KEY] = _resend_tries(entry) + 1
     entry[RESENT_POSTED_KEY] = bool(entry.get(RESENT_POSTED_KEY)) or posted
     state[audit] = entry
     target = data_dir / RESENT_FILE
@@ -1417,19 +1422,19 @@ def _record_resend(data_dir: Path, audit: str, tried: bool, posted: bool) -> Non
 
 
 class RelayAnswer(NamedTuple):
-    """One request's outcome: the line for the log, whether the relay answered (the audit is settled), and
-    whether the request counts as a try."""
+    """One request's outcome: the line for the log, and whether the relay answered (the audit is settled)."""
 
     outcome: str
     posted: bool
-    tried: bool
 
 
 def pending_resends(data_dir: Path, state: dict, now: float) -> list[LostRun]:
     """The first-run audits whose summary found no home channel and whose report the relay can still post.
 
     ``_lost_audits`` over the first-run chain, less the crashed runs (a failure notice is not a report), the
-    runs claimed more than ``RESEND_WINDOW_SECONDS`` ago, and the audits tried ``RESEND_MAX_ATTEMPTS`` times.
+    runs claimed more than ``RESEND_WINDOW_SECONDS`` ago, the audits tried ``RESEND_MAX_ATTEMPTS`` times, and
+    the audits with a run in flight (``oobe.audits_in_flight``): that run reset the chat report record at its
+    start, so the relay would post its notice in place of the lost report, and mark the new run posted.
     Less the audits the relay answered for (``RESENT_POSTED_KEY``): a relay row settles the audit in
     ``_lost_audits`` only until a later run of it fails, after which the earlier run reads as lost again, and
     a relay that could not tell the job posted the request text and wrote no row. Nothing when the run records
@@ -1441,13 +1446,16 @@ def pending_resends(data_dir: Path, state: dict, now: float) -> list[LostRun]:
     if not runs:
         return []
     posts = _relay_posts(data_dir)
-    if posts is None:
+    every_run = oobe._runs(data_dir, audits)
+    if posts is None or every_run is None:
         return []
+    in_flight = oobe.audits_in_flight(every_run, now)
     resent = _resend_state(data_dir)
     return [
         run
         for run in _lost_audits(audits, runs, _windows(data_dir, state, audits), posts)
         if not run.crashed
+        and run.audit not in in_flight
         and now - run.claimed_at <= RESEND_WINDOW_SECONDS
         and not resent.get(run.audit, {}).get(RESENT_POSTED_KEY)
         and _resend_tries(resent.get(run.audit, {})) < RESEND_MAX_ATTEMPTS
@@ -1464,8 +1472,8 @@ def _post_cron_report(audit: str, title: str) -> RelayAnswer:
     """Ask the relay to post ``audit``'s latest report as a scheduled run's delivery leg would.
 
     A 2xx settles the audit: the relay posted the report, or a notice in its place, and asking again
-    would post a notice. A refusal is a try; so is an answer that does not come, which is not a
-    failure: the relay may have posted, and its record says so next tick.
+    would post a notice. A refusal, or an answer that does not come, leaves it to the next tick; the
+    second is not a failure: the relay may have posted, and its record says so.
     """
     body = {
         REQUEST_JOB_KEY: audit,
@@ -1485,11 +1493,11 @@ def _post_cron_report(audit: str, title: str) -> RelayAnswer:
             answer = json.loads(response.read().decode("utf-8", "replace") or "{}")
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", "replace")[:RELAY_ANSWER_MAX_CHARS]
-        return RelayAnswer(f"the relay answered {e.code}: {detail}", False, True)
+        return RelayAnswer(f"the relay answered {e.code}: {detail}", False)
     except (urllib.error.URLError, OSError, ValueError) as e:
-        return RelayAnswer(f"no answer from the relay, which may have posted; its record decides the next tick: {e!r}", False, True)
+        return RelayAnswer(f"no answer from the relay, which may have posted; its record decides the next tick: {e!r}", False)
     status = answer.get("status") if isinstance(answer, dict) else None
-    return RelayAnswer(f"the relay answered {status or 'ok'}", True, True)
+    return RelayAnswer(f"the relay answered {status or 'ok'}", True)
 
 
 def resend_lost_summaries(data_dir: Path, now: float) -> None:
@@ -1513,7 +1521,7 @@ def resend_lost_summaries(data_dir: Path, now: float) -> None:
     titles = _job_titles(data_dir)
     for run in pending:
         answer = _post_cron_report(run.audit, titles.get(run.audit) or run.audit)
-        _record_resend(data_dir, run.audit, answer.tried, answer.posted)
+        _record_resend(data_dir, run.audit, answer.posted)
         _stage_note(data_dir, f"re-sent the {run.audit} summary to the home channel: {answer.outcome}")
 
 
