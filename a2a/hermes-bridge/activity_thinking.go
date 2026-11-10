@@ -164,6 +164,7 @@ type sessionTrace struct {
 	plannedTitles        map[string]string // tool call id -> the step title it was planned under
 	sessionCards         map[string]string // worker sessionID -> cardID
 	cardTitles           map[string]string // cardID -> short cluster/card title
+	filedCards           map[string]bool   // cardID -> made by this task's kanban_create, title or not
 	claimedSessions      map[string]bool   // worker sessionID claimed by this task
 	reportedSettledCards map[string]bool   // cardID -> KindSubtask step already emitted for this task
 }
@@ -199,6 +200,7 @@ func (a *activityState) initSessionTraceLocked() {
 	if a.trace.sessionCards == nil {
 		a.trace.sessionCards = make(map[string]string)
 		a.trace.cardTitles = make(map[string]string)
+		a.trace.filedCards = make(map[string]bool)
 		a.trace.claimedSessions = make(map[string]bool)
 		a.trace.plannedTitles = make(map[string]string)
 		a.trace.reportedSettledCards = make(map[string]bool)
@@ -291,6 +293,7 @@ func (a *activityState) observeWorkerContextLocked(d hookDelivery, rawInput json
 	}
 	effectiveTool, parsed := unwrapHermesToolCall(d.ToolName, rawInput)
 	if effectiveTool == kanbanCreateTool && createdCardID != "" {
+		a.trace.filedCards[createdCardID] = true
 		if short := shortCardClusterOrTitle(scrubInlineSecrets(extractArgStr(parsed, "title"))); short != "" {
 			a.trace.cardTitles[createdCardID] = short
 		}
@@ -501,7 +504,7 @@ func (a *activityState) hasCardID(cardID string) bool {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.trace.cardTitles[cardID] != ""
+	return a.trace.filedCards[cardID] || a.trace.cardTitles[cardID] != ""
 }
 
 // buildAPIRequestSteps reads one post_api_request delivery into the step
@@ -2247,7 +2250,8 @@ func markdownParenKept(content, after string) bool {
 // code. A run of backticks opens a code span the next run of the same
 // length closes; what is inside one is literal. Outside them, a run of * or
 // _ not inside a word is dropped when a later run of the same mark and
-// length closes it.
+// length closes it. A list bullet (one * then a blank, at the line's start
+// after indentation) is not a run: it neither opens nor closes emphasis.
 func markPairedMarkdownRuns(s string, lo, hi int, drop []bool, code [][2]int) [][2]int {
 	inCode := func(int) bool { return false }
 	first := len(code)
@@ -2305,9 +2309,10 @@ func markPairedMarkdownRuns(s string, lo, hi int, drop []bool, code [][2]int) []
 		c     byte
 	}
 	var open []run
+	bullet := listBulletAt(s, lo, hi)
 	for i := lo; i < hi; {
 		c := s[i]
-		if c != '*' && c != '_' || inCode(i) {
+		if c != '*' && c != '_' || inCode(i) || i == bullet {
 			i++
 			continue
 		}
@@ -2336,6 +2341,19 @@ func markPairedMarkdownRuns(s string, lo, hi int, drop []bool, code [][2]int) []
 		open = open[:k]
 	}
 	return code
+}
+
+// listBulletAt is where s[lo:hi] (one line) has a * list bullet: one *
+// followed by a blank, after the line's indentation. -1 when it has none.
+func listBulletAt(s string, lo, hi int) int {
+	p := lo
+	for p < hi && (s[p] == ' ' || s[p] == '\t') {
+		p++
+	}
+	if p+1 < hi && s[p] == '*' && (s[p+1] == ' ' || s[p+1] == '\t') {
+		return p
+	}
+	return -1
 }
 
 func isWordByte(c byte) bool {
@@ -2399,8 +2417,8 @@ func isLineLeadingKVKey(s string, matchStart int) bool {
 	if nl := strings.LastIndexByte(s[:matchStart], '\n'); nl >= 0 {
 		lineStart = nl + 1
 	}
-	prefix := strings.TrimLeft(s[lineStart:matchStart], " \t")
-	return prefix == "" || prefix == "-"
+	prefix := strings.TrimRight(strings.TrimLeft(s[lineStart:matchStart], " \t"), " \t")
+	return prefix == "" || prefix == "-" || prefix == "*" || prefix == "+"
 }
 
 func hasLaterInlineKVAssignment(lineRest string) bool {
