@@ -656,13 +656,26 @@ func TestActivity_AnUntitledFiledCardStillFeedsTheSet(t *testing.T) {
 	a.mu.Unlock()
 	run := &taskRun{origin: &lib.Envelope{TaskID: "task-untitled"}, state: stateRunning}
 	run.act.Store(a)
+	other := newActivityState(false)
+	other.sessionID = "a2a-coord-other"
+	other.waitingCard.Store(true)
+	otherRun := &taskRun{origin: &lib.Envelope{TaskID: "task-other"}, state: stateRunning}
+	otherRun.act.Store(other)
+	runs := []*taskRun{otherRun, run}
 	d := hookDelivery{SessionID: "20990101_120001_worker", Cwd: "/var/lib/hermes/kanban/workspaces/t_card77/repo", ToolName: "terminal"}
-	if got := cardWorkerRun([]*taskRun{run}, d); got != run {
+	if got := cardWorkerRun(runs, d); got != run {
 		t.Error("the untitled card's worker was not claimed for the task that filed it")
 	}
-	d.Cwd = "/var/lib/hermes/kanban/workspaces/t_card78/repo"
-	if got := cardWorkerRun([]*taskRun{run}, d); got != nil {
-		t.Error("a card the task never filed was claimed")
+	missed := d
+	missed.Cwd = "/var/lib/hermes/kanban/workspaces/t_card78/repo"
+	if got := cardWorkerRun(runs, missed); got != nil {
+		t.Error("a card no task filed was claimed")
+	}
+	// Waiting on its cards, the filing task, not another waiting one, takes
+	// the worker's activity.
+	a.waitingCard.Store(true)
+	if got := matchWorkerDeliveryRun(runs, d); got != run {
+		t.Error("the untitled card's worker activity was not attributed to the task that filed it")
 	}
 }
 

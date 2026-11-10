@@ -589,8 +589,9 @@ func TestScrubInlineSecretsValuelessFlagBeforeACredentialFlag(t *testing.T) {
 }
 
 // A * list bullet is not emphasis: it does not pair with an emphasised
-// label on its line, and a key after a *, + or - bullet is line-leading, so
-// a passphrase value is redacted whole. Emphasis and plain bullets with no
+// label on its line, and a key after markdown line markers (bullets,
+// ordered-list numbers, task boxes, blockquotes) is line-leading, so a
+// passphrase value is redacted whole. Emphasis and plain bullets with no
 // credential stay as written.
 func TestScrubInlineSecretsListBullets(t *testing.T) {
 	cases := []struct{ in, want string }{
@@ -600,6 +601,14 @@ func TestScrubInlineSecretsListBullets(t *testing.T) {
 		{"* password: correct horse battery staple", "* password: [redacted]"},
 		{"- password: correct horse battery staple", "- password: [redacted]"},
 		{"+ password: correct horse battery staple", "+ password: [redacted]"},
+		{"*\tpassword: correct horse battery staple", "*\tpassword: [redacted]"},
+		{"1. password: correct horse battery staple", "1. password: [redacted]"},
+		{"2) password: correct horse battery staple", "2) password: [redacted]"},
+		{"- [ ] password: correct horse battery staple", "- [ ] password: [redacted]"},
+		{"> - password: correct horse battery staple", "> - password: [redacted]"},
+		{"* * password: correct horse battery staple", "* * password: [redacted]"},
+		{"\t* The *password* is quietpasture", "\t* The *password* is [redacted]"},
+		{"*\tThe *password* is quietpasture", "*\tThe *password* is [redacted]"},
 		{"* item with *emphasis* only", "* item with *emphasis* only"},
 		{"* status: ok, password set", "* status: ok, password set"},
 		{"- note: the password rotation runs nightly", "- note: the password rotation runs nightly"},

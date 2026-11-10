@@ -2417,9 +2417,13 @@ func isLineLeadingKVKey(s string, matchStart int) bool {
 	if nl := strings.LastIndexByte(s[:matchStart], '\n'); nl >= 0 {
 		lineStart = nl + 1
 	}
-	prefix := strings.TrimRight(strings.TrimLeft(s[lineStart:matchStart], " \t"), " \t")
-	return prefix == "" || prefix == "-" || prefix == "*" || prefix == "+"
+	return lineMarkersPattern.MatchString(s[lineStart:matchStart])
 }
+
+// lineMarkersPattern is what may stand before a line-leading key: blanks
+// and markdown line markers (a -, * or + bullet, an ordered-list number, a
+// task box, a blockquote's >), stacked or not.
+var lineMarkersPattern = regexp.MustCompile(`^[ \t]*(?:(?:[-*+>]|[0-9]{1,3}[.)]|\[[ xX]\])[ \t]*)*$`)
 
 func hasLaterInlineKVAssignment(lineRest string) bool {
 	ws := strings.IndexAny(lineRest, " \t")
