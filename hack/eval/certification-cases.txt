@@ -37,6 +37,21 @@
 # seeded-networking, route unattached, no load balancer). A declared gap,
 # expected_fail: no audit reads the mismatch; the gap is #2576 (item 3).
 ./tasks/networking-gateway-ingress-port-mismatch/task.yaml
+# Capability row: networking fabric, load balancers and Gateway; the
+# obtainability audit on a node-networking DaemonSet with no toleration for a
+# tainted node pool (the fleet's cni-shaped-agent in seeded-shapes on slot a,
+# which covers the default pool alone while idle-batch-pool and
+# pinned-inference-pool run without it). A declared gap, expected_fail: no
+# audit reads a DaemonSet's coverage of a tainted pool; the gap is #2576
+# (item 2).
+./tasks/networking-ip-masq-agent-missing-ccc-toleration/task.yaml
+# Capability row: observability, logging and Managed Prometheus; the
+# obtainability audit on a Deployment whose container is throttled at its 50m
+# CPU limit with zero restarts (the planted fluent-bit in seeded-logging, a
+# busybox busy loop under equal requests and limits). A declared gap,
+# expected_fail: no audit reads a container's CPU usage against its CPU limit;
+# the gap is #2579, whose OOM half is observability-gmp-kube-state-metrics-oom.
+./tasks/observability-fluentbit-dcgm-cpu-throttling-oom/task.yaml
 # Capability row: observability, logging and Managed Prometheus; the
 # obtainability audit on a Deployment whose container is OOM-killed in a loop
 # (the planted kube-state-metrics in seeded-observability, busybox under a 64Mi
@@ -44,11 +59,25 @@
 # last termination or restart count; the gap is #2579.
 ./tasks/observability-gmp-kube-state-metrics-oom/task.yaml
 # Capability row: security, Workload Identity, RBAC and CVEs; the compliance
+# audit's default-sa-automount check on a Deployment that runs under the
+# default ServiceAccount with its token mounted (the planted
+# metrics-agent-deploy in seeded-sa-token). A declared gap, expected_fail: the
+# collector lists the workload, but the ledger body drops every major and
+# minor finding once the criticals fill its budget; the gap is #5052.
+./tasks/security-default-sa-token-mount-baseline/task.yaml
+# Capability row: security, Workload Identity, RBAC and CVEs; the compliance
 # audit on an admission webhook whose CA bundle certificate has expired (the
 # planted ValidatingWebhookConfiguration bench-expiring-webhook-ca, failurePolicy
 # Ignore on an inert group). A declared gap, expected_fail: no compliance check
 # reads a CA bundle's notAfter; the gap is #4960.
 ./tasks/security-expiring-node-bootstrap-and-webhook-certs/task.yaml
+# Capability row: security, Workload Identity, RBAC and CVEs; the compliance
+# audit on a fail-closed admission webhook whose backend Service does not exist
+# (the planted ValidatingWebhookConfiguration strict-policy-webhook, failurePolicy
+# Fail on an inert group, its clientConfig.service in a namespace nothing
+# creates). A declared gap, expected_fail: no compliance check reads an
+# admission webhook configuration; the gap is #5335.
+./tasks/security-webhook-blocks-config-management-system/task.yaml
 # Capability row: security, Workload Identity, RBAC and CVEs; the compliance
 # audit on a ServiceAccount whose Workload Identity annotation names a Google
 # service account with no workloadIdentityUser binding behind it (the planted
@@ -61,6 +90,10 @@
 # ReadWriteOnce claim (the planted single-writer-app and single-writer-data in
 # seeded-storage). A baseline: no gap declared.
 ./tasks/storage-rwo-pvc-rollingupdate-multiattach-deadlock/task.yaml
+# Capability row: cluster and node upgrades; the obtainability audit names a
+# three-replica Deployment that no PodDisruptionBudget selects (the planted
+# stateless-ingest-service in seeded-upgrades). A baseline: no gap declared.
+./tasks/upgrade-missing-pdb-drain-outage-baseline/task.yaml
 # Capability row: workloads, OOM, probes and HPA; the obtainability audit on a
 # Deployment whose HorizontalPodAutoscaler scales down with no stabilization
 # window and whose containers have no preStop hook (the planted web-api-server

@@ -267,6 +267,8 @@ func configFromEnv(log *slog.Logger) (hermesbridge.Config, error) {
 		TaskDeadline: time.Duration(envInt(log, "BRIDGE_TASK_DEADLINE_SECONDS", defaultTaskDeadlineSeconds)) * time.Second,
 		KillGrace:    time.Duration(envInt(log, "BRIDGE_KILL_GRACE_SECONDS", defaultKillGraceSeconds)) * time.Second,
 		KVBucket:     envOr("BRIDGE_KV_BUCKET", defaultKVBucket),
+		// Set by the operator (#4173): bind the pre-created intake durable.
+		DurablePrecreated: os.Getenv("BRIDGE_DURABLE_PRECREATED") == "true",
 		// The activity door (a2a/hermes-bridge/activity.go): on by default;
 		// each child is handed whatever address the door bound.
 		ActivityListen:   activityListen(envOr("BRIDGE_ACTIVITY_LISTEN", hermesbridge.DefaultActivityListen)),

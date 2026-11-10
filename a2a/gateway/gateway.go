@@ -370,6 +370,10 @@ type Gateway struct {
 	droppedNotices map[string]bool
 	// relayDurable is the event relay's durable name (Options.RelayDurable).
 	relayDurable string
+	// relayPrecreated is Config.RelayPrecreated, for the default durable
+	// only: a live test's own durable (Options.RelayDurable) isn't one the
+	// provision Job made, so that relay still creates it.
+	relayPrecreated bool
 	// relayBound is set once the event relay has bound; Readiness answers
 	// from it. relayHeldBack is set while a start after a crash holds the
 	// bind back (RunOptions.RelayBindDelay), so Readiness names that wait
@@ -609,6 +613,7 @@ func New(o Options) (*Gateway, error) {
 		a2aGoogleAllowed: a2aGoogleAllowed,
 		droppedNotices:   map[string]bool{},
 		relayDurable:     o.RelayDurable,
+		relayPrecreated:  o.Config.RelayPrecreated && o.RelayDurable == relayDurable,
 	}
 	g.inbox = newKeyedQueue(func(_ string, batch []InboundMessage) {
 		for _, msg := range batch {
@@ -719,11 +724,12 @@ func (g *Gateway) relaySubscribeConfig() lib.SubscribeConfig {
 	// Both task-event subjects, one durable: the executors' events and the
 	// terminals this gateway synthesizes as supervisor, which it relays to
 	// the requester and retires the task on exactly like an executor's own.
-	// Two filter subjects put the filter in the request body, which the
-	// gateway's unscoped consumer-create grant permits and a session's
-	// pinned grant would not; the durable already exists on every install
-	// with the single filter, and rebinding it to the pair is an update the
-	// server accepts (lib's rebind test).
+	// On a deployed install the provision Job creates this durable with
+	// both filters, and the gateway binds it with Precreated and never
+	// creates it (#4173). A live test's own durable, and a gateway run
+	// without the operator, still creates it: two filter subjects put the
+	// filter in the request body, and rebinding a single-filter durable to
+	// the pair is an update the server accepts (lib's rebind test).
 	agreement := SupervisorAgreement(g.cfg)
 	// WaitForStream: the provision Job creates TASKS, and on a three-server
 	// bus that can trail the gateway's start by more than lib's bind window.
@@ -738,6 +744,7 @@ func (g *Gateway) relaySubscribeConfig() lib.SubscribeConfig {
 		Agreement:     &agreement,
 		MaxAckPending: relayMaxAckPending,
 		WaitForStream: true,
+		Precreated:    g.relayPrecreated,
 	}
 }
 
@@ -2147,6 +2154,7 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 		}
 		state.Usage, state.ChildUsage, state.UsagePartial = g.chainUsage(ctx, rec, taskID, read, readTask)
 	}
+	state.ChildAddressees = chainChildAddressees(rec, taskID)
 	// A session turn whose request minted no child: its own completed is
 	// the hand-off line, and the observers were told the root failed with
 	// the reason (observeEnded). Report the same, by the same rule, on a
@@ -2224,6 +2232,28 @@ func (g *Gateway) chainUsage(ctx context.Context, rec *SessionRecord, taskID, re
 		}
 	}
 	return usageSum(frontTurns), usageSum(childTurns), partial
+}
+
+// chainChildAddressees is whom the delegation chain rooted at taskID's root
+// delegated to: the addressee each child task was minted for (the profile the
+// delegation resolved to, which for a cluster target may be a pinned
+// profile's own name, or platform), once each, in the record's order, which is the order
+// they were delegated. Empty, not nil, when the chain delegated nothing, so
+// the wire tells "none" from "unknown"; nil only when taskID is unknown.
+func chainChildAddressees(rec *SessionRecord, taskID string) []string {
+	ref, ok := rec.TaskRefFor(taskID)
+	if !ok {
+		return nil
+	}
+	root := ref.rootID()
+	out := []string{}
+	for _, t := range rec.Tasks {
+		if t.Role != taskRoleChild || t.rootID() != root || t.Addressee == "" || slices.Contains(out, t.Addressee) {
+			continue
+		}
+		out = append(out, t.Addressee)
+	}
+	return out
 }
 
 // usageSum is turns folded by lib.UsageTotal, or nil when there are none.

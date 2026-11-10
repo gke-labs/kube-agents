@@ -76,9 +76,11 @@ an older stage's no-repository skip ran the workload checks in the scan), and a 
 otherwise read as a healthy fleet. It also names every shipped fleet audit that ran since the sweep
 was filed and whose summary was not posted, however its run started, with a request for those
 reports (``_lost_audits``): an audit that finished before anyone opened the chat had no home channel
-to post to, and nothing posts it later. The note is built before the claim. The text path appends it
-to the report; the
-card paths print it on their own, since the card leaves closing lines out.
+to post to. A first-run audit's summary is posted after all by the ``oobe`` tick's last stage,
+``resend_lost_summaries``, once the operator projects a home channel, while its run is inside
+``RESEND_WINDOW_SECONDS``; every other one keeps the request. The note is built before the claim. The
+text path appends it to the report; the card paths print it on their own, since the card leaves
+closing lines out.
 
 Just before the claim, the run registers the sweep's findings in the
 findings queue from this pod, from the items and scores the prioritization
@@ -365,6 +367,14 @@ RELAY_POSTED_AT_FORMAT = "%Y-%m-%d %H:%M:%S"
 # One ended run: (claimed_at, finished_at, delivery_outcome, status).
 AuditRun = tuple[float, float | None, str | None, str]
 
+
+class LostRun(NamedTuple):
+    """One audit whose newest run in its window posted nothing: a lost summary, or a crashed run's lost notice."""
+
+    audit: str
+    crashed: bool
+    claimed_at: float
+
 # The sentence that names the home channel, and what replaces it where the gateway has none to post
 # to (no A2A_NOTIFY_PLATFORM on the conversation path).
 AUDITS_HOME_SENTENCE = "Each posts a summary to the home channel when it finds something new."
@@ -372,6 +382,40 @@ AUDITS_NO_HOME_SENTENCE = (
     "Each one's summary goes to the home channel, and this install has none yet, so those summaries "
     "are not posted to chat."
 )
+
+# A first-run audit whose summary found no home channel is posted again by the re-send stage
+# (``resend_lost_summaries``) once the operator projects one: a request to the chat relay's own route,
+# on the findings endpoint's server, so the relay reads the audit's chat report record and posts it as a
+# scheduled run's delivery leg would, and records the post in ``audit_report_runs``.
+CRON_REPORTS_PATH = "/v1/cron-reports"
+# The relay reads the audit's record only for a request carrying this key (session_kv_server.SCHEDULER_LEG_KEY).
+SCHEDULER_LEG_KEY = "also_delivered_to"
+# What the relay posts when it cannot tell the job for a fleet audit (its roster unreadable): the request
+# that fetches the report, so the message still leads to it.
+RESEND_FALLBACK_REPORT = (
+    "The {label} ran during onboarding, before this channel was set. To see its report, send me: `{request}`"
+)
+# A run is re-sent only while its claim is this recent. The relay posts an audit's record only under its own
+# two-hour age (session_kv_server.CHAT_REPORT_MAX_AGE_S) and a "did not finish" notice past it; the record is
+# written during the run, after the claim, so a claim inside this window keeps the record inside the relay's.
+RESEND_WINDOW_SECONDS = 90 * 60
+# The request's fields, as the relay plugin (deploy/docker/plugins/chat/adapter.py) names them.
+REQUEST_JOB_KEY = "job_id"
+REQUEST_PROFILE_KEY = "profile"
+REQUEST_TITLE_KEY = "title"
+REQUEST_REPORT_KEY = "report"
+# How many times one audit's re-send is tried, one per tick. An answered request settles the audit
+# (``RESENT_POSTED_KEY``); for one whose answer was lost the relay's own record decides; the cap is for a
+# relay that keeps refusing. A refusal while the gateway's projected copy of the home file still lags the
+# agent's (one kubelet refresh) costs one of these, and the gateway keeps that post for its digest.
+RESEND_MAX_ATTEMPTS = 5
+# One request to the relay, which posts synchronously and answers when the post has landed or failed.
+RESEND_TIMEOUT_SECONDS = 180
+RELAY_ANSWER_MAX_CHARS = 300
+# ``audit -> {"tries": n, "posted": bool}``, beside the other markers; absent until the first try.
+RESENT_FILE = ".oobe_summaries_resent.json"
+RESENT_TRIES_KEY = "tries"
+RESENT_POSTED_KEY = "posted"
 
 # Under spec.mode next the plugin records the conversation the report goes to (its
 # CONVERSATION_FILE) and touches CONVERSATION_ALIGNED_MARKER in place of .user_aligned. Either one
@@ -890,14 +934,18 @@ def _mark_registered(data_dir: Path) -> None:
         sys.stderr.write(f"bootstrap_delivery: could not touch {FINDINGS_REGISTERED_MARKER}: {e}\n")
 
 
-def _post_surfaced(endpoint: str, finding_id: str, body: dict) -> None:
+def _session_kv_headers() -> dict[str, str]:
     headers = dict(JSON_HEADERS)
     token = (os.environ.get(SESSION_KV_AUTH_ENV) or "").strip()
     if token:
         headers[AUTH_HEADER] = f"{BEARER_PREFIX}{token}"
+    return headers
+
+
+def _post_surfaced(endpoint: str, finding_id: str, body: dict) -> None:
     path = SURFACED_PATH.format(id=urllib.parse.quote(finding_id, safe=""))
     request = urllib.request.Request(
-        f"{endpoint}{path}", data=json.dumps(body).encode("utf-8"), headers=headers, method="POST"
+        f"{endpoint}{path}", data=json.dumps(body).encode("utf-8"), headers=_session_kv_headers(), method="POST"
     )
     with urllib.request.urlopen(request, timeout=MARK_TIMEOUT_SECONDS) as response:
         response.read()
@@ -1100,8 +1148,8 @@ def _lost_sentences(data_dir: Path, state: dict) -> list[str]:
     if runs is None:
         return [AUDITS_UNREAD_NOTE.format(request=_request(audits))]
     lost = _lost_audits(audits, runs, _windows(data_dir, state, audits), _relay_posts(data_dir))
-    summaries = [a for a, crashed in lost if not crashed]
-    failed = [a for a, crashed in lost if crashed]
+    summaries = [run.audit for run in lost if not run.crashed]
+    failed = [run.audit for run in lost if run.crashed]
     sentences = []
     if summaries:
         labels = ", ".join(_audit_label(a) for a in summaries)
@@ -1292,8 +1340,8 @@ def _relay_posts(data_dir: Path) -> dict[str, float] | None:
 
 
 def _lost_audits(audits: tuple[str, ...], runs: dict[str, list[AuditRun]], windows: dict[str, float],
-                 posts: dict[str, float] | None) -> list[tuple[str, bool]]:
-    """``(audit, its run failed)`` for each audit whose newest run in its window with something to post did not post it.
+                 posts: dict[str, float] | None) -> list[LostRun]:
+    """A ``LostRun`` for each audit whose newest run in its window with something to post did not post it.
 
     A run that ends before anyone has opened the chat finds no home channel, the relay refuses
     it, and nothing posts it later; this delivery is the first message that user reads. Runs are
@@ -1327,15 +1375,146 @@ def _lost_audits(audits: tuple[str, ...], runs: dict[str, list[AuditRun]], windo
                 continue
             if kind == OUTCOME_LOST and status == RUN_FAILED_STATUS:
                 if not crashed:
-                    lost.append((audit, True))
+                    lost.append(LostRun(audit, True, claimed))
                 crashed = True
                 continue
             if kind == OUTCOME_LOST:
-                lost.append((audit, False))
+                lost.append(LostRun(audit, False, claimed))
                 break
             if posts is None and status != RUN_FAILED_STATUS:
                 break
     return lost
+
+
+def _resend_state(data_dir: Path) -> dict[str, dict]:
+    """``audit -> {"tries": n, "posted": bool}`` from ``RESENT_FILE``; empty when absent or unreadable."""
+    try:
+        raw = json.loads((data_dir / RESENT_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {k: v for k, v in raw.items() if isinstance(k, str) and isinstance(v, dict)}
+
+
+def _resend_tries(entry: dict) -> int:
+    tries = entry.get(RESENT_TRIES_KEY)
+    return tries if isinstance(tries, int) and not isinstance(tries, bool) else 0
+
+
+def _record_resend(data_dir: Path, audit: str, tried: bool, posted: bool) -> None:
+    """Count a try and settle ``audit`` once the relay answered, replacing the file whole so a run killed
+    mid-write leaves the previous one."""
+    state = _resend_state(data_dir)
+    entry = state.get(audit, {})
+    entry[RESENT_TRIES_KEY] = _resend_tries(entry) + (1 if tried else 0)
+    entry[RESENT_POSTED_KEY] = bool(entry.get(RESENT_POSTED_KEY)) or posted
+    state[audit] = entry
+    target = data_dir / RESENT_FILE
+    tmp = target.with_name(target.name + oobe.TMP_SUFFIX)
+    tmp.write_text(json.dumps(state, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.replace(target)
+
+
+class RelayAnswer(NamedTuple):
+    """One request's outcome: the line for the log, whether the relay answered (the audit is settled), and
+    whether the request counts as a try."""
+
+    outcome: str
+    posted: bool
+    tried: bool
+
+
+def pending_resends(data_dir: Path, state: dict, now: float) -> list[LostRun]:
+    """The first-run audits whose summary found no home channel and whose report the relay can still post.
+
+    ``_lost_audits`` over the first-run chain, less the crashed runs (a failure notice is not a report), the
+    runs claimed more than ``RESEND_WINDOW_SECONDS`` ago, and the audits tried ``RESEND_MAX_ATTEMPTS`` times.
+    Less the audits the relay answered for (``RESENT_POSTED_KEY``): a relay row settles the audit in
+    ``_lost_audits`` only until a later run of it fails, after which the earlier run reads as lost again, and
+    a relay that could not tell the job posted the request text and wrote no row. Nothing when the run records
+    or the relay's cannot be read: without the relay's record a post whose answer was lost cannot be told from
+    a lost one, and a second copy is what the record guards against.
+    """
+    audits = tuple(oobe.FIRST_RUN_AUDITS)
+    runs = _audit_runs(data_dir, audits)
+    if not runs:
+        return []
+    posts = _relay_posts(data_dir)
+    if posts is None:
+        return []
+    resent = _resend_state(data_dir)
+    return [
+        run
+        for run in _lost_audits(audits, runs, _windows(data_dir, state, audits), posts)
+        if not run.crashed
+        and now - run.claimed_at <= RESEND_WINDOW_SECONDS
+        and not resent.get(run.audit, {}).get(RESENT_POSTED_KEY)
+        and _resend_tries(resent.get(run.audit, {})) < RESEND_MAX_ATTEMPTS
+    ]
+
+
+def _job_titles(data_dir: Path) -> dict[str, str]:
+    """``job id -> name`` from the Platform Agent's roster, the title a scheduled delivery carries; empty when unreadable."""
+    jobs = oobe.roster_jobs(data_dir) or []
+    return {str(job["id"]): str(job.get("name") or "") for job in jobs if job.get("id")}
+
+
+def _post_cron_report(audit: str, title: str) -> RelayAnswer:
+    """Ask the relay to post ``audit``'s latest report as a scheduled run's delivery leg would.
+
+    A 2xx settles the audit: the relay posted the report, or a notice in its place, and asking again
+    would post a notice. A refusal is a try; so is an answer that does not come, which is not a
+    failure: the relay may have posted, and its record says so next tick.
+    """
+    body = {
+        REQUEST_JOB_KEY: audit,
+        REQUEST_PROFILE_KEY: oobe.PLATFORM_PROFILE,
+        REQUEST_TITLE_KEY: title,
+        REQUEST_REPORT_KEY: RESEND_FALLBACK_REPORT.format(label=title, request=_request([audit])),
+        SCHEDULER_LEG_KEY: [],
+    }
+    request = urllib.request.Request(
+        f"{_findings_endpoint()}{CRON_REPORTS_PATH}",
+        data=json.dumps(body).encode("utf-8"),
+        headers=_session_kv_headers(),
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=RESEND_TIMEOUT_SECONDS) as response:
+            answer = json.loads(response.read().decode("utf-8", "replace") or "{}")
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:RELAY_ANSWER_MAX_CHARS]
+        return RelayAnswer(f"the relay answered {e.code}: {detail}", False, True)
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        return RelayAnswer(f"no answer from the relay, which may have posted; its record decides the next tick: {e!r}", False, True)
+    status = answer.get("status") if isinstance(answer, dict) else None
+    return RelayAnswer(f"the relay answered {status or 'ok'}", True, True)
+
+
+def resend_lost_summaries(data_dir: Path, now: float) -> None:
+    """The ``oobe`` stage that posts the first-run audit summaries the want of a home channel lost.
+
+    A first-run audit that ends before anyone has opened the chat finds no home channel: under
+    ``spec.mode: next`` the gateway keeps the post for its digest, the run is recorded failed, and
+    nothing posts the summary once the channel is learned minutes later. This stage watches the home
+    channel the operator projects into the pod (``chat_notify.home_file``: Slack under next; today mode
+    and Google Chat project none, and get no re-send) and, once it names a channel, asks the chat relay
+    to post each pending run's report through the route a scheduled run's delivery leg takes, so the
+    relay reads the audit's own chat report record, posts it the same way, and records the post. The
+    relay's answer settles the audit in ``RESENT_FILE``; for a request whose answer was lost the relay's
+    record decides. Each outcome goes to the stage log.
+    """
+    if not chat_notify.home_file_value():
+        return
+    pending = pending_resends(data_dir, oobe.read_state(data_dir), now)
+    if not pending:
+        return
+    titles = _job_titles(data_dir)
+    for run in pending:
+        answer = _post_cron_report(run.audit, titles.get(run.audit) or run.audit)
+        _record_resend(data_dir, run.audit, answer.tried, answer.posted)
+        _stage_note(data_dir, f"re-sent the {run.audit} summary to the home channel: {answer.outcome}")
 
 
 def _stage_note(data_dir: Path, message: str) -> None:

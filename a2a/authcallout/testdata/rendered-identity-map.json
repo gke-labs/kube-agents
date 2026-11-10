@@ -1,5 +1,5 @@
 {
-  "version": "f0e8d8237ce63a35",
+  "version": "9671c501d2681112",
   "shard": 0,
   "shards": 1,
   "identities": [
@@ -40,6 +40,12 @@
           "$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
           "$JS.API.STREAM.INFO.PROFILE_SUBMITS",
           "$JS.API.STREAM.INFO.DISPATCH_STOPS",
+          "$JS.API.CONSUMER.INFO.TASKS.gateway-relay",
+          "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay",
+          "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay.>",
+          "$JS.API.CONSUMER.INFO.TASKS.bridge-platform",
+          "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform",
+          "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform.>",
           "_INBOX.provision.>"
         ],
         "subscribe": [

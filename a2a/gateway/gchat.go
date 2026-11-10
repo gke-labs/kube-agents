@@ -700,11 +700,11 @@ func (a *GoogleChatAdapter) PostNotifyMessage(space, thread string, m OutMessage
 }
 
 // createLaidOut lays m.Chat out and creates it in space, as a reply on
-// thread when one is given, and remembers it when it carries choices,
-// bound to conversation (empty for a home post). A rated answer in a
-// conversation ends with the rating buttons; when Chat refuses that layout
-// it is created once more without them, and that outcome is returned. The
-// question is remembered without the rating buttons.
+// thread when one is given, records the layout it sent (gchat_layout.go),
+// and remembers the question when it carries choices, bound to
+// conversation (empty for a home post). A rated answer in a conversation
+// ends with the rating buttons; when Chat refuses that layout it is created
+// once more without them, and that outcome is returned and recorded.
 func (a *GoogleChatAdapter) createLaidOut(space, thread, conversation string, m OutMessage) (message, landed string, err error) {
 	layout, err := renderGchatChat(m.Chat)
 	if err != nil {
@@ -730,15 +730,13 @@ func (a *GoogleChatAdapter) createLaidOut(space, thread, conversation string, m 
 			return "", "", gchatLayoutError(err, false)
 		}
 	}
-	if rating.task != "" {
-		a.rememberRating(message, rating)
-	}
-	a.trackQuestion(message, conversation, m.Chat, layout)
 	sent := layout
 	if rating.task != "" {
+		a.rememberRating(message, rating)
 		sent = rated
 	}
-	a.trackBoard(message, m.Chat, sent)
+	a.trackQuestion(message, conversation, m.Chat)
+	a.trackLayout(message, m.Chat, sent)
 	return message, landed, nil
 }
 
@@ -807,8 +805,9 @@ func (a *GoogleChatAdapter) EditNotifyMessage(space, _, messageID string, m OutM
 }
 
 // editLaidOut patches messageID to m, laid out when m carries a chat
-// message and as text otherwise, and tracks the question it opens or closes
-// under conversation, or under no conversation for a home post. A re-ask whose
+// message and as text otherwise, records the layout it sent
+// (gchat_layout.go), and tracks the question it opens or closes under
+// conversation, or under no conversation for a home post. A re-ask whose
 // layout is refused forgets the earlier answer, since the notifier's text
 // edit follows and must not carry the answer's line; one that fails with the
 // message left as it was keeps the answer the message still shows. A
@@ -861,8 +860,8 @@ func (a *GoogleChatAdapter) editLaidOut(conversation, messageID string, m OutMes
 		}
 		return err
 	}
-	a.trackQuestion(messageID, conversation, m.Chat, layout)
-	a.trackBoard(messageID, m.Chat, layout)
+	a.trackQuestion(messageID, conversation, m.Chat)
+	a.trackLayout(messageID, m.Chat, layout)
 	return nil
 }
 

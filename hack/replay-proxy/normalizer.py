@@ -95,6 +95,21 @@ RUN_ID_SUFFIX = "_run_id"
 EVENTS_KEY = "events"
 EVENT_KIND_KEY = "kind"
 HEARTBEAT_KIND = "heartbeat"
+# `queued` is the dispatcher noting that the card waited for a free worker
+# ("Queued: the system is busy", with how many were running): whether a card
+# has one depends on what else was running at that moment. Dropped like a
+# heartbeat. A dropped event's values that cannot be put back in an answer (an
+# epoch `created_at`, a date) still count against one (Normalizer.dropped_guards).
+QUEUED_KIND = "queued"
+DROPPED_EVENT_KINDS = (HEARTBEAT_KIND, QUEUED_KIND)
+EVENT_PAYLOAD_KEY = "payload"
+# A dropped event's payload counts (`running`, `limit`, `ahead`) are plain
+# numbers no placeholder can restore. An answer repeating one counts as
+# repeating a swapped number when it repeats it next to its key, or anywhere in
+# an answer that talks about the queue: no answer quotes the queue without one
+# of these words, and refusing every answer holding a small number would refuse
+# about one answer in five that follows a queued card (Nov 7 shadow data).
+QUEUE_WORDS_RE = re.compile(r"\bqueue[ds]?\b|\bqueu(?:e)?ing\b|\bahead\b|\bbehind\b|system is busy|frees up", re.I)
 # gcloud writes warnings to stderr, and the shell tool merges stderr into the
 # output in whatever order the two streams arrive: the same command's warning
 # came before its JSON in one run and after it in the next. Only that shape is
@@ -293,10 +308,54 @@ IPV4_OCTET_MAX = 255
 # Kubernetes' random-suffix alphabet (k8s.io/apimachinery rand.SafeEncodeString).
 K8S_SAFE = "bcdfghjklmnpqrstvwxz2456789"
 
+# The eval pool's GCP projects (docs/ci-pool-projects.md): `kube-agents-evals`,
+# then `kube-agents-evals-2` up. Every Prow build leases its own, and the name
+# is in the Cluster Agent's profile (`cluster-kube-agents-evals-31-seeded-a-…`),
+# the front door's specialist list, the GitOps repository
+# (`gke-agentic/kube-agents-evals-31-infra`) and tool results, so it is an
+# identifier. A numbered name is one wherever no letter or digit comes before
+# it and none follows its number (`xkube-agents-evals-31` stays). The bare name is also the start of names that belong to
+# no project and are the same in every run (`kube-agents-evals-token-minter`,
+# `kube-agents-evals-large-gitops`), so it counts only on its own or before a
+# part that pool projects add to their own names. A percent-escape before it is
+# a boundary too (`project_id%3D%22kube-agents-evals-22%22` in a console URL).
+EVAL_POOL_PROJECT = "kube-agents-evals"
+EVAL_POOL_NAME_PARTS = ("infra", "seeded", "platform", "us")
+PERCENT_ESCAPE_BEFORE = r"(?<=%[0-9A-Fa-f]{2})"
+EVAL_POOL_PROJECT_RE = re.compile(
+    r"(?:(?<![A-Za-z0-9])|" + PERCENT_ESCAPE_BEFORE + r")" + re.escape(EVAL_POOL_PROJECT)
+    + r"(?:-\d+(?![A-Za-z0-9])|(?![A-Za-z0-9-])|(?=-(?:" + "|".join(EVAL_POOL_NAME_PARTS) + r")(?![A-Za-z0-9])))"
+)
+EVAL_POOL_CLASS = "EVALPROJECT"
+# A repository's commit as `owner/repo@<sha>` (`gke-agentic/kube-agents-evals-31-infra@c99b1ab`): each
+# pool project's repository has its own history. The owner and repository may
+# already be placeholders when the pattern runs over a normalized answer.
+COMMIT_CLASS = "COMMIT"
+COMMIT_MIN_HEX = 7
+COMMIT_MAX_HEX = 40
+COMMIT_HEX = r"([0-9a-f]{" + str(COMMIT_MIN_HEX) + "," + str(COMMIT_MAX_HEX) + r"})(?![0-9A-Za-z])"
+COMMIT_RE = re.compile(r"[\w.⟦⟧-]+/[\w.⟦⟧-]+@" + COMMIT_HEX)
+# The same commits in a forge URL: `…/blob/<sha>/README.md`, `…/tree/<sha>`, `…/commit/<sha>`.
+COMMIT_URL_RE = re.compile(r"/(?:blob|tree|commit|commits)/" + COMMIT_HEX)
+# A run of hex an answer may hold a bound commit as, anywhere, or abbreviate one to
+# (Mapping.apply_to_answer, Mapping.identifier_left_literal).
+HEX_RUN_RE = re.compile(r"(?<![0-9A-Za-z])[0-9a-f]{" + str(COMMIT_MIN_HEX) + r",}(?![0-9A-Za-z])")
+# A run of hex with a letter in it: one with digits only is a number, not a commit.
+HEX_LETTER_RE = re.compile(r"[a-f]")
+
 # (class, pattern, group): identifier classes in the order they are applied.
 # Longer, more specific shapes go first. `group` is the part replaced; the
 # rest of the match stays literal (a pod keeps its workload name).
 ID_CLASSES: List[Tuple[str, "re.Pattern[str]", int]] = [
+    # GKE operation: operation-<epoch ms>-<uuid>. Before UID, which would take the uuid alone.
+    ("GKEOP", re.compile(
+        r"\boperation-(1\d{12}-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b"), 1),
+    (COMMIT_CLASS, COMMIT_RE, 1),
+    (COMMIT_CLASS, COMMIT_URL_RE, 1),
+    (EVAL_POOL_CLASS, EVAL_POOL_PROJECT_RE, 0),
+    # The fleet audit's declared-intent clone directory, a Python tempfile name:
+    # `declared-intent-` (CLONE_TMP_PREFIX in audit_report.py) and 8 random characters.
+    ("TMPNAME", re.compile(r"(?<![A-Za-z0-9])declared-intent-([a-z0-9_]{8})(?![A-Za-z0-9_-])"), 1),
     ("UID", re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b"), 0),
     # Hermes session id: 20261102_002640_791a68.
     ("SESSION", re.compile(r"\b\d{8}_\d{6}_[0-9a-f]{4,}\b"), 0),
@@ -307,8 +366,10 @@ ID_CLASSES: List[Tuple[str, "re.Pattern[str]", int]] = [
     ("TASK", re.compile(r"\bt_[0-9a-f]{8}\b"), 0),
     ("A2ATASK", re.compile(r"\btask-[0-9a-f]{16}\b"), 0),
     ("INJ", re.compile(r"\binj-\d+\b"), 0),
-    # GKE node: gke-<cluster>-<pool>-<8 hex>-<4>; the cluster and pool stay.
-    ("NODE", re.compile(r"\bgke-[a-z0-9-]+?-([0-9a-f]{8}-[a-z0-9]{4})\b"), 1),
+    # GKE node: gke-<cluster>-<pool>-<8 hex>-<4>; the cluster and pool stay. The
+    # name may hold a placeholder already (`gke-⟦EVALPROJECT_1⟧-default-pool-…`).
+    ("NODE", re.compile(r"\bgke-(?:[a-z0-9-]|" + re.escape(OPEN) + r"[A-Za-z0-9_]+" + re.escape(CLOSE) + r")+?"
+                        r"-([0-9a-f]{8}-[a-z0-9]{4})\b"), 1),
     # Pod of a ReplicaSet: <workload>-<template hash>-<5>; the workload stays.
     ("POD", re.compile(r"\b[a-z0-9](?:[a-z0-9-]*[a-z0-9])?-([" + K8S_SAFE + r"]{6,10}-[" + K8S_SAFE + r"]{5})\b"), 1),
 ]
@@ -325,11 +386,18 @@ TIMESTAMP_PATTERNS = (ISO_TS_RE, RFC1123_RE, OPENSSL_TS_RE, LS_DATE_RE)
 # Hermes appends `## Recent work by @<assignee>` (the assignee's last runs on
 # other cards, one `- ` line each, then a blank line) to every card view. It
 # differs between otherwise identical runs, so it is dropped from the key
-# (#1730). Matched with real and JSON-escaped newlines.
-RECENT_WORK_RE = re.compile(r"(?m)^## Recent work by @[^\n]*\n(?:- [^\n]*(?:\n|$))*")
-RECENT_WORK_ESCAPED_RE = re.compile(r"## Recent work by @(?:(?!\\n).)*(?:\\n- (?:(?!\\n).)*)*")
-RECENT_WORK_STRIPPED = "## Recent work [stripped]\n"
-RECENT_WORK_ESCAPED_STRIPPED = "## Recent work [stripped]"
+# (#1730). Whether a card view has one at all depends on whether the assignee
+# happened to finish another card first, so the header goes too, with the blank
+# line that separates it from the section before (Hermes joins sections with
+# one): a view with the digest keys as the same view without it. A digest with
+# no blank line before it takes the line breaks after it instead. Matched with
+# real and JSON-escaped newlines.
+RECENT_WORK_SECTION = r"## Recent work by @[^\n]*(?:\n- [^\n]*)*"
+RECENT_WORK_RE = re.compile(r"\n\n" + RECENT_WORK_SECTION + r"(?=\n|\Z)|(?m:^)" + RECENT_WORK_SECTION + r"(?:\n\n?)?")
+RECENT_WORK_ESCAPED_SECTION = r"## Recent work by @(?:(?!\\n).)*(?:\\n- (?:(?!\\n).)*)*"
+RECENT_WORK_ESCAPED_RE = re.compile(
+    r"\\n\\n" + RECENT_WORK_ESCAPED_SECTION + r"(?=\\n|\Z|\")|" + RECENT_WORK_ESCAPED_SECTION + r"(?:\\n(?:\\n)?)?"
+)
 
 # A string that may hold a JSON document (a tool result usually does).
 JSON_OPENERS = "{["
@@ -344,7 +412,7 @@ TOKEN_AFTER = r"(?![A-Za-z0-9+/=_-])"
 # Classes whose value is the tail of a longer name (`web-` + the pod's hash
 # suffix, `gke-…-` + the node's): in an answer that tail follows a `-` or `_`,
 # so those may border it on the left.
-SUFFIX_CLASSES = ("POD", "NODE", "SCRATCH", "TERMOUT")
+SUFFIX_CLASSES = ("POD", "NODE", "SCRATCH", "TERMOUT", "TMPNAME", "GKEOP")
 SUFFIX_TOKEN_BEFORE = r"(?<![A-Za-z0-9+/=])"
 # A bare number is a token when no word character, `.` or `-` precedes it and
 # no word character or `.`+digit follows it: `1` in `1.31`, `node-pool-1` or
@@ -502,8 +570,8 @@ def key_timed(key: Any) -> bool:
 
 def strip_recent_work(text: str) -> str:
     """Drop the `## Recent work` digest, which the key leaves out (RECENT_WORK_RE)."""
-    text = RECENT_WORK_RE.sub(RECENT_WORK_STRIPPED, text)
-    return RECENT_WORK_ESCAPED_RE.sub(RECENT_WORK_ESCAPED_STRIPPED, text)
+    text = RECENT_WORK_RE.sub("", text)
+    return RECENT_WORK_ESCAPED_RE.sub("", text)
 
 
 @dataclass
@@ -530,6 +598,12 @@ class Mapping:
     # reading of the clock, and a served `--since 5m` must not become this
     # run's `--since 3m`; an answer repeating one is not saved instead.
     ages: set = field(default_factory=set)
+    # What text the key drops held that an answer must not repeat: a dropped
+    # event's payload counts and their keys (QUEUE_WORDS_RE), and the runs of
+    # hex a dropped recent-work digest held outside any identifier (a commit).
+    dropped_counts: set = field(default_factory=set)
+    dropped_count_keys: set = field(default_factory=set)
+    dropped_hex: set = field(default_factory=set)
 
     def add_date(self, when: "date", today: bool) -> None:
         self.dates.add(when)
@@ -554,7 +628,8 @@ class Mapping:
 
     def copy(self) -> "Mapping":
         return Mapping(dict(self.to_placeholder), dict(self.to_value), dict(self.counts), set(self.bare_numbers),
-                       set(self.dates), set(self.today_dates), list(self.time_occurrences), set(self.ages))
+                       set(self.dates), set(self.today_dates), list(self.time_occurrences), set(self.ages),
+                       set(self.dropped_counts), set(self.dropped_count_keys), set(self.dropped_hex))
 
     def swappable_values(self) -> Dict[str, str]:
         """Values an answer may be rewritten with: not opaque, not bare numbers."""
@@ -569,6 +644,11 @@ class Mapping:
     def bound(self, value: str) -> Optional[str]:
         """The placeholder a swappable value is bound to, if any."""
         return self.to_placeholder.get(MAPPING_KEY_SEPARATOR + value)
+
+    def bound_commit(self, value: str) -> Optional[str]:
+        """The placeholder a bound commit is bound to, if `value` is one: a commit is one wherever it is a whole run of hex."""
+        token = self.bound(value)
+        return token if token is not None and token_class(token) == COMMIT_CLASS else None
 
     def bound_time(self, literal: str) -> Optional[str]:
         """The placeholder for a timestamp's text: every position it held outside assistant messages, if any."""
@@ -608,8 +688,17 @@ class Mapping:
         for cls, pattern, group in ID_CLASSES:
             text = Normalizer.sub_group(pattern, group, lambda v: self.bound(v) or v, text)
         text = IPV4_RE.sub(lambda m: self.bound(m.group(0)) or m.group(0), text)
+        text = self.swap_bare_commits(text)
         for pattern in TIMESTAMP_PATTERNS:
             text = pattern.sub(lambda m: self.bound_time(m.group(0)) or m.group(0), text)
+        return self.swap_whole_tokens(text)
+
+    def swap_bare_commits(self, text: str) -> str:
+        """Swap each whole run of hex that is a bound commit for its placeholder."""
+        return HEX_RUN_RE.sub(lambda m: self.bound_commit(m.group(0)) or m.group(0), text)
+
+    def swap_whole_tokens(self, text: str) -> str:
+        """Swap each bound value where it is a whole token, longest first; a suffix class's may follow `-` or `_`."""
         for value, token in sorted(self.swappable_values().items(), key=lambda kv: len(kv[0]), reverse=True):
             if value not in text:
                 continue
@@ -652,25 +741,43 @@ class Mapping:
 
         A backstop for apply_to_answer: such an answer would be served with the
         recording's value. IPs count only where no digit or `.`+digit borders
-        them, so 10.1.2.3 is not found in 10.1.2.30.
+        them, so 10.1.2.3 is not found in 10.1.2.30. A commit counts also as
+        any run of 7 or more hex digits that starts it, or that it starts: an
+        answer may shorten `…@c99b1ab1fee8…` to `c99b1ab`, and no pattern binds that.
         """
+        hex_runs = None
         for key, token in self.to_placeholder.items():
             cls, value = key.split(MAPPING_KEY_SEPARATOR, 1)
-            if cls or token_class(token) not in IDENTIFIER_CLASSES or value not in text:
+            if cls or token_class(token) not in IDENTIFIER_CLASSES:
+                continue
+            if token_class(token) == COMMIT_CLASS:
+                if hex_runs is None:
+                    hex_runs = HEX_RUN_RE.findall(text)
+                if any(run.startswith(value) or value.startswith(run) for run in hex_runs):
+                    return True
+            if value not in text:
                 continue
             if token_class(token) != IP_CLASS or re.search(IP_LITERAL_BEFORE + re.escape(value) + IP_LITERAL_AFTER, text):
                 return True
         return False
 
-    @staticmethod
-    def has_identifier(text: str) -> bool:
-        """Whether a normalized answer still holds an identifier shape (ID_CLASSES).
+    def has_identifier(self, text: str) -> bool:
+        """Whether a normalized answer still holds an identifier shape (ID_CLASSES), or a dropped digest's hex.
 
         After apply_to_answer, any left is one the key never bound (it sat in
         text the key drops, like the recent-work digest, or the model made it),
-        so no placeholder can bring it up to date.
+        so no placeholder can bring it up to date. A commit the digest names has
+        no identifier shape once an answer writes it as plain hex, so the
+        digest's commits are kept to check (dropped_hex). As in
+        identifier_left_literal, a run counts when it starts a kept commit or a
+        kept commit starts it: an answer may shorten or lengthen a SHA.
         """
-        return any(pattern.search(text) for _, pattern, _ in ID_CLASSES)
+        if any(pattern.search(text) for _, pattern, _ in ID_CLASSES):
+            return True
+        if not self.dropped_hex:
+            return False
+        return any(run.startswith(kept) or kept.startswith(run)
+                   for run in HEX_RUN_RE.findall(text) for kept in self.dropped_hex)
 
     @staticmethod
     def has_timestamp(text: str) -> bool:
@@ -712,6 +819,21 @@ class Mapping:
                 pattern = r"(?<![A-Za-z0-9_])" + SHORT_NUMBER_KEYS + SHORT_NUMBER_KEY_GAP + re.escape(value) + NUMBER_AFTER
             if re.search(pattern, text):
                 return True
+        return self.answer_repeats_dropped_count(text)
+
+    def answer_repeats_dropped_count(self, text: str) -> bool:
+        """Whether an answer repeats a dropped event's payload count next to its key, or with the queue (QUEUE_WORDS_RE)."""
+        if not self.dropped_counts:
+            return False
+        queue = QUEUE_WORDS_RE.search(text) is not None
+        keys = "|".join(re.escape(k) for k in sorted(self.dropped_count_keys))
+        for value in self.dropped_counts:
+            token = NUMBER_BEFORE + re.escape(value) + NUMBER_AFTER
+            if queue and re.search(token, text):
+                return True
+            if keys and re.search(r"(?<![A-Za-z0-9_])(?:" + keys + r")" + SHORT_NUMBER_KEY_GAP + re.escape(value) + NUMBER_AFTER,
+                                  text):
+                return True
         return False
 
 
@@ -734,6 +856,9 @@ class Normalizer:
         # Whether a value in any object or list enclosing the one being walked
         # holds a time of day (timed): then no date in it is day-counted.
         self.time_beside = False
+        # Whether the message being walked is an assistant message (walk_message):
+        # then text() also swaps bound values as Mapping.apply_to_answer does.
+        self.in_answer = False
         # Per-request caches: a string's parsed JSON document (nested_json),
         # whether a string or container holds a time of day (timed), and a
         # string's TimeIndex, so each is computed once however often it is asked.
@@ -758,12 +883,22 @@ class Normalizer:
             return self.text(obj)
         if isinstance(obj, (list, dict)):
             items = self.kept_items(obj, key, is_tool_call)
+            self.dropped_guards(obj, key)
             beside = self.siblings_timed(items)
             walked = [self.beside(flag, lambda item=item: self.walk(*item)) for item, flag in zip(items, beside)]
             if isinstance(obj, dict):
                 return {item[1]: value for item, value in zip(items, walked)}
             return walked
         return obj
+
+    def walk_message(self, message: Any) -> Any:
+        """Walk one request message; an assistant message's text also gets the answer-only swaps (text)."""
+        outer = self.in_answer
+        self.in_answer = isinstance(message, dict) and message.get(ROLE_FIELD) == ASSISTANT_ROLE
+        try:
+            return self.walk(message)
+        finally:
+            self.in_answer = outer
 
     def replacement(self, obj: Any, key: Optional[str], in_tool_call: bool) -> Optional[Callable[[], Any]]:
         """What `walk` swaps `obj` for whole (a placeholder or token), as a call, or None when it walks into it."""
@@ -781,13 +916,79 @@ class Normalizer:
     def kept_items(obj: Any, key: Optional[str], is_tool_call: bool) -> List[Tuple[Any, Optional[str], bool, bool]]:
         """The children `walk` keeps, as its arguments: (value, key or None, in_tool_call, is_tool_call).
 
-        A dict's keys come sorted; a kanban card's heartbeat events are dropped.
+        A dict's keys come sorted; a kanban card's heartbeat and queued events are dropped.
         """
         if isinstance(obj, dict):
             return [(obj[k], k, is_tool_call, False) for k in sorted(obj)]
         if key == EVENTS_KEY:
-            obj = [v for v in obj if not (isinstance(v, dict) and v.get(EVENT_KIND_KEY) == HEARTBEAT_KIND)]
+            obj = [v for v in obj if not Normalizer.dropped_event(v)]
         return [(v, None, False, key == TOOL_CALLS_KEY and isinstance(v, dict)) for v in obj]
+
+    @staticmethod
+    def dropped_event(value: Any) -> bool:
+        return isinstance(value, dict) and value.get(EVENT_KIND_KEY) in DROPPED_EVENT_KINDS
+
+    def dropped_guards(self, obj: Any, key: Optional[str]) -> None:
+        """Note what an answer must not repeat from the events kept_items drops, without keying them.
+
+        Each is walked by a throwaway normalizer, so no placeholder is numbered
+        for it; its unrestorable values (an epoch `created_at`, a keyed number,
+        an age, a day-counted date) join this request's. An identifier only a
+        dropped event holds is unbound, which has_identifier already refuses.
+        """
+        if key != EVENTS_KEY or not isinstance(obj, list):
+            return
+        for event in obj:
+            if not self.dropped_event(event):
+                continue
+            scratch = Normalizer(self.now, self.keep_ips)
+            scratch.walk(event)
+            self.merge_unrestorable(scratch.mapping)
+            self.note_counts(event.get(EVENT_PAYLOAD_KEY))
+
+    def merge_unrestorable(self, other: "Mapping") -> None:
+        """Add what another (throwaway) mapping noted as unrestorable to this request's."""
+        self.mapping.bare_numbers |= other.bare_numbers
+        self.mapping.ages |= other.ages
+        self.mapping.dates |= other.dates
+        self.mapping.today_dates |= other.today_dates
+
+    def note_counts(self, payload: Any, key: Optional[str] = None) -> None:
+        """Every integer in a dropped event's payload, with the key it sat under (Mapping.answer_repeats_dropped_count)."""
+        if isinstance(payload, bool):
+            return
+        if isinstance(payload, int):
+            self.mapping.dropped_counts.add(str(payload))
+            if key is not None:
+                self.mapping.dropped_count_keys.add(key)
+        elif isinstance(payload, dict):
+            for k, v in payload.items():
+                self.note_counts(v, k if isinstance(k, str) else None)
+        elif isinstance(payload, list):
+            for v in payload:
+                self.note_counts(v, key)
+
+    def digest_guards(self, text: str) -> None:
+        """Note what an answer must not repeat from the recent-work digests strip_recent_work drops from `text`.
+
+        Each digest is read by a throwaway normalizer, as a dropped event is
+        (dropped_guards): its keyed numbers, epochs, ages and day-counted dates
+        join this request's. Its identifiers are unbound, which has_identifier
+        refuses while they keep their shape. Its commits are kept for it as
+        plain hex too: a run of hex outside any identifier, and every commit the
+        throwaway normalizer bound (`owner/repo@<sha>`, a `/commit/<sha>` URL),
+        since an answer may repeat either as a bare SHA.
+        """
+        for pattern in (RECENT_WORK_RE, RECENT_WORK_ESCAPED_RE):
+            for m in pattern.finditer(text):
+                scratch = Normalizer(self.now, self.keep_ips)
+                digest = scratch.text(m.group(0), strip=False)
+                self.merge_unrestorable(scratch.mapping)
+                self.mapping.dropped_hex.update(run for run in HEX_RUN_RE.findall(PLACEHOLDER_RE.sub(" ", digest))
+                                                if HEX_LETTER_RE.search(run))
+                self.mapping.dropped_hex.update(scratch.mapping.to_value[token]
+                                                for token in scratch.mapping.to_value
+                                                if token_class(token) == COMMIT_CLASS)
 
     def beside(self, flag: bool, walk: Callable[[], Any]) -> Any:
         """Run `walk` with time_beside also set when `flag` is, then restore the enclosing value.
@@ -875,13 +1076,35 @@ class Normalizer:
             return self.timed_containers[cache_key]
         return False
 
-    def text(self, text: str) -> str:
+    def text(self, text: str, strip: bool = True) -> str:
+        """Normalize a string; `strip` False leaves a recent-work digest in (digest_guards reads one so).
+
+        In an assistant message (in_answer), the values bound so far are first
+        swapped as Mapping.apply_to_answer swaps them, in its order: identifiers
+        already bound, then a bound commit as a bare run of hex, then a bound
+        value as a whole token outside its pattern (`clone-<tmpname>`). A served
+        answer comes back in the next request's history with this run's values
+        where the recording had its own, so both must key the same. Before the
+        binding identifier pass, which would bind part of such a token afresh
+        (the uuid of `old_<operation>`); after the age columns, which read
+        positions. It binds nothing; a value it swaps is the placeholder the
+        binding pass would have given it.
+        """
         text = warnings_last(text)
         nested = self.nested_json(text)
         if nested is not None:
             return json.dumps(self.walk(nested), sort_keys=True, ensure_ascii=False)
-        text = strip_recent_work(text)
+        if strip:
+            self.digest_guards(text)
+            text = strip_recent_work(text)
         text = self.age_columns(text)
+        if self.in_answer:
+            # Mapping.apply_to_answer's order: identifiers already bound first
+            # (looked up, never bound here), then the bare-commit and whole-token
+            # swaps, so a commit equal to one segment of a bound uuid never splits it.
+            for cls, pattern, group in ID_CLASSES:
+                text = self.sub_group(pattern, group, lambda v: self.mapping.bound(v) or v, text)
+            text = self.mapping.swap_whole_tokens(self.mapping.swap_bare_commits(text))
         for cls, pattern, group in ID_CLASSES:
             text = self.sub_group(pattern, group, lambda v, c=cls: self.mapping.placeholder(c, v), text)
         text = self.timestamps(text)
@@ -1165,7 +1388,7 @@ def normalize_request(body: Dict[str, Any], now: float) -> NormalizedRequest:
     # a slot blanks an answer's words, so a position counted there could shift.
     for message in raw_messages if isinstance(raw_messages, list) else []:
         normalizer.time_literals = []
-        messages.append(normalizer.walk(message))
+        messages.append(normalizer.walk_message(message))
         if not (isinstance(message, dict) and message.get(ROLE_FIELD) == ASSISTANT_ROLE):
             normalizer.mapping.time_occurrences += normalizer.time_literals
     history_mapping = normalizer.mapping.copy()
@@ -1270,7 +1493,7 @@ def answer_after(normalized: NormalizedRequest, answer: Any) -> str:
     walker = Normalizer(normalized.now, normalized.keep_ips)
     walker.mapping = normalized.history_mapping.copy()
     message = dict(answer, role=ASSISTANT_ROLE) if isinstance(answer, dict) else answer
-    return answer_identity(walker.walk(message))
+    return answer_identity(walker.walk_message(message))
 
 
 def answer_variant(normalized: NormalizedRequest, answer: Any, context: KeyContext) -> Tuple[str, str]:

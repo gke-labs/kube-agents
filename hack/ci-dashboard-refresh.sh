@@ -49,9 +49,9 @@
 #                              gitlab, its own watermark); empty disables it
 #   EVAL_DASHBOARD_GITLAB_PR_GLOB_PREVIOUS  that lane's archive before the
 #                              move, read alongside; empty disables it
-#   EVAL_DASHBOARD_GITLAB_NIGHTLY_PREFIX  the GitLab lane's nightly periodic's
-#                              log prefix (tier gitlab, no pull request, its
-#                              own watermark); empty disables it
+#   EVAL_DASHBOARD_GITLAB_NIGHTLY_PREFIX  a GitLab nightly's log prefix read
+#                              as tier gitlab; empty (the default since the
+#                              lane's today-mode nightly retired) disables it
 #   EVAL_DASHBOARD_LANE_PR_GLOBS  the other forge lanes' build-dir globs,
 #                              space-separated TIER=GLOB (collect.py
 #                              --lane-pr-glob); empty disables them
@@ -179,7 +179,7 @@ EVAL_DASHBOARD_NIGHTLY_MAIN_D_PREFIX="${EVAL_DASHBOARD_NIGHTLY_MAIN_D_PREFIX-gs:
 EVAL_DASHBOARD_NIGHTLY_MAIN_E_PREFIX="${EVAL_DASHBOARD_NIGHTLY_MAIN_E_PREFIX-gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-main-e/}"
 EVAL_DASHBOARD_NIGHTLY_WRITERS_B_PREFIX="${EVAL_DASHBOARD_NIGHTLY_WRITERS_B_PREFIX-gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-writers-b/}"
 EVAL_DASHBOARD_NIGHTLY_WRITERS_C_PREFIX="${EVAL_DASHBOARD_NIGHTLY_WRITERS_C_PREFIX-gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-writers-c/}"
-EVAL_DASHBOARD_GITLAB_NIGHTLY_PREFIX="${EVAL_DASHBOARD_GITLAB_NIGHTLY_PREFIX-gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/}"
+EVAL_DASHBOARD_GITLAB_NIGHTLY_PREFIX="${EVAL_DASHBOARD_GITLAB_NIGHTLY_PREFIX-}"
 # The self-managed forge lanes (kube-agents#3682) with their weekly jobs,
 # and the GitLab lane's next-mode nightly, as .github/workflows/ci-health.yml
 # lists them.
