@@ -220,7 +220,8 @@ def test_the_blind_set_splits_by_what_the_doors_trace_can_serve(write_task):
     router-scope ``tool_called`` grades once the record carries the
     ``a2a.activity`` marker; it carries no card ids and no worker's entries,
     so ``worker_commands``, ``worker_agents`` and a ``tool_called`` in the
-    ``workers`` or ``all`` scope stay blind on every inject record. A
+    ``workers`` or ``all`` scope are blind on an inject record that does not
+    carry the workers' tagged entries (#5236). A
     compound mixing a router leaf with a worker leaf lands on the worker
     side, since its worker leaf would still error with the trace shown."""
     path = write_task(

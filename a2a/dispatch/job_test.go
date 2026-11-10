@@ -158,11 +158,15 @@ func TestAJobNoWorkerIsTombstonedBeforeItsTerminal(t *testing.T) {
 	b := newBus(t)
 	b.ensure("inv", 1, 0, "unattended")
 	key := lib.ProfileLeaseKey("inv", "unattended", lib.ProfileLeaseRefusedPod, "task-1")
-	var seen, tombstoned atomic.Bool
+	// The hook reads the lease bucket at the moment the first task-1 terminal
+	// arrives and hands the answer over only once that read is done; the test
+	// blocks on the answer rather than on a flag the hook sets before reading.
+	var seen atomic.Bool
+	tombstoned := make(chan bool, 1)
 	b.onTerminal = func(taskID string) {
 		if taskID == "task-1" && !seen.Swap(true) {
 			_, ok := b.tombstones()[key]
-			tombstoned.Store(ok)
+			tombstoned <- ok
 		}
 	}
 	jobs := newFakeJobs(-1)
@@ -173,9 +177,13 @@ func TestAJobNoWorkerIsTombstonedBeforeItsTerminal(t *testing.T) {
 	if ts := b.waitTerminal("task-1", 15*time.Second); ts.state != lib.StateFailed || !hasReason(ts, ReasonNoWorker) {
 		t.Fatalf("terminal %+v, want failed no-worker", ts)
 	}
-	waitFor(t, 5*time.Second, "the terminal hook", seen.Load)
-	if !tombstoned.Load() {
-		t.Error("the failed no-worker terminal went out before the tombstone")
+	select {
+	case ok := <-tombstoned:
+		if !ok {
+			t.Error("the failed no-worker terminal went out before the tombstone")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out after 5s waiting for the terminal hook")
 	}
 }
 

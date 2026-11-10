@@ -27,7 +27,7 @@ import unittest.mock
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 
-from eval_dashboard import render
+from eval_dashboard import nightly, render
 
 FIXTURE = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "testdata_classify" / "incidents.json.gz"
 PAGES_JS = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "template" / "pages.js"
@@ -119,6 +119,22 @@ def brief_view_anchors(pages_js: str) -> frozenset:
 
 
 BRIEF_VIEW_ANCHORS = brief_view_anchors(PAGES_JS.read_text())
+
+
+def night_part_words(pages_js: str) -> dict:
+    """PAGE.nightPartWords from pages.js's text, a flat object of quoted
+    or bare keys to quoted words."""
+    match = re.search(r"^\s*nightPartWords:\s*\{([^{}]*)\}", pages_js, re.MULTILINE)
+    if match is None:
+        raise RuntimeError(f"{PAGES_JS}: PAGE.nightPartWords is not a flat object literal")
+    return dict(re.findall(r'"?([\w-]+)"?\s*:\s*"([^"]*)"', match.group(1)))
+
+
+class NightPartWordsTest(unittest.TestCase):
+    def test_the_pages_part_words_are_nightly_py_s(self):
+        # pages.js carries a hand copy of nightly.PART_WORDS; a part added to
+        # one alone would render as its raw id on the Nightly page.
+        self.assertEqual(night_part_words(PAGES_JS.read_text()), dict(nightly.PART_WORDS))
 # The Cases page's one polled call, in
 # test_cases_page_sorts_filters_and_the_hash_highlight: a row fragment,
 # the bare case name, under boot and two polls on the page's real clock.
@@ -943,8 +959,16 @@ class BrowserTest(unittest.TestCase):
         out = render_to(pathlib.Path(self.tmp.name) / "gitlab-night", data, health=health_doc())
         page = dom_text(out / "index.html")
         self.assertIn("1 night on record: 1 green, 0 not", page)
-        self.assertIn('href="https://oss.gprow.dev/view/gs/kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/2097282860221206700"', page)
+        # Its log_url is a Spyglass link into the private nightly bucket, which is dead: the row links the Console.
+        self.assertIn('href="https://console.cloud.google.com/storage/browser/kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/2097282860221206700"', page)
+        self.assertNotIn('href="https://oss.gprow.dev/view/gs/kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/2097282860221206700"', page)
         self.assertIn("1 run on record: 0 green, 1 not", page, "the night is not among the lane's pull-request runs")
+        # A night that records where it lives (gcs_base) links the Console the same way.
+        night["gcs_base"] = "gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/2097282860221206700/"
+        out = render_to(pathlib.Path(self.tmp.name) / "gitlab-night-console", data, health=health_doc())
+        page = dom_text(out / "index.html")
+        self.assertIn('href="https://console.cloud.google.com/storage/browser/kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/2097282860221206700"', page)
+        self.assertNotIn('href="https://oss.gprow.dev/view/gs/kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/2097282860221206700"', page)
 
     def test_the_self_managed_forges_share_a_section_each_row_naming_its_forge(self):
         """The GHES and GitLab CE lanes (kube-agents#3682) share one
@@ -959,7 +983,12 @@ class BrowserTest(unittest.TestCase):
             self.assertIn(f"/test {job}", app)
         self.assertIn("No scheduled run on record", app)
         self.assertIn("once a week", app)
-        self.assertIn("GHES's scheduled jobs are off: not in Prow yet", app, "the page says what the digest says")
+        self.assertNotIn("scheduled jobs are off", app, "no lane is paused")
+        # A paused lane says why, as the digest does.
+        from eval_dashboard import forge_lane, tiers
+        with unittest.mock.patch.dict(forge_lane.LANES[tiers.TIER_GHES], {"off": "the weekly job waits on a fix"}):
+            paused = render_to(pathlib.Path(self.tmp.name) / "paused", self.data, health=health_doc())
+        self.assertIn("GHES's scheduled jobs are off: the weekly job waits on a fix", dom_text(paused / "index.html"))
         data = copy.deepcopy(self.data)
         base = next(r for r in data["runs"] if r["build_id"] == "2097282860221206528")
         lane_base = "gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/4480/pull-kube-agents-smoke-test-gitlab-ce/2097282860221206800/"

@@ -153,7 +153,7 @@ Rules (see also [`.agents/rules/documentation.md`](.agents/rules/documentation.m
   lists (`SKILL.md` excepted per `.agents/skills/skill-review/SKILL.md`).
 
 Run `make docs-check` before pushing: generated regions, links/anchors/reachability, terminology,
-site audience, site prose, the context budget, and the PR template's sections.
+site audience, site prose, the context budget, the PR template's sections, and upgrade-table labels.
 
 ## Contributing as an agent
 

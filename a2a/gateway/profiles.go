@@ -109,17 +109,19 @@ func (g *Gateway) mintTaskCapability(ctx context.Context, taskID, addressee stri
 	return &ref, nil
 }
 
-// submissionPayload is the submission's message: the text, and for a profile
-// route with parameters, the taskParameters part beside it.
-func submissionPayload(text, taskID, contextID string, route *profileRoute) ([]byte, error) {
-	if route == nil || len(route.Params) == 0 {
-		return messagePayload(text, taskID, contextID)
+// submissionPayload is the submission's message: the text, for a profile
+// route with parameters the taskParameters part beside it, and any extra
+// parts after (a session turn's delegateTargets).
+func submissionPayload(text, taskID, contextID string, route *profileRoute, extra ...lib.Part) ([]byte, error) {
+	parts := []lib.Part{{Kind: "text", Text: text}}
+	if route != nil && len(route.Params) > 0 {
+		params, err := lib.TaskParametersPart(lib.TaskParameters{Parameters: route.Params})
+		if err != nil {
+			return nil, err
+		}
+		parts = append(parts, params)
 	}
-	params, err := lib.TaskParametersPart(lib.TaskParameters{Parameters: route.Params})
-	if err != nil {
-		return nil, err
-	}
-	return messagePayloadParts([]lib.Part{{Kind: "text", Text: text}, params}, taskID, contextID)
+	return messagePayloadParts(append(parts, extra...), taskID, contextID)
 }
 
 // submissionSubject is where a new task is published: a profile's submission

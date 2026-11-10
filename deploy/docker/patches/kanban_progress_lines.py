@@ -186,6 +186,13 @@ FOLD_ANCESTOR_DEPTH = 8
 #: card has stopped as a give-up stops, parked at ``blocked`` for a human, so
 #: it settles as one (:func:`settles_as`); ``needs_input`` stays a pause.
 HARD_WALL_BLOCK_KIND = "capability"
+#: The dispatcher's own hard wall (``hermes_cli/kanban_admission.py``): a card
+#: refused for capacity (the pod's memory budget, a worker's resident-size cap,
+#: or a wait past the queue bound) is parked the same way and settles the same
+#: way; the reason names the alternatives.
+CAPACITY_BLOCK_KIND = "capacity"
+#: Every kind a block settles as a give-up under.
+HARD_WALL_BLOCK_KINDS = (HARD_WALL_BLOCK_KIND, CAPACITY_BLOCK_KIND)
 #: The kind a hard-wall block settles as.
 GAVE_UP_KIND = "gave_up"
 #: The most of a hard-wall block's reason its line carries, as
@@ -199,7 +206,7 @@ GAVE_UP_SQL = (
     "({card}.status = 'blocked' AND COALESCE((SELECT CASE g.kind WHEN 'blocked' "
     "THEN json_extract(g.payload, '$.kind') ELSE g.kind END FROM task_events g "
     "WHERE g.task_id = {card}.id AND g.kind IN ('blocked', 'unblocked', 'gave_up') "
-    "ORDER BY g.id DESC LIMIT 1), '') IN ('" + GAVE_UP_KIND + "', '" + HARD_WALL_BLOCK_KIND + "'))"
+    "ORDER BY g.id DESC LIMIT 1), '') IN ('" + "', '".join((GAVE_UP_KIND, *HARD_WALL_BLOCK_KINDS)) + "'))"
 )
 
 #: One row when the card's nearest ancestor that created more than one card is
@@ -365,7 +372,7 @@ def result_line(kind: str, payload: object) -> str:
 
 def settles_as(kind: str, payload: object) -> str:
     """The kind an event settles its plan row and its ask as: a hard-wall block as a give-up, else its own."""
-    if kind == NEEDS_YOU_KIND and isinstance(payload, dict) and payload.get("kind") == HARD_WALL_BLOCK_KIND:
+    if kind == NEEDS_YOU_KIND and isinstance(payload, dict) and payload.get("kind") in HARD_WALL_BLOCK_KINDS:
         return GAVE_UP_KIND
     return kind
 

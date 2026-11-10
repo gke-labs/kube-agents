@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -86,6 +87,13 @@ func TestGenerateHelmValuesYAML(t *testing.T) {
 	}
 	if !strings.Contains(yaml, "role: gitops") || !strings.Contains(yaml, "role: managed") {
 		t.Fatalf("generateHelmValuesYAML missing roles:\n%s", yaml)
+	}
+}
+
+func TestGenerateHelmValuesYAMLNamesGitHubForAForgeWithNoProvider(t *testing.T) {
+	yaml := generateHelmValuesYAML([]forgeInfo{{Name: "github", Namespace: "org"}}, nil)
+	if !strings.Contains(yaml, "      - name: github\n        provider: github\n") {
+		t.Fatalf("a forge with no provider should read as github:\n%s", yaml)
 	}
 }
 
@@ -619,5 +627,47 @@ func TestASaveFollowsTheClusterOrderOverAnOlderCache(t *testing.T) {
 	}
 	if strings.Index(answer.HelmValuesYAML, "name: ghe") > strings.Index(answer.HelmValuesYAML, "name: github") {
 		t.Errorf("Helm values list github before ghe:\n%s", answer.HelmValuesYAML)
+	}
+}
+
+func TestASaveKeepsABitbucketForgeTheClusterDeclares(t *testing.T) {
+	credentials := map[string]any{"name": "bitbucket-token"}
+	s, patched, _ := fakeForgeCluster(t, map[string]any{
+		"forges": []any{
+			map[string]any{"name": "github", "provider": "github", "namespace": "org"},
+			map[string]any{"name": "bb", "provider": "bitbucket", "namespace": "ws", "identity": "bot", "credentialsRef": credentials},
+			map[string]any{"name": "bbdc", "provider": "bitbucket-datacenter", "host": "bitbucket.corp.example", "identity": "bot", "credentialsRef": credentials},
+		},
+		"repositories": []any{
+			map[string]any{"forge": "github", "repository": "org/infra", "role": "gitops"},
+			map[string]any{"forge": "bb", "repository": "ws/app", "role": "managed"},
+			map[string]any{"forge": "bbdc", "repository": "PROJ/svc", "role": "context"},
+		},
+	})
+	get := httptest.NewRecorder()
+	getReq := httptest.NewRequest(http.MethodGet, "/api/repositories", nil)
+	getReq.Host = "localhost"
+	s.handleRepositoriesGet(get, getReq)
+	var current repositoriesResponse
+	if err := json.NewDecoder(get.Body).Decode(&current); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := postJSON(t, s.handleRepositoriesSet, "/api/repositories",
+		repositoriesSetRequest{Repositories: current.Repositories, Forges: current.Forges})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("save: status %d: %s", rec.Code, rec.Body)
+	}
+	forges := (*patched)[len(*patched)-1]
+	if got := forgeNames(forges); !slices.Equal(got, []string{"github", "bb", "bbdc"}) {
+		t.Fatalf("forges %v, want [github bb bbdc]", got)
+	}
+	for _, f := range forges[1:] {
+		if f["identity"] != "bot" || !reflect.DeepEqual(f["credentialsRef"], credentials) {
+			t.Errorf("forge %v lost its identity or credentialsRef: %v", f["name"], f)
+		}
+	}
+	if forges[1]["provider"] != "bitbucket" || forges[2]["provider"] != "bitbucket-datacenter" {
+		t.Errorf("providers %v and %v, want bitbucket and bitbucket-datacenter", forges[1]["provider"], forges[2]["provider"])
 	}
 }

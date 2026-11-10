@@ -197,23 +197,27 @@ restart or pod roll. So the nine are **readings**, not counters, through the rea
 [`human-interaction-readings.md`](human-interaction-readings.md) §2.2 generalises it in its second pull request, a target per reading with the miss rule following the target, which this design depends on: a new reading kind, `origins`, on the chat plugin's target (its metrics listener, read on the pod
 that runs the gateway), present when all nine origins resolved from the body, each on at least
 one sample and summed over `platform` (the listener serves every origin's series, zero included,
-from its first ledger read, so presence needs no age series for completeness, like the
-`people` kind), one miss
+from its first ledger read), and the body carries `kubeagents_proposals_opened_read_age_seconds`,
+the seconds since the plugin's last successful ledger read, not above two poll intervals; one miss
 per poll without them, cleared after two, the largest reading across the bodies read, and its own
 pruning record ("the nine origin readings"), so a served CRD that predates them keeps the rest of
-the block landing. Presence does not prove freshness: a failed ledger read still serves the last counts, so the
-plugin also serves `kubeagents_proposals_opened_read_age_seconds`, the seconds since its last
-successful read. The `origins` kind's presence rule is to require a fresh age too, so stale counts
-clear like a miss; that rule is design, not built yet, and the kind reads the counts alone today.
+the block landing. Presence does
+not prove freshness by itself: a failed ledger read still serves the last counts, which is why the
+plugin serves the read age and the presence rule requires it fresh, so stale counts clear like a
+miss two polls after its read age passes two poll intervals, about twenty minutes after the
+ledger stops answering.
 
 The fields, named like the block's other readings: `proposalsFromChat`,
 `proposalsFromConsole`, `proposalsFromApi`, `proposalsFromEvent`, `proposalsFromDrift`,
 `proposalsFromAudit`, `proposalsFromScheduled`, `proposalsFromIssue`, `proposalsFromOther`. Each
 is a pointer field: a 0 is a reading; absent until the first reading, after two polls in a row
 without one, and while the served CRD predates it. They move neither `lastActiveTime` nor `lastHumanActiveTime`, as readings do not.
-A ledger read that fails after the plugin's first success keeps serving the last counts, so the
-fields hold a stale count until the plugin restarts; a staleness signal beside the series is a
-plugin follow-up, not part of this design.
+A ledger read that fails after the plugin's first success keeps serving the last counts, and the
+read age grows with each failed read. Once the age passes two poll intervals the poll is a miss,
+so the fields clear two polls later, as for any miss. A body with the counts and no age series, from a
+plugin older than the operator, keeps the old rule and is present: an agent image can be pinned apart
+from the operator, and nine fields absent with no cause would be worse than counts the plugin still
+vouches for.
 Each gets a row in the per-field gauge `kubeagents_platformagent_usage{field=...}`, so a shared
 Prometheus reads the split with one `sum by (field)`.
 
@@ -280,8 +284,8 @@ holds as it stands.
   and `kubeagents_proposals_opened_read_age_seconds`, the seconds since the last successful read.
 - **Operator** (`usage_counters_scrape.go`, `usage_counters_poller.go`, `usage_gauges.go`,
   `common_types.go`, the CRD copies): the `origins` reading kind on the chat target, nine
-  specs, nine pointer fields, one pruning record, nine gauge rows. Not built yet: the presence
-  rule's fresh-age requirement on `kubeagents_proposals_opened_read_age_seconds`.
+  specs, nine pointer fields, one pruning record, nine gauge rows, and the presence rule's
+  fresh-age requirement on `kubeagents_proposals_opened_read_age_seconds`.
 - **Summary** (`feedback_summary.py`, `a2a/gateway/feedback_summary.go`): the one line, the
   pinned field list, the audit's removal of the line, the caps.
 - **Docs**: the observability page (nine rows, the gauge, the one-line answer to "who started
@@ -307,7 +311,7 @@ A deterministic guard in the sense of `.agents/rules/eval_driven_development.md`
 record, a verified ledger, a reading and a status field, with no model call in any path. The one text the model sees change is a machine record line it already reads today, from which the hook now strips an opaque token field; no prompt, instruction, tool text or
 skill text changes, and a worker's output has the line removed exactly as today. Unit tests cover every origin's resolution, the inheritance through a
 card, a child card and a continuation, the `other` fallback, the ledger's once-per-url rule, the
-reading's presence rule (today the nine counts; the fresh-age requirement once built) and the summary line.
+reading's presence rule (the nine counts beside a fresh read age) and the summary line.
 
 ## 6. Left to the builder
 

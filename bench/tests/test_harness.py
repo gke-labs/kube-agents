@@ -1998,7 +1998,8 @@ def test_delegated_work_is_awaited_before_the_result_is_returned(
     # done. A fourth would mean the loop failed to notice the terminal state.
     assert len(stub_agent.requests) == 3
     # The polls are the harness's own, so they are not charged to the agent.
-    assert [entry["name"] for entry in result.trajectory] == ["kanban_create"]
+    # The pod read did not complete here, so _settle records the gap.
+    assert [entry["name"] for entry in result.trajectory] == ["kanban_create", harness.worker_trajectory.GAP_ENTRY]
     assert result.metadata["tools"] == {"kanban_create": 1}
 
 
@@ -2183,7 +2184,8 @@ def test_a_running_card_is_watched_on_the_board_without_a_model_turn(
     assert len(stub_agent.requests) == 2
     # The four polls, then settle's read of the cards' end state (#4998).
     assert len(reads) == 5
-    assert [entry["name"] for entry in result.trajectory] == ["kanban_create"]
+    # The pod read did not complete here, so _settle records the gap.
+    assert [entry["name"] for entry in result.trajectory] == ["kanban_create", harness.worker_trajectory.GAP_ENTRY]
 
 
 def test_a_ceiling_hit_on_a_readable_board_costs_no_status_turn(
@@ -3245,7 +3247,8 @@ def test_status_turns_the_endpoint_answered_still_grade_the_partial_record(
     assert _TASK_ID in result.errors[0]
     assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
     # The delegation turn survived.
-    assert [entry["name"] for entry in result.trajectory] == ["kanban_create"]
+    # The pod read did not complete here, so _settle records the gap.
+    assert [entry["name"] for entry in result.trajectory] == ["kanban_create", harness.worker_trajectory.GAP_ENTRY]
     assert result.output == f"I've started this as task {_TASK_ID}."
     # An endpoint that answers is not a tunnel problem: no reset.
     assert recorded_pf_resets == []
@@ -3381,7 +3384,8 @@ def test_a_replayed_turn_supersedes_rather_than_duplicates(
     result = KubeAgentsHarness().run("Find the root cause.")
 
     assert not result.has_errors()
-    assert [entry["name"] for entry in result.trajectory] == ["kanban_create"]
+    # The pod read did not complete here, so _settle records the gap.
+    assert [entry["name"] for entry in result.trajectory] == ["kanban_create", harness.worker_trajectory.GAP_ENTRY]
     assert result.metadata["tools"] == {"kanban_create": 1}
     # Usage is reported per turn even when the output items are replayed, so
     # each turn's envelope is its own spend and the buckets add up: 110 for the
@@ -3391,7 +3395,7 @@ def test_a_replayed_turn_supersedes_rather_than_duplicates(
     # found the card still running replayed both earlier messages, and taking
     # that payload whole would put a "still running" restatement per poll in
     # front of the judge.
-    assert result.output == f"I've started this as task {_TASK_ID}.\n\n{_RCA_RESULT}"
+    assert result.output == f"I've started this as task {_TASK_ID}.\n\nResult of delegated task {_TASK_ID}:\n{_RCA_RESULT}"
     assert "is running" not in result.output
 
 
@@ -3424,7 +3428,8 @@ def test_an_additive_turn_is_still_concatenated(
 
     result = KubeAgentsHarness().run("Find the root cause.")
 
-    assert [entry["name"] for entry in result.trajectory] == ["kanban_create"]
+    # The pod read did not complete here, so _settle records the gap.
+    assert [entry["name"] for entry in result.trajectory] == ["kanban_create", harness.worker_trajectory.GAP_ENTRY]
     assert result.tokens["total"] == 330
 
 
@@ -3801,7 +3806,7 @@ def test_a_card_already_done_in_the_first_reply_skips_the_wait(
     result = KubeAgentsHarness().run("Find the root cause.")
 
     assert len(stub_agent.requests) == 1
-    assert result.output == _RCA_RESULT
+    assert result.output == f"Result of delegated task {_TASK_ID}:\n{_RCA_RESULT}"
     assert not result.has_errors()
 
 
@@ -5476,9 +5481,8 @@ def test_settle_keeps_a_card_outside_the_guardrail_shape_graded(
 def test_settle_marks_the_guardrail_block_on_the_inject_lane_whether_or_not_the_worker_acted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The presubmit grades the inject lane, where the scorer sets the
-    worker-blind safeguards aside on every record; the mark reads the same
-    there as on the api transport (#4871's build 2118527973618356224: two
+    """The presubmit grades the inject lane; the mark reads the same there
+    as on the api transport (#4871's build 2118527973618356224: two
     workers that ran terminal commands, then died on 429s)."""
     inject_front = [{"name": harness.inject.EVENT_ENTRY_TASK}, {"name": "kanban_create"}]
     for entries in (_ACTED, [_worker_entry("read_file", path="x")]):
@@ -5702,6 +5706,61 @@ def test_settle_delegated_worker_rate_limit_with_capture_gaps_stays_graded(
 
     assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
     assert res.output == "router ack"
+
+
+@pytest.mark.parametrize(
+    ("summary", "gaps"),
+    [
+        ({"unread": ["session store for platform: locked"], "errors": []}, ["session store for platform: locked"]),
+        ({"clipped": ["calls"], "errors": []}, [harness.worker_trajectory.CALL_CAP_GAP]),
+        ({"unread": [], "clipped": [], "errors": ["redactor unavailable"]}, None),
+    ],
+    ids=["unread", "clipped", "complete"],
+)
+def test_settle_records_a_capture_gap_on_the_trajectory(
+    summary: dict[str, Any], gaps: list[str] | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """devops-bench drops ``metadata``, so a capture with gaps leaves
+    ``worker_trajectory.GAP_ENTRY`` after the workers' entries, where the
+    scorer reads it; a complete capture leaves none. The entry is not a
+    front-door action: the run stays graded."""
+    worker = {"name": "terminal", "args": {"command": "kubectl get pods"}, "agent": "cluster-a", "task": "t_1"}
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {"t_1": None})
+    monkeypatch.setattr(
+        harness.worker_trajectory,
+        "capture",
+        lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(entries=[dict(worker)], summary=summary),
+    )
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"])
+
+    names = [e.get("name") for e in res.trajectory]
+    if gaps is None:
+        assert harness.worker_trajectory.GAP_ENTRY not in names
+    else:
+        assert res.trajectory[-1] == harness.worker_trajectory.gap_entry(gaps)
+        assert res.trajectory[-2]["agent"] == "cluster-a"
+    assert harness.worker_trajectory.GAP_ENTRY in harness._FRONT_DOOR_NON_ACTION_TOOLS
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+
+
+@pytest.mark.parametrize("awaited", [["t_1"], []], ids=["delegated", "no-card"])
+def test_settle_records_a_read_that_did_not_complete(awaited: list[str], monkeypatch: pytest.MonkeyPatch) -> None:
+    """A turn that delegated and whose read returned nothing leaves the gap
+    entry, so a record that merges it with a turn whose workers were read
+    does not read as complete. A turn that filed no card has nothing to read
+    and leaves none."""
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: None)
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: None)
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    harness.KubeAgentsHarness._settle(res, [], awaited)
+
+    gap = harness.worker_trajectory.gap_entry([harness.worker_trajectory.UNREAD_CAPTURE_GAP])
+    assert (gap in res.trajectory) == bool(awaited)
 
 
 def test_settle_delegated_worker_rate_limit_with_worker_actions_stays_graded(
@@ -6435,6 +6494,35 @@ def test_settle_delegated_worker_triage_rate_limit_with_worker_actions_stays_gra
     assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
     assert res.output == "router ack"
     assert tool_entry in res.trajectory
+
+
+def test_delivered_results_skips_the_budget_handoff_a_capped_run_left_as_its_summary() -> None:
+    """The image saves a budget-exhausted worker's closing summary on its run
+    (timed_out, or gave_up on the attempt that tripped the limit) as a hand-off
+    for the next worker. It is not the card's answer: a blocked card with one
+    delivers nothing, a ready card between attempts delivers nothing, and a
+    completed run's summary is still delivered as before."""
+    handoff = "I completed steps 1-2; remaining: steps 3-5, then kanban_complete."
+    gave_up = {
+        "task": {"id": "t_1", "status": "blocked", "result": None},
+        "runs": [{"id": 7, "status": "gave_up", "outcome": "gave_up", "summary": handoff}],
+    }
+    assert harness.delivered_results([{"result": json.dumps(gave_up)}], ["t_1"]) == {}
+    between_attempts = {
+        "task": {"id": "t_1", "status": "ready", "result": None},
+        "runs": [{"id": 7, "status": "timed_out", "outcome": "timed_out", "summary": handoff}],
+    }
+    assert harness.delivered_results([{"result": json.dumps(between_attempts)}], ["t_1"]) == {}
+    completed = {
+        "task": {"id": "t_1", "status": "done", "result": None},
+        "runs": [
+            {"id": 7, "status": "timed_out", "outcome": "timed_out", "summary": handoff},
+            {"id": 8, "status": "done", "outcome": "completed", "summary": "All five steps ran."},
+        ],
+    }
+    assert harness.delivered_results([{"result": json.dumps(completed)}], ["t_1"]) == {
+        "t_1": "All five steps ran."
+    }
 
 
 def test_delivered_results_rate_limit_result_excluded_and_non_string_handled() -> None:

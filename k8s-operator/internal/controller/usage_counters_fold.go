@@ -68,6 +68,7 @@ const (
 	usageCounterChatTurnsErrored      = "chatTurnsErroredTotal"
 	usageCounterBackgroundTasksGaveUp = "backgroundTasksGaveUpTotal"
 	usageCounterNegativeFeedback      = "negativeFeedbackTotal"
+	usageCounterPositiveFeedback      = "positiveFeedbackTotal"
 	// The two counters an earlier release kept for the proposals merged and
 	// closed unmerged, which are readings now (usageReadingSpecs): a document
 	// that carries them has their totals and pod entries dropped on read
@@ -105,15 +106,17 @@ var (
 	usageGatewayCounters = []string{usageCounterEventsIngested, usageCounterSessionsTriage}
 	usageChatCounters    = []string{usageCounterChatMessagesInbound, usageCounterSessionsChat, usageCounterChatTurnsErrored, usageCounterBackgroundTasksGaveUp, usageCounterNegativeFeedback}
 	// usageA2AChatCounters are the counters the A2A gateway's body feeds: the
-	// chat counter, the chat sessions and the errored turns through its own
-	// families, and not the board's gave_up cards, which the chat_metrics
-	// listener alone serves, nor the thumbs-downs, which the Hermes gateway's
-	// reaction hook alone counts; asking would seed an idle entry per A2A pod
-	// and name the field in that pod's Warning.
-	usageA2AChatCounters = []string{usageCounterChatMessagesInbound, usageCounterSessionsChat, usageCounterChatTurnsErrored}
+	// chat counter, the chat sessions, the errored turns and the two answer
+	// ratings through its own families, and not the board's gave_up cards,
+	// which the chat_metrics listener alone serves; asking would seed an idle
+	// entry per A2A pod and name the field in that pod's Warning. The
+	// thumbs-ups are the A2A gateway's alone: the Hermes gateway's reaction
+	// hook counts thumbs-downs only, so usageChatCounters does not ask for
+	// them.
+	usageA2AChatCounters = []string{usageCounterChatMessagesInbound, usageCounterSessionsChat, usageCounterChatTurnsErrored, usageCounterNegativeFeedback, usageCounterPositiveFeedback}
 	usageBrokerCounters  = []string{usageCounterToolExecutions, usageCounterRemediationsProposed, usageCounterToolExecutionsBlocked, usageCounterBrokerFailures}
 	// usageCounters is every counter the document keeps and the status seeds.
-	usageCounters = []string{usageCounterToolExecutions, usageCounterEventsIngested, usageCounterRemediationsProposed, usageCounterChatMessagesInbound, usageCounterSessionsTriage, usageCounterSessionsChat, usageCounterToolExecutionsBlocked, usageCounterBrokerFailures, usageCounterChatTurnsErrored, usageCounterBackgroundTasksGaveUp, usageCounterNegativeFeedback}
+	usageCounters = []string{usageCounterToolExecutions, usageCounterEventsIngested, usageCounterRemediationsProposed, usageCounterChatMessagesInbound, usageCounterSessionsTriage, usageCounterSessionsChat, usageCounterToolExecutionsBlocked, usageCounterBrokerFailures, usageCounterChatTurnsErrored, usageCounterBackgroundTasksGaveUp, usageCounterNegativeFeedback, usageCounterPositiveFeedback}
 	// usageRetiredCounters are the counters an earlier release kept and this
 	// one does not: migrateUsageDocument drops them from a document.
 	usageRetiredCounters = []string{usageCounterRemediationsMerged, usageCounterRemediationsClosedUnmerged}
@@ -122,9 +125,9 @@ var (
 	// an unreachable fleet cluster through the relay produces every poll on
 	// an install nobody is using; the failed turns, each a failure whose
 	// message already moved the time; and a background card giving up, a
-	// failure, not the agent at work; and a thumbs-down, a person's verdict on
-	// a message that already moved it.
-	usageQuietCounters = map[string]bool{usageCounterBrokerFailures: true, usageCounterChatTurnsErrored: true, usageCounterBackgroundTasksGaveUp: true, usageCounterNegativeFeedback: true}
+	// failure, not the agent at work; and a rating either way, a person's
+	// verdict on a message that already moved it.
+	usageQuietCounters = map[string]bool{usageCounterBrokerFailures: true, usageCounterChatTurnsErrored: true, usageCounterBackgroundTasksGaveUp: true, usageCounterNegativeFeedback: true, usageCounterPositiveFeedback: true}
 	// usageSessionsCounters is the pair that projects to usageStatusFieldSessions.
 	usageSessionsCounters = []string{usageCounterSessionsTriage, usageCounterSessionsChat}
 	// usageHumanCounters is the counter only a person moves: a chat message.
@@ -163,6 +166,24 @@ func usageFieldFloor(floors map[string]int64, counter string) int64 {
 		return floors[usageCounterSessionsChat] + floors[usageCounterSessionsTriage]
 	}
 	return floors[counter]
+}
+
+// usageBodyRead reports whether one of read, the counters a pod has entries
+// for, comes from the same listener body as counter: some pod group's list
+// holds both. A body is read whole or not at all, so such an entry means the
+// listener was read before and counter was not asked of it then.
+func usageBodyRead(read []string, counter string) bool {
+	for _, group := range [][]string{usageGatewayCounters, usageChatCounters, usageA2AChatCounters, usageBrokerCounters} {
+		if !slices.Contains(group, counter) {
+			continue
+		}
+		for _, other := range read {
+			if other != counter && slices.Contains(group, other) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // usagePodEntryKey is the document key of one pod's entry for one counter.
@@ -391,6 +412,9 @@ type usageScrapedPod struct {
 	// DataVolume is the watcher's data volume reading, nil for any pod but a
 	// gateway's and for a watcher body that carried none. Not folded either.
 	DataVolume *usageDataVolume
+	// Dispatcher is the chat plugin's kanban dispatcher reading, nil for any
+	// pod but the gateway's chat_metrics body. Not folded either.
+	Dispatcher *usageDispatcherReading
 	// ToolPairs is the broker's tool counter by tool and subcommand, nil for
 	// any pod but a broker's. Not folded either: the poll sums it across the
 	// broker pods read and projects the top rows (usageTopToolsForPoll).
@@ -486,8 +510,15 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 	// set is the live pods the document already knew, so an entry recorded
 	// this poll, whose marker is this poll, resets no sibling.
 	markers := make(map[string]metav1.Time, len(doc.Pods))
+	// The counters the document already read on each pod, before this poll
+	// records anything: a counter first asked of a body the document already
+	// read under another counter (an upgrade that reads a new family from a
+	// listener it already scrapes) finds a sample that predates the asking,
+	// not one the pod started from zero.
+	readPods := map[string][]string{}
 	for key, entry := range doc.Pods {
 		markers[key] = entry.Marker
+		readPods[entry.PodUID] = append(readPods[entry.PodUID], entry.Counter)
 	}
 
 	candidates := map[string][]usageCandidate{}
@@ -507,7 +538,8 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 			// first recorded, it started from zero and none of it was seen, so
 			// the whole sample adds, under the ceiling; so does a sample for a
 			// counter the migration added unfolded, which no document and no
-			// status has seen any of; older on any other counter, or past the
+			// status has seen any of; older on any other counter, its listener
+			// already read under another counter (usageBodyRead), or past the
 			// ceiling, it is recorded and adds nothing.
 			entry = &usagePodEntry{Name: s.Name, PodUID: s.UID, Counter: s.Counter, Sample: s.Sample, StartTime: s.StartTime, Marker: stamp}
 			doc.Pods[key] = entry
@@ -552,7 +584,8 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 			// interval of messages counts. Max counters are read on every
 			// replica from the first poll, so none reaches here that way.
 			youngProcess := usageAggregationFor(s.Counter) == usageAggregateSum && s.StartTime != nil && *s.StartTime > float64(doc.FirstRecorded.Unix())
-			if (s.Created.After(doc.FirstRecorded.Time) || unfolded || youngProcess) && s.Sample <= usageDeltaCeiling {
+			fresh := !usageBodyRead(readPods[s.UID], s.Counter) && (s.Created.After(doc.FirstRecorded.Time) || youngProcess)
+			if (fresh || unfolded) && s.Sample <= usageDeltaCeiling {
 				candidates[s.Counter] = append(candidates[s.Counter], usageCandidate{entry: entry, delta: s.Sample, sample: s.Sample, startTime: s.StartTime})
 			}
 			continue

@@ -82,10 +82,10 @@ import sys
 from datetime import datetime, timedelta, timezone
 
 try:
-    from eval_dashboard import classify, ghcli, health, post_health, tiers
+    from eval_dashboard import classify, ghcli, health, links, post_health, tiers
 except ImportError:  # run as a script: scripts/eval_dashboard/gate_comment.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-    from eval_dashboard import classify, ghcli, health, post_health, tiers
+    from eval_dashboard import classify, ghcli, health, links, post_health, tiers
 
 STATE_SCHEMA_VERSION = 1
 # The hidden first line every comment starts with; how the next tick finds
@@ -125,11 +125,9 @@ OUTCOME_FAILED = classify.OUTCOME_FAILED
 # incident_link names the failing cases in the URL; this comment is public);
 # the build log is Prow's Deck for this job.
 BUILD_LOG_URL = "https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/{pr}/" + JOB_NAME + "/{build_id}"
-# For a run that records where it lives (runs[].gcs_base): the lanes' log
-# bucket is not Deck-readable, so Spyglass shows nothing for it, while a
-# project reader opens the build in the Console's bucket browser.
-GCS_BROWSER_URL = "https://console.cloud.google.com/storage/browser/"
-GS_SCHEME = "gs://"
+# A run that records where it lives (runs[].gcs_base) links the Console's
+# bucket browser instead (links.py): the lanes' log bucket is not
+# Deck-readable, so Spyglass shows nothing for it.
 # GitHub REST paths, relative to the repository (`gh.path` prefixes it), and
 # the page size the comment search reads; the marker search needs every
 # comment on the pull request, so it paginates from the largest page.
@@ -291,7 +289,7 @@ def build_url(run: health.Run) -> str:
     """The build's link: the Console browser when the run says where it
     lives, Spyglass for a document from before that field."""
     if run.gcs_base:
-        return GCS_BROWSER_URL + run.gcs_base.removeprefix(GS_SCHEME).rstrip("/")
+        return links.console_url(run.gcs_base)
     return BUILD_LOG_URL.format(pr=run.pr, build_id=run.build_id)
 
 
@@ -339,10 +337,9 @@ def cause_text(health_doc: dict) -> str:
 
 
 def brief_link(health_doc: dict) -> str:
-    """The incident brief's URL with no case names in it: post_health's
-    incident_link lists the failing cases in the query string, and this
-    comment is public."""
-    return post_health.dashboard_link(post_health.DASHBOARD_VIEW_GATE, [], post_health.parse_iso(health_doc.get("since")), None)
+    """The incident brief's URL with no case names in it (post_health's
+    public_brief_link, shared with the tracking issue)."""
+    return post_health.public_brief_link(health_doc)
 
 
 def health_box(red: Red, health_doc: dict) -> str:

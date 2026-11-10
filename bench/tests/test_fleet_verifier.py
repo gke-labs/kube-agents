@@ -1298,6 +1298,42 @@ _PATH_SCOPED_ABSENT_WITNESSES[
     },
 }
 
+_PATH_SCOPED_ABSENT_WITNESSES[
+    "networking-ip-masq-agent-missing-ccc-toleration/audit-left-the-daemonset-without-tolerations"
+] = {
+    # What a remediation writes: the toleration for the tainted pool (or
+    # a keyless `operator: Exists`) in the pod template.
+    "present": {
+        "kind": "DaemonSet",
+        "metadata": {"name": "cni-shaped-agent", "namespace": "seeded-shapes"},
+        "spec": {
+            "template": {
+                "metadata": {"labels": {"app": "cni-shaped-agent"}},
+                "spec": {
+                    "hostNetwork": True,
+                    "tolerations": [
+                        {"key": "seeded-role", "operator": "Exists", "effect": "NoSchedule"}
+                    ],
+                    "containers": [{"name": "agent"}],
+                },
+            }
+        },
+    },
+    # As planted: the API server stores no tolerations on a template that
+    # declares none; the controller adds the node-condition tolerations to
+    # the pods, not to the template.
+    "absent": {
+        "kind": "DaemonSet",
+        "metadata": {"name": "cni-shaped-agent", "namespace": "seeded-shapes"},
+        "spec": {
+            "template": {
+                "metadata": {"labels": {"app": "cni-shaped-agent"}},
+                "spec": {"hostNetwork": True, "containers": [{"name": "agent"}]},
+            }
+        },
+    },
+}
+
 
 def test_no_path_scoped_absent_asserts_on_a_field_the_fixture_cannot_produce():
     """The sharp edge of `absent` when it carries a path.

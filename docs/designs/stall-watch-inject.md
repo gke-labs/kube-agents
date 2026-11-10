@@ -178,7 +178,16 @@ held and the budget entry says so. A hold that outlasts three consecutive ticks 
 fault rather than a transient: the fit stands, recovery posts, and the next exhaustion is heard,
 so one project that can never be listed does not hold the flag up for good. On such a fleet a cluster is read across consecutive ticks, so the
 operator's interval is the ticks a full pass takes rather than the 30-minute schedule; the budget
-entry is where to read it.
+entry is where to read it. The ledger also records what the reads cost: `cluster_timings` holds,
+per cluster the sweep reached, the tick that read it, its seconds, the namespaces in the watch's scope,
+the namespaces scanned and whether the budget stopped the sweep inside it (`cut`). A tick that resumes
+a cut cluster at the cursor carries the cut record's seconds and scans forward, so the record it leaves
+is the whole pass over the cluster; a cluster with an unreadable namespace scans fewer than it listed
+without the cut. The records are kept across ticks on the credentials' terms, so the span from the
+oldest `at` to the newest, over the schedule, is the ticks a pass takes. `tick_timing` holds, for the
+last tick whose sweep ran, its listing, sweep and whole-tick seconds and its clusters and namespaces
+read; the whole-tick figure is `null` in a ledger saved before the tick reached its end. They live in the ledger rather than on stderr because the scheduler
+discards a script's stderr when it exits 0.
 
 ## 4. Work breakdown
 
@@ -225,7 +234,10 @@ session that files no card is raised again a day later, and keeps its episode wh
 the daemon's route accepts. `test_triage_reply_roundtrip.py` drives a report cut from `_stall_task_body`
 through the real notifier, server and plugin, and shows the pre-inject stall report shape earns no row.
 The `Credentials` tests hold the fetch to the first tick, a day-old record and a refused first read, and
-the `Coverage` tests the budget entry's content and the chat line's cadence (§3.9).
+the `Coverage` tests the budget entry's content and the chat line's cadence (§3.9), and the `Timings`
+tests the ledger's per-cluster and per-tick cost records: a read cluster and the tick timed, a cut
+cluster showing fewer scans than namespaces beside an unreached one keeping its record, and an
+unreadable cluster timed with no scans while a cluster gone from the listing is dropped.
 
 **Eval.** `autoops-controller-stall-triage`, modelled on `gitops-drift-out-of-band-triage`, covers the
 daemon end of the chain and everything after it, not the stall watch, which its unit tests cover. Its
