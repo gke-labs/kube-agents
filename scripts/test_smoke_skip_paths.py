@@ -79,6 +79,7 @@ GENERIC_NAMES = {"README.md", "OWNERS", "LICENSE", "common.sh", "__init__.py", "
 DOCKERFILE_RE = re.compile(r"[\w./$-]*Dockerfile[\w.$-]*")
 COPY_RE = re.compile(r"^\s*(?:COPY|ADD)\s+(.*)$", re.IGNORECASE)
 PATH_TOKEN_RE = re.compile(r"(?:\$\{?SCRIPT_DIR\}?/)?(?:\.\./)*[\w.-]+(?:/[\w.-]+)*")
+SOURCE_RE = re.compile(r"^\s*(?:source|\.)\s")
 IMPORT_RE = re.compile(r"^\s*(?:from\s+([\w.]+)\s+import|import\s+([\w.]+))")
 IGNORE_FILE_RE = re.compile(r"(^|/)(\.dockerignore|\.gcloudignore|[^/]*\.dockerignore)$")
 PROW_YAML_URL = (
@@ -111,30 +112,40 @@ def under(path, prefixes):
 
 
 def job_closure(files):
-    """{path: the file that names it} for the job scripts and everything they name."""
+    """{path: the file that names it} for the job scripts and everything they name.
+
+    Every path a hack/ script names counts. Past hack/ the scripts mention much they never
+    run, so there only what they import or source counts.
+    """
     named = {p: "the job" for p in JOB_SCRIPTS}
     queue = list(JOB_SCRIPTS)
     while queue:
         current = queue.pop()
         base = os.path.dirname(current)
+        whole = current.startswith("hack/")
         for line in code_lines(current):
             candidates = set()
-            for token in PATH_TOKEN_RE.findall(line):
+            tokens = PATH_TOKEN_RE.findall(line) if whole or SOURCE_RE.match(line) else []
+            for token in tokens:
                 token = re.sub(r"^\$\{?SCRIPT_DIR\}?/", "", token).rstrip("/.")
                 candidates.add(os.path.normpath(os.path.join(base, token)))
                 candidates.add(os.path.normpath(token))
-            if current.endswith(".py"):
-                match = IMPORT_RE.match(line)
-                if match:
-                    module = (match.group(1) or match.group(2)).split(".")[0]
-                    candidates.add(os.path.join(base, module + ".py"))
+            module = imported_module(line) if current.endswith(".py") else None
+            if module:
+                candidates.add(os.path.join(base, module + ".py"))
             for path in candidates:
                 if path not in files or path in named or NOT_NAMED_RE.search(path):
                     continue
                 named[path] = current
-                if path.startswith("hack/") and path.endswith((".sh", ".py")):
+                if path.endswith((".sh", ".py")) and not under(path, NOT_READ):
                     queue.append(path)
     return named
+
+
+def imported_module(line):
+    """The top-level module a Python import line names, or None."""
+    match = IMPORT_RE.match(line)
+    return (match.group(1) or match.group(2)).split(".")[0] if match else None
 
 
 def build_dockerfiles():
@@ -231,11 +242,15 @@ class SkipListTest(unittest.TestCase):
             if "/" in path:
                 spellings[f"{os.path.basename(os.path.dirname(path))}/{name}"] = path
         pattern = re.compile(r"(?<![\w.-])(" + "|".join(re.escape(n) for n in spellings) + r")(?![\w-])")
+        modules = {os.path.basename(p)[: -len(".py")]: p for p in self.skipped if p.endswith(".py")}
         wrong = set()
         for reader in sorted(set(readers)):
             for line in code_lines(reader):
                 for match in pattern.finditer(line):
                     wrong.add(f"{spellings[match.group(1)]} (named in {reader})")
+                module = imported_module(line) if reader.endswith(".py") else None
+                if module in modules:
+                    wrong.add(f"{modules[module]} (imported by {reader})")
         self.assertEqual(sorted(wrong), [], "code the eval runs names a skipped file")
 
     def test_not_read_entries_are_on_the_list(self):
@@ -265,6 +280,13 @@ class SkipListTest(unittest.TestCase):
         ):
             with self.subTest(path=path):
                 self.assertIn(path, read)
+
+    def test_an_import_names_its_module_file(self):
+        """The name check reads `import github_api`, which never spells `github_api.py`."""
+        for line in ("import github_api", "from github_api import GitHubAPI", "  import github_api.sub as g"):
+            with self.subTest(line=line):
+                self.assertEqual(imported_module(line), "github_api")
+        self.assertIsNone(imported_module("github_api.call()"))
 
     def test_no_image_build_compiles_go_tests(self):
         """What makes `_test.go` safe to skip although the images copy it."""
