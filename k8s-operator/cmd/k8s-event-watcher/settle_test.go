@@ -60,6 +60,12 @@ func TestSettleAppliesToTheTransientFamiliesOnly(t *testing.T) {
 	for reason, want := range map[string]bool{
 		"CrashLoopBackOff": true, "FailedMount": true, "Unhealthy": true,
 		"NodeNotReady": false, "OOMKilled": false, "Evicted": false, "ImagePullBackOff": false, "FailedScheduling": false, "FailedToDrainNode": false,
+		// Config Connector's two transient-by-design reasons settle; its
+		// verdicts fire at once, and its normal states are on no list.
+		"DependencyNotReady": true, "Unmanaged": true,
+		"UpdateFailed": false, "DeleteFailed": false, "DependencyNotFound": false, "DependencyInvalid": false,
+		"ManagementConflict": false, "PreActuationTransformFailed": false, "PostActuationTransformFailed": false,
+		"Updating": false, "UpToDate": false,
 	} {
 		if got := settleApplies(reason, ""); got != want {
 			t.Errorf("settleApplies(%q) = %t; want %t", reason, got, want)

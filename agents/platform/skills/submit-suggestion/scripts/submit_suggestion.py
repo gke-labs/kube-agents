@@ -1129,7 +1129,7 @@ RETIRED = {
     "--lease": "there is no shared volume to lease a clone on",
     "--handle": "there is no broker-side checkout to hold a handle to",
     # Content mode's two, and the pair that matters most here: the operator
-    # renders CREDENTIAL_PROXY_CONTENT_WORKSPACE=1 unconditionally and offers
+    # rendered CREDENTIAL_PROXY_CONTENT_WORKSPACE=1 unconditionally and offered
     # no field to turn it off, so content mode -- not the leased-clone shape
     # `--workspace` and `--lease` belong to -- is what every card in flight
     # during the rollout is calling.

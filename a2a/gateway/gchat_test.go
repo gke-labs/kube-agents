@@ -281,7 +281,14 @@ type fakeChatRelay struct {
 	mu        sync.Mutex
 	calls     []relayCall
 	responses map[string]any // "spaces.messages/create" -> response body
-	tokens    []string
+	// queue holds one-shot responses per method key, answered in order
+	// before responses is read.
+	queue  map[string][]any
+	tokens []string
+	// beforeCall, when set, runs on each call before the fake records or
+	// answers it, outside its lock, so a test can hold one call back while
+	// others land.
+	beforeCall func(key string)
 }
 
 // fakeChatAPIError, as a response, makes the fake relay answer a call with
@@ -298,8 +305,21 @@ type relayCall struct {
 }
 
 func newFakeChatRelay(t *testing.T) *fakeChatRelay {
-	f := &fakeChatRelay{t: t, responses: map[string]any{}}
+	f := &fakeChatRelay{t: t, responses: map[string]any{}, queue: map[string][]any{}}
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Resource  []string       `json:"resource"`
+			Method    string         `json:"method"`
+			Arguments map[string]any `json:"arguments"`
+		}
+		decodeErr := json.NewDecoder(r.Body).Decode(&body)
+		key := strings.Join(body.Resource, ".") + "/" + body.Method
+		f.mu.Lock()
+		hook := f.beforeCall
+		f.mu.Unlock()
+		if hook != nil && decodeErr == nil {
+			hook(key)
+		}
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		f.tokens = append(f.tokens, strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
@@ -307,18 +327,16 @@ func newFakeChatRelay(t *testing.T) *fakeChatRelay {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		var body struct {
-			Resource  []string       `json:"resource"`
-			Method    string         `json:"method"`
-			Arguments map[string]any `json:"arguments"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		if decodeErr != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
 		f.calls = append(f.calls, relayCall{body.Resource, body.Method, body.Arguments})
-		key := strings.Join(body.Resource, ".") + "/" + body.Method
 		resp, ok := f.responses[key]
+		if queued := f.queue[key]; len(queued) > 0 {
+			resp, ok = queued[0], true
+			f.queue[key] = queued[1:]
+		}
 		if !ok {
 			w.WriteHeader(http.StatusBadGateway)
 			json.NewEncoder(w).Encode(map[string]any{"error": "Google Chat operation failed"})
@@ -1242,9 +1260,17 @@ func TestGchatOpenDirectUsesTheLearnedIDForAKnownEmail(t *testing.T) {
 // (2026-09-09), and legacy-dm-button-click.json from the one in
 // bhoekstra-gkedemos (2026-10-30), scrubbed only of identity fields and the
 // one-time redirect token; field set, key order and every other byte are as
-// Chat published them. addon-dm-button-click.json is the exception: a click
-// composed in the add-on layout from Google's documented shape, since the
-// measured app delivers clicks in the legacy layout.
+// Chat published them. Two are composed rather than captured:
+// addon-dm-button-click.json, a click in the add-on layout from Google's
+// documented shape, since the measured app delivers clicks in the legacy
+// layout; and addon-dm-quoted-reply.json, addon-dm-plain.json with the
+// quotedMessageMetadata the Chat API documents on a message forwarded into
+// the DM from a space (name, lastUpdateTime, quoteType FORWARD, the
+// quotedMessageSnapshot and forwardedMetadata). legacy-dm-quoted-reply.json
+// is captured, not composed: a quote-in-reply of one of the app's own DM
+// posts from the one in bhoekstra-gkedemos (2026-11-08), which Chat
+// published in the legacy layout with quoteType REPLY and the snapshot's
+// sender and text, no formattedText.
 func realGchatFixture(t *testing.T, name string) (raw []byte, b64 string) {
 	t.Helper()
 	raw, err := os.ReadFile(filepath.Join("testdata", "gchat", name))

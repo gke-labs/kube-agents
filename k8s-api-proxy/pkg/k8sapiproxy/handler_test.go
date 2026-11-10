@@ -145,10 +145,12 @@ func TestHandlerAuthentication(t *testing.T) {
 
 func TestHandlerRoutes(t *testing.T) {
 	tests := []struct {
-		name, target, wantCluster, wantPath string
+		name, target, wantCluster, wantPath, wantQuery string
 	}{
-		{"prefix", "/clusters/" + gkeFleet + "/api/v1/namespaces/kube-system/pods?limit=5", gkeFleet, "/api/v1/namespaces/kube-system/pods"},
-		{"in-cluster prefix", "/clusters/in-cluster/apis/apps/v1/deployments?limit=5", InClusterID, "/apis/apps/v1/deployments"},
+		{"prefix", "/clusters/" + gkeFleet + "/api/v1/namespaces/kube-system/pods?limit=5", gkeFleet, "/api/v1/namespaces/kube-system/pods", "limit=5"},
+		{"in-cluster prefix", "/clusters/in-cluster/apis/apps/v1/deployments?limit=5", InClusterID, "/apis/apps/v1/deployments", "limit=5"},
+		{"metrics in-cluster prefix", "/clusters/in-cluster/metrics", InClusterID, "/metrics", ""},
+		{"metrics cluster prefix", "/clusters/" + gkeFleet + "/metrics", gkeFleet, "/metrics", ""},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -160,8 +162,8 @@ func TestHandlerRoutes(t *testing.T) {
 			if upstream.clusterID != tc.wantCluster {
 				t.Errorf("cluster = %q, want %q", upstream.clusterID, tc.wantCluster)
 			}
-			if upstream.req.URL.Path != tc.wantPath || upstream.req.URL.RawQuery != "limit=5" {
-				t.Errorf("upstream URL = %q, want %q?limit=5", upstream.req.URL.String(), tc.wantPath)
+			if upstream.req.URL.Path != tc.wantPath || upstream.req.URL.RawQuery != tc.wantQuery {
+				t.Errorf("upstream URL = %q, want path=%q query=%q", upstream.req.URL.String(), tc.wantPath, tc.wantQuery)
 			}
 			if upstream.req.Host != "" {
 				t.Errorf("upstream Host = %q, want it left to the transport", upstream.req.Host)
@@ -201,7 +203,8 @@ func TestHandlerRefusals(t *testing.T) {
 		{"invalid cluster", http.MethodGet, "/clusters/bad$id/api/v1/pods", http.StatusBadRequest, metav1.StatusReasonBadRequest},
 		{"write without dry run", http.MethodPost, "/clusters/in-cluster/api/v1/namespaces/default/configmaps", http.StatusForbidden, metav1.StatusReasonForbidden},
 		{"exec", http.MethodPost, "/clusters/in-cluster/api/v1/namespaces/default/pods/p/exec?command=sh", http.StatusForbidden, metav1.StatusReasonForbidden},
-		{"non-discovery path", http.MethodGet, "/clusters/in-cluster/metrics", http.StatusForbidden, metav1.StatusReasonForbidden},
+		{"non-discovery path", http.MethodGet, "/clusters/in-cluster/debug/pprof", http.StatusForbidden, metav1.StatusReasonForbidden},
+		{"POST to /metrics", http.MethodPost, "/clusters/in-cluster/metrics", http.StatusForbidden, metav1.StatusReasonForbidden},
 		{"unclassifiable path", http.MethodGet, "/clusters/in-cluster/api/v1/watch", http.StatusBadRequest, metav1.StatusReasonBadRequest},
 	}
 	for _, tc := range tests {

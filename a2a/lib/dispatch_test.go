@@ -280,6 +280,13 @@ func TestADispatchConfigIsChecked(t *testing.T) {
 	if err := validDispatchConfig().Validate(); err != nil {
 		t.Fatalf("a good config: %v", err)
 	}
+	jobs := validDispatchConfig()
+	jobs.Profiles = append([]DispatchProfile(nil), jobs.Profiles...)
+	jobs.Profiles[0].JobTemplate = json.RawMessage(`{"spec":{"containers":[{"name":"worker","image":"w"}]}}`)
+	jobs.JobLabels = map[string]string{"app.kubernetes.io/part-of": "kube-agents", DispatchJobLabel: "true", "plain": ""}
+	if err := jobs.Validate(); err != nil {
+		t.Errorf("a config with a Job template and labels: %v", err)
+	}
 	one := validDispatchConfig()
 	one.Ceiling, one.ChildReserve, one.InteractiveReserve = 1, 0, 0
 	if err := one.Validate(); err != nil {
@@ -297,6 +304,13 @@ func TestADispatchConfigIsChecked(t *testing.T) {
 		"short lease":               {func(c *DispatchConfig) { c.LeaseSeconds = 59 }, "three renewals"},
 		"short grace":               {func(c *DispatchConfig) { c.RestartGraceSeconds = 39 }, "two renewals"},
 		"no accept timeout":         {func(c *DispatchConfig) { c.AcceptTimeoutSeconds = 0 }, "acceptTimeoutSeconds"},
+		"overflowing job start":     {func(c *DispatchConfig) { c.JobStartSeconds = 10_000_000_000 }, "over"},
+		"null job template":         {func(c *DispatchConfig) { c.Profiles[0].JobTemplate = json.RawMessage(`null`) }, "jobTemplate"},
+		"empty job template":        {func(c *DispatchConfig) { c.Profiles[0].JobTemplate = json.RawMessage(`{}`) }, "jobTemplate"},
+		"scalar job template":       {func(c *DispatchConfig) { c.Profiles[0].JobTemplate = json.RawMessage(`"x"`) }, "jobTemplate"},
+		"no containers":             {func(c *DispatchConfig) { c.Profiles[0].JobTemplate = json.RawMessage(`{"spec":{"containers":[]}}`) }, "jobTemplate"},
+		"bad job label key":         {func(c *DispatchConfig) { c.JobLabels = map[string]string{"-bad": "x"} }, "jobLabels"},
+		"bad job label value":       {func(c *DispatchConfig) { c.JobLabels = map[string]string{"app": "has space"} }, "jobLabels"},
 		"overflowing stop grace":    {func(c *DispatchConfig) { c.StopGraceSeconds = MaxDispatchSeconds + 1 }, "over"},
 		"overflowing cooldown":      {func(c *DispatchConfig) { c.BreakerCooldownSeconds = MaxDispatchSeconds + 1 }, "over"},
 		"overflowing deadline":      {func(c *DispatchConfig) { c.Profiles[0].ActiveDeadlineSeconds = MaxDispatchSeconds + 1 }, "over"},
@@ -346,6 +360,14 @@ func TestTheOperatorsDispatchConfigDecodesAndValidates(t *testing.T) {
 	}
 	if cfg.Version == "" || cfg.Namespace == "" || cfg.ProfileNamespace != cfg.Namespace+"-profiles" {
 		t.Errorf("version %q, namespace %q, profile namespace %q", cfg.Version, cfg.Namespace, cfg.ProfileNamespace)
+	}
+	// The operator can't import lib, so this is what holds the submit
+	// stream's max age it renders (the operator's own test ties that to the
+	// stream it provisions) equal to ProfileSubmitRetention, the floor the
+	// dispatcher keeps tombstones for: a change to either is a deliberate
+	// edit of both (#4813). The raised-then-lowered case is #4948.
+	if got := time.Duration(cfg.SubmitRetentionSeconds) * time.Second; got != ProfileSubmitRetention {
+		t.Errorf("the operator renders a submit retention of %v; ProfileSubmitRetention is %v", got, ProfileSubmitRetention)
 	}
 }
 
@@ -404,9 +426,10 @@ func TestTheOperatorsHeldDurableIsOneSubscribeHeldBinds(t *testing.T) {
 	}
 }
 
-// A negative submission retention is refused; zero is an operator that
-// predates the field.
-func TestDispatchConfigRefusesANegativeRetention(t *testing.T) {
+// A negative submission retention is refused, and so is one past
+// MaxSubmitRetention, whose seconds would overflow a time.Duration well
+// before they mean anything; zero is an operator that predates the field.
+func TestDispatchConfigRefusesARetentionOutOfRange(t *testing.T) {
 	base := DispatchConfig{Namespace: "ns", ProfileNamespace: "ns-profiles", Ceiling: 6, LeaseSeconds: 90, RenewSeconds: 20, RestartGraceSeconds: 60, AcceptTimeoutSeconds: 10}
 	if err := base.Validate(); err != nil {
 		t.Fatalf("the base config: %v", err)
@@ -415,5 +438,80 @@ func TestDispatchConfigRefusesANegativeRetention(t *testing.T) {
 	neg.SubmitRetentionSeconds = -1
 	if err := neg.Validate(); err == nil || !strings.Contains(err.Error(), "submitRetentionSeconds") {
 		t.Errorf("a negative retention = %v, want refused", err)
+	}
+	longest := base
+	longest.SubmitRetentionSeconds = int(MaxSubmitRetention / time.Second)
+	if err := longest.Validate(); err != nil {
+		t.Errorf("the longest retention: %v", err)
+	}
+	for _, seconds := range []int{int(MaxSubmitRetention/time.Second) + 1, 27670112510} {
+		long := base
+		long.SubmitRetentionSeconds = seconds
+		if err := long.Validate(); err == nil || !strings.Contains(err.Error(), "submitRetentionSeconds") {
+			t.Errorf("a retention of %ds = %v, want refused", seconds, err)
+		}
+	}
+}
+
+// A draining profile (#5074) has left the install: it is listed with no
+// durables, so nothing new is dispatched for it, until DrainingUntil. A live
+// profile needs a durable; a draining one has none.
+func TestADrainingProfileHasNoDurablesAndALiveOneDoes(t *testing.T) {
+	durable := DispatchDurable{Tier: "read", Kind: SubmitKindTop, Name: ProfileDurableName("tse", "read", SubmitKindTop)}
+	profile := DispatchProfile{Name: "tse", Tiers: []string{"read"}, Concurrency: 2, Durables: []DispatchDurable{durable}}
+	until := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
+	for name, tc := range map[string]struct {
+		durables []DispatchDurable
+		until    time.Time
+		ok       bool
+	}{
+		"live with a durable":     {[]DispatchDurable{durable}, time.Time{}, true},
+		"live with none":          {nil, time.Time{}, false},
+		"draining with none":      {nil, until, true},
+		"draining with a durable": {[]DispatchDurable{durable}, until, false},
+	} {
+		p := profile
+		p.Durables, p.DrainingUntil = tc.durables, tc.until
+		cfg := DispatchConfig{Namespace: "ns", ProfileNamespace: "ns-profiles", Ceiling: 6, LeaseSeconds: 90, RenewSeconds: 20,
+			RestartGraceSeconds: 60, AcceptTimeoutSeconds: 10, Profiles: []DispatchProfile{p}}
+		if err := cfg.Validate(); (err == nil) != tc.ok {
+			t.Errorf("%s: Validate = %v, want ok=%v", name, err, tc.ok)
+		}
+		if p.Draining() != !tc.until.IsZero() {
+			t.Errorf("%s: Draining() = %v", name, p.Draining())
+		}
+	}
+}
+
+// The operator's render with a draining profile (its fixture, written by the
+// operator's tests) decodes strictly into DispatchConfig and passes
+// Validate: the profile is listed draining, with no durables (#5074).
+func TestTheOperatorsDrainingDispatchConfigDecodesAndValidates(t *testing.T) {
+	raw, err := os.ReadFile("testdata/rendered-dispatch-config-draining.json")
+	if err != nil {
+		t.Fatalf("%v\nRegenerate with: go test ./internal/controller/ -run 'Draining' -update (in k8s-operator)", err)
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	var cfg DispatchConfig
+	if err := dec.Decode(&cfg); err != nil {
+		t.Fatalf("the operator's draining dispatch config does not decode strictly: %v", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("the operator's draining dispatch config fails the dispatcher's checks: %v", err)
+	}
+	var draining, live int
+	for _, p := range cfg.Profiles {
+		if p.Draining() {
+			draining++
+			if len(p.Durables) != 0 {
+				t.Errorf("draining profile %s has durables %v", p.Name, p.Durables)
+			}
+		} else {
+			live++
+		}
+	}
+	if draining != 1 || live != 1 {
+		t.Errorf("%d draining and %d live profiles, want one each", draining, live)
 	}
 }

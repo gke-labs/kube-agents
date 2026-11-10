@@ -612,6 +612,26 @@ metadata:
       name: platformagent
       uid: ""
 ---
+apiVersion: v1
+data:
+  rules.json: ""
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-event-watcher-alert-exclude
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -761,6 +781,8 @@ spec:
               value: read-only-dry-run
             - name: KUBE_PROXY_REDACT_SECRETS
               value: "true"
+            - name: GOMEMLIMIT
+              value: "912680550"
             - name: CREDENTIAL_PROXY_AUDIENCE
               value: kubeagents-credential-proxy
             - name: CREDENTIAL_PROXY_ALLOWED_CALLERS
@@ -801,10 +823,10 @@ spec:
           resources:
             limits:
               cpu: "1"
-              memory: 512Mi
+              memory: 1Gi
             requests:
               cpu: 100m
-              memory: 256Mi
+              memory: 512Mi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -1419,8 +1441,6 @@ spec:
               value: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
             - name: CREDENTIAL_PROXY_KUBE_TOKEN_FILE
               value: /var/run/secrets/kubernetes.io/serviceaccount/token
-            - name: CREDENTIAL_PROXY_CONTENT_WORKSPACE
-              value: "1"
             - name: GKE_PROJECT_ID
               value: example-project
             - name: GKE_CLUSTER_NAME
@@ -2094,6 +2114,8 @@ spec:
                 resourceFieldRef:
                   divisor: "0"
                   resource: limits.memory
+            - name: BRIDGE_DEBUG_ERROR_TEXT
+              value: "false"
             - name: A2A_CAPABILITY_REQUIRED
               value: "true"
           image: ghcr.io/gke-labs/kube-agents/hermes-bridge:latest
@@ -2253,6 +2275,13 @@ spec:
               value: http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765
             - name: WATCHER_BROKER_TOKEN_FILE
               value: /var/run/secrets/kubeagents/watcher-proxy/token
+            - name: WATCHER_ALERT_EXCLUDE
+              valueFrom:
+                configMapKeyRef:
+                  key: rules.json
+                  name: platformagent-event-watcher-alert-exclude
+            - name: WATCHER_ALERT_EXCLUDE_FILE
+              value: /etc/kube-agents/event-watcher/rules.json
             - name: CREDENTIAL_PROXY_WORKSPACE_ROOT
               value: /opt/data
             - name: EVENT_WATCHER_CLUSTER_NAME
@@ -2313,6 +2342,9 @@ spec:
               name: platform-agent-data-vol
             - mountPath: /var/run/secrets/kubeagents/watcher-proxy
               name: watcher-credential-proxy-token
+              readOnly: true
+            - mountPath: /etc/kube-agents/event-watcher
+              name: event-watcher-alert-exclude
               readOnly: true
       securityContext:
         fsGroup: 10000
@@ -2391,6 +2423,9 @@ spec:
                         apiVersion: v1
                         fieldPath: metadata.namespace
                       path: namespace
+        - configMap:
+            name: platformagent-event-watcher-alert-exclude
+          name: event-watcher-alert-exclude
         - name: agent-credential-proxy-token
           projected:
             defaultMode: 256
@@ -3478,7 +3513,8 @@ stringData:
           # So no STREAM.DELETE, PURGE,
           # UPDATE or MSG.DELETE on any stream - one STREAM.DELETE.TASKS here
           # used to destroy every task's history and the five consumers on it -
-          # no CONSUMER.DELETE on TASKS, and nothing at all on DIRECTORY, the
+          # no CONSUMER.DELETE on TASKS, nothing on DIRECTORY but its subject list
+          # and a direct get on the card subjects, and nothing at all on the
           # topic streams or the runtime-state, cap and PROFILE_LEASES buckets.
           {
             user: gateway
@@ -3488,6 +3524,8 @@ stringData:
                 allow = [
                   "a2a.tasks.*.*.in",
                   "a2a.tasks.*.*.supervisor",
+                  "a2a.submit.*.*.*.*",
+                  "a2a.stop.*.*",
                   "$KV.session-state.>",
                   "$KV.feedback.>",
                   "$KV.people.>",
@@ -3511,6 +3549,8 @@ stringData:
                   "$JS.API.DIRECT.GET.KV_people.>",
                   "$JS.API.CONSUMER.CREATE.KV_people.>",
                   "$JS.API.CONSUMER.DELETE.KV_people.*",
+                  "$JS.API.STREAM.INFO.DIRECTORY",
+                  "$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.*",
                   "$JS.ACK.TASKS.>",
                   "$JS.FC.>",
                   "_INBOX.gateway.>"
@@ -4657,7 +4697,7 @@ metadata:
       uid: ""
 spec:
   hard:
-    pods: "34"
+    pods: "36"
 status: {}
 ---
 apiVersion: v1
@@ -4734,6 +4774,15 @@ rules:
       - get
       - patch
   - apiGroups:
+      - coordination.k8s.io
+    resourceNames:
+      - platformagent-a2a-gateway
+    resources:
+      - leases
+    verbs:
+      - get
+      - update
+  - apiGroups:
       - ""
     resourceNames:
       - platformagent-resolved-scope
@@ -4809,6 +4858,27 @@ metadata:
       name: platformagent
       uid: ""
 ---
+apiVersion: coordination.k8s.io/v1
+kind: Lease
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: gateway
+    kubeagents.x-k8s.io/a2a-gateway-lease: "true"
+  name: platformagent-a2a-gateway
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec: {}
+---
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -4818,7 +4888,7 @@ metadata:
     app.kubernetes.io/name: platform-agent
     app.kubernetes.io/part-of: a2a-next
     kubeagents.x-k8s.io/a2a-component: provision
-  name: platformagent-a2a-provision-8573af72
+  name: platformagent-a2a-provision-da9e6400
   namespace: kubeagents-system
   ownerReferences:
     - apiVersion: kubeagents.x-k8s.io/v1alpha1
@@ -5130,19 +5200,37 @@ spec:
               >&2\n  echo \"  Provisioning does not edit an existing stream; to append
               the subject to its current subjects:\" >&2\n  echo \"    nats stream edit
               TOPICS-STATE --subjects=\\\"${topics_state_subjects},a2a.topics.agent.platform.topology-skew\\\"\"
-              >&2\nfi\nreport=\"{${report_findings}}\"\n# Written only where the kubelet
-              has mounted the file: outside a pod there is\n# nothing to write to, and
-              a copy of a report is not a reason to fail a fully\n# provisioned bus. Nor
-              is a write that fails (a full or faulting disk under\n# the kubelet's file):
-              under set -e that would exit 1 on a bus this script\n# just finished provisioning,
-              and exit 1 matches no podFailurePolicy rule, so\n# the Job would burn its
-              backoff into BackoffLimitExceeded. A pod that has no\n# file, or whose write
-              failed, leaves no message, and the reconcile logs that\n# rather than reading
-              it as clean.\nif [ -w \"/dev/termination-log\" ]; then\n  printf '%s' \"${report}\"
-              > \"/dev/termination-log\" \\\n    || echo \"WARNING: could not write the
-              provision report to the termination log; the log above is this run's only
-              record\" >&2\nfi\n\nrequired_consumers=110\nlive_consumers=\"$(printf '%s'
-              \"${tasks_json}\" \\\n  | grep -o '\"max_consumers\":-\\{0,1\\}[0-9]\\{1,\\}'
+              >&2\nfi\n#\n# PROFILE_SUBMITS older than this render: read its live max
+              age back. The\n# dispatcher keeps a finished task's tombstone for the max
+              age the operator\n# renders, and a submission still on the stream past its
+              tombstone would be\n# run again; provisioning never edits the stream (lowering
+              a max age evicts\n# queued submissions), so a stream an older operator created
+              longer than this\n# render's 259200s is reported, and the operator\n# renders
+              the longer one (#4948). 0 is no age limit. Same stance as the\n# extractors
+              above: an answer with no readable max_age FAILS.\nsubmits_json=\"$($NATS
+              stream info PROFILE_SUBMITS --json | tr -d ' \\t\\r\\n')\"\nlive_submit_max_age_ns=\"$(printf
+              '%s' \"${submits_json}\" \\\n  | grep -o '\"max_age\":[0-9]\\{1,\\}' | head
+              -n1 | cut -d: -f2 || true)\"\nif [ -z \"${live_submit_max_age_ns}\" ]; then\n
+              \ echo \"could not read max_age off the PROFILE_SUBMITS stream; refusing
+              to report this install as provisioned\" >&2\n  exit 1\nfi\nlive_submit_max_age=$((live_submit_max_age_ns
+              / 1000000000))\nif [ \"${live_submit_max_age_ns}\" = \"0\" ] || [ \"${live_submit_max_age}\"
+              -gt 259200 ]; then\n  report_findings=\"${report_findings}${report_findings:+,}\\\"submit_max_age\\\":{\\\"live\\\":${live_submit_max_age}}\"\n
+              \ echo \"NOTE: PROFILE_SUBMITS keeps submissions for ${live_submit_max_age}s
+              (0 is no limit); this render creates it at 259200s.\" >&2\n  echo \"  The
+              dispatcher is told the longer one, so a finished task's tombstone outlives
+              its submission.\" >&2\nfi\nreport=\"{${report_findings}}\"\n# Written only
+              where the kubelet has mounted the file: outside a pod there is\n# nothing
+              to write to, and a copy of a report is not a reason to fail a fully\n# provisioned
+              bus. Nor is a write that fails (a full or faulting disk under\n# the kubelet's
+              file): under set -e that would exit 1 on a bus this script\n# just finished
+              provisioning, and exit 1 matches no podFailurePolicy rule, so\n# the Job
+              would burn its backoff into BackoffLimitExceeded. A pod that has no\n# file,
+              or whose write failed, leaves no message, and the reconcile logs that\n#
+              rather than reading it as clean.\nif [ -w \"/dev/termination-log\" ]; then\n
+              \ printf '%s' \"${report}\" > \"/dev/termination-log\" \\\n    || echo \"WARNING:
+              could not write the provision report to the termination log; the log above
+              is this run's only record\" >&2\nfi\n\nrequired_consumers=110\nlive_consumers=\"$(printf
+              '%s' \"${tasks_json}\" \\\n  | grep -o '\"max_consumers\":-\\{0,1\\}[0-9]\\{1,\\}'
               | head -n1 | cut -d: -f2 || true)\"\nif [ -z \"${live_consumers}\" ]; then\n
               \ echo \"could not read max_consumers off the TASKS stream; refusing to
               report this install as provisioned\" >&2\n  exit 1\nfi\nif [ \"${live_consumers}\"
@@ -5409,6 +5497,10 @@ spec:
               value: platformagent-a2a-gateway
             - name: A2A_SESSION_SERVICE_ACCOUNT
               value: platformagent-a2a-session
+            - name: A2A_SCOPE_FILE
+              value: /etc/kube-agents/scope.json
+            - name: A2A_MANAGEMENT_PROJECT
+              value: example-project
             - name: A2A_PRINCIPAL_MAP
               value: /etc/a2a/principal-map
             - name: A2A_GCHAT_RELAY_URL
@@ -5422,6 +5514,13 @@ spec:
               value: /var/run/secrets/a2a-chat-relay/token
             - name: A2A_RESOLVED_SCOPE_CONFIGMAP
               value: platformagent-resolved-scope
+            - name: A2A_GATEWAY_LEASE
+              value: platformagent-a2a-gateway
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.name
           image: ghcr.io/gke-labs/kube-agents/a2a-gateway:latest
           name: gateway
           ports:
@@ -5452,6 +5551,9 @@ spec:
             - mountPath: /etc/a2a-nats-ca
               name: a2a-nats-ca
               readOnly: true
+            - mountPath: /etc/kube-agents
+              name: a2a-gateway-scope
+              readOnly: true
             - mountPath: /var/run/secrets/a2a-chat-relay
               name: a2a-chat-relay-token
               readOnly: true
@@ -5462,6 +5564,15 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       serviceAccountName: platformagent-a2a-gateway
+      topologySpreadConstraints:
+        - labelSelector:
+            matchLabels:
+              app: platformagent-a2a-gateway
+          matchLabelKeys:
+            - pod-template-hash
+          maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
       volumes:
         - configMap:
             name: principal-map
@@ -5470,6 +5581,14 @@ spec:
         - configMap:
             name: platformagent-a2a-nats-ca-bundle
           name: a2a-nats-ca
+        - configMap:
+            defaultMode: 292
+            items:
+              - key: scope.json
+                path: scope.json
+            name: platformagent-config
+            optional: true
+          name: a2a-gateway-scope
         - name: a2a-chat-relay-token
           projected:
             defaultMode: 256

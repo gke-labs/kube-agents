@@ -987,6 +987,17 @@ class TestNoPdb(unittest.TestCase):
     def test_a_single_replica_workload_is_never_flagged(self):
         self.assertIsNone(collect.check_no_pdb(self.wl(replicas=1), context_of()))
 
+    def test_the_impact_frames_upgrades_and_scale_downs_not_one_drain(self):
+        """#4966: one drain evicts only the pods on that node, so three replicas
+        on three nodes survive it. The risk is co-location and back-to-back
+        drains during upgrades and scale-downs, and the sentence must say so."""
+        impact = next(s for s in collect.OBTAINABILITY_CHECKS if s.slug == "no-pdb").impact
+        for phrase in ("node upgrades", "scale-downs", "every replica on that node", "back-to-back drains"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, impact)
+        self.assertNotIn("single node drain", impact)
+        self.assertNotIn("terminate every replica", impact)
+
 
 class TestBlockingPdb(unittest.TestCase):
     def ctx(self, pdb_entry, replicas=3, labels=None, hpas=None, ns="default"):
@@ -13097,6 +13108,131 @@ class RecordedChainsUnderTheCommandCapTest(unittest.TestCase):
                 self.assertLessEqual(len(text), audit_report.MAX_COMMAND_CHARS, len(text))
                 self.assertEqual(text, audit_report.validate_check_command(text, "clusters[0]", "privileged-container"))
                 self.assertEqual(text, audit_report.trim_command(text))
+
+
+class TestNodePoolsFromTheDiscoveryListing(unittest.TestCase):
+    """Both streams that read node pools take them from the `clusters list`
+    item that discovered the cluster, recorded against that listing's command,
+    and run their own `node-pools list` only when the item carries none
+    (#4081)."""
+
+    LISTING_ARGV = ["gcloud", "container", "clusters", "list", "--project", "acme", "--format", "json"]
+    # One legacy-metadata pool, so legacy-metadata fires only if the check saw
+    # the pools; tainted and autoscaled, so obtainability's taint arm fires
+    # only if it saw them.
+    POOLS = [
+        {
+            "name": "legacy",
+            "status": "RUNNING",
+            "autoscaling": {"enabled": True},
+            "config": {
+                "workloadMetadataConfig": {"mode": "GCE_METADATA"},
+                "taints": [{"key": "dedicated", "value": "batch", "effect": "NO_SCHEDULE"}],
+            },
+        }
+    ]
+    COMPUTE_CLASS = {"kind": "ComputeClass", "metadata": {"name": "batch"}}
+
+    def collect(self, audit_id, listed_pools=None, *, listed=True, items=()):
+        item = {"name": "c1", "location": "us-central1", "status": "RUNNING"}
+        if listed:
+            item["nodePools"] = self.POOLS if listed_pools is None else listed_pools
+        self.issued = []
+
+        def run(argv, **kwargs):
+            self.issued.append(list(argv))
+            if discovered := discovery_of_acme(argv):
+                return discovered
+            if argv[:4] == ["gcloud", "container", "clusters", "list"]:
+                return Run(argv, 0, json.dumps([item]), "", 0.05)
+            if "get-credentials" in argv:
+                return Run(argv, 0, "", "", 0.05)
+            if argv[:3] == ["kubectl", "get", "computeclasses"]:
+                return Run(argv, 0, json.dumps(dump_of(self.COMPUTE_CLASS)), "", 0.05)
+            if argv[:2] == ["kubectl", "get"] and argv[2] == collect.COMPLIANCE_DUMP_KINDS:
+                return Run(argv, 0, json.dumps(dump_of(compliance_pod("app"))), "", 0.1)
+            if argv[:2] == ["kubectl", "get"]:
+                return Run(argv, 0, json.dumps(dump_of(*items)), "", 0.1)
+            if argv[:4] == ["gcloud", "container", "clusters", "describe"]:
+                return Run(argv, 0, json.dumps({"workloadIdentityConfig": {"workloadPool": "x"}}), "", 0.1)
+            if argv[:3] == ["gcloud", "container", "node-pools"]:
+                return Run(argv, 0, json.dumps(self.POOLS), "", 0.1)
+            return Run(argv, 0, "", "", 0.01)
+
+        with TemporaryDirectory() as tmp, patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                manifest = collect.collect_fleet(audit_id, run=run)
+        self.log = stderr.getvalue()
+        entry = next(c for c in manifest["clusters"] if c["name"] == QUALIFIED_C1)
+        return manifest, entry
+
+    def node_pools_reads(self):
+        return [a for a in self.issued if a[:3] == ["gcloud", "container", "node-pools"]]
+
+    def legacy_record(self, entry):
+        return next(c for c in entry["commands"] if c["check"] == "legacy-metadata")
+
+    def test_compliance_takes_the_listed_pools_and_records_the_listing(self):
+        manifest, entry = self.collect("compliance-audit")
+        self.assertEqual(self.node_pools_reads(), [])
+        self.assertIn("NodePool/legacy", {c["object"] for c in entry["candidates"] if c["check"] == "legacy-metadata"})
+        record = self.legacy_record(entry)
+        self.assertEqual(record["command"], shlex.join(self.LISTING_ARGV))
+        self.assertEqual(record["rc"], 0)
+        self.assertEqual(record["duration_s"], 0)
+        self.assertEqual(record["output_sha256"], collect.output_digest(json.dumps(self.POOLS, sort_keys=True)))
+        self.assertNotIn(collect.collector_run.LISTED_NODE_POOLS_KEY, json.dumps(manifest))
+        # The record still verifies as the command behind the check.
+        checks_run = [{"check": c["check"], "command": c["command"]} for c in entry["commands"]]
+        doc = {"audit": "compliance-audit", "scope": {"clusters": [{"name": QUALIFIED_C1, "checks_run": checks_run}]}}
+        audit_report.cross_check_manifest(doc, manifest)
+
+    def test_compliance_takes_an_empty_listed_list_as_no_pools(self):
+        _, entry = self.collect("compliance-audit", listed_pools=[])
+        self.assertEqual(self.node_pools_reads(), [])
+        self.assertEqual([c for c in entry["candidates"] if c["check"] == "legacy-metadata"], [])
+        self.assertEqual(self.legacy_record(entry)["output_sha256"], collect.output_digest("[]"))
+
+    def test_compliance_reads_node_pools_when_the_listing_carries_none(self):
+        for listed, pools in ((False, None), (True, {"not": "a list"})):
+            with self.subTest(listed=listed, pools=pools):
+                _, entry = self.collect("compliance-audit", listed_pools=pools, listed=listed)
+                expected = [
+                    "gcloud", "container", "node-pools", "list", "--cluster", "c1", "--location", "us-central1",
+                    "--project", "acme", "--format", "json",
+                ]
+                self.assertEqual(self.node_pools_reads(), [expected])
+                self.assertEqual(self.legacy_record(entry)["command"], shlex.join(expected))
+                self.assertIn("NodePool/legacy", {c["object"] for c in entry["candidates"]})
+                self.assertIn("reading node-pools list", self.log)
+
+    def test_the_discovery_listing_is_unchanged(self):
+        self.collect("compliance-audit")
+        self.assertEqual([a for a in self.issued if a[:4] == ["gcloud", "container", "clusters", "list"]], [self.LISTING_ARGV])
+
+    def test_obtainability_takes_the_listed_pools(self):
+        _, entry = self.collect("obtainability-audit")
+        self.assertEqual(self.node_pools_reads(), [])
+        reasons = {e["check"]: e["reason"] for e in entry.get("checks_unevaluated") or []}
+        self.assertIn("all node pools carry workload taints", reasons.get("untargeted-compute-class-workload", ""))
+        # The read records no command of its own, listed or not.
+        self.assertNotIn("untargeted-compute-class-workload", {c["check"] for c in entry["commands"]})
+
+    def test_obtainability_takes_untainted_listed_pools_and_keeps_its_record(self):
+        _, entry = self.collect(
+            "obtainability-audit", listed_pools=[{**self.POOLS[0], "config": {}}], items=(deployment("api"),)
+        )
+        self.assertEqual(self.node_pools_reads(), [])
+        record = next(c for c in entry["commands"] if c["check"] == "untargeted-compute-class-workload")
+        self.assertIn("kubectl get computeclasses", record["command"])
+
+    def test_obtainability_reads_node_pools_when_the_listing_carries_none(self):
+        _, entry = self.collect("obtainability-audit", listed=False)
+        self.assertEqual(len(self.node_pools_reads()), 1)
+        reasons = {e["check"]: e["reason"] for e in entry.get("checks_unevaluated") or []}
+        self.assertIn("all node pools carry workload taints", reasons.get("untargeted-compute-class-workload", ""))
+        self.assertIn("nodePools absent from the discovery listing; reading node-pools list", self.log)
 
 
 if __name__ == "__main__":

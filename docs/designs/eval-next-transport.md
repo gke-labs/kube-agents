@@ -346,8 +346,8 @@ gate, an `authority` block that names a real principal, and the reply rendered i
 transport. `tool_called` reads the trajectory, which on this path carries tool-call data only
 when the executor publishes `activity` artifacts and the door's probe carries them: the relay
 never posts `activity` to a conversation, so the harness reads the trace off the read route when
-the probe body carries an `activity` key (`[]` for a run that called nothing), maps each entry to
-a trajectory item in the api path's shape, and writes one `a2a.activity` marker whenever the key
+the probe body carries an `activity` key (`[]` for a run that called nothing), maps each entry
+the bridge does not label with a card worker's session to a trajectory item in the api path's shape, and writes one `a2a.activity` marker whenever the key
 was present at all; a probe without the key leaves the record with no marker and no calls. Which
 executor publishes `activity`, and whether the door carries it, is each component's own to state
 (the payload spec reserves the artifact; `a2a/gateway/inject.go` defines the probe body); the
@@ -484,8 +484,8 @@ transport reaches. The delegation wait reads the cards the turn filed from the P
 session store rather than from the trajectory (Completion signals), so a case whose answer is a
 delegated worker's report is graded on that report, as on the api lane. Two differences from the
 api lane remain, and both are the transport's rather than the agent's. A router-scope
-`tool_called` reads the Planning Agent's calls through the door's trace, which carries no worker's
-calls. And the GitHub-write safeguard charges a write to the repetition whose reply or creating
+`tool_called` reads the Planning Agent's calls through the door's trace, from which the harness leaves out the
+calls the bridge labels with a card worker's session. And the GitHub-write safeguard charges a write to the repetition whose reply or creating
 call names it, and the door's trace sends the Planning Agent's arguments as shapes, so on this
 lane what names a write is the reply and the workers' calls the harness reads back from the pod
 once the delegation wait has found the cards; a write neither names is recorded as unattributed
@@ -739,10 +739,10 @@ refuses `EVAL_ROLLBACK_LANE=1` without the flag, before anything is built.
 The flag admits those jobs by name and nothing else without a pull request: section 2b of the
 deploy accepts `EVAL_MODE_NEXT=1` on a run that carries a `PULL_NUMBER` or whose `JOB_NAME` is
 listed in `EVAL_MODE_NEXT_JOB_NAMES` in `hack/ci-deploy.sh` (the merge-blocking presubmit, for
-the batch runs Tide started, the main nightly's three parts
-`ci-kube-agents-eval-nightly`, `ci-kube-agents-eval-nightly-main-b` and
-`ci-kube-agents-eval-nightly-writers`, the GitLab lane's nightly
-under next, the GHES lane's nightly under next (`ci-kube-agents-eval-nightly-ghes-next`), the certification lane's first slice (`ci-kube-agents-certification-1`), and the release-candidate eval's postsubmit, which grades a candidate in the mode a new
+the batch runs Tide started, the main nightly's eight parts
+`ci-kube-agents-eval-nightly`, `ci-kube-agents-eval-nightly-main-b` to `-main-e`,
+`ci-kube-agents-eval-nightly-writers`, `-writers-b` and `-writers-c`, the GitLab lane's nightly
+under next, the GHES and GitLab CE lanes' weekly jobs under next (`ci-kube-agents-eval-weekly-ghes-next`, `ci-kube-agents-eval-weekly-gitlab-ce-next`), the certification lane's first slice (`ci-kube-agents-certification-1`), and the release-candidate eval's postsubmit, which grades a candidate in the mode a new
 install gets), and refuses it on any other Prow run, so the flag mis-set on the today-mode GitLab nightly or another
 postsubmit still stops the deploy before anything is built. A next-mode run has a record of its own: the baseline version key carries the mode, which
 `bench-gate` reads off the inject transport ([`bench/baselines/README.md`](../../bench/baselines/README.md)),

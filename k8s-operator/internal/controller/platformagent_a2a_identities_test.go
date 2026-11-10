@@ -551,7 +551,7 @@ func TestTheWorkerCredentialIsGone(t *testing.T) {
 		t.Error("worker-password is back in a2aCredsKeys; the operator would mint a password nothing authenticates with")
 	}
 
-	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 	if strings.Contains(conf, "user: worker") {
 		t.Error("the rendered nats.conf still declares a `worker` user")
 	}
@@ -598,7 +598,7 @@ func TestAnOverriddenServiceAccountCannotMoveTheBusPrincipal(t *testing.T) {
 	if want := a2aServiceAccountName(agent.Namespace, gatewayServiceAccountName(agent)); agentSA != want {
 		t.Fatalf("the `agent` identity is keyed on %q, want the gateway's own %q", agentSA, want)
 	}
-	if _, _, err := buildA2AAuthMapConfigMaps(agent, nil); err != nil {
+	if _, _, err := buildA2AAuthMapConfigMaps(agent, nil, nil); err != nil {
 		t.Errorf("an override of the broker's ServiceAccount broke the bus map: %v", err)
 	}
 }

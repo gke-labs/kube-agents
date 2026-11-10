@@ -1,17 +1,20 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/oauth2"
 	"k8s.io/client-go/rest"
@@ -315,5 +318,38 @@ func TestScopedPoolTransportRefusesUnmappedClusterAndMintsPerProjectToken(t *tes
 	}
 	if iamCalls != 2 || containerCalls != 2 || clusterCalls != 2 {
 		t.Fatalf("unexpected call counts after second project: iam=%d container=%d cluster=%d", iamCalls, containerCalls, clusterCalls)
+	}
+}
+
+func TestEnvInt64AndDurationOrDefaultLogWarnings(t *testing.T) {
+	var buf bytes.Buffer
+	origOut := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(origOut)
+
+	t.Setenv("KUBE_PROXY_CACHE_MAX_BYTES", "64Mi")
+	if got := envInt64OrDefault("KUBE_PROXY_CACHE_MAX_BYTES", 1024); got != 1024 {
+		t.Fatalf("envInt64OrDefault(64Mi) = %d, want 1024", got)
+	}
+	if !strings.Contains(buf.String(), `warning: KUBE_PROXY_CACHE_MAX_BYTES is not a base-10 integer; using default 1024`) {
+		t.Errorf("expected warning log for invalid int64 env, got %q", buf.String())
+	}
+
+	buf.Reset()
+	t.Setenv("KUBE_PROXY_CACHE_RESOURCE_TTL", "30")
+	if got := envDurationOrDefault("KUBE_PROXY_CACHE_RESOURCE_TTL", 10*time.Second); got != 10*time.Second {
+		t.Fatalf("envDurationOrDefault(30) = %s, want 10s", got)
+	}
+	if !strings.Contains(buf.String(), `warning: KUBE_PROXY_CACHE_RESOURCE_TTL is not a valid duration; using default 10s`) {
+		t.Errorf("expected warning log for invalid duration env, got %q", buf.String())
+	}
+
+	t.Setenv("KUBE_PROXY_CACHE_MAX_BYTES", "2048")
+	if got := envInt64OrDefault("KUBE_PROXY_CACHE_MAX_BYTES", 1024); got != 2048 {
+		t.Fatalf("envInt64OrDefault(2048) = %d, want 2048", got)
+	}
+	t.Setenv("KUBE_PROXY_CACHE_RESOURCE_TTL", "15s")
+	if got := envDurationOrDefault("KUBE_PROXY_CACHE_RESOURCE_TTL", 10*time.Second); got != 15*time.Second {
+		t.Fatalf("envDurationOrDefault(15s) = %s, want 15s", got)
 	}
 }

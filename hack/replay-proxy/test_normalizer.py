@@ -93,6 +93,42 @@ class IdentifierTest(unittest.TestCase):
         self.assertEqual(card([claimed]), card([claimed, beat, beat]))
         self.assertNotEqual(card([claimed]), card([claimed, {"kind": "completed", "payload": None}]))
 
+    def test_queued_events_are_left_out_of_the_key(self):
+        def card(events):
+            return norm(json.dumps({"task": {"id": "t_11111111", "status": "running"}, "events": events}))
+        claimed = {"kind": "claimed", "payload": None, "created_at": 1793700000}
+        queued = {"kind": "queued", "created_at": 1793700100, "run_id": None, "payload": {
+            "note": "Queued: the system is busy. Your request will start when a worker frees up.",
+            "running": 4, "limit": 5, "background_running": 0}}
+        self.assertEqual(card([claimed]), card([claimed, queued]))
+        self.assertNotEqual(card([claimed]), card([claimed, {"kind": "reclaimed", "payload": None}]))
+
+    def test_a_dropped_events_unrestorable_values_still_count_against_an_answer(self):
+        walker = normalizer.Normalizer(NOW, False)
+        walker.walk({"events": [{"kind": "queued", "created_at": 1793700100, "payload": {"note": "busy since 2026-11-05"}},
+                                {"kind": "heartbeat", "payload": {"note": "pod up 5m ago"}}]})
+        self.assertTrue(walker.mapping.answer_repeats_bare_number("waited since 1793700100"))
+        self.assertTrue(walker.mapping.answer_repeats_age("logs --since 5m"))
+        self.assertTrue(walker.mapping.answer_repeats_date("busy since 2026-11-05"))
+        # A throwaway walk numbers nothing: the next placeholder is still the first.
+        self.assertEqual(walker.mapping.counts, {})
+
+    def test_a_queued_events_counts_count_against_an_answer_about_the_queue(self):
+        walker = normalizer.Normalizer(NOW, False)
+        walker.walk({"events": [{"kind": "queued", "payload": {
+            "note": "Queued: the system is busy.", "running": 4, "limit": 5, "ahead": 6, "background_running": False}}]})
+        mapping = walker.mapping
+        for answer in ("It waited behind 6 other tasks.", "The card was queued with 4 running.", "running: 4 of limit=5",
+                       "6 tasks ahead of it"):
+            with self.subTest(answer=answer):
+                self.assertTrue(mapping.answer_repeats_bare_number(answer))
+        # The same small numbers anywhere else are not the queue's.
+        for answer in ("replicas: 4", "All 5 clusters are healthy.", "pool-6 has 6 nodes", "1 minor version"):
+            with self.subTest(answer=answer):
+                self.assertFalse(mapping.answer_repeats_bare_number(answer))
+        # A boolean is no count.
+        self.assertFalse(mapping.answer_repeats_bare_number("background_running: 0 in the queue"))
+
     def test_expires_is_a_time_key(self):
         self.assertEqual(norm('"expires": 1793759016'), norm('"expires": 1793759100'))
         self.assertIn("⟦TIME_", norm('"expires": 1793759016'))
@@ -148,6 +184,138 @@ class AgeTest(unittest.TestCase):
 
     def test_cpu_differs_in_the_key(self):
         self.assertNotEqual(fp(request("cpu: 120m")), fp(request("cpu: 250m")))
+
+
+class AgeColumnTest(unittest.TestCase):
+    def test_a_line_below_the_header_that_is_not_a_row_keeps_its_text(self):
+        # The AGE cell spans columns 60-67; on the JSON line below the table that
+        # is the uid's `-83d`, which once read as an age of 83 days.
+        header = "NAME".ljust(60) + "AGE     IP"
+        row = "web-7d4b9c8f6d-x2k9p".ljust(60) + "5m".ljust(8) + "10.1.2.3"
+        line = '{"name":"' + "x" * 28 + '","uid":"6f79db96-15b3-4308-83df-7c4f203b6015","phase":"Pending"}'
+        out = norm("\n".join((header, row, line)))
+        self.assertIn('"uid":"⟦UID_1⟧"', out)
+        self.assertRegex(out, r"⟦AGEm_\d+⟧")
+
+
+class TimeOccurrenceTest(unittest.TestCase):
+    def test_only_timestamps_outside_assistant_messages_take_a_position(self):
+        # A slot blanks an answer's words, so a timestamp counted there could
+        # shift every later position between two requests that share a slot key.
+        n = normalizer.normalize_request({"model": "m", "messages": [
+            {"role": "assistant", "content": "as of 2026-11-03T11:00:00Z"},
+            {"role": "tool", "tool_call_id": "c", "content": "created 2026-11-03T11:30:00Z"},
+        ]}, NOW)
+        self.assertEqual(n.mapping.time_occurrences, ["2026-11-03T11:30:00Z"])
+        self.assertEqual(n.mapping.apply_to_answer("created 2026-11-03T11:30:00Z"), "created ⟦TIMEVAL_1⟧")
+
+
+class TimeOccurrenceInJsonTest(unittest.TestCase):
+    def test_asking_whether_a_value_holds_a_time_notes_no_timestamp(self):
+        # The walk asks of each JSON value whether it holds a time of day
+        # (Normalizer.timed) before walking it; only the walk notes the text.
+        n = normalizer.normalize_request({"model": "m", "messages": [
+            {"role": "tool", "tool_call_id": "c",
+             "content": '{"created": "2026-11-03T11:30:00Z", "name": "web", "updated": "2026-11-03T11:40:00Z"}'},
+        ]}, NOW)
+        self.assertEqual(n.mapping.time_occurrences, ["2026-11-03T11:30:00Z", "2026-11-03T11:40:00Z"])
+
+
+class StderrOrderTest(unittest.TestCase):
+    def test_a_warning_before_or_after_the_output_gives_one_key(self):
+        warning = "WARNING: --filter : operator evaluation is changing for consistency across Google APIs."
+        body = '{\n  "quotas": [{"limit": 16.0, "metric": "NVIDIA_A100_GPUS"}]\n}'
+        after = json.dumps({"exit_code": 0, "output": body + "\n" + warning})
+        before = json.dumps({"exit_code": 0, "output": warning + "\n" + body + "\n"})
+        self.assertEqual(norm(after), norm(before))
+
+    def test_a_wrapped_warning_moves_with_its_continuation_lines(self):
+        warning = "WARNING: Accessing a Kubernetes Engine cluster requires the kubernetes commandline\n    tool [kubectl]."
+        body = '[{"name": "alpha", "status": "RUNNING"}]'
+        self.assertEqual(norm(warning + "\n" + body + "\n"), norm(body + "\n" + warning))
+        self.assertEqual(norm(warning + "\n" + body), body + "\n" + warning)
+
+    def test_the_order_of_a_warning_and_plain_output_still_counts(self):
+        # In either direction: only a JSON document between warnings is reordered.
+        self.assertNotEqual(norm("WARNING: disk pressure\nPod evicted"), norm("Pod evicted\nWARNING: disk pressure"))
+        self.assertNotEqual(norm("Pod evicted\nWARNING: disk pressure"), norm("WARNING: disk pressure\nPod evicted"))
+        self.assertEqual(norm("WARNING: disk pressure\nPod evicted"), "WARNING: disk pressure\nPod evicted")
+        body = '{"ok": true}'
+        self.assertNotEqual(norm("WARNING: a\nnote\n" + body), norm(body + "\nWARNING: a\nnote"),
+                            "an unindented line is output, not a warning's continuation")
+
+    def test_the_rest_of_the_output_still_counts(self):
+        warning = "WARNING: something"
+        self.assertNotEqual(norm(warning + "\nlimit: 16"), norm(warning + "\nlimit: 64"))
+        self.assertEqual(norm(warning), warning)
+
+
+class AnswerSlotTest(unittest.TestCase):
+    CONTEXT = normalizer.KeyContext("c", "i")
+
+    @staticmethod
+    def convo(said, shown, task="t_aaaaaaaa"):
+        return normalizer.normalize_request({"model": "m", "messages": [
+            {"role": "user", "content": f"work kanban task {task}"},
+            {"role": "assistant", "content": said},
+            {"role": "user", "content": shown},
+        ]}, NOW)
+
+    def test_the_slot_key_ignores_which_answer_and_keeps_what_followed(self):
+        a, a_slots = normalizer.answer_slots(self.convo("Yes please.", "ticket Tea"), self.CONTEXT)
+        b, b_slots = normalizer.answer_slots(self.convo("Yes.", "ticket Tea", task="t_bbbbbbbb"), self.CONTEXT)
+        c, _ = normalizer.answer_slots(self.convo("Yes.", "ticket Latte"), self.CONTEXT)
+        self.assertEqual(a, b)
+        self.assertNotEqual(a, c)
+        self.assertEqual(a_slots[0][0], b_slots[0][0], "both answers fill the same context")
+        self.assertNotEqual(a_slots[0][1], b_slots[0][1])
+
+    @staticmethod
+    def acted(name, arguments, said, call_id):
+        return normalizer.normalize_request({"model": "m", "messages": [
+            {"role": "user", "content": "work kanban task t_aaaaaaaa"},
+            {"role": "assistant", "content": said, "tool_calls": [{"id": call_id, "type": "function", "function": {
+                "name": name, "arguments": json.dumps(arguments)}}]},
+            {"role": "tool", "tool_call_id": call_id, "content": '{"ok": true}'},
+        ]}, NOW)
+
+    def test_the_slot_key_keeps_the_tool_calls_and_blanks_only_the_words(self):
+        get = {"command": "kubectl get pods"}
+        base, _ = normalizer.answer_slots(self.acted("terminal", get, "Looking.", "call_1__thought__QUJD"), self.CONTEXT)
+        worded, slots = normalizer.answer_slots(
+            self.acted("terminal", get, "Let me look.", "call_8__thought__WFla"), self.CONTEXT)
+        self.assertEqual(base, worded, "other words, another call id and thought signature: the same slot")
+        for name, arguments in (("kanban_complete", get), ("terminal", {"command": "kubectl delete pods --all"})):
+            other, _ = normalizer.answer_slots(self.acted(name, arguments, "Looking.", "call_1__thought__QUJD"), self.CONTEXT)
+            self.assertNotEqual(base, other, (name, arguments))
+        self.assertNotEqual(slots[0][1], normalizer.answer_slots(
+            self.acted("terminal", get, "Looking.", "call_1"), self.CONTEXT)[1][0][1], "the words name the answer")
+
+    def test_a_read_only_tool_keeps_its_name_and_blanks_its_arguments(self):
+        show, _ = normalizer.answer_slots(self.acted("kanban_show", {}, "", "call_1"), self.CONTEXT)
+        own, slots = normalizer.answer_slots(self.acted("kanban_show", {"task_id": "t_aaaaaaaa"}, "", "call_2"), self.CONTEXT)
+        self.assertEqual(show, own)
+        other, _ = normalizer.answer_slots(self.acted("kanban_list", {}, "", "call_1"), self.CONTEXT)
+        self.assertNotEqual(show, other, "the name stays in the key")
+        self.assertNotEqual(slots[0][1], normalizer.answer_slots(
+            self.acted("kanban_show", {}, "", "call_1"), self.CONTEXT)[1][0][1], "the arguments still name the answer")
+
+    def test_an_answer_noted_at_record_time_is_the_one_a_later_slot_holds(self):
+        asked = {"model": "m", "messages": [{"role": "user", "content": "work kanban task t_aaaaaaaa"}]}
+        # As the proxy assembled it from the stream, and as the client sends it back.
+        streamed = {"role": "assistant", "content": "", "tool_calls": [{"index": 0, "id": "call_1__thought__QUJD",
+                    "type": "function", "function": {"name": "kubectl", "arguments": '{"pod": "web-7d4b9c8f6d-x2k9p"}'}}]}
+        returned = {"role": "assistant", "content": None, "tool_calls": [{"id": "call_1__thought__QUJD",
+                    "type": "function", "function": {"name": "kubectl", "arguments": '{"pod": "web-7d4b9c8f6d-x2k9p"}'}}]}
+        later = dict(asked, messages=asked["messages"] + [returned, {"role": "tool", "tool_call_id": "call_1__thought__QUJD",
+                                                                     "content": "ok"}])
+        context, _ = normalizer.answer_slots(normalizer.normalize_request(asked, NOW), self.CONTEXT)
+        _, slots = normalizer.answer_slots(normalizer.normalize_request(later, NOW), self.CONTEXT)
+        self.assertEqual(slots, [(context, normalizer.answer_in_context(asked, streamed, NOW))])
+
+    def test_placeholders_outside_answers(self):
+        n = self.convo("I'll look at web-7d4b9c8f6d-x2k9p", "ticket for web-5f6c7d8b9c-m8n7q")
+        self.assertEqual(normalizer.placeholders_outside_answers(n), {"⟦TASK_1⟧", "⟦POD_2⟧"})
 
 
 class LongDateTest(unittest.TestCase):
@@ -580,16 +748,168 @@ class OpaqueTest(unittest.TestCase):
 
 class RecentWorkTest(unittest.TestCase):
     CARD = "# Card t_3c176184\nbody\n\n## Recent work by @platform\n- t_11111111 — {title} (2026-11-02 10:00, 18h ago): done\n- t_22222222 — y: ok\n\n## Comment thread\nnone"
+    # The same view with no digest, as Hermes renders it when the assignee has no other runs.
+    BARE_CARD = "# Card t_3c176184\nbody\n\n## Comment thread\nnone"
 
     def test_block_is_dropped_from_the_key(self):
         a = request(self.CARD.format(title="audit"))
         b = request(self.CARD.format(title="something else entirely"))
         self.assertEqual(fp(a), fp(b))
-        self.assertIn("## Recent work [stripped]\n\n## Comment thread", normalizer.normalize_request(a, NOW).messages[0]["content"])
+        self.assertIn("body\n\n## Comment thread", normalizer.normalize_request(a, NOW).messages[0]["content"])
+
+    def test_a_view_with_the_digest_keys_as_the_view_without_it(self):
+        self.assertEqual(fp(request(self.CARD.format(title="audit"))), fp(request(self.BARE_CARD)))
+        # Hermes puts it last in a worker's context: the blank line before it goes too.
+        self.assertEqual(norm("flat text.\n\n## Recent work by @cluster-a\n- t_11111111 — a: b"), "flat text.")
+        self.assertEqual(norm("flat text.\n\n## Recent work by @cluster-a\n- t_11111111 — a: b\n"), "flat text.\n")
+
+    def test_what_is_around_the_digest_still_counts(self):
+        self.assertNotEqual(fp(request(self.CARD.format(title="audit"))),
+                            fp(request(self.BARE_CARD.replace("body", "other body"))))
+        self.assertNotEqual(norm("a\n\n## Recent work by @x\n- t_11111111 — y\nnot an item"), norm("a"))
 
     def test_block_inside_json_escaped_text(self):
         raw = '{"output": "x\\n## Recent work by @platform\\n- t_11111111 — a: b\\n\\nrest"'  # truncated JSON
-        self.assertEqual(norm(raw), '{"output": "x\\n## Recent work [stripped]\\n\\nrest"')
+        self.assertEqual(norm(raw), '{"output": "x\\nrest"')
+        raw = '{"output": "x\\n\\n## Recent work by @platform\\n- t_11111111 — a: b\\n\\nrest"'
+        self.assertEqual(norm(raw), '{"output": "x\\n\\nrest"')
+
+
+class EvalPoolProjectTest(unittest.TestCase):
+    def test_the_project_is_an_identifier_wherever_the_pool_writes_it(self):
+        cases = (
+            ("project kube-agents-evals-31", "project ⟦EVALPROJECT_1⟧"),
+            ("cluster-kube-agents-evals-31-seeded-a-us-central1-a", "cluster-⟦EVALPROJECT_1⟧-seeded-a-us-central1-a"),
+            ("gke_kube-agents-evals-31_us-central1-a_seeded-a", "gke_⟦EVALPROJECT_1⟧_us-central1-a_seeded-a"),
+            ("gke-agentic/kube-agents-evals-31-infra", "gke-agentic/⟦EVALPROJECT_1⟧-infra"),
+            ("sa@kube-agents-evals-31.iam.gserviceaccount.com", "sa@⟦EVALPROJECT_1⟧.iam.gserviceaccount.com"),
+            # The first pool project has no number.
+            ("--project=kube-agents-evals,", "--project=⟦EVALPROJECT_1⟧,"),
+            ("gke-agentic/kube-agents-evals-infra", "gke-agentic/⟦EVALPROJECT_1⟧-infra"),
+            ("cluster-kube-agents-evals-seeded-a", "cluster-⟦EVALPROJECT_1⟧-seeded-a"),
+            ("kube-agents-evals-us-central1.kubeagents-system", "⟦EVALPROJECT_1⟧-us-central1.kubeagents-system"),
+        )
+        for raw, want in cases:
+            with self.subTest(raw=raw):
+                self.assertEqual(norm(raw), want)
+
+    def test_runs_in_different_pool_projects_match(self):
+        def body(project):
+            return request(f"You are cluster-{project}-seeded-a-us-central1-a, project {project}",
+                           json.dumps({"output": f"gcloud container clusters list --project={project}"}))
+        self.assertEqual(fp(body("kube-agents-evals-31")), fp(body("kube-agents-evals-29")))
+        self.assertEqual(fp(body("kube-agents-evals-31")), fp(body("kube-agents-evals")))
+
+    def test_a_percent_escaped_project_in_a_url(self):
+        self.assertEqual(norm("project_id%3D%22kube-agents-evals-22%22"), "project_id%3D%22⟦EVALPROJECT_1⟧%22")
+        self.assertEqual(norm("gitlab.com%2Fgke-agentic%2Fkube-agents-evals-22-infra"),
+                         "gitlab.com%2Fgke-agentic%2F⟦EVALPROJECT_1⟧-infra")
+        self.assertEqual(norm("x%2Fkube-agents-evals-token-minter"), "x%2Fkube-agents-evals-token-minter")
+
+    def test_two_projects_in_one_request_stay_apart(self):
+        self.assertEqual(norm("kube-agents-evals-3 and kube-agents-evals-31"), "⟦EVALPROJECT_1⟧ and ⟦EVALPROJECT_2⟧")
+
+    def test_names_that_are_no_pool_project_stay_literal(self):
+        for raw in ("kube-agents-evals-token-minter[bot]", "gke-agentic/kube-agents-evals-large-gitops",
+                    "kube-agents-evals-project", "gs://kube-agents-evals-nightly-logs/", "kube-agents-evals-ledger-reader",
+                    "kube-agents-evals-31x", "xkube-agents-evals-31", "kube-agents-evalsx", "kube-agents-evals-2b"):
+            with self.subTest(raw=raw):
+                self.assertEqual(norm(raw), raw)
+
+
+class RecentWorkGuardTest(unittest.TestCase):
+    CARD = "card t_bbbbbbbb\n\n## Recent work by @platform\n- t_deadbeef — synced the repo at 0ffe0cb (2026-11-02 10:00, 18m ago): done"
+
+    def test_a_commit_only_the_digest_names_counts_against_an_answer(self):
+        walker = normalizer.Normalizer(NOW, False)
+        walker.text(self.CARD)
+        self.assertTrue(walker.mapping.has_identifier("git checkout 0ffe0cb"))
+        self.assertFalse(walker.mapping.has_identifier("git checkout 0ffe0cc"))
+        # Digits alone are a number, not a commit.
+        walker.text("x\n\n## Recent work by @platform\n- t_deadbeef — wrote 1234567 rows")
+        self.assertFalse(walker.mapping.has_identifier("wrote 1234567 rows"))
+
+    def test_a_digest_commit_at_another_length_counts_against_an_answer(self):
+        # The answer may shorten the digest's full SHA, or lengthen its short one.
+        full = "0ffe0cbd6b463ad4c3d2e1f0a9b8c7d6e5f4a3b2"
+        walker = normalizer.Normalizer(NOW, False)
+        walker.text(f"x\n\n## Recent work by @platform\n- t_deadbeef — synced the repo at {full}: done")
+        self.assertTrue(walker.mapping.has_identifier("git checkout 0ffe0cb"))
+        self.assertFalse(walker.mapping.has_identifier("git checkout 0ffe0cc"))
+        walker = normalizer.Normalizer(NOW, False)
+        walker.text(self.CARD)
+        self.assertTrue(walker.mapping.has_identifier(f"git checkout {full}"))
+
+    def test_a_digest_commit_in_an_identifier_shape_counts_as_bare_hex(self):
+        # The throwaway normalizer binds these, so the hex never reaches the run scan.
+        sha = "3f2a9c1d8e7b6a5f4c3d2e1f0a9b8c7d6e5f4a3b"
+        for written in (f"acme/fleet@{sha}", f"https://github.com/acme/fleet/commit/{sha}"):
+            with self.subTest(written=written):
+                walker = normalizer.Normalizer(NOW, False)
+                walker.text(f"x\n\n## Recent work by @platform\n- t_deadbeef — merged {written}: done")
+                self.assertTrue(walker.mapping.has_identifier(f"reset to {sha}"))
+                self.assertTrue(walker.mapping.has_identifier(f"reset to {sha[:7]}"))
+                self.assertFalse(walker.mapping.has_identifier("reset to 4f1e4140"))
+
+    def test_the_digests_unrestorable_values_count_against_an_answer(self):
+        walker = normalizer.Normalizer(NOW, False)
+        walker.text(self.CARD)
+        self.assertTrue(walker.mapping.answer_repeats_age("logs --since 18m"))
+        self.assertEqual(walker.mapping.counts, {"TASK": 1})
+
+
+class RunNameTest(unittest.TestCase):
+    def test_a_repository_commit(self):
+        self.assertEqual(norm("searched gke-agentic/kube-agents-evals-31-infra@c99b1ab (whole tree)"),
+                         "searched gke-agentic/⟦EVALPROJECT_1⟧-infra@⟦COMMIT_1⟧ (whole tree)")
+        self.assertEqual(norm('["acme/fleet@3f2a9c1d8e7b6a5f4c3d2e1f0a9b8c7d6e5f4a3b"]'), '["acme/fleet@⟦COMMIT_1⟧"]')
+        self.assertEqual(norm("acme/infra@0ffe0cb"), norm("acme/infra@4f1e414"))
+
+    def test_a_commit_in_a_forge_url(self):
+        sha = "0045315ed5ba4ce8f1091c2dcbc7626fde7f2aaa"
+        self.assertEqual(norm(f"https://github.com/gke-agentic/x/blob/{sha}/README.md"),
+                         "https://github.com/gke-agentic/x/blob/⟦COMMIT_1⟧/README.md")
+        self.assertEqual(norm(f"x/tree/{sha} and x/commit/{sha[:7]}"), "x/tree/⟦COMMIT_1⟧ and x/commit/⟦COMMIT_2⟧")
+        self.assertEqual(norm("x/blob/main/README.md and x/blob/v1.2.3/a"), "x/blob/main/README.md and x/blob/v1.2.3/a")
+
+    def test_what_is_not_a_repository_commit_stays(self):
+        for raw in ("user@deadbee1.example", "acme/infra@v1.2.3", "acme/infra@abc12", "img@sha256:0ffe0cbd6b463ad4",
+                    "acme/infra@0ffe0cbz", "commit 0ffe0cb"):
+            with self.subTest(raw=raw):
+                self.assertEqual(norm(raw), raw)
+
+    def test_the_declared_intent_clone_directory(self):
+        self.assertEqual(norm("--into /opt/data/scratch/declared-intent-a2_elobt --lease x"),
+                         "--into /opt/data/scratch/declared-intent-⟦TMPNAME_1⟧ --lease x")
+        self.assertEqual(norm("declared-intent-j77z8q6q/"), norm("declared-intent-fnrk82en/"))
+        for raw in ("declared-intent-no-finding", "compliance-declared-intent-no-finding", "declared-intent-test",
+                    "declared-intent-abcdefghi", "xdeclared-intent-a2_elobt"):
+            with self.subTest(raw=raw):
+                self.assertEqual(norm(raw), raw)
+
+    def test_a_node_name_that_holds_the_pool_project(self):
+        self.assertEqual(norm("drained gke-kube-agents-evals-31-default-pool-abcdef12-x1y2"),
+                         "drained gke-⟦EVALPROJECT_1⟧-default-pool-⟦NODE_1⟧")
+        self.assertEqual(norm("gke-kube-agents-evals-31-default-pool-abcdef12-x1y2 gke-seeded-a-pool-1-12345678-wxyz"),
+                         "gke-⟦EVALPROJECT_1⟧-default-pool-⟦NODE_1⟧ gke-seeded-a-pool-1-⟦NODE_2⟧")
+        self.assertTrue(normalizer.Mapping().has_identifier("gke-⟦EVALPROJECT_1⟧-default-pool-abcdef12-x1y2"))
+
+    def test_a_tempfile_name_or_operation_after_a_dash_or_underscore_in_an_answer(self):
+        # No pattern finds these shapes in the answer; the whole-token swap does,
+        # because a suffix class may follow `-` or `_` (SUFFIX_CLASSES).
+        op = "1793806478493-11b21f18-4eef-47ea-8ce1-fbd3c40047b3"
+        mapping = normalizer.normalize_request(
+            request(f"cloned into /opt/data/scratch/declared-intent-j77z8q6q; newest operation-{op}"), NOW).mapping
+        self.assertEqual(mapping.apply_to_answer("mv clone-j77z8q6q old_" + op),
+                         "mv clone-⟦TMPNAME_1⟧ old_⟦GKEOP_1⟧")
+
+    def test_a_gke_operation_id(self):
+        op = "operation-1793806478493-11b21f18-4eef-47ea-8ce1-fbd3c40047b3"
+        self.assertEqual(norm(f"newest operation {op} (UPGRADE_NODES)"), "newest operation operation-⟦GKEOP_1⟧ (UPGRADE_NODES)")
+        self.assertEqual(norm(op), norm("operation-1792900340178-5482a62f-d7e3-4c54-bb09-236983a9dfb7"))
+        # The operation's type and status are state and stay.
+        self.assertNotEqual(norm(f"{op} (UPGRADE_NODES, DONE)"), norm(f"{op} (UPGRADE_NODES, RUNNING)"))
+        self.assertEqual(norm("operation-999999999999-9f9999"), "operation-999999999999-9f9999")
 
 
 class NestedJsonTest(unittest.TestCase):
@@ -657,6 +977,33 @@ class AnswerMappingTest(unittest.TestCase):
         self.assertEqual(mapping.apply_to_answer("xt_11111111"), "xt_11111111")
         self.assertTrue(mapping.answer_repeats_bare_number("kill 9921"))
         self.assertFalse(mapping.answer_repeats_bare_number("kill 99210"))
+
+    def test_answer_swaps_a_pod_or_node_tail_after_its_dash(self):
+        mapping = normalizer.normalize_request(
+            request("pod web-7d4b9c8f6d-x2k9p on gke-seeded-a-default-pool-1a2b3c4d-wxyz"), NOW).mapping
+        self.assertEqual(mapping.apply_to_answer("describe web-7d4b9c8f6d-x2k9p"), "describe web-⟦POD_1⟧")
+        self.assertEqual(mapping.apply_to_answer("drain gke-seeded-a-default-pool-1a2b3c4d-wxyz"),
+                         "drain gke-seeded-a-default-pool-⟦NODE_1⟧")
+        self.assertEqual(mapping.apply_to_answer("x7d4b9c8f6d-x2k9p"), "x7d4b9c8f6d-x2k9p")
+
+    def test_restore_puts_this_requests_values_back(self):
+        mapping = normalizer.normalize_request(request("task t_11111111 pod web-7d4b9c8f6d-x2k9p age: 5m"), NOW).mapping
+        self.assertEqual(mapping.to_value["⟦TASK_1⟧"], "t_11111111")
+        restored, missing = mapping.restore("kanban_show(⟦TASK_1⟧) on web-⟦POD_1⟧")
+        self.assertEqual(restored, "kanban_show(t_11111111) on web-7d4b9c8f6d-x2k9p")
+        self.assertEqual(missing, [])
+        # An age is never put back: this run's would be another reading of the clock.
+        _, missing = mapping.restore("⟦AGEm_1⟧ old")
+        self.assertEqual(missing, ["⟦AGEm_1⟧"])
+        _, missing = mapping.restore("and ⟦TASK_2⟧")
+        self.assertEqual(missing, ["⟦TASK_2⟧"])
+
+    def test_an_age_is_never_swapped_into_an_answer_and_repeating_one_counts(self):
+        mapping = normalizer.normalize_request(request("pod web-7d4b9c8f6d-x2k9p AGE: 5m"), NOW).mapping
+        self.assertEqual(mapping.apply_to_answer("kubectl logs --since 5m"), "kubectl logs --since 5m")
+        self.assertTrue(mapping.answer_repeats_age("kubectl logs --since 5m"))
+        for answer in ("cpu 25m", "requests 5mi", "x5m"):
+            self.assertFalse(mapping.answer_repeats_age(answer), answer)
 
     def test_repeated_number_uses_token_boundaries(self):
         mapping = normalizer.normalize_request(request("resourceVersion: 4821"), NOW).mapping

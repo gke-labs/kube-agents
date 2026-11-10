@@ -13,7 +13,7 @@ Minty is the GitHub Token Minter — an in-cluster service that mints short-live
 
 GCP half (minter GSA, Workload Identity binding, import-only KMS signing key): [`terraform/modules/github-minter`](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/github-minter).
 Kubernetes half (Deployment, Service, NetworkPolicy, KSA, rule ConfigMap, `github-app-credentials` Secret): the chart's `githubMinter.*` values; the dev copy is `make -C k8s-operator deploy-github`.
-Overlay reference (the kustomize manifests behind that dev copy, and Minty's GSA-token limitations): [`k8s-operator/config/integrations/github/README.md`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/config/integrations/github/README.md).
+Overlay reference (the kustomize manifests behind that dev copy): [`k8s-operator/config/integrations/github/README.md`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/config/integrations/github/README.md).
 
 ## How it works
 
@@ -35,7 +35,7 @@ Minty's rule ConfigMap is mounted in-container at `/etc/minty/<GITHUB_ORG>`. A s
 
 ## Read-only tokens for context repositories
 
-A repository registered under `context_repos` — a Terraform repository an audit reads for declared intent — gets a read-only grant, not the write one. The operator renders a policy per same-organization context repository carrying the `platform-agent-read-scope` scope alone, which grants `contents: read` and nothing else. The credential broker requests a token from that scope for its own content-mode clone of the repository, presents it to that one `git` process, and installs it nowhere: the agent sandbox never holds it, and the broker's write gate still refuses a `commit` or `push` to a context repository. A context policy does not carry `platform-agent-sweep-scope`, which managed policies carry. A repository registered under both keys is managed and keeps its write policy.
+A repository registered under `context_repos` — a Terraform repository an audit reads for declared intent — gets a read-only grant, not the write one. The operator renders a policy per same-organization context repository carrying the `platform-agent-read-scope` scope alone, which grants `contents: read` and nothing else. The credential broker requests a token from that scope for its own `snapshot` clone of the repository, presents it to that one `git` process, and installs it nowhere: the agent sandbox never holds it, and the broker still refuses every version-control verb but `capabilities` and `snapshot` on a context repository. A context policy does not carry `platform-agent-sweep-scope`, which managed policies carry. A repository registered under both keys is managed and keeps its write policy.
 
 The GitHub App must be installed on each context repository, as it must on each managed one; a private repository the App is not installed on fails to clone as before. A cross-organization entry is skipped with an operator log line. A rule ConfigMap whose `default.yaml` predates the read scope renders no context policies — upgrade the chart or the kustomize template to get it.
 
@@ -144,9 +144,13 @@ In the Ahead-Of-Time (AOT) model, the private key is imported into Cloud KMS upf
 
 ## GSA-only auth
 
-Native Kubernetes SA tokens don't carry the `repository` claim Minty's default validator expects, so Minty routes through **Google Service Account (GSA)** tokens instead. When the token issuer is `https://accounts.google.com`, Minty bypasses the `repository` claim check and validates on `assertion.email`, deriving the target repo from the POST body.
+Minty authenticates the caller by an OIDC token that Google issues for a **Google Service Account (GSA)**. A Kubernetes ServiceAccount token does not work, and the limit is in Minty, not in the rule. Minty's claim parser requires a `repository` claim from every issuer except `https://accounts.google.com` ([`pkg/server/claims.go`](https://github.com/abcxyz/github-token-minter/blob/main/pkg/server/claims.go), `extractRepository`). A Kubernetes ServiceAccount token has none, the projected-token API cannot add one, and Minty rejects the token with HTTP 400 before it evaluates any rule. For a Google-issued token Minty skips that claim and exposes the verified `email` to the rule; the install's rule matches it, and the organization and repositories come from the POST body.
 
-That's why the install pre-provisions GSAs and Workload Identity bindings (the [`kube-agents-iam`](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/kube-agents-iam) and [`github-minter`](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/github-minter) modules) — Minty won't accept KSA tokens.
+That is why the install pre-provisions GSAs and Workload Identity bindings (the [`kube-agents-iam`](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/kube-agents-iam) and [`github-minter`](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/github-minter) modules). The chart also puts the cluster's own OIDC issuer in Minty's `ISSUER_ALLOWLIST` beside `https://accounts.google.com`. That lets Minty fetch the cluster's signing keys and verify a token's signature against them, and nothing more, because the parser then rejects the token for the missing claim. A rule keyed on the cluster issuer and a ServiceAccount subject (`assertion.sub == 'system:serviceaccount:<namespace>:<name>'`) is expressible in Minty's rule language, but no request reaches it.
+
+An estate that grants cloud access to in-cluster workloads as `principal://` members can keep that model for everything except the GSA itself. The token the credential broker presents to Minty must be issued by `accounts.google.com` and carry a GSA's `email`, so the broker needs a GSA it can obtain an ID token for.
+
+Two routes reach one. The default is the GKE Workload Identity binding on the broker's ServiceAccount (`kubeagents-platform-agent` by default), which `kube-agents-iam` creates, with the `iam.gke.io/gcp-service-account` annotation the operator applies ([Security and IAM](/kube-agents/reference/security-and-iam/)). The other is `spec.security.workloadIdentityFederation`, under which the broker exchanges its projected token through a Workload Identity pool and impersonates the same GSA. That route adds a second `roles/iam.workloadIdentityUser` binding on the GSA, for the `principal://` member of the broker's ServiceAccount; the default binding and the annotation stay ([Credential isolation](/kube-agents/reference/credential-isolation/#running-the-shell-in-its-own-pod)). On either route the GSA needs no project role for minting: the rule checks its email, and Minty signs with its own identity.
 
 ## Deployment details
 
@@ -190,4 +194,4 @@ A 200 response whose body is the short-lived, repository-scoped GitHub installat
 ## Where to go next
 
 - [Declarative workflow](/kube-agents/concepts/declarative-workflow/) — the `submit-suggestion` skill that uses Minty.
-- [`k8s-operator/config/integrations/github/README.md`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/config/integrations/github/README.md) — the kustomize overlay's reference notes, including Minty's GSA-token limitations.
+- [`k8s-operator/config/integrations/github/README.md`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/config/integrations/github/README.md) — the kustomize overlay's reference notes.

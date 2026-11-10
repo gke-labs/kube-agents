@@ -151,7 +151,10 @@ type flags struct {
 	namespaces        string
 	excludeNamespaces string
 	// alertExclude is the --alert-exclude JSON; see alertexclude.go.
-	alertExclude      string
+	alertExclude string
+	// alertExcludeFile names a file holding the same JSON, read again every
+	// --profiles-rescan so a change applies without a restart.
+	alertExcludeFile  string
 	dedupWindow       time.Duration
 	dedupPersist      string
 	unhealthyMinCount int
@@ -220,6 +223,7 @@ func parseFlags(args []string) (*flags, error) {
 	fs.StringVar(&f.namespaces, "namespace", "", "Comma-separated allow-list of namespaces. Empty = all namespaces.")
 	fs.StringVar(&f.excludeNamespaces, "exclude-namespace", "", "Comma-separated deny-list of namespaces.")
 	fs.StringVar(&f.alertExclude, "alert-exclude", "", `JSON list of alert-exclude rules. An event any rule matches opens no incident; its cluster stays in scope for reads. Each rule sets one or more of cluster ({"projectId","location","clusterName"}, clusterName required), namespace, reason (the event's or its canonical reason), kind, and name (a trailing "*" is a prefix match); a rule matches when every part it sets matches. Empty = none.`)
+	fs.StringVar(&f.alertExcludeFile, "alert-exclude-file", "", "File holding the --alert-exclude JSON, read at startup and again every --profiles-rescan; a change applies to the events decided after it is read, and a malformed or unreadable change leaves the rules in force. Not set with --alert-exclude. Empty = no file.")
 
 	// Dedup.
 	fs.DurationVar(&f.dedupWindow, "dedup-window", 5*time.Minute, "Rolling window for (uid,reason) dedup.")
@@ -230,7 +234,7 @@ func parseFlags(args []string) (*flags, error) {
 	fs.IntVar(&f.failedSchedulingMinCount, "failedscheduling-min-count", defaultFailedSchedulingMinCount, "Require this many consecutive FailedScheduling events before firing, when cluster-autoscaler has recorded no verdict on the pod. A NotTriggerScaleUp on the pod fires at any count; a TriggeredScaleUp holds at any count for --scaleup-hold. Both need their reason in --reason. 1, with --failedscheduling-min-span=0, = fire on the first event.")
 	fs.DurationVar(&f.failedSchedulingMinSpan, "failedscheduling-min-span", defaultFailedSchedulingMinSpan, "How long a FailedScheduling with no cluster-autoscaler verdict has to have lasted, by the event's own first and last sighting, before it fires, on top of --failedscheduling-min-count. Holds the burst a node scale-down drives the count through for a pod placed seconds later. 0 = off.")
 	fs.DurationVar(&f.scaleUpHold, "scaleup-hold", defaultScaleUpHold, "How long a TriggeredScaleUp on a pod holds its FailedScheduling events, measured from the autoscaler's event to the FailedScheduling's own last sighting. Past it the count threshold applies again. Cluster-autoscaler's default node-provision timeout.")
-	fs.DurationVar(&f.settle, "settle", defaultSettle, "How long a failure in the settle family (the crash-loop family, FailedMount, Unhealthy, a Failed saying \"host IP unknown\"; the reasons kubelet re-emits while they last) has to have lasted, by the event's own first and last sighting, before it is forwarded; a failure that clears inside it is not forwarded, and a repeat blip on the same event object is measured from its own start while the in-process memo remembers the first. Applied after the count thresholds, never to OOMKilled, the image-pull family or FailedScheduling. 0 = off.")
+	fs.DurationVar(&f.settle, "settle", defaultSettle, "How long a failure in the settle family (the crash-loop family, FailedMount, Unhealthy, a Failed saying \"host IP unknown\"; the reasons kubelet re-emits while they last; and Config Connector's DependencyNotReady and Unmanaged) has to have lasted, by the event's own first and last sighting, before it is forwarded; a failure that clears inside it is not forwarded, and a repeat blip on the same event object is measured from its own start while the in-process memo remembers the first. Applied after the count thresholds, never to OOMKilled, the image-pull family or FailedScheduling. 0 = off.")
 	fs.DurationVar(&f.quietAfter, "quiet-after", defaultQuietAfter, "How long after its last sighting an incident whose alert went out is reported quiet: the daemon gets one k8s-event-followup inject for it, which it posts into the alert's thread and onto its card (the card alone where no thread is routed). Silence is read off the events alone; no object is read back. 0 = off.")
 	fs.BoolVar(&f.autopilotScaleToZeroHold, "autopilot-scale-to-zero-hold", true, "Hold FailedScheduling saying 'no nodes available to schedule pods' on an Autopilot cluster with no cluster-autoscaler verdict on the pod: an Autopilot cluster with no user workloads scales to zero and leaves GKE's own system pods Pending by design. =false reports them, on the count backstop as before. Zero nodes on a GKE Standard cluster is a fault and still fires. Requires both TriggeredScaleUp and NotTriggerScaleUp in --reason, without which no verdict can be recorded and 'no verdict' would not distinguish an abandoned pod from a declined one; the hold turns itself off and logs when either is missing, which includes the shipped --reason default.")
 
@@ -238,7 +242,7 @@ func parseFlags(args []string) (*flags, error) {
 	fs.BoolVar(&f.inCluster, "in-cluster", false, "Use in-cluster service account credentials. Auto-detected inside a pod.")
 	fs.StringVar(&f.kubeconfig, "kubeconfig", "", "Explicit kubeconfig path (single cluster). Used outside a pod.")
 	fs.StringVar(&f.profilesDir, "profiles-dir", "", "Hermes profiles directory (normally /opt/data/profiles). Enables multi-cluster fan-in: every Cluster Agent profile found becomes a watched cluster, addressed by asking the GKE API about that profile's cluster_identity. Combines with --in-cluster / --kubeconfig, which add one directly-reachable cluster on top; that combination also requires --cluster-name to name it.")
-	fs.DurationVar(&f.profilesRescan, "profiles-rescan", defaultProfilesRescan, "How often --profiles-dir is read again after startup. A Cluster Agent profile written since the last read starts a watcher, one skipped on an earlier read (a GKE lookup refused with 429 or 5xx) is tried again, and one removed stops its watcher and snapshots its dedup cache. 0 = read the directory once, at startup.")
+	fs.DurationVar(&f.profilesRescan, "profiles-rescan", defaultProfilesRescan, "How often --profiles-dir is read again after startup. A Cluster Agent profile written since the last read starts a watcher, one skipped on an earlier read (a GKE lookup refused with 429 or 5xx) is tried again, and one removed stops its watcher and snapshots its dedup cache. --alert-exclude-file is read again on the same interval. 0 = read the directory once, at startup.")
 	fs.IntVar(&f.initialListConcurrency, "initial-list-concurrency", defaultInitialListConcurrency, "How many clusters may receive their initial Event state at once: the reflector's first list (every page of it, on a control plane without watch-list), or the initial events of its watch-list stream, and the relist after a 410 or a hold. Bounds the startup burst a fleet of large clusters makes on this container's memory; the rest wait their turn. 0 = no bound.")
 	fs.StringVar(&f.clusterName, "cluster-name", "", "Human-readable cluster name included in every inject payload (single-cluster mode only; with --profiles-dir the name comes from each profile's cluster_identity).")
 
@@ -356,6 +360,9 @@ func (f *flags) validate() error {
 	}
 	if f.profilesRescan < 0 {
 		return errors.New("--profiles-rescan must be >= 0 (0 = read the directory once)")
+	}
+	if f.alertExclude != "" && f.alertExcludeFile != "" {
+		return errors.New("set --alert-exclude or --alert-exclude-file, not both")
 	}
 	if f.initialListConcurrency < 0 {
 		return errors.New("--initial-list-concurrency must be >= 0 (0 = no bound)")
@@ -661,8 +668,11 @@ type dispatcher struct {
 	// scaleUps carries cluster-autoscaler's verdict on a pod from the event that
 	// records it to the FailedScheduling events it qualifies. Per-cluster for
 	// the same reason; pod UIDs are unique across clusters regardless.
-	scaleUps  *scaleUpMemo
-	settles   *settleMemo
+	scaleUps *scaleUpMemo
+	settles  *settleMemo
+	// owners fills an admitted Pod event's controller_ref from the Pod's
+	// owner (ownerResolver); nil sends the field empty, as before.
+	owners    *ownerResolver
 	injector  *injector
 	metrics   *metrics
 	mode      string // "per-incident" or "shared"
@@ -863,8 +873,8 @@ var podTemplateHashPodPattern = regexp.MustCompile(`^(.*?)-[4-9bcdf]{8,10}-[a-z0
 // named workloads held, whoever creates objects on the watched cluster. The
 // daemon keys every non-Pod object by its exact name because its row is a
 // database row, not a series; the label departs from it there and nowhere
-// else. The watcher sets no controller reference on its events (watcher.go),
-// so the name is what there is to fold.
+// else. The label is set before the owner lookup (ownerResolver), so it
+// folds by name only.
 func workloadOf(ev TriageEvent) string {
 	if !strings.EqualFold(ev.KindOfObject, kindPod) {
 		if _, ok := namedWorkloadKinds[strings.ToLower(ev.KindOfObject)]; ok {
@@ -1018,6 +1028,11 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 		d.dedup.BindSession(ev.Key, ev.Message, sid)
 		d.dedup.BindObject(ev.Key, ev.Message, ev.Namespace, ev.KindOfObject, ev.Name, ev.FirstSeen, ev.Count)
 	}
+	// Looked up only for an event the filter and dedup admitted, so a
+	// cluster's event stream costs one Pod read per incident, not per event.
+	if ev.ControllerRef == "" && ev.KindOfObject == kindPod {
+		ev.ControllerRef = d.owners.ControllerRef(ctx, ev.Namespace, ev.Name, ev.Key.UID)
+	}
 	payload := InjectPayload{
 		Kind:         injectKindEvent,
 		Reason:       ev.Key.Reason,
@@ -1124,8 +1139,8 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 // the alert's thread and onto its card, the card alone where no thread is
 // routed (session_kv_server, _inject_followup). What the watcher
 // knows is silence, and the payload says so: the object was not read back,
-// since the broker's watcher route serves no pods, and a deleted pod and a
-// recovered one both go quiet. One per incident, held on the dedup entry so
+// since the broker's watcher route serves of a pod only its owner, never its
+// state, and a deleted pod and a recovered one both go quiet. One per incident, held on the dedup entry so
 // it survives a restart with the entry; an inject that fails is retried on
 // the next sweep. Dry-run prints the payload as Dispatch does.
 func (d *dispatcher) Sweep(ctx context.Context) {
@@ -1294,21 +1309,11 @@ func realMain(argv []string) error {
 
 	// Build components.
 	filterCfg := newFilterConfig(splitCSV(f.reasons), splitCSV(f.namespaces), splitCSV(f.excludeNamespaces), f.filterThresholds())
-	// A malformed list fails open, as the entrypoint's tunables do: stopping
-	// here would end incident detection for every cluster to silence a few.
-	// Assigned only on success, so a parse error can never leave a partial
-	// list in force while the log says none is.
-	rules, err := parseAlertExclude(f.alertExclude)
-	switch {
-	case err != nil:
-		log.Printf("k8s-event-watcher: ALERT %v — running with no alert-exclude rules, so every event they would match opens an incident", err)
-	case len(rules) > 0:
-		filterCfg.alertExclude = rules
-		log.Printf("k8s-event-watcher: %d alert-exclude rules; events they match open no incident and count as gate=%s", len(rules), gateAlertExcluded)
-	}
+	m := newMetrics()
+	// A malformed list fails open; see loadAlertExclude.
+	filterCfg.alertExclude = loadAlertExclude(f.alertExclude, m)
 	filter := newFilter(filterCfg)
 
-	m := newMetrics()
 	if f.dataVolume != "" {
 		m.registry.MustRegister(newDataVolumeCollector(f.dataVolume, dataVolumeStatfs))
 	}
@@ -1358,6 +1363,13 @@ func realMain(argv []string) error {
 			log.Printf("metrics server: %v", err)
 		}
 	}()
+
+	// The rules file, read now, before any cluster starts, and again every
+	// --profiles-rescan: the operator's way to change the rules without a
+	// restart.
+	if f.alertExcludeFile != "" {
+		startAlertExcludeFile(ctx, f.alertExcludeFile, f.profilesRescan, filter, m)
+	}
 
 	clusters, err := buildWatchSet(ctx, f, m)
 	if err != nil {

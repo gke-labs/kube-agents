@@ -675,7 +675,7 @@ def mint_read_only_token(target_repo: str | None) -> str:
     """A `contents: read` installation token for one repository, and nothing else.
 
     The credential the broker presents to its own `git clone` of a context
-    repository (`content_workspace.py`, through `MintedReadCredential`). Three
+    repository (the vcs `snapshot` verb, through `MintedReadCredential`). Three
     things distinguish it from `refresh_git_credentials`, each deliberate:
 
     * The scope is `MINTY_READ_SCOPE` and the repository list is this one

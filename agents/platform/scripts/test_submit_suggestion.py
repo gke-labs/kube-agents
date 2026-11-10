@@ -2056,8 +2056,8 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         """The shape that was actually live, not the one the flags were named for.
 
         `--workspace`/`--lease` belong to the leased-clone mode. The operator
-        renders `CREDENTIAL_PROXY_CONTENT_WORKSPACE=1` unconditionally and
-        gives no field to turn it off, so the card in flight during a rollout
+        rendered `CREDENTIAL_PROXY_CONTENT_WORKSPACE=1` unconditionally and
+        gave no field to turn it off, so the card in flight during a rollout
         is calling content mode: `--handle … --from … --base … --base-sha …`.
         Leave `--from` and `--delete` out of `RETIRED` and argparse exits on
         "unrecognized arguments" before `handle_submit` is ever reached, which

@@ -203,7 +203,9 @@ SERVICE_API_PORT = 8642
 # Prefix on ``AgentResult.errors[0]`` that marks a run when the harness
 # recorded a condition under which no answer can be graded: transport exhausted,
 # the server reporting a provider rate limit or billing stop on the opening turn,
-# or a delegated worker encountering quota exhaustion before acting.
+# or a delegated worker's card blocked by its rate-limit guardrail with no
+# completion or block call of the worker's own and no artifact (#4998),
+# whether or not the worker acted first.
 # ``scoring.py`` matches this string on a record's error and classifies the repetition
 # as infrastructure rather than grading it. The literal is duplicated there (importing
 # the harness would drag ``devops_bench`` into the scorer), and ``test_scoring.py``
@@ -238,6 +240,20 @@ _BOARD_NON_ACTION_TOOLS = frozenset({
     "kanban_unblock",
 })
 
+# The block kind the worker's rate-limit guardrail files
+# (deploy/docker/patches/kanban_guardrail_exit.py, RATE_LIMIT_BLOCK_KIND;
+# test_harness.py holds the two equal) and the status it leaves the card in.
+_GUARDRAIL_BLOCK_KIND = "transient"
+_GUARDRAIL_BLOCK_STATUS = "blocked"
+# The one failure reason the guardrail blocks on (its RATE_LIMIT_FAILURE_REASONS;
+# a billing stop is not blocked transient, so a billing reason is not its write).
+_GUARDRAIL_FAILURE_REASON = "rate_limit"
+# The verbs by which a worker closes or blocks its own card. The guardrail
+# blocks from the exit path with no tool call, so a card whose worker made
+# one of these calls was closed by the model, whatever text it carries.
+_WORKER_CARD_VERBS = frozenset({"kanban_block", "kanban_complete"})
+
+
 def _is_substantive_worker_action(name: str | None) -> bool:
     """Whether a tool entry recorded for a delegated worker constitutes substantive action.
 
@@ -251,7 +267,7 @@ def _is_substantive_worker_action(name: str | None) -> bool:
     if not name:
         return False
     # Worker terminal verbs that complete or block cards
-    if name in {"kanban_complete", "kanban_block"}:
+    if name in _WORKER_CARD_VERBS:
         return True
     # Terminal, shell, and direct command execution
     if name in {"terminal", "bash", "sh", "exec", "shell", "kubectl", "gcloud"}:
@@ -285,6 +301,7 @@ _FRONT_DOOR_NON_ACTION_TOOLS = frozenset({
     inject.EVENT_ENTRY_TASK,
     inject.EVENT_ENTRY_STATUS,
     inject.EVENT_ENTRY_ACTIVITY,
+    worker_trajectory.GAP_ENTRY,
 })
 
 # Character ceiling for card detail quoted in infrastructure failure errors.
@@ -985,6 +1002,60 @@ _SESSION_ID_HEADER = "X-Hermes-Session-Id"
 _FAILURE_REASON_HEADER = "X-Hermes-Failure-Reason"
 
 
+def _guardrail_blocked_cards(
+    awaited: Sequence[str],
+    on_board: dict[str, board.BoardCard] | None,
+    captured: worker_trajectory.WorkerCapture | None,
+    with_artifact: set[str],
+    front_trajectory: Sequence[Any] = (),
+) -> list[str]:
+    """The awaited cards when EVERY one is the rate-limit guardrail's block, else ``[]``.
+
+    A card counts when the board holds it blocked with the guardrail's kind
+    and its newest run summary opens on the guardrail's prefix with a
+    rate-limit or billing reason, no artifact was produced for it, and the
+    captured worker trajectory (present, or nothing counts) holds no
+    ``kanban_block`` or ``kanban_complete`` call for it, nor a wrapper call
+    that could hide one, from its own worker, another card's worker (the
+    call's ``task_id``) or the front door (``front_trajectory``). One card
+    that reads otherwise is a delivery, and the run is graded on it.
+    """
+    if not awaited or on_board is None or captured is None:
+        return []
+    # A ``tool_call`` wrapper whose arguments cannot be read (not a dict, a
+    # clipped ``raw`` string, no names) may hold the worker's own close, as
+    # #3988 counts it as acted; it is read as a close here too, fail closed.
+    closed: set[str] = set()
+    for e in [*captured.entries, *front_trajectory]:
+        if not isinstance(e, dict):
+            continue
+        args = e.get("args") if isinstance(e.get("args"), dict) else {}
+        names = {e.get("name")} | worker_trajectory.wrapped_tool_names(e)
+        unreadable_wrapper = e.get("name") == worker_trajectory.TOOL_CALL_WRAPPER and (
+            not isinstance(e.get("args"), dict)
+            or isinstance(args.get("raw"), str)
+            or not worker_trajectory.wrapped_tool_names(e)
+        )
+        if names & _WORKER_CARD_VERBS or unreadable_wrapper:
+            closed.add(str(e.get("task")))
+            if args.get("task_id"):
+                closed.add(str(args["task_id"]))
+    blocked: list[str] = []
+    for tid in awaited:
+        card = on_board.get(tid)
+        if (
+            card is None
+            or card.status != _GUARDRAIL_BLOCK_STATUS
+            or card.block_kind != _GUARDRAIL_BLOCK_KIND
+            or _extract_infra_failure_reason(card.summary or "") != _GUARDRAIL_FAILURE_REASON
+            or tid in with_artifact
+            or tid in closed
+        ):
+            return []
+        blocked.append(tid)
+    return blocked
+
+
 def _mark_result_infra_failure(result: AgentResult, detail: str) -> None:
     """Convert an AgentResult in-place into an infrastructure failure."""
     result.errors.insert(0, f"{INFRA_FAILURE_MARKER}: {detail}")
@@ -1109,9 +1180,92 @@ def _append_final(result: AgentResult, sections: list[str]) -> None:
     if not sections:
         return
     current = str(result.metadata.get("final_message") or "")
-    add = [s for s in sections if s.split("\n", 1)[-1].strip() not in current]
-    if add:
-        result.metadata["final_message"] = "\n\n".join(filter(None, [current, *add]))
+    folded = _fold_sections(current, sections)
+    if folded != current:
+        result.metadata["final_message"] = folded
+
+
+# The section headers a thread receives as a message of its own (a card's
+# result, a paused card's question). An artifact is a file read back from the
+# pod, so a router that quotes one has not relayed a message.
+_RELAYED_SECTION_PREFIXES = (
+    _RESULT_SECTION.partition("{tid}")[0],
+    _QUESTION_SECTION.partition("{tid}")[0],
+)
+# A delivered header on a line of its own: the text after it, blank lines
+# skipped, is the body it attributes.
+_DELIVERED_HEADER_LINE = re.compile(
+    r"(?:\A|\n)(?P<header>(?:Result of delegated task \S+|Question from delegated task \S+"
+    r"|Artifact [^\n]* produced by delegated task \S+):)[ \t]*\n"
+)
+
+
+def _attributed(current: str, header: str, body: str) -> bool:
+    """Whether ``body`` already stands under ``header`` in ``current``."""
+    return any(
+        m.group("header") == header and current[m.end() :].lstrip().startswith(body)
+        for m in _DELIVERED_HEADER_LINE.finditer(current)
+    )
+
+
+def _relayed_at(prose: str, body: str) -> int:
+    """Where ``prose`` relays ``body`` on lines of its own, or -1.
+
+    The match starts a line (indentation allowed) and ends one, so a short
+    result never claims part of the router's own sentence: ``done`` is not
+    the relay in ``abandoned``, nor ``3`` in ``has 3 clusters``. The last
+    such occurrence is the relay.
+    """
+    at = prose.rfind(body)
+    while at >= 0:
+        before, after = prose[:at].rstrip(" \t"), prose[at + len(body) :].lstrip(" \t")
+        if (not before or before.endswith("\n")) and (not after or after.startswith("\n")):
+            return at
+        at = prose.rfind(body, 0, at)
+    return at
+
+
+def _fold_sections(current: str, sections: list[str]) -> str:
+    """``current`` with each delivered section in it once, under its header.
+
+    A router that relays a card's result (or its question) verbatim already
+    has the section's body in its message; dropping the section there, as
+    the artifact rule does, would leave the worker's answer with no
+    ``Result of delegated task`` header, and a check that reads the card's
+    own answer through that header would miss it. The relayed text is lifted
+    out of the router's prose and delivered as its section instead, after
+    the prose, so the router's words stay contiguous and ahead of every
+    section, and the answer is attributed once and quoted once. A relay is
+    the body on lines of its own (``_relayed_at``); a body woven into the
+    router's sentence is left there and its section is appended in full.
+    Only the prose ahead of the first delivered section is searched, so a
+    card whose answer repeats part of an earlier card's never cuts into that
+    card's section, and the longest body is lifted first, so a card whose
+    answer is part of another card's never cuts into that card's relay. A
+    body already under its own header is left alone. An artifact already
+    quoted anywhere is not appended again.
+    """
+    first = _DELIVERED_HEADER_LINE.search(current)
+    prose = current if first is None else current[: first.start()]
+    delivered = "" if first is None else current[first.start() :].strip()
+    parts = [(section, *section.partition("\n")[::2]) for section in sections]
+    pending = [(section, header, body.strip()) for section, header, body in parts if body.strip()]
+    moved = False
+    for section, header, body in sorted(pending, key=lambda part: -len(part[2])):
+        if not header.startswith(_RELAYED_SECTION_PREFIXES) or _attributed(current, header, body):
+            continue
+        at = _relayed_at(prose, body)
+        if at >= 0:
+            prose = "\n\n".join(filter(None, [prose[:at].rstrip(), prose[at + len(body) :].strip()]))
+            moved = True
+    appended = [
+        section.rstrip()
+        for section, header, body in pending
+        if not _attributed(current, header, body) and (header.startswith(_RELAYED_SECTION_PREFIXES) or body not in current)
+    ]
+    if not moved and not appended:
+        return current
+    return "\n\n".join(filter(None, [prose, delivered, *appended]))
 
 
 def _append_delivered(
@@ -1136,9 +1290,7 @@ def _append_delivered(
         for tid, text in delivered_results(observed, task_ids).items()
         if tid not in questions
     ] + [_QUESTION_SECTION.format(tid=tid, text=text) for tid, text in questions.items()]
-    sections = [s for s in all_sections if s.split("\n", 1)[1].strip() not in result.output]
-    if sections:
-        result.output = "\n\n".join(filter(None, [result.output, *sections]))
+    result.output = _fold_sections(result.output, all_sections)
     _append_final(result, all_sections)
 
 
@@ -1170,8 +1322,9 @@ def _artifact_paths(task_ids: list[str], timeout: float) -> list[str]:
     return paths[:_MAX_ARTIFACTS]
 
 
-def _append_artifacts(result: AgentResult, task_ids: list[str], timeout: float) -> None:
+def _append_artifacts(result: AgentResult, task_ids: list[str], timeout: float) -> set[str]:
     """Append the files the delegated cards produced to the graded answer.
+    Returns the ids of the cards that produced one.
 
     On a task whose deliverable is a written report, the worker's card result is
     a summary *of* the report and the report is a file the judge never sees --
@@ -1179,17 +1332,20 @@ def _append_artifacts(result: AgentResult, task_ids: list[str], timeout: float) 
     work is done and correct. Reading it back makes the deliverable part of the
     answer, the same way :func:`_append_delivered` does for the card result.
     """
+    produced: set[str] = set()
     if not task_ids:
-        return
+        return produced
     sections = []
     for path in _artifact_paths(task_ids, timeout):
         text = _agent_shell(f"head -c {_MAX_ARTIFACT_BYTES} {_shell_quote(path)}", timeout)
         if text.strip():
             tid, _, name = path[len(_ATTACHMENTS_DIR) + 1 :].partition("/")
             sections.append(f"Artifact {name} produced by delegated task {tid}:\n{text.rstrip()}")
+            produced.add(tid)
     if sections:
         result.output = "\n\n".join(filter(None, [result.output, *sections]))
     _append_final(result, sections)
+    return produced
 
 
 _LOG_PRESENT = "__WORKER_LOG__"
@@ -4257,8 +4413,11 @@ class KubeAgentsHarness(AgentHarness):
         # sets its router-scope ``tool_called`` aside (scoring._inject_blind).
         # The workers' entries _settle appends sit outside the envelope and
         # would flip that, grading a router check against no router calls. So
-        # on such a record they are kept off the trajectory: the worker-scope
-        # checks that could read them are set aside on inject records anyway.
+        # on such a record they are kept off the trajectory, and a gap entry
+        # (``worker_trajectory.GAP_ENTRY``, a harness-written entry, so the
+        # record still reads as blind) takes their place: a run that merges
+        # this turn with one whose workers were kept, such as a pushed-report
+        # replay, would otherwise read as a complete capture.
         shown = any(e.get("name") == inject.EVENT_ENTRY_ACTIVITY for e in result.trajectory)
         before = len(result.trajectory)
         self._settle(
@@ -4269,8 +4428,14 @@ class KubeAgentsHarness(AgentHarness):
             floor=self._pod_floor,
         )
         if not shown and len(result.trajectory) > before:
-            withheld = result.trajectory[before:]
-            del result.trajectory[before:]
+            # _settle's own gap entry stays, with its reasons; only what it
+            # added besides is withheld.
+            added = result.trajectory[before:]
+            kept = [e for e in added if isinstance(e, dict) and e.get("name") == worker_trajectory.GAP_ENTRY]
+            withheld = [e for e in added if e not in kept]
+            result.trajectory[before:] = kept
+            if withheld:
+                result.trajectory.append(worker_trajectory.gap_entry([worker_trajectory.WITHHELD_ENTRIES_GAP]))
             result.metadata["worker_entries_withheld"] = len(withheld)
         return True
 
@@ -4637,7 +4802,10 @@ class KubeAgentsHarness(AgentHarness):
         buckets stay the front door's (:func:`_inject_tokens`).
         """
         _append_delivered(result, observed, awaited)
-        _append_artifacts(result, awaited, _EXEC_TIMEOUT)
+        with_artifact = _append_artifacts(result, awaited, _EXEC_TIMEOUT)
+        # The cards as the board holds them, read before the purge below
+        # deletes them: the guardrail block's key is their status and kind.
+        on_board = board.read_board_cards(_agent_shell, awaited, _EXEC_TIMEOUT) if awaited else None
         logs = _worker_logs(awaited, _EXEC_TIMEOUT)
         result.metadata["worker_commands"] = _worker_commands(logs)
         _dump_worker_logs(logs, stalled)
@@ -4650,8 +4818,19 @@ class KubeAgentsHarness(AgentHarness):
             # that did delegate and whose pod could not be read.
             if awaited:
                 result.tokens["workers"] = None
+                # And the gap goes on the trajectory, where the scorer reads
+                # it: a record that merges this turn with one whose workers
+                # were read would otherwise read as a complete capture.
+                result.trajectory.append(
+                    worker_trajectory.gap_entry([worker_trajectory.UNREAD_CAPTURE_GAP])
+                )
         else:
             result.trajectory.extend(captured.entries)
+            # devops-bench drops ``metadata``, so a gap goes on the trajectory
+            # too, where the scorer reads it (``worker_trajectory.GAP_ENTRY``).
+            capture_gaps = worker_trajectory.gaps(captured.summary)
+            if capture_gaps:
+                result.trajectory.append(worker_trajectory.gap_entry(capture_gaps))
             result.metadata["worker_trajectory"] = captured.summary
             result.tokens["workers"] = _worker_token_buckets(captured.tokens, captured.unbilled)
 
@@ -4762,6 +4941,35 @@ class KubeAgentsHarness(AgentHarness):
             _mark_result_infra_failure(
                 result,
                 f"delegated worker hit infrastructure failure ({infra_reason}): {infra_detail}",
+            )
+            return
+
+        # The guardrail's own block, whether or not the worker acted first
+        # (#4998). A worker that spent its model-call retries on 429s is
+        # blocked by kanban_guardrail_exit from the exit path: status blocked,
+        # kind transient, the provider's text as the newest run summary, and
+        # no kanban_block or kanban_complete call of its own, which is the one
+        # board-visible difference from a model that typed the same words and
+        # blocked its card itself. Every awaited card has to read so, with no
+        # artifact, for the run to hold no answer; a worker that acted and then
+        # died is still set aside, because the answer it never gave is not
+        # evidence of the agent under test, and rung 1 grades what it did
+        # before that above this mark. The mark reads the same on both
+        # transports.
+        # The front door is another matter: one that acted after the card
+        # died (a command of its own, an answer it made up) produced
+        # something the judge must see, so it stays graded, as on the path
+        # above. A capture with a gap may have dropped the worker's own
+        # close, so it stays graded too.
+        guardrail_blocked = _guardrail_blocked_cards(
+            awaited, on_board, captured, with_artifact, result.trajectory
+        )
+        if guardrail_blocked and trajectory_clean and logs_clean and not front_door_acted:
+            _mark_result_infra_failure(
+                result,
+                "delegated worker hit infrastructure failure (rate_limit): the rate-limit "
+                f"guardrail blocked {', '.join(guardrail_blocked)} with no completion or block "
+                "call of the worker's own and no artifact, so the run holds no answer",
             )
 
     @staticmethod

@@ -343,8 +343,8 @@ func TestDelegateRefusalsWithANotice(t *testing.T) {
 		notice    string
 		rule      string
 	}{
-		{name: "addressee other than platform", addressee: "chat-other-1",
-			notice: "⚠️ delegation refused: only platform can be delegated to today", rule: ruleDelegationTarget},
+		{name: "addressee that is no agent profile", addressee: "chat-other-1",
+			notice: `⚠️ delegation refused: there is no agent profile named "chat-other-1"`, rule: ruleDelegationTarget},
 		{name: "depth at the bound", addressee: "platform",
 			edit: func(rec *SessionRecord, parent string) {
 				for i := range rec.Tasks {
@@ -470,7 +470,13 @@ func TestADelegateIsIgnoredAndLogged(t *testing.T) {
 			} else if err := exec.PublishArtifact(context.Background(), art); err != nil {
 				t.Fatal(err)
 			}
-			waitFor(t, "ignore line", loggedContaining(r, "delegation ignored", "rule="+tc.rule, origin.TaskID, "backend=discord", "requester=hmac:"))
+			if tc.from != "" {
+				// Another addressee's subject: the relay drops the event before
+				// the delegate path sees it.
+				waitFor(t, "relay drop line", loggedContaining(r, "event dropped; it came on another addressee's subject", origin.TaskID, "subjectAddressee="+tc.from))
+			} else {
+				waitFor(t, "ignore line", loggedContaining(r, "delegation ignored", "rule="+tc.rule, origin.TaskID, "backend=discord", "requester=hmac:"))
+			}
 			if n := platformSubmissions(t, r); n != 0 {
 				t.Fatalf("an ignored request minted %d children", n)
 			}
@@ -647,6 +653,11 @@ func TestAnOversizedAddresseeIsCappedInTheAuditLines(t *testing.T) {
 	}
 	waitFor(t, "refusal line", loggedContaining(r, "delegation refused", "rule="+ruleDelegationTarget, origin.TaskID))
 	want := truncateRunes(long, delegateAddresseeLogCap)
+	for _, p := range r.adapter.postTexts() {
+		if strings.Contains(p, strings.Repeat("p", delegateAddresseeLogCap+1)) {
+			t.Fatalf("a post carries the addressee past the cap (%d bytes)", len(p))
+		}
+	}
 	for _, line := range strings.Split(r.logs.String(), "\n") {
 		if !strings.Contains(line, origin.TaskID) || !strings.Contains(line, "delegation") {
 			continue
@@ -698,7 +709,9 @@ func TestTheSessionCannotDelegateForItsChild(t *testing.T) {
 	if err := r.bus.Publish(ctx, lib.TaskEventsSubject(session, child.TaskID), env); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, "ignore line", loggedContaining(r, "delegation ignored", "rule="+ruleDelegationStale, child.TaskID))
+	// The child's events come only on platform's subjects; the session's
+	// subject carrying the child's id is dropped by the relay.
+	waitFor(t, "relay drop line", loggedContaining(r, "event dropped; it came on another addressee's subject", child.TaskID, "subjectAddressee="+session))
 	if n := platformSubmissions(t, r); n != 1 {
 		t.Fatalf("platform received %d submissions, want 1", n)
 	}
@@ -731,7 +744,7 @@ func postIndex(r *rig, needle string) int {
 // session's "delegated to platform" and then the refusal, so the notice waits
 // for the delegating turn's terminal, from the executor or the supervisor.
 func TestARefusalFollowsTheDelegatingTurnsAnswer(t *testing.T) {
-	const notice = "only platform can be delegated to today"
+	const notice = `there is no agent profile named "chat-other-1"`
 	for _, supervisor := range []bool{false, true} {
 		name := "executor terminal"
 		if supervisor {
@@ -1664,7 +1677,7 @@ func TestAnOffListSteerIntoTheChildIsRefusedAndNotSent(t *testing.T) {
 				waitFor(t, "the ack", postedContaining(r, ackSteerQueued))
 				return
 			}
-			waitFor(t, "the notice", postedContaining(r, noticeDelegationNotAllowed))
+			waitFor(t, "the notice", postedContaining(r, fmt.Sprintf(noticeDelegationNotAllowed, targetPlatform)))
 			waitFor(t, "the audit line", loggedContaining(r, "steer refused", "rule="+ruleDelegationChildSteer, child.TaskID))
 			if n := childSteers(t, r, child); n != 0 {
 				t.Fatalf("a refused steer reached the child: %d", n)
@@ -1900,8 +1913,8 @@ func TestAnEarlierAuthorInTheIncarnationRefusesTheDelegation(t *testing.T) {
 	waitFor(t, "refusal line", loggedContaining(r, "delegation refused", "rule="+ruleDelegationSessionAuthor,
 		"sessionBackend=discord", "sessionAuthor="+off.Subject))
 	completeTask(t, exec, "delegated to platform")
-	waitFor(t, "notice", postedContaining(r, noticeDelegationNotAllowed))
-	if i, j := postIndex(r, "delegated to platform"), postIndex(r, noticeDelegationNotAllowed); i < 0 || j < i {
+	waitFor(t, "notice", postedContaining(r, fmt.Sprintf(noticeDelegationNotAllowed, targetPlatform)))
+	if i, j := postIndex(r, "delegated to platform"), postIndex(r, fmt.Sprintf(noticeDelegationNotAllowed, targetPlatform)); i < 0 || j < i {
 		t.Fatalf("posts %v: want the answer, then the notice", r.adapter.postTexts())
 	}
 	if n := platformSubmissions(t, r); n != 0 {
@@ -2136,7 +2149,7 @@ func TestTheDoorWithNoListMayNotDelegate(t *testing.T) {
 			}
 			waitFor(t, "refusal line", loggedContaining(r, "delegation refused", "rule="+tc.rule, "backend="+a2aBackend))
 			completeTask(t, exec, "delegated to platform")
-			waitFor(t, "the target-only notice", postedContaining(r, noticeDelegationNotAllowed))
+			waitFor(t, "the target-only notice", postedContaining(r, fmt.Sprintf(noticeDelegationNotAllowed, targetPlatform)))
 			if n := platformSubmissions(t, r); n != 0 {
 				t.Fatalf("a door turn with no list minted %d children", n)
 			}
@@ -2176,7 +2189,7 @@ func TestADoorAuthorWithNoListRefusesAChatTurnsDelegation(t *testing.T) {
 			}
 			waitFor(t, "refusal line", loggedContaining(r, "delegation refused", "rule="+ruleDelegationDoorUnlisted, tc.field))
 			completeTask(t, exec, "delegated to platform")
-			waitFor(t, "the target-only notice", postedContaining(r, noticeDelegationNotAllowed))
+			waitFor(t, "the target-only notice", postedContaining(r, fmt.Sprintf(noticeDelegationNotAllowed, targetPlatform)))
 			if n := platformSubmissions(t, r); n != 0 {
 				t.Fatalf("minted past a door author with no list: %d", n)
 			}
@@ -2936,4 +2949,46 @@ func TestAHandoffAckedBeforeARestartIsReadOffTheReplay(t *testing.T) {
 	if got := envText(t, wake); !strings.Contains(got, wakeCardsPendingNote) {
 		t.Fatalf("wake text after a restart = %q, want the cards-pending note read off the replay", got)
 	}
+}
+
+// TestADelegationToAProfileIsSubmittedForTheResolvedProfile: a session turn
+// that delegates to the generic cluster profile with a pinned cluster as its
+// target gets a child on the pinned profile's child queue, at the requester's
+// tier, with the target as its parameters.
+func TestADelegationToAProfileIsSubmittedForTheResolvedProfile(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	scope := filepath.Join(t.TempDir(), "scope.json")
+	if err := os.WriteFile(scope, []byte(`{"present":true,"projects":["p1"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r.g.cfg.ScopeFile = scope
+	r.g.profiles.put("cluster", &lib.AgentCard{Name: "cluster", Parameters: clusterParams})
+	r.g.profiles.put("prod-east", &lib.AgentCard{Name: "prod-east", Parameters: clusterParams,
+		ClusterRef: &lib.ClusterRef{ProjectID: "p1", Location: "us-east1", Cluster: "prod"}})
+	ctx := context.Background()
+	exec, origin, _ := sessionTurn(t, r, spawn, "discord:g1/t-profile", "why is prod unhappy?")
+	data, err := json.Marshal(lib.DelegateRequest{Addressee: "cluster", Text: "diagnose prod", Parameters: targetParams("p1", "us-east1", "prod")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishArtifact(ctx, lib.Artifact{ArtifactID: "artifact-x-" + lib.ArtifactDelegate, Name: lib.ArtifactDelegate,
+		Parts: []lib.Part{{Kind: "data", Data: data}}}); err != nil {
+		t.Fatal(err)
+	}
+	var got []subjectEnvelope
+	waitFor(t, "the child on the pinned profile's child queue", func() bool {
+		got = streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+"prod-east.>")
+		return len(got) == 1
+	})
+	profile, tier, kind, _, ok := lib.ParseSubmitSubject(got[0].subject)
+	if !ok || profile != "prod-east" || tier != "read" || kind != lib.SubmitKindChild {
+		t.Fatalf("subject = %q, want prod-east's read child .submit", got[0].subject)
+	}
+	if got[0].env.CorrelationID != origin.CorrelationID {
+		t.Fatalf("the child's correlationId %q is not the parent's %q", got[0].env.CorrelationID, origin.CorrelationID)
+	}
+	if params, found, _ := lib.TaskParametersOf(messageParts(t, got[0].env)); !found || params.Parameters["cluster"] != "prod" {
+		t.Fatalf("parameters = %+v (found %v)", params, found)
+	}
+	waitFor(t, "the profile line note", postedContaining(r, "(delegated to prod-east)"))
 }

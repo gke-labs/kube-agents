@@ -40,7 +40,6 @@ MEBIBYTE = 1024 * 1024
 # (broker name, operator name, whether the figure is in MiB on both sides).
 TERMS = (
     ("BROKER_RESIDENT_RESERVE_BYTES", "credentialProxyResidentReserveBytes", True),
-    ("CONTENT_WORKSPACE_RESERVE_BYTES", "credentialProxyWorkspaceReserveBytes", True),
     ("REQUEST_CHILD_MEMORY_RESERVE_BYTES", "credentialProxyRequestReserveBytes", True),
     ("OUTPUT_COPIES_PER_COMMAND", "credentialProxyOutputCopiesPerCommand", False),
     ("BUDGET_MINIMUM_ADMITTED_REQUESTS", "credentialProxyMinimumAdmittedRequests", False),

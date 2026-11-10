@@ -52,6 +52,17 @@ const (
 	// (usageNewerFieldPeople).
 	usageExportPeopleSeen7d  = "peopleSeen7d"
 	usageExportPeopleSeen30d = "peopleSeen30d"
+	// The nine origin readings' field names, which share one pruning record
+	// (usageNewerFieldOrigins).
+	usageExportProposalsFromChat      = "proposalsFromChat"
+	usageExportProposalsFromConsole   = "proposalsFromConsole"
+	usageExportProposalsFromApi       = "proposalsFromApi"
+	usageExportProposalsFromEvent     = "proposalsFromEvent"
+	usageExportProposalsFromDrift     = "proposalsFromDrift"
+	usageExportProposalsFromAudit     = "proposalsFromAudit"
+	usageExportProposalsFromScheduled = "proposalsFromScheduled"
+	usageExportProposalsFromIssue     = "proposalsFromIssue"
+	usageExportProposalsFromOther     = "proposalsFromOther"
 	// usageCreatedTimeField is the one time sample that is not status.usage's:
 	// the CR's creation timestamp, so a rule can read an install's age before
 	// anyone has spoken to it. Published beside the phase, outside every hold.
@@ -65,11 +76,12 @@ const (
 	failedPhase  = "Failed"
 )
 
-// usagePhases is the closed vocabulary of status.phase the gauge carries: the
-// API's four phases and the controller's Degraded. A phase outside it leaves
-// every sample at 0; TestUsageGauges_PhasesAreConstantsTheVocabularyCarries
-// keeps the writers on these constants.
-var usagePhases = []string{pendingPhase, provisioningPhase, readyPhase, degradedPhase, failedPhase}
+// usagePhases is the closed vocabulary of status.phase the gauge carries, the
+// API's list in its order: the four phases this controller writes, and the
+// Pending and Failed it never does. A phase outside it leaves every sample at
+// 0; TestUsageGauges_PhasesAreConstantsTheVocabularyCarries keeps the writers
+// on these constants.
+var usagePhases = []string{pendingPhase, provisioningPhase, readyPhase, pausedPhase, degradedPhase, failedPhase}
 
 type usageExportField struct {
 	name string
@@ -111,6 +123,7 @@ var usageExportFields = []usageExportField{
 	{name: "chatTurnsErroredTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.ChatTurnsErroredTotal })},
 	{name: "backgroundTasksGaveUpTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.BackgroundTasksGaveUpTotal })},
 	{name: "negativeFeedbackTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.NegativeFeedbackTotal })},
+	{name: "positiveFeedbackTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.PositiveFeedbackTotal })},
 	usageGaugeField(usageExportClustersRegistered, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.ClustersRegistered }),
 	usageGaugeField(usageExportClustersMonitored, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.ClustersMonitored }),
 	usageGaugeField(usageExportRemediationsMerged, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.RemediationsMergedTotal }),
@@ -121,6 +134,15 @@ var usageExportFields = []usageExportField{
 	usageGaugeField(usageExportProposalsMergedUntouched, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.ProposalsMergedUntouched }),
 	usageGaugeField(usageExportPeopleSeen7d, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.PeopleSeen7d }),
 	usageGaugeField(usageExportPeopleSeen30d, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.PeopleSeen30d }),
+	usageGaugeField(usageExportProposalsFromChat, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.ProposalsFromChat }),
+	usageGaugeField(usageExportProposalsFromConsole, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.ProposalsFromConsole }),
+	usageGaugeField(usageExportProposalsFromApi, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.ProposalsFromApi }),
+	usageGaugeField(usageExportProposalsFromEvent, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.ProposalsFromEvent }),
+	usageGaugeField(usageExportProposalsFromDrift, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.ProposalsFromDrift }),
+	usageGaugeField(usageExportProposalsFromAudit, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.ProposalsFromAudit }),
+	usageGaugeField(usageExportProposalsFromScheduled, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.ProposalsFromScheduled }),
+	usageGaugeField(usageExportProposalsFromIssue, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.ProposalsFromIssue }),
+	usageGaugeField(usageExportProposalsFromOther, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.ProposalsFromOther }),
 }
 
 type usageExportTimeField struct {
@@ -158,7 +180,7 @@ func newUsageGauges(reg prometheus.Registerer) *usageGauges {
 	g := &usageGauges{
 		usage: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: usageGaugeName, Help: "A PlatformAgent's status.usage counters and cluster gauges, one sample per field, as the operator last wrote them."}, append(agentLabels, usageGaugeFieldLabel)),
 		times: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: usageTimeGaugeName, Help: "A PlatformAgent's status.usage times, and its creation time, as unix seconds; a status time is absent while the status holds none."}, append(agentLabels, usageGaugeFieldLabel)),
-		phase: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: usagePhaseGaugeName, Help: "A PlatformAgent's status.phase, one-hot over Pending, Provisioning, Ready, Degraded and Failed."}, append(agentLabels, usageGaugePhaseLabel)),
+		phase: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: usagePhaseGaugeName, Help: "A PlatformAgent's status.phase, one-hot over Pending, Provisioning, Ready, Paused, Degraded and Failed."}, append(agentLabels, usageGaugePhaseLabel)),
 	}
 	reg.MustRegister(g.usage, g.times, g.phase)
 	return g
@@ -206,11 +228,13 @@ func (g *usageGauges) publishPhase(agent *agentv1alpha1.PlatformAgent) {
 }
 
 // usageBlockEmpty reports a status.usage that holds nothing: no counter moved,
-// no cluster gauge or time written, no interface. That is a pruned status as
-// the server returns it, and a new agent before its first poll; either way
-// the zeros are not a reading.
+// no cluster gauge or time written, no interface, no top tool. That is a
+// pruned status as the server returns it, and a new agent before its first
+// poll; either way the zeros are not a reading. Either list alone is a poll
+// that landed: the first poll baselines a broker that already ran commands
+// without moving a counter, yet projects its tool table as topTools.
 func usageBlockEmpty(u *agentv1alpha1.AgentUsageStatus) bool {
-	if len(u.ActiveInterfaces) != 0 {
+	if len(u.ActiveInterfaces) != 0 || len(u.TopTools) != 0 {
 		return false
 	}
 	for _, f := range usageExportFields {
@@ -244,8 +268,8 @@ func usageExportFieldSet(extra []string) map[string]bool {
 
 // usageExportFieldsOfRecord maps one of the poller's per-field pruning records
 // to the exported fields it covers: the cluster gauges share one record, the
-// six proposal readings another, the two people readings a third, and every
-// other record is named for its field.
+// six proposal readings another, the two people readings a third, the nine
+// origin readings a fourth, and every other record is named for its field.
 func usageExportFieldsOfRecord(record string) []string {
 	switch record {
 	case usageNewerFieldGauges:
@@ -257,6 +281,12 @@ func usageExportFieldsOfRecord(record string) []string {
 		}
 	case usageNewerFieldPeople:
 		return []string{usageExportPeopleSeen7d, usageExportPeopleSeen30d}
+	case usageNewerFieldOrigins:
+		return []string{
+			usageExportProposalsFromChat, usageExportProposalsFromConsole, usageExportProposalsFromApi,
+			usageExportProposalsFromEvent, usageExportProposalsFromDrift, usageExportProposalsFromAudit,
+			usageExportProposalsFromScheduled, usageExportProposalsFromIssue, usageExportProposalsFromOther,
+		}
 	}
 	return []string{record}
 }

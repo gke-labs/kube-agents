@@ -268,6 +268,9 @@ DASHBOARD_VIEW_AGENT = "agent"
 # The Nightly report page beside the Brief; the digest's nightly line links
 # to it (nightly.py derives both the line and the page's data).
 NIGHTLY_URL = f"{DASHBOARD_SITE}/{nightly.NIGHTLY_PAGE}"
+# The domain scorecard (render.CASES_PAGE's domains view): every case's
+# nightly and evidence-store records; the coverage-gap issue links it.
+DOMAIN_SCORECARD_URL = f"{DASHBOARD_SITE}/cases.html#view=domains"
 # When the nightly section (nightly_digest.py) cannot be built, the digest
 # keeps its one-line nightly summary and says why the section is missing.
 NIGHTLY_SKIPPED = "🌙 Nightly section skipped: {reason}."
@@ -637,6 +640,13 @@ def dashboard_link(view: str, cases=(), since: datetime | None = None, until: da
 
 def incident_link(health: dict, until: datetime | None = None) -> str:
     return dashboard_link(DASHBOARD_VIEW_GATE, health.get("failing_cases") or [], parse_iso(health.get("since")), until)
+
+
+def public_brief_link(health: dict) -> str:
+    """The incident brief's URL with no case names in it, for the texts
+    GitHub shows (the PR comment, the tracking issue): incident_link lists
+    the failing cases in the fragment, which only Chat reads."""
+    return dashboard_link(DASHBOARD_VIEW_GATE, [], parse_iso(health.get("since")), None)
 
 
 def run_link(build_id) -> str:
@@ -1607,7 +1617,7 @@ def nightly_latency_line(data: dict, now: datetime) -> str | None:
         night, _ = nightly.last_night(data, now)
         if night is None:
             return None
-        return nightly_latency.night_line(nightly.night_reports(data, running=nightly.running_nights(data, now)))
+        return nightly_latency.night_line(nightly.night_dates(data, running=nightly.running_nights(data, now)))
     except Exception:  # noqa: BLE001 -- the digest must still go out
         traceback.print_exc()
         log("warning: nightly latency line skipped")
@@ -1890,9 +1900,9 @@ def run(
         skip = {each["number"] for each in carried}
         if condition in (CONDITION_LOST_PODS, CONDITION_DEADLINE_KILL):
             start, end = parse_iso(incident.get("first_kill") or incident.get("window_start")), parse_iso(incident.get("window_end"))
-            issue = tracker.ensure(health, now, clock(start or since, weekday=True), incident_link(health), clock_range(start, end) if start and end else clock(since, weekday=True), skip=skip)
+            issue = tracker.ensure(health, now, clock(start or since, weekday=True), public_brief_link(health), clock_range(start, end) if start and end else clock(since, weekday=True), skip=skip)
         else:
-            issue = tracker.ensure(health, now, clock(since, weekday=True), incident_link(health), skip=skip)
+            issue = tracker.ensure(health, now, clock(since, weekday=True), public_brief_link(health), skip=skip)
         if issue and issue not in carried:
             carried.append(issue)
     section = nightly_section() if nightly_section is not None and data is not None and KIND_DIGEST in kinds else None
