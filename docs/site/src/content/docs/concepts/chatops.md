@@ -393,7 +393,9 @@ Besides [`/session`](#session), a bare [`/feedback`](#feedback) and [`/feedback 
 
   A `stop` acts only on the conversation it is sent in, so on Slack or Google Chat send it in the task's thread: a new top-level message in a channel or a DM is a new conversation. A top-level `stop` in a Slack or Google Chat DM starts nothing and gets `🤷 nothing is running here — each question runs in its own thread, so reply in that question's thread`.
 
-- **Slack's Stop button.** On a Slack app that subscribes `agent_session_stopped` ([Slack app](/kube-agents/install/slack-app/)), the thread's Working… line has a Stop button. Only someone who asked for work in the thread can press it; anyone else's press changes nothing and gets no reply. When the gateway can't tell who asked, anyone it answers in the thread can press it. That happens in a thread where nothing has run yet, once any ask in it is older than a day (by default), or in a thread with more people or asks than it keeps track of.
+- **Who can press Stop.** On Slack and on Google Chat, only someone who asked for work in the thread can press its Stop button: the person who asked, or anyone who sent a follow-up while the task ran. Anyone else's press changes nothing and gets no reply; the line of a task that has ended answers anyone, since it stops nothing. When the gateway can't tell who asked, anyone it answers in the thread can press it. That is where nothing has run yet, once any ask is older than a day (by default), or with more people or asks than it keeps track of. A typed `stop` is not the button; anyone the gateway answers can type it.
+
+- **Slack's Stop button.** On a Slack app that subscribes `agent_session_stopped` ([Slack app](/kube-agents/install/slack-app/)), the thread's Working… line has a Stop button.
 
   On an install with `A2A_CARD_STOP=true` the button cancels the running reply and stops the thread's cards as `stop` does. It posts none of the `🛑` messages and answers with one reply:
   - `Stopped.` when the work stopped;
@@ -404,7 +406,7 @@ Besides [`/session`](#session), a bare [`/feedback`](#feedback) and [`/feedback 
 
   Pressing it again while a stop is still running adds nothing, unless you had asked something new since, which it stops too. Without `A2A_CARD_STOP`, and in a conversation whose tasks go to a session worker, the button does exactly what typing `stop` does.
 
-- **Google Chat's Stop button.** The status line has a **Stop** button while the task runs. Anyone the allowed-users list admits can press it. A press sends the same cancel as `stop`, and the line itself answers, as for a typed `stop`: it reads `🛑 cancel sent — the task ends when the executor confirms` with the button gone, and `🛑 **canceled**` when the executor confirms. The press posts nothing else; a second press adds nothing.
+- **Google Chat's Stop button.** The status line has a **Stop** button while the task runs. A press sends the same cancel as `stop`, and the line itself answers, as for a typed `stop`: it reads `🛑 cancel sent — the task ends when the executor confirms` with the button gone, and `🛑 **canceled**` when the executor confirms. The press posts nothing else; a second press adds nothing.
 
   A press the cards' stop answers (`A2A_CARD_STOP=true`, outside a conversation whose tasks go to a session worker) is a typed `stop` instead: its messages, the cards stopped, and the button gone at the line's next edit. A press on the line of a task that has ended cancels nothing: the line reads `ℹ️ this task has ended` when the gateway no longer knows the task, or `🛑 **canceled**` again when the gateway stopped it.
 

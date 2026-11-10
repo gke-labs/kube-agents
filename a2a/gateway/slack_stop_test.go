@@ -148,73 +148,91 @@ func TestSlackStopIsNotTakenForAMessageRedelivery(t *testing.T) {
 	}
 }
 
-func TestMayStopOnSlackOnlyTheRequesters(t *testing.T) {
-	alice := TaskRequester{Backend: slackBackend, Subject: "h-alice"}
-	bob := TaskRequester{Backend: slackBackend, Subject: "h-bob"}
-	carol := TaskRequester{Backend: slackBackend, Subject: "h-carol"}
-	dave := TaskRequester{Backend: slackBackend, Subject: "h-dave"}
-	rec := &SessionRecord{
-		Tasks:          []TaskRef{{ID: "task-1", Requester: &alice, SteerAuthors: []TaskRequester{bob}}},
-		SessionAuthors: []TaskRequester{carol},
+// gatedBackends are the backends with a Stop button the requester gate holds;
+// each gate test runs once per backend.
+var gatedBackends = []string{slackBackend, gchatBackend}
+
+// otherGatedBackend is the gated backend that is not backend.
+func otherGatedBackend(backend string) string {
+	if backend == slackBackend {
+		return gchatBackend
 	}
-	for _, who := range []TaskRequester{alice, bob, carol} {
-		if !mayStop(rec, slackBackend, who) {
-			t.Errorf("%s asked for work here and was refused", who.Subject)
+	return slackBackend
+}
+
+func TestMayStopOnAGatedBackendOnlyTheRequesters(t *testing.T) {
+	for _, backend := range gatedBackends {
+		alice := TaskRequester{Backend: backend, Subject: "h-alice"}
+		bob := TaskRequester{Backend: backend, Subject: "h-bob"}
+		carol := TaskRequester{Backend: backend, Subject: "h-carol"}
+		dave := TaskRequester{Backend: backend, Subject: "h-dave"}
+		rec := &SessionRecord{
+			Tasks:          []TaskRef{{ID: "task-1", Requester: &alice, SteerAuthors: []TaskRequester{bob}}},
+			SessionAuthors: []TaskRequester{carol},
 		}
-	}
-	if mayStop(rec, slackBackend, dave) {
-		t.Error("someone who asked for nothing here may stop it")
-	}
-	if mayStop(rec, slackBackend, TaskRequester{Backend: slackBackend}) {
-		t.Error("an author with no subject may stop it")
-	}
-	// The same subject on another backend is another person.
-	if mayStop(rec, slackBackend, TaskRequester{Backend: gchatBackend, Subject: "h-alice"}) {
-		t.Error("a requester's subject on another backend was taken for theirs")
+		for _, who := range []TaskRequester{alice, bob, carol} {
+			if !mayStop(rec, backend, who) {
+				t.Errorf("%s: %s asked for work here and was refused", backend, who.Subject)
+			}
+		}
+		if mayStop(rec, backend, dave) {
+			t.Errorf("%s: someone who asked for nothing here may stop it", backend)
+		}
+		if mayStop(rec, backend, TaskRequester{Backend: backend}) {
+			t.Errorf("%s: an author with no subject may stop it", backend)
+		}
+		// The same subject on another backend is another person.
+		if mayStop(rec, backend, TaskRequester{Backend: otherGatedBackend(backend), Subject: "h-alice"}) {
+			t.Errorf("%s: a requester's subject on another backend was taken for theirs", backend)
+		}
 	}
 }
 
-func TestMayStopOffSlackAndOnAnEmptyConversation(t *testing.T) {
+func TestMayStopOffTheGatedBackendsAndOnAnEmptyConversation(t *testing.T) {
 	alice := TaskRequester{Backend: slackBackend, Subject: "h-alice"}
 	rec := &SessionRecord{Tasks: []TaskRef{{ID: "task-1", Requester: &alice}}}
-	if !mayStop(rec, gchatBackend, TaskRequester{Backend: gchatBackend, Subject: "h-other"}) {
+	if !mayStop(rec, discordBackend, TaskRequester{Backend: discordBackend, Subject: "h-other"}) {
 		t.Error("the gate held a backend it does not cover")
 	}
-	if !mayStop(&SessionRecord{}, slackBackend, TaskRequester{Backend: slackBackend, Subject: "h-other"}) {
-		t.Error("a conversation that ran nothing refused a stop, which would hide its nothing-running answer")
-	}
-	// Every requester copy aged out (AskTTL): the tasks remain, nobody is held.
-	aged := &SessionRecord{Tasks: []TaskRef{{ID: "task-1"}, {ID: "task-2"}}}
-	if !mayStop(aged, slackBackend, TaskRequester{Backend: slackBackend, Subject: "h-alice"}) {
-		t.Error("a thread whose requesters all aged out locked everyone out")
+	for _, backend := range gatedBackends {
+		if !mayStop(&SessionRecord{}, backend, TaskRequester{Backend: backend, Subject: "h-other"}) {
+			t.Errorf("%s: a conversation that ran nothing refused a stop, which would hide its nothing-running answer", backend)
+		}
+		// Every requester copy aged out (AskTTL): the tasks remain, nobody is held.
+		aged := &SessionRecord{Tasks: []TaskRef{{ID: "task-1"}, {ID: "task-2"}}}
+		if !mayStop(aged, backend, TaskRequester{Backend: backend, Subject: "h-alice"}) {
+			t.Errorf("%s: a thread whose requesters all aged out locked everyone out", backend)
+		}
 	}
 }
 
 // When the record cannot tell who asked, anyone the gateway answers may press
 // Stop (the maintainer's decision, 2026-10-22).
 func TestMayStopFailsOpenWhenTheRecordCannotTellWhoAsked(t *testing.T) {
-	bob := TaskRequester{Backend: slackBackend, Subject: "h-bob"}
-	alice := TaskRequester{Backend: slackBackend, Subject: "h-alice"}
-	full := make([]TaskRef, taskHistoryCap)
-	for i := range full {
-		full[i] = TaskRef{ID: "task", Requester: &bob}
-	}
-	for name, rec := range map[string]*SessionRecord{
-		// Alice's ask aged out past AskTTL; Bob's newer one is still held.
-		"one requester pruned": {Tasks: []TaskRef{{ID: "task-1"}, {ID: "task-2", Requester: &bob}}},
-
-		"steer authors overflowed": {Tasks: []TaskRef{{ID: "task-1", Requester: &bob, SteerAuthorsOverflow: true}}},
-
-		"session authors unknown": {Tasks: []TaskRef{{ID: "task-1", Requester: &bob}}, SessionAuthorsUnknown: true},
-
-		"history at its cap": {Tasks: full},
-	} {
-		if !mayStop(rec, slackBackend, alice) {
-			t.Errorf("%s: the requester whose copy may be gone was refused", name)
+	for _, backend := range gatedBackends {
+		bob := TaskRequester{Backend: backend, Subject: "h-bob"}
+		alice := TaskRequester{Backend: backend, Subject: "h-alice"}
+		full := make([]TaskRef, taskHistoryCap)
+		for i := range full {
+			full[i] = TaskRef{ID: "task", Requester: &bob}
 		}
-	}
-	// A record that can tell still gates.
-	if mayStop(&SessionRecord{Tasks: []TaskRef{{ID: "task-1", Requester: &bob}}}, slackBackend, alice) {
-		t.Error("a complete record let a non-requester stop the thread")
+		for name, rec := range map[string]*SessionRecord{
+			// Alice's ask aged out past AskTTL; Bob's newer one is still held.
+			"one requester pruned": {Tasks: []TaskRef{{ID: "task-1"}, {ID: "task-2", Requester: &bob}}},
+
+			"steer authors overflowed": {Tasks: []TaskRef{{ID: "task-1", Requester: &bob, SteerAuthorsOverflow: true}}},
+
+			"session authors unknown": {Tasks: []TaskRef{{ID: "task-1", Requester: &bob}}, SessionAuthorsUnknown: true},
+
+			"history at its cap": {Tasks: full},
+		} {
+			if !mayStop(rec, backend, alice) {
+				t.Errorf("%s: %s: the requester whose copy may be gone was refused", backend, name)
+			}
+		}
+		// A record that can tell still gates.
+		if mayStop(&SessionRecord{Tasks: []TaskRef{{ID: "task-1", Requester: &bob}}}, backend, alice) {
+			t.Errorf("%s: a complete record let a non-requester stop the thread", backend)
+		}
 	}
 }
