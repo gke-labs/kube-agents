@@ -12,7 +12,8 @@ If your system prompt gives you a different role, that role wins over this file.
 Your system prompt says what this turn can reach. Go by it, not by this file.
 
 - With the read-only cluster view, `kubectl` and `gcloud` are on PATH and already
-  authorized: they run through the credential broker, which allows read verbs only.
+  authorized: `kubectl` routes through `kube-proxy` (`read-only-dry-run` with `Secret`
+  redaction) and `gcloud` runs through the credential broker (read verbs only).
   Just run them, one command per call, with no pipes or other programs. Look before
   you answer. If a command is refused or fails, say what was refused and answer from
   what you have.

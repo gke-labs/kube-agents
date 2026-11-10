@@ -58,11 +58,22 @@ variable "case_suffix" {
 
 variable "variant" {
   type        = string
-  description = "Which greeting the plugin injects: in_progress (scan running), completed (scan done), or from_report (the plugin runs its report check on INVENTORY.bench-<case_suffix>.md, which this stack plants on the shell sandbox)"
+  description = "Which greeting the plugin injects: in_progress (scan running), completed (scan done), from_report (the plugin runs its report check on INVENTORY.bench-<case_suffix>.md, which this stack plants on the shell sandbox), or filed (the report went to a ledger issue at filed_url before anyone wrote)"
 
   validation {
-    condition     = contains(["in_progress", "completed", "from_report"], var.variant)
-    error_message = "variant must be in_progress, completed or from_report."
+    condition     = contains(["in_progress", "completed", "from_report", "filed"], var.variant)
+    error_message = "variant must be in_progress, completed, from_report or filed."
+  }
+}
+
+variable "filed_url" {
+  type        = string
+  description = "With variant filed: the web address of the ledger issue the greeting points at. Any https address the greeting can repeat; nothing opens it."
+  default     = ""
+
+  validation {
+    condition     = var.filed_url == "" || can(regex("^https://", var.filed_url))
+    error_message = "filed_url must be an https address."
   }
 }
 

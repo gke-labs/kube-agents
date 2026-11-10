@@ -1025,6 +1025,13 @@
 # card.
 ./tasks/chat-tabular-answer-keeps-its-table/task.yaml
 
+# A presence answer from a Cluster Agent names the missing namespace and the
+# cluster it was looked for on, and quotes no kubectl command: the card's
+# result is posted into the thread verbatim, and a command there is plumbing
+# (#5094). deployer: noop, read-only, the slot b role standing for its
+# cluster, one card.
+./tasks/chat-voice-absent-answer-quotes-no-command/task.yaml
+
 # The front door's "what can you do?" calls a per-cluster agent "the <cluster>
 # cluster agent", not its profile id (#3082). deployer: noop, transcript-only,
 # one front-door turn with no card: +3 units.
@@ -1102,6 +1109,11 @@
 # through the Session KV server's findings routes and resolves the rows on
 # destroy. No fixture; the host install only.
 ./tasks/findings-decision-leaves-unnamed-open/task.yaml
+
+# The first-install hello when the report was filed as a ledger issue before
+# anyone wrote (#4058): the greeting answers first and links the issue once,
+# never in front of the answer. Same seam, variant filed; no fixture.
+./tasks/first-install-hello-filed/task.yaml
 
 # A fleet audit on an install whose scope excludes as many clusters as it
 # manages runs, rather than cancelling with "every managed cluster is
@@ -1278,6 +1290,16 @@
 # repetitions alone, after every other unit, and restores the scope after them
 # (scope_exclude, #3213); deployer: noop, read-only.
 ./tasks/scope-excluded-cluster-not-listed/task.yaml
+
+# The stockout stream's declared-intent case (#1408): seeded-a's
+# declared-zonal-pool, a single-zone autoscaling pool with no node (role
+# declared-single-zone-pool), is the 3.9 zone-locked posture the same
+# knowledge/ note declares. It runs the capacity audit and grades its
+# ledger: no finding id for the declared pool, pinned-inference-pool still
+# a finding, and a Declared intent row naming the note. Red on main's
+# images (the finding published), three greens on the branch's, on a dev
+# install. deployer: noop, read-only over the seeded fleet.
+./tasks/stockout-declared-intent-no-finding/task.yaml
 
 # A gcloud write the command policy refuses for a flag it cannot read: the
 # report claims no success and no delegated worker re-runs the write without

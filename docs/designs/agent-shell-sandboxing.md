@@ -2086,7 +2086,7 @@ That split is now the smaller half of what has already happened. `resolver.py` r
 sandbox today; what is left to move is the script around them.
 
 `bootstrap_delivery.py` takes the same shape. Its gating markers, `.user_aligned` and
-`.bootstrap_completed`, are written agent-side and stay on the PVC, so it checks them
+`.bootstrap_completed` (and, for a report nobody aligned to, the age of `.bootstrap_scan_filed`), are written agent-side and stay on the PVC, so it checks them
 first; only once they say a delivery is due does it read `INVENTORY.md` out of the
 sandbox with `sandbox_exec.read_bytes`, claim the delivery on the PVC, print the report,
 and rename it to `INVENTORY.delivered.md` in the sandbox. Before the claim it reads the
@@ -2695,7 +2695,7 @@ apart from the legacy chat one. Under the operator's `A2A_SESSION_CLUSTER_VIEW` 
 a fourth, `session`, for the pods the A2A gateway spawns per conversation: their token is
 minted for `kubeagents-credential-proxy-session`, `/v1/exec` admits the session beside the shell
 (the `profile` and `scope` roles, below, reach it too), and
-within that route `ROLE_EXECUTABLES` holds the session to `kubectl` and `gcloud`. One path
+within that route `ROLE_EXECUTABLES` holds the session to `gcloud` while session `kubectl` routes through `<agent>-kube-proxy`. One path
 under it is the shell's alone: `/v1/exec/admission`, the read-only report of how many commands
 the broker admits at once, which the shell's fleet sweeps size their pools by
 (`broker_admission.py`); the session, profile and scope roles don't reach it, and a sweep run under
