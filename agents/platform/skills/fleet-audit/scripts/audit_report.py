@@ -19365,6 +19365,10 @@ def unwritten_sweep_fixes(
     return unwritten
 
 
+# How `plan_generated_fixes` ends the reason for a path a file already holds.
+ALREADY_EXISTS_SUFFIX = " already exists"
+
+
 def requested_generated_fixes(
     findings: list[dict], manifest: dict | None, requested: list[str]
 ) -> dict[str, UnwrittenFix]:
@@ -22921,7 +22925,12 @@ def handle_remediate(args: argparse.Namespace) -> None:
         )
         write_generated_fixes(findings, planned, root)
         for fid in sorted(set(generated) - set(planned)):
-            ungenerated[fid] = skipped.get(fid) or (
+            why = skipped.get(fid) or ""
+            if why.endswith(ALREADY_EXISTS_SUFFIX):
+                # A file at the budget's path: most often the budget a merged pull
+                # request already added. Still refused, but said as what it is.
+                why = f"already fixed: {why[: -len(ALREADY_EXISTS_SUFFIX)]} exists"
+            ungenerated[fid] = why or (
                 f"a {noun} the harness did not close already carries it"
                 if fid in answered
                 else "its PodDisruptionBudget could not be written beside its declaration"

@@ -38024,6 +38024,10 @@ class TestRemediateWritesTheGeneratedBudget(HarnessTestCase):
     def run_over_declaration(self, extra=()):
         """The worker wrote its budget over the Deployment's own file, under the
         conventional `<workload>-pdb` name, and named that file as the fix."""
+        # An existing clone (it has `.git`), so `ensure_workspace` reuses it and the
+        # worker's file is still there when the name search runs; a first clone would
+        # remove it, and the test could not tell `probe.ignored` from its absence.
+        (self.stream_tree() / ".git").mkdir(parents=True, exist_ok=True)
         declaration = self.stream_tree() / self.DECLARATION
         declaration.parent.mkdir(parents=True, exist_ok=True)
         declaration.write_text(self.WORKER_BUDGET, encoding="utf-8")
@@ -38050,6 +38054,8 @@ class TestRemediateWritesTheGeneratedBudget(HarnessTestCase):
         self.assertIn("the budget is planned beside it instead", self.err)
         self.assertEqual(self.stdout_json()["prs_opened"], ["https://github.com/acme/fleet/pull/9"])
         self.assertTrue((self.stream_tree() / self.GENERATED).is_file())
+        # The worker's file was there for the name search, so `probe.ignored` was what let it pass.
+        self.assertEqual((self.stream_tree() / self.DECLARATION).read_text(), self.WORKER_BUDGET)
 
     def test_the_dry_run_says_so_for_a_budget_over_the_declaration(self):
         rc = self.run_over_declaration(["--dry-run"])
@@ -38112,6 +38118,43 @@ class TestRemediateWritesTheGeneratedBudget(HarnessTestCase):
                 self.assertEqual(self.run_remediate(["--manifest-file", self.manifest_file(**fields)]), 2)
                 self.assertIn(phrase, self.err)
                 self.assertEqual(self.harness.calls, [])
+
+    def budget_pr(self, branch, state="OPEN"):
+        return proposals_view([{**pr(21, branch, state=state, body=audit_report.delta_block([self.fid()])), "labels": []}])
+
+    def own_branch(self):
+        return audit_report.group_branch_for(
+            self.STREAM, [{"id": self.fid(), "remediation": {"kind": "manifest", "path": self.GENERATED}}]
+        )
+
+    def test_a_rerun_meeting_its_own_open_pull_request_reports_it_already_open(self):
+        self.harness.replies = {"issue-list": self.issue_list(), "proposal-list": self.budget_pr(self.own_branch())}
+        self.assertEqual(self.run_remediate(["--manifest-file", self.manifest_file()]), 0, self.err)
+        self.assertEqual(self.stdout_json()["already_open"], [self.fid()])
+        self.assertEqual(self.stdout_json()["prs_opened"], [])
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+
+    def test_a_pull_request_on_another_branch_carrying_the_finding_answers_it(self):
+        self.harness.replies = {"issue-list": self.issue_list(), "proposal-list": self.budget_pr("someone/their-budget")}
+        self.assertEqual(self.run_remediate(["--manifest-file", self.manifest_file()]), 2)
+        self.assertIn("already carries it", self.err)
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+
+    def test_a_budget_already_in_the_repository_reads_as_already_fixed(self):
+        (self.stream_tree() / ".git").mkdir(parents=True, exist_ok=True)
+        existing = self.stream_tree() / self.GENERATED
+        existing.parent.mkdir(parents=True, exist_ok=True)
+        existing.write_text("kind: PodDisruptionBudget\n", encoding="utf-8")
+        self.harness.replies = {"issue-list": self.issue_list()}
+        self.assertEqual(self.run_remediate(["--manifest-file", self.manifest_file()]), 2)
+        self.assertIn(f"REFUSED {self.fid()}: already fixed: {self.GENERATED} exists", self.err)
+
+    def test_only_named_findings_are_planned(self):
+        named, other = self.finding(), self.finding()
+        other["object"] = "Deployment/other"
+        manifest = json.loads(pathlib.Path(self.manifest_file()).read_text())
+        fixes = audit_report.requested_generated_fixes([named, other], manifest, [str(named["id"])])
+        self.assertEqual(list(fixes), [str(named["id"])])
 
     def test_a_manifest_finding_is_untouched_by_the_planner(self):
         """Only a `manual` finding is planned; a worker-written file is opened as written."""

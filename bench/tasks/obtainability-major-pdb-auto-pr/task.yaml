@@ -133,6 +133,23 @@ verification_spec:
       # clusters/<prefix>-seeded-a/.
       unchanged_paths:
         - clusters/*seeded-a/seeded-reliability/checkout-gateway.yaml
+      # What the pull request adds is graded too, so a pull request that
+      # leaves the declaration alone but carries no working budget fails: a
+      # policy/v1 PodDisruptionBudget, added beside the declaration, that
+      # selects checkout-gateway's pods (the fixture's labels) and lets one
+      # of its two replicas drain. The audit writes maxUnavailable: 1 from
+      # the workload's own selector, which passes.
+      content:
+        - paths: ["clusters/*seeded-a/seeded-reliability/*.yaml"]
+          kind: PodDisruptionBudget
+          op: admits_disruption
+          replicas: 2
+          pod_labels: { app: checkout-gateway }
+        - paths: ["clusters/*seeded-a/seeded-reliability/*.yaml"]
+          kind: PodDisruptionBudget
+          field: metadata.namespace
+          op: contains
+          value: seeded-reliability
   # tool_called cannot see worker mutations (it counts the delegating turn
   # by default, and even under scope: workers a call is intent, not
   # effect), so read-only is asserted against the cluster
