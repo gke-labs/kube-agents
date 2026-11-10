@@ -18,10 +18,12 @@ var clusterParams = []lib.ProfileParameter{{Name: "project", Required: true}, {N
 
 func testDirectory() *profileDirectory {
 	d := newProfileDirectory()
-	d.put("cluster", &lib.AgentCard{Name: "cluster", Parameters: clusterParams})
+	d.put("cluster", &lib.AgentCard{Name: "cluster", Parameters: clusterParams, YieldToPinned: true})
 	d.put("prod-east", &lib.AgentCard{Name: "prod-east", Parameters: clusterParams,
 		ClusterRef: &lib.ClusterRef{ProjectID: "p1", Location: "us-east1", Cluster: "prod"}})
 	d.put("chat", &lib.AgentCard{Name: "chat"})
+	// A specialist that takes a target and doesn't yield to pinned profiles.
+	d.put("tse", &lib.AgentCard{Name: "tse", Parameters: clusterParams})
 	return d
 }
 
@@ -47,6 +49,11 @@ func TestResolveProfile(t *testing.T) {
 			wantProfile: "cluster", wantTarget: "p1/us-east1/dev"},
 		{name: "generic with a pinned target goes to the pinned profile", addressee: "cluster", params: targetParams("p1", "us-east1", "prod"),
 			wantProfile: "prod-east", wantTarget: "p1/us-east1/prod"},
+		{name: "a specialist with a pinned target keeps the task", addressee: "tse", params: targetParams("p1", "us-east1", "prod"),
+			wantProfile: "tse", wantTarget: "p1/us-east1/prod"},
+		{name: "a specialist with an unpinned target", addressee: "tse", params: targetParams("p1", "us-east1", "dev"),
+			wantProfile: "tse", wantTarget: "p1/us-east1/dev"},
+		{name: "a specialist with no target", addressee: "tse", wantRefusal: "needs a target cluster"},
 		{name: "pinned with its own target", addressee: "prod-east", params: targetParams("p1", "us-east1", "prod"),
 			wantProfile: "prod-east", wantTarget: "p1/us-east1/prod"},
 		{name: "pinned with no target takes its own cluster", addressee: "prod-east",
@@ -98,6 +105,18 @@ func TestResolveProfile_TwoProfilesPinnedToOneClusterIsRefused(t *testing.T) {
 	_, _, err := resolveProfile(d, "cluster", targetParams("p1", "us-east1", "prod"))
 	if got := refusalOf(t, err); !strings.Contains(got, "more than one agent profile is pinned") {
 		t.Fatalf("refusal = %q", got)
+	}
+}
+
+// Two pinned profiles on one cluster don't stop a specialist: it never looks
+// for a pinned profile, so there is nothing to choose between.
+func TestResolveProfile_ASpecialistIgnoresAnAmbiguousPin(t *testing.T) {
+	d := testDirectory()
+	d.put("prod-east-2", &lib.AgentCard{Name: "prod-east-2", Parameters: clusterParams,
+		ClusterRef: &lib.ClusterRef{ProjectID: "p1", Location: "us-east1", Cluster: "prod"}})
+	profile, _, err := resolveProfile(d, "tse", targetParams("p1", "us-east1", "prod"))
+	if err != nil || profile != "tse" {
+		t.Fatalf("profile, err = %q, %v; want tse", profile, err)
 	}
 }
 

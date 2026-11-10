@@ -35,6 +35,8 @@ spec:
     maxTurns: 90
   identity: {}
   allowedTiers: [read]
+  # A task for a cluster with a pinned profile (below) goes to that profile.
+  yieldToPinned: true
   parameters:
     - name: project
       required: true

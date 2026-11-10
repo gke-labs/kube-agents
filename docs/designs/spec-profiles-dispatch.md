@@ -130,7 +130,9 @@ What a one-per-cluster design would have bought, and where it lives instead:
   strength of memory alone.
 - **A different persona or tier for one cluster:** a **pinned profile** with `clusterRef` set
   (already in the CRD), for example a production cluster that allows only some tiers. That is
-  a handful of CRs, not one per cluster.
+  a handful of CRs, not one per cluster. A pinned profile stands in for the generic cluster
+  agent, which opts in with `yieldToPinned`, not for a specialist such as `tse`: a task
+  addressed to a specialist by name keeps that specialist's persona on a pinned cluster.
 
 ## Scale rules
 
@@ -244,8 +246,10 @@ Gaps on main that the build closes (#3659):
    clients discover what they can address.
 2. A client names a profile and, for cluster work, a target cluster.
 3. The gateway resolves the address:
-   1. for cluster work, a pinned profile whose `clusterRef` matches the target gets the task,
-      otherwise the generic cluster agent does; a pinned profile addressed for any other
+   1. for cluster work, a task addressed to a profile that sets `yieldToPinned` (the generic
+      cluster agent) goes to a pinned profile whose `clusterRef` matches the target, otherwise
+      to the addressed profile; a task addressed to a profile that takes a target and doesn't
+      set it (a specialist) stays with that profile; a pinned profile addressed for any other
       cluster is refused;
    2. it checks that the target is in scope (`spec.scope`, including `exclude.clusters`);
    3. it mints the task's grant against the **resolved** profile, with the requester's tier

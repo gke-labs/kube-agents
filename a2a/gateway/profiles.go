@@ -261,8 +261,11 @@ func refused(format string, args ...any) error {
 // resolveProfile picks the profile a task addressed to `addressee` with
 // `params` goes to (spec-profiles-dispatch.md, "Addressing", step 1):
 //   - addressed to a pinned profile, the target must be its cluster;
-//   - addressed to a profile that takes a target, a profile pinned to that
-//     target gets it instead, and otherwise the addressed profile does;
+//   - addressed to a profile that takes a target and yields to pinned
+//     profiles (the generic cluster agent), a profile pinned to that target
+//     gets it instead, and otherwise the addressed profile does;
+//   - addressed to any other profile that takes a target (a specialist), the
+//     addressed profile keeps it, pinned cluster or not;
 //   - addressed to a profile that takes none, the task carries no target.
 //
 // Two profiles pinned to one cluster is refused rather than guessed between.
@@ -296,6 +299,9 @@ func resolveProfile(dir *profileDirectory, addressee string, params map[string]s
 	case takesTarget(card):
 		if !hasTarget {
 			return "", nil, refused(noticeProfileNoTarget, addressee)
+		}
+		if !card.YieldToPinned {
+			return addressee, &target, nil
 		}
 		switch pinned := dir.pinnedTo(target); len(pinned) {
 		case 0:

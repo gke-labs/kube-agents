@@ -2962,7 +2962,7 @@ func TestADelegationToAProfileIsSubmittedForTheResolvedProfile(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.g.cfg.ScopeFile = scope
-	r.g.profiles.put("cluster", &lib.AgentCard{Name: "cluster", Parameters: clusterParams})
+	r.g.profiles.put("cluster", &lib.AgentCard{Name: "cluster", Parameters: clusterParams, YieldToPinned: true})
 	r.g.profiles.put("prod-east", &lib.AgentCard{Name: "prod-east", Parameters: clusterParams,
 		ClusterRef: &lib.ClusterRef{ProjectID: "p1", Location: "us-east1", Cluster: "prod"}})
 	ctx := context.Background()

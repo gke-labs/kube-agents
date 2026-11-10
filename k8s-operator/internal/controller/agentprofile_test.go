@@ -613,10 +613,11 @@ func checkFixture(t *testing.T, path, rendered string) {
 // holds its hand-built envelope to the protocol.
 func TestTheAgentCardFixtureIsWhatTheOperatorRenders(t *testing.T) {
 	at := time.Date(2026, 10, 6, 0, 0, 0, 0, time.UTC)
-	// With declared parameters, so the a2a contract test can hold the
-	// routing fields' names to lib.AgentCard's.
+	// With declared parameters and yieldToPinned, so the a2a contract test
+	// can hold the routing fields' names to lib.AgentCard's.
 	card := desiredAgentCard(ptr.To(testAgentProfile("ns", "auditor", func(p *agentv1alpha1.AgentProfile) {
 		p.Spec.Parameters = []agentv1alpha1.AgentProfileParameter{{Name: "project", Required: true}, {Name: "location", Required: true}, {Name: "cluster", Required: true}}
+		p.Spec.YieldToPinned = true
 	})))
 	body, err := renderDirectoryEnvelope("auditor", &card, at, "000000000000000000000000")
 	if err != nil {
@@ -1625,15 +1626,20 @@ func TestAProfileServiceAccountChangeWakesTheAgentBesideIt(t *testing.T) {
 	}
 }
 
-// The card carries the profile's tiers, its pinned cluster and its declared
-// parameters, which is what the gateway routes on.
+// The card carries the profile's tiers, its pinned cluster, its declared
+// parameters and whether it yields to pinned profiles, which is what the
+// gateway routes on.
 func TestTheCardCarriesWhatTheGatewayRoutesOn(t *testing.T) {
 	p := testAgentProfile("ns", "prod-a", func(p *agentv1alpha1.AgentProfile) {
 		p.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead, agentv1alpha1.AgentProfileTierUnattended}
 		p.Spec.ClusterRef = &agentv1alpha1.AgentProfileClusterRef{ProjectID: "p", Location: "us-central1", Cluster: "a"}
 		p.Spec.Parameters = []agentv1alpha1.AgentProfileParameter{{Name: "namespace"}}
+		p.Spec.YieldToPinned = true
 	})
 	card := desiredAgentCard(&p)
+	if !card.YieldToPinned {
+		t.Error("yieldToPinned didn't reach the card")
+	}
 	if !slices.Equal(card.Tiers, []string{"read", "unattended"}) {
 		t.Errorf("tiers = %v", card.Tiers)
 	}
@@ -1645,7 +1651,7 @@ func TestTheCardCarriesWhatTheGatewayRoutesOn(t *testing.T) {
 	}
 	// A profile with neither: read alone, no pin, no parameters.
 	bare := desiredAgentCard(ptr.To(testAgentProfile("ns", "bare")))
-	if !slices.Equal(bare.Tiers, []string{"read"}) || bare.ClusterRef != nil || bare.Parameters != nil {
+	if !slices.Equal(bare.Tiers, []string{"read"}) || bare.ClusterRef != nil || bare.Parameters != nil || bare.YieldToPinned {
 		t.Errorf("bare card = %+v", bare)
 	}
 }

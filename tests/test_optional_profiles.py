@@ -313,6 +313,11 @@ class HelmProfilesTemplatingTest(unittest.TestCase):
             'image: "us-docker.pkg.dev/my-proj/my-mirror/a2a-worker:v2026.10.20"',
             proc.stdout,
         )
+        # A specialist: a tse task for a pinned cluster stays tse (#5435).
+        tse = [d for d in yaml.safe_load_all(proc.stdout)
+               if d and d.get("kind") == "AgentProfile" and d["metadata"]["name"] == "tse"]
+        self.assertEqual(len(tse), 1)
+        self.assertNotIn("yieldToPinned", tse[0]["spec"])
         self.assertIn('resources: ["platformagents", "agentprofiles"]', proc.stdout)
         self.assertIn("kubectl delete agentprofile --all", proc.stdout)
         self.assertIn("--timeout=30s", proc.stdout)
@@ -429,6 +434,8 @@ class HelmClusterProfileTest(unittest.TestCase):
         self.assertEqual(spec["allowedTiers"], ["read"])
         self.assertNotIn("clusterRef", spec)
         self.assertNotIn("bus", spec)
+        # Its pinned profiles are its per-cluster variants, so they take its tasks.
+        self.assertIs(spec["yieldToPinned"], True)
 
     @unittest.skipUnless(shutil.which("helm"), "helm is not installed")
     def test_parameters_are_the_personas(self):
