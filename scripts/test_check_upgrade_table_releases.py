@@ -467,6 +467,30 @@ class CheckUpgradeTableReleasesTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn('this change removes the pending row "change t", which 1.0.0 already contains', err)
 
+    def test_a_space_added_before_a_removal_does_not_hide_a_shipped_pending_row(self):
+        first = self._shipped_pending_row()
+        self.repo.rows = [r.replace("| change q |", "|  change q |") for r in self.repo.rows]
+        self.repo.write_page()
+        spaced = self.repo.commit("docs: a space in q", code=False)
+        self.repo.git("update-ref", "refs/remotes/origin/main", spaced)
+        self.repo.rows = [r for r in self.repo.rows if "change q" not in r]
+        self.repo.write_page()
+        code, err = self.repo.check()
+        self.assertEqual(code, 1)
+        self.assertIn(f'this change removes the pending row "change q", which 1.0.0 already contains. If you '
+                      f'reworded it, label the new row 1.0.0 and name its commit ({first})', err)
+
+    def test_a_removed_prefixed_pending_row_names_its_commit(self):
+        first = self.repo.commit("feat: j", row=row("pending", "#12: change j"))
+        self.repo.tag("1.0.0")
+        self.repo.git("update-ref", "refs/remotes/origin/main", first)
+        self.repo.rows = [r for r in self.repo.rows if "change j" not in r]
+        self.repo.write_page()
+        code, err = self.repo.check()
+        self.assertEqual(code, 1)
+        self.assertIn(f'removes the pending row "change j", which 1.0.0 already contains. If you reworded it, '
+                      f'label the new row 1.0.0 and name its commit ({first})', err)
+
     def test_a_push_does_not_read_a_removed_pending_row(self):
         self._shipped_pending_row()
         self.repo.reword("change q", "change q, reworded")

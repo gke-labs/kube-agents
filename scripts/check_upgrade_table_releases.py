@@ -72,9 +72,10 @@ ROW = re.compile(rf"^\| (?P<release>\d+\.\d+\.\d+|{PENDING})\s*\| (?P<change>[^|
 # dropped. So the same words in prose, in another table or inside a longer cell do not stand in for
 # the row, and a row whose cell later lost the prefix still traces to its start.
 DIFF_TABLE_LINE = r"^\| "
-# A change cell's optional `#<number>: ` prefix, which older cells carried and later ones dropped.
+# A change cell's optional `#<number>: ` prefix, which older cells carried and later ones dropped. Every
+# reader of a cell drops it, and surrounding spaces, so one row reads the same everywhere.
 CHANGE_PREFIX = re.compile(r"^#\d+:\s*")
-TABLE_LINE = re.compile(rf"^\| (?:{PENDING}|\d+\.\d+\.\d+)\s*\| (?:#\d+:\s*)?(?P<change>[^|]+?)\s*\|")
+TABLE_LINE = re.compile(rf"^\| (?:{PENDING}|\d+\.\d+\.\d+)\s*\|\s*(?:#\d+:\s*)?(?P<change>[^|]+?)\s*\|")
 ADDED = "+"
 REMOVED = "-"
 RELEASE_TAG = re.compile(r"^\d+\.\d+\.\d+$")
@@ -125,7 +126,8 @@ def git_ok(*args: str) -> bool:
 
 
 def rows(text: str) -> list[Row]:
-    return [Row(text.count("\n", 0, match.start()) + 1, match["release"], match["change"])
+    """The table's rows, each change normalized by change_key() so every reader compares the same text."""
+    return [Row(text.count("\n", 0, match.start()) + 1, match["release"], change_key(match["change"]))
             for match in ROW.finditer(text)]
 
 
@@ -206,13 +208,13 @@ def removed_pending_problems(base: str, tags: set[str], traced: dict[str, str],
     """
     found = []
     current = page_rows()
-    texts = {change_key(row.change) for row in current}
+    texts = {row.change for row in current}
     base_rows = rows(page_at(base))
-    base_texts = {change_key(row.change) for row in base_rows}
+    base_texts = {row.change for row in base_rows}
     # Rows this change adds with a trace entry: a recorded reword, if one is labelled with the release.
-    recorded = [row for row in current if change_key(row.change) not in base_texts and row.change in traced]
+    recorded = [row for row in current if row.change not in base_texts and row.change in traced]
     for row in base_rows:
-        if row.release != PENDING or change_key(row.change) in texts:
+        if row.release != PENDING or row.change in texts:
             continue
         # As for a `pending` row on the page, the base's trace entry names the row's commit if it has one.
         commit = base_traced.get(row.change.strip()) or row_commit(row.change, base)
