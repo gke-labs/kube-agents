@@ -100,7 +100,7 @@ from kube_agents_bench import (
     worker_trajectory,
 )
 from kube_agents_bench.parsing import DELEGATION_TOOL
-from kube_agents_bench.shell_words import _INTERPRETER_RE, _command_word_index, _shell_argvs
+from kube_agents_bench.shell_words import _INTERPRETER_RE, _command_word_index, _shell_argvs, _without_grep_patterns
 from kube_agents_bench.fleet import (
     ROLE_PATTERN,
     FleetRoleUnresolved,
@@ -2779,6 +2779,22 @@ class WorkerCommandsVerifier(BaseVerifier):
     more. A collapsed chain (a line ending `` + N command(s)``) hides what
     followed, so an exemption refuses it and the first command's own words
     are graded.
+    ``exempt_grep_patterns: true`` is that grep exemption by structure, read
+    before ``exempt_patterns``: the row is split into shell words as
+    ``required_runs`` splits it (:func:`kube_agents_bench.shell_words._without_grep_patterns`),
+    and when it is one ``grep``, ``egrep`` or ``fgrep`` named bare and nothing
+    else (no control operator, no redirect but ``>`` to ``/dev/null``, no
+    comment, no substitution anywhere, not a collapsed chain), only its pattern
+    argument comes off (the first positional word, or each ``-e`` or
+    ``--regexp=`` value ahead of it). The row is then graded as its words joined by
+    spaces, quotes off: the options, the file operands and any text the
+    rendering joined on stay. A row with anything else on it is graded whole.
+    A grep behind a path, a wrapper, a reserved word or a ``cd`` is not one,
+    and a long option with a separate value is read as a flag, so its value is
+    taken as the pattern and the real one is graded. A card log row that joined
+    a second typed line onto a grep is one row to it, so a line that reads the
+    removed word back (``$_``) is read as a file operand, as it was by the
+    regex exemptions this replaces.
     ``required_runs``: each names a script (by basename, or module stem under
     ``-m``), flags and word patterns; some command's shell segment, read as an
     argv, must run it with those flags after it, a word matching each pattern,
@@ -2878,6 +2894,7 @@ class WorkerCommandsVerifier(BaseVerifier):
     required_patterns: list[str] = Field(default_factory=list)
     forbidden_patterns: list[str] = Field(default_factory=list)
     exempt_patterns: list[str] = Field(default_factory=list)
+    exempt_grep_patterns: bool = False
     required_runs: list[WorkerRun] = Field(default_factory=list)
     forbidden_runs: list[WorkerRun] = Field(default_factory=list)
     forbidden_result_patterns: list[str] = Field(default_factory=list)
@@ -2904,6 +2921,8 @@ class WorkerCommandsVerifier(BaseVerifier):
         return self
 
     def _without_exempt_text(self, command: str) -> str:
+        if self.exempt_grep_patterns:
+            command = _without_grep_patterns(command) or command
         for pattern in self.exempt_patterns:
             command = re.sub(pattern, "", command)
         return command
@@ -3212,6 +3231,92 @@ class WorkerAgentsVerifier(BaseVerifier):
             reason=f"all {len(self.required_agents)} required profile pattern(s) matched; workers ran as {agents}",
         )
 
+
+
+_NO_CHILD_ADDRESSEES_REASON = (
+    "the run did not report whom its chain delegated to: the record came through a "
+    "transport other than the inject door, or a door older than its childAddressees "
+    "field, so this check could not be evaluated"
+)
+
+
+@VERIFIERS.register("delegated_to")
+class DelegatedToVerifier(BaseVerifier):
+    """Checks whom the delegating turn's chain delegated to.
+
+    The inject door's read route names each child task's addressee once, in
+    the order delegated (``childAddressees``): an AgentProfile's name, or
+    ``platform``. The harness keeps that on the transcript
+    (``TranscriptSnapshot.child_addressees``). This reads it and nothing
+    else, so a case can grade which agent a session chose, which neither the
+    answer nor the trajectory says.
+
+    ``required_addressees``: Python regular expressions, each of which must
+    ``re.fullmatch`` at least one addressee.
+    ``forbidden_addressees``: Python regular expressions, none of which may
+    ``re.fullmatch`` any addressee. At least one of the two lists is set.
+
+    Fails closed: a run that could not say (the api transport, or a door
+    older than the field) is ``status="error"``, never a pass or a fail. A
+    case that relies on this check belongs in
+    ``hack/eval/api-lane-exclusions.txt``, so the api lane never runs it.
+    """
+
+    type: Literal["delegated_to"]
+    required_addressees: list[str] = Field(default_factory=list)
+    forbidden_addressees: list[str] = Field(default_factory=list)
+
+    @field_validator("required_addressees", "forbidden_addressees")
+    @classmethod
+    def _addressee_patterns_compile(cls, patterns: list[str]) -> list[str]:
+        for pattern in patterns:
+            if re.compile(pattern).fullmatch(""):
+                raise ValueError(f"addressee pattern {pattern!r} matches the empty string")
+        return patterns
+
+    @model_validator(mode="after")
+    def _one_list_set(self) -> "DelegatedToVerifier":
+        if not self.required_addressees and not self.forbidden_addressees:
+            raise ValueError("delegated_to needs required_addressees, forbidden_addressees, or both")
+        return self
+
+    def verify(self, timeout_sec: float) -> VerificationResult:
+        start = time.monotonic()
+        snap = transcript.get()
+        if snap is None:
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=_NO_TRANSCRIPT_REASON,
+            )
+        if snap.child_addressees is None:
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=_NO_CHILD_ADDRESSEES_REASON,
+            )
+        addressees = list(snap.child_addressees)
+        missing = [p for p in self.required_addressees if not any(re.fullmatch(p, a) for a in addressees)]
+        forbidden = [a for a in addressees if any(re.fullmatch(p, a) for p in self.forbidden_addressees)]
+        seen = addressees or "nobody"
+        if missing or forbidden:
+            parts = []
+            if missing:
+                parts.append(f"no delegation went to an addressee matching {missing}")
+            if forbidden:
+                parts.append(f"the chain delegated to forbidden addressee(s) {forbidden}")
+            return VerificationResult(
+                success=False,
+                elapsed_time=time.monotonic() - start,
+                reason=f"{'; '.join(parts)}; the chain delegated to {seen}",
+            )
+        return VerificationResult(
+            success=True,
+            elapsed_time=time.monotonic() - start,
+            reason=f"the chain delegated to {seen}",
+        )
 
 
 # The dispatcher's record of a worker that ran out of its turn budget: the

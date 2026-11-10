@@ -289,4 +289,24 @@ func TestTokenReviewAuthenticatorMultipleAudiences(t *testing.T) {
 	if _, err := a.AuthenticateRequest(bearerRequest("cross-audience-token")); err == nil {
 		t.Errorf("expected cross-audience caller %q on %q to be rejected", shellUsername, profileAudience)
 	}
+
+	// Colliding audience between Audience and AudienceCallers is rejected at construction.
+	if _, err := NewTokenReviewAuthenticator(TokenReviewConfig{
+		Kubernetes:      &rest.Config{Host: srv.URL, ContentConfig: jsonContent},
+		Audience:        testAudience,
+		AllowedCallers:  []string{shellUsername},
+		AudienceCallers: map[string][]string{testAudience: {sessionUsername}},
+	}); err == nil {
+		t.Errorf("expected duplicate audience %q in AudienceCallers to be rejected", testAudience)
+	}
+
+	// Overlapping caller across AllowedCallers and AudienceCallers is rejected at construction.
+	if _, err := NewTokenReviewAuthenticator(TokenReviewConfig{
+		Kubernetes:      &rest.Config{Host: srv.URL, ContentConfig: jsonContent},
+		Audience:        testAudience,
+		AllowedCallers:  []string{shellUsername, sessionUsername},
+		AudienceCallers: map[string][]string{sessionAudience: {sessionUsername}},
+	}); err == nil {
+		t.Errorf("expected caller %q bound to two audiences to be rejected", sessionUsername)
+	}
 }

@@ -2158,6 +2158,16 @@ Mutation(
         "each module's test compares its constant to itself",
     ),
     Mutation(
+        "C1-session-audience-env-renamed-in-kube-proxy",
+        "k8s-api-proxy/cmd/k8s-api-proxy/main.go",
+        ('sessionAudienceEnv      = "CREDENTIAL_PROXY_SESSION_AUDIENCE"',
+         'sessionAudienceEnv      = "KUBE_PROXY_SESSION_AUDIENCE"'),
+        "test_C1_the_session_broker_audience_and_view_env_agree_across_the_module_boundary",
+        "rename the session-audience env var in k8s-api-proxy while "
+        "k8s-operator still renders CREDENTIAL_PROXY_SESSION_AUDIENCE: both Go "
+        "suites pass while session kubectl fails with 401",
+    ),
+    Mutation(
         "C1-shim-token-env-renamed-in-the-spawner",
         "a2a/gateway/spawn.go",
         ('Name: "CREDENTIAL_PROXY_TOKEN_FILE"', 'Name: "CREDENTIAL_PROXY_TOKEN_PATH"'),
@@ -2371,7 +2381,7 @@ Mutation(
     Mutation(
         "C1-rendered-bridge-inherits-the-agent-bus-user",
         "k8s-operator/internal/controller/platformagent_a2a_bridge.go",
-        ("\ta2aBusUserEnv:                 true,\n", ""),
+        ("\ta2aBusUserEnv:                    true,\n", ""),
         "test_C1_the_rendered_bridge_is_not_the_agent_principal",
         "let the rendered bridge inherit A2A_BUS_USER=agent, the agent "
         "principal's name and inbox prefix",

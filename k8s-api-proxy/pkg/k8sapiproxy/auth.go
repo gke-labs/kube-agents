@@ -75,39 +75,79 @@ func NewTokenReviewAuthenticator(cfg TokenReviewConfig) (CallerAuthenticator, er
 	var audiences authenticator.Audiences
 	seenAudiences := sets.New[string]()
 	allowedByAudience := make(map[string]sets.Set[string])
-	addBinding := func(rawAud string, callers []string) {
-		callerSet := sets.New[string]()
+	callerPrimaryAudience := make(map[string]string)
+
+	normalizeCallers := func(callers []string) sets.Set[string] {
+		out := sets.New[string]()
 		for _, c := range callers {
 			if c = strings.TrimSpace(c); c != "" {
-				callerSet.Insert(c)
+				out.Insert(c)
 			}
 		}
-		if callerSet.Len() == 0 {
-			return
+		return out
+	}
+
+	primaryCallers := normalizeCallers(cfg.AllowedCallers)
+	if primaryCallers.Len() > 0 {
+		for _, raw := range append([]string{cfg.Audience}, cfg.Audiences...) {
+			for _, entry := range strings.Split(raw, ",") {
+				aud := strings.TrimSpace(entry)
+				if aud == "" {
+					continue
+				}
+				if !seenAudiences.Has(aud) {
+					seenAudiences.Insert(aud)
+					audiences = append(audiences, aud)
+				}
+				allowedByAudience[aud] = primaryCallers.Clone()
+			}
 		}
+		if len(audiences) > 0 {
+			firstPrimary := audiences[0]
+			for c := range primaryCallers {
+				callerPrimaryAudience[c] = firstPrimary
+			}
+		}
+	}
+
+	// Sort keys so validation errors are deterministic.
+	extraKeys := make([]string, 0, len(cfg.AudienceCallers))
+	for k := range cfg.AudienceCallers {
+		extraKeys = append(extraKeys, k)
+	}
+	for i := 1; i < len(extraKeys); i++ {
+		for j := i; j > 0 && extraKeys[j] < extraKeys[j-1]; j-- {
+			extraKeys[j], extraKeys[j-1] = extraKeys[j-1], extraKeys[j]
+		}
+	}
+	for _, rawAud := range extraKeys {
+		callerSet := normalizeCallers(cfg.AudienceCallers[rawAud])
+		if callerSet.Len() == 0 {
+			continue
+		}
+		var groupAudiences []string
 		for _, entry := range strings.Split(rawAud, ",") {
 			aud := strings.TrimSpace(entry)
 			if aud == "" {
 				continue
 			}
-			if !seenAudiences.Has(aud) {
-				seenAudiences.Insert(aud)
-				audiences = append(audiences, aud)
+			if seenAudiences.Has(aud) {
+				return nil, fmt.Errorf("k8sapiproxy: AudienceCallers audience %q duplicates an already configured audience", aud)
 			}
-			existing, ok := allowedByAudience[aud]
-			if !ok {
-				existing = sets.New[string]()
-				allowedByAudience[aud] = existing
-			}
-			existing.Insert(callerSet.UnsortedList()...)
+			seenAudiences.Insert(aud)
+			audiences = append(audiences, aud)
+			allowedByAudience[aud] = callerSet.Clone()
+			groupAudiences = append(groupAudiences, aud)
 		}
-	}
-
-	for _, raw := range append([]string{cfg.Audience}, cfg.Audiences...) {
-		addBinding(raw, cfg.AllowedCallers)
-	}
-	for rawAud, callers := range cfg.AudienceCallers {
-		addBinding(rawAud, callers)
+		if len(groupAudiences) == 0 {
+			continue
+		}
+		for _, c := range sets.List(callerSet) {
+			if prevAud, exists := callerPrimaryAudience[c]; exists {
+				return nil, fmt.Errorf("k8sapiproxy: caller %q cannot be bound to both %q and %q", c, prevAud, groupAudiences[0])
+			}
+			callerPrimaryAudience[c] = groupAudiences[0]
+		}
 	}
 	if len(audiences) == 0 {
 		hasAudience := strings.TrimSpace(cfg.Audience) != ""

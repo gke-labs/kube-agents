@@ -58,6 +58,7 @@ from devops_bench.verification.spec import VerificationEntry, parse_node
 from kube_agents_bench import fleet, transcript, verifiers
 from kube_agents_bench.verifiers import (
     WorkerAgentsVerifier,
+    DelegatedToVerifier,
     WorkerBudgetVerifier,
     WorkerCommandsVerifier,
     LedgerIssueContainsVerifier,
@@ -1559,6 +1560,65 @@ def test_replay_card_is_published_and_registered():
         eps = tomllib.load(fh)["project"]["entry-points"]["devops_bench.verifiers"]
     assert eps["replay_card"] == "kube_agents_bench.verifiers:ReplayCardVerifier"
     assert isinstance(parse_node({"type": "replay_card", "status_not_in": ["blocked"]}), ReplayCardVerifier)
+
+
+# ------------------------------------------------------------ delegated_to
+
+
+def _delegated(addressees: list[str] | None) -> None:
+    transcript.set("ok", _TRAJECTORY, child_addressees=addressees)
+
+
+def test_delegated_to_passes_when_the_chain_delegated_to_the_profile():
+    _delegated(["tse"])
+    res = DelegatedToVerifier(type="delegated_to", required_addressees=["tse"], forbidden_addressees=["platform"]).verify(5.0)
+    assert res.success, res.reason
+    assert "['tse']" in res.reason
+
+
+def test_delegated_to_fails_when_the_chain_went_to_platform():
+    _delegated(["platform"])
+    res = DelegatedToVerifier(type="delegated_to", required_addressees=["tse"], forbidden_addressees=["platform"]).verify(5.0)
+    assert not res.success
+    assert res.status != "error"
+    assert "['tse']" in res.reason and "['platform']" in res.reason
+
+
+def test_delegated_to_fails_when_nothing_was_delegated():
+    _delegated([])
+    res = DelegatedToVerifier(type="delegated_to", required_addressees=["tse"]).verify(5.0)
+    assert not res.success
+    assert res.status != "error"
+    assert "nobody" in res.reason
+
+
+def test_delegated_to_matches_the_whole_name():
+    _delegated(["tse-shadow"])
+    assert not DelegatedToVerifier(type="delegated_to", required_addressees=["tse"]).verify(5.0).success
+    _delegated(["platform", "tse"])
+    assert not DelegatedToVerifier(type="delegated_to", forbidden_addressees=["platform"]).verify(5.0).success
+
+
+def test_delegated_to_is_an_error_when_the_run_could_not_say():
+    _delegated(None)
+    res = DelegatedToVerifier(type="delegated_to", required_addressees=["tse"]).verify(5.0)
+    assert res.status == "error"
+    assert not res.success
+
+
+def test_delegated_to_needs_a_list_and_no_empty_matcher():
+    with pytest.raises(ValueError):
+        DelegatedToVerifier(type="delegated_to")
+    with pytest.raises(ValueError):
+        DelegatedToVerifier(type="delegated_to", required_addressees=[".*"])
+
+
+def test_delegated_to_is_published_and_registered():
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    with pyproject.open("rb") as fh:
+        eps = tomllib.load(fh)["project"]["entry-points"]["devops_bench.verifiers"]
+    assert eps["delegated_to"] == "kube_agents_bench.verifiers:DelegatedToVerifier"
+    assert isinstance(parse_node({"type": "delegated_to", "required_addressees": ["tse"]}), DelegatedToVerifier)
 
 
 # ------------------------------------------------------------ worker_agents

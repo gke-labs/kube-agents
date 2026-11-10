@@ -12,8 +12,7 @@ structured audit records (`pkg/k8sapiproxy/audit.go`), Prometheus metrics
 `cmd/k8s-api-proxy` builds the production server binary.
 
 `NewTokenReviewAuthenticator` (`auth.go`) is the `CallerAuthenticator`: it accepts a bearer token
-that a TokenReview on the host cluster finds valid for any of the configured audiences (`Audience` / `AudienceCallers`), from a username on
-an allowlist, and caches each acceptance or refusal for ten seconds by default. The audiences should
+that a TokenReview on the host cluster finds valid for any configured audience (`Audience`, `Audiences`, or `AudienceCallers`), from a username in that audience's allowlist, and caches each acceptance or refusal for ten seconds by default. The audiences should
 be ones the API server does not accept, so a token sent to the proxy cannot be used against the API
 server directly; the operator picks them. A review that fails is a 503 rather than a 401.
 
@@ -32,8 +31,9 @@ The handler hands one `AuditEvent` per request to an `AuditSink` (`audit.go`) wh
 ends, so a watch or an `exec` session is recorded when it closes. The event holds the caller, the
 cluster, the API server's classification of the request, the outcome (`forwarded`,
 `unauthenticated`, `auth_unavailable` when the TokenReview fails, `refused` with its reason,
-`upstream_error`, `canceled` when the caller gives up, or `aborted` when a response fails
-mid-copy otherwise or an upgrade's 101 cannot be written), the status, the duration, and the response cache's result when the cache handled the request (a `hit` or `coalesced` request never reached the cluster). An upgraded session that breaks off after its 101 is recorded as
+`upstream_error`, `canceled` when the caller gives up, `throttled` when the in-flight cap
+answered 429, or `aborted` when a response fails mid-copy otherwise or an upgrade's 101 cannot be
+written), the status, the duration, and the response cache's result when the cache handled the request (a `hit` or `coalesced` request never reached the cluster). An upgraded session that breaks off after its 101 is recorded as
 `forwarded`, because the reverse proxy reports nothing about the stream itself. The handler
 puts no body, query or credential in it, but an authentication or transport error is recorded as
 returned. The caller never sees that error, because it can name the upstream. A Secret response

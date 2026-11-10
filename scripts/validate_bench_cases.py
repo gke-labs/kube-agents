@@ -290,6 +290,15 @@ KNOWN_UNREGISTERED = {
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
 # later pull request that moves the case to the nightly file.
 FIXTURE_NOT_READY = {
+    # Needs a Standard seeded cluster with a manual node pool labelled for a
+    # ComputeClass whose auto-creation is off: the lane's Autopilot hosts
+    # refuse the shape, so it is a fleet fixture addressed by role, and
+    # #5143 plants it. #4943 is the sibling ComputeClass gap on the same
+    # host constraint.
+    "ccc-manual-pools-single-rule-unbacked": (
+        "#5143: needs a Standard seeded cluster with a manual node pool under a ComputeClass "
+        "whose auto-creation is off; the lane's host clusters are Autopilot"
+    ),
     # Needs Config Sync's RootSync CRD and one root-sync object reporting
     # Stalled=True on a seeded cluster. No pool project enables the GKE Hub
     # API, so Config Sync is installed nowhere, and the seeded fleet plants no
@@ -571,6 +580,7 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     "tool_called": ("tool_names",),
     "worker_commands": ("required_patterns", "forbidden_patterns", "required_runs", "forbidden_runs", "forbidden_result_patterns"),
     "worker_agents": ("required_agents",),
+    "delegated_to": ("required_addressees", "forbidden_addressees"),
     "worker_budget": ("budget",),
     "replay_card": ("status_in", "status_not_in", "comment_phrases", "decoy_status_in"),
     # No assertion field: "the gateway would post nothing" is the assertion; `reply` only picks

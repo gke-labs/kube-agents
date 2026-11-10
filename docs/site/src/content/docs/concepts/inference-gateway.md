@@ -89,6 +89,32 @@ The gateway supplies the value as a fallback default when a request omits `max_t
 
 On non-adaptive Anthropic Claude models, LiteLLM maps `fallback.reasoningEffort` (`low`, `medium`, `high`) to `thinking.budget_tokens` (`1024`, `2048`, `4096`), and Anthropic requires `max_tokens > thinking.budget_tokens`. When setting `litellm.maxTokens` alongside `fallback.reasoningEffort` on a Claude model, set `maxTokens` strictly above that effort budget (for example, `> 4096` for `high`).
 
+### Setting a spend ceiling
+
+`LITELLM_BUDGET_USD` is the most the gateway spends, in US dollars as LiteLLM's cost map prices each response, in every window of `LITELLM_BUDGET_PERIOD` (a LiteLLM duration: a whole number and `s`, `m`, `h`, `d`, `w` or `mo`; the default is `1d`). Set both in `install.env` (there is no flag) and re-run `upgrade.sh`; they reach the Terraform example as `litellm_budget` and the chart as `litellm.budget.usd` and `litellm.budget.period`. On a direct Helm install set them through a values file or `--set-json litellm.budget.usd=25`: `--set` passes a decimal as a string, which the schema refuses.
+
+At the default of `0` nothing is rendered and the gateway config is what it was. On, the amount is at least `0.01`: the installer, the Terraform example and the chart's schema all refuse less, before any apply, because a smaller amount splits into per-replica shares the chart cannot render.
+
+The chart renders the ceiling as LiteLLM's provider budget for the one provider every alias routes to, with the amount split evenly across `litellm.replicaCount`. With `MODEL_PROVIDER=vertex_ai`, `LITELLM_BUDGET_USD=10` and the default two replicas the config reads:
+
+```yaml
+router_settings:
+  provider_budget_config:
+    vertex_ai:
+      budget_limit: 5.0000
+      time_period: "1d"
+```
+
+LiteLLM counts spend per gateway process, in memory, and the chart runs no Redis to share the count, so each replica holds one share. Uneven traffic can make one replica refuse before the install has spent the whole amount. The ceiling is a bound on a runaway, not a ledger. LiteLLM checks the share before a call and charges the call's cost after the call completes. Every call in flight when a share is crossed therefore completes and is charged, so a replica can end a window over its share by the cost of those calls. The Platform Agent runs several workers, and a streamed turn lasts minutes.
+
+A rolling update adds a third pod with a share of its own while it lasts, and a gateway restart or rollout starts that pod's count over.
+
+A replica whose share is spent refuses every model call until its window ends. The first window of a gateway process starts when the pod starts, not at its first spend; once a window has expired, the next spend opens the next one. The caller gets HTTP 429 with `No deployments available - crossed budget: Exceeded budget for provider vertex_ai: <spend> >= <limit>`, and the gateway logs the same line. The agent's turn fails as it does on a rate limit; nothing on the `PlatformAgent` reports the state yet.
+
+Each gateway pod exports the remaining share as `litellm_provider_remaining_budget_metric{api_provider="vertex_ai"}` on its `/metrics`, which the chart's `PodMonitoring` collects. The series appears at the pod's first routing decision and is set on every one: the share less the spend charged so far, at or below `0` while the replica refuses, negative by the in-flight overshoot. `sum` it over the gateway pods for the install's remaining budget. The per-key and per-team budget series keep reading `inf`: they describe LiteLLM virtual keys, which this install does not use.
+
+A model that LiteLLM's cost map does not price costs `0` on every call, so `litellm_spend_metric` does not move and the ceiling is never reached. Check that the series moves on your model before you rely on the ceiling. A ceiling whose per-replica share would round to `0.0000` fails the render, because LiteLLM reads a `budget_limit` of `0` as no limit; raise the amount or lower `litellm.replicaCount`. Why the ceiling is split rather than shared, and what is still to come on the `PlatformAgent`: [`docs/designs/gateway-spend-cap.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/gateway-spend-cap.md).
+
 ### Fallback alias and parameter dropping
 
 Two chart blocks, both off by default, add a fallback alias and router retry limits when a primary call fails. At their defaults nothing is rendered, so the gateway config and its rollout checksum are what they were.

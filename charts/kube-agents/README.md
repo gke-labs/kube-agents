@@ -246,6 +246,12 @@ under every primary alias the same way (the fallback alias carries
 On a Gemini 2.5 or 3.x model the gateway asks for the model's thoughts with a
 `thinking` key under every primary alias, which a `reasoningEffort` value replaces
 ([why](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#geminis-thoughts)).
+`litellm.budget.usd` (default `0`, meaning none) with `litellm.budget.period`
+(default `1d`) puts a spend ceiling on the gateway, LiteLLM's provider budget
+for the model's provider split evenly across `litellm.replicaCount`; a replica
+whose share is spent refuses model calls until the window ends, and exports the
+remaining share as `litellm_provider_remaining_budget_metric`
+([details](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#setting-a-spend-ceiling)).
 On a Claude model the gateway
 drops `temperature`, `top_p` and `top_k` from every request
 ([why](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#setting-the-default-model)),
@@ -999,10 +1005,11 @@ gives each setting's meaning and default. Alert excludes are under
 incident, while their clusters stay in scope for reads. The list is forwarded to the CR's
 `spec.harness.eventWatcher.alertExclude` when it has a rule, and an empty list omits it. The schema
 holds the CRD's bounds (at most 64 rules, a length limit and a pattern on each part), so a rule the
-API server would refuse fails the render. A change rolls the agent pod. On an existing install,
-apply the chart's `crds/` first: against a CRD that predates the field, the chart fails the upgrade
-instead of letting the API server prune the rules. A `helm upgrade` that removes the last rule also
-removes an `enabled: false` set on the CR by hand. The
+API server would refuse fails the render. A change is in force within about two minutes, without a
+pod restart (at the next pod restart if the agent image is older than the operator). On an existing
+install, apply the chart's `crds/` first: against a CRD that predates the field, the chart fails the
+upgrade instead of letting the API server prune the rules. A `helm upgrade` that removes the last
+rule also removes an `enabled: false` set on the CR by hand. The
 [`spec.harness.eventWatcher` section of the CRD reference](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#specharnesseventwatcher)
 gives the rule parts, how they match, and an example.
 
@@ -1202,7 +1209,9 @@ The third, `kube-agents-a2a-gateway-pod`, is generated from
 `k8s-operator/config/admission/a2a-gateway-pod-policy.yaml`. It holds every pod
 the A2A gateway's ServiceAccount creates to the session pod shape: the session
 ServiceAccount, no automount, the session token audiences, no Secret or host
-access, Pod Security "restricted", and exactly the session labels. Where it is
+access, Pod Security "restricted", exactly the session labels, no runtime
+class, node selector, affinity or positive priority, and only the scheduler and
+tolerations the API server and GKE add. Where it is
 rendered, the chart also sets `A2A_GATEWAY_POD_POLICY=true` on the operator, a
 signal for operator features that must run only where this policy is installed.
 Setting `admissionPolicy.enabled=false` removes this policy and that signal too.

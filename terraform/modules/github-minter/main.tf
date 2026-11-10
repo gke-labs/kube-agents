@@ -2,6 +2,8 @@ resource "google_service_account" "minter" {
   project      = var.project_id
   account_id   = var.service_account_id
   display_name = "Kube-Agents GitHub Token Minter Service Account"
+  # Names the owning install; changing it is an in-place update.
+  description = var.owner_description
 }
 
 resource "google_service_account_iam_member" "workload_identity" {
@@ -35,6 +37,10 @@ resource "google_kms_crypto_key" "minter" {
 
   import_only                   = true
   skip_initial_version_creation = true
+
+  # The owning install, read by the installer's adoption step. Labels update in
+  # place, so adding them to an existing install's key replaces nothing.
+  labels = var.owner_labels
 }
 
 resource "google_kms_crypto_key_iam_member" "signer_verifier" {

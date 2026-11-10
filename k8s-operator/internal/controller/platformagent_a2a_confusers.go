@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"slices"
 	"strings"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -85,11 +86,17 @@ const (
 // every non-secret byte without covering a credential. Reading the Secret here
 // would put five real passwords back into the hashed input by a route the
 // digest's own guard test cannot see.
-func renderA2AStaticUsers(agent *agentv1alpha1.PlatformAgent, pw func(key string) string, account string) string {
+//
+// profiles are the bound AgentProfiles' names, whose supervisor subjects the
+// gateway is denied (gatewayProfileSupervisorDeny).
+func renderA2AStaticUsers(agent *agentv1alpha1.PlatformAgent, pw func(key string) string, account string, profiles []string) string {
 	var b strings.Builder
 	for _, id := range staticIdentities(agent) {
 		if id.account != account {
 			continue
+		}
+		if id.user == a2aGatewayUser {
+			id.denyPublish = append(slices.Clone(id.denyPublish), gatewayProfileSupervisorDeny(profiles)...)
 		}
 		b.WriteString(renderA2AStaticUser(id, pw))
 	}

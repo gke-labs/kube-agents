@@ -192,6 +192,14 @@ SOURCES: dict[str, Source] = {
         ("buildCredentialBrokerTokenReviewRole", "tokenreviews", "mcpRelayURLEnvVar", "mcpRelayPath =",
          "driftDetectorDefaultSubscription =", "credentialProxyWatcherAudience ="),
     ),
+    "kube_proxy_manifests_go": Source(
+        "k8s-operator/internal/controller/kube_proxy_manifests.go",
+        ("func buildKubeProxyDeployment(", "CREDENTIAL_PROXY_SESSION_AUDIENCE", "CREDENTIAL_PROXY_SESSION_CALLERS"),
+    ),
+    "k8s_api_proxy_main_go": Source(
+        "k8s-api-proxy/cmd/k8s-api-proxy/main.go",
+        ("sessionAudienceEnv", "sessionCallersEnv", "func parseSessionAudienceCallers("),
+    ),
     "manifest_helpers_go": Source(
         "k8s-operator/internal/controller/manifest_helpers.go",
         ("DefaultPlatformAgentVersion",),

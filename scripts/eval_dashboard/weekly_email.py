@@ -15,8 +15,8 @@ default the Sunday before today, UTC), and **last week** the seven before
 it. A night is dated as ``nightly.night_date`` dates it.
 
 **A counted night** ran to its verdict: none of its parts was cut off at
-the job deadline (``nightly.run_truncated``), it has both halves of the
-main matrix it owed (main, and main-b once that job runs: the night's
+the job deadline (``nightly.run_truncated``), it has every shard of the
+main matrix it owed (main, and main-b to main-e once those jobs run: the night's
 ``verdict_withheld_by``, as the digest reads it), and it is not a
 run-level event (``classify.is_run_event``: nearly every graded
 case failed). Two counted nights on one date are one night: per case the
@@ -312,8 +312,12 @@ ROWS_JOIN = "\n"
 WHY_CUT = "cut off"
 WHY_NO_MAIN = "no main part"
 WHY_NO_MAIN_B = "no main-b part"
-# The half of the main matrix a night lacks (``verdict_withheld_by``) -> why.
-WHY_NO_PART = {nightly.PART_MAIN: WHY_NO_MAIN, nightly.PART_MAIN_B: WHY_NO_MAIN_B}
+WHY_NO_MAIN_C = "no main-c part"
+WHY_NO_MAIN_D = "no main-d part"
+WHY_NO_MAIN_E = "no main-e part"
+# The shard of the main matrix a night lacks (``verdict_withheld_by``) -> why.
+WHY_NO_PART = {nightly.PART_MAIN: WHY_NO_MAIN, nightly.PART_MAIN_B: WHY_NO_MAIN_B, nightly.PART_MAIN_C: WHY_NO_MAIN_C,
+               nightly.PART_MAIN_D: WHY_NO_MAIN_D, nightly.PART_MAIN_E: WHY_NO_MAIN_E}
 WHY_RUN_EVENT = "nearly every scenario failed"
 WHY_NO_RUN = "no run on record"
 
@@ -333,7 +337,7 @@ CHAT_NO_TREND = "No week-over-week trend: only {counted} of {dates} nights count
 CHAT_NO_TREND_PREV = "No week-over-week trend: only {counted} of last week's {dates} nights counted ({why})."
 CHAT_LEFT_OUT = "{count} {why}"
 # Why a night is not counted, as the post words it.
-CHAT_WHY = {WHY_CUT: "cut off", WHY_NO_MAIN: "missing the main part", WHY_NO_MAIN_B: "missing the main-b part",
+CHAT_WHY = {WHY_CUT: "cut off", WHY_NO_MAIN: "missing the main part", WHY_NO_MAIN_B: "missing the main-b part", WHY_NO_MAIN_C: "missing the main-c part", WHY_NO_MAIN_D: "missing the main-d part", WHY_NO_MAIN_E: "missing the main-e part",
             WHY_RUN_EVENT: "failed run-wide", WHY_NO_RUN: "not run"}
 CHAT_ATTENTION_TITLE = "*Needs attention*"
 CHAT_ATTENTION_ITEM = "• {name}: {state}, <{url}|{bugs}>"
@@ -702,9 +706,9 @@ def bugs_url(repo: str, slug: str) -> str:
 
 def night_status(night: dict[str, dict], data: dict) -> str | None:
     """None for a counted night, else why it is left out. A night without a
-    half of the main matrix it owed is the night ``nightly`` withholds a
-    verdict for (``verdict_withheld_by``): no main part, or main-b missing
-    while main-b runs."""
+    shard of the main matrix it owed is the night ``nightly`` withholds a
+    verdict for (``verdict_withheld_by``): no main part, or another main
+    shard missing while its job runs."""
     parts = nightly.night_parts(night)
     if any(nightly.run_truncated(run) for run in parts):
         return WHY_CUT
