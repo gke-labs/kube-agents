@@ -2,11 +2,14 @@ package gateway
 
 import (
 	"errors"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
@@ -533,5 +536,37 @@ func TestCheckTargetScope_NoDeclarationRefusesEveryTarget(t *testing.T) {
 	}
 	if _, err := loadScope(filepath.Join(t.TempDir(), "absent.json")); !errors.Is(err, errNoScopeFile) {
 		t.Fatalf("loadScope(absent) = %v, want errNoScopeFile", err)
+	}
+}
+
+// A pin keeps capping its cluster's tier while the handoff is opt-in: a
+// specialist that keeps a pinned cluster's task runs only at a tier the pin
+// allows (#5435). Unattended is the tier above Read here; requesterTier
+// gives every person Read today, so the route is asked directly.
+func TestProfileRoute_ASpecialistOnAPinnedReadOnlyClusterIsRefusedAboveRead(t *testing.T) {
+	d := testDirectory()
+	d.put("tse", &lib.AgentCard{Name: "tse", Parameters: clusterParams, Tiers: []string{"read", "unattended"}})
+	d.put("prod-east", &lib.AgentCard{Name: "prod-east", Parameters: clusterParams, Tiers: []string{"read"},
+		ClusterRef: &lib.ClusterRef{ProjectID: "p1", Location: "us-east1", Cluster: "prod"}})
+	g := &Gateway{profiles: d, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+
+	_, err := g.profileRouteFor("tse", targetParams("p1", "us-east1", "prod"), capability.TierUnattended, "top")
+	if got := refusalOf(t, err); !strings.Contains(got, "pinned to prod-east, which doesn't allow tier unattended") {
+		t.Fatalf("refusal = %q", got)
+	}
+	prod := clusterTarget{Project: "p1", Location: "us-east1", Cluster: "prod"}
+	if err := g.checkPinnedTiers("tse", &prod, capability.TierRead); err != nil {
+		t.Fatalf("read on the pinned cluster: %v", err)
+	}
+	// An unpinned cluster has no pin to cap it.
+	dev := clusterTarget{Project: "p1", Location: "us-east1", Cluster: "dev"}
+	if err := g.checkPinnedTiers("tse", &dev, capability.TierUnattended); err != nil {
+		t.Fatalf("unattended on an unpinned cluster: %v", err)
+	}
+	// A pin's card from an operator that predates tiers caps nothing.
+	d.put("prod-east", &lib.AgentCard{Name: "prod-east", Parameters: clusterParams,
+		ClusterRef: &lib.ClusterRef{ProjectID: "p1", Location: "us-east1", Cluster: "prod"}})
+	if err := g.checkPinnedTiers("tse", &prod, capability.TierUnattended); err != nil {
+		t.Fatalf("a tierless pin: %v", err)
 	}
 }

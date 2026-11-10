@@ -222,10 +222,9 @@ own children (or a coordinator's children of the same profile).
 - **Which tier a task runs at.** A task runs at the requester's tier. Each AgentProfile lists
   the tiers it allows, and the dispatcher refuses a task whose tier the resolved profile
   doesn't allow (a pinned production profile might allow only Read). Tier is authority, so it
-  lives on the CR, never in the persona. A pin's tiers cap only the tasks it receives, which
-  are those addressed to it or to a profile that yields to it (`yieldToPinned`). A specialist
-  keeps a pinned cluster's tasks at its own tiers, so a tier limit for every task on one
-  cluster belongs in scope (`exclude.clusters`) or on each profile's tiers, not on a pin.
+  lives on the CR, never in the persona. A pin's tiers cap every task for its cluster: a
+  specialist that keeps a pinned cluster's task (it doesn't set `yieldToPinned`) keeps its
+  persona there, and the gateway refuses the task at a tier the pin doesn't allow.
 - **Membership:** which tier a human is in comes from a mapping on the PlatformAgent (groups or
   user ids to tier), defaulting to Read. Admission refuses a mapping that assigns Unattended to
   a human. In a multi-author thread, the task runs at the minimum tier across the authors,
