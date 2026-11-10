@@ -1559,7 +1559,7 @@ RESULT_SHAPE_RULE = (
 
 def roster_comment_lines(text: str):
     """(line number, comment text) for every comment in a roster file, the
-    parsed markers left out: `# part N` and the nightly's sorted-section marker."""
+    nightly's sorted-section marker left out."""
     for number, raw in enumerate(text.splitlines(), start=1):
         if "#" not in raw:
             continue
