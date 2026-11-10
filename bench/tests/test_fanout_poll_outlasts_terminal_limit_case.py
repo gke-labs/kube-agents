@@ -88,35 +88,35 @@ def _fanout(poll_result: str, cluster_result: str = PODS) -> list[dict[str, Any]
 
 
 def test_polling_that_finishes_passes():
-    assert _status(NOT_CUT, _fanout(SLEPT)) == "passed"
+    assert _status(NOT_CUT, _fanout(SLEPT)) == "pass"
 
 
 def test_a_polling_sleep_cut_at_60s_fails():
-    assert _status(NOT_CUT, _fanout(CUT)) == "failed"
+    assert _status(NOT_CUT, _fanout(CUT)) == "fail"
 
 
 def test_a_cluster_agent_command_cut_at_60s_fails():
     calls = _fanout(SLEPT)
     calls.insert(2, _call("card-a", 5.5, "python3 /opt/data/scripts/workload_triage.py", CUT, agent=CLUSTER_A))
-    assert _status(NOT_CUT, calls) == "failed"
+    assert _status(NOT_CUT, calls) == "fail"
 
 
 def test_a_cut_at_another_limit_is_not_the_defect():
     cut_at_180 = CUT.replace("60s", "180s")
-    assert _status(NOT_CUT, _fanout(cut_at_180)) == "passed"
+    assert _status(NOT_CUT, _fanout(cut_at_180)) == "pass"
 
 
 def test_a_run_that_never_polled_fails():
     calls = [c for c in _fanout(SLEPT) if not c["args"]["command"].startswith("sleep")]
-    assert _status(NOT_CUT, calls) == "failed"
+    assert _status(NOT_CUT, calls) == "fail"
 
 
 def test_a_sleep_behind_a_chain_counts_as_polling():
     calls = [c for c in _fanout(SLEPT) if not c["args"]["command"].startswith("sleep")]
     calls.append(_call("card-platform", 90.0, "echo waiting && sleep 60", SLEPT))
-    assert _status(NOT_CUT, calls) == "passed"
+    assert _status(NOT_CUT, calls) == "pass"
 
 
 def test_the_answer_needs_the_namespace_and_a_count():
-    assert _status(COUNTS, _fanout(SLEPT)) == "passed"
-    assert _status(COUNTS, _fanout(SLEPT), output="All clusters look fine.") == "failed"
+    assert _status(COUNTS, _fanout(SLEPT)) == "pass"
+    assert _status(COUNTS, _fanout(SLEPT), output="All clusters look fine.") == "fail"
