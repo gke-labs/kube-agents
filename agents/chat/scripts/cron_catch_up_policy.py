@@ -89,6 +89,7 @@ from cron_idle_policy import (
     next_occurrence,
     parse_timestamp,
     schedule_zone,
+    stamp,
 )
 
 # The step between released catch-ups, read from the ticker's environment,
@@ -215,18 +216,6 @@ def newest_slot(job: dict, stale: datetime, now: datetime, zone: tzinfo) -> date
         return _wall_clock_slot(expr, now + timedelta(seconds=1), zone, forward=False)
     except Exception:
         return None
-
-
-def _stamp(when: datetime, zone: tzinfo) -> str:
-    """``when`` as Hermes writes ``next_run_at``: in the profile's zone.
-
-    Hermes compares a due instant's stored offset with now's before it fires
-    and, when they differ and the stored wall clock reads later than now's,
-    re-anchors the job without firing (``_repair_timezone_shifted_cron``, a
-    timezone-migration repair). A UTC stamp in a zone west of UTC reads
-    exactly like that, so every slot this module writes is in the zone.
-    """
-    return when.astimezone(zone).isoformat()
 
 
 def _fmt(delta: timedelta) -> str:
@@ -445,7 +434,7 @@ def _apply_locked(
             if release_at == now:
                 continue  # the oldest miss fires on this tick, as Hermes has it
             if release_at < target:
-                target_text = _stamp(target, zone)
+                target_text = stamp(target, zone)
                 job["next_run_at"] = target_text
                 deferred[job_id] = {
                     "next_run_at": target_text,
@@ -459,7 +448,7 @@ def _apply_locked(
                 )
                 continue
             why = f"{how}, a catch-up {_fmt(release_at - now)} later would run at or after its next slot"
-        target_text = _stamp(target, zone)
+        target_text = stamp(target, zone)
         job["next_run_at"] = target_text
         changed = True
         lines.append(f"{label}: skipped the catch-up of {job_id}: {why}; next run {target_text}")

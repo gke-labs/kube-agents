@@ -26,7 +26,7 @@ import (
 )
 
 func TestParseAlertExclude(t *testing.T) {
-	rules, err := parseAlertExclude(`[
+	rules, err := parseAlertExclude(alertExcludeFlag, `[
 		{"namespace": "payments"},
 		{"reason": "FailedScheduling", "cluster": {"clusterName": "seeded-capacity"}},
 		{"cluster": {"projectId": "p", "location": "us-central1", "clusterName": "seeded-d"}},
@@ -43,7 +43,7 @@ func TestParseAlertExclude(t *testing.T) {
 	}
 
 	for _, raw := range []string{"", "  ", "[]"} {
-		rules, err := parseAlertExclude(raw)
+		rules, err := parseAlertExclude(alertExcludeFlag, raw)
 		if err != nil || len(rules) != 0 {
 			t.Errorf("parseAlertExclude(%q) = %v, %v; want no rules", raw, rules, err)
 		}
@@ -64,7 +64,7 @@ func TestParseAlertExcludeRefuses(t *testing.T) {
 		{"text after the list", `[{"namespace": "a"}] [{"namespace": "b"}]`, "text follows the list"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			rules, err := parseAlertExclude(tc.raw)
+			rules, err := parseAlertExclude(alertExcludeFlag, tc.raw)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("parseAlertExclude(%s) err = %v; want it to contain %q", tc.raw, err, tc.want)
 			}
@@ -350,5 +350,179 @@ func TestAlertExcludeRuleString(t *testing.T) {
 		if got := tc.rule.String(); got != tc.want {
 			t.Errorf("%+v.String() = %s, want %s", tc.rule, got, tc.want)
 		}
+	}
+}
+
+// --alert-exclude-file: a change puts its rules in force without a restart,
+// an unchanged file logs nothing again, and a malformed, unreadable or empty
+// change behaves as reloadAlertExcludeFile says.
+func TestReloadAlertExcludeFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rules.json")
+	write := func(text string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(text), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	inNamespace := func(ns string) TriageEvent {
+		ev := backoffEvent(10)
+		ev.Namespace = ns
+		return ev
+	}
+	f := alertExcludeFilter(nil)
+	m := newMetrics()
+
+	// At start: an empty file is no change and logs nothing.
+	write("")
+	buf := captureLog(t)
+	seen := reloadAlertExcludeFile(path, "", f, m)
+	if log := buf.String(); log != "" {
+		t.Errorf("an empty file at start logged:\n%s", log)
+	}
+	assertAlertExcludeGauges(t, m, 0, 0)
+
+	write(`[{"namespace": "payments"}]`)
+	buf = captureLog(t)
+	seen = reloadAlertExcludeFile(path, seen, f, m)
+	if got := f.Decide(inNamespace("payments")); got != gateAlertExcluded {
+		t.Errorf("after the first rule: gate %q; want %q", got, gateAlertExcluded)
+	}
+	for _, want := range []string{"read alert-exclude rules from " + path + ": 1 in force", `alert-exclude rule 1 of 1: namespace="payments"`} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("log does not carry %q:\n%s", want, buf.String())
+		}
+	}
+	assertAlertExcludeGauges(t, m, 1, 0)
+
+	buf = captureLog(t)
+	if again := reloadAlertExcludeFile(path, seen, f, m); again != seen || buf.String() != "" {
+		t.Errorf("an unchanged file was acted on again; log:\n%s", buf.String())
+	}
+
+	write(`[{"namespace": "shop"}]`)
+	seen = reloadAlertExcludeFile(path, seen, f, m)
+	if got := f.Decide(inNamespace("payments")); got == gateAlertExcluded {
+		t.Error("a removed rule still excludes")
+	}
+	if got := f.Decide(inNamespace("shop")); got != gateAlertExcluded {
+		t.Errorf("after the rule changed: gate %q; want %q", got, gateAlertExcluded)
+	}
+
+	t.Run("malformed keeps the rules in force", func(t *testing.T) {
+		write(`[{"namespace": "shop"}, {}]`)
+		buf := captureLog(t)
+		seen = reloadAlertExcludeFile(path, seen, f, m)
+		if got := f.Decide(inNamespace("shop")); got != gateAlertExcluded {
+			t.Errorf("a malformed change dropped the rules: gate %q", got)
+		}
+		if log := buf.String(); !strings.Contains(log, "ALERT --alert-exclude-file "+path+" rule 2 sets no part") || !strings.Contains(log, "the 1 alert-exclude rules in force before this change stay in force") {
+			t.Errorf("log:\n%s", log)
+		}
+		assertAlertExcludeGauges(t, m, 1, 1)
+	})
+	t.Run("unreadable keeps the rules in force and alerts once", func(t *testing.T) {
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+		buf := captureLog(t)
+		seen = reloadAlertExcludeFile(path, seen, f, m)
+		if !strings.Contains(buf.String(), "ALERT --alert-exclude-file: open "+path) || !strings.Contains(buf.String(), "stay in force") {
+			t.Errorf("log:\n%s", buf.String())
+		}
+		buf = captureLog(t)
+		seen = reloadAlertExcludeFile(path, seen, f, m)
+		if log := buf.String(); log != "" {
+			t.Errorf("the same read error logged again:\n%s", log)
+		}
+		if got := f.Decide(inNamespace("shop")); got != gateAlertExcluded {
+			t.Errorf("an unreadable file dropped the rules: gate %q", got)
+		}
+		assertAlertExcludeGauges(t, m, 1, 1)
+	})
+	t.Run("empty clears the rules", func(t *testing.T) {
+		write("")
+		seen = reloadAlertExcludeFile(path, seen, f, m)
+		if got := f.Decide(inNamespace("shop")); got == gateAlertExcluded {
+			t.Error("an empty file left a rule in force")
+		}
+		assertAlertExcludeGauges(t, m, 0, 0)
+	})
+}
+
+// A malformed file at start leaves the watcher with no rules, as a refused
+// --alert-exclude does.
+func TestReloadAlertExcludeFileRefusedAtStart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rules.json")
+	if err := os.WriteFile(path, []byte(`namespace=payments`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	buf := captureLog(t)
+	f := alertExcludeFilter(nil)
+	m := newMetrics()
+	reloadAlertExcludeFile(path, "", f, m)
+	if rules := f.alertExcludeRules(); len(rules) != 0 {
+		t.Errorf("rules in force = %v; want none", rules)
+	}
+	if log := buf.String(); !strings.Contains(log, "ALERT --alert-exclude-file "+path+" is not a JSON list of rules") || !strings.Contains(log, "running with no alert-exclude rules") {
+		t.Errorf("log:\n%s", log)
+	}
+	assertAlertExcludeGauges(t, m, 0, 1)
+}
+
+// startAlertExcludeFile puts the file's rules in force before it returns, and
+// then reads the file again every interval, so a change applies while the
+// watcher runs; with interval 0 it reads the file once.
+func TestStartAlertExcludeFile(t *testing.T) {
+	for name, tc := range map[string]struct {
+		interval time.Duration
+		reloads  bool
+	}{
+		"every interval": {time.Millisecond, true},
+		"once":           {0, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "rules.json")
+			write := func(text string) {
+				t.Helper()
+				if err := os.WriteFile(path, []byte(text), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			write(`[{"namespace": "payments"}]`)
+			captureLog(t)
+			f := alertExcludeFilter(nil)
+			m := newMetrics()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			startAlertExcludeFile(ctx, path, tc.interval, f, m)
+			if got := f.alertExcludeRules(); len(got) != 1 || got[0].Namespace != "payments" {
+				t.Fatalf("rules in force after the start read = %v; want the file's rule", got)
+			}
+			write(`[{"namespace": "shop"}, {"reason": "OOMKilled"}]`)
+			deadline := time.Now().Add(time.Second)
+			for len(f.alertExcludeRules()) != 2 && time.Now().Before(deadline) {
+				time.Sleep(time.Millisecond)
+			}
+			if reloaded := len(f.alertExcludeRules()) == 2; reloaded != tc.reloads {
+				t.Errorf("the changed file put in force = %v; want %v", reloaded, tc.reloads)
+			}
+		})
+	}
+}
+
+func TestParseFlags_AlertExcludeFile(t *testing.T) {
+	f, err := parseFlags([]string{"--alert-exclude-file", "/etc/rules.json"})
+	if err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
+	if f.alertExcludeFile != "/etc/rules.json" {
+		t.Errorf("alertExcludeFile = %q; want /etc/rules.json", f.alertExcludeFile)
+	}
+	both, err := parseFlags([]string{"--dry-run", "--cluster-name", "x", "--alert-exclude", `[{"namespace":"payments"}]`, "--alert-exclude-file", "/etc/rules.json"})
+	if err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
+	if err := both.validate(); err == nil || !strings.Contains(err.Error(), "not both") {
+		t.Errorf("both flags set: validate() = %v; want the not-both error", err)
 	}
 }

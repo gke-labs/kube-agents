@@ -2250,7 +2250,7 @@ func (r *PlatformAgentReconciler) ensureA2ACredsSecret(ctx context.Context, agen
 // the callout keypair would update the config Secret without rolling the
 // StatefulSet, leaving the server trusting an issuer nothing signs with any
 // more — every answer the callout gives refused, on a bus that looks healthy.
-func renderA2ANATSConf(agent *agentv1alpha1.PlatformAgent, pw func(key string) string, keys *a2aCalloutKeys) string {
+func renderA2ANATSConf(agent *agentv1alpha1.PlatformAgent, pw func(key string) string, keys *a2aCalloutKeys, profiles []string) string {
 	return a2aPostureComment + `
 
 server_name: ` + a2aNATSName(agent) + `
@@ -2395,7 +2395,7 @@ accounts {
       { stream: { account: APP, subject: "chat.board.reply.gateway.>" } }
     ]
     users [
-` + renderA2AStaticUsers(agent, pw, a2aAccountControl) + `    ]
+` + renderA2AStaticUsers(agent, pw, a2aAccountControl, profiles) + `    ]
   }
   # CONSOLE: the web console and MCP server, isolated from both TRUSTED and
   # APP so that neither can reach chat.console.*.in or chat.console.*.confirm.
@@ -2419,7 +2419,7 @@ accounts {
       { stream: { account: TRUSTED, subject: "_INBOX.console-mcp.>" } }
     ]
     users [
-` + renderA2AStaticUsers(agent, pw, a2aAccountConsole) + `    ]
+` + renderA2AStaticUsers(agent, pw, a2aAccountConsole, profiles) + `    ]
   }
   # APP: runtime executors and readers (session, agent, bridge, web, profile-*).
   APP {
@@ -2457,12 +2457,12 @@ accounts {
       { stream: { account: TRUSTED, subject: "_INBOX.web.>" } }
     ]
     users [
-` + renderA2AStaticUsers(agent, pw, a2aAccountApp) + `    ]
+` + renderA2AStaticUsers(agent, pw, a2aAccountApp, profiles) + `    ]
   }
   # $SYS: human operators and monitoring only; no agent authenticates here.
   SYS {
     users [
-` + renderA2AStaticUsers(agent, pw, a2aAccountSys) + `    ]
+` + renderA2AStaticUsers(agent, pw, a2aAccountSys, profiles) + `    ]
   }
 }
 system_account: SYS
@@ -2536,8 +2536,8 @@ authorization {
 // buildA2ANATSConfigSecret renders nats.conf with the real credentials from
 // the creds Secret. This Secret's Data is the one place the passwords are
 // meant to appear; a2aConfigRolloutHash covers the rest of the render.
-func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret, keys *a2aCalloutKeys) *corev1.Secret {
-	conf := renderA2ANATSConf(agent, func(key string) string { return string(creds.Data[key]) }, keys)
+func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret, keys *a2aCalloutKeys, profiles []string) *corev1.Secret {
+	conf := renderA2ANATSConf(agent, func(key string) string { return string(creds.Data[key]) }, keys, profiles)
 
 	return &corev1.Secret{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
@@ -2595,10 +2595,10 @@ func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.
 // one that the kubelet has already written into the mounted directory is not
 // served until the pod restarts. Until a reloader sends the reload signal
 // instead, a renewal rolls the bus once a year.
-func a2aConfigRolloutHash(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret, keys *a2aCalloutKeys, servingFingerprint string) string {
+func a2aConfigRolloutHash(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret, keys *a2aCalloutKeys, servingFingerprint string, profiles []string) string {
 	redacted := renderA2ANATSConf(agent, func(key string) string {
 		return fmt.Sprintf(a2aConfigHashPlaceholder, key)
-	}, keys)
+	}, keys, profiles)
 	sum := sha256.Sum256([]byte(redacted + a2aConfigHashRotationSeparator + creds.ResourceVersion +
 		a2aConfigHashRotationSeparator + servingFingerprint))
 	return hex.EncodeToString(sum[:])[:a2aConfigHashLength]
@@ -6125,7 +6125,14 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		a2aCalloutRolloutStalled(stalled, calloutGeneration) {
 		state.calloutStalled = stalled.Name
 	}
-	sts := buildA2ANATSStatefulSet(agent, a2aConfigRolloutHash(agent, creds, calloutKeys, natsTLS.ServingFingerprint))
+	// The profiles the dispatcher writes .supervisor for, for the gateway's
+	// deny on those subjects (gatewayProfileSupervisorDeny): the admitted
+	// ones and the ones still draining, the same names as the dispatcher's
+	// grant. A profile the controller refuses gets neither. In the config
+	// and its hash, so a profile admitted, removed or done draining rolls
+	// the bus.
+	profileNames, _ := dispatcherGrantNames(agent, profiles, draining)
+	sts := buildA2ANATSStatefulSet(agent, a2aConfigRolloutHash(agent, creds, calloutKeys, natsTLS.ServingFingerprint, profileNames))
 	busHeld, err := r.a2aBusWaitsForCallout(ctx, agent, sts, calloutGeneration)
 	if err != nil {
 		return state, err
@@ -6135,7 +6142,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		logf.FromContext(ctx).Info("holding the A2A bus on its current config until no auth callout pod of an older spec is left",
 			"statefulset", sts.Name, "callout", a2aCalloutName(agent))
 	} else {
-		config := buildA2ANATSConfigSecret(agent, creds, calloutKeys)
+		config := buildA2ANATSConfigSecret(agent, creds, calloutKeys, profileNames)
 		if err := ctrl.SetControllerReference(agent, config, r.Scheme); err != nil {
 			return state, err
 		}
