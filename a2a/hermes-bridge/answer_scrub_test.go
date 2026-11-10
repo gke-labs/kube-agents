@@ -1105,7 +1105,7 @@ func TestFailureTailsAreScrubbedBeforeTheCut(t *testing.T) {
 i=0
 while [ $i -lt 60 ]; do echo "SYNTHKEYBODYc3ludGhldGljLWtleS1ib2R5LWxpbmUtc3ludGhldGljLWtleS1i"; i=$((i+1)); done
 echo "-----END RSA PRIVATE KEY-----"
-{ printf 'password: Synth-'; head -c 3000 /dev/zero | tr '\0' 'q'; printf 'Z9tail\n'; } >&2
+{ i=0; while [ $i -lt 80 ]; do echo "stderr filler line $i ............................"; i=$((i+1)); done; printf 'password: Synth-'; head -c 3000 /dev/zero | tr '\0' 'q'; printf 'Z9tail\n'; } >&2
 exit 1`))
 	c := gatewayClient(t, url)
 	submit(t, c, "task-fail-cut", "doomed")
@@ -1117,7 +1117,7 @@ exit 1`))
 	if !strings.Contains(reason, "stdout tail: ") || !strings.Contains(reason, "stderr tail: ") || !strings.Contains(reason, "[redacted]") {
 		t.Errorf("terminal reason = %q, want both tails, scrubbed", reason)
 	}
-	if n := len(reason); n > stdoutTailBytes+stderrTailBytes+512 {
-		t.Errorf("terminal reason is %d bytes, want the tails still cut", n)
+	if _, errTail, _ := strings.Cut(reason, "; stderr tail: "); len(errTail) > stderrTailBytes || len(reason) > stdoutTailBytes+stderrTailBytes+512 {
+		t.Errorf("terminal reason is %d bytes, its stderr tail %d, want the tails still cut", len(reason), len(errTail))
 	}
 }

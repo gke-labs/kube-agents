@@ -576,6 +576,10 @@ func TestScrubInlineSecretsValuelessFlagBeforeACredentialFlag(t *testing.T) {
 		{"ldapsearch -x -W -w synthetic-pass-0001", "ldapsearch -x -W -w [redacted]"},
 		{"app --password=-synthetic-pass-0001", "app --password=[redacted]"},
 		{"app -password=-synthetic-pass-0001", "app -password=[redacted]"},
+		// A dash-leading value after = is read whole, past a comma or a
+		// bracket the key-value rule would stop at.
+		{"app --password=-synthetic,pass-0001 x", "app --password=[redacted] x"},
+		{"app -password=-synthetic)pass-0001 x", "app -password=[redacted] x"},
 	}
 	for _, tc := range cases {
 		if got := scrubInlineSecrets(tc.in); got != tc.want {
