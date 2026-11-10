@@ -6664,24 +6664,28 @@ def test_which_transport_failures_are_transient(raised, cause, transient):
 
 
 @pytest.mark.parametrize(
-    "forge, minted, noted",
-    [("github", True, True), ("github", False, False), ("gitlab", True, False)],
-    ids=["github-ci-token", "github-local-token", "gitlab"],
+    "forge, token_file, noted",
+    [("github", "ghs_fake\n", True), ("github", None, False), ("github", "", False), ("gitlab", "ghs_fake\n", False)],
+    ids=["github-ci-token", "github-local-token", "github-empty-file-beside-a-local-token", "gitlab"],
 )
-def test_a_rate_limit_is_noted_only_under_the_ci_grading_token_on_github(monkeypatch, tmp_path, forge, minted, noted):
+def test_a_rate_limit_is_noted_only_under_the_ci_grading_token_on_github(monkeypatch, tmp_path, forge, token_file, noted):
     """The CI token is the ledger App's, which the agent cannot spend. A local
-    token, or GitLab's (one user for both), can be the agent's own."""
+    token, or GitLab's (one user for both), can be the agent's own; so can
+    BENCH_GITHUB_TOKEN when the file holds no usable token and read_token
+    falls back to it."""
     monkeypatch.setenv(forges.FORGE_ENV_VAR, forge)
-    if minted:
-        (tmp_path / "t").write_text("ghs_fake\n")
-        monkeypatch.setenv(forges.GITHUB_TOKEN_FILE_ENV_VAR, str(tmp_path / "t"))
-    else:
+    monkeypatch.setenv("BENCH_GITHUB_TOKEN", "ghp_personal")
+    if token_file is None:
         monkeypatch.delenv(forges.GITHUB_TOKEN_FILE_ENV_VAR, raising=False)
+    else:
+        (tmp_path / "t").write_text(token_file)
+        monkeypatch.setenv(forges.GITHUB_TOKEN_FILE_ENV_VAR, str(tmp_path / "t"))
+    sent = forges.read_token(forges.forge_name())
     monkeypatch.setattr(verifiers, "_http_get_json", lambda url, tok, timeout: (429, {"message": "Retry later"}))
     seen: list[tuple[bool, str]] = []
     token = verifiers._forge_unavailable.set(seen)
     try:
-        assert verifiers._forge_get_json("https://forge.example/x", "t", 1.0)[0] == 429
+        assert verifiers._forge_get_json("https://forge.example/x", sent, 1.0)[0] == 429
     finally:
         verifiers._forge_unavailable.reset(token)
     assert seen == [(noted, "answered 429")]

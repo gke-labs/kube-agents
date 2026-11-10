@@ -68,6 +68,7 @@ __all__ = [
     "GITLAB_HOST_ENV_VAR",
     "GITLAB_TOKEN_ENV_VARS",
     "UnknownForge",
+    "file_token",
     "forge_name",
     "forge_ssl_context",
     "github_api_root",
@@ -210,13 +211,13 @@ def read_token(forge: str, environ: Mapping[str, str] | None = None) -> str | No
     token, and an embedded newline or a non-Latin-1 character would otherwise
     raise out of the HTTP request's header instead of grading."""
     env = _env(environ)
-    token = _file_token(forge, env)
+    token = file_token(forge, env)
     if token:
         return token
     return next((v for v in (env.get(n) for n in token_env_vars(forge)) if v), None)
 
 
-def _file_token(forge: str, env: Mapping[str, str]) -> str | None:
+def file_token(forge: str, env: Mapping[str, str]) -> str | None:
     """GITHUB_TOKEN_FILE_ENV_VAR's token when it names a file holding one."""
     token_file = env.get(GITHUB_TOKEN_FILE_ENV_VAR)
     if forge == FORGE_GITLAB or not token_file:
@@ -235,7 +236,7 @@ def token_source(forge: str, environ: Mapping[str, str] | None = None) -> str:
     the file when it supplied the token, else the first variable that is set
     (the forge's first variable when none is)."""
     env = _env(environ)
-    if _file_token(forge, env):
+    if file_token(forge, env):
         return f"the token in the file {GITHUB_TOKEN_FILE_ENV_VAR} names ({env[GITHUB_TOKEN_FILE_ENV_VAR]})"
     names = token_env_vars(forge)
     name = next((n for n in names if env.get(n)), names[0])

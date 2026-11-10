@@ -4160,8 +4160,10 @@ def _forge_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
         rate_limited = status == _HTTP_TOO_MANY_REQUESTS or (
             status == _HTTP_FORBIDDEN and isinstance(message, str) and bool(_RATE_LIMIT_MESSAGE_RE.search(message))
         )
-        grading_app = forges.forge_name() == forges.FORGE_GITHUB and bool(
-            os.environ.get(forges.GITHUB_TOKEN_FILE_ENV_VAR)
+        # The token this read sent, not the variable: read_token falls back
+        # to BENCH_GITHUB_TOKEN when the file holds no usable token.
+        grading_app = forges.forge_name() == forges.FORGE_GITHUB and token == forges.file_token(
+            forges.FORGE_GITHUB, os.environ
         )
         _note_forge_read(status >= _HTTP_SERVER_ERROR_FLOOR or (rate_limited and grading_app), f"answered {status}")
     return status, payload
