@@ -1,6 +1,6 @@
 ---
 name: fleet-audit
-description: Publish the findings of an autonomous fleet audit as one continuously-rewritten issue per audit stream on the GitOps repository's forge, and propose fixes as narrow remediation pull requests (merge requests on GitLab).
+description: Publish the findings of an autonomous fleet audit as one continuously-rewritten issue per audit stream per install on the GitOps repository's forge, and propose fixes as narrow remediation pull requests (merge requests on GitLab).
 ---
 
 # fleet-audit — Audit Findings to a Ledger Issue
@@ -8,9 +8,12 @@ description: Publish the findings of an autonomous fleet audit as one continuous
 Every autonomous audit watchdog ends the same way: findings must reach a human somewhere durable,
 reviewable, and de-duplicated. This skill is that ending, in two tiers:
 
-- **Tier 1 — the ledger.** Each audit stream owns **exactly one open issue** on the forge, rewritten in
-  full on every run and closed as completed when the fleet comes back clean. An operator watches one
-  issue per stream instead of drowning in chat logs.
+- **Tier 1 — the ledger.** Each audit stream owns **exactly one open issue per install** on the
+  forge, rewritten in full on every run and closed as completed when the fleet comes back clean. An
+  operator watches one issue per stream instead of drowning in chat logs. The ledger is found by
+  its `audit:<id>` label and, on an install whose host cluster the operator declared, its
+  `audit-scope:<slug>` label too, so two installs that audit different fleets into one repository
+  each keep their own ledger per stream; the install's host cluster name is in the title.
 - **Tier 2 — the fixes.** When a finding's remediation is a file in this repository, it travels
   separately as a **narrow pull request carrying only that fix**, linked back to the ledger.
 
@@ -46,7 +49,10 @@ watchdog — **not** a prettified form of the audit id:
 | `upgrade-retrospective`       | `[audit] Upgrade Retrospective — 7 findings (0 critical)`                      |
 
 The mapping lives in `AUDITS` at the top of `audit_report.py` and mirrors `cron/jobs.json`; a test
-fails if the two drift apart. Do not restate a title anywhere else.
+fails if the two drift apart. On an install with a ledger scope the human name is followed by the
+scope's name, the host cluster's, in parentheses:
+`[audit] Workload Reliability Audit (platform-host) — 7 findings (2 critical)`. Do not restate a
+title anywhere else.
 
 ## Run an audit
 
@@ -86,9 +92,13 @@ Run every script by its full path. A kanban worker starts in its card's workspac
    succeeded in this session, do not run it again. Every field: `references/lifecycle.md`.
 
 2. **Read the SOP at `sop` in full, then run its checks**, read-only, against every cluster in
-   scope. Where the SOP runs a collector, run it the way the SOP says. Append each check's slug and
+   scope. Where the SOP runs a collector, run it the way the SOP says, then `precheck` on its
+   manifest the way the SOP says: on a scheduled run whose collector found the fleet as the last
+   scheduled run left it, `precheck` closes the run itself from that run's stored document, its
+   JSON line is `finish`'s plus `precheck: unchanged`, and steps 3 and 4 are done; any other line
+   means the SOP continues. Append each check's slug and
    the exact command you issued to that cluster's `checks_run` as the check completes. Content-mode
-   reads (`grep`, `list`, `fetch`) and `draft`: `references/lifecycle.md`.
+   reads (`grep`, `list`, `fetch`), `draft` and `precheck`: `references/lifecycle.md`.
 3. **Write the findings document at `findings_path`.** On a stream whose SOP runs a collector,
    start it from the manifest with
    `/opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py draft --audit <audit-id> --manifest-file <manifest>`:
@@ -106,8 +116,8 @@ Run every script by its full path. A kanban worker starts in its card's workspac
      [--decline-fix <finding-id> "<why>" ...] [--no-promote] [--scheduled]
    ```
 
-   Pass `--scheduled` only when the cron prompt tells you to; never on a run a person asked for
-   (`references/finish.md`). Pass `--no-promote` when the card says not to open a pull request: the
+   Pass `--scheduled` to `precheck` and to `finish` only when the cron prompt tells you to; never on
+   a run a person asked for (`references/finish.md`). Pass `--no-promote` when the card says not to open a pull request: the
    ledger still publishes, no automatic remediation pull request opens on that run.
 
    Exit 0 published. Exit 2 (`FINDINGS REJECTED`) published nothing and kept the run yours: fix
@@ -116,7 +126,7 @@ Run every script by its full path. A kanban worker starts in its card's workspac
    fields, exit codes, partial coverage and no forge: `references/finish.md`.
 
 5. **Report.** On a scheduled run with `silent_ok: true`, the final response is exactly
-   `[SILENT]`. Otherwise report `issue_url` in full and every URL in `prs_opened` and
+   `[SILENT]`; a run `precheck` closed is reported from its line the same way. Otherwise report `issue_url` in full and every URL in `prs_opened` and
    `prs_still_open`; on `status: "NO_FORGE"` or `"STORE_LEDGER"` the report is `summary` verbatim.
    An on-demand run is never silent. Zero findings, `HELD` and `silent_ok`: `references/clean-run.md`.
 

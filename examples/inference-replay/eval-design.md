@@ -1,13 +1,16 @@
 # Inference replay for evals
 
-> **STATUS — proposal; measured; shadow mode built and on by default in CI.** A prototype proxy was run against a dev install on 2026-10-31 to 2026-11-02.
-> [`hack/replay-proxy/`](../../hack/replay-proxy/README.md) has the shadow-mode proxy, its
-> fingerprint log, the scrubbed request store, the hit-rate script and the CI collector; the chart
-> carries the proxy behind `litellm.replayShadow`, and `hack/ci-deploy.sh` and `hack/ci-eval-pr.sh`
-> deploy it on every Prow presubmit and nightly and copy its output to a private bucket in
-> `kube-agents-prow` (`EVAL_REPLAY_SHADOW=false` turns it off). The join with run
-> verdicts and the collision report (Rollout step 1) are not built yet. Shadow mode changes no
-> verdict.
+> **STATUS — proposal; measured; shadow mode on by default in CI; the replay lane wired into CI,
+> waiting on its bucket and its Prow job.** A prototype proxy was run against a dev install on 2026-10-31
+> to 2026-11-02, and the replay lane's modes on 2026-11-04 and 05 (see "Replay lane trials").
+> [`hack/replay-proxy/`](../../hack/replay-proxy/README.md) has the proxy with its shadow, record
+> and replay modes, its fingerprint log, the scrubbed request store, the hit-rate script, the lane's
+> report, the baseline report and the CI collector. The chart carries the proxy behind `litellm.replayShadow`, and
+> `hack/ci-deploy.sh` and `hack/ci-eval-pr.sh` deploy it in shadow mode on every Prow presubmit and
+> nightly and copy its output to a private bucket in `kube-agents-prow` (`EVAL_REPLAY_SHADOW=false`
+> turns it off). A nightly running as `eval-baseline-recorder` deploys it in record mode, and the
+> replay lane (`EVAL_REPLAY_LANE=true`) in replay mode: Rollout step 2 below says what is built. The
+> collision report (Rollout step 1) is not built yet. Shadow and record mode change no verdict.
 
 **Scope:** serving recorded model answers to eval runs whose model input has not changed, so a
 presubmit pays for inference only from the first point where a run differs from one already graded.
@@ -160,8 +163,42 @@ The rules that keep this safe:
   differ only in a signature count as the same. Only the `id` of an entry in a message's
   `tool_calls` list is treated this way, whatever its prefix (`call_…` from Gemini, `toolu_…` from
   Claude); any other `id` field, like a card or a cluster, goes through the normal rules.
-- **Answers are rewritten by whole token only, and never for bare numbers.** An unrelated `99`
-  in an answer must not become this run's row id.
+- **Answers are rewritten where the key found the value, and never for bare numbers.** Each kind
+  of identifier is found in an answer by the same pattern that found it in the request, so
+  `--id=t_…` or `~/.hermes/sessions/<session>/` in an answer is swapped wherever the key swapped
+  it. A tool call's JSON arguments are read as the key reads them, parsed first. Anything else the
+  request bound is swapped only where it is a whole token, and an unrelated `99` in an answer
+  never becomes this run's row id. Ages are never swapped into an answer (below).
+- **An answer that would keep an identifier isn't saved.** After the rewrite, if the answer still
+  holds an identifier or IP the request bound, anywhere, it isn't saved, because a replay would act
+  on the recording's card or pod. Nor is one that names an identifier the request never bound, like
+  a card that appears only in the recent-work digest the key drops: no placeholder could bring it
+  up to date. In the lane trials' 351 answers the first rule refused none and the second refused 8
+  (7 cards named only in the digest, 1 pod name no request held).
+- **A timestamp an answer copies is restored; one the model made isn't saved.** The key buckets
+  timestamps (below), but the mapping also keeps each timestamp's exact text and where it sat, in
+  order, outside the model's own messages. An answer quoting a timestamp the request holds
+  verbatim, usually from a tool's output, keeps a placeholder naming every place that text sat,
+  and is served with this run's timestamp from the same places, so the next request, which echoes
+  it, buckets the same as in the recording. Two requests with the same key have the same buckets
+  in the same places, so a place is the same field in both runs. If this run has different
+  timestamps in those places (the recording's start time equalled its last transition, this run's
+  are a second apart), the answer isn't served. An answer quoting a timestamp found nowhere in the
+  request isn't saved. In the
+  lane trials' 351 answers, 33 quoted a timestamp and are now restored, and 2 quoted one the
+  request doesn't hold (a date written on its own, and a reformatted time) and are refused.
+- **Ages are never put back, and an answer that repeats one isn't saved.** An age is a reading of
+  the clock: served as this run's, `--since 5m` after a pod aged `5m` would become `--since 3m`, and
+  a fixed "last 24h" that happened to equal an age would change too. In the lane trials' 351
+  answers this refused 20.
+- **An answer to a request that holds a secret read isn't saved.** If a tool call earlier in the
+  conversation printed a secret's value (`kubectl get secret … | base64 -d`), the answer could
+  repeat it in a form no scrubber recognises, so the conversation runs live from the read on. In
+  the lane trials 73 of 829 requests (10% of prompt tokens) came after a secret read.
+- **An answer's reasoning is checked and not kept.** Its reasoning text and thinking blocks are
+  scrubbed for credentials like the rest of the answer, and an answer whose reasoning holds one
+  isn't saved. `reasoning_content` isn't saved at all: the client never sends it back, so no later
+  key needs it. Thinking blocks are kept, since a client that sends them back keys on them.
 - **An answer that repeats a number we swapped isn't saved.** Some values are swapped in the
   request but can't safely be put back in an answer: bare numbers like a `pid`, a row `id`,
   `resourceVersion` or `generation`, and epoch timestamps, which become an unnumbered
@@ -175,12 +212,58 @@ The rules that keep this safe:
 - **Hermes' recent-work digest is dropped from the key.** Every card view ends with
   `## Recent work by @<assignee>`, the assignee's last five runs on other cards, so the first
   card read differs between otherwise identical runs. The same block leaks earlier repetitions'
-  answers into later ones, live or replayed (#1730). Stripping it is a stopgap; fixing #1730 removes
-  the need.
+  answers into later ones, live or replayed (#1730). Its heading goes too, with the blank line
+  before it: whether a view has a digest at all depends on whether the assignee happened to finish
+  another card first, so a view with one keys the same as a view without. What an answer must not
+  repeat from a dropped digest still counts, as for a dropped event below: its keyed numbers,
+  epoch times, ages and dates, and any run of seven or more hex digits it holds outside an
+  identifier (a commit written as plain hex), since no placeholder can bring them up to date.
+  Stripping it is a stopgap; fixing #1730 removes the need.
+- **A card's `queued` events are dropped from the key, like its heartbeats.** The dispatcher adds
+  one when the card waited for a free worker ("Queued: the system is busy", with how many were
+  running), so whether a card has one depends on what else was running. What an answer must not
+  repeat from a dropped heartbeat or queued event still counts. An answer isn't saved if it
+  repeats the event's epoch `created_at` or another keyed number, an age or a date in it, or one
+  of the numbers in its payload (`running`, `limit`, `ahead`). For a payload number, the answer
+  must repeat it either next to its key (`running: 4`) or anywhere in an answer that talks about
+  the queue ("queued", "ahead", "behind", "system is busy"). Refusing every answer that holds the
+  same small number would refuse about one answer in five after a queued card, and none of the
+  64,027 distinct assistant messages stored from the Nov 7 nightlies and presubmits mentions a
+  queued event.
+- **The eval pool project is an identifier.** Every Prow build leases its own GCP project,
+  `kube-agents-evals` or `kube-agents-evals-<n>`, and its name is in 94% of requests (Nov 7 shadow
+  data): the Cluster Agent's profile name (`cluster-kube-agents-evals-31-seeded-a-…`), the front
+  door's list of specialists, the GitOps repository (`gke-agentic/kube-agents-evals-31-infra`) and
+  tool results. So it is bound like a card ID, inside longer names too, and an answer that says
+  `--project=kube-agents-evals-31` is served with this run's project. A numbered name counts
+  wherever no letter or digit comes before it (`xkube-agents-evals-31` stays literal). The bare name
+  also starts names that are the same in every run and belong to no project
+  (`kube-agents-evals-token-minter`, `kube-agents-evals-large-gitops`), so it counts only on its own
+  or before `-infra`, `-seeded`, `-platform` or `-us`, the parts a pool project adds to its own
+  names; anything else stays literal. A name inside a URL counts after a percent-escape too
+  (`project_id%3D%22kube-agents-evals-22%22`). In a run in the bare project, an answer that names
+  one of those constant names still holds the project's name inside it and isn't saved.
+- **Other per-run names are identifiers too:** a repository's commit, written as
+  `owner/repo@<sha>` or in a forge URL (`/blob/<sha>/`), since each pool project's repository has
+  its own history; the fleet audit's clone directory, `declared-intent-` and eight random
+  characters; and a GKE operation ID (`operation-<epoch ms>-<uuid>`), whose type and status stay
+  literal. An answer that quotes a bound commit anywhere is served with this run's commit. One
+  that holds a longer or shorter form of it than the request does (`c99b1ab` for
+  `c99b1ab1fee8…`) isn't saved, since nothing binds that form.
+- **A time of day on its own is left as written.** A bare `13:44` is in 43% of requests, but
+  without a date it can't be turned into how far from now it is: it may be yesterday's, another
+  time zone's, or a duration (`ps` prints CPU time as `0:47`). Any token for it would give
+  different moments, or different durations, one key, so it stays literal and costs those matches.
+- **Where a warning line lands doesn't change the key.** The shell tool mixes a command's errors
+  and its normal output in whatever order they arrive. So the same `gcloud` command, with the same
+  output, put its `WARNING:` line before the JSON in one run and after it in the next, and that one
+  difference cost the obtainability case the rest of its conversation in the replay lane. When a text is one JSON document with `WARNING: ` lines before or after it (each with any indented lines that continue it), the key puts the warnings after the JSON. Any other text keeps its order, because there the order can mean something: `WARNING: disk pressure` then `Pod evicted` is not the same story told backwards. The text the agent sees isn't touched.
 
 Classes the prototype maps: UUID, Hermes session id, ISO timestamp, kanban task id, A2A task id,
 inject message id, GKE node name, pod name with ReplicaSet hash, IP, `pid`/`run_id`/numeric `id`/
-`resourceVersion`/`generation`, scratch file `_<epoch>_<pid>` suffixes, and ages. Epoch seconds
+`resourceVersion`/`generation`, scratch file `_<epoch>_<pid>` suffixes, and ages; the eval pool
+project, repository commits, the declared-intent clone directory and GKE operation IDs came later,
+from the Nov 7 shadow data. Epoch seconds
 become an unnumbered how-far-from-now time token rather than a numbered placeholder, because two
 events in one second would otherwise shift every later number. The measurements found two gaps,
 `ls -l` dates (`Nov  2 04:13`) and Hermes' terminal-output cache file suffixes (`…-89b0.log`); the
@@ -226,13 +309,70 @@ We also checked that replay stops reusing recorded answers when something real h
 Editing a skill only matters for runs that open that skill (with `skill_view`); in our test the
 agent never opened the edited skill, so that edit showed nothing.
 
-Wall clock barely moved (1–2 minutes a run): sandboxed tool calls, the dispatcher, the fan-out
+In those minutes-later replays, wall clock barely moved (1–2 minutes a run): sandboxed tool calls, the dispatcher, the fan-out
 `sleep` loop and the judge are not model calls. The win is tokens, model time and rate-limit
 pressure.
 
 An earlier offline estimate from nightly trajectories (56–70% if prompts are unchanged) compared
 kanban results on status fields only, which hid the recent-work digest; the live numbers above
 replace it.
+
+### Replay lane trials
+
+The table above replays a recording minutes later. To test what the replay lane would do, we ran
+the lane's record and replay modes on the same dev install (2026-11-04 and 05, `gemini-4-argon`, the
+inject door, as the presubmit runs). Four cases were recorded once, the way the nightly would, and
+then each was replayed three times. "Reused" is the share of prompt tokens served from saved
+answers instead of the model.
+
+Between the two trials we fixed one cause of misses. The model sometimes answers the same request
+in two different ways that do the same thing, such as looking up its own kanban card with no
+arguments one time and with its card's id the next. The cache had saved only one of the two, so a
+replay that got the other answer missed from then on. The fix lets replay accept either answer, as
+long as a recording really gave it ("Different words for the same answer" has the rules).
+
+| Case (share reused)                          | First trial | Second trial, after that fix |
+| -------------------------------------------- | ----------- | ---------------------------- |
+| `chat-routing-own-cluster-namespaces`        | 88%         | 85%                          |
+| `obtainability-design-quota-vs-capacity`     | 32–45%      | 31%                          |
+| `provisioning-cluster-request-never-creates` | 12–19%      | 66%                          |
+| A health check fanned out to every cluster   | 10–12%      | 80%                          |
+| **All four together**                        | **23%**     | **63%**                      |
+
+The second column is the first replay pass of the second trial. Its other two passes reused
+nothing, for the midnight reason below. Of its 63%, 10 points (26 of the fleet case's 80) were six
+requests of one conversation served through the second key described under "Different words for the
+same answer". The trial ran that key with the earlier answers' tool calls blanked whole; the key as
+it now stands, with only `kanban_show`'s arguments blanked, serves the same six requests (checked
+offline against the trial's saved requests, with each recorded answer noted and checked the way the
+proxy now does).
+
+Every run passed, recordings and replays. And every replayed conversation that was served saved
+answers got the same pass or fail as the run it reused them from: 33 of 33 conversations in the
+first trial and 11 of 11 in the second (the second counts only its first pass, the one before
+midnight). A run holds several conversations, one per agent. A pass of the four cases also took about 24 minutes replayed against 42 recorded. That includes
+the trial's own waits between cases, so it's an upper bound on the time saved, not a measurement.
+
+What the trials taught us:
+
+- **A miss spreads between agents.** When one agent's request misses, the model writes fresh text,
+  and every agent that reads it (a Cluster Agent reading the card the platform agent wrote) misses
+  from its first step. Most of the first trial's loss was this.
+- **The model answers the same request in different words.** Every worker's opening request is the
+  same once IDs are swapped ("work kanban task ⟦TASK⟧"), and the model sometimes looked its card up
+  with no arguments and sometimes with the task id. The cache kept the first answer and served it to
+  every worker, so a case whose recording took the other answer never matched again. Every fork
+  the second trial served through the second key was this one: the same tool, different arguments,
+  no words on either side. None differed in words alone. `kanban_show` only reads, so the second key
+  ignores its arguments and still serves this fork; for any other tool, arguments count ("Different
+  words for the same answer").
+- **The day changes the key.** Every system prompt says which day the conversation started. The
+  second trial's last two passes ran after midnight UTC and reused nothing, because every request
+  now said Thursday where the recording said Wednesday. In CI the nightly records one day and
+  presubmits run the next, so this would have stopped almost every hit. The date is now keyed by how many days it is from the request's own day, not by its name
+  (see "Normalization").
+- **Small output differences matter.** A `gcloud` warning that landed before the JSON in one run and
+  after it in the next ended a conversation (fixed in "Normalization").
 
 ## Design for CI
 
@@ -415,31 +555,50 @@ Agents don't ask for a specific model. They send the name
 `model-default`, and LiteLLM decides which model that means and how hard it thinks. LiteLLM also
 edits requests with a few plugins (for example, one that strips old thinking text). So a pull
 request that changes any of that sends exactly the same requests as before, and without extra care
-it would get answers from the old setup. To stop that, the key also includes a fingerprint of
-LiteLLM's config, the LiteLLM image version, and the normalizer's version hash.
-
-The config fingerprint covers what changes the answer and leaves out how the request gets to the
-model. It covers the model name, the settings sent with each request (maximum tokens, thinking or
-reasoning effort, the backup model, which parameters are dropped), and the plugins that change what
-the model is sent or what comes back (the thinking-text and cache-marker strippers, and redaction
-with its rules). It treats LiteLLM's two routes to Google's Gemini models as one, so
-`vertex_ai/gemini-4-argon` and `gemini/gemini-4-argon` count as the same model; any other provider,
-and the server address of an OpenAI-compatible endpoint, stay in. It leaves out the gateway's
-timeout and retry settings and the plugins that only export telemetry, fetch a credential or pick a
-serving replica. The nightlies reach Gemini through the Gemini Developer API and the presubmits
-through Vertex AI; with the provider in the fingerprint, no presubmit could ever find a nightly's
-answer. Once both call the model through one API, the key goes back to the whole config, the
-`checksum/config` annotation that rolls the LiteLLM pods. The chart computes the fingerprint
-(`kube-agents.replayModelBehaviourChecksum` in `charts/kube-agents/templates/_helpers.tpl`) and
-gives it to the proxy as `REPLAY_MODEL_BEHAVIOUR_CHECKSUM`.
+it would get answers from the old setup. To stop that, the key also includes LiteLLM's config
+fingerprint (the chart already keeps one, in the `checksum/config` annotation), the LiteLLM image
+version, and the normalizer's version hash. The config includes the provider route, so moving a
+model between the Gemini Developer API and Vertex AI counts as a model change. The nightly and
+presubmit eval jobs each set their provider in their own Prow job config, kept equal by hand, so if
+the two ever diverge, their replay keys stop matching: that is safe, but replay then serves nothing
+across the lanes.
 
 **Backup-model answers are never saved.** LiteLLM can be set up with a backup it uses when the main
 model fails. The backup is the same model with less thinking, so the model name in the reply looks
 the same either way. But LiteLLM adds headers to each reply saying what happened:
 `x-litellm-model-group` says which setup answered, and `x-litellm-attempted-fallbacks` says whether
 it fell back (see [the gateway page](../../docs/site/src/content/docs/concepts/inference-gateway.md)).
-The proxy only saves an answer when it came from the main setup with no fallback. Our prototype
-didn't check these headers, so this part hasn't been tested yet.
+The proxy only saves an answer when it came from the main setup with no fallback, and never counts
+a fallback's answer as one a recording gave (see the next section). Its tests cover a reply that
+fell back and one from another setup; no live run has fallen back yet.
+
+**Different words for the same answer.** The model doesn't always word an answer the same way: one
+run says "Let me check the card" before a tool call and the next says nothing. The cache keeps one
+answer per request, so if a case's recording took the other wording, the next request (which
+includes that answer) never matches its recording, and the agents after it miss too.
+
+So the proxy also files each saved answer under a second key, where the words of the model's own
+earlier answers are left blank. Their tool calls stay in the key: the tool's name always, and its
+arguments too unless the tool is on a short list of tools that only read. A tool goes on that list
+only when its source shows that calling it changes nothing, with any arguments. Today the list is
+`kanban_show`, which reads a card and writes nothing. A worker that called `kanban_show()` in one
+run and `kanban_show(task_id=…)` for its own card in the next did the same thing, and the card it
+got back is in the key either way. A request
+that misses on the exact key can still be served from the second one, but only if:
+
+- every earlier answer in it is one the model really gave to that same point in a recording, and
+  that the proxy itself recorded and could have stored: never one the client wrote into the history,
+  and never an answer from a fallback;
+- the agent did the same things: every tool call matches by name, and by arguments unless the tool
+  only reads. A different action that happened to get the same output (`{"ok": true}` from
+  completing a card rather than commenting on it) is still a miss, and so is any other tool called
+  with different arguments;
+- everything the tools returned still matches exactly, since tool results stay in the key;
+- every value the saved answer names (a pod, a card) also appears outside the model's own earlier
+  answers. Otherwise that value's placeholder could point at something else in this run.
+
+Each served line says which key it matched, so the lane reports how much of the reuse came from
+this.
 
 ### How a pull request run finds an answer
 
@@ -493,11 +652,15 @@ and the merge copy takes only the merged pull request's last passing presubmit.
 **Telling the runs in a build apart.** One presubmit build isn't one run. It's about 45 runs (around
 15 cases, three times each) going at the same time on the same install, and a build can pass while
 some of those runs fail. Requests don't say which run they belong to, but we can work it out after
-the run with data we already have. Every request names the kanban card it's working on (a worker's
-first message is "work kanban task t\_…"), or the A2A task ID for the front door. Each run's
-`results.json` already lists the cards and task IDs that run used, and whether it passed. So the
-copy job can match each saved answer to its card, the card to its run, and the run to pass or fail,
-and copy only the passing ones.
+the run with data we already have. A worker's request names the card it's working on (its first
+message is "work kanban task t\_…"), and a front door's request names the cards it created (what
+its `kanban_create` calls returned). Each run's `results.json` lists the cards its workers worked,
+and whether it passed. So the copy job can match each saved answer to its card, the card to its
+run, and the run to pass or fail, and copy only the passing ones. A front door's first request
+names no card at all, only the case's prompt, and the board reads before its first card name none
+either. Each is matched through the requests that came after it: an answer is copied when a chain
+of requests, each going on from exactly the answer before it, reaches a request naming a passing
+run's card.
 
 Each case runs three times. Ideally each of the three would replay its own recording, so we still
 get three different samples instead of one sample three times. That needs the proxy to know the run
@@ -516,10 +679,43 @@ already run the affected cases on the new prompt, so its answers go into the cac
 merges, and the pull requests after it get hits. The nightly fills in cases no recent pull request
 ran.
 
-### The nightly stays live
+### How we keep testing the model's randomness
 
-The nightly never replays. It's what measures each case's real pass rate, which the dashboard and
-the blocking roster rely on, and replay would make those numbers look better than they are.
+The same case doesn't always do the same thing: the model can pick a different tool, word its
+answer differently, or take another path. That randomness is part of what our evals test. A case
+that passes 2 out of 3 times on `main` is telling us something real. Replay hides it, because a
+replayed run repeats what the recording did.
+
+**Our plan: the nightly always runs live, and presubmits replay.** The nightly never replays. It
+measures each case's real pass rate every night, which the dashboard and the blocking roster rely
+on. Replay would make those numbers look better than they are. Presubmits replay what they can,
+because what a presubmit asks is narrower: did this pull request break something? A case the pull
+request touches (its prompt, its skill, its code path) misses the cache and runs live anyway. A
+case it doesn't touch replays, and that's the point: its flakiness isn't this pull request's
+fault, and today it's what makes unrelated pull requests go red.
+
+The alternatives we looked at:
+
+- **Presubmits replay, plus a new live eval at merge time.** Every merged change would get a live
+  run of the cases, in the merge queue or right after merge.
+  - Pros: a change that makes a case flaky is caught on that change, not up to a day later in the
+    nightly; and the blame is clear.
+  - Cons: a second full eval for every merge, which is about what replay saves. In the merge queue
+    it adds 1.5 to 3.5 hours to every merge; after merge it only finds problems once they're on
+    `main`, which is what the nightly already does. It also takes more eval projects from the pool,
+    which is already the bottleneck.
+- **Keep one of the three presubmit runs live.** Each case would run once live and twice from
+  replay.
+  - Pros: every pull request still samples the real model, so a pull request that changes how the
+    model behaves on a case it didn't touch still has a chance to show it.
+  - Cons: it saves only about two thirds of what full replay saves, and the live run brings back
+    the flake reds replay is meant to remove. The gate's "all three runs failed" rule would mean
+    something different for that run.
+
+We chose the nightly because it's already there, it costs nothing extra, and it already answers
+"how random is this case on `main`?". The price is that a change which makes the model's behaviour
+flakier on cases it didn't touch shows up the next morning instead of on the pull request. If
+shadow mode or the lane shows that happens often, keeping one run live is the cheapest fix.
 
 ## What changes for the gate
 
@@ -565,7 +761,20 @@ before stage 3 of the rollout (turning replay on):
    live answer, while under replay it would be the saved one. That changes more than the answer
    itself:
    - the next request contains the live answer, so exact matches stop after the model's first
-     reply. The **simulated** estimate ignores the model's own replies to get past this;
+     reply. The **replayed** estimates (low and high, from the same sources) get past this: a
+     request counts when its settings and every message that isn't one of the model's replies
+     match an allowed recording, position by position. Only replies the logs show the model gave
+     in that conversation count as replies (an earlier request of the same build asked for exactly
+     that point, compared by hashes that don't drift as the conversation grows); an assistant
+     message the client wrote itself, such as a few-shot example or a prefill, must match. They're
+     still estimates: shadow mode can't hold the next two points fixed, so those still count as
+     misses here, and they judge each request alone, while a real replay stops at the conversation's
+     first miss. They also read low where a live reply names a new ID, IP or CIDR, which shifts how
+     later messages are keyed. For the high one's misses, the script adds up tokens by the role of
+     the first message no recording matched, replies' words aside, which is where normalizer work
+     pays. Two labels aren't roles: `assistant` means no recording matched at a reply's position
+     (none had a reply there, or the message was the client's and differed), and `none` means a
+     longer recording passes through but none stopped there;
    - in a multi-agent run, one agent's answer becomes another agent's input: the card text the
      platform agent writes is what the Cluster Agent reads. Under replay that text would match;
      in shadow mode it's worded differently every run;
@@ -575,12 +784,13 @@ before stage 3 of the rollout (turning replay on):
 
    The dev-install dry run (2026-11-04, `gemini-4-argon`, four phases standing in for a nightly,
    two builds of one pull request and a second pull request) showed how big the gap is: the
-   simulated estimate was 12%, ignoring other agents' kanban text as well raised it to 22%, and most
-   of the remaining misses were tool results after a differently chosen action. Real record and
-   replay of the same cases, in "Measurements", reused 46–100%. So the deciding measurement comes
-   from real replay, in the replay lane below. Shadow mode stays for what only it can measure: how
-   often pull requests start on a saved recording at all (prompt changes, project rotation), and the
-   stored text for normalizer work.
+   replayed estimate (then called simulated) was 12%, ignoring other agents' kanban text as well
+   raised it to 22%, and most of the remaining misses were tool results after a differently chosen
+   action. Real record and replay, in "Measurements", reused 46–100% when replayed minutes later
+   and 23% then 63% in the replay lane trials. So the deciding measurement comes from real replay,
+   in the replay lane below. Shadow mode stays for what only it can measure: how often pull
+   requests start on a saved recording at all (prompt changes, project rotation), and the stored
+   text for normalizer work.
 
    Shadow mode also checks that hits would be safe, not just how many there are. For each request
    it logs a hash of the model's live answer, and once the run is done, whether that run passed. For
@@ -590,21 +800,46 @@ before stage 3 of the rollout (turning replay on):
    collision report is a bar for stage 3. This stage needs no shared cache and no new permissions
    inside the cluster.
 
+   Two weeks of shadow data also freeze the baseline that replay is measured against: tokens,
+   cache hits, estimated cost, model time, 429s, retries and fallbacks, and pass rates, per job kind
+   and per build, from `hack/replay-proxy/baseline_report.py`. The window starts on the first full
+   UTC day after the proxy began logging LiteLLM's cost, retries, model name and reasoning and
+   cache-write tokens, so that nightlies and presubmits log every field the report compares from
+   its first line; days before that would show those figures as missing. Replay is not switched on
+   anywhere until that report is saved, and every report after it comes from the same script with
+   `--compare`, so before and after are measured the same way.
+
 2. **A replay lane that gates nothing.** Real replay can't run in the presubmit or the nightly
    without changing their results, so it gets its own job: a periodic, non-blocking job that runs a
    set of cases on `main`'s code with replay on, served from the nightly's recordings. Its results
    don't block anything and aren't written to the evidence store. For this the nightly saves its
    answers, keyed by fingerprint, as the trusted writer in "Who can write to the cache"; the lane
    only reads them. For each conversation it records
-   how many messages and tokens were replayed before the first miss, what caused that miss (the
-   proxy has the cache, so it logs the closest saved request and the message and field that
-   differed), and whether the run's verdict matched the live nightly's. Every miss here is real: a
+   how many messages and tokens were replayed before the first miss, what caused that miss (the proxy has the cache, so it logs the closest saved request, which message first differed, and
+   short cleaned-up snippets of both sides), and whether the run's verdict matched the live nightly's. Every miss here is real: a
    normalizer gap to fix, or a real difference in the cluster or the code. Because a conversation
    runs live after its first miss, each one tells us its first miss only, which is what replay would
    actually save.
 
    Run it on a dev install first, with a few cases recorded and replayed several times, to check the
-   mechanics; then as the periodic job for the measurement week. The estimate the decision rests on
+   mechanics; then as the periodic job for the measurement week.
+
+   **Built:** the dev-install runs ("Replay lane trials"), the CI wiring
+   ([`hack/replay-proxy/README.md`](../../hack/replay-proxy/README.md#record-and-replay-the-replay-lane))
+   and the bucket ([`docs/ci-pool-projects.md`](../../docs/ci-pool-projects.md)). A nightly running
+   as `eval-baseline-recorder` records, and uploads the answers whose runs passed to a bucket only
+   that account can write. It works out which run each answer came from after the fact, from the
+   cards each request and each run's results name ("Telling the runs in a build apart"). A
+   periodic on `main`, at 06:00 UTC, replays the previous nights' complete recordings plus
+   tonight's partial ones, gating nothing. It reports what was
+   served before each first miss, the miss causes, and each case's verdicts beside the nightly's.
+   The bucket's grants say who uploaded, not that nothing touched the night. A presubmit leased
+   into the same pool project as a running nightly can reach the nightly's proxy, or the LiteLLM
+   behind it, with the Prow runner's `roles/container.admin`, and the nightly then publishes what
+   they hold ("Who can write to the cache" names this). That doesn't matter while the lane only
+   measures. It must be closed before replay gates anything (stage 3), for example by recording
+   only on projects no presubmit can lease. **Not built:** the periodic's Prow job, in
+   `oss-test-infra`; the merge copy job and a pull request's own saved answers. The estimate the decision rests on
    combines both: what replay saves per conversation (this lane) times how often pull request
    conversations start on a saved recording (shadow mode).
 
@@ -614,6 +849,29 @@ before stage 3 of the rollout (turning replay on):
    #1730 is fixed (or they're happy with stripping the recent-work section from the key).
 4. **Look at polling.** If shadow mode shows most of the remaining misses come from the `sleep 60`
    polling loop, fix the polling rather than the cache.
+
+### Why a staged rollout and not an A/B test
+
+Another way to roll out would be an A/B test: turn replay on for, say, 30% of presubmits, leave the
+rest live, and compare the two groups.
+
+- Pros: it measures real pull request traffic, not a test job; both groups run at the same time,
+  against the same model and the same flaky cases, so the comparison is fair; and only 30% of pull
+  requests carry the risk.
+- Cons:
+  - Whether a pull request replays would be a coin flip, so the same change could pass in one group
+    and fail in the other. Authors would see the gate behave differently for no reason they can see.
+  - Different pull requests change different things, so the two groups never run the same work.
+    Evals are noisy and slow, so telling a real difference from noise would take weeks.
+  - It doesn't save any work: before even 30% of presubmits can replay, we need everything stage 3
+    needs (the shared cache, who can write to it, and the gate rules).
+
+Our staged plan answers the same questions without touching anyone's pull request until we know:
+shadow mode measures how often pull requests could hit, at no risk; the replay lane replays the nightly's own recordings of the same cases on `main`'s code, which is the like-for-like comparison an A/B test
+can't give; and only then do presubmits turn on. Its weakness is that the lane isn't real pull
+request traffic, and stage 3 turns replay on for everyone at once. If we want a ramp at stage 3, we
+would turn replay on case by case rather than by coin flip: the same cases replay for every pull
+request, so the gate stays fair, and we add cases as each one's lane results hold up.
 
 ## Open questions
 
@@ -625,6 +883,8 @@ before stage 3 of the rollout (turning replay on):
   input as before. The judge takes 11 to 19% of a run's time. The same key rules would apply.
 - **How do we keep a pull request's answers safe until it merges?** See "The tricky part" above. We
   need to check the two options and pick one before stage 3.
+- **Why does the obtainability case reuse so little?** It stayed at 31–45% in both trials while the
+  others improved. There is likely another fork or normalizer gap like the ones above.
 - **How big does the cache get, and when do entries expire?** Answers recorded for an old version of
   a prompt can never be hit again, so entries should expire by age. Expiry also limits one thing the
   key can't see: a model update on the provider's side (Vertex) doesn't change our requests or our

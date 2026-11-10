@@ -27,8 +27,6 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`): agent c
 - `bench/`: Evaluation harness running [kubernetes-sigs/devops-bench](https://github.com/kubernetes-sigs/devops-bench) against the Platform Agent.
 - `images.json`: Inventory of every container image an install pulls, with its upstream reference
   and pin; read by `make mirror-images`, the kustomize deploy targets, and the docs generator.
-- `INSTALL.md`: Installation guide.
-- `README.md`: Project overview.
 
 ## Where Tests Go
 
@@ -55,10 +53,9 @@ A new Python test directory only runs if a `PYTHON_TEST_DIRS` glob in the `Makef
 
 ## Agent Setup & Integration
 
-This repository is mostly configuration and documentation for AI agents, plus the Go modules in
-`k8s-operator/` and `a2a/`. Follow [INSTALL.md](INSTALL.md) to set up and register the Platform
-Agent; [docs/site/src/content/docs/](docs/site/src/content/docs/) has the architecture, concepts,
-and operational guides.
+Follow [INSTALL.md](INSTALL.md) to set up and register the Platform Agent;
+[docs/site/src/content/docs/](docs/site/src/content/docs/) has the architecture, concepts, and
+operational guides.
 
 ## Before Starting a Task
 
@@ -78,7 +75,6 @@ drift check in
 [`docs/pull-request-workflow.md`](docs/pull-request-workflow.md#measure-how-far-a-branch-has-drifted-from-main).
 If it lists a file, rebase onto `upstream/main` and re-read those files before writing more; if it
 lists nothing, being behind is a merge-conflict risk to settle later, not a reason to stop.
-[`CONTRIBUTING.md`](CONTRIBUTING.md) points here rather than restating this.
 
 ### Check whether someone is already doing it
 
@@ -157,7 +153,7 @@ Rules (see also [`.agents/rules/documentation.md`](.agents/rules/documentation.m
   lists (`SKILL.md` excepted per `.agents/skills/skill-review/SKILL.md`).
 
 Run `make docs-check` before pushing: generated regions, links/anchors/reachability, terminology,
-site audience, site prose, the context budget, and the PR template's sections.
+site audience, site prose, the context budget, the PR template's sections, and upgrade-table labels.
 
 ## Contributing as an agent
 
@@ -207,10 +203,13 @@ user" clauses here. Agents with a user in the loop follow this file.
   into the chart in step.
 - **Expect an automated review after opening a PR** from `kube-agents-bot`; see
   [Automated Review After Opening a Pull Request](#automated-review-after-opening-a-pull-request).
+- **Quarantine a flaky test, don't re-run it**, once a product race is ruled out and an owner named;
+  never a conformance or security test without a security approver
+  ([how](docs/pull-request-workflow.md#quarantining-a-flaky-test)).
 - **Leave no conversation unanswered.** Open threads block merge and keep the PR counted as
-  [its author's outstanding work](docs/pull-request-workflow.md#who-owns-an-open-pull-request), a
-  declined bot thread excepted (below). Reply first, then resolve every addressed thread per
-  [`docs/pull-request-workflow.md`](docs/pull-request-workflow.md#resolving-conversations).
+  [its author's outstanding work](docs/pull-request-workflow.md#who-owns-an-open-pull-request).
+  Reply first, then resolve every addressed thread
+  ([how](docs/pull-request-workflow.md#resolving-conversations)).
 - **You do not merge it; the merge queue does** once a reviewer's `lgtm` and an `OWNERS` approver's
   `approved` are present and required checks pass. Never post `/lgtm` or `/approve` on someone's behalf unless
   asked. Mechanics: [`docs/pull-request-workflow.md`](docs/pull-request-workflow.md#how-a-change-merges).
@@ -286,14 +285,15 @@ fix, before any `/review`; a skipped live run is written `Not live-tested: <what
 why no install reaches it>`; a description ask repeated after your reply is a dispute for the human
 reviewer, not another edit.
 
-**Resolve a thread** only when **fully confident the issue is addressed**: the fix is on the PR head
+**Resolve a thread** when **fully confident the issue is addressed**: the fix is on the PR head
 with its commit named, or the finding is factually wrong against `main` (not a stale checkout) and
-you have said why. A judgment call, a declined ask, or an unanswered rebuttal stays open with a
-reply; resolving does not end a disagreement. A declined `kube-agents-bot` finding stays open until
-a human rules on it (an approval, or a reply accepting the decline; one asking for the fix owes it),
-then you resolve it citing the ruling; with a user in the loop you may resolve it once your reply
-and **Self-Review** give the reason, bar the description thread, but prefer not to. Reply first: a
-resolved thread collapses, and the reply is the only record a reviewer may see.
+you have said why. Resolve a `kube-agents-bot` finding you decline or defer once your reply gives
+the reason (and any follow-up issue) and **Self-Review** names it, and the description thread once
+the body is edited: an open thread hides the PR from its reviewer
+([why](docs/pull-request-workflow.md#who-owns-an-open-pull-request)). Unresolve it if a reviewer
+asks for the fix. A person's thread is different: a judgment call, a declined ask, or an unanswered
+rebuttal stays open with a reply; resolving does not end a disagreement. Reply first:
+a resolved thread collapses, and the reply is the only record a reviewer may see.
 
 ## Before Reviewing Someone Else's Pull Request
 

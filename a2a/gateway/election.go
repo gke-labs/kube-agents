@@ -37,9 +37,9 @@ const (
 	// relayStopDrainTimeout, sized to the pod's grace period.
 	lostLeaseRelayDrain = 5 * time.Second
 
-	// relayAckWait is the relay durable's AckWait. The relay creates or
-	// updates its durable with none on every bind, so it's always the
-	// server's default.
+	// relayAckWait is the relay durable's AckWait. Nothing sets one: the
+	// provision Job makes the durable without it (and a gateway run without
+	// the operator creates it the same way), so it's the server's default.
 	relayAckWait = 30 * time.Second
 
 	// releasedLeaseSeconds is the duration a released lease records, as
@@ -93,9 +93,37 @@ type Leader interface {
 // after lead returns and only if this replica still holds it, so a standby
 // takes over from a gateway that has stopped.
 //
+// A term start that gave up on the bus (errTermBusGaveUp) doesn't end Run:
+// the lease is released as on any other stop, and this replica stands back
+// for a lease's duration and campaigns again. A standby whose bus works
+// takes the lease meanwhile; with none, this replica retakes it. Exiting
+// instead would put every replica on a down bus into CrashLoopBackOff, and
+// the bus coming back would then wait on the kubelet's backoff.
+//
 // Run returns nil when ctx ended, ErrLeadershipLost when the lease was lost
 // or a write was fenced, and otherwise the error that stopped lead.
 func (e Election) Run(ctx context.Context, leader Leader, lead func(context.Context, RunOptions) error) error {
+	for {
+		err := e.campaign(ctx, leader, lead)
+		if !errors.Is(err, errTermBusGaveUp) || ctx.Err() != nil {
+			return err
+		}
+		standBack := orDefault(e.LeaseDuration, electionLeaseDuration) + 2*orDefault(e.RetryPeriod, electionRetryPeriod)
+		log := e.Log
+		if log == nil {
+			log = slog.Default()
+		}
+		log.Warn("gateway election: standing back before campaigning again, so a replica whose bus answers can lead", "lease", e.Lease, "for", standBack)
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(standBack):
+		}
+	}
+}
+
+// campaign is one campaign for the lease and at most one term (Run).
+func (e Election) campaign(ctx context.Context, leader Leader, lead func(context.Context, RunOptions) error) error {
 	log := e.Log
 	if log == nil {
 		log = slog.Default()
@@ -298,19 +326,26 @@ func (l *observingLock) Get(ctx context.Context) (*resourcelock.LeaderElectionRe
 
 func (l *observingLock) Create(ctx context.Context, rec resourcelock.LeaderElectionRecord) error {
 	err := l.Interface.Create(ctx, rec)
-	l.wrote(err)
+	l.wrote(err, rec.HolderIdentity)
 	return err
 }
 
 func (l *observingLock) Update(ctx context.Context, rec resourcelock.LeaderElectionRecord) error {
 	err := l.Interface.Update(ctx, rec)
-	l.wrote(err)
+	l.wrote(err, rec.HolderIdentity)
 	return err
 }
 
-func (l *observingLock) wrote(err error) {
+// wrote records a write. A successful one also updates the view: client-go
+// renews by writing without reading first, so a replica that has just taken
+// the lease would otherwise keep the holder it read before taking it, and
+// answer readiness as a standby (ElectedReadiness).
+func (l *observingLock) wrote(err error, holder string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if err == nil && l.view != nil {
+		l.view.set(holder)
+	}
 	if err != nil || l.took {
 		return
 	}

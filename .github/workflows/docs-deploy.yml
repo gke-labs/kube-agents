@@ -163,8 +163,45 @@ jobs:
       id-token: write
     environment:
       name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+      # A first attempt refused at create sets no page_url, so the retry's stands in.
+      url: ${{ steps.deployment.outputs.page_url || steps.deployment-retry.outputs.page_url }}
+    # The Pages deploy runs once more if its first attempt fails. From
+    # 2026-08-06 to 2026-11-06 the first attempt failed in 12 of 782 runs,
+    # each in the Pages service after a green build:
+    #
+    #   - five reached the action's ten-minute timeout, which is also the
+    #     longest it accepts (`Timeout reached, aborting!`);
+    #   - four were refused at create while Pages still held an earlier
+    #     deployment as in progress (`Please cancel <sha> first`), three of
+    #     them after that deployment had timed out and been cancelled;
+    #   - two got a 5xx at create, and one `Deployment failed, try again later.`
+    #
+    # A hand re-run 43 seconds after one of the timeouts passed in 17 seconds.
+    # A failure that outlasts the pause fails both attempts, and a later run
+    # redeploys. The concurrency group above already keeps two runs from
+    # deploying at once.
+    #
+    # The pause step logs a warning annotation and a line in the job summary,
+    # so an attempt that needed the retry stays visible.
+    # tests/test_docs_deploy_retry.py holds the retry.
+    env:
+      RETRY_PAUSE_SECONDS: "60"
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
+        continue-on-error: true
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+
+      - name: Wait before retrying Deploy to GitHub Pages
+        if: steps.deployment.outcome == 'failure'
+        env:
+          FAILED_STEP: Deploy to GitHub Pages
+        run: |
+          echo "::warning::${FAILED_STEP} failed on its first attempt; retrying once in ${RETRY_PAUSE_SECONDS}s"
+          echo "- ${FAILED_STEP}: first attempt failed, retried once" >> "$GITHUB_STEP_SUMMARY"
+          sleep "$RETRY_PAUSE_SECONDS"
+
+      - name: Deploy to GitHub Pages (retry)
+        id: deployment-retry
+        if: steps.deployment.outcome == 'failure'
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

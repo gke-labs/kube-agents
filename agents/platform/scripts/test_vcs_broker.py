@@ -1,9 +1,8 @@
 """Tests for the broker-side version-control routes.
 
-`clone` and `publish` run against a real `git` and real local repositories, for
-the reason `test_content_workspace.py` gives: the properties being asserted are
-properties of what git does with a bundle, and a mock would assert what this file
-believes git does. The forge is the seam that makes that possible — a test forge
+`clone` and `publish` run against a real `git` and real local repositories: the
+properties being asserted are properties of what git does with a bundle, and a
+mock would assert what this file believes git does. The forge is the seam that makes that possible — a test forge
 registered in the host allowlist points `clone_url` at a directory, so the same
 code path that would reach github.com reaches a bare repository on disk.
 
@@ -3922,6 +3921,117 @@ class SnapshotTest(unittest.TestCase):
         self.assertTrue([argv for argv, _ in self.calls if "ls-tree" in argv])
         self.assertEqual([], list(self.scratch.iterdir()))
 
+    def _listing_for(self, paths: list[str] | None) -> str:
+        """The `ls-tree` listing a snapshot of ``paths`` measures, under a ceiling it fits."""
+        listings = []
+
+        def recording(argv, cwd, check=True, config=(), *, allow_http=False, stop=None):
+            done = git_runner(argv, cwd, check, config)
+            if "ls-tree" in argv:
+                listings.append(done.stdout)
+            return done
+
+        broker = VcsBroker(self.scratch, git_runner=recording)
+        broker.registry.hosts["local.test"] = self.forge
+        broker.snapshot({"repository": self.REPOSITORY, **({"paths": paths} if paths else {})})
+        return listings[0]
+
+    def test_a_tree_over_the_ceiling_is_refused_with_its_top_level_entries(self):
+        self.push_tree({f"zeros/{index}.bin": b"\0" * (1 << 20) for index in range(4)})
+        self.broker.max_snapshot_bytes = 1 << 20
+        with self.assertRaises(WorkspaceError) as caught:
+            self.broker.snapshot({"repository": self.REPOSITORY})
+        fields = caught.exception.fields
+        self.assertEqual(1 << 20, fields["ceiling"])
+        # The commit measured, as `PATH_NOT_FOUND` carries it.
+        self.assertEqual(git(self.seed, "rev-parse", "HEAD").stdout.strip(), fields["revision"])
+        self.assertEqual(
+            [("README.md", "blob"), ("manifests", "tree"), ("run.sh", "blob"), ("zeros", "tree")],
+            [(entry["path"], entry["type"]) for entry in fields["entries"]],
+        )
+        # Each entry's bytes is what a snapshot of it alone measures, so a
+        # caller knows which parts fit before it asks for them.
+        for entry in fields["entries"]:
+            with self.subTest(entry=entry["path"]):
+                self.assertEqual(vcs_broker._tar_bytes(self._listing_for([entry["path"]])), entry["bytes"])
+        self.assertEqual(
+            {"README.md": 0, "manifests": 1, "run.sh": 0, "zeros": 0},
+            {entry["path"]: entry["manifests"] for entry in fields["entries"]},
+        )
+        by_path = {entry["path"]: entry["bytes"] for entry in fields["entries"]}
+        self.assertGreater(by_path["zeros"], 1 << 20)
+        self.assertLess(by_path["manifests"], 1 << 20)
+
+    def test_files_past_max_bytes_are_refused_with_the_entries(self):
+        self.push_tree({f"zeros/{index}.bin": b"\0" * (1 << 20) for index in range(4)})
+        self.broker.max_snapshot_bytes = 64 << 20
+        with self.assertRaises(WorkspaceError) as caught:
+            self.broker.snapshot({"repository": self.REPOSITORY, "maxBytes": 1 << 20})
+        fields = caught.exception.fields
+        self.assertEqual(("SNAPSHOT_TOO_LARGE", 64 << 20), (fields["code"], fields["ceiling"]))
+        self.assertIn("zeros", [entry["path"] for entry in fields["entries"]])
+        self.assertIn("the caller unpacks at most", str(caught.exception))
+
+    def test_max_bytes_bounds_the_files_not_the_tar(self):
+        # Many small files: the tar's headers and padding pass the bound, the
+        # files do not, so the caller would have taken it and still does.
+        self.push_tree({f"small/{index}.txt": b"x" * 10 for index in range(50)})
+        self.broker.max_snapshot_bytes = 64 << 20
+        listing = self._listing_for([])
+        self.assertGreater(vcs_broker._tar_bytes(listing), 8192)
+        self.assertLess(vcs_broker._unpacked_bytes(listing), 8192)
+        answer = self.broker.snapshot({"repository": self.REPOSITORY, "maxBytes": 8192})
+        self.assertTrue(answer["archiveBase64"])
+
+    def test_max_bytes_above_the_ceiling_changes_nothing(self):
+        self.push_tree({f"zeros/{index}.bin": b"\0" * (1 << 20) for index in range(4)})
+        self.broker.max_snapshot_bytes = 1 << 20
+        with self.assertRaises(WorkspaceError) as caught:
+            self.broker.snapshot({"repository": self.REPOSITORY, "maxBytes": 64 << 20})
+        self.assertEqual(1 << 20, caught.exception.fields["ceiling"])
+        self.assertIn("1048576-byte ceiling", str(caught.exception))
+
+    def test_max_bytes_that_is_not_a_whole_number_is_refused(self):
+        for raw in (-1, "1024", True, 1.5):
+            with self.subTest(raw=raw), self.assertRaises(WorkspaceError) as caught:
+                self.broker.snapshot({"repository": self.REPOSITORY, "maxBytes": raw})
+            self.assertIn("maxBytes", str(caught.exception))
+
+    def test_with_paths_the_entries_are_the_children_of_each_asked_path(self):
+        self.push_tree({
+            **{f"deep/zeros/{index}.bin": b"\0" * (1 << 20) for index in range(2)},
+            "deep/zeros/sub/a.yaml": b"kind: x\n",
+        })
+        os.symlink("sub/a.yaml", self.seed / "deep/zeros/link.yaml")
+        git(self.seed, "add", "-A")
+        git(self.seed, "commit", "--quiet", "-m", "link")
+        git(self.seed, "push", "--quiet", "origin", "HEAD:refs/heads/main")
+        self.broker.max_snapshot_bytes = 1 << 20
+        with self.assertRaises(WorkspaceError) as caught:
+            self.broker.snapshot({"repository": self.REPOSITORY, "paths": ["deep/zeros", "README.md"]})
+        entries = caught.exception.fields["entries"]
+        self.assertEqual(
+            [
+                ("README.md", "blob"), ("deep/zeros/0.bin", "blob"), ("deep/zeros/1.bin", "blob"),
+                ("deep/zeros/link.yaml", "blob"), ("deep/zeros/sub", "tree"),
+            ],
+            [(entry["path"], entry["type"]) for entry in entries],
+        )
+        # A link named like a manifest counts, so the caller sees it and can say it skipped it.
+        self.assertEqual([0, 0, 0, 1, 1], [entry["manifests"] for entry in entries])
+        # The parent directories `ls-tree` and `archive` add are in each measure.
+        for entry in entries:
+            with self.subTest(entry=entry["path"]):
+                self.assertEqual(vcs_broker._tar_bytes(self._listing_for([entry["path"]])), entry["bytes"])
+
+    def test_past_the_entry_cap_the_refusal_carries_no_entries(self):
+        self.broker.max_snapshot_bytes = 1
+        with mock.patch.object(vcs_broker, "MAX_SNAPSHOT_ENTRIES", 1), self.assertRaises(WorkspaceError) as caught:
+            self.broker.snapshot({"repository": self.REPOSITORY})
+        self.assertEqual("SNAPSHOT_TOO_LARGE", caught.exception.fields["code"])
+        self.assertNotIn("entries", caught.exception.fields)
+        self.assertEqual(1, caught.exception.fields["ceiling"])
+
     def test_the_measure_is_never_under_the_tar_and_close_to_it(self):
         # Long names and a long link target take pax headers; a directory
         # entry ends in `/`; a blob at two paths is in the tar twice.
@@ -3971,6 +4081,8 @@ class SnapshotTest(unittest.TestCase):
         with self.assertRaises(WorkspaceError) as caught:
             broker.snapshot({"repository": self.REPOSITORY})
         self.assertEqual((413, "SNAPSHOT_TOO_LARGE"), (caught.exception.status, caught.exception.fields.get("code")))
+        # A partial listing names no entries: their measures would be partial too.
+        self.assertNotIn("entries", caught.exception.fields)
         self.assertFalse([argv for argv, _ in self.calls if "archive" in argv])
         self.assertEqual([], list(self.scratch.iterdir()))
 
@@ -3979,6 +4091,7 @@ class SnapshotTest(unittest.TestCase):
         with mock.patch.object(vcs_broker, "_tar_bytes", return_value=0), self.assertRaises(WorkspaceError) as caught:
             self.broker.snapshot({"repository": self.REPOSITORY})
         self.assertEqual((413, "SNAPSHOT_TOO_LARGE"), (caught.exception.status, caught.exception.fields.get("code")))
+        self.assertEqual(self.main_tip, caught.exception.fields["revision"])
         self.assertTrue([argv for argv, _ in self.calls if "archive" in argv])
         self.assertEqual([], list(self.scratch.iterdir()))
 

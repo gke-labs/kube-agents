@@ -9,6 +9,7 @@ import (
 	"maps"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -615,5 +616,86 @@ func TestWithNote(t *testing.T) {
 		if _, step := nextStep(got); strings.Contains(in, "[next:") && step != "check seeded-a" {
 			t.Errorf("withNote(%q) lost the step: nextStep = %q", in, step)
 		}
+	}
+}
+
+// A turn that files a card ends at its acknowledgement unless it came from
+// the console, MCP or the A2A door: neither a chat turn whose route the store
+// refused nor a turn with no chat conversation (the eval inject lane) holds
+// its task open while the card runs. Holding them dropped the agent's own
+// report of the card's result from the answer (#5170); the A2A door holds
+// again (#5180).
+func TestAPI_OnlyAConsoleOrA2ADoorTurnHoldsItsTaskWhileItsCardRuns(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 not on PATH; the kanban fixture needs it")
+	}
+	t.Setenv(slackUXEnv, "")
+	const shared = "pod-wide-activity-key"
+	for _, tc := range []struct {
+		name, conversation string
+		storeStatus        int
+		holds              bool
+	}{
+		{"no-conversation", "", http.StatusOK, false},
+		{"route-refused", "gchat:spaces/A/threads/B", http.StatusBadRequest, false},
+		{"console", "console:tab-1", http.StatusOK, true},
+		{"a2a-door", "a2a:caller-1:ctx-hold", http.StatusOK, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			contextID := "ctx-hold-" + tc.name
+			// A card on the session that keeps running.
+			db := filepath.Join(t.TempDir(), "kanban.db")
+			initScript := `
+import sqlite3, sys, time
+db, sess = sys.argv[1], sys.argv[2]
+now = time.time()
+c = sqlite3.connect(db)
+c.executescript("""
+CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, status TEXT, assignee TEXT, creator_session_id TEXT,
+  result TEXT, last_failure_error TEXT, created_at REAL, updated_at REAL, parent_id TEXT);
+CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, summary TEXT, error TEXT, session_id TEXT, verdict TEXT, metadata TEXT);
+CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT);
+""")
+c.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?)",
+  ("t_hold1", "Check prod-a", "running", "cluster-diagnostics", sess, "", "", now, now, None))
+c.commit()
+`
+			if out, err := exec.Command("python3", "-c", initScript, db, apiSessionID(contextID)).CombinedOutput(); err != nil {
+				t.Fatalf("init db: %v\n%s", err, out)
+			}
+			t.Setenv(hermesKanbanDBEnv, db)
+			_, url := startServer(t)
+			store := newRouteStore(t, tc.storeStatus)
+			var door atomic.Value
+			stub := newAPIStub(t, func(w http.ResponseWriter, r *http.Request, c apiCall) {
+				u := door.Load().(string)
+				postDelivery(t, u, shared, c.sessionID, hookPreToolCall, kanbanCreateTool, "call_1")
+				postDelivery(t, u, shared, c.sessionID, hookPostToolCall, kanbanCreateTool, "call_1")
+				writeCompletion(w, c.sessionID, "Filed a card for prod-a.")
+			})
+			b := startAPIBridge(t, url, stub, func(cfg *Config) {
+				cfg.ActivityListen = "127.0.0.1:0"
+				cfg.ActivitySecret = shared
+				cfg.RouteURL, cfg.RouteKey = store.srv.URL, "kv-key"
+			})
+			door.Store(b.ActivityURL())
+			c := gatewayClient(t, url)
+			submitFrom(t, c, "task-"+tc.name, contextID, tc.conversation, "check prod-a")
+			if tc.holds {
+				time.Sleep(3 * time.Second)
+				got, err := c.TasksGet(testCtx(t), "platform", "task-"+tc.name)
+				if err != nil {
+					t.Fatalf("read the console task: %v", err)
+				}
+				if got.Final {
+					t.Fatalf("a %s turn ended while its card runs: %+v", tc.name, got.State)
+				}
+				return
+			}
+			task := waitTerminalFor(t, c, "task-"+tc.name, 5*time.Second)
+			if task.State != lib.StateCompleted {
+				t.Fatalf("state = %s, want completed at the acknowledgement", task.State)
+			}
+		})
 	}
 }

@@ -999,10 +999,11 @@ gives each setting's meaning and default. Alert excludes are under
 incident, while their clusters stay in scope for reads. The list is forwarded to the CR's
 `spec.harness.eventWatcher.alertExclude` when it has a rule, and an empty list omits it. The schema
 holds the CRD's bounds (at most 64 rules, a length limit and a pattern on each part), so a rule the
-API server would refuse fails the render. A change rolls the agent pod. On an existing install,
-apply the chart's `crds/` first: against a CRD that predates the field, the chart fails the upgrade
-instead of letting the API server prune the rules. A `helm upgrade` that removes the last rule also
-removes an `enabled: false` set on the CR by hand. The
+API server would refuse fails the render. A change is in force within about two minutes, without a
+pod restart (at the next pod restart if the agent image is older than the operator). On an existing
+install, apply the chart's `crds/` first: against a CRD that predates the field, the chart fails the
+upgrade instead of letting the API server prune the rules. A `helm upgrade` that removes the last
+rule also removes an `enabled: false` set on the CR by hand. The
 [`spec.harness.eventWatcher` section of the CRD reference](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#specharnesseventwatcher)
 gives the rule parts, how they match, and an example.
 
@@ -1202,7 +1203,9 @@ The third, `kube-agents-a2a-gateway-pod`, is generated from
 `k8s-operator/config/admission/a2a-gateway-pod-policy.yaml`. It holds every pod
 the A2A gateway's ServiceAccount creates to the session pod shape: the session
 ServiceAccount, no automount, the session token audiences, no Secret or host
-access, Pod Security "restricted", and exactly the session labels. Where it is
+access, Pod Security "restricted", exactly the session labels, no runtime
+class, node selector, affinity or positive priority, and only the scheduler and
+tolerations the API server and GKE add. Where it is
 rendered, the chart also sets `A2A_GATEWAY_POD_POLICY=true` on the operator, a
 signal for operator features that must run only where this policy is installed.
 Setting `admissionPolicy.enabled=false` removes this policy and that signal too.
@@ -1213,8 +1216,9 @@ web console and its environment page are on. It holds the console's
 ServiceAccount to its own annotations and `spec.integration.forges`,
 `repositories` and `github` on the PlatformAgent, and refuses any other change it
 makes. Inside `forges`, the console may not move an existing forge's credential to
-another host, add a forge with a credential, add a GitHub forge at a new host, or
-change the install's GitHub host.
+another host or change the account it acts as, add a forge with a credential, add a GitHub forge at a new host, or
+change the install's GitHub host. While the `PlatformAgent` has a forge the operator
+refuses, the console may not add, remove or reorder forges until an administrator fixes it.
 
 The templates check `.Capabilities.KubeVersion` as well as this value, so on a
 cluster below Kubernetes 1.30 — where the policy API is not yet `v1` — it
@@ -1286,16 +1290,30 @@ It also counts the standing pods the operator renders only behind an operator fl
 listed with their sizes in `files/flagged-pods.yaml`: the MCP server's pod when `A2A_MCP_DOOR`
 is `true` (set by `operator.mcpServer.enabled` or `operator.extraEnv`, the latter winning),
 and the profile dispatcher's when `A2A_DISPATCHER_IMAGE` is set to anything but blank. A flag set in a form the chart cannot read (a `valueFrom`, a non-string value) counts
-as on. An operator test holds that file to the operator's own list and sizes. The mode is read from the values, so a mode set
+as on. An operator test holds that file to the operator's own list and sizes. It counts the A2A gateway at two pods, the operator's default under its
+election, with one gateway pod of surge room for a rollout, unless `operator.extraEnv` sets
+`A2A_GATEWAY_ELECTION` to `false`. It also counts the
+scope publisher's Job pod, sized in `files/transient-pods.yaml`, which the operator starts every
+15 minutes, one at a time, where the gateway pod admission policy is on (rendered by the chart,
+or `A2A_GATEWAY_POD_POLICY` set through `operator.extraEnv`) and `platformAgent.scope` names a
+folder, organization, Shared VPC host or Metrics Scope. A list added to the `PlatformAgent` by
+hand is not seen. The footprint summary prices that pod as if it ran all month, as it does the
+provisioning Job, so it overstates both. The mode is read from the values, so a mode set
 on the `PlatformAgent` by hand while `platformAgent.mode` stays null is counted as `today`.
 The session pods a next install spawns on demand are not counted; the operator caps those with
 a `ResourceQuota` of its own, sized above the session cap by the pods it runs, the chart's own
 pods with the surge pods each one's rollout can add, from its `maxSurge` (which the chart stamps on the
-`PlatformAgent` as `kubeagents.x-k8s.io/a2a-quota-chart-pods`; 5 for a CR without it)
-and a margin of 7. With `platformAgent.enabled=false` the chart renders no `PlatformAgent`,
-so a next-mode one written by hand in the release namespace must carry that annotation
-itself, with the figure `helm template` stamps for the same values; without it the quota
-counts 5 for the chart's pods however many the release runs.
+`PlatformAgent` as `kubeagents.x-k8s.io/a2a-quota-chart-pods`; 5 for a CR without it, unless the ConfigMap or workloads below apply)
+and a margin of 7. With `platformAgent.enabled=false` the chart renders no `PlatformAgent`, and instead renders
+the same count in a ConfigMap, `a2a-quota-chart-pods`, in the release namespace, which the
+operator reads for a next-mode one written by hand there. The operator reads it from its own namespace only. For a
+hand-written CR in any other namespace, such as beside a release with `operator.enabled=false`, it counts the chart's
+Deployments and StatefulSets there (those labelled `app.kubernetes.io/managed-by: Helm` and
+`app.kubernetes.io/part-of: kube-agents`) at their replicas and rollout surge pods, as the chart does. An annotation on
+the CR still wins. A count past the cap of 64, unreadable, or missing from the ConfigMap counts 5 instead and records an
+`A2AQuotaChartPodsDiscarded` Warning naming it, as does a failed read of the workloads. The operator reads the
+ConfigMap and the workloads on each reconcile but doesn't watch them, so a changed count reaches the quota on the next
+reconcile, which can be the operator's periodic one.
 The one value it will not guess is `hindsight.postgresql.storage`: the schema permits
 `null`, a claim sized from it would be counted as zero, so an empty one fails the check
 by name.
@@ -1347,7 +1365,7 @@ does nothing under `helm template` and nothing in a namespace with no ResourceQu
 clean render in either case is not evidence that a quota fits. Its sum still runs there: the
 footprint summary below calls the same template on every render while `quotaPreflight.enabled`
 is on, so an input the sum refuses (an empty `hindsight.postgresql.storage`, a quantity it
-cannot parse, a damaged `footprint.yaml`) stops a quota-less render and `helm template` too,
+cannot parse, a damaged `footprint.yaml`, or under `platformAgent.mode: next` a damaged `flagged-pods.yaml` or `transient-pods.yaml`) stops a quota-less render and `helm template` too,
 and `--set quotaPreflight.enabled=false` lifts the summary with the check.
 
 It reads ResourceQuota and nothing else, so a `LimitRange` in the namespace is invisible
@@ -1460,7 +1478,11 @@ would hang in `Terminating`. `platformAgent.cleanupHook` (on by default)
 prevents that with a `pre-delete` hook that deletes all `AgentProfile` CRs first
 (while the `PlatformAgent` and NATS bus are still running so tombstone cards are
 published), then deletes the `PlatformAgent` CR and waits for the finalizers
-while the operator is still running.
+while the operator is still running. The hook pod carries
+`cluster-autoscaler.kubernetes.io/safe-to-evict: "false"` and its Job retries
+twice, so a scale-down of the node the agent just left does not abort the
+uninstall; the retries run inside the same `activeDeadlineSeconds`, and a retry
+that cannot finish by then still fails the hook.
 
 The hook runs `kubectl` from `alpine/k8s`, because the operator image is
 distroless and carries no client — and because the hook needs a shell: it is
@@ -1563,6 +1585,9 @@ helm uninstall kube-agents -n kubeagents-system
   operator flag, which no golden renders. `TestTheChartCountsEveryFlaggedPod`
   (`k8s-operator/internal/controller`) fails when it and the operator's `a2aFlaggedPods`
   differ, so edit both together.
+- `files/transient-pods.yaml` is hand-kept too: the scope publisher's Job pod, which runs on a
+  schedule and which no golden declares a scope for. `TestTheChartCountsTheScopePublishersJobPod`
+  holds its size, its one-at-a-time count and its scope fields to the operator.
 - `files/footprint.yaml` is generated too, but from a different source: it is summed from
   the operator's **golden manifests**
   (`k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml`, and

@@ -416,10 +416,13 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 	// ack, or a connection outage outlasted AckWait while the ack was being
 	// retried. Its sequence is on the record then, and it is acked without
 	// rendering twice.
-	// In stream order: a stop gives deliveries back in order, but redelivery
-	// can still interleave with new events, and the stream sequence is the
-	// order they were written in. Items without one (not off the durable)
-	// keep the order they were queued in.
+	// In stream order: a stop's give-back keeps that order only for a relay
+	// already bound when it falls due, so a relay that binds later can get
+	// the oldest given-back event behind later ones, and redelivery can
+	// interleave with new events. The stream sequence is the order they were
+	// written in, and sorting by it restores that order only among the
+	// events in one batch. Items without one (not off the durable) keep the
+	// order they were queued in.
 	if !slices.ContainsFunc(batch, func(it relayItem) bool { return it.sequence() == 0 }) {
 		slices.SortStableFunc(batch, func(a, b relayItem) int { return cmp.Compare(a.sequence(), b.sequence()) })
 	}
@@ -809,7 +812,9 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		if s.Status.Message != nil {
 			reason = joinTextParts(s.Status.Message.Parts)
 		}
-		// A Slack Stop answers with its own one reply (slack_stop.go).
+		// A Stop button answers for itself: Slack's with one reply
+		// (slack_stop.go), Google Chat's on the line, as does a stop typed
+		// on Google Chat with a line (chat_stop_press.go).
 		if s.Status.State != lib.StateCanceled || !ref.QuietCancel {
 			g.post(rec.Key, terminalNotice(s.Status.State, reason))
 		}
@@ -839,7 +844,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			if g.cfg.DisplayMode == displayModeDefault {
 				progress = ""
 			}
-			g.renderLine(rec.Key, active.StatusMsgID, withLineNote(terminalLine(s.Status.State, progress), active.LineNote), rs)
+			g.renderLine(rec.Key, active.StatusMsgID, withLineNote(terminalLine(s.Status.State, progress), active.LineNote), rs, "")
 		}
 		unmarkOnSupervisorTerminal(rec, taskID, source)
 		rec.ActiveTask = nil
@@ -871,7 +876,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		if g.cfg.DisplayMode == displayModeDefault {
 			progress = ""
 		}
-		g.renderLine(rec.Key, parent.StatusMsgID, terminalLine(s.Status.State, progress), rs)
+		g.renderLine(rec.Key, parent.StatusMsgID, terminalLine(s.Status.State, progress), rs, "")
 		setParentLine(rec, taskID, "")
 		if source == TerminalFromExecutor {
 			rec.LastTaskActivity = time.Now().UTC()
@@ -929,8 +934,9 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		g.observeEnded(rec, taskID, s.Status.State, source, reason)
 	}
 
-	// A delegated child's end wakes the session that asked.
-	if ref, ok := rec.TaskRefFor(taskID); ok && ref.Role == taskRoleChild {
+	// A delegated child's end wakes the session that asked, or reaches a
+	// parent addressed to an AgentProfile, which waits open, on its .in.
+	if ref, ok := rec.TaskRefFor(taskID); ok && ref.Role == taskRoleChild && !g.deliverChildResult(ctx, rec, ref, s.Status.State, result, reason) {
 		// Only the wake's copy carries the stand-in: the room and the
 		// observers have the result and the reason as they are.
 		wakeResult, wakeReason := result, reason
@@ -1106,7 +1112,7 @@ func isReasonTokenByte(c byte) bool {
 // split, honoured here rather than reinvented.
 func (g *Gateway) updateRollingLine(rec *SessionRecord, taskID string, rs *relayState) {
 	active := rec.ActiveTask
-	if active == nil || active.TaskID != taskID || active.StatusMsgID == "" {
+	if active == nil || active.TaskID != taskID || active.StatusMsgID == "" || active.LineClosed {
 		return
 	}
 	if rs.busyShown && lineStillSubmitted(rs) {
@@ -1127,14 +1133,24 @@ func (g *Gateway) updateRollingLine(rec *SessionRecord, taskID string, rs *relay
 	// artifact renders this same line, so a failed edit recorded as sent
 	// would never be retried and the line would sit at the previous state
 	// until the terminal.
-	if g.renderLine(rec.Key, active.StatusMsgID, line, rs) {
+	// A detached task (a typed stop, its terminal pending) keeps its line
+	// moving, with no Stop control: the stop is sent. One whose stop closed
+	// the line (LineClosed) returned above and keeps it.
+	stop := taskID
+	if active.Detached {
+		stop = ""
+	}
+	if g.renderLine(rec.Key, active.StatusMsgID, line, rs, stop) {
 		rs.lastLine = lineKey(line, rs) // after the render, which may have found the backend text-only
 	}
 }
 
 // editLine edits one status message and reports whether the edit landed.
-func (g *Gateway) editLine(conversation, messageID, line string) bool {
-	if err := g.adapter.Edit(conversation, messageID, truncateRunes(line, discordChunk)); err != nil {
+// stop names the task when its line is still a running task's, which keeps
+// the Stop control a backend draws on it (OutMessage.Stop); the terminal
+// edit passes none and takes it off.
+func (g *Gateway) editLine(conversation, messageID, line, stop string) bool {
+	if err := g.adapter.EditMessage(conversation, messageID, OutMessage{Text: truncateRunes(line, discordChunk), Stop: stop}); err != nil {
 		g.log.Warn("rolling line edit failed", "conversation", conversation, "err", err)
 		return false
 	}

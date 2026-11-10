@@ -93,6 +93,14 @@ ORIGINS = ("chat", "console", "api", "event", "drift", "audit", "scheduled", "is
 PROPOSALS_COUNTS_URL = "http://127.0.0.1:8699/v1/proposals/opened/counts"
 SESSION_KV_KEY_ENV = "SESSION_KV_API_KEY"
 PROPOSALS_READ_TIMEOUT_SECONDS = 2
+# Beside the counts, rendered only with them: seconds since the last
+# successful ledger read, on a monotonic clock. 0 right after a good read; it
+# grows while failed reads keep serving the last counts, so a scraper can tell
+# stale counts from fresh (as kubeagents_vcs_readings_age_seconds does for the
+# broker's readings). The family is unlabelled; the consumer sets the limit.
+PROPOSALS_READ_AGE_METRIC = "kubeagents_proposals_opened_read_age_seconds"
+PROPOSALS_READ_AGE_HELP = "Seconds since the proposals ledger was last read successfully; present with kubeagents_proposals_opened, and growing while a failed read keeps its last counts."
+PROPOSALS_READ_AGE_DECIMALS = 3
 # The platform label of an origin the ledger has no row for, and of a row with
 # no platform.
 NO_PLATFORM = ""
@@ -113,6 +121,22 @@ HERMES_PLATFORM_LABELS = {
     "teams": "teams",
     "api_server": "api",
 }
+# The series the operator reads the KanbanDispatcherFailing condition from
+# (usage_counters_scrape.go's kanbanDispatcherFailedTicksSeries): the kanban
+# dispatcher's consecutive failed ticks on each board, set by the gateway patch
+# kanban_dispatch_failures at the dispatcher's "tick failed on board" path, with
+# the class of the last failure. A good tick drops the board's series, so only
+# failing boards have one.
+KANBAN_DISPATCHER_FAILED_TICKS_METRIC = "kubeagents_kanban_dispatcher_failed_ticks"
+BOARD_LABEL = "board"
+ERROR_LABEL = "error"
+# A board whose last failure is older than this is dropped at render: the
+# dispatcher stopped ticking it (archived, quarantined as corrupt, or the
+# dispatcher paused), and no good tick will come to end its streak. A failing
+# tick can take Hermes' whole SQLite busy timeout (120 s, kanban_db_connect's
+# DEFAULT_BUSY_TIMEOUT_MS) on a locked board, plus the interval, so the window is
+# five of those: a live streak is never this old.
+DISPATCH_FAILURE_STALE_SECONDS = 600.0
 PROCESS_START_TIME_METRIC = "process_start_time_seconds"
 PROCESS_START_TIME_SECONDS = time.time()
 METRICS_PATH = "/metrics"
@@ -216,12 +240,16 @@ class ProposalsOpenedGauge:
     there are no counts: :meth:`counts` returns None and the family is not
     rendered, so a scraper sees a miss rather than nine zero readings. The
     gauge holds nothing the ledger does not: a new process reads the same.
+    :meth:`reading` also returns the seconds since the last successful read,
+    on ``clock`` (monotonic by default), so kept counts are marked stale.
     """
 
-    def __init__(self, url: str = PROPOSALS_COUNTS_URL) -> None:
+    def __init__(self, url: str = PROPOSALS_COUNTS_URL, clock: Callable[[], float] = time.monotonic) -> None:
         self._url = url
+        self._clock = clock
         self._lock = threading.Lock()
         self._counts: Optional[dict[tuple[str, str], int]] = None
+        self._read_at = 0.0
         self._failing = False
 
     def _read(self) -> dict[tuple[str, str], int]:
@@ -247,6 +275,11 @@ class ProposalsOpenedGauge:
 
     def counts(self) -> Optional[dict[tuple[str, str], int]]:
         """The ledger's counts, the last ones on a failed read, or None before any read succeeded."""
+        reading = self.reading()
+        return None if reading is None else reading[0]
+
+    def reading(self) -> Optional[tuple[dict[tuple[str, str], int], float]]:
+        """The counts as :meth:`counts` returns them and the seconds since the last successful read, or None before one."""
         with self._lock:
             try:
                 counts = self._read()
@@ -256,10 +289,13 @@ class ProposalsOpenedGauge:
                 if not self._failing:
                     logger.warning("chat_metrics: the proposals ledger could not be read, keeping the last counts: %s", type(exc).__name__)
                     self._failing = True
-                return None if self._counts is None else dict(self._counts)
+                if self._counts is None:
+                    return None
+                return dict(self._counts), max(self._clock() - self._read_at, 0.0)
             self._failing = False
             self._counts = counts
-            return dict(counts)
+            self._read_at = self._clock()
+            return dict(counts), 0.0
 
 
 def _label_value(value: str) -> str:
@@ -275,16 +311,23 @@ def platform_label(hermes_platform: str) -> str:
 class ChatMetrics:
     """Four counters, by platform: inbound messages, new sessions, errored turns
     and thumbs-downs; the board's gave_up cards and the proposals ledger, read
-    at scrape time."""
+    at scrape time; and the dispatcher's failed-tick streak, by board."""
 
-    def __init__(self, kanban: Optional[KanbanGaveUpCounter] = None, proposals: Optional[ProposalsOpenedGauge] = None) -> None:
+    def __init__(
+        self,
+        kanban: Optional[KanbanGaveUpCounter] = None,
+        proposals: Optional[ProposalsOpenedGauge] = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self._kanban = kanban or KanbanGaveUpCounter()
         self._proposals = proposals or ProposalsOpenedGauge()
+        self._clock = clock
         self._lock = threading.Lock()
         self._inbound: dict[str, int] = {}
         self._sessions: dict[str, int] = {}
         self._errored: dict[str, int] = {}
         self._negative: dict[str, int] = {}
+        self._dispatch_failures: dict[str, tuple[int, str, float]] = {}
 
     def prime(self) -> None:
         """Take the board's baseline now rather than at the first scrape."""
@@ -307,6 +350,20 @@ class ChatMetrics:
         with self._lock:
             self._errored[label] = self._errored.get(label, 0) + 1
 
+    def record_dispatch_tick(self, board: str, error_class: str) -> None:
+        """One kanban dispatcher tick on ``board``: a failure (``error_class``
+        set) adds one to the board's streak; a good tick (``""``) ends it."""
+        with self._lock:
+            if not error_class:
+                self._dispatch_failures.pop(board, None)
+                return
+            now = self._clock()
+            streak, _, at = self._dispatch_failures.get(board, (0, "", 0.0))
+            if now - at > DISPATCH_FAILURE_STALE_SECONDS:
+                # A streak past the window ended unseen: render had not run to drop it.
+                streak = 0
+            self._dispatch_failures[board] = (streak + 1, error_class, now)
+
     def record_negative_feedback(self, hermes_platform: str) -> None:
         label = platform_label(hermes_platform)
         with self._lock:
@@ -318,6 +375,10 @@ class ChatMetrics:
             sessions = sorted(self._sessions.items())
             errored = sorted(self._errored.items())
             negative = sorted(self._negative.items())
+            now = self._clock()
+            for board in [b for b, (_, _, at) in self._dispatch_failures.items() if now - at > DISPATCH_FAILURE_STALE_SECONDS]:
+                del self._dispatch_failures[board]
+            dispatch_failures = sorted(self._dispatch_failures.items())
         lines = [
             f"# HELP {CHAT_INBOUND_METRIC} Chat messages that reached the gateway's dispatch hook, by platform.",
             f"# TYPE {CHAT_INBOUND_METRIC} counter",
@@ -341,20 +402,32 @@ class ChatMetrics:
             f"# TYPE {KANBAN_GAVE_UP_METRIC} counter",
             f"{KANBAN_GAVE_UP_METRIC} {self._kanban.count()}",
         ]
-        proposals = self._proposals.counts()
-        if proposals is not None:
+        reading = self._proposals.reading()
+        if reading is not None:
+            proposals, read_age = reading
             lines += [
                 f"# HELP {PROPOSALS_OPENED_METRIC} Pull requests the agent opened, by the origin of the work and, for chat, its platform, read from the pod's proposals ledger at scrape time.",
                 f"# TYPE {PROPOSALS_OPENED_METRIC} gauge",
             ]
             for (origin, platform), count in sorted(proposals.items()):
                 lines.append(f'{PROPOSALS_OPENED_METRIC}{{{ORIGIN_LABEL}="{_label_value(origin)}",{PLATFORM_LABEL}="{_label_value(platform)}"}} {count}')
+            lines += [
+                f"# HELP {PROPOSALS_READ_AGE_METRIC} {PROPOSALS_READ_AGE_HELP}",
+                f"# TYPE {PROPOSALS_READ_AGE_METRIC} gauge",
+                f"{PROPOSALS_READ_AGE_METRIC} {read_age:.{PROPOSALS_READ_AGE_DECIMALS}f}",
+            ]
         lines += [
             f"# HELP {CHAT_FEEDBACK_NEGATIVE_METRIC} Thumbs-down reactions a person put on one of the bot's messages, by platform, once per person and message.",
             f"# TYPE {CHAT_FEEDBACK_NEGATIVE_METRIC} counter",
         ]
         for label, count in negative:
             lines.append(f'{CHAT_FEEDBACK_NEGATIVE_METRIC}{{{PLATFORM_LABEL}="{label}"}} {count}')
+        lines += [
+            f"# HELP {KANBAN_DISPATCHER_FAILED_TICKS_METRIC} Consecutive kanban dispatcher ticks that failed on a board, with the class of the last failure; a good tick removes the board's series.",
+            f"# TYPE {KANBAN_DISPATCHER_FAILED_TICKS_METRIC} gauge",
+        ]
+        for board, (streak, error_class, _) in dispatch_failures:
+            lines.append(f'{KANBAN_DISPATCHER_FAILED_TICKS_METRIC}{{{BOARD_LABEL}="{_label_value(board)}",{ERROR_LABEL}="{_label_value(error_class)}"}} {streak}')
         lines += [
             f"# HELP {PROCESS_START_TIME_METRIC} Start time of the process since unix epoch in seconds, captured once at start.",
             f"# TYPE {PROCESS_START_TIME_METRIC} gauge",

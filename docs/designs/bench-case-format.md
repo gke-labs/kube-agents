@@ -62,8 +62,8 @@ the front door there under `spec.mode: next` too. A `session: fresh` answer carr
 thread context, which next's door does not send, so a case with one stays in
 `hack/eval/inject-lane-exclusions.txt`. Under next the reply to a wake is posted nowhere, but the
 same front door writes it, so a case that grades that reply still runs on the inject lane. A
-first line of `[bench:card-block-wake]`, with `title`, `kind` (`transient`, `capability` or
-`dependency`) and `reason`, plants a card blocked that way instead: nothing is posted, no answer
+first line of `[bench:card-block-wake]`, with `title`, `kind` (`transient`, `capability`,
+`dependency` or `capacity`) and `reason`, plants a card blocked that way instead: nothing is posted, no answer
 is sent, and the wake's reply is the run's one turn. A
 first line of
 `[bench:stop-after-first-card]`, optionally with `observe=<seconds>`, makes the rest of the
@@ -94,7 +94,7 @@ rather than for a merge decision.
 presubmit seconds rather than a cluster; `deployer: tofu` names a stack under `bench/tf/`
 and costs what that stack takes to apply and destroy on every pull request, minutes for a
 cluster and seconds for a single alert policy. `task_stack` in `hack/ci-eval-pr.sh` reads
-`infrastructure.stack` out of the file text for the infra lock and the nightly halves, so
+`infrastructure.stack` out of the file text for the infra lock and the nightly's main shards, so
 keep it on one line; `bench-gate` reads `deployer` through a YAML parse
 (`bench/kube_agents_bench/cases.py`) to classify a crashed run.
 
@@ -315,7 +315,10 @@ command, a log line or a tagged call alike, before the forbidden list reads it, 
 command it touched out of the required list, for a command that can fetch and
 send nothing but carries a forbidden word as its argument, such as a plain
 `grep` exempted through its pattern argument so that whatever else shares the
-line is still graded; or with `required_runs` a script by its basename and the flags that must
+line is still graded (`exempt_grep_patterns: true` does that by the command's
+shell words: it removes only the pattern argument of a command that is one
+grep and nothing else, and refuses a control operator, a redirect other than
+`>` to `/dev/null`, a comment, a substitution and a collapsed chain); or with `required_runs` a script by its basename and the flags that must
 follow it on the same shell segment, read from the command's argv as the shell splits
 it, so a quoted mention of the invocation is one word and not a run, and a run made through a script file or a shell's standard input is not read, since the argv names the file or the shell; each flag is read as the exact word, so the script named is built with `allow_abbrev=False`; `word_patterns` are regular expressions each of which some later word of the segment must match on its own, and `forbidden_runs` is the same shape for a run no worker may make, such as a `kubectl get` of the objects a script grades; with `after_result_pattern` the commands come from the workers' tagged `terminal` and `execute_code` calls in the trajectory instead, with their results as the record stores them, a JSON string with newlines escaped, and the forbidden set applies only to the calls after the first whose result matched, failed or not, one window per delegated card and the cards its worker fanned out; `forbidden_result_patterns` then grade the later results too; a trajectory with no tagged call at all, none readable (every code-tool argument withheld), a call with no numeric time, or a capture with gaps and no hit, is `status: "error"`, where a worker whose tagged calls are all MCP calls grades as zero commands), `worker_agents` (regular expressions every one of which must match the
 profile at least one delegated worker ran as, read from the tags the harness puts on the
@@ -350,7 +353,8 @@ card for anything else), or, with `cap`, one of the first-run cap's two (#3702):
 `cards_for_first_cap_profiles` (cards for exactly the carded profiles: the sweep marker's
 `carded=` set when it has one, else the first `cap` profiles by name) and
 `past_cap_clusters_sweep_audited` (every roster cluster outside that set shown in the sandbox's
-`INVENTORY.raw.md` as audited by the sweep itself).
+`INVENTORY.raw.md` as audited by the sweep itself, with at least one workload listed or one finding
+line on a row scanned in full, so an audit relayed empty does not pass).
 
 `bootstrap_handoff` reads both ends of the sweep's hand-off to the prioritization stage. Its
 `require` is `raw_report_has_findings_block` (the sandbox's own `inventory_findings.py` parses
@@ -388,8 +392,11 @@ Session KV server in the agent pod and passes when every row in `finding_ids`, u
 is in `state`. A listed row the queue does not hold is `status: "error"`, since it means the
 case's plant is missing. `audit_report_stored` reads the fleet-audit report store in the shell
 sandbox, then in the agent container, and passes when a `latest.json` for its `audit` finished since
-the run started, with `status` when it gives one and, for each `required_finding_phrases` entry, a
-finding in its `document` whose id contains it. `report_store_reply`, in its own module
+the run started (or, with `since_state_file`, since the `fired_at` a case's stack recorded in that
+JSON file in the agent container, for a scheduled run the stack fired and waited out before the
+turn; an unreadable file is `status: "error"`), with `status` when it gives one, with each key of `required_envelope` equal to the
+value given (`required_envelope: {precheck: unchanged}` reads the envelope's own key), and, for each
+`required_finding_phrases` entry, a finding in its `document` whose id contains it. `report_store_reply`, in its own module
 (`bench/kube_agents_bench/report_store_reply.py`), reads the same store after the reply with the
 install's own `report_status.py`, and passes when each of its `audits` is mentioned in `final_message`
 and the reply carries the ledger URL of one of the audit's envelopes written before the turn (the

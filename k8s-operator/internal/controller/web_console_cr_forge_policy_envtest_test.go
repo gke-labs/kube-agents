@@ -48,8 +48,9 @@ const (
 // policy's forge checks in a real API server. The console may carry a forge
 // over, add one with no credential, change a forge's namespace when it has no
 // credential, and remove one; it may not move a forge's credential to another
-// destination, add a forge with a credential, or move the install's GitHub
-// host, where the broker spends the GitHub App token.
+// destination, change the account it acts as (identity), add a forge with a
+// credential, or move the install's GitHub host, where the broker spends the
+// GitHub App token.
 func TestTheWebConsoleCRPolicyHoldsWhereAForgeCredentialGoes(t *testing.T) {
 	cfg, scheme := startEnvtestConfig(t)
 	admin, err := client.New(cfg, client.Options{Scheme: scheme})
@@ -156,6 +157,7 @@ func TestTheWebConsoleCRPolicyHoldsWhereAForgeCredentialGoes(t *testing.T) {
 		newForgeRule    = "a forge the web console adds may not carry a credentialsRef or a caBundleRef"
 		gitHubHostRule  = "may not change the install's GitHub host"
 		newGitHubRule   = "a GitHub forge the web console adds must sit at a host a GitHub forge already uses"
+		refusedRule     = "while the declaration has a forge the operator refuses"
 	)
 	gitLabWith := func(old, new string) string {
 		return integration(forgeGitHub+","+strings.Replace(forgeGitLab, old, new, 1)+","+forgeGitea, reposBothForge)
@@ -170,6 +172,8 @@ func TestTheWebConsoleCRPolicyHoldsWhereAForgeCredentialGoes(t *testing.T) {
 		{"a credentialed forge's provider", gitLabWith(`"provider":"gitlab"`, `"provider":"gitea"`), destinationRule},
 		{"a credentialsRef added to a forge with none", integration(
 			`{"name":"github","namespace":"gke-labs","credentialsRef":{"name":"gl-token"}},`+forgeGitLab+","+forgeGitea, reposBothForge), destinationRule},
+		{"a caBundleRef added to a forge with none", giteaWith(`"namespace":"acme"`, `"namespace":"acme","caBundleRef":{"name":"gt-ca"}`), destinationRule},
+		{"a credentialed forge's caBundleRef removed", gitLabWith(`,"caBundleRef":{"name":"gl-ca"}`, ``), destinationRule},
 		{"a forge added with only a CA bundle", integration(forgeGitHub+","+forgeGitLab+","+forgeGitea+
 			`,{"name":"gh-ca","provider":"github","host":"ghe.attacker.example","caBundleRef":{"name":"evil-ca"}}`, reposBothForge), newForgeRule},
 		{"a credentialed forge's namespace", gitLabWith(`"namespace":"acme"`, `"namespace":"other-group"`), destinationRule},
@@ -198,7 +202,99 @@ func TestTheWebConsoleCRPolicyHoldsWhereAForgeCredentialGoes(t *testing.T) {
 	}
 
 	// Cases that start from their own declaration, set by the admin.
+	const forgeBitbucket = `{"name":"bb","provider":"bitbucket","namespace":"acme",` +
+		`"credentialsRef":{"name":"bb-token"},"identity":"{0f3b2c1d-aaaa-bbbb-cccc-0123456789ab}"}`
+	bitbucketWith := func(old, new string) string {
+		return integration(forgeGitHub+","+strings.Replace(forgeBitbucket, old, new, 1), `[]`)
+	}
+	// Declarations the operator already refuses, where GitHubHost falls back
+	// from the first GitHub forge: GitHub forges at two hosts, and a GitHub
+	// forge at a GitLab forge's host. (A forge with no provider at a
+	// non-GitHub host, the third shape, is one the CRD now refuses to store.)
+	const (
+		forgeReserved = `{"name":"gh-res","provider":"github","host":"acme.ghe.com","namespace":"gke-labs"}`
+		forgeGHE      = `{"name":"ghe","provider":"github","host":"ghe.corp.example","namespace":"acme"}`
+		forgeShared   = `{"name":"gl","provider":"gitlab","host":"shared.corp.example","namespace":"acme","credentialsRef":{"name":"gl-token"}}`
+		forgeAtShared = `{"name":"gh","provider":"github","host":"shared.corp.example","namespace":"acme"}`
+		// Two GitHub forges at one GitHub Enterprise host that name different
+		// CA bundles (the CRD refuses a CA bundle at github.com): the operator
+		// keeps the first one's for the host and refuses the second.
+		forgeCAa    = `{"name":"gh-a","provider":"github","host":"ghe.corp.example","namespace":"org-a","caBundleRef":{"name":"ca-a"}}`
+		forgeCAb    = `{"name":"gh-b","provider":"github","host":"ghe.corp.example","namespace":"org-b","caBundleRef":{"name":"ca-b"}}`
+		forgeCAaKey = `{"name":"gh-b","provider":"github","host":"ghe.corp.example","namespace":"org-b","caBundleRef":{"name":"ca-a","key":"other.crt"}}`
+	)
 	for _, tc := range []struct{ name, setup, body, rule string }{
+		{
+			name:  "the GitHub forge in use removed after a refused first one",
+			setup: integration(forgeReserved+","+forgeGHE, `[]`),
+			body:  integration(forgeReserved, `[]`),
+			rule:  refusedRule,
+		},
+		{
+			name:  "the GitHub forge in use given another namespace after a refused first one",
+			setup: integration(forgeReserved+","+forgeGHE, `[]`),
+			body:  integration(forgeReserved+","+strings.Replace(forgeGHE, `"namespace":"acme"`, `"namespace":"other"`, 1), `[]`),
+			rule:  refusedRule,
+		},
+		{
+			// gitlab.com is the GitLab forge's host, read as canonicalHost reads
+			// a GitLab forge that declares none.
+			name: "a GitHub forge moved before a GitLab forge at its default host",
+			setup: integration(`{"name":"gl","provider":"gitlab","namespace":"acme","credentialsRef":{"name":"gl-token"}},`+
+				`{"name":"gh","provider":"github","host":"gitlab.com","namespace":"acme"}`, `[]`),
+			body: integration(`{"name":"gh","provider":"github","host":"gitlab.com","namespace":"acme"},`+
+				`{"name":"gl","provider":"gitlab","namespace":"acme","credentialsRef":{"name":"gl-token"}}`, `[]`),
+			rule: refusedRule,
+		},
+		{
+			name:  "a GitHub forge moved before a GitLab forge at its host",
+			setup: integration(forgeShared+","+forgeAtShared, `[]`),
+			body:  integration(forgeAtShared+","+forgeShared, `[]`),
+			rule:  refusedRule,
+		},
+		{
+			name:  "the forge whose CA bundle the broker trusts removed, leaving another bundle",
+			setup: integration(forgeCAa+","+forgeCAb, `[]`),
+			body:  integration(forgeCAb, `[]`),
+			rule:  refusedRule,
+		},
+		{
+			name:  "two GitHub forges with different CA bundles reordered",
+			setup: integration(forgeCAa+","+forgeCAb, `[]`),
+			body:  integration(forgeCAb+","+forgeCAa, `[]`),
+			rule:  refusedRule,
+		},
+		{
+			name:  "two GitHub forges with CA bundles that differ only by key reordered",
+			setup: integration(forgeCAa+","+forgeCAaKey, `[]`),
+			body:  integration(forgeCAaKey+","+forgeCAa, `[]`),
+			rule:  refusedRule,
+		},
+		{
+			name:  "the forge whose CA bundle the broker trusts given another namespace",
+			setup: integration(forgeCAa+","+forgeCAb, `[]`),
+			body:  integration(strings.Replace(forgeCAa, `"namespace":"org-a"`, `"namespace":"other"`, 1)+","+forgeCAb, `[]`),
+			rule:  refusedRule,
+		},
+		{
+			name:  "a Bitbucket forge's identity changed",
+			setup: integration(forgeGitHub+","+forgeBitbucket, `[]`),
+			body:  bitbucketWith(`0f3b2c1d-aaaa`, `99999999-aaaa`),
+			rule:  destinationRule,
+		},
+		{
+			name:  "a Bitbucket forge's identity removed",
+			setup: integration(forgeGitHub+","+forgeBitbucket, `[]`),
+			body:  bitbucketWith(`,"identity":"{0f3b2c1d-aaaa-bbbb-cccc-0123456789ab}"`, ``),
+			rule:  destinationRule,
+		},
+		{
+			name: "an identity added to a Bitbucket forge with none",
+			setup: integration(forgeGitHub+","+
+				strings.Replace(forgeBitbucket, `,"identity":"{0f3b2c1d-aaaa-bbbb-cccc-0123456789ab}"`, ``, 1), `[]`),
+			body: integration(forgeGitHub+","+forgeBitbucket, `[]`),
+			rule: destinationRule,
+		},
 		{
 			// The operator refuses a GitHub forge at a reserved domain and falls
 			// back to the first usable one, so a new forge must not become it.
@@ -226,6 +322,68 @@ func TestTheWebConsoleCRPolicyHoldsWhereAForgeCredentialGoes(t *testing.T) {
 			t.Errorf("%s: refused with %q, want the rule %q", tc.name, err, tc.rule)
 		}
 	}
+	// On a refused declaration the console still adds repositories, also when
+	// its save spells out the provider of a forge that left it out.
+	if err := patch(admin, integration(`{"name":"github","namespace":"gke-labs"},`+forgeGHE, `[]`)); err != nil {
+		t.Fatalf("setting the refused declaration: %v", err)
+	}
+	if err := patch(console, integration(`{"name":"github","provider":"github","namespace":"gke-labs"},`+forgeGHE,
+		`[{"forge":"ghe","repository":"acme/infra","role":"gitops"}]`)); err != nil {
+		t.Errorf("a repository added on a refused declaration: refused, want admitted: %v", err)
+	}
+
+	// GitHub forges with different CA bundles still take repositories.
+	if err := patch(admin, integration(forgeCAa+","+forgeCAb, `[]`)); err != nil {
+		t.Fatalf("setting the two CA bundles: %v", err)
+	}
+	if err := patch(console, integration(forgeCAa+","+forgeCAb,
+		`[{"forge":"gh-a","repository":"org-a/infra","role":"gitops"}]`)); err != nil {
+		t.Errorf("a repository added beside two CA bundles: refused, want admitted: %v", err)
+	}
+	// One CA bundle for the host, named once or on both forges: removing or
+	// reordering forges does not change it, so the console may.
+	forgeCAbSame := strings.Replace(forgeCAb, `"ca-b"`, `"ca-a"`, 1)
+	forgeNoCA := `{"name":"gh-b","provider":"github","host":"ghe.corp.example","namespace":"org-b"}`
+	for _, tc := range []struct{ name, setup, body string }{
+		{"the first of two forges with the same CA bundle removed", forgeCAa + "," + forgeCAbSame, forgeCAbSame},
+		{"two forges with the same CA bundle reordered", forgeCAa + "," + forgeCAbSame, forgeCAbSame + "," + forgeCAa},
+		{"a forge with no CA bundle moved after the one with it", forgeNoCA + "," + forgeCAa, forgeCAa + "," + forgeNoCA},
+	} {
+		if err := patch(admin, integration(tc.setup, `[]`)); err != nil {
+			t.Fatalf("%s: setting the declaration: %v", tc.name, err)
+		}
+		if err := patch(console, integration(tc.body, `[]`)); err != nil {
+			t.Errorf("%s: refused, want admitted: %v", tc.name, err)
+		}
+	}
+
+	// A provider's own host spelled out on a forge declared without one is
+	// the same host, on every provider with a default host.
+	for _, tc := range []struct{ name, declared, written string }{
+		{"gitlab.com", `{"name":"glc","provider":"gitlab","namespace":"acme","credentialsRef":{"name":"gl-token"}}`,
+			`{"name":"glc","provider":"gitlab","host":"gitlab.com","namespace":"acme","credentialsRef":{"name":"gl-token"}}`},
+		{"www.gitlab.com", `{"name":"glc","provider":"gitlab","host":"gitlab.com","namespace":"acme","credentialsRef":{"name":"gl-token"}}`,
+			`{"name":"glc","provider":"gitlab","host":"www.gitlab.com","namespace":"acme","credentialsRef":{"name":"gl-token"}}`},
+		{"bitbucket.org", `{"name":"bbc","provider":"bitbucket","namespace":"acme","credentialsRef":{"name":"bb-token"}}`,
+			`{"name":"bbc","provider":"bitbucket","host":"bitbucket.org","namespace":"acme","credentialsRef":{"name":"bb-token"}}`},
+	} {
+		if err := patch(admin, integration(forgeGitHub+","+tc.declared, `[]`)); err != nil {
+			t.Fatalf("%s: setting the declaration: %v", tc.name, err)
+		}
+		if err := patch(console, integration(forgeGitHub+","+tc.written, `[]`)); err != nil {
+			t.Errorf("a forge's default host spelled out as %s: refused, want admitted: %v", tc.name, err)
+		}
+	}
+
+	// The page's write carries a Bitbucket forge's identity over unchanged.
+	if err := patch(admin, integration(forgeGitHub+","+forgeBitbucket, `[]`)); err != nil {
+		t.Fatalf("setting the Bitbucket forge: %v", err)
+	}
+	if err := patch(console, integration(forgeGitHub+","+forgeBitbucket,
+		`[{"forge":"bb","repository":"acme/infra","role":"context"}]`)); err != nil {
+		t.Errorf("the Bitbucket forge carried over, a repository added: refused, want admitted: %v", err)
+	}
+
 	// The deprecated alias moved to forges, with github.com spelled another
 	// way: the GitHub host does not change, so the console may write it.
 	if err := patch(admin, `{"spec":{"integration":{"forges":null,"repositories":null,"github":{"org":"gke-labs","gitRepo":"kube-agents"}}}}`); err != nil {

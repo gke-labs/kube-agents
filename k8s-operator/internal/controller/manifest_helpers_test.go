@@ -353,7 +353,7 @@ func TestResolveResources(t *testing.T) {
 	defaults := resolveResources(nil)
 	cpuReq := defaults.Requests[corev1.ResourceCPU]
 	memReq := defaults.Requests[corev1.ResourceMemory]
-	if cpuReq.Cmp(resource.MustParse("1")) != 0 || memReq.Cmp(resource.MustParse("2Gi")) != 0 {
+	if cpuReq.Cmp(resource.MustParse("1")) != 0 || memReq.Cmp(resource.MustParse("4Gi")) != 0 {
 		t.Errorf("unexpected default requests: %v", defaults.Requests)
 	}
 	cpuLim := defaults.Limits[corev1.ResourceCPU]

@@ -27,8 +27,9 @@ const (
 // waitBreaker is why a submission held back by a breaker is shown waiting.
 const waitBreaker = "breaker-open"
 
-// waitHandOffFailed is why a submission whose hand-off failed (a lease that
-// couldn't be written) is shown waiting.
+// waitHandOffFailed is why a submission whose hand-off failed (a Job that
+// couldn't be launched or read, a lease that couldn't be written) is shown
+// waiting.
 const waitHandOffFailed = "hand-off-failed"
 
 const (

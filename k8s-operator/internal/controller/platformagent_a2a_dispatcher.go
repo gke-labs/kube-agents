@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	goerrors "errors"
 	"fmt"
+	"math"
 	"os"
 	"slices"
 	"strings"
@@ -483,8 +484,8 @@ func dispatchReservesShortfall0(agent *agentv1alpha1.PlatformAgent, ceiling, chi
 // dispatcherGrantNames are the profiles the dispatch config lists and every
 // durable under them, in its order: the names the dispatcher's grants
 // enumerate.
-func dispatcherGrantNames(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) (names, durables []string) {
-	cfg, err := desiredDispatchConfig(agent, profiles)
+func dispatcherGrantNames(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, draining []a2aDispatchProfile) (names, durables []string) {
+	cfg, err := desiredDispatchConfigDraining(agent, profiles, draining)
 	if err != nil {
 		return nil, nil
 	}
@@ -510,10 +511,16 @@ type a2aDispatchConfig struct {
 	RenewSeconds         int    `json:"renewSeconds"`
 	RestartGraceSeconds  int    `json:"restartGraceSeconds"`
 	AcceptTimeoutSeconds int    `json:"acceptTimeoutSeconds"`
-	// SubmitRetentionSeconds is lib.DispatchConfig's: PROFILE_SUBMITS'
-	// max age, from the constant the provision script renders it from.
+	// SubmitRetentionSeconds is lib.DispatchConfig's: PROFILE_SUBMITS' max
+	// age, the longer of the constant the provision script creates it with
+	// and the live stream's as its Job reports it (dispatchSubmitRetentionSeconds).
 	SubmitRetentionSeconds int                  `json:"submitRetentionSeconds,omitempty"`
 	Profiles               []a2aDispatchProfile `json:"profiles"`
+	// JobLabels go on every Job the dispatcher creates (lib.DispatchConfig
+	// JobLabels): the agent's, so a teardown deletes only this agent's
+	// Jobs, and dispatchJobLabel. Set only when some profile has a Job
+	// template.
+	JobLabels map[string]string `json:"jobLabels,omitempty"`
 }
 
 type a2aDispatchProfile struct {
@@ -524,6 +531,13 @@ type a2aDispatchProfile struct {
 	ActiveDeadlineSeconds int                  `json:"activeDeadlineSeconds"`
 	Parameters            []a2aCardParameter   `json:"parameters,omitempty"`
 	Durables              []a2aDispatchDurable `json:"durables"`
+	// JobTemplate is the pod template the dispatcher stamps the profile's
+	// unattended Jobs from (lib.DispatchProfile.JobTemplate), set only for a
+	// profile allowing the unattended tier (agentprofile_job_template.go).
+	JobTemplate *corev1.PodTemplateSpec `json:"jobTemplate,omitempty"`
+	// DrainingUntil is lib.DispatchProfile's (#5074): set on a profile that
+	// has left the install, which is listed with no durables until then.
+	DrainingUntil time.Time `json:"drainingUntil,omitzero"`
 }
 
 type a2aDispatchDurable struct {
@@ -540,10 +554,54 @@ func profileDurableName(profile, tier, kind string) string {
 	return fmt.Sprintf("profile-%s-%s-%s", profile, tier, kind)
 }
 
+// a2aMaxSubmitRetention is lib.MaxSubmitRetention, the longest retention a
+// dispatch config may carry (the operator can't import lib; the dispatcher's
+// Validate refuses a longer one and keeps its last good config).
+const a2aMaxSubmitRetention = 365 * 24 * time.Hour
+
+// dispatchSubmitRetentionSeconds is the submit retention the dispatch config
+// carries: the longer of this operator's a2aProfileSubmitMaxAge and the live
+// stream's, as the provision Job last reported it (#4948), capped at
+// a2aMaxSubmitRetention. A stream with no age limit, or one longer than the
+// cap, gets the cap, and its tombstones are kept that long, not as long as
+// the stream (the dispatcher refuses a longer retention). With no report yet
+// it is the constant, as before. The comparison is in seconds, so a value
+// no Duration can hold still lands on the cap.
+func dispatchSubmitRetentionSeconds(agent *agentv1alpha1.PlatformAgent) int {
+	render, ceiling := int64(a2aProfileSubmitMaxAge/time.Second), int64(a2aMaxSubmitRetention/time.Second)
+	retention := render
+	if live := agent.Status.ProfileSubmitMaxAgeSeconds; live != nil {
+		if *live == 0 || *live > ceiling {
+			retention = ceiling
+		} else {
+			retention = max(retention, *live)
+		}
+	}
+	return int(retention)
+}
+
 // desiredDispatchConfig is what the dispatcher reads for this agent: every
 // value resolved, and the profiles that have a rendered identity, each with
 // the durables the operator creates for it, one per (tier, kind).
 func desiredDispatchConfig(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) (a2aDispatchConfig, error) {
+	return desiredDispatchConfigWith(agent, profiles, nil, nil)
+}
+
+// desiredDispatchConfigDraining is desiredDispatchConfig with the profiles
+// still draining (drainingDispatchProfiles) listed after the live ones: no
+// durables, so nothing new is dispatched for them, but listed, so the
+// dispatcher keeps their .supervisor grant (dispatcherGrantNames) and the
+// terminals of the tasks they still hold reach their requesters.
+func desiredDispatchConfigDraining(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, draining []a2aDispatchProfile) (a2aDispatchConfig, error) {
+	return desiredDispatchConfigWith(agent, profiles, nil, draining)
+}
+
+// desiredDispatchConfigWith is desiredDispatchConfigDraining with each
+// unattended profile's Job template, by profile name (dispatchJobTemplates).
+// Only a live profile takes one: a draining profile is listed as
+// drainingDispatchProfiles built it, with no durables and no template, since
+// nothing new is dispatched for it.
+func desiredDispatchConfigWith(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, jobTemplates map[string]*corev1.PodTemplateSpec, draining []a2aDispatchProfile) (a2aDispatchConfig, error) {
 	ceiling := resolveProfileCeiling(agent)
 	child, interactive := dispatchReserves(agent, ceiling)
 	cfg := a2aDispatchConfig{
@@ -556,7 +614,7 @@ func desiredDispatchConfig(agent *agentv1alpha1.PlatformAgent, profiles []agentv
 		RenewSeconds:           resolveProfileRenewSeconds(agent),
 		RestartGraceSeconds:    resolveProfileRestartGraceSeconds(agent),
 		AcceptTimeoutSeconds:   resolveProfileAcceptTimeoutSeconds(agent),
-		SubmitRetentionSeconds: int(a2aProfileSubmitMaxAge / time.Second),
+		SubmitRetentionSeconds: dispatchSubmitRetentionSeconds(agent),
 		Profiles:               []a2aDispatchProfile{},
 	}
 	resolved := resolveAgentProfileIdentities(agent, profiles)
@@ -572,6 +630,7 @@ func desiredDispatchConfig(agent *agentv1alpha1.PlatformAgent, profiles []agentv
 			QueueTimeoutSeconds:   int(p.QueueTimeout()),
 			ActiveDeadlineSeconds: func() int { d, _ := cappedTaskDeadline(agent, p); return d }(),
 			Durables:              []a2aDispatchDurable{},
+			JobTemplate:           jobTemplates[p.Name],
 		}
 		for _, param := range p.Spec.Parameters {
 			dp.Parameters = append(dp.Parameters, a2aCardParameter{Name: param.Name, Required: param.Required})
@@ -583,7 +642,19 @@ func desiredDispatchConfig(agent *agentv1alpha1.PlatformAgent, profiles []agentv
 		}
 		cfg.Profiles = append(cfg.Profiles, dp)
 	}
+	live := map[string]bool{}
+	for _, p := range cfg.Profiles {
+		live[p.Name] = true
+	}
+	for _, p := range draining {
+		if !live[p.Name] {
+			cfg.Profiles = append(cfg.Profiles, p)
+		}
+	}
 	slices.SortFunc(cfg.Profiles, func(a, b a2aDispatchProfile) int { return strings.Compare(a.Name, b.Name) })
+	if len(jobTemplates) > 0 {
+		cfg.JobLabels = dispatchJobLabels(agent)
+	}
 	body, err := json.Marshal(cfg)
 	if err != nil {
 		return cfg, err
@@ -593,8 +664,114 @@ func desiredDispatchConfig(agent *agentv1alpha1.PlatformAgent, profiles []agentv
 	return cfg, nil
 }
 
-func buildA2ADispatchConfigMap(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) (*corev1.ConfigMap, error) {
+// a2aDrainingMargin is how long past the longest task deadline a profile that
+// has left the install stays draining: the dispatcher fails a task still held
+// at its deadline and retries that terminal, which needs the grant (#5074).
+const a2aDrainingMargin = 15 * time.Minute
+
+// a2aDrainingWindow is how long a profile that has left the install drains:
+// the longest deadline any of its tasks can carry, plus a2aDrainingMargin. A
+// task keeps the deadline it was confirmed with, which the profile's or the
+// install's later, lower limit doesn't shorten, so the window is the hard
+// ceiling on every task deadline (spec.harness.tuning.profiles.
+// maxTaskDeadlineSeconds may only be lowered from its default), not the
+// profile's current one.
+const a2aDrainingWindow = time.Duration(agentv1alpha1.DefaultProfileMaxTaskDeadlineSeconds)*time.Second + a2aDrainingMargin
+
+// drainingDispatchProfiles is the profiles the applied dispatch config lists
+// that the render no longer does (live names it), still draining at now: a
+// profile listed live there drains from now for a2aDrainingWindow; one
+// already draining keeps its DrainingUntil, so the render is stable, until
+// that passes. A draining profile has no durables. The applied config is the
+// state: with none, nothing drains.
+//
+// The applied config is a ConfigMap, and a draining profile's name becomes a
+// grant on the dispatcher's identity (dispatcherGrantNames), so only what the
+// render would itself produce is carried forward: a name and tiers that are
+// subject tokens, once each, the limits within the render's range (the
+// deadline under its 6h ceiling), and a time no later than the window from
+// now; nothing else of the entry. An entry that isn't is
+// dropped, and grants nothing.
+func drainingDispatchProfiles(applied *a2aDispatchConfig, live map[string]bool, now time.Time) []a2aDispatchProfile {
+	if applied == nil {
+		return nil
+	}
+	var out []a2aDispatchProfile
+	seen := map[string]bool{}
+	for _, a := range applied.Profiles {
+		if live[a.Name] || seen[a.Name] || !isDNS1123LabelToken(a.Name) || len(a.Tiers) == 0 ||
+			slices.ContainsFunc(a.Tiers, func(t string) bool { return !isDNS1123LabelToken(t) }) {
+			continue
+		}
+		seen[a.Name] = true
+		// A time past the window is not one this operator wrote: it is
+		// clamped, so no entry keeps a grant longer than a drain can need.
+		until := a.DrainingUntil
+		if until.IsZero() || until.After(now.Add(a2aDrainingWindow)) {
+			until = now.Add(a2aDrainingWindow).Truncate(time.Second).UTC()
+		} else if !now.Before(until) {
+			continue
+		}
+		out = append(out, a2aDispatchProfile{
+			Name:        a.Name,
+			Tiers:       slices.Clone(a.Tiers),
+			Concurrency: max(a.Concurrency, 1),
+			// The limits within the render's own range, so the dispatcher's
+			// Validate takes the entry whatever was written into it.
+			QueueTimeoutSeconds:   min(max(a.QueueTimeoutSeconds, 0), math.MaxInt32),
+			ActiveDeadlineSeconds: min(max(a.ActiveDeadlineSeconds, 0), agentv1alpha1.DefaultProfileMaxTaskDeadlineSeconds),
+			Durables:              []a2aDispatchDurable{},
+			DrainingUntil:         until,
+		})
+	}
+	return out
+}
+
+// dispatchDraining reads the applied dispatch config and returns the
+// profiles of it still draining against this render. None applied (NotFound)
+// drains nothing. A read that fails otherwise is an error for the pass, which
+// then applies neither render: rendering without the set would drop every
+// drain, and the next pass would have nothing left to carry forward. An
+// applied body that doesn't decode can't be read on any pass, so it is a
+// Warning and drains nothing, rather than stop the stack for good; it takes
+// an edit of an object only the operator writes.
+func (r *PlatformAgentReconciler) dispatchDraining(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) ([]a2aDispatchProfile, error) {
+	cm := &corev1.ConfigMap{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aDispatchConfigName(agent)}, cm); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("reading the applied dispatch config for the draining profiles: %w", err)
+	}
+	var applied a2aDispatchConfig
+	if err := json.Unmarshal([]byte(cm.Data[a2aDispatchConfigKey]), &applied); err != nil {
+		r.recordEvent(agent, corev1.EventTypeWarning, reasonDispatchConfigUnreadable,
+			fmt.Sprintf("the applied dispatch config %s does not decode (%v); no profile that has left the install is kept draining", cm.Name, err))
+		return nil, nil
+	}
 	cfg, err := desiredDispatchConfig(agent, profiles)
+	if err != nil {
+		return nil, err
+	}
+	live := map[string]bool{}
+	for _, p := range cfg.Profiles {
+		live[p.Name] = true
+	}
+	return drainingDispatchProfiles(&applied, live, time.Now()), nil
+}
+
+// reasonDispatchConfigUnreadable is the Warning when the applied dispatch
+// config doesn't decode, so no draining profile can be carried forward.
+const reasonDispatchConfigUnreadable = "DispatchConfigUnreadable"
+
+func buildA2ADispatchConfigMap(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, draining []a2aDispatchProfile) (*corev1.ConfigMap, error) {
+	return buildA2ADispatchConfigMapWith(agent, profiles, nil, draining)
+}
+
+// buildA2ADispatchConfigMapWith is buildA2ADispatchConfigMap with the
+// profiles' Job templates.
+func buildA2ADispatchConfigMapWith(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, jobTemplates map[string]*corev1.PodTemplateSpec, draining []a2aDispatchProfile) (*corev1.ConfigMap, error) {
+	cfg, err := desiredDispatchConfigWith(agent, profiles, jobTemplates, draining)
 	if err != nil {
 		return nil, err
 	}
@@ -616,12 +793,149 @@ func buildA2ADispatchConfigMap(agent *agentv1alpha1.PlatformAgent, profiles []ag
 // follow the profile-namespace rule: a failure there is returned for the
 // caller to log, and the rest still lands.
 func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, profileNamespaceReady bool) (profileErr error, err error) {
-	if !a2aDispatcherEnabled() {
-		return r.removeA2ADispatcher(ctx, agent)
-	}
-	cm, err := buildA2ADispatchConfigMap(agent, profiles)
+	draining, err := r.dispatchDraining(ctx, agent, profiles)
 	if err != nil {
-		return nil, fmt.Errorf("failed to render the dispatch config: %w", err)
+		return nil, err
+	}
+	return r.reconcileA2ADispatcherDraining(ctx, agent, profiles, profileNamespaceReady, draining)
+}
+
+// reconcileA2ADispatcherDraining is reconcileA2ADispatcher with the draining
+// profiles given: reconcileA2AStack reads them once a pass and hands the same
+// set to the identity map, so the two never disagree on a profile's grant.
+func (r *PlatformAgentReconciler) reconcileA2ADispatcherDraining(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, profileNamespaceReady bool, draining []a2aDispatchProfile) (profileErr error, err error) {
+	_, profileErr, err = r.reconcileA2ADispatcherWithJobMode(ctx, agent, profiles, profileNamespaceReady, draining)
+	return profileErr, err
+}
+
+// reconcileA2ADispatcherWithJobMode is reconcileA2ADispatcherDraining, also
+// returning what this pass made of Job mode, for the DispatcherJobMode
+// condition Reconcile writes on its way out (syncDispatcherJobMode).
+// jobModeTornDown when the pass tore Job mode down: the dispatcher disabled
+// and removed, or the signal off and the gate-off sweep done. nil when the
+// pass made nothing of it: a read that answered neither way and changed
+// nothing, or a teardown that failed partway. Returned with the errors too,
+// since a step after the Jobs Role failing doesn't undo what the pass did to
+// it.
+func (r *PlatformAgentReconciler) reconcileA2ADispatcherWithJobMode(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, profileNamespaceReady bool, draining []a2aDispatchProfile) (jobModeVerdict *metav1.Condition, profileErr error, err error) {
+	if !a2aDispatcherEnabled() {
+		profileErr, err = r.removeA2ADispatcher(ctx, agent)
+		if profileErr == nil && err == nil {
+			jobModeVerdict = jobModeTornDown
+		}
+		return jobModeVerdict, profileErr, err
+	}
+	// One rendering of each unattended profile's Job template, into the
+	// dispatch config and into the admission policy's params, so the two
+	// never differ.
+	imageVolumes := r.imageVolumeSupported(agent)
+	jobTemplates := dispatchJobTemplates(agent, profiles, imageVolumes)
+	// Wanted: the chart's signal, and the policy in the cluster as
+	// rendered. A read that answers neither way changes nothing.
+	signal := dispatcherJobPolicyRendered()
+	jobMode := signal
+	if jobMode {
+		ok, why, err := r.dispatcherJobPolicyInPlace(ctx)
+		if err != nil {
+			return nil, nil, fmt.Errorf("check the dispatcher Job admission policy: %w", err)
+		}
+		if !ok {
+			jobMode = false
+			msg := fmt.Sprintf("A2A_DISPATCHER_JOB_POLICY is set but the dispatcher Job admission policy is not in place (%s), %s", why, jobModeOffConsequence)
+			r.recordEvent(agent, corev1.EventTypeWarning, reasonDispatcherJobPolicyMissing, msg)
+			jobModeVerdict = jobModeOff(jobModeReasonPolicyMissing, msg)
+		}
+	}
+	// Wanted, the params and the Jobs Role come before the dispatch config
+	// that names the templates, so the config never says Job mode while the
+	// dispatcher can't run one. Any failure, or a profile namespace not
+	// ready or not selected by the policy's binding (the binding selects
+	// profile namespaces by labels it may lack), or a policy not in place,
+	// revokes the Jobs Role alone and leaves the templates out, so unattended
+	// tasks have no worker (the warm pools serve the read tier only) and are
+	// refused no-worker at admission; Jobs already running stay, since the policy holds
+	// only creates and each was held to its template when made. Only the
+	// signal off (a deliberate gate-off) tears Job mode down, below.
+	// revokeErr is the !jobMode arm's revoke, which the gate-off sweep
+	// below starts from rather than repeat; bundleCopied spares the pool
+	// pass a second copy of the CA bundle.
+	var jobErr, revokeErr error
+	var bundleCopied bool
+	switch {
+	case !jobMode:
+		jobTemplates = nil
+		revokeErr = r.revokeDispatcherJobsRole(ctx, agent)
+		jobErr = revokeErr
+	case !profileNamespaceReady:
+		jobTemplates = nil
+		jobErr = r.revokeDispatcherJobsRole(ctx, agent)
+		jobModeVerdict = jobModeOff(jobModeReasonNamespaceNotReady, fmt.Sprintf(
+			"the profile namespace %s is not ready (absent, without the chart's markers, or its network fence not applied this pass), %s",
+			profileNamespaceName(agent), jobModeOffConsequence))
+	default:
+		selected, err := r.profileNamespaceSelectedByJobPolicy(ctx, agent)
+		if err != nil || !selected {
+			if err == nil {
+				msg := fmt.Sprintf("the profile namespace %s lacks the %s=%s label the dispatcher Job admission policy selects it by, %s",
+					profileNamespaceName(agent), labelPartOf, partOfKubeAgents, jobModeOffConsequence)
+				r.recordEvent(agent, corev1.EventTypeWarning, reasonDispatcherJobPolicyMissing, msg)
+				jobModeVerdict = jobModeOff(jobModeReasonNamespaceNotSelected, msg)
+			}
+			jobTemplates = nil
+			jobErr = goerrors.Join(err, r.revokeDispatcherJobsRole(ctx, agent))
+			if err != nil {
+				jobModeVerdict = jobModeGrantFailed(jobErr)
+			}
+			break
+		}
+		// The NATS CA bundle the Job pods mount, copied before the templates
+		// and the Jobs Role are published, so no Job is created on a bundle
+		// that isn't there.
+		if len(jobTemplates) > 0 {
+			if err := r.copyProfileCABundle(ctx, agent); err != nil {
+				jobTemplates = nil
+				jobErr = goerrors.Join(err, r.revokeDispatcherJobsRole(ctx, agent))
+				jobModeVerdict = jobModeGrantFailed(jobErr)
+				break
+			}
+			bundleCopied = true
+		}
+		if err := r.reconcileDispatchJobParams(ctx, agent, jobTemplates); err != nil {
+			jobTemplates = nil
+			jobErr = goerrors.Join(err, r.revokeDispatcherJobsRole(ctx, agent))
+			jobModeVerdict = jobModeGrantFailed(jobErr)
+			// A foreign param stands until somebody removes it, which no
+			// retry does, so it has a reason of its own; its error says
+			// which object.
+			if goerrors.As(err, new(errForeignDispatchJobParam)) {
+				jobModeVerdict = jobModeOff(jobModeReasonForeignJobTemplate, err.Error())
+			}
+			break
+		}
+		jobModeVerdict = jobModeOn(profileNamespaceName(agent))
+		for _, obj := range []client.Object{buildA2ADispatcherJobsRole(agent), buildA2ADispatcherJobsRoleBinding(agent)} {
+			if err := r.applyManaged(ctx, agent, obj); err != nil {
+				jobTemplates = nil
+				jobErr = goerrors.Join(fmt.Errorf("the dispatcher's Jobs %T: %w", obj, err), r.revokeDispatcherJobsRole(ctx, agent))
+				jobModeVerdict = jobModeGrantFailed(jobErr)
+				break
+			}
+		}
+	}
+	// A profile whose Job pods would never schedule got no template; the
+	// error names it, as the pool path's does.
+	jobErr = goerrors.Join(dispatchJobToolsProblems(agent, profiles, imageVolumes), jobErr)
+	for i := range profiles {
+		if jobTemplates[profiles[i].Name] == nil {
+			continue
+		}
+		if problem := autopilotRatioProblem(&profiles[i]); problem != "" {
+			r.recordEvent(agent, corev1.EventTypeWarning, reasonProfileJobResources, "AgentProfile "+profiles[i].Name+": "+problem)
+		}
+	}
+	cm, err := buildA2ADispatchConfigMapWith(agent, profiles, jobTemplates, draining)
+	if err != nil {
+		return jobModeVerdict, nil, fmt.Errorf("failed to render the dispatch config: %w", err)
 	}
 	// A ceiling too small for every reserve is said out loud, so nobody
 	// finds out by interactive users waiting.
@@ -648,7 +962,7 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 	// only ensures it exists.
 	signingKey, err := r.ensureA2ATaskSigningKeySecret(ctx, agent)
 	if err != nil {
-		return nil, fmt.Errorf("failed to ensure the A2A task-signing key for the dispatcher: %w", err)
+		return jobModeVerdict, nil, fmt.Errorf("failed to ensure the A2A task-signing key for the dispatcher: %w", err)
 	}
 	dispatcher := buildA2ADispatcherDeployment(agent)
 	// The seed is a file mount, so a repaired key wouldn't reach a running
@@ -666,27 +980,45 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 	}
 	for _, obj := range owned {
 		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
-			return nil, err
+			return jobModeVerdict, nil, err
 		}
 		if err := r.applyManaged(ctx, agent, obj); err != nil {
-			return nil, fmt.Errorf("failed to apply the A2A dispatcher's %T: %w", obj, err)
+			return jobModeVerdict, nil, fmt.Errorf("failed to apply the A2A dispatcher's %T: %w", obj, err)
 		}
 	}
 	if !profileNamespaceReady {
-		return nil, nil
+		return jobModeVerdict, jobErr, nil
 	}
 	for _, obj := range []client.Object{buildA2ADispatcherPodsRole(agent), buildA2ADispatcherPodsRoleBinding(agent)} {
 		if err := r.applyManaged(ctx, agent, obj); err != nil {
-			return fmt.Errorf("the dispatcher's pod-read %T: %w", obj, err), nil
+			return jobModeVerdict, fmt.Errorf("the dispatcher's pod-read %T: %w", obj, err), nil
+		}
+	}
+	// Gated off: what an earlier pass rendered goes, before the pools, so
+	// the CA bundle (which the Job pods mount too) goes after the Jobs.
+	// The !jobMode arm has revoked the Jobs Role, deleteDispatcherJobResources'
+	// first step, so the sweep goes on from there.
+	var sweepErr error
+	if !signal {
+		sweepErr = revokeErr
+		if sweepErr == nil {
+			sweepErr = r.deleteDispatcherJobsAndTemplates(ctx, agent)
 		}
 	}
 	// The warm pools the dispatcher hands interactive tasks to
 	// (agentprofile_pool.go). A failure there is the profile namespace's,
-	// like the quota's.
-	if err := r.reconcileProfilePools(ctx, agent, profiles, resolved); err != nil {
-		return err, nil
+	// like the quota's. With no pool the CA bundle stays while Job mode is
+	// signalled: a revoke or a transient failure above leaves templates out
+	// but running Jobs in place, and their pods mount it. Only the gate-off
+	// sweep, once it has deleted the Jobs, lets it go.
+	poolErr := r.reconcileProfilePools(ctx, agent, profiles, resolved, bundleCopied, signal || sweepErr != nil)
+	if !signal {
+		if sweepErr == nil {
+			jobModeVerdict = jobModeTornDown
+		}
+		return jobModeVerdict, goerrors.Join(poolErr, sweepErr), nil
 	}
-	return nil, nil
+	return jobModeVerdict, goerrors.Join(jobErr, poolErr), nil
 }
 
 // removeA2ADispatcher deletes what reconcileA2ADispatcher rendered: the
@@ -713,12 +1045,14 @@ func (r *PlatformAgentReconciler) removeA2ADispatcher(ctx context.Context, agent
 }
 
 // deleteDispatcherPodsRBAC removes what the dispatcher left in the profile
-// namespace: its pod-read Role and binding, and this agent's warm pools.
+// namespace: its pod-read Role and binding, this agent's warm pools, and Job
+// mode's Jobs, Job templates and Jobs Role (deleteDispatcherJobResources),
+// each if it carries this agent's labels.
 func (r *PlatformAgentReconciler) deleteDispatcherPodsRBAC(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	// The warm pools go whatever happens to the RBAC: they have no owner
+	// Each runs whatever the others return: the warm pools have no owner
 	// reference, so nothing else would reclaim pods holding bus and broker
 	// tokens.
-	return goerrors.Join(r.deleteDispatcherPodReadRBAC(ctx, agent), r.deleteProfilePools(ctx, agent))
+	return goerrors.Join(r.deleteDispatcherPodReadRBAC(ctx, agent), r.deleteProfilePools(ctx, agent), r.deleteDispatcherJobResources(ctx, agent))
 }
 
 // deleteDispatcherPodReadRBAC removes the dispatcher's pod-read Role and

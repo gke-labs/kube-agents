@@ -366,6 +366,11 @@ data:
           memory_notifications: "off"
           tool_progress: "off"
     kanban:
+      admission:
+        fail_closed: true
+        memory_budget_mib: 4096
+        queue_bound_seconds: 600
+        worker_rss_cap_mib: 1536
       max_in_progress: 6
     model:
       api_key: none
@@ -610,6 +615,26 @@ metadata:
       name: platformagent
       uid: ""
 ---
+apiVersion: v1
+data:
+  rules.json: ""
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-event-watcher-alert-exclude
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -759,6 +784,8 @@ spec:
               value: read-only-dry-run
             - name: KUBE_PROXY_REDACT_SECRETS
               value: "true"
+            - name: GOMEMLIMIT
+              value: "912680550"
             - name: CREDENTIAL_PROXY_AUDIENCE
               value: kubeagents-credential-proxy
             - name: CREDENTIAL_PROXY_ALLOWED_CALLERS
@@ -799,10 +826,10 @@ spec:
           resources:
             limits:
               cpu: "1"
-              memory: 512Mi
+              memory: 1Gi
             requests:
               cpu: 100m
-              memory: 256Mi
+              memory: 512Mi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -1022,6 +1049,8 @@ spec:
               value: http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765
             - name: CREDENTIAL_PROXY_TOKEN_FILE
               value: /var/run/secrets/kubeagents/credential-proxy/token
+            - name: CREDENTIAL_PROXY_EXEC_URL
+              value: http://platformagent-credential-proxy-exec-tier.kubeagents-system.svc.cluster.local:8765
             - name: KUBE_PROXY_URL
               value: https://platformagent-kube-proxy.kubeagents-system.svc.cluster.local:8443
             - name: KUBE_PROXY_CA_FILE
@@ -1260,6 +1289,10 @@ spec:
             matchLabels:
               app: platformagent-credential-proxy
               kubeagents.x-k8s.io/component: credential-proxy
+        - podSelector:
+            matchLabels:
+              app: platformagent-credential-proxy-exec-tier
+              kubeagents.x-k8s.io/component: credential-proxy-exec-tier
     - ports:
         - port: 8443
           protocol: TCP
@@ -1415,8 +1448,6 @@ spec:
               value: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
             - name: CREDENTIAL_PROXY_KUBE_TOKEN_FILE
               value: /var/run/secrets/kubernetes.io/serviceaccount/token
-            - name: CREDENTIAL_PROXY_CONTENT_WORKSPACE
-              value: "1"
             - name: GKE_PROJECT_ID
               value: example-project
             - name: GKE_CLUSTER_NAME
@@ -1913,7 +1944,7 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       serviceAccountName: kubeagents-platform-agent
-      terminationGracePeriodSeconds: 45
+      terminationGracePeriodSeconds: 380
       volumes:
         - configMap:
             name: platformagent-credential-proxy-policy
@@ -2155,7 +2186,7 @@ spec:
               memory: 8Gi
             requests:
               cpu: "1"
-              memory: 2Gi
+              memory: 4Gi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -2406,6 +2437,13 @@ spec:
               value: http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765
             - name: WATCHER_BROKER_TOKEN_FILE
               value: /var/run/secrets/kubeagents/watcher-proxy/token
+            - name: WATCHER_ALERT_EXCLUDE
+              valueFrom:
+                configMapKeyRef:
+                  key: rules.json
+                  name: platformagent-event-watcher-alert-exclude
+            - name: WATCHER_ALERT_EXCLUDE_FILE
+              value: /etc/kube-agents/event-watcher/rules.json
             - name: CREDENTIAL_PROXY_WORKSPACE_ROOT
               value: /opt/data
             - name: EVENT_WATCHER_CLUSTER_NAME
@@ -2466,6 +2504,9 @@ spec:
               name: platform-agent-data-vol
             - mountPath: /var/run/secrets/kubeagents/watcher-proxy
               name: watcher-credential-proxy-token
+              readOnly: true
+            - mountPath: /etc/kube-agents/event-watcher
+              name: event-watcher-alert-exclude
               readOnly: true
       securityContext:
         fsGroup: 10000
@@ -2544,6 +2585,9 @@ spec:
                         apiVersion: v1
                         fieldPath: metadata.namespace
                       path: namespace
+        - configMap:
+            name: platformagent-event-watcher-alert-exclude
+          name: event-watcher-alert-exclude
         - name: agent-credential-proxy-token
           projected:
             defaultMode: 256

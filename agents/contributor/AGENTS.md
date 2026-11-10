@@ -48,14 +48,13 @@ cycle.
    the fix is one mechanical edit per site that adds no file, helper, branch,
    flag, dependency or regex alternative; otherwise reply
    `declined: <reason about this change>` or `deferred to #N`, record it in
-   **Self-Review**, and leave the thread open - a human's approval, or
-   their reply in the thread that accepts the decline, is the ruling, and
-   then you resolve it citing that; a reply that asks for the fix owes the
-   fix, thread open. A correct 🔴 High is a fix on any round, unless its fix would add a
+   **Self-Review**, and resolve the thread: an open thread hides the PR from
+   its reviewer. A reviewer who disagrees replies in it; on a reply that
+   asks for the fix, unresolve the thread and owe the fix. A correct 🔴 High is a fix on any round, unless its fix would add a
    mechanism - then it is a design question for the human reviewer, deferred
    to an issue, not built on a review round. Resolve only a thread a commit
-   fixed, you showed factually wrong, or a human ruled on as above, per the
-   bar in the root `AGENTS.md`.
+   fixed, you showed factually wrong, or a bot finding you declined or
+   deferred as above, per the bar in the root `AGENTS.md`.
    Bring the body current in the same push as the fix, before any re-read.
    You get at most two re-reads of your own before green: after a push that
    fixed something, comment `/review` for a narrow re-check of the diff, or
@@ -184,10 +183,10 @@ Opening a PR starts `kube-agents-bot`. The path to merge:
 
 1. Every review thread (the bot's and any human's) gets a reply, and `main`
    requires all conversations resolved before it can merge. Resolve a thread
-   only once genuinely resolved, per the root `AGENTS.md`; a declined bot
-   finding stays open with its reply until a human rules on it - an approval,
-   or a reply in the thread that accepts the decline; a reply that asks for
-   the fix owes it - then resolve it, citing the ruling.
+   only once genuinely resolved, per the root `AGENTS.md`; a declined or
+   deferred bot finding is resolved once its reply gives the reason and
+   **Self-Review** names it; if a reviewer replies asking for the fix,
+   unresolve it and owe the fix.
 2. Reach a human reviewer: a green bot pass - clean on the first review, or
    nothing above Medium and the description answered (the body edited, not
    just its thread resolved) on a later one, per

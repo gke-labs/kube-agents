@@ -98,8 +98,17 @@ const (
 	// chatFeedbackNegativeSeries is the chat plugin's count of thumbs-down
 	// reactions a person put on the bot's messages, summed over its platform
 	// label into negativeFeedbackTotal; the chat_feedback_reactions hook feeds
-	// it, and no A2A family joins it.
+	// it.
 	chatFeedbackNegativeSeries = "kubeagents_chat_feedback_negative_total"
+	// a2aAnswerFeedbackSeries is the A2A gateway's count of the ratings
+	// verified senders gave its answers, by platform and rating: under
+	// a2aRatingDown the next-mode half of negativeFeedbackTotal, under
+	// a2aRatingUp the whole of positiveFeedbackTotal, each summed over the
+	// family's other labels (a2a/gateway/metrics.go).
+	a2aAnswerFeedbackSeries = "kubeagents_a2a_gateway_answer_feedback_total"
+	a2aRatingLabel          = "rating"
+	a2aRatingUp             = "up"
+	a2aRatingDown           = "down"
 	// a2aMessagesInboundSeries is the A2A gateway's counter of the chat
 	// messages it accepted as turns, by platform: the same counter on a
 	// next-mode install, where Chat ingress is the A2A gateway's rather than
@@ -134,6 +143,15 @@ const (
 	// no family before. The origins reading (usageReadingOrigins) maps each
 	// origin, summed over the platform label, to status.usage.
 	proposalsOpenedSeries = "kubeagents_proposals_opened"
+	// proposalsOpenedReadAgeSeries is the plugin's label-less gauge of the
+	// seconds since its last successful ledger read, served only beside
+	// proposalsOpenedSeries: 0 after a good read, growing while failed reads
+	// keep the last counts.
+	proposalsOpenedReadAgeSeries = "kubeagents_proposals_opened_read_age_seconds"
+	// proposalsReadAgeLimit is the oldest ledger read the origins reading
+	// accepts: two poll intervals, so a ledger that has not answered for two
+	// polls reads as a miss and the two-miss rule clears the nine fields.
+	proposalsReadAgeLimit = 2 * usageCountersPollInterval
 	proposalsOriginLabel  = "origin"
 	// The nine origins the ledger counts, in the chat plugin's ORIGINS order.
 	proposalOriginChat      = "chat"
@@ -180,6 +198,13 @@ const (
 	// at clusterUpMonitored the clusters monitored.
 	clusterUpSeries    = "k8s_event_watcher_cluster_up"
 	clusterUpMonitored = 1
+	// The series' three labels, the cluster's triple as the watcher's profile
+	// names it, read into usageClusterGauges.Refs for the ScopeUndeclared
+	// condition (usage_scope.go). Label values are the peer's text and are
+	// validated where they are printed, not here.
+	clusterUpClusterLabel  = "cluster"
+	clusterUpProjectLabel  = "project"
+	clusterUpLocationLabel = "location"
 	// usageClusterGaugeCeiling bounds the series counted into the gauges in one
 	// body. The gauges are a reading, not an accumulation, so the per-poll delta
 	// ceiling does not reach them; this is what bounds what a body on the
@@ -196,6 +221,19 @@ const (
 	dataVolumeKindLabel = "kind"
 	dataVolumeKindTotal = "total"
 	dataVolumeKindFree  = "free"
+	// kanbanDispatcherFailedTicksSeries is the chat plugin's gauge of the
+	// kanban dispatcher's consecutive failed ticks, one series per failing
+	// board, with the class of the last failure; a good tick drops the board's
+	// series. Read from the body that serves kanbanGaveUpSeries, which only the
+	// chat_metrics listener does, and projected to the KanbanDispatcherFailing
+	// condition (usage_kanban_dispatcher.go).
+	kanbanDispatcherFailedTicksSeries = "kubeagents_kanban_dispatcher_failed_ticks"
+	kanbanDispatcherBoardLabel        = "board"
+	kanbanDispatcherErrorLabel        = "error"
+	// usageDispatcherBoardCeiling bounds the failing boards one body may list,
+	// refused rather than clamped as usageClusterGaugeCeiling is. Hermes keeps
+	// a handful of boards; a body past this is a broken one.
+	usageDispatcherBoardCeiling = 1000
 	// toolInvocationsStatusLabel is the broker's outcome label. The outcomes
 	// toolInvocationsCountedStatuses sums are the broker's success and error:
 	// the commands it ran and the requests it rejected or failed on before
@@ -280,12 +318,11 @@ var (
 		},
 		"git": {
 			"add", "am", "apply", "archive", "blame", "branch", "bundle", "cat-file",
-			"check-ref-format", "checkout", "cherry-pick", "clean", "clone", "commit",
-			"describe", "diff", "fetch", "grep", "init", "log", "ls-files", "ls-remote",
-			"ls-tree", "merge", "merge-base", "mv", "pull", "push", "rebase", "remote",
-			"reset", "restore", "rev-list", "rev-parse", "revert", "rm", "show",
-			"sparse-checkout", "stash", "status", "submodule", "switch", "symbolic-ref",
-			"tag", "update-ref", "version", "worktree",
+			"checkout", "cherry-pick", "clean", "clone", "commit", "describe", "fetch",
+			"init", "log", "ls-files", "ls-remote", "ls-tree", "merge", "merge-base", "mv",
+			"pull", "push", "rebase", "remote", "reset", "restore", "rev-list", "rev-parse",
+			"revert", "rm", "show", "sparse-checkout", "stash", "status", "submodule",
+			"switch", "symbolic-ref", "tag", "update-ref", "version", "worktree",
 		},
 		"gh": {
 			"api", "auth", "browse", "gist", "issue", "label", "pr", "project", "release",
@@ -349,6 +386,8 @@ func usageSeriesFor(counter string) (family string, filter usageLabelFilter) {
 		return kanbanGaveUpSeries, nil
 	case usageCounterNegativeFeedback:
 		return chatFeedbackNegativeSeries, nil
+	case usageCounterPositiveFeedback:
+		return a2aAnswerFeedbackSeries, usageLabelFilter{a2aRatingLabel: {a2aRatingUp: true}}
 	default:
 		return toolInvocationsSeries, usageLabelFilter{toolInvocationsStatusLabel: toolInvocationsCountedStatuses}
 	}
@@ -359,7 +398,9 @@ func usageSeriesFor(counter string) (family string, filter usageLabelFilter) {
 // each with its own filter: the chat counter and the chat sessions come from
 // the chat_metrics plugin on a gateway pod and from the A2A gateway on its own
 // pod, under the same label set; the errored counter comes from the plugin
-// whole and from the A2A gateway's task terminals under the errored states.
+// whole and from the A2A gateway's task terminals under the errored states;
+// the thumbs-downs come from the plugin whole and from the A2A gateway's
+// answer ratings under the down rating.
 func usageSiblingsFor(counter string) []usageSibling {
 	switch counter {
 	case usageCounterChatMessagesInbound:
@@ -368,6 +409,8 @@ func usageSiblingsFor(counter string) []usageSibling {
 		return []usageSibling{{family: a2aSessionsSeries}}
 	case usageCounterChatTurnsErrored:
 		return []usageSibling{{family: a2aTaskTerminalsSeries, filter: usageLabelFilter{a2aTerminalStateLabel: a2aErroredTerminalStates}}}
+	case usageCounterNegativeFeedback:
+		return []usageSibling{{family: a2aAnswerFeedbackSeries, filter: usageLabelFilter{a2aRatingLabel: {a2aRatingDown: true}}}}
 	}
 	return nil
 }
@@ -467,9 +510,15 @@ func usageReadingAged(kind usageReadingKind) bool {
 // reading is present when both its windows resolved, with no age series:
 // the gateway serves both windows together or neither, so one alone is no
 // reading. The origins reading is present when all nine origins resolved,
-// each on at least one sample, sum fields though they are, again with no age
-// series: the chat plugin serves a row for every origin, zero included, from
-// its first ledger read on, and no family before it.
+// each on at least one sample, sum fields though they are, and the body
+// carried no proposalsOpenedReadAgeSeries above proposalsReadAgeLimit: the
+// chat plugin serves a row for every origin, zero included, from its first
+// ledger read on, and keeps serving the last counts while later reads fail,
+// so only the age tells fresh counts from stale ones. A body with the counts
+// and no age series, a plugin from before the age, keeps the old rule and is
+// present: an agent image can be pinned apart from the operator, and nine
+// fields absent with no cause would be worse than counts the plugin still
+// vouches for.
 func usageReadingPresence(kind usageReadingKind) func(f *usageReadingFold) bool {
 	if kind == usageReadingTopTools {
 		// The tool counter is the broker's own, served from its first request
@@ -490,6 +539,9 @@ func usageReadingPresence(kind usageReadingKind) func(f *usageReadingFold) bool 
 		}
 	}
 	return func(f *usageReadingFold) bool {
+		if kind == usageReadingOrigins && f.originsAgeSeen && f.originsAge > proposalsReadAgeLimit.Seconds() {
+			return false
+		}
 		for i, spec := range f.specs {
 			if spec.reading == kind && !f.resolved[i] {
 				return false
@@ -518,11 +570,29 @@ type usageReading struct {
 	// carried no complete one: not the watcher's, or a watcher whose statfs
 	// failed, or one built before it exported the series.
 	DataVolume *usageDataVolume
+	// Dispatcher is the chat plugin's kanban dispatcher reading, nil for any
+	// body but the chat_metrics listener's; an empty one when no board is
+	// failing or the plugin predates the series.
+	Dispatcher *usageDispatcherReading
 	// ToolPairs is the broker's tool counter by tool and subcommand, under
 	// the closed vocabularies, for a body asked for usageReadingTopTools;
 	// nil for any other. Not folded: the poll sums it across the broker pods
 	// read and projects the top rows as they stand (usageTopToolsForPoll).
 	ToolPairs map[usageToolPair]usageToolCounts
+}
+
+// usageDispatcherReading is the kanban dispatcher's failing boards in one
+// body: each board's consecutive failed ticks and the class of its last
+// failure.
+type usageDispatcherReading struct {
+	Failing []usageDispatcherFailure
+}
+
+// usageDispatcherFailure is one board's failed-tick streak.
+type usageDispatcherFailure struct {
+	Board string
+	Error string
+	Ticks int64
 }
 
 // usageDataVolume is one reading of the agent's data volume, in bytes.
@@ -538,6 +608,20 @@ type usageDataVolume struct {
 type usageClusterGauges struct {
 	Registered int64
 	Monitored  int64
+	// Refs is every series' triple as the watcher labelled it, in body order,
+	// one per Registered; read by the ScopeUndeclared condition (usage_scope.go).
+	// The values are the peer's text, unvalidated here.
+	Refs []usageClusterRef
+}
+
+// usageClusterRef is one cluster_up series' labels: the cluster's name, project
+// and location as its profile's identity names them. The watcher's directly
+// reached cluster carries an empty project and location until its profile is
+// absorbed.
+type usageClusterRef struct {
+	Name     string
+	Project  string
+	Location string
 }
 
 // usageScrapeError is a scrape that produced no body to count, with a kind the
@@ -675,6 +759,9 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 	var clusters *usageClusterGauges
 	// volume collects the data volume series; a reading needs both kinds.
 	var volume map[string]float64
+	// dispatcher collects the kanban dispatcher's failing boards, for the
+	// chat_metrics listener's body alone.
+	var dispatcher *usageDispatcherReading
 	// readsOf is every (counter, filter) pair a family feeds, so a sibling
 	// family takes its own filter, not the one its counter's own family takes.
 	readsOf := make(map[string][]usageRead, len(counters))
@@ -697,6 +784,10 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 			volume = map[string]float64{}
 			wanted = append(wanted, clusterUpSeries, dataVolumeSeries)
 		}
+		if family == kanbanGaveUpSeries {
+			dispatcher = &usageDispatcherReading{}
+			wanted = append(wanted, kanbanDispatcherFailedTicksSeries)
+		}
 	}
 	// The reading slot, for a body asked for readings: a running sum per spec
 	// of the kinds asked for, whether a sample resolved it, and the readings
@@ -709,9 +800,6 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 	if len(kinds) > 0 {
 		readings = newUsageReadingFold(kinds)
 		families := readings.families()
-		if slices.ContainsFunc(kinds, usageReadingAged) {
-			families = append([]string{vcsReadingsAgeSeries}, families...)
-		}
 		if slices.Contains(kinds, usageReadingTopTools) {
 			pairs = map[usageToolPair]map[string]float64{}
 			families = append(families, toolInvocationsSeries)
@@ -768,6 +856,9 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 				}
 				for _, metric := range mf.GetMetric() {
 					value, ok := usageSampleValue(metric)
+					// A wanted family's sample that is not a finite non-negative number
+					// fails the scrape; the plugin's read age is clamped at zero on a
+					// monotonic clock and printed finite, so it cannot trip this.
 					if !ok || math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
 						return usageReading{}, &usageScrapeError{Kind: usageScrapeKindSample}
 					}
@@ -782,6 +873,17 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 						}
 						continue
 					}
+					if name == kanbanDispatcherFailedTicksSeries {
+						if len(dispatcher.Failing) >= usageDispatcherBoardCeiling || value >= float64(math.MaxInt64) {
+							return usageReading{}, &usageScrapeError{Kind: usageScrapeKindSample}
+						}
+						dispatcher.Failing = append(dispatcher.Failing, usageDispatcherFailure{
+							Board: usageLabelValue(metric, kanbanDispatcherBoardLabel),
+							Error: usageLabelValue(metric, kanbanDispatcherErrorLabel),
+							Ticks: int64(value),
+						})
+						continue
+					}
 					if name == clusterUpSeries {
 						clusters.Registered++
 						if clusters.Registered > usageClusterGaugeCeiling {
@@ -790,6 +892,11 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 						if value == clusterUpMonitored {
 							clusters.Monitored++
 						}
+						clusters.Refs = append(clusters.Refs, usageClusterRef{
+							Name:     usageLabelValue(metric, clusterUpClusterLabel),
+							Project:  usageLabelValue(metric, clusterUpProjectLabel),
+							Location: usageLabelValue(metric, clusterUpLocationLabel),
+						})
 						continue
 					}
 					if pairs != nil && name == toolInvocationsSeries {
@@ -819,7 +926,7 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 		}
 		samples[counter] = int64(sum)
 	}
-	out := usageReading{Samples: samples, StartTime: start, Clusters: clusters, DataVolume: usageDataVolumeReading(volume)}
+	out := usageReading{Samples: samples, StartTime: start, Clusters: clusters, DataVolume: usageDataVolumeReading(volume), Dispatcher: dispatcher}
 	if readings != nil {
 		var ok bool
 		if out.Readings, out.ReadingsPresent, ok = readings.result(); !ok {
@@ -901,13 +1008,18 @@ func usageDataVolumeReading(volume map[string]float64) *usageDataVolume {
 
 // usageReadingFold is the reading slot's state through one body: the kinds
 // asked for, their specs, and per spec its running sum and whether a sample
-// resolved it.
+// resolved it; the broker readings whose age series the body carried; and,
+// for the origins reading, the age value the body carried.
 type usageReadingFold struct {
 	kinds    []usageReadingKind
 	specs    []usageReadingSpec
 	sums     []float64
 	resolved []bool
 	aged     map[usageReadingKind]bool
+	// originsAge is the plugin's read age when the body carried it, the
+	// largest of any repeated sample; originsAgeSeen says whether it did.
+	originsAge     float64
+	originsAgeSeen bool
 }
 
 func newUsageReadingFold(kinds []usageReadingKind) *usageReadingFold {
@@ -921,9 +1033,16 @@ func newUsageReadingFold(kinds []usageReadingKind) *usageReadingFold {
 	}
 }
 
-// families is every family a field of the fold's readings is read from.
+// families is every family a field of the fold's readings is read from, and
+// the age series of the readings whose presence needs one.
 func (f *usageReadingFold) families() []string {
 	var families []string
+	if slices.ContainsFunc(f.kinds, usageReadingAged) {
+		families = append(families, vcsReadingsAgeSeries)
+	}
+	if slices.Contains(f.kinds, usageReadingOrigins) {
+		families = append(families, proposalsOpenedReadAgeSeries)
+	}
 	for _, spec := range f.specs {
 		if !slices.Contains(families, spec.family) {
 			families = append(families, spec.family)
@@ -932,13 +1051,23 @@ func (f *usageReadingFold) families() []string {
 	return families
 }
 
-// fold takes one sample of family name into the reading fields it feeds, or
-// marks a reading aged, and reports whether name is a readings family.
+// fold takes one sample of family name into the reading fields it feeds,
+// marks a reading aged, or records the origins reading's age, and reports
+// whether name is a readings family.
 func (f *usageReadingFold) fold(name string, metric *dto.Metric, value float64) bool {
 	if name == vcsReadingsAgeSeries && slices.ContainsFunc(f.kinds, usageReadingAged) {
 		kind := usageReadingKind(usageLabelValue(metric, vcsReadingsReadingLabel))
 		if slices.Contains(f.kinds, kind) && usageReadingAged(kind) {
 			f.aged[kind] = true
+		}
+		return true
+	}
+	if name == proposalsOpenedReadAgeSeries && slices.Contains(f.kinds, usageReadingOrigins) {
+		// The plugin renders one sample; a body that repeats it is judged by
+		// the oldest, so a stale ledger cannot pass on a fresh duplicate.
+		if !f.originsAgeSeen || value > f.originsAge {
+			f.originsAge = value
+			f.originsAgeSeen = true
 		}
 		return true
 	}

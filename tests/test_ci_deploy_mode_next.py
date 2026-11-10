@@ -53,6 +53,7 @@ that ships.
 
 import json
 import pathlib
+import tempfile
 import re
 import shlex
 import subprocess
@@ -99,14 +100,19 @@ _PLATFORM_URI = f"{_AR_REPO}/platform-agent:{_TAG}"
 _FLAG_UNSET_SPELLINGS = (None, "", "0", "true", "yes")
 # The Prow jobs (oss-test-infra) section 2b admits the flag on without a pull
 # request: the merge-blocking presubmit (in a batch Tide ran), the main
-# nightly's three parts, the forge lanes' next-mode nightlies and weekly
+# nightly's eight parts, the forge lanes' next-mode nightlies and weekly
 # jobs, and the certification lane's first slice; the today-mode GitLab nightly and a
 # made-up job stand for every other Prow run.
 _NEXT_LANE_JOB_NAMES = (
     "pull-kube-agents-smoke-test",
     "ci-kube-agents-eval-nightly",
     "ci-kube-agents-eval-nightly-main-b",
+    "ci-kube-agents-eval-nightly-main-c",
+    "ci-kube-agents-eval-nightly-main-d",
+    "ci-kube-agents-eval-nightly-main-e",
     "ci-kube-agents-eval-nightly-writers",
+    "ci-kube-agents-eval-nightly-writers-b",
+    "ci-kube-agents-eval-nightly-writers-c",
     "ci-kube-agents-eval-nightly-gitlab-next",
     "ci-kube-agents-eval-nightly-ghes-next",
     "ci-kube-agents-eval-nightly-gitlab-ce-next",
@@ -115,6 +121,8 @@ _NEXT_LANE_JOB_NAMES = (
     "ci-kube-agents-certification-1",
     # The release-candidate eval: a postsubmit, so no PULL_NUMBER.
     "post-kube-agents-eval-rc",
+    # The replay lane: a periodic replaying the next-mode nightlies' recordings.
+    "ci-kube-agents-eval-replay-lane",
 )
 _RC_REGISTRY_PREFIX = "ghcr.io/gke-labs/kube-agents"
 _RC_COMMIT_SHA = "b4ee5f3eb9c2aceb7f03460d2e573278ab9483fe"
@@ -1868,6 +1876,42 @@ class BridgeImageBuildTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("built FROM this run's platform image", result.stderr)
         self.assertEqual(result.stdout, "")
+
+
+
+class CrStatusReportTest(unittest.TestCase):
+    """report_cr_status: the agent's full status, which names the model the
+    install serves, goes to the job's artifacts; the job log, which Prow
+    streams to anyone while a run is in progress, gets the phase and the
+    Ready condition only."""
+
+    def test_the_log_line_names_no_model_and_the_artifact_holds_the_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_bash(
+                "\n".join(
+                    [
+                        f'export ARTIFACTS="{tmp}/artifacts"',
+                        'export NAMESPACE="kubeagents-system"',
+                        'PLATFORM_AGENT_CR_NAME="platform-agent"',
+                        "kubectl() {",
+                        '  case "$*" in',
+                        '    *"-o yaml"*) printf "status:\\n  phase: Running\\n  inference:\\n    model: secret-model-name\\n    provider: vertex_ai\\n" ;;',
+                        '    *jsonpath*) printf "Running\\tAgentReady: the agent is up" ;;',
+                        "  esac",
+                        "}",
+                        lifted_block("readonly DEPLOY_ARTIFACT_DIR=", "readonly CR_PHASE_READY_JSONPATH", "the artifact dir and status constants"),
+                        shell_function("report_cr_status"),
+                        'report_cr_status "probe"',
+                    ]
+                )
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("secret-model-name", result.stdout + result.stderr)
+            self.assertIn("Running", result.stdout)
+            self.assertIn("AgentReady", result.stdout)
+            artifact = pathlib.Path(tmp) / "artifacts" / "platformagent-status-probe.yaml"
+            self.assertTrue(artifact.exists(), result.stdout)
+            self.assertIn("secret-model-name", artifact.read_text())
 
 
 if __name__ == "__main__":

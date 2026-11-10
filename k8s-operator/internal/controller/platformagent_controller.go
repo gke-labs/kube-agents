@@ -179,13 +179,29 @@ const (
 
 	// readyConditionType and degradedPhase are the condition and the phase
 	// getDeploymentStatusDetails reads back off the CR when a pod read failed.
-	// The three phases this controller writes are these constants and never
+	// The four phases this controller writes are these constants and never
 	// a literal: usagePhases (usage_gauges.go) exports them, and a test holds
 	// the package to it.
 	readyConditionType = "Ready"
 	provisioningPhase  = "Provisioning"
 	readyPhase         = "Ready"
 	degradedPhase      = "Degraded"
+	// pausedPhase is the phase of an install whose gateway runs zero replicas
+	// because spec.deployment.scaleToZero asked for it, from the pass that sees
+	// the scale-down converged until the field is cleared. Without it a paused
+	// install read Provisioning with the start-up message, the same words as a
+	// rollout that never finishes, and nothing on the CR told the two apart.
+	pausedPhase = "Paused"
+	// reasonScaledToZero and scaledToZeroMessage are the Ready condition under
+	// pausedPhase. Ready stays False: a paused agent answers nothing.
+	// scaledToZeroNotReadyMsgFmt is the message when a workload that is not
+	// scaled with the gateway (the shell sandbox, the broker, the A2A stack)
+	// has no ready replica either: the pause is still the phase, but the
+	// message may not claim "not failing" over a workload the pod scan found
+	// no fault in and that is nonetheless not up. %s is the not-ready list.
+	reasonScaledToZero         = "ScaledToZero"
+	scaledToZeroMessage        = "Gateway runs zero replicas because spec.deployment.scaleToZero is true; the install is paused, not failing. Set scaleToZero to false to resume"
+	scaledToZeroNotReadyMsgFmt = "Gateway runs zero replicas because spec.deployment.scaleToZero is true; the install is paused, and it is also waiting for %s to become ready. Set scaleToZero to false to resume"
 	// podScanMessagePrefixContainer and podScanMessagePrefixPod open every
 	// message getDeploymentStatusDetails writes, and nothing else that writes
 	// the Ready condition opens with either: the refusals in Reconcile name a
@@ -550,9 +566,9 @@ type PlatformAgentReconciler struct {
 	// change independently.
 	shellSandboxWarningsLogged sync.Map
 
-	// a2aChartPodsWarned records, per CR, the spec generation and discarded
-	// chart-pods annotation value last reported (a2aChartPodsDiscard), so each
-	// generation and value warns once. Keyed by ObjectKey, value
+	// a2aChartPodsWarned records, per CR, the spec generation and the
+	// chart-pods Warning last reported (a2aQuotaAgent), so each generation and
+	// reason warns once. Keyed by ObjectKey, value
 	// a2aChartPodsWarning; cleared when the CR is deleted.
 	a2aChartPodsWarned sync.Map
 
@@ -627,7 +643,9 @@ type PlatformAgentReconciler struct {
 	// credential proxy's default requests (resolveCredentialProxyResourcesFor).
 	// The cluster type cannot change under a running operator, so only an
 	// authoritative probe sets autopilotResolved; a failed one is retried, and
-	// renders the Standard requests meanwhile.
+	// meanwhile the proxy keeps the cluster type it was rendered for, from its
+	// cluster-type annotation or, without one, its requests; else Standard
+	// (liveCredentialProxyAutopilot).
 	autopilotMu       sync.Mutex
 	autopilotResolved bool
 	autopilot         bool
@@ -655,6 +673,10 @@ type PlatformAgentReconciler struct {
 	// for the usage counters poller (usage_counters_poller.go); empty, as
 	// under `make run` off the cluster, renders no such rule.
 	OperatorNamespace string
+
+	// calloutStatus reads an auth callout pod's /status for the
+	// A2AIdentityMapApplied condition (#4487); nil is the HTTP reader.
+	calloutStatus calloutStatusReader
 
 	// otelEndpoint caches the discovered OpenTelemetry collector, cluster-wide — there
 	// is one collector per cluster, not one per agent. Unlike the ImageVolume
@@ -688,6 +710,23 @@ type PlatformAgentReconciler struct {
 // Without the enumeration verbs a cached Secret read cannot be added by accident.
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;update;patch;delete
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
+// `dispatchjobtemplates` are the dispatcher Job admission policy's params in
+// <ns>-profiles (agentprofile_job_template.go), which the operator alone
+// writes; no Role it renders grants the kind, and the built-in admin and edit
+// roles don't aggregate it. `podtemplates` create only: the server-side dry
+// run that defaults a Job template (defaultedJobTemplate), which stores
+// nothing. ClusterRole rules, not Roles: the profile namespace is created at
+// runtime, and RBAC escalation prevention stops the operator granting itself
+// a Role there with verbs it does not already hold. No watch: every read goes
+// through a2aReader(), uncached. Approved by @bnaylor, 2026-10-30 and
+// 2026-10-31 (#3655 PR 6).
+// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=dispatchjobtemplates,verbs=get;list;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=podtemplates,verbs=create
+// `get` on the dispatcher Job admission policy and its binding: before the
+// dispatcher gets its Jobs Role, the operator checks both are in the cluster
+// as rendered (dispatcherJobPolicyInPlace). Read by name, uncached; no list,
+// watch or write. Pending @bnaylor's sign-off (#3655 PR 6).
+// +kubebuilder:rbac:groups=admissionregistration.k8s.io,resources=validatingadmissionpolicies;validatingadmissionpolicybindings,resourceNames=kube-agents-a2a-dispatcher-job,verbs=get
 // `nodes` is still required: buildMinimalPlatformRole grants it to the agent audit
 // ClusterRole, and RBAC escalation-prevention needs the operator to hold it to apply that.
 // +kubebuilder:rbac:groups="",resources=namespaces;nodes;events;persistentvolumes;limitranges;endpoints;pods/log,verbs=get;list;watch
@@ -894,25 +933,35 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// below), so the bus a newer CRD rendered is still standing; clearing the
 	// condition would report it gone, and rewriting it would claim this binary
 	// knows what it describes. Both are worse than leaving it.
+	//
+	// DispatcherJobMode is written on the way out for the same reasons, from
+	// the dispatcher step's verdict (syncDispatcherJobMode), or cleanupA2A's
+	// below. A pass that reached neither leaves it as it was.
 	busCredsMapVersion := ""
+	var dispatcherJobMode *metav1.Condition
 	if modeErr == nil {
 		wantNext := renderMode(instance, "nats") == ModeNext
-		defer func() {
-			if err := r.syncBusCredentialsReady(ctx, instance, wantNext, busCredsMapVersion); err != nil {
-				if retErr == nil {
-					retErr = err
-					return
-				}
-				// The reconcile is already failing and will requeue. If the
-				// failure is already a PlatformAgent conflict being requeued cleanly,
-				// a subsequent conflict writing BusCredentialsReady is the same race
-				// and should not log an Error with a stack trace.
-				if isPlatformAgentConflict(retErr) && errors.IsConflict(err) {
-					log.Info("Conflict writing BusCredentialsReady; pass already requeuing on conflict", "error", err)
-				} else {
-					log.Error(err, "could not write BusCredentialsReady")
-				}
+		exitWrite := func(condition string, err error) {
+			if err == nil {
+				return
 			}
+			if retErr == nil {
+				retErr = err
+				return
+			}
+			// The reconcile is already failing and will requeue. If the
+			// failure is already a PlatformAgent conflict being requeued cleanly,
+			// a subsequent conflict writing the condition is the same race
+			// and should not log an Error with a stack trace.
+			if isPlatformAgentConflict(retErr) && errors.IsConflict(err) {
+				log.Info("Conflict writing "+condition+"; pass already requeuing on conflict", "error", err)
+			} else {
+				log.Error(err, "could not write "+condition)
+			}
+		}
+		defer func() {
+			exitWrite(busCredentialsReadyCondition, r.syncBusCredentialsReady(ctx, instance, wantNext, busCredsMapVersion))
+			exitWrite(dispatcherJobModeCondition, r.syncDispatcherJobMode(ctx, instance, dispatcherJobMode))
 		}()
 	}
 
@@ -984,6 +1033,11 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// 9. Reconcile Credential Proxy Policy ConfigMap
 	proxyPolicyHash, err := r.reconcileCredentialProxyPolicyConfigMap(ctx, instance)
 	if err != nil {
+		return ctrl.Result{}, err
+	}
+	// The event watcher's alert-exclude rules. In no pod-template hash: the
+	// watcher reads the mounted file again, so a change rolls nothing.
+	if err := r.reconcileEventWatcherAlertExcludeConfigMap(ctx, instance); err != nil {
 		return ctrl.Result{}, err
 	}
 	// The gateway's annotation leaves out what only the broker reads, so a
@@ -1190,13 +1244,27 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	var a2aState a2aProvisionState
 	a2aNext := a2aStackRendering(instance)
 	if a2aNext {
-		if a2aState, err = r.reconcileA2A(ctx, instance, homeRec); err != nil {
+		a2aState, err = r.reconcileA2A(ctx, instance, homeRec)
+		// For the deferred write at 2d, failed pass or not: a step after
+		// the dispatcher's failing doesn't undo what it did to Job mode.
+		dispatcherJobMode = a2aState.dispatcherJobMode
+		if err != nil {
 			return ctrl.Result{}, err
 		}
 	} else if modeErr == nil {
-		if err := r.cleanupA2A(ctx, instance); err != nil {
+		tornDown, err := r.cleanupA2AWithJobMode(ctx, instance)
+		if err != nil {
 			return ctrl.Result{}, err
 		}
+		// The dispatcher and its Job mode went with the stack, unless their
+		// profile-namespace teardown failed: then the Jobs Role and templates
+		// are still live and the condition stays as it was.
+		if tornDown {
+			dispatcherJobMode = jobModeTornDown
+		}
+		// No callout, so no claim about its map: the condition goes.
+		removed := a2aIdentityMapRemoved
+		a2aState.calloutMap = &removed
 	}
 	// The record travelled into the render (the projection) and travels on
 	// the state to every status writer below, the failed and parked paths
@@ -1297,7 +1365,10 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// depend on the Deployment's status event alone.
 	// busHeld shares it for the gateway's reason: the bus waits on the
 	// callout's rollout, and the pass that sees it finish has to happen.
-	if a2aNext && (!a2aState.done || a2aState.gatewayHeld || a2aState.gatewayWaking || a2aState.busHeld) {
+	// calloutMap shares it too: a map the callouts are still loading, or
+	// pods that didn't answer, changes nothing the operator watches when it
+	// settles, so the pass that sees it settle has to be scheduled.
+	if a2aNext && a2aState.wantsRequeue() {
 		requeue := a2aPendingRequeue
 		// A held-back Lease recreate can be due sooner (ensureA2AGatewayLease).
 		if a2aState.leaseRequeue > 0 {
@@ -1314,6 +1385,13 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// A held-back Lease recreate is due sooner (ensureA2AGatewayLease).
 		if a2aState.leaseRequeue > 0 {
 			requeue = min(requeue, a2aState.leaseRequeue)
+		}
+		// So is a stuck bus pod's replacement (replaceStuckA2ANATSPod).
+		if a2aState.busPodRequeue > 0 {
+			requeue = min(requeue, a2aState.busPodRequeue)
+		}
+		if credentialProxyExecShort(instance) {
+			requeue = min(requeue, credentialProxyExecShortRequeue)
 		}
 		return ctrl.Result{RequeueAfter: requeue}, nil
 	}
@@ -1360,6 +1438,16 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// else wakes the pass that creates it.
 	if a2aNext && a2aState.leaseRequeue > 0 {
 		requeueAfter = min(requeueAfter, a2aState.leaseRequeue)
+	}
+	// A bus pod stuck on an old revision inside its grace period: the pass
+	// that replaces it has to be asked for, since pods are not watched.
+	if a2aNext && a2aState.busPodRequeue > 0 {
+		requeueAfter = min(requeueAfter, a2aState.busPodRequeue)
+	}
+	// An exec tier short of its count: the scheduler's verdict lands on a pod,
+	// which is not watched, so the pass that reads it has to be asked for.
+	if credentialProxyExecShort(instance) {
+		requeueAfter = min(requeueAfter, credentialProxyExecShortRequeue)
 	}
 	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
@@ -1437,18 +1525,15 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 			return ctrl.Result{}, err
 		}
 		// The profile namespace's quota and fence carry no owner reference
-		// (agentprofile_namespace.go) and are not removed here yet: they stay
-		// until the chart's uninstall deletes the namespace. Removing the
-		// quota on deletion, and what a refused delete should do to the
-		// finalizer, is #3827.
+		// (agentprofile_namespace.go). The quota is removed last, below; the
+		// fence stays until the chart's uninstall deletes the namespace.
 		//
 		// The dispatcher's warm pools there go, with their CA bundle copy
 		// (their pods hold bus and broker tokens), and so does its pod-read
 		// binding, for the ClusterRoleBinding's reason above: left behind,
 		// anyone who later creates a ServiceAccount of the dispatcher's name
 		// inherits pod read in that namespace. A failure is logged and never
-		// holds the finalizer, under the profile-namespace rule (#3827
-		// settles what a refused delete should do).
+		// holds the finalizer, under the profile-namespace rule.
 		if err := r.deleteDispatcherPodsRBAC(ctx, agent); err != nil {
 			r.profileNamespaceFailure(ctx, agent, "delete the dispatcher's warm pools, bundle copy or pod-read Role on deletion", err)
 		}
@@ -1486,6 +1571,15 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 			}
 		case client.IgnoreNotFound(err) != nil:
 			return ctrl.Result{}, err
+		}
+
+		// The profile namespace's quota, left behind, caps a successor's
+		// profile pods. Last, so a refused delete held for its bounded retry
+		// (removeProfileQuotaOnDeletion) holds back nothing else, and the
+		// quota still caps the warm pools until they're gone; every step
+		// above is idempotent across the retries.
+		if wait := r.removeProfileQuotaOnDeletion(ctx, agent, time.Now()); wait > 0 {
+			return ctrl.Result{RequeueAfter: wait}, nil
 		}
 
 		// Resource is deleted. Safe to remove finalizer and update.
@@ -2571,6 +2665,14 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxyPolicyConfigMap(ctx co
 	return getConfigMapHash(cm)
 }
 
+func (r *PlatformAgentReconciler) reconcileEventWatcherAlertExcludeConfigMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	cm := buildEventWatcherAlertExcludeConfigMap(agent)
+	if err := ctrl.SetControllerReference(agent, cm, r.Scheme); err != nil {
+		return err
+	}
+	return r.applyManaged(ctx, agent, cm)
+}
+
 func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, otlpEndpoint string, otlpDisabled bool) error {
 	imageVolumeSupported := r.imageVolumeSupported(agent)
 	r.updatePluginStatuses(ctx, agent, agentPlugins, imageVolumeSupported)
@@ -3275,7 +3377,18 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, 
 	if err != nil {
 		return err
 	}
-	proxy := buildCredentialProxyDeploymentForPlugins(rendered, policyHash, agentPlugins, owned, profiles, r.clusterAutopilot())
+	autopilot, recorded, err := r.credentialProxyAutopilot(ctx, agent)
+	if err != nil {
+		return err
+	}
+	proxy := buildCredentialProxyDeploymentForPlugins(rendered, policyHash, agentPlugins, owned, profiles, autopilot)
+	// The annotation records a cluster type, so only a definite answer, or the
+	// annotation it carries forward, writes one; a guess from the requests is
+	// rendered but not recorded, or the next failed check would read it back
+	// as fact.
+	if !recorded {
+		delete(proxy.Annotations, credentialProxyClusterTypeAnnotation)
+	}
 	if err := r.stampSecretEnvHash(ctx, agent, proxy, &proxy.Spec.Template); err != nil {
 		return err
 	}
@@ -4353,7 +4466,9 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 		shellSandboxImagePinnedConditionCurrent(agent, sandboxPinnedMsg) &&
 		a2aMCPIdentityConditionCurrent(agent, a2a.mcpNotRendered) &&
 		a2aCalloutStalledConditionCurrent(agent, a2a.calloutStalled) &&
-		scopeResolvedConditionCurrent(agent, a2a.scopeCondition) {
+		a2aIdentityMapAppliedConditionCurrent(agent, a2a.calloutMap) &&
+		scopeResolvedConditionCurrent(agent, a2a.scopeCondition) &&
+		gatewayElectedConditionCurrent(agent, gatewayElectedImage(agent, a2a.gatewayElected)) {
 		return nil
 	}
 	if r.liveAgentSatisfies(ctx, agent, func(live *agentv1alpha1.PlatformAgent) bool {
@@ -4364,7 +4479,9 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 			shellSandboxImagePinnedConditionCurrent(live, shellSandboxImagePinnedMsg(live)) &&
 			a2aMCPIdentityConditionCurrent(live, a2a.mcpNotRendered) &&
 			a2aCalloutStalledConditionCurrent(live, a2a.calloutStalled) &&
-			scopeResolvedConditionCurrent(live, a2a.scopeCondition)
+			a2aIdentityMapAppliedConditionCurrent(live, a2a.calloutMap) &&
+			scopeResolvedConditionCurrent(live, a2a.scopeCondition) &&
+			gatewayElectedConditionCurrent(live, gatewayElectedImage(live, a2a.gatewayElected))
 	}) {
 		return nil
 	}
@@ -4377,7 +4494,9 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	setShellSandboxImagePinnedCondition(agent, sandboxPinnedMsg, now)
 	setA2AMCPIdentityCondition(agent, a2a.mcpNotRendered, now)
 	setA2ACalloutStalledCondition(agent, a2a.calloutStalled, now)
+	setA2AIdentityMapAppliedCondition(agent, a2a.calloutMap, now)
 	setScopeResolvedCondition(agent, a2a.scopeCondition, now)
+	setGatewayElectedCondition(agent, gatewayElectedImage(agent, a2a.gatewayElected), now)
 	return r.Status().Update(ctx, agent)
 }
 
@@ -4530,6 +4649,22 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 			newPhase = phaseOverride
 			condReason = reasonOverride
 			condMsg = msgOverride
+		} else if scaleToZeroRequested(agent.Spec.Deployment) && newDeploymentStatusReadyReplicas == 0 {
+			// A gateway at zero because the spec asked for it. After the pod
+			// scan, so a fault in the workloads that keep running (the shell
+			// sandbox, the broker, the A2A stack) still reads Degraded; before
+			// the start-up wait, which is what this install is not. Only once
+			// the scale-down converged: a replica still serving is still Ready,
+			// and the first arm has said so.
+			newPhase = pausedPhase
+			condReason = reasonScaledToZero
+			condMsg = scaledToZeroMessage
+			if len(notReady) > 0 {
+				// The arm below never reaches a paused install (it needs a
+				// gateway replica), so the not-ready list is named here, as
+				// it would be there, rather than hidden behind the pause.
+				condMsg = fmt.Sprintf(scaledToZeroNotReadyMsgFmt, strings.Join(notReady, " and "))
+			}
 		} else if newDeploymentStatusReadyReplicas > 0 && len(notReady) > 0 {
 			// The gateway is up and the pod scan found no fault to name, so the
 			// generic "waiting for replicas" message would point at the one
@@ -4688,6 +4823,8 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// its message so a changed count is one write.
 	replicasLimitedMsg := replicasLimitedMessage(agent)
 	replicasLimitedUnchanged := replicasLimitedConditionCurrent(agent, replicasLimitedMsg)
+	execReady := r.readCredentialProxyExecReady(ctx, agent)
+	execReadyUnchanged := credentialProxyExecReadyCurrent(agent, execReady)
 
 	// The home-channel advisory, from the spec and the record this pass read,
 	// compared on its message for the same reason EventWatcher's is.
@@ -4725,7 +4862,10 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	a2aVerifierUnchanged := a2aVerifierConditionCurrent(agent, verifierNotReady, verifierKnown)
 	a2aMCPServerUnchanged := a2aMCPIdentityConditionCurrent(agent, a2a.mcpNotRendered)
 	a2aCalloutStalledUnchanged := a2aCalloutStalledConditionCurrent(agent, a2a.calloutStalled)
+	identityMapAppliedUnchanged := a2aIdentityMapAppliedConditionCurrent(agent, a2a.calloutMap)
 	scopeResolvedUnchanged := scopeResolvedConditionCurrent(agent, a2a.scopeCondition)
+	gatewayElected := gatewayElectedImage(agent, a2a.gatewayElected)
+	gatewayElectedUnchanged := gatewayElectedConditionCurrent(agent, gatewayElected)
 
 	// A data claim its StorageClass cannot expand, from what growDataClaim
 	// recorded on this pass, compared on its message like VolumesDropped.
@@ -4788,9 +4928,11 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		sandboxPinnedUnchanged &&
 		hostPathDroppedUnchanged &&
 		replicasLimitedUnchanged &&
+		execReadyUnchanged &&
 		a2aGatewayUnchanged &&
 		busProvisionedUnchanged &&
-		a2aVerifierUnchanged && a2aMCPServerUnchanged && a2aCalloutStalledUnchanged && scopeResolvedUnchanged &&
+		a2aVerifierUnchanged && a2aMCPServerUnchanged && a2aCalloutStalledUnchanged && identityMapAppliedUnchanged && scopeResolvedUnchanged &&
+		gatewayElectedUnchanged &&
 		dataVolumeExpansionUnchanged &&
 		existingCond != nil && existingCond.Status == condStatus && existingCond.Reason == condReason && existingCond.Message == condMsg &&
 		existingCond.ObservedGeneration == agent.Generation {
@@ -4867,13 +5009,16 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	setShellSandboxImagePinnedCondition(agent, sandboxPinnedMsg, now)
 	setHostPathDroppedCondition(agent, hostPathDroppedMsg, now)
 	setReplicasLimitedCondition(agent, replicasLimitedMsg, now)
+	setCredentialProxyExecReadyCondition(agent, execReady, now)
 
 	setA2AGatewayCondition(agent, a2aGatewayMsg, now)
 	setBusProvisionedCondition(agent, busProvisionedWanted, a2a.jobName, now)
 	setA2AVerifierCondition(agent, verifierNotReady, verifierKnown, now)
 	setA2AMCPIdentityCondition(agent, a2a.mcpNotRendered, now)
 	setA2ACalloutStalledCondition(agent, a2a.calloutStalled, now)
+	setA2AIdentityMapAppliedCondition(agent, a2a.calloutMap, now)
 	setScopeResolvedCondition(agent, a2a.scopeCondition, now)
+	setGatewayElectedCondition(agent, gatewayElected, now)
 	setDataVolumeExpansionCondition(agent, dataVolumeMsg, dataVolumeKnown, now)
 
 	// Copied before the write: decoding the response may reuse the pointer's target.
@@ -5434,7 +5579,10 @@ func networkPolicyStatusUnchanged(status agentv1alpha1.NetworkPolicyStatus, prof
 // the usage poll (its four groups share three distinct selectors, every
 // usageCountersPollInterval), one per reconcile while the CR has plugins, and
 // three more per reconcile while the agent is not Ready — five of those where
-// the A2A stack renders. Each is namespace-scoped and label-selected
+// the A2A stack renders — one per reconcile while the exec tier is short
+// of its count (credentialProxyExecUnschedulablePod), and one Get of the bus
+// pod per reconcile while a bus replica is not on the StatefulSet's update
+// revision (replaceStuckA2ANATSPod). Each is namespace-scoped and label-selected
 // server-side, and controller-runtime leaves client-side rate limiting off
 // (cfg.QPS = -1, API Priority and Fairness instead), so they queue behind
 // nothing of the operator's own.
@@ -5795,9 +5943,9 @@ const (
 // degradedStatusCurrent reports whether the given PlatformAgent's status matches
 // what updateStatusDegraded would write. The comparison is keyed on phase, the Ready
 // condition's status, reason, message, and observedGeneration, plus the rendered-gated
-// VolumesDropped and ReplicasLimited conditions and the DataVolumeNotExpanded
-// condition, which is not gated on the render.
-func degradedStatusCurrent(agent *agentv1alpha1.PlatformAgent, reason, message string, rendered workloadRenderState, hostPathDroppedMsg, replicasLimitedMsg, dataVolumeMsg string, dataVolumeKnown bool) bool {
+// VolumesDropped and ReplicasLimited conditions and the DataVolumeNotExpanded and
+// CredentialProxyExecReady conditions, which are not gated on the render.
+func degradedStatusCurrent(agent *agentv1alpha1.PlatformAgent, reason, message string, rendered workloadRenderState, hostPathDroppedMsg, replicasLimitedMsg, dataVolumeMsg string, dataVolumeKnown bool, execReady credentialProxyExecReadyRead) bool {
 	existing := meta.FindStatusCondition(agent.Status.Conditions, "Ready")
 	if existing == nil ||
 		agent.Status.Phase != "Degraded" ||
@@ -5805,7 +5953,8 @@ func degradedStatusCurrent(agent *agentv1alpha1.PlatformAgent, reason, message s
 		existing.Reason != reason ||
 		existing.Message != message ||
 		existing.ObservedGeneration != agent.Generation ||
-		!dataVolumeExpansionConditionCurrent(agent, dataVolumeMsg, dataVolumeKnown) {
+		!dataVolumeExpansionConditionCurrent(agent, dataVolumeMsg, dataVolumeKnown) ||
+		!credentialProxyExecReadyCurrent(agent, execReady) {
 		return false
 	}
 	if !rendered {
@@ -5894,14 +6043,19 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 	// pass's, which still describes the claims. An unknown state (no claim
 	// read by this process yet) leaves the condition as it stands.
 	dataVolumeMsg, dataVolumeKnown := r.dataVolumeExpansionMessage(agent)
-	if degradedStatusCurrent(agent, reason, message, rendered, hostPathDroppedMsg, replicasLimitedMsg, dataVolumeMsg, dataVolumeKnown) {
+	// CredentialProxyExecReady on every park, rendered or not: the tier is
+	// applied before the egress allowlist refusal parks unrendered, and a park
+	// can last days (ShellSandboxKeysMissing). The read reports the tier as it
+	// stands in the cluster, so it is true on any pass.
+	execReady := r.readCredentialProxyExecReady(ctx, agent)
+	if degradedStatusCurrent(agent, reason, message, rendered, hostPathDroppedMsg, replicasLimitedMsg, dataVolumeMsg, dataVolumeKnown, execReady) {
 		return nil
 	}
 
 	// If the cached agent missed the status condition due to watch event lag,
 	// check the live object before attempting an Update that would conflict (409).
 	if r.liveAgentSatisfies(ctx, agent, func(live *agentv1alpha1.PlatformAgent) bool {
-		return degradedStatusCurrent(live, reason, message, rendered, hostPathDroppedMsg, replicasLimitedMsg, dataVolumeMsg, dataVolumeKnown)
+		return degradedStatusCurrent(live, reason, message, rendered, hostPathDroppedMsg, replicasLimitedMsg, dataVolumeMsg, dataVolumeKnown, execReady)
 	}) {
 		return nil
 	}
@@ -5924,6 +6078,7 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 		setHostPathDroppedCondition(agent, hostPathDroppedMsg, now)
 		setReplicasLimitedCondition(agent, replicasLimitedMsg, now)
 	}
+	setCredentialProxyExecReadyCondition(agent, execReady, now)
 	setDataVolumeExpansionCondition(agent, dataVolumeMsg, dataVolumeKnown, now)
 	return r.Status().Update(ctx, agent)
 }
@@ -6380,24 +6535,79 @@ func (r *PlatformAgentReconciler) imageVolumeSupported(agent *agentv1alpha1.Plat
 
 // clusterAutopilot reports whether the cluster is GKE Autopilot, from
 // discovery (isGKEAutopilot), and reuses an authoritative answer. An answer
-// discovery could not give is false, the Standard requests, and is asked again
-// on the next reconcile: a smaller request than Autopilot wants delays the
-// broker's CPU, where a larger one than a Standard node can fit leaves it
-// Pending.
-func (r *PlatformAgentReconciler) clusterAutopilot() bool {
+// discovery could not give is (false, false) and is asked again on the next
+// reconcile; the caller decides what to render meanwhile
+// (liveCredentialProxyAutopilot).
+func (r *PlatformAgentReconciler) clusterAutopilot() (autopilot bool, determined bool) {
 	r.autopilotMu.Lock()
 	defer r.autopilotMu.Unlock()
 	if r.autopilotResolved {
-		return r.autopilot
+		return r.autopilot, true
 	}
-	autopilot, determined := isGKEAutopilot(r.DiscoveryClient)
+	autopilot, determined = isGKEAutopilot(r.DiscoveryClient)
 	if !determined {
-		logf.Log.WithName("platformagent-controller").Info("Could not determine whether cluster is GKE Autopilot due to discovery failure; rendering the credential proxy at the Standard requests until discovery answers.")
-		return false
+		logf.Log.WithName("platformagent-controller").Info("Could not determine whether cluster is GKE Autopilot due to discovery failure; rendering the credential proxy for the cluster type it was last rendered for, else Standard, until discovery answers.")
+		return false, false
 	}
 	r.autopilot = autopilot
 	r.autopilotResolved = true
-	return autopilot
+	return autopilot, true
+}
+
+// credentialProxyAutopilot is the cluster type the credential proxy is rendered
+// at: discovery's answer, or, while discovery cannot give one, the type the
+// running proxy was last rendered for (liveCredentialProxyAutopilot). recorded
+// reports whether the type is one to write to the proxy's cluster-type
+// annotation. The render and the sizing reads (sizingAutopilot) both use it,
+// so sizing measures and compares the proxy at the requests it runs at.
+func (r *PlatformAgentReconciler) credentialProxyAutopilot(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (autopilot bool, recorded bool, err error) {
+	if autopilot, determined := r.clusterAutopilot(); determined {
+		return autopilot, true, nil
+	}
+	return r.liveCredentialProxyAutopilot(ctx, agent)
+}
+
+// liveCredentialProxyAutopilot picks the cluster type to render the proxy at
+// while discovery cannot say: the one the running proxy was last rendered for.
+// Rendering the Standard requests over a proxy running at the Autopilot ones
+// would restart it (its Deployment is Recreate), and again once discovery
+// answers. The type is read from credentialProxyClusterTypeAnnotation, which
+// holds across a CR edit and an operator upgrade that moves the defaults. A
+// Deployment an older operator wrote has no annotation, so the type is then
+// the one whose requests, for this CR, the proxy already carries. The requests
+// are still computed from the current CR, so an edit made meanwhile is
+// applied. With no proxy yet, or one matching neither render, it is Standard:
+// a smaller request than Autopilot wants delays the broker's CPU, where a
+// larger one than a Standard node can fit leaves it Pending.
+func (r *PlatformAgentReconciler) liveCredentialProxyAutopilot(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (autopilot bool, recorded bool, err error) {
+	live := &appsv1.Deployment{}
+	if err := r.Get(ctx, client.ObjectKey{Name: credentialBrokerName(agent), Namespace: agent.Namespace}, live); err != nil {
+		if errors.IsNotFound(err) {
+			return false, false, nil
+		}
+		return false, false, fmt.Errorf("failed to read the credential proxy Deployment: %w", err)
+	}
+	switch live.Annotations[credentialProxyClusterTypeAnnotation] {
+	case credentialProxyClusterTypeAutopilot:
+		return true, true, nil
+	case credentialProxyClusterTypeStandard:
+		return false, true, nil
+	}
+	for _, c := range live.Spec.Template.Spec.Containers {
+		if c.Name != credentialProxyContainerName {
+			continue
+		}
+		want := renderedCredentialProxyResourcesAt(agent.Spec.Deployment, true, renderedSizingTier(agent)).Requests
+		for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+			have, ok := c.Resources.Requests[name]
+			wantQ := want[name]
+			if !ok || have.Cmp(wantQ) != 0 {
+				return false, false, nil
+			}
+		}
+		return true, false, nil
+	}
+	return false, false, nil
 }
 
 type pluginFailure struct {

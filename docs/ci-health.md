@@ -45,11 +45,12 @@ grades through, the opening task from the door accepting it to its terminal),
 and the wall clock, or that the night was cut short, still running or missing),
 the latency line of [The nightly section](#the-nightly-section) when the night carried timing,
 a link to the dashboard's Nightly report (`nightly.html`), and a line saying why
-the section was skipped. A night can be the builds of up to three periodics
-(the main job, the main-b job when the main part runs as two halves, and the
-writers job), reported as one night: the line names a part that is missing,
+the section was skipped. A night can be the builds of up to eight periodics
+(the main job, the main-b to main-e jobs when the main part runs as five
+shards, the writers job, and the writers-b and writers-c jobs when the
+writers part runs as three thirds), reported as one night: the line names a part that is missing,
 still running or cut short, the night counts as cut short when its main or
-main-b part is, and a night without its main or main-b part gives no verdict on
+main-b to main-e part is, and a night without one of those gives no verdict on
 what is newly failing. `scripts/eval_dashboard/nightly.py` derives that line
 and the report from the same nightly runs. After it, the digest carries one
 line while nightly bug filing has been held for about two hours ([Nightly bugs](#nightly-bugs)),
@@ -102,7 +103,11 @@ archive alongside until that leaves the window; the pool-pressure check and step
 read the new bucket only, so a green from before the move is not reused and the pool gauge's window
 fills over its first week. A run in that bucket records where it lives (`runs[].gcs_base`), and
 the dashboard's and the health bot's build links open that directory in the Cloud Console for a
-project reader; a run in the old bucket keeps its Prow link, which still renders it.
+project reader; a run in the old bucket keeps its Prow link, which still renders it. The nightly's
+bucket (`gs://kube-agents-evals-nightly-logs`) is private the same way, so the Nightly report's
+and the nightly issues' run and transcript links open the Console too; for a record whose Prow
+link points into it, the Nightly report, the nightly issues and the lane rows link the Console
+instead (`nightly.console_base` via `links.private_gcs_base`), the data unchanged.
 
 Most messages end with a deep link into the dashboard:
 `index.html#since=<ISO 8601 UTC>[&until=<ISO 8601 UTC>][&cases=<comma-separated case ids>]&view=gate`
@@ -422,13 +427,13 @@ reads every project as it did before.
 
 The poster sends one line when the note appears, and again if its verdict
 changes inside the episode. The header names the cause, because the four
-causes have four different remedies and one of them spends money:
+causes call for different things and one of them spends money:
 
 ```text
 ⏳ Smoke gate: pool full — all 30 projects are leased and runs are queuing.
 Consider onboarding a project.
 Last 3h: median wait 24 min against a 15 min limit; p95 157 min against 45.
-2 runs waiting right now, past the 45 min p95 limit.
+2 of 4 waiting runs are past the 45 min p95 limit.
 Runs still pass; /retest makes the queue longer.
 ```
 
@@ -478,10 +483,15 @@ The dashboard dates
 a jam from its own oldest queued run rather than from the episode, for the same
 reason: the episode can have opened days before the backlog being described.
 
-`concurrency cap` (raise it), `runs not starting` (projects were free, so the
-delay is Prow's; the message names the build cluster) and `queue backed up`
-(the job could not read how many projects were in use) carry the same lines
-under a different first one.
+`queue` at the presubmit's cap (runs waited while the presubmit sat at its
+`max_concurrency`; while Deck sees a backlog the message says how many wait
+and the longest wait, otherwise how long runs waited on which days and
+whether the queue was read, and the cap either way; it gives no remedy,
+because the pool is shared and the gap below the cap is the other jobs'
+share), `runs not starting` (projects were free, so the delay is Prow's; the
+message names the build cluster) and `queue backed up` (the job could not
+read how many projects were in use) carry the same lines under a different
+first one.
 
 Unlike the slow note, this one also says when it is over. The window is a
 rolling seven days, so an episode outlives the bad day by up to a week:
@@ -506,8 +516,8 @@ artifact.
 
 This note files no `presubmit-gate` issue, unlike an OUTAGE, lost pods, fixture
 drift and pool drift. A full pool is a capacity fact, not a defect a code change
-closes; its remedies are onboarding and raising the cap, which are planned
-work. Chat, the Brief and the digest carry it, and nothing opens.
+closes; its remedy is onboarding, which is planned work, or a cap the operator
+weighs. Chat, the Brief and the digest carry it, and nothing opens.
 
 The digest carries the median wait every morning whether or not anything is
 wrong (`typical wait`, beside `typical run`), and repeats a one-line version
@@ -628,21 +638,20 @@ leaves one comment on each pull request (the newest red run per pull request
 when there are several). Three shapes outside that filter also get one, below:
 a not-evaluated run, a lost pod and a deadline kill.
 
-- a heading, `❌ Smoke gate: failed · 3 of 14 cases`, or `· hard failure` when
-  the run failed with no gate case failing all of its repetitions (an absolute
-  check, or a truncated log);
+- a heading, `❌ Smoke gate: failed`, or `· hard failure` when the run failed
+  with no gate case failing all of its repetitions (an absolute check, or a
+  truncated log);
 - a health box: during an OUTAGE or DEGRADED state whose signature the run
   carries, that the red is not the author's code and not to retest yet; when
-  the gate is healthy and the failed case passes on other pull requests' recent
-  runs, that it looks specific to this pull request; a mix says both, with
-  counts;
-- a table of the failed cases — result as `passed / total reps`, and how many
-  other pull requests the case is failing on right now;
-- no grading text: the check's reason and the agent's words stay on the
-  dashboard's run page, behind the link, since the pull request is public;
-- how many cases passed, the run's wall clock and pool project, and links: the
-  build log, `run.html#build=<build id>` on the dashboard, and the incident
-  brief when there is an incident.
+  the gate is healthy and what failed passes on other pull requests' recent
+  runs, that it looks specific to this pull request; a mix says both;
+- the run's wall clock and links: the build log, `run.html#build=<build id>`
+  on the dashboard, and the incident brief when there is an incident.
+
+The pull request is public, so the comment names no case and prints no count,
+reason or agent text: which cases failed, how many repetitions, why, and on
+which pool project are on the dashboard's run page behind the link, for a
+project reader. The incident brief link carries no case names either.
 
 An ordinary red that reaches a verdict during a deadline-kill OUTAGE gets the
 outage box with the kills' sentence ("N runs on M PRs were killed at the
@@ -677,27 +686,28 @@ case, lost every repetition to infrastructure, so `hack/ci-eval-pr.sh` exited
 2 and Prow recorded a `FAILURE`; a build Prow aborted after the suite's line
 carries the field and gets no comment, like any abort — is not a red to the tick: the collector
 recorded the suite's `outcome` on the run (`runs[].eval_outcome`,
-`SCHEMA.md`), so the comment names the cases the suite listed in
-`runs[].not_evaluated` and says nothing about the change is implied:
+`SCHEMA.md`), so the comment says that cases were lost to infrastructure,
+without naming them (the pull request is public; the run page behind the
+link has the list), and that nothing about the change is implied:
 
 ```text
 ### ⚪ Smoke gate: run not evaluated
 
-> `security-overgrant-probe` lost every repetition to infrastructure before
-> the agent could be graded. The suite could certify nothing, so Prow reports
-> the run red; nothing was graded for it and nothing about your change is
-> implied. Retest once the environment is healthy. [Details →](run.html#build=<build id>)
+> Some cases lost every repetition to infrastructure before the agent could
+> be graded. The suite could certify nothing, so Prow reports the run red;
+> nothing was graded for them and nothing about your change is implied.
+> Retest once the environment is healthy. [Details →](run.html#build=<build id>)
 
-Ran 27 min on evals-11 · build log
+Ran 27 min · build log
 ```
 
-When every recorded case was lost the box says so instead of naming them.
-While `health.json`'s condition is `storm` it adds "a quota storm is declared
-on the gate right now" and links the brief. A gate case that failed every
-graded repetition on the same run (the dashboard's roster can be newer than
-the branch's) is named in a second sentence, with its transcript to read
-before retesting; the heading stays ⚪, because the suite is the verdict's
-owner.
+When every recorded case was lost the box says so. While `health.json`'s
+condition is `storm` it adds "a quota storm is declared on the gate right
+now" and links the brief, with no case names in the link. A gate case that
+failed every graded repetition on the same run (the dashboard's roster can be
+newer than the branch's) gets a second sentence, unnamed, pointing at the
+transcripts to read before retesting; the heading stays ⚪, because the suite
+is the verdict's owner.
 
 The second is a lost pod (the build node went away under the job, #1478), a
 zero-task run:
@@ -750,10 +760,12 @@ comments instead.
 When the state becomes OUTAGE and no issue tracks it — `case-notes.yaml` names
 none for the failing cases, and no open issue, whatever its labels, names
 every failing case in its title or body — the poster files one, labelled
-`presubmit-gate`: `Smoke gate outage: 3 cases failing on every PR since Sun
-7:30 AM ET`, with the cases, the window, the class, the incident brief link,
-and the line "Filed automatically by the smoke health bot; edit freely. Fix
-PRs: reference this issue." A human's issue that already names the cases is
+`presubmit-gate`: `Smoke gate outage since Sun 7:30 AM ET`, with the window,
+the class and the incident brief link, and the line "Filed automatically by
+the smoke health bot; edit freely. Fix PRs: reference this issue." The issue
+names no failing case and quotes no evidence line: the repository is public,
+and both are on the brief it links; its first line is a hidden marker
+carrying the case ids, by which the bot re-finds its own issue. A human's issue that already names the cases is
 adopted instead and labelled `presubmit-gate`. One rule for a title: any open
 issue. One rule for a body: a `presubmit-gate` issue, or an unlabelled one
 whose body also carries a word the condition's own evidence uses ("drift" or
@@ -835,13 +847,13 @@ write (a timeout, a 5xx, a 403) files nothing that tick.
 
 `scripts/eval_dashboard/nightly_bugs.py` files an issue for a case that failed
 every graded repetition on its last 3 graded nightly nights, and comments on it
-once when the case passes every repetition again. It runs every tick before the
+once when the case is clear again. It runs every tick before the
 post, on the same `data.json`, so the digest's nightly section sees the issues
 it filed that tick; the step is capped at 3 minutes so a slow GitHub cannot
 hold the post past the job's timeout.
 
-A graded night, for one case, is a night where the part that ran the case (main
-or writers) was not cut off at the job deadline and at least one of the case's
+A graded night, for one case, is a night where the part that ran the case (its
+`nightly.py` part) was not cut off at the job deadline and at least one of the case's
 repetitions was graded. Three kinds of night are skipped, so they neither count
 toward a streak nor break one: a part Prow cut off at the deadline; a night
 where the case was not run or every repetition was infrastructure
@@ -855,8 +867,8 @@ is the last 14 nightly dates. A case whose `task.yaml` carries
 
 The issue is labelled `nightly-red`, `domain:<slug>` and `needs-triage`. Its
 body carries a marker naming the case, the domain, the assignee and why, the
-domain owner and backup as @-mentions, each of the three nights with its pass
-count, run link, transcript link and each failing check's reason, and what
+domain owner and backup as @-mentions, each of the three nights with its run
+link and transcript link (into the Cloud Console), and what
 triage decides: a product bug gets a fixer, a priority and a date; a broken
 test is fixed or marked `expected_fail` with the issue linked; an infra
 failure is closed in favour of the infra issue. It is assigned to the case's
@@ -920,8 +932,8 @@ rules). Neither changes the domain streak above.
   that last recorded it, unless the other part was lost that date or has not
   landed yet)
   ran to its verdict and the case graded nothing: every repetition classified as infrastructure, or no line for it. 3
-  such nights in a row file one issue naming the case and the classifier's
-  reason. A night is skipped, not counted, when the part did not run or was
+  such nights in a row file one issue naming the case, with each night's run
+  and transcript links. A night is skipped, not counted, when the part did not run or was
   lost (or any job of the part lost its build that date and was not re-run
   clean: another job's clean build does not vouch for its cases), when it
   predates the case's first recorded night in the last 14 (a case new to the
@@ -1008,7 +1020,9 @@ Nightly report's.
   list: a shift that wide has one cause. A night cut off at the deadline,
   or with a part missing or still running, carries the block too, labelled as
   covering only the cases or parts on record. Nights here are dates: a
-  same-date re-run of the main job counts once, by its newest run. It is
+  same-date re-run of the main job counts once, by its newest run, and the
+  block reads back over the last 14 dates, so a re-run never pushes an
+  earlier date out. It is
   advisory and moves no
   state, verdict or gate. `scripts/eval_dashboard/nightly_latency.py` holds the rules.
 - **🗣 Reply shape:** how last night's answers read, over every repetition that
@@ -1046,8 +1060,8 @@ plain text. A mentioned person must be a member of the space.
 
 The section is skipped, and the digest carries its one-line nightly summary
 plus the reason, when it cannot be built truthfully: `data.json` unreadable, no
-night started in the last 36 hours, last night's run or either main half
-(main or main-b) still running or missing, no GitHub token, the issues unreadable or their
+night started in the last 36 hours, last night's run or any main shard
+(main, or main-b to main-e) still running or missing, no GitHub token, the issues unreadable or their
 listing not trusted (GraphQL disagreed on every read, as for the filer), pyyaml missing, a count that does not
 add up, or a link that is not a well-formed `https` URL (an issue link must
 point into this repository). Links are checked for form, not fetched: the
@@ -1081,9 +1095,9 @@ been uncovered (counted on UTC dates, as expiry is), from a record's `since:`,
 or from the opening `<slug>, since YYYY-MM-DD` of the comment above a bare slug,
 or "start date not recorded" (also for a date that does not parse or is after
 today); why, from the entry
-and the issue it cites; and the candidates. A candidate is a case of the
+and the issue it cites; and the candidates, best first. A candidate is a case of the
 domain on the nightly matrix with a `verification_spec`, not `expected_fail`,
-not on the roster, with its
+not on the roster, ranked by its
 graded repetitions over the last 14 nightly nights (read as [Nightly
 bugs](#nightly-bugs) reads them), whether that record meets the roster's bar
 (90% over at least 20 graded runs; docs/eval-gate-roster.md, "The admission
@@ -1093,7 +1107,10 @@ deadline), what the
 store says at the current next-mode version key (the mode the main nightly grades; today-mode only when the store holds no next-mode records): `would-admit`, `would-demote`,
 `collecting` with the runs still needed for a full window, `cut` (the read left
 older records at that key behind), or that it holds no record there. Candidates are ranked store `would-admit` first, then meeting the
-bar, then by pass rate. The body is edited in place when any of this changes,
+bar, then by pass rate. The issue's table names the candidates in that order
+and nothing more, since the repository is public; the records behind it are
+on the domain scorecard (`cases.html#view=domains`), and the Chat digest line
+carries the best candidate's. The body is edited in place when any of this changes,
 about once a day; its assignees are never touched, and the assignment line of an
 open issue names the assignees GitHub holds, with the owner beside them when
 the owner is not one. The body is the bot's: an edit to it or the title is
@@ -1174,9 +1191,9 @@ week (below).
 
 The week is the seven nightly dates ending on the Sunday before the tick
 (`--week-end` overrides it), compared with the seven before. A night counts
-when none of its parts was cut off at the job deadline, it has both halves of
-the main matrix it owed (the main part, and the main-b part once that job runs;
-the digest withholds its verdict on a night without either), and it is not a
+when none of its parts was cut off at the job deadline, it has every shard of
+the main matrix it owed (the main part, and the main-b to main-e parts once
+those jobs run; the digest withholds its verdict on a night without one), and it is not a
 night on which nearly every graded case failed; two counted nights
 on one date are one night, each case's newer verdict standing. A pass rate is passes over graded repetitions
 (infrastructure repetitions are never graded), over the scenarios graded in both
@@ -1492,7 +1509,11 @@ grants them (`pool_state_readers`), so a project gets them from its fleet apply 
 the verifier fails one that lacks them (`--report` carries the binding). Grant them
 on the project: the check reads the project's own policy, so a grant on a folder or
 the organisation, or through a group, is not seen and reads as missing on every
-project. Projects applied before that default, or before a role joined the list, are one
+project. The bot's own project, `kube-agents-prow`, also needs the API Keys API
+(`apikeys.googleapis.com`) enabled: gcloud bills the `gemini_api_key` check's key listing to the
+caller's project, and with the API off there the refusal names the bot's project, so the check
+reads every pool project as unverified rather than as missing its key (seen on the first scan of
+2026-11-06). Projects applied before that default, or before a role joined the list, are one
 loop, run once by a project owner:
 
 ```bash

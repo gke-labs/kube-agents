@@ -290,6 +290,15 @@ KNOWN_UNREGISTERED = {
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
 # later pull request that moves the case to the nightly file.
 FIXTURE_NOT_READY = {
+    # Needs a Standard seeded cluster with a manual node pool labelled for a
+    # ComputeClass whose auto-creation is off: the lane's Autopilot hosts
+    # refuse the shape, so it is a fleet fixture addressed by role, and
+    # #5143 plants it. #4943 is the sibling ComputeClass gap on the same
+    # host constraint.
+    "ccc-manual-pools-single-rule-unbacked": (
+        "#5143: needs a Standard seeded cluster with a manual node pool under a ComputeClass "
+        "whose auto-creation is off; the lane's host clusters are Autopilot"
+    ),
     # Needs Config Sync's RootSync CRD and one root-sync object reporting
     # Stalled=True on a seeded cluster. No pool project enables the GKE Hub
     # API, so Config Sync is installed nowhere, and the seeded fleet plants no
@@ -343,11 +352,6 @@ FIXTURE_NOT_READY = {
         "pool (the readiness-lb-drain-timeout role) applied to every pool project (fleet "
         "re-apply); no pool project has a backend service draining longer than the 600 s "
         "GKE waits per node"
-    ),
-    "networking-world-open-ingress": (
-        "#2682: bench/tf/fleet's world_open firewall rule and VM are applied; the "
-        "un-park cites a fixture-state scan that reads the world-open-ingress role "
-        "healthy on every pool project"
     ),
     "b-0011-gitops": (
         "#1307: the GitOps fix-cycle pilot; needs a leaderboard GitOps repository "
@@ -433,21 +437,14 @@ FIXTURE_NOT_READY = {
         "registers it, so the context check fails with the repository absent, "
         "which is broken rather than red"
     ),
-    "gce-startup-script-failure": (
-        "#2483: bench/tf/fleet's startup_fail VM is applied; the un-park cites a "
-        "fixture-state scan that reads the startup-fail-vm role healthy on every "
-        "pool project"
-    ),
-    "gce-chat-request-runs-collector": (
-        "#2483: bench/tf/fleet's startup_fail VM is applied, as for "
-        "gce-startup-script-failure; the un-park cites a fixture-state scan that "
-        "reads the startup-fail-vm role healthy on every pool project"
-    ),
-    "obtainability-pdb-kustomize-overlay": (
-        "#2686: bench/tf/prebuilt/kustomize-overlay-declaration plants the "
-        "Kustomize root for each run with the write token hack/ci-eval-pr.sh "
-        "mints for a stack that declares bench_gitops_write_token_file; the "
-        "un-park cites one pool run that shows the plant and the teardown work"
+    "remediation-context-repository-owns-the-fix": (
+        "#5213: needs the three-part fixture its fixture/README.md describes in each "
+        "pool install: a context repository holding the payments chart, registered "
+        "in context_repos at a pinned ref (the registration #4243 also waits for), "
+        "the clusters/<cluster>/demo-shop/payments/ HelmRelease directory on the "
+        "GitOps repository, and the rendered workload on the agent host; no pool "
+        "install carries them, so the objective fails with the chart repository "
+        "absent, which is broken rather than red"
     ),
     "obtainability-untargeted-compute-class-manifest": (
         "#2540: needs a ComputeClass cluster without default ComputeClass and with "
