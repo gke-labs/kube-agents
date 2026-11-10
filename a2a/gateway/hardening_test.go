@@ -523,3 +523,26 @@ func TestSpawnHandsTheSessionThePodTheBusCA(t *testing.T) {
 		t.Error("a plaintext spawner stamps its pods the same as a TLS one")
 	}
 }
+
+// A session pod handed the exec tier's address is not reused by a gateway that
+// hands another one, or none; a gateway that hands none keeps the old stamp.
+func TestTheBusTransportStampFollowsTheExecTierAddress(t *testing.T) {
+	const execURL = "http://agent-credential-proxy-exec-tier.test-ns.svc.cluster.local:8765"
+	base := Config{NATSURL: "tls://agent-a2a-nats.test-ns.svc:4222", NATSCAFile: "/etc/nats-ca/ca.crt"}
+	stamp := func(mutate func(*Config)) string {
+		cfg := base
+		mutate(&cfg)
+		return (&podSpawner{cfg: &cfg}).busTransport()
+	}
+	off := stamp(func(*Config) {})
+	viewOff := stamp(func(c *Config) { c.SessionClusterView = true })
+	on := stamp(func(c *Config) { c.SessionClusterView = true; c.CredentialProxyExecURL = execURL })
+	other := stamp(func(c *Config) { c.SessionClusterView = true; c.CredentialProxyExecURL = execURL + "0" })
+	noView := stamp(func(c *Config) { c.CredentialProxyExecURL = execURL })
+	if off != viewOff || off != noView {
+		t.Errorf("a spawner that hands no exec URL moved the stamp: %s, %s, %s", off, viewOff, noView)
+	}
+	if on == off || on == other {
+		t.Errorf("the stamp does not follow the exec URL a pod is handed: off %s, on %s, other %s", off, on, other)
+	}
+}

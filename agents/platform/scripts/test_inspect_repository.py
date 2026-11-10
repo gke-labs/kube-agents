@@ -132,7 +132,9 @@ class TestClone(InspectRepositoryTestCase):
         self.assertEqual(result["sha"], self.revision)
         self.assertEqual(result["history"], "none")
         self.assertEqual((into / "cmd" / "main.go").read_text(), "func main() { serve() }\n")
-        self.assertEqual(self.calls, [("snapshot", {"repository": "acme/public"})])
+        self.assertEqual(
+            self.calls, [("snapshot", {"repository": "acme/public", "maxBytes": vcs_client.SNAPSHOT_MAX_UNPACKED_BYTES})]
+        )
 
     def test_nothing_that_lands_is_a_git_repository(self):
         """The difference from the path this replaces, as an assertion."""

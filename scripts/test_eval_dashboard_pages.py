@@ -27,7 +27,7 @@ import unittest.mock
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 
-from eval_dashboard import render
+from eval_dashboard import nightly, render
 
 FIXTURE = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "testdata_classify" / "incidents.json.gz"
 PAGES_JS = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "template" / "pages.js"
@@ -119,6 +119,22 @@ def brief_view_anchors(pages_js: str) -> frozenset:
 
 
 BRIEF_VIEW_ANCHORS = brief_view_anchors(PAGES_JS.read_text())
+
+
+def night_part_words(pages_js: str) -> dict:
+    """PAGE.nightPartWords from pages.js's text, a flat object of quoted
+    or bare keys to quoted words."""
+    match = re.search(r"^\s*nightPartWords:\s*\{([^{}]*)\}", pages_js, re.MULTILINE)
+    if match is None:
+        raise RuntimeError(f"{PAGES_JS}: PAGE.nightPartWords is not a flat object literal")
+    return dict(re.findall(r'"?([\w-]+)"?\s*:\s*"([^"]*)"', match.group(1)))
+
+
+class NightPartWordsTest(unittest.TestCase):
+    def test_the_pages_part_words_are_nightly_py_s(self):
+        # pages.js carries a hand copy of nightly.PART_WORDS; a part added to
+        # one alone would render as its raw id on the Nightly page.
+        self.assertEqual(night_part_words(PAGES_JS.read_text()), dict(nightly.PART_WORDS))
 # The Cases page's one polled call, in
 # test_cases_page_sorts_filters_and_the_hash_highlight: a row fragment,
 # the bare case name, under boot and two polls on the page's real clock.
@@ -967,7 +983,12 @@ class BrowserTest(unittest.TestCase):
             self.assertIn(f"/test {job}", app)
         self.assertIn("No scheduled run on record", app)
         self.assertIn("once a week", app)
-        self.assertIn("GHES's scheduled jobs are off: not in Prow yet", app, "the page says what the digest says")
+        self.assertNotIn("scheduled jobs are off", app, "no lane is paused")
+        # A paused lane says why, as the digest does.
+        from eval_dashboard import forge_lane, tiers
+        with unittest.mock.patch.dict(forge_lane.LANES[tiers.TIER_GHES], {"off": "the weekly job waits on a fix"}):
+            paused = render_to(pathlib.Path(self.tmp.name) / "paused", self.data, health=health_doc())
+        self.assertIn("GHES's scheduled jobs are off: the weekly job waits on a fix", dom_text(paused / "index.html"))
         data = copy.deepcopy(self.data)
         base = next(r for r in data["runs"] if r["build_id"] == "2097282860221206528")
         lane_base = "gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/4480/pull-kube-agents-smoke-test-gitlab-ce/2097282860221206800/"

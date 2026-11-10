@@ -20,6 +20,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -36,19 +37,41 @@ func agentWithAlertExclude(rules ...agentv1alpha1.EventWatcherAlertExcludeRule) 
 	return a
 }
 
-// alertExcludeEnv returns every WATCHER_ALERT_EXCLUDE value on the gateway's
+// alertExcludeEnv returns every entry of the named variable on the gateway's
 // agent-api-auth sidecar.
-func alertExcludeEnv(agent *agentv1alpha1.PlatformAgent) []string {
-	var found []string
+func alertExcludeEnv(agent *agentv1alpha1.PlatformAgent, name string) []corev1.EnvVar {
+	var found []corev1.EnvVar
 	for _, e := range buildAgentAPIAuthSidecar(agent, "/opt/data").Env {
-		if e.Name == watcherAlertExcludeEnv {
-			found = append(found, e.Value)
+		if e.Name == name {
+			found = append(found, e)
 		}
 	}
 	return found
 }
 
-// The list reaches the watcher as the JSON its --alert-exclude reads: the
+// alertExcludeRules is the rules file the operator renders for agent.
+func alertExcludeRules(agent *agentv1alpha1.PlatformAgent) string {
+	return buildEventWatcherAlertExcludeConfigMap(agent).Data[eventWatcherAlertExcludeKey]
+}
+
+// assertAlertExcludeFromTheConfigMap checks that the sidecar takes the rules
+// from the ConfigMap: WATCHER_ALERT_EXCLUDE through a key reference, for an
+// older entrypoint, and WATCHER_ALERT_EXCLUDE_FILE naming the mounted file.
+func assertAlertExcludeFromTheConfigMap(t *testing.T, agent *agentv1alpha1.PlatformAgent) {
+	t.Helper()
+	ref := &corev1.EnvVarSource{ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+		LocalObjectReference: corev1.LocalObjectReference{Name: agent.Name + "-event-watcher-alert-exclude"},
+		Key:                  "rules.json",
+	}}
+	if got := alertExcludeEnv(agent, watcherAlertExcludeEnv); len(got) != 1 || got[0].Value != "" || !reflect.DeepEqual(got[0].ValueFrom, ref) {
+		t.Errorf("WATCHER_ALERT_EXCLUDE = %+v, want one entry from the ConfigMap's key", got)
+	}
+	if got := alertExcludeEnv(agent, watcherAlertExcludeFileEnv); len(got) != 1 || got[0].Value != "/etc/kube-agents/event-watcher/rules.json" {
+		t.Errorf("WATCHER_ALERT_EXCLUDE_FILE = %+v, want the mounted file", got)
+	}
+}
+
+// The list reaches the watcher as the JSON its --alert-exclude-file reads: the
 // watcher's keys, unset parts left out (cmd/k8s-event-watcher/alertexclude.go).
 func TestAlertExcludeReachesTheWatcherAsItsJSON(t *testing.T) {
 	agent := agentWithAlertExclude(
@@ -62,24 +85,89 @@ func TestAlertExcludeReachesTheWatcherAsItsJSON(t *testing.T) {
 	const want = `[{"namespace":"payments"},` +
 		`{"cluster":{"projectId":"p","location":"us-central1","clusterName":"batch"},"reason":"FailedScheduling"},` +
 		`{"kind":"Pod","name":"inventory-api-*"}]`
-	if got := alertExcludeEnv(agent); len(got) != 1 || got[0] != want {
-		t.Errorf("WATCHER_ALERT_EXCLUDE = %q, want one entry %q", got, want)
+	if got := alertExcludeRules(agent); got != want {
+		t.Errorf("rules.json = %q, want %q", got, want)
 	}
+	assertAlertExcludeFromTheConfigMap(t, agent)
 }
 
-// With no rules the operator writes nothing, so an install that never sets the
-// field gets no new env entry and no pod roll on upgrade.
-func TestNoAlertExcludeWritesNoEnv(t *testing.T) {
+// With no rules the file is empty, and the sidecar still reads it, so setting
+// the first rule changes no pod template.
+func TestNoAlertExcludeRendersAnEmptyFile(t *testing.T) {
 	for name, agent := range map[string]*agentv1alpha1.PlatformAgent{
 		"no harness":       newTestPlatformAgent(),
 		"no event watcher": agentWithEventWatcher(nil),
 		"an empty list":    agentWithAlertExclude(),
 	} {
 		t.Run(name, func(t *testing.T) {
-			if got := alertExcludeEnv(agent); len(got) != 0 {
-				t.Errorf("WATCHER_ALERT_EXCLUDE = %q, want none", got)
+			if got := alertExcludeRules(agent); got != "" {
+				t.Errorf("rules.json = %q, want empty", got)
+			}
+			assertAlertExcludeFromTheConfigMap(t, agent)
+		})
+	}
+}
+
+// gatewayTemplate renders the gateway's pod template with the hashes the
+// reconciler computes for agent.
+func gatewayTemplate(t *testing.T, agent *agentv1alpha1.PlatformAgent) corev1.PodTemplateSpec {
+	t.Helper()
+	var hashes []string
+	for _, cm := range []*corev1.ConfigMap{
+		buildConfigMap(agent, nil),
+		buildFluentBitConfigMap(agent),
+		buildSettingsConfigMap(agent),
+		gatewayPolicyView(buildCredentialProxyPolicyConfigMap(agent)),
+	} {
+		h, err := getConfigMapHash(cm)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hashes = append(hashes, h)
+	}
+	return buildPodTemplateSpec(agent, hashes[0], hashes[1], hashes[2], hashes[3], nil, renderOptions{})
+}
+
+// Setting, changing or removing rules changes the ConfigMap and not the pod
+// template, so the gateway pod is not rolled; the watcher reads the file again.
+func TestAlertExcludeChangeLeavesThePodTemplate(t *testing.T) {
+	noBlock := newTestPlatformAgent()
+	noBlock.Spec.Harness = &agentv1alpha1.HarnessSpec{}
+	none := gatewayTemplate(t, noBlock)
+	for name, agent := range map[string]*agentv1alpha1.PlatformAgent{
+		"an empty list": agentWithAlertExclude(),
+		"one rule":      agentWithAlertExclude(agentv1alpha1.EventWatcherAlertExcludeRule{Namespace: "payments"}),
+		"two rules":     agentWithAlertExclude(agentv1alpha1.EventWatcherAlertExcludeRule{Namespace: "shop"}, agentv1alpha1.EventWatcherAlertExcludeRule{Reason: "OOMKilled"}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := gatewayTemplate(t, agent); !reflect.DeepEqual(got, none) {
+				t.Error("the pod template differs from the one with no eventWatcher block")
 			}
 		})
+	}
+}
+
+// The file is the ConfigMap's, mounted read-only and without subPath: the
+// kubelet never updates a subPath mount when the ConfigMap changes.
+func TestAlertExcludeIsMountedWithoutSubPath(t *testing.T) {
+	agent := newTestPlatformAgent()
+	var mounts []corev1.VolumeMount
+	for _, m := range buildAgentAPIAuthSidecar(agent, "/opt/data").VolumeMounts {
+		if m.Name == eventWatcherAlertExcludeVolume {
+			mounts = append(mounts, m)
+		}
+	}
+	if len(mounts) != 1 || mounts[0].MountPath != "/etc/kube-agents/event-watcher" || mounts[0].SubPath != "" || !mounts[0].ReadOnly {
+		t.Errorf("mounts = %+v, want one read-only mount of the directory with no subPath", mounts)
+	}
+	var volumes []corev1.Volume
+	for _, v := range buildAgentAPIAuthVolumes(agent) {
+		if v.Name == eventWatcherAlertExcludeVolume {
+			volumes = append(volumes, v)
+		}
+	}
+	if len(volumes) != 1 || volumes[0].ConfigMap == nil || volumes[0].ConfigMap.Name != agent.Name+"-event-watcher-alert-exclude" || len(volumes[0].ConfigMap.Items) != 0 {
+		t.Errorf("volumes = %+v, want the whole rules ConfigMap", volumes)
 	}
 }
 
@@ -90,27 +178,33 @@ func TestAlertExcludeReplacesTheDeploymentEnvEntry(t *testing.T) {
 	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
 		Env: []corev1.EnvVar{{Name: watcherAlertExcludeEnv, Value: `[{"namespace":"shop"}]`}},
 	}
-	if got := alertExcludeEnv(agent); len(got) != 1 || got[0] != `[{"namespace":"payments"}]` {
-		t.Errorf("WATCHER_ALERT_EXCLUDE = %q, want only the field's value", got)
+	if got := alertExcludeRules(agent); got != `[{"namespace":"payments"}]` {
+		t.Errorf("rules.json = %q, want only the field's value", got)
 	}
+	assertAlertExcludeFromTheConfigMap(t, agent)
 }
 
 // Unset, the field leaves a spec.deployment.env entry alone: the watcher read
-// it before the field existed, and a reserved name would drop it silently.
+// it before the field existed, and a reserved name would drop it silently. No
+// file is named then, so the entrypoint passes that entry as --alert-exclude.
 func TestNoAlertExcludeKeepsTheDeploymentEnvEntry(t *testing.T) {
 	agent := newTestPlatformAgent()
 	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
 		Env: []corev1.EnvVar{{Name: watcherAlertExcludeEnv, Value: `[{"namespace":"shop"}]`}},
 	}
-	if got := alertExcludeEnv(agent); len(got) != 1 || got[0] != `[{"namespace":"shop"}]` {
-		t.Errorf("WATCHER_ALERT_EXCLUDE = %q, want the spec.deployment.env value", got)
+	if got := alertExcludeEnv(agent, watcherAlertExcludeEnv); len(got) != 1 || got[0].Value != `[{"namespace":"shop"}]` {
+		t.Errorf("WATCHER_ALERT_EXCLUDE = %+v, want the spec.deployment.env value", got)
+	}
+	if got := alertExcludeEnv(agent, watcherAlertExcludeFileEnv); len(got) != 0 {
+		t.Errorf("WATCHER_ALERT_EXCLUDE_FILE = %+v, want none", got)
 	}
 }
 
 // The largest list the CRD admits renders far under the kernel's 128 KiB limit
-// on one environment string (MAX_ARG_STRLEN); past it, the agent-api-auth
-// container could not start at all. Every string part is at its length bound,
-// in characters its pattern admits and JSON writes as themselves.
+// on one environment string (MAX_ARG_STRLEN), which the WATCHER_ALERT_EXCLUDE
+// reference still meets; past it, the agent-api-auth container could not start
+// at all. Every string part is at its length bound, in characters its pattern
+// admits and JSON writes as themselves.
 func TestTheLargestAlertExcludeListFitsOneEnvString(t *testing.T) {
 	const maxArgStrlen = 128 * 1024
 	rule := agentv1alpha1.EventWatcherAlertExcludeRule{
@@ -125,23 +219,24 @@ func TestTheLargestAlertExcludeListFitsOneEnvString(t *testing.T) {
 		Name:      strings.Repeat("a", 252) + "*",
 	}
 	agent := agentWithAlertExclude(slices.Repeat([]agentv1alpha1.EventWatcherAlertExcludeRule{rule}, 64)...)
-	got := alertExcludeEnv(agent)
-	if len(got) != 1 {
-		t.Fatalf("want one WATCHER_ALERT_EXCLUDE, got %d", len(got))
-	}
-	if n := len(got[0]); n >= maxArgStrlen/2 {
+	if n := len(alertExcludeRules(agent)); n >= maxArgStrlen/2 {
 		t.Errorf("the largest admitted list renders %d bytes; want well under %d", n, maxArgStrlen)
 	}
 }
 
-// The name is the one start-services.sh reads and passes to the watcher.
+// The names are the ones start-services.sh reads and passes to the watcher.
 func TestAlertExcludeEnvMatchesStartServices(t *testing.T) {
 	script, err := os.ReadFile(filepath.Join("..", "..", "..", "deploy", "shared", "start-services.sh"))
 	if err != nil {
 		t.Fatalf("read start-services.sh: %v", err)
 	}
-	if want := `--alert-exclude="${` + watcherAlertExcludeEnv + `}"`; !strings.Contains(string(script), want) {
-		t.Errorf("start-services.sh does not pass %s", want)
+	for _, want := range []string{
+		`--alert-exclude="${` + watcherAlertExcludeEnv + `}"`,
+		`--alert-exclude-file="${` + watcherAlertExcludeFileEnv + `}"`,
+	} {
+		if !strings.Contains(string(script), want) {
+			t.Errorf("start-services.sh does not pass %s", want)
+		}
 	}
 }
 

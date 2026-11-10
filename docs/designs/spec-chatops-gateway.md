@@ -703,10 +703,11 @@ addressed to platform or a session gets none. The stream and the dispatcher's re
 built yet. Until they are, nothing stores the record, and a task the dispatcher still holds
 queued runs when a slot frees, or is refused at its queue timeout. The cards are re-read every five minutes, so a card or tombstone
 published while the gateway's connection was down is picked up, and a profile no longer on
-`DIRECTORY` is forgotten. The delegate tool
-the worker adapter serves still offers no `parameters`, so a session can delegate to a pinned
-profile or one that takes no target; offering the field is text the model reads and lands with
-its own eval case.
+`DIRECTORY` is forgotten. Each turn the gateway submits to a session pod carries the agents its
+requester may delegate to (the `delegateTargets` part, `spec-a2a-payloads.md`), built from those
+cards, for the delegate tool the worker adapter serves to name in its addressee description.
+The tool still offers no `parameters`, so a session can delegate to a pinned profile or one that
+takes no target; offering the field is text the model reads and lands with its own eval case.
 
 ## Session lifecycle
 
@@ -1859,18 +1860,25 @@ buttons" under the Slack adapter) gets its Retry and Drop in the same button lis
 choices and links. The list sits under the whole message rather than under each row, so when any
 row carries buttons the renderer numbers every row in the bullet's place ("1. ", "2. ") and labels
 each row's buttons with its number ("Retry 1", "Drop 1"); the button's `kage.board` action carries
-the action, the row's number and the row's ids. A tap is never a turn: it is admitted by the rule
-an inbound message is (`resolvePrincipal`; Chat has no Home tab), then sent over the board route
-as a `lib.BoardAction` like a Slack tap, and the row's line is edited in place, "✓ Retrying.
-<name>, <time>", "Dropped. <name>, <time>" or "No longer stuck. <name>, <time>" set after its text
-on the same line, the time in UTC since Chat has no date token, and the row's two buttons gone; a
-tap that did not land keeps them under a line saying so, so a second tap asks again, and so does
-one whose patch Chat refused. One tap per row at a time, and the edits of one message in turn under
-its rewrite lock, each from the layout the adapter last sent it; a message posted before a restart
-is edited from the event's copy of it, text and buttons (`gchat_board.go`). The report caps its
-rows at `MAX_STUCK_ROWS` (15), so the list holds at most 30 such buttons; Chat's own ceiling on
-buttons in one list is not documented in a form this spec can cite and has not been measured, and
-a layout Chat refuses falls back to the text as any does.
+the action, the row's number, the row's ids and the row's line in the text (its index, as the Stop
+button carries its task). A tap edits by line on every path: the line the card the gateway last
+sent carries on its own button for the row, when it remembers the card (a re-layout in the tap's
+round trip that kept the row but shifted it is drawn where the row is now); the tap's own line when
+it does not (after a restart); so a numbered list in the detail or the fold is never taken for the
+rows, and a tap whose row's line no longer starts with the row's number is dropped as stale. A tap is
+never a turn: it is admitted by the rule an inbound message is (`resolvePrincipal`; Chat has no
+Home tab), then sent over the board route as a `lib.BoardAction` like a Slack tap, and the row's
+line is edited in place, "✓ Retrying. <name>, <time>", "Dropped. <name>, <time>" or "No longer
+stuck. <name>, <time>" set after its text on the same line, the time in UTC since Chat has no date
+token, and the row's two buttons gone; a tap that did not land keeps them under a line saying so,
+so a second tap asks again, and so does one whose patch Chat refused. One tap per row at a time,
+and the edits of one message in turn under its rewrite lock, each from the layout the adapter last
+sent it; a message posted before a restart is edited from the event's copy of it, text and buttons
+(`gchat_board.go`); a button drawn before the line parameter existed carries none, and its row is
+found through the text's rows block instead, for one release (#5235). The report caps its rows at
+`MAX_STUCK_ROWS` (15), so the list holds at most 30 such buttons; Chat's own ceiling on buttons in
+one list is not documented in a form this spec can cite and has not been measured, and a layout
+Chat refuses falls back to the text as any does.
 
 A click on a choice button arrives on the same subscription as a message, as a
 `CARD_CLICKED` interaction, in either wire layout: the add-on one (`chat.buttonClickedPayload`
@@ -2129,7 +2137,12 @@ quoted, so I'm answering your words alone.` and the turn goes ahead on the words
 read the message you quoted. Paste its text, or ask again in a moment.` and no turn, logged with
 the reason. The adapter reads the gateway's admission gate for that (`SenderAdmission`, wired as
 the session lookup is) and posts nothing ahead of the gateway for a sender it would refuse: their
-words go over unchanged to the refusal any message gets, and their bare quote is dropped.
+words go over unchanged to the refusal any message gets, and their bare quote is dropped. A read
+cut short by the gateway's shutdown posts no line and makes no turn: `quotedAsk` returns the
+shutdown reason when its context is cancelled on entry or when the cancel cut its read short, and
+`Run` drops a turn `quotedAsk` composed before the cancel with the same reason, so nothing is
+promised in the thread for a turn the restart drops, the adapter's at-most-once choice for an acked
+event.
 
 **The mapping table - where it lives and who writes it.** The table is an optional
 override, not an admission gate: the allowed-users list admits, and the table joins an
@@ -2639,7 +2652,7 @@ task that handed work to kanban cards and left them unsettled at turn end (the b
 artifact; emitted on routed chat origins such as Slack, Discord, and Google Chat where
 `waitKanbanInTurn` is false and the turn returns immediately so the client receives card completion
 via `chat.notify.*`, or when a turn ends with cards still unsettled) carries `"cardsPending":
-true`, so a client waits for the cards' notify frames; on console and MCP origins only
+true`, so a client waits for the cards' notify frames; on console, MCP and A2A door origins only
 (`waitsForCardsInTurn`), the bridge's `api` executor instead
 holds the turn open in `waitForKanbanCards`, streams specialist card progress and synthesis steps in
 turn, folds settled card results directly into the task's `result` artifact, and clears `cardsFiled`

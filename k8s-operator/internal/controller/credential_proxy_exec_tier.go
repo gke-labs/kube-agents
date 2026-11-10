@@ -39,6 +39,33 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
+// How long an exec pod may take to stop (credential-broker-exec-tier.md §9
+// step 0). RollingUpdate keeps another replica serving while one rolls, so the
+// exec role drains for as long as the longest command it admits
+// (EXEC_SHUTDOWN_DRAIN_SECONDS, 360s, in credential_proxy.py), not for the
+// broker's bounded drain. tests/test_credential_proxy_drain_budget.py holds
+// these against the runtime's and the entrypoint's figures.
+const (
+	// The longest a command may run: credential_proxy.py's --timeout-seconds
+	// default, which no install can change, because the operator reserves
+	// CREDENTIAL_PROXY_TIMEOUT_SECONDS.
+	credentialProxyCommandTimeoutSeconds int64 = 300
+	// How long a request may wait for a command slot (credential_proxy.py's
+	// COMMAND_SLOT_WAIT_SECONDS). The drain does not refuse a request already
+	// waiting, so one queued at SIGTERM can be admitted and run for the whole
+	// timeout.
+	credentialProxyCommandSlotWaitSeconds int64 = 60
+	// What the stop does after the drain: the runtime's 5s end wait for the
+	// commands it ended, the entrypoint's poll, and its kill of Envoy
+	// (EXEC_RUNTIME_DRAIN_SECONDS, 370s, in deploy/shared/start-services.sh).
+	credentialProxyExecTierStopMarginSeconds int64 = 20
+	// The kubelet's wait between SIGTERM and SIGKILL for an exec pod: the
+	// timeout, the slot wait and the margin. A literal, so the drain-budget
+	// test reads the value that ships; TestTheExecTierHoldsItsLongestCommand
+	// holds it to the sum. An idle exec pod still exits after its 3s settle.
+	credentialProxyExecTierTerminationGraceSeconds int64 = 380
+)
+
 // The exec tier (docs/designs/credential-broker-exec-tier.md §3.3, names in
 // §12): stateless broker replicas beside the stateful broker, serving /v1/exec
 // and /v1/gcp/ only. Every name the tier renders is derived here.
@@ -85,6 +112,11 @@ const (
 	// credential words, which gosec's G101 reads as a hardcoded credential.
 	brokerMinterVolume       = "credential-proxy-ksa-token"
 	execTierDroppedMinterEnv = "KSA_TOKEN_FILE"
+	// The callers' address for the tier (§12): the sandbox and the session
+	// pods read CREDENTIAL_PROXY_EXEC_URL; the A2A gateway reads its own
+	// name and passes the URL to the session pods it spawns.
+	credentialProxyExecURLEnv    = "CREDENTIAL_PROXY_EXEC_URL"     // #nosec G101 -- Environment variable name, not a credential
+	a2aCredentialProxyExecURLEnv = "A2A_CREDENTIAL_PROXY_EXEC_URL" // #nosec G101 -- Environment variable name, not a credential
 )
 
 // credentialProxyExecTierEnvDropped names the broker env the exec tier does
@@ -137,6 +169,26 @@ func ValidateCredentialProxyExec(agent *agentv1alpha1.PlatformAgent, path *field
 		agent.Name, len(agent.Name), credentialProxyExecTierMaxAgentName, credentialProxyExecTierSuffix))}
 }
 
+// credentialProxyExecTierEnabled reports whether the tier renders, and with it
+// whether callers get its URL and an egress peer to it: a positive count, and
+// an agent name the tier's objects fit.
+func credentialProxyExecTierEnabled(agent *agentv1alpha1.PlatformAgent) bool {
+	return credentialProxyExecTierReplicas(agent) > 0 && len(ValidateCredentialProxyExec(agent, nil)) == 0
+}
+
+// credentialProxyExecTierURL is the exec Service's address, for the callers'
+// CREDENTIAL_PROXY_EXEC_URL.
+func credentialProxyExecTierURL(agent *agentv1alpha1.PlatformAgent) string {
+	return fmt.Sprintf("http://%s.%s.svc.cluster.local:%d",
+		credentialProxyExecTierName(agent), agent.Namespace, credentialProxyPort)
+}
+
+// credentialProxyExecTierPodPeer selects the tier's pods in the agent's
+// namespace, for a caller's egress rule in that namespace.
+func credentialProxyExecTierPodPeer(agent *agentv1alpha1.PlatformAgent) networkingv1.NetworkPolicyPeer {
+	return networkingv1.NetworkPolicyPeer{PodSelector: &metav1.LabelSelector{MatchLabels: credentialProxyExecTierSelector(agent)}}
+}
+
 // credentialProxyExecTierResources is the broker container's resources with
 // cpu and memory fixed at the tier's figures on both sides. The broker's other
 // keys stay, ephemeral-storage among them: the tier's emptyDirs are the
@@ -159,16 +211,21 @@ func credentialProxyExecTierResources(broker corev1.ResourceRequirements) corev1
 
 // buildCredentialProxyExecTierDeployment derives the tier's Deployment from the
 // stateful broker's, as rendered for this reconcile, so the image, the policy,
-// the caller authentication, the profile identities and the grace period stay
-// the same on both. The exec role drains on SIGTERM as the broker does, inside
-// that grace period (a command longer than the drain is #4780). What differs:
+// the caller authentication and the profile identities stay the same on both.
+// What differs:
 //   - its own name, selector and labels, without has-credential-proxy, which
 //     opens the github-token-minter to a pod;
 //   - the replica count and RollingUpdate with maxUnavailable 1 and maxSurge
 //     0: no exec call keeps state across calls, a second replica serves while
-//     one rolls, and a rollout needs no surge Pod, so a namespace quota with no
-//     headroom cannot stall it (at one replica the callers fall back to the stateful
-//     broker for the gap);
+//     one rolls, and a rollout needs no surge Pod. A stopping pod keeps its cpu
+//     and quota until it exits, so a step whose replacement has no room waits
+//     for it. At one replica a stopping pod refuses new requests as draining
+//     until its replacement is Ready (for the whole drain when the replacement
+//     has no room); the callers fall back to the stateful broker only once it
+//     stops accepting connections;
+//   - the grace period (credentialProxyExecTierTerminationGraceSeconds): the
+//     exec role drains on SIGTERM for as long as the longest command it
+//     admits, not for the broker's bounded drain;
 //   - CREDENTIAL_PROXY_ROLE=exec, and the replica count mounted from the
 //     ConfigMap;
 //   - cpu and memory fixed at the tier's figures (other keys as the broker's);
@@ -179,6 +236,7 @@ func credentialProxyExecTierResources(broker corev1.ResourceRequirements) corev1
 //   - no github-token-minter token, which is projected rather than a Secret.
 func buildCredentialProxyExecTierDeployment(agent *agentv1alpha1.PlatformAgent, broker *appsv1.Deployment) *appsv1.Deployment {
 	dep := broker.DeepCopy()
+	dep.Spec.Template.Spec.TerminationGracePeriodSeconds = ptr.To(credentialProxyExecTierTerminationGraceSeconds)
 	name := credentialProxyExecTierName(agent)
 	selector := credentialProxyExecTierSelector(agent)
 	dep.ObjectMeta = metav1.ObjectMeta{Name: name, Namespace: agent.Namespace}

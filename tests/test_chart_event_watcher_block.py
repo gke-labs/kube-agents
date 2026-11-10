@@ -1,7 +1,7 @@
 """The chart renders `spec.harness.eventWatcher.alertExclude` from `platformAgent.harness.eventWatcher`.
 
 The chart default is an empty list, which renders no block: with no rules the
-operator writes no WATCHER_ALERT_EXCLUDE, so an absent block and an empty list
+operator renders an empty rules file, so an absent block and an empty list
 are the same. A rule list reaches the CR as it is. The schema holds the CRD's
 bounds, so a rule the API server would refuse fails the render instead. The
 text-structural tests run everywhere; the render tests need a helm binary.

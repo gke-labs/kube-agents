@@ -266,6 +266,23 @@ ACTIVITY_STATUS_TRUNCATED = "truncated"
 # ``truncated`` would otherwise set the record aside on the run that used it.
 ACTIVITY_INPUT_TRUNCATED_KEY = "truncated"
 ACTIVITY_INPUT_TRUNCATED_KEYS = frozenset({ACTIVITY_INPUT_TRUNCATED_KEY, "bytes", "head"})
+# The bridge labels each part with the session that made the call
+# (``workerLabelLocked`` in ``a2a/hermes-bridge/activity_thinking.go``),
+# under its ``api`` executor: its own session, the router's, as
+# ``platform``, and a card worker's as ``card:<id> (<title>)`` or
+# ``worker:<session>``. A worker's call is not the router's; folded in here
+# untagged it would read as one, so a router-scoped ``tool_called`` on
+# ``kanban_complete`` would fire on the worker closing its own card. Such a
+# part is left out: the worker's calls reach the trajectory tagged with
+# their agent from the session store (``worker_trajectory``) when the
+# delegation wait found the cards, and the scorer sets the worker-scoped
+# checks aside on this transport either way. The skip names the worker
+# prefixes rather than the router's label, so a label this side does not
+# know stays the router's and shows in the record instead of emptying it.
+# A part with no label (a bridge older than the field, or the cli
+# executor) is the router's; a label that is not a string is malformed.
+ACTIVITY_WORKER_KEY = "worker"
+ACTIVITY_WORKER_PREFIXES = ("card:", "worker:")
 # The marker's argument names: the two it always carries, and three
 # present only when non-zero -- parts or counts that could not be read,
 # calls whose input the executor replaced with its truncation stand-in, and
@@ -838,6 +855,8 @@ class Fold:
         a call: its ``dropped`` joins the door's ``activityDropped`` in the
         marker and no entry is written for it, and a part with no tool name
         is counted as malformed rather than written as a call to nothing.
+        A part the bridge labels with a card worker's session is left out as
+        the worker's call, not the router's (:data:`ACTIVITY_WORKER_KEY`).
         Empty when no read carried the key.
         """
         mapped = self._map_activity()
@@ -877,6 +896,12 @@ class Fold:
                     malformed += 1
                 else:
                     dropped += count
+                continue
+            worker = part.get(ACTIVITY_WORKER_KEY)
+            if worker is not None and not isinstance(worker, str):
+                malformed += 1
+                continue
+            if worker and worker.startswith(ACTIVITY_WORKER_PREFIXES):
                 continue
             tool = part.get(ACTIVITY_TOOL_KEY)
             if not isinstance(tool, str) or not tool:
