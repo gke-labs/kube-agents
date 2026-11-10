@@ -236,6 +236,10 @@ def select(keep_dir: str, verdicts_dir: str, final: bool, state: Optional[State]
     logs = state.reader.load(p for _, _, segments in pods for p in segments)
     selection.lost_lines = logs.lost
     attribution = RA.Attribution(logs, state.store, selection.runs, final)
+    # (version, slot object, local path, answer fingerprint), in pod order:
+    # decided once every pod's answers are, since two pods can each hold a
+    # pointer for one slot key, each to its own answer.
+    slots: List[Tuple[str, str, str, str]] = []
     for _, pod_dir, segments in pods:
         version = pod_version(segments, state.versions)
         if not version:
@@ -272,8 +276,15 @@ def select(keep_dir: str, verdicts_dir: str, final: bool, state: Optional[State]
                 continue
             target = read_json(path)
             if isinstance(target, str) and SAFE_HEX.match(target):
-                selection.add(version, SLOTS, name, path)
-                selection.slot_targets.setdefault(version, {}).setdefault(name, target)
+                slots.append((version, name, path, target))
+    # A pointer is a candidate only once its answer is selected or already up,
+    # so one to an answer that will not go up never takes the name from one
+    # whose answer will.
+    for version, name, path, target in slots:
+        answer = f"{ANSWERS}/{target}{JSON_SUFFIX}"
+        if answer in selection.objects.get(version, {}).get(ANSWERS, {}) or (version, answer) in state.done:
+            selection.add(version, SLOTS, name, path)
+            selection.slot_targets.setdefault(version, {}).setdefault(name, target)
     return selection
 
 
