@@ -13,7 +13,7 @@
 # volumeAttributes as written, so the condition exists on the lane's hosts
 # and the fields a check would read are the planted ones.
 id: storage-gcsfuse-unbounded-cache-oom
-name: "GCS Fuse Volume Mounted Without Sidecar Memory or Cache Limits (gcsfuse sidecar limits check)"
+name: "GCS Fuse Volume Mounted Without a Sidecar Memory Limit (gcsfuse sidecar limits check)"
 domain: reliability
 suite: certification
 expected_fail: true

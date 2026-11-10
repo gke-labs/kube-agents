@@ -42,7 +42,7 @@ variable "target_resource_name" {
 
 variable "bucket_name" {
   type        = string
-  description = "Bucket the csi volume names. No such bucket exists and nothing creates one: the mount fails and the pod never becomes ready; the case reads the template. The case's cache safeguard names the same value."
+  description = "Bucket the csi volume names. No such bucket exists and nothing creates one: the mount fails and the pod never becomes ready; the case reads the template. The case's volume-attributes safeguard names the same value."
   default     = "kube-agents-bench-no-such-bucket"
 }
 
