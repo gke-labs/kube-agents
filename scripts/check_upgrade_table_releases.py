@@ -72,7 +72,9 @@ TABLE_LINE = re.compile(rf"^\| (?:{PENDING}|\d+\.\d+\.\d+)\s*\| (?:#\d+:\s*)?(?P
 ADDED = "+"
 REMOVED = "-"
 RELEASE_TAG = re.compile(r"^\d+\.\d+\.\d+$")
-# The table's lines start with this; its first two are the header and the separator. A heading ends it.
+# The table's lines start with this; its first two are the header (first cell RELEASE_HEADER) and the
+# separator. The first line after it that does not start with this ends it, and so does a heading.
+RELEASE_HEADER = "Release"
 TABLE_CELL_SEPARATOR = "|"
 TABLE_HEADER_LINES = 2
 HEADING_PREFIX = "#"
@@ -203,12 +205,21 @@ def release_cell_problems() -> list[str]:
     start = next((i for i, line in enumerate(lines) if line.strip() == TABLE_HEADING), None)
     if start is None:
         return found
+    # The table starts at its header row (first cell "Release") and ends at the first line after it that
+    # does not start with `|`, so another table or `|` line under the same heading, before or after it,
+    # is not read.
     table = []
     for number in range(start + 1, len(lines)):
-        if lines[number].startswith(HEADING_PREFIX):
+        line = lines[number]
+        if line.startswith(HEADING_PREFIX):
             break
-        if lines[number].startswith(TABLE_CELL_SEPARATOR):
+        if not table:
+            if line.startswith(TABLE_CELL_SEPARATOR) and line.split(TABLE_CELL_SEPARATOR)[1].strip() == RELEASE_HEADER:
+                table.append(number)
+        elif line.startswith(TABLE_CELL_SEPARATOR):
             table.append(number)
+        else:
+            break
     for number in table[TABLE_HEADER_LINES:]:
         cell = lines[number].split(TABLE_CELL_SEPARATOR)[1].strip()
         if not (RELEASE_TAG.match(cell) or cell == PENDING):
