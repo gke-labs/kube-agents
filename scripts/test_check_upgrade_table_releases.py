@@ -357,6 +357,28 @@ class CheckUpgradeTableReleasesTest(unittest.TestCase):
         self.assertIn('the Release cell "Pending" is neither a release number nor pending', err)
         self.assertNotIn('"next"', err)
 
+    def test_an_earlier_table_with_a_release_column_does_not_hide_the_table(self):
+        self.repo.rows.insert(0, row("Pending", "change m"))
+        self.repo.write_page()
+        page = self.repo.root / PAGE
+        intro = "| Release | Notes |\n| --- | --- |\n| next | x |\n\n"
+        page.write_text(page.read_text(encoding="utf-8").replace(HEADING, HEADING + intro), encoding="utf-8")
+        self.repo.commit("feat: m")
+        code, err = self.repo.check(GITHUB_EVENT_NAME="push")
+        self.assertEqual(code, 1)
+        self.assertIn('the Release cell "Pending" is neither a release number nor pending', err)
+        self.assertNotIn('"next"', err)
+
+    def test_a_renamed_table_header_fails(self):
+        page = self.repo.root / PAGE
+        page.write_text(page.read_text(encoding="utf-8").replace("| Release | Change |", "| `Release` | Change |"),
+                        encoding="utf-8")
+        self.repo.commit("docs: rename the header", code=False)
+        code, err = self.repo.check(GITHUB_EVENT_NAME="push")
+        self.assertEqual(code, 1)
+        self.assertIn('no table under "### Breaking changes in recent releases" starts with the header '
+                      '"| Release | Change |"', err)
+
     def test_a_misspelt_release_cell_fails(self):
         for cell in ("`pending`", "Pending", "next"):
             self.repo.rows = [r for r in self.repo.rows if "change m" not in r]
