@@ -96,7 +96,7 @@ whose own rule is that the project is registered last.
 
 ## The roles
 
-Forty fixtures: thirty-seven across the four cluster slots and three project-scoped. Two of the project-scoped ones, `startup-fail-vm` and `world-open-ingress`, are catalog roles with `cluster_slot: null`, which the runner probes in the project with gcloud; `orphan-disks` is in the overlay only. Three
+Forty-one fixtures: thirty-eight across the four cluster slots and three project-scoped. Two of the project-scoped ones, `startup-fail-vm` and `world-open-ingress`, are catalog roles with `cluster_slot: null`, which the runner probes in the project with gcloud; `orphan-disks` is in the overlay only. Three
 more catalog roles plant nothing: `drift-peer-a`, `-b` and `-d` assert the authorized-networks
 majority `drift-outlier` is measured against. Most in-cluster
 fixtures are on slot `a`, across the thirteen seeded namespaces `seeded-debug`,

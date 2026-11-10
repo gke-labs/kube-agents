@@ -20,7 +20,11 @@
 # objectSelector is an exemption, the one thing that keeps it inert. The
 # readiness grader reads rules and not selectors (`upgrade_readiness.py`, the
 # note on objectSelector above its scope constants), so a check built the
-# same way names the gate. Two flip conditions, both stated here. Flips this
+# same way names the gate. The same item opens with "verify that
+# capacitybuffers is established"; slot b serves that CRD already, so a check
+# that fires only on an unestablished CRD never names the gate either, and
+# the check this case waits for reads the rules of every fail-closed webhook
+# whatever the CRD's state. Two flip conditions, both stated here. Flips this
 # case: a finding of this audit from a check that reads each fail-closed
 # webhook's rules for reach into `apiextensions.k8s.io` CRD writes or an
 # `*.x-k8s.io` group together with its backend, on every collected cluster
@@ -43,12 +47,13 @@
 # CREATE and UPDATE, an objectSelector on the fleet label, clientConfig
 # pointing at Service seeded-upgrade/nonexistent-crd-gate, which does not
 # exist (role readiness-crd-webhook in bench/tf/fleet/fixtures.json). Nothing
-# is planted by the run: the case observes the fleet.
+# is planted by the run: the case observes the fleet. Parked in
+# FIXTURE_NOT_READY until the reconcile plants the gate on every pool project;
+# the un-park pull request adds `suite: certification` and the roster line.
 # Isolation class: fleet-read-only, GitOps-repo write (the audit's ledger).
 id: upgrade-webhook-blocks-capacitybuffers-crd
-name: "Fail-Closed Admission Webhook Blocking the capacitybuffers.autoscaling.x-k8s.io System CRD (upgrade audit)"
+name: "Fail-Closed Admission Webhook With No Backend Whose Rule Reaches CustomResourceDefinition Writes (system CRD webhook check)"
 domain: upgrades
-suite: certification
 expected_fail: true
 audit_streams:
   - security-patch-orchestrator
@@ -62,12 +67,12 @@ expected_output: >-
   `seeded-crd-gate`: its `failurePolicy` is `Fail`, its one rule intercepts
   CustomResourceDefinition creates and updates, and its `clientConfig.service`
   names `seeded-upgrade/nonexistent-crd-gate`, a Service that does not exist,
-  so a GKE upgrade to 1.35 or later cannot install the
-  `capacitybuffers.autoscaling.x-k8s.io` CRD and Cluster Autoscaler
-  initialization hangs; the fix is a live backend, `failurePolicy: Ignore`
-  for a hook that is not a security control, or rules that do not reach the
-  CRDs GKE installs. The closing response is the SOP's one line with the
-  ledger URL.
+  so on a cluster whose selectors do not exempt them the rule refuses the CRD
+  writes GKE's control plane makes at a 1.35+ upgrade, the
+  `capacitybuffers.autoscaling.x-k8s.io` install among them; the fix is a
+  live backend, `failurePolicy: Ignore` for a hook that is not a security
+  control, or rules that do not reach the CRDs GKE installs. The closing
+  response is the SOP's one line with the ledger URL.
 infrastructure:
   deployer: noop
 validated: false
