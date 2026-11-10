@@ -254,6 +254,24 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         proc = self._run_install_func(script)
         self.assertEqual(proc.stdout.split()[-3:], ["not-given", "given", "given"], proc.stderr)
 
+    def test_names_the_file_records_are_settled_once_the_defaults_load(self):
+        """curl | bash from outside the checkout: no defaults at source time, so the first reading failed closed."""
+        script = ('PARAM_KMS_KEYRING=my-ring PARAM_KMS_KEY=my-key PARAM_KMS_KEYRING_GIVEN=false PARAM_KMS_KEY_GIVEN=false '
+                  'INSTALL_ENV_RECORDS_KMS_KEYRING=true INSTALL_ENV_RECORDS_KMS_KEY=true INSTALL_ENV_RECORDS_GITHUB_APP=false; '
+                  'settle_minter_names_given; '
+                  'echo "ring_given=$PARAM_KMS_KEYRING_GIVEN key_given=$PARAM_KMS_KEY_GIVEN"; '
+                  'PARAM_KMS_KEYRING=github-token-minter-keyring PARAM_KMS_KEYRING_GIVEN=false; '
+                  'settle_minter_names_given; echo "default_given=$PARAM_KMS_KEYRING_GIVEN"')
+        proc = self._run_install_func(script)
+        self.assertIn("ring_given=true key_given=true", proc.stdout, proc.stderr)
+        # The old project-wide default from the file, with no App recorded, still isn't a choice.
+        self.assertIn("default_given=false", proc.stdout, proc.stderr)
+        # And resolve_shared_defaults settles them before it fills the defaults in.
+        text = _INSTALL_SH.read_text()
+        body = text[text.index("resolve_shared_defaults() {"):]
+        self.assertLess(body.index("settle_minter_names_given"),
+                        body.index('PARAM_KMS_KEYRING="${PARAM_KMS_KEYRING:-$DEFAULT_KMS_KEYRING}"'))
+
     def test_default_names_beside_a_recorded_app_are_explicit(self):
         proc = self._minter_names_given(
             "GITHUB_APP_ID=12345\nKMS_KEYRING=github-token-minter-keyring\nKMS_KEY=github-token-minter-key\n")

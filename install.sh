@@ -516,6 +516,20 @@ minter_name_given() {
   [ "$file_records" != "true" ] && return 0
   [ "${INSTALL_ENV_RECORDS_GITHUB_APP:-false}" = "true" ]
 }
+# settle_minter_names_given reads the names again once install.defaults.env is
+# loaded (resolve_shared_defaults): under curl | bash from outside the checkout
+# the reading below may not have had the defaults to compare with, and failed
+# closed. A name it already counts stays counted.
+settle_minter_names_given() {
+  if [ "${PARAM_KMS_KEYRING_GIVEN:-false}" != "true" ] &&
+    minter_name_given "$PARAM_KMS_KEYRING" "${DEFAULT_KMS_KEYRING:-}" "${INSTALL_ENV_RECORDS_KMS_KEYRING:-false}"; then
+    PARAM_KMS_KEYRING_GIVEN="true"
+  fi
+  if [ "${PARAM_KMS_KEY_GIVEN:-false}" != "true" ] &&
+    minter_name_given "$PARAM_KMS_KEY" "${DEFAULT_KMS_KEY:-}" "${INSTALL_ENV_RECORDS_KMS_KEY:-false}"; then
+    PARAM_KMS_KEY_GIVEN="true"
+  fi
+}
 PARAM_KMS_KEYRING_GIVEN="false"
 PARAM_KMS_KEY_GIVEN="false"
 if minter_name_given "$PARAM_KMS_KEYRING" "${DEFAULT_KMS_KEYRING:-}" "${INSTALL_ENV_RECORDS_KMS_KEYRING:-false}"; then
@@ -3495,6 +3509,8 @@ resolve_shared_defaults() {
   if [ "$PARAM_GITOPS_FORGE" != "gitlab" ]; then
     PARAM_GITOPS_REPO="${PARAM_GITOPS_REPO:-$DEFAULT_GITOPS_REPO}"
   fi
+  # Before the defaults fill the names in, or every name would read as given.
+  settle_minter_names_given
   PARAM_KMS_KEYRING="${PARAM_KMS_KEYRING:-$DEFAULT_KMS_KEYRING}"
   PARAM_KMS_KEY="${PARAM_KMS_KEY:-$DEFAULT_KMS_KEY}"
   PARAM_ENABLE_PUBSUB_PLATFORM="${PARAM_ENABLE_PUBSUB_PLATFORM:-$DEFAULT_ENABLE_PUBSUB_PLATFORM}"
