@@ -435,7 +435,7 @@ Helm install, set the block in your values file.
 
 Execution limits per agent persona, where `<persona>` is one of `default` (the Planning Agent front
 door), `platform` (the Platform Agent), or `cluster` (**every** Cluster Agent), plus the board-wide
-`maxInProgress`, the mode-next session-pod cap `maxSessions`, and the AgentProfile knobs under
+`maxInProgress` and the dispatcher's memory `admission`, the mode-next session-pod cap `maxSessions`, and the AgentProfile knobs under
 `profiles` (the ceiling and its child reserve, `warmReplicas`, and the dispatcher's intervals; see [AgentProfile](./agentprofile-crd.md)). Unset,
 `maxSessions` renders `10`, `profiles.ceiling` follows `maxInProgress` (`6` unless set) and `profiles.warmReplicas` `1`; all three are
 inert under `mode: today`.
@@ -465,11 +465,28 @@ below. Set it on the CR to raise or lower that. Either way the value is pinned i
 at `/etc/hermes`, so it applies over whatever the agent's own `config.yaml` says, and removing the
 field puts the default back.
 
+**`admission` is pinned the same way.** On every tick the dispatcher reads `kanban.admission` from
+the managed scope and counts the container's working set, its cgroup memory usage less the inactive
+file cache, against a budget. Past it the dispatcher refuses a card rather than spawn a worker: the
+card is blocked with kind `capacity` and a reason that names the figures, so the thread that filed
+it is told it is throttled. The budget is the request, not the limit, because the kubelet evicts the
+pod under node pressure once its working set passes the request. Under GKE Sandbox the limit the container can read is the sandbox's, not the
+cgroup's, so Hermes' own `/proc/meminfo` guard never fires there.
+
+Unset, `memoryBudgetMiB` is the agent container's memory request in MiB (`spec.deployment.resources`,
+`4096` at the default `4Gi`), so raising the request raises the budget. `workerRssCapMiB` (`1536`)
+stops a running worker whose process tree passes it and blocks its card the same way.
+`queueBoundSeconds` (`600`) refuses a ready card that memory pressure or a full board has held for
+that long. `failClosed` (`true`) makes a tick that cannot read the memory counters spawn nothing.
+[PlatformAgent fields](/kube-agents/operator/platformagent-fields/) lists the bounds.
+
 ```yaml
 spec:
   harness:
     tuning:
       maxInProgress: 8 # board-wide; raises the operator's default of 6
+      admission:
+        memoryBudgetMiB: 3072 # the dispatcher's budget; defaults to the container's memory request
       platform:
         apiMaxRetries: 8
         maxTurns: 200
@@ -569,6 +586,18 @@ should set `maxInProgress` to fit: about 430 MiB per worker over the 1.8 GiB the
 a 4Gi limit fits about five. Raise it once you know your worker footprint and your model quota —
 that quota is the other shared resource, and for most deployments it binds before memory does.
 
+At the operator's defaults the budget and this cap are close. The budget is the container's memory
+request, 4Gi unless `spec.deployment.resources` changes it, and it counts the agent container alone.
+A tick admits one new worker per 512 MiB of headroom under the budget: from an idle set of about
+800 MiB that is six, from the 1.5 GiB a `spec.mode: next` gateway idles at, five. Six workers at
+430 MiB add about 2.6 GiB, inside the request from the smaller idle set and one worker short from
+the larger. To admit more, raise the request, not the limit: under node pressure the kubelet evicts
+the pod once its working set passes the request ([`admission`](#specharnesstuning)).
+
+[`docs/designs/safe-throttling.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/safe-throttling.md)
+is the design for admission by memory beside this count: a pressure guard on the container's own
+memory counters, a resident cap per worker, and a `capacity` refusal that names the alternatives.
+
 The cap comes from the operator, not from the image or the agent's own `config.yaml`. The operator
 pins `kanban.max_in_progress` in the managed scope at `/etc/hermes`: the CR's value, or `6` when it
 says nothing. Hermes applies that file over the agent's config on every load, so a value an existing
@@ -605,6 +634,11 @@ waits, because every slot is busy or the only free one is triage's, gets one lin
 part of a request already running (a worker's child, or a card with a parent link) waits without
 one.
 
+The wait is bounded. A card that memory pressure or a full board has held past
+`tuning.admission.queueBoundSeconds` (600 s by default) is blocked with kind `capacity`. The queued
+line settles as stopped, and the Planning Agent answers the thread with the reason and the
+alternatives ([`admission`](#specharnesstuning)).
+
 A full board is logged as what it is. When every slot is busy for six ticks in a row the gateway
 logs, at most every five minutes:
 
@@ -629,7 +663,9 @@ The arithmetic behind `6`:
   two Node MCP proxies about 100 MiB each, a supervisor and an ssh. Six of them are about 2.6 GiB
   over the gateway's 1.8 GiB idle set, about 4.4 GiB under the container's 8Gi limit. A coordinator
   waiting on its own children gives its slot back but stays resident, so the process count can sit
-  above six; the 8Gi limit leaves room for about fourteen workers at that size.
+  above six; the 8Gi limit leaves room for about fourteen workers at that size. That is the limit's
+  room; the room a default install uses is the request's, because the admission budget follows the
+  request (above).
 - **Credential proxy.** Every worker's `kubectl` and `gcloud` runs through the proxy, which admits a
   request only when its children fit the proxy's memory limit: 176 MiB per request after a 192 MiB
   reserve for the broker and Envoy. At its default 2Gi limit that is 10 at once
@@ -657,7 +693,7 @@ The cap counts running cards, not resident processes, and one case makes those d
 waiting on work it fanned out is discounted, or it would hold the slot its own children need
 ([`kanban_scheduling.py`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/patches/kanban_scheduling.py)).
 Peak memory is therefore the cap plus however many coordinators are waiting, held down by the
-dispatcher's memory-pressure guard rather than by this number.
+dispatcher's memory admission ([`tuning.admission`](#specharnesstuning)) rather than by this number.
 
 ### `spec.harness.experimental`
 
@@ -683,8 +719,9 @@ Three things change while it is on:
 - `profile-platform.overlay.yaml` gains the three profile-shaped things only the `default` profile
   carried before: the toolsets each chat platform key resolves, the ingress plugins, and the
   `kanban` block. The adapters themselves are not copied — the managed scope at `/etc/hermes` is
-  machine-global, so `platforms.*`, `display.platforms` and the board's worker cap
-  ([`tuning.maxInProgress`](#specharnesstuning)) already land on this profile. The rest of `kanban`
+  machine-global, so `platforms.*`, `display.platforms`, the board's worker cap
+  ([`tuning.maxInProgress`](#specharnesstuning)) and the dispatcher's memory admission
+  ([`tuning.admission`](#specharnesstuning)) already land on this profile. The rest of `kanban`
   does have to follow the gateway, because the dispatcher and the notifier run in the gateway
   process and read their settings from its own home. The board itself does not move — Hermes
   anchors `kanban.db` at the shared root rather than the active profile, deliberately, so the
@@ -849,7 +886,7 @@ Abstracts the pod/deployment configuration. The controller synthesises a `Deploy
 
 - `availability.runtimeClassName` — pod runtime class (e.g. `gvisor`) for the agent Pod. Nested under `availability` alongside `replicas`, `nodeSelector`, `tolerations` and `affinity`. When set, the managed config also carries `database.journal_mode: delete`, and the entrypoint converts Hermes' existing databases out of WAL once at start-up — `state.db`, `kanban.db` and the cron, project, evidence, response, memory and Discord stores Hermes opens through the same journal-mode helper. A sandboxed runtime serves the data volume over a gofer mount that accepts SQLite's WAL mode and then corrupts it. The Session KV store (`session_kv.db` on the `system-metadata` volume) sets WAL itself and is not covered by either. Clearing the field drops the pin, and the databases return to WAL on their next open.
 - `env` — additional container environment variables.
-- `resources` — requests and limits for the agent container, replacing the operator's defaults as a block.
+- `resources` — requests and limits for the agent container, replacing the operator's defaults as a block. The memory request is also the dispatcher's default admission budget ([`tuning.admission`](#specharnesstuning)), so raising it admits more workers at once.
 - `credentialProxy.resources` — requests and limits for the credential-proxy container, the broker that runs every credentialed command in a pod of its own. Merged over the operator's defaults per key, unlike `resources`; [`spec.deployment.credentialProxy.resources`](#specdeploymentcredentialproxyresources) has the defaults it keeps, what the operator refuses, and what admission warns about.
 - `credentialProxy.exec.replicas` — the number of exec-tier broker pods, 0 to 32: stateless replicas beside the broker pod that answer `/v1/exec` and `/v1/gcp/` only. 0, the default, renders none. A positive count renders the `<name>-credential-proxy-exec-tier` Deployment, Service, count ConfigMap, NetworkPolicy and (from two replicas) PodDisruptionBudget, and gives the sandbox, the profile workers and the session pods its address. Each replica requests and is limited to 2 CPU and 2Gi.
 
@@ -1604,6 +1641,7 @@ These condition types appear in `conditions`; only `Ready` is always present:
 | `Ready`                    | Always                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | Tracks `phase`; its `reason` and `message` carry whatever the reconcile is waiting on, including the reasons that park `phase: Degraded` (`RuntimeClassNotFound`, `ShellSandboxCannotBeDisabled`, `ForbiddenVolumeMount`, `EgressAllowlistRefused`, `ModeNotRecognized`, `ShellSandboxKeysMissing`, and under `mode: next` `A2AProvisionFailed`). [What `Ready` reports](#what-ready-reports) says what the last three mean and how a failed provisioning Job is cleared. Under `spec.deployment.scaleToZero: true` it reads `False` with reason `ScaledToZero` beside `phase: Paused` once the gateway has no ready replica; the same section says when.                                                                                                                                                                                                                                                                                |
 | `Degraded`                 | Only while degraded                                                                                                                                                                                                                                                                                                                                                                                                                                                       | Something in the spec, cluster state, or operator install cannot be honoured. `Reason` is one of `InvalidGitRepoURL`, `CorruptManagedRepos`, `MinterPruningHeld`, `InvalidCredentialProxyResources`, `InvalidAgentAPIAuthResources`, `InvalidShellSandboxResources` or `RBACIncomplete`; [What `Degraded` reports](#what-degraded-reports) says what each means. The refusals above ride the `Ready` condition instead of this one.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `BusCredentialsReady`      | Under `mode: next`, and while a callout Deployment exists                                                                                                                                                                                                                                                                                                                                                                                                                 | Whether every replica the callout Deployment asks for is ready, and therefore both serving an identity map and attached to the bus. `Reason: CalloutServing` (`True`), `CalloutUnavailable`, or `CalloutAbsent`. The operator's own gates do not read it, and it reads `False` with `1 of 2 replicas ready` while the gateway exists and dispatches; [What `BusCredentialsReady` reports](#what-buscredentialsready-reports) has the gate it differs from and when it is removed.                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `DispatcherJobMode`        | Under `mode: next`, while the operator runs the profile dispatcher (`A2A_DISPATCHER_IMAGE`) with the chart's `A2A_DISPATCHER_JOB_POLICY` signal set, from the first pass that reaches the dispatcher                                                                                                                                                                                                                                                                      | Whether the dispatcher runs unattended profile tasks as Jobs. `Reason: InPlace` (`True`), `PolicyMissing`, `NamespaceNotSelected`, `NamespaceNotReady`, `ForeignJobTemplate`, or `GrantFailed`; [What `DispatcherJobMode` reports](#what-dispatcherjobmode-reports) has each.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `A2AIdentityMapApplied`    | Under `mode: next`, once the operator renders an identity map                                                                                                                                                                                                                                                                                                                                                                                                             | Whether the auth callout took the identity map this operator rendered, read from every Ready callout pod's `/status` by pod IP, again every 30 seconds while unsettled. `True`, `Serving`: every Ready pod answered and serves it. `False`, `Refused`: a pod refused it and serves its previous map, which can be wider; the message quotes the refusal. `False`, `Pending`: a pod is still on an older map or mid-way through its shards. `Unknown`, `StatusUnreadable`: a Ready pod didn't answer and may hold a refusal, so turning to it is a Warning event (a NetworkPolicy on the callout must admit the operator). `Unknown`, `NoReadyCallout`: no pod is Ready. Removed when the A2A stack is off.                                                                                                                                                                                                                               |
 | `A2AGateway`               | Under `mode: next`, only on an install upgraded from an operator that ran the A2A gateway at zero replicas for want of a chat backend: from the pass that scales it back to one replica until that replica is ready. Written and cleared by every pass that renders the stack, whichever phase it ends on (`Ready`, `Provisioning`, or `Degraded` for `A2AProvisionFailed` and `ShellSandboxKeysMissing`), so only a pass that stops before rendering leaves it as it was | `status: False`, `Reason: WaitingForReplica`. Every `mode: next` install runs the A2A gateway, on the console door alone when no chat backend is configured. After the upgrade the next pass renders it at one replica, `Ready` waits on it, and the condition clears once a replica is ready. [What `A2AGateway` reports](#what-a2agateway-reports) covers the older `NoChatBackend` reason and the `discord-bot` Secret.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `BusProvisioned`           | Under `mode: next`, from the first pass that sees the bus provisioning Job complete, whichever phase that pass ends on; kept through the Job's later re-runs and removed with the stack when the mode flips to `today`                                                                                                                                                                                                                                                    | `status: True`, `Reason: ProvisionJobComplete`. The record that lets `Ready` stop counting the Job: the finished Job is removed by its 24 h TTL and rendered again, and a spec edit renders a new one under a new digest, and neither re-run should flip a Ready install to `Provisioning` for the minute it takes. Until this condition exists the Job counts, so an install upgraded from an operator that never counted the Job (one that could read `Ready` over an unprovisioned bus) does not inherit a completion nobody saw. The message names the Job that first provisioned the bus. A re-run that fails is still reported as `A2AProvisionFailed`.                                                                                                                                                                                                                                                                            |
@@ -1702,7 +1740,7 @@ Deleting the Job before one of those ways out is taken (the two, or the three wh
 
 Recreating the stream costs one more step, and the order matters. Once `TASKS` is back, restart the A2A gateway (`kubectl rollout restart deployment/<agent>-a2a-gateway`), and the agent workload `<agent>-gateway` with it where a Hermes bridge sidecar runs. Deleting a stream deletes every consumer on it, and neither of those two durable readers re-creates one, so a gateway left running keeps accepting delegations and spawning session pods while relaying no events, the bridge dispatches nothing, and the CR reads `Ready` over both; session pods recover by themselves, which hides it.
 
-A gateway restarted before the stream is back waits for it, not ready, and binds once it is recreated; a bridge restarted early only fails its subscribe, so it is the bridge's restart that has to follow the stream.
+A gateway restarted before the stream is back waits for it, not ready, and for its durable, which provisioning creates with the stream, then binds once both exist. A bridge restarted early is less tidy: it waits for its durable but reports ready meanwhile, and if a task was in flight when the stream went, its startup sweep fails and the pod restarts until the stream is back. So restart the bridge's workload after the stream is back.
 
 ### What `Degraded` reports
 
@@ -1744,6 +1782,29 @@ Ready is counted against `spec.replicas`, not against the pods that exist. The c
 **When it is removed.** Removed, not set false, once the mode is not `next` **and** the callout Deployment is gone: both, so the condition never describes a callout that is still running. It is re-derived from the callout Deployment on every exit from the reconcile, not at a point in its sequence. So a pass that parks `Ready=False` for an unrelated reason (a missing shell sandbox keypair, a refused `spec.deployment`, say) still reports it, rather than leaving it absent or, worse, leaving the last value standing while the callout it named goes away.
 
 The one case it is neither written nor removed is version skew, a `spec.mode` this operator does not recognise: the bus a newer CRD rendered is deliberately left standing there, so the condition describing it is too. A CR flipped to `today` by an edit that is itself refused also keeps the condition, because the refusal withholds the teardown too and the callout is still running.
+
+### What `DispatcherJobMode` reports
+
+`DispatcherJobMode` says whether the profile dispatcher runs unattended profile tasks as Jobs. Job mode needs the dispatcher Job admission policy and its binding in the cluster as the chart renders them, the profile namespace selected by that binding, and the dispatcher holding its Jobs Role there. Without it, unattended tasks have no worker and the dispatcher refuses them at admission (`no-worker`). The operator also records a `DispatcherJobPolicyMissing` Warning Event on each pass the policy or the namespace selection fails, but Events expire; the condition stays.
+
+**Reasons.**
+
+| Reason                 | Status  | Meaning                                                                                                                                                                                                   |
+| ---------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `InPlace`              | `True`  | The last pass that settled Job mode found the policy and binding in place and granted the dispatcher its Jobs Role in the profile namespace.                                                              |
+| `PolicyMissing`        | `False` | The policy or its binding is missing, unreadable to the operator (`Forbidden`), or loosened. The message is the `DispatcherJobPolicyMissing` Event's and names which.                                     |
+| `NamespaceNotSelected` | `False` | The profile namespace lacks a label the binding selects it by, so the policy does not hold there. The message is the Event's.                                                                             |
+| `NamespaceNotReady`    | `False` | The profile namespace is absent or lacks the chart's markers, or the pass did not apply its network fence, which includes a failed fence write or a failed read of the namespace.                         |
+| `ForeignJobTemplate`   | `False` | A `DispatchJobTemplate` under one of the operator's names in the profile namespace lacks this agent's labels. The operator leaves it alone, and Job mode stays off for every profile until it is removed. |
+| `GrantFailed`          | `False` | Granting Job mode failed this pass (copying the CA bundle, writing the templates, applying the Jobs Role, or reading the profile namespace). The message carries the error.                               |
+
+Every `False` reason means the pass left the Job templates out of the dispatch config and revoked the dispatcher's Jobs Role. If the revoke itself fails, the Role can still stand; the operator logs that error, and the condition keeps the reason that triggered the revoke. Jobs already running are left to finish.
+
+**When it changes.** It follows what each pass does to the Jobs Role, written on the way out of the reconcile like `BusCredentialsReady`, so a pass that ends `Degraded` still writes it. A pass that changes nothing about the Role leaves it as it was: a read of the policy that fails for a reason other than `NotFound` or `Forbidden` (a timeout, throttling), or a pass that stops before the dispatcher step. So `True` describes the last pass that settled Job mode, not the cluster now: the operator does not watch the policy or its binding, so a policy removed since then shows on the next pass that reaches the dispatcher.
+
+**When it is removed.** Removed, not set `False`, only by a pass that tore Job mode down or found nothing of it left. With the chart's signal off, that is once the dispatcher's Jobs, Job templates and Jobs Role are deleted. With no dispatcher image, it is once the dispatcher is removed. With the mode flipped to `today`, it is once the A2A stack is torn down. A pass that stops before that teardown (a refused `spec`, say) or whose teardown fails leaves the condition as it was, because the Jobs Role and the templates are still live.
+
+Version skew, a `spec.mode` this operator does not recognise, neither writes nor removes it, as for `BusCredentialsReady`: the dispatcher a newer CRD rendered is left standing, so the condition describing it is too.
 
 ### What `A2AGateway` reports
 
@@ -1846,6 +1907,9 @@ _and_ beyond the agent's own repair:
 - `model.*`, `platforms.*`, `approvals.cron_mode` and `display.platforms`;
 - `kanban.max_in_progress`: the board is shared by every profile, and a burst of workers past it is
   lost to the OOM killer without a restart or an event;
+- `kanban.admission`: the dispatcher's memory budget, worker cap, queue bound and fail-closed
+  switch, from `spec.harness.tuning.admission`; the board is shared and an eviction is pod-wide, so
+  no profile may admit past the pod's request;
 - `terminal.*`: where the shell runs, one sandbox per Pod, reached the same way by every profile;
 - `database.journal_mode`, when the agent Pod has a runtime class: one data volume per Pod, and a
   corrupted database is found only after the sessions in it are unreadable;

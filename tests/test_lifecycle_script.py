@@ -115,6 +115,8 @@ class LifecycleScriptGuardTest(unittest.TestCase):
                    tfvar_kms_key='"k8s-secret-encryption-key"',
                    tfvar_cluster_name="null",
                    tfvar_enable_minter="false",
+                   tfvar_minter_shared_key='""',
+                   tfvar_minter_adopt_key='""',
                    gcloud_key_version="",
                    gcloud_scheduled_version="",
                    gcloud_scheduled_fail=False,
@@ -280,6 +282,12 @@ elif [[ "$cmd" == "console" ]]; then
     elif [[ "$expr" == *"create_cluster"* ]]; then
         echo '{tfvar_create_cluster}'
         exit 0
+    elif [[ "$expr" == *"github_minter_shared_kms_key"* ]]; then
+        echo '{tfvar_minter_shared_key}'
+        exit 0
+    elif [[ "$expr" == *"github_minter_adopt_unlabelled_kms_key"* ]]; then
+        echo '{tfvar_minter_adopt_key}'
+        exit 0
     elif [[ "$expr" == *"namespace"* ]]; then
         echo '{tfvar_namespace}'
         exit 0
@@ -358,6 +366,9 @@ elif [[ "$cmd" == "untaint" ]]; then
     # The address is the last argument; -no-color precedes it.
     echo "untaint ${{@: -1}}" >> "${{TF_STUB_LOG:-/dev/null}}"
     {untaint_stub}
+elif [[ "$cmd" == "import" ]]; then
+    # The address, for the adoption tests (`import -input=false -no-color <addr> <id>`).
+    echo "import ${{@: -2:1}}" >> "${{TF_STUB_LOG:-/dev/null}}"
 elif [[ "$cmd" == "apply" ]]; then
     # One line per attempt, for the retry tests; apply_stub decides the outcome.
     echo "apply ${{@:2}}" >> "${{TF_STUB_LOG:-/dev/null}}"
@@ -1711,6 +1722,125 @@ resource "google_service_account" "agent" {
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("could not read the state for tainted resources", proc.stderr)
         self.assertIn(f"untaint {self._KEYRING}", log)
+
+    # The minter's ownership check (#3504): adopt_kms imports a minter key ring
+    # or key this state doesn't hold only when it is this install's own, or the
+    # one github_minter_shared_kms_key names.
+    _MINTER_KEYRING = "module.github_minter[0].google_kms_key_ring.minter"
+    _MINTER_KEY = "module.github_minter[0].google_kms_crypto_key.minter"
+
+    @staticmethod
+    def _minter_gcloud(labels: str | None, key_exists: bool = True, labels_fail: bool = False) -> str:
+        """gcloud for the adoption: the ring exists, the key exists or not, and
+        `kms keys describe --format=value(labels)` prints the labels (or fails)."""
+        if labels_fail:
+            labels_behavior = "exit 1"
+        else:
+            labels_behavior = f"echo '{labels or ''}'; exit 0"
+        return (
+            'if [[ "$*" == *"kms keys describe"* && "$*" == *"value(labels)"* ]]; then\n'
+            f"    {labels_behavior}\n"
+            'elif [[ "$*" == *"kms keys describe"* ]]; then\n'
+            f"    exit {0 if key_exists else 1}\n"
+            "fi\n"
+            "exit 0"
+        )
+
+    def _adopt_minter(self, labels, **kwargs):
+        kwargs.setdefault("tfvar_cluster_name", '"cluster-b"')
+        return self._run_with_stub_log(
+            "adopt_kms",
+            state_list="",
+            tfvar_create_cluster="false",
+            tfvar_enable_minter="true",
+            tfvar_enable_google_chat="false",
+            gcloud_stub=self._minter_gcloud(labels, **{k: kwargs.pop(k) for k in ("key_exists", "labels_fail") if k in kwargs}),
+            **kwargs,
+        )
+
+    def test_another_installs_minter_key_is_refused(self):
+        proc, log = self._adopt_minter("kube-agents-cluster=cluster-a;kube-agents-namespace=kubeagents-system")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("belongs to install cluster-a/kubeagents-system", proc.stderr)
+        self.assertIn("github_minter_shared_kms_key", proc.stderr)
+        self.assertNotIn("import ", log)
+
+    def test_an_unlabelled_minter_key_is_refused(self):
+        """A key from before the labels may be another install's: refused, not guessed."""
+        proc, log = self._adopt_minter("")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("carries no owner labels", proc.stderr)
+        self.assertNotIn("import ", log)
+        # The way out for an install's own key from before the labels, on the
+        # paths that never ran the interview (upgrade.sh, the Day-2 menu).
+        self.assertIn("MINTER_ADOPT_KEY=github-token-minter-keyring/github-token-minter-key in install.env", proc.stderr)
+
+    def test_this_installs_own_minter_key_is_adopted(self):
+        proc, log = self._adopt_minter("kube-agents-cluster=cluster-b;kube-agents-namespace=kubeagents-system")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("its owner labels name this install", proc.stdout)
+        self.assertIn(f"import {self._MINTER_KEYRING}", log)
+        self.assertIn(f"import {self._MINTER_KEY}", log)
+
+    def test_the_same_cluster_in_another_namespace_is_another_install(self):
+        proc, log = self._adopt_minter("kube-agents-cluster=cluster-b;kube-agents-namespace=team-two")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("belongs to install cluster-b/team-two", proc.stderr)
+
+    def test_the_key_named_as_shared_is_adopted_whatever_its_labels(self):
+        proc, log = self._adopt_minter(
+            "", tfvar_minter_shared_key='"github-token-minter-keyring/github-token-minter-key"')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("names it as shared on purpose", proc.stdout)
+        self.assertIn(f"import {self._MINTER_KEY}", log)
+
+    def test_an_unlabelled_key_named_explicitly_is_adopted_as_this_installs_own(self):
+        """The installer names it when KMS_KEYRING and KMS_KEY were given; the apply then labels it."""
+        proc, log = self._adopt_minter(
+            "", tfvar_minter_adopt_key='"github-token-minter-keyring/github-token-minter-key"')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("carries no owner labels and was named explicitly", proc.stdout)
+        self.assertIn(f"import {self._MINTER_KEY}", log)
+
+    def test_labels_win_over_an_explicit_name(self):
+        proc, log = self._adopt_minter(
+            "kube-agents-cluster=cluster-a;kube-agents-namespace=kubeagents-system",
+            tfvar_minter_adopt_key='"github-token-minter-keyring/github-token-minter-key"')
+        self.assertEqual(proc.returncode, 1)
+        self.assertNotIn("import ", log)
+
+    def test_a_shared_key_naming_another_key_adopts_nothing(self):
+        """The opt-in names one resource; it isn't a switch that lets any key in."""
+        proc, log = self._adopt_minter(
+            "kube-agents-cluster=cluster-a;kube-agents-namespace=kubeagents-system",
+            tfvar_minter_shared_key='"github-token-minter-keyring/some-other-key"')
+        self.assertEqual(proc.returncode, 1)
+        self.assertNotIn("import ", log)
+
+    def test_a_ring_whose_key_does_not_exist_yet_is_adopted(self):
+        proc, log = self._adopt_minter("", key_exists=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(f"import {self._MINTER_KEYRING}", log)
+        self.assertNotIn(f"import {self._MINTER_KEY}", log)
+
+    def test_unreadable_owner_labels_refuse_rather_than_adopt(self):
+        proc, log = self._adopt_minter(None, labels_fail=True)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("Could not read the owner labels", proc.stderr)
+        self.assertNotIn("import ", log)
+
+    def test_a_minter_key_already_in_state_is_not_checked(self):
+        """An existing install's own key is in its state: no describe, no refusal."""
+        proc, log = self._run_with_stub_log(
+            "adopt_kms",
+            state_list=f"{self._MINTER_KEYRING}\n{self._MINTER_KEY}",
+            tfvar_create_cluster="false",
+            tfvar_enable_minter="true",
+            tfvar_enable_google_chat="false",
+            gcloud_stub=self._minter_gcloud(None, labels_fail=True),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("owner labels", proc.stderr)
 
     def test_the_tainted_list_is_not_read_when_no_kms_resource_is_in_state(self):
         proc, log = self._run_with_stub_log("adopt_kms", state_list="", gcloud_stub="exit 1")
