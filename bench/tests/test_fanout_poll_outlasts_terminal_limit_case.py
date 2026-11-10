@@ -106,15 +106,15 @@ def test_a_cut_at_another_limit_is_not_the_defect():
     assert _status(NOT_CUT, _fanout(cut_at_180)) == "pass"
 
 
-def test_a_run_that_never_polled_fails():
+def test_a_run_that_never_slept_passes():
     calls = [c for c in _fanout(SLEPT) if not c["args"]["command"].startswith("sleep")]
-    assert _status(NOT_CUT, calls) == "fail"
-
-
-def test_a_sleep_behind_a_chain_counts_as_polling():
-    calls = [c for c in _fanout(SLEPT) if not c["args"]["command"].startswith("sleep")]
-    calls.append(_call("card-platform", 90.0, "echo waiting && sleep 60", SLEPT))
     assert _status(NOT_CUT, calls) == "pass"
+
+
+def test_a_chained_sleep_cut_at_60s_fails():
+    calls = [c for c in _fanout(SLEPT) if not c["args"]["command"].startswith("sleep")]
+    calls.append(_call("card-platform", 90.0, "echo waiting && sleep 60", CUT))
+    assert _status(NOT_CUT, calls) == "fail"
 
 
 def test_the_answer_needs_the_namespace_and_a_count():

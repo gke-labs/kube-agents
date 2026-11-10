@@ -17,9 +17,10 @@
 # with the polling sleep; the read is in-cluster (kube-system pods), so no
 # fleet-wide read stands in for the cards. Graded is every delegated
 # worker's terminal result, the platform worker's and the Cluster Agents',
-# from the trajectory's tagged calls: none may be cut at 60 s. A run in
-# which no worker slept graded nothing about the race, so a sleep is
-# required.
+# from the trajectory's tagged calls: none may be cut at 60 s. A sleep is
+# not required: a platform worker that waits without one (1 of 10 correct
+# runs on a dev install) is not the defect, and requiring one made the case
+# fail it.
 #
 # Limits: the window opens at each lineage's first call with a non-empty
 # result, so a cut on that first call is not read (no recorded worker opens
@@ -60,9 +61,6 @@ verification_spec:
     mode: assert
     check:
       type: worker_commands
-      # The polling sleep, as a command of its own or behind a `;`/`&&`.
-      required_patterns:
-        - '(?:^|[;&|]\s*)sleep\s+\d'
       # Any non-empty result opens the window, so every later call in the
       # lineage is graded.
       after_result_pattern: '\S'
