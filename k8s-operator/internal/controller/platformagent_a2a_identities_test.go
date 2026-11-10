@@ -551,7 +551,7 @@ func TestTheWorkerCredentialIsGone(t *testing.T) {
 		t.Error("worker-password is back in a2aCredsKeys; the operator would mint a password nothing authenticates with")
 	}
 
-	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 	if strings.Contains(conf, "user: worker") {
 		t.Error("the rendered nats.conf still declares a `worker` user")
 	}

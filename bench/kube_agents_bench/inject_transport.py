@@ -281,8 +281,8 @@ ACTIVITY_INPUT_TRUNCATED_KEYS = frozenset({ACTIVITY_INPUT_TRUNCATED_KEY, "bytes"
 # ``kanban_complete`` would fire on the worker closing its own card. Such a
 # part is left out: the worker's calls reach the trajectory tagged with
 # their agent from the session store (``worker_trajectory``) when the
-# delegation wait found the cards, and the scorer sets the worker-scoped
-# checks aside on this transport either way. The skip names the worker
+# delegation wait found the cards, where the scorer grades the worker-scoped
+# checks (and sets them aside on a record without them). The skip names the worker
 # prefixes rather than the router's label, so a label this side does not
 # know stays the router's and shows in the record instead of emptying it.
 # A part with no label (a bridge older than the field, or the cli

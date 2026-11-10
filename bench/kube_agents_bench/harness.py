@@ -301,6 +301,7 @@ _FRONT_DOOR_NON_ACTION_TOOLS = frozenset({
     inject.EVENT_ENTRY_TASK,
     inject.EVENT_ENTRY_STATUS,
     inject.EVENT_ENTRY_ACTIVITY,
+    worker_trajectory.GAP_ENTRY,
 })
 
 # Character ceiling for card detail quoted in infrastructure failure errors.
@@ -4416,8 +4417,11 @@ class KubeAgentsHarness(AgentHarness):
         # sets its router-scope ``tool_called`` aside (scoring._inject_blind).
         # The workers' entries _settle appends sit outside the envelope and
         # would flip that, grading a router check against no router calls. So
-        # on such a record they are kept off the trajectory: the worker-scope
-        # checks that could read them are set aside on inject records anyway.
+        # on such a record they are kept off the trajectory, and a gap entry
+        # (``worker_trajectory.GAP_ENTRY``, a harness-written entry, so the
+        # record still reads as blind) takes their place: a run that merges
+        # this turn with one whose workers were kept, such as a pushed-report
+        # replay, would otherwise read as a complete capture.
         shown = any(e.get("name") == inject.EVENT_ENTRY_ACTIVITY for e in result.trajectory)
         before = len(result.trajectory)
         self._settle(
@@ -4428,8 +4432,14 @@ class KubeAgentsHarness(AgentHarness):
             floor=self._pod_floor,
         )
         if not shown and len(result.trajectory) > before:
-            withheld = result.trajectory[before:]
-            del result.trajectory[before:]
+            # _settle's own gap entry stays, with its reasons; only what it
+            # added besides is withheld.
+            added = result.trajectory[before:]
+            kept = [e for e in added if isinstance(e, dict) and e.get("name") == worker_trajectory.GAP_ENTRY]
+            withheld = [e for e in added if e not in kept]
+            result.trajectory[before:] = kept
+            if withheld:
+                result.trajectory.append(worker_trajectory.gap_entry([worker_trajectory.WITHHELD_ENTRIES_GAP]))
             result.metadata["worker_entries_withheld"] = len(withheld)
         return True
 
@@ -4812,8 +4822,19 @@ class KubeAgentsHarness(AgentHarness):
             # that did delegate and whose pod could not be read.
             if awaited:
                 result.tokens["workers"] = None
+                # And the gap goes on the trajectory, where the scorer reads
+                # it: a record that merges this turn with one whose workers
+                # were read would otherwise read as a complete capture.
+                result.trajectory.append(
+                    worker_trajectory.gap_entry([worker_trajectory.UNREAD_CAPTURE_GAP])
+                )
         else:
             result.trajectory.extend(captured.entries)
+            # devops-bench drops ``metadata``, so a gap goes on the trajectory
+            # too, where the scorer reads it (``worker_trajectory.GAP_ENTRY``).
+            capture_gaps = worker_trajectory.gaps(captured.summary)
+            if capture_gaps:
+                result.trajectory.append(worker_trajectory.gap_entry(capture_gaps))
             result.metadata["worker_trajectory"] = captured.summary
             result.tokens["workers"] = _worker_token_buckets(captured.tokens, captured.unbilled)
 
@@ -4937,10 +4958,8 @@ class KubeAgentsHarness(AgentHarness):
         # artifact, for the run to hold no answer; a worker that acted and then
         # died is still set aside, because the answer it never gave is not
         # evidence of the agent under test, and rung 1 grades what it did
-        # before that above this mark. On the inject lane the scorer sets the
-        # worker-blind safeguards aside on every record, died or completed,
-        # so keeping an acting worker's death graded there would protect
-        # nothing the lane has; the mark reads the same on both transports.
+        # before that above this mark. The mark reads the same on both
+        # transports.
         # The front door is another matter: one that acted after the card
         # died (a command of its own, an answer it made up) produced
         # something the judge must see, so it stays graded, as on the path

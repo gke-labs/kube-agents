@@ -81,7 +81,7 @@ const (
 // fail, it hangs: a refused request is not an error nats.go reports.
 func TestGatewayJetStreamGrantOnARealServer(t *testing.T) {
 	creds := a2aFullCreds("a", "1")
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 	gatewayPW := string(creds.Data["gateway-password"])
 	bridgePW := string(creds.Data["bridge-password"])
 	seedPW := string(creds.Data["seed-password"])
@@ -513,7 +513,7 @@ func TestGatewayJetStreamGrantOnARealServer(t *testing.T) {
 // the subject named.
 func TestGatewayConsumersSurviveABusRestart(t *testing.T) {
 	creds := a2aFullCreds("a", "1")
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 	gatewayPW := string(creds.Data["gateway-password"])
 	bridgePW := string(creds.Data["bridge-password"])
 	seedPW := string(creds.Data["seed-password"])
