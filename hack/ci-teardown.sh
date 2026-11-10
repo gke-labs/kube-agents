@@ -29,9 +29,10 @@
 # upgrade over it (#1172). The agent's leftover pull requests are not this
 # script's to close: that takes a write credential, and a presubmit runs the
 # pull request's own code, so the sweep runs from a periodic that executes only
-# main (hack/ci_sweep_agent_pulls.py, #1755). Compute VPC networks, subnets,
-# addresses and alert policies planted by killed bench runs can be swept
-# out-of-band using hack/ci_sweep_compute_plants.py (#2552, #3797).
+# main (hack/ci_sweep_agent_pulls.py, #1755). Project-level plants of killed
+# bench runs (clusters, load-balancing objects, networks, subnets, addresses,
+# alert policies) are swept out-of-band by hack/ci_sweep_compute_plants.py
+# (#2552, #3797).
 # ==============================================================================
 
 set -uo pipefail

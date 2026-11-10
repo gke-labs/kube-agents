@@ -1132,10 +1132,18 @@ class ChainSweepTest(unittest.TestCase):
         self.assertEqual([cmd[1] for cmd in commands_run if "list" in cmd], ["container"] + ["compute"] * 7 + ["monitoring"])
 
     def test_unmarked_endpoints_young_plants_and_a_deleting_cluster_survive(self):
+        """The mark comes before every other rule: an unmarked object on a selected
+        plant network, a cluster with another managed-by value, and the fleet's
+        standing objects survive; only the old plant network itself goes."""
         listed = {
+            "networks": [{"name": "psc-producer", "description": PLANT, "creationTimestamp": self.old_ts}],
             "clusters": [
                 {"name": "agent-harness-dev-cluster", "location": "us-central1", "status": "RUNNING",
                  "resourceLabels": None, "createTime": self.old_ts, "nodeConfig": {"serviceAccount": "default"}},
+                # The seeded fleet's shape: the key is there, the value is another product's.
+                {"name": "seeded-b", "location": "us-central1-a", "status": "RUNNING",
+                 "resourceLabels": {"managed-by": "kube-agents-seeded-fleet", "environment": "seeded"},
+                 "createTime": self.old_ts},
                 {"name": "ka-bench-young", "location": "us-central1-a", "status": "RUNNING",
                  "resourceLabels": {"managed-by": "kube-agents-bench"}, "createTime": self.recent_ts},
                 {"name": "ka-bench-going", "location": "us-central1-a", "status": "STOPPING",
@@ -1149,19 +1157,33 @@ class ChainSweepTest(unittest.TestCase):
                 # A plant rule under no plant network, younger than the gate.
                 {"name": "psc-endpoint", "description": PLANT, "labels": LABELS, "creationTimestamp": self.recent_ts,
                  "region": REGION, "network": NETWORK_URL + "default", "target": REGION + "/serviceAttachments/x"},
+                # An unmarked rule on the selected plant network: the mark decides, not the parent.
+                {"name": "shared-fr", "creationTimestamp": self.old_ts, "region": REGION,
+                 "network": NETWORK_URL + "psc-producer", "backendService": REGION + "/backendServices/shared-bs"},
             ],
-            # The seeded fleet's standing objects: no description.
-            "backend-services": [{"name": "drain-timeout-seeded-b", "creationTimestamp": self.old_ts,
-                                  "healthChecks": ["https://www.googleapis.com/compute/v1/projects/p/global/healthChecks/drain-timeout-seeded-b"]}],
+            # The seeded fleet's standing objects, and an unmarked one on the plant network: no description.
+            "backend-services": [
+                {"name": "drain-timeout-seeded-b", "creationTimestamp": self.old_ts,
+                 "healthChecks": ["https://www.googleapis.com/compute/v1/projects/p/global/healthChecks/drain-timeout-seeded-b"]},
+                {"name": "shared-bs", "creationTimestamp": self.old_ts, "region": REGION, "network": NETWORK_URL + "psc-producer"},
+            ],
             "health-checks": [{"name": "drain-timeout-seeded-b", "creationTimestamp": self.old_ts}],
         }
         commands_run = []
         out = io.StringIO()
         with mock.patch("sys.stdout", out):
             res = sweep.sweep_project("p", max_age_hours=4.0, runner=self.runner_for(listed, commands_run), now=self.now)
-        self.assertEqual([cmd for cmd in commands_run if "delete" in cmd], [])
-        self.assertEqual({key: value for key, value in res.items() if value}, {})
+        self.assertEqual([cmd for cmd in commands_run if "delete" in cmd], [
+            ["gcloud", "compute", "networks", "delete", "psc-producer", "--project=p", "--quiet"]])
+        self.assertEqual({key: value for key, value in res.items() if value}, {"networks": ["psc-producer"]})
         self.assertIn("skipping cluster ka-bench-going: already deleting", out.getvalue())
+
+    def test_a_rule_marked_by_the_label_alone_is_a_plant(self):
+        listed = {"forwarding-rules": [{"name": "labelled-fr", "labels": LABELS, "creationTimestamp": self.old_ts,
+                                        "region": REGION, "network": NETWORK_URL + "default"}]}
+        commands_run = []
+        res = sweep.sweep_project("p", max_age_hours=4.0, runner=self.runner_for(listed, commands_run), now=self.now)
+        self.assertEqual(res["forwarding_rules"], ["labelled-fr"])
 
     def test_a_selected_network_takes_its_young_chain_and_a_young_network_protects_it(self):
         commands_run = []

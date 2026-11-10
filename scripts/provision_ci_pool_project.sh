@@ -45,7 +45,7 @@ PULL_SWEEP_SA="serviceAccount:eval-pull-sweeper@kube-agents-prow.iam.gserviceacc
 # creates one custom role on this project with exactly these permissions and
 # grants it, which is the whole reach the identity has here. The reason for
 # each permission is beside COMPUTE_SWEEP_PERMISSIONS in
-# scripts/verify_ci_pool_project.py, whose tests keep the two copies equal.
+# scripts/verify_ci_pool_project.py, whose tests keep the three copies equal.
 readonly COMPUTE_SWEEP_SA="serviceAccount:eval-compute-sweeper@kube-agents-prow.iam.gserviceaccount.com"
 readonly COMPUTE_SWEEP_ROLE_ID="kubeAgentsComputePlantSweeper"
 readonly COMPUTE_SWEEP_ROLE_TITLE="kube-agents Compute plant sweeper"
