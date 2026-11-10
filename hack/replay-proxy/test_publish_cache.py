@@ -13,6 +13,8 @@ from test_run_attribution import World, created, front, worker
 VERSION = "f246cb61aa625224"
 BUCKET = "replay-cache-bucket"
 POD = "inference-replay-shadow-abc12-xyz34"
+# A second proxy pod, whose name sorts before POD's.
+EARLIER_POD = "inference-replay-shadow-abc12-aaaaa"
 
 
 def fp(n):
@@ -79,19 +81,22 @@ class PublishTest(unittest.TestCase):
         self.now += 1
         return self.now
 
-    def cache_file(self, rel, content):
-        path = os.path.join(self.pod_dir, "cache", rel)
+    def cache_file(self, rel, content, pod_dir=None):
+        path = os.path.join(pod_dir or self.pod_dir, "cache", rel)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as handle:
             handle.write(content)
 
-    def answer(self, n, version=VERSION):
+    def answer(self, n, version=VERSION, pod_dir=None):
         self.cache_file(f"answers/{fp(n)}.json", json.dumps(
-            {"fingerprint": fp(n), "answer": {"content": f"answer {n}"}, "normalizer_version": version}))
+            {"fingerprint": fp(n), "answer": {"content": f"answer {n}"}, "normalizer_version": version}), pod_dir)
 
-    def write_logs(self):
-        lines = [{"event": "replay_shadow_start", "normalizer_version": VERSION}] + self.world.lines
-        with open(os.path.join(self.pod_dir, "logs", "seg-1.jsonl"), "w") as handle:
+    def write_logs(self, pod_dir=None, lines=None):
+        pod_dir = pod_dir or self.pod_dir
+        os.makedirs(os.path.join(pod_dir, "logs"), exist_ok=True)
+        lines = [{"event": "replay_shadow_start", "normalizer_version": VERSION}] + (
+            self.world.lines if lines is None else lines)
+        with open(os.path.join(pod_dir, "logs", "seg-1.jsonl"), "w") as handle:
             handle.write("\n".join(json.dumps(l) for l in lines) + "\n")
 
     def test_only_answers_from_runs_that_passed_go_up(self):
@@ -144,6 +149,76 @@ class PublishTest(unittest.TestCase):
         self.assertNotIn(f"{prefix}/slots/{fp(11)}.json", objects, "its answer came from a failing run")
         self.assertIn(f"{prefix}/variants/{fp(20)}-{'a' * 16}.json", objects)
         self.assertIn(f"{prefix}/messages/{'b' * 16}.json", objects)
+
+    def two_pods_one_slot(self, earlier_outcome):
+        """Each pod saved its own answer for one slot key, and its own pointer to it; EARLIER_POD sorts first."""
+        earlier = os.path.join(self.keep, "pods", EARLIER_POD)
+        self.world.run("case-a", 1, earlier_outcome, ["t_11111111"])
+        mine = self.world.request(worker("t_11111111"), fp(1), recorded=True)
+        theirs = self.world.request(worker("t_22222222"), fp(2), recorded=True)
+        self.answer(1, pod_dir=earlier)
+        self.cache_file(f"slots/{fp(10)}.json", json.dumps(fp(1)), pod_dir=earlier)
+        self.write_logs(pod_dir=earlier, lines=[mine])
+        self.answer(2)
+        self.cache_file(f"slots/{fp(10)}.json", json.dumps(fp(2)))
+        self.write_logs(lines=[theirs])
+
+    def test_a_slot_whose_answer_did_not_go_up_does_not_hide_another_pods_for_the_same_key(self):
+        self.two_pods_one_slot("fail")
+        self.world.run("case-a", 2, "pass", ["t_22222222"])
+        self.publisher.publish(final=True)
+        slot = f"replay-cache/{VERSION}/slots/{fp(10)}.json"
+        self.assertEqual(json.loads(self.bucket.objects().get(slot, "null")), fp(2),
+                         "the passing pod's pointer goes up, though the failing pod's sorts first")
+        objects = {o["name"]: o for o in self._records()[-1]["objects"][VERSION]}
+        self.assertEqual(objects[f"slots/{fp(10)}.json"]["target"], fp(2))
+
+    def test_a_slot_waits_for_its_answer_across_calls(self):
+        self.two_pods_one_slot("fail")
+        self.publisher.publish()
+        self.assertEqual(self.bucket.objects().get(f"replay-cache/{VERSION}/slots/{fp(10)}.json"), None,
+                         "the passing pod's answer is not graded yet")
+        self.world.run("case-a", 2, "pass", ["t_22222222"])
+        self.publisher.publish()
+        self.assertEqual(json.loads(self.bucket.objects()[f"replay-cache/{VERSION}/slots/{fp(10)}.json"]), fp(2))
+
+    def test_a_pointer_whose_answer_is_already_up_wins_over_one_that_may_fail_to_go_up(self):
+        # The other pod's answer went up on an earlier call; the earlier pod's
+        # (sorting first) is graded only now, and its upload fails. The slot
+        # still goes up, with the pointer whose answer is in the bucket.
+        earlier = os.path.join(self.keep, "pods", EARLIER_POD)
+        mine = self.world.request(worker("t_11111111"), fp(1), recorded=True)
+        theirs = self.world.request(worker("t_22222222"), fp(2), recorded=True)
+        self.answer(1, pod_dir=earlier)
+        self.write_logs(pod_dir=earlier, lines=[mine])
+        self.world.run("case-a", 2, "pass", ["t_22222222"])
+        self.answer(2)
+        self.write_logs(lines=[theirs])
+        self.assertEqual(self.publisher.publish()["uploaded"], {"answers": 1})
+        self.cache_file(f"slots/{fp(10)}.json", json.dumps(fp(1)), pod_dir=earlier)
+        self.cache_file(f"slots/{fp(10)}.json", json.dumps(fp(2)))
+        self.world.run("case-a", 1, "pass", ["t_11111111"])
+        bucket = self.bucket
+
+        def answers_fail(kind, cmd, timeout, input=None, env=None):
+            if "/answers" in cmd[-1]:
+                bucket.calls.append((kind, list(cmd)))
+                return None
+            return bucket(kind, cmd, timeout, input=input, env=env)
+
+        self.publisher.run = answers_fail
+        self.publisher.publish(final=True)
+        self.assertEqual(json.loads(self.bucket.objects()[f"replay-cache/{VERSION}/slots/{fp(10)}.json"]), fp(2))
+
+    def test_a_slot_kept_after_its_answer_went_up_follows_it(self):
+        self.world.run("case-a", 1, "pass", ["t_11111111"])
+        self.world.request(worker("t_11111111"), fp(1), recorded=True)
+        self.answer(1)
+        self.write_logs()
+        self.assertEqual(self.publisher.publish()["uploaded"], {"answers": 1})
+        self.cache_file(f"slots/{fp(10)}.json", json.dumps(fp(1)))
+        self.assertEqual(self.publisher.publish(final=True)["uploaded"], {"slots": 1},
+                         "its answer is in the bucket from an earlier call")
 
     def test_the_first_night_to_record_a_key_keeps_it(self):
         earlier = self.bucket.path(f"gs://{BUCKET}/replay-cache/{VERSION}/answers/{fp(1)}.json")
@@ -281,6 +356,17 @@ class PublishTest(unittest.TestCase):
                          ("variants", f"{fp(1)}.json"), ("other", f"{fp(1)}.json"), ("answers", "ABC.json")):
             with self.subTest(sub=sub, rel=rel):
                 self.assertIsNone(P.object_name(sub, rel))
+
+    def test_names_with_a_trailing_newline_are_refused(self):
+        self.assertIsNone(P.object_name("answers", f"{fp(1)}.json\n"))
+        for pattern, good in ((P.SAFE_HEX, fp(1)), (P.OBJECT_NAME_RE, f"variants/{fp(1)}-{'a' * 16}.json"),
+                              (P.NORMALIZER_VERSION_RE, VERSION), (P.POD_NAME_RE, POD),
+                              (P.BUILD_RE, "1790000000000000000"), (P.BUCKET_RE, BUCKET)):
+            with self.subTest(pattern=pattern.pattern):
+                self.assertTrue(pattern.match(good))
+                self.assertIsNone(pattern.match(good + "\n"))
+        self.assertFalse(P.valid_bucket_and_build(BUCKET + "\n", "1790000000000000000"))
+        self.assertFalse(P.valid_bucket_and_build(BUCKET, "1790000000000000000\n"))
 
     def _records(self):
         out = []
