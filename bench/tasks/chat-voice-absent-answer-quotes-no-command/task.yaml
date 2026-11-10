@@ -106,8 +106,10 @@ verification_spec:
   # seeded-b" does not stand in for the finding (the text is lowercased
   # before the patterns run, line breaks kept; `n't` covers "isn't" and
   # "doesn't", and the apostrophe is normalized to the straight one). No
-  # question back about which cluster, or which (GCP) project, is meant: the
-  # prompt names both.
+  # question back, whatever it asks about (the prompt names the cluster and
+  # the project), and no failure to check dressed in the prompt's words:
+  # the inject lane sets check 3 aside, so without these a run that never
+  # reached the cluster would grade green on the answer alone.
   - name: the-answer-names-the-missing-namespace-and-the-cluster
     role: objective
     mode: assert
@@ -120,8 +122,18 @@ verification_spec:
       required_patterns:
         - '(?m)^(?=.*\bledger-archive\b)(?=.*(?:\b(?:no|not|none|absent|missing)\b|n''t\b)).*$'
       forbidden_patterns:
-        - '(?i)\bwhich cluster\b'
-        - '(?i)\bwhich (?:gcp )?project\b'
+        # A question back, in any wording: a line that asks (contains
+        # "which" and ends on a question mark) or says "did you mean". A
+        # correct finding asks nothing, and "none of which exist on the
+        # cluster." ends on a stop, so it is not a question.
+        - '(?im)^.*\bwhich\b.*\?\s*$'
+        - '(?im)^.*\bdid you mean\b.*$'
+        # A failure to check, which repeats the user's terms and a negation
+        # and would otherwise satisfy the clauses above: "I couldn't check
+        # whether ledger-archive is on seeded-b", "wasn't able to verify".
+        # Apostrophes are straight after normalization.
+        - '(?i)\b(?:couldn''?t|could not|wasn''?t able|unable|can''?t|cannot|failed) to\b'
+        - '(?i)\b(?:couldn''?t|could not|cannot|can''?t|unable to) (?:check|verify|reach|read|access|connect|look)\b'
       fixture_roles:
         - version-laggard
   # The defect: a command in the worker's own finding. `kubectl` is the one
