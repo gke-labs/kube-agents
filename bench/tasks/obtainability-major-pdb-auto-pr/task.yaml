@@ -1,20 +1,29 @@
 # NIGHTLY (hack/eval/nightly-cases.txt). Every pool repository holds the
 # fixture below: scripts/provision_ci_pool_project.sh seeds it and
-# scripts/verify_ci_pool_project.py checks it (#2228). Red on main and
-# green on the branch that lets the fleet-audit sweep open `no-pdb` and two
-# other checks at `major` (MAJOR_SWEEP_CHECKS), on a dev install that
-# carries the fixture below.
+# scripts/verify_ci_pool_project.py checks it (#2228).
 #
-# WHAT THIS GRADES THAT obtainability-planted-pdb DOES NOT. That case grades
-# the ledger: a finding filed on the planted workload. This one grades what
-# `finish` does with the finding afterwards. checkout-gateway's 3.3 `no-pdb`
-# finding is `major` on a check in MAJOR_SWEEP_CHECKS, and the collector's
-# candidate is `major` too, so a `kind: manifest` remediation for it is
-# opened by `finish` as a pull request without anyone commenting
-# `/remediate`. Before the allowlist it was listed under the
-# ledger's withheld findings as below the `critical` floor, and nothing was
-# opened. Kept apart from obtainability-planted-pdb so that case's record and
-# prompt stay what they were while this one waits for its fixture.
+# WHAT THIS GRADES. The PodDisruptionBudget the audit writes in code
+# (`_pdb_manifest` in audit_report.py), reaching the GitOps repository as a
+# pull request. checkout-gateway's 3.3 `no-pdb` finding is declared, so the
+# worker leaves it `manual` and `finish` writes its budget beside the
+# declaration. obtainability-planted-pdb grades only the ledger finding;
+# pdb-remediation-pr grades a budget the model writes.
+#
+# WHY THE PROMPT ASKS FOR THE FIX. Every eval lane installs the agent with
+# KUBEAGENTS_AUDIT_AUTO_PROMOTE=false (hack/ci-deploy.sh, #3439), so the
+# automatic sweep opens nothing there: `finish` writes the budget and lists
+# it as awaiting `/remediate`. The case first asked only for the audit and
+# waited for the sweep, and went 0 of 3 on its one run (writers nightly
+# 2026-11-06, build 2118493573899882496: "Automatic remediation pull-request
+# promotion is disabled on this install", `prs_opened: []`). #3439 turned the
+# sweep off on the understanding that this case was parked. So the prompt is
+# a direct ask, the path a person in chat takes on such an install: the agent
+# runs `remediate` on each budget the audit wrote, and `remediate` writes the
+# budget the way `finish` does and opens it. Before `remediate` learnt to do
+# that, it refused the finding as not a `manifest`, because the worker's
+# findings file still says `manual`. On an install whose sweep is on,
+# `finish` opens the pull request and `remediate` reports it already open;
+# the closing line carries the same URL either way.
 #
 # THE FIXTURE. SOP §4 makes the create-a-PDB fix `manifest` only when the
 # clone ties the workload or its namespace to a directory for that cluster;
@@ -39,29 +48,31 @@
 # opens its own; the pool sweep labels before it closes too. Where the reset
 # is skipped (no App key, as in a developer loop), repetitions 2 and 3 meet
 # repetition 1's OPEN pull request on the same branch (group_branch_for keys
-# on the path set): the sweep pushes nothing, `finish` reports it under
-# `prs_still_open`, and the SOP's closing line quotes it, which
-# pull_request_opened accepts because the check sets
-# `accepts_stream_pull_request: true`.
+# on the path set): `remediate` pushes nothing and reports it already open,
+# naming its URL, and the closing line quotes it, which pull_request_opened
+# accepts because the check sets `accepts_stream_pull_request: true`.
 #
 # Isolation class: read-only on the cluster; writes the ledger issue and one
 # remediation pull request to the eval GitOps repo.
 id: obtainability-major-pdb-auto-pr
-name: A major reliability finding with a declared workload arrives as a pull request
+name: The PodDisruptionBudget the audit writes for a declared workload arrives as a pull request
 prompt: >-
   Run the workload reliability audit against the fleet, following the
-  obtainability-audit SOP. Put the URL of every remediation pull request
-  `finish` reports, opened or still open, on your closing line after the
-  ledger URL.
+  obtainability-audit SOP. Then open every PodDisruptionBudget the audit
+  wrote itself as a remediation pull request: I am asking for those fixes
+  directly, so use the fleet-audit skill's `remediate` command for any that
+  `finish` did not open. Put the URL of every remediation pull request,
+  opened or still open, on your closing line after the ledger URL.
 expected_output: >-
   The ledger issue names the checkout-gateway deployment in seeded-reliability
   as unprotected against drains and upgrades (two replicas, no
-  PodDisruptionBudget). `finish` opens a remediation pull request, without a
-  `/remediate` comment, adding a PodDisruptionBudget for checkout-gateway
-  beside its declaration in the GitOps repository, or reports the one an
-  earlier run on this audit stream opened as still open. Nothing is applied to the
-  cluster. The closing response is the SOP's one line, carrying the ledger URL
-  and the pull request URL in full.
+  PodDisruptionBudget). The audit writes a PodDisruptionBudget for
+  checkout-gateway beside its declaration in the GitOps repository, and a
+  remediation pull request carries it: opened by `remediate` on this
+  install, whose automatic sweep is off, or by `finish` where the sweep is
+  on, or one an earlier run on this audit stream opened, reported as still
+  open. Nothing is applied to the cluster. The closing response carries the
+  ledger URL and the pull request URL in full.
 infrastructure:
   deployer: noop
 validated: false
@@ -89,12 +100,11 @@ verification_spec:
       audit: obtainability-audit
       scope: finding_ids
       required_phrases: ["checkout-gateway"]
-  # The auto-promotion sweep: checkout-gateway's 3.3 finding is `major` on an
-  # allowlisted check, so a `manifest` remediation for it is opened by
-  # `finish` as a pull request on platform-agent/fix-obtainability-audit-*.
-  # Red before the allowlist: the finding was listed under "Awaiting
-  # `/remediate`" as below the `critical` floor and nothing was opened. Needs
-  # the fixture in the header; without it the fix is `manual`.
+  # The budget `finish` writes for checkout-gateway, opened as a pull request
+  # on platform-agent/fix-obtainability-audit-* by `remediate` (the sweep is
+  # off on every eval lane; see the header). Red before `remediate` wrote
+  # that budget: it refused the finding as not a `manifest`. Needs the
+  # fixture in the header; without it no budget is written.
   #
   # pull_request_opened, not github_writes: it resolves the URL the reply
   # names, refuses a pull request closed unmerged, and requires a head commit

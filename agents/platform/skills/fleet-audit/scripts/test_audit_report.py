@@ -37921,5 +37921,104 @@ class TestRetiredUnlistedOnClose(HarnessTestCase):
         self.assertTrue(any("not confirmed fixed" in a for a in answers))
 
 
+class TestRemediateWritesTheGeneratedBudget(HarnessTestCase):
+    """A direct ask for a declared `no-pdb` finding the worker left `manual`,
+    as the SOP tells it to: `remediate` writes the PodDisruptionBudget `finish`
+    would write and opens it, instead of refusing the finding as not a
+    `manifest`. This is the only way a chat ask reaches that budget on an
+    install whose automatic sweep is off (`KUBEAGENTS_AUDIT_AUTO_PROMOTE=false`),
+    which is every eval lane since #3439."""
+
+    SELECTOR = {"matchLabels": {"app": "checkout-gateway"}}
+    DECLARATION = "clusters/prod-us-east/payments/checkout-gateway.yaml"
+    GENERATED = "clusters/prod-us-east/payments/checkout-gateway-pdb.yaml"
+    STREAM = "obtainability-audit"
+
+    def finding(self):
+        return make_finding(
+            fid="checkout-gateway",
+            check="no-pdb",
+            severity="major",
+            obj="Deployment/checkout-gateway",
+            remediation={"kind": "manual", "note": "Let finish write the budget."},
+        )
+
+    def stream_tree(self):
+        """The obtainability stream's clone; `self.workspace` is the default stream's."""
+        return self.workspace.parent.parent / self.STREAM / self.workspace.name
+
+    def fid(self):
+        return derived_id(check="no-pdb", obj="Deployment/checkout-gateway")
+
+    def manifest_file(self, **fields):
+        candidate = {
+            "check": "no-pdb",
+            "cluster": "prod-us-east",
+            "namespace": "payments",
+            "object": "Deployment/checkout-gateway",
+            "severity": "major",
+            "excerpt": "replicas=2, no PodDisruptionBudget",
+            "impact": "x",
+            "needs_triage": None,
+            "declaration": {"path": self.DECLARATION, "directory": "clusters/prod-us-east/payments"},
+            "pod_selector": self.SELECTOR,
+            **fields,
+        }
+        path = self.tmp_path / "manifest.json"
+        path.write_text(json.dumps(_full_manifest(candidates=[candidate], audit=self.STREAM)), encoding="utf-8")
+        return str(path)
+
+    def run_remediate(self, extra=()):
+        self.record_run(context=["acme/fleet"])
+        path = self.write_findings(searched_doc(findings=[self.finding()]))
+        return self.run_main(
+            ["remediate", "--audit", self.STREAM, "--findings-file", path, "--finding", self.fid(), *extra]
+        )
+
+    def test_it_writes_the_budget_beside_the_declaration_and_opens_it(self):
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
+        }
+        rc = self.run_remediate(["--manifest-file", self.manifest_file()])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["prs_opened"], ["https://github.com/acme/fleet/pull/8"])
+        self.assertEqual(self.stdout_json()["refused"], [])
+        self.assertIn("GENERATED: " + self.fid(), self.err)
+        document = pytest_yaml().safe_load((self.stream_tree() / self.GENERATED).read_text())
+        self.assertEqual(document["kind"], "PodDisruptionBudget")
+        self.assertEqual(document["metadata"], {"name": "checkout-gateway-pdb", "namespace": "payments"})
+        self.assertEqual(document["spec"], {"maxUnavailable": 1, "selector": self.SELECTOR})
+        self.assertEqual(len(self.harness.forge_calls("proposal-create")), 1)
+
+    def test_without_the_manifest_it_is_refused_and_says_to_pass_it(self):
+        self.assertEqual(self.run_remediate(), 2)
+        self.assertIn("pass the collector's --manifest-file", self.err)
+        self.assertEqual(self.harness.calls, [])
+        self.assertFalse((self.stream_tree() / self.GENERATED).exists())
+
+    def test_a_budget_the_planner_will_not_write_is_refused_with_its_reason(self):
+        self.harness.replies = {"issue-list": self.issue_list()}
+        rc = self.run_remediate(["--manifest-file", self.manifest_file(namespace_pdbs=["checkout-gateway-pdb"])])
+        self.assertEqual(rc, 2)
+        self.assertIn(f"REFUSED {self.fid()}: the namespace already has a PodDisruptionBudget", self.err)
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+        self.assertFalse((self.stream_tree() / self.GENERATED).exists())
+
+    def test_the_dry_run_says_it_would_write_the_budget_and_writes_nothing(self):
+        rc = self.run_remediate(["--dry-run", "--manifest-file", self.manifest_file()])
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn("the real run writes its PodDisruptionBudget beside " + self.DECLARATION, self.err)
+        self.assertEqual(self.harness.calls, [])
+        self.assertFalse((self.stream_tree() / self.GENERATED).exists())
+
+    def test_a_manifest_finding_is_untouched_by_the_planner(self):
+        """Only a `manual` finding is planned; a worker-written file is opened as written."""
+        finding = self.finding()
+        finding["remediation"] = {"kind": "manifest", "path": "clusters/prod-us-east/payments/own-pdb.yaml", "note": "x"}
+        manifest = json.loads(pathlib.Path(self.manifest_file()).read_text())
+        self.assertEqual(audit_report.requested_generated_fixes([finding], manifest, [str(finding["id"])]), {})
+
+
 if __name__ == "__main__":
     unittest.main()

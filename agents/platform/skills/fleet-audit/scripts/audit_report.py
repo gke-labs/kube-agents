@@ -19353,6 +19353,42 @@ def unwritten_sweep_fixes(
     return unwritten
 
 
+def requested_generated_fixes(
+    findings: list[dict], manifest: dict | None, requested: list[str]
+) -> dict[str, UnwrittenFix]:
+    """Finding id to its declaration, for each named finding whose budget
+    `finish` writes itself: a `manual` `GENERATED_FIX_CHECK` finding whose
+    collector candidate carries a `declaration`.
+
+    The SOP tells the worker to leave such a finding `manual` and let `finish`
+    write its PodDisruptionBudget, so the worker's findings file never calls it
+    a `manifest`. `remediate` plans it the way `finish` does instead of
+    refusing it as not a `manifest`. Without that, a direct ask could not open
+    the budget on an install whose automatic sweep is off, past the sweep's
+    cap, or on a forge with no ledger to comment `/remediate` on. Only with
+    the collector manifest, which holds the selector the budget is written
+    from. The sweep's floor and corroboration tests do not apply: a person
+    named the finding.
+    """
+    if manifest is None:
+        return {}
+    named = set(requested)
+    declared_at = {
+        _candidate_identity(entry, candidate): str((candidate.get("declaration") or {}).get("path") or "")
+        for entry, candidate in _candidates(manifest)
+        if candidate.get("check") == GENERATED_FIX_CHECK and isinstance(candidate.get("declaration"), dict)
+    }
+    fixes: dict[str, UnwrittenFix] = {}
+    for finding in findings:
+        fid = str(finding.get("id", ""))
+        if fid not in named or (finding.get("remediation") or {}).get("kind") != "manual":
+            continue
+        declared = declared_at.get(derive_finding_id(finding), "")
+        if declared:
+            fixes[fid] = UnwrittenFix(declared, declared=True)
+    return fixes
+
+
 def _delta_carried_fixes(prs: list[dict], *, open_only: bool = False) -> set[str]:
     """Every finding id that the delta block of a pull request names, when the
     harness did not close that pull request: open, merged, or closed by a person.
@@ -22679,16 +22715,27 @@ def handle_remediate(args: argparse.Namespace) -> None:
             f"--finding: {', '.join(unknown)} not in {args.findings_file}; "
             f"known ids are {', '.join(sorted(by_id)) or '(none)'}"
         )
+    # A declared budget the worker left `manual` for `finish` to write is
+    # written here the same way, below, rather than refused.
+    generated = requested_generated_fixes(findings, manifest, args.finding)
     not_manifest = [
         fid
         for fid in args.finding
-        if (by_id[fid].get("remediation") or {}).get("kind") != "manifest"
+        if (by_id[fid].get("remediation") or {}).get("kind") != "manifest" and fid not in generated
     ]
     if not_manifest:
+        hint = (
+            f"; for a {GENERATED_FIX_CHECK} finding whose PodDisruptionBudget finish "
+            "writes itself, pass the collector's --manifest-file so this command can "
+            "write it the same way"
+            if manifest is None
+            and any(str(by_id[fid].get("check") or "") == GENERATED_FIX_CHECK for fid in not_manifest)
+            else ""
+        )
         raise ValidationError(
             f"--finding: {', '.join(not_manifest)} do not have a 'manifest' "
             "remediation; only a fix that is a file in this repository can become "
-            "a pull request"
+            f"a pull request{hint}"
         )
 
     now = datetime.now(timezone.utc)
@@ -22704,7 +22751,16 @@ def handle_remediate(args: argparse.Namespace) -> None:
         # blank preview and no explanation.
         dry_root = dry_run_repo_root(audit_id, repo=opt_repo)
         log(f"DRY RUN: resolving remediation paths under {dry_root}.")
+        for fid in sorted(generated):
+            log(
+                f"DRY RUN: {fid}: the real run writes its PodDisruptionBudget beside "
+                f"{generated[fid].path}, as finish does, unless a file, a name, a "
+                "Kustomize root or a pull request stands in the way. No body is "
+                "previewed for it."
+            )
         for fid in args.finding:
+            if fid in generated:
+                continue
             if remediation_file_problem(by_id[fid], dry_root):
                 log(
                     f"WOULD REFUSE {fid}: its remediation path is not a readable "
@@ -22758,6 +22814,32 @@ def handle_remediate(args: argparse.Namespace) -> None:
     # a forge with no labels gets no label call.
     on_forge = ledger_on_forge(repo)
     ensure_labels(repo, audit_id, noun=noun)
+    # Read here only when a budget is to be planned, which needs it; otherwise
+    # after the refusals, as before, so a refused request makes no listing.
+    remediation_prs = list_remediation_prs(repo, audit_id) if generated else None
+
+    # A declared budget the worker left `manual`: written by the planner
+    # `finish` uses, under the same rules, so it becomes this finding's
+    # `manifest` remediation. One the planner will not write is refused by
+    # name with its reason, as an unwritten manifest is below.
+    ungenerated: dict[str, str] = {}
+    if generated:
+        skipped: dict[str, str] = {}
+        probe = _RepositoryProbe(repo, root)
+        try:
+            planned, answered = plan_generated_fixes(
+                findings, manifest, generated, {}, remediation_prs or [], root, probe, audit_id, skipped
+            )
+            write_generated_fixes(findings, planned, root)
+        finally:
+            probe.close()
+        for fid in sorted(set(generated) - set(planned)):
+            ungenerated[fid] = skipped.get(fid) or (
+                f"a {noun} the harness did not close already carries it"
+                if fid in answered
+                else "its PodDisruptionBudget could not be written beside its declaration"
+            )
+            log(f"REFUSED {fid}: {ungenerated[fid]}.")
 
     # A named finding whose manifest was never written cannot become a pull
     # request, so it is refused — but only it. `/remediate all` expands to
@@ -22765,9 +22847,9 @@ def handle_remediate(args: argparse.Namespace) -> None:
     # file would answer a request for thirty fixes with zero, which is both
     # the least useful outcome and the hardest to act on. Refuse by name,
     # proceed with the rest, and let the operator see exactly which is which.
-    degraded = set(degrade_missing_remediations(findings, root, noun))
+    degraded = set(degrade_missing_remediations(findings, root, noun)) - set(ungenerated)
     refused = [fid for fid in args.finding if fid in degraded]
-    requested = [fid for fid in args.finding if fid not in degraded]
+    requested = [fid for fid in args.finding if fid not in degraded and fid not in ungenerated]
     for fid in refused:
         log(
             f"REFUSED {fid}: its remediation path is not a readable file inside "
@@ -22799,9 +22881,15 @@ def handle_remediate(args: argparse.Namespace) -> None:
         log(f"REFUSED {fid}: {why}")
     refused += [fid for fid in requested if fid in unlisted]
     requested = [fid for fid in requested if fid not in unlisted]
+    refused += [fid for fid in args.finding if fid in ungenerated]
     if refused and not requested:
         # Nothing survives, so there is no partial success to report and an
         # exit 0 with an empty list would read as "done".
+        if set(ungenerated) & set(refused):
+            raise ValidationError(
+                f"--finding: {', '.join(refused)} cannot become a {noun}: the "
+                "REFUSED lines above say why for each"
+            )
         if unlisted & set(refused):
             raise ValidationError(
                 f"--finding: {', '.join(refused)} cannot become a {noun}: the "
@@ -22829,7 +22917,9 @@ def handle_remediate(args: argparse.Namespace) -> None:
         issue_number, _, _, _ = find_existing_issue(repo, audit_id)
 
     pr_by_finding, _ = reconcile_remediation_prs(
-        audit_id, findings, list_remediation_prs(repo, audit_id)
+        audit_id,
+        findings,
+        remediation_prs if remediation_prs is not None else list_remediation_prs(repo, audit_id),
     )
     # Routed through the same gate as every other promotion, so an explicit
     # request cannot force-push over a pull request someone is reviewing.

@@ -103,6 +103,11 @@ exit 1); report that message to the user, and do not choose a repository:
   [--repo "<owner>/<repo>"] [--manifest-file <path>]
 ```
 
+A declared `no-pdb` finding that you left `manual` so that `finish` writes its PodDisruptionBudget
+is named the same way. Pass the collector's `--manifest-file`: `remediate` writes that budget beside
+the declaration, under the rules `finish` uses, and opens it. A budget it will not write is
+`refused`, with the reason on its `REFUSED` line.
+
 **It opens exactly what you name, and nothing else.** The auto-promotion sweep does not ride along:
 one `--finding` produces one pull request (or one, shared, for the group that path belongs to), never
 five more for findings the requester never mentioned and cannot tell apart from the one they
