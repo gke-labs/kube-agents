@@ -38,7 +38,7 @@ import (
 // {"subjects_filter":">"}, the body that would list every session key.
 func TestConsoleGrantOnARealServer(t *testing.T) {
 	creds := a2aFullCreds("c", "1")
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 	consolePW := string(creds.Data["console-password"])
 	consoleMCPPW := string(creds.Data["console-mcp-password"])
 	seedPW := string(creds.Data["seed-password"])
