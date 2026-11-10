@@ -10,7 +10,8 @@ to put in a diff otherwise. Three paths lead there:
 - **Auto-promotion.** A finding graded `critical` — or `major` on one of the checks in
   `MAJOR_SWEEP_CHECKS` (`no-pdb`, `unbound-sa-automount`, `ccc-no-ondemand-floor`) where the
   collector's candidate is at least `major` — that is a `manifest`, has no live pull request on its branch — and, on a run that passed
-  `--manifest-file`, is neither uncorroborated nor triage-marked by the collector — is promoted
+  `--manifest-file`, is neither uncorroborated nor triage-marked by the collector nor on an object in
+  a target's `noted_objects` — is promoted
   automatically by `finish` — **at most five per run** — unless the install's
   `KUBEAGENTS_AUDIT_AUTO_PROMOTE` switch is `false`, when `finish` opens only what `/remediate` named. Every other `major` finding is held to the `critical` floor:
   a SOP's grade says how bad the finding is, not whether its fix is safe to open unasked. The collector marks a fix that scales a controller to zero, writes a
@@ -18,7 +19,9 @@ to put in a diff otherwise. Three paths lead there:
   `major` to the Autopilot bump, turns off a namespace's default ServiceAccount token, rewrites
   or deletes a Service, or enforces spreading; the ledger names each with its marker and reason.
   The surplus is named in the ledger as awaiting `/remediate`, and so is every manifest finding
-  the floor passed over, as below the floor, so nothing is silently dropped. "Live" excludes a pull
+  the floor passed over, as below the floor. A finding on a noted object is the one exception: it
+  is in no block, because the collector could not see its result; the ledger shows it in the
+  findings table, and `/remediate` still opens it. "Live" excludes a pull
   request the harness itself closed as stale (that one is re-openable) and includes one a human
   closed or merged (those are not).
 - **`/remediate <finding-id>`**, or `/remediate all`, commented on the ledger by someone with write

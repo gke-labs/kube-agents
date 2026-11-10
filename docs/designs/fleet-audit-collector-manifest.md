@@ -507,6 +507,9 @@ Sets that withhold auto-promotion and nothing else. An explicit `/remediate <id>
   it could not measure. Named in its own paragraph, worded differently from the one above because
   the two say opposite things about the collector, each row followed by the marker and the
   consequence it stands for (`TRIAGE_REASONS`).
+- **Noted:** a finding on an object in a target's `noted_objects` is not auto-promoted and is not
+  uncorroborated, because the collector read the object but could not see the result. It is in no
+  sweep block; an explicit `/remediate` still opens it.
 
 The severity floor reads the manifest too. A finding is held to `AUTO_PROMOTION_FLOOR` (`major`)
 only when its check is in `MAJOR_SWEEP_CHECKS` and a candidate graded at least `major` stands behind

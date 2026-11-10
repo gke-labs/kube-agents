@@ -368,7 +368,7 @@ graded critical, the defect it catches, leaves no such row.
 
 ## When a fixture goes away
 
-Three ways a fixture stops being assertable, and all are worth designing a case around.
+These are the ways a fixture stops being assertable, and all are worth designing a case around.
 
 A cleanup sweep deletes it. One `orphan-pd-` deletion costs the cost case a month, because
 the recreated disk starts its 30-day clock over. The clusters carry
