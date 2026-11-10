@@ -433,6 +433,40 @@ class CheckUpgradeTableReleasesTest(unittest.TestCase):
         self.repo.trace(f"{picked} change q2")
         self.assertEqual(self.repo.check(), (0, ""))
 
+    def test_dropping_the_prefix_of_a_shipped_pending_row_is_not_a_removal(self):
+        first = self.repo.commit("feat: j", row=row("pending", "#12: change j"))
+        self.repo.tag("1.0.0")
+        self.repo.git("update-ref", "refs/remotes/origin/main", first)
+        self.repo.reword("#12: change j", "change j")
+        self.repo.relabel("change j", "1.0.0")
+        self.assertEqual(self.repo.check(), (0, ""))
+
+    def test_a_space_added_to_a_traced_row_does_not_excuse_a_removal(self):
+        self.repo.rows.insert(0, row("1.0.0", "change r"))
+        first = self.repo.commit("feat: q and r", row=row("pending", "change q"))
+        self.repo.tag("1.0.0")
+        self.repo.trace(f"{first} change r")
+        base = self.repo.commit("docs: trace r", code=False)
+        self.repo.git("update-ref", "refs/remotes/origin/main", base)
+        self.repo.rows = [r.replace("| change r |", "|  change r |") for r in self.repo.rows if "change q" not in r]
+        self.repo.write_page()
+        code, err = self.repo.check()
+        self.assertEqual(code, 1)
+        self.assertIn('this change removes the pending row "change q"', err)
+
+    def test_removing_a_pending_row_a_release_contains_through_its_trace_fails(self):
+        shipped = self.repo.commit("feat: t")
+        self.repo.tag("1.0.0")
+        self.repo.trace(f"{shipped} change t")
+        base = self.repo.commit("docs: note t", row=row("pending", "change t"), code=False)
+        self.repo.git("update-ref", "refs/remotes/origin/main", base)
+        self.repo.rows = [r for r in self.repo.rows if "change t" not in r]
+        self.repo.write_page()
+        (self.repo.root / TRACES).unlink()
+        code, err = self.repo.check()
+        self.assertEqual(code, 1)
+        self.assertIn('this change removes the pending row "change t", which 1.0.0 already contains', err)
+
     def test_a_push_does_not_read_a_removed_pending_row(self):
         self._shipped_pending_row()
         self.repo.reword("change q", "change q, reworded")

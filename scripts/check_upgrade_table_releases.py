@@ -72,6 +72,8 @@ ROW = re.compile(rf"^\| (?P<release>\d+\.\d+\.\d+|{PENDING})\s*\| (?P<change>[^|
 # dropped. So the same words in prose, in another table or inside a longer cell do not stand in for
 # the row, and a row whose cell later lost the prefix still traces to its start.
 DIFF_TABLE_LINE = r"^\| "
+# A change cell's optional `#<number>: ` prefix, which older cells carried and later ones dropped.
+CHANGE_PREFIX = re.compile(r"^#\d+:\s*")
 TABLE_LINE = re.compile(rf"^\| (?:{PENDING}|\d+\.\d+\.\d+)\s*\| (?:#\d+:\s*)?(?P<change>[^|]+?)\s*\|")
 ADDED = "+"
 REMOVED = "-"
@@ -188,7 +190,13 @@ def shipping_release(change: str, commit: str | None, tags: set[str]) -> tuple[s
     return None
 
 
-def removed_pending_problems(base: str, tags: set[str], traced: dict[str, str]) -> list[str]:
+def change_key(change: str) -> str:
+    """A change cell's text as the diff reader matches it: no surrounding spaces, no `#<number>: ` prefix."""
+    return CHANGE_PREFIX.sub("", change.strip())
+
+
+def removed_pending_problems(base: str, tags: set[str], traced: dict[str, str],
+                             base_traced: dict[str, str]) -> list[str]:
     """The `pending` rows of the base page that a release already contains and that this change removes.
 
     A reword of such a row would otherwise trace to the rewording commit and pass. The row is excused when
@@ -198,15 +206,16 @@ def removed_pending_problems(base: str, tags: set[str], traced: dict[str, str]) 
     """
     found = []
     current = page_rows()
-    texts = {row.change for row in current}
+    texts = {change_key(row.change) for row in current}
     base_rows = rows(page_at(base))
-    base_texts = {row.change for row in base_rows}
+    base_texts = {change_key(row.change) for row in base_rows}
     # Rows this change adds with a trace entry: a recorded reword, if one is labelled with the release.
-    recorded = [row for row in current if row.change not in base_texts and row.change in traced]
+    recorded = [row for row in current if change_key(row.change) not in base_texts and row.change in traced]
     for row in base_rows:
-        if row.release != PENDING or row.change in texts:
+        if row.release != PENDING or change_key(row.change) in texts:
             continue
-        commit = row_commit(row.change, base)
+        # As for a `pending` row on the page, the base's trace entry names the row's commit if it has one.
+        commit = base_traced.get(row.change.strip()) or row_commit(row.change, base)
         shipping = shipping_release(row.change, commit, tags)
         if shipping is None:
             continue
@@ -439,7 +448,8 @@ def main() -> int:
     for problem in warned_traces:
         print(WARNING_PREFIX + problem, file=sys.stderr)
     # A change that removes a shipped `pending` row's text fails; a push has no base, so it is not read there.
-    removed = removed_pending_problems(base, release_tags(), traced) if base is not None else []
+    base_traced = {change: commit for change, (_, commit) in base_entries.items()}
+    removed = removed_pending_problems(base, release_tags(), traced, base_traced) if base is not None else []
     for problem in failed + failed_traces + cells + removed:
         print(problem, file=sys.stderr)
     return EXIT_FAILED if failed or failed_traces or cells or removed else EXIT_OK
