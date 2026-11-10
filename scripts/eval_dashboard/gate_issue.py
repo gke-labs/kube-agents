@@ -427,14 +427,25 @@ def render_lost_pods_title(health: dict, when_text: str) -> str:
     return title
 
 
+# A pull request as health.py's evidence lines write it (`_pr_list`): "#N",
+# which resolves against whichever repository the issue is filed in.
+PR_REF_RE = re.compile(r"(?<![\w/#])#(\d+)(?!\w)")
+
+
 def public_evidence(health: dict, prefixes: tuple[str, ...] | None = None) -> list[str]:
     """``health["evidence"]`` as a public body may quote it: given
     ``prefixes``, only the lines that start with one of them (the condition's
-    own), and never a line that grades a case (PUBLIC_EVIDENCE_DROP_RE)."""
+    own), never a line that grades a case (PUBLIC_EVIDENCE_DROP_RE), and,
+    once the bots file in another repository, every "#N" pull request as
+    its full URL in SOURCE_REPO, where the pull requests stay (a "#N" in an
+    issue filed elsewhere would resolve there)."""
     lines = [str(line) for line in health.get("evidence") or []]
     if prefixes is not None:
         lines = [line for line in lines if line.startswith(prefixes)]
-    return [line for line in lines if not PUBLIC_EVIDENCE_DROP_RE.search(line)]
+    lines = [line for line in lines if not PUBLIC_EVIDENCE_DROP_RE.search(line)]
+    if ghcli.DEFAULT_REPO == ghcli.SOURCE_REPO:
+        return lines
+    return [PR_REF_RE.sub(lambda m: ghcli.pr_url(ghcli.SOURCE_REPO, m.group(1)), line) for line in lines]
 
 
 def render_lost_pods_body(health: dict, when_text: str, window_text: str, brief_link: str) -> str:

@@ -4,6 +4,7 @@ not by the token that filed it."""
 
 import json
 import unittest
+import unittest.mock
 
 from eval_dashboard import gate_issue, ghcli
 
@@ -77,11 +78,25 @@ class PullRequestLinksTest(unittest.TestCase):
         """A bare #N in an issue filed in the issues repository would resolve
         there; the pull requests live in SOURCE_REPO."""
         incident = {"prs": [2853, 2827], "runs": 2, "nodes": {"node-1": 2}, "window_start": "2026-10-09T00:00:00+00:00", "window_end": "2026-10-09T00:10:00+00:00"}
-        lost = gate_issue.render_lost_pods_body({"incident": incident, "evidence": []}, "Thu 8:00 PM ET", "8:00–8:10 PM ET", "brief")
-        killed = gate_issue.render_deadline_kill_body({"incident": incident, "evidence": [], "since": "2026-10-09T00:00:00+00:00"}, "Thu 8:00 PM ET", "8:00–8:10 PM ET", "brief")
-        for body in (lost, killed):
-            self.assertIn("**Affected PRs:** https://github.com/gke-labs/kube-agents/pull/2853, https://github.com/gke-labs/kube-agents/pull/2827.", body)
-            self.assertNotIn("#2853", body)
+        # health.py's evidence lines write the pull requests as _pr_list does: "#N".
+        evidence = [
+            f"{gate_issue.DEADLINE_EVIDENCE_PREFIX} 2 runs killed at the 360m job deadline 00:00–00:10 UTC (#2853, #2827)",
+            f"{gate_issue.LOST_PODS_EVIDENCE_PREFIX}2 runs 00:00–00:10 UTC (nodes node-1; #2853, #2827)",
+        ]
+        lost_health = {"incident": incident, "evidence": evidence}
+        killed_health = {"incident": incident, "evidence": evidence, "since": "2026-10-09T00:00:00+00:00"}
+        with unittest.mock.patch.object(ghcli, "DEFAULT_REPO", "gke-labs/kube-agents-eval-triage"):
+            lost = gate_issue.render_lost_pods_body(lost_health, "Thu 8:00 PM ET", "8:00–8:10 PM ET", "brief")
+            killed = gate_issue.render_deadline_kill_body(killed_health, "Thu 8:00 PM ET", "8:00–8:10 PM ET", "brief")
+            for body in (lost, killed):
+                self.assertIn("**Affected PRs:** https://github.com/gke-labs/kube-agents/pull/2853, https://github.com/gke-labs/kube-agents/pull/2827.", body)
+                self.assertIn("; https://github.com/gke-labs/kube-agents/pull/2853, https://github.com/gke-labs/kube-agents/pull/2827)" if body is lost else "(https://github.com/gke-labs/kube-agents/pull/2853, https://github.com/gke-labs/kube-agents/pull/2827)", body, "the quoted evidence line too")
+                self.assertNotIn("#2853", body)
+            self.assertEqual(gate_issue.public_evidence({"evidence": ["issue #12 noted; node-1 lost; #2853 and 3 more", "sha a1#2 kept"]}), ["issue https://github.com/gke-labs/kube-agents/pull/12 noted; node-1 lost; https://github.com/gke-labs/kube-agents/pull/2853 and 3 more", "sha a1#2 kept"])
+        with unittest.mock.patch.object(ghcli, "DEFAULT_REPO", ghcli.SOURCE_REPO):
+            body = gate_issue.render_lost_pods_body(lost_health, "Thu 8:00 PM ET", "8:00–8:10 PM ET", "brief")
+            self.assertIn("(nodes node-1; #2853, #2827)", body, "no issues repository set: the evidence line reads as health.json wrote it, so the scrub's re-render of an existing issue is a no-op")
+            self.assertIn("**Affected PRs:** https://github.com/gke-labs/kube-agents/pull/2853", body)
         self.assertIn("none recorded", gate_issue.render_lost_pods_body({"incident": {"prs": []}, "evidence": []}, "x", "y", "z"))
 
 

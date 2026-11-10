@@ -18,6 +18,9 @@ GUARD = "vars.KUBE_AGENTS_ISSUES_REPO != ''"
 MINT_GUARD = "steps.issues_repo.outputs.valid == 'true'"
 TOKEN = "${{ steps.issues_token.outputs.token || github.token }}"
 OWN_TOKEN = "${{ github.token }}"
+# Beside the minted token, the job's own for the calls that still address
+# this repository (a carried issue filed before the switch; ghcli.token_environ).
+SOURCE_TOKEN = "SOURCE_GH_TOKEN"
 ISSUE_STEPS = (
     "Rank each domain's understudies for the scorecard",
     "File bugs for persistent nightly failures (dry run unless armed)",
@@ -41,6 +44,7 @@ class IssuesRepoWiringTest(unittest.TestCase):
             env = by_name[name].get("env") or {}
             self.assertEqual(env.get("KUBE_AGENTS_ISSUES_REPO"), VARIABLE, name)
             self.assertEqual(env.get("GH_TOKEN"), TOKEN, name)
+            self.assertEqual(env.get(SOURCE_TOKEN), OWN_TOKEN, f"{name}: the carried issue of this repository is settled with the job's own token")
         self.assertEqual((by_name["Adjudicate"].get("env") or {}).get("KUBE_AGENTS_ISSUES_REPO"), VARIABLE, "health.json records the repository")
 
     def test_the_pull_request_comment_and_the_collect_keep_the_jobs_own_token(self):
@@ -49,6 +53,7 @@ class IssuesRepoWiringTest(unittest.TestCase):
             env = by_name[name].get("env") or {}
             self.assertEqual(env.get("GH_TOKEN"), OWN_TOKEN, name)
             self.assertNotIn("KUBE_AGENTS_ISSUES_REPO", env, name)
+            self.assertNotIn(SOURCE_TOKEN, env, name)
 
     def test_the_token_step_is_guarded_pinned_and_scoped_to_the_named_repository(self):
         by_name = steps()
@@ -69,6 +74,7 @@ class IssuesRepoWiringTest(unittest.TestCase):
         self.assertIs(mint.get("continue-on-error"), True, "a mint that fails must not cancel the dashboard, Chat and PR-comment steps")
         self.assertIn("must be owner/name", split["run"])
         names = list(steps())
+        self.assertLess(names.index("Split the issues repository into owner and name"), names.index("Adjudicate"), "split before every reader of its output, Adjudicate first")
         self.assertLess(names.index("Split the issues repository into owner and name"), names.index("Mint a token for the issues repository"))
         self.assertLess(names.index("Mint a token for the issues repository"), min(names.index(n) for n in ISSUE_STEPS), "minted before any step that uses it")
 

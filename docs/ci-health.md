@@ -801,6 +801,12 @@ to a storm or to lost pods before it clears still gets its recovery comment,
 and the recovery message names the ones still carried. A recovery comment or
 close that did not land, or an issue the bot could not read that tick, rides
 on past GREEN and is retried each tick until it does.
+Set `KUBE_AGENTS_ISSUES_REPO` mid-episode and the issue the bot already filed
+here is still commented on and closed: the issue steps carry the workflow's
+own token as `SOURCE_GH_TOKEN` beside the minted one, and a call that
+addresses this repository uses it. Unsetting it mid-episode has no such
+fallback (the issues repository's token is minted only while it is set); an
+issue carried there is then closed by hand.
 
 Each tick re-reads every carried issue. One a human closed is dropped rather
 than cited; if its condition still fires (`health.json`'s `open_conditions`,

@@ -25,8 +25,9 @@ there. The issue filers and their readers follow it through their `--repo`
 default: nightly_bugs, coverage_gaps, post_health and gate_issue,
 understudies, weekly_email, and nightly_digest through the Gh they are
 handed. gate_comment does not: it comments on pull requests, which stay in
-SOURCE_REPO. Every issue the bots mention is written as a full URL
-(issue_url), so it resolves wherever it is read.
+SOURCE_REPO. A reference to an issue of SOURCE_REPO is written "#N", one
+to any other repository as its full URL (issue_tag), so it resolves wherever
+it is read.
 """
 
 from __future__ import annotations
@@ -53,9 +54,14 @@ PULL_URL = "https://github.com/{repo}/pull/{number}"
 # URL the bots write. issue_key reads either to (repo, number), so a list
 # can be searched for an issue whichever form it was written in.
 ISSUE_REF_RE = re.compile(r"^(?:#|https://github\.com/(?P<repo>[^/\s]+/[^/\s]+)/issues/)(?P<number>\d+)$")
-HTTPS_PREFIX = "https://"
-# Where gh reads the token; the workflow sets it from `github.token`.
+# Where gh reads the token: the workflow's own, or the issues repository's
+# minted one once KUBE_AGENTS_ISSUES_REPO names another repository. Then the
+# workflow's own rides beside it as SOURCE_GH_TOKEN, for the calls that still
+# address SOURCE_REPO: a carried issue filed there before the switch, which
+# the minted token (scoped to the issues repository) cannot comment on or
+# close.
 TOKEN_ENV = "GH_TOKEN"
+SOURCE_TOKEN_ENV = "SOURCE_GH_TOKEN"
 # One call's ceiling; a hung `gh` must not eat the 30-minute job.
 CALL_TIMEOUT_S = 60
 # A paginated read comes back one object per line (`--jq '.[]'`), which is
@@ -98,6 +104,16 @@ def issue_url(repo: str, number) -> str:
 def pr_url(repo: str, number) -> str:
     """The pull request's page."""
     return PULL_URL.format(repo=repo, number=number)
+
+
+def token_environ(repo: str, environ=os.environ) -> dict | None:
+    """The environment a `gh` call to ``repo`` runs with: the caller's with
+    GH_TOKEN swapped for SOURCE_GH_TOKEN when the call addresses SOURCE_REPO
+    while the bots file elsewhere; None when the caller's own will do (one
+    repository, or no SOURCE_GH_TOKEN to swap in)."""
+    if repo != SOURCE_REPO or DEFAULT_REPO == SOURCE_REPO or not environ.get(SOURCE_TOKEN_ENV):
+        return None
+    return {**environ, TOKEN_ENV: environ[SOURCE_TOKEN_ENV]}
 
 
 def issue_key(ref) -> tuple[str, int] | None:
@@ -168,6 +184,7 @@ class Gh:
             argv += ["--paginate", "--jq", PAGINATE_JQ]
         if body is not None:
             argv += ["--input", "-"]
+        env = token_environ(self.repo)
         try:
             proc = self.runner(
                 argv,
@@ -176,6 +193,7 @@ class Gh:
                 text=True,
                 timeout=CALL_TIMEOUT_S,
                 check=False,
+                **({"env": env} if env is not None else {}),
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             self.last_failure = type(exc).__name__

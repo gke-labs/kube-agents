@@ -2,6 +2,7 @@
 
 import importlib
 import os
+import subprocess
 import unittest
 import unittest.mock
 
@@ -65,6 +66,30 @@ class IssuesRepoTest(unittest.TestCase):
     def test_issue_url_is_the_issues_page(self):
         self.assertEqual(ghcli.issue_url("gke-labs/kube-agents", 1278), "https://github.com/gke-labs/kube-agents/issues/1278")
         self.assertEqual(ghcli.issue_url("gke-labs/kube-agents-eval-triage", "12"), "https://github.com/gke-labs/kube-agents-eval-triage/issues/12")
+
+
+class SourceTokenTest(unittest.TestCase):
+    def test_a_call_to_this_repository_runs_with_the_workflows_own_token_once_the_bots_file_elsewhere(self):
+        """The minted GH_TOKEN is scoped to the issues repository; a carried
+        issue of this repository is still commented on and closed with
+        SOURCE_GH_TOKEN swapped in for that one call."""
+        envs = []
+
+        def runner(argv, **kwargs):
+            envs.append(kwargs.get("env"))
+            return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
+
+        environ = {ghcli.TOKEN_ENV: "minted", ghcli.SOURCE_TOKEN_ENV: "own"}
+        with unittest.mock.patch.dict(os.environ, environ), unittest.mock.patch.object(ghcli, "DEFAULT_REPO", "gke-labs/kube-agents-eval-triage"):
+            ghcli.Gh(ghcli.SOURCE_REPO, runner).call("PATCH", "repos/gke-labs/kube-agents/issues/1300", {"state": "closed"})
+            ghcli.Gh("gke-labs/kube-agents-eval-triage", runner).call("PATCH", "repos/gke-labs/kube-agents-eval-triage/issues/12", {"state": "closed"})
+            self.assertIsNone(ghcli.token_environ(ghcli.SOURCE_REPO, {ghcli.TOKEN_ENV: "minted"}), "no SOURCE_GH_TOKEN to swap in: the call goes out as is")
+        with unittest.mock.patch.dict(os.environ, environ), unittest.mock.patch.object(ghcli, "DEFAULT_REPO", ghcli.SOURCE_REPO):
+            ghcli.Gh(ghcli.SOURCE_REPO, runner).call("GET", "repos/gke-labs/kube-agents/issues/1300")
+        self.assertEqual(envs[0][ghcli.TOKEN_ENV], "own", "this repository's issue, the job's own token")
+        self.assertEqual(envs[0][ghcli.SOURCE_TOKEN_ENV], "own", "the rest of the environment rides along")
+        self.assertIsNone(envs[1], "the issues repository's issue keeps the minted token")
+        self.assertIsNone(envs[2], "no issues repository set: one repository, one token")
 
 
 if __name__ == "__main__":
