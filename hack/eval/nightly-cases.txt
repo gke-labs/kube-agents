@@ -1126,6 +1126,18 @@
 # says how to read one). deployer: noop; an audit, so 3000 s of delegation wait.
 ./tasks/fleet-audit-as-many-excluded-as-managed/task.yaml
 
+# A stockout fix of a pool whose declaration Config Connector does not apply
+# says so in the ledger (#4594). prebuilt/kcc-stalled-declaration plants one
+# stalled ContainerNodePool on seeded-a, which runs Config Connector in
+# namespaced mode (the config-connector-namespaced role), and commits its
+# declaration to the GitOps repository with the stack write token; it removes
+# both at destroy. Fixture: hpa-saturated. The fixture-state scan of
+# 2026-11-10 reads config-connector-namespaced healthy on all 40 pool
+# projects. A tofu case in the stockout audit's band, so it holds the infra
+# lock; listed in nightly-main-d.txt, the shortest stack chain then. Nightly
+# from the merge that removes its FIXTURE_NOT_READY entry.
+./tasks/fleet-audit-manifest-fix-names-stalled-config-connector/task.yaml
+
 # An on-demand audit that moved nothing still reports its ledger URL (#1929).
 # prebuilt/stale-audit-ledger with ledger_kind "gap" opens an ai-security-audit
 # ledger that a coverage gap opened; the clean run closes it with nothing new

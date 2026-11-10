@@ -12,3 +12,5 @@ fleet-audit-unread-target-keeps-finding
 gitops-drift-noise-filtered-triage
 incident-triage-workload-fold
 triage-start-burst
+# Added 2026-11-10 when the case joined the nightly: the shortest chain then.
+fleet-audit-manifest-fix-names-stalled-config-connector

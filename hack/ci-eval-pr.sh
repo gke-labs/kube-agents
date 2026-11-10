@@ -1403,9 +1403,8 @@ BENCH_GITOPS_WRITE_MARKER_RE="^[[:space:]]*variable[[:space:]]+\"${BENCH_GITOPS_
 # project role that the fleet creates there for an eval stack's
 # ConfigConnectorContext. Given to a writing stack's unit as
 # TF_VAR_kcc_cluster_name, TF_VAR_kcc_cluster_location and
-# TF_VAR_kcc_google_service_account. No stack on main reads them yet: the
-# stalled Config Connector case's stack (#4594) does, when it declares the
-# marker.
+# TF_VAR_kcc_google_service_account. The stalled Config Connector case's
+# stack (bench/tf/prebuilt/kcc-stalled-declaration) reads them.
 KCC_FLEET_SLOT="a"
 KCC_EVAL_CONTEXT_ACCOUNT="kcc-eval-context"
 # The mint itself, shared with step 0 (hack/ci-revalidate.sh); see
@@ -4439,6 +4438,10 @@ unit_cost_hint() {
     # orders it only among that phase's units.
     gce-startup-script-failure | networking-world-open-ingress) echo 900 ;;
     obtainability-pdb-kustomize-overlay) echo 900 ;;
+    # The stockout audit of stockout-pinned-pool, registered 2026-11-10
+    # unmeasured, after a stack that plants one Config Connector object and
+    # one GitOps file in seconds; that case's band.
+    fleet-audit-manifest-fix-names-stalled-config-connector) echo 900 ;;
     fleet-cost-idle-pool) echo 900 ;;
     # A plain chat request that runs the compliance collector's sweep (#2386):
     # the audit band, without the ledger write.
@@ -4674,6 +4677,7 @@ unit_delegation_timeout() {
     obtainability-planted-orphan-service) echo 3000 ;;
     gce-startup-script-failure | networking-world-open-ingress) echo 3000 ;;
     obtainability-pdb-kustomize-overlay) echo 3000 ;;
+    fleet-audit-manifest-fix-names-stalled-config-connector) echo 3000 ;;
     # A compliance-audit run on a pool install; a multi-stream audit took
     # 834 s and 1310 s on a dev install (#3933), so the wait is the audit band's.
     fleet-audit-as-many-excluded-as-managed) echo 3000 ;;

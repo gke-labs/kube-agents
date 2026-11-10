@@ -241,6 +241,7 @@ class DelegationCeilingTest(unittest.TestCase):
             "gce-startup-script-failure",
             "networking-world-open-ingress",
             "obtainability-pdb-kustomize-overlay",
+            "fleet-audit-manifest-fix-names-stalled-config-connector",
         ):
             with self.subTest(unit=name):
                 self.assertEqual(self.ceiling(name, "2700"), "3000")

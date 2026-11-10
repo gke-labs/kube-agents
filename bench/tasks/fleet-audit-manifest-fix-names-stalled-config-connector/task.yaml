@@ -1,8 +1,10 @@
-# FIXTURE_NOT_READY — scripts/validate_bench_cases.py. No pool project runs
-# Config Connector (provisioning-kcc-cluster-without-crds-stops relies on
-# that), so the stack below has no cluster to plant on. The entry moves to
-# hack/eval/nightly-cases.txt when a pool project carries a Config Connector
-# cluster in the audited fleet.
+# Registered in hack/eval/nightly-cases.txt. Seeded-a runs Config Connector
+# in namespaced mode in every pool project (the config-connector-namespaced
+# role, bench/tf/fleet/config-connector.tf), and the stack below plants on
+# that cluster. The fixture-state scan of 2026-11-10 read the role healthy on
+# all 40 pool projects. provisioning-kcc-cluster-without-crds-stops keeps
+# slot a out of its scope, so it still sees no Config Connector. A tofu case,
+# listed in hack/eval/nightly-main-d.txt.
 #
 # WHAT THIS GRADES. That a fix of a pool whose declaration Config Connector
 # does not apply says so in the ledger. The stockout collector reads Config
@@ -64,8 +66,8 @@ infrastructure:
   # Only what this case sets. The harness gives project_id. The harness gives
   # the narrowed GitOps write token file, gitops_repo (owner/name),
   # kcc_cluster_name, kcc_cluster_location and kcc_google_service_account to
-  # a stack that declares bench_gitops_write_token_file (#4742), once a pool
-  # carries a Config Connector cluster. Each value below is repeated in the stack's
+  # a stack that declares bench_gitops_write_token_file (#4742); the pool's
+  # Config Connector cluster is seeded-a. Each value below is repeated in the stack's
   # variables.tf and in the checks below; change one and change all.
   variables:
     kcc_namespace: "eval-kcc-stalled"
