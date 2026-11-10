@@ -11,10 +11,11 @@ allow rule names it, a deny rule beats every allow rule, and a file kube-agents 
 allows nothing.
 
 kube-agents reads the file only when the install's `KUBEAGENTS_AUTOMERGE` switch is `practice` or
-`on`. The switch defaults to `off`, and with it off the file is never opened. Adding the file
-changes nothing until the switch is turned on. kube-agents never merges a pull request itself: the
-file is input to your own pipeline's merge decision. No component acts on the decision yet; the
-format comes first so that rules written now keep their meaning.
+`on`. The switch is an entry in the PlatformAgent's `spec.deployment.env`, and it defaults to `off`
+([credential isolation](/kube-agents/reference/credential-isolation/) lists where it reaches). With
+it off the file is never opened. Adding the file changes nothing until the switch is turned on.
+kube-agents never merges a pull request itself: the file is input to your own pipeline's merge
+decision.
 
 ## Format
 
@@ -48,8 +49,9 @@ of a rule written before it existed.
 
 A fix's environment is the target cluster's `environment` resource label. When that label is not
 set, kube-agents reads `env`, then `stage`, then `tier`, the same keys the fleet-drift audit groups
-clusters by. The value is compared exactly as written. A cluster with none of these labels has no
-environment, and no rule matches it.
+clusters by. The value is compared exactly as written: fleet drift reads `production` as `prod`,
+this file does not, so a rule names the label value your clusters carry. A cluster with none of
+these labels has no environment, and no rule matches it.
 
 ## How a fix is decided
 
@@ -75,10 +77,10 @@ cannot leave the allow rules beside it in force:
 
 ## Check a file
 
-From a checkout of the repository, in the agent pod:
+In the install's shell sandbox (the `<name>-shell` Pod), where the agent's checkouts live:
 
 ```bash
-python3 "$HERMES_HOME/scripts/automation_rules.py" <checkout> --fix no-pdb --environment dev
+python3 /opt/defaults/scripts/automation_rules.py <checkout> --fix no-pdb --environment dev
 ```
 
 It prints the parsed rules, any warnings, the reason a file was refused, and the decision for the

@@ -78,7 +78,10 @@ class TestParse(unittest.TestCase):
             "not yaml": "version: [1\n",
             "duplicate key": "version: 1\nautomerge: {deny: [{fix: '*', environments: [prod]}]}\nautomerge: {}\n",
             "nested duplicate key": "version: 1\nautomerge: {allow: [], allow: [{fix: no-pdb, environments: [dev]}]}\n",
-            "merge key": "version: 1\nbase: &b {allow: []}\nautomerge: {<<: *b}\n",
+            "merge key": "version: 1\nautomerge:\n  deny: &d [{fix: '*', environments: [prod]}]\n  allow: [{<<: {fix: no-pdb}, environments: [dev]}]\n",
+            "trailing newline in environment": "version: 1\nautomerge:\n  deny: [{fix: '*', environments: [\"prod\\n\"]}]\n",
+            "block scalar environment": "version: 1\nautomerge:\n  deny:\n    - fix: '*'\n      environments:\n        - |\n          prod\n",
+            "trailing newline in fix": "version: 1\nautomerge: {deny: [{fix: \"no-pdb\\n\", environments: [prod]}]}\n",
             "unhashable key": "version: 1\n? [a]\n: 1\n",
             "unsafe tag": "version: !!python/object/apply:os.system ['true']\n",
             "too large": "version: 1\n#" + "x" * ar.MAX_FILE_BYTES + "\n",
@@ -90,6 +93,11 @@ class TestParse(unittest.TestCase):
                 self.assertTrue(rules.error)
                 self.assertEqual((rules.allow, rules.deny), ((), ()))
                 self.assertFalse(ar.decide(rules, "no-pdb", "dev").allowed)
+
+    def test_merge_key_named_in_error(self):
+        rules = ar.parse("version: 1\nautomerge: {allow: [{<<: {fix: no-pdb}, environments: [dev]}]}\n")
+        self.assertEqual(rules.status, ar.INVALID)
+        self.assertIn("merge keys", rules.error)
 
     def test_bad_deny_rule_does_not_leave_allow_in_force(self):
         text = (
@@ -161,6 +169,12 @@ class TestLoad(unittest.TestCase):
         rules = ar.load(_tree("version: 1\n#" + "x" * (ar.MAX_FILE_BYTES * 4) + "\n"))
         self.assertEqual(rules.status, ar.INVALID)
 
+    def test_oversized_multibyte_says_too_large(self):
+        # A cap that cuts a character in half must still report the size.
+        rules = ar.load(_tree("version: 1\n#" + "\u00e9" * ar.MAX_FILE_BYTES + "\n"))
+        self.assertEqual(rules.status, ar.INVALID)
+        self.assertIn("larger than", rules.error)
+
     def test_symlinked_file_refused(self):
         root = _tree(None)
         (root / ".kube-agents").mkdir()
@@ -203,7 +217,29 @@ class TestReadRules(unittest.TestCase):
                 fake.switch.assert_called_once_with("AUTOMERGE")
 
 
+class TestRealSwitchHelper(unittest.TestCase):
+    def test_reads_the_variable_outside_the_sandbox(self):
+        import kubeagents_switches
+
+        root = _tree(GOOD)
+        missing = Path(tempfile.mkdtemp()) / "none"
+        with mock.patch.object(kubeagents_switches, "SWITCH_DIR", missing):
+            with mock.patch.dict(os.environ, {"KUBEAGENTS_AUTOMERGE": "practice"}):
+                self.assertEqual(ar.read_rules(root).status, ar.LOADED)
+            with mock.patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(ar.read_rules(root).status, ar.SWITCH_OFF)
+
+
 class TestClusterEnvironment(unittest.TestCase):
+    def test_keys_match_fleet_drift(self):
+        # The page says the keys are the fleet-drift audit's; hold them together.
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "skills" / "fleet-audit" / "scripts"))
+        try:
+            import fleet_drift
+        finally:
+            sys.path.pop(0)
+        self.assertEqual(ar.ENV_LABEL_KEYS, fleet_drift.ENV_LABEL_KEYS)
+
     def test_label_order(self):
         self.assertEqual(ar.cluster_environment({"tier": "t", "env": "dev"}), "dev")
         self.assertEqual(ar.cluster_environment({"environment": "prod", "env": "dev"}), "prod")

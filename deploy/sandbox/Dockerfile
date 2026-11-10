@@ -601,6 +601,8 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          and passes the flags on; this module parses them
 #   kubeagents_switches.py the earned-autonomy switches' one reader: the root-owned
 #                          files entrypoint.sh writes, then the session's variables
+#   automation_rules.py    checks a GitOps checkout's .kube-agents/automation.yaml,
+#                          the checkouts being here; imports kubeagents_switches
 #   broker_admission.py    how wide the fleet-audit collectors sweep: it reads what
 #                          the broker admits at once (GET /v1/exec/admission)
 #                          through credential_proxy_client and sizes their pools
@@ -687,6 +689,7 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/feedback_broker.py \
      agents/platform/scripts/fleet_scope_args.py \
      agents/platform/scripts/kubeagents_switches.py \
+     agents/platform/scripts/automation_rules.py \
      agents/platform/scripts/collector_run.py \
      agents/platform/scripts/broker_admission.py \
      agents/platform/scripts/vcs_client.py \

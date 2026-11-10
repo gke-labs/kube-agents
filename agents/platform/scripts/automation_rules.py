@@ -52,9 +52,11 @@ ABSENT = "absent"
 INVALID = "invalid"
 LOADED = "loaded"
 
-_FIX_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+# `fullmatch`, never `match`: `$` also matches before a trailing newline, so a
+# block scalar reading `prod\n` would pass and then match nothing.
+_FIX_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 # A GKE label value: lowercase letters, digits, `_` and `-`, at most 63.
-_ENV_RE = re.compile(r"^[a-z0-9_-]{1,63}$")
+_ENV_RE = re.compile(r"[a-z0-9_-]{1,63}")
 _TOP_KEYS = frozenset({"version", "automerge"})
 _AUTOMERGE_KEYS = frozenset({"allow", "deny"})
 _RULE_KEYS = frozenset({"fix", "environments"})
@@ -115,6 +117,8 @@ class _UniqueKeyLoader:
             def construct_mapping(loader: Any, node: Any, deep: bool = False) -> dict:
                 seen: set = set()
                 for key_node, _ in node.value:
+                    if key_node.tag == "tag:yaml.org,2002:merge":
+                        raise RulesError(f"line {key_node.start_mark.line + 1}: merge keys (`<<`) are not supported")
                     key = loader.construct_object(key_node, deep=deep)
                     if key in seen:
                         raise RulesError(f"line {key_node.start_mark.line + 1}: key `{key}` appears twice")
@@ -141,14 +145,14 @@ def _require_keys(value: Any, where: str, allowed: frozenset, required: frozense
 def _parse_rule(raw: Any, where: str, *, wildcard_ok: bool, warnings: list[str]) -> Rule:
     data = _require_keys(raw, where, _RULE_KEYS, _RULE_KEYS)
     fix = data["fix"]
-    if not isinstance(fix, str) or not (_FIX_RE.match(fix) or (wildcard_ok and fix == WILDCARD)):
+    if not isinstance(fix, str) or not (_FIX_RE.fullmatch(fix) or (wildcard_ok and fix == WILDCARD)):
         hint = "" if wildcard_ok else " (`*` is allowed only in deny rules)"
         raise RulesError(f"{where}.fix: expected a fix type such as `no-pdb`{hint}")
     envs = data["environments"]
     if not isinstance(envs, list) or not envs:
         raise RulesError(f"{where}.environments: expected a non-empty list")
     for index, env in enumerate(envs):
-        if not isinstance(env, str) or not (_ENV_RE.match(env) or (wildcard_ok and env == WILDCARD)):
+        if not isinstance(env, str) or not (_ENV_RE.fullmatch(env) or (wildcard_ok and env == WILDCARD)):
             hint = "" if wildcard_ok else " (`*` is allowed only in deny rules)"
             raise RulesError(
                 f"{where}.environments[{index}]: expected an environment label value such as `dev`{hint}"
@@ -226,6 +230,8 @@ def load(tree: Path) -> Rules:
     try:
         with path.open("rb") as handle:
             raw = handle.read(MAX_FILE_BYTES + 1)
+        if len(raw) > MAX_FILE_BYTES:
+            return Rules(status=INVALID, error=f"larger than {MAX_FILE_BYTES} bytes")
         text = raw.decode("utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         return Rules(status=INVALID, error=f"unreadable ({exc})")
