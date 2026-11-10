@@ -649,14 +649,28 @@ func TestScrubEnvNameValuePairsReadsTheValueAsYAMLDoes(t *testing.T) {
 }
 
 // A table's value cell is read as a value under a key is: an auth-scheme
-// word stays, a code-spanned value is bounded by its backticks, and a pipe
-// inside a code span is the cell's content, not a column break.
+// word stays, and a code-spanned value is bounded by its backticks unless
+// only the whole cell reads as a value. Rows are split both with a pipe
+// inside a code span as content and at every pipe, and both splits'
+// spans are redacted, so backticks pairing across cells cannot move a value
+// out from under its header.
 func TestScrubInlineSecretsTableCellsSchemeCodeSpanAndPipes(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"| Key | Value |\n|---|---|\n| api_token | Bearer `synthtoken0001abcd` |\n", "| Key | Value |\n|---|---|\n| api_token | Bearer `[redacted]` |\n"},
 		{"| Key | Value |\n|---|---|\n| password | `quietpasture` (rotated) |\n", "| Key | Value |\n|---|---|\n| password | `[redacted]` (rotated) |\n"},
-		{"| User | Command | Password |\n|---|---|---|\n| app | `cat /etc/hosts | head` | quietpasture |\n", "| User | Command | Password |\n|---|---|---|\n| app | `cat /etc/hosts | head` | [redacted] |\n"},
-		{"| Key | Value | Notes |\n|---|---|---|\n| password | `synth|pass|0001` | rotated |\n", "| Key | Value | Notes |\n|---|---|---|\n| password | `[redacted]` | rotated |\n"},
+		// The every-pipe split also redacts a fragment, as before: fail
+		// closed, the value itself gone either way.
+		{"| User | Command | Password |\n|---|---|---|\n| app | `cat /etc/hosts | head` | quietpasture |\n", "| User | Command | Password |\n|---|---|---|\n| app | `cat /etc/hosts | [redacted] | [redacted] |\n"},
+		{"| Key | Value | Notes |\n|---|---|---|\n| password | `synth|pass|0001` | rotated |\n", "| Key | Value | Notes |\n|---|---|---|\n| password | [redacted]` | rotated |\n"},
+		// Backticks pairing across cells merge them under the code-aware
+		// split; the every-pipe split still finds the value's column.
+		{"| Note | Password | Extra |\n|---|---|---|\n| see `x | quietpasture | y` |\n", "| Note | Password | Extra |\n|---|---|---|\n| see `x | [redacted] | y` |\n"},
+		// A code span that does not read as a value, a value after it:
+		// the whole cell is tested and redacted.
+		{"| Key | Value |\n|---|---|\n| password | `none` quietpasture0001 |\n", "| Key | Value |\n|---|---|\n| password | `[redacted] |\n"},
+		// A code span holding only part of the value, text running on
+		// after it: the whole cell is tested and redacted.
+		{"| Key | Value |\n|---|---|\n| password | `sy`nthpass0001x |\n", "| Key | Value |\n|---|---|\n| password | `[redacted] |\n"},
 	}
 	for _, tc := range cases {
 		if got := scrubInlineSecrets(tc.in); got != tc.want {

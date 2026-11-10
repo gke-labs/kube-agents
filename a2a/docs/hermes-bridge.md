@@ -690,14 +690,17 @@ a status message is the bridge's own text. There are two passes:
      is kubectl's JSON), and YAML documents and list items, each item for its own lines (a
      `kubectl get secrets -o yaml` List), a comment on the kind line allowed. An item of a
      `SecretList`'s `items` is a Secret: the API server's list (`kubectl get --raw`, a curl through
-     the API proxy) leaves kind off its items. A quoted YAML `stringData` value is tracked both as
-     written and with its escapes read. JSON cut short is
+     the API proxy) leaves kind off its items, whether the list's kind comes before its items or
+     after them (keys sorted). A quoted YAML `stringData` value is tracked both as written and with
+     its escapes read, and a `data` value that ends in whitespace is also tracked as the base64 of
+     its trimmed value. JSON cut short is
      scanned object by object: a data block is read for its own object's kind, whatever other
      kinds the text holds. kubectl prints a block before its object's kind, so an item cut inside
      its data counts as a Secret only when every item of its list before it was one, and a single
      Secret cut there is not read. YAML cut before a scope's kind line is not read either. The
      connection settings `username`, `user`, `host`, `port` and `database` are skipped, and so
-     is a service account token Secret's `namespace`.
+     is a service account token Secret's `namespace`, or the `namespace` of any Secret cut before
+     its `type` was read.
    - **Shape-caught values.** A value a shape rule catches in a result's text, but only where the
      key, flag or prose noun in front of it names a credential outright (password, passwd,
      passphrase, token, api key, secret as a key's last component, with a digit or a value
@@ -705,7 +708,8 @@ a status message is the bridge's own text. There are two passes:
      password, a password flag, an `Authorization` header pair). JSON text is read both as a
      structure and as text, so a pair that spans fields or list items (an env entry's name and
      value, a flag and its value in `args`, a header list) is caught from `-o json` as from
-     `-o yaml`. A string under a JSON key that names a credential outright counts too, as
+     `-o yaml`. The text read is the structure re-encoded, with a string holding a line break
+     blanked (it is read as text of its own) and a Secret's data left out. A string under a JSON key that names a credential outright counts too, as
      decoded, and also with its quotes and trailing punctuation taken off when that changes it,
      unless the whole string is a state word (`disabled`, `required`) or an upper-case environment
      variable reference (`${DB_PASSWORD}`). The bare word secret, a plural (`Mountable secrets`)

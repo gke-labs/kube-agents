@@ -1888,10 +1888,40 @@ func envUnquotedValue(v string, flow bool) int {
 // and redacted where it stands. Only a key whose class is strong counts
 // (tableSecretKeyClass); a bare credential noun heads a column of names as
 // often as of values, so under one a value must be token-shaped.
+//
+// Rows are split twice, once with a pipe inside a paired code span read as
+// cell content and once at every pipe, and the spans of both are redacted:
+// backticks that pair across cells can merge columns, so neither split
+// alone decides which cell is under which header.
 func scrubMarkdownTables(s string, sink secretSink) string {
 	if !strings.Contains(s, "|") {
 		return s
 	}
+	spans := append(markdownTableSpans(s, sink, true), markdownTableSpans(s, sink, false)...)
+	return redactSpans(s, mergeSpans(spans))
+}
+
+// mergeSpans is spans with every overlapping pair joined, so redactSpans
+// skips none of a span's bytes.
+func mergeSpans(spans [][2]int) [][2]int {
+	if len(spans) < 2 {
+		return spans
+	}
+	sort.Slice(spans, func(i, j int) bool { return spans[i][0] < spans[j][0] })
+	out := [][2]int{spans[0]}
+	for _, sp := range spans[1:] {
+		if last := &out[len(out)-1]; sp[0] < last[1] {
+			last[1] = max(last[1], sp[1])
+			continue
+		}
+		out = append(out, sp)
+	}
+	return out
+}
+
+// markdownTableSpans is the value-cell spans scrubMarkdownTables redacts,
+// with rows split as markdownTableCells does under codeAware.
+func markdownTableSpans(s string, sink secretSink, codeAware bool) [][2]int {
 	var spans [][2]int
 	type row struct{ cells [][2]int }
 	var block []row
@@ -1965,7 +1995,7 @@ func scrubMarkdownTables(s string, sink secretSink) string {
 		} else {
 			lineEnd += lineStart
 		}
-		if cells := markdownTableCells(s, lineStart, lineEnd); cells != nil {
+		if cells := markdownTableCells(s, lineStart, lineEnd, codeAware); cells != nil {
 			block = append(block, row{cells})
 		} else {
 			flush()
@@ -1973,21 +2003,25 @@ func scrubMarkdownTables(s string, sink secretSink) string {
 		lineStart = lineEnd + 1
 	}
 	flush()
-	return redactSpans(s, spans)
+	return spans
 }
 
 // markdownTableCells is the content span of each cell of a table row (a
 // line that opens with a pipe and holds another), trimmed of spaces, or nil
 // for a line that is not one. A pipe escaped with a backslash is content.
-func markdownTableCells(s string, lo, hi int) [][2]int {
+func markdownTableCells(s string, lo, hi int, codeAware bool) [][2]int {
 	line := strings.TrimRight(s[lo:hi], "\r")
 	trimmed := strings.TrimLeft(line, " \t")
 	if !strings.HasPrefix(trimmed, "|") || strings.Count(trimmed, "|") < 2 {
 		return nil
 	}
-	// A pipe inside a paired code span is the cell's content: the answer
-	// is published as written, so a value it pushes past is still there.
-	code := markPairedMarkdownRuns(line, 0, len(line), make([]bool, len(line)), nil)
+	// Under codeAware, a pipe inside a paired code span is the cell's
+	// content: the answer is published as written, so a value it pushes
+	// past is still there.
+	var code [][2]int
+	if codeAware {
+		code = markPairedMarkdownRuns(line, 0, len(line), make([]bool, len(line)), nil)
+	}
 	inCode := func(i int) bool {
 		for _, c := range code {
 			if i >= c[0] && i < c[1] {
@@ -2145,18 +2179,26 @@ func tableSecretKeyClass(cell string) (secretKeyClass, bool) {
 func tableCellSpans(s string, cell [2]int, class secretKeyClass, named bool, sink secretSink) [][2]int {
 	text := s[cell[0]:cell[1]]
 	n, idx, code := normalizeMarkdownSpans(text)
-	lo := len(n) - len(strings.TrimLeft(n, " \t"))
-	hi := len(strings.TrimRight(n, " \t"))
+	cellLo := len(n) - len(strings.TrimLeft(n, " \t"))
+	cellHi := len(strings.TrimRight(n, " \t"))
+	if cellHi <= cellLo || strings.Contains(n, redactedValue) {
+		return nil
+	}
 	// As under a key: an auth-scheme word stays, and a code-spanned value
-	// is bounded by its backticks (a note may follow it in the cell).
+	// is bounded by its backticks when a blank follows it (a note after it
+	// in the cell). When that value does not read as one, or text runs on
+	// straight after the span, the whole cell is tested instead.
+	lo, hi := cellLo, cellHi
 	if sloc := inlineAuthSchemePrefixPattern.FindStringIndex(n[lo:hi]); sloc != nil {
 		lo += sloc[1]
 	}
-	if end, ok := codeSpanEnd(code, lo); ok {
+	if end, ok := codeSpanEnd(code, lo); ok && (end >= cellHi || n[end] == ' ' || n[end] == '\t') {
 		hi = end
 	}
-	if hi <= lo || strings.Contains(n, redactedValue) || !classValueRedacted(class, n[lo:hi], false) {
-		return nil
+	if hi <= lo || !classValueRedacted(class, n[lo:hi], false) {
+		if lo, hi = cellLo, cellHi; !classValueRedacted(class, n[lo:hi], false) {
+			return nil
+		}
 	}
 	if idx != nil {
 		lo, hi = idx[lo], idx[hi-1]+1
