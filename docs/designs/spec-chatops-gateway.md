@@ -658,8 +658,10 @@ leaves the record as it was:
    subscription saw first is never overwritten by the read. A profile whose card declares
    `project`, `location` and `cluster` parameters takes a cluster target. A profile pinned to a
    cluster (`clusterRef`) takes only that cluster, and gets its own cluster's parameters when it
-   is addressed with none; a profile that takes a target yields to the one profile pinned to
-   it; two profiles pinned to one cluster is refused rather than guessed between; a profile
+   is addressed with none; a profile that takes a target and whose card sets `yieldToPinned`
+   (the generic cluster agent) yields to the one profile pinned to it, and one that doesn't (a
+   specialist) keeps the task; two profiles pinned to one cluster is refused rather than
+   guessed between; a profile
    that takes no target refuses one.
 2. **Scope.** The target is checked against the install's `spec.scope`, from the `scope.json`
    the operator mounts into the gateway pod (`A2A_SCOPE_FILE`), read per task. An exclusion

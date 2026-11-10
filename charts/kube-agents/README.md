@@ -1482,6 +1482,8 @@ No pod runs it until the profile dispatcher, worker and pool land and the
 operator runs them, though enabling it already gets the profile its
 ServiceAccounts, bus identity and agent card. A cluster that needs its own
 persona or tier gets a second `AgentProfile` with `clusterRef` set (`k8s-operator/examples/agentprofile-cluster.yaml`).
+The chart sets `yieldToPinned: true` on `cluster`, so that second profile receives
+the cluster's tasks; a specialist such as `tse` keeps the tasks addressed to it.
 
 ## Uninstalling
 
