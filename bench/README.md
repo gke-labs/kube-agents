@@ -188,7 +188,7 @@ block. The lane's record is its logs bucket, read by the page per case, release 
 kept out of the baseline evidence store and the nightly dashboard, as the GitLab and rollback
 lanes are.
 
-Five rules hold for every fixture a certification case plants, enforced in review until a
+Eight rules hold for every fixture a certification case plants, enforced in review until a
 validator check lands with the first stack that needs it:
 
 1. A fail-closed admission webhook matches one bench-owned API group only, carries a
@@ -205,7 +205,27 @@ validator check lands with the first stack that needs it:
 4. A declared-gap fixture plants a signal the agent's read role reaches (a webhook configuration's
    CA bundle, an object's condition, an event), never a Secret: agents hold no Secret access, so a
    gap recorded on one could never close.
-5. Every object a fixture plants carries `managed-by=kube-agents-bench` where the kind takes
+5. A fixture holds only on the lane's host type, which is Autopilot (`hack/ci-deploy.sh`). A
+   condition that needs a Standard cluster (a ComputeClass over a class-labelled pool, a
+   `nodepools` priority) cannot occur there, and a condition Autopilot admission removes at create
+   (it writes cpu and memory requests and an ephemeral-storage request and limit onto every
+   container of a Deployment's template) cannot be planted there; such a case is parked as
+   `FIXTURE_NOT_READY`, naming the issue that plants the fixture beside its gap issue. Before the
+   card, a server-side dry run of the manifest on the host type (`kubectl create --dry-run=server
+-o yaml`) lists what admission adds or changes; a safeguard reads its value from there.
+6. A namespace-scoped plant calls `bench/tf/modules/namespaced-plant` and holds only its manifest.
+   A cluster-scoped plant copies the module's guards: one ownership read with `--ignore-not-found`
+   and a name/label jsonpath (no stderr grammar; a read error is a stop), a pre-clear that deletes
+   this stack's leftover first and stops on a foreign owner, `kubectl create` rather than `apply`,
+   the planted flag set before the create, an EXIT trap keyed on the stack's label with the signal
+   exit named as a constant, label values quoted (Prow build ids are integers), and a destroy that
+   deletes only on the label match.
+7. One safeguard per property the case tempts a fix to write: `absent` with the planted
+   container's or volume's name in the filter (a filter that matches nothing passes), a list or
+   map read whole with `eq` against the planted value including the fields the API server defaults
+   (an appended gentler entry fails it), taken from the dry run of rule 5; never a replica count
+   on an autoscaled Deployment.
+8. Every object a fixture plants carries `managed-by=kube-agents-bench` where the kind takes
    labels: every Kubernetes object, a node pool's GCE resource labels (`--labels` at create, not
    only `--node-labels`), a GCE address or forwarding rule, an alert policy. A GCP kind without
    labels (a network, a subnetwork, a backend service, a health check, a service attachment)

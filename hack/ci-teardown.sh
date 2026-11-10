@@ -220,7 +220,7 @@ echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 1: Sweeping bench plants ==="
 # What a bench case's stack planted on the host cluster and a killed run left
 # behind: webhook configurations, node readiness rules, compute classes and
 # node pools labelled managed-by=kube-agents-bench (bench/README.md,
-# "Certification suite", fixture rule 5). A run killed between its stack's
+# "Certification suite", fixture rule 8). A run killed between its stack's
 # apply and destroy runs no destroy; a leftover class or hook is read by the
 # next lease's audits and a leftover pool bills. First, because nothing here
 # belongs to the release and a planted admission hook must not refuse the

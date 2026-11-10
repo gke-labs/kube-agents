@@ -4,7 +4,7 @@
 # ==============================================================================
 # Removes what a bench case's stack planted on the host cluster and a killed
 # run left behind: the objects a stack labels managed-by=kube-agents-bench
-# (bench/README.md, "Certification suite", fixture rule 5) and the node pools
+# (bench/README.md, "Certification suite", fixture rule 8) and the node pools
 # whose GCE resource labels carry the same pair. A stack's own destroy is the
 # first remover; this is the backstop hack/ci-teardown.sh runs at every lease
 # start and end, since a run killed between apply and destroy runs no destroy,

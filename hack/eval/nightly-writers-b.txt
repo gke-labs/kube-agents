@@ -1,0 +1,34 @@
+# The cases of the nightly's writers part that run in writers-b.
+#
+# One case id per line. `#` starts a comment, blank lines are skipped.
+# hack/ci-eval-pr.sh reads this file and nightly-writers-c.txt under
+# EVAL_NIGHTLY_PART=writers-a, writers-b or writers-c, which run the
+# nightly's writers part -- the cases that request a pull request, the
+# stopped asks and the writes_alone cases -- as three periodics on three
+# leased projects (#4238). A writer runs in writers-b when it is listed
+# here, in writers-c when nightly-writers-c.txt lists it, and in writers-a
+# otherwise. On each project the writers run one at a time, each after a
+# reset of the project's one GitOps repository, so a third's length is its
+# cases' repetitions end to end, and these two lists are what balance the
+# three.
+#
+# The choice is by name, not computed from the matrix, so the three jobs
+# agree on it when a merge that adds or drops other cases lands between
+# their checkouts; a merge that edits a list can run a moved case in two
+# thirds, or in none, for that one night.
+#
+# scripts/test_ci_eval_nightly.py holds the three counts to within one of
+# each other, and fails on a line that names no writer, or a case on both
+# lists. A new writer lands in writers-a; when the counts drift apart, list
+# a case here or in nightly-writers-c.txt until they balance.
+#
+# Balanced on the gemini-4-argon night of 2026-11-06 (build
+# 2117406650204688384; the 14-case roster at 292 unit-minutes): writers-b
+# 96, writers-c 98, writers-a 98 (chat-stop-halts-delegated-remediation,
+# obtainability-major-pdb-auto-pr, obtainability-refusal-direct-mutation,
+# pdb-remediation-pr).
+chat-stop-mid-turn-files-no-card
+stop-on-permission-refusal
+vcs-review-feedback-read-back
+scale-request-proposes-pr
+provisioning-cluster-request-never-creates
