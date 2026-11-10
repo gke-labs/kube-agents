@@ -298,7 +298,7 @@ def _cluster_b(*, master: str = "1.33.4-gke.1134000", channel: str | None = "REG
         # that heals the fixture. The readiness-lb-drain-timeout role asserts
         # the default pool's status, the pool its backend service fronts.
         "nodePools": [
-            {"name": "default-pool", "status": "RUNNING", "upgradeSettings": {"maxSurge": 1}},
+            {"name": "default-pool", "status": "RUNNING", "upgradeSettings": {"maxSurge": 2}},
             {"name": "no-surge-pool", "upgradeSettings": no_surge},
         ],
         "maintenancePolicy": {
