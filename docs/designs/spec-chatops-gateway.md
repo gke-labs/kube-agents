@@ -1872,13 +1872,31 @@ line is edited in place, "✓ Retrying. <name>, <time>", "Dropped. <name>, <time
 stuck. <name>, <time>" set after its text on the same line, the time in UTC since Chat has no date
 token, and the row's two buttons gone; a tap that did not land keeps them under a line saying so,
 so a second tap asks again, and so does one whose patch Chat refused. One tap per row at a time,
-and the edits of one message in turn under its rewrite lock, each from the layout the adapter last
-sent it; a message posted before a restart is edited from the event's copy of it, text and buttons
-(`gchat_board.go`); a button drawn before the line parameter existed carries none, and its row is
+and the edits of one message in turn under its rewrite lock, each from the message's one layout
+record (below); a message posted before a restart is edited from the event's copy of it, text and
+buttons (`gchat_board.go`); a button drawn before the line parameter existed carries none, and its row is
 found through the text's rows block instead, for one release (#5235). The report caps its rows at
 `MAX_STUCK_ROWS` (15), so the list holds at most 30 such buttons; Chat's own ceiling on buttons in
 one list is not documented in a form this spec can cite and has not been measured, and a layout
 Chat refuses falls back to the text as any does.
+
+The adapter keeps one layout record per message, in this process: the text and the buttons the
+message shows now, rating buttons included, as the adapter last created or patched it
+(`gchat_layout.go`). Every laid-out create (`createLaidOut`) and every patch that lands writes it
+(an edit, the answered rewrite, a rating tap's patch, a board row's edit), and every rewrite reads
+it as its base under the message's rewrite lock, falling back to the event's copy of the message,
+text and buttons, only when there is no record (a message posted before a restart, or a rated text
+answer or a Stop line, which are created outside the layout path), which is then on record too.
+Each rewrite changes only its own part of it: the answered rewrite drops the choice buttons,
+adds the `✓` line under the text and draws the rating buttons last; a rating tap replaces the rating
+buttons with the tapped one filled (and drops the choice buttons of an answered message, so a tap
+never restores choices the answer removed); a board tap sets its row's line and drops that row's
+two buttons; an edit lays the message out anew, keeping the answered line and the rating buttons.
+So a message with a choice, a link and acting rows keeps its row buttons through its answer, its
+answered line through a tap, and a tapped row's line through a rating, in whichever order they
+come. A board edit whose answer did not come back drops the record, since the edit may have
+landed, and the next rewrite builds from the event's copy; a message laid out again without acting
+rows while its record drew a row's buttons is marked, so a tap in flight on it draws nothing.
 
 A click on a choice button arrives on the same subscription as a message, as a
 `CARD_CLICKED` interaction, in either wire layout: the add-on one (`chat.buttonClickedPayload`
@@ -1890,7 +1908,9 @@ The adapter turns it into a text turn from the clicker whose text is the
 choice's reply, bound to the conversation the clicked message sits in by the rule a message
 takes, marked as a click, and handed over like a typed message, so the allowlist decides.
 Once the gateway says the clicker is verified it rewrites the clicked message, off the inbox
-worker: the choice buttons go, the link buttons stay, and `✓ <display name>: <label>` is added
+worker, from the message's one layout record (above): the choice buttons go, every other
+button stays (links, a row's Retry and Drop, Stop), the rating buttons are drawn last, and
+`✓ <display name>: <label>` is added
 under the text, defanged like every other string, the clicker "Someone" when Chat names them
 nowhere, never their address; a later edit of the message that lays out no choices keeps the
 line, and one that lays choices out opens the question anew, the earlier answer forgotten,
@@ -1907,10 +1927,15 @@ same surface rule as a typed message, to the thread the event names, in the kind
 names, or, where the adapter clears the thread (an unthreaded space, a click event with no
 thread name), to the shared space, as a typed message there does, so the binding survives a restart without any mark, and a typed reply in its thread
 does not answer it; its buttons do. A
-rewrite that fails posts the line in the conversation instead. The questions and answers
+rewrite that fails posts the line in the conversation instead. A question closes with its layout
+record (the record's ring is the busier one, since every edit writes it, so it holds 4096 messages
+where the question ring holds 512, and a question outlives the edits made around it): the message is then as
+one from before a restart, its buttons answer from the click's copy and a typed reply in its
+thread is a turn of its own; a reply already pending when the record went posts its line in the
+conversation. The questions, answers and layout records
 are held in the process: after a restart a question keeps its buttons until clicked, the click
-is still a turn, and the rewrite reads the message the event carries, its text, its link
-buttons and the clicked button's label. A click on a button the adapter did not draw is
+is still a turn, and the rewrite reads the message the event carries, its text and buttons,
+and the clicked button's label. A click on a button the adapter did not draw is
 logged and acked. A click on a rating button or the note card is never a turn ([Answer feedback](#answer-feedback-added-1016)).
 
 **The Stop button.** A task's live message, the "⏳ submitted…" line the gateway posts and edits as the task moves, arrives at the adapter with `OutMessage.Stop` while the task runs, and the adapter draws a `Stop` button under it: after the message's own buttons when the newest progress laid it out (a progress message's links), alone under the text otherwise. The terminal edit arrives without `Stop` and takes the button off, as any text edit does. Slack's Stop is native to Agent Sessions (the Slack adapter section); Chat has no such control, so this one is drawn, and a text line Chat refuses with the button is posted or patched once more without it, so the line itself never fails for the button; a laid-out line's refusal is the layout's, and the relay falls back to its text, which then takes the same path. A click on it arrives as a `CARD_CLICKED` interaction like a choice click, with the button's function `kage.stop` and two parameters: the conversation key the line was posted under, since the click's event names the surface the line is on, which is not the key a DM's thread-less line was posted under; and the task the line is for. The adapter turns it into `IntentCancel` with no text, marked a click, naming that task (`InboundMessage.TaskID`), from the clicker, bound to that conversation, which must be in the space the click came from, and handed over like a typed message, so the allowlist decides, for anyone it admits (the Slack button's requester gate, `stopgate.go`, is Slack's). The gateway sends the cancel a typed `stop` sends, quietly, as for Slack's button (`TaskRef.QuietCancel`: no "cancel sent" post, no "canceled" notice from the relay), and answers on the line itself (a task with no line, its placeholder post having failed, takes the typed stop's posts instead): edited to "🛑 cancel sent — the task ends when the executor confirms" with the control gone, left so by later progress (`ActiveTask.LineClosed`), and made "🛑 canceled" by the terminal edit; a second press, or one on a task a typed `stop` already detached, retries the closing edit when the first did not land, closes the pressed message too when it is not the task's own line (a delegating parent's line names the parent, whose press is the running child's cancel), and otherwise changes nothing; a press with the card stop armed takes the typed stop's path, cards and replies included, and its line loses the button at its next edit, as any detached task's does. A `stop` typed on Google Chat with a task running and a line takes the press's answer in turn (amended 11/6): the quiet cancel, the line closed on "cancel sent", and the terminal edit with no notice posted, so a DM whose thread-less key would put the line, the "cancel sent" post and the relay's "canceled" each in a message of its own gets the one line; a second typed `stop` edits the line to "🛑 cancel already sent — the task ends when the executor confirms"; a typed `stop` on a task with no line, or one the armed card stop answers (`cardStopWanted`, so not on the session route), keeps its posts. A redelivered click is a duplicate by its id, as a choice click is. Nothing is remembered for it: a line carries its conversation and its task in the button, and a press on a task that is not the running one cancels nothing, so a press is never a cancel of a task the presser did not see, and is answered by what the record knows (`chatStopStale`): a task the record does not know (one from before a restart) has the pressed line edited to "ℹ️ this task has ended" with the control gone; a task the record cancelled (a stopped task the next ask superseded, whose closing edit failed, since each closing edit is one unretried call) has its "🛑 canceled" line written again; any other task the record knows ended keeps the line its end wrote, since the heal or the relay may have written it a moment before the press. A task the heal ends has its line closed by the heal, and a stopped task the next ask supersedes before its terminal has its line closed as canceled by that turn, since the relay's terminal edit would find neither, so no line outlives its task with the button on it.
@@ -2566,12 +2591,12 @@ does not admit the sender (`Admits`). Otherwise it records the rating off the pu
 (`platform: googlechat`, the rater's address, the conversation a choice click there binds to, the
 message name, and the message's text as the event carries it as the answer), then patches the
 answer with the tapped button `type: FILLED` and the other plain. The patch takes its text and
-its other buttons from the adapter's record when it has one (`ratedLayout`): a question not yet
-answered keeps its own layout; an answered one keeps the layout its answered rewrite put on it,
-the `✓` line included (`shown`, held without the rating buttons), and, while that rewrite has not
-landed, takes the event's text and link buttons only. Any other message, one from before a
-restart, takes the event's text and its choice and link buttons. A tap therefore never restores
-the choices an answer removed. A failed write logs and patches nothing; a failed patch logs and
+its other buttons from the message's one layout record when the adapter has one (`ratedLayout`;
+"The Google Chat adapter", above): the layout the message shows now, the `✓` line and a tapped
+row's line included, with the rating buttons replaced. A message with no record, one from before
+a restart, takes the event's text and buttons the same way. An answered message loses its choice
+buttons either way, so a tap never restores the choices an answer removed, whether the answered
+rewrite has landed or a restart lost its record. A failed write logs and patches nothing; a failed patch logs and
 keeps the rating. Taps on one message are ordered by event time. The adapter records each
 rater's newest tap on a message when it takes the tap. It records the rating and patches the
 message under the message's rewrite lock, and asks for the note after it releases the lock. A tap
@@ -2608,7 +2633,7 @@ in the same thread.
 
 The Google Chat rewrites keep the rating buttons. The answered rewrite a choice click or typed
 reply makes (`gchatAnsweredLayout`) and a later edit that lays out no choices (`answeredLayout`)
-put them back after the link buttons, filled as last rated, from the adapter's record. For a
+put them back after the message's other buttons, filled as last rated, from the adapter's record. For a
 message from before a restart the click's rewrite reads them from the event's copy
 (`gchatMessageButtons`, which reads the `task` parameter and the `FILLED` button) and remembers
 them, so a later edit draws the same. Buttons are told
