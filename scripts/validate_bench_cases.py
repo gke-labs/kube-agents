@@ -482,11 +482,6 @@ FIXTURE_NOT_READY = {
         "registers it, so the context check fails with the repository absent, "
         "which is broken rather than red"
     ),
-    "obtainability-untargeted-compute-class-manifest": (
-        "#2540: needs a ComputeClass cluster without default ComputeClass and with "
-        "an untargeted workload (untargeted-worker) in each pool project, so 3.24's "
-        "finding on the planted workload is verifiable"
-    ),
     "cluster-agent-stalled-controller-diagnosis": (
         "#1873: needs the stalled-controller role applied to every pool "
         "project; fixture defined in #1893, waiting on fleet re-apply and pool "

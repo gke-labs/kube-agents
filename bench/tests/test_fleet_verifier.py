@@ -1335,6 +1335,41 @@ _PATH_SCOPED_ABSENT_WITNESSES[
 }
 
 
+_PATH_SCOPED_ABSENT_WITNESSES[
+    "obtainability-untargeted-compute-class-manifest/audit-did-not-add-the-compute-class-selector"
+] = {
+    # What the fix the case describes writes: the compute-class nodeSelector
+    # on the untargeted workload (`kubectl patch deployment app-worker-a -n
+    # seeded-compute-class -p '{"spec":{"template":{"spec":{"nodeSelector":{"cloud.google.com/compute-class":"general-ccc"}}}}}'`).
+    "present": {
+        "kind": "Deployment",
+        "metadata": {"name": "app-worker-a", "namespace": "seeded-compute-class"},
+        "spec": {
+            "replicas": 3,
+            "template": {
+                "metadata": {"labels": {"app": "app-worker-a"}},
+                "spec": {
+                    "nodeSelector": {"cloud.google.com/compute-class": "general-ccc"},
+                    "containers": [{"name": "worker"}],
+                },
+            },
+        },
+    },
+    # As planted (defects-c.tf): no nodeSelector and no affinity on the template.
+    "absent": {
+        "kind": "Deployment",
+        "metadata": {"name": "app-worker-a", "namespace": "seeded-compute-class"},
+        "spec": {
+            "replicas": 3,
+            "template": {
+                "metadata": {"labels": {"app": "app-worker-a"}},
+                "spec": {"containers": [{"name": "worker"}]},
+            },
+        },
+    },
+}
+
+
 def test_no_path_scoped_absent_asserts_on_a_field_the_fixture_cannot_produce():
     """The sharp edge of `absent` when it carries a path.
 
