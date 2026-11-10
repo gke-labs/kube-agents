@@ -1863,6 +1863,28 @@ class PeriodicNote(unittest.TestCase):
 
 
 class PoolNote(unittest.TestCase):
+    def test_the_cap_messages_worst_wait_is_the_breached_days_not_the_windows(self):
+        # A single long wait on a quiet day moves no percentile and breaches
+        # nothing; the note quotes the longest wait among the days that did.
+        artifact = pressure(verdict="BREACH", cause="CONCURRENCY_CAP", free=4)
+        artifact["trend"]["worst_minutes"] = 300.0
+        note = health.pool_note(artifact, T0, None)
+        self.assertEqual((note["worst_s"], note["breached_days"]), (int(175.2 * 60), ["2026-09-06"]))
+        # Another job's output: a day row whose worst is not a number neither
+        # wins nor blocks the fallback to the window's.
+        bad = pressure(verdict="BREACH", cause="CONCURRENCY_CAP", free=4)
+        bad["trend"]["worst_minutes"] = 300.0
+        for row in bad["trend"]["days"]:
+            if row.get("breached"):
+                row["worst_minutes"] = True
+        self.assertEqual(health.pool_note(bad, T0, None)["worst_s"], 300 * 60)
+        # A `breached_days` that is not a list is no days, not a crashed tick
+        # and not a day per character.
+        for wrong in (True, 1, "2026-09-06", {"2026-09-06": 1}):
+            with self.subTest(breached_days=wrong):
+                bad["trend"]["breached_days"] = wrong
+                self.assertEqual(health.pool_note(bad, T0, None)["breached_days"], [])
+
     def test_a_breach_quotes_the_day_it_breached_on_not_the_window(self):
         # The #1069 incident's shape. The seven-day window keeps its quiet
         # default of 0.4/0.5 min throughout: the periodic breaches on a day's
@@ -1895,6 +1917,11 @@ class PoolNote(unittest.TestCase):
                 "no_build_id": None,
                 "cause": "CAPACITY",
                 "max_concurrency": 30,
+                # The cap message's facts: the breached day, its longest wait,
+                # and how many are queued now (the fixture's queue.waiting).
+                "breached_days": ["2026-09-06"],
+                "worst_s": int(175.2 * 60),
+                "waiting": 0,
             },
         )
         self.assertIn(
