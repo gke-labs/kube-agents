@@ -4956,7 +4956,7 @@ metadata:
     app.kubernetes.io/name: platform-agent
     app.kubernetes.io/part-of: a2a-next
     kubeagents.x-k8s.io/a2a-component: provision
-  name: platformagent-a2a-provision-da0418fb
+  name: platformagent-a2a-provision-0e62f5d7
   namespace: kubeagents-system
   ownerReferences:
     - apiVersion: kubeagents.x-k8s.io/v1alpha1
@@ -5387,9 +5387,10 @@ spec:
               delegations and spawning session pods while relaying no events, the\" >&2\n
               \ echo \"     bridge dispatches nothing, and the CR reads Ready over both.
               Session pods\" >&2\n  echo \"     recover by themselves, which hides it
-              rather than helping.\" >&2\n  echo \"     A client restarted before TASKS
-              and its two durables are back waits for them\" >&2\n  echo \"     and binds
-              once this Job has made them, so restarting early costs nothing.\" >&2\n
+              rather than helping.\" >&2\n  echo \"     The gateway, restarted early,
+              waits for TASKS and its durable and binds once this\" >&2\n  echo \"     Job
+              has made them. The bridge can restart in a loop until TASKS is back, so
+              restart\" >&2\n  echo \"     its workload after the stream is back.\" >&2\n
               \ # Exit 2, and the convention it establishes: 2 means \"this will fail
               the\n  # same way next time\", anything else is worth retrying. The Job's\n
               \ # podFailurePolicy matches on 2 and fails the Job from the first pod\n

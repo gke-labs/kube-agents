@@ -304,7 +304,7 @@ func TestTheFixedTasksDurablesOnARealServer(t *testing.T) {
 	if v := log.publishViolations("provision"); len(v) != 0 {
 		t.Fatalf("pre-creating the durables tripped %d publish violations for provision:\n%s", len(v), strings.Join(v, "\n"))
 	}
-	// A re-run is info and nothing else.
+	// A re-run brings both to the same settings again and changes nothing.
 	a2aPreCreateLikeTheProvisionJob(t, s.ClientURL(), log)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)

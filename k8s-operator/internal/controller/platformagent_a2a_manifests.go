@@ -3677,8 +3677,9 @@ if [ "${live_consumers}" != "-1" ] && [ "${live_consumers}" -lt "${required_cons
   echo "     accepting delegations and spawning session pods while relaying no events, the" >&2
   echo "     bridge dispatches nothing, and the CR reads Ready over both. Session pods" >&2
   echo "     recover by themselves, which hides it rather than helping." >&2
-  echo "     A client restarted before TASKS and its two durables are back waits for them" >&2
-  echo "     and binds once this Job has made them, so restarting early costs nothing." >&2
+  echo "     The gateway, restarted early, waits for TASKS and its durable and binds once this" >&2
+  echo "     Job has made them. The bridge can restart in a loop until TASKS is back, so restart" >&2
+  echo "     its workload after the stream is back." >&2
   # Exit 2, and the convention it establishes: 2 means "this will fail the
   # same way next time", anything else is worth retrying. The Job's
   # podFailurePolicy matches on 2 and fails the Job from the first pod
@@ -4883,7 +4884,7 @@ func a2aProvisionRefusalStatus(agent *agentv1alpha1.PlatformAgent) string {
 		}
 	}
 	return fmt.Sprintf(
-		" That reason means the script exited 2, the refusal a re-run reaches again: a TASKS stream holding fewer consumers than %s. max_consumers cannot be widened in place — nats-server refuses that edit on a stream that exists — so %s and let provisioning recreate it at %d, which discards the task history it is holding. The pod log has what the stream actually holds, and therefore %s. %s Deleting the stream does not — nothing re-reads the bus until the Job runs again. Delete the Job to re-run it now, or leave it and the 24h TTL will; then, once TASKS is back, restart the clients that held a durable consumer on it: kubectl rollout restart deployment/%s -n %s, and the agent workload %s-gateway with it where a Hermes bridge sidecar runs. Deleting a stream deletes its consumers and neither client re-creates one, so skipping that leaves a gateway accepting delegations and spawning session pods while relaying no events, and a CR reading Ready over it. A gateway or bridge restarted before the stream is back waits for it and for its durable, which provisioning creates with the stream, and binds once both exist.",
+		" That reason means the script exited 2, the refusal a re-run reaches again: a TASKS stream holding fewer consumers than %s. max_consumers cannot be widened in place — nats-server refuses that edit on a stream that exists — so %s and let provisioning recreate it at %d, which discards the task history it is holding. The pod log has what the stream actually holds, and therefore %s. %s Deleting the stream does not — nothing re-reads the bus until the Job runs again. Delete the Job to re-run it now, or leave it and the 24h TTL will; then, once TASKS is back, restart the clients that held a durable consumer on it: kubectl rollout restart deployment/%s -n %s, and the agent workload %s-gateway with it where a Hermes bridge sidecar runs. Deleting a stream deletes its consumers and neither client re-creates one, so skipping that leaves a gateway accepting delegations and spawning session pods while relaying no events, and a CR reading Ready over it. A gateway restarted before the stream is back waits for it and for its durable, which provisioning creates with the stream, and binds once both exist; a bridge restarted early can restart in a loop until the stream is back, so restart its workload after the stream is back.",
 		need, ways, a2aTasksMaxConsumers(agent), fits, finish,
 		a2aGatewayName(agent), agent.Namespace, agent.Name)
 }
