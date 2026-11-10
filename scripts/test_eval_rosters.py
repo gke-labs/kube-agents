@@ -1563,7 +1563,10 @@ def roster_comment_lines(text: str):
     for number, raw in enumerate(text.splitlines(), start=1):
         if "#" not in raw:
             continue
-        if eval_rosters.PART_MARKER_RE.match(raw) or raw.startswith(eval_rosters.NIGHTLY_SORTED_SECTION_MARKER):
+        # Section markers are not comments about a case. The certification
+        # suite's `# part N` file is gone (membership is the task file), so the
+        # nightly's sorted-section marker is the only one left.
+        if raw.startswith(eval_rosters.NIGHTLY_SORTED_SECTION_MARKER):
             continue
         yield number, raw.split("#", 1)[1]
 
