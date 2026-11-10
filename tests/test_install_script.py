@@ -1306,15 +1306,18 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
                 proc.stdout,
                 proc.stdout + proc.stderr,
             )
-            # Typing github.com at option 2 drops an exported CA file and Secret name
-            # even when the CA prompt default accepted the exported file.
-            proc = self._ask_gitops_forge(
-                ["2"],
-                ["github.com", ""],
-                preset=ca_refusal_preset,
-            )
-            self.assertEqual(proc.returncode, 0, proc.stderr)
-            self.assertIn("DECLINED=false FORGE=github HOST=[] CA=[] MENUS=1 READS=2 SECRET=[]", proc.stdout)
+            # Typing a github.com spelling at option 2 drops an exported CA file and Secret name
+            # without prompting for a CA file (since github.com uses public CAs).
+            for g_host in ("github.com", "www.github.com", "ssh.github.com"):
+                with self.subTest(g_host):
+                    proc = self._ask_gitops_forge(
+                        ["2"],
+                        [g_host],
+                        preset=ca_refusal_preset,
+                    )
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertIn("DECLINED=false FORGE=github HOST=[] CA=[] MENUS=1 READS=1 SECRET=[]", proc.stdout)
+                    self.assertNotIn("PEM CA file", proc.stdout)
             # On a first install with GITOPS_HOST exported and --gitops-ca-file
             # given, the early flag check derives the CA Secret's name before
             # the menu. No repository drops the name with the file: nothing
