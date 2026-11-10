@@ -348,6 +348,56 @@ def base_answer(target: Target) -> dict:
     return answer
 
 
+def read_target(
+    target: Target,
+    spec: Recheck,
+    *,
+    run: Callable | None = None,
+    kubeconfig: str = "",
+    kube_context: str = "",
+    scope=None,
+) -> tuple[dict | None, str, str]:
+    """`(dump, command, reason)`: `spec.kinds` in the finding's namespace, read
+    from the finding's own cluster under the rules `recheck` documents.
+
+    `dump` is None when nothing was read or the read failed its gate, and
+    `reason` then says why; `command` is the read as run, or "" when it never
+    ran. Shared with `pdb_safety`, which reads the same namespace before a
+    budget's pull request opens.
+    """
+    parts = cluster_parts(target.cluster)
+    if parts is None:
+        return None, "", f"{target.cluster!r} is not <project>/<location>/<name>, so no cluster can be read for it"
+    project, location, name = parts
+    if scope is None:
+        scope = collect.fleet_scope_args.DeclaredScope()
+        scope.set(None, None)
+    refusal = scope_refusal(scope, project, location, name)
+    if refusal:
+        return None, "", f"{refusal}; nothing was read"
+    expected = GKE_CONTEXT_FORMAT.format(project=project, location=location, name=name)
+    if kube_context and kube_context != expected:
+        return None, "", (
+            f"the context {kube_context!r} does not name the finding's cluster (expected {expected!r}), "
+            "so nothing was read"
+        )
+    if not kube_context and not kubeconfig:
+        fetched, cred_run = collect.fetch_credentials(project, name, location, run=run or collect.default_run)
+        if cred_run.rc != 0:
+            stderr = " ".join((cred_run.stderr or "").split())[: collect.ERROR_EXCERPT_CHARS] or "no stderr"
+            return None, "", f"get-credentials for {target.cluster} failed (rc={cred_run.rc}: {stderr}), so nothing was read"
+        kubeconfig = str(fetched)
+    argv = read_argv(spec, target.namespace, expected)
+    command = (f"KUBECONFIG={kubeconfig} " if kubeconfig else "") + shlex.join(argv)
+    env = {**os.environ, "KUBECONFIG": kubeconfig} if kubeconfig else dict(os.environ)
+    result = (run or collect.default_run)(argv, env=env, timeout=READ_TIMEOUT_S)
+    dump = _gate(result)
+    if dump is None:
+        stderr = " ".join((result.stderr or "").split())[: collect.ERROR_EXCERPT_CHARS] or "no stderr"
+        return None, command, f"the read failed its gate (rc={result.rc}: {stderr}), so nothing was judged"
+    return dump, command, ""
+
+
 def recheck(
     target: Target,
     *,
@@ -383,41 +433,13 @@ def recheck(
         return unchecked(
             f"no on-demand re-check is registered for {target.check!r} (registered: {', '.join(sorted(RECHECKS))})"
         )
-    parts = cluster_parts(target.cluster)
-    if parts is None:
-        return unchecked(f"{target.cluster!r} is not <project>/<location>/<name>, so no cluster can be read for it")
-    project, location, name = parts
-    if scope is None:
-        scope = collect.fleet_scope_args.DeclaredScope()
-        scope.set(None, None)
-    refusal = scope_refusal(scope, project, location, name)
-    if refusal:
-        return unchecked(f"{refusal}; nothing was read")
-    expected = GKE_CONTEXT_FORMAT.format(project=project, location=location, name=name)
-    if kube_context and kube_context != expected:
-        return unchecked(
-            f"the context {kube_context!r} does not name the finding's cluster (expected {expected!r}), "
-            "so nothing was read"
-        )
-    if not kube_context and not kubeconfig:
-        fetched, cred_run = collect.fetch_credentials(project, name, location, run=run or collect.default_run)
-        if cred_run.rc != 0:
-            stderr = " ".join((cred_run.stderr or "").split())[: collect.ERROR_EXCERPT_CHARS] or "no stderr"
-            return unchecked(f"get-credentials for {target.cluster} failed (rc={cred_run.rc}: {stderr}), so nothing was read")
-        kubeconfig = str(fetched)
-    argv = read_argv(spec, target.namespace, expected)
-    answer["command"] = (f"KUBECONFIG={kubeconfig} " if kubeconfig else "") + shlex.join(argv)
-    env = {**os.environ, "KUBECONFIG": kubeconfig} if kubeconfig else dict(os.environ)
-    result = (run or collect.default_run)(argv, env=env, timeout=READ_TIMEOUT_S)
-    dump = _gate(result)
+    dump, command, reason = read_target(
+        target, spec, run=run, kubeconfig=kubeconfig, kube_context=kube_context, scope=scope
+    )
+    if command:
+        answer["command"] = command
     if dump is None:
-        stderr = " ".join((result.stderr or "").split())[: collect.ERROR_EXCERPT_CHARS] or "no stderr"
-        return {
-            **answer,
-            "outcome": OUTCOME_UNCHECKED,
-            "evidence": [],
-            "reason": f"the read failed its gate (rc={result.rc}: {stderr}), so nothing was judged",
-        }
+        return unchecked(reason)
     verdict, notes = judge(spec, target, dump)
     answer.update(notes)
     answer.update({"outcome": verdict.outcome, "evidence": verdict.evidence})
