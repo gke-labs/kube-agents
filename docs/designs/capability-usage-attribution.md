@@ -18,9 +18,10 @@ Use is not even over time. The first-run flow of a new install and the weekly au
 heavy load. A normal weekday makes a light load. The report therefore measures two windows of one
 test run:
 
-- the burst window: the first 4 hours after the install starts. The first-run flow and every
-  audit run once.
-- the soak window: the next 8 hours, with the normal daily work.
+- the burst window: about 1 hour from the install's start. The first-run flow and every audit
+  run once.
+- the soak window: the next 1 hour. The watchers run, and a few scripted chat questions are
+  asked.
 
 The test run is the nightly run on the sized test fleet, which the sized test fleet design
 describes. This design adds the measurement to that run.
@@ -151,30 +152,31 @@ line does not apply.
 
 ## The two windows
 
-The windows come from the sized test fleet's run: it starts at 20:30 UTC and never on Sunday, so
-each window holds the same work every night.
+The windows come from the sized test fleet's run. It starts at 00:00 UTC and ends before the first
+scheduled audit of the day, so each window holds the same work every night.
 
-| Window | Time after the install starts | Holds                                                                                                      |
-| ------ | ----------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| Burst  | 0 to 4 h                      | The first-run flow, and beside it every other audit once on a 30-minute stagger, the weekly ones included. |
-| Soak   | 4 to 12 h                     | The script watchers on their schedules, one set of daily audits, the event watcher, the churn.             |
+| Window | Length                                                       | Holds                                                                                                |
+| ------ | ------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------- |
+| Burst  | 1 hour nominal: until the last audit ends, from 1 to 3 hours | The first-run flow, and beside it the other audits on a 5-minute stagger, the weekly ones included.  |
+| Soak   | 1 hour, after the burst window                               | The script watchers on their schedules, the event watcher, the churn, three scripted chat questions. |
 
 Each window reports its own totals, its rate an hour and its peaks.
 
 ## The monthly estimate
 
-Scaling a window by hours would count the first-run flow every 4 hours. The estimate instead
+Scaling a window by hours would count the first-run flow every hour. The estimate instead
 counts each capability's runs in a month, from its cron expression: a daily job about 30.4 runs, a
 weekly one about 4.3, an hourly one 730, one every 30 minutes 1,460, one every 10 minutes 4,380, a
 weekday job about 21.7.
 
-- **A scheduled capability:** its use a run, times its runs a month. A daily audit's use comes from
-  its soak-window run. A weekly audit's only run is in the burst window, beside the first-run
-  flow, and the install's state is reset each night, so it is a first run, which reads every
-  cluster as new. The estimate marks those rows as first-run figures until a run without the
-  reset measures a typical weekly run.
+- **A scheduled capability:** its use a run, times its runs a month. Each audit's run is in the
+  burst window, and the install's state is reset each night, so every audit run is a first run,
+  which reads every cluster as new. The estimate marks the audit rows as first-run figures until a
+  run without the reset measures typical runs. A watcher's use a run comes from its runs in the
+  soak window.
 - **An event or chat capability:** its rate an hour in the soak window, times 730 hours. The
-  nightly run has no human chat, so this row is a floor; the report says so.
+  chat rate comes from the three scripted questions, not from people, so the report marks the chat
+  row as a scripted load.
 - **The first-run flow:** once an install, a line of its own, outside the monthly total.
 - **The platform base:** its memory, times 730 hours.
 
@@ -222,10 +224,11 @@ Each item is its own pull request, after this design merges and the sized test f
 
 ## Open questions
 
-- **Chat load.** The nightly has no human chat. A scripted chat load in the soak window would give
-  the chat row a measured rate instead of a floor.
-- **Typical weekly runs.** A weekly run without the nightly reset would replace the first-run
-  figures of the weekly audits.
+- **Chat load.** Three scripted questions an hour are a guess at an install's chat traffic. The
+  number of questions in the soak window is one setting, and real installs' chat rates would set
+  it better.
+- **Typical runs.** A weekly run without the nightly reset would replace the first-run figures of
+  the audits.
 - **Retention.** Whether the per-capability series stay on in production installs, so a user can
   see the same table for their own install. The install-level counters of
   [`usage-counters-producer.md`](usage-counters-producer.md) are the place such a series would
