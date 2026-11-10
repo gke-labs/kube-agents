@@ -2865,6 +2865,81 @@ class CollectClusterTest(unittest.TestCase):
         self.assertEqual([c for c in entry["candidates"] if c["check"] == "ccc-no-ondemand-floor"], [])
 
 
+class NodePoolsFromTheDiscoveryListingTest(unittest.TestCase):
+    """single-zone-nodepool takes the pools from the `clusters list` item that
+    discovered the cluster, recorded against that listing's command, and runs
+    its own `node-pools list` only when the item carries none (#4081)."""
+
+    CLUSTER = CollectClusterTest.CLUSTER
+    AUTOPILOT_NODE_POOLS_ERROR = CollectClusterTest.AUTOPILOT_NODE_POOLS_ERROR
+    run_with = CollectClusterTest.run_with
+    issued_node_pools_read = CollectClusterTest.issued_node_pools_read
+
+    POOL = {"name": "p1", "locations": ["us-central1-a"], "autoscaling": {"enabled": True, "maxNodeCount": 10}, "config": {"machineType": "e2-standard-4"}}
+    LIVE = [node(f"n{i}", "p1") for i in range(10)]
+
+    def listed(self, **extra):
+        """The running cluster `enumerate_clusters` builds from one item, and the listing argv."""
+        issued = []
+        item = {"name": "prod-usc1", "location": "us-central1", "status": "RUNNING", **extra}
+
+        def run(argv, **kwargs):
+            issued.append(list(argv))
+            return run_of(0, json.dumps([item]))
+
+        (cluster,), _ = fs.enumerate_clusters("acme", run=run)
+        (listing_argv,) = issued
+        return cluster, listing_argv
+
+    def test_the_listing_projects_node_pools_and_nothing_more(self):
+        _, argv = self.listed()
+        projection = argv[argv.index("--format") + 1]
+        self.assertEqual(
+            projection,
+            "json(name,location,locations,status,currentMasterVersion,autopilot.enabled,"
+            "autoscaling.enableNodeAutoprovisioning,autoscaling.autoprovisioningLocations,"
+            "addonsConfig.configConnectorConfig.enabled,nodePools)",
+        )
+        self.assertNotIn("masterauth", " ".join(argv).lower())
+
+    def test_listed_pools_replace_the_node_pools_read(self):
+        cluster, listing_argv = self.listed(nodePools=[self.POOL])
+        # The fake's own `node-pools list` answers no pools, so a candidate
+        # can only come from the listing.
+        entry = self.run_with(dump_items=self.LIVE, pools=(), cluster=cluster)
+        self.assertEqual(self.issued_node_pools_read(), [])
+        self.assertIn("NodePool/p1", {c["object"] for c in entry["candidates"] if c["check"] == "single-zone-nodepool"})
+        record = next(c for c in entry["commands"] if c["check"] == "single-zone-nodepool")
+        self.assertEqual(record["command"], shlex.join(listing_argv))
+        self.assertEqual((record["rc"], record["duration_s"]), (0, 0))
+        self.assertEqual(record["output_sha256"], fs.output_digest(json.dumps([self.POOL], sort_keys=True)))
+        self.assertNotIn(fs.collector_run.LISTED_NODE_POOLS_KEY, json.dumps(entry))
+
+    def test_an_empty_listed_list_is_a_cluster_with_no_pools(self):
+        cluster, _ = self.listed(nodePools=[])
+        entry = self.run_with(dump_items=self.LIVE, pools=[self.POOL], cluster=cluster)
+        self.assertEqual(self.issued_node_pools_read(), [])
+        self.assertIn("single-zone-nodepool", {c["check"] for c in entry["commands"]})
+        self.assertNotIn("single-zone-nodepool", {c["check"] for c in entry["candidates"]})
+
+    def test_a_listing_without_pools_falls_back_to_the_node_pools_read(self):
+        for extra in ({}, {"nodePools": {"not": "a list"}}):
+            with self.subTest(extra=extra):
+                cluster, _ = self.listed(**extra)
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    entry = self.run_with(dump_items=self.LIVE, pools=[self.POOL], cluster=cluster)
+                expected = [
+                    "gcloud", "container", "node-pools", "list", "--cluster", "prod-usc1", "--location", "us-central1",
+                    "--project", "acme", "--format", "json",
+                ]
+                self.assertEqual(self.issued_node_pools_read(), [expected])
+                record = next(c for c in entry["commands"] if c["check"] == "single-zone-nodepool")
+                self.assertEqual(record["command"], shlex.join(expected))
+                self.assertIn("NodePool/p1", {c["object"] for c in entry["candidates"]})
+                self.assertIn("reading node-pools list", stderr.getvalue())
+
+
 class StockoutExclusionHelpersTest(unittest.TestCase):
     def test_non_production_reads_name_tokens_not_substrings(self):
         self.assertTrue(fs.is_non_production("api-dev"))

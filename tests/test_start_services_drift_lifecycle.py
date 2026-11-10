@@ -106,6 +106,14 @@ _LONG_DRAIN_SECONDS = 20
 # two apart, and inside _DRAIN_CEILING_SECONDS.
 _BROKER_RUNTIME_DRAIN_SECONDS = 5
 
+# The exec role's runtime budget in the same test: at _DRAIN_CEILING_SECONDS, so
+# a broker that waited it fails the broker row's ceiling, and its floor sits
+# above the broker's budget, so an exec pod that waited the broker's fails. Its
+# ceiling allows the broker row's slack past the budget, inside _run_bash's
+# timeout.
+_EXEC_RUNTIME_DRAIN_SECONDS = 8
+_EXEC_DRAIN_CEILING_SECONDS = 11.0
+
 # How long to give bash to reap a supervisor the drain has just killed. The wait
 # is what makes the check deterministic: SIGKILL is delivered synchronously but
 # the reap that makes `kill -0` fail is a SIGCHLD the shell handles when it next
@@ -259,6 +267,7 @@ class TerminateShutsTheProcessDownRatherThanJustSignallingIt(_ScriptCase):
         runtime_drain: int = _SHORT_DRAIN_SECONDS,
         role: str = "combined",
         broker_runtime_drain: int = _LONG_DRAIN_SECONDS,
+        exec_runtime_drain: int = _LONG_DRAIN_SECONDS,
     ) -> str:
         """The shipped drain functions, wired to a fake supervisor.
 
@@ -271,6 +280,7 @@ class TerminateShutsTheProcessDownRatherThanJustSignallingIt(_ScriptCase):
         readonly SHUTDOWN_DRAIN_POLL_SECONDS=1
         readonly RUNTIME_DRAIN_SECONDS={runtime_drain}
         readonly BROKER_RUNTIME_DRAIN_SECONDS={broker_runtime_drain}
+        readonly EXEC_RUNTIME_DRAIN_SECONDS={exec_runtime_drain}
         CREDENTIAL_PROXY_ROLE={role}
         {self.lift("drain_supervised")}
         {self.lift("wait_for_exit")}
@@ -525,15 +535,15 @@ class TerminateShutsTheProcessDownRatherThanJustSignallingIt(_ScriptCase):
                 "than RUNTIME_DRAIN_SECONDS",
             )
 
-    def test_the_broker_and_exec_roles_wait_on_their_own_longer_budget(self) -> None:
+    def test_the_broker_and_exec_roles_wait_on_their_own_longer_budgets(self) -> None:
         """The standalone broker and the exec tier's pods drain their requests in
-        flight on SIGTERM, so their runtime gets BROKER_RUNTIME_DRAIN_SECONDS; the
-        sidecar roles keep RUNTIME_DRAIN_SECONDS, which their pods' grace periods
-        hold.
+        flight on SIGTERM, so their runtime gets BROKER_RUNTIME_DRAIN_SECONDS or,
+        for the exec role's longer drain, EXEC_RUNTIME_DRAIN_SECONDS; the sidecar
+        roles keep RUNTIME_DRAIN_SECONDS, which their pods' grace periods hold.
         """
         for role, floor, ceiling in (
             ("broker", _BROKER_RUNTIME_DRAIN_SECONDS - 1, _DRAIN_CEILING_SECONDS),
-            ("exec", _BROKER_RUNTIME_DRAIN_SECONDS - 1, _DRAIN_CEILING_SECONDS),
+            ("exec", _EXEC_RUNTIME_DRAIN_SECONDS - 1, _EXEC_DRAIN_CEILING_SECONDS),
             ("combined", 0, _BROKER_RUNTIME_DRAIN_SECONDS - 1),
         ):
             with self.subTest(role=role), tempfile.TemporaryDirectory() as tmp:
@@ -554,6 +564,7 @@ class TerminateShutsTheProcessDownRatherThanJustSignallingIt(_ScriptCase):
                     result = _run_bash(self._harness(
                         body, runtime_drain=_SHORT_DRAIN_SECONDS, role=role,
                         broker_runtime_drain=_BROKER_RUNTIME_DRAIN_SECONDS,
+                        exec_runtime_drain=_EXEC_RUNTIME_DRAIN_SECONDS,
                     ))
                     elapsed = time.monotonic() - started
                 finally:
@@ -1207,12 +1218,19 @@ def _watcher_values_passed(watcher: str) -> set[str]:
     The command runs from the binary's path to the `|| true` that ends it, and
     every WATCHER_* token inside it counts, however it is quoted, prefixed or
     nested: `"${ROOT:-/opt}/${WATCHER_X}"` and `"${A:-${WATCHER_X}}"` are found
-    as surely as `"${WATCHER_X}"`. The lookbehind keeps EVENT_WATCHER_* out;
-    the supervisor's own WATCHER_* settings sit outside the command.
+    as surely as `"${WATCHER_X}"`. An array the command expands
+    (`"${args[@]}"`) counts with every value assigned to it in the function. The
+    lookbehind keeps EVENT_WATCHER_* out; the supervisor's own WATCHER_*
+    settings sit outside the command.
     """
     command = re.search(r"/usr/local/bin/k8s-event-watcher\b(.*?)\|\| true", watcher, re.S)
     assert command, "the watcher's command line was not found"
-    return set(re.findall(r"(?<![A-Z0-9_])WATCHER_[A-Z0-9_]+", command.group(1)))
+    text = command.group(1)
+    for array in re.findall(r'"\$\{(\w+)\[@\]\}"', text):
+        assignments = re.findall(rf"(?m)^\s*{array}=\((.*)\)$", watcher)
+        assert assignments, f"the array {array} the command expands is never assigned"
+        text += "\n".join(assignments)
+    return set(re.findall(r"(?<![A-Z0-9_])WATCHER_[A-Z0-9_]+", text))
 
 
 class TheWatchersDurationAndCountFlagsCannotStopItStarting(_ScriptCase):
@@ -1427,7 +1445,13 @@ class TheWatchersDurationAndCountFlagsCannotStopItStarting(_ScriptCase):
         covered = set(_WATCHER_DURATION_KNOBS) | set(_WATCHER_COUNT_KNOBS)
         self.assertEqual(
             set(),
-            passed - covered - {"WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD", "WATCHER_ALERT_EXCLUDE"},
+            passed
+            - covered
+            - {
+                "WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD",
+                "WATCHER_ALERT_EXCLUDE",
+                "WATCHER_ALERT_EXCLUDE_FILE",
+            },
             "a WATCHER_* value reaches the watcher without a normaliser",
         )
 
@@ -1441,6 +1465,37 @@ class TheWatchersDurationAndCountFlagsCannotStopItStarting(_ScriptCase):
             '--alert-exclude="${WATCHER_ALERT_EXCLUDE}"',
             self.lift("start_event_watcher"),
         )
+
+    def test_the_rules_file_replaces_the_list_when_it_is_named(self) -> None:
+        """The operator's mounted file, read again by the watcher, wins.
+
+        Only one flag is passed: the watcher refuses both. An older operator
+        names no file, so the list is passed as before.
+        """
+        self.assertIn('WATCHER_ALERT_EXCLUDE_FILE="${WATCHER_ALERT_EXCLUDE_FILE:-}"', self.text)
+        watcher = self.lift("start_event_watcher")
+        block = re.search(r"(?ms)^  alert_exclude_arg=.*?^  fi$", watcher)
+        self.assertIsNotNone(block, "the alert-exclude argument block was not found")
+        self.assertIn('"${alert_exclude_arg[@]}" || true', watcher)
+        rules = '[{"namespace": "payments"}]'
+        for file, want in (
+            ("", f"--alert-exclude={rules}"),
+            (
+                "/etc/kube-agents/event-watcher/rules.json",
+                "--alert-exclude-file=/etc/kube-agents/event-watcher/rules.json",
+            ),
+        ):
+            with self.subTest(file=file):
+                result = _run_bash(
+                    f"""
+                    set -u
+                    WATCHER_ALERT_EXCLUDE={shlex.quote(rules)}
+                    WATCHER_ALERT_EXCLUDE_FILE={shlex.quote(file)}
+                    {block.group(0)}
+                    printf "%s\\n" "${{alert_exclude_arg[@]}}"
+                    """
+                )
+                self.assertEqual(want + "\n", result.stdout)
 
 
 if __name__ == "__main__":

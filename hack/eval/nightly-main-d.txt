@@ -1,0 +1,14 @@
+# The stack-bearing cases of the nightly's main part that run in main-d.
+# Read with nightly-main-b.txt, whose header says how the shards are placed
+# and what scripts/test_ci_eval_nightly.py holds the lists to.
+#
+# Dealt on 2026-11-06 (#4238) by unit_cost_hint, largest first into the
+# shortest chain: 6600s here.
+autoops-controller-stall-triage
+autoops-missing-service-triage
+findings-decision-leaves-unnamed-open
+first-install-hello-running
+fleet-audit-unread-target-keeps-finding
+gitops-drift-noise-filtered-triage
+incident-triage-workload-fold
+triage-start-burst
