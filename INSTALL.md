@@ -298,7 +298,7 @@ Rules for the agent:
 
 When the GitOps repository is on Bitbucket Cloud (`bitbucket.org`) or on a Bitbucket Data Center
 instance, use the Bitbucket flags in place of the GitHub App flags. Bitbucket support starts in
-release 0.25.0. Use 0.25.0 or a later release as `<RELEASE_VERSION>`. A Bitbucket install has no
+release 0.28.0. Use 0.28.0 or a later release as `<RELEASE_VERSION>`. A Bitbucket install has no
 GitHub App and no token minter. The installer refuses `--github-app-id` and `--github-pem-path` with
 a Bitbucket forge. The Go and Cloud KMS prerequisites of the PEM import do not apply.
 
