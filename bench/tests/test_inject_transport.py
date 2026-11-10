@@ -4377,6 +4377,29 @@ def test_a_door_without_the_addressees_field_reads_as_cannot_say(stub_gateway: _
     assert snap is not None and snap.child_addressees is None
 
 
+def test_the_addressees_a_poll_carried_survive_a_read_after_the_terminal_that_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The door sends childAddressees on every read; a poll's copy is kept,
+    so the deadline or a transient error on the read after the terminal
+    doesn't lose whom the chain delegated to."""
+    task = inject.InjectTask(base_url="http://127.0.0.1:1", conversation="c", prompt="p", token="t")
+    monkeypatch.setattr(inject, "POLL_PAUSE_SECONDS", 0.0)
+    monkeypatch.setattr(task, "_poll", lambda *args, **kwargs: {
+        "entries": completed_transcript("task-1", "done"),
+        "lastSeq": 6,
+        "probe": {"active": False, "taskId": "task-1", "final": True, "executorState": "completed",
+                  "childAddressees": ["tse"]},
+    })
+
+    def unavailable(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise inject.InjectUnavailable("the door is restarting")
+
+    monkeypatch.setattr(inject, "_request", unavailable)
+    exchange = task.await_terminal("task-1", deadline=time.monotonic() + 30)
+    assert exchange.fold.child_addressees == ["tse"]
+
+
 def test_the_addressees_field_parses_none_from_cannot_say() -> None:
     def parsed(value: Any) -> list[str] | None:
         probe = inject.Probe.from_body({"probe": {"active": False, "taskId": "t", "childAddressees": value}})

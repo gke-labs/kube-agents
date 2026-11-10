@@ -794,9 +794,10 @@ class Fold:
     usage: dict[str, int | None] | None = None
     child_usage: dict[str, int | None] | None = None
     usage_partial: bool = False
-    # Whom the chain delegated to, from the same read after the terminal
-    # (:data:`PROBE_CHILD_ADDRESSEES_KEY`); ``None`` until a read answers
-    # with it.
+    # Whom the chain delegated to (:data:`PROBE_CHILD_ADDRESSEES_KEY`), from
+    # the latest read about this task that carried it, the polls' included
+    # (:meth:`InjectTask._note`) and the read after the terminal last;
+    # ``None`` until a read answers with it.
     child_addressees: list[str] | None = None
     terminal: str = ""
     terminal_source: str = ""
@@ -1806,6 +1807,12 @@ class InjectTask:
                 adopted = True
             if probe.progress:
                 fold.progress = probe.progress
+            # The door sends it on every read, from the record, and a chain
+            # only grows, so the latest read about this task is the fullest:
+            # kept here so a run whose read after the terminal never lands
+            # (the deadline, a transient error) still has it.
+            if probe.child_addressees is not None:
+                fold.child_addressees = probe.child_addressees
         if probe.could_look and probe.concerns(task_id) and not probe.final and not fold.final:
             if probe.reached_working:
                 # The read shows the latest state; ``working`` may have come
