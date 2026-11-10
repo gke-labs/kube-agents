@@ -214,22 +214,26 @@ const (
 	// CPU-seconds at 5,000. The limits are sized for 2,000, the stated
 	// ceiling (about 1,000 clusters' profiles); past it the exporter nears
 	// its memory limit, and an OOM kill takes the container and so the pod's
-	// readiness. On an Autopilot cluster without Pod bursting the limit is
-	// rewritten to the request, so the ceiling there is lower: about 1,500
-	// consumers (about 750 clusters), from the measurements above with
-	// headroom under 96Mi, since GOMEMLIMIT sits above that limit and
-	// collects no earlier. The CPU request is the stack's floor, 50m,
-	// rather than what the exporter uses idle, so a namespace LimitRange
-	// that admits the bus's other containers admits this one: a refused
-	// sidecar would keep its server out of the bus.
+	// readiness. On an Autopilot cluster without Pod bursting the limits are
+	// rewritten to the requests, 50m and 96Mi; the loop derives GOMEMLIMIT
+	// from the real limit, and measured there the exporter peaked at 70Mi
+	// with 2,000 consumers (a scrape about 12s) and 78Mi with 3,000, where a
+	// scrape at 50m outlasts the 30s interval. So the ceiling holds there
+	// too, bound by CPU rather than memory.
+	// The CPU request is the stack's floor, 50m, rather than what the
+	// exporter uses idle, so a namespace LimitRange that admits the bus's
+	// other containers admits this one: a refused sidecar would keep its
+	// server out of the bus.
 	a2aNATSExporterCPURequest    = "50m"
 	a2aNATSExporterMemoryRequest = "96Mi"
 	a2aNATSExporterCPULimit      = "500m"
 	a2aNATSExporterMemoryLimit   = "192Mi"
 	// The Go runtime's soft limit, below the container's so the exporter
 	// collects garbage before the kernel kills the container (which the
-	// supervisor loop cannot survive). GOMEMLIMIT takes a byte count with an
-	// IEC suffix.
+	// supervisor loop cannot survive). The loop replaces it with 80% of the
+	// limit it reads from its cgroup (a2aNATSExporterSupervisor); this is
+	// the value where it can't read one, 80% of the rendered limit.
+	// GOMEMLIMIT takes a byte count with an IEC suffix.
 	a2aNATSExporterGoMemLimit = "160MiB"
 
 	a2aGatewayCPURequest    = "50m"
@@ -4974,8 +4978,21 @@ const a2aNATSExporterBinary = "/prometheus-nats-exporter"
 // PID 1, which gets no default signal handling: the trap kills the exporter
 // (or the pause) and exits at once on TERM or INT, so a pod delete or a
 // NATS drain is not held for the grace period. The image is alpine, so sh,
-// sleep and date are busybox's.
+// sleep, date and cat are busybox's.
+//
+// Before the first run it sets GOMEMLIMIT to 80% of the container's actual
+// memory limit, read from its cgroup. The rendered value assumes the
+// rendered limit, but an Autopilot cluster without Pod bursting rewrites the
+// limit to the request, and a GOMEMLIMIT above the real limit never makes
+// the runtime collect early. A limit that reads "max" (none) or can't be read
+// (a cgroup v1 node) keeps the rendered value.
 const a2aNATSExporterSupervisor = `trap 'kill -TERM "$pid" 2>/dev/null; exit 0' TERM INT
+max=$(cat /sys/fs/cgroup/memory.max 2>/dev/null)
+case "$max" in
+  '' | *[!0-9]*) ;;
+  *) GOMEMLIMIT=$((max / 5 * 4)) && export GOMEMLIMIT ;;
+esac
+echo "prometheus-nats-exporter GOMEMLIMIT=$GOMEMLIMIT" >&2
 delay=1
 while :; do
   started=$(date +%s)

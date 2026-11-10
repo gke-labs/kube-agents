@@ -201,6 +201,38 @@ func TestTheExporterSupervisorCapsAndResetsItsPause(t *testing.T) {
 	}
 }
 
+// The loop sets GOMEMLIMIT to 80% of the memory limit its cgroup reports,
+// and keeps the rendered value when the cgroup says "max" or can't be read.
+// A stand-in cat answers for /sys/fs/cgroup/memory.max.
+func TestTheExporterSupervisorDerivesGoMemLimitFromTheCgroup(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cat  string
+		want string
+	}{
+		{"a 96Mi limit (Autopilot without bursting)", "echo 100663296", "GOMEMLIMIT=80530636"},
+		{"the rendered 192Mi limit", "echo 201326592", "GOMEMLIMIT=161061272"},
+		{"no limit", "echo max", "GOMEMLIMIT=160MiB"},
+		{"no cgroup v2 file", "exit 1", "GOMEMLIMIT=160MiB"},
+		{"an empty read", "exit 0", "GOMEMLIMIT=160MiB"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("GOMEMLIMIT", a2aNATSExporterGoMemLimit)
+			stubs := t.TempDir()
+			writeScript(t, stubs, "cat", tc.cat)
+			_, out := startSupervisor(t, `echo "exporter saw GOMEMLIMIT=$GOMEMLIMIT"; exec sleep 60`, stubs)
+			waitForSupervisor(t, "the exporter to start", 5*time.Second, func() bool { return strings.Contains(out.String(), "exporter saw") })
+			log := out.String()
+			if !strings.Contains(log, "exporter saw "+tc.want+"\n") {
+				t.Errorf("exporter environment: want %s:\n%s", tc.want, log)
+			}
+			if !strings.Contains(log, "prometheus-nats-exporter "+tc.want+"\n") {
+				t.Errorf("the loop did not log %s:\n%s", tc.want, log)
+			}
+		})
+	}
+}
+
 // GOMEMLIMIT has to sit below the container's limit to do anything: at or
 // above it, the kernel kills the container before the runtime collects.
 func TestTheExporterGoMemLimitSitsBelowTheContainerLimit(t *testing.T) {

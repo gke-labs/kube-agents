@@ -4082,6 +4082,12 @@ spec:
             - -c
             - |-
               trap 'kill -TERM "$pid" 2>/dev/null; exit 0' TERM INT
+              max=$(cat /sys/fs/cgroup/memory.max 2>/dev/null)
+              case "$max" in
+                '' | *[!0-9]*) ;;
+                *) GOMEMLIMIT=$((max / 5 * 4)) && export GOMEMLIMIT ;;
+              esac
+              echo "prometheus-nats-exporter GOMEMLIMIT=$GOMEMLIMIT" >&2
               delay=1
               while :; do
                 started=$(date +%s)
