@@ -4,8 +4,8 @@ The exemption reads a row as shell words and removes only the pattern argument
 of a row that is one grep and nothing else. These pin the plain mentions it
 exempts, the rows from the regex exemption's review rounds that stay graded,
 and each shape it refuses: a pipe, a later command, a redirect other than
-``>`` to /dev/null, a comment, a substitution in the removed word, and a
-collapsed chain.
+``>`` to /dev/null, a comment, a substitution in the removed word, a
+collapsed chain, and a row that can read the removed pattern back (#5331).
 """
 
 from __future__ import annotations
@@ -158,6 +158,32 @@ def test_a_single_quoted_lookalike_of_a_substitution_is_exempt():
     for row in ("grep -rn '`inspect_repository.py open`' SKILL.md", f"grep -rn '$(echo {ROUTE})' SKILL.md"):
         passed, reason = _verdict(row)
         assert passed, reason
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        # A row that joined a typed `$_` line: `$_` reads the grep's last argument back.
+        pytest.param(f"grep -rq 'curl -s -X POST {URL}' SKILL.md $_", id="last-argument"),
+        pytest.param(f"grep -rq {URL} SKILL.md ${{_}}", id="last-argument-braced"),
+        # A pattern that assigns a variable as it expands, and a joined line that runs it.
+        pytest.param(f'grep "${{X:=curl -s -X POST {URL}}}" SKILL.md $X', id="assigning-expansion"),
+        pytest.param(f'grep "${{X=curl {URL}}}" SKILL.md', id="assigning-expansion-unset-only"),
+        # An arithmetic assignment is a substitution, which the exemption already refuses.
+        pytest.param(f"grep -rq $((N=1)){URL} SKILL.md", id="arithmetic-assignment"),
+    ],
+)
+def test_a_row_that_can_read_the_removed_pattern_back_is_graded_whole(row):
+    assert _without_grep_patterns(row) is None
+    passed, reason = _verdict(row)
+    assert not passed, reason
+
+
+def test_a_plain_expansion_or_a_lookalike_variable_stays_exempt():
+    # `${NAME}` and `${NAME:-…}` assign nothing, and `$_dir` is another variable.
+    for row in (f'grep -rn "${{HOME}}{ROUTE}" SKILL.md', f'grep -rn {ROUTE} "${{DIR:-.}}"', f"grep -rn {ROUTE} $_dir/SKILL.md"):
+        passed, reason = _verdict(row)
+        assert passed, (row, reason)
 
 
 def test_a_run_chained_behind_an_exempt_grep_meets_the_required_run():

@@ -84,9 +84,11 @@
 #     3`: the value is read as the pattern), or with a `2>&1` or
 #     `&>/dev/null` trailer, which a typed card keeps.
 #   - A card log row joins a second typed line onto the grep with a space, so
-#     a second line that reads the removed pattern back from the shell (`$_`,
-#     or a variable the pattern set with `${X:=...}`) reads as a file operand
-#     and passes; the regex exemption this replaced had the same limit.
+#     a second line could read the removed pattern back from the shell. The
+#     grep is graded whole when its pattern assigns a variable as it expands
+#     (`${X:=...}`, `${X=...}`) or another word on the row reads the last
+#     argument (`$_`). A single-quoted lookalike of either is graded whole
+#     too, and another read-back (`declare -p`, `history`) is not seen.
 #   - The required run also reads each card's tagged call as typed, so a
 #     clone chained behind another command, or inside a shell heredoc
 #     (`bash <<'EOF' … clone … EOF`), is credited when the call reached the

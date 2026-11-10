@@ -101,6 +101,11 @@ _GREP_OUTPUT_SINK = "/dev/null"
 # typed line onto it with a space, so a comment there would hide that line from the grading.
 _COMMENT_CHAR = "#"
 _COLLAPSED_CHAIN_RE = re.compile(r"\s\+\s\d+\scommand(?:s|\(s\))?\s*$")
+# A pattern that assigns a variable as it expands (`${NAME=…}`, `${NAME:=…}`): a word the
+# rendering joined on from the next line can run it (`$NAME`).
+_ASSIGNING_EXPANSION_RE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*:?=")
+# A word that reads the last argument of the command before it back (`$_`, `${_}`, `${_:…}`).
+_LAST_ARGUMENT_RE = re.compile(r"\$(?:_(?![A-Za-z0-9_])|\{_(?![A-Za-z0-9_]))")
 
 
 def _read_shell_line(command: str) -> tuple[str, list[str], list[str]]:
@@ -455,5 +460,12 @@ def _without_grep_patterns(command: str) -> str | None:
         i += 1
     removed = set(patterns) if given else set(positionals[:1])
     if not removed:
+        return None
+    # A card log row joins the next typed line onto the grep, so a word after it can be a
+    # command that reads the removed word back: from a variable the pattern assigned, or as
+    # the last argument (`$_`). Such a row is graded whole (#5331).
+    if any(_ASSIGNING_EXPANSION_RE.search(words[k]) for k in removed):
+        return None
+    if any(_LAST_ARGUMENT_RE.search(word) for k, word in enumerate(words) if k and k not in removed):
         return None
     return " ".join(word for k, word in enumerate(words) if k not in removed)
