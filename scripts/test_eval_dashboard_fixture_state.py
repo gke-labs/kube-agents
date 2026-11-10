@@ -247,7 +247,11 @@ def _cluster_c():
     return {
         "currentMasterVersion": "1.34.1-gke.1",
         "createTime": _CREATED,
-        "nodePools": [{"name": "default-pool", "status": "RUNNING", "config": {"diskSizeGb": 50, "kubeletConfig": {"cpuCfsQuota": False}}}],
+        # Since the ComputeClass fixtures (defects-c.tf): the pool carries the
+        # class label, the NodeLocal DNSCache add-on is off (GKE omits the false
+        # boolean, so the block is empty), and node auto-provisioning is unset.
+        "nodePools": [{"name": "default-pool", "status": "RUNNING", "config": {"diskSizeGb": 50, "kubeletConfig": {"cpuCfsQuota": False}, "labels": {"cloud.google.com/compute-class": "general-ccc"}}}],
+        "addonsConfig": {"dnsCacheConfig": {}},
     }
 
 
@@ -284,6 +288,14 @@ def healthy_world(*projects):
         "kubectl": {
             "namespace/seeded-debug": {"metadata": {"name": "seeded-debug"}},
             "namespace/seeded-capacity": {"metadata": {"name": "seeded-capacity"}},
+            "namespace/seeded-compute-class": {"metadata": {"name": "seeded-compute-class"}},
+            # The ComputeClass fixtures on slot c (defects-c.tf): three running
+            # workloads, the class, and the labelled, untainted node.
+            "deployment/app-worker-a": {"status": {"readyReplicas": 3, "replicas": 3}, "spec": {"template": {"spec": {"containers": [{"resources": {"requests": {"cpu": "10m", "memory": "8Mi"}}}]}}}},
+            "deployment/app-worker-b": {"status": {"readyReplicas": 1, "replicas": 1}, "spec": {"template": {"spec": {"containers": [{"resources": {"requests": {"cpu": "10m", "memory": "8Mi"}}}]}}}},
+            "deployment/batch-worker-a": {"status": {"readyReplicas": 1, "replicas": 1}, "spec": {"template": {"spec": {"nodeSelector": {"cloud.google.com/compute-class": "general-ccc"}, "tolerations": [{"key": "cloud.google.com/compute-class", "value": "general-ccc", "effect": "NoSchedule"}], "containers": [{"resources": {"requests": {"cpu": "10m", "memory": "8Mi"}}}]}}}},
+            "computeclass/general-ccc": {"spec": {"priorities": [{"nodepools": ["default-pool"]}, {"machineFamily": "n4"}, {"machineFamily": "c3"}], "nodePoolAutoCreation": {"enabled": False}}},
+            "node?cloud.google.com/compute-class=general-ccc": {"items": [{"metadata": {"name": "gke-seeded-c-default-pool-4q2m", "labels": {"cloud.google.com/compute-class": "general-ccc"}}, "spec": {}, "status": {"conditions": [{"type": "Ready", "status": "True"}]}}]},
             "namespace/seeded-reliability": {"metadata": {"name": "seeded-reliability"}},
             "deployment/payments-api": {"status": {"readyReplicas": 0}},
             "pod?app=payments-api": _pods(_pod(restarts=3, last_reason="OOMKilled")),
@@ -561,10 +573,10 @@ class HealthyScan(ScanHarness):
         self.assertEqual(set(self.states(doc).values()), {"healthy"})
         self.assertEqual(set(self.states(doc)), set(self.roles))
         entry = doc["projects"][PROJECT]
-        self.assertEqual(entry["summary"], {"healthy": 41, "drifted": 0, "absent": 0, "not_checked": 0})
+        self.assertEqual(entry["summary"], {"healthy": 47, "drifted": 0, "absent": 0, "not_checked": 0})
         self.assertEqual(entry["reader"], "seeded-fleet-reader@kube-agents-evals-2.iam.gserviceaccount.com")
         self.assertNotIn("error", entry)
-        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "absent_projects": 0, "healthy": 41, "drifted": 0, "absent": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "absent_projects": 0, "healthy": 47, "drifted": 0, "absent": 0, "not_checked": 0})
         self.assertEqual(doc["previous"], {"scanned_at": None, "drifted": {}})
         self.assertEqual(err, "")
 
@@ -618,7 +630,7 @@ class Drift(ScanHarness):
         doc, _ = self.scan(world, projects=(PROJECT, OTHER))
         self.assertEqual(set(self.states(doc, PROJECT).values()), {"healthy"})
         self.assertEqual(self.states(doc, OTHER)["crashloop-workload"], "drifted")
-        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "absent_projects": 0, "healthy": 81, "drifted": 1, "absent": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "absent_projects": 0, "healthy": 93, "drifted": 1, "absent": 0, "not_checked": 0})
 
 
 class NotChecked(ScanHarness):
