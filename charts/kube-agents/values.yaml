@@ -1095,11 +1095,13 @@ platformAgent:
     # clusterName required), namespace, reason, kind and name (a trailing *
     # is a prefix), and matches when every part it sets matches; an event is
     # excluded when any rule matches. At most 64 rules. Empty omits the block.
-    # A change rolls the gateway pod. See spec.harness.eventWatcher in the
-    # PlatformAgent CRD reference. Removing the last rule through helm upgrade
-    # removes the CR's whole eventWatcher block, so an enabled: false set there
-    # with kubectl patch is lost too; set it again afterwards. The watcher's
-    # tuning settings are under platformAgent.deployment.eventWatcher.
+    # A change is in force within about two minutes, without a pod restart
+    # (at the next pod restart if the agent image is older than the operator).
+    # See spec.harness.eventWatcher in the PlatformAgent CRD reference.
+    # Removing the last rule through helm upgrade removes the CR's whole
+    # eventWatcher block, so an enabled: false set there with kubectl patch is
+    # lost too; set it again afterwards. The watcher's tuning settings are
+    # under platformAgent.deployment.eventWatcher.
     eventWatcher:
       alertExclude: []
         # - namespace: payments

@@ -999,10 +999,11 @@ gives each setting's meaning and default. Alert excludes are under
 incident, while their clusters stay in scope for reads. The list is forwarded to the CR's
 `spec.harness.eventWatcher.alertExclude` when it has a rule, and an empty list omits it. The schema
 holds the CRD's bounds (at most 64 rules, a length limit and a pattern on each part), so a rule the
-API server would refuse fails the render. A change rolls the agent pod. On an existing install,
-apply the chart's `crds/` first: against a CRD that predates the field, the chart fails the upgrade
-instead of letting the API server prune the rules. A `helm upgrade` that removes the last rule also
-removes an `enabled: false` set on the CR by hand. The
+API server would refuse fails the render. A change is in force within about two minutes, without a
+pod restart (at the next pod restart if the agent image is older than the operator). On an existing
+install, apply the chart's `crds/` first: against a CRD that predates the field, the chart fails the
+upgrade instead of letting the API server prune the rules. A `helm upgrade` that removes the last
+rule also removes an `enabled: false` set on the CR by hand. The
 [`spec.harness.eventWatcher` section of the CRD reference](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#specharnesseventwatcher)
 gives the rule parts, how they match, and an example.
 

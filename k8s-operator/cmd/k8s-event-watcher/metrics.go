@@ -145,9 +145,10 @@ type metrics struct {
 	fleetMaxClusterPods  prometheus.Gauge
 	fleetShapeClusters   *prometheus.GaugeVec
 	// alertExcludeRules is the number of alert-exclude rules in force, and
-	// alertExcludeRefused is 1 when --alert-exclude was refused and the
-	// watcher runs with none, which an alert can read where the ALERT log
-	// line cannot be. loadAlertExclude sets both once, at start.
+	// alertExcludeRefused is 1 when --alert-exclude, or the last change to
+	// --alert-exclude-file, was refused, which an alert can read where the
+	// ALERT log line cannot be. loadAlertExclude sets both at start, and
+	// reloadAlertExcludeFile again on each change to the file.
 	alertExcludeRules   prometheus.Gauge
 	alertExcludeRefused prometheus.Gauge
 }
@@ -297,11 +298,11 @@ func newMetrics() *metrics {
 		}),
 		alertExcludeRules: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "k8s_event_watcher_alert_exclude_rules",
-			Help: "Alert-exclude rules in force, from --alert-exclude: events they match open no incident. 0 with no rules and when the list was refused.",
+			Help: "Alert-exclude rules in force, from --alert-exclude or --alert-exclude-file: events they match open no incident. 0 with no rules and when the list at startup was refused.",
 		}),
 		alertExcludeRefused: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "k8s_event_watcher_alert_exclude_refused",
-			Help: "1 when --alert-exclude was refused as malformed, so the watcher runs with no alert-exclude rules and every event they would match opens an incident; 0 otherwise.",
+			Help: "1 when --alert-exclude, or the last change to --alert-exclude-file, was refused as malformed: the watcher runs with no rules, or with the file's rules from before that change. 0 otherwise.",
 		}),
 		fleetShapeClusters: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "k8s_event_watcher_fleet_shape_clusters",

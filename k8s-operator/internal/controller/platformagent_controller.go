@@ -1025,6 +1025,11 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	// The event watcher's alert-exclude rules. In no pod-template hash: the
+	// watcher reads the mounted file again, so a change rolls nothing.
+	if err := r.reconcileEventWatcherAlertExcludeConfigMap(ctx, instance); err != nil {
+		return ctrl.Result{}, err
+	}
 	// The gateway's annotation leaves out what only the broker reads, so a
 	// forge configuration change rolls the broker and not the gateway.
 	gatewayPolicyHash, err := getConfigMapHash(gatewayPolicyView(buildCredentialProxyPolicyConfigMap(instance)))
@@ -2637,6 +2642,14 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxyPolicyConfigMap(ctx co
 		return "", err
 	}
 	return getConfigMapHash(cm)
+}
+
+func (r *PlatformAgentReconciler) reconcileEventWatcherAlertExcludeConfigMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	cm := buildEventWatcherAlertExcludeConfigMap(agent)
+	if err := ctrl.SetControllerReference(agent, cm, r.Scheme); err != nil {
+		return err
+	}
+	return r.applyManaged(ctx, agent, cm)
 }
 
 func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, otlpEndpoint string, otlpDisabled bool) error {
