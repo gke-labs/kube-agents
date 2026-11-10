@@ -1066,3 +1066,32 @@ func TestSeenSecrets_JSONResultsShapePairsAreTracked(t *testing.T) {
 		}
 	}
 }
+
+// A JSON credential value that trimValueEdges would change (quotes around
+// it, a trailing full stop) is tracked in both forms, so an answer that
+// echoes either is redacted whole; a trimmed form that is a state word is
+// not tracked.
+func TestSeenSecrets_AnExactJSONValueAlsoTracksItsTrimmedForm(t *testing.T) {
+	const quoted, dotted = "synthpass-0005", "synthpass-0006."
+	var s seenSecrets
+	s.collectToolResult(terminalResult(t, `{"password": "\"`+quoted+`\"", "token": "`+dotted+`", "api_key": "disabled."}`))
+	for _, v := range []string{`"` + quoted + `"`, quoted, dotted, "synthpass-0006"} {
+		if !s.has(v) {
+			t.Errorf("the set does not track %q", v)
+		}
+	}
+	if s.has("disabled") {
+		t.Error("the set tracks a trimmed state word")
+	}
+	cases := map[string]string{
+		"It is " + quoted + " now":     "It is [redacted] now",
+		"It is \"" + quoted + "\" now": "It is [redacted] now",
+		"Rotate synthpass-0006 today":  "Rotate [redacted] today",
+		"Rotate synthpass-0006. Now.":  "Rotate [redacted] Now.",
+	}
+	for in, want := range cases {
+		if got := scrubAnswerText(in, &s); got != want {
+			t.Errorf("answer %q = %q, want %q", in, got, want)
+		}
+	}
+}

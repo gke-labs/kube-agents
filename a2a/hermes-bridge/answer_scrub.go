@@ -511,8 +511,17 @@ func (c *toolResultCollector) shapeCaught(v string) { c.trackShape(trimValueEdge
 
 // exactCaught tracks a value whose edges are already exact, a decoded JSON
 // string, as it is: trailing punctuation in it is its own, not a
-// sentence's (trackShape).
-func (c *toolResultCollector) exactCaught(v string) { c.trackShape(v) }
+// sentence's (trackShape). Where trimValueEdges would change it, the
+// trimmed form is tracked as well, unless it is a state word or an env
+// var reference (jsonValueNotASecret), for an answer that drops the
+// value's quotes or trailing punctuation; redact replaces the longest
+// match first, so the exact form still covers its own punctuation.
+func (c *toolResultCollector) exactCaught(v string) {
+	c.trackShape(v)
+	if tv := trimValueEdges(v); tv != v && !jsonValueNotASecret(tv) {
+		c.trackShape(tv)
+	}
+}
 
 // trackShape adds v to the shape-caught pool unless it holds a space (a
 // phrase, "14 bytes" or "denied for user ...", is not a credential to
