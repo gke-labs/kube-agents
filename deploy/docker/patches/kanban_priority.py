@@ -268,6 +268,21 @@ QUEUED_KIND = "queued"
 QUEUED_TEXT = "Queued: the system is busy. Your request will start when a worker frees up."
 QUEUED_MARKER = "⏳"
 
+#: The gateway log line written once per ``queued`` event: which card waited,
+#: how many user cards were ahead of it, and what held the slots at that
+#: moment. The saturation warning below only fires after ``_HEALTH_WINDOW``
+#: saturated ticks back to back and at most every WARN_INTERVAL_SECONDS, so a
+#: card queued during a short saturation left no line at all, and a report
+#: like gke-labs/kube-agents#3311 could not be read back from the logs.
+QUEUED_LOG = (
+    "kanban priority: %s queued (%d user card(s) ahead): %d/%d worker slots "
+    "busy (%d background, %d user: %s)"
+)
+#: The ``queued`` event payload key holding the ids of the running cards that
+#: held the slots (the first CARDS_SHOWN, oldest first), so the board keeps the
+#: record where the log may have rotated.
+HOLDERS_KEY = "holders"
+
 #: How many running cards the saturation warning names.
 CARDS_SHOWN = 5
 
@@ -658,11 +673,14 @@ def note_waiting(
         ]
         if not owed:
             return
+        sat = result.saturation
+        holders = [card.get("id") for card in sat.get("cards", ())]
         payload_base = {
             "note": QUEUED_TEXT,
-            "running": result.saturation["running"],
-            "limit": result.saturation["limit"],
-            "background_running": result.saturation["background_running"],
+            "running": sat["running"],
+            "limit": sat["limit"],
+            "background_running": sat["background_running"],
+            HOLDERS_KEY: holders,
         }
         kb = _kb()
         with kb.write_txn(conn):
@@ -670,6 +688,12 @@ def note_waiting(
                 ahead = user_waiting.index(tid)
                 kb._append_event(conn, tid, QUEUED_KIND, {**payload_base, "ahead": ahead})
         result.queued_noticed.extend(owed)
+        holders_text = _holders_text(sat.get("cards", ()), time.time())
+        for tid in owed:
+            logger.info(
+                QUEUED_LOG, tid, user_waiting.index(tid), sat["running"], sat["limit"],
+                sat.get("background_running", 0), sat.get("user_running", 0), holders_text,
+            )
     except Exception as exc:  # noqa: BLE001 — never break the dispatch tick
         logger.warning("kanban priority: noting waiting cards failed: %r", exc)
 
@@ -823,14 +847,19 @@ def _origin(card: dict) -> str:
     return "background"
 
 
+def _holders_text(cards: Iterable[dict], now: float) -> str:
+    """The running cards that hold the slots, one ``id @assignee age [origin]`` each."""
+    return ", ".join(
+        f"{card.get('id')} @{card.get('assignee') or '?'} "
+        f"{_age(card.get('started_at'), now)} [{_origin(card)}]"
+        for card in cards
+    ) or "none listed"
+
+
 def saturation_message(sat: dict, now: Optional[float] = None) -> str:
     """The warning text. Counts belong here, not in the user's thread."""
     now = time.time() if now is None else now
-    cards = ", ".join(
-        f"{card.get('id')} @{card.get('assignee') or '?'} "
-        f"{_age(card.get('started_at'), now)} [{_origin(card)}]"
-        for card in sat.get("cards", ())
-    )
+    cards = _holders_text(sat.get("cards", ()), now)
     # A free slot held for the other class is not saturation; say which class
     # is being held back.
     running, limit = sat.get("running"), sat.get("limit")
@@ -849,7 +878,7 @@ def saturation_message(sat: dict, now: Optional[float] = None) -> str:
     text = (
         f"kanban dispatcher {state}: {running}/{limit} "
         f"worker slots busy ({sat.get('background_running', 0)} background, "
-        f"{sat.get('user_running', 0)} user: {cards or 'none listed'}); "
+        f"{sat.get('user_running', 0)} user: {cards}); "
         f"{sat.get('user_waiting', 0)} user card(s) and "
         f"{sat.get('background_waiting', 0)} background card(s) waiting"
     )
