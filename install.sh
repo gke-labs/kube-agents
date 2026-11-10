@@ -414,6 +414,15 @@ bootstrap_install_env() {
   if grep -Eq "^[[:space:]]*(export[[:space:]]+)?GITHUB_PEM_PATH=" "$file" 2>/dev/null; then
     INSTALL_ENV_RECORDS_GITHUB_PEM_PATH="true"
   fi
+  # And for the minter's key ring and key, which an install.env written
+  # before per-install names recorded as the project-wide defaults whether or
+  # not the install ever ran a minter (minter_name_given).
+  if grep -Eq "^[[:space:]]*(export[[:space:]]+)?KMS_KEYRING=" "$file" 2>/dev/null; then
+    INSTALL_ENV_RECORDS_KMS_KEYRING="true"
+  fi
+  if grep -Eq "^[[:space:]]*(export[[:space:]]+)?KMS_KEY=" "$file" 2>/dev/null; then
+    INSTALL_ENV_RECORDS_KMS_KEY="true"
+  fi
   # stderr, not stdout. This runs at source time, before main(), so anything on
   # stdout here lands in front of whatever the caller went on to capture --
   # including a function's echoed return value when the test suite sources this
@@ -486,6 +495,59 @@ PARAM_GITHUB_APP_ID="${GITHUB_APP_ID:-}"
 PARAM_GITHUB_PEM_PATH="${GITHUB_PEM_PATH:-}"
 PARAM_KMS_KEYRING="${KMS_KEYRING:-}"
 PARAM_KMS_KEY="${KMS_KEY:-}"
+# Whether the operator named the minter's key ring and key (install.env, the
+# environment or a flag) before resolve_shared_defaults fills in a default:
+# apply_minter_name_defaults gives a new install per-install names only when
+# nobody did (#3504).
+#
+# One exception. An install.env written before per-install names recorded the
+# project-wide default names whether or not the install ever ran a minter, so
+# a default name the file records never counts as given: an older install
+# turning the minter on (by flag, the interview, or a GITHUB_APP_ID added to
+# the file by hand) would otherwise adopt, as its own, the unlabelled default
+# key another install may hold. Named by a flag, or by the environment when
+# the file has no line for it (an environment rebuild), the default still
+# counts; a line in the file overwrites what the shell exported.
+#
+# Fails closed when the default isn't known yet (a first curl | bash run, before
+# install.defaults.env is on disk): a name the file records then doesn't count
+# until settle_minter_names_given reads it again with the defaults loaded.
+minter_name_given() {
+  local value=$1 default=$2 file_records=$3
+  [ -n "$value" ] || return 1
+  [ "$file_records" != "true" ] && return 0
+  [ -n "$default" ] && [ "$value" != "$default" ]
+}
+# settle_minter_names_given reads the names again once install.defaults.env is
+# loaded (resolve_shared_defaults): under curl | bash from outside the checkout
+# the reading below may not have had the defaults to compare with, and failed
+# closed. A name it already counts stays counted.
+settle_minter_names_given() {
+  if [ "${PARAM_KMS_KEYRING_GIVEN:-false}" != "true" ] &&
+    minter_name_given "$PARAM_KMS_KEYRING" "${DEFAULT_KMS_KEYRING:-}" "${INSTALL_ENV_RECORDS_KMS_KEYRING:-false}"; then
+    PARAM_KMS_KEYRING_GIVEN="true"
+  fi
+  if [ "${PARAM_KMS_KEY_GIVEN:-false}" != "true" ] &&
+    minter_name_given "$PARAM_KMS_KEY" "${DEFAULT_KMS_KEY:-}" "${INSTALL_ENV_RECORDS_KMS_KEY:-false}"; then
+    PARAM_KMS_KEY_GIVEN="true"
+  fi
+}
+PARAM_KMS_KEYRING_GIVEN="false"
+PARAM_KMS_KEY_GIVEN="false"
+if minter_name_given "$PARAM_KMS_KEYRING" "${DEFAULT_KMS_KEYRING:-}" "${INSTALL_ENV_RECORDS_KMS_KEYRING:-false}"; then
+  PARAM_KMS_KEYRING_GIVEN="true"
+fi
+if minter_name_given "$PARAM_KMS_KEY" "${DEFAULT_KMS_KEY:-}" "${INSTALL_ENV_RECORDS_KMS_KEY:-false}"; then
+  PARAM_KMS_KEY_GIVEN="true"
+fi
+# The minter's GSA name the same way. This file never calls common.sh's
+# export_identity_names, so the flag is set here, after bootstrap_install_env
+# has read install.env, for apply_minter_name_defaults to read.
+if [ -n "${GITHUB_MINTER_GSA_NAME:-}" ]; then
+  export GITHUB_MINTER_GSA_NAME_GIVEN="true"
+else
+  export GITHUB_MINTER_GSA_NAME_GIVEN="false"
+fi
 # GitLab: the forge, a self-managed host, the Secret's name, and a FILE the
 # token is read from. There is deliberately no token-value input: a value in
 # argv or the environment is a value in `ps`, shell history and CI logs.
@@ -578,6 +640,7 @@ PARAM_ENABLE_DRIFT_DETECTOR="${ENABLE_DRIFT_DETECTOR:-}"
 # answer and the run's answer are distinguishable.
 SHELL_ENABLE_DRIFT_DETECTOR="${ENABLE_DRIFT_DETECTOR:-}"
 PARAM_ENABLE_GKE_BACKUP_PLAN="${ENABLE_GKE_BACKUP_PLAN:-}"
+PARAM_DISALLOW_SECRETS_READ="${DISALLOW_SECRETS_READ:-}"
 # Set-ness, never ${VAR:-...}: `--enable-gvisor=` with no value sets this to the empty
 # string, and that has to survive to the validator in main rather than being
 # silently read back as the default. The default itself comes from
@@ -837,10 +900,10 @@ Flags for AI Agents & Automation:
                                 and the installer restarts the minter so it reads the CA
   --github-app-id=ID            Numeric GitHub App ID for GitOps token minter
   --github-pem-path=PATH        Local path to downloaded GitHub App private key (.pem)
-  --kms-keyring=KEYRING         Cloud KMS Keyring Name for token minter (default: DEFAULT_KMS_KEYRING,
-                                currently github-token-minter-keyring)
-  --kms-key=KEY                 Cloud KMS Key Name for token minter (default: DEFAULT_KMS_KEY,
-                                currently github-token-minter-key)
+  --kms-keyring=KEYRING         Cloud KMS Keyring Name for token minter (default on a new install:
+                                <cluster>-minter-keyring; an install with a minter keeps its own)
+  --kms-key=KEY                 Cloud KMS Key Name for token minter (default on a new install:
+                                <cluster>-minter-key; an install with a minter keeps its own)
   --permission-set=SET          Agent GCP IAM permission set: read-only | custom
                                 (default: DEFAULT_PERMISSION_SET, currently read-only)
   --custom-roles=ROLES          Roles for --permission-set=custom (space- or comma-separated)
@@ -890,6 +953,11 @@ Flags for AI Agents & Automation:
   --enable-gke-backup-plan[=true|false]
                                 Provision a GKE Backup Plan for the cluster
                                 (default: DEFAULT_ENABLE_GKE_BACKUP_PLAN, currently false)
+  --disallow-secrets-read[=true|false]
+                                Omit core secrets (get, list, watch) from the reader
+                                ClusterRole (kubeagents:minimal:<ns>:<name>); when unset,
+                                new installs grant secrets read access and existing installs
+                                keep their current ClusterRole permissions
   --user-profile-enabled=BOOL   Enable user profile persona extensions
                                 (default: DEFAULT_USER_PROFILE_ENABLED,
                                 currently false)
@@ -1173,8 +1241,8 @@ parse_args() {
       --gitops-ca-file=*) PARAM_GITOPS_CA_FILE="${1#*=}"; PARAM_GITOPS_CA_FILE_FROM_FLAG="true"; shift ;;
       --github-app-id=*) PARAM_GITHUB_APP_ID="${1#*=}"; PARAM_GITHUB_APP_FROM_FLAG="true"; PARAM_GITHUB_APP_ID_FROM_FLAG="true"; shift ;;
       --github-pem-path=*) PARAM_GITHUB_PEM_PATH="${1#*=}"; PARAM_GITHUB_APP_FROM_FLAG="true"; PARAM_GITHUB_PEM_PATH_FROM_FLAG="true"; shift ;;
-      --kms-keyring=*) PARAM_KMS_KEYRING="${1#*=}"; shift ;;
-      --kms-key=*) PARAM_KMS_KEY="${1#*=}"; shift ;;
+      --kms-keyring=*) PARAM_KMS_KEYRING="${1#*=}"; PARAM_KMS_KEYRING_GIVEN="true"; shift ;;
+      --kms-key=*) PARAM_KMS_KEY="${1#*=}"; PARAM_KMS_KEY_GIVEN="true"; shift ;;
       --permission-set=*) PARAM_PERMISSION_SET="${1#*=}"; shift ;;
       --custom-roles=*) PARAM_CUSTOM_ROLES="${1#*=}"; shift ;;
       --scope-projects=*)
@@ -1229,6 +1297,9 @@ parse_args() {
       --enable-gke-backup-plan|--enable-gke-backup-plan=*)
         PARAM_ENABLE_GKE_BACKUP_PLAN="$(flag_bool_value "$1")"
         validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_GKE_BACKUP_PLAN"; shift ;;
+      --disallow-secrets-read|--disallow-secrets-read=*)
+        PARAM_DISALLOW_SECRETS_READ="$(flag_bool_value "$1")"
+        validate_bool_flag_value "${1%%=*}" "$PARAM_DISALLOW_SECRETS_READ"; shift ;;
       --enable-pubsub-platform|--enable-pubsub|--enable-pubsub-platform=*|--enable-pubsub=*)
         PARAM_ENABLE_PUBSUB_PLATFORM="$(flag_bool_value "$1")"
         validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_PUBSUB_PLATFORM"; shift ;;
@@ -2229,7 +2300,10 @@ warn_flag_beats_unrecorded_file_value() {
 # appends a chat flag's key. upgrade.sh renders from the file alone, so GitOps
 # configured with --gitops-org, --gitops-repo and --github-app-id and never
 # recorded was rendered off by the next full upgrade, which planned to
-# destroy the token minter (#3075). A key the file lacks is appended, and one
+# destroy the token minter (#3075). The minter's key ring, key and GSA names go
+# the same way, and the minter key the install shares on purpose: a new
+# install's names are derived from its cluster, not defaulted (#3504). A key
+# the file lacks is appended, and one
 # it records with a different value is replaced (that line only), since this
 # apply is about to use the new value and the next upgrade would otherwise put
 # the old one back. --github-pem-path never is (the key lives in Cloud KMS once
@@ -2243,8 +2317,15 @@ record_github_gitops_keys() {
   [ "${PARAM_DRY_RUN:-false}" = "true" ] && return 0
   [ "${GITOPS_FORGE:-github}" = "github" ] || return 0
   [ -n "${GITOPS_ORG:-}" ] && [ -n "${GITOPS_REPO:-}" ] && [ -n "${GITHUB_APP_ID:-}" ] || return 0
-  local tmp
-  for key in GITOPS_ORG GITOPS_REPO GITHUB_APP_ID; do
+  local tmp keys=(GITOPS_ORG GITOPS_REPO GITHUB_APP_ID)
+  # The minter's names too (#3504): a new install's are derived from its
+  # cluster rather than defaulted, so a file that doesn't record them would
+  # send the next upgrade.sh back to the project-wide names. And the key it
+  # shares on purpose, when it does.
+  for key in KMS_KEYRING KMS_KEY GITHUB_MINTER_GSA_NAME MINTER_SHARED_KEY; do
+    [ -n "${!key:-}" ] && keys+=("$key")
+  done
+  for key in "${keys[@]}"; do
     value="${!key}"
     # Read afresh for each key: a rewrite below drops a whole line, and a line
     # that assigned two of these keys takes both with it.
@@ -2264,7 +2345,7 @@ record_github_gitops_keys() {
         printf '\n' >> "$file"
       fi
       write_env_var "$file" "$key" "$value"
-      print_info "Recorded ${key}=$(printf '%q' "$value") in ${file}, which assigned no ${key}, so upgrade.sh keeps GitOps on."
+      print_info "Recorded ${key}=$(printf '%q' "$value") in ${file}, which assigned no ${key}, so upgrade.sh keeps it."
     fi
   done
   # The cache read_recorded_install_env_values keeps is keyed by path, and the
@@ -2318,7 +2399,7 @@ record_gitops_forge_keys() {
   # The App's KMS key too, on GitHub: an App belongs to one GitHub host, so a
   # switch of host names the new App's key (--kms-key), and the next
   # upgrade.sh must render that key and not the old App's.
-  [ "$current" = "github" ] && keys+=(KMS_KEYRING KMS_KEY)
+  [ "$current" = "github" ] && keys+=(KMS_KEYRING KMS_KEY MINTER_SHARED_KEY)
   local tmp="${file}.tmp.$$"
   ( umask 077; : >"$tmp" )
   grep -E -v "^[[:space:]]*(export[[:space:]]+)?($(IFS='|'; echo "${keys[*]}"))=" "$file" >"$tmp" || true
@@ -2341,6 +2422,10 @@ record_gitops_forge_keys() {
     write_env_var "$tmp" GITHUB_APP_ID "${GITHUB_APP_ID:-}"
     write_env_var "$tmp" KMS_KEYRING "${KMS_KEYRING:-}"
     write_env_var "$tmp" KMS_KEY "${KMS_KEY:-}"
+    # A minter key this install shares on purpose (#3504), kept beside its names.
+    if [ -n "${MINTER_SHARED_KEY:-}" ]; then
+      write_env_var "$tmp" MINTER_SHARED_KEY "${MINTER_SHARED_KEY}"
+    fi
     # The path of the App's private key, never the key: the path this run
     # uses (--github-pem-path, the PEM prompt, or the path install.env
     # recorded). A rewrite of the forge keys must not drop a key the operator
@@ -2643,6 +2728,11 @@ bootstrap_install_env_file() {
       "A later run without it re-reads the recorded value and plans the BackupPlan's destruction; once a backup has been taken the API refuses that destroy and the apply fails partway instead." \
       true \
       "every later install.sh run"
+    warn_flag_beats_unrecorded_file_value "$destination" DISALLOW_SECRETS_READ --disallow-secrets-read \
+      "${PARAM_DISALLOW_SECRETS_READ:-}" \
+      "A later run without it renders the PlatformAgent from what the file records; upgrade.sh and --menu take no --disallow-secrets-read, so the next of either puts the reader ClusterRole's secrets rule back to the recorded or existing state." \
+      true \
+      "every later install.sh run"
     warn_flag_beats_unrecorded_file_value "$destination" WEB_CONSOLE_ENABLED --enable-web-console \
       "${PARAM_ENABLE_WEB_CONSOLE:-}" \
       "A later run without it renders the web console from what the file records; upgrade.sh and --menu take no --enable-web-console, so the next of either puts the console back to the recorded or default state." \
@@ -2910,6 +3000,11 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" LITELLM_REDACTION_IP_ACTION "${LITELLM_REDACTION_IP_ACTION:-$DEFAULT_LITELLM_REDACTION_IP_ACTION}"
   write_env_var "$tmp" LITELLM_REDACTION_IP_ALLOW_CIDRS "${LITELLM_REDACTION_IP_ALLOW_CIDRS:-}"
   write_env_var "$tmp" LITELLM_REDACTION_RULES "${LITELLM_REDACTION_RULES:-}"
+  # The gateway's spend ceiling, install.env only (no flag): recorded so every
+  # later run, which reads the file alone, keeps it. Empty takes the defaults
+  # (0, no ceiling; 1d) in the tfvars generator.
+  write_env_var "$tmp" LITELLM_BUDGET_USD "${LITELLM_BUDGET_USD:-}"
+  write_env_var "$tmp" LITELLM_BUDGET_PERIOD "${LITELLM_BUDGET_PERIOD:-}"
   write_env_var "$tmp" VERTEX_PROJECT_ID "${VERTEX_PROJECT_ID:-}"
   write_env_var "$tmp" VERTEX_LOCATION "${VERTEX_LOCATION:-}"
   write_env_var "$tmp" VERTEX_MANAGE_SERVING_PROJECT "${VERTEX_MANAGE_SERVING_PROJECT:-}"
@@ -2983,12 +3078,19 @@ bootstrap_install_env_file() {
   fi
   write_env_var "$tmp" KMS_KEYRING "${KMS_KEYRING:-}"
   write_env_var "$tmp" KMS_KEY "${KMS_KEY:-}"
+  # A minter key this install shares on purpose (#3504), kept beside its names.
+  if [ -n "${MINTER_SHARED_KEY:-}" ]; then
+    write_env_var "$tmp" MINTER_SHARED_KEY "${MINTER_SHARED_KEY}"
+  fi
   write_env_var "$tmp" MEMORY "$PARAM_MEMORY"
   write_env_var "$tmp" USER_PROFILE_ENABLED "${USER_PROFILE_ENABLED:-$DEFAULT_USER_PROFILE_ENABLED}"
   write_env_var "$tmp" HERMES_DASHBOARD_ENABLED "${HERMES_DASHBOARD_ENABLED:-$DEFAULT_ENABLE_WEBUI}"
   write_env_var "$tmp" WEB_CONSOLE_ENABLED "${WEB_CONSOLE_ENABLED:-$DEFAULT_ENABLE_WEB_CONSOLE}"
   write_env_var "$tmp" ENABLE_GVISOR "${ENABLE_GVISOR:-$DEFAULT_ENABLE_GVISOR}"
   write_env_var "$tmp" ENABLE_GKE_BACKUP_PLAN "${ENABLE_GKE_BACKUP_PLAN:-$DEFAULT_ENABLE_GKE_BACKUP_PLAN}"
+  if [ -n "${DISALLOW_SECRETS_READ:-}" ]; then
+    write_env_var "$tmp" DISALLOW_SECRETS_READ "${DISALLOW_SECRETS_READ}"
+  fi
   write_env_var "$tmp" ENABLE_PUBSUB_PLATFORM "${PARAM_ENABLE_PUBSUB_PLATFORM:-$DEFAULT_ENABLE_PUBSUB_PLATFORM}"
   write_env_var "$tmp" ENABLE_STOCKOUT_INVESTIGATOR "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}"
   write_env_var "$tmp" ENABLE_DRIFT_DETECTOR "${PARAM_ENABLE_DRIFT_DETECTOR:-$DEFAULT_ENABLE_DRIFT_DETECTOR}"
@@ -3322,6 +3424,78 @@ source_provisioning_helpers() {
 # living next to the code that reads it, and two copies drift. It also reads
 # as though the value might legitimately be unset at that point, which it
 # cannot be: this runs in step 2, before the interview.
+# Gives the token minter this install's own key ring, key and GSA names where
+# the operator named none (#3504): the names its state holds on an install
+# that already has a minter, else names derived from the cluster
+# (minter_derived_names). Called once project and cluster are settled and
+# before anything reads the names: the PEM decision, the interview's
+# defaults, and the KMS_KEYRING, KMS_KEY and GITHUB_MINTER_GSA_NAME this run
+# records in install.env, which keep a new install's names on later runs.
+apply_minter_name_defaults() {
+  local project=$1 cluster=$2 names ring key gsa
+  names="$(minter_name_defaults "$project" "$cluster")"
+  IFS='|' read -r ring key gsa <<<"$names"
+  [ "${PARAM_KMS_KEYRING_GIVEN:-false}" = "true" ] || PARAM_KMS_KEYRING="$ring"
+  [ "${PARAM_KMS_KEY_GIVEN:-false}" = "true" ] || PARAM_KMS_KEY="$key"
+  if [ "${GITHUB_MINTER_GSA_NAME_GIVEN:-false}" != "true" ]; then
+    export GITHUB_MINTER_GSA_NAME="$gsa"
+  fi
+}
+
+# Says whose minter key the interview's key ring and key name, when it exists,
+# isn't in this install's state and isn't this install's own (#3504), and asks
+# before adopting it: a yes records MINTER_SHARED_KEY for that one key, which
+# lifecycle.sh's adoption step honours. A key with no owner labels whose names
+# were given explicitly is adopted as this install's own (MINTER_ADOPT_KEY).
+# Without a terminal to ask at, refuses
+# here, before anything is provisioned, rather than at the apply. A key that is
+# absent or can't be described is left to lifecycle.sh's own check.
+confirm_minter_key_owner() {
+  local ring=$1 key=$2 location=$3 project=$4 cluster=$5
+  local namespace="${NAMESPACE:-$DEFAULT_NAMESPACE}" names state_ring="" state_key="" owner rc=0 answer=""
+  [ "${MINTER_SHARED_KEY:-}" = "${ring}/${key}" ] && return 0
+  names="$(tf_state_minter_names "$project" "$cluster" 2>/dev/null)" || names=""
+  IFS='|' read -r state_ring state_key _ <<<"$names"
+  [ "${state_ring}/${state_key}" = "${ring}/${key}" ] && return 0
+  owner="$(minter_key_owner "$ring" "$key" "$location" "$project")" || rc=$?
+  case "$rc" in
+    1) return 0 ;;
+    2) print_warning "Could not read the owner labels of Cloud KMS key ${ring}/${key}; the apply checks again before adopting it."
+       return 0 ;;
+  esac
+  [ "$owner" = "${cluster}/${namespace}" ] && return 0
+  # A key with no owner labels that this run was named explicitly (KMS_KEYRING
+  # and KMS_KEY, from install.env, the environment or the flags) is a choice,
+  # not the silent default adoption the labels exist to stop: it is adopted as
+  # this install's own, and the apply labels it. Labels win over a name: a key
+  # another install's labels claim is refused below whatever named it.
+  if [ -z "$owner" ] && [ "${PARAM_KMS_KEYRING_GIVEN:-false}" = "true" ] && [ "${PARAM_KMS_KEY_GIVEN:-false}" = "true" ]; then
+    print_info "Cloud KMS key ${ring}/${key} carries no owner labels and was named explicitly, so this install adopts it as its own; the apply labels it."
+    export MINTER_ADOPT_KEY="${ring}/${key}"
+    return 0
+  fi
+  if [ -n "$owner" ]; then
+    print_warning "Cloud KMS key ${ring}/${key} belongs to install ${owner} (its owner labels), not this one (${cluster}/${namespace})."
+  else
+    print_warning "Cloud KMS key ${ring}/${key} exists and carries no owner labels, so it may be another install's."
+  fi
+  print_info "Adopting it would put that install's App key in this install's state, where a destroy here schedules its versions for destruction."
+  if [ "$PARAM_NON_INTERACTIVE" = "true" ] || ! has_controlling_tty; then
+    print_error "Set KMS_KEYRING and KMS_KEY to names of this install's own, or set MINTER_SHARED_KEY=${ring}/${key} to share this key on purpose."
+    return 1
+  fi
+  prompt_read "Share this key on purpose? (y/N)" answer "n"
+  case "$answer" in
+    [yY]*)
+      export MINTER_SHARED_KEY="${ring}/${key}"
+      print_info "Sharing ${ring}/${key} on purpose; recorded as MINTER_SHARED_KEY."
+      return 0 ;;
+    *)
+      print_error "Choose other key ring and key names (KMS_KEYRING, KMS_KEY, or --kms-keyring and --kms-key) and re-run."
+      return 1 ;;
+  esac
+}
+
 resolve_shared_defaults() {
   normalize_gitops_repo_vars
   resolve_platform_agent_mode_fallback
@@ -3359,6 +3533,8 @@ resolve_shared_defaults() {
   if [ "$PARAM_GITOPS_FORGE" != "gitlab" ]; then
     PARAM_GITOPS_REPO="${PARAM_GITOPS_REPO:-$DEFAULT_GITOPS_REPO}"
   fi
+  # Before the defaults fill the names in, or every name would read as given.
+  settle_minter_names_given
   PARAM_KMS_KEYRING="${PARAM_KMS_KEYRING:-$DEFAULT_KMS_KEYRING}"
   PARAM_KMS_KEY="${PARAM_KMS_KEY:-$DEFAULT_KMS_KEY}"
   PARAM_ENABLE_PUBSUB_PLATFORM="${PARAM_ENABLE_PUBSUB_PLATFORM:-$DEFAULT_ENABLE_PUBSUB_PLATFORM}"
@@ -3977,7 +4153,8 @@ print_generate_only_handoff() {
   echo -e "    gcloud kms keyrings create ${minter_keyring} --location=${kms_loc} --project=${project_id}"
   echo -e "    gcloud kms keys create ${minter_key} --keyring=${minter_keyring} --location=${kms_loc} \\\\"
   echo -e "      --purpose=asymmetric-signing --default-algorithm=rsa-sign-pkcs1-2048-sha256 \\\\"
-  echo -e "      --import-only --skip-initial-version-creation --protection-level=software --project=${project_id}"
+  echo -e "      --import-only --skip-initial-version-creation --protection-level=software \\\\"
+  echo -e "      --labels=kube-agents-cluster=${cluster_name},kube-agents-namespace=${NAMESPACE:-$DEFAULT_NAMESPACE} --project=${project_id}"
   echo -e "    git clone --depth 1 --branch ${MINTY_CLI_GIT_TAG} ${MINTY_CLI_REPO_URL} ${MINTY_CLI_MANUAL_CLONE_DIR}"
   echo -e "    (cd ${MINTY_CLI_MANUAL_CLONE_DIR} && go run ./cmd/minty tools import-pk -project-id=${project_id} -location=${kms_loc} -key-ring=${minter_keyring} -key=${minter_key} -private-key=@<path-to-pem>)"
   echo ""
@@ -5534,17 +5711,16 @@ apply_gitlab_token_secret() {
 
 # github.com presents a certificate the public CAs sign, and the later flag
 # check refuses a CA file with no host. Called by the forge menu's github.com
-# and no-repository answers: an exported GITOPS_CA_FILE is dropped without a
-# word, as the GitLab validator drops one for gitlab.com (a CA file typed for
-# an Enterprise Server host never reaches here: the validator's refusal puts
-# the entry value back); one given by flag is dropped with a line, since
-# refusing it after the whole interview would be the alternative. The CA
-# Secret name goes with it: a recorded forge, org, App or host flag settles
-# the forge before the menu, so the only name here is the default the early
-# flag check derived from an exported host and CA file (a refused attempt
-# at the menu derives none: the validator names the Secret only after it
-# accepts the file), and the later flag check would otherwise report it
-# dropped as a recorded one.
+# and no-repository answers, and by the Enterprise Server answer when the
+# entered host is a github.com spelling: an exported GITOPS_CA_FILE is dropped
+# without a word, as the GitLab validator drops one for gitlab.com (a CA file
+# is never prompted for a github.com host; for an Enterprise Server host, the
+# validator's refusal puts the entry value back); one given by flag is dropped
+# with a line, since refusing it after the whole interview would be the
+# alternative. The CA Secret name goes with it (whether derived from an exported
+# file or named in the environment): a recorded forge, org, App or host flag
+# settles the forge before the menu, and the later flag check would otherwise
+# report it dropped as a recorded one.
 drop_gitops_ca_file_for_github_com() {
   if [ -n "${PARAM_GITOPS_CA_FILE:-}" ] && [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" = "true" ]; then
     print_info "Dropping --gitops-ca-file '${PARAM_GITOPS_CA_FILE}': this run's GitOps forge is github.com, which uses the public CAs."
@@ -5572,12 +5748,13 @@ ask_gitops_forge() {
   # What the menu was first shown over. An option 2 attempt the validator
   # refuses puts these back, so the next answer -- option 2 again, github.com
   # or no repository -- starts from here and not from the refused host and
-  # CA file. The hostname prompt's default is the host the menu was shown
+  # CA file. The hostname and CA prompts' defaults are what the menu was shown
   # over on the first attempt and nothing after a refusal: prompt_read
-  # substitutes a default for an empty answer, so a refused host offered
+  # substitutes a default for an empty answer, so a refused host or file offered
   # again would make enter resubmit it instead of returning to the menu.
   local host_on_entry="${PARAM_GITOPS_HOST:-}" ca_file_on_entry="${PARAM_GITOPS_CA_FILE:-}"
-  local ghes_host="${PARAM_GITOPS_HOST:-}"
+  local ca_secret_on_entry="${PARAM_GITOPS_CA_SECRET:-}"
+  local ghes_host="${PARAM_GITOPS_HOST:-}" ghes_ca_file="${PARAM_GITOPS_CA_FILE:-}"
   while true; do
     prompt_menu "Where does the GitOps repository live?" \
       "GitHub (github.com)" \
@@ -5610,14 +5787,30 @@ ask_gitops_forge() {
         fi
         PARAM_GITOPS_FORGE="github"
         PARAM_GITOPS_HOST="$ghes_host"
-        # The CA prompt has no default, so empty stays a way to answer "a
-        # public CA signed it" on every pass.
-        if [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" != "true" ]; then
-          PARAM_GITOPS_CA_FILE=""
-          if [ -z "${PARAM_GITOPS_CA_SECRET:-}" ]; then
-            prompt_read "PEM CA file that signed the instance's certificate (empty if a public CA signed it)" PARAM_GITOPS_CA_FILE ""
-          fi
-        fi
+        case "$PARAM_GITOPS_HOST" in
+          github.com|www.github.com|ssh.github.com)
+            drop_gitops_ca_file_for_github_com
+            ;;
+          *)
+            if [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" != "true" ]; then
+              local ca_prompt="PEM CA file that signed the instance's certificate"
+              if [ -n "$ghes_ca_file" ]; then
+                ca_prompt="$ca_prompt (empty keeps the file; a path replaces it)"
+              elif [ -z "$ca_file_on_entry" ] && [ -n "$PARAM_GITOPS_CA_SECRET" ]; then
+                ca_prompt="$ca_prompt (empty keeps Secret '$PARAM_GITOPS_CA_SECRET'; a path replaces it)"
+              else
+                ca_prompt="$ca_prompt (empty if a public CA signed it)"
+              fi
+              prompt_read "$ca_prompt" PARAM_GITOPS_CA_FILE "$ghes_ca_file"
+              # An empty answer means a public CA signed the certificate: clear
+              # any Secret name the early flag check derived from an exported file.
+              # Leave an operator-named Secret alone if it arrived without a file.
+              if [ -z "$PARAM_GITOPS_CA_FILE" ] && [ -n "$ca_file_on_entry" ]; then
+                PARAM_GITOPS_CA_SECRET=""
+              fi
+            fi
+            ;;
+        esac
         if validate_gitops_forge_flags; then
           # A github.com spelling clears the host: the install is then github.com.
           if [ -n "${PARAM_GITOPS_HOST:-}" ]; then
@@ -5631,9 +5824,11 @@ ask_gitops_forge() {
         # CA file themselves; option 3 does not, and without this it would
         # offer the refused Enterprise Server host as the GitLab host's default.
         ghes_host=""
+        ghes_ca_file=""
         PARAM_GITOPS_HOST="$host_on_entry"
         if [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" != "true" ]; then
           PARAM_GITOPS_CA_FILE="$ca_file_on_entry"
+          PARAM_GITOPS_CA_SECRET="$ca_secret_on_entry"
         fi
         has_controlling_tty || exit 1
         ;;
@@ -5916,6 +6111,12 @@ validate_non_interactive_minter_config() {
     print_error "GitHub App ID ('${app_id}') was provided in non-interactive mode, but no ENABLED KMS key exists in ${keyring}/${key} and no --github-pem-path was provided."
     print_minter_restore_advice "$key" "$keyring" "$kms_loc" "$project_id" ||
       print_info "To enable the token minter, provide --github-pem-path=<path-to-pem> for automated import, or pre-import the private key into Cloud KMS (AOT)."
+    # Derived names on a key that doesn't exist are what a re-run gets after an
+    # earlier run chose the project-wide default names by flag: install.env
+    # records them, and recorded defaults don't count (minter_name_given).
+    if [ "${PARAM_KMS_KEYRING_GIVEN:-false}" != "true" ] || [ "${PARAM_KMS_KEY_GIVEN:-false}" != "true" ]; then
+      print_info "If an earlier run named this install's key with --kms-keyring and --kms-key, pass both again: install.env doesn't keep a choice of the default names."
+    fi
     print_info "To install without the token minter, omit --github-app-id."
     return 1
   fi
@@ -6084,7 +6285,7 @@ apply_managed_otel_scope() {
 # ENABLED (the import happened on an earlier run), downgraded to printed
 # instructions when no PEM is provided, and auto-installs Go if missing.
 import_github_pem() {
-  local project_id="$1" region="$2"
+  local project_id="$1" region="$2" cluster="${3:-}"
   [ -n "${GITOPS_ORG:-}" ] && [ -n "${GITOPS_REPO:-}" ] && [ -n "${GITHUB_APP_ID:-}" ] || return 0
   local pem_path="${GITHUB_PEM_PATH:-}"
   pem_path="$(expand_tilde_path "$pem_path")"
@@ -6163,10 +6364,16 @@ import_github_pem() {
   if grep -Eq "$KMS_API_PROPAGATION_PATTERN" <<<"$kms_ring_err"; then
     kms_key_err="skipped: keyring creation exhausted Cloud KMS API propagation retry budget"
   else
+    # Labelled with this install as the composition's owner_labels would
+    # label it (#3504): the apply's adoption step refuses an unlabelled key
+    # it doesn't hold, and this one is about to be imported into this
+    # install's state.
+    local owner_labels=()
+    [ -n "$cluster" ] && owner_labels=(--labels="kube-agents-cluster=${cluster},kube-agents-namespace=${NAMESPACE:-$DEFAULT_NAMESPACE}")
     kms_key_err="$(trap - ERR; retry_kms_create gcloud kms keys create "$key" --keyring="$keyring" --location="$kms_location" \
       --purpose=asymmetric-signing --default-algorithm=rsa-sign-pkcs1-2048-sha256 \
       --import-only --skip-initial-version-creation \
-      --protection-level=software --project="$project_id")" || true
+      --protection-level=software ${owner_labels[@]+"${owner_labels[@]}"} --project="$project_id")" || true
   fi
 
   # The assertion, not the create, is what makes a failure visible. Whatever went
@@ -6195,7 +6402,7 @@ import_github_pem() {
     # easy to lose and the one KMS refuses an import-only key without.
     print_info "Create them by hand with:"
     print_info "  gcloud kms keyrings create ${keyring} --location=${kms_location} --project=${project_id}"
-    print_info "  gcloud kms keys create ${key} --keyring=${keyring} --location=${kms_location} --purpose=asymmetric-signing --default-algorithm=rsa-sign-pkcs1-2048-sha256 --import-only --skip-initial-version-creation --protection-level=software --project=${project_id}"
+    print_info "  gcloud kms keys create ${key} --keyring=${keyring} --location=${kms_location} --purpose=asymmetric-signing --default-algorithm=rsa-sign-pkcs1-2048-sha256 --import-only --skip-initial-version-creation --protection-level=software ${owner_labels[*]+${owner_labels[*]}} --project=${project_id}"
     print_info "Then import the PEM following: https://github.com/abcxyz/github-token-minter"
     return 0
   fi
@@ -7675,6 +7882,7 @@ main() {
   # authenticated, and project and region are settled -- step 5 can still
   # change the region, and it has run. Called before the locals below copy
   # PARAM_GITHUB_PEM_PATH, so every consumer in this step sees one answer.
+  apply_minter_name_defaults "$project_id" "$cluster_name"
   resolve_missing_pem_against_kms "$region" "$project_id" || exit 1
 
   local github_org="$PARAM_GITOPS_ORG"
@@ -7808,6 +8016,7 @@ main() {
 
         local kms_loc existing_kms_ver=""
         kms_loc="$(derive_kms_location "$region")"
+        confirm_minter_key_owner "$kms_keyring" "$kms_key" "$kms_loc" "$project_id" "$cluster_name" || exit 1
         existing_kms_ver="$(kms_key_enabled_version "$kms_key" "$kms_keyring" "$kms_loc" "$project_id" 2>/dev/null || echo "")"
         if [ -n "$existing_kms_ver" ]; then
           print_success "Cloud KMS key ${kms_keyring}/${kms_key} already has an ENABLED version (${existing_kms_ver}); skipping PEM prompt."
@@ -7868,6 +8077,11 @@ main() {
     fi
 
     validate_non_interactive_minter_config "$github_app_id" "$github_pem_path" "$kms_keyring" "$kms_key" "$region" "$project_id" "$github_org" || exit 1
+    # The same owner check as the interactive arm, which refuses here with no
+    # one to ask (#3504).
+    if [ -n "$github_app_id" ]; then
+      confirm_minter_key_owner "$kms_keyring" "$kms_key" "$(derive_kms_location "$region")" "$project_id" "$cluster_name" || exit 1
+    fi
 
     if [ -n "$github_app_id" ] && [ -n "$github_pem_path" ]; then
       local kms_loc existing_kms_ver=""
@@ -8215,6 +8429,9 @@ main() {
   # the generator's DEFAULT_ENABLE_GKE_BACKUP_PLAN decides as it did before.
   if [ -n "${PARAM_ENABLE_GKE_BACKUP_PLAN:-}" ]; then
     export ENABLE_GKE_BACKUP_PLAN="$PARAM_ENABLE_GKE_BACKUP_PLAN"
+  fi
+  if [ -n "${PARAM_DISALLOW_SECRETS_READ:-}" ]; then
+    export DISALLOW_SECRETS_READ="$PARAM_DISALLOW_SECRETS_READ"
   fi
   export MODEL_PROVIDER="$model_provider"
   export MODEL_DEFAULT_NAME="$model_default_name"
@@ -8734,7 +8951,7 @@ main() {
   # pass readiness once the key is imported. The generator enabled the
   # minter on the promise of this import, so a failed one stops the run
   # here rather than wedging the apply.
-  import_github_pem "$project_id" "$region" || exit 1
+  import_github_pem "$project_id" "$region" "$cluster_name" || exit 1
   local minter_enabled_version=""
   minter_enabled_version="$(kms_key_enabled_version "${KMS_KEY:-$DEFAULT_KMS_KEY}" \
     "${KMS_KEYRING:-$DEFAULT_KMS_KEYRING}" "$(derive_kms_location "$region")" "$project_id")"

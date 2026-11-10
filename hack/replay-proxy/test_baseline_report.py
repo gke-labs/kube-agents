@@ -154,6 +154,12 @@ class TokenMetrics(unittest.TestCase):
         self.assertEqual(total["uncached_prompt_tokens"], 900)
         self.assertEqual(total["completion_tokens"], 30)
 
+    def test_schema_2_and_schema_3_lines_count_alike(self):
+        # Schema 2 named the LiteLLM config checksum model_behaviour_checksum.
+        total = report([line("a", 1, schema=2, model_behaviour_checksum="c2"),
+                        line("b", 2, schema=3, litellm_config_checksum="c3")])["scopes"]["total"]
+        self.assertEqual((total["requests"], total["ok_requests"], total["prompt_tokens"]), (2, 2, 2000))
+
     def test_cached_above_prompt_is_capped_at_prompt(self):
         total = report([line("a", 1, prompt=100, cached=150)])["scopes"]["total"]
         self.assertEqual((total["cached_prompt_tokens"], total["uncached_prompt_tokens"]), (100, 0))
@@ -739,7 +745,7 @@ class NightlyUntrusted(unittest.TestCase):
 
     def test_the_kinds_are_analyze_shadows(self):
         self.assertIs(br.JOB_KINDS, br.analyze_shadow.JOB_KINDS)
-        self.assertEqual(br.JOB_KINDS, ("nightly", "nightly-untrusted", "presubmit"))
+        self.assertEqual(br.JOB_KINDS, ("nightly", "nightly-untrusted", "presubmit", "replay-lane"))
         self.assertEqual(br.SCOPES, ("total",) + br.JOB_KINDS)
 
 

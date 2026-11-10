@@ -32,10 +32,11 @@ their own copies:
 | `DEFAULT_MODEL_GEMINI` / `_OPENAI` / `_ANTHROPIC`                         | The model each provider serves by default; the chart's `_helpers.tpl` mirrors them     |
 | `DEFAULT_MODEL_MAX_TOKENS`                                                | Output tokens the gateway asks for on a request that names none (`0`: no `max_tokens`) |
 | `DEFAULT_LITELLM_REDACTION_ENABLED` / `_IP_ACTION`                        | Gateway redaction (`false`) and what it does with IP literals (`pseudonym`)            |
+| `DEFAULT_LITELLM_BUDGET_USD` / `_PERIOD`                                  | The gateway's spend ceiling (`0`: none) and its window (`1d`); `install.env` only      |
 | `DEFAULT_GEMINI_API_KEY_SECRET_NAME`                                      | Secret Manager secret a Gemini key is read from when none is given (`gemini-api-key`)  |
 | `DEFAULT_NAMESPACE`                                                       | Kubernetes namespace of the release (`kubeagents-system`)                              |
 | `DEFAULT_PLATFORM_AGENT_GSA_NAME`                                         | The agent's GCP service account id (`kubeagents-platform-gsa`); one name per project   |
-| `DEFAULT_GITHUB_MINTER_GSA_NAME`                                          | The minter's GCP service account id (`kubeagents-github-minter-gsa`); one per project  |
+| `DEFAULT_GITHUB_MINTER_GSA_NAME`                                          | Existing installs' minter GSA (`kubeagents-github-minter-gsa`); see below              |
 | `DEFAULT_LITELLM_GSA_NAME`                                                | The gateway's Vertex AI service account id (`kubeagents-litellm-gsa`); one per project |
 | `DEFAULT_GKE_DB_KMS_KEYRING`                                              | Cloud KMS key ring for GKE database encryption (`platform-agent-keyring`)              |
 | `DEFAULT_GKE_DB_KMS_KEY`                                                  | Cloud KMS key for GKE database encryption (`k8s-secret-encryption-key`)                |
@@ -61,8 +62,11 @@ their own copies:
 | `kms_key_enabled_version <key> <ring> <location> <project>`               | The minter key's first ENABLED version, or nothing; one probe for three callers        |
 | `tf_state_has_cluster`                                                    | Whether that state manages THIS cluster (project, location and name all match)         |
 | `check_service_account_ownership`                                         | Refuses an apply that would 409 on a service account another install owns              |
+| `minter_name_defaults <project> <cluster>`                                | The minter's names: its state's, else derived from the cluster                         |
 | `write_tfvars_from_state <dest> [tag]`                                    | The `terraform.tfvars` generator (reads the loaded `install.env` variable set)         |
 | `read_platform_agent_install_state [namespace]`                           | The CR and release reads shared by the scope check and the mode notice                 |
+
+**The token minter's names.** A new install gets a key ring, key and GSA named after its cluster (`<cluster>-minter-keyring`, `<cluster>-minter-key`, `<cluster>-minter`, from `minter_derived_names`). An install whose state already holds a minter keeps those names, because a KMS key can't be deleted and renaming one plans a replacement. A name set in `install.env` (`KMS_KEYRING`, `KMS_KEY`, `GITHUB_MINTER_GSA_NAME`) always wins. `lifecycle.sh` refuses to adopt a minter key ring or key that another install's owner labels claim, unless `MINTER_SHARED_KEY` names it as `<keyring>/<key>`. A key with no owner labels is adopted as this install's own, and labelled, only when its names were given explicitly (`KMS_KEYRING` and `KMS_KEY`, from `install.env`, the environment or the flags); labels win over a name. The project-wide default names don't count when `install.env` records them, since a file from before per-install names records them whether or not the install ran a minter. A GitHub environment's rebuild passes them in the environment (`scripts/release/minter_environment_names.sh`), so it adopts the environment's own key.
 
 The values themselves live in [`install.defaults.env`](../../install.defaults.env) at the
 repository root, which `installer_common.sh` sources. That file does one job and holds
@@ -419,7 +423,9 @@ that goes on to the apply, or ends with the `--generate-only` handoff, records e
 the file lacks, and replaces one it records
 with a different value (that line only). `upgrade.sh` renders from the file alone, so GitOps set
 up with `--gitops-org`, `--gitops-repo` and `--github-app-id` would otherwise be rendered off by
-the next full upgrade, which would destroy the minter's Cloud KMS key and service account. The PEM
+the next full upgrade, which would destroy the minter's Cloud KMS key and service account. The
+minter's names are recorded the same way (`KMS_KEYRING`, `KMS_KEY`, `GITHUB_MINTER_GSA_NAME`, and
+`MINTER_SHARED_KEY` when set), since a new install's are derived from its cluster. The PEM
 path is never recorded. A declined run, or `--dry-run`, leaves the file as it was.
 
 Each applying front door (`install.sh`, the Day-2 menu, a full `upgrade.sh`) also refuses an apply
@@ -753,6 +759,23 @@ recorded. But each `upgrade.sh` run calls the generator before it selects the mo
 stops the run in every mode. The [chatops page](https://gke-labs.github.io/kube-agents/concepts/chatops/#daily-alert-ceiling)
 gives the buckets, the defaults, and what happens to entries added to the CR by hand.
 
+### The gateway's spend ceiling
+
+`LITELLM_BUDGET_USD` and `LITELLM_BUDGET_PERIOD` set the gateway's spend ceiling. Empty takes
+`DEFAULT_LITELLM_BUDGET_USD` (`0`, no ceiling) and `DEFAULT_LITELLM_BUDGET_PERIOD` (`1d`).
+`write_tfvars_from_state` writes `litellm_budget` only while the amount is above `0`, so an install
+without a ceiling keeps the file it had; the period is read, and checked, only then. The generator
+refuses an amount that is not a number of `0` or more, an amount above `0` and under
+`LITELLM_BUDGET_MIN_USD` (`0.01`: the chart splits the amount across the gateway replicas and renders
+each share with four decimals, so a smaller amount would fail at the Helm apply), or a period that is
+not a LiteLLM duration (a whole number and `s`, `m`, `h`, `d`, `w` or `mo`), and names the key. `install.sh` records both
+keys in a new `install.env`, empty included. No flag sets them. `uninstall.sh` blanks them, so a bad
+value cannot stop a teardown. Only `install.sh`, the Day-2 menu and `upgrade.sh --upgrade-mode=full`
+apply these keys; the operator and harness modes of `upgrade.sh` use the values that the release
+recorded, but each run calls the generator before it selects the mode, so a bad value stops the run
+in every mode. The [inference-gateway page](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#setting-a-spend-ceiling)
+says how the chart splits the amount and what the gateway does when it is spent.
+
 ### Cluster adoption and component toggles
 
 `SKIP_CERT_MANAGER=true` makes the generator emit `enable_cert_manager = false`, for a
@@ -827,7 +850,7 @@ is a hand-authored dotenv and a hand may well write `export`.
   the registry prefixes, cluster connection, the step runner. Sources
   `installer_common.sh`, so nothing is defined twice. `hack/ci-deploy.sh` sources
   `scripts/release/common.sh`, not this file.
-- **[gke_dns_endpoint.sh](gke_dns_endpoint.sh)**: `gke_dns_endpoint_flag`, which decides whether a given cluster should be reached with `get-credentials --dns-endpoint`. The agent's runtime copy also selects `--internal-ip` for a cluster on its own VPC; this helper does not, for the reason its header gives. This is the roster the file's own header defers to: `common.sh`, `installer_common.sh`, `install.sh`, `upgrade.sh`, `hack/ci-env.sh`, `scripts/release/common.sh`, `scripts/release/reconcile_environment.sh`, `terraform/examples/full-install/lifecycle.sh`, and the staging-workload scripts all source it. It is kept out of `common.sh` and free of every helper in this directory so that each of them can take the predicate and nothing else — `hack/ci-env.sh` and `lifecycle.sh` want no part of the state file, and `installer_common.sh` is sourced by front doors that load no other helper. It sets `GKE_DNS_ENDPOINT_FLAG` rather than echoing, so that callers do not run it in a `$(...)` subshell that would discard its memo of whether the local gcloud offers the flag at all. That answer leaves it empty — as do a cluster with no externally reachable DNS endpoint and a describe call that fails — leaving today's IP-endpoint command untouched. `installer_common.sh` and `lifecycle.sh` fall back to a stub setting the same empty value when the file is absent, as `reconcile_environment.sh` does, so a tree without it reaches every cluster with a routable IP endpoint rather than refusing to run.
+- **[gke_dns_endpoint.sh](gke_dns_endpoint.sh)**: `gke_dns_endpoint_flag`, which decides whether a given cluster should be reached with `get-credentials --dns-endpoint`. The agent's runtime copy also selects `--internal-ip` for a cluster on its own VPC; this helper does not, for the reason its header gives. This is the roster the file's own header defers to: `common.sh`, `installer_common.sh`, `install.sh`, `upgrade.sh`, `hack/ci-env.sh`, `hack/ci_sweep_bench_plants.sh`, `scripts/release/common.sh`, `scripts/release/reconcile_environment.sh`, `terraform/examples/full-install/lifecycle.sh`, and the staging-workload scripts all source it. It is kept out of `common.sh` and free of every helper in this directory so that each of them can take the predicate and nothing else — `hack/ci-env.sh` and `lifecycle.sh` want no part of the state file, and `installer_common.sh` is sourced by front doors that load no other helper. It sets `GKE_DNS_ENDPOINT_FLAG` rather than echoing, so that callers do not run it in a `$(...)` subshell that would discard its memo of whether the local gcloud offers the flag at all. That answer leaves it empty — as do a cluster with no externally reachable DNS endpoint and a describe call that fails — leaving today's IP-endpoint command untouched. `installer_common.sh` and `lifecycle.sh` fall back to a stub setting the same empty value when the file is absent, as `reconcile_environment.sh` does, so a tree without it reaches every cluster with a routable IP endpoint rather than refusing to run.
 - **[min_versions.sh](min_versions.sh)**: minimum tool versions, side-effect-free so
   `install.sh` can source it standalone before any checkout exists.
 - **[print_instructions_gchat.sh](print_instructions_gchat.sh)** /

@@ -84,7 +84,7 @@ func a2aTestCreds() *corev1.Secret {
 func TestBuildA2ANATSConfig(t *testing.T) {
 	agent := a2aTestAgent()
 	keys := a2aTestCalloutKeys(t)
-	secret := buildA2ANATSConfigSecret(agent, a2aTestCreds(), keys)
+	secret := buildA2ANATSConfigSecret(agent, a2aTestCreds(), keys, nil)
 
 	if secret.Name != "test-agent-a2a-nats-config" {
 		t.Errorf("config secret name = %q", secret.Name)
@@ -280,7 +280,7 @@ func TestSystemUsersAckGrantsAreScopedPerStream(t *testing.T) {
 		}
 	}
 
-	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 	if strings.Contains(conf, `"$JS.ACK.>"`) {
 		t.Error("nats.conf still grants unscoped $JS.ACK.> to someone")
 	}
@@ -618,7 +618,7 @@ func TestHandleDeletionReapsOnlyTheLabeledJetStreamPVC(t *testing.T) {
 // reach beyond those. The read-only web rail is the consumer; kubectl
 // port-forward is the demo transport, which is why ClusterIP is enough.
 func TestBuildA2ANATSConfigWebsocketAndWebUser(t *testing.T) {
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 
 	if !strings.Contains(conf, "websocket {") {
 		t.Fatal("nats.conf has no websocket block")
@@ -667,6 +667,15 @@ func TestBuildA2ANATSConfigWebsocketAndWebUser(t *testing.T) {
 	// principals' resources. An exact list means any widening is a review
 	// conversation, which is the only control that actually holds here.
 	pub := rest[strings.Index(rest, "publish"):strings.Index(rest, "subscribe")]
+	// The deny list follows the allow list in the block (#4173): pinned on
+	// its own below, so the allow list here is the allow list alone.
+	pubDeny := ""
+	if i := strings.Index(pub, "deny"); i >= 0 {
+		pub, pubDeny = pub[:i], pub[i:]
+	}
+	if got := quotedLines(pubDeny); !reflect.DeepEqual(got, a2aTasksFixedDurableDenyPublish()) {
+		t.Errorf("publish deny-list changed.\n got: %q\nwant: %q", got, a2aTasksFixedDurableDenyPublish())
+	}
 	var got []string
 	for _, line := range strings.Split(pub, "\n") {
 		line = strings.TrimSpace(line)
@@ -718,7 +727,7 @@ func TestBuildA2ANATSConfigWebsocketAndWebUser(t *testing.T) {
 // EXACTLY for the same reason web's list is - the reach lives in request
 // bodies and wildcards, and a blocklist cannot see either.
 func TestBuildA2ANATSConfigConsoleUser(t *testing.T) {
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 
 	start := strings.Index(conf, "user: console")
 	if start < 0 {
@@ -733,6 +742,15 @@ func TestBuildA2ANATSConfigConsoleUser(t *testing.T) {
 	}
 
 	pub := rest[strings.Index(rest, "publish"):strings.Index(rest, "subscribe")]
+	// The deny list follows the allow list in the block (#4173): pinned on
+	// its own below, so the allow list here is the allow list alone.
+	pubDeny := ""
+	if i := strings.Index(pub, "deny"); i >= 0 {
+		pub, pubDeny = pub[:i], pub[i:]
+	}
+	if got := quotedLines(pubDeny); !reflect.DeepEqual(got, a2aTasksFixedDurableDenyPublish()) {
+		t.Errorf("publish deny-list changed.\n got: %q\nwant: %q", got, a2aTasksFixedDurableDenyPublish())
+	}
 	sub := rest[strings.Index(rest, "subscribe"):]
 	subDeny := ""
 	if i := strings.Index(sub, "deny"); i >= 0 {
@@ -3866,7 +3884,7 @@ func TestNoAgentSidePrincipalCanPublishToTheDirectory(t *testing.T) {
 	// Third argument is this branch's: the callout's NKey seeds. #1313 wrote
 	// this test against the two-argument signature on main.
 	agent := a2aTestAgent()
-	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 	doc, err := renderA2AAuthMap(agent, nil)
 	if err != nil {
 		t.Fatalf("rendering the auth map: %v", err)
@@ -3968,17 +3986,17 @@ func TestA2AConfigRolloutHashOmitsCredentialsAndTracksRotation(t *testing.T) {
 
 	// Guard against an inert test: if the two creds rendered the same conf,
 	// an equal hash below would prove nothing.
-	confA := string(buildA2ANATSConfigSecret(agent, credsA, keys).Data["nats.conf"])
-	confB := string(buildA2ANATSConfigSecret(agent, credsB, keys).Data["nats.conf"])
+	confA := string(buildA2ANATSConfigSecret(agent, credsA, keys, nil).Data["nats.conf"])
+	confB := string(buildA2ANATSConfigSecret(agent, credsB, keys, nil).Data["nats.conf"])
 	if confA == confB {
 		t.Fatal("the two creds Secrets render the same nats.conf; the omission check below is inert")
 	}
 
-	hashA := a2aConfigRolloutHash(agent, credsA, keys, "serving-a")
+	hashA := a2aConfigRolloutHash(agent, credsA, keys, "serving-a", nil)
 	if len(hashA) != a2aConfigHashLength {
 		t.Errorf("rollout hash is %d characters, want %d", len(hashA), a2aConfigHashLength)
 	}
-	if hashB := a2aConfigRolloutHash(agent, credsB, keys, "serving-a"); hashA != hashB {
+	if hashB := a2aConfigRolloutHash(agent, credsB, keys, "serving-a", nil); hashA != hashB {
 		t.Errorf("the rollout hash still tracks the password bytes: %q vs %q", hashA, hashB)
 	}
 
@@ -3986,14 +4004,14 @@ func TestA2AConfigRolloutHashOmitsCredentialsAndTracksRotation(t *testing.T) {
 	// Update on the same Secret, so the UID does not move and the
 	// resourceVersion is the only thing that says a credential changed.
 	rotated := a2aFullCreds("b", "4712")
-	if hashRotated := a2aConfigRolloutHash(agent, rotated, keys, "serving-a"); hashA == hashRotated {
+	if hashRotated := a2aConfigRolloutHash(agent, rotated, keys, "serving-a", nil); hashA == hashRotated {
 		t.Error("a credential rotation does not roll the bus: the hash ignores resourceVersion")
 	}
 
 	// A config change: the agent's name is rendered into server_name.
 	other := a2aTestAgent()
 	other.Name = "other-agent"
-	if hashOther := a2aConfigRolloutHash(other, credsA, keys, "serving-a"); hashA == hashOther {
+	if hashOther := a2aConfigRolloutHash(other, credsA, keys, "serving-a", nil); hashA == hashOther {
 		t.Error("a config change does not roll the bus: the hash ignores the render")
 	}
 
@@ -4002,14 +4020,14 @@ func TestA2AConfigRolloutHashOmitsCredentialsAndTracksRotation(t *testing.T) {
 	// what the new callout signs. If this does not move the hash, the
 	// StatefulSet is never rolled and the bus rejects every authorization.
 	rotatedKeys := a2aTestCalloutKeys(t)
-	if hashKeys := a2aConfigRolloutHash(agent, credsA, rotatedKeys, "serving-a"); hashA == hashKeys {
+	if hashKeys := a2aConfigRolloutHash(agent, credsA, rotatedKeys, "serving-a", nil); hashA == hashKeys {
 		t.Error("a callout keypair rotation does not roll the bus: the hash ignores the public keys")
 	}
 
 	// A serving-certificate renewal: the kubelet updates the mounted files in
 	// place, but nats-server reads its certificate at boot, so the bus has to
 	// roll or it keeps serving the old one until it expires.
-	if hashRenewed := a2aConfigRolloutHash(agent, credsA, keys, "serving-b"); hashA == hashRenewed {
+	if hashRenewed := a2aConfigRolloutHash(agent, credsA, keys, "serving-b", nil); hashA == hashRenewed {
 		t.Error("a serving-certificate renewal does not roll the bus: the hash ignores the fingerprint")
 	}
 }
@@ -4894,7 +4912,7 @@ func TestSeedGrantsAndProvisionScriptNameTheSameStreams(t *testing.T) {
 //     including the ones a2aSeedJetStreamGrants produced. That is the question
 //     the server asks, so a wildcard cannot grant a route without naming it.
 func TestSeedHoldsNoWholesaleJetStreamAPI(t *testing.T) {
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 
 	// Seed's publish allow-list exactly, not the span to the next user: the
 	// following block's explanatory comment names grants of its own, and a
@@ -5008,7 +5026,7 @@ func TestSeedHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 // (TestAgentHoldsOnlyTheBlackboard), and a change that gave either of them the
 // other's list would put `worker` back under a new name.
 func TestBridgeHoldsNoWholesaleJetStreamAPI(t *testing.T) {
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 	got := a2aGrantSubjects(t, conf, a2aBridgeUser, "publish")
 
 	if sub, want := a2aGrantSubjects(t, conf, a2aBridgeUser, "subscribe"), []string{
@@ -5054,7 +5072,8 @@ func TestBridgeHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		section string
 		want    []string
 	}{
-		{"publish", capDenyPublish},
+		// The cap bucket, and the pre-created TASKS durables' names (#4173).
+		{"publish", withTasksFixedDurableDeny(capDenyPublish)},
 		{"subscribe", capDenySubscribe},
 	} {
 		deny, ok := a2aGrantDenials(t, conf, a2aBridgeUser, tc.section)
@@ -5158,6 +5177,8 @@ func TestBridgeHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	allowedShapes["$JS.API.DIRECT.GET.TASKS.>"] = true
 	allowedShapes["$JS.API.CONSUMER.MSG.NEXT.TASKS.*"] = true
 	allowedShapes["$JS.API.CONSUMER.DELETE.KV_runtime-state.*"] = true
+	// The bind on its own pre-created intake (#4173), by exact name.
+	allowedShapes["$JS.API.CONSUMER.INFO.TASKS.bridge-platform"] = true
 	for _, grant := range a2aBridgeJetStreamGrants() {
 		if !allowedShapes[grant] {
 			t.Errorf("bridge holds JetStream API grant %q, which is outside the shapes a2aBridgeJetStreamGrants argues for", grant)
@@ -5325,7 +5346,7 @@ func TestBusGrantsNameStreamsTheProvisionScriptCreates(t *testing.T) {
 // $JS.API.STREAM.DELETE.TASKS, which the wildcard permitted and which was
 // measured deleting the stream on a live install.
 func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 	got := a2aGrantSubjects(t, conf, "gateway", "publish")
 
 	if sub, want := a2aGrantSubjects(t, conf, "gateway", "subscribe"), []string{
@@ -5376,7 +5397,8 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		section string
 		want    []string
 	}{
-		{"publish", capDenyPublish},
+		// The cap bucket, and the pre-created TASKS durables' names (#4173).
+		{"publish", withTasksFixedDurableDeny(capDenyPublish)},
 		{"subscribe", capDenySubscribe},
 	} {
 		deny, ok := a2aGrantDenials(t, conf, "gateway", tc.section)
@@ -5496,6 +5518,8 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		"$JS.API.DIRECT.GET." + kvPeople + ".>":              true,
 		"$JS.API.CONSUMER.CREATE." + kvPeople + ".>":         true,
 		"$JS.API.CONSUMER.DELETE." + kvPeople + ".*":         true,
+		// The bind on its own pre-created relay (#4173), by exact name.
+		"$JS.API.CONSUMER.INFO." + a2aTasksStream + ".gateway-relay": true,
 	}
 	for _, grant := range a2aGatewayJetStreamGrants() {
 		if !allowedShapes[grant] {
@@ -5518,8 +5542,11 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 // this one is the cheap version that fails in milliseconds and says which
 // caller lost its route.
 func TestGatewayGrantCoversEveryJetStreamSubjectItsCallersEmit(t *testing.T) {
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 	grants := a2aGrantSubjects(t, conf, "gateway", "publish")
+	// A deny overrides an allow, so a subject the allow list covers and the
+	// deny list names is refused all the same.
+	denied, _ := a2aGrantDenials(t, conf, "gateway", "publish")
 
 	// The generated tokens nats.go supplies: an ordered consumer's name is
 	// nuid-derived with a serial suffix, and a KV watcher's is a hash.
@@ -5539,14 +5566,11 @@ func TestGatewayGrantCoversEveryJetStreamSubjectItsCallersEmit(t *testing.T) {
 		{"lib.TasksGet GetLastMsgForSubject (supervisor)", "$JS.API.DIRECT.GET." + a2aTasksStream + ".a2a.tasks.platform.task-0001.supervisor"},
 		{"lib.TasksGet OrderedConsumer", "$JS.API.CONSUMER.CREATE." + a2aTasksStream + "." + orderedConsumerName},
 		{"lib.TasksGet ordered Next", "$JS.API.CONSUMER.MSG.NEXT." + a2aTasksStream + "." + orderedConsumerName},
-		// gateway.Run's event relay: two filter subjects, so nats.go puts
-		// the filter in the body and the subject ends at the durable name.
-		{"lib.SubscribeDurable relay create", "$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".gateway-relay"},
+		// gateway.Run's event relay binds the durable the provision Job
+		// created (#4173): js.Consumer, an INFO on that one name, and never
+		// a create.
+		{"lib.SubscribeDurable relay bind (Precreated)", "$JS.API.CONSUMER.INFO." + a2aTasksStream + ".gateway-relay"},
 		{"relay Consume pull", "$JS.API.CONSUMER.MSG.NEXT." + a2aTasksStream + ".gateway-relay"},
-		// The same durable rebound with ONE filter subject, which is the
-		// shape every install already has on disk and the shape a rebind
-		// goes through: nats.go appends the filter to the API subject.
-		{"lib.SubscribeDurable single-filter rebind", "$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".gateway-relay." + eventsSubject},
 		// gateway.Registry, over the session-state bucket.
 		{"Registry js.KeyValue", "$JS.API.STREAM.INFO." + kvSessionState},
 		{"Registry Get / SessionForTask (kv.Get)", "$JS.API.DIRECT.GET." + kvSessionState + ".$KV." + a2aSessionStateBucket + "." + sessionKey},
@@ -5580,6 +5604,11 @@ func TestGatewayGrantCoversEveryJetStreamSubjectItsCallersEmit(t *testing.T) {
 			t.Errorf("no gateway grant covers %q (%s); that call gets no reply and the caller waits out its context",
 				tc.subject, tc.caller)
 		}
+		for _, d := range denied {
+			if subjectMatches(d, tc.subject) {
+				t.Errorf("the gateway's deny %q refuses %q (%s), which its allow list covers", d, tc.subject, tc.caller)
+			}
+		}
 	}
 }
 
@@ -5596,7 +5625,7 @@ func TestGatewayGrantCoversEveryJetStreamSubjectItsCallersEmit(t *testing.T) {
 // are: a grant naming a bucket nothing creates is a call that times out on a
 // real install and nowhere else.
 func TestGatewayGrantNamesTheBucketItsDataPlaneWritesTo(t *testing.T) {
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 	grants := a2aGrantSubjects(t, conf, "gateway", "publish")
 
 	known := []string{a2aTasksStream}
@@ -6055,7 +6084,7 @@ func checkA2AUserGrants(t a2aGrantReporter, user string, row a2aGrantRow, lists 
 // widening gets.
 func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 	agent := a2aTestAgent()
-	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 
 	const (
 		bareJetStreamAPI = "$JS.API.>"
@@ -6081,7 +6110,9 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 	rows := map[string]a2aGrantRow{
 		"gateway": {
 			streams: map[string][]string{
-				a2aTasksStream: {"ACK", "STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.MSG.NEXT", "DIRECT.GET"},
+				// CONSUMER.INFO is the bind on its pre-created relay and
+				// names only that durable (TestGatewayHoldsNoWholesaleJetStreamAPI).
+				a2aTasksStream: {"ACK", "STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.INFO", "CONSUMER.MSG.NEXT", "DIRECT.GET"},
 				kvSessionState: {"KV", "STREAM.INFO", "DIRECT.GET", "CONSUMER.CREATE", "CONSUMER.DELETE"},
 				// The profile cards' start-up read: the subject list and a
 				// direct get per card, no consumer (readDirectory).
@@ -6104,7 +6135,9 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 		},
 		a2aBridgeUser: {
 			streams: map[string][]string{
-				a2aTasksStream: {"STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.MSG.NEXT", "DIRECT.GET", "ACK"},
+				// CONSUMER.INFO is the bind on its pre-created intake and
+				// names only that durable (TestBridgeHoldsNoWholesaleJetStreamAPI).
+				a2aTasksStream: {"STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.INFO", "CONSUMER.MSG.NEXT", "DIRECT.GET", "ACK"},
 				kvRuntimeState: {"KV", "STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.DELETE"},
 			},
 		},
@@ -6140,8 +6173,15 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 			accountLevel: []string{"$JS.API.INFO"},
 		},
 		"provision": {
-			callout:      true,
-			streams:      a2aSameVerbsOn(a2aProvisionedStreams, "STREAM.CREATE", "STREAM.INFO"),
+			callout: true,
+			// Plus CONSUMER.INFO and CONSUMER.CREATE on TASKS, naming only
+			// the two durables it pre-creates (#4173,
+			// TestProvisionHoldsConsumerGrantsOnlyOnTheFixedDurables).
+			streams: func() map[string][]string {
+				m := a2aSameVerbsOn(a2aProvisionedStreams, "STREAM.CREATE", "STREAM.INFO")
+				m[a2aTasksStream] = append(m[a2aTasksStream], "CONSUMER.INFO", "CONSUMER.CREATE")
+				return m
+			}(),
 			accountLevel: []string{"$JS.API.INFO", "$JS.API.STREAM.NAMES", "$JS.API.STREAM.LIST"},
 		},
 		"session": {
@@ -6937,9 +6977,10 @@ func TestA2AInjectBackendIsRemovedWhenTheFlagGoesOff(t *testing.T) {
 }
 
 // TestA2AInjectFlagOffRemovalReadsTheSecretUncached: the flag-off path reads
-// four objects before deleting them, and the fourth is a Secret. The operator
-// ships secrets with get only, so a cached Get of one starts an informer
-// whose LIST is forbidden and blocks the single reconcile worker for good --
+// four objects before deleting them, and the fourth is a Secret. The manager
+// does not watch Secrets, so a cached Get of one starts a cluster-wide Secret
+// informer that holds every Secret in memory and blocks the single reconcile
+// worker in WaitForCacheSync wherever list/watch on secrets is trimmed --
 // the fake client cannot show that hang (its cache is the store), so this
 // test fails the cached path outright and passes only if the Secret is read
 // through the reader the other A2A Secrets use.
@@ -6960,7 +7001,7 @@ func TestA2AInjectFlagOffRemovalReadsTheSecretUncached(t *testing.T) {
 	cached := interceptor.NewClient(base, interceptor.Funcs{
 		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 			if _, ok := obj.(*corev1.Secret); ok && strict.Load() {
-				return fmt.Errorf("cached Get of Secret %s: on the shipped RBAC this starts an informer whose LIST is forbidden, and the reconcile worker blocks in WaitForCacheSync", key)
+				return fmt.Errorf("cached Get of Secret %s: starts an unwatched cluster-wide Secret informer instead of reading through APIReader", key)
 			}
 			return c.Get(ctx, key, obj, opts...)
 		},
@@ -8501,7 +8542,7 @@ func TestProvisionedJetStreamCapsFitTheStore(t *testing.T) {
 		}
 	}
 
-	conf := renderA2ANATSConf(agent, func(string) string { return "pw" }, &a2aCalloutKeys{IssuerPublic: "A", XKeyPublic: "X"})
+	conf := renderA2ANATSConf(agent, func(string) string { return "pw" }, &a2aCalloutKeys{IssuerPublic: "A", XKeyPublic: "X"}, nil)
 	m := regexp.MustCompile(`(?m)^\s*max_file_store:\s*(\d+)\s*$`).FindStringSubmatch(conf)
 	if m == nil {
 		t.Fatal("nats.conf renders no max_file_store")
@@ -8842,4 +8883,17 @@ func TestA2AChartPodsDiscardWarnsOncePerGenerationAndValue(t *testing.T) {
 			}
 		})
 	}
+}
+
+// quotedLines are the quoted entries of a rendered permission list, one per
+// line, in order.
+func quotedLines(block string) []string {
+	var out []string
+	for _, line := range strings.Split(block, "\n") {
+		line = strings.TrimSuffix(strings.TrimSpace(line), ",")
+		if strings.HasPrefix(line, `"`) {
+			out = append(out, strings.Trim(line, `"`))
+		}
+	}
+	return out
 }

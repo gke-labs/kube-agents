@@ -9,7 +9,8 @@ governance/stockout_prevention_sop.md.
 
 **All twelve checks are converted.** Ten read structures this repository's
 other collectors already read with confidence — a `ComputeClass`/`Deployment`/
-`StatefulSet`/`StorageClass`/`Node` dump, `gcloud container node-pools list`,
+`StatefulSet`/`StorageClass`/`Node` dump, the node pools (the discovery
+`clusters list` item's `nodePools`, else `gcloud container node-pools list`),
 `gcloud compute reservations list`, `gcloud compute regions describe
 --format=json(quotas)`: `ccc-missing-fallbacks`, `ccc-no-ondemand-floor`,
 `ccc-large-vm-scarcity`, `ccc-priority-starvation`,
@@ -396,6 +397,14 @@ _COMMITMENT_QUOTA_PREFIX = "COMMITTED_"
 # ceiling "a hard stop, not a soft one, so 'close to it' means measurably
 # close, not a judgment call".
 NODEPOOL_CEILING_FRACTION = 0.9
+# How each arm of §3.9 opens its excerpt clause. The arms share a slug, an
+# object kind and a severity, so the excerpt is the one field that says which
+# fired: audit_report.py's declared-intent join reads these two prefixes
+# (`ZONE_LOCKED_ARM_MARK`, `CEILING_ARM_MARK`) to move a declared zone-locked
+# pool and leave a pool at its ceiling a finding, and a test pins its copies
+# to these. Reword them here and there together, never one side alone.
+ZONE_LOCKED_ARM_PREFIX = "single-zone ("
+CEILING_ARM_PREFIX = "at its autoscaling ceiling:"
 
 # §3.9's Impact, one per arm. The arms share a slug and nothing else, so no
 # single sentence is true of both: the zone-locked arm is about a stockout in
@@ -544,6 +553,8 @@ def is_non_production(name: str, labels: dict | None = None, namespace: str = ""
 
 
 Run = collector_run.Run
+listing_fields = collector_run.listing_fields
+listed_node_pools = collector_run.listed_node_pools
 run_and_gate = collector_run.run_and_gate
 paged_dump = collector_run.paged_dump
 paged_command_text = collector_run.paged_command_text
@@ -800,12 +811,14 @@ def _advising_once(run: RunFn) -> RunFn:
 
 
 def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[dict]]:
-    result = run(
-        [
-            "gcloud", "container", "clusters", "list", "--project", project,
-            "--format", "json(name,location,locations,status,currentMasterVersion,autopilot.enabled,autoscaling.enableNodeAutoprovisioning,autoscaling.autoprovisioningLocations,addonsConfig.configConnectorConfig.enabled)",
-        ]
-    )
+    # `nodePools` so the Standard clusters' single-zone-nodepool read can take
+    # them from here (`collector_run.listed_node_pools`); the projection gains
+    # that sub-object and nothing else.
+    listing_argv = [
+        "gcloud", "container", "clusters", "list", "--project", project,
+        "--format", "json(name,location,locations,status,currentMasterVersion,autopilot.enabled,autoscaling.enableNodeAutoprovisioning,autoscaling.autoprovisioningLocations,addonsConfig.configConnectorConfig.enabled,nodePools)",
+    ]
+    result = run(listing_argv)
     if result.rc != 0:
         if _api_disabled(result):
             ours, why_not = refusal_owner(project, result.stderr, run=run)
@@ -841,6 +854,7 @@ def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[di
             "autoprovisioning_locations": (c.get("autoscaling") or {}).get("autoprovisioningLocations") or [],
             # Read first by the Config Connector read after the sweep.
             kcc_health.ADDON_FIELD: kcc_health.addon_enabled(c),
+            **listing_fields(c, listing_argv),
         }
         for c in clusters
         if c.get("status") in AUDITABLE_STATUSES
@@ -1498,7 +1512,7 @@ def check_single_zone_nodepool(pool: dict, has_nap: bool, current_node_count: in
             why = f"tainted ({keys}), so no other pool is counted as its fallback"
         else:
             why = f"no multi-zone node pool of machine type {machine_type or 'unknown'} on the cluster"
-        excerpts.append(f"single-zone ({locations}), autoscaling enabled, no NAP, {why}")
+        excerpts.append(f"{ZONE_LOCKED_ARM_PREFIX}{locations}), autoscaling enabled, no NAP, {why}")
         impacts.append(_IMPACT_ZONE_LOCKED)
     if at_ceiling:
         # Name the arm and the zone span. This condition has nothing to do with
@@ -1508,7 +1522,7 @@ def check_single_zone_nodepool(pool: dict, has_nap: bool, current_node_count: in
         # 3.9 keys its impact and its remediation off this prefix, so a run
         # stops proposing multi-zone node pools to an operator who has them.
         excerpts.append(
-            f"at its autoscaling ceiling: {current_node_count}/{ceiling} live nodes "
+            f"{CEILING_ARM_PREFIX} {current_node_count}/{ceiling} live nodes "
             f"({current_node_count / ceiling * 100:.0f}% of {basis}), zones {locations}"
         )
         impacts.append(_ceiling_impact(ceiling, current_node_count, has_nap))
@@ -2015,8 +2029,17 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     pools_record: dict | None = None
     pools_readable = False
     if not autopilot:
-        node_pools_argv = ["gcloud", "container", "node-pools", "list", "--cluster", name, "--location", location, "--project", project, "--format", "json"]
-        parsed_pools, pools_result = run_and_gate(node_pools_argv, run=run)
+        # Taken from the discovery listing when it carried the pools, and
+        # recorded against that listing's command, the read that returned them.
+        pools_result, unlisted = listed_node_pools(cluster)
+        if pools_result is not None:
+            parsed_pools = json.loads(pools_result.stdout)
+            pools_command = shlex.join(pools_result.argv)
+        else:
+            log(f"{project}/{location}/{name}: {unlisted}; reading node-pools list")
+            node_pools_argv = ["gcloud", "container", "node-pools", "list", "--cluster", name, "--location", location, "--project", project, "--format", "json"]
+            parsed_pools, pools_result = run_and_gate(node_pools_argv, run=run)
+            pools_command = shlex.join(node_pools_argv)
         # Empty output at exit 0 is a cluster with no pools; output that does
         # not parse to a list of objects (the shim's cut, an error object, a
         # stray string) is a failed read, filed below as unevaluated rather
@@ -2025,7 +2048,7 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         pools_unreadable = pools_result.rc == 0 and bool(pools_result.stdout.strip()) and not pools_listed
         pools_readable = pools_result.rc == 0 and not pools_unreadable
         node_pools = parsed_pools if pools_listed else []
-        pools_record = _record(shlex.join(node_pools_argv), pools_result)
+        pools_record = _record(pools_command, pools_result)
     pools_failure = ""
     if not autopilot and not pools_readable:
         pools_failure = (

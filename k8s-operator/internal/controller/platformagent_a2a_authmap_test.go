@@ -240,7 +240,7 @@ func TestRenderedAuthMapMatchesTheCalloutFixture(t *testing.T) {
 const natsConfFixturePath = "../../../a2a/authcallout/testdata/rendered-nats.conf"
 
 func TestRenderedNATSConfMatchesTheCalloutFixture(t *testing.T) {
-	conf := string(buildA2ANATSConfigSecret(authMapTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(authMapTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 
 	// The generated keys differ on every run, so the committed fixture is
 	// normalised to a stable placeholder. The consuming test replaces these

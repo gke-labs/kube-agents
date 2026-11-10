@@ -871,12 +871,22 @@ cache contract.
        not kill it before the drain and the exit end. Chat receipts still unsettled go back to
        Pub/Sub; Slack and Teams events the gateway did not pull before the exit end with the
        process, and the Slack count is logged. This half is implemented (`install_shutdown_handler`
-       in `credential_proxy.py`, the broker and exec roles).
-     - On the exec tier, `RollingUpdate` keeps another replica serving, so the drain is long: a
-       `terminationGracePeriodSeconds` longer than the longest command it admits. Today an exec
-       pod runs the broker's 30 s drain inside the broker's 45 s grace period; the longer drain is
-       #4780. A PodDisruptionBudget with `maxUnavailable: 1` applies only when replicas are 2 or
-       more; at 1 replica it protects nothing.
+       in `credential_proxy.py`, the broker role).
+     - On the exec tier, `RollingUpdate` keeps another replica serving, so the drain is long: it
+       lasts as long as the longest command the pod admits, the 300 s command timeout plus the
+       60 s slot wait, because a request still waiting for a slot at SIGTERM can be admitted. The
+       pod's `terminationGracePeriodSeconds` is 380 s, which holds the 360 s drain, the end wait
+       and the exit. An idle pod still stops after the 3 s settle. A stopping pod keeps its CPU
+       and quota until it exits, so a rollout step whose replacement has no room waits up to that
+       long. A draining exec pod answers its readiness probe with 503, and three failed probes 3 s apart
+       take it out of the Service, so at 1 replica a new call's connect fails after about 9 s, once
+       the endpoint change has reached the node, and the caller falls back to the stateful
+       broker until the replacement is Ready. Until then a new call reads `draining`, which the
+       shim retries on a new connection. The commands already in flight finish on the stopping
+       pod. A
+       PodDisruptionBudget with `maxUnavailable: 1` applies only when replicas are 2 or more; at 1
+       replica it protects nothing. This half is implemented (`EXEC_SHUTDOWN_DRAIN_SECONDS` in
+       `credential_proxy.py`, `credentialProxyExecTierTerminationGraceSeconds` in the operator).
 1. **Off by default.** New CR field `spec.deployment.credentialProxy.exec.replicas`. The value 0
    (the default) means no exec tier and no `CREDENTIAL_PROXY_EXEC_URL`, so every install behaves
    as today. The operator sets N. It is not derived from the fleet size and not an autoscaling

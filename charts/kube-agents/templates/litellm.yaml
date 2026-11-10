@@ -149,18 +149,7 @@
   path relative to the config directory, which is why its two files are
   mounted beside config.yaml below.
 */}}
-{{- /*
-  Every callback entry, named once in kube-agents.litellmCallbacks and sorted
-  there by whether it is in the shadow replay proxy's key: $keyedHook entries
-  change what the model is sent or what comes back, $unkeyedHook entries only
-  export telemetry, fetch a credential or pick a serving replica. A keyed
-  hook's source goes in $replayBehaviourSources where it is registered.
-*/}}
-{{- $callbackClasses := include "kube-agents.litellmCallbacks" . | fromJson }}
-{{- $keyedHook := $callbackClasses.replayKeyed }}
-{{- $unkeyedHook := $callbackClasses.replayUnkeyed }}
-{{- $callbackList := ternary (list $unkeyedHook.otel $unkeyedHook.prometheus) (list $unkeyedHook.prometheus) .Values.litellm.otel }}
-{{- $replayBehaviourSources := list }}
+{{- $callbackList := ternary (list "otel" "prometheus") (list "prometheus") .Values.litellm.otel }}
 {{- /*
   The thinking-replay hook runs on every install: it acts only on a request
   bound for a Gemini model, and leaves every other model's request as sent.
@@ -170,8 +159,7 @@
 {{- if empty $thinkingReplaySource }}
 {{- fail "the chart's files/litellm_thinking_replay_callback.py is missing" }}
 {{- end }}
-{{- $callbackList = append $callbackList $keyedHook.thinkingReplay }}
-{{- $replayBehaviourSources = append $replayBehaviourSources $thinkingReplaySource }}
+{{- $callbackList = append $callbackList "litellm_thinking_replay_callback.proxy_handler_instance" }}
 {{- /*
   The cache-marker hook runs on every install too: it drops a caller's own
   cache_control markers from a request bound for a Gemini model, which LiteLLM
@@ -182,11 +170,9 @@
 {{- if empty $cacheControlStripSource }}
 {{- fail "the chart's files/litellm_cache_control_strip_callback.py is missing" }}
 {{- end }}
-{{- $callbackList = append $callbackList $keyedHook.cacheControlStrip }}
-{{- $replayBehaviourSources = append $replayBehaviourSources $cacheControlStripSource }}
+{{- $callbackList = append $callbackList "litellm_cache_control_strip_callback.proxy_handler_instance" }}
 {{- if $redactionEnabled }}
-{{- $callbackList = append $callbackList $keyedHook.redaction }}
-{{- $replayBehaviourSources = concat $replayBehaviourSources (list $redactionConfig $redactorSource $redactionCallbackSource) }}
+{{- $callbackList = append $callbackList "litellm_redaction_callback.proxy_handler_instance" }}
 {{- end }}
 {{- /*
   The OAuth2 client-credentials hook, for an openai_compatible gateway that
@@ -203,7 +189,7 @@
 {{- if empty $oauthHookSource }}
 {{- fail "the chart's files/litellm_oauth2_callback.py is missing" }}
 {{- end }}
-{{- $callbackList = append $callbackList $unkeyedHook.oauth2 }}
+{{- $callbackList = append $callbackList "litellm_oauth2_callback.proxy_handler_instance" }}
 {{- end }}
 {{- /*
   The session-affinity hook gives each Gemini conversation a Vertex session_id
@@ -224,7 +210,7 @@
 {{- if empty $sessionAffinitySource }}
 {{- fail "litellm.vertex.sessionAffinity is enabled but the chart's files/litellm_session_affinity_callback.py is missing" }}
 {{- end }}
-{{- $callbackList = append $callbackList $unkeyedHook.sessionAffinity }}
+{{- $callbackList = append $callbackList "litellm_session_affinity_callback.proxy_handler_instance" }}
 {{- end }}
 {{- $traceLogEnabled := default false .Values.litellm.traceLogEnabled }}
 {{- $traceLogPath := .Values.litellm.traceLogPath | default "/tmp/litellm_traces.jsonl" }}
@@ -248,7 +234,7 @@
 {{- if empty $traceLogSource }}
 {{- fail "the chart's files/llm_trace_logger.py is missing" }}
 {{- end }}
-{{- $callbackList = append $callbackList $unkeyedHook.traceLog }}
+{{- $callbackList = append $callbackList "llm_trace_logger.proxy_handler_instance" }}
 {{- end }}
 {{- $quotedCallbacks := list }}
 {{- range $callbackList }}
@@ -265,7 +251,7 @@
   concrete model gets routed rather than a 404 from the gateway.
 */}}
 {{- $fallback := .Values.litellm.fallback | default dict }}
-{{- $config := include "kube-agents.litellmConfig" (merge (dict "provider" $provider "model" $model "callbacks" $callbacks "maxTokens" .Values.litellm.maxTokens "reasoningEffort" .Values.litellm.reasoningEffort "dropParams" .Values.litellm.dropParams "fallback" $fallback "timeoutSeconds" $fallback.timeoutSeconds "numRetries" $fallback.numRetries "retryAfterSeconds" $fallback.retryAfterSeconds) $configEndpoint) }}
+{{- $config := include "kube-agents.litellmConfig" (merge (dict "provider" $provider "model" $model "callbacks" $callbacks "maxTokens" .Values.litellm.maxTokens "reasoningEffort" .Values.litellm.reasoningEffort "dropParams" .Values.litellm.dropParams "fallback" $fallback "timeoutSeconds" $fallback.timeoutSeconds "numRetries" $fallback.numRetries "retryAfterSeconds" $fallback.retryAfterSeconds "budget" .Values.litellm.budget "replicas" .Values.litellm.replicaCount) $configEndpoint) }}
 {{- /*
   Every key the ConfigMap carries feeds the checksum: the thinking-replay
   and cache-marker hooks, the rule file, the two redaction modules, the OAuth2
@@ -287,16 +273,6 @@
 */}}
 {{- $replayShadow := .Values.litellm.replayShadow | default dict }}
 {{- $replayShadowEnabled := default false $replayShadow.enabled }}
-{{- $replayModelBehaviourChecksum := "" }}
-{{- if $replayShadowEnabled }}
-{{- $replayBehaviourCallbacks := list }}
-{{- range $callbackList }}
-{{- if has . (values $keyedHook) }}
-{{- $replayBehaviourCallbacks = append $replayBehaviourCallbacks . }}
-{{- end }}
-{{- end }}
-{{- $replayModelBehaviourChecksum = include "kube-agents.replayModelBehaviourChecksum" (dict "config" $config "callbacks" $replayBehaviourCallbacks "sources" $replayBehaviourSources) }}
-{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -716,6 +692,25 @@ spec:
 {{- $replayShadowDataSize := "2Gi" }}
 {{- $replayShadowDataMaxBytes := 1610612736 }}
 {{- /*
+  The mode (values.yaml, replayShadow.mode). Record and replay keep saved
+  answers in the same volume (cacheDir). Record's are emptied as the collector
+  copies them out, and the proxy counts them against REPLAY_DATA_MAX_BYTES with
+  the logs and store, so the budget stays as it is. Replay's are the seeded
+  cache, which the replay lane holds to 512 MiB of disk
+  (hack/replay-proxy/fetch_cache.py) outside the budget, so the logs and store
+  get 1 GiB there and all three stay under the volume. Replay serves answers,
+  so it renders only with allowServe as well; the schema refuses either alone,
+  and this refuses it again.
+*/}}
+{{- $replayShadowMode := $replayShadow.mode | default "shadow" }}
+{{- $replayShadowAllowServe := default false $replayShadow.allowServe }}
+{{- if or (and (eq $replayShadowMode "replay") (not $replayShadowAllowServe)) (and $replayShadowAllowServe (ne $replayShadowMode "replay")) }}
+{{- fail "litellm.replayShadow: mode replay and allowServe true go together; set both or neither" }}
+{{- end }}
+{{- if eq $replayShadowMode "replay" }}
+{{- $replayShadowDataMaxBytes = 1073741824 }}
+{{- end }}
+{{- /*
   The proxy closes a log segment this long after its first line, and a pod
   being replaced keeps running this long after it leaves the Service
   (preStop). While it drains, its segments close 5 s after their first line
@@ -822,12 +817,10 @@ spec:
             - name: REPLAY_DATA_MAX_BYTES
               value: {{ $replayShadowDataMaxBytes | quote }}
             # What the LiteLLM pods are running, part of every fingerprint:
-            # a checksum of the config that treats the Gemini API and Vertex
-            # AI routes as one (kube-agents.replayModelBehaviourChecksum says
-            # why, and what else it leaves out), and their image. A change to
-            # either rolls the proxy.
-            - name: REPLAY_MODEL_BEHAVIOUR_CHECKSUM
-              value: {{ $replayModelBehaviourChecksum | quote }}
+            # the same checksum their checksum/config annotation carries, and
+            # their image. A change to either rolls the proxy with them.
+            - name: REPLAY_LITELLM_CONFIG_CHECKSUM
+              value: {{ $checksumInput | sha256sum | quote }}
             - name: REPLAY_LITELLM_IMAGE
               value: "{{ include "kube-agents.imageRepository" (dict "repository" .Values.litellm.image.repository "registry" (include "kube-agents.thirdPartyImageRegistry" .)) }}:{{ .Values.litellm.image.tag }}"
             - name: REPLAY_JOB_KIND
@@ -838,6 +831,17 @@ spec:
               value: {{ $replayShadowJob.build | default "" | quote }}
             - name: REPLAY_JOB_PR
               value: {{ $replayShadowJob.pr | default "" | quote }}
+            {{- if ne $replayShadowMode "shadow" }}
+            - name: REPLAY_MODE
+              value: {{ $replayShadowMode | quote }}
+            - name: REPLAY_CACHE_DIR
+              value: {{ $replayShadow.cacheDir | default "/data/replay-cache" | quote }}
+            {{- end }}
+            {{- if and (eq $replayShadowMode "replay") $replayShadowAllowServe }}
+            # Replay mode refuses to start without it (hack/replay-proxy/README.md, "Modes").
+            - name: REPLAY_ALLOW_SERVE
+              value: "yes"
+            {{- end }}
           ports:
             - containerPort: 8080
           # Forwarded through the proxy to LiteLLM's own readiness endpoint, so

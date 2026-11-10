@@ -2786,6 +2786,7 @@ class TestAuditCatalogue(unittest.TestCase):
                 "kanban-workspace-gc",
                 "session-retention",
                 "kanban-board-health",
+                "kanban-block-recheck",
                 "findings-morning-nudge",
                 "chat-delivery-watch",
                 "feedback-prompt",
@@ -6673,7 +6674,7 @@ class TestDeclaredIntent(BaseTestCase):
                 self.validate(doc)
 
     def test_a_stream_without_a_declared_intent_step_rejects_the_list(self):
-        # Five streams have no declared-intent step. A worker on one of them that writes a
+        # Four streams have no declared-intent step. A worker on one of them that writes a
         # `declared` list has misread a step that does not exist for it, and a
         # hostile document has found a stream with no rule to break; both are
         # rejected whole rather than admitted because the check is on the
@@ -6685,7 +6686,7 @@ class TestDeclaredIntent(BaseTestCase):
             if not spec.declarable
         ]
         self.assertIn(NON_DECLARING_AUDIT, silent)
-        self.assertEqual(len(silent), len(audit_report.AUDITS) - 4)
+        self.assertEqual(len(silent), len(audit_report.AUDITS) - 5)
         for audit_id in silent:
             with self.subTest(audit=audit_id):
                 doc = make_doc(audit=audit_id, findings=[])
@@ -7734,6 +7735,247 @@ class TestCostDeclaredShapes(HarnessTestCase):
                     audit_report.validate_findings(copy.deepcopy(written), self.COST)
                 self.assertIn("declared[0].object", str(caught.exception))
                 self.assertIn("never a roll-up", str(caught.exception))
+
+
+class TestStockoutDeclaredShapes(HarnessTestCase):
+    """The stockout stream's one posture: a zone-locked pool. The pool at its ceiling shares the slug and stays a finding."""
+
+    STOCKOUT = "stockout-prevention"
+    CLUSTER = "acme-prod/us-east1-b/prod-us-east"
+    PROJECT = "project/acme-prod"
+    # The two arms as fleet_stockout.py's check_single_zone_nodepool spells
+    # them; a pool matching both carries both clauses, joined.
+    ZONE_LOCKED = "single-zone (['us-east1-b']), autoscaling enabled, no NAP, tainted (seeded-role), so no other pool is counted as its fallback"
+    AT_CEILING = "at its autoscaling ceiling: 9/10 live nodes (90% of maxNodeCount 10 x 1 zone), zones ['us-east1-b']"
+
+    def _pool_finding(self, fid, obj, excerpt):
+        return make_finding(fid=fid, check="single-zone-nodepool", severity="major", cluster=self.CLUSTER, namespace="", obj=obj, excerpt=excerpt, command="gcloud container node-pools list --cluster=prod-us-east --location=us-east1-b --project=acme-prod --format=json", remediation={"kind": "manual", "note": "a human decides"})
+
+    def _quota_finding(self):
+        return make_finding(fid="quota", check="quota-exhaustion-risk", severity="critical", cluster=self.PROJECT, namespace="", obj="Quota/us-east1:CPUS", excerpt="CPUS at 95% of its limit", command="gcloud compute regions describe us-east1 --project=acme-prod --format=json(quotas)", remediation={"kind": "manual", "note": "a human decides"})
+
+    def _doc(self, findings):
+        clusters = [
+            {"name": self.CLUSTER, "location": "us-east1-b", "project": "acme-prod", "checks_run": list(audit_report.audit_target_checks(self.STOCKOUT, self.CLUSTER))},
+            {"name": self.PROJECT, "location": "-", "project": "acme-prod", "checks_run": list(audit_report.audit_target_checks(self.STOCKOUT, self.PROJECT))},
+        ]
+        return audit_report.validate_findings(make_doc(findings=findings, audit=self.STOCKOUT, clusters=clusters), self.STOCKOUT)
+
+    def _declaration(self, obj, check="single-zone-nodepool", **extra):
+        return {"check": check, "namespace": "", "object": obj, "repo": "acme/fleet", "path": "knowledge/zonal-pools.md", "excerpt": "x", **extra}
+
+    def test_the_declarable_set_is_the_zone_locked_pool(self):
+        # Pinned as a literal: the catalogue test only checks the set is a
+        # subset of the roster, and a fault slipping in would pass it.
+        self.assertEqual(audit_report.audit_declarable_checks(self.STOCKOUT), frozenset({"single-zone-nodepool"}))
+        for fault in ("quota-exhaustion-risk", "autoscaler-out-of-resources", "ccc-no-ondemand-floor", "dangling-compute-class", "spot-scarcity-risk"):
+            self.assertNotIn(fault, audit_report.audit_declarable_checks(self.STOCKOUT))
+
+    def test_a_declaration_moves_the_zone_locked_pool_and_not_one_at_its_ceiling(self):
+        # One note names three pools and a quota. The zone-locked pool moves;
+        # the pool at its ceiling and the pool matching both arms stay, each
+        # said on stderr; the quota is never looked up.
+        locked = self._pool_finding("locked", "NodePool/zonal-batch", self.ZONE_LOCKED)
+        ceiling = self._pool_finding("ceiling", "NodePool/regional-web", self.AT_CEILING)
+        both = self._pool_finding("both", "NodePool/zonal-full", f"{self.ZONE_LOCKED}; {self.AT_CEILING}")
+        doc = self._doc([locked, ceiling, both, self._quota_finding()])
+        declarations = [self._declaration(obj) for obj in ("NodePool/zonal-batch", "NodePool/regional-web", "NodePool/zonal-full")]
+        declarations.append(self._declaration("Quota/us-east1:CPUS", check="quota-exhaustion-risk"))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            moved = audit_report.apply_declarations(doc, declarations)
+        self.assertEqual([f["object"] for f in moved], ["NodePool/zonal-batch"])
+        self.assertEqual([f["object"] for f in doc["findings"]], ["NodePool/regional-web", "NodePool/zonal-full", "Quota/us-east1:CPUS"])
+        self.assertEqual([e["object"] for e in doc["declared"]], ["NodePool/zonal-batch"])
+        self.assertEqual(err.getvalue().count("DECLARATION NOT APPLIED"), 2)
+        self.assertIn("at its autoscaling ceiling", err.getvalue())
+        self.assertIn("SOP §3.9", err.getvalue())
+        self.assertIn("acme/fleet:knowledge/zonal-pools.md stands and the finding publishes", err.getvalue())
+
+    def test_the_manifest_route_declares_a_zone_locked_candidate_and_not_one_at_its_ceiling(self):
+        locked = {"check": "single-zone-nodepool", "cluster": self.CLUSTER, "namespace": "", "object": "NodePool/zonal-batch", "severity": "major", "excerpt": self.ZONE_LOCKED}
+        full = {"check": "single-zone-nodepool", "cluster": self.CLUSTER, "namespace": "", "object": "NodePool/zonal-full", "severity": "major", "excerpt": f"{self.ZONE_LOCKED}; {self.AT_CEILING}"}
+        manifest = {"clusters": [{"name": self.CLUSTER, "candidates": [locked, full]}]}
+        doc = self._doc([])
+        declarations = [self._declaration("NodePool/zonal-batch"), self._declaration("NodePool/zonal-full")]
+        with contextlib.redirect_stderr(io.StringIO()):
+            added = audit_report.declare_collector_candidates(doc, declarations, manifest)
+        self.assertEqual(added, [audit_report._shorten_id(audit_report.derive_finding_id(locked))])
+        self.assertEqual([e["object"] for e in doc["declared"]], ["NodePool/zonal-batch"])
+
+    def test_an_incomplete_search_withholds_both_arms_and_publishes_the_faults(self):
+        # The withhold cannot tell the arms apart without reading the excerpt
+        # and errs toward holding, as it does for `hpa-cannot-scale`.
+        locked = self._pool_finding("locked", "NodePool/zonal-batch", self.ZONE_LOCKED)
+        ceiling = self._pool_finding("ceiling", "NodePool/regional-web", self.AT_CEILING)
+        doc = self._doc([locked, ceiling, self._quota_finding()])
+        doc.pop(audit_report.DECLARED_INTENT_SEARCHED_KEY, None)
+        with contextlib.redirect_stderr(io.StringIO()):
+            withheld = audit_report.withhold_unsearched_postures(doc, None)
+        self.assertEqual(sorted(f["object"] for f in withheld), ["NodePool/regional-web", "NodePool/zonal-batch"])
+        self.assertEqual([f["object"] for f in doc["findings"]], ["Quota/us-east1:CPUS"])
+        # The coverage-gap sentence says why a fault sits among the withheld
+        # postures, as it does for the hpa dangling-target fault.
+        gap = audit_report._declared_intent_gap(doc)
+        self.assertIn("single-zone-nodepool at its autoscaling ceiling shares its slug", gap)
+        # And the ledger body's rendering of the same gap carries the footnote,
+        # so an operator is not told the held-back fault is a posture.
+        body = "\n".join(audit_report._render_declared_intent_search(doc))
+        self.assertIn("`single-zone-nodepool` at its autoscaling ceiling is a fault", body)
+        self.assertIn("NodePool/regional-web", body)
+
+    def test_the_validator_rejects_a_declared_fault_and_an_object_that_is_not_a_pool(self):
+        doc = self._doc([])
+        doc["declared"] = [make_declared(check="single-zone-nodepool", cluster=self.CLUSTER, namespace="", obj="NodePool/zonal-batch", title="zonal-batch stays in one zone by design", repo="acme/fleet", path="knowledge/zonal-pools.md", excerpt="x")]
+        audit_report.validate_findings(copy.deepcopy(doc), self.STOCKOUT)
+        for fault in ("quota-exhaustion-risk", "autoscaler-out-of-resources", "spot-scarcity-risk", "ccc-missing-fallbacks"):
+            with self.subTest(fault):
+                doc["declared"][0]["check"] = fault
+                with self.assertRaises(audit_report.ValidationError) as cm:
+                    audit_report.validate_findings(copy.deepcopy(doc), self.STOCKOUT)
+                self.assertIn("declared[0].check", str(cm.exception))
+                self.assertIn("fault, not a posture", str(cm.exception))
+        doc["declared"][0]["check"] = "single-zone-nodepool"
+        for obj in ("Cluster/prod-us-east", "Deployment/web", "ComputeClass/zonal"):
+            with self.subTest(obj):
+                doc["declared"][0]["object"] = obj
+                with self.assertRaises(audit_report.ValidationError) as cm:
+                    audit_report.validate_findings(copy.deepcopy(doc), self.STOCKOUT)
+                self.assertIn("declared[0].object", str(cm.exception))
+                self.assertIn("nodepool", str(cm.exception))
+
+    def test_an_expired_declaration_leaves_the_pool_a_finding_and_a_standing_one_moves_it(self):
+        # Dates judged against the run's start day; pinned with the clock
+        # pinned beside it, so the test reads neither live.
+        run_day = date(2026, 11, 9)
+        self.patch_attr("run_start_day", lambda audit_id: run_day)
+        self.patch_attr("_today_utc", lambda: run_day)
+        yesterday = (run_day - timedelta(days=1)).strftime(audit_report.DECLARATION_EXPIRES_FORMAT)
+        next_year = (run_day + timedelta(days=365)).strftime(audit_report.DECLARATION_EXPIRES_FORMAT)
+        locked = self._pool_finding("locked", "NodePool/zonal-batch", self.ZONE_LOCKED)
+        ceiling = self._pool_finding("ceiling", "NodePool/regional-web", self.AT_CEILING)
+        doc = self._doc([locked, ceiling])
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            moved = audit_report.apply_declarations(doc, [self._declaration("NodePool/zonal-batch", expires=yesterday), self._declaration("NodePool/regional-web", expires=yesterday)])
+        self.assertEqual(moved, [])
+        lapsed, held = doc["findings"]
+        self.assertEqual(lapsed[audit_report.EXPIRED_DECLARATION_FIELD]["path"], "knowledge/zonal-pools.md")
+        self.assertEqual(lapsed[audit_report.EXPIRED_DECLARATION_FIELD]["expires"], yesterday)
+        # A lapsed note is reported only against a posture it did cover: the
+        # pool at its ceiling was never covered, so it carries no line.
+        self.assertNotIn(audit_report.EXPIRED_DECLARATION_FIELD, held)
+        self.assertEqual(err.getvalue().count("DECLARATION EXPIRED"), 1)
+        doc = self._doc([self._pool_finding("locked", "NodePool/zonal-batch", self.ZONE_LOCKED)])
+        with contextlib.redirect_stderr(io.StringIO()):
+            moved = audit_report.apply_declarations(doc, [self._declaration("NodePool/zonal-batch", expires=next_year)])
+        self.assertEqual([f["object"] for f in moved], ["NodePool/zonal-batch"])
+        self.assertEqual(doc["declared"][0]["declaration"]["expires"], next_year)
+
+    def test_the_arm_marks_are_the_collectors_prefixes(self):
+        # The join reads the arm off the excerpt the collector writes, so each
+        # prefix's two copies are pinned to each other and to what
+        # check_single_zone_nodepool produces for a zone-locked pool and for
+        # one at its ceiling; a rewording on one side alone fails here.
+        import fleet_stockout
+
+        self.assertEqual(audit_report.ZONE_LOCKED_ARM_MARK, fleet_stockout.ZONE_LOCKED_ARM_PREFIX)
+        self.assertEqual(audit_report.CEILING_ARM_MARK, fleet_stockout.CEILING_ARM_PREFIX)
+        pool = {"name": "zonal-batch", "locations": ["us-east1-b"], "autoscaling": {"enabled": True, "minNodeCount": 0, "maxNodeCount": 2}, "config": {"machineType": "e2-small", "taints": [{"key": "seeded-role", "value": "zonal", "effect": "NO_SCHEDULE"}]}}
+        locked = fleet_stockout.check_single_zone_nodepool(pool, False, 0)
+        full = fleet_stockout.check_single_zone_nodepool(pool, False, 2)
+        self.assertTrue(audit_report._is_zone_locked_arm(locked), locked)
+        self.assertTrue(audit_report._is_ceiling_arm(full), full)
+        self.assertFalse(audit_report._is_zone_locked_arm(full), full)
+
+    def test_a_hand_written_excerpt_naming_no_arm_is_not_moved(self):
+        # A finding the worker wrote on a cluster the collector could not read
+        # carries the worker's wording; with neither prefix nothing says which
+        # arm it is, and the join errs toward not silencing.
+        prose = self._pool_finding("prose", "NodePool/zonal-batch", "2/2 live nodes, 100% of maxNodeCount 2, in us-east1-b")
+        # The zone-locked prefix counts only where the collector writes it, at
+        # the start: a full pool described in prose that mentions a single
+        # zone later on is still not the posture.
+        trailing = self._pool_finding("trailing", "NodePool/zonal-full", "2/2 live nodes, 100% of maxNodeCount 2, single-zone (us-east1-b) pool cannot grow")
+        doc = self._doc([prose, trailing])
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            moved = audit_report.apply_declarations(doc, [self._declaration("NodePool/zonal-batch"), self._declaration("NodePool/zonal-full")])
+        self.assertEqual(moved, [])
+        self.assertEqual([f["object"] for f in doc["findings"]], ["NodePool/zonal-batch", "NodePool/zonal-full"])
+        self.assertEqual(err.getvalue().count("opens neither 3.9 arm"), 2)
+
+    def test_a_namespace_a_worker_wrote_onto_the_pool_is_folded_before_the_join(self):
+        # The collector files the pool with no namespace and the note writes
+        # `namespace: ""`; a worker's namespace would give the pool a third
+        # identity that neither matches, so the validator empties it
+        # (UNNAMESPACED_CHECKS) and the declaration still joins.
+        stray = make_finding(fid="stray", check="single-zone-nodepool", severity="major", cluster=self.CLUSTER, namespace="kube-system", obj="NodePool/zonal-batch", excerpt=self.ZONE_LOCKED, command="gcloud container node-pools list --cluster=prod-us-east --location=us-east1-b --project=acme-prod --format=json", remediation={"kind": "manual", "note": "a human decides"})
+        doc = self._doc([stray])
+        self.assertEqual(doc["findings"][0]["namespace"], "")
+        self.assertIn("._.nodepool-zonal-batch", doc["findings"][0]["id"])
+        with contextlib.redirect_stderr(io.StringIO()):
+            moved = audit_report.apply_declarations(doc, [self._declaration("NodePool/zonal-batch")])
+        self.assertEqual([f["object"] for f in moved], ["NodePool/zonal-batch"])
+
+    def test_a_hand_written_declared_entry_for_a_pool_at_its_ceiling_is_refused_against_the_manifest(self):
+        # A `declared[]` entry carries no excerpt, so the validator cannot tell
+        # the arms apart and lets the entry through; its identity would then
+        # enter `known` and keep the collector's at-ceiling candidate off the
+        # ledger. The manifest is where the entry meets the arm: exit 2.
+        full = {"check": "single-zone-nodepool", "cluster": self.CLUSTER, "namespace": "", "object": "NodePool/zonal-full", "severity": "major", "excerpt": f"{self.ZONE_LOCKED}; {self.AT_CEILING}"}
+        locked = {"check": "single-zone-nodepool", "cluster": self.CLUSTER, "namespace": "", "object": "NodePool/zonal-batch", "severity": "major", "excerpt": self.ZONE_LOCKED}
+        manifest = {"clusters": [{"name": self.CLUSTER, "candidates": [full, locked]}]}
+        doc = self._doc([])
+        doc["declared"] = [make_declared(check="single-zone-nodepool", cluster=self.CLUSTER, namespace="", obj="NodePool/zonal-full", title="zonal-full stays in one zone by design", repo="acme/fleet", path="knowledge/zonal-pools.md", excerpt="x")]
+        doc = audit_report.validate_findings(doc, self.STOCKOUT)
+        with self.assertRaises(audit_report.ValidationError) as cm:
+            audit_report.reject_declared_ceiling_pools(doc, manifest)
+        self.assertIn("declared[]", str(cm.exception))
+        self.assertIn("NodePool/zonal-full", str(cm.exception))
+        self.assertIn(audit_report.CEILING_ARM_MARK, str(cm.exception))
+        # The same entry for the zone-locked pool stands, and a run without a
+        # manifest has nothing to hold the entry to.
+        doc["declared"][0]["object"] = "NodePool/zonal-batch"
+        self.assertIsNone(audit_report.reject_declared_ceiling_pools(doc, manifest))
+        doc["declared"][0]["object"] = "NodePool/zonal-full"
+        self.assertIsNone(audit_report.reject_declared_ceiling_pools(doc, None))
+
+    def test_remediate_reads_the_collectors_excerpt_before_judging_the_arm(self):
+        # The worker reworded the excerpt of a declared zone-locked pool.
+        # `finish` adopts the collector's wording before the join and lists the
+        # pool under Declared intent; `remediate` reads the same wording and
+        # refuses the id as declared, instead of opening a pull request for a
+        # posture the ledger calls declared.
+        workspace = self.gitops_root / self.STOCKOUT / "acme__fleet"
+        (workspace / ".git").mkdir(parents=True)
+        audit_report.set_workspace(workspace)
+        self.patch_attr("repo_root", lambda: workspace)
+        self.harness.replies = {"issue-list": {"issues": []}}
+        Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
+        audit_report.write_run_record(self.STOCKOUT, "acme/fleet", [], searched=[f"acme/fleet@{SEARCH_SHA}"], sources=[])
+        audit_report.write_declarations(self.STOCKOUT, "acme/fleet", [self._declaration("NodePool/zonal-batch")])
+        prose = self._pool_finding("prose", "NodePool/zonal-batch", "pool pinned to one zone, autoscaling on, nothing else to fall back to")
+        doc = self._doc([prose])
+        fid = doc["findings"][0]["id"]
+        candidate = {"check": "single-zone-nodepool", "cluster": self.CLUSTER, "namespace": "", "object": "NodePool/zonal-batch", "severity": "major", "excerpt": self.ZONE_LOCKED, "command": "gcloud container node-pools list --cluster=prod-us-east --location=us-east1-b --project=acme-prod --format=json"}
+        manifest_path = self.tmp_path / "manifest_stockout.json"
+        manifest_path.write_text(json.dumps({"audit": self.STOCKOUT, "clusters": [{"name": self.CLUSTER, "outcome": "collected", "candidates": [candidate]}]}), encoding="utf-8")
+        rc = self.run_main(["remediate", "--audit", self.STOCKOUT, "--findings-file", self.write_findings(doc), "--manifest-file", str(manifest_path), "--finding", fid, "--dry-run", "--repo", "acme/fleet"])
+        self.assertEqual(rc, 2, self.err)
+        self.assertIn("a repository declaration covers this posture", self.err)
+        self.assertNotIn("opens neither 3.9 arm", self.err)
+        # Through the same call site: a `declared[]` entry the worker wrote for
+        # a pool the manifest reports at its ceiling is refused before the join.
+        full = {"check": "single-zone-nodepool", "cluster": self.CLUSTER, "namespace": "", "object": "NodePool/zonal-full", "severity": "major", "excerpt": f"{self.ZONE_LOCKED}; {self.AT_CEILING}", "command": candidate["command"]}
+        manifest_path.write_text(json.dumps({"audit": self.STOCKOUT, "clusters": [{"name": self.CLUSTER, "outcome": "collected", "candidates": [candidate, full]}]}), encoding="utf-8")
+        written = self._doc([self._quota_finding()])
+        written["declared"] = [make_declared(check="single-zone-nodepool", cluster=self.CLUSTER, namespace="", obj="NodePool/zonal-full", title="zonal-full stays in one zone by design", repo="acme/fleet", path="knowledge/zonal-pools.md", excerpt="x")]
+        quota_id = written["findings"][0]["id"]
+        rc = self.run_main(["remediate", "--audit", self.STOCKOUT, "--findings-file", self.write_findings(written), "--manifest-file", str(manifest_path), "--finding", quota_id, "--dry-run", "--repo", "acme/fleet"])
+        self.assertEqual(rc, 2, self.err)
+        self.assertIn("declared[]: NodePool/zonal-full", self.err)
+        self.assertIn(audit_report.CEILING_ARM_MARK, self.err)
 
 
 class TestDeclaredIntentSearch(HarnessTestCase):
@@ -35092,6 +35334,31 @@ class TestStoreLedger(HarnessTestCase):
         self.assertEqual(1, len(self.harness.forge_calls("proposal-close")))
         self.assertIn(proposal["url"], out["summary"])
 
+    def test_a_scoped_install_leaves_another_installs_unlabelled_fix_on_the_store_path(self):
+        # The store ledger on a forge with proposals and labels but no issue
+        # tracker: the stale close is handed the stored ids, so #9, whose id
+        # this install never stored, stays open while this install's own #8
+        # closes.
+        self.forge_is({"forge": "stub", "verbs": PROPOSAL_VERBS, "labels": True})
+        with scoped({audit_report.LEDGER_SCOPE_ENV: "tenant-b"}):
+            self.claim()
+            self.touch(self.NETPOL)
+            doc = make_doc()
+            self.run_once(doc)
+            validated = audit_report.load_findings(audit_report.findings_path_for(AUDIT), AUDIT)
+            ours = self.open_proposal(8, validated)
+            theirs = {**self.open_proposal(9, validated, body_ids=["x"]), "source": "platform-agent/fix-theirs"}
+            self.harness.replies["proposal-list"] = {"proposals": [ours, theirs], "truncated": False}
+            clean = make_doc(findings=[])
+            clean["resolved_because"] = [
+                {**{k: validated["findings"][0][k] for k in ("check", "cluster", "namespace", "object")},
+                 "reason": "kubectl get networkpolicy -n payments now lists default-deny; it was applied on 2026-09-16."}
+            ]
+            out = self.run_once(clean)
+        self.assertEqual(out["prs_closed"], [ours["url"]])
+        self.assertEqual([c["number"] for c in self.harness.forge_calls("proposal-close")], [8])
+        self.assertIn("PR #9 carries no scope label and covers x", self.err)
+
     def test_a_clean_run_over_an_unexplained_finding_closes_nothing(self):
         self.claim()
         self.touch(self.NETPOL)
@@ -37301,6 +37568,195 @@ class TestScopedRemediationPrs(ScopedHarnessTestCase):
         self.assertEqual((found or {}).get("number"), 8)
 
 
+class TestUnlabelledPullRequestOfAnotherInstall(ScopedHarnessTestCase):
+    """A pre-upgrade remediation pull request carries no scope label (#5229).
+
+    During a mixed-version window every install that shares the repository
+    reads it as its own. A scoped install's stale close therefore leaves an
+    unlabelled open pull request alone when none of the ids it covers was
+    ever on this install's ledger: it is some other install's fix, and this
+    run never looked for its findings.
+    """
+
+    OURS = "platform-agent/fix-ours"
+    THEIRS = "platform-agent/fix-theirs"
+
+    def close(self, prs, current_ids=frozenset(), **kwargs):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            closed = audit_report.close_stale_remediation_prs(
+                "acme/fleet", AUDIT, prs, set(current_ids), {"a": "Old title"}, {}, NOW, **kwargs
+            )
+        self.err = err.getvalue()
+        return closed
+
+    def theirs(self):
+        return pr(9, self.THEIRS, body=audit_report.delta_block(["x"]))
+
+    def test_an_unlabelled_pull_request_this_install_never_listed_is_left_alone(self):
+        self.assertEqual(self.close([self.theirs()], previous_ids=["a"]), [])
+        self.assertEqual(self.harness.forge_calls("proposal-close"), [])
+        self.assertEqual(self.harness.forge_calls("proposal-comment"), [])
+        self.assertIn("PR #9 carries no scope label and covers x", self.err)
+        self.assertIn("never listed", self.err)
+
+    def test_one_this_install_listed_is_still_closed(self):
+        ours = pr(8, self.OURS, body=audit_report.delta_block(["a"]))
+        self.assertEqual(self.close([ours], previous_ids=["a"]), [ours["url"]])
+        self.assertTrue(self.harness.forge_calls("proposal-close", number=8))
+
+    def test_one_covering_a_current_finding_is_this_installs(self):
+        # An id this run sees is this install's whatever the ledger listed
+        # before, so the pull request is judged as it always was: the finding
+        # persists, and it stays open for that reason, not for the skip.
+        self.assertEqual(self.close([self.theirs()], {"x"}, previous_ids=["a"]), [])
+        self.assertNotIn("never listed", self.err)
+
+    def test_the_orphan_rule_does_not_reach_it_either(self):
+        # On a findings run the branch rule closes a pull request on no
+        # group's branch, and another install's branch is never one of ours.
+        closed = self.close(
+            [self.theirs()], {"a"}, previous_ids=["a"], branch_by_finding={"a": self.OURS}
+        )
+        self.assertEqual(closed, [])
+        self.assertEqual(self.harness.forge_calls("proposal-close"), [])
+        self.assertIn("never listed", self.err)
+
+    def test_a_forge_with_no_labels_skips_nothing(self):
+        # No pull request there carries a scope label, and the listing already
+        # proved each one this install's, so the question does not arise.
+        self.harness.replies["capabilities"] = NO_ISSUES_NO_LABELS
+        theirs = self.theirs()
+        self.harness.replies["proposal-view"] = {"proposal": {"number": 9, "body": theirs["body"]}}
+        self.assertEqual(self.close([theirs], previous_ids=["a"]), [theirs["url"]])
+        self.assertNotIn("never listed", self.err)
+
+    def test_the_shields_close_comes_before_the_skip(self):
+        # A finding in a namespace this install declared is this install's
+        # whatever the ledger listed: the shield closes it, on the
+        # declaration, as it did before (and over a lost memory, where
+        # `previous_ids` is empty).
+        theirs = self.theirs()
+        closed = self.close([theirs], previous_ids=[], shielded_ids={"x"})
+        self.assertEqual(closed, [theirs["url"]])
+        self.assertNotIn("never listed", self.err)
+        self.assertIn("declared", "".join(self.harness.bodies_for("proposal-comment")).lower())
+
+    def test_with_the_labelled_or_unscoped_cases_as_before(self):
+        # This install's own label: the skip is not for it. No scope at all:
+        # the install owns everything on the stream, as before scopes. No
+        # `previous_ids` handed in: the caller has no ledger to judge by.
+        labelled = {**self.theirs(), "labels": [{"name": self.scope.label}]}
+        self.assertEqual(self.close([labelled], previous_ids=["a"]), [labelled["url"]])
+        self.harness.calls.clear()
+        self.harness.payloads.clear()
+        with scoped({audit_report.LEDGER_SCOPE_ENV: ""}):
+            self.assertEqual(self.close([self.theirs()], previous_ids=["a"]), [self.theirs()["url"]])
+        self.harness.calls.clear()
+        self.harness.payloads.clear()
+        self.assertEqual(self.close([self.theirs()]), [self.theirs()["url"]])
+
+    def test_a_clean_run_leaves_another_installs_pre_upgrade_fix_open(self):
+        # End to end: the ledger carried `a`, whose fix is #8; #9 is a fix
+        # some other install opened before scopes for a finding this ledger
+        # never had. The clean run closes #8 and leaves #9 alone.
+        previous = published_body(make_doc(findings=[make_finding(fid="a")]), generated_at=NOW)
+        a_id = derived_id(fid="a")
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous}),
+            "proposal-list": proposals_view(
+                [
+                    pr(8, self.OURS, body=audit_report.delta_block([a_id])),
+                    pr(9, self.THEIRS, body=audit_report.delta_block(["x"])),
+                ]
+            ),
+        }
+        doc = make_doc(findings=[])
+        doc["resolved_because"] = resolved_for(previous)
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+        self.assertTrue(self.harness.forge_calls("issue-close", number=42))
+        self.assertEqual([c["number"] for c in self.harness.forge_calls("proposal-close")], [8])
+        self.assertEqual(self.stdout_json()["prs_closed"], ["https://github.com/acme/fleet/pull/8"])
+        self.assertIn("PR #9 carries no scope label and covers x", self.err)
+
+    def test_an_id_the_body_cut_counts_as_listed_on_a_seeded_memory(self):
+        # The store was never written for this ledger, so the memory is
+        # seeded from the issue body and holds no document; the ids the body
+        # budget cut live only in its `audit-findings-all` block. A fix for
+        # one of them is this install's and closes as before.
+        previous = published_body(make_doc(findings=[make_finding(fid="a")]), generated_at=NOW)
+        previous += f'\n<!-- audit-findings-all: {json.dumps([derived_id(fid="a"), "cut.id"])} -->\n'
+        self.harness.replies = {
+            "issue-list": issues_view(
+                [{"number": 42, "url": "https://github.com/acme/fleet/issues/42", "body": previous}]
+            ),
+            "proposal-list": proposals_view([pr(8, self.OURS, body=audit_report.delta_block(["cut.id"]))]),
+        }
+        doc = make_doc(findings=[])
+        doc["resolved_because"] = resolved_for(previous)
+        # No store the harness wrote on the test's behalf: the body the
+        # listing serves is all the run has, as on the first run after an
+        # upgrade that brings in the store.
+        shutil.rmtree(self.reports_dir, ignore_errors=True)
+        findings_file = self.write_findings(doc)
+        code = BaseTestCase.run_main(
+            self, ["finish", "--audit", AUDIT, "--findings-file", findings_file, "--scheduled"]
+        )
+        self.assertEqual(code, 0, self.err)
+        self.assertIn("seeding this run's memory once", self.err)
+        self.assertEqual([c["number"] for c in self.harness.forge_calls("proposal-close")], [8], self.err)
+        self.assertNotIn("never listed", self.err)
+
+    def test_a_held_open_run_over_a_seeded_memory_keeps_the_cut_ids_listed(self):
+        # The run after a seeded, held-open clean run: the store now holds
+        # the seeded body beside that run's own empty document and
+        # `ledger_held_open`, so no stored document names the cut ids; the
+        # body's complete block still does, and the fix for one closes.
+        previous = published_body(make_doc(findings=[make_finding(fid="a")]), generated_at=NOW)
+        previous += f'\n<!-- audit-findings-all: {json.dumps([derived_id(fid="a"), "cut.id"])} -->\n'
+        self.seed_report(previous, ledger_held_open=True)
+        self.harness.replies = {
+            "issue-list": issues_view(
+                [{"number": 42, "url": "https://github.com/acme/fleet/issues/42", "body": previous}]
+            ),
+            "proposal-list": proposals_view([pr(8, self.OURS, body=audit_report.delta_block(["cut.id"]))]),
+        }
+        doc = make_doc(findings=[])
+        doc["resolved_because"] = resolved_for(previous)
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+        self.assertEqual([c["number"] for c in self.harness.forge_calls("proposal-close")], [8], self.err)
+        self.assertNotIn("never listed", self.err)
+
+    NETPOL = "clusters/prod-us-east/payments-netpol.yaml"
+
+    def test_a_findings_run_leaves_it_open_where_the_branch_rule_closed_it(self):
+        # The findings branch of `finish`: this install's fix goes to its
+        # group's branch, so #9's branch is no group's and the branch rule
+        # would have closed it as moved; the skip comes first.
+        self.touch(self.NETPOL)
+        self.harness.replies.update(
+            {
+                "identity": {"login": "kube-agents-bot"},
+                "issue-list": {"issues": []},
+                "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+                "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
+                "rev-parse --abbrev-ref": "feature-branch\n",
+                "proposal-list": proposals_view([self.theirs()]),
+            }
+        )
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        self.assertEqual(self.harness.forge_calls("proposal-close"), [])
+        self.assertEqual(self.stdout_json()["prs_closed"], [])
+        self.assertIn("PR #9 carries no scope label and covers x", self.err)
+
+    def test_an_old_scheme_body_is_left_open_without_the_never_listed_claim(self):
+        old = pr(9, self.THEIRS, body='<!-- audit-findings: ["x"] -->\n<!-- audit-id-scheme: 0 -->')
+        self.assertEqual(self.close([old], {"a"}, previous_ids=["a"], branch_by_finding={"a": self.OURS}), [])
+        self.assertIn("another id scheme", self.err)
+        self.assertNotIn("never listed", self.err)
+
+
 # --------------------------------------------------------------------------- #
 # Relative ages in finding text are dated to the run (#4901)
 # --------------------------------------------------------------------------- #
@@ -37468,6 +37924,16 @@ class TestRetiredUnlistedOnClose(HarnessTestCase):
         self.assertIn("closed as completed", comment)
         self.assertIn("Not confirmed fixed: 1 previously reported finding", comment)
         self.assertIn(f"- `{RETIRED_CLUSTER}`: `{self.gone_id()}`", comment)
+        # The lead above that note must not claim what the note takes back.
+        self.assertNotIn("Every finding previously reported here is gone", comment)
+        self.assertIn("1 finding on a cluster this run listed nowhere is not confirmed fixed", comment)
+        # Nor the banner `close_ledger_reads_clean` puts at the top of the
+        # closed ledger: it names the retired id instead of "all resolved".
+        banner = self.harness.bodies_for("issue-update")[-1]
+        self.assertIn(audit_report.CLEAN_CLOSE_MARKER, banner)
+        self.assertNotIn("all of them are resolved", banner)
+        self.assertIn("not confirmed fixed", banner)
+        self.assertIn(f"`{self.gone_id()}`", banner)
         payload = self.stdout_json()
         self.assertEqual(payload["status"], "CLEAN")
         self.assertEqual(payload["resolved"], 1)
@@ -37494,7 +37960,60 @@ class TestRetiredUnlistedOnClose(HarnessTestCase):
         payload = self.stdout_json()
         self.assertEqual(payload["resolved"], 2)
         self.assertNotIn(audit_report.RETIRED_UNLISTED_KEY, payload)
-        self.assertNotIn("Not confirmed fixed", self.harness.bodies_for("issue-comment")[0])
+        comment = self.harness.bodies_for("issue-comment")[0]
+        self.assertNotIn("Not confirmed fixed", comment)
+        self.assertIn("Every finding previously reported here is gone", comment)
+        banner = self.harness.bodies_for("issue-update")[-1]
+        self.assertIn("all of them are resolved", banner)
+        self.assertNotIn("not confirmed fixed", banner)
+
+    def test_the_banner_names_the_retired_ids(self):
+        # The clean banner with nothing retired is the one it always was.
+        plain = audit_report.clean_close_banner(AUDIT, NOW)
+        self.assertIn("found none of the findings below, so all of them are resolved", plain)
+        self.assertEqual(audit_report.clean_close_banner(AUDIT, NOW, retired_ids=[]), plain)
+        banner = audit_report.clean_close_banner(AUDIT, NOW, retired_ids=["z.id", "a.id"])
+        self.assertTrue(banner.startswith(audit_report.CLEAN_CLOSE_MARKER))
+        self.assertNotIn("all of them are resolved", banner)
+        self.assertIn("2 of them are not confirmed fixed", banner)
+        self.assertIn("`a.id`, `z.id`", banner)
+        self.assertIn("retired with the ledger", banner)
+        one = audit_report.clean_close_banner(AUDIT, NOW, retired_ids=["a.id"])
+        self.assertIn("1 of them is not confirmed fixed", one)
+        # The lead of the all-clear comment is conditioned the same way.
+        gone = {"id": "a.id", "cluster": RETIRED_CLUSTER, "check": "c", "object": "o"}
+        comment = audit_report.render_clean_comment(AUDIT, make_doc(findings=[]), NOW, retired=[gone])
+        self.assertNotIn("Every finding previously reported here is gone", comment)
+        self.assertIn("closed as completed", comment)
+        self.assertIn("1 finding on a cluster this run listed nowhere is not confirmed fixed", comment)
+        two = audit_report.render_clean_comment(
+            AUDIT, make_doc(findings=[]), NOW, retired=[gone, {**gone, "id": "b.id"}]
+        )
+        self.assertIn("2 findings on a cluster this run listed nowhere are not confirmed fixed", two)
+
+    def test_a_banner_whose_ids_do_not_fit_counts_them_instead(self):
+        # A body near the forge's limit: the named banner would push it over,
+        # so the count-only banner goes on rather than no banner at all.
+        ids = [f"check-{i}.cluster-{i}.ns-{i}.deployment-{i}" for i in range(40)]
+        named = audit_report.clean_close_banner(AUDIT, NOW, retired_ids=ids)
+        counted = audit_report.clean_close_banner(AUDIT, NOW, retired_ids=ids, named=False)
+        self.assertIn("40 of them are not confirmed fixed, and the closing comment names them.", counted)
+        self.assertNotIn(ids[0], counted)
+        # And the closing comment does name them, with a marker past its cap.
+        many = [{"id": f"c.k.n.d-{i:03d}", "cluster": RETIRED_CLUSTER} for i in range(audit_report.MAX_DELTA_ROWS + 1)]
+        note = "\n".join(audit_report._comment_retired(many))
+        self.assertIn("…and 1 more", note)
+        self.assertIn(f"`{RETIRED_CLUSTER}`: `c.k.n.d-000`", note)
+        room = audit_report.MAX_BODY_CHARS - len(counted) - 2 - 100
+        live = audit_report.delta_block(["a"]) + "\n" + "x" * (room - len(audit_report.delta_block(["a"])) - 1)
+        self.assertGreater(len(named) + 2 + len(live), audit_report.MAX_BODY_CHARS)
+        self.assertTrue(audit_report.close_ledger_reads_clean("acme/fleet", 42, AUDIT, live, NOW, retired_ids=ids))
+        body = self.harness.bodies_for("issue-update")[-1]
+        self.assertTrue(body.startswith(counted))
+        # A body that fits with the named banner keeps it.
+        short = audit_report.delta_block(["a"])
+        self.assertTrue(audit_report.close_ledger_reads_clean("acme/fleet", 42, AUDIT, short, NOW, retired_ids=ids))
+        self.assertTrue(self.harness.bodies_for("issue-update")[-1].startswith(named))
 
     def test_a_cluster_in_scope_skipped_holds_the_close_instead(self):
         self.previous_ledger(self.gone())

@@ -4300,11 +4300,11 @@ class SessionRoleExecutableTest(unittest.TestCase):
     def test_the_shell_is_refused_kubectl_while_the_roleless_caller_passes_a_file_argument(self):
         with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
             status, body = self.post_as(
-                credential_proxy.CALLER_ROLE_SHELL, {"argv": ["kubectl", "get", "-f", "x.yaml"]}
+                credential_proxy.CALLER_ROLE_SHELL, {"argv": ["kubectl", "rollout", "history", "-f", "x.yaml"]}
             )
         self.assertEqual(403, status)
         self.assertEqual(credential_proxy.RULE_CALLER_EXECUTABLE, body["rule"])
-        status, body = self.post_as("", {"argv": ["kubectl", "get", "-f", "x.yaml"]})
+        status, body = self.post_as("", {"argv": ["kubectl", "rollout", "history", "-f", "x.yaml"]})
         self.assertEqual(200, status, body)
 
     def test_a_metrics_read_from_a_session_is_refused_as_a_flag_before_the_policy(self):
@@ -10213,6 +10213,29 @@ class GracefulDrainTest(unittest.TestCase):
                 self.assertFalse(handler._refused_while_draining(method))
                 self.assertEqual({}, captured)
 
+    def test_a_draining_exec_pod_fails_its_readiness_probe(self):
+        # The readiness probe reads /healthz. An exec pod that drains answers
+        # 503, so the Service stops sending it new connections and a caller at
+        # one replica falls back to the stateful broker; the broker, which
+        # rolls with Recreate, and any pod that does not drain answer ok.
+        cases = (
+            (credential_proxy_client.EXEC_ROLE, True, HTTPStatus.SERVICE_UNAVAILABLE,
+             credential_proxy.HEALTHZ_DRAINING_PAYLOAD),
+            (credential_proxy_client.EXEC_ROLE, False, HTTPStatus.OK, credential_proxy.HEALTHZ_PAYLOAD),
+            ("broker", True, HTTPStatus.OK, credential_proxy.HEALTHZ_PAYLOAD),
+            ("broker", False, HTTPStatus.OK, credential_proxy.HEALTHZ_PAYLOAD),
+        )
+        for role, draining, status, payload in cases:
+            with self.subTest(role=role, draining=draining), \
+                    mock.patch.object(CredentialProxyHandler, "broker_role", role):
+                if draining:
+                    CredentialProxyHandler.draining.set()
+                else:
+                    CredentialProxyHandler.draining.clear()
+                handler, captured = self._handler(credential_proxy.HEALTHZ_PATH)
+                handler.do_GET()
+                self.assertEqual((status, payload), (captured.get("status"), captured.get("payload")))
+
     def test_a_pull_with_a_query_is_still_an_open_route(self):
         CredentialProxyHandler.draining.set()
         handler, _ = self._handler("/v1/chat/slack/events?timeout=20")
@@ -11045,10 +11068,11 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
 
     def test_serve_drains_on_sigterm_in_the_broker_and_exec_roles(self):
         # The broker pod's and the exec pods' grace periods hold the drain; the
-        # sidecar roles' pods keep the short stop.
+        # sidecar roles' pods keep the short stop. An exec pod drains for as
+        # long as the longest command it admits, the broker for its bounded 30s.
         for role, drain_seconds in (
             ("broker", credential_proxy.SHUTDOWN_DRAIN_SECONDS),
-            (credential_proxy_client.EXEC_ROLE, credential_proxy.SHUTDOWN_DRAIN_SECONDS),
+            (credential_proxy_client.EXEC_ROLE, credential_proxy.EXEC_SHUTDOWN_DRAIN_SECONDS),
             ("combined", 0),
         ):
             with self.subTest(role=role):

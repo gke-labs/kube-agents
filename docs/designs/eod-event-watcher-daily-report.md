@@ -346,8 +346,8 @@ row in a namespace in `EOD_EXCLUDE_NAMESPACES` is left out of the line, as it is
 breakdown. The watcher's `k8s_event_watcher_events_filtered_total{gate="alert_excluded"}` counts them
 per cluster.
 
-Two limits. The watcher keeps its count in memory, so a restart, which a change to the rules causes,
-counts the events still inside the API server's Event TTL once more. And the rows count toward
+Two limits. The watcher keeps its count in memory, so a watcher restart counts the events still
+inside the API server's Event TTL once more. And the rows count toward
 `LEDGER_MAX_ROWS` like every other row, up to 24 per object and reason a day, so a large set of
 chronic excluded keys pushes older rows out of the ledger sooner.
 

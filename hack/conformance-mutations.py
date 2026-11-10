@@ -1580,10 +1580,12 @@ Mutation(
     Mutation(
         "D1-platform-role-reaches-secrets",
         "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
-        ("      - configmaps\n      - serviceaccounts", "      - configmaps\n      - secrets\n      - serviceaccounts"),
+        (
+            "      - serviceaccounts\n      - secrets\n    verbs:\n      - get\n      - list\n      - watch",
+            "      - serviceaccounts\n      - secrets\n    verbs:\n      - get\n      - list\n      - watch\n      - patch",
+        ),
         "test_D1_no_product_role_can_write_the_identity_table",
-        "add secrets to the platform agent's minimal ClusterRole in the default golden, "
-        "beside the configmaps it already reads",
+        "grant a write verb on secrets in the platform agent's minimal ClusterRole",
     ),
     Mutation(
         "D2-workflow-mode",
@@ -2371,7 +2373,7 @@ Mutation(
     Mutation(
         "C1-rendered-bridge-inherits-the-agent-bus-user",
         "k8s-operator/internal/controller/platformagent_a2a_bridge.go",
-        ("\ta2aBusUserEnv:                 true,\n", ""),
+        ("\ta2aBusUserEnv:                    true,\n", ""),
         "test_C1_the_rendered_bridge_is_not_the_agent_principal",
         "let the rendered bridge inherit A2A_BUS_USER=agent, the agent "
         "principal's name and inbox prefix",
