@@ -636,7 +636,8 @@ what the renderer does with them.
   and the list through to `brief.json`, where the run page and the Brief's
   run rows label the run and the Reds tile says how many of the gate's reds
   were not evaluated. A gate case that failed every graded repetition
-  on the same run is named in the lede and the comment (the suite's roster
+  on the same run is named in the run page's lede; the comment adds one
+  unnamed sentence pointing at the run page (the suite's roster
   is the branch's; the dashboard's can be newer). `health.py` carries both
   on `Run`, keeps them through `--trim`, and its `pr_caused_reds` never
   counts such a run as the pull request's own, collapsed gate case or not,

@@ -2986,6 +2986,11 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" LITELLM_REDACTION_IP_ACTION "${LITELLM_REDACTION_IP_ACTION:-$DEFAULT_LITELLM_REDACTION_IP_ACTION}"
   write_env_var "$tmp" LITELLM_REDACTION_IP_ALLOW_CIDRS "${LITELLM_REDACTION_IP_ALLOW_CIDRS:-}"
   write_env_var "$tmp" LITELLM_REDACTION_RULES "${LITELLM_REDACTION_RULES:-}"
+  # The gateway's spend ceiling, install.env only (no flag): recorded so every
+  # later run, which reads the file alone, keeps it. Empty takes the defaults
+  # (0, no ceiling; 1d) in the tfvars generator.
+  write_env_var "$tmp" LITELLM_BUDGET_USD "${LITELLM_BUDGET_USD:-}"
+  write_env_var "$tmp" LITELLM_BUDGET_PERIOD "${LITELLM_BUDGET_PERIOD:-}"
   write_env_var "$tmp" VERTEX_PROJECT_ID "${VERTEX_PROJECT_ID:-}"
   write_env_var "$tmp" VERTEX_LOCATION "${VERTEX_LOCATION:-}"
   write_env_var "$tmp" VERTEX_MANAGE_SERVING_PROJECT "${VERTEX_MANAGE_SERVING_PROJECT:-}"
