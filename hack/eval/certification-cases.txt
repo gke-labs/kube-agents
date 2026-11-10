@@ -85,6 +85,13 @@
 # gap, expected_fail: no compliance check reads the binding behind an
 # annotation; the gap is #5027.
 ./tasks/security-wi-ksa-gsa-iam-binding-missing/task.yaml
+# Capability row: storage, CSI drivers and PVCs; the obtainability audit on a
+# Deployment that mounts a bucket through the gcsfuse CSI driver with no sidecar
+# memory-limit annotation and no file-cache capacity (the planted
+# bucket-reader-app in seeded-fuse). A declared gap, expected_fail: no
+# obtainability check reads a gcsfuse volume's cache or sidecar limits; the gap
+# is item 3 of #2577.
+./tasks/storage-gcsfuse-unbounded-cache-oom/task.yaml
 # Capability row: storage, CSI drivers and PVCs; the obtainability audit names a
 # one-replica Deployment under the default RollingUpdate strategy that mounts a
 # ReadWriteOnce claim (the planted single-writer-app and single-writer-data in
