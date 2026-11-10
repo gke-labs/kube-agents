@@ -85,8 +85,13 @@ ID_KEY = "id"
 TOOL_CALLS_KEY = "tool_calls"
 OPAQUE_CLASS = "OPAQUE"
 
-# Keys whose numeric value is a per-run counter or row id.
-KEYED_NUMBER_KEYS = ("pid", "PID", "run_id", "id", "resourceVersion", "generation", "observedGeneration")
+# Keys whose numeric value is a per-run counter or row id. `comment_id` is the
+# row id `kanban_comment` returns: upstream's `add_comment` returns the
+# comment's `lastrowid` (deploy/docker/patches/kanban_comment_status.py), one
+# counter for the whole install's board, so it counts every comment earlier
+# runs left (the Nov 10 lane trial recorded 41 and replayed 43, 44, 45).
+KEYED_NUMBER_KEYS = ("pid", "PID", "run_id", "id", "comment_id", "resourceVersion", "generation",
+                     "observedGeneration")
 # Any key ending in this is a run id too (`current_run_id`, `parent_run_id`).
 RUN_ID_SUFFIX = "_run_id"
 # Kanban card history: heartbeat entries are liveness pings on a timer, so how
@@ -127,11 +132,11 @@ NUMBER_CLASS = "NUM"
 # (`2>&1`, "revision 1") is almost never the swapped value, and treating it as
 # one marked about one answer in seven unstorable in the dev-install dry run.
 MIN_STANDALONE_REPEAT_DIGITS = 4
-SHORT_NUMBER_KEYS = r"(?:resourceVersion|observedGeneration|generation|run_id|run|pid|PID|id)"
+SHORT_NUMBER_KEYS = r"(?:resourceVersion|observedGeneration|generation|run_id|run|comment_id|comment|pid|PID|id)"
 SHORT_NUMBER_KEY_GAP = r"(?:\s+(?:is|was|now|of)\s+|\W{0,4})"
 DIGITS_RE = re.compile(r"^\d+$")
 KEYED_NUMBER_TEXT_RE = re.compile(
-    r"(?<![A-Za-z0-9_])(resourceVersion|observedGeneration|generation|[A-Za-z0-9]*_?run_id|pid|PID|id)"
+    r"(?<![A-Za-z0-9_])(resourceVersion|observedGeneration|generation|[A-Za-z0-9]*_?run_id|comment_id|pid|PID|id)"
     r"(\\?[\"']?\s*[:=]\s*\\?[\"']?)(\d+)\b"
 )
 # `pid 4821`, as a process listing or a sentence names one.
