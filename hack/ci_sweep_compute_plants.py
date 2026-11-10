@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sweep leftover Compute networks, subnets, addresses and alert policies planted by killed bench runs.
+"""Sweep leftover GKE clusters, Compute load-balancing objects, networks, subnets, addresses and alert policies planted by killed bench runs.
 
 A bench stack that plants project-level Compute resources (such as
 prebuilt subnet exhaustion stacks) creates a VPC network, subnet,
@@ -21,7 +21,12 @@ networking audit evaluations (SOP 2.1) to file false positive critical
 `subnet-ip-exhaustion` findings.
 
 This script sweeps Compute addresses, subnets, and networks whose
-`description` starts with `kube-agents-bench plant`. In `--project` mode, it
+`description` starts with `kube-agents-bench plant`, and ahead of them the
+kinds a PSC or cluster fixture plants (bench/README.md fixture rule 8):
+GKE clusters labelled `managed-by=kube-agents-bench`, and forwarding
+rules, service attachments, backend services and health checks that carry
+the description prefix (a forwarding rule may carry the label instead;
+it takes both). In `--project` mode, it
 acquires the named project from Boskos out of `free` into `cleaning` and refuses
 if it is leased, busy, or not registered there, ensuring active evaluation runs are not swept. Gating is
 rooted on the VPC network: plant networks older than `max_age_hours` (default: 4 hours,
@@ -29,10 +34,27 @@ with unparseable or missing timestamps treated as old) are selected along with t
 child plant subnets and internal addresses, while plant subnets and addresses attached
 to non-plant networks (or orphaned) are gated on their own creation timestamp.
 
-Deletion order is strictly dependency-ordered:
-1. Addresses go first (releasing in-use IP reservations on the subnet).
-2. Subnets go second (removing the subnet from the VPC).
-3. Networks go third (deleting the empty VPC).
+Deletion order is strictly dependency-ordered; each link holds the next:
+1. Clusters (`--async`: a synchronous delete takes minutes; their firewall
+   rules and secondary ranges hold the network, so a network whose cluster
+   is still deleting fails this run and clears the next).
+2. Consumer forwarding rules (a PSC endpoint holds its service attachment).
+3. Service attachments (hold the producer forwarding rule).
+4. Producer forwarding rules (hold the backend service).
+5. Backend services (hold their health checks).
+6. Health checks.
+7. Addresses (releasing in-use IP reservations on the subnet).
+8. Subnets (removing the subnet from the VPC).
+9. Networks (deleting the empty VPC).
+
+A refused list of one of the kinds in steps 1 to 6 is recorded as that
+kind's failure and the sweep goes on, so a project whose sweeper role lags
+the code still gets the rest of its sweep before the run fails it. Not
+swept, so named here: a forwarding rule's target proxy and URL map (no
+stack plants one; its backend service then stays), the Service
+LoadBalancer objects a killed cluster leaves (`k8s-fw-*`, no mark), and a
+deleted cluster's node service account and bindings, which the sweeper
+role cannot touch; the sweep prints and returns the account's name.
 
 Cloud Monitoring alert policies come last and depend on nothing. A stack that
 plants one (bench/tf/prebuilt/monitoring-alert-policy) labels it
@@ -70,9 +92,65 @@ ALERT_POLICY_LABELS_FIELD = "userLabels"
 # An alert policy's creation time sits under creationRecord.mutateTime.
 ALERT_POLICY_CREATED_FIELD = "creationRecord"
 ALERT_POLICY_CREATED_TIME_FIELD = "mutateTime"
-# The entry a refused policy list leaves in the failed alert_policies list,
-# in place of a policy name.
-ALERT_POLICY_LIST_FAILURE_NAME = "list"
+# The entry a refused list leaves in a kind's failed list, in place of a name.
+LIST_FAILURE_NAME = "list"
+ALERT_POLICY_LIST_FAILURE_NAME = LIST_FAILURE_NAME
+# The kinds, by their key in the deleted and failed dicts and the report, in
+# delete order. The first five came with the PSC and cluster fixtures.
+KIND_CLUSTERS = "clusters"
+KIND_FORWARDING_RULES = "forwarding_rules"
+KIND_SERVICE_ATTACHMENTS = "service_attachments"
+KIND_BACKEND_SERVICES = "backend_services"
+KIND_HEALTH_CHECKS = "health_checks"
+KIND_ADDRESSES = "addresses"
+KIND_SUBNETS = "subnets"
+KIND_NETWORKS = "networks"
+KIND_ALERT_POLICIES = "alert_policies"
+# (key, the gcloud compute noun, the word the log lines use) for the kinds
+# one generic list-and-delete handles; the rest have their own shapes.
+COMPUTE_CHAIN_KINDS = (
+    (KIND_FORWARDING_RULES, "forwarding-rules", "forwarding rule"),
+    (KIND_SERVICE_ATTACHMENTS, "service-attachments", "service attachment"),
+    (KIND_BACKEND_SERVICES, "backend-services", "backend service"),
+    (KIND_HEALTH_CHECKS, "health-checks", "health check"),
+)
+# (key, the plural the summary lines print), in delete order.
+KIND_SUMMARY = (
+    (KIND_CLUSTERS, "cluster(s)"),
+    (KIND_FORWARDING_RULES, "forwarding rule(s)"),
+    (KIND_SERVICE_ATTACHMENTS, "service attachment(s)"),
+    (KIND_BACKEND_SERVICES, "backend service(s)"),
+    (KIND_HEALTH_CHECKS, "health check(s)"),
+    (KIND_ADDRESSES, "address(es)"),
+    (KIND_SUBNETS, "subnet(s)"),
+    (KIND_NETWORKS, "network(s)"),
+    (KIND_ALERT_POLICIES, "alert polic(y|ies)"),
+)
+KIND_KEYS = tuple(key for key, _ in KIND_SUMMARY)
+RULE_KIND, ATTACHMENT_KIND, BACKEND_KIND, CHECK_KIND = COMPUTE_CHAIN_KINDS
+# The key under which sweep_project returns the node service accounts of the
+# clusters it deleted; not a count the report carries (see the docstring).
+ORPHANED_ACCOUNTS_KEY = "orphaned_service_accounts"
+# `gcloud container clusters list` JSON: the labels, the creation time, the
+# location the delete needs, the status, and the default pool's account.
+CLUSTER_LABELS_FIELD = "resourceLabels"
+CLUSTER_CREATED_FIELD = "createTime"
+CLUSTER_LOCATION_FIELD = "location"
+CLUSTER_STATUS_FIELD = "status"
+CLUSTER_NODE_CONFIG_FIELD = "nodeConfig"
+CLUSTER_NODE_ACCOUNT_FIELD = "serviceAccount"
+# A cluster whose delete is already in flight; a second delete is refused,
+# and the next run no longer lists it.
+CLUSTER_DELETING_STATUS = "STOPPING"
+# The project's default compute account is not the cluster's own.
+DEFAULT_NODE_ACCOUNT = "default"
+# A forwarding rule whose target is a service attachment is a PSC consumer
+# endpoint; every other plant rule is a producer rule.
+SERVICE_ATTACHMENT_TARGET_MARK = "/serviceAttachments/"
+# The field of a service attachment that names its producer forwarding rule,
+# and the field of a backend service that lists its health checks.
+SERVICE_ATTACHMENT_TARGET_FIELD = "targetService"
+BACKEND_SERVICE_HEALTH_CHECKS_FIELD = "healthChecks"
 # datetime.fromisoformat before Python 3.11 accepts at most six fractional
 # digits; a Monitoring creationRecord.mutateTime carries up to nine.
 FRACTIONAL_SECONDS_RE = re.compile(r"(\.\d{6})\d+")
@@ -109,7 +187,12 @@ class SweepError(Exception):
 
     def __init__(self, message: str, deleted: dict | None = None):
         super().__init__(message)
-        self.deleted = deleted or {"addresses": [], "subnets": [], "networks": [], "alert_policies": []}
+        self.deleted = deleted or empty_kinds()
+
+
+def empty_kinds() -> dict:
+    """One empty list per kind, keyed as the report keys them."""
+    return {key: [] for key in KIND_KEYS}
 
 
 def parse_timestamp(ts_str: str | None) -> datetime | None:
@@ -233,6 +316,113 @@ def list_alert_policies(project: str, runner=subprocess.run) -> list[dict]:
     return _list_json(cmd, "alert policies", project, runner=runner)
 
 
+def list_clusters(project: str, runner=subprocess.run) -> list[dict]:
+    """List a project's GKE clusters, every location, as JSON dicts."""
+    cmd = ["gcloud", "container", "clusters", "list", f"--project={project}", "--format=json"]
+    return _list_json(cmd, KIND_CLUSTERS, project, runner=runner)
+
+
+def _list_or_record(kind: str, lister, failed: dict) -> list[dict]:
+    """A refused list is that kind's failure, not the end of the project's sweep."""
+    try:
+        return lister()
+    except SweepError as exc:
+        print(f"  {exc}", file=sys.stderr)
+        failed[kind].append((LIST_FAILURE_NAME, str(exc)))
+        return []
+
+
+def is_plant_object(item: dict) -> bool:
+    """True for a Compute object that carries the description prefix or the label."""
+    return matches_plant_description(item.get("description")) or matches_plant_labels(item.get("labels"))
+
+
+def is_consumer_rule(rule: dict) -> bool:
+    """True for a forwarding rule whose target is a service attachment (a PSC endpoint)."""
+    target = rule.get("target")
+    return isinstance(target, str) and SERVICE_ATTACHMENT_TARGET_MARK in target
+
+
+def select_chain(
+    items: list[dict],
+    label: str,
+    parent_of,
+    selected_parents: set,
+    plant_parents: set,
+    max_age_hours: float,
+    now: datetime,
+) -> list[dict]:
+    """The plant objects among items to delete, by the rule subnets follow.
+
+    An object whose parent (per parent_of) is a selected plant object goes
+    with it whatever its own age, one whose parent is a plant object that is
+    still young is protected, and one with no plant parent is gated on its
+    own creationTimestamp.
+    """
+    selected = []
+    for item in items:
+        if not is_plant_object(item):
+            continue
+        parent = parent_of(item)
+        if parent and parent in selected_parents:
+            selected.append(item)
+        elif parent and parent in plant_parents:
+            print(f"  skipping {label} {item.get('name', '')}: parent plant {parent} is younger than {max_age_hours}h")
+        elif is_older_than(item.get("creationTimestamp"), max_age_hours, now=now):
+            selected.append(item)
+    return selected
+
+
+def _delete_compute(
+    kind: str, noun: str, label: str, item: dict, project: str,
+    dry_run: bool, runner, deleted: dict, failed: dict,
+):
+    """Delete one regional or global Compute object and record the outcome."""
+    name = item.get("name", "")
+    if dry_run:
+        print(f"  would delete {label} {name} in {project}")
+        deleted[kind].append(name)
+        return
+    region_name = resource_name(item.get("region"))
+    scope = f"--region={region_name}" if region_name else "--global"
+    cmd = ["gcloud", "compute", noun, "delete", name, f"--project={project}", scope, "--quiet"]
+    del_proc = runner(cmd, capture_output=True, text=True, check=False)
+    if del_proc.returncode == 0:
+        print(f"  deleted {label} {name} in {project}")
+        deleted[kind].append(name)
+    else:
+        err = (del_proc.stderr or "").strip()
+        print(f"  could not delete {label} {name} in {project}: {err}", file=sys.stderr)
+        failed[kind].append((name, err))
+
+
+def _delete_cluster(cluster: dict, project: str, dry_run: bool, runner, deleted: dict, failed: dict):
+    """Fire one cluster delete without waiting, and name the account it leaves."""
+    name = cluster.get("name", "")
+    location = cluster.get(CLUSTER_LOCATION_FIELD, "")
+    if dry_run:
+        print(f"  would delete cluster {name} ({location}) in {project}")
+        deleted[KIND_CLUSTERS].append(name)
+        return
+    cmd = [
+        "gcloud", "container", "clusters", "delete", name,
+        f"--project={project}", f"--location={location}", "--async", "--quiet",
+    ]
+    del_proc = runner(cmd, capture_output=True, text=True, check=False)
+    if del_proc.returncode != 0:
+        err = (del_proc.stderr or "").strip()
+        print(f"  could not delete cluster {name} in {project}: {err}", file=sys.stderr)
+        failed[KIND_CLUSTERS].append((name, err))
+        return
+    print(f"  deleting cluster {name} ({location}) in {project}")
+    deleted[KIND_CLUSTERS].append(name)
+    node_config = cluster.get(CLUSTER_NODE_CONFIG_FIELD)
+    account = node_config.get(CLUSTER_NODE_ACCOUNT_FIELD) if isinstance(node_config, dict) else None
+    if isinstance(account, str) and account and account != DEFAULT_NODE_ACCOUNT:
+        print(f"  cluster {name} leaves its node service account {account}; the sweeper role cannot delete it")
+        deleted.setdefault(ORPHANED_ACCOUNTS_KEY, []).append(account)
+
+
 def sweep_project(
     project: str,
     max_age_hours: float = DEFAULT_MAX_AGE_HOURS,
@@ -249,17 +439,39 @@ def sweep_project(
     the age threshold). Standalone/orphaned subnets or addresses are gated by
     their own creationTimestamp.
 
-    Deletes addresses first, then subnets, then networks, then the alert
+    Ahead of those, labelled clusters older than max_age_hours (an async
+    delete; one already STOPPING is left to finish), then the load-balancing
+    chain in the order each link holds the next: consumer forwarding rules,
+    service attachments, producer forwarding rules, backend services, health
+    checks. A chain object under a selected plant network (a rule's or a
+    backend service's network, an attachment's producer rule, a backend
+    service's health checks) goes with it, as a subnet does; one with no
+    plant parent is gated on its own creationTimestamp. A refused list of one
+    of these kinds is recorded as its failure and the sweep goes on.
+
+    Deletes addresses next, then subnets, then networks, then the alert
     policies labelled managed-by=kube-agents-bench and older than
     max_age_hours (gated on their own creation time; they depend on nothing).
     The policies are listed after the Compute deletes, so a project whose
     sweeper role predates the alert-policy permissions still gets its Compute
     sweep before the refused list fails it.
-    Returns a dict with lists of deleted resources:
-      {"addresses": [...], "subnets": [...], "networks": [...], "alert_policies": [...]}
+    Returns a dict with one list of deleted names per kind (KIND_KEYS), plus
+    ORPHANED_ACCOUNTS_KEY when a deleted cluster had its own node account.
     """
     if now is None:
         now = datetime.now(timezone.utc)
+    deleted = empty_kinds()
+    failed = empty_kinds()
+
+    # 0. Clusters: their own age gate; one already deleting is skipped.
+    clusters_to_delete = []
+    for cluster in _list_or_record(KIND_CLUSTERS, lambda: list_clusters(project, runner=runner), failed):
+        if not matches_plant_labels(cluster.get(CLUSTER_LABELS_FIELD)):
+            continue
+        if cluster.get(CLUSTER_STATUS_FIELD) == CLUSTER_DELETING_STATUS:
+            print(f"  skipping cluster {cluster.get('name', '')}: already deleting")
+        elif is_older_than(cluster.get(CLUSTER_CREATED_FIELD), max_age_hours, now=now):
+            clusters_to_delete.append(cluster)
 
     # 1. Inspect networks first (root of dependency chain)
     raw_networks = list_compute_resources(project, "networks", runner=runner)
@@ -341,10 +553,60 @@ def sweep_project(
         if is_older_than(addr.get("creationTimestamp"), max_age_hours, now=now):
             addresses_to_delete.append(addr)
 
-    deleted = {"addresses": [], "subnets": [], "networks": [], "alert_policies": []}
-    failed = {"addresses": [], "subnets": [], "networks": [], "alert_policies": []}
+    # 4. The load-balancing chain, each kind rooted on the one that holds it.
+    def chain_list(key, noun):
+        return _list_or_record(key, lambda: list_compute_resources(project, noun, runner=runner), failed)
+
+    def network_of(item):
+        return resource_name(item.get("network"))
+
+    raw_rules = chain_list(RULE_KIND[0], RULE_KIND[1])
+    rules_to_delete = select_chain(
+        raw_rules, RULE_KIND[2], network_of, selected_network_names, plant_network_names, max_age_hours, now)
+    consumer_rules = [rule for rule in rules_to_delete if is_consumer_rule(rule)]
+    producer_rules = [rule for rule in rules_to_delete if not is_consumer_rule(rule)]
+    selected_rule_names = {rule.get("name") for rule in producer_rules if rule.get("name")}
+    plant_rule_names = {rule.get("name") for rule in raw_rules if rule.get("name") and is_plant_object(rule)}
+
+    raw_attachments = chain_list(ATTACHMENT_KIND[0], ATTACHMENT_KIND[1])
+    attachments_to_delete = select_chain(
+        raw_attachments, ATTACHMENT_KIND[2],
+        lambda item: resource_name(item.get(SERVICE_ATTACHMENT_TARGET_FIELD)),
+        selected_rule_names, plant_rule_names, max_age_hours, now)
+
+    raw_backends = chain_list(BACKEND_KIND[0], BACKEND_KIND[1])
+    backends_to_delete = select_chain(
+        raw_backends, BACKEND_KIND[2], network_of, selected_network_names, plant_network_names, max_age_hours, now)
+
+    # A health check's parent is the plant backend service that names it.
+    plant_backends = [backend for backend in raw_backends if is_plant_object(backend)]
+    backend_of_check = {
+        resource_name(check): backend.get("name")
+        for backend in plant_backends
+        for check in (backend.get(BACKEND_SERVICE_HEALTH_CHECKS_FIELD) or [])
+        if isinstance(check, str)
+    }
+    raw_checks = chain_list(CHECK_KIND[0], CHECK_KIND[1])
+    checks_to_delete = select_chain(
+        raw_checks, CHECK_KIND[2], lambda item: backend_of_check.get(item.get("name")),
+        {backend.get("name") for backend in backends_to_delete if backend.get("name")},
+        {backend.get("name") for backend in plant_backends if backend.get("name")},
+        max_age_hours, now)
 
     try:
+        for cluster in clusters_to_delete:
+            _delete_cluster(cluster, project, dry_run, runner, deleted, failed)
+        chain = (
+            (RULE_KIND, consumer_rules),
+            (ATTACHMENT_KIND, attachments_to_delete),
+            (RULE_KIND, producer_rules),
+            (BACKEND_KIND, backends_to_delete),
+            (CHECK_KIND, checks_to_delete),
+        )
+        for (kind, noun, label), items in chain:
+            for item in items:
+                _delete_compute(kind, noun, label, item, project, dry_run, runner, deleted, failed)
+
         # Step 1: Delete addresses
         for addr in addresses_to_delete:
             name = addr.get("name", "")
@@ -456,27 +718,18 @@ def sweep_project(
         raise SweepError(f"{project}: {'; '.join(fault_msgs)}", deleted=deleted)
 
     verb = "would delete" if dry_run else "deleted"
-    print(
-        f"{project}: {verb} {len(deleted['addresses'])} address(es), "
-        f"{len(deleted['subnets'])} subnet(s), {len(deleted['networks'])} network(s), "
-        f"{len(deleted['alert_policies'])} alert polic(y|ies)"
-    )
+    print(f"{project}: {verb} " + ", ".join(f"{len(deleted[key])} {plural}" for key, plural in KIND_SUMMARY))
     return deleted
 
 
 def _counts(resources: dict | None, allow_empty: bool = False) -> dict | None:
-    """Extract address/subnet/network counts from a resources or deleted dict.
+    """Extract one count per kind (KIND_KEYS) from a resources or deleted dict.
 
     If allow_empty is False, returns None when all counts are zero.
     """
     if not resources and not allow_empty:
         return None
-    counts = {
-        "addresses": len((resources or {}).get("addresses", [])),
-        "subnets": len((resources or {}).get("subnets", [])),
-        "networks": len((resources or {}).get("networks", [])),
-        "alert_policies": len((resources or {}).get("alert_policies", [])),
-    }
+    counts = {key: len((resources or {}).get(key, [])) for key in KIND_KEYS}
     return counts if (allow_empty or any(counts.values())) else None
 
 
@@ -540,14 +793,10 @@ def sweep_pool(
         release_failures=failures,
     )
 
-    total_addr = sum(d.get("addresses", 0) for d in deleted.values())
-    total_sub = sum(d.get("subnets", 0) for d in deleted.values())
-    total_net = sum(d.get("networks", 0) for d in deleted.values())
-    total_pol = sum(d.get("alert_policies", 0) for d in deleted.values())
+    totals = ", ".join(
+        f"{sum(d.get(key, 0) for d in deleted.values())} {plural}" for key, plural in KIND_SUMMARY)
     print(
-        f"swept {len(set(deleted) | set(failures))} project(s): "
-        f"deleted {total_addr} address(es), {total_sub} subnet(s), {total_net} network(s), "
-        f"{total_pol} alert polic(y|ies); "
+        f"swept {len(set(deleted) | set(failures))} project(s): deleted {totals}; "
         f"{len(failures)} failed, {len(unmapped)} unmapped, {len(skipped)} skipped"
     )
     return deleted, failures, unmapped

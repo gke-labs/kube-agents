@@ -949,7 +949,7 @@ class AlertPolicySweepTest(unittest.TestCase):
         commands_run = []
         sweep.sweep_project("p", runner=self.runner_for([], commands_run), now=self.now)
         kinds = [cmd[1] for cmd in commands_run if "list" in cmd]
-        self.assertEqual(kinds, ["compute", "compute", "compute", "monitoring"])
+        self.assertEqual(kinds, ["container"] + ["compute"] * 7 + ["monitoring"])
         self.assertEqual(
             commands_run[-1], ["gcloud", "monitoring", "policies", "list", "--project=p", "--format=json"])
 
@@ -982,8 +982,8 @@ class AlertPolicySweepTest(unittest.TestCase):
             sweep.sweep_project("p", runner=runner, now=self.now)
         self.assertIn("alert_policies: list (could not list alert policies in p: denied)", str(ctx.exception))
         self.assertEqual(ctx.exception.deleted["networks"], ["bench-vpc-1"])
-        self.assertEqual(sweep._counts(ctx.exception.deleted), {"addresses": 0, "subnets": 0, "networks": 1, "alert_policies": 0})
-        self.assertEqual([cmd[1] for cmd in commands_run if "list" in cmd], ["compute"] * 3 + ["monitoring"])
+        self.assertEqual(sweep._counts(ctx.exception.deleted), {**_zero_counts(), "networks": 1})
+        self.assertEqual([cmd[1] for cmd in commands_run if "list" in cmd], ["container"] + ["compute"] * 7 + ["monitoring"])
 
     def test_nine_fractional_digit_creation_time_is_gated_by_age(self):
         # A protobuf Timestamp as the Monitoring API writes it; fromisoformat
@@ -1008,11 +1008,250 @@ class AlertPolicySweepTest(unittest.TestCase):
     def test_counts_include_policies_and_tolerate_the_old_shape(self):
         self.assertEqual(
             sweep._counts({"addresses": [], "subnets": [], "networks": [], "alert_policies": ["111"]}),
-            {"addresses": 0, "subnets": 0, "networks": 0, "alert_policies": 1})
+            {**_zero_counts(), "alert_policies": 1})
         self.assertEqual(
             sweep._counts({"addresses": ["a"], "subnets": [], "networks": []}),
-            {"addresses": 1, "subnets": 0, "networks": 0, "alert_policies": 0})
+            {**_zero_counts(), "addresses": 1})
         self.assertIsNone(sweep._counts({"addresses": [], "subnets": [], "networks": []}))
+
+
+def _zero_counts():
+    return {key: 0 for key in sweep.KIND_KEYS}
+
+
+REGION = "https://www.googleapis.com/compute/v1/projects/p/regions/us-central1"
+NETWORK_URL = "https://www.googleapis.com/compute/v1/projects/p/global/networks/"
+PLANT = "kube-agents-bench plant (networking-psc-routing-deadlock-baseline); safe to delete when no eval run holds the infra lock"
+LABELS = {"managed-by": "kube-agents-bench", "build-id": "7"}
+
+
+def _delete_argv(cmd):
+    return cmd if "delete" in cmd else None
+
+
+class ChainSweepTest(unittest.TestCase):
+    """The five kinds the PSC and cluster fixtures plant: clusters first, then
+    the load-balancing chain in the order each link holds the next, each by
+    its rule-8 mark, nothing else touched."""
+
+    def setUp(self):
+        self.now = datetime(2026, 11, 10, 12, 0, 0, tzinfo=timezone.utc)
+        self.old_ts = (self.now - timedelta(hours=6)).isoformat()
+        self.young_ts = (self.now - timedelta(minutes=10)).isoformat()
+        self.recent_ts = (self.now - timedelta(hours=1)).isoformat()
+
+    def chain(self, ts, network_ts=None):
+        """The S31 stack's objects: producer and consumer networks, the chain between them."""
+        network_ts = network_ts or ts
+        return {
+            "clusters": [{
+                "name": "ka-bench-s27-7", "location": "us-central1-a", "status": "RUNNING",
+                "resourceLabels": {"managed-by": "kube-agents-bench"}, "createTime": ts,
+                "nodeConfig": {"serviceAccount": "gke-nodes-ka-bench-s-ab12cd@p.iam.gserviceaccount.com"},
+            }],
+            "networks": [
+                {"name": "psc-producer", "description": PLANT, "creationTimestamp": network_ts},
+                {"name": "psc-consumer", "description": PLANT, "creationTimestamp": network_ts},
+            ],
+            "subnets": [
+                {"name": "psc-producer-sub", "description": PLANT, "creationTimestamp": ts, "region": REGION,
+                 "network": NETWORK_URL + "psc-producer"},
+                {"name": "psc-nat", "description": PLANT, "creationTimestamp": ts, "region": REGION,
+                 "network": NETWORK_URL + "psc-producer"},
+                {"name": "psc-consumer-sub", "description": PLANT, "creationTimestamp": ts, "region": REGION,
+                 "network": NETWORK_URL + "psc-consumer"},
+            ],
+            "addresses": [{
+                "name": "psc-endpoint-ip", "description": PLANT, "labels": LABELS, "creationTimestamp": ts,
+                "region": REGION, "network": NETWORK_URL + "psc-consumer",
+                "subnetwork": REGION + "/subnetworks/psc-consumer-sub",
+            }],
+            "forwarding-rules": [
+                {"name": "psc-endpoint", "description": PLANT, "labels": LABELS, "creationTimestamp": ts,
+                 "region": REGION, "network": NETWORK_URL + "psc-consumer",
+                 "target": REGION + "/serviceAttachments/psc-sa"},
+                {"name": "psc-producer-fr", "description": PLANT, "labels": LABELS, "creationTimestamp": ts,
+                 "region": REGION, "network": NETWORK_URL + "psc-producer",
+                 "loadBalancingScheme": "INTERNAL", "backendService": REGION + "/backendServices/psc-bs"},
+            ],
+            "service-attachments": [{
+                "name": "psc-sa", "description": PLANT, "creationTimestamp": ts, "region": REGION,
+                "targetService": REGION + "/forwardingRules/psc-producer-fr",
+            }],
+            "backend-services": [{
+                "name": "psc-bs", "description": PLANT, "creationTimestamp": ts, "region": REGION,
+                "network": NETWORK_URL + "psc-producer", "loadBalancingScheme": "INTERNAL",
+                "healthChecks": [REGION + "/healthChecks/psc-hc"],
+            }],
+            "health-checks": [{
+                "name": "psc-hc", "description": PLANT, "creationTimestamp": ts, "region": REGION,
+            }],
+        }
+
+    def runner_for(self, listed, commands_run, refuse=(), delete_rc=0):
+        """A gcloud that lists `listed` by kind and refuses the kinds in `refuse`."""
+        def mock_runner(cmd, capture_output=True, text=True, check=False):
+            commands_run.append(cmd)
+            if "list" in cmd:
+                if cmd[1] == "container":
+                    kind = "clusters"
+                elif cmd[1] == "monitoring":
+                    kind = "policies"
+                elif cmd[2] == "networks" and cmd[3] == "subnets":
+                    kind = "subnets"
+                else:
+                    kind = cmd[2]
+                if kind in refuse:
+                    return mock.Mock(returncode=1, stdout="", stderr="denied")
+                return mock.Mock(returncode=0, stdout=json.dumps(listed.get(kind, [])), stderr="")
+            return mock.Mock(returncode=delete_rc, stdout="", stderr="boom" if delete_rc else "")
+        return mock_runner
+
+    def test_clusters_then_the_psc_chain_go_before_the_four_kinds(self):
+        commands_run = []
+        res = sweep.sweep_project(
+            "p", max_age_hours=4.0, runner=self.runner_for(self.chain(self.old_ts), commands_run), now=self.now)
+        deletes = [cmd for cmd in commands_run if "delete" in cmd]
+        self.assertEqual(deletes[:6], [
+            ["gcloud", "container", "clusters", "delete", "ka-bench-s27-7",
+             "--project=p", "--location=us-central1-a", "--async", "--quiet"],
+            ["gcloud", "compute", "forwarding-rules", "delete", "psc-endpoint", "--project=p", "--region=us-central1", "--quiet"],
+            ["gcloud", "compute", "service-attachments", "delete", "psc-sa", "--project=p", "--region=us-central1", "--quiet"],
+            ["gcloud", "compute", "forwarding-rules", "delete", "psc-producer-fr", "--project=p", "--region=us-central1", "--quiet"],
+            ["gcloud", "compute", "backend-services", "delete", "psc-bs", "--project=p", "--region=us-central1", "--quiet"],
+            ["gcloud", "compute", "health-checks", "delete", "psc-hc", "--project=p", "--region=us-central1", "--quiet"],
+        ])
+        self.assertEqual([cmd[2] for cmd in deletes[6:]], ["addresses", "networks", "networks", "networks", "networks", "networks"])
+        self.assertEqual(res["clusters"], ["ka-bench-s27-7"])
+        self.assertEqual(res["forwarding_rules"], ["psc-endpoint", "psc-producer-fr"])
+        self.assertEqual(res["service_attachments"], ["psc-sa"])
+        self.assertEqual(res["backend_services"], ["psc-bs"])
+        self.assertEqual(res["health_checks"], ["psc-hc"])
+        self.assertEqual(res["networks"], ["psc-producer", "psc-consumer"])
+        self.assertEqual(res[sweep.ORPHANED_ACCOUNTS_KEY], ["gke-nodes-ka-bench-s-ab12cd@p.iam.gserviceaccount.com"])
+        self.assertEqual([cmd[1] for cmd in commands_run if "list" in cmd], ["container"] + ["compute"] * 7 + ["monitoring"])
+
+    def test_unmarked_endpoints_young_plants_and_a_deleting_cluster_survive(self):
+        listed = {
+            "clusters": [
+                {"name": "agent-harness-dev-cluster", "location": "us-central1", "status": "RUNNING",
+                 "resourceLabels": None, "createTime": self.old_ts, "nodeConfig": {"serviceAccount": "default"}},
+                {"name": "ka-bench-young", "location": "us-central1-a", "status": "RUNNING",
+                 "resourceLabels": {"managed-by": "kube-agents-bench"}, "createTime": self.recent_ts},
+                {"name": "ka-bench-going", "location": "us-central1-a", "status": "STOPPING",
+                 "resourceLabels": {"managed-by": "kube-agents-bench"}, "createTime": self.old_ts},
+            ],
+            "forwarding-rules": [
+                # An Autopilot cluster's own PSC endpoint: no description, no labels.
+                {"name": "gk3-agent-harness-dev-cluster-4753b4b0-f29b28c8-pe", "creationTimestamp": self.old_ts,
+                 "region": REGION, "network": NETWORK_URL + "default",
+                 "target": "https://www.googleapis.com/compute/v1/projects/a4f8a8f2f677f5af0p-tp/regions/us-central1/serviceAttachments/gke-sa"},
+                # A plant rule under no plant network, younger than the gate.
+                {"name": "psc-endpoint", "description": PLANT, "labels": LABELS, "creationTimestamp": self.recent_ts,
+                 "region": REGION, "network": NETWORK_URL + "default", "target": REGION + "/serviceAttachments/x"},
+            ],
+            # The seeded fleet's standing objects: no description.
+            "backend-services": [{"name": "drain-timeout-seeded-b", "creationTimestamp": self.old_ts,
+                                  "healthChecks": ["https://www.googleapis.com/compute/v1/projects/p/global/healthChecks/drain-timeout-seeded-b"]}],
+            "health-checks": [{"name": "drain-timeout-seeded-b", "creationTimestamp": self.old_ts}],
+        }
+        commands_run = []
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out):
+            res = sweep.sweep_project("p", max_age_hours=4.0, runner=self.runner_for(listed, commands_run), now=self.now)
+        self.assertEqual([cmd for cmd in commands_run if "delete" in cmd], [])
+        self.assertEqual({key: value for key, value in res.items() if value}, {})
+        self.assertIn("skipping cluster ka-bench-going: already deleting", out.getvalue())
+
+    def test_a_selected_network_takes_its_young_chain_and_a_young_network_protects_it(self):
+        commands_run = []
+        res = sweep.sweep_project(
+            "p", max_age_hours=4.0,
+            runner=self.runner_for(self.chain(self.young_ts, network_ts=self.old_ts), commands_run), now=self.now)
+        self.assertEqual(res["forwarding_rules"], ["psc-endpoint", "psc-producer-fr"])
+        self.assertEqual(res["service_attachments"], ["psc-sa"])
+        self.assertEqual(res["backend_services"], ["psc-bs"])
+        self.assertEqual(res["health_checks"], ["psc-hc"])
+        self.assertEqual(res["networks"], ["psc-producer", "psc-consumer"])
+
+        commands_run = []
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out):
+            res = sweep.sweep_project(
+                "p", max_age_hours=4.0,
+                runner=self.runner_for(self.chain(self.old_ts, network_ts=self.recent_ts), commands_run), now=self.now)
+        self.assertEqual([cmd for cmd in commands_run if "delete" in cmd and cmd[1] == "compute"], [])
+        for line in (
+            "skipping forwarding rule psc-endpoint: parent plant psc-consumer is younger than 4.0h",
+            "skipping forwarding rule psc-producer-fr: parent plant psc-producer is younger than 4.0h",
+            "skipping service attachment psc-sa: parent plant psc-producer-fr is younger than 4.0h",
+            "skipping backend service psc-bs: parent plant psc-producer is younger than 4.0h",
+            "skipping health check psc-hc: parent plant psc-bs is younger than 4.0h",
+        ):
+            self.assertIn(line, out.getvalue())
+        self.assertEqual(res["clusters"], ["ka-bench-s27-7"])
+
+    def test_global_rule_backend_service_and_health_check_use_global(self):
+        listed = {
+            "forwarding-rules": [{"name": "ext-fr", "description": PLANT, "creationTimestamp": self.old_ts,
+                                  "target": "https://www.googleapis.com/compute/v1/projects/p/global/targetHttpProxies/ext"}],
+            "backend-services": [{"name": "ext-bs", "description": PLANT, "creationTimestamp": self.old_ts,
+                                  "healthChecks": ["https://www.googleapis.com/compute/v1/projects/p/global/healthChecks/ext-hc"]}],
+            "health-checks": [{"name": "ext-hc", "description": PLANT, "creationTimestamp": self.old_ts}],
+        }
+        commands_run = []
+        sweep.sweep_project("p", max_age_hours=4.0, runner=self.runner_for(listed, commands_run), now=self.now)
+        self.assertEqual([cmd for cmd in commands_run if "delete" in cmd], [
+            ["gcloud", "compute", "forwarding-rules", "delete", "ext-fr", "--project=p", "--global", "--quiet"],
+            ["gcloud", "compute", "backend-services", "delete", "ext-bs", "--project=p", "--global", "--quiet"],
+            ["gcloud", "compute", "health-checks", "delete", "ext-hc", "--project=p", "--global", "--quiet"],
+        ])
+
+    def test_dry_run_lists_the_five_kinds_and_deletes_nothing(self):
+        commands_run = []
+        res = sweep.sweep_project(
+            "p", max_age_hours=4.0, dry_run=True, runner=self.runner_for(self.chain(self.old_ts), commands_run), now=self.now)
+        self.assertEqual([cmd for cmd in commands_run if "delete" in cmd], [])
+        self.assertEqual(res["clusters"], ["ka-bench-s27-7"])
+        self.assertEqual(res["forwarding_rules"], ["psc-endpoint", "psc-producer-fr"])
+        self.assertEqual(res["health_checks"], ["psc-hc"])
+        self.assertNotIn(sweep.ORPHANED_ACCOUNTS_KEY, res)
+
+    def test_refused_cluster_list_is_the_failure_and_the_rest_still_sweeps(self):
+        commands_run = []
+        with self.assertRaises(sweep.SweepError) as ctx:
+            sweep.sweep_project(
+                "p", max_age_hours=4.0,
+                runner=self.runner_for(self.chain(self.old_ts), commands_run, refuse=("clusters",)), now=self.now)
+        self.assertIn("clusters: list (could not list clusters in p: denied)", str(ctx.exception))
+        self.assertEqual(ctx.exception.deleted["clusters"], [])
+        self.assertEqual(ctx.exception.deleted["service_attachments"], ["psc-sa"])
+        self.assertEqual(ctx.exception.deleted["networks"], ["psc-producer", "psc-consumer"])
+        self.assertEqual([cmd[1] for cmd in commands_run if "list" in cmd], ["container"] + ["compute"] * 7 + ["monitoring"])
+
+    def test_a_chain_delete_failure_is_reported_and_the_rest_still_sweeps(self):
+        commands_run = []
+
+        def runner(cmd, capture_output=True, text=True, check=False):
+            if "delete" in cmd and cmd[2] == "service-attachments":
+                commands_run.append(cmd)
+                return mock.Mock(returncode=1, stdout="", stderr="in use")
+            return self.runner_for(self.chain(self.old_ts), commands_run)(cmd, capture_output, text, check)
+
+        with self.assertRaises(sweep.SweepError) as ctx:
+            sweep.sweep_project("p", max_age_hours=4.0, runner=runner, now=self.now)
+        self.assertIn("service_attachments: psc-sa (in use)", str(ctx.exception))
+        self.assertEqual(ctx.exception.deleted["service_attachments"], [])
+        self.assertEqual(ctx.exception.deleted["health_checks"], ["psc-hc"])
+
+    def test_counts_and_the_exception_default_carry_the_five_kinds(self):
+        self.assertEqual(sweep.SweepError("x").deleted, sweep.empty_kinds())
+        self.assertEqual(list(sweep.empty_kinds()), [
+            "clusters", "forwarding_rules", "service_attachments", "backend_services", "health_checks",
+            "addresses", "subnets", "networks", "alert_policies"])
+        self.assertEqual(
+            sweep._counts({**sweep.empty_kinds(), "clusters": ["a"], sweep.ORPHANED_ACCOUNTS_KEY: ["sa"]}),
+            {**_zero_counts(), "clusters": 1})
 
 
 class SweepPoolTest(unittest.TestCase):

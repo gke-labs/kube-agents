@@ -843,9 +843,10 @@ GEMINI_KEY_FINDINGS = frozenset(
 PULL_SWEEP_MEMBER = "serviceAccount:eval-pull-sweeper@kube-agents-prow.iam.gserviceaccount.com"
 
 # The Compute plant sweep (hack/ci_sweep_compute_plants.py, the periodic
-# ci-kube-agents-compute-sweep on main) lists and deletes the plant networks,
-# subnets, addresses and alert policies that a killed run left in a free
-# project. It holds one project-level custom role with exactly
+# ci-kube-agents-compute-sweep on main) lists and deletes the plant clusters,
+# forwarding rules, service attachments, backend services, health checks,
+# networks, subnets, addresses and alert policies that a killed run left in a
+# free project. It holds one project-level custom role with exactly
 # COMPUTE_SWEEP_PERMISSIONS, and nothing else on the project.
 # roles/compute.networkAdmin also covers the sweep, but it holds almost a
 # thousand permissions. A project without the grant fails every
@@ -892,6 +893,38 @@ COMPUTE_SWEEP_PERMISSIONS = frozenset({
     # list repairs it (docs/ci-pool-projects.md section 5.7).
     "monitoring.alertPolicies.list",
     "monitoring.alertPolicies.delete",
+    # `gcloud container clusters list`, and `clusters delete --async` for a
+    # cluster labelled managed-by=kube-agents-bench. No container.operations.get:
+    # with --async gcloud returns before any operation read.
+    "container.clusters.list",
+    "container.clusters.delete",
+    # `gcloud compute forwarding-rules list` (an aggregated list; both scopes
+    # held so a global plant rule cannot hide in a partial list), and
+    # `forwarding-rules delete --region` or `--global`. A PSC consumer
+    # endpoint (a rule whose target is a service attachment) is deleted under
+    # pscDelete, a producer rule under delete.
+    "compute.forwardingRules.list",
+    "compute.forwardingRules.delete",
+    "compute.forwardingRules.pscDelete",
+    "compute.globalForwardingRules.list",
+    "compute.globalForwardingRules.delete",
+    "compute.globalForwardingRules.pscDelete",
+    # `gcloud compute service-attachments list`, and `service-attachments
+    # delete --region` (regional only).
+    "compute.serviceAttachments.list",
+    "compute.serviceAttachments.delete",
+    # `gcloud compute backend-services list` (aggregated), and
+    # `backend-services delete --region` or `--global`.
+    "compute.backendServices.list",
+    "compute.backendServices.delete",
+    "compute.regionBackendServices.list",
+    "compute.regionBackendServices.delete",
+    # `gcloud compute health-checks list` (aggregated), and `health-checks
+    # delete --region` or `--global`.
+    "compute.healthChecks.list",
+    "compute.healthChecks.delete",
+    "compute.regionHealthChecks.list",
+    "compute.regionHealthChecks.delete",
 })
 
 # Every identity that leases a pool project and runs hack/ci-eval-pr.sh in it,
