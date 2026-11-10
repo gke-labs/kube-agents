@@ -1173,8 +1173,11 @@ resource "helm_release" "kube_agents" {
         data   = local.credentials
       }
       integration = local.platform_agent_integration
-      }, var.platform_agent_storage_size == local.platform_agent_default_storage_size ? {} : {
-      storage = { size = var.platform_agent_storage_size }
+      }, var.platform_agent_storage_size == local.platform_agent_default_storage_size && var.platform_agent_expected_cluster_profiles == null ? {} : {
+      storage = merge(
+        var.platform_agent_storage_size == local.platform_agent_default_storage_size ? {} : { size = var.platform_agent_storage_size },
+        var.platform_agent_expected_cluster_profiles == null ? {} : { expectedClusterProfiles = var.platform_agent_expected_cluster_profiles },
+      )
       }, var.platform_agent_mode == "today" ? {} : {
       mode = var.platform_agent_mode
     })

@@ -1057,6 +1057,17 @@ variable "platform_agent_storage_size" {
   }
 }
 
+variable "platform_agent_expected_cluster_profiles" {
+  description = "The PlatformAgent's spec.storage.expectedClusterProfiles: how many Cluster Agent profiles the install is expected to hold, one per cluster in scope. The operator raises the agent's own data claim (not the shell sandbox's) to at least 8Gi plus 400Mi per profile, rounded up to whole GiB, the size the session stores settle at under the default 90-day retention; the claim takes the larger of that and platform_agent_storage_size, so this only raises it, and the formula passes the 50Gi default above 107 profiles. null, the default, passes the chart nothing. A whole number from 1 to 20000. Mirrors PLATFORM_AGENT_EXPECTED_CLUSTERS in install.env."
+  type        = number
+  default     = null
+
+  validation {
+    condition     = var.platform_agent_expected_cluster_profiles == null || try(floor(var.platform_agent_expected_cluster_profiles) == var.platform_agent_expected_cluster_profiles && var.platform_agent_expected_cluster_profiles >= 1 && var.platform_agent_expected_cluster_profiles <= 20000, false)
+    error_message = "platform_agent_expected_cluster_profiles must be a whole number from 1 to 20000. It sets the PlatformAgent CRD's spec.storage.expectedClusterProfiles."
+  }
+}
+
 variable "extra_helm_values" {
   description = "Extra values for the kube-agents Helm release, covering chart settings this composition does not expose as its own variable (telemetry.otlpEndpoint, litellm.otel, the resource blocks, the PlatformAgent harness knobs). Passed as a second values document, so Helm deep-merges it key by key over the ones computed here and anything set wins. Setting a key the composition also computes — platformAgent.harness.clusterName, say — overrides it, which is rarely what you want."
   type        = any

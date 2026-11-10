@@ -1278,7 +1278,9 @@ passes the `50Gi` default above 107 profiles.
 Raising it grows the existing claim online, as a
 raised `size` does, and the `DataVolumeNotExpanded` condition covers a class that can't expand it.
 The sandbox's claim holds no session stores; the copy it takes of the agent's working directories
-leaves them out. The chart sets it from `platformAgent.storage.expectedClusterProfiles`.
+leaves them out. The chart sets it from `platformAgent.storage.expectedClusterProfiles`, the
+Terraform composition from `platform_agent_expected_cluster_profiles` and `install.sh` from
+`PLATFORM_AGENT_EXPECTED_CLUSTERS` in `install.env`.
 
 ## `spec.telemetry`
 

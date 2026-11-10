@@ -1752,6 +1752,64 @@ class InstallerCommonTest(unittest.TestCase):
                     self.assertIn("rc=0", proc.stdout, proc.stderr)
                     self.assertIn(expected, dest.read_text())
 
+    # ── PLATFORM_AGENT_EXPECTED_CLUSTERS: spec.storage.expectedClusterProfiles ──
+
+    def test_tfvars_carry_the_expected_cluster_count_only_when_set(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for env, present in (
+                ({}, None),
+                ({"PLATFORM_AGENT_EXPECTED_CLUSTERS": ""}, None),
+                ({"PLATFORM_AGENT_EXPECTED_CLUSTERS": "200"}, "platform_agent_expected_cluster_profiles = 200\n"),
+                ({"PLATFORM_AGENT_EXPECTED_CLUSTERS": "20000"}, "platform_agent_expected_cluster_profiles = 20000\n"),
+            ):
+                with self.subTest(env=env):
+                    proc = self._run(
+                        f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                        env={"API_SERVER_KEY": "k", **env},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=0", proc.stdout, proc.stderr)
+                    text = dest.read_text()
+                    if present is None:
+                        self.assertNotIn("platform_agent_expected_cluster_profiles", text)
+                    else:
+                        self.assertIn(present, text)
+
+    def test_tfvars_refuse_a_malformed_expected_cluster_count(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for value in ("0", "20001", "-5", "12.5", "200 ", "0200", "two"):
+                with self.subTest(value=value):
+                    proc = self._run(
+                        f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                        env={"API_SERVER_KEY": "k", "PLATFORM_AGENT_EXPECTED_CLUSTERS": value},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=1", proc.stdout, proc.stderr)
+                    self.assertIn(f"PLATFORM_AGENT_EXPECTED_CLUSTERS='{value}' is not a whole number from 1 to 20000", proc.stderr)
+                    self.assertFalse(dest.exists(), "no tfvars is written for a value Terraform would refuse")
+
+    def test_load_install_env_reads_the_expected_cluster_count_from_the_file_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            silent = pathlib.Path(tmp) / "silent.env"
+            silent.write_text("PROJECT_ID=p\n")
+            recorded = pathlib.Path(tmp) / "recorded.env"
+            recorded.write_text("PLATFORM_AGENT_EXPECTED_CLUSTERS=200\n")
+            for file, expected in ((silent, "N=[]"), (recorded, "N=[200]")):
+                with self.subTest(file=file.name):
+                    proc = self._run(
+                        f'load_install_env "{file}"; echo "N=[${{PLATFORM_AGENT_EXPECTED_CLUSTERS:-}}]"',
+                        env={"PLATFORM_AGENT_EXPECTED_CLUSTERS": "999"},
+                    )
+                    self.assertIn(expected, proc.stdout, proc.stderr)
+
+    def test_the_footprint_preview_passes_the_expected_cluster_count_to_the_chart(self):
+        text = _INSTALLER_COMMON.read_text()
+        self.assertIn(
+            "platform_agent_expected_cluster_profiles=platformAgent.storage.expectedClusterProfiles\n", text
+        )
+
     _CONTEXT_KUBECTL = '#!/usr/bin/env bash\ncase "$*" in *"config get-contexts"*) exit 0 ;; esac\nexit 1\n'
 
     # A CR list as `kubectl get platformagents -o json` prints it: no CR, a CR

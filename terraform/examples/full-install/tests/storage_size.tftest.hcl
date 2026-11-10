@@ -122,3 +122,42 @@ run "a_size_above_64Ti_is_refused" {
   }
   expect_failures = [var.platform_agent_storage_size]
 }
+
+run "an_expected_profile_count_is_passed_alone" {
+  command = apply
+  variables {
+    platform_agent_expected_cluster_profiles = 200
+  }
+  assert {
+    condition     = jsonencode(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).platformAgent.storage) == jsonencode({ expectedClusterProfiles = 200 })
+    error_message = "storage: ${jsonencode(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).platformAgent.storage)}"
+  }
+}
+
+run "an_expected_profile_count_is_passed_beside_a_raised_size" {
+  command = apply
+  variables {
+    platform_agent_storage_size              = "80Gi"
+    platform_agent_expected_cluster_profiles = 300
+  }
+  assert {
+    condition     = jsonencode(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).platformAgent.storage) == jsonencode({ expectedClusterProfiles = 300, size = "80Gi" })
+    error_message = "storage: ${jsonencode(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).platformAgent.storage)}"
+  }
+}
+
+run "an_expected_profile_count_out_of_range_is_refused" {
+  command = plan
+  variables {
+    platform_agent_expected_cluster_profiles = 0
+  }
+  expect_failures = [var.platform_agent_expected_cluster_profiles]
+}
+
+run "a_fractional_expected_profile_count_is_refused" {
+  command = plan
+  variables {
+    platform_agent_expected_cluster_profiles = 12.5
+  }
+  expect_failures = [var.platform_agent_expected_cluster_profiles]
+}

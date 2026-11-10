@@ -73,6 +73,11 @@ install without the interview.
   sandbox's. A raise grows both claims where the StorageClass allows it, and a
   lower value is refused. `install.sh` sets it from `PLATFORM_AGENT_STORAGE_SIZE`
   in `install.env`.
+  `platform_agent_expected_cluster_profiles` (default `null`, which passes nothing)
+  sets `spec.storage.expectedClusterProfiles`: the agent's data claim (not the
+  sandbox's) is raised to at least `8Gi` plus `400Mi` per profile, never below
+  `platform_agent_storage_size`. `install.sh` sets it from
+  `PLATFORM_AGENT_EXPECTED_CLUSTERS`.
   `alert_daily_limits` (default `{}`) sets the daily alert ceilings, and
   `install.sh` sets it from the `ALERT_DAILY_LIMIT_*` keys in `install.env`.
   A key that is not set keeps the default in the agent image. Each apply that

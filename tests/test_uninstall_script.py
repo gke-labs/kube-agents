@@ -1180,6 +1180,9 @@ class GvisorFloorCannotBlockTheTeardownTest(unittest.TestCase):
         storage_at = text.find('export PLATFORM_AGENT_STORAGE_SIZE=""')
         self.assertNotEqual(storage_at, -1, "uninstall.sh must blank PLATFORM_AGENT_STORAGE_SIZE")
         self.assertLess(storage_at, call_at)
+        expected_at = text.find('export PLATFORM_AGENT_EXPECTED_CLUSTERS=""')
+        self.assertNotEqual(expected_at, -1, "uninstall.sh must blank PLATFORM_AGENT_EXPECTED_CLUSTERS")
+        self.assertLess(expected_at, call_at)
         # The scoped service account pool too: the generator refuses a
         # misspelt switch or a malformed cap, and the pool goes with the state.
         pool_at = text.find('export SCOPED_SA_POOL_ENABLED="false" SCOPED_SA_POOL_MAX_ACCOUNTS=""')

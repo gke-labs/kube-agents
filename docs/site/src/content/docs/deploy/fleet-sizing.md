@@ -251,7 +251,8 @@ helm upgrade kube-agents ./charts/kube-agents -n kubeagents-system \
 
 An install made with `install.sh` re-renders the chart from `install.env` on a full
 [upgrade](/kube-agents/install/upgrade/), so a value passed only by hand is rendered away on the
-next run. Put the data volume size in `PLATFORM_AGENT_STORAGE_SIZE=100Gi` and the rest in the
+next run. Put the data volume size in `PLATFORM_AGENT_STORAGE_SIZE=100Gi`, the expected cluster count
+in `PLATFORM_AGENT_EXPECTED_CLUSTERS` past about 230 clusters, and the rest in the
 file's `TF_VAR_extra_helm_values` line, which the
 [quickstart](/kube-agents/install/quickstart-gke/#operator-settings) describes. The file holds one
 such line and a second `platformAgent` key replaces the first, so merge these keys into a line

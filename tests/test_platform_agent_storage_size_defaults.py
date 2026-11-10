@@ -77,8 +77,13 @@ class DataStorageSizeDefaultParityTest(unittest.TestCase):
     def test_main_tf_passes_nothing_for_the_default(self):
         main = (_COMPOSITION / "main.tf").read_text()
         self.assertIn(
-            "}, var.platform_agent_storage_size == local.platform_agent_default_storage_size ? {} : {\n"
-            "      storage = { size = var.platform_agent_storage_size }\n",
+            "}, var.platform_agent_storage_size == local.platform_agent_default_storage_size && "
+            "var.platform_agent_expected_cluster_profiles == null ? {} : {\n",
+            main,
+        )
+        self.assertIn(
+            "var.platform_agent_storage_size == local.platform_agent_default_storage_size ? {} : "
+            "{ size = var.platform_agent_storage_size },\n",
             main,
         )
 

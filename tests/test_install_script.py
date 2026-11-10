@@ -6558,6 +6558,7 @@ class PlatformAgentStorageSizePersistsThroughInstallEnvTest(unittest.TestCase):
     def _env(overrides):
         env = get_isolated_test_env(overrides=overrides)
         env.pop("PLATFORM_AGENT_STORAGE_SIZE", None)
+        env.pop("PLATFORM_AGENT_EXPECTED_CLUSTERS", None)
         env.update(overrides)
         return env
 
@@ -6591,6 +6592,27 @@ class PlatformAgentStorageSizePersistsThroughInstallEnvTest(unittest.TestCase):
             )
             self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
             self.assertIn("SIZE=[]", proc.stdout)
+
+    def test_an_inherited_expected_cluster_count_is_recorded_and_a_later_run_drops_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = self._bootstrap_with_export(tmp, 'export PLATFORM_AGENT_EXPECTED_CLUSTERS="200"')
+            self.assertIn("PLATFORM_AGENT_EXPECTED_CLUSTERS=200\n", dest.read_text())
+            dest.unlink()
+            dest = self._bootstrap_with_export(tmp, "unset PLATFORM_AGENT_EXPECTED_CLUSTERS")
+            self.assertNotIn("PLATFORM_AGENT_EXPECTED_CLUSTERS", dest.read_text())
+            loaded = pathlib.Path(tmp) / "existing.install.env"
+            loaded.write_text("PROJECT_ID=p\n")
+            loaded.chmod(0o600)
+            proc = subprocess.run(
+                ["bash", "-c",
+                 f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                 'echo "N=[${PLATFORM_AGENT_EXPECTED_CLUSTERS:-}]"'],
+                capture_output=True, text=True,
+                env=self._env({"KUBE_AGENTS_INSTALL_ENV": str(loaded), "PLATFORM_AGENT_EXPECTED_CLUSTERS": "200"}),
+                cwd=str(_REPO_ROOT),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertIn("N=[]", proc.stdout)
 
 
 class ModelMaxTokensPersistsThroughInstallEnvTest(unittest.TestCase):
