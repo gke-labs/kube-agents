@@ -12,7 +12,10 @@ allows nothing.
 
 kube-agents reads the file only when the install's `KUBEAGENTS_AUTOMERGE` switch is `practice` or
 `on`. The switch is an entry in the PlatformAgent's `spec.deployment.env`, and it defaults to `off`
-([credential isolation](/kube-agents/reference/credential-isolation/) lists where it reaches). With
+([credential isolation](/kube-agents/reference/credential-isolation/) lists where it reaches). On a
+chart, `install.sh` or Terraform install, set it through the chart value
+`platformAgent.deployment.env`, as [Operator settings](/kube-agents/install/quickstart-gke/#operator-settings)
+shows; a hand edit of the CR can be lost at the next chart apply. With
 it off the file is never opened. Adding the file changes nothing until the switch is turned on.
 kube-agents never merges a pull request itself: the file is input to your own pipeline's merge
 decision.
