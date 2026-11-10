@@ -49,6 +49,10 @@ class FakeCluster:
         # Copy this many files of the next upload, then fail it.
         self.upload_partial = None
         self.list_pods_fail = False
+        # Pods being deleted: listed with a deletionTimestamp, still running (the preStop drain).
+        self.draining = set()
+        # Pods whose exec fails as a pod deleted mid-copy does.
+        self.gone = set()
         self.calls = []
 
     def add_pod(self, name):
@@ -88,12 +92,16 @@ class FakeCluster:
         if "get" in cmd:
             if self.list_pods_fail:
                 return subprocess.CompletedProcess(cmd, 1, b"", b"Unable to connect to the server: dial tcp: i/o timeout")
-            items = [{"metadata": {"name": name}, "status": {"phase": "Running", "containerStatuses": [
-                {"name": CONTAINER, "state": {"running": {}}}]}} for name in sorted(self.pods)]
+            items = [{"metadata": {"name": name, **({"deletionTimestamp": "2026-11-10T06:00:00Z"}
+                                                    if name in self.draining else {})},
+                      "status": {"phase": "Running", "containerStatuses": [
+                          {"name": CONTAINER, "state": {"running": {}}}]}} for name in sorted(self.pods)]
             return subprocess.CompletedProcess(cmd, 0, json.dumps({"items": items}).encode(), b"")
         assert "exec" in cmd, cmd
         pod = cmd[cmd.index("exec") + 1 + (1 if cmd[cmd.index("exec") + 1] == "-i" else 0)]
         assert cmd[cmd.index("-c") + 1] == CONTAINER
+        if pod in self.gone:
+            return subprocess.CompletedProcess(cmd, 1, b"", f'Error from server (NotFound): pods "{pod}" not found'.encode())
         script_args = cmd[cmd.index("--") + 1:]
         assert script_args[:2] == ["python3", "-c"], script_args
         script, args = script_args[2], script_args[3:]
@@ -193,6 +201,16 @@ class OnlyCompleteFilesTest(CollectorTestCase):
         self.collector.collect_pass()
         self.assertEqual(len([c for c in self.cluster.calls if c[0] == "gcloud"]), gcloud_before)
         self.assertEqual(self.size(f"store/blobs/{HEX}.json", pod=other), 0)
+
+    def test_a_draining_pod_is_still_listed_and_emptied(self):
+        other = self.cluster.add_pod("proxy-b")
+        self.cluster.draining.add("proxy-b")
+        self.put("logs/p-2-000001.jsonl", b"last\n", pod=other)
+        self.assertEqual(self.collector.pods(), [C.ProxyPod("proxy-a", False), C.ProxyPod("proxy-b", True)])
+        stats = self.collector.collect_pass()
+        self.assertEqual(stats["pods"], 2)
+        self.assertEqual(self.cluster.objects(), {self.key("logs/p-2-000001.jsonl"): b"last\n"})
+        self.assertEqual(self.size("logs/p-2-000001.jsonl", pod=other), 0)
 
 
 class TruncateOnlyAfterUploadTest(CollectorTestCase):
@@ -702,6 +720,65 @@ class ReplayModeTest(CollectorTestCase):
     def test_seed_all_reports_how_many_pods_took_it(self):
         self.cluster.add_pod("proxy-b")
         self.assertEqual(self.collector.seed_all(), (2, 2))
+
+    def test_seed_once_skips_a_draining_pod_and_counts_only_live_ones(self):
+        # The old pod of a rollout: listed while it drains, gone before its copy ends.
+        old = self.cluster.add_pod("proxy-old")
+        self.cluster.draining.add("proxy-old")
+        self.cluster.gone.add("proxy-old")
+        self.assertEqual(self.collector.seed_all(), (1, 1))
+        self.assertFalse(os.path.exists(os.path.join(old, CACHE, C.CACHE_SEED_MARKER)))
+        self.assertTrue(os.path.isfile(os.path.join(self.pod, CACHE, C.CACHE_SEED_MARKER)))
+        self.assertEqual(self.collector.totals.errors, {})
+        self.assertIn('"event": "seed_skipped_draining", "pods": 1', self.out.getvalue())
+
+    def test_a_pod_deleted_during_its_seed_leaves_both_counts(self):
+        # Live when listed, evicted while its copy ran: gone, not a refusal.
+        self.cluster.add_pod("proxy-b")
+        self.cluster.gone.add("proxy-b")
+        seed = self.collector.seed
+
+        def seed_then_delete(pod):
+            took = seed(pod)
+            if not took:
+                del self.cluster.pods[pod]
+            return took
+
+        self.collector.seed = seed_then_delete
+        self.assertEqual(self.collector.seed_all(), (1, 1))
+        self.assertIn('"event": "seed_skipped_vanished", "pods": 1', self.out.getvalue())
+
+    def test_a_failed_relisting_counts_every_failed_seed_as_a_refusal(self):
+        # The API server stops answering after proxy-a took the cache: proxy-b's
+        # seed fails and so does the listing that would show whether it went.
+        self.cluster.add_pod("proxy-b")
+        self.cluster.gone.add("proxy-b")
+        seed = self.collector.seed
+
+        def seed_then_lose_the_api(pod):
+            took = seed(pod)
+            self.cluster.list_pods_fail = not took
+            return took
+
+        self.collector.seed = seed_then_lose_the_api
+        self.assertEqual(self.collector.seed_all(), (2, 1))
+        self.assertNotIn("seed_skipped_vanished", self.out.getvalue())
+
+    def test_a_live_pod_that_refused_its_seed_still_counts(self):
+        self.cluster.add_pod("proxy-b")
+        self.cluster.gone.add("proxy-b")
+        self.assertEqual(self.collector.seed_all(), (2, 1))
+        self.assertNotIn("seed_skipped_vanished", self.out.getvalue())
+
+    def test_a_pass_seeds_no_draining_pod_but_collects_its_lines(self):
+        old = self.cluster.add_pod("proxy-old")
+        self.cluster.draining.add("proxy-old")
+        self.put("logs/p-2-000001.jsonl", b"last\n", pod=old)
+        self.collector.collect_pass()
+        self.assertFalse(os.path.exists(os.path.join(old, CACHE, C.CACHE_SEED_MARKER)))
+        self.assertTrue(os.path.isfile(os.path.join(self.pod, CACHE, C.CACHE_SEED_MARKER)))
+        self.assertEqual(self.seeds(), 1)
+        self.assertIn(self.key("logs/p-2-000001.jsonl"), self.cluster.objects())
 
     def test_the_last_pass_uploads_the_lane_report_under_report(self):
         def report(out_dir):

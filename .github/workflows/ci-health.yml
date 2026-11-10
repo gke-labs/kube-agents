@@ -245,11 +245,10 @@ env:
   NIGHTLY_MAIN_E_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-main-e/
   NIGHTLY_WRITERS_B_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-writers-b/
   NIGHTLY_WRITERS_C_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-writers-c/
-  # The GitLab lane's nightly (kube-agents#2832): the lane's list once a night,
-  # tier gitlab with no pull request, listed under the Brief's GitLab section.
-  GITLAB_NIGHTLY_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/
-  # Its next-mode nightly, listed beside it under its own job; the job sets no
-  # gcs_configuration, so it logs to Prow's bucket.
+  # The GitLab lane's nightly, next mode (kube-agents#2832): the lane's list
+  # once a night, tier gitlab with no pull request, listed under the Brief's
+  # GitLab section; the job sets no gcs_configuration, so it logs to Prow's
+  # bucket.
   GITLAB_NIGHTLY_NEXT_PREFIX: gs://kube-agents-prow/logs/ci-kube-agents-eval-nightly-gitlab-next/
   # The self-managed forge lanes (kube-agents#3682), a tier each and one
   # Brief section together: their presubmits log to the lanes' own bucket,
@@ -409,7 +408,6 @@ jobs:
             --nightly-main-e-prefix "$NIGHTLY_MAIN_E_PREFIX" \
             --nightly-writers-b-prefix "$NIGHTLY_WRITERS_B_PREFIX" \
             --nightly-writers-c-prefix "$NIGHTLY_WRITERS_C_PREFIX" \
-            --gitlab-nightly-prefix "$GITLAB_NIGHTLY_PREFIX" \
             --lane-nightly-prefix "gitlab=$GITLAB_NIGHTLY_NEXT_PREFIX" \
             --lane-pr-glob "ghes=$GHES_PR_GLOB" \
             --lane-nightly-prefix "ghes=$GHES_WEEKLY_PREFIX" \

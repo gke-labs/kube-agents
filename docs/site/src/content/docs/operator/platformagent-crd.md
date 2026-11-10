@@ -657,6 +657,12 @@ instead. That line is load, not a fault. The older
 `kanban dispatcher stuck: … Check profile health` warning now means what it says: slots were free
 and still nothing started.
 
+That warning waits for six ticks, so a short saturation would leave no trace. Each user card that
+waits therefore also writes one `kanban priority: <id> queued …` line to the gateway log on the tick
+it is queued. The line says how many user cards are ahead of it, names the cards that held the
+slots and ends with the same held-back clause, so the wait is readable back afterwards. The card's
+`queued` event on the board carries the holders' ids as well.
+
 The arithmetic behind `6`:
 
 - **Gateway memory.** One worker measured about 430 MiB on a live install: `hermes chat` 207 MiB,
@@ -1123,6 +1129,14 @@ spec:
   it: the daily upgrade-readiness watch and the Saturday `upgrade-readiness-weekly-review`, whose reports enumerate by project (the review's findings on such a cluster reach the findings queue and the weekly brief); the networking audit's
   subnet usage, since its pods still hold their IPs; the GCE audit's instance listing; and the
   third-party `gke` MCP server's `list_clusters`.
+
+  Excluding a cluster narrows what the agents look at, but it is not yet enforced. The credential
+  proxy still issues a kubeconfig for an excluded cluster. So a worker that fetches the cluster's
+  credentials itself (`gcloud container clusters get-credentials`), or names it as a `kubectl`
+  context, can still read it with the agent's read roles. Those are granted per project or inherited
+  from a declared folder or organization, and reach every cluster beneath. Only a project where the
+  agent holds no roles, bound there or inherited, keeps the agent off a cluster. A cluster in the
+  management project can't be fenced off this way yet, since that project always holds the roles.
 
 ### Project outcomes
 
