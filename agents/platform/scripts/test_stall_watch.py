@@ -1803,6 +1803,72 @@ class Coverage(Base):
         self.assertNotIn(stall_watch.BUDGET_SCOPE, self.ledger()["unreadable"])
 
 
+class Timings(Base):
+    """The ledger records what each cluster cost to read and the tick's own
+    figures, so a fleet the budget does not cover can be measured from the
+    ledger alone: which cluster takes the time, and how many ticks a pass
+    takes (#5259)."""
+
+    NOW = "2026-11-09T18:00:00+00:00"
+    LATER = "2026-11-09T18:30:00+00:00"
+
+    def test_each_read_cluster_and_the_tick_are_timed_in_the_ledger(self):
+        fleet = {"a": {"ns": [], "ns2": []}, "b": {"ns": []}}
+        self.run_tick(fleet, now=self.NOW)
+        timings = self.ledger()[stall_watch.CLUSTER_TIMINGS_KEY]
+        self.assertEqual(sorted(timings), [cid("a"), cid("b")])
+        a = timings[cid("a")]
+        self.assertEqual(a[stall_watch.TIMING_AT_KEY], self.NOW)
+        self.assertEqual(a[stall_watch.TIMING_NAMESPACES_KEY], 2)
+        self.assertEqual(a[stall_watch.TIMING_SCANS_KEY], 2)
+        self.assertIsInstance(a[stall_watch.TIMING_SECONDS_KEY], float)
+        self.assertGreaterEqual(a[stall_watch.TIMING_SECONDS_KEY], 0)
+        self.assertFalse(a[stall_watch.TIMING_CUT_KEY])
+        tick = self.ledger()[stall_watch.TICK_TIMING_KEY]
+        self.assertEqual(tick[stall_watch.TIMING_AT_KEY], self.NOW)
+        self.assertEqual(tick[stall_watch.TIMING_CLUSTERS_KEY], 2)
+        self.assertEqual(tick[stall_watch.TIMING_SCANS_KEY], 3)
+        self.assertGreaterEqual(tick[stall_watch.TIMING_SECONDS_KEY], tick[stall_watch.TIMING_SWEEP_KEY], "the tick holds the sweep and the alerts")
+        self.assertGreaterEqual(tick[stall_watch.TIMING_SWEEP_KEY], tick[stall_watch.TIMING_LISTING_KEY])
+        self.assertGreaterEqual(tick[stall_watch.TIMING_LISTING_KEY], 0)
+
+    def test_a_cluster_the_budget_did_not_reach_keeps_its_record_and_a_cut_one_shows_it(self):
+        fleet = {"a": {"ns": []}, "b": {"ns": [], "ns2": []}, "c": {"ns": []}}
+        self.run_tick(fleet, now=self.NOW)
+        over = stall_watch.TICK_BUDGET_SECONDS + 1
+        # a read in full, b cut before its second namespace, c never reached.
+        with patch.object(stall_watch.time, "monotonic", side_effect=[0, 1, 2, 3, 4, over] + [over] * 12):
+            self.run_tick(fleet, now=self.LATER)
+        timings = self.ledger()[stall_watch.CLUSTER_TIMINGS_KEY]
+        self.assertEqual(timings[cid("a")][stall_watch.TIMING_AT_KEY], self.LATER)
+        b = timings[cid("b")]
+        self.assertEqual(b[stall_watch.TIMING_AT_KEY], self.LATER)
+        self.assertEqual((b[stall_watch.TIMING_NAMESPACES_KEY], b[stall_watch.TIMING_SCANS_KEY], b[stall_watch.TIMING_CUT_KEY]), (2, 1, True))
+        self.assertEqual(timings[cid("c")][stall_watch.TIMING_AT_KEY], self.NOW, "not reached this tick: the last read's record stands")
+        self.assertEqual(self.ledger()[stall_watch.TICK_TIMING_KEY][stall_watch.TIMING_CLUSTERS_KEY], 2)
+        # The next tick fits and resumes inside b: it scans the one namespace
+        # left and the record carries the cut tick's scans and seconds
+        # forward, so it reads as the whole pass over b, no longer cut.
+        cut_seconds = b[stall_watch.TIMING_SECONDS_KEY]
+        with patch.object(stall_watch, "seconds_since", return_value=5.0):
+            self.run_tick(fleet, now="2026-11-09T19:00:00+00:00")
+        b = self.ledger()[stall_watch.CLUSTER_TIMINGS_KEY][cid("b")]
+        self.assertEqual((b[stall_watch.TIMING_NAMESPACES_KEY], b[stall_watch.TIMING_SCANS_KEY], b[stall_watch.TIMING_CUT_KEY]), (2, 2, False))
+        self.assertEqual(b[stall_watch.TIMING_SECONDS_KEY], round(cut_seconds + 5.0, 1))
+        a = self.ledger()[stall_watch.CLUSTER_TIMINGS_KEY][cid("a")]
+        self.assertEqual(a[stall_watch.TIMING_SECONDS_KEY], 5.0, "a cluster read in full carries nothing forward")
+        self.assertIsNone(self.ledger()[stall_watch.CURSOR_KEY])
+
+    def test_a_cluster_that_could_not_be_read_is_timed_with_no_scans_and_a_gone_one_is_dropped(self):
+        self.run_tick({"a": {"ns": []}, "down": TIMEOUT, "c": {"ns": []}}, now=self.NOW)
+        timings = self.ledger()[stall_watch.CLUSTER_TIMINGS_KEY]
+        down = timings[cid("down")]
+        self.assertEqual((down[stall_watch.TIMING_NAMESPACES_KEY], down[stall_watch.TIMING_SCANS_KEY], down[stall_watch.TIMING_CUT_KEY]), (0, 0, False))
+        self.assertGreaterEqual(down[stall_watch.TIMING_SECONDS_KEY], 0)
+        self.run_tick({"a": {"ns": []}}, now=self.LATER)
+        self.assertEqual(sorted(self.ledger()[stall_watch.CLUSTER_TIMINGS_KEY]), [cid("a")])
+
+
 class Scope(Base):
     def test_system_namespaces_are_skipped_and_the_harness_is_not(self):
         extra = ["kube-system", "gke-managed-cim", "config-management-system", "gmp-public"]

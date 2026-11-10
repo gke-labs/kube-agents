@@ -1095,11 +1095,13 @@ platformAgent:
     # clusterName required), namespace, reason, kind and name (a trailing *
     # is a prefix), and matches when every part it sets matches; an event is
     # excluded when any rule matches. At most 64 rules. Empty omits the block.
-    # A change rolls the gateway pod. See spec.harness.eventWatcher in the
-    # PlatformAgent CRD reference. Removing the last rule through helm upgrade
-    # removes the CR's whole eventWatcher block, so an enabled: false set there
-    # with kubectl patch is lost too; set it again afterwards. The watcher's
-    # tuning settings are under platformAgent.deployment.eventWatcher.
+    # A change is in force within about two minutes, without a pod restart
+    # (at the next pod restart if the agent image is older than the operator).
+    # See spec.harness.eventWatcher in the PlatformAgent CRD reference.
+    # Removing the last rule through helm upgrade removes the CR's whole
+    # eventWatcher block, so an enabled: false set there with kubectl patch is
+    # lost too; set it again afterwards. The watcher's tuning settings are
+    # under platformAgent.deployment.eventWatcher.
     eventWatcher:
       alertExclude: []
         # - namespace: payments
@@ -1382,7 +1384,7 @@ platformAgent:
     # memory limit set without its request, below the default request, lowers
     # that request to the limit. On Autopilot a CPU request the override does
     # not set is held to at most one CPU per GiB of the memory request. The operator
-    # refuses a memory limit below 672Mi (two commands at once), a request
+    # refuses a memory limit below 544Mi (two commands at once), a request
     # above its limit, a
     # negative quantity, a zero limit, claims, and any resource name other than cpu, memory and
     # ephemeral-storage, whether or not its webhook is enabled: the reconciler
@@ -1407,7 +1409,11 @@ platformAgent:
       # The exec tier: stateless broker replicas beside the stateful broker that
       # answer /v1/exec and /v1/gcp/ only, forwarded to the CR as
       # spec.deployment.credentialProxy.exec.replicas when above 0. 0 renders
-      # none. Each replica requests and is limited to 2 CPU and 2Gi. On an
+      # none. Above 0 the shell sandbox, the profile workers and the session
+      # pods are given its address, and a change between 0 and a positive value
+      # restarts the shell sandbox and the profile warm pools (and the A2A
+      # gateway under the cluster view). Each replica requests and is
+      # limited to 2 CPU and 2Gi. On an
       # existing install the chart fails the upgrade when the installed CRD
       # predates the field; apply crds/ first (upgrade.sh does).
       exec:

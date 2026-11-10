@@ -172,7 +172,7 @@ roster line on 2026-11-02 (its bullet stays for the record):
   2026-10-28, agent on gemini-4-argon), because that lane sets the route check aside and the
   current models read the block correctly on their own, so a presubmit seat could not fail when
   the fix it guards is undone. It stays a nightly case; the domain's seat is
-  consistency-drift-outlier's. No CI lane grades its route check today: the nightly halves run
+  consistency-drift-outlier's. No CI lane grades its route check today: the nightly's main shards run
   through the inject door since #3783, and since #3969 retired the today-mode nightly the
   api-lane jobs that remain carry the presubmit list (the GitLab nightly its own list), not the
   nightly file, so the route is graded only on an api-lane run that carries the case, as #3975's
@@ -297,8 +297,9 @@ Admitted on the record since the split:
   `gcp.read-only`, which is the red it guards against; its red run on `main` is #3633's, on a
   dev install (`run_20261019_201435_772300`: both report objectives failed, the agent answering
   that its command and API proxy policies did not allow reading alert policies). The record is
-  the main nightly's `-main-b` half (`ci-kube-agents-eval-nightly-main-b`, where the case runs as
-  a stack case; that periodic's first night is 2026-10-27), read from each build's
+  the main nightly's `-main-b` half as it then was (`ci-kube-agents-eval-nightly-main-b`, where the case
+  ran as a stack case; that periodic's first night is 2026-10-27; since the main part runs as five
+  shards the case is in main-e, `hack/eval/nightly-main-e.txt`), read from each build's
   `case-monitoring-alert-policy-read.json` and dated by the build's UTC start: 21 of 21 graded
   repetitions on the seven nights 2026-10-27 to 11-02, every night 3/3, no infra repetition, all
   under `spec.mode next` on the inject lane; 6/6 on the two nights at
@@ -432,7 +433,8 @@ across 5 recorded run(s), 5 more needed before this case can collapse`; and, bec
   repository held no manifest for it, or named an older pull request it had not opened).
   [#3145](https://github.com/gke-labs/kube-agents/pull/3145), merged 2026-10-23 00:36 UTC, seeds
   that manifest into every pool repository. The record is the writers nightly
-  (`ci-kube-agents-eval-nightly-writers`, where the case runs because it opens a pull request),
+  (`ci-kube-agents-eval-nightly-writers`, where the case runs because it opens a pull request; its
+  writers-a third since the part runs in thirds),
   read from each build's `case-pdb-remediation-pr.json` and dated, as the dashboard's Nightly page
   dates it, by the build's UTC start (8 PM ET the evening before): 3/3 on each of the three nights
   since #3145, 2026-10-24, 10-25 and 10-26 (builds 2113782591684349952, 2114144983022833664 and
@@ -698,7 +700,7 @@ version key carries the mode ([`bench/baselines/README.md`](../bench/baselines/R
 presubmit's `next` is compared only with lines a next-mode run on `main` recorded at its key, and
 the today lane's `today` only with today's; a case with no line at its key contributes nothing to
 `main`'s side, with one exception below. The main nightly (`ci-kube-agents-eval-nightly`, its
-`-main-b` half and its `-writers` part) is the next-mode run on `main` that records, on the presubmit's agent model. A case
+`-main-b` to `-main-e` shards and its three writers thirds) is the next-mode run on `main` that records, on the presubmit's agent model. A case
 with no line at its next key (one the inject lane excludes, or whose window has not filled) falls
 back, for this number only, to its today-mode lines at the same key otherwise, which the store
 already holds (no job appends them now), and the verdict names those cases in a note; rung 6
@@ -780,8 +782,8 @@ back to `next` and to `today` again before the matrix, and a rollback that fails
 The matrix is the presubmit's, roster included, so a case graded only over the api transport is
 graded there, but the job does not block a merge.
 
-A check the transport blinds is the scorer's business. The door's trace carries no card ids,
-no worker's entries and no results. The delegation wait now reads the cards and the workers from the pod
+A check the transport blinds is the scorer's business. The harness reads no card ids, no worker's
+entries and no results off the door's trace. The delegation wait now reads the cards and the workers from the pod
 when the turn ran under the bridge's `api` executor, but the scorer still treats
 `worker_commands`, `worker_agents`, `worker_budget`, `report_times_in_window`, a `tool_called` in the `workers` or `all` scope, and a
 `tool_called` with a `result` pattern as blind on

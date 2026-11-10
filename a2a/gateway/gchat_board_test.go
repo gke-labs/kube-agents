@@ -58,13 +58,46 @@ func newBoardGchatAdapter(t *testing.T) (*GoogleChatAdapter, *fakeChatRelay, *fa
 	return a, f, actor
 }
 
-// gchatBoardTap is the fixture's click as a tap on row's action.
+// gchatBoardTap is the fixture's click as a tap on row's action, carrying
+// the line the fixture card's button for that row carries (every card the
+// tests post puts its rows after a headline, so the lines agree).
 func gchatBoardTap(t *testing.T, action string, row int, tasks string) *gchatEvent {
+	t.Helper()
+	layout, err := renderGchatChat(gchatBoardCard())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return gchatBoardTapAt(t, action, row, tasks, gchatButtonLine(t, layout, action, row))
+}
+
+// gchatBoardTapAt is gchatBoardTap with the line the button carries, "" for
+// a button drawn before the line parameter existed.
+func gchatBoardTapAt(t *testing.T, action string, row int, tasks, line string) *gchatEvent {
 	t.Helper()
 	ev := gchatClickEvent(t)
 	ev.click.Function = gchatBoardFunction
 	ev.click.Parameters = map[string]string{"action": action, "row": strconv.Itoa(row), "tasks": tasks}
+	if line != "" {
+		ev.click.Parameters["line"] = line
+	}
 	return ev
+}
+
+// gchatButtonLine is the line parameter of layout's board button for row's
+// action.
+func gchatButtonLine(t *testing.T, layout gchatChatLayout, action string, row int) string {
+	t.Helper()
+	for _, w := range layout.Widgets {
+		list, _ := w["buttonList"].(map[string]any)
+		buttons, _ := list["buttons"].([]map[string]any)
+		for _, b := range buttons {
+			if gchatButtonFunction(b) == gchatBoardFunction && gchatButtonParam(b, "action") == action && gchatButtonParam(b, "row") == strconv.Itoa(row) {
+				return gchatButtonParam(b, "line")
+			}
+		}
+	}
+	t.Fatalf("no %s button for row %d in %+v", action, row, layout.Widgets)
+	return ""
 }
 
 // buttonTexts is the texts of a patched body's buttons, none for an empty
@@ -104,8 +137,8 @@ func postBoardCard(t *testing.T, a *GoogleChatAdapter) {
 
 // A message whose rows carry buttons numbers every row in the bullet's
 // place and draws each row's Retry and Drop, labelled with its number, in
-// the one button list, their parameters the action, the row and its ids. A
-// message whose rows carry none keeps its bullets.
+// the one button list, their parameters the action, the row, its ids and
+// its line in the text. A message whose rows carry none keeps its bullets.
 func TestRenderGchatChatNumbersRowsWithButtons(t *testing.T) {
 	layout, err := renderGchatChat(gchatBoardCard())
 	if err != nil {
@@ -132,11 +165,16 @@ func TestRenderGchatChatNumbersRowsWithButtons(t *testing.T) {
 		t.Errorf("labels = %v", labels)
 	}
 	first, last := buttons[0], buttons[3]
-	if gchatButtonParam(first, "action") != "retry" || gchatButtonParam(first, "row") != "1" || gchatButtonParam(first, "tasks") != "t_1,t_2" {
+	if gchatButtonParam(first, "action") != "retry" || gchatButtonParam(first, "row") != "1" || gchatButtonParam(first, "tasks") != "t_1,t_2" ||
+		gchatButtonParam(first, "line") != "2" {
 		t.Errorf("first button's parameters = %v", first)
 	}
-	if gchatButtonParam(last, "action") != "drop" || gchatButtonParam(last, "row") != "2" || gchatButtonParam(last, "tasks") != "t_3" {
+	if gchatButtonParam(last, "action") != "drop" || gchatButtonParam(last, "row") != "2" || gchatButtonParam(last, "tasks") != "t_3" ||
+		gchatButtonParam(last, "line") != "3" {
 		t.Errorf("last button's parameters = %v", last)
+	}
+	if lines := strings.Split(layout.Text, "\n"); !strings.HasPrefix(lines[2], "1. ") || !strings.HasPrefix(lines[3], "2. ") {
+		t.Errorf("the lines the buttons carry are not the rows: %q", lines)
 	}
 	plain := &chatmsg.Message{Schema: chatmsg.Schema, Rows: []chatmsg.Row{{Text: "a"}, {Text: "b"}}}
 	if layout, err = renderGchatChat(plain); err != nil || layout.Text != "- a\n- b" || layout.Widgets != nil {
@@ -373,8 +411,44 @@ func TestGchatBoardLineAndRowText(t *testing.T) {
 			t.Errorf("row text of %q = %q, want %q", tc.line, got, tc.want)
 		}
 	}
-	if _, err := gchatBoardRowLayout(gchatChatLayout{Text: "10. x"}, 1, "l", true); !errors.Is(err, errGchatBoardRowGone) {
-		t.Errorf("row 1 found in %q: %v", "10. x", err)
+}
+
+// gchatBoardRowOf resolves the line a tap edits, once, and refuses a row
+// the text does not show at it: a line that does not start with the row's
+// marker, from the button or from the finder, is no row; the finder's
+// index is the one returned for a button that carries none; and the
+// remembered card's button line wins over the tap's only when the card is
+// remembered.
+func TestGchatBoardRowOfResolvesTheLineOnce(t *testing.T) {
+	rows := []chatmsg.Row{{Text: "x", Tasks: []string{"t_1"}, Actions: []string{"retry"}}}
+	tasks := []string{"t_1"}
+	withLine := gchatChatLayout{Text: "h\n\n1. x", Widgets: gchatButtonList(gchatBoardButtons(rows, 2))}
+	legacy := gchatWithoutLines(gchatChatLayout{Text: "h\n\n1. x", Widgets: gchatButtonList(gchatBoardButtons(rows, 2))})
+	for _, tc := range []struct {
+		name       string
+		layout     gchatChatLayout
+		remembered bool
+		tap        gchatBoardRow
+		want       int
+		ok         bool
+	}{
+		{"the tap's line, no record", withLine, false, gchatBoardRow{n: 1, line: 2}, 2, true},
+		{"the card's line over the tap's, remembered", withLine, true, gchatBoardRow{n: 1, line: 0}, 2, true},
+		{"the tap's line checked when not remembered", withLine, false, gchatBoardRow{n: 1, line: 0}, 0, false},
+		{"the tap's line over the finder on a legacy card", legacy, true, gchatBoardRow{n: 1, line: 2}, 2, true},
+		{"the finder's index for a legacy tap", legacy, true, gchatBoardRow{n: 1, line: gchatBoardNoLine}, 2, true},
+		{"a line past the text", withLine, false, gchatBoardRow{n: 1, line: 9}, 0, false},
+		{"a row the layout does not hold", withLine, true, gchatBoardRow{n: 2, line: 2}, 0, false},
+	} {
+		row, ok := gchatBoardRowOf(tc.layout, tc.remembered, tc.tap, tasks)
+		if ok != tc.ok || (ok && row.line != tc.want) {
+			t.Errorf("%s: row %+v, %v; want line %d, %v", tc.name, row, ok, tc.want, tc.ok)
+		}
+	}
+	for _, text := range []string{"10. x", "h\n\n10. x"} {
+		if row, ok := gchatBoardRowOf(gchatChatLayout{Text: text, Widgets: legacy.Widgets}, true, gchatBoardRow{n: 1, line: gchatBoardNoLine}, tasks); ok {
+			t.Errorf("row 1 found in %q at %+v", text, row)
+		}
 	}
 }
 
@@ -408,36 +482,29 @@ func TestGchatBoardReLayoutFreesTheRowsClaims(t *testing.T) {
 	}
 }
 
-// The row is found in the rows block, not at the first line that starts
-// with its number: a detail with a numbered list of its own is left alone.
+// The row's button carries the row's line, past a detail with a numbered
+// list of its own, and the tap edits that line: the detail is left alone.
 func TestGchatBoardTapEditsTheRowNotADetailLine(t *testing.T) {
 	a, f, _ := newBoardGchatAdapter(t)
 	card := gchatBoardCard()
 	card.Detail = "1. not a row\n2. nor this"
+	layout, err := renderGchatChat(card)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if line := gchatButtonLine(t, layout, "retry", 1); line != "5" {
+		t.Fatalf("row 1's line = %q, want 5 (the headline, a gap, two detail lines, a gap):\n%s", line, layout.Text)
+	}
 	if _, _, err := a.PostNotifyMessage("spaces/_c2fixtureAA", "", OutMessage{Text: "fallback", Chat: card}); err != nil {
 		t.Fatal(err)
 	}
-	if _, reason := a.classify(gchatBoardTap(t, "retry", 1, "t_1,t_2")); !strings.HasPrefix(reason, gchatBoardTaken) {
+	if _, reason := a.classify(gchatBoardTapAt(t, "retry", 1, "t_1,t_2", gchatButtonLine(t, layout, "retry", 1))); !strings.HasPrefix(reason, gchatBoardTaken) {
 		t.Fatalf("tap: %q", reason)
 	}
 	body := checkPatch(t, f, 1, gchatBoardMessage)
 	text := body["text"].(string)
 	if !strings.Contains(text, "\n\n1. not a row\n2. nor this\n\n1. *Triage x* · Stopped 1 day ago before finishing. — ✓ Retrying. Test Sender, 15:04 UTC\n2. ") {
 		t.Errorf("text =\n%s", text)
-	}
-	for _, tc := range []struct {
-		lines        []string
-		start, count int
-	}{
-		{[]string{"h", "", "1. a", "2. b", "", "x"}, 2, 2},
-		{[]string{"1. d", "", "1. a", "2. b"}, 2, 2},
-		{[]string{"1. a", "2. b", "", "1. f"}, 0, 2},
-		{[]string{"1. d", "", "1. a"}, 2, 1},
-		{[]string{"h", "10. x"}, 0, 0},
-	} {
-		if start, count := gchatBoardRowsBlock(tc.lines); start != tc.start || count != tc.count {
-			t.Errorf("rows block of %q = %d, %d; want %d, %d", tc.lines, start, count, tc.start, tc.count)
-		}
 	}
 }
 
@@ -493,13 +560,14 @@ func TestGchatBoardAdmitsIsWiredThroughNewMuxAndSideDoor(t *testing.T) {
 	if _, reason := a.classify(other); reason != gchatBoardUnverified {
 		t.Errorf("unlisted presser: %q", reason)
 	}
-	// As after a restart: the event carries the message, text and buttons.
+	// As after a restart: the event carries the message, text and buttons
+	// (this card has no headline, so its row is on the first line).
 	shown, err := renderGchatChat(&chatmsg.Message{Schema: chatmsg.Schema,
 		Rows: []chatmsg.Row{{Text: "x", Tasks: []string{"t_1"}, Actions: []string{"retry", "drop"}}}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	ev := gchatBoardTap(t, "retry", 1, "t_1")
+	ev := gchatBoardTapAt(t, "retry", 1, "t_1", gchatButtonLine(t, shown, "retry", 1))
 	ev.Message.Text = shown.Text
 	ev.Message.AccessoryWidgets = gchatShownWidgets(t, shown)
 	if _, reason := a.classify(ev); !strings.HasPrefix(reason, gchatBoardTaken) {
@@ -600,9 +668,9 @@ func TestGchatBoardSkippedRowTakesNoNumber(t *testing.T) {
 	buttons := layout.Widgets[0]["buttonList"].(map[string]any)["buttons"].([]map[string]any)
 	var got []string
 	for _, b := range buttons {
-		got = append(got, b["text"].(string)+"="+gchatButtonParam(b, "tasks"))
+		got = append(got, b["text"].(string)+"="+gchatButtonParam(b, "tasks")+"@"+gchatButtonParam(b, "line"))
 	}
-	if strings.Join(got, ",") != "Retry 1=t_1,Drop 1=t_1,Retry 2=t_3,Drop 2=t_3" {
+	if strings.Join(got, ",") != "Retry 1=t_1@2,Drop 1=t_1@2,Retry 2=t_3@3,Drop 2=t_3@3" {
 		t.Errorf("buttons = %v", got)
 	}
 	if _, _, err := a.PostNotifyMessage("spaces/_c2fixtureAA", "", OutMessage{Text: "fallback", Chat: card}); err != nil {
@@ -664,9 +732,8 @@ func TestGchatBoardSettleDuringTheRoundTripStands(t *testing.T) {
 	}
 }
 
-// The row is edited where the renderer put the rows, so a numbered list in
-// the fold (which renders after the rows) is left alone; a layout read back
-// from a click's copy still uses the finder.
+// The row is edited on the line its button carries, so a numbered list in
+// the fold (which renders after the rows) is left alone.
 func TestGchatBoardTapEditsTheRowNotAFoldList(t *testing.T) {
 	a, f, _ := newBoardGchatAdapter(t)
 	card := gchatBoardCard()
@@ -676,13 +743,13 @@ func TestGchatBoardTapEditsTheRowNotAFoldList(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if layout.RowsStart != 2 || layout.RowsCount != 3 {
-		t.Fatalf("rows at %d for %d lines, want 2 for 3:\n%s", layout.RowsStart, layout.RowsCount, layout.Text)
+	if line := gchatButtonLine(t, layout, "retry", 1); line != "2" {
+		t.Fatalf("row 1's line = %q, want 2:\n%s", line, layout.Text)
 	}
 	if _, _, err := a.PostNotifyMessage("spaces/_c2fixtureAA", "", OutMessage{Text: "fallback", Chat: card}); err != nil {
 		t.Fatal(err)
 	}
-	if _, reason := a.classify(gchatBoardTap(t, "retry", 1, "t_1,t_2")); !strings.HasPrefix(reason, gchatBoardTaken) {
+	if _, reason := a.classify(gchatBoardTapAt(t, "retry", 1, "t_1,t_2", gchatButtonLine(t, layout, "retry", 1))); !strings.HasPrefix(reason, gchatBoardTaken) {
 		t.Fatalf("tap: %q", reason)
 	}
 	body := checkPatch(t, f, 1, gchatBoardMessage)
@@ -691,9 +758,6 @@ func TestGchatBoardTapEditsTheRowNotAFoldList(t *testing.T) {
 		"2. *Open GitOps PR for y* · Waiting on you.\n3. *Too many to act on*\n\n*why*\n1. x\n2. y"
 	if body["text"] != want {
 		t.Errorf("text =\n%s\nwant\n%s", body["text"], want)
-	}
-	if plain, err := renderGchatChat(&chatmsg.Message{Schema: chatmsg.Schema, Rows: []chatmsg.Row{{Text: "a"}}}); err != nil || plain.RowsCount != 0 {
-		t.Errorf("rows without buttons recorded a block: %+v, %v", plain, err)
 	}
 }
 
@@ -801,10 +865,10 @@ func TestGchatBoardTapAfterARestartOnASettledMessageIsDroppedBeforeActing(t *tes
 }
 
 // A rated card (posted in a conversation, with the rating buttons after
-// the row buttons) is remembered with the rows where the renderer put them,
-// so a tap edits its row and not a numbered list in the fold as long as the
-// rows. The layouts an answer and a rating edit derive keep the rows too.
-func TestGchatBoardRatedCardIsEditedByTheRecordedRows(t *testing.T) {
+// the row buttons) is edited on the line its row's button carries, so a
+// tap edits its row and not a numbered list in the fold as long as the
+// rows, and keeps the rating pair.
+func TestGchatBoardRatedCardIsEditedByTheButtonsLine(t *testing.T) {
 	a, f, _ := newBoardGchatAdapter(t)
 	a.SetFeedbackRecorder(&fakeRecorder{admit: map[string]bool{"sender@example.com": true}})
 	card := gchatBoardCard()
@@ -829,25 +893,6 @@ func TestGchatBoardRatedCardIsEditedByTheRecordedRows(t *testing.T) {
 	if texts := buttonTexts(t, body); len(texts) != 4 || strings.Join(texts[:2], ",") != "Retry 2,Drop 2" {
 		t.Errorf("buttons after the tap = %v, want row 2's and the rating pair", texts)
 	}
-	layout, err := renderGchatChat(card)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for name, derived := range map[string]gchatChatLayout{
-		"answered":       gchatAnsweredLayout(layout, nil, gchatRating{}, "line"),
-		"without rating": gchatWithoutRating(gchatWithRatingLayout(layout, gchatRating{task: "t-root"})),
-	} {
-		if derived.RowsStart != layout.RowsStart || derived.RowsCount != layout.RowsCount {
-			t.Errorf("the %s layout lost the rows: %d for %d, want %d for %d", name, derived.RowsStart, derived.RowsCount, layout.RowsStart, layout.RowsCount)
-		}
-	}
-}
-
-// gchatWithRatingLayout is layout with r's buttons after its own.
-func gchatWithRatingLayout(layout gchatChatLayout, r gchatRating) gchatChatLayout {
-	rated := layout
-	rated.Widgets = gchatWithRating(layout.Widgets, r)
-	return rated
 }
 
 // A tap whose edit fails forgets the message's record, since the edit may
@@ -911,5 +956,213 @@ func TestGchatBoardFailedEditLetsAConcurrentTapDrawFromItsCopy(t *testing.T) {
 	}
 	if _, reason := a.classify(gchatBoardTap(t, "drop", 1, "t_1,t_2")); !strings.HasPrefix(reason, gchatBoardTaken) {
 		t.Errorf("a tap on the failed edit's row: %q", reason)
+	}
+}
+
+// A tap on a message with no record (posted before a restart) edits the
+// line its button carries, so a numbered list in the fold as long as the
+// rows is left alone: the button names the row's line, and no finder reads
+// the text for it, even when the copy's own buttons carry no line.
+func TestGchatBoardTapAfterARestartEditsTheRowNotAFoldList(t *testing.T) {
+	a, f, _ := newBoardGchatAdapter(t)
+	card := gchatBoardCard()
+	card.After = nil
+	card.Fold = &chatmsg.Fold{Title: "why", Text: "1. x\n2. y\n3. z"}
+	layout, err := renderGchatChat(card)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if line := gchatButtonLine(t, layout, "retry", 1); line != "2" {
+		t.Fatalf("row 1's line = %q, want 2", line)
+	}
+	ev := gchatBoardTapAt(t, "retry", 1, "t_1,t_2", gchatButtonLine(t, layout, "retry", 1))
+	ev.Message.Text = layout.Text
+	ev.Message.AccessoryWidgets = gchatShownWidgets(t, gchatWithoutLines(layout))
+	if _, reason := a.classify(ev); !strings.HasPrefix(reason, gchatBoardTaken) {
+		t.Fatalf("tap: %q", reason)
+	}
+	body := checkPatch(t, f, 0, gchatBoardMessage)
+	want := "*2 tasks are stuck and need someone to decide.*\n\n" +
+		"1. *Triage x* · Stopped 1 day ago before finishing. — ✓ Retrying. Test Sender, 15:04 UTC\n" +
+		"2. *Open GitOps PR for y* · Waiting on you.\n3. *Too many to act on*\n\n*why*\n1. x\n2. y\n3. z"
+	if body["text"] != want {
+		t.Errorf("text =\n%s\nwant\n%s", body["text"], want)
+	}
+	if texts := buttonTexts(t, body); strings.Join(texts, ",") != "Retry 2,Drop 2" {
+		t.Errorf("buttons = %v", texts)
+	}
+}
+
+// A tap's line is checked against the card the tap edits. On a remembered
+// card the card's own button gives the row's line, so a tap whose button
+// named another line (a client showing an older layout of the same row)
+// still acts, on the row where it is now; a line that is no index is no
+// row. With no record the tap's line is the row's, and one that does not
+// start with the row's number (the headline, another row's line, a line
+// past the text) is stale: it acts on nothing and edits nothing.
+func TestGchatBoardTapLineIsCheckedAgainstTheCardItEdits(t *testing.T) {
+	a, f, actor := newBoardGchatAdapter(t)
+	postBoardCard(t, a)
+	for _, line := range []string{"-1", "x"} {
+		if _, reason := a.classify(gchatBoardTapAt(t, "retry", 1, "t_1,t_2", line)); reason != gchatBoardNoRow {
+			t.Errorf("tap on line %s: %q", line, reason)
+		}
+	}
+	if len(actor.taken()) != 0 || relayCallCount(f) != 1 {
+		t.Fatalf("a tap with no index acted: %+v, %d relay calls", actor.taken(), relayCallCount(f))
+	}
+	if _, reason := a.classify(gchatBoardTapAt(t, "retry", 1, "t_1,t_2", "0")); !strings.HasPrefix(reason, gchatBoardTaken) {
+		t.Fatalf("a tap naming another line on a remembered card: %q", reason)
+	}
+	body := checkPatch(t, f, 1, gchatBoardMessage)
+	want := strings.Replace(gchatBoardCardText, "finishing.\n", "finishing. — ✓ Retrying. Test Sender, 15:04 UTC\n", 1)
+	if body["text"] != want {
+		t.Errorf("text =\n%s\nwant\n%s", body["text"], want)
+	}
+	// The same card with no record: the tap's line is the row's.
+	shown, err := renderGchatChat(gchatBoardCard())
+	if err != nil {
+		t.Fatal(err)
+	}
+	bare := newTestGchatAdapterWithRelay(t, f)
+	bare.SetBoardActor(actor.act)
+	bare.SetBoardAdmits(func(backend, author string) bool { return true })
+	for _, line := range []string{"0", "3", "99"} {
+		off := gchatBoardTapAt(t, "retry", 1, "t_1,t_2", line)
+		off.Message.Text = shown.Text
+		off.Message.AccessoryWidgets = gchatShownWidgets(t, shown)
+		if _, reason := bare.classify(off); reason != gchatBoardStale {
+			t.Errorf("a tap on line %s with no record: %q", line, reason)
+		}
+	}
+	if len(actor.taken()) != 1 || relayCallCount(f) != 2 {
+		t.Fatalf("a tap off its row acted: %+v, %d relay calls", actor.taken(), relayCallCount(f))
+	}
+}
+
+// A keyed re-layout during a tap's round trip that keeps the row's number
+// and cards but shifts its line (a detail line added above the rows)
+// refreshes the record, and the remembered card's own button carries the
+// row's new line: the outcome is drawn on the row where it is now, not on
+// the line the tap's button named, and the row's buttons go with it, so a
+// later tap on the row from either card's button is stale.
+func TestGchatBoardReLayoutDuringTheRoundTripDrawsOnTheRowsNewLine(t *testing.T) {
+	a, f, _ := newBoardGchatAdapter(t)
+	postBoardCard(t, a)
+	moved := gchatBoardCard()
+	moved.Detail = "Read before you act."
+	shown, err := renderGchatChat(moved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if line := gchatButtonLine(t, shown, "retry", 1); line != "4" {
+		t.Fatalf("the moved row's line = %q, want 4:\n%s", line, shown.Text)
+	}
+	a.SetBoardActor(func(_ context.Context, act lib.BoardAction) (*lib.BoardActionResult, error) {
+		if err := a.EditNotifyMessage("spaces/_c2fixtureAA", "", gchatBoardMessage, OutMessage{Text: "moved", Chat: moved}); err != nil {
+			t.Fatal(err)
+		}
+		return &lib.BoardActionResult{Action: act.Action, Results: []lib.BoardActionOutcome{{ID: act.Tasks[0], Outcome: lib.BoardOutcomeDone}}}, nil
+	})
+	// The tap's button names line 2, the row's place on the card it was
+	// drawn on.
+	if _, reason := a.classify(gchatBoardTap(t, "retry", 1, "t_1,t_2")); !strings.HasPrefix(reason, gchatBoardTaken) {
+		t.Fatalf("tap: %q", reason)
+	}
+	if n := relayCallCount(f); n != 3 {
+		t.Fatalf("%d relay calls, want the create, the re-layout and the tap's edit", n)
+	}
+	body := checkPatch(t, f, 2, gchatBoardMessage)
+	want := "*2 tasks are stuck and need someone to decide.*\n\nRead before you act.\n\n" +
+		"1. *Triage x* · Stopped 1 day ago before finishing. — ✓ Retrying. Test Sender, 15:04 UTC\n" +
+		"2. *Open GitOps PR for y* · Waiting on you.\n3. *Too many to act on*\n\nAnd 3 more."
+	if body["text"] != want {
+		t.Errorf("text =\n%s\nwant\n%s", body["text"], want)
+	}
+	if texts := buttonTexts(t, body); strings.Join(texts, ",") != "Retry 2,Drop 2" {
+		t.Errorf("buttons = %v", texts)
+	}
+	// The row has settled and its buttons are gone, so a tap from either
+	// card's button for it finds no row to hold.
+	for _, line := range []string{"2", "4"} {
+		if _, reason := a.classify(gchatBoardTapAt(t, "drop", 1, "t_1,t_2", line)); reason != gchatBoardStale {
+			t.Errorf("a tap on the settled row at line %s: %q", line, reason)
+		}
+	}
+}
+
+// gchatWithoutLines is layout with the line parameter taken off every board
+// button: the buttons as a card posted before the parameter existed drew
+// them.
+func gchatWithoutLines(layout gchatChatLayout) gchatChatLayout {
+	for _, w := range layout.Widgets {
+		list, _ := w["buttonList"].(map[string]any)
+		buttons, _ := list["buttons"].([]map[string]any)
+		for _, b := range buttons {
+			action := b["onClick"].(map[string]any)["action"].(map[string]any)
+			var kept []map[string]any
+			for _, p := range action["parameters"].([]map[string]any) {
+				if p["key"] != "line" {
+					kept = append(kept, p)
+				}
+			}
+			action["parameters"] = kept
+		}
+	}
+	return layout
+}
+
+// A button drawn before the line parameter existed carries none, and its
+// tap still finds the row through the rows block of the message's text:
+// the longest run of lines numbered from "1. ", the last on a tie. The
+// layout a legacy tap's edit leaves is remembered with those buttons, so a
+// second legacy tap on it goes through the finder again.
+func TestGchatBoardLegacyButtonWithoutALineEditsThroughTheFinder(t *testing.T) {
+	a, f, _ := newBoardGchatAdapter(t)
+	layout, err := renderGchatChat(gchatBoardCard())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ev := gchatBoardTapAt(t, "retry", 2, "t_3", "")
+	ev.Message.Text = layout.Text
+	ev.Message.AccessoryWidgets = gchatShownWidgets(t, gchatWithoutLines(layout))
+	if _, reason := a.classify(ev); !strings.HasPrefix(reason, gchatBoardTaken) {
+		t.Fatalf("tap: %q", reason)
+	}
+	body := checkPatch(t, f, 0, gchatBoardMessage)
+	want := strings.Replace(gchatBoardCardText, "Waiting on you.\n", "Waiting on you. — ✓ Retrying. Test Sender, 15:04 UTC\n", 1)
+	if body["text"] != want {
+		t.Errorf("text =\n%s\nwant\n%s", body["text"], want)
+	}
+	if texts := buttonTexts(t, body); strings.Join(texts, ",") != "Retry 1,Drop 1" {
+		t.Errorf("buttons = %v", texts)
+	}
+	if _, remembered, _ := a.boardLayoutOf(gchatBoardMessage); !remembered {
+		t.Fatal("the legacy tap's edit was not remembered")
+	}
+	if _, reason := a.classify(gchatBoardTapAt(t, "drop", 1, "t_1,t_2", "")); !strings.HasPrefix(reason, gchatBoardTaken) {
+		t.Fatalf("second legacy tap: %q", reason)
+	}
+	body = checkPatch(t, f, 1, gchatBoardMessage)
+	want = strings.Replace(want, "finishing.\n", "finishing. — Dropped. Test Sender, 15:04 UTC\n", 1)
+	if body["text"] != want {
+		t.Errorf("text after the second tap =\n%s\nwant\n%s", body["text"], want)
+	}
+	if texts := buttonTexts(t, body); texts != nil {
+		t.Errorf("buttons after the second tap = %v", texts)
+	}
+	for _, tc := range []struct {
+		lines        []string
+		start, count int
+	}{
+		{[]string{"h", "", "1. a", "2. b", "", "x"}, 2, 2},
+		{[]string{"1. d", "", "1. a", "2. b"}, 2, 2},
+		{[]string{"1. a", "2. b", "", "1. f"}, 0, 2},
+		{[]string{"1. d", "", "1. a"}, 2, 1},
+		{[]string{"h", "10. x"}, 0, 0},
+	} {
+		if start, count := gchatBoardRowsBlock(tc.lines); start != tc.start || count != tc.count {
+			t.Errorf("rows block of %q = %d, %d; want %d, %d", tc.lines, start, count, tc.start, tc.count)
+		}
 	}
 }
