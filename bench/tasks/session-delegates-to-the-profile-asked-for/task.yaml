@@ -6,33 +6,39 @@
 # only \"platform\"", and a session asked for a profile delegated to
 # platform or filed a Kanban card instead.
 #
-# The profile is `tse`, the built-in GKE support specialist every next-mode
-# eval install renders (`profiles.tse.enabled=true`, hack/ci-deploy.sh), so the
-# case needs no fixture and creates no profile. It is unpinned and takes no
-# target, so the delegation records it as `tse`.
+# The profile is `cluster`, the generic cluster agent (#3658), which takes the
+# target cluster as its project, location and cluster parameters. The prompt
+# names the agent's own cluster through the harness's {{AGENT_CLUSTER_*}}
+# placeholders, expanded from AGENT_CLUSTER_CONTEXT; a run without a GKE context
+# is a setup failure, not the model's. Where a profile is pinned to that
+# cluster, the gateway resolves the delegation to the pinned profile, so the
+# check accepts its `cluster-...` name too.
 #
 # What is checked is whom the chain delegated to, read from the inject read
 # route's `childAddressees` (`delegated_to`, #5340). The answer's wording
-# depends on what the tse agent finds, so it is left to the judge.
+# depends on what the cluster agent finds, so it is left to the judge.
 #
 # TRANSPORT: inject only, against a `spec.mode: next` install, where the
 # gateway routes `/session ...` to a session pod. The api transport has no
 # delegation chain to read, so `delegated_to` errors there.
 #
-# DISPATCHER: the tse child runs only where the AgentProfile dispatcher does.
+# DISPATCHER: the cluster child runs only where the AgentProfile dispatcher does.
 # Without it the child never starts, the run ends on the gateway's first-event
 # grace as an infrastructure failure, and the check errors. The CI next lane
-# gets the dispatcher from #5394, which registers this case in the nightly and
-# on hack/eval/api-lane-exclusions.txt; until then it is KNOWN_UNREGISTERED.
+# gets the dispatcher and enables profiles.cluster in #5394, which registers
+# this case in the nightly and on hack/eval/api-lane-exclusions.txt; until
+# then it is KNOWN_UNREGISTERED.
 id: session-delegates-to-the-profile-asked-for
 name: A session asked for an agent profile by name delegates to that profile
 prompt: >-
-  /session ask the tse agent to check whether any pods in the kube-system
-  namespace are failing, and tell me what it finds
+  /session ask the cluster agent to check whether any pods in the kube-system
+  namespace on cluster {{AGENT_CLUSTER_NAME}} (project {{AGENT_CLUSTER_PROJECT}},
+  location {{AGENT_CLUSTER_LOCATION}}) are failing, and tell me what it finds
 expected_output: >-
-  The session delegates the question to the tse agent profile, not to the
-  platform agent, and then answers with what the tse agent reported about the
-  kube-system pods: which are failing and why, or that none are.
+  The session delegates the question to the cluster agent profile, not to the
+  platform agent, and then answers with what the cluster agent reported about
+  the kube-system pods on that cluster: which are failing and why, or that
+  none are.
 infrastructure:
   deployer: noop
 validated: false
@@ -52,4 +58,4 @@ verification_spec:
     mode: assert
     check:
       type: delegated_to
-      required_addressees: ["tse"]
+      required_addressees: ["cluster(-.+)?"]

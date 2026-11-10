@@ -170,9 +170,9 @@ SCENARIO_BATCH_WAIT = (
 )
 
 KNOWN_UNREGISTERED = {
-    # Grades whom a /session turn delegated to (delegated_to); the tse child it
-    # delegates to only runs where the AgentProfile dispatcher does, which the
-    # CI next lane turns on with the dispatcher flip (#5394). That pull request
+    # Grades whom a /session turn delegated to (delegated_to); the cluster child
+    # it delegates to only runs where the AgentProfile dispatcher does, which the
+    # CI next lane turns on, with profiles.cluster, in the dispatcher flip (#5394). That pull request
     # registers the case in hack/eval/nightly-cases.txt and on
     # hack/eval/api-lane-exclusions.txt, and removes this entry.
     "session-delegates-to-the-profile-asked-for": (
