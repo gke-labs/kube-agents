@@ -534,6 +534,12 @@ REPORT_ISSUE_INTRO = (
     "It describes the fleet as it was then; the scheduled audits carry the current picture."
 )
 REPORT_ISSUE_LIST_LIMIT = 20
+# Ceiling on each of the no-human path's forge calls between its claim and its record (two
+# listings, the label, the create), so the claim-to-record window stays under the stale rule:
+# a slow broker must not let the next tick release a live run's claim and open a second issue.
+# ``test_bootstrap_onboarding_scripts`` pins four of these plus the margin under STALE_CLAIM_SECONDS.
+REPORT_FORGE_CALL_TIMEOUT_SECONDS = 90
+REPORT_FORGE_CALLS_BEFORE_RECORD = 4
 REPORT_ISSUE_DATE_FMT = "%Y-%m-%d %H:%M"
 # Where this stage records the issue it filed (repository, number, when), read
 # by a later run's log line and by an operator asking where the report went.
@@ -590,6 +596,7 @@ REPORT_UNLABELLED_NOTE = (
     "the issue resolver will not skip it"
 )
 REPORT_FILING_FAILED_REASON = "filing the first-run report in {repo} failed: {error!r}"
+REPORT_NO_ISSUE_AT_CAP_REASON = "no more tries: no issue of this sweep is open in {repo}; the report waits for the retire"
 LEDGER_REPO_UNREADABLE_REASON = "the managed repositories could not be read: {error}; the first-run report waits"
 REPORT_HOME_LINE_NOTE = "the home line for the filed report {outcome}"
 HOME_LINE_POSTED = "was posted"
@@ -781,6 +788,18 @@ def _claim_for_this_path(data_dir: Path) -> bool:
         return True
     _unmark_claiming(data_dir)
     return False
+
+
+def _drop_orphan_claiming_marker(data_dir: Path) -> None:
+    """Remove a no-human path marker that has no claim behind it, before a human's claim."""
+    if (data_dir / ".bootstrap_completed").exists():
+        return
+    try:
+        (data_dir / REPORT_CLAIMING_FILE).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        sys.stderr.write(f"bootstrap_delivery: could not drop an orphan claim marker: {e}\n")
 
 
 def _release_claim(data_dir: Path) -> None:
@@ -2074,7 +2093,10 @@ def _existing_report_issue(repo: str, sweep: str) -> tuple[int, str, object] | N
     broker's, and one odd row must not hold the report.
     """
     answer = forge.call(
-        "issue-list", {"labels": [REPORT_ISSUE_LABEL], "state": "open", "limit": REPORT_ISSUE_LIST_LIMIT}, repo
+        "issue-list",
+        {"labels": [REPORT_ISSUE_LABEL], "state": "open", "limit": REPORT_ISSUE_LIST_LIMIT},
+        repo,
+        timeout_s=REPORT_FORGE_CALL_TIMEOUT_SECONDS,
     )
     marker = REPORT_ISSUE_SWEEP_MARKER.format(sweep=sweep)
 
@@ -2094,7 +2116,9 @@ def _existing_report_issue(repo: str, sweep: str) -> tuple[int, str, object] | N
         # An earlier run's issue may carry no label (the repository refused it), while another
         # install's labelled issue is open in a shared repository: one more listing without the
         # label filter, by the sweep marker alone.
-        answer = forge.call("issue-list", {"state": "open", "limit": REPORT_ISSUE_LIST_LIMIT}, repo)
+        answer = forge.call(
+            "issue-list", {"state": "open", "limit": REPORT_ISSUE_LIST_LIMIT}, repo, timeout_s=REPORT_FORGE_CALL_TIMEOUT_SECONDS
+        )
         found = _matching(list(answer.get("issues") or []))
     if not found:
         return None
@@ -2133,10 +2157,16 @@ def _file_report_issue(repo: str, body: str, sweep: str, filed_at: float, now: f
             "label-ensure",
             {"name": REPORT_ISSUE_LABEL, "color": REPORT_ISSUE_LABEL_COLOR, "description": REPORT_ISSUE_LABEL_DESCRIPTION},
             repo,
+            timeout_s=REPORT_FORGE_CALL_TIMEOUT_SECONDS,
         )
     title = REPORT_ISSUE_TITLE.format(date=_utc(now))
     text = _issue_text(body, sweep, filed_at, now)
-    answer = forge.call("issue-create", {"title": title, "body": text, "labels": [REPORT_ISSUE_LABEL]}, repo)
+    answer = forge.call(
+        "issue-create",
+        {"title": title, "body": text, "labels": [REPORT_ISSUE_LABEL]},
+        repo,
+        timeout_s=REPORT_FORGE_CALL_TIMEOUT_SECONDS,
+    )
     issue = answer.get("issue") if isinstance(answer.get("issue"), dict) else {}
     try:
         number = int(issue.get("number") or 0)
@@ -2210,6 +2240,51 @@ def _retire_undelivered(data_dir: Path, in_sandbox: bool) -> int:
     return 0
 
 
+def _record_issue_left_open(data_dir: Path, in_sandbox: bool, sweep: str, record: dict, now: float) -> int:
+    """At the attempt cap: find the issue a create-then-fail may have opened, and settle on it.
+
+    One lookup per retry wait (the last wait in the table), so a repository that keeps refusing
+    is not listed every tick. A hit is recorded as filed, the report set aside and the home
+    line sent, as a clean filing would have done; a miss changes nothing.
+    """
+    try:
+        last = float(record.get(ATTEMPTS_AT))
+    except (TypeError, ValueError):
+        last = 0.0
+    if now - last < CONVERSATION_RETRY_WAITS_SECONDS[-1]:
+        return 0
+    try:
+        repo = _ledger_repo()
+    except Exception:  # noqa: BLE001 - recorded by the filing path already; the lookup just waits
+        return 0
+    if not repo:
+        return 0
+    try:
+        found = _existing_report_issue(repo, sweep)
+    except forge.ForgeError as e:
+        _record_attempt(data_dir, f"issue-list on {repo} refused: {e.reason}: {e.value}", counted=False, name=REPORT_ATTEMPTS_FILE)
+        return 0
+    if found is None:
+        _record_attempt(data_dir, REPORT_NO_ISSUE_AT_CAP_REASON.format(repo=repo), counted=False, name=REPORT_ATTEMPTS_FILE)
+        return 0
+    if not _claim_for_this_path(data_dir):
+        return 0
+    if _someone_is_here(data_dir):
+        _release_claim(data_dir)
+        return 0
+    number, url, labels = found
+    ref = f"{repo}#{number}"
+    if not _record_filed(data_dir, repo, number, url):
+        _stage_note(data_dir, REPORT_RECORD_FAILED_NOTE.format(ref=ref))
+        return 0
+    _stage_note(data_dir, REPORT_FILED_NOTE.format(ref=ref))
+    if not _issue_labelled(labels):
+        _stage_note(data_dir, REPORT_UNLABELLED_NOTE.format(ref=ref))
+    _cleanup(data_dir, in_sandbox)
+    _post_home_line(data_dir, url, now)
+    return 0
+
+
 def _file_without_thread(data_dir: Path, in_sandbox: bool, sweep: str, filed_at: float, now: float) -> int:
     """File the report as a ledger issue, after the claim, and say so in the home channel.
 
@@ -2220,7 +2295,9 @@ def _file_without_thread(data_dir: Path, in_sandbox: bool, sweep: str, filed_at:
     record = _read_attempts(data_dir, REPORT_ATTEMPTS_FILE)
     count = _attempt_count(record)
     if count >= CONVERSATION_MAX_ATTEMPTS:
-        return 0
+        # Past the last try. A create that opened the issue and then failed (a timeout after the
+        # write) left it open and unrecorded, so each retry wait still gets one lookup for it.
+        return _record_issue_left_open(data_dir, in_sandbox, sweep, record, now)
     if count:
         try:
             last = float(record.get(ATTEMPTS_AT))
@@ -2425,6 +2502,10 @@ def main(data_dir: Path | None = None) -> int:
     home = bool(chat_notify.routed_platform()) if conversation is not None else True
     note = _safe_audits_note(data_dir, no_ranking is True, home)
 
+    # A no-human run killed between its marker and its claim leaves the marker with no claim
+    # behind it; a claim taken beside it would read as that path's and never settle. A no-human
+    # run that is mid-claim right now re-checks for this human after its claim and releases.
+    _drop_orphan_claiming_marker(data_dir)
     # The cheap check above is advisory; this is the decision. Nothing may be
     # written to stdout before it succeeds.
     if not _claim_delivery(data_dir):

@@ -135,6 +135,16 @@ verification_spec:
         - '\?[\s\S]*\?'
         - '[^?\s]\s*\Z'
 
+  # This case's request has home_channel_set false, so the plugin adds no
+  # sentence about scheduled reports. A greeting that says it anyway tells the user
+  # something the install did not do.
+  - name: no-scheduled-report-claim
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns: ["scheduled report"]
+
   - name: at-most-sixty-words
     role: objective
     mode: assert
