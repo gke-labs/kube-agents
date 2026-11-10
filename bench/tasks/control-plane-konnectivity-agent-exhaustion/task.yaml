@@ -1,0 +1,63 @@
+# Control plane, setup, cost and CLI (gce-compute-fleet-audit):
+# konnectivity-agent in kube-system is undersized or CPU-throttled for the
+# node count and webhook traffic, and control-plane-to-node calls (logs, exec,
+# webhooks) time out. A declared gap: expected_fail until the check lands
+# (gke-labs/kube-agents#5415, which proposes `konnectivity-agent-exhaustion`).
+# Nothing is planted, and no honest plant exists: the agent is a GKE-managed
+# add-on whose replica count GKE's autoscaler sets and reconciles, editing it
+# is the host mutation the certification rules forbid, and a bench Deployment
+# under that name would confuse the compliance audit's add-on suppression.
+# The customer cannot resize it either; the customer action is a support
+# case, so a check reports the ratio rather than a fix. Two flip conditions,
+# both needed: a check that reports the agent's replicas against node count
+# on every Standard cluster (in this stream, or another, which edits `audit:`
+# and `finding_check` in the same diff), and an objective type that grades a
+# clean read, because `ledger_issue_contains` cannot pass on a clean close
+# and a finding on a healthy agent would be a false positive; the pull
+# request that lands both rewrites this objective and flips the marker in
+# the same diff. Until then the objective below is the form a finding would
+# take. The `fixtures:` role stands for slot a's shape, not for a plant; no
+# safeguard reads a fixture because none exists. Domain `fleet-audits` as the
+# other GCE compute cases.
+# Isolation class: fleet-read-only, GitOps-repo write (the audit's ledger).
+id: control-plane-konnectivity-agent-exhaustion
+name: "Konnectivity agent exhaustion (declared gap; nothing planted, a GKE-managed add-on; needs a clean-read objective)"
+domain: fleet-audits
+suite: certification
+expected_fail: true
+audit_streams:
+  - gce-compute-fleet-audit
+fixtures:
+  - default-pool-headroom
+prompt: >-
+  Run the gce-compute-fleet-audit audit across the fleet, following the
+  gce-compute-fleet-audit SOP.
+expected_output: >-
+  Nothing planted. Customer failure: control-plane-to-node tunnels saturated.
+  Certified needs a check that reports konnectivity-agent replicas against
+  node count, graded by a clean-read objective type that does not exist yet;
+  the ledger issue would then carry the ratio for Deployment
+  `konnectivity-agent` in namespace `kube-system`. The closing response is
+  the SOP's one line with the ledger URL.
+infrastructure:
+  deployer: noop
+validated: false
+
+verification_spec:
+  # The form a finding would take; the fixing pull request replaces it with a
+  # clean-read objective. The three slugs are the names the case accepts; the
+  # first is the one #5415 proposes.
+  - name: ledger-reports-konnectivity-sizing-on-the-agent
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: gce-compute-fleet-audit
+      scope: finding
+      finding_check:
+        [
+          "konnectivity-agent-exhaustion",
+          "konnectivity-tunnel-saturation",
+          "control-plane-konnectivity",
+        ]
+      any_of_phrases: ["konnectivity-agent"]

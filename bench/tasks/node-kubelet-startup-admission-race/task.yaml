@@ -1,0 +1,56 @@
+# Node OS, kubelet and auto-repair (gce-compute-fleet-audit): a new node
+# reports Ready and takes workload pods before an initialization DaemonSet is
+# ready on it, because the pool has no startup taint and no readiness rule;
+# the first pods fail with FailedCreatePodSandBox or run unprotected. A
+# declared gap: expected_fail until the check lands (gke-labs/kube-agents#5411,
+# which proposes `kubelet-startup-admission-race`). Nothing is planted today:
+# the shape (a DaemonSet `node-init-agent` labelled init-critical with a long
+# readiness delay, and a one-replica Deployment `batch-compute-worker`, on a
+# pool with no startup taint) lands in the pull request that adds the check,
+# which rebinds this case to its role and flips the marker in the same diff.
+# The race itself happens only when a node joins, so the fixture does not
+# re-enact it on demand; containerd overlayfs errors are a node fault no
+# fixture plants. Two flip conditions: a check that reads a pool's taints
+# against an initialization DaemonSet (in this stream, or the obtainability
+# audit, whose collector already dumps DaemonSets and pool taints; a landing
+# there edits `audit:` and `finding_check` in the same diff) flips this case
+# once the shape is planted; a check keyed on sandbox events on young nodes
+# reads nothing here. The `fixtures:` role stands for slot a's shape, not for
+# a plant; no safeguard reads a fixture because none exists yet. Domain
+# `fleet-audits` as the other GCE compute cases.
+# Isolation class: fleet-read-only, GitOps-repo write (the audit's ledger).
+id: node-kubelet-startup-admission-race
+name: "Kubelet startup admission race (declared gap; planted as an init DaemonSet on a pool with no startup taint when its check lands)"
+domain: fleet-audits
+suite: certification
+expected_fail: true
+audit_streams:
+  - gce-compute-fleet-audit
+fixtures:
+  - default-pool-headroom
+prompt: >-
+  Run the gce-compute-fleet-audit audit across the fleet, following the
+  gce-compute-fleet-audit SOP.
+expected_output: >-
+  Planted as an init DaemonSet and a worker on a pool with no startup taint,
+  once its check lands. Customer failure: pods admitted before the DaemonSet
+  is ready on a new node. Certified means: the ledger issue carries a finding
+  that names DaemonSet `node-init-agent` or pool `default-pool` as that
+  shape. The closing response is the SOP's one line with the ledger URL.
+infrastructure:
+  deployer: noop
+validated: false
+
+verification_spec:
+  # One finding must carry both the check and the shape's object, the
+  # DaemonSet or the pool. The three slugs are the names the case accepts; the
+  # first is the one #5411 proposes.
+  - name: ledger-files-the-startup-race-shape-on-the-daemonset-or-pool
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: gce-compute-fleet-audit
+      scope: finding
+      finding_check: ["kubelet-startup-admission-race", "node-startup-race"]
+      any_of_phrases: ["node-init-agent", "default-pool"]
