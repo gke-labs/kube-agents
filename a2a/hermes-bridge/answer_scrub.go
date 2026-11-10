@@ -801,11 +801,16 @@ func yamlUnescape(raw string) (string, bool) {
 		if n == 0 || i+n >= len(raw) {
 			return "", false
 		}
-		r, err := strconv.ParseUint(raw[i+1:i+1+n], 16, 32)
-		if err != nil || !utf8.ValidRune(rune(r)) {
+		u, err := strconv.ParseUint(raw[i+1:i+1+n], 16, 32)
+		// Bounded before the conversion, so rune(u) is in range.
+		if err != nil || u > utf8.MaxRune {
 			return "", false
 		}
-		sb.WriteRune(rune(r))
+		r := rune(u)
+		if !utf8.ValidRune(r) {
+			return "", false
+		}
+		sb.WriteRune(r)
 		i += n
 	}
 	return sb.String(), true

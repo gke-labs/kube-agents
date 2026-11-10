@@ -956,3 +956,20 @@ func TestActivity_RouteDeliveryHandsBackWhatItRead(t *testing.T) {
 		t.Error("a body the shared secret did not sign was decoded")
 	}
 }
+
+// A YAML \x, \u or \U escape names a code point only up to utf8.MaxRune and
+// outside the surrogates: one past either is not read, so the quoted value
+// is kept as written.
+func TestYAMLUnescape_EscapeOutOfRuneRangeIsNotRead(t *testing.T) {
+	if got, ok := yamlUnescape(`synth\U0010FFFFx`); !ok || got != "synth\U0010FFFFx" {
+		t.Errorf("yamlUnescape(max rune) = %q, %v, want it read", got, ok)
+	}
+	if got, ok := yamlUnescape(`synth\x41x`); !ok || got != "synthAx" {
+		t.Errorf("yamlUnescape(\\x41) = %q, %v, want it read", got, ok)
+	}
+	for _, raw := range []string{`synth\U00110000x`, `synth\UFFFFFFFFx`, `synth\U80000041x`, `synth\uD800x`} {
+		if got, ok := yamlUnescape(raw); ok {
+			t.Errorf("yamlUnescape(%q) = %q, true, want it refused", raw, got)
+		}
+	}
+}
