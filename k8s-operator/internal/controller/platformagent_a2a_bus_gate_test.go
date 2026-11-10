@@ -415,6 +415,145 @@ func TestTheBusWaitIsBoundedByWhatCanStillAnswer(t *testing.T) {
 	}
 }
 
+// A bus whose pod has not been Ready for a2aNATSStuckPodGrace, while no
+// callout replica is Ready, is not held: it serves nobody, and no callout pod
+// becomes Ready without it. A missing pod, a Ready one, one inside the grace,
+// one terminating, one the StatefulSet does not control, or a Ready callout
+// replica still holds, and records no event. A callout with no older pods
+// does not hold, and records no event either.
+func TestADownBusIsNotHeldForTheCallout(t *testing.T) {
+	agent := a2aTestAgent()
+	r, cl, req := a2aGateTestReconciler(t, agent)
+	recorder := record.NewFakeRecorder(8)
+	r.Recorder = recorder
+	ctx := context.Background()
+	for i := 0; i < 2; i++ {
+		busGatePass(t, ctx, r, req, "install")
+	}
+	reportCalloutServing(t, ctx, cl, agent)
+	dep := getCallout(t, ctx, cl, agent)
+	oldRS := calloutReplicaSet(t, ctx, cl, dep, "old", "1")
+	calloutReplicaSet(t, ctx, cl, dep, "new", "2")
+	oldPod := calloutPod(t, ctx, cl, dep, oldRS, "callout-old-0", "", false)
+	reportCalloutStatus(t, ctx, cl, agent, 3, 0, 1)
+	sts := buildA2ANATSStatefulSet(agent, "next")
+	live := &appsv1.StatefulSet{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(sts), live); err != nil {
+		t.Fatalf("get the bus StatefulSet: %v", err)
+	}
+	defer func(was func() time.Time) { a2aBusGateNow = was }(a2aBusGateNow)
+	a2aBusGateNow = func() time.Time { return stuckPodNow }
+
+	holds := func(what string) bool {
+		t.Helper()
+		held, err := r.a2aBusWaitsForCallout(ctx, agent, sts, 0)
+		if err != nil {
+			t.Fatalf("a2aBusWaitsForCallout (%s): %v", what, err)
+		}
+		return held
+	}
+	pod := stuckPod(stuckPodOldRevision, false, a2aNATSStuckPodGrace-time.Second)
+	pod.Namespace = agent.Namespace
+	pod.OwnerReferences[0].UID = live.UID
+	setPod := func(ready bool, notReadyFor time.Duration, owner types.UID) {
+		t.Helper()
+		if err := cl.Get(ctx, client.ObjectKeyFromObject(pod), pod); err != nil {
+			t.Fatalf("get the bus pod: %v", err)
+		}
+		pod.OwnerReferences[0].UID = owner
+		if err := cl.Update(ctx, pod); err != nil {
+			t.Fatalf("update the bus pod: %v", err)
+		}
+		pod.Status = stuckPod(stuckPodOldRevision, ready, notReadyFor).Status
+		if err := cl.Status().Update(ctx, pod); err != nil {
+			t.Fatalf("update the bus pod's status: %v", err)
+		}
+	}
+
+	if !holds("no bus pod") {
+		t.Fatal("the rig does not hold to begin with; the cases below would pass on nothing")
+	}
+	if err := cl.Create(ctx, pod); err != nil {
+		t.Fatalf("create the bus pod: %v", err)
+	}
+	if !holds("a bus pod inside the grace") {
+		t.Error("a bus pod not Ready for less than the grace released the bus")
+	}
+	setPod(true, a2aNATSStuckPodGrace+time.Hour, live.UID)
+	if !holds("a Ready bus pod") {
+		t.Error("a Ready bus pod released the bus")
+	}
+	setPod(false, a2aNATSStuckPodGrace+time.Second, "another-uid")
+	if !holds("a pod the StatefulSet does not control") {
+		t.Error("a pod the bus StatefulSet does not control released the bus")
+	}
+	setPod(false, a2aNATSStuckPodGrace, live.UID)
+	reportCalloutStatus(t, ctx, cl, agent, 3, 1, 1)
+	if !holds("a Ready callout replica") {
+		t.Error("the bus was released while a callout replica was Ready, so attached to a bus that still serves")
+	}
+	reportCalloutStatus(t, ctx, cl, agent, 3, 0, 1)
+	select {
+	case event := <-recorder.Events:
+		t.Errorf("an event was recorded while the bus was held: %s", event)
+	default:
+	}
+
+	if holds("a bus pod down for the grace") {
+		t.Error("a bus pod not Ready for the grace held the bus until the callout's progress deadline")
+	}
+	select {
+	case event := <-recorder.Events:
+		if !strings.HasPrefix(event, corev1.EventTypeWarning+" "+a2aBusHoldSkippedReason+" ") || !strings.Contains(event, pod.Name+" has not been Ready for 2m0s") {
+			t.Errorf("event = %q, want a %s Warning naming the pod and how long it was down", event, a2aBusHoldSkippedReason)
+		}
+	default:
+		t.Errorf("no %s event when the bus moved without the callout", a2aBusHoldSkippedReason)
+	}
+
+	if err := cl.Delete(ctx, oldPod); err != nil {
+		t.Fatalf("delete the old callout pod: %v", err)
+	}
+	if holds("no older callout pod") {
+		t.Error("a callout with no older pods held the bus")
+	}
+	select {
+	case event := <-recorder.Events:
+		t.Errorf("an event was recorded where no hold was skipped: %s", event)
+	default:
+	}
+	// A callout spec not yet observed holds a running bus, but not a down one.
+	dep = getCallout(t, ctx, cl, agent)
+	dep.Status.ObservedGeneration = dep.Generation - 1
+	if err := cl.Status().Update(ctx, dep); err != nil {
+		t.Fatalf("report the callout spec unobserved: %v", err)
+	}
+	if holds("a callout spec not yet observed, the bus down") {
+		t.Error("a callout spec not yet observed held a down bus")
+	}
+	select {
+	case event := <-recorder.Events:
+		if !strings.Contains(event, a2aBusHoldSkippedReason) {
+			t.Errorf("event = %q, want %s", event, a2aBusHoldSkippedReason)
+		}
+	default:
+		t.Errorf("no %s event when a down bus moved past an unobserved callout spec", a2aBusHoldSkippedReason)
+	}
+	reportCalloutStatus(t, ctx, cl, agent, 3, 0, 1)
+	calloutPod(t, ctx, cl, dep, oldRS, "callout-old-1", "", false)
+
+	pod.Finalizers = []string{"test.kubeagents.x-k8s.io/terminating"}
+	if err := cl.Update(ctx, pod); err != nil {
+		t.Fatalf("add a finalizer to the bus pod: %v", err)
+	}
+	if err := cl.Delete(ctx, pod); err != nil {
+		t.Fatalf("start terminating the bus pod: %v", err)
+	}
+	if !holds("a terminating bus pod") {
+		t.Error("a terminating bus pod released the bus; the StatefulSet is already replacing it")
+	}
+}
+
 // A stalled callout rollout is not waited on, and is not passed quietly
 // either: the release records a Warning event naming the rollout, and the
 // PlatformAgent carries a2aCalloutStalledConditionType while the rollout

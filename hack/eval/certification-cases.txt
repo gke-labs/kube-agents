@@ -24,12 +24,32 @@
 # pull request.
 
 # part 1
+# Capability row: cost, idle and over-requested resources; a request cut on two
+# named workloads names the dependency each cut would change (the seeded fleet's
+# HPA-scaled inference-server in seeded-capacity and the Guaranteed-QoS
+# ledger-writer in seeded-qos; no stack). A baseline: no gap declared; moved in
+# from the nightly file on its record there: 43 of 45 repetitions pass,
+# 2026-10-23 to 2026-11-09 (the case of #3507, for #3199).
+./tasks/cost-rightsizing-names-dependencies/task.yaml
 # Capability row: networking fabric, load balancers and Gateway; the
 # obtainability audit on an HTTPRoute whose Service maps to a numeric targetPort
 # no backing container declares or serves (the planted backend-api-svc in
 # seeded-networking, route unattached, no load balancer). A declared gap,
 # expected_fail: no audit reads the mismatch; the gap is #2576 (item 3).
 ./tasks/networking-gateway-ingress-port-mismatch/task.yaml
+# Capability row: observability, logging and Managed Prometheus; the
+# obtainability audit on a Deployment whose container is OOM-killed in a loop
+# (the planted kube-state-metrics in seeded-observability, busybox under a 64Mi
+# limit). A declared gap, expected_fail: no audit reads a container's OOMKilled
+# last termination or restart count; the gap is #2579.
+./tasks/observability-gmp-kube-state-metrics-oom/task.yaml
+# Capability row: security, Workload Identity, RBAC and CVEs; the compliance
+# audit's default-sa-automount check on a Deployment that runs under the
+# default ServiceAccount with its token mounted (the planted
+# metrics-agent-deploy in seeded-sa-token). A declared gap, expected_fail: the
+# collector lists the workload, but the ledger body drops every major and
+# minor finding once the criticals fill its budget; the gap is #5052.
+./tasks/security-default-sa-token-mount-baseline/task.yaml
 # Capability row: security, Workload Identity, RBAC and CVEs; the compliance
 # audit on an admission webhook whose CA bundle certificate has expired (the
 # planted ValidatingWebhookConfiguration bench-expiring-webhook-ca, failurePolicy
@@ -43,6 +63,21 @@
 # gap, expected_fail: no compliance check reads the binding behind an
 # annotation; the gap is #5027.
 ./tasks/security-wi-ksa-gsa-iam-binding-missing/task.yaml
+# Capability row: storage, CSI drivers and PVCs; the obtainability audit names a
+# one-replica Deployment under the default RollingUpdate strategy that mounts a
+# ReadWriteOnce claim (the planted single-writer-app and single-writer-data in
+# seeded-storage). A baseline: no gap declared.
+./tasks/storage-rwo-pvc-rollingupdate-multiattach-deadlock/task.yaml
+# Capability row: cluster and node upgrades; the obtainability audit names a
+# three-replica Deployment that no PodDisruptionBudget selects (the planted
+# stateless-ingest-service in seeded-upgrades). A baseline: no gap declared.
+./tasks/upgrade-missing-pdb-drain-outage-baseline/task.yaml
+# Capability row: workloads, OOM, probes and HPA; the obtainability audit on a
+# Deployment whose HorizontalPodAutoscaler scales down with no stabilization
+# window and whose containers have no preStop hook (the planted web-api-server
+# and web-api-server-hpa in seeded-autoscaling). A declared gap, expected_fail:
+# no obtainability check reads the scale-down behavior; the gap is #4941.
+./tasks/workload-hpa-scaledown-and-missing-prestop/task.yaml
 # Capability row: workloads, OOM, probes and HPA; the compliance audit on a
 # Deployment that pulls an Artifact Registry image through the node identity
 # alone and is refused for lack of the registry reader role (the planted

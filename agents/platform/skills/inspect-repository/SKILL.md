@@ -22,6 +22,11 @@ object on stdout.
   doc, or a user's question.
 - **Reading the GitOps repository or a context repository** when you are not
   editing it.
+- **Tracing a diagnosis into a repository you do not write.** The chart a
+  `HelmRelease` installs, the module a Terraform root calls, a context
+  repository on the preflight's `CONTEXT:` line: read it here to name the
+  file and line the fix belongs in (`SOUL.md` §3, item 8). The broker presents
+  a context repository's read-only credential and no other.
 
 ## When NOT to Use
 

@@ -657,9 +657,12 @@ type EventWatcherSpec struct {
 	// The watcher counts what the rules hold back in
 	// k8s_event_watcher_events_filtered_total{gate="alert_excluded"}, and the
 	// end-of-day recap states how many events and workloads they held back and
-	// names the noisiest workloads. A change rolls the gateway pod. When
-	// this list is set, it replaces a WATCHER_ALERT_EXCLUDE entry in
-	// spec.deployment.env.
+	// names the noisiest workloads. A change is in force within about two
+	// minutes, without a pod restart: the operator writes the list to a
+	// ConfigMap that the watcher reads again every minute. If the agent image
+	// is older than the operator, a change applies at the next pod restart.
+	// When this list is set, it replaces a WATCHER_ALERT_EXCLUDE entry in
+	// spec.deployment.env; a move between the two rolls the pod once.
 	// +listType=atomic
 	// +kubebuilder:validation:MaxItems=64
 	// +optional
@@ -818,18 +821,22 @@ type StallWatchSpec struct {
 	MinStallAgeMinutes *int32 `json:"minStallAgeMinutes,omitempty"`
 
 	// Kinds replaces the watch's default list of resources to scan (Deployments,
-	// StatefulSets, DaemonSets, Jobs, Gateway API Gateways and HTTPRoutes, and
-	// cert-manager Certificates). Each item is a kubectl resource name such as
-	// `deployments` or `gateways.gateway.networking.k8s.io`. The single item `all`
-	// scans every namespaced kind the cluster serves, one read per kind per
-	// namespace, which is slow on a large fleet. Absent or empty keeps the
-	// default list. Secrets, ConfigMaps, Events, Endpoints, EndpointSlices,
+	// StatefulSets, DaemonSets, Jobs, Gateway API Gateways and HTTPRoutes,
+	// cert-manager Certificates, and `*.cnrm.cloud.google.com`, every Config
+	// Connector kind the cluster serves). Each item is a kubectl resource name
+	// such as `deployments` or `gateways.gateway.networking.k8s.io`, or a group
+	// wildcard `*.<suffix>` for every namespaced kind whose API group ends in
+	// the suffix; the watch reads a wildcard's kinds only in the namespaces
+	// where it found their objects. The single item `all` scans every
+	// namespaced kind the cluster serves, one read per kind per namespace,
+	// which is slow on a large fleet. Absent or empty keeps the default list.
+	// Secrets, ConfigMaps, Events, Endpoints, EndpointSlices,
 	// ControllerRevisions and Leases are refused: the scan reports nothing from
 	// them, and a Secret listing would carry every body.
 	// +listType=set
 	// +kubebuilder:validation:MaxItems=20
 	// +kubebuilder:validation:items:MaxLength=253
-	// +kubebuilder:validation:items:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	// +kubebuilder:validation:items:Pattern=`^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*|\*(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)+)$`
 	// +kubebuilder:validation:XValidation:rule="!self.exists(k, k == 'all') || self.size() == 1",message="kinds: all must be the only item"
 	// +kubebuilder:validation:XValidation:rule="!self.exists(k, k.split('.')[0] in ['secrets', 'secret', 'configmaps', 'configmap', 'cm', 'events', 'event', 'ev', 'endpoints', 'endpoint', 'ep', 'endpointslices', 'endpointslice', 'controllerrevisions', 'controllerrevision', 'leases', 'lease'])",message="kinds: secrets, configmaps, events, endpoints, endpointslices, controllerrevisions and leases are never scanned"
 	// +optional
@@ -899,7 +906,7 @@ type TuningSpec struct {
 	// over the gateway's 1.8 GiB idle set, about 4.4 GiB under its 8Gi memory limit; a
 	// coordinator waiting on its own children gives its slot back but stays resident, so
 	// processes can sit above six. The credential proxy at its default 2Gi memory limit
-	// admits 9 brokered commands at once, held to 8 by its slot cap, which the stall
+	// admits 10 brokered commands at once, held to 8 by its slot cap, which the stall
 	// watch's and cluster-agent reconcile's four-wide listings share. Per-install model
 	// rate limits are not measured: a small quota may see 429s at 6, so lower this if
 	// worker logs show them.
@@ -911,14 +918,31 @@ type TuningSpec struct {
 	// slot cap binds, and no CR field moves it, so raising the memory limit in
 	// spec.deployment.credentialProxy.resources does not help: a command beyond eight
 	// waits up to 60 s for a slot and is then refused busy. Keep that limit at 2Gi or
-	// more, since below it the memory budget (176 MiB per command after 320 MiB of fixed
-	// reserves) binds first. Set it to 1 to serialise all delegated work. When quota rather than
-	// memory binds, note the related failure mode: workers that exhaust their retry
+	// more, since below it the memory budget (176 MiB per command after the 192 MiB
+	// resident reserve) binds first. Set it to 1 to serialise all delegated work. When
+	// quota rather than memory binds, note the related failure mode: workers that exhaust their retry
 	// budget exit without calling a terminal kanban tool, and the dispatcher reports that
 	// as a "protocol violation" rather than as the quota exhaustion it actually is.
 	// +kubebuilder:validation:Minimum=1
 	// +optional
 	MaxInProgress *int `json:"maxInProgress,omitempty"`
+
+	// Admission is the memory admission the kanban dispatcher applies to its own
+	// workers, board-wide like MaxInProgress: the pod memory budget it classifies
+	// pressure against, the resident-memory cap one running worker may reach, how
+	// long a ready card may wait on memory or a full board before it is refused, and
+	// what a tick does when it cannot read memory at all. Past the budget the
+	// dispatcher refuses rather than spawns: the card is blocked with kind
+	// "capacity" and a reason that names the figures, so the thread that filed it is
+	// told it is throttled instead of losing the worker to an eviction. Unset, every
+	// field takes the operator's default, and the budget is the agent container's
+	// memory request (spec.deployment.resources, 4Gi unless set).
+	//
+	// The block is rendered into the managed scope whatever this field says, so the
+	// dispatcher never runs without one: an install that sets nothing runs the
+	// defaults, and removing a field here puts its default back.
+	// +optional
+	Admission *AdmissionSpec `json:"admission,omitempty"`
 
 	// MaxSessions caps how many A2A session pods run concurrently, install-wide.
 	// It only means something under mode: next - a today install renders neither
@@ -1104,6 +1128,101 @@ const (
 	DefaultProfileMaxTaskDeadlineSeconds = 21600
 )
 
+// AdmissionSpec is the memory admission the kanban dispatcher applies to its own
+// workers. The operator renders the four values as kanban.admission.* in the
+// managed scope, defaults applied, on every install.
+//
+// It exists because the pod's own limits do not protect it. The agent container
+// runs under GKE Sandbox, where the kernel the container sees reports the
+// sandbox's virtual memory rather than the cgroup's, so Hermes' upstream
+// memory guard, which reads /proc/meminfo, never fires there. And the kubelet
+// evicts a pod under node pressure once its usage passes its memory REQUEST,
+// long before the limit would stop it: the gateway pod was evicted three times
+// at 3.1 to 3.5 GiB against the 2Gi request it had then. The dispatcher therefore reads the
+// container's working set and counts it against a budget sized from the
+// request, which is what makes its guard fire before the eviction does.
+type AdmissionSpec struct {
+	// MemoryBudgetMiB is the pod memory budget, in MiB, the dispatcher
+	// classifies memory pressure against before it spawns a worker: on every
+	// tick it reads the container's working set (its cgroup memory usage less
+	// the inactive file cache, the figure the kubelet evicts on) and counts it
+	// against this figure. Absent means the agent container's resolved memory request
+	// in MiB (4096 at the operator's default resources), so a CR that raises
+	// the request raises the budget with it.
+	//
+	// Two bounds act on the budget. Each tick admits one new worker per
+	// 512 MiB of headroom under it, so with the container's working set at W
+	// the tick spawns at most (budget - W) / 512 workers and none once the
+	// headroom is under 512 MiB; and Hermes' own classification
+	// (gateway/memory_status.py) permits at most one worker with less than
+	// 15% of the budget, or 128 MiB, left and none with less than 5%, or
+	// 64 MiB. At the default budget the headroom bound acts first. A budget
+	// under the container's idle working set plus 512 MiB therefore admits
+	// no worker and refuses every card after QueueBoundSeconds; the schema's
+	// minimum of 512 is left there for a test install that wants exactly
+	// that, and a derived budget under it is clamped to it. A card the tick
+	// cannot spawn waits, and is refused after QueueBoundSeconds. Set the
+	// budget below the request to keep headroom for the gateway's own growth,
+	// or above it, up to the limit, on a node pool where eviction is not the
+	// risk; past the limit the OOM killer, not this budget, is what stops a
+	// worker.
+	// +kubebuilder:validation:Minimum=512
+	// +kubebuilder:validation:Maximum=65536
+	// +optional
+	MemoryBudgetMiB *int32 `json:"memoryBudgetMiB,omitempty"`
+
+	// WorkerRssCapMiB is the most resident memory, in MiB, one running
+	// worker's process tree may hold: the worker and every descendant, its MCP
+	// proxies included. A worker past it is stopped (SIGTERM, a grace period,
+	// then SIGKILL) and its card is blocked with kind "capacity" and a reason
+	// that names the figure and the cap, so the thread that filed it is told.
+	// Absent means 1536.
+	//
+	// The default is three and a half times the 430 MiB a worker measured on
+	// a live install: a fleet-wide audit that holds a large listing fits, and
+	// one worker cannot take the whole of the default budget by itself. A
+	// worker stopped here has done nothing a retry would fix; the reason it
+	// leaves on the card offers a smaller scope instead.
+	// +kubebuilder:validation:Minimum=256
+	// +kubebuilder:validation:Maximum=65536
+	// +optional
+	WorkerRssCapMiB *int32 `json:"workerRssCapMiB,omitempty"`
+
+	// QueueBoundSeconds is how long a ready card may wait, in seconds, on ticks
+	// that could not spawn it because of memory pressure or an exhausted slot
+	// budget, before it is blocked with kind "capacity" instead of left in the
+	// queue. A card that waits for another reason is not touched: one that is
+	// unassigned, not spawnable, held by the respawn guard, by a per-profile
+	// cap or by the per-class slot reservation stays ready, and so does a child
+	// of a request already running (a fan-out's per-cluster cards), whose wait
+	// belongs to the coordinator the thread is subscribed to. Absent means 600.
+	//
+	// Ten minutes is 120 ticks at the 5s dispatch interval. On a board busy
+	// with other work a card waits minutes for a slot in ordinary operation:
+	// the presubmit install showed two to four while memory was healthy, and a
+	// two-minute bound refused eighteen ordinary cards in one run. The thread
+	// has read the queued line since the first wait; ten minutes is past any
+	// answer it was still waiting for, and a strategy change serves it better.
+	// +kubebuilder:validation:Minimum=10
+	// +kubebuilder:validation:Maximum=3600
+	// +optional
+	QueueBoundSeconds *int32 `json:"queueBoundSeconds,omitempty"`
+
+	// FailClosed is what a tick does when it cannot read the memory counters
+	// at all: true spawns nothing on that tick and logs why; false keeps
+	// Hermes' upstream behaviour, where an unreadable sample imposes no
+	// restriction. Absent means true.
+	//
+	// Closed is the default because the counters go unreadable on exactly the
+	// installs the budget exists for: a sandbox runtime that hides the cgroup
+	// files is also the one that hides the pressure, and an open tick there
+	// spawns into the eviction the budget was meant to prevent. Set it false
+	// only to diagnose a dispatcher that spawns nothing and logs the read
+	// failure.
+	// +optional
+	FailClosed *bool `json:"failClosed,omitempty"`
+}
+
 // AgentLimits bounds a single agent run. Both limits exist because they fail the same
 // way — the run stops mid-task without calling a terminal kanban tool, which the
 // dispatcher then records as a "protocol violation" regardless of the real cause.
@@ -1118,10 +1237,11 @@ type AgentLimits struct {
 	APIMaxRetries *int `json:"apiMaxRetries,omitempty"`
 
 	// MaxTurns is how many iterations (model calls) a single turn may take. Hermes
-	// defaults to 90. A long multi-step task can exhaust it while still mid-flight, and
-	// a run that does cannot even produce a closing summary. Repository exploration is
-	// the main consumer, so size this against how much the agent has to read, not
-	// against how complex the request is.
+	// defaults to 90. A long multi-step task can exhaust it while still mid-flight; a
+	// kanban worker that does ends with its closing summary saved on its card for the
+	// retry, not with the result it was asked for. Repository exploration is the main
+	// consumer, so size this against how much the agent has to read, not against how
+	// complex the request is.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=1000
 	// +optional
@@ -1291,6 +1411,8 @@ type DeploymentSpec struct {
 	PodAnnotations map[string]string `json:"podAnnotations,omitempty"`
 
 	// ScaleToZero scales the deployment replicas to 0 when true (useful for saving costs during idle periods).
+	// While it holds and the gateway has no ready replica, status.phase reads Paused and the Ready
+	// condition False with reason ScaledToZero; clearing it restores the normal phases.
 	// +optional
 	ScaleToZero *bool `json:"scaleToZero,omitempty"`
 
@@ -1299,6 +1421,8 @@ type DeploymentSpec struct {
 	Availability *AvailabilitySpec `json:"availability,omitempty"`
 
 	// Resources specifies resource requests and limits for the main container.
+	// The memory request is also the dispatcher's default admission budget
+	// (spec.harness.tuning.admission.memoryBudgetMiB).
 	// +optional
 	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
 
@@ -1392,9 +1516,9 @@ type CredentialProxySpec struct {
 	// a listing of a small cluster, and a kubectl listing thousands of objects
 	// holds several hundred Mi on its own, so size the limit to the largest
 	// listing the fleet produces for every command that runs at once (eight
-	// at the slot cap) plus the 320Mi of fixed reserves (192Mi for the broker
-	// and Envoy, 128Mi for the content workspace); the broker's child peak and
-	// memory high-water series give the figure.
+	// at the slot cap) plus the 192Mi resident reserve for the broker and
+	// Envoy; the broker's child peak and memory high-water series give the
+	// figure.
 	// Only cpu, memory and ephemeral-storage
 	// are accepted, the quantities the container declares. The operator
 	// refuses a memory limit below what admits two commands at once, a request
@@ -1429,12 +1553,19 @@ type CredentialProxySpec struct {
 // CredentialProxyExecSpec sizes the credential broker's exec tier.
 type CredentialProxyExecSpec struct {
 	// Replicas is the number of exec-tier pods. Unset or 0 renders no exec
-	// tier. Each replica requests and is limited to 2 CPU and 2Gi of memory,
-	// with no override. A change between two positive values rewrites the
-	// count the pods read and does not restart them. The operator does not
-	// derive the count from the fleet size. Above 0 the agent's name must be
-	// at most 36 characters, so the tier's objects fit a 63-character name;
-	// a longer one is refused, the tier is not rendered, and Degraded says so.
+	// tier, and callers send every request to the stateful broker. At a
+	// positive count the shell sandbox, the profile workers and the session
+	// pods under the cluster view are given the tier's address for /v1/exec
+	// and /v1/gcp/. Each replica requests and is limited to 2 CPU and 2Gi of
+	// memory, with no override. A change between 0 and a positive value
+	// restarts the shell sandbox, the profile warm pools, and under the
+	// cluster view the A2A gateway, which read the tier's address when they
+	// start; a change between two positive values rewrites the count the pods
+	// read and restarts nothing. The operator does not derive the count from
+	// the fleet size.
+	// Above 0 the agent's name must be at most 36 characters, so the tier's
+	// objects fit a 63-character name; a longer one is refused, the tier is not
+	// rendered, and Degraded says so.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=32
@@ -2565,7 +2696,9 @@ type NetworkPolicyStatus struct {
 
 // AgentStatus defines the observed state of an agent.
 type AgentStatus struct {
-	// Phase is the overall state (Pending, Provisioning, Ready, Degraded, Failed).
+	// Phase is the overall state (Pending, Provisioning, Ready, Paused, Degraded, Failed).
+	// Paused is a gateway held at zero replicas by spec.deployment.scaleToZero; the
+	// Ready condition then reads False with reason ScaledToZero.
 	// +optional
 	Phase string `json:"phase,omitempty"`
 
@@ -2868,23 +3001,34 @@ type AgentUsageStatus struct {
 	// LastActiveTime: a card giving up is not the agent at work.
 	// +optional
 	BackgroundTasksGaveUpTotal int64 `json:"backgroundTasksGaveUpTotal,omitempty"`
-	// NegativeFeedbackTotal is the cumulative count of thumbs-down reactions
-	// put on one of the bot's Slack messages: the chat_feedback_reactions hook
-	// on the Hermes gateway counts a -1 or thumbsdown reaction, skin tone or
-	// not, whose reactor is not the bot and whose message is the bot's, once
-	// per reactor and message within one gateway process (a thumbs-down taken
-	// off and put back is one; after a restart the same one counts again, and
-	// a reaction before the first inbound message after a start is not
-	// counted), into the
-	// chat_metrics plugin's kubeagents_chat_feedback_negative_total, which is
-	// read every five minutes and kept monotonic the same way as
-	// ToolExecutionsTotal. Slack through the Hermes gateway only: Google Chat
-	// delivers no reaction events, and the A2A gateway's Slack adapter does not
-	// subscribe to them, so on a next-mode install with Slack through A2A this
-	// stays at 0. Does not move LastActiveTime: the message the person
-	// reacted to already did.
+	// NegativeFeedbackTotal is the cumulative count of thumbs-downs people
+	// gave the bot's answers. On the Hermes gateway the
+	// chat_feedback_reactions hook counts a -1 or thumbsdown reaction on one
+	// of the bot's Slack messages, skin tone or not, whose reactor is not the
+	// bot, once per reactor and message within one gateway process (a
+	// thumbs-down taken off and put back is one; after a restart the same one
+	// counts again, and a reaction before the first inbound message after a
+	// start is not counted), into the chat_metrics plugin's
+	// kubeagents_chat_feedback_negative_total; Google Chat delivers no
+	// reaction events. On a next-mode install the A2A gateway's
+	// kubeagents_a2a_gateway_answer_feedback_total under rating down joins
+	// it: one count each time a verified sender's rating of one of its
+	// answers becomes Bad answer, so a repeated tap adds nothing. Read every
+	// five minutes and kept monotonic the same way as ToolExecutionsTotal.
+	// Does not move
+	// LastActiveTime: the message the person rated already did.
 	// +optional
 	NegativeFeedbackTotal int64 `json:"negativeFeedbackTotal,omitempty"`
+	// PositiveFeedbackTotal is the cumulative count of times a verified
+	// sender's rating of one of the A2A gateway's answers became Good answer,
+	// so a repeated tap adds nothing:
+	// kubeagents_a2a_gateway_answer_feedback_total under rating up, summed
+	// over its other labels; read every five minutes and kept monotonic the
+	// same way as ToolExecutionsTotal. Next mode only: the Hermes gateway counts no thumbs-up, so on a today-mode
+	// install this stays at 0. Does not move LastActiveTime: the message the
+	// person rated already did.
+	// +optional
+	PositiveFeedbackTotal int64 `json:"positiveFeedbackTotal,omitempty"`
 	// RemediationsClosedUnmergedTotal is the forge's count now of this
 	// install's proposals closed without a merge by a person or a bot:
 	// kubeagents_vcs_proposals_closed_by under actor human plus actor bot. A
@@ -2950,8 +3094,10 @@ type AgentUsageStatus struct {
 	// the nine origin fields usually sum to at most RemediationsProposedTotal.
 	// A reading, not an accumulation: the ledger survives a restart and the
 	// plugin reads it whole; a read that fails after the plugin's first success
-	// keeps serving the last counts, so a stale count reads as current until
-	// the plugin restarts. A 0 is a reading. Absent until the first
+	// keeps serving the last counts, and the poller reads a read age past two
+	// poll intervals as no reading, so a stale count clears two polls after
+	// that, about twenty minutes after the ledger stops answering. A 0 is a
+	// reading. Absent until the first
 	// reading, after two polls in a row without one, and while the served CRD
 	// predates the field. Moves neither LastActiveTime nor
 	// LastHumanActiveTime.
@@ -3064,9 +3210,9 @@ type AgentUsageStatus struct {
 	// LastActiveTime is the time of the last poll in which a counter above
 	// moved: a brokered command ran or was refused, a proposal was opened, a
 	// chat message reached the gateway, or an event was accepted for triage;
-	// BrokerFailuresTotal, ChatTurnsErroredTotal, BackgroundTasksGaveUpTotal
-	// and NegativeFeedbackTotal alone leave it where it was, and the six
-	// proposal readings never move it.
+	// BrokerFailuresTotal, ChatTurnsErroredTotal, BackgroundTasksGaveUpTotal,
+	// NegativeFeedbackTotal and PositiveFeedbackTotal alone leave it where it
+	// was, and the six proposal readings never move it.
 	// Scheduled maintenance jobs that run brokered commands move it too --
 	// the Controller Stall Watch cron runs some every 30 minutes by default
 	// -- so it marks agent activity of any origin, not human or operator use

@@ -78,9 +78,11 @@ pull requests already open on findings this run still carries; empty on a clean 
 declaration kept off the ledger (it never decides silence), `postures_withheld`, the ids of the
 posture findings `finish` held back because the document recorded no complete declared-intent
 search (empty everywhere but on a declaring stream that skipped the step; see
-[`declared_intent_searched`](findings-document.md#declared_intent_searched)), and `unaccounted`, the ids of the previous
+[`declared_intent_searched`](findings-document.md#declared_intent_searched)), `unaccounted`, the ids of the previous
 findings a clean run was refused its close over (empty on every other outcome; see
-[The clean run](clean-run.md#the-clean-run)). On every status, the line also carries `notes` when a
+[The clean run](clean-run.md#the-clean-run)), and `retired_unlisted` (only when not empty), the ids
+of the previous findings a clean close retired unread because their cluster was in neither scope
+list (see [The clean run](clean-run.md#the-clean-run)). On every status, the line also carries `notes` when a
 target has one: a list of `{target, note}`, each one a sentence from the collector about what a check
 read on that target but could not see. A note is not a coverage gap: `partial` does not count it,
 and it does not change `silent_ok`. Relay each note in your report on every status, and do not report

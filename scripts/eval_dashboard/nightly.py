@@ -33,22 +33,27 @@ carries every case graded before the deadline and its counts are those
 cases, flagged truncated (the collector's fixture 2102186223282950144);
 before that a deadline-cut night recorded nothing at all (#1491).
 
-One night can be two or three builds. The matrix can run split across
+One night can be up to eight builds. The matrix can run split across
 periodics on separate pool projects, all started at 00:00 UTC: the main
 part (``ci-kube-agents-eval-nightly``, which is the whole matrix when it
 runs alone), the writers part (``ci-kube-agents-eval-nightly-writers``, the
 cases that request a pull request: each resets and watches the project's
 one GitOps repo, so on a shared project they run one at a time after
-everything else) and the main-b part (``ci-kube-agents-eval-nightly-main-b``:
-when the main part runs as two halves, ``EVAL_NIGHTLY_PART=main-a`` and
-``main-b``, the main job runs main-a under its own name and is still the
-main part). A build's part is read from its job name, and the builds
+everything else), the main-b to main-e parts
+(``ci-kube-agents-eval-nightly-main-b`` to ``-main-e``: when the main part
+runs as five shards, ``EVAL_NIGHTLY_PART=main-a`` to ``main-e``, the main
+job runs main-a under its own name and is still the main part), and the
+writers-b and writers-c parts
+(``ci-kube-agents-eval-nightly-writers-b`` and ``-writers-c``: when the
+writers part runs as three thirds, ``EVAL_NIGHTLY_PART=writers-a``,
+``writers-b`` and ``writers-c``, the writers job runs writers-a under its
+own name and is still the writers part). A build's part is read from its job name, and the builds
 of one date are one night (``filed_nights``; a build is dated by its UTC
 start plus NIGHT_START_GRACE, so one that starts a moment before midnight
 joins the night it was meant for): its cases
 are the union of theirs, "incomplete" is judged against the whole matrix,
 and each part says for itself whether it was cut short (``parts[]``). The
-night is truncated when its main or main-b part is (MAIN_PARTS); a writers
+night is truncated when any of its main shards is (MAIN_PARTS); a writers
 part at its deadline does not hide or relabel the main parts' results. A
 night short of a part says which part is missing, or still running; a
 same-day re-run of the main job reports its date's other parts as its own
@@ -69,8 +74,9 @@ import math
 import re
 
 try:
-    from eval_dashboard import tiers
+    from eval_dashboard import links, tiers
 except ImportError:  # run as a script from scripts/eval_dashboard/
+    import links  # type: ignore[no-redef]
     import tiers  # type: ignore[no-redef]
 
 # The report page render.py writes and the digest links to.
@@ -99,7 +105,7 @@ EVAL_VERDICT_KEY = "eval_verdict"
 # A nightly build on the collector's pending_builds (listed, no finished.json
 # yet) is a night still running only while it started this recently: the
 # longest part's budget is 14 hours (oss-test-infra: timeout 840m on the main
-# and main-b parts for the gemini-4-argon window, 720m before), plus Prow's
+# shards for the gemini-4-argon window, 720m before), plus Prow's
 # 5-minute grace and the minutes a pod cut at its deadline takes to end (seen
 # at 12h04m-12h06m on the 720m budget). Past that the build is a pod that
 # died without uploading, which the collector keeps on pending_builds for
@@ -132,30 +138,62 @@ NIGHT_START_GRACE = datetime.timedelta(minutes=15)
 # Where Prow's Spyglass shows a periodic's build and its artifacts. The
 # collector records it per nightly run (``runs[].log_url``, SCHEMA.md) from
 # the build directory it listed, so the link follows whichever bucket the
-# nightly logs to. A nightly record without the field predates it and was
-# read from the bucket the nightly used before 2026-09-15, the cluster
-# default gs://kube-agents-prow; a periodic's build lives under logs/<job>/
-# there, with no pull request in the path.
+# nightly logs to; a run in a bucket Deck cannot read also records the
+# directory (``runs[].gcs_base``) and links the Cloud Console (links.py), as
+# does a record whose ``log_url`` is a Spyglass link into such a bucket. A
+# nightly record without either field predates them and was read from the
+# bucket the nightly used before 2026-09-15, the cluster default
+# gs://kube-agents-prow; a periodic's build lives under logs/<job>/ there,
+# with no pull request in the path.
 LEGACY_SPYGLASS_LOGS_ROOT = "https://oss.gprow.dev/view/gs/kube-agents-prow/logs"
 DEFAULT_NIGHTLY_JOB = "ci-kube-agents-eval-nightly"
 # The other periodics of a split night (module docstring): the writers
-# job (#2467) and the job that runs the main part's second half (#3384),
-# and the parts' names in report order. PART_JOBS reads a build's part from
+# job (#2467), the jobs that run the main part's other shards (#3384,
+# #4238) and the two that run the writers part's other thirds (#4238), and
+# the parts' names in report order. PART_JOBS reads a build's part from
 # its job; any other nightly build is the main part, which is also what
-# every build was before the split, and what the main job's main-a half is.
+# every build was before the split, and what the main job's main-a shard is;
+# the writers job's writers-a third is the writers part the same way.
 # PART_WORDS is how the digest and the page name a part.
 NIGHTLY_WRITERS_JOB = "ci-kube-agents-eval-nightly-writers"
 NIGHTLY_MAIN_B_JOB = "ci-kube-agents-eval-nightly-main-b"
+NIGHTLY_MAIN_C_JOB = "ci-kube-agents-eval-nightly-main-c"
+NIGHTLY_MAIN_D_JOB = "ci-kube-agents-eval-nightly-main-d"
+NIGHTLY_MAIN_E_JOB = "ci-kube-agents-eval-nightly-main-e"
+NIGHTLY_WRITERS_B_JOB = "ci-kube-agents-eval-nightly-writers-b"
+NIGHTLY_WRITERS_C_JOB = "ci-kube-agents-eval-nightly-writers-c"
 PART_MAIN = "main"
 PART_MAIN_B = "main-b"
+PART_MAIN_C = "main-c"
+PART_MAIN_D = "main-d"
+PART_MAIN_E = "main-e"
 PART_WRITERS = "writers"
-PARTS = (PART_MAIN, PART_MAIN_B, PART_WRITERS)
-PART_JOBS = {NIGHTLY_MAIN_B_JOB: PART_MAIN_B, NIGHTLY_WRITERS_JOB: PART_WRITERS}
-PART_WORDS = {PART_MAIN: "main part", PART_MAIN_B: "main-b part", PART_WRITERS: "writers part"}
-# The parts that hold the main matrix: either one cut short cuts the night
-# short, and either one still running holds back the digest's numbers. The
-# writers part, a few cases, does neither.
-MAIN_PARTS = (PART_MAIN, PART_MAIN_B)
+PART_WRITERS_B = "writers-b"
+PART_WRITERS_C = "writers-c"
+PARTS = (PART_MAIN, PART_MAIN_B, PART_MAIN_C, PART_MAIN_D, PART_MAIN_E, PART_WRITERS, PART_WRITERS_B, PART_WRITERS_C)
+PART_JOBS = {
+    NIGHTLY_MAIN_B_JOB: PART_MAIN_B,
+    NIGHTLY_MAIN_C_JOB: PART_MAIN_C,
+    NIGHTLY_MAIN_D_JOB: PART_MAIN_D,
+    NIGHTLY_MAIN_E_JOB: PART_MAIN_E,
+    NIGHTLY_WRITERS_JOB: PART_WRITERS,
+    NIGHTLY_WRITERS_B_JOB: PART_WRITERS_B,
+    NIGHTLY_WRITERS_C_JOB: PART_WRITERS_C,
+}
+PART_WORDS = {
+    PART_MAIN: "main part",
+    PART_MAIN_B: "main-b part",
+    PART_MAIN_C: "main-c part",
+    PART_MAIN_D: "main-d part",
+    PART_MAIN_E: "main-e part",
+    PART_WRITERS: "writers part",
+    PART_WRITERS_B: "writers-b part",
+    PART_WRITERS_C: "writers-c part",
+}
+# The parts that hold the main matrix: any one cut short cuts the night
+# short, and any one still running holds back the digest's numbers. The
+# writers parts, a few cases each, do neither.
+MAIN_PARTS = (PART_MAIN, PART_MAIN_B, PART_MAIN_C, PART_MAIN_D, PART_MAIN_E)
 # The job segment of a Spyglass build link (.../logs/<job>/<build>), which
 # is how a pending build's part is read: its entry carries no job.
 JOB_IN_LOG_URL = re.compile(r"/(?P<job>[^/]+)/\d+/?$")
@@ -350,10 +388,23 @@ def expected_cases(data: dict) -> list[str]:
     return sorted(out)
 
 
+def console_base(run: dict) -> str | None:
+    """The ``gs://`` directory a run's links open in the Console: its
+    ``gcs_base``, or the directory behind a ``log_url`` that is a Spyglass
+    link into a private bucket (links.py); None for a run Spyglass renders."""
+    base = run.get("gcs_base")
+    if isinstance(base, str) and base.startswith(links.GS_SCHEME):
+        return base
+    return links.private_gcs_base(run.get("log_url"))
+
+
 def build_url(run: dict) -> str | None:
     build = run.get("build_id")
     if not isinstance(build, str) or not build.isdigit():
         return None
+    base = console_base(run)
+    if base:
+        return links.console_url(base)
     recorded = run.get("log_url")
     if isinstance(recorded, str) and recorded.startswith("https://"):
         return recorded
@@ -363,7 +414,12 @@ def build_url(run: dict) -> str | None:
 
 def transcript_url(run: dict, case: str) -> str | None:
     base = build_url(run)
-    return f"{base}/{TRANSCRIPT_ARTIFACT.format(case=case)}" if base else None
+    if not base:
+        return None
+    directory = console_base(run)
+    if directory:
+        return links.console_object_url(directory, TRANSCRIPT_ARTIFACT.format(case=case))
+    return f"{base}/{TRANSCRIPT_ARTIFACT.format(case=case)}"
 
 
 # --------------------------------------------------------------------------
@@ -442,7 +498,7 @@ def filed_nights(runs: list[dict]) -> list[tuple[dict[str, dict], list[dict]]]:
     filed first, each a night of its own dated by ``night_date``, so one
     job alone is one build per night as before and a same-day re-run of
     the main job is a night of its own. A build of any other part (writers,
-    main-b) then joins, among the nights of its date that have no such part
+    main-b to main-e, writers-b, writers-c) then joins, among the nights of its date that have no such part
     yet, the one whose first part started closest to it (the newer on a
     tie), so a main re-run started late the evening before does not take
     the cron night's other parts, even one that started a moment before
@@ -504,7 +560,7 @@ def run_truncated(run: dict) -> bool:
 
 
 def replaces(newcomer: dict, incumbent: dict) -> bool:
-    """Whether a re-run of a part other than main (writers, main-b) takes
+    """Whether a re-run of a part other than main (writers, main-b to main-e, writers-b, writers-c) takes
     the night's part from the build that has it: it graded more cases (an infra-only or unrecorded
     case is no verdict), or as many and was not cut short where the
     incumbent finished."""
@@ -626,14 +682,14 @@ def absent_parts(night: dict[str, dict], missing_cases: list[str], recorded_by: 
     is not missing.
 
     The main part is expected beside any other part: it is the job that
-    always runs. Any other part (writers, main-b) is expected only when a
+    always runs. Any other part (the writers thirds, the other main shards) is expected only when a
     case the night is missing is one a build of that part recorded on or
     before the night's date (``recorded_by``, ``part_cases``). So every
     night before a split, and every night while the main job runs alone,
     looks exactly as it did; and once the main job runs the whole matrix
     again (the split undone), a night short of a main case is incomplete
-    without naming another part, while one short of a former writers or
-    main-b case still names that part."""
+    without naming another part, while one short of a case a former other
+    part recorded still names that part."""
     present = night_parts(night)
     day = night_date(present[0])
     in_flight = {pending_part(e) for e in running if day and night_day(parse_iso(e.get("first_seen"))) == day}
@@ -712,15 +768,15 @@ def joined_night_document(night: dict[str, dict], data: dict, previous: dict[str
     missing = [name for name in expected if name not in recorded]
     day = night_date(runs[0])
     missing_parts, running_parts = absent_parts(night, missing, part_cases(data, day), list(running), parts_by_date(data).get(day, set()) if day else set())
-    # The night is cut short as a whole when its main or main-b part was
+    # The night is cut short as a whole when any of its main shards was
     # (MAIN_PARTS, which hold nearly every case), or every part when it has
-    # neither. A writers part at its deadline alone is that part's
+    # none of them. A writers part at its deadline alone is that part's
     # ``truncated``: the main parts' results stand, and the night is not
     # complete.
     held = [p for p in parts if p["part"] in MAIN_PARTS]
-    # A night without either half of the main matrix -- missing, still
+    # A night without any shard of the main matrix -- missing, still
     # running, or (the main part, defensively) absent from the night at all
-    # -- never compared that half's cases, so it gives no newly-failing
+    # -- never compared that shard's cases, so it gives no newly-failing
     # verdict. The digest and the page both read this one decision.
     withheld_by = next((p for p in MAIN_PARTS if p in missing_parts or p in running_parts or (p == PART_MAIN and PART_MAIN not in night)), None)
     truncated = any(p["truncated"] for p in held) if held else all(p["truncated"] for p in parts)
@@ -990,10 +1046,10 @@ def digest_line(data: dict | None, now: datetime.datetime, clock=None) -> str:
     """One line for the 11 AM digest. ``clock`` renders a datetime the way
     the rest of the digest does (post_health.clock); without one the ISO
     form is used. A truncated or missing night says so instead of numbers,
-    and so does a split night whose main or main-b part is still running; a
+    and so does a split night with a main shard still running; a
     split night with one part cut short, missing or still running otherwise
     has its numbers and says which part, without a newly-failing verdict
-    when either main half is absent (the night's ``verdict_withheld_by``,
+    when any main shard is absent (the night's ``verdict_withheld_by``,
     which the page reads too). A night with numbers whose reps carried the
     opening chat turn's time gives its p50 and p95, as advice
     (``turn1_note``)."""
@@ -1026,21 +1082,21 @@ def digest_line(data: dict | None, now: datetime.datetime, clock=None) -> str:
     recorded = f"{counts['recorded']} of {counts['expected']} cases recorded" if counts["expected"] else f"{counts['recorded']} cases recorded"
     if night["truncated"]:
         # A night is cut short by its main part when it has one: that
-        # part's wall clock, not the longest part's. A night with a main-b
-        # part names each of the two halves that was cut short, with its own.
+        # part's wall clock, not the longest part's. A night with another
+        # main shard names each main shard that was cut short, with its own.
         on_record = night.get("parts") or []
         main = next((p for p in on_record if p.get("part") == PART_MAIN), None)
         if main is not None:
             took = duration_text(main["duration_s"]) if main.get("duration_s") is not None else "unknown wall clock"
         head = f"truncated after {took}"
-        if any(p.get("part") == PART_MAIN_B for p in on_record):
+        if any(p.get("part") in MAIN_PARTS[1:] for p in on_record):
             head = SEP.join(cut_notes(night, MAIN_PARTS))
         notes = "".join(f"{SEP}{note}" for note in part_notes(night, cut=False))
         return f"{DIGEST_GLYPH} Nightly: {head}{SEP}{recorded}{notes}{SEP}the night's numbers are not comparable"
     parts = [f"{counts['recorded']} cases", f"{counts['passed']} passed all reps", f"{counts['partial']} partial", f"{counts['failed']} failed"]
     if counts["infra"]:
         parts.append(f"{counts['infra']} infra")
-    # No verdict on what is newly failing without either half of the main
+    # No verdict on what is newly failing without every shard of the main
     # matrix (``verdict_withheld_by``); the part notes say which part.
     if night.get("verdict_withheld_by"):
         pass
