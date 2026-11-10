@@ -8712,7 +8712,13 @@ class FindingsItemStateVerifier(_OnboardingPollVerifier):
     reason names the state of each row not in ``state``. With ``not_state``
     instead, passes when no row is in it, for a property a single state cannot
     say: "not dismissed" holds while the install's own nudge moves a queued
-    row to surfaced. Exactly one of the two is set.
+    row to surfaced. Exactly one of the two is set. ``unless_shown``, with
+    ``not_state`` only, also passes a row in ``not_state`` that has a
+    ``first_shown_at``: a paced publisher's message (the nudge's) named it
+    before it was decided, so a decision that reached it is by design. Only a
+    paced publisher sets that field, and only on an undecided row, so a mark
+    the model makes (which raises ``surface_count`` on any row) cannot pass a
+    row. "No row that no message named was dismissed."
 
     A listed row the queue does not hold is ``status="error"``: the case's plant
     is missing, so there is nothing to grade. An unreadable pod or a queue that
@@ -8724,11 +8730,14 @@ class FindingsItemStateVerifier(_OnboardingPollVerifier):
     finding_ids: list[str] = Field(min_length=1)
     state: FindingState | None = None
     not_state: FindingState | None = None
+    unless_shown: bool = False
 
     @model_validator(mode="after")
     def _one_state(self) -> "FindingsItemStateVerifier":
         if (self.state is None) == (self.not_state is None):
             raise ValueError("set exactly one of state and not_state")
+        if self.unless_shown and self.not_state is None:
+            raise ValueError("unless_shown goes with not_state")
         return self
 
     @field_validator("finding_ids")
@@ -8758,6 +8767,13 @@ class FindingsItemStateVerifier(_OnboardingPollVerifier):
             )
         if self.not_state is not None:
             hit = {finding_id: states[finding_id] for finding_id in self.finding_ids if states[finding_id] == self.not_state}
+            named: list[str] = []
+            if self.unless_shown:
+                # A row without the field (an older read) counts as never named.
+                shown = {str(row.get("id")): row.get("first_shown_at") for row in read["findings"]}
+                raw["first_shown_at"] = {finding_id: shown.get(finding_id) for finding_id in self.finding_ids}
+                named = [finding_id for finding_id in hit if shown.get(finding_id)]
+                hit = {finding_id: state for finding_id, state in hit.items() if finding_id not in named}
             if hit:
                 return (
                     "fail",
@@ -8766,7 +8782,9 @@ class FindingsItemStateVerifier(_OnboardingPollVerifier):
                 )
             return (
                 "pass",
-                f"none of {len(self.finding_ids)} row(s) are {self.not_state}; "
+                f"none of {len(self.finding_ids)} row(s) are {self.not_state}"
+                + (f" but for {len(named)} a message had named" if named else "")
+                + "; "
                 + ", ".join(f"{finding_id} is {state}" for finding_id, state in raw["states"].items()),
                 raw,
             )

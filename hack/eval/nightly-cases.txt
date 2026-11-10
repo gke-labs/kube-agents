@@ -1097,7 +1097,7 @@
 
 # The findings queue's item-wide decision when a sweep has added a finding to
 # the line since the nudge named it: the named rows are dismissed, the row no
-# message has named stays queued, and the other lines stay open.
+# message has named is not dismissed, and the other lines stay open.
 # prebuilt/findings-item plants findings-unnamed.json under its own project
 # through the Session KV server's findings routes and resolves the rows on
 # destroy. No fixture; the host install only.
