@@ -25995,6 +25995,12 @@ class TestScopeNotesReachTheReader(HarnessTestCase):
         self.assertEqual(payload["status"], "OPENED")
         self.assertEqual(payload["notes"], [{"target": "prod-us-east", "note": ROTATED_NOTE}])
 
+    def test_the_short_held_note_does_not_claim_a_candidate_for_a_noted_entry(self):
+        entry = {"id": "x", "title": "t", "check": "c", "cluster": "k", "namespace": "", "object": "o", "commands": ["cmd"], audit_report.NOTED_HELD_KEY: True}
+        text = "\n".join(audit_report._render_held_note([entry]))
+        self.assertIn("For 1 of them the collector does not flag the object", text)
+        self.assertNotIn("still emits a candidate", text)
+
     def test_a_dry_run_previews_no_noted_object_as_held(self):
         """The dry run reads no ledger, so it cannot know that a noted object
         is carried; it does not preview one as still flagged."""
@@ -26114,7 +26120,11 @@ class TestScopeNotesReachTheReader(HarnessTestCase):
         body = self.harness.bodies_for("issue-update")[0]
         self.assertIn(derived_id(fid="a"), audit_report.parse_delta_block(body))
         # A noted object has its own wording: the collector does not flag it.
-        self.assertIn("1 of them the collector does not flag", body)
+        # Every held entry here is noted, so the opening does not claim a
+        # candidate for each.
+        self.assertIn("For 1 of them the collector does not flag the object", body)
+        self.assertNotIn("still emits a candidate for each", body)
+        self.assertNotIn("still emits a candidate:", body)
         self.assertIn("could not see the result; the target's notes say why", body)
         # The row shows the object's own read, not the check's joined record.
         self.assertIn(f"`{NOTED_READ}`", body)
@@ -35407,6 +35417,33 @@ class TestStoreLedger(HarnessTestCase):
         self.assertNotIn("labelsAdd", update)
         self.assertEqual(1, len(self.harness.forge_calls("proposal-close")))
         self.assertIn(proposal["url"], out["summary"])
+
+    def test_a_noted_finding_the_stored_ledger_carries_keeps_its_fix_open(self):
+        """The store-ledger path holds a noted object the stored ledger
+        carries, as the forge path does: its fix is not closed as stale."""
+        self.claim()
+        self.touch(self.NETPOL)
+        self.run_once(make_doc(findings=[make_finding(fid="a"), make_finding(fid="b")]))
+        validated = audit_report.load_findings(audit_report.findings_path_for(AUDIT), AUDIT)
+        only_a = {**validated, "findings": [f for f in validated["findings"] if f["object"] == "Namespace/a"]}
+        proposal = self.open_proposal(8, only_a)
+        self.harness.replies["proposal-list"] = {"proposals": [proposal], "truncated": False}
+        manifest = _full_manifest()
+        manifest["clusters"][0][audit_report.NOTED_OBJECTS_KEY] = [
+            {"check": "netpol-missing", "namespace": "payments", "object": "Namespace/a"}
+        ]
+        manifest_path = self.tmp_path / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        self.start()
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(make_doc(findings=[make_finding(fid="b")])), encoding="utf-8")
+        self.new_process()
+        rc = self.run_main(["finish", "--audit", AUDIT, "--findings-file", path, "--manifest-file", str(manifest_path)])
+        self.assertEqual(rc, 0, self.err)
+        out = self.stdout_json()
+        self.assertEqual(out["status"], audit_report.STORE_LEDGER_STATUS)
+        self.assertEqual(out["prs_closed"], [])
+        self.assertEqual([], self.harness.forge_calls("proposal-close"))
 
     def test_a_clean_run_over_an_unexplained_finding_closes_nothing(self):
         self.claim()

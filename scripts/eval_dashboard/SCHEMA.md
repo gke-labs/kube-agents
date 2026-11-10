@@ -1430,7 +1430,7 @@ startup_fail_reset?}}, summary}`
 (`mapped` is how many projects the run set out to visit and `visited` how
 many it held; a held project carries its times, and `allowlist_unused` only
 when its plan was read; `startup_fail_reset` is `{result: reset|failed|skipped,
-instance?, zone?, detail?}`, only on a project whose state the run read,
+instance?, zone?, detail?}`, only on a project whose state the run read or tried to read,
 whatever the plan outcome, with the fixture refresh on and not on a dry run; `fleet_tree` is the hash `hack/fleet_reconcile.py` computes
 over the stack's inputs (`docs/ci-pool-projects.md` §6.2 names them; reports
 from before #2645 carry the git tree id of `bench/tf/fleet` instead);

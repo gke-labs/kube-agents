@@ -295,7 +295,7 @@ cannot make: write them, and `finish` has nothing else to reject.
 runs after the collector command and before the drafting by hand, where the SOP puts it (two
 SOPs' collector command writes the `draft` itself; the step still follows it). It digests what the
 manifest says about the fleet (every cluster's outcome, its checks and their exit codes, its
-candidates by identity and severity, its limitations, `notes` and `noted_objects`, `checks_not_applicable`,
+candidates by identity and severity, its limitations, `notes` and `noted_objects` (with each object's read command, a string that does not change from run to run), `checks_not_applicable`,
 `checks_unevaluated` and the collector's `checks_revision`; not its timestamps, durations, output
 hashes, command strings, or a candidate's excerpt and impact text, which carry ages and counts and
 which `finish` takes from the fresh manifest on a close, except an impact the collector marks

@@ -2143,12 +2143,17 @@ class FixtureRefreshTest(unittest.TestCase):
                 self.assertIn("startup-fail VM not reset", outcomes[P7][1])
                 self.assertEqual(run.extras[P7][reconcile.REPORT_KEY_REFRESH]["result"], "failed")
 
-    def test_a_zone_with_a_trailing_newline_is_never_put_on_a_command_line(self):
-        calls = []
-        state = _state(("google_compute_instance.startup_fail", {"name": "startup-fail-seeded", "zone": "us-central1-a\n"}))
-        outcomes, _ = self._reconcile(_Tofu({P7: UPDATE_ONLY}, states={P7: state}), self._gcloud(calls))
-        self.assertEqual(calls, [])
-        self.assertIn("startup-fail VM not reset", outcomes[P7][1])
+    def test_a_name_or_zone_with_a_trailing_newline_is_never_put_on_a_command_line(self):
+        for values in (
+            {"name": "startup-fail-seeded", "zone": "us-central1-a\n"},
+            {"name": "startup-fail-seeded\n", "zone": "us-central1-a"},
+        ):
+            with self.subTest(values):
+                calls = []
+                state = _state(("google_compute_instance.startup_fail", values))
+                outcomes, _ = self._reconcile(_Tofu({P7: UPDATE_ONLY}, states={P7: state}), self._gcloud(calls))
+                self.assertEqual(calls, [])
+                self.assertIn("startup-fail VM not reset", outcomes[P7][1])
 
     def test_a_name_or_zone_outside_the_shape_is_never_put_on_a_command_line(self):
         for values in (

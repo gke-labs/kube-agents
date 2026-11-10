@@ -78,6 +78,11 @@ CLEAN_BOOT = (
 TESTDATA = Path(__file__).resolve().parent / "testdata"
 WRAPPED_SERIAL = (TESTDATA / "serial_wrapped.txt").read_text(encoding="utf-8")
 FRESH_FAILED_SERIAL = (TESTDATA / "serial_fresh_boot_failed.txt").read_text(encoding="utf-8")
+# The failed boot above, then a reboot read in its boot window: systemd has
+# started the startup-scripts unit, and the runner has printed nothing yet.
+BOOT_WINDOW_SERIAL = (TESTDATA / "serial_boot_window.txt").read_text(encoding="utf-8")
+# A line the runner prints after its start, whichever agent it is.
+RUNNER_LINE = "google_metadata_script_runner[845]: Found startup-script in metadata\n"
 RECORDED_FAILURE_LINE = (
     "2026-10-07T02:18:03.065033+00:00 startup-fail-seeded google_metadata_script_runner[845]: "
     'Script "startup-script" failed with error: exit status 1'
@@ -260,7 +265,11 @@ class StartupScriptTest(unittest.TestCase):
             "systemd[1]: Starting google-startup-scripts.service - Google Compute Engine Startup Scripts...",
         ):
             with self.subTest(line):
-                self.assertTrue(cf.startup_run_visible(line + "\n"))
+                self.assertTrue(cf.startup_run_visible(line + "\n" + RUNNER_LINE))
+        # systemd's line alone is a run in progress: the runner has not printed.
+        self.assertFalse(cf.startup_run_visible(
+            "systemd[1]: Starting google-startup-scripts.service - Google Compute Engine Startup Scripts...\n"
+        ))
         # The shutdown event is a different run, and it is not a boot.
         self.assertFalse(cf.startup_run_visible(
             'google_metadata_script_runner[845]: Running metadata script runner (version 20260715.00) for "shutdown" event\n'
@@ -1148,6 +1157,18 @@ class CollectProjectTest(unittest.TestCase):
         self.assertEqual([c["excerpt"] for c in entry["candidates"]], [RECORDED_FAILURE_LINE])
         self.assertNotIn("limitations", entry)
         self.assertNotIn("notes", entry)
+
+    def test_a_read_in_the_boot_window_still_shows_the_earlier_failure(self):
+        """The new boot's run has not started, so the last run that printed
+        is the failed one."""
+        entry = cf.collect_project(
+            "proj-1",
+            run=self.fake_run(self.clean(**{
+                "instances list": run_of(0, one_running_instance("startup-fail-seeded")),
+                "get-serial-port-output": run_of(0, BOOT_WINDOW_SERIAL),
+            })),
+        )
+        self.assertEqual([c["excerpt"] for c in entry["candidates"]], [RECORDED_FAILURE_LINE])
 
     def test_a_fresh_console_with_a_clean_run_reads_clean(self):
         entry = cf.collect_project(

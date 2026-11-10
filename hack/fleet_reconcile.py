@@ -260,7 +260,7 @@ WARNING_MARKER = "applied.json not written: %s"
 # the project's state, and the shapes its name and zone must have before
 # either goes on a gcloud command line.
 STARTUP_FAIL_ADDRESS = "google_compute_instance.startup_fail"
-STARTUP_FAIL_NAME_RE = re.compile(r"^startup-fail-[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
+STARTUP_FAIL_NAME_RE = re.compile(r"startup-fail-[a-z0-9]([-a-z0-9]*[a-z0-9])?")
 ZONE_RE = re.compile(r"[a-z]+-[a-z]+[0-9]+-[a-z]")
 # A reset waits for its zone operation, which takes seconds. No reset starts
 # once a termination is under way, but one already in flight runs to this
@@ -674,7 +674,7 @@ def startup_fail_instance(state_json):
             continue
         values = resource.get("values") or {}
         name, zone = str(values.get("name") or ""), str(values.get("zone") or "")
-        if not STARTUP_FAIL_NAME_RE.match(name) or not ZONE_RE.fullmatch(zone):
+        if not STARTUP_FAIL_NAME_RE.fullmatch(name) or not ZONE_RE.fullmatch(zone):
             raise ReconcileError("%s has a name or zone outside the expected shape" % STARTUP_FAIL_ADDRESS)
         return name, zone
     return None

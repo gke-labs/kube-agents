@@ -73,7 +73,11 @@ verification_spec:
   # appendix's serial-read commands, a limitations sentence and the Notes
   # cell, but always after a space, while only a finding's object path
   # (`ComputeInstance/<zone>/startup-fail-...`, in its heading and its Where:
-  # line) puts it after a slash.
+  # line) puts it after a slash. A held row shows that path too, and the
+  # finding_ids block lists held ids, so neither check tells a held finding
+  # from one this run filed. They need this run's finding because each
+  # repetition starts from an empty ledger (hack/ci_reset_audit_ledgers.py),
+  # which holds nothing.
   - name: a-startup-script-finding-was-filed
     role: objective
     # assert, not converge: the ledger is written once, at `finish`.

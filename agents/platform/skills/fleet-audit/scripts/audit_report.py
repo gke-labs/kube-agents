@@ -1680,8 +1680,9 @@ NOTE_TEXT_FIELD = "note"
 # The lead of the notes list in a comment and in the no-forge summary.
 NOTES_LEAD = "Read but not visible, which is not a coverage gap"
 # A collected target's manifest entry may list the objects its `notes` names
-# as `{check, object}` (and `namespace` where the check has one): each one an
-# object a check read but could not see. `finish` refuses a `resolved_because`
+# as `{check, object}` (and `namespace` where the check has one, and an
+# optional `command`, the object's own read): each one an object a check read
+# but could not see. `finish` refuses a `resolved_because`
 # entry for one of them (`refuse_resolved_over_notes`), because the run did
 # not see the finding go away.
 NOTED_OBJECTS_KEY = "noted_objects"
@@ -13124,6 +13125,22 @@ def _held_identity_lines(entry: dict) -> list[str]:
     )
 
 
+def _held_reasons(held: list[dict]) -> str:
+    """Why the collector-held entries are held, when some are noted objects:
+    one sentence for the flagged ones, if any, and one for the noted ones."""
+    noted = sum(1 for entry in held if entry.get(NOTED_HELD_KEY))
+    flagged = len(held) - noted
+    out = []
+    if flagged:
+        out.append(
+            f"For {flagged} of them the collector still emits a candidate: the condition "
+            "is still observed, and each stays until the collector stops emitting it or "
+            "a `declared` entry covers it."
+        )
+    out.append(f"For {noted} of them the collector does not flag the object: {NOTED_HOLD_CAUSE}, and {NOTED_HOLD_END}.")
+    return " ".join(out)
+
+
 def _render_flagged_held(
     held: list[dict],
     *,
@@ -13157,7 +13174,7 @@ def _render_flagged_held(
             "does not carry it. Shown from the manifest; the real run intersects with "
             "the marker it reads back."
         )
-    else:
+    elif not any(entry.get(NOTED_HELD_KEY) for entry in held):
         out.append(
             f"{len(held)} previous {count_word} this run's document did not carry, kept on "
             "the ledger because the collector still emits a candidate for each: the "
@@ -13167,13 +13184,12 @@ def _render_flagged_held(
             "over these; a `/remediate <finding-id>` on one is held, not refused, "
             "until a document carries the finding again."
         )
-    noted = sum(1 for entry in held if entry.get(NOTED_HELD_KEY))
-    if noted and not carried:
-        # A noted object is held on other grounds: nothing flags it, but the
-        # run cannot see it go away (`noted_ids`).
-        out[-1] += (
-            f" {noted} of them the collector does not flag: {NOTED_HOLD_CAUSE}. "
-            f"For each of these, {NOTED_HOLD_END}."
+    else:
+        out.append(
+            f"{len(held)} previous {count_word} this run's document did not carry, kept on "
+            f"the ledger. {_held_reasons(held)} A `resolved_because` entry does not release "
+            "one. The automatic sweep passes over these; a `/remediate <finding-id>` on "
+            "one is held, not refused, until a document carries the finding again."
         )
     for index, entry in enumerate(held):
         fid = str(entry.get("id", ""))
@@ -13271,7 +13287,7 @@ def _render_held_note(
             "not carry it. The body had no room for their rows; they are shown from the "
             "manifest, and the real run intersects them with the marker it reads back."
         )
-    else:
+    elif not any(entry.get(NOTED_HELD_KEY) for entry in held):
         opening = (
             f"{len(held)} previous finding(s) this run's document did not carry are "
             "kept on this ledger because the collector still emits a candidate for "
@@ -13280,11 +13296,12 @@ def _render_held_note(
             "stays held until the collector stops emitting it or a `declared` entry "
             "covers it."
         )
-    noted = sum(1 for entry in held if entry.get(NOTED_HELD_KEY))
-    if noted and not carried:
-        opening += (
-            f" {noted} of them the collector does not flag: {NOTED_HOLD_CAUSE}. "
-            f"For each of these, {NOTED_HOLD_END}."
+    else:
+        opening = (
+            f"{len(held)} previous finding(s) this run's document did not carry are "
+            f"kept on this ledger. {_held_reasons(held)} The body had no room for their "
+            "rows; their ids are in the hidden block below, which is what the next run "
+            "reads them back from."
         )
     return [
         "",

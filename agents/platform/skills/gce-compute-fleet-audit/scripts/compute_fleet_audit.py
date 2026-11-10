@@ -265,6 +265,12 @@ STARTUP_RUN_PATTERN = re.compile(
     r'|Running metadata script runner \(version [^)]*\) for "startup" event'
     r"|Starting google-startup-scripts\.service"
 )
+# systemd's line, the one start marker the runner does not print. As the last
+# start with no runner output after it, it means the run is in progress
+# (`_run_starts`). The runner tags its lines with its name; older agents
+# tagged them `GCEMetadataScripts`.
+SYSTEMD_START_MARKER = "Starting google-startup-scripts.service"
+RUNNER_OUTPUT_PATTERN = re.compile(r"google_metadata_script_runner|GCEMetadataScripts")
 
 # §2.5's threshold. Measured against the snapshot's own `creationTimestamp`,
 # which is what this collector can see; §2.5 words the condition as the source
@@ -827,7 +833,7 @@ def check_startup_script(instance_name: str, zone: str, serial_text: str) -> dic
     lines = serial_text.splitlines()
     # The console buffer outlives a guest reboot, so a failure an operator has
     # since fixed is still in it. Only the last startup-script run counts.
-    starts = [index for index, line in enumerate(lines) if STARTUP_RUN_PATTERN.search(line)]
+    starts = _run_starts(lines)
     for line in lines[starts[-1] if starts else 0 :]:
         if STARTUP_FAILURE_PATTERN.search(line):
             return {
@@ -853,7 +859,25 @@ def startup_run_visible(serial_text: str) -> bool:
     run marker and no failure line is therefore no evidence of a clean run.
     The caller lists such an instance as passed over, not cleared.
     """
-    return any(STARTUP_RUN_PATTERN.search(line) for line in serial_text.splitlines())
+    return bool(_run_starts(serial_text.splitlines()))
+
+
+def _run_starts(lines: list[str]) -> list[int]:
+    """The indices of the lines that open a startup-script run.
+
+    Less a last start that is systemd's line with no runner output after it:
+    a read in the boot window, after systemd starts the unit and before the
+    runner prints, holds no run yet, so it is not the visible run. The
+    previous run counts instead.
+    """
+    starts = [index for index, line in enumerate(lines) if STARTUP_RUN_PATTERN.search(line)]
+    if (
+        starts
+        and SYSTEMD_START_MARKER in lines[starts[-1]]
+        and not any(RUNNER_OUTPUT_PATTERN.search(line) for line in lines[starts[-1] + 1 :])
+    ):
+        starts.pop()
+    return starts
 
 
 def _metadata_keys(payload: dict, field: str) -> set[str]:
@@ -1312,7 +1336,7 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
         common_script = isinstance(info_parsed, dict) and project_wide
         unread: list[str] = []
         rotated: list[str] = []
-        rotated_objects: list[str] = []
+        rotated_objects: list[tuple[str, str]] = []
         for instance_name, zone in targets:
             argv = _serial_argv(instance_name, zone, project)
             result = run(argv)
