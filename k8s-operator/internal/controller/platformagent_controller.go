@@ -421,6 +421,15 @@ const (
 	dataVolumeStorageClassGoneFmt   = "StorageClass %q does not exist, so the claim cannot expand."
 	dataVolumeStorageClassFixedFmt  = "StorageClass %q does not allow volume expansion. Set allowVolumeExpansion: true on the class to let the claim grow."
 	dataVolumeExpansionMsgSeparator = " "
+	// The Warning Event for an agent data claim below
+	// ResolveAgentDataStorageSize that will not grow: a claim the operator does
+	// not control (made or adopted by hand), or one whose StorageClass cannot
+	// expand it, which DataVolumeNotExpanded also reports. An Event rather than
+	// a second condition reason, so the condition's API is unchanged.
+	dataVolumeUndersizedReason   = "DataVolumeUndersized"
+	dataVolumeUndersizedFormat   = "Claim %s requests %s, below the %s the data volume should have (spec.storage.size or the operator default, raised for spec.storage.expectedClusterProfiles). %s"
+	dataVolumeUnownedSentence    = "The claim is not controlled by this PlatformAgent, so the operator leaves its size to whoever made it; resize it by hand."
+	dataVolumeCannotGrowSentence = "Its StorageClass cannot expand it; see the DataVolumeNotExpanded condition."
 
 	conditionReasonInvalidGitRepoURL   = "InvalidGitRepoURL"
 	conditionReasonCorruptManagedRepos = "CorruptManagedRepos"
@@ -585,6 +594,13 @@ type PlatformAgentReconciler struct {
 	// with no entry was not read by this process yet, and the status writers
 	// then leave the condition as it stands. Cleared when the CR is deleted.
 	dataVolumeExpansion sync.Map
+
+	// dataVolumeUndersizedWarned records, per data claim, the
+	// DataVolumeUndersized Event this process last wrote, so a claim that stays
+	// in the same state is warned about once rather than on every pass. Keyed by
+	// the claim's ObjectKey, value string; removed when the claim is no longer
+	// undersized and cleared when the CR is deleted.
+	dataVolumeUndersizedWarned sync.Map
 
 	// gatewayLeaseSeen records each A2A gateway Lease this process has seen
 	// exist, and gatewayLeaseGoneAt when it first saw a seen one missing:
@@ -1664,7 +1680,9 @@ func (r *PlatformAgentReconciler) reconcilePVC(ctx context.Context, agent *agent
 	// reconcileShellSandbox applies the StatefulSet.
 	r.growShellSandboxDataClaim(ctx, agent)
 	key := client.ObjectKeyFromObject(dataClaim)
-	r.noteDataClaimGrowth(key, r.growDataClaim(ctx, key, dataClaim.Spec.Resources.Requests[corev1.ResourceStorage], agent))
+	growth := r.growDataClaim(ctx, key, dataClaim.Spec.Resources.Requests[corev1.ResourceStorage], agent)
+	r.noteDataClaimGrowth(key, growth)
+	r.warnUndersizedDataClaim(agent, key, growth)
 	return nil
 }
 
@@ -3035,6 +3053,9 @@ func (r *PlatformAgentReconciler) growShellSandboxDataClaim(ctx context.Context,
 type dataClaimGrowth struct {
 	claim      string
 	have, want resource.Quantity
+	// unowned is true for a claim the owner passed to growDataClaim does not
+	// control, which growDataClaim leaves at its size.
+	unowned bool
 	// cannotExpand is "" unless the claim is below want and its StorageClass
 	// cannot expand it. Then it is the sentence that says why.
 	cannotExpand string
@@ -3082,7 +3103,37 @@ func (r *PlatformAgentReconciler) dataVolumeExpansionMessage(agent *agentv1alpha
 func (r *PlatformAgentReconciler) forgetDataVolumeExpansion(agent *agentv1alpha1.PlatformAgent) {
 	for _, key := range dataClaimKeys(agent) {
 		r.dataVolumeExpansion.Delete(key)
+		r.dataVolumeUndersizedWarned.Delete(key)
 	}
+}
+
+// warnUndersizedDataClaim writes one DataVolumeUndersized Warning Event when
+// the agent's data claim is below the size it should have and will not grow,
+// and again only when what it says changes. A nil growth (the claim could not
+// be read) leaves the record alone; a claim that is not undersized, or that
+// growDataClaim patched, clears it, so a later shortfall is warned about anew.
+func (r *PlatformAgentReconciler) warnUndersizedDataClaim(agent *agentv1alpha1.PlatformAgent, key client.ObjectKey, growth *dataClaimGrowth) {
+	if growth == nil {
+		return
+	}
+	var why string
+	switch {
+	case growth.have.IsZero() || growth.have.Cmp(growth.want) >= 0:
+	case growth.unowned:
+		why = dataVolumeUnownedSentence
+	case growth.cannotExpand != "":
+		why = dataVolumeCannotGrowSentence
+	}
+	if why == "" {
+		r.dataVolumeUndersizedWarned.Delete(key)
+		return
+	}
+	msg := fmt.Sprintf(dataVolumeUndersizedFormat, growth.claim, growth.have.String(), growth.want.String(), why)
+	if previous, ok := r.dataVolumeUndersizedWarned.Load(key); ok && previous.(string) == msg {
+		return
+	}
+	r.dataVolumeUndersizedWarned.Store(key, msg)
+	r.recordEvent(agent, corev1.EventTypeWarning, dataVolumeUndersizedReason, msg)
 }
 
 // dataClaimKeys are the two data claims: the agent's own, which
@@ -3194,13 +3245,14 @@ func (r *PlatformAgentReconciler) growDataClaim(ctx context.Context, key client.
 		}
 		return growth
 	}
+	have := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
+	growth.have = have
 	if owner != nil && !metav1.IsControlledBy(pvc, owner) {
 		log.Info("the data claim is not the operator's; leaving its size alone", "claim", key.Name)
+		growth.unowned = true
 		return growth
 	}
 
-	have := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
-	growth.have = have
 	if have.Cmp(want) >= 0 {
 		// The spec asks for enough. Whether the volume has it is a different
 		// question: the API server admits a resize on the StorageClass alone, and

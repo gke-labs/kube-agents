@@ -3361,7 +3361,7 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
   {{- $storageValues := .Values.platformAgent.storage | default dict -}}
   {{- if or $storageValues.size $storageValues.expectedClusterProfiles -}}
     {{- if not (and (hasKey $storage "dataClaims") (hasKey $storage "dataClaimBytesRequest")) -}}
-      {{- fail "quota preflight: footprint.yaml has no dataClaims or dataClaimBytesRequest, so platformAgent.storage.size cannot be counted. Reinstall from an intact chart, or set quotaPreflight.enabled=false to skip the check." -}}
+      {{- fail "quota preflight: footprint.yaml has no dataClaims or dataClaimBytesRequest, so platformAgent.storage.size and platformAgent.storage.expectedClusterProfiles cannot be counted. Reinstall from an intact chart, or set quotaPreflight.enabled=false to skip the check." -}}
     {{- end -}}
     {{- $defaultBytes := $storage.dataClaimBytesRequest | int64 -}}
     {{- $sizedBytes := $defaultBytes -}}

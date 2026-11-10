@@ -12044,17 +12044,17 @@ spec:
                   type: object
                 storage:
                   description: |-
-                    Storage sizes the agent's /opt/data volume and the shell sandbox's
-                    matching data volume.
+                    Storage sizes the agent's /opt/data volume and the shell sandbox's data
+                    volume.
                   properties:
                     expectedClusterProfiles:
                       description: |-
                         ExpectedClusterProfiles is how many Cluster Agent profiles the install is
                         expected to hold, one per cluster in scope. It sizes the agent's own
                         <name>-data claim to at least a base for the Platform Agent's stores plus
-                        a per-profile budget for each, measured at the default 90-day session
-                        retention (dataVolumeBaseSize and perClusterProfileStorage in the
-                        controller). The claim takes the larger of that and Size, or the operator
+                        a per-profile budget for each, 8Gi plus 400Mi per profile rounded up to
+                        whole GiB, measured at the default 90-day session retention. The claim
+                        takes the larger of that and Size, or the operator
                         default when Size is absent, so this only ever raises it. Raising it
                         expands the existing claim online where the StorageClass allows. The
                         shell sandbox's claim holds no session stores and keeps Size or the
@@ -12069,8 +12069,9 @@ spec:
                         - type: string
                       description: |-
                         Size is the request of the <name>-data claim and of the shell sandbox's
-                        data claim. The operator requests the same size for both claims and grows
-                        the sandbox's claim first, so the sandbox mirror fits. A StorageClass or a
+                        data claim. The operator requests the same base size for both and grows
+                        the sandbox's claim first, so the sandbox mirror fits;
+                        expectedClusterProfiles can raise the agent's claim alone. A StorageClass or a
                         quota that refuses the growth of one claim can leave the two claims at
                         different sizes. Absent, the operator default applies (50Gi). Raising it
                         expands both existing claims online where the StorageClass sets

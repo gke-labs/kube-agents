@@ -174,7 +174,8 @@ on a dev fleet:
 | A Cluster Agent profile (10 cards a day, about 25 KB each)     | 291 MiB          | 18.6 MiB               |
 | The Platform Agent's own profile (18 cards a day, 220 KB each) | 3.47 GiB         | not settled by day 300 |
 
-**At the 50Gi default the claim fills at about 176 Cluster Agent profiles.** Set
+**At the 50Gi default the claim fills at about 163 Cluster Agent profiles**, beside the
+Platform Agent's own store. Set
 `platformAgent.storage.expectedClusterProfiles` (CR: `spec.storage.expectedClusterProfiles`)
 to the number of clusters you expect in scope, and the operator sizes the agent's claim to at
 least:

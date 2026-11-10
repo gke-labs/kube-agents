@@ -176,7 +176,7 @@ const (
 	// Re-measure both if the session store or the retention default changes.
 	dataVolumeBaseSize       = "8Gi"
 	perClusterProfileStorage = "400Mi"
-	credentialProxyPort  = 8765
+	credentialProxyPort      = 8765
 	// The Chat consumers' broker env: the project id both carry, the legacy
 	// consumer's subscription name, and the fully qualified subscription
 	// form both consumers' env carries.

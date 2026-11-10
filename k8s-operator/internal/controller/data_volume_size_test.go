@@ -259,6 +259,69 @@ func TestARaisedProfileCountGrowsTheAgentClaimOnly(t *testing.T) {
 	}
 }
 
+// undersizedEvents drains the fake recorder and returns the DataVolumeUndersized
+// Events it holds.
+func undersizedEvents(r *PlatformAgentReconciler) []string {
+	var out []string
+	recorder := r.Recorder.(*record.FakeRecorder)
+	for {
+		select {
+		case event := <-recorder.Events:
+			if strings.Contains(event, dataVolumeUndersizedReason) {
+				out = append(out, event)
+			}
+		default:
+			return out
+		}
+	}
+}
+
+// TestAnUndersizedClaimThatWillNotGrowIsWarnedAboutOnce pins the
+// DataVolumeUndersized Event: an agent claim below the formula's size that the
+// operator does not control, or whose class cannot expand it, gets one Warning
+// that says which, and a second pass in the same state writes none. A claim the
+// operator can grow gets none.
+func TestAnUndersizedClaimThatWillNotGrowIsWarnedAboutOnce(t *testing.T) {
+	cases := []struct {
+		name       string
+		owned      bool
+		expandable bool
+		want       string
+	}{
+		{"a claim made by hand", false, true, dataVolumeUnownedSentence},
+		{"a class that cannot expand", true, false, dataVolumeCannotGrowSentence},
+		{"a claim the operator grows", true, true, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := profileCountAgent("", 200)
+			agentClaim := buildPVC(agent).Name
+			sandboxClaim := shellSandboxDataClaimName(agent)
+			r, cl := sizeFixture(t, agent,
+				storageClass(testStorageClassName, tc.expandable),
+				boundClaim(agent, agentClaim, agentDataStorageSize, testStorageClassName, tc.owned),
+				boundClaim(agent, sandboxClaim, agentDataStorageSize, testStorageClassName, false))
+
+			reconcileOnce(t, r, cl, agent)
+			events := undersizedEvents(r)
+			if tc.want == "" {
+				if len(events) != 0 {
+					t.Fatalf("a claim that grows was warned about: %v", events)
+				}
+				return
+			}
+			if len(events) != 1 || !strings.Contains(events[0], "Warning") || !strings.Contains(events[0], tc.want) ||
+				!strings.Contains(events[0], "87Gi") {
+				t.Fatalf("want one Warning naming 87Gi and %q, got %v", tc.want, events)
+			}
+			reconcileOnce(t, r, cl, agent)
+			if again := undersizedEvents(r); len(again) != 0 {
+				t.Errorf("a second pass in the same state warned again: %v", again)
+			}
+		})
+	}
+}
+
 // TestDataVolumeNotExpandedFollowsTheStorageClass pins the condition: a claim
 // below the field whose class cannot expand it keeps its size and sets
 // DataVolumeNotExpanded with the reason; a class name that is empty or names

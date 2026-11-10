@@ -110,7 +110,9 @@ pods, 4 persistent volume claims totalling 102 GiB of `requests.storage`, and 14
 ephemeral-storage requests against 14,912 MiB of limits. Two of those claims, the agent's data
 claim and the shell sandbox's, are 50 GiB each and follow
 [`spec.storage.size`](/kube-agents/operator/platformagent-crd/#specstorage), so each GiB
-added to it adds 2 GiB of `requests.storage`, and the chart's check counts it. A
+added to it adds 2 GiB of `requests.storage`, and the chart's check counts it.
+[`spec.storage.expectedClusterProfiles`](/kube-agents/operator/platformagent-crd/#specstorage)
+raises the agent's claim alone, and the check counts that too. A
 namespace quota that caps pod or
 claim counts below what the release needs refuses the install the same way; note that
 constraining ephemeral storage additionally requires every container to declare it (or

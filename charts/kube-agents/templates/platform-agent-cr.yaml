@@ -136,7 +136,7 @@ spec:
   {{- end }}
   {{- end }}
   {{- if not (hasKey $specProps "storage") }}
-  {{- fail "platformAgent.storage.size needs a PlatformAgent CRD that has spec.storage, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/, or run upgrade.sh, which does). Otherwise the API server prunes the value silently while the release record keeps it" }}
+  {{- fail "platformAgent.storage.size or platformAgent.storage.expectedClusterProfiles needs a PlatformAgent CRD that has spec.storage, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/, or run upgrade.sh, which does). Otherwise the API server prunes the value silently while the release record keeps it" }}
   {{- end }}
   {{- if and $expectedProfiles (not (hasKey (dig "storage" "properties" (dict) $specProps) "expectedClusterProfiles")) }}
   {{- fail "platformAgent.storage.expectedClusterProfiles needs a PlatformAgent CRD that has spec.storage.expectedClusterProfiles, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/, or run upgrade.sh, which does). Otherwise the API server prunes the value silently while the release record keeps it" }}
