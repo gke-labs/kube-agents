@@ -93,8 +93,9 @@ _A2A_SUBSTITUTIONS = (
     "_A2A_CONSOLE_URI",
     "_A2A_BRIDGE_URI",
     "_A2A_DISPATCHER_URI",
+    "_PERSONA_CLUSTER_URI",
 )
-_A2A_IMAGES = ("a2a-gateway", "a2a-authcallout", "a2a-worker", "a2a-verifier", "a2a-console", "hermes-bridge", "a2a-dispatcher")
+_A2A_IMAGES = ("a2a-gateway", "a2a-authcallout", "a2a-worker", "a2a-verifier", "a2a-console", "hermes-bridge", "a2a-dispatcher", "persona-cluster")
 _A2A_DOCKERFILE_SUFFIXES = ("gateway", "authcallout", "worker", "verifier", "console", "dispatcher")
 _PLATFORM_URI = f"{_AR_REPO}/platform-agent:{_TAG}"
 _FLAG_UNSET_SPELLINGS = (None, "", "0", "true", "yes")
@@ -440,6 +441,19 @@ class FlagSetIsNextTest(unittest.TestCase):
             "--set-string",
             f"operator.extraEnv[10].value={_AR_REPO}/a2a-dispatcher:{_TAG}",
         ]
+        # The profiles' images, at this build: the cluster profile's persona and
+        # worker, and tse's worker. Unset, the chart would take ghcr at the CI tag.
+        for key, image in (
+            ("profiles.cluster.persona", "persona-cluster"),
+            ("profiles.cluster.harness", "a2a-worker"),
+            ("profiles.tse.harness", "a2a-worker"),
+        ):
+            expected += [
+                "--set-string",
+                f"{key}.image.repository={_AR_REPO}/{image}",
+                "--set-string",
+                f"{key}.image.tag={_TAG}",
+            ]
         self.assertEqual(args, expected)
         # Nothing names the executor setting, under any index: set to anything,
         # the operator renders BRIDGE_EXECUTOR and the lane stops measuring the
@@ -904,6 +918,8 @@ class TasksBudgetSizingTest(unittest.TestCase):
         self.assertIn('--set-string "platformAgent.deployment.env[4].name=KUBEAGENTS_AUDIT_AUTO_PROMOTE"', block.group(1))
         self.assertIn('--set-string "platformAgent.deployment.env[4].value=false"', block.group(1))
         self.assertIn('--set "profiles.tse.enabled=true"', block.group(1))
+        # The cluster profile too, which a delegation case reads (#5194).
+        self.assertIn('--set "profiles.cluster.enabled=true"', block.group(1))
         self.assertIn('${MODE_NEXT_ENV_ARGS[@]+"${MODE_NEXT_ENV_ARGS[@]}"}', script)
         root = _CI_DEPLOY.parent.parent
         self.assertIn('envAuditAutoPromote = "KUBEAGENTS_AUDIT_AUTO_PROMOTE"', (root / "k8s-operator/internal/controller/shell_sandbox_manifests.go").read_text())
@@ -1851,6 +1867,10 @@ class BridgeImageBuildTest(unittest.TestCase):
             context = "." if suffix == "worker" else "a2a"
             expected.append(f"docker build --platform linux/amd64 -t {uri} -f a2a/Dockerfile.{suffix} {context}")
             expected.append(f"docker push {uri}")
+        # The cluster persona, from its own directory, as the ghcr workflow builds it.
+        uri = f"{_AR_REPO}/persona-cluster:{_TAG}"
+        expected.append(f"docker build --platform linux/amd64 -t {uri} -f a2a/Dockerfile.persona-cluster agents/cluster/persona")
+        expected.append(f"docker push {uri}")
         self.assertEqual(result.stdout.splitlines(), expected)
 
     def test_the_bridge_step_waits_for_the_platform_image_and_builds_from_it(self) -> None:

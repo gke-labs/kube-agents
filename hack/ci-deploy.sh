@@ -643,6 +643,10 @@ readonly A2A_WORKER_IMAGE_NAME="a2a-worker"
 readonly A2A_VERIFIER_IMAGE_NAME="a2a-verifier"
 readonly A2A_CONSOLE_IMAGE_NAME="a2a-console"
 readonly A2A_DISPATCHER_IMAGE_NAME="a2a-dispatcher"
+# The cluster AgentProfile's persona image (a2a/Dockerfile.persona-cluster,
+# context agents/cluster/persona), built beside the A2A images so the lane runs
+# this tree's persona.
+readonly PERSONA_CLUSTER_IMAGE_NAME="persona-cluster"
 # The bridge image goes to the operator too (A2A_BRIDGE_IMAGE_ENV_VAR), which
 # renders the bridge sidecar from it.
 readonly A2A_BRIDGE_IMAGE_NAME="hermes-bridge"
@@ -787,7 +791,8 @@ A2A_OPERATOR_ENV_ARGS=()
 # workload with a major finding (#3439). spec.deployment.env carries the
 # switch; the operator forwards it to the shell sandbox, where finish runs.
 # It also enables the optional `tse` AgentProfile so `mode: next` eval lanes
-# scaffold `/opt/data/profiles/tse` (#3492). Empty on the today lane, so that
+# scaffold `/opt/data/profiles/tse` (#3492), and the `cluster` one, which the
+# profile dispatcher serves (its images are set with the A2A overrides below). Empty on the today lane, so that
 # release stays byte-for-byte the same.
 # env[3], set on every lane in the install below, turns the broker's proposal
 # readings sweep off (CREDENTIAL_PROXY_VCS_READINGS=off). Its hourly forge
@@ -800,6 +805,7 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     --set-string "platformAgent.deployment.env[4].name=KUBEAGENTS_AUDIT_AUTO_PROMOTE"
     --set-string "platformAgent.deployment.env[4].value=false"
     --set "profiles.tse.enabled=true"
+    --set "profiles.cluster.enabled=true"
   )
 fi
 
@@ -1734,6 +1740,7 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   A2A_CONSOLE_URI="${A2A_IMAGE_PREFIX}/${A2A_CONSOLE_IMAGE_NAME}:${TAG}"
   A2A_BRIDGE_URI="${A2A_IMAGE_PREFIX}/${A2A_BRIDGE_IMAGE_NAME}:${TAG}"
   A2A_DISPATCHER_URI="${A2A_IMAGE_PREFIX}/${A2A_DISPATCHER_IMAGE_NAME}:${TAG}"
+  PERSONA_CLUSTER_URI="${A2A_IMAGE_PREFIX}/${PERSONA_CLUSTER_IMAGE_NAME}:${TAG}"
   A2A_OPERATOR_ENV_ARGS=(
     --set-string "operator.extraEnv[0].name=${A2A_GATEWAY_IMAGE_ENV_VAR}"
     --set-string "operator.extraEnv[0].value=${A2A_GATEWAY_URI}"
@@ -1769,6 +1776,16 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     # operator's registry, as it would the verifier's.
     --set-string "operator.extraEnv[10].name=${A2A_DISPATCHER_IMAGE_ENV_VAR}"
     --set-string "operator.extraEnv[10].value=${A2A_DISPATCHER_URI}"
+    # The profiles' images. Unset, the chart takes each from ghcr at the agent
+    # image's tag, which on this lane is a CI tag ghcr never has, and the
+    # profile's worker never pulls. The cluster profile runs this build's
+    # persona and worker; tse runs this build's worker.
+    --set-string "profiles.cluster.persona.image.repository=${A2A_IMAGE_PREFIX}/${PERSONA_CLUSTER_IMAGE_NAME}"
+    --set-string "profiles.cluster.persona.image.tag=${TAG}"
+    --set-string "profiles.cluster.harness.image.repository=${A2A_IMAGE_PREFIX}/${A2A_WORKER_IMAGE_NAME}"
+    --set-string "profiles.cluster.harness.image.tag=${TAG}"
+    --set-string "profiles.tse.harness.image.repository=${A2A_IMAGE_PREFIX}/${A2A_WORKER_IMAGE_NAME}"
+    --set-string "profiles.tse.harness.image.tag=${TAG}"
   )
 fi
 
@@ -1780,7 +1797,7 @@ fi
 if [ -n "${RC_COMMIT_SHA:-}" ]; then
   echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Skipping image builds: installing published images at ${RC_COMMIT_SHA:0:7} ==="
   if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
-    echo "EVAL_MODE_NEXT=1: the A2A gateway, auth callout, worker, verifier, dispatcher and console images and the Hermes bridge sidecar are the candidate's published ones, from ${A2A_IMAGE_PREFIX}"
+    echo "EVAL_MODE_NEXT=1: the A2A gateway, auth callout, worker, verifier, dispatcher and console images, the cluster persona and the Hermes bridge sidecar are the candidate's published ones, from ${A2A_IMAGE_PREFIX}"
   fi
 else
   STEP_START=$SECONDS
@@ -1813,7 +1830,7 @@ else
     echo "Shadow replay proxy: also building its image"
   fi
   if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
-    A2A_BUILD_SUBSTITUTIONS=",_A2A_GATEWAY_URI=${A2A_GATEWAY_URI},_A2A_CALLOUT_URI=${A2A_CALLOUT_URI},_A2A_WORKER_URI=${A2A_WORKER_URI},_A2A_VERIFIER_URI=${A2A_VERIFIER_URI},_A2A_CONSOLE_URI=${A2A_CONSOLE_URI},_A2A_BRIDGE_URI=${A2A_BRIDGE_URI},_A2A_DISPATCHER_URI=${A2A_DISPATCHER_URI}"
+    A2A_BUILD_SUBSTITUTIONS=",_A2A_GATEWAY_URI=${A2A_GATEWAY_URI},_A2A_CALLOUT_URI=${A2A_CALLOUT_URI},_A2A_WORKER_URI=${A2A_WORKER_URI},_A2A_VERIFIER_URI=${A2A_VERIFIER_URI},_A2A_CONSOLE_URI=${A2A_CONSOLE_URI},_A2A_BRIDGE_URI=${A2A_BRIDGE_URI},_A2A_DISPATCHER_URI=${A2A_DISPATCHER_URI},_PERSONA_CLUSTER_URI=${PERSONA_CLUSTER_URI}"
     echo "EVAL_MODE_NEXT=1: also building the A2A gateway, auth callout, worker, verifier, dispatcher and console images and the Hermes bridge sidecar"
   fi
   # Submitted asynchronously and polled, never streamed (#3129). Without

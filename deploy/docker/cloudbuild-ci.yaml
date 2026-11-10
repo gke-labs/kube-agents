@@ -225,6 +225,9 @@ steps:
   # which copies the credential broker's shim client from agents/platform/scripts - each
   # Dockerfile's header says which. One step rather than six: they share the Go
   # module download layer, which the daemon serves to the ones after the first.
+  # The cluster AgentProfile's persona (a2a/Dockerfile.persona-cluster, context
+  # agents/cluster/persona, as docker-publish-ghcr.yml builds it) rides along:
+  # a busybox image with one COPY, so it adds seconds, not minutes.
   # Nothing here depends on the platform image, so the step starts at once,
   # like sandbox and operator; the bridge, which does, is the step after.
   #
@@ -257,6 +260,8 @@ steps:
         build_and_push verifier "$_A2A_VERIFIER_URI" a2a
         build_and_push console "$_A2A_CONSOLE_URI" a2a
         build_and_push dispatcher "$_A2A_DISPATCHER_URI" a2a
+        # The cluster profile's persona: busybox and the persona directory.
+        build_and_push persona-cluster "$_PERSONA_CLUSTER_URI" agents/cluster/persona
 
   # The Hermes bridge sidecar (a2a/Dockerfile.hermes-bridge), under the same
   # flag and the same no-op rule. It is FROM the platform-agent image of THIS
@@ -365,6 +370,7 @@ substitutions:
   _A2A_CONSOLE_URI: ""
   _A2A_BRIDGE_URI: ""
   _A2A_DISPATCHER_URI: ""
+  _PERSONA_CLUSTER_URI: ""
   # Empty means the replay-shadow-proxy step is a no-op; hack/ci-deploy.sh sets
   # it under EVAL_REPLAY_SHADOW=true.
   _REPLAY_SHADOW_PROXY_URI: ""
