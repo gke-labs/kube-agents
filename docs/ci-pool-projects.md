@@ -559,6 +559,24 @@ lane's plumbing: the deploy refusing `EVAL_MODE_NEXT=1` because the job's name i
 that is also a presubmit or nightly case; a lease that never came (the pool reading in the job's pull request is why the slot is Saturday morning). An overdue note with no failed build means the
 Saturday run did not start: check the cron in the job and whether horologium created a run.
 
+### 5.10 The replay lane
+
+`ci-kube-agents-eval-replay-lane` in `oss-test-infra` (`kube-agents-periodics.yaml`) runs daily at
+06:00 UTC with the nightlies' identity, decoration and log bucket
+(`gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-replay-lane/`). It replays the
+model answers the next-mode nightlies recorded to the replay cache bucket (section 3) on `main`,
+gates nothing and publishes no dashboard data: its report (served share and each replayed
+conversation's verdict against its recording's) is in the shadow bucket under
+`replay-shadow/replay-lane/<YYYY-MM-DD>/<build>/report/`, and its summary lines are in the job's
+`replay-shadow-collector.log`. ci-health watches the job
+([the watched periodics](ci-health.md#the-watched-periodics)), so a failed or stale run is a
+health note and a digest line. It stops red before its cases when the cache gives it nothing: no
+answer arrived, a key was refused, the records could not be listed, or no live proxy pod took the
+cache. The download's summary line in the job log names which, and
+[`hack/replay-proxy/README.md`](../hack/replay-proxy/README.md#record-and-replay-the-replay-lane)
+explains each. A first red after a change to `hack/replay-proxy/normalizer.py` is expected until a
+nightly has recorded under the new normalizer version.
+
 ## 6. The seeded dirty fleet
 
 Six of the evaluation scenarios assert on defects that were planted on purpose — a crashlooping `payments-api`, a workload with no PodDisruptionBudget, an idle node pool, a control plane held a minor behind, a cluster missing master authorized networks. Those fixtures are not provisioned per run. They live on four small standing GKE clusters, `seeded-a` to `seeded-d`, and **each pool project needs its own set**: Boskos leases at random, so a project without them is a project where every fleet check reports `status: "error"` and `VerificationCoverage` drops below 1.0 for that run.

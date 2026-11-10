@@ -528,7 +528,9 @@ rule existed they reported nowhere but TestGrid: `ci-kube-agents-pull-sweep`
 reconcile, as a postsubmit on every merge that changes the stack and as a
 daily pass over every project. A fourth, `ci-kube-agents-certification-1`, is
 not a pool job but the certification lane's weekly slice, watched here because
-its record is its logs bucket and nothing else reads a failed build of it. `scripts/eval_dashboard/periodics.py` lists them in `WATCHED`, one entry
+its record is its logs bucket and nothing else reads a failed build of it. A fifth,
+`ci-kube-agents-eval-replay-lane`, is the inference-replay lane, watched for the same reason: it
+gates nothing and publishes no dashboard data. `scripts/eval_dashboard/periodics.py` lists them in `WATCHED`, one entry
 per job with its label, its stale window, the report it writes, and the words
 its messages are built from, so adding the next periodic is one entry. The 15-minute tick's `Fetch the watched periodics'
 latest builds` step reads each job's `latest-build.txt` from

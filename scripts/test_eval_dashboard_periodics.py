@@ -1048,7 +1048,8 @@ class WorkflowWiring(unittest.TestCase):
         # can check; a rename there is a rename here.
         self.assertEqual(
             [p.job for p in periodics.WATCHED],
-            ["ci-kube-agents-pull-sweep", "ci-kube-agents-fleet-reconcile-daily", "post-kube-agents-fleet-reconcile", "ci-kube-agents-certification-1"],
+            ["ci-kube-agents-pull-sweep", "ci-kube-agents-fleet-reconcile-daily", "post-kube-agents-fleet-reconcile", "ci-kube-agents-certification-1",
+             "ci-kube-agents-eval-replay-lane"],
         )
         for periodic in periodics.WATCHED:
             self.assertTrue(periodic.stale_after is None or periodic.stale_after >= timedelta(hours=1))

@@ -222,6 +222,10 @@ CERTIFICATION_SLICE_JOB = "ci-kube-agents-certification-1"
 # A week between runs, plus a day: a Saturday run that never started (no
 # cron fire, no lease) reads STALE on the Sunday, one tick after the slot.
 CERTIFICATION_STALE_AFTER = timedelta(days=8)
+# The inference-replay lane (oss-test-infra: kube-agents-periodics.yaml),
+# daily at 06:00 UTC; a day and a half, as for the daily reconcile.
+REPLAY_LANE_JOB = "ci-kube-agents-eval-replay-lane"
+REPLAY_LANE_STALE_AFTER = timedelta(hours=36)
 RECONCILE_POSTSUBMIT_JOB = "post-kube-agents-fleet-reconcile"
 # A watched job whose failed build is retired by another job's later pass:
 # the postsubmit has no window, and the daily that followed it did its work.
@@ -369,6 +373,17 @@ WATCHED = (
         "runs weekly on Saturday 14:00 UTC and on Rerun, grading part 1 of hack/eval/certification-cases.txt at 60 repetitions against the newest GA release on a leased pool project",
         "the certified-capabilities page's suite tests stop accruing runs, and a forbidden write or an unrun check on the lane is a failed build nobody reads.",
         f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#59-the-certification-lane",
+        logs_root=EVAL_NIGHTLY_LOGS_ROOT,
+    ),
+    # The inference-replay lane: it gates nothing and publishes no dashboard
+    # data, so a red run (nothing to replay, a refused key, a proxy pod that
+    # did not take the cache) reaches a person only through this note.
+    Periodic(
+        REPLAY_LANE_JOB, "inference replay lane", REPLAY_LANE_STALE_AFTER, None,
+        "Inference replay lane", "the replay lane is not measuring replay", "the replay lane is measuring replay again",
+        "runs daily at 06:00 UTC and replays the next-mode nightlies' recorded model answers on main, reporting the served share and verdict agreement under replay-shadow/replay-lane/",
+        "replay's hit rate and verdict agreement stop being measured, and a nightly that stopped recording, or a normalizer change no night has recorded under, goes unseen.",
+        f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#510-the-replay-lane",
         logs_root=EVAL_NIGHTLY_LOGS_ROOT,
     ),
 )
