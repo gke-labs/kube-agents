@@ -2724,6 +2724,79 @@ class C5PrivilegedControllersAreBounded(unittest.TestCase):
     #   system:auth-delegator, which carries subjectaccessreviews too.
     WRITE_CAPABLE_ROLE_PREFIXES = ("kubeagents:leader:", "kubeagents:tokenreview:")
 
+    # The two halves of the operator's Secret grant. The reads are the
+    # ClusterRole's: escalation prevention needs the operator to hold what the
+    # agent's `minimal` role grants. The writes are the namespaced Role's:
+    # by-name writes in one namespace are the whole grant.
+    OPERATOR_SECRET_READ_VERBS = frozenset({"get", "list", "watch"})
+    OPERATOR_SECRET_WRITE_VERBS = frozenset({"create", "update", "patch", "delete"})
+
+    def test_C5_the_operators_secret_grant_is_namespaced(self) -> None:
+        """The operator writes Secrets in its install namespace and nowhere else.
+
+        The operator is the most privileged identity an install puts on a
+        cluster, and the Secret write verbs on its ClusterRole were the rule
+        that made it cluster-admin in effect: `create`, `update`, `patch` and
+        `delete` on every Secret in every namespace is every ServiceAccount
+        token and every credential on the cluster. Every Secret the operator
+        writes is in the namespace of the PlatformAgent it reconciles, so the
+        write verbs are a Role there. The reads stay cluster-wide, because the
+        agent's `minimal` ClusterRole grants them and the API server refuses a
+        grant the grantor does not hold; the operator itself reads by name.
+
+        Asserted on both delivery paths, as the refusal rather than the
+        presence of the control: no ClusterRole in `role.yaml` or in the
+        chart's RBAC template grants a Secret verb beyond the three reads, or
+        a wildcard that reaches it, and the one Role that names `secrets`
+        carries exactly the four write verbs. The positive half keeps the test
+        from passing on an operator that lost the grant altogether, which
+        would be a different bug.
+        """
+
+        def secret_rules(role: dict) -> list[dict]:
+            return [
+                rule
+                for rule in role.get("rules") or []
+                if "secrets" in (rule.get("resources") or [])
+                or "*" in (rule.get("resources") or [])
+            ]
+
+        for source, documents in (
+            ("operator_clusterrole", h.yaml_documents("operator_clusterrole")),
+            ("chart_operator_rbac", h.helm_documents("chart_operator_rbac")),
+        ):
+            with self.subTest(source=source):
+                cluster_roles = h.objects_of_kind(documents, "ClusterRole")
+                self.assertTrue(cluster_roles, f"{source} renders no ClusterRole")
+                for role in cluster_roles:
+                    for rule in secret_rules(role):
+                        self.assertNotIn("*", rule.get("resources") or [])
+                        self.assertTrue(
+                            set(rule.get("verbs") or []) <= self.OPERATOR_SECRET_READ_VERBS,
+                            f"{source}: ClusterRole {role['metadata']['name']} grants "
+                            f"{sorted(set(rule.get('verbs') or []) - self.OPERATOR_SECRET_READ_VERBS)} on secrets "
+                            "cluster-wide; the write verbs belong in the namespaced Role",
+                        )
+                granting = [
+                    (role, secret_rules(role))
+                    for role in h.objects_of_kind(documents, "Role")
+                    if secret_rules(role)
+                ]
+                self.assertEqual(
+                    1,
+                    len(granting),
+                    f"{source}: expected exactly one namespaced Role granting secrets, "
+                    f"found {[r['metadata']['name'] for r, _ in granting]}",
+                )
+                role, rules = granting[0]
+                self.assertTrue(
+                    role["metadata"].get("namespace"),
+                    f"{source}: the Role granting secrets carries no namespace",
+                )
+                self.assertEqual(1, len(rules), f"{source}: secrets appear in more than one rule")
+                self.assertEqual(["secrets"], rules[0].get("resources"))
+                self.assertEqual(self.OPERATOR_SECRET_WRITE_VERBS, set(rules[0].get("verbs") or []))
+
     def test_C5_no_minted_role_grants_a_write_verb(self) -> None:
         """The agent-side half of A2's intersection, asserted on rendered output.
 

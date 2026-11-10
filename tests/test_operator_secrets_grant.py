@@ -1,6 +1,7 @@
 """The operator's `secrets` grant, and the ceiling on it.
 
-Five callers need a Secret verb on `manager-role`:
+Five callers need a Secret verb on the manager role, and the grant is split in
+two documents of `role.yaml` by what they do:
 
 - `checkShellSandboxKeys` needs `get`. It asks whether the sandbox's
   authorized-keys Secret exists so the CR can say so, because that Secret is the
@@ -13,38 +14,50 @@ Five callers need a Secret verb on `manager-role`:
   (`k8s-operator/internal/controller/platformagent_secret_hash.go`). Which
   Secrets it reads is decided by the rendered pod spec, so a CR- or
   plugin-supplied `SecretKeyRef` is covered. Every read is by name and uncached.
+- `buildMinimalPlatformRole` grants `get`/`list`/`watch` on `secrets` to
+  `kubeagents:minimal:<ns>:<name>` so `<agent>-kube-proxy` can read `Secret`
+  objects and serve redacted metadata (`KUBE_PROXY_REDACT_SECRETS=true`).
+  Kubernetes RBAC escalation prevention requires the operator to hold
+  `get`/`list`/`watch` on `secrets` cluster-wide before it can grant those
+  verbs on a managed `ClusterRole`.
+- `ensureKubeProxyTLSSecret` needs `create` and `update` to manage the
+  `<agent>-kube-proxy-tls` Secret on every install.
 - The `mode: next` A2A render needs `create`/`update`/`patch`/`delete`. The
   operator generates the NATS credential Secret once and repairs a missing key,
   renders the config Secret, and deletes the config Secret on the way back to
   `today`; all of them are owner-referenced to the `PlatformAgent`.
-- `ensureKubeProxyTLSSecret` needs `get`/`create`/`update` to manage the
-  `<agent>-kube-proxy-tls` Secret.
-- `buildMinimalPlatformRole` grants `get`/`list`/`watch` on `secrets` to
-  `kubeagents:minimal:<ns>:<name>` so `<agent>-kube-proxy` can read `Secret`
-  objects and serve redacted metadata (`KUBE_PROXY_REDACT_SECRETS=true`).
-  Kubernetes RBAC escalation prevention requires `manager-role` to hold
-  `get`/`list`/`watch` on `secrets` before it can grant those verbs on a
-  managed `ClusterRole`.
 
-Even though `manager-role` holds `list` and `watch` for RBAC escalation
-prevention, the operator itself must never list or watch `Secret` objects:
-every controller Secret read goes by name through `a2aReader()`, and
+The three read verbs are the ClusterRole document: they are held cluster-wide
+because the agent's audit ClusterRole grants them and the API server refuses a
+grant the grantor does not hold. The four write verbs are the namespaced `Role`
+document: every write names a Secret in the namespace of the PlatformAgent
+being reconciled, so the `+kubebuilder:rbac` marker carries `namespace=`,
+controller-gen renders it as the second document in `role.yaml`, and the
+ClusterRole document carries no Secret write verb. That shape is what this file
+pins. A write verb that reappears in the ClusterRole is write of every Secret on
+the cluster, which is the cluster-admin-equivalent grant the namespacing exists
+to remove.
+
+Even though the ClusterRole holds `list` and `watch` for escalation prevention,
+the operator itself must never list or watch `Secret` objects: every controller
+Secret read goes by name through `a2aReader()`, and
 `test_the_operator_never_watches_or_lists_secrets_in_controller_code` below
 forbids `&corev1.SecretList`, `Owns(&corev1.Secret`, and
 `Watches(&corev1.Secret` in controller Go files.
 
-Trivy's KSV-0041 flags any Secret verb on a ClusterRole as CRITICAL, and its
-ignore file has no way to scope an exemption to one rule -- `paths` globs are
+Trivy's KSV-0041 flags any Secret verb on a Role or ClusterRole as CRITICAL, and
+its ignore file has no way to scope an exemption to one rule -- `paths` globs are
 the whole vocabulary -- so exempting this grant exempts `k8s-operator/config/rbac/`
 and the rendered golden fixtures in
 `k8s-operator/internal/testing/testdata/platform/expected/`. That is the check
-this file replaces: it pins the verb set and `+kubebuilder:rbac` marker, forbids
-controller `Secret` list/watch calls, and fails if the Trivy exemption widens
-past those two directories.
+this file replaces: it pins the verb set of each document and the two
+`+kubebuilder:rbac` markers, forbids controller `Secret` list/watch calls, and
+fails if the Trivy exemption widens past those two directories.
 
-`charts/kube-agents/templates/operator-rbac.yaml` is not read here: it is
-spliced from `role.yaml` by `hack/sync-chart-manifests.sh`, and `make
-chart-check` is what holds the two together.
+`charts/kube-agents/templates/operator-rbac.yaml` is not read here: both of its
+generated blocks are spliced from `role.yaml` by `hack/sync-chart-manifests.sh`,
+and `make chart-check` is what holds the two together. The conformance suite's
+C5 test reads the chart as well.
 
 Run:
   python3 -m unittest discover -s tests -p 'test_operator_secrets_grant.py' -v
@@ -74,37 +87,100 @@ DISALLOW_SECRETS_GUARD = (
 )
 CORE_API_GROUP = ""
 SECRETS_RESOURCE = "secrets"
-PERMITTED_SECRET_VERBS = {"get", "list", "watch", "create", "update", "patch", "delete"}
+WILDCARD = "*"
+CLUSTER_ROLE_KIND = "ClusterRole"
+ROLE_KIND = "Role"
+# The ClusterRole half: what escalation prevention needs the operator to hold.
+CLUSTER_SECRET_VERBS = {"get", "list", "watch"}
+# The Role half: what the operator writes, in the install namespace only.
+NAMESPACED_SECRET_VERBS = {"create", "update", "patch", "delete"}
+# One marker per document; both name `secrets` alone.
+SECRET_MARKER_COUNT = 2
 CONTROLLER_DIR = REPO_ROOT / "k8s-operator" / "internal" / "controller"
 IGNORE_PATH = REPO_ROOT / ".trivyignore.yaml"
 SECRETS_MISCONFIG_ID = "KSV-0041"
 
 
-def _secret_rules() -> list[dict]:
-    role = yaml.safe_load(ROLE_PATH.read_text(encoding="utf-8"))
+def _documents() -> list[dict]:
+    return [
+        doc
+        for doc in yaml.safe_load_all(ROLE_PATH.read_text(encoding="utf-8"))
+        if isinstance(doc, dict)
+    ]
+
+
+def _of_kind(kind: str) -> list[dict]:
+    return [doc for doc in _documents() if doc.get("kind") == kind]
+
+
+def _cluster_role(test: unittest.TestCase) -> dict:
+    cluster_roles = _of_kind(CLUSTER_ROLE_KIND)
+    test.assertEqual(len(cluster_roles), 1, f"expected one ClusterRole in {ROLE_PATH}, found {len(cluster_roles)}")
+    return cluster_roles[0]
+
+
+def _namespaced_role(test: unittest.TestCase) -> dict:
+    # Asserted, not indexed: against a role.yaml with no Role document the
+    # failure should read as the missing grant, not as an IndexError.
+    roles = _of_kind(ROLE_KIND)
+    test.assertEqual(len(roles), 1, f"expected one namespaced Role in {ROLE_PATH}, found {len(roles)}")
+    return roles[0]
+
+
+def _secret_rules(doc: dict) -> list[dict]:
     return [
         rule
-        for rule in role.get("rules", [])
+        for rule in doc.get("rules", [])
         if SECRETS_RESOURCE in (rule.get("resources") or [])
+        or WILDCARD in (rule.get("resources") or [])
     ]
 
 
 class OperatorSecretsGrantTest(unittest.TestCase):
-    def test_secrets_are_granted_in_exactly_one_rule(self):
-        rules = _secret_rules()
+    def test_the_cluster_role_grants_no_secret_write_verb(self):
+        # The invariant the namespacing exists for: a write verb on `secrets`
+        # in the ClusterRole, or a wildcard that would reach it, is write of
+        # every Secret on the cluster whatever namespace the operator works in.
+        rules = _secret_rules(_cluster_role(self))
         self.assertEqual(
             len(rules),
             1,
-            f"expected one rule naming {SECRETS_RESOURCE}, found {len(rules)}: {rules}",
+            f"expected one ClusterRole rule naming {SECRETS_RESOURCE}, found {len(rules)}: {rules}",
         )
+        self.assertNotIn(WILDCARD, rules[0].get("resources") or [])
+        self.assertEqual(
+            set(rules[0].get("verbs") or []),
+            CLUSTER_SECRET_VERBS,
+            "the operator's ClusterRole carries a Secret verb beyond the reads escalation "
+            "prevention needs; the write verbs belong in the namespaced Role (marker with namespace=)",
+        )
+        self.assertEqual(rules[0].get("apiGroups"), [CORE_API_GROUP])
 
-    def test_the_secret_verbs_are_exactly_the_permitted_set(self):
-        rule = _secret_rules()[0]
-        self.assertEqual(set(rule.get("verbs") or []), PERMITTED_SECRET_VERBS)
-        self.assertEqual(rule.get("apiGroups"), [CORE_API_GROUP])
+    def test_the_write_verbs_are_granted_in_exactly_one_namespaced_rule(self):
+        role = _namespaced_role(self)
+        self.assertTrue(
+            role.get("metadata", {}).get("namespace"),
+            "the Role document carries no namespace; controller-gen writes one from the marker",
+        )
+        rules = _secret_rules(role)
+        self.assertEqual(
+            len(rules),
+            1,
+            f"expected one Role rule naming {SECRETS_RESOURCE}, found {len(rules)}: {rules}",
+        )
+        self.assertEqual(set(rules[0].get("verbs") or []), NAMESPACED_SECRET_VERBS)
+        self.assertEqual(rules[0].get("apiGroups"), [CORE_API_GROUP])
+
+    def test_the_namespaced_rule_names_no_other_resource(self):
+        # A verb set is only a ceiling for the resources it is attached to.
+        # Folding `secrets` into a rule that also names, say, `configmaps` would
+        # keep the verbs as they are and still widen what a later verb addition
+        # reaches.
+        rule = _secret_rules(_namespaced_role(self))[0]
+        self.assertEqual(rule.get("resources"), [SECRETS_RESOURCE])
 
     def test_the_operator_never_watches_or_lists_secrets_in_controller_code(self):
-        # `list` and `watch` are held on `manager-role` only so the operator
+        # `list` and `watch` are held on the ClusterRole only so the operator
         # passes Kubernetes RBAC escalation prevention when reconciling
         # `buildMinimalPlatformRole` (which grants `get`/`list`/`watch` on
         # `secrets` to `<agent>-kube-proxy`, where Secret payloads are stripped).
@@ -135,22 +211,29 @@ class OperatorSecretsGrantTest(unittest.TestCase):
                 f"{go_file.name} watches Secrets via WatchesMetadata(&corev1.Secret...); operator must not start a Secret informer",
             )
 
-    def test_the_secrets_marker_names_no_other_resource(self):
+    def test_the_secrets_markers_name_no_other_resource(self):
         # controller-gen merges rules with identical apiGroups and verbs in
-        # role.yaml, so check the +kubebuilder:rbac marker in
-        # platformagent_controller.go directly to ensure `secrets` stays on its
-        # own marker line and is never folded into another resource's marker.
-        rule = _secret_rules()[0]
-        self.assertNotIn("*", rule.get("resources") or [])
+        # role.yaml (the read rule lands beside nodes and namespaces), so check
+        # the +kubebuilder:rbac markers in platformagent_controller.go directly:
+        # `secrets` stays on its own two marker lines, one cluster-scoped for
+        # the reads and one with `namespace=` for the writes, and is never
+        # folded into another resource's marker.
         controller_src = (CONTROLLER_DIR / "platformagent_controller.go").read_text(encoding="utf-8")
         secret_markers = [
             line.strip()
             for line in controller_src.splitlines()
-            if "+kubebuilder:rbac:" in line and "secrets" in line
+            if "+kubebuilder:rbac:" in line and SECRETS_RESOURCE in line
         ]
-        self.assertEqual(len(secret_markers), 1)
+        self.assertEqual(len(secret_markers), SECRET_MARKER_COUNT, secret_markers)
         for marker in secret_markers:
-            self.assertIn("resources=secrets,", marker, f"secrets marker shares resources: {marker}")
+            self.assertIn(f"resources={SECRETS_RESOURCE},", marker, f"secrets marker shares resources: {marker}")
+        namespaced = [marker for marker in secret_markers if "namespace=" in marker]
+        self.assertEqual(len(namespaced), 1, f"expected one namespaced secrets marker, found {namespaced}")
+        for verb in NAMESPACED_SECRET_VERBS:
+            self.assertIn(verb, namespaced[0])
+        cluster_wide = [marker for marker in secret_markers if "namespace=" not in marker]
+        for verb in NAMESPACED_SECRET_VERBS:
+            self.assertNotIn(verb, cluster_wide[0], f"the cluster-wide secrets marker carries a write verb: {cluster_wide[0]}")
 
     def test_the_trivy_exemption_stays_scoped_to_the_expected_directories(self):
         ignores = yaml.safe_load(IGNORE_PATH.read_text(encoding="utf-8"))

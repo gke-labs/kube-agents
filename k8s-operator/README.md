@@ -351,7 +351,12 @@ When modifying or deprecating RBAC roles or rolebindings in the operator:
    ServiceAccount and deletes any non-canonical `kubeagents*` binding.
 3. **Sync controller RBAC annotations:** make sure the `// +kubebuilder:rbac` markers on the
    reconciler include every permission the operator itself needs to grant or clean up, then run
-   `make manifests` to regenerate `config/rbac/role.yaml`.
+   `make manifests` to regenerate `config/rbac/role.yaml`. A marker that carries `namespace=`
+   renders as the Role document in that file (bound by `namespaced_role_binding.yaml`) rather
+   than into the ClusterRole; the Secret write verbs are the one such marker, and
+   `tests/test_operator_secrets_grant.py` refuses them anywhere else. Add the verbs to
+   `requiredPermissions` in `rbac_selfcheck.go` too, with `Namespaced: true` for a namespaced
+   marker, then `make chart-sync` to copy both documents into the chart.
 
 ---
 

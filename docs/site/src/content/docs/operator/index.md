@@ -179,9 +179,9 @@ refusals among them. Re-apply with `make deploy IMG=$IMG` once the cause is fixe
 
 ## An image ahead of its ClusterRole
 
-The webhook port above is one instance of a general skew: `make deploy` ships the ClusterRole with
-the image, and only when it is re-run. A controller deployed from a floating tag such as `:latest`
-is upgraded on its next pod reschedule while the applied ClusterRole stays put, and the first verb
+The webhook port above is one instance of a general skew: `make deploy` ships the operator's RBAC objects
+with the image, and only when it is re-run. A controller deployed from a floating tag such as `:latest`
+is upgraded on its next pod reschedule while the applied roles stay put, and the first verb
 the newer controller needs that the older role lacks fails every reconcile with `forbidden`.
 Two things say so.
 
