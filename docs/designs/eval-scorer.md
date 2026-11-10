@@ -1119,7 +1119,9 @@ fan-out, as before. `bench-gate record --recorded-manifest` (the `baseline-recor
 keeps that pass from appending a case twice, and the EXIT trap's `report_partial_verdict` tables the
 graded cases into `eval-verdict.md` under a PARTIAL banner and prints a cut-off line that is
 deliberately not a verdict line, so the Nightly report counts the cases and still calls the night
-truncated. The presubmit grades per case too and gets the same table on a deadline kill; its store
+truncated. The presubmit grades per case too and gets the same table on a deadline kill, holding
+the cases graded before the SIGTERM: on a presubmit or batch run the TERM trap stops the stackless
+units and scales LiteLLM to zero at once, since a cancelled run's verdict is discarded. Its store
 stays read-only, as `PULL_NUMBER` and the viewer-only identity already guarantee.
 
 Whether the shared `prowjob-default-sa` or a dedicated identity should hold the bucket grants is
