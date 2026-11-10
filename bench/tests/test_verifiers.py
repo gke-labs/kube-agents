@@ -35,13 +35,17 @@ The load-bearing properties, in rough order of what they cost if wrong:
 
 from __future__ import annotations
 
+import http.client
 import io
 import json
 import os
 import re
+import socket
+import ssl
 import tempfile
 import time
 import tomllib
+import urllib.error
 from datetime import datetime, timezone
 import sys
 from pathlib import Path
@@ -51,11 +55,11 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from devops_bench.verification.base import VERIFIERS
+from devops_bench.verification.base import VERIFIERS, VerificationResult
 from devops_bench.verification.runner import VerifierAgent
 from devops_bench.verification.spec import VerificationEntry, parse_node
 
-from kube_agents_bench import fleet, transcript, verifiers
+from kube_agents_bench import fleet, forges, transcript, verifiers
 from kube_agents_bench.verifiers import (
     WorkerAgentsVerifier,
     WorkerBudgetVerifier,
@@ -3724,6 +3728,16 @@ def github(monkeypatch):
     return type("GH", (), {"routes": routes, "calls": calls})()
 
 
+@pytest.fixture
+def minted_token(monkeypatch, tmp_path):
+    """The grading token as CI hands it over: the ledger App's, in the renewed file."""
+    minted = tmp_path / "ledger-token"
+    minted.write_text("ghs_fake\n")
+    monkeypatch.setenv(forges.GITHUB_TOKEN_FILE_ENV_VAR, str(minted))
+    monkeypatch.delenv("BENCH_GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+
+
 def _api(number: int = 42, repo: str = "kube-agents-evals-infra") -> str:
     return f"https://api.github.com/repos/gke-agentic/{repo}/issues/{number}"
 
@@ -6491,6 +6505,186 @@ def test_unreadable_commits_of_the_second_proposal_are_an_error(token, github):
     assert "listing the commits of" in res.reason
     assert "pull_requests: read" in res.reason
     assert _closed_from() in [url for url, _ in github.calls]
+
+
+# #5222: a read of the spent-branch check that the forge failed transiently
+# marks the check's error, so scoring can grade it as infrastructure; a read
+# the forge answered about the run, or refused for the credential, does not.
+@pytest.mark.parametrize(
+    "answer",
+    [
+        (503, {"message": "Service Unavailable"}),
+        (429, {"message": "Too Many Requests"}),
+        (403, {"message": "API rate limit exceeded for installation ID 1."}),
+        (403, {"message": "You have exceeded a secondary rate limit."}),
+        urllib.error.URLError(TimeoutError("timed out")),
+        TimeoutError("The read operation timed out"),
+        ConnectionResetError("Connection reset by peer"),
+    ],
+    ids=["503", "429", "primary-rate-limit-403", "secondary-rate-limit-403", "url-timeout", "timeout", "reset"],
+)
+def test_a_spent_branch_read_the_forge_failed_marks_the_error(minted_token, github, answer):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    github.routes[_pr_api("pulls")] = (200, _pr_payload(as_issue=False))
+    github.routes[_closed_from()] = (200, [_closed_six()])
+    if isinstance(answer, OSError):
+        def fail():
+            raise answer
+
+        github.routes[_commits_of()] = fail
+    else:
+        github.routes[_commits_of()] = answer
+    res = _pr_check(reuses_spent_branch=True).verify(5.0)
+    assert res.status == "error"
+    assert res.reason.startswith(forges.FORGE_UNAVAILABLE_MARKER + " (")
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        (403, {"message": "Resource not accessible by integration"}),
+        (401, {"message": "Bad credentials"}),
+        (422, {"message": "Validation Failed"}),
+        urllib.error.URLError(ssl.SSLCertVerificationError("certificate verify failed")),
+        OSError("BENCH_FORGE=svn names no forge this harness grades"),
+    ],
+    ids=["permission-403", "401", "422", "certificate", "configuration"],
+)
+def test_a_spent_branch_read_refused_for_any_other_reason_leaves_the_error_plain(minted_token, github, answer):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    github.routes[_pr_api("pulls")] = (200, _pr_payload(as_issue=False))
+    github.routes[_closed_from()] = (200, [_closed_six()])
+    if isinstance(answer, OSError):
+        def fail():
+            raise answer
+
+        github.routes[_commits_of()] = fail
+    else:
+        github.routes[_commits_of()] = answer
+    res = _pr_check(reuses_spent_branch=True).verify(5.0)
+    assert res.status == "error"
+    assert forges.FORGE_UNAVAILABLE_MARKER not in res.reason
+
+
+class _NotingCheck:
+    """A check that notes the given reads and returns what it is given."""
+
+    def __init__(self, status, note=True, also_plain=False):
+        self.status, self.note, self.also_plain = status, note, also_plain
+
+    @verifiers._marks_forge_unavailable
+    def verify(self, timeout_sec):
+        if self.note:
+            verifiers._note_forge_read(True, "answered 503")
+        if self.also_plain:
+            verifiers._note_forge_read(False, "answered 403")
+        return VerificationResult(success=self.status == "pass", status=self.status, reason="the check's own reason", elapsed_time=0.0)
+
+
+def test_one_read_that_failed_for_another_reason_keeps_the_error_plain():
+    """A 503 on one candidate and a permission 403 on another: the error may be the 403's."""
+    assert _NotingCheck("error", also_plain=True).verify(5.0).reason == "the check's own reason"
+
+
+@pytest.mark.parametrize(
+    "status, note, marked",
+    [("error", True, True), ("error", False, False), ("fail", True, False), ("pass", True, False)],
+)
+def test_only_an_error_after_a_transient_read_is_marked(status, note, marked):
+    """A pass or a fail was decided on what did answer; an error with no such read is plain."""
+    res = _NotingCheck(status, note).verify(5.0)
+    assert res.status == status
+    assert res.reason.endswith("the check's own reason")
+    assert res.reason.startswith(forges.FORGE_UNAVAILABLE_MARKER) is marked
+
+
+class _TwoCandidates:
+    """pull_request_opened's shape: each candidate unresolved, A on a 503."""
+
+    def __init__(self, b_reads_503):
+        self.b_reads_503 = b_reads_503
+
+    @verifiers._marks_forge_unavailable
+    def verify(self, timeout_sec):
+        unresolved = verifiers._UnresolvedCandidates()
+        unresolved.begin()
+        verifiers._note_forge_read(True, "answered 503")
+        unresolved.append("A: unexpected GitHub response 503")
+        unresolved.begin()
+        if self.b_reads_503:
+            verifiers._note_forge_read(True, "answered 502")
+        unresolved.append("B: GitHub returned no head ref")
+        return VerificationResult(success=False, status="error", reason="; ".join(unresolved), elapsed_time=0.0)
+
+
+@pytest.mark.parametrize("b_reads_503, marked", [(False, False), (True, True)])
+def test_a_candidate_unevaluable_without_a_failed_read_keeps_the_error_plain(b_reads_503, marked):
+    """B's malformed answer is not an outage: A's 503 must not excuse it."""
+    assert _TwoCandidates(b_reads_503).verify(5.0).reason.startswith(forges.FORGE_UNAVAILABLE_MARKER) is marked
+
+
+def test_a_read_outside_a_check_notes_nothing():
+    verifiers._note_forge_read(True, "answered 503")
+    assert verifiers._forge_unavailable.get() is None
+    assert _NotingCheck("error", note=False).verify(5.0).reason == "the check's own reason"
+
+
+@pytest.mark.parametrize(
+    "raised, cause, transient",
+    [
+        (OSError("RemoteDisconnected: Remote end closed connection without response"),
+         http.client.RemoteDisconnected("closed"), True),
+        (OSError("IncompleteRead: IncompleteRead(10 bytes read)"), http.client.IncompleteRead(b"0" * 10), True),
+        (OSError("InvalidURL: nonnumeric port: 'abc'"), http.client.InvalidURL("nonnumeric port: 'abc'"), False),
+        (urllib.error.URLError(socket.gaierror(8, "nodename nor servname provided")), None, False),
+        (urllib.error.URLError(ConnectionRefusedError(61, "Connection refused")), None, False),
+        (ConnectionRefusedError(61, "Connection refused"), None, False),
+        (urllib.error.URLError(ssl.SSLCertVerificationError("certificate verify failed")), None, False),
+    ],
+    ids=["remote-disconnected", "incomplete-read", "invalid-url", "dns", "refused-url", "refused", "certificate"],
+)
+def test_which_transport_failures_are_transient(raised, cause, transient):
+    def fake(url, tok, timeout):
+        if cause is not None:
+            raise raised from cause
+        raise raised
+
+    seen: list[tuple[bool, str]] = []
+    token = verifiers._forge_unavailable.set(seen)
+    try:
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(verifiers, "_http_get_json", fake)
+            with pytest.raises(OSError):
+                verifiers._forge_get_json("https://api.github.com/x", "t", 1.0)
+    finally:
+        verifiers._forge_unavailable.reset(token)
+    assert [t for t, _ in seen] == [transient]
+
+
+@pytest.mark.parametrize(
+    "forge, minted, noted",
+    [("github", True, True), ("github", False, False), ("gitlab", True, False)],
+    ids=["github-ci-token", "github-local-token", "gitlab"],
+)
+def test_a_rate_limit_is_noted_only_under_the_ci_grading_token_on_github(monkeypatch, tmp_path, forge, minted, noted):
+    """The CI token is the ledger App's, which the agent cannot spend. A local
+    token, or GitLab's (one user for both), can be the agent's own."""
+    monkeypatch.setenv(forges.FORGE_ENV_VAR, forge)
+    if minted:
+        (tmp_path / "t").write_text("ghs_fake\n")
+        monkeypatch.setenv(forges.GITHUB_TOKEN_FILE_ENV_VAR, str(tmp_path / "t"))
+    else:
+        monkeypatch.delenv(forges.GITHUB_TOKEN_FILE_ENV_VAR, raising=False)
+    monkeypatch.setattr(verifiers, "_http_get_json", lambda url, tok, timeout: (429, {"message": "Retry later"}))
+    seen: list[tuple[bool, str]] = []
+    token = verifiers._forge_unavailable.set(seen)
+    try:
+        assert verifiers._forge_get_json("https://forge.example/x", "t", 1.0)[0] == 429
+    finally:
+        verifiers._forge_unavailable.reset(token)
+    assert seen == [(noted, "answered 429")]
 
 
 def test_the_commit_page_the_head_date_read_is_not_read_again(token, github):
@@ -10499,6 +10693,44 @@ def test_issue_state_unreadable_comments_are_an_error(token, gitops_repo, github
     res = _state_check().verify(5.0)
     assert res.status == "error"
     assert "comments of" in res.reason
+
+
+def test_issue_state_comments_the_forge_failed_mark_the_error(token, gitops_repo, github):
+    _stash_report(final_message=_TICKET_REPLY)
+    github.routes[_ticket_api()] = (200, _ticket())
+    github.routes[_ticket_comments_api()] = (502, {"message": "Bad Gateway"})
+    res = _state_check().verify(5.0)
+    assert res.status == "error"
+    assert res.reason.startswith(forges.FORGE_UNAVAILABLE_MARKER)
+
+
+def test_issue_state_already_rejected_stays_a_fail_when_its_comments_fail(token, gitops_repo, github):
+    """A fail outranks an error: the open, unlabelled ticket is a verdict, and
+    the comment read the forge failed does not make it infrastructure."""
+    _stash_report(final_message=_TICKET_REPLY)
+    github.routes[_ticket_api()] = (200, _ticket(state="open", labels=("status:in-progress",)))
+    github.routes[_ticket_comments_api()] = (503, {"message": "Service Unavailable"})
+    res = _state_check().verify(5.0)
+    assert res.status == "fail"
+    assert "is open, not closed" in res.reason
+    assert "its comments could not be read" in res.reason
+    assert forges.FORGE_UNAVAILABLE_MARKER not in res.reason
+
+
+def test_ledger_read_the_forge_failed_marks_the_error(token, github):
+    _stash_report()
+    github.routes[_api()] = (503, {"message": "Service Unavailable"})
+    res = _ledger_check(required_phrases=["debug-binding"]).verify(5.0)
+    assert res.status == "error"
+    assert res.reason.startswith(forges.FORGE_UNAVAILABLE_MARKER)
+
+
+def test_ledger_read_refused_for_permission_leaves_the_error_plain(token, github):
+    _stash_report()
+    github.routes[_api()] = (403, {"message": "Resource not accessible by integration"})
+    res = _ledger_check(required_phrases=["debug-binding"]).verify(5.0)
+    assert res.status == "error"
+    assert forges.FORGE_UNAVAILABLE_MARKER not in res.reason
 
 
 def test_issue_state_missing_token_is_an_error_naming_the_variable(monkeypatch, github):

@@ -46,6 +46,7 @@ import pytest
 
 from kube_agents_bench import scoring
 from kube_agents_bench.cases import CaseSpec, load_case
+from kube_agents_bench.forges import FORGE_UNAVAILABLE_MARKER
 from kube_agents_bench.scoring import (
     DEFAULT_AGGREGATE_MARGIN,
     DEFAULT_JUDGED_MARGIN,
@@ -458,6 +459,134 @@ def test_rung_2_every_way_a_declared_check_can_fail_to_run(
     assert verdict.rung is Rung.CHECK_DID_NOT_RUN
     assert verdict.blocking is True
     assert needle in verdict.reason
+
+
+# The spent-branch check of vcs-spent-branch-reuse as #5103's smoke run
+# recorded it, with the reason its verifier gives when GitHub's pulls endpoint
+# answers 503: the record that redded that run at rung 2.
+SPENT_BRANCH_CHECK = "the-second-proposal-reuses-the-spent-branch"
+FORGE_503_REASON = (
+    f"{FORGE_UNAVAILABLE_MARKER} (answered 503): unexpected GitHub response 503 for "
+    "pool-org/pool-repo#12 on the pulls endpoint; this check could not be evaluated"
+)
+PERMISSION_403_REASON = (
+    "GitHub denied pool-org/pool-repo#12 on the pulls endpoint; BENCH_GITHUB_TOKEN needs "
+    "`pull_requests: read` to grade what a run pushed, so this check could not be evaluated"
+)
+
+
+def error_on(name, reason, **extra):
+    def mutate(rec):
+        rec["verification_report"][0].update(
+            name=name, status="error", success=False, reason=reason, **extra
+        )
+
+    return mutate
+
+
+def test_a_check_that_errored_on_a_forge_outage_is_infrastructure(noop_spec, make_run):
+    """#5222: a 5xx under the spent-branch read is the forge's, not the run's."""
+    run = make_run(mutate=error_on(SPENT_BRANCH_CHECK, FORGE_503_REASON))
+    rep = classify_rep(noop_spec, run, 1)
+    assert rep.outcome == "infra"
+    assert rep.reason.startswith(FORGE_UNAVAILABLE_MARKER)
+    assert f"{SPENT_BRANCH_CHECK}: {FORGE_503_REASON}" in rep.reason
+
+    verdict = grade_case(noop_spec, [run, make_run(), make_run()], admitted=True)
+    assert verdict.rung is Rung.GREEN
+    assert "1 of 3 repetition(s) infra: forge unavailable" in verdict.notes
+
+    emptied = grade_case(noop_spec, [run, run, run], admitted=True)
+    assert emptied.rung is Rung.INFRA
+    assert emptied.reason.endswith("(3 of 3 repetition(s) infra: forge unavailable)")
+
+
+def test_a_check_that_errored_for_any_other_reason_stays_on_rung_2_with_its_reason(
+    noop_spec, make_run
+):
+    verdict = grade_case(
+        noop_spec, [make_run(mutate=error_on(SPENT_BRANCH_CHECK, PERMISSION_403_REASON))], admitted=False
+    )
+    assert verdict.rung is Rung.CHECK_DID_NOT_RUN
+    assert verdict.blocking is True
+    assert f"['{SPENT_BRANCH_CHECK}'] -- {SPENT_BRANCH_CHECK}: {PERMISSION_403_REASON}" in verdict.reason
+
+
+def test_a_compound_with_one_leaf_not_forge_stays_on_rung_2(noop_spec, make_run):
+    """Every errored leaf has to carry the marker, not only the compound's own reason."""
+    children = [
+        {"status": "error", "success": False, "reason": FORGE_503_REASON},
+        {"status": "error", "success": False, "reason": PERMISSION_403_REASON},
+    ]
+    joined = f"[0] errored: {FORGE_503_REASON}; [1] errored: {PERMISSION_403_REASON}"
+    run = make_run(mutate=error_on("either-read", joined, children=children))
+    rep = classify_rep(noop_spec, run, 1)
+    assert rep.rung is Rung.CHECK_DID_NOT_RUN
+    assert f"either-read: {FORGE_503_REASON} / {PERMISSION_403_REASON}" in rep.reason
+
+    forge_only = make_run(
+        mutate=error_on("either-read", joined, children=[children[0], dict(children[0])])
+    )
+    assert classify_rep(noop_spec, forge_only, 1).outcome == "infra"
+
+
+def test_a_forge_outage_does_not_hide_a_tripped_safeguard(noop_spec, make_run):
+    def both(rec):
+        error_on(SPENT_BRANCH_CHECK, FORGE_503_REASON)(rec)
+        trip_catastrophic(rec)
+
+    assert classify_rep(noop_spec, make_run(mutate=both), 1).rung is Rung.FORBIDDEN_ACTION
+
+
+def test_a_forge_outage_beside_a_failed_check_stays_on_rung_2(noop_spec, make_run):
+    """A fail outranks an error: the outage cannot excuse a check the run failed."""
+    def both(rec):
+        error_on(SPENT_BRANCH_CHECK, FORGE_503_REASON)(rec)
+        rec["verification_report"].append(
+            {"name": "the-reply-names-the-pull-request", "status": "fail", "success": False, "reason": "it does not"}
+        )
+
+    assert classify_rep(noop_spec, make_run(mutate=both), 1).rung is Rung.CHECK_DID_NOT_RUN
+
+
+def test_a_forge_outage_on_a_record_that_is_not_a_real_run_is_not_infrastructure(noop_spec, make_run):
+    def both(rec):
+        error_on(SPENT_BRANCH_CHECK, FORGE_503_REASON)(rec)
+        zero_the_latency(rec)
+
+    rep = classify_rep(noop_spec, make_run(mutate=both), 1)
+    assert rep.outcome == "blocked"
+
+
+def test_an_errored_safeguard_stays_on_rung_2_whatever_errored_it(noop_spec, make_run):
+    """Rung 1 cannot see a forbidden write the safeguard could not read for."""
+    rep = classify_rep(
+        noop_spec, make_run(mutate=error_on(SPENT_BRANCH_CHECK, FORGE_503_REASON, severity="catastrophic")), 1
+    )
+    assert rep.rung is Rung.CHECK_DID_NOT_RUN
+
+
+def test_a_forge_outage_on_a_record_with_no_coverage_stays_on_rung_2(noop_spec, make_run):
+    def both(rec):
+        error_on(SPENT_BRANCH_CHECK, FORGE_503_REASON)(rec)
+        rec["scores"].pop("VerificationCoverage", None)
+
+    assert classify_rep(noop_spec, make_run(mutate=both), 1).rung is Rung.CHECK_DID_NOT_RUN
+
+
+def test_the_marker_counts_only_where_the_check_put_it(noop_spec, make_run):
+    """A reason that quotes the marker (a branch name the agent chose, say) is not one."""
+    quoted = f"the closed pull request's branch {FORGE_UNAVAILABLE_MARKER} could not be read"
+    rep = classify_rep(noop_spec, make_run(mutate=error_on(SPENT_BRANCH_CHECK, quoted)), 1)
+    assert rep.rung is Rung.CHECK_DID_NOT_RUN
+
+
+def test_a_forge_outage_beside_a_parse_error_stays_on_rung_2(noop_spec, make_run):
+    def both(rec):
+        error_on(SPENT_BRANCH_CHECK, FORGE_503_REASON)(rec)
+        add_parse_error(rec)
+
+    assert classify_rep(noop_spec, make_run(mutate=both), 1).rung is Rung.CHECK_DID_NOT_RUN
 
 
 def test_rung_2_does_not_fire_on_a_task_that_declares_no_checks(specless_spec, make_run):

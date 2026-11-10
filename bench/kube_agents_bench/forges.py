@@ -56,6 +56,7 @@ __all__ = [
     "FORGE_ENV_VAR",
     "FORGE_GITHUB",
     "FORGE_GITLAB",
+    "FORGE_UNAVAILABLE_MARKER",
     "GITHUB_API_ROOT",
     "GITHUB_API_ROOT_ENV_VAR",
     "GITHUB_DEFAULT_HOST",
@@ -89,6 +90,14 @@ FORGE_ENV_VAR = "BENCH_FORGE"
 FORGE_GITHUB = "github"
 FORGE_GITLAB = "gitlab"
 FORGES = (FORGE_GITHUB, FORGE_GITLAB)
+#: What a check's reason starts with when it could not be evaluated and every
+#: forge read of it that failed did so in a way that says nothing about the
+#: run: a 5xx after the retries, a transport failure, or, on GitHub with the
+#: CI-minted grading token (the ledger App's, which the agent cannot spend),
+#: a 429 or a 403 that says it is rate limited. The scoring ladder grades a
+#: repetition whose every errored check carries it, with no check failed and
+#: no catastrophic safeguard errored, as infrastructure.
+FORGE_UNAVAILABLE_MARKER = "KUBE_AGENTS_FORGE_UNAVAILABLE"
 
 GITHUB_API_ROOT = "https://api.github.com"
 #: The GitHub host the reply's URLs are on: github.com, or a GitHub

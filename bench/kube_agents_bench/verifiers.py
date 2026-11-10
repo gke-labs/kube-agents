@@ -69,7 +69,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter
+from contextvars import ContextVar
 from collections.abc import Callable
+from functools import wraps
 from datetime import datetime, time as dt_time, timedelta, timezone
 from typing import Any, Literal
 
@@ -222,6 +224,12 @@ _ONBOARDING_READ_TIMEOUT_SEC = 60.0
 _FORGE_READ_ATTEMPTS = 3
 _FORGE_READ_RETRY_PAUSE_SEC = 2.0
 _HTTP_SERVER_ERROR_FLOOR = 500
+# Answers that say the forge is limiting the caller rather than answering about
+# the run: 429, and a 403 whose message names a rate limit (GitHub's primary
+# and secondary limits both say "rate limit"; a permission 403 does not).
+_HTTP_TOO_MANY_REQUESTS = 429
+_HTTP_FORBIDDEN = 403
+_RATE_LIMIT_MESSAGE_RE = re.compile(r"rate limit", re.IGNORECASE)
 # The sandbox's report changes at most twice (written, then renamed), so at most
 # two of three sandbox re-reads can differ from the read before them.
 _REPORT_READ_ATTEMPTS = 3
@@ -2403,7 +2411,7 @@ def _gitlab_project_unseen(repo: str, token: str, budget: float) -> str | None:
     ``_resolve`` grades a 404 pair: a mistyped project is the agent's error,
     not a credential fault to red every repetition with.
     """
-    status, _ = _http_get_json(
+    status, _ = _forge_get_json(
         forges.gitlab_api_root() + forges.gitlab_project_path(repo), token, budget
     )
     if status == 200:
@@ -2477,7 +2485,7 @@ def _issue_comments(
         urls = [first] + [f"{first}&page={page}" for page in range(2, pages + 1)]
     comments: list[tuple[datetime | None, str]] = []
     for url in urls:
-        status_code, payload = _http_get_json(url, token, budget)
+        status_code, payload = _forge_get_json(url, token, budget)
         if status_code != 200 or not isinstance(payload, list):
             return None
         for comment in payload:
@@ -4122,6 +4130,112 @@ def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
     raise AssertionError("unreachable")
 
 
+# The forge reads of the check being verified that did not answer 2xx, each as
+# (transient, what): transient when the read says nothing about the run (see
+# _forge_get_json). None outside a forge-reading check's verify.
+_forge_unavailable: ContextVar[list[tuple[bool, str]] | None] = ContextVar("forge_unavailable", default=None)
+
+
+def _forge_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
+    """:func:`_http_get_json`, noting each read that did not answer 2xx.
+
+    A read is noted transient for :func:`_marks_forge_unavailable` when it
+    ended in a 5xx (already retried) or a transport failure (a timeout, a
+    reset, a dropped connection), or, on GitHub with the CI-minted grading
+    token (forges.GITHUB_TOKEN_FILE_ENV_VAR), in a 429 or a 403 that says it is
+    rate limited. That token is the ledger App's installation, which the agent
+    under test cannot spend; a local token, or GitLab's, where the agent's
+    token and grading's are one user's, can be the agent's, so its rate limit
+    is not transient. Every other non-2xx answer or OSError (a 404, a
+    permission 403, a redirect, a certificate failure, a host that does not
+    resolve or refuses the connection, an unknown forge) is noted as not
+    transient, and keeps the check's error plain."""
+    try:
+        status, payload = _http_get_json(url, token, timeout)
+    except OSError as exc:
+        _note_forge_read(_forge_transport_failure(exc), f"{type(exc).__name__}: {exc}")
+        raise
+    if status // 100 != 2:
+        message = payload.get("message") if isinstance(payload, dict) else None
+        rate_limited = status == _HTTP_TOO_MANY_REQUESTS or (
+            status == _HTTP_FORBIDDEN and isinstance(message, str) and bool(_RATE_LIMIT_MESSAGE_RE.search(message))
+        )
+        grading_app = forges.forge_name() == forges.FORGE_GITHUB and bool(
+            os.environ.get(forges.GITHUB_TOKEN_FILE_ENV_VAR)
+        )
+        _note_forge_read(status >= _HTTP_SERVER_ERROR_FLOOR or (rate_limited and grading_app), f"answered {status}")
+    return status, payload
+
+
+def _forge_transport_failure(exc: OSError) -> bool:
+    """Whether a read's OSError is the forge or the path to it failing for a
+    while: a timeout, a reset, a dropped connection, or a response cut off
+    (http.client's RemoteDisconnected or IncompleteRead, which
+    :func:`_http_get_json` re-raises as a plain OSError). A refused connection
+    is a configured address that is wrong; a host that does not resolve, a
+    certificate failure and a malformed URL are not ConnectionErrors."""
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    if isinstance(reason, ConnectionRefusedError):
+        return False
+    return isinstance(reason, (TimeoutError, ConnectionError)) or isinstance(
+        exc.__cause__, (http.client.RemoteDisconnected, http.client.IncompleteRead)
+    )
+
+
+def _note_forge_read(transient: bool, what: str) -> None:
+    noted = _forge_unavailable.get()
+    if noted is not None:
+        noted.append((transient, what))
+
+
+class _UnresolvedCandidates(list):
+    """pull_request_opened's unevaluable candidates. One left unevaluable with
+    no transient forge read behind it (a malformed answer, a clause not
+    implemented for the forge) is noted as not transient, so the check's error
+    is not marked for another candidate's outage."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._since = 0
+
+    def begin(self) -> None:
+        """Start a candidate: only reads noted after this count for it."""
+        noted = _forge_unavailable.get()
+        self._since = len(noted) if noted is not None else 0
+
+    def append(self, reason: str) -> None:
+        noted = _forge_unavailable.get()
+        if noted is not None and not any(transient for transient, _ in noted[self._since:]):
+            noted.append((False, "a candidate unevaluable without a failed read"))
+        super().append(reason)
+
+
+def _marks_forge_unavailable(verify: Callable[[Any, float], VerificationResult]) -> Callable[[Any, float], VerificationResult]:
+    """Prefix an errored result's reason with forges.FORGE_UNAVAILABLE_MARKER when
+    the check's forge reads that did not answer 2xx were all transient
+    (:func:`_forge_get_json`), and there was at least one.
+
+    One read that failed for another reason keeps the error plain, whichever
+    read the error came from. Only an ``error`` is marked: a pass or a fail
+    was decided on what the reads did return. The marker leads, so the reason
+    the check gave is kept whole."""
+
+    @wraps(verify)
+    def marked(self: Any, timeout_sec: float) -> VerificationResult:
+        token = _forge_unavailable.set([])
+        try:
+            result = verify(self, timeout_sec)
+            noted = _forge_unavailable.get() or []
+        finally:
+            _forge_unavailable.reset(token)
+        if result.status != "error" or not noted or not all(transient for transient, _ in noted):
+            return result
+        what = ", ".join(what for _, what in noted)
+        return result.model_copy(update={"reason": f"{forges.FORGE_UNAVAILABLE_MARKER} ({what}): {result.reason}"})
+
+    return marked
+
+
 def _parse_footer(body: str) -> tuple[str, datetime] | None:
     """The ledger footer's ``(audit id, generated-at)``, or None when absent.
 
@@ -4475,6 +4589,7 @@ class LedgerIssueContainsVerifier(BaseVerifier):
                 return True
         return False
 
+    @_marks_forge_unavailable
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
 
@@ -4552,7 +4667,7 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             slug = f"{repo}#{number}"
             url = _issue_api_url(forge, repo, number)
             try:
-                status_code, payload = _http_get_json(url, token, budget)
+                status_code, payload = _forge_get_json(url, token, budget)
             except OSError as exc:
                 return done(
                     False,
@@ -4897,6 +5012,7 @@ class ForgeIssueStateVerifier(BaseVerifier):
             )
         return self
 
+    @_marks_forge_unavailable
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
 
@@ -4963,7 +5079,7 @@ class ForgeIssueStateVerifier(BaseVerifier):
                 continue
             url = _issue_api_url(forge, repo, number)
             try:
-                status_code, payload = _http_get_json(url, token, budget)
+                status_code, payload = _forge_get_json(url, token, budget)
             except OSError as exc:
                 return done(
                     False,
@@ -5018,33 +5134,31 @@ class ForgeIssueStateVerifier(BaseVerifier):
                 faults.append(f"lacks the label(s) {missing} (labels: {sorted(view['labels'])})")
             comments: int | None = None
             if self.min_comments:
+                unread: str | None = None
                 try:
                     listed = _issue_comments(
                         url, token, budget, forge, window_start, _ISSUE_COMMENT_PAGES
                     )
                 except OSError as exc:
-                    return done(
-                        False,
-                        f"could not read the comments of {slug}: {exc}; "
-                        "this check could not be evaluated",
-                        status="error",
+                    listed, unread = None, f"could not read the comments of {slug}: {exc}; "
+                if listed is None and unread is None:
+                    unread = f"the comments of {slug} could not be read ({label} did not answer 200 with a list), so "
+                # An issue already rejected stays a fail: comments it could not
+                # read change no verdict, and must not make it an error.
+                if unread is not None and not faults:
+                    return done(False, unread + "this check could not be evaluated", status="error")
+                if unread is not None:
+                    faults.append("its comments could not be read")
+                else:
+                    comments = sum(
+                        1 for created_at, _ in listed
+                        if created_at is not None and created_at >= window_start
                     )
-                if listed is None:
-                    return done(
-                        False,
-                        f"the comments of {slug} could not be read ({label} did not "
-                        "answer 200 with a list), so this check could not be evaluated",
-                        status="error",
-                    )
-                comments = sum(
-                    1 for created_at, _ in listed
-                    if created_at is not None and created_at >= window_start
-                )
-                if comments < self.min_comments:
-                    faults.append(
-                        f"carries {comments} comment(s) posted since this run started, "
-                        f"{self.min_comments} required"
-                    )
+                    if comments < self.min_comments:
+                        faults.append(
+                            f"carries {comments} comment(s) posted since this run started, "
+                            f"{self.min_comments} required"
+                        )
             if faults:
                 rejected.append(f"{slug} " + ", ".join(faults))
                 continue
@@ -5576,7 +5690,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
         texts: dict[str, str] = {}
         unread: list[str] = []
         for page in range(1, _PR_FILES_MAX_PAGES + 1):
-            status, files = _http_get_json(
+            status, files = _forge_get_json(
                 f"{base}?per_page={_PR_FILES_PAGE_SIZE}&page={page}", token, budget
             )
             if status != 200 or not isinstance(files, list):
@@ -5630,7 +5744,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
         base = f"{forges.github_api_root()}/repos/{owner}/{repo}/pulls/{number}/files"
         entries: list[dict] = []
         for page in range(1, _PR_FILES_MAX_PAGES + 1):
-            status, files = _http_get_json(
+            status, files = _forge_get_json(
                 f"{base}?per_page={_PR_FILES_PAGE_SIZE}&page={page}", token, budget
             )
             if status != 200 or not isinstance(files, list):
@@ -5728,7 +5842,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
         ref = str(head.get("ref") or "")
         if not ref:
             return None, f"GitHub returned no head ref for {slug}; this check could not be evaluated"
-        status_code, listed = _http_get_json(
+        status_code, listed = _forge_get_json(
             f"{forges.github_api_root()}/repos/{owner}/{repo}/pulls"
             f"?state=closed&head={owner}:{urllib.parse.quote(ref, safe='')}&per_page={_GITHUB_PAGE_SIZE}",
             token,
@@ -5786,7 +5900,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     commits = listing[1]
                     status_code = 200
                 else:
-                    status_code, commits = _http_get_json(
+                    status_code, commits = _forge_get_json(
                         f"{forges.github_api_root()}/repos/{owner}/{repo}/pulls/{number}/commits"
                         f"?per_page={_PR_COMMITS_PAGE_SIZE}&page={page}",
                         token,
@@ -5849,10 +5963,10 @@ class PullRequestOpenedVerifier(BaseVerifier):
         anything. Everything else the agent chose, so it is graded.
         """
         base = f"{forges.github_api_root()}/repos/{owner}/{repo}"
-        first, payload = _http_get_json(f"{base}/issues/{number}", token, budget)
+        first, payload = _forge_get_json(f"{base}/issues/{number}", token, budget)
         status_code = first
         if first in (401, 403, 404):
-            status_code, payload = _http_get_json(f"{base}/pulls/{number}", token, budget)
+            status_code, payload = _forge_get_json(f"{base}/pulls/{number}", token, budget)
         if 401 in (first, status_code):
             # 401 is the credential itself, not its scopes: an installation
             # token lasts an hour, and telling the reader to widen a permission
@@ -5919,7 +6033,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
         base = f"{forges.github_api_root()}/repos/{owner}/{repo}"
         payload = resolved
         if "changed_files" not in payload:
-            status, payload = _http_get_json(f"{base}/pulls/{number}", token, budget)
+            status, payload = _forge_get_json(f"{base}/pulls/{number}", token, budget)
             # The same three readings `_resolve` gives this endpoint: 401 is
             # the token, 403 is the permission, anything else is GitHub's.
             if status == 401:
@@ -5961,7 +6075,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
         if not isinstance(total, int) or total < 1:
             return changed, None, payload, None, None
         page = (total + _PR_COMMITS_PAGE_SIZE - 1) // _PR_COMMITS_PAGE_SIZE
-        status, commits = _http_get_json(
+        status, commits = _forge_get_json(
             f"{base}/pulls/{number}/commits"
             f"?per_page={_PR_COMMITS_PAGE_SIZE}&page={page}",
             token,
@@ -6041,7 +6155,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
         since = started if since is None else since
         base = forges.gitlab_api_root() + forges.gitlab_project_path(repo)
         slug = f"{repo}!{number}"
-        status, mr = _http_get_json(f"{base}/merge_requests/{number}", token, budget)
+        status, mr = _forge_get_json(f"{base}/merge_requests/{number}", token, budget)
         if status == 404:
             why = (
                 _gitlab_project_unseen(repo, token, budget)
@@ -6090,7 +6204,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
         head_sha = str(mr.get("sha") or "")
         pushed = None
         if head_sha:
-            status, commit = _http_get_json(
+            status, commit = _forge_get_json(
                 f"{base}/repository/commits/{head_sha}", token, budget
             )
             if status in (401, 403):
@@ -6178,7 +6292,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 f"GitLab returned no source branch for {slug}; this check could not be "
                 "evaluated"
             ), None
-        status, listed = _http_get_json(
+        status, listed = _forge_get_json(
             f"{base}/merge_requests?state=all&source_branch="
             f"{urllib.parse.quote(ref, safe='')}&per_page={_GITHUB_PAGE_SIZE}",
             token,
@@ -6218,7 +6332,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 ), None
             carried[sha] = closed.get("iid")
         for page in range(1, _PR_COMMITS_MAX_PAGES + 1):
-            status, commits = _http_get_json(
+            status, commits = _forge_get_json(
                 f"{base}/merge_requests/{number}/commits"
                 f"?per_page={_PR_COMMITS_PAGE_SIZE}&page={page}",
                 token,
@@ -6251,6 +6365,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
             ), None
         return None
 
+    @_marks_forge_unavailable
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
 
@@ -6352,8 +6467,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
         # else resolves. An agent that mistypes a repository slug beside the
         # real URL would otherwise error, and an error is rung 2, which reds the
         # eval job for every open pull request.
-        unresolved: list[str] = []
+        unresolved = _UnresolvedCandidates()
         for owner, repo, number in seen:
+            unresolved.begin()
             slug = f"{owner}/{repo}#{number}"
             if self.owner and owner.lower() != self.owner.lower():
                 rejected.append(f"{slug}: not under {self.owner}")
@@ -6824,6 +6940,7 @@ class GitHubWritesVerifier(BaseVerifier):
     # two different machines. Small on purpose, as on pull_request_opened.
     max_clock_skew_sec: float = Field(default=120.0, ge=0)
 
+    @_marks_forge_unavailable
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
 
@@ -6879,7 +6996,7 @@ class GitHubWritesVerifier(BaseVerifier):
         started = datetime.fromtimestamp(snap.started_at, tz=timezone.utc)
         since = started - timedelta(seconds=self.max_clock_skew_sec)
         client = github_writes.client_for(
-            forge, token, _http_get_json, single_call_timeout(timeout_sec)
+            forge, token, _forge_get_json, single_call_timeout(timeout_sec)
         )
         try:
             report = github_writes.find_writes(client, repo, since, author=self.author)
