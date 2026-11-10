@@ -392,22 +392,25 @@ readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # The Prow jobs that deploy under the flag with no PULL_NUMBER: the
 # merge-blocking presubmit in a batch Tide ran (it grades next since next became
 # the mode new installs get, #2007, "The cutover itself"); the main nightly's
-# three parts on main (the main part's two halves, main-a and main-b, and
-# the writers part), which grade the full catalog under next (the nightly the dashboard and
+# eight parts on main (the main part's five shards, main-a to main-e, and
+# the writers part's three thirds, writers-a, -b and -c), which grade the full
+# catalog under next (the nightly the dashboard and
 # the digest read); the GitLab lane's nightly under next (EVAL_FORGE=gitlab,
 # hack/eval/gitlab-cases.txt), beside its today-mode nightly; the GHES and
 # GitLab CE lanes' weekly jobs (EVAL_FORGE=ghes, hack/eval/ghes-cases.txt;
 # EVAL_FORGE=gitlab-ce, hack/eval/gitlab-cases.txt), with the next-mode
 # nightlies they replace listed until the weekly jobs run; and the
 # release-candidate eval's postsubmit, which grades a candidate in the mode a
-# new install gets (hack/ci-eval-rc.sh). The today lane's on-demand presubmit
+# new install gets (hack/ci-eval-rc.sh); and the replay lane's periodic
+# (EVAL_REPLAY_LANE=true), which replays the nightlies' recordings and must
+# send the requests they did. The today lane's on-demand presubmit
 # is optional, so Tide never batched it, and a pull request's run of it
 # carries a PULL_NUMBER. Section 2b admits the flag on a run whose JOB_NAME is
 # one of these (space-separated, matched whole) or that carries a PULL_NUMBER
 # -- a presubmit is admitted by the second on a pull request and the blocking
 # one by the first on a batch Tide ran, the nightlies, the certification
-# lane's first slice (EVAL_TIER=certification) and the RC
-# postsubmit only by the first -- and refuses it on any other Prow run, so
+# lane's first slice (EVAL_TIER=certification), the RC
+# postsubmit and the replay lane only by the first -- and refuses it on any other Prow run, so
 # the flag leaking into the today-mode GitLab nightly's or another postsubmit's environment
 # still stops the deploy at second zero. The names are the jobs' own in
 # oss-test-infra (prow/prowjobs/gke-labs/kube-agents/); a rename there is a
@@ -415,7 +418,7 @@ readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # a run graded through the inject door records under the version key's next
 # mode (bench-gate), and hack/ci-eval-pr.sh keeps the today lane, the GitLab
 # lane and a release candidate out of the recorder altogether.
-readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test ci-kube-agents-eval-nightly ci-kube-agents-eval-nightly-main-b ci-kube-agents-eval-nightly-writers ci-kube-agents-eval-nightly-gitlab-next ci-kube-agents-eval-nightly-ghes-next ci-kube-agents-eval-nightly-gitlab-ce-next ci-kube-agents-eval-weekly-ghes-next ci-kube-agents-eval-weekly-gitlab-ce-next ci-kube-agents-certification-1 post-kube-agents-eval-rc"
+readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test ci-kube-agents-eval-nightly ci-kube-agents-eval-nightly-main-b ci-kube-agents-eval-nightly-main-c ci-kube-agents-eval-nightly-main-d ci-kube-agents-eval-nightly-main-e ci-kube-agents-eval-nightly-writers ci-kube-agents-eval-nightly-writers-b ci-kube-agents-eval-nightly-writers-c ci-kube-agents-eval-nightly-gitlab-next ci-kube-agents-eval-nightly-ghes-next ci-kube-agents-eval-nightly-gitlab-ce-next ci-kube-agents-eval-weekly-ghes-next ci-kube-agents-eval-weekly-gitlab-ce-next ci-kube-agents-certification-1 post-kube-agents-eval-rc ci-kube-agents-eval-replay-lane"
 readonly AGENT_DEPLOYMENT_NAME="${PLATFORM_AGENT_CR_NAME}-gateway"
 readonly OPERATOR_DEPLOYMENT_NAME="${HELM_RELEASE_NAME}-controller-manager"
 # The broker Deployment, named after the CR the way the operator names it
@@ -807,13 +810,16 @@ fi
 # image step 4 builds (cloudbuild-ci.yaml's replay-shadow-proxy step) and the
 # chart values step 5 installs it with. Both empty when it is off, so the build
 # and the release are byte-for-byte what they were. resolve_replay_shadow
-# refuses it on the release-candidate path, which builds nothing.
+# refuses it on the release-candidate path, which builds nothing. Its mode is
+# record on a trusted nightly and replay on the replay lane (EVAL_REPLAY_LANE),
+# both of which build from main's checkout: the lane refuses any pull-request
+# ref, and a presubmit stays in shadow mode.
 REPLAY_SHADOW_PROXY_URI=""
 REPLAY_SHADOW_HELM_ARGS=()
 if [ "${REPLAY_SHADOW_ACTIVE:-false}" = "true" ]; then
   REPLAY_SHADOW_PROXY_URI="${AR_REPO}/${REPLAY_SHADOW_IMAGE_NAME}:${TAG}"
   replay_shadow_helm_args "${AR_REPO}/${REPLAY_SHADOW_IMAGE_NAME}" "${TAG}"
-  echo "Shadow replay proxy: goes in front of LiteLLM (${REPLAY_SHADOW_KIND}, build ${REPLAY_SHADOW_BUILD}); EVAL_REPLAY_SHADOW=false turns it off"
+  echo "Shadow replay proxy: goes in front of LiteLLM (${REPLAY_SHADOW_KIND}, ${REPLAY_SHADOW_MODE} mode, build ${REPLAY_SHADOW_BUILD}); EVAL_REPLAY_SHADOW=false turns it off"
 fi
 
 # ─── 2a. Image Source: Pull Request Build, or Published Release Candidate ─────

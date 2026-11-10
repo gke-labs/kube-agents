@@ -119,11 +119,24 @@ Sources:
               other job is collected but reported as the main part, and is
               warned about.
   --nightly-main-b-prefix  the same, for the periodic that runs the
-              main part's second half (EVAL_NIGHTLY_PART=main-b; the main
+              main part's main-b shard (EVAL_NIGHTLY_PART=main-b; the main
               job runs main-a). Given without a value it is
               DEFAULT_NIGHTLY_MAIN_B_PREFIX; read, watermarked and warned
               about as the writers prefix is, against
               DEFAULT_NIGHTLY_MAIN_B_JOB.
+  --nightly-main-c-prefix, --nightly-main-d-prefix, --nightly-main-e-prefix
+              the same, for the periodics that run the main part's other
+              shards (EVAL_NIGHTLY_PART=main-c, main-d, main-e); read,
+              watermarked and warned about as the main-b prefix is, against
+              DEFAULT_NIGHTLY_MAIN_C_JOB, _D_JOB and _E_JOB.
+  --nightly-writers-b-prefix, --nightly-writers-c-prefix  the same, for
+              the two periodics that run the writers part's second and
+              third thirds (EVAL_NIGHTLY_PART=writers-b and writers-c; the
+              writers job runs writers-a). Given without a value they are
+              DEFAULT_NIGHTLY_WRITERS_B_PREFIX and
+              DEFAULT_NIGHTLY_WRITERS_C_PREFIX; read, watermarked and warned
+              about as the writers prefix is, against
+              DEFAULT_NIGHTLY_WRITERS_B_JOB and DEFAULT_NIGHTLY_WRITERS_C_JOB.
   --index-prefix  Prow's per-job directory index, gs://<bucket>/pr-logs/
               directory/<job>/: one small `<build_id>.txt` object per build
               holding the gs:// path of that build's directory (plus a
@@ -240,12 +253,28 @@ DEFAULT_NIGHTLY_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{DEFAULT_NIGHTLY_JOB}/"
 # over a main build the listing has not named yet.
 DEFAULT_NIGHTLY_WRITERS_JOB = "ci-kube-agents-eval-nightly-writers"
 DEFAULT_NIGHTLY_WRITERS_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{DEFAULT_NIGHTLY_WRITERS_JOB}/"
-# The nightly's third periodic when the main part runs as two halves
-# (#3384): the main job keeps its name and runs main-a, this one runs
+# The nightly's third periodic when the main part runs as shards
+# (#3384, #4238): the main job keeps its name and runs main-a, this one runs
 # main-b. Told apart and watermarked as the writers job is
 # (nightly.py, NIGHTLY_MAIN_B_JOB).
 DEFAULT_NIGHTLY_MAIN_B_JOB = "ci-kube-agents-eval-nightly-main-b"
 DEFAULT_NIGHTLY_MAIN_B_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{DEFAULT_NIGHTLY_MAIN_B_JOB}/"
+# The main part's other shards (#4238), told apart and watermarked as main-b
+# is (nightly.py, NIGHTLY_MAIN_C_JOB, NIGHTLY_MAIN_D_JOB, NIGHTLY_MAIN_E_JOB).
+DEFAULT_NIGHTLY_MAIN_C_JOB = "ci-kube-agents-eval-nightly-main-c"
+DEFAULT_NIGHTLY_MAIN_C_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{DEFAULT_NIGHTLY_MAIN_C_JOB}/"
+DEFAULT_NIGHTLY_MAIN_D_JOB = "ci-kube-agents-eval-nightly-main-d"
+DEFAULT_NIGHTLY_MAIN_D_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{DEFAULT_NIGHTLY_MAIN_D_JOB}/"
+DEFAULT_NIGHTLY_MAIN_E_JOB = "ci-kube-agents-eval-nightly-main-e"
+DEFAULT_NIGHTLY_MAIN_E_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{DEFAULT_NIGHTLY_MAIN_E_JOB}/"
+# The writers part's other two periodics when it runs as
+# three thirds (#4238): the writers job keeps its name and runs writers-a,
+# these two run writers-b and writers-c. Told apart and watermarked as the
+# writers job is (nightly.py, NIGHTLY_WRITERS_B_JOB, NIGHTLY_WRITERS_C_JOB).
+DEFAULT_NIGHTLY_WRITERS_B_JOB = "ci-kube-agents-eval-nightly-writers-b"
+DEFAULT_NIGHTLY_WRITERS_B_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{DEFAULT_NIGHTLY_WRITERS_B_JOB}/"
+DEFAULT_NIGHTLY_WRITERS_C_JOB = "ci-kube-agents-eval-nightly-writers-c"
+DEFAULT_NIGHTLY_WRITERS_C_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{DEFAULT_NIGHTLY_WRITERS_C_JOB}/"
 # The GitLab lane's nightly (kube-agents#2832): the lane's list once a night,
 # archived as a periodic beside the GitHub nightly, tier gitlab, pr null.
 DEFAULT_GITLAB_NIGHTLY_JOB = "ci-kube-agents-eval-nightly-gitlab"
@@ -2414,6 +2443,11 @@ def collect(
     nightly_job: str | None = None,
     nightly_writers_prefix: str | None = None,
     nightly_main_b_prefix: str | None = None,
+    nightly_main_c_prefix: str | None = None,
+    nightly_main_d_prefix: str | None = None,
+    nightly_main_e_prefix: str | None = None,
+    nightly_writers_b_prefix: str | None = None,
+    nightly_writers_c_prefix: str | None = None,
     rc_globs: list[str] | None = None,
     rc_from_dir: pathlib.Path | None = None,
     rc_limit: int = RC_RELEASES_MAX,
@@ -2431,9 +2465,9 @@ def collect(
     # the index off, anything else is listed as given. nightly_prefix is
     # what asks for the nightly periodic to be scanned at all (None: it is
     # not), the way --pr-glob asks for the presubmit; nightly_job labels
-    # the runs it yields. nightly_writers_prefix and nightly_main_b_prefix
-    # ask the same for the writers and main-b periodics, whose job is each
-    # prefix's last segment. lane_globs and lane_nightly_prefixes map a
+    # the runs it yields. The other nightly_*_prefix arguments ask the same
+    # for the writers, main-b to main-e, writers-b and writers-c periodics,
+    # whose job is each prefix's last segment. lane_globs and lane_nightly_prefixes map a
     # forge tier (tiers.FORGE_TIERS) to its pull-request globs and its
     # nightlies' prefixes; gitlab_globs and gitlab_nightly_prefix are the
     # GitLab lane's, folded in.
@@ -2458,15 +2492,29 @@ def collect(
     # is normally above every nightly id (one a day); the newest id on
     # record says what one source has seen, not the other. The nightly's
     # periodics are separate sources (DEFAULT_NIGHTLY_WRITERS_JOB,
-    # DEFAULT_NIGHTLY_MAIN_B_JOB): a nightly run of the writers or main-b
-    # job counts towards that job's watermark, every other nightly run
-    # towards the main one's, as all of them did before the split.
+    # DEFAULT_NIGHTLY_MAIN_B_JOB to DEFAULT_NIGHTLY_MAIN_E_JOB, DEFAULT_NIGHTLY_WRITERS_B_JOB,
+    # DEFAULT_NIGHTLY_WRITERS_C_JOB): a nightly run of a part's job counts
+    # towards that job's watermark, every other nightly run towards the
+    # main one's, as all of them did before the split.
     writers_job = _periodic_job(nightly_writers_prefix) if nightly_writers_prefix else DEFAULT_NIGHTLY_WRITERS_JOB
     main_b_job = _periodic_job(nightly_main_b_prefix) if nightly_main_b_prefix else DEFAULT_NIGHTLY_MAIN_B_JOB
-    for flag, prefix, job, expected in (
-        ("--nightly-writers-prefix", nightly_writers_prefix, writers_job, DEFAULT_NIGHTLY_WRITERS_JOB),
-        ("--nightly-main-b-prefix", nightly_main_b_prefix, main_b_job, DEFAULT_NIGHTLY_MAIN_B_JOB),
-    ):
+    main_c_job = _periodic_job(nightly_main_c_prefix) if nightly_main_c_prefix else DEFAULT_NIGHTLY_MAIN_C_JOB
+    main_d_job = _periodic_job(nightly_main_d_prefix) if nightly_main_d_prefix else DEFAULT_NIGHTLY_MAIN_D_JOB
+    main_e_job = _periodic_job(nightly_main_e_prefix) if nightly_main_e_prefix else DEFAULT_NIGHTLY_MAIN_E_JOB
+    writers_b_job = _periodic_job(nightly_writers_b_prefix) if nightly_writers_b_prefix else DEFAULT_NIGHTLY_WRITERS_B_JOB
+    writers_c_job = _periodic_job(nightly_writers_c_prefix) if nightly_writers_c_prefix else DEFAULT_NIGHTLY_WRITERS_C_JOB
+    # One row per part flag, in the order the flags are listed; the dedupe
+    # below rewrites a row's prefix and job in place.
+    part_sources = [
+        ["--nightly-writers-prefix", nightly_writers_prefix, writers_job, DEFAULT_NIGHTLY_WRITERS_JOB],
+        ["--nightly-main-b-prefix", nightly_main_b_prefix, main_b_job, DEFAULT_NIGHTLY_MAIN_B_JOB],
+        ["--nightly-main-c-prefix", nightly_main_c_prefix, main_c_job, DEFAULT_NIGHTLY_MAIN_C_JOB],
+        ["--nightly-main-d-prefix", nightly_main_d_prefix, main_d_job, DEFAULT_NIGHTLY_MAIN_D_JOB],
+        ["--nightly-main-e-prefix", nightly_main_e_prefix, main_e_job, DEFAULT_NIGHTLY_MAIN_E_JOB],
+        ["--nightly-writers-b-prefix", nightly_writers_b_prefix, writers_b_job, DEFAULT_NIGHTLY_WRITERS_B_JOB],
+        ["--nightly-writers-c-prefix", nightly_writers_c_prefix, writers_c_job, DEFAULT_NIGHTLY_WRITERS_C_JOB],
+    ]
+    for flag, prefix, job, expected in part_sources:
         if job != expected:
             # nightly.py tells the part by this job name alone.
             part = nightly.night_part({"job": job})
@@ -2480,23 +2528,32 @@ def collect(
     # twice and take that job's runs out of its own watermark: list each
     # job once, under the first flag that names it, and drop the later one.
     main_job = (nightly_job or _periodic_job(nightly_prefix)) if nightly_prefix else None
-    if nightly_writers_prefix and writers_job == main_job:
-        print(f"warning: --nightly-writers-prefix names job {writers_job}, as --nightly-prefix does; listing it once", file=sys.stderr)
-        nightly_writers_prefix, writers_job = None, DEFAULT_NIGHTLY_WRITERS_JOB
-    if nightly_main_b_prefix and main_b_job in (main_job, writers_job if nightly_writers_prefix else None):
-        other = "--nightly-prefix" if main_b_job == main_job else "--nightly-writers-prefix"
-        print(f"warning: --nightly-main-b-prefix names job {main_b_job}, as {other} does; listing it once", file=sys.stderr)
-        nightly_main_b_prefix, main_b_job = None, DEFAULT_NIGHTLY_MAIN_B_JOB
+    listed_by: dict[str, str] = {main_job: "--nightly-prefix"} if main_job is not None else {}
+    for source in part_sources:
+        flag, prefix, job, default = source
+        if not prefix:
+            continue
+        if job in listed_by:
+            print(f"warning: {flag} names job {job}, as {listed_by[job]} does; listing it once", file=sys.stderr)
+            source[1], source[2] = None, default
+        else:
+            listed_by[job] = flag
+    (_, nightly_writers_prefix, writers_job, _), (_, nightly_main_b_prefix, main_b_job, _), (_, nightly_main_c_prefix, main_c_job, _), (_, nightly_main_d_prefix, main_d_job, _), (_, nightly_main_e_prefix, main_e_job, _), (_, nightly_writers_b_prefix, writers_b_job, _), (_, nightly_writers_c_prefix, writers_c_job, _) = part_sources
     # The mirror case: --nightly-prefix itself naming a part's job. Its runs
     # are the main source here, so only the part jobs it does not name are
     # kept out of the main watermark; otherwise every run it lists would be.
-    part_jobs = {j for j in (writers_job, main_b_job) if j != main_job}
-    if main_job is not None and main_job in (DEFAULT_NIGHTLY_WRITERS_JOB, DEFAULT_NIGHTLY_MAIN_B_JOB):
+    part_jobs = {j for j in (writers_job, main_b_job, main_c_job, main_d_job, main_e_job, writers_b_job, writers_c_job) if j != main_job}
+    if main_job is not None and main_job in (DEFAULT_NIGHTLY_WRITERS_JOB, DEFAULT_NIGHTLY_MAIN_B_JOB, DEFAULT_NIGHTLY_MAIN_C_JOB, DEFAULT_NIGHTLY_MAIN_D_JOB, DEFAULT_NIGHTLY_MAIN_E_JOB, DEFAULT_NIGHTLY_WRITERS_B_JOB, DEFAULT_NIGHTLY_WRITERS_C_JOB):
         print(f"warning: --nightly-prefix names job {main_job}, a part's job; the report files its runs as the {nightly.night_part({'job': main_job})} part", file=sys.stderr)
     after_build = None
     nightly_after = None
     writers_after = None
     main_b_after = None
+    main_c_after = None
+    main_d_after = None
+    main_e_after = None
+    writers_b_after = None
+    writers_c_after = None
     # Each forge lane job's own watermark, (tier, job, night) -> newest id:
     # a lane's jobs (its pull-request job, a today and a next nightly) run on
     # their own schedules, so one watermark per tier would skip the slower
@@ -2510,6 +2567,11 @@ def collect(
             nightly_after = newest_build_id([r for r in tiers.nightly_runs(prior) if r.get("job") not in part_jobs])
             writers_after = newest_build_id([r for r in tiers.nightly_runs(prior) if r.get("job") == writers_job])
             main_b_after = newest_build_id([r for r in tiers.nightly_runs(prior) if r.get("job") == main_b_job])
+            main_c_after = newest_build_id([r for r in tiers.nightly_runs(prior) if r.get("job") == main_c_job])
+            main_d_after = newest_build_id([r for r in tiers.nightly_runs(prior) if r.get("job") == main_d_job])
+            main_e_after = newest_build_id([r for r in tiers.nightly_runs(prior) if r.get("job") == main_e_job])
+            writers_b_after = newest_build_id([r for r in tiers.nightly_runs(prior) if r.get("job") == writers_b_job])
+            writers_c_after = newest_build_id([r for r in tiers.nightly_runs(prior) if r.get("job") == writers_c_job])
             lane_after = _forge_lane_watermarks(prior)
             for build_id, first_seen in pending_from_prior(prior_data).items():
                 if _pending_expired(first_seen, now_dt):
@@ -2627,10 +2689,20 @@ def collect(
     nightly_fresh: list[dict] = []
     writers_fresh: list[dict] = []
     main_b_fresh: list[dict] = []
+    main_c_fresh: list[dict] = []
+    main_d_fresh: list[dict] = []
+    main_e_fresh: list[dict] = []
+    writers_b_fresh: list[dict] = []
+    writers_c_fresh: list[dict] = []
     for prefix, job, after, out in (
         (nightly_prefix, nightly_job, nightly_after, nightly_fresh),
         (nightly_writers_prefix, None, writers_after, writers_fresh),
         (nightly_main_b_prefix, None, main_b_after, main_b_fresh),
+        (nightly_main_c_prefix, None, main_c_after, main_c_fresh),
+        (nightly_main_d_prefix, None, main_d_after, main_d_fresh),
+        (nightly_main_e_prefix, None, main_e_after, main_e_fresh),
+        (nightly_writers_b_prefix, None, writers_b_after, writers_b_fresh),
+        (nightly_writers_c_prefix, None, writers_c_after, writers_c_fresh),
     ):
         if not prefix:
             continue
@@ -2672,6 +2744,36 @@ def collect(
                 f"; main-b scan resumed above build {main_b_after},"
                 f" {len(main_b_fresh)} new"
                 if nightly_main_b_prefix
+                else ""
+            )
+            + (
+                f"; main-c scan resumed above build {main_c_after},"
+                f" {len(main_c_fresh)} new"
+                if nightly_main_c_prefix
+                else ""
+            )
+            + (
+                f"; main-d scan resumed above build {main_d_after},"
+                f" {len(main_d_fresh)} new"
+                if nightly_main_d_prefix
+                else ""
+            )
+            + (
+                f"; main-e scan resumed above build {main_e_after},"
+                f" {len(main_e_fresh)} new"
+                if nightly_main_e_prefix
+                else ""
+            )
+            + (
+                f"; writers-b scan resumed above build {writers_b_after},"
+                f" {len(writers_b_fresh)} new"
+                if nightly_writers_b_prefix
+                else ""
+            )
+            + (
+                f"; writers-c scan resumed above build {writers_c_after},"
+                f" {len(writers_c_fresh)} new"
+                if nightly_writers_c_prefix
                 else ""
             )
             + "".join(f"; {note}" for note in lane_notes)
@@ -2853,10 +2955,64 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         metavar="GS_PREFIX",
         help="also collect the periodic that runs the nightly main part's"
-        " second half (main-b) from this Prow log prefix. Given without a"
+        " main-b shard from this Prow log prefix. Given without a"
         f" value: {DEFAULT_NIGHTLY_MAIN_B_PREFIX}. Omitted: no main-b scan."
         " Its runs are tier=nightly with the prefix's last segment as job, on"
         " a watermark of their own",
+    )
+    parser.add_argument(
+        "--nightly-main-c-prefix",
+        nargs="?",
+        const=DEFAULT_NIGHTLY_MAIN_C_PREFIX,
+        default=None,
+        metavar="GS_PREFIX",
+        help="also collect the periodic that runs the nightly main part's"
+        " main-c shard from this Prow log prefix. Given without a"
+        f" value: {DEFAULT_NIGHTLY_MAIN_C_PREFIX}. Omitted: no main-c scan."
+        " Its runs are tier=nightly with the prefix's last segment as job, on"
+        " a watermark of their own",
+    )
+    parser.add_argument(
+        "--nightly-main-d-prefix",
+        nargs="?",
+        const=DEFAULT_NIGHTLY_MAIN_D_PREFIX,
+        default=None,
+        metavar="GS_PREFIX",
+        help="the same for the main-d shard. Given without a value:"
+        f" {DEFAULT_NIGHTLY_MAIN_D_PREFIX}. Omitted: no main-d scan",
+    )
+    parser.add_argument(
+        "--nightly-main-e-prefix",
+        nargs="?",
+        const=DEFAULT_NIGHTLY_MAIN_E_PREFIX,
+        default=None,
+        metavar="GS_PREFIX",
+        help="the same for the main-e shard. Given without a value:"
+        f" {DEFAULT_NIGHTLY_MAIN_E_PREFIX}. Omitted: no main-e scan",
+    )
+    parser.add_argument(
+        "--nightly-writers-b-prefix",
+        nargs="?",
+        const=DEFAULT_NIGHTLY_WRITERS_B_PREFIX,
+        default=None,
+        metavar="GS_PREFIX",
+        help="also collect the periodic that runs the nightly writers part's"
+        " second third (writers-b) from this Prow log prefix. Given without a"
+        f" value: {DEFAULT_NIGHTLY_WRITERS_B_PREFIX}. Omitted: no writers-b"
+        " scan. Its runs are tier=nightly with the prefix's last segment as"
+        " job, on a watermark of their own",
+    )
+    parser.add_argument(
+        "--nightly-writers-c-prefix",
+        nargs="?",
+        const=DEFAULT_NIGHTLY_WRITERS_C_PREFIX,
+        default=None,
+        metavar="GS_PREFIX",
+        help="also collect the periodic that runs the nightly writers part's"
+        " third third (writers-c) from this Prow log prefix. Given without a"
+        f" value: {DEFAULT_NIGHTLY_WRITERS_C_PREFIX}. Omitted: no writers-c"
+        " scan. Its runs are tier=nightly with the prefix's last segment as"
+        " job, on a watermark of their own",
     )
     parser.add_argument(
         "--from-dir",
@@ -2939,6 +3095,11 @@ def main(argv: list[str] | None = None) -> int:
         and args.nightly_prefix is None
         and args.nightly_writers_prefix is None
         and args.nightly_main_b_prefix is None
+        and args.nightly_main_c_prefix is None
+        and args.nightly_main_d_prefix is None
+        and args.nightly_main_e_prefix is None
+        and args.nightly_writers_b_prefix is None
+        and args.nightly_writers_c_prefix is None
         and not args.rc_glob
         and args.rc_from_dir is None
         and not args.gitlab_pr_glob
@@ -2950,6 +3111,8 @@ def main(argv: list[str] | None = None) -> int:
             "nothing to collect: pass --pr-glob, --gitlab-pr-glob, --gitlab-nightly-prefix,"
             " --lane-pr-glob, --lane-nightly-prefix,"
             " --nightly-prefix, --nightly-writers-prefix, --nightly-main-b-prefix,"
+            " --nightly-main-c-prefix, --nightly-main-d-prefix, --nightly-main-e-prefix,"
+            " --nightly-writers-b-prefix, --nightly-writers-c-prefix,"
             " --from-dir, --rc-glob,"
             " --rc-from-dir and/or --merge-with"
         )
@@ -2981,6 +3144,11 @@ def main(argv: list[str] | None = None) -> int:
         nightly_job=args.nightly_job,
         nightly_writers_prefix=args.nightly_writers_prefix,
         nightly_main_b_prefix=args.nightly_main_b_prefix,
+        nightly_main_c_prefix=args.nightly_main_c_prefix,
+        nightly_main_d_prefix=args.nightly_main_d_prefix,
+        nightly_main_e_prefix=args.nightly_main_e_prefix,
+        nightly_writers_b_prefix=args.nightly_writers_b_prefix,
+        nightly_writers_c_prefix=args.nightly_writers_c_prefix,
         rc_globs=args.rc_glob,
         rc_from_dir=args.rc_from_dir,
         rc_limit=args.rc_limit,

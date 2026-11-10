@@ -857,14 +857,15 @@ github_app_id         = "12"
 
 The composition declares the github forge at `gitops_host` in `spec.integration.forges`, with the owner as its namespace and `caBundleRef` from `github_ca_secret_name`, and no `github` alias. The chart points the minter at `https://<host>/api/v3` and mounts the CA. In this order:
 
-1. **Create the Cloud KMS key and import the App's private key.** The minter is not Ready until the key holds an `ENABLED` version, and the apply waits for every Deployment, so import the key before the apply. Use the composition's default names and the cluster's region (for a zonal cluster, the region that contains the zone). The import calls only Cloud KMS.
+1. **Create the Cloud KMS key and import the App's private key.** The minter is not Ready until the key holds an `ENABLED` version, and the apply waits for every Deployment, so import the key before the apply. Use the composition's default names and the cluster's region (for a zonal cluster, the region that contains the zone). The labels name this install as the key's owner: `make tf-apply` adopts a key it doesn't hold only when they do. The import calls only Cloud KMS.
 
    ```bash
    gcloud services enable cloudkms.googleapis.com --project=PROJECT_ID
    gcloud kms keyrings create github-token-minter-keyring --location=REGION --project=PROJECT_ID
    gcloud kms keys create github-token-minter-key --keyring=github-token-minter-keyring --location=REGION \
      --purpose=asymmetric-signing --default-algorithm=rsa-sign-pkcs1-2048-sha256 \
-     --import-only --skip-initial-version-creation --protection-level=software --project=PROJECT_ID
+     --import-only --skip-initial-version-creation --protection-level=software \
+     --labels=kube-agents-cluster=CLUSTER_NAME,kube-agents-namespace=kubeagents-system --project=PROJECT_ID
    git clone --depth 1 --branch v2.7.1 https://github.com/abcxyz/github-token-minter.git ~/minty
    (cd ~/minty && go run ./cmd/minty tools import-pk -project-id=PROJECT_ID -location=REGION \
      -key-ring=github-token-minter-keyring -key=github-token-minter-key -private-key=@/path/to/app.pem)
@@ -1138,7 +1139,7 @@ pods the A2A gateway creates under `spec.mode: next` free to run as any ServiceA
 namespace. The operator on this path does not get the chart's `A2A_GATEWAY_POD_POLICY` signal, so
 an operator feature that needs the second policy stays off. Likewise `A2A_DISPATCHER_JOB_POLICY`:
 without it the operator runs no dispatcher Job mode, and unattended profile tasks have no worker
-and are refused at admission (`no-worker`); set it on the operator only once the third policy is applied. Read each file's header for what the
+and are refused at admission (`no-worker`); set it on the operator only once the third policy is applied. With it set, under `mode: next` with the dispatcher running (`A2A_DISPATCHER_IMAGE`), the `PlatformAgent`'s `DispatcherJobMode` condition says whether Job mode is on, and why not. Read each file's header for what the
 policies do and do not enforce — notably, the agent-RBAC policies cannot check the rules of a role
 that a binding merely _references_.
 

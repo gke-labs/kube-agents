@@ -1282,6 +1282,18 @@ func TestSafeSandboxEnvOverridesPassesTheCronIdleThresholds(t *testing.T) {
 	}
 }
 
+func TestSafeSandboxEnvOverridesPassesTheCronCatchUpStep(t *testing.T) {
+	// The site documents CRON_CATCH_UP_STAGGER_MINUTES as a spec.deployment.env
+	// entry, and `0` is how an install that wants every catch-up on resume
+	// turns the policy off; it reaches the ticker only through this allowlist.
+	got := safeSandboxEnvOverrides([]corev1.EnvVar{
+		{Name: "CRON_CATCH_UP_STAGGER_MINUTES", Value: "0"},
+	})
+	if len(got) != 1 || got[0].Name != "CRON_CATCH_UP_STAGGER_MINUTES" || got[0].Value != "0" {
+		t.Fatalf("expected CRON_CATCH_UP_STAGGER_MINUTES to survive the allowlist, got %#v", got)
+	}
+}
+
 func TestSafeSandboxEnvOverridesPassesTheReconcileCreateCap(t *testing.T) {
 	// BOOTSTRAP_MAX_CREATES_PER_TICK bounds how many Cluster Agent profiles one
 	// reconcile run scaffolds; the site documents it as a spec.deployment.env
@@ -5607,10 +5619,11 @@ func TestMaxInProgressIsPinnedInTheManagedScope(t *testing.T) {
 		if !ok {
 			t.Fatalf("the managed scope carries no kanban block, got:\n%v", managed)
 		}
-		if len(kanban) != 1 {
-			// Only the cap is board-wide. The rest of the block (tick, wake set, stale
-			// timeout) belongs to whichever profile the gateway is homed at.
-			t.Errorf("the managed scope must pin kanban.max_in_progress alone, got %v", kanban)
+		// Only the cap and the dispatcher's admission are board-wide
+		// (TestKanbanAdmissionIsPinnedInTheManagedScope). The rest of the block (tick,
+		// wake set, stale timeout) belongs to whichever profile the gateway is homed at.
+		if got := slices.Sorted(maps.Keys(kanban)); !slices.Equal(got, []string{"admission", "max_in_progress"}) {
+			t.Errorf("the managed scope must pin kanban.max_in_progress and kanban.admission alone, got %v", kanban)
 		}
 		return kanban["max_in_progress"]
 	}
@@ -5628,6 +5641,138 @@ func TestMaxInProgressIsPinnedInTheManagedScope(t *testing.T) {
 		agent := agentWithTuning(&agentv1alpha1.TuningSpec{MaxInProgress: ptr.To(want)})
 		if got := managedCap(t, agent); fmt.Sprint(got) != fmt.Sprint(want) {
 			t.Errorf("max_in_progress = %v, want the CR's %d", got, want)
+		}
+	}
+}
+
+// spec.harness.tuning.admission is pinned in the managed scope as kanban.admission, always:
+// the CR's values where it sets them, the operator's defaults where it does not, so the
+// dispatcher never runs without a block. The budget's default is derived rather than
+// constant: the agent container's resolved memory request in MiB, the figure the kubelet
+// evicts the pod against under node pressure, so a CR that raises the request raises the
+// budget and the two cannot drift apart.
+func TestKanbanAdmissionIsPinnedInTheManagedScope(t *testing.T) {
+	managedAdmission := func(t *testing.T, agent *agentv1alpha1.PlatformAgent) map[string]any {
+		t.Helper()
+		var managed map[string]any
+		if err := yaml.Unmarshal([]byte(buildConfigMapData(agent, nil)[managedConfigKey]), &managed); err != nil {
+			t.Fatalf("unmarshal managed scope: %v", err)
+		}
+		kanban, _ := managed["kanban"].(map[string]any)
+		admission, ok := kanban["admission"].(map[string]any)
+		if !ok {
+			t.Fatalf("the managed scope carries no kanban.admission block, got:\n%v", managed)
+		}
+		return admission
+	}
+	assertAdmission := func(t *testing.T, name string, got map[string]any, budget, rssCap, bound int, failClosed bool) {
+		t.Helper()
+		want := map[string]any{
+			"memory_budget_mib":   budget,
+			"worker_rss_cap_mib":  rssCap,
+			"queue_bound_seconds": bound,
+			"fail_closed":         failClosed,
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("%s: kanban.admission = %v, want %v", name, got, want)
+		}
+	}
+	withResources := func(resources corev1.ResourceRequirements) *agentv1alpha1.PlatformAgent {
+		agent := newTestPlatformAgent()
+		agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Resources: &resources}
+		return agent
+	}
+
+	// Untuned: every default, and the budget is the operator's default memory request in MiB.
+	// The 4096 is asserted against resolveResources rather than written twice, so a change to
+	// the default request fails here with the reason rather than as a bare mismatch.
+	if defaultRequest := resolveResources(nil).Requests[corev1.ResourceMemory]; defaultRequest.Value() != 4096<<20 {
+		t.Fatalf("the operator's default memory request is %s; this test assumes 4Gi, so update its budget figures with the default", defaultRequest.String())
+	}
+	assertAdmission(t, "untuned", managedAdmission(t, newTestPlatformAgent()),
+		4096, defaultAdmissionWorkerRssCapMiB, defaultAdmissionQueueBoundSeconds, defaultAdmissionFailClosed)
+	if !defaultAdmissionFailClosed {
+		t.Error("fail_closed defaults open; the admission exists for installs whose memory counters are unreadable, and an open default spawns into the eviction there")
+	}
+
+	// A raised request raises the budget with it; the limit does not enter into it.
+	raised := withResources(corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("6Gi")},
+		Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("16Gi")},
+	})
+	assertAdmission(t, "raised request", managedAdmission(t, raised),
+		6144, defaultAdmissionWorkerRssCapMiB, defaultAdmissionQueueBoundSeconds, defaultAdmissionFailClosed)
+
+	// A resources block that sets only a limit: the kubelet gives the container a request
+	// equal to it, so the budget follows the limit rather than the operator's default.
+	limitOnly := withResources(corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("3Gi")},
+	})
+	assertAdmission(t, "limit only", managedAdmission(t, limitOnly),
+		3072, defaultAdmissionWorkerRssCapMiB, defaultAdmissionQueueBoundSeconds, defaultAdmissionFailClosed)
+
+	// A resources block with no memory at all falls back to the operator's default request:
+	// spec.deployment.resources replaces the defaults as a block, so nothing else would
+	// give the budget a figure.
+	cpuOnly := withResources(corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")},
+	})
+	assertAdmission(t, "cpu only", managedAdmission(t, cpuOnly),
+		4096, defaultAdmissionWorkerRssCapMiB, defaultAdmissionQueueBoundSeconds, defaultAdmissionFailClosed)
+
+	// A request that is not a whole number of MiB rounds down: the dispatcher must not be
+	// told a budget larger than the request it stands for.
+	decimal := withResources(corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2000M")},
+	})
+	assertAdmission(t, "decimal request", managedAdmission(t, decimal),
+		1907, defaultAdmissionWorkerRssCapMiB, defaultAdmissionQueueBoundSeconds, defaultAdmissionFailClosed)
+
+	// A request the operator cannot read as a budget is clamped to the CRD's floor rather
+	// than rendered as 0, which the dispatcher reads as no budget and answers with the
+	// meminfo guard in silence; at the floor it refuses every card, loudly, with the figures
+	// in the reason. A bare "2" is two bytes, 256Mi is under the floor, and an explicit "0"
+	// beside a limit is a request of zero, not an unset request the limit stands in for.
+	for name, quantity := range map[string]string{"bare number request": "2", "sub-floor request": "256Mi", "explicit zero request": "0"} {
+		small := withResources(corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse(quantity)},
+			Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("4Gi")},
+		})
+		assertAdmission(t, name, managedAdmission(t, small),
+			admissionMemoryBudgetFloorMiB, defaultAdmissionWorkerRssCapMiB, defaultAdmissionQueueBoundSeconds, defaultAdmissionFailClosed)
+	}
+	if admissionMemoryBudgetFloorMiB != 512 {
+		t.Errorf("admissionMemoryBudgetFloorMiB = %d; the CRD's Minimum on memoryBudgetMiB is 512, keep the two equal", admissionMemoryBudgetFloorMiB)
+	}
+
+	// The CR's values win over every default, the derived budget included, and a false
+	// fail_closed is rendered rather than dropped: an absent key would read as the default.
+	tuned := agentWithTuning(&agentv1alpha1.TuningSpec{Admission: &agentv1alpha1.AdmissionSpec{
+		MemoryBudgetMiB:   ptr.To[int32](6144),
+		WorkerRssCapMiB:   ptr.To[int32](2048),
+		QueueBoundSeconds: ptr.To[int32](300),
+		FailClosed:        ptr.To(false),
+	}})
+	tuned.Spec.Deployment = raised.Spec.Deployment
+	assertAdmission(t, "tuned", managedAdmission(t, tuned), 6144, 2048, 300, false)
+	if !strings.Contains(buildConfigMapData(tuned, nil)[managedConfigKey], "fail_closed: false") {
+		t.Errorf("fail_closed: false must be rendered as a key, got:\n%s", buildConfigMapData(tuned, nil)[managedConfigKey])
+	}
+
+	// A partial block keeps the defaults for the fields it leaves out, the derived budget
+	// included: setting one field is not a way to lose the others.
+	partial := agentWithTuning(&agentv1alpha1.TuningSpec{Admission: &agentv1alpha1.AdmissionSpec{
+		WorkerRssCapMiB: ptr.To[int32](1024),
+	}})
+	partial.Spec.Deployment = raised.Spec.Deployment
+	assertAdmission(t, "partial", managedAdmission(t, partial),
+		6144, 1024, defaultAdmissionQueueBoundSeconds, defaultAdmissionFailClosed)
+
+	// One route only: an overlay copy would be merged into a profile's config.yaml and then
+	// overruled by the pin, and would outlive the CR field.
+	for key, overlay := range buildConfigMapData(tuned, nil) {
+		if key != managedConfigKey && strings.Contains(overlay, "memory_budget_mib") {
+			t.Errorf("%s must not carry kanban.admission; it belongs to the managed scope alone", key)
 		}
 	}
 }

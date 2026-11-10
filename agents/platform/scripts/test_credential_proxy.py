@@ -11045,10 +11045,11 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
 
     def test_serve_drains_on_sigterm_in_the_broker_and_exec_roles(self):
         # The broker pod's and the exec pods' grace periods hold the drain; the
-        # sidecar roles' pods keep the short stop.
+        # sidecar roles' pods keep the short stop. An exec pod drains for as
+        # long as the longest command it admits, the broker for its bounded 30s.
         for role, drain_seconds in (
             ("broker", credential_proxy.SHUTDOWN_DRAIN_SECONDS),
-            (credential_proxy_client.EXEC_ROLE, credential_proxy.SHUTDOWN_DRAIN_SECONDS),
+            (credential_proxy_client.EXEC_ROLE, credential_proxy.EXEC_SHUTDOWN_DRAIN_SECONDS),
             ("combined", 0),
         ):
             with self.subTest(role=role):
