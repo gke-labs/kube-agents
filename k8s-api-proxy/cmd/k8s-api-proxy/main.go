@@ -27,15 +27,23 @@ const (
 	metricsUnavailableAlert = "ALERT metrics listener unavailable; kube-proxy serves no /metrics until it restarts, and API proxying is unaffected"
 	metricsPortEnv          = "KUBE_PROXY_METRICS_PORT"
 	metricsPortFlag         = "metrics-port"
+	maxInFlightEnv          = "KUBE_PROXY_MAX_IN_FLIGHT"
+
+	// defaultMaxInFlight keeps a replica under its 512Mi limit (kubeProxyMemoryLimit in
+	// k8s-operator/internal/controller/kube_proxy_manifests.go): at the 500-object pages
+	// kubectl reads, a forwarded list held about 9.5 MiB in flight and the proxy was
+	// OOMKilled at 43 to 48 in flight.
+	defaultMaxInFlight = 24
 
 	// otelShutdownTimeout bounds the flush of buffered spans on exit.
 	otelShutdownTimeout = 5 * time.Second
 	// readHeaderTimeout closes a connection whose request headers have not
 	// arrived in time, so a slow client cannot hold one open indefinitely.
 	readHeaderTimeout = 15 * time.Second
-	// serverShutdownTimeout bounds srv.Shutdown after SIGTERM. main does not
-	// wait for Shutdown to return, so a request still in flight when the
-	// process exits is cut.
+	// serverShutdownTimeout is how long in-flight requests get to finish
+	// after SIGTERM before their connections are closed. An open watch or
+	// log follow never finishes on its own, so it reaches this timeout and
+	// its client reconnects to another replica.
 	serverShutdownTimeout = 10 * time.Second
 )
 
@@ -156,6 +164,7 @@ func main() {
 		scopeFile                = flag.String("scope-file", envOrDefault("KUBE_PROXY_SCOPE_FILE", ""), "The install's scope.json; every request to a cluster its exclude.clusters names is refused (empty excludes nothing)")
 		excludeHostCluster       = flag.String("exclude-host-cluster-id", envOrDefault("KUBE_PROXY_EXCLUDE_HOST_CLUSTER_ID", ""), "gke_ ID of the cluster the proxy runs in, which in-cluster is checked against the exclusions as; routing is unaffected")
 		cacheDiscoveryTTL        = flag.Duration("cache-discovery-ttl", envDurationOrDefault("KUBE_PROXY_CACHE_DISCOVERY_TTL", k8sapiproxy.DefaultDiscoveryCacheTTL), "Default TTL for cached discovery responses (0s uses the default)")
+		maxInFlight              = flag.Int("max-in-flight", envIntOrDefault(maxInFlightEnv, defaultMaxInFlight), "Forwarded requests in flight before kube-proxy answers 429 with Retry-After; watches and long-running subresources do not count (0 disables the cap)")
 	)
 	flag.Parse()
 
@@ -254,6 +263,7 @@ func main() {
 		Logger:         logger,
 		Metrics:        metrics,
 		TracerProvider: tp,
+		MaxInFlight:    *maxInFlight,
 	})
 	if err != nil {
 		log.Fatalf("failed to initialize k8s-api-proxy handler: %v", err)
@@ -268,21 +278,39 @@ func main() {
 		},
 	}
 
-	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), serverShutdownTimeout)
-		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
-	}()
-
+	listen := srv.ListenAndServe
 	if *tlsCertFile != "" && *tlsKeyFile != "" {
 		log.Printf("starting k8s-api-proxy (TLS) on %s (mode=%s, redactSecrets=%v, metricsPort=%d, cacheMaxBytes=%d)", *listenAddr, mode, *redactSecrets, *metricsPort, *cacheMaxBytes)
-		err = srv.ListenAndServeTLS(*tlsCertFile, *tlsKeyFile)
+		listen = func() error { return srv.ListenAndServeTLS(*tlsCertFile, *tlsKeyFile) }
 	} else {
 		log.Printf("starting k8s-api-proxy (plain HTTP) on %s (mode=%s, redactSecrets=%v, metricsPort=%d, cacheMaxBytes=%d)", *listenAddr, mode, *redactSecrets, *metricsPort, *cacheMaxBytes)
-		err = srv.ListenAndServe()
 	}
-	if err != nil && !errors.Is(err, http.ErrServerClosed) {
+	drainErr, err := serveUntilDrained(ctx, srv, listen, serverShutdownTimeout)
+	if err != nil {
 		log.Fatalf("k8s-api-proxy server exited with error: %v", err)
 	}
+	if drainErr != nil {
+		log.Printf("closed requests still open after the %s shutdown drain (open watches and log follows end this way): %v", serverShutdownTimeout, drainErr)
+	}
+}
+
+// serveUntilDrained runs listen until ctx ends, then stops srv accepting and
+// returns only once its in-flight requests finish or timeout passes. Returning
+// as soon as listen does would cut them: ListenAndServe returns the moment
+// Shutdown starts, not when it ends. Hijacked connections (exec,
+// port-forward) are not waited for. err is listen's own failure, such as a
+// port already bound; drainErr is Shutdown's, set when timeout cut requests.
+func serveUntilDrained(ctx context.Context, srv *http.Server, listen func() error, timeout time.Duration) (drainErr, err error) {
+	drained := make(chan error, 1)
+	go func() {
+		<-ctx.Done()
+		// ctx is already done; the drain gets its own deadline.
+		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+		defer cancel()
+		drained <- srv.Shutdown(shutdownCtx)
+	}()
+	if err := listen(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return nil, err
+	}
+	return <-drained, nil
 }

@@ -957,6 +957,49 @@ callbacks is the formatted list of LiteLLM callbacks, built by the caller.
 {{- if and (gt $retryAfter 0) (gt (add $gatewayHoldSeconds $firstChunkAllowanceSeconds) $workerStaleSeconds) -}}
 {{- fail (printf "litellm.fallback.numRetries %d with retryAfterSeconds %d holds a rate-limited call %ds at the gateway; with %ds for the model's first chunk that crosses the agents' %ds stale-stream bound (stale_timeout_seconds), and the agent would drop the stream before it sees the 429" $numRetries $retryAfter $gatewayHoldSeconds $firstChunkAllowanceSeconds $workerStaleSeconds) -}}
 {{- end -}}
+{{- /*
+  The spend ceiling, as router_settings.provider_budget_config for the one
+  provider every alias routes to. LiteLLM's router budget limiter
+  (litellm/router_strategy/budget_limiter.py, v1.106.0) adds each response's
+  cost to a per-provider counter in the router's cache, filters the provider's
+  deployments out once the counter reaches budget_limit, and lets the counter
+  expire time_period after the window opened (at router start for the first
+  window, at the first spend after expiry for the next); its spend comes from
+  the standard logging payload, so streamed calls count, and lands when a call
+  completes, so the calls in flight when the share is crossed are charged past
+  it. Chosen over
+  litellm_settings.max_budget, which without a database counts only
+  non-streamed calls, from the completion text alone, and exports nothing.
+  The cache is in-process (the chart runs no Redis), so the ceiling is split
+  evenly across the gateway's replicas: each replica refuses on its share, so
+  the install's spend per window is bounded by .budget.usd plus the in-flight
+  calls above, and a restarted pod starts its count over. The share is
+  rendered with four decimals, always with a
+  dot, so PyYAML reads a float; a share that rounds to 0 is refused, because
+  LiteLLM treats a budget_limit of 0 as no limit. The schema's floor of 0.01
+  (shared by the installer and the Terraform example, which refuse less before
+  any apply) keeps that out of reach up to 100 replicas; this is the backstop.
+*/}}
+{{- $budget := .budget | default dict -}}
+{{- $budgetUSD := float64 ($budget.usd | default 0) -}}
+{{- $budgetPeriod := $budget.period | default "" -}}
+{{- $budgetReplicas := max (int (.replicas | default 1)) 1 -}}
+{{- $budgetPeriodPattern := `^[1-9][0-9]*(s|m|h|d|w|mo)$` -}}
+{{- $budgetShareFormat := "%.4f" -}}
+{{- $budgetShareZero := "0.0000" -}}
+{{- $budgetShare := "" -}}
+{{- if lt $budgetUSD 0.0 -}}
+{{- fail (printf "litellm.budget.usd %v is negative; 0 turns the ceiling off" $budget.usd) -}}
+{{- end -}}
+{{- if gt $budgetUSD 0.0 -}}
+{{- if not (regexMatch $budgetPeriodPattern $budgetPeriod) -}}
+{{- fail (printf "litellm.budget.period %q is not a LiteLLM duration (a whole number and s, m, h, d, w or mo, such as 1d); litellm.budget.usd %v needs one" $budgetPeriod $budget.usd) -}}
+{{- end -}}
+{{- $budgetShare = printf $budgetShareFormat (divf $budgetUSD (float64 $budgetReplicas)) -}}
+{{- if eq $budgetShare $budgetShareZero -}}
+{{- fail (printf "litellm.budget.usd %v split across %d gateway replicas is under 0.0001 USD per replica, which LiteLLM reads as no ceiling; raise the budget or lower litellm.replicaCount" $budget.usd $budgetReplicas) -}}
+{{- end -}}
+{{- end -}}
 {{- $primaries := list "model-default" "hermes-agent" .model -}}
 {{- if and $fallbackName (has $fallbackName $primaries) -}}
 {{- fail (printf "litellm.fallback.modelName %q is already a primary alias (%s); a model cannot fall back to itself" $fallbackName (join ", " $primaries)) -}}
@@ -1024,7 +1067,7 @@ litellm_settings:
   only in its anthropic overlay; see that file for why the breakpoints live
   here rather than in the agent's own config.
 */}}
-{{- if or $claude $fallbackName (gt $timeout 0) (gt $numRetries 0) (gt $retryAfter 0) }}
+{{- if or $claude $fallbackName (gt $timeout 0) (gt $numRetries 0) (gt $retryAfter 0) $budgetShare }}
 router_settings:
   {{- if $fallbackName }}
   fallbacks:
@@ -1048,6 +1091,17 @@ router_settings:
   {{- if gt $retryAfter 0 }}
   retry_after: {{ $retryAfter }}
   {{- end }}
+  {{- /*
+    The spend ceiling's share for this replica; see the budget block above.
+    Keyed on the provider prefix every alias carries, which is what LiteLLM
+    resolves for the deployment and records on the logging payload.
+  */}}
+  {{- if $budgetShare }}
+  provider_budget_config:
+    {{ $litellmProvider }}:
+      budget_limit: {{ $budgetShare }}
+      time_period: {{ $budgetPeriod | quote }}
+  {{- end }}
   {{- if $claude }}
   default_litellm_params:
     cache_control_injection_points:
@@ -1062,102 +1116,6 @@ router_settings:
         index: -1
   {{- end }}
 {{- end }}
-{{- end }}
-
-{{/*
-Every LiteLLM callback entry the chart can register, named once and sorted by
-whether the shadow replay proxy's key covers it
-(kube-agents.replayModelBehaviourChecksum). replayKeyed: the hooks that change
-what the model is sent or what comes back (thinking replay, cache-marker strip,
-redaction). replayUnkeyed: telemetry (otel, prometheus, the trace logger), the
-OAuth2 credential hook, and session affinity, which only picks a Vertex
-serving replica. templates/litellm.yaml registers callbacks only through these
-names, and tests/test_chart_replay_shadow.py fails on a rendered entry that is
-in neither set, so a new hook has to be put in one.
-
-Takes the root context; returns JSON.
-*/}}
-{{- define "kube-agents.litellmCallbacks" -}}
-{{- toJson (dict
-  "replayKeyed" (dict
-    "thinkingReplay" "litellm_thinking_replay_callback.proxy_handler_instance"
-    "cacheControlStrip" "litellm_cache_control_strip_callback.proxy_handler_instance"
-    "redaction" "litellm_redaction_callback.proxy_handler_instance")
-  "replayUnkeyed" (dict
-    "otel" "otel"
-    "prometheus" "prometheus"
-    "oauth2" "litellm_oauth2_callback.proxy_handler_instance"
-    "sessionAffinity" "litellm_session_affinity_callback.proxy_handler_instance"
-    "traceLog" "llm_trace_logger.proxy_handler_instance")) -}}
-{{- end }}
-
-{{/*
-The shadow replay proxy's checksum of what decides the model's answer
-(REPLAY_MODEL_BEHAVIOUR_CHECKSUM in litellm.yaml). The pods' checksum/config
-covers the whole config; this one treats the two LiteLLM routes to Google's
-Gemini models, gemini/ (the Gemini Developer API) and vertex_ai/ (Vertex AI),
-as one, so a nightly and a presubmit serving the same model with the same
-settings get the same replay key. Without that, the eval nightlies (Gemini
-Developer API) record answers no presubmit (Vertex AI) can ever look up.
-
-TODO(#4988): temporary. Once the nightlies and presubmits call the model
-through one API, key replay on the full checksum/config again and delete this.
-
-From the parsed rendered config it changes, and keeps everything else:
-  - a model's gemini/ or vertex_ai/ prefix becomes one shared token
-    ($sharedGoogleRoute); every other provider prefix stays as rendered, so
-    openai_compatible against gemini, or two servers behind two api_base
-    values, keep apart (the chart renders api_base for openai_compatible
-    only, so it stays in);
-  - the Vertex route keys ($vertexRouteParams) are dropped defensively: the
-    chart renders none of them into the config today (the project and
-    location reach the pod as env vars);
-  - the router's timeout and retry settings, which decide when a call is
-    retried, not what the answer says ($deliverySettings), are dropped;
-  - callbacks become .callbacks, the replayKeyed entries of
-    kube-agents.litellmCallbacks in registration order.
-Each keyed hook's source, and the redaction rule file when redaction is on,
-arrive in .sources and are hashed with the config, so an edit to one changes
-the key the way it rolls the pods.
-
-Takes a dict of config (the rendered gateway config), callbacks (the kept
-callback entries, in order) and sources (a list of strings).
-*/}}
-{{- define "kube-agents.replayModelBehaviourChecksum" -}}
-{{- $vertexRouteParams := list "vertex_project" "vertex_location" "vertex_credentials" -}}
-{{- $deliverySettings := list "timeout" "num_retries" "retry_after" -}}
-{{- $googleRoutePattern := "^(gemini|vertex_ai)/" -}}
-{{- $sharedGoogleRoute := "gemini-or-vertex_ai/" -}}
-{{- $parsed := .config | fromYaml -}}
-{{- if hasKey $parsed "Error" -}}
-{{- fail (printf "the rendered LiteLLM config does not parse as YAML, so the replay checksum cannot be computed: %s" (get $parsed "Error")) -}}
-{{- end -}}
-{{- $behaviour := deepCopy $parsed -}}
-{{- $models := list -}}
-{{- range $parsed.model_list -}}
-{{- $params := deepCopy .litellm_params -}}
-{{- range $vertexRouteParams -}}
-{{- $_ := unset $params . -}}
-{{- end -}}
-{{- $_ := set $params "model" (regexReplaceAll $googleRoutePattern $params.model $sharedGoogleRoute) -}}
-{{- $models = append $models (set (deepCopy .) "litellm_params" $params) -}}
-{{- end -}}
-{{- $_ := set $behaviour "model_list" $models -}}
-{{- $settings := deepCopy ($parsed.litellm_settings | default dict) -}}
-{{- $_ := set $settings "callbacks" .callbacks -}}
-{{- $_ := set $behaviour "litellm_settings" $settings -}}
-{{- if $parsed.router_settings -}}
-{{- $router := deepCopy $parsed.router_settings -}}
-{{- range $deliverySettings -}}
-{{- $_ := unset $router . -}}
-{{- end -}}
-{{- if $router -}}
-{{- $_ := set $behaviour "router_settings" $router -}}
-{{- else -}}
-{{- $_ := unset $behaviour "router_settings" -}}
-{{- end -}}
-{{- end -}}
-{{- printf "%s%s" (toJson $behaviour) (join "" .sources) | sha256sum -}}
 {{- end }}
 
 {{/*
@@ -2578,7 +2536,7 @@ platformAgent.deployment.credentialProxy.resources. Copies of the operator's:
 credentialProxyCPURequest, credentialProxyMemoryRequest, credentialProxyCPULimit,
 credentialProxyMemoryLimit and credentialProxyEphemeralStorageLimit, and
 credentialProxyMemoryFloorBytesAtDefaultCap, credentialProxyMinimumMemoryLimitBytes at the
-default output cap, 672Mi (k8s-operator/internal/controller/credential_proxy_manifests.go).
+default output cap, 544Mi (k8s-operator/internal/controller/credential_proxy_manifests.go).
 tests/test_credential_proxy_sizing_parity.py holds them equal, the floor to the operator's and
 the broker's declared copies; each side's own test holds its copy to its formula. Change all
 sides together.
@@ -2818,7 +2776,7 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
 {{- end }}
 
 {{- define "kube-agents.credentialProxyMemoryFloorBytes" -}}
-704643072
+570425344
 {{- end }}
 
 {{- define "kube-agents.quotaRequirements" -}}

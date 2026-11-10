@@ -14,7 +14,7 @@ import tempfile
 import unittest
 import unittest.mock
 
-from eval_dashboard import nightly, post_health, render, trend
+from eval_dashboard import links, nightly, post_health, render, trend
 from test_eval_dashboard_pages import (
     TWO_POLLS_BUDGET_MS,
     chrome,
@@ -266,11 +266,33 @@ class ShapeRollupTest(unittest.TestCase):
 
 
 class BuildUrlTest(unittest.TestCase):
-    """The links follow the bucket the collector read the build from
-    (``runs[].log_url``); a record without the field is from the bucket the
-    nightly used before 2026-09-15 and is linked there."""
+    """The links follow the bucket the collector read the build from:
+    Spyglass for a bucket Deck reads (``runs[].log_url``), the Cloud Console
+    for a private one (``runs[].gcs_base``, or a Spyglass ``log_url`` into it
+    from before the field; links.py); a record with neither field is from
+    the bucket the nightly used before 2026-09-15 and is linked there."""
 
-    URL = "https://oss.gprow.dev/view/gs/kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly/3000000000000000005"
+    URL = f"https://oss.gprow.dev/view/gs/kube-agents-prow/logs/{JOB}/3000000000000000005"
+    PRIVATE_URL = f"https://oss.gprow.dev/view/gs/kube-agents-evals-nightly-logs/logs/{JOB}/3000000000000000005"
+    GCS_BASE = f"gs://kube-agents-evals-nightly-logs/logs/{JOB}/3000000000000000005/"
+    CONSOLE = f"https://console.cloud.google.com/storage/browser/kube-agents-evals-nightly-logs/logs/{JOB}/3000000000000000005"
+    CONSOLE_TRANSCRIPT = f"https://storage.cloud.google.com/kube-agents-evals-nightly-logs/logs/{JOB}/3000000000000000005/artifacts/eval_case-b_rep1.log"
+
+    def test_a_run_in_a_private_bucket_links_the_console(self):
+        run = {"build_id": "3000000000000000005", "job": JOB, "gcs_base": self.GCS_BASE, "log_url": self.PRIVATE_URL}
+        self.assertEqual(nightly.build_url(run), self.CONSOLE)
+        self.assertEqual(nightly.transcript_url(run, "case-b"), self.CONSOLE_TRANSCRIPT)
+        # A record from before gcs_base: its Spyglass link into the private bucket is dead, so it is rewritten.
+        legacy = {"build_id": "3000000000000000005", "job": JOB, "log_url": self.PRIVATE_URL}
+        self.assertEqual(nightly.build_url(legacy), self.CONSOLE)
+        self.assertEqual(nightly.transcript_url(legacy, "case-b"), self.CONSOLE_TRANSCRIPT)
+        self.assertEqual(links.private_gcs_base(self.PRIVATE_URL), self.GCS_BASE)
+        # A bucket Deck reads keeps its Spyglass link.
+        public = {"build_id": "3000000000000000005", "job": JOB, "log_url": self.URL}
+        self.assertEqual(nightly.build_url(public), self.URL)
+        self.assertEqual(nightly.transcript_url(public, "case-b"), self.URL + "/artifacts/eval_case-b_rep1.log")
+        self.assertIsNone(links.private_gcs_base(self.URL))
+        self.assertIsNone(links.private_gcs_base(self.GCS_BASE), "not a Spyglass link")
 
     def test_a_recorded_log_url_wins_and_the_transcript_hangs_off_it(self):
         run = {"build_id": "3000000000000000005", "job": JOB, "log_url": self.URL}
@@ -296,6 +318,8 @@ class BuildUrlTest(unittest.TestCase):
         data["pending_builds"] = [{"build_id": "3000000000000000005", "first_seen": "2026-09-08T14:05:00+00:00", "tier": "nightly", "log_url": self.URL}]
         now = datetime.datetime.fromisoformat(NOW)
         self.assertEqual(nightly.running_nights(data, now)[0]["log_url"], self.URL)
+        data["pending_builds"][0]["log_url"] = self.PRIVATE_URL
+        self.assertEqual(nightly.running_nights(data, now)[0]["log_url"], self.CONSOLE, "a running night in the private bucket links the Console")
 
 
 class DigestLineTest(unittest.TestCase):
@@ -398,7 +422,10 @@ WRITERS_2 = "3000000000000000012"
 SPLIT_CASES = [*CASES, {"name": "pr-a", "domain": "gitops", "active": False, "nightly_active": True},
                {"name": "pr-b", "domain": "gitops", "active": False, "nightly_active": True}]
 RERUN_MAIN = "3000000000000000004"
-WRITERS_URL = f"https://oss.gprow.dev/view/gs/kube-agents-evals-nightly-logs/logs/{WRITERS_JOB}/{WRITERS_2}"
+# The writers part logs to the private nightly bucket (its fixture's log_url is
+# the Spyglass link the collector recorded), so the report links the Console.
+WRITERS_URL = f"https://console.cloud.google.com/storage/browser/kube-agents-evals-nightly-logs/logs/{WRITERS_JOB}/{WRITERS_2}"
+WRITERS_TRANSCRIPT = f"https://storage.cloud.google.com/kube-agents-evals-nightly-logs/logs/{WRITERS_JOB}/{WRITERS_2}/artifacts/eval_pr-b_rep1.log"
 
 
 def writers(build, started, finished, tasks, result="SUCCESS", duration_s=7800, **extra):
@@ -422,6 +449,73 @@ def split_nights():
 class SplitNightTest(unittest.TestCase):
     def line(self, data, at=DIGEST_AT):
         return nightly.digest_line(data, at, clock=lambda value: post_health.clock(value, weekday=True))
+
+    def test_a_main_c_build_is_a_main_shard_for_the_cut_and_the_verdict(self):
+        """The main part as five jobs (#4238): a ci-kube-agents-eval-nightly-main-c
+        build is the main-c part, joins the night beside main and main-b, cuts
+        the night short when it is cut, is named with its own wall clock, and
+        withholds the newly-failing verdict when it is missing."""
+        job, build = "ci-kube-agents-eval-nightly-main-c", "3000000000000000023"
+        data = split_nights()
+        data["cases"].append({"name": "c-c", "domain": "cost", "active": True, "nightly_active": True})
+        data["runs"].append(night(build, "2026-09-08T00:00:04+00:00", "2026-09-08T05:00:04+00:00", [task("c-c", "pass", "pass", "pass")],
+                                  result="SUCCESS", duration_s=18000, job=job,
+                                  log_url=f"https://oss.gprow.dev/view/gs/kube-agents-evals-nightly-logs/logs/{job}/{build}"))
+        self.assertEqual(nightly.night_part({"job": job}), "main-c")
+        self.assertIn("main-c", nightly.MAIN_PARTS)
+        last = nightly.night_reports(data)[0]
+        self.assertEqual([p["part"] for p in last["parts"]], ["main", "main-c", "writers"])
+        self.assertEqual(last["counts"]["recorded"], 6)
+        self.assertFalse(last["truncated"])
+        self.assertIsNone(last["verdict_withheld_by"])
+        # Cut short: the night is cut, and the digest names the third with its own clock.
+        cut = copy.deepcopy(data)
+        run = next(r for r in cut["runs"] if r["build_id"] == build)
+        run.update(result="FAILURE", eval_verdict=None, duration_s=18000)
+        report = nightly.night_reports(cut)[0]
+        self.assertTrue(report["truncated"])
+        self.assertIn("main-c part truncated after 5h", self.line(cut))
+        # Missing the next night, after it recorded a case: no verdict on what is newly failing.
+        later = copy.deepcopy(data)
+        later["runs"].append(night("3000000000000000031", "2026-09-09T00:00:00+00:00", "2026-09-09T06:40:00+00:00", [task("case-a", "pass", "pass", "pass")]))
+        report = nightly.night_reports(later)[0]
+        self.assertIn("main-c", report["missing_parts"])
+        self.assertEqual(report["verdict_withheld_by"], "main-c")
+
+    def test_the_writers_thirds_join_the_night_as_parts_of_their_own(self):
+        """The writers part as three jobs (#4238): a build of
+        ci-kube-agents-eval-nightly-writers-b or -writers-c is the writers-b
+        or writers-c part, joins the night of its date beside the writers
+        part, counts its cases once, and is named by its own word when cut
+        short; the writers job's build stays the writers part."""
+        data = split_nights()
+        data["cases"] += [{"name": "pr-c", "domain": "gitops", "active": False, "nightly_active": True},
+                          {"name": "pr-d", "domain": "gitops", "active": False, "nightly_active": True}]
+        for job, build, case, result in (("ci-kube-agents-eval-nightly-writers-b", "3000000000000000022", "pr-c", "SUCCESS"),
+                                         ("ci-kube-agents-eval-nightly-writers-c", "3000000000000000023", "pr-d", "FAILURE")):
+            data["runs"].append(night(build, "2026-09-08T00:00:07+00:00", "2026-09-08T03:00:07+00:00", [task(case, "pass", "pass", "pass")],
+                                      result=result, duration_s=10800, job=job,
+                                      log_url=f"https://oss.gprow.dev/view/gs/kube-agents-evals-nightly-logs/logs/{job}/{build}"))
+        self.assertEqual(nightly.night_part({"job": "ci-kube-agents-eval-nightly-writers-b"}), "writers-b")
+        self.assertEqual(nightly.night_part({"job": "ci-kube-agents-eval-nightly-writers-c"}), "writers-c")
+        nights = nightly.night_reports(data)
+        self.assertEqual([n["build"] for n in nights], [NIGHT_2, NIGHT_1], "still two nights, filed by the main part")
+        last = nights[0]
+        self.assertEqual([(p["part"], p["job"]) for p in last["parts"]],
+                         [("main", JOB), ("writers", WRITERS_JOB), ("writers-b", "ci-kube-agents-eval-nightly-writers-b"), ("writers-c", "ci-kube-agents-eval-nightly-writers-c")])
+        self.assertEqual(last["counts"], {"expected": 7, "recorded": 7, "passed": 4, "partial": 1, "failed": 2, "infra": 0, "missing": 0})
+        self.assertTrue(last["complete"])
+        # writers-c ended FAILURE with its verdict recorded: not a truncation,
+        # and a writers third never cuts the night short anyway.
+        self.assertFalse(last["truncated"])
+        self.assertEqual((last["missing_parts"], last["running_parts"]), ([], []))
+        self.assertEqual((last["job"], last["duration_s"]), (JOB, 24000), "the main part's name and the longest part's clock")
+        self.assertEqual(self.line(data), "🌙 Nightly: 7 cases · 4 passed all reps · 1 partial · 2 failed · newly failing: case-b, pr-b · 6h 40m")
+        # The night after, short of pr-c, names the part that recorded it.
+        later = copy.deepcopy(data)
+        later["runs"].append(night("3000000000000000031", "2026-09-09T00:00:00+00:00", "2026-09-09T06:40:00+00:00", [task("case-a", "pass", "pass", "pass")]))
+        self.assertEqual(nightly.night_reports(later)[0]["missing_parts"], ["writers", "writers-b", "writers-c"])
+        self.assertIn("writers-b part missing", self.line(later, DIGEST_AT + datetime.timedelta(days=1)))
 
     def test_one_job_alone_is_one_part_per_night_and_expects_no_other(self):
         for report in nightly.night_reports(two_nights()):
@@ -447,7 +541,7 @@ class SplitNightTest(unittest.TestCase):
         self.assertEqual((last["job"], last["result"], last["project"]), (JOB, "FAILURE", "kube-agents-evals-3"), "the main part's")
         self.assertEqual((last["started"], last["finished"], last["duration_s"]), ("2026-09-08T00:00:00+00:00", "2026-09-08T06:40:00+00:00", 24000))
         by_name = {c["case"]: c for c in last["cases"]}
-        self.assertEqual(by_name["pr-b"]["transcript_url"], f"{WRITERS_URL}/artifacts/eval_pr-b_rep1.log", "each case links its own build")
+        self.assertEqual(by_name["pr-b"]["transcript_url"], WRITERS_TRANSCRIPT, "each case links its own build")
         self.assertEqual([c["case"] for c in last["cases"]], ["case-a", "pr-a", "pr-b", "case-b", "case-c"], "by domain, then name, across the parts")
         # Monday, before any writers build: incomplete against today's
         # matrix, but no part is missing.
@@ -834,7 +928,8 @@ MAIN_B_JOB = "ci-kube-agents-eval-nightly-main-b"
 MAIN_B_2 = "3000000000000000022"
 THREE_PART_CASES = [*SPLIT_CASES, {"name": "b-a", "domain": "network", "active": True, "nightly_active": True},
                     {"name": "b-b", "domain": "network", "active": True, "nightly_active": True}]
-MAIN_B_URL = f"https://oss.gprow.dev/view/gs/kube-agents-evals-nightly-logs/logs/{MAIN_B_JOB}/{MAIN_B_2}"
+MAIN_B_URL = f"https://console.cloud.google.com/storage/browser/kube-agents-evals-nightly-logs/logs/{MAIN_B_JOB}/{MAIN_B_2}"
+MAIN_B_TRANSCRIPT = f"https://storage.cloud.google.com/kube-agents-evals-nightly-logs/logs/{MAIN_B_JOB}/{MAIN_B_2}/artifacts/eval_b-b_rep1.log"
 
 
 def main_b(build, started, finished, tasks, result="SUCCESS", duration_s=12000, **extra):
@@ -876,7 +971,7 @@ class ThreePartNightTest(unittest.TestCase):
         self.assertEqual(last["newly_failing"], ["b-b", "case-b", "pr-b"])
         self.assertEqual((last["build"], last["job"], last["result"]), (NIGHT_2, JOB, "FAILURE"), "the main part's")
         self.assertEqual((last["started"], last["finished"], last["duration_s"]), ("2026-09-08T00:00:00+00:00", "2026-09-08T06:40:00+00:00", 24000))
-        self.assertEqual({c["case"]: c["transcript_url"] for c in last["cases"]}["b-b"], f"{MAIN_B_URL}/artifacts/eval_b-b_rep1.log")
+        self.assertEqual({c["case"]: c["transcript_url"] for c in last["cases"]}["b-b"], MAIN_B_TRANSCRIPT)
         self.assertEqual(nightly.night_builds(data), {NIGHT_1: NIGHT_1, NIGHT_2: NIGHT_2, MAIN_B_2: NIGHT_2, WRITERS_2: NIGHT_2})
         # Monday, before any main-b or writers build: short of today's
         # matrix, but no part is missing.

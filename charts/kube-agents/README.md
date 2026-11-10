@@ -246,6 +246,12 @@ under every primary alias the same way (the fallback alias carries
 On a Gemini 2.5 or 3.x model the gateway asks for the model's thoughts with a
 `thinking` key under every primary alias, which a `reasoningEffort` value replaces
 ([why](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#geminis-thoughts)).
+`litellm.budget.usd` (default `0`, meaning none) with `litellm.budget.period`
+(default `1d`) puts a spend ceiling on the gateway, LiteLLM's provider budget
+for the model's provider split evenly across `litellm.replicaCount`; a replica
+whose share is spent refuses model calls until the window ends, and exports the
+remaining share as `litellm_provider_remaining_budget_metric`
+([details](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#setting-a-spend-ceiling)).
 On a Claude model the gateway
 drops `temperature`, `top_p` and `top_k` from every request
 ([why](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#setting-the-default-model)),
@@ -999,10 +1005,11 @@ gives each setting's meaning and default. Alert excludes are under
 incident, while their clusters stay in scope for reads. The list is forwarded to the CR's
 `spec.harness.eventWatcher.alertExclude` when it has a rule, and an empty list omits it. The schema
 holds the CRD's bounds (at most 64 rules, a length limit and a pattern on each part), so a rule the
-API server would refuse fails the render. A change rolls the agent pod. On an existing install,
-apply the chart's `crds/` first: against a CRD that predates the field, the chart fails the upgrade
-instead of letting the API server prune the rules. A `helm upgrade` that removes the last rule also
-removes an `enabled: false` set on the CR by hand. The
+API server would refuse fails the render. A change is in force within about two minutes, without a
+pod restart (at the next pod restart if the agent image is older than the operator). On an existing
+install, apply the chart's `crds/` first: against a CRD that predates the field, the chart fails the
+upgrade instead of letting the API server prune the rules. A `helm upgrade` that removes the last
+rule also removes an `enabled: false` set on the CR by hand. The
 [`spec.harness.eventWatcher` section of the CRD reference](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#specharnesseventwatcher)
 gives the rule parts, how they match, and an example.
 
@@ -1202,7 +1209,9 @@ The third, `kube-agents-a2a-gateway-pod`, is generated from
 `k8s-operator/config/admission/a2a-gateway-pod-policy.yaml`. It holds every pod
 the A2A gateway's ServiceAccount creates to the session pod shape: the session
 ServiceAccount, no automount, the session token audiences, no Secret or host
-access, Pod Security "restricted", and exactly the session labels. Where it is
+access, Pod Security "restricted", exactly the session labels, no runtime
+class, node selector, affinity or positive priority, and only the scheduler and
+tolerations the API server and GKE add. Where it is
 rendered, the chart also sets `A2A_GATEWAY_POD_POLICY=true` on the operator, a
 signal for operator features that must run only where this policy is installed.
 Setting `admissionPolicy.enabled=false` removes this policy and that signal too.
@@ -1214,7 +1223,8 @@ ServiceAccount to its own annotations and `spec.integration.forges`,
 `repositories` and `github` on the PlatformAgent, and refuses any other change it
 makes. Inside `forges`, the console may not move an existing forge's credential to
 another host or change the account it acts as, add a forge with a credential, add a GitHub forge at a new host, or
-change the install's GitHub host.
+change the install's GitHub host. While the `PlatformAgent` has a forge the operator
+refuses, the console may not add, remove or reorder forges until an administrator fixes it.
 
 The templates check `.Capabilities.KubeVersion` as well as this value, so on a
 cluster below Kubernetes 1.30 — where the policy API is not yet `v1` — it
@@ -1474,7 +1484,11 @@ would hang in `Terminating`. `platformAgent.cleanupHook` (on by default)
 prevents that with a `pre-delete` hook that deletes all `AgentProfile` CRs first
 (while the `PlatformAgent` and NATS bus are still running so tombstone cards are
 published), then deletes the `PlatformAgent` CR and waits for the finalizers
-while the operator is still running.
+while the operator is still running. The hook pod carries
+`cluster-autoscaler.kubernetes.io/safe-to-evict: "false"` and its Job retries
+twice, so a scale-down of the node the agent just left does not abort the
+uninstall; the retries run inside the same `activeDeadlineSeconds`, and a retry
+that cannot finish by then still fails the hook.
 
 The hook runs `kubectl` from `alpine/k8s`, because the operator image is
 distroless and carries no client — and because the hook needs a shell: it is

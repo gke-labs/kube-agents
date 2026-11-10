@@ -933,6 +933,30 @@ class StageTest(unittest.TestCase):
         )
         self.deliver.assert_not_called()
 
+    def test_a_lost_summary_still_to_re_send_keeps_it(self):
+        # The re-send stage needs the home channel the user's first message brings; its window bounds the wait.
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        now = self._drive()
+        self._claim(now - oobe.bootstrap_delivery.RETIRE_AFTER_SECONDS)
+        pending = [oobe.bootstrap_delivery.LostRun("fleet-wide-cost-analysis", False, now - MINUTE)]
+        with mock.patch.object(oobe.bootstrap_delivery, "pending_resends", return_value=pending) as asked:
+            self.assertEqual(self._main_removing(now), [])
+        asked.assert_called_with(self.d, oobe.read_state(self.d), now)
+        with mock.patch.object(oobe.bootstrap_delivery, "pending_resends", return_value=[]):
+            self.assertEqual(self._main_removing(now)[-1], oobe.OOBE_JOB_ID)
+
+    def test_each_tick_runs_the_lost_summaries_stage_last(self):
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        order: list[str] = []
+        self.deliver.side_effect = lambda *_a, **_k: order.append("delivery") or 0
+        with mock.patch.object(oobe.bootstrap_delivery, "resend_lost_summaries",
+                               side_effect=lambda *_a, **_k: order.append("lost summaries")) as stage:
+            self._main()
+        stage.assert_called_once_with(self.d, NOW_SETTLED)
+        self.assertEqual(order, ["delivery", "lost summaries"])
+
     def test_it_stays_until_the_report_is_claimed(self):
         self._file_scan()
         _board(self.board, [_ranking("done")])

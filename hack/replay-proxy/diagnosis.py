@@ -6,7 +6,9 @@ whether a CIDR appears anywhere in the request (IPs then stay literal), and
 one mapping, so a placeholder number in the tools depends on the messages. So the same earlier
 message can hash differently in a later request of the same conversation, and
 the closest-earlier-request search would report a difference that is only
-drift. These hashes are for that search only; they never decide a match.
+drift. analyze_shadow.py also uses them to decide which assistant messages
+the model generated in the conversation (the evidence its replayed estimates
+rest on), never as part of a cache key or the replayed key itself.
 
 The proxy remembers when it first saw each raw message (one float per distinct
 message, oldest dropped past FIRST_SEEN_CAPACITY). A request's messages are
@@ -94,7 +96,7 @@ class DiagnosisHasher:
             raw = json.dumps(message, sort_keys=True, ensure_ascii=False)
             norm.now = self._first_seen(raw, now)
             norm.keep_ips = norm.keep_ips or normalizer.CIDR_RE.search(raw) is not None
-            value = norm.walk(message)
+            value = norm.walk_message(message)
             walked.append(value)
             hashes.append(normalizer.stable_hash(value)[: normalizer.MESSAGE_HASH_HEX_CHARS])
         return hashes, walked

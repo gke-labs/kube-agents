@@ -32,14 +32,18 @@ Usage::
 ``--check`` is what CI runs: if regenerating would change a file, the committed
 documentation no longer matches its source. Naming blocks, or a prefix,
 restricts a run to those regions; ``make -C k8s-operator manifests`` uses the
-prefix to refresh the CRD field pages beside the CRD YAML.
+prefix to refresh the CRD field pages and the conditions table beside the CRD
+YAML.
 
 Standard library only, deliberately -- this must run in CI and in a bare clone
-without installing anything. The one tool it calls out to is ``go``: the CRD
-field pages are read from the operator's Go API types by
-``scripts/gen_crd_docs.go``, itself standard library and run with the
-installed toolchain. Without ``go`` on PATH a write run skips those pages and
-says so, so the other regions still refresh; ``--check`` fails, since a check
+without installing anything. The two tools it calls out to are ``go`` and
+``helm``. The CRD field pages are read from the operator's Go API types by
+``scripts/gen_crd_docs.go``, and the PlatformAgent conditions table from the
+controller package by ``scripts/gen_condition_docs.go``, both standard library,
+reading syntax, and run with the installed toolchain. The install footprint is
+rendered from the chart by ``helm`` (``scripts/install_footprint.py``). Without
+``go`` or ``helm`` on PATH a write run skips the blocks that need it and says
+so, so the other regions still refresh; ``--check`` fails, since a check
 that cannot read the pages cannot vouch for them.
 """
 
@@ -47,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+import importlib
 import json
 import os
 import re
@@ -56,6 +61,7 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 
+import install_footprint
 from generate_sop_geography import SOP_REF_RE
 
 REPO = Path(__file__).resolve().parent.parent
@@ -111,6 +117,20 @@ SKILLS_CONCEPT_PAGE = REPO / "docs/site/src/content/docs/concepts/skills.md"
 SKILLS_PAGE = REPO / "docs/site/src/content/docs/skills/index.mdx"
 IMAGES_PAGE = REPO / "docs/site/src/content/docs/deploy/docker-images.md"
 README = REPO / "README.md"
+# The replay baseline report's metric definitions, read from the script that
+# computes them (METRICS and CASE_METRICS).
+REPLAY_PROXY_DIR = REPO / "hack/replay-proxy"
+REPLAY_BASELINE_MODULE = "baseline_report"
+REPLAY_PROXY_README = REPLAY_PROXY_DIR / "README.md"
+REPLAY_METRICS_HEADER = (
+    "| Metric | Unit | Headline | Definition |",
+    "| ------ | ---- | -------- | ---------- |",
+)
+REPLAY_CASE_METRICS_HEADER = (
+    "| Case metric | Unit | Definition |",
+    "| ----------- | ---- | ---------- |",
+)
+HEADLINE_MARK = "yes"
 # A governance audit is a Platform Agent job that carries the fleet-audit skill;
 # that skill's tests hold this set equal to its audit catalogue. The prompt names
 # the audit's SOP by a path relative to the profile home.
@@ -140,6 +160,30 @@ CRD_GUIDES = {
     "AgentPlugin": "/kube-agents/operator/agentplugin-crd/",
 }
 CRD_BLOCK_PREFIX = "crd-fields-"
+# Every block read from the operator's Go source, the field pages above and the
+# conditions table below; the family `make -C k8s-operator manifests` refreshes
+# and the one that needs `go`.
+CRD_FAMILY_PREFIX = "crd-"
+# The PlatformAgent conditions table on the CRD guide, read from the slice the
+# controller package keeps beside the constants it writes, by the Go program
+# beside this script. The controller's own test holds the slice complete
+# against every condition type it writes.
+CONDITION_DOCS_GENERATOR = REPO / "scripts/gen_condition_docs.go"
+CONDITION_DOCS_DIR = REPO / "k8s-operator/internal/controller"
+CONDITIONS_BLOCK = "crd-conditions-platformagent"
+CONDITIONS_PAGE = OPERATOR_DOCS_DIR / "platformagent-crd.md"
+CONDITIONS_TABLE_HEADER = (
+    "| Type | Written | Meaning |",
+    "| ---- | ------- | ------- |",
+)
+CONDITIONS_REASONS_PLACEHOLDER = "{reasons}"
+# The install footprint, rendered from the chart by helm (scripts/install_footprint.py):
+# the tables on the prerequisites page, and the same profiles' totals as JSON for the
+# installer's summary test. Both blocks need helm, as the CRD blocks need go.
+FOOTPRINT_BLOCK_PREFIX = "install-footprint"
+FOOTPRINT_PAGE = REPO / "docs/site/src/content/docs/install/prerequisites.md"
+FOOTPRINT_PROFILES_JSON = REPO / "tests/data/footprint_profiles.json"
+HELM_BINARY = install_footprint.HELM_BINARY
 # The paragraph above the tables, rendered once here rather than kept by hand
 # on each page, so the three pages cannot drift apart. It states what the
 # tables leave out: standard metadata, the inside of upstream Kubernetes
@@ -339,6 +383,7 @@ CRON_CADENCE = {
     "11 * * * *": "Hourly at :11",
     "25 * * * *": "Hourly at :25",
     "*/10 * * * *": "Every 10 minutes",
+    "7,22,37,52 * * * *": "Four times an hour (:07, :22, :37, :52)",
     "*/30 * * * *": "Every 30 minutes",
     "0 21 * * 1-5": "Weekdays 21:00",
     "0 6 * * 6": "Weekly, Saturday 06:00",
@@ -782,28 +827,52 @@ def gen_container_images() -> str:
     return "\n".join(out).rstrip()
 
 
-def run_crd_generator(api_dir: Path, kinds: tuple[str, ...]) -> dict:
-    """Run ``gen_crd_docs.go`` over ``api_dir`` and return its JSON model.
+def load_replay_baseline_module():
+    """Import baseline_report.py from its own directory, where its sibling modules are."""
+    sys.path.insert(0, str(REPLAY_PROXY_DIR))
+    try:
+        return importlib.import_module(REPLAY_BASELINE_MODULE)
+    finally:
+        sys.path.remove(str(REPLAY_PROXY_DIR))
 
-    A missing ``go`` and a generator that refuses the package are both hard
+
+def gen_replay_baseline_metrics() -> str:
+    module = load_replay_baseline_module()
+    out = list(REPLAY_METRICS_HEADER)
+    for metric in module.METRICS:
+        out.append(
+            f"| `{metric.name}` | {metric.unit} | {HEADLINE_MARK if metric.headline else ''} |"
+            f" {escape_cell(metric.definition)} |"
+        )
+    out.append("")
+    out.extend(REPLAY_CASE_METRICS_HEADER)
+    for metric in module.CASE_METRICS:
+        out.append(f"| `{metric.name}` | {metric.unit} | {escape_cell(metric.definition)} |")
+    return "\n".join(out)
+
+
+def run_crd_generator(api_dir: Path, kinds: tuple[str, ...]) -> dict:
+    """Run ``gen_crd_docs.go`` over ``api_dir`` and return its JSON model."""
+    return run_go_generator(
+        CRD_DOCS_GENERATOR,
+        ["-dir", str(api_dir), "-kinds", ",".join(kinds)],
+        "the CRD field pages are read from the Go API types",
+    )
+
+
+def run_go_generator(program: Path, args: list[str], reads: str) -> dict:
+    """Run a standard-library Go program beside this script; return its JSON.
+
+    A missing ``go`` and a generator that refuses its input are both hard
     failures with the reason: a page silently rendered from nothing would
     pass ``--check`` while saying nothing.
     """
     if shutil.which(GO_BINARY) is None:
         raise SystemExit(
-            f"{CRD_DOCS_GENERATOR.relative_to(REPO)}: the CRD field pages are read "
-            f"from the Go API types, which needs a Go toolchain; `{GO_BINARY}` is "
-            "not on PATH."
+            f"{program.relative_to(REPO)}: {reads}, which needs a Go toolchain; "
+            f"`{GO_BINARY}` is not on PATH."
         )
-    command = [
-        GO_BINARY,
-        "run",
-        str(CRD_DOCS_GENERATOR),
-        "-dir",
-        str(api_dir),
-        "-kinds",
-        ",".join(kinds),
-    ]
+    command = [GO_BINARY, "run", str(program), *args]
     result = subprocess.run(
         command,
         cwd=REPO,
@@ -816,7 +885,7 @@ def run_crd_generator(api_dir: Path, kinds: tuple[str, ...]) -> dict:
     )
     if result.returncode != 0:
         raise SystemExit(
-            f"{CRD_DOCS_GENERATOR.relative_to(REPO)} failed "
+            f"{program.relative_to(REPO)} failed "
             f"(exit {result.returncode}):\n{result.stderr.strip()}"
         )
     return json.loads(result.stdout)
@@ -879,6 +948,31 @@ def gen_crd_fields(kind: str) -> str:
     return "\n".join(out).rstrip()
 
 
+def code_span_list(names: list[str]) -> str:
+    """Render names as "`A`, `B` or `C`"."""
+    spans = [f"`{name}`" for name in names]
+    if len(spans) < 2:
+        return "".join(spans)
+    return f"{', '.join(spans[:-1])} or {spans[-1]}"
+
+
+def render_condition_row(condition: dict) -> str:
+    meaning = condition["meaning"]
+    if condition["reasons"]:
+        meaning = meaning.replace(CONDITIONS_REASONS_PLACEHOLDER, code_span_list(condition["reasons"]))
+    return f"| `{condition['type']}` | {escape_cell(condition['written'])} | {escape_cell(meaning)} |"
+
+
+def gen_platformagent_conditions() -> str:
+    """Render the PlatformAgent conditions table, in the slice's order."""
+    model = run_go_generator(
+        CONDITION_DOCS_GENERATOR,
+        ["-dir", str(CONDITION_DOCS_DIR)],
+        "the conditions table is read from the controller package",
+    )
+    return "\n".join([*CONDITIONS_TABLE_HEADER, *(render_condition_row(c) for c in model["conditions"])])
+
+
 # Each region names every file it is spliced into. One generator, one body,
 # however many pages carry it: the job example is the same entry on three
 # pages, and rendering it once is what keeps the three from disagreeing.
@@ -893,14 +987,20 @@ BLOCKS: dict[str, tuple[tuple[Path, ...], Callable[[], str]]] = {
     "skill-catalog": ((SKILLS_PAGE,), gen_skill_catalog),
     "container-images": ((IMAGES_PAGE,), gen_container_images),
     "capabilities": ((README,), gen_capabilities),
+    "replay-baseline-metrics": ((REPLAY_PROXY_README,), gen_replay_baseline_metrics),
     **{
         f"{CRD_BLOCK_PREFIX}{kind.lower()}": ((page,), functools.partial(gen_crd_fields, kind))
         for kind, page in CRD_KINDS.items()
     },
+    CONDITIONS_BLOCK: ((CONDITIONS_PAGE,), gen_platformagent_conditions),
+    FOOTPRINT_BLOCK_PREFIX: ((FOOTPRINT_PAGE,), install_footprint.render_tables),
+    f"{FOOTPRINT_BLOCK_PREFIX}-profiles": ((FOOTPRINT_PROFILES_JSON,), install_footprint.profiles_json),
 }
 
 # Generated artifacts that are a whole file rather than a region inside a
-# hand-written document, written verbatim from their generator.
+# hand-written document, written verbatim from their generator: a block whose
+# target has one of these suffixes replaces the file, markers and all.
+WHOLE_FILE_SUFFIXES = (".json",)
 
 
 # --------------------------------------------------------------------------- #
@@ -934,6 +1034,10 @@ def splice(path: Path, block_id: str, body: str, text: str | None = None) -> tup
     the text the previous one produced, so the last result carries them all.
     Left ``None``, the file is read from disk.
     """
+    if path.suffix in WHOLE_FILE_SUFFIXES:
+        if text is None:
+            text = path.read_text(encoding="utf-8") if path.exists() else ""
+        return body != text, body
     if text is None:
         text = path.read_text(encoding="utf-8")
     begin, end, notice = region_markers(path, block_id)
@@ -1023,8 +1127,21 @@ def select_blocks(names: list[str], prefixes: list[str] = (), blocks=BLOCKS) -> 
 
 
 def needs_go(block_id: str) -> bool:
-    """Whether a block's generator reads the Go API types."""
-    return block_id.startswith(CRD_BLOCK_PREFIX)
+    """Whether a block's generator reads the operator's Go source."""
+    return block_id.startswith(CRD_FAMILY_PREFIX)
+
+
+def needs_helm(block_id: str) -> bool:
+    """Whether a block's generator renders the chart."""
+    return block_id.startswith(FOOTPRINT_BLOCK_PREFIX)
+
+
+def missing_tool(block_id: str) -> str | None:
+    """The tool a block needs that is not on PATH, if any."""
+    for needed, binary in ((needs_go, GO_BINARY), (needs_helm, HELM_BINARY)):
+        if needed(block_id) and shutil.which(binary) is None:
+            return binary
+    return None
 
 
 def main(argv: list[str] | None = None, blocks=BLOCKS) -> int:
@@ -1050,13 +1167,15 @@ def main(argv: list[str] | None = None, blocks=BLOCKS) -> int:
     args = ap.parse_args(argv)
 
     selected = select_blocks(args.blocks, args.block_prefix, blocks)
-    # A write run on a machine without Go still refreshes every region that
-    # needs none; the CRD pages are reported skipped, not silently left. A
+    # A write run on a machine without Go or helm still refreshes every region
+    # that needs neither; the others are reported skipped, not silently left. A
     # block asked for by name is wanted, so it fails as it would in --check.
-    if not args.check and not args.blocks and not args.block_prefix and shutil.which(GO_BINARY) is None:
-        for block_id in [b for b in selected if needs_go(b)]:
-            print(f"  skipped  [{block_id}]: needs `{GO_BINARY}` on PATH; regions that need none are refreshed")
-            del selected[block_id]
+    if not args.check and not args.blocks and not args.block_prefix:
+        for block_id in list(selected):
+            binary = missing_tool(block_id)
+            if binary:
+                print(f"  skipped  [{block_id}]: needs `{binary}` on PATH; regions that need none are refreshed")
+                del selected[block_id]
 
     targets = collect_targets(selected)
 

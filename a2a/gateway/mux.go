@@ -348,6 +348,16 @@ func (m *MultiAdapter) SetSessionLookup(lookup SessionLookup, idleTTL time.Durat
 	}
 }
 
+// SetSenderAdmission hands the gateway's admission gate to every backend
+// that reads it (SenderAdmissionSink), as SetSessionLookup does.
+func (m *MultiAdapter) SetSenderAdmission(admits SenderAdmission) {
+	for _, a := range m.byPrefix {
+		if sink, ok := a.(SenderAdmissionSink); ok {
+			sink.SetSenderAdmission(admits)
+		}
+	}
+}
+
 // SetFeedbackRecorder hands the answer-feedback recorder to every backend
 // that draws rating controls (FeedbackSink), as SetSessionLookup does.
 func (m *MultiAdapter) SetFeedbackRecorder(r FeedbackRecorder) {

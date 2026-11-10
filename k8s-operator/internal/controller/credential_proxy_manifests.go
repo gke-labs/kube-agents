@@ -176,10 +176,9 @@ const (
 	// this container's limit through credentialProxyMemoryLimitEnv, reserves
 	// credentialProxyRequestReserveBytes per admitted request, and admits a
 	// request only when the reservations plus the output allowance of the
-	// slots in use fit the limit less credentialProxyResidentReserveBytes and
-	// credentialProxyWorkspaceReserveBytes -- nine at once at the 2Gi below,
-	// held to eight by the slot cap (credentialProxyMaxConcurrentCommands),
-	// which is the upper bound. 2Gi rather than the earlier 1Gi (four at once)
+	// slots in use fit the limit less credentialProxyResidentReserveBytes --
+	// ten at once at the 2Gi below, held to eight by the slot cap
+	// (credentialProxyMaxConcurrentCommands), which is the upper bound. 2Gi rather than the earlier 1Gi (four at once)
 	// because the default kanban cap is six workers, and each can have a
 	// brokered command in flight. The sizing test in
 	// platformagent_manifests_test.go and ValidateCredentialProxyResources
@@ -196,8 +195,8 @@ const (
 	// and 1.3Gi as YAML (#2025). The budget cannot see that growth, so on a
 	// fleet with thousands of objects per cluster the limit has to hold the
 	// largest listing the fleet produces for every command that may run at
-	// once, plus the two fixed reserves (320Mi): eight 500Mi listings need
-	// about 4.2Gi, not the 2Gi below. The broker measures this itself
+	// once, plus the fixed resident reserve (192Mi): eight 500Mi listings
+	// need about 4.1Gi, not the 2Gi below. The broker measures this itself
 	// (kubeagents_credential_proxy_child_peak_rss_bytes and its memory
 	// high-water log lines), and that is what a large fleet's override is
 	// sized from (#4315).
@@ -215,9 +214,9 @@ const (
 	// container's limits equal to its requests, so there the broker's limit
 	// is the Autopilot memory request, and the budget it derives from the
 	// limit is sized by it. At 2Gi that is the same budget as Standard's 2Gi
-	// limit, nine at once held to eight by the slot cap
+	// limit, ten at once held to eight by the slot cap
 	// (TestCredentialProxyBudgetArithmeticAtTheDefaults). The Standard 1Gi
-	// request stays above the budget's 672Mi floor
+	// request stays above the budget's 544Mi floor
 	// (credentialProxyMinimumMemoryLimitBytes) for a cluster discovery could
 	// not classify and no running proxy shows as Autopilot, which the operator
 	// renders as Standard (liveCredentialProxyAutopilot).
@@ -312,8 +311,7 @@ const (
 	credentialProxyTmpLimitEnv   = "CREDENTIAL_PROXY_TMP_LIMIT_BYTES"   // #nosec G101 -- Env var name, not a credential
 	// The child memory budget's terms, in bytes, as the broker declares them
 	// (credential_proxy.py: BROKER_RESIDENT_RESERVE_BYTES,
-	// CONTENT_WORKSPACE_RESERVE_BYTES, REQUEST_CHILD_MEMORY_RESERVE_BYTES,
-	// OUTPUT_COPIES_PER_COMMAND). The sizing test reads them, and
+	// REQUEST_CHILD_MEMORY_RESERVE_BYTES, OUTPUT_COPIES_PER_COMMAND). The sizing test reads them, and
 	// tests/test_credential_proxy_sizing_parity.py holds them, and
 	// credentialProxyMinimumAdmittedRequests below, equal to the broker's;
 	// they are declared here rather than in the test so that
@@ -321,7 +319,6 @@ const (
 	// (docs/designs/credential-proxy-child-memory-budget.md §2.2) is why each
 	// is the size it is. Change the Python side in the same commit.
 	credentialProxyResidentReserveBytes   int64 = 192 << 20
-	credentialProxyWorkspaceReserveBytes  int64 = 128 << 20
 	credentialProxyRequestReserveBytes    int64 = 128 << 20
 	credentialProxyOutputCopiesPerCommand int64 = 6
 	// credentialProxyMinimumAdmittedRequests is the floor the sizing test
@@ -331,12 +328,12 @@ const (
 	credentialProxyMinimumAdmittedRequests int64 = 2
 	// credentialProxyMemoryFloorBytesAtDefaultCap is
 	// credentialProxyMinimumMemoryLimitBytes at credentialProxyOutputCapBytes,
-	// 672 MiB, declared as a literal so that the copies elsewhere can be
+	// 544 MiB, declared as a literal so that the copies elsewhere can be
 	// compared with it as text. TestCredentialProxyBudgetArithmeticAtTheDefaults
 	// holds it to the function, and tests/test_credential_proxy_sizing_parity.py
 	// holds it equal to the broker's CHILD_MEMORY_BUDGET_FLOOR_BYTES_AT_DEFAULT_CAP
 	// and the chart's kube-agents.credentialProxyMemoryFloorBytes.
-	credentialProxyMemoryFloorBytesAtDefaultCap int64 = 704643072
+	credentialProxyMemoryFloorBytesAtDefaultCap int64 = 570425344
 )
 
 // credentialProxyOutputCapBytes is credentialProxyMaxOutputBytes as a count.
@@ -356,7 +353,7 @@ func credentialProxyRequestCostBytes(outputCapBytes int64) int64 {
 // credentialProxyAdmittedRequests is how many requests the broker admits at
 // once under a memory limit, the number its startup line prints.
 func credentialProxyAdmittedRequests(limitBytes, outputCapBytes int64) int64 {
-	budget := limitBytes - credentialProxyResidentReserveBytes - credentialProxyWorkspaceReserveBytes
+	budget := limitBytes - credentialProxyResidentReserveBytes
 	if budget <= 0 {
 		return 0
 	}
@@ -366,7 +363,7 @@ func credentialProxyAdmittedRequests(limitBytes, outputCapBytes int64) int64 {
 // credentialProxyMinimumMemoryLimitBytes is the smallest limit that admits
 // credentialProxyMinimumAdmittedRequests at once.
 func credentialProxyMinimumMemoryLimitBytes(outputCapBytes int64) int64 {
-	return credentialProxyResidentReserveBytes + credentialProxyWorkspaceReserveBytes +
+	return credentialProxyResidentReserveBytes +
 		credentialProxyMinimumAdmittedRequests*credentialProxyRequestCostBytes(outputCapBytes)
 }
 
@@ -1076,8 +1073,9 @@ func credentialProxyEmptyDirSizeLimit(defaultSize, defaultLimit string, ephemera
 	return &size
 }
 
-// buildAgentAPIAuthVolumes is the gateway pod's remaining share. The data volume
-// the watcher reads is not here: the gateway pod already declares it.
+// buildAgentAPIAuthVolumes is the gateway pod's remaining share, and the
+// watcher's alert-exclude rules (buildEventWatcherAlertExcludeConfigMap). The
+// data volume the watcher reads is not here: the gateway pod already declares it.
 //
 // The /tmp emptyDir is widened to the sidecar's own merged ephemeral-storage
 // limit, as buildCredentialProxyRuntimeVolumes widens the broker's state: the sidecar
@@ -1095,7 +1093,9 @@ func buildAgentAPIAuthVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volum
 			volumes[i].EmptyDir.SizeLimit = credentialProxyEmptyDirSizeLimit(credentialProxyTmpSizeLimit, agentAPIAuthEphemeralStorageLimit, ephemeralLimit)
 		}
 	}
-	return volumes
+	return append(volumes, corev1.Volume{Name: eventWatcherAlertExcludeVolume, VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+		LocalObjectReference: corev1.LocalObjectReference{Name: agent.Name + eventWatcherAlertExcludeSuffix},
+	}}})
 }
 
 func filterVolumes(volumes []corev1.Volume, keep map[string]bool) []corev1.Volume {

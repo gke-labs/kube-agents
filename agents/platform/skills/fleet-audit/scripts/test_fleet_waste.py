@@ -5782,6 +5782,94 @@ class AutopilotNotApplicableTest(unittest.TestCase):
         self.assertIn("idle-nodepool", {c["check"] for c in entry["commands"]})
 
 
+class NodePoolsFromTheDiscoveryListingTest(unittest.TestCase):
+    """idle-nodepool takes the pools from the `clusters list` item that
+    discovered the cluster, recorded against that listing's command, and runs
+    its own `node-pools list` only when the item carries none (#4081)."""
+
+    POOLS = [{"name": "idle", "config": {"machineType": "e2-standard-4"}},
+             {"name": "busy", "config": {"machineType": "e2-standard-4"}}]
+    NODE_POOLS_ARGV = [
+        "gcloud", "container", "node-pools", "list", "--cluster", "two-usc1", "--location", "us-central1",
+        "--project", "acme", "--format", "json",
+    ]
+
+    def listed(self, **extra):
+        """The running cluster `enumerate_clusters` builds from one item, and the listing argv."""
+        issued = []
+        item = {"name": "two-usc1", "location": "us-central1", "status": "RUNNING", **extra}
+
+        def run(argv, **kwargs):
+            issued.append(list(argv))
+            return run_of(0, json.dumps([item]))
+
+        (cluster,), _ = fw.enumerate_clusters("acme", run=run)
+        (listing_argv,) = issued
+        return cluster, listing_argv
+
+    def collect(self, cluster, served_pools):
+        """`served_pools` is what the cluster's own `node-pools list` would answer."""
+        calls = []
+        node = obj("Node", "node-1", **{
+            "metadata.labels": {"cloud.google.com/gke-nodepool": "idle"},
+            "status.allocatable": {"cpu": "4", "memory": "8Gi"},
+        })
+
+        def run(argv, **kwargs):
+            calls.append(list(argv))
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of(node)))
+            if argv[:3] == ["gcloud", "container", "node-pools"]:
+                return run_of(0, json.dumps(served_pools))
+            if argv[:3] == ["gcloud", "container", "operations"]:
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp, patch.object(fw, "KUBECONFIG_DIR", Path(tmp)), patch.object(fw, "log") as log:
+            entry, _ = fw.collect_cluster(cluster, run=run, session=usage_session(), now=NOW)
+        self.node_pools_reads = [a for a in calls if a[:3] == ["gcloud", "container", "node-pools"]]
+        self.logged = [c.args[0] for c in log.call_args_list]
+        return entry
+
+    def test_the_listing_projects_node_pools_and_nothing_more(self):
+        _, argv = self.listed()
+        self.assertEqual(argv[argv.index("--format") + 1], "json(name,location,status,autopilot.enabled,createTime,nodePools)")
+        self.assertNotIn("masterauth", " ".join(argv).lower())
+
+    def test_listed_pools_replace_the_node_pools_read(self):
+        cluster, listing_argv = self.listed(nodePools=self.POOLS)
+        # The cluster's own read would answer no pools, so a candidate can
+        # only come from the listing.
+        entry = self.collect(cluster, served_pools=[])
+        self.assertEqual(self.node_pools_reads, [])
+        self.assertIn("NodePool/idle", {c["object"] for c in entry["candidates"] if c["check"] == "idle-nodepool"})
+        record = next(c for c in entry["commands"] if c["check"] == "idle-nodepool")
+        self.assertEqual(record["command"], shlex.join(listing_argv))
+        self.assertEqual((record["rc"], record["duration_s"]), (0, 0))
+        self.assertEqual(record["output_sha256"], fw.output_digest(json.dumps(self.POOLS, sort_keys=True)))
+        self.assertNotIn(fw.collector_run.LISTED_NODE_POOLS_KEY, json.dumps(entry))
+
+    def test_an_empty_listed_list_is_a_cluster_with_no_pools(self):
+        cluster, _ = self.listed(nodePools=[])
+        entry = self.collect(cluster, served_pools=self.POOLS)
+        self.assertEqual(self.node_pools_reads, [])
+        self.assertNotIn("idle-nodepool", {c["check"] for c in entry["candidates"]})
+        self.assertNotIn("idle-nodepool", {e["check"] for e in entry.get("checks_unevaluated") or []})
+
+    def test_a_listing_without_pools_falls_back_to_the_node_pools_read(self):
+        for extra in ({}, {"nodePools": "not a list"}):
+            with self.subTest(extra=extra):
+                cluster, _ = self.listed(**extra)
+                entry = self.collect(cluster, served_pools=self.POOLS)
+                self.assertEqual(self.node_pools_reads, [self.NODE_POOLS_ARGV])
+                record = next(c for c in entry["commands"] if c["check"] == "idle-nodepool")
+                self.assertEqual(record["command"], shlex.join(self.NODE_POOLS_ARGV))
+                self.assertIn("NodePool/idle", {c["object"] for c in entry["candidates"]})
+                self.assertTrue([m for m in self.logged if m.endswith("; reading node-pools list")], self.logged)
+
+
 class NodePoolAgeFromOperationsTest(unittest.TestCase):
     """§3.7's age exclusion reads the pool's `CREATE_NODE_POOL` operation."""
 

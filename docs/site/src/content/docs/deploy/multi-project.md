@@ -223,6 +223,9 @@ on the project's clusters are not reported.
 
 You can also exclude specific project globs or individual clusters under
 `spec.scope.exclude`; see [`spec.scope` in the `PlatformAgent` CRD reference](/kube-agents/operator/platformagent-crd/#specscope).
+An install that declares no project, folder or selector still adopts every cluster in its
+own project; the `PlatformAgent`'s `ScopeUndeclared` condition names the ones beyond the
+host cluster, and clears once you name the project in `spec.scope.projects` or exclude them.
 
 #### Option B: Onboard individual clusters on demand in chat
 

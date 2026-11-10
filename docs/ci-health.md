@@ -45,11 +45,12 @@ grades through, the opening task from the door accepting it to its terminal),
 and the wall clock, or that the night was cut short, still running or missing),
 the latency line of [The nightly section](#the-nightly-section) when the night carried timing,
 a link to the dashboard's Nightly report (`nightly.html`), and a line saying why
-the section was skipped. A night can be the builds of up to three periodics
-(the main job, the main-b job when the main part runs as two halves, and the
-writers job), reported as one night: the line names a part that is missing,
+the section was skipped. A night can be the builds of up to eight periodics
+(the main job, the main-b to main-e jobs when the main part runs as five
+shards, the writers job, and the writers-b and writers-c jobs when the
+writers part runs as three thirds), reported as one night: the line names a part that is missing,
 still running or cut short, the night counts as cut short when its main or
-main-b part is, and a night without its main or main-b part gives no verdict on
+main-b to main-e part is, and a night without one of those gives no verdict on
 what is newly failing. `scripts/eval_dashboard/nightly.py` derives that line
 and the report from the same nightly runs. After it, the digest carries one
 line while nightly bug filing has been held for about two hours ([Nightly bugs](#nightly-bugs)),
@@ -102,7 +103,11 @@ archive alongside until that leaves the window; the pool-pressure check and step
 read the new bucket only, so a green from before the move is not reused and the pool gauge's window
 fills over its first week. A run in that bucket records where it lives (`runs[].gcs_base`), and
 the dashboard's and the health bot's build links open that directory in the Cloud Console for a
-project reader; a run in the old bucket keeps its Prow link, which still renders it.
+project reader; a run in the old bucket keeps its Prow link, which still renders it. The nightly's
+bucket (`gs://kube-agents-evals-nightly-logs`) is private the same way, so the Nightly report's
+and the nightly issues' run and transcript links open the Console too; for a record whose Prow
+link points into it, the Nightly report, the nightly issues and the lane rows link the Console
+instead (`nightly.console_base` via `links.private_gcs_base`), the data unchanged.
 
 Most messages end with a deep link into the dashboard:
 `index.html#since=<ISO 8601 UTC>[&until=<ISO 8601 UTC>][&cases=<comma-separated case ids>]&view=gate`
@@ -179,7 +184,11 @@ below a storm because a 429-starved worker hits the same wait; the storm
 also needs the pool's peak hourly Vertex 429 share to clear 10 % over the hours
 those runs spent on their calls, when the 429 reading below covers them; a
 reading that does not, and no reading, leaves the runs to decide and the
-evidence says the storm is unconfirmed), or setup
+evidence says the storm is unconfirmed; the evidence line and the Chat
+sentence also quote the repetitions' own words for how they died, as the
+harness wrote them and after the same scrub as the periodics' quoted log line,
+commonest first, so a batch that said `hermes-rate-limited` reads as that and
+not as the bot's guess), or setup
 deaths (3+ runs that concluded `FAILURE` under 5 minutes with no tasks, on 2+
 pull requests, in 2 hours, #1172; an aborted zero-task run is a superseded
 push), or seeded
@@ -249,8 +258,7 @@ towards a distinct-PR floor, and a nightly collapsing is a case's record on
 `main`, not a gate incident. It carries the forge lanes' runs too, one tier
 each (`tiers.FORGE_TIERS`): the GitLab lane (`pull-kube-agents-smoke-test-gitlab`, `tier: gitlab`), on a pull request the
 forge-grading cases of `hack/eval/gitlab-cases.txt` (registered cases, not only presubmit ones) against a pool project's
-GitLab repository, with its nightlies `ci-kube-agents-eval-nightly-gitlab` and `ci-kube-agents-eval-nightly-gitlab-next`
-running the same list; and the self-managed GHES and GitLab CE lanes (`pull-kube-agents-smoke-test-ghes`, `tier: ghes`;
+GitLab repository, with its next-mode nightly `ci-kube-agents-eval-nightly-gitlab-next` running the same list; and the self-managed GHES and GitLab CE lanes (`pull-kube-agents-smoke-test-ghes`, `tier: ghes`;
 `pull-kube-agents-smoke-test-gitlab-ce`, `tier: gitlab-ce`; `docs/ci-pool-projects.md` 5.8), each with a next-mode
 weekly job (`ci-kube-agents-eval-weekly-ghes-next`, `ci-kube-agents-eval-weekly-gitlab-ce-next`). The GitLab lane has a
 section of the Brief, its pull-request runs and then each nightly's nights; the GHES and GitLab CE lanes share one
@@ -422,13 +430,13 @@ reads every project as it did before.
 
 The poster sends one line when the note appears, and again if its verdict
 changes inside the episode. The header names the cause, because the four
-causes have four different remedies and one of them spends money:
+causes call for different things and one of them spends money:
 
 ```text
 ⏳ Smoke gate: pool full — all 30 projects are leased and runs are queuing.
 Consider onboarding a project.
 Last 3h: median wait 24 min against a 15 min limit; p95 157 min against 45.
-2 runs waiting right now, past the 45 min p95 limit.
+2 of 4 waiting runs are past the 45 min p95 limit.
 Runs still pass; /retest makes the queue longer.
 ```
 
@@ -478,10 +486,15 @@ The dashboard dates
 a jam from its own oldest queued run rather than from the episode, for the same
 reason: the episode can have opened days before the backlog being described.
 
-`concurrency cap` (raise it), `runs not starting` (projects were free, so the
-delay is Prow's; the message names the build cluster) and `queue backed up`
-(the job could not read how many projects were in use) carry the same lines
-under a different first one.
+`queue` at the presubmit's cap (runs waited while the presubmit sat at its
+`max_concurrency`; while Deck sees a backlog the message says how many wait
+and the longest wait, otherwise how long runs waited on which days and
+whether the queue was read, and the cap either way; it gives no remedy,
+because the pool is shared and the gap below the cap is the other jobs'
+share), `runs not starting` (projects were free, so the delay is Prow's; the
+message names the build cluster) and `queue backed up` (the job could not
+read how many projects were in use) carry the same lines under a different
+first one.
 
 Unlike the slow note, this one also says when it is over. The window is a
 rolling seven days, so an episode outlives the bad day by up to a week:
@@ -506,8 +519,8 @@ artifact.
 
 This note files no `presubmit-gate` issue, unlike an OUTAGE, lost pods, fixture
 drift and pool drift. A full pool is a capacity fact, not a defect a code change
-closes; its remedies are onboarding and raising the cap, which are planned
-work. Chat, the Brief and the digest carry it, and nothing opens.
+closes; its remedy is onboarding, which is planned work, or a cap the operator
+weighs. Chat, the Brief and the digest carry it, and nothing opens.
 
 The digest carries the median wait every morning whether or not anything is
 wrong (`typical wait`, beside `typical run`), and repeats a one-line version
@@ -523,13 +536,15 @@ rule existed they reported nowhere but TestGrid: `ci-kube-agents-pull-sweep`
 reconcile, as a postsubmit on every merge that changes the stack and as a
 daily pass over every project. A fourth, `ci-kube-agents-certification-1`, is
 not a pool job but the certification lane's weekly slice, watched here because
-its record is its logs bucket and nothing else reads a failed build of it. `scripts/eval_dashboard/periodics.py` lists them in `WATCHED`, one entry
+its record is its logs bucket and nothing else reads a failed build of it. A fifth,
+`ci-kube-agents-eval-replay-lane`, is the inference-replay lane, watched because it gates nothing
+and publishes no dashboard data, so nothing else reads a failed build of it either. `scripts/eval_dashboard/periodics.py` lists them in `WATCHED`, one entry
 per job with its label, its stale window, the report it writes, and the words
 its messages are built from, so adding the next periodic is one entry. The 15-minute tick's `Fetch the watched periodics'
 latest builds` step reads each job's `latest-build.txt` from
 `gs://kube-agents-periodic-logs`, the bucket the pool jobs log to (their own
 identities cannot write the Prow archive), or from the nightlies' bucket
-`gs://kube-agents-evals-nightly-logs` for the certification slice, which is
+`gs://kube-agents-evals-nightly-logs` for the certification slice and the replay lane, which are
 decorated like the nightlies (each `WATCHED` entry names its root),
 walks back to a build with a `finished.json` (the newest is often still
 running), keeps the job's report when the build wrote one (the reconcile's
@@ -562,7 +577,7 @@ notes any failed build rather than hide one already told. A
 recovery needs a build that passed: a failed check under the threshold writes
 no note and is not one. One whose latest finished
 build is older than its stale window (two hours for the sweep, 36 hours for the
-daily reconcile, eight days for the weekly certification slice; the postsubmit runs on merges, so no age makes it stale) is `STALE`, whatever that build's
+daily reconcile and the daily replay lane, eight days for the weekly certification slice; the postsubmit runs on merges, so no age makes it stale) is `STALE`, whatever that build's
 verdict, measured on the wall clock rather than data.json's horizon, as the
 pool note is. The note carries the build, when it finished, `since` (kept for
 the job across ticks through the previous `health.json`, ticks with no reading
@@ -629,8 +644,7 @@ when there are several). Three shapes outside that filter also get one, below:
 a not-evaluated run, a lost pod and a deadline kill.
 
 - a heading, `❌ Smoke gate: failed`, or `· hard failure` when the run failed
-  with no gate case failing all of its repetitions (an absolute check, or a
-  truncated log);
+  with no gate case collapsing (an absolute check, or a truncated log);
 - a health box: during an OUTAGE or DEGRADED state whose signature the run
   carries, that the red is not the author's code and not to retest yet; when
   the gate is healthy and what failed passes on other pull requests' recent
@@ -638,10 +652,10 @@ a not-evaluated run, a lost pod and a deadline kill.
 - the run's wall clock and links: the build log, `run.html#build=<build id>`
   on the dashboard, and the incident brief when there is an incident.
 
-The pull request is public, so the comment names no case and prints no count,
-reason or agent text: which cases failed, how many repetitions, why, and on
-which pool project are on the dashboard's run page behind the link, for a
-project reader. The incident brief link carries no case names either.
+The pull request is public, so the comment names no case and prints no case
+count, repetition count, reason or agent text: which cases failed, how many
+repetitions, why, and on which pool project are on the dashboard's run page
+behind the link, for a project reader. The incident brief link carries no case names either.
 
 An ordinary red that reaches a verdict during a deadline-kill OUTAGE gets the
 outage box with the kills' sentence ("N runs on M PRs were killed at the
@@ -683,8 +697,8 @@ link has the list), and that nothing about the change is implied:
 ```text
 ### ⚪ Smoke gate: run not evaluated
 
-> Some cases lost every repetition to infrastructure before the agent could
-> be graded. The suite could certify nothing, so Prow reports the run red;
+> Some cases could not be graded: infrastructure failed before the agent
+> ran. The suite could certify nothing, so Prow reports the run red;
 > nothing was graded for them and nothing about your change is implied.
 > Retest once the environment is healthy. [Details →](run.html#build=<build id>)
 
@@ -694,10 +708,10 @@ Ran 27 min · build log
 When every recorded case was lost the box says so. While `health.json`'s
 condition is `storm` it adds "a quota storm is declared on the gate right
 now" and links the brief, with no case names in the link. A gate case that
-failed every graded repetition on the same run (the dashboard's roster can be
-newer than the branch's) gets a second sentence, unnamed, pointing at the
-transcripts to read before retesting; the heading stays ⚪, because the suite
-is the verdict's owner.
+went red on the same run (the dashboard's roster can be newer than the
+branch's) gets a second sentence, unnamed and with no per-repetition verdict,
+pointing at the run page; the heading stays ⚪, because the suite is the
+verdict's owner.
 
 The second is a lost pod (the build node went away under the job, #1478), a
 zero-task run:
@@ -750,10 +764,12 @@ comments instead.
 When the state becomes OUTAGE and no issue tracks it — `case-notes.yaml` names
 none for the failing cases, and no open issue, whatever its labels, names
 every failing case in its title or body — the poster files one, labelled
-`presubmit-gate`: `Smoke gate outage: 3 cases failing on every PR since Sun
-7:30 AM ET`, with the cases, the window, the class, the incident brief link,
-and the line "Filed automatically by the smoke health bot; edit freely. Fix
-PRs: reference this issue." A human's issue that already names the cases is
+`presubmit-gate`: `Smoke gate outage since Sun 7:30 AM ET`, with the window,
+the class and the incident brief link, and the line "Filed automatically by
+the smoke health bot; edit freely. Fix PRs: reference this issue." The issue
+names no failing case and quotes no evidence line: the repository is public,
+and both are on the brief it links; its first line is a hidden marker
+carrying the case ids, by which the bot re-finds its own issue. A human's issue that already names the cases is
 adopted instead and labelled `presubmit-gate`. One rule for a title: any open
 issue. One rule for a body: a `presubmit-gate` issue, or an unlabelled one
 whose body also carries a word the condition's own evidence uses ("drift" or
@@ -835,13 +851,13 @@ write (a timeout, a 5xx, a 403) files nothing that tick.
 
 `scripts/eval_dashboard/nightly_bugs.py` files an issue for a case that failed
 every graded repetition on its last 3 graded nightly nights, and comments on it
-once when the case passes every repetition again. It runs every tick before the
+once when the case is clear again. It runs every tick before the
 post, on the same `data.json`, so the digest's nightly section sees the issues
 it filed that tick; the step is capped at 3 minutes so a slow GitHub cannot
 hold the post past the job's timeout.
 
-A graded night, for one case, is a night where the part that ran the case (main
-or writers) was not cut off at the job deadline and at least one of the case's
+A graded night, for one case, is a night where the part that ran the case (its
+`nightly.py` part) was not cut off at the job deadline and at least one of the case's
 repetitions was graded. Three kinds of night are skipped, so they neither count
 toward a streak nor break one: a part Prow cut off at the deadline; a night
 where the case was not run or every repetition was infrastructure
@@ -856,8 +872,7 @@ is the last 14 nightly dates. A case whose `task.yaml` carries
 The issue is labelled `nightly-red`, `domain:<slug>` and `needs-triage`. Its
 body carries a marker naming the case, the domain, the assignee and why, the
 domain owner and backup as @-mentions, each of the three nights with its run
-link and transcript link (the night's pass count and each failing check's
-reason stay on the dashboard behind them: the repository is public), and what
+link and transcript link (into the Cloud Console), and what
 triage decides: a product bug gets a fixer, a priority and a date; a broken
 test is fixed or marked `expected_fail` with the issue linked; an infra
 failure is closed in favour of the infra issue. It is assigned to the case's
@@ -921,8 +936,8 @@ rules). Neither changes the domain streak above.
   that last recorded it, unless the other part was lost that date or has not
   landed yet)
   ran to its verdict and the case graded nothing: every repetition classified as infrastructure, or no line for it. 3
-  such nights in a row file one issue naming the case and the classifier's
-  reason. A night is skipped, not counted, when the part did not run or was
+  such nights in a row file one issue naming the case, with each night's run
+  and transcript links. A night is skipped, not counted, when the part did not run or was
   lost (or any job of the part lost its build that date and was not re-run
   clean: another job's clean build does not vouch for its cases), when it
   predates the case's first recorded night in the last 14 (a case new to the
@@ -1049,8 +1064,8 @@ plain text. A mentioned person must be a member of the space.
 
 The section is skipped, and the digest carries its one-line nightly summary
 plus the reason, when it cannot be built truthfully: `data.json` unreadable, no
-night started in the last 36 hours, last night's run or either main half
-(main or main-b) still running or missing, no GitHub token, the issues unreadable or their
+night started in the last 36 hours, last night's run or any main shard
+(main, or main-b to main-e) still running or missing, no GitHub token, the issues unreadable or their
 listing not trusted (GraphQL disagreed on every read, as for the filer), pyyaml missing, a count that does not
 add up, or a link that is not a well-formed `https` URL (an issue link must
 point into this repository). Links are checked for form, not fetched: the
@@ -1084,9 +1099,9 @@ been uncovered (counted on UTC dates, as expiry is), from a record's `since:`,
 or from the opening `<slug>, since YYYY-MM-DD` of the comment above a bare slug,
 or "start date not recorded" (also for a date that does not parse or is after
 today); why, from the entry
-and the issue it cites; and the candidates. A candidate is a case of the
+and the issue it cites; and the candidates, best first. A candidate is a case of the
 domain on the nightly matrix with a `verification_spec`, not `expected_fail`,
-not on the roster, with its
+not on the roster, ranked by its
 graded repetitions over the last 14 nightly nights (read as [Nightly
 bugs](#nightly-bugs) reads them), whether that record meets the roster's bar
 (90% over at least 20 graded runs; docs/eval-gate-roster.md, "The admission
@@ -1096,7 +1111,10 @@ deadline), what the
 store says at the current next-mode version key (the mode the main nightly grades; today-mode only when the store holds no next-mode records): `would-admit`, `would-demote`,
 `collecting` with the runs still needed for a full window, `cut` (the read left
 older records at that key behind), or that it holds no record there. Candidates are ranked store `would-admit` first, then meeting the
-bar, then by pass rate. The body is edited in place when any of this changes,
+bar, then by pass rate. The issue's table names the candidates in that order
+and nothing more, since the repository is public; the records behind it are
+on the domain scorecard (`cases.html#view=domains`), and the Chat digest line
+carries the best candidate's. The body is edited in place when any of this changes,
 about once a day; its assignees are never touched, and the assignment line of an
 open issue names the assignees GitHub holds, with the owner beside them when
 the owner is not one. The body is the bot's: an edit to it or the title is
@@ -1141,6 +1159,33 @@ eval crew approves every roster line. Locally,
 `python3 scripts/eval_dashboard/coverage_gaps.py --data data.json [--store store.json]`
 is a dry run; `--live` writes.
 
+## Scrubbing the bots' older posts
+
+The posts above carried pass ratios, repetition counts, failing-check reasons and, on the
+outage issue, the failing cases and the evidence lines until the bots stopped writing them.
+`scripts/eval_dashboard/scrub_bot_posts.py` is the one-off that brings the posts already on
+GitHub to the current shape, run by a person with a repository-write token (`GH_TOKEN`) against
+`--repo` (default `GITHUB_REPOSITORY`, else `gke-labs/kube-agents`): dry run by default and
+`--live` to write, `--pace` seconds between writes (default 2, under GitHub's secondary limits
+of about 80 content writes a minute and 500 an hour), `--limit` writes at most (default none),
+`--since` bounding the repository-wide comment listing (default 2026-09-01), `--show-bodies`
+printing each edit's new body; it stops after three writes in a row fail. It plans one action
+per post from the post's own markers. Comments are deleted, issues are edited: the smoke-gate
+pull-request comments go (the verdict lives in the private bucket and on the dashboard; one on
+an open pull request is left for the next red tick to rewrite, and so is one already in the
+current shape), and
+so do the bot's recovery and later-night comments on the nightly issues (an edited comment
+would keep its history, and the issue's nights list carries the dates and links); the
+nightly-red and kept-case issues are rewritten to the current templates with their run and
+transcript links in Console form, the lost-nights issues get the same links; a coverage-gap
+issue gets the current candidates sentence and the first column of its table; the outage
+issue is retitled and its body rewritten with the marker; the lost-pods, deadline,
+fixture-drift and pool-drift issues keep only their own evidence lines. A post already in the
+current shape plans as a skip, so a second run finds nothing to do. GitHub keeps an edited
+issue's revision history, which the script cannot clear: it prints the edited issues' URLs,
+and that step is done by hand in the web UI. Human posts and the review bot's comments are
+out of scope.
+
 ## The domain scorecard
 
 `scripts/eval_dashboard/understudies.py` writes one row per domain in
@@ -1177,9 +1222,9 @@ week (below).
 
 The week is the seven nightly dates ending on the Sunday before the tick
 (`--week-end` overrides it), compared with the seven before. A night counts
-when none of its parts was cut off at the job deadline, it has both halves of
-the main matrix it owed (the main part, and the main-b part once that job runs;
-the digest withholds its verdict on a night without either), and it is not a
+when none of its parts was cut off at the job deadline, it has every shard of
+the main matrix it owed (the main part, and the main-b to main-e parts once
+those jobs run; the digest withholds its verdict on a night without one), and it is not a
 night on which nearly every graded case failed; two counted nights
 on one date are one night, each case's newer verdict standing. A pass rate is passes over graded repetitions
 (infrastructure repetitions are never graded), over the scenarios graded in both
