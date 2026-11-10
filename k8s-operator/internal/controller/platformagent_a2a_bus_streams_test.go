@@ -741,3 +741,108 @@ func TestAStatefulSetTheCRDoesNotControlGivesNoVerdict(t *testing.T) {
 		t.Errorf("scraped %d times and deleted %v under a StatefulSet the CR does not control", rig.source.calls, rig.deleted)
 	}
 }
+
+// The pod at a server's own name counts only when the StatefulSet controls it,
+// on its current revision, off the host network: a pod recreated by someone
+// else under that name, or a stale one, is not a server.
+func TestTheServersOwnPodMustBeTheStatefulSets(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		alter func(pod *corev1.Pod)
+	}{
+		{"not controlled by the StatefulSet", func(pod *corev1.Pod) { pod.OwnerReferences = nil }},
+		{"an old revision", func(pod *corev1.Pod) { pod.Labels[appsv1.ControllerRevisionHashLabelKey] = "r0" }},
+		{"on the host network", func(pod *corev1.Pod) { pod.Spec.HostNetwork = true }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := busStreamsAgent(1)
+			rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+			pod := &corev1.Pod{}
+			if err := rig.cl.Get(context.Background(), types.NamespacedName{Namespace: agent.Namespace, Name: a2aNATSName(agent) + "-0"}, pod); err != nil {
+				t.Fatal(err)
+			}
+			tc.alter(pod)
+			if err := rig.cl.Update(context.Background(), pod); err != nil {
+				t.Fatal(err)
+			}
+			rig.serve(1)
+			for i := 0; i < 4; i++ {
+				rig.poll()
+			}
+			if len(rig.deleted) != 0 || rig.source.calls != 0 {
+				t.Errorf("scraped %d times and deleted %v", rig.source.calls, rig.deleted)
+			}
+		})
+	}
+}
+
+// A StatefulSet still on three servers while the CR resolves to one is
+// mid-conversion: no verdict, even with every server saying TASKS is gone.
+func TestNoVerdictWhileTheServerCountDiffersFromTheCRs(t *testing.T) {
+	agent := busStreamsAgent(3)
+	rig := newBusStreamsRig(t, 3, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	live := rig.agent()
+	live.Status.BusReplicas = 1
+	if err := rig.cl.Status().Update(context.Background(), live); err != nil {
+		t.Fatal(err)
+	}
+	rig.serve(3, allStreamsBut("TASKS")...)
+	for i := 0; i < 4; i++ {
+		rig.poll()
+	}
+	if len(rig.deleted) != 0 {
+		t.Errorf("deleted %v mid-conversion", rig.deleted)
+	}
+}
+
+// Polls with nothing to judge by count in a row only: a poll the gate skips
+// starts the count again.
+func TestAGatedPollRestartsTheUnreachableCount(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	rig.source.bodies[busStreamsAddr(0)] = exporterBody(false, "")
+	rig.poll()
+	rig.poll()
+	rig.setStatefulSet(busStreamsStatefulSet(rig.agent(), 1, 0))
+	rig.poll()
+	rig.setStatefulSet(busStreamsStatefulSet(rig.agent(), 1, 1))
+	rig.poll()
+	if c := rig.condition(); c != nil {
+		t.Errorf("condition = %+v, want none: the gated poll broke the run", c)
+	}
+}
+
+// Through Reconcile: a False BusStreamsPresent makes the CR Degraded with its
+// message, and a True one clears it.
+func TestTheReconcileReportsMissingBusStreamsAsDegraded(t *testing.T) {
+	r, cl, req := settledStuckPodReconciler(t, nil)
+	ctx := context.Background()
+	set := func(status metav1.ConditionStatus, reason, message string) {
+		t.Helper()
+		agent := &agentv1alpha1.PlatformAgent{}
+		if err := cl.Get(ctx, req.NamespacedName, agent); err != nil {
+			t.Fatal(err)
+		}
+		meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{Type: busStreamsPresentConditionType, Status: status, Reason: reason, Message: message})
+		if err := cl.Status().Update(ctx, agent); err != nil {
+			t.Fatal(err)
+		}
+		busGatePass(t, ctx, r, req, "bus streams "+reason)
+	}
+	degraded := func() *metav1.Condition {
+		t.Helper()
+		agent := &agentv1alpha1.PlatformAgent{}
+		if err := cl.Get(ctx, req.NamespacedName, agent); err != nil {
+			t.Fatal(err)
+		}
+		return meta.FindStatusCondition(agent.Status.Conditions, degradedConditionType)
+	}
+	set(metav1.ConditionFalse, busStreamsReasonMissing, "Missing from the A2A bus on 3 polls in a row: TASKS.")
+	if c := degraded(); c == nil || c.Status != metav1.ConditionTrue || c.Reason != conditionReasonA2ABusStreamsMissing || !strings.Contains(c.Message, "TASKS") {
+		t.Fatalf("Degraded = %+v, want True/%s naming TASKS", c, conditionReasonA2ABusStreamsMissing)
+	}
+	set(metav1.ConditionTrue, busStreamsReasonAllPresent, "All present.")
+	if c := degraded(); c != nil {
+		t.Errorf("Degraded = %+v after the streams came back, want none", c)
+	}
+}
