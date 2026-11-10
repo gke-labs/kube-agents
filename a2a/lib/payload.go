@@ -7,6 +7,8 @@ import (
 	"math"
 	"regexp"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // TaskState is the A2A task state machine, plus rejected. auth-required is
@@ -304,6 +306,142 @@ func TaskParametersOf(parts []Part) (TaskParameters, bool, error) {
 	}
 	if found == nil {
 		return TaskParameters{}, false, nil
+	}
+	return *found, true, nil
+}
+
+// DelegateTargets is the delegateTargets data part on a session turn's
+// submission: the agents the turn's requester may delegate to, as the gateway
+// resolved them when it submitted the turn (platform, then each AgentProfile
+// whose card admits them). The session pod's delegate tool names them in its
+// addressee description, so the model is told what it can address rather than
+// a fixed name. It's a hint for the model, not a grant: the gateway checks a
+// delegation against the same rules when it arrives, so a stale list costs at
+// most a refused delegation.
+//
+// The part's presence is the marker: a turn that carries one has exactly the
+// agents listed (an empty list is none), and a turn with none reads as
+// platform only. Truncated says the gateway left agents out to stay inside
+// the bounds below.
+type DelegateTargets struct {
+	Targets   []DelegateTarget `json:"targets"`
+	Truncated bool             `json:"truncated,omitempty"`
+}
+
+// DelegateTarget is one agent a session may delegate to: its addressee, its
+// card's routing blurb, and the parameters its card declares (a pinned
+// profile's cluster, say), which a delegation may pass.
+type DelegateTarget struct {
+	Name        string             `json:"name"`
+	Description string             `json:"description,omitempty"`
+	Parameters  []ProfileParameter `json:"parameters,omitempty"`
+}
+
+// The bounds a delegateTargets part is held to. A name is a subject token (an
+// addressee); a description is one line of at most DelegateTargetDescriptionMax
+// bytes, cut by the gateway (DelegateTargetDescription); a parameter is named
+// by TaskParameterNameRE, at most TaskParametersMax a target. The encoded part
+// is at most DelegateTargetsMaxBytes, so the session pod can hand it to its
+// tool server in one environment variable.
+const (
+	DelegateTargetsMax           = 32
+	DelegateTargetDescriptionMax = 200
+	DelegateTargetsMaxBytes      = 16 * 1024
+)
+
+const delegateTargetsKey = "delegateTargets"
+
+// DelegateTargetDescription is a card's description as a delegate target
+// carries it: control characters and line breaks folded to spaces, runs of
+// space collapsed, and cut to DelegateTargetDescriptionMax bytes on a rune
+// boundary.
+func DelegateTargetDescription(s string) string {
+	s = strings.Join(strings.Fields(strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, s)), " ")
+	if len(s) <= DelegateTargetDescriptionMax {
+		return s
+	}
+	cut := DelegateTargetDescriptionMax
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	// A cut that lands after a space would leave it trailing, and the
+	// description would no longer read back as itself.
+	return strings.TrimRight(s[:cut], " ")
+}
+
+func validateDelegateTargets(t DelegateTargets) error {
+	if len(t.Targets) > DelegateTargetsMax {
+		return fmt.Errorf("delegate targets: %d, at most %d", len(t.Targets), DelegateTargetsMax)
+	}
+	for _, d := range t.Targets {
+		if !ValidSubjectToken(d.Name) {
+			return fmt.Errorf("delegate target %q is not an addressee", d.Name)
+		}
+		if d.Description != DelegateTargetDescription(d.Description) {
+			return fmt.Errorf("delegate target %s: the description is not one line of at most %d bytes", d.Name, DelegateTargetDescriptionMax)
+		}
+		if len(d.Parameters) > TaskParametersMax {
+			return fmt.Errorf("delegate target %s: %d parameters, at most %d", d.Name, len(d.Parameters), TaskParametersMax)
+		}
+		for _, p := range d.Parameters {
+			if !TaskParameterNameRE.MatchString(p.Name) {
+				return fmt.Errorf("delegate target %s: parameter %q is not a lower-case identifier", d.Name, p.Name)
+			}
+		}
+	}
+	if raw, err := json.Marshal(t); err != nil || len(raw) > DelegateTargetsMaxBytes {
+		return fmt.Errorf("delegate targets: encoded past %d bytes", DelegateTargetsMaxBytes)
+	}
+	return nil
+}
+
+// DelegateTargetsPart is t as a data part, refused when t breaks the bounds.
+func DelegateTargetsPart(t DelegateTargets) (Part, error) {
+	if err := validateDelegateTargets(t); err != nil {
+		return Part{}, err
+	}
+	if t.Targets == nil {
+		t.Targets = []DelegateTarget{}
+	}
+	data, err := json.Marshal(map[string]DelegateTargets{delegateTargetsKey: t})
+	if err != nil {
+		return Part{}, err
+	}
+	return Part{Kind: "data", Data: data}, nil
+}
+
+// DelegateTargetsOf finds the delegateTargets part among parts. A part that
+// breaks the bounds, or a second one, is an error, and the reader falls back
+// to what it would show with none.
+func DelegateTargetsOf(parts []Part) (DelegateTargets, bool, error) {
+	var found *DelegateTargets
+	for _, p := range parts {
+		raw, ok := wrappedData(p, delegateTargetsKey)
+		if !ok {
+			continue
+		}
+		if found != nil {
+			return DelegateTargets{}, true, errors.New("delegate targets: more than one delegateTargets part")
+		}
+		var t DelegateTargets
+		if err := json.Unmarshal(raw, &t); err != nil {
+			return DelegateTargets{}, true, fmt.Errorf("delegate targets: %w", err)
+		}
+		if t.Targets == nil {
+			return DelegateTargets{}, true, errors.New("delegate targets: the part carries no targets list")
+		}
+		if err := validateDelegateTargets(t); err != nil {
+			return DelegateTargets{}, true, err
+		}
+		found = &t
+	}
+	if found == nil {
+		return DelegateTargets{}, false, nil
 	}
 	return *found, true, nil
 }

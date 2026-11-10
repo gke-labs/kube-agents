@@ -72,7 +72,7 @@ class AnalyzeCase(unittest.TestCase):
         config = replay_proxy.Config(mode=mode, allow_serve=mode == "replay", cache_dir=self.cache_dir,
                                      store_dir=os.path.join(self.cache_dir, "store-" + build),
                                      redactor_path=REDACTOR, transcript_rules_path=RULES,
-                                     model_behaviour_checksum="abc", litellm_image="img", job_build=build)
+                                     litellm_config_checksum="abc", litellm_image="img", job_build=build)
         proxy = replay_proxy.ShadowProxy(config, out=io.StringIO())
         self.addCleanup(proxy.close)
         return proxy
@@ -402,6 +402,148 @@ class BoundValueTest(AnalyzeCase):
         self.assertEqual(line["unstorable"], [])
 
 
+class RunNameTest(AnalyzeCase):
+    """The eval pool project, a repository commit, a clone directory and a GKE operation are bound like ids."""
+
+    CASES = (
+        # (what the request shows, recorded value, replayed value, the answer naming it)
+        ("You are cluster-{}-seeded-a-us-central1-a.", "kube-agents-evals-31", "kube-agents-evals-29",
+         "gcloud container clusters describe seeded-a --project={} --zone us-central1-a"),
+        # The nightly's project has no number; the presubmit's does.
+        ("project {}", "kube-agents-evals", "kube-agents-evals-7",
+         "I opened a PR on gke-agentic/{}-infra for cluster-{}-seeded-a-us-central1-a."),
+        ("searched gke-agentic/kube-agents-evals-3-infra@{} (whole tree)", "c99b1ab", "4f1e414",
+         "git -C repo checkout {}"),
+        ("cloned into /opt/data/scratch/declared-intent-{}", "a2_elobt", "j77z8q6q",
+         "ls /opt/data/scratch/declared-intent-{}/"),
+        ("newest operation operation-{} (UPGRADE_NODES)", "1793806478493-11b21f18-4eef-47ea-8ce1-fbd3c40047b3",
+         "1792900340178-5482a62f-d7e3-4c54-bb09-236983a9dfb7", "gcloud container operations describe operation-{}"),
+    )
+
+    @staticmethod
+    def body(shown):
+        return {"model": "m", "messages": [{"role": "user", "content": shown}]}
+
+    def test_the_answer_is_served_with_this_runs_value(self):
+        for shown, recorded, replayed, said in self.CASES:
+            with self.subTest(said=said):
+                self.setUp()
+                line = self.recorded(self.body(shown.format(recorded)),
+                                     {"role": "assistant", "content": said.format(recorded, recorded)})
+                self.assertEqual(line["unstorable"], [])
+                hit, _ = self.proxy().lookup(self.body(shown.format(replayed)), time.time())
+                self.assertIsNotNone(hit)
+                self.assertEqual(hit[0]["content"], said.format(replayed, replayed))
+
+    def test_the_next_request_holding_the_served_answer_still_matches(self):
+        # The answer names the value outside the shape that bound it, so only the
+        # whole-token swap finds it; turn 2 sends each run's own text back.
+        for shown, recorded, replayed, said in (
+            ("searched gke-agentic/kube-agents-evals-3-infra@{}", "c99b1ab", "4f1e414", "git -C repo checkout {}"),
+            ("cloned into /opt/data/scratch/declared-intent-{}", "a2_elobt", "j77z8q6q", "mv clone-{} done"),
+        ):
+            with self.subTest(said=said):
+                self.setUp()
+                first = self.body(shown.format(recorded))
+                answer = {"role": "assistant", "content": said.format(recorded)}
+                self.assertEqual(self.recorded(first, answer)["unstorable"], [])
+                first["messages"] += [answer, {"role": "user", "content": "thanks"}]
+                self.recorded(first, {"role": "assistant", "content": "Done."})
+
+                replay = self.proxy()
+                echoed = self.body(shown.format(replayed))
+                hit, _ = replay.lookup(echoed, time.time())
+                self.assertEqual(hit[0]["content"], said.format(replayed))
+                echoed["messages"] += [hit[0], {"role": "user", "content": "thanks"}]
+                hit, refused = replay.lookup(echoed, time.time())
+                self.assertIsNone(refused)
+                self.assertEqual((hit[0]["content"], hit[3]), ("Done.", "exact"))
+
+    def test_the_project_in_tool_arguments_is_served_with_this_runs_value(self):
+        def answer(project):
+            return {"role": "assistant", "content": "", "tool_calls": [{"id": "call_1", "type": "function", "function": {
+                "name": "terminal", "arguments": json.dumps({"command": f"gcloud projects describe {project}"})}}]}
+
+        def shown(project):
+            return json.dumps({"output": f"project: {project}"})
+
+        self.assertEqual(self.recorded(self.body(shown("kube-agents-evals-31")),
+                                       answer("kube-agents-evals-31"))["unstorable"], [])
+        hit, _ = self.proxy().lookup(self.body(shown("kube-agents-evals-12")), time.time())
+        self.assertEqual(json.loads(hit[0]["tool_calls"][0]["function"]["arguments"]),
+                         {"command": "gcloud projects describe kube-agents-evals-12"})
+
+    def test_a_bound_commit_anywhere_in_the_answer_is_served_with_this_runs_commit(self):
+        # The request binds the commit after `@`; the answer quotes it inside a forge URL.
+        old, new = "0ffe0cbd6b463ad4509311e5ea7eaf34afd746f3", "4f1e4141f06dd20a6d36af538e51dab2f5af93a6"
+        shown = "searched gke-agentic/kube-agents-evals-29-infra@{}"
+        said = "[README.md](https://github.com/gke-agentic/kube-agents-evals-29-infra/blob/{}/README.md) is empty."
+        self.assertEqual(self.recorded(self.body(shown.format(old)),
+                                       {"role": "assistant", "content": said.format(old)})["unstorable"], [])
+        hit, _ = self.proxy().lookup(self.body(shown.format(new)), time.time())
+        self.assertEqual(hit[0]["content"], said.format(new))
+        # After `=`, which no pattern and no whole-token swap reads as a boundary.
+        self.setUp()
+        said = "git fetch origin --negotiation-tip={}"
+        self.assertEqual(self.recorded(self.body(shown.format(old[:7])),
+                                       {"role": "assistant", "content": said.format(old[:7])})["unstorable"], [])
+        hit, _ = self.proxy().lookup(self.body(shown.format(new[:7])), time.time())
+        self.assertEqual(hit[0]["content"], said.format(new[:7]))
+
+    def test_a_percent_escaped_project_is_served_with_this_runs_project(self):
+        shown = "project {}"
+        said = "[Logs](https://console.cloud.google.com/logs/query;query=project_id%3D%22{}%22?project={})"
+        self.assertEqual(self.recorded(self.body(shown.format("kube-agents-evals-22")), {
+            "role": "assistant", "content": said.format("kube-agents-evals-22", "kube-agents-evals-22")})["unstorable"], [])
+        hit, _ = self.proxy().lookup(self.body(shown.format("kube-agents-evals-5")), time.time())
+        self.assertEqual(hit[0]["content"], said.format("kube-agents-evals-5", "kube-agents-evals-5"))
+
+    def test_a_pool_project_the_request_never_named_is_not_stored(self):
+        line = self.recorded(self.body("list the clusters"),
+                             {"role": "assistant", "content": "gcloud container clusters list --project=kube-agents-evals-31"})
+        self.assertEqual(line["unstorable"], ["unbound_identifier"])
+
+    def test_a_shortened_commit_is_not_stored(self):
+        # The request holds the full commit; the answer abbreviates it, which no pattern binds.
+        full = "c99b1ab1fee849df074d039fe5d4d4ad4301d1c9"
+        line = self.recorded(self.body(f"searched gke-agentic/kube-agents-evals-3-infra@{full}"),
+                             {"role": "assistant", "content": "the repository is at c99b1ab"})
+        self.assertEqual(line["unstorable"], ["bound_value_left_literal"])
+
+    def test_names_that_are_no_pool_project_are_served_as_recorded(self):
+        said = "Opened by kube-agents-evals-token-minter[bot] against gke-agentic/kube-agents-evals-large-gitops."
+        self.assertEqual(self.recorded(self.body("project kube-agents-evals-31"),
+                                       {"role": "assistant", "content": said})["unstorable"], [])
+        hit, _ = self.proxy().lookup(self.body("project kube-agents-evals-29"), time.time())
+        self.assertEqual(hit[0]["content"], said)
+
+    def test_a_node_name_that_holds_the_pool_project_is_served_with_this_runs_node(self):
+        shown = "node {} is NotReady"
+        old, new = "gke-kube-agents-evals-31-default-pool-abcdef12-x1y2", "gke-kube-agents-evals-7-default-pool-98765432-q9r8"
+        said = "kubectl drain {} --ignore-daemonsets"
+        self.assertEqual(self.recorded(self.body(shown.format(old)),
+                                       {"role": "assistant", "content": said.format(old)})["unstorable"], [])
+        hit, _ = self.proxy().lookup(self.body(shown.format(new)), time.time())
+        self.assertEqual(hit[0]["content"], said.format(new))
+
+    def test_an_answer_quoting_a_queued_events_count_is_not_stored(self):
+        card = json.dumps({"task": {"id": "t_bbbbbbbb"}, "events": [
+            {"kind": "queued", "payload": {"note": "Queued: the system is busy.", "running": 5, "limit": 5, "ahead": 6}}]})
+        line = self.recorded(self.body(card), {"role": "assistant", "content": "It waited behind 6 other tasks."})
+        self.assertEqual(line["unstorable"], ["repeats_swapped_number"])
+
+    def test_an_answer_quoting_a_commit_only_the_digest_names_is_not_stored(self):
+        card = "card t_bbbbbbbb\n\n## Recent work by @platform\n- t_deadbeef — synced the repo at 0ffe0cb: done"
+        line = self.recorded(self.body(card), {"role": "assistant", "content": "The repository is at 0ffe0cb."})
+        self.assertEqual(line["unstorable"], ["unbound_identifier"])
+
+    def test_an_answer_repeating_a_dropped_queued_events_time_is_not_stored(self):
+        card = json.dumps({"task": {"id": "t_bbbbbbbb"}, "events": [
+            {"kind": "queued", "created_at": 1793700100, "payload": {"note": "Queued: the system is busy."}}]})
+        line = self.recorded(self.body(card), {"role": "assistant", "content": "It waited from 1793700100."})
+        self.assertEqual(line["unstorable"], ["repeats_swapped_number"])
+
+
 class ReasoningTest(AnalyzeCase):
     """An answer's reasoning is checked for credentials, and never stored."""
 
@@ -596,6 +738,25 @@ class RecordTest(ProxyTestCase):
         self.assertFalse(os.path.exists(os.path.join(self.cache_dir, replay_cache.ANSWERS_DIR)))
 
 
+class RecordContinuationTest(ProxyTestCase):
+    """A record line names its answer, and the next request names the answer it went on from."""
+
+    mode = "record"
+
+    def test_the_next_requests_prior_answer_is_the_recorded_answer_variant(self):
+        self.request("POST", COMPLETIONS, ReplayTest.opening("t_11111111"))
+        first = self.lines(1)[0]
+        self.assertTrue(first["recorded"])
+        self.assertNotIn("prior_answer", first, "an opening holds no answer yet")
+        self.request("POST", COMPLETIONS, ReplayTest.pickup("t_11111111", "answer 1 for t_11111111", "Latte"))
+        second = self.lines(2)[1]
+        self.assertEqual(second["prior_answer"], first["answer_variant"])
+        self.request("POST", COMPLETIONS, ReplayTest.pickup("t_11111111", "a different answer", "Latte"))
+        third = self.lines(3)[2]
+        self.assertNotEqual(third["prior_answer"], first["answer_variant"],
+                            "a conversation that went on from another answer is not evidence for this one")
+
+
 class RecordBudgetTest(ProxyTestCase):
     """The cache counts against the data budget in record mode: spent, nothing is saved and forwarding goes on."""
 
@@ -745,6 +906,31 @@ class ReplayTest(ProxyTestCase):
         self.assertEqual(line["unstorable"], [])
         self.assertEqual((line["litellm_model_group"], line["litellm_attempted_fallbacks"]), (None, None))
 
+    def test_a_served_line_carries_no_litellm_accounting(self):
+        # The recording's usage block keeps LiteLLM's cost and reasoning count;
+        # a served answer never reached LiteLLM, so its line says none of them.
+        FakeLiteLLM.extra_headers = {"x-litellm-model-group": "model-default", "x-litellm-attempted-fallbacks": "0",
+                                     "x-litellm-model-name": "vertex_ai/gemini-x", "x-litellm-attempted-retries": "1",
+                                     "x-litellm-response-cost": "0.5"}
+        self.addCleanup(setattr, FakeLiteLLM, "extra_headers", {})
+        FakeLiteLLM.custom_body = json.dumps({
+            "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "ok"}}],
+            "usage": {"prompt_tokens": 600, "completion_tokens": 59, "cost": 0.25, "cache_creation_input_tokens": 40,
+                      "completion_tokens_details": {"reasoning_tokens": 57}},
+        }).encode()
+        self.record(chat("t_11111111", stream=False))
+        recorded = json.loads(self.record_out.getvalue().splitlines()[-1])
+        self.assertEqual((recorded["litellm_cost_usd"], recorded["litellm_model_name"], recorded["litellm_attempted_retries"],
+                          recorded["reasoning_tokens"], recorded["cache_write_tokens"]),
+                         (0.25, "vertex_ai/gemini-x", 1, 57, 40))
+        _, port, out = self.replay()
+        self.request("POST", COMPLETIONS, chat("t_22222222", stream=False), port=port)
+        line = self.lines(1, out)[0]
+        self.assertTrue(line["served"])
+        for name in ("litellm_cost_usd", "litellm_model_name", "litellm_attempted_retries", "reasoning_tokens",
+                     "cache_write_tokens"):
+            self.assertIsNone(line[name], name)
+
     def test_a_non_streamed_hit(self):
         self.record(chat("t_11111111", stream=False))
         _, port, out = self.replay()
@@ -890,6 +1076,20 @@ class ReplayTest(ProxyTestCase):
         _, port, out = self.replay()
         self.request("POST", COMPLETIONS, chat("t_11111111", stream=False), port=port)
         self.assertEqual(self.lines(1, out)[0]["miss"]["role"], "no_saved_request")
+
+    def test_a_cache_seeded_after_start_rebuilds_the_miss_index_once_marked(self):
+        # The replay lane seeds the cache into a running proxy (collect_shadow.py).
+        _, port, out = self.replay()
+        extra = ({"role": "user", "content": "first turn"},)
+        self.record(chat("t_11111111", stream=False, extra_messages=extra))
+        changed = ({"role": "user", "content": "first turn, but the pod restarted 3 times"},)
+        self.request("POST", COMPLETIONS, chat("t_11111111", stream=False, extra_messages=changed), port=port)
+        self.assertEqual(self.lines(1, out)[0]["miss"]["role"], "no_saved_request", "not marked yet")
+        Path(self.cache_dir, replay_cache.SEED_MARKER).write_text("1")
+        self.request("POST", COMPLETIONS, chat("t_11111111", stream=False, extra_messages=changed), port=port)
+        miss = self.lines(2, out)[1]["miss"]
+        self.assertEqual(miss["closest_fingerprint"], self.lines(1, self.record_out)[0]["fingerprint"])
+        self.assertEqual((miss["index"], miss["role"]), (1, "user"))
 
     def test_an_unbound_placeholder_is_a_miss(self):
         self.record(chat("t_11111111", stream=False))

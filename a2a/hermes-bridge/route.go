@@ -49,7 +49,8 @@ const (
 	// routeLostNote follows a completed answer whose route could not be
 	// recorded, so the user is told rather than left waiting for a card's
 	// answer that cannot arrive. Such a turn ends at its acknowledgement
-	// (only a console or MCP turn waits on its cards, waitsForCardsInTurn),
+	// (only a console, MCP or A2A door turn waits on its cards,
+	// waitsForCardsInTurn),
 	// and most file no card, hence "if".
 	routeLostNote = "\n\n(If a card this turn filed is still running, its answer cannot be posted back to this conversation: the conversation's route could not be recorded.)"
 )
@@ -69,15 +70,34 @@ var routePlatforms = map[string]string{
 // that carries its task (conversationRoute.TaskID).
 const consoleRoutePrefix = "console:"
 
+// a2aDoorRoutePrefix is the gateway's A2A door's conversation key prefix
+// (a2a/gateway/a2adoor.go, a2aKeyPrefix): a client calling message/send,
+// which has no thread for a card's post and reads the task's answer.
+const a2aDoorRoutePrefix = "a2a:"
+
 // waitsForCardsInTurn reports whether a turn holds its task open while the
-// Kanban cards it filed run (waitForKanbanCards): only a console or MCP
-// turn. Every other turn ends at the acknowledgement, as before the in-turn
-// wait (#5170). On a chat turn with a recorded route a card's answer comes
-// back through the chat.notify route; on a turn whose route was not recorded
-// it cannot (routeLostNote says so); a turn with no chat conversation (the
-// A2A door, the eval inject lane) gets none from the bridge.
+// Kanban cards it filed run (waitForKanbanCards): a console or MCP turn, or
+// an A2A door turn (#5180). Those clients read the task's answer and have
+// no thread for a card's post. Every other turn ends at the acknowledgement,
+// as before the in-turn wait (#5170). On a chat turn with a recorded route a
+// card's answer comes back through the chat.notify route; on a turn whose
+// route was not recorded it cannot (routeLostNote says so); the eval inject
+// lane gets none from the bridge.
 func waitsForCardsInTurn(env *lib.Envelope) bool {
-	return isConsoleOrigin(env)
+	return isConsoleOrigin(env) || hasConversationPrefix(env, a2aDoorRoutePrefix)
+}
+
+// hasConversationPrefix reports whether env's authority names a
+// conversation starting with prefix.
+func hasConversationPrefix(env *lib.Envelope, prefix string) bool {
+	if env == nil {
+		return false
+	}
+	auth, err := parseRouteAuthority(env)
+	if err != nil {
+		return false
+	}
+	return strings.HasPrefix(strings.TrimSpace(auth.Audience.Conversation), prefix)
 }
 
 func isConsoleOrigin(env *lib.Envelope) bool {

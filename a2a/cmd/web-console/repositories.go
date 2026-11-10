@@ -16,9 +16,11 @@ var (
 	validRefsHeadsPrefixPattern = regexp.MustCompile(`^refs/heads/[A-Za-z0-9]`)
 	validForgeNamePattern       = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
 	allowedForgeProviders       = map[string]bool{
-		"github": true,
-		"gitlab": true,
-		"gitea":  true,
+		"github":               true,
+		"gitlab":               true,
+		"gitea":                true,
+		"bitbucket":            true,
+		"bitbucket-datacenter": true,
 	}
 )
 
@@ -32,6 +34,12 @@ const (
 	categoryIAM       = "iam"
 	categoryContext   = "context"
 	categoryCustom    = "custom"
+
+	// The providers the PlatformAgent CRD's forge enum registers, as the
+	// errors name them.
+	allowedForgeProvidersText = "github, gitlab, gitea, bitbucket, or bitbucket-datacenter"
+	// The provider a forge with no provider reads as.
+	defaultForgeProvider = "github"
 
 	maxRepositoriesCount = 50
 	maxBaseBranchLength  = 200
@@ -174,7 +182,11 @@ func generateHelmValuesYAML(forges []forgeInfo, repos []repositoryInfo) string {
 		sb.WriteString("      - name: github\n        provider: github\n")
 	} else {
 		for _, f := range forges {
-			sb.WriteString(fmt.Sprintf("      - name: %s\n        provider: %s\n", f.Name, f.Provider))
+			provider := f.Provider
+			if provider == "" {
+				provider = defaultForgeProvider
+			}
+			sb.WriteString(fmt.Sprintf("      - name: %s\n        provider: %s\n", f.Name, provider))
 			if f.Host != "" {
 				sb.WriteString(fmt.Sprintf("        host: %q\n", f.Host))
 			}
@@ -418,7 +430,7 @@ func (s *server) handleRepositoriesSet(w http.ResponseWriter, r *http.Request) {
 			f.Provider = "github"
 		}
 		if !allowedForgeProviders[f.Provider] {
-			writeError(w, http.StatusBadRequest, "invalid_provider", fmt.Sprintf("Provider %q is invalid; must be github, gitlab, or gitea.", f.Provider))
+			writeError(w, http.StatusBadRequest, "invalid_provider", fmt.Sprintf("Provider %q is invalid; must be %s.", f.Provider, allowedForgeProvidersText))
 			return
 		}
 		needForge(f)
@@ -472,7 +484,7 @@ func (s *server) handleRepositoriesSet(w http.ResponseWriter, r *http.Request) {
 			r.Provider = "github"
 		}
 		if !allowedForgeProviders[r.Provider] {
-			writeError(w, http.StatusBadRequest, "invalid_provider", fmt.Sprintf("Repository %q has invalid provider %q; must be github, gitlab, or gitea.", r.Repository, r.Provider))
+			writeError(w, http.StatusBadRequest, "invalid_provider", fmt.Sprintf("Repository %q has invalid provider %q; must be %s.", r.Repository, r.Provider, allowedForgeProvidersText))
 			return
 		}
 		r.Forge = strings.TrimSpace(r.Forge)
@@ -787,7 +799,7 @@ func (s *server) handleRepositoriesConnect(w http.ResponseWriter, r *http.Reques
 		provider = "github"
 	}
 	if !allowedForgeProviders[provider] {
-		writeError(w, http.StatusBadRequest, "invalid_provider", fmt.Sprintf("Provider %q is invalid; must be github, gitlab, or gitea.", provider))
+		writeError(w, http.StatusBadRequest, "invalid_provider", fmt.Sprintf("Provider %q is invalid; must be %s.", provider, allowedForgeProvidersText))
 		return
 	}
 	if forge == "" || forge == provider {

@@ -235,6 +235,12 @@ USAGE_CHAIN = "chain"
 PROBE_USAGE_KEY = "usage"
 PROBE_CHILD_USAGE_KEY = "childUsage"
 PROBE_USAGE_PARTIAL_KEY = "usagePartial"
+# Whom the chain delegated to, each child's addressee once in order: a
+# profile's name or platform. The door sends it on every read, ``[]`` when
+# nothing was delegated and ``null`` for a task it could not find; a door
+# older than the field omits the key, which reads as ``None`` here, "can't
+# say", never as "delegated nothing" (``delegated_to`` errors on it).
+PROBE_CHILD_ADDRESSEES_KEY = "childAddressees"
 USAGE_READ_ATTEMPTS = 2
 USAGE_INPUT_KEY = "inputTokens"
 USAGE_OUTPUT_KEY = "outputTokens"
@@ -266,6 +272,23 @@ ACTIVITY_STATUS_TRUNCATED = "truncated"
 # ``truncated`` would otherwise set the record aside on the run that used it.
 ACTIVITY_INPUT_TRUNCATED_KEY = "truncated"
 ACTIVITY_INPUT_TRUNCATED_KEYS = frozenset({ACTIVITY_INPUT_TRUNCATED_KEY, "bytes", "head"})
+# The bridge labels each part with the session that made the call
+# (``workerLabelLocked`` in ``a2a/hermes-bridge/activity_thinking.go``),
+# under its ``api`` executor: its own session, the router's, as
+# ``platform``, and a card worker's as ``card:<id> (<title>)`` or
+# ``worker:<session>``. A worker's call is not the router's; folded in here
+# untagged it would read as one, so a router-scoped ``tool_called`` on
+# ``kanban_complete`` would fire on the worker closing its own card. Such a
+# part is left out: the worker's calls reach the trajectory tagged with
+# their agent from the session store (``worker_trajectory``) when the
+# delegation wait found the cards, where the scorer grades the worker-scoped
+# checks (and sets them aside on a record without them). The skip names the worker
+# prefixes rather than the router's label, so a label this side does not
+# know stays the router's and shows in the record instead of emptying it.
+# A part with no label (a bridge older than the field, or the cli
+# executor) is the router's; a label that is not a string is malformed.
+ACTIVITY_WORKER_KEY = "worker"
+ACTIVITY_WORKER_PREFIXES = ("card:", "worker:")
 # The marker's argument names: the two it always carries, and three
 # present only when non-zero -- parts or counts that could not be read,
 # calls whose input the executor replaced with its truncation stand-in, and
@@ -628,6 +651,13 @@ def _readable_count(value: Any) -> int | None:
     return int(value)
 
 
+def _child_addressees(raw: Any) -> list[str] | None:
+    """The probe's ``childAddressees`` as a list, or ``None`` when it can't say."""
+    if not isinstance(raw, list) or not all(isinstance(a, str) for a in raw):
+        return None
+    return list(raw)
+
+
 def _usage_counts(raw: Any) -> dict[str, int | None] | None:
     """A usage object's two counts, ``{"input": n, "output": n}``, a count that
     cannot be read as ``None``; ``None`` whole when ``raw`` is no object."""
@@ -764,6 +794,11 @@ class Fold:
     usage: dict[str, int | None] | None = None
     child_usage: dict[str, int | None] | None = None
     usage_partial: bool = False
+    # Whom the chain delegated to (:data:`PROBE_CHILD_ADDRESSEES_KEY`), from
+    # the latest read about this task that carried it, the polls' included
+    # (:meth:`InjectTask._note`) and the read after the terminal last;
+    # ``None`` until a read answers with it.
+    child_addressees: list[str] | None = None
     terminal: str = ""
     terminal_source: str = ""
     terminal_reason: str = ""
@@ -838,6 +873,8 @@ class Fold:
         a call: its ``dropped`` joins the door's ``activityDropped`` in the
         marker and no entry is written for it, and a part with no tool name
         is counted as malformed rather than written as a call to nothing.
+        A part the bridge labels with a card worker's session is left out as
+        the worker's call, not the router's (:data:`ACTIVITY_WORKER_KEY`).
         Empty when no read carried the key.
         """
         mapped = self._map_activity()
@@ -877,6 +914,12 @@ class Fold:
                     malformed += 1
                 else:
                     dropped += count
+                continue
+            worker = part.get(ACTIVITY_WORKER_KEY)
+            if worker is not None and not isinstance(worker, str):
+                malformed += 1
+                continue
+            if worker and worker.startswith(ACTIVITY_WORKER_PREFIXES):
                 continue
             tool = part.get(ACTIVITY_TOOL_KEY)
             if not isinstance(tool, str) or not tool:
@@ -1163,6 +1206,9 @@ class Probe:
     # The same for ``childUsage``, and the body's ``usagePartial``.
     child_usage: dict[str, int | None] | None = None
     usage_partial: bool = False
+    # The body's ``childAddressees`` (:data:`PROBE_CHILD_ADDRESSEES_KEY`):
+    # ``None`` when the key was absent, null, or not a list of strings.
+    child_addressees: list[str] | None = None
     last_post: str = ""
     error: str = ""
     # The conversation's A2A contextId, from the gateway's session record;
@@ -1226,6 +1272,7 @@ class Probe:
             usage=_usage_counts(raw.get(PROBE_USAGE_KEY)),
             child_usage=_usage_counts(raw.get(PROBE_CHILD_USAGE_KEY)),
             usage_partial=raw.get(PROBE_USAGE_PARTIAL_KEY) is True,
+            child_addressees=_child_addressees(raw.get(PROBE_CHILD_ADDRESSEES_KEY)),
             last_post=str(last_post.get("text") or "") if isinstance(last_post, dict) else "",
             error=str(raw.get("error") or ""),
             context_id=str(raw.get("contextId") or ""),
@@ -1714,6 +1761,8 @@ class InjectTask:
                 return
             if answered is None or not answered.could_look or answered.task_id != task_id:
                 return
+            if answered.child_addressees is not None:
+                fold.child_addressees = answered.child_addressees
             if answered.usage is None and answered.child_usage is None and not answered.usage_partial:
                 return
             fold.usage = answered.usage
@@ -1758,6 +1807,12 @@ class InjectTask:
                 adopted = True
             if probe.progress:
                 fold.progress = probe.progress
+            # The door sends it on every read, from the record, and a chain
+            # only grows, so the latest read about this task is the fullest:
+            # kept here so a run whose read after the terminal never lands
+            # (the deadline, a transient error) still has it.
+            if probe.child_addressees is not None:
+                fold.child_addressees = probe.child_addressees
         if probe.could_look and probe.concerns(task_id) and not probe.final and not fold.final:
             if probe.reached_working:
                 # The read shows the latest state; ``working`` may have come

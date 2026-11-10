@@ -19,13 +19,55 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
+// configConnectorReasons are the Event.Reason values Config Connector's
+// controller records against a managed resource whose reconcile did not
+// succeed, as its monitoring guide lists them
+// (docs.cloud.google.com/config-connector/docs/how-to/monitoring-your-resources).
+// They are on the shipped reason lists, here and in the entrypoint's --reason,
+// because a managed resource that cannot apply is otherwise silent: the
+// controller does not crash, logs only on the object, and the resource's
+// Ready=False stands until an audit reads it. Updating, UpToDate, Deleting and
+// Deleted are the controller's normal states and stay off the list. Two of
+// them, configConnectorSettleReasons, are transient by the guide's own
+// account and sit in the settle family; the rest are verdicts and fire on
+// their first sighting (settleApplies).
+var configConnectorReasons = []string{
+	"UpdateFailed",
+	"DeleteFailed",
+	"DependencyNotReady",
+	"DependencyNotFound",
+	"DependencyInvalid",
+	"ManagementConflict",
+	"Unmanaged",
+	"PreActuationTransformFailed",
+	"PostActuationTransformFailed",
+}
+
+// configConnectorSettleReasons are the two Config Connector reasons that are
+// the normal state of an ordered apply for a while: DependencyNotReady while
+// a referenced resource is still being created, and Unmanaged, which the guide
+// says can appear transiently when a resource and its namespace's
+// ConfigConnectorContext are created together. Held for the settle period, so
+// one that clears on the next reconcile is not forwarded. The other seven are
+// verdicts (an API refused the change, a reference is missing or malformed,
+// another resource owns the Google Cloud resource) and fire at once: a settle
+// period measured on one Event object's stamps would otherwise hold a failure
+// whose message changes between reconciles forever, since each sighting is
+// then a new object with no span.
+var configConnectorSettleReasons = stringSet([]string{
+	"DependencyNotReady",
+	"Unmanaged",
+})
+
 // defaultReasons lists the standard Event.Reason values that trigger investigations.
-// These cover typical Kubernetes workload and node failures, but operators can
-// override this list via the --reason flag.
-var defaultReasons = []string{
+// These cover typical Kubernetes workload and node failures and Config
+// Connector's reconcile failures, but operators can override this list via
+// the --reason flag.
+var defaultReasons = append([]string{
 	"CrashLoopBackOff",
 	"ImagePullBackOff",
 	"ErrImagePull",
@@ -37,7 +79,7 @@ var defaultReasons = []string{
 	"NetworkNotReady",
 	"NodeNotReady",
 	"Evicted",
-}
+}, configConnectorReasons...)
 
 // filterConfig holds the configuration for event filtering rules.
 // Loaded from command-line flags and injected to allow independent unit testing.
@@ -51,9 +93,10 @@ type filterConfig struct {
 	// excludedNamespaces suppresses events from these namespaces.
 	// Exclude rules take precedence over allowedNamespaces rules.
 	excludedNamespaces map[string]struct{}
-	// alertExclude holds the --alert-exclude rules: an event any of them
-	// matches opens no incident (gateAlertExcluded). Set after
-	// newFilterConfig, from parseAlertExclude.
+	// alertExclude holds the alert-exclude rules in force at start: an event
+	// any of them matches opens no incident (gateAlertExcluded). Set after
+	// newFilterConfig, from parseAlertExclude. The filter holds its own copy,
+	// which --alert-exclude-file replaces (see filter.alertExclude).
 	alertExclude []alertExcludeRule
 	// unhealthyMinCount specifies the minimum repeat threshold count for "Unhealthy"
 	// events before they pass. This prevents transient probe failures from triggering alerts.
@@ -413,10 +456,26 @@ type filter struct {
 	fsLogMu     sync.Mutex
 	fsLogged    boundedEntries[filterGate]
 	fsLastSweep time.Time
+	// alertExclude is the alert-exclude rules in force: cfg.alertExclude at
+	// start, replaced whole when --alert-exclude-file changes (see
+	// reloadAlertExcludeFile). Read from every cluster's delivery goroutine.
+	alertExclude atomic.Pointer[[]alertExcludeRule]
 }
 
 func newFilter(cfg filterConfig) *filter {
-	return &filter{cfg: cfg, fsLogged: newBoundedEntries[filterGate](failedSchedulingLogEvery, maxFailedSchedulingLogEntries)}
+	f := &filter{cfg: cfg, fsLogged: newBoundedEntries[filterGate](failedSchedulingLogEvery, maxFailedSchedulingLogEntries)}
+	f.setAlertExclude(cfg.alertExclude)
+	return f
+}
+
+// alertExcludeRules is the alert-exclude rules in force.
+func (f *filter) alertExcludeRules() []alertExcludeRule {
+	return *f.alertExclude.Load()
+}
+
+// setAlertExclude puts rules in force for every event decided after it.
+func (f *filter) setAlertExclude(rules []alertExcludeRule) {
+	f.alertExclude.Store(&rules)
 }
 
 func (f *filter) clock() time.Time {
@@ -521,7 +580,7 @@ func (f *filter) Decide(ev TriageEvent) filterGate {
 			return gateNamespaceNotAllowed
 		}
 	}
-	if scaleUpVerdictFor(ev.Key.Reason) == scaleUpNone && alertExcluded(f.cfg.alertExclude, ev) {
+	if scaleUpVerdictFor(ev.Key.Reason) == scaleUpNone && alertExcluded(f.alertExcludeRules(), ev) {
 		return gateAlertExcluded
 	}
 	if ev.Key.Reason == "Unhealthy" && belowMinCount(ev.Count, f.cfg.unhealthyMinCount) {
@@ -838,8 +897,12 @@ func autopilotScaleToZero(ev TriageEvent) bool {
 // image-pull family, whose transient half has its own gate and whose
 // terminal half (a bad tag) should fire at once; FailedScheduling, which the
 // autoscaler gate reads with a better signal than time; and FailedToDrainNode.
-// The family is read on the canonical reason so kubelet's Reason=BackOff
-// crash loop is in it and its image-pull BackOff is not.
+// Of Config Connector's reconcile failures only configConnectorSettleReasons
+// are in it: a DependencyNotReady during an ordinary apply of several
+// resources clears inside the period, while UpdateFailed and the other
+// verdicts fire at once. The family is read on the canonical reason so
+// kubelet's Reason=BackOff crash loop is in it and its image-pull BackOff is
+// not.
 //
 // A plain Failed joins it only when the message is one of kubelet's config
 // errors (retriedConfigError). A start error stays out because a container
@@ -854,7 +917,8 @@ func settleApplies(canonicalReason, message string) bool {
 	case reasonFailed:
 		return retriedConfigError(message)
 	}
-	return false
+	_, configConnector := configConnectorSettleReasons[canonicalReason]
+	return configConnector
 }
 
 // retriedConfigError reports whether a Failed event's message is a config

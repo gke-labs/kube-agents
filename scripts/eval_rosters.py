@@ -11,7 +11,9 @@ The files under hack/eval/ hold what the eval gate runs and what blocks (#1546, 
 - ``hack/eval/blocking-roster.txt`` -- one case id per line, the default of
   ``BOOTSTRAP_ADMITTED``;
 - ``hack/eval/certification-cases.txt`` -- what ``EVAL_TIER=certification``
-  runs on its own, in ``# part N`` sections, one periodic each.
+  runs on its own, in ``# part N`` sections, one periodic each;
+- ``hack/eval/replay-lane-cases.txt`` -- what ``EVAL_REPLAY_LANE=true`` replays
+  from the nightlies' recordings, registered cases, gating nothing.
 
 In every file ``#`` starts a comment and blank lines are skipped, which is
 exactly the ``sed | grep`` the script applies; this module is the Python copy
@@ -55,6 +57,9 @@ GHES_CASES_FILE = EVAL_DIR / "ghes-cases.txt"
 # sections the ci-kube-agents-certification periodics run one each.
 CERTIFICATION_CASES_FILE = EVAL_DIR / "certification-cases.txt"
 CERTIFICATION_SUITE = "certification"
+# The replay lane's matrix (examples/inference-replay/eval-design.md, Rollout
+# step 2): registered cases, replayed from the nightlies' recordings.
+REPLAY_LANE_CASES_FILE = EVAL_DIR / "replay-lane-cases.txt"
 # The inject lane's exclusions (#2039): case ids the script drops from TASKS
 # under AGENT_TRANSPORT=inject, each with its reason as the comment block
 # directly above it.
@@ -178,6 +183,10 @@ def ghes_cases(path: pathlib.Path = GHES_CASES_FILE) -> list[str]:
 
 
 def certification_cases(path: pathlib.Path = CERTIFICATION_CASES_FILE) -> list[str]:
+    return case_names(path.read_text(encoding="utf-8"))
+
+
+def replay_lane_cases(path: pathlib.Path = REPLAY_LANE_CASES_FILE) -> list[str]:
     return case_names(path.read_text(encoding="utf-8"))
 
 
@@ -444,6 +453,7 @@ def summary(repetitions: int = 3) -> dict[str, int]:
         "presubmit units": len(presubmit) * repetitions,
         "gitlab lane cases": len(gitlab_cases()),
         "ghes lane cases": len(ghes_cases()),
+        "replay lane cases": len(replay_lane_cases()),
         "inject lane exclusions": len(inject_lane_exclusions()),
         "presubmit serial-phase cases": len(wall["requesting"]),
         "presubmit wall estimate, minutes": -(-wall["total"] // 60),

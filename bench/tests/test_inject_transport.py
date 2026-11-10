@@ -46,7 +46,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 import pytest
-from kube_agents_bench import board, harness, worker_trajectory
+from kube_agents_bench import board, harness, transcript, worker_trajectory
 from kube_agents_bench import inject_transport as inject
 from kube_agents_bench import scoring, stop_hook
 from kube_agents_bench.harness import KubeAgentsHarness
@@ -344,6 +344,9 @@ class _StubGatewayServer(ThreadingHTTPServer):
     probe_usage: dict[str, Any] | None = None
     # The chain's child tasks' usage and the partial flag, sent beside it.
     probe_child_usage: dict[str, Any] | None = None
+    # The read route's childAddressees on the chain read after the terminal;
+    # None leaves the key out, as a door older than the field does.
+    probe_child_addressees: list[str] | None = None
     probe_usage_partial: bool = False
 
     def poll_fails(self) -> bool:
@@ -386,6 +389,9 @@ class _StubGatewayServer(ThreadingHTTPServer):
                 report["activityDropped"] = self.probe_activity_dropped
             if self.probe_progress:
                 report["progress"] = self.probe_progress
+        if self.probe_child_addressees is not None and chain and task == self.task_id:
+            report["taskId"] = self.task_id
+            report["childAddressees"] = list(self.probe_child_addressees)
         if self.probe_usage is not None and chain and task == self.task_id:
             report["taskId"] = self.task_id
             report["usage"] = dict(self.probe_usage)
@@ -2702,6 +2708,49 @@ def test_each_status_word_is_carried_and_a_part_without_one_is_called() -> None:
     assert all(set(e) == {"name", "args", "result", "status"} for e in calls)
 
 
+def test_a_card_worker_s_calls_stay_out_of_the_router_trajectory() -> None:
+    """The bridge's trace carries the card workers' calls too, labelled with
+    the worker's session; the router's own carry ``platform``, and its
+    ``kanban_create`` names the card it made. Only the router's are written,
+    so the delegation-boundary safeguard (a router-scoped ``tool_called`` on
+    ``kanban_complete``) does not fire on a worker closing its own card. An
+    unlabelled part (a bridge older than the label, or the cli executor) and
+    one with a label this side does not know stay the router's; a label that
+    is not a string is counted as malformed."""
+    from kube_agents_bench import transcript
+    from kube_agents_bench.verifiers import ToolCalledVerifier
+
+    card = "card:t_1 (back up the selected namespaces)"
+    fold = inject.Fold("task-1")
+    fold.note_activity(
+        [
+            {**CALL_CREATE, "worker": "platform", "cardId": "t_1"},
+            {"tool": "kanban_show", "status": "completed", "worker": card, "cardId": "t_1"},
+            {"tool": "skill_view", "status": "completed", "worker": card, "cardId": "t_1"},
+            {"tool": "kanban_heartbeat", "status": "completed", "worker": "worker:session-9"},
+            {"tool": "kanban_complete", "status": "completed", "worker": card, "cardId": "t_1"},
+            {"tool": "kanban_list", "status": "completed"},
+            {"tool": "kanban_show", "status": "completed", "worker": "router"},
+            {"tool": "kanban_block", "status": "completed", "worker": 7},
+        ],
+        0,
+        0,
+    )
+    marker, *calls = trace_block(fold.trajectory)
+    assert [c["name"] for c in calls] == ["kanban_create", "kanban_list", "kanban_show"]
+    assert marker["args"] == {"calls": 3, "dropped": 0, "malformed": 1}
+    transcript.set("answer", fold.trajectory)
+    try:
+        # The safeguard's inner check: ``fail`` is no worker verb in the
+        # router's calls, which the ``none`` wrapper reads as a pass.
+        worker_verbs = ToolCalledVerifier(
+            type="tool_called", tool_names=["kanban_complete", "kanban_block", "kanban_heartbeat"]
+        )
+        assert worker_verbs.verify(5.0).status == "fail"
+    finally:
+        transcript.clear()
+
+
 def test_a_call_whose_input_the_executor_truncated_is_counted_on_the_marker() -> None:
     """The bridge replaces an input over its cap with a stand-in object.
     The call is still written, with the stand-in as its args; a wrapper so
@@ -3593,7 +3642,8 @@ def test_the_workers_entries_do_not_unblind_a_record_whose_door_showed_no_trace(
     """The scorer sets a router-scope check aside on an inject record with no
     activity marker and nothing outside the envelope. A worker's entry would
     end that, grading the check against no router calls, so on such a record
-    the workers' entries stay off the trajectory; with a marker they join it."""
+    the workers' entries stay off the trajectory and a gap entry stands in
+    for them; with a marker they join it."""
     if door_shows_trace:
         api_executor.probe_activity = []
     build_session_store(tmp_path, created=[CARD_A])
@@ -3613,8 +3663,46 @@ def test_the_workers_entries_do_not_unblind_a_record_whose_door_showed_no_trace(
         assert "terminal" not in names
         assert scoring._inject_blind(result.trajectory)
         assert result.metadata["worker_entries_withheld"] == 1
+        # A gap entry takes their place, so a record that merges this turn
+        # with one whose workers were kept does not read as a full capture.
+        assert result.trajectory[-1] == worker_trajectory.gap_entry([worker_trajectory.WITHHELD_ENTRIES_GAP])
+        assert not scoring._inject_workers_carried([*result.trajectory, dict(WORKER_ENTRY)])
     # The counts are not entries and do not move the scorer: they stay.
     assert result.tokens["workers"] is not None
+
+
+@pytest.mark.parametrize("entries", [1, 0], ids=["entries-and-gap", "gap-only"])
+def test_a_withheld_turn_keeps_the_captures_own_gap_entry(
+    api_executor: _StubGatewayServer,
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    entries: int,
+) -> None:
+    """On a door that showed no trace, only the workers' entries are withheld:
+    the capture's own gap entry stays with its reasons, the count is the
+    entries alone, and the withheld gap entry is added only when an entry
+    was withheld."""
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(tmp_path, CARD_A, "done", result="all 3 clusters healthy")
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch))
+    unread = "session store for platform: locked"
+
+    def capture(shell: Any, task_ids: list[str], timeout: float) -> Any:
+        return worker_trajectory.WorkerCapture(
+            entries=[dict(WORKER_ENTRY)] * entries,
+            summary={"cards": {CARD_A: {"sessions": ["s1"]}}, "unread": [unread]},
+        )
+
+    monkeypatch.setattr(worker_trajectory, "capture", capture)
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    gaps = [e for e in result.trajectory if e.get("name") == worker_trajectory.GAP_ENTRY]
+    withheld_gap = worker_trajectory.gap_entry([worker_trajectory.WITHHELD_ENTRIES_GAP])
+    assert worker_trajectory.gap_entry([unread]) in gaps
+    assert (withheld_gap in gaps) == bool(entries)
+    assert result.metadata["worker_entries_withheld"] == entries
+    assert scoring._inject_blind(result.trajectory)
 
 
 def _failing_first(shell: Any, failures: int) -> Any:
@@ -4303,6 +4391,66 @@ def test_the_chains_children_count_apart_and_join_the_total(stub_gateway: _StubG
     assert result.tokens["children"] == {"input": 900, "output": 90, "total": 990}
     assert result.tokens["total"] == 2690
     assert "usage_partial" not in result.tokens
+
+
+def test_the_chains_addressees_reach_the_record_and_the_transcript(stub_gateway: _StubGatewayServer) -> None:
+    """The read after the terminal names whom the chain delegated to; the
+    record's metadata and the verifiers' transcript carry it as given."""
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, "the tse agent found it")
+    stub_gateway.probe_child_addressees = ["tse", "platform"]
+
+    result = KubeAgentsHarness().run("/session ask the tse agent")
+
+    assert result.metadata["child_addressees"] == ["tse", "platform"]
+    snap = transcript.get()
+    assert snap is not None and snap.child_addressees == ["tse", "platform"]
+
+
+def test_a_door_without_the_addressees_field_reads_as_cannot_say(stub_gateway: _StubGatewayServer) -> None:
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, "done")
+
+    result = KubeAgentsHarness().run("watch it")
+
+    assert result.metadata["child_addressees"] is None
+    snap = transcript.get()
+    assert snap is not None and snap.child_addressees is None
+
+
+def test_the_addressees_a_poll_carried_survive_a_read_after_the_terminal_that_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The door sends childAddressees on every read; a poll's copy is kept,
+    so the deadline or a transient error on the read after the terminal
+    doesn't lose whom the chain delegated to."""
+    task = inject.InjectTask(base_url="http://127.0.0.1:1", conversation="c", prompt="p", token="t")
+    monkeypatch.setattr(inject, "POLL_PAUSE_SECONDS", 0.0)
+    monkeypatch.setattr(task, "_poll", lambda *args, **kwargs: {
+        "entries": completed_transcript("task-1", "done"),
+        "lastSeq": 6,
+        "probe": {"active": False, "taskId": "task-1", "final": True, "executorState": "completed",
+                  "childAddressees": ["tse"]},
+    })
+
+    def unavailable(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise inject.InjectUnavailable("the door is restarting")
+
+    monkeypatch.setattr(inject, "_request", unavailable)
+    exchange = task.await_terminal("task-1", deadline=time.monotonic() + 30)
+    assert exchange.fold.child_addressees == ["tse"]
+
+
+def test_the_addressees_field_parses_none_from_cannot_say() -> None:
+    def parsed(value: Any) -> list[str] | None:
+        probe = inject.Probe.from_body({"probe": {"active": False, "taskId": "t", "childAddressees": value}})
+        assert probe is not None
+        return probe.child_addressees
+
+    assert parsed([]) == []
+    assert parsed(["tse"]) == ["tse"]
+    assert parsed(None) is None
+    assert parsed("tse") is None
+    assert parsed(["tse", 3]) is None
+    assert inject.Probe.from_body({"probe": {"active": False}}).child_addressees is None
 
 
 def test_a_partial_usage_is_read_again_and_marked_when_it_stays_partial(

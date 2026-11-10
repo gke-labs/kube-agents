@@ -312,21 +312,17 @@ ENV_MAX_CONCURRENT_COMMANDS = "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"
 # the same -- are most of what a wide-scope install's container holds. So a
 # request that runs commands also reserves this much for its children when it
 # is admitted, and the sum of reservations has to fit what is left of the
-# limit after the broker's own resident set and the content workspace's one
-# process tree at a time. One size for every route, because every route can
-# end up running the heavy case (§2.1). The operator's sizing test declares
-# the same four figures under matching names (credential_proxy_manifests.go)
-# and asserts the arithmetic against the rendered limit; change them together.
+# limit after the broker's own resident set. One size for every route, because
+# every route can end up running the heavy case (§2.1). The operator's sizing
+# test declares the same three figures under matching names
+# (credential_proxy_manifests.go) and asserts the arithmetic against the
+# rendered limit; change them together.
 # They, and BUDGET_MINIMUM_ADMITTED_REQUESTS below, are held equal by
 # tests/test_credential_proxy_sizing_parity.py.
 MEBIBYTE = 1024 * 1024
 REQUEST_CHILD_MEMORY_RESERVE_BYTES = 128 * MEBIBYTE
 # The broker process and Envoy: 168 MiB measured, with margin.
 BROKER_RESIDENT_RESERVE_BYTES = 192 * MEBIBYTE
-# The content workspace store serves one verb at a time under its own lock, so
-# at most one of its process trees exists at any moment; that is a fixed term
-# rather than a reservation per verb, and it is one request's worth.
-CONTENT_WORKSPACE_RESERVE_BYTES = 128 * MEBIBYTE
 # What the broker itself holds per admitted request, as a multiple of the
 # output cap: the two capped stream buffers, their decoded text, the JSON body
 # and its encoding. Charged for the slots in use, not for the cap.
@@ -344,12 +340,12 @@ OUTPUT_COPIES_PER_COMMAND = 6
 BUDGET_MINIMUM_ADMITTED_REQUESTS = 2
 # child_memory_budget_floor_bytes at the 8 MiB output cap the operator sets
 # (CREDENTIAL_PROXY_MAX_OUTPUT_BYTES; the broker's own fallback is not the
-# deployed cap): 672 MiB. Declared as a literal so that the copies elsewhere can
+# deployed cap): 544 MiB. Declared as a literal so that the copies elsewhere can
 # be compared with it as text. test_credential_proxy.py holds it to the
 # function, and tests/test_credential_proxy_sizing_parity.py holds it equal to
 # the operator's credentialProxyMemoryFloorBytesAtDefaultCap and the chart's
 # kube-agents.credentialProxyMemoryFloorBytes.
-CHILD_MEMORY_BUDGET_FLOOR_BYTES_AT_DEFAULT_CAP = 704643072
+CHILD_MEMORY_BUDGET_FLOOR_BYTES_AT_DEFAULT_CAP = 570425344
 # Where the limit comes from, in order: the operator's Downward API variable,
 # then the cgroup v2 file for a broker whose Deployment predates the variable.
 # A value of `max` in the file means no limit, and no limit means no budget.
@@ -641,14 +637,22 @@ SHUTDOWN_NACK_TIMEOUT_SECONDS = 2
 SHUTDOWN_ERROR = "credential proxy shutting down"
 # The drain thread's name, for a reader of a thread dump mid-stop.
 SHUTDOWN_THREAD_NAME = "shutdown"
-# In the broker and exec roles the stop is a drain (install_shutdown_handler):
-# new requests are refused with the `draining` bound, and the requests already
-# in flight get this long to finish before the commands still running are ended.
+# In the broker role the stop is a drain (install_shutdown_handler): new
+# requests are refused with the `draining` bound, and the requests already in
+# flight get this long to finish before the commands still running are ended.
 # The pod's terminationGracePeriodSeconds (45 s, the operator's
 # credentialProxyTerminationGraceSeconds) holds this, SHUTDOWN_END_WAIT_SECONDS,
 # the hand-back and the entrypoint's kill of Envoy after it; the entrypoint
 # waits BROKER_RUNTIME_DRAIN_SECONDS (40 s) for the runtime to exit.
 SHUTDOWN_DRAIN_SECONDS = 30
+# The exec role drains for as long as the longest command it admits, because
+# another replica serves while its pod rolls: the default --timeout-seconds
+# (300 s) plus COMMAND_SLOT_WAIT_SECONDS (60 s), since a request still waiting
+# for a slot at SIGTERM can be admitted. A literal, not the parsed timeout: the
+# entrypoint's EXEC_RUNTIME_DRAIN_SECONDS (370 s) and the operator's
+# credentialProxyExecTierTerminationGraceSeconds (380 s) are literals too, and a
+# drain that followed a longer timeout would outlast them.
+EXEC_SHUTDOWN_DRAIN_SECONDS = 360
 # After the drain, how long the stop waits for the requests whose commands it
 # ended to write their answers: KILL_GRACE_SECONDS and KILL_SETTLE_SECONDS for
 # the process group, the poll that notices the stop, and the write. A request
@@ -866,8 +870,10 @@ ADMISSION_PATH = "/v1/exec/admission"
 # file is held to it.
 EXEC_REPLICAS_MAX = 32
 EXEC_REPLICAS_RE = re.compile(r"[0-9]+")
-# Requests that keep serving while the broker drains (SHUTDOWN_DRAIN_SECONDS),
-# by method and path: the health probe; a relay's settle routes, so the
+# Requests that keep serving while the broker or an exec pod drains
+# (SHUTDOWN_DRAIN_SECONDS, EXEC_SHUTDOWN_DRAIN_SECONDS),
+# by method and path: the health probe (which an exec pod answers 503 while it
+# drains, HEALTHZ_DRAINING_PAYLOAD); a relay's settle routes, so the
 # gateway's acks for pulls already answered land; and the event pulls. Slack's
 # and Teams' queues are in-process and already acknowledged upstream, so every
 # event taken now is one fewer lost with the pod; the Chat pulls keep their own
@@ -1066,8 +1072,18 @@ THREAD_CAP_LOG_INTERVAL_SECONDS = 60
 HEALTH_PORT_ENV = "CREDENTIAL_PROXY_HEALTH_PORT"
 DEFAULT_HEALTH_PORT = 0
 HEALTH_SERVER_HEADER = "credential-proxy-health"
-# What /healthz answers, on both listeners.
+# What /healthz answers, on both listeners, except that an exec pod that drains
+# answers HEALTHZ_DRAINING_PAYLOAD on the credentialed one (below). The
+# health-only listener is opt-in and not set on exec pods, so it keeps ok.
 HEALTHZ_PAYLOAD = {"status": "ok"}
+# What /healthz answers, with 503, on an exec pod that drains: the readiness
+# probe then marks it NotReady, so the Service sends no new connection to it,
+# and at one replica a caller fails to connect and falls back to the stateful
+# broker rather than reading `draining` for the whole drain. The requests
+# already in flight are not touched: readiness steers only new connections.
+# The broker keeps answering ok: it rolls with Recreate, so no other pod could
+# take its traffic.
+HEALTHZ_DRAINING_PAYLOAD = {"status": "draining"}
 # Metric names, and the vocabulary of every label value. Nothing served is
 # caller text: a label value is one of these strings or a member of the
 # vocabularies below, so a caller cannot grow the series set by varying what
@@ -3134,11 +3150,7 @@ def child_memory_budget_floor_bytes(max_output_bytes: int) -> int:
     """The smallest container limit at which the budget admits
     BUDGET_MINIMUM_ADMITTED_REQUESTS slot-taking requests at once."""
     per_request = REQUEST_CHILD_MEMORY_RESERVE_BYTES + OUTPUT_COPIES_PER_COMMAND * max_output_bytes
-    return (
-        BROKER_RESIDENT_RESERVE_BYTES
-        + CONTENT_WORKSPACE_RESERVE_BYTES
-        + BUDGET_MINIMUM_ADMITTED_REQUESTS * per_request
-    )
+    return BROKER_RESIDENT_RESERVE_BYTES + BUDGET_MINIMUM_ADMITTED_REQUESTS * per_request
 
 
 class CommandSlotUnavailable(RuntimeError):
@@ -8968,9 +8980,7 @@ class CommandExecutor:
         self.memory_limit_bytes = memory_limit_bytes
         self.children_budget_bytes: int | None = None
         if memory_limit_bytes is not None:
-            self.children_budget_bytes = (
-                memory_limit_bytes - BROKER_RESIDENT_RESERVE_BYTES - CONTENT_WORKSPACE_RESERVE_BYTES
-            )
+            self.children_budget_bytes = memory_limit_bytes - BROKER_RESIDENT_RESERVE_BYTES
         # Bytes reserved by admitted requests right now; guarded by
         # `_slot_condition` like the slot count, because admission reads both.
         self._reserved_bytes = 0
@@ -12968,7 +12978,8 @@ class HealthHandler(MetricsHandler):
     """The health-only listener: GET /healthz, and nothing else.
 
     MetricsHandler's bounds, deadline and silence, serving the answer the
-    credentialed listener's /healthz gives and nothing the process knows:
+    credentialed listener's /healthz gives outside an exec pod's drain (see
+    HEALTHZ_DRAINING_PAYLOAD), and nothing the process knows:
     unauthenticated, like that route, because the probe runs before any
     token would be available and reveals nothing. A separate port so that a
     credentialed listener at its thread cap still reads as alive.
@@ -13533,6 +13544,9 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             return
         if self.path != HEALTHZ_PATH:
             self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
+            return
+        if self.broker_role == EXEC_ROLE and self.draining.is_set():
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE, HEALTHZ_DRAINING_PAYLOAD)
             return
         self._json(HTTPStatus.OK, HEALTHZ_PAYLOAD)
 
@@ -16293,7 +16307,8 @@ def install_shutdown_handler(
     gateway on a next install reads Slack itself. A second SIGTERM changes
     nothing; the stop already under way finishes.
 
-    With drain_seconds (the broker and exec roles, SHUTDOWN_DRAIN_SECONDS), the
+    With drain_seconds (the broker role's SHUTDOWN_DRAIN_SECONDS, the exec role's
+    EXEC_SHUTDOWN_DRAIN_SECONDS), the
     stop is a drain as well: every new request outside DRAIN_OPEN_ROUTES is
     refused 503 with the `draining` bound, the Slack relay stops taking events
     from Slack, and the requests already in flight get up to drain_seconds from
@@ -16647,11 +16662,16 @@ def serve(args: argparse.Namespace) -> None:
         ],
         executor=executor,
         # The standalone broker pod and the exec tier's pods drain: the operator
-        # gives each the grace period for one
-        # (credentialProxyTerminationGraceSeconds), and an exec pod that stops
-        # mid-rollout must finish the commands it
-        # admitted. The sidecar roles' pods keep the short stop.
-        drain_seconds=SHUTDOWN_DRAIN_SECONDS if role in (ROLE_BROKER, EXEC_ROLE) else 0,
+        # gives each the grace period for its drain
+        # (credentialProxyTerminationGraceSeconds,
+        # credentialProxyExecTierTerminationGraceSeconds), and an exec pod that
+        # stops mid-rollout must finish the commands it admitted. The sidecar
+        # roles' pods keep the short stop.
+        drain_seconds=(
+            SHUTDOWN_DRAIN_SECONDS if role == ROLE_BROKER
+            else EXEC_SHUTDOWN_DRAIN_SECONDS if role == EXEC_ROLE
+            else 0
+        ),
     )
     server.serve_forever()
     LOGGER.info("credential proxy stopped")

@@ -2184,6 +2184,9 @@ func TestInjectReadRouteCarriesTheTasksUsage(t *testing.T) {
 	if usage, ok := plain["usage"]; ok {
 		t.Fatalf("usage = %s on a read that did not ask; want the key absent", usage)
 	}
+	if addressees := string(plain["childAddressees"]); addressees != "[]" {
+		t.Fatalf("childAddressees = %s on a turn that delegated nothing; want []", addressees)
+	}
 	raw, ok := r.probeRaw(t, reply.Conversation, reply.TaskID, asked)["usage"]
 	if !ok {
 		t.Fatalf("no usage on a read that asked for it")
@@ -2195,6 +2198,30 @@ func TestInjectReadRouteCarriesTheTasksUsage(t *testing.T) {
 	want := lib.Usage{Model: "m2", InputTokens: 2000, OutputTokens: 400, DurationMs: 2500}
 	if got != want {
 		t.Fatalf("usage = %+v, want %+v: the sum over the task's turns", got, want)
+	}
+}
+
+// The read route names whom the chain delegated to as childAddressees, the
+// profile names or platform, in the order given (chainChildAddressees fills it).
+func TestInjectProbeCarriesTheChildAddressees(t *testing.T) {
+	door, err := NewInjectAdapter("127.0.0.1:0", injectTestToken, injectTestGrace, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	door.SetProbe(func(context.Context, string, string) (ConversationState, error) {
+		return ConversationState{TaskID: "task-1", ChildAddressees: []string{"tse", "platform"}}, nil
+	})
+	report := door.runProbe(context.Background(), injectKeyPrefix+"delegated", "task-1", false)
+	data, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire map[string]json.RawMessage
+	if err := json.Unmarshal(data, &wire); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(wire["childAddressees"]); got != `["tse","platform"]` {
+		t.Fatalf("childAddressees on the wire = %s, want [\"tse\",\"platform\"]", got)
 	}
 }
 

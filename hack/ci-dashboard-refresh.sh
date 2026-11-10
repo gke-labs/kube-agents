@@ -49,9 +49,9 @@
 #                              gitlab, its own watermark); empty disables it
 #   EVAL_DASHBOARD_GITLAB_PR_GLOB_PREVIOUS  that lane's archive before the
 #                              move, read alongside; empty disables it
-#   EVAL_DASHBOARD_GITLAB_NIGHTLY_PREFIX  the GitLab lane's nightly periodic's
-#                              log prefix (tier gitlab, no pull request, its
-#                              own watermark); empty disables it
+#   EVAL_DASHBOARD_GITLAB_NIGHTLY_PREFIX  a GitLab nightly's log prefix read
+#                              as tier gitlab; empty (the default since the
+#                              lane's today-mode nightly retired) disables it
 #   EVAL_DASHBOARD_LANE_PR_GLOBS  the other forge lanes' build-dir globs,
 #                              space-separated TIER=GLOB (collect.py
 #                              --lane-pr-glob); empty disables them
@@ -74,12 +74,21 @@
 #                              ci-kube-agents-eval-nightly-writers. Empty
 #                              disables it; offline as above.
 #   EVAL_DASHBOARD_NIGHTLY_MAIN_B_PREFIX  the same for the periodic that runs
-#                              the nightly main part's second half (main-b),
+#                              the nightly main part's main-b shard,
 #                              read the way the writers prefix is; its runs
 #                              count as the main-b part only when the
 #                              prefix's last segment is
 #                              ci-kube-agents-eval-nightly-main-b. Empty
 #                              disables it; offline as above.
+#   EVAL_DASHBOARD_NIGHTLY_MAIN_C_PREFIX, EVAL_DASHBOARD_NIGHTLY_MAIN_D_PREFIX,
+#   EVAL_DASHBOARD_NIGHTLY_MAIN_E_PREFIX, EVAL_DASHBOARD_NIGHTLY_WRITERS_B_PREFIX,
+#   EVAL_DASHBOARD_NIGHTLY_WRITERS_C_PREFIX
+#                              the same for the main part's other shards and
+#                              the writers part's other thirds, read the way
+#                              the main-b prefix is; their runs count as that
+#                              part only when the prefix's last segment is
+#                              the part's job. Empty disables one; offline
+#                              as above.
 #   EVAL_DASHBOARD_SINCE_DAYS  sweep bound when no usable prior data exists
 #                              (default 14).
 #   EVAL_DASHBOARD_STALE_AFTER_S  freshness-badge threshold written into
@@ -165,7 +174,12 @@ EVAL_DASHBOARD_GITLAB_PR_GLOB_PREVIOUS="${EVAL_DASHBOARD_GITLAB_PR_GLOB_PREVIOUS
 EVAL_DASHBOARD_NIGHTLY_PREFIX="${EVAL_DASHBOARD_NIGHTLY_PREFIX-gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly/}"
 EVAL_DASHBOARD_NIGHTLY_WRITERS_PREFIX="${EVAL_DASHBOARD_NIGHTLY_WRITERS_PREFIX-gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-writers/}"
 EVAL_DASHBOARD_NIGHTLY_MAIN_B_PREFIX="${EVAL_DASHBOARD_NIGHTLY_MAIN_B_PREFIX-gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-main-b/}"
-EVAL_DASHBOARD_GITLAB_NIGHTLY_PREFIX="${EVAL_DASHBOARD_GITLAB_NIGHTLY_PREFIX-gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/}"
+EVAL_DASHBOARD_NIGHTLY_MAIN_C_PREFIX="${EVAL_DASHBOARD_NIGHTLY_MAIN_C_PREFIX-gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-main-c/}"
+EVAL_DASHBOARD_NIGHTLY_MAIN_D_PREFIX="${EVAL_DASHBOARD_NIGHTLY_MAIN_D_PREFIX-gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-main-d/}"
+EVAL_DASHBOARD_NIGHTLY_MAIN_E_PREFIX="${EVAL_DASHBOARD_NIGHTLY_MAIN_E_PREFIX-gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-main-e/}"
+EVAL_DASHBOARD_NIGHTLY_WRITERS_B_PREFIX="${EVAL_DASHBOARD_NIGHTLY_WRITERS_B_PREFIX-gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-writers-b/}"
+EVAL_DASHBOARD_NIGHTLY_WRITERS_C_PREFIX="${EVAL_DASHBOARD_NIGHTLY_WRITERS_C_PREFIX-gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-writers-c/}"
+EVAL_DASHBOARD_GITLAB_NIGHTLY_PREFIX="${EVAL_DASHBOARD_GITLAB_NIGHTLY_PREFIX-}"
 # The self-managed forge lanes (kube-agents#3682) with their weekly jobs,
 # and the GitLab lane's next-mode nightly, as .github/workflows/ci-health.yml
 # lists them.
@@ -242,7 +256,7 @@ BUDGET="${EVAL_DASHBOARD_TIMEOUT:-900}"
 TIMEOUT_CMD=(timeout "${BUDGET}")
 command -v timeout >/dev/null 2>&1 || TIMEOUT_CMD=()
 
-# Single quotes on purpose: $1..${18} are the child bash's own positionals, so
+# Single quotes on purpose: $1..${23} are the child bash's own positionals, so
 # no value ever meets an outer expansion. --merge-with always points at the
 # prior path; when the download above left nothing there, collect.py treats
 # it as a first run and bounds the sweep itself. The nightly prefixes and the
@@ -268,6 +282,11 @@ ${TIMEOUT_CMD[@]+"${TIMEOUT_CMD[@]}"} bash -c '
     for g in ${lane_globs[@]+"${lane_globs[@]}"}; do src_args+=(--lane-pr-glob "$g"); done
     read -r -a lane_prefixes <<<"${18}"
     for p in ${lane_prefixes[@]+"${lane_prefixes[@]}"}; do src_args+=(--lane-nightly-prefix "$p"); done
+    [ -n "${19}" ] && src_args+=(--nightly-main-c-prefix "${19}")
+    [ -n "${20}" ] && src_args+=(--nightly-writers-b-prefix "${20}")
+    [ -n "${21}" ] && src_args+=(--nightly-writers-c-prefix "${21}")
+    [ -n "${22}" ] && src_args+=(--nightly-main-d-prefix "${22}")
+    [ -n "${23}" ] && src_args+=(--nightly-main-e-prefix "${23}")
   fi
   # The RC source. ${10} is the offline one and wins outright; the bucket glob
   # in $9 is only armed on the bucket path, so EVAL_DASHBOARD_FROM_DIR stays
@@ -310,6 +329,11 @@ if not json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"runs\"):
   "${EVAL_DASHBOARD_GITLAB_PR_GLOB_PREVIOUS}" \
   "${EVAL_DASHBOARD_LANE_PR_GLOBS}" \
   "${EVAL_DASHBOARD_LANE_NIGHTLY_PREFIXES}" \
+  "${EVAL_DASHBOARD_NIGHTLY_MAIN_C_PREFIX}" \
+  "${EVAL_DASHBOARD_NIGHTLY_WRITERS_B_PREFIX}" \
+  "${EVAL_DASHBOARD_NIGHTLY_WRITERS_C_PREFIX}" \
+  "${EVAL_DASHBOARD_NIGHTLY_MAIN_D_PREFIX}" \
+  "${EVAL_DASHBOARD_NIGHTLY_MAIN_E_PREFIX}" \
   >>"${REFRESH_LOG}" 2>&1 || rc=$?
 
 # The full stage log always goes to stdout too: on a periodic, the build log

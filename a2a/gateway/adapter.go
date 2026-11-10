@@ -36,6 +36,23 @@ type InboundMessage struct {
 	MessageID string
 	// Text is the message content.
 	Text string
+	// Quoted is the turn's text when it reaches an agent: the member's words
+	// followed by the message they quoted, framed; empty when the message
+	// quotes nothing. Text stays the member's own words so the gateway's
+	// command matchers read them: a stop or a status ask quoted onto an
+	// alert is answered on the words alone, and the router puts Quoted in
+	// Text's place only for a turn that reaches an agent (agentText). Set by
+	// Google Chat's quote-in-reply (gchat.go, quotedAsk); empty on every
+	// other path.
+	Quoted string
+	// QuotedUnread marks a message that quoted one the adapter could not
+	// read (the read refused or timed out, or a card or an image with no
+	// text), so the words travel alone: Quoted is empty and the member is
+	// owed one line saying so. The router posts that line only for a turn
+	// that reaches an agent (noteUnreadQuote), since a command it answers
+	// itself never needed the quote. Set with words beside the quote; a
+	// bare quote that could not be read is no turn (gchat.go, quotedAsk).
+	QuotedUnread bool
 
 	// Backend names the ingress this message arrived through, and empty
 	// means the gateway's own configured backend. It exists because one
@@ -531,6 +548,22 @@ type SessionLookupSink interface {
 	SetSessionLookup(lookup SessionLookup, idleTTL time.Duration)
 }
 
+// SenderAdmission reports whether the gateway would take a turn from author
+// on backend: the same gate verifySender applies, read ahead of the hand-over
+// by an adapter that has to decide on its own goroutine whether to post
+// anything in the sender's conversation before the gateway has seen them
+// (the Google Chat adapter's line on a quote it could not read). It decides
+// nothing about the turn: verifySender still rules on every message.
+type SenderAdmission func(backend, author string) bool
+
+// SenderAdmissionSink is the optional extension an Adapter implements to
+// receive the gateway's SenderAdmission. Wired in New the way
+// SessionLookupSink is; an adapter without it posts nothing ahead of the
+// gateway.
+type SenderAdmissionSink interface {
+	SetSenderAdmission(admits SenderAdmission)
+}
+
 // ConversationState is one read's answer: the record as it stands, plus the
 // two gateway-wide facts a caller needs beside it.
 type ConversationState struct {
@@ -614,6 +647,13 @@ type ConversationState struct {
 	Usage        *lib.Usage
 	ChildUsage   *lib.Usage
 	UsagePartial bool
+	// ChildAddressees names whom the chain delegated to: each child task's
+	// addressee under TaskID's root, a profile's name or platform, once
+	// each in the order delegated (chainChildAddressees), empty when it
+	// delegated nothing, nil when the task is unknown. Read from the
+	// record, so it costs no stream read. Only the inject door's read
+	// route carries it, for a harness grading which agent a turn chose.
+	ChildAddressees []string
 }
 
 // chainUsageKey marks a probe's context as asking for

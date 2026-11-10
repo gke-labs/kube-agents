@@ -5,8 +5,12 @@ read them; all use the names here, so a renamed field breaks the tests instead
 of the analysis.
 """
 
-# 2: litellm_config_checksum became model_behaviour_checksum.
-LOG_SCHEMA_VERSION = 2
+# 2: litellm_config_checksum became model_behaviour_checksum, a checksum that
+#    treated the Gemini Developer API and Vertex AI routes as one.
+# 3: back to litellm_config_checksum, the LiteLLM pods' checksum/config. Not 1
+#    again, since the bucket holds schema-2 lines. The readers group lines by
+#    fingerprint and read neither name, so schema-2 lines still read.
+LOG_SCHEMA_VERSION = 3
 
 REQUEST_EVENT = "replay_shadow_request"
 START_EVENT = "replay_shadow_start"
@@ -20,7 +24,7 @@ JOB = "job"
 MODEL = "model"
 STREAM = "stream"
 NORMALIZER_VERSION = "normalizer_version"
-MODEL_BEHAVIOUR_CHECKSUM = "model_behaviour_checksum"
+LITELLM_CONFIG_CHECKSUM = "litellm_config_checksum"
 LITELLM_IMAGE = "litellm_image"
 STATUS = "status"
 LATENCY_MS = "latency_ms"
@@ -30,12 +34,25 @@ OBSERVE_FAILED = "observe_failed"
 # LiteLLM's headers; null on a served line, which never reached LiteLLM.
 LITELLM_MODEL_GROUP = "litellm_model_group"
 LITELLM_ATTEMPTED_FALLBACKS = "litellm_attempted_fallbacks"
+# The deployment's model behind the alias (x-litellm-model-name), the retries
+# LiteLLM made inside this request (x-litellm-attempted-retries), and its own
+# cost for the request in USD: usage.cost, else x-litellm-response-cost on a
+# non-streamed response only (a stream's headers go out before the cost is
+# known and say 0.0). All three are null on a served line.
+LITELLM_MODEL_NAME = "litellm_model_name"
+LITELLM_ATTEMPTED_RETRIES = "litellm_attempted_retries"
+LITELLM_COST_USD = "litellm_cost_usd"
 PROMPT_TOKENS = "prompt_tokens"
 # True when the response carried no usage and prompt_tokens is estimated from
 # the request's size.
 TOKENS_ESTIMATED = "tokens_estimated"
 CACHED_TOKENS = "cached_tokens"
 COMPLETION_TOKENS = "completion_tokens"
+# From usage.completion_tokens_details.reasoning_tokens; part of completion_tokens.
+# Null on a served line, as is CACHE_WRITE_TOKENS.
+REASONING_TOKENS = "reasoning_tokens"
+# From usage.cache_creation_input_tokens (Anthropic-style prompt cache writes).
+CACHE_WRITE_TOKENS = "cache_write_tokens"
 FINGERPRINT = "fingerprint"
 SETTINGS_HASH = "settings_hash"
 MESSAGE_HASHES = "message_hashes"
@@ -126,6 +143,13 @@ RECORDED = "recorded"
 # RECORD_ERROR_BUDGET when the data budget is spent and nothing was saved.
 RECORD_ERROR = "record_error"
 RECORD_ERROR_BUDGET = "budget_spent"
+# In record mode: [context, answer] identifying this request's answer as a
+# later request's history holds it (normalizer.answer_variant), and the same
+# pair for the last assistant message this request holds. A later request's
+# PRIOR_ANSWER equal to an earlier line's ANSWER_VARIANT says its conversation
+# went on from that very answer (hack/replay-proxy/run_attribution.py).
+ANSWER_VARIANT = "answer_variant"
+PRIOR_ANSWER = "prior_answer"
 # On a replay miss: the closest saved request and where this one differed.
 MISS = "miss"
 MISS_CLOSEST_FINGERPRINT = "closest_fingerprint"
