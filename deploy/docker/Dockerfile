@@ -903,6 +903,12 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
 # edit_message; the steer and auth failure replies are replaced where they
 # are built, so no exception text reaches Slack). See
 # deploy/docker/patches/slack_boilerplate.py.
+# Slack: with KUBEAGENTS_DIAL=on (off unless set to on), the app's Home tab
+# shows the autonomy dial: Explain, Propose fixes or Auto-merge proven fixes,
+# changeable only by an install admin (KUBEAGENTS_DIAL_ADMINS, else an admin or
+# owner of the install's own Slack workspace) and read-only for everyone else. Off, the Home tab is
+# ignored as upstream ignores it. Also rides this COPY and RUN. See
+# deploy/docker/patches/slack_dial_home.py.
 # Slack, flag or not: a message_changed that is not an edit (no `edited`, or
 # the same `edited.ts` as previous_message, since Slack keeps it once set, or
 # with no previous_message an `edited.ts` older than the event by more than a
@@ -934,6 +940,9 @@ COPY deploy/docker/patches/apply_slack_code_emphasis.py \
      deploy/docker/patches/apply_slack_ux_clicks.py \
      deploy/docker/patches/verify_slack_ux_clicks.py \
      deploy/docker/patches/slack_ux_clicks.py \
+     deploy/docker/patches/apply_slack_dial_home.py \
+     deploy/docker/patches/verify_slack_dial_home.py \
+     deploy/docker/patches/slack_dial_home.py \
      deploy/docker/patches/apply_slack_ux_moments.py \
      deploy/docker/patches/verify_slack_ux_moments.py \
      deploy/docker/patches/slack_ux_moments.py \
@@ -987,6 +996,9 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_unedited_chan
     install -m 0644 /tmp/message-surface/slack_ux_clicks.py /opt/hermes/gateway/slack_ux_clicks.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_ux_clicks.py /opt/hermes && \
     grep -qF "_kage_slack_clicks.enabled()" /opt/hermes/plugins/platforms/slack/adapter.py && \
+    install -m 0644 /tmp/message-surface/slack_dial_home.py /opt/hermes/gateway/slack_dial_home.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_dial_home.py /opt/hermes && \
+    grep -qF "_kage_dial_home.enabled()" /opt/hermes/plugins/platforms/slack/adapter.py && \
     install -m 0644 /tmp/message-surface/slack_ux_moments.py /opt/hermes/gateway/slack_ux_moments.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_ux_moments.py /opt/hermes && \
     grep -qF "_kage_moments_wake_text(" /opt/hermes/gateway/kanban_watchers_notifier.py && \
@@ -1024,6 +1036,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_unedited_chan
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_ux_reactions.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_ux_status.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_ux_clicks.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_dial_home.py /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_ux_moments.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_ux_incident.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_ux_answer.py && \

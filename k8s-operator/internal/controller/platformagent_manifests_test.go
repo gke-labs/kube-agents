@@ -1428,6 +1428,27 @@ func TestSafeSandboxEnvOverridesPassesSlackUxFlag(t *testing.T) {
 	}
 }
 
+func TestSafeSandboxEnvOverridesPassesDialAdmins(t *testing.T) {
+	// The dial's admin list is read by the gateway's Slack adapter in this
+	// container. Off the allowlist, the documented override renders on the CR
+	// and never reaches it, and the dial falls back to workspace admins.
+	custom := []corev1.EnvVar{
+		{Name: "KUBEAGENTS_DIAL_ADMINS", Value: "U0123ABCD,U0456EFGH"},
+		{
+			Name: "KUBEAGENTS_DIAL_ADMINS",
+			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "s"},
+				Key:                  "k",
+			}},
+		},
+	}
+
+	got := safeSandboxEnvOverrides(custom)
+	if len(got) != 1 || got[0].Name != "KUBEAGENTS_DIAL_ADMINS" || got[0].Value != "U0123ABCD,U0456EFGH" || got[0].ValueFrom != nil {
+		t.Errorf("expected only the literal KUBEAGENTS_DIAL_ADMINS to pass, got %#v", got)
+	}
+}
+
 func TestSafeSandboxEnvOverridesPassesFeedbackPromptKnobs(t *testing.T) {
 	// The feedback prompt's whole per-install surface: `feedback_prompt.py`
 	// reads both from the environment on every tick and there is no config

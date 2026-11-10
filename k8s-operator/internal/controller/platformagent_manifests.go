@@ -5400,6 +5400,14 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		// count of pull requests and reaches nothing else.
 		"INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS": {},
 
+		// The Slack members who may change the autonomy dial on the Home tab
+		// (ADMINS_ENV in deploy/docker/patches/slack_dial_home.py), read by
+		// the gateway's Slack adapter in this container. A comma-separated
+		// list of member ids, compared literally against the clicker; any
+		// value only narrows who may record the dial's level, and none names a
+		// path, a URL, a credential or an image.
+		"KUBEAGENTS_DIAL_ADMINS": {},
+
 		// How many Cluster Agent profiles one reconcile run scaffolds before it
 		// leaves the rest for the next run (MAX_CREATES_PER_RUN_ENV in
 		// cluster_agent_reconcile.py). Parsed as a whole number; anything but a

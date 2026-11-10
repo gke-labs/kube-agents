@@ -285,6 +285,16 @@ The daily stuck-task report shows a **Retry** and a **Drop** button under each t
 
 On Google Chat under `spec.mode: next`, the report shows the same buttons. Google Chat draws every button under the message, so the report numbers its tasks and labels each button with the task's number: "Retry 1" and "Drop 1". The task's line then ends with "✓ Retrying." or "Dropped.", who pressed, and the time in UTC. A press that did not land keeps the buttons and says so on the line.
 
+### The autonomy dial
+
+Under `today`, with `KUBEAGENTS_DIAL=on` (off by default), the app's Home tab shows the autonomy dial: what the agent may change. Set the variable in the chart value `platformAgent.deployment.env`, or in the `PlatformAgent` CR's `spec.deployment.env` on an install that no chart manages.
+
+The levels are **Explain** (finds and explains, changes nothing), **Propose fixes** (opens a pull request, your team merges) and **Auto-merge proven fixes** (your pipeline merges proven fixes). Under them, each kind of fix shows whether it auto-merges: only at the Auto-merge level, and only when it is turned on for that kind, which the tab does not do. Until someone picks a level the dial shows Propose fixes, which is what the agent does without it. The tab records the level and who set it on the agent's volume, and says the setting is recorded only: the agent does not act on it yet.
+
+Only an install admin can change the level: a member listed in `KUBEAGENTS_DIAL_ADMINS` (comma-separated Slack member IDs), or, with that unset, an admin or owner of the install's own Slack workspace, checked with `users.info`. An admin of another workspace the app is in is not an install admin. Every other allowed member sees the dial read-only, and a member the install would not answer sees one line. If the admin check fails, for example because the app lacks `users:read`, the dial is shown read-only and says so.
+
+The app needs the Home tab and the `app_home_opened` event turned on ([Slack app setup](/kube-agents/install/slack-app/), step 3). Under `next` the Home tab is the gateway's fleet dashboard ([the Slack Home tab](#the-slack-home-tab)) and `KUBEAGENTS_DIAL` has no effect. After the switch is turned off, Slack keeps showing the last dial it drew until the tab is redrawn; a click on it answers that the dial is off and records nothing.
+
 ### Harness messages
 
 With `KAGE_SLACK_UX` on, the harness's own messages stay out of the way on Slack. Scheduled reports arrive without the `Cronjob Response` header, job ID and footer. The long-turn heartbeat, if it is enabled for Slack, says the agent is still working without naming the tool running. The agent does not announce that it is back after a restart, post the session-database warnings (the error stays in the log), or append Hermes' tip about its queueing setting.
