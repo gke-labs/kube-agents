@@ -2185,20 +2185,32 @@ func tableCellSpans(s string, cell [2]int, class secretKeyClass, named bool, sin
 		return nil
 	}
 	// As under a key: an auth-scheme word stays, and a code-spanned value
-	// is bounded by its backticks when a blank follows it (a note after it
-	// in the cell). When that value does not read as one, or text runs on
-	// straight after the span, the whole cell is tested instead.
-	lo, hi := cellLo, cellHi
-	if sloc := inlineAuthSchemePrefixPattern.FindStringIndex(n[lo:hi]); sloc != nil {
-		lo += sloc[1]
+	// is bounded by its backticks. Both the span and the whole cell are
+	// candidates, and the first that reads as a value is redacted: the span
+	// first when a blank or the cell's end follows it (a note after it),
+	// the whole cell first when text runs on straight after it.
+	valueLo := cellLo
+	if sloc := inlineAuthSchemePrefixPattern.FindStringIndex(n[cellLo:cellHi]); sloc != nil {
+		valueLo += sloc[1]
 	}
-	if end, ok := codeSpanEnd(code, lo); ok && (end >= cellHi || n[end] == ' ' || n[end] == '\t') {
-		hi = end
-	}
-	if hi <= lo || !classValueRedacted(class, n[lo:hi], false) {
-		if lo, hi = cellLo, cellHi; !classValueRedacted(class, n[lo:hi], false) {
-			return nil
+	cands := [][2]int{{valueLo, cellHi}, {cellLo, cellHi}}
+	if end, ok := codeSpanEnd(code, valueLo); ok {
+		span := [2]int{valueLo, end}
+		if end >= cellHi || n[end] == ' ' || n[end] == '\t' {
+			cands = [][2]int{span, {cellLo, cellHi}}
+		} else {
+			cands = [][2]int{{cellLo, cellHi}, span}
 		}
+	}
+	lo, hi := 0, 0
+	for _, c := range cands {
+		if c[1] > c[0] && classValueRedacted(class, n[c[0]:c[1]], false) {
+			lo, hi = c[0], c[1]
+			break
+		}
+	}
+	if hi <= lo {
+		return nil
 	}
 	if idx != nil {
 		lo, hi = idx[lo], idx[hi-1]+1

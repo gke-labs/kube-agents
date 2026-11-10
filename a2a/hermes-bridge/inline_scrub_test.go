@@ -668,6 +668,10 @@ func TestScrubInlineSecretsTableCellsSchemeCodeSpanAndPipes(t *testing.T) {
 		// A code span that does not read as a value, a value after it:
 		// the whole cell is tested and redacted.
 		{"| Key | Value |\n|---|---|\n| password | `none` quietpasture0001 |\n", "| Key | Value |\n|---|---|\n| password | `[redacted] |\n"},
+		// A code-spanned value with punctuation and a note glued after it,
+		// under a bare noun (a value must be token-shaped): the whole cell
+		// does not read as a value, the span does.
+		{"| Name | Token |\n|---|---|\n| ci | `abcd1234efgh5678wxyz`, rotated |\n", "| Name | Token |\n|---|---|\n| ci | `[redacted]`, rotated |\n"},
 		// A code span holding only part of the value, text running on
 		// after it: the whole cell is tested and redacted.
 		{"| Key | Value |\n|---|---|\n| password | `sy`nthpass0001x |\n", "| Key | Value |\n|---|---|\n| password | `[redacted] |\n"},
