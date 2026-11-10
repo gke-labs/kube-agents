@@ -953,6 +953,9 @@ COPY deploy/docker/patches/apply_slack_code_emphasis.py \
      deploy/docker/patches/apply_chat_turn_metrics.py \
      deploy/docker/patches/verify_chat_turn_metrics.py \
      deploy/docker/patches/chat_turn_metrics.py \
+     deploy/docker/patches/apply_kanban_dispatch_failures.py \
+     deploy/docker/patches/verify_kanban_dispatch_failures.py \
+     deploy/docker/patches/kanban_dispatch_failures.py \
      agents/platform/scripts/slack_presenter.py \
      agents/platform/scripts/slack_status.py \
      agents/platform/scripts/slack_moments.py \
@@ -1006,6 +1009,10 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_unedited_chan
     grep -qF "_kage_chat_turn_metrics.record_turn_error(source)" /opt/hermes/gateway/run_turn.py && \
     grep -qF "_kage_chat_turn_metrics.record_turn_error(ctx.source)" /opt/hermes/gateway/run_turn_runner.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_chat_turn_metrics.py /opt/hermes && \
+    install -m 0644 /tmp/message-surface/kanban_dispatch_failures.py /opt/hermes/gateway/kanban_dispatch_failures.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_kanban_dispatch_failures.py /opt/hermes && \
+    grep -qF "_kage_dispatch_failures.record_tick(slug, exc)" /opt/hermes/gateway/kanban_watchers_dispatcher.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_kanban_dispatch_failures.py /opt/hermes && \
     cd /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_agent_view.py /opt/hermes && \
     grep -qF "def _kage_slack_ux_on(" /opt/hermes/hermes_cli/slack_cli.py && \
