@@ -19,11 +19,30 @@ import fleet_upgrade_report as report  # noqa: E402
 import readiness_rules as shared  # noqa: E402
 from fleet_upgrade_report import parse_version  # noqa: E402
 from readiness_rules import capacity  # noqa: E402
-from test_fleet_upgrade_report import FakeReadinessCommands  # noqa: E402
+from test_fleet_upgrade_report import FakeReadinessCommands, paged_dump_adapter  # noqa: E402
 from test_fleet_upgrade_report import cluster as report_cluster  # noqa: E402
 from test_readiness_rules import CURRENT, LAGGING, TARGET, cluster, deployment_pod, node, pod, read  # noqa: E402
 
+# FakeReadinessCommands answers the one-shot `kubectl get <kinds> -A -o json`; the report
+# pages through `kubectl get --raw`, and the adapter joins the two for this module's own
+# runs of `report.main` (`test_fleet_upgrade_report.paged_dump_adapter` says why each
+# module starts its own).
+_PAGED_DUMP = paged_dump_adapter()
+
+
+def setUpModule():
+    _PAGED_DUMP.start()
+
+
+def tearDownModule():
+    _PAGED_DUMP.stop()
+
 TARGET_TEXT = "1.35.1-gke.1000"
+# The report tests' fleet runs below TARGET_TEXT: the location's server config lists the target
+# as valid beside the running version, as GKE lists a version it serves, so `target-patch-valid`
+# has nothing to say.
+SERVER_CONFIG_VERSIONS = [LAGGING, TARGET_TEXT]
+SERVER_CONFIG = {"us-central1-a": {"channels": [{"channel": "REGULAR", "defaultVersion": SERVER_CONFIG_VERSIONS[0], "validVersions": SERVER_CONFIG_VERSIONS}], "validMasterVersions": SERVER_CONFIG_VERSIONS, "validNodeVersions": SERVER_CONFIG_VERSIONS}}
 AT = "2026-09-14T15:00:00Z"
 NO_SURGE = {"maxUnavailable": 1, "strategy": "SURGE"}  # the API omits a zero maxSurge
 PIN = {"seeded-role": "no-surge"}
@@ -540,7 +559,7 @@ class CapacityThroughTheReportTest(unittest.TestCase):
         _, items = seeded()
         nodes = [i for i in items if i["kind"] == "Node"]
         pods = [i for i in items if i["kind"] == "Pod"]
-        fake = FakeReadinessCommands({"p1": [record]}, {}, {"seeded-b": []}, pods_by_cluster={"seeded-b": pods}, nodes_by_cluster={"seeded-b": nodes})
+        fake = FakeReadinessCommands({"p1": [record]}, SERVER_CONFIG, {"seeded-b": []}, pods_by_cluster={"seeded-b": pods}, nodes_by_cluster={"seeded-b": nodes})
         out_path = os.path.join(state_dir, "report.json")
         with patch.object(report, "run_cmd", fake), redirect_stdout(io.StringIO()) as stdout:
             rc = report.main(["--state-dir", state_dir, "--project", "p1", "--target-version", TARGET_TEXT, "--readiness", "--at", AT, "--kubeconfig-dir", kubeconfig_dir, "--output", out_path])
@@ -567,7 +586,7 @@ class CapacityThroughTheReportTest(unittest.TestCase):
         record["clusterIpv4Cidr"] = "10.4.0.0/23"
         record["nodePools"][1]["config"] = {"accelerators": [{"acceleratorCount": "1", "acceleratorType": "nvidia-l4"}], "reservationAffinity": {"consumeReservationType": "ANY_RESERVATION"}}
         nodes = [node_with("10.4.0.0/24", "gke-gpu-canary-default-1", "default-pool"), node_with("10.4.1.0/24", "gke-gpu-canary-gpu-1", "gpu-pool")]
-        fake = FakeReadinessCommands({"p1": [record]}, {}, {"gpu-canary": []}, pods_by_cluster={"gpu-canary": []}, nodes_by_cluster={"gpu-canary": nodes})
+        fake = FakeReadinessCommands({"p1": [record]}, SERVER_CONFIG, {"gpu-canary": []}, pods_by_cluster={"gpu-canary": []}, nodes_by_cluster={"gpu-canary": nodes})
         out_path = os.path.join(state_dir, "report.json")
         with patch.object(report, "run_cmd", fake), redirect_stdout(io.StringIO()) as stdout:
             rc = report.main(["--state-dir", state_dir, "--project", "p1", "--target-version", TARGET_TEXT, "--readiness", "--at", AT, "--kubeconfig-dir", kubeconfig_dir, "--output", out_path])

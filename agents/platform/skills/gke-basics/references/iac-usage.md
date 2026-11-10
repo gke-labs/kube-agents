@@ -27,8 +27,9 @@ resource "google_container_cluster" "primary" {
   # Do NOT specify node configurations (like initial_node_count or node_config)
   # in Autopilot mode; doing so causes a Terraform provider error.
 
-  # Deletion protection should be set to false for testing
-  deletion_protection = false
+  # Keep deletion protection on (the provider default since 5.0.0). Turning it
+  # off is a human's change, never one to make for a test (gcp-terraform).
+  deletion_protection = true
 }
 ```
 

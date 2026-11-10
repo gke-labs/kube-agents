@@ -11,7 +11,7 @@
 # published to the ledger wrote, stayed empty. `start` and `finish` now run
 # without a forge: the checks run, `finish` keeps the findings document in the
 # store under `no_forge/local` with status NO_FORGE, and the run's answer
-# carries a summary that says no forge is configured.
+# carries a summary that says no GitOps repository is connected.
 #
 # It also grades that no worker's `skill_view` of fleet-audit spilled
 # (#3088), and that the worker ran `start` at all. A kanban
@@ -41,8 +41,8 @@ expected_output: >-
   The audit runs every check with no forge configured, finds that
   debug-binding grants cluster-admin to the default ServiceAccount in
   seeded-security, and keeps the findings in the report store. The closing
-  response summarizes the findings and says that no forge is configured, so no
-  ledger issue or pull request was written.
+  response summarizes the findings and says that no GitOps repository is
+  connected, so no ledger issue or fix pull request was opened.
 infrastructure:
   deployer: noop
 validated: false

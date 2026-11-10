@@ -1,0 +1,650 @@
+package gateway
+
+import (
+	"context"
+	"fmt"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
+)
+
+// Retry and Drop on the board-health card, on Google Chat (slack_board.go
+// has Slack's). The cron relay posts the stuck tasks into the home space as
+// a chat message whose rows carry the board cards they stand for
+// (chatmsg.Row's Tasks) and the buttons to draw under them (Actions). A Chat
+// text message has one button list, under the whole message rather than
+// under each row, so the renderer numbers the rows when any carries buttons
+// ("1. ", "2. ", in the bullet's place) and labels each row's buttons with
+// its number ("Retry 1", "Drop 1"); the number is the renderer's own, as
+// the bullet is. The button's parameters carry the action, the row's number,
+// the row's ids and the row's line in the text, as the Stop button carries
+// its task (gchat_stop.go): a tap edits by the line on every path, whether
+// or not the adapter remembers the message's layout, so a numbered list in
+// the detail or the fold is never taken for the rows.
+//
+// A tap is no turn. It is admitted by the gateway's rule for the backend
+// (BoardAdmits, the allowlist an inbound message is admitted by; Chat has
+// no Home tab whose rule a Slack tap takes), then goes over the board route
+// as a lib.BoardAction (board.go), as a Slack tap does. The row's line is
+// then edited in place: "✓ Retrying. <name>, <time>", "Dropped. <name>,
+// <time>" or "No longer stuck. <name>, <time>" set after its text on the
+// same line, and its two buttons go; a tap that did not land keeps the
+// buttons and the line says so, so the row can be tapped again. The time is
+// UTC: Chat has no date token each reader sees in their own zone.
+//
+// One tap per row at a time, held in this process, and the edits of one
+// message in turn under its rewrite lock (lockRewrite), each from the
+// message's one layout record (gchat_layout.go), the layout the last
+// rewrite of any kind sent; a message with no record (posted before a
+// restart) is rebuilt from the event's copy of it, text and buttons.
+const (
+	// gchatBoardFunction is the onClick action a Retry or Drop sends, and
+	// gchatBoardParamAction, gchatBoardParamRow, gchatBoardParamTasks and
+	// gchatBoardParamLine its parameters: the action (chatmsg.RowActionRetry
+	// or RowActionDrop), the row's number as drawn, the row's ids joined by
+	// gchatBoardTaskSeparator, and the index of the row's line in the
+	// message's text. The line is the row's place when the message was laid
+	// out, and holds while edits keep the line count, which the adapter's
+	// own do (a tap's line goes on the row's line; an answer's line goes
+	// after the text). A tap edits by the line of the card the adapter
+	// remembers, whose own button for the row is current through a
+	// re-layout that kept the row but shifted it, and by its own line when
+	// there is no record; either way the line must still start with the
+	// row's marker before the tap acts (gchatBoardRowOf).
+	gchatBoardFunction      = "kage.board"
+	gchatBoardParamAction   = "action"
+	gchatBoardParamRow      = "row"
+	gchatBoardParamTasks    = "tasks"
+	gchatBoardParamLine     = "line"
+	gchatBoardTaskSeparator = ","
+	// gchatBoardNoLine is the line of a button that carries none: one
+	// drawn before gchatBoardParamLine existed, whose row the text's rows
+	// block finds (gchatBoardRowsBlock).
+	gchatBoardNoLine = -1
+	// gchatBoardRowMarker leads each row of a message whose rows carry
+	// buttons, in the bullet's place, and gchatBoardLabel is a button's
+	// text: the action's label, then the row's number.
+	gchatBoardRowMarker = "%d. "
+	gchatBoardLabel     = "%s %d"
+	// gchatBoardNoteSep sets a tapped row's line after its text, on the
+	// same line: a line of its own would fall out of the list, as a row's
+	// detail did (gchatChatRowDetailSep).
+	gchatBoardNoteSep = " — "
+	// gchatBoardSeenPrefix keys a board tap in the dedupe ring, apart from
+	// a choice click on the same message at the same time.
+	gchatBoardSeenPrefix = "board:"
+	// gchatBoardTapSep joins a message name and a row's number into the
+	// key one tap at a time holds, and gchatBoardOwnerSep the parts of the
+	// tap's own name in that claim: its click id and its cards, so a tap
+	// frees only the claim it made.
+	gchatBoardTapSep   = "#"
+	gchatBoardOwnerSep = "|"
+	// gchatBoardSettledShape is the rest of a settled row's line after the
+	// note: a name, a comma, and the time as gchatBoardTime writes it.
+	gchatBoardSettledShape = ` .+, [0-9]{2}:[0-9]{2} UTC$`
+	// The line a tapped row shows: its note, then who and when
+	// (gchatBoardSettledLine) for a tap that settled the cards, the time in
+	// gchatBoardTime; a tap that did not land shows Slack's whole line.
+	gchatBoardRetriedNote = "✓ Retrying."
+	gchatBoardDroppedNote = "Dropped."
+	gchatBoardMovedNote   = "No longer stuck."
+	gchatBoardSettledLine = "%s %s, %s"
+	gchatBoardTime        = "15:04 UTC"
+	// The widget keys a drawn button's action parameters sit under, read
+	// back to find a row's buttons.
+	gchatParametersKey = "parameters"
+	gchatParamKey      = "key"
+	gchatParamValue    = "value"
+
+	// The reasons a board tap is not a turn, for the pull loop's log.
+	gchatBoardNoRow      = "a board tap with no row, card or action"
+	gchatBoardNoEmail    = "presser has no email"
+	gchatBoardNoMessage  = "board tap names no space or no message"
+	gchatBoardDuplicate  = "duplicate delivery of board tap "
+	gchatBoardUnwired    = "a board tap with no board route wired"
+	gchatBoardUnverified = "a board tap from a member the gateway would not answer"
+	gchatBoardBusy       = "a second tap on a board row being tapped"
+	gchatBoardStale      = "a board tap on a row the message no longer shows"
+	gchatBoardTaken      = "a board tap, acted on off the pull loop: "
+	// gchatBoardRowMoved is logged for a tap whose row was laid out again
+	// between the tap and its edit: the outcome is not drawn on the new row.
+	gchatBoardRowMoved = "gchat: the tapped board row was laid out again before its edit; the message is left as it is"
+)
+
+// gchatBoardSettledRE matches the whole line a settled tap leaves on a row
+// (gchatBoardLine), and gchatBoardFailedLines are the two a failed one
+// leaves; a later tap replaces only a line of one of these shapes, so a
+// row whose own text holds a note's words after a separator is kept whole.
+var (
+	gchatBoardSettledRE = regexp.MustCompile("^(" + strings.Join([]string{
+		regexp.QuoteMeta(gchatBoardRetriedNote), regexp.QuoteMeta(gchatBoardDroppedNote), regexp.QuoteMeta(gchatBoardMovedNote),
+	}, "|") + ")" + gchatBoardSettledShape)
+	gchatBoardFailedLines = []string{slackBoardRetryFailed, slackBoardDropFailed}
+)
+
+// BoardAdmits answers whether the gateway would take a turn from author on
+// backend: the rule a board tap is admitted by on a backend with no Home tab
+// (gchat_board.go), the same one a rating tap takes (FeedbackRecorder.Admits).
+type BoardAdmits func(backend, author string) bool
+
+// BoardAdmitSink is the optional extension an Adapter implements to take
+// that rule. Wired in New beside BoardActSink.
+type BoardAdmitSink interface {
+	SetBoardAdmits(admits BoardAdmits)
+}
+
+var (
+	_ BoardActSink   = (*GoogleChatAdapter)(nil)
+	_ BoardAdmitSink = (*GoogleChatAdapter)(nil)
+)
+
+// SetBoardActor arms the Retry and Drop buttons (BoardActSink). Unarmed, a
+// tap is logged and changes nothing.
+func (a *GoogleChatAdapter) SetBoardActor(actor BoardActor) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.boardActor = actor
+}
+
+// SetBoardAdmits hands the adapter the rule a tap is admitted by
+// (BoardAdmitSink). Without one, a tap changes nothing.
+func (a *GoogleChatAdapter) SetBoardAdmits(admits BoardAdmits) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.boardAdmits = admits
+}
+
+// gchatBoardButtons is the buttons of every row that asks for them, in row
+// order, each labelled with the action and the row's number as drawn: its
+// place among the rows gchatChatRows draws, so a row that draws nothing
+// (gchatChatRowText) takes no number and gets no buttons, and each carrying
+// its row's line, counted from rowsStart, the line the first drawn row is
+// on (gchatChatRows draws one line per drawn row). nil when no row asks for
+// any.
+func gchatBoardButtons(rows []chatmsg.Row, rowsStart int) []map[string]any {
+	var buttons []map[string]any
+	n := 0
+	for _, r := range rows {
+		if _, drawn := gchatChatRowText(r); !drawn {
+			continue
+		}
+		n++
+		if len(r.Actions) == 0 || len(r.Tasks) == 0 {
+			continue
+		}
+		tasks := strings.Join(r.Tasks, gchatBoardTaskSeparator)
+		for _, action := range r.Actions {
+			label, ok := slackBoardLabels[action]
+			if !ok {
+				continue
+			}
+			b := gchatChatButton(fmt.Sprintf(gchatBoardLabel, label, n), false)
+			b[gchatOnClickKey] = map[string]any{gchatActionKey: map[string]any{
+				gchatFunctionKey: gchatBoardFunction,
+				gchatParametersKey: []map[string]any{
+					{gchatParamKey: gchatBoardParamAction, gchatParamValue: action},
+					{gchatParamKey: gchatBoardParamRow, gchatParamValue: strconv.Itoa(n)},
+					{gchatParamKey: gchatBoardParamTasks, gchatParamValue: tasks},
+					{gchatParamKey: gchatBoardParamLine, gchatParamValue: strconv.Itoa(rowsStart + n - 1)},
+				},
+			}}
+			buttons = append(buttons, b)
+		}
+	}
+	return buttons
+}
+
+// gchatButtonFunction is the onClick action function of a button as the
+// renderer draws it, empty for a link.
+func gchatButtonFunction(b map[string]any) string {
+	click, _ := b[gchatOnClickKey].(map[string]any)
+	action, _ := click[gchatActionKey].(map[string]any)
+	function, _ := action[gchatFunctionKey].(string)
+	return function
+}
+
+// gchatButtonParam is the value of a drawn button's action parameter key,
+// empty when it carries none.
+func gchatButtonParam(b map[string]any, key string) string {
+	click, _ := b[gchatOnClickKey].(map[string]any)
+	action, _ := click[gchatActionKey].(map[string]any)
+	params, _ := action[gchatParametersKey].([]map[string]any)
+	for _, p := range params {
+		if p[gchatParamKey] == key {
+			value, _ := p[gchatParamValue].(string)
+			return value
+		}
+	}
+	return ""
+}
+
+// boardClick takes one tap on a row's Retry or Drop. It is never a turn: it
+// always returns the reason the pull loop logs. A tap with no row, card,
+// action, presser or message, or a line that is no index, a redelivery,
+// one with no board route or admission rule wired, one from a presser the
+// gateway would not answer, one on a row already being tapped, and one
+// whose line is not its row's change nothing. Otherwise the tap is acted
+// on off the pull loop (runBoardTap).
+func (a *GoogleChatAdapter) boardClick(ev *gchatEvent) string {
+	click := ev.click
+	verb := click.Parameters[gchatBoardParamAction]
+	n, err := strconv.Atoi(click.Parameters[gchatBoardParamRow])
+	line, lineOK := gchatBoardLineOf(click.Parameters[gchatBoardParamLine])
+	var tasks []string
+	for _, task := range strings.Split(click.Parameters[gchatBoardParamTasks], gchatBoardTaskSeparator) {
+		if task != "" {
+			tasks = append(tasks, task)
+		}
+	}
+	switch {
+	case slackBoardLabels[verb] == "" || err != nil || n < 1 || len(tasks) == 0 || !lineOK:
+		return gchatBoardNoRow
+	case click.User.Email == "":
+		return gchatBoardNoEmail
+	case ev.Space.Name == "" || ev.Message.Name == "":
+		return gchatBoardNoMessage
+	}
+	message := ev.Message.Name
+	id := gchatClickID(message, click.EventTime)
+	a.mu.Lock()
+	// As a choice click: a tap with no event time has no id of its own.
+	if click.EventTime != "" && a.seenLocked(gchatBoardSeenPrefix+id) {
+		a.mu.Unlock()
+		return gchatBoardDuplicate + id
+	}
+	actor, admits := a.boardActor, a.boardAdmits
+	a.mu.Unlock()
+	if actor == nil || admits == nil {
+		return gchatBoardUnwired
+	}
+	if !admits(gchatBackend, click.User.Email) {
+		return gchatBoardUnverified
+	}
+	key := message + gchatBoardTapSep + strconv.Itoa(n)
+	a.mu.Lock()
+	ux := a.uxLocked()
+	if ux.boardTaps[key] != "" {
+		a.mu.Unlock()
+		return gchatBoardBusy
+	}
+	// A message laid out again since the client drew its buttons: the row
+	// the tap names is not the row n the message shows now, its line is
+	// not where the button says, or the message shows no rows at all. A
+	// message with no record (posted before a restart) is edited from the
+	// click's own copy, so that copy must still draw the row, or the tap
+	// would act on cards it cannot report on.
+	layout, remembered := ux.layouts[message]
+	if !remembered {
+		layout = gchatEventLayout(ev.Message)
+	}
+	if _, ok := gchatBoardRowOf(layout, remembered, gchatBoardRow{n: n, line: line}, tasks); ux.boardMoved[message] || !ok {
+		a.mu.Unlock()
+		return gchatBoardStale
+	}
+	owner := id + gchatBoardOwnerSep + strings.Join(tasks, gchatBoardTaskSeparator)
+	ux.boardTaps[key] = owner
+	remember(&ux.boardTapsOrder, key, func(k string) { delete(ux.boardTaps, k) })
+	a.mu.Unlock()
+	name := click.User.DisplayName
+	if name == "" {
+		name = namelessClicker
+	}
+	// The rewrite runs after this returns: it reads its own copy of the
+	// message, never the event the caller holds.
+	snapshot := &gchatEvent{Space: ev.Space, Message: gchatMessage{Name: message, Text: ev.Message.Text,
+		Thread: ev.Message.Thread, AccessoryWidgets: cloneGchatWidgets(ev.Message.AccessoryWidgets)}}
+	a.goRewrite(func() {
+		a.runBoardTap(snapshot, gchatBoardClaim{key: key, owner: owner}, verb, gchatBoardRow{n: n, line: line}, tasks, name, actor)
+	})
+	return gchatBoardTaken + verb
+}
+
+// gchatBoardLineOf is the line a tap's line parameter names, and whether
+// it is one: gchatBoardNoLine for a button that carries none, an index
+// otherwise.
+func gchatBoardLineOf(raw string) (line int, ok bool) {
+	if raw == "" {
+		return gchatBoardNoLine, true
+	}
+	line, err := strconv.Atoi(raw)
+	return line, err == nil && line >= 0
+}
+
+// gchatBoardRow is a row by its number as drawn and its line in the text:
+// the one a tap's button names (line gchatBoardNoLine for a button that
+// carries none), or the one a tap edits, its line resolved
+// (gchatBoardRowOf).
+type gchatBoardRow struct {
+	n, line int
+}
+
+// gchatBoardClaim is a tap's hold on its row: the claim's key and the tap's
+// own name in it.
+type gchatBoardClaim struct {
+	key, owner string
+}
+
+// runBoardTap acts on the row's cards and edits the row. A tap that
+// settled its cards keeps the row claimed, since its buttons are gone; one
+// that did not, or whose edit failed, releases it, so the row can be tapped
+// again. The release comes after the edit, under the message's rewrite lock,
+// so a second tap cannot edit the row before the first has drawn its line
+// and then have that line drawn over it.
+func (a *GoogleChatAdapter) runBoardTap(ev *gchatEvent, claim gchatBoardClaim, verb string, tap gchatBoardRow, tasks []string, name string, actor BoardActor) {
+	message, n := ev.Message.Name, tap.n
+	ctx, cancel := context.WithTimeout(context.Background(), slackBoardTimeout)
+	defer cancel()
+	res, err := actor(ctx, lib.BoardAction{Action: verb, Tasks: tasks, By: name})
+	outcome := slackBoardOutcome(res, err)
+	a.log.Info("gchat: board tap", "action", verb, "message", message, "tasks", strings.Join(tasks, gchatBoardTaskSeparator),
+		"outcome", outcome, "err", err)
+	settled := outcome != slackBoardFailed
+	line := gchatBoardLine(verb, outcome, name, a.clock())
+	// Under the message's rewrite lock, so the edits of one message land in
+	// turn, each from the layout the last one sent (gchat_layout.go).
+	defer a.lockRewrite(message)()
+	base, remembered, moved := a.layoutOf(message)
+	// The round trip took time, and the message may have been laid out
+	// again in it (trackLayout frees the claims and replaces the record):
+	// the outcome belongs to the row the tap named, not to whatever is row
+	// n now, so it is drawn only where that row, with those cards, still
+	// is: on the line the remembered card's own button gives it, which a
+	// re-layout that kept the row but shifted it has moved, or the line the
+	// tap's button named when there is no record (gchatBoardRowOf). A
+	// message marked as laid out without rows is such a message, and the
+	// tap's own copy of it (the click's) is stale. A message with no
+	// record, never remembered (posted before a restart) or forgotten since
+	// the tap was taken (an edit that failed, below), is read from that
+	// copy.
+	if moved {
+		a.releaseBoardTap(claim)
+		a.log.Info(gchatBoardRowMoved, "message", message, "row", n, "outcome", outcome)
+		return
+	}
+	if !remembered {
+		base = gchatEventLayout(ev.Message)
+	}
+	row, ok := gchatBoardRowOf(base, remembered, tap, tasks)
+	if !ok {
+		a.releaseBoardTap(claim)
+		a.log.Info(gchatBoardRowMoved, "message", message, "row", n, "outcome", outcome)
+		return
+	}
+	layout := gchatBoardRowLayout(base, row, line, settled)
+	err = a.patchLayout(message, layout)
+	if err != nil || !settled {
+		a.releaseBoardTap(claim)
+	}
+	if err != nil {
+		// The edit may have landed though Chat's answer did not, so the
+		// next rewrite builds from the event's copy of the message.
+		a.forgetLayout(message)
+		a.log.Warn("gchat: editing a board row failed", "message", message, "err", err)
+		return
+	}
+	a.rememberLayout(message, layout)
+}
+
+// releaseBoardTap frees a tap's claim on its row, so it can be tapped
+// again: only while the claim is still the tap's own, since a re-layout may
+// have freed it and a newer tap may hold the row by now.
+func (a *GoogleChatAdapter) releaseBoardTap(claim gchatBoardClaim) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	ux := a.uxLocked()
+	if ux.boardTaps[claim.key] == claim.owner {
+		ux.releaseBoardTapLocked(claim.key)
+	}
+}
+
+// releaseBoardTapLocked is releaseBoardTap under the adapter's lock.
+func (ux *gchatUX) releaseBoardTapLocked(key string) {
+	delete(ux.boardTaps, key)
+	forget(&ux.boardTapsOrder, key)
+}
+
+// releaseBoardTapsLocked frees every row claim on message: laid out again,
+// its rows are new ones, and a claim a settled tap kept would hold their
+// buttons dead. Called under the adapter's lock.
+func (ux *gchatUX) releaseBoardTapsLocked(message string) {
+	prefix := message + gchatBoardTapSep
+	for key := range ux.boardTaps {
+		if strings.HasPrefix(key, prefix) {
+			ux.releaseBoardTapLocked(key)
+		}
+	}
+}
+
+// gchatBoardLine is the row's line after a tap: who and when for one that
+// settled it, an ask to try again otherwise. The name is defanged like
+// every string the adapter adds to a message.
+func gchatBoardLine(verb, outcome, name string, now time.Time) string {
+	if outcome == slackBoardFailed {
+		if verb == chatmsg.RowActionDrop {
+			return slackBoardDropFailed
+		}
+		return slackBoardRetryFailed
+	}
+	note := gchatBoardMovedNote
+	switch {
+	case outcome != lib.BoardOutcomeDone:
+	case verb == chatmsg.RowActionDrop:
+		note = gchatBoardDroppedNote
+	default:
+		note = gchatBoardRetriedNote
+	}
+	return fmt.Sprintf(gchatBoardSettledLine, note, defangGchatControls(name), now.UTC().Format(gchatBoardTime))
+}
+
+// gchatBoardRowLayout is layout with the row's line put in: after the row's
+// text on its line, in place of the line an earlier tap left, and the row's
+// buttons gone when settled. row is as gchatBoardRowOf resolved it against
+// this layout, its line an index the text has.
+func gchatBoardRowLayout(layout gchatChatLayout, row gchatBoardRow, line string, settled bool) gchatChatLayout {
+	lines := strings.Split(layout.Text, "\n")
+	lines[row.line] = gchatBoardRowText(lines[row.line]) + gchatBoardNoteSep + line
+	widgets := layout.Widgets
+	if settled {
+		widgets = gchatWithoutButtons(widgets, func(b map[string]any) bool {
+			return gchatButtonFunction(b) == gchatBoardFunction && gchatButtonParam(b, gchatBoardParamRow) == strconv.Itoa(row.n)
+		})
+	}
+	return gchatChatLayout{Text: strings.Join(lines, "\n"), Widgets: widgets}
+}
+
+// gchatBoardRowOf is the row a tap on tap's row edits in layout, its line
+// resolved to the index of the row's line in the text, and whether layout
+// holds it: row n with those cards still drawing its buttons
+// (gchatBoardRowHolds), on a line that starts with its marker
+// (gchatBoardRowIndex). The line is taken in this order: the one layout's
+// own button for the row carries when the layout is remembered, since that
+// is the card this process last sent and a re-layout that kept the row but
+// shifted it moved the button's line with it; the tap's own line otherwise
+// (a copy read back from the click, after a restart, whose buttons are the
+// tap's); and, when neither carries one, the line the text's rows block
+// gives (gchatBoardRowsBlock, for buttons drawn before the parameter). The
+// marker is checked here once; gchatBoardRowLayout edits the index as is.
+func gchatBoardRowOf(layout gchatChatLayout, remembered bool, tap gchatBoardRow, tasks []string) (gchatBoardRow, bool) {
+	held, holds := gchatBoardRowHolds(layout, tap.n, tasks)
+	if !holds {
+		return gchatBoardRow{}, false
+	}
+	row := tap
+	if remembered && held != gchatBoardNoLine {
+		row.line = held
+	}
+	i, ok := gchatBoardRowIndex(strings.Split(layout.Text, "\n"), row)
+	if !ok {
+		return gchatBoardRow{}, false
+	}
+	row.line = i
+	return row, true
+}
+
+// gchatBoardRowIndex is the index in lines of the row's line: the one its
+// button carries, or, for a button that carries none, the nth line of the
+// rows block gchatBoardRowsBlock finds. Either way the line must start with
+// the row's marker ("n. "): the index is the row's place when the message
+// was laid out, and a line that no longer starts with the marker is a
+// message laid out again since the button was drawn, whose row n, if it
+// has one, is elsewhere.
+func gchatBoardRowIndex(lines []string, row gchatBoardRow) (int, bool) {
+	i := row.line
+	if i == gchatBoardNoLine {
+		start, count := gchatBoardRowsBlock(lines)
+		if row.n > count {
+			return 0, false
+		}
+		i = start + row.n - 1
+	}
+	if i < 0 || i >= len(lines) || !strings.HasPrefix(lines[i], fmt.Sprintf(gchatBoardRowMarker, row.n)) {
+		return 0, false
+	}
+	return i, true
+}
+
+// gchatBoardRowHolds reports whether layout still draws row n's buttons for
+// tasks: a kage.board button whose row is n and whose cards are tasks, in
+// order; and the line that button carries, gchatBoardNoLine when it carries
+// none or one that is no index. A settled row has none, and a message laid
+// out again has other rows or other cards.
+func gchatBoardRowHolds(layout gchatChatLayout, n int, tasks []string) (line int, holds bool) {
+	row, joined := strconv.Itoa(n), strings.Join(tasks, gchatBoardTaskSeparator)
+	for _, w := range layout.Widgets {
+		list, _ := w[gchatButtonListKey].(map[string]any)
+		buttons, _ := list[gchatButtonsKey].([]map[string]any)
+		for _, b := range buttons {
+			if gchatButtonFunction(b) == gchatBoardFunction && gchatButtonParam(b, gchatBoardParamRow) == row &&
+				gchatButtonParam(b, gchatBoardParamTasks) == joined {
+				if line, ok := gchatBoardLineOf(gchatButtonParam(b, gchatBoardParamLine)); ok {
+					return line, true
+				}
+				return gchatBoardNoLine, true
+			}
+		}
+	}
+	return gchatBoardNoLine, false
+}
+
+// gchatBoardRowsBlock finds the rows in a laid-out text for a button that
+// carries no line (gchatBoardNoLine): the longest run of lines numbered in
+// order from "1. " (the renderer's markers, gchatChatRows), the last such
+// run when two are as long, since the rows come after the detail and the
+// fold's text is the one section after them that may hold a list. It
+// returns the run's first line and its length, 0 for none.
+//
+// This is the path for cards posted before gchatBoardParamLine existed,
+// whose buttons name no line; a daily card lives up to a day, so a deploy
+// in the middle of one would otherwise leave its buttons dead. Remove it,
+// and gchatBoardNoLine, one release after the parameter shipped (#5235).
+func gchatBoardRowsBlock(lines []string) (start, count int) {
+	first := fmt.Sprintf(gchatBoardRowMarker, 1)
+	for i := range lines {
+		if !strings.HasPrefix(lines[i], first) {
+			continue
+		}
+		n := 1
+		for i+n < len(lines) && strings.HasPrefix(lines[i+n], fmt.Sprintf(gchatBoardRowMarker, n+1)) {
+			n++
+		}
+		if n >= count {
+			start, count = i, n
+		}
+	}
+	return start, count
+}
+
+// gchatBoardRowText is a row's line without the line an earlier tap left on
+// it: what follows the last separator is cut only when it is, whole, a line
+// a tap writes (gchatBoardSettledRE, gchatBoardFailedLines).
+func gchatBoardRowText(l string) string {
+	i := strings.LastIndex(l, gchatBoardNoteSep)
+	if i < 0 {
+		return l
+	}
+	rest := l[i+len(gchatBoardNoteSep):]
+	if gchatBoardSettledRE.MatchString(rest) {
+		return l[:i]
+	}
+	for _, failed := range gchatBoardFailedLines {
+		if rest == failed {
+			return l[:i]
+		}
+	}
+	return l
+}
+
+// gchatWithoutButtons is widgets with every button drop reports removed, and
+// a button list left empty by that removed with it. It returns new slices
+// and maps and leaves widgets as they are, since a remembered layout is kept.
+func gchatWithoutButtons(widgets []map[string]any, drop func(b map[string]any) bool) []map[string]any {
+	var out []map[string]any
+	for _, w := range widgets {
+		list, ok := w[gchatButtonListKey].(map[string]any)
+		if !ok {
+			out = append(out, w)
+			continue
+		}
+		existing, _ := list[gchatButtonsKey].([]map[string]any)
+		var buttons []map[string]any
+		for _, b := range existing {
+			if !drop(b) {
+				buttons = append(buttons, b)
+			}
+		}
+		if len(buttons) == len(existing) {
+			out = append(out, w)
+			continue
+		}
+		if len(buttons) == 0 {
+			continue
+		}
+		newList := make(map[string]any, len(list))
+		for k, v := range list {
+			newList[k] = v
+		}
+		newList[gchatButtonsKey] = buttons
+		newWidget := make(map[string]any, len(w))
+		for k, v := range w {
+			newWidget[k] = v
+		}
+		newWidget[gchatButtonListKey] = newList
+		out = append(out, newWidget)
+	}
+	return out
+}
+
+// gchatEventLayout is a message as the event carries it, as a layout: its
+// text, and every button it shows re-encoded as the renderer draws one, in
+// the event's order.
+func gchatEventLayout(m gchatMessage) gchatChatLayout {
+	var buttons []map[string]any
+	for _, w := range m.AccessoryWidgets {
+		for _, b := range w.ButtonList.Buttons {
+			buttons = append(buttons, gchatButtonWidget(b))
+		}
+	}
+	return gchatChatLayout{Text: m.Text, Widgets: gchatButtonList(buttons)}
+}
+
+// patchLayout patches message to layout.
+func (a *GoogleChatAdapter) patchLayout(message string, layout gchatChatLayout) error {
+	arguments := map[string]any{
+		gchatNameArg:       message,
+		gchatUpdateMaskArg: gchatLayoutUpdateMask,
+		gchatBodyArg:       gchatLayoutBody(layout),
+	}
+	return a.apiCall([]string{gchatSpacesResource, gchatMessagesResource}, gchatPatchMethod, arguments, nil)
+}
+
+// clock is the adapter's time, time.Now outside a test.
+func (a *GoogleChatAdapter) clock() time.Time {
+	if a.now != nil {
+		return a.now()
+	}
+	return time.Now()
+}

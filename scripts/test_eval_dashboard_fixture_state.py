@@ -29,6 +29,7 @@ What is pinned:
 from __future__ import annotations
 
 import contextlib
+import importlib.util
 import io
 import json
 import os
@@ -123,6 +124,22 @@ if args[:3] == ["container", "clusters", "describe"]:
 if args[:2] == ["container", "get-server-config"]:
     print(json.dumps(world.get("server_config", {})))
     sys.exit(0)
+if args[0] == "compute" and args[2] == "list":
+    # A project-scoped role's probe (`--format=value(name)`) or state read
+    # (`--format json`): the objects of world["compute"][project][collection]
+    # whose name starts with the filter's prefix.
+    objects = world.get("compute", {}).get(project, {}).get(args[1])
+    if objects is None:
+        print(f"ERROR: (gcloud.compute.{args[1]}.list) Required 'compute.{args[1]}.list' permission for 'projects/{project}'", file=sys.stderr)
+        sys.exit(1)
+    prefix = (flag("--filter") or "").split("^", 1)[-1]
+    matched = [o for o in objects if o["name"].startswith(prefix)]
+    if flag("--format") == "json":
+        print(json.dumps(matched))
+    else:
+        for o in matched:
+            print(o["name"])
+    sys.exit(0)
 print("unexpected gcloud call: " + " ".join(args), file=sys.stderr)
 sys.exit(64)
 '''
@@ -214,13 +231,36 @@ def _future(days=30):
     return (datetime.now(UTC) + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# Every seeded cluster is past the drift SOP's 24-hour age gate, and slots a,
+# b and d carry the authorized-networks block the drift-peer roles assert.
+_CREATED = "2026-08-21T14:47:09+00:00"
+_OPEN_BLOCK = {"enabled": True, "cidrBlocks": [{"displayName": "open-for-eval", "cidrBlock": "0.0.0.0/0"}]}
+
+
+def _peer():
+    return {"currentMasterVersion": "1.34.1-gke.1", "createTime": _CREATED, "masterAuthorizedNetworksConfig": _OPEN_BLOCK}
+
+
+def _cluster_c():
+    # No authorized-networks block, and the default pool bench/tf/fleet/main.tf
+    # plants as the pool-level outlier: a 50 GB disk with cpuCfsQuota false.
+    return {
+        "currentMasterVersion": "1.34.1-gke.1",
+        "createTime": _CREATED,
+        "nodePools": [{"name": "default-pool", "status": "RUNNING", "config": {"diskSizeGb": 50, "kubeletConfig": {"cpuCfsQuota": False}}}],
+    }
+
+
 def _cluster_b():
     return {
         "currentMasterVersion": "1.33.4-gke.1134000",
+        "createTime": _CREATED,
+        "masterAuthorizedNetworksConfig": _OPEN_BLOCK,
         "releaseChannel": {"channel": "REGULAR"},
-        # The no-surge pool as `clusters describe` reports it; the
-        # readiness-surge-blocked role asserts on maxUnavailable here.
-        "nodePools": [{"name": "default-pool", "upgradeSettings": {"maxSurge": 1}}, {"name": "no-surge-pool", "upgradeSettings": {"maxUnavailable": 1}}],
+        # The pools as `clusters describe` reports them: the readiness-surge-blocked
+        # role asserts on the no-surge pool's maxUnavailable, and the
+        # readiness-lb-drain-timeout role on the default pool's status.
+        "nodePools": [{"name": "default-pool", "status": "RUNNING", "upgradeSettings": {"maxSurge": 1}}, {"name": "no-surge-pool", "upgradeSettings": {"maxUnavailable": 1}}],
         "maintenancePolicy": {"window": {"maintenanceExclusions": {"hold-the-minor-lag": {"startTime": "2026-09-01T00:00:00Z", "endTime": _future(), "maintenanceExclusionOptions": {"scope": "NO_MINOR_UPGRADES"}}}}},
     }
 
@@ -228,8 +268,19 @@ def _cluster_b():
 def healthy_world(*projects):
     """Every role planted and in its designed state on each project."""
     fleet = [["seeded-a", "us-central1-a"], ["seeded-b", "us-central1-a"], ["seeded-c", "us-central1-a"], ["seeded-d", "us-central1-a"]]
+    compute = {
+        "instances": [
+            {"name": "startup-fail-seeded", "status": "RUNNING", "metadata": {"items": [{"key": "startup-script", "value": "exit 1"}]}},
+            {"name": "world-open-seeded", "status": "RUNNING", "networkInterfaces": [{"accessConfigs": [{"type": "ONE_TO_ONE_NAT"}]}]},
+        ],
+        "firewall-rules": [
+            {"name": "world-open-2379-seeded", "disabled": False, "sourceRanges": ["0.0.0.0/0"], "allowed": [{"IPProtocol": "tcp", "ports": ["2379"]}]},
+            {"name": "world-open-deny-remote-seeded", "disabled": False, "sourceRanges": ["0.0.0.0/0"]},
+        ],
+    }
     return {
         "clusters": {project: fleet for project in projects},
+        "compute": {project: compute for project in projects},
         "kubectl": {
             "namespace/seeded-debug": {"metadata": {"name": "seeded-debug"}},
             "namespace/seeded-capacity": {"metadata": {"name": "seeded-capacity"}},
@@ -357,10 +408,20 @@ def healthy_world(*projects):
                 "spec": {"template": {"spec": {"hostNetwork": True, "volumes": [{"name": "cni-conf", "hostPath": {"path": "/etc/cni/net.d", "type": "Directory"}}]}}},
                 "status": {"desiredNumberScheduled": 2, "numberReady": 2},
             },
+            "configconnector/configconnector.core.cnrm.cloud.google.com": {"spec": {"mode": "namespaced"}, "status": {"healthy": True}},
             "cronjob/cuda-pinned-trainer": {"spec": {"schedule": "0 3 * * *", "suspend": True, "jobTemplate": {"spec": {"template": {"spec": {"nodeSelector": {"cloud.google.com/gke-accelerator": "nvidia-l4"}, "containers": [{"name": "trainer", "image": "docker.io/nvidia/cuda:12.2.0-base-ubuntu22.04"}]}}}}}},
+            # seeded-scaled-zero: a switched-off environment behind a Gateway.
+            "namespace/seeded-scaled-zero": {"metadata": {"name": "seeded-scaled-zero"}},
+            "deployment/storefront": {"spec": {"replicas": 0}},
+            "deployment/envoy-seeded-scaled-zero-storefront-edge": {"spec": {"replicas": 0}},
+            "service/storefront": {"metadata": {"name": "storefront"}},
+            "gateway/storefront-edge": {"status": {"conditions": [{"type": "Programmed", "status": "False", "reason": "NoResources"}]}},
+            "httproute/storefront": {"metadata": {"name": "storefront"}},
+            "pod?app=storefront": {"items": []},
+            "pod?app.kubernetes.io/name=envoy": {"items": []},
         },
-        "describe": {project: {"seeded-b": _cluster_b(), "seeded-c": {"currentMasterVersion": "1.34.1-gke.1"}} for project in projects},
-        "server_config": {"channels": [{"channel": "REGULAR", "defaultVersion": "1.34.1-gke.1"}]},
+        "describe": {project: {"seeded-a": _peer(), "seeded-b": _cluster_b(), "seeded-c": _cluster_c(), "seeded-d": _peer()} for project in projects},
+        "server_config": {"channels": [{"channel": "REGULAR", "defaultVersion": "1.34.1-gke.1", "validVersions": ["1.34.1-gke.1", "1.33.4-gke.1134000"]}]},
     }
 
 
@@ -416,6 +477,69 @@ class ScanHarness(unittest.TestCase):
         return {role: entry["state"] for role, entry in doc["projects"][project]["roles"].items()}
 
 
+AGE_GATE_LINE = 'cluster createTime age_hours_ge 24: observed "2026-09-14T14:00:00+00:00", 6.0 hours old (why: Clears itself; no re-apply helps)'
+AHEAD_LINE = 'cluster currentMasterVersion not_ahead_of_channel: observed "1.34.12-gke.1011000", newer than every 1.34 patch REGULAR offers (newest 1.34.11-gke.1209000) (why: seeded_b_pin.py holds it)'
+ORDINARY_LINE = "pod?app=payments-api status.phase eq \"Running\": observed \"Pending\" (why: a planted object a re-apply restores)"
+
+
+class NoReapplyDrift(unittest.TestCase):
+    """#4005: drift lines no re-apply clears, by the assertion's op."""
+
+    def test_the_op_in_the_label_decides_not_the_why(self):
+        self.assertEqual(fixture_state.no_reapply_op(AGE_GATE_LINE), fixture_state.OP_AGE_GATE)
+        self.assertEqual(fixture_state.no_reapply_op(AHEAD_LINE), fixture_state.OP_AHEAD_OF_CHANNEL)
+        self.assertIsNone(fixture_state.no_reapply_op(ORDINARY_LINE))
+        self.assertIsNone(fixture_state.no_reapply_op("pod?app=x status.phase eq 1: observed 2 (why: unlike age_hours_ge or not_ahead_of_channel)"))
+        # An unset channel is the stack's to restore; only "newer than every" is the channel's to clear.
+        for other in ('; release channel unset', '; get-server-config lists no EXTENDED channel', ', not a GKE version'):
+            self.assertIsNone(fixture_state.no_reapply_op(f'cluster currentMasterVersion not_ahead_of_channel: observed "1.34.12-gke.1011000"{other}'), other)
+        self.assertIsNone(fixture_state.no_reapply_op("cluster currentMasterVersion not_ahead_of_channel: observed nothing"))
+        # A createTime ahead of the scanning host's clock reads as a negative age: still the age gate.
+        self.assertEqual(fixture_state.no_reapply_op('cluster createTime age_hours_ge 24: observed "2026-10-27T12:00:00+00:00", -0.3 hours old'), fixture_state.OP_AGE_GATE)
+        # Hours past any date: no clear time, and no exception to take the tick down.
+        for huge in ("70000000", "30000000000"):
+            self.assertIsNone(fixture_state.age_gate_clears_at(f'cluster createTime age_hours_ge {huge}: observed "2026-10-27T12:00:00+00:00", 1.0 hours old'), huge)
+        # An unparseable timestamp is no age the clock will reach.
+        self.assertIsNone(fixture_state.no_reapply_op('cluster createTime age_hours_ge 24: observed "soon", not one RFC 3339 timestamp'))
+
+    def test_the_age_gate_clears_at_the_timestamp_plus_its_hours(self):
+        self.assertEqual(fixture_state.age_gate_clears_at(AGE_GATE_LINE), datetime(2026, 9, 15, 14, 0, tzinfo=UTC))
+        self.assertIsNone(fixture_state.age_gate_clears_at(AHEAD_LINE))
+
+    def test_only_lines_that_are_all_no_reapply_clear_nothing(self):
+        self.assertTrue(fixture_state.reapply_clears_nothing([AGE_GATE_LINE, AHEAD_LINE]))
+        self.assertFalse(fixture_state.reapply_clears_nothing([AGE_GATE_LINE, ORDINARY_LINE]))
+        self.assertFalse(fixture_state.reapply_clears_nothing([]))
+
+    def test_the_runners_own_age_gate_line_is_read(self):
+        # The line comes from hack/fleet-fixture-state.py; a change to its shape must show here.
+        spec = importlib.util.spec_from_file_location("fleet_fixture_state", REPO / "hack" / "fleet-fixture-state.py")
+        runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner)
+        created = (datetime.now(UTC) - timedelta(hours=2)).replace(microsecond=0)
+        entry = {"subject": "cluster", "path": "createTime", "op": "age_hours_ge", "value": 24, "steps": runner.parse_path("createTime")}
+        line = runner.evaluate(entry, [{"createTime": created.isoformat()}])
+        self.assertEqual(fixture_state.age_gate_clears_at(line), created + timedelta(hours=24))
+
+    def test_the_runners_own_ahead_of_channel_line_is_read(self):
+        # The line comes from hack/fleet-fixture-state.py's evaluate(); a change to its wording must show here.
+        spec = importlib.util.spec_from_file_location("fleet_fixture_state", REPO / "hack" / "fleet-fixture-state.py")
+        runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner)
+        entry = {"subject": "cluster", "path": "currentMasterVersion", "op": runner.OP_NOT_AHEAD, "value": None,
+                 "steps": runner.parse_path("currentMasterVersion")}
+        offered = ["1.34.11-gke.1209000", "1.35.8-gke.1919000"]
+        ahead = {"currentMasterVersion": "1.34.12-gke.1011000", "releaseChannel": {"channel": "REGULAR"}}
+        line = runner.evaluate(entry, [ahead], channel_valid=lambda name: offered)
+        self.assertEqual(fixture_state.no_reapply_op(line), fixture_state.OP_AHEAD_OF_CHANNEL)
+        # A minor the channel carries none of: "newer than every version", still the channel's to clear.
+        line = runner.evaluate(entry, [dict(ahead, currentMasterVersion="1.36.1-gke.100")], channel_valid=lambda name: offered)
+        self.assertEqual(fixture_state.no_reapply_op(line), fixture_state.OP_AHEAD_OF_CHANNEL)
+        # An unset channel is the stack's to restore.
+        line = runner.evaluate(entry, [{"currentMasterVersion": "1.34.12-gke.1011000"}], channel_valid=lambda name: offered)
+        self.assertIsNone(fixture_state.no_reapply_op(line))
+
+
 class ProjectList(unittest.TestCase):
     def test_the_repo_mapping_names_the_pool(self):
         projects = fixture_state.pool_projects(CI_DEPLOY.read_text())
@@ -437,10 +561,10 @@ class HealthyScan(ScanHarness):
         self.assertEqual(set(self.states(doc).values()), {"healthy"})
         self.assertEqual(set(self.states(doc)), set(self.roles))
         entry = doc["projects"][PROJECT]
-        self.assertEqual(entry["summary"], {"healthy": 32, "drifted": 0, "absent": 0, "not_checked": 0})
+        self.assertEqual(entry["summary"], {"healthy": 41, "drifted": 0, "absent": 0, "not_checked": 0})
         self.assertEqual(entry["reader"], "seeded-fleet-reader@kube-agents-evals-2.iam.gserviceaccount.com")
         self.assertNotIn("error", entry)
-        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "absent_projects": 0, "healthy": 32, "drifted": 0, "absent": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "absent_projects": 0, "healthy": 41, "drifted": 0, "absent": 0, "not_checked": 0})
         self.assertEqual(doc["previous"], {"scanned_at": None, "drifted": {}})
         self.assertEqual(err, "")
 
@@ -494,7 +618,7 @@ class Drift(ScanHarness):
         doc, _ = self.scan(world, projects=(PROJECT, OTHER))
         self.assertEqual(set(self.states(doc, PROJECT).values()), {"healthy"})
         self.assertEqual(self.states(doc, OTHER)["crashloop-workload"], "drifted")
-        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "absent_projects": 0, "healthy": 63, "drifted": 1, "absent": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "absent_projects": 0, "healthy": 81, "drifted": 1, "absent": 0, "not_checked": 0})
 
 
 class NotChecked(ScanHarness):
@@ -517,7 +641,11 @@ class NotChecked(ScanHarness):
         world["clusters"] = {}
         doc, _ = self.scan(world)
         states = self.states(doc)
-        self.assertEqual(set(states.values()), {"not_checked"})
+        # The project-scoped roles are read with gcloud compute, not through a
+        # cluster, so a refused cluster list leaves them readable.
+        project_roles = {"startup-fail-vm", "world-open-ingress"}
+        self.assertEqual({s for r, s in states.items() if r not in project_roles}, {"not_checked"})
+        self.assertEqual({states[r] for r in project_roles}, {"healthy"})
         detail = doc["projects"][PROJECT]["roles"]["crashloop-workload"]["detail"]
         self.assertIn("could not list clusters", detail[0])
         self.assertNotIn("error", doc["projects"][PROJECT], "the runner ran and said why; that is not a scan error")
@@ -609,6 +737,20 @@ class NotChecked(ScanHarness):
         other = ["x absent from a.kubeconfig in p, so fixture role 'idle-nodepool' was never planted (or has already been destroyed)."]
         self.assertEqual(fixture_state.unpublished_state("crashloop-workload", "a", other)[0], "not_checked")
         self.assertEqual(fixture_state.unpublished_state("idle-nodepool", "a", other)[0], "absent")
+
+    def test_a_project_scoped_role_is_decided_by_its_own_warning_alone(self):
+        # A project-scoped role (slot "") is probed in the project with gcloud,
+        # so a cluster-side warning says nothing about it.
+        cluster_side = [
+            "project p carries no clusters labelled environment=seeded,managed-by=kube-agents-seeded-fleet. Apply bench/tf/fleet/ there",
+            "could not list clusters in p; every fleet check will report status=error",
+        ]
+        self.assertEqual(fixture_state.unpublished_state("startup-fail-vm", "", cluster_side)[0], "not_checked")
+        own = ["instance/startup-fail-* absent from project p, so fixture role 'startup-fail-vm' was never planted (or has already been destroyed)."]
+        self.assertEqual(fixture_state.unpublished_state("startup-fail-vm", "", cluster_side + own), ("absent", own[0]))
+        refused = ["instance/startup-fail-* could not be read from project p (403), so fixture role 'startup-fail-vm' could not be checked."]
+        self.assertEqual(fixture_state.unpublished_state("startup-fail-vm", "", refused), ("not_checked", refused[0]))
+        self.assertEqual(fixture_state.catalog_roles(fixture_state.FLEET_CATALOG)["startup-fail-vm"], "")
 
     def test_a_read_that_fails_is_not_checked_not_drift(self):
         world = healthy_world(PROJECT)
@@ -718,7 +860,7 @@ class Workflow(unittest.TestCase):
         scan = next(step for step in steps if "fixture_state.py" in step.get("run", ""))
         self.assertIn("--prior work/fixture-state-prior.json", scan["run"])
         self.assertIn('--workers "$FIXTURE_STATE_WORKERS"', scan["run"])
-        upload = next(step for step in steps if "cp work/fixture-state.json" in step.get("run", ""))
+        upload = next(step for step in steps if "cp --cache-control=no-cache work/fixture-state.json" in step.get("run", ""))
         self.assertIn('"$DASHBOARD_BUCKET/fixture-state.json"', upload["run"])
         import re
 
@@ -735,7 +877,7 @@ class Workflow(unittest.TestCase):
         import sys
 
         steps = self.jobs["fixture-state-scan"]["steps"]
-        upload = next(step for step in steps if "cp work/fixture-state.json" in step.get("run", ""))
+        upload = next(step for step in steps if "cp --cache-control=no-cache work/fixture-state.json" in step.get("run", ""))
         run = upload["run"]
         code = run[run.index("python3 -c '") + len("python3 -c '") :]
         code = code[: code.index("\n'")]
@@ -760,7 +902,7 @@ class Workflow(unittest.TestCase):
     def test_the_tick_reads_the_published_scan(self):
         steps = self.jobs["refresh-and-adjudicate"]["steps"]
         fetch = next(step for step in steps if "fixture-state.json" in step.get("run", "") and "health-prev.json" in step["run"])
-        self.assertIn('gsutil -q cp "$DASHBOARD_BUCKET/fixture-state.json" work/fixture-state.json || true', fetch["run"])
+        self.assertIn('gcloud storage cp "$DASHBOARD_BUCKET/fixture-state.json" work/fixture-state.json || true', fetch["run"])
         adjudicate = next(step for step in steps if step.get("name") == "Adjudicate")
         self.assertIn("--fixture-state work/fixture-state.json", adjudicate["run"])
 

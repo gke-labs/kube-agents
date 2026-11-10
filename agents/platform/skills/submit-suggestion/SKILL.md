@@ -1,6 +1,6 @@
 ---
 name: submit-suggestion
-description: Propose declarative configuration updates securely by committing file changes and submitting pull requests (merge requests on GitLab) for SRE review, including a request to delete a resource, which its "Deleting a resource" section answers with a pull request that removes the declaring manifest, or a stated stop when the repository does not declare it. Not for fleet-audit finding fixes — the fleet-audit skill opens and tracks those PRs itself.
+description: Open a pull request (a merge request on GitLab) when the request asked for one, committing declarative configuration changes for SRE review; not for a request to "propose a manifest", which is answered in the reply. Covers a request to delete a resource, which its "Deleting a resource" section answers with a pull request that removes the declaring manifest, or a stated stop when the repository does not declare it. Not for fleet-audit finding fixes — the fleet-audit skill opens and tracks those PRs itself.
 ---
 
 # submit-suggestion - Secure GitOps Pull Request Orchestrator
@@ -12,6 +12,7 @@ This skill equips the Platform Agent to propose declarative file updates, GKE in
 - **Declarative File Provisioning:** Triggered when new GKE manifests or configs are requested.
 - **Configuration Upgrades:** Triggered when upgrading version configurations, security patches, or network policies.
 - **Governance Policy Syncs:** Triggered when compliance playbooks or settings require updates.
+- **Any change in the GitOps repository** reaches review through this skill, but a Terraform, Config Connector or Helm-chart change is written by its authoring skill first (Step 2's table).
 - **Deletions:** Triggered when someone asks to delete a resource. See [Deleting a resource](#deleting-a-resource) before Step 1: a declared object is removed in a pull request, anything else is a stated stop.
 
 _Crucially, you are strictly forbidden from executing direct, manual mutations. All changes must flow through a secure PR path — this skill, or the **fleet-audit** skill for fixes of its findings (below)._
@@ -27,6 +28,16 @@ _Crucially, you are strictly forbidden from executing direct, manual mutations. 
   promotion, which `finish` does on a scheduled run, never this skill. A pull
   request nobody asked for is a write on their repository they now have to
   triage.
+- **A fix that belongs in a repository this agent does not write.** When
+  reading the managed repository shows the value is defined somewhere else —
+  the chart a `HelmRelease` or `Application` installs, a Terraform module, a
+  tenant's own repository, a `context` repository — `SOUL.md` §3, item 8
+  applies: follow the reference read-only with **inspect-repository**, name
+  the repository, file and line in the reply with the change as a diff, and
+  open no pull request. Never stand in an edit here (an override, a
+  post-render patch, a second copy of the object) for the fix there. A
+  SOPS-encrypted file in the workspace is read for its metadata only: never
+  decrypt it, and never ask for or offer to wait for its key.
 - **Fixing a fleet-audit finding.** The bullets above match audit fixes too — a
   security patch, a policy update — which is exactly why this warning exists. If
   the change addresses a fleet-audit finding (it carries a finding id, or an
@@ -83,6 +94,13 @@ python3 "$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py pre
 _(Example: `--repo "acme/fleet" --branch "platform-agent/provision-mercury-09"` or `--repo "acme/fleet" --branch "platform-agent/upgrade-policy-baseline"`)_
 
 In a multi-repository environment, pass `--repo "<owner>/<repo>"` for the repository your task targets (identified from cluster annotations or task context per SOUL.md §3, item 6).
+
+Pass `--repo` as the repository registration names it: `<owner>/<repo>` on
+GitHub, or `<host>/<owner>/<repo>` on another declared forge (such as GitLab or
+Gitea). `prepare` echoes the canonical repository name in `repo`; pass that
+`repo` value to every later `--repo` in this skill and in `version-control`
+calls so installs that serve more than one forge do not have to guess which
+host a bare slug belongs to.
 
 It prints one JSON line. **Keep it — Step 2 works inside its `workspace`.** The
 `workspace` is named for your branch as well as the repository, because
@@ -170,7 +188,50 @@ sandbox cannot read the branch at all; `prepare` then refuses the name with
 
 ### Step 2: Make the Changes
 
+**First, hand the edit to the skill that writes its format.** `prepare` is
+often the first time you see what the change is written in, and this skill
+is the transport, not the author. Before you edit, look at the file or
+directory the change lands in:
+
+| The change is                                                                                                                        | Load and follow first    |
+| ------------------------------------------------------------------------------------------------------------------------------------ | ------------------------ |
+| a Terraform file (`.tf`, `.tf.json`, `.tfvars`), wherever it sits                                                                    | **gcp-terraform**        |
+| a Config Connector object (`apiVersion: *.cnrm.cloud.google.com/*`)                                                                  | **gcp-config-connector** |
+| a Helm chart's declaration (a Helm-sourced `RootSync`, a Flux `HelmRelease`, an Argo CD Helm `Application`, kustomize `helmCharts:`) | **gitops-helm-chart**    |
+
+Load it with `skill_view` and follow it from its Step 1, its own `prepare`
+and checks included (the CRD check for Config Connector, the reconciler form
+for a chart, the owning files and pins for Terraform, then `tofu fmt`). You
+have edited nothing yet, so nothing is lost: its `prepare` opens the copy
+under its own branch name, and its last step submits that branch through
+Step 3 here. Leave the copy you prepared here unused. A plain Kubernetes
+manifest has no authoring skill; write it here.
+
+**When the branch is already decided, stay on it.** In a review round
+(Step 5), or when `prepare` returned a non-empty `proposal`, the revisions
+under review are on this copy's branch. Take the authoring skill's reads,
+writing rules and checks, but not its Step 1 `prepare`, its branch name or
+its submit: edit in this `workspace` and submit from Step 3 here, onto the
+same branch. Starting from its Step 1 would open a second pull request.
+
+**Implement only the chosen option.** When the request comes from a multi-option
+triage or audit report (or a single-fix triage report), implement only the
+option the caller chose (the one marked Recommended when none was named, the
+single proposed fix, or the `Option <X>` the user selected) and edit only the
+file(s) that option calls for; if the repository holds both a GitOps sync source
+path and cluster bootstrap or provisioning copies of the workload, check the
+repository's GitOps sync declaration for the namespace or workload and edit only
+the synced workload manifest(s). Never bundle unchosen options
+or optional hardening into the same pull request, and never touch unrelated
+manifests or infrastructure definitions.
+
 Generate or edit the files **inside the returned `workspace`**.
+
+When modifying an existing Kubernetes object, edit the file that declares it in place. When
+creating a new Kubernetes object (such as a `PodDisruptionBudget` for a `Deployment` or a
+`NetworkPolicy` for a `Namespace`), write it to a new, standalone file in that same directory.
+Never append a new object to an existing manifest file. If that directory uses Kustomize, add the
+new filename to `resources:` in `kustomization.yaml` in the same pull request.
 
 `git` here holds no credential and cannot reach a forge; it works on the
 working copy and nothing else, and `submit` is what sends the result.
@@ -458,7 +519,10 @@ no token to refresh.
 
    Edit the files the reviewer commented on in the `workspace` — what is on the
    branch is what you are being asked to change, and rewriting a file from
-   memory loses the rest of it. Stage only those specific files
+   memory loses the rest of it. A Terraform, Config Connector or Helm-chart
+   file is edited by its authoring skill's rules here too (Step 2's table),
+   its checks included: `tofu fmt` after any `.tf` edit. Its Step 1 and its
+   submit do not apply: stay on `<source>` in this copy. Stage only those specific files
    (**never `git add .` / `-A`**).
 
    Pass `--title` and `--body-file` again so the description matches the

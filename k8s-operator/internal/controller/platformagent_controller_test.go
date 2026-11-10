@@ -350,6 +350,37 @@ func TestDeleteLegacyCredentialIsolationResources(t *testing.T) {
 	}
 }
 
+// TestLegacyCleanupSkipsAnUnownedObjectUnderItsNames (#3871): the legacy
+// cleanup runs on every reconcile in both modes, and a Deployment or
+// ServiceAccount named <agent>-sandbox that this PlatformAgent does not
+// control is somebody else's. It is left as found and the cleanup completes;
+// refusing it stopped everything after this step, the status write included.
+func TestLegacyCleanupSkipsAnUnownedObjectUnderItsNames(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns", UID: "agent-uid"}}
+	planted := []client.Object{
+		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-sandbox", Namespace: "test-ns"}},
+		&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-sandbox", Namespace: "test-ns"}},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{agent}, planted...)...).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+
+	if err := r.deleteLegacyCredentialIsolationResources(ctx, agent); err != nil {
+		t.Fatalf("an unowned object under a legacy name stopped the cleanup: %v", err)
+	}
+	for _, obj := range planted {
+		got := obj.DeepCopyObject().(client.Object)
+		if err := cl.Get(ctx, client.ObjectKeyFromObject(obj), got); err != nil {
+			t.Errorf("the unowned %T is gone: %v", obj, err)
+			continue
+		}
+		if refs := got.GetOwnerReferences(); len(refs) != 0 {
+			t.Errorf("the unowned %T was adopted: owner references %+v", obj, refs)
+		}
+	}
+}
+
 // TestReconcileDoesNotDeleteTheMetadataDenyGuardrail runs a full Reconcile
 // rather than the cleanup helper alone, so the assertion holds no matter which
 // step of Reconcile a future change wires the deletion into.
@@ -990,17 +1021,9 @@ func reconcileInvalidCredentialProxyResources(t *testing.T, override *corev1.Res
 	if want := resolveCredentialProxyImage(agent.Spec.Deployment); proxy.Image != want || proxy.Image == staleImage {
 		t.Errorf("the proxy container's image = %q, want %q; a refused override must not stop the Deployment being applied", proxy.Image, want)
 	}
-	wantResources := corev1.ResourceRequirements{
-		Requests: corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse("500m"),
-			corev1.ResourceMemory: resource.MustParse("1Gi"),
-		},
-		Limits: corev1.ResourceList{
-			corev1.ResourceCPU:              resource.MustParse("1"),
-			corev1.ResourceMemory:           resource.MustParse("2Gi"),
-			corev1.ResourceEphemeralStorage: resource.MustParse("2Gi"),
-		},
-	}
+	// The operator's defaults, read from the merge with no override, so a
+	// change to them does not need a second copy here.
+	wantResources := resolveCredentialProxyResources(nil, sizingTierSmall)
 	if !equality.Semantic.DeepEqual(proxy.Resources, wantResources) {
 		t.Errorf("the proxy container's resources = %v, want the operator's defaults %v; a refused override is ignored", proxy.Resources, wantResources)
 	}
@@ -1069,7 +1092,8 @@ func TestPlatformAgentReconciler_Reconcile_CredentialProxyWarningLoggedOncePerGe
 		Spec: agentv1alpha1.PlatformAgentSpec{
 			AgentSpec: agentv1alpha1.AgentSpec{Deployment: &agentv1alpha1.DeploymentSpec{
 				CredentialProxy: &agentv1alpha1.CredentialProxySpec{Resources: &corev1.ResourceRequirements{
-					Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")},
+					// Above the 2Gi default request, so Autopilot's clamp is worth a note.
+					Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("3Gi")},
 				}},
 			}},
 			Harness: &agentv1alpha1.HarnessSpec{ProjectID: "test-project", Location: "us-central1", ClusterName: "test-cluster"},
@@ -1129,7 +1153,8 @@ func TestPlatformAgentReconciler_Reconcile_CredentialProxyWarningLoggedAfterAnEa
 			AgentSpec: agentv1alpha1.AgentSpec{Deployment: &agentv1alpha1.DeploymentSpec{
 				Availability: &agentv1alpha1.AvailabilitySpec{RuntimeClassName: ptr.To("gvisor")},
 				CredentialProxy: &agentv1alpha1.CredentialProxySpec{Resources: &corev1.ResourceRequirements{
-					Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")},
+					// Above the 2Gi default request, so Autopilot's clamp is worth a note.
+					Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("3Gi")},
 				}},
 			}},
 			Harness: &agentv1alpha1.HarnessSpec{ProjectID: "test-project", Location: "us-central1", ClusterName: "test-cluster"},
@@ -5451,14 +5476,15 @@ func TestSyncGithubTokenMinterConfigMap(t *testing.T) {
 		t.Fatalf("failed to get updated ConfigMap: %v", err)
 	}
 
-	// Verify repo-1.yaml and repo-2.yaml were created and scoped to all managed repos in org
-	expectedRepo1 := "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'repo-1'\n      - 'repo-2'\n"
-	expectedRepo2 := "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'repo-1'\n      - 'repo-2'\n"
+	// Verify repo-1.yaml and repo-2.yaml were created, each scoped to its own repository
+	// alone: listing every managed repository in every key made the ConfigMap quadratic.
+	expectedRepo1 := "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'repo-1'\n"
+	expectedRepo2 := "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'repo-2'\n"
 	if updatedCM.Data["repo-1.yaml"] != expectedRepo1 {
-		t.Errorf("expected repo-1.yaml to contain all managed repos in org, got %q", updatedCM.Data["repo-1.yaml"])
+		t.Errorf("expected repo-1.yaml to list repo-1 alone, got %q", updatedCM.Data["repo-1.yaml"])
 	}
 	if updatedCM.Data["repo-2.yaml"] != expectedRepo2 {
-		t.Errorf("expected repo-2.yaml to contain all managed repos in org, got %q", updatedCM.Data["repo-2.yaml"])
+		t.Errorf("expected repo-2.yaml to list repo-2 alone, got %q", updatedCM.Data["repo-2.yaml"])
 	}
 
 	// Verify unmanaged-static.yaml was NOT pruned
@@ -5722,10 +5748,15 @@ func TestSyncGithubTokenMinterConfigMap_AdoptsPreRenderedKeys(t *testing.T) {
 		t.Fatalf("failed to get updated ConfigMap: %v", err)
 	}
 
-	// Verify repo-1.yaml was adopted and updated to include both repos
-	expectedRepo1 := "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'repo-1'\n      - 'repo-2'\n"
+	// Verify repo-1.yaml was adopted and kept at its own repository, and repo-2.yaml rendered
+	// beside it listing repo-2 alone.
+	expectedRepo1 := "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'repo-1'\n"
 	if updatedCM.Data["repo-1.yaml"] != expectedRepo1 {
-		t.Errorf("expected pre-rendered repo-1.yaml to be updated with all repos, got %q", updatedCM.Data["repo-1.yaml"])
+		t.Errorf("expected pre-rendered repo-1.yaml to list repo-1 alone, got %q", updatedCM.Data["repo-1.yaml"])
+	}
+	expectedRepo2 := "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'repo-2'\n"
+	if updatedCM.Data["repo-2.yaml"] != expectedRepo2 {
+		t.Errorf("expected repo-2.yaml to list repo-2 alone, got %q", updatedCM.Data["repo-2.yaml"])
 	}
 
 	// Verify managed keys annotation includes both repo-1.yaml and repo-2.yaml
@@ -5735,11 +5766,11 @@ func TestSyncGithubTokenMinterConfigMap_AdoptsPreRenderedKeys(t *testing.T) {
 	}
 }
 
-// The base template as the chart renders it since the read scope was added: a
-// write scope and a read scope, both listing the primary repository. Written
-// with sigs.k8s.io/yaml in mind -- the read-only rendering re-marshals it with
-// sorted keys, so the expectations below are built from a parse rather than
-// from a string.
+// The base template as the chart renders it since the sweep scope was added: a
+// write scope, a read scope and a sweep scope, all listing the primary
+// repository. Written with sigs.k8s.io/yaml in mind -- the read-only rendering
+// re-marshals it with sorted keys, so the expectations below are built from a
+// parse rather than from a string.
 const minterTemplateWithReadScope = `version: 'minty.abcxyz.dev/v2'
 rule:
   if: "assertion.iss == 'https://accounts.google.com'"
@@ -5760,6 +5791,15 @@ scope:
       - 'default-repo'
     permissions:
       contents: 'read'
+  platform-agent-sweep-scope:
+    rule:
+      if: "assertion.email in ['agent@example.iam.gserviceaccount.com']"
+    repositories:
+      - 'default-repo'
+    permissions:
+      contents: 'read'
+      pull_requests: 'read'
+      issues: 'read'
 `
 
 // parsedMinterPolicy unmarshals a rendered policy so a test can assert on its
@@ -5795,8 +5835,13 @@ func TestRenderReadOnlyPolicy(t *testing.T) {
 		t.Errorf("expected the top-level rule to be carried over, got %v", doc["rule"])
 	}
 	scopes := minterPolicyScopes(t, rendered)
+	// One scope, though the template carries three: the sweep scope reads pull
+	// requests and issues, and a context repository's policy grants contents alone.
 	if len(scopes) != 1 {
 		t.Fatalf("expected exactly the read scope, got %v", scopes)
+	}
+	if _, hasSweep := scopes[minterSweepScope]; hasSweep {
+		t.Errorf("a read-only policy must not carry the sweep scope, got %v", scopes)
 	}
 	readScope, ok := scopes["platform-agent-read-scope"].(map[string]interface{})
 	if !ok {
@@ -5885,6 +5930,16 @@ func TestSyncGithubTokenMinterConfigMap_ContextRepos(t *testing.T) {
 	if got := fmt.Sprint(managedScopes["platform-agent-scope"].(map[string]interface{})["repositories"]); got != "[gitops]" {
 		t.Errorf("expected the managed policy to list managed repositories only, got %s", got)
 	}
+	sweepScope, hasSweep := managedScopes[minterSweepScope].(map[string]interface{})
+	if !hasSweep {
+		t.Fatalf("expected gitops.yaml to carry the sweep scope, got %v", managedScopes)
+	}
+	if got := fmt.Sprint(sweepScope["repositories"]); got != "[gitops]" {
+		t.Errorf("expected the sweep scope to list managed repositories only, got %s", got)
+	}
+	if _, hasSweep := contextScopes[minterSweepScope]; hasSweep {
+		t.Errorf("expected tf-live.yaml to carry no sweep scope, got %v", contextScopes)
+	}
 	if ann := updatedCM.Annotations[AnnotationManagedMinterKeys]; ann != "gitops.yaml,tf-live.yaml" {
 		t.Errorf("expected both keys tracked, got %q", ann)
 	}
@@ -5943,10 +5998,10 @@ func TestSyncGithubTokenMinterConfigMap_ContextRepos(t *testing.T) {
 	if err := cl.Get(ctx, key, updatedCM); err != nil {
 		t.Fatalf("get failed: %v", err)
 	}
-	for _, name := range []string{"tf-live.yaml", "tf-modules.yaml"} {
-		readScope = minterPolicyScopes(t, updatedCM.Data[name])["platform-agent-read-scope"].(map[string]interface{})
-		if got := fmt.Sprint(readScope["repositories"]); got != "[tf-live tf-modules]" {
-			t.Errorf("%s: expected every same-org context repository, got %s", name, got)
+	for _, name := range []string{"tf-live", "tf-modules"} {
+		readScope = minterPolicyScopes(t, updatedCM.Data[name+".yaml"])["platform-agent-read-scope"].(map[string]interface{})
+		if got := fmt.Sprint(readScope["repositories"]); got != "["+name+"]" {
+			t.Errorf("%s.yaml: expected the context repository alone, got %s", name, got)
 		}
 	}
 	if _, exists := updatedCM.Data["gitops.yaml"]; exists {
@@ -7667,5 +7722,188 @@ func TestReconcileGitopsStateGitOpsRepoFromTheDeprecatedAlias(t *testing.T) {
 	}
 	if got, want := cm.Data[gitopsStateGitOpsRepoKey], `{"type":"github","url":"https://github.com/acme/infra"}`; got != want {
 		t.Errorf("gitops_repo = %q, expected %q", got, want)
+	}
+}
+
+// TestReconcileRendersTheCredentialProxyRequestsForTheClusterMode: Reconcile
+// passes the discovered cluster mode to the proxy builder, so an Autopilot
+// cluster gets the Autopilot requests and a Standard one keeps the defaults.
+func TestReconcileRendersTheCredentialProxyRequestsForTheClusterMode(t *testing.T) {
+	autopilot := &mockAutopilotDiscovery{
+		serverGroupsList: &metav1.APIGroupList{Groups: []metav1.APIGroup{{
+			Name:     "auto.gke.io",
+			Versions: []metav1.GroupVersionForDiscovery{{GroupVersion: "auto.gke.io/v1", Version: "v1"}},
+		}}},
+		resourcesList: map[string]*metav1.APIResourceList{"auto.gke.io/v1": {
+			GroupVersion: "auto.gke.io/v1", APIResources: []metav1.APIResource{{Name: "allowlistedworkloads"}},
+		}},
+	}
+	tests := []struct {
+		name     string
+		dc       discovery.DiscoveryInterface
+		wantCPU  string
+		wantMem  string
+		wantType string
+	}{
+		{name: "standard", dc: &mockAutopilotDiscovery{}, wantCPU: "500m", wantMem: "1Gi", wantType: credentialProxyClusterTypeStandard},
+		{name: "autopilot", dc: autopilot, wantCPU: "2", wantMem: "2Gi", wantType: credentialProxyClusterTypeAutopilot},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scheme := setupScheme()
+			agent := &agentv1alpha1.PlatformAgent{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-agent-proxy-mode", Namespace: "test-ns"},
+				Spec: agentv1alpha1.PlatformAgentSpec{
+					Harness: &agentv1alpha1.HarnessSpec{ProjectID: "test-project", Location: "us-central1", ClusterName: "test-cluster"},
+				},
+			}
+			cl := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(agent, shellSandboxKeysSecret(agent)).
+				WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+				WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+				Build()
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(64), DiscoveryClient: tt.dc}
+			req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(agent)}
+			ctx := context.Background()
+			for i := range 2 {
+				if _, err := r.Reconcile(ctx, req); err != nil {
+					t.Fatalf("Reconcile %d failed: %v", i+1, err)
+				}
+			}
+			dep := &appsv1.Deployment{}
+			if err := cl.Get(ctx, client.ObjectKey{Name: credentialBrokerName(agent), Namespace: agent.Namespace}, dep); err != nil {
+				t.Fatalf("get the proxy Deployment: %v", err)
+			}
+			proxy, found := findContainer(dep.Spec.Template.Spec, credentialProxyContainerName)
+			if !found {
+				t.Fatalf("no %s container in the proxy Deployment", credentialProxyContainerName)
+			}
+			assertQuantity(t, proxy.Resources.Requests, corev1.ResourceCPU, tt.wantCPU)
+			assertQuantity(t, proxy.Resources.Requests, corev1.ResourceMemory, tt.wantMem)
+			assertQuantity(t, proxy.Resources.Limits, corev1.ResourceCPU, "2")
+			if got := dep.Annotations[credentialProxyClusterTypeAnnotation]; got != tt.wantType {
+				t.Errorf("%s = %q, want %q", credentialProxyClusterTypeAnnotation, got, tt.wantType)
+			}
+			if _, onPod := dep.Spec.Template.Annotations[credentialProxyClusterTypeAnnotation]; onPod {
+				t.Errorf("%s is on the pod template, where a change restarts the proxy", credentialProxyClusterTypeAnnotation)
+			}
+		})
+	}
+}
+
+// TestReconcileKeepsTheRunningProxyRequestsWhileDiscoveryFails: when
+// discovery cannot say whether the cluster is Autopilot, Reconcile renders the
+// proxy at the cluster type the running proxy was rendered for: the one its
+// cluster-type annotation records, or, on a Deployment without one, the one
+// whose requests it carries. So a failed check after an operator restart does
+// not restart the proxy. With no proxy yet it renders the Standard requests.
+func TestReconcileKeepsTheRunningProxyRequestsWhileDiscoveryFails(t *testing.T) {
+	lowerMemory := &corev1.ResourceRequirements{Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1536Mi")}}
+	cpuOnly := &corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")}}
+	cpuHalf := &corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m")}}
+	memory2Gi := &corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")}}
+	bothRequests := &corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("1Gi")}}
+	tests := []struct {
+		name      string
+		resources *corev1.ResourceRequirements
+		running   *bool
+		// editedMeanwhile renders the running proxy without the CR's override,
+		// as before a CR edit made while discovery fails; runningResources, when
+		// set, is the override the running proxy was rendered from instead.
+		editedMeanwhile  bool
+		runningResources *corev1.ResourceRequirements
+		unannotated      bool
+		wantCPU          string
+		wantMem          string
+		// wantType is the cluster-type annotation after the reconcile; "" is
+		// none. A guess from the requests is never recorded.
+		wantType string
+	}{
+		{name: "running at the Autopilot requests", running: ptr.To(true), wantCPU: "2", wantMem: "2Gi", wantType: credentialProxyClusterTypeAutopilot},
+		{name: "running at the Standard requests", running: ptr.To(false), wantCPU: "500m", wantMem: "1Gi", wantType: credentialProxyClusterTypeStandard},
+		{name: "no proxy yet", running: nil, wantCPU: "500m", wantMem: "1Gi"},
+		// The annotation holds across a CR edit that moves the requests, which
+		// the request comparison cannot follow.
+		{name: "Autopilot, the CR edited meanwhile", resources: lowerMemory, running: ptr.To(true), editedMeanwhile: true, wantCPU: "1500m", wantMem: "1536Mi", wantType: credentialProxyClusterTypeAutopilot},
+		// A Standard proxy at 500m / 2Gi (requests.memory 2Gi), whose CR now
+		// sets only requests.cpu 500m: the new CR's Autopilot render is also
+		// 500m / 2Gi, so only the annotation keeps it Standard.
+		{
+			name: "Standard, the CR edited meanwhile", resources: cpuHalf, running: ptr.To(false), editedMeanwhile: true,
+			runningResources: memory2Gi, wantCPU: "500m", wantMem: "1Gi", wantType: credentialProxyClusterTypeStandard,
+		},
+		// A Deployment an older operator wrote has no annotation, so its
+		// requests decide.
+		{name: "unannotated, at the Autopilot requests", running: ptr.To(true), unannotated: true, wantCPU: "2", wantMem: "2Gi"},
+		{name: "unannotated, at the Standard requests", running: ptr.To(false), unannotated: true, wantCPU: "500m", wantMem: "1Gi"},
+		// requests.cpu 2 on Standard runs at 2 / 1Gi: the CPU matches the
+		// Autopilot render (2 / 2Gi) and the memory does not, so it is Standard.
+		{name: "unannotated, only the CPU matches the Autopilot render", resources: cpuOnly, running: ptr.To(false), unannotated: true, wantCPU: "2", wantMem: "1Gi"},
+		// A CR that sets both requests renders the same on either type, so the
+		// comparison matches Autopilot on a Standard proxy; that guess must not
+		// be written down, or a later CR edit would render the Autopilot
+		// defaults while discovery still fails.
+		{name: "unannotated, the requests match both renders", resources: bothRequests, running: ptr.To(false), unannotated: true, wantCPU: "1", wantMem: "1Gi"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scheme := setupScheme()
+			agent := &agentv1alpha1.PlatformAgent{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-agent-proxy-mode", Namespace: "test-ns"},
+				Spec: agentv1alpha1.PlatformAgentSpec{
+					Harness: &agentv1alpha1.HarnessSpec{ProjectID: "test-project", Location: "us-central1", ClusterName: "test-cluster"},
+				},
+			}
+			if tt.resources != nil {
+				agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{CredentialProxy: &agentv1alpha1.CredentialProxySpec{Resources: tt.resources}}
+			}
+			objs := []client.Object{agent, shellSandboxKeysSecret(agent)}
+			if tt.running != nil {
+				source := agent.DeepCopy()
+				if tt.editedMeanwhile {
+					source.Spec.Deployment = nil
+					if tt.runningResources != nil {
+						source.Spec.Deployment = &agentv1alpha1.DeploymentSpec{CredentialProxy: &agentv1alpha1.CredentialProxySpec{Resources: tt.runningResources}}
+					}
+				}
+				live := buildCredentialProxyDeploymentForPlugins(source, "policy-hash", nil, allBrokerCallersOwned, credentialProxyProfileConfig{}, *tt.running)
+				if tt.unannotated {
+					delete(live.Annotations, credentialProxyClusterTypeAnnotation)
+				}
+				objs = append(objs, live)
+			}
+			cl := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(objs...).
+				WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+				WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+				Build()
+			failing := &mockAutopilotDiscovery{serverGroupsErr: fmt.Errorf("503 Service Unavailable")}
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(64), DiscoveryClient: failing}
+			req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(agent)}
+			ctx := context.Background()
+			for i := range 2 {
+				if _, err := r.Reconcile(ctx, req); err != nil {
+					t.Fatalf("Reconcile %d failed: %v", i+1, err)
+				}
+			}
+			if r.autopilotResolved {
+				t.Fatal("an undetermined discovery answer was cached")
+			}
+			dep := &appsv1.Deployment{}
+			if err := cl.Get(ctx, client.ObjectKey{Name: credentialBrokerName(agent), Namespace: agent.Namespace}, dep); err != nil {
+				t.Fatalf("get the proxy Deployment: %v", err)
+			}
+			proxy, found := findContainer(dep.Spec.Template.Spec, credentialProxyContainerName)
+			if !found {
+				t.Fatalf("no %s container in the proxy Deployment", credentialProxyContainerName)
+			}
+			assertQuantity(t, proxy.Resources.Requests, corev1.ResourceCPU, tt.wantCPU)
+			assertQuantity(t, proxy.Resources.Requests, corev1.ResourceMemory, tt.wantMem)
+			if got := dep.Annotations[credentialProxyClusterTypeAnnotation]; got != tt.wantType {
+				t.Errorf("%s = %q, want %q", credentialProxyClusterTypeAnnotation, got, tt.wantType)
+			}
+		})
 	}
 }

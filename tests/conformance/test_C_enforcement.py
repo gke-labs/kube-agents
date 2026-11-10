@@ -17,6 +17,7 @@ rather than the object assertion being allowed to stand in for it.
 from __future__ import annotations
 
 import ast
+import json
 import re
 import shutil
 import subprocess
@@ -241,7 +242,7 @@ class C1IsolationIsStructural(unittest.TestCase):
         relayed = json.loads(h.watcher_policy.project_cluster(answer))
         self.assertEqual(relayed["masterAuth"], {"clusterCaCertificate": "CA"})
 
-    def test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_and_named_reads(self) -> None:
+    def test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_named_reads_and_count_lists(self) -> None:
         policy = h.watcher_policy
         target = "kagents-dev/us-east4/fleet-a/"
         for method in ("POST", "PUT", "PATCH", "DELETE"):
@@ -283,6 +284,124 @@ class C1IsolationIsStructural(unittest.TestCase):
             decision = policy.evaluate_k8s("GET", target + path, {})
             self.assertEqual(decision.rule_id, policy.RULE_K8S_SECRETS, f"GET {path} is not refused as a Secret")
 
+    def test_C1_the_watcher_count_list_is_five_cluster_scoped_kinds_one_item_metadata_only(self) -> None:
+        """The watcher's fleet-shape probe counts workloads through the broker
+        as one-item lists plus the server's remainingItemCount. The rule that
+        admits them is held to three things at once: five cluster-scoped paths
+        and no other (no namespaced form, no Secret, no Node), a query that is
+        exactly limit=1 (a larger limit or a selector is a list, not a count),
+        and an Accept every range of which asks for a PartialObjectMetadataList
+        (one plain range beside it and the server may answer with the item's
+        whole body: a pod's environment, a CronJob's template)."""
+        policy = h.watcher_policy
+        target = "kagents-dev/us-east4/fleet-a/"
+        metadata = "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1"
+        one = {"limit": ["1"]}
+        five = {"api/v1/pods", "apis/apps/v1/deployments", "apis/apps/v1/statefulsets",
+                "apis/apps/v1/daemonsets", "apis/batch/v1/cronjobs"}
+        self.assertEqual(set(policy.COUNT_LIST_PATHS), five, "the count-list rule admits a path this test does not know")
+        for path in sorted(five):
+            decision = policy.evaluate_k8s("GET", target + path, one, metadata)
+            self.assertEqual(decision.rule_id, policy.RULE_K8S_COUNT_LIST, f"GET {path}?limit=1 is not a count list")
+        for path in (
+            "api/v1/namespaces/default/pods",
+            "apis/apps/v1/namespaces/default/deployments",
+            "api/v1/secrets",
+            "api/v1/nodes",
+            "api/v1/configmaps",
+            "apis/batch/v1/jobs",
+            "apis/example.com/v1/deployments",
+        ):
+            decision = policy.evaluate_k8s("GET", target + path, one, metadata)
+            self.assertFalse(decision.allowed, f"GET {path}?limit=1 is relayed as a count list")
+        for query in (
+            {}, {"limit": ["0"]}, {"limit": ["2"]}, {"limit": ["1"], "labelSelector": ["app=web"]}, {"limit": ["1"], "watch": ["true"]},
+        ):
+            decision = policy.evaluate_k8s("GET", target + "api/v1/pods", query, metadata)
+            self.assertEqual(decision.rule_id, policy.RULE_K8S_QUERY, f"GET api/v1/pods with {query} is relayed")
+        # The API server keeps the last duplicate parameter, so a second `as`
+        # behind the metadata one would answer a Table whose columns are spec
+        # and status; the parse is the server's, and a repeat is refused.
+        for accept in (
+            "",
+            "application/json",
+            "application/vnd.kubernetes.protobuf,application/json",
+            metadata + ",application/json",
+            metadata + ";as=Table",
+            metadata + ";as = Table",
+            "application/json;as=PartialObjectMetadataList",
+        ):
+            decision = policy.evaluate_k8s("GET", target + "api/v1/pods", one, accept)
+            self.assertEqual(decision.rule_id, policy.RULE_K8S_ACCEPT, f"GET api/v1/pods?limit=1 with Accept {accept!r} is relayed whole")
+
+    def test_C1_the_watcher_reads_a_named_pod_as_metadata_and_never_whole(self) -> None:
+        """The event watcher's owner lookup reads one named, namespaced Pod
+        through the broker. The rule that admits it holds a JSON Accept every
+        range of which asks for a PartialObjectMetadata, so the server answers
+        with the Pod's ObjectMeta and never its spec or status. That ObjectMeta
+        still carries every annotation (a client-side apply's manifest, env
+        values included) and managedFields, so the broker relays only its
+        projection: the controller ownerReference's kind and name when it is a
+        kind the lookup folds on, and the pod-template-hash label for a
+        ReplicaSet controller. A full Pod read, a Pod
+        list, a cluster-scoped or other-group Pod path and a Pod subresource
+        stay refused."""
+        policy = h.watcher_policy
+        target = "kagents-dev/us-east4/fleet-a/"
+        pod = "api/v1/namespaces/default/pods/web-0"
+        metadata = "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1"
+        self.assertEqual(policy.evaluate_k8s("GET", target + pod, {}, metadata).rule_id, policy.RULE_K8S_POD_METADATA)
+        self.assertNotIn(("", "pods"), policy.WATCHER_NAMED_READS, "a named Pod is readable whole")
+        for accept in (
+            "",
+            "application/json",
+            "application/vnd.kubernetes.protobuf,application/json",
+            metadata + ",application/json",
+            metadata + ";as=Table",
+            "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1",
+            "application/json;as=PartialObjectMetadata",
+        ):
+            decision = policy.evaluate_k8s("GET", target + pod, {}, accept)
+            self.assertEqual(decision.rule_id, policy.RULE_K8S_ACCEPT, f"GET {pod} with Accept {accept!r} is relayed whole")
+        for path in (
+            "api/v1/pods/web-0",
+            "apis/metrics.k8s.io/v1beta1/namespaces/default/pods/web-0",
+            pod + "/log",
+            pod + "/exec",
+            "api/v1/namespaces/default/secrets/db",
+        ):
+            self.assertFalse(policy.evaluate_k8s("GET", target + path, {}, metadata).allowed, f"GET {path} is relayed")
+        self.assertFalse(policy.evaluate_k8s("POST", target + pod, {}, metadata).allowed, "a Pod write is relayed")
+        for query in ({"resourceVersion": ["0"]}, {"watch": ["true"]}, {"fieldSelector": ["x"]}):
+            self.assertEqual(
+                policy.evaluate_k8s("GET", target + pod, query, metadata).rule_id, policy.RULE_K8S_QUERY,
+                f"GET {pod} with {query} is relayed",
+            )
+        upstream = {
+            "kind": "PartialObjectMetadata",
+            "apiVersion": "meta.k8s.io/v1",
+            "metadata": {
+                "name": "web-0", "namespace": "default", "uid": "u",
+                "labels": {"pod-template-hash": "abc", "app": "web"},
+                "annotations": {"kubectl.kubernetes.io/last-applied-configuration": '{"env":"hunter2"}'},
+                "managedFields": [{"manager": "kubectl"}],
+                "ownerReferences": [{"kind": "StatefulSet", "name": "web", "controller": True, "uid": "o"}],
+            },
+        }
+        projected = json.loads(policy.project_pod_metadata(json.dumps(upstream).encode()))
+        self.assertEqual(
+            projected, {"metadata": {"ownerReferences": [{"kind": "StatefulSet", "name": "web", "controller": True}]}},
+            "the broker relays more of a Pod than its controller",
+        )
+        upstream["metadata"]["ownerReferences"] = [{"kind": "ReplicaSet", "name": "web-abc", "controller": True}]
+        projected = json.loads(policy.project_pod_metadata(json.dumps(upstream).encode()))
+        self.assertEqual(projected["metadata"].get("labels"), {"pod-template-hash": "abc"}, "a Pod label beyond the hash is relayed")
+        upstream["metadata"]["ownerReferences"] = [{"kind": "Node", "name": "node-a", "controller": True}]
+        self.assertEqual(
+            json.loads(policy.project_pod_metadata(json.dumps(upstream).encode())), {"metadata": {}},
+            "the broker relays a controller the owner lookup does not fold on",
+        )
+
     def test_C1_the_watcher_pubsub_routes_reach_only_the_configured_subscription(self) -> None:
         policy = h.watcher_policy
         configured = "projects/kagents-dev/subscriptions/platform-agent-drift-audit-sub"
@@ -304,6 +423,69 @@ class C1IsolationIsStructural(unittest.TestCase):
         proxy = h.credential_proxy
         for prefix in (h.watcher_policy.WATCHER_GCP_PREFIX, h.watcher_policy.WATCHER_K8S_PREFIX):
             self.assertEqual(proxy.required_roles(prefix + "x"), (proxy.CALLER_ROLE_WATCHER,), prefix)
+
+    def test_C1_the_watcher_reads_by_name_only_the_reconciler_kinds_the_agent_can_read(self) -> None:
+        """The drift join's custom-resource kinds are the agent's own grant.
+
+        The broker lets the drift detector's join read a GitOps reconciler's
+        sync object by name (watcher_policy.RECONCILER_NAMED_READS), and the
+        operator grants the agent's minimal ClusterRole get/list/watch on the
+        same kinds (#2987). Two modules, so no single test compiles both: a
+        kind added to either side alone either relays an object the agent was
+        never granted or leaves a granted kind unenriched. Every custom-resource
+        kind (a group not on the built-in list below) in the rendered minimal
+        role, on every fixture, is a reconciler kind the join may read, and the
+        reverse, each with get.
+        """
+        expected = set(h.watcher_policy.RECONCILER_NAMED_READS)
+        self.assertTrue(expected, "the reconciler table is empty")
+
+        # Built-in groups by name, not by suffix: a CRD can live under
+        # *.k8s.io too (gateway.networking.k8s.io, snapshot.storage.k8s.io),
+        # and a suffix rule would wave it through on both sides. A built-in
+        # group new to the role or the table fails loudly here, and the fix
+        # is to add it to this list.
+        builtin = frozenset({
+            "", "admissionregistration.k8s.io", "apiextensions.k8s.io", "apps", "autoscaling",
+            "batch", "metrics.k8s.io", "networking.k8s.io", "policy", "rbac.authorization.k8s.io",
+        })
+
+        def custom(group: str) -> bool:
+            return group not in builtin
+
+        # The broker enforces WATCHER_NAMED_READS; the reconciler table is the
+        # only custom-resource part of it, and that is what keeps the two in
+        # step rather than a kind added to the wider table directly.
+        relayed = {kind for kind in h.watcher_policy.WATCHER_NAMED_READS if custom(kind[0])}
+        self.assertEqual(expected, relayed, "a custom-resource kind is relayed outside RECONCILER_NAMED_READS")
+
+        fixtures = h.golden_documents()
+        self.assertTrue(fixtures, "no golden fixtures to read")
+        for fixture, documents in fixtures.items():
+            roles = [
+                d for d in h.objects_of_kind(documents, "ClusterRole")
+                if d["metadata"]["name"].startswith("kubeagents:minimal:")
+            ]
+            with self.subTest(fixture=fixture):
+                self.assertEqual(len(roles), 1, "no single minimal ClusterRole rendered")
+                rules = roles[0].get("rules") or []
+                for rule in rules:
+                    self.assertNotIn("*", rule.get("apiGroups") or [], "a wildcard API group in the minimal role")
+                granted = {
+                    (group, resource)
+                    for rule in rules
+                    if {"get", "*"} & set(rule.get("verbs") or [])
+                    for group in rule.get("apiGroups") or []
+                    if custom(group)
+                    for resource in rule.get("resources") or []
+                }
+                self.assertEqual(
+                    expected,
+                    granted,
+                    "the agent's custom-resource reads and the drift join's reconciler kinds differ. "
+                    "If the role gained a built-in group, add it to builtin here; otherwise, unless the kind is a GitOps sync object, "
+                    "do not widen RECONCILER_NAMED_READS, which widens what the broker relays",
+                )
 
     def test_C1_the_platform_pubsub_relay_reaches_only_the_configured_subscriptions(self) -> None:
         """The gateway's Pub/Sub platform adapter pulls through the broker, and only its own subscriptions.
@@ -1568,7 +1750,7 @@ class C1IsolationIsStructural(unittest.TestCase):
             self.assertNotRegex(body, magic_number, f"{what} hand-spells the delegate text cap")
 
     def test_C1_the_delegate_tool_schema_names_agree_with_the_wire_shape(self) -> None:
-        """The MCP tool schema and `lib.DelegateRequest` spell the same two fields.
+        """The MCP tool schema and `lib.DelegateRequest` spell the same fields, bar `parameters`.
 
         The session's harness speaks MCP to the worker-adapter's own server,
         which answers `tools/list` with `delegateToolSchema` -- a
@@ -1585,12 +1767,23 @@ class C1IsolationIsStructural(unittest.TestCase):
         """
         payload = h.text("a2a_payload")
         struct = payload.split("type DelegateRequest struct {")[1].split("\n}")[0]
-        tags = sorted(re.findall(r'`json:"(\w+)"`', struct))
+        # A tag's name runs to its first comma or quote: `json:"parameters,omitempty"`.
+        all_tags = sorted(re.findall(r'`json:"(\w+)[,"]', struct))
         self.assertEqual(
-            ["addressee", "text"],
-            tags,
+            ["addressee", "parameters", "text"],
+            all_tags,
             "lib.DelegateRequest's wire shape changed; this test compared nothing",
         )
+        # `parameters` is on the wire struct but not the tool: the worker
+        # adapter refuses a request carrying any until a gateway reads them
+        # (validateDelegate), so the model is not offered the field. The
+        # exemption holds only while that refusal does.
+        self.assertIn(
+            "if len(req.Parameters) > 0 {",
+            h.text("a2a_worker_adapter_delegate"),
+            "the adapter no longer refuses delegate parameters; declare them in delegateToolSchema",
+        )
+        tags = [t for t in all_tags if t != "parameters"]
 
         mcp = h.text("a2a_worker_adapter_mcp")
         schema = mcp.split("var delegateToolSchema")[1].split("\n}\n")[0]
@@ -2748,6 +2941,35 @@ class C5PrivilegedControllersAreBounded(unittest.TestCase):
         chart = h.text("chart_admission_policy")
         self.assertIn("failurePolicy: Fail", chart)
         self.assertNotIn("failurePolicy: Ignore", chart)
+
+    def test_C5_the_gateway_pod_policy_holds_its_pods_to_the_session_account(self) -> None:
+        """The A2A gateway's `create` on pods is confined by admission, not by RBAC.
+
+        RBAC cannot see a PodSpec, so buildA2AGatewayRole's grant would let a
+        compromised gateway run a pod as any ServiceAccount in its namespace.
+        kube-agents-a2a-gateway-pod holds those pods to `<name>-a2a-session`
+        and the session token audiences. This is the static half: the policy
+        fails closed, denies, keeps the identity rule, and is tied to the
+        chart copy. k8s-operator's a2a_gateway_pod_policy_envtest_test.go runs
+        it in an API server.
+        """
+        documents = h.yaml_documents("gateway_pod_policy")
+        policy = next(d for d in documents if d.get("kind") == "ValidatingAdmissionPolicy")
+        binding = next(d for d in documents if d.get("kind") == "ValidatingAdmissionPolicyBinding")
+        self.assertEqual("Fail", policy["spec"].get("failurePolicy"))
+        self.assertEqual(["Deny"], binding["spec"].get("validationActions"))
+        self.assertEqual(policy["metadata"]["name"], binding["spec"]["policyName"])
+        self.assertTrue(
+            any(
+                "object.spec.serviceAccountName == variables.sessionAccount" in v["expression"]
+                for v in policy["spec"]["validations"]
+            ),
+            "the policy no longer holds the gateway's pods to the session account",
+        )
+        sync = (h.REPO_ROOT / "hack/sync-chart-manifests.sh").read_text()
+        for tied in (h.SOURCES["gateway_pod_policy"].path, h.SOURCES["chart_gateway_pod_policy"].path):
+            self.assertIn(tied, sync, "the sync script no longer ties the chart copy to the source")
+        self.assertNotIn("failurePolicy: Ignore", h.text("chart_gateway_pod_policy"))
 
 
 def _executor():

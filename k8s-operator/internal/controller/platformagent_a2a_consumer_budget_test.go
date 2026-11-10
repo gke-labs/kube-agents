@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
 	batchv1 "k8s.io/api/batch/v1"
@@ -751,7 +752,7 @@ func TestProvisionFailureStatusNamesBothInputs(t *testing.T) {
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
-	state, err := r.reconcileA2A(context.Background(), agent)
+	state, err := r.reconcileA2A(context.Background(), agent, homeChannelRecord{})
 	if err != nil {
 		t.Fatalf("reconcileA2A: %v", err)
 	}
@@ -846,8 +847,12 @@ func TestProvisionReportsATasksStreamOlderThanItsRender(t *testing.T) {
 	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{MaxSessions: &sessions}}
 
 	for _, tc := range []struct {
-		name       string
-		liveJSON   string
+		name     string
+		liveJSON string
+		// topicsJSON is the `stream info TOPICS-STATE --json` answer; empty
+		// means the render's own subject list, which the subject check
+		// passes over in silence.
+		topicsJSON string
 		wantExit   int
 		wantStderr []string
 		notStderr  []string
@@ -1030,11 +1035,63 @@ func TestProvisionReportsATasksStreamOlderThanItsRender(t *testing.T) {
 			wantExit:   1,
 			wantStderr: []string{"could not read max_msgs_per_subject"},
 		},
+		{
+			// The TOPICS-STATE half of the closing block, on the live
+			// stream's own answer rather than a key smuggled into the
+			// TASKS one: an install whose stream predates the
+			// topology-skew topic is told the edit, with its current
+			// subjects preserved, and the run stays clean (exit 0).
+			name:       "an existing TOPICS-STATE missing topology-skew prints the stream edit note preserving existing subjects",
+			liveJSON:   `{"name":"TASKS","max_consumers":332,"max_msgs_per_subject":4096}`,
+			topicsJSON: topicsStateInfoJSON("a2a.topics.agent.platform.upgrade-readiness", "a2a.topics.shared.blueprint", "a2a.topics.shared.probe", "a2a.topics.custom.extra"),
+			wantExit:   0,
+			wantStderr: []string{"NOTE: TOPICS-STATE does not carry subject a2a.topics.agent.platform.topology-skew", `nats stream edit TOPICS-STATE --subjects="a2a.topics.agent.platform.upgrade-readiness,a2a.topics.shared.blueprint,a2a.topics.shared.probe,a2a.topics.custom.extra,a2a.topics.agent.platform.topology-skew"`},
+		},
+		{
+			name:       "an existing TOPICS-STATE that already carries topology-skew prints no note",
+			liveJSON:   `{"name":"TASKS","max_consumers":332,"max_msgs_per_subject":4096}`,
+			topicsJSON: topicsStateInfoJSON("a2a.topics.agent.platform.upgrade-readiness", "a2a.topics.agent.platform.topology-skew", "a2a.topics.shared.blueprint", "a2a.topics.shared.probe"),
+			wantExit:   0,
+			notStderr:  []string{"NOTE: TOPICS-STATE"},
+		},
+		{
+			name:       "an existing TOPICS-STATE covered by a platform wildcard prints no note",
+			liveJSON:   `{"name":"TASKS","max_consumers":332,"max_msgs_per_subject":4096}`,
+			topicsJSON: topicsStateInfoJSON("a2a.topics.agent.platform.>", "a2a.topics.shared.>"),
+			wantExit:   0,
+			notStderr:  []string{"NOTE: TOPICS-STATE"},
+		},
+		{
+			// The same stance as the two TASKS extractors: an answer the
+			// subject extractor cannot read fails the run rather than
+			// passing it as "nothing to report". Exit 1, the retryable
+			// side, for the same reason as theirs.
+			name:       "an answer the TOPICS-STATE subject extractor cannot read is retryable",
+			liveJSON:   `{"name":"TASKS","max_consumers":332,"max_msgs_per_subject":4096}`,
+			topicsJSON: `{"config":{"name":"TOPICS-STATE"},"state":{"messages":0}}`,
+			wantExit:   1,
+			wantStderr: []string{"could not read subjects off the TOPICS-STATE stream"},
+		},
+		{
+			// An empty subject list reads the same way: it is a mirror or
+			// a sourced stream, which this render does not create, and
+			// the check does not know what to append to.
+			name:       "a TOPICS-STATE with an empty subject list is not a stream this render knows",
+			liveJSON:   `{"name":"TASKS","max_consumers":332,"max_msgs_per_subject":4096}`,
+			topicsJSON: topicsStateInfoJSON(),
+			wantExit:   1,
+			wantStderr: []string{"could not read subjects off the TOPICS-STATE stream"},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
 			script := stageProvisionScript(t, dir, a2aProvisionScript(agent))
-			callLog := stubNats(t, dir, tc.liveJSON)
+			var callLog string
+			if tc.topicsJSON != "" {
+				callLog = stubNatsWithTopicsState(t, dir, tc.liveJSON, tc.topicsJSON)
+			} else {
+				callLog = stubNats(t, dir, tc.liveJSON)
+			}
 
 			cmd := exec.Command(bash, script)
 			cmd.Env = append(os.Environ(),
@@ -1148,8 +1205,43 @@ func stageProvisionScript(t *testing.T, dir, script string) string {
 // already existing — the live-install shape, where the create-only guards all
 // short-circuit — and answers `stream info TASKS --json` with liveJSON. Every
 // invocation is appended to a log the caller reads, which is how the ordering
-// assertions below know how far the script got before it exited.
+// assertions below know how far the script got before it exited. The
+// TOPICS-STATE answer carries the subjects this render creates, so the
+// closing block's subject check stays out of a test about something else;
+// stubNatsWithTopicsState is for the tests that are about it.
 func stubNats(t *testing.T, dir, liveJSON string) string {
+	t.Helper()
+	return stubNatsWithTopicsState(t, dir, liveJSON, topicsStateInfoJSON("a2a.topics.agent.platform.upgrade-readiness", a2aTopologySkewSubject, "a2a.topics.shared.blueprint", "a2a.topics.shared.probe"))
+}
+
+// topicsStateInfoJSON is a `stream info TOPICS-STATE --json` answer with the
+// given subject list, in the shape natscli prints (the list under config).
+func topicsStateInfoJSON(subjects ...string) string {
+	quoted := make([]string, 0, len(subjects))
+	for _, s := range subjects {
+		quoted = append(quoted, strconv.Quote(s))
+	}
+	return `{"config":{"name":"TOPICS-STATE","subjects":[` + strings.Join(quoted, ",") + `]},"state":{"messages":0}}`
+}
+
+// stubNatsWithTopicsState is stubNats with the `stream info TOPICS-STATE
+// --json` answer chosen by the caller: the stub answers per stream, as the
+// real CLI does, so a test can shape one stream's answer without the other's.
+func stubNatsWithTopicsState(t *testing.T, dir, liveJSON, topicsStateJSON string) string {
+	t.Helper()
+	return stubNatsAnswering(t, dir, liveJSON, topicsStateJSON, profileSubmitsInfoJSON(a2aProfileSubmitMaxAge))
+}
+
+// profileSubmitsInfoJSON is a `stream info PROFILE_SUBMITS --json` answer
+// with the given max age, in the shape natscli prints (nanoseconds, under
+// config). Zero is no age limit.
+func profileSubmitsInfoJSON(maxAge time.Duration) string {
+	return fmt.Sprintf(`{"config":{"name":"PROFILE_SUBMITS","subjects":["a2a.submit.>"],"max_age":%d},"state":{"messages":0}}`, maxAge.Nanoseconds())
+}
+
+// stubNatsAnswering is stubNats with the TOPICS-STATE and PROFILE_SUBMITS
+// answers chosen by the caller; every other stream gets liveJSON.
+func stubNatsAnswering(t *testing.T, dir, liveJSON, topicsStateJSON, submitsJSON string) string {
 	t.Helper()
 	bin := filepath.Join(dir, "bin")
 	if err := os.MkdirAll(bin, 0o700); err != nil {
@@ -1158,16 +1250,32 @@ func stubNats(t *testing.T, dir, liveJSON string) string {
 	log := filepath.Join(dir, "nats-calls.log")
 	stub := fmt.Sprintf(`#!/bin/sh
 echo "$*" >> %q
+json=0
+stream=""
 for a in "$@"; do
-  if [ "$a" = "--json" ]; then
+  case "$a" in
+    --json) json=1 ;;
+    TASKS|TOPICS-STATE|DIRECTORY|TOPICS-JOURNAL|PROFILE_SUBMITS) stream="$a" ;;
+  esac
+done
+if [ "$json" = "1" ]; then
+  if [ "$stream" = "TOPICS-STATE" ]; then
     cat <<'JSON'
 %s
 JSON
-    exit 0
+  elif [ "$stream" = "PROFILE_SUBMITS" ]; then
+    cat <<'JSON'
+%s
+JSON
+  else
+    cat <<'JSON'
+%s
+JSON
   fi
-done
+  exit 0
+fi
 exit 0
-`, log, liveJSON)
+`, log, topicsStateJSON, submitsJSON, liveJSON)
 	if err := os.WriteFile(filepath.Join(bin, "nats"), []byte(stub), 0o700); err != nil {
 		t.Fatal(err)
 	}

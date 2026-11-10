@@ -411,11 +411,69 @@ class GitTrustTest(unittest.TestCase):
         with mock.patch.object(providers, "load_forge_entries", side_effect=ValueError("bad")):
             self.assertEqual((), credential_proxy._configured_forge_entries())
 
+    @unittest.skipUnless(shutil.which("git"), "git is needed to read the layer back")
+    def test_a_ported_gitea_forge_pins_its_ca_and_source_by_host_and_port(self):
+        ported = (
+            {
+                "provider": "gitea",
+                "name": "gitea-corp",
+                "host": "gitea.corp",
+                "port": 8443,
+                "token_path": "/t",
+                "allowed_paths": ("acme",),
+                "ca_file": "/ca/gitea.crt",
+                "ca_source": "the Secret gitea-ca or its key ca.crt",
+            },
+        )
+        entries = credential_proxy._ca_reading_entries(ported)
+        self.assertEqual(
+            (
+                {
+                    "host": "gitea.corp:8443",
+                    "ca_file": "/ca/gitea.crt",
+                    "ca_source": "the Secret gitea-ca or its key ca.crt",
+                },
+            ),
+            entries,
+        )
+        config = credential_proxy.forge_ca_git_config(entries)
+        self.assertEqual(
+            (
+                ("http.https://gitea.corp:8443/.sslCAInfo", "/ca/gitea.crt"),
+                ("http.https://gitea.corp:8443/.followRedirects", "false"),
+            ),
+            config,
+        )
+        sources = credential_proxy.forge_ca_sources(entries)
+        self.assertEqual({"gitea.corp:8443": "the Secret gitea-ca or its key ca.crt"}, sources)
+
+        environment = {
+            **os.environ,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            **credential_proxy._git_forced_config_environment(config),
+        }
+        result = subprocess.run(
+            ["git", "config", "--get-urlmatch", "http.sslCAInfo", "https://gitea.corp:8443/acme/infra.git"],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual("/ca/gitea.crt", result.stdout.strip())
+
+        refusal = providers.tls_refusal(
+            "fatal: unable to access 'https://gitea.corp:8443/acme/infra.git/': "
+            "Problem with the SSL CA cert (path? access rights?)",
+            sources,
+        )
+        self.assertIn("the Secret gitea-ca or its key ca.crt is missing", refusal.fields["detail"])
+
 
 @unittest.skipUnless(OPENSSL and shutil.which("git"), "openssl and git are needed")
 class GitLoopbackTrustTest(unittest.TestCase):
-    """The pin on the paths that clone and push: `execute_vcs_git` and
-    `execute_workspace_git`, which rebuild the forced layer with the caller's
+    """The pin on the path that clones and pushes: `execute_vcs_git`, which
+    rebuilds the forced layer with the caller's
     credential config ahead of it. A real git talks TLS to a
     loopback server that a test CA signed: with the pin the handshake passes,
     and without it git refuses the certificate."""
@@ -437,16 +495,14 @@ class GitLoopbackTrustTest(unittest.TestCase):
              "ca_source": "the Secret test-ca or its key ca.crt"},
         ) if pinned else ()
         state = Path(self.tmp.name) / ("pinned" if pinned else "bare")
-        with mock.patch.object(credential_proxy, "_configured_forge_entries", return_value=entries), \
-                mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_CONTENT_WORKSPACE": "1"}):
+        with mock.patch.object(credential_proxy, "_configured_forge_entries", return_value=entries):
             executor = credential_proxy.CommandExecutor(
                 timeout_seconds=20, max_output_bytes=1 << 16, state_dir=str(state), scoped_pool=None
             )
         executor.vcs_root.mkdir(parents=True, exist_ok=True)
-        executor.content_workspace_root.mkdir(parents=True, exist_ok=True)
         return executor
 
-    # A credential's own config rides ahead of the pins on these paths; one is
+    # A credential's own config rides ahead of the pins on this path; one is
     # passed so the layer is rebuilt the way a stored token's clone rebuilds it.
     CREDENTIAL_CONFIG = (("credential.helper", ""),)
 
@@ -460,18 +516,6 @@ class GitLoopbackTrustTest(unittest.TestCase):
         self.assertIsNone(providers.classify_tls(pinned.stderr)[0] or None, pinned.stderr)
         bare = self.vcs_ls_remote(self.executor(pinned=False))
         self.assertEqual("untrusted", providers.classify_tls(bare.stderr)[0], bare.stderr)
-
-    def test_the_workspace_path_trusts_the_pinned_ca(self):
-        for pinned, expect in ((True, ""), (False, "untrusted")):
-            with self.subTest(pinned=pinned):
-                executor = self.executor(pinned=pinned)
-                target = executor.content_workspace_root / "clone"
-                result = executor.execute_workspace_git(
-                    ["git", "clone", "--quiet", self.url, str(target / "repo")],
-                    executor.content_workspace_root,
-                    config=self.CREDENTIAL_CONFIG,
-                )
-                self.assertEqual(expect, providers.classify_tls(result.stderr)[0], result.stderr)
 
     def test_a_missing_ca_file_names_its_secret_and_key(self):
         executor = self.executor(pinned=True)
@@ -504,39 +548,10 @@ class OpenerTest(unittest.TestCase):
 class UncheckedGitPathsTest(unittest.TestCase):
     """git runs that read a failure themselves (`check=False`) answer a
     certificate by its cause too, not as "push failed" or a retryable call
-    failure: the content workspace's push, and the version-control verbs'
-    `ls-remote` reads."""
+    failure: the version-control verbs' `ls-remote` reads."""
 
     UNTRUSTED = ("fatal: unable to access 'https://gitlab.internal/g/p.git/': server verification failed: "
                  "certificate signer not trusted. (CAfile: /etc/ssl/certs/ca-certificates.crt CRLfile: none)")
-
-    def test_a_push_answers_a_certificate_by_its_cause(self):
-        import content_workspace
-
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        root = Path(tmp.name)
-        (root / "agent").mkdir()
-
-        class Result:
-            exit_code = 128
-            stdout = ""
-            stderr = self.UNTRUSTED
-
-        store = content_workspace.ContentWorkspaceStore(
-            root / "trees", root / "agent", lambda argv, cwd, **kwargs: Result()
-        )
-        handle = "a" * 32
-        tree = store.tree_root / handle / "repo"
-        tree.mkdir(parents=True)
-        store._workspaces[handle] = content_workspace.Workspace(
-            handle=handle, repo="gitlab.internal/g/p", tree=tree, base="main", base_sha="1" * 40,
-            branch="platform-agent/fix", head="2" * 40, default_branch="main",
-        )
-        with self.assertRaises(content_workspace.TlsUntrusted) as caught:
-            store.push(handle, "platform-agent/fix")
-        self.assertEqual("FORGE_TLS_UNTRUSTED", caught.exception.code)
-        self.assertIn("`git push` failed", str(caught.exception))
 
     def _bound(self, stderr: str, returncode: int = 128):
         import types
@@ -689,32 +704,6 @@ class CertificateFailureTest(unittest.TestCase):
     def test_other_failures_are_not(self):
         self.assertEqual(("", ""), providers.classify_tls("fatal: could not read Username for 'https://h': No such device"))
         self.assertEqual(("", ""), providers.classify_tls(""))
-
-    def test_the_content_workspace_answers_a_certificate_by_name(self):
-        import content_workspace
-
-        stderr = (
-            "fatal: unable to access 'https://gitlab.internal/g/p.git/': server verification failed: "
-            "certificate signer not trusted."
-        )
-
-        class Result:
-            exit_code = 128
-            stdout = ""
-
-        Result.stderr = stderr
-        store = content_workspace.ContentWorkspaceStore.__new__(content_workspace.ContentWorkspaceStore)
-        store._runner = lambda argv, cwd, **kwargs: Result()
-        store._redact = lambda text: str(text)
-        store._tls_refusal = providers.tls_refusal
-        with self.assertRaises(content_workspace.TlsUntrusted) as caught:
-            store._git(Path("/tmp"), ["clone", "--quiet", "https://gitlab.internal/g/p.git", "repo"])
-        self.assertEqual("FORGE_TLS_UNTRUSTED", caught.exception.code)
-        self.assertEqual(502, caught.exception.status)
-        self.assertIn("caBundleRef", str(caught.exception))
-        Result.stderr = "fatal: repository not found"
-        with self.assertRaises(content_workspace.GitFailed):
-            store._git(Path("/tmp"), ["clone", "--quiet", "https://gitlab.internal/g/p.git", "repo"])
 
 
 if __name__ == "__main__":

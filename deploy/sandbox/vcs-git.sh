@@ -7,7 +7,11 @@
 # `core.hooksPath` would point git at one; `-c` outranks every config file, so
 # the empty, root-owned directory named here is where git looks whatever the
 # repository says. `core.fsmonitor` is the other setting that names a program
-# git runs on an ordinary `status`.
+# git runs on an ordinary `status`. `safe.bareRepository=explicit` stops git
+# from opening a directory of plain files laid out as a bare repository (HEAD,
+# objects/, refs/, config) as one, and so from obeying that `config`: a
+# snapshot of a repository nobody registered is such a directory if its tree
+# says so.
 #
 # Not a boundary. A repository-local `filter.<name>.clean` still executes, since
 # no `-c` can unset a name it does not know, and the agent can call the binary
@@ -19,4 +23,5 @@ exec /opt/vcs/libexec/git \
     -c core.hooksPath=/opt/vcs/share/no-hooks \
     -c core.fsmonitor=false \
     -c protocol.ext.allow=never \
+    -c safe.bareRepository=explicit \
     "$@"

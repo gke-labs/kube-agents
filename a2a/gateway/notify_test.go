@@ -25,10 +25,14 @@ type fakeNotifyPoster struct {
 	posts   []notifyPost
 	failAt  int // 1-based post index to fail; 0 never
 	landsIn string
-	noName  bool // answer with an empty message name
+	noName  bool              // answer with an empty message name
+	before  func(text string) // runs before each post lands, outside the lock
 }
 
 func (f *fakeNotifyPoster) PostNotify(space, thread, text string) (string, string, error) {
+	if f.before != nil {
+		f.before(text)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.posts = append(f.posts, notifyPost{space, thread, text})
@@ -76,12 +80,18 @@ func serveJSON(t *testing.T, n *Notifier, req lib.NotifyRequest) lib.NotifyReply
 // returns the one answer it gives.
 func serveBytes(t *testing.T, n *Notifier, body []byte) lib.NotifyReply {
 	t.Helper()
-	req, refusal := n.validate(body)
+	req, home, refusal := n.validate(body)
 	if refusal != nil {
+		if refusal.Kept {
+			// As handle does: the keeper answers once the store has the post.
+			done := make(chan lib.NotifyReply, 1)
+			n.keepRefused(req, func(r lib.NotifyReply) { done <- r })
+			return <-done
+		}
 		return *refusal
 	}
 	var answers []lib.NotifyReply
-	n.post(notifyJob{req: req, answer: func(r lib.NotifyReply) { answers = append(answers, r) }})
+	n.post(notifyJob{req: req, home: home, answer: func(r lib.NotifyReply) { answers = append(answers, r) }})
 	if len(answers) != 1 {
 		t.Fatalf("post answered %d times, want exactly once: %+v", len(answers), answers)
 	}
@@ -371,8 +381,8 @@ func TestStopAnswersEveryAcceptedRequest(t *testing.T) {
 		}
 		var got lib.NotifyReply
 		_ = json.Unmarshal(msg.Data, &got)
-		if got.Error != notifyStoppingRefusal {
-			t.Errorf("queued answer %d = %+v, want the stopping refusal", i+1, got)
+		if got.Error != notifyStoppingRefusal || !got.Retry {
+			t.Errorf("queued answer %d = %+v, want the stopping refusal, marked retry", i+1, got)
 		}
 	}
 	close(poster.release)
@@ -395,10 +405,20 @@ func TestStopAnswersEveryAcceptedRequest(t *testing.T) {
 	n.handle(&nats.Msg{Subject: lib.NotifySubjectGchat, Reply: lib.NotifyReplyPrefix + "late", Data: body})
 }
 
+// routeArmWait bounds how long TestRunServesUntilItsContextEnds probes for
+// the route Run binds, in 250 ms requests; routeStopWait is how long Run
+// then has to return once its context ends. The test's context outlives
+// both, since Run stops serving the moment it ends and a probe after that
+// can only fail.
+const (
+	routeArmWait  = 30 * time.Second
+	routeStopWait = 5 * time.Second
+)
+
 // Run binds and serves, and returns when its context ends.
 func TestRunServesUntilItsContextEnds(t *testing.T) {
 	s := startServer(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), routeArmWait+2*routeStopWait)
 	defer cancel()
 	client, err := lib.Connect(ctx, s.ClientURL(), lib.WithName("notify-gateway"))
 	if err != nil {
@@ -419,8 +439,10 @@ func TestRunServesUntilItsContextEnds(t *testing.T) {
 	}
 	defer agent.Close()
 	body, _ := json.Marshal(lib.NotifyRequest{Text: "x"})
+	// Run binds its route on its own goroutine; under the race detector on
+	// a loaded runner that took longer than the 5 s twenty probes gave it.
 	var answered bool
-	for i := 0; i < 20 && !answered; i++ {
+	for deadline := time.Now().Add(routeArmWait); !answered && time.Now().Before(deadline); {
 		in, _ := agent.SubscribeSync(lib.NotifyReplyPrefix + "run")
 		_ = agent.PublishRequest(lib.NotifySubjectGchat, lib.NotifyReplyPrefix+"run", body)
 		if _, err := in.NextMsg(250 * time.Millisecond); err == nil {
@@ -434,7 +456,7 @@ func TestRunServesUntilItsContextEnds(t *testing.T) {
 	stopRun()
 	select {
 	case <-done:
-	case <-time.After(5 * time.Second):
+	case <-time.After(routeStopWait):
 		t.Fatal("Run did not return after its context ended")
 	}
 }
@@ -644,7 +666,7 @@ func TestNotifyRefusesAConversationItCannotMatch(t *testing.T) {
 		{"no session record", &fakeConversations{contexts: map[string]string{}},
 			lib.NotifyRequest{Conversation: testConversation, ContextID: testContext}, notifyConversationRefused},
 		{"an unreadable record", &fakeConversations{err: errors.New("kv down")},
-			lib.NotifyRequest{Conversation: testConversation, ContextID: testContext}, notifyConversationRefused},
+			lib.NotifyRequest{Conversation: testConversation, ContextID: testContext}, notifyRecordUnreadable},
 		{"another backend's conversation", &fakeConversations{contexts: map[string]string{"slack:C1/1.2": testContext}},
 			lib.NotifyRequest{Conversation: "slack:C1/1.2", ContextID: testContext}, "not on this route's backend"},
 		{"no context id", &fakeConversations{contexts: map[string]string{testConversation: ""}},
@@ -671,6 +693,30 @@ func TestNotifyRefusesAConversationItCannotMatch(t *testing.T) {
 	}
 }
 
+// A record that can't be read, or a stopping gateway, is a refusal the
+// sender waits out (Retry), and says nothing about the conversation; no
+// record or the wrong context is the one refusal, and not a retry.
+func TestATransientRefusalAsksTheSenderToWait(t *testing.T) {
+	n := newTestNotifier(t, &fakeNotifyPoster{})
+	n.SetConversations(&fakeConversations{err: errors.New("kv down")})
+	got := serveJSON(t, n, lib.NotifyRequest{Text: "report", Conversation: testConversation, ContextID: testContext})
+	if !got.Retry || got.Error != notifyRecordUnreadable {
+		t.Fatalf("unreadable record: reply = %+v, want a retry", got)
+	}
+	n = newTestNotifier(t, &fakeNotifyPoster{})
+	n.SetConversations(&fakeConversations{contexts: map[string]string{}})
+	got = serveJSON(t, n, lib.NotifyRequest{Text: "report", Conversation: testConversation, ContextID: testContext})
+	if got.Retry || got.Error != notifyConversationRefused {
+		t.Fatalf("no record: reply = %+v, want the one refusal and no retry", got)
+	}
+	n = newTestNotifier(t, &fakeNotifyPoster{})
+	n.SetConversations(&fakeConversations{err: fmt.Errorf("session x: %w: bad json", errRecordUndecodable)})
+	got = serveJSON(t, n, lib.NotifyRequest{Text: "report", Conversation: testConversation, ContextID: testContext})
+	if got.Retry || got.Error != notifyConversationRefused {
+		t.Fatalf("a record that doesn't decode: reply = %+v, want the one refusal and no retry", got)
+	}
+}
+
 // With no home channel the route serves conversation requests and refuses
 // a home post.
 func TestNotifyWithNoHomeServesConversationsOnly(t *testing.T) {
@@ -680,7 +726,7 @@ func TestNotifyWithNoHomeServesConversationsOnly(t *testing.T) {
 	}
 	conv := &fakeConversations{contexts: map[string]string{testConversation: testContext}}
 	n.SetConversations(conv)
-	if got := serveJSON(t, n, lib.NotifyRequest{Text: "alert"}); got.Error != notifyNoHome {
+	if got := serveJSON(t, n, lib.NotifyRequest{Text: "alert"}); got.Error != notifyNoHome || got.Kept {
 		t.Fatalf("home post reply = %+v, want refused", got)
 	}
 	if got := serveJSON(t, n, lib.NotifyRequest{Text: "3 nodes", Conversation: testConversation, ContextID: testContext}); got.Error != "" {
@@ -864,8 +910,8 @@ func TestConversationLookupDoesNotPostWhenStopping(t *testing.T) {
 	if err := json.Unmarshal(msg.Data, &got); err != nil {
 		t.Fatalf("unmarshaling reply: %v", err)
 	}
-	if got.Error != notifyStoppingRefusal {
-		t.Fatalf("reply error = %q, want %q", got.Error, notifyStoppingRefusal)
+	if got.Error != notifyStoppingRefusal || !got.Retry {
+		t.Fatalf("reply = %+v, want %q marked retry", got, notifyStoppingRefusal)
 	}
 
 	select {
@@ -878,5 +924,96 @@ func TestConversationLookupDoesNotPostWhenStopping(t *testing.T) {
 	defer conv.mu.Unlock()
 	if len(conv.posts) != 0 {
 		t.Fatalf("conv.posts = %v, want 0 posts after Stop", conv.posts)
+	}
+}
+
+// TestARecordThatDoesntDecodeIsMarkedAsSuch: the registry marks a record that
+// exists and doesn't decode, so the notify route can tell it from an
+// unreachable bucket.
+func TestARecordThatDoesntDecodeIsMarkedAsSuch(t *testing.T) {
+	r := startRig(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	kv, err := r.client.KV(ctx, lib.SessionStateBucket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := kv.Put(ctx, kvKey(testConversation), []byte("not json")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.g.reg.Get(ctx, testConversation); !errors.Is(err, errRecordUndecodable) {
+		t.Fatalf("Get = %v, want errRecordUndecodable", err)
+	}
+}
+
+// TestARequestWhileStoppingIsARetry: a request that reaches the route after
+// it began stopping, and one the worker takes off the queue then, are both
+// answered with the stopping refusal marked retry, which the CLI turns into
+// "route unavailable" rather than a failure charged to the destination.
+func TestARequestWhileStoppingIsARetry(t *testing.T) {
+	s := startServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	client, err := lib.Connect(ctx, s.ClientURL(), lib.WithName("notify-gateway"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	poster := &blockingPoster{release: make(chan struct{})}
+	n, err := NewGchatNotifier(poster, testHome, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub, err := n.Start(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { sub.Stop() }()
+	agent, err := nats.Connect(s.ClientURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer agent.Close()
+	in, err := agent.SubscribeSync(lib.NotifyReplyPrefix + ">")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(lib.NotifyRequest{Text: "x"})
+	// One the worker holds, one queued behind it.
+	for i := 0; i < 2; i++ {
+		if err := agent.PublishRequest(lib.NotifySubjectGchat, lib.NotifyReplyPrefix+"s", body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = agent.Flush()
+	time.Sleep(300 * time.Millisecond)
+	// Stopping, with the subscription still up (Stop itself would drain the
+	// queue first): a new request, and the queued one once the worker frees.
+	n.mu.Lock()
+	n.stopping = true
+	n.mu.Unlock()
+	if err := agent.PublishRequest(lib.NotifySubjectGchat, lib.NotifyReplyPrefix+"s", body); err != nil {
+		t.Fatal(err)
+	}
+	_ = agent.Flush()
+	close(poster.release)
+	retries := 0
+	for i := 0; i < 3; i++ {
+		msg, err := in.NextMsg(3 * time.Second)
+		if err != nil {
+			t.Fatalf("answer %d: %v", i+1, err)
+		}
+		var got lib.NotifyReply
+		_ = json.Unmarshal(msg.Data, &got)
+		switch {
+		case got.MessageID != "":
+		case got.Error == notifyStoppingRefusal && got.Retry:
+			retries++
+		default:
+			t.Fatalf("answer %d = %+v, want the post or a stopping refusal marked retry", i+1, got)
+		}
+	}
+	if retries != 2 {
+		t.Fatalf("%d stopping refusals marked retry, want 2 (the new request and the queued one)", retries)
 	}
 }

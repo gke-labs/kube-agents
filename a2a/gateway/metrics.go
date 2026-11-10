@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"slices"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -20,15 +22,21 @@ import (
 // copied from the credential broker's (CREDENTIAL_PROXY_METRICS_PORT in
 // agents/platform/scripts/credential_proxy.py), so that the collector
 // scraping it, and the operator's usage poller, are admitted to a port that
-// serves counters and nothing else.
+// serves counters (MetricsPath) and a readiness line for the kubelet
+// (ReadyzPath) and nothing else.
 // The doors keep their own loopback listeners and never serve these series.
 // The operator renders A2A_METRICS_PORT from the constant that also declares
 // the container port and the collector's ingress rule
 // (a2aGatewayMetricsPort in platformagent_a2a_manifests.go); unset means no
 // listener, which is what an older operator that declares no port gets.
 const (
-	// MetricsPath is the one path the metrics listener serves.
+	// MetricsPath is the counters' path on the metrics listener.
 	MetricsPath = "/metrics"
+
+	// ReadyzPath is the readiness path on the same listener: 200 once the
+	// gateway has bound its event relay, 503 with the reason until then. The
+	// operator's readinessProbe reads it (a2aGatewayReadyzPath).
+	ReadyzPath = "/readyz"
 
 	// metricsNamespace and metricsSubsystem prefix every series, so the
 	// gateway's sit beside the broker's kubeagents_* names and cannot be
@@ -50,6 +58,10 @@ const (
 	// chatMessagesInboundTotal, which the chat_metrics plugin counts for the
 	// Hermes-side ingress (docs/designs/usage-counters-producer.md).
 	messagesInboundName = "messages_inbound_total"
+	// answerFeedbackName counts the ratings chat users gave answers, by
+	// platform, rating and answer (feedback.go): the dashboard's 👍/👎
+	// series.
+	answerFeedbackName = "answer_feedback_total"
 	// sessionsName counts the conversations the gateway minted a session
 	// record for, by platform: the next-mode chat half of status.usage's
 	// sessionsTotal, beside the watcher's triage sessions and the
@@ -63,6 +75,12 @@ const (
 	// chat_metrics plugin serve it (docs/designs/usage-counters-producer.md,
 	// "Resets"). Unprefixed: it is the process's, not the gateway's.
 	processStartTimeName = "process_start_time_seconds"
+	// peopleSeenName is the gauge of distinct chat people seen in each
+	// window (people.go); it serves no sample until the people map holds
+	// the bucket.
+	peopleSeenName = "people_seen"
+	// peopleSeenHelp is peopleSeenName's help text.
+	peopleSeenHelp = "Distinct people whose last verified chat turn, within an hour, is inside the window."
 
 	// The label names. Every value under them comes from a closed list
 	// below, never from a task, a conversation or an executor's text, so
@@ -71,6 +89,9 @@ const (
 	labelSource   = "source"
 	labelOutcome  = "outcome"
 	labelPlatform = "platform"
+	labelRating   = "rating"
+	labelAnswer   = "answer"
+	labelWindow   = "window"
 	// The platform label's values: the chat backends, under the names the
 	// operator's activeInterfaces vocabulary and the chat_metrics plugin use
 	// for the ones they share, so one series name reads the same on either
@@ -80,6 +101,15 @@ const (
 	platformSlack      = "slack"
 	platformDiscord    = "discord"
 	platformConsole    = "console"
+	// The answer label's values: what the rated message answered with, the
+	// chain's own reply or a card's report that settled the ask (TaskRef.CardsAnswer).
+	// A rating no session record names the rated task for (unreadable, reaped,
+	// or the root aged out of its history) is counted as other.
+	answerReply = "reply"
+	answerCard  = "card"
+	// The window label's values: peopleWindowShort and peopleWindowLong.
+	peopleWindowShortLabel = "7d"
+	peopleWindowLongLabel  = "30d"
 
 	// metricsLabelOther is the bucket for a value outside a closed list.
 	// observeTaskTerminal sees only the four final states and the four
@@ -145,6 +175,11 @@ var (
 	metricsGchatOutcomes   = []string{gchatPullEvents, gchatPullEmpty, gchatPullFailed}
 	metricsChatOutcomes    = []string{chatRendered, chatTextOnly, chatRefused, chatInvalid}
 	metricsPlatforms       = []string{platformGoogleChat, platformSlack, platformDiscord, platformConsole}
+	metricsRatings         = []string{FeedbackUp, FeedbackDown}
+	metricsAnswers         = []string{answerReply, answerCard}
+	// metricsRatedPlatforms are the backends that draw rating controls, each
+	// given a zero answer_feedback_total series per rating and answer.
+	metricsRatedPlatforms = []string{platformGoogleChat, platformSlack}
 	// metricsBackendPlatforms maps each chat backend to its platform label; a
 	// backend outside it is a door and is not counted.
 	metricsBackendPlatforms = map[string]string{
@@ -169,10 +204,44 @@ type Metrics struct {
 	chatMessages        *prometheus.CounterVec
 	notifyMarksDropped  prometheus.Counter
 	messagesInbound     *prometheus.CounterVec
+	answerFeedback      *prometheus.CounterVec
 	sessions            *prometheus.CounterVec
 	// processStart is processStartTimeName, set once in NewMetrics and constant
 	// for the life of the process by construction.
 	processStart prometheus.Gauge
+	// peopleSource is the people desk's count, set once the count is on;
+	// unset, the people gauge serves no sample.
+	peopleSource atomic.Pointer[peopleCount]
+}
+
+// peopleCount reports the distinct people seen in the short and long windows,
+// on the source's own clock, and whether the count holds the bucket (ok).
+type peopleCount func() (short, long int, ok bool)
+
+// peopleCollector serves peopleSeenName from the Metrics' people source: two
+// samples, one per window, while the source reports ok, and none otherwise.
+type peopleCollector struct {
+	m    *Metrics
+	desc *prometheus.Desc
+}
+
+// Describe sends the people gauge's one Desc.
+func (c *peopleCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- c.desc
+}
+
+// Collect emits the two window samples when a source is set and reports ok.
+func (c *peopleCollector) Collect(ch chan<- prometheus.Metric) {
+	fn := c.m.peopleSource.Load()
+	if fn == nil {
+		return
+	}
+	short, long, ok := (*fn)()
+	if !ok {
+		return
+	}
+	ch <- prometheus.MustNewConstMetric(c.desc, prometheus.GaugeValue, float64(short), peopleWindowShortLabel)
+	ch <- prometheus.MustNewConstMetric(c.desc, prometheus.GaugeValue, float64(long), peopleWindowLongLabel)
 }
 
 // NewMetrics builds the counters on a fresh registry.
@@ -215,6 +284,12 @@ func NewMetrics() *Metrics {
 			Name:      messagesInboundName,
 			Help:      "Chat messages the gateway accepted as turns, by platform (googlechat, slack, discord, console, other), counted before the sender is verified; a door's turns are not chat and are not counted.",
 		}, []string{labelPlatform}),
+		answerFeedback: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      answerFeedbackName,
+			Help:      "Ratings verified chat users gave the gateway's answers, by platform (googlechat, slack, discord, console, other), rating (up, down, other) and answer (reply, the chain's own; card, a card's report that settled the ask; other, no session record names the rated task); counted once per rating change, so a repeated rating and one the gateway did not keep are not counted.",
+		}, []string{labelPlatform, labelRating, labelAnswer}),
 		sessions: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Subsystem: metricsSubsystem,
@@ -227,7 +302,11 @@ func NewMetrics() *Metrics {
 		}),
 	}
 	m.processStart.Set(float64(time.Now().UnixNano()) / float64(time.Second))
-	m.registry.MustRegister(m.taskTerminals, m.gchatEventsReceived, m.gchatPulls, m.chatMessages, m.notifyMarksDropped, m.messagesInbound, m.sessions, m.processStart)
+	people := &peopleCollector{
+		m:    m,
+		desc: prometheus.NewDesc(prometheus.BuildFQName(metricsNamespace, metricsSubsystem, peopleSeenName), peopleSeenHelp, []string{labelWindow}, nil),
+	}
+	m.registry.MustRegister(m.taskTerminals, m.gchatEventsReceived, m.gchatPulls, m.chatMessages, m.notifyMarksDropped, m.messagesInbound, m.answerFeedback, m.sessions, m.processStart, people)
 	for _, outcome := range metricsChatOutcomes {
 		m.chatMessages.WithLabelValues(outcome)
 	}
@@ -243,7 +322,22 @@ func NewMetrics() *Metrics {
 	for _, outcome := range metricsGchatOutcomes {
 		m.gchatPulls.WithLabelValues(outcome)
 	}
+	for _, platform := range metricsRatedPlatforms {
+		for _, rating := range metricsRatings {
+			for _, answer := range metricsAnswers {
+				m.answerFeedback.WithLabelValues(platform, rating, answer)
+			}
+		}
+	}
 	return m
+}
+
+// setPeopleSource makes fn the people gauge's source.
+func (m *Metrics) setPeopleSource(fn peopleCount) {
+	if m == nil {
+		return
+	}
+	m.peopleSource.Store(&fn)
 }
 
 // Handler serves the registry in the Prometheus text format.
@@ -347,9 +441,10 @@ func metricsTerminalSourceLabel(source TerminalSource) string {
 	return metricsLabelOther
 }
 
-// MetricsServer is the metrics-only listener: MetricsPath and nothing else,
-// on its own port, so the NetworkPolicy rule that admits the collector to it
-// admits the collector and the operator to counters and nothing else.
+// MetricsServer is the metrics-only listener: MetricsPath, plus ReadyzPath
+// for the kubelet, on its own port, so the NetworkPolicy rule that admits the
+// collector to it admits the collector and the operator to counters and a
+// readiness line (whether the relay has bound) and nothing else.
 type MetricsServer struct {
 	listen  string
 	metrics *Metrics
@@ -358,13 +453,34 @@ type MetricsServer struct {
 	// listener, when set, is an already-bound listener Run serves on
 	// instead of binding listen. Test injection only.
 	listener net.Listener
+
+	// readiness answers ReadyzPath; nil answers ready (SetReadiness).
+	readiness func() (bool, string)
+}
+
+// SetReadiness sets what ReadyzPath reports: the gateway's Readiness. Call
+// before Run.
+func (s *MetricsServer) SetReadiness(readiness func() (bool, string)) { s.readiness = readiness }
+
+// serveReadyz answers ReadyzPath: 200 or 503, with the reason as the body so
+// a probe failure in `kubectl describe` and a curl both say what it waits on.
+func (s *MetricsServer) serveReadyz(w http.ResponseWriter, _ *http.Request) {
+	ready, reason := true, "ready"
+	if s.readiness != nil {
+		ready, reason = s.readiness()
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	if !ready {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}
+	fmt.Fprintln(w, reason)
 }
 
 // NewMetricsServer builds the listener for a port. It binds every interface,
 // unlike the doors' loopback binds, because its callers, the collector and
 // the operator's poller, are on the pod network; what keeps anyone else off
 // it is the NetworkPolicy, and
-// what it serves is counters.
+// what it serves is counters and a readiness line.
 func NewMetricsServer(port int, metrics *Metrics, log *slog.Logger) (*MetricsServer, error) {
 	if port < metricsPortMin || port > metricsPortMax {
 		return nil, fmt.Errorf("metrics listener port %d is not in %d-%d", port, metricsPortMin, metricsPortMax)
@@ -378,11 +494,12 @@ func NewMetricsServer(port int, metrics *Metrics, log *slog.Logger) (*MetricsSer
 	return &MetricsServer{listen: fmt.Sprintf(":%d", port), metrics: metrics, log: log}, nil
 }
 
-// Run serves MetricsPath until ctx is done. Every other path is 404, and
+// Run serves MetricsPath and ReadyzPath until ctx is done. Every other path is 404, and
 // every method on it but GET (and the HEAD the mux answers with it) 405.
 func (s *MetricsServer) Run(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.Handle(http.MethodGet+" "+MetricsPath, s.metrics.Handler())
+	mux.HandleFunc(http.MethodGet+" "+ReadyzPath, s.serveReadyz)
 	srv := &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: metricsConnectionDeadline,
@@ -420,4 +537,22 @@ func (s *MetricsServer) Run(ctx context.Context) error {
 		_ = srv.Shutdown(shutdownCtx)
 		return nil
 	}
+}
+
+// answerRated counts one rating. Every label comes from a closed list: a
+// platform, rating or answer outside them is counted as other.
+func (m *Metrics) answerRated(platform, rating, answer string) {
+	if m == nil {
+		return
+	}
+	if !slices.Contains(metricsPlatforms, platform) {
+		platform = metricsLabelOther
+	}
+	if !slices.Contains(metricsRatings, rating) {
+		rating = metricsLabelOther
+	}
+	if !slices.Contains(metricsAnswers, answer) {
+		answer = metricsLabelOther
+	}
+	m.answerFeedback.WithLabelValues(platform, rating, answer).Inc()
 }

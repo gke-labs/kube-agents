@@ -76,7 +76,8 @@ Env:
   GITOPS_MERGE_CHECK     comma-separated check-run names whose failure means the
                          repository rejected the PR (default ``check``, the job the
                          pilot repositories' merge-on-green workflow runs)
-  BENCH_GITHUB_TOKEN or GITHUB_TOKEN, else GITOPS_TOKEN_FILE   GitHub read token
+  BENCH_GITHUB_TOKEN_FILE, BENCH_GITHUB_TOKEN or GITHUB_TOKEN, else GITOPS_TOKEN_FILE
+                         GitHub read token
 """
 
 from __future__ import annotations
@@ -96,7 +97,7 @@ from typing import Any
 
 from devops_bench.agents import AgentResult
 
-from kube_agents_bench.verifiers import LEDGER_TOKEN_ENV_VARS
+from kube_agents_bench import forges
 
 _log = logging.getLogger(__name__)
 
@@ -160,9 +161,11 @@ def repo_slug(url: str) -> str:
 
 
 def _github_token(env: Mapping[str, str]) -> str:
-    for name in LEDGER_TOKEN_ENV_VARS:
-        if env.get(name):
-            return env[name].strip()
+    # The renewed grading token first (forges.GITHUB_TOKEN_FILE_ENV_VAR), then
+    # the variables: a fix cycle can run past the hour the unit's token lasts.
+    token = forges.read_token(forges.FORGE_GITHUB, env)
+    if token:
+        return token.strip()
     token_file = env.get("GITOPS_TOKEN_FILE")
     if token_file:
         path = Path(os.path.expanduser(token_file))
@@ -245,10 +248,14 @@ def await_fix_cycle(
     soak = _seconds(env, "GITOPS_SOAK_SECONDS", DEFAULT_SOAK_S)
     merge_checks = {n.strip() for n in (env.get("GITOPS_MERGE_CHECK") or DEFAULT_MERGE_CHECK).split(",") if n.strip()}
 
-    headers = dict(GITHUB_HEADERS)
-    token = _github_token(env)
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+    def headers() -> dict[str, str]:
+        """Built per request: the token file can be renewed mid-cycle."""
+        built = dict(GITHUB_HEADERS)
+        token = _github_token(env)
+        if token:
+            built["Authorization"] = f"Bearer {token}"
+        return built
+
     api = f"{GITHUB_API}/repos/{slug}"
 
     record: dict[str, Any] = {"repo": slug, "run_branch": branch, "application": f"{app_ns}/{app}", "poll_errors": 0}
@@ -314,7 +321,7 @@ def await_fix_cycle(
     pr: dict[str, Any] | None = None
     deadline = clock() + pr_timeout
     while True:
-        pr = newest_pr(attempt("listing pull requests", lambda: fetch_json(pulls_url, headers)))
+        pr = newest_pr(attempt("listing pull requests", lambda: fetch_json(pulls_url, headers())))
         if pr is not None:
             break
         if not wait(deadline):
@@ -333,7 +340,7 @@ def await_fix_cycle(
         """
         nonlocal number, deadline
         rejected.append(number)
-        later = newest_pr(attempt("listing pull requests", lambda: fetch_json(pulls_url, headers)))
+        later = newest_pr(attempt("listing pull requests", lambda: fetch_json(pulls_url, headers())))
         if later is None:
             return False
         record.setdefault("superseded", []).append({"pr_number": number, "reason": reason})
@@ -347,7 +354,7 @@ def await_fix_cycle(
     merge_sha = ""
     deadline = clock() + merge_timeout
     while True:
-        detail = attempt(f"reading PR #{number}", lambda: fetch_json(f"{api}/pulls/{number}", headers))
+        detail = attempt(f"reading PR #{number}", lambda: fetch_json(f"{api}/pulls/{number}", headers()))
         if detail:
             if detail.get("merged_at"):
                 merge_sha = detail.get("merge_commit_sha") or ""
@@ -362,7 +369,7 @@ def await_fix_cycle(
                 record["head_sha"] = head_sha
                 checks = attempt(
                     f"reading check runs for {head_sha[:8]}",
-                    lambda: fetch_json(f"{api}/commits/{head_sha}/check-runs", headers),
+                    lambda: fetch_json(f"{api}/commits/{head_sha}/check-runs", headers()),
                 )
                 if checks:
                     failed = [
@@ -395,7 +402,7 @@ def await_fix_cycle(
     branch_url = f"{api}/branches/{urllib.parse.quote(branch, safe='')}"
     deadline = clock() + sync_timeout
     while True:
-        head_info = attempt("reading the run branch head", lambda: fetch_json(branch_url, headers))
+        head_info = attempt("reading the run branch head", lambda: fetch_json(branch_url, headers()))
         head = (head_info or {}).get("commit", {}).get("sha", "")
         if head:
             record["branch_head"] = head

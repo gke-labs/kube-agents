@@ -21,11 +21,16 @@ SHARED_SESSION_NOTICE = (
     "that more than one person can post in, and the harness cannot attribute a "
     "message to its sender here, so nothing may be read from or written to a "
     "person's private memory. Shared memory still works; personal memory works "
-    "in a direct message."
+    "in a direct message. If someone asks you to remember a personal fact or "
+    "preference here, tell them that personal memory is off in a shared thread "
+    "and nothing was saved — never imply it was noted."
 )
 NO_IDENTITY_NOTICE = (
     "Personal memory is unavailable because this session carries no user "
-    "identity. Only shared memory is reachable here."
+    "identity. Only shared memory is reachable here. If a person asks you to "
+    "remember a personal fact or preference, tell them that personal memory is "
+    "unavailable in this session and nothing was saved — never imply it was "
+    "noted."
 )
 
 RECALL_PREAMBLE = (

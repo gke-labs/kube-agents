@@ -318,6 +318,39 @@ class StageTest(unittest.TestCase):
         self._main(now=NOW_PAST_FALLBACK + 10 * oobe.bootstrap_handoff.DEADLINE_PER_CARD_SECONDS)
         self.assertEqual(self._started_ids(), FIRST)
 
+    def test_a_fleet_past_the_first_run_cap_waits_for_its_uncarded_clusters(self):
+        # #3702: the marker's uncarded= agents have no card but are still in the hand-off's deadline.
+        per_card = oobe.bootstrap_handoff.DEADLINE_PER_CARD_SECONDS
+        clusters = [(f"t_c{i}", "running", f"bootstrap-inventory-cluster-c{i}", SWEEP_CREATED_AT + 1) for i in range(6)]
+        (self.d / oobe.SCAN_FILED_MARKER).write_text(
+            f"task_id={SWEEP_ID}\nfiled_at={FILED_AT}\nuncarded=4\n", encoding="utf-8"
+        )
+        _board(self.board, clusters)
+        self._main(now=NOW_PAST_FALLBACK + 6 * per_card)
+        self.assertEqual(self.started, [])
+        self._main(now=NOW_PAST_FALLBACK + 10 * per_card - 1)
+        self.assertEqual(self.started, [])
+        self._main(now=NOW_PAST_FALLBACK + 10 * per_card)
+        self.assertEqual(self._started_ids(), FIRST)
+
+    def test_an_unpinned_sweep_waits_for_the_live_roster_past_the_cap(self):
+        # #3702: the marker pinned nothing (an empty or failed listing at filing), so the
+        # stage budgets the live roster's agents past the cap, as the hand-off does.
+        per_card = oobe.bootstrap_handoff.DEADLINE_PER_CARD_SECONDS
+        clusters = [(f"t_c{i}", "running", f"bootstrap-inventory-cluster-c{i}", SWEEP_CREATED_AT + 1) for i in range(6)]
+        (self.d / oobe.SCAN_FILED_MARKER).write_text(
+            f"task_id={SWEEP_ID}\nfiled_at={FILED_AT}\ncap=6\n", encoding="utf-8"
+        )
+        _board(self.board, clusters)
+        with mock.patch.object(oobe.bootstrap_scan_gate, "cluster_agents", return_value=[{}] * 10) as listing:
+            self._main(now=NOW_PAST_FALLBACK + 6 * per_card)
+            self.assertEqual(self.started, [])
+            self._main(now=NOW_PAST_FALLBACK + 10 * per_card - 1)
+            self.assertEqual(self.started, [])
+            self._main(now=NOW_PAST_FALLBACK + 10 * per_card)
+        self.assertEqual(self._started_ids(), FIRST)
+        listing.assert_called_with(capped=False)
+
     def test_the_fallback_is_the_hand_offs_deadline_for_the_cards_it_counts(self):
         # An archived cluster card is not one the hand-off waits for, so the stage does not either.
         per_card = oobe.bootstrap_handoff.DEADLINE_PER_CARD_SECONDS
@@ -379,9 +412,10 @@ class StageTest(unittest.TestCase):
             self.assertEqual(env["HERMES_HOME"], str(self.d / "profiles" / "platform"))
 
     def test_the_chain_follows_1866s_order(self):
+        # #1866's four in its order, then the upgrade retrospective.
         self.assertEqual(
             oobe.FIRST_RUN_AUDITS,
-            ("fleet-wide-cost-analysis", "compliance-audit", "obtainability-audit", "stockout-prevention"),
+            ("fleet-wide-cost-analysis", "compliance-audit", "obtainability-audit", "stockout-prevention", "upgrade-retrospective"),
         )
 
     def test_the_trigger_marks_the_job_due_and_does_not_run_it(self):
@@ -791,11 +825,12 @@ class StageTest(unittest.TestCase):
             {"id": "obtainability-audit", "enabled": False, "state": "paused", "paused_at": "2026-10-06T00:00:00"},
             {"id": "stockout-prevention", "enabled": True, "paused_at": "2026-10-06T00:00:00"},
             {"id": "fleet-wide-cost-analysis", "enabled": True},
+            {"id": "upgrade-retrospective", "enabled": True},
         ])
         self._file_scan()
         _board(self.board, [_ranking("done")])
         self._drive()
-        self.assertEqual(self._started_ids(), ["fleet-wide-cost-analysis"])
+        self.assertEqual(self._started_ids(), ["fleet-wide-cost-analysis", "upgrade-retrospective"])
         state = oobe.read_state(self.d)
         self.assertEqual(state[oobe.STATE_HELD], {
             "compliance-audit": "disabled",
@@ -897,6 +932,30 @@ class StageTest(unittest.TestCase):
             removed, [oobe.bootstrap_delivery.SCAN_JOB_ID, oobe.bootstrap_delivery.DELIVERY_JOB_ID, oobe.OOBE_JOB_ID]
         )
         self.deliver.assert_not_called()
+
+    def test_a_lost_summary_still_to_re_send_keeps_it(self):
+        # The re-send stage needs the home channel the user's first message brings; its window bounds the wait.
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        now = self._drive()
+        self._claim(now - oobe.bootstrap_delivery.RETIRE_AFTER_SECONDS)
+        pending = [oobe.bootstrap_delivery.LostRun("fleet-wide-cost-analysis", False, now - MINUTE)]
+        with mock.patch.object(oobe.bootstrap_delivery, "pending_resends", return_value=pending) as asked:
+            self.assertEqual(self._main_removing(now), [])
+        asked.assert_called_with(self.d, oobe.read_state(self.d), now)
+        with mock.patch.object(oobe.bootstrap_delivery, "pending_resends", return_value=[]):
+            self.assertEqual(self._main_removing(now)[-1], oobe.OOBE_JOB_ID)
+
+    def test_each_tick_runs_the_lost_summaries_stage_last(self):
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        order: list[str] = []
+        self.deliver.side_effect = lambda *_a, **_k: order.append("delivery") or 0
+        with mock.patch.object(oobe.bootstrap_delivery, "resend_lost_summaries",
+                               side_effect=lambda *_a, **_k: order.append("lost summaries")) as stage:
+            self._main()
+        stage.assert_called_once_with(self.d, NOW_SETTLED)
+        self.assertEqual(order, ["delivery", "lost summaries"])
 
     def test_it_stays_until_the_report_is_claimed(self):
         self._file_scan()

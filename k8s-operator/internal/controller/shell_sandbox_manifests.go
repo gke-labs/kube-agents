@@ -221,6 +221,25 @@ const (
 	shellSandboxImageTreesCPULimit      = "500m"
 	shellSandboxImageTreesMemoryLimit   = "256Mi"
 
+	// The shell container's default requests and limits, which
+	// spec.harness.experimental.shellSandbox.resources overrides per key
+	// (resolveShellSandboxResources). Requests and limits on every container,
+	// always: the platform-baseline-quota in kubeagents-system rejects a pod
+	// that omits them, and the rejection surfaces as a StatefulSet that never
+	// creates a pod. The requests pair sits at 2.5 GiB per vCPU, inside the band
+	// GKE Autopilot admits unchanged. The chart's footprint
+	// (charts/kube-agents/files/footprint.yaml) carries the same figures,
+	// summed from the default golden.
+	shellSandboxCPURequest    = "200m"
+	shellSandboxMemoryRequest = "512Mi"
+	shellSandboxCPULimit      = "2"
+	shellSandboxMemoryLimit   = "2Gi"
+
+	// The shell container's name, which the sizing step-up check reads the
+	// StatefulSet's template by (sizing_profile.go) and the eval harness execs
+	// into (hack/, pinned by scripts/test_ci_eval_inflight_note.py).
+	shellSandboxContainerName = "shell"
+
 	// The agent pod's side of the same keypair. Two volumes rather than one for
 	// a reason spelled out at buildShellSandboxClientKeyInitContainer: the
 	// Secret cannot be handed to `ssh -i` directly.
@@ -346,6 +365,13 @@ func resolveShellSandboxImage(agent *agentv1alpha1.PlatformAgent) string {
 	if spec := shellSandboxSpec(agent); spec != nil && spec.Image != "" {
 		return spec.Image
 	}
+	return operatorShellSandboxImage()
+}
+
+// operatorShellSandboxImage is the sandbox image this operator runs when the CR
+// pins none: every rung of resolveShellSandboxImage below the CR's own. The
+// ShellSandboxPinned condition compares a pin against it.
+func operatorShellSandboxImage() string {
 	if override := os.Getenv(shellSandboxImageEnvVar); override != "" {
 		return override
 	}
@@ -529,13 +555,24 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 			Name:  "CREDENTIAL_PROXY_TOKEN_FILE",
 			Value: credentialProxyTokenMountPath + "/token",
 		})
+		// The exec tier, while it renders: the shim sends /v1/exec and
+		// /v1/gcp/ there and everything else to CREDENTIAL_PROXY_URL, and
+		// falls back to CREDENTIAL_PROXY_URL when it cannot connect. Read at
+		// start, so a change between 0 and a positive count rolls the sandbox.
+		if credentialProxyExecTierEnabled(agent) {
+			env = append(env, corev1.EnvVar{Name: credentialProxyExecURLEnv, Value: credentialProxyExecTierURL(agent)})
+		}
+		env = append(env,
+			corev1.EnvVar{Name: "KUBE_PROXY_URL", Value: kubeProxyURL(agent)},
+			corev1.EnvVar{Name: "KUBE_PROXY_CA_FILE", Value: kubeProxyCACertFile},
+		)
 	}
 	if harness := agent.Spec.Harness; harness != nil && harness.ProjectID != "" && harness.Location != "" && harness.ClusterName != "" {
 		env = append(env,
 			corev1.EnvVar{Name: envGKEProjectID, Value: harness.ProjectID},
 			corev1.EnvVar{Name: envGKEClusterName, Value: harness.ClusterName},
 			corev1.EnvVar{Name: envGKELocation, Value: harness.Location},
-			corev1.EnvVar{Name: envKubeContextName, Value: fmt.Sprintf("gke_%s_%s_%s", harness.ProjectID, harness.Location, harness.ClusterName)},
+			corev1.EnvVar{Name: envKubeContextName, Value: hostClusterContextName(agent)},
 		)
 	}
 
@@ -664,11 +701,11 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 			// Two claims, because one of them must be unreachable from the account
 			// that can write the other. See shellSandboxSshdPath.
 			//
-			// VolumeClaimTemplates is immutable, so an install that already has a
-			// sandbox needs its StatefulSet deleted (--cascade=orphan keeps the
-			// pod up meanwhile) before the operator can lay this down. The feature
-			// is experimental and off by default, which is what makes that
-			// acceptable rather than a migration.
+			// VolumeClaimTemplates is immutable, so a change here is refused on an
+			// install that already has a sandbox. applyShellSandboxStatefulSet
+			// answers that refusal by deleting the StatefulSet with Orphan
+			// propagation and creating it again, which leaves the pod and its
+			// claims running throughout.
 			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
 				{
 					// Sized from the agent's own /opt/data claim, not independently.
@@ -762,7 +799,17 @@ func buildShellSandboxVolumes(agent *agentv1alpha1.PlatformAgent, authorizedKeys
 		// See shellSandboxHermesHomePath. Empty and read-only: the point is the
 		// mount, not what is behind it.
 		Name:         shellSandboxHermesHomeVolume,
-		VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+		VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse(shellSandboxHermesHomeSizeLimit))}},
+	}, {
+		Name: kubeProxyCAVolumeName,
+		VolumeSource: corev1.VolumeSource{
+			Secret: &corev1.SecretVolumeSource{
+				SecretName:  kubeProxyTLSSecretName(agent),
+				DefaultMode: ptr.To(int32(0444)),
+				Items:       []corev1.KeyToPath{{Key: "ca.crt", Path: "ca.crt"}},
+				Optional:    ptr.To(true),
+			},
+		},
 	}, buildShellSandboxCredentialProxyTokenVolume(), buildGitopsStateVolume(agent)}
 	return volumes
 }
@@ -893,13 +940,36 @@ func buildShellSandboxImageTreesInitContainer(agent *agentv1alpha1.PlatformAgent
 	}
 }
 
+// resolveShellSandboxResources merges the CR's
+// spec.harness.experimental.shellSandbox.resources override over the tier's
+// row (shellSandboxTierResources; the small row is the operator's defaults),
+// one key at a time, so a CR that sets only requests.memory keeps every other
+// figure of the row. A nil override on the small row returns the defaults
+// unchanged, which the goldens and the chart's quota preflight carry.
+// ValidateShellSandboxResources reads the same merged result, and
+// reconcileShellSandbox renders the row in place of an override it refuses.
+func resolveShellSandboxResources(agent *agentv1alpha1.PlatformAgent, tier sizingTier) corev1.ResourceRequirements {
+	resolved := shellSandboxTierResources(tier)
+	spec := shellSandboxSpec(agent)
+	if spec == nil || spec.Resources == nil {
+		return resolved
+	}
+	for name, quantity := range spec.Resources.Requests {
+		resolved.Requests[name] = quantity.DeepCopy()
+	}
+	for name, quantity := range spec.Resources.Limits {
+		resolved.Limits[name] = quantity.DeepCopy()
+	}
+	return resolved
+}
+
 func buildShellSandboxContainer(agent *agentv1alpha1.PlatformAgent, env []corev1.EnvVar) corev1.Container {
 	env = append(slices.Clone(env),
 		corev1.EnvVar{Name: shellSandboxImageTreesEnvVar, Value: shellSandboxImageTreesMode},
 		corev1.EnvVar{Name: shellSandboxHomeRootsEnvVar, Value: shellSandboxHomeRoots()},
 	)
 	container := corev1.Container{
-		Name:  "shell",
+		Name:  shellSandboxContainerName,
 		Image: resolveShellSandboxImage(agent),
 		// No command or args: the image's entrypoint does the
 		// volume-dependent setup and execs sshd. An earlier prototype
@@ -940,20 +1010,11 @@ func buildShellSandboxContainer(agent *agentv1alpha1.PlatformAgent, env []corev1
 			InitialDelaySeconds: 5,
 			PeriodSeconds:       5,
 		},
-		// Requests and limits on every container, always: the
-		// platform-baseline-quota in kubeagents-system rejects a pod
-		// that omits them, and the rejection surfaces as a StatefulSet
-		// that never creates a pod.
-		Resources: corev1.ResourceRequirements{
-			Requests: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse("200m"),
-				corev1.ResourceMemory: resource.MustParse("512Mi"),
-			},
-			Limits: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse("2"),
-				corev1.ResourceMemory: resource.MustParse("2Gi"),
-			},
-		},
+		// The operator's defaults with the CR's
+		// spec.harness.experimental.shellSandbox.resources merged over them
+		// per key; the constants' comment says why every container carries
+		// both sides.
+		Resources: resolveShellSandboxResources(agent, renderedSizingTier(agent)),
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: shellSandboxKeysVolume, MountPath: shellSandboxKeysPath, ReadOnly: true},
 			{Name: shellSandboxDataVolume, MountPath: shellSandboxDataPath},
@@ -966,6 +1027,11 @@ func buildShellSandboxContainer(agent *agentv1alpha1.PlatformAgent, env []corev1
 			{
 				Name:      shellSandboxCredentialProxyTokenVolume,
 				MountPath: credentialProxyTokenMountPath,
+				ReadOnly:  true,
+			},
+			{
+				Name:      kubeProxyCAVolumeName,
+				MountPath: kubeProxyCAMountPath,
 				ReadOnly:  true,
 			},
 			{
@@ -1011,6 +1077,17 @@ func buildShellSandboxContainer(agent *agentv1alpha1.PlatformAgent, env []corev1
 	return container
 }
 
+// sandboxBrokerPeers is the broker, and the exec tier while it renders.
+func sandboxBrokerPeers(agent *agentv1alpha1.PlatformAgent) []networkingv1.NetworkPolicyPeer {
+	peers := []networkingv1.NetworkPolicyPeer{{
+		PodSelector: &metav1.LabelSelector{MatchLabels: credentialProxySelector(agent)},
+	}}
+	if credentialProxyExecTierEnabled(agent) {
+		peers = append(peers, credentialProxyExecTierPodPeer(agent))
+	}
+	return peers
+}
+
 // buildShellSandboxNetworkPolicy is deny-by-default in both directions, with
 // three holes: ssh in from the gateway, DNS out, and the broker's Service out.
 //
@@ -1024,7 +1101,8 @@ func buildShellSandboxContainer(agent *agentv1alpha1.PlatformAgent, env []corev1
 // selects pods, so a broker sharing this pod would make every address it needs —
 // a GKE control plane per registered cluster, googleapis.com, chat.googleapis.com,
 // slack.com, github.com, the token minter — an address the *shell* may reach.
-// Off-pod, the shell's whole outbound world is DNS and one ClusterIP.
+// Off-pod, the shell's whole outbound world is DNS and the broker's pods: the
+// stateful broker, and the exec tier while it renders.
 // dnsIPs is the resolved Cluster DNS VIP list, the same one the gateway policy is
 // built from; an empty slice falls back to the standard VIP inside clusterDNSPeers.
 func buildShellSandboxNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsIPs []string) *networkingv1.NetworkPolicy {
@@ -1059,13 +1137,24 @@ func buildShellSandboxNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsIPs [
 
 	egress = append(egress, networkingv1.NetworkPolicyEgressRule{
 		// The credential proxy in a pod of its own. This is the connection
-		// every wrapped CLI in the sandbox makes.
-		To: []networkingv1.NetworkPolicyPeer{{
-			PodSelector: &metav1.LabelSelector{MatchLabels: credentialProxySelector(agent)},
-		}},
+		// every wrapped CLI in the sandbox makes; the exec tier, while it
+		// renders, takes its commands.
+		To: sandboxBrokerPeers(agent),
 		Ports: []networkingv1.NetworkPolicyPort{{
 			Protocol: &tcp,
 			Port:     ptr.To(intstr.FromInt32(credentialProxyPort)),
+		}},
+	})
+
+	egress = append(egress, networkingv1.NetworkPolicyEgressRule{
+		// The Kubernetes API proxy in a pod of its own. Stock kubectl in the
+		// sandbox connects over HTTPS on port 8443.
+		To: []networkingv1.NetworkPolicyPeer{{
+			PodSelector: &metav1.LabelSelector{MatchLabels: kubeProxySelector(agent)},
+		}},
+		Ports: []networkingv1.NetworkPolicyPort{{
+			Protocol: &tcp,
+			Port:     ptr.To(intstr.FromInt32(kubeProxyPort)),
 		}},
 	})
 
@@ -1131,7 +1220,7 @@ func buildShellSandboxClientKeyVolumes() []corev1.Volume {
 		},
 		{
 			Name:         shellSandboxClientKeyVolume,
-			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse(shellSandboxClientKeySizeLimit))}},
 		},
 	}
 }
@@ -1169,12 +1258,14 @@ fi`,
 		},
 		Resources: corev1.ResourceRequirements{
 			Requests: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse("10m"),
-				corev1.ResourceMemory: resource.MustParse("16Mi"),
+				corev1.ResourceCPU:              resource.MustParse("10m"),
+				corev1.ResourceMemory:           resource.MustParse("16Mi"),
+				corev1.ResourceEphemeralStorage: resource.MustParse(shellSandboxClientKeyEphemeralRequest),
 			},
 			Limits: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse("100m"),
-				corev1.ResourceMemory: resource.MustParse("64Mi"),
+				corev1.ResourceCPU:              resource.MustParse("100m"),
+				corev1.ResourceMemory:           resource.MustParse("64Mi"),
+				corev1.ResourceEphemeralStorage: resource.MustParse(shellSandboxClientKeyEphemeralRequest),
 			},
 		},
 		SecurityContext: &corev1.SecurityContext{

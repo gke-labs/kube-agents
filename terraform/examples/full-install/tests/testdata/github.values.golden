@@ -83,3 +83,19 @@
       "sink": "gke-stockout-alerts-sink"
       "subscription": "gke-stockout-alerts-sub"
       "topic": "gke-stockout-alerts-topic"
+"webConsole":
+  "agentIdentity":
+    "gcpServiceAccount": "mock-service-account@tftest-project.iam.gserviceaccount.com"
+    "roles":
+    - "roles/cloudtrace.user"
+    - "roles/compute.viewer"
+    - "roles/container.clusterViewer"
+    - "roles/container.viewer"
+    - "roles/gkehub.viewer"
+    - "roles/iam.securityReviewer"
+    - "roles/iam.serviceAccountUser"
+    - "roles/logging.viewer"
+    - "roles/mcp.toolUser"
+    - "roles/monitoring.viewer"
+    - "roles/serviceusage.serviceUsageConsumer"
+  "enabled": false

@@ -31,6 +31,7 @@ IMAGE_SKILL_TREES = (
     "agents/cluster/skills",
     "agents/tse/skills",
     "agents/tse/persona/skills",
+    "agents/cluster/persona/skills",
     "a2a/persona/platform/skills",
 )
 

@@ -12,6 +12,10 @@ locals {
     # credential broker's relay on the Trace role granted below; the API has
     # to be on for the grant to buy anything.
     "cloudtrace.googleapis.com",
+    # The readiness report's rollout-sequence precheck lists the fleet host
+    # project's RolloutSequences on the GKE Hub role granted below; the API has
+    # to be on for the grant to buy anything.
+    "gkehub.googleapis.com",
     # Unconditional: the cluster is created with the Backup for GKE agent
     # enabled whether or not a BackupPlan follows, and the addon cannot be
     # enabled without the API.
@@ -117,12 +121,14 @@ locals {
       }
     } : {},
     var.enable_slack ? {
-      slack = {
+      slack = merge({
         enabled         = true
         allowedUsers    = var.slack_allowed_users
         homeChannel     = var.slack_home_channel
         homeChannelName = var.slack_home_channel_name
-      }
+        }, var.slack_home_channel_policy != "" ? {
+        homeChannelPolicy = var.slack_home_channel_policy
+      } : {})
     } : {},
     local.gitops_is_gitlab ? { forges = local.gitlab_forges } : {},
     local.gitops_is_gitlab ? { repositories = local.gitlab_repositories } : {},
@@ -156,6 +162,7 @@ locals {
     "roles/compute.viewer",
     "roles/monitoring.viewer",
     "roles/logging.viewer",
+    "roles/gkehub.viewer",
     "roles/cloudtrace.user",
     "roles/iam.serviceAccountUser",
     "roles/iam.securityReviewer",
@@ -328,6 +335,13 @@ locals {
       try(var.extra_helm_values.platformAgent.harness.driftDetector, "absent") == null
     )
   )
+
+  # Whether the release will deploy the web console, by either door that
+  # reaches the field (web_console_enabled or extra_helm_values.webConsole.enabled).
+  web_console_requested = (
+    var.web_console_enabled ||
+    try(tobool(var.extra_helm_values.webConsole.enabled) == true, false)
+  )
 }
 
 # A warning rather than a precondition: setting image_registry without
@@ -436,6 +450,16 @@ module "gke_cluster" {
   enable_backup_agent        = var.enable_backup_agent
   enable_gvisor_node_pool    = var.enable_gvisor_node_pool
   gvisor_pool_name           = var.gvisor_pool_name
+  sizing_profile             = var.sizing_profile
+  standard_machine_type      = var.standard_machine_type
+  standard_node_count        = var.standard_node_count
+  standard_disk_size_gb      = var.standard_disk_size_gb
+  standard_disk_type         = var.standard_disk_type
+  gvisor_machine_type        = var.gvisor_machine_type
+  gvisor_min_node_count      = var.gvisor_min_node_count
+  gvisor_max_node_count      = var.gvisor_max_node_count
+  gvisor_disk_size_gb        = var.gvisor_disk_size_gb
+  gvisor_disk_type           = var.gvisor_disk_type
 
   resource_labels = {
     "kube-agents-host" = "true"
@@ -729,8 +753,23 @@ module "github_minter" {
   service_account_id = var.github_minter_service_account_id
   kms_keyring_name   = var.github_minter_kms_keyring
   kms_key_name       = var.github_minter_kms_key
+  # The owning install, which lifecycle.sh's adoption step checks before it
+  # imports a key ring or key this state doesn't hold (#3504). None on a key
+  # this install shares on purpose: the labels stay its owner's. `labels` on
+  # the crypto key is non-authoritative (provider 5.x), so an empty map leaves
+  # the owner's labels where they are rather than removing them.
+  owner_labels = var.github_minter_shared_kms_key == "${var.github_minter_kms_keyring}/${var.github_minter_kms_key}" ? {} : {
+    "kube-agents-cluster"   = var.cluster_name
+    "kube-agents-namespace" = var.namespace
+  }
+  owner_description = "kube-agents GitHub token minter for install ${var.cluster_name}/${var.namespace}"
 
-  depends_on = [google_project_service.required]
+  # module.gke_cluster for the reason module.kube_agents_iam's depends_on
+  # states in full: the module's workload_identity binding names the pool as
+  # an interpolated string, so Terraform sees no edge to the cluster whose
+  # creation brings the pool into existence, and on a first install into a new
+  # project the binding fails with "Identity Pool does not exist".
+  depends_on = [google_project_service.required, module.gke_cluster]
 }
 
 # Stockout Investigator Pub/Sub Infrastructure (Topic, Subscription, Logging Sink, IAM).
@@ -887,6 +926,26 @@ resource "helm_release" "kube_agents" {
   wait    = true
   timeout = 600
 
+  # Opt-in (HELM_UPGRADE_INSTALL in install.env). The helm provider can drop a
+  # live release from state when a refresh lookup errors
+  # (hashicorp/terraform-provider-helm#1669), and the next apply then plans a
+  # create that fails with "cannot re-use a name that is still in use" (#4108).
+  # With this on, that create runs as `helm upgrade --install` and adopts the
+  # release. It adopts any release of this name in the namespace, including one
+  # another Terraform state or a manual `helm install` owns, so it is only for
+  # long-lived environments whose own state owns the release. Off, a conflicting
+  # first install fails loudly.
+  upgrade_install = var.helm_upgrade_install
+
+  # The chart's own version, stated so the provider never infers it. With
+  # upgrade_install on and version unset, the provider's plan asks the cluster
+  # for the installed release's version: that fails before the cluster exists,
+  # so a from-nothing install could not plan, and it plans the installed
+  # version, so the apply after any chart version change fails with
+  # "Provider produced inconsistent result". This is the value the provider
+  # computes from the chart anyway, so it changes no existing plan.
+  version = yamldecode(file("${path.module}/../../../charts/kube-agents/Chart.yaml")).version
+
   values = [yamlencode({
     # Reaches every image this release pulls, including the two the chart
     # does not render itself — the agent Deployment and the shell sandbox
@@ -975,6 +1034,14 @@ resource "helm_release" "kube_agents" {
             allowCidrs = var.litellm_redaction.allow_cidrs
           }
           rules = [for r in var.litellm_redaction.rules : { for k, v in r : k => v if v != null }]
+        }
+      } : {},
+      # Only above zero, for the same reason: an install without a spend
+      # ceiling renders the gateway ConfigMap, and its checksum, as before.
+      var.litellm_budget.usd > 0 ? {
+        budget = {
+          usd    = var.litellm_budget.usd
+          period = var.litellm_budget.period
         }
       } : {}
     )
@@ -1121,7 +1188,9 @@ resource "helm_release" "kube_agents" {
         org     = local.github_org
         repo    = local.github_repo_name
         appId   = var.github_app_id
-        # The minty rule's only gate on either scope is assertion.email
+        # The minty rule's only gate on each of its three scopes
+        # (platform-agent-scope, platform-agent-read-scope and
+        # platform-agent-sweep-scope) is assertion.email
         # against this value; left unset the chart falls back to the fixed
         # kubeagents-platform-gsa name, so an install that overrides
         # agent_service_account_id would annotate one GSA and allowlist another.
@@ -1140,6 +1209,18 @@ resource "helm_release" "kube_agents" {
         gsaName = module.github_minter[0].service_account_id
       } : {}
     )
+    # The browser chat page for installs with no chat platform. Its image
+    # follows platformAgent.deployment.image.tag and global.imageRegistry,
+    # and its Service is ClusterIP by construction. agentIdentity is what the
+    # console's identity box shows: the console holds no credentials to read
+    # IAM, so the agent's GSA and project roles are recorded here at apply.
+    webConsole = {
+      enabled = var.web_console_enabled
+      agentIdentity = {
+        gcpServiceAccount = module.kube_agents_iam.service_account_email
+        roles             = sort(module.kube_agents_iam.agent_project_roles)
+      }
+    }
     plugins = {
       pubsubPlatform = merge(
         {
@@ -1323,6 +1404,16 @@ resource "helm_release" "kube_agents" {
     precondition {
       condition     = !local.extra_helm_values_countermands_detector
       error_message = "enable_drift_detector is true, but extra_helm_values sets platformAgent.harness.driftDetector.enabled to something other than true, and Helm merges that document over the one this composition computes -- so the CR decides against the flag: a null leaf deletes the field and the CRD's default false applies, a false leaf arrives as false. The sink, topic and subscription are provisioned and bill either way, and no detector reads them. Remove the enabled leaf from extra_helm_values -- enable_drift_detector already writes it, and the rest of your driftDetector block is still merged in -- or set it to true."
+    }
+
+    # The web console holds the Platform Agent's API key with no login of its
+    # own; its deny-all-ingress NetworkPolicy is what confines access to
+    # kubectl port-forward. On a cluster that enforces no NetworkPolicy
+    # (create_cluster = false with accept_no_network_policy = true), any pod in
+    # the cluster could reach the console Service and drive the agent.
+    precondition {
+      condition     = !local.web_console_requested || module.gke_cluster.network_policy_enforced
+      error_message = "the web console requires a cluster that enforces NetworkPolicy (web_console_enabled = true or webConsole.enabled in extra_helm_values cannot be used when NetworkPolicy is not enforced, such as create_cluster = false with accept_no_network_policy = true): its deny-all-ingress NetworkPolicy is what confines access to kubectl port-forward, and without enforcement any pod in the cluster can reach the console Service and drive the agent."
     }
   }
 }

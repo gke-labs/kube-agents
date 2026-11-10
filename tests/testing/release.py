@@ -16,16 +16,20 @@ MOCK_REQUIRED_RELEASE_IMAGES = [
     "k8s-operator",
     "platform-agent",
     "credential-proxy",
+    "kube-proxy",
     "agent-sandbox",
     "replay-proxy",
     "pubsub-platform",
     "gke-stockout-investigator",
     "a2a-gateway",
     "a2a-worker",
+    "persona-cluster",
     "a2a-authcallout",
     "a2a-verifier",
+    "a2a-dispatcher",
     "a2a-console",
     "hermes-bridge",
+    "web-console",
 ]
 
 # A list from before the growths: what a candidate or a release line cut

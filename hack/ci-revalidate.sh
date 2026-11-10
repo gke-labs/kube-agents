@@ -13,9 +13,9 @@
 # Three things count as a verdict this run could only repeat. The first is a
 # green build at THIS head (#1202), or at an earlier head with the same tree
 # (an empty commit, or a message-only rewrite: the matrix gets the same
-# files, so it is the same head in all but name): Tide credits a presubmit only against the
-# base SHA it ran on, so every merge to main retests, or batches, every other
-# green pull request whose head has not changed -- over the three weeks to
+# files, so it is the same head in all but name): Tide credited a presubmit only against the
+# base SHA it ran on, so every merge to main retested, or batched, every other
+# green pull request whose head had not changed -- over the three weeks to
 # 2026-10-05 that was 150 Tide-started runs against 831 merges, 34 of them on
 # a pull request that had already merged, and batches held the pool for 53
 # hours in all with nothing merging while one was in flight. A head that
@@ -25,7 +25,7 @@
 # retest at a new base WOULD test a different combination, and reusing the
 # head's verdict means that combination -- and, in a batch, the pulls with
 # each other -- is not tested before the merge, on every retest rather than
-# only when the sticky re-pin wins its race. The nightly eval on main is
+# only when the sticky re-pin (retired since) won its race. The nightly eval on main is
 # what finds a combination that broke, and so is the next full run any pull
 # request starts after it. The second is a green at an EARLIER head from
 # which everything since -- on the pull request's side AND on main's side
@@ -43,10 +43,10 @@
 # the override plugin posts a success status reading "Overridden by <user>"
 # (kubernetes-sigs/prow, pkg/plugins/override), which only a repository
 # admin can obtain, and it is the admin's decision that this head merges
-# without the job passing. A retest Tide starts after main moves posts
-# `pending` over that status and, run in full, comes back with whatever red
+# without the job passing. A retest Tide started after main moved posted
+# `pending` over that status and, run in full, came back with whatever red
 # the override was given for -- so the override had to be repeated after
-# every merge, and the phantom retest Tide starts on a pull request it has
+# every merge, and the phantom retest Tide started on a pull request it had
 # just merged by override ran the whole matrix for nobody (#2464 on
 # 2026-10-06: two overrides six minutes apart, then a phantom). Reusing
 # the override is the same trade as reusing a green, at the admin's
@@ -75,11 +75,11 @@
 # and skips the build as an override's standing rather than a run. A reuse
 # of a green is not marked: a build that reused a real green is attested in
 # its own right, and marking it would push the real green past the scan's
-# depth on a pull request Tide retests often. A run that cannot write the
+# depth on a pull request that is retested often. A run that cannot write the
 # record (no ARTIFACTS directory, an unwritable file) does not reuse an
 # override.
 #
-# A batch job (Tide testing several pull requests merged together) is
+# A batch job (one in which Tide tested several pull requests merged together) is
 # revalidated pull by pull: every one must hold a reusable verdict, else the
 # batch runs in full. PULL_REFS carries the batch's pulls; a serial presubmit
 # names its one pull in PULL_NUMBER and PULL_PULL_SHA.
@@ -118,7 +118,7 @@
 # its own context green can already edit this script to `exit 0` -- its own
 # code IS the job -- and a pull request that edits the revalidation logic
 # touches hack/, which is not inert, so its own run goes full. That argument
-# does NOT cover the CROSS-PR case: the job history under gs://kube-agents-prow
+# does NOT cover the CROSS-PR case: the job history under the log bucket
 # is written by pod utilities that may share the test container's identity,
 # so a hostile pull request's run could conceivably plant a fabricated
 # "green" record under a VICTIM pull request's history path (kube-agents-bot's
@@ -140,7 +140,8 @@
 # only after GitHub confirmed the commenter is a repository admin -- on
 # this build; upstream also honours allowed_github_teams and
 # allow_top_level_owners, and prow/oss/plugins.yaml in oss-test-infra sets
-# neither for the plugin, so widening it there widens who step 0 trusts. A copy of that description under another login -- the sticky
+# neither for the plugin, so widening it there widens who step 0 trusts. A
+# copy of that description under another login -- the retired sticky
 # re-pin's, posted with a workflow token -- is not read as one; the
 # original event is still on the head beside it.
 #
@@ -181,8 +182,10 @@ set -euo pipefail
 # below the root (agents/**/*.md is prompt content shipped in the image)
 # must still run the eval.
 readonly REVALIDATION_INERT_PATHS='^((docs|\.github|examples)/|[^/]+\.md$|(LICENSE|OWNERS|OWNERS_ALIASES)$)'
-# Where the job history lives and how a human opens a build from the log.
-readonly REVALIDATION_HISTORY_PREFIX="gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents"
+# Where the job history lives: the bucket kube-agents owns for the smoke
+# lanes (oss-test-infra, decoration_config.gcs_configuration), not the Prow
+# cluster's default, which Deck renders to anyone.
+readonly REVALIDATION_HISTORY_PREFIX="gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents"
 # The job whose history and status context step 0 reads: the running job's
 # own name, which Prow exports as JOB_NAME. Every presubmit that runs this
 # script has its own history path and its own status context, so keying the
@@ -192,7 +195,10 @@ readonly REVALIDATION_HISTORY_PREFIX="gs://kube-agents-prow/pr-logs/pull/gke-lab
 # lines and the tests naming the job that exists.
 readonly REVALIDATION_DEFAULT_JOB_NAME="pull-kube-agents-smoke-test"
 readonly REVALIDATION_JOB_NAME="${JOB_NAME:-${REVALIDATION_DEFAULT_JOB_NAME}}"
-readonly REVALIDATION_SPYGLASS_PREFIX="https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents"
+# How a human opens a reused build from the log: the Cloud Console's bucket
+# browser, which project readers can open; Deck has no read on this bucket,
+# so its Spyglass page would show nothing.
+readonly REVALIDATION_BUILD_URL_PREFIX="https://console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents"
 # The started.json repos key naming this repository's clone record, and the
 # base ref assumed when the decoration did not export PULL_BASE_REF.
 readonly REVALIDATION_REPO_KEY="gke-labs/kube-agents"
@@ -226,15 +232,15 @@ readonly REVALIDATION_OVERRIDE_CANCEL_PREFIX="Override cancelled by"
 # comment-URL event is always there (#2464's head carries both).
 readonly REVALIDATION_PULL_URL_PREFIX="https://github.com/gke-labs/kube-agents/pull"
 # How many of the newest builds to inspect for a green one. Each costs one
-# gsutil cat (~1s); an active PR rarely stacks this many pushes between
+# gcloud storage cat (~1s); an active PR rarely stacks this many pushes between
 # greens, and a bound keeps the fall-through path seconds long.
 readonly REVALIDATION_HISTORY_LIMIT=20
 # A green from before the job changed what it grades is not a verdict this
 # run could only repeat. EVAL_REVALIDATION_NOT_BEFORE, a UTC time set in the
 # job's env in oss-test-infra (the swap to spec.mode next, or a rollback to
 # today), refuses a green build whose EARLIEST matching success status on
-# GitHub was created before it: the original crier event, which the sticky
-# re-pin's later copies (same build URL) cannot stand in for. GitHub's
+# GitHub was created before it: the original crier event, which the retired
+# sticky re-pin's later copies (same build URL) cannot stand in for. GitHub's
 # time, not the GCS record's, for the trust-surface reason above. Unset or
 # empty, nothing changes; unparsable, an event with no readable time, or a
 # status read stopped at its page cap (the original may lie past it), is a
@@ -242,8 +248,8 @@ readonly REVALIDATION_HISTORY_LIMIT=20
 readonly REVALIDATION_NOT_BEFORE="${EVAL_REVALIDATION_NOT_BEFORE:-}"
 # The status read pages through GitHub's newest-first events (100 a page,
 # following `Link: rel="next"`) up to this many pages. One page is not
-# enough: the sticky re-pin posts a copy on every open head after every
-# merge to main -- about two dozen a day -- so the one Prow-bot event an
+# enough: until it was retired, the sticky re-pin posted a copy on every open
+# head after every merge to main -- about two dozen a day -- so the one Prow-bot event an
 # override binds to is past the first hundred within days, where a green's
 # attestation matches the re-pin copies themselves (they carry the build's
 # URL). Ten pages is a thousand events, some six weeks of re-pins at an
@@ -569,7 +575,7 @@ revalidate_from_green_history() {
 
   local history_dir="${REVALIDATION_HISTORY_PREFIX}/${pull_number}/${REVALIDATION_JOB_NAME}"
   local listing
-  if ! listing="$(gsutil ls "${history_dir}/*/finished.json" 2>/dev/null)"; then
+  if ! listing="$(gcloud storage ls "${history_dir}/*/finished.json" 2>/dev/null)"; then
     _revalidation_no_green "no finished ${REVALIDATION_JOB_NAME} build for PR #${pull_number} (first run on this PR, or GCS unreadable)"
     return 1
   fi
@@ -598,7 +604,7 @@ revalidate_from_green_history() {
   local build prev_green="" finished_revision="" candidate_parsed candidate_revision
   while read -r build; do
     [ -n "${build}" ] || continue
-    candidate_parsed="$(gsutil cat "${history_dir}/${build}/finished.json" 2>/dev/null | python3 -c '
+    candidate_parsed="$(gcloud storage cat "${history_dir}/${build}/finished.json" 2>/dev/null | python3 -c '
 import json
 import sys
 
@@ -634,7 +640,7 @@ EOF_REVALIDATION_CANDIDATES
   # the same Refs.String() shape as PULL_REFS, so a pull entry may carry a
   # third ":<ref>" field; only the first two are read.
   local started shas prev_base prev_head
-  if ! started="$(gsutil cat "${history_dir}/${prev_green}/started.json" 2>/dev/null)"; then
+  if ! started="$(gcloud storage cat "${history_dir}/${prev_green}/started.json" 2>/dev/null)"; then
     _revalidation_no_green "green build ${prev_green} of PR #${pull_number} has no readable started.json"
     return 1
   fi
@@ -750,13 +756,13 @@ print("attested")
   esac
 
   # The head itself has passed: the first kind of reusable verdict. The
-  # base is not compared -- a retest Tide starts because main moved, serial
-  # or batch, is exactly this case, and the header says what that trades
+  # base is not compared -- a retest Tide started because main moved, serial
+  # or batch, was exactly this case, and the header says what that trades
   # away. No git work is needed: the attested record names the head, and
   # the head is this run's.
   if [ "${prev_head}" = "${cur_head}" ]; then
     echo "PR #${pull_number} holds a reusable verdict: green build ${prev_green} -- this head already passed"
-    echo "Reused verdict: ${REVALIDATION_SPYGLASS_PREFIX}/${pull_number}/${REVALIDATION_JOB_NAME}/${prev_green}"
+    echo "Reused verdict: ${REVALIDATION_BUILD_URL_PREFIX}/${pull_number}/${REVALIDATION_JOB_NAME}/${prev_green}"
     echo "Attested by the Prow-posted ${REVALIDATION_JOB_NAME} success status on ${prev_head}"
     echo "Same head ${cur_head}; base ${prev_base} then, ${cur_base} now -- a head that passed once passes"
     REVALIDATION_REUSED+=("green build ${prev_green} (PR #${pull_number})")
@@ -787,7 +793,7 @@ print("attested")
     && cur_tree="$(git -C "${repo_dir}" rev-parse --verify --quiet "${cur_head}^{tree}" 2>/dev/null)" \
     && [ "${prev_tree}" = "${cur_tree}" ]; then
     echo "PR #${pull_number} holds a reusable verdict: green build ${prev_green} -- this tree already passed"
-    echo "Reused verdict: ${REVALIDATION_SPYGLASS_PREFIX}/${pull_number}/${REVALIDATION_JOB_NAME}/${prev_green}"
+    echo "Reused verdict: ${REVALIDATION_BUILD_URL_PREFIX}/${pull_number}/${REVALIDATION_JOB_NAME}/${prev_green}"
     echo "Attested by the Prow-posted ${REVALIDATION_JOB_NAME} success status on ${prev_head}"
     echo "Same tree ${cur_tree} at head ${prev_head} then, ${cur_head} now; base ${prev_base} then, ${cur_base} now -- a tree that passed once passes"
     REVALIDATION_REUSED+=("green build ${prev_green} (PR #${pull_number})")
@@ -819,7 +825,7 @@ print("attested")
   fi
 
   echo "PR #${pull_number} holds a reusable verdict: green build ${prev_green} -- every change since is inert"
-  echo "Reused verdict: ${REVALIDATION_SPYGLASS_PREFIX}/${pull_number}/${REVALIDATION_JOB_NAME}/${prev_green}"
+  echo "Reused verdict: ${REVALIDATION_BUILD_URL_PREFIX}/${pull_number}/${REVALIDATION_JOB_NAME}/${prev_green}"
   echo "Attested by the Prow-posted ${REVALIDATION_JOB_NAME} success status on ${prev_head}"
   _revalidation_print_delta "head delta" "${prev_head}..${cur_head}" "${head_delta}"
   _revalidation_print_delta "base delta" "${prev_base}..${cur_base}" "${base_delta}"
@@ -835,11 +841,11 @@ revalidate_against_green_history() {
     echo "Step 0: full run: EVAL_SKIP_REVALIDATION=1 (escape hatch)"
     return 1
   fi
-  if ! command -v gsutil >/dev/null 2>&1; then
-    echo "Step 0: full run: no gsutil on PATH to read the job history with"
+  if ! command -v gcloud >/dev/null 2>&1; then
+    echo "Step 0: full run: no gcloud on PATH to read the job history with"
     return 1
   fi
-  # Preflighted like gsutil so a missing interpreter logs its own reason
+  # Preflighted like gcloud so a missing interpreter logs its own reason
   # instead of every finished.json silently classifying as not-green.
   if ! command -v python3 >/dev/null 2>&1; then
     echo "Step 0: full run: no python3 on PATH to parse the job records with"
@@ -852,7 +858,7 @@ revalidate_against_green_history() {
   # shell's) cannot narrow a batch to one pull; a serial presubmit names its
   # one pull in PULL_NUMBER and PULL_PULL_SHA.
   # Prow's decoration exports 40-hex SHAs. The ones this run was handed are
-  # held to that shape before any of them reaches gsutil or git, as the
+  # held to that shape before any of them reaches gcloud storage or git, as the
   # recovered ones are: a value shaped like an option would otherwise reach
   # `git diff` as one, and an empty file list reads as an inert delta.
   if [ -n "${PULL_BASE_SHA:-}" ] && ! [[ "${PULL_BASE_SHA}" =~ ${REVALIDATION_SHA_RE} ]]; then

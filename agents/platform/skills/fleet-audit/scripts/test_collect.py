@@ -16,10 +16,10 @@ import json
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import sys
 import textwrap
+import types
 import unittest
 import os
 from contextlib import contextmanager, redirect_stderr
@@ -31,6 +31,32 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import collect  # noqa: E402
+import test_collector_run as _shared_run_tests  # noqa: E402
+import audit_report  # noqa: E402
+
+# The longest identifiers a recorded command can carry in its kubeconfig path
+# under the shipped platform profile: a 30-character project id, a 40-character
+# cluster name, GCP's longest location. A collector's recorded chain is held
+# under `audit_report.MAX_COMMAND_CHARS` at this length, since `finish` refuses
+# a `checks_run` command over it and the SOPs copy the chain verbatim.
+PLATFORM_PROFILE_KUBECONFIG_DIR = Path("/opt/data/profiles/platform/.kubeconfigs")
+LONGEST_PROJECT = "p" * 30
+LONGEST_CLUSTER = "c" * 40
+LONGEST_LOCATION = "northamerica-northeast1-a"
+
+# The collector pages its kinds through `kubectl get --raw`; the fakes below
+# still answer the one-shot dump, and the adapter feeds the real paging from
+# it (test_collector_run.paged_dump_over). The tests that assert the paged
+# argv itself patch the real `paged_dump` back in.
+_PAGED_DUMP = patch.object(collect, "paged_dump", _shared_run_tests.paged_dump_over())
+
+
+def setUpModule():
+    _PAGED_DUMP.start()
+
+
+def tearDownModule():
+    _PAGED_DUMP.stop()
 
 # Every resolver asks the operator's answer when a run passes neither scope flag:
 # the root-owned file the sandbox writes, else KUBEAGENTS_SCOPE_DECLARED. A shell
@@ -38,6 +64,11 @@ import collect  # noqa: E402
 # would turn this suite's listing tests into refusals. The suite is about the
 # collector, not the host it runs on, so both are neutralised at import.
 os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)  # module-level, on purpose
+# The sweep width is read from the credential broker (broker_admission); with its
+# URLs unset that read makes no request and the width is the fallback, four, so
+# no test here reaches the network or depends on the host's broker.
+os.environ.pop("CREDENTIAL_PROXY_URL", None)  # module-level, on purpose
+os.environ.pop("CREDENTIAL_PROXY_EXEC_URL", None)  # module-level, on purpose
 import fleet_scope_args as _fleet_scope_args  # noqa: E402
 
 _fleet_scope_args.SCOPE_DECLARED_FILE = "/nonexistent/kube-agents-sandbox/scope-declared"
@@ -162,7 +193,7 @@ class TestReconcilerOf(unittest.TestCase):
     All three markers are written at apply time and sit in the dump every check
     already runs on, so naming the reconciler costs no extra call. The phrase
     ends up in the remediation note of any `manual` finding on the object --
-    `audit_report.disclose_reconciled_manual_remediations` -- which is why each
+    `audit_report.disclose_manual_remediation_routes` -- which is why each
     one names the release or Application rather than saying "something".
     """
 
@@ -428,24 +459,20 @@ def context_of(dump=None, **overrides):
 
 
 class TestSweepPool(unittest.TestCase):
-    # The credential proxy admits four requests at once under its child memory
-    # budget at the operator's default 1Gi limit
-    # (docs/designs/credential-proxy-child-memory-budget.md §2.2). stall_watch.py and
-    # cluster_agent_reconcile.py pin the same figure for their listing pools; the
-    # broker computes the admitted count at runtime from its container limit and
-    # exposes no constant, so this pins the shared figure the pools agree on at the
-    # default limit -- four -- not the broker's running count. A non-default proxy
-    # limit is the caller's to re-sync (see collect.py and #2639).
-    DEFAULT_LIMIT_ADMITTED_COUNT = 4
+    # Every check a sweep runs is a command the credential broker executes, and
+    # the broker admits its slot cap or what its child memory budget fits at the
+    # container's effective limit (8 at the default 2Gi, 4 on Autopilot without
+    # bursting). Only the broker sees that limit, so each collector reads its
+    # width from it through broker_admission.sweep_width() rather than carrying a
+    # constant (broker_admission.py has the formula and the fallback).
 
-    def test_collector_pools_pin_the_default_limit_admitted_count(self):
-        self.assertEqual(collect.MAX_WORKERS, self.DEFAULT_LIMIT_ADMITTED_COUNT)
+    def test_collector_pools_resolve_the_broker_width(self):
         here = Path(__file__).resolve().parent
         # Every module in this directory that runs a worker pool is a sweep
         # collector and must be pinned. Discovered by the pool it runs
         # (ThreadPoolExecutor), not by a constant name the diff happens to use, so
-        # a collector added under MAX_WORKERS, LIST_WORKERS, WORKERS or any other
-        # name fails this test rather than slipping through unpinned.
+        # a collector added under any name fails this test rather than slipping
+        # through unpinned.
         pooled = sorted(
             path
             for path in here.glob("*.py")
@@ -454,17 +481,52 @@ class TestSweepPool(unittest.TestCase):
         self.assertTrue(pooled, "no pooled collector modules discovered -- did the scan break?")
         for path in pooled:
             with self.subTest(collector=path.name):
-                mod = importlib.import_module(path.stem)
-                self.assertTrue(
-                    hasattr(mod, "MAX_WORKERS") and hasattr(mod, "collect_fleet"),
-                    f"{path.name} runs a worker pool but exposes no MAX_WORKERS + collect_fleet to pin; "
-                    "name its pool MAX_WORKERS and its entry collect_fleet, or widen this scan",
-                )
-                self.assertEqual(mod.MAX_WORKERS, collect.MAX_WORKERS)
-                self.assertEqual(
-                    inspect.signature(mod.collect_fleet).parameters["max_workers"].default,
-                    mod.MAX_WORKERS,
-                )
+                if path.name == "kcc_health.py":
+                    # Not a sweep collector: the Config Connector read the
+                    # collectors share. Its per-kind pool and its slot bound
+                    # take the same broker width, with no constant for it.
+                    assert_kcc_health_resolves_the_broker_width(self)
+                    continue
+                assert_resolves_the_broker_width(self, importlib.import_module(path.stem), path.name)
+
+
+class _WidthAsked(Exception):
+    """Raised by a patched broker_admission.sweep_width, to show it was asked."""
+
+
+def assert_resolves_the_broker_width(case, mod, name):
+    """``mod``'s pool width is the broker's: ``collect_fleet(max_workers=None)``
+    resolves it through broker_admission, and no constant stands in for it."""
+    case.assertTrue(hasattr(mod, "collect_fleet"), f"{name} runs a worker pool but exposes no collect_fleet to pin")
+    case.assertIsNone(
+        inspect.signature(mod.collect_fleet).parameters["max_workers"].default,
+        f"{name}: collect_fleet's max_workers must default to None, resolved from the broker",
+    )
+    case.assertIn("broker_admission", vars(mod), f"{name} doesn't import broker_admission")
+    case.assertFalse(hasattr(mod, "MAX_WORKERS"), f"{name} still carries a MAX_WORKERS constant")
+    # By behaviour, not by the line's spelling: with max_workers unset,
+    # collect_fleet asks the broker before anything else. The patched
+    # sweep_width raises, so nothing past that point runs, and the required
+    # arguments it never reaches can be placeholders.
+    required = [
+        param
+        for param in inspect.signature(mod.collect_fleet).parameters.values()
+        if param.default is inspect.Parameter.empty
+        and param.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    with mock.patch.object(mod.broker_admission, "sweep_width", side_effect=_WidthAsked):
+        with case.assertRaises(_WidthAsked, msg=f"{name}: collect_fleet doesn't ask broker_admission.sweep_width() for its width"):
+            mod.collect_fleet(*[None] * len(required))
+
+
+def assert_kcc_health_resolves_the_broker_width(case):
+    """kcc_health's request bound (`proxy_slots`) is the broker's width."""
+    import kcc_health  # noqa: PLC0415
+
+    with mock.patch.object(collect.broker_admission, "sweep_width", return_value=3):
+        case.assertEqual(kcc_health.proxy_slots(), 3)
+    case.assertFalse(hasattr(kcc_health, "MAX_WORKERS"), "kcc_health.py still carries a MAX_WORKERS constant")
+    case.assertFalse(hasattr(kcc_health, "KIND_READ_WORKERS"), "kcc_health.py still carries a pool width constant")
 
 
 class TestNoRequests(unittest.TestCase):
@@ -924,6 +986,17 @@ class TestNoPdb(unittest.TestCase):
 
     def test_a_single_replica_workload_is_never_flagged(self):
         self.assertIsNone(collect.check_no_pdb(self.wl(replicas=1), context_of()))
+
+    def test_the_impact_frames_upgrades_and_scale_downs_not_one_drain(self):
+        """#4966: one drain evicts only the pods on that node, so three replicas
+        on three nodes survive it. The risk is co-location and back-to-back
+        drains during upgrades and scale-downs, and the sentence must say so."""
+        impact = next(s for s in collect.OBTAINABILITY_CHECKS if s.slug == "no-pdb").impact
+        for phrase in ("node upgrades", "scale-downs", "every replica on that node", "back-to-back drains"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, impact)
+        self.assertNotIn("single node drain", impact)
+        self.assertNotIn("terminate every replica", impact)
 
 
 class TestBlockingPdb(unittest.TestCase):
@@ -3971,8 +4044,7 @@ class TestDumpStateGate(unittest.TestCase):
             return Run(argv, rc, stdout, "", 0.05)
 
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "SCRATCH_DIR", tmp):
-                return collect.dump_state(Path(tmp) / "kc.yaml", "c1", run=run)
+            return collect.dump_state(Path(tmp) / "kc.yaml", "c1", run=run)
 
     def test_a_well_formed_dump_passes_the_gate(self):
         _, _, gate_ok = self.run_dump(json.dumps({"items": []}))
@@ -3997,22 +4069,61 @@ class TestDumpStateGate(unittest.TestCase):
         _, _, gate_ok = self.run_dump(json.dumps({"error": "no"}))
         self.assertFalse(gate_ok)
 
-    def test_two_same_named_clusters_in_two_projects_write_two_files(self):
-        """The design's thread-safety rule is that a worker writes only to
-        paths keyed by its own cluster, and named this file as the case no two
-        threads can collide on. A cluster name is unique within a project, not
-        across the eight this collector runs at once: two clusters called
-        `prod` wrote one path, and the loser re-read the winner's dump — one
-        cluster's workloads published under the other's name."""
+    def test_the_dump_is_returned_parsed_and_nothing_is_written(self):
+        """The dump used to land in a `wra_state_<project>_<cluster>_<location>.json`
+        scratch file and be read straight back (two same-named clusters in two
+        projects once shared one path). Nothing read it after that, so the
+        parsed dict is the whole answer and the scratch directory stays empty."""
 
         def run(argv, **kwargs):
-            return Run(argv, 0, json.dumps({"items": []}), "", 0.05)
+            return Run(argv, 0, json.dumps({"items": [{"kind": "Deployment", "metadata": {"name": "web"}}]}), "", 0.05)
 
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "SCRATCH_DIR", tmp):
-                a, _, _ = collect.dump_state(Path(tmp) / "kc.yaml", "prod", project="acme-a", location="us-central1", run=run)
-                b, _, _ = collect.dump_state(Path(tmp) / "kc.yaml", "prod", project="acme-b", location="us-central1", run=run)
-        self.assertNotEqual(a, b)
+            with patch.dict(os.environ, {"FLEET_AUDIT_SCRATCH_DIR": tmp}):
+                parsed, _, gate_ok = collect.dump_state(Path(tmp) / "kc.yaml", "prod", project="acme-a", location="us-central1", run=run)
+            self.assertEqual([], [p.name for p in Path(tmp).iterdir()])
+        self.assertTrue(gate_ok)
+        self.assertEqual(["web"], [i["metadata"]["name"] for i in parsed["items"]])
+        self.assertFalse(hasattr(collect, "SCRATCH_DIR"))
+
+    def test_the_dump_is_one_paged_raw_read_per_kind(self):
+        """The real paging, not the adapter: every kind in DUMP_COMMAND_KINDS is
+        a `kubectl get --raw` collection read with a page limit, the
+        deployments' continue token is followed, and a cut page fails the gate
+        with the shim's exit code on the run."""
+        issued = []
+
+        def run(argv, **kwargs):
+            issued.append(argv)
+            path, _, query = argv[3].partition("?")
+            if path == "/apis/apps/v1/deployments" and "continue=" not in query:
+                return Run(argv, 0, json.dumps({"metadata": {"continue": "next"}, "items": [{"metadata": {"name": "a", "managedFields": [{}]}}]}), "", 0.01)
+            if path == "/apis/apps/v1/deployments":
+                return Run(argv, 0, json.dumps({"metadata": {}, "items": [{"metadata": {"name": "b"}}]}), "", 0.01)
+            return Run(argv, 0, json.dumps({"metadata": {}, "items": []}), "", 0.01)
+
+        with TemporaryDirectory() as tmp, patch.object(collect, "paged_dump", _shared_run_tests.cr.paged_dump):
+            parsed, result, gate_ok = collect.dump_state(Path(tmp) / "kc.yaml", "c1", run=run)
+        self.assertTrue(gate_ok)
+        self.assertEqual(len(collect.DUMP_COMMAND_KINDS.split(",")) + 1, len(issued))
+        self.assertTrue(all(a[:3] == ["kubectl", "get", "--raw"] for a in issued))
+        self.assertIn("/apis/apps/v1/deployments?limit=500&continue=next", [a[3] for a in issued])
+        self.assertIn("/api/v1/nodes?limit=100", [a[3] for a in issued])
+        self.assertEqual([("Deployment", "a"), ("Deployment", "b")], [(i["kind"], i["metadata"]["name"]) for i in parsed["items"]])
+        self.assertNotIn("managedFields", parsed["items"][0]["metadata"])
+        self.assertEqual(0, result.rc)
+
+        def cut(argv, **kwargs):
+            if argv[3].startswith("/api/v1/services"):
+                return Run(argv, 74, '{"items": [{"metadata": {"name": "s', "credential proxy output truncated at 8388608 bytes (kept 8388608 bytes of stdout; exit 74)\n", 0.01)
+            return run(argv, **kwargs)
+
+        with TemporaryDirectory() as tmp, patch.object(collect, "paged_dump", _shared_run_tests.cr.paged_dump):
+            parsed, result, gate_ok = collect.dump_state(Path(tmp) / "kc.yaml", "c1", run=cut)
+        self.assertFalse(gate_ok)
+        self.assertIsNone(parsed)
+        self.assertEqual(74, result.rc)
+        self.assertIn("credential proxy output truncated", result.stderr)
 
 
 class TestCollectCluster(unittest.TestCase):
@@ -4030,8 +4141,7 @@ class TestCollectCluster(unittest.TestCase):
             return Run(argv, 0, "", "", 0.01)
 
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), \
-                    patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 result = collect.collect_cluster(
                     cluster or self.CLUSTER, "obtainability-audit",
                     checks or collect.OBTAINABILITY_CHECKS, run=run
@@ -4248,8 +4358,7 @@ class TestCollectCluster(unittest.TestCase):
             return Run(argv, 0, "", "", 0.01)
 
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), \
-                    patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 result = collect.collect_cluster(cluster, "obtainability-audit", collect.OBTAINABILITY_CHECKS, run=run)
         by_slug = {c["check"]: c for c in result["candidates"]}
         self.assertEqual(by_slug["no-requests"]["severity"], "minor")
@@ -4352,6 +4461,33 @@ class TestCollectCluster(unittest.TestCase):
         )
         self.assertIn("kubectl get computeclasses", cc_cmd)
 
+    def test_every_check_records_the_paged_dump_chain_under_the_clusters_kubeconfig(self):
+        """The record, not only the reads: each obtainability check's `command` is
+        the chain `paged_command_text` builds for DUMP_COMMAND_KINDS under the
+        cluster's kubeconfig in the patched directory, the SOP's evidence command.
+        A record put back to the one-shot `kubectl get <kinds> -A -o json` fails
+        here however `dump_state` reads."""
+
+        def run(argv, **kwargs):
+            if "get-credentials" in argv:
+                return Run(argv, 0, "", "", 0.1)
+            if argv[:2] == ["kubectl", "get"]:
+                return Run(argv, 0, json.dumps(dump_of(deployment("api"))), "", 0.2)
+            return Run(argv, 0, "", "", 0.01)
+
+        with TemporaryDirectory() as tmp, patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
+            result = collect.collect_cluster(self.CLUSTER, "obtainability-audit", collect.OBTAINABILITY_CHECKS, run=run)
+            kubeconfig = collect.kubeconfig_path(self.CLUSTER["project"], self.CLUSTER["name"], self.CLUSTER["location"])
+        self.assertEqual(result["outcome"], "collected", result.get("error"))
+        self.assertTrue(str(kubeconfig).startswith(tmp), kubeconfig)
+        expected = collect.paged_command_text(collect.DUMP_COMMAND_KINDS.split(","), kubeconfig=kubeconfig)
+        self.assertTrue(expected.startswith("( export KUBECONFIG="), expected)
+        dump_slugs = {c["check"] for c in result["commands"] if c["check"] != "untargeted-compute-class-workload"}
+        self.assertEqual({spec.slug for spec in collect.OBTAINABILITY_CHECKS} - {"untargeted-compute-class-workload"}, dump_slugs)
+        for c in result["commands"]:
+            if c["check"] != "untargeted-compute-class-workload":
+                self.assertEqual(expected, c["command"], c["check"])
+
 
 class TestCollectFleet(unittest.TestCase):
     def test_every_enumerated_cluster_gets_an_entry_even_under_parallelism(self):
@@ -4378,8 +4514,7 @@ class TestCollectFleet(unittest.TestCase):
             return Run(argv, 0, "", "", 0.01)
 
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), \
-                    patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 manifest = collect.collect_fleet("obtainability-audit", "acme", run=run, max_workers=3)
 
         names = {c["name"]: c["outcome"] for c in manifest["clusters"]}
@@ -4417,8 +4552,7 @@ class TestCollectFleet(unittest.TestCase):
             return Run(argv, 0, "", "", 0.01)
 
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), \
-                    patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 manifest = collect.collect_fleet("obtainability-audit", "acme", run=run)
         outcomes = {c["name"]: c["outcome"] for c in manifest["clusters"]}
         self.assertEqual(
@@ -4454,8 +4588,7 @@ class TestCollectFleet(unittest.TestCase):
             return Run(argv, 0, "", "", 0.01)
 
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), \
-                    patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 manifest = collect.collect_fleet("obtainability-audit", "acme", run=run)
 
         outcomes = {c["name"]: c["outcome"] for c in manifest["clusters"]}
@@ -4580,7 +4713,7 @@ class TestDiscovery(unittest.TestCase):
 
     def collect(self, run):
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 return collect.collect_fleet("obtainability-audit", run=run)
 
     def test_every_listed_project_is_swept_and_named_by_its_qualified_target(self):
@@ -4692,8 +4825,7 @@ class TestManifestComposesWithAuditReport(unittest.TestCase):
             return Run(argv, 0, "", "", 0.01)
 
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), \
-                    patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 return collect.collect_fleet("obtainability-audit", run=run)
 
     def test_the_full_roster_of_checks_run_verifies_against_the_real_manifest(self):
@@ -4739,12 +4871,17 @@ class TestManifestComposesWithAuditReport(unittest.TestCase):
                 # check is declared inapplicable and `checks_run` below is
                 # rightly rejected for naming checks that examined nothing.
                 return Run(argv, 0, json.dumps(dump_of(compliance_pod("app"))), "", 0.1)
-            if argv[:3] == ["kubectl", "get", collect.KCC_CATEGORY]:
+            if is_kcc_read(argv):
                 # One healthy Config Connector object. An empty list here is
                 # not the same thing: it declares `kcc-object-wedged`
                 # inapplicable, and the full roster this test asserts against
                 # would then rightly be rejected for naming a check nothing ran.
-                return Run(argv, 0, json.dumps(dump_of(kcc_object("ComputeFirewall", "allow-ssh"))), "", 0.1)
+                return serve_kcc(argv, [kcc_object("ComputeFirewall", "allow-ssh")])
+            if argv[:2] == ["kubectl", "get"] and argv[2] in collect.CONFIGSYNC_SYNC_KINDS:
+                # One healthy RootSync, for the reason the `gcp` read above
+                # answers with one healthy object: served and empty would
+                # declare `configsync-reconciler-stalled` inapplicable.
+                return Run(argv, 0, json.dumps(dump_of(configsync_object("RootSync", "root-sync"))), "", 0.1)
             if argv[:2] == ["kubectl", "get"]:
                 return Run(argv, 0, json.dumps(dump_of()), "", 0.1)
             if argv[:3] == ["gcloud", "container", "clusters"]:
@@ -4754,7 +4891,7 @@ class TestManifestComposesWithAuditReport(unittest.TestCase):
             return Run(argv, 0, "", "", 0.01)
 
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 manifest = collect.collect_fleet("compliance-audit", run=run)
 
         checks_run = [{"check": c.slug, "command": "x"} for c in collect.COMPLIANCE_CHECKS]
@@ -4776,7 +4913,7 @@ class TestManifestComposesWithAuditReport(unittest.TestCase):
             return Run(argv, 0, "", "", 0.01)
 
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 manifest = collect.collect_fleet("ai-security-audit", run=run)
 
         checks_run = [{"check": c.slug, "command": "x"} for c in collect.AI_SECURITY_CHECKS]
@@ -4833,8 +4970,43 @@ def compliance_pod(name, ns="default", **meta_overrides):
     return doc
 
 
+# The group of every fake Config Connector kind, and the kind a cluster that
+# runs Config Connector lists when it holds no object.
+KCC_FAKE_GROUP = "test.cnrm.cloud.google.com"
+KCC_DEFAULT_KIND = "ComputeFirewall"
+
+
+def kcc_crd_line(kind):
+    """One line of `kubectl api-resources -o wide --no-headers` for a kind."""
+    return f"{kind.lower()}s   {KCC_FAKE_GROUP}/v1beta1   true   {kind}   get,list,watch   gcp"
+
+
+def is_kcc_read(argv):
+    """Whether `argv` is a step of `kcc_health.read_objects`."""
+    return argv[:2] == ["kubectl", "api-resources"] or argv[:3] == ["kubectl", "get", "--raw"]
+
+
+def serve_kcc(argv, kcc_items):
+    """One step of the Config Connector read (`kcc_health.read_objects`).
+
+    `kcc_items` None: no Config Connector kind served. A list: the cluster
+    runs Config Connector and holds those objects, and it serves their kinds
+    (`KCC_DEFAULT_KIND` when it holds none). A callable: the discovery names
+    `KCC_DEFAULT_KIND`, and the callable answers that kind's list request.
+    """
+    if argv[1] == "api-resources":
+        if kcc_items is None:
+            return Run(argv, 0, "deployments   deploy   apps/v1   true   Deployment   get,list   all\n", "", 0.05)
+        kinds = sorted({item["kind"] for item in kcc_items} if not callable(kcc_items) and kcc_items else {KCC_DEFAULT_KIND})
+        return Run(argv, 0, "".join(kcc_crd_line(kind) + "\n" for kind in kinds), "", 0.05)
+    if callable(kcc_items):
+        return kcc_items(argv)
+    plural = argv[3].partition("?")[0].rsplit("/", 1)[1]
+    return Run(argv, 0, json.dumps(dump_of(*(i for i in kcc_items or [] if f"{i['kind'].lower()}s" == plural))), "", 0.05)
+
+
 def kcc_object(kind, name, ns="kubeagents-system", ready="True", reason="UpToDate", message="The resource is up to date"):
-    """A Config Connector object as `kubectl get gcp -A -o json` returns it.
+    """A Config Connector object as one kind's list request returns it.
 
     `ready=None` omits the condition entirely, which is what KCC has written
     in the seconds between an apply and its first reconcile.
@@ -4847,6 +5019,31 @@ def kcc_object(kind, name, ns="kubeagents-system", ready="True", reason="UpToDat
         if message is not None:
             condition["message"] = message
         doc["status"]["conditions"] = [condition]
+    return doc
+
+
+def configsync_object(kind, name, ns="config-management-system", stalled="False", syncing_refs=(), syncing_message="Sync Completed",
+                      reconciling="False", stage_errors=None):
+    """A Config Sync RootSync or RepoSync as `kubectl get <kind> -A -o json` returns it.
+
+    `stalled=None` omits every condition, which is what a just-applied object
+    carries. `syncing_refs` are the `errorSourceRefs` of the `Syncing`
+    condition; `stage_errors` is `{"source": [{"code": ..., "errorMessage": ...}]}`
+    and lands under `status.<stage>.errors`.
+    """
+    doc = {"kind": kind, "metadata": {"namespace": ns, "name": name}, "status": {}}
+    if stalled is None:
+        return doc
+    syncing = {"type": "Syncing", "status": "False", "reason": "Sync", "message": syncing_message}
+    if syncing_refs:
+        syncing["errorSourceRefs"] = list(syncing_refs)
+    doc["status"]["conditions"] = [
+        {"type": "Reconciling", "status": reconciling, "reason": "Deployment", "message": "Reconciler deployment was created"},
+        {"type": "Stalled", "status": stalled, "reason": "Deployment" if stalled == "True" else "", "message": "Reconciler deployment failed" if stalled == "True" else ""},
+        syncing,
+    ]
+    for stage, errors in (stage_errors or {}).items():
+        doc["status"][stage] = {"errors": errors, "errorSummary": {"totalCount": len(errors)}}
     return doc
 
 
@@ -7500,6 +7697,111 @@ def lb_service(
     return svc
 
 
+
+class TestConfigSyncReconcilerStalled(unittest.TestCase):
+    """§2.17. The twin of §2.12 for the controller that writes cluster state."""
+
+    SOURCE_ERROR = (
+        "KNV2004: error in the git-sync container: {\"Msg\":\"error running command\","
+        "\"Err\":\"fatal: could not read Username for 'https://github.com': terminal prompts disabled\"}"
+    )
+
+    def run_on(self, *objects):
+        return collect.check_configsync_reconciler_stalled({"configsync_objects": list(objects)})
+
+    def test_healthy_objects_report_nothing(self):
+        self.assertEqual(
+            self.run_on(configsync_object("RootSync", "root-sync"), configsync_object("RepoSync", "team-a", ns="team-a")),
+            [],
+        )
+
+    def test_no_conditions_yet_is_not_a_finding(self):
+        self.assertEqual(self.run_on(configsync_object("RootSync", "root-sync", stalled=None)), [])
+
+    def test_reconciling_alone_is_not_a_finding(self):
+        """The state of every first sync; a large repository holds it for a
+        long time, and no threshold this check could pick is defensible."""
+        self.assertEqual(self.run_on(configsync_object("RootSync", "root-sync", reconciling="True")), [])
+
+    def test_stalled_is_one_critical_naming_the_object(self):
+        hits = self.run_on(configsync_object("RootSync", "root-sync", stalled="True"))
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "RootSync/root-sync")
+        self.assertEqual(hits[0]["namespace"], "config-management-system")
+        self.assertIn("Deployment: Reconciler deployment failed", hits[0]["excerpt"])
+        self.assertNotIn("severity", hits[0])  # the CheckSpec's `critical` stands
+
+    def test_syncing_errors_name_the_stage_and_its_first_error(self):
+        hits = self.run_on(
+            configsync_object(
+                "RepoSync", "team-a", ns="team-a",
+                syncing_refs=["status.source.errors"], syncing_message="Source error",
+                stage_errors={"source": [{"code": "2004", "errorMessage": self.SOURCE_ERROR}]},
+            )
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "RepoSync/team-a")
+        self.assertIn("could not read Username", hits[0]["excerpt"])
+        self.assertIn("errors in status.source.errors", hits[0]["excerpt"])
+
+    def test_a_stale_stage_counter_without_a_syncing_ref_is_not_a_finding(self):
+        """The stage summaries keep the previous commit's errors until the next
+        stage overwrites them. The `Syncing` condition is scoped to the current
+        commit, and it is the one that decides."""
+        hits = self.run_on(
+            configsync_object(
+                "RootSync", "root-sync",
+                stage_errors={"sync": [{"code": "2009", "errorMessage": "failed to apply"}]},
+            )
+        )
+        self.assertEqual(hits, [])
+
+    def test_a_render_in_progress_is_not_a_finding(self):
+        hits = self.run_on(
+            configsync_object(
+                "RootSync", "root-sync",
+                syncing_refs=["status.rendering.errors"], syncing_message="Rendering in progress",
+                stage_errors={"rendering": [{"code": "2016", "errorMessage": "The rendering is still in progress"}]},
+            )
+        )
+        self.assertEqual(hits, [])
+
+    def test_a_mixed_stage_quotes_the_real_error_not_the_transient_one(self):
+        """A render in flight writes KNV2016 beside a real error. The check
+        fires on the real one, and the excerpt must quote it, not the
+        transient line that clears by itself."""
+        hits = self.run_on(
+            configsync_object(
+                "RootSync", "root-sync",
+                syncing_refs=["status.rendering.errors", "status.source.errors"], syncing_message="Source error",
+                stage_errors={
+                    "rendering": [{"code": "2016", "errorMessage": "The rendering is still in progress"}],
+                    "source": [{"code": "2004", "errorMessage": self.SOURCE_ERROR}],
+                },
+            )
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertIn("could not read Username", hits[0]["excerpt"])
+        self.assertNotIn("still in progress", hits[0]["excerpt"])
+
+    def test_an_empty_error_source_ref_falls_back_to_the_condition_without_a_stage_list(self):
+        hits = self.run_on(configsync_object("RootSync", "root-sync", syncing_refs=[""], syncing_message="Sync error"))
+        self.assertEqual(len(hits), 1)
+        self.assertIn("Sync error", hits[0]["excerpt"])
+        self.assertNotIn("errors in", hits[0]["excerpt"])
+
+    def test_a_syncing_ref_with_no_readable_error_still_counts_and_quotes_the_condition(self):
+        hits = self.run_on(configsync_object("RootSync", "root-sync", syncing_refs=["status.sync.errors"], syncing_message="Sync error"))
+        self.assertEqual(len(hits), 1)
+        self.assertIn("Sync error", hits[0]["excerpt"])
+
+    def test_hits_are_sorted_and_the_message_is_cut(self):
+        long = configsync_object("RootSync", "root-sync", syncing_refs=["status.source.errors"],
+                                 stage_errors={"source": [{"code": "2004", "errorMessage": "x" * 1000}]})
+        hits = self.run_on(long, configsync_object("RepoSync", "b", ns="b", stalled="True"), configsync_object("RepoSync", "a", ns="a", stalled="True"))
+        self.assertEqual([h["object"] for h in hits], ["RepoSync/a", "RepoSync/b", "RootSync/root-sync"])
+        self.assertLess(len(hits[2]["excerpt"]), collect.MAX_CONFIGSYNC_MESSAGE_CHARS + 120)
+
 class TestLbWorldOpen(unittest.TestCase):
     def run_on(self, *services):
         return collect.check_lb_world_open({"services": list(services)})
@@ -7597,6 +7899,14 @@ class TestLbWorldOpen(unittest.TestCase):
         self.assertEqual(self.run_on(lb_service(ports=())), [])
 
 
+class NotRunningClusterStatusTest(unittest.TestCase):
+    def test_a_cluster_that_is_not_running_carries_its_status(self):
+        """`finish` must not count a STOPPING cluster as one that may run
+        Config Connector (`audit_report.kcc_health`)."""
+        entry = collect.not_running_entry({"name": "going", "location": "us-central1", "status": "STOPPING"}, "acme")
+        self.assertEqual(entry["cluster_status"], "STOPPING")
+
+
 class TestComplianceCollectCluster(unittest.TestCase):
     """One end-to-end pass over compliance-audit's real collection plan --
     five distinct kubectl/gcloud commands, gated and cross-referenced --
@@ -7631,7 +7941,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         }
         return pod
 
-    def run_with(self, workload_items=None, rbac_items=(), netpol_items=(), sa_items=(), describe=None, node_pools=(), ccnp_run=None, cluster=None, allowlist_items=None, kcc_items=None, svc_items=()):
+    def run_with(self, workload_items=None, rbac_items=(), netpol_items=(), sa_items=(), describe=None, node_pools=(), ccnp_run=None, cluster=None, allowlist_items=None, kcc_items=None, svc_items=(), configsync_items=None):
         workload_items = [self.benign_pod()] if workload_items is None else workload_items
         describe = describe if describe is not None else {}
         target = cluster or self.CLUSTER
@@ -7641,6 +7951,8 @@ class TestComplianceCollectCluster(unittest.TestCase):
             self.issued.append(list(argv))
             if "get-credentials" in argv:
                 return Run(argv, 0, "", "", 0.05)
+            if argv[:2] == ["kubectl", "api-resources"]:
+                return serve_kcc(argv, kcc_items if not callable(kcc_items) else (lambda kind_argv: kcc_items(kind_argv, **kwargs)))
             if argv[:2] == ["kubectl", "get"]:
                 kinds = argv[2]
                 if kinds == collect.COMPLIANCE_DUMP_KINDS:
@@ -7659,18 +7971,27 @@ class TestComplianceCollectCluster(unittest.TestCase):
                     # A cluster without Dataplane V2's CRD, and the default:
                     # only this answer reads as "no cluster-wide policies".
                     return Run(argv, 1, "", 'error: the server doesn\'t have a resource type "ccnp"', 0.05)
-                if kinds == collect.KCC_CATEGORY:
-                    if kcc_items is None:
-                        # A cluster not running Config Connector, which is
-                        # every cluster in a fleet but the one hosting it, and
-                        # so the default here.
-                        return Run(argv, 1, "", 'error: the server doesn\'t have a resource type "gcp"', 0.05)
-                    # A callable answers the read itself -- for the malformed
-                    # responses `run_and_gate` cannot distinguish from an
-                    # absent CRD, which no list of objects can express.
+                if is_kcc_read(argv):
+                    # `kcc_items` None is a cluster not running Config
+                    # Connector, which is every cluster in a fleet but the one
+                    # hosting it, and so the default here. A callable answers
+                    # the kind's list request -- for the failed and malformed
+                    # responses no list of objects can express.
                     if callable(kcc_items):
-                        return kcc_items(argv, **kwargs)
-                    return Run(argv, 0, json.dumps(dump_of(*kcc_items)), "", 0.05)
+                        answer = kcc_items
+                        return serve_kcc(argv, lambda kind_argv: answer(kind_argv, **kwargs))
+                    return serve_kcc(argv, kcc_items)
+                if kinds in collect.CONFIGSYNC_SYNC_KINDS:
+                    if callable(configsync_items):
+                        return configsync_items(argv, **kwargs)
+                    if configsync_items is None or kinds != collect.CONFIGSYNC_SYNC_KINDS[0]:
+                        # A cluster without Config Sync, which is most of a
+                        # fleet and the default here. A list answers the
+                        # RootSync read alone: a cluster can serve RootSync
+                        # without RepoSync, and the mix is the shape §2.17's
+                        # "one served, one unserved" arm has to accept.
+                        return Run(argv, 1, "", f'error: the server doesn\'t have a resource type "{kinds.split(".")[0]}" in group "configsync.gke.io"', 0.05)
+                    return Run(argv, 0, json.dumps(dump_of(*configsync_items)), "", 0.05)
                 if kinds in collect.AUTOPILOT_ALLOWLIST_KINDS:
                     if callable(allowlist_items):
                         return allowlist_items(argv, **kwargs)
@@ -7689,7 +8010,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
             return Run(argv, 0, "", "", 0.01)
 
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 return collect.collect_cluster(target, "compliance-audit", collect.COMPLIANCE_CHECKS, run=run)
 
     def test_a_clean_cluster_reports_nothing(self):
@@ -7702,6 +8023,73 @@ class TestComplianceCollectCluster(unittest.TestCase):
         self.assertEqual(result["outcome"], "collected")
         self.assertEqual(result["candidates"], [])
         self.assertEqual(len(result["commands"]), 15)
+
+    def test_the_five_built_in_reads_are_paged_raw_reads_one_kind_at_a_time(self):
+        """The real paging, not the module's adapter: the workload, RBAC,
+        NetworkPolicy/Namespace, Service and ServiceAccount reads each go out
+        as `kubectl get --raw` collection pages, one kind at a time, and each
+        record names that paged read under the cluster's kubeconfig. A
+        `_collect_compliance` that went back to a one-shot
+        `kubectl get <kinds> -A -o json` for any of the five passes every other
+        test in this class, because the adapter answers that argv; here it
+        fails."""
+        issued = []
+        one_shot_kinds = {
+            collect.COMPLIANCE_DUMP_KINDS, collect.RBAC_DUMP_KINDS, collect.NETPOL_DUMP_KINDS,
+            collect.SERVICE_DUMP_KINDS, collect.SERVICEACCOUNT_DUMP_KINDS,
+        }
+        # One in-scope pod on the pods page, as a raw list carries it (no
+        # `kind`), so the workload- and account-scoped checks run and record
+        # their reads rather than being declared inapplicable.
+        pod = {k: v for k, v in self.benign_pod().items() if k not in ("kind", "apiVersion")}
+
+        def run(argv, **kwargs):
+            issued.append(list(argv))
+            if "get-credentials" in argv:
+                return Run(argv, 0, "", "", 0.05)
+            if argv[:3] == ["kubectl", "get", "--raw"]:
+                items = [pod] if argv[3].startswith("/api/v1/pods?") else []
+                return Run(argv, 0, json.dumps({"metadata": {}, "items": items}), "", 0.01)
+            if argv[:2] == ["kubectl", "get"]:
+                if argv[2] in one_shot_kinds:
+                    raise AssertionError(f"a one-shot dump was issued: {argv}")
+                # The CRD and category reads keep their one-shot shape; a
+                # cluster without any of them is their ordinary answer.
+                return Run(argv, 1, "", f'error: the server doesn\'t have a resource type "{argv[2]}"', 0.05)
+            if argv[:3] == ["gcloud", "container", "clusters"]:
+                return Run(argv, 0, json.dumps({"workloadIdentityConfig": {"workloadPool": "acme.svc.id.goog"}}), "", 0.1)
+            if argv[:3] == ["gcloud", "container", "node-pools"]:
+                return Run(argv, 0, "[]", "", 0.1)
+            return Run(argv, 0, "", "", 0.01)
+
+        with TemporaryDirectory() as tmp, patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(collect, "paged_dump", _shared_run_tests.cr.paged_dump):
+            result = collect.collect_cluster(self.CLUSTER, "compliance-audit", collect.COMPLIANCE_CHECKS, run=run)
+        self.assertEqual(result["outcome"], "collected", result.get("error"))
+        raw = [a[3] for a in issued if a[:3] == ["kubectl", "get", "--raw"]]
+        self.assertEqual(
+            [
+                "/apis/apps/v1/deployments?limit=500", "/apis/apps/v1/statefulsets?limit=500",
+                "/apis/apps/v1/daemonsets?limit=500", "/apis/batch/v1/cronjobs?limit=500", "/api/v1/pods?limit=500",
+                "/apis/rbac.authorization.k8s.io/v1/clusterroles?limit=500", "/apis/rbac.authorization.k8s.io/v1/roles?limit=500",
+                "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings?limit=500", "/apis/rbac.authorization.k8s.io/v1/rolebindings?limit=500",
+                "/apis/networking.k8s.io/v1/networkpolicies?limit=500", "/api/v1/namespaces?limit=500",
+                "/api/v1/services?limit=500",
+                "/api/v1/serviceaccounts?limit=500",
+            ],
+            raw,
+        )
+        commands_by_slug = {c["check"]: c["command"] for c in result["commands"]}
+        kubeconfig = re.search(r"KUBECONFIG=([^\s;]+)", commands_by_slug["privileged-container"]).group(1)
+        self.assertTrue(kubeconfig.startswith(tmp), kubeconfig)
+        self.assertTrue(commands_by_slug["privileged-container"].startswith("( export KUBECONFIG="), commands_by_slug["privileged-container"])
+        for slug, kinds in (
+            ("privileged-container", collect.COMPLIANCE_DUMP_KINDS),
+            ("cluster-admin-binding", collect.RBAC_DUMP_KINDS),
+            ("netpol-missing", collect.NETPOL_DUMP_KINDS),
+            ("lb-world-open", collect.SERVICE_DUMP_KINDS),
+            ("default-sa-automount", collect.SERVICEACCOUNT_DUMP_KINDS),
+        ):
+            self.assertEqual(collect.paged_command_text(kinds.split(","), kubeconfig=kubeconfig), commands_by_slug[slug], slug)
 
     def test_a_dirty_cluster_reports_across_multiple_sources(self):
         privileged_pod = compliance_pod("bad")
@@ -7765,7 +8153,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
             return Run(argv, 0, "", "", 0.01)
 
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 result = collect.collect_cluster(self.CLUSTER, "compliance-audit", collect.COMPLIANCE_CHECKS, run=run)
         self.assertEqual(result["outcome"], "gate-failed")
         self.assertNotIn("candidates", result)
@@ -7809,13 +8197,13 @@ class TestComplianceCollectCluster(unittest.TestCase):
             # Config Connector does. It is declared by the collector rather
             # than by the Autopilot table, so it is not part of what this test
             # is about -- see `test_a_cluster_without_config_connector_...`.
-            {"privileged-container", "host-namespace", "hostpath-mount", "kcc-object-wedged"},
+            {"privileged-container", "host-namespace", "hostpath-mount", "kcc-object-wedged", "configsync-reconciler-stalled"},
         )
         command_slugs = {c["check"] for c in result["commands"]}
         self.assertFalse(not_applicable_slugs & command_slugs)
         # Every reason is the SOP's own canonical text, not a placeholder.
         for entry in result["checks_not_applicable"]:
-            if entry["check"] == "kcc-object-wedged":
+            if entry["check"] in ("kcc-object-wedged", "configsync-reconciler-stalled"):
                 continue
             self.assertIn("Autopilot", entry["reason"])
 
@@ -7833,7 +8221,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
             # wrote it: an unfalsifiable claim is the defect, not Autopilot's
             # phrasing of one.
             self.assertNotIn("cannot exist", entry["reason"])
-            if entry["check"] == "kcc-object-wedged":
+            if entry["check"] in ("kcc-object-wedged", "configsync-reconciler-stalled"):
                 continue
             # Scoped to the workloads the audit can see, and to the admission
             # policy holding -- both halves, on every Autopilot reason.
@@ -7851,7 +8239,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
             allowlist_items=[{"kind": "WorkloadAllowlist", "metadata": {"name": "vendor-agent"}}],
         )
         self.assertEqual(
-            {e["check"] for e in result["checks_not_applicable"]}, {"kcc-object-wedged"}
+            {e["check"] for e in result["checks_not_applicable"]}, {"kcc-object-wedged", "configsync-reconciler-stalled"}
         )
         # And they report as what they are: checks that ran and found nothing.
         command_slugs = {c["check"] for c in result["commands"]}
@@ -7870,7 +8258,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         self.assertEqual(result["outcome"], "collected")
         self.assertEqual(
             {e["check"] for e in result["checks_not_applicable"]},
-            {"privileged-container", "host-namespace", "hostpath-mount", "kcc-object-wedged"},
+            {"privileged-container", "host-namespace", "hostpath-mount", "kcc-object-wedged", "configsync-reconciler-stalled"},
         )
 
     def test_a_standard_cluster_never_reads_for_allowlists(self):
@@ -7891,7 +8279,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
 
         result = self.run_with(cluster={**self.CLUSTER, "autopilot": True}, allowlist_items=answer)
         self.assertEqual(result["outcome"], "collected")
-        self.assertEqual({e["check"] for e in result["checks_not_applicable"]}, {"kcc-object-wedged"})
+        self.assertEqual({e["check"] for e in result["checks_not_applicable"]}, {"kcc-object-wedged", "configsync-reconciler-stalled"})
         self.assertLessEqual(
             {"privileged-container", "host-namespace", "hostpath-mount"},
             {c["check"] for c in result["commands"]},
@@ -7909,7 +8297,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         result = self.run_with(cluster={**self.CLUSTER, "autopilot": True}, allowlist_items=answer)
         self.assertEqual(
             {e["check"] for e in result["checks_not_applicable"]},
-            {"privileged-container", "host-namespace", "hostpath-mount", "kcc-object-wedged"},
+            {"privileged-container", "host-namespace", "hostpath-mount", "kcc-object-wedged", "configsync-reconciler-stalled"},
         )
 
     def test_standard_cluster_declares_only_the_config_connector_check(self):
@@ -7923,7 +8311,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         and just as good at teaching a reader to ignore the column."""
         result = self.run_with()
         self.assertEqual(
-            {e["check"] for e in result["checks_not_applicable"]}, {"kcc-object-wedged"}
+            {e["check"] for e in result["checks_not_applicable"]}, {"kcc-object-wedged", "configsync-reconciler-stalled"}
         )
 
     def kcc_reason(self, result):
@@ -7944,7 +8332,11 @@ class TestComplianceCollectCluster(unittest.TestCase):
         result = self.run_with(kcc_items=[kcc_object("ComputeFirewall", "allow-ssh")])
         self.assertIsNone(self.kcc_reason(result))
         entry = next(c for c in result["commands"] if c["check"] == "kcc-object-wedged")
-        self.assertIn("get gcp -A", entry["command"])
+        # A command a reader can run, not a description of the parallel read,
+        # and no digest that no single command produced.
+        self.assertTrue(entry["command"].endswith("kubectl get gcp -A -o json"), entry["command"])
+        self.assertEqual(shlex.split(entry["command"])[1:], ["kubectl", "get", "gcp", "-A", "-o", "json"])
+        self.assertNotIn("output_sha256", entry)
         self.assertEqual(entry["rc"], 0)
 
     def test_config_connector_installed_but_declaring_nothing_is_its_own_reason(self):
@@ -7994,15 +8386,74 @@ class TestComplianceCollectCluster(unittest.TestCase):
         # than in a report.
         self.assertNotIn("does not serve", reason)
 
+    def test_the_entry_lists_the_unready_config_connector_objects(self):
+        """The same `gcp` read gives the entry its `kcc_unready` key, which
+        `finish` matches against the files the run's manifest fixes edit."""
+        result = self.run_with(
+            kcc_items=[
+                kcc_object("ComputeFirewall", "allow-ssh"),
+                kcc_object("PubSubTopic", "fleet-events", ready="False", reason="UpdateFailed", message="Error 403"),
+                kcc_object("ContainerCluster", "fresh", ready=None),
+            ]
+        )
+        self.assertEqual(
+            result["kcc_unready"],
+            [{"kind": "PubSubTopic", "namespace": "kubeagents-system", "name": "fleet-events", "why": "UpdateFailed: Error 403"}],
+        )
+        self.assertNotIn("kcc_unread", result)
+        discoveries = [argv for argv in self.issued if argv[:2] == ["kubectl", "api-resources"]]
+        self.assertEqual(len(discoveries), 1, "the key must come from the check's own read, not a second one")
+
+    def test_a_failed_gcp_read_is_recorded_as_unknown_on_the_entry(self):
+        result = self.run_with(kcc_items=lambda argv, **kw: Run(argv, collect.TIMEOUT_RC, "", "", 60.0))
+        self.assertIn("not known", result["kcc_unread"])
+        self.assertNotIn("kcc_unready", result)
+
+    def test_an_unready_object_takes_its_namespaces_project(self):
+        """Config Connector takes the project from the namespace when the
+        object names none; the NetworkPolicy read already holds the
+        namespaces, so no second read runs."""
+        namespace = {"apiVersion": "v1", "kind": "Namespace", "metadata": {
+            "name": "kubeagents-system", "annotations": {"cnrm.cloud.google.com/project-id": "acme"}}}
+        result = self.run_with(
+            netpol_items=[namespace],
+            kcc_items=[kcc_object("PubSubTopic", "fleet-events", ready="False", reason="UpdateFailed", message="Error 403")],
+        )
+        self.assertEqual(result["kcc_unready"][0]["project"], "acme")
+        self.assertFalse([argv for argv in self.issued if argv[:3] == ["kubectl", "get", "namespaces"]])
+
+    def test_a_timed_out_gcp_read_names_the_timeout_it_had(self):
+        """The compliance read ends inside `KCC_READ_TIMEOUT_S`, and
+        `kcc_unread` states that limit."""
+        with mock.patch.object(collect, "KCC_READ_TIMEOUT_S", 70):
+            result = self.run_with(kcc_items=lambda argv, **kw: Run(argv, collect.TIMEOUT_RC, "", "", 60.0))
+        self.assertRegex(result["kcc_unread"], r"did not finish in (69|70)s")
+
+    def test_the_check_and_the_manifest_keys_read_the_same_objects(self):
+        """One read serves `kcc-object-wedged` and `kcc_unready`: a stalled
+        object is a candidate of the check and an entry of the key, from the
+        per-kind lists of `kcc_health.read_objects`."""
+        stalled = kcc_object("PubSubTopic", "fleet-events", ready="False", reason="UpdateFailed", message="Error 403")
+        result = self.run_with(kcc_items=[kcc_object("ComputeFirewall", "allow-ssh"), stalled])
+        wedged = [c for c in result["candidates"] if c["check"] == "kcc-object-wedged"]
+        self.assertEqual([c["object"] for c in wedged], ["PubSubTopic/fleet-events"])
+        self.assertEqual([r["name"] for r in result["kcc_unready"]], ["fleet-events"])
+        kind_reads = [argv for argv in self.issued if argv[:3] == ["kubectl", "get", "--raw"]]
+        self.assertEqual(len(kind_reads), 2)
+
+    def test_a_cluster_without_config_connector_gets_neither_key(self):
+        result = self.run_with()
+        self.assertNotIn("kcc_unready", result)
+        self.assertNotIn("kcc_unread", result)
+
     def test_the_gcp_read_gets_the_longer_timeout_and_the_others_do_not(self):
-        """A truthful `Undetermined` still leaves the check having never run on
-        the only cluster it can apply to, so the timeout is the other half of
-        the fix. Asserted per-read, because `run_and_gate` takes a default and
-        the whole defect was one read needing something other than it."""
-        seen = {}
+        """The Config Connector read is the one read here whose limit is not
+        `DEFAULT_TIMEOUT_S`: the whole read (discovery and one list per kind)
+        ends inside `KCC_READ_TIMEOUT_S`, and no step of it gets more."""
+        seen = []
 
         def record(argv, **kwargs):
-            seen["kcc"] = kwargs.get("timeout")
+            seen.append(kwargs.get("timeout"))
             return Run(argv, 0, json.dumps(dump_of(kcc_object("ComputeFirewall", "allow-ssh"))), "", 0.05)
 
         original = collect.run_and_gate
@@ -8014,14 +8465,15 @@ class TestComplianceCollectCluster(unittest.TestCase):
 
         with patch.object(collect, "run_and_gate", spy):
             self.run_with(kcc_items=record)
-        self.assertEqual(seen["kcc"], collect.KCC_READ_TIMEOUT_S)
+        self.assertTrue(seen)
+        self.assertTrue(all(0 < t <= collect.KCC_READ_TIMEOUT_S for t in seen), seen)
         self.assertGreater(collect.KCC_READ_TIMEOUT_S, collect.DEFAULT_TIMEOUT_S)
-        others = [t for kind, t in observed if kind != collect.KCC_CATEGORY]
-        self.assertTrue(others, "the spy saw no other reads, so it proves nothing about them")
+        self.assertTrue(observed, "the spy saw no other reads, so it proves nothing about them")
         self.assertTrue(
-            all(t in (None, collect.DEFAULT_TIMEOUT_S) for t in others),
-            f"a read other than the `gcp` one took a custom timeout: {observed}",
+            all(t in (None, collect.DEFAULT_TIMEOUT_S) for _, t in observed),
+            f"a read other than the Config Connector one took a custom timeout: {observed}",
         )
+        self.assertFalse([kind for kind, _ in observed if kind in (collect.KCC_CATEGORY, "--raw")])
 
     def test_an_unreadable_gcp_response_never_claims_config_connector_is_absent(self):
         """`run_and_gate` collapses five different failures into `None` -- a
@@ -8065,7 +8517,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         # Nor are the other two, though they found nothing: all three rest on
         # one admission rule, and a privileged pod says it is not holding on
         # this cluster, so a hostPath or host-namespace pod could be there too.
-        self.assertEqual(not_applicable, {"kcc-object-wedged"})
+        self.assertEqual(not_applicable, {"kcc-object-wedged", "configsync-reconciler-stalled"})
         self.assertLessEqual({"host-namespace", "hostpath-mount"}, {c["check"] for c in result["commands"]})
 
     def test_autopilot_collects_rather_than_gate_failing_on_a_read_the_api_refuses(self):
@@ -8106,22 +8558,22 @@ class TestComplianceCollectCluster(unittest.TestCase):
             return Run(argv, 0, "", "", 0.01)
 
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 result = collect.collect_cluster(self.CLUSTER, "compliance-audit", collect.COMPLIANCE_CHECKS, run=run)
         self.assertEqual(result["outcome"], "gate-failed")
         self.assertIn("node-pools", result["error"])
 
     def test_autopilot_records_every_check_it_could_run(self):
         """The point of not gate-failing: the other checks reach the manifest.
-        Sixteen checks minus the three Autopilot rules out and the one no
-        cluster without Config Connector can run is twelve, each with a command
-        behind it, and the four dispositioned rather than silently absent --
+        Seventeen checks minus the three Autopilot rules out and the two no
+        cluster without Config Connector or Config Sync can run is twelve, each
+        with a command behind it, and the five dispositioned rather than silently absent --
         absent is what §6 reads as a coverage gap."""
         result = self.run_with(cluster={**self.CLUSTER, "autopilot": True})
         command_slugs = {c["check"] for c in result["commands"]}
         na_slugs = {e["check"] for e in result["checks_not_applicable"]}
         self.assertEqual(len(command_slugs), 12)
-        self.assertEqual(len(na_slugs), 4)
+        self.assertEqual(len(na_slugs), 5)
         self.assertFalse(command_slugs & na_slugs)
         self.assertTrue(all(c["rc"] == 0 for c in result["commands"]))
 
@@ -9347,8 +9799,55 @@ class TestAiSecurityCollectCluster(unittest.TestCase):
             return Run(argv, 0, "", "", 0.01)
 
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 return collect.collect_cluster(self.CLUSTER, "ai-security-audit", collect.AI_SECURITY_CHECKS, run=run)
+
+    def test_the_reconciled_model_plant_files_one_manual_candidate_with_its_reconciler(self):
+        """The object `bench/tf/prebuilt/ai-reconciled-model` plants, as the
+        dump reads it: a zero-replica model server on a floating tag with the
+        two Helm release annotations. It must give exactly one candidate,
+        `model-image-floating-tag`, carrying the reconciler that
+        `audit_report.disclose_manual_remediation_routes` names. Change the
+        stack and change this test."""
+        planted = {
+            "kind": "Deployment",
+            "metadata": {
+                "name": "eval-reconciled-model",
+                "namespace": "eval-ai-reconciled",
+                "labels": {"app": "eval-reconciled-model"},
+                "annotations": {
+                    "meta.helm.sh/release-name": "eval-model-release",
+                    "meta.helm.sh/release-namespace": "eval-ai-reconciled",
+                },
+            },
+            "spec": {
+                "replicas": 0,
+                "selector": {"matchLabels": {"app": "eval-reconciled-model"}},
+                "template": {
+                    "metadata": {"labels": {"app": "eval-reconciled-model"}},
+                    "spec": {
+                        "automountServiceAccountToken": False,
+                        "containers": [
+                            {
+                                "name": "server",
+                                "image": "registry.invalid/vllm/vllm-openai:latest",
+                                "resources": {
+                                    "requests": {"cpu": "10m", "memory": "16Mi"},
+                                    "limits": {"memory": "32Mi"},
+                                },
+                            }
+                        ],
+                    },
+                },
+            },
+        }
+        result = self.run_with(workload_items=[planted])
+        self.assertEqual(result["outcome"], "collected")
+        self.assertEqual([c["check"] for c in result["candidates"]], ["model-image-floating-tag"])
+        candidate = result["candidates"][0]
+        self.assertEqual(candidate["object"], "Deployment/eval-reconciled-model")
+        self.assertEqual(candidate["reconciler"], "the Helm release `eval-model-release` in eval-ai-reconciled")
+        self.assertNotIn("declaration", candidate)
 
     def test_a_cluster_with_no_ai_workloads_still_runs_every_check(self):
         """The one stream where an empty scope is *not* declared inapplicable.
@@ -9383,7 +9882,7 @@ class TestAiSecurityCollectCluster(unittest.TestCase):
         self.assertEqual(endpoint[0]["reconciler"], ARGO_PHRASE)
 
     def test_an_unreconciled_endpoint_omits_the_key_rather_than_carrying_none(self):
-        """`disclose_reconciled_manual_remediations` reads the field with a
+        """`disclose_manual_remediation_routes` reads the field with a
         truth test, but the candidate is also what `derive_finding_id` and the
         ledger diff hash over: a `reconciler: null` key on every unmanaged
         object is churn in the stored manifest for no reader's benefit."""
@@ -9488,7 +9987,7 @@ class TestAiSecurityCollectCluster(unittest.TestCase):
             return Run(argv, 0, "", "", 0.01)
 
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 result = collect.collect_cluster(self.CLUSTER, "ai-security-audit", collect.AI_SECURITY_CHECKS, run=run)
         self.assertEqual(result["outcome"], "gate-failed")
         self.assertNotIn("candidates", result)
@@ -9516,10 +10015,63 @@ class TestAiSecurityCollectCluster(unittest.TestCase):
     def test_the_service_dump_backs_only_inference_endpoint_public(self):
         result = self.run_with(workload_items=[deployment("web")], service_items=[])
         commands_by_slug = {c["check"]: c["command"] for c in result["commands"]}
-        self.assertIn(" svc ", commands_by_slug["inference-endpoint-public"])
-        for slug in commands_by_slug:
+        self.assertIn("kubectl get --raw '/api/v1/services?limit=500'", commands_by_slug["inference-endpoint-public"])
+        for slug, command in commands_by_slug.items():
             if slug != "inference-endpoint-public":
-                self.assertIn(collect.COMPLIANCE_DUMP_KINDS, commands_by_slug[slug])
+                # The cluster's kubeconfig exported once for the chain, so the
+                # recorded line runs every read against the audited cluster
+                # when pasted unchanged.
+                kubeconfig = re.search(r"KUBECONFIG=([^\s;]+)", command).group(1)
+                self.assertTrue(kubeconfig.endswith(".yaml"), command)
+                self.assertEqual(collect.paged_command_text(collect.COMPLIANCE_DUMP_KINDS.split(","), kubeconfig=kubeconfig), command)
+
+    def test_the_two_reads_are_paged_raw_reads_one_kind_at_a_time(self):
+        """The real paging, not the module's adapter: the workload dump and
+        the Service dump each go out as `kubectl get --raw` collection pages,
+        one kind at a time, and each record names that paged read under the
+        cluster's kubeconfig. A `_collect_ai_security` that went back to a
+        one-shot `kubectl get <kinds> -A -o json` for either passes every
+        other test in this class, because the adapter answers that argv;
+        here it fails."""
+        issued = []
+        # One AI workload on the deployments page, as a raw list carries it
+        # (no `kind`), so the workload checks have something to examine.
+        workload = {k: v for k, v in ai_workload().items() if k not in ("kind", "apiVersion")}
+
+        def run(argv, **kwargs):
+            issued.append(list(argv))
+            if "get-credentials" in argv:
+                return Run(argv, 0, "", "", 0.05)
+            if argv[:3] == ["kubectl", "get", "--raw"]:
+                items = [workload] if argv[3].startswith("/apis/apps/v1/deployments?") else []
+                return Run(argv, 0, json.dumps({"metadata": {}, "items": items}), "", 0.01)
+            if argv[:2] == ["kubectl", "get"] and argv[2] in (collect.COMPLIANCE_DUMP_KINDS, collect.SERVICE_DUMP_KINDS):
+                raise AssertionError(f"a one-shot dump was issued: {argv}")
+            return Run(argv, 0, "", "", 0.01)
+
+        with TemporaryDirectory() as tmp, patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(collect, "paged_dump", _shared_run_tests.cr.paged_dump):
+            result = collect.collect_cluster(self.CLUSTER, "ai-security-audit", collect.AI_SECURITY_CHECKS, run=run)
+        self.assertEqual(result["outcome"], "collected", result.get("error"))
+        raw = [a[3] for a in issued if a[:3] == ["kubectl", "get", "--raw"]]
+        self.assertEqual(
+            [
+                "/apis/apps/v1/deployments?limit=500", "/apis/apps/v1/statefulsets?limit=500",
+                "/apis/apps/v1/daemonsets?limit=500", "/apis/batch/v1/cronjobs?limit=500", "/api/v1/pods?limit=500",
+                "/api/v1/services?limit=500",
+            ],
+            raw,
+        )
+        commands_by_slug = {c["check"]: c["command"] for c in result["commands"]}
+        kubeconfig = re.search(r"KUBECONFIG=([^\s;]+)", commands_by_slug["inference-endpoint-public"]).group(1)
+        self.assertTrue(kubeconfig.startswith(tmp), kubeconfig)
+        self.assertEqual(
+            collect.paged_command_text(collect.SERVICE_DUMP_KINDS.split(","), kubeconfig=kubeconfig),
+            commands_by_slug["inference-endpoint-public"],
+        )
+        workload_slugs = [slug for slug in commands_by_slug if slug != "inference-endpoint-public"]
+        self.assertTrue(workload_slugs, commands_by_slug)
+        for slug in workload_slugs:
+            self.assertEqual(collect.paged_command_text(collect.COMPLIANCE_DUMP_KINDS.split(","), kubeconfig=kubeconfig), commands_by_slug[slug], slug)
 
 
 class TestEvidenceCommandsArePasteable(unittest.TestCase):
@@ -9555,7 +10107,7 @@ class TestEvidenceCommandsArePasteable(unittest.TestCase):
 
     def test_the_compliance_describe_command_survives_a_shell(self):
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 result = collect.collect_cluster(
                     {"name": "kube-agents-host", "location": "us-east4", "project": "adamparco-kage"},
                     "compliance-audit",
@@ -9590,7 +10142,7 @@ class TestEvidenceCommandsArePasteable(unittest.TestCase):
         # netpol-missing reads the namespaces holding live Pods instead and
         # still ran.
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 result = collect.collect_cluster(
                     {"name": "c1", "location": "us-east4", "project": "p"},
                     "compliance-audit",
@@ -9833,117 +10385,42 @@ class TestWorkloadDeclarations(unittest.TestCase):
         self.assertEqual(collect.workload_declarations(Path("/nonexistent-clone")), {})
 
 
-class _FakeListing(list):
-    def __init__(self, entries, truncated=False, symlinks=(), symlinked_directories=()):
-        super().__init__(entries)
-        self.truncated = truncated
-        self.symlinks = list(symlinks)
-        self.symlinked_directories = list(symlinked_directories)
+class _SnapshotRefused(Exception):
+    """A refusal shaped like `vcs_client.VcsError`: a message and the broker's code."""
+
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        self.code = code
 
 
-class _FakeBrokerWorkspace:
-    """The slice of `credential_proxy_client.Workspace` the mirror calls.
+class _FakeSnapshot:
+    """`vcs_client.snapshot` with the broker replaced.
 
-    `pages` is the listing the broker returns page by page; `budget` is how many
-    paths one `read_many` answers before deferring the rest as `requestBudget`;
-    `refuse` maps a path to the reason the broker will never send it; `symlinks`
-    and `symlinked_directories` are names the listing reports apart from its
-    entries, all on the first page.
-    `grep` searches `files`, refused or not, as the broker searches its checkout;
-    `grep_error` makes it raise instead, and a path in `grep_binary` matches
-    nothing, as `git grep -I` answers for a file git treats as binary.
+    It writes `files` and the `links` (path -> target) into `into`, as the
+    client unpacks a tar, and answers `skipped` as the entries the snapshot
+    left out. `error` makes it refuse instead.
     """
 
-    def __init__(
-        self,
-        files,
-        page_size=2,
-        budget=None,
-        refuse=None,
-        fail_open=None,
-        symlinks=(),
-        symlinked_directories=(),
-    ):
+    def __init__(self, files, links=None, skipped=None, error=None):
         self.files = files
-        self.symlinks = list(symlinks)
-        self.symlinked_directories = list(symlinked_directories)
-        self.page_size = page_size
-        self.budget = budget
-        self.refuse = refuse or {}
-        self.fail_open = fail_open
-        self.opened = []
-        self.reads = []
-        self.extra = {}
-        self.greps = []
-        self.grep_error = None
-        self.grep_binary = set()
-        self.stall = set()
-        self.single_reads = []
-        self.read_error = None
+        self.links = links or {}
+        self.skipped = skipped or []
+        self.error = error
+        self.calls = []
 
-    def open(self, endpoint, repo, depth=None):
-        if self.fail_open:
-            raise self.fail_open
-        self.opened.append((endpoint, repo))
-        return self
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_exc):
-        return False
-
-    def list(self, after=None):
-        names = sorted(self.files)
-        if after is not None:
-            names = [n for n in names if n > after]
-        page = names[: self.page_size]
-        entries = [{"path": n, "size": len(self.files[n])} for n in page]
-        return _FakeListing(
-            entries,
-            truncated=len(names) > self.page_size,
-            symlinks=self.symlinks if after is None else (),
-            symlinked_directories=self.symlinked_directories if after is None else (),
-        )
-
-    def read_many(self, paths):
-        self.reads.append(list(paths))
-        got, skipped = {}, []
-        exhausted = False
-        for i, path in enumerate(paths):
-            # The broker defers a file over one request's budget, and every
-            # path after it, even when nothing was sent before it.
-            exhausted = exhausted or path in self.stall
-            if exhausted:
-                skipped.append({"path": path, "reason": collect.BROKER_SKIP_REQUEST_BUDGET})
-            elif path in self.refuse:
-                skipped.append({"path": path, "reason": self.refuse[path]})
-            elif self.budget is not None and i >= self.budget:
-                skipped.append({"path": path, "reason": collect.BROKER_SKIP_REQUEST_BUDGET})
-            else:
-                got[path] = self.files[path]
-        got.update(self.extra)
-        return got, skipped
-
-    def read(self, path):
-        self.single_reads.append(path)
-        if self.read_error:
-            raise self.read_error
-        return self.files[path]
-
-    def grep(self, pattern, prefix=None, regex=False, ignore_case=False):
-        self.greps.append((pattern, prefix, regex))
-        if self.grep_error:
-            raise self.grep_error
-        expression = re.compile(pattern if regex else re.escape(pattern))
-        matches = [
-            {"path": path, "line": number, "text": line}
-            for path, content in sorted(self.files.items())
-            if (prefix is None or path == prefix) and path not in self.grep_binary
-            for number, line in enumerate(content.decode().splitlines(), 1)
-            if expression.search(line)
-        ]
-        return {"matches": matches, "total": len(matches), "truncated": False}
+    def __call__(self, repository, ref=None, paths=None, *, into, max_bytes=None):
+        self.calls.append((repository, Path(into), max_bytes))
+        if self.error:
+            raise self.error
+        root = Path(into)
+        root.mkdir(parents=True, exist_ok=True)
+        for relative, content in self.files.items():
+            (root / relative).parent.mkdir(parents=True, exist_ok=True)
+            (root / relative).write_bytes(content)
+        for relative, target in self.links.items():
+            (root / relative).parent.mkdir(parents=True, exist_ok=True)
+            (root / relative).symlink_to(target)
+        return {"revision": "0a1b2c3", "files": len(self.files), "skipped": list(self.skipped)}
 
 
 class TestBrokerMirror(unittest.TestCase):
@@ -9959,6 +10436,7 @@ class TestBrokerMirror(unittest.TestCase):
     DEPLOYMENT = TestWorkloadDeclarations.DEPLOYMENT
     ENDPOINT = "http://broker.test"
     REPO = "example-org/infra"
+    LINKED = "clusters/other/apps/linked.yaml"
 
     def setUp(self):
         env = patch.dict("os.environ", {collect.CREDENTIAL_PROXY_URL_ENV: self.ENDPOINT})
@@ -9973,6 +10451,17 @@ class TestBrokerMirror(unittest.TestCase):
             "provisioning/cluster.yml": b"kind: ConfigMap\n",
         }
 
+    def two_clusters(self):
+        other = self.DEPLOYMENT.replace("waste-unsized", "other-app")
+        return {
+            **self.files(),
+            "clusters/other/apps/other.yaml": other.encode(),
+            "clusters/other/apps/vendored.yaml": b"kind: List\n",
+        }
+
+    def left_out(self, path, reason="a link whose target is out of the tree"):
+        return [{"path": path, "reason": reason}]
+
     def indexes(self, root):
         declarations = collect.workload_declarations(root)
         releases = collect.release_declarations(root)
@@ -9985,273 +10474,51 @@ class TestBrokerMirror(unittest.TestCase):
             "apps/podinfo.yaml": overlay.OVERLAY.encode(),
             "overlays/shared/podinfo/kustomization.yaml": overlay.KUSTOMIZATION.encode(),
         }
-        link = {"path": "overlays/prod-usc1/podinfo", "target": "../shared/podinfo"}
-        broker = _FakeBrokerWorkspace(files, symlinked_directories=[link])
+        links = {"overlays/prod-usc1/podinfo": "../shared/podinfo"}
+        snapshot = _FakeSnapshot(files, links=links)
         with TemporaryDirectory() as mirror, TemporaryDirectory() as clone:
-            for relative, content in files.items():
-                (Path(clone) / relative).parent.mkdir(parents=True, exist_ok=True)
-                (Path(clone) / relative).write_bytes(content)
-            (Path(clone) / link["path"]).parent.mkdir(parents=True)
-            (Path(clone) / link["path"]).symlink_to(link["target"], target_is_directory=True)
-            self.assertTrue(collect.broker_mirror(self.REPO, Path(mirror), broker.open))
-            mirrored, cloned = self.indexes(Path(mirror)), self.indexes(Path(clone))
+            _FakeSnapshot(files, links=links)(self.REPO, into=clone)
+            self.assertTrue(collect.broker_mirror(self.REPO, Path(mirror) / "tree", snapshot))
+            mirrored, cloned = self.indexes(Path(mirror) / "tree"), self.indexes(Path(clone))
         self.assertEqual(mirrored, cloned)
         self.assertTrue(all(mirrored))
 
-    def test_the_mirror_writes_only_the_yaml(self):
-        broker = _FakeBrokerWorkspace(self.files(), page_size=2, budget=1)
-        with TemporaryDirectory() as tmp:
-            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            index = collect.workload_declarations(Path(tmp))
+    def test_the_snapshot_is_asked_for_the_repository_under_the_byte_cap(self):
+        snapshot = _FakeSnapshot(self.files())
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
+            dest = Path(tmp) / "tree"
+            self.assertTrue(collect.broker_mirror(self.REPO, dest, snapshot))
             found = collect.declaration_for(
-                index, "spot-capacity-test", "waste-canary", "Deployment/waste-unsized"
+                collect.workload_declarations(dest), "spot-capacity-test", "waste-canary", "Deployment/waste-unsized"
             )
-            written = sorted(str(p.relative_to(tmp)) for p in Path(tmp).rglob("*") if p.is_file())
+        self.assertEqual(snapshot.calls, [(self.REPO, dest, collect.MIRROR_MAX_BYTES)])
         self.assertEqual(found["path"], "clusters/spot-capacity-test/workloads/fixture.yaml")
-        self.assertEqual(
-            written,
-            [
-                "clusters/spot-capacity-test/workloads/fixture.yaml",
-                "clusters/spot-capacity-test/workloads/kustomization.yaml",
-                "provisioning/cluster.yml",
-            ],
-        )
-        self.assertEqual(broker.opened, [(self.ENDPOINT, self.REPO)])
+        self.assertIn(f"mirrored 3 YAML file(s) of {self.REPO} at 0a1b2c3", err.getvalue())
 
-    def two_clusters(self):
-        other = self.DEPLOYMENT.replace("waste-unsized", "other-app")
-        return {
-            **self.files(),
-            "clusters/other/apps/other.yaml": other.encode(),
-            "clusters/other/apps/vendored.yaml": b"kind: List\n",
-        }
-
-    def test_a_file_the_broker_will_not_send_withholds_only_its_cluster(self):
-        """A missing file can hide a second declaration in its own cluster's
-        tree, so that tree goes; the other clusters' trees are whole and stay.
-        The broker's search finds no release kind in it, so releases stay."""
-        broker = _FakeBrokerWorkspace(
-            self.two_clusters(),
-            refuse={"clusters/other/apps/vendored.yaml": collect.BROKER_SKIP_TOO_LARGE},
-        )
+    def test_a_yaml_entry_the_snapshot_left_out_withholds_its_cluster(self):
+        """A clone's walk would have read it, so its cluster's tree is
+        incomplete and goes; the other clusters' trees are whole and stay."""
+        snapshot = _FakeSnapshot(self.two_clusters(), skipped=self.left_out(self.LINKED))
         with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
-            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            index = collect.workload_declarations(Path(tmp))
-            withheld = (Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists()
-        self.assertRegex(err.getvalue(), r"clusters/other/apps/vendored.yaml from .* \(tooLarge\); no candidate on cluster other")
-        self.assertNotIn("release_declaration", err.getvalue())
-        self.assertIn(collect.BROKER_MAX_FILE_BYTES_ENV, err.getvalue())
+            dest = Path(tmp) / "tree"
+            self.assertTrue(collect.broker_mirror(self.REPO, dest, snapshot))
+            index = collect.workload_declarations(dest)
+            withheld = (dest / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists()
+            clusters = collect._withheld_clusters(dest)
+            left = sorted(str(p.relative_to(dest)) for p in (dest / "clusters/other").rglob("*.yaml"))
+        self.assertRegex(
+            err.getvalue(),
+            r"left clusters/other/apps/linked.yaml out of .*\(a link whose target is out of the tree\); "
+            r"no candidate on cluster other will carry a declaration, and no candidate will carry a release_declaration",
+        )
         self.assertEqual({key[0] for key in index}, {"spot-capacity-test"})
-        self.assertFalse(withheld)
-        self.assertEqual(
-            [pattern for pattern, _prefix, _regex in broker.greps],
-            [collect.RELEASE_DECLARING_PATTERN, collect.COLUMN_ZERO_KIND_PATTERN],
-        )
-
-    # A CRD bundle names release kinds under `spec.names`, indented; a release
-    # is a document's own `kind`.
-    CRD_BUNDLE = textwrap.dedent(
-        """\
-        apiVersion: apiextensions.k8s.io/v1
-        kind: CustomResourceDefinition
-        spec:
-          names:
-            kind: HelmRelease
-            listKind: HelmReleaseList
-          versions:
-          - schema:
-              openAPIV3Schema:
-                properties:
-                  kind: {type: string}
-        ---
-        kind: CustomResourceDefinition
-        spec:
-          names: {kind: ApplicationSet, listKind: ApplicationSetList}
-        """
-    )
-    # The search's over-charge: a flow `names:` block reads as a flow release.
-    FLOW_CRD = "kind: CustomResourceDefinition\nspec:\n  names: {kind: Application, listKind: ApplicationList}\n"
-    DECLARING = {
-        "block": "kind: Application\n",
-        "quoted-crlf": "'kind': \"HelmRelease\"\r\n",
-        "commented": "kind: AppProject  # the hub's\n",
-        "flow": "{apiVersion: v1, kind: HelmRepository, metadata: {name: x}}\n",
-        "json": '{\n  "apiVersion": "argoproj.io/v1alpha1",\n  "kind": "Application"\n}\n',
-        "secret": "kind: Secret\nmetadata:\n  labels:\n    argocd.argoproj.io/secret-type: cluster\n",
-        "bom": "\ufeffkind: Application\n",
-        "next-line": "kind:\n  Application\n",
-        "next-line-crlf": "kind:\r\n  Application\r\n",
-        "tagged": "kind: !!str Application\n",
-        "alias": "kind: *k\n",
-        "folded": "kind: >-\n  Application\n",
-        "complex-key": "? kind\n: Application\n",
-        "json-next-line": '{\n  "kind":\n    "Application"\n}\n',
-        "comment-then-next-line": "kind: # the hub's\n  Application\n",
-    }
-    # A schema's `kind` property is no document's `kind`.
-    SCHEMA = '{\n  "properties": {\n    "kind": {\n      "type": "string"\n    },\n    "items": {"kind": [1]}\n  }\n}\n'
-    # Each reads line by line as an indented CRD block does, so the release
-    # search lets them through; with no column-0 `kind` beside them the
-    # withheld-file probe still charges them, and a sent file is parsed.
-    INDENTED = {
-        "indented": "  apiVersion: argoproj.io/v1alpha1\n  kind: AppProject\n",
-        "flow-spread": "{\n  kind: Application,\n}\n",
-    }
-    # The miss that remains: an indented release beside a column-0 document.
-    MIXED = "kind: ConfigMap\n---\n  kind: Application\n  metadata: {name: x}\n"
-
-    def test_the_release_search_tells_a_release_from_a_crd_that_names_one(self):
-        """The broker's `git grep -E` runs line by line over a withheld file;
-        a sent file is parsed, as `release_declarations` reads it."""
-        # name: (text, the release search matches, a sent file declares)
-        cases = {
-            **{name: (text, True, True) for name, text in self.DECLARING.items()},
-            **{name: (text, False, True) for name, text in self.INDENTED.items()},
-            "mixed": (self.MIXED, False, True),
-            "crd": (self.CRD_BUNDLE, False, False),
-            "flow-crd": (self.FLOW_CRD, True, False),
-            "schema": (self.SCHEMA, False, False),
-        }
-        for name, (text, searched, sent) in cases.items():
-            with self.subTest(name):
-                self.assertIs(collect._sent_file_declares_release("a/b.yaml", text.encode()), sent)
-                self.assertIs(
-                    any(re.search(collect.RELEASE_DECLARING_PATTERN, line) for line in text.split("\n")),
-                    searched,
-                )
-        if shutil.which("git") is None:
-            self.skipTest("git is not available")
-        with TemporaryDirectory() as tmp:
-            for name, (text, _, _) in cases.items():
-                (Path(tmp) / f"{name}.yaml").write_bytes(text.encode())
-            subprocess.run(["git", "init", "-q", tmp], check=True)
-            found = {
-                pattern: subprocess.run(
-                    ["git", "-C", tmp, "grep", "--no-index", "-I", "-l", "-E", "-e", pattern],
-                    capture_output=True, text=True, check=False,
-                ).stdout.split()
-                for pattern in (collect.RELEASE_DECLARING_PATTERN, collect.COLUMN_ZERO_KIND_PATTERN)
-            }
-        self.assertEqual(
-            sorted(found[collect.RELEASE_DECLARING_PATTERN]),
-            sorted(f"{name}.yaml" for name, (_, searched, _) in cases.items() if searched),
-        )
-        # The files with no column-0 `kind` key: the indented ones, the JSON
-        # and flow ones, and `? kind`, which the release search already caught.
-        self.assertEqual(
-            sorted(set(f"{name}.yaml" for name in cases) - set(found[collect.COLUMN_ZERO_KIND_PATTERN])),
-            sorted(f"{name}.yaml" for name in [*self.INDENTED, "schema", "json", "json-next-line", "flow", "complex-key"]),
-        )
-
-    def test_a_sent_file_the_parser_cannot_read_falls_back_to_the_search(self):
-        not_yaml = b"kind: Application\n: : [\n"
-        self.assertTrue(collect._sent_file_declares_release("a/b.yaml", not_yaml))
-        self.assertFalse(collect._sent_file_declares_release("a/b.yaml", b"kind: ConfigMap\n: : [\n"))
-        with patch.dict("sys.modules", {"yaml": None}):
-            self.assertTrue(collect._sent_file_declares_release("a/b.yaml", b"kind: Application\n"))
-            self.assertFalse(collect._sent_file_declares_release("a/b.yaml", self.CRD_BUNDLE.encode()))
-
-    def test_a_sent_file_is_read_as_the_release_index_reads_it(self):
-        """Invalid UTF-8 decodes with replacement, as `release_declarations`
-        reads it; a Secret counts only as a cluster registration."""
-        latin1 = b"# caf\xe9\n" + self.MIXED.encode()
-        self.assertTrue(collect._sent_file_declares_release("a/b.yaml", latin1))
-        repository = self.DECLARING["secret"].replace(": cluster", ": repository")
-        self.assertFalse(collect._sent_file_declares_release("a/b.yaml", repository.encode()))
-        self.assertFalse(collect._sent_file_declares_release("a/b.yaml", b"a: &a [1, 1]\nkind: *a\n"))
-
-    def test_an_indented_release_in_a_dropped_tree_withholds_the_release_index(self):
-        files = {**self.two_clusters(), "clusters/other/apps/projects.yaml": self.MIXED.encode()}
-        broker = _FakeBrokerWorkspace(
-            files, refuse={"clusters/other/apps/vendored.yaml": collect.BROKER_SKIP_TOO_LARGE}
-        )
-        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO):
-            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            withheld = (Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists()
         self.assertTrue(withheld)
-
-    def test_a_large_indented_release_withholds_the_release_index(self):
-        """No column-0 `kind` at all: not a CRD bundle, so not ruled out."""
-        for name, text in self.INDENTED.items():
-            with self.subTest(name):
-                big = "bootstrap/projects.yaml"
-                broker = _FakeBrokerWorkspace(
-                    {**self.two_clusters(), big: text.encode()},
-                    refuse={big: collect.BROKER_SKIP_TOO_LARGE},
-                )
-                with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
-                    self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-                    withheld = (Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists()
-                self.assertTrue(withheld)
-                self.assertIn("release_declaration", err.getvalue())
-
-    def flux_bootstrap(self):
-        """What `flux bootstrap` commits under `clusters/<c>/flux-system/`,
-        with the bundle over the broker's per-file limit."""
-        root = "clusters/other/flux-system"
-        files = {
-            **self.two_clusters(),
-            f"{root}/gotk-components.yaml": self.CRD_BUNDLE.encode(),
-            f"{root}/gotk-sync.yaml": b"kind: GitRepository\n---\nkind: Kustomization\n",
-            f"{root}/kustomization.yaml": b"resources:\n- gotk-components.yaml\n- gotk-sync.yaml\n",
-        }
-        return files, {f"{root}/gotk-components.yaml": collect.BROKER_SKIP_TOO_LARGE}
-
-    def mirror_withholds(self, files, refuse, links=()):
-        broker = _FakeBrokerWorkspace(files, refuse=refuse, symlinked_directories=list(links))
-        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
-            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            return (Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists(), err.getvalue()
-
-    def test_a_large_crd_bundle_keeps_the_release_index(self):
-        """The bootstrap's own Kustomization goes with the dropped tree, but
-        no Application renders it, so it costs nothing beyond that tree."""
-        withheld, err = self.mirror_withholds(*self.flux_bootstrap())
-        self.assertNotIn("release_declaration", err)
-        self.assertFalse(withheld)
-
-    def test_a_dropped_kustomization_an_application_renders_withholds_the_release_index(self):
-        """The overlay check would find it on disk in a clone; the mirror
-        has no file there."""
-        files, refuse = self.flux_bootstrap()
-        application = TestKustomizeOverlayDeclarations.OVERLAY
-        for name, named, links in (
-            ("direct", "clusters/other/flux-system", ()),
-            ("through a link", "overlays/flux", [{"path": "overlays/flux", "target": "../clusters/other/flux-system"}]),
-        ):
-            with self.subTest(name):
-                apps = {"apps/app.yaml": application.replace("overlays/prod-usc1/podinfo", named).encode()}
-                withheld, _ = self.mirror_withholds({**files, **apps}, refuse, links)
-                self.assertTrue(withheld)
-        with self.subTest("unreadable Applications"), patch.dict("sys.modules", {"yaml": None}):
-            self.assertTrue(self.mirror_withholds(files, refuse)[0])
-        with self.subTest("escaped kind"):
-            escaped = application.replace("kind: Application", 'kind: "\\u0041pplication"')
-            apps = {"apps/app.yaml": escaped.replace("overlays/prod-usc1/podinfo", "clusters/other/flux-system").encode()}
-            self.assertTrue(self.mirror_withholds({**files, **apps}, refuse)[0])
-        with self.subTest("a path that is not a string"):
-            apps = {"apps/app.yaml": application.replace("overlays/prod-usc1/podinfo", "2024").encode()}
-            links = [{"path": "2024", "target": "clusters/other/flux-system"}]
-            self.assertTrue(self.mirror_withholds({**files, **apps}, refuse, links)[0])
-
-    def test_a_link_into_itself_is_followed_a_bounded_number_of_times(self):
-        links = [{"path": "x", "target": "x/y"}]
-        files = {"apps/app.yaml": TestKustomizeOverlayDeclarations.OVERLAY.replace("overlays/prod-usc1/podinfo", "x").encode()}
-        self.assertIsNone(collect._application_source_paths(files, links))
-
-    def test_a_kustomization_file_nothing_renders_is_still_read_for_releases(self):
-        """`release_declarations` reads every `*.yaml`, `kustomization.yaml` included."""
-        project = b"kind: AppProject\nmetadata: {name: p}\nspec: {destinations: [{namespace: a}]}\n"
-        self.assertTrue(collect._sent_file_declares_release("clusters/other/kustomization.yaml", project, set()))
-        self.assertFalse(collect._sent_file_declares_release("clusters/other/kustomization.yaml", b"resources: []\n", set()))
+        self.assertEqual(clusters, {"other"})
+        self.assertEqual(left, [])
 
     def test_a_dropped_tree_names_its_cluster_to_the_namespace_index(self):
         """With `clusters/other/` gone, an overlay elsewhere rendering into
         `other` would answer where the sibling arm would have won."""
-        broker = _FakeBrokerWorkspace(
-            self.two_clusters(),
-            refuse={"clusters/other/apps/vendored.yaml": collect.BROKER_SKIP_TOO_LARGE},
-        )
         releases = {
             (cluster, collect.RELEASE_KEY_NAMESPACE, "payments"): {
                 "chart": f"overlays/{cluster}/payments",
@@ -10259,16 +10526,18 @@ class TestBrokerMirror(unittest.TestCase):
             }
             for cluster in ("other", "spot-capacity-test")
         }
-        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
-            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            index = collect.workload_declarations(Path(tmp))
-            directories = collect.namespace_directories(index, releases, Path(tmp))
+        with TemporaryDirectory() as tmp:
+            dest = Path(tmp)
+            _FakeSnapshot(self.files())(self.REPO, into=dest)
+            marker = dest / collect.MIRROR_CLUSTERS_WITHHELD_MARKER
+            marker.parent.mkdir()
+            marker.write_text("other\n", encoding="utf-8")
+            directories = collect.namespace_directories(collect.workload_declarations(dest), releases, dest)
         self.assertNotIn(("other", "payments"), directories)
         self.assertEqual(
             directories[("spot-capacity-test", "payments")]["source"],
             collect.NAMESPACE_DIRECTORY_OVERLAY,
         )
-        self.assertRegex(err.getvalue(), r"cluster other will carry a declaration or namespace_directory;")
 
     def test_a_withheld_cluster_name_with_a_space_reads_back_whole(self):
         with TemporaryDirectory() as tmp:
@@ -10282,274 +10551,6 @@ class TestBrokerMirror(unittest.TestCase):
         would switch its indexes off with no WARNING saying why."""
         for marker in (collect.MIRROR_RELEASES_WITHHELD_MARKER, collect.MIRROR_CLUSTERS_WITHHELD_MARKER):
             self.assertEqual(PurePosixPath(marker).parts[0], collect.GIT_DIR_NAME)
-
-    def test_a_large_file_git_will_not_search_withholds_the_release_index(self):
-        """`git grep -I` answers "no match" for a file marked binary."""
-        broker = _FakeBrokerWorkspace(
-            self.two_clusters(),
-            refuse={"clusters/other/apps/vendored.yaml": collect.BROKER_SKIP_TOO_LARGE},
-        )
-        broker.grep_binary = {"clusters/other/apps/vendored.yaml"}
-        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO):
-            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            self.assertTrue((Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists())
-
-    def test_a_release_in_the_dropped_tree_withholds_the_release_index(self):
-        """The withheld file names no release, but its cluster's tree goes with
-        it, and that tree held a hub's Application for another cluster."""
-        files = self.two_clusters()
-        files["clusters/other/apps/spoke.yaml"] = b"apiVersion: argoproj.io/v1alpha1\nkind: Application\n"
-        broker = _FakeBrokerWorkspace(
-            files, refuse={"clusters/other/apps/vendored.yaml": collect.BROKER_SKIP_TOO_LARGE}
-        )
-        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
-            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            self.assertTrue((Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists())
-        self.assertRegex(err.getvalue(), r"vendored.yaml from .* no candidate will carry a release_declaration")
-
-    def test_a_large_file_naming_a_release_kind_withholds_the_release_index(self):
-        """An Application can live in any file and target any cluster."""
-        files = self.two_clusters()
-        files["clusters/other/apps/vendored.yaml"] = b"apiVersion: argoproj.io/v1alpha1\nkind: Application\n"
-        broker = _FakeBrokerWorkspace(
-            files, refuse={"clusters/other/apps/vendored.yaml": collect.BROKER_SKIP_TOO_LARGE}
-        )
-        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
-            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            withheld = (Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists()
-            releases = collect.release_declarations(Path(tmp))
-        self.assertRegex(err.getvalue(), r"cluster other will carry a declaration, and no candidate will carry a release_declaration")
-        self.assertTrue(withheld)
-        self.assertEqual(releases, {})
-
-    def test_a_large_file_the_broker_cannot_search_withholds_the_release_index(self):
-        broker = _FakeBrokerWorkspace(
-            self.two_clusters(),
-            refuse={"clusters/other/apps/vendored.yaml": collect.BROKER_SKIP_TOO_LARGE},
-        )
-        broker.grep_error = RuntimeError("unknown op grep")
-        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO):
-            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            self.assertTrue((Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists())
-
-    def test_a_large_kustomization_withholds_the_release_index_unsearched(self):
-        """`namespace_directories` reads a Kustomization file by its name."""
-        name = "clusters/spot-capacity-test/workloads/kustomization.yaml"
-        broker = _FakeBrokerWorkspace(self.files(), refuse={name: collect.BROKER_SKIP_TOO_LARGE})
-        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO):
-            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            self.assertTrue((Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists())
-        self.assertEqual(broker.greps, [])
-
-    def test_a_withheld_file_outside_the_cluster_trees_keeps_every_declaration(self):
-        files = self.two_clusters()
-        files["provisioning/cluster.yml"] = b"kind: AppProject\n"
-        broker = _FakeBrokerWorkspace(
-            files, refuse={"provisioning/cluster.yml": collect.BROKER_SKIP_TOO_LARGE}
-        )
-        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
-            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            index = collect.workload_declarations(Path(tmp))
-            directories = collect.namespace_directories(
-                index, collect.release_declarations(Path(tmp)), Path(tmp)
-            )
-        self.assertRegex(err.getvalue(), r"provisioning/cluster.yml from .* \(tooLarge\); no candidate will carry a release_declaration")
-        self.assertEqual({key[0] for key in index}, {"spot-capacity-test", "other"})
-        # Without the release index a directory inside an overlay would read as
-        # a plain sibling, and the withheld file may be a restrictive AppProject.
-        self.assertEqual(directories, {})
-
-    def test_a_listed_symlink_withholds_its_cluster(self):
-        """`read` refuses a symlink, so `list` names it apart; a clone's walk
-        would have read it, so its cluster's tree is incomplete."""
-        broker = _FakeBrokerWorkspace(
-            self.two_clusters(), symlinks=["clusters/other/apps/linked.yaml", "docs/link.md"]
-        )
-        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
-            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            index = collect.workload_declarations(Path(tmp))
-        self.assertRegex(err.getvalue(), r"linked.yaml from .* \(symlink\)")
-        self.assertEqual({key[0] for key in index}, {"spot-capacity-test"})
-
-    def test_the_release_marker_alone_empties_the_release_index(self):
-        """The hub's Application is outside every cluster tree, so it is copied
-        and indexable; only the marker the withheld symlink sets hides it."""
-        files = self.two_clusters()
-        files["apps/hub.yaml"] = TestReleaseDeclarations.APPLICATION.encode()
-        broker = _FakeBrokerWorkspace(files, symlinks=["clusters/other/apps/linked.yaml"])
-        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO):
-            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            marked = collect.release_declarations(Path(tmp))
-            (Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).unlink()
-            unmarked = collect.release_declarations(Path(tmp))
-        self.assertEqual(marked, {})
-        self.assertNotEqual(unmarked, {})
-
-    def test_a_directory_link_is_recreated_so_an_overlay_through_it_resolves(self):
-        """Neither walk enters the link, but the overlay check resolves the
-        Application's path through it in a clone, so the mirror holds it too."""
-        overlay = TestKustomizeOverlayDeclarations
-        files = {
-            "apps/podinfo.yaml": overlay.OVERLAY.encode(),
-            "overlays/shared/podinfo/kustomization.yaml": overlay.KUSTOMIZATION.encode(),
-        }
-        broker = _FakeBrokerWorkspace(
-            files,
-            symlinked_directories=[{"path": "overlays/prod-usc1/podinfo", "target": "../shared/podinfo"}],
-        )
-        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
-            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            withheld = (Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists()
-            found = collect.release_declaration_for(
-                collect.release_declarations(Path(tmp)), "prod-usc1", overlay.TRACKED
-            )
-        self.assertNotIn("WARNING", err.getvalue())
-        self.assertFalse(withheld)
-        self.assertEqual(found, overlay.EXPECTED)
-
-    def test_a_directory_link_in_a_dropped_tree_still_resolves_an_overlay(self):
-        """The tree's files go, but an Application elsewhere may name a path
-        through a link in it, and a clone would resolve that path."""
-        overlay = TestKustomizeOverlayDeclarations
-        through = "clusters/other/overlay"
-        files = {
-            **self.two_clusters(),
-            "apps/podinfo.yaml": overlay.OVERLAY.replace(overlay.EXPECTED["chart"], through).encode(),
-            "overlays/shared/podinfo/kustomization.yaml": overlay.KUSTOMIZATION.encode(),
-        }
-        broker = _FakeBrokerWorkspace(
-            files,
-            refuse={"clusters/other/apps/vendored.yaml": collect.BROKER_SKIP_TOO_LARGE},
-            symlinked_directories=[{"path": through, "target": "../../overlays/shared/podinfo"}],
-        )
-        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO):
-            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            withheld = (Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists()
-            found = collect.release_declaration_for(
-                collect.release_declarations(Path(tmp)), "prod-usc1", overlay.TRACKED
-            )
-        self.assertFalse(withheld)
-        self.assertEqual(found, {**overlay.EXPECTED, "chart": through})
-
-    def test_a_directory_link_the_mirror_cannot_hold_withholds_the_release_index(self):
-        for target in ("/etc", "../../..", "../.git", ""):
-            with self.subTest(target=target):
-                links = [{"path": "overlays/x", "target": target}]
-                broker = _FakeBrokerWorkspace(self.two_clusters(), symlinked_directories=links)
-                with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
-                    self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-                    withheld = (Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists()
-                    linked = [p for p in Path(tmp).rglob("*") if p.is_symlink()]
-                    index = collect.workload_declarations(Path(tmp))
-                self.assertRegex(err.getvalue(), r"directory link .* cannot hold; no candidate will carry a release_declaration")
-                self.assertTrue(withheld)
-                self.assertEqual(linked, [])
-                self.assertEqual({key[0] for key in index}, {"spot-capacity-test", "other"})
-
-    def test_a_directory_link_in_a_dropped_tree_the_mirror_cannot_hold_withholds_the_release_index(self):
-        """Handled like any other link: an Application may name a path through it."""
-        broker = _FakeBrokerWorkspace(
-            self.two_clusters(),
-            refuse={"clusters/other/apps/vendored.yaml": collect.BROKER_SKIP_TOO_LARGE},
-            symlinked_directories=[{"path": "clusters/other/vendor", "target": ""}],
-        )
-        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
-            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            withheld = (Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists()
-        self.assertRegex(err.getvalue(), r"directory link clusters/other/vendor .* cannot hold")
-        self.assertTrue(withheld)
-
-    def test_a_directory_link_named_outside_the_repository_fails_the_mirror(self):
-        """The broker should never send such a name, as for a file entry."""
-        for link in ({"path": "../up", "target": "."}, {"path": ".git/x", "target": "."}, "bare"):
-            with self.subTest(link=link):
-                broker = _FakeBrokerWorkspace(self.two_clusters(), symlinked_directories=[link])
-                with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
-                    self.assertFalse(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-                self.assertIn("not a path inside the repository", err.getvalue())
-
-    def test_more_directory_links_than_the_cap_fails_the_mirror(self):
-        links = [{"path": f"links/{n}", "target": "."} for n in range(3)]
-        broker = _FakeBrokerWorkspace(self.two_clusters(), symlinked_directories=links)
-        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err, patch.object(
-            collect, "MIRROR_MAX_FILES", 2
-        ):
-            self.assertFalse(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-        self.assertIn("more directory links than the collector mirrors", err.getvalue())
-
-    def test_directory_links_together_cannot_reach_out_of_the_mirror(self):
-        """Each link stays inside alone. In the first set `z` turns `a/f`, made
-        before it, into a climb one above the mirror; in the second `a/f`
-        climbs from the start, and `a/f/g/h` would create `g` up there."""
-        sets = {
-            "redirected": [
-                {"path": "a/f", "target": "../z/.."},
-                {"path": "z", "target": "."},
-            ],
-            "through": [
-                {"path": "0", "target": "."},
-                {"path": "a/f", "target": "../0/.."},
-                {"path": "a/f/g/h", "target": "."},
-            ],
-        }
-        for name, links in sets.items():
-            with self.subTest(name), TemporaryDirectory() as outer:
-                broker = _FakeBrokerWorkspace(self.two_clusters(), symlinked_directories=links)
-                tmp = Path(outer) / "mirror"
-                tmp.mkdir()
-                with patch("sys.stderr", new_callable=io.StringIO) as err:
-                    self.assertTrue(collect.broker_mirror(self.REPO, tmp, broker.open))
-                root = tmp.resolve()
-                escaped = [
-                    p for p in tmp.rglob("*")
-                    if p.is_symlink() and root not in (p.resolve(), *p.resolve().parents)
-                ]
-                self.assertEqual(escaped, [])
-                self.assertEqual(sorted(p.name for p in Path(outer).iterdir()), ["mirror"])
-                self.assertTrue((tmp / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists())
-                self.assertIn("directory link a/f ", err.getvalue())
-
-    def test_a_symlink_that_is_not_yaml_withholds_nothing(self):
-        broker = _FakeBrokerWorkspace(self.two_clusters(), symlinks=["docs/link.md"])
-        with TemporaryDirectory() as tmp:
-            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            self.assertFalse((Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists())
-
-    def test_an_unknown_skip_still_abandons_the_mirror(self):
-        broker = _FakeBrokerWorkspace(
-            self.files(), refuse={"provisioning/cluster.yml": "somethingNew"}
-        )
-        with TemporaryDirectory() as tmp:
-            self.assertFalse(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            self.assertEqual(list(Path(tmp).iterdir()), [])
-
-    def test_a_repository_over_the_cap_abandons_the_mirror(self):
-        broker = _FakeBrokerWorkspace(self.files())
-        with TemporaryDirectory() as tmp, patch.object(collect, "MIRROR_MAX_FILES", 1):
-            self.assertFalse(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            self.assertEqual(list(Path(tmp).iterdir()), [])
-
-    def test_a_broker_failure_abandons_the_mirror(self):
-        broker = _FakeBrokerWorkspace(self.files(), fail_open=RuntimeError("503"))
-        with TemporaryDirectory() as tmp:
-            self.assertFalse(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-
-    def test_a_name_outside_the_tree_abandons_the_mirror(self):
-        for name in ("../escape.yaml", ".git/config.yaml"):
-            with self.subTest(name=name), TemporaryDirectory() as tmp:
-                broker = _FakeBrokerWorkspace({name: b"kind: X\n", **self.files()})
-                mirror = Path(tmp) / "mirror"
-                mirror.mkdir()
-                self.assertFalse(collect.broker_mirror(self.REPO, mirror, broker.open))
-                self.assertFalse((Path(tmp) / "escape.yaml").exists())
-                self.assertEqual(list(mirror.iterdir()), [])
-
-    def test_reads_are_batched_under_the_byte_limit(self):
-        batches = collect._batches([("a.yaml", 4), ("b.yaml", 4), ("c.yaml", 4)])
-        self.assertEqual(len(batches), 1)
-        with patch.object(collect, "MIRROR_BATCH_BYTES", 8):
-            batches = collect._batches([("a.yaml", 4), ("b.yaml", 4), ("c.yaml", 4)])
-        self.assertEqual(batches, [["a.yaml", "b.yaml"], ["c.yaml"]])
 
     def test_the_repository_comes_from_the_lease_marker(self):
         with TemporaryDirectory() as tmp:
@@ -10570,83 +10571,12 @@ class TestBrokerMirror(unittest.TestCase):
             (holder / ".lease").write_text(json.dumps({"lease": "x", "repo": "other-org/apps"}))
             self.assertEqual(collect.broker_repo(scratch), self.REPO)
 
-    def test_a_file_over_one_requests_budget_is_read_alone(self):
-        """Above the request budget but under the per-file limit, a file stalls
-        every batch that starts with it; a single read has no request budget."""
-        broker = _FakeBrokerWorkspace(self.files(), page_size=10)
-        broker.stall = {"clusters/spot-capacity-test/workloads/fixture.yaml"}
-        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO):
-            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            index = collect.workload_declarations(Path(tmp))
-        self.assertEqual(broker.single_reads, ["clusters/spot-capacity-test/workloads/fixture.yaml"])
-        self.assertEqual({key[0] for key in index}, {"spot-capacity-test"})
-
-    def test_batches_that_never_relent_end_in_single_reads(self):
-        broker = _FakeBrokerWorkspace(self.files(), budget=0)
-        with TemporaryDirectory() as tmp:
-            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-        self.assertEqual(len(broker.single_reads), len([p for p in self.files() if collect._mirrored(p)]))
-
     def test_a_copy_run_near_the_root_imports_without_a_checkout(self):
         """`parents[3]` does not exist for `/x/collect.py`."""
         with patch.object(collect, "__file__", "/x/collect.py"), \
                 patch.object(collect, "PLATFORM_SCRIPT_DIRS", ()), \
                 patch.object(sys, "path", list(sys.path)):
             self.assertIsNone(collect._import_platform_script("no_such_platform_script"))
-
-    def test_a_broker_that_never_relents_abandons_the_mirror(self):
-        """Every path deferred as `requestBudget`, round after round, and the
-        single read refused too: stop, do not spin."""
-        broker = _FakeBrokerWorkspace(self.files(), budget=0)
-        broker.read_error = RuntimeError("503")
-        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
-            self.assertFalse(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            self.assertEqual(list(Path(tmp).iterdir()), [])
-        self.assertIn(f"{collect.BROKER_SKIP_REQUEST_BUDGET}, then 503", err.getvalue())
-
-    def test_an_unset_endpoint_abandons_the_mirror_with_a_warning(self):
-        broker = _FakeBrokerWorkspace(self.files())
-        with TemporaryDirectory() as tmp, \
-                patch.dict("os.environ", {collect.CREDENTIAL_PROXY_URL_ENV: ""}), \
-                patch("sys.stderr", new_callable=io.StringIO) as err:
-            self.assertFalse(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-        self.assertEqual(broker.opened, [])
-        self.assertIn("WARNING", err.getvalue())
-
-    def test_a_failed_write_abandons_the_mirror(self):
-        """A write that fails halfway leaves part of the tree; the caller must not index it."""
-        broker = _FakeBrokerWorkspace(self.files())
-        real_write = Path.write_bytes
-        calls = []
-
-        def write_once(path, data):
-            calls.append(path)
-            if len(calls) > 1:
-                raise OSError("disk full")
-            return real_write(path, data)
-
-        with TemporaryDirectory() as tmp, \
-                patch.object(Path, "write_bytes", write_once), \
-                patch("sys.stderr", new_callable=io.StringIO):
-            self.assertFalse(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-
-    def test_reads_stay_under_the_brokers_page_length(self):
-        """A broker configured below MIRROR_BATCH_PATHS refuses a larger read whole."""
-        broker = _FakeBrokerWorkspace(self.files(), page_size=2)
-        with TemporaryDirectory() as tmp:
-            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-        self.assertTrue(broker.reads)
-        self.assertLessEqual(max(len(r) for r in broker.reads), 2)
-
-    def test_a_name_the_listing_did_not_carry_abandons_the_mirror(self):
-        broker = _FakeBrokerWorkspace(self.files())
-        broker.extra = {"../escape.yaml": b"kind: X\n"}
-        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO):
-            mirror = Path(tmp) / "mirror"
-            mirror.mkdir()
-            self.assertFalse(collect.broker_mirror(self.REPO, mirror, broker.open))
-            self.assertEqual(list(mirror.iterdir()), [])
-            self.assertFalse((Path(tmp) / "escape.yaml").exists())
 
     def test_a_directory_no_lease_holds_is_walked_quietly(self):
         """A local run or an exported tree: no broker, no warning, the tree itself."""
@@ -10684,38 +10614,6 @@ class TestBrokerMirror(unittest.TestCase):
                 self.assertIsNone(indexed)
         self.assertIn("WARNING", err.getvalue())
 
-    def test_main_indexes_the_mirror_in_content_mode(self):
-        """End to end through `main`: the scratch path in, the mirror's tree indexed."""
-        seen = {}
-
-        def fake_collect_fleet(audit, project, workspace=None):
-            seen["declarations"] = collect.workload_declarations(workspace)
-            return {"clusters": []}
-
-        broker = _FakeBrokerWorkspace(self.files())
-        client = type("Client", (), {"Workspace": type("W", (), {"open": staticmethod(broker.open)})})
-        with TemporaryDirectory() as tmp:
-            holder = Path(tmp) / "lease"
-            scratch = holder / "example-org" / "infra"
-            scratch.mkdir(parents=True)
-            (holder / ".lease").write_text(json.dumps({"lease": "x", "repo": self.REPO}))
-            real_import = collect._import_platform_script
-            with patch.object(collect, "collect_fleet", side_effect=fake_collect_fleet), \
-                    patch.object(
-                        collect,
-                        "_import_platform_script",
-                        side_effect=lambda n: client if n == "credential_proxy_client" else real_import(n),
-                    ), \
-                    patch("sys.stdout", new_callable=io.StringIO), \
-                    patch("sys.stderr", new_callable=io.StringIO):
-                collect.main(["obtainability-audit", "--workspace", str(scratch)])
-            self.assertEqual(list(scratch.iterdir()), [], "nothing lands in the remediation workspace")
-        self.assertIn(
-            ("spot-capacity-test", "Deployment", "waste-canary", "waste-unsized"),
-            seen["declarations"],
-        )
-
-
     def test_main_does_not_index_a_failed_mirror(self):
         seen = {}
 
@@ -10733,6 +10631,307 @@ class TestBrokerMirror(unittest.TestCase):
                     patch("sys.stderr", new_callable=io.StringIO):
                 collect.main(["obtainability-audit", "--workspace", str(scratch)])
         self.assertIsNone(seen["workspace"], "a failed mirror indexes nothing, not the scratch")
+
+    def test_an_entry_left_out_outside_the_cluster_trees_keeps_every_declaration(self):
+        snapshot = _FakeSnapshot(self.two_clusters(), skipped=self.left_out("provisioning/linked.yml"))
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
+            dest = Path(tmp) / "tree"
+            self.assertTrue(collect.broker_mirror(self.REPO, dest, snapshot))
+            index = collect.workload_declarations(dest)
+            directories = collect.namespace_directories(index, collect.release_declarations(dest), dest)
+        self.assertRegex(err.getvalue(), r"left provisioning/linked.yml out of .*; no candidate will carry a release_declaration")
+        self.assertEqual({key[0] for key in index}, {"spot-capacity-test", "other"})
+        # Without the release index a directory inside an overlay would read as
+        # a plain sibling, and the entry left out may be a restrictive AppProject.
+        self.assertEqual(directories, {})
+
+    def test_the_release_marker_alone_empties_the_release_index(self):
+        """The hub's Application is outside every cluster tree, so it is copied
+        and indexable; only the marker the left-out link sets hides it."""
+        files = self.two_clusters()
+        files["apps/hub.yaml"] = TestReleaseDeclarations.APPLICATION.encode()
+        snapshot = _FakeSnapshot(files, skipped=self.left_out(self.LINKED))
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO):
+            dest = Path(tmp) / "tree"
+            self.assertTrue(collect.broker_mirror(self.REPO, dest, snapshot))
+            marked = collect.release_declarations(dest)
+            (dest / collect.MIRROR_RELEASES_WITHHELD_MARKER).unlink()
+            unmarked = collect.release_declarations(dest)
+        self.assertEqual(marked, {})
+        self.assertNotEqual(unmarked, {})
+
+    def test_a_directory_link_inside_the_tree_resolves_an_overlay_through_it(self):
+        """Neither walk enters the link, but the overlay check resolves the
+        Application's path through it in a clone, and the snapshot keeps it."""
+        overlay = TestKustomizeOverlayDeclarations
+        files = {
+            "apps/podinfo.yaml": overlay.OVERLAY.encode(),
+            "overlays/shared/podinfo/kustomization.yaml": overlay.KUSTOMIZATION.encode(),
+        }
+        snapshot = _FakeSnapshot(files, links={"overlays/prod-usc1/podinfo": "../shared/podinfo"})
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
+            dest = Path(tmp) / "tree"
+            self.assertTrue(collect.broker_mirror(self.REPO, dest, snapshot))
+            withheld = (dest / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists()
+            found = collect.release_declaration_for(collect.release_declarations(dest), "prod-usc1", overlay.TRACKED)
+        self.assertNotIn("WARNING", err.getvalue())
+        self.assertFalse(withheld)
+        self.assertEqual(found, overlay.EXPECTED)
+
+    def test_a_dropped_tree_keeps_its_directory_links_and_loses_its_file_links(self):
+        """An Application elsewhere may name a path through a directory link in
+        the tree, and no walk enters one; a file link is read like a file."""
+        files = {**self.two_clusters(), "overlays/shared/podinfo/kustomization.yaml": b"resources: []\n"}
+        links = {
+            "clusters/other/overlay": "../../overlays/shared/podinfo",
+            "clusters/other/apps/alias.yaml": "other.yaml",
+        }
+        snapshot = _FakeSnapshot(files, links=links, skipped=self.left_out(self.LINKED))
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO):
+            dest = Path(tmp) / "tree"
+            self.assertTrue(collect.broker_mirror(self.REPO, dest, snapshot))
+            self.assertTrue((dest / "clusters/other/overlay").is_symlink())
+            self.assertFalse((dest / "clusters/other/apps/alias.yaml").is_symlink())
+            self.assertTrue((dest / "overlays/shared/podinfo/kustomization.yaml").exists())
+
+    def test_an_entry_with_no_suffix_left_out_withholds_the_release_index(self):
+        """A directory link out of the tree, or a bare-repository layout: either
+        may hold what an Application names."""
+        snapshot = _FakeSnapshot(self.two_clusters(), skipped=self.left_out("overlays/x", "an absolute target"))
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
+            dest = Path(tmp) / "tree"
+            self.assertTrue(collect.broker_mirror(self.REPO, dest, snapshot))
+            withheld = (dest / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists()
+            index = collect.workload_declarations(dest)
+        self.assertRegex(err.getvalue(), r"left overlays/x out of .*\(an absolute target\); no candidate will carry a release_declaration")
+        self.assertTrue(withheld)
+        self.assertEqual({key[0] for key in index}, {"spot-capacity-test", "other"})
+
+    BARE = collect.BARE_LAYOUT_SKIPPED_PREFIX + " (HEAD, objects, refs), whose config git would read"
+
+    def test_a_bare_layout_left_out_of_a_cluster_tree_drops_that_tree_whatever_its_name(self):
+        """The snapshot leaves the layout out whole, YAML and all."""
+        for name in ("clusters/other/vendor", "clusters/other/fixture.git"):
+            with self.subTest(name), TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO):
+                dest = Path(tmp) / "tree"
+                snapshot = _FakeSnapshot(self.two_clusters(), skipped=self.left_out(name, self.BARE))
+                self.assertTrue(collect.broker_mirror(self.REPO, dest, snapshot))
+                self.assertEqual({key[0] for key in collect.workload_declarations(dest)}, {"spot-capacity-test"})
+                self.assertTrue((dest / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists())
+
+    def test_a_link_with_no_suffix_left_out_of_a_cluster_tree_keeps_that_tree(self):
+        """It may be a directory an Application names, so the release index
+        goes; no walk enters a directory link, so the declarations stay."""
+        snapshot = _FakeSnapshot(self.two_clusters(), skipped=self.left_out("clusters/other/vendor"))
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO):
+            dest = Path(tmp) / "tree"
+            self.assertTrue(collect.broker_mirror(self.REPO, dest, snapshot))
+            index = collect.workload_declarations(dest)
+            withheld = (dest / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists()
+        self.assertEqual({key[0] for key in index}, {"spot-capacity-test", "other"})
+        self.assertTrue(withheld)
+
+    def test_a_file_link_into_a_dropped_tree_drops_its_own_tree_too(self):
+        """Left dangling, the link would make its cluster's region partial: a
+        clone indexes both files and refuses, the mirror would name one."""
+        other = self.DEPLOYMENT.replace("spot-capacity-test", "other")
+        files = {**self.files(), "clusters/other/apps/web.yaml": other.encode()}
+        links = {"clusters/spot-capacity-test/workloads/shared.yaml": "../../other/apps/web.yaml"}
+        snapshot = _FakeSnapshot(files, links=links, skipped=self.left_out("clusters/other/vendor", self.BARE))
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
+            dest = Path(tmp) / "tree"
+            self.assertTrue(collect.broker_mirror(self.REPO, dest, snapshot))
+            index = collect.workload_declarations(dest)
+            clusters = collect._withheld_clusters(dest)
+        self.assertEqual(index, {})
+        self.assertEqual(clusters, {"other", "spot-capacity-test"})
+        self.assertIn(f"shared.yaml in {self.REPO} links to a file the mirror dropped; no candidate on cluster spot-capacity-test", err.getvalue())
+        self.assertIn("mirrored 1 YAML file(s)", err.getvalue())  # provisioning/cluster.yml
+
+    def test_the_copied_snapshot_names_match_the_client_and_the_broker(self):
+        client = collect._import_platform_script("vcs_client")
+        self.assertIsNotNone(client)
+        self.assertTrue(client.BARE_LAYOUT_SKIPPED.startswith(collect.BARE_LAYOUT_SKIPPED_PREFIX))
+        self.assertEqual(client.SNAPSHOT_TOO_LARGE, collect.SNAPSHOT_TOO_LARGE_CODE)
+        broker = Path(client.__file__).with_name("vcs_broker.py").read_text(encoding="utf-8")
+        for spelled in (
+            f'MAX_SNAPSHOT_BYTES_ENV = "{collect.BROKER_MAX_SNAPSHOT_BYTES_ENV}"',
+            f'"{collect.BROKER_MAX_CLONE_BYTES_ENV}"',
+            f'code="{collect.CLONE_TOO_LARGE_CODE}"',
+        ):
+            self.assertIn(spelled, broker)
+
+    def test_an_entry_left_out_that_is_not_yaml_withholds_only_the_release_index(self):
+        """The snapshot does not say whether a link was to a file or to a
+        directory, and `overlays/team.payments` is a directory an Application
+        can name; a dotted name is no proof of a file."""
+        for name in ("docs/link.md", "overlays/team.payments"):
+            with self.subTest(name), TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
+                dest = Path(tmp) / "tree"
+                snapshot = _FakeSnapshot(self.two_clusters(), skipped=self.left_out(name))
+                self.assertTrue(collect.broker_mirror(self.REPO, dest, snapshot))
+                self.assertTrue((dest / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists())
+                index = collect.workload_declarations(dest)
+            self.assertIn(f"left {name} out of", err.getvalue())
+            self.assertEqual({key[0] for key in index}, {"spot-capacity-test", "other"})
+
+    def test_a_link_the_repository_left_with_no_target_costs_nothing(self):
+        """A clone reads the same unreadable link."""
+        snapshot = _FakeSnapshot(self.two_clusters(), links={"clusters/other/apps/stale.yaml": "gone.yaml"})
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
+            dest = Path(tmp) / "tree"
+            self.assertTrue(collect.broker_mirror(self.REPO, dest, snapshot))
+            self.assertFalse((dest / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists())
+            index = collect.workload_declarations(dest)
+        self.assertNotIn("WARNING", err.getvalue())
+        self.assertEqual({key[0] for key in index}, {"spot-capacity-test", "other"})
+
+    def test_a_bare_layout_at_a_cluster_directory_names_that_cluster(self):
+        """The snapshot names a skipped directory by its own path, so
+        `clusters/other` itself has to name cluster `other`."""
+        files = {k: v for k, v in self.two_clusters().items() if not k.startswith("clusters/other/")}
+        snapshot = _FakeSnapshot(files, skipped=self.left_out("clusters/other", self.BARE))
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
+            dest = Path(tmp) / "tree"
+            self.assertTrue(collect.broker_mirror(self.REPO, dest, snapshot))
+            clusters = collect._withheld_clusters(dest)
+        self.assertEqual(clusters, {"other"})
+        self.assertIn("cluster other", err.getvalue())
+
+    def test_a_link_into_an_entry_the_snapshot_left_out_drops_its_tree(self):
+        """In a clone the link reads a real file, which may declare an object
+        the tree declares again, so the tree is not indexed partial."""
+        snapshot = _FakeSnapshot(
+            self.two_clusters(),
+            links={"clusters/other/apps/fixture-app.yaml": "../../../fixtures/app.yaml"},
+            skipped=self.left_out("fixtures", self.BARE),
+        )
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO):
+            dest = Path(tmp) / "tree"
+            self.assertTrue(collect.broker_mirror(self.REPO, dest, snapshot))
+            index = collect.workload_declarations(dest)
+            clusters = collect._withheld_clusters(dest)
+        self.assertEqual(clusters, {"other"})
+        self.assertEqual({key[0] for key in index}, {"spot-capacity-test"})
+
+    def test_a_chain_of_links_into_dropped_trees_drops_every_tree_on_it(self):
+        """a's tree goes for its bare layout, so b's link into it dangles and b
+        goes; only then does c's link to b's file dangle, and c goes: one pass
+        per link, so a loop bounded at two passes leaves c indexed."""
+        deployment = self.DEPLOYMENT
+        files = {
+            f"clusters/{c}/apps/web.yaml": deployment.replace("spot-capacity-test", c).encode() for c in ("a", "b", "c")
+        }
+        links = {"clusters/b/apps/y.yaml": "../../a/apps/web.yaml", "clusters/c/apps/z.yaml": "../../b/apps/web.yaml"}
+        snapshot = _FakeSnapshot(files, links=links, skipped=self.left_out("clusters/a/vendor", self.BARE))
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO):
+            dest = Path(tmp) / "tree"
+            self.assertTrue(collect.broker_mirror(self.REPO, dest, snapshot))
+            left = sorted(p.relative_to(dest).as_posix() for p in dest.rglob("*.yaml"))
+            clusters = collect._withheld_clusters(dest)
+        self.assertEqual(left, [])
+        self.assertEqual(clusters, {"a", "b", "c"})
+
+    def test_a_refused_snapshot_abandons_the_mirror(self):
+        """A tree over the broker's ceiling, a name it will not write, an older
+        broker without the verb: the run goes on with nothing indexed."""
+        cases = {
+            "too-large": (_SnapshotRefused("over the ceiling", collect.SNAPSHOT_TOO_LARGE_CODE), [collect.BROKER_MAX_SNAPSHOT_BYTES_ENV, "MIRROR_MAX_BYTES"]),
+            "clone": (_SnapshotRefused("over the clone ceiling", collect.CLONE_TOO_LARGE_CODE), [collect.BROKER_MAX_CLONE_BYTES_ENV]),
+            "member": (_SnapshotRefused("a .git component", "SNAPSHOT_MEMBER_REFUSED"), []),
+            "transport": (RuntimeError("503"), []),
+        }
+        knobs = (collect.BROKER_MAX_SNAPSHOT_BYTES_ENV, collect.BROKER_MAX_CLONE_BYTES_ENV, "MIRROR_MAX_BYTES")
+        for name, (error, named) in cases.items():
+            with self.subTest(name), TemporaryDirectory() as tmp, \
+                    patch("sys.stderr", new_callable=io.StringIO) as err:
+                self.assertFalse(collect.broker_mirror(self.REPO, Path(tmp) / "tree", _FakeSnapshot({}, error=error)))
+            self.assertIn("no candidate will carry a declaration", err.getvalue())
+            self.assertEqual([k for k in knobs if k in err.getvalue()], named)
+
+    def test_a_repository_over_the_file_cap_abandons_the_mirror(self):
+        with TemporaryDirectory() as tmp, patch.object(collect, "MIRROR_MAX_FILES", 2), \
+                patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.assertFalse(collect.broker_mirror(self.REPO, Path(tmp) / "tree", _FakeSnapshot(self.files())))
+        self.assertIn("more YAML than the collector mirrors (2 files)", err.getvalue())
+
+    def test_an_unset_endpoint_abandons_the_mirror_with_a_warning(self):
+        snapshot = _FakeSnapshot(self.files())
+        with TemporaryDirectory() as tmp, \
+                patch.dict("os.environ", {collect.CREDENTIAL_PROXY_URL_ENV: ""}), \
+                patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.assertFalse(collect.broker_mirror(self.REPO, Path(tmp) / "tree", snapshot))
+        self.assertEqual(snapshot.calls, [])
+        self.assertIn("WARNING", err.getvalue())
+
+    def test_without_the_vcs_client_the_mirror_is_abandoned(self):
+        with TemporaryDirectory() as tmp, \
+                patch.object(collect, "_import_platform_script", return_value=None), \
+                patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.assertFalse(collect.broker_mirror(self.REPO, Path(tmp) / "tree"))
+        self.assertIn("no broker client", err.getvalue())
+
+    def test_a_failed_marker_write_abandons_the_mirror(self):
+        """The tree is on disk but its markers are not: indexing it would read
+        a dropped cluster as whole."""
+        snapshot = _FakeSnapshot(self.two_clusters(), skipped=self.left_out(self.LINKED))
+        with TemporaryDirectory() as tmp, \
+                patch.object(Path, "touch", side_effect=OSError("disk full")), \
+                patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.assertFalse(collect.broker_mirror(self.REPO, Path(tmp) / "tree", snapshot))
+        self.assertIn("could not prepare", err.getvalue())
+
+    def test_the_mirror_is_a_subdirectory_of_a_private_directory_removed_afterwards(self):
+        """The snapshot stages its files beside the directory it is given, so
+        that directory sits inside one the context manager removes."""
+        seen = []
+
+        def mirror(repo, dest):
+            seen.append(dest)
+            dest.mkdir()
+            return True
+
+        with TemporaryDirectory() as tmp, \
+                patch.object(collect, "broker_repo", return_value=self.REPO), \
+                patch.object(collect, "broker_mirror", side_effect=mirror):
+            with collect.indexed_workspace(Path(tmp)) as indexed:
+                self.assertEqual(indexed, seen[0])
+        self.assertEqual(seen[0].name, collect.MIRROR_TREE_NAME)
+        self.assertTrue(seen[0].parent.name.startswith(collect.MIRROR_DIR_PREFIX))
+        self.assertFalse(seen[0].parent.exists())
+
+    def test_main_indexes_the_mirror_in_content_mode(self):
+        """End to end through `main`: the scratch path in, the mirror's tree indexed."""
+        seen = {}
+
+        def fake_collect_fleet(audit, project, workspace=None):
+            seen["declarations"] = collect.workload_declarations(workspace)
+            return {"clusters": []}
+
+        snapshot = _FakeSnapshot(self.files())
+        client = types.SimpleNamespace(snapshot=snapshot)
+        with TemporaryDirectory() as tmp:
+            holder = Path(tmp) / "lease"
+            scratch = holder / "example-org" / "infra"
+            scratch.mkdir(parents=True)
+            (holder / ".lease").write_text(json.dumps({"lease": "x", "repo": self.REPO}))
+            real_import = collect._import_platform_script
+            with patch.object(collect, "collect_fleet", side_effect=fake_collect_fleet), \
+                    patch.object(
+                        collect,
+                        "_import_platform_script",
+                        side_effect=lambda n: client if n == "vcs_client" else real_import(n),
+                    ), \
+                    patch("sys.stdout", new_callable=io.StringIO), \
+                    patch("sys.stderr", new_callable=io.StringIO):
+                collect.main(["obtainability-audit", "--workspace", str(scratch)])
+            self.assertEqual(list(scratch.iterdir()), [], "nothing lands in the remediation workspace")
+        self.assertEqual([repo for repo, _into, _cap in snapshot.calls], [self.REPO])
+        self.assertIn(
+            ("spot-capacity-test", "Deployment", "waste-canary", "waste-unsized"),
+            seen["declarations"],
+        )
+
 
 class TestCandidatesCarryTheirDeclaration(unittest.TestCase):
     """The annotation has to reach the candidate, or the model never sees it.
@@ -10793,8 +10992,7 @@ class TestCandidatesCarryTheirDeclaration(unittest.TestCase):
 
     def test_a_declared_object_carries_its_path_and_directory(self):
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), \
-                    patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 manifest = collect.collect_fleet(
                     "obtainability-audit", "acme",
                     run=self.fleet_run("api", "web"), workspace=self.clone(tmp),
@@ -10826,8 +11024,7 @@ class TestCandidatesCarryTheirDeclaration(unittest.TestCase):
         GitOps repository does not contain.
         """
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), \
-                    patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 manifest = collect.collect_fleet(
                     "obtainability-audit", "acme",
                     run=self.fleet_run("api"), workspace=self.clone(tmp),
@@ -10851,8 +11048,7 @@ class TestCandidatesCarryTheirDeclaration(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             empty = Path(tmp) / "empty"
             empty.mkdir()
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), \
-                    patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 manifest = collect.collect_fleet(
                     "obtainability-audit", "acme", run=self.fleet_run("api"), workspace=empty,
                 )
@@ -10878,8 +11074,7 @@ class TestCandidatesCarryTheirDeclaration(unittest.TestCase):
         existed, on a run that actually produces candidates.
         """
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), \
-                    patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 manifest = collect.collect_fleet(
                     "obtainability-audit", "acme", run=self.fleet_run("api"),
                 )
@@ -11587,7 +11782,7 @@ class TestKustomizeOverlayDeclarations(unittest.TestCase):
 class TestReleaseDeclarationsSurviveMalformedDocuments(unittest.TestCase):
     """One malformed file in the clone must not crash the run before the
     manifest prints: each is skipped and the well-formed release indexes.
-    `fleet_waste.py` carries a copy of this function and the same test."""
+    `fleet_waste.py` imports this function and runs the same test."""
 
     GOOD = (
         "kind: HelmRelease\nmetadata: {name: web, namespace: apps}\n"
@@ -11679,8 +11874,7 @@ class TestCandidatesCarryTheirReleaseDeclaration(unittest.TestCase):
 
     def candidates(self, *items, audit_id="obtainability-audit"):
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), \
-                    patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 manifest = collect.collect_fleet(
                     audit_id, "acme",
                     run=self.fleet_run(*items), workspace=self.clone(tmp),
@@ -12157,8 +12351,7 @@ class TestCandidatesCarryTheirNamespaceDirectory(unittest.TestCase):
             return Run(argv, 0, "", "", 0.01)
 
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), \
-                    patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 manifest = collect.collect_fleet(
                     "obtainability-audit", "acme", run=run, workspace=self.clone(tmp),
                 )
@@ -12287,6 +12480,74 @@ class TestAdversarialReviewFixes(unittest.TestCase):
         result = self.compliance()
         self.assertIn("kcc-object-wedged", {e["check"] for e in result["checks_not_applicable"]})
         self.assertNotIn("checks_unevaluated", result)
+
+    # §2.17's two reads, folded into one disposition.
+    def configsync_reason(self, result):
+        for entry in (result.get("checks_not_applicable") or []) + (result.get("checks_unevaluated") or []):
+            if entry["check"] == "configsync-reconciler-stalled":
+                return entry["reason"]
+        return None
+
+    def test_a_cluster_without_config_sync_is_inapplicable_and_records_no_command(self):
+        """The no-op: both kinds unserved on most of a fleet, with no
+        exception, no command and no `checks_unevaluated`."""
+        result = self.compliance()
+        self.assertIn("not installed", self.configsync_reason(result))
+        self.assertNotIn("configsync-reconciler-stalled", {c["check"] for c in result["commands"]})
+        self.assertNotIn("checks_unevaluated", result)
+
+    def test_rootsync_served_without_reposync_counts_as_run_over_the_served_kind(self):
+        result = self.compliance(configsync_items=[configsync_object("RootSync", "root-sync", stalled="True")])
+        self.assertIsNone(self.configsync_reason(result))
+        command = next(c for c in result["commands"] if c["check"] == "configsync-reconciler-stalled")
+        self.assertIn("rootsyncs.configsync.gke.io", command["command"])
+        self.assertNotIn("reposyncs", command["command"])
+        self.assertEqual(command["rc"], 0)
+        candidate = next(c for c in result["candidates"] if c["check"] == "configsync-reconciler-stalled")
+        self.assertEqual(candidate["object"], "RootSync/root-sync")
+        self.assertEqual(candidate["severity"], "critical")
+        self.assertEqual(candidate["namespace"], "config-management-system")
+
+    def test_both_kinds_served_record_one_pasteable_command(self):
+        def both(argv, **kw):
+            return Run(argv, 0, json.dumps(dump_of(configsync_object("RootSync", "root-sync"))), "", 0.05)
+        result = self.compliance(configsync_items=both)
+        command = next(c for c in result["commands"] if c["check"] == "configsync-reconciler-stalled")
+        self.assertIn("rootsyncs.configsync.gke.io -A -o json; KUBECONFIG=", command["command"])
+        self.assertIn("reposyncs.configsync.gke.io", command["command"])
+
+    def test_served_but_empty_is_inapplicable_not_clean(self):
+        result = self.compliance(configsync_items=[])
+        self.assertIn("declares no RootSync or RepoSync", self.configsync_reason(result))
+        self.assertNotIn("configsync-reconciler-stalled", {c["check"] for c in result["commands"]})
+
+    def test_a_forbidden_config_sync_read_is_undetermined_not_absence(self):
+        result = self.compliance(
+            configsync_items=lambda argv, **kw: Run(argv, 1, "", "Error from server (Forbidden): rootsyncs.configsync.gke.io is forbidden", 0.1)
+        )
+        reason = self.configsync_reason(result)
+        self.assertIn("Undetermined", reason)
+        self.assertIn("Forbidden", reason)
+        self.assertNotIn("not installed", reason)
+        self.assertIn("configsync-reconciler-stalled", {e["check"] for e in result["checks_unevaluated"]})
+        self.assertNotIn("configsync-reconciler-stalled", {c["check"] for c in result["commands"]})
+
+    def test_a_timed_out_config_sync_read_is_undetermined_even_when_the_other_kind_answered(self):
+        def one_slow(argv, **kw):
+            if argv[2] == collect.CONFIGSYNC_SYNC_KINDS[0]:
+                return Run(argv, 0, json.dumps(dump_of(configsync_object("RootSync", "root-sync", stalled="True"))), "", 0.05)
+            return Run(argv, collect.TIMEOUT_RC, "", "", 60.0)
+        result = self.compliance(configsync_items=one_slow)
+        reason = self.configsync_reason(result)
+        self.assertIn("Undetermined", reason)
+        self.assertIn("did not finish", reason)
+        # Its candidate rests on a read that did not finish; it is dropped with the check.
+        self.assertNotIn("configsync-reconciler-stalled", {c["check"] for c in result["candidates"]})
+        self.assertNotIn("configsync-reconciler-stalled", {e["check"] for e in result.get("checks_not_applicable") or []})
+
+    def test_an_unparseable_config_sync_read_is_undetermined(self):
+        result = self.compliance(configsync_items=lambda argv, **kw: Run(argv, 0, "{not json", "", 0.1))
+        self.assertIn("could not read", self.configsync_reason(result))
 
     # Any ccnp failure read as "no cluster-wide policies".
     def test_a_forbidden_ccnp_read_leaves_netpol_missing_unevaluated(self):
@@ -12816,6 +13077,163 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("--scope-projects", proc.stdout)
         self.assertIn("--scope-unread", proc.stdout)
+
+class DefaultRunFailureTest(unittest.TestCase):
+    """`default_run` turns a child that could not start into a failed `Run`, so
+    project discovery records the failure instead of ending the run with a
+    traceback and no manifest."""
+
+    def test_a_missing_gcloud_is_a_recorded_discovery_error_not_a_raise(self):
+        collect.declared_scope.set(None, None)
+        missing = FileNotFoundError(2, "No such file or directory", "gcloud")
+        with mock.patch.object(collect.subprocess, "run", side_effect=missing), redirect_stderr(io.StringIO()):
+            discovery = collect.discover_fleet(None)
+        self.assertEqual(discovery.projects, [])
+        self.assertIn("rc=-1", discovery.error)
+        self.assertIn("No such file or directory", discovery.error)
+
+
+class RecordedChainsUnderTheCommandCapTest(unittest.TestCase):
+    """Every paged chain `collect.py` records is copied verbatim into `checks_run` and into
+    `evidence.command`; `finish` refuses the first over `MAX_COMMAND_CHARS` and clips the
+    second. Held at the longest kubeconfig path the platform profile can produce."""
+
+    def test_every_recorded_chain_passes_the_validator_at_the_longest_path(self):
+        with patch.object(collect, "KUBECONFIG_DIR", PLATFORM_PROFILE_KUBECONFIG_DIR):
+            kubeconfig = collect.kubeconfig_path(LONGEST_PROJECT, LONGEST_CLUSTER, LONGEST_LOCATION)
+        for name in ("DUMP_COMMAND_KINDS", "COMPLIANCE_DUMP_KINDS", "RBAC_DUMP_KINDS", "NETPOL_DUMP_KINDS", "SERVICE_DUMP_KINDS", "SERVICEACCOUNT_DUMP_KINDS"):
+            kinds = getattr(collect, name)
+            with self.subTest(kinds=name):
+                text = collect.paged_command_text(kinds.split(","), kubeconfig=kubeconfig)
+                self.assertLessEqual(len(text), audit_report.MAX_COMMAND_CHARS, len(text))
+                self.assertEqual(text, audit_report.validate_check_command(text, "clusters[0]", "privileged-container"))
+                self.assertEqual(text, audit_report.trim_command(text))
+
+
+class TestNodePoolsFromTheDiscoveryListing(unittest.TestCase):
+    """Both streams that read node pools take them from the `clusters list`
+    item that discovered the cluster, recorded against that listing's command,
+    and run their own `node-pools list` only when the item carries none
+    (#4081)."""
+
+    LISTING_ARGV = ["gcloud", "container", "clusters", "list", "--project", "acme", "--format", "json"]
+    # One legacy-metadata pool, so legacy-metadata fires only if the check saw
+    # the pools; tainted and autoscaled, so obtainability's taint arm fires
+    # only if it saw them.
+    POOLS = [
+        {
+            "name": "legacy",
+            "status": "RUNNING",
+            "autoscaling": {"enabled": True},
+            "config": {
+                "workloadMetadataConfig": {"mode": "GCE_METADATA"},
+                "taints": [{"key": "dedicated", "value": "batch", "effect": "NO_SCHEDULE"}],
+            },
+        }
+    ]
+    COMPUTE_CLASS = {"kind": "ComputeClass", "metadata": {"name": "batch"}}
+
+    def collect(self, audit_id, listed_pools=None, *, listed=True, items=()):
+        item = {"name": "c1", "location": "us-central1", "status": "RUNNING"}
+        if listed:
+            item["nodePools"] = self.POOLS if listed_pools is None else listed_pools
+        self.issued = []
+
+        def run(argv, **kwargs):
+            self.issued.append(list(argv))
+            if discovered := discovery_of_acme(argv):
+                return discovered
+            if argv[:4] == ["gcloud", "container", "clusters", "list"]:
+                return Run(argv, 0, json.dumps([item]), "", 0.05)
+            if "get-credentials" in argv:
+                return Run(argv, 0, "", "", 0.05)
+            if argv[:3] == ["kubectl", "get", "computeclasses"]:
+                return Run(argv, 0, json.dumps(dump_of(self.COMPUTE_CLASS)), "", 0.05)
+            if argv[:2] == ["kubectl", "get"] and argv[2] == collect.COMPLIANCE_DUMP_KINDS:
+                return Run(argv, 0, json.dumps(dump_of(compliance_pod("app"))), "", 0.1)
+            if argv[:2] == ["kubectl", "get"]:
+                return Run(argv, 0, json.dumps(dump_of(*items)), "", 0.1)
+            if argv[:4] == ["gcloud", "container", "clusters", "describe"]:
+                return Run(argv, 0, json.dumps({"workloadIdentityConfig": {"workloadPool": "x"}}), "", 0.1)
+            if argv[:3] == ["gcloud", "container", "node-pools"]:
+                return Run(argv, 0, json.dumps(self.POOLS), "", 0.1)
+            return Run(argv, 0, "", "", 0.01)
+
+        with TemporaryDirectory() as tmp, patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                manifest = collect.collect_fleet(audit_id, run=run)
+        self.log = stderr.getvalue()
+        entry = next(c for c in manifest["clusters"] if c["name"] == QUALIFIED_C1)
+        return manifest, entry
+
+    def node_pools_reads(self):
+        return [a for a in self.issued if a[:3] == ["gcloud", "container", "node-pools"]]
+
+    def legacy_record(self, entry):
+        return next(c for c in entry["commands"] if c["check"] == "legacy-metadata")
+
+    def test_compliance_takes_the_listed_pools_and_records_the_listing(self):
+        manifest, entry = self.collect("compliance-audit")
+        self.assertEqual(self.node_pools_reads(), [])
+        self.assertIn("NodePool/legacy", {c["object"] for c in entry["candidates"] if c["check"] == "legacy-metadata"})
+        record = self.legacy_record(entry)
+        self.assertEqual(record["command"], shlex.join(self.LISTING_ARGV))
+        self.assertEqual(record["rc"], 0)
+        self.assertEqual(record["duration_s"], 0)
+        self.assertEqual(record["output_sha256"], collect.output_digest(json.dumps(self.POOLS, sort_keys=True)))
+        self.assertNotIn(collect.collector_run.LISTED_NODE_POOLS_KEY, json.dumps(manifest))
+        # The record still verifies as the command behind the check.
+        checks_run = [{"check": c["check"], "command": c["command"]} for c in entry["commands"]]
+        doc = {"audit": "compliance-audit", "scope": {"clusters": [{"name": QUALIFIED_C1, "checks_run": checks_run}]}}
+        audit_report.cross_check_manifest(doc, manifest)
+
+    def test_compliance_takes_an_empty_listed_list_as_no_pools(self):
+        _, entry = self.collect("compliance-audit", listed_pools=[])
+        self.assertEqual(self.node_pools_reads(), [])
+        self.assertEqual([c for c in entry["candidates"] if c["check"] == "legacy-metadata"], [])
+        self.assertEqual(self.legacy_record(entry)["output_sha256"], collect.output_digest("[]"))
+
+    def test_compliance_reads_node_pools_when_the_listing_carries_none(self):
+        for listed, pools in ((False, None), (True, {"not": "a list"})):
+            with self.subTest(listed=listed, pools=pools):
+                _, entry = self.collect("compliance-audit", listed_pools=pools, listed=listed)
+                expected = [
+                    "gcloud", "container", "node-pools", "list", "--cluster", "c1", "--location", "us-central1",
+                    "--project", "acme", "--format", "json",
+                ]
+                self.assertEqual(self.node_pools_reads(), [expected])
+                self.assertEqual(self.legacy_record(entry)["command"], shlex.join(expected))
+                self.assertIn("NodePool/legacy", {c["object"] for c in entry["candidates"]})
+                self.assertIn("reading node-pools list", self.log)
+
+    def test_the_discovery_listing_is_unchanged(self):
+        self.collect("compliance-audit")
+        self.assertEqual([a for a in self.issued if a[:4] == ["gcloud", "container", "clusters", "list"]], [self.LISTING_ARGV])
+
+    def test_obtainability_takes_the_listed_pools(self):
+        _, entry = self.collect("obtainability-audit")
+        self.assertEqual(self.node_pools_reads(), [])
+        reasons = {e["check"]: e["reason"] for e in entry.get("checks_unevaluated") or []}
+        self.assertIn("all node pools carry workload taints", reasons.get("untargeted-compute-class-workload", ""))
+        # The read records no command of its own, listed or not.
+        self.assertNotIn("untargeted-compute-class-workload", {c["check"] for c in entry["commands"]})
+
+    def test_obtainability_takes_untainted_listed_pools_and_keeps_its_record(self):
+        _, entry = self.collect(
+            "obtainability-audit", listed_pools=[{**self.POOLS[0], "config": {}}], items=(deployment("api"),)
+        )
+        self.assertEqual(self.node_pools_reads(), [])
+        record = next(c for c in entry["commands"] if c["check"] == "untargeted-compute-class-workload")
+        self.assertIn("kubectl get computeclasses", record["command"])
+
+    def test_obtainability_reads_node_pools_when_the_listing_carries_none(self):
+        _, entry = self.collect("obtainability-audit", listed=False)
+        self.assertEqual(len(self.node_pools_reads()), 1)
+        reasons = {e["check"]: e["reason"] for e in entry.get("checks_unevaluated") or []}
+        self.assertIn("all node pools carry workload taints", reasons.get("untargeted-compute-class-workload", ""))
+        self.assertIn("nodePools absent from the discovery listing; reading node-pools list", self.log)
+
 
 if __name__ == "__main__":
     unittest.main()

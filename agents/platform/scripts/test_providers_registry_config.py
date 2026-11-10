@@ -87,7 +87,7 @@ class ConfigurationFileTest(_ConfigCase):
         )
         self.assertEqual(
             [{"provider": "testforge", "host": "git.example.com", "token_path": "", "read_token_path": "",
-              "ca_file": "", "ca_source": "", "allowed_paths": ("/acme/",)}],
+              "ca_file": "", "ca_source": "", "identity": "", "allowed_paths": ("/acme/",)}],
             registry_module.load_forge_entries(),
         )
 
@@ -99,6 +99,21 @@ class ConfigurationFileTest(_ConfigCase):
         self.assertEqual("/t/read-token", registry_module.load_forge_entries()[0]["read_token_path"])
         [forge] = providers.Registry().forges
         self.assertEqual("/t/read-token", forge.read_token_path)
+
+    def test_an_identity_is_one_login_or_the_build_stops(self):
+        # The login a forge's token acts as, for a token that cannot name its
+        # own account. A Bitbucket Cloud uuid keeps its braces; a space, a
+        # newline or a non-string is refused by name, as the operator's
+        # schema refuses it.
+        self.configure({"forges": [{"provider": "testforge", "host": "git.example.com",
+                                    "identity": " {0f3b2c1d-aaaa} "}]})
+        self.assertEqual("{0f3b2c1d-aaaa}", registry_module.load_forge_entries()[0]["identity"])
+        for bad in ("two words", "a\nb", "", 7, "x" * 256):
+            with self.subTest(identity=bad):
+                self.configure({"forges": [{"provider": "testforge", "host": "git.example.com", "identity": bad}]})
+                with self.assertRaises(ValueError) as caught:
+                    registry_module.load_forge_entries()
+                self.assertIn("identity", str(caught.exception))
 
     def test_github_refuses_allowed_paths_rather_than_ignoring_them(self):
         # Review round 2: accepted and never enforced, it read as narrowing
@@ -210,12 +225,71 @@ class UnclaimedProviderTest(_ConfigCase):
     def test_a_provider_no_forge_class_serves_stops_the_build(self):
         # Review finding: a misspelt provider, or one this image predates,
         # built a broker with no forges that refused everything at runtime.
-        for provider in ("githib", "gitlab"):
+        for provider in ("githib", "gitlab", "gitea"):
             with self.subTest(provider=provider):
                 self.configure({"forges": [{"provider": provider, "host": "git.example.test"}]})
                 with self.assertRaises(ValueError) as caught:
                     providers.Registry()
                 self.assertIn(provider, str(caught.exception))
+
+    def test_forges_config_refuses_port_or_http_scheme_for_providers_that_do_not_support_them(self):
+        for bad in (
+            {
+                "provider": "gitlab",
+                "host": "gitlab.example.test",
+                "port": 8443,
+                "tokenPath": "/t",
+                "allowedPaths": ["acme"],
+            },
+            {
+                "provider": "gitlab",
+                "host": "gitlab.svc.cluster.local",
+                "scheme": "http",
+                "tokenPath": "/t",
+                "allowedPaths": ["acme"],
+            },
+            {
+                "provider": "github",
+                "host": "ghe.example.test",
+                "port": 8443,
+            },
+            {
+                "provider": "github",
+                "host": "ghe.svc.cluster.local",
+                "scheme": "http",
+            },
+        ):
+            with self.subTest(bad=bad):
+                self.configure({"forges": [bad]})
+                with self.assertRaises(ValueError) as caught:
+                    registry_module.load_forge_entries()
+                self.assertIn(f"not supported for {bad['provider']}", str(caught.exception))
+
+    def test_forges_config_builds_gitea_with_scheme_and_port(self):
+        self.configure(
+            {
+                "forges": [
+                    {
+                        "name": "gitea",
+                        "provider": "gitea",
+                        "host": "gitea.gitea.svc.cluster.local",
+                        "scheme": "http",
+                        "port": 3000,
+                        "tokenPath": "/var/run/kube-agents/forge-credentials/gitea/token",
+                        "allowedPaths": [],
+                    }
+                ]
+            }
+        )
+        registry = providers.Registry()
+        self.assertEqual(["gitea"], [f.name for f in registry.forges])
+        self.assertIs(registry.default, registry.forges[0])
+        forge, repo = registry.resolve("acme/infra")
+        self.assertEqual(("gitea", "acme/infra"), (forge.name, repo))
+        self.assertEqual(
+            "http://gitea.gitea.svc.cluster.local:3000/acme/infra.git",
+            forge.clone_url(repo),
+        )
 
 
 class TwoForgesTest(_ConfigCase):

@@ -35,6 +35,11 @@ const defaultMaxSessions = 10
 // field's comment carries the rationale.
 const defaultDelegationDepthMax = 3
 
+// defaultScopeFile is where the operator projects the install's rendered
+// spec.scope into the gateway pod: the same scope.json, at the same path, the
+// platform agent reads.
+const defaultScopeFile = "/etc/kube-agents/scope.json"
+
 // defaultGchatTokenPath is where the operator projects the gateway's
 // relay-audience ServiceAccount token when the gchat backend is armed.
 const defaultGchatTokenPath = "/var/run/secrets/a2a-chat-relay/token"
@@ -46,6 +51,44 @@ const envGchatHomeChannel = "A2A_GCHAT_HOME_CHANNEL"
 // envSlackHomeChannel carries the Slack home channel's id the chat.notify
 // route posts to; the operator renders it from slack.homeChannel.
 const envSlackHomeChannel = "A2A_SLACK_HOME_CHANNEL"
+
+// The learned-home contract (slack_home_channel.go): the operator renders the
+// policy from slack.homeChannelPolicy, the record ConfigMap's name, the
+// gateway's own image for the record's writer and reader keys, and the one
+// switch that arms the learn, which only an operator that also admits the
+// record renders.
+const (
+	envSlackHomePolicy    = "A2A_SLACK_HOME_POLICY"
+	envHomeChannelRecord  = "A2A_HOME_CHANNEL_RECORD"
+	envSelfImage          = "A2A_SELF_IMAGE"
+	envHomeChannelLearn   = "A2A_HOME_CHANNEL_LEARN"
+	slackHomePolicyManual = "manual"
+	envTrue               = "true"
+)
+
+// The election (election.go): the Lease the gateway campaigns for, and its
+// identity there, the pod's own name. The operator renders both together.
+// With no Lease the gateway runs unelected at term 0, as it did before the
+// election, which is what every install runs until the operator renders
+// the Lease and its Role.
+const (
+	envGatewayLease = "A2A_GATEWAY_LEASE"
+	envPodName      = "POD_NAME"
+)
+
+// envSlackAnswerFeedback and envGchatAnswerFeedback turn answer feedback
+// off when "false" (feedback.go); the operator renders each only from its
+// backend's answerFeedback=false. The gateway holds one chat backend, so
+// either name turns off the one switch.
+const (
+	envSlackAnswerFeedback = "A2A_SLACK_ANSWER_FEEDBACK"
+	envGchatAnswerFeedback = "A2A_GOOGLE_CHAT_ANSWER_FEEDBACK"
+)
+
+// envPeopleSeen turns the people bucket's records off when "false"
+// (people.go); the operator renders it only from
+// spec.telemetry.peopleSeen=false.
+const envPeopleSeen = "A2A_PEOPLE_SEEN"
 
 // defaultInjectPrincipalMapPath is where the operator mounts the inject
 // door's own principal map when the door is armed. A file of "id principal"
@@ -174,6 +217,27 @@ type Config struct {
 	// the one place a Slack chat.notify home post may land (notify.go). Empty
 	// leaves the route serving conversation requests only.
 	SlackHomeChannel string
+	// SlackHomePolicy is slack.homeChannelPolicy as the operator renders it:
+	// "manual" keeps the home channel the CR's alone; anything else is auto.
+	SlackHomePolicy string
+	// HomeChannelRecord names the ConfigMap a learned home channel is
+	// recorded in, and SelfImage the gateway's own image reference, which it
+	// stamps into that record. HomeChannelLearn is the switch that arms the
+	// learn at all (HomeLearnArmed).
+	HomeChannelRecord string
+	SelfImage         string
+	HomeChannelLearn  bool
+	// GatewayLease names the Lease this gateway campaigns for (Elected), and
+	// PodName is its identity there. Empty runs the gateway unelected.
+	GatewayLease string
+	PodName      string
+	// AnswerFeedbackOff is the install's slack.answerFeedback=false or
+	// googleChat.answerFeedback=false: no rating controls are drawn and
+	// nothing is kept, whatever the feedback bucket holds.
+	AnswerFeedbackOff bool
+	// PeopleSeenOff is the install's spec.telemetry.peopleSeen=false: the
+	// gateway records no one it sees in the people bucket.
+	PeopleSeenOff bool
 	// SlackAllowedUsers is the Slack backend's ingress allowlist, carried
 	// from spec.integration.slack.allowedUsers the way GchatAllowedUsers is
 	// from Chat's: the gate the legacy path enforces as SLACK_ALLOWED_USERS.
@@ -186,6 +250,12 @@ type Config struct {
 	// mirroring the legacy SLACK_ALLOW_ALL_USERS posture. Another
 	// workspace's member is still refused.
 	SlackAllowAllUsers bool
+	// RelayPrecreated binds the event relay to the durable the provision Job
+	// created rather than creating it (#4173): the operator sets
+	// A2A_GATEWAY_RELAY_PRECREATED=true beside a grant that denies this
+	// principal the create on that name. Off, as in tests and a hand-run
+	// gateway, the relay creates its own durable as before.
+	RelayPrecreated bool
 
 	// TargetAllowedUsers is the per-target, per-backend trusted-human
 	// allowlist a session's delegation is checked against: target ->
@@ -282,7 +352,7 @@ type Config struct {
 	// MetricsPort is the metrics-only listener's port (A2A_METRICS_PORT);
 	// zero means no listener. It binds every interface, because its caller
 	// is the managed-Prometheus collector on the pod network, and serves
-	// MetricsPath and nothing else. It may not be either door's port: a door
+	// MetricsPath and ReadyzPath and nothing else. It may not be either door's port: a door
 	// that lost its port to this listener would fail to bind, and a door
 	// that won it would be what the collector's NetworkPolicy rule admits.
 	MetricsPort int
@@ -475,9 +545,12 @@ type Config struct {
 	// audience, the broker's URL, and Bash in the worker. Rendered by the
 	// operator under its A2A_SESSION_CLUSTER_VIEW flag; off, the pod is
 	// exactly the inert one. CredentialProxyURL is where the shim dials;
-	// New refuses the view without it.
-	SessionClusterView bool
-	CredentialProxyURL string
+	// New refuses the view without it. CredentialProxyExecURL is the
+	// broker's exec tier, empty while the operator renders none; the shim
+	// sends its commands there and falls back to CredentialProxyURL.
+	SessionClusterView     bool
+	CredentialProxyURL     string
+	CredentialProxyExecURL string
 
 	// StrictEventsWriter makes the `…events` writer-class agreement check a
 	// refusal instead of a counted advisory (A2A_STRICT_EVENTS_WRITER=true).
@@ -550,6 +623,19 @@ type Config struct {
 	// (A2A_DELEGATE_TOOL on the worker side), not a typo to paper over.
 	DelegationDepthMax int
 
+	// ScopeFile is the rendered spec.scope a profile task's target is
+	// checked against (A2A_SCOPE_FILE; checkTargetScope). It is read per
+	// routed task, so an edit reaches the gateway without a restart. A
+	// missing or unreadable file refuses every target.
+	ScopeFile string
+
+	// ManagementProject is the install's own project
+	// (A2A_MANAGEMENT_PROJECT, spec.harness.projectId). checkTargetScope
+	// admits it whatever the scope lists, and ignores an exclude.projects
+	// entry that matches it, as the reconcile does. Empty admits nothing
+	// extra.
+	ManagementProject string
+
 	// BusyNoticeAt is how many tasks have to be ahead of a new fixed-route
 	// turn before the gateway marks the turn's status line queued
 	// (A2A_BUSY_NOTICE_AT). The count is the fixed addressee's outstanding
@@ -601,6 +687,19 @@ func (c *Config) Backend() string {
 // InjectArmed reports whether the side door is open.
 func (c *Config) InjectArmed() bool { return c.InjectListen != "" }
 
+// HomeLearnArmed reports whether the gateway may learn the Slack home channel
+// from the first admitted channel mention and record it: the backend is
+// Slack, the CR names no home channel (a set one is the CR's, malformed or
+// not), the policy is auto, a record is named, and the operator has armed the
+// learn. Every gate holds, or nothing is read, written or posted.
+func (c *Config) HomeLearnArmed() bool {
+	return c.Backend() == slackBackend && c.SlackHomeChannel == "" &&
+		c.SlackHomePolicy != slackHomePolicyManual && c.HomeChannelRecord != "" && c.HomeChannelLearn
+}
+
+// Elected reports whether this gateway runs under the election (election.go).
+func (c *Config) Elected() bool { return c.GatewayLease != "" }
+
 // A2ADoorArmed reports whether the A2A door is open.
 func (c *Config) A2ADoorArmed() bool { return c.A2ADoorListen != "" }
 
@@ -621,13 +720,16 @@ func FromEnv() (*Config, error) {
 		Namespace:        envOr("POD_NAMESPACE", "kubeagents-system"),
 		WorkerImage:      envOr("A2A_WORKER_IMAGE", defaultWorkerRepository+":"+defaultWorkerTag),
 
-		SessionServiceAccount: os.Getenv("A2A_SESSION_SERVICE_ACCOUNT"),
-		StrictEventsWriter:    os.Getenv("A2A_STRICT_EVENTS_WRITER") == "true",
-		SessionClusterView:    os.Getenv("A2A_SESSION_CLUSTER_VIEW") == "true",
-		CredentialProxyURL:    os.Getenv("A2A_CREDENTIAL_PROXY_URL"),
-		AuthorityTier:         capability.Tier(envOr("A2A_AUTHORITY_TIER", string(capability.TierDeveloperTeam))),
-		AuthorityScope:        capability.Scope(os.Getenv("A2A_AUTHORITY_SCOPE")),
-		CapabilityOptional:    capability.OptionalFromEnv(),
+		SessionServiceAccount:  os.Getenv("A2A_SESSION_SERVICE_ACCOUNT"),
+		StrictEventsWriter:     os.Getenv("A2A_STRICT_EVENTS_WRITER") == "true",
+		SessionClusterView:     os.Getenv("A2A_SESSION_CLUSTER_VIEW") == "true",
+		CredentialProxyURL:     os.Getenv("A2A_CREDENTIAL_PROXY_URL"),
+		CredentialProxyExecURL: os.Getenv("A2A_CREDENTIAL_PROXY_EXEC_URL"),
+		AuthorityTier:          capability.Tier(envOr("A2A_AUTHORITY_TIER", string(capability.TierDeveloperTeam))),
+		AuthorityScope:         capability.Scope(os.Getenv("A2A_AUTHORITY_SCOPE")),
+		CapabilityOptional:     capability.OptionalFromEnv(),
+		ScopeFile:              envOr("A2A_SCOPE_FILE", defaultScopeFile),
+		ManagementProject:      os.Getenv("A2A_MANAGEMENT_PROJECT"),
 	}
 	cfg.GchatRelayURL = os.Getenv("A2A_GCHAT_RELAY_URL")
 	cfg.GchatTokenPath = envOr("A2A_GCHAT_TOKEN_PATH", defaultGchatTokenPath)
@@ -639,6 +741,20 @@ func FromEnv() (*Config, error) {
 	cfg.GchatAllowAllUsers = os.Getenv("A2A_GCHAT_ALLOW_ALL_USERS") == "true"
 	cfg.GchatHomeChannel = strings.TrimSpace(os.Getenv(envGchatHomeChannel))
 	cfg.SlackHomeChannel = strings.TrimSpace(os.Getenv(envSlackHomeChannel))
+	cfg.SlackHomePolicy = strings.TrimSpace(os.Getenv(envSlackHomePolicy))
+	cfg.HomeChannelRecord = strings.TrimSpace(os.Getenv(envHomeChannelRecord))
+	cfg.SelfImage = strings.TrimSpace(os.Getenv(envSelfImage))
+	cfg.HomeChannelLearn = os.Getenv(envHomeChannelLearn) == envTrue
+	cfg.GatewayLease = strings.TrimSpace(os.Getenv(envGatewayLease))
+	cfg.PodName = strings.TrimSpace(os.Getenv(envPodName))
+	if cfg.GatewayLease != "" && cfg.PodName == "" {
+		// The pod name is the election's identity; without it every replica
+		// would campaign as the same holder.
+		return nil, fmt.Errorf("%s is set but %s is empty: the election needs the pod's name as its identity", envGatewayLease, envPodName)
+	}
+	cfg.AnswerFeedbackOff = strings.TrimSpace(os.Getenv(envSlackAnswerFeedback)) == strconv.FormatBool(false) ||
+		strings.TrimSpace(os.Getenv(envGchatAnswerFeedback)) == strconv.FormatBool(false)
+	cfg.PeopleSeenOff = strings.TrimSpace(os.Getenv(envPeopleSeen)) == strconv.FormatBool(false)
 	cfg.TargetAllowedUsers = map[string]map[string][]string{}
 	platformLists := map[string][]string{}
 	// Set is a list, even set empty: the operator renders the var empty for
@@ -658,6 +774,7 @@ func FromEnv() (*Config, error) {
 		}
 	}
 	cfg.SlackAllowAllUsers = os.Getenv("A2A_SLACK_ALLOW_ALL_USERS") == "true"
+	cfg.RelayPrecreated = os.Getenv("A2A_GATEWAY_RELAY_PRECREATED") == "true"
 	cfg.InjectListen = strings.TrimSpace(os.Getenv("A2A_INJECT_LISTEN"))
 	cfg.InjectToken = strings.TrimSpace(os.Getenv("A2A_INJECT_TOKEN"))
 	cfg.InjectPrincipalMapPath = envOr("A2A_INJECT_PRINCIPAL_MAP", defaultInjectPrincipalMapPath)

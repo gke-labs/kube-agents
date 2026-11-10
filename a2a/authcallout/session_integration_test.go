@@ -68,7 +68,7 @@ const sessionMap = `{
     {
       "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-gateway",
       "user": "gateway",
-      "account": "APP",
+      "account": "TRUSTED",
       "grants": {
         "publish": ["a2a.tasks.>", "$KV.cap.root.*", "$JS.API.>", "_INBOX.gateway.>"],
         "subscribe": ["a2a.tasks.>", "_INBOX.gateway.>"]
@@ -84,7 +84,7 @@ const sessionMap = `{
     {
       "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-verifier",
       "user": "verifier",
-      "account": "APP",
+      "account": "TRUSTED",
       "grants": {
         "publish": [
           "a2a.cap.reply.>",
@@ -297,7 +297,7 @@ func TestTwoSessionsOnOneServiceAccountAreRefusedOnEachOthersSubjects(t *testing
 // to publish anywhere, reading in production as nothing at all.
 func TestASessionTokenBoundToNoPodIsRefusedAtConnect(t *testing.T) {
 	h := startHarness(t, sessionMap, sessionTokens())
-	if nc, err := nats.Connect(h.url, h.tls, nats.Token(tokenNoPod), nats.CustomInboxPrefix("_INBOX."+podA)); err == nil {
+	if nc, err := nats.Connect(h.url, h.dial, nats.Token(tokenNoPod), nats.CustomInboxPrefix("_INBOX."+podA)); err == nil {
 		nc.Close()
 		t.Fatal("a session token bound to no pod was accepted")
 	}
@@ -309,7 +309,7 @@ func TestASessionTokenBoundToNoPodIsRefusedAtConnect(t *testing.T) {
 // every grant.
 func TestASessionPodNameThatIsNotOneSubjectTokenIsRefusedAtConnect(t *testing.T) {
 	h := startHarness(t, sessionMap, sessionTokens())
-	if nc, err := nats.Connect(h.url, h.tls, nats.Token(tokenDotted), nats.CustomInboxPrefix("_INBOX.chat")); err == nil {
+	if nc, err := nats.Connect(h.url, h.dial, nats.Token(tokenDotted), nats.CustomInboxPrefix("_INBOX.chat")); err == nil {
 		nc.Close()
 		t.Fatal("a session whose pod name is not a single subject token was accepted")
 	}
@@ -374,38 +374,26 @@ func TestSessionGrantsMentionNoPodButTheirOwn(t *testing.T) {
 	}
 }
 
-// A KNOWN LIMIT of the capability model, pinned as a test because it is the
-// one place the grant enumeration in session.go cannot be read as closure.
+// Subject permissions govern the subject a client publishes ON. Within a single
+// NATS account, they do not govern the reply subject a client names on a
+// JetStream API request; across an account boundary, however, a service import
+// rewrites the caller's reply subject to a server-managed reply prefix, so a
+// session in APP cannot redirect a JetStream delivery to a subscriber in
+// TRUSTED unless that subject is explicitly exported as a stream from APP and
+// imported into TRUSTED.
 //
-// Subject permissions govern the subject a client publishes ON. They do not
-// govern the reply subject it names, and nats-server does not check one:
-// isReservedReply (server/client.go) refuses service-import replies, $JS.ACK
-// and gateway-prefixed replies, and accepts anything else unchecked. So a
-// session can address a JetStream request it IS granted — MSG.NEXT on its own
-// consumer — and have the server deliver the answer to a subject it is
-// refused. Measured here: the payload lands on the gateway's inbox, which the
-// same connection is refused a direct publish to two lines above.
+// Measured here in both parts:
 //
-// What it is worth is much less than "the allowlist does not hold", and the
-// bounds are asserted rather than asserted-away:
-//
-//   - The delivered message keeps its ORIGINAL subject in the Subject field —
-//     measured, not assumed: it arrives at the reply subject but reads as
-//     a2a.tasks.<attacker>.<task>.events. So a receiver that decides anything
-//     from the subject is not fooled, and the attacker cannot make a message
-//     look like it came from a subject it cannot publish to. The assertion
-//     below pins that, because if it stopped being true this would stop being
-//     a redirect and become subject forgery.
-//   - The content is a message the session could already read. It is a
-//     redirect, not a read primitive: it cannot fetch what its filter subject
-//     does not cover.
-//   - Reaching a request/reply peer means naming its inbox exactly, and those
-//     carry a random NUID token per request.
-//
-// It is not fixable with subject permissions, so it is not a bug in the
-// narrowing: the `worker` credential this replaces had the same property over
-// a far wider grant set. It is recorded so the next person to read
-// sessionGrants as an exhaustive statement of reach finds this first.
+//   - Cross-account (APP -> TRUSTED): a session in APP addressing MSG.NEXT with
+//     a reply subject on the gateway's inbox in TRUSTED (`_INBOX.gateway.>`,
+//     which is NOT exported from APP into TRUSTED) cannot deliver the payload
+//     to the gateway.
+//   - Same-account (APP -> APP): a session in APP addressing MSG.NEXT with a
+//     reply subject on a sibling session pod's inbox in APP (`_INBOX.<podB>.>`)
+//     still delivers the payload within APP, and the delivered message keeps
+//     its ORIGINAL subject (`a2a.tasks.<attacker>.<task>.events`) so a receiver
+//     that checks Subject is not fooled into treating it as a message published
+//     to that inbox.
 func TestASessionCanRedirectAJetStreamDeliveryOffItsOwnGrants(t *testing.T) {
 	h := startHarness(t, sessionMap, sessionTokens())
 
@@ -417,19 +405,32 @@ func TestASessionCanRedirectAJetStreamDeliveryOffItsOwnGrants(t *testing.T) {
 	if _, err := js.AddStream(&nats.StreamConfig{Name: "TASKS", Subjects: []string{"a2a.tasks.>"}}); err != nil {
 		t.Fatalf("AddStream: %v", err)
 	}
-	const victimSubject = "_INBOX.gateway.reply-42"
-	victim, err := gw.SubscribeSync(victimSubject)
+	const gatewayInboxSubject = "_INBOX.gateway.reply-42"
+	gwSub, err := gw.SubscribeSync(gatewayInboxSubject)
 	if err != nil {
-		t.Fatalf("the victim could not subscribe: %v", err)
+		t.Fatalf("the gateway could not subscribe: %v", err)
 	}
 	if err := gw.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	peer, _ := h.connectAs(t, podB, tokenPodB)
+	const victimSubject = "_INBOX." + podB + ".reply-42"
+	victim, err := peer.SubscribeSync(victimSubject)
+	if err != nil {
+		t.Fatalf("the peer session could not subscribe: %v", err)
+	}
+	if err := peer.Flush(); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
 
 	nc, violations := h.connectAs(t, podA, tokenPodA)
 
 	// The baseline this test is only interesting against: a direct publish
-	// to that subject is refused.
+	// to either subject is refused.
+	if !publishRefused(t, nc, violations, gatewayInboxSubject) {
+		t.Fatalf("the session was ALLOWED a direct publish to %s", gatewayInboxSubject)
+	}
 	if !publishRefused(t, nc, violations, victimSubject) {
 		t.Fatalf("the session was ALLOWED a direct publish to %s; the grant set has widened and everything below is moot", victimSubject)
 	}
@@ -437,6 +438,9 @@ func TestASessionCanRedirectAJetStreamDeliveryOffItsOwnGrants(t *testing.T) {
 	const payload = "written-by-the-session"
 	if err := nc.Publish(lib.TaskEventsSubject(podA, "task-1"), []byte(payload)); err != nil {
 		t.Fatalf("publishing to its own events subject: %v", err)
+	}
+	if err := nc.Publish(lib.TaskEventsSubject(podA, "task-1"), []byte(payload)); err != nil {
+		t.Fatalf("publishing second event to its own events subject: %v", err)
 	}
 	if err := nc.Flush(); err != nil {
 		t.Fatalf("Flush: %v", err)
@@ -450,7 +454,21 @@ func TestASessionCanRedirectAJetStreamDeliveryOffItsOwnGrants(t *testing.T) {
 		t.Fatalf("creating its own granted consumer: %v", err)
 	}
 
-	// Granted subject, ungranted reply.
+	// Cross-account (APP -> TRUSTED): the service import rewrites the reply
+	// subject at the account boundary, so the delivery never reaches the
+	// gateway's inbox in TRUSTED.
+	if err := nc.PublishRequest(consumerSubject("MSG.NEXT", name), gatewayInboxSubject, []byte(`{"batch":1,"no_wait":true}`)); err != nil {
+		t.Fatalf("PublishRequest to gateway inbox: %v", err)
+	}
+	if err := nc.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if got, err := gwSub.NextMsg(300 * time.Millisecond); err == nil {
+		t.Fatalf("a session in APP redirected a JetStream reply across the account boundary onto TRUSTED inbox %s (%q)", gatewayInboxSubject, got.Data)
+	}
+
+	// Same-account (APP -> APP): granted subject, ungranted reply in the
+	// same account.
 	if err := nc.PublishRequest(consumerSubject("MSG.NEXT", name), victimSubject, []byte(`{"batch":1,"no_wait":true}`)); err != nil {
 		t.Fatalf("PublishRequest: %v", err)
 	}
@@ -460,7 +478,7 @@ func TestASessionCanRedirectAJetStreamDeliveryOffItsOwnGrants(t *testing.T) {
 
 	got, err := victim.NextMsg(3 * time.Second)
 	if err != nil {
-		t.Fatalf("the redirect did not land, so this limit no longer holds as described: %v.\n"+
+		t.Fatalf("the same-account redirect did not land, so this limit no longer holds as described: %v.\n"+
 			"That is good news, but the comment above and the closure discussion in session.go "+
 			"were written around it and both need rereading before this test is deleted", err)
 	}
@@ -469,9 +487,9 @@ func TestASessionCanRedirectAJetStreamDeliveryOffItsOwnGrants(t *testing.T) {
 	}
 
 	// The bound that makes this a redirect rather than subject forgery: the
-	// message reads as what it is. It was DELIVERED to the gateway's inbox,
+	// message reads as what it is. It was DELIVERED to the peer's inbox,
 	// which is the escape, but its Subject is still the attacker's own events
-	// subject, so nothing downstream can be made to believe the gateway
+	// subject, so nothing downstream can be made to believe the peer
 	// published it or that it came off a subject the session cannot reach.
 	// If this ever fails the finding is a great deal worse than recorded.
 	if got.Subject != lib.TaskEventsSubject(podA, "task-1") {

@@ -145,7 +145,7 @@ def test_the_status_set_matches_what_the_status_view_knows():
     block = view[view.index("STATUS_STYLE = {"):]
     block = block[: block.index("}")]
     known = set(re.findall(r'^\s+"([A-Z_]+)": "', block, re.M))
-    assert len(known) == 5, known
+    assert len(known) == 6, known
     assert known == set(verifiers.AuditStatus.__args__)
 
 
@@ -222,3 +222,118 @@ def test_the_no_forge_answer_is_recognised(answer):
 )
 def test_an_answer_without_it_is_not(answer):
     assert _answer_check("the-answer-says-no-forge-is-configured", answer) == "fail"
+
+
+NEW_CASE = REPO / "bench" / "tasks" / "fleet-audit-unchanged-manifest-skips-synthesis" / "task.yaml"
+
+
+def _verify_envelope(root, **fields):
+    check = {"type": "audit_report_stored", "audit": AUDIT, **fields}
+    return AuditReportStoredVerifier(**check).verify(1.0)
+
+
+def _store_with(root, extra, finished):
+    _store(root, finished=finished)
+    path = root / AUDIT / "no_forge" / "local" / "latest.json"
+    envelope = json.loads(path.read_text(encoding="utf-8"))
+    envelope.update(extra)
+    path.write_text(json.dumps(envelope), encoding="utf-8")
+
+
+def test_a_required_envelope_key_passes_when_it_matches(root):
+    _store_with(root, {"precheck": "unchanged", "scheduled": True}, STARTED + timedelta(minutes=12))
+    result = _verify_envelope(root, required_envelope={"precheck": "unchanged", "scheduled": True})
+    assert result.status == "pass", result.reason
+
+
+def test_a_required_envelope_key_that_differs_fails_naming_it(root):
+    _store_with(root, {"precheck": "unchanged"}, STARTED + timedelta(minutes=12))
+    result = _verify_envelope(root, required_envelope={"precheck": "findings-changed"})
+    assert result.status == "fail"
+    assert "precheck is 'unchanged', not 'findings-changed'" in result.reason
+
+
+def test_a_required_envelope_key_the_envelope_lacks_fails(root):
+    _store(root, finished=STARTED + timedelta(minutes=12))
+    result = _verify_envelope(root, required_envelope={"precheck": "unchanged"})
+    assert result.status == "fail"
+    assert "precheck is None, not 'unchanged'" in result.reason
+
+
+def test_required_envelope_is_checked_before_the_finding_phrases(root):
+    _store(root, finished=STARTED + timedelta(minutes=12))
+    result = _verify_envelope(root, required_envelope={"precheck": "unchanged"}, required_finding_phrases=["debug-binding"])
+    assert result.status == "fail"
+    assert "precheck" in result.reason
+
+
+def _state_shell(state: dict | None):
+    def shell(script: str, timeout: float) -> str:
+        if script.startswith("cat "):
+            return json.dumps(state) if state is not None else ""
+        return _local_shell(script, timeout)
+    return shell
+
+
+def test_since_state_file_takes_the_stacks_fired_at_as_the_clock(root, monkeypatch):
+    fired = STARTED - timedelta(hours=2)
+    monkeypatch.setattr(onboarding, "agent_shell", _state_shell({"job_id": AUDIT, "fired_at": fired.isoformat()}))
+    # Older than the run's start, newer than the fire: counts with the file, not without it.
+    _store_with(root, {"precheck": "unchanged"}, fired + timedelta(minutes=9))
+    without = _verify_envelope(root, required_envelope={"precheck": "unchanged"})
+    assert without.status == "fail"
+    with_file = _verify_envelope(root, required_envelope={"precheck": "unchanged"}, since_state_file="/opt/data/.bench-x.json")
+    assert with_file.status == "pass", with_file.reason
+
+
+def test_the_planted_envelope_seconds_before_the_fire_does_not_count(root, monkeypatch):
+    """No skew in state-file mode: the plant's finish runs seconds before the fire, in the same pod."""
+    fired = STARTED - timedelta(hours=2)
+    monkeypatch.setattr(onboarding, "agent_shell", _state_shell({"job_id": AUDIT, "fired_at": fired.isoformat()}))
+    _store_with(root, {"precheck": None}, fired - timedelta(seconds=30))
+    result = _verify_envelope(root, required_envelope={"precheck": "unchanged"}, since_state_file="/opt/data/.bench-x.json")
+    assert result.status == "fail"
+    assert "since the stack fired the audit" in result.reason
+
+
+def test_an_envelope_older_than_the_fire_fails_with_the_fire_named(root, monkeypatch):
+    fired = STARTED - timedelta(hours=2)
+    monkeypatch.setattr(onboarding, "agent_shell", _state_shell({"job_id": AUDIT, "fired_at": fired.isoformat()}))
+    _store_with(root, {"precheck": "unchanged"}, fired - timedelta(minutes=9))
+    result = _verify_envelope(root, required_envelope={"precheck": "unchanged"}, since_state_file="/opt/data/.bench-x.json")
+    assert result.status == "fail"
+    assert "since the stack fired the audit" in result.reason
+
+
+@pytest.mark.parametrize("state", [None, {}, {"fired_at": "yesterday"}, {"fired_at": "2026-10-13T18:00:00"}])
+def test_a_missing_or_unreadable_fire_is_an_error(root, monkeypatch, state):
+    monkeypatch.setattr(onboarding, "agent_shell", _state_shell(state))
+    _store_with(root, {"precheck": "unchanged"}, STARTED + timedelta(minutes=12))
+    result = _verify_envelope(root, required_envelope={"precheck": "unchanged"}, since_state_file="/opt/data/.bench-x.json")
+    assert result.status == "error"
+    assert "did not fire" in result.reason
+
+
+def test_read_fired_at_reads_the_arms_file():
+    fired = datetime(2026, 11, 5, 8, 20, tzinfo=timezone.utc)
+    shell = _state_shell({"job_id": "fleet-consistency-drift", "fired_at": fired.isoformat(), "was_paused": True})
+    assert verifiers.read_fired_at(shell, "/opt/data/.bench-x.json", 1.0) == fired
+    assert verifiers.read_fired_at(_silent_shell, "/opt/data/.bench-x.json", 1.0) is None
+
+
+def test_the_unchanged_manifest_case_declares_the_check():
+    spec = yaml.safe_load(NEW_CASE.read_text())["verification_spec"]
+    check = next(entry for entry in spec if entry["name"] == "the-scheduled-run-was-closed-by-the-precheck")
+    node = parse_node(check["check"])
+    assert isinstance(node, AuditReportStoredVerifier)
+    assert node.required_envelope == {"precheck": "unchanged"}
+    assert node.since_state_file == "/opt/data/.bench-unchanged-manifest-digest.json"
+    assert node.status is None
+
+
+def test_the_unchanged_manifest_cases_state_file_is_the_arms():
+    arm = (REPO / "bench" / "tf" / "prebuilt" / "unchanged-manifest-digest" / "arm.py").read_text()
+    name = re.search(r'^STATE_NAME = "([^"]+)"', arm, re.M).group(1)
+    spec = yaml.safe_load(NEW_CASE.read_text())["verification_spec"]
+    check = next(entry for entry in spec if entry["name"] == "the-scheduled-run-was-closed-by-the-precheck")
+    assert check["check"]["since_state_file"] == f"/opt/data/{name}"

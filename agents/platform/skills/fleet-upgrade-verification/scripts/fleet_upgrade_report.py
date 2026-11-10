@@ -22,22 +22,31 @@ kube-public; read with two `kubectl get` per member after
 `gcloud container clusters get-credentials` into a per-target kubeconfig), a maintenance
 exclusion in effect whose scope covers the upgrade, the maintenance window's state at
 `--at`, and node-pool version skew against the target control plane; then the per-entry
-rules registered in `upgrade_readiness.EXTRA_RULES` (`readiness_rules/`, one module per
-entry of the upgrade-failure catalogue), which read the same cluster record, the objects of
+rules registered in `upgrade_readiness.EXTRA_RULES` (`readiness_rules/`, one or more modules
+per entry of the upgrade-failure catalogue), which read the same cluster record, the objects of
 the `kubectl get`s after the PDB read, one per group in LATER_READS (the namespaced kinds;
 the Pods on their own; the Nodes through a jsonpath template; StorageClasses and
-PersistentVolumes), each failing on its own, and, through the per-member context, whatever
-a rule reads itself (a rule that reads the audit log runs paged `gcloud logging read`s).
-A rule's blockers join the verdict and its risks get a column of their own. The rules live
-in `upgrade_readiness.py` and `readiness_rules/`; this file reads and renders.
+PersistentVolumes), each failing on its own, the project reads the report makes once per
+project or location for them (`ProjectReads`: the project's backend services, compute
+instances and GKE operations, and the location's server config, each failure an error row
+that sets exit code 1), and, through the per-member context, whatever a rule reads itself
+(a rule that reads the audit log runs paged `gcloud logging read`s). A rule's blockers join
+the verdict and its risks get a column of their own; the add-on inventory one rule builds
+from the reads is written per member as `addons` and printed as a table. The rules live in
+`upgrade_readiness.py` and `readiness_rules/`; this file reads and renders.
 
 Read-only against GCP: the gcloud commands it runs are `container clusters list`,
 `container get-server-config`, `projects list` (when neither `--project` nor a declared scope is passed), `config get-value project`, `projects
 describe` (to tie an API-disabled refusal to its project or resolve a numeric project
 number to its projectId) and, with
-`--readiness`, `container clusters get-credentials` and, for a rule that reads the audit
-log, `logging read`. The only things it writes are its own state file, the per-target
-kubeconfig files `get-credentials` produces, and the optional `--output` JSON.
+`--readiness`, `container clusters get-credentials`, `compute backend-services list`,
+`compute instances list` and `container operations list` once per project (per reporter
+process: once per behind cluster under the Monday audit, which runs the reporter per cluster),
+`container clusters describe` and a `container operations list` for one cluster for a member the list
+showed not RUNNING with no RUNNING operation on it (the status-age rule confirming a status and
+a holder the project's lists may predate), and, for a rule that reads the audit log,
+`logging read`. The only things it writes are its own state file,
+the per-target kubeconfig files `get-credentials` produces, and the optional `--output` JSON.
 """
 
 import argparse
@@ -54,7 +63,7 @@ from datetime import datetime, timezone
 
 import readiness_rules
 import upgrade_readiness as readiness
-from readiness_rules import audit_log
+from readiness_rules import audit_log, known_issues_matrix
 
 # Project resolution: explicit --project flags are the whole scope, and so is the
 # declared scope the agent passes (--scope-projects, from the platform_control
@@ -100,6 +109,16 @@ for _shared_dir in SHARED_SCRIPT_DIRS:
     if _shared_dir not in sys.path:
         sys.path.append(_shared_dir)
 import fleet_scope_args  # noqa: E402
+import collector_run  # noqa: E402
+
+# The JSON reads page through `kubectl get --raw`, one kind at a time
+# (collector_run.paged_dump), so a list the credential proxy would cut at its
+# output cap in one `-A -o json` read comes back whole in pages; the node read
+# keeps its jsonpath projection.
+Run = collector_run.Run
+paged_dump = collector_run.paged_dump
+paged_command_text = collector_run.paged_command_text
+failed_page_text = collector_run.failed_page_text
 
 # The scope this collector was handed, set by main from the scope flags.
 declared_scope = fleet_scope_args.DeclaredScope()
@@ -199,6 +218,11 @@ OUTPUT_TMP_PREFIX = ".fleet-upgrade-output-"
 # graded, from one the API server never answered.
 ERROR_READ_KEY = "read"
 WEBHOOK_READ = "webhooks"
+# The `read` a project-keyed error row names: the project's `clusters list`, or one of the
+# per-project reads the rules take (readiness_rules.PROJECT_READS, under their own names).
+# The rollout record carries a missing member forward only when its project's `clusters
+# list` failed: a failed instances or backend-services list left the clusters listed and graded.
+CLUSTERS_LIST_READ = "clusters"
 # Bumped when the record's shape changes; a file with another version is reported and
 # treated as no prior run rather than compared field by field.
 STATE_FORMAT_VERSION = 1
@@ -313,9 +337,7 @@ KUBECTL_WEBHOOK_RESOURCES = "validatingwebhookconfigurations,mutatingwebhookconf
 # code. The kinds are readiness_rules.READ_KINDS, named once for the rules and the report; a
 # failed command marks every kind it carried, including a partial listing.
 # KUBECTL_READS_PER_MEMBER, derived from the table, is the count the help cites.
-ALL_NAMESPACES_FLAG = "-A"
 OUTPUT_FLAG = "-o"
-JSON_OUTPUT_ARGS = (OUTPUT_FLAG, "json")
 READ_MODE_NAMESPACED_JSON = "namespaced-json"
 READ_MODE_CLUSTER_JSON = "cluster-json"
 READ_MODE_NODE_JSONPATH = "node-jsonpath"
@@ -330,21 +352,28 @@ LATER_READS = (
     (readiness_rules.CLUSTER_READ_KINDS, KUBECTL_CLUSTER_RESOURCES, READ_MODE_CLUSTER_JSON),
 )
 KUBECTL_READS_PER_MEMBER = 2 + len(LATER_READS)  # the PDB read, the webhook read, then LATER_READS
-KUBECTL_NODE_JSONPATH = '{range .items[*]}{.metadata.name}{"\\t"}{.spec.podCIDR}{"\\t"}{.metadata.labels}{"\\t"}{.spec.taints}{"\\t"}{.spec.unschedulable}{"\\t"}{.status.nodeInfo}{"\\t"}{.status.allocatable}{"\\t"}{.status.conditions}{"\\n"}{end}'
+KUBECTL_NODE_JSONPATH = '{range .items[*]}{.metadata.name}{"\\t"}{.spec.providerID}{"\\t"}{.metadata.creationTimestamp}{"\\t"}{.spec.podCIDR}{"\\t"}{.metadata.labels}{"\\t"}{.spec.taints}{"\\t"}{.spec.unschedulable}{"\\t"}{.status.nodeInfo}{"\\t"}{.status.allocatable}{"\\t"}{.status.conditions}{"\\n"}{end}'
 JSONPATH_OUTPUT_FORMAT = "jsonpath={template}"
 NODE_FIELD_SEPARATOR = "\t"
 NODE_LINE_SEPARATOR = "\n"  # what the jsonpath template ends each node with; a NEL (U+0085) inside a field is not a line break
-NODE_FIELD_COUNT = 8
-NODE_RAW_FIELD_COUNT = 2  # the name and the Pod CIDR, which jsonpath renders raw; the fields after them are JSON
+# The name, the providerID (`gce://<project>/<zone>/<instance>`, the instance behind the
+# node, which the orphan-node rule joins to the project's instances), the creation
+# timestamp (which that rule reads against the instance list's read time) and the Pod CIDR
+# are strings and come raw; the fields after them are JSON as kubectl's jsonpath renders
+# maps, lists and booleans.
+NODE_FIELD_COUNT = 10
+NODE_RAW_FIELDS = 4
 NODE_POD_CIDR_KEY = "podCIDR"
 NODE_KIND = readiness_rules.KIND_NODE
 # The credential proxy caps each stream a brokered command returns; past the cap it writes
-# the cut stdout, prints a marker on stderr (readiness_rules.PROXY_TRUNCATION_MARKER, which
-# the audit-log reader checks too) and returns the command's own exit code, so a cut list
-# reads as rc 0 with output that may or may not parse. The marker, not the parse failure,
-# names the cause, and the kinds the read carried are recorded as cut.
+# the cut stdout and prints a marker on stderr (readiness_rules.PROXY_TRUNCATION_MARKER, which
+# the audit-log reader checks too), and the shim exits 74 on a cut payload (an older shim
+# returned the command's own exit code). Every reader checks the marker before the exit
+# code, so the marker, not the exit code or the parse failure, names the cause, and the
+# kinds the read carried are recorded as cut.
 PROXY_TRUNCATION_MARKER = readiness_rules.PROXY_TRUNCATION_MARKER
 KUBECTL_OUTPUT_CUT = "{cmd} output was cut at the credential proxy's output cap, so the list did not fit in one read"
+GCLOUD_OUTPUT_CUT = KUBECTL_OUTPUT_CUT  # one cap, one sentence, for a kubectl list and a gcloud list alike
 # The member's note names the one cause its reads failed for, so an operator goes to the
 # step that failed: the directory, the credentials, the first read, the second read, or the
 # second read skipped because the first failed before the server answered it (the note names
@@ -451,6 +480,36 @@ READINESS_READ_SKIPPED_CELL = "read skipped"
 READINESS_NOT_EVALUATED_CELL = "not evaluated"
 READINESS_NO_OPENING_CELL = f"none within {readiness.DAYS_PER_WEEK} days"
 
+# The reads the per-entry rules take from the project rather than the cluster, made once per
+# project with `--readiness` on (`ProjectReads`) and handed to every member's rules through
+# the context under readiness_rules.CONTEXT_PROJECT_READS, beside the location's server
+# config from the cache the version table fills. Each is projected to the fields the rules
+# read, so a project of a few thousand instances stays under the credential proxy's output
+# cap; a failed or cut read is an error row under the table (exit 1) and the rules that need
+# it say `unknown`.
+COMPUTE_BACKEND_SERVICES_LIST = (GCLOUD, "compute", "backend-services", "list")
+BACKEND_SERVICES_FORMAT_FLAG = "--format=json(name,region,selfLink,backends,connectionDraining)"
+COMPUTE_INSTANCES_LIST = (GCLOUD, "compute", "instances", "list")
+INSTANCES_FORMAT_FLAG = "--format=json(name,zone,status)"
+CONTAINER_OPERATIONS_LIST = (GCLOUD, "container", "operations", "list")
+OPERATIONS_FORMAT_FLAG = "--format=json(name,operationType,status,statusMessage,startTime,endTime,targetLink,zone,location,error)"
+PROJECT_FLAG_FORMAT = "--project={project}"
+PROJECT_READ_COMMANDS = (
+    (readiness_rules.PROJECT_READ_BACKEND_SERVICES, COMPUTE_BACKEND_SERVICES_LIST, BACKEND_SERVICES_FORMAT_FLAG),
+    (readiness_rules.PROJECT_READ_INSTANCES, COMPUTE_INSTANCES_LIST, INSTANCES_FORMAT_FLAG),
+    (readiness_rules.PROJECT_READ_OPERATIONS, CONTAINER_OPERATIONS_LIST, OPERATIONS_FORMAT_FLAG),
+)
+PROJECT_READ_NOT_A_LIST = "{cmd} returned no list"
+# The add-on inventory table printed after the readiness table: one row per member, the
+# image names and tags of the DaemonSets and Deployments in the add-on namespaces.
+ADDONS_COLUMNS = (
+    "project",
+    "cluster",
+    "location",
+    "add-ons (image tag)",
+)
+ADDONS_HEADING = "Add-ons in {namespaces}, per member (the known-issues matrix's input; `members[].readiness.addons` in the JSON):"
+
 # Exit codes. A failed gcloud call is reported per project and per location and does
 # not abort the run. The exit code says whether every read that grades the version table,
 # the PDB rule or the webhook rule succeeded: the gcloud reads, `get-credentials`, the PDB
@@ -512,6 +571,8 @@ def run_cmd(cmd: list[str], timeout: int = GCLOUD_TIMEOUT_SECONDS, env: dict | N
 def run_gcloud_json(cmd: list[str]) -> tuple[list | dict | None, str | None]:
     """Runs a gcloud command with JSON output and returns (parsed, error_message)."""
     rc, stdout, stderr = run_cmd(cmd)
+    if PROXY_TRUNCATION_MARKER in stderr:
+        return None, GCLOUD_OUTPUT_CUT.format(cmd=" ".join(cmd))
     if rc != 0:
         return None, f"{' '.join(cmd)} failed ({rc}): {stderr.strip()}"
     if not stdout.strip():
@@ -733,6 +794,42 @@ class ServerConfigCache:
         return self._cache[key]
 
 
+class ProjectReads:
+    """The gcloud reads the per-entry rules take from the project (PROJECT_READ_COMMANDS),
+    made once per project the first time a member of it is graded, and the location's server
+    config from the version table's cache: `for_member` hands one dict per member, keyed as
+    readiness_rules.PROJECT_READS names the reads, each entry `data` and `error`, the project
+    reads with `read_at`, the instant the list was made (at the project's first graded member,
+    after that member's own kubectl reads), so a rule that joins a member's read to it can say
+    how far apart the two were. A failed
+    read is recorded under `errors` as an error row for the project (the server config's
+    rows stay the cache's own) and handed to the rules as its error, so the rules that need
+    it say `unknown` and the ones that do not grade on."""
+
+    def __init__(self, server_configs: ServerConfigCache):
+        self._server_configs = server_configs
+        self._by_project: dict[str, dict] = {}
+        self.errors: list[dict] = []
+
+    def _project(self, project: str) -> dict:
+        if project not in self._by_project:
+            reads = {}
+            for name, command, format_flag in PROJECT_READ_COMMANDS:
+                cmd = [*command, PROJECT_FLAG_FORMAT.format(project=project), format_flag]
+                data, error = run_gcloud_json(cmd)
+                if error is None and not isinstance(data, list):
+                    data, error = None, PROJECT_READ_NOT_A_LIST.format(cmd=" ".join(cmd))
+                if error is not None:
+                    self.errors.append({"project": project, "location": None, ERROR_READ_KEY: name, "message": error})
+                reads[name] = {readiness_rules.PROJECT_READ_DATA_KEY: data, readiness_rules.PROJECT_READ_ERROR_KEY: error, readiness_rules.PROJECT_READ_AT_KEY: format_timestamp(utc_now())}
+            self._by_project[project] = reads
+        return self._by_project[project]
+
+    def for_member(self, project: str, location: str) -> dict:
+        server_config, error = self._server_configs.get(project, location)
+        return {**self._project(project), readiness_rules.LOCATION_READ_SERVER_CONFIG: {readiness_rules.PROJECT_READ_DATA_KEY: server_config, readiness_rules.PROJECT_READ_ERROR_KEY: error}}
+
+
 def channel_default(server_config: dict, channel: str) -> str | None:
     """The `defaultVersion` of the named channel in a server config, or None."""
     for entry in server_config.get("channels", []) or []:
@@ -853,23 +950,32 @@ def get_credentials_cmd(cluster: dict, project: str) -> list[str]:
     ]
 
 
-def _kubectl_get(resources: str, env: dict, namespaced: bool) -> tuple[list | None, str | None]:
-    """(items, error) of one `kubectl get <resources> [-A] -o json`; a list the credential
-    proxy cut at its output cap is an error naming the cap."""
-    cmd = [KUBECTL, "get", resources, *([ALL_NAMESPACES_FLAG] if namespaced else []), *JSON_OUTPUT_ARGS]
-    rc, stdout, stderr = run_cmd(cmd, KUBECTL_TIMEOUT_SECONDS, env)
-    if rc != 0:
-        return None, f"{' '.join(cmd)} failed ({rc}): {stderr.strip()}"
-    if PROXY_TRUNCATION_MARKER in stderr:
-        return None, KUBECTL_OUTPUT_CUT.format(cmd=" ".join(cmd))
-    try:
-        data = json.loads(stdout) if stdout.strip() else {}
-    except ValueError as e:
-        return None, f"{' '.join(cmd)} returned unparsable JSON: {e}"
-    items = data.get("items") if isinstance(data, dict) else None
-    if not isinstance(items, list):
-        return None, f"{' '.join(cmd)} returned no items list"
-    return items, None
+def _paged_run(argv: list[str], *, env: dict | None = None) -> Run:
+    """`run_cmd` in the shape the paged reader drives: one page's argv in, its `Run` out."""
+    rc, stdout, stderr = run_cmd(argv, KUBECTL_TIMEOUT_SECONDS, env)
+    return Run(argv, rc, stdout, stderr, 0.0)
+
+
+def _kubectl_get(resources: str, env: dict) -> tuple[list | None, str | None]:
+    """(items, error) of one read of `resources` (a kubectl kind list), one kind at a time in
+    pages through `kubectl get --raw`. An error names the page that failed, not every kind's
+    first page: the paged reader hands back the failing page's `Run`, and the one-page text
+    leaves the member's 160-character note room for the reason. A later page's `continue`
+    token is elided from that text (`collector_run.failed_page_text`): the token alone is
+    longer than the note and names a list that has moved on. The reason is the page's exit
+    code and stderr, or, for a page that exited 0, the reader's own text for what was wrong
+    with it (empty, not JSON, not a list, a repeated token). A page the credential proxy cut
+    at its output cap is an error naming the cap, as a cut list was."""
+    kinds = resources.split(",")
+    parsed, result = paged_dump(kinds, run=_paged_run, env=env)
+    if parsed is not None:
+        return parsed.get("items") or [], None
+    text = failed_page_text(result.argv)
+    if PROXY_TRUNCATION_MARKER in result.stderr:
+        return None, KUBECTL_OUTPUT_CUT.format(cmd=text)
+    if result.rc != 0:
+        return None, f"{text} failed ({result.rc}): {result.stderr.strip()}"
+    return None, f"{text} failed: {result.stderr.strip()}"
 
 
 def prepare_kubeconfig(kubeconfig_dir: str, path: str) -> str | None:
@@ -988,15 +1094,20 @@ def parse_node_lines(stdout: str) -> tuple[list[dict] | None, str | None]:
         fields = line.split(NODE_FIELD_SEPARATOR)
         if len(fields) != NODE_FIELD_COUNT:
             return None, f"node line has {len(fields)} field(s), not {NODE_FIELD_COUNT}: {line[:NOTE_ERROR_CHARS]!r}"
-        name, pod_cidr = fields[:NODE_RAW_FIELD_COUNT]
+        name, provider_id, created, pod_cidr = fields[:NODE_RAW_FIELDS]
         try:
-            labels, taints, unschedulable, info, allocatable, conditions = (json.loads(f) if f.strip() else None for f in fields[NODE_RAW_FIELD_COUNT:])
+            labels, taints, unschedulable, info, allocatable, conditions = (json.loads(f) if f.strip() else None for f in fields[NODE_RAW_FIELDS:])
         except ValueError as e:
             return None, f"node line unparsable: {e}"
         spec = {"taints": taints or [], "unschedulable": bool(unschedulable)}
+        if provider_id:  # absent on a node the cloud provider has not registered; left out, as the API leaves it out
+            spec[readiness_rules.NODE_PROVIDER_ID_KEY] = provider_id
         if pod_cidr.strip():  # a node without a block (not yet registered) carries no key, as the API's object does not
             spec[NODE_POD_CIDR_KEY] = pod_cidr.strip()
-        nodes.append({"kind": NODE_KIND, "metadata": {"name": name, "labels": labels or {}}, "spec": spec, "status": {"nodeInfo": info or {}, "allocatable": allocatable or {}, "conditions": conditions or []}})
+        metadata = {"name": name, "labels": labels or {}}
+        if created:
+            metadata[readiness_rules.NODE_CREATION_TIMESTAMP_KEY] = created
+        nodes.append({"kind": NODE_KIND, "metadata": metadata, "spec": spec, "status": {"nodeInfo": info or {}, "allocatable": allocatable or {}, "conditions": conditions or []}})
     return nodes, None
 
 
@@ -1005,10 +1116,10 @@ def _kubectl_nodes(env: dict) -> tuple[list[dict] | None, str | None]:
     when the cut fell on a line boundary and the lines before it parse."""
     cmd = [KUBECTL, "get", KUBECTL_NODE_RESOURCE, OUTPUT_FLAG, JSONPATH_OUTPUT_FORMAT.format(template=KUBECTL_NODE_JSONPATH)]
     rc, stdout, stderr = run_cmd(cmd, KUBECTL_TIMEOUT_SECONDS, env)
-    if rc != 0:
-        return None, f"{' '.join(cmd[:3])} failed ({rc}): {stderr.strip()}"
     if PROXY_TRUNCATION_MARKER in stderr:
         return None, KUBECTL_OUTPUT_CUT.format(cmd=" ".join(cmd[:3]))
+    if rc != 0:
+        return None, f"{' '.join(cmd[:3])} failed ({rc}): {stderr.strip()}"
     return parse_node_lines(stdout)
 
 
@@ -1016,7 +1127,7 @@ def _later_read(resources: str, mode: str, env: dict) -> tuple[list | None, str 
     """One read of LATER_READS, by its mode."""
     if mode == READ_MODE_NODE_JSONPATH:
         return _kubectl_nodes(env)
-    return _kubectl_get(resources, env, mode == READ_MODE_NAMESPACED_JSON)
+    return _kubectl_get(resources, env)
 
 
 def first_read_failed_before_the_server_answered(error: str) -> bool:
@@ -1070,12 +1181,12 @@ def read_cluster_objects(cluster: dict, project: str, kubeconfig_dir: str) -> di
     if rc != 0:
         read["error"] = read["webhook_error"] = read["credentials_error"] = f"{' '.join(cmd)} failed ({rc}): {stderr.strip()}"
         return _later_reads_skipped(read, readiness_rules.NO_READ_RAN_REASON)
-    read["items"], read["error"] = _kubectl_get(KUBECTL_RESOURCES, env, True)
+    read["items"], read["error"] = _kubectl_get(KUBECTL_RESOURCES, env)
     if read["error"] is not None and first_read_failed_before_the_server_answered(read["error"]):
         read["webhook_skipped"] = True
         read["webhook_error"] = f"{WEBHOOK_READ_SKIPPED} ({read['error']})"
         return _later_reads_skipped(read, readiness_rules.LATER_READS_SKIPPED_REASON)
-    read["webhook_items"], read["webhook_error"] = _kubectl_get(KUBECTL_WEBHOOK_RESOURCES, env, True)
+    read["webhook_items"], read["webhook_error"] = _kubectl_get(KUBECTL_WEBHOOK_RESOURCES, env)
     if read["error"] is not None:
         return _later_reads_skipped(read, readiness_rules.LATER_READS_SKIPPED_REASON)
     for kinds, resources, mode in LATER_READS:
@@ -1120,11 +1231,13 @@ def _read_error_notes(read_errors: dict) -> list[str]:
     return [NOTE_READ_FAILED.format(kinds=readiness.LIST_SEPARATOR.join(kinds), error=_error_excerpt(error)) for error, kinds in kinds_by_error.items()]
 
 
-def readiness_context(member: dict, at: datetime, clusters: list[dict] | None = None, pools: list[dict] | None = None, master=None, autopilot: bool = False) -> dict:
+def readiness_context(member: dict, at: datetime, clusters: list[dict] | None = None, pools: list[dict] | None = None, master=None, autopilot: bool = False, project_reads: dict | None = None, graded: list[dict] | None = None, addons: list[dict] | None = None) -> dict:
     """The per-member read context the per-entry rules share (readiness_rules documents the
     keys): the member's project, location and name for a log filter, this module's runner
     with its per-call cap, the instant, a cache a rule fills so another reads it once, every
-    cluster record the run listed, the member's pools, target, control plane and Autopilot."""
+    cluster record the run listed, the member's pools, target, control plane and Autopilot,
+    and the project reads (`ProjectReads.for_member`; empty when none were made, which the
+    rules that need one report as `unknown`), and the member's add-on inventory, built once."""
     return {
         readiness_rules.CONTEXT_PROJECT: member["project"],
         readiness_rules.CONTEXT_LOCATION: member["location"],
@@ -1138,13 +1251,18 @@ def readiness_context(member: dict, at: datetime, clusters: list[dict] | None = 
         readiness_rules.CONTEXT_TARGET_TEXT: member["target_version"],
         readiness_rules.CONTEXT_MASTER: master,
         readiness_rules.CONTEXT_AUTOPILOT: autopilot,
+        readiness_rules.CONTEXT_PROJECT_READS: dict(project_reads) if project_reads else {},
+        readiness_rules.CONTEXT_ADDONS: list(addons) if addons is not None else None,
+        readiness_rules.CONTEXT_GRADED: list(graded) if graded is not None else None,
     }
 
 
-def assess_readiness(cluster: dict, member: dict, read: dict, at: datetime, fleet: list[dict] | None = None) -> dict:
+def assess_readiness(cluster: dict, member: dict, read: dict, at: datetime, fleet: list[dict] | None = None, project_reads: dict | None = None, graded: list[dict] | None = None) -> dict:
     """The member's `readiness` object: the PDB, maintenance, skew and webhook rules, then
     EXTRA_RULES, against the row's target. `fleet` is every cluster record in the run, for the
-    rules that compare peers."""
+    rules that compare peers; `project_reads` the project and location reads the rules take
+    from the context (`ProjectReads.for_member`). `addons` is the add-on inventory the
+    known-issues rule builds from the reads, the matrix's input."""
     target = parse_version(member["target_version"]) if member["target_version"] else None
     master = parse_version(member["control_plane_version"])
     pools = _pool_records(cluster, member)
@@ -1154,7 +1272,8 @@ def assess_readiness(cluster: dict, member: dict, read: dict, at: datetime, flee
     webhooks = None if webhook_items is None else readiness.grade_webhooks(*readiness.split_webhook_items(webhook_items))
     maintenance = readiness.evaluate_maintenance(cluster.get("maintenancePolicy"), at, member["target_version"], target, master, pools)
     skew = readiness.evaluate_skew(target, pools, autopilot)
-    context = readiness_context(member, at, fleet if fleet is not None else [cluster], pools, master, autopilot)
+    addons = known_issues_matrix.inventory(read)  # once per member: the rule reads it from the context, the JSON carries it
+    context = readiness_context(member, at, fleet if fleet is not None else [cluster], pools, master, autopilot, project_reads, graded, addons)
     rules = readiness.evaluate_extra_rules(cluster, member, read, target, context)
     status = readiness.readiness_status(pdbs, webhooks, maintenance, skew, target is not None, rules)
 
@@ -1209,6 +1328,7 @@ def assess_readiness(cluster: dict, member: dict, read: dict, at: datetime, flee
         "risks": rules["risks"],
         "unknown": rules["unknown"],
         "notes": rules["notes"],
+        "addons": addons,
         # From the cache as the reads left it: an entry a rule wrote in another shape is that
         # rule's `unknown` (the fold checks the cache around each rule) and is not read here.
         "audit_log": audit_log.summaries(context),
@@ -1265,6 +1385,7 @@ def build_report(projects: list[str], explicit_target: str | None, readiness_opt
         narrowed_to = sorted(set(clusters))
     matched: set[tuple[str, str]] = set()
     cache = ServerConfigCache()
+    project_reads = ProjectReads(cache)
     members: list[dict] = []
     errors: list[dict] = []
     # Projects whose listing failed: a spec can match nothing there, and the
@@ -1286,7 +1407,7 @@ def build_report(projects: list[str], explicit_target: str | None, readiness_opt
                 if ours:
                     continue
                 error = f"{error} ({why_not})"
-            errors.append({"project": project, "location": None, "message": error or f"{' '.join(cmd)} returned no list"})
+            errors.append({"project": project, "location": None, ERROR_READ_KEY: CLUSTERS_LIST_READ, "message": error or f"{' '.join(cmd)} returned no list"})
             unlisted.append(project)
             continue
         # Narrowed by --scope-exclude-clusters, which the agent passes with the
@@ -1317,12 +1438,13 @@ def build_report(projects: list[str], explicit_target: str | None, readiness_opt
                 if message != read["error"]:
                     row[ERROR_READ_KEY] = WEBHOOK_READ
                 errors.append(row)
-            member["readiness"] = assess_readiness(cluster, member, read, readiness_options["at"], fleet)
+            member["readiness"] = assess_readiness(cluster, member, read, readiness_options["at"], fleet, project_reads.for_member(project, member["location"]), graded=[c for _, c in found])
             for which, log in (member["readiness"].get("audit_log") or {}).items():
                 if log.get("error"):
                     audit_log_failures.append({"project": project, "location": member["location"], "cluster": member["cluster"], "read": which, "message": log["error"]})
         members.append(member)
     errors.extend(cache.errors)
+    errors.extend(project_reads.errors)
     listed = [p for p in projects if p not in unlisted]
     excluded_by_spec: dict[tuple[str, str], list[str]] = {}
     for project in projects:
@@ -1518,6 +1640,22 @@ def render_readiness(report: dict) -> str:
     return "\n".join(lines)
 
 
+def render_addons(report: dict) -> str:
+    """The add-on inventory table printed after the readiness table: one row per member, the
+    image names and tags of the DaemonSets and Deployments in the add-on namespaces, as the
+    known-issues rule read them (`members[].readiness.addons` carries the rows)."""
+    lines = [
+        ADDONS_HEADING.format(namespaces=readiness.LIST_SEPARATOR.join(known_issues_matrix.ADDON_NAMESPACES)),
+        "",
+        "| " + " | ".join(ADDONS_COLUMNS) + " |",
+        "| " + " | ".join(TABLE_SEPARATOR_CELL for _ in ADDONS_COLUMNS) + " |",
+    ]
+    for m in report["members"]:
+        row = (m["project"], m["cluster"], m["location"], known_issues_matrix.inventory_cell(m["readiness"].get("addons") or []))
+        lines.append("| " + " | ".join(_cell(v) for v in row) + " |")
+    return "\n".join(lines)
+
+
 def utc_now() -> datetime:
     """The clock every timestamp in the state file comes from; tests patch it."""
     return datetime.now(timezone.utc)
@@ -1658,7 +1796,10 @@ def compute_progress(report: dict, previous: dict | None, now: datetime, rollout
     """
     now_text = format_timestamp(now)
     prior_members = previous["members"] if previous else {}
-    failed_projects = {e["project"] for e in report["errors"] if e.get("location") is None and e.get("project")}
+    # The projects whose `clusters list` failed, by the row's `read`: a project read that failed
+    # (instances, backend services, operations) leaves the clusters listed and graded, so a
+    # member missing there is gone, not unread.
+    failed_projects = {e["project"] for e in report["errors"] if e.get("location") is None and e.get("project") and e.get(ERROR_READ_KEY) == CLUSTERS_LIST_READ}
     read_projects = set(report["projects"]) - failed_projects
 
     record: dict[str, dict] = {}
@@ -1776,7 +1917,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", help="Path to write the report as JSON.")
     parser.add_argument("--state-dir", default=DEFAULT_STATE_DIR, help=f"Directory holding one record per target from the previous run (default: {DEFAULT_STATE_DIR}).")
     parser.add_argument("--rollout-in-progress", action="store_true", help="Assert a rollout is under way, so an unchanged, behind member is flagged stalled even when no other member moved.")
-    parser.add_argument("--readiness", action="store_true", help=f"Also grade each member's readiness for the upgrade: drain-blocking PDBs and fail-closed webhooks with an unreachable backend in the upgrade's path or able to refuse the control plane's bootstrap RBAC writes (ClusterRoles and ClusterRoleBindings; Roles and RoleBindings in kube-system and kube-public), maintenance exclusions and window, node-pool skew, then the per-entry rules of the upgrade-failure catalogue (readiness_rules/; {KUBECTL_READS_PER_MEMBER} kubectl reads per member in all, each after the webhook read failing on its own), whose blockers join the verdict and whose risks get a column of their own.")
+    parser.add_argument("--readiness", action="store_true", help=f"Also grade each member's readiness for the upgrade: drain-blocking PDBs and fail-closed webhooks with an unreachable backend in the upgrade's path or able to refuse the control plane's bootstrap RBAC writes (ClusterRoles and ClusterRoleBindings; Roles and RoleBindings in kube-system and kube-public), maintenance exclusions and window, node-pool skew, then the per-entry rules of the upgrade-failure catalogue (readiness_rules/; {KUBECTL_READS_PER_MEMBER} kubectl reads per member in all, each after the webhook read failing on its own), whose blockers join the verdict and whose risks get a column of their own; three gcloud list reads per project (backend services, instances, operations) and the server config per location feed them, one `clusters describe` and one `operations list` for the cluster confirm a member listed not RUNNING with no RUNNING operation, and the add-on inventory follows the readiness table.")
     parser.add_argument("--at", help="RFC 3339 instant to evaluate maintenance exclusions and the window at (default: now). Only with --readiness.")
     parser.add_argument("--kubeconfig-dir", help="Directory for the per-member kubeconfig files --readiness writes (default: $HERMES_HOME/.kubeconfigs).")
     args = parser.parse_args(argv)
@@ -1824,6 +1965,8 @@ def main(argv: list[str] | None = None) -> int:
     if readiness_options is not None:
         print()
         print(render_readiness(report))
+        print()
+        print(render_addons(report))
     write_failed = False
     if args.cluster:
         # A narrowed read is not a rollout observation: the record would file

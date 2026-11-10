@@ -67,6 +67,16 @@ HELM_INVOCATION = re.compile(
     r"(?im)(?:^|[;&|(`]|-c\s+['\"]|\$|/|\b\w+=\S*\s|\b(?:sudo|env|timeout\s+\d+|xargs|exec|command|nohup)\s)\s*helm\s"
 )
 SHIPPED_SKILL_DIRS = sorted(Path(__file__).resolve().parents[2].glob("*/skills/*/"))
+# The bench seeds that onboard a per-run cluster prove the Cluster Agent's
+# path by running kubectl through the shim as the sandbox user under the
+# profile's kubeconfig, under `set -e`: a probe the policy refuses fails the
+# seed before the agent's turn. Each probe is a `KUBECONFIG=<path> kubectl …`
+# word run inside the seed's remote shell command, up to its redirect.
+PREBUILT_SEED_SCRIPTS = sorted(Path(__file__).resolve().parents[3].glob("bench/tf/prebuilt/*/scripts/*.sh"))
+SEED_SHIM_PROBE = re.compile(r"KUBECONFIG=\S+\s+kubectl\s+(?P<args>[^;>|&]*)")
+# Fewer probes than this means a seed reworded its probe lines and the test
+# would pass by finding nothing; the gitops-fix-cycle seed runs one per layout.
+MIN_SEED_SHIM_PROBES = 2
 MIN_HELM_CHART_FENCED_COMMANDS = 6
 
 
@@ -302,6 +312,296 @@ class KubectlReadOnlyTest(unittest.TestCase):
                 decision = evaluate(argv)
                 self.assertFalse(decision.allowed)
                 self.assertEqual("identity.caller-supplied-impersonation", decision.rule_id)
+
+
+class GcloudNearestReadHintTest(unittest.TestCase):
+    """A refusal of a misspelt read names the admitted read it resembles."""
+
+    HINT = command_policy._NEAREST_READ_HINT.format(command="container fleet rolloutsequences list")
+
+    def test_a_hyphenated_misspelling_is_pointed_at_the_one_word_read(self):
+        decision = evaluate(["gcloud", "container", "fleet", "rollout-sequences", "list", "--project", "p"])
+        self.assertFalse(decision.allowed)
+        self.assertEqual("gcp.read-only", decision.rule_id)
+        self.assertTrue(decision.message.endswith(self.HINT), decision.message)
+
+    def test_an_extra_group_word_still_finds_the_read(self):
+        argv = ["gcloud", "container", "fleet", "rollout-sequencing", "rollout-sequences", "list"]
+        self.assertTrue(evaluate(argv).message.endswith(self.HINT))
+
+    def test_a_missing_group_word_still_finds_the_read(self):
+        argv = ["gcloud", "container", "rollout-sequences", "list", "--project", "p"]
+        self.assertTrue(evaluate(argv).message.endswith(self.HINT))
+
+    def test_a_write_gets_no_hint(self):
+        for argv in (
+            ["gcloud", "container", "clusters", "upgrade", "prod-usc1"],
+            ["gcloud", "container", "fleet", "rolloutsequences", "delete", "seeded-train"],
+        ):
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertFalse(decision.allowed)
+                self.assertNotIn("nearest admitted read", decision.message)
+
+    def test_a_read_of_another_group_gets_no_hint(self):
+        decision = evaluate(["gcloud", "container", "fleet", "foo", "list"])
+        self.assertFalse(decision.allowed)
+        self.assertNotIn("nearest admitted read", decision.message)
+
+
+class KubectlRawPathTest(unittest.TestCase):
+    """`kubectl get --raw` is one shape: a relative collection path on an
+    allowlisted kind, with the list verb's query keys, on `get` alone."""
+
+    RULE = "kubernetes.raw-path"
+
+    def refused(self, argv):
+        decision = evaluate(argv)
+        self.assertFalse(decision.allowed, argv)
+        self.assertEqual(self.RULE, decision.rule_id, argv)
+        self.assertEqual("--raw", decision.offending_flag)
+        self.assertIn("Refused:", decision.message)
+        return decision
+
+    def test_the_probes_the_bench_seeds_run_through_the_shim_are_admitted(self):
+        """The gitops-fix-cycle seed proves a Cluster Agent profile from the
+        shell sandbox with one kubectl through the shim under the pinned
+        kubeconfig; a probe this rule refuses fails the seed before the agent's
+        turn. Its `get --raw=/readyz` did once `--raw` was held to paged
+        collection reads and /metrics; the probe is `version` now."""
+        probes = []
+        for path in PREBUILT_SEED_SCRIPTS:
+            for match in SEED_SHIM_PROBE.finditer(path.read_text(encoding="utf-8")):
+                probes.append((path.parent.parent.name, shlex.split(match.group("args"))))
+        self.assertGreaterEqual(len(probes), MIN_SEED_SHIM_PROBES, probes)
+        for stack, args in probes:
+            argv = ["kubectl", *args]
+            with self.subTest(stack=stack, argv=argv):
+                decision = evaluate(argv)
+                self.assertTrue(decision.allowed, decision.message)
+
+    def test_the_paged_reads_the_collectors_issue_are_allowed(self):
+        for argv in (
+            ["kubectl", "get", "--raw", "/api/v1/pods?limit=500"],
+            ["kubectl", "get", "--raw=/apis/apps/v1/deployments?limit=500"],
+            ["kubectl", "get", "--raw", "/apis/batch/v1/cronjobs?limit=500&continue=eyJ2IjoibWV0YS5rOHMuaW8vdjEifQ"],
+            ["kubectl", "get", "--raw", "/api/v1/events?limit=500&fieldSelector=type%3DWarning"],
+            ["kubectl", "get", "--raw", "/api/v1/pods?labelSelector=app.kubernetes.io/name%3Dweb,tier%20in%20(a,b)"],
+            ["kubectl", "get", "--raw", "/api/v1/namespaces/kube-system/pods?limit=10"],
+            ["kubectl", "--context", "gke_p_l_c", "get", "--raw", "/api/v1/nodes?limit=100"],
+            ["kubectl", "get", "--raw", "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings"],
+            ["kubectl", "get", "--raw", "/apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations?resourceVersion=0&resourceVersionMatch=NotOlderThan"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertTrue(evaluate(argv).allowed, evaluate(argv).message)
+
+    def test_secrets_are_never_a_raw_collection(self):
+        for argv in (
+            ["kubectl", "get", "--raw", "/api/v1/secrets?limit=1"],
+            ["kubectl", "get", "--raw", "/api/v1/namespaces/default/secrets"],
+            ["kubectl", "get", "--raw", "/api/v1/%73ecrets"],
+            ["kubectl", "get", "--raw", "/api/v1/pods", "--raw", "/api/v1/secrets"],
+            # The `=` spelling is the one profile confinement rewrites argv into.
+            ["kubectl", "get", "--raw=/api/v1/secrets?limit=1"],
+            ["kubectl", "get", "--raw=/api/v1/namespaces/default/secrets"],
+            ["kubectl", "get", "--raw=/api/v1/pods", "--raw=/api/v1/secrets"],
+        ):
+            with self.subTest(argv=argv):
+                self.refused(argv)
+        self.assertNotIn("/api/v1/secrets", command_policy.KUBECTL_RAW_COLLECTIONS)
+        self.assertFalse(any(path.endswith("/secrets") for path in command_policy.KUBECTL_RAW_COLLECTIONS))
+
+    def test_subresources_single_objects_and_traversal_are_refused(self):
+        for argv in (
+            ["kubectl", "get", "--raw", "/api/v1/pods/x/log"],
+            ["kubectl", "get", "--raw", "/api/v1/namespaces/default/pods/x/exec"],
+            ["kubectl", "get", "--raw", "/api/v1/nodes/n/proxy/metrics"],
+            ["kubectl", "get", "--raw", "/api/v1/namespaces/default/pods/x/portforward"],
+            ["kubectl", "get", "--raw", "/api/v1/namespaces/default/serviceaccounts/sa/token"],
+            ["kubectl", "get", "--raw", "/apis/apps/v1/namespaces/default/deployments/d/scale"],
+            ["kubectl", "get", "--raw", "/api/v1/namespaces/default/pods/x"],
+            ["kubectl", "get", "--raw", "/api/v1/namespaces/kube-system"],
+            ["kubectl", "get", "--raw", "/api/v1/../v1/pods"],
+            ["kubectl", "get", "--raw", "/api/v1/%2e%2e/v1/pods"],
+            ["kubectl", "get", "--raw", "/api/v1//pods"],
+            ["kubectl", "get", "--raw", "/api/v1\\pods"],
+            ["kubectl", "get", "--raw", "/api/v1/pods%2Fx%2Flog"],
+            ["kubectl", "get", "--raw", "/api/v1/pods/"],
+            ["kubectl", "get", "--raw", "api/v1/pods"],
+            ["kubectl", "get", "--raw", "/API/v1/pods"],
+            ["kubectl", "get", "--raw", "/healthz"],
+            ["kubectl", "get", "--raw", "/apis/evil.example.com/v1/pods"],
+            ["kubectl", "get", "--raw", "/apis/apps/v1beta1/deployments"],
+            ["kubectl", "get", "--raw=/api/v1/pods/x/log"],
+            ["kubectl", "get", "--raw=/api/v1/nodes/n/proxy/metrics"],
+            ["kubectl", "get", "--raw=/api/v1/namespaces/default/pods/x"],
+        ):
+            with self.subTest(argv=argv):
+                self.refused(argv)
+
+    def test_a_scheme_or_host_is_refused(self):
+        for argv in (
+            ["kubectl", "get", "--raw", "https://example.com/api/v1/pods"],
+            ["kubectl", "get", "--raw", "//example.com/api/v1/pods"],
+            ["kubectl", "get", "--raw", "http:/api/v1/pods"],
+            ["kubectl", "get", "--raw", "/api/v1/pods?limit=1#frag"],
+            ["kubectl", "get", "--raw", "/api/v1/pods%3Flimit=1"],
+            ["kubectl", "get", "--raw=https://example.com/api/v1/pods"],
+            ["kubectl", "get", "--raw=//example.com/api/v1/pods"],
+        ):
+            with self.subTest(argv=argv):
+                self.refused(argv)
+
+    def test_a_raw_after_a_flag_that_took_the_separator_as_its_value_is_judged(self):
+        # pflag reads the next argv element as a value-taking flag's value even
+        # when it is `--`, so `-n -- --raw <path>` is a namespace of `--` and a
+        # parsed `--raw`; a scan that stopped at `--` never saw it, and a local
+        # kubectl sent the request. A real `--` on `get` makes a later `--raw` an
+        # unresolvable resource name, so judging it refuses nothing that ran.
+        for argv in (
+            ["kubectl", "get", "-n", "--", "--raw", "/api/v1/nodes/n1/proxy/configz"],
+            ["kubectl", "get", "-n", "--", "--raw", "/api/v1/secrets"],
+            ["kubectl", "get", "-n", "--", "--raw=https://example.com/api/v1/pods"],
+            ["kubectl", "get", "-o", "--", "--raw", "/api/v1/namespaces/default/pods/x/exec"],
+            ["kubectl", "get", "pods", "--", "--raw", "/api/v1/secrets"],
+            ["kubectl", "get", "--raw", "--", "/api/v1/pods"],
+        ):
+            with self.subTest(argv=argv):
+                self.refused(argv)
+        self.assertEqual(
+            ["/api/v1/secrets"],
+            command_policy._kubectl_raw_values(["kubectl", "get", "-n", "--", "--raw", "/api/v1/secrets"]),
+        )
+        # A permitted page keeps passing through the same spelling.
+        self.assertTrue(evaluate(["kubectl", "get", "-n", "--", "--raw", "/api/v1/pods?limit=500"]).allowed)
+
+    def test_only_the_list_query_keys_pass(self):
+        for argv in (
+            ["kubectl", "get", "--raw", "/api/v1/pods?watch=true"],
+            ["kubectl", "get", "--raw", "/api/v1/pods?limit=500&pretty=true"],
+            ["kubectl", "get", "--raw", "/api/v1/pods?limit=5&limit=6"],
+            ["kubectl", "get", "--raw", "/api/v1/pods?limit=-1"],
+            ["kubectl", "get", "--raw", "/api/v1/pods?limit=abc"],
+            ["kubectl", "get", "--raw", "/api/v1/pods?=500"],
+            ["kubectl", "get", "--raw", "/api/v1/pods?labelSelector=a%3Db%26watch%3Dtrue%23"],
+            ["kubectl", "get", "--raw", "/api/v1/pods?continue=%00"],
+        ):
+            with self.subTest(argv=argv):
+                self.refused(argv)
+
+    def test_raw_on_any_read_verb_but_get_is_refused(self):
+        for argv in (
+            ["kubectl", "describe", "--raw", "/api/v1/pods"],
+            ["kubectl", "auth", "can-i", "--raw", "/api/v1/pods"],
+            ["kubectl", "top", "--raw", "/api/v1/nodes"],
+        ):
+            with self.subTest(argv=argv):
+                self.refused(argv)
+
+    def test_raw_on_a_write_is_refused_as_the_write(self):
+        # The verb is the problem there, and the refusal says so; `config
+        # view --raw` keeps its token-disclosure refusal the same way.
+        for argv in (
+            ["kubectl", "delete", "--raw", "/api/v1/pods"],
+            ["kubectl", "create", "--raw", "/api/v1/namespaces/default/pods", "-f", "pod.json"],
+        ):
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertFalse(decision.allowed)
+                self.assertEqual("kubernetes.read-only", decision.rule_id)
+
+    def test_raw_with_no_path_is_refused(self):
+        self.refused(["kubectl", "get", "--raw"])
+
+    def test_the_endpoints_shipped_skills_name_stay_admitted(self):
+        # gke-upgrades reads /metrics; capacity-obtainability reads the
+        # metrics API's node collection. Both ran on main and keep running.
+        for argv in (
+            ["kubectl", "get", "--raw", "/metrics"],
+            ["kubectl", "get", "--raw", "/apis/metrics.k8s.io/v1beta1/nodes"],
+            ["kubectl", "get", "--raw", "/apis/metrics.k8s.io/v1beta1/pods?limit=500"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertTrue(evaluate(argv).allowed, evaluate(argv).message)
+        for argv in (
+            ["kubectl", "get", "--raw", "/metrics?watch=true"],
+            ["kubectl", "get", "--raw", "/metrics/"],
+            ["kubectl", "get", "--raw", "/healthz"],
+            ["kubectl", "get", "--raw", "/.well-known/openid-configuration"],
+        ):
+            with self.subTest(argv=argv):
+                self.refused(argv)
+
+    def test_the_endpoint_reader_decodes_the_path_and_leaves_the_query(self):
+        # The broker's session walker and the profile confinement keep the
+        # endpoints to the shell role through this reader, so it decodes as
+        # the rule does and reads the path alone; the rule refuses the query.
+        for value in ("/metrics", "/%6detrics", "/%6Detrics", "/metrics?watch=true"):
+            with self.subTest(value=value):
+                self.assertEqual("/metrics", command_policy.kubectl_raw_endpoint(value))
+        for value in ("/api/v1/pods?limit=500", "/metrics/", "/metricsx", "/healthz", "/", ""):
+            with self.subTest(value=value):
+                self.assertIsNone(command_policy.kubectl_raw_endpoint(value))
+
+    def test_the_grammar_is_anchored_at_both_ends(self):
+        # `re.match(..., "$")` would pass a trailing newline; fullmatch does not,
+        # and limit=0 asks for the unpaged list this rule exists to avoid.
+        for argv in (
+            ["kubectl", "get", "--raw", "/api/v1/pods\n"],
+            ["kubectl", "get", "--raw", "/api/v1/pods?labelSelector=a%0A"],
+            ["kubectl", "get", "--raw", "/api/v1/pods?limit=0"],
+            ["kubectl", "get", "--raw", "/api/v1/pods?limit=00"],
+        ):
+            with self.subTest(argv=argv):
+                self.refused(argv)
+
+    def test_a_limit_past_int64_is_refused_without_raising(self):
+        # `int()` on a string past `sys.int_info.default_max_str_digits` raises
+        # under Python 3.11; the policy never raises, so the length is bounded
+        # at an int64's widest decimal before the conversion.
+        widest = "9" * command_policy._RAW_LIMIT_MAX_DIGITS
+        self.assertTrue(evaluate(["kubectl", "get", "--raw", f"/api/v1/pods?limit={widest}"]).allowed)
+        for digits in (command_policy._RAW_LIMIT_MAX_DIGITS + 1, 4301):
+            argv = ["kubectl", "get", "--raw", f"/api/v1/pods?limit={'1' * digits}"]
+            with self.subTest(digits=digits):
+                decision = self.refused(argv)
+                self.assertIn("limit is not a positive integer", decision.message)
+
+    def test_the_refusal_names_the_boundary_and_the_shape(self):
+        decision = self.refused(["kubectl", "get", "--raw", "/api/v1/secrets"])
+        self.assertIn("relative /api/v1/<resource>", decision.message)
+        self.assertIn("permission boundary", decision.message)
+        self.assertEqual(("get",), decision.verb_tuple)
+
+    def test_the_allowlist_is_canonical_cluster_wide_paths(self):
+        for path in command_policy.KUBECTL_RAW_COLLECTIONS:
+            with self.subTest(path=path):
+                self.assertIsNotNone(command_policy._RAW_PATH_RE.match(path))
+                self.assertNotIn("/namespaces/", path.replace("/api/v1/namespaces", ""))
+
+    def test_a_read_without_raw_is_untouched(self):
+        self.assertTrue(evaluate(["kubectl", "get", "pods", "-A", "-o", "json"]).allowed)
+        self.assertIsNone(command_policy._kubectl_raw_refusal(["kubectl", "get", "pods"], ("get",)))
+
+    def test_the_raw_decoders_read_as_urllib_does_without_importing_it(self):
+        # The conformance suite (tests/conformance, C3) holds the policy module
+        # to imports that cannot read a file or a socket, and `urllib` is on
+        # its list, so the module decodes percent escapes and splits the query
+        # itself. This pins the two decoders to the stdlib's reading of the
+        # same strings: a drift here would admit or refuse a different path
+        # than the one kubectl sends.
+        import urllib.parse
+
+        corpus = (
+            "", "/api/v1/pods", "/api/v1/pods%2Fx%2Flog", "/api/v1/%2e%2e/v1/pods", "%E2%9C%93",
+            "%FF%FE", "%zz%4%", "a%20b+c", "limit=500", "limit=500&continue=eyJ2IjoibWV0YS5rOHMuaW8vdjEifQ",
+            "labelSelector=app.kubernetes.io/name%3Dweb,tier%20in%20(a,b)", "labelSelector=a%3Db%26watch%3Dtrue%23",
+            "watch", "watch=", "=x", "&&limit=1&", "a=b=c", "k+e+y=v+a+l", "a;b=c",
+        )
+        for text in corpus:
+            with self.subTest(text=text):
+                self.assertEqual(urllib.parse.unquote(text), command_policy._percent_decode(text))
+                self.assertEqual(urllib.parse.parse_qsl(text, keep_blank_values=True), command_policy._query_pairs(text))
 
 
 class KubectlKubercTest(unittest.TestCase):
@@ -654,6 +954,9 @@ class PreviouslyAllowedReadsTest(unittest.TestCase):
             ["gcloud", "projects", "describe", "myproj"],
             ["gcloud", "compute", "disks", "list"],
             ["gcloud", "container", "operations", "list"],
+            ["gcloud", "container", "fleet", "rolloutsequences", "list", "--project=acme-fleet-host", "--format=json"],
+            ["gcloud", "container", "fleet", "rolloutsequences", "describe", "prod-train", "--project=acme-fleet-host"],
+            ["gcloud", "container", "fleet", "rollouts", "list", "--project=acme-fleet-host"],
             ["gcloud", "auth", "list"],
             ["gcloud", "info"],
             ["gcloud", "version"],
@@ -756,7 +1059,11 @@ class GcloudReadOnlyTest(unittest.TestCase):
                 self.assertEqual("gcp.unreadable-command", decision.rule_id)
                 self.assertNotIn("global", decision.message)
                 # The advice has to be something the reader can act on alone.
-                self.assertIn("without the flag", decision.message)
+                # Both argvs are writes, so that advice is that the retry is
+                # refused too: inviting a flagless retry sent the cluster agent
+                # into the bare `clusters update`, refused regardless (#2979).
+                self.assertIn(command_policy._STILL_REFUSED, decision.message)
+                self.assertNotIn("Re-run without", decision.message)
 
     def test_multiple_flags_before_command(self):
         # Multiple flags should be correctly skipped.
@@ -767,6 +1074,32 @@ class GcloudReadOnlyTest(unittest.TestCase):
     def test_config_list_is_allowed(self):
         # Test individual listed commands from GCLOUD_READ_COMMANDS.
         self.assertTrue(evaluate(["gcloud", "config", "list"]).allowed)
+
+    def test_fleet_rollout_sequencing_reads_are_allowed_and_their_writes_are_refused(self):
+        # The readiness report's rollout-sequence precheck runs exactly this argv through the
+        # proxy (fleet-upgrade-verification's readiness_rules/rollout_sequence_precheck.py),
+        # and the upgrade SOP's stage check the other two; `--project` and `--format` take a
+        # value, so an unlisted flag would hide the command path and refuse it silently.
+        self.assertTrue(evaluate(["gcloud", "container", "fleet", "rolloutsequences", "list", "--project=acme-fleet-host", "--format=json"]).allowed)
+        self.assertTrue(evaluate(["gcloud", "container", "fleet", "rolloutsequences", "list", "--project", "acme-fleet-host", "--format", "json"]).allowed)
+        self.assertTrue(evaluate(["gcloud", "container", "fleet", "rolloutsequences", "describe", "prod-train", "--project=acme-fleet-host"]).allowed)
+        self.assertTrue(evaluate(["gcloud", "container", "fleet", "rollouts", "list", "--project=acme-fleet-host", "--format=json"]).allowed)
+        # The writes that drive a train stay refused, by whichever rule fires first: the verb
+        # check, or the unknown-flag refusal on a write's own flags.
+        for argv in (
+            ["gcloud", "container", "fleet", "rolloutsequences", "create", "prod-train", "--project=acme-fleet-host"],
+            ["gcloud", "container", "fleet", "rolloutsequences", "upgrade", "prod-train", "--project=acme-fleet-host"],
+            ["gcloud", "container", "fleet", "rolloutsequences", "delete", "prod-train", "--project=acme-fleet-host"],
+            ["gcloud", "container", "fleet", "rollouts", "pause", "rollout-1", "--project=acme-fleet-host"],
+            ["gcloud", "container", "fleet", "rollouts", "resume", "rollout-1", "--project=acme-fleet-host"],
+            ["gcloud", "container", "fleet", "rollouts", "cancel", "rollout-1", "--project=acme-fleet-host"],
+            ["gcloud", "container", "fleet", "rollouts", "force-complete-stage", "rollout-1", "--project=acme-fleet-host"],
+            ["gcloud", "container", "fleet", "rollouts", "delete", "rollout-1", "--project=acme-fleet-host"],
+            ["gcloud", "container", "fleet", "rolloutsequences"],
+            ["gcloud", "container", "fleet", "rollouts"],
+            ["gcloud", "container", "fleet"],
+        ):
+            self.assertFalse(evaluate(argv).allowed, argv)
 
     def test_asset_search_is_allowed_with_its_selectors_and_asset_writes_are_refused(self):
         # The Cluster Agent reconcile resolves a folder or organisation in spec.scope with
@@ -923,6 +1256,25 @@ class GcloudReadOnlyTest(unittest.TestCase):
         )
         self.assertFalse(decision.allowed)
         self.assertEqual("gcp.read-only", decision.rule_id)
+
+    def test_a_help_flag_with_a_false_value_grants_nothing(self):
+        """Only a bare --help/-h, or one valued true, is a help request."""
+        for flag in ("--help=false", "--help=0", "--help=no", "-h=false", "--help="):
+            with self.subTest(flag=flag):
+                decision = evaluate(["gcloud", "container", "clusters", "delete", "c", flag])
+                self.assertFalse(decision.allowed)
+                self.assertEqual("gcp.read-only", decision.rule_id)
+        for flag in ("--help", "-h", "--help=true", "--help=True"):
+            with self.subTest(flag=flag):
+                self.assertTrue(evaluate(["gcloud", "container", "clusters", "delete", "c", flag]).allowed)
+
+    def test_a_false_help_past_an_unknown_flag_does_not_invite_a_retry(self):
+        """A --help=false past an unknown flag is no help request, so the refusal doesn't hold the retry open."""
+        argv = ["gcloud", "container", "clusters", "delete", "c", "--async-x", "--timeout-x=5", "--help=false"]
+        self.assertTrue(command_policy._gcloud_prefix_write(argv))
+        self.assertIn("still refused", evaluate(argv).message)
+        with_help = argv[:-1] + ["--help"]
+        self.assertFalse(command_policy._gcloud_prefix_write(with_help))
 
     def test_help_after_an_unknown_flag_is_still_unreadable(self):
         """An unknown flag's arity is unknown, so nothing after it is trusted.
@@ -1133,6 +1485,9 @@ class GcloudReadOnlyTest(unittest.TestCase):
             (["gcloud", "container", "node-pools", "describe", "default", "--cluster=c", "--location=l"], "container node-pools describe with --cluster"),
             (["gcloud", "container", "node-pools", "list", "--cluster=c", "--location=l"], "container node-pools list with --cluster"),
             (["gcloud", "container", "operations", "list"], "container operations list"),
+            (["gcloud", "container", "fleet", "rolloutsequences", "list", "--project=acme-fleet-host", "--format=json"], "container fleet rolloutsequences list"),
+            (["gcloud", "container", "fleet", "rolloutsequences", "describe", "prod-train"], "container fleet rolloutsequences describe"),
+            (["gcloud", "container", "fleet", "rollouts", "list"], "container fleet rollouts list"),
             (["gcloud", "info"], "info"),
             (["gcloud", "logging", "read"], "logging read"),
             (["gcloud", "projects", "describe", "myproj"], "projects describe"),
@@ -2211,6 +2566,252 @@ class LocalRenderTests(unittest.TestCase):
             ["kubectl", "scale", "deploy/x", "--replicas=3", "--dry-run=client", "--dry-run=none"],
         ):
             self.assertFalse(command_policy.local_render(argv), argv)
+
+
+class NoRetryInvitationForAWriteTest(unittest.TestCase):
+    """A refusal invites a retry without a flag only when that retry would be allowed (#2979).
+
+    Seen live: refused for an unknown-arity flag on `gcloud container clusters
+    update` and told to "re-run without the flag", the cluster agent did, seven
+    times, ending with a bare `clusters update` that is refused as a write
+    regardless. The invitation is now made only when the remainder is allowed.
+
+    kubectl keeps the invitation: its flagless retry, refused under
+    `kubernetes.read-only`, is the refusal the runtime stop halts on (#3380).
+    """
+
+    INVITATIONS = ("without the flag", "Re-run without", "Remove ", "Drop the flag", "Expand flags manually")
+    WRITE_PHRASE = command_policy._STILL_REFUSED
+
+    # The live argv, verbatim in shape.
+    LIVE = ["gcloud", "container", "clusters", "update", "prod", "--location", "us-east4",
+            "--binauthz-evaluation-mode=PROJECT_SINGLETON_POLICY_ENFORCE"]
+
+    def test_the_live_unknown_flag_on_a_write_says_stop_and_report(self):
+        decision = evaluate(self.LIVE)
+        self.assertFalse(decision.allowed)
+        self.assertEqual("gcp.unreadable-command", decision.rule_id)
+        self.assertEqual(
+            "gcloud used a flag whose arity is unknown to this module, but the command is refused "
+            "whatever that flag is. " + command_policy._STILL_REFUSED + " "
+            + command_policy._GCLOUD_READ_ONLY_MESSAGE
+            + " For its synopsis only, --help with no other flags is allowed.",
+            decision.message,
+        )
+        self.assertIsNone(decision.verb_tuple)
+        self.assertEqual("--binauthz-evaluation-mode", decision.offending_flag)
+        # And the retry it used to invite is refused, which is why it is not invited.
+        self.assertFalse(evaluate(self.LIVE[:-1]).allowed)
+
+    def test_an_unknown_flag_on_what_could_still_be_a_read_keeps_the_retry(self):
+        for argv in (
+            ["gcloud", "container", "clusters", "describe", "prod", "--brand-new-flag=x"],
+            ["gcloud", "container", "--brand-new-flag", "clusters", "list"],
+        ):
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertEqual("gcp.unreadable-command", decision.rule_id)
+                self.assertIn("Re-run without the flag", decision.message)
+                self.assertIsNone(decision.verb_tuple)
+
+    def test_no_help_clause_where_help_is_not_an_escape(self):
+        decision = evaluate(["gcloud", "config", "set", "project", "p", "--brand-new-flag=x"])
+        self.assertEqual("gcp.unreadable-command", decision.rule_id)
+        self.assertTrue(decision.message.startswith(command_policy._UNREADABLE_WRITE_LEAD),
+                        "the refused-retry variant stopped firing; this test would be vacuous")
+        self.assertNotIn("--help", decision.message)
+
+    def test_the_help_clause_follows_the_surface_after_a_leading_unknown_flag(self):
+        # With the unknown flag ahead of the surface there are no words before
+        # it; the clause must follow the surface of the retry, which for
+        # `config` has no help escape.
+        for argv, offered in (
+            (["gcloud", "--new-flag", "config", "set", "project", "p"], False),
+            (["gcloud", "--log-http", "config", "set", "project", "p"], False),
+            (["gcloud", "--new-flag", "container", "clusters", "update", "prod"], True),
+        ):
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertTrue(decision.message.startswith(command_policy._UNREADABLE_WRITE_LEAD))
+                self.assertEqual(offered, "--help" in decision.message)
+                if offered:
+                    retry = [a for a in argv if not a.startswith("--new")] + ["--help"]
+                    self.assertTrue(evaluate(retry).allowed, f"the offered retry {retry} is refused")
+
+    def test_a_help_flag_beside_two_unknown_flags_keeps_the_retry(self):
+        # The SOP's own shape: confirm a remediation flag with --help. The
+        # reading drops one unknown flag and stops at the next, so only the
+        # prefix check judges it, and --help can still make it a synopsis
+        # wherever it sits: before, between or after the two flags.
+        head = ["gcloud", "container", "clusters", "upgrade", "c"]
+        flags = ["--node-pool=pool", "--image-type=t"]
+        for at in range(len(flags) + 1):
+            argv = head + flags[:at] + ["--help"] + flags[at:]
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertFalse(decision.message.startswith(command_policy._UNREADABLE_WRITE_LEAD))
+                self.assertIn("Re-run without the flag", decision.message)
+        self.assertTrue(evaluate(head + ["--help"]).allowed)
+
+    def test_the_unreadable_variant_names_no_positional(self):
+        # On a two-word surface the third word is the caller's positional; the
+        # variant carries no verb at all, as the flag refusals do not.
+        decision = evaluate(["gcloud", "projects", "delete", "acme-prod", "--new-flag=x"])
+        self.assertTrue(decision.message.startswith(command_policy._UNREADABLE_WRITE_LEAD))
+        self.assertIsNone(decision.verb_tuple)
+
+    def test_a_bare_gcloud_with_an_unknown_flag_invites_no_refused_retry(self):
+        # The retry, bare `gcloud` or `gcloud beta`, is refused; an answer of
+        # "every reading is refused" must not be lost for having no verb words.
+        for argv in (["gcloud", "--new-flag"], ["gcloud", "beta", "--new-flag"]):
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertTrue(decision.message.startswith(command_policy._UNREADABLE_WRITE_LEAD))
+                self.assertNotIn("Re-run without", decision.message)
+                self.assertFalse(evaluate([a for a in argv if a != "--new-flag"]).allowed)
+
+    def test_a_synopsis_request_after_an_unknown_flag_keeps_the_retry(self):
+        # Dropping the unknown flag leaves `update x -h`, which the help escape
+        # allows, so the retry is invited even though the words name a write.
+        decision = evaluate(["gcloud", "container", "clusters", "update", "x", "--brand-new-flag", "-h"])
+        self.assertEqual("gcp.unreadable-command", decision.rule_id)
+        self.assertIn("Re-run without the flag", decision.message)
+        self.assertTrue(evaluate(["gcloud", "container", "clusters", "update", "x", "-h"]).allowed)
+
+    # Each kubectl flag refusal on a write, and its flagless retry.
+    KUBECTL_WRITE_FLAG_REFUSALS = (
+        (["kubectl", "delete", "pod", "web-0", "--as", "system:admin"], "identity.caller-supplied-impersonation"),
+        (["kubectl", "--kuberc", "/workspace/kr.yaml", "delete", "pod", "web-0"], "kubernetes.kuberc-forbidden"),
+        (["kubectl", "delete", "pod", "web-0", "--token", "t"], "kubernetes.identity-change-forbidden"),
+        (["kubectl", "delete", "pod", "web-0", "--profile-output", "/workspace/x"],
+         "kubernetes.file-write-forbidden"),
+        (["kubectl", "exec", "my-secret-pod", "--as=u", "--", "sh"], "identity.caller-supplied-impersonation"),
+    )
+
+    def test_a_kubectl_flag_refusal_on_a_write_keeps_the_retry_the_runtime_halts_on(self):
+        # The runtime stop does not count a flag refusal's rule id; it halts on
+        # the retry's `kubernetes.read-only` refusal of the write, so telling
+        # the agent not to retry would give the halt up (#3380).
+        for argv, rule_id in self.KUBECTL_WRITE_FLAG_REFUSALS:
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertEqual(rule_id, decision.rule_id)
+                self.assertIn("without the flag", decision.message)
+                self.assertNotIn(self.WRITE_PHRASE, decision.message)
+                self.assertIsNone(decision.verb_tuple)
+                retry = evaluate(command_policy._strip_refused_flags(argv))
+                self.assertEqual(command_policy.KUBERNETES_READ_ONLY_RULE, retry.rule_id)
+
+    def test_a_local_render_with_a_refused_flag_keeps_the_retry(self):
+        # A local render is guidance at runtime, not a refusal, and keeps the
+        # invitation like every kubectl flag refusal.
+        for argv in (
+            ["kubectl", "apply", "-f", "x.yaml", "--dry-run=client", "--as=u"],
+            ["kubectl", "apply", "view-last-applied", "deploy/x", "--as=u"],
+            ["kubectl", "delete", "pod", "p", "--help", "--as=u"],
+        ):
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertIn("without the flag", decision.message)
+                self.assertNotIn(self.WRITE_PHRASE, decision.message)
+
+    def test_an_unlisted_read_is_not_told_it_changes_state(self):
+        # gcp.read-only also refuses reads missing from the allowlist; the
+        # remainder's own message says so, and nothing claims a state change.
+        decision = evaluate(["gcloud", "beta", "container", "clusters", "list", "--account=a"])
+        self.assertIn(self.WRITE_PHRASE, decision.message)
+        self.assertIn("missing from GCLOUD_READ_COMMANDS", decision.message)
+        self.assertNotIn("would still change", decision.message)
+
+    # Each gcloud flag refusal on a write: the same rule, the flag's reason, and
+    # the write notice instead of the removal hint and the flag notice.
+    WRITE_FLAG_REFUSALS = (
+        (["gcloud", "--flags-file", "/workspace/f.yaml", "container", "clusters", "update", "prod"],
+         "gcp.flags-file-forbidden",
+         "--flags-file reads from a file under the agent's control. We cannot read that file without "
+         "a race condition, so we refuse it outright."),
+        (["gcloud", "container", "clusters", "update", "prod", "--account", "x@example.com"],
+         "gcp.identity-change-forbidden",
+         "Identity belongs to the broker."),
+        (["gcloud", "container", "clusters", "update", "prod", "--log-http-log-file", "/workspace/l"],
+         "gcp.file-write-forbidden",
+         "--output-path and --log-http-log-file write a file inside the credential proxy's own "
+         "container, not the agent workspace."),
+    )
+
+    def test_a_flag_refusal_on_a_write_states_the_write_and_invites_nothing(self):
+        for argv, rule_id, reason in self.WRITE_FLAG_REFUSALS:
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertFalse(decision.allowed)
+                self.assertEqual(rule_id, decision.rule_id)
+                self.assertEqual(
+                    f"{reason} {command_policy._STILL_REFUSED} {command_policy._GCLOUD_READ_ONLY_MESSAGE}",
+                    decision.message,
+                )
+                self.assertIsNone(decision.verb_tuple)
+                for invitation in self.INVITATIONS:
+                    self.assertNotIn(invitation, decision.message)
+
+    def test_a_flag_refusal_on_a_read_keeps_its_removal_hint(self):
+        # The mirror of RefusalsSayTheBoundaryIsFinal.FLAG_REFUSALS: on a read, the
+        # remainder is allowed, so the invitation stays and the write notice
+        # does not appear.
+        for argv, rule_id in RefusalsSayTheBoundaryIsFinal.FLAG_REFUSALS:
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertEqual(rule_id, decision.rule_id)
+                self.assertIn("without the flag", decision.message)
+                self.assertNotIn(self.WRITE_PHRASE, decision.message)
+                self.assertIsNone(decision.verb_tuple)
+
+    # A corpus across both tools: every refused flag, in both spellings, on a
+    # read and on a write, plus unknown flags in several positions.
+    READS = (["kubectl", "get", "pods"], ["gcloud", "container", "clusters", "list"], ["gcloud", "info"])
+    WRITES = (["kubectl", "delete", "pod", "web-0"], ["kubectl", "rollout", "restart", "deploy/web"],
+              ["gcloud", "container", "clusters", "update", "prod"], ["gcloud", "projects", "delete", "p"],
+              ["gcloud", "beta", "container", "clusters", "update", "prod"])
+
+    def _corpus(self):
+        for base in self.READS + self.WRITES:
+            tool = base[0]
+            booleans = command_policy._KUBECTL_BOOLEAN_FLAGS | command_policy._GCLOUD_BOOLEAN_FLAGS
+            for flag in sorted(command_policy._refused_flags(tool)):
+                spelled = [flag] if flag in booleans else [flag, "value"]
+                yield base + spelled
+                yield base + [f"{flag}=value"]
+                yield [base[0]] + spelled + base[1:]
+            if tool == "gcloud":
+                for position in range(1, len(base) + 1):
+                    yield base[:position] + ["--brand-new-flag=x"] + base[position:]
+                    yield base[:position] + ["--brand-new-flag", "x"] + base[position:]
+
+    def test_no_gcloud_refusal_invites_a_retry_the_policy_would_refuse_as_a_write(self):
+        # kubectl is held to the opposite, above: its invited retry is the halt.
+        checked = 0
+        for argv in self._corpus():
+            if argv[0] == "kubectl":
+                continue
+            decision = evaluate(argv)
+            if decision.allowed or not any(i in decision.message for i in self.INVITATIONS):
+                continue
+            checked += 1
+            with self.subTest(argv=argv, rule=decision.rule_id):
+                retry = command_policy._strip_refused_flags(argv)
+                if decision.rule_id == "gcp.unreadable-command":
+                    # The retry it invites is the argv without the unknown flag
+                    # and its value. An attached value goes with the token; a
+                    # separate one is a reading the caller makes, so the claim
+                    # is that some reading of the retry is not a refused write.
+                    index = next(i for i, t in enumerate(argv) if t.startswith("--brand-new-flag"))
+                    retries = [argv[:index] + argv[index + 1:]]
+                    if "=" not in argv[index]:
+                        retries.append(argv[:index] + argv[index + 2:])
+                else:
+                    retries = [retry]
+                refused = [evaluate(c).rule_id in ("gcp.read-only", "kubernetes.read-only") for c in retries]
+                self.assertFalse(all(refused), f"every reading of the invited retry {retries} is a refused write")
+        self.assertGreater(checked, 20, "the corpus stopped reaching the inviting refusals")
 
 
 class TheDeletionSectionStaysInsideThePolicy(unittest.TestCase):

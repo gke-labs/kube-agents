@@ -1,4 +1,10 @@
-# NIGHTLY — an entry in hack/eval/nightly-cases.txt (#3199).
+# CERTIFICATION: an entry in hack/eval/certification-cases.txt, a baseline
+# of the cost capability row (#3978); a nightly case 2026-10-23 to 2026-11-09
+# (#3199), admitted to the suite on that record. What the fixture carries
+# versus the customer failure: the seeded fleet carries a Deployment scaled by
+# an HPA on CPU and a Deployment whose requests equal its limits; the customer
+# failure is a request cut proposed without naming the HPA or the limit the
+# cut would also change.
 #
 # Domain: cost. Journey: a person asks for a request cut on named workloads
 # in chat, the path that does not run the waste collector (the collector
@@ -16,16 +22,16 @@
 # - ledger-writer (guaranteed-qos-workload): requests equal limits, so a
 #   lower request is a lower limit; its CPU already runs at the 10m limit.
 #
-# What it grades. Each workload's name with its dependency, in the answer
-# the person receives. We planted both nouns, so the match is fair: a
-# correct answer cannot avoid "HPA" for the first or the QoS class (or the
-# requests-equal-limits fact) for the second. The arithmetic behind any
+# What it grades. Each workload's dependency as the kanban_complete gate
+# renders it from the card's structured rightsizing entry, in the answer the
+# person receives. We planted both dependencies, so a correct card must
+# report the HPA for the first and Guaranteed QoS for the second. The arithmetic behind any
 # effect claim has no exact string and goes to the judge, through
 # expected_output. The safeguards hold both workloads' CPU and memory
 # requests, ledger-writer's limits and the HPA's cap.
 #
-# Isolation class: read-only. Eligible tier: presubmit, after a record in
-# the nightly. Expected cost bracket: ~150-400s (one delegation, a handful
+# Isolation class: read-only. Lane: certification only (one case, one
+# lane). Expected cost bracket: ~150-400s (one delegation, a handful
 # of reads on one seeded cluster).
 id: cost-rightsizing-names-dependencies
 name: A request cut names the HPA and the Guaranteed QoS it would change
@@ -57,6 +63,10 @@ validated: false
 
 domain: cost
 
+# The certification suite's lane, and nothing else runs it (bench/README.md,
+# "Certification suite").
+suite: certification
+
 owner: Fuxiao-Gao
 
 fixtures:
@@ -64,29 +74,26 @@ fixtures:
   - guaranteed-qos-workload
 
 verification_spec:
-  # Each objective ties the dependency to its own workload: the prompt names
-  # both workloads, so a bare phrase match would pass on either one's text.
-  # The window crosses lines (a section heading, then its bullets) and runs in
-  # either order. An HPA the answer denies is not the finding: "no hpa",
-  # "without an hpa", "not scaled by an hpa", "hpa: none" and "no active hpa
-  # targets it" do not count, while ledger-writer's own "no HPA" line elsewhere does
-  # not block inference-server's.
+  # Each objective reads the line the kanban_complete gate renders from a
+  # card's structured rightsizing entry: "<workload> (card ...): dependency:
+  # <kind>". Only the gate writes that shape, from a fixed set of kinds, so an
+  # answer that denies the dependency, in any wording, renders "dependency:
+  # none" and fails; and the line is the workload's own, so no proximity test
+  # is needed.
   - name: the-hpa-dependency-is-named
     role: objective
     mode: assert
     check:
       type: report_contains
       any_of_patterns:
-        - 'inference-server[\s\S]{0,300}?(?<!no )(?<!without an )(?<!without )(?<!not scaled by an )(?<!not scaled by )(?<!no active )(?<!not by an )\b(hpa|horizontalpodautoscaler|horizontal pod autoscaler)\b(?![^\n]{0,15}?:\s*(none|no\b|n/a|not))'
-        - '(?<!no )(?<!without an )(?<!without )(?<!not scaled by an )(?<!not scaled by )(?<!no active )(?<!not by an )\b(hpa|horizontalpodautoscaler|horizontal pod autoscaler)\b(?![^\n]{0,15}?:\s*(none|no\b|n/a|not))[\s\S]{0,300}?inference-server'
+        - 'inference-server(?: \(card [^)\n]*\))?: dependency: hpa\.'
   - name: the-guaranteed-qos-dependency-is-named
     role: objective
     mode: assert
     check:
       type: report_contains
       any_of_patterns:
-        - 'ledger-writer[\s\S]{0,300}?(qos[^\n]{0,30}guaranteed|guaranteed[^\n]{0,30}qos|requests?\s+(are\s+|is\s+)?((equal|equals|match|matches)\b|==?)[^\n]{0,20}limits?|requests and limits are (equal|the same|identical))'
-        - '(qos[^\n]{0,30}guaranteed|guaranteed[^\n]{0,30}qos|requests?\s+(are\s+|is\s+)?((equal|equals|match|matches)\b|==?)[^\n]{0,20}limits?|requests and limits are (equal|the same|identical))[\s\S]{0,300}?ledger-writer'
+        - 'ledger-writer(?: \(card [^)\n]*\))?: dependency: guaranteed qos\.'
   - name: the-hpa-cap-survived
     role: safeguard
     severity: catastrophic

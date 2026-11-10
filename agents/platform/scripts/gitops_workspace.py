@@ -175,6 +175,9 @@ LOGGER = logging.getLogger(__name__)
 #: there.
 GITHUB_REPO_TYPE = "github"
 
+#: The `type` of a self-managed Gitea forge's `managed_repos` entries.
+GITEA_REPO_TYPE = "gitea"
+
 #: What a forge with no noun of its own calls a change proposal, and what every
 #: name that is not a managed repository on another forge is spoken of as.
 DEFAULT_PROPOSAL_NOUN = "pull request"
@@ -185,7 +188,13 @@ DEFAULT_PROPOSAL_NOUN = "pull request"
 #: broker's dependencies, and an import there would fail every consumer on
 #: every install. Kept in step with the forge classes by
 #: `test_gitops_workspace.TestForgeTable`, which runs where `providers` is.
-FORGE_PROPOSAL_NOUNS = {GITHUB_REPO_TYPE: "pull request", "gitlab": "merge request"}
+FORGE_PROPOSAL_NOUNS = {
+    GITHUB_REPO_TYPE: "pull request",
+    "gitlab": "merge request",
+    GITEA_REPO_TYPE: "pull request",
+    "bitbucket": "pull request",
+    "bitbucket-datacenter": "pull request",
+}
 
 #: How a host-qualified name's `/` is spelt in its workspace directory name.
 ENCODED_SEPARATOR = "%2F"
@@ -722,8 +731,8 @@ def ensure_scratch_workspace(
     """The same leased path as `ensure_workspace`, with no clone in it.
 
     What a caller gets is a directory and nothing else: no `.git`, no remote, no
-    checkout. It is for the content-passing path, where the repository lives in
-    the broker and the agent's side of the exchange is a pile of files it wrote.
+    checkout. It is for the broker paths, where the repository lives in the
+    broker and the agent's side of the exchange is a pile of files it wrote.
     Removing the clone is the point — a `.git` the agent can write is where a
     filter driver, an alias or a hook path would have to be defined for the
     known code-execution routes through the credential container to work, and
@@ -750,10 +759,9 @@ def ensure_scratch_workspace(
         write_lease(holder, lease, repo, owner=owner)
 
     # `reset` is the only thing that deletes, including when what is there is a
-    # clone left by the directory path. A stream whose broker was armed between
-    # `start` and `finish` finds one, and clearing it then would delete the
-    # manifests the agent wrote in between — the same data loss `reset=False`
-    # exists to prevent on the clone path. Nothing runs `git` here, so an
+    # clone left by the directory path. Clearing it on a later call would
+    # delete the manifests the agent wrote in between — the same data loss
+    # `reset=False` exists to prevent on the clone path. Nothing runs `git` here, so an
     # unwanted `.git` sitting in the directory for one run is inert; the next
     # `start` takes it away.
     if reset and target.exists():
@@ -763,7 +771,13 @@ def ensure_scratch_workspace(
 
 
 def _now_iso() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    # The argument is deliberate. `time.gmtime()` with none reads the C
+    # `time()` call, the coarse clock on Linux, which trails `time.time()`
+    # by a second for a moment after each second boundary. The fleet audit's
+    # in-flight note stamps `started_at` from `time.time()` and accepts a
+    # lease only if `refreshed_at` is not older than that, so the two stamps
+    # have to come from one clock or the run disowns the lease it just wrote.
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time()))
 
 
 def _remove_tree(path: Path) -> None:
@@ -1579,15 +1593,26 @@ def _forge_repo_names(
         if kind not in served:
             LOGGER.warning("Skipping %s repository %r: no provider for type %r.", key, url, kind)
             continue
-        if _names_a_port(url):
+        if _names_a_port(url) and (kind != GITEA_REPO_TYPE or "://" not in str(url)):
             # Before parsing: the parser reads a URL's host without its port
             # and a bare `host:8443/path` as an scp remote, so either would
             # come back named on another endpoint than the one registered.
-            LOGGER.warning(
-                "Skipping %s repository %r: a host with a port is not supported; "
-                "the broker serves a forge on its standard HTTPS port only.",
-                key, url,
-            )
+            # Self-managed Gitea URLs seeded by the operator carry `://` and
+            # an explicit port (`http://gitea:3000/owner/repo`), which the
+            # broker's GiteaForge matches by host and reaches on its
+            # configured port.
+            if kind == GITEA_REPO_TYPE:
+                LOGGER.warning(
+                    "Skipping %s repository %r: write a Gitea repository with a port "
+                    "as a full URL (scheme://host:port/owner/repo), or omit the port.",
+                    key, url,
+                )
+            else:
+                LOGGER.warning(
+                    "Skipping %s repository %r: a host with a port is not supported; "
+                    "the broker serves a forge on its standard HTTPS port only.",
+                    key, url,
+                )
             continue
         ref = repo_ref.try_parse(url)
         if ref is None or not ref.host or not HOSTNAME_RE.fullmatch(ref.host):
@@ -1628,7 +1653,10 @@ def _forge_repo_names(
     return github + others
 
 
-_PORT_RE = re.compile(r"^(?:[a-z][a-z0-9+.-]*://)?(?:[^/@]+@)?[^/:]+:\d+(?:/|$)", re.I)
+_PORT_RE = re.compile(
+    r"^(?:[a-z][a-z0-9+.-]*://(?:[^/@]+@)?[^/:]+:\d+(?:/|$)|[^/@:]+:\d+(?:/|$)|[^/@]+@[^/:]+:\d+/[^/]+/)",
+    re.I,
+)
 
 
 def _names_a_port(url: str) -> bool:

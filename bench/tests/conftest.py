@@ -35,7 +35,8 @@ from typing import Any
 import pytest
 
 #: The variables that select and configure a forge: GitLab, a GitHub
-#: Enterprise Server host, another GitHub API root, a private CA. Every check
+#: Enterprise Server host, another GitHub API root, a private CA, the renewed
+#: GitHub grading-token file (which outranks a fixture's token). Every check
 #: reads them from the process environment, so a developer's shell that
 #: exports them (as a GitLab dev install is told to) would turn the GitHub
 #: tests' answers into another forge's. Cleared before every test; a forge
@@ -48,6 +49,7 @@ FORGE_ENV_VARS = (
     "BENCH_GITHUB_HOST",
     "BENCH_GITHUB_API_ROOT",
     "BENCH_FORGE_CA_FILE",
+    "BENCH_GITHUB_TOKEN_FILE",
 )
 
 
@@ -55,6 +57,22 @@ FORGE_ENV_VARS = (
 def _no_forge_from_the_shell(monkeypatch):
     for name in FORGE_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_grader_sha_from_the_shell(monkeypatch):
+    """`bench-gate suite` reads EVAL_GRADER_SHA, which hack/ci-eval-pr.sh
+    exports; a shell that has it would add a key and a line to every suite
+    output the tests compare, the store-unset golden's included."""
+    monkeypatch.delenv("EVAL_GRADER_SHA", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_judge_skip_from_the_shell(monkeypatch):
+    """hack/ci-eval-pr.sh exports KUBE_AGENTS_SKIP_REPORT_ONLY_JUDGES on a pull
+    request; a shell that has it would patch two devops-bench evaluators off
+    in the first test that builds a harness, for the rest of the session."""
+    monkeypatch.delenv("KUBE_AGENTS_SKIP_REPORT_ONLY_JUDGES", raising=False)
 
 
 FIXTURE_RUNS = Path(__file__).parent / "fixtures" / "runs"
@@ -123,6 +141,40 @@ def kanban_task() -> Path:
 
 
 @pytest.fixture
+def measured_kanban_task(write_task) -> Path:
+    """`agent-kanban-smoke` as the inject measurement run (#2039) declared it.
+
+    The answer check, and the router-scope `kanban_create` check #4004 dropped
+    from the real task file. The captured inject record (``INJECT_RUN``)
+    carries both entries, so the tests of how the lane grades a check its
+    transport blinds read the case this way.
+    """
+    return write_task(
+        "agent-kanban-smoke",
+        {
+            "id": "agent-kanban-smoke",
+            "name": "Agent kanban smoke test",
+            "prompt": "Which GKE clusters are we running in this project right now? Give me the list.",
+            "infrastructure": {"deployer": "noop"},
+            "verification_spec": [
+                {
+                    "name": "the-answer-names-the-planted-fleet",
+                    "role": "objective",
+                    "mode": "assert",
+                    "check": {"type": "report_contains", "required_phrases": ["seeded-a", "seeded-b", "seeded-c"]},
+                },
+                {
+                    "name": "the-kanban-card-was-actually-filed",
+                    "role": "objective",
+                    "mode": "assert",
+                    "check": {"type": "tool_called", "tool_names": ["kanban_create"], "require_success": True},
+                },
+            ],
+        },
+    )
+
+
+@pytest.fixture
 def write_task(tmp_path: Path):
     """Write a synthetic ``<case-id>/task.yaml`` and return its path.
 
@@ -142,3 +194,22 @@ def write_task(tmp_path: Path):
         return path
 
     return _write
+
+
+def check_passes(task_id: str, check_name: str, report: str) -> bool:
+    """Whether one named ``report_contains`` check of a case passes ``report``.
+
+    The whole check as the verifier grades it, phrases and patterns together,
+    loaded from the case file, so a test that pins a case's wording cannot
+    drift onto a surface or a clause the verifier does not use.
+    """
+    import yaml
+
+    from kube_agents_bench import transcript
+    from kube_agents_bench.verifiers import ReportContainsVerifier
+
+    task = Path(__file__).resolve().parent.parent / "tasks" / task_id / "task.yaml"
+    doc = yaml.safe_load(task.read_text())
+    (check,) = [c for c in doc["verification_spec"] if c.get("name") == check_name]
+    transcript.set(report, [], final_message=report, started_at=1.0)
+    return ReportContainsVerifier(**check["check"]).verify(5.0).status == "pass"

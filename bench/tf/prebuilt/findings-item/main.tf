@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The scenario driver for bench/tasks/findings-decision-covers-item: plant the
-# five findings-queue rows in findings.json on the install under test, every one
-# `surfaced`, and resolve them again on destroy.
+# The scenario driver for bench/tasks/findings-decision-covers-item and
+# bench/tasks/findings-decision-leaves-unnamed-open: plant the findings-queue
+# rows of var.findings_file (findings.json by default) on the install under
+# test, every one `surfaced` except a row marked `plant_state: queued`, and
+# resolve them again on destroy.
 #
 # Three rows share check, project and cluster, so they are one gathered line of
 # the nudge's message, which names only the first of them by id. The other two
@@ -53,7 +55,7 @@ locals {
   # The Session KV server's loopback address in the agent pod
   # (platform_mcp_server.py, _findings_request).
   session_kv_url = "http://127.0.0.1:8699" # sanitizer: allow the agent pod's own loopback, where the Session KV server listens
-  rows_b64       = base64encode(file("${path.module}/findings.json"))
+  rows_b64       = base64encode(file("${path.module}/${var.findings_file}"))
   script_b64     = base64encode(file("${path.module}/queue.py"))
   # How long an exec into the agent Deployment waits for a running pod; see
   # bench/tf/prebuilt/bootstrap-ranking/main.tf.

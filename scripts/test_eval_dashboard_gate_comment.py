@@ -157,20 +157,19 @@ class Shapes(Harness):
         body = self.gh.bodies()[0]
         lines = body.split("\n")
         self.assertEqual(lines[0], gate_comment.MARKER)
-        self.assertEqual(lines[1], "### ❌ Smoke gate: failed · 3 of 7 cases")
+        self.assertEqual(lines[1], "### ❌ Smoke gate: failed")
         self.assertEqual(
             lines[3],
-            "> 🔴 **Gate outage in progress** since Sun 7:30 AM ET. The 3 crashloop tests fail on every PR (7 PRs so far)."
-            " **Your 3 failures are exactly those 3, so this red is not your code.** Don't retest yet; run `/retest` once #kube-agents-ci-health says the gate is healthy again."
+            "> 🔴 **Gate outage in progress** since Sun 7:30 AM ET: the same cases fail on every PR (7 PRs so far)."
+            " **Your failures are exactly the gate's, so this red is not your code.** Don't retest yet; run `/retest` once #kube-agents-ci-health says the gate is healthy again."
             " [Why this run failed →](https://storage.cloud.google.com/kube-agents-dashboards/evals/run.html#build=100)"
-            " · [Incident brief →](https://storage.cloud.google.com/kube-agents-dashboards/evals/index.html#since=2026-09-06T11:30:00Z&cases=cluster-agent-crashloop-debug,cluster-agent-crashloop-evidence-chain,cluster-agent-crashloop-misleading-symptom&view=gate)",
+            " · [Incident brief →](https://storage.cloud.google.com/kube-agents-dashboards/evals/index.html#since=2026-09-06T11:30:00Z&view=gate)",
         )
-        self.assertIn("| Case | Result | Also failing on |", body)
-        self.assertIn("| `cluster-agent-crashloop-debug` | 0 / 3 reps | 7 other PRs |", body)
+        self.assertNotIn("| Case |", body, "no per-case table on the public comment")
         self.assertNotIn("Reason:", body, "no check reason for the gate's failures")
         self.assertTrue(
             body.rstrip().endswith(
-                "4 cases passed. Run 132 min on evals-23 · [build log](https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/1300/pull-kube-agents-smoke-test/100)"
+                "Run 132 min · [build log](https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/1300/pull-kube-agents-smoke-test/100)"
             ),
             body,
         )
@@ -185,23 +184,23 @@ class Shapes(Harness):
         self.assertEqual(len(self.gh.writes()), 1, "the newest red per PR")
         body = self.gh.bodies()[0]
         lines = body.split("\n")
-        self.assertEqual(lines[1], "### ❌ Smoke gate: failed · 1 of 7 cases")
+        self.assertEqual(lines[1], "### ❌ Smoke gate: failed")
         self.assertEqual(
             lines[3],
-            "> 🟢 **Gate healthy.** `security-overgrant-probe` passed on the last 9 runs from other PRs and failed on your last 4. **This looks specific to your PR.**"
+            "> 🟢 **Gate healthy.** What failed here passes on other PRs' recent runs and failed on your recent runs. **This looks specific to your PR.**"
             " [Why this run failed →](https://storage.cloud.google.com/kube-agents-dashboards/evals/run.html#build=103)",
         )
-        self.assertIn("| `security-overgrant-probe` | 0 / 3 reps | no other PR |", body)
-        self.assertIn("Reason: `", body)
-        self.assertIn("sandbox pod never reached Running (ImagePullBackOff: agent-sandbox:pr-913)", body)
+        self.assertNotIn("security-overgrant-probe", body, "no case name on the public comment")
+        self.assertNotIn("Reason", body, "the check's reason stays off the public comment")
+        self.assertNotIn("sandbox pod never reached Running", body)
         self.assertNotIn("Incident brief", body)
-        self.assertIn("6 cases passed.", body)
+        self.assertNotIn("cases passed", body)
 
-    def test_the_reason_line_is_the_graders_check_not_the_agents_report(self):
-        # Since 2026-09-15 the collector keeps the agent's report under a
-        # failing rep as `excerpt` (the Brief's quote). The comment's Reason
-        # line must still be the check that failed; the excerpt stands in
-        # only for a rep that has no reason at all.
+    def test_the_comment_carries_neither_the_graders_check_nor_the_agents_report(self):
+        # The pull request is public; the check's reason (`reps[].reason`)
+        # and the agent's report (`reps[].excerpt`, the Brief's quote) stay
+        # on the dashboard, behind the run link. Neither reaches the comment,
+        # whether the rep carries both or only the excerpt.
         report = "🔀 Delegated to the **platform** agent Created as task `t_169f6f10`. The pod is `Running` and the service answers on port 8080."
         with_both = task("security-overgrant-probe", "fff")
         for rep in with_both["reps"]:
@@ -210,7 +209,9 @@ class Shapes(Harness):
         mine = [run(100 + i, 913, NOW - timedelta(hours=3 - i), tasks=tasks) for i in range(4)]
         self.tick(data(*mine, *green_others()), green_health())
         body = self.gh.bodies()[0]
-        self.assertIn("Reason: `sandbox pod never reached Running (ImagePullBackOff: agent-sandbox:pr-913)`", body)
+        self.assertIn("### ❌ Smoke gate: failed", body)
+        self.assertNotIn("Reason", body)
+        self.assertNotIn("sandbox pod never reached Running", body)
         self.assertNotIn("Delegated", body)
 
         for rep in with_both["reps"]:
@@ -219,7 +220,8 @@ class Shapes(Harness):
         gh = FakeGh()
         self.tick(data(*other_pr, *green_others()), green_health(), gh=gh)
         body = gh.bodies()[0]
-        self.assertIn("Reason: `" + report.replace("`", "'")[:gate_comment.EXCERPT_CHARS] + "`", body)
+        self.assertNotIn("Reason", body)
+        self.assertNotIn("Delegated", body)
 
     def test_a_green_night_is_not_another_pr(self):
         # The nightly periodic's run shares data.json with no pull request
@@ -231,18 +233,18 @@ class Shapes(Harness):
         self.tick(data(night, *mine, *green_others()), green_health())
         self.assertEqual(self.gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues/913/comments")])
         body = self.gh.bodies()[0]
-        self.assertIn("`security-overgrant-probe` passed on the last 9 runs from other PRs and failed on your last 4.", body)
-        self.assertIn("| `security-overgrant-probe` | 0 / 3 reps | no other PR |", body)
+        self.assertIn("passes on other PRs' recent runs and failed on your recent runs.", body)
+        self.assertIn("**This looks specific to your PR.**", body)
 
     def test_mixed(self):
         mine = run(100, 1300, NOW - timedelta(minutes=5), failing=TRIO + ["agent-kanban-smoke"])
         self.tick(data(mine, *other_runs()), outage_health())
         box = self.gh.bodies()[0].split("\n")[3]
-        self.assertIn("3 of your 4 failures are the gate's (`cluster-agent-crashloop-debug`, `cluster-agent-crashloop-evidence-chain` and `cluster-agent-crashloop-misleading-symptom`)", box)
-        self.assertIn("1 (`agent-kanban-smoke`) looks specific to your PR", box)
-        self.assertIn("Fix that one; don't retest for the rest until the gate is healthy.", box)
+        self.assertIn("**Some of your failures are the gate's; the rest look specific to your PR.**", box)
+        self.assertIn("Fix those; don't retest for the rest until the gate is healthy.", box)
+        self.assertNotIn("agent-kanban-smoke", box)
         self.assertIn("· [Incident brief →]", box)
-        self.assertIn("Reason: `", self.gh.bodies()[0])
+        self.assertNotIn("Reason", self.gh.bodies()[0])
 
     def test_hard_failure(self):
         # FAILURE with every gate case passing: an absolute check tripped.
@@ -252,15 +254,10 @@ class Shapes(Harness):
         body = self.gh.bodies()[0]
         lines = body.split("\n")
         self.assertEqual(lines[1], "### ❌ Smoke gate: failed · hard failure")
-        self.assertTrue(lines[3].startswith("> 🔴 **The run failed without a gate case failing all of its repetitions.**"), lines[3])
-        self.assertIn("1 held-out case also failed; held-out cases do not block.", lines[3])
-        self.assertIn(f"| `{HELD_OUT}` (held out) | 0 / 3 reps |", body)
-        self.assertIn("6 cases passed.", body)
-
-    def test_the_result_cell_counts_ceiling_reps_in_the_total(self):
-        cell = gate_comment.result_cell({"reps": {"pass": 1, "fail": 1, "infra": 0, "ceiling": 1}})
-        self.assertEqual(cell, "1 / 3 reps (1 at the delegation ceiling)")
-        self.assertEqual(gate_comment.result_cell({"reps": {"pass": 0, "fail": 2, "infra": 1}}), "0 / 3 reps (1 infra)")
+        self.assertTrue(lines[3].startswith("> 🔴 **The run failed without a gate case collapsing.**"), lines[3])
+        self.assertIn("Held-out cases also failed; held-out cases do not block.", lines[3])
+        self.assertNotIn(HELD_OUT, body)
+        self.assertNotIn("cases passed", body)
 
     def test_degraded_storm_match(self):
         names = sorted(ADMITTED)
@@ -270,8 +267,24 @@ class Shapes(Harness):
         self.tick(data(mine, *green_others()), storm)
         box = self.gh.bodies()[0].split("\n")[3]
         self.assertTrue(box.startswith("> 🟡 **Gate degraded** since Tue 9:00 AM ET. quota storm 9:15 AM–10:25 AM ET hit 3 PRs."), box)
-        self.assertIn("Your 1 failure is exactly that one, so this red is not your code.", box)
-        self.assertIn("| 0 / 3 reps (1 infra) |", self.gh.bodies()[0])
+        self.assertIn("Your failures are exactly the gate's, so this red is not your code.", box)
+        self.assertNotIn("reps", self.gh.bodies()[0])
+
+    def test_a_run_that_records_where_it_lives_links_the_console_browser(self):
+        """runs[].gcs_base (the smoke lanes' own bucket, which Deck cannot
+        read) turns the footer's build link into the Console's bucket
+        browser; a record without it keeps the Spyglass link."""
+        mine = run(100, 1300, NOW - timedelta(minutes=5), failing=TRIO)
+        mine["gcs_base"] = "gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/1300/pull-kube-agents-smoke-test/100/"
+        self.tick(data(mine, *other_runs()), outage_health())
+        body = self.gh.bodies()[0]
+        self.assertTrue(
+            body.rstrip().endswith(
+                "[build log](https://console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/1300/pull-kube-agents-smoke-test/100)"
+            ),
+            body,
+        )
+        self.assertNotIn("oss.gprow.dev", body)
 
 
 class RunAsAScript(Harness):
@@ -298,7 +311,7 @@ class RunAsAScript(Harness):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("warning: gh api GET repos/gke-labs/kube-agents/issues/913/comments", proc.stderr)
         self.assertIn("--dry-run: would comment on #913 (build 103)", proc.stderr)
-        self.assertIn("`security-overgrant-probe` passed on the last 9 runs from other PRs and failed on your last 4.", proc.stderr)
+        self.assertIn("passes on other PRs' recent runs and failed on your recent runs.", proc.stderr)
 
 
 def lost(build, pr, finished, minutes=128, node="gke-kube-agents-prow-default-pool-eb220b2a-sgnk", **fields):
@@ -409,7 +422,7 @@ class DeadlineKillComment(Harness):
         mine = run(100, 1300, NOW - timedelta(minutes=5), failing=TRIO)
         self.tick(data(mine, *other_runs()), deadline_health())
         body = self.gh.bodies()[0]
-        self.assertIn("### ❌ Smoke gate: failed · 3 of 7 cases", body)
+        self.assertIn("### ❌ Smoke gate: failed\n", body)
         self.assertIn("> 🔴 **Gate outage in progress** since Tue 10:05 AM ET. 3 runs on 3 PRs were killed at the 360-minute deadline", body)
         self.assertNotIn("fail on every PR", body)
         self.assertIn("[Incident brief →]", body)
@@ -647,14 +660,13 @@ class WhenItComments(Harness):
         self.assertEqual(rc, 0)
         self.assertEqual(self.gh.writes(), [])
         self.assertIn("--dry-run: would comment on #1300 (build 100", err)
-        self.assertIn("### ❌ Smoke gate: failed · 3 of 7 cases", err)
+        self.assertIn("### ❌ Smoke gate: failed", err)
         self.assertIn("--dry-run: would POST repos/gke-labs/kube-agents/issues/1300/comments", err)
 
     def test_the_class_vocabulary_is_classify_pys(self):
         from eval_dashboard import classify
 
         self.assertEqual((gate_comment.CLS_SHARED, gate_comment.CLS_ONLY_THIS_PR, gate_comment.CLS_STORM), (classify.CLS_SHARED, classify.CLS_ONLY_THIS_PR, classify.CLS_STORM))
-        self.assertEqual(gate_comment.ONLY_PR_WINDOW, classify.ONLY_PR_WINDOW)
 
 
 
@@ -667,6 +679,10 @@ def not_evaluated(build, pr, finished, lost=("security-overgrant-probe",), every
     raw = run(build, pr, finished, tasks=tasks, result="FAILURE", minutes=minutes)
     raw.update({"eval_outcome": "not_evaluated", "not_evaluated": names + [HELD_OUT] if every else list(lost), **fields})
     return raw
+
+
+def health_doc_for(condition, cause, since, incident):
+    return {"state": "DEGRADED", "condition": condition, "cause": cause, "since": since, "failing_cases": [], "tracking_issues": [], "incident": incident}
 
 
 def storm_health():
@@ -690,12 +706,12 @@ class NotEvaluatedComment(Harness):
         self.assertEqual(lines[1], "### ⚪ Smoke gate: run not evaluated")
         self.assertEqual(
             lines[3],
-            "> `security-overgrant-probe` lost every repetition to infrastructure before the agent could be graded."
-            " The suite could certify nothing, so Prow reports the run red; nothing was graded for it"
+            "> Some cases could not be graded: infrastructure failed before the agent ran."
+            " The suite could certify nothing, so Prow reports the run red; nothing was graded for them"
             " and nothing about your change is implied. Retest once the environment is healthy."
             " [Details →](https://storage.cloud.google.com/kube-agents-dashboards/evals/run.html#build=100)",
         )
-        self.assertEqual(lines[5], "Ran 27 min on evals-23 · [build log](https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/1300/pull-kube-agents-smoke-test/100)")
+        self.assertEqual(lines[5], "Ran 27 min · [build log](https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/1300/pull-kube-agents-smoke-test/100)")
         for absent in ("hard failure", "absolute check", "❌", "Incident brief", "| Case |"):
             self.assertNotIn(absent, body)
         self.assertEqual(self.recorded()["comments"]["1300"], {"comment_id": 501, "build_id": "100", "at": NOW.isoformat()})
@@ -736,24 +752,25 @@ class NotEvaluatedComment(Harness):
         self.assertNotIn("Prow reports the run red", body)
         self.assertEqual(self.recorded()["comments"]["1300"]["build_id"], "100")
 
-    def test_two_lost_cases_are_named_together(self):
+    def test_two_lost_cases_are_not_named(self):
         mine = not_evaluated(100, 1300, NOW - timedelta(minutes=5), lost=("agent-kanban-smoke", "security-overgrant-probe"))
         self.tick(data(mine, *green_others()), green_health())
         box = self.gh.bodies()[0].split("\n")[3]
-        self.assertTrue(box.startswith("> `agent-kanban-smoke` and `security-overgrant-probe` lost every repetition to infrastructure"), box)
+        self.assertTrue(box.startswith("> Some cases could not be graded: infrastructure failed before the agent ran"), box)
+        self.assertNotIn("agent-kanban-smoke", box)
         self.assertIn("nothing was graded for them", box)
 
     def test_every_case_lost_says_so(self):
         mine = not_evaluated(100, 1300, NOW - timedelta(minutes=5), every=True)
         self.tick(data(mine, *green_others()), green_health())
         box = self.gh.bodies()[0].split("\n")[3]
-        self.assertTrue(box.startswith("> Every case lost every repetition to infrastructure before the agent could be graded. The suite evaluated nothing"), box)
+        self.assertTrue(box.startswith("> No case could be graded: infrastructure failed before the agent ran. The suite evaluated nothing"), box)
 
     def test_inside_a_declared_storm_the_box_names_it_and_links_the_brief(self):
         mine = not_evaluated(100, 1300, NOW - timedelta(minutes=5))
         self.tick(data(mine, *green_others()), storm_health())
         box = self.gh.bodies()[0].split("\n")[3]
-        self.assertIn("before the agent could be graded — a quota storm is declared on the gate right now.", box)
+        self.assertIn("before the agent ran — a quota storm is declared on the gate right now.", box)
         self.assertTrue(box.endswith("[Details →](https://storage.cloud.google.com/kube-agents-dashboards/evals/run.html#build=100) · [Incident brief →](https://storage.cloud.google.com/kube-agents-dashboards/evals/index.html#since=2026-09-08T13:00:00Z&view=gate)"), box)
 
     def test_the_same_build_is_never_commented_on_twice_and_a_later_one_edits(self):
@@ -766,9 +783,9 @@ class NotEvaluatedComment(Harness):
         self.tick(data(first, second, *green_others()), green_health(), now=later)
         self.assertEqual(self.gh.writes()[-1], ("PATCH", "repos/gke-labs/kube-agents/issues/comments/501"))
         self.assertEqual(self.recorded()["comments"]["1300"]["build_id"], "101")
-        self.assertTrue(self.gh.bodies()[-1].split("\n")[1].startswith("### ❌ Smoke gate: failed · 1 of"), "the retest's real red replaces it in place")
+        self.assertEqual(self.gh.bodies()[-1].split("\n")[1], "### ❌ Smoke gate: failed", "the retest's real red replaces it in place")
 
-    def test_a_gate_case_that_collapsed_on_the_same_run_is_named_under_the_white_heading(self):
+    def test_a_gate_case_that_collapsed_on_the_same_run_is_noted_unnamed_under_the_white_heading(self):
         # The suite's roster is the branch's and the dashboard's can be
         # newer: the suite said not evaluated, the dashboard sees a collapse.
         # The verdict stays the suite's; the author is told what to read.
@@ -778,7 +795,36 @@ class NotEvaluatedComment(Harness):
         self.tick(data(mine, *green_others()), green_health())
         lines = self.gh.bodies()[0].split("\n")
         self.assertEqual(lines[1], "### ⚪ Smoke gate: run not evaluated")
-        self.assertIn("Retest once the environment is healthy. `agent-kanban-smoke` also failed every graded repetition here; read its transcript before retesting. [Details →]", lines[3])
+        self.assertIn("Retest once the environment is healthy. Other cases also went red on this run; the run page has them. [Details →]", lines[3])
+        self.assertNotIn("agent-kanban-smoke", lines[3])
+
+    def test_no_repetition_verdict_reaches_the_comment(self):
+        # The public post carries the outcome and the pointer, nothing from
+        # inside the record: the ceiling cause loses its repetition count on
+        # the way to the comment (health.json keeps it for the dashboard and
+        # Chat), and the collapsed note names no per-repetition verdict.
+        ceiling = health_doc_for(
+            "delegation_ceiling",
+            health.CAUSE_CEILING.format(reps=18, prs=3, start="17:15", end="18:25"),
+            since="2026-09-08T13:00:00+00:00",
+            incident={"prs": [1, 2, 3], "runs": 3, "reps": 18, "window_start": "2026-09-08T13:15:00+00:00", "window_end": "2026-09-08T14:25:00+00:00"},
+        )
+        before = json.dumps(ceiling, sort_keys=True)
+        mine = run(100, 1300, NOW - timedelta(minutes=5), failing=["security-overgrant-probe"])
+        tasks = [task(n, "iii" if n == "security-overgrant-probe" else "fff" if n == "agent-kanban-smoke" else "ppp") for n in sorted(ADMITTED)]
+        collapsed = run(101, 1301, NOW - timedelta(minutes=5), tasks=tasks, result="FAILURE")
+        collapsed.update({"eval_outcome": "not_evaluated", "not_evaluated": ["security-overgrant-probe"]})
+        self.tick(data(mine, collapsed, *green_others()), ceiling)
+        bodies = self.gh.bodies()
+        self.assertEqual(len(bodies), 2)
+        for body in bodies:
+            self.assertNotRegex(body, r"\d+ repetitions?|\breps\b")
+            self.assertNotRegex(body, r"failed every|every graded repetition")
+        red, white = bodies
+        self.assertIn("> 🟡 **Gate degraded** since Tue 9:00 AM ET. runs on 3 PRs ended with the worker still running 9:15 AM–10:25 AM ET; nothing was graded and nothing counts against a case.", red)
+        self.assertIn("Other cases also went red on this run; the run page has them.", white)
+        self.assertEqual(json.dumps(ceiling, sort_keys=True), before, "the health doc's cause is the dashboard's and is left alone")
+        self.assertRegex(ceiling["cause"], r"^delegation ceiling: 18 repetitions on 3 PRs ended with the worker still running 17:15–18:25 UTC$")
 
     def test_dry_run_prints_it(self):
         rc, err = self.tick(data(not_evaluated(100, 1300, NOW - timedelta(minutes=5)), *green_others()), green_health(), dry_run=True)
@@ -786,6 +832,70 @@ class NotEvaluatedComment(Harness):
         self.assertEqual(self.gh.writes(), [])
         self.assertIn("### ⚪ Smoke gate: run not evaluated", err)
         self.assertIn("gate comments: 1 run (red, lost or not evaluated)", err)
+
+
+
+class PublicCommentCarriesNoCaseResultsTest(Harness):
+    """The pull request is public. The comment says the run failed and whether
+    the failure looks like the gate's or the PR's; it names no case, prints no
+    per-case or per-run count, and names no pool project. The detail is behind
+    the private links."""
+
+    CASE_WORDS = tuple(sorted(ADMITTED)) + (HELD_OUT, "crashloop")
+    COUNT_WORDS = ("reps", "of 7 cases", "cases passed", "case passed", "on the last", "your last", "evals-23", "Your 3", "Your 4", "3 of your")
+
+    def assert_strict(self, body):
+        for word in self.CASE_WORDS + self.COUNT_WORDS:
+            self.assertNotIn(word, body, body)
+        self.assertNotIn("| Case |", body)
+
+    def test_pr_caused_names_no_case(self):
+        mine = [run(100 + i, 913, NOW - timedelta(hours=3 - i), failing=["security-overgrant-probe"]) for i in range(4)]
+        self.tick(data(*mine, *green_others()), green_health())
+        body = self.gh.bodies()[0]
+        self.assert_strict(body)
+        self.assertIn("### ❌ Smoke gate: failed\n", body)
+        self.assertIn("looks specific to your PR", body)
+        self.assertIn("[Why this run failed →]", body)
+        self.assertIn("[build log]", body)
+
+    def test_outage_names_no_case(self):
+        mine = run(100, 1300, NOW - timedelta(minutes=5), failing=TRIO)
+        self.tick(data(mine, *other_runs()), outage_health())
+        body = self.gh.bodies()[0]
+        self.assert_strict(body)
+        self.assertIn("Gate outage in progress", body)
+        self.assertIn("not your code", body)
+        self.assertIn("7 PRs so far", body)
+
+    def test_mixed_names_no_case(self):
+        mine = run(100, 1300, NOW - timedelta(minutes=5), failing=TRIO + ["agent-kanban-smoke"])
+        self.tick(data(mine, *other_runs()), outage_health())
+        body = self.gh.bodies()[0]
+        self.assert_strict(body)
+        self.assertIn("the gate's", body)
+        self.assertIn("specific to your PR", body)
+
+    def test_not_evaluated_names_no_case(self):
+        mine = not_evaluated(100, 1300, NOW - timedelta(minutes=5), lost=("agent-kanban-smoke", "security-overgrant-probe"))
+        mine["tasks"].append(task("reliability-pdb-probe", "fff"))
+        storm = {"state": "DEGRADED", "condition": "storm", "since": "2026-09-08T13:00:00+00:00", "failing_cases": ["security-overgrant-probe"], "tracking_issues": [], "incident": {"prs": [1, 2, 3], "runs": 3, "window_start": "2026-09-08T13:15:00+00:00", "window_end": "2026-09-08T14:25:00+00:00"}}
+        self.tick(data(mine, *green_others()), storm)
+        [body] = self.gh.bodies()
+        self.assertIn("### ⚪ Smoke gate: run not evaluated", body)
+        self.assertIn("[Incident brief →]", body)
+        self.assert_strict(body)
+
+    def test_a_shared_break_the_pr_did_not_hit_names_no_case_in_the_cause(self):
+        # The gate's incident names its cases; a PR whose only failure is its
+        # own gets the degraded sentence, which must not carry them either.
+        mine = run(100, 1300, NOW - timedelta(minutes=5), failing=["agent-kanban-smoke"])
+        self.tick(data(mine, *other_runs()), outage_health(cases=["security-overgrant-probe"]))
+        [body] = self.gh.bodies()
+        self.assertIn("Gate degraded", body)
+        self.assertIn("the same cases fail on every PR since", body)
+        self.assertIn("looks specific to your PR", body)
+        self.assert_strict(body)
 
 
 if __name__ == "__main__":

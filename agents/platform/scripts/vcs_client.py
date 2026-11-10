@@ -17,7 +17,8 @@ the two facts `publish()` proves its revisions against.
 
 The operations mirror the command line: `capabilities`, `clone`, `branch`,
 `commit`, `publish`, `discard`, `forge(verb, payload)` for the collaboration
-verbs, and `local(session, args, verb)` for a read. Each returns the JSON the
+verbs, and `local(session, args, verb)` for a read. `snapshot` is the one that
+is not a working copy: one revision's files, with no history. Each returns the JSON the
 command line would have printed and raises `VcsError` where it would have
 printed one.
 """
@@ -26,11 +27,13 @@ from __future__ import annotations
 
 import base64
 import functools
+import io
 import json
 import os
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import urllib.error
@@ -83,6 +86,44 @@ AUTHOR_EMAIL = os.environ.get(
 # caller is told before anything is sent.
 MAX_BUNDLE_BYTES = 64 << 20
 
+# The most a `snapshot` may unpack to, summed over its regular files. The
+# broker caps the tar it sends (32 MiB by default) and an uncompressed tar is
+# no smaller than its files, so this is the second bound and not the first:
+# it holds if the broker's ceiling is raised, or the tar is not the broker's.
+SNAPSHOT_MAX_UNPACKED_BYTES = 64 << 20
+
+# The codes `snapshot` refuses with on this side: a tar member it will not
+# write, a tree over the unpacked ceiling, a tree with more files than the
+# caller allows, a destination that is not empty.
+SNAPSHOT_MEMBER_REFUSED = "SNAPSHOT_MEMBER_REFUSED"
+SNAPSHOT_TOO_LARGE = "SNAPSHOT_TOO_LARGE"
+SNAPSHOT_TOO_MANY_FILES = "SNAPSHOT_TOO_MANY_FILES"
+DESTINATION_NOT_EMPTY = "DESTINATION_NOT_EMPTY"
+
+# The name a path component must never fold to: a `.git` written into the
+# sandbox is a repository config some later git would read.
+DOTGIT = ".git"
+# What Windows strips from the end of a name before it opens it; folded away
+# before the `.git` comparison, as git's own NTFS check does.
+DOTGIT_TRAILING = ". "
+# The names git's discovery (`is_git_directory`) reads a directory as a bare
+# repository by: `HEAD`, with `objects` and `refs` beside it or a `commondir`
+# that names where they are. git run in such a directory reads its `config`,
+# so a snapshot directory that holds them is one some later git would obey.
+# Folded as `.git` is.
+GIT_DIR_HEAD = "head"
+GIT_DIR_OBJECTS = "objects"
+GIT_DIR_REFS = "refs"
+GIT_DIR_COMMONDIR = "commondir"
+BARE_LAYOUT_SKIPPED = (
+    "a directory laid out as a bare repository (HEAD, objects, refs), whose config git would read"
+)
+# git opens a bare repository only when it is named (`--git-dir`, GIT_DIR),
+# never by discovery from the working directory. `-c` outranks every config
+# file, so a repository cannot turn this off. deploy/sandbox/vcs-git.sh gives
+# the agent's own git the same pin.
+SAFE_BARE_REPOSITORY = "safe.bareRepository=explicit"
+
 # How many untracked files the refusal below names before it counts the rest.
 # Enough that the caller can see what it is being asked about -- a stray report
 # beside two manifests -- and few enough that a copy someone ran a build in
@@ -100,10 +141,27 @@ class VcsError(RuntimeError):
     handing the agent a decision keyed on a field it never receives.
     """
 
-    def __init__(self, message: str, *, code: str | None = None, detail: str | None = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str | None = None,
+        detail: str | None = None,
+        revision: str | None = None,
+        entries: list | None = None,
+        ceiling: int | None = None,
+    ):
         super().__init__(message)
         self.code = code or None
         self.detail = detail or None
+        # The commit the broker read, on a refusal that has one (`PATH_NOT_FOUND`).
+        self.revision = revision or None
+        # On `SNAPSHOT_TOO_LARGE`: the entries one level down, each with what a
+        # snapshot of it alone measures, and the ceiling, for a caller that
+        # asks again with `paths`. Not printed: a listing is for a script, and
+        # it can name thousands of entries.
+        self.entries = entries if isinstance(entries, list) else None
+        self.ceiling = ceiling if isinstance(ceiling, int) and not isinstance(ceiling, bool) else None
 
     def as_json(self) -> dict:
         answer = {"error": str(self)}
@@ -111,6 +169,8 @@ class VcsError(RuntimeError):
             answer["code"] = self.code
         if self.detail:
             answer["detail"] = self.detail
+        if self.revision:
+            answer["revision"] = self.revision
         return answer
 
 
@@ -132,20 +192,35 @@ BROKER_ENDPOINT_VAR = "CREDENTIAL_PROXY_URL"
 #: The verb that opens a change proposal, and the record `call()` writes to stderr
 #: when the broker answers it with one: a single compact JSON object on its own
 #: line, `{"kube-agents.event": "proposal-opened", "proposal": {url, number,
-#: title}}`. Every caller that opens a pull request or merge request -- `vcs.py`,
+#: title, claim, repo}}`. Every caller that opens a pull request or merge request -- `vcs.py`,
 #: submit-suggestion, the fleet audit -- reaches the broker through `call()`, so
 #: this is the one place that knows a proposal was opened, with the forge's own
 #: url. The agent pod's `pr_opened` plugin (agents/platform/plugins/pr_opened)
-#: checks the proposal with the forge, records it on the worker's card and takes
-#: the line out of the terminal output, which is how the thread's PR message is
-#: posted without reading the worker's words. The line proves nothing alone --
-#: any text in the output can take its shape -- which is why the plugin checks. A JSON value rather than a prefixed line, so a pipeline that
-#: merges stderr into `jq` reads one more document instead of failing. The
-#: plugin holds the same three names; its test reads these to keep them equal.
+#: presents the line's claim to the broker's `proposal-claim` verb, and the
+#: broker checks the proposal with the forge. A worker then records the claimed
+#: proposal on its card and takes the line out of the terminal output, which is
+#: how the thread's PR message is posted without reading the worker's words;
+#: every other process keeps the line without its claim. The line proves nothing
+#: alone -- any text in the output can take its shape -- which is why the claim
+#: is checked. A JSON value rather than a prefixed line, so a pipeline that
+#: merges stderr into `jq` reads one more document instead of failing.
+#: The claim is the one-time token the broker issues with each proposal it opens
+#: (`CLAIM_TOKEN_FIELD`), which the hook presents back to the broker: `call()`
+#: takes it out of the answer, so it never reaches what a caller prints, and a
+#: line without a valid claim counts nothing. The plugin holds the same names;
+#: its test reads these to keep them equal.
 PROPOSAL_CREATE_VERB = "proposal-create"
 PROPOSAL_OPENED_KEY = "kube-agents.event"
 PROPOSAL_OPENED_EVENT = "proposal-opened"
-PROPOSAL_OPENED_FIELDS = ("url", "number", "title")
+#: The top-level key of a `proposal-create` answer that holds the claim token
+#: (credential_proxy.py `CLAIM_TOKEN_FIELD`), and its field on the record.
+CLAIM_TOKEN_FIELD = "claim"
+#: The top-level key of a `proposal-create` answer that names the managed
+#: repository as the broker resolved it (`vcs_broker.Binding.stamp`), and its
+#: field on the record. The hook sends it back with the claim, so it needs no
+#: per-forge grammar for the proposal's url.
+REPO_FIELD = "repo"
+PROPOSAL_OPENED_FIELDS = ("url", "number", "title", CLAIM_TOKEN_FIELD, REPO_FIELD)
 
 
 @functools.lru_cache(maxsize=1)
@@ -189,12 +264,22 @@ def call(verb: str, payload: dict) -> dict:
     """`POST /v1/vcs/<verb>`, and the stderr record of a proposal it opened (`PROPOSAL_OPENED_KEY`)."""
     answer = _call(verb, payload)
     if verb.replace("_", "-") == PROPOSAL_CREATE_VERB:
-        _say_opened(answer)
+        claim = None
+        if isinstance(answer, dict) and CLAIM_TOKEN_FIELD in answer:
+            answer = dict(answer)
+            claim = answer.pop(CLAIM_TOKEN_FIELD)
+        _say_opened(answer, claim)
     return answer
 
 
-def _say_opened(answer: object) -> None:
+def _say_opened(answer: object, claim: object = None) -> None:
     """Write the `PROPOSAL_OPENED_KEY` record for the proposal in `answer`, if it names one.
+
+    `claim` is the token `call()` took from the answer's top level. An answer
+    with none -- a broker older than the token -- still records the proposal,
+    with the `claim` field absent rather than null. `repo` comes from the
+    answer's top level too (`REPO_FIELD`), and is absent when the answer has
+    no such string.
 
     Never raises: the proposal is open whatever happens to this line, and a
     caller told otherwise would try to open it again.
@@ -202,10 +287,17 @@ def _say_opened(answer: object) -> None:
     proposal = answer.get("proposal") if isinstance(answer, dict) else None
     if not isinstance(proposal, dict) or not proposal.get("url"):
         return
-    record = {
-        PROPOSAL_OPENED_KEY: PROPOSAL_OPENED_EVENT,
-        "proposal": {field: proposal.get(field) for field in PROPOSAL_OPENED_FIELDS},
+    fields = {
+        field: proposal.get(field)
+        for field in PROPOSAL_OPENED_FIELDS
+        if field not in (CLAIM_TOKEN_FIELD, REPO_FIELD)
     }
+    if claim is not None:
+        fields[CLAIM_TOKEN_FIELD] = claim
+    repo = answer.get(REPO_FIELD)
+    if isinstance(repo, str) and repo:
+        fields[REPO_FIELD] = repo
+    record = {PROPOSAL_OPENED_KEY: PROPOSAL_OPENED_EVENT, "proposal": fields}
     # A process started with fd 2 closed has no `sys.stderr`, and `print` would then
     # write to stdout, ahead of the one JSON document the callers print there.
     stream = sys.stderr
@@ -279,6 +371,9 @@ def _call(verb: str, payload: dict) -> dict:
             payload.get("error", str(exc)),
             code=code,
             detail=payload.get("detail"),
+            revision=payload.get("revision"),
+            entries=payload.get("entries"),
+            ceiling=payload.get("ceiling"),
         ) from exc
     except credential_proxy_client.TokenUnavailable as exc:
         # The projected token is missing or empty -- the kubelet mid-rewrite,
@@ -331,17 +426,22 @@ def _call(verb: str, payload: dict) -> dict:
 # ---- the local working copy ----------------------------------------------
 
 
-def local_git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+def local_git(cwd: Path, *args: str, check: bool = True, text: bool = True) -> subprocess.CompletedProcess:
     """git, in this container, on a repository with no remote.
+
+    `text=False` returns stdout and stderr as bytes, for a caller whose
+    output holds file content: text mode's universal newlines would turn a
+    lone carriage return in it into a line break.
 
     The environment is the argument that this cannot execute anything the
     repository supplied. A bundle carries objects and refs and no config, so the
     only config this copy has is the one git just wrote — which means a
     `.gitattributes` naming `filter.foo.clean` finds no `foo` defined and is
-    inert, the same reasoning `content_workspace` makes about the broker's
-    trees. `core.hooksPath` is pointed at an empty directory rather than left to
+    inert. `core.hooksPath` is pointed at an empty directory rather than left to
     default, because a hook is the one thing that would not need a config entry
-    to have been supplied.
+    to have been supplied. `safe.bareRepository=explicit` stops git from
+    opening a directory of files laid out as a bare repository, and so from
+    reading the `config` among them.
     """
     empty = ROOT / ".no-hooks"
     empty.mkdir(parents=True, exist_ok=True)
@@ -370,6 +470,7 @@ def local_git(cwd: Path, *args: str, check: bool = True) -> subprocess.Completed
         "-c", f"core.hooksPath={empty}",
         "-c", "protocol.ext.allow=never",
         "-c", "protocol.file.allow=always",
+        "-c", SAFE_BARE_REPOSITORY,
         "-c", f"user.name={AUTHOR_NAME}",
         "-c", f"user.email={AUTHOR_EMAIL}",
         *args,
@@ -378,7 +479,7 @@ def local_git(cwd: Path, *args: str, check: bool = True) -> subprocess.Completed
         argv,
         cwd=str(cwd),
         capture_output=True,
-        text=True,
+        text=text,
         check=check,
         timeout=600,
         env=environment,
@@ -905,6 +1006,238 @@ def clone(
         # is no truncated case for a caller to have to notice.
         "history": "complete",
         "remotes": [],
+    }
+
+
+def _is_dotgit(component: str) -> bool:
+    return component.rstrip(DOTGIT_TRAILING).casefold() == DOTGIT
+
+
+def _member_refused(name: str, reason: str) -> VcsError:
+    return VcsError(
+        f"the snapshot holds {name!r}, {reason}; nothing was unpacked",
+        code=SNAPSHOT_MEMBER_REFUSED,
+    )
+
+
+def _fold(component: str) -> str:
+    """A path component as a case-insensitive file system would open it."""
+    return component.rstrip(DOTGIT_TRAILING).casefold()
+
+
+def _resolve_link(start: list[str], target: str, links: set[str]) -> tuple[list[str] | None, str]:
+    """Walk ``target`` from the directory ``start``, one component at a time.
+
+    Answers (the components it names, "") or (None, the reason it is not
+    followed): it climbs above the top of the tree, or it passes through a
+    symbolic link of the snapshot. A lexical `normpath` cannot see the second:
+    `a -> .` then `a/x -> ../outside` normalises to `outside` and resolves to
+    the directory above the tree.
+    """
+    resolved = list(start)
+    steps = [step for step in target.split("/") if step not in ("", ".")]
+    for index, step in enumerate(steps):
+        if step == "..":
+            if not resolved:
+                return None, "a link that points out of the tree"
+            resolved.pop()
+            continue
+        resolved.append(step)
+        if index < len(steps) - 1 and "/".join(resolved) in links:
+            return None, "a link that passes through another link"
+    return resolved, ""
+
+
+def _check_snapshot_members(
+    members: list[tarfile.TarInfo], max_bytes: int, max_files: int | None = None
+) -> tuple[list[tarfile.TarInfo], int, int, list[dict]]:
+    """Refuse the tar unless every member it writes is safe.
+
+    Answers the members to write, their file count and bytes, and the links
+    skipped.
+
+    Checked before anything is written, so a refusal leaves nothing behind.
+    `extractall(filter="data")` repeats some of this as it writes, but these
+    checks do not depend on it. They also refuse what it does not: a `.git`
+    component, a path or a link through a symbolic link, a tree over the
+    ceiling, and a tree with more than `max_files` files.
+
+    Two kinds of member are not written, and the answer lists them under
+    `skipped`, because real repositories hold them and one of them must not
+    cost the caller every other file:
+
+    - a symbolic link whose target is absolute, empty, out of the tree,
+      through another link or into a `.git` path (`-> /dev/null`);
+    - every member of a directory laid out as a bare repository, which git
+      would discover and whose `config` it would read. Git tooling commits
+      such directories as test fixtures. The directory is listed once, and a
+      hard link into it is skipped too, so nothing of the layout is written.
+
+    Every other unsafe member refuses the whole tar.
+    """
+    named = []
+    for member in members:
+        name = member.name
+        if name.startswith("/"):
+            raise _member_refused(name, "an absolute path")
+        parts = [part for part in name.split("/") if part not in ("", ".")]
+        if not parts:
+            raise _member_refused(name, "which names no path in the tree")
+        if ".." in parts:
+            raise _member_refused(name, "a path with a `..` component")
+        if any(_is_dotgit(part) for part in parts):
+            raise _member_refused(name, "a path with a `.git` component")
+        named.append((member, parts))
+
+    # Every symbolic link, from the whole tar and not only the members before
+    # this one: tar order is the writer's choice, and a check that depends on
+    # it is a check a crafted tar can step round.
+    links = {"/".join(parts) for member, parts in named if member.issym()}
+    children: dict[str, set[str]] = {}
+    for _member, parts in named:
+        for depth, part in enumerate(parts):
+            children.setdefault("/".join(parts[:depth]), set()).add(_fold(part))
+    bare = sorted(
+        directory for directory, held in children.items()
+        if GIT_DIR_HEAD in held and ({GIT_DIR_OBJECTS, GIT_DIR_REFS} <= held or GIT_DIR_COMMONDIR in held)
+    )
+
+    def in_bare(path: list[str]) -> bool:
+        name = "/".join(path)
+        return any(not directory or name == directory or name.startswith(directory + "/") for directory in bare)
+
+    files = total = 0
+    skipped: list[dict] = [
+        {"path": directory or ".", "reason": BARE_LAYOUT_SKIPPED} for directory in bare
+    ]
+    kept: list[tarfile.TarInfo] = []
+    for member, parts in named:
+        name = "/".join(parts)
+        if in_bare(parts):
+            continue
+        if any("/".join(parts[:depth]) in links for depth in range(1, len(parts))):
+            raise _member_refused(member.name, "a path through a symbolic link")
+        if member.issym() or member.islnk():
+            target = member.linkname
+            reason = ""
+            if not target or target.startswith("/"):
+                reason = "a link with an absolute or empty target"
+            else:
+                # A symbolic link resolves from its own directory; a hard link
+                # names another member, from the top of the tree.
+                start = parts[:-1] if member.issym() else []
+                resolved, reason = _resolve_link(start, target, links)
+                if resolved is not None and any(_is_dotgit(part) for part in resolved):
+                    reason = "a link into a `.git` path"
+                elif resolved is not None and member.islnk() and "/".join(resolved) in links:
+                    reason = "a hard link to a symbolic link"
+                elif resolved is not None and member.islnk() and in_bare(resolved):
+                    skipped.append({"path": name, "reason": "a hard link into a skipped bare-repository layout"})
+                    continue
+            if reason and member.issym():
+                skipped.append({"path": name, "reason": reason})
+                continue
+            if reason:
+                raise _member_refused(member.name, reason)
+        elif member.isreg():
+            files += 1
+            total += member.size
+            if total > max_bytes:
+                raise VcsError(
+                    f"the snapshot unpacks to more than {max_bytes} bytes; name "
+                    "`paths` to take part of the tree",
+                    code=SNAPSHOT_TOO_LARGE,
+                )
+        elif not member.isdir():
+            raise _member_refused(member.name, "a device file, a FIFO or another special file")
+        kept.append(member)
+    # After the walk, so that the refusal gives the full count.
+    if max_files is not None and files > max_files:
+        raise VcsError(
+            f"the snapshot holds {files} files, more than the limit of {max_files}",
+            code=SNAPSHOT_TOO_MANY_FILES,
+        )
+    return kept, files, total, skipped
+
+
+def snapshot(
+    repository: str,
+    ref: str | None = None,
+    paths: list[str] | None = None,
+    *,
+    into: str | Path,
+    max_bytes: int = SNAPSHOT_MAX_UNPACKED_BYTES,
+    max_files: int | None = None,
+) -> dict:
+    """One revision's files, unpacked into `into`, with no history and no `.git`.
+
+    One call to the broker, which clones one revision, writes its tree as a
+    tar and deletes its scratch directory before it answers. It serves a
+    repository of any role -- managed, context, or one nobody registered --
+    and chooses the credential by that role itself.
+
+    `into` must be absent or an empty directory. The tar is checked whole
+    before anything is written (`_check_snapshot_members`), unpacked with
+    `tarfile`'s `data` filter into a fresh directory beside `into`, and moved
+    into place, so a refusal leaves nothing behind. A symbolic link that
+    would point out of the tree is left out and named under `skipped`.
+    `max_files`, when given, refuses a tree with more regular files than that.
+    """
+    destination = Path(into)
+    if destination.is_symlink() or (
+        destination.exists() and (not destination.is_dir() or any(destination.iterdir()))
+    ):
+        raise VcsError(
+            f"{destination} is not an empty directory; a snapshot unpacks only into one",
+            code=DESTINATION_NOT_EMPTY,
+        )
+    payload: dict = {"repository": repository}
+    # The broker refuses a tree whose files pass this bound, with the entries a
+    # caller can ask for one by one; a tree it served and this side then
+    # refused would come with none. A bound below 0 is this side's alone.
+    if max_bytes >= 0:
+        payload["maxBytes"] = max_bytes
+    if ref:
+        payload["ref"] = ref
+    if paths:
+        payload["paths"] = list(paths)
+    answer = call("snapshot", payload)
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(dir=str(destination.parent), prefix=f".{destination.name}."))
+    try:
+        try:
+            with tarfile.open(fileobj=io.BytesIO(base64.b64decode(answer["archiveBase64"])), mode="r:") as archive:
+                members, files, total, skipped = _check_snapshot_members(
+                    archive.getmembers(), max_bytes, max_files
+                )
+                archive.extractall(str(staging), members=members, filter="data")
+        except tarfile.TarError as exc:
+            raise VcsError(
+                f"the snapshot could not be unpacked safely: {exc}",
+                code=SNAPSHOT_MEMBER_REFUSED,
+            ) from exc
+        if destination.exists():
+            destination.rmdir()
+        os.replace(staging, destination)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return {
+        "forge": answer["forge"],
+        "repo": answer["repo"],
+        "role": answer.get("role"),
+        "ref": answer.get("ref"),
+        "revision": answer["revision"],
+        "path": str(destination),
+        "files": files,
+        "bytes": total,
+        # What was not written, each with the reason: unsafe symbolic links,
+        # bare-repository layouts and hard links into them.
+        "skipped": skipped,
+        "archiveBytes": answer["size"],
+        # A tar carries no history: there is nothing here for git to read.
+        "history": answer.get("history"),
     }
 
 

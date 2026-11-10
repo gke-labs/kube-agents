@@ -4,14 +4,17 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import http.client
 import json
+import math
 import os
+import random
 import re
 import stat
 import sys
 import tempfile
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -43,6 +46,21 @@ BROKER_CONNECT_TIMEOUT_SECONDS = 10.0
 # runtime does not attach an execution/chmod hint that misleads the agent
 # into seeking local file workarounds for a policy boundary (#2179).
 EXIT_SECURITY_POLICY_BLOCKED = getattr(os, "EX_NOPERM", 77)
+# Exit code returned when the broker cut the command's output at its per-stream
+# cap. 74 is EX_IOERR from sysexits.h ("input/output error"): the command may
+# well have exited 0, but what the caller holds is a partial payload, and a
+# partial `-o json` dump read as success is the false all-clear this code
+# exists to prevent. Scripts that already gate on the stderr marker below see
+# the same marker; the exit code is what the model's own kubectl sees.
+EXIT_OUTPUT_TRUNCATED = getattr(os, "EX_IOERR", 74)
+# The stderr line a cut command gets. Its prefix is what every reader matches
+# (`PROXY_TRUNCATED_MARKER` in the collectors); the counts after it say how
+# much of stdout was kept and the cap it was held to, when the broker said.
+OUTPUT_TRUNCATED_MARKER = "credential proxy output truncated"
+OUTPUT_TRUNCATED_COUNTS = " at {limit} bytes (kept {kept} bytes of stdout; exit {code})"
+# The cut fell on stderr alone: stdout is whole, so the exit code is the
+# command's own and only the diagnostics are short.
+OUTPUT_TRUNCATED_STDERR_ONLY = " (stderr only; stdout is complete)"
 # The `policy verb:` line is read by the agent runtime one line at a time, so a
 # verb word (an argv token) must not carry a line break or a quote.
 _VERB_WORD_SAFE_RE = re.compile(r"[^\w./:@-]")
@@ -66,6 +84,148 @@ MAX_KUBECONFIG_BYTES = 1 << 20
 # the client; `api_policy.API_READ_ROUTES` on the broker is what it may reach.
 API_RELAY_PREFIX = "/v1/gcp/"
 
+# The exec tier's shared names, here for the same reason as the relay prefix:
+# the broker and the shim both spell them, and this is the module both import.
+# docs/designs/credential-broker-exec-tier.md §12 is the contract, and
+# test_exec_tier_contract.py checks that these match it.
+EXEC_ROLE = "exec"
+EXEC_URL_ENV = "CREDENTIAL_PROXY_EXEC_URL"
+EXEC_REPLICAS_FILE_ENV = "CREDENTIAL_PROXY_EXEC_REPLICAS_FILE"
+EXEC_REPLICAS_FILE = "/etc/credential-proxy-exec-tier/replicas"
+# The keys the admission route adds for the whole tier when the replicas file
+# holds a count (§3.5); `broker_admission` sizes a sweep by them.
+ADMISSION_REPLICAS_KEY = "replicas"
+ADMISSION_TIER_ADMITTED_KEY = "tier_admitted"
+ADMISSION_TIER_INTERACTIVE_CAP_KEY = "tier_interactive_cap"
+BUSY_BOUND_KEY = "bound"
+ADMISSION_BOUND_DRAINING = "draining"
+ADMISSION_BOUND_BACKGROUND = "background"
+# A busy answer under one of these bounds is retried, each attempt on a new
+# connection, so another replica can admit it. The session cap is a caller's
+# own limit, and the others name no replica-local shortage.
+RETRYABLE_BUSY_BOUNDS = frozenset(
+    {"slot", "budget", ADMISSION_BOUND_BACKGROUND, ADMISSION_BOUND_DRAINING, "profile"}
+)
+
+# The broker's admission refusals, which it raises before a command starts, so
+# a retry never runs one twice. `BUSY_CODE` is the 503 the broker answers at a
+# cap or its memory budget. `RESOURCE_PRESSURE_CODE` is the 429 the broker's
+# resource watermark gate answers at once past its hard watermark, with the
+# interval to wait in the Retry-After header and the body's `retry_after`.
+BUSY_CODE = "CREDENTIAL_PROXY_BUSY"
+RESOURCE_PRESSURE_CODE = "CREDENTIAL_PROXY_RESOURCE_PRESSURE"
+# Envoy's mark on a 503 it answered itself, under its own overload manager,
+# without forwarding the request. Any other non-JSON 503 may be an upstream
+# that reset after the request was forwarded, so the command may have run.
+ENVOY_OVERLOADED_HEADER = "x-envoy-overloaded"
+RETRY_AFTER_HEADER = "Retry-After"
+# How many times a refused request is sent again: four retries, five attempts.
+CREDENTIAL_PROXY_CLIENT_MAX_RETRIES = 4
+# The wait before retry `k` (from 0) is uniform in [base/2, base]: full jitter
+# over half the window, so shims refused together do not return together. The
+# base is the reply's `Retry-After` when it names a number of seconds, held
+# between RETRY_BACKOFF_BASE_SECONDS and RETRY_AFTER_CAP_SECONDS per wait (a
+# header of 0 or less, which HTTP allows, would otherwise make the retries a
+# burst with no wait and no jitter, the load this schedule exists to avoid);
+# otherwise RETRY_BACKOFF_BASE_SECONDS grown RETRY_BACKOFF_GROWTH-fold per
+# retry (2, 4, 8, 16 s), capped at RETRY_BACKOFF_CAP_SECONDS. The sleeps add
+# up to about 30 s on the exponential schedule and to four times the per-wait
+# cap when every reply names one.
+RETRY_AFTER_CAP_SECONDS = 30.0
+RETRY_BACKOFF_BASE_SECONDS = 2.0
+RETRY_BACKOFF_GROWTH = 2
+RETRY_BACKOFF_CAP_SECONDS = 16.0
+RETRY_JITTER_FLOOR = 0.5
+# The broker refuses a request at the slot cap, the memory budget or the
+# background cap only after holding it the full admission wait
+# (credential_proxy.COMMAND_SLOT_WAIT_SECONDS; test_credential_proxy_client
+# holds the two equal), so each such attempt costs a minute before its
+# refusal. The terminal tool kills a command at 180 s (Hermes
+# TERMINAL_TOOL_TIMEOUT_SECONDS, which cluster_preflight.sh mirrors), and a
+# shim killed there leaves the model a timeout instead of the broker's reason.
+# So a retry is started only when its wait, plus a full admission wait, would
+# still end inside RETRY_DEADLINE_SECONDS of the first send: two waited
+# attempts (about 2 min) fit, a third does not, and the throttled line reaches
+# the caller inside the tool's cap. Refusals the broker answers at once are not
+# held back by it. The rule reserves the retry's admission wait and not the
+# command's run after it: a retry the broker admits in the last seconds of
+# its queue, whose command then uses most of its own bound (60 s for a
+# one-shot kubectl), ends past the tool's kill, which closes the shim's
+# connection and has the broker kill the command (CommandExecutor, on a
+# caller that has gone); the model then reads a timeout, not output. The
+# window is a few seconds wide (admission in the last seconds of the queue,
+# a run within seconds of its bound), and reserving the run as well would
+# leave no retry at all for a waited refusal under 170 s, so the window is
+# the price of retrying one; §4.3 of the exec-tier design states it. A caller
+# that kills the shim sooner than the tool does names its own deadline, in
+# seconds from the first send, in RETRY_DEADLINE_ENV, less what this rule
+# does not reserve: the Cluster Agent preflight's `timeout` on one brokered
+# call, 125 s, has room for one admission wait and one command run, so it
+# passes the cap less its margin and the run bound, 60 s, under which no
+# retry fits, and the shim gives up at the first refusal with the broker's
+# reason instead of being killed with that reason unread. The variable only
+# shortens the deadline: a longer one would put the throttled line past the
+# tool's kill again. Unset, empty, or anything but a finite non-negative
+# number keeps the default.
+BROKER_ADMISSION_WAIT_SECONDS = 60.0
+RETRY_DEADLINE_SECONDS = 170.0
+RETRY_DEADLINE_ENV = "CREDENTIAL_PROXY_RETRY_DEADLINE_SECONDS"
+# What a refusal with no JSON body is reported as; the broker's own text is
+# used when it sent one.
+NON_JSON_RESPONSE_TEXT = "non-JSON response"
+CLASS_INTERACTIVE = "interactive"
+CLASS_BACKGROUND = "background"
+CLASS_LABEL = "class"
+BACKGROUND_NICE = 10
+BROKER_TIER_EXEC = "exec"
+BROKER_TIER_STATEFUL = "stateful"
+AUDIT_BROKER_TIER = "broker_tier"
+AUDIT_CLASS = "class"
+AUDIT_BROKER_POD = "broker_pod"
+
+# The shim's own names for exec-tier routing; not part of the contract above.
+# The stateful broker's URL, which an exec-role call falls back on when the exec
+# tier cannot be reached, and every other call uses. The exec URL is plain http,
+# as the broker's Service is: only `BrokerConnection` bounds the connect and
+# tells "nothing was sent" apart.
+BROKER_URL_ENV = "CREDENTIAL_PROXY_URL"
+# The one line a fallback writes. No "credential proxy" prefix and no low-level
+# cause: kubectl's failure classifiers read the whole stderr, and either would
+# make a real cluster connection failure after the fallback look like the
+# shim's own (cluster_agent_profile.NOT_A_CONNECTION_FAILURE_RE) or a broker
+# refusal look like the cluster's (CONNECTIVITY_FAILURE_RE).
+EXEC_FALLBACK_NOTICE = "exec tier not reachable; this command went to the stateful broker"
+# The broker route `execute` sends a command to, under the broker's URL.
+EXEC_ROUTE = "/v1/exec"
+# The exec body's session key (the broker's SESSION_ID_FIELD): the card or
+# session id this process runs under, `default_caller_label`, so the broker
+# can count a run's commands and break its retry loops. Omitted when there is
+# none; a request without one is uncounted.
+SESSION_ID_FIELD = "sessionId"
+# The refusal codes the shim prints as a policy block (the message, then
+# `policy rule: <rule>`) and exits EXIT_SECURITY_POLICY_BLOCKED on: the policy's
+# own, and the broker's two per-session bounds. The exit code keeps the runtime
+# from reading the refusal as a missing executable; the runtime's refusal stop
+# (deploy/docker/patches/permission_refusal_stop.py) halts on the read-only
+# rule's write refusals only, so for the two session bounds the message is
+# what tells the model to stop.
+SECURITY_POLICY_BLOCKED_CODE = "SECURITY_POLICY_BLOCKED"
+SESSION_BUDGET_EXCEEDED_CODE = "BROKER_SESSION_BUDGET_EXCEEDED"
+LOOP_BREAKER_CODE = "BROKER_LOOP_BREAKER"
+POLICY_BLOCKED_CODES = frozenset({SECURITY_POLICY_BLOCKED_CODE, SESSION_BUDGET_EXCEEDED_CODE, LOOP_BREAKER_CODE})
+# The line a malformed exec URL writes, once per process, when the stateful
+# broker takes its place. No "credential proxy" prefix, for the same reason as
+# EXEC_FALLBACK_NOTICE; the reason names the shape, never a network cause.
+EXEC_URL_IGNORED_NOTICE = "{name} ignored ({reason}); commands go to the stateful broker"
+_exec_url_notice_written = False
+# A connection that closed once the request was sent: the command may have run,
+# so it is never sent again. The `credential proxy error` prefix marks the line
+# as the shim's own for kubectl's failure classifiers.
+_DROPPED_LINE = "credential proxy error: the connection dropped {cause}; the command may have run"
+# The least read time a relay fallback is worth sending with; less, and the
+# caller's budget is already spent, so the error is raised instead.
+RELAY_FALLBACK_MIN_SECONDS = 1.0
+
 # Where a `get-credentials` that named no destination leaves its file:
 # `$HERMES_HOME/.kubeconfigs/kubeconfig_<project>_<cluster>_<location>.yaml`,
 # the convention agents/platform/AGENTS.md ("Cluster Credentials") teaches and
@@ -73,12 +233,24 @@ API_RELAY_PREFIX = "/v1/gcp/"
 # one that convention spells as `${HERMES_HOME:-/opt/data}`.
 DEFAULT_HERMES_HOME = "/opt/data"
 KUBECONFIG_DIR_NAME = ".kubeconfigs"
-# What a workspace `open` labels itself with, so the broker's log can say who
-# holds a slot when the store is full: the kanban card first, the session
-# otherwise. The grammar mirrors `content_workspace.CALLER_LABEL_RE`; a value
-# outside it is dropped rather than sent, because a label is a courtesy to the
-# log and must never be what fails an open.
-CALLER_LABEL_ENV = ("HERMES_KANBAN_TASK", "HERMES_SESSION_ID")
+DEFAULT_KUBE_PROXY_CA_FILE = "/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt"
+DEFAULT_KUBE_PROXY_TOKEN_FILE = "/var/run/secrets/kubeagents/credential-proxy/token"
+KUBE_PROXY_USER_NAME = "kube-proxy-caller"
+SANDBOX_HERMES_UID = 1001
+SANDBOX_HERMES_KUBECONFIG_PATH = Path("/home/hermes/.kube/config")
+SANDBOX_SHARED_KUBECONFIG_PATH = Path("/opt/data/.kubeconfig")
+# What an exec request sends as its `sessionId`, so the broker can count the
+# run's commands: the kanban card first, then the scheduled run, then the
+# session. Where each comes from matters, because no process environment
+# crosses the SSH hop into the shell sandbox: there the ForceCommand
+# (deploy/sandbox/session-command.sh) recovers the card and the cron run from
+# the command's cwd, and a chat turn, which runs from neither, sends no key.
+# HERMES_SESSION_ID reaches the shim only where the terminal runs in the
+# shim's own pod, the profile and session pods. The grammar mirrors the
+# broker's SESSION_ID_RE; a value outside it is dropped rather than sent,
+# because the key serves the broker's count and must never be what fails a
+# command.
+CALLER_LABEL_ENV = ("HERMES_KANBAN_TASK", "HERMES_CRON_RUN", "HERMES_SESSION_ID")
 CALLER_LABEL_RE = re.compile(r"\A[A-Za-z0-9._:-]{1,64}\Z")
 PER_TARGET_KUBECONFIG_NAME = "kubeconfig_{project}_{cluster}_{location}.yaml"
 
@@ -144,8 +316,90 @@ class BrokerConnection(http.client.HTTPConnection):
 
     def connect(self) -> None:
         self.timeout = BROKER_CONNECT_TIMEOUT_SECONDS
-        super().connect()
+        try:
+            super().connect()
+        except (OSError, UnicodeError) as exc:
+            # The one point where "nothing was sent" is certain. urllib wraps
+            # this in a URLError as before, so a caller that reads only that
+            # sees no change. UnicodeError is the resolver's IDNA step refusing
+            # the host (an empty or over-long label), before any lookup.
+            raise BrokerUnreachable(str(exc)) from exc
         self.sock.settimeout(None)
+
+
+class BrokerUnreachable(OSError):
+    """No connection to the broker could be made, so no request reached it."""
+
+
+def exec_endpoints() -> tuple[str | None, str | None]:
+    """The broker an exec-role call goes to, and the one it falls back on.
+
+    The exec tier when the operator set a well-formed URL, with the stateful
+    broker as the fallback; else the stateful broker alone, as before the exec
+    tier. A malformed URL is ignored with one stderr line (`_exec_url_fault`).
+    `execute` falls back only on a failure before a byte was sent (no
+    connection to the exec tier, or a URL it could not build a request from):
+    then no request reached a broker, and nothing ran. `ApiSession` also falls
+    back after a dropped connection, because its relay calls are GETs, which
+    are safe to send again.
+    """
+    # Spelled out, not BROKER_URL_ENV: tests/conformance/test_C_enforcement.py
+    # (C1) pins that the shim reads this name, across the module boundary to
+    # the operator and the gateway that set it.
+    stateful = os.getenv("CREDENTIAL_PROXY_URL")
+    exec_url = os.getenv(EXEC_URL_ENV, "").strip()
+    if exec_url:
+        reason = _exec_url_fault(exec_url)
+        if reason is None or not stateful:
+            # With no stateful broker to use instead, a malformed URL is
+            # reported when the call is made, as before this check.
+            return exec_url, stateful or None
+        global _exec_url_notice_written
+        if not _exec_url_notice_written:
+            print(EXEC_URL_IGNORED_NOTICE.format(name=EXEC_URL_ENV, reason=reason), file=sys.stderr)
+            _exec_url_notice_written = True
+        return stateful, None
+    return stateful, None
+
+
+def _exec_url_fault(url: str) -> str | None:
+    """Why the exec URL can't be used, or None.
+
+    The broker opener's connect bound and its `BrokerUnreachable` signal are on
+    plain http only, so an https URL would get neither the bound nor the
+    fallback. A bad port or a missing scheme fails before any socket opens.
+    """
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        # A bracketed host that is not an IPv6 address, such as `http://[::1`.
+        return "not a valid URL"
+    if parts.scheme != "http":
+        return "not an http:// URL"
+    if not parts.hostname:
+        return "no host"
+    try:
+        parts.port
+    except ValueError:
+        return "the port is not a number from 0 to 65535"
+    if "?" in url or "#" in url:
+        # The route is appended to the URL, so it would land in the query or
+        # be cut off with the fragment.
+        return "it has a query or a fragment"
+    try:
+        # What execute() builds from the raw string, short of a socket: the
+        # resolver's IDNA step, the connection's host check and the request
+        # line's path check. urlsplit's view drops a tab or newline and keeps
+        # a %-escape, so it can't answer for them.
+        parts.hostname.encode("idna")
+        request = urllib.request.Request(url.rstrip("/") + EXEC_ROUTE)
+        connection = http.client.HTTPConnection(request.host)
+        # urllib sends its own Host header, which http.client encodes as latin-1.
+        connection.putrequest("POST", request.selector, skip_host=True)
+        connection.putheader("Host", request.host)
+    except (ValueError, http.client.InvalidURL):
+        return "not a valid URL"
+    return None
 
 
 class _BrokerHTTPHandler(urllib.request.HTTPHandler):
@@ -170,7 +424,12 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 # A private opener rather than urllib.request.install_opener: this module is
 # imported by github_token_refresh and the two relay patches, and a global
 # opener would strip the total timeouts their own urlopen calls rely on.
-_BROKER_OPENER = urllib.request.build_opener(_BrokerHTTPHandler, _NoRedirect())
+# No proxy from the environment: the broker is an in-cluster Service, and a
+# proxy in between would make every connect succeed, so a broker that cannot
+# be reached could not be told apart from one that dropped the request.
+_BROKER_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}), _BrokerHTTPHandler, _NoRedirect()
+)
 
 
 def open_broker_request(request: urllib.request.Request):
@@ -205,6 +464,94 @@ def authorization_headers() -> dict[str, str]:
     if not token:
         raise TokenUnavailable(f"{token_file} is empty")
     return {"Authorization": f"Bearer {token}"}
+
+# A profile worker's task credential (#3889): the dispatcher's proxyToken, which
+# the worker adapter writes to a tmpfs file on the task's confirm and removes at
+# the task's end. Sent in this header on every exec, re-read on every call, so a
+# warm pod's next task presents its own. The broker confines the call to the
+# cluster the credential names (credential_proxy.TASK_CREDENTIAL_HEADER).
+TASK_TOKEN_FILE_ENV = "CREDENTIAL_PROXY_TASK_TOKEN_FILE"
+TASK_CREDENTIAL_HEADER = "X-Kube-Agents-Task-Credential"
+# The broker's own ceiling on the value (task_credential.MAX_TOKEN_BYTES).
+MAX_TASK_CREDENTIAL_BYTES = 8192
+_TASK_CREDENTIAL_SHAPE = re.compile(r"\A[A-Za-z0-9_.-]+\Z")
+# gcloud settings that would choose the project, account, identity, endpoint,
+# location or configuration of a call if gcloud ran here. It doesn't: the shim
+# forwards no environment, and the broker's gcloud reads the broker's. In task
+# mode the shim names any that are set rather than leaving the model to believe
+# one took. Named rather than matched on the CLOUDSDK_ prefix: images and
+# workstations set plenty of CLOUDSDK_* that redirect nothing (CLOUDSDK_PYTHON,
+# the context-aware access settings), and a notice on every call that lists
+# them would be noise the model learns to skip.
+CLOUDSDK_REDIRECTING_ENV = frozenset({
+    "CLOUDSDK_CORE_PROJECT",
+    "CLOUDSDK_CORE_ACCOUNT",
+    "CLOUDSDK_CORE_BILLING_QUOTA_PROJECT",
+    "CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT",
+    "CLOUDSDK_AUTH_ACCESS_TOKEN_FILE",
+    "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE",
+    "CLOUDSDK_ACTIVE_CONFIG_NAME",
+    "CLOUDSDK_CONFIG",
+    "CLOUDSDK_CONTAINER_CLUSTER",
+    "CLOUDSDK_COMPUTE_ZONE",
+    "CLOUDSDK_COMPUTE_REGION",
+})
+CLOUDSDK_ENDPOINT_OVERRIDE_PREFIX = "CLOUDSDK_API_ENDPOINT_OVERRIDES_"
+
+
+def task_mode() -> bool:
+    """Whether this shim runs for a profile task (CREDENTIAL_PROXY_TASK_TOKEN_FILE set)."""
+    return bool(os.environ.get(TASK_TOKEN_FILE_ENV, "").strip())
+
+
+def task_credential_headers() -> dict[str, str]:
+    """The task credential header, or nothing when there is no task.
+
+    Read per call. A missing file is no task, not an error: the adapter
+    removes it when the task ends, and the broker then runs local-only
+    commands and nothing else, which is the answer to give. Any other read
+    failure, or a value that isn't one compact JWT, is TokenUnavailable, for
+    authorization_headers' reason: a request sent without it would earn a
+    refusal that hides the fault.
+    """
+    token_file = os.environ.get(TASK_TOKEN_FILE_ENV, "").strip()
+    if not token_file:
+        return {}
+    try:
+        token = Path(token_file).read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return {}
+    except (OSError, UnicodeDecodeError) as exc:
+        raise TokenUnavailable(f"{token_file}: {getattr(exc, 'strerror', None) or exc}") from exc
+    if not token:
+        return {}
+    if len(token) > MAX_TASK_CREDENTIAL_BYTES or not _TASK_CREDENTIAL_SHAPE.match(token):
+        raise TokenUnavailable(f"{token_file} does not hold a task credential")
+    return {TASK_CREDENTIAL_HEADER: token}
+
+
+def ignored_task_environment() -> list[str]:
+    """The environment a profile task's shim does not honour, by name.
+
+    KUBECONFIG (and with it the shell's own get-credentials pin) would choose
+    the cluster; the CLOUDSDK_* settings in CLOUDSDK_REDIRECTING_ENV would
+    choose a project, account or endpoint if gcloud ran here. In task mode the cluster and project are the
+    task credential's, which the broker enforces whatever is sent, so none of
+    these is read, and naming them keeps the model from believing one took.
+    """
+    names = []
+    if os.environ.get("KUBECONFIG", "").strip():
+        names.append("KUBECONFIG")
+    names.extend(
+        sorted(
+            name
+            for name, value in os.environ.items()
+            if (name in CLOUDSDK_REDIRECTING_ENV or name.startswith(CLOUDSDK_ENDPOINT_OVERRIDE_PREFIX))
+            and value.strip()
+        )
+    )
+    return names
+
 
 # Only these read KUBECONFIG: kubectl to pick a context, gcloud to write one in
 # `container clusters get-credentials`. Today that is every executable this
@@ -640,6 +987,253 @@ def implicit_kubectl_context(argv: list[str]) -> str:
     return shell_context() or ""
 
 
+def build_kube_proxy_kubeconfig(
+    context: str,
+    proxy_url: str | None = None,
+    ca_file: str | None = None,
+    token_file: str | None = None,
+) -> str:
+    """Build a kubeconfig document that routes `context` through `k8s-api-proxy`."""
+    import yaml
+
+    resolved_url = (proxy_url or os.environ.get("KUBE_PROXY_URL", "")).strip().rstrip("/")
+    resolved_ca = (
+        ca_file
+        or os.environ.get("KUBE_PROXY_CA_FILE", "")
+        or DEFAULT_KUBE_PROXY_CA_FILE
+    ).strip()
+    resolved_token = (
+        token_file
+        or os.environ.get("CREDENTIAL_PROXY_TOKEN_FILE", "")
+        or DEFAULT_KUBE_PROXY_TOKEN_FILE
+    ).strip()
+    doc = {
+        "apiVersion": "v1",
+        "kind": "Config",
+        "clusters": [
+            {
+                "name": context,
+                "cluster": {
+                    "server": f"{resolved_url}/clusters/{context}",
+                    "certificate-authority": resolved_ca,
+                },
+            }
+        ],
+        "users": [
+            {
+                "name": KUBE_PROXY_USER_NAME,
+                "user": {
+                    "tokenFile": resolved_token,
+                },
+            }
+        ],
+        "contexts": [
+            {
+                "name": context,
+                "context": {
+                    "cluster": context,
+                    "user": KUBE_PROXY_USER_NAME,
+                },
+            }
+        ],
+        "current-context": context,
+    }
+    return yaml.safe_dump(doc, sort_keys=False)
+
+
+def _caller_default_kubeconfig_path() -> Path:
+    """Return the default kubeconfig path for the active sandbox user."""
+    if os.geteuid() == SANDBOX_HERMES_UID:
+        return SANDBOX_HERMES_KUBECONFIG_PATH
+    return SANDBOX_SHARED_KUBECONFIG_PATH
+
+
+def _default_kubeconfig_candidates() -> list[Path]:
+    """Return the default kubeconfig files to update when a cluster context is registered."""
+    return [_caller_default_kubeconfig_path(), SANDBOX_SHARED_KUBECONFIG_PATH]
+
+
+def _is_default_sandbox_kubeconfig(path: str | Path) -> bool:
+    """Return True when `path` is one of the sandbox default multi-context kubeconfigs."""
+    return Path(path) in _default_kubeconfig_candidates()
+
+
+def _merge_context_into_kubeconfig_file(
+    path: Path,
+    context: str,
+    proxy_url: str,
+    ca_file: str,
+    token_file: str,
+) -> None:
+    import fcntl
+    import yaml
+
+    try:
+        if not path.parent.is_dir():
+            return
+        lock_path = path.with_name(f".{path.name}.lock")
+        lock_flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        lock_fd = os.open(lock_path, lock_flags, 0o600)
+    except OSError:
+        return
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            if path.is_symlink() or not path.is_file():
+                return
+            st = path.stat()
+            if st.st_uid != os.geteuid() or st.st_nlink != 1:
+                return
+            doc = yaml.safe_load(path.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, yaml.YAMLError, RecursionError):
+            return
+        if not isinstance(doc, dict):
+            return
+        expected_server = f"{proxy_url}/clusters/{context}"
+        existing_clusters = list(doc.get("clusters") or [])
+        existing_contexts = list(doc.get("contexts") or [])
+        existing_users = list(doc.get("users") or [])
+        has_cluster = any(
+            isinstance(c, dict)
+            and c.get("name") == context
+            and isinstance(c.get("cluster"), dict)
+            and c["cluster"].get("server") == expected_server
+            and c["cluster"].get("certificate-authority") == ca_file
+            for c in existing_clusters
+        )
+        has_context = any(
+            isinstance(c, dict)
+            and c.get("name") == context
+            and isinstance(c.get("context"), dict)
+            and c["context"].get("cluster") == context
+            and c["context"].get("user") == KUBE_PROXY_USER_NAME
+            for c in existing_contexts
+        )
+        has_user = any(
+            isinstance(u, dict)
+            and u.get("name") == KUBE_PROXY_USER_NAME
+            and u.get("user") == {"tokenFile": token_file}
+            for u in existing_users
+        )
+        if has_cluster and has_context and has_user:
+            return
+        clusters = [
+            c for c in existing_clusters if isinstance(c, dict) and c.get("name") != context
+        ]
+        clusters.append(
+            {
+                "name": context,
+                "cluster": {
+                    "server": expected_server,
+                    "certificate-authority": ca_file,
+                },
+            }
+        )
+        doc["clusters"] = clusters
+        users = [
+            u
+            for u in existing_users
+            if isinstance(u, dict) and u.get("name") != KUBE_PROXY_USER_NAME
+        ]
+        users.append(
+            {
+                "name": KUBE_PROXY_USER_NAME,
+                "user": {"tokenFile": token_file},
+            }
+        )
+        doc["users"] = users
+        contexts = [
+            c for c in existing_contexts if isinstance(c, dict) and c.get("name") != context
+        ]
+        contexts.append(
+            {
+                "name": context,
+                "context": {
+                    "cluster": context,
+                    "user": KUBE_PROXY_USER_NAME,
+                },
+            }
+        )
+        doc["contexts"] = contexts
+        try:
+            _replace_file(path, yaml.safe_dump(doc, sort_keys=False))
+        except OSError:
+            pass
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(lock_fd)
+        except OSError:
+            pass
+
+
+def merge_context_into_default_kubeconfig(context: str) -> None:
+    """Register `context` in the default kubeconfig while preserving `current-context`."""
+    proxy_url = os.environ.get("KUBE_PROXY_URL", "").strip().rstrip("/")
+    if not proxy_url:
+        return
+    ca_file = (
+        os.environ.get("KUBE_PROXY_CA_FILE", "") or DEFAULT_KUBE_PROXY_CA_FILE
+    ).strip()
+    token_file = (
+        os.environ.get("CREDENTIAL_PROXY_TOKEN_FILE", "")
+        or DEFAULT_KUBE_PROXY_TOKEN_FILE
+    ).strip()
+    seen: set[Path] = set()
+    for path in _default_kubeconfig_candidates():
+        if path in seen:
+            continue
+        seen.add(path)
+        _merge_context_into_kubeconfig_file(
+            path, context, proxy_url, ca_file, token_file
+        )
+
+
+def ensure_kube_proxy_context_for_argv(argv: list[str]) -> None:
+    """Register a `--context=gke_...` flag's cluster in the active kubeconfig before `kubectl` runs."""
+    proxy_url = os.environ.get("KUBE_PROXY_URL", "").strip().rstrip("/")
+    if not proxy_url:
+        return
+    normalized = argv if (argv and argv[0] == "kubectl") else ["kubectl", *argv]
+    if names_kubeconfig_flag(normalized):
+        return
+    flag = kubectl_context_flag(normalized)
+    target = parse_gke_context(flag) if flag else None
+    if target is None:
+        return
+    merge_context_into_default_kubeconfig(target.context_name)
+    env_kc = os.environ.get("KUBECONFIG", "").strip()
+    if env_kc and os.pathsep not in env_kc:
+        candidate = Path(env_kc)
+        if candidate not in _default_kubeconfig_candidates():
+            ca_file = (
+                os.environ.get("KUBE_PROXY_CA_FILE", "") or DEFAULT_KUBE_PROXY_CA_FILE
+            ).strip()
+            token_file = (
+                os.environ.get("CREDENTIAL_PROXY_TOKEN_FILE", "")
+                or DEFAULT_KUBE_PROXY_TOKEN_FILE
+            ).strip()
+            _merge_context_into_kubeconfig_file(
+                candidate, target.context_name, proxy_url, ca_file, token_file
+            )
+
+
+def rewrite_kubeconfig_for_kube_proxy(generated: str) -> str:
+    """Rewrite a `get-credentials` kubeconfig to route through `k8s-api-proxy`."""
+    proxy_url = os.environ.get("KUBE_PROXY_URL", "").strip()
+    if not proxy_url:
+        return generated
+    context = read_current_context(generated)
+    target = parse_gke_context(context) if context else None
+    if target is None:
+        return generated
+    merge_context_into_default_kubeconfig(target.context_name)
+    return build_kube_proxy_kubeconfig(target.context_name, proxy_url=proxy_url)
+
+
 def land_implicit_kubeconfig(generated: str) -> None:
     """File a context-less get-credentials' kubeconfig, and say how to use it.
 
@@ -667,7 +1261,9 @@ def land_implicit_kubeconfig(generated: str) -> None:
     except OSError as exc:
         written = False
         print(f"credential proxy: could not write {path}: {exc}", file=sys.stderr)
-    pinned = record_shell_context(target.context_name)
+    pinned = False
+    if not os.environ.get("KUBE_PROXY_URL", "").strip():
+        pinned = record_shell_context(target.context_name)
     lines = ["credential proxy: no --kubeconfig or KUBECONFIG was given."]
     if written:
         lines.append(f"  Credentials for {target.context_name} are in {path}.")
@@ -688,19 +1284,77 @@ def land_implicit_kubeconfig(generated: str) -> None:
     print("\n".join(lines), file=sys.stderr)
 
 
+def report_task_kubeconfig(generated: str) -> None:
+    """Say, in one line, what a get-credentials in a profile task did.
+
+    Nothing is filed and no shell context is recorded: in a task neither is
+    read (the broker holds every kubectl and gcloud call to the task's
+    cluster and project), and `land_implicit_kubeconfig`'s advice -- the
+    host cluster for later commands, `export KUBECONFIG` -- would be false.
+    """
+    context = read_current_context(generated)
+    target = parse_gke_context(context) if context else None
+    if target is None:
+        return
+    print(
+        f"credential proxy: credentials for {target.context_name} fetched; this profile task's kubectl and "
+        "gcloud calls already target its cluster, so there is nothing to export.",
+        file=sys.stderr,
+    )
+
+
+_GET_CREDENTIALS_WORDS = ("container", "clusters", "get-credentials")
+
+# gcloud's short flags that take a value: the single-dash members of
+# `command_policy._GCLOUD_FLAGS_WITH_VALUE`, which the shim can't import. A
+# test holds the two equal, so a short valued flag added there fails it.
+_GCLOUD_SHORT_FLAGS_WITH_VALUE = frozenset({"-z"})
+_GCLOUD_RELEASE_TRACKS = frozenset({"alpha", "beta"})
+
+
 def is_get_credentials(argv: list[str]) -> bool:
     """Is this the one command that legitimately authors a kubeconfig?
 
-    Matched on the subcommand sequence rather than on position, so global flags
-    may appear anywhere ahead of it.
+    Read the way the broker reads it: the command words past gcloud's flags, so
+    a flag between the words (`container clusters --location l get-credentials`)
+    is the same command. The shim can't import the broker's policy, so this walk
+    doesn't know every flag's arity. A short valued flag (`-z`) always takes the
+    next token. A bare `--flag` takes the next token as its value unless that
+    token is one of the command words, and none of the three is a plausible
+    flag value.
     """
     if not argv or argv[0] != "gcloud":
         return False
-    try:
-        index = argv.index("container")
-    except ValueError:
-        return False
-    return argv[index + 1 : index + 3] == ["clusters", "get-credentials"]
+    words: list[str] = []
+    index = 1
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            break
+        if token in _GCLOUD_SHORT_FLAGS_WITH_VALUE:
+            index += 2
+            continue
+        if token.startswith("-"):
+            # Known and harmless: a bare `--flag` never takes one of the three
+            # command words as its value, so `clusters --format get-credentials
+            # list` is get-credentials here but not to the broker, which knows
+            # `--format` takes a value. The shim then asks for a file the broker
+            # doesn't send and nothing lands. The parity test lists it.
+            if (
+                token.startswith("--")
+                and "=" not in token
+                and index + 1 < len(argv)
+                and not argv[index + 1].startswith("-")
+                and argv[index + 1] not in _GET_CREDENTIALS_WORDS
+            ):
+                index += 1
+            index += 1
+            continue
+        words.append(token)
+        index += 1
+    if words[:1] and words[0] in _GCLOUD_RELEASE_TRACKS:
+        words = words[1:]
+    return words[:3] == list(_GET_CREDENTIALS_WORDS)
 
 
 def get_credentials_destination(argv: list[str]) -> tuple[list[str], Path | None]:
@@ -714,7 +1368,8 @@ def get_credentials_destination(argv: list[str]) -> tuple[list[str], Path | None
     writes it here.
 
     Falls back to `$KUBECONFIG`, which is where a Cluster Agent profile's pin
-    lives when the caller did not name one.
+    lives when the caller did not name one; not in task mode, where KUBECONFIG
+    is not honoured (`ignored_task_environment`).
     """
     stripped: list[str] = []
     destination: str | None = None
@@ -731,15 +1386,225 @@ def get_credentials_destination(argv: list[str]) -> tuple[list[str], Path | None
             continue
         stripped.append(argument)
         index += 1
-    if destination is None:
-        destination = os.environ.get("KUBECONFIG", "").strip() or None
+    if destination is None and not task_mode():
+        env_kc = os.environ.get("KUBECONFIG", "").strip()
+        if env_kc and not (
+            os.environ.get("KUBE_PROXY_URL", "").strip()
+            and _is_default_sandbox_kubeconfig(env_kc)
+        ):
+            destination = env_kc
     return stripped, Path(destination) if destination else None
+
+
+def _refusal_payload(exc: urllib.error.HTTPError) -> dict | None:
+    """The JSON body of a refusal, or None when it has none.
+
+    The proxy's own errors are JSON, but the error can also come from whatever
+    sits between shim and proxy: an Envoy restarting mid-request answers 503
+    with an HTML body. The body is read once and kept on the error, because
+    the retry decision and the message printed after it both need it; a body
+    that is not a JSON object counts as none. `exc.shim_dropped` says the
+    connection closed while the body was read.
+    """
+    exc.shim_dropped = False
+    exc.shim_payload = None
+    try:
+        payload = json.load(exc)
+    except (ValueError, TypeError):
+        return None
+    except (http.client.HTTPException, OSError):
+        # The connection closed while the refusal's body was read.
+        exc.shim_dropped = True
+        return None
+    exc.shim_payload = payload if isinstance(payload, dict) else None
+    return exc.shim_payload
+
+
+def _exec_refused(exc: urllib.error.HTTPError, payload: dict | None) -> int:
+    """Print a refusal from `/v1/exec` the way the agent reads it, and its exit code."""
+    if payload is None:
+        # A traceback here would turn a transient sidecar blip into a shim
+        # crash the agent cannot read.
+        print(
+            f"credential proxy error (HTTP {exc.code}): {NON_JSON_RESPONSE_TEXT}",
+            file=sys.stderr,
+        )
+        return 1
+    # The far side composes the payload: a `code` that is not a string (a
+    # list, an object) is not a refusal code, and must not raise out of here.
+    if isinstance(payload.get("code"), str) and payload["code"] in POLICY_BLOCKED_CODES:
+        print(
+            payload.get("message", "Command blocked for security reasons."),
+            file=sys.stderr,
+        )
+        print(f"policy rule: {payload.get('rule', 'unknown')}", file=sys.stderr)
+        # The verb the policy resolved and whether this was a local render:
+        # the agent runtime's refusal stop reads these two lines.
+        if payload.get("verb"):
+            # Each word is an argv token the agent chose; keep it to one line
+            # and to the characters a verb or resource name is made of.
+            words = (_VERB_WORD_SAFE_RE.sub("_", str(w))[:_VERB_WORD_MAX] for w in payload["verb"])
+            print(f"policy verb: {' '.join(words)}", file=sys.stderr)
+        if payload.get("local_render"):
+            print("policy render: local", file=sys.stderr)
+        return EXIT_SECURITY_POLICY_BLOCKED
+    print(payload.get("error", str(exc)), file=sys.stderr)
+    return 1
+
+
+def retry_delay_seconds(attempt: int, retry_after: str | None = None, rng=random) -> float:
+    """How long to wait before retry number `attempt` (counted from 0).
+
+    `retry_after` is the reply's `Retry-After` header when it sent one; a
+    numeric value (seconds) is the base, held between RETRY_BACKOFF_BASE_SECONDS
+    (so a header of 0 or less still waits, and jittered) and
+    RETRY_AFTER_CAP_SECONDS, and anything else (an HTTP date, garbage, nothing)
+    falls back to the
+    exponential base, RETRY_BACKOFF_BASE_SECONDS grown RETRY_BACKOFF_GROWTH-fold
+    per retry and capped at RETRY_BACKOFF_CAP_SECONDS. The wait is uniform in
+    [base/2, base]. `rng` is anything with `uniform(a, b)`, injectable so a
+    test can pin the draw.
+    """
+    base = None
+    if retry_after is not None:
+        try:
+            value = float(retry_after.strip())
+        except (ValueError, AttributeError):
+            value = None
+        if value is not None and math.isfinite(value):
+            base = min(max(value, RETRY_BACKOFF_BASE_SECONDS), RETRY_AFTER_CAP_SECONDS)
+    if base is None:
+        base = min(
+            RETRY_BACKOFF_BASE_SECONDS * (RETRY_BACKOFF_GROWTH ** attempt), RETRY_BACKOFF_CAP_SECONDS
+        )
+    return rng.uniform(RETRY_JITTER_FLOOR * base, base)
+
+
+def retry_deadline_seconds(environ=os.environ) -> float:
+    """The deadline the retries keep to: the caller's, when it named a shorter one.
+
+    RETRY_DEADLINE_ENV carries the caller's bound in seconds from the first
+    send. It can only shorten RETRY_DEADLINE_SECONDS, and a value that is not
+    a finite non-negative number is ignored.
+    """
+    raw = environ.get(RETRY_DEADLINE_ENV, "").strip()
+    if not raw:
+        return RETRY_DEADLINE_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return RETRY_DEADLINE_SECONDS
+    if not math.isfinite(value) or value < 0:
+        return RETRY_DEADLINE_SECONDS
+    return min(value, RETRY_DEADLINE_SECONDS)
+
+
+def retry_wait(
+    attempts_made: int,
+    started: float,
+    retry_after: str | None = None,
+    rng=random,
+    clock=time.monotonic,
+    deadline: float = RETRY_DEADLINE_SECONDS,
+) -> float | None:
+    """The wait before one more attempt, or None when the retries are spent.
+
+    `attempts_made` counts the attempts already refused (from 1); `started` is
+    the clock reading at the first send. Spent means either the count
+    (CREDENTIAL_PROXY_CLIENT_MAX_RETRIES retries) or the deadline: a retry
+    whose wait, plus the admission wait the broker may hold it for, would end
+    past `deadline` seconds from the first send is not started, so the
+    throttled line, not a tool timeout, is what the caller reads. `deadline`
+    is RETRY_DEADLINE_SECONDS, or what `retry_deadline_seconds` read from the
+    caller.
+    """
+    if attempts_made > CREDENTIAL_PROXY_CLIENT_MAX_RETRIES:
+        return None
+    delay = retry_delay_seconds(attempts_made - 1, retry_after, rng)
+    if clock() - started + delay + BROKER_ADMISSION_WAIT_SECONDS > deadline:
+        return None
+    return delay
+
+
+def busy_reply_retryable(payload) -> bool:
+    """Whether a JSON refusal from the broker is an admission refusal worth retrying.
+
+    Admission is decided before the command starts, so a retry never runs it
+    twice. A busy reply under a retryable bound (RETRYABLE_BUSY_BOUNDS), or
+    with no bound at all (a broker that predates the field), is; one at the
+    session or scope cap is the caller's own limit and is reported instead,
+    and so is a bound of any shape but a string (a list, a number): the shim
+    retries only what it understands. The 429 under memory pressure is
+    retried whatever it carries.
+    """
+    if not isinstance(payload, dict):
+        return False
+    code = payload.get("code")
+    if code == RESOURCE_PRESSURE_CODE:
+        return True
+    if code != BUSY_CODE:
+        return False
+    bound = payload.get(BUSY_BOUND_KEY)
+    return bound is None or (isinstance(bound, str) and bound in RETRYABLE_BUSY_BOUNDS)
+
+
+def exec_refusal_retryable(status: int, headers, payload) -> bool:
+    """Whether `/v1/exec` answered a refusal made before the command ran.
+
+    Any 429 is one. A 503 is one when its JSON body is a retryable busy reply
+    (`busy_reply_retryable`), or when it has no JSON body and Envoy marked it
+    as answered under overload, so nothing was forwarded. A bare non-JSON 503
+    is not: Envoy also answers 503 when the upstream reset after the request
+    was forwarded, and the command may have run.
+    """
+    if status == http.HTTPStatus.TOO_MANY_REQUESTS:
+        return True
+    if status != http.HTTPStatus.SERVICE_UNAVAILABLE:
+        return False
+    if payload is not None:
+        return busy_reply_retryable(payload)
+    return headers is not None and ENVOY_OVERLOADED_HEADER in headers
+
+
+def refusal_text(payload) -> str:
+    """The broker's own words for a refusal, for the stderr line."""
+    if isinstance(payload, dict):
+        return str(payload.get("error") or payload.get("message") or NON_JSON_RESPONSE_TEXT)
+    return NON_JSON_RESPONSE_TEXT
+
+
+def report_retry(status: int, text: str, attempts_made: int, delay: float) -> None:
+    """One stderr line per wait, so the agent sees the shim is waiting, not hung.
+
+    The attempt is numbered without a total: the deadline, not the count, ends
+    a run of waited refusals, so "of 5" would promise attempts that cannot
+    start.
+    """
+    next_attempt = attempts_made + 1
+    print(
+        f"credential proxy busy (HTTP {status}): {text}; retrying in {delay:.1f}s (attempt {next_attempt})",
+        file=sys.stderr,
+    )
+
+
+def report_throttled(status: int, text: str, attempts_made: int) -> None:
+    """The line the agent reads when the retries are spent, by count or by deadline."""
+    noun = "attempt" if attempts_made == 1 else "attempts"
+    print(
+        f"credential proxy throttled: gave up after {attempts_made} {noun} (HTTP {status}): {text}",
+        file=sys.stderr,
+    )
 
 
 def execute(
     endpoint: str,
     argv: list[str],
     stdin: str | None = None,
+    *,
+    fallback: str | None = None,
+    sleep_fn=time.sleep,
+    rng=random,
+    clock=time.monotonic,
 ) -> int:
     # No `cwd`. The broker resolves a path against its own filesystem, and it
     # has no view of this one — so a directory sent from here would name either
@@ -757,8 +1622,22 @@ def execute(
     # kubectl may still name a cluster: see `land_implicit_kubeconfig` and
     # `implicit_kubectl_context` for why, and for what keeps #1852's host
     # default for everything that names nothing.
+    #
+    # A profile task (`task_mode`) honours none of that environment: the
+    # cluster and project are the task credential's, and the broker holds the
+    # call to them. Only an explicit `--kubeconfig` in argv is still resolved,
+    # and the broker refuses it unless it names the task's cluster.
     destination: Path | None = None
     implicit_destination = False
+    in_task = task_mode()
+    if in_task:
+        ignored = ignored_task_environment()
+        if ignored:
+            print(
+                f"credential proxy: {', '.join(ignored)} not honoured for a profile task; "
+                "the task's cluster and project are used",
+                file=sys.stderr,
+            )
     try:
         context = ""
         if is_get_credentials(argv):
@@ -767,10 +1646,13 @@ def execute(
         elif argv and argv[0] in KUBECONFIG_AWARE:
             flag_pinned = names_kubeconfig_flag(argv)
             argv = resolve_kubeconfig_flags(argv)
-            kubeconfig = os.environ.get("KUBECONFIG", "").strip()
-            if kubeconfig:
+            kubeconfig = "" if in_task else os.environ.get("KUBECONFIG", "").strip()
+            if kubeconfig and not (
+                os.environ.get("KUBE_PROXY_URL", "").strip()
+                and _is_default_sandbox_kubeconfig(kubeconfig)
+            ):
                 context = kubeconfig_context(kubeconfig)
-            elif argv[0] == "kubectl" and not flag_pinned:
+            elif argv[0] == "kubectl" and not flag_pinned and not in_task:
                 context = implicit_kubectl_context(argv)
     except KubeconfigUnreadable as exc:
         print(f"credential proxy: {exc}", file=sys.stderr)
@@ -782,6 +1664,9 @@ def execute(
     }
     if context:
         request_payload["kubeconfigContext"] = context
+    session_label = default_caller_label()
+    if session_label:
+        request_payload[SESSION_ID_FIELD] = session_label
     if destination is not None or implicit_destination:
         request_payload["wantsKubeconfig"] = True
     if stdin is not None:
@@ -793,62 +1678,108 @@ def execute(
     headers = {"Content-Type": "application/json"}
     try:
         headers.update(authorization_headers())
+        headers.update(task_credential_headers())
     except TokenUnavailable as exc:
         # Sending the request anyway would earn an undifferentiated 401 and
         # hide the real fault, which is a broken token projection.
         print(f"credential proxy token unavailable: {exc}", file=sys.stderr)
         return 1
-    request = urllib.request.Request(
-        endpoint.rstrip("/") + "/v1/exec",
-        data=body,
-        headers=headers,
-        method="POST",
-    )
-    try:
-        with open_broker_request(request) as response:
-            payload = json.load(response)
-    except urllib.error.HTTPError as exc:
-        # The proxy's own errors are JSON, but the error can also come from
-        # whatever sits between shim and proxy — an Envoy restarting mid-request
-        # answers 503 with an HTML body, and a traceback here turns a transient
-        # sidecar blip into a shim crash the agent cannot read.
+    targets = [endpoint] + ([fallback] if fallback and fallback != endpoint else [])
+    # The body, and the requestId in it, is built once: a fallback or a retry
+    # re-sends the same request, so the broker's audit shows one request
+    # refused and then admitted rather than two. The Request object is new per
+    # attempt, and so is the connection under it, which is what lets another
+    # replica admit it. `attempts_made` counts the refusals the schedule has
+    # answered; a fallback is not one of them, since nothing reached a broker.
+    attempts_made = 0
+    started = clock()
+    deadline = retry_deadline_seconds()
+    while True:
         try:
-            payload = json.load(exc)
-        except (ValueError, TypeError):
-            print(
-                f"credential proxy error (HTTP {exc.code}): non-JSON response",
-                file=sys.stderr,
+            request = urllib.request.Request(
+                targets[0].rstrip("/") + EXEC_ROUTE,
+                data=body,
+                headers=headers,
+                method="POST",
             )
+        except ValueError as exc:
+            # A URL with no scheme, such as a bare Service name: nothing was
+            # sent, so a fallback is safe.
+            if len(targets) > 1:
+                print(EXEC_FALLBACK_NOTICE, file=sys.stderr)
+                targets = targets[1:]
+                continue
+            print(f"credential proxy unavailable: {exc}", file=sys.stderr)
             return 1
-        if payload.get("code") == "SECURITY_POLICY_BLOCKED":
-            print(
-                payload.get("message", "Command blocked for security reasons."),
-                file=sys.stderr,
-            )
-            print(f"policy rule: {payload.get('rule', 'unknown')}", file=sys.stderr)
-            # The verb the policy resolved and whether this was a local render:
-            # the agent runtime's refusal stop reads these two lines.
-            if payload.get("verb"):
-                # Each word is an argv token the agent chose; keep it to one line
-                # and to the characters a verb or resource name is made of.
-                words = (_VERB_WORD_SAFE_RE.sub("_", str(w))[:_VERB_WORD_MAX] for w in payload["verb"])
-                print(f"policy verb: {' '.join(words)}", file=sys.stderr)
-            if payload.get("local_render"):
-                print("policy render: local", file=sys.stderr)
-            return EXIT_SECURITY_POLICY_BLOCKED
-        print(payload.get("error", str(exc)), file=sys.stderr)
-        return 1
-    except urllib.error.URLError as exc:
-        print(f"credential proxy unavailable: {exc.reason}", file=sys.stderr)
-        return 1
+        try:
+            with open_broker_request(request) as response:
+                payload = json.load(response)
+            break
+        except urllib.error.HTTPError as exc:
+            payload = _refusal_payload(exc)
+            if exc.shim_dropped:
+                print(_DROPPED_LINE.format(cause="while the refusal was read"), file=sys.stderr)
+                return 1
+            if exec_refusal_retryable(exc.code, exc.headers, payload):
+                # Refused before the command ran, so sending it again runs
+                # nothing twice. The wait is what lets the broker that refused
+                # it admit it, and the new connection is what lets another
+                # replica; so the schedule runs whether or not exec routing is
+                # on. Every disconnect after the send, and every other status,
+                # falls through: the command may have run.
+                attempts_made += 1
+                text = refusal_text(payload)
+                delay = retry_wait(
+                    attempts_made, started, exc.headers.get(RETRY_AFTER_HEADER), rng, clock, deadline=deadline
+                )
+                if delay is None:
+                    report_throttled(exc.code, text, attempts_made)
+                    return 1
+                report_retry(exc.code, text, attempts_made, delay)
+                exc.close()
+                sleep_fn(delay)
+                continue
+            return _exec_refused(exc, payload)
+        except urllib.error.URLError as exc:
+            if isinstance(exc.reason, BrokerUnreachable) and len(targets) > 1:
+                print(EXEC_FALLBACK_NOTICE, file=sys.stderr)
+                targets = targets[1:]
+                continue
+            print(f"credential proxy unavailable: {exc.reason}", file=sys.stderr)
+            return 1
+        except (http.client.InvalidURL, UnicodeEncodeError) as exc:
+            # Raised while the connection, the request line or the Host header
+            # is built, before a socket opens: nothing was sent, so a fallback
+            # is safe. A reply is decoded, never encoded, so a UnicodeEncodeError
+            # here is the request's own.
+            if len(targets) > 1:
+                print(EXEC_FALLBACK_NOTICE, file=sys.stderr)
+                targets = targets[1:]
+                continue
+            print(f"credential proxy unavailable: {exc}", file=sys.stderr)
+            return 1
+        except (http.client.HTTPException, OSError) as exc:
+            # The request was sent and the connection dropped: the command may
+            # have run, so it is never sent again.
+            print(_DROPPED_LINE.format(cause=f"after the request was sent ({exc!r})"), file=sys.stderr)
+            return 1
 
     sys.stdout.write(payload.get("stdout", ""))
     sys.stderr.write(payload.get("stderr", ""))
-    if payload.get("truncated"):
-        print("credential proxy output truncated", file=sys.stderr)
+    truncated = bool(payload.get("truncated"))
+    # The exit code is for a cut payload. A broker older than the field says
+    # only that a stream was cut, and that is read as the payload.
+    stdout_cut = bool(payload.get("stdoutTruncated", truncated))
+    if truncated:
+        print(_truncated_marker(payload, stdout_cut), file=sys.stderr)
     generated = payload.get("kubeconfig")
+    if generated and os.environ.get("KUBE_PROXY_URL", "").strip():
+        generated = rewrite_kubeconfig_for_kube_proxy(generated)
     if implicit_destination and generated:
-        land_implicit_kubeconfig(generated)
+        if in_task:
+            report_task_kubeconfig(generated)
+        else:
+            land_implicit_kubeconfig(generated)
     if destination is not None and generated:
         # gcloud's own output, written where gcloud would have written it had it
         # run here. The agent never runs a command against this file — a later
@@ -860,11 +1791,27 @@ def execute(
         except OSError as exc:
             print(f"credential proxy: could not write {destination}: {exc}", file=sys.stderr)
             return 1
+    if stdout_cut:
+        # Whatever the command itself exited: a cut payload is not the
+        # command's answer, and exit 0 on one is what a caller reads as success.
+        return EXIT_OUTPUT_TRUNCATED
     return int(payload.get("exitCode", 1))
 
 
+def _truncated_marker(payload: dict, stdout_cut: bool) -> str:
+    """The stderr line for a cut reply: the bare marker when the broker gave no
+    counts (one older than the fields), the counts after it otherwise, and the
+    stderr-only form when the payload is whole and the cut fell on stderr."""
+    if not stdout_cut:
+        return OUTPUT_TRUNCATED_MARKER + OUTPUT_TRUNCATED_STDERR_ONLY
+    kept, limit = payload.get("bytesWritten"), payload.get("limit")
+    if isinstance(kept, int) and isinstance(limit, int) and not isinstance(kept, bool) and not isinstance(limit, bool):
+        return OUTPUT_TRUNCATED_MARKER + OUTPUT_TRUNCATED_COUNTS.format(limit=limit, kept=kept, code=EXIT_OUTPUT_TRUNCATED)
+    return OUTPUT_TRUNCATED_MARKER
+
+
 class WorkspaceUnavailable(RuntimeError):
-    """The broker does not have content workspaces armed."""
+    """The broker has no version control built (`VCS_UNAVAILABLE`)."""
 
 
 class BrokerDisconnected(RuntimeError):
@@ -891,58 +1838,30 @@ class WorkspaceRequestError(RuntimeError):
     """The broker refused. `status` and `payload` carry its answer verbatim."""
 
     def __init__(self, status: int, payload: dict) -> None:
-        # Two spellings of the same field, because the broker has two error
-        # shapes: a refusal from `ContentWorkspaceError` answers `{status,
-        # code, message}`, while a malformed body answers `{error}`. Reading
+        # Two spellings of the same field: the vcs routes answer `{error,
+        # code}`, and a broker policy refusal answers `{status, code,
+        # message}`. Reading
         # only one of them would render half the broker's refusals as the
         # generic fallback below, which is the sentence that tells a caller
         # nothing.
         super().__init__(
             payload.get("message")
             or payload.get("error")
-            or f"workspace request failed ({status})"
+            or f"broker request failed ({status})"
         )
         self.status = status
         self.payload = payload
 
 
-class Listing(list):
-    """The entries `list` returned, plus what it did not return.
-
-    A plain list, so every existing caller keeps working, carrying the two
-    fields that say whether it is the whole answer. A listing that stops at the
-    broker's ceiling and looks complete is how a caller ends up asking `read`
-    for a path it inferred rather than one it saw. `symlinks` names the files
-    in the page's range that `read` refuses and so are never entries, and
-    `symlinked_directories` the links to directories the listing does not
-    enter, each a `{"path", "target"}` mapping.
-    """
-
-    def __init__(
-        self,
-        entries,
-        total: int = 0,
-        truncated: bool = False,
-        symlinks=(),
-        symlinked_directories=(),
-    ) -> None:
-        super().__init__(entries)
-        self.total = total or len(self)
-        self.truncated = truncated
-        # Symlinked files in this page's range, which `read` refuses and so
-        # are never entries; a broker older than the field reports none.
-        self.symlinks = list(symlinks)
-        self.symlinked_directories = list(symlinked_directories)
-
-
 def default_caller_label() -> str:
-    """The card or session id this process runs under, or "" when it has none.
+    """The card, scheduled run or session id this process runs under, or ""
+    when it has none.
 
     Read at call time, like `session_lease` in the skill, because the agent
     runs each command in a fresh process and the identity lives in its
     environment. A value the broker's grammar would refuse is dropped here:
-    the label exists so the log can name who filled the store, and it must
-    never be the reason an open fails.
+    the key exists so the broker can count a run's commands, and it must
+    never be the reason a command fails.
     """
     for name in CALLER_LABEL_ENV:
         value = os.environ.get(name, "").strip()
@@ -951,301 +1870,12 @@ def default_caller_label() -> str:
     return ""
 
 
-class Workspace:
-    """A git repository the broker owns and this process cannot see.
-
-    There is no path anywhere in this class, which is the point. A caller says
-    "write these bytes to `manifests/app.yaml` and commit them"; it never learns
-    where that file lands, so it cannot be talked into reading or writing
-    anything else there -- including `.git/config`, which is where a filter
-    driver or a hook path would have to be defined for the sixteen known
-    code-execution routes to work.
-
-    Typical use, replacing a clone/add/commit/push sequence:
-
-        with Workspace.open(endpoint, "acme/infra") as workspace:
-            current = workspace.read_text("manifests/app.yaml")
-            workspace.commit(
-                branch="fix/replicas",
-                message="raise replicas",
-                changes={"manifests/app.yaml": patched.encode()},
-            )
-            workspace.push()
-    """
-
-    def __init__(self, endpoint: str, opened: dict) -> None:
-        self.endpoint = endpoint
-        self.handle = opened["handle"]
-        self.repo = opened["repo"]
-        self.base = opened["base"]
-        self.base_sha = opened["baseSha"]
-        self.branch_sha = opened.get("branchSha", "")
-        self.started_from = opened.get("startedFrom", "")
-        self.shallow = bool(opened.get("shallow", False))
-        self.branch: str | None = None
-        self._closed = False
-
-    @classmethod
-    def open(
-        cls,
-        endpoint: str,
-        repo: str,
-        base: str | None = None,
-        branch: str | None = None,
-        depth: int | None = None,
-        caller: str | None = None,
-    ) -> "Workspace":
-        """`branch` names the branch this session will commit to, if known.
-
-        `caller` labels the workspace in the broker's log; left None, it is the
-        card or session id from the environment (`default_caller_label`).
-
-        Naming it decides what `read` and `list` answer with: when the branch
-        already exists on the remote -- a second round of review feedback -- the
-        broker checks that out rather than the base, so a file read here is the
-        file as the pull request has it.
-
-        `depth` opens a shallow single-branch clone for reading. The broker
-        refuses `commit` on one and refuses `depth` together with `branch`.
-        """
-        payload = {"repo": repo}
-        if base:
-            payload["base"] = base
-        if branch:
-            payload["branch"] = branch
-        if depth:
-            payload["depth"] = depth
-        label = default_caller_label() if caller is None else caller
-        if label:
-            payload["caller"] = label
-        return cls(endpoint, _workspace_call(endpoint, "open", payload))
-
-    def read(self, path: str) -> bytes:
-        result = _workspace_call(
-            self.endpoint, "read", {"handle": self.handle, "path": path}
-        )
-        return base64.b64decode(result["contentBase64"])
-
-    def read_text(self, path: str, encoding: str = "utf-8") -> str:
-        return self.read(path).decode(encoding)
-
-    def read_many(self, paths: list[str]) -> tuple[dict[str, bytes], list[dict]]:
-        """Several files in one round trip.
-
-        Returns what came back and what did not, the second as the broker's own
-        `{path, reason}` records. A caller that ignores the second half will
-        materialise a partial tree and not know it -- `requestBudget` means ask
-        again for the rest, `tooLarge` means that file is never coming, and
-        `symlink` means the file is there but the broker will not follow a link
-        to it, so ask for the target's own name.
-        """
-        result = _workspace_call(
-            self.endpoint, "read", {"handle": self.handle, "paths": list(paths)}
-        )
-        files = {
-            entry["path"]: base64.b64decode(entry["contentBase64"])
-            for entry in result.get("files", [])
-        }
-        return files, result.get("skipped", [])
-
-    def list(self, prefix: str | None = None, after: str | None = None) -> Listing:
-        """One page of tracked names. `after` is the last path of the page before.
-
-        `total` on the result counts what is still in scope after the cursor, so
-        a caller pages until `truncated` is false. `symlinks` on the result
-        names the symlinked files the page's range holds, each once across the
-        pages; a caller rebuilding the tree needs them to know what it lacks,
-        and `symlinked_directories` the links to directories with their targets.
-        """
-        payload = {"handle": self.handle}
-        if prefix:
-            payload["prefix"] = prefix
-        if after:
-            payload["after"] = after
-        result = _workspace_call(self.endpoint, "list", payload)
-        return Listing(
-            result.get("entries", []),
-            total=result.get("total", 0),
-            truncated=bool(result.get("truncated")),
-            symlinks=result.get("symlinks") or [],
-            symlinked_directories=result.get("symlinkedDirectories") or [],
-        )
-
-    def grep(
-        self,
-        pattern: str,
-        prefix: str | None = None,
-        regex: bool = False,
-        ignore_case: bool = False,
-    ) -> dict:
-        """Search the checked-out tree. Fixed-string unless `regex` is set.
-
-        The whole answer, `{matches, total, truncated}`, rather than the matches
-        alone: a search that hit the broker's ceiling and looks complete sends a
-        reader off with a wrong conclusion about the repository.
-        """
-        payload = {"handle": self.handle, "pattern": pattern}
-        if prefix:
-            payload["prefix"] = prefix
-        if regex:
-            payload["regex"] = True
-        if ignore_case:
-            payload["ignoreCase"] = True
-        return _workspace_call(self.endpoint, "grep", payload)
-
-    def commit(
-        self,
-        branch: str,
-        message: str,
-        changes: dict[str, bytes | None],
-        expected_base_sha: str | None = None,
-        expected_branch_sha: str | None = None,
-    ) -> dict:
-        """`changes` maps a repository-relative path to bytes, or to None to delete.
-
-        Pass `expected_base_sha` (normally `self.base_sha`) to have the broker
-        refuse with 409 when the base branch has moved under a file this commit
-        also writes. Leaving it out means last-writer-wins against whatever
-        landed in the meantime.
-
-        The working branch is checked the same way and needs no argument: the
-        broker compares against the sha it last saw for that branch, which is
-        the only place the value exists. `expected_branch_sha` overrides it for
-        a caller that learned the sha somewhere else.
-        """
-        entries = []
-        for path, content in changes.items():
-            if content is None:
-                entries.append({"path": path, "delete": True})
-            else:
-                entries.append(
-                    {
-                        "path": path,
-                        "contentBase64": base64.b64encode(content).decode("ascii"),
-                    }
-                )
-        payload = {
-            "handle": self.handle,
-            "branch": branch,
-            "message": message,
-            "changes": entries,
-        }
-        if expected_base_sha:
-            payload["expectedBaseSha"] = expected_base_sha
-        if expected_branch_sha:
-            payload["expectedBranchSha"] = expected_branch_sha
-        result = _workspace_call(self.endpoint, "commit", payload)
-        self.branch = result["branch"]
-        # `committed: false` is an ordinary answer rather than an error -- a
-        # re-run whose fix is already on the branch has nothing to add -- and it
-        # carries neither a sha nor a commit. Callers read the flag; reading
-        # `result["commit"]` unconditionally is how that case turns into a
-        # KeyError several frames from the decision that produced it.
-        if result.get("baseSha"):
-            self.base_sha = result["baseSha"]
-        if result.get("branchSha") is not None:
-            self.branch_sha = result["branchSha"]
-        return result
-
-    def push(self, branch: str | None = None) -> dict:
-        branch = branch or self.branch
-        if not branch:
-            raise ValueError("nothing has been committed on this workspace yet")
-        result = _workspace_call(
-            self.endpoint, "push", {"handle": self.handle, "branch": branch}
-        )
-        if result.get("branchSha"):
-            self.branch_sha = result["branchSha"]
-        return result
-
-    def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        _workspace_call(self.endpoint, "close", {"handle": self.handle})
-
-    def __enter__(self) -> "Workspace":
-        return self
-
-    def __exit__(self, *_exc) -> None:
-        # Best effort: a failure to clean up a broker-side tree must not mask
-        # the exception that is already propagating out of the with-block.
-        try:
-            self.close()
-        except Exception:
-            pass
-
-
-def workspaces_available(endpoint: str) -> bool:
-    """Whether this broker has content workspaces armed.
-
-    Both mechanisms run side by side while the skills migrate, so a caller that
-    can do either asks first rather than assuming.
-    """
-    try:
-        _workspace_call(endpoint, "open", {"repo": ""})
-    except WorkspaceUnavailable:
-        return False
-    except WorkspaceRequestError as exc:
-        # 401 is the one status that says nothing about the route: the broker
-        # rejects the caller before it looks at the path, so a client with no
-        # token would read "workspaces are armed" off a broker that never
-        # reached the question. Every other status is an answer about the
-        # payload, and an answer about the payload means the route exists.
-        #
-        # Reported live: a sandbox with no CREDENTIAL_PROXY_TOKEN_FILE saw this
-        # return True and then failed on the first real verb.
-        if exc.status == 401:
-            return False
-        return True
-    except TokenUnavailable:
-        # No token to present, so nothing here is reachable whatever the broker
-        # is serving.
-        return False
-    except urllib.error.URLError:
-        return False
-    return True
-
-
-def _workspace_call(endpoint: str, verb: str, payload: dict) -> dict:
-    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
-    # The same credential and the same opener `execute` uses. These routes
-    # spend the broker's GitHub token exactly as /v1/exec does, so a
-    # cross-Pod call that omitted the header would earn a 401, and one that
-    # went through the stock opener would carry a total socket timeout onto a
-    # clone that legitimately runs for minutes.
-    headers.update(authorization_headers())
-    request = urllib.request.Request(
-        endpoint.rstrip("/") + f"/v1/workspace/{verb}",
-        data=body,
-        headers=headers,
-        method="POST",
-    )
-    try:
-        with open_broker_request(request) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as exc:
-        try:
-            answer = json.load(exc)
-        except (ValueError, TypeError):
-            raise WorkspaceRequestError(exc.code, {"error": f"HTTP {exc.code}"}) from exc
-        if answer.get("code") == "CONTENT_WORKSPACES_DISABLED":
-            raise WorkspaceUnavailable(answer.get("error", "not enabled")) from exc
-        raise WorkspaceRequestError(exc.code, answer) from exc
-
-
 def vcs_call(endpoint: str, verb: str, payload: dict) -> dict:
     """One `POST /v1/vcs/<verb>`.
 
-    Its own function rather than a parameter on `_workspace_call`, because the
-    two namespaces are different protocols that happen to share a transport:
-    every `/v1/vcs/*` call stands alone and holds nothing across a session.
-    Folding them together would put a `handle` argument on routes that have
-    none and invite a caller to hold one.
-
-    Public, unlike its neighbour, because the version-control skill is the
-    caller and it lives outside this module.
+    Every `/v1/vcs/*` call stands alone and holds nothing across a session.
+    Public, because the version-control skill is the caller and it lives
+    outside this module.
     """
     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     headers = {"Content-Type": "application/json"}
@@ -1304,7 +1934,8 @@ class ApiSession:
     rewrites `https://<host>/<path>` onto the broker's `/v1/gcp/<host>/<path>`
     route and attaches the caller token; the broker checks the read against
     `api_policy.API_READ_ROUTES`, forwards it on its own credential, and hands
-    back the upstream status, `Content-Type` and body unchanged. A refusal
+    back the upstream status, `Content-Type` and body unchanged (or, on a route
+    with a projection, a 2xx body cut down to the fields it names). A refusal
     arrives as a 403 whose JSON body carries `rule` and `message`, the same
     shape `/v1/exec` uses.
 
@@ -1317,35 +1948,176 @@ class ApiSession:
     already holds a configured session.
     """
 
-    def __init__(self, endpoint: str | None = None, http=None) -> None:
-        endpoint = endpoint or os.environ.get("CREDENTIAL_PROXY_URL", "")
+    def __init__(
+        self, endpoint: str | None = None, http=None, *, sleep_fn=time.sleep, rng=random, clock=time.monotonic
+    ) -> None:
+        # A named endpoint is used as given. Otherwise the relay is an exec-tier
+        # route, with the stateful broker as the fallback (`exec_endpoints`).
+        fallback = None
+        if not endpoint:
+            endpoint, fallback = exec_endpoints()
         if not endpoint:
             raise RuntimeError(
-                "CREDENTIAL_PROXY_URL is not set; the credential broker is the only "
+                f"{BROKER_URL_ENV} is not set; the credential broker is the only "
                 "path from here to a Google API"
             )
         self._endpoint = endpoint.rstrip("/")
+        self._fallback = fallback.rstrip("/") if fallback else None
+        # Fleet collectors share one session across a thread pool.
+        self._lock = threading.Lock()
         if http is None:
             import requests
 
             http = requests.Session()
+            # No proxy from the environment, as for the broker opener: through
+            # a proxy every connect succeeds, and the fallback would never fire.
+            http.trust_env = False
         self._http = http
+        self._sleep = sleep_fn
+        self._rng = rng
+        self._clock = clock
 
-    def relay_url(self, url: str) -> str:
+    def relay_url(self, url: str, endpoint: str | None = None) -> str:
         """The broker URL that stands for `url`; the query is kept where it was."""
         parsed = urllib.parse.urlsplit(url)
-        relayed = f"{self._endpoint}{API_RELAY_PREFIX}{parsed.netloc}{parsed.path}"
+        relayed = f"{endpoint or self._endpoint}{API_RELAY_PREFIX}{parsed.netloc}{parsed.path}"
         if parsed.query:
             relayed += f"?{parsed.query}"
         return relayed
 
     def get(self, url: str, *, params=None, timeout=None):
-        return self._http.get(
-            self.relay_url(url),
-            params=params,
-            headers=authorization_headers(),
-            timeout=timeout,
-        )
+        """One relayed GET, sent again on the shim's schedule if the broker itself refuses it.
+
+        Only the broker's own refusal is retried (`busy_reply_retryable`: a
+        body whose top-level `code` is its busy or resource-pressure code). The
+        relay route takes no admission slot today and answers neither, so this
+        loop is dormant until a broker refuses the relay under pressure; it is
+        here so the collectors need no change when one does. Each send goes
+        through `_get_once`, so a retry falls back with the session. A 429 or 503 the
+        upstream Google API returned comes back with its body unchanged, whose
+        `code` is nested under `error`, and is handed to the caller as it is:
+        the collectors that make hundreds of these calls own their own pacing
+        for a quota refusal.
+        """
+        attempts_made = 0
+        started = self._clock()
+        deadline = retry_deadline_seconds()
+        while True:
+            response = self._get_once(url, params=params, timeout=timeout)
+            attempts_made += 1
+            if not self._refused_admission(response):
+                return response
+            retry_after = getattr(response, "headers", {}).get(RETRY_AFTER_HEADER)
+            delay = retry_wait(attempts_made, started, retry_after, self._rng, self._clock, deadline=deadline)
+            if delay is None:
+                return response
+            report_retry(response.status_code, refusal_text(self._json_body(response)), attempts_made, delay)
+            self._sleep(delay)
+            if (self._json_body(response) or {}).get(BUSY_BOUND_KEY) == ADMISSION_BOUND_DRAINING:
+                # A draining exec pod keeps answering this on the pooled
+                # keep-alive connection to its Envoy, so the retry would go back
+                # to it. A new connection reaches a ready replica, or fails over
+                # to the stateful broker.
+                self._drop_pooled_connections()
+
+    def _drop_pooled_connections(self) -> None:
+        close = getattr(self._http, "close", None)
+        if close is not None:
+            with self._lock:
+                close()
+
+    @staticmethod
+    def _json_body(response):
+        try:
+            return response.json()
+        except (ValueError, AttributeError):
+            return None
+
+    def _refused_admission(self, response) -> bool:
+        status = getattr(response, "status_code", None)
+        if status not in (http.HTTPStatus.TOO_MANY_REQUESTS, http.HTTPStatus.SERVICE_UNAVAILABLE):
+            return False
+        return busy_reply_retryable(self._json_body(response))
+
+    def _get_once(self, url: str, *, params=None, timeout=None):
+        """One relayed GET, moved to the stateful broker when the exec tier cannot be reached."""
+        caller_timeout = timeout
+        started = time.monotonic()
+        with self._lock:
+            endpoint, exec_attempt = self._endpoint, self._fallback is not None
+        if exec_attempt:
+            # The exec tier gets the shim's connect bound, as `BrokerConnection`
+            # gives it, whatever the caller's timeout; the read keeps the
+            # caller's. A missing egress peer hangs the dial rather than
+            # refusing it.
+            timeout = _exec_connect_bound(timeout)
+        try:
+            return self._http.get(
+                self.relay_url(url, endpoint),
+                params=params,
+                headers=authorization_headers(),
+                timeout=timeout,
+            )
+        except _connection_errors() as exc:
+            with self._lock:
+                if self._endpoint == endpoint and self._fallback is not None:
+                    # The first reader to fail moves the session. Every relay
+                    # call is a GET, so sending it again is safe even when the
+                    # error came after the request left, and the rest of the
+                    # session stays on the stateful broker: a missing exec
+                    # Service would otherwise cost each read its connect bound.
+                    self._endpoint, self._fallback = self._fallback, None
+                    print(f"{EXEC_FALLBACK_NOTICE} for the Cloud API relay ({exc})", file=sys.stderr)
+                moved = self._endpoint != endpoint
+            if not moved:
+                raise
+            # The caller sized its timeout for one attempt; the fallback gets
+            # what the exec attempt left of it.
+            left = _time_left(caller_timeout, time.monotonic() - started)
+            if left is False:
+                raise
+            return self._get_once(url, params=params, timeout=left)
+
+
+def _exec_connect_bound(timeout):
+    """A `requests` timeout whose connect part is at most the shim's connect bound."""
+    if isinstance(timeout, tuple):
+        connect, read = timeout
+    else:
+        connect, read = timeout, timeout
+    bound = BROKER_CONNECT_TIMEOUT_SECONDS if connect is None else min(connect, BROKER_CONNECT_TIMEOUT_SECONDS)
+    return (bound, read)
+
+
+def _time_left(timeout, spent: float):
+    """`timeout` less `spent` seconds of read time, or False when too little is left."""
+    if timeout is None:
+        return None
+    if isinstance(timeout, tuple):
+        connect, read = timeout
+        if read is None:
+            return timeout
+        left = read - spent
+        return (connect, left) if left >= RELAY_FALLBACK_MIN_SECONDS else False
+    left = timeout - spent
+    return left if left >= RELAY_FALLBACK_MIN_SECONDS else False
+
+
+def _connection_errors() -> tuple[type[BaseException], ...]:
+    """The errors a `requests` session raises when the relay cannot be reached."""
+    try:
+        import requests
+    except ImportError:
+        return (ConnectionError,)
+    # The URL errors are raised while the request is prepared, before a byte is
+    # sent, so moving to the fallback is as safe as for a connection error.
+    return (
+        requests.exceptions.ConnectionError,
+        requests.exceptions.InvalidURL,
+        requests.exceptions.MissingSchema,
+        requests.exceptions.InvalidSchema,
+        ConnectionError,
+    )
 
 
 def read_stdin_if_requested(argv: list[str]) -> str | None:
@@ -1367,10 +2139,14 @@ def read_stdin_if_requested(argv: list[str]) -> str | None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+    # No default: a named endpoint is used as given, with no exec routing and
+    # no fallback, and an unnamed one is resolved by `exec_endpoints`. Read from
+    # the environment here, not through `exec_endpoints`, which would write its
+    # malformed-URL line even when an endpoint is named.
     parser.add_argument(
         "--endpoint",
-        default=os.getenv("CREDENTIAL_PROXY_URL"),
-        required=os.getenv("CREDENTIAL_PROXY_URL") is None,
+        default=None,
+        required=not os.getenv(EXEC_URL_ENV, "").strip() and os.getenv(BROKER_URL_ENV) is None,
     )
     parser.add_argument(
         "executable",
@@ -1381,17 +2157,23 @@ def parse_args() -> argparse.Namespace:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) >= 2 and sys.argv[1] == "--ensure-kubectl-context":
+        ensure_kube_proxy_context_for_argv(["kubectl", *sys.argv[2:]])
+        raise SystemExit(0)
     invoked_as = os.path.basename(sys.argv[0])
+    fallback = None
     if invoked_as in set(SUPPORTED_EXECUTABLES):
-        endpoint = os.getenv("CREDENTIAL_PROXY_URL")
+        endpoint, fallback = exec_endpoints()
         if endpoint is None:
-            print("CREDENTIAL_PROXY_URL is not configured", file=sys.stderr)
+            print(f"{BROKER_URL_ENV} is not configured", file=sys.stderr)
             raise SystemExit(1)
         argv = [invoked_as, *sys.argv[1:]]
         stdin = read_stdin_if_requested(argv)
     else:
         args = parse_args()
         endpoint = args.endpoint
+        if endpoint is None:
+            endpoint, fallback = exec_endpoints()
         argv = [args.executable, *args.arguments]
         stdin = read_stdin_if_requested(argv)
     raise SystemExit(
@@ -1399,5 +2181,6 @@ if __name__ == "__main__":
             endpoint,
             argv,
             stdin=stdin,
+            fallback=fallback,
         )
     )

@@ -97,6 +97,23 @@ const (
 	workerMemoryRequest = "512Mi"
 	workerCPULimit      = "2"
 	workerMemoryLimit   = "2Gi"
+	// The scratch emptyDir is the harness's working directory (the worker
+	// adapter's defaultWorkdir), so files the model writes land there, as
+	// do the delegate socket and, with SessionClusterView, HERMES_HOME's
+	// kubeconfig files. No clone can: the image carries no git, and the
+	// agent SDK keeps its transcripts under $HOME, in the writable layer.
+	// Sessions measured on dev lanes over seven days (2026-10-22, 30-40
+	// minutes each) left it at 4 KiB. 1Gi is the floor for a workspace an
+	// agent writes into, and Autopilot's default ephemeral-storage request
+	// per container, so it bounds a Standard node at the figure Autopilot
+	// already enforces there. The request is the volume plus 64Mi for the
+	// container's own logs and writable layer (2.2 MiB measured), and the
+	// limit equals it: a namespace ResourceQuota on
+	// requests.ephemeral-storage refuses a pod without a request, and a
+	// LimitRange defaulting a smaller limit would refuse a request with no
+	// limit of its own.
+	workerScratchSizeLimit        = "1Gi"
+	workerEphemeralStorageRequest = "1088Mi"
 	// sessionNameHexWidth suffixes minted session names — wide enough that
 	// two conversations can't plausibly collide onto one addressee.
 	// supervisorCorrHexWidth suffixes the fallback correlation id a
@@ -457,12 +474,14 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 				},
 				Resources: corev1.ResourceRequirements{
 					Requests: corev1.ResourceList{
-						corev1.ResourceCPU:    resource.MustParse(workerCPURequest),
-						corev1.ResourceMemory: resource.MustParse(workerMemoryRequest),
+						corev1.ResourceCPU:              resource.MustParse(workerCPURequest),
+						corev1.ResourceMemory:           resource.MustParse(workerMemoryRequest),
+						corev1.ResourceEphemeralStorage: resource.MustParse(workerEphemeralStorageRequest),
 					},
 					Limits: corev1.ResourceList{
-						corev1.ResourceCPU:    resource.MustParse(workerCPULimit),
-						corev1.ResourceMemory: resource.MustParse(workerMemoryLimit),
+						corev1.ResourceCPU:              resource.MustParse(workerCPULimit),
+						corev1.ResourceMemory:           resource.MustParse(workerMemoryLimit),
+						corev1.ResourceEphemeralStorage: resource.MustParse(workerEphemeralStorageRequest),
 					},
 				},
 				VolumeMounts: []corev1.VolumeMount{
@@ -479,7 +498,7 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 			Volumes: []corev1.Volume{
 				{
 					Name:         "scratch",
-					VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+					VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse(workerScratchSizeLimit))}},
 				},
 				// The transcript primer, read by the worker before its
 				// first turn (lib.EnvPrimerFile). The annotation is the
@@ -554,6 +573,9 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 			corev1.EnvVar{Name: "HERMES_HOME", Value: sessionHermesHome},
 			corev1.EnvVar{Name: lib.EnvClusterView, Value: "true"},
 		)
+		if s.cfg.CredentialProxyExecURL != "" {
+			c.Env = append(c.Env, corev1.EnvVar{Name: "CREDENTIAL_PROXY_EXEC_URL", Value: s.cfg.CredentialProxyExecURL})
+		}
 		c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{Name: credentialProxyTokenVolume, MountPath: credentialProxyTokenMountPath, ReadOnly: true})
 		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
 			Name: credentialProxyTokenVolume,
@@ -684,9 +706,16 @@ func (s *podSpawner) Reusable(ctx context.Context, podName string) (bool, error)
 
 // busTransport is the stamp annoBusTransport carries: a digest of the NATS
 // URL and the CA file path the spawner hands a pod, which is what changes when
-// the bus moves to TLS.
+// the bus moves to TLS. The exec tier's address joins it when the spawner
+// hands a pod one: a pod spawned with another address, or none, would keep
+// sending commands where the tier no longer is, or past it. A spawner that
+// hands none keeps the stamp its pods already carry.
 func (s *podSpawner) busTransport() string {
-	sum := sha256.Sum256([]byte(s.cfg.NATSURL + "\n" + s.cfg.NATSCAFile))
+	stamped := s.cfg.NATSURL + "\n" + s.cfg.NATSCAFile
+	if s.cfg.SessionClusterView && s.cfg.CredentialProxyExecURL != "" {
+		stamped += "\n" + s.cfg.CredentialProxyExecURL
+	}
+	sum := sha256.Sum256([]byte(stamped))
 	return hex.EncodeToString(sum[:])[:busTransportLength]
 }
 

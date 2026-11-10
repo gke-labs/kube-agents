@@ -4,8 +4,8 @@
 Run: cd scripts && python3 -m unittest test_merge_gate
 
 The two wrong answers cost differently. A gate that passes when Tide would
-not merges a pull request that is unapproved or unsmoked; a gate
-that holds when Tide would merge leaves a ready pull request out of the queue
+not have merged lets in a pull request that is unapproved or unsmoked; a gate
+that holds when Tide would have merged leaves a ready pull request out of the queue
 with nothing on it saying why. So each verdict gets both sides, the smoke
 skip list is checked against the paths Prow skips, and the queue branch is
 parsed from the shape GitHub names it.
@@ -23,7 +23,6 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 import merge_gate as gate
-import pin_smoke_status
 
 REPO = "gke-labs/kube-agents"
 SHA = "a" * 40
@@ -112,15 +111,15 @@ class LabelsTest(unittest.TestCase):
         self.assertEqual(state, gate.PENDING)
         self.assertIn("lgtm", description)
 
-    def test_each_label_tide_excludes_holds(self):
+    def test_each_label_tide_excluded_holds(self):
         for hold in ("do-not-merge", "do-not-merge/hold", "do-not-merge/invalid-owners-file", "do-not-merge/work-in-progress"):
             with self.subTest(label=hold):
                 state, description = gate.labels_verdict(APPROVED | {hold})
                 self.assertEqual(state, gate.PENDING)
                 self.assertIn(hold, description)
 
-    def test_a_do_not_merge_label_tide_does_not_exclude_does_not_hold(self):
-        """Holding on it would keep a pull request out of the queue that Tide merges today."""
+    def test_a_do_not_merge_label_tide_did_not_exclude_does_not_hold(self):
+        """Holding on it would keep a pull request out of the queue that Tide would have merged."""
         for label in ("do-not-merge/release-note", "do-not-merge-ish"):
             with self.subTest(label=label):
                 self.assertEqual(gate.labels_verdict(APPROVED | {label})[0], gate.SUCCESS)
@@ -146,13 +145,13 @@ class SmokeTest(unittest.TestCase):
         self.assertEqual(results[gate.SMOKE_GATE][0], gate.PENDING)
 
     def test_no_smoke_on_skipped_paths_passes(self):
-        """Prow posts no smoke status on these, and Tide does not wait for one."""
+        """Prow posts no smoke status on these, and Tide did not wait for one."""
         files = ["docs/a.md", ".github/workflows/x.yml", "README.md", "scripts/test_x.py", "OWNERS", "install.sh"]
         results = gate.verdicts(pull(), lambda: files)
         self.assertEqual(results[gate.SMOKE_GATE][0], gate.SUCCESS)
 
     def test_a_red_or_running_smoke_on_skipped_paths_still_decides(self):
-        """A hand-run `/test` posts a smoke status on a skip-only change; Tide holds on its red."""
+        """A hand-run `/test` posts a smoke status on a skip-only change; Tide held on its red."""
         for state, expected in (("failure", gate.FAILURE), ("pending", gate.PENDING)):
             with self.subTest(state=state):
                 statuses = {gate.SMOKE_CONTEXT: (state, "")}
@@ -166,6 +165,18 @@ class SmokeTest(unittest.TestCase):
         for path in ("scripts/x.py", "scripts/sub/test_x.py", "docs.md/x", "agents/a.md", "install.sh.bak"):
             with self.subTest(path=path):
                 self.assertTrue(gate.smoke_required([path]))
+
+    def test_a_k8s_api_proxy_change_runs_the_smoke(self):
+        """Now that sandbox kubectl routes through kube-proxy, k8s-api-proxy changes run the smoke test."""
+        for files in (
+            ["k8s-api-proxy/go.mod", "k8s-api-proxy/pkg/k8sapiproxy/policy.go"],
+            ["k8s-api-proxy/go.mod", "deploy/sandbox/Dockerfile"],
+            ["k8s-api-proxy/go.mod", "deploy/kube-proxy/Dockerfile"],
+            ["k8s-api-proxyx/main.go"],
+            ["a2a/k8s-api-proxy/x.go"],
+        ):
+            with self.subTest(files=files):
+                self.assertTrue(gate.smoke_required(files))
 
     def test_an_overlong_file_list_needs_the_smoke_and_an_empty_one_does_not(self):
         """Prow skips a `skip_if_only_changed` job when no file changed."""
@@ -219,7 +230,7 @@ class CutoffTest(unittest.TestCase):
         self.assertEqual(skipped[gate.SMOKE_GATE][0], gate.SUCCESS)
 
     def test_a_re_pin_copy_counts_from_the_builds_first_report(self):
-        """A re-pin after the cutoff is a fresh copy of a green from before it."""
+        """A re-pin after the cutoff was a fresh copy of a green from before it."""
         api = FakeAPI(all_statuses=[smoke_status("2026-10-23T19:00:00Z"), smoke_status("2026-10-23T12:00:00Z")])
         self.assertEqual(gate.smoke_first_reported(api, SHA), datetime(2026, 10, 23, 12, 0, tzinfo=timezone.utc))
 
@@ -234,7 +245,7 @@ class CutoffTest(unittest.TestCase):
         self.assertEqual(gate.smoke_first_reported(api, SHA), datetime(2026, 10, 23, 19, 0, tzinfo=timezone.utc))
 
     def test_a_status_with_no_build_link_counts_from_the_earliest_with_none(self):
-        """A re-pin copies a link-less green with a new time; the copy must not pass for a new verdict."""
+        """A re-pin copied a link-less green with a new time; the copy must not pass for a new verdict."""
         api = FakeAPI(
             all_statuses=[
                 smoke_status("2026-10-23T19:00:00Z", target_url=""),
@@ -254,7 +265,7 @@ class CutoffTest(unittest.TestCase):
             with self.subTest(statuses=statuses):
                 self.assertIsNone(gate.smoke_first_reported(FakeAPI(all_statuses=statuses), SHA))
 
-    def test_the_variable_is_read_as_pin_smoke_status_reads_it(self):
+    def test_the_variable_is_read_as_a_utc_time(self):
         for raw, want in (("", None), ("  ", None), ("2026-10-23T18:00:00Z", CUTOFF), ("2026-10-23T14:00:00-04:00", CUTOFF)):
             with self.subTest(raw=raw):
                 self.assertEqual(gate.not_before_from_env({gate.NOT_BEFORE_ENV: raw}), want)
@@ -276,7 +287,7 @@ class CutoffTest(unittest.TestCase):
             self.assertEqual(gate.main(["--repo", REPO, "group", "--ref", "x", "--gate", gate.LABELS_GATE]), 0)
         self.assertIsNone(group.call_args.kwargs["not_before"])
 
-    def test_a_green_pin_smoke_status_expired_waits_with_or_without_the_variable(self):
+    def test_an_expired_green_waits_with_or_without_the_variable(self):
         def unread():
             raise AssertionError("the status history was read for an expired green")
 
@@ -286,9 +297,9 @@ class CutoffTest(unittest.TestCase):
                 results = gate.verdicts(pull(statuses=expired), no_files, not_before, unread)
                 self.assertEqual(results[gate.SMOKE_GATE], (gate.PENDING, gate.SMOKE_PREDATES))
 
-    def test_the_expired_note_is_the_one_pin_smoke_status_writes(self):
-        self.assertEqual(gate.SMOKE_EXPIRED_NOTE, pin_smoke_status.EXPIRED_NOTE)
-        self.assertIn(gate.SMOKE_EXPIRED_NOTE, pin_smoke_status.expired_description("x" * 200))
+    def test_the_expired_note_is_the_one_on_existing_statuses(self):
+        # The retired pin_smoke_status.py wrote this note; greens that carry it stay on old heads.
+        self.assertEqual(gate.SMOKE_EXPIRED_NOTE, "(predates SMOKE_PIN_NOT_BEFORE: retest)")
 
     def test_the_queue_refuses_a_green_from_before_the_cutoff(self):
         raw = {"number": 42, "head": {"sha": SHA}, "base": {"ref": "main"}, "labels": []}
@@ -321,7 +332,7 @@ class PostTest(unittest.TestCase):
         self.assertTrue(all(path == f"/repos/{REPO}/statuses/{SHA}" for path, _ in api.posts))
 
     def test_a_non_green_verdict_is_not_posted_over_nothing(self):
-        """Tide holds on any non-green context, so a first pending would hold a Tide merge."""
+        """Tide held on any non-green context, so a first pending would have held a Tide merge."""
         api = FakeAPI()
         gate.gate_pull(api, pull({"lgtm"}, statuses=green(gate.SMOKE_CONTEXT)))
         self.assertEqual([payload["context"] for _, payload in api.posts], [gate.SMOKE_GATE])
@@ -500,6 +511,41 @@ def node(number, labels, auto_merge=False, queue_entry=None, contexts=(), timeli
             "statusCheckRollup": {"contexts": {"nodes": list(contexts)}},
         }}]},
     }
+
+
+class PullsQueryTest(unittest.TestCase):
+    """The open-PR query pages small enough to answer, and reads every page."""
+
+    def test_the_page_size_is_below_the_size_that_timed_out(self):
+        # The sweep 504'd at 50; the fix is a smaller page, not more retries.
+        self.assertLess(gate.PULLS_PAGE_SIZE, 50)
+        self.assertGreaterEqual(gate.PULLS_PAGE_SIZE, 1)
+
+    def test_the_query_graphql_pulls_sends_asks_for_the_page_size(self):
+        # Drives the call site, so a page key that regressed to a literal is caught.
+        api = FakeAPI()
+        with mock.patch.object(gate, "PULLS_PAGE_SIZE", 13):
+            gate.graphql_pulls(api)
+        self.assertIn("first: 13, after: $after", api.queries[0])
+
+    def test_every_page_is_read_and_the_cursor_is_followed(self):
+        class PagingAPI:
+            def __init__(self):
+                self.repo = REPO
+                self.afters = []
+
+            def graphql(self, query, variables):
+                self.afters.append(variables["after"])
+                if variables["after"] is None:
+                    page = {"pageInfo": {"hasNextPage": True, "endCursor": "CURSOR1"}, "nodes": [node(1, APPROVED)]}
+                else:
+                    page = {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [node(2, APPROVED)]}
+                return {"repository": {"pullRequests": page}}
+
+        api = PagingAPI()
+        pulls = gate.graphql_pulls(api)
+        self.assertEqual([pull["number"] for pull in pulls], [1, 2])
+        self.assertEqual(api.afters, [None, "CURSOR1"])
 
 
 class RollupTest(unittest.TestCase):

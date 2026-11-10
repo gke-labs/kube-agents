@@ -96,11 +96,22 @@ on_error() {
   # function it was in, or this script and `main` at top level. $LINENO alone
   # counts from the top of whichever file the command sat in, so a bare line
   # number sent the reader to that line of uninstall.sh instead. Piped through
-  # stdin, bash labels this script's frames `main` or not at all, and $0 is
-  # `bash`; both read as the script by name.
+  # stdin, bash labels this script's frames `main` (bash 5.2), after $0 (bash
+  # 5.3, measured: `bash` for the documented one-liner, `/bin/bash` when the
+  # interpreter is invoked by path, `sh` where that is bash), or not at all
+  # (bash 3.2); all read as the script by name. The $0 of a stdin or -c
+  # script is the shell as invoked, and resolves to the running interpreter,
+  # $BASH; a frame run from a file (`bash ./uninstall.sh`) is labelled $0 on
+  # every bash too, and that $0 is the script, not $BASH, which keeps its
+  # path. A sourced file is never $0, whatever it is named.
   local source_file="${BASH_SOURCE[1]:-}"
   case "$source_file" in
     ""|main) source_file="$UNINSTALL_SCRIPT_NAME" ;;
+    "$0")
+      if [ "$(command -v -- "$0" 2>/dev/null || true)" = "$BASH" ]; then
+        source_file="$UNINSTALL_SCRIPT_NAME"
+      fi
+      ;;
   esac
   local func_name="${FUNCNAME[1]:-main}"
   echo -e "\n\033[91m\033[1m✗ Teardown error encountered at ${source_file}:${line_no} in ${func_name} (exit code ${exit_code}): ${bash_cmd}\033[0m" >&2
@@ -295,7 +306,7 @@ resolve_state_location() {
     # Remote state where the installer keeps it (or where the caller pointed
     # us): pin the backend for lifecycle.sh.
     export KUBE_AGENTS_STATE_BUCKET="${KUBE_AGENTS_STATE_BUCKET:-$DEFAULT_KUBE_AGENTS_STATE_BUCKET}"
-  elif ! printf '%s' "$probe_err" | grep -qiE "$GCS_OBJECT_ABSENT_PATTERN"; then
+  elif ! grep -qiE "$GCS_OBJECT_ABSENT_PATTERN" <<<"$probe_err"; then
     # Anything that is not a clean "absent" — refuse rather than report an
     # empty target. Reaching the local-state branches below on a permission
     # error would be the same mistake one level down.
@@ -918,13 +929,26 @@ main() {
   # Gateway redaction, for the same reason: the generator refuses a misspelt
   # toggle or a malformed rule, and the gateway goes with the release.
   export LITELLM_REDACTION_ENABLED="false" LITELLM_REDACTION_IP_ACTION="" LITELLM_REDACTION_IP_ALLOW_CIDRS="" LITELLM_REDACTION_RULES=""
+  # The gateway's spend ceiling, likewise: the generator refuses an amount or
+  # a period it cannot read, and the gateway goes with the release.
+  export LITELLM_BUDGET_USD="" LITELLM_BUDGET_PERIOD=""
   # The scoped service account pool, likewise: the generator refuses a
   # misspelt switch or a malformed cap, and the destroy removes the members
   # in state whatever these say.
   export SCOPED_SA_POOL_ENABLED="false" SCOPED_SA_POOL_MAX_ACCOUNTS=""
+  # The serving-project switch, likewise: the generator refuses a misspelt
+  # value, and the destroy removes the two serving-project resources in state
+  # whichever way the key renders.
+  export VERTEX_MANAGE_SERVING_PROJECT=""
+  # The release's upgrade_install switch, likewise: the generator refuses a
+  # misspelt value, and the destroy removes the release however it renders.
+  export HELM_UPGRADE_INSTALL=""
   # The mode, likewise: the generator refuses a value outside the CRD's enum,
   # and the destroy removes the release whichever mode it renders.
   export PLATFORM_AGENT_MODE=""
+  # The Slack home channel policy, likewise: the generator refuses a value
+  # outside the CRD's enum, and the destroy removes the release whatever it says.
+  export SLACK_HOME_CHANNEL_POLICY=""
   # The data volume size, likewise: the generator refuses a malformed size,
   # and a teardown must not stop on a typo in install.env.
   export PLATFORM_AGENT_STORAGE_SIZE=""
@@ -949,6 +973,11 @@ main() {
     { declare -F is_table_model_provider >/dev/null && ! is_table_model_provider "${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}"; }; then
     export MODEL_PROVIDER="$DEFAULT_MODEL_PROVIDER" MODEL_DEFAULT_NAME=""
   fi
+  export WEB_CONSOLE_ENABLED="false"
+  # The minter keys a lifecycle.sh refusal asks an operator to type into
+  # install.env by hand: the composition refuses either one in the wrong shape,
+  # and a destroy has no use for them, since both only steer adoption.
+  export MINTER_SHARED_KEY="" MINTER_ADOPT_KEY=""
   write_tfvars_from_state "${compose_dir}/terraform.tfvars"
   (
     cd "$compose_dir"
@@ -965,7 +994,7 @@ main() {
 
   print_step "🎉 Uninstall Complete!"
   echo -e "${C_GREEN}${C_BOLD}🏆 All kube-agents infrastructure elements have been safely removed.${C_RESET}"
-  print_info "Kept by design: the Cloud KMS key rings (GCP cannot delete them; the next install adopts them) and the Terraform state bucket gs://$(tf_state_bucket)."
+  print_info "Kept by design: the Cloud KMS key rings (GCP cannot delete them; the next install adopts them), the cluster key's grant to the GKE service agent if this install made it (other installs that use the key need it), and the Terraform state bucket gs://$(tf_state_bucket)."
   print_info "Cluster-level settings kept on pre-existing clusters: CMEK database encryption, Workload Identity pool, GKE_METADATA node pool migrations, and Calico NetworkPolicy are preserved and not reverted."
   print_info "If this project will not host kube-agents again, delete the bucket yourself: gcloud storage rm -r gs://$(tf_state_bucket)"
 }

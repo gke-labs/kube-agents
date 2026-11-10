@@ -75,7 +75,7 @@ is four modules, split along the lines of what would break if each changed:
   nonexistence. Changing anything here is an agent-behaviour question.
 * ``client`` — the only module that reaches into the stock Hindsight provider or
   its generated client. A Hermes base-image bump lands here.
-* ``session`` — the provider class: identity resolution, the three session
+* ``session`` — the provider class: identity resolution, session
   states, and tool dispatch.
 """
 

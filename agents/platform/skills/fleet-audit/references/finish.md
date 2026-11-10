@@ -10,8 +10,27 @@ Part of the `fleet-audit` skill (`/opt/data/profiles/platform/skills/fleet-audit
   --findings-file <findings_path> \
   [--repo "<owner>/<repo>"] \
   [--manifest-file <path> | --no-collector-manifest "<why>"] \
-  [--decline-fix <finding-id> "<why>" ...]
+  [--decline-fix <finding-id> "<why>" ...] \
+  [--no-promote] \
+  [--scheduled]
 ```
+
+Pass `--no-promote` when the card that asked for the run says not to open a pull request (the
+Planning Agent's propose-only line). The ledger publishes as on any run; the automatic remediation
+sweep opens nothing on that run, and the ledger lists those fixes under "Awaiting `/remediate`" with
+the reason. The install's own switch (`KUBEAGENTS_AUDIT_AUTO_PROMOTE`) is not changed.
+
+Pass `--scheduled` only when the cron prompt tells you to: it says that the run is a scheduled run,
+and only a scheduled run can get `silent_ok: true` (see [The clean run](clean-run.md#the-clean-run)). Do not
+pass it on a run that a person asked for. A fleet-audit cron job that you create on request must
+carry the same sentence as the shipped jobs in its prompt. The same flag goes to `precheck`, which
+runs this `finish` itself on a scheduled run whose collector manifest digests the same as the last
+scheduled run's ([`draft` and `precheck`](lifecycle.md#between-the-collector-and-finish-draft-and-precheck)): the
+document is that run's stored one, the manifest is this run's, and every rule below applies as it
+is. The line such a run prints is this command's, plus `precheck: unchanged`; a `finish` you run
+yourself never carries that key. A scheduled `finish` with a manifest also records the manifest's
+digest for the next run's `precheck`; one that waived the manifest removes the record, so the next
+run drafts in full.
 
 The last pair belongs to a stream whose SOP runs a collector (the repository's collector-manifest
 design says what the manifest holds), and on such a stream one of the two is **required**:
@@ -29,26 +48,41 @@ streams `collect.py` covers: compliance (`/opt/data/profiles/platform/governance
 (`/opt/data/profiles/platform/governance/obtainability_audit_sop.md` §2) and AI security (`/opt/data/profiles/platform/governance/ai_security_audit_sop.md`
 §3), the cost stream (`fleet_waste.py`, `/opt/data/profiles/platform/governance/fleet_wide_cost_analysis_sop.md` §2), the
 stockout stream (`fleet_stockout.py`, `/opt/data/profiles/platform/governance/stockout_prevention_sop.md` §3), the GCE
-compute stream (`compute_fleet_audit.py`, `/opt/data/profiles/platform/governance/gce_compute_fleet_sop.md` §2) and the networking
-stream (`networking_audit.py`, `/opt/data/profiles/platform/governance/gcp_networking_fabric_sop.md` §2).
-The compliance, obtainability, stockout, cost, GCE compute, networking and upgrade collectors may also give a target `checks_unevaluated`,
+compute stream (`compute_fleet_audit.py`, `/opt/data/profiles/platform/governance/gce_compute_fleet_sop.md` §2), the networking
+stream (`networking_audit.py`, `/opt/data/profiles/platform/governance/gcp_networking_fabric_sop.md` §2) and the upgrade
+retrospective (`upgrade_retrospective.py`, `/opt/data/profiles/platform/governance/upgrade_retrospective_sop.md` §2).
+The compliance, obtainability, stockout, cost, GCE compute, networking, patch readiness (`patch_readiness.py`) and upgrade retrospective collectors may also give a target `checks_unevaluated`,
 `{check, reason}` for a check whose own read failed or whose inputs could not decide it: it did not run and is not inapplicable, so it
 goes in neither `checks_run` nor `checks_not_applicable` but in that target's `limitations`, which
 keeps the run partial and leaves open every finding that check filed there. `finish` rejects the
 slug anywhere else.
+
+The compliance collector, and the drift, patch readiness and stockout collectors with
+`--config-connector` or while this run is in flight, also give `kcc_unready`, the Config Connector
+objects whose `Ready` condition is `False`, to a cluster that serves a kind they read: any Config
+Connector kind for compliance, `ContainerCluster` or `ContainerNodePool` for the other three. A
+cluster whose read failed, also at the discovery, gets `kcc_unread` with the reason. You copy
+neither into the document. `finish` reads them: any fix whose finding's own object is among them
+gets a last paragraph that starts "**Config Connector is not applying this file.**" (it names the
+declaring file when the fix is not a manifest fix of it) or, when `finish` finds no single
+declaration, "**Config Connector is not applying the declaration of this object.**". The fix keeps
+its kind. Do not write either paragraph yourself, and do not copy it from an earlier ledger:
+`finish` removes it and writes it again from this run's manifest.
 
 The script validates the document, reconciles every finding against the pull requests already open
 for this stream, rewrites (or opens) the ledger issue, comments the delta, opens pull requests for
 the fixes that qualify, and closes the ones whose findings have stopped reproducing. It prints one
 JSON line — `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_still_open` (remediation
 pull requests already open on findings this run still carries; empty on a clean run), `prs_closed`,
-`partial`, `coverage_gaps`, `unreported_under_gap` (only when not empty), `silent_ok`, `declared`, the number of postures a repository
+`partial`, `coverage_gaps`, `precheck` (only on a run `precheck` closed from the stored document; its value is `unchanged`), `unreported_under_gap` (only when not empty), `since_last_scheduled` (only on a scheduled run whose findings changed since the last scheduled run while `new` and `resolved` do not say it, or `null` when that is not known; absent when every id that moved left under a coverage gap; see [The clean run](clean-run.md#the-clean-run)), `silent_ok`, `declared`, the number of postures a repository
 declaration kept off the ledger (it never decides silence), `postures_withheld`, the ids of the
 posture findings `finish` held back because the document recorded no complete declared-intent
 search (empty everywhere but on a declaring stream that skipped the step; see
-[`declared_intent_searched`](findings-document.md#declared_intent_searched)), and `unaccounted`, the ids of the previous
+[`declared_intent_searched`](findings-document.md#declared_intent_searched)), `unaccounted`, the ids of the previous
 findings a clean run was refused its close over (empty on every other outcome; see
-[The clean run](clean-run.md#the-clean-run)). A `finish` that follows an earlier `finish` of the same
+[The clean run](clean-run.md#the-clean-run)), and `retired_unlisted` (only when not empty), the ids
+of the previous findings a clean close retired unread because their cluster was in neither scope
+list (see [The clean run](clean-run.md#the-clean-run)). A `finish` that follows an earlier `finish` of the same
 repository in the run also carries `refinish: true`; when that earlier `finish` wrote the report
 store, `new` and `resolved` count against it. When that earlier `finish` reported news or opened a
 pull request, the line also carries `silent_floor: true`: its `silent_ok` stays `false` and its
@@ -76,6 +110,10 @@ gives its `started_at` and `finished_at`. A timer without its input is absent. T
 - `{"status":"NO_FORGE","issue_url":null,…,"findings":4,"critical":2,"no_forge":"…","summary":"…"}`
   — no forge is configured, or the broker cannot reach the repository, so nothing was published; see
   [No forge configured](#no-forge-configured).
+- `{"status":"STORE_LEDGER","issue_url":null,…,"prs_opened":["…"],"ledger":"store","ledger_note":"…","summary":"…"}`
+  — the forge has no issue tracker, or no labels: the ledger is in the report store and chat, and
+  the remediation pull requests still open on the forge; see
+  [A forge with no issue tracker](#a-forge-with-no-issue-tracker).
 
 Add `--dry-run` to validate and print the rendered ledger body — and every PR body it _would_ open —
 to stdout with **zero** git or forge side effects. It applies the same grouping and the same
@@ -146,6 +184,18 @@ cluster is not evidence that it was fixed. Over a partial run the harness:
 
 - reports `resolved: 0` and posts no "resolved" delta, rather than announcing fixes it cannot see;
 - closes **no** remediation pull request as stale, so a fix survives to the next complete run, except the shield's close (SOP 2.7), which rests on the declaration rather than on this run's reading;
+- keeps each previous finding on a target that this run did not check on the ledger, under
+  _Not re-checked this run_. A target was not checked when it is in `scope.skipped`; when the
+  finding's check is on that target's roster and is in neither `checks_run` nor
+  `checks_not_applicable` on it; when the check is a derived one (drift's `uncohorted`) and a roster
+  check that applies there did not run; when no entry names the target and its project target is
+  in `scope.skipped`; or when the run listed no target of its kind. The id stays in the
+  hidden block, so the next complete run reports the finding again without calling it new, or
+  shows it as resolved. A finding on a target that the run read and checked is not kept: it is in
+  the document, or it is gone. A finding whose target the run cannot find on the previous ledger or
+  in the stored report is not kept either. The run keeps these findings only when a ledger is open
+  and the report store holds a trusted record of it (with no forge: a trusted record of the
+  previous run; with the ledger in the report store: a trusted stored ledger);
 - does **not** close the ledger, even with zero findings — the issue stays open and gains a comment
   naming the gaps (not again on the next clean run if the gaps did not change). `status` is `CLEAN` where the run accounted for every finding the previous
   ledger held, and `HELD` where it did not, which is a separate refusal that a gap neither causes
@@ -154,7 +204,7 @@ cluster is not evidence that it was fixed. Over a partial run the harness:
   findings or when a maintainer who has checked them closes the ledger.
 
 A partial run with a new or changed gap is never `[SILENT]` — `finish` returns `silent_ok: false`
-for it. A gap that is the same as on the stored previous run does not stop `silent_ok` on its own.
+for it. A gap that is the same as on the last stored scheduled run does not stop `silent_ok` on its own.
 Report the issue URL and say which clusters were not covered. See [The clean run](clean-run.md#the-clean-run)
 for the full rule.
 
@@ -164,7 +214,9 @@ An install with no GitOps repository registered in `$GITOPS_STATE_CONFIGMAP` (an
 no forge to write a ledger to. A run whose repository the broker cannot reach (the forge says that it
 does not exist, or that the credential cannot read it) is the same: its `no_forge` note names the
 repository and the reason, and the JSON line of `finish` carries them under `unreachable_repo`. The
-check is one issue listing that `start` makes through the broker, and `finish` follows its result.
+check is one issue listing that `start` makes through the broker (one pull request listing when the
+ledger goes to the report store: a forge with no issue tracker, or with issues and no labels), and
+`finish` follows its result.
 The run does not choose another repository, and it is never silent (`silent_ok: false`). A run for
 which several repositories are managed and none can be chosen (none has `role: gitops`) is the same
 too: its note gives the reason and the fix, and the JSON line carries it under
@@ -189,7 +241,53 @@ too: its note gives the reason and the fix, and the JSON line carries it under
 
 **Report.** `status: "NO_FORGE"` replaces the SOP's report lines, which all name a ledger URL that
 does not exist. `silent_ok` decides silence as usual: on a scheduled run, `silent_ok: true` → exactly
-`[SILENT]`. Otherwise, and on every on-demand run, your final response is `summary` verbatim. It
-names the most severe findings with the object each one is about, the ids held for the collector,
-the coverage gaps, and that no forge is configured or which repository could not be reached. Do not report the run as
+`[SILENT]`. Otherwise, and on every on-demand run (where `silent_ok` is always `false`), your final response is `summary` verbatim. It
+names the most severe findings, one short line each with its cluster and the object it is about,
+counts the rest, and gives the ids held for the collector, the coverage gaps, and that no GitOps
+repository is connected or which repository could not be reached. Do not report the run as
 failed, and do not invent an issue URL.
+
+### A forge with no issue tracker
+
+A repository on a forge that has no issue tracker (Bitbucket), or that has issues and no labels, has
+no ledger issue: the ledger is found by its label. `start` asks the forge's `capabilities` and
+decides. The ledger goes to the report store and to chat, as with no forge, and the remediation pull
+requests still open on the forge. `start` writes the decision into the run record, and `finish`
+follows it. A `capabilities` answer that cannot be read keeps the ledger issue.
+
+- `start` clones the repository as usual and prints `"issue": null`, the `repo`, the usual `mode`
+  and `workspace`, `"ledger": "store"`, and a `ledger_note` that says why. `carried` lists the
+  findings the stored ledger carries. `pending_remediation_requests` is always empty: there is no
+  ledger thread.
+- Write the findings and the `manifest` fixes as usual. `finish` applies the same refusals and the
+  same Kustomize and declaration checks as with a ledger issue, and the sweep opens the same pull
+  requests, at most five a run. On a forge with no labels they carry the stream in their
+  description and their branch name instead of labels.
+- `finish` prints `status: "STORE_LEDGER"`, `issue_url: null`, `new` and `resolved` against the
+  previous such run, `prs_opened`, `prs_still_open`, `prs_closed`, `unaccounted`, `findings`,
+  `critical`, `"ledger": "store"`, the `ledger_note`, and `summary`. A clean run closes a stale pull
+  request only when coverage is complete and every finding the stored ledger carries is reported or
+  explained under `resolved_because` and not still flagged by the collector, as with a ledger issue.
+  If the forge refuses the listing of the remediation pull requests (too many pull requests in the
+  repository, or an unknown login), `finish` still stores the findings, opens, updates and closes
+  no pull request, and says why in `remediation_refused` and in `summary`. Such a run is never
+  silent. A previous finding the collector
+  still flags is held on the stored ledger, and the next `start` lists it in `carried`.
+- `silent_ok` follows the ledger-issue rule: nothing is wrong with the repository, so a scheduled
+  run with nothing new is silent, and an on-demand run is never silent. The stored ledger keeps the
+  findings of the last scheduled run (`scheduled_published_ids`), so a change that an on-demand run
+  saw first still makes the next scheduled run speak, with `since_last_scheduled` on the JSON line
+  and in `summary`. A run the store does not hold is never silent.
+- If the store lost the previous ledger, a clean run closes no pull request, and its
+  `coverage_gaps` says why. The store loses it when its last write failed, or when its record cannot
+  be read. A store that does not exist, or that holds only records of runs that could not reach the
+  repository in a ring that is not full, is a first run when no remediation pull request of the
+  stream is open, and a lost ledger when one is open. A new identity scheme does not lose it. It stores a record that the next run also reads as lost, so each clean
+  run after it closes nothing until a run that reports findings stores the ledger again. Such a
+  run is never silent.
+- A `/remediate` cannot be commented on a ledger. A person asks in chat, and you run `remediate` for
+  the ids they name ([remediation.md](remediation.md)).
+
+**Report.** As for `NO_FORGE`: `silent_ok` decides silence, and otherwise your final response is
+`summary` verbatim. It names the findings, the pull request links, and why the ledger is in the
+report store. Do not invent an issue URL.

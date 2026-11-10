@@ -45,13 +45,14 @@ REPO = "gke-agentic/kube-agents-evals-2-infra"
 PROJECT = "kube-agents-evals-2"
 BOT = "kube-agents-evals-token-minter[bot]"
 
-# The twelve ledger-writing cases and the audit id each grades under; a case
+# The fourteen ledger-writing cases and the audit id each grades under; a case
 # that writes no ledger has none.
 AUDIT_IDS = {
     "ai-security-planted-model-audit": "ai-security-audit",
     "compliance-rbac-overgrant": "compliance-audit",
     "consistency-drift-outlier": "fleet-consistency-drift",
     "consistency-no-environment-label": "fleet-consistency-drift",
+    "fleet-audit-unread-target-keeps-finding": "fleet-consistency-drift",
     "fleet-audit-clean-close-reads-clean": "ai-security-audit",
     "fleet-audit-unchanged-finding-keeps-wording": "fleet-consistency-drift",
     "fleet-cost-idle-pool": "fleet-wide-cost-analysis",
@@ -380,7 +381,7 @@ class ResetStepTest(unittest.TestCase):
                 'EVAL_FORGE="github"',  # the GitHub path, whatever the shell exports
                 f'EVAL_LEDGER_APP_ID=4739812; EVAL_LEDGER_APP_KEY_FILE="{key_file}"',
                 f'EVAL_LEDGER_REPO="{repo}"; PROJECT_ID="{PROJECT}"; BUILD_ID=2102186223282950144',
-                f'SCRIPT_DIR="{self.dir}"',
+                f'SCRIPT_DIR="{self.dir}"; EVAL_GRADING_LOG="{self.dir}/eval-grading.log"',
                 mint,
                 lifted("ledger_reset_token"),
                 lifted("forge_write_token"),
@@ -394,6 +395,12 @@ class ResetStepTest(unittest.TestCase):
     def mints(self):
         return int(self.count_file.read_text().strip())
 
+    def grading(self):
+        """What the step appended to the grading artifact, "" when nothing:
+        the helper's lines quote ledger titles, so they never reach the job log."""
+        path = self.dir / "eval-grading.log"
+        return path.read_text() if path.exists() else ""
+
     def test_the_unit_reset_narrows_the_token_and_names_its_stream(self):
         result = self.run_step('"compliance-rbac-overgrant rep 2" compliance-audit')
         self.assertIn("RC=0", result.stdout, result.stderr)
@@ -401,19 +408,20 @@ class ResetStepTest(unittest.TestCase):
             json.loads(self.body_file.read_text()),
             {"repositories": ["kube-agents-evals-2-infra"], "permissions": {"issues": "write"}},
         )
-        argv = json.loads(re.search(r"HELPER argv=(.*)", result.stdout).group(1))
+        argv = json.loads(re.search(r"HELPER argv=(.*)", self.grading()).group(1))
         self.assertEqual(
             argv,
             ["--repo", REPO, "--project", PROJECT, "--build", "2102186223282950144", "--audit", "compliance-audit"],
         )
         self.assertNotIn("tok-write", " ".join(argv))
-        self.assertIn("HELPER token=tok-write", result.stdout)
-        self.assertIn("Ledger reset (compliance-rbac-overgrant rep 2): HELPER argv=", result.stdout)
+        self.assertIn("HELPER token=tok-write", self.grading())
+        self.assertIn("Ledger reset (compliance-rbac-overgrant rep 2): HELPER argv=", self.grading())
+        self.assertNotIn("HELPER", result.stdout, "the helper's lines go to the artifact, not the job log")
         self.assertNotIn("BENCH_GITHUB_TOKEN", lifted("reset_audit_ledgers") + lifted("ledger_reset_token"))
 
     def test_the_lease_reset_names_no_stream(self):
-        result = self.run_step('"lease"')
-        argv = json.loads(re.search(r"HELPER argv=(.*)", result.stdout).group(1))
+        self.run_step('"lease"')
+        argv = json.loads(re.search(r"HELPER argv=(.*)", self.grading()).group(1))
         self.assertNotIn("--audit", argv)
         self.assertEqual(argv[:2], ["--repo", REPO])
 
@@ -631,10 +639,11 @@ class CallSiteTest(unittest.TestCase):
         # A failed acquisition gives back the streams already held.
         self.assertIn('release_streams "${held}"', unit)
         # Released on the gone-gateway, state-lock and infra-lock paths and
-        # after the run here, and on the mint-failure, repository-reset and
-        # kubeconfig-copy paths through skip_unit, which all hand it the streams.
+        # after the run here, and on the mint-failure, repository-reset,
+        # kubeconfig-copy and GitOps-write-token paths through skip_unit, which
+        # all hand it the streams.
         self.assertEqual(unit.count('release_streams "${streams}"'), 4)
-        self.assertEqual(unit.count('skip_unit "${task}" "${name}" "${rep}" "${streams}" "${has_stack}"'), 3)
+        self.assertEqual(unit.count('skip_unit "${task}" "${name}" "${rep}" "${streams}" "${has_stack}"'), 4)
         self.assertIn('release_streams "${streams}"', lifted("skip_unit"))
         # Before the infra lock: a stack-bearing unit waiting on its stream
         # must not hold the one tofu lane while it waits.
@@ -649,7 +658,7 @@ class CallSiteTest(unittest.TestCase):
         self.assertEqual(unit.count('"${lock_deadline}"'), 1)
         self.assertIn('"$(stream_lock_deadline "${name}" "${s}" "${streams}")"', unit)
         self.assertIn(
-            'echo $(( $(stream_case_count "$2") * ($(unit_delegation_timeout "$1") + UNIT_LOCK_ALLOWANCE_SECONDS + EVAL_INFLIGHT_GRACE_SECONDS + run_wait) + $(stream_stack_wait "$2") ))',
+            'echo $(( $(stream_case_count "$2") * ($(unit_delegation_timeout "$1") + UNIT_LOCK_ALLOWANCE_SECONDS + EVAL_INFLIGHT_GRACE_SECONDS * notes + run_wait) + $(stream_stack_wait "$2") ))',
             lifted("stream_lock_deadline"),
         )
         self.assertLess(unit.index('lock_deadline="$(stream_lock_deadline'), task_lock)
@@ -660,7 +669,7 @@ class CallSiteTest(unittest.TestCase):
         self.assertIn("lock_deadline=$(( lock_deadline + INFRA_LOCK_DEADLINE ))", unit[stack_term:task_lock])
 
     def test_the_lock_deadline_scales_by_the_cases_that_share_a_stream(self):
-        # Against the real task files: the three consistency cases share
+        # Against the real task files: the four drift cases share
         # fleet-consistency-drift, the three patch cases share
         # security-patch-orchestrator, every other stream has one case, and a
         # case that writes no ledger (or an empty id) keeps the single-unit
@@ -680,7 +689,7 @@ class CallSiteTest(unittest.TestCase):
         )
         result = run_bash(body)
         got = dict(line.split("=", 1) for line in result.stdout.splitlines())
-        self.assertEqual(got, {"drift": "3", "compliance": "1", "patch": "3", "none": "1", "unknown": "1"}, result.stderr)
+        self.assertEqual(got, {"drift": "4", "compliance": "1", "patch": "3", "none": "1", "unknown": "1"}, result.stderr)
         self.assertEqual(result.stderr, "")
 
     def test_a_stream_deadline_covers_its_stack_bearing_cases_infra_queue(self):
@@ -712,7 +721,7 @@ class CallSiteTest(unittest.TestCase):
         self.assertEqual(result.stderr, "")
 
     def test_a_case_holds_the_streams_it_declares(self):
-        # oobe-first-run-audits grades no ledger, but its stack starts four real
+        # oobe-first-run-audits grades no ledger, but its stack starts five real
         # audit runs; it holds their streams, sorted, and is counted on each, so
         # an audit case waiting behind it on one of them waits long enough.
         tasks = (
@@ -742,7 +751,7 @@ class CallSiteTest(unittest.TestCase):
         self.assertEqual(
             got,
             {
-                "oobe": "compliance-audit fleet-wide-cost-analysis obtainability-audit stockout-prevention",
+                "oobe": "compliance-audit fleet-wide-cost-analysis obtainability-audit stockout-prevention upgrade-retrospective",
                 "compliance_case": "compliance-audit",
                 "probe": "",
                 "compliance_count": "2",

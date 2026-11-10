@@ -1,6 +1,6 @@
 ---
 name: review-preflight
-description: Runs the review passes required before a pull request is opened — adversarial and docs-drift — each in a context that did not write the change, and merges what they return into one disposition list.
+description: Runs the pre-PR review passes — adversarial and docs-drift, required on every change, plus chat UX when chat output changes — each in a context that did not write the change, and merges what they return into one disposition list.
 ---
 
 # Task
@@ -8,10 +8,10 @@ description: Runs the review passes required before a pull request is opened —
 Get every pre-PR review pass into a context that did not write the change, then merge what comes
 back into the list that becomes the pull request's **Self-Review** section.
 
-This skill is plumbing. It holds no review method — [`review-adversarial`](../review-adversarial/SKILL.md)
-and [`review-docs-drift`](../review-docs-drift/SKILL.md) own that — and it does not state the
-requirement: "Pull Request Hygiene" in [`AGENTS.md`](../../../AGENTS.md) does, and that list wins if
-this file disagrees with it.
+This skill is plumbing. It holds no review method — [`review-adversarial`](../review-adversarial/SKILL.md),
+[`review-docs-drift`](../review-docs-drift/SKILL.md) and [`review-chat-ux`](../review-chat-ux/SKILL.md)
+own that — and it does not state the requirement: "Pull Request Hygiene" in
+[`AGENTS.md`](../../../AGENTS.md) does, and that list wins if this file disagrees with it.
 
 [`.claude/commands/pr-preflight.md`](../../../.claude/commands/pr-preflight.md) is the Claude Code
 wrapper. Any harness can follow this file directly.
@@ -64,10 +64,12 @@ branch wrote them.
 
 - `review-adversarial` — always.
 - `review-docs-drift` — always.
+- `review-chat-ux` — when the range touches chat output, as that skill's Scope defines it.
 
-Both, on every change. Neither has a trigger to evaluate and there is no third pass, so this step is
-a checklist rather than a judgment — but say which ran anyway, and say it when one of them did not.
-A pass nobody ran is a gap in the section, not an absence of findings.
+The first two are required on every change and have no trigger to evaluate. The third is not a
+requirement; it runs when chat output changes: read the range's file list and hunks against its
+Scope, and run it when in doubt. Say which passes ran, and
+say it when one did not. A pass nobody ran is a gap in the section, not an absence of findings.
 
 ## 3. Run the mechanical gate first, in the main loop
 
@@ -77,10 +79,10 @@ make docs-check
 
 Every time, whatever the range touches: CI runs it unfiltered on every pull request. It is cheap, it
 is deterministic, and its output is a fact the passes would otherwise re-derive, so hand the result
-on. It does not substitute for its pass — it covers generated regions, links, terminology, map
-coverage, maintainer identifiers on site pages, and the always-loaded instruction files' context
-budget, but not whether the prose is still true, which is the whole of what `review-docs-drift`
-asks.
+on. It does not substitute for its pass — it covers generated regions, links and section anchors,
+reachability, terminology, maintainer identifiers and PR/issue citations on site pages, site prose
+ceilings, and the always-loaded instruction files' context budget, but not whether the prose is
+still true, which is the whole of what `review-docs-drift` asks.
 
 It is here because the passes want its output, not because it is the local check you owe.
 `AGENTS.md` "Local Validation Checks" is that list — prettier on changed Markdown and YAML,
@@ -175,13 +177,14 @@ defect found twice is one finding, kept in whichever form names the failure conc
 Where two passes disagree, go and read the source. Do not average them and do not take the more
 alarming one on the grounds that it is safer.
 
-The two passes do not grade alike, and the merged list keeps each one's own severity rather than
+The passes do not grade alike, and the merged list keeps each one's own severity rather than
 translating it. `review-adversarial` returns a verdict per finding, so `review-adversarial` §6
 governs its half: edit on CONFIRMED, report on PLAUSIBLE. `review-docs-drift` returns a
 Blocking/Advisory triage instead and never emits a verdict — Blocking is addressed before the pull
 request opens, Advisory gets the same disposition treatment as PLAUSIBLE. Do not restate a Blocking
 finding as CONFIRMED to make one column of it; the pass did not do the verification that word
-claims.
+claims. `review-chat-ux` returns violations of a named rule, each tied to a line; each gets a
+disposition like any other finding.
 
 Every survivor gets a disposition either way, to the bar
 [`.agents/rules/pre_pr_review.md`](../../rules/pre_pr_review.md) sets: fixed, or deliberately
@@ -210,8 +213,9 @@ of the fresh one.
 
 One severity-ordered disposition list covering every pass that ran. Severity and confidence are two
 axes, and a finding carries both: its pass's severity (`BLOCKER`/`HIGH`/`MEDIUM`/`LOW` from
-`review-adversarial`, Blocking or Advisory from `review-docs-drift`) orders the list, and its
-CONFIRMED/PLAUSIBLE verdict or triage says how sure the pass was. Name which pass each came from, so
+`review-adversarial`, Blocking or Advisory from `review-docs-drift`, a violation from
+`review-chat-ux`) orders the list, and its CONFIRMED/PLAUSIBLE verdict or triage says how sure the
+pass was. Name which pass each came from, so
 a reader can tell what kind of check stands behind it. Above the list, three lines the reviewer
 cannot reconstruct from the findings:
 

@@ -90,7 +90,8 @@ After this change, under `next`:
 - The agent material names the docs-site short link only, never a Google Forms URL
   (`tests/test_feedback_reference.py`), so a recreated form needs no agent release.
 - Agent behaviour changes need a case: red against `main`, green three times on the
-  branch, registered in `hack/eval/nightly-cases.txt`.
+  branch, registered in `hack/eval/nightly-cases.txt`, unless one of the exemptions in
+  [`eval_driven_development.md`](../../.agents/rules/eval_driven_development.md) applies.
 
 ## The parts, as decided
 
@@ -255,10 +256,14 @@ chat message's button may not carry it either. The dispatch case sits beside the
 ahead of `/session`, status, stop and steer, and changes nothing about the record's task
 state. `a2a/gateway/feedback_summary.go` renders the install's usage and feedback summary
 deterministically, with the environment, usage and feedback sections `scripts/feedback-summary.sh`
-prints from a workstation (epic #3426's share surface; the script adds the model, the performance
-figures and recent task rows): environment (tag, mode, Kubernetes version, install age,
-readiness, active interfaces), the `status.usage` counters, a roll-up of the gateway's own
-task records, and the feedback template. That roll-up is labelled `chat turns`, not `tasks`:
+prints from a workstation (epic #3426's share surface; the script alone adds the cluster scale
+counts, the performance figures and recent task rows): environment (tag, mode, model from
+`status.inference` or `unavailable`, Kubernetes version, install age, readiness, active
+interfaces), the `status.usage` counters, the credential broker's top five tool and subcommand
+pairs from `status.usage.topTools` (the operator's reading of the broker's counter,
+[`usage-counters-producer.md`](usage-counters-producer.md); the script reads the broker's
+metrics directly when it can and falls back to the same status list), a roll-up of the
+gateway's own task records, and the feedback template. That roll-up is labelled `chat turns`, not `tasks`:
 the script's `tasks` line counts kanban cards, and two pastes from one install must not
 disagree under one label. The roll-up splits by what a `TaskRef` holds: the
 record's `ActiveTask` names the running task, `Canceled` marks a published cancel, and the
@@ -272,12 +277,15 @@ that the line reads `unavailable`. It reads the
 `PlatformAgent` resource through the gateway's ServiceAccount, which the operator's Role
 grants one `get` on, pinned by `resourceNames` to this agent's resource; the server version
 needs no grant. Tokens, spend and latency are not the gateway's to see and the block says
-where they are. Before posting, the block is audited as the script audits its own: every
+where they are. Before posting, the block less its model line is audited as the script audits its own: every
 string leaf of the spec's naming subtrees plus the resource's name and namespace, as whole
 tokens, with booleans, numbers, short strings and the template's own vocabulary skipped; a
 hit posts a fixed refusal instead, and a resource that cannot be read posts a fixed
 unavailability notice. No error text reaches chat. The web console classifies the turn as
-settled, like the bare form. No model is in the loop, so the eval loop does not apply.
+settled, like the bare form, sends it from a `usage summary` button in the chat footer, and puts
+a `copy` button on any gateway notice that holds a fenced block, so the block reaches the
+clipboard in one click (the third surface #3428 asks for). No model is in the loop, so the eval
+loop does not apply.
 
 ## Calls made in the build
 

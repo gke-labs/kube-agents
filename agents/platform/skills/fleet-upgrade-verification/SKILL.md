@@ -99,11 +99,12 @@ The script runs `gcloud container clusters list`, `gcloud container get-server-c
 `--project` nor a declared scope is passed, `gcloud config get-value project` and `gcloud projects list` (plus `gcloud projects describe` for a
 project whose `clusters list` was refused as API-disabled or whose configured identifier is a
 project number), each with a 60-second timeout, and
-with `--readiness` one `gcloud container clusters get-credentials` and the `kubectl get`s per
-member that "Check upgrade readiness" lists (the PDB rule's, the webhook rule's, then one per
-group of kinds the per-entry rules read), plus whatever a registered rule reads itself through the
-script's own runner under the same cap (a rule that reads the audit log runs paged `gcloud logging
-read`s).
+with `--readiness` three `gcloud` list reads per project (`compute backend-services list`,
+`compute instances list`, `container operations list`, each projected to the fields the per-entry
+rules read), one `gcloud container clusters get-credentials` and the `kubectl get`s per
+member that "Check upgrade readiness" lists (the PDB rule's, the webhook rule's, then one paged
+read per kind the per-entry rules read), plus whatever a registered rule reads through the
+script's own runner under the same cap (the audit-log rule's paged `gcloud logging read`s).
 It changes nothing in GCP or in any cluster; the only things it writes are its own record under
 `/opt/data/state/fleet-upgrade-verification/`, the per-member kubeconfig files `--readiness`
 needs, and the `--output` file. A failed or timed-out gcloud read, `get-credentials`, PDB read,
@@ -180,13 +181,15 @@ file and the JSON: `references/track-a-rollout.md`.
 
 ## Check upgrade readiness
 
-`--readiness` adds a second table after the version table, one row per member, graded against
+`--readiness` adds a readiness table after the version table, one row per member, graded against
 the same target as the member's version row, and a `readiness` object per member in the JSON
 (`members[].readiness`, with a top-level `readiness` block holding the instant evaluated and a
-count per verdict). Without the flag nothing changes. The rules below each name the governance
+count per verdict), then the add-on inventory table (`members[].readiness.addons` in the JSON, the
+known-issues rule's input). Without the flag nothing changes. The rules below each name the governance
 SOP check they derive from, except the webhook rule, which has no SOP check yet; after them run
 the per-entry rules registered in `upgrade_readiness.EXTRA_RULES` (`scripts/readiness_rules/`, one
-module per entry of the upgrade-failure catalogue in the repository's design docs; the package
+module per rule, each stamped with the entry of the upgrade-failure catalogue in the repository's
+design docs it reads (an entry can have several); the package
 docstring is the contract a module meets); the maintenance rule departs from its SOP where the two
 differ, and says so. Run it once, from this profile, for every cluster the question covers; a
 readiness question fanned out to the Cluster Agents loses the maintenance read and the grading
@@ -198,8 +201,10 @@ backend, GKE's own URL-backed ones included, as a blocker.
   `${HERMES_HOME:-/opt/data}/.kubeconfigs/` (`kubeconfig_<project>_<cluster>_<location>.yaml`, one file per
   target so concurrent reads never share a current-context; `--kubeconfig-dir` moves the
   directory), adding `--dns-endpoint` when the cluster record says its DNS endpoint accepts
-  external traffic, then one `kubectl get pdb,deploy,statefulset -A -o json`, the first of the
-  member's reads (the per-entry rules' reads follow it, below). A PDB is matched to
+  external traffic, then the PDB read, the first of the member's reads: PodDisruptionBudgets,
+  Deployments and StatefulSets, one kind at a time in pages of 500 through `kubectl get --raw`
+  (`/apis/policy/v1/poddisruptionbudgets?limit=500`, following `continue`), so no one reply
+  meets the credential proxy's output cap. A PDB is matched to
   the Deployments and StatefulSets in its namespace whose pod-template labels satisfy its
   selector (`matchLabels` and `matchExpressions`), and it blocks every drain when
   `maxUnavailable` is `0` or `0%`, or when `minAvailable` demands every expected pod: an integer
@@ -215,11 +220,11 @@ backend, GKE's own URL-backed ones included, as a blocker.
   does not include (a bare ReplicaSet, a custom controller), which is noted so it is never
   silently `ready`. DaemonSets are never matched: a drain deletes their pods rather than evicting
   them.
-- **Fail-closed webhooks**, from a second read with the same kubeconfig: `kubectl get
-validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpointslices,namespaces -A -o json`.
-  It is a read of its own so that a failure there grades only this rule `unknown` and never costs
-  the PDB result. In the agent sandbox the credential proxy cuts a list past its output cap on the
-  largest clusters; the error row names the cap, and the rule is `unknown` there. A webhook is graded when its `failurePolicy` is `Fail` (or absent, which
+- **Fail-closed webhooks**, from a second read with the same kubeconfig, paged the same way over
+  ValidatingWebhookConfigurations, MutatingWebhookConfigurations, Services, EndpointSlices and
+  Namespaces. A read of its own, so a failure there grades only this rule `unknown` and never
+  costs the PDB result. A page the credential proxy still cuts (the shim exits 74 with its
+  marker) fails the read; the error row names the cap, and the rule is `unknown` there. A webhook is graded when its `failurePolicy` is `Fail` (or absent, which
   `admissionregistration.k8s.io/v1` defaults to `Fail`) and its backend is a Service the API
   server cannot reach: the Service does not exist, no Service port equals the webhook's port (443
   when unset), or no ready endpoint sits behind that port in the Service's EndpointSlices (an
@@ -289,14 +294,13 @@ validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpoints
   goes in the note. Autopilot members read `n/a`.
 
 The per-entry rules run after those four, over the same cluster record and the reads after
-the webhook read, one per group of kinds: `kubectl get daemonset,cronjob,pvc,networkpolicy,namespace
--A -o json`; `kubectl get pods -A -o json` on its own, because the pod list is the one most
-likely to exceed the credential proxy's output cap and a cut read must cost only the rules that
-need pods; the Nodes through a jsonpath template that keeps each node's name, Pod CIDR, labels, taints,
-whether it is cordoned, node info, allocatable and conditions and drops the rest (so a few
-hundred nodes stay under that cap); and `kubectl get storageclass,pv -o json`. Each of them
-fails on its own: a refused or unparsable read, or one the credential proxy cut at its output
-cap (recorded as that kind's error naming the cap, never as unparsable JSON), costs only the
+the webhook read, one per group of kinds, paged the same way (`/api/v1/pods?limit=500`):
+DaemonSets, CronJobs, PersistentVolumeClaims, NetworkPolicies and Namespaces; Pods on their
+own, so a failure there costs only the rules that need pods; Nodes through a jsonpath template
+that keeps name, `providerID`, Pod CIDR, labels, taints, cordon, node info, allocatable and
+conditions (a few hundred nodes fit one read); and StorageClasses and PersistentVolumes. Each
+fails on its own: a refused or unparsable read, or a cut page (recorded as that kind's error
+naming the cap, never as unparsable JSON), costs only the
 rules that need its kinds, each of which says so as `unknown` and grades what it has, and it
 sets no exit code; the note names the kinds not read and the JSON records the error per kind
 under `read_errors` (every kind carries the reason when `get-credentials` or the PDB read failed:
@@ -315,8 +319,15 @@ Each rule returns blockers,
 risks, reasons it could not decide, and notes, and declares whether it can block at all; a
 blocker joins the verdict, a risk never does, and the table prints them under `other blockers`
 and `risks`, each as `<rule id>: <the rule's description>`, so the cell names the rule the way the
-note column does. The rules, one per catalogue entry, with their reads and actions:
-`references/readiness-rules.md`.
+note column does. The rules, one per catalogue entry or incident scenario, with their reads and
+actions: [`references/readiness-rules.md`](references/readiness-rules.md). After them runs one plan-level rule, `rollout-sequence-precheck`
+(no catalogue entry, never a blocker): for a fleet member it lists the fleet host project's
+RolloutSequences once per run, with
+`gcloud container fleet rolloutsequences list --project <host> --format=json`, filed on the host's
+first member in the listing (the host's other members carry a note saying where, a non-member a
+note that no sequence can carry it), and an existing sequence is
+a risk naming its stages, since the platform allows one sequence per host project and refuses a
+plan that creates a second; the clause after the cell's last `; ` is the one action.
 
 A member is `blocked` when any rule blocks, whatever else could not be evaluated; `unknown` when
 nothing blocked but a rule that could have blocked could not be evaluated (the cluster read
@@ -325,10 +336,8 @@ rule said so); `ready` only when every rule was evaluated and none blocks. A ris
 verdict, and neither does an unknown from a rule that declares it can never block, which is
 reported in the note. In the JSON each member carries `readiness.rules` (per rule id: its entry,
 whether it can block, and a count of its blocking, risk, unknown and note entries),
-`rule_blocking`, `risks` and `unknown` (the findings across rules, once, each with its `rule`,
-`entry` and the `text` the cell or the note prints; an unknown entry with its `reason` and
-`can_block`), `notes`, `read_errors` (per kind) and `audit_log` (per read); the top-level
-`readiness` block counts the members with risks (`members_with_risks`). A failed
+`rule_blocking`, `risks` and `unknown` (the findings across rules, once: `rule`, `entry`, `text`; an unknown adds `reason` and `can_block`), `notes`, `addons` (the add-on inventory rows), `read_errors` (per kind) and `audit_log` (per read); the top-level
+`readiness` block counts the members with risks (`members_with_risks`). `notes[]` are strings prefixed `<rule id>: <text>`; `rule_blocking[]`, `risks[]` and `unknown[]` are objects with `rule` and `text`. A per-rule question is answered from the JSON per member by [the recipe](references/readiness-rules.md#a-per-rule-answer): a note is an entry unless the question is for a risk or blocker (its finding-only form); `none` where `readiness.rules.<id>` counts nothing. A failed
 `get-credentials`, PDB read or webhook read is listed under the table as a read failure for that
 member and sets exit code 1, like a failed gcloud read. A failed `get-credentials` or PDB read
 leaves the PDB rule and every per-entry rule that needs an object ungraded (the webhook read is
@@ -381,17 +390,18 @@ already written.
   `--target-version` defaults to the file's `target_version` when the report was run with one.
 - Without `--repo` the script scans every repository under `managed_repos`, on every forge, the
   same list the GitOps skills write to; `--repo` is repeatable and, when given, is the whole scope.
-  A repository on another forge than GitHub is named `host/path`, as the list names it, and is read
-  through the content workspace only: on a broker not armed for content-passing it is listed under
-  errors, because the leased checkout reaches GitHub alone.
+  A repository on another forge than GitHub is named `host/path`, as the list names it. A `--repo`
+  can also name a `context_repos` entry or a public repository: the broker reads each with the
+  credential its role allows.
   `--manifests-dir` scans a local tree instead of, or as well as, repositories.
-- It reads each repository the way `inspect-repository` does: through the credential broker's
-  content workspaces as a shallow read-only clone, or, on an install whose broker is not armed
-  for content-passing, through a leased checkout on the shared volume. That checkout is under
-  a lease of the scan's own (`--lease` overrides it), so positioning it on the base branch
-  never resets a checkout another skill is working in -- `fleet-audit`'s remediation clone is
-  leased on its audit id on the same volume. It runs no `gcloud` and writes to no repository. A repository the broker or git cannot
-  serve is listed under errors and sets exit code 1; the other repositories are still reported.
+- It reads one revision of each repository through the credential broker, with no history, into a
+  temporary directory of its own, and deletes it, so it never touches a copy another skill is
+  working in. A tree over the broker's snapshot ceiling is read in the parts that hold manifests; a
+  part it could not read is a `partial` line with the reason, and sets exit code 1. When
+  `CREDENTIAL_PROXY_URL` is not set (a run outside the pod), the script reads a leased checkout of
+  its own instead, for GitHub repositories only; `--lease` names that lease. It runs no `gcloud`
+  and writes to no repository. A repository the broker or git cannot serve is listed under errors
+  and sets exit code 1; the other repositories are still reported.
 - Removal data is `removed_apis.json` beside the script: Kubernetes 1.16 through 1.32, from the
   upstream Deprecated API Migration Guide, whose URL and `as_of` version the report prints. The
   script cannot call MCP tools, so when the target is newer than the table (the report says so)
@@ -411,10 +421,11 @@ members affected, which are the members whose control plane is still below that 
 is an apiVersion removed after the floor and no later than the target; a removal at or below
 the floor has already happened on every member and is not reported. A clean section says so
 with the file and document counts it read. Under either, `skipped` lines name the files it did
-not read and why, and a `partial` line means a size cap stopped the scan; a clean section with
-skipped files is clean for what it read, so say that. A section headed `not scanned` means this
-run did not read that repository: report it as not read, with the error the section gives, and
-never answer for it from a scan file this run did not write or from another card's result.
+not read and why, and a `partial` line means a size cap stopped the scan or names a part it did
+not read; a clean section with either is clean for what it read, so say that. A section headed
+`not scanned` means this run did not read that repository: report it as not read, with the error
+the section gives, and never answer for it from a scan file this run did not write or from another
+card's result.
 
 The scan reads what Git declares. Whether a client is still calling a deprecated API on a live
 cluster is a different question, answered by GKE Deprecation Insights from the cluster's audit

@@ -13,20 +13,27 @@ import io
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import typing
 import unittest
+import unittest.mock
 
 import yaml
-
 from eval_dashboard import nightly_bugs
+
+# What a public post must never carry: a pass ratio, a repetition count, a
+# percentage, a streak, a failing-check reason, or the wording the posts
+# carried before. "every repetition" in a rule's wording is not a count.
+RESULTS_RE = re.compile(r"\d+/\d+|\d+ of \d+|\d+ repetitions?|\d+ ?%|\bpassed\b|failed every|failed all|fails every|nights in a row|RESOURCE_EXHAUSTED|\b429\b")
 
 TESTDATA = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "testdata_nightly_bugs"
 JOB = "ci-kube-agents-eval-nightly"
 WRITERS_JOB = "ci-kube-agents-eval-nightly-writers"
+MAIN_B_JOB = "ci-kube-agents-eval-nightly-main-b"
 REPO = "gke-labs/kube-agents"
 ISSUES = f"repos/{REPO}/issues"
 FAIL_REASON = "VerificationCorrectness=0.0 (floor 1.0) -- names-the-pool: required phrases absent"
@@ -85,7 +92,15 @@ class FakeGh:
     """A `gh api` runner: open issues and per-issue comments for reads, a
     freshly numbered object for writes; records every call."""
 
-    def __init__(self, open_issues=(), closed_issues=(), comments=None, fail_list=False, fail_closed=False, refuse_assignees=False, lands_then_fails=False, fail_writes=False, fail_comments=False):
+    def __init__(self, open_issues=(), closed_issues=(), comments=None, fail_list=False, fail_closed=False, refuse_assignees=False, lands_then_fails=False, fail_writes=False, fail_comments=False,
+                 empty_open=False, empty_closed=False, empty_comments=False, graphql=None):
+        # empty_*: the REST read answers 200 with nothing while the items
+        # exist (2026-10-22). graphql: "fail", "errors", or None for an
+        # answer that agrees with the issues held.
+        self.empty_open = empty_open
+        self.empty_closed = empty_closed
+        self.empty_comments = empty_comments
+        self.graphql = graphql
         self.calls = []
         self.open_issues = list(open_issues)
         self.closed_issues = list(closed_issues)
@@ -106,14 +121,36 @@ class FakeGh:
             number = int(path.split("/issues/")[1].split("/")[0])
             if self.fail_comments:
                 return GhResult(rc=1, stderr="HTTP 502")
+            if self.empty_comments:
+                return GhResult()
             return GhResult(stdout="\n".join(json.dumps(c) for c in self.comments.get(number, [])))
+        if method == "POST" and path == "graphql":
+            if self.graphql == "fail":
+                return GhResult(rc=1, stderr="HTTP 502")
+            if self.graphql == "errors":
+                return GhResult(stdout=json.dumps({"data": None, "errors": [{"message": "Something went wrong"}]}))
+
+            def conn(held):
+                items = [i for i in held if not i.get("pull_request")]
+                return {"totalCount": len(items), "nodes": [{"number": i["number"]} for i in items[:nightly_bugs.GRAPHQL_FIRST]]}
+            repo = {"open": conn(self.open_issues)}
+            if body["variables"]["closed"]:
+                repo["closed"] = conn(self.closed_issues)
+            return GhResult(stdout=json.dumps({"data": {"repository": repo}}))
         if method == "GET" and "state=closed" in path:
+            if self.empty_closed:
+                return GhResult()
             if self.fail_closed:
                 return GhResult(rc=1, stderr="HTTP 502")
             return GhResult(stdout="\n".join(json.dumps(i) for i in self.closed_issues))
         if method == "GET":
             if self.fail_list:
                 return GhResult(rc=1, stderr="HTTP 502")
+            if self.empty_open:
+                # True: empty every time; an int: that many empty answers first.
+                if self.empty_open is not True:
+                    self.empty_open -= 1
+                return GhResult()
             return GhResult(stdout="\n".join(json.dumps(i) for i in self.open_issues))
         if self.fail_writes:
             return GhResult(rc=1, stderr="HTTP 403")
@@ -132,7 +169,7 @@ class FakeGh:
         return GhResult(stdout=json.dumps({"number": number, "html_url": f"https://github.com/{REPO}/issues/{number}"}))
 
     def writes(self):
-        return [(m, p, b) for m, p, b in self.calls if m != "GET"]
+        return [(m, p, b) for m, p, b in self.calls if m != "GET" and p != "graphql"]
 
 
 class Harness(unittest.TestCase):
@@ -142,12 +179,15 @@ class Harness(unittest.TestCase):
         self.root = pathlib.Path(tmp.name) / "repo"
         shutil.copytree(TESTDATA, self.root)
         self.dir = pathlib.Path(tmp.name)
+        sleep = unittest.mock.patch.object(nightly_bugs.time, "sleep")
+        self.slept = sleep.start()
+        self.addCleanup(sleep.stop)
 
-    def run_once(self, doc, gh=None, live=True):
+    def run_once(self, doc, gh=None, live=True, extra=()):
         gh = gh or FakeGh()
         path = self.dir / "data.json"
         path.write_text(json.dumps(doc))
-        argv = ["--data", str(path), "--repo-root", str(self.root)] + (["--live"] if live else [])
+        argv = ["--data", str(path), "--repo-root", str(self.root)] + (["--live"] if live else []) + list(extra)
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = nightly_bugs.main(argv, gh_runner=gh)
@@ -168,16 +208,16 @@ class StreakTest(Harness):
         [issue] = self.filed(gh)
         self.assertEqual(issue["labels"], ["nightly-red", "domain:capacity", "needs-triage"])
         self.assertEqual(issue["assignees"], ["alice"])
-        self.assertIn("case-red", issue["title"])
+        self.assertEqual(issue["title"], "Nightly: case-red needs triage")
         body = issue["body"]
         self.assertIn("<!-- kube-agents-bot:nightly-red case=case-red -->", body)
         self.assertIn("@carol", body, "the domain owner is mentioned")
         self.assertIn("backup @dave", body)
         for day in (15, 16, 17):
-            self.assertIn(f"2026-10-{day}: 0/3 passed", body)
+            self.assertIn(f"- 2026-10-{day} · [run](", body)
         self.assertIn(f"/logs/{JOB}/30000000000000170001", body, "the run link")
         self.assertIn("eval_case-red_rep1.log", body, "the transcript link")
-        self.assertIn("failed: `names-the-pool: required phrases absent`", body, "the check's reason, score prefix dropped")
+        self.assertNotIn("names-the-pool", body, "the check's reason stays on the dashboard")
         self.assertIn("**Broken test:**", body)
         self.assertLess(body.index("2026-10-17"), body.index("2026-10-15"), "newest night first")
         self.assertIn("filed 1,", out)
@@ -236,7 +276,7 @@ class StreakTest(Harness):
         # say nothing: three real reds around them still file.
         gh, _, _ = self.run_once(data(night(13, [red()]), night(14, [all_infra]), night(15, [storm_graded_fail]), night(16, [red()]), night(17, [task("case-red", "fail", "infra", "fail")])))
         [issue] = self.filed(gh)
-        self.assertIn("2026-10-17: 0/2 passed, 1 infra", issue["body"])
+        self.assertIn("- 2026-10-17 · [run](", issue["body"])
         self.assertNotIn("2026-10-14", issue["body"])
         self.assertNotIn("2026-10-15", issue["body"])
         # Without the real reds, the infra nights alone file no domain bug
@@ -321,6 +361,70 @@ class DedupeTest(Harness):
             self.assertEqual(gh.writes(), [])
             self.assertIn("could not list the nightly-red issues", err)
 
+    def test_an_empty_listing_while_issues_exist_files_nothing(self):
+        # 2026-10-22: the REST listing came back [] with the bugs open, and
+        # the filer filed six duplicates. GraphQL still sees them: no write.
+        issue = {"number": 3667, "title": "t", "body": nightly_bugs.MARKER.format(case="case-red")}
+        gh, out, err = self.run_once(self.THREE_RED(), FakeGh(open_issues=[issue], empty_open=True))
+        self.assertEqual(gh.writes(), [])
+        self.assertIn("listing is not trusted (the open listing holds 0 issues, GraphQL 1 (missing #3667))", err)
+        self.assertIn("filed 0,", out)
+        # The same for a closed bug that still tracks the streak.
+        closed = {"number": 3996, "title": "t", "body": nightly_bugs.MARKER.format(case="case-red"), "closed_at": "2026-10-17T12:00:00Z"}
+        gh, _, err = self.run_once(self.THREE_RED(), FakeGh(closed_issues=[closed], empty_closed=True))
+        self.assertEqual(gh.writes(), [])
+        self.assertIn("the closed listing holds 0 issues, GraphQL 1", err)
+        # And for an infra issue: a lost job's open issue hidden by the listing.
+        lost = data(night(15, [], lost=True), night(16, [green()]), night(17, [], lost=True))
+        job_issue = {"number": 3715, "title": "t", "body": nightly_bugs.BOT_MARKER.format(kind=nightly_bugs.KIND_LOST, field=nightly_bugs.KEY_JOB, key=JOB)}
+        self.assertEqual(len(self.filed(self.run_once(lost)[0], infra=True)), 1, "files when nothing tracks it")
+        gh, _, _ = self.run_once(lost, FakeGh(open_issues=[job_issue], empty_open=True))
+        self.assertEqual(gh.writes(), [])
+
+    def test_a_listing_that_reads_right_on_a_later_attempt_is_used(self):
+        issue = {"number": 3667, "title": "t", "body": nightly_bugs.MARKER.format(case="case-red")}
+        gh, out, err = self.run_once(self.THREE_RED(), FakeGh(open_issues=[issue], empty_open=nightly_bugs.LISTING_ATTEMPTS - 1))
+        self.assertEqual(gh.writes(), [])
+        self.assertIn("tracked: case-red by #3667", out)
+        self.assertEqual(err.count("listing is not trusted"), nightly_bugs.LISTING_ATTEMPTS - 1)
+        reads = [p for m, p, _ in gh.calls if m == "GET" and "state=open" in p]
+        self.assertEqual(len(reads), nightly_bugs.LISTING_ATTEMPTS)
+        self.assertEqual(self.slept.call_count, nightly_bugs.LISTING_ATTEMPTS - 1, "a pause between reads")
+        # Empty on every attempt: nothing written, and the pass says so.
+        gh, _, err = self.run_once(self.THREE_RED(), FakeGh(open_issues=[issue], empty_open=True))
+        self.assertEqual(gh.writes(), [])
+        self.assertIn("no trusted nightly-red issue listing this pass", err)
+
+    def test_a_graphql_cross_check_that_fails_files_nothing(self):
+        for mode in ("fail", "errors"):
+            with self.subTest(mode=mode):
+                gh, _, err = self.run_once(self.THREE_RED(), FakeGh(graphql=mode))
+                self.assertEqual(gh.writes(), [])
+                self.assertIn("the GraphQL cross-check could not be read", err)
+
+    def test_the_cross_check_reads_both_states_in_dry_run_too(self):
+        gh, _, _ = self.run_once(self.THREE_RED(), live=False)
+        [(_, _, body)] = [c for c in gh.calls if c[1] == "graphql"]
+        self.assertEqual(body["variables"], {"owner": "gke-labs", "name": "kube-agents", "label": "nightly-red",
+                                             "since": "2026-10-15T00:00:30Z", "closed": True})
+        gh, _, _ = self.run_once(self.THREE_RED())
+        self.assertEqual(len(self.filed(gh)), 1, "an empty listing GraphQL agrees with still files")
+
+    def test_a_pull_request_in_the_listing_does_not_count_as_an_issue(self):
+        # A labelled pull request pads the REST listing; GraphQL's issues
+        # exclude it, so a listing of the pull request alone is short.
+        pr = {"number": 3990, "title": "t", "body": "", "pull_request": {"url": "https://api.github.com/pulls/3990"}}
+        hidden = {"number": 3667, "title": "t", "body": nightly_bugs.MARKER.format(case="case-red")}
+        filer = nightly_bugs.Filer(nightly_bugs.ghcli.Gh(REPO, FakeGh(open_issues=[pr, hidden])), self.root)
+        self.assertEqual(nightly_bugs.listing_doubt(filer.gh, [pr], [], None), "the open listing holds 0 issues, GraphQL 1 (missing #3667)")
+        self.assertIsNone(nightly_bugs.listing_doubt(filer.gh, [pr, hidden], [], None))
+
+    def test_a_listing_short_of_graphqls_total_beyond_its_first_page_is_untrusted(self):
+        listed = [{"number": n, "title": "t", "body": ""} for n in range(1, 101)]
+        fake = FakeGh(open_issues=listed + [{"number": 101, "title": "t", "body": ""}])
+        filer = nightly_bugs.Filer(nightly_bugs.ghcli.Gh(REPO, fake), self.root)
+        self.assertIsNotNone(nightly_bugs.listing_doubt(filer.gh, listed, [], None))
+
     def test_a_bug_closed_after_the_newest_red_night_is_not_filed_again(self):
         marker = nightly_bugs.MARKER.format(case="case-red")
         # Closed on the 17th after that night's run started (a fix merged).
@@ -330,8 +434,11 @@ class DedupeTest(Harness):
         self.assertIn("tracked: case-red by #3996 (closed, still tracking)", out)
         reads = [p for m, p, _ in gh.calls if m == "GET" and "state=closed" in p]
         self.assertEqual(reads, [f"{ISSUES}?labels=nightly-red&state=closed&since=2026-10-15T00:00:30Z&per_page=100"])
-        # A newer failing night after the close files again.
+        # One newer failing night is not a streak after the close; three are.
         later = data(*(night(d, [red(), green()]) for d in (15, 16, 17, 18)))
+        gh, _, _ = self.run_once(later, FakeGh(closed_issues=[closed]))
+        self.assertEqual(self.filed(gh), [])
+        later = data(*(night(d, [red(), green()]) for d in range(15, 21)))
         gh, _, _ = self.run_once(later, FakeGh(closed_issues=[closed]))
         self.assertEqual(len(self.filed(gh)), 1)
 
@@ -355,12 +462,23 @@ class DedupeTest(Harness):
         gh, _, _ = self.run_once(self.THREE_RED(), FakeGh(closed_issues=[old]))
         self.assertEqual(len(self.filed(gh)), 1)
 
-    def test_a_bug_closed_while_the_newest_red_night_ran_is_filed_again(self):
-        # Closed at 00:30 on the 17th, between that night's start (00:00:30)
-        # and its finish (00:59): the close did not see the night's verdict.
-        closed = {"number": 3996, "title": "t", "body": nightly_bugs.MARKER.format(case="case-red"), "closed_at": "2026-10-17T00:30:00Z"}
-        gh, _, _ = self.run_once(self.THREE_RED(), FakeGh(closed_issues=[closed]))
-        self.assertEqual(len(self.filed(gh)), 1)
+    def test_a_bug_closed_while_the_newest_red_night_ran_counts_only_nights_started_after(self):
+        # #4041: a fix merged and closed the bug at 00:30 on the 17th, while
+        # that night's run (started 00:00:30, from code before the fix) was
+        # still going. Its red verdict and the older ones do not re-file.
+        closed = {"number": 3863, "title": "t", "body": nightly_bugs.MARKER.format(case="case-red"), "closed_at": "2026-10-17T00:30:00Z",
+                  "state_reason": "completed"}
+        gh, out, _ = self.run_once(self.THREE_RED(), FakeGh(closed_issues=[closed]))
+        self.assertEqual(gh.writes(), [])
+        self.assertIn("tracked: case-red by #3863 (closed, still tracking)", out)
+        # Failing on three nights that started after the close: the fix did
+        # not hold, and a fresh issue lists only those nights.
+        after = data(*(night(d, [red(), green()]) for d in range(15, 21)))
+        gh, _, _ = self.run_once(after, FakeGh(closed_issues=[closed]))
+        [issue] = self.filed(gh)
+        for day in (18, 19, 20):
+            self.assertIn(f"- 2026-10-{day} · [run](", issue["body"])
+        self.assertNotIn("2026-10-17", issue["body"])
 
     def test_another_cases_bot_issue_quoting_this_case_is_not_a_match(self):
         other = {"number": 3995, "title": "Nightly: case-maint fails every run", "body": nightly_bugs.MARKER.format(case="case-maint") + "\nreason: see case-red too"}
@@ -419,6 +537,16 @@ class RecoveryTest(Harness):
         [(_, path, body)] = gh.writes()
         self.assertEqual(path, f"{ISSUES}/3989/comments")
         self.assertIn("2026-10-19 nightly", body["body"])
+
+    def test_an_empty_comment_read_on_an_issue_with_comments_does_not_comment_again(self):
+        # The comment read answers [] while the listing counts the bot's
+        # recovery comment: not commented again, retried next tick.
+        issue = dict(self.ISSUE, comments=1)
+        posted = {"body": nightly_bugs.RECOVERY_MARKER.format(case="case-red", date="2026-10-17")}
+        gh, out, err = self.run_once(self.recovered_data(), FakeGh(open_issues=[issue], comments={3990: [posted]}, empty_comments=True))
+        self.assertEqual(gh.writes(), [])
+        self.assertIn("#3990 lists 1 comments and the read returned 0", err)
+        self.assertIn("failed: case-red", out)
 
     def test_unreadable_comments_are_reported_failed(self):
         _, out, err = self.run_once(self.recovered_data(), FakeGh(open_issues=[self.ISSUE], fail_comments=True))
@@ -537,6 +665,117 @@ class DryRunTest(Harness):
             nightly_bugs.parse_args(["--data", "x", "--dry-run", "--live"])
 
 
+class HeldStateTest(Harness):
+    """--state counts the live ticks held on an untrusted listing (#3769)."""
+
+    THREE_RED = staticmethod(lambda: data(*(night(d, [red(), green()]) for d in (15, 16, 17))))
+
+    def held_tick(self, live=True, **gh):
+        issue = {"number": 3667, "title": "t", "body": nightly_bugs.MARKER.format(case="case-red")}
+        self.run_once(self.THREE_RED(), FakeGh(open_issues=[issue], **gh), live=live, extra=["--state", str(self.state)])
+        return json.loads(self.state.read_text()) if self.state.exists() else None
+
+    def setUp(self):
+        super().setUp()
+        self.state = self.dir / "held.json"
+
+    def test_held_ticks_count_up_from_one_since_and_a_trusted_tick_clears_them(self):
+        first = self.held_tick(empty_open=True)
+        self.assertEqual(first["held_ticks"], 1)
+        self.assertIn("the open listing holds 0 issues, GraphQL 1", first["doubt"])
+        second = self.held_tick(empty_open=True)
+        self.assertEqual(second["held_ticks"], 2)
+        self.assertEqual(second["held_since"], first["held_since"], "the hold keeps its start")
+        cleared = self.held_tick()
+        self.assertEqual((cleared["held_ticks"], cleared["held_since"], cleared["doubt"]), (0, None, None))
+
+    def test_a_dry_run_records_no_hold(self):
+        self.held_tick(empty_open=True)
+        self.assertEqual(self.held_tick(live=False, empty_open=True)["held_ticks"], 0, "a disarmed filer is not held")
+
+    def test_a_listing_that_could_not_be_read_carries_the_hold_forward(self):
+        # #4573 review: an hour of failed reads must not age an open hold
+        # out (HELD_STATE_FRESH) and restart it with a later held_since.
+        before = self.held_tick(empty_open=True)
+        aged = dict(before, updated_at="2026-01-01T00:00:00+00:00")
+        self.state.write_text(json.dumps(aged))
+        after = self.held_tick(fail_list=True)
+        self.assertEqual({k: after[k] for k in ("held_ticks", "held_since", "doubt")}, {k: before[k] for k in ("held_ticks", "held_since", "doubt")})
+        self.assertNotEqual(after["updated_at"], aged["updated_at"], "refreshed, so the next held tick adds to it")
+        self.assertEqual(self.held_tick(empty_open=True)["held_ticks"], 2)
+        # No open hold, or a dry run: nothing to carry, nothing written.
+        self.state.unlink()
+        self.assertIsNone(self.held_tick(fail_list=True), "nothing to record")
+        self.state.write_text(json.dumps(aged))
+        self.assertEqual(self.held_tick(live=False, fail_list=True), aged)
+
+    def test_a_count_older_than_an_hour_starts_over(self):
+        # The ticks between went unrecorded, so they were not held in a row.
+        old = nightly_bugs.datetime.datetime.now(nightly_bugs.datetime.timezone.utc) - nightly_bugs.datetime.timedelta(hours=2)
+        self.state.write_text(json.dumps({"held_ticks": 7, "held_since": "2026-10-19T12:00:00+00:00", "doubt": "x", "updated_at": old.isoformat()}))
+        after = self.held_tick(empty_open=True)
+        self.assertEqual(after["held_ticks"], 1)
+        self.assertNotEqual(after["held_since"], "2026-10-19T12:00:00+00:00")
+
+    def test_a_state_that_cannot_be_read_costs_the_count_not_the_run(self):
+        # run_once asserts rc 0.
+        with unittest.mock.patch.object(nightly_bugs.post_health, "read_state", side_effect=FileNotFoundError("gcloud")):
+            _, _, err = self.run_once(self.THREE_RED(), FakeGh(empty_open=True), extra=["--state", str(self.state)])
+        self.assertIn("could not update", err)
+
+    def test_a_failed_read_leaves_the_record_alone(self):
+        # #4573 review: a gcloud failure is not "no hold on record"; a
+        # fresh count written over a 9-tick hold would lose the line.
+        before = self.held_tick(empty_open=True)
+        with unittest.mock.patch.object(nightly_bugs, "read_held_state", side_effect=nightly_bugs.StateUnreadable("HTTP 503")):
+            _, _, err = self.run_once(self.THREE_RED(), FakeGh(empty_open=True), extra=["--state", str(self.state)])
+        self.assertIn("could not update", err)
+        self.assertEqual(json.loads(self.state.read_text()), before)
+
+    def test_a_gs_read_tells_an_absent_object_from_a_failed_read(self):
+        location = "gs://bucket/nightly-bugs-state.json"
+
+        def runner(stdout="", stderr="", rc=0):
+            return lambda argv, **kw: GhResult(rc=rc, stdout=stdout, stderr=stderr)
+
+        self.assertEqual(nightly_bugs.read_held_state(location, runner('{"held_ticks": 3}')), {"held_ticks": 3})
+        self.assertIsNone(nightly_bugs.read_held_state(location, runner(rc=1, stderr="ERROR: The following URLs matched no objects or files")))
+        with self.assertRaises(nightly_bugs.StateUnreadable):
+            nightly_bugs.read_held_state(location, runner(rc=1, stderr="ERROR: HTTPError 503: Service Unavailable"))
+
+    def test_without_state_nothing_is_written(self):
+        self.run_once(self.THREE_RED(), FakeGh(empty_open=True))
+        self.assertEqual(sorted(p.name for p in self.dir.iterdir()), ["data.json", "repo"])
+
+
+class HeldDigestLineTest(unittest.TestCase):
+    NOW = nightly_bugs.datetime.datetime(2026, 10, 20, 15, 0, tzinfo=nightly_bugs.datetime.timezone.utc)
+
+    def state(self, ticks, updated_min_ago=15):
+        updated = self.NOW - nightly_bugs.datetime.timedelta(minutes=updated_min_ago)
+        return {"held_ticks": ticks, "held_since": "2026-10-20T12:45:00+00:00", "doubt": "the open listing holds 0 issues, GraphQL 3", "updated_at": updated.isoformat()}
+
+    def test_the_line_appears_at_the_threshold_with_the_start_and_the_reason(self):
+        self.assertEqual(nightly_bugs.held_digest_lines(self.state(nightly_bugs.HELD_TICKS_DIGEST - 1), self.NOW), [])
+        self.assertEqual(
+            nightly_bugs.held_digest_lines(self.state(nightly_bugs.HELD_TICKS_DIGEST), self.NOW),
+            ["🚫 Nightly bug filing held since Tue 8:45 AM ET: the nightly-red issue listing is untrusted (the open listing holds 0 issues, GraphQL 3), so no bugs are filed or commented on."],
+        )
+
+    def test_a_hold_older_than_a_day_names_its_date(self):
+        # #4573 review: a weekday alone reads a week-old hold as this morning's.
+        old = dict(self.state(700), held_since="2026-10-13T12:45:00+00:00")
+        [line] = nightly_bugs.held_digest_lines(old, self.NOW)
+        self.assertIn("held since Tue Oct 13 8:45 AM ET:", line)
+        [line] = nightly_bugs.held_digest_lines(dict(old, held_since="garbage"), self.NOW)
+        self.assertIn("held since an unrecorded time:", line)
+
+    def test_a_stale_cleared_or_missing_state_says_nothing(self):
+        self.assertEqual(nightly_bugs.held_digest_lines(self.state(20, updated_min_ago=61), self.NOW), [])
+        self.assertEqual(nightly_bugs.held_digest_lines({"held_ticks": 0, "updated_at": self.NOW.isoformat()}, self.NOW), [])
+        self.assertEqual(nightly_bugs.held_digest_lines(None, self.NOW), [])
+
+
 class WorkflowSwitchTest(unittest.TestCase):
     """ci-health.yml's step is the only thing that arms the writes: run its
     shell with each switch setting and a `python3` that prints its argv."""
@@ -564,6 +803,11 @@ class WorkflowSwitchTest(unittest.TestCase):
 
     def test_the_switch_defaults_off(self):
         self.assertIn("NIGHTLY_BUGS_LIVE: ${{ vars.NIGHTLY_BUGS_LIVE || 'false' }}", WORKFLOW.read_text())
+
+    def test_the_filer_and_the_digest_share_one_held_state_object(self):
+        text = WORKFLOW.read_text()
+        self.assertIn('nightly_bugs.py --data work/data.json --state "$DASHBOARD_BUCKET/nightly-bugs-state.json"', text)
+        self.assertIn('--bugs-state "$DASHBOARD_BUCKET/nightly-bugs-state.json"', text)
 
 
 def infra_task(name, reason=STORM_REASON):
@@ -697,14 +941,72 @@ class InfraCaseTest(Harness):
         self.assertIn("<!-- kube-agents-bot:nightly-infra case=case-red -->", body)
         self.assertIn("Infra backup: @iris", body)
         self.assertIn("owner @carol", body, "the domain owner is named for a hand-off")
-        self.assertIn("`3 of 3 repetitions infrastructure: agent run failed: http 429 RESOURCE_EXHAUSTED`", body)
+        self.assertIn("- 2026-10-17 · [run](", body)
+        self.assertNotIn("3 of 3", body, "the repetition count stays on the dashboard")
+        self.assertNotIn("RESOURCE_EXHAUSTED", body, "and so does the classifier's reason")
         self.assertIn("eval_case-red_rep1.log", body)
+
+    def test_a_drifted_fixture_files_no_domain_bug_and_one_infra_issue_without_the_role(self):
+        # hack/ci-eval-pr.sh recorded every repetition without running it:
+        # the lease-time scan saw version-laggard drifted on each night.
+        reason = (
+            "KUBE_AGENTS_INFRA_FAILURE: the record holds no scored run, so there is nothing to grade "
+            "(fixture-drift:version-laggard: cluster currentMasterVersion minor_behind_channel_default: observed the default)"
+        )
+
+        def drifted():
+            return {"name": "case-red", "result": "infra", "reps": [rep(i + 1, "infra", reason) for i in range(3)]}
+
+        gh, _, _ = self.run_once(data(*(night(d, [drifted()]) for d in (15, 16, 17))))
+        self.assertEqual(self.filed(gh), [], "never a nightly-red bug against the case")
+        [issue] = self.filed(gh, infra=True)
+        self.assertEqual(issue["title"], "Nightly infra: case-red kept from running")
+        self.assertNotIn("fixture-drift", issue["body"], "the classifier's reason stays on the dashboard")
+        self.assertNotIn("3 of 3", issue["body"])
 
     def test_a_case_with_no_line_on_clean_nights_files(self):
         gh, _, _ = self.run_once(data(night(14, [green("case-red")]), *(night(d, []) for d in (15, 16, 17))))
         [issue] = self.filed(gh, infra=True)
         self.assertIn("no line for the case", issue["body"])
         self.assertNotIn("eval_case-red_rep1.log", issue["body"], "no transcript link for a run that recorded nothing")
+
+    def test_a_case_the_inject_lane_dropped_is_not_kept_from_running(self):
+        # case-red ran on the 14th (today mode), then the nightly moved to
+        # next, whose inject lane drops it before the fan-out: not kept.
+        nights = [night(d, []) for d in (15, 16, 17)]
+        for run in nights:
+            run["lane_excluded"] = ["case-red"]
+        gh, _, _ = self.run_once(data(night(14, [green("case-red")]), *nights))
+        self.assertEqual(self.filed(gh, infra=True), [])
+
+    def test_lane_excluded_cases_do_not_count_toward_a_pool_wide_night(self):
+        # The 14th ran four cases the next-mode lane drops from the 15th on.
+        # Each later night has 2 of 5 cases infra: 40%, not pool-wide, though
+        # it would read as 6 of 9 if the dropped four counted as no line.
+        gone = ("gone-1", "gone-2", "gone-3", "gone-4")
+        before = night(14, [green("case-red"), *(green(n) for n in gone)])
+        after = []
+        for d in (15, 16, 17):
+            run = night(d, [infra_task("case-red"), infra_task("filler-1"), *(green(n) for n in FILLER[1:])], filler=False)
+            run["lane_excluded"] = list(gone)
+            after.append(run)
+        gh, _, _ = self.run_once(data(before, *after))
+        [issue] = self.filed(gh, infra=True)
+        self.assertIn("case-red", issue["title"])
+
+    def test_a_post_flip_matrix_larger_than_the_pre_flip_one_sizes_the_night(self):
+        # The post-flip matrix (11) outgrew the pre-flip one less its dropped
+        # four (5). A later night with 6 lines, 2 infra, misses 5 of 11:
+        # 7 of 11 ungraded is pool-wide and skipped, never 3 of 7.
+        gone = ("gone-1", "gone-2", "gone-3", "gone-4")
+        new = tuple(f"new-{i}" for i in range(1, 7))
+        before = night(14, [green("case-red"), *(green(n) for n in gone)])
+        full = night(15, [green("case-red"), *(green(n) for n in new)])
+        short = [night(d, [infra_task("case-red"), infra_task("new-1")]) for d in (16, 17, 18)]
+        for run in (full, *short):
+            run["lane_excluded"] = list(gone)
+        gh, _, _ = self.run_once(data(before, full, *short))
+        self.assertEqual(self.filed(gh, infra=True), [])
 
     def test_nights_before_a_case_first_ran_do_not_count(self):
         gh, _, _ = self.run_once(data(night(15, []), night(16, []), night(17, [infra_task("case-red")])))
@@ -783,7 +1085,8 @@ class InfraCaseTest(Harness):
         doc = data(night(15, [red()]), night(16, [green("case-red")]), night(17, [infra_task("case-red")]))
         gh, _, _ = self.run_once(doc, FakeGh(open_issues=[issue]))
         [(_, comment)] = self.comments(gh)
-        self.assertIn("Again on the 2026-10-17 nightly: `3 of 3 repetitions infrastructure", comment)
+        self.assertIn("Again on the 2026-10-17 nightly: `case-red` was kept from running · [run](", comment)
+        self.assertNotIn("429", comment)
 
     def test_a_human_issue_about_the_case_neither_blocks_nor_receives_infra(self):
         human = {"number": 3950, "title": "case-red fails on main", "body": "see the nightly", "created_at": "2026-10-01T00:00:00Z"}
@@ -837,13 +1140,31 @@ class InfraCaseTest(Harness):
         doc = data(*(night(d, [infra_task("case-red")]) for d in (14, 15, 16, 17)))
         gh, _, _ = self.run_once(doc, FakeGh(closed_issues=[closed]))
         self.assertEqual(self.filed(gh, infra=True), [])
-        # Closed as completed (fixed), the next kept night files again.
-        gh, _, _ = self.run_once(doc, FakeGh(closed_issues=[dict(closed, state_reason="completed")]))
+        # Closed as completed (fixed) on the 16th while the streak's nights
+        # (15th-17th) include ones that started before the close: still
+        # tracked, as for domain bugs (#4041).
+        fixed = dict(closed, state_reason="completed")
+        gh, _, _ = self.run_once(doc, FakeGh(closed_issues=[fixed]))
+        self.assertEqual(self.filed(gh, infra=True), [])
+        # Three kept nights that all started after the close: filed again.
+        after = data(*(night(d, [infra_task("case-red")]) for d in (14, 15, 16, 17, 18, 19)))
+        gh, _, _ = self.run_once(after, FakeGh(closed_issues=[fixed]))
         self.assertEqual(len(self.filed(gh, infra=True)), 1)
         # Graded after the close, then kept again: a new problem, filed.
         doc = data(*(night(d, [infra_task("case-red")]) for d in (14, 15, 16)), night(17, [green("case-red")]),
                    *(night(d, [infra_task("case-red")]) for d in (18, 19, 20)))
         gh, _, _ = self.run_once(doc, FakeGh(closed_issues=[closed]))
+        self.assertEqual(len(self.filed(gh, infra=True)), 1)
+
+    def test_a_handed_off_lost_job_issue_clears_on_a_clean_night_inside_the_window(self):
+        # Lost on the 15th, clean on the 16th, lost on the 17th; the job's
+        # issue was handed off (not planned) on the 15th after that night
+        # started. The clean 16th finished after the close, so the hand-off
+        # has cleared and the 17th's loss files fresh.
+        lost = data(night(15, [], lost=True), night(16, [green()]), night(17, [], lost=True))
+        handed_off = {"number": 3716, "title": "t", "closed_at": "2026-10-15T12:00:00Z", "state_reason": "not_planned",
+                      "body": nightly_bugs.BOT_MARKER.format(kind=nightly_bugs.KIND_LOST, field=nightly_bugs.KEY_JOB, key=JOB)}
+        gh, _, _ = self.run_once(lost, FakeGh(closed_issues=[handed_off]))
         self.assertEqual(len(self.filed(gh, infra=True)), 1)
 
     def test_a_case_that_changed_parts_is_read_from_the_part_that_ran_it(self):
@@ -876,6 +1197,16 @@ class InfraCaseTest(Harness):
         gh, _, _ = self.run_once(data(*runs, night(18, [green("case-red")])), FakeGh(open_issues=[issue]))
         [(_, comment)] = self.comments(gh)
         self.assertIn("`case-red` was graded on the 2026-10-18 nightly", comment)
+
+    def test_an_open_issue_naming_the_main_b_job_is_read_on_the_main_b_part(self):
+        # As above, but main-b ran the case: the note cites main-b's build.
+        issue = {"number": 3976, "title": "t", "body": f"<!-- kube-agents-bot:nightly-infra case=case-red --> (`{MAIN_B_JOB}`)", "created_at": "2026-10-04T12:00:00Z"}
+        main = [night(d, []) for d in range(1, 18)]
+        main_b = [night(1, [green("case-red")], job=MAIN_B_JOB, hour="09")] + [night(d, [], job=MAIN_B_JOB, hour="09") for d in range(2, 18)]
+        gh, _, _ = self.run_once(data(*sorted(main + main_b, key=lambda r: r["build_id"])), FakeGh(open_issues=[issue]))
+        [(_, comment)] = self.comments(gh)
+        self.assertIn("Again on the 2026-10-17 nightly", comment)
+        self.assertIn(f"/logs/{MAIN_B_JOB}/30000000000000170902)", comment, "read on the main-b part: its run is linked")
 
     def test_a_lost_half_is_not_vouched_for_by_a_clean_sibling_job(self):
         # Two jobs of the main part each date: the first runs clean, the
@@ -958,6 +1289,56 @@ class RunAsAScript(Harness):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("warning: gh api GET repos/gke-labs/kube-agents/issues?labels=nightly-red", proc.stderr)
         self.assertIn("nightly bugs (dry run): would file 0", proc.stdout)
+
+
+
+class PublicIssueCarriesNoCaseResultsTest(Harness):
+    """The repository is public. A nightly-red issue names the case and links
+    the run, the transcript and the nightly report; the per-night pass counts
+    and the checks' reasons stay on the dashboard behind those links."""
+
+    def test_the_issue_body_has_no_counts_and_no_reasons(self):
+        gh, _, _ = self.run_once(data(night(15, [red(), green()]), night(16, [red(), green()]), night(17, [red(), green()])))
+        [issue] = self.filed(gh)
+        body = issue["body"]
+        self.assertIn("case-red", issue["title"])
+        for day in (15, 16, 17):
+            self.assertIn(f"- 2026-10-{day} · [run](", body)
+        self.assertNotIn("passed", body.split("**Nights**")[1].split("Nightly report")[0], body)
+        self.assertNotIn("failed: ", body)
+        self.assertNotIn("names-the-pool", body, "the check's reason stays off the public issue")
+        self.assertIn(f"/logs/{JOB}/30000000000000170001", body)
+        self.assertIn("eval_case-red_rep1.log", body)
+        self.assertIn("Nightly report:", body)
+
+    def test_the_recovery_comment_has_no_counts(self):
+        issue = {"number": 3990, "title": "Nightly: case-red", "body": nightly_bugs.MARKER.format(case="case-red"), "created_at": "2026-10-16T12:00:00Z"}
+        recovered = data(night(14, [red()]), night(15, [red()]), night(16, [red()]), night(17, [green("case-red")]), night(18, [green("case-red")]))
+        gh, _, _ = self.run_once(recovered, FakeGh(open_issues=[issue]))
+        [(_, _, body)] = gh.writes()
+        self.assertIn("`case-red` is clear on the 2026-10-17 nightly: [run](", body["body"])
+        self.assertNotIn("3/3", body["body"])
+
+    def test_the_red_issue_and_its_recovery_carry_no_result(self):
+        gh, _, _ = self.run_once(data(night(15, [red(), green()]), night(16, [red(), green()]), night(17, [red(), green()])))
+        [issue] = self.filed(gh)
+        for text in (issue["title"], issue["body"]):
+            self.assertIsNone(RESULTS_RE.search(text), text)
+        issue = {"number": 3990, "title": "Nightly: case-red", "body": nightly_bugs.MARKER.format(case="case-red"), "created_at": "2026-10-16T12:00:00Z"}
+        recovered = data(night(14, [red()]), night(15, [red()]), night(16, [red()]), night(17, [green("case-red")]))
+        gh, _, _ = self.run_once(recovered, FakeGh(open_issues=[issue]))
+        [(_, _, body)] = gh.writes()
+        self.assertIsNone(RESULTS_RE.search(body["body"]), body["body"])
+
+    def test_the_infra_case_issue_and_its_night_comment_carry_no_result(self):
+        gh, _, _ = self.run_once(data(*(night(d, [infra_task("case-red")]) for d in (15, 16, 17))))
+        [issue] = self.filed(gh, infra=True)
+        for text in (issue["title"], issue["body"]):
+            self.assertIsNone(RESULTS_RE.search(text), text)
+        issue = {"number": 3971, "title": "t", "body": "<!-- kube-agents-bot:nightly-infra case=case-red -->", "created_at": "2026-10-14T12:00:00Z"}
+        gh, _, _ = self.run_once(data(night(15, [red()]), night(16, [green("case-red")]), night(17, [infra_task("case-red")])), FakeGh(open_issues=[issue]))
+        [(_, comment)] = self.comments(gh)
+        self.assertIsNone(RESULTS_RE.search(comment), comment)
 
 
 if __name__ == "__main__":

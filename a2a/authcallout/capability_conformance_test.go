@@ -442,6 +442,62 @@ func TestTheWebCredentialCannotReachTheVerifyPlane(t *testing.T) {
 	}
 }
 
+// The console credential, the same hole and the same deny. consoleIdentity
+// copied web's `a2a.>` read surface and shipped without web's subtraction, and
+// its password is handed to a browser too (the PoC console server's
+// /config.json). It holds no publish under `a2a.cap.reply.>` either, so the
+// hazard is the same swallowed request, not a forged answer.
+func TestTheConsoleCredentialCannotReachTheVerifyPlane(t *testing.T) {
+	h, _ := startHarnessWithServerLogMap(t, capMap(t), capTokens())
+	nc, violations := connectStatic(t, h, "console", "pw-console")
+
+	if !queueSubscribeRefused(t, nc, violations, capability.VerifySubscribe, capability.VerifyQueue) {
+		t.Errorf("console joined queue group %q on %s; it can swallow verify requests and every swallowed one is a task rejected",
+			capability.VerifyQueue, capability.VerifySubscribe)
+	}
+	if !subscribeRefused(t, nc, violations, capability.ReplyPrefix+">") {
+		t.Errorf("console may subscribe to %s>", capability.ReplyPrefix)
+	}
+	// The control: the console still reads the task plane its page renders.
+	if subscribeRefused(t, nc, violations, "a2a.tasks.>") {
+		t.Error("console can no longer subscribe to the task plane; the deny is too wide")
+	}
+}
+
+// The principals the callout mints, a session pod and an AgentProfile pod,
+// cannot join the verifier's queue group either. The operator's render test
+// checks only the identities it renders; these grants are built here
+// (sessionGrants, profileGrants), so a widening in either would otherwise
+// ship with no test asking this question.
+func TestCalloutMintedPrincipalsCannotJoinTheVerifyQueue(t *testing.T) {
+	for _, c := range []struct {
+		name, pod, token string
+		addressee        string // the principal's own verify token
+		idmap            string
+		tokens           map[string]Attested
+	}{
+		{"session pod", podA, tokenPodA, podA, sessionMap, sessionTokens()},
+		{"profile pod", auditorPod1, tokenAuditorPod1, auditor, profileMap, profileTokens()},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			h := startHarness(t, c.idmap, c.tokens)
+			nc, violations := h.connectAs(t, c.pod, c.token)
+			// The wildcard and literal verify subjects: queue members share a
+			// group by name across subjects, so an exact grant on one
+			// delegate's subject joins the verifier's group for it.
+			for _, subject := range []string{
+				capability.VerifySubscribe,
+				strings.Replace(capability.VerifySubscribe, "*", bridgeAddressee, 1),
+				strings.Replace(capability.VerifySubscribe, "*", c.addressee, 1),
+			} {
+				if !queueSubscribeRefused(t, nc, violations, subject, capability.VerifyQueue) {
+					t.Errorf("%s joined queue group %q on %s", c.name, capability.VerifyQueue, subject)
+				}
+			}
+		})
+	}
+}
+
 // The bridge -- the executor a stock install actually runs -- can verify, and
 // cannot ask in anybody else's name.
 //

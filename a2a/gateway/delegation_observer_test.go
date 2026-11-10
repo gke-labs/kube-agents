@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -1269,6 +1270,134 @@ func TestASettledChainProbesAsItsLastTask(t *testing.T) {
 			t.Fatalf("probe of a plain turn = %+v", st)
 		}
 	})
+}
+
+// TestTheProbesUsageIsTheFrontDoorsTurnsOverTheChain: a harness reads the
+// chain's cost off the root, so a probe that asks for it sums the usage of
+// the root's own turn and of every wake that continued it, whichever link
+// the read follows, and the children's apart, since a child is another
+// addressee's work. A probe that did not ask reads no extra streams and
+// carries none.
+func TestTheProbesUsageIsTheFrontDoorsTurnsOverTheChain(t *testing.T) {
+	r, spawn, obs := startObservedRig(t, doorDelegation(t))
+	ctx := context.Background()
+	conv := "a2a:agent-1001/ctx-usage-chain"
+	publishUsage := func(exec *lib.TaskExecution, in, out int64) {
+		t.Helper()
+		part, err := lib.UsagePart(lib.Usage{InputTokens: in, OutputTokens: out})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := exec.PublishArtifact(ctx, lib.Artifact{ArtifactID: lib.ArtifactUsage, Name: lib.ArtifactUsage,
+			Parts: []lib.Part{part}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// delegate has the turn exec publish its usage and delegate, then ends
+	// it, and returns the child once the record names it.
+	delegate := func(exec *lib.TaskExecution, turnID string, n int, in, out int64) *lib.Envelope {
+		t.Helper()
+		publishUsage(exec, in, out)
+		if err := exec.PublishArtifact(ctx, delegateArtifact(t, "platform", "report fleet health")); err != nil {
+			t.Fatal(err)
+		}
+		child := awaitSubmission(t, r, targetPlatform, n)
+		waitFor(t, "the child on the record", func() bool {
+			rec, _ := r.g.reg.Get(ctx, conv)
+			ref, _ := rec.TaskRefFor(turnID)
+			return len(ref.Children) == 1
+		})
+		completeTask(t, exec, "delegated to platform")
+		return child
+	}
+	// wakeAfter ends the child, whose usage counts apart from the front
+	// door's, and returns the wake its end started.
+	wakeAfter := func(child *lib.Envelope, spawns int) (*lib.TaskExecution, *lib.Envelope) {
+		t.Helper()
+		cexec := r.execFor(t, child, targetPlatform)
+		publishUsage(cexec, 100000, 10000)
+		completeTask(t, cexec, "fleet is green")
+		waitFor(t, "wake spawn", func() bool { return len(spawn.calls()) >= spawns })
+		session := spawn.calls()[spawns-1].Session
+		n := 0
+		for _, c := range spawn.calls()[:spawns-1] {
+			if c.Session == session {
+				n++
+			}
+		}
+		wake := awaitSubmission(t, r, session, n)
+		wexec := r.execFor(t, wake, session)
+		if err := wexec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+			t.Fatal(err)
+		}
+		return wexec, wake
+	}
+
+	exec, origin, _ := sessionTurnVia(t, r, spawn, conv, a2aBackend, "how is the fleet?")
+	child := delegate(exec, origin.TaskID, 0, 1000, 100)
+	wexec, wake := wakeAfter(child, 2)
+	child2 := delegate(wexec, wake.TaskID, 1, 200, 20)
+	wexec2, _ := wakeAfter(child2, 3)
+	publishUsage(wexec2, 30, 3)
+	completeTask(t, wexec2, "the fleet is healthy")
+
+	waitFor(t, "the root's terminal", func() bool { _, ok := obs.terminalFor(origin.TaskID); return ok })
+	waitFor(t, "the chain settled on the record", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		return rec.ActiveTask == nil
+	})
+	plain, err := r.g.probeConversation(ctx, conv, origin.TaskID)
+	if err != nil || plain.Usage != nil || plain.ChildUsage != nil {
+		t.Fatalf("a probe that did not ask carries usage %+v / %+v (err %v); want none", plain.Usage, plain.ChildUsage, err)
+	}
+	st, err := r.g.probeConversation(withChainUsage(ctx), conv, origin.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := lib.Usage{InputTokens: 1230, OutputTokens: 123}
+	if !st.Final || st.Usage == nil || *st.Usage != want {
+		t.Fatalf("probe of the root = %+v (usage %+v), want final with usage %+v: the root and both wakes, no child",
+			st, st.Usage, want)
+	}
+	wantChildren := lib.Usage{InputTokens: 200000, OutputTokens: 20000}
+	if st.ChildUsage == nil || *st.ChildUsage != wantChildren || st.UsagePartial {
+		t.Fatalf("child usage = %+v (partial %v), want %+v: both children, apart from the front door",
+			st.ChildUsage, st.UsagePartial, wantChildren)
+	}
+	// Both children went to platform: named once, on any read.
+	if want := []string{targetPlatform}; !slices.Equal(st.ChildAddressees, want) || !slices.Equal(plain.ChildAddressees, want) {
+		t.Fatalf("child addressees = %v / %v, want %v on both reads", st.ChildAddressees, plain.ChildAddressees, want)
+	}
+}
+
+// chainChildAddressees names each child of the read's chain once, in the
+// order delegated, as the addressee it was minted for; a child of another
+// chain on the same record isn't this chain's.
+func TestChainChildAddresseesNameTheChainsChildrenOnce(t *testing.T) {
+	rec := &SessionRecord{Tasks: []TaskRef{
+		{ID: "root", Addressee: "chat-otter"},
+		{ID: "c1", Addressee: "tse", Role: taskRoleChild, ParentTaskID: "root", RootTaskID: "root"},
+		{ID: "w1", Addressee: "chat-otter", Role: taskRoleWake, RootTaskID: "root"},
+		{ID: "c2", Addressee: targetPlatform, Role: taskRoleChild, ParentTaskID: "w1", RootTaskID: "root"},
+		{ID: "c3", Addressee: "tse", Role: taskRoleChild, ParentTaskID: "w1", RootTaskID: "root"},
+		{ID: "other", Addressee: "chat-otter"},
+		{ID: "c4", Addressee: "elsewhere", Role: taskRoleChild, ParentTaskID: "other", RootTaskID: "other"},
+	}}
+	want := []string{"tse", targetPlatform}
+	for _, read := range []string{"root", "w1", "c3"} {
+		if got := chainChildAddressees(rec, read); !slices.Equal(got, want) {
+			t.Errorf("read on %s: %v, want %v", read, got, want)
+		}
+	}
+	if got := chainChildAddressees(rec, "other"); !slices.Equal(got, []string{"elsewhere"}) {
+		t.Errorf("the other chain: %v", got)
+	}
+	if got := chainChildAddressees(rec, "missing"); got != nil {
+		t.Errorf("an unknown task: %v, want nil", got)
+	}
+	if got := chainChildAddressees(&SessionRecord{Tasks: []TaskRef{{ID: "solo"}}}, "solo"); got == nil || len(got) != 0 {
+		t.Errorf("no delegation: %#v, want an empty, non-nil list", got)
+	}
 }
 
 // The door's one deliverable is the last turn's answer; earlier turns are

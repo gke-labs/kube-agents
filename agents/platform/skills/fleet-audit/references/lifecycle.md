@@ -18,10 +18,11 @@ workspace exists.
 What that workspace contains depends on the install, and `start` tells you which one you have as its
 `mode` field:
 
-- **`content`** — the workspace is an empty directory. The repository lives in the credential broker,
-  which owns the only checkout; you write manifests into the directory and the harness hands the
-  bytes over. Nothing on your side is a git repository, so there is nothing here to read the
-  repository out of: use `list` and `fetch` (below) for that.
+- **`content`** — the workspace is an empty directory. You write manifests into it, and at `finish`
+  the harness copies them into a clone the credential broker sends down, commits there, and has the
+  broker push the branch. The workspace is not a git repository, so there is nothing here to read
+  the repository out of: use `grep`, `list` and `fetch` (below) for that. Every install with a
+  broker configured takes this mode.
 - **`directory`** — the workspace is a clone of the GitOps repository on the shared volume, and the
   harness runs `checkout`, `add`, `commit` and `push` inside it.
 - **`none`** — no forge is configured; see [No forge configured](finish.md#no-forge-configured).
@@ -59,6 +60,12 @@ it, or the broker does not manage it, the run does not choose another repository
 no-forge path, and its `no_forge` note names the repository and the reason; see
 [No forge configured](finish.md#no-forge-configured). Such a run is never silent.
 
+Before that listing, `start` asks the forge's `capabilities`. A forge with no issue tracker, or with
+no labels, gets no ledger issue: `start` prints `"ledger": "store"` and a `ledger_note`, the ledger
+goes to the report store and chat, and the remediation pull requests still open on the forge. The
+listing is then one open pull request, not one open issue. See
+[A forge with no issue tracker](finish.md#a-forge-with-no-issue-tracker).
+
 ### Step 1 — `start`
 
 Before inspecting anything, claim the workspace:
@@ -78,8 +85,8 @@ credential proxy or the broker is the same answer, and you stop there: see the s
 working around a refusal (`SKILL.md`, "Never work around a refusal").
 `--repo` takes the name as the managed list
 gives it: `owner/name` on github.com, `<host>/owner/name` on a GitHub Enterprise Server, and
-`<host>/<path>` for a repository on another forge (`gitlab.com/<group>/<subgroup>/<project>`). In content mode the broker's file workspace clones a repository
-from its own forge, so `fetch`, `list`, `grep`, the remediation step and the declared-intent search
+`<host>/<path>` for a repository on another forge (`gitlab.com/<group>/<subgroup>/<project>`). In content mode the broker reaches a repository
+on its own forge, so `fetch`, `list`, `grep`, the remediation step and the declared-intent search
 work the same way on every forge, and a remediation on GitLab is a merge request. Directory mode
 serves GitHub only: its local clone reaches no other forge, so `start` and `finish` on a repository
 elsewhere stop at the clone, with no ledger written. Run the audit in content mode for those. It
@@ -142,7 +149,7 @@ in `content` mode the workspace is empty rather than a checkout. Read it rather 
 what is on disk. `none` means no forge is configured; see [No forge configured](finish.md#no-forge-configured).
 
 `pending_remediation_requests` lists the findings a repository writer has already asked to be fixed,
-parsed from the ledger's comments. **Write those manifests during inspection** — if the finding is
+parsed from the ledger's comments (always empty when `ledger` is `store`: there is no ledger thread). **Write those manifests during inspection** — if the finding is
 still reproducing at `finish`, its pull request opens immediately instead of a week later.
 
 `carried` lists every finding the open ledger carries — its id, the check that found it, where it
@@ -164,12 +171,12 @@ and the issue has no readable block (`start` says so on stderr).
 `context_repos` names the repositories registered for **declared intent**: the `context_repos` key
 of `$GITOPS_STATE_CONFIGMAP`, added by an administrator by hand, as `owner/name` slugs. A stream
 whose SOP has a declared-intent step (`obtainability-audit` §4a, `compliance-audit` §3a, `security-patch-orchestrator` §4a, `fleet-wide-cost-analysis` §3a) searches them before it
-reports a posture as a finding. They are read and nothing else: the key is separate from
+reports a posture as a finding. The audit only reads them, and nothing writes them: the key is separate from
 `managed_repos`, the harness never merges the two, so the broker's push gate, the repository
 resolver and the sweep never see them. The list is empty when nothing is registered or the key
 could not be read, which `start` says on stderr; the GitOps clone is searched either way. A private
 context repository is readable through the broker's content-mode clone only (`inspect_repository.py
-clone` and `open`): the broker mints a `contents: read` token for it per clone and installs it
+clone`): the broker mints a `contents: read` token for it per clone and installs it
 nowhere. The sandbox's own CLI credential and the directory-mode clone cover managed repositories
 alone.
 
@@ -196,7 +203,8 @@ file names a path with nothing behind it, is copied whole under those caps. `sta
 at `declarations_path` and lists each repository it read completely — every note under the
 searched paths arrived and was read; one the broker withheld or the harness could not decode costs
 the repository its entry, a symlink there being no note in either mode — as `owner/name@sha`. `finish` unions that list into the document's and
-moves every finding a filed declaration covers to `declared` itself. A slug in `declared_intent_repos` missing
+moves every finding a filed, still-standing declaration covers to `declared` itself; a filed item
+whose `expires` has passed moves nothing (`findings-document.md`, `declared`). A slug in `declared_intent_repos` missing
 from `declared_intent_searched` is one the harness could not read; `declared_intent_unsearched`
 lists each as `{repo, ref}`, stderr says why, and the SOP says what the worker does about it — its
 own copy at that `ref`. An entry whose `ref` failed the branch-name check carries the value under
@@ -239,26 +247,30 @@ them, and `fetch` copies the ones you name into the workspace:
 /opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py fetch --audit <audit-id> --path clusters/prod-us-east/payments-netpol.yaml
 ```
 
-`grep` runs broker-side and answers with matching lines; it is a fixed string unless `--regex`, and
-`--prefix` narrows it. Use it when what you know is what a file says. `list` answers with paths and
-sizes, never content — use it when what you know is where the file lives. The broker caps what each
-returns, so read `truncated` on both and **pass `--prefix`** on a large repository. `fetch` writes
+Each command reads a snapshot of the repository: one revision's files, with no history, which the
+broker sends and the harness deletes once the command is done. `grep` answers with matching lines;
+it is a fixed string unless `--regex` (POSIX extended), and `--prefix` narrows it. Use it when what
+you know is what a file says. `list` answers with paths and sizes, never content — use it when what
+you know is where the file lives. `list` returns at most 256 entries and `grep` at most 200 matches,
+so read `truncated` on both and **pass `--prefix`** on a large repository. With `--prefix`, the
+snapshot holds only that directory, which also keeps a large repository under the snapshot's size
+limit. `fetch` writes
 each file into the workspace at its repo-relative path, which is exactly where a remediation editing
 that file has to end up; fetch it, edit it in place, and name the same path in the finding.
 
 The collectors do not need them. Handed the scratch workspace as `--workspace`, `collect.py` and
-`fleet_waste.py` copy the repository's YAML out of the broker into a private directory and index that,
-so candidates carry `declaration` and `release_declaration` (and, from `collect.py` alone,
-`namespace_directory`) in content mode as they do from a clone. When a collector cannot read the
-tree it logs a `WARNING` naming why and attaches none of those fields. Each file the broker will not
-send (over its size limit, or a symlink) costs less: no `declaration` or `namespace_directory` on a
-cluster whose `clusters/<name>/` tree holds it, and no `release_declaration` or `namespace_directory`
-anywhere. The exception is a too-large non-Kustomization file holding a column-0 `kind` and, by
-the broker's search, no release kind: it loses only its cluster's tree, if that tree holds no release
-and no Kustomization an Application names. Either way the declaration rule's own search is the
-answer for what is missing.
+`fleet_waste.py` copy one revision of the repository out of the broker into a private directory and
+index that, so candidates carry `declaration` and `release_declaration` (and, from `collect.py`
+alone, `namespace_directory`) in content mode as they do from a clone. When a collector cannot read
+the tree it logs a `WARNING` naming why and attaches none of those fields; the size limits count every
+file in the repository, not only its YAML. An entry the broker leaves out of the copy (a link it will
+not follow, or a directory laid out as a bare repository) costs less, and a `WARNING` names each one
+with its reason. Every such entry costs `release_declaration` and `namespace_directory` everywhere. A
+YAML-named one, a bare layout, or a YAML file link that points into a cluster tree the copy dropped
+or into an entry the copy left out also costs `declaration` and `namespace_directory` on the cluster whose `clusters/<name>/` tree holds
+it. Either way the declaration rule's own search is the answer for what is missing.
 
-All three print `sha`, the commit of the tree the broker answered from. There is no `git` on this
+All three print `sha`, the commit of the snapshot they read. There is no `git` on this
 side to ask, and the declared-intent record ([`declared_intent_searched`](findings-document.md#declared_intent_searched)) names each repository
 as `owner/name@sha`; take the sha from the command whose answer you searched.
 
@@ -270,9 +282,43 @@ a branch it does not have falls back to the base, which is what a first round wa
 
 All three exit 2 in directory mode, where the clone already holds the file.
 
+#### Between the collector and `finish`: `draft` and `precheck`
+
 `audit_report.py draft --audit <audit-id> --manifest-file <manifest> [--out <path>]` starts the
 findings document from the collector's manifest: `scope.clusters` with each collected target's
 `checks_run` copied from the commands it ran, `scope.skipped` for every target it could not read, and
 one finding per candidate carrying its evidence, impact and severity. It leaves each finding's
 `recommendation` empty and its `remediation` `manual`, because those are the judgement the collector
 cannot make: write them, and `finish` has nothing else to reject.
+
+`audit_report.py precheck --audit <audit-id> --manifest-file <manifest> [--repo "<owner>/<repo>"] [--scheduled]`
+runs after the collector command and before the drafting by hand, where the SOP puts it (two
+SOPs' collector command writes the `draft` itself; the step still follows it). It digests what the
+manifest says about the fleet (every cluster's outcome, its checks and their exit codes, its
+candidates by identity and severity, its limitations, `checks_not_applicable`,
+`checks_unevaluated` and the collector's `checks_revision`; not its timestamps, durations, output
+hashes, command strings, or a candidate's excerpt and impact text, which carry ages and counts and
+which `finish` takes from the fresh manifest on a close, except an impact the collector marks
+authoritative, which says which arm of a check fired) and compares the digest with the
+one the last scheduled `finish` of the stream recorded at
+`/opt/data/scratch/last_scheduled_digest_<audit-id>.json`. Its one JSON line gives the `verdict`:
+`first-run` (no record), `findings-changed` (the digest differs, a target was not collected, or a
+check went unevaluated), `periodic-refresh` (seven days since the last full synthesis) or
+`unchanged`. With `--scheduled` and `unchanged`, when the newest stored run of the ledger is the
+scheduled run the record names, one that did not hold the ledger open (a held-open run's document
+is the empty set its comment measured the ledger against, and replaying it would post that comment
+again), with a findings document `finish` can run again (no remediation
+that names a file or carries a note `finish` wrote, no withheld postures, every `declared[]` entry
+filed again by this run's `start`, and this run's own search covering every repository the step
+names), and the ledger carries no `/remediate` request still owed an answer (a writer's, `all`
+included, with no acked or refused marker; a conversation that cannot be read whole, or a
+repository `start` found unreachable, counts as one, and a lost broker is the
+`BROKER UNAVAILABLE` exit 2 as from any command), it writes that
+document to `findings_path`, with each remediation's note as the worker wrote it before the route
+notes, without the previous run's search record and with each `declared[]` entry's declaration as
+this run's `start` filed it, and runs `finish --scheduled` on it with this run's manifest, so the cross-check,
+the ledger comparison and `silent_ok` are `finish`'s own: the line is then `finish`'s, plus
+`precheck: unchanged`, and the run is over. In every other case the line says `closed: false` and
+why, the findings file is as it was, and the SOP continues; a close that dies puts the file back
+too, and the run's in-flight note stays until the SOP's own `finish`. Without the flag it never
+closes a run: an on-demand run is answered by the person who asked for it, in full.

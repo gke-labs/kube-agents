@@ -185,6 +185,44 @@ class TheMapping(unittest.TestCase):
         (settings,) = review.rule_findings(with_rules())[:1]
         self.assertEqual(settings["recommendation"]["action"], review.ENTRY_MITIGATIONS[2])
 
+    def test_a_plan_level_rule_row_takes_its_own_title_remedy_and_rubric(self):
+        # The rollout-sequence precheck has no catalogue entry: the readiness report stamps
+        # `entry: None`, files one risk per existing sequence on the host project's first
+        # member and a note on the host's other members, so the week has one row per host.
+        text = (
+            "host project acme-fleet-host already holds RolloutSequence prod-train (2 stage(s): stage 1: projects acme-fleet-host, "
+            "selector resource.labels.env=='canary', soak 604800s (7d); stage 2: projects acme-fleet-host, selector none (every member), soak none); "
+            "the platform allows one per host project, so a plan that creates a second is refused (FAILED_PRECONDITION); "
+            "add the train as stages of prod-train, or plan it in a separate host project"
+        )
+        risk = {"rule": "rollout-sequence-precheck", "entry": None, "grade": "risk", "kind": "RolloutSequence", "namespace": "", "name": "prod-train", "object": "acme-fleet-host/prod-train", "host_project": "acme-fleet-host", "text": text}
+        rules = {"rollout-sequence-precheck": {"entry": None, "can_block": False, "blocking": 0, "risks": 1, "unknown": 0, "notes": 0}}
+        (row,) = review.rule_findings(member("prod-a", "ready", rules=rules, risks=[risk]))
+        self.assertEqual(row["check"], "upgrade-rollout-sequence-precheck")
+        self.assertEqual((row["namespace"], row["object"]), ("", "RolloutSequence/prod-train"))
+        self.assertEqual(row["title"], "A second RolloutSequence in the host project is refused: RolloutSequence/prod-train shapes the upgrade plan")
+        self.assertEqual(row["recommendation"]["action"], "Add the train as stages of prod-train, or plan it in a separate host project")
+        self.assertEqual(row["remediation"]["note"], row["recommendation"]["action"])
+        self.assertIn("(a plan-level rule, no catalogue entry)", row["recommendation"]["rationale"])
+        self.assertEqual(severity(row), "minor")
+        self.assertIsNone(row["_entry"])
+        fq.validate_finding(review.payload(row))
+        # The identity is the check, the host's first member and the sequence: the same row
+        # every week, and no second row for the host's other members, which carry a note.
+        self.assertEqual(review.item_id(row), fq.derive_finding_id("upgrade-rollout-sequence-precheck", PROJECT, "prod-a", "", "RolloutSequence/prod-train"))
+        noted = {"rollout-sequence-precheck": {**rules["rollout-sequence-precheck"], "risks": 0, "notes": 1}}
+        other = member("prod-b", "ready", rules=noted, notes=["rollout-sequence-precheck: precheck for host project acme-fleet-host filed on acme-prod/us-central1-a/prod-a"])
+        self.assertEqual(review.rule_findings(other), [])
+        # A blocker from a plan-level rule is critical like any rule's, under the rule's title.
+        (blocker,) = review.rule_findings(member("prod-a", "blocked", rules=rules, rule_blocking=[{**risk, "grade": "blocking"}]))
+        self.assertEqual(severity(blocker), "critical")
+        self.assertTrue(blocker["title"].endswith("RolloutSequence/prod-train blocks the upgrade"), blocker["title"])
+        # A plan-level rule the tables do not name keeps the default heading, rubric and mitigation.
+        (unnamed,) = review.rule_findings(member("prod-a", "ready", rules={"some-plan-rule": {"entry": None, "can_block": False}}, risks=[{"rule": "some-plan-rule", "entry": None, "text": "something is off; do this"}]))
+        self.assertTrue(unnamed["title"].startswith(review.DEFAULT_ENTRY_TITLE + ": this cluster"), unnamed["title"])
+        self.assertEqual(unnamed["recommendation"]["action"], review.DEFAULT_MITIGATION)
+        self.assertEqual(severity(unnamed), "major")
+
     def test_every_payload_is_one_the_queue_accepts(self):
         for m in (seeded_b(), gemma(), with_rules()):
             for item in review.member_findings(m):
@@ -262,10 +300,16 @@ class TheMapping(unittest.TestCase):
             # the worker on the live route cannot read the script's table, so the prose carries it.
             self.assertIn("blocker is critical", text, document.name)
             self.assertIn(split, text, document.name)
+            # The plan-level rules, graded by rule id, are named the same way.
+            for rule, values in review.RULE_RISK_RUBRIC.items():
+                self.assertIn(f"{review.severity_of({'rubric': review.rubric(values)})} for the plan-level `{rule}`", text, document.name)
 
     def test_the_rubric_table_covers_the_queue_anchors(self):
-        for values in list(review.RUBRIC.values()) + list(review.ENTRY_RISK_RUBRIC.values()) + [review.DEFAULT_RISK_RUBRIC]:
+        for values in list(review.RUBRIC.values()) + list(review.ENTRY_RISK_RUBRIC.values()) + list(review.RULE_RISK_RUBRIC.values()) + [review.DEFAULT_RISK_RUBRIC]:
             fq.validate_rubric(review.rubric(values))
+        for rule in review.RULE_RISK_RUBRIC:
+            self.assertIn(rule, review.RULE_TITLES, rule)
+            self.assertIn(rule, review.RULE_REMEDY_RULES, rule)
 
 
 class Registration(unittest.TestCase):

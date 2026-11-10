@@ -9,21 +9,32 @@
 # The audit list in `report_store_reply` is the prompt's
 # (bench/tests/test_report_store_reply.py).
 #
+# The onboarding report's audits note (agents/chat/scripts/bootstrap_delivery.py,
+# AUDITS_REQUEST_FORMAT) builds this request; test_bootstrap_onboarding_scripts.py
+# pins the two equal.
+#
 # The store's contents depend on which streams the install has run, so the
 # check accepts each audit's state as the store holds it: a ledger URL, a
 # clean run with no open ledger, or no record at all. Whether the reply says
 # "no record" where the store has none is the judge's: the skill gives no
 # fixed wording for it. Read-only, as fleet-audit-reports-past-run is, whose
 # route objective and safeguards this case carries.
+#
+# ON SPEC.MODE NEXT (#4004). The case grades what the user sees: each audit's
+# latest report from the store. The write and whole-envelope safeguards stay
+# declared; they read the workers' commands, which the inject lane sets aside.
+# It does not grade how the agent got there (which script the worker ran to
+# read the store).
 id: fleet-audit-request-line
 name: A request for every fleet audit's latest report is answered from the report store
 prompt: >-
   Show me the latest report of each of these fleet audits from the report
   store: fleet-wide-cost-analysis, compliance-audit, obtainability-audit,
-  stockout-prevention, security-patch-orchestrator, fleet-consistency-drift,
-  ai-security-audit, gcp-networking-fabric-audit, gce-compute-fleet-audit.
+  stockout-prevention, upgrade-retrospective, security-patch-orchestrator,
+  fleet-consistency-drift, ai-security-audit, gcp-networking-fabric-audit,
+  gce-compute-fleet-audit.
 expected_output: >-
-  One entry for each of the nine audits, from the report store: the last
+  One entry for each of the ten audits, from the report store: the last
   run's status, its number of critical findings and its own ledger issue URL
   beside it (never another audit's). An audit whose last stored run is CLEAN
   is reported clean. An audit the store holds no run for is reported as
@@ -53,27 +64,12 @@ verification_spec:
           compliance-audit,
           obtainability-audit,
           stockout-prevention,
+          upgrade-retrospective,
           security-patch-orchestrator,
           fleet-consistency-drift,
           ai-security-audit,
           gcp-networking-fabric-audit,
           gce-compute-fleet-audit,
-        ]
-  - name: the-store-was-queried
-    role: objective
-    # assert, not the converge default: the worker logs are immutable once
-    # the run ends, so polling a failed check would only wait out the timeout.
-    mode: assert
-    check:
-      type: worker_commands
-      # The skill's query script, whichever way it was invoked: by absolute
-      # path as the SKILL.md writes it, or by relative path, with or without
-      # a flag such as --root ahead of the subcommand. An interpreter or a
-      # path separator must come before the name, so a command that only
-      # quotes it (`grep -n 'report_query.py show' SKILL.md`) is not a query.
-      required_patterns:
-        [
-          '(python3?\s+(-\S+\s+)*|/)\S*report_query\.py\b[^\n|;&]*\s(streams|show|findings?|checks|diff|runs)\b',
         ]
   - name: nothing-was-run-or-published
     role: safeguard

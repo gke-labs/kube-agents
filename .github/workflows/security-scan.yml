@@ -21,6 +21,13 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # Cap @actions/cache's wait on one cache segment so a restore the service
+  # refuses costs a step about a minute, not the default ten. The rule, the
+  # trade-off and the test that holds it: .agents/rules/github_actions.md,
+  # "Cap the Actions cache segment download wait".
+  SEGMENT_DOWNLOAD_TIMEOUT_MINS: "1"
+
 jobs:
   gosec-scan:
     name: Go Security Scan (gosec)
@@ -45,6 +52,14 @@ jobs:
         # argument is an int, is the analyzer being imprecise. G304 stays
         # enabled and still catches a file path that does come from outside.
         run: go run github.com/securego/gosec/v2/cmd/gosec -exclude=G703,G706 ./...
+      # The same gosec, built from k8s-operator/go.mod's pin, over the
+      # k8s-api-proxy module, which declares no gosec of its own. No
+      # exclusions: the G703/G706 reasoning above is about the operator's argv.
+      - name: Run gosec on k8s-api-proxy
+        run: |
+          go -C k8s-operator build -o "$RUNNER_TEMP/gosec" github.com/securego/gosec/v2/cmd/gosec
+          cd k8s-api-proxy
+          "$RUNNER_TEMP/gosec" ./...
 
   trivy-scan:
     name: Container & Manifest Scan (trivy)
@@ -82,7 +97,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Run Checkov
-        uses: bridgecrewio/checkov-action@6f26dc90000b74feb589a906cdfae540f5119895 # v12.3134.0
+        uses: bridgecrewio/checkov-action@c10e2438743528f9e4549758fad8b7a62052541d # v12.3136.0
         with:
           framework: terraform,github_actions
           output_format: cli

@@ -11,7 +11,9 @@ from __future__ import annotations
 import http.client
 import json
 import shlex
+import sqlite3
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -1688,6 +1690,83 @@ def test_a_timing_file_that_will_not_write_leaves_the_run_alone(
     assert not target.is_file()
 
 
+# --- the delivered reply's shape file -----------------------------------------
+#
+# hack/ci-eval-pr.sh sets KUBE_AGENTS_SHAPE_FILE per repetition and copies the
+# file beside results.json, where load_run reads it for the dashboard.
+
+
+def test_a_run_writes_its_replys_shape(
+    stub_agent: _StubAgentServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    target = tmp_path / "shape.json"
+    monkeypatch.setenv("KUBE_AGENTS_SHAPE_FILE", str(target))
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "0")
+
+    result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
+
+    assert not result.has_errors()
+    assert json.loads(target.read_text(encoding="utf-8")) == {
+        "opens_on_verdict": True,
+        "apology": False,
+        "bot_messages": 1,
+        "words_before_answer": 0,
+        "answer_words": len(_FINAL_TEXT.split()),
+    }
+    assert [p.name for p in tmp_path.iterdir()] == ["shape.json"]
+
+
+def test_no_shape_file_without_the_variable(
+    stub_agent: _StubAgentServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("KUBE_AGENTS_SHAPE_FILE", "")
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "0")
+    monkeypatch.chdir(tmp_path)
+
+    result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
+
+    assert not result.has_errors()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_no_shape_file_for_a_silence_marker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The gateway posts nothing for the marker, so there is no reply to measure."""
+    target = tmp_path / "shape.json"
+    monkeypatch.setenv("KUBE_AGENTS_SHAPE_FILE", str(target))
+
+    harness._write_chat_shape(AgentResult(output="[SILENT]", trajectory=[], metadata={"final_message": "[SILENT]"}))
+
+    assert not target.exists()
+
+
+def test_no_shape_file_for_an_answer_adopted_from_the_stream(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The relay posted nothing; the thread shows only the placeholder."""
+    target = tmp_path / "shape.json"
+    monkeypatch.setenv("KUBE_AGENTS_SHAPE_FILE", str(target))
+    metadata = {"final_message": "**Two pods are OOMKilled.**", "outcome": harness.inject.OUTCOME_STREAM_TERMINAL, "window_posts": 1}
+
+    harness._write_chat_shape(AgentResult(output="", trajectory=[], metadata=metadata))
+
+    assert not target.exists()
+
+
+def test_no_shape_file_when_nothing_was_delivered(
+    stub_agent: _StubAgentServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    target = tmp_path / "shape.json"
+    monkeypatch.setenv("KUBE_AGENTS_SHAPE_FILE", str(target))
+    stub_agent.fail_with = 400
+
+    result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
+
+    assert result.has_errors()
+    assert not target.exists()
+
+
 # --- the ci-eval-pr.sh contract ----------------------------------------------
 
 
@@ -1892,6 +1971,10 @@ def no_cluster_exec(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     return scripts
 
 
+def _is_purge(script: str) -> bool:
+    return harness._shell_quote(harness._PURGE_ROWS_SCRIPT) in script
+
+
 def test_delegated_work_is_awaited_before_the_result_is_returned(
     stub_agent: _StubAgentServer, instant_polls: None
 ) -> None:
@@ -1915,7 +1998,8 @@ def test_delegated_work_is_awaited_before_the_result_is_returned(
     # done. A fourth would mean the loop failed to notice the terminal state.
     assert len(stub_agent.requests) == 3
     # The polls are the harness's own, so they are not charged to the agent.
-    assert [entry["name"] for entry in result.trajectory] == ["kanban_create"]
+    # The pod read did not complete here, so _settle records the gap.
+    assert [entry["name"] for entry in result.trajectory] == ["kanban_create", harness.worker_trajectory.GAP_ENTRY]
     assert result.metadata["tools"] == {"kanban_create": 1}
 
 
@@ -2098,8 +2182,10 @@ def test_a_running_card_is_watched_on_the_board_without_a_model_turn(
     # result once the board shows the card done. The three reads that saw it
     # still moving cost no turn at all.
     assert len(stub_agent.requests) == 2
-    assert len(reads) == 4
-    assert [entry["name"] for entry in result.trajectory] == ["kanban_create"]
+    # The four polls, then settle's read of the cards' end state (#4998).
+    assert len(reads) == 5
+    # The pod read did not complete here, so _settle records the gap.
+    assert [entry["name"] for entry in result.trajectory] == ["kanban_create", harness.worker_trajectory.GAP_ENTRY]
 
 
 def test_a_ceiling_hit_on_a_readable_board_costs_no_status_turn(
@@ -2147,6 +2233,467 @@ def test_a_ceiling_hit_keeps_the_stalled_cards_transcript_under_artifacts(
     index = (tmp_path / "worker-logs" / "index.txt").read_text().splitlines()
     assert index[1] == f"{_TASK_ID}\t1758579012\t4096\t{harness._LOG_PRESENT}"
     assert (tmp_path / "worker-logs" / f"{_TASK_ID}.log").read_text() == "worker was here\n"
+
+
+def test_delegated_worker_board_rate_limit_marks_run_infra(
+    stub_agent: _StubAgentServer, instant_polls: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A delegated card whose board state records Hermes rate limit is marked infra."""
+    rate_limit_msg = "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429"
+    reads: list[str] = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            reads.append(script)
+            payload = {
+                "statuses": {_TASK_ID: "blocked"},
+                "summaries": {_TASK_ID: rate_limit_msg},
+                "errors": {},
+            }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        if worker_trajectory.CAPTURE_PRESENT in script or "kanban_worker_children" in script:
+            payload = {"cards": [], "calls": [], "errors": [], "unread": [], "clipped": []}
+            return f"{worker_trajectory.CAPTURE_PRESENT}\n{json.dumps(payload)}\n"
+        if harness._LOGS_DIR in script:
+            return f"{harness._LOG_PRESENT} {_TASK_ID} 0\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+    stub_agent.turns = [_create_turn(), _show_turn("blocked")]
+
+    result = KubeAgentsHarness().run("Find the root cause of the frontend outage.")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "card on board recorded rate_limit" in result.errors[0]
+    assert reads
+
+
+def test_delegated_worker_board_rate_limit_in_errors_marks_run_infra(
+    stub_agent: _StubAgentServer, instant_polls: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A delegated card whose board state records Hermes rate limit in errors is marked infra."""
+    rate_limit_msg = "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429"
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            payload = {
+                "statuses": {_TASK_ID: "blocked"},
+                "summaries": {},
+                "errors": {_TASK_ID: rate_limit_msg},
+            }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        if worker_trajectory.CAPTURE_PRESENT in script or "kanban_worker_children" in script:
+            payload = {"cards": [], "calls": [], "errors": [], "unread": [], "clipped": []}
+            return f"{worker_trajectory.CAPTURE_PRESENT}\n{json.dumps(payload)}\n"
+        if harness._LOGS_DIR in script:
+            return f"{harness._LOG_PRESENT} {_TASK_ID} 0\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+    stub_agent.turns = [_create_turn(), _show_turn("blocked")]
+
+    result = KubeAgentsHarness().run("Find the root cause of the frontend outage.")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "card on board recorded rate_limit" in result.errors[0]
+
+
+def test_delegated_worker_board_rate_limit_cleared_on_retry_stays_graded(
+    stub_agent: _StubAgentServer, instant_polls: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When a card is unblocked and retried, earlier board rate limit messages are discarded and the run stays graded."""
+    rate_limit_msg = "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429"
+    read_count = 0
+
+    def _shell(script: str, timeout: float) -> str:
+        nonlocal read_count
+        if board.BOARD_PRESENT in script:
+            read_count += 1
+            if read_count == 1:
+                payload = {
+                    "statuses": {_TASK_ID: "blocked"},
+                    "summaries": {_TASK_ID: rate_limit_msg},
+                    "errors": {},
+                }
+            else:
+                payload = {
+                    "statuses": {_TASK_ID: "blocked"},
+                    "summaries": {},
+                    "errors": {},
+                }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        if worker_trajectory.CAPTURE_PRESENT in script or "kanban_worker_children" in script:
+            payload = {"cards": [], "calls": [], "errors": [], "unread": [], "clipped": []}
+            return f"{worker_trajectory.CAPTURE_PRESENT}\n{json.dumps(payload)}\n"
+        if harness._LOGS_DIR in script:
+            return f"{harness._LOG_PRESENT} {_TASK_ID} 0\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+    # Turn 1: create card; Turn 2: status turn reporting running (allows retry/poll 2); Turn 3: status turn reporting blocked (retry failed without summary)
+    stub_agent.turns = [_create_turn(), _show_turn("running"), _show_turn("blocked")]
+
+    result = KubeAgentsHarness().run("Find the root cause of the frontend outage.")
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert read_count >= 2
+
+
+def test_delegated_worker_board_rate_limit_errors_cleared_on_retry_stays_graded(
+    stub_agent: _StubAgentServer, instant_polls: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When a card is unblocked and retried, earlier board rate limit errors are discarded and the run stays graded."""
+    rate_limit_msg = "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429"
+    read_count = 0
+
+    def _shell(script: str, timeout: float) -> str:
+        nonlocal read_count
+        if board.BOARD_PRESENT in script:
+            read_count += 1
+            if read_count == 1:
+                payload = {
+                    "statuses": {_TASK_ID: "blocked"},
+                    "summaries": {},
+                    "errors": {_TASK_ID: rate_limit_msg},
+                }
+            else:
+                payload = {
+                    "statuses": {_TASK_ID: "blocked"},
+                    "summaries": {},
+                    "errors": {},
+                }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        if worker_trajectory.CAPTURE_PRESENT in script or "kanban_worker_children" in script:
+            payload = {"cards": [], "calls": [], "errors": [], "unread": [], "clipped": []}
+            return f"{worker_trajectory.CAPTURE_PRESENT}\n{json.dumps(payload)}\n"
+        if harness._LOGS_DIR in script:
+            return f"{harness._LOG_PRESENT} {_TASK_ID} 0\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+    stub_agent.turns = [_create_turn(), _show_turn("running"), _show_turn("blocked")]
+
+    result = KubeAgentsHarness().run("Find the root cause of the frontend outage.")
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert read_count >= 2
+
+
+def test_delegated_worker_board_rate_limit_multi_card_unblocked_retry_stays_graded(
+    stub_agent: _StubAgentServer, instant_polls: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """In a multi-card wait, if t_1 was blocked on rate limit and retired, but unblocked/retried while t_2 kept the wait open, t_1's stale rate limit is not filed as infra."""
+    rate_limit_msg = "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429"
+    read_count = 0
+
+    def _shell(script: str, timeout: float) -> str:
+        nonlocal read_count
+        if board.BOARD_PRESENT in script:
+            read_count += 1
+            if read_count == 1:
+                # Poll 1: t_1 blocked with 429, t_2 running
+                payload = {
+                    "statuses": {"t_1": "blocked", "t_2": "running"},
+                    "summaries": {"t_1": rate_limit_msg, "t_2": ""},
+                    "errors": {},
+                }
+            elif read_count == 2:
+                # Poll 2: only outstanding (t_2) is polled; t_2 running
+                payload = {
+                    "statuses": {"t_2": "running"},
+                    "summaries": {"t_2": ""},
+                    "errors": {},
+                }
+            else:
+                # Final read for awaited (t_1, t_2): t_1 was unblocked/retried without 429, t_2 blocked without 429
+                payload = {
+                    "statuses": {"t_1": "ready", "t_2": "blocked"},
+                    "summaries": {"t_1": "", "t_2": ""},
+                    "errors": {},
+                }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        if worker_trajectory.CAPTURE_PRESENT in script or "kanban_worker_children" in script:
+            payload = {"cards": [], "calls": [], "errors": [], "unread": [], "clipped": []}
+            return f"{worker_trajectory.CAPTURE_PRESENT}\n{json.dumps(payload)}\n"
+        if harness._LOGS_DIR in script:
+            return f"{harness._LOG_PRESENT} t_1 0\n{harness._LOG_PRESENT} t_2 0\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+    # Turn 1: create cards t_1 and t_2
+    turn_1 = _turn(
+        *_call("kanban_create", {"title": "task 1"}, {"ok": True, "task_id": "t_1", "status": "ready"}, "c1"),
+        *_call("kanban_create", {"title": "task 2"}, {"ok": True, "task_id": "t_2", "status": "ready"}, "c2"),
+        _text("Created tasks"),
+    )
+    # Turn 2: status turn reporting t_1 blocked, t_2 running (t_1 leaves outstanding)
+    turn_2 = _turn(
+        *_call("kanban_show", {"task_id": "t_1"}, {"task": {"id": "t_1", "status": "blocked"}}, "s1"),
+        *_call("kanban_show", {"task_id": "t_2"}, {"task": {"id": "t_2", "status": "running"}}, "s2"),
+        _text("Status update"),
+    )
+    # Turn 3: status turn reporting t_2 blocked (both terminal now)
+    turn_3 = _turn(
+        *_call("kanban_show", {"task_id": "t_2"}, {"task": {"id": "t_2", "status": "blocked"}}, "s3"),
+        _text("Status update 2"),
+    )
+    stub_agent.turns = [turn_1, turn_2, turn_3]
+
+    result = KubeAgentsHarness().run("Find the root cause of the frontend outage.")
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert read_count >= 3
+
+
+def test_delegated_worker_board_rate_limit_cleared_on_status_turn_unblock_even_if_next_board_exec_fails(
+    stub_agent: _StubAgentServer, instant_polls: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A board summary from run 1 is dropped when a status turn reports the card non-terminal, even if the subsequent board exec fails."""
+    rate_limit_msg = "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429"
+    read_count = 0
+
+    def _shell(script: str, timeout: float) -> str:
+        nonlocal read_count
+        if board.BOARD_PRESENT in script:
+            read_count += 1
+            if read_count == 1:
+                payload = {
+                    "statuses": {_TASK_ID: "blocked"},
+                    "summaries": {_TASK_ID: rate_limit_msg},
+                    "errors": {},
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            # Read 2 fails (e.g. transient kubectl exec failure)
+            return ""
+        if worker_trajectory.CAPTURE_PRESENT in script or "kanban_worker_children" in script:
+            payload = {"cards": [], "calls": [], "errors": [], "unread": [], "clipped": []}
+            return f"{worker_trajectory.CAPTURE_PRESENT}\n{json.dumps(payload)}\n"
+        if harness._LOGS_DIR in script:
+            return f"{harness._LOG_PRESENT} {_TASK_ID} 0\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+    stub_agent.turns = [_create_turn(), _show_turn("running"), _show_turn("blocked", call_id="call_show_2")]
+
+    result = KubeAgentsHarness().run("Find the root cause of the frontend outage.")
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert read_count >= 2
+
+
+@pytest.mark.parametrize(
+    ("branch_name", "board_replies", "stub_turn_factories"),
+    [
+        pytest.param(
+            "gate_non_terminal_read_drops_summary",
+            [
+                {
+                    "statuses": {_TASK_ID: "running"},
+                    "summaries": {_TASK_ID: "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429"},
+                    "errors": {},
+                },
+                None,  # second read fails (returns "")
+            ],
+            [_create_turn, lambda: _show_turn("blocked")],
+            id="gate_non_terminal_read",
+        ),
+        pytest.param(
+            "read2_pop_missing_summary_on_blocked_read",
+            [
+                {
+                    "statuses": {_TASK_ID: "blocked"},
+                    "summaries": {_TASK_ID: "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429"},
+                    "errors": {},
+                },
+                {
+                    "statuses": {_TASK_ID: "blocked"},
+                    "summaries": {},
+                    "errors": {},
+                },
+            ],
+            [_create_turn, lambda: _turn(_text("investigating...")), lambda: _show_turn("blocked")],
+            id="read2_pop_summary",
+        ),
+        pytest.param(
+            "read2_pop_missing_error_on_blocked_read",
+            [
+                {
+                    "statuses": {_TASK_ID: "blocked"},
+                    "summaries": {},
+                    "errors": {_TASK_ID: "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429"},
+                },
+                {
+                    "statuses": {_TASK_ID: "blocked"},
+                    "summaries": {},
+                    "errors": {},
+                },
+            ],
+            [_create_turn, lambda: _turn(_text("investigating...")), lambda: _show_turn("blocked")],
+            id="read2_pop_error",
+        ),
+        pytest.param(
+            "filter_terminal_status_done_ignores_stale_summary",
+            [
+                {
+                    "statuses": {_TASK_ID: "blocked"},
+                    "summaries": {_TASK_ID: "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429"},
+                    "errors": {},
+                },
+            ],
+            [_create_turn, lambda: _show_turn("done")],
+            id="filter_status_done_summary",
+        ),
+        pytest.param(
+            "filter_terminal_status_done_ignores_stale_error",
+            [
+                {
+                    "statuses": {_TASK_ID: "blocked"},
+                    "summaries": {},
+                    "errors": {_TASK_ID: "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429"},
+                },
+            ],
+            [_create_turn, lambda: _show_turn("done")],
+            id="filter_status_done_error",
+        ),
+        pytest.param(
+            "read2_pop_summary_on_non_blocked_board_read",
+            [
+                {
+                    "statuses": {_TASK_ID: "blocked"},
+                    "summaries": {_TASK_ID: "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429"},
+                    "errors": {},
+                },
+                {
+                    "statuses": {_TASK_ID: "running"},
+                    "summaries": {},
+                    "errors": {},
+                },
+                None,
+            ],
+            [_create_turn, lambda: _turn(_text("investigating...")), lambda: _show_turn("blocked")],
+            id="pop_non_terminal_read_summary",
+        ),
+        pytest.param(
+            "read2_pop_error_on_non_blocked_board_read",
+            [
+                {
+                    "statuses": {_TASK_ID: "blocked"},
+                    "summaries": {},
+                    "errors": {_TASK_ID: "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429"},
+                },
+                {
+                    "statuses": {_TASK_ID: "running"},
+                    "summaries": {},
+                    "errors": {},
+                },
+                None,
+            ],
+            [_create_turn, lambda: _turn(_text("investigating...")), lambda: _show_turn("blocked")],
+            id="pop_non_terminal_read_error",
+        ),
+    ],
+)
+def test_delegated_worker_board_rate_limit_clearing_branches_pinned(
+    branch_name: str,
+    board_replies: list[dict[str, Any] | None],
+    stub_turn_factories: list[Any],
+    stub_agent: _StubAgentServer,
+    instant_polls: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each clearing branch in _await_delegated_work's per-card board tracking decides independently."""
+    replies_iter = iter(board_replies)
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            payload = next(replies_iter, None)
+            if payload is None:
+                return ""
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        if worker_trajectory.CAPTURE_PRESENT in script or "kanban_worker_children" in script:
+            payload = {"cards": [], "calls": [], "errors": [], "unread": [], "clipped": []}
+            return f"{worker_trajectory.CAPTURE_PRESENT}\n{json.dumps(payload)}\n"
+        if harness._LOGS_DIR in script:
+            return f"{harness._LOG_PRESENT} {_TASK_ID} 0\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+    stub_agent.turns = [f() for f in stub_turn_factories]
+
+    result = KubeAgentsHarness().run("Find the root cause of the frontend outage.")
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+
+
+def test_delegated_worker_board_rate_limit_triage_marks_run_infra(
+    stub_agent: _StubAgentServer,
+    instant_polls: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A board read reporting triage with a rate limit summary retires the wait and marks infra."""
+    val = "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429"
+    board_payload = {
+        "statuses": {_TASK_ID: "triage"},
+        "summaries": {_TASK_ID: val},
+    }
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            return f"{board.BOARD_PRESENT}\n{json.dumps(board_payload)}\n"
+        if worker_trajectory.CAPTURE_PRESENT in script or "kanban_worker_children" in script:
+            payload = {"cards": [], "calls": [], "errors": [], "unread": [], "clipped": []}
+            return f"{worker_trajectory.CAPTURE_PRESENT}\n{json.dumps(payload)}\n"
+        if harness._LOGS_DIR in script:
+            return f"{harness._LOG_PRESENT} {_TASK_ID} 0\n"
+        return ""
+
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "0.3")
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+    stub_agent.turns = [_create_turn(), _show_turn("triage")]
+
+    result = KubeAgentsHarness().run("Find the root cause of the frontend outage.")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "rate_limit" in result.errors[0]
+    assert not any(harness.DELEGATION_CEILING_MARKER in e or "did not finish within" in e for e in result.errors)
+    assert len(result.errors) == 1
+
+
+def test_delegated_worker_board_rate_limit_triage_status_turn_accumulates_output(
+    stub_agent: _StubAgentServer,
+    instant_polls: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A status turn reporting rate-limited triage is settled and accumulates its body into output."""
+    val = "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429"
+    board_payload = {
+        "statuses": {_TASK_ID: "triage"},
+        "summaries": {_TASK_ID: val},
+    }
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            return f"{board.BOARD_PRESENT}\n{json.dumps(board_payload)}\n"
+        if worker_trajectory.CAPTURE_PRESENT in script or "kanban_worker_children" in script:
+            payload = {"cards": [], "calls": [], "errors": [], "unread": [], "clipped": []}
+            return f"{worker_trajectory.CAPTURE_PRESENT}\n{json.dumps(payload)}\n"
+        if harness._LOGS_DIR in script:
+            return f"{harness._LOG_PRESENT} {_TASK_ID} 0\n"
+        return ""
+
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "0.3")
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+    body = "Task is triage due to quota exhaustion."
+    stub_agent.turns = [_create_turn(), _show_turn("triage", body=body)]
+
+    result = KubeAgentsHarness().run("Find the root cause of the frontend outage.")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert body in result.output
 
 
 def test_a_mute_agent_leaves_no_transcript_behind(
@@ -2546,7 +3093,7 @@ def test_a_status_turn_gateway_storm_is_infrastructure_not_an_answer(
     port = stub_agent.server_address[1]
     assert recorded_pf_resets == [port] * (harness._MAX_TRANSPORT_FAILURES - 1)
     # The filed card's state is still cleared, even though nothing is graded.
-    purges = [s for s in no_cluster_exec if "rm -rf" in s]
+    purges = [s for s in no_cluster_exec if _is_purge(s)]
     assert len(purges) == 1
     assert _TASK_ID in purges[0]
 
@@ -2584,7 +3131,7 @@ def test_a_status_turn_429_storm_is_infrastructure_not_an_answer(
     assert len(stub_agent.requests) == 1 + harness._MAX_TRANSPORT_FAILURES
     port = stub_agent.server_address[1]
     assert recorded_pf_resets == [port] * (harness._MAX_TRANSPORT_FAILURES - 1)
-    purges = [s for s in no_cluster_exec if "rm -rf" in s]
+    purges = [s for s in no_cluster_exec if _is_purge(s)]
     assert len(purges) == 1
     assert _TASK_ID in purges[0]
 
@@ -2700,7 +3247,8 @@ def test_status_turns_the_endpoint_answered_still_grade_the_partial_record(
     assert _TASK_ID in result.errors[0]
     assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
     # The delegation turn survived.
-    assert [entry["name"] for entry in result.trajectory] == ["kanban_create"]
+    # The pod read did not complete here, so _settle records the gap.
+    assert [entry["name"] for entry in result.trajectory] == ["kanban_create", harness.worker_trajectory.GAP_ENTRY]
     assert result.output == f"I've started this as task {_TASK_ID}."
     # An endpoint that answers is not a tunnel problem: no reset.
     assert recorded_pf_resets == []
@@ -2723,7 +3271,7 @@ def test_a_status_turn_502_with_rate_limit_is_infra_without_retrying(
     assert result.has_errors()
     assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
     assert len(stub_agent.requests) == 2
-    purges = [s for s in no_cluster_exec if "rm -rf" in s]
+    purges = [s for s in no_cluster_exec if _is_purge(s)]
     assert len(purges) == 1
     assert _TASK_ID in purges[0]
 
@@ -2836,7 +3384,8 @@ def test_a_replayed_turn_supersedes_rather_than_duplicates(
     result = KubeAgentsHarness().run("Find the root cause.")
 
     assert not result.has_errors()
-    assert [entry["name"] for entry in result.trajectory] == ["kanban_create"]
+    # The pod read did not complete here, so _settle records the gap.
+    assert [entry["name"] for entry in result.trajectory] == ["kanban_create", harness.worker_trajectory.GAP_ENTRY]
     assert result.metadata["tools"] == {"kanban_create": 1}
     # Usage is reported per turn even when the output items are replayed, so
     # each turn's envelope is its own spend and the buckets add up: 110 for the
@@ -2846,7 +3395,7 @@ def test_a_replayed_turn_supersedes_rather_than_duplicates(
     # found the card still running replayed both earlier messages, and taking
     # that payload whole would put a "still running" restatement per poll in
     # front of the judge.
-    assert result.output == f"I've started this as task {_TASK_ID}.\n\n{_RCA_RESULT}"
+    assert result.output == f"I've started this as task {_TASK_ID}.\n\nResult of delegated task {_TASK_ID}:\n{_RCA_RESULT}"
     assert "is running" not in result.output
 
 
@@ -2879,7 +3428,8 @@ def test_an_additive_turn_is_still_concatenated(
 
     result = KubeAgentsHarness().run("Find the root cause.")
 
-    assert [entry["name"] for entry in result.trajectory] == ["kanban_create"]
+    # The pod read did not complete here, so _settle records the gap.
+    assert [entry["name"] for entry in result.trajectory] == ["kanban_create", harness.worker_trajectory.GAP_ENTRY]
     assert result.tokens["total"] == 330
 
 
@@ -3256,7 +3806,7 @@ def test_a_card_already_done_in_the_first_reply_skips_the_wait(
     result = KubeAgentsHarness().run("Find the root cause.")
 
     assert len(stub_agent.requests) == 1
-    assert result.output == _RCA_RESULT
+    assert result.output == f"Result of delegated task {_TASK_ID}:\n{_RCA_RESULT}"
     assert not result.has_errors()
 
 
@@ -3327,11 +3877,770 @@ def test_a_cards_state_is_cleared_once_its_artifacts_are_read(
 
     KubeAgentsHarness().run("Find the root cause.")
 
-    purges = [s for s in no_cluster_exec if "rm -rf" in s]
+    purges = [s for s in no_cluster_exec if _is_purge(s)]
     assert len(purges) == 1
     assert _TASK_ID in purges[0]
     assert harness._ATTACHMENTS_DIR in purges[0]
     assert harness._LOGS_DIR in purges[0]
+
+
+def test_a_cards_board_rows_are_deleted_with_its_state(
+    stub_agent: _StubAgentServer, instant_polls: None, no_cluster_exec: list[str]
+) -> None:
+    """A run left on the board primes the next one through the role-history digest (#1730)."""
+    stub_agent.turns = [_create_turn(), _show_turn("done", result=_RCA_RESULT)]
+
+    KubeAgentsHarness().run("Find the root cause.")
+
+    (purge,) = [s for s in no_cluster_exec if _is_purge(s)]
+    assert harness._shell_quote(harness._PURGE_ROWS_SCRIPT) in purge
+    assert purge.endswith(" ".join(harness._shell_quote(a) for a in harness._purge_argv([_TASK_ID])))
+
+
+# hermes v2026.9.14's ``_ctx_role_history`` query, verbatim: what the next
+# card's worker is shown as "Recent work by @<assignee>".
+_ROLE_HISTORY_SQL = (
+    "SELECT t.id, t.title, r.summary, r.ended_at "
+    "FROM task_runs r JOIN tasks t ON r.task_id = t.id "
+    "WHERE r.profile = ? AND r.task_id != ? "
+    "  AND r.outcome = 'completed' "
+    "ORDER BY r.ended_at DESC LIMIT 5"
+)
+
+
+def _purge_board(root: Path) -> sqlite3.Connection:
+    """A board with the tables the purge touches, minus ``task_attachments``."""
+    kb = sqlite3.connect(root / "kanban.db")
+    kb.executescript(
+        "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, status TEXT, assignee TEXT);"
+        "CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, profile TEXT,"
+        " outcome TEXT, summary TEXT, ended_at INTEGER);"
+        "CREATE TABLE task_links (parent_id TEXT, child_id TEXT);"
+        "CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT);"
+        "CREATE TABLE task_comments (id INTEGER PRIMARY KEY, task_id TEXT, body TEXT);"
+        "CREATE TABLE kanban_notify_subs (task_id TEXT, chat_id TEXT);"
+        "CREATE TABLE kanban_worker_children (child_id TEXT PRIMARY KEY, creator_id TEXT, created_at INTEGER);"
+    )
+    for tid, status, ended in [("t_done", "done", 3), ("t_run", "running", 2), ("t_other", "done", 1)]:
+        _purge_card(kb, tid, status, ended=ended)
+    kb.execute("INSERT INTO task_links VALUES ('t_done', 't_other')")
+    kb.execute("INSERT INTO kanban_worker_children VALUES ('t_kid', 't_done', 0)")
+    kb.execute("INSERT INTO tasks VALUES ('t_next', 'next run', 'ready', 'platform')")
+    kb.commit()
+    return kb
+
+
+def _purge_card(
+    kb: sqlite3.Connection, tid: str, status: str, *, ended: int = 1, creator: str | None = None,
+    attributed_to: str | None = None,
+) -> None:
+    """One card with a completed run, and its ``created`` event as hermes writes it.
+
+    ``creator`` is the event's ``creator_task_id`` (``None`` for a cron, a person,
+    or a card someone else's worker filed); ``attributed_to`` is the
+    ``kanban_worker_children`` creator, which the adoption window can set to a
+    run's card when ``creator`` is not.
+    """
+    kb.execute("INSERT INTO tasks VALUES (?, ?, ?, 'platform')", (tid, tid, status))
+    kb.execute(
+        "INSERT INTO task_runs (task_id, profile, outcome, summary, ended_at) "
+        "VALUES (?, 'platform', 'completed', ?, ?)", (tid, f"fixed it in {tid}", ended),
+    )
+    kb.execute(
+        "INSERT INTO task_events (task_id, kind, payload) VALUES (?, 'created', ?)",
+        (tid, json.dumps({"creator_task_id": creator})),
+    )
+    if attributed_to:
+        kb.execute("INSERT INTO kanban_worker_children VALUES (?, ?, 0)", (tid, attributed_to))
+
+
+def _run_purge(
+    root: Path, roots: list[str], fanned_out: list[str] = (), *, floor: int | None = None, busy: str = "",
+    prelude: str = "",
+) -> list[str]:
+    """The in-pod script on the harness's own argv, pointed at a temporary tree.
+
+    ``busy`` replaces the lock wait, for a test that holds the write lock;
+    ``prelude`` runs first, for a test that breaks part of the filesystem.
+    """
+    argv = harness._purge_argv(roots, fanned_out, floor)
+    paths = [worker_trajectory.DATA_ROOT, harness._ATTACHMENTS_DIR, harness._LOGS_DIR]
+    local = [str(root), str(root / "attachments"), str(root / "logs")]
+    argv = [local[paths.index(a)] if a in paths else a for a in argv]
+    argv = [str(root / "logs") + a[len(harness._LOGS_DIR):] if a.startswith(harness._LOGS_DIR + "/") else a for a in argv]
+    if busy:
+        argv[1] = busy
+    proc = subprocess.run(
+        [sys.executable, "-c", prelude + harness._PURGE_ROWS_SCRIPT, *argv], capture_output=True, text=True,
+        check=True,
+    )
+    return proc.stdout.splitlines()
+
+
+def test_the_purge_script_drops_a_settled_card_from_the_role_history(tmp_path: Path) -> None:
+    """Run in-pod against a board: the settled card is gone, a running one and others stay."""
+    kb = _purge_board(tmp_path)
+    before = [r[0] for r in kb.execute(_ROLE_HISTORY_SQL, ("platform", "t_next"))]
+    assert before == ["t_done", "t_run", "t_other"]
+
+    assert _run_purge(tmp_path, ["t_done", "t_run", "t_gone"]) == ["kept t_run", "pending t_run", "purged"]
+
+    after = [r[0] for r in kb.execute(_ROLE_HISTORY_SQL, ("platform", "t_next"))]
+    assert after == ["t_run", "t_other"]
+    for table, column in [
+        ("tasks", "id"), ("task_runs", "task_id"), ("task_events", "task_id"),
+        ("task_links", "parent_id"), ("kanban_worker_children", "creator_id"),
+    ]:
+        assert kb.execute(f"SELECT COUNT(*) FROM {table} WHERE {column} = 't_done'").fetchone() == (0,)
+
+
+def test_the_purge_leaves_a_card_the_run_adopted_but_did_not_create(tmp_path: Path) -> None:
+    """A worker's ``kanban_create`` can hand back a card a cron filed seconds earlier by its key.
+
+    ``kanban_worker_children`` attributes it to the worker's card anyway, so the
+    capture lists it as fan-out; hermes' ``created`` event says who made it.
+    """
+    kb = _purge_board(tmp_path)
+    _purge_card(kb, "t_mine", "done", creator="t_done", attributed_to="t_done")
+    _purge_card(kb, "t_cron", "done", creator=None, attributed_to="t_done")
+    _purge_card(kb, "t_cron_kid", "done", creator="t_cron", attributed_to="t_cron")
+    _purge_card(kb, "t_garbled", "done", attributed_to="t_done")
+    _purge_card(kb, "t_listed", "done", attributed_to="t_done")
+    kb.execute("UPDATE task_events SET payload = 'not json' WHERE task_id = 't_garbled'")
+    kb.execute("UPDATE task_events SET payload = '[1]' WHERE task_id = 't_listed'")
+    kb.commit()
+    (tmp_path / "attachments" / "t_cron").mkdir(parents=True)
+    (tmp_path / "attachments" / "t_mine").mkdir()
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "t_mine.log").write_text("worker transcript")
+    (tmp_path / "logs" / "t_cron.log").write_text("someone else's transcript")
+
+    out = _run_purge(tmp_path, ["t_done"], ["t_mine", "t_cron", "t_cron_kid", "t_garbled", "t_listed"])
+
+    assert out == ["foreign t_cron", "foreign t_cron_kid", "foreign t_garbled", "foreign t_listed", "purged"]
+    on_board = {r[0] for r in kb.execute("SELECT id FROM tasks")}
+    assert {"t_cron", "t_cron_kid", "t_garbled", "t_listed"} <= on_board and not {"t_done", "t_mine"} & on_board
+    assert (tmp_path / "attachments" / "t_cron").is_dir() and (tmp_path / "logs" / "t_cron.log").exists()
+    assert not (tmp_path / "attachments" / "t_mine").exists()
+    assert not (tmp_path / "logs" / "t_mine.log").exists()
+
+
+def test_the_purge_keeps_a_fan_out_while_one_of_its_cards_runs(tmp_path: Path) -> None:
+    """``kanban_fanout_reaper`` reaches an overdue card only through its creator's and siblings' rows."""
+    kb = _purge_board(tmp_path)
+    _purge_card(kb, "t_parent", "done", creator=None)
+    _purge_card(kb, "t_c1", "done", creator="t_parent", attributed_to="t_parent")
+    _purge_card(kb, "t_c2", "running", creator="t_parent", attributed_to="t_parent")
+    kb.commit()
+
+    _purge_card(kb, "t_gc", "done", creator="t_c2", attributed_to="t_c2")
+    kb.commit()
+    for tid in ("t_c1", "t_c2", "t_gc"):
+        (tmp_path / "attachments" / tid).mkdir(parents=True)
+
+    out = _run_purge(tmp_path, ["t_parent"], ["t_c1", "t_c2", "t_gc"])
+
+    # t_gc is settled, but t_c2's worker is still reading it.
+    held = ["t_parent", "t_c1", "t_c2", "t_gc"]
+    assert out == [*(f"kept {t}" for t in held), *(f"pending {t}" for t in held), "purged"]
+    rows = kb.execute("SELECT child_id FROM kanban_worker_children WHERE creator_id = 't_parent' ORDER BY 1")
+    assert [r[0] for r in rows] == ["t_c1", "t_c2"]
+    assert all((tmp_path / "attachments" / tid).is_dir() for tid in ("t_c1", "t_c2", "t_gc"))
+
+
+def test_the_purge_holds_no_fan_out_for_a_card_that_cannot_run(tmp_path: Path) -> None:
+    """A blocked fan-out card is no reaper's, nor a parent-linked follow-up: the rest goes."""
+    kb = _purge_board(tmp_path)
+    _purge_card(kb, "t_parent", "done", creator=None)
+    _purge_card(kb, "t_c1", "done", creator="t_parent", attributed_to="t_parent")
+    _purge_card(kb, "t_blocked", "blocked", creator="t_parent", attributed_to="t_parent")
+    _purge_card(kb, "t_follow", "ready", creator="t_parent", attributed_to="t_parent")
+    kb.execute("INSERT INTO task_links VALUES ('t_parent', 't_follow')")
+    kb.commit()
+
+    assert _run_purge(tmp_path, ["t_parent"], ["t_c1", "t_blocked", "t_follow"]) == ["purged"]
+    assert not {r[0] for r in kb.execute("SELECT id FROM tasks")} & {"t_parent", "t_c1", "t_blocked", "t_follow"}
+
+
+_FLOOR = 1_700_000_000
+
+
+def _stamp(kb: sqlite3.Connection, created: dict[str, int]) -> None:
+    """Give the board hermes' ``tasks.created_at`` and stamp the given cards."""
+    kb.execute("ALTER TABLE tasks ADD COLUMN created_at INTEGER")
+    for tid, at in created.items():
+        kb.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (at, tid))
+    kb.commit()
+
+
+def _card_files(root: Path, *tids: str) -> None:
+    (root / "logs").mkdir(exist_ok=True)
+    for tid in tids:
+        (root / "attachments" / tid).mkdir(parents=True)
+        (root / "logs" / f"{tid}.log").write_text(f"{tid}'s transcript")
+
+
+def _has_files(root: Path, tid: str) -> bool:
+    return (root / "attachments" / tid).is_dir() or (root / "logs" / f"{tid}.log").exists()
+
+
+def test_the_purge_leaves_a_root_created_before_the_run_started(tmp_path: Path) -> None:
+    """A front-door ``kanban_create`` can hand back a live card by its ``idempotency_key`` (#4591).
+
+    The result looks like a create, so the card is among the run's roots; its
+    ``created_at`` before the run's start floor says it is someone else's. The
+    card it fanned out stays with it.
+    """
+    kb = _purge_board(tmp_path)
+    _purge_card(kb, "t_sweep", "done")
+    _purge_card(kb, "t_sweep_kid", "done", creator="t_sweep", attributed_to="t_sweep")
+    _purge_card(kb, "t_mine", "done")
+    _purge_card(kb, "t_edge", "done")
+    _stamp(kb, {"t_sweep": _FLOOR - 1, "t_sweep_kid": _FLOOR - 1, "t_mine": _FLOOR + 5, "t_edge": _FLOOR})
+    _card_files(tmp_path, "t_sweep", "t_mine", "t_edge")
+
+    out = _run_purge(tmp_path, ["t_sweep", "t_mine", "t_edge"], ["t_sweep_kid"], floor=_FLOOR)
+
+    assert out == ["foreign t_sweep", "foreign t_sweep_kid", "purged"]
+    on_board = {r[0] for r in kb.execute("SELECT id FROM tasks")}
+    assert {"t_sweep", "t_sweep_kid"} <= on_board and not {"t_mine", "t_edge"} & on_board
+    assert kb.execute("SELECT COUNT(*) FROM task_runs WHERE task_id = 't_sweep'").fetchone() == (1,)
+    assert (tmp_path / "attachments" / "t_sweep").is_dir() and (tmp_path / "logs" / "t_sweep.log").exists()
+    # A card stamped in the floor's own second is the run's: hermes truncates both.
+    assert not _has_files(tmp_path, "t_mine") and not _has_files(tmp_path, "t_edge")
+
+
+def test_the_purge_takes_every_root_when_the_pod_clock_was_not_read(tmp_path: Path) -> None:
+    """No floor: the roots are taken as given, files included, as before #4591."""
+    kb = _purge_board(tmp_path)
+    _purge_card(kb, "t_old", "done")
+    _stamp(kb, {"t_old": _FLOOR - 1})
+    _card_files(tmp_path, "t_old")
+
+    assert _run_purge(tmp_path, ["t_old"]) == ["purged"]
+    assert kb.execute("SELECT COUNT(*) FROM tasks WHERE id = 't_old'").fetchone() == (0,)
+    assert not _has_files(tmp_path, "t_old")
+
+
+def test_a_purge_that_cannot_check_the_floor_still_clears_the_roots_files(tmp_path: Path) -> None:
+    """With a floor but no board to check it against, the run's own report must not outlive it."""
+    _card_files(tmp_path, "t_1")
+    (tmp_path / "kanban.db").write_text("not a database")
+
+    out = _run_purge(tmp_path, ["t_1"], floor=_FLOOR)
+
+    assert out[0] == "pending t_1" and len(out) == 2 and out[1].startswith("rows kept: ")
+    assert not _has_files(tmp_path, "t_1")
+
+
+def test_a_floored_purge_whose_script_never_ran_clears_the_roots_files_from_the_shell(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No python, or the exec timed out: nothing sorted the roots, so the shell clears them."""
+    scripts: list[str] = []
+    replies = iter(["", "", "purged\n"])
+    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: scripts.append(script) or next(replies))
+
+    harness._purge_card_state(["t_1"], 5.0, floor=_FLOOR)
+    assert len(scripts) == 2 and _is_purge(scripts[0])
+    marker = harness._shell_quote(harness._purge_sorted_marker(["t_1"]))
+    assert scripts[1].startswith(f"if [ -e {marker} ]") and f"rm -rf {harness._ATTACHMENTS_DIR}" in scripts[1]
+
+    # A script that ran sorted the roots itself: no second exec.
+    harness._purge_card_state(["t_1"], 5.0, floor=_FLOOR)
+    assert len(scripts) == 3
+
+
+def test_a_purge_whose_board_step_fails_still_clears_the_runs_files(tmp_path: Path) -> None:
+    """The floor checked, the write lock not taken: the run's own files still go, an older root's stay."""
+    kb = _purge_board(tmp_path)
+    _purge_card(kb, "t_old", "done")
+    _purge_card(kb, "t_mine", "done")
+    _stamp(kb, {"t_old": _FLOOR - 1, "t_mine": _FLOOR})
+    _card_files(tmp_path, "t_old", "t_mine")
+    holder = sqlite3.connect(tmp_path / "kanban.db", isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        out = _run_purge(tmp_path, ["t_old", "t_mine"], floor=_FLOOR, busy="0")
+    finally:
+        holder.execute("ROLLBACK")
+
+    # The whole purge is owed with its floor, so a retry leaves t_old alone too.
+    assert out[:3] == ["foreign t_old", "pending t_old", "pending t_mine"] and out[3].startswith("rows kept: ")
+    assert _has_files(tmp_path, "t_old") and not _has_files(tmp_path, "t_mine")
+
+
+def _owed(root: Path) -> list[dict[str, Any]]:
+    """The purges the script left pending in a temporary tree, oldest file name first."""
+    pending = root / "logs" / Path(harness._PURGE_PENDING_DIR).name
+    return [json.loads(f.read_text()) for f in sorted(pending.glob(f"*{harness._PURGE_PENDING_SUFFIX}"))]
+
+
+def _owe(root: Path, roots: list[str], fanned: list[str] = (), *, floor: int | None = None, first: int) -> None:
+    pending = root / "logs" / Path(harness._PURGE_PENDING_DIR).name
+    pending.mkdir(parents=True, exist_ok=True)
+    body = {"roots": roots, "fanned": list(fanned), "floor": floor, "first": first}
+    (pending / f"{roots[0]}{harness._PURGE_PENDING_SUFFIX}").write_text(json.dumps(body))
+
+
+def test_a_kept_card_is_owed_and_the_next_run_deletes_it_once_it_settles(tmp_path: Path) -> None:
+    """A fan-out card still running at the purge would reach the next repetition's digest (#4658)."""
+    kb = _purge_board(tmp_path)
+    _purge_card(kb, "t_parent", "done", creator=None)
+    _purge_card(kb, "t_c1", "running", creator="t_parent", attributed_to="t_parent")
+    kb.commit()
+    _card_files(tmp_path, "t_c1")
+
+    assert _run_purge(tmp_path, ["t_parent"], ["t_c1"]) == [
+        "kept t_parent", "kept t_c1", "pending t_parent", "pending t_c1", "purged",
+    ]
+    (owed,) = _owed(tmp_path)
+    # Kept cards were already sorted as the run's own: taken as given next time.
+    assert owed["roots"] == ["t_parent", "t_c1"] and owed["fanned"] == [] and owed["floor"] is None
+
+    # Still running at the next run's start: owed again, first-owed time kept.
+    assert _run_purge(tmp_path, []) == ["kept t_parent", "kept t_c1", "pending t_parent", "pending t_c1", "purged"]
+    (again,) = _owed(tmp_path)
+    assert again["first"] == owed["first"]
+    # t_c1's creator is not running, but t_c1 is: its worker still has its files.
+    assert _has_files(tmp_path, "t_c1")
+
+    kb.execute("UPDATE tasks SET status = 'done' WHERE id = 't_c1'")
+    kb.commit()
+    assert _run_purge(tmp_path, []) == ["purged"]
+    assert _owed(tmp_path) == []
+    assert not {r[0] for r in kb.execute("SELECT id FROM tasks")} & {"t_parent", "t_c1"}
+    assert not _has_files(tmp_path, "t_c1")
+
+
+def test_an_owed_card_the_next_runs_front_door_hands_back_is_still_owed(tmp_path: Path) -> None:
+    """Each purge keeps its own floor: older than the run is foreign to it, not to the purge that kept it."""
+    kb = _purge_board(tmp_path)
+    _purge_card(kb, "t_x", "running")
+    _stamp(kb, {"t_x": _FLOOR - 1})
+    assert _run_purge(tmp_path, ["t_x"]) == ["kept t_x", "pending t_x", "purged"]
+
+    kb.execute("UPDATE tasks SET status = 'done' WHERE id = 't_x'")
+    kb.commit()
+    # The next run's create returned t_x by its idempotency key, so it is among that run's roots.
+    # Not "foreign": the earlier purge's debt takes it, so nothing is left behind to warn of.
+    assert _run_purge(tmp_path, ["t_x"], floor=_FLOOR) == ["purged"]
+    assert kb.execute("SELECT COUNT(*) FROM tasks WHERE id = 't_x'").fetchone() == (0,)
+    assert _owed(tmp_path) == []
+
+
+def test_an_owed_purge_whose_rewrite_fails_keeps_its_old_file(tmp_path: Path) -> None:
+    """A full data volume must not erase the debt: the old file goes only once the new one is written."""
+    kb = _purge_board(tmp_path)
+    _purge_card(kb, "t_x", "running")
+    kb.commit()
+    _owe(tmp_path, ["t_x"], first=int(time.time()))
+    disk_full = "import os\ndef _full(*a):\n    raise OSError('No space left on device')\nos.replace = _full\n"
+
+    assert _run_purge(tmp_path, [], prelude=disk_full) == ["kept t_x", "purged"]
+    (owed,) = _owed(tmp_path)
+    assert owed["roots"] == ["t_x"]
+    pending = tmp_path / "logs" / Path(harness._PURGE_PENDING_DIR).name
+    assert [f.name for f in pending.iterdir() if f.name.startswith(".")] == []
+
+
+def test_a_root_an_earlier_purge_still_keeps_is_owed_not_foreign(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Handed back by the next run's front door while still running: owed, and logged as owed only."""
+    kb = _purge_board(tmp_path)
+    _purge_card(kb, "t_x", "running")
+    _stamp(kb, {"t_x": _FLOOR - 1})
+    _owe(tmp_path, ["t_x"], first=int(time.time()))
+
+    out = _run_purge(tmp_path, ["t_x"], floor=_FLOOR)
+    assert out == ["kept t_x", "pending t_x", "purged"]
+
+    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: "\n".join(out) + "\n")
+    with caplog.at_level("WARNING", logger="kube_agents_bench.harness"):
+        harness._purge_card_state(["t_x"], 5.0, floor=_FLOOR)
+    assert "owed to a later purge" in caplog.text and "left cards" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"roots": ["t_1"], "fanned": [], "floor": None, "first": 1e999},
+        {"roots": [""], "fanned": [], "floor": None, "first": 0},
+        {"roots": [""], "fanned": [], "floor": None, "first": 2_000_000_000},
+        {"roots": ["../attachments"], "fanned": [], "floor": None, "first": 2_000_000_000},
+        {"roots": [".."], "fanned": [], "floor": None, "first": 2_000_000_000},
+        {"roots": ["t_1"], "fanned": ["."], "floor": None, "first": 2_000_000_000},
+        {"roots": ["t_1"], "fanned": ["t 2"], "floor": None, "first": 2_000_000_000},
+        {"roots": ["t_1"], "fanned": [], "floor": "1700000000", "first": 2_000_000_000},
+        ["t_1"],
+        # Deep enough for RecursionError, which is no ValueError.
+        pytest.param("[" * 1_000_000, id="nested"),
+    ],
+)
+def test_an_owed_purge_that_is_not_card_ids_and_whole_times_is_dropped_unread(tmp_path: Path, body: Any) -> None:
+    """Anything with a shell on the volume can write here: nothing it writes may crash the script or widen a delete."""
+    _purge_board(tmp_path)
+    _card_files(tmp_path, "t_1")
+    pending = tmp_path / "logs" / Path(harness._PURGE_PENDING_DIR).name
+    pending.mkdir()
+    (pending / f"x{harness._PURGE_PENDING_SUFFIX}").write_text(body if isinstance(body, str) else json.dumps(body))
+
+    assert _run_purge(tmp_path, []) == ["purged"]
+    assert _owed(tmp_path) == [] and _has_files(tmp_path, "t_1")
+
+
+def test_an_owed_purge_stamped_in_the_future_still_ages_out(tmp_path: Path) -> None:
+    """A first-owed time ahead of the pod's clock counts as now, so the 24 h limit still runs."""
+    kb = _purge_board(tmp_path)
+    _purge_card(kb, "t_x", "running")
+    kb.commit()
+    _owe(tmp_path, ["t_x"], first=10_000_000_000_000_000_000)
+
+    assert _run_purge(tmp_path, []) == ["kept t_x", "pending t_x", "purged"]
+    (owed,) = _owed(tmp_path)
+    assert owed["first"] <= int(time.time())
+
+
+def test_a_retried_card_kept_but_not_re_owed_is_still_a_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The volume refused the re-owe, so no ``pending`` line: ``kept`` alone still says it is on the board."""
+    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: "kept t_x\npurged\n")
+    with caplog.at_level("WARNING", logger="kube_agents_bench.harness"):
+        harness._retry_pending_purges(5.0)
+    assert "cards t_x, left by an earlier run's purge, are still on the board" in caplog.text
+
+
+def test_an_owed_purge_keeps_every_id_the_harness_accepts(tmp_path: Path) -> None:
+    """Held to the harness's own id grammar: an id with ``.`` or ``:`` is owed, not dropped with its file."""
+    kb = _purge_board(tmp_path)
+    for tid in ("t_a.b", "t_c:d"):
+        _purge_card(kb, tid, "running")
+    kb.commit()
+    _owe(tmp_path, ["t_a.b", "t_c:d"], first=int(time.time()))
+
+    assert _run_purge(tmp_path, []) == ["kept t_a.b", "kept t_c:d", "pending t_a.b", "pending t_c:d", "purged"]
+
+
+def test_an_owed_dot_dot_id_is_dropped_even_with_a_row_to_delete(tmp_path: Path) -> None:
+    """Were it taken, deleting its row would unlink ``attachments/..``: the whole kanban tree, board included."""
+    kb = _purge_board(tmp_path)
+    _purge_card(kb, "..", "done")
+    kb.commit()
+    _card_files(tmp_path, "t_1")
+    _owe(tmp_path, [".."], first=int(time.time()))
+    (tmp_path / "logs" / Path(harness._PURGE_PENDING_DIR).name / f"..{harness._PURGE_PENDING_SUFFIX}").rename(
+        tmp_path / "logs" / Path(harness._PURGE_PENDING_DIR).name / f"dots{harness._PURGE_PENDING_SUFFIX}"
+    )
+
+    assert _run_purge(tmp_path, []) == ["purged"]
+    assert _has_files(tmp_path, "t_1") and (tmp_path / "kanban.db").exists()
+    assert kb.execute("SELECT COUNT(*) FROM tasks WHERE id = '..'").fetchone() == (1,)
+
+
+def test_the_runs_own_ids_never_reach_a_path_as_a_bare_dot(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``_TASK_ID_RE`` admits ``..``; joined to the attachments directory it would name its parent."""
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: scripts.append(script) or "purged\n")
+    harness._purge_card_state(["..", "."], 5.0)
+    assert scripts == []
+    harness._purge_card_state(["t_1", ".."], 5.0, ["."])
+    (purge,) = scripts
+    assert purge.endswith(" ".join(harness._shell_quote(a) for a in harness._purge_argv(["t_1"])))
+
+
+def test_the_owe_script_leaves_no_temp_file_when_its_write_fails(tmp_path: Path) -> None:
+    """``mv`` failing (a full or read-only volume) must not strand a ``.<hex>`` file the retry never reads."""
+    pending = tmp_path / "pending"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "mv").write_text("#!/bin/sh\nexit 1\n")
+    (bin_dir / "mv").chmod(0o755)
+    script = harness._owe_script(["t_1"], [], None).replace(harness._PURGE_PENDING_DIR, str(pending))
+    env = {"PATH": f"{bin_dir}:/usr/bin:/bin"}
+    proc = subprocess.run(["/bin/sh", "-c", script], capture_output=True, text=True, env=env)
+    assert harness._PURGE_PENDING_PRESENT not in proc.stdout
+    assert list(pending.iterdir()) == []
+
+
+def test_a_marker_with_no_id_is_skipped() -> None:
+    assert harness._purge_marked(["abandoned ", "abandoned", "abandoned t_1", "pending t_2"], "abandoned") == ["t_1"]
+
+
+def test_a_card_owed_again_keeps_its_earliest_owed_time(tmp_path: Path) -> None:
+    """Named again by a run that could not read its clock: the 24 h limit runs from the first debt, not this one."""
+    kb = _purge_board(tmp_path)
+    _purge_card(kb, "t_x", "running")
+    kb.commit()
+    long_ago = int(time.time()) - 3600
+    _owe(tmp_path, ["t_x"], first=long_ago)
+
+    assert _run_purge(tmp_path, ["t_x"]) == ["kept t_x", "pending t_x", "purged"]
+    (owed,) = _owed(tmp_path)
+    assert owed["first"] == long_ago
+
+
+def test_a_retried_purge_that_finds_a_card_not_its_own_is_a_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: "foreign t_old\nforeign t_cron\npurged\n")
+    with caplog.at_level("WARNING", logger="kube_agents_bench.harness"):
+        harness._retry_pending_purges(5.0)
+    assert "left cards t_old, t_cron on the board for good" in caplog.text
+
+
+def test_a_purge_whose_board_step_failed_is_retried_under_its_own_rules(tmp_path: Path) -> None:
+    """The retry keeps the failed purge's floor and creator check: a stranger's card is still left alone."""
+    kb = _purge_board(tmp_path)
+    _purge_card(kb, "t_old", "done")
+    _purge_card(kb, "t_mine", "done")
+    _purge_card(kb, "t_mine_kid", "done", creator="t_mine", attributed_to="t_mine")
+    _purge_card(kb, "t_cron", "done", attributed_to="t_mine")
+    _stamp(kb, {"t_old": _FLOOR - 1, "t_mine": _FLOOR, "t_mine_kid": _FLOOR, "t_cron": _FLOOR})
+    holder = sqlite3.connect(tmp_path / "kanban.db", isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        out = _run_purge(tmp_path, ["t_old", "t_mine"], ["t_mine_kid", "t_cron"], floor=_FLOOR, busy="0")
+    finally:
+        holder.execute("ROLLBACK")
+    assert out[-1].startswith("rows kept: ")
+    (owed,) = _owed(tmp_path)
+    assert owed["roots"] == ["t_old", "t_mine"] and owed["fanned"] == ["t_mine_kid", "t_cron"]
+    assert owed["floor"] == _FLOOR
+
+    assert _run_purge(tmp_path, []) == ["foreign t_old", "foreign t_cron", "purged"]
+    assert {r[0] for r in kb.execute("SELECT id FROM tasks")} >= {"t_old", "t_cron"}
+    assert not {r[0] for r in kb.execute("SELECT id FROM tasks")} & {"t_mine", "t_mine_kid"}
+    assert _owed(tmp_path) == []
+
+
+def test_an_owed_purge_past_its_age_is_abandoned_and_a_garbled_one_dropped(tmp_path: Path) -> None:
+    kb = _purge_board(tmp_path)
+    _purge_card(kb, "t_stale", "done")
+    kb.commit()
+    _owe(tmp_path, ["t_stale"], first=int(time.time()) - harness._PURGE_PENDING_MAX_AGE_SECONDS - 60)
+    garbled = tmp_path / "logs" / Path(harness._PURGE_PENDING_DIR).name / f"t_x{harness._PURGE_PENDING_SUFFIX}"
+    garbled.write_text("{not json")
+
+    assert _run_purge(tmp_path, []) == ["abandoned t_stale", "purged"]
+    assert not garbled.exists() and _owed(tmp_path) == []
+    assert kb.execute("SELECT COUNT(*) FROM tasks WHERE id = 't_stale'").fetchone() == (1,)
+
+
+def test_a_purge_that_printed_nothing_is_owed_from_the_shell(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """No python, or the exec timed out: nothing in the pod wrote the purge down, so the harness does."""
+    scripts: list[str] = []
+    replies = iter(["", f"{harness._PURGE_PENDING_PRESENT}\n"])
+    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: scripts.append(script) or next(replies))
+    with caplog.at_level("WARNING", logger="kube_agents_bench.harness"):
+        harness._purge_card_state(["t_1"], 5.0, ["t_kid"])
+    assert len(scripts) == 2 and _is_purge(scripts[0])
+    assert harness._PURGE_PENDING_DIR in scripts[1] and "'[\"t_1\"]' '[\"t_kid\"]' 'null'" in scripts[1]
+    assert "could not delete the board rows of cards t_1, t_kid; owed to a later purge" in caplog.text
+
+
+def test_the_owe_script_writes_what_the_purge_script_reads(tmp_path: Path) -> None:
+    """The shell's file and the script's agree: a shell-owed purge is retried like any other."""
+    kb = _purge_board(tmp_path)
+    _purge_card(kb, "t_mine", "done")
+    _stamp(kb, {"t_mine": _FLOOR})
+    pending = tmp_path / "logs" / Path(harness._PURGE_PENDING_DIR).name
+    script = harness._owe_script(["t_mine"], [], _FLOOR).replace(harness._PURGE_PENDING_DIR, str(pending))
+    env = {"PATH": "/usr/bin:/bin"}
+    proc = subprocess.run(["/bin/sh", "-c", script], capture_output=True, text=True, env=env, check=True)
+    assert proc.stdout.split() == [harness._PURGE_PENDING_PRESENT]
+    (owed,) = _owed(tmp_path)
+    assert owed["roots"] == ["t_mine"] and owed["floor"] == _FLOOR and owed["first"] > _FLOOR
+
+    assert _run_purge(tmp_path, []) == ["purged"]
+    assert kb.execute("SELECT COUNT(*) FROM tasks WHERE id = 't_mine'").fetchone() == (0,)
+
+
+def test_a_run_retries_owed_purges_before_its_agent_is_invoked(
+    stub_agent: _StubAgentServer, instant_polls: None, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    turns_at_retry: list[int] = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if script == harness._POD_CLOCK_SCRIPT:
+            return f"{_FLOOR}\n{harness._PURGE_PENDING_PRESENT}\n"
+        if _is_purge(script) and script.endswith(" ".join(harness._shell_quote(a) for a in harness._purge_argv([]))):
+            turns_at_retry.append(len(stub_agent.requests))
+            return "kept t_prev\npending t_prev\npurged\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+    stub_agent.turns = [_turn(_text("No delegation needed; the answer is 42."))]
+
+    with caplog.at_level("WARNING", logger="kube_agents_bench.harness"):
+        KubeAgentsHarness().run("What is six times seven?")
+
+    assert turns_at_retry == [0]
+    assert "cards t_prev, left by an earlier run's purge, are still on the board" in caplog.text
+
+
+def test_the_pod_clock_read_is_the_floor_or_none(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # "²" is a digit to str.isdigit() and not to int(): it must not raise out of run().
+    flagged = f"1700000000\n{harness._PURGE_PENDING_PRESENT}\n"
+    flag_only = f"{harness._PURGE_PENDING_PRESENT}\n"
+    replies = iter(["1700000000\n", flagged, "", "Error from server\n", "\u00b2\n", flag_only])
+    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: next(replies))
+    assert harness._pod_start() == (_FLOOR, False)
+    assert harness._pod_start() == (_FLOOR, True)
+    with caplog.at_level("WARNING", logger="kube_agents_bench.harness"):
+        assert harness._pod_start() == (None, False)
+        assert harness._pod_start() == (None, False)
+        assert harness._pod_start() == (None, False)
+        # date printed nothing: the clock is unread, but the owed purge is still seen.
+        assert harness._pod_start() == (None, True)
+    assert caplog.text.count("could not read the agent pod's clock") == 4
+
+
+def _clocked_pod(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> tuple[list[str], list[int]]:
+    """An agent pod whose clock reads ``_FLOOR``; returns the scripts and, per clock read, the turns sent."""
+    scripts: list[str] = []
+    turns_before_clock: list[int] = []
+
+    def _shell(script: str, timeout: float) -> str:
+        scripts.append(script)
+        if script == harness._POD_CLOCK_SCRIPT:
+            turns_before_clock.append(len(stub_agent.requests))
+            return f"{_FLOOR}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+    return scripts, turns_before_clock
+
+
+def test_the_pod_clock_is_read_before_the_agent_and_floors_the_purge(
+    stub_agent: _StubAgentServer, instant_polls: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scripts, turns_before_clock = _clocked_pod(monkeypatch, stub_agent)
+    stub_agent.turns = [_create_turn(), _show_turn("done", result=_RCA_RESULT)]
+
+    KubeAgentsHarness().run("Find the root cause.")
+
+    assert turns_before_clock == [0]
+    (purge,) = [s for s in scripts if _is_purge(s)]
+    floored = harness._purge_argv([_TASK_ID], floor=_FLOOR)
+    assert purge.endswith(" ".join(harness._shell_quote(a) for a in floored))
+
+
+def test_a_transport_exhausted_run_floors_its_purge_too(
+    stub_agent: _StubAgentServer,
+    instant_polls: None,
+    recorded_pf_resets: list[int],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The paths that purge without settling carry the floor as well."""
+    scripts, _ = _clocked_pod(monkeypatch, stub_agent)
+    stub_agent.turns = [_create_turn(), _show_turn("done")]
+    stub_agent.fail_on = frozenset(range(2, 2 + harness._MAX_TRANSPORT_FAILURES))
+    stub_agent.fail_on_status = 429
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    (purge,) = [s for s in scripts if _is_purge(s)]
+    assert purge.endswith(" ".join(harness._shell_quote(a) for a in harness._purge_argv([_TASK_ID], floor=_FLOOR)))
+
+
+def test_an_infra_status_turn_floors_its_purge_too(
+    stub_agent: _StubAgentServer,
+    instant_polls: None,
+    recorded_pf_resets: list[int],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A status turn the endpoint marks infrastructure purges at once, with the floor."""
+    scripts, _ = _clocked_pod(monkeypatch, stub_agent)
+    stub_agent.turns = [_create_turn(), _show_turn("done")]
+    stub_agent.fail_on = frozenset({2})
+    stub_agent.fail_on_status = 502
+    stub_agent.fail_headers = {"X-Hermes-Failure-Reason": "rate_limit"}
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert len(stub_agent.requests) == 2
+    (purge,) = [s for s in scripts if _is_purge(s)]
+    assert purge.endswith(" ".join(harness._shell_quote(a) for a in harness._purge_argv([_TASK_ID], floor=_FLOOR)))
+
+
+def test_an_unfloored_purge_clears_the_runs_files_from_the_shell_first(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no floor every root is the run's own, so its files go even if python never starts."""
+    scripts: list[str] = []
+    # Both scripts ran ("purged"), so the floored one needs no shell fallback.
+    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: scripts.append(script) or "purged\n")
+    harness._purge_card_state(["t_1"], 5.0)
+    harness._purge_card_state(["t_1"], 5.0, floor=1_700_000_000)
+    unfloored, floored = scripts
+    assert unfloored.index(f"rm -rf {harness._ATTACHMENTS_DIR}") < unfloored.index("-c ")
+    # With a floor a root may not be the run's, so only the script may delete its files.
+    assert "rm -rf" not in floored
+
+
+def test_a_root_older_than_the_floor_is_a_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """It may be an earlier repetition's leftover, which nothing purges now."""
+    monkeypatch.setattr(
+        harness, "_agent_shell", lambda script, timeout: "foreign t_old\nforeign t_adopted\npurged\n"
+    )
+    with caplog.at_level("INFO", logger="kube_agents_bench.harness"):
+        harness._purge_card_state(["t_old", "t_new"], 5.0, ["t_adopted"], floor=1_700_000_000)
+    warned = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warned) == 1 and "t_old" in warned[0] and "t_adopted" not in warned[0]
+    assert any("t_adopted" in r.getMessage() for r in caplog.records if r.levelname == "INFO")
+
+
+def test_a_purge_that_cannot_reach_the_board_is_a_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: "kept t_1\n")
+    with caplog.at_level("WARNING", logger="kube_agents_bench.harness"):
+        harness._purge_card_state(["t_1", "t_2"], 5.0)
+    assert "cards t_1 were still running" in caplog.text
+    assert "could not delete the board rows of cards t_1, t_2" in caplog.text
+
+
+def test_settle_purges_the_cards_the_workers_fanned_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Cluster Agent profile outlives the run, so its cards' digest leaks too.
+
+    Only cards the run's workers filed: a card linked under one is left alone.
+    """
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {})
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        summary={"cards": [
+            {"task": "t_1", "fanned_out": ["t_child"], "children": ["t_child", "t_linked"]},
+            {"task": "t_child", "fanned_out": ["t_grandchild"], "children": ["t_grandchild"]},
+            {"task": "t_grandchild", "fanned_out": [], "children": []},
+            # Reached through a predecessor link only: someone else's card.
+            {"task": "t_linked", "fanned_out": ["t_linked_kid"], "children": ["t_linked_kid"]},
+            {"task": "t_linked_kid", "fanned_out": [], "children": []},
+        ]},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+    calls: list[tuple[list[str], list[str], int | None]] = []
+    monkeypatch.setattr(
+        harness, "_purge_card_state",
+        lambda ids, to, fanned_out=(), floor=None: calls.append((list(ids), list(fanned_out), floor)),
+    )
+
+    res = harness.AgentResult(output="ok", trajectory=[{"name": "kanban_create"}])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"], floor=1700000000)
+
+    # The run's own card is checked against the floor; the fan-out against hermes' record.
+    assert calls == [(["t_1"], ["t_child", "t_grandchild"], 1700000000)]
 
 
 def test_artifacts_are_read_before_the_card_state_is_purged(
@@ -3343,27 +4652,34 @@ def test_artifacts_are_read_before_the_card_state_is_purged(
     KubeAgentsHarness().run("Find the root cause.")
 
     kinds = [
-        "purge" if "rm -rf" in s else "board" if board.BOARD_PRESENT in s else "read"
+        "purge" if _is_purge(s) else "board" if board.BOARD_PRESENT in s else
+        "clock" if s == harness._POD_CLOCK_SCRIPT else "owe" if harness._PURGE_PENDING_DIR in s else "read"
         for s in no_cluster_exec
     ]
-    # The board read of the one poll (unanswered here, so the status turn
-    # follows), then three reads: the artifact listing, the card's worker log
-    # (for the worker_commands check), then the workers' session stores (for
-    # the worker trajectory); the purge comes after all of them.
-    assert kinds == ["board", "read", "read", "read", "purge"]
-    assert harness._LOGS_DIR in no_cluster_exec[2]
-    assert worker_trajectory.CAPTURE_PRESENT in no_cluster_exec[3]
+    # The pod clock at the run's start, the board read of the one poll
+    # (unanswered here, so the status turn follows), then the artifact
+    # listing, settle's read of the cards' end state (#4998), the card's
+    # worker log (for the worker_commands check), then the workers' session
+    # stores (for the worker trajectory); the purge comes after all of them.
+    # The stub pod prints nothing, so the purge is owed.
+    assert kinds == ["clock", "board", "read", "board", "read", "read", "purge", "owe"]
+    assert harness._LOGS_DIR in no_cluster_exec[4]
+    assert worker_trajectory.CAPTURE_PRESENT in no_cluster_exec[5]
 
 
-def test_a_run_that_delegates_nothing_touches_no_pod(
+def test_a_run_that_delegates_nothing_reads_nothing_and_purges_nothing(
     stub_agent: _StubAgentServer, no_cluster_exec: list[str]
 ) -> None:
-    """No card means no artifacts and nothing to clear, so no exec at all."""
+    """No card means no artifacts and nothing to clear: the only exec is the run-start clock read.
+
+    The clock is read before the agent is invoked, when nobody knows yet
+    whether it will file a card (:func:`harness._pod_start`).
+    """
     stub_agent.turns = [_turn(_text("No delegation needed; the answer is 42."))]
 
     result = KubeAgentsHarness().run("What is six times seven?")
 
-    assert no_cluster_exec == []
+    assert no_cluster_exec == [harness._POD_CLOCK_SCRIPT]
     assert not result.has_errors()
 
 
@@ -3585,7 +4901,7 @@ def test_a_question_wake_archives_its_card_when_the_wake_turn_errors(
     assert len(stub_agent.requests) == 2
     assert _archived(scripts)
     assert [s["name"] for s in result.trajectory][-1] == card_wake.SETTLED_ENTRY
-    assert "question_wake" in result.metadata and "failure_wake" not in result.metadata
+    assert "question_wake" in result.metadata
 
 
 def test_a_wake_turn_that_replied_with_a_parse_warning_still_gets_its_answer(
@@ -3742,103 +5058,61 @@ def test_a_question_wake_missing_its_answer_errors_without_planting(
     result = KubeAgentsHarness().run(_REPLAY_PROMPT.replace("answer: seeded-b\n", ""))
 
     assert result.errors == [f"{card_wake.QUESTION_DIRECTIVE} prompt is missing answer"]
-    assert scripts == []
+    # Only the run-start clock read: nothing planted.
+    assert scripts == [harness._POD_CLOCK_SCRIPT]
     assert stub_agent.requests == []
 
 
-_FAILURE_PROMPT = """[bench:card-failure-wake]
-title: Restart checkout-gateway on seeded-a
-body: Roll the checkout-gateway Deployment on seeded-a.
-outcome: blocked
-reason: Permission denied: container.deployments.update on seeded-a.
-"""
-
-
-def test_a_failure_wake_is_the_runs_only_turn_and_its_reply_is_graded(
-    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
-) -> None:
-    scripts: list[str] = []
-    monkeypatch.setattr(harness, "_agent_shell", _replay_shell(scripts))
-    stub_agent.turns = [
-        _turn(
-            *_call("kanban_show", {"task_id": _REPLAY_CARD}, {"status": "blocked"}, "c1"),
-            _text("I couldn't restart checkout-gateway on seeded-a."),
-        )
-    ]
-
-    result = KubeAgentsHarness().run(_FAILURE_PROMPT)
-
-    assert not result.has_errors()
-    assert [r["input"] for r in stub_agent.requests] == [_REPLAY_WAKE]
-    assert result.output == "I couldn't restart checkout-gateway on seeded-a."
-    assert [s["name"] for s in result.trajectory] == ["kanban_show", card_wake.SETTLED_ENTRY]
-    assert result.trajectory[-1]["result"] == _REPLAY_SETTLED
-    assert transcript.get().final_message == "I couldn't restart checkout-gateway on seeded-a."
-    assert result.metadata["failure_wake"]["card"] == _REPLAY_CARD
-    assert result.metadata["failure_wake"]["settled"] == _REPLAY_SETTLED
-    assert _archived(scripts)
-
-
-def test_a_failure_wake_that_errors_keeps_its_card_and_wake_and_archives_the_card(
-    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
-) -> None:
-    scripts: list[str] = []
-    monkeypatch.setattr(harness, "_agent_shell", _replay_shell(scripts))
-    stub_agent.fail_with = 500
-
-    result = KubeAgentsHarness().run(_FAILURE_PROMPT)
-
-    assert result.has_errors()
-    assert result.metadata["failure_wake"]["card"] == _REPLAY_CARD
-    assert result.metadata["failure_wake"]["wake"] == _REPLAY_WAKE
-    assert _archived(scripts)
-
-
-def test_a_failure_wake_whose_breaker_disagrees_is_an_errored_run_not_infrastructure(
-    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
-) -> None:
-    mismatch = json.dumps(
-        {"card": None, "wake": None, "posted": 0, "error": None,
-         "mismatch": "BreakerMismatch: card t_1 tripped its failure breaker"}
-    )
-    reply = f"{card_wake.REPLAY_PRESENT}\n{mismatch}"
-    monkeypatch.setattr(harness, "_agent_shell", _replay_shell([], plant_reply=reply))
-
-    result = KubeAgentsHarness().run(_FAILURE_PROMPT)
-
-    assert result.errors == ["failure wake: BreakerMismatch: card t_1 tripped its failure breaker"]
-    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
-    assert stub_agent.requests == []
-
-
-def test_a_failure_wake_whose_script_reports_an_error_is_an_errored_run_not_infrastructure(
-    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
-) -> None:
-    failed = json.dumps(
-        {"card": None, "wake": None, "posted": 0, "error": "AttributeError: no build_wake_text",
-         "mismatch": None}
-    )
-    reply = f"{card_wake.REPLAY_PRESENT}\n{failed}"
-    monkeypatch.setattr(harness, "_agent_shell", _replay_shell([], plant_reply=reply))
-
-    result = KubeAgentsHarness().run(_FAILURE_PROMPT)
-
-    assert result.errors == ["failure wake: AttributeError: no build_wake_text"]
-    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
-    assert stub_agent.requests == []
-
-
-def test_a_failure_wake_needs_the_api_transport(
+def test_a_question_wake_on_the_inject_transport_sends_both_turns_to_the_api_server(
     monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
 ) -> None:
     scripts: list[str] = []
     monkeypatch.setattr(harness, "_agent_shell", _replay_shell(scripts))
     monkeypatch.setenv("AGENT_TRANSPORT", "inject")
+    monkeypatch.delenv("AGENT_INJECT_TOKEN", raising=False)
+    stub_agent.turns = [_turn(_text("[SILENT]")), _answer_turn()]
 
-    result = KubeAgentsHarness().run(_FAILURE_PROMPT)
+    result = KubeAgentsHarness().run(_REPLAY_PROMPT)
 
-    assert result.errors == [f"{card_wake.FAILURE_DIRECTIVE} needs AGENT_TRANSPORT=api, got 'inject'"]
-    assert scripts == []
+    assert not result.has_errors()
+    assert [r["input"] for r in stub_agent.requests] == [_REPLAY_WAKE, "seeded-b"]
+    assert stub_agent.requests[0]["conversation"] == stub_agent.requests[1]["conversation"]
+    assert result.trajectory[-1]["result"] == _REPLAY_SETTLED
+    assert _archived(scripts)
+
+
+def test_a_fresh_session_answer_on_the_inject_transport_goes_to_the_api_server(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _fresh_shell(scripts))
+    monkeypatch.setenv("AGENT_TRANSPORT", "inject")
+    monkeypatch.delenv("AGENT_INJECT_TOKEN", raising=False)
+    stub_agent.turns = [_turn(_text("[SILENT]")), _answer_turn()]
+
+    result = KubeAgentsHarness().run(_FRESH_PROMPT)
+
+    assert not result.has_errors()
+    wake, answer = stub_agent.requests
+    assert wake["input"] == _REPLAY_WAKE
+    assert answer["input"].endswith("seeded-b")
+    assert wake["conversation"] != answer["conversation"]
+    assert _archived(scripts)
+
+
+def test_a_card_wake_refuses_an_unknown_transport(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell(scripts))
+    monkeypatch.setenv("AGENT_TRANSPORT", "smoke-signal")
+
+    result = KubeAgentsHarness().run(_REPLAY_PROMPT)
+
+    assert result.errors == ["AGENT_TRANSPORT must be one of ['api', 'inject'], got 'smoke-signal'"]
+    # Only the run-start clock read: nothing planted.
+    assert scripts == [harness._POD_CLOCK_SCRIPT]
+    assert stub_agent.requests == []
 
 
 # --- The fresh-session question replay (session: fresh) ----------------------
@@ -3946,3 +5220,1550 @@ def test_a_fresh_session_replay_whose_context_failed_in_the_image_sends_no_answe
     assert not result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
     assert len(stub_agent.requests) == 1
     assert _archived(scripts)
+
+
+def test_extract_infra_failure_reason():
+    """Only text opening with the Hermes failure prefix is classified as rate_limit."""
+    prefix = "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429"
+    assert harness._extract_infra_failure_reason(prefix) == "rate_limit"
+
+    billing = "provider rate limit: API retries exhausted (failure_reason=billing): quota exceeded"
+    assert harness._extract_infra_failure_reason(billing) == "billing"
+
+    plain_prefix = "provider rate limit: API retries exhausted: 429 Too Many Requests"
+    assert harness._extract_infra_failure_reason(plain_prefix) == "rate_limit"
+
+    # Arbitrary / spoofed 429 without the Hermes prefix must NOT match
+    assert harness._extract_infra_failure_reason("HTTP 429 Too Many Requests: TPM quota exhausted") is None
+    assert harness._extract_infra_failure_reason("agent error: rate limit hit") is None
+    assert harness._extract_infra_failure_reason("transient rate limit on cluster") is None
+    assert harness._extract_infra_failure_reason("") is None
+    assert harness._extract_infra_failure_reason(None) is None
+
+
+def test_rate_limit_reason_prefix_matches_guardrail_constant():
+    """_RATE_LIMIT_REASON_PREFIX must exactly match the guardrail exit constant."""
+    import importlib.util
+    import pathlib
+    import sys
+
+    path = pathlib.Path(__file__).resolve().parents[2] / "deploy/docker/patches/kanban_guardrail_exit.py"
+    patches_dir = str(path.parent)
+    if patches_dir not in sys.path:
+        sys.path.insert(0, patches_dir)
+    spec = importlib.util.spec_from_file_location("kanban_guardrail_exit", path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    assert harness._RATE_LIMIT_REASON_PREFIX == mod.RATE_LIMIT_REASON_PREFIX
+    reason_line = mod.rate_limit_block_reason("rate_limit", "429")
+    assert harness._extract_infra_failure_reason(reason_line) == "rate_limit"
+
+
+def test_guardrail_block_kind_matches_the_patch_constant():
+    import importlib.util
+    import pathlib
+
+    path = pathlib.Path(__file__).resolve().parents[2] / "deploy/docker/patches/kanban_guardrail_exit.py"
+    spec = importlib.util.spec_from_file_location("kanban_guardrail_exit", path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert harness._GUARDRAIL_BLOCK_KIND == mod.RATE_LIMIT_BLOCK_KIND
+
+
+_GUARDRAIL_SUMMARY = (
+    "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429: "
+    "TPM quota exhausted"
+)
+
+
+def _worker_entry(name: str, task: str = "t_1", **args: object) -> dict[str, object]:
+    return {"name": name, "args": dict(args), "result": None, "failed": None, "agent": "platform", "task": task}
+
+
+def _settle_after_guardrail_block(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    entries: list[dict[str, object]] | None,
+    cards: dict[str, harness.board.BoardCard] | None,
+    artifact_paths: list[str] = (),
+    front_trajectory: list[dict[str, object]] | None = None,
+    awaited: list[str] = ("t_1",),
+    summary: dict[str, object] | None = None,
+) -> harness.AgentResult:
+    """Settle the awaited cards (``t_1`` by default) with the board, the capture
+    and the artifacts faked; ``entries=None`` is a capture that could not run."""
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {"t_1": harness._WorkerLog("log", "100", "100")})
+    monkeypatch.setattr(
+        harness.worker_trajectory,
+        "capture",
+        lambda shell, awaited, to: None
+        if entries is None
+        else harness.worker_trajectory.WorkerCapture(
+            entries=list(entries), tokens={}, unbilled=[], summary=dict(summary or {})
+        ),
+    )
+    monkeypatch.setattr(harness.board, "read_board_cards", lambda shell, awaited, to: cards)
+    monkeypatch.setattr(harness, "_artifact_paths", lambda task_ids, to: list(artifact_paths))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "report body")
+    res = harness.AgentResult(
+        output="router ack", trajectory=list(front_trajectory or [{"name": "kanban_create"}])
+    )
+    harness.KubeAgentsHarness._settle(res, [], list(awaited))
+    return res
+
+
+_ACTED = [_worker_entry("read_file", path="x"), _worker_entry("terminal", command="kubectl get pods")]
+_GUARDRAIL_CARD = {"t_1": harness.board.BoardCard("blocked", _GUARDRAIL_SUMMARY, None, "transient")}
+
+
+def test_settle_marks_infra_when_the_guardrail_blocked_a_worker_that_acted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#4998: the worker ran commands, then spent its retries on 429s and the
+    guardrail blocked its card. The run holds no answer; it is infrastructure,
+    and rung 1 grades what the worker did before that above the mark."""
+    res = _settle_after_guardrail_block(monkeypatch, entries=_ACTED, cards=_GUARDRAIL_CARD)
+    assert res.errors and res.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "rate-limit guardrail blocked t_1" in res.errors[0]
+    assert res.output == "router ack"
+
+
+def test_settle_keeps_a_card_the_worker_blocked_itself_graded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The same board state written by the model's own kanban_block call is
+    the worker's word, not the guardrail's: graded."""
+    entries = [*_ACTED, _worker_entry("kanban_block", reason=_GUARDRAIL_SUMMARY, kind="transient")]
+    res = _settle_after_guardrail_block(monkeypatch, entries=entries, cards=_GUARDRAIL_CARD)
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+
+
+def test_settle_keeps_a_card_the_worker_completed_under_the_tool_call_wrapper_graded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wrapped = _worker_entry(
+        harness.worker_trajectory.TOOL_CALL_WRAPPER,
+        calls=[{"name": "kanban_complete", "args": {"summary": _GUARDRAIL_SUMMARY}}],
+    )
+    assert "kanban_complete" in harness.worker_trajectory.wrapped_tool_names(wrapped)
+    res = _settle_after_guardrail_block(monkeypatch, entries=[*_ACTED, wrapped], cards=_GUARDRAIL_CARD)
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+
+
+@pytest.mark.parametrize(
+    "wrapper",
+    [
+        _worker_entry(harness.worker_trajectory.TOOL_CALL_WRAPPER, raw='{"name": "kanban_bl'),
+        {**_worker_entry(harness.worker_trajectory.TOOL_CALL_WRAPPER), "args": "kanban_block(...)"},
+        _worker_entry(harness.worker_trajectory.TOOL_CALL_WRAPPER, calls=[{"arguments": {}}]),
+    ],
+    ids=["clipped-raw", "string-args", "no-names"],
+)
+def test_settle_keeps_a_card_graded_when_a_wrapper_call_could_hide_the_workers_close(
+    wrapper: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unreadable ``tool_call`` wrapper may hold the worker's own kanban_block:
+    #3988 counts it as acted, and here it fails closed to graded."""
+    assert not harness.worker_trajectory.wrapped_tool_names(wrapper)
+    res = _settle_after_guardrail_block(monkeypatch, entries=[*_ACTED, wrapper], cards=_GUARDRAIL_CARD)
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+
+
+def test_settle_keeps_a_card_graded_when_the_front_door_acted_after_it_died(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A front door that ran a command of its own, or made up an answer, after
+    the card died produced something the judge must see."""
+    res = _settle_after_guardrail_block(
+        monkeypatch,
+        entries=_ACTED,
+        cards=_GUARDRAIL_CARD,
+        front_trajectory=[{"name": "kanban_create"}, {"name": "terminal", "args": {"command": "kubectl delete deploy web"}}],
+    )
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+
+
+def test_settle_keeps_a_card_graded_when_the_capture_was_clipped(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A capture that hit a cap may have dropped the worker's own kanban_block,
+    so the guardrail's block and the worker's cannot be told apart: graded."""
+    res = _settle_after_guardrail_block(
+        monkeypatch, entries=_ACTED, cards=_GUARDRAIL_CARD, summary={"clipped": ["calls"]}
+    )
+    assert harness.worker_trajectory.gaps(res.metadata["worker_trajectory"])
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+
+
+@pytest.mark.parametrize(
+    "closer",
+    [
+        [_worker_entry("kanban_block", task="t_other", task_id="t_1", reason="x", kind="transient")],
+        [{"name": "kanban_block", "args": {"task_id": "t_1", "reason": "x", "kind": "transient"}}],
+    ],
+    ids=["another-cards-worker", "front-door"],
+)
+def test_settle_keeps_a_card_graded_when_someone_else_blocked_it(
+    closer: list[dict[str, object]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    worker = closer if closer[0].get("agent") else []
+    front = [{"name": "kanban_create"}, *([] if closer[0].get("agent") else closer)]
+    res = _settle_after_guardrail_block(
+        monkeypatch, entries=[*_ACTED, *worker], cards=_GUARDRAIL_CARD, front_trajectory=front
+    )
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+
+
+def test_settle_keeps_a_fan_out_graded_when_one_card_delivered(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every awaited card has to be the guardrail's block: one that completed is
+    a delivery the run is graded on."""
+    cards = {**_GUARDRAIL_CARD, "t_2": harness.board.BoardCard("done", "The pods are healthy.", None, None)}
+    res = _settle_after_guardrail_block(
+        monkeypatch, entries=_ACTED, cards=cards, awaited=["t_1", "t_2"]
+    )
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+    both = _settle_after_guardrail_block(
+        monkeypatch,
+        entries=_ACTED,
+        cards={**_GUARDRAIL_CARD, "t_2": _GUARDRAIL_CARD["t_1"]},
+        awaited=["t_1", "t_2"],
+    )
+    assert both.errors and "blocked t_1, t_2" in both.errors[0]
+
+
+def test_settle_keeps_a_guardrail_blocked_card_with_an_artifact_graded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A file the worker wrote before it died is a delivery the checks read."""
+    res = _settle_after_guardrail_block(
+        monkeypatch,
+        entries=_ACTED,
+        cards=_GUARDRAIL_CARD,
+        artifact_paths=[f"{harness._ATTACHMENTS_DIR}/t_1/report.md"],
+    )
+    assert "Artifact report.md produced by delegated task t_1" in res.output
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+
+
+def test_settle_keeps_a_guardrail_blocked_card_graded_when_the_capture_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No capture, no way to tell the guardrail's block from the model's: fail closed."""
+    res = _settle_after_guardrail_block(monkeypatch, entries=None, cards=_GUARDRAIL_CARD)
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+
+
+@pytest.mark.parametrize(
+    "card",
+    [
+        harness.board.BoardCard("blocked", _GUARDRAIL_SUMMARY, None, "needs_input"),
+        harness.board.BoardCard("blocked", "Two clusters run it. Which one?", None, "transient"),
+        harness.board.BoardCard("done", _GUARDRAIL_SUMMARY, None, "transient"),
+        harness.board.BoardCard("blocked", _GUARDRAIL_SUMMARY, None, None),
+        harness.board.BoardCard(
+            "blocked", "HTTP 429 (failure_reason=rate_limit): TPM quota exhausted", None, "transient"
+        ),
+        harness.board.BoardCard(
+            "blocked",
+            "provider rate limit: API retries exhausted (failure_reason=billing): credit wall",
+            None,
+            "transient",
+        ),
+    ],
+    ids=["question-kind", "other-reason", "done", "no-kind", "reason-without-the-guardrail-prefix", "billing"],
+)
+def test_settle_keeps_a_card_outside_the_guardrail_shape_graded(
+    card: harness.board.BoardCard, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    res = _settle_after_guardrail_block(monkeypatch, entries=_ACTED, cards={"t_1": card})
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+
+
+def test_settle_marks_the_guardrail_block_on_the_inject_lane_whether_or_not_the_worker_acted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The presubmit grades the inject lane; the mark reads the same there
+    as on the api transport (#4871's build 2118527973618356224: two
+    workers that ran terminal commands, then died on 429s)."""
+    inject_front = [{"name": harness.inject.EVENT_ENTRY_TASK}, {"name": "kanban_create"}]
+    for entries in (_ACTED, [_worker_entry("read_file", path="x")]):
+        res = _settle_after_guardrail_block(
+            monkeypatch, entries=entries, cards=_GUARDRAIL_CARD, front_trajectory=inject_front
+        )
+        assert res.errors and res.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+
+
+def test_settle_delegated_worker_rate_limit_with_no_worker_actions_is_infra(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When a worker hits the Hermes rate limit and executed zero tools, the run is marked infra."""
+    body = (
+        "  ┊ 💻 preparing terminal…\n"
+        "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429\n"
+    )
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {
+        "t_1": harness._WorkerLog(body, "100", "100")
+    })
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}], errors=["pre-existing ceiling note"])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"], board_messages=[body])
+
+    assert res.has_errors()
+    assert res.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "delegated worker hit infrastructure failure (rate_limit)" in res.errors[0]
+    assert "card on board recorded rate_limit" in res.errors[0]
+    # Existing errors are preserved, with the infra marker inserted at index 0
+    assert len(res.errors) == 2
+    assert res.errors[1] == "pre-existing ceiling note"
+    # Output is preserved rather than blanked so results.json / build logs retain diagnostics
+    assert res.output == "router ack"
+    # Trajectory is preserved rather than wiped so downstream safeguards can inspect it
+    assert res.trajectory == [{"name": "kanban_create"}]
+
+
+def test_settle_delegated_worker_rate_limit_front_door_acted_stays_graded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the front door made non-delegation calls, it acted and stays graded."""
+    body = "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {
+        "t_1": harness._WorkerLog(body, "100", "100")
+    })
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    # Front door executed a forbidden worker verb (kanban_complete) before delegating
+    trajectory = [{"name": "kanban_complete"}, {"name": "kanban_create"}]
+    res = harness.AgentResult(output="router ack", trajectory=list(trajectory))
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"], board_messages=[body])
+
+    # Must stay graded so Rung 1 catastrophic safeguard can block
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+    assert res.output == "router ack"
+    assert res.trajectory == trajectory
+
+
+def test_settle_delegated_worker_rate_limit_sanctioned_front_door_tools_is_infra(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sanctioned front-door tools (roster, memory, card updates) do not count as acting; rate limit is infra."""
+    body = "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {
+        "t_1": harness._WorkerLog(body, "100", "100")
+    })
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    trajectory = [
+        {"name": "list_agents"},
+        {"name": "memory_recall"},
+        {"name": "multiuser_memory"},
+        {"name": "kanban_create"},
+        {"name": "kanban_comment"},
+        {"name": "kanban_unblock"},
+    ]
+    res = harness.AgentResult(output="router ack", trajectory=list(trajectory))
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"], board_messages=[body])
+
+    assert res.has_errors()
+    assert res.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "delegated worker hit infrastructure failure (rate_limit)" in res.errors[0]
+    assert "card on board recorded rate_limit" in res.errors[0]
+    assert res.output == "router ack"
+    assert res.trajectory == trajectory
+
+
+@pytest.mark.parametrize("tool_name", sorted(harness._FRONT_DOOR_NON_ACTION_TOOLS))
+def test_settle_delegated_worker_rate_limit_every_sanctioned_tool_individually_is_infra(
+    tool_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every member of _FRONT_DOOR_NON_ACTION_TOOLS individually permits classification as infra."""
+    body = "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {
+        "t_1": harness._WorkerLog(body, "100", "100")
+    })
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    trajectory = [{"name": tool_name}]
+    res = harness.AgentResult(output="router ack", trajectory=list(trajectory))
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"], board_messages=[body])
+
+    assert res.has_errors()
+    assert res.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "delegated worker hit infrastructure failure (rate_limit)" in res.errors[0]
+
+
+def test_settle_delegated_worker_rate_limit_orphaned_tool_output_is_infra(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An orphaned tool output with empty name synthesised by parse_response does not count as front-door action."""
+    body = "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {
+        "t_1": harness._WorkerLog(body, "100", "100")
+    })
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    orphan_entry = {"name": "", "args": {}, "result": "orphan", "status": "completed"}
+    res = harness.AgentResult(output="router ack", trajectory=[orphan_entry])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"], board_messages=[body])
+
+    assert res.has_errors()
+    assert res.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "delegated worker hit infrastructure failure (rate_limit)" in res.errors[0]
+
+
+def test_settle_delegated_worker_rate_limit_preserves_front_door_trajectory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Converting to infra failure must preserve the front-door trajectory so safeguards can grade it."""
+    body = "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {
+        "t_1": harness._WorkerLog(body, "100", "100")
+    })
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    front_door_entries = [{"name": "kanban_create"}]
+    res = harness.AgentResult(output="router ack", trajectory=list(front_door_entries))
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"], board_messages=[body])
+
+    assert res.has_errors()
+    assert res.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    # The trajectory is kept intact rather than deleted
+    assert res.trajectory == front_door_entries
+
+
+def test_settle_delegated_worker_rate_limit_with_failed_capture_stays_graded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When worker trajectory capture failed (None), we cannot verify 0 actions; run stays graded."""
+    body = "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {
+        "t_1": harness._WorkerLog(body, "100", "100")
+    })
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: None)
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"], board_messages=[body])
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+    assert res.output == "router ack"
+
+
+def test_settle_delegated_worker_rate_limit_with_capture_gaps_stays_graded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When worker trajectory capture has unread errors/gaps, 0 actions cannot be trusted; run stays graded."""
+    body = "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {
+        "t_1": harness._WorkerLog(body, "100", "100")
+    })
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[],
+        tokens={},
+        unbilled=[],
+        summary={"unread": ["session store for platform: locked"], "errors": []},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"], board_messages=[body])
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+    assert res.output == "router ack"
+
+
+@pytest.mark.parametrize(
+    ("summary", "gaps"),
+    [
+        ({"unread": ["session store for platform: locked"], "errors": []}, ["session store for platform: locked"]),
+        ({"clipped": ["calls"], "errors": []}, [harness.worker_trajectory.CALL_CAP_GAP]),
+        ({"unread": [], "clipped": [], "errors": ["redactor unavailable"]}, None),
+    ],
+    ids=["unread", "clipped", "complete"],
+)
+def test_settle_records_a_capture_gap_on_the_trajectory(
+    summary: dict[str, Any], gaps: list[str] | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """devops-bench drops ``metadata``, so a capture with gaps leaves
+    ``worker_trajectory.GAP_ENTRY`` after the workers' entries, where the
+    scorer reads it; a complete capture leaves none. The entry is not a
+    front-door action: the run stays graded."""
+    worker = {"name": "terminal", "args": {"command": "kubectl get pods"}, "agent": "cluster-a", "task": "t_1"}
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {"t_1": None})
+    monkeypatch.setattr(
+        harness.worker_trajectory,
+        "capture",
+        lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(entries=[dict(worker)], summary=summary),
+    )
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"])
+
+    names = [e.get("name") for e in res.trajectory]
+    if gaps is None:
+        assert harness.worker_trajectory.GAP_ENTRY not in names
+    else:
+        assert res.trajectory[-1] == harness.worker_trajectory.gap_entry(gaps)
+        assert res.trajectory[-2]["agent"] == "cluster-a"
+    assert harness.worker_trajectory.GAP_ENTRY in harness._FRONT_DOOR_NON_ACTION_TOOLS
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+
+
+@pytest.mark.parametrize("awaited", [["t_1"], []], ids=["delegated", "no-card"])
+def test_settle_records_a_read_that_did_not_complete(awaited: list[str], monkeypatch: pytest.MonkeyPatch) -> None:
+    """A turn that delegated and whose read returned nothing leaves the gap
+    entry, so a record that merges it with a turn whose workers were read
+    does not read as complete. A turn that filed no card has nothing to read
+    and leaves none."""
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: None)
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: None)
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    harness.KubeAgentsHarness._settle(res, [], awaited)
+
+    gap = harness.worker_trajectory.gap_entry([harness.worker_trajectory.UNREAD_CAPTURE_GAP])
+    assert (gap in res.trajectory) == bool(awaited)
+
+
+def test_settle_delegated_worker_rate_limit_with_worker_actions_stays_graded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When a worker executed a tool before hitting a rate limit, it acted and stays graded."""
+    body = "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {
+        "t_1": harness._WorkerLog(body, "100", "100")
+    })
+    # Worker executed a tool call tagged with agent
+    tool_entry = {"name": "kubectl", "agent": "platform", "args": {"command": "get pods"}, "result": "ok"}
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[tool_entry],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"], board_messages=[body])
+
+    # Result was NOT converted to infra failure because worker acted
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+    assert res.output == "router ack"
+    assert tool_entry in res.trajectory
+
+
+def test_settle_delegated_worker_rate_limit_with_worker_commands_in_log_stays_graded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When captured entries are empty but worker log contains executed commands, worker acted and stays graded."""
+    body = (
+        "  ┊ 💻 $ kubectl get pods 0.4s [exit 0]\n"
+        "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429\n"
+    )
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {
+        "t_1": harness._WorkerLog(body, "100", "100")
+    })
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"], board_messages=[body])
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+    assert res.output == "router ack"
+    assert res.metadata.get("worker_commands") == [{"task": "t_1", "command": "kubectl get pods"}]
+
+
+def test_settle_delegated_worker_board_summary_rate_limit_is_infra(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A board message carrying the Hermes rate limit prefix with no worker actions marks infra."""
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {})
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    harness.KubeAgentsHarness._settle(
+        res,
+        [],
+        ["t_1"],
+        board_messages=["provider rate limit: API retries exhausted (failure_reason=rate_limit) on card t_1"],
+    )
+
+    assert res.has_errors()
+    assert res.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "card on board recorded rate_limit" in res.errors[0]
+
+
+def test_settle_spoofed_rate_limit_without_hermes_prefix_stays_graded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A board message without the exact Hermes rate-limit prefix does not mark infra."""
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {})
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    harness.KubeAgentsHarness._settle(
+        res,
+        [],
+        ["t_1"],
+        board_messages=["HTTP 429: rate limit error occurred"],
+    )
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+    assert res.output == "router ack"
+
+
+def test_settle_delegated_worker_observed_summary_rate_limit_is_infra(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When board_messages is empty (e.g. board exec hiccup), observed kanban_show summary marks infra."""
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {})
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    rate_limit_text = "provider rate limit: API retries exhausted (failure_reason=rate_limit) on card t_1"
+    observed = [{
+        "name": "kanban_show",
+        "result": json.dumps({
+            "task": {"id": "t_1", "status": "blocked"},
+            "runs": [{"summary": rate_limit_text}],
+        }),
+    }]
+    harness.KubeAgentsHarness._settle(
+        res,
+        observed,
+        ["t_1"],
+        board_messages=[],
+    )
+
+    assert res.has_errors()
+    assert res.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "card on board recorded rate_limit" in res.errors[0]
+
+
+_WORKER_NON_ACTION_TEST_TOOLS = (
+    *harness._BOARD_NON_ACTION_TOOLS,
+    "read_file",
+    "search_files",
+    "memory",
+    "memory_recall",
+    "memory_reflect",
+    "multiuser_memory",
+    "web_search",
+    "tool_search",
+    "skill_view",
+    "todo",
+    "todo_list",
+    "session_search",
+    "mcp__developer_knowledge__search_documents",
+)
+
+
+@pytest.mark.parametrize("tool_name", sorted(_WORKER_NON_ACTION_TEST_TOOLS))
+def test_settle_delegated_worker_rate_limit_after_kanban_show_is_infra(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+) -> None:
+    """A worker whose only tool call was a protocol / non-action board tool before hitting 429 is marked infra."""
+    body = "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {
+        "t_1": harness._WorkerLog(body, "100", "100")
+    })
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[{
+            "name": tool_name,
+            "agent": "platform",
+            "task": "t_1",
+            "session": "sess_1",
+            "args": {"task_id": "t_1"},
+            "result": None,
+            "failed": None,
+            "at": "2026-10-26T12:00:00Z",
+            "_id": "call_1",
+        }],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"], board_messages=[body])
+
+    assert res.has_errors()
+    assert res.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "card on board recorded rate_limit" in res.errors[0]
+
+
+def test_settle_delegated_worker_rate_limit_worker_orphaned_tool_output_is_infra(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An orphaned worker tool output with empty name does not count as worker action."""
+    body = "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {
+        "t_1": harness._WorkerLog(body, "100", "100")
+    })
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[{
+            "name": "",
+            "agent": "platform",
+            "task": "t_1",
+            "session": "sess_1",
+            "args": {},
+            "result": None,
+            "failed": None,
+            "at": "2026-10-26T12:00:00Z",
+            "_id": "call_1",
+        }],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"], board_messages=[body])
+
+    assert res.has_errors()
+    assert res.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "card on board recorded rate_limit" in res.errors[0]
+
+
+def test_settle_worker_log_body_rate_limit_alone_does_not_mark_infra(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Worker stdout transcript containing rate-limit prefix text without board corroboration does not mark infra."""
+    body = "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {
+        "t_1": harness._WorkerLog(body, "100", "100")
+    })
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"], board_messages=[])
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+
+
+@pytest.mark.parametrize(
+    "substantive_call",
+    [
+        {"name": "kanban_complete", "args": {"task_id": "t_1"}},
+        {"name": "kanban_block", "args": {"task_id": "t_1"}},
+        {"name": "terminal", "args": {"command": "kubectl get pods"}},
+        {"name": "bash", "args": {"command": "kubectl get pods"}},
+        {"name": "execute_code", "args": {"code": "print(1)"}},
+        {"name": "write_file", "args": {"path": "/tmp/out.txt", "content": "ok"}},
+        {"name": "patch", "args": {"path": "/tmp/out.txt", "patch": "diff"}},
+        {"name": "mcp__gke__list_clusters", "args": {}},
+        {"name": "mcp__platform_control__apply", "args": {}},
+        {"name": "tool_call", "args": {"name": "mcp__gke__delete_k8s_resource"}},
+        {"name": "tool_call", "args": {"calls": [{"name": "mcp__platform_control__get_cluster_profile_name"}]}},
+        {
+            "name": "tool_call",
+            "args": {
+                "raw": '{"calls": [{"name": "mcp__platform_control__send_notification", "arguments": {"message": "'
+                + "a" * 2100
+                + ' ...[clipped 300 chars]"}}]}'
+            },
+        },
+        {"name": "tool_call", "args": {"raw": "clipped"}},
+        {"name": "tool_call", "args": {"calls": "not-a-list"}},
+        {
+            "name": "tool_call",
+            "args": {
+                "raw": '{"arguments": {"resourceType": "deployment", "name": "checkout", "patch": "'
+                + "x" * 2100
+                + '"}, "name": "mcp__gke__patch_k8s_resource"}'
+            },
+        },
+        {
+            "name": "tool_call",
+            "args": {
+                "raw": '{"calls": [{"name": "mcp__developer_knowledge__search_documents", "arguments": {"query": "'
+                + "a" * 2100
+                + ' ...[clipped 300 chars]"}}]}'
+            },
+        },
+    ],
+    ids=[
+        "kanban_complete",
+        "kanban_block",
+        "terminal",
+        "bash",
+        "execute_code",
+        "write_file",
+        "patch",
+        "mcp_gke_direct",
+        "mcp_platform_control_direct",
+        "mcp_gke_wrapped",
+        "mcp_platform_control_wrapped",
+        "mcp_platform_control_wrapped_clipped",
+        "tool_call_unparseable_raw",
+        "tool_call_unparseable_calls",
+        "mcp_gke_arguments_first_clipped",
+        "mcp_batch_substantive_clipped_past_cut",
+    ],
+)
+def test_settle_delegated_worker_rate_limit_after_kanban_show_and_substantive_tool_stays_graded(
+    monkeypatch: pytest.MonkeyPatch,
+    substantive_call: dict[str, Any],
+) -> None:
+    """A worker that executed a substantive tool after kanban_show remains graded."""
+    body = "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {
+        "t_1": harness._WorkerLog(body, "100", "100")
+    })
+    substantive_entry = {
+        "agent": "platform",
+        "task": "t_1",
+        "session": "sess_1",
+        "result": "ok",
+        "failed": False,
+        "at": "2026-10-26T12:00:05Z",
+        "_id": "call_2",
+        **substantive_call,
+    }
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[
+            {
+                "name": "kanban_show",
+                "agent": "platform",
+                "task": "t_1",
+                "session": "sess_1",
+                "args": {"task_id": "t_1"},
+                "result": None,
+                "failed": None,
+                "at": "2026-10-26T12:00:00Z",
+                "_id": "call_1",
+            },
+            substantive_entry,
+        ],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"], board_messages=[body])
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+
+
+def test_settle_unblocked_retry_failed_on_own_stays_graded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unblocked card that failed on its retry without a rate limit is graded, not excused as infra."""
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {})
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    observed = [{
+        "name": "kanban_show",
+        "result": json.dumps({
+            "task": {"id": "t_1", "status": "failed", "result": None},
+            "runs": [{"summary": ""}],
+        }),
+    }]
+    harness.KubeAgentsHarness._settle(
+        res,
+        observed,
+        ["t_1"],
+        board_messages=[],
+    )
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+
+
+def test_settle_unblocked_retry_status_not_blocked_with_prefix_summary_stays_graded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A card whose newest run carries the prefix summary but whose status is failed (not blocked) stays graded."""
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {})
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    rate_limit_text = "provider rate limit: API retries exhausted (failure_reason=rate_limit) on card t_1"
+    observed = [{
+        "name": "kanban_show",
+        "result": json.dumps({
+            "task": {"id": "t_1", "status": "failed", "result": None},
+            "runs": [{"summary": rate_limit_text}],
+        }),
+    }]
+    harness.KubeAgentsHarness._settle(
+        res,
+        observed,
+        ["t_1"],
+        board_messages=[],
+    )
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+
+
+def test_delivered_results_and_settle_multiple_runs_newest_empty_summary_stays_graded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """delivered_results and _settle evaluate runs[-1], so an older run's rate limit is not treated as final."""
+    rate_limit_text = "provider rate limit: API retries exhausted (failure_reason=rate_limit) on card t_1"
+    payload = {
+        "task": {"id": "t_1", "status": "blocked"},
+        "runs": [{"summary": rate_limit_text}, {"summary": ""}],
+    }
+    # delivered_results should not deliver the older run's summary
+    assert harness.delivered_results([{"result": json.dumps(payload)}], ["t_1"]) == {}
+
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {})
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    observed = [{"name": "kanban_show", "result": json.dumps(payload)}]
+    harness.KubeAgentsHarness._settle(res, observed, ["t_1"], board_messages=[])
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+
+
+def test_settle_two_kanban_shows_newer_unblocked_run_empty_summary_stays_graded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When observed has two kanban_show entries for the same card, the final reading decides."""
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {})
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    rate_limit_text = "provider rate limit: API retries exhausted (failure_reason=rate_limit) on card t_1"
+    # First show: card blocked on rate limit
+    show_1 = {
+        "name": "kanban_show",
+        "result": json.dumps({
+            "task": {"id": "t_1", "status": "blocked"},
+            "runs": [{"summary": rate_limit_text}],
+        }),
+    }
+    # Second show: card unblocked and failed on second run without summary
+    show_2 = {
+        "name": "kanban_show",
+        "result": json.dumps({
+            "task": {"id": "t_1", "status": "blocked"},
+            "runs": [{"summary": rate_limit_text}, {"summary": ""}],
+        }),
+    }
+    observed = [show_1, show_2]
+    harness.KubeAgentsHarness._settle(
+        res,
+        observed,
+        ["t_1"],
+        board_messages=[],
+    )
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+
+
+def test_settle_kanban_list_after_kanban_show_unblocked_retry_stays_graded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When a kanban_list reading shows the card transitioned away from blocked, the stale show summary is dropped."""
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {})
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    rate_limit_text = "provider rate limit: API retries exhausted (failure_reason=rate_limit) on card t_1"
+    show_1 = {
+        "name": "kanban_show",
+        "result": json.dumps({
+            "task": {"id": "t_1", "status": "blocked"},
+            "runs": [{"summary": rate_limit_text}],
+        }),
+    }
+    list_entry = {
+        "name": "kanban_list",
+        "result": json.dumps({
+            "tasks": [{"id": "t_1", "status": "running"}],
+        }),
+    }
+    observed = [show_1, list_entry]
+    harness.KubeAgentsHarness._settle(
+        res,
+        observed,
+        ["t_1"],
+        board_messages=[],
+    )
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+
+
+def test_settle_kanban_list_after_kanban_show_same_blocked_status_preserves_summary_is_infra(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A subsequent kanban_list confirming the same blocked status preserves the kanban_show summary and marks infra."""
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {
+        "t_1": harness._WorkerLog("ok", "100", "100")
+    })
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    rate_limit_text = "provider rate limit: API retries exhausted (failure_reason=rate_limit) on card t_1"
+    show_1 = {
+        "name": "kanban_show",
+        "result": json.dumps({
+            "task": {"id": "t_1", "status": "blocked"},
+            "runs": [{"summary": rate_limit_text}],
+        }),
+    }
+    list_entry = {
+        "name": "kanban_list",
+        "result": json.dumps({
+            "tasks": [{"id": "t_1", "status": "blocked"}],
+        }),
+    }
+    observed = [show_1, list_entry]
+    harness.KubeAgentsHarness._settle(
+        res,
+        observed,
+        ["t_1"],
+        board_messages=[],
+    )
+    assert res.has_errors()
+    assert res.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "card on board recorded rate_limit" in res.errors[0]
+
+
+def test_settle_kanban_list_after_kanban_unblock_discards_stale_summary_stays_graded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When a card is unblocked after kanban_show, a later kanban_list blocked status is from a new run and must not reuse the stale summary."""
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {
+        "t_1": harness._WorkerLog("ok", "100", "100")
+    })
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    rate_limit_text = "provider rate limit: API retries exhausted (failure_reason=rate_limit) on card t_1"
+    show_1 = {
+        "name": "kanban_show",
+        "result": json.dumps({
+            "task": {"id": "t_1", "status": "blocked"},
+            "runs": [{"summary": rate_limit_text}],
+        }),
+    }
+    unblock_entry = {
+        "name": "kanban_unblock",
+        "args": {"task_id": "t_1"},
+        "result": json.dumps({"status": "ready"}),
+    }
+    list_entry = {
+        "name": "kanban_list",
+        "result": json.dumps({
+            "tasks": [{"id": "t_1", "status": "blocked"}],
+        }),
+    }
+    observed = [show_1, unblock_entry, list_entry]
+    harness.KubeAgentsHarness._settle(
+        res,
+        observed,
+        ["t_1"],
+        board_messages=[],
+    )
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+
+
+def test_settle_delegated_worker_rate_limit_with_failed_log_read_stays_graded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When worker log could not be read, the harness cannot verify zero actions, so the run stays graded."""
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {"t_1": None})
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    rate_limit_text = "provider rate limit: API retries exhausted (failure_reason=rate_limit) on card t_1"
+    harness.KubeAgentsHarness._settle(
+        res,
+        [],
+        ["t_1"],
+        board_messages=[rate_limit_text],
+    )
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+
+
+_BLOCK_REPLAY_PROMPT = """[bench:card-block-wake]
+title: Health check for checkout-gateway on seeded-a
+kind: transient
+reason: provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429
+"""
+
+
+def test_a_block_wake_sends_only_the_wake_and_grades_its_reply(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell(scripts))
+    reply = "I couldn't finish the check: the AI model's usage limit was reached. Want me to try again?"
+    stub_agent.turns = [_turn(_text(reply))]
+
+    result = KubeAgentsHarness().run(_BLOCK_REPLAY_PROMPT)
+
+    assert not result.has_errors()
+    assert [r["input"] for r in stub_agent.requests] == [_REPLAY_WAKE]
+    assert result.output == reply
+    assert transcript.get().final_message == reply
+    assert [s["name"] for s in result.trajectory] == [card_wake.SETTLED_ENTRY]
+    assert "answer_reply" not in result.trajectory[-1]["args"]
+    assert result.metadata["question_wake"]["card"] == _REPLAY_CARD
+    assert _archived(scripts)
+
+
+def test_settle_delegated_worker_triage_rate_limit_is_infra(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When a card ends in triage (e.g. block loop / second storm) with a rate limit summary, it is marked infra."""
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {
+        "t_1": harness._WorkerLog("ok", "100", "100")
+    })
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    rate_limit_text = "provider rate limit: API retries exhausted (failure_reason=rate_limit) on card t_1"
+    show = {
+        "name": "kanban_show",
+        "result": json.dumps({
+            "task": {"id": "t_1", "status": "triage"},
+            "runs": [{"summary": rate_limit_text}],
+        }),
+    }
+    harness.KubeAgentsHarness._settle(
+        res,
+        [show],
+        ["t_1"],
+        board_messages=[],
+    )
+    assert res.has_errors()
+    assert res.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+
+
+def test_settle_delegated_worker_triage_rate_limit_with_worker_actions_stays_graded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When a worker executed a tool before being routed to triage by a rate limit, it acted and stays graded."""
+    rate_limit_text = "provider rate limit: API retries exhausted (failure_reason=rate_limit) on card t_1"
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {
+        "t_1": harness._WorkerLog("ok", "100", "100")
+    })
+    tool_entry = {"name": "kubectl", "agent": "platform", "args": {"command": "get pods"}, "result": "ok"}
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[tool_entry],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    show = {
+        "name": "kanban_show",
+        "result": json.dumps({
+            "task": {"id": "t_1", "status": "triage"},
+            "runs": [{"summary": rate_limit_text}],
+        }),
+    }
+    harness.KubeAgentsHarness._settle(
+        res,
+        [show],
+        ["t_1"],
+        board_messages=[],
+    )
+    # Stays graded because worker acted
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+    assert res.output == "router ack"
+    assert tool_entry in res.trajectory
+
+
+def test_delivered_results_skips_the_budget_handoff_a_capped_run_left_as_its_summary() -> None:
+    """The image saves a budget-exhausted worker's closing summary on its run
+    (timed_out, or gave_up on the attempt that tripped the limit) as a hand-off
+    for the next worker. It is not the card's answer: a blocked card with one
+    delivers nothing, a ready card between attempts delivers nothing, and a
+    completed run's summary is still delivered as before."""
+    handoff = "I completed steps 1-2; remaining: steps 3-5, then kanban_complete."
+    gave_up = {
+        "task": {"id": "t_1", "status": "blocked", "result": None},
+        "runs": [{"id": 7, "status": "gave_up", "outcome": "gave_up", "summary": handoff}],
+    }
+    assert harness.delivered_results([{"result": json.dumps(gave_up)}], ["t_1"]) == {}
+    between_attempts = {
+        "task": {"id": "t_1", "status": "ready", "result": None},
+        "runs": [{"id": 7, "status": "timed_out", "outcome": "timed_out", "summary": handoff}],
+    }
+    assert harness.delivered_results([{"result": json.dumps(between_attempts)}], ["t_1"]) == {}
+    completed = {
+        "task": {"id": "t_1", "status": "done", "result": None},
+        "runs": [
+            {"id": 7, "status": "timed_out", "outcome": "timed_out", "summary": handoff},
+            {"id": 8, "status": "done", "outcome": "completed", "summary": "All five steps ran."},
+        ],
+    }
+    assert harness.delivered_results([{"result": json.dumps(completed)}], ["t_1"]) == {
+        "t_1": "All five steps ran."
+    }
+
+
+def test_delivered_results_rate_limit_result_excluded_and_non_string_handled() -> None:
+    """delivered_results excludes rate-limited triage results and handles non-string result safely."""
+    rate_limit_text = "provider rate limit: API retries exhausted (failure_reason=rate_limit) on card t_1"
+
+    # Rate-limited result on triage card is excluded
+    entry_triage = {"result": json.dumps({"task": {"id": "t_1", "status": "triage", "result": rate_limit_text}})}
+    assert harness.delivered_results([entry_triage], ["t_1"]) == {}
+
+    # Rate-limited result on blocked card delivers as normal (blocked cards stay as on main)
+    entry_blocked = {"result": json.dumps({"task": {"id": "t_1", "status": "blocked", "result": rate_limit_text}})}
+    assert harness.delivered_results([entry_blocked], ["t_1"]) == {"t_1": rate_limit_text}
+
+    # Non-string results on triage/blocked cards do not crash with AttributeError
+    for non_str in (5, True, False, ["list"], {"nested": "dict"}):
+        entry_non_str = {"result": json.dumps({"task": {"id": "t_1", "status": "triage", "result": non_str}})}
+        assert harness.delivered_results([entry_non_str], ["t_1"]) == {}
+
+    # Legitimate non-rate-limit result delivers normally
+    entry_ok = {"result": json.dumps({"task": {"id": "t_1", "status": "done", "result": "completed report"}})}
+    assert harness.delivered_results([entry_ok], ["t_1"]) == {"t_1": "completed report"}
+
+    # Rate-limited triage card with stashed tasks.result (e.g. refused completion) and run summary is excluded per card
+    entry_stashed = {
+        "result": json.dumps({
+            "task": {"id": "t_1", "status": "triage", "result": "stashed text from refused completion"},
+            "runs": [{"summary": rate_limit_text}],
+        })
+    }
+    assert harness.delivered_results([entry_stashed], ["t_1"]) == {}
+
+
+def test_pending_first_rate_limited_triage_sorted_after_moving_cards() -> None:
+    """_pending_first places rate-limited triage cards after moving cards so running cards are not dropped under cap."""
+    rate_limit_text = f"{harness._RATE_LIMIT_REASON_PREFIX} (failure_reason=rate_limit)"
+    task_ids = [f"t_{i}" for i in range(33)]
+    statuses = {f"t_{i}": "running" for i in range(33)}
+    statuses["t_0"] = "triage"
+    summaries = {"t_0": rate_limit_text}
+
+    def is_terminal(tid: str) -> bool:
+        st = statuses.get(tid, "")
+        if st in harness._TERMINAL_STATUSES:
+            return True
+        return harness._is_rate_limited_triage(st, tid, summaries)
+
+    ordered = harness._pending_first(task_ids, statuses, is_terminal)
+    # The 32 running cards must come first in filing order, followed by t_0
+    assert ordered[:32] == [f"t_{i}" for i in range(1, 33)]
+    assert ordered[32] == "t_0"
+
+    # Default without is_terminal treats triage as pending (backwards compatibility)
+    ordered_default = harness._pending_first(task_ids, statuses)
+    assert ordered_default == task_ids
+
+
+def test_the_stall_archive_spares_a_card_created_before_the_floor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The front door's create handed it back by its key: its worker is someone else's to stop."""
+    archived: list[str] = []
+
+    def shell(script: str, timeout: float) -> str:
+        if harness._shell_quote(harness._CREATED_BEFORE_SCRIPT) in script:
+            return "t_old\nlisted\n"
+        if "kanban archive" in script:
+            tid = next(t for t in ("t_old", "t_new") if f"'{t}'" in script)
+            archived.append(tid)
+            return f"Archived {tid}\n"
+        return "listed\n"
+
+    monkeypatch.setattr(harness, "_agent_shell", shell)
+    harness._archive_stalled_cards(["t_old", "t_new"], 5.0, floor=_FLOOR)
+    assert archived == ["t_new"]
+
+
+def test_the_stall_archive_archives_everything_when_the_board_is_unread(monkeypatch: pytest.MonkeyPatch) -> None:
+    archived: list[str] = []
+
+    def shell(script: str, timeout: float) -> str:
+        if harness._shell_quote(harness._CREATED_BEFORE_SCRIPT) in script:
+            return ""
+        if "kanban archive" in script:
+            archived.append(next(t for t in ("t_old", "t_new") if f"'{t}'" in script))
+            return "Archived\n"
+        return "listed\n"
+
+    monkeypatch.setattr(harness, "_agent_shell", shell)
+    harness._archive_stalled_cards(["t_old", "t_new"], 5.0, floor=_FLOOR)
+    assert archived == ["t_old", "t_new"]
+
+
+def test_the_created_before_script_reads_the_board(tmp_path: Path) -> None:
+    kb = sqlite3.connect(tmp_path / "kanban.db")
+    kb.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, created_at INTEGER)")
+    kb.executemany("INSERT INTO tasks VALUES (?, ?)", [("t_old", _FLOOR - 1), ("t_same", _FLOOR), ("t_new", _FLOOR + 5)])
+    kb.commit()
+    proc = subprocess.run(
+        [
+            sys.executable, "-c", harness._CREATED_BEFORE_SCRIPT, str(tmp_path), str(_FLOOR),
+            str(harness._PURGE_BUSY_TIMEOUT_SECONDS), harness._CREATED_BEFORE_DONE_MARKER,
+            "t_old", "t_same", "t_new", "t_gone",
+        ],
+        capture_output=True, text=True, check=True,
+    )
+    assert proc.stdout.splitlines() == ["t_old", harness._CREATED_BEFORE_DONE_MARKER]
+
+
+def test_settle_floors_its_stall_archive(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {})
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: None)
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+    monkeypatch.setattr(harness, "_purge_card_state", lambda *a, **k: None)
+    seen: list[tuple[list[str], int | None]] = []
+    monkeypatch.setattr(
+        harness, "_archive_stalled_cards", lambda ids, to, floor=None: seen.append((list(ids), floor))
+    )
+    harness.KubeAgentsHarness._settle(
+        harness.AgentResult(output="ok", trajectory=[]), [], ["t_1"], stalled=["t_1"], floor=_FLOOR
+    )
+    assert seen == [(["t_1"], _FLOOR)]
+
+
+def test_a_card_already_done_on_the_first_read_floors_its_purge(
+    stub_agent: _StubAgentServer, instant_polls: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ``if not outstanding`` settle: the opening turn already shows the card done."""
+    scripts, _ = _clocked_pod(monkeypatch, stub_agent)
+    done = _turn(
+        *_call("kanban_create", {"title": "t", "assignee": "cluster"}, {"ok": True, "task_id": _TASK_ID, "status": "ready"}, "c1"),
+        *_call("kanban_show", {"task_id": _TASK_ID}, {"task": {"id": _TASK_ID, "status": "done", "result": _RCA_RESULT}, "runs": []}, "c2"),
+        _text("done already"),
+    )
+    stub_agent.turns = [done]
+
+    KubeAgentsHarness().run("Find the root cause.")
+
+    (purge,) = [s for s in scripts if _is_purge(s)]
+    assert purge.endswith(" ".join(harness._shell_quote(a) for a in harness._purge_argv([_TASK_ID], floor=_FLOOR)))
+
+
+def test_a_completed_purge_leaves_no_sorted_marker(tmp_path: Path) -> None:
+    kb = _purge_board(tmp_path)
+    _stamp(kb, {"t_done": _FLOOR})
+    _card_files(tmp_path, "t_done")
+    _run_purge(tmp_path, ["t_done"], floor=_FLOOR)
+    assert not list((tmp_path / "logs").glob(harness._PURGE_SORTED_PREFIX + "*"))
+
+
+def test_a_purge_cut_off_mid_board_step_leaves_the_sorted_marker(tmp_path: Path) -> None:
+    """The exec times out after the roots were sorted: the marker stops the shell fallback undoing that."""
+    kb = _purge_board(tmp_path)
+    _purge_card(kb, "t_old", "done")
+    _purge_card(kb, "t_mine", "done")
+    _stamp(kb, {"t_old": _FLOOR - 1, "t_mine": _FLOOR})
+    _card_files(tmp_path, "t_mine", "t_old")
+    argv = harness._purge_argv(["t_mine", "t_old"], floor=_FLOOR)
+    argv[0], argv[5], argv[6] = str(tmp_path), str(tmp_path / "attachments"), str(tmp_path / "logs")
+    marker = tmp_path / "logs" / Path(harness._purge_sorted_marker(["t_mine"])).name
+    argv[7] = str(marker)
+    holder = sqlite3.connect(tmp_path / "kanban.db", isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            subprocess.run([sys.executable, "-c", harness._PURGE_ROWS_SCRIPT, *argv], capture_output=True, timeout=3)
+    finally:
+        holder.execute("ROLLBACK")
+    assert marker.exists()
+    assert not _has_files(tmp_path, "t_mine") and _has_files(tmp_path, "t_old")
+
+
+def test_the_shell_fallback_clears_the_roots_only_without_the_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(harness, "_ATTACHMENTS_DIR", str(tmp_path / "attachments"))
+    monkeypatch.setattr(harness, "_LOGS_DIR", str(tmp_path / "logs"))
+    monkeypatch.setattr(harness, "_PURGE_PENDING_DIR", str(tmp_path / "logs" / ".purge-pending"))
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: scripts.append(script) or "")
+    harness._purge_card_state(["t_1"], 5.0, floor=_FLOOR)
+    fallback = scripts[1]
+    marker = Path(harness._purge_sorted_marker(["t_1"]))
+
+    _card_files(tmp_path, "t_1")
+    marker.write_text("")
+    subprocess.run(["sh", "-c", fallback], check=True)
+    assert _has_files(tmp_path, "t_1") and not marker.exists()
+
+    subprocess.run(["sh", "-c", fallback], check=True)
+    assert not _has_files(tmp_path, "t_1")
+
+
+def test_the_sorted_marker_is_this_processs_alone(tmp_path: Path) -> None:
+    """Each repetition is its own process: another's marker, live or stale, must not pass for this one's."""
+    probe = "import kube_agents_bench.harness as h; print(h._purge_sorted_marker(['t_1']))"
+    others = {
+        subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, check=True).stdout.strip()
+        for _ in range(2)
+    }
+    mine = harness._purge_sorted_marker(["t_1"])
+    assert len(others) == 2 and mine not in others
+    assert all(m.endswith("-t_1") for m in {*others, mine})
+
+
+def _report_only_judge_context() -> Any:
+    """A record both report-only evaluators apply to: MCP on, a bulleted checklist."""
+    from devops_bench.metrics.pipeline import _build_context
+
+    record = {"input": "prompt", "output": "answer", "expected_output": "Critical requirements:\n- names the node pool"}
+    return _build_context(record, judge_model=None, use_mcp=True)
+
+
+@pytest.fixture
+def report_only_judges(monkeypatch: pytest.MonkeyPatch) -> tuple[type, type]:
+    """The two evaluator classes, with ``applies`` restored after the test, as the switch patches the class."""
+    from devops_bench.metrics.checklist import ChecklistMetric
+    from devops_bench.metrics.tool_invocation import ToolInvocationMetric
+
+    for evaluator in (ToolInvocationMetric, ChecklistMetric):
+        monkeypatch.setattr(evaluator, "applies", evaluator.applies)
+    return ToolInvocationMetric, ChecklistMetric
+
+
+def test_report_only_judges_run_when_the_switch_is_unset(
+    monkeypatch: pytest.MonkeyPatch, report_only_judges: tuple[type, type]
+) -> None:
+    monkeypatch.delenv(harness.SKIP_REPORT_ONLY_JUDGES_ENV, raising=False)
+    KubeAgentsHarness()
+    ctx = _report_only_judge_context()
+    assert all(evaluator().applies(ctx) for evaluator in report_only_judges)
+
+
+def test_a_pull_request_run_skips_the_report_only_judges(
+    monkeypatch: pytest.MonkeyPatch, report_only_judges: tuple[type, type], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """hack/ci-eval-pr.sh sets the switch on a pull request; OutcomeValidity, which rung 6 reads, still runs."""
+    from devops_bench.metrics.base import METRICS
+
+    monkeypatch.setenv(harness.SKIP_REPORT_ONLY_JUDGES_ENV, "1")
+    KubeAgentsHarness()
+    ctx = _report_only_judge_context()
+    assert not any(evaluator().applies(ctx) for evaluator in report_only_judges)
+    assert METRICS["outcome_validity"]().applies(ctx)
+    assert {"tool_invocation", "checklist"} <= set(METRICS)
+    assert "judge scores are off for this run" in capsys.readouterr().err

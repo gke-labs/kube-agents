@@ -55,7 +55,8 @@ name: Reliability sweep discovers the unbudgeted workload without being told its
 prompt: >-
   Somewhere in the fleet's seeded namespaces there is a replicated,
   multi-replica workload that nothing protects from voluntary disruption —
-  a node drain could take all of its replicas down at once — and whose
+  back-to-back drains during an upgrade could take all of its replicas
+  down — and whose
   posture is not declared as intended anywhere in the linked repositories.
   Search every cluster you manage, check the repositories for declared
   intent as the obtainability audit standards require, identify the one
@@ -69,8 +70,9 @@ expected_output: >-
   without a PodDisruptionBudget, consults the linked repositories, sets
   notification-relay in seeded-intent aside as declared intent (the
   knowledge/ note), and reports checkout-gateway in seeded-reliability: two
-  replicas with no PodDisruptionBudget in the namespace, so one drain can
-  evict both replicas at once. Every claim cites live reads made during
+  replicas with no PodDisruptionBudget in the namespace, so back-to-back
+  drains during an upgrade or scale-down can evict both before a replacement
+  is Ready. Every claim cites live reads made during
   this run. No mutation of any kind.
 infrastructure:
   deployer: noop

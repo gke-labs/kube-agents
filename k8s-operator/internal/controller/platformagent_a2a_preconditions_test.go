@@ -33,12 +33,16 @@ type renderedRole struct {
 // a new builder cannot quietly escape the sweeps below.
 func everyRenderedRole(agent *agentv1alpha1.PlatformAgent) []renderedRole {
 	return []renderedRole{
-		{"buildA2ACalloutRole", buildA2ACalloutRole(agent).Rules},
+		{"buildA2ACalloutRole", buildA2ACalloutRole(agent, 1).Rules},
 		{"buildA2AGatewayRole", buildA2AGatewayRole(agent).Rules},
+		{"buildA2ADispatcherConfigRole", buildA2ADispatcherConfigRole(agent).Rules},
+		{"buildA2ADispatcherPodsRole", buildA2ADispatcherPodsRole(agent).Rules},
+		{"buildA2ADispatcherJobsRole", buildA2ADispatcherJobsRole(agent).Rules},
 		{"buildCredentialBrokerTokenReviewRole", buildCredentialBrokerTokenReviewRole(agent).Rules},
 		{"buildMinimalPlatformRole", buildMinimalPlatformRole(agent).Rules},
 		{"buildPlatformLocalRole", buildPlatformLocalRole(agent).Rules},
 		{"buildPlatformLeaderRole", buildPlatformLeaderRole(agent).Rules},
+		{"buildScopePublisherRole", buildScopePublisherRole(agent).Rules},
 	}
 }
 
@@ -204,14 +208,20 @@ func TestEveryRenderedRoleIsOnThisList(t *testing.T) {
 
 // TestTheGatewayReadsItsOwnPlatformAgentAndNothingElseOfTheKind: the
 // "/feedback summary" read (a2a/gateway/feedback_summary.go) is a get on the
-// one named PlatformAgent, no list, no watch, no write. The other A2A roles
-// are only logged here: an unpinned PlatformAgent read among them predates
-// this change and is not this test's claim.
+// one named PlatformAgent, and no rule of the gateway Role, this one or any
+// added beside it, reaches list, watch or a write on the kind.
 func TestTheGatewayReadsItsOwnPlatformAgentAndNothingElseOfTheKind(t *testing.T) {
 	agent := a2aTestAgent()
 	gw := buildA2AGatewayRole(agent)
 	var reads int
 	for _, rule := range gw.Rules {
+		// Every rule, not only the one that reads: a list or a write added
+		// beside the pinned get is the widening this test exists to refuse.
+		for _, verb := range []string{"list", "watch", "create", "update", "patch", "delete"} {
+			if ruleReaches(rule, agentv1alpha1.GroupVersion.Group, "platformagents", verb) {
+				t.Errorf("the gateway may only get its PlatformAgent, not %s", verb)
+			}
+		}
 		if !ruleReaches(rule, agentv1alpha1.GroupVersion.Group, "platformagents", "get") {
 			continue
 		}
@@ -219,23 +229,53 @@ func TestTheGatewayReadsItsOwnPlatformAgentAndNothingElseOfTheKind(t *testing.T)
 		if len(rule.ResourceNames) != 1 || rule.ResourceNames[0] != agent.Name {
 			t.Errorf("the PlatformAgent read must be pinned to %q by resourceNames, got %v", agent.Name, rule.ResourceNames)
 		}
-		for _, verb := range []string{"list", "watch", "create", "update", "patch", "delete"} {
-			if ruleReaches(rule, agentv1alpha1.GroupVersion.Group, "platformagents", verb) {
-				t.Errorf("the gateway may only get its PlatformAgent, not %s", verb)
-			}
-		}
 	}
 	if reads != 1 {
 		t.Fatalf("the gateway Role should carry exactly one PlatformAgent read, found %d", reads)
 	}
-	for _, r := range everyRenderedRole(agent) {
-		if r.from == "buildA2AGatewayRole" {
-			continue
+}
+
+// The dispatcher Job admission policy's params are DispatchJobTemplates in
+// the profile namespace, so whoever can write one there can widen what the
+// dispatcher's Jobs may be. The operator is the sole writer (approved on that
+// condition, #3655 PR 6): its ClusterRole holds the verbs, and no Role or
+// ClusterRole it renders for anyone else reaches a write on the kind, nor
+// does the one built-in ClusterRole it binds (the callout's
+// system:auth-delegator, which is tokenreviews and subjectaccessreviews).
+// The operator's podtemplates grant is create alone, for the dry run that
+// defaults a template; nothing it renders reaches a podtemplate write.
+// everyRenderedRole is held complete by TestEveryRenderedRoleIsOnThisList, so
+// a new builder can't escape this.
+func TestOnlyTheOperatorWritesPodTemplates(t *testing.T) {
+	writes := []string{"create", "update", "patch", "delete", "deletecollection"}
+	op := operatorClusterRole(t)
+	reaches := func(rules []rbacv1.PolicyRule, group, resource, verb string) bool {
+		return slices.ContainsFunc(rules, func(r rbacv1.PolicyRule) bool { return ruleReaches(r, group, resource, verb) })
+	}
+	for _, verb := range []string{"get", "list", "create", "update", "patch", "delete"} {
+		if !reaches(op.rules, "kubeagents.x-k8s.io", "dispatchjobtemplates", verb) {
+			t.Errorf("the operator's ClusterRole can't %s dispatchjobtemplates; it writes the Job policy's params", verb)
 		}
-		for i, rule := range r.rules {
-			if ruleReaches(rule, agentv1alpha1.GroupVersion.Group, "platformagents", "get") && len(rule.ResourceNames) == 0 {
-				t.Logf("%s rule %d reads platformagents without resourceNames (pre-existing; noted, not asserted)", r.from, i)
+	}
+	if !reaches(op.rules, "", "podtemplates", "create") {
+		t.Error("the operator's ClusterRole can't create podtemplates; it dry-runs one to default a Job template")
+	}
+	for _, verb := range []string{"get", "list", "watch", "update", "patch", "delete"} {
+		if reaches(op.rules, "", "podtemplates", verb) {
+			t.Errorf("the operator's ClusterRole can %s podtemplates; it needs create alone, for the dry run", verb)
+		}
+	}
+	for _, role := range everyRenderedRole(a2aTestAgent()) {
+		for _, verb := range writes {
+			if reaches(role.rules, "kubeagents.x-k8s.io", "dispatchjobtemplates", verb) {
+				t.Errorf("%s grants %s on dispatchjobtemplates: only the operator may write the Job policy's params", role.from, verb)
+			}
+			if reaches(role.rules, "", "podtemplates", verb) {
+				t.Errorf("%s grants %s on podtemplates", role.from, verb)
 			}
 		}
+	}
+	if a2aAuthDelegatorRole != "system:auth-delegator" {
+		t.Errorf("the callout is bound to the built-in ClusterRole %q; check it grants no write on these kinds, then update this test", a2aAuthDelegatorRole)
 	}
 }

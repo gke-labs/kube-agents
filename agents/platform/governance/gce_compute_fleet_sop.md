@@ -38,6 +38,14 @@ If `pending_remediation_requests` is non-empty, inspect each requested finding i
 python3 /opt/data/profiles/platform/skills/gce-compute-fleet-audit/scripts/compute_fleet_audit.py <collector_args from the fleet_scope tool, verbatim, or nothing on an install that declares no scope> > /opt/data/scratch/manifest_gce-compute-fleet-audit.json
 ```
 
+**Then run the precheck on the manifest, before reading it or evaluating any check by hand.**
+
+```bash
+python3 /opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py precheck --audit gce-compute-fleet-audit --manifest-file /opt/data/scratch/manifest_gce-compute-fleet-audit.json
+```
+
+The cron prompt of a scheduled run names the flag to add to this command, the same one it names for `finish`; on a run a person asked for, add it to neither. It prints one JSON line. A line carrying `precheck: unchanged` is `finish`'s own line: the collector found the fleet exactly as the last scheduled run left it, so the run has been closed from that run's stored findings document, and nothing in the rest of this SOP is left for you to do — read `silent_ok` from that line and report as the closing step of this SOP says (exactly `[SILENT]` when it is `true`). Any other line (`verdict` with `closed: false`) means nothing was closed: continue this SOP from here as on any run. A `BROKER UNAVAILABLE` line means the credential proxy did not answer: wait for it and run the same `precheck` again. An exit 1 (`FATAL`) means the close died partway, with your findings file put back as it was: run the same `precheck` once more, and if it fails again continue this SOP from here.
+
 This stream's targets are GCP projects, not GKE clusters, so its collector is its own script rather than `fleet-audit`'s `collect.py` — see the script's own module docstring for the field contracts it assumes of each `gcloud` command's JSON. Pass `--project-id <id>` only to scope a run to one project the tool lists, with the `collector_args` beside it. Left alone it resolves the scope §1 describes — the `--scope-projects` you pass from `fleet_scope`, else `MONITORED_PROJECT_IDS` when set, which narrows the run on purpose, and otherwise the configured project plus every project `gcloud projects list` returns — so without a declared scope an identity that can list the organisation sweeps every project it can see rather than the one it is configured for. On this install's sandbox the collector knows whether a scope is declared and, if it is, refuses a run without the `collector_args`, so the fall-through cannot cross the boundary. Read the manifest before doing anything else:
 
 - Every entry in `manifest.clusters` is one project target, named `project/<project_id>`, carrying one `outcome`. `"collected"` means every check the collector implements already ran; do not re-run it by hand. `"gate-failed"` means a project-level read the whole target depends on failed (an instance listing that did not complete is the usual one): put it in `scope.skipped` with its `error` as the reason. A failed read of one instance's console is not that, and stays on a `"collected"` target as a `limitations` note. `project/UNENUMERATED_PROJECTS` is always `gate-failed`: it stands for the projects the run did not enumerate, so it goes in `scope.skipped` the same way. A manifest with a top-level `error` read no project at all: do not call `finish`, and report the error as your one-line summary. The collector exits non-zero for it.
@@ -163,14 +171,15 @@ Every finding must conform to the full findings schema:
 python3 /opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py finish --audit gce-compute-fleet-audit \
   --findings-file /opt/data/scratch/findings_gce-compute-fleet-audit.json \
   --manifest-file /opt/data/scratch/manifest_gce-compute-fleet-audit.json
-# -> {"status":"CLEAN"|"HELD"|"OPENED"|"UPDATED"|"NO_FORGE","issue_url":...,"new":n,"resolved":m,
+# -> {"status":"CLEAN"|"HELD"|"OPENED"|"UPDATED"|"NO_FORGE"|"STORE_LEDGER","issue_url":...,"new":n,"resolved":m,
 #     "prs_opened":[...],"prs_closed":[...],"partial":false,"coverage_gaps":[],
 #     "silent_ok":true}
 ```
 
 - On a **scheduled** run, `silent_ok: true` -> your final response is exactly `[SILENT]`.
-- **An on-demand run is never silent.** If a person dispatched this job, report the outcome and the ledger URL whatever `silent_ok` says.
+- **An on-demand run is never silent.** `finish` returns `silent_ok: true` only for a scheduled run. On a run that a person asked for, `silent_ok` is always `false`, so report the outcome and the ledger URL.
 - `status == "NO_FORGE"` → no forge is configured, or the broker cannot reach the repository, so nothing was published and there is no ledger URL: unless the run is silent by the rule above, your report is `summary` verbatim (the skill's "No forge configured" section, `/opt/data/profiles/platform/skills/fleet-audit/references/finish.md`).
+- `status == "STORE_LEDGER"` → the forge has no issue tracker, or no labels, so the ledger is in the report store and there is no ledger URL: unless the run is silent by the rule above, your report is `summary` verbatim, which names the remediation pull requests (the skill's "A forge with no issue tracker" section, `/opt/data/profiles/platform/skills/fleet-audit/references/finish.md`).
 - Repo writers can trigger remediation by commenting `/remediate <finding-id>` or `/remediate all` on the ledger issue.
 
 ---

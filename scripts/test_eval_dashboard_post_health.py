@@ -3,8 +3,8 @@ day, renders the six approved message shapes, and never lets the token, the
 space or the webhook URL reach a log.
 
 Times in messages are Toronto time ("7:30 AM ET"); T0 is 12:00Z, which is
-8:00 AM EDT on 2026-09-04, and the digest hour is 9 AM Toronto (13:00Z that
-day), so the window is 12:40Z-13:20Z.
+8:00 AM EDT on 2026-09-04, and these tests pin the digest hour at 9 AM Toronto
+(13:00Z that day; the product's default is 11), so the window is 12:40Z-13:20Z.
 
 The HTTP layer is a recording fake handed in as `opener`; nothing here opens
 a socket or touches a bucket (the gs:// state path is exercised through a
@@ -14,14 +14,22 @@ recording `runner`, the GitHub calls through a recording `gh_runner`).
 import contextlib
 import io
 import json
+import re
 import pathlib
 import tempfile
 import unittest
+import unittest.mock
 import urllib.error
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 
 from eval_dashboard import post_health
+from eval_dashboard.health import near_deadline_margin
+
+# What a public post must never carry: a pass ratio, a repetition count, a
+# percentage, a streak, a failing-check reason, or the wording the posts
+# carried before. "every repetition" in a rule's wording is not a count.
+RESULTS_RE = re.compile(r"\d+/\d+|\d+ of \d+|\d+ repetitions?|\d+ ?%|\bpassed\b|failed every|failed all|fails every|nights in a row|RESOURCE_EXHAUSTED|\b429\b")
 
 SPACE = "spaces/AAAAtestspace"
 TOKEN = "ya29.super-secret-token-value"
@@ -30,7 +38,7 @@ URL = post_health.DASHBOARD_URL
 GH_ENV = {post_health.ghcli.TOKEN_ENV: "ghs_workflow_token"}
 
 T0 = datetime(2026, 9, 4, 12, 0, tzinfo=timezone.utc)
-DIGEST_HOUR = 9  # Toronto; 13:00Z in September
+DIGEST_HOUR = 9  # Toronto; 13:00Z in September. The tests pin this hour; the product's default is 11 (post_health.DEFAULT_DIGEST_HOUR)
 DIGEST_UTC = 13
 
 TRIO = ["cluster-agent-crashloop-debug", "cluster-agent-crashloop-evidence-chain", "cluster-agent-crashloop-misleading-symptom"]
@@ -127,6 +135,7 @@ def pool_note(verdict="BREACH", cause="CAPACITY", since="2026-09-04T09:00:00+00:
         "p95_s": 61 * 60,
         "waiting_longest_s": 40 * 60,
         "over_threshold": 2,
+        "waiting": 4,
         "threshold_p50_s": 15 * 60,
         "threshold_p95_s": 45 * 60,
         "free": 0,
@@ -248,19 +257,30 @@ class FakeGh:
     keyed by method, in order, defaulting to an empty list for reads and a
     freshly numbered issue or comment for writes."""
 
-    def __init__(self, open_issues=(), fail_writes=False):
+    def __init__(self, open_issues=(), fail_writes=False, lookups=None):
         self.calls = []
         self.open_issues = list(open_issues)
         self.fail_writes = fail_writes
+        self.fail_patch = False
         self.next_number = 1300
+        # GET issues/{n}: the payload per number; a number not listed reads
+        # as open and filed by the bot.
+        self.lookups = dict(lookups or {})
 
     def __call__(self, argv, input=None, **kwargs):
         method, path = argv[argv.index("-X") + 1], argv[argv.index("-X") + 2]
         body = json.loads(input) if input else None
         self.calls.append((method, path, body))
         if method == "GET":
-            return GhResult(stdout="\n".join(json.dumps(issue) for issue in self.open_issues))
-        if self.fail_writes:
+            one = re.fullmatch(r"repos/[^/]+/[^/]+/issues/(\d+)", path)
+            if one:
+                number = int(one.group(1))
+                return GhResult(stdout=json.dumps(self.lookups.get(number, {"number": number, "state": "open", "user": {"login": "github-actions[bot]"}})))
+            # A `labels=` filter in the list path narrows the answer as GitHub would.
+            wanted = re.search(r"labels=([^&]+)", path)
+            listed = [issue for issue in self.open_issues if not wanted or wanted.group(1) in {label.get("name") if isinstance(label, dict) else label for label in issue.get("labels") or []}]
+            return GhResult(stdout="\n".join(json.dumps(issue) for issue in listed))
+        if self.fail_writes or (self.fail_patch and method == "PATCH"):
             return GhResult(rc=1, stderr="gh: Resource not accessible by integration (HTTP 403)")
         number = self.next_number
         self.next_number += 1
@@ -280,11 +300,16 @@ class RunHarness(unittest.TestCase):
         self.state = self.dir / "state.json"
         self.opener = FakeOpener()
         self.gh = FakeGh()
+        # The coverage-gap lines read this checkout's roster, which moves;
+        # tests that want them patch their own (CoverageLines below).
+        coverage = unittest.mock.patch.object(post_health, "coverage_lines", return_value=[])
+        self.coverage = coverage.start()
+        self.addCleanup(coverage.stop)
 
-    def tick(self, health_doc, now, environ=None, opener=None, dry_run=False, digest_hour=DIGEST_HOUR, digest_tz=None, gh=None, data=None):
+    def tick(self, health_doc, now, environ=None, opener=None, dry_run=False, digest_hour=DIGEST_HOUR, digest_tz=None, gh=None, data=None, extra=()):
         path = self.dir / "health.json"
         path.write_text(json.dumps(health_doc))
-        argv = ["--health", str(path), "--state", str(self.state), "--now", now.isoformat(), "--digest-hour", str(digest_hour)]
+        argv = ["--health", str(path), "--state", str(self.state), "--now", now.isoformat(), "--digest-hour", str(digest_hour)] + list(extra)
         if data is not None:
             data_path = self.dir / "data.json"
             data_path.write_text(data if isinstance(data, str) else json.dumps(data))
@@ -402,16 +427,6 @@ class Shapes(RunHarness):
         self.assertEqual(self.opener.texts[0], "⚪ *Smoke gate: no fresh data since 1:55 AM ET* — the health bot can't see recent runs. Someone check the refresh job.")
         self.tick(health(), T0.replace(minute=15))
         self.assertEqual(self.opener.texts[1], "⚪ *Smoke gate: fresh data again* — refreshed 8:00 AM ET; the gate reads GREEN.")
-
-    def test_slow(self):
-        self.tick(slow(), T0)
-        self.assertEqual(
-            self.opener.texts[0],
-            "🐢 *Smoke gate: slow* — the last 5 full runs took 152–213 min (median 183) against a 7-day typical of 151 min (p90 198); 2 reps lost to 429s or empty records."
-            " Not a break, and /retest won't make yours faster.\n"
-            f"{URL}#view=agent",
-        )
-        self.assertEqual(self.recorded()["state"], "GREEN", "the note moves no state")
 
     def test_times_are_toronto_and_dst_correct(self):
         clock = post_health.clock
@@ -581,6 +596,38 @@ class Digest(RunHarness):
         self.tick(health(), self.at(DIGEST_UTC, 5, day=5))
         self.assertEqual(len(self.opener.requests), 2, "the next day gets its own")
 
+    def test_the_digest_says_when_bug_filing_has_been_held_for_hours(self):
+        # The nightly bug filer's --state (#3769); no line on a non-digest tick.
+        bugs = self.dir / "nightly-bugs-state.json"
+        now = self.at(DIGEST_UTC, 5)
+        bugs.write_text(json.dumps({"held_ticks": 9, "held_since": "2026-09-04T10:30:00+00:00", "doubt": "the GraphQL cross-check could not be read", "updated_at": now.isoformat()}))
+        self.tick(health(), self.at(DIGEST_UTC - 2, 5), extra=["--bugs-state", str(bugs)])
+        self.assertEqual(self.opener.texts, [])
+        self.tick(health(), now, extra=["--bugs-state", str(bugs)])
+        self.assertIn("🚫 Nightly bug filing held since Fri 6:30 AM ET: the nightly-red issue listing is untrusted (the GraphQL cross-check could not be read)", self.opener.texts[-1])
+        # An unreadable state file costs the line, not the digest.
+        # A failed gs:// read costs the line with a warning, not the digest.
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            failed = post_health.filing_lines("gs://b/s.json", now, lambda argv, **kw: GhResult(rc=1, stderr="HTTPError 503"))
+        self.assertEqual(failed, [])
+        self.assertIn("held bug-filing line skipped", err.getvalue())
+        bugs.write_text("not json")
+        self.tick(health(), self.at(DIGEST_UTC, 5, day=5), extra=["--bugs-state", str(bugs)])
+        self.assertNotIn("bug filing held", self.opener.texts[-1])
+
+    def test_without_the_flag_the_digest_goes_out_at_the_default_hour(self):
+        # The workflow passes no --digest-hour, so DEFAULT_DIGEST_HOUR (11 AM
+        # Toronto) is the product's hour; the rest of this file pins 9.
+        path = self.dir / "health.json"
+        path.write_text(json.dumps(health()))
+        for hour_utc, sent in ((13, 0), (15, 1)):  # 9:05 AM EDT: not yet; 11:05 AM EDT: once
+            argv = ["--health", str(path), "--state", str(self.state), "--now", datetime(2026, 9, 4, hour_utc, 5, tzinfo=timezone.utc).isoformat()]
+            with contextlib.redirect_stderr(io.StringIO()):
+                post_health.main(argv, environ={post_health.SPACE_ENV: SPACE, post_health.TOKEN_ENV: TOKEN}, opener=self.opener, gh_runner=self.gh)
+            self.assertEqual(len(self.opener.requests), sent, f"{hour_utc}:05Z")
+        self.assertEqual(post_health.DEFAULT_DIGEST_HOUR, 11)
+
     def test_digest_hour_is_a_toronto_hour_and_the_zone_is_configurable(self):
         # 9 AM Toronto is 13:00Z in September and 14:00Z in January (DST).
         self.tick(health(), datetime(2026, 1, 15, 13, 5, tzinfo=timezone.utc))
@@ -595,6 +642,19 @@ class Digest(RunHarness):
         # 16th in Toronto, so a digest at 9 AM local that day is a new one.
         self.tick(health(), datetime(2026, 1, 17, 14, 5, tzinfo=timezone.utc))
         self.assertEqual(len(self.opener.requests), 3)
+
+    def test_the_digest_carries_one_line_on_the_forge_nightlies(self):
+        """Last night's result per forge-lane nightly; jobs with no night on
+        record at all, or in a lane with a reason, say so, and why."""
+        data = {"runs": [
+            {"build_id": "10", "tier": "gitlab", "job": "ci-kube-agents-eval-nightly-gitlab", "pr": None, "result": "SUCCESS", "started": "2026-09-14T06:30:00+00:00"},
+            {"build_id": "11", "tier": "gitlab", "job": "ci-kube-agents-eval-nightly-gitlab-next", "pr": None, "result": "FAILURE", "started": "2026-09-14T08:30:00+00:00"},
+        ]}
+        lines = [text for text in post_health.render_digest(health("GREEN"), T14, data).splitlines() if text.startswith("🦊")]
+        self.assertEqual(lines, [
+            "🦊 Forge lanes: GitLab next red · GitLab ci-kube-agents-eval-nightly-gitlab green · GHES weekly, GitLab CE weekly no run on record"
+        ])
+        self.assertFalse([t for t in post_health.render_digest(health("GREEN"), T14).splitlines() if t.startswith("🦊")], "no data.json, no line")
 
     def test_digest_carries_one_line_on_last_night_when_data_json_is_given(self):
         # Two nights of the nightly tier; the digest goes out Fri 9 AM ET
@@ -621,7 +681,13 @@ class Digest(RunHarness):
             self.opener.texts[0],
             "📊 *Smoke gate, last 24h:* 31 runs · 26 green · 2 PR-caused red · 5 infra · typical run 125 min · typical wait n/a\n"
             "🌙 Nightly: 3 cases · 1 passed all reps · 1 partial · 1 failed · newly failing: case-c · 6h 40m\n"
-            f"{post_health.NIGHTLY_URL}\n{URL}#since=2026-09-04T03:30:00Z&view=agent",
+            f"{post_health.NIGHTLY_URL}\n"
+            # No GitHub token in this harness: the nightly section cannot read
+            # the nightly-red issues, so the one line stands and says why
+            # (test_eval_dashboard_nightly_digest.py covers the section).
+            "🌙 Nightly section skipped: no GitHub token to read the nightly-red issues.\n"
+            "🦊 Forge lanes: GitLab next, GHES weekly, GitLab CE weekly no run on record\n"
+            f"{URL}#since=2026-09-04T03:30:00Z&view=agent",
         )
         self.assertEqual(post_health.NIGHTLY_URL, "https://storage.cloud.google.com/kube-agents-dashboards/evals/nightly.html")
         # A truncated night says so instead of numbers; a missing night too.
@@ -638,6 +704,34 @@ class Digest(RunHarness):
         self.assertEqual(rc, 0)
         self.assertIn("warning:", err)
         self.assertIn("\n🌙 Nightly: no data.json to read a night from\n", self.opener.texts[4])
+        self.assertIn("\n🌙 Nightly section skipped: data.json could not be read.\n", self.opener.texts[4])
+
+    def test_the_coverage_gap_lines_go_in_after_the_nightly_part_on_the_digest_only(self):
+        gap = "🚧 Coverage gap: remediation uncovered 9 days (owner: someone); best candidate pdb-remediation-pr, 37/41 on the nightly (90%, meets 90%)."
+        self.coverage.return_value = [gap]
+        self.tick(outage(), self.at(DIGEST_UTC - 2, 5))
+        self.tick(health(), self.at(DIGEST_UTC, 5), data={"schema_version": 1, "runs": [], "cases": []})
+        self.assertEqual(self.coverage.call_count, 1, "computed on the digest tick alone")
+        self.assertNotIn(gap, self.opener.texts[0], "not in a state-change message")
+        digest = self.opener.texts[-1]
+        self.assertIn(f"\n🌙 Nightly: no run on record yet\n{post_health.NIGHTLY_URL}\n", digest)
+        self.assertLess(digest.index("🌙 Nightly"), digest.index(gap))
+        self.assertLess(digest.index(gap), digest.index(URL))
+        # Every domain covered: no line, and nothing in its place.
+        self.coverage.return_value = []
+        self.tick(health(), self.at(DIGEST_UTC, 5, day=5), data={"schema_version": 1, "runs": [], "cases": []})
+        self.assertNotIn("Coverage gap", self.opener.texts[-1])
+
+    def test_the_coverage_gap_lines_pass_the_store_through(self):
+        store = self.dir / "store.json"
+        store.write_text("{}")
+        path = self.dir / "health.json"
+        path.write_text(json.dumps(health()))
+        argv = ["--health", str(path), "--state", str(self.state), "--now", self.at(DIGEST_UTC, 5).isoformat(), "--digest-hour", str(DIGEST_HOUR), "--store", str(store)]
+        with contextlib.redirect_stderr(io.StringIO()):
+            post_health.main(argv, environ={post_health.SPACE_ENV: SPACE, post_health.TOKEN_ENV: TOKEN}, opener=self.opener, gh_runner=self.gh)
+        [(args, _)] = self.coverage.call_args_list
+        self.assertEqual(args[2], store)
 
     def test_the_digest_without_data_json_is_unchanged(self):
         self.tick(health(), self.at(DIGEST_UTC, 5))
@@ -774,150 +868,92 @@ class Digest(RunHarness):
         )
 
     def test_digest_carries_the_slow_line_while_it_lasts(self):
-        self.tick(slow(), T0.replace(hour=7))  # the note itself
+        self.tick(slow(), T0.replace(hour=7))  # no message of its own
         self.tick(slow(), self.at(DIGEST_UTC, 5))
         self.assertEqual(
-            self.opener.texts[1].split("\n")[1],
+            self.opener.texts[0].split("\n")[1],
             "🐢 Slow since 2:00 PM ET: the last 5 full runs took 152–213 min (median 183) against a 7-day typical of 151 min (p90 198); 2 reps lost to 429s or empty records.",
         )
         self.tick(health(), self.at(DIGEST_UTC, 5, day=5))
-        self.assertEqual(len(self.opener.texts), 3, "clearing is not a message")
-        self.assertNotIn("Slow since", self.opener.texts[2])
+        self.assertEqual(len(self.opener.texts), 2, "clearing is not a message")
+        self.assertNotIn("Slow since", self.opener.texts[1])
 
     def test_digest_carries_the_near_deadline_line_while_it_lasts(self):
-        self.tick(near_deadline(), T0.replace(hour=7))  # the note itself
+        self.tick(near_deadline(), T0.replace(hour=7))  # no message of its own
         self.tick(near_deadline(), self.at(DIGEST_UTC, 5))
         self.assertEqual(
-            self.opener.texts[1].split("\n")[1],
+            self.opener.texts[0].split("\n")[1],
             "⏱ Close to the deadline since 12:00 PM ET: slowest run 356 min, 4 min of headroom.",
         )
         self.tick(health(), self.at(DIGEST_UTC, 5, day=5))
-        self.assertEqual(len(self.opener.texts), 3, "clearing is not a message")
-        self.assertNotIn("Close to the deadline since", self.opener.texts[2])
+        self.assertEqual(len(self.opener.texts), 2, "clearing is not a message")
+        self.assertNotIn("Close to the deadline since", self.opener.texts[1])
 
 
 # --------------------------------------------------------------------------- #
-# The slow note
+# The slow and near_deadline notes: the digest only
 # --------------------------------------------------------------------------- #
 
 
-class SlowNote(RunHarness):
-    def test_posted_once_per_episode_and_again_after_it_clears(self):
+class DigestOnlyNotes(RunHarness):
+    def test_neither_note_posts_on_its_own(self):
         # Morning ticks, clear of the 12:40-13:20Z digest window.
-        self.tick(slow(), self.at(10))
-        self.tick(slow(), self.at(10, 15))
-        self.tick(slow(), self.at(10, 30))
-        self.assertEqual(len(self.opener.requests), 1, "one note for the episode")
-        self.assertTrue(self.recorded()["slow"])
-        self.tick(health(), self.at(10, 45))
-        self.assertEqual(len(self.opener.requests), 1, "clearing is not news")
-        self.assertFalse(self.recorded()["slow"])
-        self.tick(slow(infra_reps=0), self.at(15))
-        self.assertEqual(len(self.opener.requests), 2, "a new episode is")
-        self.assertIn("; no reps lost.", self.opener.texts[1])
+        docs = (slow(), near_deadline(), near_deadline(max_s=327 * 60))
+        for minute, doc in zip((0, 15, 30), docs):
+            rc, err = self.tick(doc, self.at(10, minute))
+            self.assertEqual(rc, 0)
+            self.assertIn("posted nothing", err)
+        self.assertEqual(self.opener.requests, [])
+        self.assertEqual(self.recorded()["state"], "GREEN", "the note moves no state")
 
-    def test_a_failed_note_is_retried_next_tick(self):
-        self.tick(health(), T0)
-        rc, err = self.tick(slow(), T0.replace(minute=15), opener=FakeOpener(statuses=[500]))
-        self.assertEqual(rc, 1)
-        self.assertIn("failed to post: slow", err)
-        self.assertFalse(self.recorded()["slow"], "not told yet")
-        self.tick(slow(), T0.replace(minute=30))
-        self.assertEqual(len(self.opener.requests), 1)
-        self.assertTrue(self.recorded()["slow"])
-
-    def test_a_note_that_vanishes_with_the_state_is_told_again_when_green_returns(self):
-        # health.py computes the note for GREEN ticks only, so an incident
-        # takes it away; the state file follows it down silently and the
-        # note after the recovery is a new episode, told once more.
-        self.tick(slow(), self.at(10))
-        self.tick(outage(), self.at(10, 15))
-        self.assertEqual([text.split(" ")[0] for text in self.opener.texts], ["🐢", "🔴"])
-        self.assertEqual((self.recorded()["state"], self.recorded()["slow"]), ("OUTAGE", False))
-        self.tick(slow(), self.at(10, 30))
-        self.assertEqual([text.split(" ")[0] for text in self.opener.texts][2:], ["🟢", "🐢"])
-        self.assertTrue(self.recorded()["slow"])
-
-
-class NearDeadlineNote(RunHarness):
-    def test_posted_once_per_episode_and_again_after_it_clears(self):
-        # Morning ticks, clear of the 12:40-13:20Z digest window.
+    def test_a_near_deadline_note_with_a_kill_posts_once_with_its_advice(self):
+        # A killed run reached no verdict, so the message drops "Not a break"
+        # and keeps the one thing to do; the digest line does not carry it.
         self.tick(near_deadline(), self.at(10))
-        self.tick(near_deadline(), self.at(10, 15))
-        self.tick(near_deadline(), self.at(10, 30))
-        self.assertEqual(len(self.opener.requests), 1, "one note for the episode")
+        self.assertEqual(self.opener.requests, [], "no kill, no message")
+        self.tick(near_deadline(max_s=365 * 60, kills=1, max_killed=True), self.at(10, 15))
+        self.assertEqual(
+            self.opener.texts,
+            [
+                "⏱ *Smoke gate: close to the deadline* — slowest run 365 min in the last 24h, 5 min past the 360-minute Prow timeout."
+                " Check the run cost before adding a case to `hack/eval/presubmit-cases.txt`.\n"
+                f"{URL}#view=agent"
+            ],
+        )
         self.assertTrue(self.recorded()["near_deadline"])
+        self.tick(near_deadline(max_s=360 * 60, kills=2, max_killed=True), self.at(10, 30))
+        self.assertEqual(len(self.opener.texts), 1, "once per episode")
         self.tick(health(), self.at(10, 45))
-        self.assertEqual(len(self.opener.requests), 1, "clearing is not news")
-        self.assertFalse(self.recorded()["near_deadline"])
-        self.tick(near_deadline(max_s=327 * 60), self.at(15))
-        self.assertEqual(len(self.opener.requests), 2, "a new episode is")
-        self.assertIn("slowest run 327 min in the last 24h, 33 min under the 360-minute Prow timeout.", self.opener.texts[1])
+        self.assertFalse(self.recorded()["near_deadline"], "the note clears silently")
+        self.tick(near_deadline(max_s=360 * 60, kills=1, max_killed=False), self.at(11))
+        self.assertEqual(len(self.opener.texts), 2, "a new episode is told again")
+        self.assertIn("slowest run 360 min in the last 24h, at the 360-minute Prow timeout. Check the run cost", self.opener.texts[1])
+        self.assertNotIn("Not a break", self.opener.texts[1])
 
-    def test_a_failed_note_is_retried_next_tick(self):
-        self.tick(health(), T0)
-        rc, err = self.tick(near_deadline(), T0.replace(minute=15), opener=FakeOpener(statuses=[500]))
+    def test_a_failed_kill_message_is_retried_next_tick(self):
+        self.tick(health(), self.at(10))
+        rc, err = self.tick(near_deadline(kills=1), self.at(10, 15), opener=FakeOpener(statuses=[500]))
         self.assertEqual(rc, 1)
         self.assertIn("failed to post: near_deadline", err)
         self.assertFalse(self.recorded()["near_deadline"], "not told yet")
-        self.tick(near_deadline(), T0.replace(minute=30))
+        self.tick(near_deadline(kills=1), self.at(10, 30))
         self.assertEqual(len(self.opener.requests), 1)
         self.assertTrue(self.recorded()["near_deadline"])
 
-    def test_a_note_that_vanishes_with_the_state_is_told_again_when_green_returns(self):
-        self.tick(near_deadline(), self.at(10))
+    def test_an_outage_recovery_is_not_followed_by_the_note(self):
+        self.tick(slow(), self.at(10))
         self.tick(outage(), self.at(10, 15))
-        self.assertEqual([text.split(" ")[0] for text in self.opener.texts], ["⏱", "🔴"])
-        self.assertEqual((self.recorded()["state"], self.recorded()["near_deadline"]), ("OUTAGE", False))
         self.tick(near_deadline(), self.at(10, 30))
-        self.assertEqual([text.split(" ")[0] for text in self.opener.texts][2:], ["🟢", "⏱"])
-        self.assertTrue(self.recorded()["near_deadline"])
+        self.assertEqual([text.split(" ")[0] for text in self.opener.texts], ["🔴", "🟢"])
 
-    def test_render_message(self):
-        self.tick(near_deadline(), self.at(10))
-        lines = self.opener.texts[0].split("\n")
-        self.assertEqual(
-            lines[0],
-            "⏱ *Smoke gate: close to the deadline* — slowest run 356 min in the last 24h, 4 min under the 360-minute Prow timeout. Not a break. Check the run cost before adding a case to `hack/eval/presubmit-cases.txt`.",
-        )
-        self.assertEqual(lines[1], f"{URL}#view=agent")
-
-    def test_render_message_when_killed_past_deadline(self):
-        self.tick(near_deadline(max_s=365 * 60, kills=1, max_killed=True), self.at(10))
-        lines = self.opener.texts[0].split("\n")
-        self.assertEqual(
-            lines[0],
-            "⏱ *Smoke gate: close to the deadline* — slowest run 365 min in the last 24h, 5 min past the 360-minute Prow timeout. Check the run cost before adding a case to `hack/eval/presubmit-cases.txt`.",
-        )
-        self.assertEqual(lines[1], f"{URL}#view=agent")
-
-    def test_render_message_when_killed_at_deadline(self):
-        self.tick(near_deadline(max_s=360 * 60, kills=1, max_killed=True), self.at(10))
-        lines = self.opener.texts[0].split("\n")
-        self.assertEqual(
-            lines[0],
-            "⏱ *Smoke gate: close to the deadline* — slowest run 360 min in the last 24h, killed at the deadline. Check the run cost before adding a case to `hack/eval/presubmit-cases.txt`.",
-        )
-        self.assertEqual(lines[1], f"{URL}#view=agent")
-
-    def test_render_message_when_graded_at_deadline_with_separate_kill(self):
-        self.tick(near_deadline(max_s=360 * 60, kills=1, max_killed=False), self.at(10))
-        lines = self.opener.texts[0].split("\n")
-        self.assertEqual(
-            lines[0],
-            "⏱ *Smoke gate: close to the deadline* — slowest run 360 min in the last 24h, at the 360-minute Prow timeout. Check the run cost before adding a case to `hack/eval/presubmit-cases.txt`.",
-        )
-        self.assertEqual(lines[1], f"{URL}#view=agent")
-
-    def test_non_integer_minute_wall_clock_does_not_drift(self):
+    def test_the_digest_line_reads_the_margin_each_way(self):
+        self.assertEqual(near_deadline_margin(near_deadline_note()), "4 min under the 360-minute Prow timeout")
+        self.assertEqual(near_deadline_margin(near_deadline_note(max_s=365 * 60, kills=1, max_killed=True)), "5 min past the 360-minute Prow timeout")
+        self.assertEqual(near_deadline_margin(near_deadline_note(max_s=360 * 60, kills=1, max_killed=True)), "killed at the deadline")
+        self.assertEqual(near_deadline_margin(near_deadline_note(max_s=360 * 60, kills=1, max_killed=False)), "at the 360-minute Prow timeout")
         # 21330s = 355.5m -> 270s headroom = 4.5m -> floors both to 4 min
-        self.tick(near_deadline(max_s=21330, headroom_s=270), self.at(10))
-        lines = self.opener.texts[0].split("\n")
-        self.assertEqual(
-            lines[0],
-            "⏱ *Smoke gate: close to the deadline* — slowest run 355 min in the last 24h, 4 min under the 360-minute Prow timeout. Not a break. Check the run cost before adding a case to `hack/eval/presubmit-cases.txt`.",
-        )
         nd = near_deadline_note(max_s=21330, headroom_s=270)
+        self.assertEqual(near_deadline_margin(nd), "4 min under the 360-minute Prow timeout")
         self.assertEqual(post_health.near_deadline_digest_line(nd), "slowest run 355 min, 4 min of headroom")
 
 
@@ -939,7 +975,7 @@ class PoolNote(RunHarness):
             lines[1],
             "Last 3h: median wait 22 min against a 15 min limit; p95 61 min against 45.",
         )
-        self.assertEqual(lines[2], "2 runs waiting right now, past the 45 min p95 limit.")
+        self.assertEqual(lines[2], "2 of 4 waiting runs are past the 45 min p95 limit.")
         self.assertEqual(lines[3], "Runs still pass; /retest makes the queue longer.")
         self.assertEqual(lines[4], f"{URL}#view=agent")
 
@@ -958,7 +994,7 @@ class PoolNote(RunHarness):
         # then there is no day's median to print -- only the live queue.
         self.tick(pooled(day=None, p50_s=None, p95_s=None, over_threshold=3), self.at(10))
         lines = self.first()
-        self.assertEqual(lines[1], "3 runs waiting right now, past the 45 min p95 limit.")
+        self.assertEqual(lines[1], "3 of 4 waiting runs are past the 45 min p95 limit.")
         self.assertEqual(lines[2], "Runs still pass; /retest makes the queue longer.")
 
     def test_a_breach_on_a_day_and_on_the_live_queue_reports_both(self):
@@ -968,14 +1004,30 @@ class PoolNote(RunHarness):
             lines[1],
             "Last 3h: median wait 22 min against a 15 min limit; p95 61 min against 45.",
         )
-        self.assertEqual(lines[2], "1 run waiting right now, past the 45 min p95 limit.")
+        self.assertEqual(lines[2], "1 of 4 waiting runs is past the 45 min p95 limit.")
 
-    def test_the_cap_message_names_the_cap_and_the_pool_it_is_below(self):
-        self.tick(pooled(cause="CONCURRENCY_CAP", free=4, max_concurrency=26), self.at(10))
-        self.assertEqual(
-            self.first()[0],
-            "⏳ *Smoke gate: concurrency cap* — the pool has 30 projects but the concurrency cap is only 26. Raise the cap.",
-        )
+    def test_the_cap_message_says_the_wait_the_days_and_the_cap(self):
+        # A live queue: how many wait, how long, and the cap they wait at. The
+        # count under it is the part of those past the limit, not a second count.
+        self.tick(pooled(cause="CONCURRENCY_CAP", free=4, max_concurrency=26, waiting=6, waiting_longest_s=40 * 60), self.at(10))
+        lines = self.first()
+        self.assertEqual(lines[0], "⏳ *Smoke gate: queue* — 6 presubmit runs are waiting, longest 40 min; the presubmit is at its cap of 26 slots.")
+        self.assertEqual(lines[2], "2 of 6 waiting runs are past the 45 min p95 limit.")
+        # A note written before the live count was carried keeps the old line.
+        self.assertIn("2 runs waiting right now, past the 45 min p95 limit.", post_health.pool_numbers(pool_note(waiting=None)))
+        # Deck unread: the breached days and their longest wait, past tense,
+        # and no claim about now. This is the form Chat posts without a live
+        # queue; decide() withholds a breach whose queue was seen drained.
+        note = pool_note(cause="CONCURRENCY_CAP", free=5, max_concurrency=35, total=40, waiting=None, waiting_longest_s=None, over_threshold=0, worst_s=110 * 60, breached_days=["2026-11-05", "2026-11-06"])
+        self.assertEqual(post_health.pool_cause_text(note), "*Smoke gate: queue* — presubmit runs waited up to 110 min on 11-05 and 11-06; the presubmit was at its cap of 35 slots. The job could not read the queue, so this bot cannot say whether runs still wait.")
+        # Deck saw no run past the limit: the live count says whether the
+        # queue is empty or merely short.
+        note = pool_note(cause="CONCURRENCY_CAP", free=35, max_concurrency=35, total=40, waiting_now=False, waiting=0, over_threshold=0, waiting_longest_s=None, worst_s=110 * 60, breached_days=["2026-11-05", "2026-11-06"])
+        self.assertEqual(post_health.pool_cause_text(note), "*Smoke gate: queue* — presubmit runs waited up to 110 min on 11-05 and 11-06; the presubmit was at its cap of 35 slots. Nothing waits now.")
+        self.assertTrue(post_health.pool_cause_text(dict(note, waiting=3)).endswith("at its cap of 35 slots. 3 runs wait now, none past the limit."))
+        self.assertEqual(post_health.days_text(["2026-11-05"]), "11-05")
+        self.assertEqual(post_health.days_text(["2026-11-04", "2026-11-05", "2026-11-06"]), "11-04, 11-05 and 11-06")
+        self.assertEqual(post_health.days_text([]), "recent days")
 
     def test_the_control_plane_message_states_the_cause_and_names_the_build_cluster(self):
         # No hedge: decide() posts this only while runs are waiting, and the
@@ -1070,16 +1122,18 @@ class PoolNote(RunHarness):
         self.assertEqual(self.recorded()["pool_verdict"], "STALE")
 
     def test_a_cause_that_changes_inside_an_episode_is_told_again(self):
-        # The cause picks the remedy and is recomputed from live occupancy every
-        # hour, so a week-long breach switches from "onboard a project" to
-        # "raise the cap" with the verdict unchanged. Only this message carries
-        # a remedy; the digest line and the Brief sentence are cause-free.
+        # The cause picks the message and is recomputed from live occupancy
+        # every hour, so a week-long breach switches from "onboard a project"
+        # to the cap's wait-and-cap line with the verdict unchanged. Only this
+        # message names a cause; the digest line and the Brief sentence are
+        # cause-free.
         self.tick(pooled(), self.at(10))
         self.tick(pooled(cause="CONCURRENCY_CAP"), self.at(11))
         self.assertEqual(len(self.opener.requests), 2)
         self.assertIn("pool full", self.opener.texts[0])
-        self.assertIn("concurrency cap", self.opener.texts[1])
-        self.assertEqual(self.recorded()["pool_causes"], ["CAPACITY", "CONCURRENCY_CAP"])
+        self.assertIn("at its cap of", self.opener.texts[1])
+        # The live cap form covers the unread one, as the build cluster does.
+        self.assertEqual(self.recorded()["pool_causes"], ["CAPACITY", "CONCURRENCY_CAP", "CONCURRENCY_CAP:queue-unread"])
 
     def test_a_cause_the_episode_already_named_is_not_repeated(self):
         # Free projects cross zero repeatedly inside one episode, so CAPACITY
@@ -1099,7 +1153,7 @@ class PoolNote(RunHarness):
         self.tick(pooled(cause="CONCURRENCY_CAP"), self.at(10, 15))
         self.assertEqual(self.recorded()["pool_causes"], ["CAPACITY"], "the cap was never announced")
         self.tick(pooled(cause="CONCURRENCY_CAP"), self.at(10, 30))
-        self.assertEqual(self.recorded()["pool_causes"], ["CAPACITY", "CONCURRENCY_CAP"])
+        self.assertEqual(self.recorded()["pool_causes"], ["CAPACITY", "CONCURRENCY_CAP", "CONCURRENCY_CAP:queue-unread"])
         # Three attempts: the first note, the cap that 500'd, and its retry.
         self.assertEqual([text.split(" ")[0] for text in self.opener.texts], ["⏳", "⏳", "⏳"])
 
@@ -1206,6 +1260,18 @@ class PoolNote(RunHarness):
         self.tick(pooled(cause="CONTROL_PLANE", free=25, waiting_longest_s=None), self.at(11))
         self.assertEqual(len(self.opener.requests), 1)
         self.assertIn("Check the build cluster", self.opener.texts[0])
+
+    def test_the_caps_live_count_is_still_owed_after_an_unread_opening(self):
+        # Like CONTROL_PLANE: the two cap forms share a cause and say different
+        # things, so an episode that opens on an unread Deck still posts the
+        # live queue when Deck comes back, and the unread form is not owed
+        # again after the live one.
+        self.tick(pooled(cause="CONCURRENCY_CAP", free=5, waiting=None, waiting_longest_s=None, over_threshold=0, breached_days=["2026-09-03"], worst_s=50 * 60), self.at(10))
+        self.tick(pooled(cause="CONCURRENCY_CAP", free=5, waiting=9, waiting_longest_s=40 * 60), self.at(11))
+        self.tick(pooled(cause="CONCURRENCY_CAP", free=5, waiting=None, waiting_longest_s=None, over_threshold=0, breached_days=["2026-09-03"], worst_s=50 * 60), self.at(12))
+        self.assertEqual(len(self.opener.requests), 2)
+        self.assertIn("could not read the queue", self.opener.texts[0])
+        self.assertIn("9 presubmit runs are waiting", self.opener.texts[1])
 
     def test_a_new_episode_names_its_remedy_again(self):
         # The list is the episode's, not the channel's memory: the same cause a
@@ -1464,12 +1530,16 @@ class TrackingIssue(RunHarness):
         self.assertEqual(rc, 0)
         self.assertEqual(self.gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues")])
         _, _, body = self.gh.calls[-1]
-        self.assertEqual(body["title"], "Smoke gate outage: 2 cases failing on every PR since Tue 7:30 AM ET")
+        self.assertEqual(body["title"], "Smoke gate outage since Tue 7:30 AM ET")
         self.assertEqual(body["labels"], ["presubmit-gate"])
-        self.assertIn("- `cost-idle-pool-probe`\n- `reliability-pdb-probe`", body["body"])
+        marker, _, rest = body["body"].partition("\n")
+        self.assertEqual(marker, "<!-- kube-agents-bot:gate-outage cases=cost-idle-pool-probe,reliability-pdb-probe -->", "the hidden marker is how the bot re-finds it")
+        self.assertNotIn("cost-idle-pool-probe", rest, "the cases are on the brief, not in the public issue")
         self.assertIn("**Window:** since Tue 7:30 AM ET (2026-09-08T11:30:00+00:00), 3 PRs red so far.", body["body"])
-        self.assertIn("**Class:** shared fixture/environment break: cost-idle-pool-probe, reliability-pdb-probe (`shared_break`).", body["body"])
-        self.assertIn(f"Incident brief: {URL}#since=2026-09-08T11:30:00Z&cases=cost-idle-pool-probe,reliability-pdb-probe&view=gate", body["body"])
+        self.assertIn("**Class:** shared fixture/environment break (`shared_break`).", body["body"])
+        self.assertIn(f"The failing cases and the evidence are on the incident brief: {URL}#since=2026-09-08T11:30:00Z&view=gate", body["body"])
+        for text in (body["title"], body["body"]):
+            self.assertIsNone(RESULTS_RE.search(text), text)
         self.assertTrue(body["body"].rstrip().endswith("Filed automatically by the smoke health bot; edit freely. Fix PRs: reference this issue."))
         self.assertEqual(self.opener.texts[0].split("\n")[1], "Don't retest yet. Tracking #1300.")
         recorded = self.recorded()
@@ -1480,8 +1550,67 @@ class TrackingIssue(RunHarness):
         self.assertEqual(len(self.gh.writes()), 1, "filed once")
         self.assertIn("Tracking #1300.", self.opener.texts[-1])
 
+    def test_the_bots_own_outage_issue_is_re_found_by_its_marker(self):
+        # The body names the cases in the marker alone, and the label has
+        # been taken off (a human's edit), so the name match on a labelled
+        # body cannot find it: only the marker path does.
+        own = {"number": 1301, "html_url": "https://github.com/gke-labs/kube-agents/issues/1301", "title": "Smoke gate outage since Mon 5:00 AM ET",
+               "body": post_health.gate_issue.OUTAGE_MARKER.format(cases=",".join(sorted(TRIO))) + "\nThe smoke gate (`pull-kube-agents-smoke-test`) is in OUTAGE.", "labels": [{"name": "bug"}]}
+        gh = FakeGh(open_issues=[own])
+        self.tick(outage(cases=TRIO), T0, environ=self.environ(), gh=gh)
+        self.assertEqual(gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues/1301/labels")], "re-labelled on adoption, nothing filed")
+        self.assertIn("Tracking #1301.", self.opener.texts[0])
+        self.assertEqual(self.recorded()["issue"]["number"], 1301)
+
+    def test_a_marker_for_other_cases_is_not_this_breaks(self):
+        other = {"number": 1302, "html_url": "https://github.com/gke-labs/kube-agents/issues/1302", "title": "Smoke gate outage since Mon 5:00 AM ET",
+                 "body": post_health.gate_issue.OUTAGE_MARKER.format(cases="a-probe") + "\nin OUTAGE.", "labels": [{"name": "presubmit-gate"}]}
+        gh = FakeGh(open_issues=[other])
+        self.tick(outage(cases=TRIO), T0, environ=self.environ(), gh=gh)
+        self.assertEqual(gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues")])
+        self.assertTrue(gh.calls[-1][2]["body"].startswith(post_health.gate_issue.OUTAGE_MARKER.format(cases=",".join(sorted(TRIO)))), "the filed body leads with its marker")
+
+    def test_a_human_issue_naming_the_cases_in_its_title_is_adopted(self):
+        human = {"number": 1279, "html_url": "https://github.com/gke-labs/kube-agents/issues/1279", "title": "cluster-agent-crashloop-debug, cluster-agent-crashloop-evidence-chain, cluster-agent-crashloop-misleading-symptom red on every PR", "body": "seeded fleet?"}
+        gh = FakeGh(open_issues=[human])
+        self.tick(outage(cases=TRIO), T0, environ=self.environ(), gh=gh)
+        self.assertEqual(gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues/1279/labels")], "adopted and labelled, nothing filed")
+        self.assertIn("Tracking #1279.", self.opener.texts[0])
+
+    def test_the_infrastructure_issues_quote_no_per_case_grading_line(self):
+        """health.assess concatenates shared_break's per-case lines and the
+        watched periodics' lines (a build log's last error line) into
+        evidence whatever the condition; each public body quotes only the
+        lines that start with its own condition's prefix."""
+        gi = post_health.gate_issue
+        graded = ["cluster-agent-crashloop-debug failed all graded reps on 4 runs from 3 PRs (#1, #2, #3)",
+                  "these cases explain 4 of 5 red runs (5 of 6 concluded runs red) in the last 6h",
+                  "PR-caused: upgrades-lagging-master-probe failing only on #7 (passing on 2 other PRs built on the same main commit)"]
+        periodic = "certification lane: build 2100000000000000001 failed at 2026-11-07T03:10:00Z (log `ERROR rca-remediation-pr: required phrases absent`)"
+        foreign = [*graded, periodic]
+        lost_line = "lost pods: 12 runs on 12 PRs died with their build node 14:05–14:19 UTC"
+        drift_line = f"{DRIFT_ROLE} drifted on 3 pool project(s) (kube-agents-evals-1, kube-agents-evals-2, kube-agents-evals-3) at the 13:00 UTC scan"
+        kill_line = "deadline kills: 3 runs on 3 PRs killed at the 360-minute deadline with no verdict 19:40–20:00 UTC"
+        pool_line = f"{FINDING} found on 3 pool project(s) (kube-agents-evals-1, kube-agents-evals-2, kube-agents-evals-3) at the 13:00 UTC scan"
+        bodies = {
+            lost_line: gi.render_lost_pods_body(lost_pods(evidence=[*foreign, lost_line]), "Fri 10:05 AM ET", "10:05–10:19 AM ET", "brief"),
+            drift_line: gi.render_fixture_drift_body(fixture_drift(evidence=[*foreign, drift_line]), "Mon 9:00 AM ET", "brief"),
+            kill_line: gi.render_deadline_kill_body(deadline_kill(evidence=[*foreign, kill_line]), "Tue 3:00 PM ET", "3:40–4:00 PM ET", "brief"),
+            pool_line: gi.render_pool_drift_body(pool_drift(evidence=[*foreign, pool_line]), "Mon 9:00 AM ET", "brief"),
+        }
+        for own_line, body in bodies.items():
+            self.assertIn(f"- {own_line}", body)
+            for name in ("cluster-agent-crashloop-debug", "upgrades-lagging-master-probe", "these cases explain", "PR-caused", "certification lane", "rca-remediation-pr"):
+                self.assertNotIn(name, body, own_line)
+            self.assertIsNone(RESULTS_RE.search(body), body)
+        # The drop regex alone takes the graded lines; the prefix layer is what keeps a periodic's line out.
+        self.assertEqual(gi.public_evidence({"evidence": foreign}), [periodic])
+        self.assertEqual(gi.public_evidence({"evidence": [*foreign, kill_line, lost_line]}, (gi.DEADLINE_EVIDENCE_PREFIX,)), [kill_line])
+        self.assertEqual(gi.public_evidence({"evidence": [kill_line, lost_line]}, (gi.LOST_PODS_EVIDENCE_PREFIX,)), [lost_line])
+        self.assertEqual(gi.public_evidence({"evidence": [drift_line, lost_line]}, (gi.FIXTURE_DRIFT_EVIDENCE_PREFIX.format(role=DRIFT_ROLE),)), [drift_line])
+
     def test_a_human_filed_issue_naming_the_cases_is_adopted(self):
-        human = {"number": 1278, "html_url": "https://github.com/gke-labs/kube-agents/issues/1278", "title": "Seeded fleet outage", "body": "cluster-agent-crashloop-debug, cluster-agent-crashloop-evidence-chain and cluster-agent-crashloop-misleading-symptom red every PR"}
+        human = {"number": 1278, "html_url": "https://github.com/gke-labs/kube-agents/issues/1278", "title": "Seeded fleet outage", "body": "cluster-agent-crashloop-debug, cluster-agent-crashloop-evidence-chain and cluster-agent-crashloop-misleading-symptom red every PR", "labels": [{"name": "presubmit-gate"}]}
         other = {"number": 1254, "html_url": "x", "title": "upgrades-lagging-master-probe: rung-4 collapse", "body": "unrelated"}
         gh = FakeGh(open_issues=[other, human])
         self.tick(outage(cases=TRIO), T0, environ=self.environ(), gh=gh)
@@ -1497,9 +1626,10 @@ class TrackingIssue(RunHarness):
     def test_recovery_comments_on_the_issue_and_drops_it(self):
         self.tick(outage(cases=["a-probe"], since="2026-09-04T09:00:00+00:00", prs=(1, 2, 3)), T0, environ=self.environ())
         self.tick(health(), T0.replace(hour=15, minute=30), environ=self.environ())
-        self.assertEqual(self.gh.writes()[-1], ("POST", "repos/gke-labs/kube-agents/issues/1300/comments"))
-        self.assertEqual(self.gh.calls[-1][2], {"body": "Healthy again after 6h 30m; bot will not close it."})
-        self.assertNotIn("PATCH", [method for method, _ in self.gh.writes()], "never closed")
+        # The bot's own issue: the recovery comment, then the close.
+        self.assertEqual(self.gh.writes()[-2:], [("POST", "repos/gke-labs/kube-agents/issues/1300/comments"), ("PATCH", "repos/gke-labs/kube-agents/issues/1300")])
+        self.assertEqual(self.gh.calls[-2][2], {"body": "Healthy again after 6h 30m; closing (filed by the bot; reopen if the cause is still live)."})
+        self.assertEqual(self.gh.calls[-1][2], {"state": "closed", "state_reason": "completed"})
         self.assertIn("(a-probe were failing, #1300)", self.opener.texts[1])
         self.assertIsNone(self.recorded()["issue"])
 
@@ -1520,7 +1650,7 @@ class TrackingIssue(RunHarness):
         self.assertEqual(rc, 0)
         self.assertEqual(self.gh.writes(), [])
         self.assertIn("--dry-run: would POST repos/gke-labs/kube-agents/issues", err)
-        self.assertIn("Smoke gate outage: 1 case failing on every PR since", err)
+        self.assertIn("Smoke gate outage since", err)
 
 
 class InfraAddressee(unittest.TestCase):
@@ -1640,7 +1770,7 @@ class LostPods(RunHarness):
         self.assertIn("- lost pods: 12 runs on 12 PRs died with their build node 14:05–14:19 UTC", text)
         self.assertIn("**Advice for authors:** nothing about your change; `/retest` once new jobs are progressing.", text)
         self.assertIn(f"Incident brief: {URL}#since=2026-09-11T14:05:52Z&view=gate", text)
-        self.assertIn("Filed automatically by the smoke health bot; the cluster owner should check the node events and autorepair; the bot will not close it.", text)
+        self.assertIn("Filed automatically by the smoke health bot; the cluster owner should check the node events and autorepair; the bot closes it when the condition clears.", text)
         # Whatever domains.yaml names (a null owner or backup included), the
         # issue carries what the tracker's own wiring adds; InfraAddressee
         # pins the wording with injected logins.
@@ -1655,11 +1785,11 @@ class LostPods(RunHarness):
         self.assertEqual(len(self.opener.requests), 1)
 
     def test_a_human_issue_naming_the_nodes_is_adopted(self):
-        human = {"number": 1478, "html_url": "https://github.com/gke-labs/kube-agents/issues/1478", "title": "Build-cluster nodes went NotReady", "body": "nodes gke-kube-agents-prow-default-pool-eb220b2a-pe72 and gke-kube-agents-prow-default-pool-eb220b2a-sgnk"}
+        human = {"number": 1478, "html_url": "https://github.com/gke-labs/kube-agents/issues/1478", "title": "Build-cluster nodes went NotReady", "body": "nodes gke-kube-agents-prow-default-pool-eb220b2a-pe72 and gke-kube-agents-prow-default-pool-eb220b2a-sgnk went NotReady"}
         gh = FakeGh(open_issues=[human])
         doc = lost_pods(prs=(1, 2, 3, 4, 5, 6, 7, 8), nodes={"gke-kube-agents-prow-default-pool-eb220b2a-pe72": 5, "gke-kube-agents-prow-default-pool-eb220b2a-sgnk": 3})
         self.tick(doc, T0.replace(day=11, hour=14, minute=30), environ=self.environ(), gh=gh)
-        self.assertEqual(gh.writes(), [], "nothing filed")
+        self.assertEqual(gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues/1478/labels")], "labelled, nothing filed")
         self.assertIn("Tracking #1478.", self.opener.texts[0])
         self.assertEqual(self.recorded()["issue"]["condition"], "lost_pods")
         # An issue naming only one of the two nodes is not this event's.
@@ -1702,21 +1832,22 @@ class LostPods(RunHarness):
         self.assertNotIn("Tracking", self.opener.texts[-1])
         self.assertEqual((self.recorded()["issue"], [i["number"] for i in self.recorded()["issues"]]), (None, [1300]))
         self.tick(health(), T0.replace(hour=15, minute=30), environ=self.environ())
-        self.assertEqual(self.gh.writes()[-1], ("POST", "repos/gke-labs/kube-agents/issues/1300/comments"))
-        self.assertEqual(self.gh.calls[-1][2], {"body": "Healthy again after 2h 30m; bot will not close it."})
+        self.assertEqual(self.gh.writes()[-2:], [("POST", "repos/gke-labs/kube-agents/issues/1300/comments"), ("PATCH", "repos/gke-labs/kube-agents/issues/1300")])
+        self.assertEqual(self.gh.calls[-2][2], {"body": "Healthy again after 2h 30m; closing (filed by the bot; reopen if the cause is still live)."})
         self.assertEqual(self.opener.texts[-1].split("\n")[0], "🟢 *Smoke gate: healthy again* — fixed after 2h 30m (quota storm, #1300).")
         # A state file from before `issues` existed: its lone `issue` is
         # the episode's, and gets the comment too.
         self.state.write_text(json.dumps(dict(self.recorded(), state="DEGRADED", condition="storm", since="2026-09-04T13:00:00+00:00", issue={"number": 1200, "url": "x"}, issues=None)))
         self.tick(health(), T0.replace(hour=18), environ=self.environ())
-        self.assertEqual(self.gh.writes()[-1], ("POST", "repos/gke-labs/kube-agents/issues/1200/comments"))
+        self.assertEqual(self.gh.writes()[-2:], [("POST", "repos/gke-labs/kube-agents/issues/1200/comments"), ("PATCH", "repos/gke-labs/kube-agents/issues/1200")])
 
     def test_the_recovery_names_the_lost_nodes_and_the_issue(self):
         self.tick(lost_pods(), T0.replace(day=11, hour=14, minute=30), environ=self.environ())
         self.tick(health(), T0.replace(day=11, hour=16), environ=self.environ())
         # `since` is the first loss, 14:05:52Z; the recovery tick is 16:00Z.
         self.assertEqual(self.opener.texts[1].split("\n")[0], "🟢 *Smoke gate: healthy again* — fixed after 1h 54m (the build cluster lost nodes, #1300).")
-        self.assertEqual(self.gh.calls[-1][2], {"body": "Healthy again after 1h 54m; bot will not close it."})
+        self.assertEqual(self.gh.calls[-2][2], {"body": "Healthy again after 1h 54m; closing (filed by the bot; reopen if the cause is still live)."})
+        self.assertEqual(self.gh.writes()[-1], ("PATCH", "repos/gke-labs/kube-agents/issues/1300"))
         self.assertIsNone(self.recorded()["issue"])
 
     def test_dry_run_prints_the_cluster_owner_issue_instead_of_filing_it(self):
@@ -1877,7 +2008,7 @@ class Secrecy(RunHarness):
 
 
 class BucketState(unittest.TestCase):
-    def test_gs_state_is_read_and_written_through_gsutil_only(self):
+    def test_gs_state_is_read_and_written_through_gcloud_storage_only(self):
         calls = []
 
         class Result:
@@ -1887,14 +2018,14 @@ class BucketState(unittest.TestCase):
 
         def runner(argv, **kwargs):
             calls.append(argv)
-            if argv[:3] == ["gsutil", "-q", "cat"]:
+            if argv[:3] == ["gcloud", "storage", "cat"]:
                 return Result(1)
             return Result(0)
 
         self.assertIsNone(post_health.read_state("gs://bucket/evals/health-state.json", runner))
         post_health.write_state("gs://bucket/evals/health-state.json", {"state": "GREEN"}, runner)
-        self.assertEqual(calls[0], ["gsutil", "-q", "cat", "gs://bucket/evals/health-state.json"])
-        self.assertEqual(calls[1][:5], ["gsutil", "-q", "-h", "Cache-Control: no-cache", "cp"])
+        self.assertEqual(calls[0], ["gcloud", "storage", "cat", "gs://bucket/evals/health-state.json"])
+        self.assertEqual(calls[1][:4], ["gcloud", "storage", "cp", "--cache-control=no-cache"])
         self.assertEqual(calls[1][-1], "gs://bucket/evals/health-state.json")
 
 
@@ -1941,6 +2072,31 @@ class FixtureDrift(RunHarness):
         self.assertNotIn(post_health.FIXTURE_RECONCILE_HINT, text)
         self.assertIn(post_health.FIXTURE_CAPACITY_HINT, text)
 
+    def test_drift_no_re_apply_clears_names_the_remedy_not_the_re_apply(self):
+        # #4005, keyed on the op in the drift lines: the age gate's time, the channel's next patch.
+        age = 'cluster createTime age_hours_ge 24: observed "2026-09-14T12:00:00+00:00", 1.0 hours old (why: Clears itself)'
+        ahead = 'cluster currentMasterVersion not_ahead_of_channel: observed "1.34.12-gke.1011000", newer than every 1.34 patch REGULAR offers (newest 1.34.11-gke.1209000) (why: seeded_b_pin.py holds it)'
+
+        def advice(*lines):
+            doc = fixture_drift()
+            doc["incident"]["drift"] = {p: {DRIFT_ROLE: list(lines)} for p in DRIFT_PROJECTS}
+            return post_health.fixture_drift_advice(doc)
+
+        aged = advice(age)
+        self.assertTrue(aged.startswith(post_health.FIXTURE_NO_REAPPLY_LEAD), aged)
+        self.assertIn("clears itself at Tue 8:00 AM ET", aged)
+        self.assertNotIn(post_health.FIXTURE_RECONCILE_HINT, aged)
+        ahead_only = advice(ahead)
+        self.assertIn("until the channel ships a newer patch of that minor", ahead_only)
+        self.assertNotIn(post_health.FIXTURE_RECONCILE_HINT, ahead_only)
+        # One ordinary line beside them keeps the re-apply advice.
+        mixed = advice(age, DRIFT_DETAIL)
+        self.assertIn(post_health.FIXTURE_RECONCILE_HINT, mixed)
+        self.assertNotIn(post_health.FIXTURE_NO_REAPPLY_LEAD, mixed)
+        # An unset channel on the same op is the stack's to restore: the re-apply advice.
+        unset = advice('cluster currentMasterVersion not_ahead_of_channel: observed "1.34.12-gke.1011000"; release channel unset')
+        self.assertIn(post_health.FIXTURE_RECONCILE_HINT, unset)
+
     def test_a_new_drift_condition_posts_once_and_files_the_fleet_owner_issue(self):
         rc, err = self.tick(fixture_drift(evidence=[f"{DRIFT_ROLE} drifted on 3 pool project(s) (kube-agents-evals-1, kube-agents-evals-2, kube-agents-evals-3) at the 13:00 UTC scan"]), T14, environ=self.environ())
         self.assertEqual(rc, 0, err)
@@ -1949,7 +2105,7 @@ class FixtureDrift(RunHarness):
             [
                 (
                     "🟡 *Smoke gate: flaky* — seeded fixture crashloop-workload out of designed state on 3 pool projects since 9:00 AM ET;"
-                    " a red on a case that depends on it from a run that leased one of those projects is the fixture, not the code. Retest once the fleet is re-applied."
+                    " a case that depends on it is recorded as infrastructure on a run whose own scan saw the drift, and a red on one from a run whose scan could not read the role is the fixture, not the code. Retest once the fleet is re-applied."
                     " The daily reconcile re-applies bench/tf/fleet in the projects named at 08:30 UTC; a hand run of hack/fleet_reconcile.py --project from main does it sooner. Tracking #1300.\n"
                     f"{post_health.DASHBOARD_URL}#since=2026-09-14T13:00:00Z&view=gate"
                 )
@@ -1971,7 +2127,7 @@ class FixtureDrift(RunHarness):
         gh = FakeGh(open_issues=[{"number": 1290, "html_url": "https://github.com/gke-labs/kube-agents/issues/1290", "title": "crashloop-workload sits Pending on the fleet again", "body": ""}])
         self.tick(fixture_drift(), T14, environ=self.environ(), gh=gh)
         self.assertTrue(self.opener.texts[0].endswith(f"Tracking #1290.\n{post_health.DASHBOARD_URL}#since=2026-09-14T13:00:00Z&view=gate"))
-        self.assertEqual(gh.writes(), [])
+        self.assertEqual(gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues/1290/labels")], "labelled, nothing filed")
         self.assertEqual(self.recorded()["issue"]["condition"], "fixture_drift")
 
     def test_the_recovery_says_the_fixtures_had_drifted_and_comments(self):
@@ -1981,18 +2137,18 @@ class FixtureDrift(RunHarness):
         green["fixture_state"] = fixture_block()
         self.tick(green, later, environ=self.environ())
         self.assertEqual(self.opener.texts[-1].splitlines()[0], "🟢 *Smoke gate: healthy again* — fixed after 2h 30m (seeded fixtures had drifted, #1300).")
-        self.assertEqual(self.gh.writes()[-1], ("POST", "repos/gke-labs/kube-agents/issues/1300/comments"))
+        self.assertEqual(self.gh.writes()[-2:], [("POST", "repos/gke-labs/kube-agents/issues/1300/comments"), ("PATCH", "repos/gke-labs/kube-agents/issues/1300")])
         self.assertIsNone(self.recorded()["issue"])
 
     def test_the_cause_sentence_the_gate_comment_box_carries(self):
         self.assertEqual(
             post_health.cause_sentence(fixture_drift()),
-            "seeded fixture crashloop-workload out of designed state on 3 pool projects since 9:00 AM ET; a red on a case that depends on it from a run that leased one of those projects is the fixture, not the code.",
+            "seeded fixture crashloop-workload out of designed state on 3 pool projects since 9:00 AM ET; a case that depends on it is recorded as infrastructure on a run whose own scan saw the drift, and a red on one from a run whose scan could not read the role is the fixture, not the code.",
         )
         two = fixture_drift(roles=(DRIFT_ROLE, "no-pdb-workload"), projects=("kube-agents-evals-1",))
         self.assertEqual(
             post_health.cause_sentence(two),
-            "seeded fixtures crashloop-workload, no-pdb-workload out of designed state on 1 pool project since 9:00 AM ET; a red on a case that depends on them from a run that leased one of those projects is the fixture, not the code.",
+            "seeded fixtures crashloop-workload, no-pdb-workload out of designed state on 1 pool project since 9:00 AM ET; a case that depends on them is recorded as infrastructure on a run whose own scan saw the drift, and a red on one from a run whose scan could not read the role is the fixture, not the code.",
         )
 
     def test_the_digest_carries_one_line_on_the_latest_scan(self):
@@ -2021,7 +2177,7 @@ class FixtureDrift(RunHarness):
         )
         self.assertEqual(
             line(fixture_block(drifted={"kube-agents-evals-1": [DRIFT_ROLE], "kube-agents-evals-4": [DRIFT_ROLE, "no-pdb-workload"]})),
-            ["🧭 *Seeded fleet:* 2 of 30 checked pool projects drifted at 9:00 AM ET (crashloop-workload, no-pdb-workload); a red on a case that depends on them there is the fixture, not the code."],
+            ["🧭 *Seeded fleet:* 2 of 30 checked pool projects drifted at 9:00 AM ET (crashloop-workload, no-pdb-workload); a case that depends on them is not run there and counts as infrastructure."],
         )
         self.assertEqual(line(fixture_block(checked=0, unknown=True, reason=BLIND_REASON)), [f"🧭 *Seeded fleet:* the 9:00 AM ET scan could check none of 30 pool projects ({BLIND_REASON})."])
         self.assertEqual(line(fixture_block(stale=True)), ["🧭 *Seeded fleet:* the last scan (9:00 AM ET) is stale; someone check the scan job."])
@@ -2098,6 +2254,44 @@ class WatchedPeriodics(RunHarness):
 
     DAILY = "ci-kube-agents-fleet-reconcile-daily"
 
+    def test_a_failed_note_says_how_the_build_died(self):
+        doc = health("GREEN")
+        doc["periodics"] = {self.DAILY: dict(periodic_note(summary="1 project(s) not reconciled"), node="gke-kube-agents-prow-default-pool-eb220b2a-ru4s", last_event="NodeNotReady", last_line="/bin/sh: python3: not found")}
+        doc["periodics_read"] = [self.DAILY]
+        self.tick(doc, T14)
+        text = self.opener.texts[0]
+        self.assertIn("(build 100) failed: 1 project(s) not reconciled.\n- how it died: log `/bin/sh: python3: not found`, node `gke-kube-agents-prow-default-pool-eb220b2a-ru4s`, pod event NodeNotReady\nEffect:", text)
+        digest = post_health.periodic_digest_lines(doc, T14)
+        self.assertTrue(any("failed" in line and "log `/bin/sh: python3: not found`" in line for line in digest), digest)
+
+    def test_jobs_that_died_the_same_way_are_one_message(self):
+        sweep = "ci-kube-agents-pull-sweep"
+        line = "/bin/sh: python3: not found"
+        doc = health("GREEN")
+        doc["periodics"] = {
+            self.DAILY: dict(periodic_note(summary="1 project(s) not reconciled", detail=["kube-agents-evals-3: refused (x); next: y"], dry_run=True), node="gke-kube-agents-prow-default-pool-eb220b2a-ru4s", last_event="Evicted", last_line=line),
+            sweep: dict(periodic_note(job=sweep, label="GitOps pull sweep", build="200", finished="2026-09-14T13:50:00+00:00", stale_after_h=1), node="gke-kube-agents-prow-default-pool-eb220b2a-9e1h", last_line=line),
+        }
+        doc["periodics_read"] = [self.DAILY, sweep]
+        self.tick(doc, T14)
+        self.assertEqual(len(self.opener.texts), 1)
+        text = self.opener.texts[0]
+        self.assertEqual(text.count("🟠"), 1, "one block, not two")
+        self.assertTrue(text.startswith(f"🟠 *Eval seeded fleet and Eval GitOps repos: 2 jobs failed on the same log line.*\nEach build's log ends on the same line, `{line}`; one place to look first.\n"), text)
+        # Each job keeps what its own block would say: what it does, its run, the dry flag, its detail, its node and event.
+        self.assertIn(f"`{self.DAILY}` runs daily at 08:30 UTC and re-applies the seeded-fleet stack in every pool project, waiting for the leased ones. Its 9:40 AM ET run (build 100) (a dry run: nothing was applied) failed: 1 project(s) not reconciled.\n- kube-agents-evals-3: refused (x); next: y\n- how it died: node `gke-kube-agents-prow-default-pool-eb220b2a-ru4s`, pod event Evicted\n", text)
+        self.assertIn(f"`{sweep}` runs hourly and closes the pull requests", text)
+        self.assertIn("Its 9:50 AM ET run (build 200) failed.\n- how it died: node `gke-kube-agents-prow-default-pool-eb220b2a-9e1h`\n", text)
+        self.assertEqual(text.count(line), 1, "the shared line is said once, in the header")
+        self.assertIn("Effect: drifted fixtures stay drifted", text)
+        self.assertIn("pull requests a run left behind stay open", text)
+        self.assertIn(f"`{sweep}`: Runbook: ", text)
+        # Different last lines: two blocks, as before.
+        self.setUp()
+        doc["periodics"][sweep]["last_line"] = "fatal: could not read Username"
+        self.tick(doc, T14)
+        self.assertEqual(self.opener.texts[0].count("🟠"), 2)
+
     def test_a_due_gitlab_token_is_said_once_as_its_own_note_and_cleared_by_name(self):
         sweep = "ci-kube-agents-pull-sweep"
         line = "gitlab token kube-agents-prow/gitlab-ledger-token: expires 2026-11-01, in 25 day(s); rotate it (docs/ci-pool-projects.md 5.6)"
@@ -2109,7 +2303,7 @@ class WatchedPeriodics(RunHarness):
         self.tick(doc, T14)
         self.assertEqual(len(self.opener.texts), 1)
         text = self.opener.texts[0]
-        self.assertTrue(text.startswith("🟡 *Eval GitOps repos: a GitLab token of the eval pool is due for rotation, or dead.*\n`ci-kube-agents-pull-sweep` runs every ten minutes and"), text)
+        self.assertTrue(text.startswith("🟡 *Eval GitOps repos: a GitLab token of the eval pool is due for rotation, or dead.*\n`ci-kube-agents-pull-sweep` runs hourly and"), text)
         self.assertIn("Its 9:40 AM ET run (build 100) passed, and its GitLab report names:\n- " + line, text)
         self.assertIn("Effect: rotated with overlap nothing stops;", text)
         self.assertIn("Runbook: " + words.TOKEN_RUNBOOK, text)
@@ -2316,7 +2510,7 @@ class WatchedPeriodics(RunHarness):
         doc["periodics_read"] = [sweep]
         self.tick(doc, T14)
         text = self.opener.texts[0]
-        self.assertTrue(text.startswith("🟠 *Eval GitOps repos: leftover pull requests from eval runs are not being cleaned up.*\n`ci-kube-agents-pull-sweep` runs every ten minutes and closes the pull requests the agent opened during eval runs"), text)
+        self.assertTrue(text.startswith("🟠 *Eval GitOps repos: leftover pull requests from eval runs are not being cleaned up.*\n`ci-kube-agents-pull-sweep` runs hourly and closes the pull requests the agent opened during eval runs"), text)
         self.assertIn("Its 9:40 AM ET run (build 100) failed: failed in 11 of 11 project(s).", text)
         self.assertIn("- 3 write(s) left for the next run (the run's write budget)", text)
         self.assertIn("Effect: pull requests a run left behind stay open until the project's next lease, whose reset closes them. CI eval infrastructure only.", text)
@@ -2495,7 +2689,7 @@ class PoolDrift(RunHarness):
         gh = FakeGh(open_issues=[{"number": 1290, "html_url": "https://github.com/gke-labs/kube-agents/issues/1290", "title": f"{FINDING} is missing on the pool again", "body": ""}])
         self.tick(pool_drift(), T14, environ=self.environ(), gh=gh)
         self.assertTrue(self.opener.texts[0].endswith(f"Tracking #1290.\n{post_health.DASHBOARD_URL}#since=2026-09-14T13:00:00Z&view=gate"))
-        self.assertEqual(gh.writes(), [])
+        self.assertEqual(gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues/1290/labels")], "labelled, nothing filed")
         self.assertEqual(self.recorded()["issue"]["condition"], "pool_drift")
         # Every bot-filed body quotes the evidence, which names the finding
         # whether or not it fired: an outage issue is not the pool's tracker.
@@ -2557,7 +2751,7 @@ class PoolDrift(RunHarness):
         # finding; the body's marker is how the bot re-finds it after a GREEN.
         many = [f"iam/pool-state-reader/missing/{role}" for role in ("roles/iam.securityReviewer", "roles/container.clusterViewer", "roles/artifactregistry.reader", "roles/cloudkms.viewer", "roles/storage.bucketViewer")]
         marker = post_health.gate_issue.POOL_DRIFT_MARKER.format(findings=",".join(many))
-        own = {"number": 1295, "html_url": "https://github.com/gke-labs/kube-agents/issues/1295", "title": "Pool drift: 5 findings on 3 pool projects since Mon 9:00 AM ET", "body": marker + "\n**Findings**\n" + "\n".join(f"- `{f}`" for f in many)}
+        own = {"number": 1295, "html_url": "https://github.com/gke-labs/kube-agents/issues/1295", "title": "Pool drift: 5 findings on 3 pool projects since Mon 9:00 AM ET", "body": marker + "\n**Findings**\n" + "\n".join(f"- `{f}`" for f in many), "labels": [{"name": "presubmit-gate"}]}
         gh = FakeGh(open_issues=[own])
         self.tick(pool_drift(findings=tuple(many)), T14, environ=self.environ(), gh=gh)
         self.assertEqual(gh.writes(), [], "adopted, not re-filed")
@@ -2679,7 +2873,7 @@ class PoolDrift(RunHarness):
         green["pool_state"] = pool_block()
         self.tick(green, T14 + timedelta(hours=2), environ=self.environ())
         self.assertEqual(self.opener.texts[-1].splitlines()[0], "🟢 *Smoke gate: healthy again* — fixed after 2h 30m (pool projects had drifted, #1300).")
-        self.assertEqual(self.gh.writes()[-1], ("POST", "repos/gke-labs/kube-agents/issues/1300/comments"))
+        self.assertEqual(self.gh.writes()[-2:], [("POST", "repos/gke-labs/kube-agents/issues/1300/comments"), ("PATCH", "repos/gke-labs/kube-agents/issues/1300")])
 
     def test_the_digest_carries_one_line_on_the_latest_scan(self):
         def line(block):
@@ -2787,11 +2981,16 @@ class DeadlineKillMessages(RunHarness):
         self.assertIn("The rest of the evidence (any case collapsing underneath the kills) is in the brief.", body["body"])
 
     def test_a_humans_issue_titled_for_the_deadline_kills_is_adopted(self):
-        human = {"number": 1894, "html_url": "https://github.com/gke-labs/kube-agents/issues/1894", "title": "Smoke Health bot stayed GREEN through a 12 h gate outage: deadline-killed runs with no verdict match no condition", "body": ""}
+        human = {"number": 1894, "html_url": "https://github.com/gke-labs/kube-agents/issues/1894", "title": "Smoke Health bot stayed GREEN through a 12 h gate outage: deadline-killed runs with no verdict match no condition", "body": "", "labels": [{"name": "presubmit-gate"}]}
         gh = FakeGh(open_issues=[human])
         self.tick(deadline_kill(), T0.replace(day=22, hour=20, minute=5), environ=self.environ(), gh=gh)
         self.assertEqual(gh.writes(), [], "nothing filed")
         self.assertIn("Tracking #1894.", self.opener.texts[0])
+        # The pair has no identifier: without the label the same title is not the tracker.
+        self.setUp()
+        unlabelled = FakeGh(open_issues=[dict(human, labels=[])])
+        self.tick(deadline_kill(), T0.replace(day=22, hour=20, minute=5), environ=self.environ(), gh=unlabelled)
+        self.assertEqual(unlabelled.writes(), [("POST", "repos/gke-labs/kube-agents/issues")])
 
     def test_a_break_issue_whose_body_quotes_the_kills_is_not_adopted(self):
         # Every bot-filed body names the job and quotes the evidence block,
@@ -2819,6 +3018,392 @@ class DeadlineKillMessages(RunHarness):
     def test_the_recovery_names_the_kills(self):
         self.assertEqual(post_health.short_cause({"condition": "deadline_kill"}), "runs were being killed at the deadline")
 
+
+
+# --------------------------------------------------------------------------- #
+# The tracking issue's life after it is filed (#3664)
+# --------------------------------------------------------------------------- #
+
+
+def human(number, title, body="", labels=("bug", "Infra")):
+    return {"number": number, "html_url": f"https://github.com/gke-labs/kube-agents/issues/{number}", "title": title, "body": body, "labels": [{"name": name} for name in labels]}
+
+
+def closed(number, at, login="alice"):
+    return {"number": number, "state": "closed", "closed_at": at, "user": {"login": login}}
+
+
+class IssueLifecycle(RunHarness):
+    """Every tick re-reads the carried issues: a closed one is dropped and,
+    while its condition still fires on newer evidence, adopted or filed
+    again; a bot-filed one whose own condition stopped firing is commented
+    on and closed; a human's is commented on and left open."""
+
+    def environ(self):
+        return {post_health.SPACE_ENV: SPACE, post_health.TOKEN_ENV: TOKEN, **GH_ENV}
+
+    def drifting(self, scanned=SCAN_AT):
+        doc = fixture_drift()
+        doc["fixture_state"] = fixture_block(drifted={p: [DRIFT_ROLE] for p in DRIFT_PROJECTS}, scanned=scanned)
+        doc["open_conditions"] = ["fixture_drift"]
+        return doc
+
+    def test_a_closed_issue_is_dropped_and_the_still_firing_condition_files_again(self):
+        self.tick(self.drifting(), T14, environ=self.environ())
+        self.assertEqual(self.recorded()["issue"]["number"], 1300)
+        # A human closed #1300; the next scan (newer than the close) still shows the drift.
+        self.gh.lookups[1300] = closed(1300, "2026-09-14T13:30:00+00:00")
+        rc, err = self.tick(self.drifting(scanned="2026-09-14T14:00:00+00:00"), T14 + timedelta(hours=1), environ=self.environ())
+        self.assertEqual(rc, 0, err)
+        self.assertIn("tracking issue: #1300 is closed; dropped", err)
+        self.assertEqual(self.gh.writes()[-1], ("POST", "repos/gke-labs/kube-agents/issues"), "filed again, without a Chat change")
+        self.assertEqual(len(self.opener.texts), 1, "no message was due")
+        self.assertEqual((self.recorded()["issue"]["number"], [i["number"] for i in self.recorded()["issues"]]), (1301, [1301]))
+
+    def test_a_close_newer_than_the_scan_waits_for_the_next_scan(self):
+        self.tick(self.drifting(), T14, environ=self.environ())
+        self.gh.lookups[1300] = closed(1300, "2026-09-14T13:40:00+00:00")
+        self.tick(self.drifting(), T14 + timedelta(minutes=30), environ=self.environ())
+        self.assertEqual(len(self.gh.writes()), 1, "the scan predates the repair the close claims; nothing filed")
+        self.assertEqual((self.recorded()["issue"], self.recorded()["issues"]), (None, []))
+        # The scan after the close still shows it: filed then.
+        self.tick(self.drifting(scanned="2026-09-14T14:00:00+00:00"), T14 + timedelta(hours=1), environ=self.environ())
+        self.assertEqual(self.gh.writes()[-1], ("POST", "repos/gke-labs/kube-agents/issues"))
+
+    def test_a_closed_issue_for_a_condition_that_stopped_firing_is_not_replaced(self):
+        self.tick(self.drifting(), T14, environ=self.environ())
+        self.gh.lookups[1300] = closed(1300, "2026-09-14T13:30:00+00:00")
+        held = self.drifting(scanned="2026-09-14T14:00:00+00:00")
+        held["open_conditions"] = []
+        self.tick(held, T14 + timedelta(hours=1), environ=self.environ())
+        self.assertEqual(len(self.gh.writes()), 1, "nothing filed")
+        self.assertIsNone(self.recorded()["issue"])
+
+    def test_the_open_issue_naming_the_role_is_adopted_instead_whatever_its_labels(self):
+        self.tick(self.drifting(), T14, environ=self.environ())
+        self.gh.lookups[1300] = closed(1300, "2026-09-14T13:30:00+00:00")
+        self.gh.open_issues = [human(3607, "fleet: seeded-a's default pool has no CPU headroom", body=f"one of the {DRIFT_ROLE} pods has been pending since 03:16Z")]
+        self.tick(self.drifting(scanned="2026-09-14T14:00:00+00:00"), T14 + timedelta(hours=1), environ=self.environ())
+        self.assertEqual(self.gh.writes()[-1], ("POST", "repos/gke-labs/kube-agents/issues/3607/labels"))
+        self.assertEqual(self.gh.calls[-1][2], {"labels": ["presubmit-gate"]})
+        self.assertEqual(self.recorded()["issue"]["number"], 3607)
+
+    def test_a_closed_issue_leaves_the_outage_message(self):
+        self.tick(outage(cases=["a-probe"], prs=(1, 2, 3)), T0, environ=self.environ())
+        self.assertIn("Tracking #1300.", self.opener.texts[0])
+        self.gh.lookups[1300] = closed(1300, "2026-09-04T12:30:00+00:00")
+        # health.py built tracking_issues around the issue it was handed; a case joins.
+        grown = outage(cases=["a-probe", "b-probe"], prs=(1, 2, 3, 4), issues=["#1300"])
+        grown["open_conditions"] = ["shared_break"]
+        self.tick(grown, T0.replace(hour=15), environ=self.environ())
+        change = [text for text in self.opener.texts if text.startswith("🔴")][-1]
+        self.assertIn("Tracking #1301.", change)
+        self.assertNotIn("#1300", change)
+
+    def test_a_closed_outage_issue_waits_for_the_next_change(self):
+        self.tick(outage(cases=["a-probe"], prs=(1, 2, 3)), T0, environ=self.environ())
+        self.gh.lookups[1300] = closed(1300, "2026-09-04T12:30:00+00:00")
+        # A break has no clock of its own: without a change, dropped and not replaced.
+        same = outage(cases=["a-probe"], prs=(1, 2, 3), issues=["#1300"])
+        same["open_conditions"] = ["shared_break"]
+        self.tick(same, T0.replace(hour=12, minute=40), environ=self.environ())
+        self.assertEqual(len(self.gh.writes()), 1, "nothing filed without a change")
+        self.assertEqual((self.recorded()["issue"], self.recorded()["issues"]), (None, []))
+
+    def test_an_unreadable_issue_is_kept(self):
+        self.tick(self.drifting(), T14, environ=self.environ())
+        self.gh.lookups[1300] = {}
+        self.tick(self.drifting(), T14 + timedelta(minutes=30), environ=self.environ())
+        self.assertEqual(len(self.gh.writes()), 1)
+        self.assertEqual(self.recorded()["issue"]["number"], 1300)
+
+    def lost_after_drift(self, open_conditions):
+        self.tick(self.drifting(), T14, environ=self.environ())
+        doc = lost_pods(since="2026-09-14T14:00:00+00:00", window=("2026-09-14T14:00:00+00:00", "2026-09-14T14:10:00+00:00"))
+        doc["fixture_state"] = fixture_block(scanned="2026-09-14T14:00:00+00:00")
+        if open_conditions is not None:
+            doc["open_conditions"] = list(open_conditions)
+        return doc
+
+    def test_a_bot_issue_is_closed_when_its_condition_clears_under_another(self):
+        doc = self.lost_after_drift(["lost_pods", "fixture_drift"])
+        self.tick(doc, T14 + timedelta(hours=1), environ=self.environ())
+        self.assertEqual([i["number"] for i in self.recorded()["issues"]], [1300, 1301], "the drift still fires under the lost nodes: both ride")
+        self.assertEqual([m for m, _ in self.gh.writes()], ["POST", "POST"], "no comment, no close")
+        doc["open_conditions"] = ["lost_pods"]
+        now = T14 + timedelta(hours=2)
+        rc, err = self.tick(doc, now, environ=self.environ())
+        self.assertEqual(rc, 0, err)
+        self.assertIn("tracking issue: #1300's condition fixture_drift cleared; commenting", err)
+        self.assertEqual(self.gh.writes()[-2:], [("POST", "repos/gke-labs/kube-agents/issues/1300/comments"), ("PATCH", "repos/gke-labs/kube-agents/issues/1300")])
+        bodies = [body for _, path, body in self.gh.calls if path.endswith("/1300/comments")]
+        self.assertEqual(bodies, [{"body": f"The fixture drift cleared at {post_health.clock(now, weekday=True)} (health.json no longer shows the condition); closing (filed by the bot; reopen if the cause is still live)."}])
+        self.assertEqual([body for method, _, body in self.gh.calls if method == "PATCH"], [{"state": "closed", "state_reason": "completed"}])
+        self.assertEqual(([i["number"] for i in self.recorded()["issues"]], self.recorded()["issue"]["number"]), ([1301], 1301))
+        self.assertEqual(len(self.opener.texts), 2, "nothing posted to Chat for it")
+
+    def test_a_humans_adopted_issue_gets_the_comment_and_stays_open(self):
+        self.gh.open_issues = [human(1290, f"{DRIFT_ROLE} sits Pending on the fleet again")]
+        self.gh.lookups[1290] = {"number": 1290, "state": "open", "user": {"login": "alice"}}
+        doc = self.lost_after_drift(["lost_pods"])
+        self.tick(doc, T14 + timedelta(hours=1), environ=self.environ())
+        comments = [(m, p) for m, p in self.gh.writes() if p.endswith("/1290/comments")]
+        self.assertEqual(comments, [("POST", "repos/gke-labs/kube-agents/issues/1290/comments")])
+        self.assertNotIn("PATCH", [m for m, _ in self.gh.writes()])
+        self.assertTrue(any(body and body.get("body", "").endswith("bot will not close it.") for _, _, body in self.gh.calls))
+
+    def test_a_health_json_without_open_conditions_closes_nothing(self):
+        self.tick(self.lost_after_drift(None), T14 + timedelta(hours=1), environ=self.environ())
+        self.assertEqual([i["number"] for i in self.recorded()["issues"]], [1300, 1301])
+        self.assertEqual([m for m, _ in self.gh.writes()], ["POST", "POST"])
+
+    def test_at_green_the_recovery_settles_them_not_the_tick(self):
+        doc = self.lost_after_drift(["lost_pods"])
+        doc["open_conditions"] = []
+        doc["state"], doc["condition"], doc["incident"] = "GREEN", None, None
+        self.tick(doc, T14 + timedelta(hours=1), environ=self.environ())
+        self.assertEqual(self.gh.writes()[-2:], [("POST", "repos/gke-labs/kube-agents/issues/1300/comments"), ("PATCH", "repos/gke-labs/kube-agents/issues/1300")])
+        self.assertTrue(self.gh.calls[-2][2]["body"].startswith("Healthy again after"))
+
+    def test_a_feature_request_about_the_deadline_is_not_the_kills_tracker(self):
+        self.gh.open_issues = [human(2873, "feat(ci-health): warn in the smoke gate Chat report when runs get close to the 360-minute deadline", labels=("enhancement", "presubmit-gate"))]
+        self.tick(deadline_kill(), T0.replace(day=22, hour=20, minute=5), environ=self.environ())
+        self.assertEqual(self.gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues")], "filed, not adopted")
+
+    def test_a_nightly_red_issue_naming_the_role_is_never_adopted(self):
+        self.gh.open_issues = [human(1290, f"{DRIFT_ROLE} failed 3 nights", labels=("nightly-red",)), human(1291, "fleet: pods stranded", body=f"{DRIFT_ROLE} Pending")]
+        self.tick(self.drifting(), T14, environ=self.environ())
+        self.assertEqual(self.recorded()["issue"]["number"], 1291)
+        self.assertEqual(self.gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues/1291/labels")])
+
+    def test_a_coverage_gap_issue_naming_the_cases_is_never_adopted(self):
+        body = "<!-- kube-agents-bot:coverage-gap domain=cluster-debugging -->\n" + "\n".join(f"| `{case}` | 21/21 |" for case in TRIO)
+        self.gh.open_issues = [human(1295, "Presubmit coverage: cluster-debugging has no blocking roster seat", body=body, labels=("presubmit-gate", "domain:cluster-debugging"))]
+        self.tick(outage(), T0.replace(day=8, hour=9, minute=5), environ=self.environ())
+        self.assertEqual(self.gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues")], "filed, not adopted")
+
+    def test_a_closed_lost_nodes_issue_is_refiled_only_on_a_later_loss(self):
+        doc = lost_pods()
+        doc["open_conditions"] = ["lost_pods"]
+        self.tick(doc, T0.replace(day=11, hour=14, minute=30), environ=self.environ())
+        self.gh.lookups[1300] = closed(1300, "2026-09-11T14:40:00+00:00")
+        self.tick(doc, T0.replace(day=11, hour=14, minute=50), environ=self.environ())
+        self.assertEqual(len(self.gh.writes()), 1, "no loss after the close; nothing filed")
+        later = lost_pods(window=("2026-09-11T14:05:52+00:00", "2026-09-11T15:00:00+00:00"))
+        later["open_conditions"] = ["lost_pods"]
+        self.tick(later, T0.replace(day=11, hour=15, minute=10), environ=self.environ())
+        self.assertEqual(self.gh.writes()[-1], ("POST", "repos/gke-labs/kube-agents/issues"))
+
+    def test_an_outage_issue_outlives_a_storm_and_is_closed_at_the_recovery(self):
+        self.tick(outage(cases=["a-probe"], since="2026-09-04T09:00:00+00:00", prs=(1, 2, 3)), T0, environ=self.environ())
+        stormy = storm(since="2026-09-04T13:00:00+00:00")
+        stormy["open_conditions"] = ["storm"]
+        self.tick(stormy, T0.replace(hour=13), environ=self.environ())
+        self.assertEqual([i["number"] for i in self.recorded()["issues"]], [1300], "a storm can mask rule 1: the break's issue waits")
+        self.assertEqual(len(self.gh.writes()), 1)
+        self.tick(health(), T0.replace(hour=15, minute=30), environ=self.environ())
+        self.assertEqual(self.gh.writes()[-2:], [("POST", "repos/gke-labs/kube-agents/issues/1300/comments"), ("PATCH", "repos/gke-labs/kube-agents/issues/1300")])
+
+    def test_a_failed_cleared_comment_keeps_the_issue_for_the_next_tick(self):
+        doc = self.lost_after_drift(["lost_pods", "fixture_drift"])
+        self.tick(doc, T14 + timedelta(hours=1), environ=self.environ())
+        doc["open_conditions"] = ["lost_pods"]
+        self.gh.fail_writes = True
+        self.tick(doc, T14 + timedelta(hours=2), environ=self.environ())
+        self.assertEqual([i["number"] for i in self.recorded()["issues"]], [1300, 1301], "kept")
+        self.assertNotIn("PATCH", [m for m, _ in self.gh.writes()], "no close without its comment")
+        self.gh.fail_writes = False
+        self.tick(doc, T14 + timedelta(hours=3), environ=self.environ())
+        self.assertEqual(self.gh.writes()[-2:], [("POST", "repos/gke-labs/kube-agents/issues/1300/comments"), ("PATCH", "repos/gke-labs/kube-agents/issues/1300")])
+        self.assertEqual([i["number"] for i in self.recorded()["issues"]], [1301])
+
+    def test_case_names_in_an_unlabelled_body_are_not_a_tracker_but_a_title_is(self):
+        roster = human(2242, "Faster evals: where presubmit time goes", body="per case: " + ", ".join(TRIO), labels=("needs-triage",))
+        self.gh.open_issues = [roster]
+        self.tick(outage(cases=TRIO), T0, environ=self.environ())
+        self.assertEqual(self.gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues")], "filed; the body of a performance tracker is not adoption")
+        self.setUp()
+        self.gh.open_issues = [roster, human(1278, "Seeded fleet outage: " + ", ".join(TRIO) + " red on every PR", labels=("bug",))]
+        self.tick(outage(cases=TRIO), T0, environ=self.environ())
+        self.assertEqual((self.recorded()["issue"]["number"], self.gh.writes()), (1278, [("POST", "repos/gke-labs/kube-agents/issues/1278/labels")]))
+        # A labelled issue still matches on its body, as before.
+        self.setUp()
+        self.gh.open_issues = [dict(roster, labels=[{"name": "presubmit-gate"}])]
+        self.tick(outage(cases=TRIO), T0, environ=self.environ())
+        self.assertEqual((self.recorded()["issue"]["number"], self.gh.writes()), (2242, []))
+
+    def test_the_recovery_leaves_an_adopted_human_issue_open(self):
+        self.gh.open_issues = [human(1290, f"{DRIFT_ROLE} sits Pending on the fleet again")]
+        self.gh.lookups[1290] = {"number": 1290, "state": "open", "user": {"login": "alice"}}
+        self.tick(self.drifting(), T14, environ=self.environ())
+        green = health("GREEN")
+        green["fixture_state"] = fixture_block()
+        self.tick(green, T14 + timedelta(hours=2), environ=self.environ())
+        self.assertEqual(self.gh.writes()[-1], ("POST", "repos/gke-labs/kube-agents/issues/1290/comments"))
+        self.assertEqual(self.gh.calls[-1][2], {"body": "Healthy again after 2h 30m; bot will not close it."})
+        self.assertNotIn("PATCH", [m for m, _ in self.gh.writes()])
+
+    def test_a_skill_issue_about_the_deadline_is_not_the_kills_tracker(self):
+        self.gh.open_issues = [human(3001, "skill: review-preflight should respect the job deadline", labels=("presubmit-gate",)), human(3003, "health.py: deadline_kill OUTAGE never recovers", labels=("presubmit-gate",)), human(3004, "gate_comment: deadline-kill verdict text is wrong"), human(3002, "Smoke runs killed at the 360-minute deadline again", labels=("presubmit-gate",))]
+        self.tick(deadline_kill(), T0.replace(day=22, hour=20, minute=5), environ=self.environ())
+        self.assertEqual((self.recorded()["issue"]["number"], self.gh.writes()), (3002, []))
+
+    def test_the_episodes_own_fixture_issue_is_not_the_breaks_tracker(self):
+        # The bot's fixture issue quotes the evidence, case lines included,
+        # and carries the label: a body match would adopt it for the break.
+        own = human(1290, "Seeded fleet drift: crashloop-workload out of designed state", body="- " + " failed all graded reps\n- ".join(TRIO), labels=("presubmit-gate",))
+        self.gh.open_issues = [own]
+        self.tick(self.drifting(), T14, environ=self.environ())
+        self.assertEqual(self.recorded()["issue"]["number"], 1290)
+        broken = outage(cases=TRIO, since="2026-09-14T14:00:00+00:00")
+        broken["open_conditions"] = ["shared_break", "fixture_drift"]
+        self.tick(broken, T14 + timedelta(hours=1), environ=self.environ())
+        self.assertEqual(self.gh.writes()[-1], ("POST", "repos/gke-labs/kube-agents/issues"), "a new issue, not #1290 again")
+        self.assertEqual([(i["number"], i["condition"]) for i in self.recorded()["issues"]], [(1290, "fixture_drift"), (1300, "shared_break")])
+
+    def test_a_failed_close_after_its_comment_is_retried(self):
+        doc = self.lost_after_drift(["lost_pods", "fixture_drift"])
+        self.tick(doc, T14 + timedelta(hours=1), environ=self.environ())
+        doc["open_conditions"] = ["lost_pods"]
+        self.gh.fail_patch = True
+        self.tick(doc, T14 + timedelta(hours=2), environ=self.environ())
+        self.assertEqual(self.gh.writes()[-2:], [("POST", "repos/gke-labs/kube-agents/issues/1300/comments"), ("PATCH", "repos/gke-labs/kube-agents/issues/1300")])
+        self.assertEqual([i["number"] for i in self.recorded()["issues"]], [1300, 1301], "kept: the close did not land")
+        self.gh.fail_patch = False
+        self.tick(doc, T14 + timedelta(hours=3), environ=self.environ())
+        self.assertEqual(self.gh.writes()[-2:], [("POST", "repos/gke-labs/kube-agents/issues/1300/comments"), ("PATCH", "repos/gke-labs/kube-agents/issues/1300")])
+        self.assertEqual([i["number"] for i in self.recorded()["issues"]], [1301])
+
+    def test_every_infrastructure_issue_is_closed_when_its_condition_clears(self):
+        firsts = {
+            "lost_pods": (lost_pods(), T0.replace(day=11, hour=14, minute=30), "The lost nodes"),
+            "pool_drift": (pool_drift(), T14, "The pool drift"),
+            "deadline_kill": (deadline_kill(), T0.replace(day=22, hour=20, minute=5), "The deadline kills"),
+        }
+        for condition, (first, at, words) in firsts.items():
+            with self.subTest(condition=condition):
+                self.setUp()
+                first["open_conditions"] = [condition]
+                self.tick(first, at, environ=self.environ())
+                self.assertEqual(self.recorded()["issue"]["condition"], condition)
+                later = storm(since=(at + timedelta(hours=1)).isoformat())
+                later["open_conditions"] = ["storm"]
+                rc, err = self.tick(later, at + timedelta(hours=1, minutes=10), environ=self.environ())
+                self.assertIn(f"tracking issue: #1300's condition {condition} cleared; commenting", err)
+                self.assertEqual(self.gh.writes()[-2:], [("POST", "repos/gke-labs/kube-agents/issues/1300/comments"), ("PATCH", "repos/gke-labs/kube-agents/issues/1300")])
+                self.assertTrue(self.gh.calls[-2][2]["body"].startswith(f"{words} cleared at "), self.gh.calls[-2][2])
+                self.assertEqual(self.recorded()["issues"], [])
+
+    def test_a_closed_pool_or_deadline_issue_is_refiled_only_on_newer_evidence(self):
+        # Pool drift: the scan must be newer than the close.
+        first = pool_drift()
+        first["open_conditions"] = ["pool_drift"]
+        self.tick(first, T14, environ=self.environ())
+        self.gh.lookups[1300] = closed(1300, "2026-09-14T13:30:00+00:00")
+        self.tick(first, T14 + timedelta(minutes=30), environ=self.environ())
+        self.assertEqual(len(self.gh.writes()), 1, "the scan predates the close")
+        rescanned = pool_drift()
+        rescanned["pool_state"] = pool_block(drifted={p: [FINDING] for p in DRIFT_PROJECTS}, scanned="2026-09-14T14:00:00+00:00")
+        rescanned["open_conditions"] = ["pool_drift"]
+        self.tick(rescanned, T14 + timedelta(hours=1), environ=self.environ())
+        self.assertEqual(self.gh.writes()[-1], ("POST", "repos/gke-labs/kube-agents/issues"))
+        # Deadline kills: a kill after the close.
+        self.setUp()
+        first = deadline_kill()
+        first["open_conditions"] = ["deadline_kill"]
+        self.tick(first, T0.replace(day=22, hour=20, minute=5), environ=self.environ())
+        self.gh.lookups[1300] = closed(1300, "2026-09-22T20:10:00+00:00")
+        self.tick(first, T0.replace(day=22, hour=20, minute=15), environ=self.environ())
+        self.assertEqual(len(self.gh.writes()), 1, "no kill after the close")
+        later = deadline_kill(window=("2026-09-22T19:40:00+00:00", "2026-09-22T20:20:00+00:00"))
+        later["open_conditions"] = ["deadline_kill"]
+        self.tick(later, T0.replace(day=22, hour=20, minute=25), environ=self.environ())
+        self.assertEqual(self.gh.writes()[-1], ("POST", "repos/gke-labs/kube-agents/issues"))
+
+    def test_a_closed_issue_gets_no_recovery_comment(self):
+        self.tick(self.drifting(), T14, environ=self.environ())
+        self.gh.lookups[1300] = closed(1300, "2026-09-14T13:40:00+00:00")
+        green = health("GREEN")
+        green["fixture_state"] = fixture_block()
+        rc, err = self.tick(green, T14 + timedelta(hours=2), environ=self.environ())
+        self.assertIn("tracking issue: #1300 is closed; dropped", err)
+        self.assertEqual([path for _, path in self.gh.writes() if "/1300" in path], [])
+        self.assertTrue(self.opener.texts[-1].startswith("🟢"))
+        self.assertNotIn("#1300", self.opener.texts[-1])
+
+    def test_a_dry_run_prints_the_close(self):
+        self.tick(self.drifting(), T14, environ=self.environ())
+        green = health("GREEN")
+        green["fixture_state"] = fixture_block()
+        rc, err = self.tick(green, T14 + timedelta(hours=2), environ={}, dry_run=True)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("would POST repos/gke-labs/kube-agents/issues/1300/comments", err)
+        self.assertIn("would PATCH repos/gke-labs/kube-agents/issues/1300", err)
+        self.assertEqual(len(self.gh.writes()), 1, "nothing written by the dry run")
+
+    def test_a_passing_mention_of_the_role_in_an_unlabelled_body_is_not_the_tracker(self):
+        self.gh.open_issues = [human(3700, "bench: add a second case over the fleet", body=f"the case reads {DRIFT_ROLE} on seeded-b like the first one")]
+        self.tick(self.drifting(), T14, environ=self.environ())
+        self.assertEqual(self.gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues")], "filed; no drift word beside the name")
+
+    def test_an_unreadable_issue_is_neither_settled_nor_dropped(self):
+        # Mid-episode: the condition cleared but the issue could not be read.
+        doc = self.lost_after_drift(["lost_pods", "fixture_drift"])
+        self.tick(doc, T14 + timedelta(hours=1), environ=self.environ())
+        doc["open_conditions"] = ["lost_pods"]
+        self.gh.lookups[1300] = {}
+        self.tick(doc, T14 + timedelta(hours=2), environ=self.environ())
+        self.assertEqual([path for _, path in self.gh.writes() if "/1300" in path], [], "nothing written on a failed read")
+        self.assertEqual([i["number"] for i in self.recorded()["issues"]], [1300, 1301], "kept")
+        # At the recovery: kept past GREEN, retried when readable.
+        green = health("GREEN")
+        green["fixture_state"] = fixture_block()
+        self.tick(green, T14 + timedelta(hours=3), environ=self.environ())
+        self.assertEqual([path for _, path in self.gh.writes() if "/1300" in path], [])
+        self.assertEqual([(i["number"], i["unsettled"]) for i in self.recorded()["issues"]], [(1300, "2h 30m")], "the lost-pods episode began at 14:00Z")
+        del self.gh.lookups[1300]
+        self.tick(green, T14 + timedelta(hours=3, minutes=10), environ=self.environ())
+        self.assertEqual(self.gh.writes()[-2:], [("POST", "repos/gke-labs/kube-agents/issues/1300/comments"), ("PATCH", "repos/gke-labs/kube-agents/issues/1300")])
+        self.assertEqual(self.gh.calls[-2][2]["body"], "Healthy again after 2h 30m; closing (filed by the bot; reopen if the cause is still live).")
+        self.assertEqual(self.recorded()["issues"], [])
+
+    def test_a_failed_close_at_the_recovery_is_retried_and_never_cited(self):
+        self.tick(self.drifting(), T14, environ=self.environ())
+        green = health("GREEN")
+        green["fixture_state"] = fixture_block()
+        self.gh.fail_patch = True
+        self.tick(green, T14 + timedelta(hours=2), environ=self.environ())
+        self.assertEqual([(i["number"], i["unsettled"]) for i in self.recorded()["issues"]], [(1300, "2h 30m")])
+        # A new episode never cites the leftover.
+        self.gh.fail_patch = False
+        again = self.drifting(scanned="2026-09-14T16:00:00+00:00")
+        again["since"] = "2026-09-14T16:00:00+00:00"
+        self.tick(again, T14 + timedelta(hours=3), environ=self.environ())
+        self.assertEqual(self.gh.writes()[-3:-1], [("POST", "repos/gke-labs/kube-agents/issues/1300/comments"), ("PATCH", "repos/gke-labs/kube-agents/issues/1300")], "retried")
+        self.assertEqual(self.gh.writes()[-1], ("POST", "repos/gke-labs/kube-agents/issues"), "the new episode files its own")
+        self.assertEqual([(i["number"] != 1300, i.get("unsettled")) for i in self.recorded()["issues"]], [(True, None)])
+
+    def test_a_closed_issue_is_not_refiled_on_a_blind_or_short_scan(self):
+        self.tick(self.drifting(), T14, environ=self.environ())
+        self.gh.lookups[1300] = closed(1300, "2026-09-14T13:30:00+00:00")
+        for block in (fixture_block(scanned="2026-09-14T14:00:00+00:00", checked=0, unknown=True), fixture_block(drifted={p: [DRIFT_ROLE] for p in DRIFT_PROJECTS}, scanned="2026-09-14T14:00:00+00:00", checked=29)):
+            with self.subTest(block=block):
+                doc = self.drifting()
+                doc["fixture_state"] = block
+                self.tick(doc, T14 + timedelta(hours=1), environ=self.environ())
+                self.assertEqual(len(self.gh.writes()), 1, "no filing on a scan that read nothing or not everything")
+
+    def test_a_failed_label_write_still_adopts(self):
+        self.gh.open_issues = [human(3607, "fleet: seeded-a's default pool has no CPU headroom", body=f"the {DRIFT_ROLE} pods are pending")]
+        self.gh.fail_writes = True
+        self.tick(self.drifting(), T14, environ=self.environ())
+        self.assertEqual(self.recorded()["issue"]["number"], 3607)
+        self.assertEqual(self.gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues/3607/labels")], "the label was tried, nothing filed")
+
+    def test_the_open_issue_list_is_read_once_per_tick(self):
+        self.gh.open_issues = [human(1290, "x", body=f"{DRIFT_ROLE}", labels=("presubmit-gate",))]
+        self.tick(self.drifting(), T14, environ=self.environ())
+        self.assertEqual(sum(1 for m, p, _ in self.gh.calls if m == "GET" and "state=open" in p), 1)
 
 
 if __name__ == "__main__":

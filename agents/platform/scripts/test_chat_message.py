@@ -186,6 +186,15 @@ class ChoicesTest(unittest.TestCase):
         self.assertEqual(chat["choices"], [{"text": "Look at seeded-a", "primary": True}])
         self.assertEqual(chat["detail"], "checked 3\nstop")
 
+    def test_a_report_reply_is_found_by_the_label_as_the_button_spells_it(self):
+        label = "Fix it\n"
+        chat = cm.report_message("h", choices=[label], replies={label: "Fix it: the leak"})
+        self.assertEqual(chat["choices"], [{"text": "Fix it", "reply": "Fix it: the leak", "primary": True}])
+
+    def test_a_report_reply_the_choice_refuses_leaves_the_label(self):
+        chat = cm.report_message("h", choices=["Fix it"], replies={"Fix it": "x" * (cm.REPLY_MAX + 1)})
+        self.assertEqual(chat["choices"], [{"text": "Fix it", "primary": True}])
+
     def test_a_needs_you_reply_names_the_card(self):
         chat = cm.needs_you_message("Which cluster?\n- seeded-a\n- seeded-b", "t_1")
         self.assertEqual(chat["choices"][0], {"text": "seeded-a", "reply": "seeded-a\n\n(Clicked on the question from card t_1.)"})

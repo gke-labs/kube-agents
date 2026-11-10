@@ -12,11 +12,11 @@ metadata:
   {{- $annotations = deepCopy . }}
   {{- end }}
   {{- /*
-    Three keys the operator reads are also derived from chart values, and the value
+    Four keys the operator reads are also derived from chart values, and the value
     wins because it drives the rest of the release too: litellm.networkPolicy is
     the static render gate, telemetry.collectorNamespace the static policy's
-    egress namespace, and litellm.openaiCompatible the static policy's rule to
-    the model server. A platformAgent.annotations entry that disagrees with the
+    egress namespace, litellm.openaiCompatible the static policy's rule to
+    the model server, and the chart's pods (standing plus each workload's rollout surge pods) the session quota's count. A platformAgent.annotations entry that disagrees with the
     value it duplicates fails the render rather than being overwritten in silence.
   */}}
   {{- $litellmPolicyKey := "kubeagents.x-k8s.io/enable-litellm-network-policy" }}
@@ -55,6 +55,33 @@ metadata:
   {{- $_ := set $annotations $upstreamEgressKey $upstreamEgress }}
   {{- end }}
   {{- end }}
+  {{- /*
+    The chart's pods in this namespace, with the surge pods each one's
+    rollout can add (kube-agents.chartQuotaPods), which share the next-mode
+    namespace pod quota with the session pods; the operator sizes that quota's
+    headroom from it (#3848). Stamped on the CR rather than the operator, because
+    the CR is in the namespace those pods run in and the chart renders it even
+    when an operator installed elsewhere reconciles it. Chart-derived like the
+    keys above, so an entry in platformAgent.annotations that disagrees fails.
+  */}}
+  {{- $chartPodsKey := "kubeagents.x-k8s.io/a2a-quota-chart-pods" }}
+  {{- $chartPods := include "kube-agents.chartQuotaPods" $ }}
+  {{- /* The operator discards a count past its cap (a2aMaxChartPods) for its
+         default (a2aDefaultChartPods), which would size the session quota
+         below what the namespace runs; refuse to stamp one rather than let it
+         be dropped. The quota renders only in next mode, so only a next-mode
+         render is refused; as for the quota preflight, the mode is read from
+         the values, and the operator's A2AQuotaChartPodsDiscarded Warning
+         covers a mode set on the PlatformAgent by hand. */}}
+  {{- if and (eq (toString .Values.platformAgent.mode) "next") (gt (int $chartPods) 64) }}
+  {{- fail (printf "the chart would run %s pods at once in this namespace, counting each workload's rollout surge pods, past the operator's cap of 64 for the session quota's chart count (a2aMaxChartPods); the quota would fall back to the default of 5 and refuse pods the release needs. Lower the replica counts or a workload's rollingUpdate.maxSurge, or run some of these components in another namespace." $chartPods) }}
+  {{- end }}
+  {{- with get $annotations $chartPodsKey }}
+  {{- if ne (toString . | trim) $chartPods }}
+  {{- fail (printf "platformAgent.annotations[%q]=%q contradicts the chart's own pods, %s. Drop the annotation; the chart stamps it." $chartPodsKey (toString .) $chartPods) }}
+  {{- end }}
+  {{- end }}
+  {{- $_ := set $annotations $chartPodsKey $chartPods }}
   {{- with $annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
@@ -187,13 +214,59 @@ spec:
     stallWatch:
       {{- $stallWatchFields | nindent 6 }}
     {{- end }}
+    {{- $alertExcludeValues := .Values.platformAgent.harness.eventWatcher | default dict }}
+    {{- /*
+      Rendered only when an install sets a rule: with none the operator
+      renders an empty rules file, so an absent block and an empty list are
+      the same. The same CRD guard as stallWatch's above, one level down:
+      spec.harness.eventWatcher is older than its alertExclude field.
+    */}}
+    {{- if $alertExcludeValues.alertExclude }}
+    {{- $crd := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "platformagents.kubeagents.x-k8s.io" }}
+    {{- if $crd }}
+    {{- $eventWatcherProps := dict }}
+    {{- range $crd.spec.versions }}
+    {{- if .storage }}
+    {{- $eventWatcherProps = dig "schema" "openAPIV3Schema" "properties" "spec" "properties" "harness" "properties" "eventWatcher" "properties" (dict) . }}
+    {{- end }}
+    {{- end }}
+    {{- if not (hasKey $eventWatcherProps "alertExclude") }}
+    {{- fail "platformAgent.harness.eventWatcher.alertExclude is set, but the installed PlatformAgent CRD predates spec.harness.eventWatcher.alertExclude and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/, or run upgrade.sh, which does). Otherwise the API server prunes the rules silently while the release record keeps them" }}
+    {{- end }}
+    {{- end }}
+    eventWatcher:
+      alertExclude:
+        {{- toYaml $alertExcludeValues.alertExclude | nindent 8 }}
+    {{- end }}
+    {{- $retention := .Values.platformAgent.harness.retention | default dict }}
+    {{- /*
+      Rendered only when an install sets sessionDays: the operator renders its own
+      default (defaultSessionRetentionDays) when the block is absent. The same CRD
+      guard as stallWatch's above, for the same reason.
+    */}}
+    {{- if $retention.sessionDays }}
+    {{- $crd := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "platformagents.kubeagents.x-k8s.io" }}
+    {{- if $crd }}
+    {{- $harnessProps := dict }}
+    {{- range $crd.spec.versions }}
+    {{- if .storage }}
+    {{- $harnessProps = dig "schema" "openAPIV3Schema" "properties" "spec" "properties" "harness" "properties" (dict) . }}
+    {{- end }}
+    {{- end }}
+    {{- if not (hasKey $harnessProps "retention") }}
+    {{- fail "platformAgent.harness.retention is set, but the installed PlatformAgent CRD predates spec.harness.retention and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/, or run upgrade.sh, which does). Otherwise the API server prunes the value silently while the release record keeps it" }}
+    {{- end }}
+    {{- end }}
+    retention:
+      sessionDays: {{ $retention.sessionDays }}
+    {{- end }}
     {{- $tuning := deepCopy (.Values.platformAgent.harness.tuning | default dict) }}
     {{- $stockout := (.Values.plugins | default dict).stockoutInvestigator | default dict }}
     {{- if and $stockout.enabled (ne $stockout.applyTuning false) }}
     {{- $defaultStockoutTuning := dict "maxInProgress" 3 "platform" (dict "apiMaxRetries" 8 "maxTurns" 200) "cluster" (dict "apiMaxRetries" 8 "maxTurns" 150) }}
     {{- $tuning = merge $tuning $defaultStockoutTuning }}
     {{- end }}
-    {{- if or (hasKey $tuning "maxInProgress") (hasKey $tuning "maxSessions") $tuning.platform $tuning.cluster $tuning.default }}
+    {{- if or (hasKey $tuning "maxInProgress") (hasKey $tuning "maxSessions") $tuning.platform $tuning.cluster $tuning.default $tuning.profiles $tuning.admission }}
     tuning:
       {{- if hasKey $tuning "maxInProgress" }}
       maxInProgress: {{ $tuning.maxInProgress }}
@@ -213,6 +286,32 @@ spec:
       cluster:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- with $tuning.profiles }}
+      profiles:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $tuning.admission }}
+      {{- /*
+        The same CRD guard as retention's above, one level down: an installed CRD
+        that predates spec.harness.tuning.admission prunes the block silently while
+        the release record keeps it, and the dispatcher runs on the operator's
+        defaults as if nothing had been set.
+      */}}
+      {{- $crd := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "platformagents.kubeagents.x-k8s.io" }}
+      {{- if $crd }}
+      {{- $tuningProps := dict }}
+      {{- range $crd.spec.versions }}
+      {{- if .storage }}
+      {{- $tuningProps = dig "schema" "openAPIV3Schema" "properties" "spec" "properties" "harness" "properties" "tuning" "properties" (dict) . }}
+      {{- end }}
+      {{- end }}
+      {{- if not (hasKey $tuningProps "admission") }}
+      {{- fail "platformAgent.harness.tuning.admission is set, but the installed PlatformAgent CRD predates spec.harness.tuning.admission and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/, or run upgrade.sh, which does). Otherwise the API server prunes the value silently while the release record keeps it" }}
+      {{- end }}
+      {{- end }}
+      admission:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
     {{- end }}
     {{- $sandbox := (.Values.platformAgent.harness.experimental | default dict).shellSandbox | default dict }}
     {{- /*
@@ -225,13 +324,38 @@ spec:
     {{- if and (kindIs "bool" $sandbox.enabled) (not $sandbox.enabled) }}
     {{- fail "platformAgent.harness.experimental.shellSandbox.enabled: false is not supported -- the operator refuses it. Remove the key or set it true." }}
     {{- end }}
-    {{- with include "kube-agents.compactFields" (dict
+    {{- /*
+      The shell container's requests and limits, forwarded to the CR as
+      spec.harness.experimental.shellSandbox.resources. Lean, as the
+      agentAPIAuth block below: the operator and its webhook validate the
+      override (floor-free), so the chart forwards it and guards only the shape
+      it can catch cheaply through the shared check, which the quota preflight
+      calls too. Emitted only when a key is set, through
+      kube-agents.resourcesOverrideQuantities and kube-agents.resourcesOverrideBlock,
+      which hold the leaf, quoting and ordering rules the three sizing overrides
+      share, and behind kube-agents.crdFieldGuard, which fails the upgrade against
+      an installed CRD that predates the field.
+    */}}
+    {{- $sandboxResources := $sandbox.resources | default dict }}
+    {{- include "kube-agents.shellSandboxResourcesCheck" $sandboxResources }}
+    {{- $sandboxQuantities := include "kube-agents.resourcesOverrideQuantities" $sandboxResources | fromJson }}
+    {{- if $sandboxQuantities }}
+    {{- include "kube-agents.crdFieldGuard" (dict "value" "platformAgent.harness.experimental.shellSandbox.resources" "path" (list "harness" "experimental" "shellSandbox") "field" "resources") }}
+    {{- end }}
+    {{- $sandboxFields := include "kube-agents.compactFields" (dict
           "enabled" $sandbox.enabled
           "image" $sandbox.image
           "runtimeClassName" $sandbox.runtimeClassName) }}
+    {{- if or $sandboxFields $sandboxQuantities }}
     experimental:
       shellSandbox:
+        {{- with $sandboxFields }}
         {{- . | nindent 8 }}
+        {{- end }}
+        {{- if $sandboxQuantities }}
+        resources:
+          {{- include "kube-agents.resourcesOverrideBlock" $sandboxQuantities | nindent 10 }}
+        {{- end }}
     {{- end }}
   deployment:
     image: {{ include "kube-agents.imageRepository" (dict "repository" .Values.platformAgent.deployment.image.repository "registry" (include "kube-agents.imageRegistry" .)) | quote }}
@@ -245,6 +369,17 @@ spec:
     */}}
     {{- with (include "kube-agents.imagePullSecrets" .) }}
     {{- . | nindent 4 }}
+    {{- end }}
+    {{- /*
+      The sizing preset, forwarded as spec.deployment.sizingProfile when set.
+      The schema holds the value to the CRD's enum, so the only shape fault
+      left to guard is the one the API server would prune silently: a profile
+      set against an installed CRD that predates the field, through the same
+      guard the three resources overrides use.
+    */}}
+    {{- with .Values.platformAgent.deployment.sizingProfile }}
+    {{- include "kube-agents.crdFieldGuard" (dict "value" "platformAgent.deployment.sizingProfile" "path" (list "deployment") "field" "sizingProfile") }}
+    sizingProfile: {{ . | quote }}
     {{- end }}
     {{- $availability := .Values.platformAgent.deployment.availability | default dict }}
     {{- with include "kube-agents.compactFields" (dict
@@ -263,15 +398,23 @@ spec:
       this agent did not export to.
 
       The daily alert ceilings in deployment.alertDailyLimits come first in the
-      list, as ALERT_DAILY_LIMIT_<KEY>. A key that is not set adds no entry, so
-      a default render has no env. A name that deployment.env also lists is
-      skipped, so the explicit entry wins. The CRD keys env on name, and the
-      API server refuses a duplicate name. A valueFrom entry for a name whose
-      key is set fails the render. The operator forwards only literal values
-      and drops that entry, so the agent would ignore both the entry and the
-      key. The value goes through int64 because Helm reads a number from a
-      values file as float64, and toString writes a large float64 in exponent
-      form, which the daemon cannot read.
+      list, as ALERT_DAILY_LIMIT_<KEY>, then the workload fold window in
+      deployment.incidentWorkloadDedupSeconds as INCIDENT_WORKLOAD_DEDUP_SECONDS.
+      A ceiling that is not set adds no entry; the window defaults to 3600, so a
+      default render carries that one entry, and null leaves it to the
+      operator's own default, which is the same hour. A name that
+      deployment.env also lists is skipped, so the explicit entry wins. The CRD
+      keys env on name, and the API server refuses a duplicate name. A
+      valueFrom entry for a name whose key is set fails the render. The
+      operator forwards only literal values and drops that entry, so the agent
+      would ignore both the entry and the key. The value goes through int64
+      because Helm reads a number from a values file as float64, and toString
+      writes a large float64 in exponent form, which the daemon cannot read.
+
+      deployment.incidentMaxOpenPullRequests follows them as
+      INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS, by the same rules, but only when
+      it is above 0: 0 is no limit, the same as no entry, so it adds nothing to
+      a default render.
     */}}
     {{- $userEnv := .Values.platformAgent.deployment.env | default list }}
     {{- $userEnvNames := dict }}
@@ -292,6 +435,55 @@ spec:
     {{- end }}
     {{- if and (not (kindIs "invalid" $limit)) (not (hasKey $userEnvNames $name)) }}
     {{- $env = append $env (dict "name" $name "value" ($limit | int64 | toString)) }}
+    {{- end }}
+    {{- end }}
+    {{- $dedupName := "INCIDENT_WORKLOAD_DEDUP_SECONDS" }}
+    {{- $dedupSeconds := .Values.platformAgent.deployment.incidentWorkloadDedupSeconds }}
+    {{- if and (not (kindIs "invalid" $dedupSeconds)) (hasKey $userValueFromNames $dedupName) }}
+    {{- fail (printf "platformAgent.deployment.incidentWorkloadDedupSeconds is set, and platformAgent.deployment.env gives %s through valueFrom. The operator forwards only literal values, so it drops that entry and the agent keeps its default. Remove the valueFrom entry or set the key to null." $dedupName) }}
+    {{- end }}
+    {{- if and (not (kindIs "invalid" $dedupSeconds)) (not (hasKey $userEnvNames $dedupName)) }}
+    {{- $env = append $env (dict "name" $dedupName "value" ($dedupSeconds | int64 | toString)) }}
+    {{- end }}
+    {{- $prLimitName := "INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS" }}
+    {{- $prLimit := .Values.platformAgent.deployment.incidentMaxOpenPullRequests }}
+    {{- if and (not (kindIs "invalid" $prLimit)) (gt ($prLimit | int64) 0) }}
+    {{- if hasKey $userValueFromNames $prLimitName }}
+    {{- fail (printf "platformAgent.deployment.incidentMaxOpenPullRequests is set, and platformAgent.deployment.env gives %s through valueFrom. The operator forwards only literal values, so it drops that entry and the agent has no limit. Remove the valueFrom entry or set the key to 0." $prLimitName) }}
+    {{- end }}
+    {{- if not (hasKey $userEnvNames $prLimitName) }}
+    {{- $env = append $env (dict "name" $prLimitName "value" ($prLimit | int64 | toString)) }}
+    {{- end }}
+    {{- end }}
+    {{- /*
+      The event watcher's settings in deployment.eventWatcher come next, as
+      WATCHER_<NAME>. A name that deployment.env also lists is skipped, so the
+      explicit entry wins, a valueFrom entry included: the operator forwards
+      valueFrom to the agent-api-auth container, unlike to the agent container
+      the alert ceilings go to. There deploy/shared/start-services.sh reads
+      each variable and passes it to the watcher as a flag. A number goes
+      through int64 for the reason above; a duration string and a boolean go
+      through toString.
+    */}}
+    {{- $eventWatcher := .Values.platformAgent.deployment.eventWatcher | default dict }}
+    {{- range $setting := list
+          (list "dedupWindow" "WATCHER_DEDUP_WINDOW")
+          (list "backoffMinCount" "WATCHER_BACKOFF_MIN_COUNT")
+          (list "imagePullTransientMinCount" "WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT")
+          (list "failedSchedulingMinCount" "WATCHER_FAILEDSCHEDULING_MIN_COUNT")
+          (list "failedSchedulingMinSpan" "WATCHER_FAILEDSCHEDULING_MIN_SPAN")
+          (list "scaleUpHold" "WATCHER_SCALEUP_HOLD")
+          (list "settle" "WATCHER_SETTLE")
+          (list "quietAfter" "WATCHER_QUIET_AFTER")
+          (list "autopilotScaleToZeroHold" "WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD") }}
+    {{- $key := index $setting 0 }}
+    {{- $name := index $setting 1 }}
+    {{- $setValue := index $eventWatcher $key }}
+    {{- if and (not (kindIs "invalid" $setValue)) (not (hasKey $userEnvNames $name)) }}
+    {{- if or (kindIs "float64" $setValue) (kindIs "int" $setValue) (kindIs "int64" $setValue) }}
+    {{- $setValue = $setValue | int64 }}
+    {{- end }}
+    {{- $env = append $env (dict "name" $name "value" ($setValue | toString)) }}
     {{- end }}
     {{- end }}
     {{- /*
@@ -379,42 +571,49 @@ spec:
       `credentialProxy: {resources: {}}` onto every CR, which an API server
       serving a CRD from before the field prunes silently and a reader mistakes
       for an override. The operator merges what is here over its defaults per
-      key, so a block carrying only limits.memory is complete as written.
-
-      Each quantity is quoted rather than passed through toYaml, for the reason
-      env[].value is above: a values file's `cpu: 1.5` arrives as a float, and
-      the CRD types a quantity as int-or-string, so the API server refuses the
-      bare number. An unset leaf is skipped by kube-agents.compactFields' rule:
-      null (`memory: null`, Helm's way to drop a key) or the empty string, which
-      the CRD's quantity pattern refuses. A map holding nothing else writes no
-      block either.
+      key, so a block carrying only limits.memory is complete as written. The
+      leaf rules (an unset leaf skipped, each quantity trimmed and quoted) are
+      kube-agents.resourcesOverrideQuantities' and kube-agents.resourcesOverrideBlock's,
+      shared with the agentAPIAuth and shellSandbox blocks.
     */}}
-    {{- $proxyQuantities := dict }}
-    {{- range $side := list "limits" "requests" }}
-      {{- $set := dict }}
-      {{- range $name, $quantity := (index $proxyResources $side) | default dict }}
-        {{- if not (or (kindIs "invalid" $quantity) (and (kindIs "string" $quantity) (eq $quantity ""))) }}
-          {{- $_ := set $set $name $quantity }}
-        {{- end }}
-      {{- end }}
-      {{- if $set }}
-        {{- $_ := set $proxyQuantities $side $set }}
-      {{- end }}
-    {{- end }}
-    {{- $proxyDefaults := include "kube-agents.credentialProxyDefaults" . | fromJson }}
+    {{- $proxyQuantities := include "kube-agents.resourcesOverrideQuantities" $proxyResources | fromJson }}
+    {{- /* The row the override merges over is the sizing profile's
+           (kube-agents.credentialProxyRow): the defaults under small, unset and
+           auto, so a pair valid on the chosen row is not refused against the
+           small one, as the operator admits it. A request set without its limit
+           is checked against the ceiling row's limit
+           (kube-agents.credentialProxyCeilingRow): the same row, and under auto
+           the fleet row, since the operator renders the latched tier, which the
+           chart cannot read, and a request under the fleet row's limit is one
+           the webhook admits at a latch that has reached it. */}}
+    {{- $proxyDefaults := include "kube-agents.credentialProxyRow" . | fromJson }}
+    {{- $proxyCeiling := include "kube-agents.credentialProxyCeilingRow" . | fromJson }}
+    {{- $proxyAuto := eq (((.Values.platformAgent.deployment | default dict).sizingProfile) | default "") "auto" }}
     {{- $proxyFloor := include "kube-agents.credentialProxyMemoryFloorBytes" . | int64 }}
     {{- $proxyMerged := dict "requests" (dict) "limits" (dict) }}
-    {{- $proxyRendered := dict "requests" (dict) "limits" (dict) }}
     {{- range $side := list "requests" "limits" }}
       {{- range $name, $raw := index $proxyDefaults $side }}
         {{- $_ := set (index $proxyMerged $side) $name $raw }}
       {{- end }}
     {{- end }}
     {{- range $side, $set := $proxyQuantities }}
-      {{- range $name, $quantity := $set }}
-        {{- $raw := toString $quantity | trim }}
+      {{- range $name, $raw := $set }}
         {{- $_ := set (index $proxyMerged $side) $name $raw }}
-        {{- $_ := set (index $proxyRendered $side) $name $raw }}
+      {{- end }}
+    {{- end }}
+    {{- /* A cpu or memory limit set without its request, below the default request, takes the
+           request down with it, as resolveCredentialProxyResources does in the operator, so the
+           render admits what the operator admits rather than refusing a crossed pair. */}}
+    {{- range $name := list "cpu" "memory" }}
+      {{- $setLimit := hasKey ((index $proxyQuantities "limits") | default dict) $name }}
+      {{- $setRequest := hasKey ((index $proxyQuantities "requests") | default dict) $name }}
+      {{- if and $setLimit (not $setRequest) }}
+        {{- $isCpu := eq $name "cpu" }}
+        {{- $lim := include "kube-agents.quantityExact" (dict "raw" (index $proxyMerged.limits $name) "cpu" $isCpu "key" (printf "%s.limits.%s" $proxyPrefix $name)) | float64 }}
+        {{- $req := include "kube-agents.quantityExact" (dict "raw" (index $proxyMerged.requests $name) "cpu" $isCpu "key" (printf "%s.requests.%s" $proxyPrefix $name)) | float64 }}
+        {{- if and (gt $lim 0.0) (lt $lim $req) }}
+          {{- $_ := set $proxyMerged.requests $name (index $proxyMerged.limits $name) }}
+        {{- end }}
       {{- end }}
     {{- end }}
     {{- if $proxyQuantities }}
@@ -443,54 +642,50 @@ spec:
     {{- range $name, $rawRequest := $proxyMerged.requests }}
       {{- if hasKey $proxyMerged.limits $name }}
       {{- $isCpu := eq $name "cpu" }}
-      {{- $request := include "kube-agents.quantityExact" (dict "raw" $rawRequest "cpu" $isCpu "key" (printf "%s.requests.%s" $proxyPrefix $name)) | float64 }}
-      {{- $limit := include "kube-agents.quantityExact" (dict "raw" (index $proxyMerged.limits $name) "cpu" $isCpu "key" (printf "%s.limits.%s" $proxyPrefix $name)) | float64 }}
-      {{- if gt $request $limit }}
       {{- $setRequest := hasKey ((index $proxyQuantities "requests") | default dict) $name }}
       {{- $setLimit := hasKey ((index $proxyQuantities "limits") | default dict) $name }}
-      {{- $req := index $proxyMerged.requests $name }}
       {{- $lim := index $proxyMerged.limits $name }}
+      {{- if not $setLimit }}
+      {{- $lim = index $proxyCeiling.limits $name }}
+      {{- end }}
+      {{- $request := include "kube-agents.quantityExact" (dict "raw" $rawRequest "cpu" $isCpu "key" (printf "%s.requests.%s" $proxyPrefix $name)) | float64 }}
+      {{- $limit := include "kube-agents.quantityExact" (dict "raw" $lim "cpu" $isCpu "key" (printf "%s.limits.%s" $proxyPrefix $name)) | float64 }}
+      {{- if gt $request $limit }}
+      {{- $req := index $proxyMerged.requests $name }}
       {{- if and $setRequest $setLimit }}
       {{- fail (printf "%s.requests.%s (%s) exceeds limits.%s (%s); a request above its limit is refused by the API server, and by the operator" $proxyPrefix $name $req $name $lim) }}
-      {{- else if $setRequest }}
-      {{- fail (printf "%s.requests.%s (%s) exceeds the operator's default limits.%s (%s), which the override does not raise; set limits.%s as well" $proxyPrefix $name $req $name $lim $name) }}
+      {{- else if $proxyAuto }}
+      {{- fail (printf "%s.requests.%s (%s) exceeds the fleet row's limits.%s (%s), the highest row auto reaches, which the override does not raise; set limits.%s as well" $proxyPrefix $name $req $name $lim $name) }}
       {{- else }}
-      {{- fail (printf "%s.limits.%s (%s) is below the operator's default requests.%s (%s), which the override does not lower; set requests.%s as well" $proxyPrefix $name $lim $name $req $name) }}
+      {{- fail (printf "%s.requests.%s (%s) exceeds the sizing profile row's limits.%s (%s), which the override does not raise; set limits.%s as well" $proxyPrefix $name $req $name $lim $name) }}
       {{- end }}
       {{- end }}
       {{- end }}
     {{- end }}
     {{- end }}
     {{- /*
-      The same CRD guard as the scoped pool's below, for the same reason:
-      `helm upgrade` never applies crds/, and an API server serving a CRD from
-      before spec.deployment.credentialProxy admits the CR with the block
-      pruned. The proxy keeps the operator's defaults while the release record
-      carries the override, and nothing says so. `lookup` is empty under
-      `helm template`, so the guard fires only against a live install.
+      The exec tier's replica count, forwarded as
+      spec.deployment.credentialProxy.exec.replicas when above 0. Written only
+      then, for the reason the resources block is: 0 is the operator's default,
+      and an empty block on every CR is noise a reader takes for a setting.
     */}}
+    {{- $execReplicas := dig "exec" "replicas" 0 (.Values.platformAgent.deployment.credentialProxy | default dict) | int }}
     {{- if $proxyQuantities }}
-    {{- $crd := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "platformagents.kubeagents.x-k8s.io" }}
-    {{- if $crd }}
-    {{- $deploymentProps := dict }}
-    {{- range $crd.spec.versions }}
-    {{- if .storage }}
-    {{- $deploymentProps = dig "schema" "openAPIV3Schema" "properties" "spec" "properties" "deployment" "properties" (dict) . }}
+    {{- include "kube-agents.crdFieldGuard" (dict "value" "platformAgent.deployment.credentialProxy.resources" "path" (list "deployment" "credentialProxy") "field" "resources") }}
     {{- end }}
+    {{- if gt $execReplicas 0 }}
+    {{- include "kube-agents.crdFieldGuard" (dict "value" "platformAgent.deployment.credentialProxy.exec.replicas" "path" (list "deployment" "credentialProxy") "field" "exec") }}
     {{- end }}
-    {{- if not (hasKey $deploymentProps "credentialProxy") }}
-    {{- fail "platformAgent.deployment.credentialProxy.resources is set, but the installed PlatformAgent CRD predates spec.deployment.credentialProxy and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/, or run upgrade.sh, which does). Otherwise the API server prunes the value silently while the release record keeps it" }}
-    {{- end }}
-    {{- end }}
+    {{- if or $proxyQuantities (gt $execReplicas 0) }}
     credentialProxy:
+      {{- if $proxyQuantities }}
       resources:
-        {{- range $side := keys $proxyQuantities | sortAlpha }}
-        {{ $side }}:
-          {{- $set := index $proxyRendered $side }}
-          {{- range $name := keys $set | sortAlpha }}
-          {{ $name }}: {{ index $set $name | quote }}
-          {{- end }}
-        {{- end }}
+        {{- include "kube-agents.resourcesOverrideBlock" $proxyQuantities | nindent 8 }}
+      {{- end }}
+      {{- if gt $execReplicas 0 }}
+      exec:
+        replicas: {{ $execReplicas }}
+      {{- end }}
     {{- end }}
     {{- /*
       The agent-api-auth sidecar's requests and limits, forwarded to the CR as
@@ -499,8 +694,7 @@ spec:
       admission count from the limit), so the chart forwards it and guards only
       the shape it can catch cheaply — an override set against a CRD that predates
       the field, which the API server would prune silently. Emitted only when a
-      key is set, each quantity quoted, for the reasons the credentialProxy block
-      above gives.
+      key is set, through the same helpers as the credentialProxy block above.
     */}}
     {{- $apiAuthResources := ((.Values.platformAgent.deployment.agentAPIAuth | default dict).resources) | default dict }}
     {{- /* Shape and grammar check, shared with the quota preflight so a mistyped side
@@ -509,43 +703,12 @@ spec:
            operator as garbage. The floor and crossed-pair checks stay the operator's
            and the webhook's. */}}
     {{- include "kube-agents.agentAPIAuthResourcesCheck" $apiAuthResources }}
-    {{- $apiAuthQuantities := dict }}
-    {{- range $side := list "limits" "requests" }}
-      {{- $set := dict }}
-      {{- range $name, $quantity := (index $apiAuthResources $side) | default dict }}
-        {{- if not (or (kindIs "invalid" $quantity) (and (kindIs "string" $quantity) (eq $quantity ""))) }}
-          {{- /* Trimmed as the check validated it and the proxy block emits it, so a
-                 value with surrounding whitespace is not emitted raw for the API server
-                 to refuse against the CRD's no-whitespace quantity pattern. */}}
-          {{- $_ := set $set $name (toString $quantity | trim) }}
-        {{- end }}
-      {{- end }}
-      {{- if $set }}
-        {{- $_ := set $apiAuthQuantities $side $set }}
-      {{- end }}
-    {{- end }}
+    {{- $apiAuthQuantities := include "kube-agents.resourcesOverrideQuantities" $apiAuthResources | fromJson }}
     {{- if $apiAuthQuantities }}
-    {{- $apiAuthCrd := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "platformagents.kubeagents.x-k8s.io" }}
-    {{- if $apiAuthCrd }}
-    {{- $apiAuthDeploymentProps := dict }}
-    {{- range $apiAuthCrd.spec.versions }}
-    {{- if .storage }}
-    {{- $apiAuthDeploymentProps = dig "schema" "openAPIV3Schema" "properties" "spec" "properties" "deployment" "properties" (dict) . }}
-    {{- end }}
-    {{- end }}
-    {{- if not (hasKey $apiAuthDeploymentProps "agentAPIAuth") }}
-    {{- fail "platformAgent.deployment.agentAPIAuth.resources is set, but the installed PlatformAgent CRD predates spec.deployment.agentAPIAuth and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/, or run upgrade.sh, which does). Otherwise the API server prunes the value silently while the release record keeps it" }}
-    {{- end }}
-    {{- end }}
+    {{- include "kube-agents.crdFieldGuard" (dict "value" "platformAgent.deployment.agentAPIAuth.resources" "path" (list "deployment" "agentAPIAuth") "field" "resources") }}
     agentAPIAuth:
       resources:
-        {{- range $side := keys $apiAuthQuantities | sortAlpha }}
-        {{ $side }}:
-          {{- $set := index $apiAuthQuantities $side }}
-          {{- range $name := keys $set | sortAlpha }}
-          {{ $name }}: {{ index $set $name | quote }}
-          {{- end }}
-        {{- end }}
+        {{- include "kube-agents.resourcesOverrideBlock" $apiAuthQuantities | nindent 8 }}
     {{- end }}
   security:
     serviceAccountName: {{ .Values.platformAgent.security.serviceAccountName | quote }}
@@ -662,9 +825,16 @@ spec:
     what leaves the operator free to discover a collector; an explicit "" would look like
     a decision the chart made.
   */}}
-  {{- with .Values.telemetry.otlpEndpoint }}
+  {{- $peopleSeenOff := eq (toString (.Values.platformAgent.telemetry | default dict).peopleSeen) "false" }}
+  {{- if or .Values.telemetry.otlpEndpoint $peopleSeenOff }}
   telemetry:
+    {{- with .Values.telemetry.otlpEndpoint }}
     otlpEndpoint: {{ . | quote }}
+    {{- end }}
+    {{- if $peopleSeenOff }}
+    {{- include "kube-agents.crdFieldGuard" (dict "value" "platformAgent.telemetry.peopleSeen" "path" (list "telemetry") "field" "peopleSeen") }}
+    peopleSeen: false
+    {{- end }}
   {{- end }}
   {{- with .Values.platformAgent.networkPolicy }}
   networkPolicy:
@@ -773,6 +943,9 @@ spec:
   {{- if and (has "gitlab" (splitList "," $providers)) (not (has "gitlab" $enum)) }}
   {{- fail "platformAgent.integration.forges declares a gitlab forge, but the installed PlatformAgent CRD does not accept provider gitlab, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/)" }}
   {{- end }}
+  {{- if and (has "gitea" (splitList "," $providers)) (not (has "gitea" $enum)) }}
+  {{- fail "platformAgent.integration.forges declares a gitea forge, but the installed PlatformAgent CRD does not accept provider gitea, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/)" }}
+  {{- end }}
   {{- /* The same for caBundleRef: a CRD that prunes it leaves the forge's certificate untrusted, with nothing to say why. */}}
   {{- $caBundled := false }}
   {{- range $forges }}
@@ -816,6 +989,12 @@ spec:
         provider: {{ .provider | default "github" | quote }}
         {{- with .host }}
         host: {{ . | quote }}
+        {{- end }}
+        {{- with .scheme }}
+        scheme: {{ . | quote }}
+        {{- end }}
+        {{- with .port }}
+        port: {{ . | int }}
         {{- end }}
         {{- with .namespace }}
         namespace: {{ . | quote }}
@@ -871,19 +1050,22 @@ spec:
       {{- with $integ.googleChat.homeChannel }}
       homeChannel: {{ . | quote }}
       {{- end }}
+      {{- if eq (toString $integ.googleChat.answerFeedback) "false" }}
+      answerFeedback: false
+      {{- end }}
       mode: {{ $integ.googleChat.mode | default "default" | quote }}
     {{- end }}
     {{- if $integ.slack.enabled }}
     slack:
       enabled: true
       # The CRD requires both token refs when Slack is enabled; they point
-      # into the credentials Secret by convention.
+      # into the credentials Secret by default unless custom refs are provided.
       botTokenSecretRef:
-        name: {{ .Values.platformAgent.credentials.secretName | quote }}
-        key: SLACK_BOT_TOKEN
+        name: {{ (dig "botTokenSecretRef" "name" "" $integ.slack) | default .Values.platformAgent.credentials.secretName | quote }}
+        key: {{ (dig "botTokenSecretRef" "key" "" $integ.slack) | default "SLACK_BOT_TOKEN" | quote }}
       appTokenSecretRef:
-        name: {{ .Values.platformAgent.credentials.secretName | quote }}
-        key: SLACK_APP_TOKEN
+        name: {{ (dig "appTokenSecretRef" "name" "" $integ.slack) | default .Values.platformAgent.credentials.secretName | quote }}
+        key: {{ (dig "appTokenSecretRef" "key" "" $integ.slack) | default "SLACK_APP_TOKEN" | quote }}
       {{- with $integ.slack.allowedUsers }}
       allowedUsers:
         {{- toYaml . | nindent 8 }}
@@ -894,16 +1076,34 @@ spec:
       {{- with $integ.slack.homeChannelName }}
       homeChannelName: {{ . | quote }}
       {{- end }}
+      {{- if eq (toString $integ.slack.answerFeedback) "false" }}
+      answerFeedback: false
+      {{- end }}
+      {{- with $integ.slack.homeChannelPolicy }}
+      {{- $policyCRD := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "platformagents.kubeagents.x-k8s.io" }}
+      {{- if $policyCRD }}
+      {{- $slackProps := dict }}
+      {{- range $policyCRD.spec.versions }}
+      {{- if eq .name "v1alpha1" }}
+      {{- $slackProps = dig "schema" "openAPIV3Schema" "properties" "spec" "properties" "integration" "properties" "slack" "properties" (dict) . }}
+      {{- end }}
+      {{- end }}
+      {{- if not (hasKey $slackProps "homeChannelPolicy") }}
+      {{- fail "platformAgent.integration.slack.homeChannelPolicy needs a PlatformAgent CRD that has spec.integration.slack.homeChannelPolicy, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/, or run upgrade.sh, which does). Otherwise the API server prunes the value silently while the release record keeps it" }}
+      {{- end }}
+      {{- end }}
+      homeChannelPolicy: {{ . | quote }}
+      {{- end }}
     {{- end }}
     {{- if $integ.teams.enabled }}
     teams:
       enabled: true
       appIdSecretRef:
-        name: {{ .Values.platformAgent.credentials.secretName | quote }}
-        key: TEAMS_APP_ID
+        name: {{ (dig "appIdSecretRef" "name" "" $integ.teams) | default .Values.platformAgent.credentials.secretName | quote }}
+        key: {{ (dig "appIdSecretRef" "key" "" $integ.teams) | default "TEAMS_APP_ID" | quote }}
       appPasswordSecretRef:
-        name: {{ .Values.platformAgent.credentials.secretName | quote }}
-        key: TEAMS_APP_PASSWORD
+        name: {{ (dig "appPasswordSecretRef" "name" "" $integ.teams) | default .Values.platformAgent.credentials.secretName | quote }}
+        key: {{ (dig "appPasswordSecretRef" "key" "" $integ.teams) | default "TEAMS_APP_PASSWORD" | quote }}
       {{- with $integ.teams.tenantId }}
       tenantId: {{ . | quote }}
       {{- end }}
@@ -916,9 +1116,6 @@ spec:
       {{- end }}
       {{- with $integ.teams.homeChannel }}
       homeChannel: {{ . | quote }}
-      {{- end }}
-      {{- with $integ.teams.serviceUrl }}
-      serviceUrl: {{ . | quote }}
       {{- end }}
       {{- if hasKey $integ.teams "adaptiveCards" }}
       adaptiveCards: {{ $integ.teams.adaptiveCards }}

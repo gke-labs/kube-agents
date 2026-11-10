@@ -8,12 +8,17 @@ case a `api_command(...) -> argv` interface would have quietly ruled out.
 
 The neutral request is:
 
-    api(method, path, *, params=None, body=None, raw=None) -> Any
+    api(method, path, *, params=None, body=None, raw=None, with_headers=False) -> Any
 
 `params` is a dict rather than something a verb formats into the path, because
 a dict is what gets URL-encoded; `f"...?state={state}"` does not. `raw` names a
 media type rather than smuggling one through as a header, so a transport with
-no notion of headers can still honour it.
+no notion of headers can still honour it. `with_headers` asks for the answer's
+headers as well, `(payload, headers)` with lower-case names, for a forge that
+counts a listing in a header; only the HTTP transport has them. The HTTP
+transport also keeps the request quota the latest answer reported, read by the
+forge's own `quota_from_headers`, and answers it from `quota()`; the CLI
+transport sees no headers and answers None, unknown.
 
 What a transport owns, and no forge may:
 
@@ -43,6 +48,7 @@ from urllib.parse import urlencode
 
 from workspace_paths import WorkspaceError
 
+from .base import ForgeUnsupported, QuotaReading
 from .errors import (
     Guidance,
     Override,
@@ -83,6 +89,7 @@ class Transport(Protocol):
         params: Mapping[str, Any] | None = None,
         body: Mapping[str, Any] | None = None,
         raw: str | None = None,
+        with_headers: bool = False,
     ) -> Any: ...
 
     def whoami(self) -> str:
@@ -150,7 +157,15 @@ class CliTransport:
         params: Mapping[str, Any] | None = None,
         body: Mapping[str, Any] | None = None,
         raw: str | None = None,
+        with_headers: bool = False,
     ) -> Any:
+        if with_headers:
+            # `<cli> api` prints the body alone, so the headers a count is read
+            # from never reach this side. Refused before anything runs.
+            raise ForgeUnsupported(
+                f"the `{self._executable}` CLI transport cannot answer `with-headers`; "
+                "a call that reads response headers needs the HTTP transport"
+            )
         argv = [self._executable, "api", "--method", method, _with_query(path, params)]
         if raw:
             argv += ["-H", f"Accept: {raw}"]
@@ -206,6 +221,10 @@ class CliTransport:
             )
         found = _CLI_LOGIN_RE.search(f"{done.stdout or ''}\n{done.stderr or ''}")
         return found.group(1).strip() if found else ""
+
+    def quota(self) -> QuotaReading | None:
+        """Always unknown: `<cli> api` prints the body alone, never the headers."""
+        return None
 
     def _failure(self, stderr: str, stdout: str = "", default: int = 0) -> WorkspaceError:
         """The forge's refusal, with the reason it actually gave as the detail.
@@ -481,6 +500,13 @@ class HttpTransport:
     `whoami_route` is the forge's "current user" route and the field that
     names the login, or None when it has none -- in which case `whoami` says
     so with "" rather than guessing.
+
+    `quota_from_headers` is the forge's reader of its quota headers
+    (`Forge.quota_from_headers`), handed in as `whoami_route` is. Every
+    answer, a refusal included, is read through it, and the latest reading it
+    gave is what `quota()` answers; an answer it reads nothing from, or no
+    `remaining` from, keeps the one before, so a search answer does not erase
+    the `core` reading.
     """
 
     def __init__(
@@ -497,9 +523,14 @@ class HttpTransport:
         ca_file: str = "",
         ca_source: str = "",
         whoami_graphql: str = "",
+        allow_http: bool = False,
+        quota_from_headers: Callable[[Mapping[str, Any]], QuotaReading | None] | None = None,
     ) -> None:
-        if not base_url.startswith("https://"):
+        allowed_schemes = ("https://", "http://") if allow_http else ("https://",)
+        if not base_url.startswith(allowed_schemes):
             raise ValueError("a forge API is reached over https only")
+        if ca_file and base_url.startswith("http://"):
+            raise ValueError("a forge over http cannot use a ca_file")
         self._base = base_url.rstrip("/")
         self._host = self._base.split("://", 1)[1].split("/", 1)[0]
         # A GraphQL endpoint that answers `viewer { login }`, for a forge whose
@@ -520,6 +551,8 @@ class HttpTransport:
         self._whoami_route = whoami_route
         self._outer_deadline = outer_deadline
         self._opener = opener
+        self._quota_from_headers = quota_from_headers
+        self._quota: QuotaReading | None = None
         # Built once for the transport's life when no CA file is named, as
         # before CA files existed; only a forge that names one builds per
         # call, so a remounted file is the next call's trust.
@@ -555,6 +588,7 @@ class HttpTransport:
         params: Mapping[str, Any] | None = None,
         body: Mapping[str, Any] | None = None,
         raw: str | None = None,
+        with_headers: bool = False,
     ) -> Any:
         # A forge composes paths from validated segments; this is the backstop
         # that keeps one from naming its own host or climbing out of the API
@@ -567,7 +601,7 @@ class HttpTransport:
                 code="FORGE_CALL_FAILED",
             )
         url = f"{self._base}/{_with_query(path, params).lstrip('/')}"
-        return self._call(method, url, body=body, raw=raw)
+        return self._call(method, url, body=body, raw=raw, with_headers=with_headers)
 
     def _call(
         self,
@@ -576,8 +610,14 @@ class HttpTransport:
         *,
         body: Mapping[str, Any] | None = None,
         raw: str | None = None,
+        with_headers: bool = False,
     ) -> Any:
-        """One authenticated request to `url`, which the caller composed and checked."""
+        """One authenticated request to `url`, which the caller composed and checked.
+
+        With `with_headers`, `(payload, headers)`, the header names in lower
+        case: HTTP names are case-blind, and a forge reads its count by one
+        spelling.
+        """
         data = None if body is None else json.dumps(body).encode("utf-8")
         request = urllib.request.Request(url, data=data, method=method)
         request.add_header("Accept", raw or "application/json")
@@ -623,7 +663,12 @@ class HttpTransport:
         try:
             with self._open(request, timeout=socket_timeout) as response:
                 payload = self._read_within(response, deadline, slow=slow)
+                received = getattr(response, "headers", None) or {}
+                headers = {str(name).lower(): value for name, value in received.items()}
         except urllib.error.HTTPError as exc:
+            # A refusal carries the quota too, and a throttled one is the
+            # answer that says when the quota comes back.
+            self._note_quota(getattr(exc, "headers", None) or {})
             return self._refused(exc.code, self._error_text(exc, deadline))
         except WorkspaceError:
             raise
@@ -653,17 +698,38 @@ class HttpTransport:
             # request and then stopped, which is an answer broken off, not a
             # forge that could not be reached.
             raise forge_error(0, _broken_answer(exc)) from exc
+        self._note_quota(headers)
         text = payload.decode("utf-8", "replace")
         if raw:
-            return text
+            parsed: Any = text
+        else:
+            try:
+                parsed = json.loads(text or "null")
+            except (json.JSONDecodeError, RecursionError) as exc:
+                raise WorkspaceError(
+                    "the forge returned something that is not JSON",
+                    status=502,
+                    code="FORGE_CALL_FAILED",
+                ) from exc
+        return (parsed, headers) if with_headers else parsed
+
+    def quota(self) -> QuotaReading | None:
+        """The request quota the latest answer that reported one reported, or
+        None when none has (or the forge reads no quota headers)."""
+        return self._quota
+
+    def _note_quota(self, received: Any) -> None:
+        if self._quota_from_headers is None:
+            return
         try:
-            return json.loads(text or "null")
-        except (json.JSONDecodeError, RecursionError) as exc:
-            raise WorkspaceError(
-                "the forge returned something that is not JSON",
-                status=502,
-                code="FORGE_CALL_FAILED",
-            ) from exc
+            headers = {str(name).lower(): value for name, value in received.items()}
+            reading = self._quota_from_headers(headers)
+        except Exception:  # noqa: BLE001 -- a quota reading never fails the call it rode on
+            return
+        # A reading that says nothing of what remains would only erase a
+        # good one; the previous reading stands.
+        if isinstance(reading, QuotaReading) and reading.remaining is not None:
+            self._quota = reading
 
     def _error_text(self, exc: urllib.error.HTTPError, deadline: float) -> str:
         """What a refusal said, read under the same deadline as an answer.

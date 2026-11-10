@@ -40,7 +40,8 @@ at import (``cron/executions.py`` binds ``EXECUTIONS_FILE`` when it loads). A
 fresh process is the only way to get all of them pointing at one profile, and
 it is the same path ``hermes cron tick`` takes for a manual tick — so a job
 fires through the identical execute → save → deliver → mark body the gateway
-ticker uses, with the profile's own persona, toolsets and ``max_turns``.
+ticker uses, with the profile's own persona and toolsets and the entry's own
+``skills``, ``model`` and ``max_turns``.
 
 Correctness comes from ``tick()`` itself, not from bookkeeping here:
 
@@ -61,8 +62,22 @@ interpreter is worth it, never whether a job runs, and it errs towards
 spawning: a spurious tick is a no-op, a missed one is the bug this exists to
 fix.
 
+Two policies change a store before Hermes reads it, both under Hermes' own
+store lock and before the filter above looks, and both by moving a model-run
+job's ``next_run_at``, the one lever Hermes itself reads (skipping an id here
+would hold nothing, because the ``no_agent`` entries keep every tick spawning
+and Hermes fires whatever is due). The idle policy in ``cron_idle_policy.py``
+runs first: on an install nobody has messaged for a week or more it moves
+due model-run jobs out of reach. The catch-up policy in
+``cron_catch_up_policy.py`` runs over what is still due: after a pause it
+skips a catch-up that is a whole period late and spaces the rest out, so an
+install back from two days at ``scaleToZero`` does not start every
+whole-estate audit in its first tick. A fault in either is one line in the
+output and the tick goes on as before.
+
 Output is empty on a quiet minute (``deliver: local`` plus empty stdout is a
-silent run). It speaks only when a tick was dispatched, and exits non-zero if
+silent run). It speaks only when a tick was dispatched or a policy held,
+skipped, deferred or released a job, and exits non-zero if
 one failed to start or came back non-zero within
 :data:`DEFAULT_BUDGET_SECONDS` — so a broken ticker shows up as a failed cron
 run instead of reproducing the silence it was written to end. A tick still
@@ -447,17 +462,52 @@ def _summarise(due: list[str]) -> str:
     return f"{head}, +{extra} more" if extra > 0 else head
 
 
+def idle_policy_lines(home: Path, now: datetime) -> list[str]:
+    """Run the idle policy over every named profile; its report, never a raise.
+
+    Imported here rather than at the top so a policy module that cannot load
+    (a missing sibling in a hand-built image) costs one line per tick and not
+    the schedule it exists to thin.
+    """
+    try:
+        import cron_idle_policy
+
+        return cron_idle_policy.apply(home, now)
+    except Exception as exc:
+        return [f"cron idle policy skipped: {type(exc).__name__}: {exc}"]
+
+
+def catch_up_policy_lines(home: Path, now: datetime) -> list[str]:
+    """Run the catch-up policy over every named profile; its report, never a raise.
+
+    After the idle policy on purpose: a job the idle policy has held is no
+    longer due, so this policy neither skips nor defers it.
+    """
+    try:
+        import cron_catch_up_policy
+
+        return cron_catch_up_policy.apply(home, now)
+    except Exception as exc:
+        return [f"cron catch-up policy skipped: {type(exc).__name__}: {exc}"]
+
+
 def main() -> int:
     now = datetime.now(timezone.utc)
+    lines = idle_policy_lines(hermes_home(), now)
+    lines.extend(catch_up_policy_lines(hermes_home(), now))
     work = profiles_with_due_jobs(hermes_home(), now)
     if not work:
-        return 0  # quiet minute: no output, silent run
+        if lines:
+            print("\n".join(lines))
+        return 0  # quiet minute: silent unless a policy moved something
 
     try:
         binary = hermes_bin()
     except FileNotFoundError as exc:
         names = ", ".join(profile.name for profile, _ in work)
-        print(f"cannot tick {names}: {exc}")
+        # The policies have already written their holds and skips; this
+        # run's output is the only place they are reported.
+        print("\n".join([*lines, f"cannot tick {names}: {exc}"]))
         return 1
 
     # Read once: every child gets the same home target, and re-parsing the
@@ -465,7 +515,6 @@ def main() -> int:
     home_env = home_target_env(hermes_home())
 
     failed = False
-    lines: list[str] = []
     started: list[tuple[Path, list[str], subprocess.Popen]] = []
     for profile, due in work:
         try:

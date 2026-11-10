@@ -3,6 +3,7 @@ package lib
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -18,8 +19,8 @@ import (
 // taskId matches the subject token, and the writer the envelope names is the
 // writer the subject implies. Disagreement is a protocol error and the message
 // carries no identity. Nothing here is signed and nothing is looked up; every
-// check is a field-to-token comparison, plus the one supervisor name a
-// consumer is configured with.
+// check is a field-to-token comparison, plus the supervisor names a consumer
+// is configured with.
 //
 // `from` therefore stops being "routing and display only" and becomes a
 // refusal input - but never the source of identity. Identity comes from the
@@ -36,6 +37,14 @@ type AgreementPolicy struct {
 	// `…supervisor` writer check falls back to the negative form: anyone but
 	// the addressee.
 	Supervisor string
+
+	// OtherSupervisors are further `from.session` values the render assigns
+	// a supervisor's role beside Supervisor: the profile dispatcher
+	// (DispatcherSession), which writes the terminal of a profile task it
+	// refuses or fails on that task's `…supervisor`. Read only when
+	// Supervisor is set. Which `…supervisor` subjects each may write is the
+	// grant's business; this only lets its terminal agree with them.
+	OtherSupervisors []string
 
 	// Submitter is the `from.session` allowed to write a profile's
 	// submissions (`…submit`): the gateway, for a dispatcher. Empty falls back
@@ -150,7 +159,7 @@ func checkTaskAgreement(subject, addressee, taskID, class string, env *Envelope,
 			return disagree(subject, "non-final status-update on a supervisor subject; supervisors emit only terminal events")
 		}
 		switch {
-		case p.Supervisor != "" && env.From.Session != p.Supervisor:
+		case p.Supervisor != "" && env.From.Session != p.Supervisor && !slices.Contains(p.OtherSupervisors, env.From.Session):
 			return disagree(subject, "from.session %q is not the supervisor %q", env.From.Session, p.Supervisor)
 		case p.Supervisor == "" && namesAddressee(env.From, addressee):
 			return disagree(subject, "from %s names the addressee; an executor is not its own supervisor", describeParty(env.From))

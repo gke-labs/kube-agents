@@ -90,9 +90,9 @@ REQUEST_TIMEOUT_SECONDS = 30
 # agent's own (EVAL_GITHUB_APP_ID): the eval runs open their remediation pull
 # requests and write their ledger issues through the same installation, so the
 # sweep takes a share of that hour, not the whole of it. A close and its branch
-# delete are two writes; six runs an hour at this budget are 240 of the 500,
-# and a backlog drains across runs instead of in one burst. What a run leaves
-# is logged and reported.
+# delete are two writes; one run an hour at this budget is 40 of the 500, and
+# a backlog drains across runs instead of in one burst. What a run leaves is
+# logged and reported.
 WRITE_PAUSE_SECONDS = 1.0
 WRITE_BUDGET_PER_RUN = 40
 # A pull request left unclosed will cost its close and its branch delete, and
@@ -195,10 +195,10 @@ DEFAULT_BOSKOS_OWNER = "ci-kube-agents-pull-sweep"
 # A sweep killed mid-hold (deadline, node loss) would leave its project in
 # BOSKOS_SWEEP_STATE: not free, not busy, unusable. Each run starts by asking
 # Boskos to return anything that has sat there longer than this to free -- its
-# own /reset, a Go duration. Under the periodic's ten-minute interval, so the
-# very next run returns a strand (15m would have let one sit for two or three
-# runs). A live hold's LastUpdate is refreshed by the heartbeat, so a sweep
-# that runs for minutes stays outside the window; only a dead run's is inside.
+# own /reset, a Go duration. Under the periodic's interval, so the very next
+# run returns a strand. A live hold's LastUpdate is refreshed by the heartbeat,
+# so a sweep that runs for minutes stays outside the window; only a dead run's
+# is inside.
 BOSKOS_STRANDED_AFTER = "5m"
 TERMINATED_EXIT_CODE = boskos_pool.TERMINATED_EXIT_CODE
 Terminated = boskos_pool.Terminated
@@ -794,8 +794,11 @@ def sweep_gitlab_project(project, path, token, dry_run=False):
         exc.closed = len(record["closed"])
         raise
     except gitlab.RateLimited as exc:
-        # The GitHub pass's rule: a limit ends the run, and the projects
-        # Boskos still hands out are held and released untouched.
+        # Raised only once a request stayed refused through the module's
+        # Retry-After waits (a single 429 is waited out there and the project
+        # carries on, kube-agents#5215). Then the GitHub pass's rule: the run
+        # ends, and the projects Boskos still hands out are held and released
+        # untouched.
         raise RateLimited(str(exc), closed=len(record["closed"]))
     except gitlab.ResetError as exc:
         # The module's refusals (a path outside the pool, a lookup without a

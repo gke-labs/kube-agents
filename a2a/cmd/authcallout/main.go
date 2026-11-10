@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -31,17 +32,18 @@ import (
 )
 
 const (
-	envNATSURL      = "NATS_URL"
-	envNATSUser     = "NATS_USER"
-	envNATSPassword = "NATS_PASSWORD"
-	envNamespace    = "POD_NAMESPACE"
-	envAuthMapName  = "A2A_AUTHMAP_NAME"
-	envAuthMapKey   = "A2A_AUTHMAP_KEY"
-	envAudience     = "A2A_TOKEN_AUDIENCE"
-	envIssuerSeed   = "A2A_ISSUER_SEED"
-	envXKeySeed     = "A2A_XKEY_SEED"
-	envGrantTTL     = "A2A_GRANT_TTL_SECONDS"
-	envStatusAddr   = "A2A_STATUS_ADDR"
+	envNATSURL       = "NATS_URL"
+	envNATSUser      = "NATS_USER"
+	envNATSPassword  = "NATS_PASSWORD"
+	envNamespace     = "POD_NAMESPACE"
+	envAuthMapName   = "A2A_AUTHMAP_NAME"
+	envAuthMapKey    = "A2A_AUTHMAP_KEY"
+	envAuthMapShards = "A2A_AUTHMAP_SHARDS"
+	envAudience      = "A2A_TOKEN_AUDIENCE"
+	envIssuerSeed    = "A2A_ISSUER_SEED"
+	envXKeySeed      = "A2A_XKEY_SEED"
+	envGrantTTL      = "A2A_GRANT_TTL_SECONDS"
+	envStatusAddr    = "A2A_STATUS_ADDR"
 
 	// envReservedPrincipals carries the static nats.conf user names, comma
 	// separated, which the operator renders from the list it renders
@@ -52,6 +54,22 @@ const (
 	// separated, which the operator renders from the constant the bridge's
 	// grants name. Required: see authcallout.ParseReservedAddressees.
 	envReservedAddressees = "A2A_RESERVED_ADDRESSEES"
+
+	// envTaskSigningKeys carries the task-signing public keys, comma
+	// separated, which the operator renders from the task-signing Secret it
+	// generates beside the callout keys. Optional: see
+	// authcallout.ParseTaskSigningKeys.
+	envTaskSigningKeys = "A2A_TASK_SIGNING_PUBLIC_KEYS"
+
+	// envTaskCredentialMaxLifetime is the furthest out a task credential's
+	// expiry may be, as a Go duration. #4121's operator will render it with
+	// time.Duration.String ("6h0m0s" by default, 60s to 21600s) from the
+	// PlatformAgent's spec.harness.tuning.profiles.maxTaskDeadlineSeconds,
+	// the same value it will clamp profile deadlines to; this PR's operator
+	// doesn't set it. Optional; unset means the callout's 6h default, which
+	// matches #4121's. See
+	// authcallout.Config.TaskCredentialMaxLifetime.
+	envTaskCredentialMaxLifetime = "A2A_TASK_CREDENTIAL_MAX_LIFETIME"
 
 	defaultAuthMapKey  = "identities.json"
 	defaultStatusAddr  = ":8080"
@@ -75,6 +93,17 @@ const (
 	// grantTTLJitter, one layer down.
 	reconnectJitter    = 500 * time.Millisecond
 	reconnectJitterTLS = 2 * time.Second
+
+	// tokenReviewQPS and tokenReviewBurst are the client-go rate limit the
+	// TokenReview client runs under, raised from client-go's defaults of 5
+	// and 10. The callout decides calloutWorkers (authcallout) connections
+	// at once per replica, each one a TokenReview, and a fleet reconnecting
+	// together arrives as a burst; at the defaults the limiter itself
+	// queued requests past the server's first-ping timer (#4332). Fifty a
+	// second is well under what one API server sustains on this endpoint,
+	// and a hundred absorbs one reconnecting fleet's burst.
+	tokenReviewQPS   = 50
+	tokenReviewBurst = 100
 )
 
 func main() {
@@ -100,6 +129,21 @@ func run(log *slog.Logger) error {
 	authMapKey := os.Getenv(envAuthMapKey)
 	if authMapKey == "" {
 		authMapKey = defaultAuthMapKey
+	}
+	// The shard count. Refused rather than defaulted, like the reserved
+	// names below: the operator cuts the map into numbered ConfigMaps and
+	// renders the count here beside the Role that names them, so a callout
+	// that guessed one would watch one name and serve part of a map whose
+	// other parts it cannot see. An image newer than the operator rendering
+	// it lands here, which is the safe direction: the rollout stalls on the
+	// new pods and the old ones keep serving.
+	rawShards, ok := os.LookupEnv(envAuthMapShards)
+	if !ok {
+		return fmt.Errorf("%s is required; the operator renders it from the number of identity map shards it cut", envAuthMapShards)
+	}
+	authMapShards, err := strconv.Atoi(strings.TrimSpace(rawShards))
+	if err != nil || authMapShards < 1 {
+		return fmt.Errorf("%s=%q is not a shard count of one or more", envAuthMapShards, rawShards)
 	}
 	audience := os.Getenv(envAudience)
 	if audience == "" {
@@ -139,16 +183,37 @@ func run(log *slog.Logger) error {
 		return fmt.Errorf("%s: %w", envReservedAddressees, err)
 	}
 
+	// The task-signing public keys. Unset is not a refusal, unlike the two
+	// above: without a key no task connection is honoured, which narrows a
+	// worker rather than widening anyone. A malformed one is, so a render
+	// bug surfaces here rather than as every task connection refused.
+	taskKeys, err := authcallout.ParseTaskSigningKeys(os.Getenv(envTaskSigningKeys))
+	if err != nil {
+		return fmt.Errorf("%s: %w", envTaskSigningKeys, err)
+	}
+
+	// The task credential lifetime. Unlike the variables above, a bad value
+	// does not stop startup: it refuses every task credential and nothing
+	// else (authcallout.Config.TaskCredentialMaxLifetimeInvalid says why),
+	// so the error is logged and handed on rather than returned.
+	taskMaxLifetime, taskLifetimeErr := authcallout.ParseTaskCredentialMaxLifetime(os.Getenv(envTaskCredentialMaxLifetime))
+	if taskLifetimeErr != nil {
+		log.Error("the task credential lifetime is unusable; task credentials will be refused", "error", taskLifetimeErr)
+	}
+
 	restCfg, err := rest.InClusterConfig()
 	if err != nil {
 		return fmt.Errorf("in-cluster config: %w", err)
 	}
-	clientset, err := kubernetes.NewForConfig(restCfg)
+	clientset, err := kubernetes.NewForConfig(withTokenReviewLimits(restCfg))
 	if err != nil {
 		return fmt.Errorf("building the Kubernetes client: %w", err)
 	}
 
-	store := authcallout.NewStore(log)
+	store, err := authcallout.NewShardedStore(log, authMapShards)
+	if err != nil {
+		return fmt.Errorf("%s: %w", envAuthMapShards, err)
+	}
 	validator, err := authcallout.NewTokenValidator(clientset, audience)
 	if err != nil {
 		return err
@@ -169,6 +234,10 @@ func run(log *slog.Logger) error {
 		GrantTTL:           grantTTL,
 		ReservedPrincipals: reserved,
 		ReservedAddressees: reservedAddressees,
+		TaskSigningKeys:    taskKeys,
+
+		TaskCredentialMaxLifetime:        taskMaxLifetime,
+		TaskCredentialMaxLifetimeInvalid: taskLifetimeErr,
 	}, log)
 	if err != nil {
 		return err
@@ -206,11 +275,12 @@ func run(log *slog.Logger) error {
 		_ = statusSrv.Shutdown(shutdownCtx)
 	}()
 
-	// WatchConfigMap returns only when the context ends, so there is no
-	// error branch here to log: the informer retries internally and a
+	// WatchConfigMapShards returns only when the context ends, so there is
+	// no error branch here to log: the informers retry internally and a
 	// genuinely broken watch surfaces as the store never becoming ready,
-	// which WaitForMap below reports with the reason attached.
-	go func() { _ = store.WatchConfigMap(ctx, clientset, namespace, authMapName, authMapKey) }()
+	// which WaitForMap below reports with the reason attached. One by-name
+	// watch per shard, <authMapName>-0 through -<authMapShards-1>.
+	go func() { _ = store.WatchConfigMapShards(ctx, clientset, namespace, authMapName, authMapKey) }()
 
 	// Serving nothing means refusing everything, so do not subscribe until
 	// there is a map to answer from. Subscribing first would mean the window
@@ -258,6 +328,15 @@ func run(log *slog.Logger) error {
 		return errors.New("the bus connection ended and will not recover in this process; " +
 			"restarting to re-read the callout credential")
 	}
+}
+
+// withTokenReviewLimits sets the client-go rate limit the TokenReview client
+// runs under; see tokenReviewQPS. The same client serves the identity-map
+// informer, whose traffic is a watch and does not count against it.
+func withTokenReviewLimits(cfg *rest.Config) *rest.Config {
+	cfg.QPS = tokenReviewQPS
+	cfg.Burst = tokenReviewBurst
+	return cfg
 }
 
 // connectToBus dials as the callout's own statically-authenticated user. It

@@ -58,6 +58,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
+from collections.abc import Callable
 from typing import Any
 
 __all__ = [
@@ -215,6 +216,34 @@ EVENT_ENTRY_ACTIVITY = "a2a.activity"
 PROBE_ACTIVITY_KEY = "activity"
 PROBE_ACTIVITY_DROPPED_KEY = "activityDropped"
 PROBE_PROGRESS_KEY = "progress"
+# What the chain's turns cost, which the door sends only on a read that asks
+# for it (``usage=chain``), since summing a delegation chain reads one stream
+# per link (``ConversationState``): ``usage`` is the ``usage`` artifact summed
+# over the front door's own turns, the root and every wake that continued its
+# chain; ``childUsage`` the same over the chain's child tasks, the addressees
+# the front door delegated to (the platform router that files the cards);
+# each absent when none of its turns published usage, and both on a door
+# older than the fields. ``usagePartial`` says a link's stream could not be
+# read, so the sums are short of it. Each executor publishes a turn's usage
+# before its terminal, so the harness asks after the terminal
+# (:meth:`InjectTask._read_usage`), and once more while the answer is
+# partial (:data:`USAGE_READ_ATTEMPTS`). Hermes reports the prompt whole,
+# cached reads included, with no split, so the harness maps ``inputTokens``
+# and ``outputTokens`` alone.
+USAGE_PARAM = "usage"
+USAGE_CHAIN = "chain"
+PROBE_USAGE_KEY = "usage"
+PROBE_CHILD_USAGE_KEY = "childUsage"
+PROBE_USAGE_PARTIAL_KEY = "usagePartial"
+# Whom the chain delegated to, each child's addressee once in order: a
+# profile's name or platform. The door sends it on every read, ``[]`` when
+# nothing was delegated and ``null`` for a task it could not find; a door
+# older than the field omits the key, which reads as ``None`` here, "can't
+# say", never as "delegated nothing" (``delegated_to`` errors on it).
+PROBE_CHILD_ADDRESSEES_KEY = "childAddressees"
+USAGE_READ_ATTEMPTS = 2
+USAGE_INPUT_KEY = "inputTokens"
+USAGE_OUTPUT_KEY = "outputTokens"
 # The keys of one activity part, as the executors publish them, and the two
 # status words with a meaning here: the api shape's default for a call the
 # part gives no status for (``ToolCall.status`` before a result is folded
@@ -243,6 +272,23 @@ ACTIVITY_STATUS_TRUNCATED = "truncated"
 # ``truncated`` would otherwise set the record aside on the run that used it.
 ACTIVITY_INPUT_TRUNCATED_KEY = "truncated"
 ACTIVITY_INPUT_TRUNCATED_KEYS = frozenset({ACTIVITY_INPUT_TRUNCATED_KEY, "bytes", "head"})
+# The bridge labels each part with the session that made the call
+# (``workerLabelLocked`` in ``a2a/hermes-bridge/activity_thinking.go``),
+# under its ``api`` executor: its own session, the router's, as
+# ``platform``, and a card worker's as ``card:<id> (<title>)`` or
+# ``worker:<session>``. A worker's call is not the router's; folded in here
+# untagged it would read as one, so a router-scoped ``tool_called`` on
+# ``kanban_complete`` would fire on the worker closing its own card. Such a
+# part is left out: the worker's calls reach the trajectory tagged with
+# their agent from the session store (``worker_trajectory``) when the
+# delegation wait found the cards, where the scorer grades the worker-scoped
+# checks (and sets them aside on a record without them). The skip names the worker
+# prefixes rather than the router's label, so a label this side does not
+# know stays the router's and shows in the record instead of emptying it.
+# A part with no label (a bridge older than the field, or the cli
+# executor) is the router's; a label that is not a string is malformed.
+ACTIVITY_WORKER_KEY = "worker"
+ACTIVITY_WORKER_PREFIXES = ("card:", "worker:")
 # The marker's argument names: the two it always carries, and three
 # present only when non-zero -- parts or counts that could not be read,
 # calls whose input the executor replaced with its truncation stand-in, and
@@ -364,15 +410,20 @@ INFRASTRUCTURE_REASONS = frozenset(
 # The persona's reasons, graded: the hermes turn exited non-zero, or ran past
 # the bridge's own deadline; under the api executor, the API server answered
 # with a 5xx or a failed 200, an unparseable completion, a body that broke
-# off mid-read, or a body over the bridge's read cap -- the turn's own failure, as a non-zero exit is for the subprocess. Listed
-# for the record and the tests; an unknown token lands in the same class, so
-# nothing here is consulted to grade.
+# off mid-read, or a body over the bridge's read cap -- the turn's own failure, as a non-zero exit is for the subprocess, and
+# under the cli executor a child's stdout over the same cap. On
+# either executor, an answer the bridge withheld because it was the model's own
+# reasoning under a `thought` or `thought:` line (#3206): the turn ran and produced no
+# answer. Listed for the record and the tests; an unknown token lands in the
+# same class, so nothing here is consulted to grade.
 REASON_HERMES_EXITED_NONZERO = "hermes-exited-nonzero"
 REASON_DEADLINE_EXCEEDED = "deadline-exceeded"
 REASON_HERMES_API_FAILED = "hermes-api-failed"
 REASON_HERMES_API_UNREADABLE = "hermes-api-unreadable"
 REASON_HERMES_API_READ_FAILED = "hermes-api-read-failed"
 REASON_HERMES_API_OVERSIZE = "hermes-api-oversize"
+REASON_HERMES_CLI_OVERSIZE = "hermes-cli-oversize"
+REASON_HERMES_UNSTRUCTURED_REASONING = "hermes-unstructured-reasoning"
 PERSONA_REASONS = frozenset(
     {
         REASON_HERMES_EXITED_NONZERO,
@@ -381,6 +432,8 @@ PERSONA_REASONS = frozenset(
         REASON_HERMES_API_UNREADABLE,
         REASON_HERMES_API_READ_FAILED,
         REASON_HERMES_API_OVERSIZE,
+        REASON_HERMES_CLI_OVERSIZE,
+        REASON_HERMES_UNSTRUCTURED_REASONING,
     }
 )
 # The two canceled terminals. After this transport's own cancel the executor
@@ -551,6 +604,7 @@ POLL_PAUSE_SECONDS = 1.0
 # started rather than routing a second message (``injectSubmission`` in
 # a2a/gateway/inject.go).
 RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
+RETRY_AFTER_HEADER = "Retry-After"
 
 
 def conversation_key(run_id: str, case_id: str, repetition: str) -> str:
@@ -595,6 +649,24 @@ def _readable_count(value: Any) -> int | None:
     if value < 1:
         return None
     return int(value)
+
+
+def _child_addressees(raw: Any) -> list[str] | None:
+    """The probe's ``childAddressees`` as a list, or ``None`` when it can't say."""
+    if not isinstance(raw, list) or not all(isinstance(a, str) for a in raw):
+        return None
+    return list(raw)
+
+
+def _usage_counts(raw: Any) -> dict[str, int | None] | None:
+    """A usage object's two counts, ``{"input": n, "output": n}``, a count that
+    cannot be read as ``None``; ``None`` whole when ``raw`` is no object."""
+    if not isinstance(raw, dict):
+        return None
+    return {
+        "input": _readable_count(raw.get(USAGE_INPUT_KEY)),
+        "output": _readable_count(raw.get(USAGE_OUTPUT_KEY)),
+    }
 
 
 def budget_floor(grace_seconds: float) -> float:
@@ -644,9 +716,14 @@ class InjectUnavailable(RuntimeError):
     abandon path reads the difference (:attr:`InjectTask.unanswered_post`).
     """
 
-    def __init__(self, message: str, *, retryable: bool = True, answered: bool = False) -> None:
+    def __init__(
+        self, message: str, *, retryable: bool = True, answered: bool = False, retry_after: float | None = None
+    ) -> None:
         super().__init__(message)
         self.retryable = retryable
+        # The seconds a 503 asked the caller to wait (its Retry-After), as a
+        # gateway standby answers; None when it named none.
+        self.retry_after = retry_after
         self.answered = answered
 
 
@@ -710,6 +787,18 @@ class Fold:
     # adopt, so ``activity`` is an earlier read's (:meth:`note_trace_stale`).
     activity_stale: bool = False
     progress: str = ""
+    # The front door's and the chain's children's token counts, from the
+    # read after the terminal that asks for them (:meth:`InjectTask._read_usage`);
+    # ``None`` until it answers with them. ``usage_partial`` is that read's
+    # word that a link could not be read, so the counts are short of it.
+    usage: dict[str, int | None] | None = None
+    child_usage: dict[str, int | None] | None = None
+    usage_partial: bool = False
+    # Whom the chain delegated to (:data:`PROBE_CHILD_ADDRESSEES_KEY`), from
+    # the latest read about this task that carried it, the polls' included
+    # (:meth:`InjectTask._note`) and the read after the terminal last;
+    # ``None`` until a read answers with it.
+    child_addressees: list[str] | None = None
     terminal: str = ""
     terminal_source: str = ""
     terminal_reason: str = ""
@@ -784,6 +873,8 @@ class Fold:
         a call: its ``dropped`` joins the door's ``activityDropped`` in the
         marker and no entry is written for it, and a part with no tool name
         is counted as malformed rather than written as a call to nothing.
+        A part the bridge labels with a card worker's session is left out as
+        the worker's call, not the router's (:data:`ACTIVITY_WORKER_KEY`).
         Empty when no read carried the key.
         """
         mapped = self._map_activity()
@@ -823,6 +914,12 @@ class Fold:
                     malformed += 1
                 else:
                     dropped += count
+                continue
+            worker = part.get(ACTIVITY_WORKER_KEY)
+            if worker is not None and not isinstance(worker, str):
+                malformed += 1
+                continue
+            if worker and worker.startswith(ACTIVITY_WORKER_PREFIXES):
                 continue
             tool = part.get(ACTIVITY_TOOL_KEY)
             if not isinstance(tool, str) or not tool:
@@ -866,8 +963,8 @@ class Fold:
         """The answer this task produced, as a customer would have read it.
 
         Ordinarily that is everything the conversation received for the task
-        that nothing rewrote, reassembled. The window is decided here rather
-        than while folding: whether a post belongs to this task is only
+        that nothing rewrote, reassembled. The window (:attr:`window_posts`)
+        is decided when read rather than while folding: whether a post belongs to this task is only
         answerable once it is known whether this task's marker appeared at
         all, and a fold reading a bounded transcript may never see one. With a
         marker, the posts between it and the next task's; without, every post,
@@ -883,10 +980,15 @@ class Fold:
         """
         if self.stream_result:
             return self.stream_result
+        return "".join(post["text"] for post in self.window_posts if post["messageId"] not in self.edited)
+
+    @property
+    def window_posts(self) -> list[dict[str, Any]]:
+        """The messages this task posted: its window when its marker appeared,
+        every post otherwise. A post a later edit rewrote (the status
+        placeholder) is still a message the thread shows."""
         windowed = [post for post in self.posts if post["inWindow"]]
-        if not windowed:
-            windowed = self.posts
-        return "".join(post["text"] for post in windowed if post["messageId"] not in self.edited)
+        return windowed or self.posts
 
     @property
     def gateway_declared(self) -> bool:
@@ -1097,6 +1199,16 @@ class Probe:
     activity_dropped: int = 0
     activity_malformed: int = 0
     progress: str = ""
+    # The task's token counts at this read, ``{"input": n, "output": n}`` from
+    # the body's ``usage`` (:data:`PROBE_USAGE_KEY`), a count that cannot be
+    # read as ``None``; ``None`` whole when the body had no usage.
+    usage: dict[str, int | None] | None = None
+    # The same for ``childUsage``, and the body's ``usagePartial``.
+    child_usage: dict[str, int | None] | None = None
+    usage_partial: bool = False
+    # The body's ``childAddressees`` (:data:`PROBE_CHILD_ADDRESSEES_KEY`):
+    # ``None`` when the key was absent, null, or not a list of strings.
+    child_addressees: list[str] | None = None
     last_post: str = ""
     error: str = ""
     # The conversation's A2A contextId, from the gateway's session record;
@@ -1157,6 +1269,10 @@ class Probe:
             activity_dropped=dropped,
             activity_malformed=malformed,
             progress=str(raw.get(PROBE_PROGRESS_KEY) or ""),
+            usage=_usage_counts(raw.get(PROBE_USAGE_KEY)),
+            child_usage=_usage_counts(raw.get(PROBE_CHILD_USAGE_KEY)),
+            usage_partial=raw.get(PROBE_USAGE_PARTIAL_KEY) is True,
+            child_addressees=_child_addressees(raw.get(PROBE_CHILD_ADDRESSEES_KEY)),
             last_post=str(last_post.get("text") or "") if isinstance(last_post, dict) else "",
             error=str(raw.get("error") or ""),
             context_id=str(raw.get("contextId") or ""),
@@ -1243,6 +1359,19 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(_NoRedirect, urllib.request.ProxyHandler({}))
 
 
+def _retry_after(exc: urllib.error.HTTPError) -> float | None:
+    """A response's Retry-After in seconds, when it gives a number of them.
+
+    The HTTP-date form is not read: nothing this transport talks to sends it.
+    """
+    raw = exc.headers.get(RETRY_AFTER_HEADER) if exc.headers is not None else None
+    try:
+        seconds = float(raw) if raw is not None else None
+    except ValueError:
+        return None
+    return seconds if seconds is not None and seconds >= 0 else None
+
+
 def _error_detail(exc: urllib.error.HTTPError) -> str:
     """The body of an error answer, or what stopped it arriving.
 
@@ -1296,6 +1425,7 @@ def _request(
             f"HTTP {exc.code} from {url}: {detail}",
             retryable=exc.code in RETRYABLE_STATUSES,
             answered=True,
+            retry_after=_retry_after(exc),
         ) from exc
     except (OSError, http.client.HTTPException, ValueError) as exc:
         # A ValueError is a body that was not JSON, which the door did
@@ -1493,7 +1623,29 @@ class InjectTask:
         self.task_id = probe.task_id
         return self.task_id
 
-    def await_terminal(self, task_id: str, *, deadline: float) -> Exchange:
+    def await_terminal(
+        self,
+        task_id: str,
+        *,
+        deadline: float,
+        on_poll: Callable[[Fold], float | None] | None = None,
+    ) -> Exchange:
+        """Await the terminal of ``task_id`` (:meth:`_await_terminal`), then,
+        for a task that ended, read the front door's usage once
+        (:meth:`_read_usage`).
+        """
+        exchange = self._await_terminal(task_id, deadline=deadline, on_poll=on_poll)
+        if exchange.outcome in (OUTCOME_TERMINAL, OUTCOME_STREAM_TERMINAL):
+            self._read_usage(exchange.fold, task_id, deadline)
+        return exchange
+
+    def _await_terminal(
+        self,
+        task_id: str,
+        *,
+        deadline: float,
+        on_poll: Callable[[Fold], float | None] | None = None,
+    ) -> Exchange:
         """Await the terminal of ``task_id``, folding what the relay posts.
 
         A function of a task id rather than of "the task I submitted", so the
@@ -1516,6 +1668,12 @@ class InjectTask:
             deadline: ``time.monotonic()`` instant after which the wait ends
                 on the read route's answer. The budget behind it clears the
                 floor (:func:`check_budget`).
+            on_poll: Called with the fold before the first read and after
+                each read that did not end the wait; what it returns caps
+                how long the next read may block, in seconds (``None``: the
+                usual long poll). The harness's mid-turn stop sends from
+                here, and caps the reads so its delay is kept to a second or
+                so rather than a long poll's 30 (:mod:`stop_hook`).
 
         Raises:
             InjectUnavailable: The gateway could not be reached or was lost.
@@ -1523,13 +1681,14 @@ class InjectTask:
         fold = Fold(task_id)
         after = 0
         probe: Probe | None = None
+        poll_cap = on_poll(fold) if on_poll is not None else None
         while True:
             if fold.final:
                 return self._ended(fold, task_id, probe)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return self._classify(fold, task_id, after)
-            body = self._poll(task_id, after, remaining)
+            body = self._poll(task_id, after, remaining if poll_cap is None else min(remaining, poll_cap))
             after, fresh = self._absorb(fold, body, after)
             answered = Probe.from_body(body)
             adopted = False
@@ -1547,6 +1706,8 @@ class InjectTask:
                         return self._finish(fold, task_id, after, answered)
                     if answered.executor_state == "" and answered.past_grace:
                         return self._never_started(fold, task_id, answered)
+            if on_poll is not None:
+                poll_cap = on_poll(fold)
             if fold.final and not adopted:
                 # The relay's terminal arrived in this read and its probe
                 # carried no trace to adopt: whatever trace the fold holds
@@ -1558,6 +1719,58 @@ class InjectTask:
     def _ended(self, fold: Fold, task_id: str, probe: Probe | None) -> Exchange:
         outcome = OUTCOME_NEVER_STARTED if fold.never_started else OUTCOME_TERMINAL
         return Exchange(fold, outcome, self.conversation, task_id, probe)
+
+    def _read_usage(self, fold: Fold, task_id: str, deadline: float) -> None:
+        """A probed read for the chain's usage, after the terminal.
+
+        Each executor publishes a turn's usage before its terminal, so a read
+        made now carries every turn's; it asks the door for the chain's sums
+        (:data:`USAGE_PARAM`), which the per-poll probe leaves out. An answer
+        the door marks partial (a link it could not read) is kept but read
+        once more, up to :data:`USAGE_READ_ATTEMPTS`, and a later full answer
+        replaces it. Made only inside the wait's deadline and bounded by what
+        is left of it, so a run already past its budget, or a cancel past its
+        settle bound, spends no time on it. Best effort: a read that fails, or
+        a door that sends no usage, leaves the counts as they stand.
+        """
+        seqs = [e.get("seq") for e in fold.entries]
+        after = max((seq for seq in seqs if isinstance(seq, int)), default=0)
+        params: dict[str, Any] = {
+            "after": after,
+            "wait": 0,
+            "task": task_id,
+            PROBE_PARAM: 1,
+            USAGE_PARAM: USAGE_CHAIN,
+        }
+        url = (
+            self.base_url
+            + CONVERSATIONS_PATH
+            + urllib.parse.quote(self.conversation, safe="")
+            + "?"
+            + urllib.parse.urlencode(params)
+        )
+        for _ in range(USAGE_READ_ATTEMPTS):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            timeout = min(remaining, POLL_TIMEOUT_MARGIN_SECONDS + PROBES_PER_POLL * PROBE_BOUND_SECONDS)
+            try:
+                answered = Probe.from_body(_request(url, timeout, self.token))
+            except InjectUnavailable as exc:
+                _log.info("inject: could not read the usage of %s after its terminal: %s", task_id, exc)
+                return
+            if answered is None or not answered.could_look or answered.task_id != task_id:
+                return
+            if answered.child_addressees is not None:
+                fold.child_addressees = answered.child_addressees
+            if answered.usage is None and answered.child_usage is None and not answered.usage_partial:
+                return
+            fold.usage = answered.usage
+            fold.child_usage = answered.child_usage
+            fold.usage_partial = answered.usage_partial
+            if not answered.usage_partial:
+                return
+            _log.info("inject: the usage of %s is partial; reading it once more", task_id)
 
     def _never_started(self, fold: Fold, task_id: str, probe: Probe) -> Exchange:
         """The read showed nothing on the stream past the grace: nobody took it."""
@@ -1594,6 +1807,12 @@ class InjectTask:
                 adopted = True
             if probe.progress:
                 fold.progress = probe.progress
+            # The door sends it on every read, from the record, and a chain
+            # only grows, so the latest read about this task is the fullest:
+            # kept here so a run whose read after the terminal never lands
+            # (the deadline, a transient error) still has it.
+            if probe.child_addressees is not None:
+                fold.child_addressees = probe.child_addressees
         if probe.could_look and probe.concerns(task_id) and not probe.final and not fold.final:
             if probe.reached_working:
                 # The read shows the latest state; ``working`` may have come

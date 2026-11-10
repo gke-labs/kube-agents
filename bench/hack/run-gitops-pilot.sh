@@ -551,7 +551,8 @@ if repo and (lists or integration.get("forges") or integration.get("repositories
         r for r in integration.get("repositories") or [] if r.get("role") != "gitops"]
 elif repo:
     integration.setdefault("github", {})["gitRepo"] = repo
-d["spec"].setdefault("harness", {})["eventWatcher"] = {"enabled": watcher}
+harness = d["spec"].setdefault("harness", {})
+harness["eventWatcher"] = {**(harness.get("eventWatcher") or {}), "enabled": watcher}
 if drift_field:
     d["spec"]["harness"]["driftDetector"] = {**(d["spec"]["harness"].get("driftDetector") or {}), "enabled": drift}
 print(json.dumps(d))' "${backup}" "${GITOPS_REPO:-}" "${AGENT_EVENT_WATCHER:-false}" "${lists}" "${AGENT_DRIFT_DETECTOR:-false}" "${drift_field}" "${GITOPS_REPO_HELPER%/*}" > "${reapply}"
@@ -639,9 +640,11 @@ export TF_VAR_gitops_run_branch="${RUN_BRANCH}" TF_VAR_gitops_token_file="${GITO
 export TF_VAR_agent_host_context="${AGENT_HOST_CONTEXT}" TF_VAR_agent_namespace="${AGENT_NAMESPACE}"
 export TF_VAR_gitops_repo="${GITOPS_REPO}" TF_VAR_gitops_broken_base_sha="${GITOPS_BROKEN_BASE_SHA}"
 export GITOPS_REPO GITOPS_RUN_BRANCH="${RUN_BRANCH}" GITOPS_TOKEN_FILE
-# The harness prefers BENCH_GITHUB_TOKEN or GITHUB_TOKEN over the file; hand it
-# the token the stack uses, so an ambient GITHUB_TOKEN for another account
-# cannot make it poll the private repository as a stranger.
+# The harness reads BENCH_GITHUB_TOKEN_FILE first, then BENCH_GITHUB_TOKEN or
+# GITHUB_TOKEN, then GITOPS_TOKEN_FILE; hand it the token the stack uses and
+# drop an ambient token file, so another account's credential cannot make it
+# poll the private repository as a stranger.
+unset BENCH_GITHUB_TOKEN_FILE
 BENCH_GITHUB_TOKEN="$(tr -d '\r\n' < "${GITOPS_TOKEN_FILE}")"; export BENCH_GITHUB_TOKEN
 # The stack names the Argo Application after the task; the harness looks it up.
 export GITOPS_ARGO_APP="${TASK}"
@@ -725,14 +728,14 @@ if [ "${BENCH_NO_TEARDOWN:-false}" != "true" ]; then
   [ "${default_branch}" = "${REPO_DEFAULT_BRANCH}" ] || echo "WARN leak: default branch of ${repo_slug} is '${default_branch}', not ${REPO_DEFAULT_BRANCH}" >&2
   if ! agent_base_lines="$(agent_bases 2>/dev/null)"; then
     echo "WARN leak: whether a PlatformAgent spec.integration.repositories[].baseBranch still names ${RUN_BRANCH} is unknown (it could not be read); check it by hand" >&2
-  elif cut -f3 <<<"${agent_base_lines}" | grep -qxF "${RUN_BRANCH}"; then
+  elif grep -qxF "${RUN_BRANCH}" <<<"$(cut -f3 <<<"${agent_base_lines}")"; then
     echo "WARN leak: a PlatformAgent spec.integration.repositories[].baseBranch still names ${RUN_BRANCH}" >&2
   fi
-  if gcloud container clusters list --project "${GCP_PROJECT_ID}" --filter="name=${CLUSTER_NAME}" --format="value(name)" 2>/dev/null | grep -q .; then
+  if grep -q . <<<"$(gcloud container clusters list --project "${GCP_PROJECT_ID}" --filter="name=${CLUSTER_NAME}" --format="value(name)" 2>/dev/null)"; then
     echo "WARN leak: task cluster ${CLUSTER_NAME} still exists" >&2
   fi
 elif [ "${case_pin}" = "true" ] \
-  && { agent_bases 2>/dev/null || true; } | cut -f3 | grep -qxF "${RUN_BRANCH}"; then
+  && grep -qxF "${RUN_BRANCH}" <<<"$({ agent_bases 2>/dev/null || true; } | cut -f3)"; then
   echo "WARN BENCH_NO_TEARDOWN=true: the PlatformAgent's spec.integration.repositories[].baseBranch still names ${RUN_BRANCH}, so every proposal onto ${slug} from this install targets it until the stack's destroy is run by hand" >&2
 fi
 exit "${rc}"

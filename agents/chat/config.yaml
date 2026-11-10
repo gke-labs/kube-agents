@@ -48,11 +48,14 @@
 # /etc/hermes is MACHINE-GLOBAL — one file
 # for every profile in the pod, not just this one — so it carries only what is
 # identical for every profile AND beyond the agent's own repair: `model`,
-# `platforms`, `approvals.cron_mode`, `display.platforms`, and
+# `platforms`, `approvals.cron_mode`, `display.platforms`,
 # `kanban.max_in_progress`, the board's worker cap (the board is shared by every
-# profile; spec.harness.tuning.maxInProgress, else defaultKanbanMaxInProgress).
+# profile; spec.harness.tuning.maxInProgress, else defaultKanbanMaxInProgress),
+# and `kanban.admission`, the dispatcher's memory admission (an eviction is
+# pod-wide; spec.harness.tuning.admission, else the operator's defaults).
 # Everything profile-shaped below — toolsets, plugins.enabled, mcp_servers,
-# memory, and every `kanban` key except max_in_progress — is this file's alone.
+# memory, and every `kanban` key except max_in_progress and admission — is
+# this file's alone.
 # Do not add any of that to renderConfigYAML: the merge is per leaf key and lists
 # REPLACE rather than union, so a list pinned there would hand the platform
 # specialist the front door's tools and vice versa.
@@ -100,7 +103,10 @@ model:
 # It is 600s because Gemini thinks in silence on this path: with the request
 # shape Hermes sends, no reasoning deltas stream, and a hard prompt measured
 # 140-210s before its first chunk, so a shorter bound would cut off healthy
-# long thinks, and every retry would repeat the same think.
+# long thinks, and every retry would repeat the same think. That was measured
+# before the chart's gateway asked Gemini for its thoughts; thought summaries
+# may now arrive as reasoning deltas before the answer, which has not been
+# measured, so the bound stays.
 # request_timeout_seconds is the per-read socket timeout (and the stream read
 # timeout), not a cap on a whole call; the chart's LiteLLM sets no timeout of
 # its own. A call that stalls is retried inside each of Hermes' 3 attempts
@@ -134,6 +140,22 @@ mcp_servers:
       - "${HERMES_HOME}/scripts/router_server.py"
     env:
       HERMES_HOME: "${HERMES_HOME}"
+      # For list_agents' Host Cluster Identity and GCP Projects in Scope
+      # sections (agent_roster.py), so the tool renders what the injected block
+      # renders. The operator sets the GKE_* and GCP_PROJECT_ID values outside
+      # kind only; an unset one arrives here as the literal "${...}"
+      # placeholder, which agent_roster.py treats as unset.
+      GKE_CLUSTER_NAME: "${GKE_CLUSTER_NAME}"
+      GKE_PROJECT_ID: "${GKE_PROJECT_ID}"
+      GKE_LOCATION: "${GKE_LOCATION}"
+      GCP_PROJECT_ID: "${GCP_PROJECT_ID}"
+      KUBEAGENTS_SCOPE_FILE: "${KUBEAGENTS_SCOPE_FILE}"
+      # The group size above which the roster counts a shared-role group
+      # instead of naming each agent (agent_roster.summary_threshold; default
+      # 20). spec.deployment.env sets it on the agent container through the
+      # operator's allowlist; unset arrives as the placeholder, which means
+      # the default. Passed so list_agents summarizes where the block does.
+      KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD: "${KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD}"
 
 # Explicitly list platform_toolsets (reserved Hermes key). ONLY the router MCP —
 # no base tool bundle. `mcp-<name>` here maps to `mcp_servers.<name>` above.
@@ -175,6 +197,12 @@ platform_toolsets:
   # Real Google Chat ingress resolves under the `google_chat` platform key; pin
   # it to the delegation surface too so it never falls back to a full base bundle.
   google_chat:
+    - mcp-router
+    - kanban
+    - memory
+  # Microsoft Teams ingress resolves under the `teams` platform key; pin
+  # it to the delegation surface too so it never falls back to a full base bundle.
+  teams:
     - mcp-router
     - kanban
     - memory
@@ -243,7 +271,7 @@ kanban:
   # A worker measured about 430 MiB, so six are about 2.6 GiB over the
   # gateway's 1.8 GiB idle set, under its 8Gi limit; coordinators waiting on
   # their own children stay resident on top. The credential proxy's default
-  # 2Gi admits 9 brokered commands (8 with its slot cap), shared with the
+  # 2Gi admits 10 brokered commands (8 with its slot cap), shared with the
   # stall watch's and reconcile's four-wide listings. Model rate limits are
   # per install and unmeasured: if worker logs show 429s, lower this.
   max_in_progress: 6
@@ -339,6 +367,13 @@ platforms:
       # its input. Teaching an agent to emit Slack mrkdwn directly would defeat
       # both this renderer and format_message.
       rich_blocks: true
+  # Microsoft Teams egress presentation. `enabled` is the operator's to set, from the CR's
+  # spec.integration.teams.
+  teams:
+    typing_status_text: "Kage is thinking…"
+    extra:
+      # Render outbound messages as Adaptive Cards v1.5 JSON when enabled.
+      adaptive_cards: true
 
 # Memory. The built-in MEMORY.md/USER.md store stays off; the
 # `kube_agents_memory` provider (agents/chat/plugins/memory/kube_agents_memory/)
@@ -432,7 +467,8 @@ plugins:
     - legacy_slash_commands
     # Counts every inbound message on pre_gateway_dispatch, the failed turns the
     # gateway patch reports, the board's cards that gave up and the thumbs-downs the
-    # chat_feedback_reactions hook reports from Hermes' reaction:added event, and
+    # chat_feedback_reactions hook reports from Hermes' reaction:added event, reads
+    # the proposals ledger by origin from Session KV at scrape time, and
     # serves them on the listener the operator reads into
     # status.usage.chatMessagesInboundTotal, chatTurnsErroredTotal,
     # backgroundTasksGaveUpTotal and negativeFeedbackTotal.

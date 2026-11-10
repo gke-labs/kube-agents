@@ -1,8 +1,8 @@
 """The one way the health job talks to GitHub: `gh api`, best-effort.
 
-gate_comment.py (the comment on a red pull request) and gate_issue.py (the
-tracking issue an OUTAGE files) both write to GitHub with the workflow's own
-GITHUB_TOKEN, through the `gh` binary the runner already has -- the same
+The health job's writers (the comment on a red pull request, the tracking
+and nightly issues) and the one-off scrub_bot_posts.py write to GitHub with
+the token in GH_TOKEN, through the `gh` binary the runner already has -- the same
 call coverage-comment.yml makes for its sticky comment, so no new dependency
 and no token handling here: `gh` reads GH_TOKEN from the environment and this
 module never sees it.
@@ -32,7 +32,7 @@ CALL_TIMEOUT_S = 60
 # A paginated read comes back one object per line (`--jq '.[]'`), which is
 # what stays valid JSON when gh concatenates pages.
 PAGINATE_JQ = ".[]"
-WRITE_METHODS = ("POST", "PATCH")
+WRITE_METHODS = ("POST", "PATCH", "DELETE")
 DRY_RUN_PREFIX = "--dry-run: would"
 # GitHub's answer to a field it will not take (an assignee who is not a
 # collaborator): gh prints the status to stderr and the JSON body, which
@@ -65,10 +65,12 @@ class Gh:
     def path(self, suffix: str) -> str:
         return f"repos/{self.repo}/{suffix}"
 
-    def call(self, method: str, path: str, body: dict | None = None, paginate: bool = False):
-        """The decoded JSON response, a list for a paginated read, or None."""
+    def call(self, method: str, path: str, body: dict | None = None, paginate: bool = False, read: bool = False):
+        """The decoded JSON response, a list for a paginated read, or None.
+        ``read`` marks a POST that only reads (a GraphQL query), which a dry
+        run still sends."""
         self.last_failure = None
-        if self.dry_run and method in WRITE_METHODS:
+        if self.dry_run and method in WRITE_METHODS and not read:
             log(f"{DRY_RUN_PREFIX} {method} {path}\n{json.dumps(body, indent=2, ensure_ascii=False) if body else ''}")
             return None
         argv = [self.binary, "api", "-X", method, path]

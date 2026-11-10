@@ -1,0 +1,432 @@
+{
+  "payload": {
+    "number": 10,
+    "comments": true,
+    "diff": true
+  },
+  "responses": [
+    {
+      "id": 10,
+      "version": 2,
+      "title": "Raise the replica floor to two",
+      "description": "Two replicas survive one eviction.",
+      "state": "DECLINED",
+      "open": false,
+      "closed": true,
+      "draft": true,
+      "createdDate": 1793644407817,
+      "updatedDate": 1793644410245,
+      "closedDate": 1793644410245,
+      "fromRef": {
+        "id": "refs/heads/platform-agent/replicas-1793644386",
+        "displayId": "platform-agent/replicas-1793644386",
+        "latestCommit": "ae20e95ac2776c278e49aa1de74cb7f3839a3291",
+        "type": "BRANCH",
+        "repository": {
+          "slug": "infra",
+          "id": 1,
+          "name": "infra",
+          "hierarchyId": "5840b4a83cefa1b0580e",
+          "scmId": "git",
+          "state": "AVAILABLE",
+          "statusMessage": "Available",
+          "forkable": true,
+          "project": {
+            "key": "ACME",
+            "id": 1,
+            "name": "acme",
+            "public": false,
+            "type": "NORMAL",
+            "links": {
+              "self": [
+                {
+                  "href": "https://bitbucket.acme.example/projects/ACME"
+                }
+              ]
+            }
+          },
+          "public": false,
+          "archived": false,
+          "links": {
+            "clone": [
+              {
+                "href": "https://bitbucket.acme.example/scm/acme/infra.git",
+                "name": "http"
+              },
+              {
+                "href": "ssh://git@bitbucket.acme.example:7999/acme/infra.git",
+                "name": "ssh"
+              }
+            ],
+            "self": [
+              {
+                "href": "https://bitbucket.acme.example/projects/ACME/repos/infra/browse"
+              }
+            ]
+          }
+        }
+      },
+      "toRef": {
+        "id": "refs/heads/main",
+        "displayId": "main",
+        "latestCommit": "adae32302776860009d732ce2599f15be92954d9",
+        "type": "BRANCH",
+        "repository": {
+          "slug": "infra",
+          "id": 1,
+          "name": "infra",
+          "hierarchyId": "5840b4a83cefa1b0580e",
+          "scmId": "git",
+          "state": "AVAILABLE",
+          "statusMessage": "Available",
+          "forkable": true,
+          "project": {
+            "key": "ACME",
+            "id": 1,
+            "name": "acme",
+            "public": false,
+            "type": "NORMAL",
+            "links": {
+              "self": [
+                {
+                  "href": "https://bitbucket.acme.example/projects/ACME"
+                }
+              ]
+            }
+          },
+          "public": false,
+          "archived": false,
+          "links": {
+            "clone": [
+              {
+                "href": "https://bitbucket.acme.example/scm/acme/infra.git",
+                "name": "http"
+              },
+              {
+                "href": "ssh://git@bitbucket.acme.example:7999/acme/infra.git",
+                "name": "ssh"
+              }
+            ],
+            "self": [
+              {
+                "href": "https://bitbucket.acme.example/projects/ACME/repos/infra/browse"
+              }
+            ]
+          }
+        }
+      },
+      "locked": false,
+      "author": {
+        "user": {
+          "name": "access-token-user/1/1",
+          "active": true,
+          "displayName": "Access Token User - acme",
+          "emailAddress": null,
+          "id": 4,
+          "slug": "access-token-user_1_1",
+          "type": "SERVICE",
+          "links": {
+            "self": [
+              {
+                "href": "https://bitbucket.acme.example/bots/access-token-user_1_1"
+              }
+            ]
+          }
+        },
+        "role": "AUTHOR",
+        "approved": false,
+        "status": "UNAPPROVED"
+      },
+      "reviewers": [],
+      "participants": [],
+      "links": {
+        "self": [
+          {
+            "href": "https://bitbucket.acme.example/projects/ACME/repos/infra/pull-requests/10"
+          }
+        ]
+      }
+    },
+    {
+      "size": 5,
+      "limit": 100,
+      "isLastPage": true,
+      "values": [
+        {
+          "id": 48,
+          "createdDate": 1793644488591,
+          "user": {
+            "name": "access-token-user/1/1",
+            "active": true,
+            "displayName": "Access Token User - acme",
+            "emailAddress": null,
+            "id": 4,
+            "slug": "access-token-user_1_1",
+            "type": "SERVICE",
+            "links": {
+              "self": [
+                {
+                  "href": "https://bitbucket.acme.example/bots/access-token-user_1_1"
+                }
+              ]
+            }
+          },
+          "action": "COMMENTED",
+          "commentAction": "ADDED",
+          "comment": {
+            "properties": {
+              "repositoryId": 1
+            },
+            "id": 5,
+            "version": 0,
+            "text": "A second note on the change.",
+            "author": {
+              "name": "access-token-user/1/1",
+              "active": true,
+              "displayName": "Access Token User - acme",
+              "emailAddress": null,
+              "id": 4,
+              "slug": "access-token-user_1_1",
+              "type": "SERVICE",
+              "links": {
+                "self": [
+                  {
+                    "href": "https://bitbucket.acme.example/bots/access-token-user_1_1"
+                  }
+                ]
+              }
+            },
+            "createdDate": 1793644488589,
+            "updatedDate": 1793644488589,
+            "comments": [],
+            "threadResolved": false,
+            "severity": "NORMAL",
+            "state": "OPEN",
+            "permittedOperations": {
+              "editable": true,
+              "transitionable": true,
+              "deletable": true
+            }
+          }
+        },
+        {
+          "id": 47,
+          "createdDate": 1793644488539,
+          "user": {
+            "name": "access-token-user/1/1",
+            "active": true,
+            "displayName": "Access Token User - acme",
+            "emailAddress": null,
+            "id": 4,
+            "slug": "access-token-user_1_1",
+            "type": "SERVICE",
+            "links": {
+              "self": [
+                {
+                  "href": "https://bitbucket.acme.example/bots/access-token-user_1_1"
+                }
+              ]
+            }
+          },
+          "action": "COMMENTED",
+          "commentAction": "ADDED",
+          "comment": {
+            "properties": {
+              "repositoryId": 1
+            },
+            "id": 4,
+            "version": 0,
+            "text": "Two is the floor the budget needs.",
+            "author": {
+              "name": "access-token-user/1/1",
+              "active": true,
+              "displayName": "Access Token User - acme",
+              "emailAddress": null,
+              "id": 4,
+              "slug": "access-token-user_1_1",
+              "type": "SERVICE",
+              "links": {
+                "self": [
+                  {
+                    "href": "https://bitbucket.acme.example/bots/access-token-user_1_1"
+                  }
+                ]
+              }
+            },
+            "createdDate": 1793644488528,
+            "updatedDate": 1793644488528,
+            "comments": [],
+            "threadResolved": false,
+            "severity": "NORMAL",
+            "state": "OPEN",
+            "permittedOperations": {
+              "editable": true,
+              "transitionable": true,
+              "deletable": true
+            }
+          },
+          "commentAnchor": {
+            "fromHash": "adae32302776860009d732ce2599f15be92954d9",
+            "toHash": "ae20e95ac2776c278e49aa1de74cb7f3839a3291",
+            "line": 1,
+            "lineType": "ADDED",
+            "fileType": "TO",
+            "path": "ingest.yaml",
+            "diffType": "EFFECTIVE",
+            "orphaned": false
+          },
+          "diff": {
+            "source": null,
+            "destination": {
+              "components": [
+                "ingest.yaml"
+              ],
+              "parent": "",
+              "name": "ingest.yaml",
+              "extension": "yaml",
+              "toString": "ingest.yaml"
+            },
+            "hunks": [
+              {
+                "sourceLine": 0,
+                "sourceSpan": 0,
+                "destinationLine": 1,
+                "destinationSpan": 2,
+                "segments": [
+                  {
+                    "type": "ADDED",
+                    "lines": [
+                      {
+                        "destination": 1,
+                        "source": 0,
+                        "line": "replicas: 2",
+                        "repository": false,
+                        "commentIds": [
+                          4
+                        ]
+                      },
+                      {
+                        "destination": 2,
+                        "source": 0,
+                        "line": "minAvailable: 1",
+                        "repository": false
+                      }
+                    ],
+                    "truncated": false
+                  }
+                ],
+                "truncated": false
+              }
+            ],
+            "truncated": false,
+            "properties": {
+              "toHash": "ae20e95ac2776c278e49aa1de74cb7f3839a3291",
+              "current": true,
+              "fromHash": "adae32302776860009d732ce2599f15be92954d9"
+            }
+          }
+        },
+        {
+          "id": 46,
+          "createdDate": 1793644410245,
+          "user": {
+            "name": "access-token-user/1/1",
+            "active": true,
+            "displayName": "Access Token User - acme",
+            "emailAddress": null,
+            "id": 4,
+            "slug": "access-token-user_1_1",
+            "type": "SERVICE",
+            "links": {
+              "self": [
+                {
+                  "href": "https://bitbucket.acme.example/bots/access-token-user_1_1"
+                }
+              ]
+            }
+          },
+          "action": "DECLINED"
+        },
+        {
+          "id": 44,
+          "createdDate": 1793644409741,
+          "user": {
+            "name": "access-token-user/1/1",
+            "active": true,
+            "displayName": "Access Token User - acme",
+            "emailAddress": null,
+            "id": 4,
+            "slug": "access-token-user_1_1",
+            "type": "SERVICE",
+            "links": {
+              "self": [
+                {
+                  "href": "https://bitbucket.acme.example/bots/access-token-user_1_1"
+                }
+              ]
+            }
+          },
+          "action": "COMMENTED",
+          "commentAction": "ADDED",
+          "comment": {
+            "properties": {
+              "repositoryId": 1
+            },
+            "id": 3,
+            "version": 0,
+            "text": "Rebased onto the new base image. <!-- agent:ack -->",
+            "author": {
+              "name": "access-token-user/1/1",
+              "active": true,
+              "displayName": "Access Token User - acme",
+              "emailAddress": null,
+              "id": 4,
+              "slug": "access-token-user_1_1",
+              "type": "SERVICE",
+              "links": {
+                "self": [
+                  {
+                    "href": "https://bitbucket.acme.example/bots/access-token-user_1_1"
+                  }
+                ]
+              }
+            },
+            "createdDate": 1793644409739,
+            "updatedDate": 1793644409739,
+            "comments": [],
+            "threadResolved": false,
+            "severity": "NORMAL",
+            "state": "OPEN",
+            "permittedOperations": {
+              "editable": true,
+              "transitionable": true,
+              "deletable": true
+            }
+          }
+        },
+        {
+          "id": 43,
+          "createdDate": 1793644407835,
+          "user": {
+            "name": "access-token-user/1/1",
+            "active": true,
+            "displayName": "Access Token User - acme",
+            "emailAddress": null,
+            "id": 4,
+            "slug": "access-token-user_1_1",
+            "type": "SERVICE",
+            "links": {
+              "self": [
+                {
+                  "href": "https://bitbucket.acme.example/bots/access-token-user_1_1"
+                }
+              ]
+            }
+          },
+          "action": "OPENED"
+        }
+      ],
+      "start": 0
+    }
+  ]
+}

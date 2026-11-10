@@ -104,6 +104,10 @@ func serveDelegateConn(c net.Conn, ch chan<- delegateAsk, done <-chan struct{}, 
 	_ = enc.Encode(<-ask.reply)
 }
 
+// delegateParametersNotYet refuses a delegate request that carries task
+// parameters, which no gateway reads yet (lib.DelegateRequest.Parameters).
+const delegateParametersNotYet = "parameters are not supported by this gateway yet; delegate without them"
+
 // validateDelegate is the adapter's share of the check; the gateway's is the
 // one that matters (allowlist, target, depth), this one keeps junk off the bus.
 func validateDelegate(req lib.DelegateRequest) string {
@@ -114,6 +118,14 @@ func validateDelegate(req lib.DelegateRequest) string {
 		return "text is required"
 	case len(req.Text) > lib.DelegateTextCap:
 		return "text is too long for a delegation"
+	}
+	// The delegate tool offers no parameters yet (offering them is text
+	// the model reads, and lands with its own eval case), so a request
+	// carrying some reached the adapter some other way; refuse it rather
+	// than pass on a target the tool never asked for. The gateway reads
+	// them, validating with lib.ValidateTaskParameters.
+	if len(req.Parameters) > 0 {
+		return delegateParametersNotYet
 	}
 	return ""
 }

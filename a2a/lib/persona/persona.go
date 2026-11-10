@@ -72,9 +72,6 @@ type Manifest struct {
 	APIVersion  string `json:"apiVersion"`
 	Name        string `json:"name"`
 	Description string `json:"description"`
-	// Tier is the capability tier the dispatcher matches the persona on
-	// (#3654). Adapters do not read it.
-	Tier string `json:"tier,omitempty"`
 	// Model is a hint; the worker decides whether to honour it.
 	Model string `json:"model,omitempty"`
 	// Tools is the allowlist: BuiltinTools and MCP server references.

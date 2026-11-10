@@ -48,17 +48,67 @@ const (
 	routeMemoryTTL = 24 * time.Hour
 	// routeLostNote follows a completed answer whose route could not be
 	// recorded, so the user is told rather than left waiting for a card's
-	// answer that cannot arrive.
-	routeLostNote = "\n\n(If this turn filed a card, its answer cannot be posted back to this conversation: the conversation's route could not be recorded.)"
+	// answer that cannot arrive. Such a turn ends at its acknowledgement
+	// (only a console, MCP or A2A door turn waits on its cards,
+	// waitsForCardsInTurn),
+	// and most file no card, hence "if".
+	routeLostNote = "\n\n(If a card this turn filed is still running, its answer cannot be posted back to this conversation: the conversation's route could not be recorded.)"
 )
 
 // routePlatforms maps a gateway conversation key's prefix to the platform name
 // the agent side spells it with (Hermes's, and lib's NotifyPlatform names).
-// A conversation on any other door (inject, the A2A door, Discord) has no
-// notify route, and no route is recorded for it.
+// A conversation on any other door (inject, console, the A2A door, Discord) has
+// no chat notify route; identityRouteFor records an identity-only route for
+// doors that still carry speaker or audience context.
 var routePlatforms = map[string]string{
-	"gchat:": lib.NotifyPlatformGchat,
-	"slack:": lib.NotifyPlatformSlack,
+	"gchat:":           lib.NotifyPlatformGchat,
+	"slack:":           lib.NotifyPlatformSlack,
+	consoleRoutePrefix: lib.NotifyPlatformConsole,
+}
+
+// consoleRoutePrefix is the console conversation's key prefix, the one route
+// that carries its task (conversationRoute.TaskID).
+const consoleRoutePrefix = "console:"
+
+// a2aDoorRoutePrefix is the gateway's A2A door's conversation key prefix
+// (a2a/gateway/a2adoor.go, a2aKeyPrefix): a client calling message/send,
+// which has no thread for a card's post and reads the task's answer.
+const a2aDoorRoutePrefix = "a2a:"
+
+// waitsForCardsInTurn reports whether a turn holds its task open while the
+// Kanban cards it filed run (waitForKanbanCards): a console or MCP turn, or
+// an A2A door turn (#5180). Those clients read the task's answer and have
+// no thread for a card's post. Every other turn ends at the acknowledgement,
+// as before the in-turn wait (#5170). On a chat turn with a recorded route a
+// card's answer comes back through the chat.notify route; on a turn whose
+// route was not recorded it cannot (routeLostNote says so); the eval inject
+// lane gets none from the bridge.
+func waitsForCardsInTurn(env *lib.Envelope) bool {
+	return isConsoleOrigin(env) || hasConversationPrefix(env, a2aDoorRoutePrefix)
+}
+
+// hasConversationPrefix reports whether env's authority names a
+// conversation starting with prefix.
+func hasConversationPrefix(env *lib.Envelope, prefix string) bool {
+	if env == nil {
+		return false
+	}
+	auth, err := parseRouteAuthority(env)
+	if err != nil {
+		return false
+	}
+	return strings.HasPrefix(strings.TrimSpace(auth.Audience.Conversation), prefix)
+}
+
+func isConsoleOrigin(env *lib.Envelope) bool {
+	if env == nil {
+		return false
+	}
+	auth, err := parseRouteAuthority(env)
+	if err != nil {
+		return false
+	}
+	return strings.HasPrefix(strings.TrimSpace(auth.Audience.Conversation), consoleRoutePrefix)
 }
 
 // errNoChatConversation is an authority that names no chat conversation the
@@ -70,34 +120,125 @@ var errRouteDisabled = errors.New("no route store configured")
 
 // conversationRoute is the PUT's body. Ask is the kind of the task's ask,
 // a mark.ask token (askKind in chat.go): the kanban notifier keeps it marked
-// on the chat messages its cards send while they run.
+// on the chat messages its cards send while they run. UserID and ChatType
+// carry the gateway's requester principal (hmac:<32-hex>) and audience kind
+// ("dm" or "group") so the memory provider can isolate personal memory per
+// user and fail closed in shared threads.
+//
+// TaskID, on a console conversation's route only, is the gateway task the
+// turn runs: a card the turn files snapshots it, and its report names it
+// (a2a notify --reply-to), so a console client can join the report to the
+// turn. A chat conversation's route leaves it out.
 type conversationRoute struct {
 	Platform     string `json:"platform"`
 	Conversation string `json:"conversation"`
 	ContextID    string `json:"context_id"`
 	Ask          string `json:"ask,omitempty"`
+	TaskID       string `json:"task_id,omitempty"`
+	UserID       string `json:"user_id,omitempty"`
+	ChatType     string `json:"chat_type,omitempty"`
+}
+
+type routeAuthority struct {
+	Audience struct {
+		Conversation string `json:"conversation"`
+		Kind         string `json:"kind"`
+	} `json:"audience"`
+	Requester struct {
+		Principal  string `json:"principal"`
+		Backend    string `json:"backend"`
+		VerifiedBy string `json:"verifiedBy"`
+	} `json:"requester"`
+}
+
+func parseRouteAuthority(env *lib.Envelope) (routeAuthority, error) {
+	var auth routeAuthority
+	if len(env.Authority) > 0 {
+		if err := json.Unmarshal(env.Authority, &auth); err != nil {
+			return routeAuthority{}, fmt.Errorf("authority unreadable: %w", err)
+		}
+	}
+	return auth, nil
 }
 
 // routeFor reads the conversation the gateway's authority block names
-// (audience.conversation, its session-record key) and the platform it is on.
+// (audience.conversation, its session-record key), the platform it is on, and
+// the speaker identity and audience kind for memory scoping.
 func routeFor(env *lib.Envelope) (conversationRoute, error) {
-	var auth struct {
-		Audience struct {
-			Conversation string `json:"conversation"`
-		} `json:"audience"`
-	}
-	if len(env.Authority) > 0 {
-		if err := json.Unmarshal(env.Authority, &auth); err != nil {
-			return conversationRoute{}, fmt.Errorf("authority unreadable: %w", err)
-		}
+	auth, err := parseRouteAuthority(env)
+	if err != nil {
+		return conversationRoute{}, err
 	}
 	key := strings.TrimSpace(auth.Audience.Conversation)
+	userID := strings.TrimSpace(auth.Requester.Principal)
+	// A console route is recorded so its cards post back, but the console
+	// door's credential is shared, so its principal is not a person.
+	if hasSharedPrincipal(key, auth) {
+		userID = ""
+	}
+	chatType := strings.TrimSpace(auth.Audience.Kind)
 	for prefix, platform := range routePlatforms {
 		if strings.HasPrefix(key, prefix) && len(key) > len(prefix) && env.ContextID != "" {
-			return conversationRoute{Platform: platform, Conversation: key, ContextID: env.ContextID}, nil
+			route := conversationRoute{
+				Platform:     platform,
+				Conversation: key,
+				ContextID:    env.ContextID,
+				UserID:       userID,
+				ChatType:     chatType,
+			}
+			if prefix == consoleRoutePrefix {
+				route.TaskID = env.TaskID
+			}
+			return route, nil
 		}
 	}
 	return conversationRoute{}, errNoChatConversation
+}
+
+// hasSharedPrincipal reports whether the gateway conversation or requester
+// uses a shared credential across multiple callers (the console door's
+// nats:console grant, or the inject and A2A static bearer-token doors where any
+// token holder can self-assert an author/caller name). Personal memory must
+// stay off for shared credentials so one caller's private memories never pool
+// with or become readable by another's.
+func hasSharedPrincipal(key string, auth routeAuthority) bool {
+	if strings.HasPrefix(key, "console:") || strings.HasPrefix(key, "inject:") {
+		return true
+	}
+	switch strings.TrimSpace(auth.Requester.Backend) {
+	case "console", "inject", "a2a":
+		return true
+	}
+	switch strings.TrimSpace(auth.Requester.VerifiedBy) {
+	case "nats-grant", "inject-bearer", "a2a-bearer":
+		return true
+	}
+	return false
+}
+
+// identityRouteFor extracts an identity-only record for doors without a chat
+// notify route (such as the Google-token A2A door or Discord) when the gateway
+// supplies a non-shared requester principal. Doors whose credential is shared
+// across callers (console, inject, and static-token A2A) clear userID and do
+// not record a user route, since any a2a-* session without a stored user_id
+// already fails closed as an unattributable interactive conversation.
+func identityRouteFor(env *lib.Envelope) (conversationRoute, bool) {
+	auth, err := parseRouteAuthority(env)
+	if err != nil {
+		return conversationRoute{}, false
+	}
+	key := strings.TrimSpace(auth.Audience.Conversation)
+	userID := strings.TrimSpace(auth.Requester.Principal)
+	chatType := strings.TrimSpace(auth.Audience.Kind)
+	if hasSharedPrincipal(key, auth) || key == "" || userID == "" || env.ContextID == "" {
+		return conversationRoute{}, false
+	}
+	return conversationRoute{
+		Conversation: key,
+		ContextID:    env.ContextID,
+		UserID:       userID,
+		ChatType:     chatType,
+	}, true
 }
 
 // recordRoute records env's conversation route against sessionID. It returns
@@ -111,6 +252,15 @@ func (b *Bridge) recordRoute(ctx context.Context, sessionID string, env *lib.Env
 	}
 	route, err := routeFor(env)
 	if err != nil {
+		if errors.Is(err, errNoChatConversation) {
+			if idRoute, ok := identityRouteFor(env); ok && b.recordedRoute(sessionID) != idRoute {
+				if putErr := b.putRoute(ctx, sessionID, idRoute); putErr != nil {
+					b.cfg.Logger.Warn("conversation identity PUT failed", "session", sessionID, "err", putErr)
+				} else {
+					b.rememberRoute(sessionID, idRoute)
+				}
+			}
+		}
 		return err
 	}
 	prompt, _ := promptFromMessage(env.Payload)
@@ -118,8 +268,18 @@ func (b *Bridge) recordRoute(ctx context.Context, sessionID string, env *lib.Env
 	if err := b.putRoute(ctx, sessionID, route); err != nil {
 		// The ask is a reaction's kind, not what a card needs to report
 		// back: an earlier record of the same conversation still routes it.
+		// In a group conversation, the requester principal varies by speaker
+		// while personal memory is disabled regardless, so an earlier group
+		// record of the same conversation still holds.
+		// A console route's task is not: a card filed now would report
+		// naming the earlier turn, which its client cannot join to this one,
+		// so a console route differing only in its task is lost, and the
+		// answer says the card's report may not arrive.
 		earlier := b.recordedRoute(sessionID)
 		earlier.Ask = route.Ask
+		if route.ChatType == "group" {
+			earlier.UserID = route.UserID
+		}
 		if earlier == route {
 			b.cfg.Logger.Warn("conversation route PUT failed; the session's earlier record of the same route stands",
 				"session", sessionID, "err", err)
@@ -164,17 +324,32 @@ func (b *Bridge) rememberRoute(sessionID string, route conversationRoute) {
 
 // putRoute writes route against sessionID in the store.
 func (b *Bridge) putRoute(ctx context.Context, sessionID string, route conversationRoute) error {
+	return b.putSessionRecord(ctx, fmt.Sprintf(routePathFormat, url.PathEscape(sessionID)), route)
+}
+
+// storeStatusError is a non-2xx answer from the session-kv store.
+type storeStatusError struct {
+	status int
+	detail string
+}
+
+func (e *storeStatusError) Error() string {
+	return fmt.Sprintf("HTTP %d: %s", e.status, e.detail)
+}
+
+// putSessionRecord PUTs body as JSON to path under the session-kv store.
+func (b *Bridge) putSessionRecord(ctx context.Context, path string, body any) error {
 	if strings.TrimSpace(b.cfg.RouteKey) == "" {
 		return fmt.Errorf("%s is not set", RouteKeyEnv)
 	}
-	body, err := json.Marshal(route)
+	raw, err := json.Marshal(body)
 	if err != nil {
 		return err
 	}
 	ctx, cancel := context.WithTimeout(ctx, routeTimeout)
 	defer cancel()
-	target := strings.TrimRight(b.cfg.RouteURL, "/") + fmt.Sprintf(routePathFormat, url.PathEscape(sessionID))
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, target, bytes.NewReader(body))
+	target := strings.TrimRight(b.cfg.RouteURL, "/") + path
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, target, bytes.NewReader(raw))
 	if err != nil {
 		return err
 	}
@@ -186,8 +361,93 @@ func (b *Bridge) putRoute(ctx context.Context, sessionID string, route conversat
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, routeErrorTailBytes))
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+		tail, _ := io.ReadAll(io.LimitReader(resp.Body, routeErrorTailBytes))
+		return &storeStatusError{status: resp.StatusCode, detail: strings.TrimSpace(string(tail))}
 	}
 	return nil
+}
+
+// The session's origin (docs/designs/proposal-origin.md §2.1): before a task's
+// first turn the bridge records which door opened the session, once, under
+// PUT /v1/sessions/{id}/origin; session-kv answers 409 when the session
+// already has a record, as a resumed session does. The origin values are the
+// Session KV server's ORIGINS (agents/platform/scripts/session_kv_server.py),
+// held to it by TestBackendOriginsArePinnedToTheSessionKVServer.
+const (
+	originPathFormat = "/v1/sessions/%s/origin"
+	originChat       = "chat"
+	originConsole    = "console"
+	originAPI        = "api"
+
+	// The gateway's door names (a2a/gateway: gchatBackend, slackBackend, ...).
+	backendGchat     = "gchat"
+	backendSlack     = "slack"
+	backendDiscord   = "discord"
+	backendConsole   = "console"
+	backendA2A       = "a2a"
+	backendA2AGoogle = "a2a-google"
+	backendInject    = "inject"
+
+	// originPlatformGooglechat is gchat's origin platform in the chat metrics
+	// label vocabulary (agents/chat/defaults/plugins/chat_metrics/metrics.py
+	// HERMES_PLATFORM_LABELS), the one every origin writer uses.
+	originPlatformGooglechat = "googlechat"
+)
+
+// errOriginExists is a session that already has its origin record.
+var errOriginExists = errors.New("the session already has an origin record")
+
+// sessionOrigin is the origin PUT's body.
+type sessionOrigin struct {
+	Origin   string `json:"origin"`
+	Platform string `json:"platform,omitempty"`
+}
+
+// backendOrigins maps the gateway door a task came through
+// (authority.requester.backend) to the session's origin. A chat door's
+// platform is the ledger's platform label: Google Chat and Slack are spelled
+// as the chat metrics labels spell them, and Discord, which has no chat
+// metrics label, keeps its backend name.
+var backendOrigins = map[string]sessionOrigin{
+	backendGchat:     {Origin: originChat, Platform: originPlatformGooglechat},
+	backendSlack:     {Origin: originChat, Platform: backendSlack},
+	backendDiscord:   {Origin: originChat, Platform: backendDiscord},
+	backendConsole:   {Origin: originConsole},
+	backendA2A:       {Origin: originAPI},
+	backendA2AGoogle: {Origin: originAPI},
+	backendInject:    {Origin: originAPI},
+}
+
+// putOrigin writes the session's origin record; errOriginExists when it has one.
+func (b *Bridge) putOrigin(ctx context.Context, sessionID, origin, platform string) error {
+	err := b.putSessionRecord(ctx, fmt.Sprintf(originPathFormat, url.PathEscape(sessionID)),
+		sessionOrigin{Origin: origin, Platform: platform})
+	var status *storeStatusError
+	if errors.As(err, &status) && status.status == http.StatusConflict {
+		return errOriginExists
+	}
+	return err
+}
+
+// recordOrigin records the origin env's door implies against sessionID. Best
+// effort: a door with no mapping records nothing, an existing record is left,
+// and a failed write is logged and ignored.
+func (b *Bridge) recordOrigin(ctx context.Context, sessionID string, env *lib.Envelope) {
+	if b.cfg.RouteURL == "" {
+		return
+	}
+	auth, err := parseRouteAuthority(env)
+	if err != nil {
+		return
+	}
+	origin, ok := backendOrigins[strings.TrimSpace(auth.Requester.Backend)]
+	if !ok {
+		return
+	}
+	switch err := b.putOrigin(ctx, sessionID, origin.Origin, origin.Platform); {
+	case errors.Is(err, errOriginExists):
+		b.cfg.Logger.Debug("session origin already recorded", "session", sessionID)
+	case err != nil:
+		b.cfg.Logger.Warn("session origin not recorded", "session", sessionID, "err", err)
+	}
 }

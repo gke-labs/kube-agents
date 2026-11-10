@@ -571,11 +571,15 @@ class B1NoAgentCredentialCausesAProductionChange(unittest.TestCase):
         self.assertGreaterEqual(checked, 5, "the scan matched fewer remote servers than ship")
 
     def test_B1_only_the_gateway_reaches_the_mcp_relay(self) -> None:
-        """The relay is the gateway's: the sandbox and session pods get no new read path."""
+        """The relay is the gateway's: the sandbox and session pods get no new read path.
+
+        Profile workers are the one other role, narrowed in the handler to the
+        servers whose tools name no cluster (A3, PROFILE_SERVER_TOOLS, #3658).
+        """
         prefix = h.mcp_policy.MCP_RELAY_PREFIX
         self.assertEqual(
             h.credential_proxy.required_roles(prefix + "gke"),
-            (h.credential_proxy.CALLER_ROLE_CHAT,),
+            (h.credential_proxy.CALLER_ROLE_CHAT, h.credential_proxy.CALLER_ROLE_PROFILE),
         )
 
     def test_B1_the_operator_points_the_relay_url_at_the_brokers_mcp_route(self) -> None:
@@ -628,7 +632,7 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
     def test_B2_no_workflow_grants_a_bot_the_ability_to_approve(self) -> None:
         """`pull-requests: write` is the permission an approval needs.
 
-        Eight workflows hold it, and none can give an approval:
+        Seven workflows hold it, and none can give an approval:
 
         - auto-enqueue: `schedule`, `workflow_dispatch` and
           `pull_request_target: labeled, unlabeled`, `permissions: {}` at the
@@ -639,15 +643,13 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
           auto-merge calls run on a GitHub App token, which the tests below
           pin; the comment explains a removal and cannot approve or merge.
         - auto_request_review, which requests reviewers and does not give them.
-        - auto-assign-milestone: triggers on `pull_request_target: closed`
-          gated on `merged == true`, so it runs only after the merge decision
-          has been taken, and its one call is `gh pr edit --milestone`.
         - coverage-comment: `workflow_run`-triggered in the base repository,
           job-gated on `github.repository`, and its one write is posting the
           coverage comment.
         - risk_classify: `pull_request_target` with `permissions: {}` at the
-          top, the grant job-scoped, checkout pinned to the default branch,
-          and its one write is swapping the `risk:*` label.
+          top, job-gated on `github.repository`, the grant job-scoped, checkout
+          pinned to the default branch, and its one write is swapping the
+          `risk:*` label.
         - hold-unresolved-threads: `schedule` plus `pull_request_target:
           labeled`, `permissions: {}` at the top, the grant job-scoped,
           checkout pinned to the default branch, and its writes are the
@@ -671,8 +673,8 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
           check; it cannot approve, label, or merge anything.
 
         The list is an allowlist of holders, not of intents: the permission is
-        a capability, and this asserts membership rather than absence so a
-        ninth holder is a red test and a conversation rather than a silent
+        a capability, and this asserts membership rather than absence so an
+        eighth holder is a red test and a conversation rather than a silent
         addition. Adding a name here means someone read the workflow. A GitHub
         App token minted with Pull requests write is not a `permissions:`
         grant; `test_B2_app_token_write_grants_are_pinned` holds those.
@@ -690,7 +692,6 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
                     break
         self.assertEqual(
             [
-                "auto-assign-milestone.yml",
                 "auto-enqueue.yml",
                 "auto_request_review.yml",
                 "ci-health.yml",
@@ -714,9 +715,9 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
         auto-merge, which with a merge queue on `main` means "enqueue once the
         required checks pass". That is assent by policy: it fires only on
         `lgtm` and `approved` with no `do-not-merge` label, the predicate Tide
-        merges on today, and Prow sets those two labels only for accounts the
-        `OWNERS` files name. No model verdict is an input. The call runs on a
-        GitHub App token, not on a `pull-requests: write` grant: the holder
+        merged on before the merge queue, and Prow sets those two labels only
+        for accounts the `OWNERS` files name. No model verdict is an input.
+        The call runs on a GitHub App token, not on a `pull-requests: write` grant: the holder
         list above shows `auto-enqueue.yml` only for its left-out comment, and
         the App-token test below pins who mints one. The next test pins the predicate; any other script under
         `scripts/` making one of these calls is a red.
@@ -753,7 +754,7 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
 
         Auto-merge goes on only for a pull request that is not a draft, carries
         both `lgtm` and `approved`, and carries none of the `do-not-merge`
-        labels Tide's query excludes. Every other combination must leave it
+        labels Tide's query excluded. Every other combination must leave it
         off. That holds on each removal path too: never removed, removed with
         the one retry after a `failed_checks` removal due, and removed with it
         spent, which stays out.

@@ -47,12 +47,12 @@ The shipped path is four stages, described in full by the
 [`bootstrap_onboarding` README](../../agents/chat/defaults/plugins/bootstrap_onboarding/README.md)
 and the site's [ChatOps concepts page](../site/src/content/docs/concepts/chatops.md), which are
 canonical for it. In outline: `bootstrap_scan_gate.py` files a kanban card to `platform`; that
-worker follows `inventory.md` and lists the fleet, while the gate files one audit card per Cluster Agent; once their cards settle,
+worker follows `inventory.md` and lists the fleet, while the gate files one audit card per Cluster Agent up to the first-run cap (the sweep audits the rest); once their cards settle,
 `bootstrap_handoff.py` writes the complete findings to `/opt/data/INVENTORY.raw.md`; a
 second card follows `inventory_prioritize_sop.md`, scoring and registering everything, and
 `inventory_findings.py select` chooses what it renders to `/opt/data/INVENTORY.md`: at most
 `FINDINGS_FIRST_REPORT_CRITICALS` (2) critical items and nothing below critical (§7.2);
-`bootstrap_delivery.py` posts that file to chat as written, followed by a note on the first-run audits (on Slack with `KAGE_SLACK_UX` on, laid out
+`bootstrap_delivery.py` posts that file to chat as written, followed by a note on the fleet audits (on Slack with `KAGE_SLACK_UX` on, laid out
 again by a fixed script that keeps every listed finding with its sentence as written) and marks the
 listed findings shown. The cap covers criticals too. A fleet with six criticals gets two in the report
 and the other four through the paced nudge; a fleet with one critical and forty gaps gets one, and the
@@ -347,8 +347,9 @@ alone does not mean shown: `expire_snoozes`, a `PATCH` and a pull all set it wit
 An _item_ is the rows that share check, project and cluster, one gathered line: they are named and
 marked together, the item is pending while any of them is, and its severity is the highest among its
 pending and never-shown members. A decision (accept, snooze, dismiss) on any row of an item is
-applied to every other row of it that is still `queued` or `surfaced`, so the one id the nudge
-prints is enough to decide the line; the count the nudge prints beside that id is the number of rows
+applied to every other row of it that is still `surfaced`, so the one id the nudge
+prints is enough to decide the line it named; a `queued` row of the item, which no message has
+named, keeps its state (§7.2); the count the nudge prints beside that id is the number of rows
 the decision reaches, which includes shown rows a sweep stopped reporting; the nudge does not list
 those, and says how many of the count they are. Two consequences of the
 severity rule are accepted rather than designed around: a new critical row that joins a pending
@@ -906,8 +907,8 @@ rather than the whole queue at once, so the first inventory report lists only it
 and after it `findings_nudge.py` runs hourly and names only what `findings_queue.pace` allows, using
 §3.2's _shown_, _pending_ and _item_:
 
-- **The first report:** at most `FINDINGS_FIRST_REPORT_CRITICALS` (2) critical items, and nothing
-  below critical. Its delivery marks them shown as critical additions on that UTC day, so they count
+- **The first report:** at most `FINDINGS_FIRST_REPORT_CRITICALS` (2) critical items, never more
+  than the 20 rows one chat message carries, and nothing below critical. Its delivery marks them shown as critical additions on that UTC day, so they count
   against that day's `FINDINGS_DAILY_CRITICALS`, are pending from then on, and are reminded from the
   next UTC day.
 - **Criticals:** new critical items are added from 12:00 UTC (`REMIND_HOUR`), at most
@@ -999,7 +1000,10 @@ what makes that visible. An undecided critical holds every new non-critical back
 stays pending, while new criticals still arrive within the day's budget; the daily reminder names
 it only if it is in the day's top, and nothing says that non-criticals are waiting. On a standard
 install only a person's decision (dismiss, snooze or accept) releases a pending item: clearing one without a person needs §7.4's verification, which is not
-built. The onboarding sweep runs once, so for its rows no recurring complete sweep lowers a fixed
+built. A decision reaches only the rows of the item a message has named: the nudge marks every
+member of a line it names, so its count is what the decision covers, while a row a sweep adds to the
+line after the message stays `queued` and keeps its state, and the decision returns its id as left
+open (`item_rows_left_open`) until a later message names it. The onboarding sweep runs once, so for its rows no recurring complete sweep lowers a fixed
 row's `C` unless someone re-runs the sweep by hand; the weekly upgrade readiness review is such a
 sweep for its own `upgrade-` rows, so a shown row of that family that a Saturday no longer reports
 is not pending and is not reminded from that Saturday on, and comes back at the confidence the

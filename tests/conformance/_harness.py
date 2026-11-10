@@ -58,6 +58,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 import command_policy  # noqa: E402
 import credential_proxy  # noqa: E402
 import mcp_policy  # noqa: E402
+import task_confinement  # noqa: E402
 import watcher_policy  # noqa: E402
 
 # The name the gateway redactor is registered under in sys.modules when a test
@@ -231,6 +232,14 @@ SOURCES: dict[str, Source] = {
         "charts/kube-agents/templates/agent-rbac-admission-policy.yaml",
         ("policyName",),
     ),
+    "gateway_pod_policy": Source(
+        "k8s-operator/config/admission/a2a-gateway-pod-policy.yaml",
+        ("kube-agents-a2a-gateway-pod", "failurePolicy", "variables.sessionAccount"),
+    ),
+    "chart_gateway_pod_policy": Source(
+        "charts/kube-agents/templates/a2a-gateway-pod-admission-policy.yaml",
+        ("kube-agents.a2aGatewayPodPolicyEnabled", "policyName"),
+    ),
     # --- rendered output the operator is asserted against -----------------
     "shell_sandbox_manifests_go": Source(
         "k8s-operator/internal/controller/shell_sandbox_manifests.go",
@@ -290,7 +299,8 @@ SOURCES: dict[str, Source] = {
     # The A2A gateway's rendered ingress: its three fences and the gateway
     # container's declared ports, written by an operator Go test
     # (TestRenderedA2AGatewayIngressMatchesTheConformanceFixture) because no
-    # golden renders mode next. The anchors are the collector's namespace and
+    # golden renders mode next with both doors armed (the next-mode golden is
+    # the example CR, which arms neither). The anchors are the collector's namespace and
     # the metrics port's name: lose either and C1's assertion has nothing to
     # hold the fences to.
     "a2a_gateway_ingress_fixture": Source(
@@ -449,6 +459,14 @@ SOURCES: dict[str, Source] = {
     # file also holds one half of a contract neither module can import: the
     # operator renders an env var naming the agent's principal, and the `a2a`
     # CLI reads it back to pin its inbox prefix.
+    # The AgentProfile dispatcher's identity is built in its own file. It
+    # authenticates through the callout, so it is in no served config, and
+    # its publish list is appended to a per-profile slice that the identity
+    # reader above can't parse; the writer tests read its body directly.
+    "a2a_dispatcher": Source(
+        "k8s-operator/internal/controller/platformagent_a2a_dispatcher.go",
+        ("func dispatcherIdentity(", "a2a.dispatch.*.*.*"),
+    ),
     "a2a_identities": Source(
         "k8s-operator/internal/controller/platformagent_a2a_identities.go",
         (
@@ -477,13 +495,14 @@ SOURCES: dict[str, Source] = {
     ),
     "a2a_session_grants": Source(
         "a2a/authcallout/session.go",
-        ("func sessionGrants", "func executorGrants", "lib.TaskEventsSubject(addressee,"),
+        ("func sessionGrants", "func executorGrants", "func executorTaskGrants", "lib.TaskEventsSubject(addressee,"),
     ),
-    # The other narrowing that starts from executorGrants: an AgentProfile's
-    # pods (the A2A profile resource, not a Hermes profile directory).
+    # The other narrowing that starts from executorTaskGrants: an
+    # AgentProfile's pods (the A2A profile resource, not a Hermes profile
+    # directory), on the task connection a task credential opens (#3889).
     "a2a_profile_grants": Source(
         "a2a/authcallout/profile_narrowing.go",
-        ("func profileGrants", "executorGrants(profile, pod)"),
+        ("func profileGrants", "func profileTaskGrants", "executorTaskGrants(profile, task, stem)"),
     ),
     # What the server actually loads, as opposed to what the Go builders say.
     # The writer-set tests read both and assert they agree: the Go map is what

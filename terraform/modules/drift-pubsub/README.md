@@ -60,7 +60,7 @@ The 10,000 is the query's row cap rather than the window's true total, so it fix
 
 The exclusion is scoped by principal rather than dropping Leases outright, so a person running `kubectl patch lease` still reaches the detector. That is not GitOps drift, but it can knock an active controller off its lock, and discarding it silently is hard to defend.
 
-Both principal clauses matter. Matching `^system:` alone leaves the GKE service agent behind — in the same sample `container-engine-robot` made 287 Lease writes, which would have inflated the surviving stream by 65%. The second clause matches any `*.iam.gserviceaccount.com`, covering it and any future service agent that carries the `iam` label. It does not cover the Google-managed accounts, which do not carry it — `<number>-compute@developer.`, `@cloudbuild.`, `@appspot.` and `@cloudservices.` — so their Lease writes survive this exclusion and reach the topic. That costs delivered volume and nothing else: the detector matches the whole `.gserviceaccount.com` domain and drops them as automation. Widening the suffix here would cut volume, and is left for its own change because it alters what a deployed install receives.
+Both principal clauses matter. Matching `^system:` alone leaves the GKE service agent behind — in the same sample `container-engine-robot` made 287 Lease writes, which would have inflated the surviving stream by 65%. The second clause matches the whole `*.gserviceaccount.com` domain: that agent, any future service agent under `iam`, and the Google-managed accounts that carry no `iam` label — `<number>-compute@developer.`, `@cloudbuild.`, `@appspot.` and `@cloudservices.` — whose node heartbeats are most of what a node pool writes. It is the same suffix the detector's classifier drops as automation, so no Lease write the sink drops would have reached the join; dropping them at the sink rather than in the detector keeps them out of the pull, where a full batch of them can serialize past the credential broker's relay cap. The surviving-stream figures above were measured with the clause narrowed to `*.iam.gserviceaccount.com`, so the whole-domain clause delivers less than they say. A change to the clause reaches an install on its next apply, as an in-place update of the sink's filter.
 
 Set the variable to `false` to export the unfiltered stream while debugging.
 
@@ -132,4 +132,4 @@ than half of it, but it does not adopt it.
 [The detector's README](../../../k8s-operator/cmd/drift-detector/README.md) is canonical for what
 happens when the budget outlasts the deadline.
 
-See the [Release versioning & promotion guide](../../../docs/site/src/content/docs/deploy/release-versioning.md) for SemVer pinning instructions.
+See the [Release versioning guide](../../../docs/site/src/content/docs/deploy/release-versioning.md) for SemVer pinning instructions.

@@ -18,21 +18,25 @@
 
 import argparse
 import hashlib
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 import sandbox_exec
 from gke_endpoint import EndpointDecision, endpoint_decision
 from profile_scaffold import (
     HERMES_BIN,
+    PROFILE_LOCKS_DIRNAME,  # noqa: F401 - re-exported for this script's tests
     backfill_cron_file,
     ensure_profile,
     is_scaffolded,
     overlay_template,
+    profile_lock,
     profiles_base,
 )
 
@@ -54,6 +58,15 @@ SANDBOX_MIRROR = Path(
 # Comfortably past the mirror's own `--wait 30` plus one SSH round trip per
 # cluster profile, so this timeout only fires when the mirror itself is stuck.
 SANDBOX_MIRROR_TIMEOUT_SECONDS = 120
+# A prune's batch (#4574): how many names delete_profiles holds locks for at once.
+# Each held lock is an open file until its chunk's sandbox removal is done, the
+# descriptor lesson of #4628; a prune larger than this runs in several chunks,
+# each still one mirror start and one SSH hop.
+DELETE_BATCH_MAX = 50
+# sandbox_mirror.REMOVE_RESULT_PREFIX: the line --remove-profile prints with each
+# name's outcome. Spelled here because that script is run, not imported;
+# test_cluster_agent_profile holds the two equal.
+MIRROR_REMOVE_RESULT_PREFIX = "remove-result: "
 ENV_HERMES_OTEL_ENABLED = "HERMES_OTEL_ENABLED"
 ENV_OTEL_SDK_DISABLED = "OTEL_SDK_DISABLED"
 # Hermes stores each profile at $HERMES_HOME/profiles/<name> (persists on the data PVC).
@@ -94,6 +107,32 @@ SOUL_SECTION_1_ANCHOR = "---\n\n## 1. Core Truths"
 # a minute per cluster on a busy broker.
 CONNECTIVITY_PROBE_REQUEST_TIMEOUT = "5s"
 CONNECTIVITY_PROBE_TIMEOUT_SECONDS = 45
+# The shim retries a broker refusal on its own (credential_proxy_client, keeping
+# a retry's admission wait, not its run, inside a deadline the caller may
+# shorten). The probe's bound is shorter than one admission wait, let alone a
+# one-shot kubectl's 60 s run after it (the broker's --kubectl-timeout-seconds
+# default), so a retry could only end in the probe's own kill, with the
+# refusal's text, the one line the probe exists to log, unread. The probe tells
+# the shim its bound less the run bound, under which no retry fits, and a
+# refused probe logs the refusal at once. The variable's name is spelled here
+# rather than imported from credential_proxy_client (test_cluster_agent_profile.py
+# holds the two equal): the image entrypoint's cluster loop runs this script at
+# gateway start-up, and tests/test_docker_entrypoint.py stages it with the three
+# modules it imports, so a new import here is a loop that silently stops stamping.
+SHIM_RETRY_DEADLINE_ENV = "CREDENTIAL_PROXY_RETRY_DEADLINE_SECONDS"
+BROKER_KUBECTL_RUN_SECONDS = 60
+PROBE_SHIM_RETRY_DEADLINE_SECONDS = max(0, CONNECTIVITY_PROBE_TIMEOUT_SECONDS - BROKER_KUBECTL_RUN_SECONDS)
+# The credential fetch in step 3 is a gcloud, which the broker bounds at 300 s
+# (its --timeout-seconds default), under a 60 s cap: one admission wait at
+# most, so a held refusal cannot reach a retry, but the broker's resource
+# watermark gate refuses at once with a 5 to 30 s Retry-After and the shim's
+# 170 s default admits three or four such waits, so without the deadline about
+# half the draws carry the fetch past its cap and the scaffold exits on
+# "timed out" where the refusal's reason is the line to read. Same rule, same
+# answer: the cap less the run bound, under which no retry fits.
+CREDENTIAL_FETCH_TIMEOUT_SECONDS = 60
+BROKER_GCLOUD_RUN_SECONDS = 300
+CREDENTIAL_FETCH_SHIM_RETRY_DEADLINE_SECONDS = max(0, CREDENTIAL_FETCH_TIMEOUT_SECONDS - BROKER_GCLOUD_RUN_SECONDS)
 # What kubectl prints when it never reached the API server, as opposed to an
 # answer it did not like (401, 403, NotFound). The endpoint remedy is about
 # reaching the server, so it is offered only for the first kind.
@@ -109,13 +148,17 @@ CONNECTIVITY_FAILURE_RE = re.compile(
 # ... Connection refused", "credential proxy: kubeconfig is unreadable") are
 # the shim or the broker, not the cluster's list. Matched on the shim's
 # prefixes, not the words: preflight's cap text mentions "the credential
-# proxy's admission wait" and is a real timeout.
+# proxy's admission wait" and is a real timeout. Only the shim's terminal
+# lines are here, the ones after which it exits without running kubectl: its
+# "credential proxy busy ... retrying" line is followed by the admitted
+# attempt's own stderr, so a command refused once and then failing to reach
+# the endpoint still earns the remedy.
 # "Error from server" fronts every answer the API server gave, a degraded
 # etcd's "request timed out" included: the server was reached, so the list is
 # not what stands in the way whatever words follow.
 NOT_A_CONNECTION_FAILURE_RE = re.compile(
     r"credential proxy( token)? unavailable|credential proxy error|credential proxy:|"
-    r"Error from server",
+    r"credential proxy throttled|Error from server",
     re.IGNORECASE,
 )
 
@@ -368,6 +411,12 @@ def _push_sandbox_layout(name: str) -> None:
     entrypoint's job and has a marker of its own. A brand new profile has no
     files to move.
 
+    ``--profile``: this profile's home, plus the machine home and the platform
+    profile (the mirror's FIXED_HOMES, which the sandbox creates as bare roots).
+    Every other cluster home is left to its own scaffold or the entrypoint's
+    start-time pass; re-sending every home on every scaffold made onboarding N
+    clusters O(N^2) (#3701).
+
     Never fatal. An install with no sandbox exits 0 from the script itself, and
     a sandbox that is down leaves a profile whose shell starts in the machine
     home -- which is where it starts anyway.
@@ -377,7 +426,8 @@ def _push_sandbox_layout(name: str) -> None:
     try:
         subprocess.run(
             [sys.executable, str(SANDBOX_MIRROR),
-             "--agent-home", str(HERMES_HOME), "--skeleton-only", "--wait", "30"],
+             "--agent-home", str(HERMES_HOME), "--skeleton-only", "--profile", name,
+             "--wait", "30"],
             check=True,
             capture_output=True,
             text=True,
@@ -387,6 +437,164 @@ def _push_sandbox_layout(name: str) -> None:
     except Exception as e:  # noqa: BLE001 - no sandbox, or a sandbox that is down
         log(f"{name}: could not push the profile layout into the shell sandbox ({e}); "
             "the next container start retries it")
+
+
+def _remove_sandbox_layout(name: str) -> None:
+    """Remove a deleted profile's home from the shell sandbox (#4389).
+
+    The inverse of _push_sandbox_layout, through the same script over the same
+    SSH hop: the mirror's ``--remove-profile`` mode, which refuses a name that
+    still has anything under this pod's profiles/. delete_profile calls it under
+    the profile's lock, after the home here is gone, so no scaffold of the same
+    name can be between those two steps. A prune's batch uses
+    _remove_sandbox_layouts instead: one call for many names (#4574).
+
+    Never fatal, for the reason the push is not: a sandbox that is down leaves a
+    stale skeleton, which costs disk and nothing else.
+    """
+    if not SANDBOX_MIRROR.is_file():
+        return
+    try:
+        subprocess.run(
+            [sys.executable, str(SANDBOX_MIRROR),
+             "--agent-home", str(HERMES_HOME), "--skeleton-only", "--remove-profile", name,
+             "--wait", "30"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=SANDBOX_MIRROR_TIMEOUT_SECONDS,
+        )
+        log(f"{name}: removed the profile layout from the shell sandbox")
+    except Exception as e:  # noqa: BLE001 - no sandbox, or a sandbox that is down
+        log(f"{name}: could not remove the profile layout from the shell sandbox ({e}); "
+            "its directory stays there until somebody removes it")
+
+
+def _remove_sandbox_layouts(names: list[str]) -> dict[str, str]:
+    """Remove several deleted profiles' homes from the sandbox in one mirror call.
+
+    `_remove_sandbox_layout` for a batch (#4574): one mirror start and one SSH hop
+    for every name, rather than one each. Returns each name's outcome as the
+    mirror reports it: "removed", "left" (the rm could not take it) or "refused"
+    (something of it is still here). A name the mirror said nothing about, because
+    there is no sandbox, it did not answer, or its answer cannot be read, is
+    "unreached". Never fatal, for the reason the single removal is not.
+    """
+    if not names:
+        return {}
+    unreached = {name: "unreached" for name in names}
+    if not SANDBOX_MIRROR.is_file():
+        return unreached
+    argv = [sys.executable, str(SANDBOX_MIRROR), "--agent-home", str(HERMES_HOME), "--skeleton-only",
+            "--wait", "30"]
+    for name in names:
+        argv += ["--remove-profile", name]
+    try:
+        done = subprocess.run(argv, check=False, capture_output=True, text=True,
+                              timeout=SANDBOX_MIRROR_TIMEOUT_SECONDS)
+        lines = [line for line in done.stdout.splitlines() if line.startswith(MIRROR_REMOVE_RESULT_PREFIX)]
+        if not lines and done.returncode == 0:
+            # The mirror's "no sandbox to mirror" exits (no ssh terminal backend, no
+            # agent home): zero, before it reads the names. Nothing to remove there.
+            return {name: "removed" for name in names}
+        if not lines:
+            raise ValueError(f"no result line (exit {done.returncode})")
+        result = json.loads(lines[-1][len(MIRROR_REMOVE_RESULT_PREFIX):])
+    except Exception as e:  # noqa: BLE001 - no sandbox, a sandbox that is down, or a bad answer
+        log(f"could not remove {len(names)} profile layout(s) from the shell sandbox ({e}); "
+            "their directories stay there until somebody removes them")
+        return unreached
+    outcomes = dict(unreached)
+    for outcome in ("removed", "left", "refused"):
+        for name in result.get(outcome) or []:
+            if name in outcomes:
+                outcomes[name] = outcome
+    return outcomes
+
+
+def delete_profiles(names: list[str]) -> dict[str, str]:
+    """Delete several profiles, here and in the sandbox; return each one's outcome (#4574).
+
+    delete_profile for a prune's worth of names, with the sandbox removals made in
+    one mirror call per chunk rather than one per name. Each name keeps
+    delete_profile's guarantee: its sandbox home goes only while its lock is held
+    and its home here is gone. The locks are taken in sorted order and without
+    blocking: a held one is a scaffold or delete of that name running now, so that
+    name alone is skipped, and the next run tries it again.
+
+    Outcomes: "deleted" (here and in the sandbox), "locked" (skipped: its lock was
+    held), "home-remains" (its home here survived the delete, so its sandbox home
+    was not touched), "sandbox-unlocked" (its lock could not be opened: deleted
+    here, as delete_profile does, and its sandbox home left), and "sandbox-left",
+    "sandbox-refused" or "sandbox-unreached" (gone here; the sandbox home stays, as
+    the mirror said).
+
+    A held lock is a scaffold or delete that a blocking create of the same name
+    may queue behind; while a chunk holds its locks, such a create waits for that
+    chunk's deletes and its one mirror call, not one delete's.
+    """
+    outcomes: dict[str, str] = {}
+    ordered = sorted(set(names))
+    for start in range(0, len(ordered), DELETE_BATCH_MAX):
+        with ExitStack() as held:
+            mine = []
+            for name in ordered[start:start + DELETE_BATCH_MAX]:
+                errors: list[str] = []
+                if held.enter_context(profile_lock(profile_lock_root(), name, blocking=False,
+                                                   on_error=lambda e, errs=errors: errs.append(str(e)))):
+                    mine.append(name)
+                elif errors:
+                    # As delete_profile does without its lock: delete here, keep the
+                    # sandbox home. Skipping the name outright would keep its
+                    # project retiring for as long as the lock directory is broken.
+                    _delete_profile(name)
+                    outcomes[name] = "sandbox-unlocked"
+                    log(f"{name}: its profile lock could not be opened ({errors[0]}); "
+                        "deleted here, its sandbox home stays")
+                else:
+                    outcomes[name] = "locked"
+                    log(f"{name}: not deleted this run, its profile lock is held")
+            for name in mine:
+                _delete_profile(name)
+            gone = [name for name in mine if not os.path.lexists(profile_home(name))]
+            for name in mine:
+                if name not in gone:
+                    outcomes[name] = "home-remains"
+                    log(f"{name}: its home survived the delete; its sandbox home stays")
+            sandbox = _remove_sandbox_layouts(gone)
+            for name in gone:
+                outcomes[name] = {"removed": "deleted"}.get(sandbox[name], f"sandbox-{sandbox[name]}")
+            removed = [name for name in gone if outcomes[name] == "deleted"]
+            if removed:
+                log(f"removed {len(removed)} profile layout(s) from the shell sandbox in one call: {', '.join(removed)}")
+    return outcomes
+
+
+def profile_lock_root() -> Path:
+    """The data root this script's profile locks live under: HERMES_HOME, which is
+    the data volume itself wherever this script runs (the chat roster, the CLI)."""
+    return HERMES_HOME
+
+
+@contextmanager
+def _profile_lock(name: str):
+    """Hold this profile name's lock; yield whether it is held.
+
+    The reconcile's own lock keeps two reconciles apart, but not a reconcile's
+    PRUNE from a `create` or `delete` of the same name run some other way: by
+    hand in the agent pod, or by bench seeding (the model cannot run this script;
+    the sandbox carries a stub at its path). A delete that removed the sandbox
+    home after such a create had pushed it would take the kubeconfig the create
+    then fetched into it. Blocking: a scaffold is bounded
+    by its own timeouts, and the other side waits it out rather than racing it.
+    An unopenable lock yields False, and the caller decides what that forbids.
+    kanban_workspace_gc's stale-home sweep holds the same lock (profile_scaffold.profile_lock).
+    """
+    def report(e):
+        log(f"{name}: could not open the profile lock ({e}); a create refuses, a delete leaves the sandbox home")
+
+    with profile_lock(profile_lock_root(), name, on_error=report) as held:
+        yield held
 
 
 def _endpoint_bullets(decision: EndpointDecision | None) -> str:
@@ -447,7 +655,10 @@ def _probe_connectivity(name: str, kubeconfig: Path, decision: EndpointDecision 
         # cost one misleading line in the scaffold log.
         completed = sandbox_exec.run(
             argv,
-            remote_env={"KUBECONFIG": str(kubeconfig)},
+            remote_env={
+                "KUBECONFIG": str(kubeconfig),
+                SHIM_RETRY_DEADLINE_ENV: str(PROBE_SHIM_RETRY_DEADLINE_SECONDS),
+            },
             local_env=_run_env({"KUBECONFIG": str(kubeconfig)}),
             timeout=CONNECTIVITY_PROBE_TIMEOUT_SECONDS,
             principal=sandbox_exec.TERMINAL_PRINCIPAL,
@@ -488,7 +699,17 @@ def create_profile(project: str, cluster: str, location: str) -> str:
     for field, value in (("project", project), ("cluster", cluster), ("location", location)):
         _validate(value, field)
     name = profile_name(project, cluster, location)
+    with _profile_lock(name) as locked:
+        if not locked:
+            # Refused rather than run unlocked: a delete of this name that does hold the
+            # lock could remove the sandbox home this scaffold is about to push and fetch
+            # its kubeconfig into. The reconcile retries a failed scaffold on its next run.
+            raise SystemExit(f"ERROR: could not take the profile lock for '{name}'; not scaffolding it")
+        return _create_profile(project, cluster, location, name)
 
+
+def _create_profile(project: str, cluster: str, location: str, name: str) -> str:
+    """create_profile's steps, run under the profile's lock."""
     if not TEMPLATE_DIR.is_dir():
         raise SystemExit(f"ERROR: cluster template dir not found: {TEMPLATE_DIR}")
 
@@ -596,8 +817,11 @@ def create_profile(project: str, cluster: str, location: str) -> str:
                 f"--location={location}", f"--project={project}",
                 *endpoint_flags,
             ],
-            check=True, timeout=60,
-            remote_env={"KUBECONFIG": str(kubeconfig)},
+            check=True, timeout=CREDENTIAL_FETCH_TIMEOUT_SECONDS,
+            remote_env={
+                "KUBECONFIG": str(kubeconfig),
+                SHIM_RETRY_DEADLINE_ENV: str(CREDENTIAL_FETCH_SHIM_RETRY_DEADLINE_SECONDS),
+            },
             local_env=env,
             principal=sandbox_exec.TERMINAL_PRINCIPAL,
         )
@@ -692,12 +916,24 @@ def cmd_create(args: argparse.Namespace) -> None:
 
 
 def delete_profile(name: str) -> None:
-    """Deregister a Hermes profile and remove its home directory.
+    """Deregister a Hermes profile and remove its home, here and in the shell sandbox.
 
     Tolerant of an already-absent profile (the ``hermes profile delete`` failure is
     logged, then the home is cleaned up regardless). Shared by the ``delete`` CLI
     subcommand and the reconcile engine.
+
+    Under the profile's lock, so a scaffold of the same name runs wholly before or
+    wholly after it. The sandbox home goes last and only while the lock is held and
+    the home here is gone: without the lock it stays, since a stale skeleton costs
+    disk and a removed live one costs a profile its kubeconfig (#4389).
     """
+    with _profile_lock(name) as locked:
+        _delete_profile(name)
+        if locked and not os.path.lexists(profile_home(name)):
+            _remove_sandbox_layout(name)
+
+
+def _delete_profile(name: str) -> None:
     home = profile_home(name)
     try:
         # Stays in the agent pod: `hermes` needs the profiles on the data PVC and
@@ -782,7 +1018,11 @@ def cmd_stamp_soul(args: argparse.Namespace) -> None:
     home = Path(args.profile_dir)
     identity = read_cluster_identity(home)
     if identity is None:
-        return
+        # The entrypoint has just replaced SOUL.md with the blank template, so a
+        # profile whose config.yaml carries no readable identity is left without
+        # its block. Exit non-zero so the caller says so and does not stamp the
+        # pass as finished; a silent return read as one.
+        raise SystemExit(f"ERROR: {home / 'config.yaml'} has no readable cluster_identity; SOUL.md was not stamped")
     _stamp_soul_identity(home, identity["project"], identity["cluster"], identity["location"])
 
 

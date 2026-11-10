@@ -56,13 +56,17 @@ locals {
   # roles out: roles/cloudtrace.user is one of those, since Google's Trace
   # User role carries create, delete and update on Trace-console objects
   # beside the two trace reads, and the observability helpers that need the
-  # reads look at the host project's own traces (design §6).
+  # reads look at the host project's own traces (design §6). roles/gkehub.viewer
+  # is in: the readiness report's rollout-sequence precheck lists the fleet host
+  # project's RolloutSequences, and a member's host project may be another
+  # project in the scope.
   scope_role_allowlist = [
     "roles/container.clusterViewer",
     "roles/container.viewer",
     "roles/compute.viewer",
     "roles/monitoring.viewer",
     "roles/logging.viewer",
+    "roles/gkehub.viewer",
     "roles/iam.securityReviewer",
   ]
 

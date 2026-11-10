@@ -10,8 +10,14 @@ sends a message only when:
     the state returned to GREEN             -> the recovery, with how long it lasted
     an OUTAGE grew to name a new case       -> the same shape, rate-limited
     it is the digest hour and none went out -> the daily digest with the 24h numbers,
-                                               plus one line on last night's
+                                               plus a section on last night's
                                                nightly run when --data is given
+                                               (nightly_digest.py), and one
+                                               line per domain with no blocking
+                                               presubmit seat (coverage_gaps.py),
+                                               and one while the nightly bug
+                                               filer has been held for hours
+                                               (--bugs-state, nightly_bugs.py)
 
 Everything else is silence. The last-posted state lives in a small JSON file
 (`--state`, a local path or a gs:// object) that this script is the only
@@ -27,16 +33,16 @@ space is told once, and once more when the scan sees the fleet again. That
 is never a drift. The digest carries one line on the latest scan. The
 pool-state scan (`pool_state.unknown`, #1967) is told the same way.
 
-A seventh, one line and once per episode: when health.json carries a `slow`
-note (the gate's green runs are taking far longer than usual, #1586), the
-space hears it the first tick it appears and not again until it has cleared
-and come back; the digest repeats the line while it lasts. It is not a state
-change -- nothing is broken and /retest does not help -- so it moves nothing
-else. An eighth pair, the pool note: once when the pool-pressure periodic
-reports runs waiting to be scheduled and once when they stop (KIND_POOL,
-KIND_POOL_CLEAR). A ninth pair, the watched Prow periodics (KIND_PERIODIC,
-KIND_PERIODIC_CLEAR): a failed run or a stopped job once per episode and
-verdict, and once when a told job passes again.
+The `slow` note (the gate's green runs are taking far longer than usual,
+#1586) and the `near_deadline` note are not breaks and /retest helps
+neither, so the digest carries them while they last. The one message of
+their own: a `near_deadline` note whose window holds a deadline kill, once
+per episode, since that run reached no verdict and the note says what to
+check before adding a case. A seventh pair, the pool note: once when the pool-pressure
+periodic reports runs waiting to be scheduled and once when they stop
+(KIND_POOL, KIND_POOL_CLEAR). An eighth pair, the watched Prow periodics
+(KIND_PERIODIC, KIND_PERIODIC_CLEAR): a failed run or a stopped job once per
+episode and verdict, and once when a told job passes again.
 
 Every time a reader sees is on the reader's clock: America/Toronto, written
 "7:30 AM ET", never UTC (the deep links and the state file keep ISO UTC).
@@ -48,17 +54,19 @@ the same cases -- gate_issue.py files one with the workflow's GitHub token
 (`gh api`, GH_TOKEN), the "broken" message says "Tracking #NNN", and the
 recovery comments on it. A new `lost_pods` condition (the build cluster lost
 the nodes under running jobs, #1478) files one the same way, addressed to
-the cluster owner, unless an open `presubmit-gate` issue already names the
-lost nodes. A new `fixture_drift` condition (a seeded fixture out of its
-designed state on two consecutive hourly scans or on three pool projects at
-once, #1550) files one for the fleet owner the same way, unless an open
-`presubmit-gate` issue already names the drifted roles. A new `pool_drift`
+the cluster owner, unless an open issue already names the lost nodes. A new `fixture_drift` condition (a seeded fixture out of its
+designed state on two consecutive hourly scans, #1550) files one for the
+fleet owner the same way, unless an open
+issue already names the drifted roles. A new `pool_drift`
 condition (#1967) files one for the pool owner, with the repair per project,
-unless an open `presubmit-gate` issue's title names every finding. A new `deadline_kill`
+unless an open issue's title names every finding. A new `deadline_kill`
 OUTAGE (runs killed at the job timeout with no verdict, #1894) files one for
-whoever owns the gate, unless an open `presubmit-gate` issue's title already
-names the deadline kills. It never closes an issue. A GitHub failure is a warning: the message goes out with "no issue
-yet" and the next change asks again.
+whoever owns the gate, unless an open issue's title already names the
+deadline kills. The dedupe reads every open issue, whatever its labels, and
+labels the adopted one. An issue a human closed is dropped, not cited; the
+bot's own issue is closed when its condition stops firing or at the
+recovery (#3664). A GitHub failure is a warning: the message goes out with
+"no issue yet" and the next change asks again.
 
 Delivery is the Google Chat REST API with the job's service account acting
 as a Chat app: POST https://chat.googleapis.com/v1/{space}/messages with an
@@ -82,16 +90,18 @@ import argparse
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import tempfile
+import traceback
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 try:
-    from eval_dashboard import gate_issue, ghcli, nightly, periodics
+    from eval_dashboard import forge_lane, gate_issue, ghcli, nightly, nightly_latency, periodics
 
     # By name, not as a module: `health` is the parameter every render_*
     # function here takes, and importing the module would shadow it.
@@ -102,6 +112,7 @@ try:
         POOL_UNMEASURED,
         PROW_JOB_TIMEOUT,
         SECONDS_PER_MINUTE,
+        fixture_no_reapply,
         minutes_text,
         near_deadline_headroom_text,
         near_deadline_margin,
@@ -111,7 +122,7 @@ try:
     )
 except ImportError:  # run as a script: scripts/eval_dashboard/post_health.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-    from eval_dashboard import gate_issue, ghcli, nightly, periodics
+    from eval_dashboard import forge_lane, gate_issue, ghcli, nightly, nightly_latency, periodics
     from eval_dashboard.health import (
         CAPACITY_ROLES,
         POOL_BREACH,
@@ -119,6 +130,7 @@ except ImportError:  # run as a script: scripts/eval_dashboard/post_health.py
         POOL_UNMEASURED,
         PROW_JOB_TIMEOUT,
         SECONDS_PER_MINUTE,
+        fixture_no_reapply,
         minutes_text,
         near_deadline_headroom_text,
         near_deadline_margin,
@@ -153,6 +165,18 @@ DEADLINE_MINUTES = int(PROW_JOB_TIMEOUT.total_seconds() // SECONDS_PER_MINUTE)
 # health.json's summary of the hourly seeded-fleet scan (health.py,
 # fixture_state_block); absent before the scan has ever published.
 FIXTURE_STATE_KEY = "fixture_state"
+# health.py's list of the conditions whose rule still fires (or whose scan
+# could not say) this tick, whatever condition the gate reports.
+OPEN_CONDITIONS_KEY = "open_conditions"
+# The conditions whose bot-filed issue is closed as soon as the condition
+# leaves `open_conditions` while the gate reports another: the four with
+# evidence of their own (a scan, a window of losses or kills). A shared
+# break's issue waits for the recovery: a storm's reds can take rule 1 under
+# its majority while the break is live.
+MID_EPISODE_CLOSE_CONDITIONS = (CONDITION_LOST_PODS, CONDITION_FIXTURE_DRIFT, CONDITION_POOL_DRIFT, CONDITION_DEADLINE_KILL)
+# On a carried issue record: the recovery's "lasted" text it is still owed
+# because its comment or close did not land; retried each tick, never cited.
+UNSETTLED_KEY = "unsettled"
 # The same for the hourly pool-state scan (health.py, scan_block).
 POOL_STATE_KEY = "pool_state"
 # The 24h window health.py reports metrics over, for a health.json that
@@ -164,26 +188,31 @@ DEFAULT_SLOW_BASELINE_DAYS = 7
 
 # pool-pressure.json's vocabulary (scripts/pool_pressure.py owns it), carried
 # through health.json's `pool` note. Copied rather than imported, and
-# test_integration_contracts.py fails if the copy drifts. The four causes have
-# four different remedies, one of which spends money, so the message branches
-# on them rather than printing the label.
+# test_integration_contracts.py fails if the copy drifts. The four causes call
+# for different things, one of which spends money, so the message branches on
+# them rather than printing the label.
 CAUSE_CAPACITY = "CAPACITY"
 CAUSE_CONCURRENCY_CAP = "CONCURRENCY_CAP"
 CAUSE_CONTROL_PLANE = "CONTROL_PLANE"
-# Not a cause the periodic emits: the key `pool_causes` records when
-# CONTROL_PLANE is announced without the queue, which says something different
-# and names no build cluster. See `pool_cause_key`.
-CAUSE_CONTROL_PLANE_UNREAD = "CONTROL_PLANE:queue-unread"
 # The periodic's own "I could not tell", distinct from a label added later that
 # this file has no remedy for. Both ask for nothing; only this one knows why.
 CAUSE_UNKNOWN = "UNKNOWN"
+# Not causes the periodic emits: the keys `pool_causes` records when one of
+# QUEUE_UNREAD_CAUSES is announced without the queue, which says something
+# different (no build cluster; no live count). See `pool_cause_key`.
+QUEUE_UNREAD_KEY_SUFFIX = ":queue-unread"
+QUEUE_UNREAD_CAUSES = (CAUSE_CONTROL_PLANE, CAUSE_CONCURRENCY_CAP)
+# The cap message names the days the periodic breached on as month-day,
+# "11-05 and 11-06": the digit span after the year in the artifact's ISO day.
+DAY_MONTH_DAY = slice(5, None)
+DAYS_JOIN = ", "
+DAYS_LAST_JOIN = " and "
 
 # The kinds of message this script sends.
 KIND_CHANGE = "change"  # a new state, condition or (in an OUTAGE) case list
 KIND_RECOVERY = "recovery"  # back to GREEN, with how long it took
 KIND_STALE = "stale"  # data.json stopped refreshing, or started again
-KIND_SLOW = "slow"  # the gate's runs are far longer than usual; once per episode
-KIND_NEAR_DEADLINE = "near_deadline"  # qualifying runs approach the Prow job timeout; once per episode
+KIND_NEAR_DEADLINE = "near_deadline"  # a near_deadline note with a deadline kill; once per episode
 KIND_POOL = "pool"  # runs are waiting to start; once per episode
 KIND_POOL_CLEAR = "pool_clear"  # ... and once when they stop
 KIND_DIGEST = "digest"  # the daily numbers
@@ -204,13 +233,17 @@ SPACE_PREFIX = "spaces/"
 NOT_CONFIGURED = "webhook not configured: set CI_HEALTH_CHAT_SPACE (+ CI_HEALTH_CHAT_TOKEN) or CI_HEALTH_CHAT_WEBHOOK; nothing posted"
 REQUEST_TIMEOUT_S = 30
 USER_AGENT = "kube-agents-ci-health"
+# Chat's text markup, which a card's fallbackText (a notification) shows raw:
+# <url|label> links and *bold*.
+CHAT_LINK_RE = re.compile(r"<[^|<>]+\|([^<>]+)>")
+CHAT_BOLD = "*"
 
 # The digest goes out once per local day (`--digest-tz`, Toronto by
 # default), on the first tick inside [digest_hour:00 - window, digest_hour:00
 # + window] local time. The job runs every 15 minutes, so a 20-minute window
 # always contains at least one tick and the per-day marker in the state file
 # (the local date) stops the second one from repeating it.
-DEFAULT_DIGEST_HOUR = 9
+DEFAULT_DIGEST_HOUR = 11
 DIGEST_WINDOW = timedelta(minutes=20)
 
 # Inside an OUTAGE the cause grows as more cases collapse. Each growth is
@@ -241,6 +274,14 @@ DASHBOARD_VIEW_AGENT = "agent"
 # The Nightly report page beside the Brief; the digest's nightly line links
 # to it (nightly.py derives both the line and the page's data).
 NIGHTLY_URL = f"{DASHBOARD_SITE}/{nightly.NIGHTLY_PAGE}"
+# The domain scorecard (render.CASES_PAGE's domains view): every case's
+# nightly and evidence-store records; the coverage-gap issue links it.
+DOMAIN_SCORECARD_URL = f"{DASHBOARD_SITE}/cases.html#view=domains"
+# When the nightly section (nightly_digest.py) cannot be built, the digest
+# keeps its one-line nightly summary and says why the section is missing.
+NIGHTLY_SKIPPED = "🌙 Nightly section skipped: {reason}."
+NIGHTLY_UNREADABLE = "data.json could not be read"
+NIGHTLY_FAILED = "building it failed ({error}); see the job log"
 
 # The message wording. One sentence of cause, one of what to do, then the
 # link; the details live behind the link. Case names are read by a human
@@ -261,6 +302,9 @@ FIXTURE_RECONCILE_HINT = "The daily reconcile re-applies bench/tf/fleet in the p
 # own role), and so would "edit main.tf" in the hours after a size change has
 # merged, while the postsubmit is still rolling it; the hint covers both.
 FIXTURE_CAPACITY_HINT = "default-pool-headroom reads capacity, not an unapplied stack: seeded-a's default pool is below the 100m headroom margin the scan keeps for the next fixtures, and a re-apply changes nothing. The fix is the pool's size in bench/tf/fleet/main.tf (seeded_a_default): if a size change has just merged, the postsubmit reconcile is rolling it project by project and the scans clear as it lands; otherwise the pool needs a larger machine type or node count."
+# When every drift line is one no re-apply clears (health.fixture_no_reapply,
+# #4005), the retest line names the remedy instead of the reconcile.
+FIXTURE_NO_REAPPLY_LEAD = "No re-apply of bench/tf/fleet clears this drift."
 # A reconcile run older than this is printed with its date in the digest.
 RECONCILE_RUN_DATED_AFTER = timedelta(days=1)
 # The pool-state scan's message: the scan's document carries the command per
@@ -311,11 +355,12 @@ POOL_JOB_HISTORY_URL = (
     f"https://oss.gprow.dev/job-history/gs/kube-agents-prow/logs/{POOL_PRESSURE_JOB}"
 )
 
-# gsutil is how the state object is read and written; publish.py uses the
-# same header so a reader never gets an hour-stale copy.
-GSUTIL = "gsutil"
+# `gcloud storage` is how the state object is read and written; publish.py
+# sets the same Cache-Control so a reader never gets an hour-stale copy.
+GCLOUD = "gcloud"
+STORAGE_GROUP = "storage"
 GS_PREFIX = "gs://"
-CACHE_CONTROL = "Cache-Control: no-cache"
+CACHE_CONTROL_FLAG = "--cache-control=no-cache"
 
 UTC = timezone.utc
 
@@ -332,7 +377,7 @@ def log(message: str) -> None:
 def read_state(location: str, runner=subprocess.run) -> dict | None:
     """The last posted state, or None when there is none yet."""
     if location.startswith(GS_PREFIX):
-        result = runner([GSUTIL, "-q", "cat", location], capture_output=True, text=True)
+        result = runner([GCLOUD, STORAGE_GROUP, "cat", location], capture_output=True, text=True)
         if result.returncode != 0:
             return None
         text = result.stdout
@@ -355,7 +400,7 @@ def write_state(location: str, state: dict, runner=subprocess.run) -> None:
             handle.write(text)
             name = handle.name
         try:
-            runner([GSUTIL, "-q", "-h", CACHE_CONTROL, "cp", name, location], check=True)
+            runner([GCLOUD, STORAGE_GROUP, "cp", CACHE_CONTROL_FLAG, name, location], check=True)
         finally:
             os.unlink(name)
         return
@@ -430,23 +475,26 @@ def pool_cause_key(pool: dict) -> str | None:
 
     `pool_causes` is what this episode has already said, and CONTROL_PLANE says
     two things: the build cluster to go and check, or that the queue could not
-    be read so nothing can be blamed. Keyed on the cause alone, an hour of
-    unreadable Deck at the start of an episode would record the vague one as
-    the remedy and the remedy would never post.
+    be read so nothing can be blamed; CONCURRENCY_CAP likewise says the live
+    queue, or the past days with the queue unread. Keyed on the cause alone, an
+    hour of unreadable Deck at the start of an episode would record the vague
+    one as the remedy and the remedy would never post.
     """
-    if pool.get("cause") == CAUSE_CONTROL_PLANE and pool.get("waiting_now") is None:
-        return CAUSE_CONTROL_PLANE_UNREAD
-    return pool.get("cause")
+    cause = pool.get("cause")
+    if cause in QUEUE_UNREAD_CAUSES and pool.get("waiting_now") is None:
+        return cause + QUEUE_UNREAD_KEY_SUFFIX
+    return cause
 
 
 def pool_told_keys(pool: dict) -> list[str]:
     """The keys a sent ⏳ marks as told, which the diagnosis widens.
 
-    Once the build cluster has been named, the unread-queue message is less
-    than the reader already has, so it is not owed later in the same episode.
+    Once the build cluster or the live queue has been named, the unread-queue
+    message is less than the reader already has, so it is not owed later in
+    the same episode.
     """
     key = pool_cause_key(pool)
-    return [key, CAUSE_CONTROL_PLANE_UNREAD] if key == CAUSE_CONTROL_PLANE else [key]
+    return [key, key + QUEUE_UNREAD_KEY_SUFFIX] if key in QUEUE_UNREAD_CAUSES else [key]
 
 
 def decide(health: dict, prev: dict | None, now: datetime, digest_hour: int, tz=LOCAL_TZ) -> list[str]:
@@ -491,14 +539,13 @@ def decide(health: dict, prev: dict | None, now: datetime, digest_hour: int, tz=
     if periodic_clears(health, prev):
         kinds.append(KIND_PERIODIC_CLEAR)
 
-    # The slow note goes out when the note appears, not when it clears: the
-    # digest carries it while it lasts, and "back to normal" is not news.
-    if health.get("slow") and not (prev or {}).get("slow"):
-        kinds.append(KIND_SLOW)
-
-    # The near_deadline note goes out when the note appears, not when it clears: the
-    # digest carries it while it lasts, and "back to normal" is not news.
-    if health.get("near_deadline") and not (prev or {}).get("near_deadline"):
+    # The slow and near_deadline notes have no message of their own: neither
+    # is a break nor moves the state, so the digest carries them while they
+    # last. The exception is a near_deadline note with a deadline kill in its
+    # window: that run reached no verdict, and the note's advice (check the
+    # run cost before adding a case) is said nowhere else. Once per episode;
+    # a kill below the deadline_kill OUTAGE's threshold is otherwise silent.
+    if ((health.get("near_deadline") or {}).get("kills") or 0) > 0 and not (prev or {}).get("near_deadline"):
         kinds.append(KIND_NEAR_DEADLINE)
 
     # Rule 8, once per episode, plus a re-post on a verdict change or a cause
@@ -604,6 +651,13 @@ def incident_link(health: dict, until: datetime | None = None) -> str:
     return dashboard_link(DASHBOARD_VIEW_GATE, health.get("failing_cases") or [], parse_iso(health.get("since")), until)
 
 
+def public_brief_link(health: dict) -> str:
+    """The incident brief's URL with no case names in it, for the texts
+    GitHub shows (the PR comment, the tracking issue): incident_link lists
+    the failing cases in the fragment, which only Chat reads."""
+    return dashboard_link(DASHBOARD_VIEW_GATE, [], parse_iso(health.get("since")), None)
+
+
 def run_link(build_id) -> str:
     """The PR view for one prow build: `run.html#build=<id>`."""
     return f"{DASHBOARD_SITE}/{DASHBOARD_RUN_PAGE}#build={build_id}"
@@ -698,6 +752,39 @@ def pool_state_unknown(health: dict) -> bool | None:
     return bool(block.get("unknown"))
 
 
+def condition_open(health: dict, condition: str | None) -> bool | None:
+    """Whether `condition`'s rule still fires on this tick's evidence
+    (health.py's `open_conditions`); None for a health.json without the key,
+    which closes nothing and files as before."""
+    listed = health.get(OPEN_CONDITIONS_KEY)
+    if not isinstance(listed, list):
+        return None
+    return condition in listed
+
+
+def evidence_after(health: dict, condition: str | None, when: datetime | None) -> bool:
+    """Whether the evidence `condition` fires on is newer than `when`, a
+    human's close of its issue: the scan for a scan condition, the last loss
+    or kill for lost pods and deadline kills. A human who closes the bot's
+    issue once the repair is in is not handed a new one on the reading that
+    predates it. A shared break has no such clock; its re-file waits for the
+    next change."""
+    if when is None:
+        return True
+    if condition in (CONDITION_FIXTURE_DRIFT, CONDITION_POOL_DRIFT):
+        # A scan that was stale, blind, hand-scoped or short of a project is
+        # no reading the rule fired on; it holds the condition, it files nothing.
+        block = fixture_state_of(health) if condition == CONDITION_FIXTURE_DRIFT else pool_state_of(health)
+        if block.get("stale") or block.get("unknown") or block.get("partial") or block.get("checked") != block.get("projects"):
+            return False
+        observed = parse_iso(block.get("scanned_at"))
+    elif condition in (CONDITION_LOST_PODS, CONDITION_DEADLINE_KILL):
+        observed = parse_iso((health.get("incident") or {}).get("window_end"))
+    else:
+        return False
+    return observed is not None and observed > when
+
+
 def plural(count: int, one: str, many: str | None = None) -> str:
     return one if count == 1 else (many if many is not None else one + "s")
 
@@ -709,13 +796,18 @@ def fixture_drift_sentence(health: dict, since: str) -> str:
     return (
         f"seeded {plural(len(roles), 'fixture')} {', '.join(roles) or '(unnamed)'} out of designed state"
         f" on {len(projects)} pool {plural(len(projects), 'project')} since {since};"
-        f" a red on a case that depends on {plural(len(roles), 'it', 'them')} from a run that leased one of those projects is the fixture, not the code."
+        f" a case that depends on {plural(len(roles), 'it', 'them')} is recorded as infrastructure on a run whose own scan saw the drift,"
+        f" and a red on one from a run whose scan could not read the role is the fixture, not the code."
     )
 
 
 def fixture_drift_advice(health: dict) -> str:
     """The retest line and the hint, by what drifted: a re-apply for a planted
-    object out of shape, the pool's size for a capacity role, both when mixed."""
+    object out of shape, the pool's size for a capacity role, both when mixed,
+    and the real remedy when no re-apply clears any drift line."""
+    remedy = fixture_no_reapply(health.get("incident") or {})
+    if remedy:
+        return f"{FIXTURE_NO_REAPPLY_LEAD} {remedy}"
     roles = set((health.get("incident") or {}).get("roles") or [])
     if roles and roles <= CAPACITY_ROLES:
         return f"Retest once the pool has headroom. {FIXTURE_CAPACITY_HINT}"
@@ -858,37 +950,15 @@ def slow_text(slow: dict) -> str:
     )
 
 
-def render_slow(health: dict) -> str:
-    slow = health.get("slow") or {}
-    return "\n".join(
-        [
-            f"🐢 *Smoke gate: slow* — {slow_text(slow)}. Not a break, and /retest won't make yours faster.",
-            # No `since`: the Brief resolves a `since` to an incident, and the
-            # note's start is a GREEN tick that names none, so the page would
-            # show a synthetic past incident. The bare agent view is the
-            # healthy headline, which carries the same sentence.
-            dashboard_link(DASHBOARD_VIEW_AGENT),
-        ]
-    )
-
-
-def near_deadline_text(nd: dict) -> str:
-    max_min = minutes_text(nd.get("max_s"))
-    return f"slowest run {max_min} min in the last 24h, {near_deadline_margin(nd)}"
-
-
 def render_near_deadline(health: dict) -> str:
+    """The message for a near_deadline note with a deadline kill in its window:
+    no "Not a break", because that run was killed without a verdict."""
     nd = health.get("near_deadline") or {}
-    tail = (
-        " Check the run cost before adding a case to `hack/eval/presubmit-cases.txt`."
-        if nd.get("kills", 0) > 0
-        else (
-            " Not a break. Check the run cost before adding a case to `hack/eval/presubmit-cases.txt`."
-        )
-    )
+    max_min = minutes_text(nd.get("max_s"))
     return "\n".join(
         [
-            f"⏱ *Smoke gate: close to the deadline* — {near_deadline_text(nd)}.{tail}",
+            f"⏱ *Smoke gate: close to the deadline* — slowest run {max_min} min in the last 24h, {near_deadline_margin(nd)}."
+            " Check the run cost before adding a case to `hack/eval/presubmit-cases.txt`.",
             dashboard_link(DASHBOARD_VIEW_AGENT),
         ]
     )
@@ -918,10 +988,16 @@ def pool_numbers(pool: dict) -> list[str]:
             f" against a {minutes_text(pool.get('threshold_p50_s'))} min limit;"
             f" p95 {wait_text(pool.get('p95_s'))} against {minutes_text(pool.get('threshold_p95_s'))}."
         )
-    waiting = pool.get("over_threshold") or 0
-    if waiting:
+    over = pool.get("over_threshold") or 0
+    waiting = pool.get("waiting")
+    if over and isinstance(waiting, int):
+        # The part of the live queue past the limit, against the whole of it;
+        # the cap's cause line has already said the whole.
+        lines.append(f"{over} of {waiting} waiting {plural(waiting, 'run')} {plural(over, 'is', 'are')} past the {minutes_text(pool.get('threshold_p95_s'))} min p95 limit.")
+    elif over:
+        # A note from before the live count was carried.
         lines.append(
-            f"{waiting} {plural(waiting, 'run')} waiting right now,"
+            f"{over} {plural(over, 'run')} waiting right now,"
             f" past the {minutes_text(pool.get('threshold_p95_s'))} min p95 limit."
         )
     if pool.get("lease_failures"):
@@ -937,10 +1013,21 @@ def pool_refusals(pool: dict) -> str:
     return f"{refused} {plural(refused, 'run')} refused a project{stretch}"
 
 
+def days_text(days) -> str:
+    """The artifact's ISO days as "11-05 and 11-06"; "recent days" when it
+    named none."""
+    names = [day[DAY_MONTH_DAY] for day in (days or []) if isinstance(day, str) and len(day) > DAY_MONTH_DAY.start]
+    if not names:
+        return "recent days"
+    if len(names) == 1:
+        return names[0]
+    return DAYS_JOIN.join(names[:-1]) + DAYS_LAST_JOIN + names[-1]
+
+
 def pool_cause_text(pool: dict) -> str:
-    """What to do, by cause. The four remedies differ and one of them spends
-    money, so an unrecognised cause falls through to the message that asks for
-    nothing."""
+    """What is wrong, by cause, and the remedy where there is one. The causes
+    call for different things and one of them spends money, so an unrecognised
+    cause falls through to the message that asks for nothing."""
     cause = pool.get("cause")
     if cause == CAUSE_CAPACITY:
         # The counts are this hour's Boskos reading and carry the remedy on
@@ -962,9 +1049,33 @@ def pool_cause_text(pool: dict) -> str:
             f"{held}{queuing}. Consider onboarding a project."
         )
     if cause == CAUSE_CONCURRENCY_CAP:
+        # The presubmit sat at its own cap while runs queued. The pool is
+        # shared, so the cap's gap below the pool is the other jobs' share and
+        # the message gives no remedy: moving the cap is a human tradeoff.
+        cap = figure(pool.get("max_concurrency"))
+        live = pool.get("waiting_now")
+        if live:
+            waiting = pool.get("waiting")
+            count = f"{waiting} presubmit {plural(waiting, 'run is', 'runs are')}" if isinstance(waiting, int) else "presubmit runs are"
+            return (
+                f"*Smoke gate: queue* — {count} waiting, longest {wait_text(pool.get('waiting_longest_s'))};"
+                f" the presubmit is at its cap of {cap} slots."
+            )
+        worst = pool.get("worst_s")
+        waited = f"waited up to {wait_text(worst)}" if worst is not None else "waited past the limit"
+        # False is "no run past the p50 limit", not an empty queue: the live
+        # count says which. None is a queue Deck did not see, and "nothing
+        # waits" would assert what nothing measured.
+        waiting = pool.get("waiting")
+        if live is None or not isinstance(waiting, int):
+            now = " The job could not read the queue, so this bot cannot say whether runs still wait."
+        elif waiting:
+            now = f" {waiting} {plural(waiting, 'run waits', 'runs wait')} now, none past the limit."
+        else:
+            now = " Nothing waits now."
         return (
-            f"*Smoke gate: concurrency cap* — the pool has {figure(pool.get('total'))} projects"
-            f" but the concurrency cap is only {figure(pool.get('max_concurrency'))}. Raise the cap."
+            f"*Smoke gate: queue* — presubmit runs {waited} on {days_text(pool.get('breached_days'))};"
+            f" the presubmit was at its cap of {cap} slots.{now}"
         )
     if cause == CAUSE_CONTROL_PLANE:
         if pool.get("waiting_now") is None:
@@ -1086,7 +1197,7 @@ def told_key(job: str, note: dict) -> str:
 
 
 def told_job(key: str) -> str:
-    return key[: -len(TOKEN_TOLD_SUFFIX)] if key.endswith(TOKEN_TOLD_SUFFIX) else key
+    return key.removesuffix(TOKEN_TOLD_SUFFIX)
 
 
 def periodic_news(health: dict, prev: dict | None) -> dict[str, dict]:
@@ -1170,12 +1281,60 @@ def _periodic_footer(words: dict, history_url: str) -> str:
     return f"{runbook}Build: {history_url}"
 
 
+def shared_cause_groups(notes: dict[str, dict]) -> list[list[str]]:
+    """The failed jobs, two or more, whose builds ended with the same last log
+    line: one cause, one message. A job with no last line, or alone with
+    its own, is not grouped."""
+    by_line: dict[str, list[str]] = {}
+    for job, note in sorted(notes.items()):
+        if note.get("verdict") == periodics.VERDICT_FAILED and note.get(periodics.KEY_LAST_LINE):
+            by_line.setdefault(note[periodics.KEY_LAST_LINE], []).append(job)
+    return [jobs for jobs in by_line.values() if len(jobs) > 1]
+
+
+def render_shared_cause(jobs: list[str], notes: dict[str, dict]) -> str:
+    """One block for jobs whose builds died on the same log line: where and
+    the line, then each job as its own block would say it (what it does, its
+    run, its detail lines, its own node and Warning pod event), the effects,
+    a footer per job."""
+    words = {job: _job_words(job, notes[job]) for job in jobs}
+    places = " and ".join(dict.fromkeys(words[job]["place"] for job in jobs))
+    lines = [
+        f"🟠 *{places}: {len(jobs)} jobs failed on the same log line.*",
+        f"Each build's log ends on the same line, `{notes[jobs[0]][periodics.KEY_LAST_LINE]}`; one place to look first.",
+    ]
+    for job in jobs:
+        note = notes[job]
+        does = f"`{job}` {words[job]['does']}." if words[job].get("does") else f"`{job}`."
+        dry = " (a dry run: nothing was applied)" if note.get("dry_run") else ""
+        how = f": {note['summary']}" if note.get("summary") else ""
+        lines.append(f"{does} Its {clock(parse_iso(note.get('finished_at')))} run (build {note['build']}){dry} failed{how}.")
+        lines.extend(f"- {line}" for line in note.get("detail") or [])
+        # The shared line is in the header; the node and the event are this job's.
+        own = periodics.cause_text({key: value for key, value in note.items() if key != periodics.KEY_LAST_LINE})
+        if own:
+            lines.append(f"- how it died: {own}")
+    effects = " ".join(dict.fromkeys(words[job]["effect"] for job in jobs if words[job].get("effect")))
+    lines.append(" ".join(part for part in ("Effect:", effects, periodics.SCOPE_LINE) if part))
+    lines.extend(f"`{job}`: {_periodic_footer(words[job], notes[job]['history_url'])}" for job in jobs)
+    return "\n".join(lines)
+
+
 def render_periodic(health: dict, prev: dict | None) -> str:
     """One block per job with news, four lines each: where and what stopped
-    happening; which job, what it does, which run and how it failed; what that
-    costs and the scope; the runbook and the build."""
+    happening; which job, what it does, which run and how it failed (and how
+    the build died: the log line that says so, the node and a Warning pod
+    event, when read); what that costs and the scope; the runbook and the
+    build. Failed jobs whose builds died on the same log line share one block."""
+    news = periodic_news(health, prev)
     blocks = []
-    for job, note in sorted(periodic_news(health, prev).items()):
+    grouped: set[str] = set()
+    for jobs in shared_cause_groups(news):
+        blocks.append(render_shared_cause(jobs, news))
+        grouped.update(jobs)
+    for job, note in sorted(news.items()):
+        if job in grouped:
+            continue
         when = clock(parse_iso(note.get("finished_at")))
         words = _job_words(job, note)
         does = f"`{job}` {words['does']}." if words.get("does") else f"`{job}`."
@@ -1201,6 +1360,9 @@ def render_periodic(health: dict, prev: dict | None) -> str:
         how = f": {note['summary']}" if note.get("summary") else ""
         lines = [f"🟠 *{words['place']}: {words['absence']}.*", f"{does} Its {when} run (build {note['build']}){dry} failed{how}."]
         lines.extend(f"- {line}" for line in note.get("detail") or [])
+        cause = periodics.cause_text(note)
+        if cause:
+            lines.append(f"- how it died: {cause}")
         lines.append(effect)
         lines.append(footer)
         blocks.append("\n".join(lines))
@@ -1300,7 +1462,8 @@ def periodic_digest_lines(health: dict, now: datetime | None = None) -> list[str
         elif note.get("verdict") == periodics.VERDICT_TOKEN:
             lines.append(f"🟡 {words['place']}: {words['absence']} (build {note['build']} passed {dated_clock(parse_iso(note.get('finished_at')), now)}; {'; '.join(note.get('detail') or [])}); {note['history_url']}")
         else:
-            lines.append(f"🟠 {words['place']}: {words['absence']} (build {note['build']} failed {dated_clock(parse_iso(note.get('finished_at')), now)}); {note['history_url']}")
+            cause = periodics.cause_text(note)
+            lines.append(f"🟠 {words['place']}: {words['absence']} (build {note['build']} failed {dated_clock(parse_iso(note.get('finished_at')), now)}{f'; {cause}' if cause else ''}); {note['history_url']}")
     return lines
 
 
@@ -1389,7 +1552,7 @@ def fixture_digest_line(health: dict) -> str | None:
         roles = sorted({role for roles in drifted.values() for role in roles})
         return (
             f"🧭 *Seeded fleet:* {len(drifted)} of {checked} checked pool projects drifted at {when}"
-            f" ({', '.join(roles)}); a red on a case that depends on {plural(len(roles), 'it', 'them')} there is the fixture, not the code."
+            f" ({', '.join(roles)}); a case that depends on {plural(len(roles), 'it', 'them')} is not run there and counts as infrastructure."
         )
     unchecked = f", {total - checked} not checked" if total > checked else ""
     unread = int(block.get("unread_units") or 0)
@@ -1494,12 +1657,38 @@ def pool_digest_line(pool: dict) -> str:
     )
 
 
-def render_digest(health: dict, now: datetime, data: dict | None = None) -> str:
+def nightly_latency_line(data: dict, now: datetime) -> str | None:
+    """The latency block's night line (nightly_latency.py) for the one-line
+    nightly summary: last night only, when it carried timing; the line says
+    so when the night is cut short or partial. It runs on the morning the
+    section failed, so a failure of its own is no line, never a lost
+    digest."""
+    try:
+        night, _ = nightly.last_night(data, now)
+        if night is None:
+            return None
+        return nightly_latency.night_line(nightly.night_dates(data, running=nightly.running_nights(data, now)))
+    except Exception:  # noqa: BLE001 -- the digest must still go out
+        traceback.print_exc()
+        log("warning: nightly latency line skipped")
+        return None
+
+
+def render_digest(health: dict, now: datetime, data: dict | None = None, section=None, coverage=()) -> str:
     """The 24h numbers, the stale note while a stall lasts, and -- when
-    data.json was given -- one line on last night's nightly run with a link
-    to its report: the counts, what is newly failing against the night
-    before, the opening chat turn's p50 and p95 when the reps carried it,
-    and the wall clock, or that the night was truncated or missing."""
+    data.json was given -- last night's nightly run. ``section`` is what
+    ``nightly_section`` returned: the nightly section's lines
+    (nightly_digest.py) go in as they are; a skip reason, or none, keeps
+    the one line on the night with a link to its report -- the counts, what
+    is newly failing against the night before, the opening chat turn's p50
+    and p95 when the reps carried it, and the wall clock, or that the night
+    was truncated or missing -- then the latency block's night line
+    (nightly_latency.py) when last night carried timing, and a reason adds
+    a line saying why the
+    section is missing. ``coverage`` is main's ``coverage()``: the held
+    bug-filing line (``filing_lines``) while one is due, then
+    ``coverage_lines``'s one line per domain with no blocking presubmit
+    seat, none while every domain has one."""
     metrics = health.get("metrics") or {}
     p50 = metrics.get("wall_clock_p50_s")
     typical = f"{int(p50 // 60)} min" if p50 is not None else "n/a"
@@ -1533,9 +1722,23 @@ def render_digest(health: dict, now: datetime, data: dict | None = None) -> str:
         )
     if health.get("pool"):
         lines.append(pool_digest_line(health["pool"]))
-    if data is not None:
+    if data is not None and getattr(section, "lines", None):
+        lines.extend(section.lines)
+        if len(section.lines) > 1:
+            # A blank line closes a multi-line section off from the lines after it.
+            lines.append("")
+    elif data is not None:
         lines.append(nightly.digest_line(data, now, clock=lambda value: clock(value, weekday=True)))
+        latency = nightly_latency_line(data, now)
+        if latency:
+            lines.append(latency)
         lines.append(NIGHTLY_URL)
+        if isinstance(section, str):
+            lines.append(NIGHTLY_SKIPPED.format(reason=section))
+    forge = forge_lane.digest_line(data, now) if data is not None else None
+    if forge:
+        lines.append(forge)
+    lines.extend(coverage)
     fleet = fixture_digest_line(health)
     if fleet:
         lines.append(fleet)
@@ -1547,19 +1750,17 @@ def render_digest(health: dict, now: datetime, data: dict | None = None) -> str:
     return "\n".join(lines)
 
 
-def render(kind: str, health: dict, prev: dict | None, now: datetime, issue: dict | None = None, data: dict | None = None) -> str:
+def render(kind: str, health: dict, prev: dict | None, now: datetime, issue: dict | None = None, data: dict | None = None, section=None, coverage=()) -> str:
     if kind == KIND_RECOVERY:
         return render_recovery(health, prev or {}, now)
     if kind == KIND_DIGEST:
-        return render_digest(health, now, data)
+        return render_digest(health, now, data, section, coverage)
     if kind == KIND_STALE:
         return render_stale(health)
     if kind == KIND_FIXTURE_SCAN:
         return render_fixture_scan(health)
     if kind == KIND_POOL_SCAN:
         return render_pool_scan(health)
-    if kind == KIND_SLOW:
-        return render_slow(health)
     if kind == KIND_NEAR_DEADLINE:
         return render_near_deadline(health)
     if kind == KIND_POOL:
@@ -1588,6 +1789,8 @@ class Sender:
         self.token = token.strip()
         self.webhook = webhook.strip()
         self.opener = opener
+        # The last send's HTTP status; None when no response came back.
+        self.status: int | None = None
 
     @classmethod
     def from_env(cls, environ=os.environ, opener=urllib.request.urlopen) -> Sender:
@@ -1609,8 +1812,17 @@ class Sender:
             return f"chat api (space set, {TOKEN_ENV} missing)"
         return "webhook" if self.webhook else "unconfigured"
 
-    def request(self, text: str) -> urllib.request.Request:
-        body = json.dumps({"text": text}).encode("utf-8")
+    @staticmethod
+    def body(text: str, card: dict | None = None) -> dict:
+        """The message: ``text``, or with a cardsV2 ``card`` the card and
+        ``text`` as its fallback (what a notification or a client without
+        cards shows; Chat would print a ``text`` above the card as well)."""
+        if card is None:
+            return {"text": text}
+        return {"fallbackText": CHAT_LINK_RE.sub(r"\1", text).replace(CHAT_BOLD, ""), "cardsV2": [card]}
+
+    def request(self, text: str, card: dict | None = None) -> urllib.request.Request:
+        body = json.dumps(self.body(text, card)).encode("utf-8")
         headers = {"Content-Type": "application/json; charset=UTF-8", "User-Agent": USER_AGENT}
         if self.space and self.token:
             url = f"{CHAT_API_ROOT}/{CHAT_MESSAGES_PATH.format(space=self.space)}"
@@ -1619,12 +1831,15 @@ class Sender:
             url = self.webhook
         return urllib.request.Request(url, data=body, headers=headers, method="POST")
 
-    def send(self, text: str) -> bool:
+    def send(self, text: str, card: dict | None = None) -> bool:
         """POST once. True on 2xx; a failure is logged without the URL."""
+        self.status = None
         try:
-            with self.opener(self.request(text), timeout=REQUEST_TIMEOUT_S) as response:
+            with self.opener(self.request(text, card), timeout=REQUEST_TIMEOUT_S) as response:
                 status = getattr(response, "status", 200)
+            self.status = status
         except urllib.error.HTTPError as exc:
+            self.status = exc.code
             log(f"post failed: HTTP {exc.code} from {self.describe()}")
             return False
         except (urllib.error.URLError, OSError) as exc:
@@ -1652,17 +1867,28 @@ def run(
     tz=LOCAL_TZ,
     tracker: gate_issue.Tracker | None = None,
     data: dict | None = None,
+    nightly_section=None,
+    coverage_lines=None,
 ) -> tuple[dict, list[tuple[str, str]], list[str]]:
     """Decide, render, send. Returns (new state, [(kind, text)], kinds that failed).
 
     `data`, when given, is the collector's data.json; the digest reads last
-    night's nightly run from it.
+    night's nightly run from it. `nightly_section`, when given, is called
+    once, only on a tick that sends the digest, and returns the nightly
+    section (an object with `lines`) or the reason it was skipped.
+    `coverage_lines`, when given, is called the same way and returns the
+    digest's held bug-filing line, if due, and its coverage-gap lines.
 
     `tracker`, when given, files the tracking issue a new OUTAGE or a new
     lost-pods condition lacks before the message is rendered (so it can say
     "Tracking #NNN") and comments on it after a recovery goes out. An issue
     filed for one condition is never cited for another (issue_for): the
-    outage's issue is not the cluster owner's, nor the reverse."""
+    outage's issue is not the cluster owner's, nor the reverse. Each tick it
+    re-reads every carried issue: one a human closed is dropped (and the
+    current condition, if it still fires on evidence newer than the close,
+    adopts or files again), and an infrastructure one the bot filed whose own
+    condition has stopped firing while the gate reports another is commented
+    on and closed; the recovery closes every one the bot filed."""
     kinds = decide(health, prev, now, digest_hour, tz)
     before = prev or {}
     condition = health.get("condition")
@@ -1674,9 +1900,46 @@ def run(
     carried = episode_issues(before)
     if issue_tag(health.get("issue")) and health["issue"] not in carried:
         carried.append(health["issue"])
-    issue = next((candidate for candidate in [health.get("issue"), *carried] if issue_for(candidate, condition)), None)
+    # Re-read each carried issue (#3664). A closed one is dropped before it
+    # is cited again, and its tag scrubbed from the tracking list health.py
+    # built around it; `reopen` is set when the current condition still fires
+    # on evidence newer than the close, so a human's close of the wrong issue
+    # (#2877, a different fixture) hands the condition back to adopt-or-file.
+    # A bot-filed infrastructure issue whose own condition no longer fires
+    # while the gate reports another is settled here; at GREEN the recovery
+    # below settles every one.
+    reopen = False
+    dropped: list[str] = []
+    if tracker is not None and carried:
+        kept = []
+        for each in carried:
+            if tracker.is_open(each) is False:
+                log(f"tracking issue: #{each['number']} is closed; dropped")
+                dropped.append(issue_tag(each))
+                health = dict(health, tracking_issues=[tag for tag in health.get("tracking_issues") or [] if tag != issue_tag(each)])
+                if issue_for(each, condition) and condition_open(health, condition) is not False and evidence_after(health, condition, tracker.closed_at(each)):
+                    reopen = True
+                continue
+            if each.get(UNSETTLED_KEY):
+                # A recovery's comment or close that did not land: retried
+                # until it does, and never cited again.
+                if not tracker.recovered(each, each[UNSETTLED_KEY]):
+                    kept.append(each)
+                continue
+            filed_for = each.get("condition") or CONDITION_SHARED_BREAK
+            if health.get("state") != GREEN and filed_for in MID_EPISODE_CLOSE_CONDITIONS and filed_for != condition and condition_open(health, filed_for) is False:
+                log(f"tracking issue: #{each['number']}'s condition {filed_for} cleared; commenting")
+                # A comment that did not go through keeps the issue for the next tick.
+                if tracker.cleared(each, clock(now, weekday=True)):
+                    continue
+            kept.append(each)
+        carried = kept
+    issue = next((candidate for candidate in carried if issue_for(candidate, condition) and not candidate.get(UNSETTLED_KEY)), None)
+    # What the readers were told, less the issues this tick found closed:
+    # the recovery names the ones still carried.
+    told = prev if prev is None else dict(prev, issues=carried, issue=None if issue_tag(prev.get("issue")) in dropped else prev.get("issue"), tracking_issues=[tag for tag in prev.get("tracking_issues") or [] if tag not in dropped])
     wants_issue = (
-        KIND_CHANGE in kinds
+        (KIND_CHANGE in kinds or reopen)
         and (health.get("state") == OUTAGE or condition in (CONDITION_LOST_PODS, CONDITION_FIXTURE_DRIFT, CONDITION_POOL_DRIFT))
         and not issue
         and not health.get("tracking_issues")
@@ -1684,14 +1947,17 @@ def run(
     if tracker is not None and wants_issue:
         incident = health.get("incident") or {}
         since = parse_iso(health.get("since"))
+        skip = {each["number"] for each in carried}
         if condition in (CONDITION_LOST_PODS, CONDITION_DEADLINE_KILL):
             start, end = parse_iso(incident.get("first_kill") or incident.get("window_start")), parse_iso(incident.get("window_end"))
-            issue = tracker.ensure(health, now, clock(start or since, weekday=True), incident_link(health), clock_range(start, end) if start and end else clock(since, weekday=True))
+            issue = tracker.ensure(health, now, clock(start or since, weekday=True), public_brief_link(health), clock_range(start, end) if start and end else clock(since, weekday=True), skip=skip)
         else:
-            issue = tracker.ensure(health, now, clock(since, weekday=True), incident_link(health))
+            issue = tracker.ensure(health, now, clock(since, weekday=True), public_brief_link(health), skip=skip)
         if issue and issue not in carried:
             carried.append(issue)
-    messages = [(kind, render(kind, health, prev, now, issue, data)) for kind in kinds]
+    section = nightly_section() if nightly_section is not None and data is not None and KIND_DIGEST in kinds else None
+    coverage = coverage_lines() if coverage_lines is not None and KIND_DIGEST in kinds else []
+    messages = [(kind, render(kind, health, told, now, issue, data, section, coverage)) for kind in kinds]
     failed = []
     for kind, text in messages:
         if dry_run:
@@ -1701,8 +1967,10 @@ def run(
     sent = [kind for kind in kinds if kind not in failed]
     if tracker is not None and KIND_RECOVERY in sent:
         began = parse_iso(before.get("since"))
-        for each in episode_issues(before):
-            tracker.recovered(each, duration_text(now - began) if began else "a while")
+        lasted = duration_text(now - began) if began else "a while"
+        # An issue the recovery could not settle (a failed read or write)
+        # rides on past GREEN with the text it is owed, and is retried.
+        carried = [dict(each, **{UNSETTLED_KEY: lasted}) for each in carried if not tracker.recovered(each, lasted)]
 
     # The state file records what the space was last TOLD, kind by kind,
     # so the next tick asks its questions -- did the state change, did a new
@@ -1718,9 +1986,7 @@ def run(
     # leaves its part where it was, so the next tick re-asks exactly that
     # question: a change that failed beside a stale notice that succeeded is
     # posted next tick, and a stale flip posted mid-OUTAGE does not swallow a
-    # case that joined inside OUTAGE_REPOST_INTERVAL. The slow bit follows
-    # the note down silently (a cleared note is not posted) and up only once
-    # the note has gone out, so a failed one is retried. The tracking issues
+    # case that joined inside OUTAGE_REPOST_INTERVAL. The tracking issues
     # ride along while the recorded state is not GREEN -- `issue` for the
     # current condition, `issues` for every one this episode filed or
     # adopted -- and are dropped by the recovery; health.py reads them back
@@ -1729,8 +1995,6 @@ def run(
     told_stale = KIND_STALE in sent
     told_fixture = KIND_FIXTURE_SCAN in sent
     told_pool_scan = KIND_POOL_SCAN in sent
-    told_slow = KIND_SLOW in sent or KIND_SLOW not in kinds
-    told_near_deadline = KIND_NEAR_DEADLINE in sent or KIND_NEAR_DEADLINE not in kinds
     # The pool note records its verdict rather than a bit, because a verdict
     # change inside one episode is its own message (see decide). The clear is
     # held to the same bar: dropping the verdict on a send that failed would
@@ -1816,14 +2080,15 @@ def run(
         "tracking_issues": source.get("tracking_issues") or [],
         "since": source.get("since"),
         "issue": issue if source.get("state") not in (None, GREEN) else None,
-        "issues": carried if source.get("state") not in (None, GREEN) else [],
+        "issues": carried if source.get("state") not in (None, GREEN) else [each for each in carried if each.get(UNSETTLED_KEY)],
         "stale": bool(health.get("stale")) if told_stale else bool(before.get("stale")),
+        # Whether this note's episode has had its kill message: set by the
+        # send (a failed one is retried), dropped silently with the note.
+        "near_deadline": bool(health.get("near_deadline")) and (KIND_NEAR_DEADLINE in sent or bool(before.get("near_deadline"))),
         "fixture_unknown": fixture_unknown(health) if told_fixture else bool(before.get("fixture_unknown")),
         "pool_state_unknown": (
             pool_state_unknown(health) if told_pool_scan and pool_state_unknown(health) is not None else bool(before.get("pool_state_unknown"))
         ),
-        "slow": bool(health.get("slow")) if told_slow else bool(before.get("slow")),
-        "near_deadline": bool(health.get("near_deadline")) if told_near_deadline else bool(before.get("near_deadline")),
         # No artifact is not a reading: clearing the verdict on a blind tick
         # re-posts the same breach once the fetch recovers.
         "pool_verdict": (
@@ -1847,6 +2112,62 @@ def run(
     return state, messages, failed
 
 
+def nightly_section(data: dict, now: datetime, gh, environ=os.environ):
+    """nightly_digest.build's section, or the reason it was skipped. Imported
+    here rather than at the top: it reads YAML through nightly_bugs, which
+    imports this module, and every other message must go out without it.
+    Any failure of its own is a skip, never a lost digest."""
+    if not data:
+        return NIGHTLY_UNREADABLE
+    try:
+        from eval_dashboard import nightly_digest
+
+        mentions = nightly_digest.load_mentions(environ.get(nightly_digest.MENTIONS_ENV))
+        return nightly_digest.build(data, now, gh, mentions=mentions)
+    except Exception as exc:  # noqa: BLE001 -- the digest must still go out
+        skipped = getattr(sys.modules.get("eval_dashboard.nightly_digest"), "Skipped", ())
+        if skipped and isinstance(exc, skipped):
+            reason = str(exc)
+        else:
+            reason = NIGHTLY_FAILED.format(error=type(exc).__name__)
+            traceback.print_exc()
+        log(f"warning: nightly section skipped: {reason}")
+        return reason
+
+
+def coverage_lines(data: dict | None, now: datetime, store_path: pathlib.Path | None = None) -> list[str]:
+    """coverage_gaps.digest_lines over this checkout: one line per domain
+    with no blocking presubmit seat. Imported here for the reason
+    nightly_section is; any failure is a warning and no lines, never a lost
+    digest."""
+    try:
+        from eval_dashboard import coverage_gaps
+
+        store = coverage_gaps.read_json(store_path, "store.json")
+        return coverage_gaps.digest_lines(coverage_gaps.find_gaps(coverage_gaps.REPO_ROOT, data or {}, store, now))
+    except Exception:  # noqa: BLE001 -- the digest must still go out
+        traceback.print_exc()
+        log("warning: coverage-gap lines skipped")
+        return []
+
+
+def filing_lines(location: str | None, now: datetime, runner=subprocess.run) -> list[str]:
+    """nightly_bugs.held_digest_lines over the filer's ``--state``: one line
+    while bug filing has been held for hours on an untrusted issue listing.
+    Imported here for the reason nightly_section is; any failure is a
+    warning and no line, never a lost digest."""
+    if not location:
+        return []
+    try:
+        from eval_dashboard import nightly_bugs
+
+        return nightly_bugs.held_digest_lines(nightly_bugs.read_held_state(location, runner), now)
+    except Exception:  # noqa: BLE001 -- the digest must still go out
+        traceback.print_exc()
+        log("warning: held bug-filing line skipped")
+        return []
+
+
 def parse_tz(name: str):
     try:
         return ZoneInfo(name)
@@ -1858,7 +2179,9 @@ def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--health", type=pathlib.Path, required=True, help="the health.json health.py wrote")
     parser.add_argument("--state", required=True, help="last-posted state: local path or gs:// object (this script's only write)")
-    parser.add_argument("--data", type=pathlib.Path, default=None, help="the collector's data.json; the digest then carries one line on last night's nightly run (unreadable: a warning and the line says so)")
+    parser.add_argument("--data", type=pathlib.Path, default=None, help="the collector's data.json; the digest then carries a section on last night's nightly run, or one line when the section cannot be built (unreadable: a warning and the digest says so)")
+    parser.add_argument("--store", type=pathlib.Path, default=None, help="the store.json the tick read; the digest's coverage-gap lines then carry the evidence store's verdict on each domain's best candidate")
+    parser.add_argument("--bugs-state", default=None, help="the nightly bug filer's --state (local path or gs:// object); the digest then says when filing has been held for hours")
     parser.add_argument("--digest-hour", type=int, default=DEFAULT_DIGEST_HOUR, help="hour of the daily digest, in --digest-tz")
     parser.add_argument("--digest-tz", type=parse_tz, default=LOCAL_TZ, help=f"IANA zone the digest hour and day are read in (default {DEFAULT_TZ}); times in messages stay {DEFAULT_TZ} ({TZ_LABEL}) regardless")
     parser.add_argument("--repo", default=ghcli.DEFAULT_REPO, help="owner/repo the tracking issue is filed in")
@@ -1880,9 +2203,9 @@ def main(argv=None, environ=os.environ, opener=urllib.request.urlopen, runner=su
         try:
             data = json.loads(args.data.read_text())
         except (OSError, ValueError) as exc:
-            # The digest still goes out; its nightly line says the data was
-            # unreadable rather than inventing a quiet night.
-            log(f"warning: {args.data}: {exc}; the digest's nightly line will say so")
+            # The digest still goes out; it says the data was unreadable
+            # rather than inventing a quiet night.
+            log(f"warning: {args.data}: {exc}; the digest will say so")
             data = {}
         if not isinstance(data, dict):
             data = {}
@@ -1896,8 +2219,18 @@ def main(argv=None, environ=os.environ, opener=urllib.request.urlopen, runner=su
     if environ.get(ghcli.TOKEN_ENV) or args.dry_run:
         tracker = gate_issue.Tracker(ghcli.Gh(args.repo, gh_runner or runner, dry_run=args.dry_run))
 
+    gh = tracker.gh if tracker is not None else None
+
+    def section():
+        return nightly_section(data, now, gh, environ)
+
+    def coverage():
+        # The held-filing line rides with the coverage-gap lines: both are
+        # one-liners about a filer, read only on a digest tick.
+        return filing_lines(args.bugs_state, now, runner) + coverage_lines(data, now, args.store)
+
     prev = read_state(args.state, runner)
-    state, messages, failed = run(health, prev, now, args.digest_hour, sender, args.dry_run, args.digest_tz, tracker, data)
+    state, messages, failed = run(health, prev, now, args.digest_hour, sender, args.dry_run, args.digest_tz, tracker, data, section, coverage)
     if prev is None and failed and len(failed) == len(messages):
         # Nothing has ever been told and nothing got through: there is no
         # state worth recording, and the next tick starts from scratch.

@@ -28,7 +28,7 @@ hourly and half-hourly jobs fire, so they are contention, not noise. Every one
 of the board's 1000 rows reads ``completed``. There is no query against the
 current schema that can find the twenty.
 
-Seven ways an occurrence is lost, all recorded with a distinguishing
+Eight ways an occurrence is lost, all recorded with a distinguishing
 reason (the codes below are the vocabulary, and they are content-free so they
 can also be projected to monitoring):
 
@@ -118,6 +118,15 @@ nothing; the scheduled slot is untouched, see ``already_running`` above.
     whatever the name suggests, and the count of the code — projected as
     ``error_class`` — is the signal to watch. Separating the fence failures
     out needs upstream to say why it refused, which it does not today.
+
+``stale_catch_up``
+    The one code not written by Hermes' own tick. ``profile_cron_tick.py``'s
+    catch-up policy (``agents/chat/scripts/cron_catch_up_policy.py``) moves a
+    model-run job that is a whole period or more overdue to its next slot
+    before Hermes scans the store, so the occurrence never reaches the
+    ``missed_window`` path above; the policy writes this row itself, in the
+    shape ``record_skipped_execution`` writes, so the job's history still
+    says the slot was due and did not run.
 
 Two near-misses deliberately *not* recorded, because neither loses an
 occurrence: the tick-lock contention path (``Tick skipped — another instance
@@ -257,6 +266,11 @@ SKIP_CREATE_EXECUTION_FAILED = "create_execution_failed"
 #: The worker re-took the fire claim at execution time and was refused; the
 #: docstring lists the five refusals this covers.
 SKIP_FIRE_CLAIM_LOST = "fire_claim_lost"
+#: The ticker's catch-up policy (agents/chat/scripts/cron_catch_up_policy.py)
+#: moved a job a whole period or more overdue to its next slot instead of
+#: letting the catch-up fire; written by that policy, since Hermes never sees
+#: the occurrence.
+SKIP_STALE_CATCH_UP = "stale_catch_up"
 
 #: Every reason the ledger will accept. An unknown code is coerced rather than
 #: rejected: a skip recorded under a bad label is still evidence, and dropping
@@ -270,6 +284,7 @@ SKIP_REASONS = frozenset(
         SKIP_DISPATCH_CLAIM_REJECTED,
         SKIP_CREATE_EXECUTION_FAILED,
         SKIP_FIRE_CLAIM_LOST,
+        SKIP_STALE_CATCH_UP,
     }
 )
 SKIP_REASON_UNSPECIFIED = "unspecified"

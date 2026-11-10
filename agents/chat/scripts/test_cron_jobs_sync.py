@@ -14,6 +14,7 @@ new job simply never appeared — so several tests assert on what did NOT happen
 import fcntl
 import json
 import os
+import sys
 import pathlib
 import threading
 import time
@@ -22,7 +23,9 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
 
-import cron_jobs_sync
+sys.path.insert(1, str(Path(__file__).resolve().parents[2] / "platform" / "scripts"))
+import cron_jobs_sync  # noqa: E402
+import profile_scaffold  # noqa: E402
 
 
 def job(job_id, **kw):
@@ -559,7 +562,7 @@ class SyncFileTests(unittest.TestCase):
         lock_fd = open(lock_file, "a+")
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         try:
-            with mock.patch.object(cron_jobs_sync, "DEFAULT_JOBS_LOCK_TIMEOUT_SECONDS", 0.05):
+            with mock.patch.object(profile_scaffold, "DEFAULT_JOBS_LOCK_TIMEOUT_SECONDS", 0.05):
                 rc = cron_jobs_sync.sync(self.image, self.runtime, self.ledger)
         finally:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)

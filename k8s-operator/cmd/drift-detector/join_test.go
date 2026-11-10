@@ -490,6 +490,9 @@ func TestJoinCountsStringAlwaysNamesEveryOutcome(t *testing.T) {
 			t.Errorf("joinCounts.String() = %q, want it to name %q", got, outcome)
 		}
 	}
+	if !strings.Contains(got, "benched=") {
+		t.Errorf("joinCounts.String() = %q, want it to name benched", got)
+	}
 	// Not an outcome, but printed beside unreachable for the same reason: a
 	// run that held every unreachable record and one that forwarded them all
 	// print the same unreachable count.
@@ -1196,5 +1199,310 @@ func TestJoinCardsALateKubectlRecord(t *testing.T) {
 	j.Handle(context.Background(), record)
 	if !got.Digest {
 		t.Error("a late record from Helm's Go client was not digested")
+	}
+}
+
+// slowFleet is a two-cluster join whose first cluster (joinCluster, which
+// joinRecord names) hangs until its lookup context ends and whose second
+// answers at once. Two clusters, because the bench is off for one.
+func slowFleet(t *testing.T) (j *joiner, slow, fast *stubGetter, events *[]DriftEvent) {
+	t.Helper()
+	blocked := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-blocked:
+		default:
+			close(blocked)
+		}
+	})
+	slow = &stubGetter{block: blocked}
+	fast = &stubGetter{obj: &unstructured.Unstructured{}}
+	events = &[]DriftEvent{}
+	j = newJoiner(map[clusterIdentity]objectGetter{joinCluster(): slow, fastCluster(): fast}, nil, nil, nil,
+		func(_ context.Context, e DriftEvent) { *events = append(*events, e) })
+	j.timeout = 50 * time.Millisecond
+	j.slowLookup = 20 * time.Millisecond
+	j.cooldown = time.Hour
+	return j, slow, fast, events
+}
+
+func fastCluster() clusterIdentity {
+	return clusterIdentity{Project: "example-project", Location: "us-central1", Cluster: "prod-b"}
+}
+
+func fastRecord() AuditRecord {
+	r := joinRecord()
+	r.Cluster = fastCluster().Cluster
+	return r
+}
+
+// smallestExampleBudget is the smallest --batch-join-budget the README offers
+// (for a subscription on Pub/Sub's ten-second default deadline). A threshold
+// at or above it would leave that install's hung lookups cut off by the budget
+// before they were slow enough to bench.
+const smallestExampleBudget = 4 * time.Second
+
+func TestSlowClusterDefaults(t *testing.T) {
+	j := newJoiner(nil, nil, nil, nil, nil)
+	if j.slowLookup != slowLookupThreshold || j.cooldown != slowClusterCooldown {
+		t.Errorf("newJoiner slowLookup=%s cooldown=%s, want %s and %s", j.slowLookup, j.cooldown, slowLookupThreshold, slowClusterCooldown)
+	}
+	// At or past the per-request timeout, a hung cluster's lookups would end
+	// before they were slow enough to bench it.
+	if slowLookupThreshold >= joinRequestTimeout {
+		t.Errorf("slowLookupThreshold %s must be below joinRequestTimeout %s", slowLookupThreshold, joinRequestTimeout)
+	}
+	if slowLookupThreshold >= smallestExampleBudget {
+		t.Errorf("slowLookupThreshold %s must be below the README's %s budget", slowLookupThreshold, smallestExampleBudget)
+	}
+	// Defined as the ceiling today; this fails the moment it is set to
+	// anything shorter, which would let one batch probe a hung cluster twice.
+	if slowClusterCooldown < batchJoinBudgetCeiling {
+		t.Errorf("slowClusterCooldown %s must be at least batchJoinBudgetCeiling %s", slowClusterCooldown, batchJoinBudgetCeiling)
+	}
+}
+
+func TestJoinBenchesASlowClusterInAFleet(t *testing.T) {
+	j, slow, fast, events := slowFleet(t)
+
+	j.Handle(context.Background(), joinRecord())
+	j.Handle(context.Background(), joinRecord())
+	j.Handle(context.Background(), fastRecord())
+
+	if len(slow.refs) != 1 {
+		t.Errorf("slow cluster saw %d lookups, want 1: the timeout should bench it", len(slow.refs))
+	}
+	if len(fast.refs) != 1 {
+		t.Errorf("fast cluster saw %d lookups, want 1", len(fast.refs))
+	}
+	got := *events
+	if len(got) != 3 {
+		t.Fatalf("forwarded %d events, want 3: a benched record fails open, it is not dropped", len(got))
+	}
+	if got[0].Outcome != joinFailed || !errors.Is(got[0].LookupError, context.DeadlineExceeded) {
+		t.Errorf("first = %q %v, want failed with the deadline", got[0].Outcome, got[0].LookupError)
+	}
+	if got[1].Outcome != joinFailed || !errors.Is(got[1].LookupError, errSlowClusterSkipped) {
+		t.Errorf("second = %q %v, want failed with errSlowClusterSkipped", got[1].Outcome, got[1].LookupError)
+	}
+	if got[1].LookupError != nil && !strings.Contains(got[1].LookupError.Error(), joinCluster().String()) {
+		t.Errorf("skip error %q does not name the cluster", got[1].LookupError)
+	}
+	if got[2].Outcome != joinEnriched {
+		t.Errorf("fast cluster's record = %q, want enriched", got[2].Outcome)
+	}
+	// The skipped record is benched=, not failed=: failed= stays lookups tried.
+	if c := j.Counts(); c.Failed != 1 || c.Benched != 1 || c.Enriched != 1 {
+		t.Errorf("Counts() = %s, want failed=1 benched=1 enriched=1", c)
+	}
+}
+
+// A budget shorter than joinRequestTimeout (the README's 4s for a ten-second
+// ack deadline) cuts the lookup off before the request timeout does. That is
+// still the cluster sitting on the request and has to bench it, or such an
+// install pays the whole budget to the hung cluster every batch.
+func TestJoinBenchesWhenTheBatchBudgetCutsTheLookup(t *testing.T) {
+	j, slow, _, events := slowFleet(t)
+	j.timeout = time.Minute
+
+	budget, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	j.Handle(budget, joinRecord())
+	// Short again, so a join that does not bench fails this in milliseconds
+	// rather than sitting out a minute.
+	j.timeout = 10 * time.Millisecond
+	j.Handle(context.Background(), joinRecord())
+
+	if len(slow.refs) != 1 {
+		t.Errorf("slow cluster saw %d lookups, want 1", len(slow.refs))
+	}
+	if got := (*events)[1].LookupError; !errors.Is(got, errSlowClusterSkipped) {
+		t.Errorf("second LookupError = %v, want errSlowClusterSkipped", got)
+	}
+}
+
+func TestJoinDoesNotBenchOnAFastFailureOrShutdown(t *testing.T) {
+	t.Run("fast failure", func(t *testing.T) {
+		j, _, _, _ := slowFleet(t)
+		forbidden := &stubGetter{err: errors.New("forbidden")}
+		j.clusters[joinCluster()] = forbidden
+		j.Handle(context.Background(), joinRecord())
+		j.Handle(context.Background(), joinRecord())
+		if len(forbidden.refs) != 2 {
+			t.Errorf("saw %d lookups, want 2: an error that cost nothing is no reason to bench", len(forbidden.refs))
+		}
+	})
+	t.Run("shutdown", func(t *testing.T) {
+		j, slow, _, _ := slowFleet(t)
+		j.timeout = time.Minute
+		ctx, cancel := context.WithCancel(context.Background())
+		time.AfterFunc(50*time.Millisecond, cancel)
+		j.Handle(ctx, joinRecord())
+		j.timeout = 10 * time.Millisecond
+		j.Handle(context.Background(), joinRecord())
+		if len(slow.refs) != 2 {
+			t.Errorf("saw %d lookups, want 2: a SIGTERM says nothing about the cluster", len(slow.refs))
+		}
+	})
+}
+
+func TestJoinProbesABenchedClusterAfterTheCooldown(t *testing.T) {
+	j, slow, _, events := slowFleet(t)
+	j.cooldown = 0
+
+	j.Handle(context.Background(), joinRecord())
+	// Recovered: the next lookup answers.
+	slow.block = nil
+	slow.obj = &unstructured.Unstructured{}
+	j.Handle(context.Background(), joinRecord())
+
+	if len(slow.refs) != 2 {
+		t.Errorf("saw %d lookups, want 2: the cooldown is over, so the next record probes", len(slow.refs))
+	}
+	if got := (*events)[1].Outcome; got != joinEnriched {
+		t.Errorf("probe outcome = %q, want enriched", got)
+	}
+	if _, benched := j.slow[joinCluster()]; benched {
+		t.Error("a probe that answered left the cluster benched")
+	}
+}
+
+// One cluster: there is no other cluster's budget to protect, so the bench
+// stays off and every record keeps its lookup, as before it existed.
+func TestJoinNeverBenchesTheOnlyCluster(t *testing.T) {
+	blocked := make(chan struct{})
+	defer close(blocked)
+	slow := &stubGetter{block: blocked}
+	j := newJoiner(joinSet(slow), nil, nil, nil, func(context.Context, DriftEvent) {})
+	j.timeout = 50 * time.Millisecond
+	j.slowLookup = 20 * time.Millisecond
+	j.cooldown = time.Hour
+
+	j.Handle(context.Background(), joinRecord())
+	j.Handle(context.Background(), joinRecord())
+
+	if len(slow.refs) != 2 {
+		t.Errorf("saw %d lookups, want 2 on a single-cluster join", len(slow.refs))
+	}
+}
+
+// slowAnswerGetter answers every lookup, but only after delay: an overloaded
+// control plane rather than a hung one. delays, when set, gives the delay of
+// each call in turn, the last repeating.
+type slowAnswerGetter struct {
+	delay  time.Duration
+	delays []time.Duration
+	calls  int
+}
+
+func (g *slowAnswerGetter) Get(ctx context.Context, _ ResourceRef) (*unstructured.Unstructured, error) {
+	delay := g.delay
+	if len(g.delays) > 0 {
+		delay = g.delays[min(g.calls, len(g.delays)-1)]
+	}
+	g.calls++
+	select {
+	case <-time.After(delay):
+		return &unstructured.Unstructured{}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// A slow answer is a strike, not a bench: it may be this process's own cold
+// path. Two in a row bench, a fast answer between them clears the streak, and
+// every answering record keeps its result.
+func TestJoinBenchesOnTheSecondSlowAnswerInARow(t *testing.T) {
+	const slow, fast = 40 * time.Millisecond, time.Duration(0)
+	for _, tc := range []struct {
+		name      string
+		delays    []time.Duration
+		records   int
+		wantCalls int
+		benched   bool
+	}{
+		{"one slow answer does not bench", []time.Duration{slow, fast}, 2, 2, false},
+		{"two in a row bench", []time.Duration{slow, slow, fast}, 3, 2, true},
+		{"a fast answer clears the streak", []time.Duration{slow, fast, slow, fast}, 4, 4, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			j, _, _, events := slowFleet(t)
+			getter := &slowAnswerGetter{delays: tc.delays}
+			j.clusters[joinCluster()] = getter
+			j.timeout = time.Second
+
+			for range tc.records {
+				j.Handle(context.Background(), joinRecord())
+			}
+
+			if getter.calls != tc.wantCalls {
+				t.Errorf("saw %d lookups, want %d", getter.calls, tc.wantCalls)
+			}
+			if _, benched := j.slow[joinCluster()]; benched != tc.benched {
+				t.Errorf("benched = %v, want %v", benched, tc.benched)
+			}
+			for i, e := range (*events)[:tc.wantCalls] {
+				if e.Outcome != joinEnriched {
+					t.Errorf("answered record %d = %q %v, want enriched", i, e.Outcome, e.LookupError)
+				}
+			}
+			if tc.benched {
+				last := (*events)[tc.records-1]
+				if !errors.Is(last.LookupError, errSlowClusterSkipped) || !strings.Contains(last.LookupError.Error(), slowAnswer) {
+					t.Errorf("skipped record's LookupError = %v, want errSlowClusterSkipped saying it answered slowly", last.LookupError)
+				}
+			}
+		})
+	}
+}
+
+// A lookup the batch budget ends before it answers is not a fast answer: it
+// leaves the streak alone, so a cluster that answers slowly still benches on
+// its second slow answer even when a spent budget cut a lookup in between.
+func TestJoinStreakSurvivesALookupTheBudgetCutShort(t *testing.T) {
+	const slow = 40 * time.Millisecond
+	j, _, _, _ := slowFleet(t)
+	getter := &slowAnswerGetter{delay: slow}
+	j.clusters[joinCluster()] = getter
+	j.timeout = time.Second
+
+	spent, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+
+	j.Handle(context.Background(), joinRecord()) // slow answer: strike one
+	j.Handle(spent, joinRecord())                // ended at once on the spent budget
+	if _, benched := j.slow[joinCluster()]; benched {
+		t.Fatal("benched after one slow answer and one cut-short lookup, want a strike only")
+	}
+	j.Handle(context.Background(), joinRecord()) // second slow answer
+	if _, benched := j.slow[joinCluster()]; !benched {
+		t.Errorf("not benched: the cut-short lookup cleared the streak (strikes=%d)", j.strikes[joinCluster()])
+	}
+}
+
+// The DRIFT line carries the lookup's duration when there was a lookup, and
+// not otherwise, so latency is readable from the logs.
+func TestLogDriftEventLookupDuration(t *testing.T) {
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(io.Discard) })
+
+	logDriftEvent(context.Background(), DriftEvent{Record: joinRecord(), Outcome: joinEnriched, LookupDuration: 1500 * time.Millisecond})
+	if !strings.Contains(buf.String(), " lookup_ms=1500") {
+		t.Errorf("DRIFT line %q lacks lookup_ms=1500", buf.String())
+	}
+	buf.Reset()
+	logDriftEvent(context.Background(), DriftEvent{Record: joinRecord(), Outcome: joinNoObject})
+	if strings.Contains(buf.String(), "lookup_ms=") {
+		t.Errorf("DRIFT line %q carries lookup_ms with no lookup", buf.String())
+	}
+}
+
+func TestJoinRecordsTheLookupDuration(t *testing.T) {
+	var got DriftEvent
+	j := newJoiner(joinSet(&slowAnswerGetter{delay: 20 * time.Millisecond}), nil, nil, nil, func(_ context.Context, e DriftEvent) { got = e })
+	j.Handle(context.Background(), joinRecord())
+	if got.LookupDuration < 20*time.Millisecond {
+		t.Errorf("LookupDuration = %s, want at least the getter's 20ms", got.LookupDuration)
 	}
 }

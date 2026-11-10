@@ -56,6 +56,9 @@ PLATFORM_JOBS_FILE = REPO_ROOT / "agents" / "platform" / "cron" / "jobs.json"
 # its rule rather than a second one.
 AUDIT_STREAMS_FILE = REPO_ROOT / "bench" / "kube_agents_bench" / "audit_streams.py"
 AUDIT_STREAMS_MODULE_NAME = "bench_audit_streams"
+# The runner's reader of `scope_exclude:` (hack/ci-eval-pr.sh), loaded the same way.
+SCOPE_EXCLUDE_FILE = REPO_ROOT / "bench" / "kube_agents_bench" / "scope_exclude.py"
+SCOPE_EXCLUDE_MODULE_NAME = "bench_scope_exclude"
 TASKS_DIR = REPO_ROOT / "bench" / "tasks"
 # The tag PyYAML gives a `<<:` merge key; its pairs are merged in, not repeated.
 YAML_MERGE_TAG = "tag:yaml.org,2002:merge"
@@ -63,7 +66,12 @@ YAML_MERGE_TAG = "tag:yaml.org,2002:merge"
 # runs, what the nightly adds. A case is registered by being in one of them.
 PRESUBMIT_CASES_FILE = eval_rosters.PRESUBMIT_CASES_FILE
 NIGHTLY_CASES_FILE = eval_rosters.NIGHTLY_CASES_FILE
-ROSTER_FILES = (PRESUBMIT_CASES_FILE, NIGHTLY_CASES_FILE)
+# The certification suite's file: a case there is registered too, on a lane
+# of its own, and its task file must say so with `suite: certification`.
+CERTIFICATION_CASES_FILE = eval_rosters.CERTIFICATION_CASES_FILE
+ROSTER_FILES = (PRESUBMIT_CASES_FILE, NIGHTLY_CASES_FILE, CERTIFICATION_CASES_FILE)
+SUITE_KEY = "suite"
+CERTIFICATION_SUITE = eval_rosters.CERTIFICATION_SUITE
 # The synthetic result key validate_all() reports a broken roster parse under,
 # so a tree whose roster files cannot be read fails loudly instead of calling
 # every case an orphan.
@@ -167,16 +175,6 @@ KNOWN_UNREGISTERED = {
     # nightly is a tier decision nobody has made; this entry is the record
     # that the omission is known rather than accidental.
     "cluster-provision-kanban": "cluster-scoped provisioning task, tier decision pending",
-    # Has its fixture (its own stack) and its eval record (#3467: red on main,
-    # three greens on the fix, on a dev install), and belongs in the nightly.
-    # The pool runners hold no role that creates a Cloud Monitoring alert
-    # policy, so every apply of its stack would fail with 403; #3632 grants
-    # roles/monitoring.alertPolicyEditor. The entry goes when the case joins
-    # hack/eval/nightly-cases.txt.
-    "monitoring-alert-policy-read": (
-        "#3632: stack case held out of the nightly until the pool runners can "
-        "create a Cloud Monitoring alert policy"
-    ),
     # Has its fixture (its own stack) and its eval record (#2468: red on main,
     # three greens on the fix), and belongs in the nightly. #2755 lists what it
     # still needs first: Compute network permission for the CI runners,
@@ -215,13 +213,14 @@ KNOWN_UNREGISTERED = {
     "notification-dead-thread-falls-back": (
         "needs a chat platform, which no CI install has; run by hand on a chat install"
     ),
-    # It grades a GitHub forge declared at a GitHub Enterprise Server host,
-    # which needs the GHES proxy (hack/ghes-proxy) and an install pointed at
-    # it. No eval lane deploys either, so it runs by hand with the recipe in
-    # its header. The entry goes when a lane deploys both.
+    # It grades a GitHub forge declared at a GitHub Enterprise Server host.
+    # The GHES lane (hack/eval/ghes-cases.txt) runs pdb-remediation-pr itself
+    # against the proxy, which proves the same path; registering this copy in
+    # the nightly would run it on the github.com nightly too. The entry goes
+    # when the registration rules grow a lane-only seat.
     "ghes-pdb-remediation-pr": (
-        "needs the GHES proxy and a GHES-forge install, which no eval lane has; "
-        "run by hand with the recipe in the case header"
+        "the GHES lane runs pdb-remediation-pr against the proxy; a nightly registration "
+        "would run this copy on github.com too; run by hand with the recipe in the case header"
     ),
     # The upgrade-failure catalogue's scenario cases enter
     # hack/eval/nightly-cases.txt in batches of five (decided 2026-10-15 on
@@ -291,6 +290,26 @@ KNOWN_UNREGISTERED = {
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
 # later pull request that moves the case to the nightly file.
 FIXTURE_NOT_READY = {
+    # Needs a Standard seeded cluster with a manual node pool labelled for a
+    # ComputeClass whose auto-creation is off: the lane's Autopilot hosts
+    # refuse the shape, so it is a fleet fixture addressed by role, and
+    # #5143 plants it. #4943 is the sibling ComputeClass gap on the same
+    # host constraint.
+    "ccc-manual-pools-single-rule-unbacked": (
+        "#5143: needs a Standard seeded cluster with a manual node pool under a ComputeClass "
+        "whose auto-creation is off; the lane's host clusters are Autopilot"
+    ),
+    # Needs Config Sync's RootSync CRD and one root-sync object reporting
+    # Stalled=True on a seeded cluster. No pool project enables the GKE Hub
+    # API, so Config Sync is installed nowhere, and the seeded fleet plants no
+    # custom resource. The CRD alone is enough (no operator): apply the
+    # upstream CRD, create the object, write its status with
+    # `kubectl patch --subresource=status`. #2580's "Fixture & Eval" section
+    # specifies the object.
+    "compliance-configsync-stalled": (
+        "#2580: needs the Config Sync RootSync CRD and a Stalled root-sync object "
+        "on a seeded cluster; no pool project runs Config Sync"
+    ),
     # Needs a GitOps repository that declares the namespace under a path a
     # reconciler syncs; no pool project's repository has one. Run by hand on
     # the GitOps-wired dev lane (gitops-target-1, sackheads/kage-fleet-dev).
@@ -312,20 +331,27 @@ FIXTURE_NOT_READY = {
     "terraform-node-pool-autoscaling-pr": (
         "#3576: needs a Terraform provisioning/ path in the pool GitOps repositories"
     ),
+    "terraform-new-cluster-pr": (
+        "#3576: needs a Terraform provisioning/ path in the pool GitOps repositories"
+    ),
+    # Needs a cluster that runs Config Connector in the audited fleet of a
+    # pool project; no pool project runs it (provisioning-kcc-cluster-without-
+    # crds-stops relies on that). bench/tf/prebuilt/kcc-stalled-declaration
+    # plants the stalled object on such a cluster and removes it.
+    "fleet-audit-manifest-fix-names-stalled-config-connector": (
+        "#4218: needs a cluster that runs Config Connector in the pool fleet, for the "
+        "stalled ContainerNodePool the stack plants; no pool project runs Config Connector"
+    ),
     "fanout-bound-ten-cards": (
         "#3560: needs an eval install with more than ten clusters in scope, so a "
         "fleet question reaches the ten-card fan-out bound; the seeded fleet and "
         "every dev install have five or fewer"
     ),
-    "scope-excluded-cluster-not-listed": (
-        "#3213: needs an eval install whose PlatformAgent spec.scope.exclude.clusters "
-        "names seeded-b (seeded-a and seeded-c in scope); no pool install declares a "
-        "cluster exclusion and the case cannot patch the CR for a run"
-    ),
-    "networking-world-open-ingress": (
-        "#2682: needs bench/tf/fleet's world_open firewall rule and VM applied to "
-        "every pool project (fleet re-apply); no pool project has a rule opening a "
-        "management port to the internet"
+    "upgrades-readiness-lb-drain-timeout": (
+        "#3524: needs bench/tf/fleet's drain-timeout backend service on seeded-b's default "
+        "pool (the readiness-lb-drain-timeout role) applied to every pool project (fleet "
+        "re-apply); no pool project has a backend service draining longer than the 600 s "
+        "GKE waits per node"
     ),
     "b-0011-gitops": (
         "#1307: the GitOps fix-cycle pilot; needs a leaderboard GitOps repository "
@@ -367,6 +393,13 @@ FIXTURE_NOT_READY = {
         "spec.integration); every CI eval install has a GitHub forge, so no CI tier "
         "can run it; run it by hand against such an install"
     ),
+    "fleet-audit-forge-without-issues-keeps-the-ledger-in-the-store": (
+        "#1154: needs an install whose forge's capabilities declare no issue verbs "
+        "and labels: false (an install whose forge declares no issue tracker, as a "
+        "Bitbucket provider does), and the no-pdb-workload declaration of #2228; "
+        "every CI eval install has a GitHub forge, so no CI tier can run it; run it "
+        "by hand against such an install"
+    ),
     "fleet-audit-ledger-goes-to-the-gitops-repository": (
         "#3536: needs an install whose PlatformAgent declares a second managed "
         "repository beside the gitops one; every CI eval install declares one, and "
@@ -398,27 +431,20 @@ FIXTURE_NOT_READY = {
         "not, so the case fails with the branch absent, which is broken rather "
         "than red"
     ),
-    "gce-startup-script-failure": (
-        "#2483: needs bench/tf/fleet's startup_fail VM applied to every pool project "
-        "(fleet re-apply); no pool project runs a VM whose startup script fails"
+    "inspect-repository-unmanaged-and-context-read": (
+        "#4243: needs kubernetes-sigs/kind at v0.24.0 registered in each pool "
+        "install's context_repos, as the case's header gives; no pool install "
+        "registers it, so the context check fails with the repository absent, "
+        "which is broken rather than red"
     ),
-    "gce-chat-request-runs-collector": (
-        "#2483: needs bench/tf/fleet's startup_fail VM applied to every pool project "
-        "(fleet re-apply), as gce-startup-script-failure does; until then it runs by "
-        "hand on a dev install with the VM planted"
-    ),
-    "obtainability-major-pdb-auto-pr": (
-        "#2228: needs checkout-gateway declared under clusters/seeded-a/ in "
-        "each pool project's *-infra repository, so 3.3's fix is a manifest "
-        "rather than manual"
-    ),
-    "obtainability-pdb-kustomize-overlay": (
-        "#2686: needs checkout-gateway declared in a Kustomize root under "
-        "clusters/seeded-a/seeded-reliability/ in each pool project's *-infra "
-        "repository (the two files are in the case's header), so a new "
-        "PodDisruptionBudget there renders only if the kustomization lists it; "
-        "the fixture cannot share a repository with "
-        "obtainability-major-pdb-auto-pr's (#2228)"
+    "remediation-context-repository-owns-the-fix": (
+        "#5213: needs the three-part fixture its fixture/README.md describes in each "
+        "pool install: a context repository holding the payments chart, registered "
+        "in context_repos at a pinned ref (the registration #4243 also waits for), "
+        "the clusters/<cluster>/demo-shop/payments/ HelmRelease directory on the "
+        "GitOps repository, and the rendered workload on the agent host; no pool "
+        "install carries them, so the objective fails with the chart repository "
+        "absent, which is broken rather than red"
     ),
     "obtainability-untargeted-compute-class-manifest": (
         "#2540: needs a ComputeClass cluster without default ComputeClass and with "
@@ -429,6 +455,22 @@ FIXTURE_NOT_READY = {
         "#1873: needs the stalled-controller role applied to every pool "
         "project; fixture defined in #1893, waiting on fleet re-apply and pool "
         "verification sweep"
+    ),
+    "autoops-warning-event-triage-open-pr": (
+        "#2513 / #3576: needs an install with INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true in "
+        "spec.deployment.env and a GitOps repository declaring eval-open-pr-workload alongside "
+        "provisioning files; every CI eval install leaves INCIDENT_TRIAGE_OPEN_PULL_REQUEST off "
+        "(which the nightly AutoOps triage cases require) and no pool *-infra repository carries "
+        "both paths, so no CI tier can run it; run it by hand against such an install"
+    ),
+    "incident-triage-open-pr-reminder": (
+        "#2513: needs an install with INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true in spec.deployment.env, "
+        "INCIDENT_WORKLOAD_DEDUP_SECONDS set shorter than the fix pull request takes to open (150, "
+        "as hack/ci-deploy.sh sets it; on the hour default the stack's recurrence lands inside the "
+        "window and folds with no pull request on its row, which the objective check fails) and a "
+        "GitOps repository declaring eval-pr-reminder-workload; every CI eval install leaves "
+        "INCIDENT_TRIAGE_OPEN_PULL_REQUEST off and no pool *-infra repository declares it, so no CI "
+        "tier can run it; run it by hand against such an install"
     ),
     "upgrades-removed-api-caller-named": (
         "#2655: needs a removed-api-caller role, a writer that calls an API "
@@ -451,6 +493,15 @@ FIXTURE_NOT_READY = {
         "the surge-capacity rule's two surge halves are covered by unit tests on "
         "a recorded cluster record and node list until the fixture lands"
     ),
+    "upgrades-readiness-rollout-sequence-precheck": (
+        "#3798: needs gkehub.googleapis.com enabled, roles/gkehub.viewer bound for "
+        "the agent's service account, a fleet, and the standing RolloutSequence "
+        "`seeded-train` on every pool project, so a worker's `gcloud container fleet "
+        "rolloutsequences list` on the eval project answers `existing 1; plan "
+        "blocked`, the line the case pins; no pool project has them today, so the "
+        "read fails for a reason that is not the case's, and the blocked path is "
+        "graded by the rule's unit tests on a recorded list"
+    ),
 }
 
 # Cases graded by the judge alone. The OutcomeValidity >= 0.7 fallback in
@@ -465,15 +516,15 @@ KNOWN_JUDGE_ONLY: dict[str, str] = {}
 # the run did.
 #
 # devops-bench's registry is authoritative and rejects an unknown type at
-# spec-load time; this table is the pre-cluster copy. The first three come
-# from the pinned devops-bench SHA in bench/pyproject.toml, the last three
-# from bench/kube_agents_bench/verifiers.py -- a test re-derives those from
-# the entry-point group so a new local verifier fails here rather than
-# drifting silently.
+# spec-load time; this table is the pre-cluster copy. The upstream entries
+# come from the pinned devops-bench SHA in bench/pyproject.toml, the local
+# ones from the `devops_bench.verifiers` entry-point group in the same file
+# -- a test re-derives the local ones from that group so a new local
+# verifier fails here rather than drifting silently.
 #
-# For the first three the named field is also required by the verifier's own
+# For the upstream entries the named field is also required by the verifier's own
 # pydantic model, so this rule only moves the rejection earlier -- from after a
-# cluster lease to now. The rule earns its keep on the last three, where the
+# cluster lease to now. The rule earns its keep on the local ones, where the
 # field is optional and an empty or blank-stringed list is the shape that
 # actually ships: a check that reads as an assertion and can only pass.
 CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
@@ -505,6 +556,11 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
         "any_of_phrases",
         "every_finding_named",
     ),
+    # No field: the verifier's own model refuses a spec that binds nothing
+    # (`state: closed` or `min_comments` >= 1 is required), and
+    # bench/tests/test_lane.py parses every shipped case through devops-bench
+    # on every pull request, so an unbound spec never reaches a lease.
+    "forge_issue_state": (),
     # No field: a bold one-sentence lead, no heading and the length caps are
     # the assertion, and every field narrows it.
     "answer_first": (),
@@ -517,13 +573,15 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # field only narrows it. See the empty-tuple rule in _check_assertions.
     "pull_request_opened": (),
     # Likewise: "the run wrote to the GitOps repository since it started" is
-    # the assertion, and every field narrows it. The inject lane appends it
-    # to every case it runs (hack/eval/inject-lane-safeguards.yaml); a case
+    # the assertion, and every field narrows it. Both lanes append it to
+    # every case they run (hack/eval/inject-lane-safeguards.yaml); a case
     # may also declare it.
     "github_writes": (),
     "tool_called": ("tool_names",),
     "worker_commands": ("required_patterns", "forbidden_patterns", "required_runs", "forbidden_runs", "forbidden_result_patterns"),
     "worker_agents": ("required_agents",),
+    "delegated_to": ("required_addressees", "forbidden_addressees"),
+    "worker_budget": ("budget",),
     "replay_card": ("status_in", "status_not_in", "comment_phrases", "decoy_status_in"),
     # No assertion field: "the gateway would post nothing" is the assertion; `reply` only picks
     # which reply is graded.
@@ -551,9 +609,10 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # This repository, sandbox-reading: the paragraphs the onboarding report
     # opens with, and the verdicts it must not write.
     "bootstrap_report_posture": ("posture",),
-    # This repository, sandbox-reading. No field, like pull_request_opened:
-    # the diff against the image is the assertion. It reads the agent's own
-    # shell sandbox pod, not a seeded-fleet fixture, so it is not in
+    # This repository, sandbox- or agent-pod-reading. No field, like
+    # pull_request_opened: the diff against the image is the assertion, and
+    # `target` only picks which pod's copy is read. It reads the agent's own
+    # install, not a seeded-fleet fixture, so it is not in
     # CLUSTER_READING_TYPES below.
     "sandbox_tree_matches_image": (),
     # This repository, agent-disk-reading. No field: whether every first-run audit has a run
@@ -578,6 +637,9 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # post a fired audit run produced is the report its `finish` rendered is the
     # whole assertion.
     "audit_chat_report_posted": (),
+    # This repository, agent-pod- and cluster-reading: the namespace names the
+    # burst whose admitted alerts must each have started a triage turn.
+    "triage_starts": ("namespace",),
 }
 
 # Check types that read live cluster state. A case using one is asserting on
@@ -598,6 +660,50 @@ CLUSTER_READING_TYPES = frozenset(
 
 # Compound nodes assert nothing themselves; their children do.
 COMPOUND_TYPES = frozenset({"sequence", "parallel", "all", "any", "none"})
+
+#: The property checks whose `value` the upstream verifier compares raw, so
+#: a quoted boolean never equals the API's boolean.
+RESOURCE_PROPERTY_TYPES = frozenset({"resource_property", "fleet_resource_property"})
+# `ledger_issue_contains` under `scope: finding` reads the findings of the
+# check(s) `finding_check` names; the verifier's model refuses one without the
+# other, which in the lane is after the cluster lease.
+LEDGER_CHECK_TYPE = "ledger_issue_contains"
+LEDGER_FINDING_SCOPE = "finding"
+LEDGER_FINDING_CHECK_FIELD = "finding_check"
+EQUALITY_OPS = frozenset({"eq", "ne"})
+QUOTED_BOOLEANS = frozenset({"true", "false"})
+#: The (parent segment, field) pairs the Kubernetes and GKE APIs serve as
+#: booleans; "" is the object root. The rule fires on a pair in this table
+#: and on nothing else, so a string field that shares a name with a boolean
+#: (`spec.selector.enabled`, a CRD's `spec.enabled` string) is never blocked;
+#: a boolean pair missing here is a miss, and a case that needs it adds the
+#: row. A path the reader does not follow (PATH_UNREAD) is also a miss.
+#: A kind column is held in reserve: no shipped case needs one.
+BOOLEAN_FIELD_PAIRS = frozenset({
+    ("spec", "suspend"), ("spec", "paused"), ("spec", "hostNetwork"), ("spec", "hostPID"),
+    ("spec", "hostIPC"), ("spec", "shareProcessNamespace"), ("spec", "enableServiceLinks"),
+    ("spec", "automountServiceAccountToken"), ("", "automountServiceAccountToken"),
+    ("", "immutable"), ("", "allowVolumeExpansion"),
+    ("securityContext", "runAsNonRoot"), ("securityContext", "privileged"),
+    ("securityContext", "allowPrivilegeEscalation"), ("securityContext", "readOnlyRootFilesystem"),
+    ("configMap", "optional"), ("secret", "optional"), ("configMapRef", "optional"),
+    ("secretRef", "optional"), ("configMapKeyRef", "optional"), ("secretKeyRef", "optional"),
+    ("volumeMounts", "readOnly"), ("nodePoolAutoCreation", "enabled"),
+    ("management", "autoUpgrade"), ("management", "autoRepair"), ("autoscaling", "enabled"),
+})
+#: A JSONPath filter, `[?(@.name=='data')]`: removed before the path is read,
+#: so a literal inside it is never mistaken for a segment.
+PATH_FILTER = re.compile(r"\[\?\([^\]]*\)\]")
+#: Path forms the reader does not follow: recursive descent and a script
+#: expression. A path with one yields no segments, so it is never judged.
+PATH_UNREAD = re.compile(r"\.\.|\[\(")
+#: One path segment: a bracket-quoted key kept whole (`['feature.enabled']`),
+#: any other bracket group (an index, a slice, a union, a wildcard, all
+#: selectors the parser walks past), or a bare name. `$.spec['suspend']` and
+#: `spec.suspend` therefore end in the same pair.
+PATH_TOKEN = re.compile(r"""\['([^']*)'\]|\["([^"]*)"\]|\[([^\]'"]*)\]|([^.\[\]'"]+)""")
+#: Tokens that name no field: the root, the current node, a wildcard.
+PATH_NON_FIELDS = frozenset({"$", "@", "*"})
 
 # The entry vocabulary devops-bench's VerificationEntry accepts
 # (verification/spec.py). Every rule below is one devops-bench enforces at
@@ -683,6 +789,15 @@ def audit_streams_reader() -> Any:
     spec = importlib.util.spec_from_file_location(AUDIT_STREAMS_MODULE_NAME, AUDIT_STREAMS_FILE)
     if spec is None or spec.loader is None:
         raise CaseError(f"{AUDIT_STREAMS_FILE}: could not be loaded")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def scope_exclude_reader() -> Any:
+    spec = importlib.util.spec_from_file_location(SCOPE_EXCLUDE_MODULE_NAME, SCOPE_EXCLUDE_FILE)
+    if spec is None or spec.loader is None:
+        raise CaseError(f"{SCOPE_EXCLUDE_FILE}: could not be loaded")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -809,9 +924,10 @@ def _overlay_fixtures() -> list[dict[str, Any]]:
 def known_fixture_roles() -> set[str]:
     """Every role slug a task.yaml may name.
 
-    bench/tf/fleet/fixtures.json is the vocabulary; the overlay contributes
-    only the roles that have no cluster slot, which a catalogue keyed by slot
-    cannot hold (orphan-disks is project-scoped). Rejecting a slug is not the
+    bench/tf/fleet/fixtures.json is the vocabulary, its project-scoped roles
+    (`cluster_slot: null`) included; the overlay contributes the roles that
+    have no cluster slot and that the catalogue does not probe (orphan-disks).
+    Rejecting a slug is not the
     place to also complain that the two disagree -- that is a repository-level
     fault, not a fault of the case that happened to name the role, so it is
     reported once by fixture_catalog_disagreements() instead of once per case.
@@ -832,12 +948,15 @@ def fixture_catalog_disagreements() -> list[str]:
     """
     catalog = _catalog_roles()
     problems = []
+    overlay_project_roles = set()
     for entry in _overlay_fixtures():
         role, slot = entry.get("role"), entry.get("slot")
         if not isinstance(role, str):
             problems.append(f"fleet-fixtures.yaml: {role!r} is not a role slug")
         elif slot is None:
-            if role in catalog:
+            overlay_project_roles.add(role)
+            # A project-scoped catalogue role (`cluster_slot: null`) agrees.
+            if role in catalog and catalog[role].get("cluster_slot") is not None:
                 problems.append(
                     f"fleet-fixtures.yaml: {role!r} declares no slot, but "
                     "bench/tf/fleet/fixtures.json gives it slot "
@@ -855,15 +974,31 @@ def fixture_catalog_disagreements() -> list[str]:
                 "bench/tf/fleet/fixtures.json puts it on "
                 f"{catalog[role].get('cluster_slot')!r}"
             )
+    # The other direction for a project-scoped catalogue role: the overlay is
+    # where such a role's day-N gate and objects are written down.
+    for role, spec in sorted(catalog.items()):
+        if not isinstance(spec, dict):
+            problems.append(
+                f"bench/tf/fleet/fixtures.json: {role!r} is not a mapping, so it "
+                "has no cluster_slot, probes or state the runner can read"
+            )
+            continue
+        if spec.get("cluster_slot") is None and role not in overlay_project_roles:
+            problems.append(
+                f"bench/tf/fleet/fixtures.json: {role!r} is project-scoped "
+                "(cluster_slot null), but fleet-fixtures.yaml does not list it "
+                "with slot null"
+            )
     return problems
 
 
 def registered_cases() -> set[str] | None:
-    """Case names the eval runs: hack/eval/presubmit-cases.txt and nightly-cases.txt.
+    """Case names the eval runs: the presubmit, nightly and certification files.
 
-    An entry in either file is registered; the presubmit one runs on every
+    An entry in any of them is registered; the presubmit one runs on every
     pull request, the nightly one every night (EVAL_TIER=nightly in
-    hack/ci-eval-pr.sh). A commented-out path counts for nothing -- that
+    hack/ci-eval-pr.sh), the certification one on its own lane
+    (EVAL_TIER=certification). A commented-out path counts for nothing -- that
     parking state is retired; a case whose fixture does not exist waits in
     FIXTURE_NOT_READY instead, and commented_out_registrations() reports the
     comment as a finding.
@@ -880,6 +1015,14 @@ def registered_cases() -> set[str] | None:
         except (OSError, ValueError):
             return None
     return names
+
+
+def certification_cases() -> set[str] | None:
+    """Case names in hack/eval/certification-cases.txt; None when it cannot be read."""
+    try:
+        return set(eval_rosters.certification_cases())
+    except (OSError, ValueError):
+        return None
 
 
 def commented_out_registrations() -> dict[str, str]:
@@ -969,6 +1112,67 @@ def _check_assertions(node: Any, where: str, problems: list[str]) -> None:
             f"{list(fields)}, so it can only pass"
         )
 
+    # The same two rules the verifier's model applies after the cluster lease:
+    # the scope needs its check, a name or a list of names; the field is
+    # refused, blank or not, under any other scope.
+    if node_type == LEDGER_CHECK_TYPE:
+        scoped = node.get("scope") == LEDGER_FINDING_SCOPE
+        check_names = node.get(LEDGER_FINDING_CHECK_FIELD)
+        names = check_names if isinstance(check_names, list) else [check_names]
+        named = check_names is not None and all(isinstance(n, str) for n in names) and any(
+            n.strip() for n in names if isinstance(n, str)
+        )
+        if scoped and not named:
+            problems.append(
+                f"{where}: check '{node_type}' under scope '{LEDGER_FINDING_SCOPE}' "
+                f"names no '{LEDGER_FINDING_CHECK_FIELD}' (a check name, or a list of them), "
+                "the check whose findings it reads"
+            )
+        elif check_names is not None and not scoped:
+            problems.append(
+                f"{where}: check '{node_type}' sets '{LEDGER_FINDING_CHECK_FIELD}', "
+                f"which is read only under scope '{LEDGER_FINDING_SCOPE}'"
+            )
+
+    # A quoted boolean against a boolean field never compares equal: the
+    # verifier compares the value raw and the API holds a bool, so the check
+    # asserts nothing. Only a (parent, field) pair known to be a boolean is
+    # judged; a string field compared to "true" is a correct case and is
+    # left alone.
+    op = node.get("op")
+    value = node.get("value")
+    segments = _path_segments(node.get("path"))
+    pair = (segments[-2] if len(segments) > 1 else "", segments[-1]) if segments else None
+    if (
+        node_type in RESOURCE_PROPERTY_TYPES
+        and isinstance(op, str) and op in EQUALITY_OPS
+        and isinstance(value, str) and value.strip().lower() in QUOTED_BOOLEANS
+        and pair in BOOLEAN_FIELD_PAIRS
+    ):
+        problems.append(
+            f"{where}: check '{node_type}' compares the boolean field "
+            f"{node.get('path')!r} to the string {value!r}; the string never "
+            f"compares equal to the API's boolean, so the check asserts nothing. "
+            f"Write the bare boolean: value: {value.strip().lower()}. The judged "
+            f"fields are the BOOLEAN_FIELD_PAIRS table in scripts/validate_bench_cases.py."
+        )
+
+
+def _path_segments(path: Any) -> list[str]:
+    """The segments of a JSONPath as its parser walks them by name: filters
+    removed, every other bracket group dropped as a selector, bracket-quoted
+    keys whole, padding around a bare name ignored. A form the reader does
+    not follow yields no segments, so nothing is judged."""
+    text = PATH_FILTER.sub("", str(path or ""))
+    if PATH_UNREAD.search(text):
+        return []
+    segments = []
+    for quoted_single, quoted_double, selector, bare in PATH_TOKEN.findall(text):
+        segment = quoted_single or quoted_double or bare.strip()
+        if segment and segment not in PATH_NON_FIELDS and not selector:
+            segments.append(segment)
+    return segments
+
 
 def _check_types(node: Any, found: set[str]) -> None:
     """Every check type used anywhere in one check subtree."""
@@ -1001,6 +1205,29 @@ def _fixture_roles(node: Any, found: set[str], plural: set[str] | None = None) -
                     plural.add(role)
     for child in node.get("checks") or []:
         _fixture_roles(child, found, plural)
+
+
+def _singular_fixture_roles(node: Any, found: set[str]) -> None:
+    """Every singular `fixture_role:` in one check subtree."""
+    if not isinstance(node, dict):
+        return
+    role = node.get("fixture_role")
+    if isinstance(role, str):
+        found.add(role)
+    for child in node.get("checks") or []:
+        _singular_fixture_roles(child, found)
+
+
+def _catalog_slot_roles() -> set[str]:
+    """Catalogue roles on a cluster slot: the ones the runner records a slot
+    and writes a kubeconfig for."""
+    return {role for role, spec in _catalog_roles().items() if isinstance(spec, dict) and spec.get("cluster_slot") is not None}
+
+
+def _catalog_project_roles() -> set[str]:
+    """Catalogue roles with `cluster_slot: null`: Compute Engine objects the
+    runner probes in the project and publishes with no kubeconfig."""
+    return {role for role, spec in _catalog_roles().items() if isinstance(spec, dict) and spec.get("cluster_slot") is None}
 
 
 def _entry_vocabulary(entry: dict[str, Any], where: str, problems: list[str]) -> None:
@@ -1040,12 +1267,40 @@ def _entry_vocabulary(entry: dict[str, Any], where: str, problems: list[str]) ->
         problems.append(f"{where}: weight {weight!r} must be a number greater than 0")
 
 
-def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None) -> list[str]:
+def validate_case(
+    name: str, path: pathlib.Path, *, registered: set[str] | None, certification: set[str] | None = None
+) -> list[str]:
     """Every problem with one case file, as reader-facing sentences."""
     problems: list[str] = []
     spec = _load_yaml(path)
     if not isinstance(spec, dict):
         return [f"{path}: does not parse to a mapping"]
+
+    # The suite. A certification case says so in its file and sits in the
+    # certification roster; one without the other is a case on the wrong lane.
+    suite = spec.get(SUITE_KEY)
+    if suite is not None and suite != CERTIFICATION_SUITE:
+        problems.append(f"declares '{SUITE_KEY}: {suite}'; the only suite is '{CERTIFICATION_SUITE}'")
+    if certification is not None:
+        if name in certification and suite != CERTIFICATION_SUITE:
+            problems.append(
+                f"is in {_display(CERTIFICATION_CASES_FILE)} but declares no "
+                f"'{SUITE_KEY}: {CERTIFICATION_SUITE}'; add the line, or take the case off the roster"
+            )
+        # A parked case (FIXTURE_NOT_READY, KNOWN_UNREGISTERED) may carry its
+        # suite line before its roster line lands; the registration check
+        # below leaves a suite case to this finding, so the two never ask for
+        # a nightly line and a certification line at once.
+        if (
+            name not in certification
+            and suite == CERTIFICATION_SUITE
+            and name not in KNOWN_UNREGISTERED
+            and name not in FIXTURE_NOT_READY
+        ):
+            problems.append(
+                f"declares '{SUITE_KEY}: {CERTIFICATION_SUITE}' but is not in "
+                f"{_display(CERTIFICATION_CASES_FILE)}; a certification case runs on that lane only"
+            )
 
     # The id key. devops-bench accepts task_id as an alias for id
     # (tasks/schema.py, from_dict) and prefers id when both are present, so a
@@ -1154,6 +1409,28 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
                     f"{PLATFORM_JOBS_FILE.relative_to(REPO_ROOT)} does not define"
                 )
 
+    # The seeded slots a case excludes from the install's scope. The runner
+    # resolves each to its cluster through the fleet's .fleet-context; a slot
+    # the catalogue does not declare resolves to nothing, so every repetition
+    # would be recorded as infrastructure, and a case that excludes every slot
+    # has no seeded cluster left to ask about.
+    if "scope_exclude" in spec:
+        reader = scope_exclude_reader()
+        try:
+            slots = reader.declared_slots(path)
+        except reader.ScopeExcludeError as exc:
+            problems.append(f"'scope_exclude:' must be {{slots: [<slot>, ...], absent: <n>}}: {exc}")
+        else:
+            catalog = _catalog_slots()
+            unknown = sorted(set(slots) - catalog)
+            if unknown:
+                problems.append(
+                    f"'scope_exclude:' names slot(s) {', '.join(unknown)}, which "
+                    f"{ROLE_CATALOG.relative_to(REPO_ROOT)} does not declare"
+                )
+            elif set(slots) >= catalog:
+                problems.append("'scope_exclude:' excludes every seeded slot; leave at least one in scope")
+
     # The expected-fail marker. bench-gate inverts a marked case's verdict,
     # and its loader (bench/kube_agents_bench/cases.py, _coerce_bool) refuses
     # anything but a YAML boolean -- after the cluster lease. A quoted "false"
@@ -1170,6 +1447,12 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
             f"'tool_calls_optional:' {spec['tool_calls_optional']!r} is not a YAML "
             "boolean; write a bare true or false. bench-gate refuses a quoted "
             "value at spec-load time, after the lease"
+        )
+    if "writes_alone" in spec and not isinstance(spec["writes_alone"], bool):
+        problems.append(
+            f"'writes_alone:' {spec['writes_alone']!r} is not a YAML boolean; write a "
+            "bare true or false. The lane reads only a bare true, so a quoted value "
+            "would leave the case in the shared first phase"
         )
 
     # Fixture roles. Cases address the seeded fleet by role, never by cluster
@@ -1242,11 +1525,24 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
         # which is not in the catalogue yet by definition; it is off every
         # roster, so the plural is held to the catalogue only once it runs.
         if name not in FIXTURE_NOT_READY:
-            for role in sorted(slot_roles - set(_catalog_roles())):
+            for role in sorted(slot_roles - _catalog_slot_roles()):
                 problems.append(
                     f"'fixture_roles:' names {role!r}, which has no cluster slot "
                     "in the fleet catalogue; the runner records a slot for "
                     "catalogue roles only, so the check would error on every run"
+                )
+            # A project-scoped role has no kubeconfig, so a check that reads
+            # a role's objects through `fixture_role:` cannot open one.
+            singular: set[str] = set()
+            for entry in entries:
+                if isinstance(entry, dict):
+                    _singular_fixture_roles(entry.get("check"), singular)
+            for role in sorted(singular & _catalog_project_roles()):
+                problems.append(
+                    f"'fixture_role:' names {role!r}, a project-scoped role "
+                    "(cluster_slot null in the fleet catalogue); the runner "
+                    "writes no kubeconfig for it, so the check would error on "
+                    "every run"
                 )
 
         # The two ways a case names a fixture have to be the same name. A
@@ -1315,12 +1611,16 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
 
     # Registration. hack/ci-eval-pr.sh runs the cases in
     # hack/eval/presubmit-cases.txt and, on the nightly tier,
-    # hack/eval/nightly-cases.txt -- and only those.
+    # hack/eval/nightly-cases.txt, and on the certification tier those in
+    # hack/eval/certification-cases.txt -- and only those. A `suite:
+    # certification` case is reported by the suite check above instead,
+    # which names the right file.
     if (
         registered is not None
         and name not in registered
         and name not in KNOWN_UNREGISTERED
         and name not in FIXTURE_NOT_READY
+        and suite != CERTIFICATION_SUITE
     ):
         problems.append(
             "is registered nowhere and never runs. Add it to "
@@ -1379,12 +1679,15 @@ def validate_paths(paths: list[pathlib.Path]) -> dict[str, list[str]]:
     findings that matter.
     """
     registered = registered_cases()
+    certification = certification_cases()
     out: dict[str, list[str]] = {}
     for path in paths:
         resolved = path.resolve()
         in_tree = resolved.parent.parent == TASKS_DIR
         name = resolved.parent.name if resolved.name == "task.yaml" else resolved.stem
-        out[name] = validate_case(name, resolved, registered=registered if in_tree else None)
+        out[name] = validate_case(
+            name, resolved, registered=registered if in_tree else None, certification=certification if in_tree else None
+        )
     return out
 
 
@@ -1394,25 +1697,27 @@ def validate_all() -> dict[str, list[str]]:
     if registered is None:
         return {
             ROSTER_PARSE_KEY: [
-                "could not read hack/eval/presubmit-cases.txt and "
-                "hack/eval/nightly-cases.txt as case lists -- a file is missing "
-                "or holds a line that is not a ./tasks/<id>/task.yaml path"
+                "could not read hack/eval/presubmit-cases.txt, "
+                "hack/eval/nightly-cases.txt and hack/eval/certification-cases.txt "
+                "as case lists -- a file is missing or holds a line that is not a "
+                "./tasks/<id>/task.yaml path"
             ]
         }
     if not registered:
         return {
             ROSTER_PARSE_KEY: [
-                "hack/eval/presubmit-cases.txt and hack/eval/nightly-cases.txt "
-                "parsed to no cases -- either both are empty or this parse has "
-                "drifted"
+                "hack/eval/presubmit-cases.txt, hack/eval/nightly-cases.txt and "
+                "hack/eval/certification-cases.txt parsed to no cases -- either "
+                "all three are empty or this parse has drifted"
             ]
         }
     results: dict[str, list[str]] = {}
     cases = bench_cases()
+    certification = certification_cases()
     for name, path in cases.items():
         # One unreadable file must not hide every other case's findings.
         try:
-            results[name] = validate_case(name, path, registered=registered)
+            results[name] = validate_case(name, path, registered=registered, certification=certification)
         except CaseError as exc:
             results[name] = [str(exc)]
     for name, problems in greet_phrase_collisions(cases).items():

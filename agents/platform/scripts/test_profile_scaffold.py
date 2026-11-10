@@ -617,6 +617,10 @@ class NpmCacheTest(unittest.TestCase):
         (old / "index").write_bytes(b"x" * 10)
         return process_home / ".npm"
 
+    def reclaim_dirs(self, process_home):
+        """The directories the sweep moved an old cache to, or left behind."""
+        return sorted(path for path in process_home.glob(ps.NPM_RECLAIM_GLOB) if ps._is_reclaim_dir(path))
+
     def test_a_scaffolded_profile_uses_the_shared_cache(self):
         """Hermes looks for npx packages at ~/.npm/_npx, so that path leads to the shared cache too."""
         for hermes_home in (self.tmp / "opt" / "data", self.tmp / "srv" / "agent-home"):
@@ -669,7 +673,8 @@ class NpmCacheTest(unittest.TestCase):
         err = self.share(process_home, self.tmp, reclaim=True)
 
         self.assertEqual(old.resolve(), self.tmp / ".cache" / "npm")
-        self.assertIn(f"reclaimed the per-profile npm cache {process_home / ps.NPM_RECLAIM_NAME} (10 bytes)", err)
+        self.assertRegex(err, rf"reclaimed the per-profile npm cache {process_home}/\.npm\.reclaim\.[0-9a-f]{{32}} \(10 bytes\)")
+        self.assertEqual(self.reclaim_dirs(process_home), [])
 
     def test_a_failed_delete_still_leaves_the_link(self):
         # The old cache is moved aside before the link goes in, so a delete that
@@ -689,15 +694,16 @@ class NpmCacheTest(unittest.TestCase):
 
         self.assertTrue(old.is_symlink())
         self.assertEqual(old.resolve(), self.tmp / ".cache" / "npm")
-        self.assertTrue((process_home / ps.NPM_RECLAIM_NAME).is_dir())
-        self.assertIn(f"could not delete the old per-profile npm cache {process_home / ps.NPM_RECLAIM_NAME}", err)
+        [orphan] = self.reclaim_dirs(process_home)
+        self.assertTrue(orphan.is_dir())
+        self.assertIn(f"could not delete the old per-profile npm cache {orphan}", err)
         self.assertNotIn("could not point npm", err)
 
         # The next start-up sweep deletes the orphan.
         ps.shutil.rmtree = real_rmtree
         err = self.share(process_home, self.tmp, reclaim=True)
 
-        self.assertFalse((process_home / ps.NPM_RECLAIM_NAME).exists())
+        self.assertEqual(self.reclaim_dirs(process_home), [])
         self.assertIn("reclaimed the per-profile npm cache", err)
         self.assertTrue(old.is_symlink())
 
@@ -707,7 +713,7 @@ class NpmCacheTest(unittest.TestCase):
         process_home = self.tmp / "home"
         process_home.mkdir()
         old = self.old_cache(process_home)
-        orphan = process_home / ps.NPM_RECLAIM_NAME
+        orphan = process_home / ps.NPM_RECLAIM_PREFIX  # the fixed name an older image used
         (orphan / "_cacache").mkdir(parents=True)
         (orphan / "_cacache" / "index").write_text("x" * 7, encoding="utf-8")
 
@@ -721,12 +727,133 @@ class NpmCacheTest(unittest.TestCase):
         """Only the start-up sweep deletes, because a process can be using the directory."""
         process_home = self.tmp / "home"
         process_home.mkdir()
-        orphan = process_home / ps.NPM_RECLAIM_NAME
+        orphan = process_home / ps.NPM_RECLAIM_PREFIX  # the fixed name an older image used
         orphan.mkdir()
 
         self.share(process_home, self.tmp)
 
         self.assertTrue(orphan.is_dir())
+
+    def test_an_orphan_that_cannot_be_deleted_does_not_block_the_move(self):
+        # The issue's first case: a start-up stopped between the move and the
+        # link, a process made a new real cache, and now the orphan's delete
+        # fails. The move goes to a new name, so the link still goes in.
+        process_home = self.tmp / "home"
+        process_home.mkdir()
+        old = self.old_cache(process_home)
+        orphan = process_home / ps.NPM_RECLAIM_PREFIX
+        (orphan / "_cacache").mkdir(parents=True)
+        real_rmtree = ps.shutil.rmtree
+        self.addCleanup(setattr, ps.shutil, "rmtree", real_rmtree)
+
+        def fail_on_the_orphan(path, *args, **kwargs):
+            if Path(path) == orphan:
+                raise OSError(16, "Device or resource busy", str(path))
+            real_rmtree(path, *args, **kwargs)
+
+        ps.shutil.rmtree = fail_on_the_orphan
+        err = self.share(process_home, self.tmp, reclaim=True)
+
+        self.assertEqual(old.resolve(), self.tmp / ".cache" / "npm")
+        self.assertIn(f"could not delete the old per-profile npm cache {orphan}", err)
+        self.assertNotIn("could not point npm", err)
+        self.assertEqual(self.reclaim_dirs(process_home), [orphan])
+
+    def test_a_file_at_the_old_name_does_not_block_the_move(self):
+        # The issue's second case: a regular file at the fixed name made the move
+        # fail with ENOTDIR. It is not ours, so it stays, and no longer blocks.
+        process_home = self.tmp / "home"
+        process_home.mkdir()
+        old = self.old_cache(process_home)
+        stray = process_home / ps.NPM_RECLAIM_PREFIX
+        stray.write_text("not a directory\n", encoding="utf-8")
+
+        err = self.share(process_home, self.tmp, reclaim=True)
+
+        self.assertEqual(old.resolve(), self.tmp / ".cache" / "npm")
+        self.assertTrue(stray.is_file())
+        self.assertNotIn("WARN", err)
+
+    def test_the_sweep_deletes_a_leftover_with_a_unique_name(self):
+        process_home = self.scaffold(self.tmp)
+        leftover = process_home / f"{ps.NPM_RECLAIM_STEM}{'0123456789abcdef' * 2}"  # the sweep's own shape
+        (leftover / "_cacache").mkdir(parents=True)
+        (leftover / "_cacache" / "index").write_bytes(b"x" * 5)
+
+        err = self.share(process_home, self.tmp, reclaim=True)
+
+        self.assertFalse(leftover.exists())
+        self.assertIn(f"reclaimed the per-profile npm cache {leftover} (5 bytes)", err)
+
+    def test_a_failed_move_leaves_no_empty_directory(self):
+        process_home = self.tmp / "home"
+        process_home.mkdir()
+        old = self.old_cache(process_home)
+        real_rename = Path.rename
+        self.addCleanup(setattr, Path, "rename", real_rename)
+
+        def fail(path, target):
+            raise OSError(18, "Invalid cross-device link", str(path))
+
+        Path.rename = fail
+        err = self.share(process_home, self.tmp, reclaim=True)
+
+        self.assertIn("could not point npm", err)
+        self.assertEqual(self.reclaim_dirs(process_home), [])
+        self.assertTrue((old / "_cacache" / "index").is_file())
+
+    def test_the_sweep_names_what_it_leaves_without_the_link(self):
+        """A home the sweep cannot point at the shared cache gets one line naming the shape."""
+        elsewhere = self.tmp / "elsewhere"
+        elsewhere.mkdir()
+        (self.tmp / "a-file").write_text("x", encoding="utf-8")
+        shapes = {
+            "is not a directory": lambda npm: npm.write_text("x", encoding="utf-8"),
+            "is a dangling symlink": lambda npm: npm.symlink_to(self.tmp / "gone"),
+            "is a symlink to somewhere other than the shared cache": lambda npm: npm.symlink_to(elsewhere),
+            # Before Python 3.13 resolving a loop raised RuntimeError, which
+            # stopped the sweep for every home after this one.
+            "is a symlink loop": lambda npm: npm.symlink_to(npm.name),
+            # A target under a regular file stats as ENOTDIR, not ENOENT, and is
+            # named by its own error rather than called dangling.
+            "is a symlink whose target cannot be reached (Not a directory)":
+                lambda npm: npm.symlink_to(self.tmp / "a-file" / "npm"),
+        }
+        for shape, make in shapes.items():
+            with self.subTest(shape=shape):
+                process_home = self.tmp / "homes" / shape.replace(" ", "-")
+                process_home.mkdir(parents=True)
+                make(process_home / ".npm")
+
+                err = self.share(process_home, self.tmp, reclaim=True)
+                self.assertEqual(err.count("WARN"), 1, err)
+                self.assertIn(f"left npm in {process_home} as it is: ~/.npm {shape}", err)
+                # Profile create is quiet about the same home.
+                self.assertEqual(self.share(process_home, self.tmp), "")
+
+    def test_a_user_directory_under_the_prefix_is_not_swept(self):
+        """Only the bare prefix and the sweep's UUID names are its own; a name a person chose is not."""
+        process_home = self.scaffold(self.tmp)
+        rests = ("ed", ".bak", ".2026-11-03", ".backup-old",
+                 # Eight characters from [a-z0-9_], which a narrower guess at mkdtemp's shape still took.
+                 ".20261103", ".previous", ".old_copy", ".livetest")
+        mine = [process_home / f"{ps.NPM_RECLAIM_PREFIX}{rest}" for rest in rests]
+        for path in mine:
+            path.mkdir()
+
+        self.assertEqual(self.share(process_home, self.tmp, reclaim=True), "")
+        for path in mine:
+            self.assertTrue(path.is_dir(), path)
+
+    def test_the_sweep_is_quiet_after_the_agent_home_moves(self):
+        """The relative link resolves to the new shared cache, so nothing is reported."""
+        old_home, new_home = self.tmp / "opt" / "data", self.tmp / "srv" / "agent-home"
+        self.scaffold(old_home)
+        new_home.parent.mkdir(parents=True)
+        old_home.rename(new_home)
+        process_home = new_home / "profiles" / "cluster-a" / "home"
+
+        self.assertEqual(self.share(process_home, new_home, reclaim=True), "")
 
     def test_a_second_run_changes_nothing(self):
         process_home = self.scaffold(self.tmp)
@@ -829,6 +956,45 @@ class BackfillCronStoreTest(unittest.TestCase):
 
     def test_backfill_cron_file_handles_nonexistent_file(self):
         self.assertFalse(ps.backfill_cron_file(self.root / "absent.json"))
+
+    def test_backfill_cron_file_tells_a_store_it_cannot_read_from_nothing_to_do(self):
+        # None, not False: the entrypoint stamps a cluster profile as refreshed only
+        # when every step finished, so a store it could not parse must not read as one
+        # with nothing to back-fill.
+        cron_file = self.root / "jobs.json"
+        cron_file.write_text("{not json", encoding="utf-8")
+        err = io.StringIO()
+        with redirect_stderr(err):
+            self.assertIsNone(ps.backfill_cron_file(cron_file))
+        self.assertIn("WARN: could not read cron store", err.getvalue())
+        self.assertEqual(cron_file.read_text(encoding="utf-8"), "{not json")
+
+    def test_backfill_cron_file_tells_a_store_it_cannot_rewrite_from_nothing_to_do(self):
+        cron_file = self.root / "jobs.json"
+        cron_file.write_text(json.dumps({"jobs": [{"id": "job1"}]}))
+        err = io.StringIO()
+        with unittest.mock.patch.object(ps.os, "replace", side_effect=OSError("read-only file system")), \
+                redirect_stderr(err):
+            self.assertIsNone(ps.backfill_cron_file(cron_file))
+        self.assertIn("WARN: could not backfill cron store", err.getvalue())
+        self.assertEqual(json.loads(cron_file.read_text()), {"jobs": [{"id": "job1"}]})
+
+    def test_backfill_cron_cli_exits_non_zero_for_a_store_it_could_not_back_fill(self):
+        # The entrypoint reads this exit code and nothing else from the step.
+        cron_file = self.root / "jobs.json"
+        cron_file.write_text("{not json", encoding="utf-8")
+        with unittest.mock.patch.object(sys, "argv", ["profile_scaffold.py", "--backfill-cron", str(cron_file)]), \
+                redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
+            ps.main()
+        self.assertNotEqual(raised.exception.code, 0)
+        self.assertIn("could not read or rewrite", str(raised.exception.code))
+
+    def test_backfill_cron_cli_exits_zero_for_a_store_with_nothing_to_do(self):
+        cron_file = self.root / "jobs.json"
+        cron_file.write_text(json.dumps({"jobs": [{"id": "job1", "risk": "low"}]}))
+        with unittest.mock.patch.object(sys, "argv", ["profile_scaffold.py", "--backfill-cron", str(cron_file)]), \
+                redirect_stderr(io.StringIO()):
+            self.assertIsNone(ps.main())
 
     def test_backfill_cron_file_holds_cron_jobs_lock(self):
         cron_file = self.root / "jobs.json"

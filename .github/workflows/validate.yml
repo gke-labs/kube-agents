@@ -21,6 +21,13 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # Cap @actions/cache's wait on one cache segment so a restore the service
+  # refuses costs a step about a minute, not the default ten. The rule, the
+  # trade-off and the test that holds it: .agents/rules/github_actions.md,
+  # "Cap the Actions cache segment download wait".
+  SEGMENT_DOWNLOAD_TIMEOUT_MINS: "1"
+
 jobs:
   # A job of its own rather than a step in `validate` below, for two reasons.
   # It needs none of that job's setup -- no Helm, no Terraform, no pip, just the
@@ -73,19 +80,29 @@ jobs:
       # already on main's required-status-checks list and a new job name is
       # not: a check that is not required does not gate, however red it goes.
       #
-      # The release tarball rather than `apt install shellcheck`: the apt
-      # package on ubuntu-latest is 0.9.0, two releases behind what the tree
-      # is cleared against, and a rule added or tightened since then reports
-      # differently here than on a maintainer's laptop. Pinned by version and
-      # SHA-256 for the same reason every third-party action is pinned to a
-      # commit: a moving `latest` turns a new upstream rule into a red check on
-      # a pull request that changed no shell. Bumping the pin means running
-      # `make shellcheck` with the new release first and clearing what it adds.
+      # Pinned to one release for the same reason every third-party action is
+      # pinned to a commit: a moving `latest` turns a new upstream rule into a
+      # red check on a pull request that changed no shell, and a rule added or
+      # tightened between releases reports differently here than on a
+      # maintainer's laptop. The runner image's apt package is whatever release
+      # its Ubuntu ships (0.11.0 on 26.04, which `ubuntu-latest` resolves to;
+      # 0.9.0 on 24.04), so the step uses the binary on PATH only when it
+      # reports exactly the pinned version, and otherwise downloads the release
+      # tarball and checks its SHA-256. Skipping the download keeps a GitHub
+      # download outage off this required check: on 2026-11-05 the release URL
+      # returned 504 for longer than curl retries, in four runs within 70
+      # minutes. Bumping the pin means running `make shellcheck` with the new
+      # release first and clearing what it adds; until the image ships the new
+      # release, the step downloads it.
       - name: Install shellcheck
         env:
           SHELLCHECK_VERSION: v0.11.0
           SHELLCHECK_SHA256: 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
         run: |
+          if shellcheck --version 2>/dev/null | grep -Fx "version: ${SHELLCHECK_VERSION#v}"; then
+            echo "$(command -v shellcheck) is already ${SHELLCHECK_VERSION}; skipping the download."
+            exit 0
+          fi
           archive="shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
           curl -sSfL --retry 5 --retry-all-errors -o "$RUNNER_TEMP/$archive" \
             "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/${archive}"
@@ -124,10 +141,11 @@ jobs:
           )
           helm lint charts/kube-agents "${SET_FLAGS[@]}"
           helm template test-release charts/kube-agents "${SET_FLAGS[@]}" > /dev/null
-          # A default render must carry the agent-RBAC admission policies. The
-          # Python suite checks the template and the values gate; only a real
-          # render proves the two combine into installable objects.
-          for name in kube-agents-agent-readonly kube-agents-agent-binding-scope; do
+          # A default render must carry the admission policies (the agent-RBAC
+          # pair and the A2A gateway's pod policy). The Python suite checks the
+          # templates and the values gate; only a real render proves the two
+          # combine into installable objects.
+          for name in kube-agents-agent-readonly kube-agents-agent-binding-scope kube-agents-a2a-gateway-pod; do
             count=$(helm template test-release charts/kube-agents "${SET_FLAGS[@]}" \
               | grep -c "^  name: $name$" || true)
             if [ "$count" -ne 2 ]; then
@@ -144,6 +162,19 @@ jobs:
             echo "the admission policies rendered on 1.29, where the API is not v1" >&2
             exit 1
           fi
+          # The operator's A2A_GATEWAY_POD_POLICY follows the gateway pod policy:
+          # set in a default render, absent where the policy is not rendered.
+          if ! helm template test-release charts/kube-agents "${SET_FLAGS[@]}" | grep -q "name: A2A_GATEWAY_POD_POLICY"; then
+            echo "a default render does not set A2A_GATEWAY_POD_POLICY on the operator" >&2
+            exit 1
+          fi
+          for off in "--kube-version 1.29.0" "--set admissionPolicy.enabled=false"; do
+            # shellcheck disable=SC2086 # two words each, split on purpose
+            if helm template test-release charts/kube-agents "${SET_FLAGS[@]}" $off | grep -q "name: A2A_GATEWAY_POD_POLICY"; then
+              echo "A2A_GATEWAY_POD_POLICY is set with $off, where the policy is not rendered" >&2
+              exit 1
+            fi
+          done
           # Render again with explicit image tags to cover the override path.
           helm template test-release charts/kube-agents "${SET_FLAGS[@]}" \
             --set operator.image.tag=v9.9.9 \
@@ -499,13 +530,31 @@ jobs:
           path: ~/.terraform.d/plugin-cache
           key: terraform-plugins-${{ runner.os }}-${{ hashFiles('terraform/modules/*/versions.tf', 'terraform/examples/*/providers.tf') }}
 
+      # terraform init alone retries. No directory commits a
+      # .terraform.lock.hcl, and without one init downloads every provider
+      # from the registry even when the plugin cache holds it; one connection
+      # reset there failed this step (#5142). Each directory gets four
+      # attempts with a doubling delay from five seconds, the schedule of
+      # k8s-operator/Makefile's go-install-tool. fmt and validate make no
+      # network call and run once. tests/test_third_party_download_retry.py
+      # runs the loop against stubs.
       - name: Validate Terraform Modules
         run: |
+          attempts=4; first_delay=5
           terraform fmt -check -recursive terraform/
           for dir in terraform/modules/* terraform/examples/*; do
             if [ -d "$dir" ]; then
               echo "Validating $dir..."
-              (cd "$dir" && terraform init -backend=false && terraform validate)
+              attempt=1; delay=$first_delay
+              until (cd "$dir" && terraform init -backend=false); do
+                if [ "$attempt" -ge "$attempts" ]; then
+                  echo "::error::terraform init in $dir failed after $attempts attempts."
+                  exit 1
+                fi
+                echo "::warning::terraform init in $dir: attempt $attempt of $attempts failed; retrying in ${delay}s."
+                sleep "$delay"; attempt=$((attempt + 1)); delay=$((delay * 2))
+              done
+              (cd "$dir" && terraform validate)
             fi
           done
 

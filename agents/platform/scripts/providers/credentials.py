@@ -237,19 +237,12 @@ class MintedWriteCredential:
     (`GIT_CONFIG_VALUE_n`), never in argv, a file, a CLI's store or the
     sandbox.
 
-    `stored_token` is set for the content workspace's reason: no ambient
-    helper stands behind this token, so a managed clone presents it on its own
-    fetch and push, and the workspace asks again before each presentation
-    whether the repository still earns it.
-
     A refused mint (`PermissionError`) propagates: the repository is not one
     the install manages. Any other failure is raised as
     FORGE_CREDENTIAL_UNAVAILABLE rather than swallowed: there is no ambient
     token to fall back on, and a call without one would reach the forge as an
     anonymous read, which answers a private repository with 404.
     """
-
-    stored_token = True
 
     def __init__(
         self,
@@ -339,6 +332,10 @@ class MintedWriteCredential:
 # the value is composed from this literal and two arguments that are checked
 # against _HELPER_ARGUMENT_RE first; nothing a caller sent reaches it.
 TOKEN_FILE_HELPER = "/opt/defaults/scripts/git_credential_token_file.py"
+#: The username that makes the token-file helper answer with the token as a
+#: bearer (`authtype=Bearer`, git 2.46 and later), for a forge whose git
+#: endpoint refuses the token as a Basic password.
+BEARER_GIT_USERNAME = "authtype-bearer"
 _HELPER_ARGUMENT_RE = re.compile(r"[A-Za-z0-9._/-]+")
 _HOST_RE = re.compile(r"[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]+)?")
 
@@ -355,11 +352,6 @@ def is_token(token: str) -> bool:
 
 class StaticFileCredential:
     """A long-lived token an administrator put in a Secret, read from its file.
-
-    `stored_token` marks it for the content workspace: nothing ambient stands
-    behind a stored token, so a clone that holds one presents it on its own
-    push, and asks again before every presentation whether the repository
-    still earns it.
 
     Nothing to acquire and nothing to refresh, so `ensure` does nothing -- the
     strategy says the token does not need it rather than implementing a step
@@ -380,8 +372,6 @@ class StaticFileCredential:
     gone.
     """
 
-    stored_token = True
-
     def __init__(
         self,
         token_path: str,
@@ -391,6 +381,7 @@ class StaticFileCredential:
         header_format: str = "{token}",
         username: str = "oauth2",
         helper: str = TOKEN_FILE_HELPER,
+        scheme: str = "https",
     ) -> None:
         for name, value in (("token path", token_path), ("username", username)):
             if not _HELPER_ARGUMENT_RE.fullmatch(value or "") or ".." in value:
@@ -399,12 +390,15 @@ class StaticFileCredential:
             raise ValueError(f"the token path {token_path!r} is not absolute")
         if not _HOST_RE.fullmatch(host or ""):
             raise ValueError(f"the host {host!r} is not a hostname")
+        if scheme not in ("https", "http"):
+            raise ValueError(f"the scheme {scheme!r} must be https or http")
         self._token_path = token_path
         self._host = host
         self._header = header
         self._format = header_format
         self._username = username
         self._helper = helper
+        self._scheme = scheme
 
     def ensure(self, repo: str) -> None:
         return None
@@ -458,7 +452,7 @@ class StaticFileCredential:
         return (
             (CREDENTIAL_HELPER_KEY, ""),
             (
-                f"credential.https://{self._host}.helper",
+                f"credential.{self._scheme}://{self._host}.helper",
                 f"{self._helper} {self._token_path} {self._username}",
             ),
         )

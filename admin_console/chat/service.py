@@ -10,7 +10,7 @@ from typing import Sequence
 
 from admin_console.agent_chat import AgentChatError, ChatRunResult
 from admin_console.agent_runtime import AgentRuntimeError, TaskUpdateResult
-from admin_console.chat.backend import BackendFactory, ChatBackend
+from admin_console.chat.backend import BackendFactory
 from admin_console.chat.models import (
     Interaction,
     InteractionStatus,

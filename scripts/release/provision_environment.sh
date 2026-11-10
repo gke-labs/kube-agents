@@ -33,7 +33,8 @@ export CLOUDSDK_CORE_DISABLE_PROMPTS="${CLOUDSDK_CORE_DISABLE_PROMPTS:-1}"
 # gives up after the budget so a day-long outage does not hold the runner.
 # Both knobs are environment overrides so a test runs with no wait. Any
 # failure that is not this message returns as it is. The caller's
-# timeout-minutes in deploy-environment.yml is sized to this budget.
+# timeout-minutes in deploy-environment.yml is sized to this budget and to
+# teardown_common.sh's second run of a failed uninstall.sh.
 readonly PROVISION_STOCKOUT_PATTERN='does not have enough resources available to fulfill request|ZONE_RESOURCE_POOL_EXHAUSTED'
 PROVISION_STOCKOUT_ATTEMPTS="${PROVISION_STOCKOUT_ATTEMPTS:-3}"
 PROVISION_STOCKOUT_WAIT_SECONDS="${PROVISION_STOCKOUT_WAIT_SECONDS:-600}"
@@ -41,16 +42,9 @@ PROVISION_STOCKOUT_WAIT_SECONDS="${PROVISION_STOCKOUT_WAIT_SECONDS:-600}"
 # below exit 2, which an if reads as false, and the loop would retry until
 # the job timeout; a value past six digits does the same, because `[` calls it
 # not an integer; and a leading zero is octal to the arithmetic below, where
-# 09 is an error that abandons the loop and 0600 reads as 384.
-for _knob in PROVISION_STOCKOUT_ATTEMPTS PROVISION_STOCKOUT_WAIT_SECONDS; do
-  case "${!_knob}" in
-    "" | *[!0-9]* | 0?* | ???????*)
-      echo "::error title=${_knob} is not a plain decimal::${_knob}='${!_knob}' must be a whole number of at most six digits with no leading zero." >&2
-      exit 1
-      ;;
-  esac
-done
-unset _knob
+# 09 is an error that abandons the loop and 0600 reads as 384. The check is
+# teardown_common.sh's, shared with the teardown knobs.
+teardown_require_plain_decimal PROVISION_STOCKOUT_ATTEMPTS PROVISION_STOCKOUT_WAIT_SECONDS
 
 # Verify required GCP/GKE inputs before executing any destructive teardown.
 teardown_require_inputs
@@ -176,7 +170,7 @@ fi
 # here reverts to failing after the teardown.
 INSTALL_REFUSAL_STATUS=0
 
-for _bool_var in ENABLE_GKE_BACKUP_PLAN ENABLE_GVISOR HERMES_DASHBOARD_ENABLED ENABLE_DRIFT_DETECTOR; do
+for _bool_var in ENABLE_GKE_BACKUP_PLAN ENABLE_GVISOR HERMES_DASHBOARD_ENABLED WEB_CONSOLE_ENABLED ENABLE_DRIFT_DETECTOR VERTEX_MANAGE_SERVING_PROJECT; do
   [ -n "${!_bool_var:-}" ] || continue
   _canonical="$(canonical_bool "${!_bool_var}")"
   case "$_canonical" in
@@ -188,6 +182,20 @@ for _bool_var in ENABLE_GKE_BACKUP_PLAN ENABLE_GVISOR HERMES_DASHBOARD_ENABLED E
       ;;
   esac
 done
+
+# HELM_UPGRADE_INSTALL is no install.sh flag: it reaches the tfvars generator
+# through the environment, which refuses a spelling that is neither true nor
+# false. That refusal comes after the teardown, so it is checked here first.
+if [ -n "${HELM_UPGRADE_INSTALL:-}" ]; then
+  case "$(canonical_bool "$HELM_UPGRADE_INSTALL")" in
+    true | false) ;;
+    *)
+      echo "::error title=HELM_UPGRADE_INSTALL is not a boolean::'${HELM_UPGRADE_INSTALL}' is neither true nor false, and the installer's tfvars generator refuses it, after the teardown. Refusing before the teardown rather than after. Set HELM_UPGRADE_INSTALL on this GitHub environment to true or false."
+      echo "==> HELM_UPGRADE_INSTALL='${HELM_UPGRADE_INSTALL}' is not a boolean." >&2
+      INSTALL_REFUSAL_STATUS=1
+      ;;
+  esac
+fi
 
 # install.sh refuses --enable-slack without both tokens when there is no tty,
 # which is this job. Its own guard runs after the Secret-recovery loop, which
@@ -355,6 +363,9 @@ if [ "${SLACK_ENABLED:-false}" = "true" ]; then
   if [ -n "${SLACK_HOME_CHANNEL_NAME:-}" ]; then
     INSTALL_ARGS+=(--slack-home-channel-name="${SLACK_HOME_CHANNEL_NAME}")
   fi
+  if [ -n "${SLACK_HOME_CHANNEL_POLICY:-}" ]; then
+    INSTALL_ARGS+=(--slack-home-channel-policy="${SLACK_HOME_CHANNEL_POLICY}")
+  fi
 fi
 
 if [ -n "${ENABLE_GKE_BACKUP_PLAN:-}" ]; then
@@ -365,6 +376,10 @@ if [ -n "${HERMES_DASHBOARD_ENABLED:-}" ]; then
   INSTALL_ARGS+=(--enable-hermes-dashboard="$(canonical_bool "${HERMES_DASHBOARD_ENABLED}")")
 fi
 
+if [ -n "${WEB_CONSOLE_ENABLED:-}" ]; then
+  INSTALL_ARGS+=(--enable-web-console="$(canonical_bool "${WEB_CONSOLE_ENABLED}")")
+fi
+
 # Unset omits the flag and install.sh's own default answers, which for this one
 # is on. The flag is worth passing anyway: this is a fresh install, so it is the
 # one run that records the choice into the install.env it creates -- which is
@@ -372,6 +387,11 @@ fi
 # file as the durable answer.
 if [ -n "${ENABLE_DRIFT_DETECTOR:-}" ]; then
   INSTALL_ARGS+=(--enable-drift-detector="$(canonical_bool "${ENABLE_DRIFT_DETECTOR}")")
+fi
+
+# The same shape: unset omits the flag and install.sh's default (on) answers.
+if [ -n "${VERTEX_MANAGE_SERVING_PROJECT:-}" ]; then
+  INSTALL_ARGS+=(--vertex-manage-serving-project="$(canonical_bool "${VERTEX_MANAGE_SERVING_PROJECT}")")
 fi
 
 if [ -n "${MODEL_PROVIDER:-}" ]; then
@@ -416,6 +436,18 @@ fi
 #
 # The half-configured case is refused at the top of this script, above the
 # teardown, so it never reaches here.
+#
+# The minter's names: the state holds no minter after the teardown above, so
+# install.sh would derive per-install names with no key behind them. An
+# environment with the minter names the project-wide ones instead, by the rule
+# render_install_env.sh applies too. install.sh reads all three from the
+# environment and counts them as given.
+# shellcheck source=scripts/release/minter_environment_names.sh
+. "$(dirname "${BASH_SOURCE[0]}")/minter_environment_names.sh"
+minter_environment_names
+if [ -n "${MINTER_ENVIRONMENT_GSA_NAME:-}" ]; then
+  export GITHUB_MINTER_GSA_NAME="${GITHUB_MINTER_GSA_NAME:-$MINTER_ENVIRONMENT_GSA_NAME}"
+fi
 
 # Memory mode mapping: kube_agents_memory/hindsight -> hindsight, none/off -> off, else -> file
 if [ "${MEMORY_PROVIDER:-}" = "kube_agents_memory" ] || [ "${MEMORY_PROVIDER:-}" = "hindsight" ]; then

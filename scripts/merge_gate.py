@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """The merge queue's two gate checks, and the sweep that enqueues pull requests.
 
-Part of the Tide-to-merge-queue migration (#1363). Tide decides two things
-that `main`'s required GitHub checks do not: the smoke test passed, and the
+Part of the Tide-to-merge-queue migration (#1363). Tide decided two things
+that `main`'s required GitHub checks did not: the smoke test passed, and the
 pull request carries `lgtm` and `approved` with no `do-not-merge` label. A
 merge queue only reads required checks, so each of the two becomes one, under
 these names:
@@ -10,20 +10,21 @@ these names:
   - `Smoke gate`: the latest `pull-kube-agents-smoke-test` status on the pull
     request head is green (an `/override` included), or there is none and the
     pull request only changes paths the presubmit skips, which is when Tide
-    does not wait for it.
-  - `Merge labels`: Tide's query for this repository, read from the labels.
+    did not wait for it either.
+  - `Merge labels`: the label test of Tide's query for this repository, read
+    from the labels.
 
-A smoke green from before the blocking job changed what it grades does not
-pass. While the repository variable SMOKE_PIN_NOT_BEFORE holds a UTC time, the
-same cutoff `pin_smoke_status.py` applies to its re-pins, `Smoke gate` stays
-pending on a green whose build first reported before that time, until a run
-from after it replaces it. The time is the earliest success status on the
-commit naming the same build, as that script reads it: a re-pin is a fresh copy
-with its own creation time. A green with no build link counts from the earliest
-success with none. That is one more read per green while the variable is set,
-skipped when the head `Smoke gate` is already green.
+A smoke green from before the blocking job changed what it grades does not pass.
+While the repository variable SMOKE_PIN_NOT_BEFORE holds a UTC time,
+`Smoke gate` stays pending on a green whose build first reported before that
+time, until a run from after it replaces it. The time is the earliest success
+status on the commit naming the same build: each re-pin that the retired
+`pin_smoke_status.py` posted is a fresh copy with its own creation time. A green
+with no build link counts from the earliest success with none. That is one more
+read per green while the variable is set, skipped when the head `Smoke gate` is
+already green.
 An `/override` links its own comment, so it counts from when it was posted. A
-green that `pin_smoke_status.py` expired carries its note and stays pending
+green that the retired `pin_smoke_status.py` expired carries its note and stays pending
 even after the variable is cleared. A green from before the cutoff that the
 script did not expire, because Tide already saw it as stale, has no note. So
 leave the variable set: clearing it lets such a green pass again. An
@@ -36,12 +37,12 @@ the queue removed, stays out until its head moves: the one retry after a
 `failed_checks` removal fails the same way. So the pending text asks for a push,
 not a `/test`.
 
-Tide also holds a merge on any other posted context that is not green, required
-or not, because no `context_options` entry for this repository says otherwise.
+Tide also held a merge on any other posted context that was not green, required
+or not, because no `context_options` entry for this repository said otherwise.
 These two checks do not restate that rule. The CLA needs no gate:
 `cla/google` stays a required check, because the CLA app also posts it on a
-queue commit (it subscribes to `merge_group`). A check that is not required stops
-blocking a merge at cut-over unless the ruleset adds it.
+queue commit (it subscribes to `merge_group`). A check that is not required no
+longer blocks a merge unless the ruleset adds it.
 
 Each check reports in two places, because the queue asks twice. A pull request
 must already pass every required check to enter the queue, so `pull` and
@@ -88,7 +89,7 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
-from github_api import PER_PAGE, GitHubAPI, log  # noqa: E402
+from github_api import PER_PAGE, GitHubAPI, has_marker_comment, log  # noqa: E402
 
 #: The queue is `main`'s alone; a release line still merges through Tide.
 BASE = "main"
@@ -99,18 +100,17 @@ SMOKE_CONTEXT = "pull-kube-agents-smoke-test"
 SMOKE_GATE = "Smoke gate"
 LABELS_GATE = "Merge labels"
 GATES = (SMOKE_GATE, LABELS_GATE)
-#: The repository variable that holds the smoke cutoff (module docstring), read as
-#: `pin_smoke_status.py` reads it.
+#: The repository variable that holds the smoke cutoff (module docstring).
 NOT_BEFORE_ENV = "SMOKE_PIN_NOT_BEFORE"
 #: What `Smoke gate` says while it waits on a green from before the cutoff.
 SMOKE_PREDATES = f"smoke predates {NOT_BEFORE_ENV}; push a new commit to rerun {SMOKE_CONTEXT}"
-#: The note `pin_smoke_status.py` (EXPIRED_NOTE) adds to a pre-cutoff green that Tide still
-#: credited. It holds that green with or without the variable, as it does for Tide.
+#: The note the retired `pin_smoke_status.py` added to a pre-cutoff green that Tide still
+#: credited. It holds that green with or without the variable, as it did for Tide.
 SMOKE_EXPIRED_NOTE = f"(predates {NOT_BEFORE_ENV}: retest)"
-#: Tide's query for this repository (`prow/oss/config.yaml` in oss-test-infra) wants both.
+#: Tide's query for this repository (`prow/oss/config.yaml` in oss-test-infra) wanted both.
 REQUIRED_LABELS = ("approved", "lgtm")
-#: The four labels Tide's query for this repository excludes. Any other `do-not-merge/` label
-#: does not hold a Tide merge, so it does not hold here either.
+#: The four labels Tide's query for this repository excluded. Any other `do-not-merge/` label
+#: did not hold a Tide merge, so it does not hold here either.
 HOLD_LABELS = (
     "do-not-merge",
     "do-not-merge/hold",
@@ -122,10 +122,25 @@ HOLD_LABELS = (
 STICKY_LGTM_TEAM = "gke-labs/Googlers"
 #: `skip_if_only_changed` of `pull-kube-agents-smoke-test` in oss-test-infra
 #: `prow/prowjobs/gke-labs/kube-agents/kube-agents-presubmits.yaml`. Keep the two identical.
+#: It names only paths the eval never reads, so a new folder runs the eval until it is added
+#: here; past the folders, only `_test.go`, `check_*.py` and `print_instructions_*.sh` match new
+#: files. `test_smoke_skip_paths.py` fails if it covers anything the presubmit reads.
 SMOKE_SKIP_RE = re.compile(
-    r"^(docs/|\.github/|examples/|tests/|scripts/release/|scripts/eval_dashboard/)"
-    r"|^scripts/test_[^/]+\.py$|^[^/]+\.md$"
-    r"|^(LICENSE|OWNERS|OWNERS_ALIASES|\.gitignore|install\.sh|upgrade\.sh|uninstall\.sh)$"
+    r"^(docs/|\.github/|\.agents/|\.claude/|examples/|tests/|admin_console/|terraform/"
+    r"|agents/contributor/|bench/cuj/|bench/dashboard/|bench/tests/"
+    r"|hack/slack-live-check/|scripts/dev/|scripts/eval_dashboard/|scripts/feedback_form/"
+    r"|scripts/release/|scripts/testdata/)"
+    r"|^scripts/test_[^/]+\.py$|_test\.go$|^[^/]+\.md$|^(hack|scripts)/[^/]+\.md$"
+    r"|^hack/(ci-dashboard-refresh\.sh|conformance-mutations\.py|pool_pressure_cron\.sh"
+    r"|slack-live-check-run\.sh)$"
+    r"|^scripts/(case_owner|check_[a-z_]+|classify_risk|domain_allowlist|domain_coverage"
+    r"|eval_rosters|generate_docs|github_api|hold_unresolved_threads|merge_gate"
+    r"|notify_broken_main|notify_flaky_check|pool_pressure|request_reviewers|rerun_failed_checks"
+    r"|skill_overlay|sync-upstream-skills)\.py$"
+    r"|^scripts/installer/(README\.md|common\.sh|installer_common\.sh|min_versions\.sh"
+    r"|print_instructions_[a-z]+\.sh)$"
+    r"|^(LICENSE|OWNERS|OWNERS_ALIASES|\.gitignore|install\.sh|upgrade\.sh|uninstall\.sh"
+    r"|install\.defaults\.env|install\.env\.example|requirements-test\.txt)$"
 )
 #: GitHub lists at most this many files for a pull request; a list that long may be cut short.
 FILES_CEILING = 3000
@@ -232,6 +247,13 @@ PUSH_REMOVAL_WINDOW = timedelta(minutes=2)
 CHECK_SUITES_READ = 10
 #: Queue removals read per pull request: enough to count the `failed_checks` ones since the push.
 REMOVALS_READ = 10
+#: Open pull requests read per page of the sweep's query. Each node carries labels, the queue
+#: entry, the head's check suites and its whole status rollup, so GitHub answers one page as a
+#: heavy request; at 50 the query began timing out with HTTP 504 at the repository's open-PR count,
+#: failing the scheduled sweep so approved pull requests were not enqueued. A smaller page keeps
+#: each request inside GitHub's gateway timeout; the retry in github_api does not help a request
+#: that is too heavy to answer at all, only one that fails in transit.
+PULLS_PAGE_SIZE = 20
 #: How many times per head commit the sweep puts a pull request back after `failed_checks`
 #: removals. `LEFT_OUT_HEADLINES` and the sweep's log line say "one retry"; change them with it.
 FAILED_CHECKS_RETRIES = 1
@@ -240,7 +262,7 @@ FAILED_CHECKS_RETRIES = 1
 PULLS_QUERY = """
 query($owner: String!, $name: String!, $base: String!, $after: String) {
   repository(owner: $owner, name: $name) {
-    pullRequests(states: OPEN, baseRefName: $base, first: 50, after: $after) {
+    pullRequests(states: OPEN, baseRefName: $base, first: %(page)d, after: $after) {
       pageInfo { hasNextPage endCursor }
       nodes {
         id number isDraft headRefOid
@@ -314,7 +336,7 @@ def verdicts(pull, files, not_before=None, first_reported=None):
     """
     smoke = pull["statuses"].get(SMOKE_CONTEXT)
     # A posted smoke status decides, even on skipped paths: a hand-run `/test`
-    # that went red holds a Tide merge too. The paths decide only when Prow
+    # that went red held a Tide merge too. The paths decide only when Prow
     # posted nothing.
     if smoke is None and not smoke_required(files()):
         smoke_gate = SUCCESS, "smoke not required: only paths it skips changed"
@@ -354,7 +376,7 @@ def smoke_first_reported(api, sha):
 
     The earliest success status naming the same build (its target URL); for a
     status with no link, the earliest success with none, because each re-pin
-    copies it with a new creation time. None
+    copied it with a new creation time. None
     when the latest smoke status is not green or a creation time is unreadable
     or zoneless, which the cutoff counts as before it.
     """
@@ -400,10 +422,11 @@ def rest_pull(api, raw):
 def post_verdicts(api, pull, results, dry_run=False):
     """Post each gate status that differs from the one on the head. Returns log lines.
 
-    Green only. Tide holds a merge on any posted context that is not green,
-    required or not, and nothing re-posts a status when the hold sweep's own
-    label change starts no run, so a non-green posted while Tide still merges
-    could hold a pull request after its inputs turned green again. A green that
+    Green only. This was written while Tide still merged: Tide held a merge on
+    any posted context that was not green, required or not, and nothing
+    re-posts a status when the hold sweep's own label change starts no run, so
+    a non-green posted then could hold a pull request after its inputs turned
+    green again. A green that
     went stale is safe: the queue judges both again on its own commit.
     """
     lines = []
@@ -601,8 +624,7 @@ def comment_left_out(api, pull, line, dry_run=False):
     path = f"/repos/{api.repo}/issues/{pull['number']}/comments"
     try:
         # The marker comment is newer than the removal, so only comments since then can hold it.
-        since = f"{path}?since={removed}" if removed else path
-        if any((comment.get("body") or "").startswith(marker) for comment in api.get_all(since)):
+        if has_marker_comment(api, pull["number"], marker, since=removed):
             return f"#{pull['number']}: left-out comment already posted"
         if not dry_run:
             body = left_out_comment(pull, marker, line)
@@ -618,12 +640,12 @@ def parse_time(stamp):
 
 
 def graphql_pulls(api, base=BASE, actor=SWEEP_ACTOR):
-    """Every open pull request on `base`, with what the sweep reads, in one query per 50."""
+    """Every open pull request on `base`, with what the sweep reads, a page (`PULLS_PAGE_SIZE`) per query."""
     owner, name = api.repo.split("/", 1)
     pulls = []
     after = None
     while True:
-        page = api.graphql(PULLS_QUERY % {"removals": REMOVALS_READ, "suites": CHECK_SUITES_READ}, {"owner": owner, "name": name, "base": base, "after": after})
+        page = api.graphql(PULLS_QUERY % {"removals": REMOVALS_READ, "suites": CHECK_SUITES_READ, "page": PULLS_PAGE_SIZE}, {"owner": owner, "name": name, "base": base, "after": after})
         page = page["repository"]["pullRequests"]
         for node in page["nodes"]:
             commits = node["commits"]["nodes"]

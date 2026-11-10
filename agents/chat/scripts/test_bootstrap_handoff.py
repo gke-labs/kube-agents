@@ -11,6 +11,8 @@ checked with the ranking stage's own parser, inventory_findings.parse_block,
 rather than with a copy of its rules.
 """
 
+import contextlib
+import copy
 import json
 import os
 import shlex
@@ -263,10 +265,10 @@ class ComposeTest(unittest.TestCase):
         text = h.compose(self._state([("t_str", "done", meta, "")]), timed_out=False, now=NOW)
         self.assertIn("seeded-a (t_str): could not list Jobs", text)
 
-    def test_a_cluster_the_sweep_audited_is_named_as_having_no_agent(self):
+    def test_a_cluster_the_sweep_audited_is_named_as_having_no_agent_card(self):
         own = dict(_metadata()["t_ccbfda55"], cluster="no-agent-cluster")
         text = h.compose(self._state([], {"clusters": [own], "fleet": []}), timed_out=False, now=NOW)
-        self.assertIn("no-agent-cluster (example-project): no Cluster Agent, so the sweep audited it itself", text)
+        self.assertIn("no-agent-cluster (example-project, us-central1-a): no Cluster Agent card, so the sweep audited it itself", text)
 
     def test_a_sweep_that_never_finished_says_so(self):
         text = h.compose(self._state(_all_done(), sweep_status="running"), timed_out=True, now=NOW)
@@ -326,6 +328,279 @@ class ComposeTest(unittest.TestCase):
         self.assertEqual(inventory_findings.parse_block(text), [])
 
 
+class _ReadFailed(RuntimeError):
+    """sandbox_exec.SandboxReadFailed, as the stub raises it."""
+
+
+class _Unavailable(RuntimeError):
+    """sandbox_exec.SandboxUnavailable, as the stub raises it."""
+
+
+class CollectedAuditsTest(unittest.TestCase):
+    """The sweep's relayed audits give way to the collector's files (#4115)."""
+
+    IDENT = {"project": "p", "location": "us-central1-a", "cluster": "seeded-c"}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.d = Path(self.tmp.name)
+        self.sweep_dir = self.d / Path(h.SWEEP_DIR).name
+        self.sweep_dir.mkdir()
+        self.sandbox = types.SimpleNamespace(
+            sandbox_enabled=lambda: False, TERMINAL_PRINCIPAL="agent", run=None,
+            read_bytes=lambda *_a, **_k: None, SandboxReadFailed=_ReadFailed, SandboxUnavailable=_Unavailable,
+        )
+        p = mock.patch.object(h, "_sandbox", lambda: self.sandbox)
+        p.start()
+        self.addCleanup(p.stop)
+        self.addCleanup(self.tmp.cleanup)
+
+    def _file(self, ident=None, **over):
+        ident = ident or self.IDENT
+        obj = {
+            **ident,
+            "topology": {"k8s_version": "1.35"},
+            "workloads": [{"namespace": "shop", "name": "web", "kind": "Deployment", "replicas": "1/1",
+                           "probes": {"startup": False}, "telemetry": "none",
+                           "security_context": {"read_only_root_fs": False, "added_capabilities": []}}],
+            "namespace_governance": [],
+            "findings": [{"check": "probes-startup", "severity": "medium", "area": "reliability",
+                          "namespace": "shop", "workload": "web", "issue": "web has no startupProbe",
+                          "recommendation": "add one"}],
+            "gaps": [],
+            h.SWEEP_FILE_STAMP_AT: NOW - 10,
+            h.SWEEP_FILE_STAMP_SWEEP: SWEEP,
+        }
+        obj.update(over)
+        return obj
+
+    def _write(self, obj, ident=None):
+        ident = ident or self.IDENT
+        path = self.sweep_dir / Path(h.sweep_file_path(**ident)).name
+        path.write_text(json.dumps(obj) if not isinstance(obj, (bytes, str)) else obj if isinstance(obj, str) else "")
+        if isinstance(obj, bytes):
+            path.write_bytes(obj)
+        return path
+
+    def _state(self, clusters):
+        return {"sweep": {"id": SWEEP, "status": "done", "block_reason": "", "metadata": {"clusters": clusters, "fleet": []}},
+                "clusters": [], "archived_clusters": 0}
+
+    def _merge(self, state, past_cap=()):
+        return h.merge_collected_audits(state, self.d, SWEEP, NOW - 60, list(past_cap))
+
+    def test_the_file_replaces_the_card_entry_the_worker_relayed(self):
+        # Green 1's shape: the worker's copy lost every list to a boolean.
+        self._write(self._file())
+        relayed = {**self.IDENT, "topology": False, "workloads": False, "findings": [False], "gaps": []}
+        state = self._state([relayed])
+        self.assertTrue(self._merge(state))
+        [entry] = state["sweep"]["metadata"]["clusters"]
+        self.assertEqual(len(entry["workloads"]), 1)
+        self.assertEqual(entry["findings"][0]["check"], "probes-startup")
+        self.assertEqual(h._malformed(entry), [])
+        self.assertIn("| seeded-c | p | us-central1-a | t_sweep | 1 | yes |", h.compose(state, timed_out=False, now=NOW))
+
+    def test_a_named_cluster_without_a_file_keeps_its_entry_with_a_gap(self):
+        state = self._state([{**self.IDENT, "workloads": [], "findings": [], "gaps": []}])
+        self.assertTrue(self._merge(state))
+        [entry] = state["sweep"]["metadata"]["clusters"]
+        self.assertEqual(len(entry["gaps"]), 1)
+        self.assertIn("is missing", entry["gaps"][0])
+        self.assertIn(h.sweep_file_path(**self.IDENT), entry["gaps"][0])
+        self.assertIn("no — see Gaps", h.compose(state, timed_out=False, now=NOW))
+
+    def test_a_by_hand_audit_without_a_file_keeps_its_entry_without_a_gap(self):
+        # The card's fallback where the collector cannot run: the SOP's full
+        # object in the entry. No file is not a gap for it.
+        by_hand = {k: v for k, v in self._file().items() if k not in (h.SWEEP_FILE_STAMP_AT, h.SWEEP_FILE_STAMP_SWEEP)}
+        state = self._state([by_hand])
+        self.assertTrue(self._merge(state))
+        [entry] = state["sweep"]["metadata"]["clusters"]
+        self.assertEqual(entry, by_hand)
+        self.assertIn("| seeded-c | p | us-central1-a | t_sweep | 1 | yes |", h.compose(state, timed_out=False, now=NOW))
+
+    def test_a_relayed_boolean_object_is_not_a_by_hand_audit(self):
+        state = self._state([{**self.IDENT, "topology": False, "workloads": False, "findings": False, "gaps": []}])
+        self.assertTrue(self._merge(state))
+        [entry] = state["sweep"]["metadata"]["clusters"]
+        self.assertIn("is missing", entry["gaps"][0])
+
+    def test_the_fleet_check_and_the_sweep_line_carry_the_location(self):
+        # Two clusters of one name in two locations: the audited one is listed
+        # as the sweep's, the other is unreported; a pair key would hide it.
+        twin = {**self.IDENT, "location": "europe-west1-b"}
+        audit = {k: v for k, v in self._file().items() if k not in (h.SWEEP_FILE_STAMP_AT, h.SWEEP_FILE_STAMP_SWEEP)}
+        state = self._state([audit])
+        state["sweep"]["metadata"]["fleet"] = [dict(self.IDENT, status="RUNNING"), dict(twin, status="RUNNING")]
+        text = h.compose(state, timed_out=False, now=NOW)
+        self.assertIn("seeded-c (p, us-central1-a): no Cluster Agent card, so the sweep audited it itself", text)
+        self.assertIn("seeded-c (p, europe-west1-b): listed in the fleet but no audit reported on it", text)
+        self.assertNotIn("seeded-c (p, us-central1-a): listed in the fleet", text)
+        [line] = h.finding_lines(audit)
+        self.assertEqual((line["project"], line["location"], line["cluster"]), ("p", "us-central1-a", "seeded-c"))
+        self.assertEqual(h.cluster_identity(audit), ("p", "us-central1-a", "seeded-c"))
+
+    def test_a_past_cap_cluster_the_worker_did_not_name_takes_its_file(self):
+        self._write(self._file())
+        state = self._state([])
+        agent = {"name": "cluster-p-seeded-c", "key": "k", "identity": dict(self.IDENT)}
+        self.assertTrue(self._merge(state, past_cap=[agent]))
+        [entry] = state["sweep"]["metadata"]["clusters"]
+        self.assertEqual(entry["cluster"], "seeded-c")
+
+    def test_a_past_cap_cluster_with_neither_name_nor_file_is_left_alone(self):
+        state = self._state([])
+        agent = {"name": "cluster-p-seeded-c", "key": "k", "identity": dict(self.IDENT)}
+        self.assertTrue(self._merge(state, past_cap=[agent]))
+        self.assertEqual(state["sweep"]["metadata"]["clusters"], [])
+
+    def test_a_wrong_file_is_a_gap_not_an_audit(self):
+        cases = {
+            "not JSON": b"{not json",
+            "not a JSON object": json.dumps([1, 2]).encode(),
+            "names cluster 'other'": json.dumps(self._file(cluster="other")).encode(),
+            "from sweep t_old": json.dumps(self._file(**{h.SWEEP_FILE_STAMP_SWEEP: "t_old"})).encode(),
+            "before this sweep was filed": json.dumps(self._file(**{h.SWEEP_FILE_STAMP_AT: NOW - 600})).encode(),
+            "carries no collected_at": json.dumps({k: v for k, v in self._file().items() if k != h.SWEEP_FILE_STAMP_AT}).encode(),
+            f"over {h.SWEEP_FILE_MAX_BYTES} bytes": b"{" + b" " * h.SWEEP_FILE_MAX_BYTES + b"}",
+        }
+        for why, raw in cases.items():
+            with self.subTest(why=why):
+                self._write(raw)
+                state = self._state([{**self.IDENT, "workloads": [], "findings": [], "gaps": []}])
+                self.assertTrue(self._merge(state))
+                [entry] = state["sweep"]["metadata"]["clusters"]
+                self.assertEqual(entry["workloads"], [])
+                self.assertIn(why, entry["gaps"][0])
+
+    def test_an_unreachable_sandbox_asks_for_a_retry(self):
+        self.sandbox.sandbox_enabled = lambda: True
+
+        def unreachable(*_a, **_k):
+            raise self.sandbox.SandboxUnavailable("ssh: no route")
+
+        self.sandbox.read_bytes = unreachable
+        state = self._state([{**self.IDENT, "workloads": [], "findings": [], "gaps": []}])
+        self.assertFalse(self._merge(state))
+
+    def test_a_read_that_ran_and_failed_is_a_gap(self):
+        self.sandbox.sandbox_enabled = lambda: True
+
+        def failed(*_a, **_k):
+            raise self.sandbox.SandboxReadFailed("not a regular file")
+
+        self.sandbox.read_bytes = failed
+        state = self._state([{**self.IDENT, "workloads": [], "findings": [], "gaps": []}])
+        self.assertTrue(self._merge(state))
+        [entry] = state["sweep"]["metadata"]["clusters"]
+        self.assertIn("could not be read", entry["gaps"][0])
+
+    def test_the_sandbox_read_is_byte_capped_and_as_the_terminal_login(self):
+        self.sandbox.sandbox_enabled = lambda: True
+        reads = []
+        self.sandbox.read_bytes = lambda path, **kw: reads.append((path, kw)) or json.dumps(self._file()).encode()
+        state = self._state([{**self.IDENT, "workloads": [], "findings": [], "gaps": []}])
+        self.assertTrue(self._merge(state))
+        [(path, kw)] = reads
+        self.assertEqual(path, h.sweep_file_path(**self.IDENT))
+        self.assertEqual(kw["max_bytes"], h.SWEEP_FILE_MAX_BYTES + 1)
+        self.assertEqual(kw["principal"], "agent")
+        self.assertEqual(len(state["sweep"]["metadata"]["clusters"][0]["workloads"]), 1)
+
+    def test_cluster_agent_cards_are_never_touched(self):
+        self._write(self._file())
+        state = self._state([])
+        card = {"id": "t_card", "status": "done", "key": "k", "title": "x",
+                "metadata": {**self.IDENT, "workloads": [], "findings": []}, "block_reason": ""}
+        state["clusters"] = [copy.deepcopy(card)]
+        agent = {"name": "cluster-p-seeded-c", "key": "k", "identity": dict(self.IDENT)}
+        self.assertTrue(self._merge(state, past_cap=[agent]))
+        self.assertEqual(state["clusters"], [card])
+        # The roster read puts the file under the sweep, not under the card.
+        self.assertEqual(state["sweep"]["metadata"]["clusters"][0]["cluster"], "seeded-c")
+
+    def test_two_clusters_of_one_name_in_two_locations_are_two_audits(self):
+        # GKE names are unique per project and location; the files and the
+        # merge are keyed on all three, so both are read.
+        west = {"project": "p", "location": "europe-west1", "cluster": "seeded-c"}
+        self._write(self._file())
+        self._write(self._file(west), west)
+        state = self._state([{**self.IDENT, "gaps": []}, {**west, "gaps": []}])
+        self.assertTrue(self._merge(state))
+        entries = state["sweep"]["metadata"]["clusters"]
+        self.assertEqual([e["location"] for e in entries], ["us-central1-a", "europe-west1"])
+        self.assertTrue(all(len(e["workloads"]) == 1 and not e["gaps"] for e in entries))
+
+    def test_an_entry_without_a_location_and_two_roster_matches_keeps_its_copy(self):
+        agents = [
+            {"name": "a", "key": "ka", "identity": dict(self.IDENT)},
+            {"name": "b", "key": "kb", "identity": {"project": "p", "location": "europe-west1", "cluster": "seeded-c"}},
+        ]
+        state = self._state([{"project": "p", "cluster": "seeded-c", "workloads": [], "findings": [], "gaps": []}])
+        self.assertTrue(self._merge(state, past_cap=agents))
+        copies = [e for e in state["sweep"]["metadata"]["clusters"] if e.get("gaps")]
+        self.assertEqual(len(copies), 1)
+        self.assertIn("roster has 2 clusters of that name", copies[0]["gaps"][0])
+
+    def test_a_file_with_no_sweep_stamp_is_refused(self):
+        self._write(self._file(**{h.SWEEP_FILE_STAMP_SWEEP: ""}))
+        state = self._state([{**self.IDENT, "workloads": [], "findings": [], "gaps": []}])
+        self.assertTrue(self._merge(state))
+        [entry] = state["sweep"]["metadata"]["clusters"]
+        self.assertIn("carries no sweep_id", entry["gaps"][0])
+
+    def test_a_roster_only_cluster_with_a_wrong_file_leaves_a_gap_under_the_sweep(self):
+        self._write(self._file(**{h.SWEEP_FILE_STAMP_AT: NOW - 600}))
+        state = self._state([])
+        agent = {"name": "cluster-p-seeded-c", "key": "k", "identity": dict(self.IDENT)}
+        self.assertTrue(self._merge(state, past_cap=[agent]))
+        self.assertEqual(state["sweep"]["metadata"]["clusters"], [])
+        [gap] = state["sweep"]["metadata"]["gaps"]
+        self.assertIn("before this sweep was filed", gap)
+        self.assertIn("the card did not name this cluster", gap)
+
+    def test_an_entry_without_a_location_takes_the_rosters_and_one_row_results(self):
+        # B1: the card named the cluster without its location; keyed by project and
+        # cluster, the entry and the roster's identity are one cluster, one file, one row.
+        self._write(self._file())
+        state = self._state([{"project": "p", "cluster": "seeded-c", "gaps": ["worker note"]}])
+        agent = {"name": "cluster-p-seeded-c", "key": "k", "identity": dict(self.IDENT)}
+        self.assertTrue(self._merge(state, past_cap=[agent]))
+        [entry] = state["sweep"]["metadata"]["clusters"]
+        self.assertEqual(entry["location"], "us-central1-a")
+        self.assertEqual(len(entry["workloads"]), 1)
+        self.assertEqual(entry["gaps"], ["worker note"])  # the worker's gaps ride along
+        self.assertEqual(h.compose(state, timed_out=False, now=NOW).count("| seeded-c | p |"), 1)
+
+    def test_an_entry_without_a_location_anywhere_keeps_its_copy_with_a_gap(self):
+        state = self._state([{"project": "p", "cluster": "seeded-c", "workloads": [], "findings": [], "gaps": []}])
+        self.assertTrue(self._merge(state))
+        [entry] = state["sweep"]["metadata"]["clusters"]
+        self.assertIn("names no location", entry["gaps"][0])
+
+    def test_a_cluster_named_twice_keeps_the_first_entry_with_a_gap(self):
+        self._write(self._file())
+        first = {**self.IDENT, "workloads": [], "findings": [], "gaps": []}
+        state = self._state([first, {**self.IDENT, "gaps": ["second"]}])
+        self.assertTrue(self._merge(state))
+        [entry] = state["sweep"]["metadata"]["clusters"]
+        self.assertIn("names this cluster twice", entry["gaps"][0])
+        self.assertEqual(entry["workloads"], [])
+
+    def test_an_identity_that_is_not_a_bare_name_is_not_read(self):
+        reads = []
+        self.sandbox.sandbox_enabled = lambda: True
+        self.sandbox.read_bytes = lambda path, **kw: reads.append(path) or None
+        for bad in ({"cluster": "../etc"}, {"project": "p/q"}, {"location": ""}):
+            with self.subTest(bad=bad):
+                state = self._state([{**self.IDENT, **bad, "workloads": [], "findings": [], "gaps": []}])
+                self.assertTrue(self._merge(state))
+                [entry] = state["sweep"]["metadata"]["clusters"]
+                self.assertTrue(any("bare name" in g or "no location" in g for g in entry["gaps"]), entry["gaps"])
+        self.assertEqual(reads, [])
+
+
 class HandOffTest(unittest.TestCase):
     _real_file_prioritize = staticmethod(h.file_prioritize)
 
@@ -355,8 +630,66 @@ class HandOffTest(unittest.TestCase):
         self.filed.append(1)
         return f"t_rank{len(self.filed)}"
 
-    def _run(self, now=NOW):
-        return h.hand_off(self.d, self.scan_marker, None, now=now)
+    def _run(self, now=NOW, full_roster=None):
+        return h.hand_off(self.d, self.scan_marker, None, now=now, full_roster=full_roster)
+
+    def test_the_hand_off_reads_the_collectors_file_for_a_past_cap_cluster(self):
+        # The worker named the cluster and nothing more (SOP step 4); the audit came by file.
+        sweep_dir = self.d / Path(h.SWEEP_DIR).name
+        sweep_dir.mkdir()
+        ident = {"project": "p", "location": "us-central1-a", "cluster": "seeded-c"}
+        obj = {**ident, "topology": {}, "workloads": [{"namespace": "shop", "name": "web", "kind": "Deployment",
+               "replicas": "1/1", "probes": {"startup": True}, "telemetry": "none",
+               "security_context": {"read_only_root_fs": True, "added_capabilities": []}}],
+               "namespace_governance": [], "findings": [], "gaps": [],
+               h.SWEEP_FILE_STAMP_AT: NOW - 10, h.SWEEP_FILE_STAMP_SWEEP: SWEEP}
+        (sweep_dir / Path(h.sweep_file_path(**ident)).name).write_text(json.dumps(obj))
+        _board(self.board, "done", {"clusters": [{**ident, "gaps": []}], "fleet": []}, [])
+        self.assertEqual(self._run(), "t_rank1")
+        raw = (self.d / "INVENTORY.raw.md").read_text()
+        self.assertIn("| seeded-c | p | us-central1-a | t_sweep | 1 | yes |", raw)
+        self.assertIn("| seeded-c | shop | web | Deployment | 1/1 | yes | none | yes |", raw)
+
+    def test_a_carded_clusters_file_is_not_read_as_the_sweeps(self):
+        # The roster entry whose key the marker lists as carded has its own
+        # card; a file for it (a collector run by hand) must not become a sweep
+        # row beside that card's.
+        sweep_dir = self.d / Path(h.SWEEP_DIR).name
+        sweep_dir.mkdir()
+        ident = {"project": "p", "location": "us-central1-a", "cluster": "seeded-a"}
+        obj = {**ident, "topology": {}, "workloads": [], "namespace_governance": [], "findings": [], "gaps": [],
+               h.SWEEP_FILE_STAMP_AT: NOW - 10, h.SWEEP_FILE_STAMP_SWEEP: SWEEP}
+        (sweep_dir / Path(h.sweep_file_path(**ident)).name).write_text(json.dumps(obj))
+        key = "bootstrap-inventory-cluster-cluster-p-seeded-a-us-central1-a"
+        self.scan_marker.write_text(f"task_id={SWEEP}\nfiled_at={NOW - 60}\ncarded={key}\n")
+        _board(self.board, "done", {"clusters": [], "fleet": []}, [])
+        roster = [{"name": "cluster-p-seeded-a-us-central1-a", "key": key, "title": "t", "cluster_label": "c", "identity": ident}]
+        # With every roster cluster carded and no card done, nothing was audited:
+        # the hand-off writes the no-coverage report and files no ranking card.
+        self.assertIsNone(self._run(full_roster=lambda: roster))
+        raw = (self.d / "INVENTORY.raw.md").read_text()
+        self.assertNotIn("| seeded-a | p | us-central1-a | t_sweep |", raw)
+        self.assertIn("no cluster was audited", (self.d / "INVENTORY.md").read_text())
+
+    def test_the_hand_off_reads_a_past_cap_file_the_card_did_not_name(self):
+        # The roster leg: hand_off builds past_cap from full_roster minus the
+        # carded keys and the file is read though the worker named nothing.
+        sweep_dir = self.d / Path(h.SWEEP_DIR).name
+        sweep_dir.mkdir()
+        ident = {"project": "p", "location": "us-central1-a", "cluster": "seeded-c"}
+        obj = {**ident, "topology": {}, "workloads": [{"namespace": "shop", "name": "web", "kind": "Deployment",
+               "replicas": "1/1", "probes": {"startup": True}, "telemetry": "none",
+               "security_context": {"read_only_root_fs": True, "added_capabilities": []}}],
+               "namespace_governance": [], "findings": [], "gaps": [],
+               h.SWEEP_FILE_STAMP_AT: NOW - 10, h.SWEEP_FILE_STAMP_SWEEP: SWEEP}
+        (sweep_dir / Path(h.sweep_file_path(**ident)).name).write_text(json.dumps(obj))
+        self.scan_marker.write_text(f"task_id={SWEEP}\nfiled_at={NOW - 60}\ncarded=\n")
+        _board(self.board, "done", {"clusters": [], "fleet": []}, [])
+        roster = [{"name": "cluster-p-seeded-c-us-central1-a", "key": "bootstrap-inventory-cluster-cluster-p-seeded-c-us-central1-a",
+                   "title": "t", "cluster_label": "c", "identity": ident}]
+        self.assertEqual(self._run(full_roster=lambda: roster), "t_rank1")
+        raw = (self.d / "INVENTORY.raw.md").read_text()
+        self.assertIn("| seeded-c | p | us-central1-a | t_sweep | 1 | yes |", raw)
 
     def _run_roster(self, roster, now=NOW):
         import bootstrap_scan_gate
@@ -588,6 +921,35 @@ class HandOffTest(unittest.TestCase):
         self.assertIn("cluster_inventory_audit_sop.md", argv[argv.index("--body") + 1])
         self.assertEqual(self.filed, [])
 
+    def test_onboarding_cards_are_stamped_chat_by_a_minted_ticket_never_an_argument(self):
+        _board(self.board, clusters=[])
+        sent, seen, minted = [], [], []
+        origin = types.ModuleType("hermes_cli.kanban_origin")
+
+        held = []
+
+        @contextlib.contextmanager
+        def writer_ticket(value):
+            minted.append(value)
+            held.append("t1cket")
+            try:
+                yield "t1cket"
+            finally:
+                held.pop()
+
+        origin.writer_ticket = writer_ticket
+        kanban_stub = self._stub_kanban(sent, reply=json.dumps({"id": "t_new"}))
+        with kanban_stub, mock.patch.dict(sys.modules, {"hermes_cli.kanban_origin": origin}):
+            sys.modules["hermes_cli"].kanban_origin = origin
+            kanban = sys.modules["hermes_cli.kanban"]
+            reply = kanban.run_slash
+            kanban.run_slash = lambda cmd: seen.append(held[-1] if held else None) or reply(cmd)
+            self.assertIsNone(self._run_roster([self._agent("t_a")]))
+        self.assertEqual(minted, ["chat"])
+        self.assertEqual(h.CARD_ORIGIN, "chat")
+        self.assertEqual(seen, ["t1cket"])
+        self.assertNotIn("--origin", sent[0])
+
     def test_a_sweep_that_filed_no_cards_does_not_report_a_clean_fleet(self):
         # The live failure: a done sweep with no cluster cards at all.
         _board(self.board, clusters=[])
@@ -597,6 +959,194 @@ class HandOffTest(unittest.TestCase):
         self.assertEqual(len(sent), 2)
         self.assertFalse((self.d / "INVENTORY.raw.md").exists())
         self.assertEqual(self.filed, [])
+
+    def test_the_first_run_cap_bounds_the_cards_one_sweep_files(self):
+        # #3702: a roster past the cap files the cap's worth, and the rest are
+        # left to the sweep rather than counted as unfiled.
+        _board(self.board, clusters=[])
+        (self.d / h.FIRST_RUN_CLUSTER_CARDS_FILE).write_text("3\n")
+        sent = []
+        with self._stub_kanban(sent):
+            self.assertIsNone(self._run_roster([self._agent(f"t_{i}") for i in range(10)]))
+        self.assertEqual(len(sent), 3)
+
+    def test_the_cap_counts_cards_already_filed_for_the_sweep(self):
+        # A roster that changes between ticks cannot file past the cap: two
+        # cards are on the board, so a cap of three files one more.
+        _board(self.board, clusters=_all_done()[:2])
+        (self.d / h.FIRST_RUN_CLUSTER_CARDS_FILE).write_text("3")
+        sent = []
+        roster = [self._agent(f"t_new{i}") for i in range(5)]
+        with self._stub_kanban(sent):
+            self.assertIsNone(self._run_roster(roster))
+        self.assertEqual(len(sent), 1)
+
+    def test_an_agent_past_the_cap_is_not_a_card_the_gate_could_not_file(self):
+        # #3702: the cap's worth of cards are on the board and done and the sweep
+        # finished, so the hand-off goes ahead; the agents past the cap were left
+        # to the sweep, so the raw report has no unfiled-card gap for them.
+        _board(self.board, clusters=_all_done())
+        (self.d / h.FIRST_RUN_CLUSTER_CARDS_FILE).write_text(str(len(_all_done())))
+        roster = [self._agent(tid) for tid, _, _, _ in _all_done()] + [self._agent(f"t_past{i}") for i in range(3)]
+        sent = []
+        with self._stub_kanban(sent):
+            self.assertEqual(self._run_roster(roster), "t_rank1")
+        self.assertEqual(sent, [])
+        self.assertNotIn("could not file this Cluster Agent's card", (self.d / "INVENTORY.raw.md").read_text())
+
+    def test_the_deadline_budgets_for_the_agents_the_marker_left_uncarded(self):
+        # #3702: the gate's marker records the agents past the cap, and the
+        # hand-off waits five more minutes for each before it stops waiting.
+        uncarded = 4
+        self.scan_marker.write_text(f"task_id={SWEEP}\nfiled_at={NOW - 60}\nuncarded={uncarded}\n")
+        _board(self.board, clusters=_all_done() + [("t_stuck", "running", None, "")])
+        unbudgeted = h.DEADLINE_SECONDS + h.DEADLINE_PER_CARD_SECONDS * (len(_all_done()) + 1)
+        budgeted = unbudgeted + h.DEADLINE_PER_CARD_SECONDS * uncarded
+        self.assertIsNone(self._run(now=NOW - 60 + unbudgeted))
+        self.assertIsNone(self._run(now=NOW - 60 + budgeted - 1))
+        self.assertFalse((self.d / "INVENTORY.raw.md").exists())
+        self.assertEqual(self._run(now=NOW - 60 + budgeted), "t_rank1")
+        self.assertIn("stopped waiting", (self.d / "INVENTORY.raw.md").read_text())
+
+    def _mid_sweep(self, marker_cap):
+        # Six of the sweep's cluster cards are on the board, four more agents
+        # are ready, and the operator has since raised the file to 20.
+        self.scan_marker.write_text(f"task_id={SWEEP}\nfiled_at={NOW - 60}\nuncarded=4\n{marker_cap}")
+        _board(self.board, clusters=[(f"t_{i}", "running", None, "") for i in range(6)])
+        (self.d / h.FIRST_RUN_CLUSTER_CARDS_FILE).write_text("20\n")
+        sent = []
+        with self._stub_kanban(sent):
+            self.assertIsNone(self._run_roster([self._agent(f"t_{i}") for i in range(10)]))
+        return sent
+
+    def test_a_cap_raised_mid_sweep_files_no_more_cards(self):
+        # #3702: the sweep card told its worker to audit the four past cap 6;
+        # carding them now would audit them twice.
+        self.assertEqual(self._mid_sweep("cap=6\n"), [])
+
+    def test_a_sweep_marker_without_a_cap_falls_back_to_the_file(self):
+        # A sweep filed by an older build records no cap= and keeps the file's.
+        self.assertEqual(len(self._mid_sweep("")), 4)
+
+    def _carded_run(self, carded, clusters, roster, cap=3):
+        self.scan_marker.write_text(f"task_id={SWEEP}\nfiled_at={NOW - 60}\ncap={cap}\ncarded={carded}\n")
+        self.board.unlink(missing_ok=True)
+        _board(self.board, clusters=clusters)
+        sent = []
+        with self._stub_kanban(sent):
+            self.assertIsNone(self._run_roster([self._agent(t) for t in roster]))
+        return [shlex.split(cmd)[shlex.split(cmd).index("--idempotency-key") + 1] for cmd in sent]
+
+    def test_a_failed_carded_create_is_retried_and_a_newly_ready_profile_gets_none(self):
+        # #3702: t_3's create failed on the filing tick, and t_0, which sorts
+        # first, has become ready since. The sweep card gave t_0 to its worker,
+        # so the free slot goes to t_3 alone.
+        carded = ",".join(f"{h.CLUSTER_KEY_PREFIX}t_{i}" for i in (1, 2, 3))
+        running = [(f"t_{i}", "running", None, "") for i in (1, 2)]
+        self.assertEqual(self._carded_run(carded, running, ["t_0", "t_1", "t_2", "t_3"]),
+                         [f"{h.CLUSTER_KEY_PREFIX}t_3"])
+
+    def test_a_stray_cluster_card_takes_no_carded_agents_slot(self):
+        # #3702: cap 3 over a, b, c; a's create failed, b and c are on the board,
+        # and so is a card for x, which the sweep card never listed. Counting x
+        # against the cap would leave a without a card for the whole sweep.
+        carded = ",".join(f"{h.CLUSTER_KEY_PREFIX}t_{n}" for n in "abc")
+        clusters = [(f"t_{n}", "running", None, "") for n in "bcx"]
+        self.assertEqual(self._carded_run(carded, clusters, ["t_a", "t_b", "t_c"], cap=3),
+                         [f"{h.CLUSTER_KEY_PREFIX}t_a"])
+
+    def test_an_archived_carded_card_frees_no_slot_for_an_unlisted_profile(self):
+        carded = f"{h.CLUSTER_KEY_PREFIX}t_1,{h.CLUSTER_KEY_PREFIX}t_2"
+        clusters = [("t_1", "running", None, ""), ("t_2", "archived", None, "")]
+        self.assertEqual(self._carded_run(carded, clusters, ["t_0", "t_1", "t_2"], cap=2), [])
+
+    def test_a_boolean_where_a_list_belongs_is_malformed(self):
+        # Green 1 of #4115: a worker relayed the collector's object with
+        # `workloads: false` and `findings: [false, ...]`; a falsy bool must not
+        # read as "none" and leave the Coverage row saying scanned in full.
+        meta = {"project": "p", "cluster": "c", "workloads": False, "findings": [False, False], "gaps": False}
+        bad = dict(h._malformed(meta))
+        self.assertEqual(bad.get("workloads"), "bool")
+        self.assertEqual(bad.get("gaps"), "bool")
+        self.assertNotIn("findings", bad)  # a list, its items dropped as unnamed findings
+        self.assertEqual(h._malformed({"project": "p", "cluster": "c", "workloads": 0, "findings": ""}), [])
+
+    def test_workloads_that_are_not_objects_are_not_counted(self):
+        meta = {"project": "p", "cluster": "c", "location": "l", "workloads": [False, "x", {"namespace": "n", "name": "w"}],
+                "findings": [], "topology": {}}
+        state = {"sweep": {"id": "t_s", "status": "done", "block_reason": "", "metadata": {"clusters": [meta], "fleet": []}},
+                 "clusters": [], "archived_clusters": 0}
+        raw = h.compose(state, timed_out=False, now=NOW)
+        self.assertIn("| c | p | l | t_s | 1 | no — see Gaps |", raw)
+        self.assertIn("c (t_s): 2 reported workload(s) were not objects, so they are neither counted nor listed", raw)
+
+    def test_a_malformed_carded_list_narrows_and_never_widens(self):
+
+        # Entries that are not cluster card keys are dropped; a list with none
+        # left files nothing rather than falling back to the cap alone.
+        roster = ["t_0", "t_1", "t_2"]
+        self.assertEqual(self._carded_run(f"garbage,,bootstrap-inventory-other-t_0,{h.CLUSTER_KEY_PREFIX}t_1", [], roster),
+                         [f"{h.CLUSTER_KEY_PREFIX}t_1"])
+        for carded in ("!!", "-", f"{h.CLUSTER_KEY_PREFIX}t_0;rm"):
+            with self.subTest(carded=carded):
+                self.assertEqual(self._carded_run(carded, [], roster), [])
+
+    def test_a_marker_without_carded_keeps_the_cap_as_the_only_bound(self):
+        self.scan_marker.write_text(f"task_id={SWEEP}\nfiled_at={NOW - 60}\ncap=2\n")
+        _board(self.board, clusters=[])
+        sent = []
+        with self._stub_kanban(sent):
+            self.assertIsNone(self._run_roster([self._agent(f"t_{i}") for i in range(4)]))
+        self.assertEqual(len(sent), 2)
+
+    def _unpinned_at(self, now, full_roster):
+        # #3702: a marker that pinned nothing (an empty or failed listing at
+        # filing), cap 6, six cluster cards, and 200 ready agents now.
+        self.scan_marker.write_text(f"task_id={SWEEP}\nfiled_at={NOW - 60}\ncap=6\n")
+        self.board.unlink(missing_ok=True)
+        # Four done with findings and two still running: six cards, so the
+        # timed-out hand-off has audits to rank.
+        _board(self.board, clusters=_all_done() + [(f"t_run{i}", "running", None, "") for i in range(2)])
+        with self._stub_kanban([]):
+            return h.hand_off(self.d, self.scan_marker, None, roster=[], now=now, full_roster=full_roster)
+
+    def test_an_unpinned_sweep_budgets_the_live_roster_past_the_cap(self):
+        roster = [self._agent(f"t_{i:03d}") for i in range(200)]
+        filed_at = NOW - 60
+        self.assertEqual(h.DEADLINE_SECONDS + h.DEADLINE_PER_CARD_SECONDS * (6 + 194), 63600)
+        self.assertIsNone(self._unpinned_at(filed_at + h.DEADLINE_SECONDS + h.DEADLINE_PER_CARD_SECONDS * 6 + 1, lambda: roster))
+        self.assertIsNone(self._unpinned_at(filed_at + 63600 - 1, lambda: roster))
+        self.assertFalse((self.d / "INVENTORY.raw.md").exists())
+        self.assertEqual(self._unpinned_at(filed_at + 63600, lambda: roster), "t_rank1")
+        self.assertIn("stopped waiting", (self.d / "INVENTORY.raw.md").read_text())
+
+    def test_a_full_roster_that_raises_reads_as_no_live_budget(self):
+        def broken():
+            raise OSError("profiles unreadable")
+
+        with mock.patch.object(h, "_log"):
+            self.assertEqual(
+                self._unpinned_at(NOW - 60 + h.DEADLINE_SECONDS + h.DEADLINE_PER_CARD_SECONDS * 6, broken), "t_rank1"
+            )
+
+    def test_a_pinned_marker_ignores_the_live_roster(self):
+        marker = self.d / "pinned"
+        roster = [self._agent(f"t_{i}") for i in range(200)]
+        marker.write_text("task_id=t\ncap=6\nuncarded=4\n")
+        self.assertEqual(h.uncarded_budget(marker, 6, roster), 4)
+        marker.write_text(f"task_id=t\ncap=6\ncarded={h.CLUSTER_KEY_PREFIX}t_0\n")
+        self.assertEqual(h.uncarded_budget(marker, 6, roster), 0)
+        marker.write_text("task_id=t\ncap=6\n")
+        self.assertEqual(h.uncarded_budget(marker, 6, roster), 194)
+        self.assertEqual(h.uncarded_budget(marker, 6, None), 0)
+        self.assertEqual(h.uncarded_budget(marker, 6, [self._agent("t")] * 5000), h.FIRST_RUN_UNCARDED_MAX)
+
+    def test_a_roster_under_the_cap_files_every_card(self):
+        _board(self.board, clusters=[])
+        sent = []
+        with self._stub_kanban(sent):
+            self.assertIsNone(self._run_roster([self._agent(f"t_{i}") for i in range(h.FIRST_RUN_CLUSTER_CARDS - 1)]))
+        self.assertEqual(len(sent), h.FIRST_RUN_CLUSTER_CARDS - 1)
 
     def test_an_archived_cluster_card_is_not_filed_again(self):
         _board(self.board, clusters=_all_done() + [("t_gone", "archived", None, "")])
@@ -797,6 +1347,105 @@ class HandOffTest(unittest.TestCase):
         self.assertEqual(kw["principal"], "agent")
         self.assertIn("first_report_criticals", json.loads(kw["stdin"]))
         self.assertFalse((self.d / "INVENTORY.raw.md").exists())
+
+
+class FirstRunClusterCardsTest(unittest.TestCase):
+    """The cap file's clamp (#3702): it can lower or raise the cap within
+    bounds, and nothing in it uncaps the scan."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.d = Path(self.tmp.name)
+
+    def _cap(self, content=None):
+        if content is not None:
+            (self.d / h.FIRST_RUN_CLUSTER_CARDS_FILE).write_text(content)
+        with mock.patch.object(h, "_log"):
+            return h.first_run_cluster_cards(self.d)
+
+    def test_absent_is_the_default(self):
+        self.assertEqual(self._cap(), h.FIRST_RUN_CLUSTER_CARDS)
+
+    def test_a_value_in_range_is_used(self):
+        self.assertEqual(self._cap("2\n"), 2)
+        self.assertEqual(self._cap(str(h.FIRST_RUN_CLUSTER_CARDS_MAX)), h.FIRST_RUN_CLUSTER_CARDS_MAX)
+
+    def test_malformed_zero_or_negative_is_the_default(self):
+        for content in ("", "six", "2.5", "0", "-3", "1e9"):
+            with self.subTest(content=content):
+                self.assertEqual(self._cap(content), h.FIRST_RUN_CLUSTER_CARDS)
+
+    def test_a_value_past_the_maximum_is_clamped(self):
+        self.assertEqual(self._cap("100000"), h.FIRST_RUN_CLUSTER_CARDS_MAX)
+
+    def test_an_unreadable_file_is_the_default(self):
+        (self.d / h.FIRST_RUN_CLUSTER_CARDS_FILE).mkdir()
+        self.assertEqual(self._cap(), h.FIRST_RUN_CLUSTER_CARDS)
+
+    def test_a_file_that_is_not_utf8_is_the_default(self):
+        # UnicodeDecodeError is a ValueError, not an OSError.
+        (self.d / h.FIRST_RUN_CLUSTER_CARDS_FILE).write_bytes(b"\xff\xfe6\x00")
+        self.assertEqual(self._cap(), h.FIRST_RUN_CLUSTER_CARDS)
+
+    def test_the_marker_count_of_uncarded_agents_is_clamped(self):
+        marker = self.d / "scan_filed"
+        for content, want in (("task_id=t\nfiled_at=1\n", 0), ("task_id=t\nuncarded=194\n", 194),
+                              ("task_id=t\nuncarded=-4\n", 0), ("task_id=t\nuncarded=lots\n", 0),
+                              (f"task_id=t\nuncarded={h.FIRST_RUN_UNCARDED_MAX + 1}\n", h.FIRST_RUN_UNCARDED_MAX)):
+            with self.subTest(content=content):
+                marker.write_text(content)
+                self.assertEqual(h.uncarded_agents(marker), want)
+
+    def test_the_marker_cap_is_read_like_the_file(self):
+        marker = self.d / "scan_filed"
+        for content, want in (("task_id=t\nfiled_at=1\n", None), ("task_id=t\ncap=3\n", 3),
+                              ("task_id=t\ncap=0\n", h.FIRST_RUN_CLUSTER_CARDS),
+                              ("task_id=t\ncap=-2\n", h.FIRST_RUN_CLUSTER_CARDS),
+                              ("task_id=t\ncap=lots\n", h.FIRST_RUN_CLUSTER_CARDS),
+                              (f"task_id=t\ncap={h.FIRST_RUN_CLUSTER_CARDS_MAX + 1}\n", h.FIRST_RUN_CLUSTER_CARDS_MAX)):
+            with self.subTest(content=content), mock.patch.object(h, "_log"):
+                marker.write_text(content)
+                self.assertEqual(h.marker_cap(marker), want)
+
+    def test_a_sweep_uses_its_marker_cap_and_else_the_file(self):
+        marker = self.d / "scan_filed"
+        (self.d / h.FIRST_RUN_CLUSTER_CARDS_FILE).write_text("20")
+        marker.write_text("task_id=t\ncap=99\n")
+        with mock.patch.object(h, "_log"):
+            self.assertEqual(h.sweep_cluster_cards(self.d, marker), h.FIRST_RUN_CLUSTER_CARDS_MAX)
+            marker.write_text("task_id=t\n")
+            self.assertEqual(h.sweep_cluster_cards(self.d, marker), 20)
+            marker.write_bytes(b"\xff\xfecap=2\n")
+            self.assertEqual(h.sweep_cluster_cards(self.d, marker), 20)
+
+    def test_the_carded_keys_are_read_from_the_marker(self):
+        marker = self.d / "scan_filed"
+        key = h.CLUSTER_KEY_PREFIX
+        for content, want in (("task_id=t\n", None),
+                              (f"task_id=t\ncarded={key}a,{key}b.c\n", {f"{key}a", f"{key}b.c"}),
+                              (f"task_id=t\ncarded={key}a,x,{key}\n", {f"{key}a"}),
+                              ("task_id=t\ncarded=-\n", set())):
+            with self.subTest(content=content):
+                marker.write_text(content)
+                got = h.carded_keys(marker)
+                self.assertEqual(got if got is None else set(got), want)
+        many = ",".join(f"{key}p{i:03d}" for i in range(h.FIRST_RUN_CLUSTER_CARDS_MAX + 5))
+        marker.write_text(f"task_id=t\ncarded={many}\n")
+        self.assertEqual(len(h.carded_keys(marker)), h.FIRST_RUN_CLUSTER_CARDS_MAX)
+        marker.write_bytes(b"\xff\xfecarded=x\n")
+        self.assertIsNone(h.carded_keys(marker))
+
+    def test_a_marker_that_is_not_utf8_records_no_uncarded_agents(self):
+        # _read_marker raises UnicodeDecodeError, a ValueError, which this read catches.
+        marker = self.d / "scan_filed"
+        marker.write_bytes(b"\xff\xfe6\x00")
+        self.assertEqual(h.uncarded_agents(marker), 0)
+
+    def test_the_deadline_budgets_for_clusters_left_to_the_sweep(self):
+        state = {"clusters": [{}] * 6, "uncarded": 194}
+        self.assertEqual(h.deadline(state), h.DEADLINE_SECONDS + h.DEADLINE_PER_CARD_SECONDS * 200)
+        self.assertEqual(h.deadline({"clusters": [{}] * 6}), h.DEADLINE_SECONDS + h.DEADLINE_PER_CARD_SECONDS * 6)
 
 
 if __name__ == "__main__":

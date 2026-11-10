@@ -2,9 +2,13 @@ package lib
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
+	"regexp"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // TaskState is the A2A task state machine, plus rejected. auth-required is
@@ -179,15 +183,329 @@ func UsageTotal(turns []Usage) Usage {
 // hop is how the call gets from the harness's delegate tool to the adapter
 // that actually publishes the artifact), so it is named here, beside
 // ArtifactDelegate, rather than duplicated per caller.
+//
+// Parameters are the child task's parameters (TaskParameters), the target
+// cluster among them. The contract (spec-a2a-payloads.md, "Task parameters
+// and child results"): the gateway carries them into the child's submission
+// and refuses a child whose target is not inside its parent's. No gateway
+// reads them yet.
 type DelegateRequest struct {
-	Addressee string `json:"addressee"`
-	Text      string `json:"text"`
+	Addressee  string            `json:"addressee"`
+	Text       string            `json:"text"`
+	Parameters map[string]string `json:"parameters,omitempty"`
 }
 
 // DelegateTextCap bounds DelegateRequest.Text in bytes: the adapter refuses a
 // longer request before it reaches the bus and the gateway ignores one that
 // arrives anyway, so the two sides cannot disagree on the number.
 const DelegateTextCap = 16 * 1024
+
+// TaskParameters is the taskParameters data part on a profile task's
+// submission: the parameters its persona declares (the cluster persona's
+// project, location and cluster), set by the gateway from what the client
+// or the parent task asked. The dispatcher builds the verifier's resource
+// from them and hands each to the worker as PROFILE_TASK_<NAME>; the
+// verifier refuses a target outside the grant's scope, which is what makes
+// these message fields authoritative. They never ride the authority block.
+type TaskParameters struct {
+	Parameters map[string]string `json:"parameters"`
+}
+
+// The bounds ValidateTaskParameters holds a parameter set to. A name is a
+// lower-case identifier (TaskParameterNameRE), as a persona declares it and as the worker's
+// PROFILE_TASK_<NAME> spells it upper-cased. A value is one token with no
+// '/' or space, because the dispatcher joins values into a verifier resource
+// path (project/<p>/location/<l>/cluster/<c>) and a '/' would let a value
+// name a different resource. It starts with a letter or digit, so it is
+// never "." or ".." (a path step) and never reads as a flag ("-x") where a
+// worker passes it to a command.
+const (
+	TaskParametersMax        = 16
+	TaskParameterValueMaxLen = 128
+)
+
+var (
+	// TaskParameterNameRE is a parameter name: the persona loader declares
+	// names by it (lib/persona), and a submission carries names by it, so a
+	// name a persona can declare is one its tasks can be handed.
+	TaskParameterNameRE = regexp.MustCompile(`^[a-z][a-z0-9_]{0,62}$`)
+	taskParameterValue  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]*$`)
+)
+
+// ValidateTaskParameters reports the first way params break the bounds
+// above, or nil. An empty or nil set is valid: a task with no parameters.
+func ValidateTaskParameters(params map[string]string) error {
+	if len(params) > TaskParametersMax {
+		return fmt.Errorf("task parameters: %d, at most %d", len(params), TaskParametersMax)
+	}
+	for name, value := range params {
+		if !TaskParameterNameRE.MatchString(name) {
+			return fmt.Errorf("task parameter name %q is not a lower-case identifier of at most 63 characters", name)
+		}
+		if len(value) > TaskParameterValueMaxLen || !taskParameterValue.MatchString(value) {
+			return fmt.Errorf("task parameter %s: the value is not one token (a letter or digit, then letters, digits, . _ : -) of at most %d characters", name, TaskParameterValueMaxLen)
+		}
+	}
+	return nil
+}
+
+const taskParametersKey = "taskParameters"
+
+// TaskParametersPart is p as a data part, refused when p breaks the bounds.
+func TaskParametersPart(p TaskParameters) (Part, error) {
+	if err := ValidateTaskParameters(p.Parameters); err != nil {
+		return Part{}, err
+	}
+	if p.Parameters == nil {
+		p.Parameters = map[string]string{}
+	}
+	data, err := json.Marshal(map[string]TaskParameters{taskParametersKey: p})
+	if err != nil {
+		return Part{}, err
+	}
+	return Part{Kind: "data", Data: data}, nil
+}
+
+// TaskParametersOf finds the taskParameters part among parts. A data part
+// that is not one is skipped. One that is but breaks the bounds is an
+// error rather than skipped, so a reader never runs a task as though it had
+// no parameters when its submission carried bad ones; so are two such
+// parts, which leave the task's target ambiguous.
+func TaskParametersOf(parts []Part) (TaskParameters, bool, error) {
+	var found *TaskParameters
+	for _, p := range parts {
+		raw, ok := wrappedData(p, taskParametersKey)
+		if !ok {
+			continue
+		}
+		if found != nil {
+			return TaskParameters{}, true, errors.New("task parameters: more than one taskParameters part")
+		}
+		var tp TaskParameters
+		if err := json.Unmarshal(raw, &tp); err != nil {
+			return TaskParameters{}, true, fmt.Errorf("task parameters: %w", err)
+		}
+		// A null part, a null set or a misspelt field decodes to no
+		// parameters at all; that is a broken part, not an empty set, which
+		// is written {"parameters":{}}.
+		if tp.Parameters == nil {
+			return TaskParameters{}, true, errors.New("task parameters: the part carries no parameters object")
+		}
+		if err := ValidateTaskParameters(tp.Parameters); err != nil {
+			return TaskParameters{}, true, err
+		}
+		found = &tp
+	}
+	if found == nil {
+		return TaskParameters{}, false, nil
+	}
+	return *found, true, nil
+}
+
+// DelegateTargets is the delegateTargets data part on a session turn's
+// submission: the agents the turn's requester may delegate to, as the gateway
+// resolved them when it submitted the turn (platform, then each AgentProfile
+// whose card admits them). The session pod's delegate tool names them in its
+// addressee description, so the model is told what it can address rather than
+// a fixed name. It's a hint for the model, not a grant: the gateway checks a
+// delegation against the same rules when it arrives, so a stale list costs at
+// most a refused delegation.
+//
+// The part's presence is the marker: a turn that carries one has exactly the
+// agents listed (an empty list is none), and a turn with none reads as
+// platform only. Truncated says the gateway left agents out to stay inside
+// the bounds below.
+type DelegateTargets struct {
+	Targets   []DelegateTarget `json:"targets"`
+	Truncated bool             `json:"truncated,omitempty"`
+}
+
+// DelegateTarget is one agent a session may delegate to: its addressee, its
+// card's routing blurb, and the parameters its card declares (a pinned
+// profile's cluster, say), which a delegation may pass.
+type DelegateTarget struct {
+	Name        string             `json:"name"`
+	Description string             `json:"description,omitempty"`
+	Parameters  []ProfileParameter `json:"parameters,omitempty"`
+}
+
+// The bounds a delegateTargets part is held to. A name is a subject token (an
+// addressee); a description is one line of at most DelegateTargetDescriptionMax
+// bytes, cut by the gateway (DelegateTargetDescription); a parameter is named
+// by TaskParameterNameRE, at most TaskParametersMax a target. The encoded part
+// is at most DelegateTargetsMaxBytes, so the session pod can hand it to its
+// tool server in one environment variable.
+const (
+	DelegateTargetsMax           = 32
+	DelegateTargetDescriptionMax = 200
+	DelegateTargetsMaxBytes      = 16 * 1024
+)
+
+const delegateTargetsKey = "delegateTargets"
+
+// DelegateTargetDescription is a card's description as a delegate target
+// carries it: control characters and line breaks folded to spaces, runs of
+// space collapsed, and cut to DelegateTargetDescriptionMax bytes on a rune
+// boundary.
+func DelegateTargetDescription(s string) string {
+	s = strings.Join(strings.Fields(strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, s)), " ")
+	if len(s) <= DelegateTargetDescriptionMax {
+		return s
+	}
+	cut := DelegateTargetDescriptionMax
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	// A cut that lands after a space would leave it trailing, and the
+	// description would no longer read back as itself.
+	return strings.TrimRight(s[:cut], " ")
+}
+
+func validateDelegateTargets(t DelegateTargets) error {
+	if len(t.Targets) > DelegateTargetsMax {
+		return fmt.Errorf("delegate targets: %d, at most %d", len(t.Targets), DelegateTargetsMax)
+	}
+	for _, d := range t.Targets {
+		if !ValidSubjectToken(d.Name) {
+			return fmt.Errorf("delegate target %q is not an addressee", d.Name)
+		}
+		if d.Description != DelegateTargetDescription(d.Description) {
+			return fmt.Errorf("delegate target %s: the description is not one line of at most %d bytes", d.Name, DelegateTargetDescriptionMax)
+		}
+		if len(d.Parameters) > TaskParametersMax {
+			return fmt.Errorf("delegate target %s: %d parameters, at most %d", d.Name, len(d.Parameters), TaskParametersMax)
+		}
+		for _, p := range d.Parameters {
+			if !TaskParameterNameRE.MatchString(p.Name) {
+				return fmt.Errorf("delegate target %s: parameter %q is not a lower-case identifier", d.Name, p.Name)
+			}
+		}
+	}
+	if raw, err := json.Marshal(t); err != nil || len(raw) > DelegateTargetsMaxBytes {
+		return fmt.Errorf("delegate targets: encoded past %d bytes", DelegateTargetsMaxBytes)
+	}
+	return nil
+}
+
+// DelegateTargetsPart is t as a data part, refused when t breaks the bounds.
+func DelegateTargetsPart(t DelegateTargets) (Part, error) {
+	if err := validateDelegateTargets(t); err != nil {
+		return Part{}, err
+	}
+	if t.Targets == nil {
+		t.Targets = []DelegateTarget{}
+	}
+	data, err := json.Marshal(map[string]DelegateTargets{delegateTargetsKey: t})
+	if err != nil {
+		return Part{}, err
+	}
+	return Part{Kind: "data", Data: data}, nil
+}
+
+// DelegateTargetsOf finds the delegateTargets part among parts. A part that
+// breaks the bounds, or a second one, is an error, and the reader falls back
+// to what it would show with none.
+func DelegateTargetsOf(parts []Part) (DelegateTargets, bool, error) {
+	var found *DelegateTargets
+	for _, p := range parts {
+		raw, ok := wrappedData(p, delegateTargetsKey)
+		if !ok {
+			continue
+		}
+		if found != nil {
+			return DelegateTargets{}, true, errors.New("delegate targets: more than one delegateTargets part")
+		}
+		var t DelegateTargets
+		if err := json.Unmarshal(raw, &t); err != nil {
+			return DelegateTargets{}, true, fmt.Errorf("delegate targets: %w", err)
+		}
+		if t.Targets == nil {
+			return DelegateTargets{}, true, errors.New("delegate targets: the part carries no targets list")
+		}
+		if err := validateDelegateTargets(t); err != nil {
+			return DelegateTargets{}, true, err
+		}
+		found = &t
+	}
+	if found == nil {
+		return DelegateTargets{}, false, nil
+	}
+	return *found, true, nil
+}
+
+// ChildResult is the childResult data part: a child task's end, which the
+// gateway delivers on its parent's .in as a message, for a parent that waits
+// by staying open (a profile task under the dispatcher). A chat session's
+// turn ends when it delegates, so a session parent is woken with the child's
+// result as a new turn instead (spec-a2a-payloads.md, "Task parameters and
+// child results").
+type ChildResult struct {
+	ChildTaskID string    `json:"childTaskId"`
+	Addressee   string    `json:"addressee"`
+	State       TaskState `json:"state"`
+	// Text is the child's deliverable when it completed, and the reason it
+	// gave otherwise; at most ChildResultTextCap bytes, cut by the gateway.
+	Text string `json:"text,omitempty"`
+}
+
+// ChildResultTextCap bounds ChildResult.Text in bytes. The gateway cuts a
+// longer deliverable and says so; the child's own result artifact keeps it
+// whole on TASKS.
+const ChildResultTextCap = 64 * 1024
+
+const childResultKey = "childResult"
+
+// ChildResultPart is c as a data part, refused without a child task id or a
+// terminal state, or with text past ChildResultTextCap.
+func ChildResultPart(c ChildResult) (Part, error) {
+	if !ValidSubjectToken(c.ChildTaskID) || !c.State.Terminal() || len(c.Text) > ChildResultTextCap {
+		return Part{}, fmt.Errorf("child result: needs a task id, a terminal state and at most %d bytes of text", ChildResultTextCap)
+	}
+	data, err := json.Marshal(map[string]ChildResult{childResultKey: c})
+	if err != nil {
+		return Part{}, err
+	}
+	return Part{Kind: "data", Data: data}, nil
+}
+
+// ChildResultOf finds the childResult part among parts. A data part that is
+// not one, or one without a task id or a terminal state or with text past
+// the cap, is skipped: a malformed child result is no event, where a
+// malformed parameter set (TaskParametersOf) would change what runs.
+func ChildResultOf(parts []Part) (ChildResult, bool) {
+	for _, p := range parts {
+		raw, ok := wrappedData(p, childResultKey)
+		if !ok {
+			continue
+		}
+		var c ChildResult
+		if json.Unmarshal(raw, &c) != nil || !ValidSubjectToken(c.ChildTaskID) || !c.State.Terminal() ||
+			len(c.Text) > ChildResultTextCap {
+			continue
+		}
+		return c, true
+	}
+	return ChildResult{}, false
+}
+
+// wrappedData is a data part's payload under key, when p is a data part
+// wrapping one.
+func wrappedData(p Part, key string) (json.RawMessage, bool) {
+	if p.Kind != "data" || len(p.Data) == 0 {
+		return nil, false
+	}
+	var wrap map[string]json.RawMessage
+	if json.Unmarshal(p.Data, &wrap) != nil {
+		return nil, false
+	}
+	raw, ok := wrap[key]
+	return raw, ok
+}
 
 // SteerNotice is the data part an executor that queues follow-ups puts on
 // the non-final status-update it publishes for each follow-up message it
@@ -280,7 +598,7 @@ func SteerNoticeOf(parts []Part) (SteerNotice, bool) {
 // them (the executor's log names each card). truncated says the
 // conversation had more open cards than one stop takes, so some may still
 // be open; deadline that the stop ran out of time. listsCut says only that
-// the executor cut stopped or settled to fit the part, each at
+// the executor cut stopped, settled or notStopped to fit the part, each at
 // CardStopListMax, so the list that was cut is one at that length: the
 // cards themselves are as the counts say. A stop that found nothing open answers empty lists.
 // A stop that failed answers no part: its terminal is failed, and the
@@ -306,6 +624,10 @@ type CardStopResult struct {
 	Truncated  bool           `json:"truncated"`
 	Deadline   bool           `json:"deadline"`
 	ListsCut   bool           `json:"listsCut"`
+	// NotStopped names the cards Failed, Pending and Unresolved count, in that
+	// order, cut at CardStopListMax (ListsCut covers it too). Absent from an
+	// older executor's result, which reads as none named.
+	NotStopped []CardStopCard `json:"notStopped,omitempty"`
 }
 
 // CardStopCard is one card a result names. PriorStatus is set on a stopped
@@ -444,9 +766,34 @@ type ArtifactUpdate struct {
 	LastChunk bool     `json:"lastChunk,omitempty"`
 }
 
-// AgentCard carries only the field validation needs.
+// AgentCard is the directory card on a2a.agents.<name>. Validation needs
+// only Name; the rest is what the gateway routes a profile on (#3655), all
+// optional so a card without them still parses.
 type AgentCard struct {
 	Name string `json:"name"`
+	// Description is the routing blurb, a sentence a router can read.
+	Description string `json:"description,omitempty"`
+	// Tiers are the tiers the profile may run at (its allowedTiers).
+	Tiers []string `json:"tiers,omitempty"`
+	// ClusterRef pins a profile to one cluster; absent on a profile that
+	// takes its target as task parameters.
+	ClusterRef *ClusterRef `json:"clusterRef,omitempty"`
+	// Parameters are the task parameters the profile's persona declares.
+	Parameters []ProfileParameter `json:"parameters,omitempty"`
+}
+
+// ClusterRef names one GKE cluster.
+type ClusterRef struct {
+	ProjectID string `json:"projectId"`
+	Location  string `json:"location"`
+	Cluster   string `json:"cluster"`
+}
+
+// ProfileParameter is one task parameter a profile declares: its name, as
+// TaskParameterNameRE, and whether a submission must carry it.
+type ProfileParameter struct {
+	Name     string `json:"name"`
+	Required bool   `json:"required,omitempty"`
 }
 
 func protocolErrf(format string, args ...any) error {

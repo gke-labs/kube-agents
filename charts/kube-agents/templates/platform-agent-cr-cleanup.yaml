@@ -74,13 +74,23 @@ metadata:
     helm.sh/hook-weight: "0"
     helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
 spec:
-  backoffLimit: 0
+  {{- /*
+    The hook runs right after the PlatformAgent leaves its node, which is when
+    the autoscaler scales that node down; a pod lost to that eviction counts as
+    a failure. Both deletes below are idempotent, so a retry is safe, and the
+    annotation keeps the autoscaler off the pod in the first place. The retries
+    share the one activeDeadlineSeconds budget: a retry that cannot finish by
+    then still fails the hook.
+  */}}
+  backoffLimit: 2
   {{- /* Bounds the hook even if the pod never becomes ready; must cover scheduling, pull, and both waits (agentProfileTimeout + timeout). */}}
   activeDeadlineSeconds: {{ .Values.platformAgent.cleanupHook.activeDeadlineSeconds }}
   template:
     metadata:
       labels:
         {{- include "kube-agents.labels" . | nindent 8 }}
+      annotations:
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
     spec:
       restartPolicy: Never
       serviceAccountName: {{ .Release.Name }}-cr-cleanup
@@ -111,8 +121,8 @@ spec:
           {{- /*
             The trailing `|| true` is what makes the best-effort contract above
             real: `kubectl delete --wait` exits non-zero when the finalizer does
-            not clear within the timeout, and with backoffLimit 0 that would
-            fail the Job and abort the uninstall. It needs a shell, which is why
+            not clear within the timeout, and once the retries are spent that
+            would fail the Job and abort the uninstall. It needs a shell, which is why
             the image is not the distroless registry.k8s.io/kubectl.
             --ignore-not-found makes an already-deleted CR a success, which is
             the common case when the teardown tooling removed it first.
@@ -143,10 +153,16 @@ spec:
             requests:
               cpu: 50m
               memory: 64Mi
+              {{- /* The cache emptyDir's sizeLimit plus 64Mi for logs; the quota preflight
+                     in _helpers.tpl sums the same figure. */}}
+              ephemeral-storage: 1088Mi
             limits:
               cpu: 200m
               memory: 128Mi
+              ephemeral-storage: 1088Mi
       volumes:
+        {{- /* 1Gi: kubectl's discovery cache, which grows with the cluster's CRDs. */}}
         - name: cache
-          emptyDir: {}
+          emptyDir:
+            sizeLimit: 1Gi
 {{- end }}

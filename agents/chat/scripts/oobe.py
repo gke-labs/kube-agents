@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
 """Dispatcher for the ``oobe`` cron job: the work an install does once, on first boot.
 
-The design is ``docs/designs/oobe.md``. Each tick runs three stages in order:
+The design is ``docs/designs/oobe.md``. Each tick runs four stages in order:
 
 1. Delivery, ``bootstrap_delivery.main``: post the report to the chat the
    ``bootstrap_onboarding`` plugin linked this job to, once a human has spoken. First,
    because the scheduler snapshots this job's destination when the run starts.
 2. The inventory scan, ``bootstrap_scan_gate.main``: file the sweep card, then the
    hand-off's cluster and ranking cards.
-3. The first-run audits, below: once the scan has settled, the four fleet audits that
+3. The first-run audits, below: once the scan has settled, the four fleet audits and the upgrade retrospective that
    would otherwise wait for their schedules (the next 06:20 UTC, the next Monday for
-   cost), one after another.
+   cost), one after another, and then the upgrade retrospective, whose schedule is
+   Sunday evening and whose first run is the baseline of every cluster the install
+   manages.
+4. The lost summaries, ``bootstrap_delivery.resend_lost_summaries``: a first-run audit
+   that ended before the install had a home channel posted nothing; once the operator
+   projects one, the stage asks the chat relay to post that audit's report, once.
 
 Delivery's stdout is the report, and the scheduler posts whatever this job prints to
-that chat, and a failed run with its stderr. So the other two stages write to
+that chat, and a failed run with its stderr. So the other three stages write to
 ``logs/oobe.log``, their subprocesses' included, and an exception in either is logged
 rather than raised: neither may post, or change delivery's exit.
 
@@ -51,9 +56,9 @@ entrypoint could not tell, or a start check failed all day; the stage cannot tel
 so the reason it records says only which: the scan had not settled, or it had. A scan marker the
 hand-off refuses is given up on a day after it was written. Its audits run on their schedules.
 
-Once the audits stage is done and the report was claimed ``RETIRE_AFTER_SECONDS``
-ago, a run removes this job; delivery's own run removes the two bootstrap entries,
-disabled since this job took them over.
+Once the audits stage is done, no lost summary is left to re-send, and the report was
+claimed ``RETIRE_AFTER_SECONDS`` ago, a run removes this job; delivery's own run removes
+the two bootstrap entries, disabled since this job took them over.
 """
 
 import contextlib
@@ -78,13 +83,16 @@ MARKER_TASK_ID = "task_id"
 # The hand-off's marker (bootstrap_handoff._record): `sweep=`, and `task_id=` its ranking card.
 HANDOFF_SWEEP = "sweep"
 
-# The four audits #1866 names, by their ids in agents/platform/cron/jobs.json, in the
-# order it chains them: cost, security, reliability, capacity.
+# The four audits #1866 names and the upgrade retrospective, by their ids in agents/platform/cron/jobs.json, in the
+# order it chains them: cost, security, reliability, capacity; then the upgrade
+# retrospective, last so the four keep #1866's order and the review of every cluster's
+# last upgrade follows the audits whose findings it cites.
 FIRST_RUN_AUDITS = (
     "fleet-wide-cost-analysis",
     "compliance-audit",
     "obtainability-audit",
     "stockout-prevention",
+    "upgrade-retrospective",
 )
 EXECUTIONS_DB = "executions.db"
 # A run row in either is still going; any other status has ended.
@@ -271,6 +279,14 @@ def scan_settled(data_dir: Path, now: float) -> bool:
     state = bootstrap_handoff.read_board(board, sweep_id)
     if state is None:
         return False
+    # The hand-off's own budget for the clusters past the cap, the live roster included when the
+    # marker pinned nothing (a failed listing at filing still sent the worker to audit them).
+    marker = data_dir / SCAN_FILED_MARKER
+    state["uncarded"] = bootstrap_handoff.uncarded_budget(
+        marker,
+        bootstrap_handoff.sweep_cluster_cards(data_dir, marker),
+        lambda: bootstrap_scan_gate.cluster_agents(capped=False),
+    )
     wait = bootstrap_handoff.deadline(state) + RANKING_ALLOWANCE_SECONDS
     if now - filed_at >= wait:
         _log(
@@ -307,11 +323,8 @@ def trigger(job_id: str, data_dir: Path) -> bool:
     return True
 
 
-def audit_holds(data_dir: Path) -> dict[str, str] | None:
-    """Audits not to start, each with why: absent from the roster, disabled or paused.
-
-    None when the Platform Agent's roster cannot be read.
-    """
+def roster_jobs(data_dir: Path) -> list[dict] | None:
+    """The jobs on the Platform Agent's roster; None when it cannot be read, and the log says why."""
     roster = data_dir / PROFILES_DIR / PLATFORM_PROFILE / CRON_DIR / ROSTER_FILE
     try:
         stored = json.loads(roster.read_text(encoding="utf-8"))
@@ -322,7 +335,18 @@ def audit_holds(data_dir: Path) -> dict[str, str] | None:
     if not isinstance(jobs, list):
         _log(f"cannot read {roster}: its jobs are not a list")
         return None
-    by_id = {job.get("id"): job for job in jobs if isinstance(job, dict)}
+    return [job for job in jobs if isinstance(job, dict)]
+
+
+def audit_holds(data_dir: Path) -> dict[str, str] | None:
+    """Audits not to start, each with why: absent from the roster, disabled or paused.
+
+    None when the Platform Agent's roster cannot be read.
+    """
+    jobs = roster_jobs(data_dir)
+    if jobs is None:
+        return None
+    by_id = {job.get("id"): job for job in jobs}
     holds = {}
     for job_id in FIRST_RUN_AUDITS:
         job = by_id.get(job_id)
@@ -480,7 +504,7 @@ def advance_chain(data_dir: Path, state: dict, now: float, since: float | None =
 
     busy = audits_in_flight(runs, now)
     if busy:
-        # One of the four has a run going, whatever started it, including the run a mark found
+        # One of the chain's audits has a run going, whatever started it, including the run a mark found
         # already going; the chain waits its turn, as the schedule does.
         return save()
     holds = audit_holds(data_dir)
@@ -602,14 +626,17 @@ def first_run_audits(data_dir: Path, now: float) -> None:
 
 def finished(data_dir: Path, now: float) -> bool:
     """Every stage is done, and the report was claimed long enough ago that no run still posts it,
-    and on the conversation path its post recorded an outcome."""
-    if not read_state(data_dir).get(STATE_DONE):
+    and on the conversation path its post recorded an outcome, and no lost summary can still be
+    re-sent (``bootstrap_delivery.pending_resends``, which its window bounds)."""
+    state = read_state(data_dir)
+    if not state.get(STATE_DONE):
         return False
     claimed = bootstrap_delivery._completed_at(data_dir)
     return (
         claimed is not None
         and now - claimed >= bootstrap_delivery.RETIRE_AFTER_SECONDS
         and bootstrap_delivery.delivery_settled(data_dir)
+        and not bootstrap_delivery.pending_resends(data_dir, state, now)
     )
 
 
@@ -627,6 +654,7 @@ def main(data_dir: Path | None = None, now: float | None = None) -> int:
     code = bootstrap_delivery.main(data_dir)
     _quiet_stage("scan", bootstrap_scan_gate.main, data_dir)
     _quiet_stage("first-run audits", first_run_audits, data_dir, now)
+    _quiet_stage("lost summaries", bootstrap_delivery.resend_lost_summaries, data_dir, now)
     return code
 
 

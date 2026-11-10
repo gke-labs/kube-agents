@@ -10,8 +10,12 @@
 #
 # What this file adds on top of that catalogue is the part fixtures.json does
 # not carry: the day-N availability gate below, and the fixtures that are not
-# on a cluster at all (`orphan-disks`, `startup-fail-vm` and `world-open-ingress` are project-scoped,
-# so they have no cluster slot and no entry in a catalogue keyed by one).
+# on a cluster at all (`orphan-disks`, `startup-fail-vm` and
+# `world-open-ingress` are project-scoped, so they have no cluster slot).
+# fixtures.json carries `startup-fail-vm` and `world-open-ingress` as
+# project-scoped roles (`cluster_slot: null`), which the runner probes in the
+# project with gcloud; `orphan-disks` is in this file alone. A project-scoped
+# role in fixtures.json must appear here with `slot: null`.
 #
 # A case names a fixture by role and never by a cluster name or a project id.
 # Each eval project carries its own set of clusters (`bench/tf/fleet/`,
@@ -43,7 +47,7 @@ slots:
     carries: The held-back control plane, and the upgrade-readiness drain defects
   - slot: c
     suffix: c
-    carries: The configuration outlier, and no workloads
+    carries: The configuration outlier, on the control plane and its default pool, and no workloads
   - slot: d
     suffix: d
     carries: Nodes in two zones, and the zonal-skew workloads
@@ -236,11 +240,14 @@ fixtures:
       enrolled in REGULAR, which is what makes the lag visible to the upgrade
       SOP's master-behind check at all. Held between reconciles by a
       NO_MINOR_UPGRADES maintenance exclusion. The pin is drawn from REGULAR's
-      own list and held when the running patch is one REGULAR does not carry,
-      so the held version can be absent from REGULAR; while another roster or
-      validMasterVersions still offers it (so on 2026-10-14; nothing in the
-      stack keeps it) upgrade check 3.1 branch (a) does not fire and the
-      cluster carries branch (b) at major. See
+      own list on a create and is the running version inside the lag minor,
+      so once REGULAR moves past the running patch the version stays absent
+      from REGULAR until GKE's own patch auto-upgrade moves it; while another
+      roster or validMasterVersions still offers it (so on 2026-10-14; nothing
+      in the stack keeps it) upgrade check 3.1 branch (a) does not fire and
+      the cluster carries branch (b) at major. A held version newer than every
+      REGULAR patch of its minor is drift (`not_ahead_of_channel` in
+      fixtures.json): agents read it as current or ahead, not behind. See
       docs/designs/bench-fleet-catalog.md.
 
   - role: drift-outlier
@@ -253,7 +260,55 @@ fixtures:
       open-for-eval block. The drift SOP excludes a cluster whose createTime is
       under 24 hours old from every cohort, and its cohort floor is three
       clusters: replacing c silences the finding for a day, and so does
-      replacing any cluster on a project whose fleet predates slot d.
+      replacing any cluster on a project whose fleet predates slot d. The
+      hourly scan reports a c under a day old as drift.
+
+  - role: drift-pool-outlier
+    slot: c
+    available_from_day: 1
+    objects:
+      - cluster/self
+    defect: >-
+      Slot c's default pool on a 50 GB boot disk with kubeletConfig.cpuCfsQuota
+      false, where every other pool in the fleet runs a 20 GB disk and no
+      kubelet block, planted ahead of the boot-disk and kubelet-config drift
+      facets, which the drift SOP does not read yet. Day 1 as for drift-outlier,
+      the cohort's 24-hour age gate. A separate role, so this half drifting
+      excuses nothing from the case that lists drift-outlier; until the
+      reconcile rolls the change every project reads it drifted.
+
+  - role: drift-peer-a
+    slot: a
+    available_from_day: 1
+    objects:
+      - cluster/self
+    defect: >-
+      Not a defect: slot a's master authorized networks on, with the
+      open-for-eval block, one of the majority drift-outlier is outvoted by.
+      The hourly scan asserts the block. Its age is not asserted: one new peer
+      leaves seeded-c outvoted 2/3 by the other two.
+
+  - role: drift-peer-b
+    slot: b
+    available_from_day: 1
+    objects:
+      - cluster/self
+    defect: >-
+      Not a defect: slot b's master authorized networks on, with the
+      open-for-eval block, one of the majority drift-outlier is outvoted by.
+      The hourly scan asserts the block. Its age is not asserted: one new peer
+      leaves seeded-c outvoted 2/3 by the other two.
+
+  - role: drift-peer-d
+    slot: d
+    available_from_day: 1
+    objects:
+      - cluster/self
+    defect: >-
+      Not a defect: slot d's master authorized networks on, with the
+      open-for-eval block, one of the majority drift-outlier is outvoted by.
+      The hourly scan asserts the block. Its age is not asserted: one new peer
+      leaves seeded-c outvoted 2/3 by the other two.
 
   - role: readiness-surge-blocked
     slot: b
@@ -286,6 +341,21 @@ fixtures:
       A PodDisruptionBudget with maxUnavailable 0 over the pinned workload, so
       disruptionsAllowed is 0 permanently and no drain that touches it can
       finish.
+
+  - role: readiness-lb-drain-timeout
+    slot: b
+    available_from_day: 0
+    objects:
+      - backendservice/drain-timeout-<prefix>-b
+      - healthcheck/drain-timeout-<prefix>-b
+    defect: >-
+      A Compute Engine backend service on the default pool's instance group
+      whose connection draining timeout is 720 seconds, a fifth over the 600
+      seconds GKE waits per node during a pool upgrade, behind a TCP health
+      check and no forwarding rule, so it routes nothing and costs nothing;
+      every default-pool node recreate on this cluster waits the 720 seconds
+      on it, which stays under the 30 minutes after which GKE fails the node
+      step.
 
   - role: readiness-failclosed-webhook
     slot: b
@@ -331,7 +401,15 @@ fixtures:
     objects:
       - nodepool/default-pool
     defect: >-
-      Not a defect: seeded-a's default pool itself, two e2-standard-2 nodes asserted to keep 100m CPU unrequested each so the next planted fixture can place; the one role whose drift means the pool is within ten fixtures of full and a re-apply changes nothing
+      Not a defect: seeded-a's default pool itself, three e2-standard-2 nodes asserted to keep 100m CPU unrequested each so the next planted fixture can place; the one role whose drift means the pool is within ten fixtures of full and a re-apply changes nothing
+
+  - role: config-connector-namespaced
+    slot: a
+    available_from_day: 0
+    objects:
+      - configconnector/configconnector.core.cnrm.cloud.google.com
+    defect: >-
+      Not a defect: the GKE Config Connector add-on on seeded-a, with its ConfigConnector object in namespaced mode. The Config Connector eval cases plant their objects on this cluster, each in a namespace of its own with a ConfigConnectorContext that names the kcc-eval-context service account, which holds no project role
 
   - role: intree-pd-volume
     slot: a
@@ -408,6 +486,19 @@ fixtures:
     defect: >-
       cuda-pinned-trainer CronJob, suspended: requests one GPU on an nvidia-l4 pool with an image pinned to CUDA 12.2, so its manifest carries the driver dependency without ever running
 
+  - role: scaled-zero-gateway
+    slot: a
+    available_from_day: 0
+    objects:
+      - deployment/storefront
+      - deployment/envoy-seeded-scaled-zero-storefront-edge
+      - service/storefront
+      - gateway/storefront-edge
+      - httproute/storefront
+    namespace: seeded-scaled-zero
+    defect: >-
+      Not a defect: an environment switched off on purpose. The backend and the Gateway's proxy Deployment are at replicas 0, and the Gateway reports Programmed=False (NoResources), the status Envoy Gateway v1.9.2 wrote for that shape. No controller runs. A stall check that reports it is wrong
+
   - role: zonal-skew-scheduling
     slot: d
     available_from_day: 0
@@ -434,6 +525,7 @@ fixtures:
     available_from_day: 0
     objects:
       - deployment/capacity-starved-worker
+      - deployment/first-zone-sponge
     namespace: seeded-topology
     defect: >-
       Four replicas at 120m CPU against two e2-small nodes, so those that do

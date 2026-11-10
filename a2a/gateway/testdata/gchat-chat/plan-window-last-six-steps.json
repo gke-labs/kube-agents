@@ -1,0 +1,8 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "text": "⚙️ n9 · step 10 ▸\n  ✓ n4\n  ✓ n5\n  ✓ n6\n  ✓ n7\n  ✓ n8\n  ◌ n9",
+    "widgets": null
+  }
+]

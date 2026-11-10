@@ -467,6 +467,7 @@ def report_message(
     after_rows: str = "",
     fold_title: str = "",
     fold_rows: Sequence[Any] = (),
+    replies: Mapping[str, str] | None = None,
 ) -> dict:
     """:func:`slack_presenter.blocks_report`'s report: the first choice primary, links after.
 
@@ -475,7 +476,11 @@ def report_message(
     ``detail``, as a needs-you question keeps an option it cannot offer.
     ``fold_rows`` go under ``fold_title`` as the fold's text, a row each
     (its severity as inline code, its detail on the line under it).
+    ``replies`` gives a choice, by its label, the longer turn its click posts;
+    a reply :func:`_choice` refuses leaves the choice's label as its turn.
     """
+    # Keyed as `kept` spells the labels, by the same function, so a lookup by a kept label finds its reply.
+    replies = {spelled: reply for label, reply in (replies or {}).items() for spelled in _presenter._choice_labels([label])}
     shown = _presenter._shown(rows)[:ROWS_MAX]
     kept, left = _usable(choices)
     detail_line = _presenter._clip(_line(_presenter._plain(detail or "")), _presenter.ROW_TEXT_MAX)
@@ -496,7 +501,10 @@ def report_message(
         rows=[_row(row) for row in shown],
         after=after[:AFTER_MAX],
         fold=fold,
-        choices=[_choice(label, primary=not i) for i, label in enumerate(kept[:CHOICES_MAX])],
+        choices=[
+            _choice(label, reply=replies.get(label, ""), primary=not i) or _choice(label, primary=not i)
+            for i, label in enumerate(kept[:CHOICES_MAX])
+        ],
         links=_links(links),
     )
 
@@ -594,7 +602,8 @@ def triage_message(triage: Mapping[str, Any], fold_text: str) -> dict | None:
     """``slack_ux_incident.parse_triage``'s result as the alert's edit, or None when it cannot fold.
 
     Each label is the option's title, the recommended one primary rather than suffixed, and its reply
-    starts with that label: "<label> — apply Option B".
+    starts with that label: "<label> — apply Option B". A ``detail`` (a drift alert's what, who and
+    when, ``slack_ux_incident.drift_triage``) sits under the headline.
     """
     if len(fold_text) > FOLD_TEXT_MAX:
         return None
@@ -609,6 +618,7 @@ def triage_message(triage: Mapping[str, Any], fold_text: str) -> dict | None:
         return None
     return message(
         headline=_headline(triage["headline"]),
+        detail=str(triage.get("detail") or "")[:DETAIL_MAX],
         fold={"title": str(triage.get("fold_title") or FOLD_TITLE_DEFAULT)[:FOLD_TITLE_MAX], "text": fold_text},
         choices=choices,
         links=_links([(TRIAGE_LINK_LABEL.format(label=label), url) for label, url in triage.get("links") or ()]),
@@ -619,5 +629,5 @@ def triage_text(triage: Mapping[str, Any], report: str) -> str:
     """The alert edit's fallback: the headline, what each button sends, then the report."""
     replies = [_triage_reply(_presenter._clip(_line(str(label).removesuffix(RECOMMENDED_SUFFIX)), _presenter.BUTTON_TEXT_MAX), reply)
                for label, reply, _rec in triage["choices"]]
-    head = "\n".join([_headline(triage["headline"]), *replies])
+    head = "\n".join([_headline(triage["headline"]), *([triage["detail"]] if triage.get("detail") else []), *replies])
     return f"{head}\n\n{report}"

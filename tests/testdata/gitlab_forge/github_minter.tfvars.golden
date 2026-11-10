@@ -102,6 +102,7 @@ slack_app_token         = ""
 slack_allowed_users     = []
 slack_home_channel      = ""
 slack_home_channel_name = ""
+slack_home_channel_policy = ""
 
 github_repo = "acme/infra"
 enable_github_minter = false
@@ -109,9 +110,12 @@ github_app_id        = "123"
 
 enable_gke_backup_plan = false
 
+helm_upgrade_install = false
+
 # The CRD defaults dashboardEnabled to true; the installer has always
 # defaulted it to false and asks. Memory settings mirror --memory.
 hermes_dashboard_enabled = false
+web_console_enabled      = false
 memory_enabled           = false
 memory_provider          = "multiuser_memory"
 user_profile_enabled     = false

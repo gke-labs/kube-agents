@@ -142,6 +142,24 @@ class MinterGuardTest(unittest.TestCase):
         self.assertEqual(rc, 0, log)
         self.assertEqual(parse(text)["GITHUB_APP_ID"], "12345")
 
+    def test_an_environment_with_the_minter_names_the_project_wide_key(self):
+        """A rebuild has no minter in state, so unnamed it would derive new names; it names the old ones."""
+        rc, log, text = render(
+            {**_COORDS, **_STRICT_OK, "GITHUB_APP_ID": "12345",
+             "GITOPS_ORG": "gke-agentic", "GITOPS_REPO": "gke-fleet-iac"},
+            strict=True)
+        self.assertEqual(rc, 0, log)
+        got = parse(text)
+        self.assertEqual((got["KMS_KEYRING"], got["KMS_KEY"], got["GITHUB_MINTER_GSA_NAME"]),
+                         ("github-token-minter-keyring", "github-token-minter-key", "kubeagents-github-minter-gsa"))
+        # Names the environment sets are kept, and an install without a minter gets none.
+        _, _, text = render(
+            {**_COORDS, **_STRICT_OK, "GITHUB_APP_ID": "12345", "GITOPS_ORG": "o", "GITOPS_REPO": "r",
+             "KMS_KEYRING": "env-ring", "KMS_KEY": "env-key"}, strict=True)
+        self.assertEqual((parse(text)["KMS_KEYRING"], parse(text)["KMS_KEY"]), ("env-ring", "env-key"))
+        _, _, text = render({**_COORDS, **_STRICT_OK}, strict=True)
+        self.assertNotIn("KMS_KEYRING", parse(text))
+
     def test_none_of_the_three_is_an_install_without_a_minter(self):
         rc, log, _ = render({**_COORDS, **_STRICT_OK}, strict=True)
         self.assertEqual(rc, 0, log)
@@ -290,21 +308,13 @@ class DefaultOnKeysAreRefusableTest(unittest.TestCase):
     """
 
     # Keyed by the install.env name, valued by why MAPPING does not carry it.
-    # Both are pre-existing and neither is this file's to fix; they are listed
-    # so that the next `true` default has to be argued about rather than added.
+    # Listed so that the next `true` default has to be argued about rather
+    # than added.
     _NOT_MAPPED = {
         # Chooses where secrets go -- terraform.tfvars, or TF_VAR_* in the
         # process environment. Provisions nothing either way, so an environment
         # that cannot override it loses no cloud resource by the omission.
         "PERSIST_SECRETS_ON_DISK",
-        # The same shape as the drift key and genuinely unaddressed: the default
-        # enables the Vertex API on the serving project and grants the gateway's
-        # role there, so an omission acts on a project rather than skipping it,
-        # and a long-lived environment has no variable that declines. Narrower
-        # in that nothing happens unless model_provider is vertex_ai. Left as it
-        # was found -- flipping one default is not licence to widen the audit --
-        # and tracked as issue #2269, which is what removes this entry.
-        "VERTEX_MANAGE_SERVING_PROJECT",
     }
 
     def test_every_default_true_boolean_can_be_refused_by_an_environment(self):
@@ -365,11 +375,30 @@ class RenderingTest(unittest.TestCase):
             **_COORDS,
             "ENABLE_PUBSUB_PLATFORM": "true",
             "ENABLE_STOCKOUT_INVESTIGATOR": "false",
+            "WEB_CONSOLE_ENABLED": "true",
         })
         self.assertEqual(rc, 0, log)
         rendered = parse(text)
         self.assertEqual(rendered["ENABLE_PUBSUB_PLATFORM"], "true")
         self.assertEqual(rendered["ENABLE_STOCKOUT_INVESTIGATOR"], "false")
+        self.assertEqual(rendered["WEB_CONSOLE_ENABLED"], "true")
+
+    def test_helm_upgrade_install_is_rendered_when_set_and_omitted_when_not(self):
+        """Opt-in per environment (#4108): unset leaves the key out, so the
+        installer's default (false) answers, and set reaches install.env."""
+        rc, log, text = render(dict(_COORDS))
+        self.assertEqual(rc, 0, log)
+        self.assertNotIn("HELM_UPGRADE_INSTALL", parse(text))
+        rc, log, text = render({**_COORDS, "HELM_UPGRADE_INSTALL": "true"})
+        self.assertEqual(rc, 0, log)
+        self.assertEqual(parse(text)["HELM_UPGRADE_INSTALL"], "true")
+
+    def test_helm_upgrade_install_is_not_required_under_strict(self):
+        """Absent keeps today's behaviour and destroys nothing, so a strict
+        render must not ask for it."""
+        rc, log, _ = render({**_COORDS, **_STRICT_OK}, strict=True)
+        self.assertEqual(rc, 0, log)
+        self.assertNotIn("HELM_UPGRADE_INSTALL", log)
 
     def test_the_github_side_names_are_translated_to_installer_names(self):
         rc, log, text = render(dict(_COORDS))
@@ -410,6 +439,10 @@ class RenderingTest(unittest.TestCase):
     def test_google_chat_home_channel_is_mapped(self):
         _, _, text = render({**_COORDS, "GOOGLE_CHAT_HOME_CHANNEL": "spaces/TEST12345"})
         self.assertEqual(parse(text)["GOOGLE_CHAT_HOME_CHANNEL"], "spaces/TEST12345")
+
+    def test_slack_home_channel_policy_is_mapped(self):
+        _, _, text = render({**_COORDS, "SLACK_HOME_CHANNEL_POLICY": "manual"})
+        self.assertEqual(parse(text)["SLACK_HOME_CHANNEL_POLICY"], "manual")
 
     def test_the_file_is_not_readable_by_anyone_else(self):
         """It carries the model provider's API key and the Slack tokens."""

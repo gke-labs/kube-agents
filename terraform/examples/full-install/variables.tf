@@ -26,7 +26,7 @@ variable "create_cluster" {
 }
 
 variable "accept_no_network_policy" {
-  description = "With create_cluster = false, install onto a cluster that enforces no NetworkPolicy instead of refusing the plan. The cluster is left as it is; every NetworkPolicy the install ships — the agent's ingress and egress confinement, the shell sandbox's deny-all, LiteLLM's, the minter's, Hindsight's — is accepted by the API server and enforced by nothing. The choice is stamped onto the PlatformAgent as the kubeagents.x-k8s.io/network-policy-enforcement annotation so it outlives the run. install.sh sets this from --accept-no-network-policy. No effect on a created cluster or one that already enforces."
+  description = "With create_cluster = false, install onto a cluster that enforces no NetworkPolicy instead of refusing the plan. The cluster is left as it is; every NetworkPolicy the install ships — the agent's ingress and egress confinement, the shell sandbox's deny-all, LiteLLM's, the minter's, Hindsight's, the web console's — is accepted by the API server and enforced by nothing (and web_console_enabled = true is refused when NetworkPolicy is not enforced). The choice is stamped onto the PlatformAgent as the kubeagents.x-k8s.io/network-policy-enforcement annotation so it outlives the run. install.sh sets this from --accept-no-network-policy. No effect on a created cluster or one that already enforces."
   type        = bool
   default     = false
 }
@@ -46,6 +46,66 @@ variable "gvisor_pool_name" {
   description = "Name of the gVisor node pool."
   type        = string
   default     = "gvisor-pool"
+}
+
+variable "sizing_profile" {
+  description = "Shape of the Standard cluster's node pools when no explicit machine type or disk size is given: \"small\" (today's rendering), \"medium\" or \"fleet\"; null (the default) and \"\" (a blanked TF_VAR_ line) are \"small\" in the module; the gke-cluster module's README, \"Sizing the node pools\", has each profile's machine types and disks. An explicit standard_* or gvisor_* value wins over the profile. Null rather than \"small\" here so lifecycle.sh's guard_node_pool_shape can tell a profile the operator named from a lost TF_VAR_ line. Passed through to the gke-cluster module; Standard mode only."
+  type        = string
+  default     = null
+}
+
+variable "standard_machine_type" {
+  description = "Machine type for the Standard cluster's default node pool; null takes the sizing_profile's. Passed through to the gke-cluster module."
+  type        = string
+  default     = null
+}
+
+variable "standard_node_count" {
+  description = "Node count per zone the Standard cluster's default node pool is created with: the cluster's initial_node_count, ForceNew on the cluster itself, so a changed value on a live cluster plans the cluster's destruction and recreation, which lifecycle.sh's guard_standard_node_count refuses. Passed through to the gke-cluster module."
+  type        = number
+  default     = 1
+}
+
+variable "standard_disk_size_gb" {
+  description = "Boot disk size in GB for the Standard cluster's default node pool; null takes the sizing_profile's. Passed through to the gke-cluster module."
+  type        = number
+  default     = null
+}
+
+variable "standard_disk_type" {
+  description = "Boot disk type for the Standard cluster's default node pool (pd-standard, pd-balanced, pd-ssd or hyperdisk-balanced); null is pd-balanced. Passed through to the gke-cluster module."
+  type        = string
+  default     = null
+}
+
+variable "gvisor_machine_type" {
+  description = "Machine type for the gVisor node pool; null takes the sizing_profile's. Passed through to the gke-cluster module."
+  type        = string
+  default     = null
+}
+
+variable "gvisor_min_node_count" {
+  description = "Lower autoscaling bound of the gVisor node pool, per zone, and the size it is created at. Passed through to the gke-cluster module."
+  type        = number
+  default     = 1
+}
+
+variable "gvisor_max_node_count" {
+  description = "Upper autoscaling bound of the gVisor node pool, per zone; equal to gvisor_min_node_count keeps the pool at a fixed size. Passed through to the gke-cluster module."
+  type        = number
+  default     = 2
+}
+
+variable "gvisor_disk_size_gb" {
+  description = "Boot disk size in GB for the gVisor node pool; null takes the sizing_profile's. Passed through to the gke-cluster module."
+  type        = number
+  default     = null
+}
+
+variable "gvisor_disk_type" {
+  description = "Boot disk type for the gVisor node pool (pd-standard, pd-balanced, pd-ssd or hyperdisk-balanced); null is pd-balanced. Passed through to the gke-cluster module."
+  type        = string
+  default     = null
 }
 
 variable "agent_runtime_class" {
@@ -94,6 +154,12 @@ variable "namespace" {
   description = "Kubernetes namespace the kube-agents release is installed into and the Workload Identity binding targets. Leave at the default: the agent's model-gateway endpoint is hard-wired to kubeagents-system (see the chart's values.yaml), so a release in any other namespace leaves the agent unable to reach the gateway."
   type        = string
   default     = "kubeagents-system"
+}
+
+variable "helm_upgrade_install" {
+  description = "Install the kube-agents release with `helm upgrade --install` semantics (opt-in), so an apply whose state lost a live release adopts it instead of failing with \"cannot re-use a name that is still in use\" (#4108). It also silently takes over a release of the same name that another Terraform state or a manual `helm install` owns in the namespace, so set it only on a long-lived environment whose own state owns the release."
+  type        = bool
+  default     = false
 }
 
 # With one bundle left, this no longer selects between bundles: `read-only` takes
@@ -387,6 +453,34 @@ variable "model_max_tokens" {
   }
 }
 
+variable "litellm_budget" {
+  description = "The LiteLLM gateway's spend ceiling, the chart's litellm.budget: usd is the most the gateway spends, in US dollars as LiteLLM prices each response, in every window of period (a LiteLLM duration: a whole number and s, m, h, d, w or mo). Rendered only while usd is above 0, so an install without a ceiling keeps the gateway config it had; the chart splits the ceiling evenly across the gateway's replicas, and a replica whose share is spent refuses model calls until its window ends. What the agent sees and how to read the remaining budget: the site's inference-gateway page, \"Setting a spend ceiling\"."
+  type = object({
+    usd    = optional(number, 0)
+    period = optional(string, "1d")
+  })
+  nullable = false
+  default  = {}
+
+  # The same checks as the chart's values.schema.json, so a bad value fails the
+  # plan rather than the helm_release apply. The period is checked only beside
+  # an amount above zero: the chart reads it then and not otherwise.
+  # 0.01 is the least a ceiling can be when it is on: the chart splits the
+  # amount across the gateway replicas and renders each share with four
+  # decimals, refusing a share that rounds to 0 at the helm_release apply. A
+  # cent keeps the share above that floor at up to 100 replicas, and the
+  # refusal happens at the plan. The installer's LITELLM_BUDGET_MIN_USD and the
+  # chart's values.schema.json carry the same floor.
+  validation {
+    condition     = var.litellm_budget.usd == 0 || var.litellm_budget.usd >= 0.01
+    error_message = "litellm_budget.usd must be 0 (no ceiling) or an amount in US dollars of at least 0.01."
+  }
+  validation {
+    condition     = var.litellm_budget.usd == 0 || can(regex("^[1-9][0-9]*(s|m|h|d|w|mo)$", var.litellm_budget.period))
+    error_message = "litellm_budget.period must be a LiteLLM duration: a whole number and s, m, h, d, w or mo, such as 1d."
+  }
+}
+
 variable "alert_daily_limits" {
   description = "Daily alert ceilings for the Platform Agent, one per bucket: critical, warning, info and drift. The chart renders each key that is set as ALERT_DAILY_LIMIT_<KEY> in the PlatformAgent's spec.deployment.env. A key that is not set keeps the default in the agent image, and 0 removes the cap for that bucket. Each apply that changes the env list that the chart renders replaces the full env list on the CR, and entries added to the CR by hand are lost; set those through platformAgent.deployment.env in extra_helm_values. Buckets, defaults and a sizing method: the site's chatops page, \"Daily alert ceiling\"."
   # A map, not an object type: Terraform drops an unknown attribute of an
@@ -615,6 +709,16 @@ variable "slack_home_channel_name" {
   default     = ""
 }
 
+variable "slack_home_channel_policy" {
+  description = "\"auto\" (also empty) or \"manual\". Under platform_agent_mode next with Slack on the gateway (Google Chat not enabled) and slack_home_channel empty, \"auto\" lets the A2A gateway make the channel of the first top-level mention of the agent the home channel; \"manual\" leaves slack_home_channel alone to decide. A set slack_home_channel wins under either. Only used when enable_slack is true."
+  type        = string
+  default     = ""
+  validation {
+    condition     = contains(["", "auto", "manual"], var.slack_home_channel_policy)
+    error_message = "slack_home_channel_policy must be \"\", \"auto\" or \"manual\"."
+  }
+}
+
 variable "chat_topic_name" {
   description = "Pub/Sub topic for Google Chat events. The default matches the chat-pubsub module and the chart."
   type        = string
@@ -631,6 +735,12 @@ variable "hermes_dashboard_enabled" {
   description = "Whether the Hermes Web UI dashboard is enabled on the agent. null leaves the field out of the CR so the CRD default (true) applies."
   type        = bool
   default     = null
+}
+
+variable "web_console_enabled" {
+  description = "Whether to deploy the in-cluster web console, a browser chat page for the Platform Agent reached by kubectl port-forward. Maps to the chart's webConsole.enabled."
+  type        = bool
+  default     = false
 }
 
 variable "memory_enabled" {
@@ -729,6 +839,28 @@ variable "github_minter_kms_key" {
   description = "Cloud KMS asymmetric signing key the minter signs GitHub App JWTs with. The App private key is imported into it outside Terraform."
   type        = string
   default     = "github-token-minter-key"
+}
+
+variable "github_minter_shared_kms_key" {
+  description = "A minter signing key this install shares on purpose, as <keyring>/<key>: one provisioned for the project outside any install, as the CI pool projects' is. lifecycle.sh's adoption step imports a minter key ring or key that another install's labels claim, or that carries no owner labels, only when it is the one named here. Empty adopts only this install's own. When it names the key this install uses, the composition sets no owner labels on that key, so they stay its owner's."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = can(regex("^$|^[a-zA-Z0-9_-]{1,63}/[a-zA-Z0-9_-]{1,63}$", var.github_minter_shared_kms_key))
+    error_message = "github_minter_shared_kms_key must be empty or <keyring>/<key>."
+  }
+}
+
+variable "github_minter_adopt_unlabelled_kms_key" {
+  description = "A minter signing key with no owner labels that this install adopts as its own, as <keyring>/<key>. The installer sets it when the key ring and key were named explicitly (KMS_KEYRING and KMS_KEY), and the apply then labels the key as this install's. A key another install's labels claim is refused whatever this says. Terraform itself reads nothing from it."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = can(regex("^$|^[a-zA-Z0-9_-]{1,63}/[a-zA-Z0-9_-]{1,63}$", var.github_minter_adopt_unlabelled_kms_key))
+    error_message = "github_minter_adopt_unlabelled_kms_key must be empty or <keyring>/<key>."
+  }
 }
 
 variable "github_app_id" {

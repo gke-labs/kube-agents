@@ -1,13 +1,13 @@
 """The onboarding sweep's hand-off to ranking, run by ``bootstrap_scan_gate.py``.
 
 After the gate files the sweep card, this module runs once a minute on the
-gate's tick: it files one ``bootstrap-inventory-cluster-*`` card per Cluster
-Agent, waits for those cards and the sweep to settle, writes
+gate's tick: it files one ``bootstrap-inventory-cluster-*`` card per carded
+Cluster Agent (up to the first-run cap), waits for those cards and the sweep to settle, writes
 ``INVENTORY.raw.md`` from their structured ``metadata``, and files the
 ``bootstrap-inventory-prioritize`` card that ranks it into the report the user
 receives — or, when no cluster's audit reached the raw file, writes that report
 itself, saying so, and files no ranking card. The sweep's worker only lists the fleet and audits any cluster with
-no Cluster Agent.
+no Cluster Agent, and the clusters past the first-run cap (#3702).
 
 It is code rather than SOP text because each of these steps is mechanical
 and the worker could not do them reliably: it has no tool that waits
@@ -39,8 +39,37 @@ from pathlib import Path
 CLUSTER_KEY_PREFIX = "bootstrap-inventory-cluster-"
 PRIORITIZE_KEY = "bootstrap-inventory-prioritize"
 ASSIGNEE = "platform"
+# The board stamp the onboarding cards carry (docs/designs/proposal-origin.md
+# §2.1): the chat bootstrap is chat work. Passed to the board as a one-time stamp
+# ticket minted for the create (hermes_cli/kanban_origin.py), never as an
+# argument of the create command.
+CARD_ORIGIN = "chat"
 RAW_PATH = "/opt/data/INVENTORY.raw.md"
 REPORT_PATH = "/opt/data/INVENTORY.md"
+# Where the sweep worker's collector leaves each audited cluster's Step 5
+# object (cluster_inventory_collect.py writes it, under the sandbox's
+# /opt/data): one file per cluster, named by the identity the hand-off can
+# predict, so the object never travels through the worker's completion call,
+# which has relayed it partial (gemini-4-argon) and as booleans
+# (gemini-3.8-flash, #4115). The two copies of the format are held equal by
+# test_cluster_inventory_collect.py.
+SWEEP_DIR = "/opt/data/INVENTORY.sweep"
+SWEEP_FILE_FORMAT = "{project}__{location}__{cluster}.json"
+# Above the largest object seen (a 46-workload cluster is about 30 KB); a
+# file over this is a gap, never a partial object.
+SWEEP_FILE_MAX_BYTES = 1 << 20
+# The fields the file must carry for the hand-off to take it over the card's
+# copy: the collector's two stamps, both required (a file with no sweep id
+# could be any login's write at the predicted path), and the identity it was
+# asked for.
+SWEEP_FILE_STAMP_AT = "collected_at"
+SWEEP_FILE_STAMP_SWEEP = "sweep_id"
+# A file is read only for an identity whose every component is a bare name: a
+# project id, a location and a GKE cluster name hold these characters, and a
+# `/` or an empty field would move the path out of SWEEP_DIR. The collector
+# refuses the same shapes before it writes.
+IDENTITY_FIELDS = ("project", "location", "cluster")
+IDENTITY_COMPONENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]*")
 # inventory_findings.py's DEFAULT_LIMITS_PATH, which its `select` reads;
 # test_bootstrap_handoff.py holds the two copies equal.
 LIMITS_PATH = "/opt/data/INVENTORY.limits.json"
@@ -57,6 +86,10 @@ CLUSTER_AUDIT_INSTRUCTIONS_PATHS = (
 HANDOFF_MARKER = ".bootstrap_handoff_filed"
 MARKER_FIELD = re.compile(r"^(\w+)=(\S+)$")
 MARKER_LINE = re.compile(r"^\s*(\w+)\s*=\s*(\S+)\s*$")
+# A Cluster Agent card's key as the gate builds it: the prefix and a profile
+# name, which cluster_agent_profile._validate holds to these characters. No
+# comma, so the marker's `carded=` list splits on one.
+CLUSTER_KEY = re.compile(rf"^{re.escape(CLUSTER_KEY_PREFIX)}[a-zA-Z0-9._-]+$")
 BOARD_FILE = "kanban.db"
 SQLITE_BUSY_TIMEOUT_SECONDS = 10
 
@@ -84,6 +117,28 @@ DEADLINE_SECONDS = 3600
 # an hour is not cut off while its cards are only queued.
 DEADLINE_PER_CARD_SECONDS = 300
 SECONDS_PER_MINUTE = 60
+
+# How many per-cluster audit cards one first-run sweep files (#3702). Each card
+# is a model turn before the user has asked anything: 200 Cluster Agents filed
+# 200 turns in 44 minutes (c1913-20261021). Past the cap, a cluster is not on
+# the sweep card's roster, so the sweep's worker audits it the way it audits a
+# cluster with no ready Cluster Agent. Six is the board's worker concurrency in
+# that run, so the cards finish in one wave. The long-term value comes from the
+# sizing budget function (#3753); until then an operator can set it in this file
+# under the data dir. It is read when the sweep is filed, which records it in its
+# marker, and that value holds for the sweep (marker_cap). No model tool can write it: the file tools run in the
+# shell sandbox, which has its own volume, and it is read here in the agent pod. Absent, malformed, zero or negative means the default,
+# and the value is clamped to FIRST_RUN_CLUSTER_CARDS_MAX, so the file cannot
+# uncap the scan.
+FIRST_RUN_CLUSTER_CARDS = 6
+FIRST_RUN_CLUSTER_CARDS_MAX = 24
+FIRST_RUN_CLUSTER_CARDS_FILE = ".first_run_cluster_cards"
+# How much of a malformed cap file the log line quotes.
+MAX_LOGGED_CHARS = 40
+# The most uncarded agents the deadline will budget for: it bounds how much
+# time a hand-edited marker can add to the hand-off's wait. A larger count is
+# read as this many.
+FIRST_RUN_UNCARDED_MAX = 1000
 
 SANDBOX_TIMEOUT_SECONDS = 30
 # Absolute paths, so nothing the model left in the sandbox shadows them.
@@ -182,6 +237,95 @@ def read_scan_marker(marker: Path, now: float | None = None) -> tuple[str, float
     return sweep_id, filed_at
 
 
+def uncarded_agents(marker: Path) -> int:
+    """How many ready Cluster Agents the first-run cap left without a card (#3702), from the marker.
+
+    The gate records it when it files the sweep, so the hand-off's time limit
+    still budgets for those clusters, which the sweep's worker now audits
+    itself. Zero when the marker does not say, or says something that is not
+    a positive whole number; never more than FIRST_RUN_UNCARDED_MAX.
+    """
+    try:
+        value = int(_read_marker(marker).get("uncarded", "0"))
+    except ValueError:
+        return 0
+    return min(value, FIRST_RUN_UNCARDED_MAX) if value > 0 else 0
+
+
+def marker_cap(marker: Path) -> int | None:
+    """The first-run cap the sweep was filed under (#3702), from the marker; None when it records none.
+
+    The gate records it when it files the sweep, and the hand-off holds to it
+    for that sweep: the sweep card already told its worker to audit the
+    clusters past it, so a cap raised mid-sweep would card them as well and
+    they would be audited twice. None for a sweep filed by an older build,
+    whose caller falls back to the file, or a marker that cannot be read. A
+    value is read the way the file's is: not a whole number or below one is
+    the default, and it is never more than FIRST_RUN_CLUSTER_CARDS_MAX.
+    """
+    try:
+        raw = _read_marker(marker).get("cap")
+    except ValueError:  # not UTF-8
+        return None
+    return None if raw is None else _clamp_cap(raw, f"{marker}'s cap=")
+
+
+def carded_keys(marker: Path) -> frozenset[str] | None:
+    """The keys of the Cluster Agents the sweep card listed for cards (#3702), from the marker; None when it records none.
+
+    The gate records them when it files the sweep, and the hand-off files cards
+    for those agents only: the card told its worker to audit every other
+    cluster, so a profile that became ready since, or one that sorts into a
+    slot a failed or archived card left, must not get a card as well. None for
+    a sweep filed by an older build, one whose roster listing came back empty
+    when it was filed (the gate pins nothing then), or a marker that cannot be
+    read, which keeps the cap as the only bound. An entry that is not a cluster card key
+    is dropped rather than read as no list, so a damaged ``carded=`` narrows
+    the set and never widens it; at most FIRST_RUN_CLUSTER_CARDS_MAX are kept.
+    """
+    try:
+        raw = _read_marker(marker).get("carded")
+    except ValueError:  # not UTF-8
+        return None
+    if raw is None:
+        return None
+    keys = [k for k in raw.split(",") if CLUSTER_KEY.match(k)]
+    return frozenset(keys[:FIRST_RUN_CLUSTER_CARDS_MAX])
+
+
+def uncarded_budget(scan_marker: Path, cap: int, full_roster=None) -> int:
+    """How many uncarded clusters the hand-off's time limit budgets for (#3702).
+
+    The marker's ``uncarded=`` when the gate pinned the sweep (it recorded
+    ``uncarded=`` or ``carded=``). A sweep it did not pin, because the listing
+    came back empty when it was filed (failed, or no Cluster Agent yet), or an
+    older build filed it, has no count, yet its worker was told to audit every
+    cluster without a card, including those past the cap on the live roster;
+    the deadline must still cover them. So the count is read from
+    ``full_roster``, the ready Cluster Agents uncapped (a list, or a callable
+    that returns one): how many exceed ``cap``, at most FIRST_RUN_UNCARDED_MAX.
+    Zero without it, or when the callable raises.
+    """
+    pinned = uncarded_agents(scan_marker)
+    if pinned > 0 or carded_keys(scan_marker) is not None:
+        return pinned
+    if callable(full_roster):
+        try:
+            full_roster = full_roster()
+        except Exception as e:  # noqa: BLE001 - no live budget rather than no hand-off
+            _log(f"could not list the Cluster Agents for the time limit: {e!r}")
+            return 0
+    if full_roster is None:
+        return 0
+    return min(max(0, len(full_roster) - cap), FIRST_RUN_UNCARDED_MAX)
+
+
+def sweep_cluster_cards(data_dir: Path, marker: Path) -> int:
+    """The per-cluster card cap for a filed sweep: its marker's, else the data dir's file."""
+    cap = marker_cap(marker)
+    return first_run_cluster_cards(data_dir) if cap is None else cap
+
+
 def _metadata(conn: sqlite3.Connection, task_id: str) -> dict:
     row = conn.execute(
         "SELECT metadata FROM task_runs WHERE task_id = ? AND outcome = 'completed' "
@@ -272,8 +416,13 @@ def settled(state: dict) -> bool:
 
 
 def deadline(state: dict) -> int:
-    """Seconds after the sweep was filed that the hand-off stops waiting."""
-    return DEADLINE_SECONDS + DEADLINE_PER_CARD_SECONDS * len(state["clusters"])
+    """Seconds after the sweep was filed that the hand-off stops waiting.
+
+    Per cluster, card or not: a cluster the first-run cap left to the sweep
+    (``state["uncarded"]``) still has to be audited before the hand-off can
+    write a complete report.
+    """
+    return DEADLINE_SECONDS + DEADLINE_PER_CARD_SECONDS * (len(state["clusters"]) + state.get("uncarded", 0))
 
 
 def _text(value) -> str:
@@ -312,7 +461,7 @@ def finding_lines(meta: dict) -> list[dict]:
     it names no single namespace either, rather than dropped: the user can still
     act on it.
     """
-    project, cluster = _text(meta.get("project")), _text(meta.get("cluster"))
+    project, location, cluster = cluster_identity(meta)
     if not project or not cluster:
         return []
     lines = []
@@ -335,6 +484,7 @@ def finding_lines(meta: dict) -> list[dict]:
         line = {
             "check": _text(finding.get("check")) or _slug(f"{_text(finding.get('area'))} {title}"),
             "project": project,
+            "location": location,
             "cluster": cluster,
             "object": obj,
             "title": title,
@@ -361,9 +511,35 @@ def _cell(value) -> str:
     return str(value).replace("|", "/").replace("\n", " ")
 
 
+def _workload_rows(meta: dict) -> list[dict]:
+    """The workloads an audit listed as objects: what the Coverage cell counts and the
+    inventory table shows. A list of booleans (a relayed list one level down) counts none."""
+    return [w for w in _list(meta.get("workloads")) if isinstance(w, dict)]
+
+
+def cluster_identity(obj: dict) -> tuple[str, str, str]:
+    """The (project, location, cluster) triple that names one cluster everywhere
+    this module keys on one: the collector's file, the merge, the fleet check,
+    the Coverage rows and the finding lines. Two clusters of one name in two
+    locations of one project are two clusters."""
+    return tuple(_text(obj.get(f)) for f in IDENTITY_FIELDS)  # type: ignore[return-value]
+
+
 def _named(meta) -> bool:
     """An audit the report can list: it names its project and cluster."""
     return isinstance(meta, dict) and bool(_text(meta.get("cluster")) and _text(meta.get("project")))
+
+
+def _audited_by_hand(entry: dict) -> bool:
+    """A card entry carrying the SOP's object: the by-hand walk the card
+    prescribes where the collector cannot run. A names-only entry has no
+    topology; the relayed-boolean shape has no workload list."""
+    workloads = entry.get("workloads")
+    return (
+        isinstance(entry.get("topology"), dict)
+        and isinstance(workloads, list)
+        and all(isinstance(w, dict) for w in workloads)
+    )
 
 
 def _sweep_audits(sweep: dict) -> list:
@@ -376,11 +552,17 @@ def _malformed(meta: dict) -> list[tuple[str, str]]:
     """The list fields the audit SOP prescribes that a card set to something else.
 
     An empty value of the wrong type (``{}``, ``""``, ``0``) says "none" and
-    loses nothing, so it is not reported.
+    loses nothing, so it is not reported. A boolean is reported even when it is
+    ``False``: a worker that relays a list as ``false`` has lost the list, and
+    an audit read as complete with no workloads would stand as a clean cluster.
     """
-    bad = [(f, type(meta[f]).__name__) for f in LIST_FIELDS if meta.get(f) and not isinstance(meta[f], list)]
+    bad = [
+        (f, type(meta[f]).__name__)
+        for f in LIST_FIELDS
+        if (meta.get(f) or isinstance(meta.get(f), bool)) and not isinstance(meta[f], list)
+    ]
     gaps = meta.get("gaps")
-    if gaps and not isinstance(gaps, (list, str)):
+    if (gaps or isinstance(gaps, bool)) and not isinstance(gaps, (list, str)):
         bad.append(("gaps", type(gaps).__name__))
     return bad
 
@@ -407,7 +589,7 @@ def compose(state: dict, timed_out: bool, now: float | None = None) -> str:
     """``INVENTORY.raw.md`` for one sweep, from its cards' metadata.
 
     The sweep reports the clusters it audited itself (those with no Cluster
-    Agent) under ``metadata.clusters`` and the fleet it enumerated under
+    Agent, and those past the first-run cap) under ``metadata.clusters`` and the fleet it enumerated under
     ``metadata.fleet``; a fleet cluster nobody reported on is a gap, because a
     silent gap reads as a clean cluster.
     """
@@ -437,8 +619,8 @@ def compose(state: dict, timed_out: bool, now: float | None = None) -> str:
         if _named(meta):
             audits.append((meta, sweep["id"]))
             gaps.append(
-                f"{_cell(meta.get('cluster'))} ({_cell(meta.get('project'))}): no Cluster Agent, so the sweep "
-                "audited it itself"
+                f"{_cell(meta.get('cluster'))} ({_cell(meta.get('project'))}, {_cell(meta.get('location'))}): "
+                "no Cluster Agent card, so the sweep audited it itself"
             )
         elif isinstance(meta, dict):
             gaps.append(f"sweep {sweep['id']}: an audit it reported has no `project` and `cluster`, so it is not listed")
@@ -456,6 +638,12 @@ def compose(state: dict, timed_out: bool, now: float | None = None) -> str:
                 f"{_cell(meta.get('cluster'))} ({card_id}): {dropped} reported finding(s) had no `issue` "
                 "or `title` to list, so they are not in the plan or the findings block"
             )
+        unlisted = len(_list(meta.get("workloads"))) - len(_workload_rows(meta))
+        if unlisted:
+            gaps.append(
+                f"{_cell(meta.get('cluster'))} ({card_id}): {unlisted} reported workload(s) were not objects, "
+                "so they are neither counted nor listed"
+            )
     for gap in _gap_list(sweep["metadata"]):
         gaps.append(f"sweep {sweep['id']}: {_cell(gap)}")
     if sweep["status"] in (BLOCKED, TRIAGE):
@@ -467,13 +655,13 @@ def compose(state: dict, timed_out: bool, now: float | None = None) -> str:
             f"sweep {sweep['id']} was still {_cell(sweep['status'])}: discovery did not finish, so clusters "
             "it would have listed or audited may be missing"
         )
-    reported = {(_text(m.get("project")), _text(m.get("cluster"))) for m, _ in audits}
+    reported = {cluster_identity(m) for m, _ in audits}
     fleet = [f for f in _list(sweep["metadata"].get("fleet")) if isinstance(f, dict)]
     for entry in fleet:
         status = _text(entry.get("status"))
         if status and status.upper() not in HEALTHY_CLUSTER_STATUSES:
             gaps.append(f"{_cell(entry.get('cluster'))} ({_cell(entry.get('project'))}): cluster status {_cell(status)}")
-        if (_text(entry.get("project")), _text(entry.get("cluster"))) not in reported:
+        if cluster_identity(entry) not in reported:
             gaps.append(
                 f"{_cell(entry.get('cluster'))} ({_cell(entry.get('project'))}, {_cell(entry.get('location'))}): "
                 "listed in the fleet but no audit reported on it"
@@ -514,10 +702,14 @@ def compose(state: dict, timed_out: bool, now: float | None = None) -> str:
         "| :------ | :------ | :------- | :--- | ----------------: | :-------------- |",
     ]
     for meta, card_id in audits:
-        complete = not _gap_list(meta) and not _malformed(meta)
+        complete = (
+            not _gap_list(meta)
+            and not _malformed(meta)
+            and len(_workload_rows(meta)) == len(_list(meta.get("workloads")))
+        )
         out.append(
             f"| {_cell(meta.get('cluster'))} | {_cell(meta.get('project'))} | {_cell(meta.get('location'))} "
-            f"| {card_id} | {len(_list(meta.get('workloads')))} | {'yes' if complete else 'no — see Gaps'} |"
+            f"| {card_id} | {len(_workload_rows(meta))} | {'yes' if complete else 'no — see Gaps'} |"
         )
     out += [
         "",
@@ -554,9 +746,7 @@ def compose(state: dict, timed_out: bool, now: float | None = None) -> str:
         "| :------ | :-------- | :------------ | :--- | :------- | :------------ | :-------- | :--------- |",
     ]
     for meta, _ in audits:
-        for w in _list(meta.get("workloads")):
-            if not isinstance(w, dict):
-                continue
+        for w in _workload_rows(meta):
             row = f"| {_cell(meta.get('cluster'))} | {_cell(w.get('namespace'))} | {_cell(w.get('name'))} "
             row += f"| {_cell(w.get('kind'))} | {_cell(w.get('replicas'))} "
             row += (
@@ -711,12 +901,22 @@ def _create(parse_task_id, assignee: str, key: str, title: str, body: str) -> st
     except Exception as e:  # noqa: BLE001 - kanban unavailable; retry next tick
         _log(f"kanban API unavailable: {e}")
         return None
+    try:
+        from hermes_cli import kanban_origin
+    except Exception as e:  # noqa: BLE001 - file the card unstamped
+        _log(f"card origin unavailable: {e}")
+        kanban_origin = None
     cmd = (
         f"create --json --assignee {shlex.quote(assignee)} --idempotency-key {shlex.quote(key)} "
         f"--body {shlex.quote(body)} {shlex.quote(title)}"
     )
     try:
-        out = str(run_slash(cmd)).strip()
+        if kanban_origin is not None:
+            # The board redeems the ticket and stamps CARD_ORIGIN at insert.
+            with kanban_origin.writer_ticket(CARD_ORIGIN):
+                out = str(run_slash(cmd)).strip()
+        else:
+            out = str(run_slash(cmd)).strip()
     except Exception as e:  # noqa: BLE001 - never fail the cron run
         _log(f"could not file {key}: {e}")
         return None
@@ -739,23 +939,75 @@ def _archive(task_id: str) -> bool:
     return True
 
 
-def file_cluster_cards(state: dict, roster: list, parse_task_id) -> tuple[int, list]:
-    """File a card for every Cluster Agent on the roster that has none for this sweep.
+def first_run_cluster_cards(data_dir: Path) -> int:
+    """The per-cluster card cap for one first-run sweep, from the data dir's file.
+
+    The default when the file is absent, unreadable, not an integer, or below
+    one; never more than FIRST_RUN_CLUSTER_CARDS_MAX.
+    """
+    path = data_dir / FIRST_RUN_CLUSTER_CARDS_FILE
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return FIRST_RUN_CLUSTER_CARDS
+    except OSError as e:
+        _log(f"could not read {path}: {e}; using {FIRST_RUN_CLUSTER_CARDS}")
+        return FIRST_RUN_CLUSTER_CARDS
+    except UnicodeDecodeError as e:
+        # A ValueError, not an OSError, so it needs its own branch.
+        _log(f"{path} is not UTF-8 ({e}); using {FIRST_RUN_CLUSTER_CARDS}")
+        return FIRST_RUN_CLUSTER_CARDS
+    return _clamp_cap(raw, str(path))
+
+
+def _clamp_cap(raw: str, source: str) -> int:
+    """A cap as written in ``source``: the default unless a whole number from one, at most the maximum."""
+    try:
+        value = int(raw)
+    except ValueError:
+        _log(f"{source} holds {raw[:MAX_LOGGED_CHARS]!r}, not a number; using {FIRST_RUN_CLUSTER_CARDS}")
+        return FIRST_RUN_CLUSTER_CARDS
+    if value < 1:
+        _log(f"{source} holds {value}; using {FIRST_RUN_CLUSTER_CARDS}")
+        return FIRST_RUN_CLUSTER_CARDS
+    if value > FIRST_RUN_CLUSTER_CARDS_MAX:
+        _log(f"{source} holds {value}; capped at {FIRST_RUN_CLUSTER_CARDS_MAX}")
+        return FIRST_RUN_CLUSTER_CARDS_MAX
+    return value
+
+
+def file_cluster_cards(
+    state: dict, roster: list, parse_task_id, cap: int | None = None, carded: frozenset[str] | None = None
+) -> tuple[int, list]:
+    """File a card for each Cluster Agent on the roster that has none for this sweep, up to its cap.
 
     The gate, not the sweep's worker, is the one creator of these cards: asked
     to make the calls itself, the worker once completed saying it had fanned out
     to seven clusters having filed none, and the report that followed called
     the fleet clean. Re-run every tick until the hand-off, so a create that
     failed is retried; the idempotency key keeps a retry from filing twice, and
-    a card someone archived is not filed again. Returns how many it filed and
-    the agents still without a card.
+    a card someone archived is not filed again. With ``cap``, it stops once the
+    sweep has that many cluster cards, so a roster that changes between ticks
+    cannot file past the first-run cap the sweep was filed under (#3702); an agent it skips for the cap
+    is left to the sweep and is not counted as unfiled. With ``carded``, the
+    keys the sweep card listed, it files for those agents only, and skips any
+    other the same way: a retry after a failed create, or a slot an archived
+    card left, goes to no profile the card already gave its worker. Returns how
+    many it filed and the agents still without a card.
     """
     have = {c["key"] for c in state["clusters"]} | state.get("archived_keys", set())
     stale = state.get("stale_keys", {})
     filed, unfiled = 0, []
+    # With ``carded``, only the carded agents' cards count against the cap: a
+    # stray cluster card on the board (one someone filed by hand, or a key the
+    # card never listed) must not take the slot of a carded agent whose create
+    # failed. Without it, every cluster card of the sweep counts, as before.
+    counted = len(state["clusters"]) if carded is None else sum(1 for c in state["clusters"] if c["key"] in carded)
     for agent in roster:
-        if agent["key"] in have:
+        if agent["key"] in have or (carded is not None and agent["key"] not in carded):
             continue
+        if cap is not None and counted + filed >= cap:
+            break
         old = stale.get(agent["key"])
         if old and not _archive(old):
             unfiled.append(dict(agent, stale_card=old))
@@ -787,12 +1039,189 @@ def _record(marker: Path, sweep_id: str, task_id: str, now: float) -> None:
     marker.write_text(f"sweep={sweep_id}\ntask_id={task_id}\nfiled_at={int(now)}\n", encoding="utf-8")
 
 
-def hand_off(data_dir: Path, scan_marker: Path, parse_task_id, roster=None, now: float | None = None) -> str | None:
+def sweep_file_path(project: str, location: str, cluster: str) -> str:
+    """The collector's file for one cluster, under the sandbox's data root."""
+    return f"{SWEEP_DIR}/{SWEEP_FILE_FORMAT.format(project=project, location=location, cluster=cluster)}"
+
+
+def _read_sweep_file(data_dir: Path, path: str) -> bytes | None:
+    """The file's bytes (at most one over the cap), None when absent.
+
+    Raises what ``sandbox_exec.read_bytes`` raises: a sandbox that could not be
+    reached is the caller's signal to retry next tick; a read that ran and
+    failed is a gap for that cluster.
+    """
+    sx = _sandbox()
+    if not sx.sandbox_enabled():
+        local = data_dir / Path(SWEEP_DIR).name / Path(path).name
+        if not local.is_file():
+            return None
+        with local.open("rb") as fh:
+            return fh.read(SWEEP_FILE_MAX_BYTES + 1)
+    return sx.read_bytes(
+        path, max_bytes=SWEEP_FILE_MAX_BYTES + 1, principal=sx.TERMINAL_PRINCIPAL, timeout=SANDBOX_TIMEOUT_SECONDS
+    )
+
+
+def _collected_audit(raw: bytes, ident: dict, sweep_id: str, filed_at: float) -> tuple[dict | None, str]:
+    """The file's object when it is this sweep's audit of ``ident``, else why not."""
+    if len(raw) > SWEEP_FILE_MAX_BYTES:
+        return None, f"over {SWEEP_FILE_MAX_BYTES} bytes"
+    try:
+        obj = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None, "not JSON"
+    if not isinstance(obj, dict):
+        return None, "not a JSON object"
+    for field in IDENTITY_FIELDS:
+        if _text(obj.get(field)) != ident[field]:
+            return None, f"names {field} {_text(obj.get(field))!r}, not {ident[field]!r}"
+    stamped_sweep = _text(obj.get(SWEEP_FILE_STAMP_SWEEP))
+    if not stamped_sweep:
+        return None, f"carries no {SWEEP_FILE_STAMP_SWEEP}"
+    if stamped_sweep != sweep_id:
+        return None, f"from sweep {stamped_sweep}, not {sweep_id}"
+    stamped_at = obj.get(SWEEP_FILE_STAMP_AT)
+    if not isinstance(stamped_at, (int, float)) or isinstance(stamped_at, bool) or stamped_at != stamped_at:
+        return None, f"carries no {SWEEP_FILE_STAMP_AT}"
+    if stamped_at < filed_at:
+        return None, f"collected at {int(stamped_at)}, before this sweep was filed at {int(filed_at)}"
+    return obj, ""
+
+
+def _identity_ok(ident: dict) -> bool:
+    """Every component is a bare name: no empty field and nothing that moves the path."""
+    return all(IDENTITY_COMPONENT_RE.fullmatch(_text(ident.get(f)) or "") for f in IDENTITY_FIELDS)
+
+
+def merge_collected_audits(state: dict, data_dir: Path, sweep_id: str, filed_at: float, past_cap: list[dict]) -> bool:
+    """Replace the sweep's relayed audits with the collector's files.
+
+    The clusters read are the ones the sweep card named under ``clusters``
+    and ``past_cap``, the roster identities the first-run cap left to the
+    sweep, keyed by (project, location, cluster) as the files are named: a
+    GKE cluster name is unique only within a project and location. A named
+    entry without a location takes the roster's when exactly one roster
+    cluster has its project and name. For each, the file at
+    :func:`sweep_file_path` replaces the card's entry when it is this sweep's
+    audit of that cluster, with the worker's own gaps for it kept; a cluster
+    the card named whose file is missing or wrong keeps its entry with a gap
+    naming the file, so its Coverage row reads "no, see Gaps"; so does one
+    named twice, or without a location anywhere (or with two roster matches),
+    or with a component that is not a bare name. A cluster the card did not
+    name takes its file as its entry, nothing when there is none, and a gap
+    line under the sweep when a file is there but wrong. Cluster Agent cards
+    are never touched. Returns False when the sandbox could not be read at
+    all, which the caller takes as "retry next tick".
+    """
+    meta = state["sweep"]["metadata"]
+    entries = [c for c in _sweep_audits(state["sweep"]) if isinstance(c, dict)]
+    roster: dict[tuple[str, str, str], None] = {}
+    for agent in past_cap:
+        identity = agent.get("identity") if isinstance(agent, dict) else None
+        if isinstance(identity, dict):
+            ident = cluster_identity(identity)
+            if all(ident):
+                roster.setdefault(ident, None)
+    # The one key without a location, on purpose: it resolves a named entry
+    # that carries none to the roster's location when exactly one matches.
+    locations_by_name: dict[tuple[str, str], list[str]] = {}
+    for project, location, cluster in roster:
+        locations_by_name.setdefault((project, cluster), []).append(location)
+    named: dict[tuple[str, str, str], dict] = {}
+    order: list[tuple[str, str, str]] = []
+    problems: dict[tuple[str, str, str], str] = {}
+    unresolved: list[dict] = []  # entries kept as they are, each with a gap already appended
+    unnamed: list[dict] = []
+    for entry in entries:
+        project, location, cluster = cluster_identity(entry)
+        if not (project and cluster):
+            unnamed.append(entry)  # compose reports an audit with no project or cluster as such
+            continue
+        if not location:
+            candidates = locations_by_name.get((project, cluster), [])
+            if len(candidates) == 1:
+                location = candidates[0]
+            else:
+                why = (
+                    "the card names no location for it and the roster has none"
+                    if not candidates
+                    else f"the card names no location for it and the roster has {len(candidates)} clusters of that name"
+                )
+                unresolved.append({**entry, "gaps": _gap_list(entry) + [f"{why}, so its file cannot be found; this entry is the card's own copy"]})
+                continue
+        key = (project, location, cluster)
+        if key in named:
+            problems[key] = "the card names this cluster twice; the first entry stands"
+            continue
+        named[key] = {**entry, "location": location}
+        order.append(key)
+    for key in roster:
+        if key not in named:
+            named[key] = {}
+            order.append(key)
+    merged: list[dict] = []
+    sweep_gaps: list[str] = []
+    sx = _sandbox()
+    for key in order:
+        project, location, cluster = key
+        card_entry = named[key]
+        ident = {"project": project, "location": location, "cluster": cluster}
+        why = problems.get(key, "")
+        raw = None
+        if not why and not _identity_ok(ident):
+            why = "its project, location or cluster is not a bare name, so its file is not read"
+        elif not why:
+            path = sweep_file_path(project, location, cluster)
+            try:
+                raw = _read_sweep_file(data_dir, path)
+            except sx.SandboxReadFailed as e:
+                why = f"the collector's file {path} could not be read: {e}"
+            except sx.SandboxUnavailable as e:
+                _log(f"cannot read {path}, the sandbox was not reached: {e}")
+                return False
+            except OSError as e:
+                why = f"the collector's file {path} could not be read: {e}"
+            except Exception as e:  # noqa: BLE001 - nothing is known about the file; retry next tick
+                _log(f"cannot read {path}: {e}")
+                return False
+            else:
+                if raw is None and _audited_by_hand(card_entry):
+                    merged.append(card_entry)
+                    continue
+                if raw is None:
+                    why = f"the collector's file {path} is missing"
+                else:
+                    obj, bad = _collected_audit(raw, ident, sweep_id, filed_at)
+                    if obj is None:
+                        why = f"the collector's file {path} {bad}"
+                    else:
+                        merged.append({**obj, "gaps": _gap_list(obj) + _gap_list(card_entry)})
+                        continue
+        if card_entry:
+            merged.append({**card_entry, "gaps": _gap_list(card_entry) + [f"{why}; this entry is the card's own copy"]})
+        elif raw is not None or "could not be read" in why:
+            # A roster cluster the card never named, with a file that is not this
+            # sweep's audit: no row for it, but the reason is not thrown away.
+            sweep_gaps.append(f"{cluster} ({project}, {location}): {why}; the card did not name this cluster")
+    merged.extend(unresolved)
+    merged.extend(unnamed)
+    meta["clusters"] = merged
+    if sweep_gaps:
+        meta["gaps"] = _gap_list(meta) + sweep_gaps
+    return True
+
+
+def hand_off(
+    data_dir: Path, scan_marker: Path, parse_task_id, roster=None, now: float | None = None, full_roster=None
+) -> str | None:
     """Advance the hand-off one tick. Returns the ranking card id once filed.
 
     ``roster`` is the gate's list of ready Cluster Agents (or a callable that
     returns it), each ``{name, key, title, cluster_label}``; their cards are
-    filed here, once per sweep.
+    filed here, once per sweep. ``full_roster``, the same uncapped, budgets the
+    time limit for the clusters past the cap when the marker pinned nothing
+    (``uncarded_budget``).
     """
     now = time.time() if now is None else now
     filed = read_scan_marker(scan_marker, now)
@@ -807,6 +1236,7 @@ def hand_off(data_dir: Path, scan_marker: Path, parse_task_id, roster=None, now:
     state = read_board(_board_path(data_dir), sweep_id)
     if state is None:
         return None
+    state["uncarded"] = uncarded_budget(scan_marker, sweep_cluster_cards(data_dir, scan_marker), full_roster)
     # Archiving the sweep, or every one of its cards, is how a person, the
     # re-arm runbook or a bench stack cancels it, often to plant a raw file of
     # their own; writing over that file once the deadline passed would undo
@@ -816,7 +1246,9 @@ def hand_off(data_dir: Path, scan_marker: Path, parse_task_id, roster=None, now:
         _log(f"sweep {sweep_id} or all of its cluster cards are archived; not handing off")
         return None
     agents = (roster() if callable(roster) else roster) or []
-    filed_now, unfiled = file_cluster_cards(state, agents, parse_task_id)
+    filed_now, unfiled = file_cluster_cards(
+        state, agents, parse_task_id, cap=sweep_cluster_cards(data_dir, scan_marker), carded=carded_keys(scan_marker)
+    )
     if filed_now:
         # The cards just filed have not run; nothing is settled this tick.
         return None
@@ -833,6 +1265,15 @@ def hand_off(data_dir: Path, scan_marker: Path, parse_task_id, roster=None, now:
         return None
     if written:
         _log(f"{REPORT_PATH} is already written and sweep {sweep_id} has no hand-off; leaving it for delivery")
+        return None
+    carded = carded_keys(scan_marker) or frozenset()
+    try:
+        everyone = (full_roster() if callable(full_roster) else full_roster) or []
+    except Exception as e:  # noqa: BLE001 - as uncarded_budget reads it: no live roster, the named clusters still read
+        _log(f"could not list the roster for the collector's files: {e}")
+        everyone = []
+    past_cap = [a for a in everyone if isinstance(a, dict) and a.get("key") not in carded]
+    if not merge_collected_audits(state, data_dir, sweep_id, filed_at, past_cap):
         return None
     raw = compose(state, timed_out, now)
     if not write_raw(data_dir, raw):

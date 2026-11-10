@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 8,
+  "nextSeq": 13,
+  "eventSeqs": {
+    "deploy:kube-agents-demo": 1,
+    "session-start:session-triage": 2,
+    "session-start:session-triage-db": 5,
+    "task-done:t-100:completed": 9,
+    "task-done:t-101:completed": 10,
+    "task-done:t-104:failed": 12,
+    "task-in:t-100": 3,
+    "task-in:t-101": 4,
+    "task-in:t-102": 6,
+    "task-in:t-103": 7,
+    "task-in:t-104": 8,
+    "task-input:t-103": 11
+  },
+  "authors": {
+    "coordinator": true,
+    "platform": true
+  }
+}

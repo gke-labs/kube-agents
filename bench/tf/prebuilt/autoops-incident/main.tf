@@ -136,6 +136,8 @@ resource "null_resource" "incident" {
       tostring(var.replicas),
       tostring(var.crash_seconds),
       var.wait_for,
+      var.gitops_manifest_path,
+      tostring(var.start_settle_seconds),
       var.host_cluster_name,
     ]))
   }
@@ -436,10 +438,9 @@ resource "null_resource" "incident" {
       # given regex since the plant? The same read as step 3's poll, for the
       # follow-up wait in 3b; the regex names this namespace's pods.
       watcher_logged() {
-        kubectl logs "deployment/${var.agent_deployment}" \
+        grep -qE "$1" <<<"$(kubectl logs "deployment/${var.agent_deployment}" \
             -n "${var.agent_namespace}" -c "${var.agent_container}" \
-            --since-time="$started_at" --tail=-1 2>/dev/null \
-          | grep -qE "$1"
+            --since-time="$started_at" --tail=-1 2>/dev/null)"
       }
       # ---- 3. Wait for the watcher to hand the event to the daemon ----------
       # Read from the watcher's own log rather than from the gateway's
@@ -466,10 +467,9 @@ resource "null_resource" "incident" {
       # loop is sequential. A leftover namespace on a DIFFERENT watched cluster,
       # which step 0b does not reach, or the concurrency of #637, would.
       elapsed=0
-      until kubectl logs "deployment/${var.agent_deployment}" \
+      until grep -qE "${local.watcher_handled} .*pod=${local.ns}/" <<<"$(kubectl logs "deployment/${var.agent_deployment}" \
               -n "${var.agent_namespace}" -c "${var.agent_container}" \
-              --since-time="$started_at" --tail=-1 2>/dev/null \
-            | grep -qE "${local.watcher_handled} .*pod=${local.ns}/"; do
+              --since-time="$started_at" --tail=-1 2>/dev/null)"; do
         if [ "$elapsed" -ge 300 ]; then
           echo "ERROR: the workload is crash-looping past the debounce, but k8s-event-watcher logged no '${local.watcher_handled}' for a pod in ${local.ns} within $${elapsed}s. The incident was detected by Kubernetes and not by the watcher, so nothing downstream will run. Its recent log follows." >&2
           kubectl logs "deployment/${var.agent_deployment}" -n "${var.agent_namespace}" \
@@ -501,13 +501,83 @@ resource "null_resource" "incident" {
           echo "k8s-event-watcher sent the quiet follow-up for ${local.ns} after $${elapsed}s."
         fi
       fi
+      if [ "${var.wait_for}" = "recurrence" ]; then
+        # ---- 3c. The same fault again, while its fix waits for review ---------
+        # First the fix: an open pull request in the run's GitOps repository
+        # that changes the workload's manifest. Asked of GitHub with the
+        # runner's read token, not of the install, so it reads the same on a
+        # build with or without the change under test. The incident's
+        # triage, and on an install with INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true
+        # the card that opens its pull request, run meanwhile.
+        repo="$${BENCH_GITOPS_REPO:-}"
+        token="$${BENCH_GITHUB_TOKEN:-$${GITHUB_TOKEN:-}}"
+        api="$${BENCH_GITHUB_API_ROOT:-https://api.github.com}"
+        if [ -z "$repo" ] || [ -z "$token" ] || [ -z "${var.gitops_manifest_path}" ]; then
+          echo "ERROR: wait_for = recurrence needs BENCH_GITOPS_REPO, BENCH_GITHUB_TOKEN (or GITHUB_TOKEN) and gitops_manifest_path to find the incident's pull request." >&2
+          exit 1
+        fi
+        open_fix() {
+          curl -fsS -H "Authorization: Bearer $token" -H "Accept: application/vnd.github+json" \
+            "$api/repos/$repo/pulls?state=open&per_page=50" \
+          | python3 -c '
+      import json, subprocess, sys
+      since, path, api, repo, token = sys.argv[1:6]
+      for pull in json.load(sys.stdin):
+          if pull.get("created_at", "") < since:
+              continue
+          files = subprocess.run(
+              ["curl", "-fsS", "-H", "Authorization: Bearer " + token,
+               api + "/repos/" + repo + "/pulls/" + str(pull["number"]) + "/files?per_page=100"],
+              capture_output=True, text=True).stdout
+          names = [f.get("filename", "") for f in json.loads(files or "[]")]
+          if any(n == path or n.endswith("/" + path) for n in names):
+              print(pull["html_url"]); break
+      ' "$started_at" "${var.gitops_manifest_path}" "$api" "$repo" "$token"
+        }
+        elapsed=0
+        fix=""
+        until fix="$(open_fix)" && [ -n "$fix" ]; do
+          if [ "$elapsed" -ge 2400 ]; then
+            echo "ERROR: no open pull request changing ${var.gitops_manifest_path} appeared in $repo within $${elapsed}s, so the recurrence would not be graded against an open fix. Check that the install opens the triage's pull request (INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true) and that the repository declares the workload there." >&2
+            exit 1
+          fi
+          sleep 30
+          elapsed=$((elapsed + 30))
+        done
+        echo "The incident's fix is open after $${elapsed}s: $fix"
 
-      # After a `fire` line the card is filed within seconds and then takes
-      # minutes to run; after a `folded` one no card is filed for this run.
-      # Waiting for the card HERE would mean reading the Platform Agent pod's
-      # SQLite board over `kubectl exec`, coupling a bench fixture to an
-      # internal file path; a task's prompt reads the board through the kanban
-      # tools instead, which is the read path the product actually offers.
+        # Then the fault again: a replaced pod is a new object to the watcher,
+        # whose dedup key is the object's UID, so its BackOff is a new event
+        # rather than a repeat it already holds. The pod's controller recreates
+        # it; nothing outside this namespace is touched.
+        recur_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        ${local.kubectl} delete pod -l app=${local.workload} --wait=false
+        elapsed=0
+        until grep -qE "(fire|folded) .*pod=${local.ns}/" <<<"$(kubectl logs "deployment/${var.agent_deployment}" \
+                -n "${var.agent_namespace}" -c "${var.agent_container}" \
+                --since-time="$recur_at" --tail=-1 2>/dev/null)"; do
+          if [ "$elapsed" -ge 600 ]; then
+            echo "ERROR: the replaced pod crash-looped, but k8s-event-watcher logged no 'fire' or 'folded' for it within $${elapsed}s, so the recurrence never reached the daemon." >&2
+            exit 1
+          fi
+          sleep 10
+          elapsed=$((elapsed + 10))
+        done
+        echo "k8s-event-watcher handled the replaced pod of ${local.ns} after $${elapsed}s."
+      fi
+      if [ "${var.start_settle_seconds}" != "0" ]; then
+        echo "Waiting ${var.start_settle_seconds}s for the incident cards to settle before the board read."
+        sleep "${var.start_settle_seconds}"
+      fi
+
+      # After a `fire` line the incident turn files its card(s) within seconds
+      # and each card then takes minutes to run (sequentially when a follow-up
+      # card is parented on the triage card); after a `folded` line no card is
+      # filed for this run. `start_settle_seconds` is an optional wall-clock
+      # head start before the reader turn begins; polling for completion HERE
+      # would mean reading the Platform Agent pod's SQLite board over
+      # `kubectl exec`, coupling a bench fixture to an internal file path, so a
+      # task's prompt reads and re-checks the board through the kanban tools.
     EOT
   }
 

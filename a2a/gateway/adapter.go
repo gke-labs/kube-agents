@@ -45,6 +45,14 @@ type InboundMessage struct {
 	// to the configured backend, which is every chat backend's case.
 	Backend string
 
+	// Profile, when set, addresses this turn to an AgentProfile, with
+	// Parameters its task parameters (the target cluster's project, location
+	// and cluster for cluster work). Only the console sets it today, whose
+	// clients name an agent; every chat backend leaves it empty and its
+	// turns go to the conversation's route.
+	Profile    string
+	Parameters map[string]string
+
 	// Intent, when set, is a control action the backend expressed directly
 	// rather than a message to be understood. Empty is an ordinary message.
 	Intent string
@@ -58,17 +66,19 @@ type InboundMessage struct {
 	TaskID string
 	// TopLevel marks a message that roots a conversation of its own in a
 	// space whose questions each get their own thread, rather than one
-	// typed inside a thread: today a top-level Slack DM, which the adapter
-	// keys on its own message id. Such a conversation has nothing running
-	// in it, so a stop or a status question there gets a reply saying
-	// where to send it instead of being read as an ask. False is every
-	// other message, and every other backend's case.
+	// typed inside a thread: a top-level Slack DM, or a top-level Google
+	// Chat DM whose message has a thread of its own, which the adapter keys
+	// on its own message id or thread. Such a conversation
+	// has nothing running in it, so a stop or a status question there gets
+	// a reply saying where to send it instead of being read as an ask.
+	// False is every other message, and every other backend's case.
 	TopLevel bool
 	// Click marks a message that is a click on a choice button rather than a
 	// message of its own: MessageID then names the click (the audit chain's
 	// join), not a message anything can be drawn on. A chain a click starts
 	// carries its mark on the conversation's previous ask instead (mark.go).
-	// False for a typed message, and for every backend but Slack.
+	// False for a typed message, and for every backend but Slack and Google
+	// Chat.
 	Click bool
 	// Answer marks a typed message that answers a question the conversation
 	// has open (one the adapter laid out with choices). Like a click, it
@@ -94,12 +104,12 @@ type InboundMessage struct {
 }
 
 // IntentCancel is the only Intent today: stop the conversation's running
-// task. The chat backends have no way to express it -- a human types "stop"
-// and the text matcher reads it -- but a program should not have to spell a
-// phrase to reach a control path, and a phrase that changes meaning is a
-// class of bug an API does not have. The inject door has an explicit route
-// for it, and it lands on the bus as kind: cancel exactly as the text route
-// does.
+// task. A chat message cannot express it -- a human types "stop" and the
+// text matcher reads it -- but a program should not have to spell a phrase
+// to reach a control path, and a phrase that changes meaning is a class of
+// bug an API does not have. The inject door has an explicit route for it,
+// Slack's Stop button arrives as it (slack_stop.go), and it lands on the bus
+// as kind: cancel exactly as the text route does.
 const IntentCancel = "cancel"
 
 // Adapter is the five-operation backend interface from the gateway design:
@@ -128,14 +138,17 @@ type Adapter interface {
 	// a backend that cannot hold this one, or whose API refuses it, returns
 	// the reason. Either way nothing was posted, and the gateway posts
 	// m.Text instead, chunked under the backend's cap (Gateway.postMessage).
-	// With m.Chat nil it is Post(conversation, m.Text).
+	// With m.Chat nil it is Post(conversation, m.Text), unless m.Feedback
+	// marks an answer a backend draws rating controls on (feedback.go), or
+	// m.Stop a task's live message a backend draws a Stop control on.
 	PostMessage(conversation string, m OutMessage) (messageID string, err error)
 
 	// EditMessage replaces a posted message with m, laid out or not, under
 	// PostMessage's rules: ErrTextOnly from a backend that renders no chat
 	// message, which the gateway answers with Edit. With m.Chat nil a
 	// backend that laid the message out before replaces the layout with the
-	// text; any other backend makes it Edit.
+	// text; any other backend makes it Edit. m.Stop is read as on
+	// PostMessage, and an edit without it takes the Stop control off.
 	EditMessage(conversation, messageID string, m OutMessage) error
 
 	// Roster returns the members of a conversation in the same vocabulary
@@ -217,12 +230,24 @@ type OutMessage struct {
 	// already read and validated for its carrier (chatmsg.Read); an adapter
 	// renders it or declines it, and never repairs one.
 	Chat *chatmsg.Message
+	// Feedback, when set, is the task id an answer can be rated under: the
+	// root of the chain whose final answer this message is (answer
+	// feedback, feedback.go). A backend that draws rating controls draws
+	// them on this message; every other backend ignores it.
+	Feedback string
+	// Stop, when set, is the id of the running task whose live message
+	// this is: the status line the gateway posts for a task and edits as
+	// it moves (relay.go). A backend that draws a Stop control draws it on
+	// this message, naming that task, and an edit without Stop takes it
+	// off, which is the terminal edit; every other backend ignores it.
+	Stop string
 }
 
 // ErrTextOnly is a backend's answer to a message value with a chat message
-// when it renders none: Discord, Google Chat, the inject door, the console
-// and the A2A door. The gateway posts the text instead, so every one of them
-// posts exactly what it posted before chat messages existed.
+// when it renders none: Discord, the inject door, the console and the A2A
+// door. The gateway posts the text instead, so every one of them posts
+// exactly what it posted before chat messages existed. Slack and Google
+// Chat render one (slack_chat.go, gchat_chat.go).
 var ErrTextOnly = errors.New("this backend posts text only")
 
 // ErrLayoutRefused wraps a backend's refusal of one chat message's layout:
@@ -494,6 +519,22 @@ type SessionLookupSink interface {
 	SetSessionLookup(lookup SessionLookup, idleTTL time.Duration)
 }
 
+// SenderAdmission reports whether the gateway would take a turn from author
+// on backend: the same gate verifySender applies, read ahead of the hand-over
+// by an adapter that has to decide on its own goroutine whether to post
+// anything in the sender's conversation before the gateway has seen them
+// (the Google Chat adapter's line on a quote it could not read). It decides
+// nothing about the turn: verifySender still rules on every message.
+type SenderAdmission func(backend, author string) bool
+
+// SenderAdmissionSink is the optional extension an Adapter implements to
+// receive the gateway's SenderAdmission. Wired in New the way
+// SessionLookupSink is; an adapter without it posts nothing ahead of the
+// gateway.
+type SenderAdmissionSink interface {
+	SetSenderAdmission(admits SenderAdmission)
+}
+
 // ConversationState is one read's answer: the record as it stands, plus the
 // two gateway-wide facts a caller needs beside it.
 type ConversationState struct {
@@ -561,4 +602,42 @@ type ConversationState struct {
 	// which is the line the relay's rolling edit shows.
 	Activity []json.RawMessage
 	Progress string
+	// Usage is what the front door's own turns cost: the usage artifact's
+	// parts summed (lib.UsageTotal) over TaskID's stream and, for a
+	// delegation chain's root, every wake that continued it, whichever link
+	// the read follows. ChildUsage is the same sum over the chain's child
+	// tasks, the addressees the front door delegated to (the platform
+	// router that files the cards among them), kept apart because it is
+	// another addressee's work. Each is nil when none of its turns
+	// published usage. UsagePartial is set when a link's stream could not
+	// be read, so the sums leave out what that link cost. Each executor
+	// publishes a turn's usage before its terminal, so a read after the
+	// root's end carries all of it. Set only on a probe whose context asked
+	// for it (withChainUsage): summing a chain reads one stream per link,
+	// which a caller polling the read route has no use for on every poll.
+	Usage        *lib.Usage
+	ChildUsage   *lib.Usage
+	UsagePartial bool
+	// ChildAddressees names whom the chain delegated to: each child task's
+	// addressee under TaskID's root, a profile's name or platform, once
+	// each in the order delegated (chainChildAddressees), empty when it
+	// delegated nothing, nil when the task is unknown. Read from the
+	// record, so it costs no stream read. Only the inject door's read
+	// route carries it, for a harness grading which agent a turn chose.
+	ChildAddressees []string
+}
+
+// chainUsageKey marks a probe's context as asking for
+// ConversationState.Usage (withChainUsage).
+type chainUsageKey struct{}
+
+// withChainUsage asks the probe run under ctx to sum the front door's usage.
+func withChainUsage(ctx context.Context) context.Context {
+	return context.WithValue(ctx, chainUsageKey{}, true)
+}
+
+// chainUsageAsked reports whether ctx asks the probe for usage.
+func chainUsageAsked(ctx context.Context) bool {
+	asked, _ := ctx.Value(chainUsageKey{}).(bool)
+	return asked
 }

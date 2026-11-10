@@ -22,9 +22,10 @@ prompt: >-
   not based on live cluster inspection.
 expected_output: >-
   The agent inspects checkout-gateway in seeded-reliability, observes that it
-  has two replicas but lacks a PodDisruptionBudget, and explains that a node
-  drain or cluster upgrade could evict both replicas simultaneously, causing
-  downtime.
+  has two replicas but lacks a PodDisruptionBudget, states the pod placement
+  it observed, and explains that one node drain evicts only the pods on that
+  node, while back-to-back drains during a node-pool upgrade or scale-down can
+  evict both replicas before a replacement is Ready, causing downtime.
 infrastructure:
   deployer: noop
 validated: false

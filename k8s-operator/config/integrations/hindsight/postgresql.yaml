@@ -127,9 +127,12 @@ spec:
             requests:
               cpu: 250m
               memory: 256Mi
+              # The run and tmp emptyDirs' sizeLimits plus 64Mi for logs, as the chart.
+              ephemeral-storage: 1152Mi
             limits:
               cpu: "1"
               memory: 1Gi
+              ephemeral-storage: 1152Mi
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
@@ -138,10 +141,13 @@ spec:
             - name: tmp
               mountPath: /tmp
       volumes:
+        # As the chart (templates/hindsight.yaml): socket and pid, then /tmp.
         - name: run
-          emptyDir: {}
+          emptyDir:
+            sizeLimit: 64Mi
         - name: tmp
-          emptyDir: {}
+          emptyDir:
+            sizeLimit: 1Gi
   volumeClaimTemplates:
     - metadata:
         name: data

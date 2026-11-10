@@ -74,8 +74,11 @@ sandbox (invisible to the file guard's ``realpath``, which runs on the
 gateway) never reaches this module. The sandbox closes those itself: its copy
 of the trees is root-owned and mounted read-only (see "The delivered trees
 are read-only mounts" in ``docs/designs/agent-shell-sandboxing.md``). The
-bench case's safeguard counts only a successful ``skill_manage`` write;
-``platform-worker-shell-edit-of-shipped-skill`` grades the sandbox's copy.
+bench case ``platform-worker-refuses-shipped-skill-edit`` grades the routes
+as state: a ``skill_manage`` write that went through, and the sandbox's staged
+trees (where the file tools and the shell write) against the image;
+``platform-worker-shell-edit-of-shipped-skill`` grades the sandbox's copy on
+its own run.
 """
 
 from __future__ import annotations

@@ -35,7 +35,38 @@ sys.path.insert(0, os.path.dirname(__file__))
 # file the sandbox writes, else KUBEAGENTS_SCOPE_DECLARED. A shell that carries either would turn
 # this suite's --project runs into refusals; both are neutralised at import, as the sibling suites do.
 os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)  # module-level, on purpose
+# The sweep width is read from the credential broker (broker_admission); with its
+# URLs unset that read makes no request and the width is the fallback, four, so
+# no test here reaches the network or depends on the host's broker.
+os.environ.pop("CREDENTIAL_PROXY_URL", None)  # module-level, on purpose
+os.environ.pop("CREDENTIAL_PROXY_EXEC_URL", None)  # module-level, on purpose
 import upgrade_retrospective as ur  # noqa: E402
+import test_collector_run as _shared_run_tests  # noqa: E402
+import audit_report  # noqa: E402
+
+# The longest identifiers a recorded command can carry in its kubeconfig path
+# under the shipped platform profile: a 30-character project id, a 40-character
+# cluster name, GCP's longest location. A collector's recorded chain is held
+# under `audit_report.MAX_COMMAND_CHARS` at this length, since `finish` refuses
+# a `checks_run` command over it and the SOPs copy the chain verbatim.
+PLATFORM_PROFILE_KUBECONFIG_DIR = Path("/opt/data/profiles/platform/.kubeconfigs")
+LONGEST_PROJECT = "p" * 30
+LONGEST_CLUSTER = "c" * 40
+LONGEST_LOCATION = "northamerica-northeast1-a"
+
+# The collector pages its kinds through `kubectl get --raw`; FakeFleet below
+# still answers the one-shot dump by kind, and the adapter feeds the real
+# paging from it (test_collector_run.paged_dump_over). The test that asserts
+# the paged argv itself patches the real `paged_dump` back in.
+_PAGED_DUMP = mock.patch.object(ur, "paged_dump", _shared_run_tests.paged_dump_over())
+
+
+def setUpModule():
+    _PAGED_DUMP.start()
+
+
+def tearDownModule():
+    _PAGED_DUMP.stop()
 
 ur.fleet_scope_args.SCOPE_DECLARED_FILE = "/nonexistent/kube-agents-sandbox/scope-declared"
 
@@ -108,6 +139,48 @@ def owned_by(path, uid):
 
 def run_of(rc=0, stdout="", stderr=""):
     return ur.Run(["x"], rc, stdout, stderr, 0.01)
+
+
+LOG_VOLUME_BEFORE = load("log_volume_seeded_a_before.json")["body"]
+LOG_VOLUME_AFTER = load("log_volume_seeded_a_after.json")["body"]
+
+
+class FakeResponse:
+    def __init__(self, status_code, text):
+        self.status_code, self.text = status_code, text
+
+
+class FakeSession:
+    """Answers the gate's two timeSeries reads per cluster from the recorded
+    weeks (the week before the upgrade first, then the week after), with a
+    container's after-week scaled by `scale` ({(namespace, container): factor})
+    or added by `extra_after` ({(namespace, container): bytes}); `status`,
+    `text` and `raises` make the read fail."""
+
+    def __init__(self, scale=None, extra_after=None, status=200, text="", raises=None):
+        self.scale, self.extra_after, self.status, self.text, self.raises = dict(scale or {}), dict(extra_after or {}), status, text, raises
+        self.calls = []
+
+    def _after(self):
+        body = copy.deepcopy(LOG_VOLUME_AFTER)
+        for series in body["timeSeries"]:
+            labels = series["resource"]["labels"]
+            key = (labels.get("namespace_name"), labels.get("container_name"))
+            if key in self.scale:
+                for point in series["points"]:
+                    point["value"]["int64Value"] = str(int(int(point["value"]["int64Value"]) * self.scale[key]))
+        for (namespace, container), count in self.extra_after.items():
+            body["timeSeries"].append({"resource": {"type": "k8s_container", "labels": {"namespace_name": namespace, "container_name": container, "project_id": PROJECT}}, "metricKind": "DELTA", "valueType": "INT64", "points": [{"value": {"int64Value": str(int(count))}}]})
+        return body
+
+    def get(self, url, params=None, timeout=None):
+        self.calls.append((url, dict(params or {}), timeout))
+        if self.raises:
+            raise self.raises
+        if self.status != 200:
+            return FakeResponse(self.status, self.text)
+        body = LOG_VOLUME_BEFORE if len(self.calls) % 2 == 1 else self._after()
+        return FakeResponse(200, json.dumps(body))
 
 
 class FakeFleet:
@@ -337,6 +410,43 @@ class OperationsTest(unittest.TestCase):
         ops, error = ur.list_operations(PROJECT, SINCE, run=lambda argv, **kw: run_of(1, "", "denied"))
         self.assertEqual(ops, [])
         self.assertIn("rc=1", error)
+
+    def test_paged_json_words_a_failed_page_with_its_rc_or_the_readers_reason(self):
+        """A page that exited non-zero is worded as `run_json` words it, the command being
+        the page that failed rather than the read's kind list; one that exited 0 and
+        still failed quotes the paged reader's own text for what was wrong with it."""
+        cr = ur.collector_run
+        events_page = "kubectl get --raw '/api/v1/events?limit=500&fieldSelector=type%3DWarning'"
+        items, error = ur.paged_json("events", {"fieldSelector": "type=Warning"}, run=lambda argv, **kw: run_of(1, "", "denied"), timeout=5, env=None)
+        self.assertEqual((items, error), (None, f"{events_page} rc=1: denied"))
+        for stdout, reason in (("{not json", cr.PAGE_NOT_JSON_TEXT), ("", cr.PAGE_EMPTY_TEXT), ('{"kind": "Status"}', cr.PAGE_NOT_A_LIST_TEXT)):
+            with self.subTest(stdout=stdout):
+                items, error = ur.paged_json("events", {"fieldSelector": "type=Warning"}, run=lambda argv, **kw: run_of(0, stdout, ""), timeout=5, env=None)
+                self.assertEqual((items, error), (None, f"{events_page} failed: {reason}"))
+
+    def test_paged_json_names_the_page_that_failed_not_the_kind_list(self):
+        """The real paging: when the jobs page of the two-kind `owners` read fails, the
+        error names that page (`replicasets,jobs` says nothing about which kind failed,
+        and a failed read's command is recorded nowhere else); when a pods continue
+        page fails, the error names that page with its token elided."""
+
+        def jobs_denied(argv, **kw):
+            if argv[3].startswith("/apis/batch/v1/jobs?"):
+                return ur.Run(argv, 1, "", "denied", 0.01)
+            return ur.Run(argv, 0, json.dumps({"metadata": {}, "items": []}), "", 0.01)
+
+        def second_pods_page_cut(argv, **kw):
+            if "continue=" in argv[3]:
+                return ur.Run(argv, 74, '{"items": [{"metadata": {"na', "credential proxy output truncated at 8388608 bytes (kept 8388608 bytes of stdout; exit 74)", 0.01)
+            return ur.Run(argv, 0, json.dumps({"metadata": {"continue": "eyJ2IjoibWV0YS5rOHMuaW8vdjEiLCJydiI6MTIzNDU2Nzg5LCJzdGFydCI6ImRlZmF1bHQvd2ViLTdkOWY4YjZjNWQtcTJ4N3pcdTAwMDAifQ"}, "items": [{"metadata": {"name": "a"}}]}), "", 0.01)
+
+        with mock.patch.object(ur, "paged_dump", _shared_run_tests.cr.paged_dump):
+            items, error = ur.paged_json("replicasets,jobs", None, run=jobs_denied, timeout=5, env=None)
+            self.assertEqual((items, error), (None, "kubectl get --raw '/apis/batch/v1/jobs?limit=500' rc=1: denied"))
+            items, error = ur.paged_json("pods", None, run=second_pods_page_cut, timeout=5, env=None)
+        self.assertIsNone(items)
+        self.assertTrue(error.startswith("kubectl get --raw '/api/v1/pods?limit=500&continue=…' rc=74: credential proxy output truncated"), error)
+        self.assertNotIn("eyJ2", error)
 
 
 def symptoms_of(name, reads=None, ops=None, window=SINCE):
@@ -2069,10 +2179,11 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.env.stop()
         self.tmp.cleanup()
 
-    def collect(self, fleet=None, now=NOW, **overrides):
+    def collect(self, fleet=None, now=NOW, session=None, **overrides):
         fleet = fleet or FakeFleet()
+        session = FakeSession() if session is None else session
         with redirect_stderr(io.StringIO()):
-            return ur.collect(args(**overrides), run=fleet, now=now), fleet
+            return ur.collect(args(**overrides), run=fleet, now=now, session=session), fleet
 
     def test_ledger_round_trip_makes_the_second_run_quiet(self):
         result, _ = self.collect()
@@ -4565,7 +4676,7 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertTrue(seeded["what_failed"])
         self.assertEqual([e.split(":")[0] for e in seeded["read_errors"]], ["events"])
         self.assertEqual([s for s in seeded["what_failed"] if s["category"] == "event"], [])
-        self.assertIn(f"- {SEEDED}: events: kubectl get events rc=1", ur.render_report(result).split(ur.INFO_FAILED_READS)[1])
+        self.assertIn(f"- {SEEDED}: events: kubectl get --raw '/api/v1/events?limit=500&fieldSelector=type%3DWarning' rc=1", ur.render_report(result).split(ur.INFO_FAILED_READS)[1])
 
     def test_failed_cluster_listing_is_a_failed_read(self):
         result, _ = self.collect(FakeFleet(list_rc=1))
@@ -4787,10 +4898,11 @@ class ChecksRunTest(unittest.TestCase):
         self.env.stop()
         self.tmp.cleanup()
 
-    def collect(self, fleet=None, now=NOW, **overrides):
+    def collect(self, fleet=None, now=NOW, session=None, **overrides):
         fleet = fleet or FakeFleet()
+        session = FakeSession() if session is None else session
         with redirect_stderr(io.StringIO()):
-            return ur.collect(args(**overrides), run=fleet, now=now), fleet
+            return ur.collect(args(**overrides), run=fleet, now=now, session=session), fleet
 
     def test_a_reviewed_cluster_carries_every_check_with_the_read_that_ran_it(self):
         result, _ = self.collect()
@@ -4802,16 +4914,16 @@ class ChecksRunTest(unittest.TestCase):
         self.assertIn("UPGRADE_MASTER OR UPGRADE_NODES", operations)
         self.assertIn("endTime>=2026-09-24T18:00:00Z OR status!=DONE", operations)
         pods = by_check[ur.CHECK_BROKE_WORKLOAD]
-        self.assertEqual(pods, f"KUBECONFIG={self.tmp.name}/.kubeconfigs/kubeconfig_{PROJECT}_seeded-a_{LOCATION}.yaml kubectl get pods -A -o json")
-        self.assertTrue(by_check[ur.CHECK_NODE_BROKEN].endswith(" kubectl get nodes -o json"))
+        self.assertEqual(pods, f"KUBECONFIG={self.tmp.name}/.kubeconfigs/kubeconfig_{PROJECT}_seeded-a_{LOCATION}.yaml {ur.paged_command_text(['pods'])}")
+        self.assertTrue(by_check[ur.CHECK_NODE_BROKEN].endswith(" " + ur.paged_command_text(["nodes"])))
         for check in (ur.CHECK_SYMPTOM_TENTATIVE, ur.CHECK_SYMPTOM_UNCLASSIFIED, ur.CHECK_SYMPTOM_PREDATES):
             self.assertEqual(by_check[check], pods)
-        self.assertEqual([check for check, _ in ur.CHECK_READS], [ur.CHECK_OPERATION_FAILED, ur.CHECK_BROKE_WORKLOAD, ur.CHECK_NODE_BROKEN, ur.CHECK_SYMPTOM_TENTATIVE, ur.CHECK_SYMPTOM_UNCLASSIFIED, ur.CHECK_SYMPTOM_PREDATES])
+        self.assertEqual([check for check, _ in ur.CHECK_READS], [ur.CHECK_OPERATION_FAILED, ur.CHECK_BROKE_WORKLOAD, ur.CHECK_NODE_BROKEN, ur.CHECK_SYMPTOM_TENTATIVE, ur.CHECK_SYMPTOM_UNCLASSIFIED, ur.CHECK_SYMPTOM_PREDATES, ur.CHECK_LOG_VOLUME])
 
     def test_a_failed_read_drops_the_checks_it_backs(self):
         result, _ = self.collect(FakeFleet(kubectl_fail={("seeded-a", "pods")}))
         seeded = next(r for r in result["reviews"] if r["cluster"] == SEEDED)
-        self.assertEqual([c["check"] for c in seeded["commands"]], [ur.CHECK_OPERATION_FAILED, ur.CHECK_NODE_BROKEN])
+        self.assertEqual([c["check"] for c in seeded["commands"]], [ur.CHECK_OPERATION_FAILED, ur.CHECK_NODE_BROKEN, ur.CHECK_LOG_VOLUME])
         self.assertIn("pods", seeded["partial"])
 
     def test_an_unreadable_cluster_carries_the_listing_backed_check_alone(self):
@@ -4834,15 +4946,15 @@ class ChecksRunTest(unittest.TestCase):
             self.assertEqual(list(by_check), [check for check, _ in ur.CHECK_READS])
             self.assertTrue(by_check[ur.CHECK_OPERATION_FAILED].startswith("gcloud container operations list"))
             # A full run refreshes every fleet cluster's pods, so the checks that read pods name that read.
-            self.assertIn(" kubectl get pods -A -o json", by_check[ur.CHECK_SYMPTOM_TENTATIVE])
-            self.assertIn(" kubectl get nodes -o json", by_check[ur.CHECK_NODE_BROKEN])
+            self.assertIn(" " + ur.paged_command_text(["pods"]), by_check[ur.CHECK_SYMPTOM_TENTATIVE])
+            self.assertIn(" " + ur.paged_command_text(["nodes"]), by_check[ur.CHECK_NODE_BROKEN])
 
     def test_an_unchanged_cluster_whose_recheck_read_failed_drops_the_checks_it_backs(self):
         self.collect()
         second, _ = self.collect(FakeFleet(kubectl_fail=[("seeded-a", "pods")]), now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
         row = next(u for u in second["unchanged"] if u["cluster"] == SEEDED)
         # The listing backs a check whose read did not run, never one whose read ran and failed.
-        self.assertEqual([c["check"] for c in row["commands"]], [ur.CHECK_OPERATION_FAILED, ur.CHECK_NODE_BROKEN])
+        self.assertEqual([c["check"] for c in row["commands"]], [ur.CHECK_OPERATION_FAILED, ur.CHECK_NODE_BROKEN, ur.CHECK_LOG_VOLUME])
         self.assertEqual([c["check"] for c in row["checks_unevaluated"]], [ur.CHECK_BROKE_WORKLOAD, ur.CHECK_SYMPTOM_TENTATIVE, ur.CHECK_SYMPTOM_UNCLASSIFIED, ur.CHECK_SYMPTOM_PREDATES])
         self.assertTrue(all(c["reason"] == "pods read failed" for c in row["checks_unevaluated"]))
         self.assertTrue(row["limitations"].startswith("reads that failed: pods:"))
@@ -4925,11 +5037,12 @@ class ManifestTest(unittest.TestCase):
         self.env.stop()
         self.tmp.cleanup()
 
-    def collect(self, fleet=None, now=NOW, **overrides):
+    def collect(self, fleet=None, now=NOW, session=None, **overrides):
         fleet = fleet or FakeFleet()
+        session = FakeSession() if session is None else session
         overrides.setdefault("manifest_file", str(self.home / "manifest.json"))
         with redirect_stderr(io.StringIO()):
-            return ur.collect(args(**overrides), run=fleet, now=now), fleet
+            return ur.collect(args(**overrides), run=fleet, now=now, session=session), fleet
 
     def document_from(self, manifest):
         """The findings document the SOP writes from this manifest: every
@@ -4964,7 +5077,7 @@ class ManifestTest(unittest.TestCase):
         unclassified = next(c for c in seeded["candidates"] if c["check"] == ur.CHECK_SYMPTOM_UNCLASSIFIED)
         self.assertEqual((unclassified["namespace"], unclassified["object"]), ("seeded-stall", "Deployment/inventory-api"))
         self.assertEqual(unclassified["impact"], ur.UNCLASSIFIED_MITIGATION_TEXT)
-        self.assertTrue(unclassified["command"].endswith(" kubectl get pods -A -o json"))
+        self.assertTrue(unclassified["command"].endswith(" " + ur.paged_command_text(["pods"])))
         budget = next(c for c in seeded["candidates"] if c["object"] == "PodDisruptionBudget/inference-server")
         self.assertEqual((budget["check"], budget["severity"], budget["namespace"]), (ur.CHECK_BROKE_WORKLOAD, ur.MANIFEST_SEVERITY_MAJOR, "seeded-capacity"))
         self.assertIn(f"Mitigate before: {ur.BUDGET_DOWNSTREAM_MITIGATE_BEFORE}", budget["impact"])
@@ -5008,7 +5121,7 @@ class ManifestTest(unittest.TestCase):
         manifest = json.loads(Path(result["manifest_path"]).read_text())
         seeded = next(c for c in manifest["clusters"] if c["name"] == SEEDED)
         self.assertEqual(seeded["outcome"], ur.MANIFEST_OUTCOME_COLLECTED)
-        self.assertEqual([c["check"] for c in seeded["commands"]], [ur.CHECK_OPERATION_FAILED, ur.CHECK_NODE_BROKEN])
+        self.assertEqual([c["check"] for c in seeded["commands"]], [ur.CHECK_OPERATION_FAILED, ur.CHECK_NODE_BROKEN, ur.CHECK_LOG_VOLUME])
         self.assertEqual({c["check"] for c in seeded["checks_unevaluated"]}, {ur.CHECK_BROKE_WORKLOAD, ur.CHECK_SYMPTOM_TENTATIVE, ur.CHECK_SYMPTOM_UNCLASSIFIED, ur.CHECK_SYMPTOM_PREDATES})
         self.assertTrue(seeded["limitations"].startswith("reads that failed: pods:"))
         self.assertTrue(manifest["partial"])
@@ -5021,7 +5134,7 @@ class ManifestTest(unittest.TestCase):
         manifest = json.loads(Path(later["manifest_path"]).read_text())
         seeded = next(c for c in manifest["clusters"] if c["name"] == SEEDED)
         self.assertEqual((seeded["outcome"], seeded["facts"]["status"]), (ur.MANIFEST_OUTCOME_COLLECTED, "unchanged"))
-        self.assertEqual([c["check"] for c in seeded["commands"]], [ur.CHECK_OPERATION_FAILED, ur.CHECK_NODE_BROKEN])
+        self.assertEqual([c["check"] for c in seeded["commands"]], [ur.CHECK_OPERATION_FAILED, ur.CHECK_NODE_BROKEN, ur.CHECK_LOG_VOLUME])
         self.assertEqual({c["check"] for c in seeded["checks_unevaluated"]}, {ur.CHECK_BROKE_WORKLOAD, ur.CHECK_SYMPTOM_TENTATIVE, ur.CHECK_SYMPTOM_UNCLASSIFIED, ur.CHECK_SYMPTOM_PREDATES})
         self.assertTrue(seeded["limitations"].startswith("reads that failed: pods:"))
         self.assertEqual(seeded["candidates"], [])
@@ -5092,7 +5205,7 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual(candidate["persistence"], ["persists since 2026-10-08T18:00:00Z, 2 review(s)", "persists since 2026-10-08T18:00:00Z, 2 review(s)"])
         self.assertNotIn("not_recheckable", candidate)
         self.assertTrue(candidate["excerpt"].startswith(f"guard {ur.guard_id(SEEDED, 2, INFERENCE)} persists since 2026-10-08T18:00:00Z, 2 review(s): "))
-        self.assertTrue(candidate["command"].endswith(" kubectl get pods -A -o json"))
+        self.assertTrue(candidate["command"].endswith(" " + ur.paged_command_text(["pods"])))
         # `finish` spells the set the way the ledger spells ids: derived, then clipped; the id is the
         # first run's finding id, so the finding is held, not resolved and refiled.
         held_id = self.audit_report.published_id(held)
@@ -5207,16 +5320,16 @@ class ManifestTest(unittest.TestCase):
         self.assertNotIn(filed_id, self.audit_report.still_flagged_ids(manifest, {"findings": []}))
         self.assertNotIn(filed_id, self.audit_report.collector_flagged_ids(manifest))
 
-    def test_every_collected_entry_carries_the_six_checks_the_roster_reads(self):
+    def test_every_collected_entry_carries_the_seven_checks_the_roster_reads(self):
         # The contract main's `coverage_gaps` reads: every `scope.clusters` entry is measured against
         # the stream's roster, and a check in neither `checks_run` nor `checks_not_applicable` is a
-        # gap. A reviewed cluster carries all six with the read that decided each. An unchanged
-        # cluster carries all six too: the operations listing that found no upgrade, with the
+        # gap. A reviewed cluster carries all seven with the read that decided each. An unchanged
+        # cluster carries all seven too: the operations listing that found no upgrade, with the
         # cluster's versions, answers every check that asks what the upgrade did, and a check whose
         # read the re-check made is backed by that read instead. The roster is `CHECK_READS`; until
         # the SOP registers it in `AUDITS`, the test registers it the same way.
         roster = tuple(check for check, _ in ur.CHECK_READS)
-        self.assertEqual(len(roster), 6)
+        self.assertEqual(len(roster), 7)
         spec = self.audit_report.AuditSpec("Upgrade retrospective", "upgrade_retrospective_sop.md", roster)
         first, _ = self.collect()
         second, _ = self.collect(now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
@@ -5235,14 +5348,14 @@ class ManifestTest(unittest.TestCase):
             seeded = next(c for c in json.loads(Path(second["manifest_path"]).read_text())["clusters"] if c["name"] == SEEDED)
             commands = {c["check"]: c["command"] for c in seeded["commands"]}
             self.assertTrue(commands[ur.CHECK_OPERATION_FAILED].startswith("gcloud container operations list"))
-            self.assertIn(" kubectl get pods -A -o json", commands[ur.CHECK_BROKE_WORKLOAD])
-            self.assertIn(" kubectl get nodes -o json", commands[ur.CHECK_NODE_BROKEN])
+            self.assertIn(" " + ur.paged_command_text(["pods"]), commands[ur.CHECK_BROKE_WORKLOAD])
+            self.assertIn(" " + ur.paged_command_text(["nodes"]), commands[ur.CHECK_NODE_BROKEN])
             # A read that ran and failed is the gap `coverage_gaps` names: the four pod checks leave
             # `checks_run`, the read is the limitation, and the run is partial.
             third, _ = self.collect(FakeFleet(kubectl_fail=[("seeded-a", "pods")]), now=datetime(2026, 10, 22, 18, 0, tzinfo=timezone.utc))
             manifest = json.loads(Path(third["manifest_path"]).read_text())
             [gap] = self.audit_report.coverage_gaps(self.document_from(manifest))
-            self.assertTrue(gap.startswith(f"{SEEDED}: partially audited — 4 of 6 applicable checks did not run ({ur.CHECK_BROKE_WORKLOAD}, "), gap)
+            self.assertTrue(gap.startswith(f"{SEEDED}: partially audited — 4 of 7 applicable checks did not run ({ur.CHECK_BROKE_WORKLOAD}, "), gap)
             self.assertIn("reads that failed: pods", gap)
             self.assertTrue(manifest["partial"])
 
@@ -5343,12 +5456,12 @@ class ManifestTest(unittest.TestCase):
         unevaluated = [check for check, read in ur.CHECK_READS if read in needed]
         self.assertEqual(len(unevaluated), 5)
         row = next(u for u in second["unchanged"] if u["cluster"] == SEEDED)
-        self.assertEqual(([c["check"] for c in row["commands"]], [c["check"] for c in row["checks_unevaluated"]]), ([ur.CHECK_OPERATION_FAILED], unevaluated))
+        self.assertEqual(([c["check"] for c in row["commands"]], [c["check"] for c in row["checks_unevaluated"]]), ([ur.CHECK_OPERATION_FAILED, ur.CHECK_LOG_VOLUME], unevaluated))
         self.assertIn("re-check failed: RuntimeError('planted')", row["limitations"])
         self.assertEqual({g["id"]: (g["last_seen"], g["reviews"]) for g in second["guards"] if g["cluster"] == SEEDED}, before)
         manifest = json.loads(Path(second["manifest_path"]).read_text())
         seeded = next(e for e in manifest["clusters"] if e["name"] == SEEDED)
-        self.assertEqual((seeded["outcome"], [c["check"] for c in seeded["commands"]], seeded["candidates"]), (ur.MANIFEST_OUTCOME_COLLECTED, [ur.CHECK_OPERATION_FAILED], []))
+        self.assertEqual((seeded["outcome"], [c["check"] for c in seeded["commands"]], seeded["candidates"]), (ur.MANIFEST_OUTCOME_COLLECTED, [ur.CHECK_OPERATION_FAILED, ur.CHECK_LOG_VOLUME], []))
         self.assertEqual([c["check"] for c in seeded["checks_unevaluated"]], unevaluated)
         self.assertTrue(manifest["partial"])
         self.assertEqual([h for h in manifest["still_flagged"] if h["cluster"] == SEEDED], [])
@@ -5959,7 +6072,7 @@ class ManifestTest(unittest.TestCase):
 
         def run(argv, **kwargs):
             result = fleet(argv, **kwargs)
-            if argv[0] == "kubectl" and argv[2] == ur.KUBECTL_READS[-1][1][2]:
+            if argv[0] == "kubectl" and argv[2] == ur.KUBECTL_READS[-1][1]:
                 state["spent"] = True
             return result
 
@@ -6025,8 +6138,8 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual((gemma["reviewed"], gemma["answered"], gemma["partial"]), (False, [], list(ur.CORE_READS)))
         # The read the deadline fell inside carries the budget as its error, the hang's own text after
         # it, so the operator reads a spent budget rather than a hung API server.
-        self.assertTrue(any(e.startswith("pods: kubectl get pods rc=124: " + ur.BUDGET_CUT_TEXT.format(seconds=1, given=1) + "; timed out") for e in gemma["read_errors"]), gemma["read_errors"])
-        self.assertTrue(any(e.startswith("nodes: kubectl get nodes rc=124: " + ur.BUDGET_READ_TEXT.format(seconds=1)) for e in gemma["read_errors"]), gemma["read_errors"])
+        self.assertTrue(any(e.startswith("pods: kubectl get --raw '/api/v1/pods?limit=500' rc=124: " + ur.BUDGET_CUT_TEXT.format(seconds=1, given=1) + "; timed out") for e in gemma["read_errors"]), gemma["read_errors"])
+        self.assertTrue(any(e.startswith("nodes: kubectl get --raw '/api/v1/nodes?limit=100' rc=124: " + ur.BUDGET_READ_TEXT.format(seconds=1)) for e in gemma["read_errors"]), gemma["read_errors"])
         self.assertEqual((result["deferred"], result["budget_spent"]), ([SEEDED], True))
         manifest = json.loads(Path(result["manifest_path"]).read_text())
         entry = next(c for c in manifest["clusters"] if c["name"] == GEMMA)
@@ -6036,6 +6149,42 @@ class ManifestTest(unittest.TestCase):
         self.assertTrue(manifest["partial"])
         self.assertEqual(ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"][GEMMA]["partial_read"], "2026-10-08T18:00:00Z")
         self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
+
+    def test_the_cluster_reads_are_paged_raw_reads_with_the_events_selector(self):
+        """The real paging, not the adapter: every read in KUBECTL_READS is one
+        `kubectl get --raw` collection read per kind, the Warning-events field
+        selector rides on the events pages, a pods continue token is followed,
+        and a page the shim cut (exit 74) fails that read alone, named by rc."""
+        issued = []
+
+        def run(argv, *, timeout=None, env=None):
+            # Each page's Run carries the argv that ran, as `default_run`'s does: the
+            # error names the failing page from it.
+            issued.append(argv)
+            path, _, query = argv[3].partition("?")
+            if path == "/api/v1/pods" and "continue=" not in query:
+                return ur.Run(argv, 0, json.dumps({"metadata": {"continue": "more"}, "items": [{"metadata": {"name": "a", "namespace": "ns", "managedFields": [{}]}}]}), "", 0.01)
+            if path == "/apis/apps/v1/replicasets":
+                return ur.Run(argv, 74, '{"items": [{"metadata": {"na', "credential proxy output truncated at 8388608 bytes (kept 8388608 bytes of stdout; exit 74)", 0.01)
+            return ur.Run(argv, 0, json.dumps({"metadata": {}, "items": []}), "", 0.01)
+
+        with mock.patch.object(ur, "paged_dump", _shared_run_tests.cr.paged_dump):
+            reads, errors = ur.read_cluster(Path(self.tmp.name) / "kc.yaml", run=run)
+        paths = [a[3] for a in issued]
+        self.assertTrue(all(a[:3] == ["kubectl", "get", "--raw"] for a in issued))
+        self.assertIn("/api/v1/events?limit=500&fieldSelector=type%3DWarning", paths)
+        self.assertIn("/api/v1/pods?limit=500&continue=more", paths)
+        self.assertIn("/api/v1/nodes?limit=100", paths)
+        self.assertEqual(["a"], [p["metadata"]["name"] for p in reads["pods"]])
+        self.assertNotIn("managedFields", reads["pods"][0]["metadata"])
+        self.assertEqual([], reads["owners"])
+        self.assertEqual(1, len(errors))
+        # The error names the replicasets page, not the read's kind list, which would not say
+        # which of the two kinds' pages failed.
+        self.assertTrue(errors[0].startswith("owners: kubectl get --raw '/apis/apps/v1/replicasets?limit=500' rc=74: credential proxy output truncated"), errors[0])
+        self.assertNotIn("replicasets,jobs", errors[0])
+        # The jobs page is never asked once the replicasets page failed.
+        self.assertNotIn("/apis/batch/v1/jobs?limit=500", paths)
 
     def test_a_cut_last_read_counts_the_review_and_the_recheck_as_cut(self):
         # When the deadline falls inside the last read a review or a re-check makes, no later read is
@@ -6049,7 +6198,8 @@ class ManifestTest(unittest.TestCase):
         # The last read is an Info-only one (endpoint slices), so the review stays complete on its core
         # reads; the cut is still counted and named under "Reads that failed".
         self.assertEqual((result["budget_spent"], result["budget"]["cut"], result["budget"]["cut_rechecks"], review["partial"]), (True, 1, 0, []))
-        self.assertEqual([e for e in review["read_errors"] if ur.BUDGET_PREFIX_FORMAT.format(seconds=1) in e], [f"{last}: kubectl get {ur.KUBECTL_READS[-1][1][2]} rc=124: " + ur.BUDGET_CUT_TEXT.format(seconds=1, given=1) + "; timed out"])
+        last_page = ur.failed_page_text(ur.collector_run.list_argv(ur.KUBECTL_READS[-1][1]))
+        self.assertEqual([e for e in review["read_errors"] if ur.BUDGET_PREFIX_FORMAT.format(seconds=1) in e], [f"{last}: {last_page} rc=124: " + ur.BUDGET_CUT_TEXT.format(seconds=1, given=1) + "; timed out"])
         self.assertTrue(any(ur.BUDGET_CUT_TEXT.format(seconds=1, given=1) in line for line in result["failed_reads"]), result["failed_reads"])
         # The next run re-checks the cluster for its guards; the re-check's one read cut the same way
         # counts as a re-check cut mid-read, not as a hung read.
@@ -6111,14 +6261,347 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual(ur.AUDIT_ID, "upgrade-retrospective")
 
 
+SOP_PATH = Path(__file__).resolve().parents[3] / "governance" / "upgrade_retrospective_sop.md"
+ORCHESTRATION_SOP_PATH = Path(__file__).resolve().parents[3] / "governance" / "upgrade_rollout_orchestration_sop.md"
+LATER = NOW + timedelta(days=8)  # past every fixture operation's after-week
+KONNECTIVITY = ("kube-system", "konnectivity-agent")
+WINDOW = (datetime(2026, 10, 6, 3, 27, tzinfo=timezone.utc), datetime(2026, 10, 6, 3, 35, tzinfo=timezone.utc))
+
+
+def symptom(obj, entry=1, confidence=None, system=False, predates=False, recreated=False, category=None):
+    return {"object": obj, "category": category or ur.CATEGORY_NOT_READY, "system": system, "predates_upgrade": predates, "recreated_only": recreated, "reason": "x", "classifications": [{"entry": entry, "confidence": confidence or ur.HIGH, "title": "t", "evidence": "e"}]}
+
+
+def review_for(symptoms=(), operations=None, partial=()):
+    """The parts of a review the gate reads."""
+    ops = operations if operations is not None else [{"name": "op-1", "type": "UPGRADE_MASTER", "target": "control plane", "start": "2026-10-06T03:27:00Z", "end": "2026-10-06T03:35:00Z", "duration_s": 480, "status": "DONE", "error": None}]
+    return {"cluster": SEEDED, "project": PROJECT, "location": LOCATION, "name": "seeded-a", "what_happened": {"status": ur.STATUS_UPGRADED, "operations": ops}, "what_failed": list(symptoms), "partial": list(partial), "read_errors": []}
+
+
+class LogVolumeTest(unittest.TestCase):
+    def test_the_two_weeks_are_anchored_on_the_window(self):
+        session = FakeSession()
+        volume = ur.fetch_log_volume(session, PROJECT, "seeded-a", LOCATION, *WINDOW, now=LATER)
+        self.assertIsNone(volume["error"])
+        (_, before, _), (_, after, _) = session.calls
+        self.assertEqual((before["interval.startTime"], before["interval.endTime"]), ("2026-09-29T03:27:00Z", "2026-10-06T03:27:00Z"))
+        self.assertEqual((after["interval.startTime"], after["interval.endTime"]), ("2026-10-06T03:35:00Z", "2026-10-13T03:35:00Z"))
+        self.assertEqual(before["aggregation.alignmentPeriod"], "604800s")
+        self.assertEqual(before["aggregation.groupByFields"], ["resource.labels.namespace_name", "resource.labels.container_name"])
+        self.assertIn('resource.labels.cluster_name="seeded-a"', before["filter"])
+        self.assertTrue(volume["after_complete"])
+        self.assertGreater(volume["before_total"], 0)
+        self.assertGreater(volume["after_total"], 0)
+
+    def test_an_incomplete_after_week_is_clamped_to_now_and_breaches_nothing(self):
+        now = WINDOW[1] + timedelta(days=2)
+        volume = ur.fetch_log_volume(FakeSession(scale={KONNECTIVITY: 10}), PROJECT, "seeded-a", LOCATION, *WINDOW, now=now)
+        self.assertFalse(volume["after_complete"])
+        self.assertEqual(volume["requests"][1]["interval.endTime"], ur.fmt_ts(now))
+        self.assertFalse(any(row["breach"] for row in volume["rows"]))
+
+    def test_rows_breach_on_both_thresholds_only(self):
+        rows = ur.log_volume_rows({("a", "x"): 1 << 30, ("a", "y"): 100, ("a", "z"): 1 << 31}, {("a", "x"): 1 << 31, ("a", "y"): 10_000, ("a", "z"): (1 << 31) + 1, ("b", "new"): 2 << 30}, complete=True)
+        by_name = {(r["namespace"], r["container"]): r for r in rows}
+        self.assertTrue(by_name[("a", "x")]["breach"])  # doubled past the floor
+        self.assertFalse(by_name[("a", "y")]["breach"])  # a hundredfold, under the floor
+        self.assertFalse(by_name[("a", "z")]["breach"])  # large, flat
+        self.assertTrue(by_name[("b", "new")]["breach"])  # new, past the floor
+        self.assertIsNone(by_name[("b", "new")]["ratio"])
+        self.assertEqual(rows[0]["object"], "b/Container/new")  # the largest rise first
+
+    def test_bytes_text_and_the_curl_label(self):
+        self.assertEqual((ur.bytes_text(0), ur.bytes_text(1536), ur.bytes_text(1 << 30)), ("0 B", "1.5 KiB", "1.0 GiB"))
+        volume = ur.fetch_log_volume(FakeSession(), PROJECT, "seeded-a", LOCATION, *WINDOW, now=LATER)
+        command = ur.log_volume_command(PROJECT, volume["requests"])
+        self.assertTrue(command.startswith("curl -sG --oauth2-bearer"))
+        self.assertEqual(command.count("monitoring.googleapis.com/v3/projects/example-project/timeSeries"), 2)
+        self.assertNotIn("pageSize", command)
+        self.assertIn("interval.startTime=2026-09-29T03:27:00Z", command)
+        self.assertLess(len(command), 2000)
+
+    def test_a_new_container_reads_new_not_a_ratio(self):
+        volume = ur.fetch_log_volume(FakeSession(extra_after={("seeded-shapes", "noisy"): 2 << 30}), PROJECT, "seeded-a", LOCATION, *WINDOW, now=LATER)
+        row = next(r for r in volume["rows"] if r["container"] == "noisy")
+        self.assertTrue(row["breach"] and row["ratio"] is None)
+        lines = ur._gate_lines({"verdict": ur.GATE_RISK, "reasons": ["x"], "after_complete": True, "log_volume": volume})
+        self.assertIn("seeded-shapes/noisy: 0 B -> 2.0 GiB per week (new)", lines[1])
+        self.assertNotIn("newx", lines[1])
+
+    def test_a_failed_read_is_the_error_and_no_rows(self):
+        for session, text in ((FakeSession(status=500, text="boom"), "HTTP 500"), (FakeSession(raises=RuntimeError("down")), "down")):
+            volume = ur.fetch_log_volume(session, PROJECT, "seeded-a", LOCATION, *WINDOW, now=LATER)
+            self.assertIn(text, volume["error"])
+            self.assertEqual(volume["rows"], [])
+        self.assertEqual(ur.fetch_log_volume(None, PROJECT, "seeded-a", LOCATION, *WINDOW, now=LATER)["error"], ur.NO_MONITORING_SESSION_TEXT)
+
+
+class GateTest(unittest.TestCase):
+    def gate(self, review, session=None, now=LATER):
+        return ur.cluster_gate(review, WINDOW, FakeSession() if session is None else session, now)
+
+    def test_no_operation_means_no_gate(self):
+        self.assertIsNone(ur.cluster_gate(review_for(), None, FakeSession(), LATER))
+        self.assertIsNone(ur.operation_window([]))
+
+    def test_clear_when_nothing_new_and_the_volume_is_flat(self):
+        gate = self.gate(review_for())
+        self.assertEqual((gate["verdict"], gate["reasons"]), (ur.GATE_CLEAR, [ur.GATE_REASON_CLEAR]))
+        self.assertTrue(gate["after_complete"])
+
+    def test_risk_on_an_error_the_upgrade_brought(self):
+        gate = self.gate(review_for([symptom(INFERENCE)]))
+        self.assertEqual((gate["verdict"], gate["reasons"]), (ur.GATE_RISK, [ur.GATE_REASON_INCIDENT.format(count=1)]))
+
+    def test_risk_on_a_warning_that_does_not_predate(self):
+        self.assertEqual(self.gate(review_for([symptom(TUNER, confidence=ur.MEDIUM, system=True)]))["verdict"], ur.GATE_RISK)
+
+    def test_a_predating_symptom_or_a_recreated_pod_alone_does_not_move_it(self):
+        self.assertEqual(self.gate(review_for([symptom(INFERENCE, predates=True), symptom(PAYMENTS, confidence=ur.MEDIUM, recreated=True)]))["verdict"], ur.GATE_CLEAR)
+
+    def test_risk_on_a_failed_operation(self):
+        failed = [{"name": "op-2", "type": "UPGRADE_NODES", "target": "pool", "start": "2026-10-06T03:27:00Z", "end": "2026-10-06T03:35:00Z", "duration_s": 480, "status": "DONE", "error": "capacity"}]
+        self.assertEqual(self.gate(review_for(operations=failed))["verdict"], ur.GATE_RISK)
+
+    def test_risk_when_a_container_doubles_past_the_floor(self):
+        gate = self.gate(review_for(), FakeSession(scale={KONNECTIVITY: 10}))
+        self.assertEqual((gate["verdict"], gate["reasons"]), (ur.GATE_RISK, [ur.GATE_REASON_LOG_VOLUME.format(count=1)]))
+        self.assertEqual([r["object"] for r in gate["log_volume"]["rows"] if r["breach"]], ["kube-system/Container/konnectivity-agent"])
+
+    def test_pending_until_the_after_week_completes(self):
+        gate = self.gate(review_for(), now=WINDOW[1] + timedelta(days=3))
+        self.assertEqual((gate["verdict"], gate["reasons"]), (ur.GATE_PENDING, [ur.GATE_REASON_AFTER_WEEK.format(at="2026-10-13T03:35:00Z")]))
+
+    def test_pending_when_the_read_fails_and_the_read_error_is_recorded(self):
+        review = review_for()
+        gate = self.gate(review, FakeSession(status=503, text="unavailable"))
+        self.assertEqual(gate["verdict"], ur.GATE_PENDING)
+        self.assertEqual(review["read_errors"], [f"{ur.LOG_VOLUME_READ}: HTTP 503: unavailable"])
+        self.assertIn("HTTP 503", gate["reasons"][0])
+
+    def test_pending_without_a_session_and_no_read_error(self):
+        review = review_for()
+        gate = ur.cluster_gate(review, WINDOW, None, LATER)
+        self.assertEqual((gate["verdict"], review["read_errors"]), (ur.GATE_PENDING, []))
+
+    def test_a_partial_review_is_pending_and_a_risk_still_wins(self):
+        self.assertEqual(self.gate(review_for(partial=["pods"]))["verdict"], ur.GATE_PENDING)
+        self.assertEqual(self.gate(review_for([symptom(INFERENCE)], partial=["pods"]))["verdict"], ur.GATE_RISK)
+
+    def test_the_record_and_the_reread(self):
+        gate = self.gate(review_for(), now=WINDOW[1] + timedelta(days=3))
+        record = ur.gate_record(gate, "2026-10-09T03:35:00Z")
+        self.assertEqual(set(record), {"verdict", "reasons", "first_start", "last_end", "after_complete_at", "after_complete", "recorded_at"})
+        cluster = {"project": PROJECT, "location": LOCATION, "name": "seeded-a"}
+        self.assertEqual(ur.reread_gate(record, cluster, FakeSession(), LATER)["verdict"], ur.GATE_CLEAR)
+        self.assertEqual(ur.reread_gate(record, cluster, FakeSession(scale={KONNECTIVITY: 10}), LATER)["verdict"], ur.GATE_RISK)
+        self.assertEqual(ur.reread_gate(record, cluster, FakeSession(), WINDOW[1] + timedelta(days=4))["verdict"], ur.GATE_PENDING)
+        self.assertIsNone(ur.gate_record(None, "x"))
+
+
+class FamilyTest(unittest.TestCase):
+    def cluster(self, name, family=None):
+        doc = {"project": PROJECT, "location": LOCATION, "name": name}
+        if family:
+            doc["resourceLabels"] = {ur.FAMILY_LABEL_KEY: family}
+        return doc
+
+    def test_members_canaries_and_the_verdict(self):
+        clusters = [self.cluster("a", "regular"), self.cluster("b", "regular"), self.cluster("c", "regular"), self.cluster("d", "held"), self.cluster("e")]
+        key = lambda n: f"{PROJECT}/{LOCATION}/{n}"  # noqa: E731
+        gates = {key("a"): {"verdict": ur.GATE_CLEAR, "reasons": ["x"], "first_start": "2026-10-06T00:00:00Z"}, key("b"): {"verdict": ur.GATE_RISK, "reasons": ["y"], "first_start": "2026-10-07T00:00:00Z"}}
+        rows = ur.family_verdicts(clusters, gates)
+        self.assertEqual([r["family"] for r in rows], ["held", "regular"])
+        held, regular = rows
+        self.assertEqual((held["verdict"], held["canaries"], held["waiting"]), (None, [], [key("d")]))
+        self.assertEqual(regular["verdict"], ur.FAMILY_HOLD)
+        self.assertEqual([c["cluster"] for c in regular["canaries"]], [key("a"), key("b")])
+        self.assertEqual(regular["waiting"], [key("c")])
+        gates[key("b")]["verdict"] = ur.GATE_PENDING
+        self.assertEqual(ur.family_verdicts(clusters, gates)[1]["verdict"], ur.FAMILY_PENDING)
+        gates[key("b")]["verdict"] = ur.GATE_CLEAR
+        self.assertEqual(ur.family_verdicts(clusters, gates)[1]["verdict"], ur.FAMILY_GO)
+        self.assertEqual(ur.family_verdicts([self.cluster("e")], {}), [])
+
+    def test_the_lines_name_the_first_upgraded_member(self):
+        rows = ur.family_verdicts([self.cluster("a", "regular"), self.cluster("b", "regular")], {f"{PROJECT}/{LOCATION}/b": {"verdict": ur.GATE_RISK, "reasons": ["2 container(s) past the log-volume thresholds"], "first_start": "2026-10-06T00:00:00Z"}})
+        lines = ur._families_lines(rows)
+        self.assertEqual(lines[0], ur.INFO_FAMILIES)
+        self.assertIn(f"- regular: first upgraded {PROJECT}/{LOCATION}/b (gate risk: 2 container(s) past the log-volume thresholds); rollout hold; waiting: {PROJECT}/{LOCATION}/a", lines)
+
+
+class GateRunTest(unittest.TestCase):
+    """The gate through a run: the report, the JSON, the ledger and the re-read."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        self.env = mock.patch.dict(os.environ, {ur.HERMES_HOME_ENV: self.tmp.name, ur.STORE_HOME_ENV: self.tmp.name})
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+        self.tmp.cleanup()
+
+    def collect(self, fleet=None, now=NOW, session=None, **overrides):
+        fleet = fleet or FakeFleet()
+        with redirect_stderr(io.StringIO()):
+            return ur.collect(args(**overrides), run=fleet, now=now, session=FakeSession() if session is None else session), fleet
+
+    def test_a_reviewed_cluster_carries_its_gate_in_the_report_the_json_and_the_ledger(self):
+        result, _ = self.collect()
+        seeded = next(r for r in result["reviews"] if r["cluster"] == SEEDED)
+        # The fixture's upgrade brought incidents, so the gate is a risk even
+        # though its after-week is still open; both reasons are listed.
+        self.assertEqual(seeded["gate"]["verdict"], ur.GATE_RISK)
+        self.assertTrue(seeded["gate"]["reasons"][0].endswith("the upgrade brought"), seeded["gate"]["reasons"])
+        self.assertIn(ur.GATE_REASON_AFTER_WEEK.format(at=seeded["gate"]["after_complete_at"]), seeded["gate"]["reasons"])
+        self.assertIn(ur.PART_GATE, result["report"])
+        self.assertIn(ur.PART_LOG_VOLUME, result["report"])
+        self.assertIn(ur.CHECK_LOG_VOLUME, [c["check"] for c in seeded["commands"]])
+        ledger = ur.load_json(self.home / ur.LEDGER_FILENAME, {})
+        self.assertEqual(ledger["clusters"][SEEDED][ur.LEDGER_GATE_KEY]["verdict"], ur.GATE_RISK)
+        self.assertEqual(result["families"], [])
+        clean = next(row for row in result["sections"]["info"]["clean"] if row["cluster"] == SEEDED)
+        self.assertEqual(clean["gate"]["verdict"], ur.GATE_RISK)
+
+    def test_a_pending_gate_is_reread_on_the_next_full_run(self):
+        self.collect()
+        # A cluster whose review left its gate pending (the fixture's review
+        # grades a risk, so the ledger's record is set to the pending case).
+        ledger_path = self.home / ur.LEDGER_FILENAME
+        ledger = ur.load_json(ledger_path, {})
+        ledger["clusters"][SEEDED][ur.LEDGER_GATE_KEY].update(verdict=ur.GATE_PENDING, reasons=[ur.GATE_REASON_AFTER_WEEK.format(at="x")], after_complete=False)
+        ur.write_json_atomically(ledger_path, ledger)
+        second, _ = self.collect(now=LATER)
+        self.assertEqual([u["cluster"] for u in second["unchanged"]], [GEMMA, SEEDED])
+        self.assertEqual([(r["cluster"], r["verdict"]) for r in second["gates_reread"]], [(SEEDED, ur.GATE_CLEAR)])
+        self.assertIn(ur.INFO_GATES_REREAD, second["report"])
+        ledger = ur.load_json(self.home / ur.LEDGER_FILENAME, {})
+        self.assertEqual(ledger["clusters"][SEEDED][ur.LEDGER_GATE_KEY]["verdict"], ur.GATE_CLEAR)
+        third, _ = self.collect(now=LATER + timedelta(days=1))
+        self.assertEqual(third["gates_reread"], [])
+
+    def test_a_breach_found_on_the_reread_is_filed_as_a_warning_and_a_candidate(self):
+        manifest_file = self.home / "manifest.json"
+        first, _ = self.collect()  # the fixture's upgrade is this week: the gate is a risk from the diff with its after-week open
+        seeded = next(r for r in first["reviews"] if r["cluster"] == SEEDED)
+        self.assertEqual((seeded["gate"]["verdict"], seeded["gate"]["after_complete"]), (ur.GATE_RISK, False))
+        second, _ = self.collect(now=LATER, session=FakeSession(scale={KONNECTIVITY: 10}), manifest_file=str(manifest_file))
+        reread = next(r for r in second["gates_reread"] if r["cluster"] == SEEDED)
+        self.assertEqual(reread["verdict"], ur.GATE_RISK)
+        self.assertIn(ur.GATE_REASON_LOG_VOLUME.format(count=1), reread["reasons"])
+        self.assertTrue(any(r.endswith(ur.GATE_REASON_INCIDENT_SUFFIX) for r in reread["reasons"]))
+        warnings = [w for w in second["sections"]["warnings"] if w["kind"] == ur.INCIDENT_LOG_VOLUME]
+        self.assertEqual([(w["cluster"], w["object"]) for w in warnings], [(SEEDED, "kube-system/Container/konnectivity-agent")])
+        self.assertIn("prepare the logging exclusion for kube-system/konnectivity-agent", second["report"])
+        manifest = json.loads(manifest_file.read_text())
+        entry = next(e for e in manifest["clusters"] if e["name"] == SEEDED)
+        self.assertEqual(entry["facts"]["status"], "unchanged")
+        self.assertEqual(entry["facts"]["gate"]["verdict"], ur.GATE_RISK)
+        self.assertEqual([(c["check"], c["object"]) for c in entry["candidates"] if c["check"] == ur.CHECK_LOG_VOLUME], [(ur.CHECK_LOG_VOLUME, "Container/konnectivity-agent")])
+        self.assertIn("curl", next(c["command"] for c in entry["commands"] if c["check"] == ur.CHECK_LOG_VOLUME))
+        ledger = ur.load_json(self.home / ur.LEDGER_FILENAME, {})
+        self.assertTrue(ledger["clusters"][SEEDED][ur.LEDGER_GATE_KEY]["after_complete"])
+        third, _ = self.collect(now=LATER + timedelta(days=1), session=FakeSession(scale={KONNECTIVITY: 10}))
+        self.assertEqual(third["gates_reread"], [])  # a gate read with its week complete stands
+
+    def test_a_breach_is_a_warning_under_the_seventh_check(self):
+        result, _ = self.collect(now=LATER, session=FakeSession(scale={KONNECTIVITY: 10}))
+        warnings = [w for w in result["sections"]["warnings"] if w["kind"] == ur.INCIDENT_LOG_VOLUME]
+        self.assertEqual([(w["cluster"], w["object"], w["check"]) for w in warnings], [(SEEDED, "kube-system/Container/konnectivity-agent", ur.CHECK_LOG_VOLUME)])
+        self.assertIn("prepare the logging exclusion for kube-system/konnectivity-agent", result["report"])
+        seeded = next(r for r in result["reviews"] if r["cluster"] == SEEDED)
+        self.assertEqual(seeded["gate"]["verdict"], ur.GATE_RISK)
+
+    def test_families_from_the_label(self):
+        docs = [cluster_doc("seeded-a"), cluster_doc("gemma-gpu-upgraded")]
+        for doc in docs:
+            doc["resourceLabels"] = {**(doc.get("resourceLabels") or {}), ur.FAMILY_LABEL_KEY: "seeded-regular"}
+        result, _ = self.collect(FakeFleet(clusters=docs))
+        self.assertEqual([(f["family"], f["verdict"]) for f in result["families"]], [("seeded-regular", ur.FAMILY_HOLD)])
+        # Only seeded-a had an upgrade operation in the window; gemma waits.
+        self.assertEqual(([c["cluster"] for c in result["families"][0]["canaries"]], result["families"][0]["waiting"]), ([SEEDED], [GEMMA]))
+        self.assertIn(ur.INFO_FAMILIES, result["report"])
+
+    def test_a_review_with_no_upgrade_carries_the_seventh_check_on_the_listing(self):
+        manifest_file = self.home / "manifest.json"
+        result, _ = self.collect(FakeFleet(operations=[]), manifest_file=str(manifest_file))
+        for review in result["reviews"]:
+            self.assertIsNone(review["gate"])
+            commands = {c["check"]: c["command"] for c in review["commands"]}
+            self.assertEqual(set(commands), {check for check, _ in ur.CHECK_READS})
+            self.assertIn("operations list", commands[ur.CHECK_LOG_VOLUME])
+        manifest = json.loads(manifest_file.read_text())
+        for entry in manifest["clusters"]:
+            self.assertEqual([c["check"] for c in entry["commands"]], [check for check, _ in ur.CHECK_READS])
+            self.assertNotIn("checks_unevaluated", entry)
+
+    def test_a_recorded_gate_keeps_its_family_on_hold_a_week_later(self):
+        docs = [cluster_doc("seeded-a"), cluster_doc("gemma-gpu-upgraded")]
+        for doc in docs:
+            doc["resourceLabels"] = {**(doc.get("resourceLabels") or {}), ur.FAMILY_LABEL_KEY: "seeded-regular"}
+        first, _ = self.collect(FakeFleet(clusters=docs))
+        self.assertEqual(first["families"][0]["verdict"], ur.FAMILY_HOLD)
+        second, _ = self.collect(FakeFleet(clusters=docs), now=LATER)
+        self.assertEqual([u["cluster"] for u in second["unchanged"]], [GEMMA, SEEDED])
+        regular = second["families"][0]
+        self.assertEqual((regular["verdict"], regular["canaries"][0]["cluster"], regular["waiting"]), (ur.FAMILY_HOLD, SEEDED, [GEMMA]))
+        self.assertIn("rollout hold", second["report"])
+
+    def test_a_scoped_diff_lists_the_whole_family(self):
+        docs = [cluster_doc("seeded-a"), cluster_doc("gemma-gpu-upgraded")]
+        for doc in docs:
+            doc["resourceLabels"] = {**(doc.get("resourceLabels") or {}), ur.FAMILY_LABEL_KEY: "seeded-regular"}
+        result, _ = self.collect(FakeFleet(clusters=docs), cluster=[SEEDED], since="30d")
+        self.assertTrue(result["scoped"])
+        self.assertEqual([r["cluster"] for r in result["reviews"]], [SEEDED])
+        regular = result["families"][0]
+        self.assertEqual((sorted(regular["members"]), regular["waiting"]), (sorted([GEMMA, SEEDED]), [GEMMA]))
+
+    def test_a_failed_read_is_an_unevaluated_check_with_its_limitation(self):
+        manifest_file = self.home / "manifest.json"
+        self.collect(session=FakeSession(status=500, text="boom"), manifest_file=str(manifest_file))
+        manifest = json.loads(manifest_file.read_text())
+        entry = next(e for e in manifest["clusters"] if e["name"] == SEEDED)
+        self.assertIn({"check": ur.CHECK_LOG_VOLUME, "reason": f"{ur.LOG_VOLUME_READ} read failed"}, entry["checks_unevaluated"])
+        self.assertIn(ur.LOG_VOLUME_READ, entry["limitations"])
+        self.assertIn(ur.GATE_REASON_READ_FAILED.format(error="HTTP 500: boom"), entry["facts"]["gate"]["reasons"])
+        self.assertNotIn(ur.CHECK_LOG_VOLUME, [c["check"] for c in entry["commands"]])
+
+
+class SopQuotesTest(unittest.TestCase):
+    """The SOPs quote the collector's gate as it is spelled here."""
+
+    def test_the_retrospective_sop_quotes_the_gate(self):
+        sop = SOP_PATH.read_text(encoding="utf-8")
+        for word in (ur.GATE_CLEAR, ur.GATE_RISK, ur.GATE_PENDING, ur.FAMILY_LABEL_KEY):
+            self.assertIn(f"`{word}`", sop, word)
+        self.assertIn(f"(`{ur.CHECK_LOG_VOLUME}`)", sop)
+        self.assertIn(f"at least {ur.LOG_VOLUME_RISK_RATIO} times", sop)
+        self.assertIn("at least 1 GiB", sop)
+        self.assertIn(ur.PART_GATE, sop)
+        self.assertIn(ur.PART_LOG_VOLUME, sop)
+        self.assertIn("--cluster <project>/<location>/<name>", sop)
+
+    def test_the_orchestration_sop_quotes_the_gate(self):
+        sop = ORCHESTRATION_SOP_PATH.read_text(encoding="utf-8")
+        for word in (ur.GATE_CLEAR, ur.GATE_RISK, ur.GATE_PENDING):
+            self.assertIn(f"`{word}`", sop, word)
+        self.assertIn(ur.PART_GATE, sop)
+        self.assertIn(ur.PART_LOG_VOLUME, sop)
+        self.assertIn(f"{ur.LOG_VOLUME_RISK_RATIO} times", sop)
+        self.assertIn("1 GiB", sop)
+        self.assertIn("--cluster <project>/<location>/<canary> --since", sop)
+        self.assertIn(ur.FAMILY_LABEL_KEY, sop)
+
 class SweepEntryTest(unittest.TestCase):
     def test_collect_fleet_is_the_pinned_pool_entry(self):
         # The sweep-pool test across the collectors pins every module that runs a ThreadPoolExecutor
-        # to MAX_WORKERS (the credential proxy's admitted count at the default limit, four) through a
-        # `collect_fleet` entry whose `max_workers` defaults to it.
-        self.assertEqual(ur.MAX_WORKERS, 4)
+        # to a `collect_fleet` entry whose `max_workers` defaults to None and is resolved from the
+        # credential broker's admitted count (broker_admission.sweep_width()).
         self.assertIs(ur.collect, ur.collect_fleet)
-        self.assertEqual(inspect.signature(ur.collect_fleet).parameters["max_workers"].default, ur.MAX_WORKERS)
+        self.assertIsNone(inspect.signature(ur.collect_fleet).parameters["max_workers"].default)
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {ur.HERMES_HOME_ENV: tmp, ur.STORE_HOME_ENV: tmp}):
             with redirect_stderr(io.StringIO()):
                 result = ur.collect_fleet(args(), run=FakeFleet(), now=NOW, max_workers=1)
@@ -6172,6 +6655,41 @@ class DefaultRunTest(unittest.TestCase):
             result = ur.default_run(["kubectl"], timeout=1)
         self.assertEqual((result.rc, result.stdout, result.stderr), (ur.TIMEOUT_RC, "partial", "late"))
         self.assertEqual(ur.default_run(["/nonexistent/binary"]).rc, -1)
+
+
+class ReadsTellTheShimTheirDeadlineTest(unittest.TestCase):
+    """Each read's cap holds one admission wait and one run at most. The deadline under which
+    no retry fits is collector_run's to derive from the cap (test_collector_run.py holds the
+    rule and the binding); what is this file's is that the retrospective's reads, with and
+    without an environment of their own, reach a child that was told it."""
+
+    def test_a_read_with_and_without_its_own_environment_hands_the_child_the_deadline(self):
+        name = ur.collector_run.SHIM_RETRY_DEADLINE_ENV
+        done = subprocess.CompletedProcess(["kubectl"], 0, stdout="", stderr="")
+        with mock.patch.dict(os.environ, {"KUBECONFIG": "/outer"}), mock.patch.object(ur.subprocess, "run", return_value=done) as run:
+            os.environ.pop(name, None)
+            ur.default_run(["gcloud", "container", "operations", "list"])
+            inherited = run.call_args.kwargs["env"]
+            ur.default_run(["kubectl", "get", "nodes"], env={**os.environ, "KUBECONFIG": "/k"})
+            given = run.call_args.kwargs["env"]
+        expected = str(ur.collector_run.shim_retry_deadline(ur.GCLOUD_TIMEOUT_S))
+        self.assertEqual(("/outer", expected), (inherited["KUBECONFIG"], inherited[name]))
+        self.assertEqual(("/k", expected), (given["KUBECONFIG"], given[name]))
+        self.assertEqual("0", expected, "the cap admits no retry")
+
+
+class RecordedReadsUnderTheCommandCapTest(unittest.TestCase):
+    def test_every_recorded_read_passes_the_validator_at_the_longest_path(self):
+        """`draft` copies each read's recorded command into `checks_run`, which `finish` refuses
+        over `MAX_COMMAND_CHARS`; held at the longest kubeconfig path the platform profile makes."""
+        with mock.patch.object(ur, "kubeconfig_dir", return_value=PLATFORM_PROFILE_KUBECONFIG_DIR):
+            kubeconfig = ur.kubeconfig_path(LONGEST_PROJECT, LONGEST_CLUSTER, LONGEST_LOCATION)
+        self.assertTrue(str(kubeconfig).startswith(str(PLATFORM_PROFILE_KUBECONFIG_DIR)), kubeconfig)
+        for name, kinds, query in ur.KUBECTL_READS:
+            with self.subTest(read=name):
+                text = ur.paged_command_text(kinds.split(","), query=query, kubeconfig=kubeconfig)
+                self.assertLessEqual(len(text), audit_report.MAX_COMMAND_CHARS, len(text))
+                self.assertEqual(text, audit_report.validate_check_command(text, "clusters[0]", ur.CHECK_NODE_BROKEN))
 
 
 if __name__ == "__main__":

@@ -33,7 +33,6 @@ import subprocess
 import tempfile
 import threading
 import time
-import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -474,7 +473,7 @@ class ManagedKeysTest(unittest.TestCase):
 
 
 class WriteMintTest(unittest.TestCase):
-    """The executor's in-memory write mint: managed only, cached per host."""
+    """The executor's in-memory write mint: managed only, cached per repository."""
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -498,16 +497,40 @@ class WriteMintTest(unittest.TestCase):
             self.addCleanup(patcher.stop)
 
     def run_helper(self, provider, helper, arguments, action, log_success=False):
+        # The helper mints for the one repository named, as
+        # `--print-write-token` does, and reports that repository alone.
         self.runs.append(arguments)
-        stdout = json.dumps({"token": TOKEN, "repositories": ["acme/infra", "acme/web"]})
+        stdout = json.dumps({"token": TOKEN, "repositories": [arguments[-1]]})
         return credential_proxy.ExecutionResult(exit_code=0, stdout=stdout, stderr="", duration_ms=1, truncated=False, timed_out=False)
 
-    def test_a_managed_repository_is_minted_once_for_the_repositories_the_token_covers(self):
+    def test_a_managed_repository_is_minted_once_and_reused_for_the_window(self):
         self.assertEqual(TOKEN, self.executor.mint_write_credential("github", "acme/infra"))
-        self.assertEqual(TOKEN, self.executor.mint_write_credential("github", "acme/web"))
+        self.assertEqual(TOKEN, self.executor.mint_write_credential("github", "acme/infra"))
         self.assertEqual([[credential_proxy.FORGE_WRITE_MINT_FLAG, credential_proxy.FORGE_HOST_FLAG, HOST, "acme/infra"]],
                          self.runs)
-        self.assertEqual({("github", HOST, "acme")}, set(self.executor._write_tokens))
+        self.assertEqual({("github", HOST, "acme/infra")}, set(self.executor._write_tokens))
+
+    def test_two_repositories_of_one_owner_each_keep_their_token(self):
+        # A mint covers one repository, so each keeps its own slot and
+        # alternating requests mint once per repository, not once per switch.
+        for repo in ("acme/infra", "acme/web", "acme/infra", "acme/web"):
+            self.assertEqual(TOKEN, self.executor.mint_write_credential("github", repo))
+        self.assertEqual([["acme/infra"], ["acme/web"]], [run[-1:] for run in self.runs])
+        self.assertEqual({("github", HOST, "acme/infra"), ("github", HOST, "acme/web")},
+                         set(self.executor._write_tokens))
+
+    def test_a_failed_mint_for_one_repository_keeps_the_other_repositorys_token(self):
+        self.executor.mint_write_credential("github", "acme/infra")
+
+        def refuse(provider, helper, arguments, action, log_success=False):
+            raise RuntimeError("write credential mint failed")
+
+        with mock.patch.object(credential_proxy.CommandExecutor, "_run_forge_helper", side_effect=refuse):
+            with self.assertRaises(RuntimeError):
+                self.executor.mint_write_credential("github", "acme/web")
+        self.assertEqual({("github", HOST, "acme/infra")}, set(self.executor._write_tokens))
+        self.executor.mint_write_credential("github", "acme/infra")
+        self.assertEqual([["acme/infra"]], [run[-1:] for run in self.runs])
 
     def test_an_unmanaged_repository_is_refused_before_anything_runs(self):
         with self.assertRaises(PermissionError):
@@ -525,25 +548,25 @@ class WriteMintTest(unittest.TestCase):
         config = ((f"http.https://{HOST}/.extraheader", "AUTHORIZATION: basic x"), ("credential.helper", ""))
         # A failure that is not a refused credential keeps the token.
         self.executor._drop_write_tokens_refused_by(128, "fatal: repository not found", config)
-        self.assertIn(("github", HOST, "acme"), self.executor._write_tokens)
+        self.assertIn(("github", HOST, "acme/infra"), self.executor._write_tokens)
         self.executor._drop_write_tokens_refused_by(
             128, "fatal: could not read Username for 'https://ghe.other.example': terminal prompts disabled", config)
-        self.assertIn(("github", HOST, "acme"), self.executor._write_tokens)
+        self.assertIn(("github", HOST, "acme/infra"), self.executor._write_tokens)
         self.executor._drop_write_tokens_refused_by(
             128, f"fatal: could not read Username for 'https://{HOST}': terminal prompts disabled", config)
-        self.assertNotIn(("github", HOST, "acme"), self.executor._write_tokens)
+        self.assertNotIn(("github", HOST, "acme/infra"), self.executor._write_tokens)
         self.executor.mint_write_credential("github", "acme/infra")
         self.assertEqual(2, len(self.runs))
 
     def test_two_organisations_each_keep_their_token(self):
-        # A mint covers one organisation, so each keeps its own slot and
-        # alternate requests do not mint again.
+        # Repositories of two owners keep their own slots too, and one
+        # `drop_write_credential` for the forge forgets every slot on its host.
         with mock.patch.object(credential_proxy, "managed_repositories",
                                return_value=frozenset({f"github:{HOST}/acme/infra", f"github:{HOST}/other/x"})):
             for repo in ("acme/infra", "other/x", "acme/infra", "other/x"):
                 self.executor.mint_write_credential("github", repo)
         self.assertEqual([["acme/infra"], ["other/x"]], [run[-1:] for run in self.runs])
-        self.assertEqual({("github", HOST, "acme"), ("github", HOST, "other")}, set(self.executor._write_tokens))
+        self.assertEqual({("github", HOST, "acme/infra"), ("github", HOST, "other/x")}, set(self.executor._write_tokens))
         self.executor.drop_write_credential("github")
         self.assertEqual({}, self.executor._write_tokens)
 
@@ -603,8 +626,8 @@ class RefusedGitCallTest(unittest.TestCase):
 
     def test_a_401_from_git_drops_the_refusing_hosts_token_only(self):
         now = time.monotonic()
-        self.executor._write_tokens[("github", self.host, "acme")] = (now, frozenset({"acme/infra"}), TOKEN)
-        self.executor._write_tokens[("github", "ghe.other.example", "acme")] = (now, frozenset({"acme/infra"}), TOKEN)
+        self.executor._write_tokens[("github", self.host, "acme/infra")] = (now, frozenset({"acme/infra"}), TOKEN)
+        self.executor._write_tokens[("github", "ghe.other.example", "acme/infra")] = (now, frozenset({"acme/infra"}), TOKEN)
         header = "AUTHORIZATION: basic " + base64.b64encode(f"x-access-token:{TOKEN}".encode()).decode()
         config = (
             (f"http.https://{self.host}/.extraheader", header),
@@ -621,21 +644,24 @@ class RefusedGitCallTest(unittest.TestCase):
         self.assertIn("terminal prompts disabled", result.stderr)
         # The token was presented, and the server refused it.
         self.assertIn(header.split(": ", 1)[1].replace("basic", "Basic").lower(), [h.lower() for h in self.seen if h])
-        self.assertNotIn(("github", self.host, "acme"), self.executor._write_tokens)
-        self.assertIn(("github", "ghe.other.example", "acme"), self.executor._write_tokens)
+        self.assertNotIn(("github", self.host, "acme/infra"), self.executor._write_tokens)
+        self.assertIn(("github", "ghe.other.example", "acme/infra"), self.executor._write_tokens)
 
 
 class HelperPrintModeTest(unittest.TestCase):
     def test_it_mints_for_the_host_and_installs_nothing(self):
-        keys = [f"github:{HOST}/acme/infra", f"github:{HOST}/acme/web", f"github:{HOST}/other/x",
-                "github:github.com/acme/dotcom"]
+        # The mint names the one repository asked for: the minter's policy for
+        # a managed repository covers that repository alone, so the other
+        # managed repositories of the organisation are not asked for and the
+        # managed list is not read.
         with mock.patch.object(github_token_refresh, "broker_oidc_token", return_value="oidc"), \
                 mock.patch.object(github_token_refresh, "request_minty_token", return_value=TOKEN) as minty, \
-                mock.patch.object(gitops_workspace, "get_managed_repo_keys", return_value=keys), \
+                mock.patch.object(gitops_workspace, "get_managed_repo_keys") as managed, \
                 mock.patch.object(github_token_refresh.subprocess, "run") as run:
             answer = github_token_refresh.mint_write_token("acme/infra", HOST)
-        self.assertEqual({"token": TOKEN, "repositories": ["acme/infra", "acme/web"]}, answer)
-        minty.assert_called_once_with("oidc", "acme", ["infra", "web"], github_token_refresh.MINTY_WRITE_SCOPE)
+        self.assertEqual({"token": TOKEN, "repositories": ["acme/infra"]}, answer)
+        minty.assert_called_once_with("oidc", "acme", ["infra"], github_token_refresh.MINTY_WRITE_SCOPE)
+        managed.assert_not_called()
         run.assert_not_called()
 
     def test_it_refuses_github_com_and_a_bad_repository(self):
@@ -713,35 +739,14 @@ class ConsumerLinksTest(unittest.TestCase):
         self.assertEqual([{"provider": "github", "repository": f"https://{HOST}/acme/infra"}], seen)
 
 
-class ContentWorkspaceTest(unittest.TestCase):
-    def test_a_bare_name_is_placed_on_the_install_github_host(self):
-        from content_workspace import ContentWorkspaceStore
-
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        root = Path(tmp.name)
-        (root / "agent").mkdir()
-        store = ContentWorkspaceStore(root / "trees", root / "agent", lambda *a, **k: None, github_host=lambda: HOST)
-        self.assertEqual((f"{HOST}/acme/infra", f"https://{HOST}/acme/infra.git"), store._where("acme/infra"))
-        dotcom = ContentWorkspaceStore(root / "trees2", root / "agent", lambda *a, **k: None)
-        self.assertEqual(("acme/infra", "https://github.com/acme/infra.git"), dotcom._where("acme/infra"))
-
-    def test_the_broker_locates_an_enterprise_repository_with_its_host(self):
+class ProviderForgeTest(unittest.TestCase):
+    def test_the_broker_finds_the_enterprise_forge_by_its_provider(self):
         registry = providers.Registry({"forges": [{"provider": "github", "host": HOST}]})
         with mock.patch.object(credential_proxy, "forge_registry", return_value=registry):
-            self.assertEqual((f"{HOST}/acme/infra", f"https://{HOST}/acme/infra.git"),
-                             credential_proxy._workspace_locate(f"{HOST}/acme/infra"))
-            self.assertEqual(HOST, credential_proxy._workspace_github_host())
             self.assertIs(registry.forges[0], credential_proxy._provider_forge("github"))
-        dotcom = providers.Registry({"forges": [{"provider": "github", "host": "github.com"}]})
-        with mock.patch.object(credential_proxy, "forge_registry", return_value=dotcom):
-            self.assertEqual(("acme/infra", "https://github.com/acme/infra.git"),
-                             credential_proxy._workspace_locate("github.com/acme/infra"))
-            self.assertEqual("github.com", credential_proxy._workspace_github_host())
 
 
 WRITE_TOKEN = "mock-write-token-0002"
-READ_TOKEN = "mock-read-token-0003"
 EXTRAHEADER = f"http.https://{HOST}/.extraheader"
 
 
@@ -863,82 +868,6 @@ class VcsBrokerGitTest(_EnterpriseGitCase):
         self.assertEqual({"acme/infra"}, set(minted))
         tip = _git(self.origins[f"https://{HOST}/acme/infra.git"], "rev-parse", "refs/heads/fix/replicas").stdout
         self.assertTrue(tip.strip())
-
-
-class ContentWorkspaceGitTest(_EnterpriseGitCase):
-    """`build_workspace_store` opens a managed and a context repository with the right token."""
-
-    def setUp(self):
-        super().setUp()
-        executor = credential_proxy.CommandExecutor(
-            timeout_seconds=5, max_output_bytes=1 << 16, state_dir=str(self.dir / "state"), scoped_pool=None
-        )
-        self.helper_runs: list[list[str]] = []
-
-        def run_helper(provider, helper, arguments, action, log_success=False):
-            self.helper_runs.append(arguments)
-            if arguments[0] == credential_proxy.FORGE_READ_ONLY_FLAG:
-                stdout = READ_TOKEN
-            else:
-                stdout = json.dumps({"token": WRITE_TOKEN, "repositories": ["acme/infra"]})
-            return credential_proxy.ExecutionResult(exit_code=0, stdout=stdout, stderr="", duration_ms=1,
-                                                    truncated=False, timed_out=False)
-
-        def workspace_git(argv, cwd, config=()):
-            done = self.run_git(argv, cwd, config)
-            return credential_proxy.ExecutionResult(exit_code=done.returncode, stdout=done.stdout,
-                                                    stderr=done.stderr, duration_ms=1, truncated=False,
-                                                    timed_out=False)
-
-        helper = self.dir / "github_token_refresh.py"
-        helper.write_text("")
-        for patcher in (
-            mock.patch.object(credential_proxy, "managed_repositories",
-                              return_value=frozenset({f"github:{HOST}/acme/infra"})),
-            mock.patch.object(credential_proxy, "context_repositories",
-                              return_value=frozenset({f"github:{HOST}/acme/docs"})),
-            mock.patch.object(credential_proxy.CommandExecutor, "_forge_helper", return_value=helper),
-            mock.patch.object(credential_proxy.CommandExecutor, "_run_forge_helper", side_effect=run_helper),
-        ):
-            patcher.start()
-            self.addCleanup(patcher.stop)
-        self.store = credential_proxy.build_workspace_store(types.SimpleNamespace(
-            content_workspace_root=self.dir / "trees",
-            workspace_dir=self.dir / "agent",
-            execute_workspace_git=workspace_git,
-            mint_read_credential=executor.mint_read_credential,
-            mint_write_credential=executor.mint_write_credential,
-            drop_write_credential=executor.drop_write_credential,
-            tls_refusal=executor.tls_refusal,
-        ))
-        (self.dir / "agent").mkdir()
-
-    def test_a_managed_repository_opens_and_pushes_on_the_write_token(self):
-        from content_workspace import Change, repo_relative
-
-        workspace = self.store.open("acme/infra")
-        self.assertEqual(f"{HOST}/acme/infra", workspace.repo)
-        self.store.commit(workspace.handle, "platform-agent/change", "feat: a change",
-                          [Change(repo_relative("notes.md"), b"hello\n")])
-        credential_proxy.require_managed_workspace(self.store, workspace.handle)
-        self.store.push(workspace.handle, "platform-agent/change")
-        remote = self.remote_calls()
-        self.assertIn("clone", [sub for sub, _ in remote])
-        self.assertIn("push", [sub for sub, _ in remote])
-        for sub, config in remote:
-            with self.subTest(subcommand=sub):
-                self.assertEqual(_basic(WRITE_TOKEN), config.get(EXTRAHEADER))
-        # The mint was asked about the forge's path, never the store's host-qualified name.
-        self.assertTrue(self.helper_runs)
-        for arguments in self.helper_runs:
-            self.assertEqual("acme/infra", arguments[-1])
-
-    def test_a_context_repository_opens_on_a_read_token_and_never_the_write_one(self):
-        workspace = self.store.open(f"{HOST}/acme/docs")
-        self.assertEqual(f"{HOST}/acme/docs", workspace.repo)
-        [(sub, config)] = [c for c in self.remote_calls() if c[0] == "clone"]
-        self.assertEqual(_basic(READ_TOKEN), config.get(EXTRAHEADER))
-        self.assertEqual([[credential_proxy.FORGE_READ_ONLY_FLAG, "acme/docs"]], self.helper_runs)
 
 
 BOT = "kube-agents[bot]"

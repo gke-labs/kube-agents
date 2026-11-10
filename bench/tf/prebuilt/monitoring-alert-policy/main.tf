@@ -48,8 +48,10 @@ resource "google_monitoring_alert_policy" "fixture" {
     mime_type = "text/markdown"
   }
 
-  # The same identity labels the per-run clusters carry, so a policy that a
-  # killed run left behind can be found by label and deleted.
+  # The same identity labels the per-run clusters carry. The hourly Compute
+  # plant sweep (hack/ci_sweep_compute_plants.py) deletes a policy with this
+  # managed-by label once it is older than the sweep's age gate, so a run
+  # killed between apply and destroy leaves nothing behind for good.
   user_labels = {
     managed-by  = "kube-agents-bench"
     build-id    = var.prow_build_id != "" ? var.prow_build_id : "local"

@@ -235,7 +235,7 @@ resource "null_resource" "drift" {
       managers="$(kubectl get deployment "${local.workload}" -n "${local.ns}" \
         -o jsonpath='{range .metadata.managedFields[*]}{.manager}{"\n"}{end}')"
       for expected in "${var.gitops_field_manager}" "${var.drift_field_manager}"; do
-        if ! printf '%s\n' "$managers" | grep -qxF "$expected"; then
+        if ! grep -qxF "$expected" <<<"$managers"; then
           echo "ERROR: ${local.workload} does not record field manager '$expected' after the plant, so the ownership the drift record claims is not on the live object. Managers found:" >&2
           printf '%s\n' "$managers" >&2
           exit 1
@@ -285,9 +285,10 @@ resource "null_resource" "drift" {
 
       # ---- 3. Wait for the card ---------------------------------------------
       # The inject returns as soon as the daemon has queued the front-door turn;
-      # the card appears when that turn runs. Without this wait the agent turn
-      # starts first, finds an empty board, and the case grades a correct agent
-      # on a fixture that had not finished.
+      # the card appears when that turn runs, and then takes minutes to finish.
+      # This waits for both, so the agent turn reads a finished card -- left to
+      # poll a running one, the agent is stopped by the runtime's repetition
+      # filter (#3761) and reports a card it never saw finish.
       drift_wait_for_card
     EOT
   }

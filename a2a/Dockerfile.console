@@ -1,6 +1,9 @@
 # The a2a console image: the console page (a2a/web) built to static files,
 # and the Go server that serves them, hands the page its bus credential and
-# proxies its websocket to the bus.
+# proxies its websocket to the bus. It also carries the MCP server
+# (a2a/cmd/mcp), the other console client, which the operator runs from this
+# image with /mcp as its command when an install opts in, so it ships without
+# an image of its own.
 #
 # Build from the a2a/ module root:
 #   docker build --platform linux/amd64 -f Dockerfile.console -t <registry>/a2a-console:<tag> .
@@ -32,13 +35,15 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -o /out/console ./cmd/console
+RUN CGO_ENABLED=0 go build -trimpath -o /out/console ./cmd/console \
+ && CGO_ENABLED=0 go build -trimpath -o /out/mcp ./cmd/mcp
 
 # Distroless nonroot is USER 65532 and the Deployment imposes 1000, so the
 # Deployment sets WorkingDir explicitly -- WORKDIR /home/nonroot is 0700
 # owned by 65532. See hardenedSecurityContext() and #1259.
 FROM ${DISTROLESS_IMAGE}:${DISTROLESS_VERSION}
 COPY --from=build /out/console /console
+COPY --from=build /out/mcp /mcp
 COPY --from=page /web/dist /srv/console
 USER nonroot
 ENTRYPOINT ["/console"]
