@@ -2308,6 +2308,10 @@ _PR_CONTENT_MAX_NAMED = 5
 # The kind `admits_disruption` grades, at the one version a cluster serves.
 _PDB_KIND = "PodDisruptionBudget"
 _PDB_API_VERSION = "policy/v1"
+# An IntOrString percentage, ASCII digits only (int() would take fullwidth
+# ones), and the most a budget's percentage may be.
+_PDB_PERCENT_RE = re.compile(r"([0-9]+)%")
+_PDB_MAX_PERCENT = 100
 
 _NO_PR_RUN_CLOCK_REASON = (
     "the run's transcript carries no start time (TranscriptSnapshot.started_at "
@@ -5409,14 +5413,17 @@ def _is_null(value: Any) -> bool:
     return value is None or (isinstance(value, str) and value.strip() in _YAML_NULL_SPELLINGS)
 
 
-def _selector_rejection(selector: Any, pod_labels: dict[str, str]) -> str | None:
+def _selector_rejection(
+    selector: Any, pod_labels: dict[str, str], *, empty_selects: bool = False
+) -> str | None:
     """Why a policy/v1 label selector does not select pods carrying
     ``pod_labels``, or None when it does.
 
     An absent or null selector selects no pods in policy/v1, and an empty one
     selects every pod in the namespace: a budget over the whole namespace
     counts other workloads' pods against this one's replicas, so neither is
-    the workload's budget.
+    the workload's budget. ``empty_selects`` asks only whether the pods are
+    selected, which an empty selector does.
     """
     shown = ",".join(f"{k}={v}" for k, v in sorted(pod_labels.items()))
     if _is_null(selector):
@@ -5428,6 +5435,8 @@ def _selector_rejection(selector: Any, pod_labels: dict[str, str]) -> str | None
     if not isinstance(match_labels, dict) or not isinstance(expressions, list):
         return "its selector is not a label selector"
     if not match_labels and not expressions:
+        if empty_selects:
+            return None
         return "its selector is empty, which selects every pod in the namespace rather than the workload's"
     for key, value in match_labels.items():
         if pod_labels.get(key) != value:
@@ -5439,21 +5448,25 @@ def _selector_rejection(selector: Any, pod_labels: dict[str, str]) -> str | None
         values = [] if _is_null(expression.get("values")) else expression.get("values")
         if not isinstance(values, list):
             return f"its selector's matchExpressions values for {key!r} is not a list"
-        if _is_null(key):
+        # A label key and its values are strings; "" and "null" are values, so
+        # they are not read as null here.
+        if not isinstance(key, str) or _is_null(key):
             return "a matchExpressions requirement names no key, which the API server refuses"
-        if operator not in ("In", "NotIn", "Exists", "DoesNotExist"):
+        if not all(isinstance(item, str) for item in values):
+            return f"its selector's matchExpressions values for {key!r} are not all strings"
+        if operator not in (_SELECTOR_IN, _SELECTOR_NOT_IN, _SELECTOR_EXISTS, _SELECTOR_DOES_NOT_EXIST):
             return f"its selector's matchExpressions operator {operator!r} is not a Kubernetes one"
-        if (operator in ("In", "NotIn")) != bool(values):
+        if (operator in (_SELECTOR_IN, _SELECTOR_NOT_IN)) != bool(values):
             return (
                 f"its requirement {key} {operator} {values} is one the API server refuses: In and "
                 "NotIn need values, Exists and DoesNotExist take none"
             )
         present = key in pod_labels
-        if operator == "In":
+        if operator == _SELECTOR_IN:
             selected = present and pod_labels[key] in values
-        elif operator == "NotIn":
+        elif operator == _SELECTOR_NOT_IN:
             selected = not present or pod_labels[key] not in values
-        elif operator == "Exists":
+        elif operator == _SELECTOR_EXISTS:
             selected = present
         else:
             selected = not present
@@ -5469,11 +5482,11 @@ def _scaled_count(value: Any, replicas: int) -> int | None:
     if not isinstance(value, str):
         return None
     text = value.strip()
-    if re.fullmatch(r"\d+", text):
+    if _DIGITS_RE.fullmatch(text):
         return int(text)
-    match = re.fullmatch(r"(\d+)%", text)
-    if match and int(match[1]) <= 100:
-        return -(-int(match[1]) * replicas // 100)
+    match = _PDB_PERCENT_RE.fullmatch(text)
+    if match and int(match[1]) <= _PDB_MAX_PERCENT:
+        return -(-int(match[1]) * replicas // _PDB_MAX_PERCENT)
     return None
 
 
@@ -5575,7 +5588,9 @@ def _content_rejection(check: PullRequestContentCheck, files: dict[str, str]) ->
         selecting = [
             label for label, _ in kept
             if isinstance(objects[label].get("spec"), dict)
-            and _selector_rejection(objects[label]["spec"].get("selector"), check.pod_labels) is None
+            and _selector_rejection(
+                objects[label]["spec"].get("selector"), check.pod_labels, empty_selects=True
+            ) is None
         ]
         if len(selecting) > 1:
             return (

@@ -5935,6 +5935,23 @@ def test_admits_disruption_fails_two_budgets_over_the_same_pods(token, github):
     assert "more than one budget selects" in res.reason
 
 
+def test_admits_disruption_counts_an_empty_selector_as_a_second_budget(token, github):
+    """An empty selector selects every pod in the namespace, the workload's too."""
+    files = {f"{_PDB_DIR}/a.yaml": _pdb_yaml("  minAvailable: 1\n"),
+             f"{_PDB_DIR}/b.yaml": _pdb_yaml("  maxUnavailable: 1\n", "  selector: {}\n")}
+    _content_pr(github, files)
+    res = _pr_check(content=[_pdb_check(quantifier="any")]).verify(5.0)
+    assert res.status == "fail"
+    assert "more than one budget selects" in res.reason
+
+
+@pytest.mark.parametrize("value", ["\uff11", "\uff15\uff10%"])
+def test_admits_disruption_refuses_non_ascii_digits(value):
+    """Fullwidth digits read as numbers to int(); the API server refuses them."""
+    doc = yaml.load(_pdb_yaml(f"  minAvailable: {value}\n"), Loader=verifiers._ContentLoader)
+    assert "neither a whole number nor a percentage" in (verifiers._pdb_rejection(doc, 2, _PDB_LABELS) or "")
+
+
 def test_admits_disruption_grades_only_policy_v1():
     for version in ("policy/v1beta1", None):
         doc = yaml.load(_pdb_yaml("  minAvailable: 1\n"), Loader=verifiers._ContentLoader)
@@ -6001,6 +6018,11 @@ def test_admits_disruption_refuses_budgets_that_block_or_bound_nothing(budget, r
         ("  selector:\n    matchExpressions:\n      - {key: tier, operator: NotIn, values: []}\n",
          "the API server refuses"),
         ("  selector:\n    matchExpressions:\n      - {operator: Exists}\n", "names no key"),
+        ("  selector:\n    matchExpressions:\n      - {key: [app], operator: Exists}\n", "names no key"),
+        ("  selector:\n    matchExpressions:\n      - {key: app, operator: In, values: [[checkout-gateway]]}\n",
+         "not all strings"),
+        ("  selector:\n    matchExpressions:\n      - {key: app, operator: NotIn, values: [{a: b}]}\n",
+         "not all strings"),
     ],
 )
 def test_admits_disruption_refuses_a_selector_that_misses_the_workload(selector, why):
