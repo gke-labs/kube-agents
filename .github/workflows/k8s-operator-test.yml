@@ -28,10 +28,11 @@ name: Operator Tests
 # gosec runs here, inside the required check, rather than in security-scan.yml,
 # whose checks the `main-merge-queue` ruleset does not require. On 2026-11-10 a
 # change with a G304 finding merged with that check red, and every pull request
-# rebased onto main inherited the red for four hours (#5228, fixed by #5345). A
+# rebased onto main inherited the red for four and a half hours (#5228, fixed
+# by #5345). A
 # finding now fails `Run Controller Tests`, which no pull request can merge
-# around. tests/test_gosec_in_required_checks.py holds gosec to this workflow
-# and k8sapiproxy-test.yml.
+# around. tests/test_gosec_in_module_checks.py holds gosec to this workflow
+# and the other module checks.
 on:
   pull_request:
     branches: [main, "release/**"]
