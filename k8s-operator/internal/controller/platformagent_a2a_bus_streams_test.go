@@ -1000,3 +1000,23 @@ func TestAJudgedPollRestartsTheUnreachableCount(t *testing.T) {
 		t.Errorf("condition = %+v, want AllPresent still: the judged poll broke the run", c)
 	}
 }
+
+// A CRD that predates status.busReplicas prunes it: the running StatefulSet's
+// count is the bus's then, and the check still judges a one-server bus.
+func TestABusWhoseCountTheStatusDoesNotRecordIsStillJudged(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	live := rig.agent()
+	live.Status.BusReplicas = 0
+	if err := rig.cl.Status().Update(context.Background(), live); err != nil {
+		t.Fatal(err)
+	}
+	// The Job's name follows the stream replicas, so give the CR as it now
+	// reads a completed Job of its own.
+	rig.recreateJob(batchv1.JobComplete)
+	rig.serve(1, a2aProvisionedStreams...)
+	rig.poll()
+	if c := rig.condition(); c == nil || c.Reason != busStreamsReasonAllPresent {
+		t.Errorf("condition = %+v, want AllPresent on a one-server bus whose count the status does not record", c)
+	}
+}

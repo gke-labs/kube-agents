@@ -532,7 +532,7 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 	}
 
 	readings := p.scrapeServers(ctx, agent, sts)
-	verdict := busStreamsVerdictFor(a2aNATSReplicas(agent), readings)
+	verdict := busStreamsVerdictFor(int(busServers(sts)), readings)
 	if !verdict.known {
 		streak.missing, streak.misses = nil, 0
 		streak.unknown++
@@ -700,6 +700,15 @@ func (p *BusStreamPoller) provisionJob(ctx context.Context, agent *agentv1alpha1
 	return job, busJobRunning, nil
 }
 
+// busServers is the bus StatefulSet's server count, the API default of one
+// when unset.
+func busServers(sts *appsv1.StatefulSet) int32 {
+	if sts.Spec.Replicas == nil {
+		return 1
+	}
+	return *sts.Spec.Replicas
+}
+
 // busSettled reads the bus StatefulSet and reports whether it is at rest: the
 // controller has seen its spec, every replica is updated and ready on one
 // revision, and it runs the server count the CR resolves to (not
@@ -712,10 +721,14 @@ func (p *BusStreamPoller) busSettled(ctx context.Context, agent *agentv1alpha1.P
 	if owner := metav1.GetControllerOf(sts); owner == nil || owner.UID != agent.UID {
 		return nil, false, nil
 	}
-	want := int32(a2aNATSReplicas(agent))
-	replicas := int32(1)
-	if sts.Spec.Replicas != nil {
-		replicas = *sts.Spec.Replicas
+	replicas := busServers(sts)
+	// The count the CR records for the running bus, when it records one. A
+	// CRD that predates status.busReplicas prunes it, and a2aNATSReplicas
+	// would then answer its default for a new bus, not the running one; the
+	// StatefulSet is the count then.
+	want := replicas
+	if recorded := agent.Status.BusReplicas; recorded == 1 || recorded == 3 {
+		want = recorded
 	}
 	return sts, sts.Status.ObservedGeneration >= sts.Generation &&
 		replicas == want &&
@@ -737,10 +750,7 @@ func (p *BusStreamPoller) busSettled(ctx context.Context, agent *agentv1alpha1.P
 // count.
 func (p *BusStreamPoller) scrapeServers(ctx context.Context, agent *agentv1alpha1.PlatformAgent, sts *appsv1.StatefulSet) []busServerReading {
 	log := logf.FromContext(ctx).WithName(busStreamsPollerLogName)
-	replicas := int32(1)
-	if sts.Spec.Replicas != nil {
-		replicas = *sts.Spec.Replicas
-	}
+	replicas := busServers(sts)
 	var readings []busServerReading
 	for ordinal := int32(0); ordinal < replicas; ordinal++ {
 		pod := &corev1.Pod{}
