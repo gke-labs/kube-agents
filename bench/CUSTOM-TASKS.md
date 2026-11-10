@@ -701,6 +701,17 @@ and a `quantifier` of `all` (the default) or `any` over the documents kept.
   `not_matches`: the field is there with a value that is not empty or a spelling of null (`~`, `null`) and no value matches, so a node pool that
   leaves its machine type out fails a "not E2" check. `absent`: no kept document has the field, or,
   with `field` empty, no document of that kind; a matching file that does not parse fails it. `exists` and `absent` take no `value`, and `absent` no `quantifier`. An empty list or map still counts as the key being there. A `field` outside the grammar (a quote outside brackets, text glued to a bracket) is refused when the case loads.
+- `admits_disruption` grades a `PodDisruptionBudget` against the workload it protects, which the
+  entry names with `replicas` (2 or more) and `pod_labels`, as the case planted them; the workload's
+  own manifest is not read, since the pull request does not add it. It needs `kind:
+  PodDisruptionBudget` and takes no `field` or `value`. A budget passes when its selector selects
+  pods carrying `pod_labels` (`matchLabels` and the four `matchExpressions` operators; an absent
+  selector selects nothing in `policy/v1` and an empty one the whole namespace, so both fail), it
+  sets exactly one of `minAvailable` and `maxUnavailable`, and with every pod healthy it allows
+  between one and `replicas - 1` evictions: `replicas - minAvailable`, or `maxUnavailable`, with a
+  percentage rounded up as the disruption controller rounds it. `minAvailable: 1` passes over two
+  replicas and fails over one, which no `matches` on the field can tell apart. A quoted number
+  (`"1"`) reads as the number, though the API server refuses it.
 - Every op but `absent` fails when no matching file holds such a document, so a case cannot pass on
   an object nobody added.
 - Only files the pull request adds are read, whole from the files listing's patch, which needs
@@ -726,6 +737,19 @@ and a `quantifier` of `all` (the default) or `any` over the documents kept.
         field: spec.nodeConfig.machineType
         op: not_matches
         value: "^e2-"
+```
+
+```yaml
+- name: the-budget-lets-one-checkout-gateway-pod-drain
+  check:
+    type: pull_request_opened
+    owner: gke-agentic
+    content:
+      - paths: ["clusters/*/seeded-reliability/*.yaml"]
+        kind: PodDisruptionBudget
+        op: admits_disruption
+        replicas: 2
+        pod_labels: { app: checkout-gateway }
 ```
 
 `accepts_stream_pull_request: true` is for a case whose later runs meet a pull request an earlier

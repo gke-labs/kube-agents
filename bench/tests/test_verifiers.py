@@ -5875,6 +5875,150 @@ def test_a_content_check_needs_a_value_for_its_op():
         _pr_check(content=[{"paths": ["x"], "op": "matches", "value": "("}])
 
 
+# ---- content: admits_disruption, a budget graded against the workload it protects
+
+_PDB_DIR = "clusters/seeded-a/seeded-reliability"
+_PDB_LABELS = {"app": "checkout-gateway"}
+
+
+def _pdb_yaml(budget: str, selector: str = "  selector:\n    matchLabels:\n      app: checkout-gateway\n") -> str:
+    return (
+        "apiVersion: policy/v1\nkind: PodDisruptionBudget\nmetadata:\n  name: checkout-gateway-pdb\n"
+        f"  namespace: seeded-reliability\nspec:\n{budget}{selector}"
+    )
+
+
+def _pdb_check(**kw):
+    return {"paths": [f"{_PDB_DIR}/*.yaml"], "kind": "PodDisruptionBudget", "op": "admits_disruption",
+            "replicas": 2, "pod_labels": _PDB_LABELS, **kw}
+
+
+def test_admits_disruption_passes_the_budget_an_eval_run_opened(token, github):
+    """The file kube-agents-evals-26-infra#1187 added, byte for byte."""
+    _content_pr(github, {f"{_PDB_DIR}/checkout-gateway-pdb.yaml": _pdb_yaml("  minAvailable: 1\n")})
+    res = _pr_check(content=[_pdb_check()]).verify(5.0)
+    assert res.status == "pass", res.reason
+
+
+def test_admits_disruption_fails_a_budget_that_blocks_every_drain(token, github):
+    _content_pr(github, {f"{_PDB_DIR}/checkout-gateway-pdb.yaml": _pdb_yaml("  minAvailable: 2\n")})
+    res = _pr_check(content=[_pdb_check()]).verify(5.0)
+    assert res.status == "fail"
+    assert "allows 0 disruptions" in res.reason
+    assert f"{_PDB_DIR}/checkout-gateway-pdb.yaml#0" in res.reason
+
+
+def test_admits_disruption_fails_when_no_budget_was_written(token, github):
+    _content_pr(github, {f"{_PDB_DIR}/hpa.yaml": "kind: HorizontalPodAutoscaler\nmetadata: {name: h}\n"})
+    res = _pr_check(content=[_pdb_check()]).verify(5.0)
+    assert res.status == "fail"
+    assert "adds no such document" in res.reason
+
+
+def test_admits_disruption_reads_a_budget_beside_other_objects(token, github):
+    """Any one good budget passes with quantifier any; all needs every budget good."""
+    good = _pdb_yaml("  maxUnavailable: 1\n")
+    bad = _pdb_yaml("  maxUnavailable: 0\n")
+    _content_pr(github, {f"{_PDB_DIR}/pdbs.yaml": f"kind: Service\nmetadata: {{name: s}}\n---\n{good}---\n{bad}"})
+    assert _pr_check(content=[_pdb_check()]).verify(5.0).status == "fail"
+    _content_pr(github, {f"{_PDB_DIR}/pdbs.yaml": f"kind: Service\nmetadata: {{name: s}}\n---\n{good}---\n{bad}"})
+    res = _pr_check(content=[_pdb_check(quantifier="any")]).verify(5.0)
+    assert res.status == "pass", res.reason
+
+
+@pytest.mark.parametrize(
+    ("budget", "replicas"),
+    [
+        ("  minAvailable: 1\n", 2),
+        ("  maxUnavailable: 1\n", 2),
+        ("  maxUnavailable: 50%\n", 2),
+        ("  minAvailable: 50%\n", 2),
+        ("  minAvailable: 60%\n", 3),
+        ("  maxUnavailable: 34%\n", 3),
+    ],
+)
+def test_admits_disruption_accepts_budgets_that_drain_and_protect(budget, replicas):
+    doc = yaml.load(_pdb_yaml(budget), Loader=verifiers._ContentLoader)
+    assert verifiers._pdb_rejection(doc, replicas, _PDB_LABELS) is None
+
+
+@pytest.mark.parametrize(
+    ("budget", "replicas", "why"),
+    [
+        # gke-agentic/kube-agents-autopush-infra#20: minAvailable 1 over one replica.
+        ("  minAvailable: 1\n", 1, "allows 0 disruptions"),
+        ("  minAvailable: 2\n", 2, "allows 0 disruptions"),
+        ("  minAvailable: 51%\n", 2, "allows 0 disruptions"),
+        ("  minAvailable: 100%\n", 2, "allows 0 disruptions"),
+        ("  maxUnavailable: 0\n", 2, "allows 0 disruptions"),
+        ("  maxUnavailable: 0%\n", 2, "allows 0 disruptions"),
+        ("  minAvailable: 0\n", 2, "protects nothing"),
+        ("  maxUnavailable: 2\n", 2, "protects nothing"),
+        ("  maxUnavailable: 100%\n", 2, "protects nothing"),
+        ("  minAvailable: 1\n  maxUnavailable: 1\n", 2, "sets both"),
+        ("", 2, "sets neither"),
+        ("  minAvailable: ~\n", 2, "sets neither"),
+        ("  minAvailable: one\n", 2, "neither a whole number nor a percentage"),
+        ("  maxUnavailable: 150%\n", 2, "neither a whole number nor a percentage"),
+    ],
+)
+def test_admits_disruption_refuses_budgets_that_block_or_bound_nothing(budget, replicas, why):
+    doc = yaml.load(_pdb_yaml(budget), Loader=verifiers._ContentLoader)
+    assert why in (verifiers._pdb_rejection(doc, replicas, _PDB_LABELS) or "")
+
+
+@pytest.mark.parametrize(
+    ("selector", "why"),
+    [
+        ("  selector:\n    matchLabels:\n      app: checkout\n", "does not select the workload's pods"),
+        ("  selector:\n    matchLabels:\n      app: checkout-gateway\n      tier: web\n", "tier=web"),
+        ("", "has no selector"),
+        ("  selector: {}\n", "selects every pod in the namespace"),
+        ("  selector:\n    matchLabels: {}\n", "selects every pod in the namespace"),
+        ("  selector:\n    matchExpressions:\n      - {key: app, operator: NotIn, values: [checkout-gateway]}\n",
+         "NotIn"),
+        ("  selector:\n    matchExpressions:\n      - {key: app, operator: DoesNotExist}\n", "DoesNotExist"),
+        ("  selector:\n    matchExpressions:\n      - {key: app, operator: Like, values: [x]}\n",
+         "not a Kubernetes one"),
+    ],
+)
+def test_admits_disruption_refuses_a_selector_that_misses_the_workload(selector, why):
+    doc = yaml.load(_pdb_yaml("  minAvailable: 1\n", selector), Loader=verifiers._ContentLoader)
+    assert why in (verifiers._pdb_rejection(doc, 2, _PDB_LABELS) or "")
+
+
+@pytest.mark.parametrize(
+    "selector",
+    [
+        "  selector:\n    matchExpressions:\n      - {key: app, operator: In, values: [checkout-gateway, x]}\n",
+        "  selector:\n    matchExpressions:\n      - {key: app, operator: Exists}\n      - {key: tier, operator: DoesNotExist}\n",
+        "  selector:\n    matchLabels:\n      app: checkout-gateway\n    matchExpressions:\n      - {key: tier, operator: NotIn, values: [batch]}\n",
+    ],
+)
+def test_admits_disruption_accepts_expressions_that_select_the_workload(selector):
+    doc = yaml.load(_pdb_yaml("  minAvailable: 1\n", selector), Loader=verifiers._ContentLoader)
+    assert verifiers._pdb_rejection(doc, 2, _PDB_LABELS) is None
+
+
+@pytest.mark.parametrize(
+    "check",
+    [
+        {"paths": ["x"], "kind": "PodDisruptionBudget", "op": "admits_disruption", "pod_labels": _PDB_LABELS},
+        {"paths": ["x"], "kind": "PodDisruptionBudget", "op": "admits_disruption", "replicas": 2},
+        {"paths": ["x"], "kind": "PodDisruptionBudget", "op": "admits_disruption", "replicas": 1,
+         "pod_labels": _PDB_LABELS},
+        {"paths": ["x"], "op": "admits_disruption", "replicas": 2, "pod_labels": _PDB_LABELS},
+        {"paths": ["x"], "kind": "PodDisruptionBudget", "op": "admits_disruption", "replicas": 2,
+         "pod_labels": _PDB_LABELS, "field": "spec.minAvailable"},
+        {"paths": ["x"], "kind": "PodDisruptionBudget", "op": "exists", "replicas": 2},
+        {"paths": ["x"], "kind": "PodDisruptionBudget", "op": "exists", "pod_labels": _PDB_LABELS},
+    ],
+)
+def test_an_admits_disruption_check_is_refused_without_its_workload(check):
+    with pytest.raises(ValueError):
+        _pr_check(content=[check])
+
+
 def test_a_previous_reps_pull_request_is_a_fail(token, github):
     """The defect this check exists for (#1755). The pool sweep runs between
     leases, not between reps, so rep 1's pull request is still there for rep 2
