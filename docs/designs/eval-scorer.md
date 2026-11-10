@@ -121,7 +121,7 @@ map, for a repetition it could not start because GitHub's token endpoint failed 
 attempt (`record_unit_not_run` in `hack/ci-eval-pr.sh`); the marker is read before the scores map
 is, so that record is `infra` under a reason that carries the launcher's words. The never-ran
 signature covers the producers no one names, such as a transport
-failure that comes back as an empty success with no error string. A second marker,
+failure that comes back as an empty success with no error string; a record whose write-safeguard charge rung 1 set aside is not one of them, because the pull request it charged shows something acted, so it goes on to rungs 2–3. A second marker,
 `KUBE_AGENTS_DELEGATION_CEILING`, names the harness's own delegation wait running out
 (`AGENT_DELEGATION_TIMEOUT`) with the delegated card still running and nothing delivered: the
 record is scored, but what was scored is the acknowledgement the front door gives by design when
