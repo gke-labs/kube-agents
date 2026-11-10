@@ -166,12 +166,14 @@ func TestSlackClicksThroughThePumpBecomeATurnAndARating(t *testing.T) {
 		kept, err := getFeedback(ctx, kv, feedbackKey(origin.TaskID, "U1"))
 		return err == nil && kept.Rating == FeedbackDown
 	})
-	if got := counterValue(t, c.r.g.Metrics().answerFeedback.WithLabelValues(platformSlack, FeedbackDown, answerReply)); got != 1 {
-		t.Errorf("answer_feedback_total{slack,down,reply} = %v, want 1", got)
-	}
+	// The desk keeps the record before it counts it, and the note box opens
+	// only once Rate has returned, so the counter is read after the box.
 	waitFor(t, "the note box", func() bool {
 		c.feedback.mu.Lock()
 		defer c.feedback.mu.Unlock()
 		return len(c.feedback.triggers) == 1 && c.feedback.triggers[0] == "trig-down"
 	})
+	if got := counterValue(t, c.r.g.Metrics().answerFeedback.WithLabelValues(platformSlack, FeedbackDown, answerReply)); got != 1 {
+		t.Errorf("answer_feedback_total{slack,down,reply} = %v, want 1", got)
+	}
 }
