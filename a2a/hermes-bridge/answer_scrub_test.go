@@ -973,3 +973,23 @@ func TestYAMLUnescape_EscapeOutOfRuneRangeIsNotRead(t *testing.T) {
 		}
 	}
 }
+
+// A state word or placeholder under a JSON key that names a credential
+// (password: disabled) is not tracked, so the answer's ordinary use of the
+// word stays.
+func TestSeenSecrets_AStateWordUnderACredentialJSONKeyIsNotTracked(t *testing.T) {
+	var s seenSecrets
+	s.collectToolResult(terminalResult(t, `{"password": "disabled", "token": "required", "api_key": "configured", "clientSecret": "now-expired", "db_password": "${DB_PASSWORD}", "access_token": "`+synthSecretPlain+`"}`))
+	for _, w := range []string{"disabled", "required", "configured", "now-expired", "${DB_PASSWORD}"} {
+		if s.has(w) {
+			t.Errorf("the set tracks %q, a state word or placeholder", w)
+		}
+	}
+	if !s.has(synthSecretPlain) {
+		t.Error("the credential under access_token was not tracked")
+	}
+	const answer = "Basic auth is disabled; a token is required and the key is configured."
+	if got := scrubAnswerText(answer, &s); got != answer {
+		t.Errorf("answer = %q, want it unchanged", got)
+	}
+}

@@ -411,7 +411,9 @@ func (c *toolResultCollector) value(v any, depth int) {
 			if secret && (k == "data" || k == "stringData") {
 				continue // read above
 			}
-			if sv, ok := x.(string); ok && keyClearlyNamesSecret(k) {
+			// A state word or placeholder (password: disabled) is not a
+			// value, as the shape rules say (valueNotASecret).
+			if sv, ok := x.(string); ok && keyClearlyNamesSecret(k) && !valueNotASecret(trimValueEdges(sv)) {
 				c.shapeCaught(sv)
 			}
 			c.value(x, depth)
