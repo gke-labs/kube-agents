@@ -235,7 +235,7 @@ func TestTheConsoleServerLogsInAsTheConsoleIdentity(t *testing.T) {
 }
 
 func TestTheWebsocketOriginsAreTheConsoleServers(t *testing.T) {
-	conf := string(buildA2ANATSConfigSecret(authMapTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(authMapTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 	const want = `allowed_origins: ["http://localhost:8080", "http://127.0.0.1:8080"]`
 	if !strings.Contains(conf, want) {
 		t.Errorf("rendered nats.conf lacks %s", want)

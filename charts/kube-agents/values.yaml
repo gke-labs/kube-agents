@@ -702,10 +702,22 @@ litellm:
     rollingUpdate:
       maxSurge: 1
       maxUnavailable: 0
+    # What the proxy does with answers (hack/replay-proxy/README.md, "Modes").
+    # shadow, the default, saves and serves nothing. record also saves each
+    # answer under cacheDir, for a trusted nightly (job.kind nightly) to
+    # publish. replay serves saved answers instead of calling the model, for
+    # the replay lane (job.kind replay-lane) only, and needs allowServe: true
+    # as well; the schema refuses either of those two without the other, so
+    # one value set by mistake can't serve an answer. hack/ci-env.sh decides
+    # the mode (resolve_replay_shadow). cacheDir is one directory in the data
+    # volume, beside the proxy's logs/ and store/.
+    mode: shadow
+    cacheDir: /data/replay-cache
+    allowServe: false
     # Stamped on every log line (REPLAY_JOB_*). kind is nightly,
-    # nightly-untrusted or presubmit (hack/ci-env.sh, resolve_replay_shadow),
-    # and is required when the proxy is on: an untagged line counts in no
-    # estimate.
+    # nightly-untrusted, presubmit or replay-lane (hack/ci-env.sh,
+    # resolve_replay_shadow), and is required when the proxy is on: an
+    # untagged line counts in no estimate.
     job:
       kind: ""
       project: ""
@@ -1095,11 +1107,13 @@ platformAgent:
     # clusterName required), namespace, reason, kind and name (a trailing *
     # is a prefix), and matches when every part it sets matches; an event is
     # excluded when any rule matches. At most 64 rules. Empty omits the block.
-    # A change rolls the gateway pod. See spec.harness.eventWatcher in the
-    # PlatformAgent CRD reference. Removing the last rule through helm upgrade
-    # removes the CR's whole eventWatcher block, so an enabled: false set there
-    # with kubectl patch is lost too; set it again afterwards. The watcher's
-    # tuning settings are under platformAgent.deployment.eventWatcher.
+    # A change is in force within about two minutes, without a pod restart
+    # (at the next pod restart if the agent image is older than the operator).
+    # See spec.harness.eventWatcher in the PlatformAgent CRD reference.
+    # Removing the last rule through helm upgrade removes the CR's whole
+    # eventWatcher block, so an enabled: false set there with kubectl patch is
+    # lost too; set it again afterwards. The watcher's tuning settings are
+    # under platformAgent.deployment.eventWatcher.
     eventWatcher:
       alertExclude: []
         # - namespace: payments
@@ -1206,6 +1220,18 @@ platformAgent:
       # maxSessions caps the A2A session pods a "next" install runs at once;
       # the operator's default applies when it is unset, and "today" ignores it.
       # maxSessions: 10
+      # admission is the memory admission the kanban dispatcher applies to its
+      # own workers, board-wide: past the budget it refuses a card rather than
+      # spawn a worker, blocking the card with kind "capacity" and telling its
+      # thread. memoryBudgetMiB defaults to the agent container's memory request
+      # in MiB (4096 at the default 4Gi), workerRssCapMiB to 1536,
+      # queueBoundSeconds to 600 and failClosed to true; the operator renders
+      # the block with those defaults when nothing is set here.
+      # admission:
+      #   memoryBudgetMiB: 3072
+      #   workerRssCapMiB: 1536
+      #   queueBoundSeconds: 600
+      #   failClosed: true
       # profiles sizes AgentProfile work on a "next" install: ceiling is the most
       # profile tasks running at once across every profile (default: maxInProgress,
       # 6 unless set), childReserve the share of it kept for child tasks (default
@@ -1382,7 +1408,7 @@ platformAgent:
     # memory limit set without its request, below the default request, lowers
     # that request to the limit. On Autopilot a CPU request the override does
     # not set is held to at most one CPU per GiB of the memory request. The operator
-    # refuses a memory limit below 672Mi (two commands at once), a request
+    # refuses a memory limit below 544Mi (two commands at once), a request
     # above its limit, a
     # negative quantity, a zero limit, claims, and any resource name other than cpu, memory and
     # ephemeral-storage, whether or not its webhook is enabled: the reconciler
@@ -1407,7 +1433,11 @@ platformAgent:
       # The exec tier: stateless broker replicas beside the stateful broker that
       # answer /v1/exec and /v1/gcp/ only, forwarded to the CR as
       # spec.deployment.credentialProxy.exec.replicas when above 0. 0 renders
-      # none. Each replica requests and is limited to 2 CPU and 2Gi. On an
+      # none. Above 0 the shell sandbox, the profile workers and the session
+      # pods are given its address, and a change between 0 and a positive value
+      # restarts the shell sandbox and the profile warm pools (and the A2A
+      # gateway under the cluster view). Each replica requests and is
+      # limited to 2 CPU and 2Gi. On an
       # existing install the chart fails the upgrade when the installed CRD
       # predates the field; apply crds/ first (upgrade.sh does).
       exec:

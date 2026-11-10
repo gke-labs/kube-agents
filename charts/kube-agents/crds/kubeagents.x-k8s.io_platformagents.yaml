@@ -1209,12 +1209,19 @@ spec:
                             replicas:
                               description: |-
                                 Replicas is the number of exec-tier pods. Unset or 0 renders no exec
-                                tier. Each replica requests and is limited to 2 CPU and 2Gi of memory,
-                                with no override. A change between two positive values rewrites the
-                                count the pods read and does not restart them. The operator does not
-                                derive the count from the fleet size. Above 0 the agent's name must be
-                                at most 36 characters, so the tier's objects fit a 63-character name;
-                                a longer one is refused, the tier is not rendered, and Degraded says so.
+                                tier, and callers send every request to the stateful broker. At a
+                                positive count the shell sandbox, the profile workers and the session
+                                pods under the cluster view are given the tier's address for /v1/exec
+                                and /v1/gcp/. Each replica requests and is limited to 2 CPU and 2Gi of
+                                memory, with no override. A change between 0 and a positive value
+                                restarts the shell sandbox, the profile warm pools, and under the
+                                cluster view the A2A gateway, which read the tier's address when they
+                                start; a change between two positive values rewrites the count the pods
+                                read and restarts nothing. The operator does not derive the count from
+                                the fleet size.
+                                Above 0 the agent's name must be at most 36 characters, so the tier's
+                                objects fit a 63-character name; a longer one is refused, the tier is not
+                                rendered, and Degraded says so.
                               format: int32
                               maximum: 32
                               minimum: 0
@@ -1245,9 +1252,9 @@ spec:
                             a listing of a small cluster, and a kubectl listing thousands of objects
                             holds several hundred Mi on its own, so size the limit to the largest
                             listing the fleet produces for every command that runs at once (eight
-                            at the slot cap) plus the 320Mi of fixed reserves (192Mi for the broker
-                            and Envoy, 128Mi for the content workspace); the broker's child peak and
-                            memory high-water series give the figure.
+                            at the slot cap) plus the 192Mi resident reserve for the broker and
+                            Envoy; the broker's child peak and memory high-water series give the
+                            figure.
                             Only cpu, memory and ephemeral-storage
                             are accepted, the quantities the container declares. The operator
                             refuses a memory limit below what admits two commands at once, a request
@@ -5411,9 +5418,10 @@ spec:
                         to the generated Pod template.
                       type: object
                     resources:
-                      description:
-                        Resources specifies resource requests and limits
-                        for the main container.
+                      description: |-
+                        Resources specifies resource requests and limits for the main container.
+                        The memory request is also the dispatcher's default admission budget
+                        (spec.harness.tuning.admission.memoryBudgetMiB).
                       properties:
                         claims:
                           description: |-
@@ -9420,9 +9428,12 @@ spec:
                             The watcher counts what the rules hold back in
                             k8s_event_watcher_events_filtered_total{gate="alert_excluded"}, and the
                             end-of-day recap states how many events and workloads they held back and
-                            names the noisiest workloads. A change rolls the gateway pod. When
-                            this list is set, it replaces a WATCHER_ALERT_EXCLUDE entry in
-                            spec.deployment.env.
+                            names the noisiest workloads. A change is in force within about two
+                            minutes, without a pod restart: the operator writes the list to a
+                            ConfigMap that the watcher reads again every minute. If the agent image
+                            is older than the operator, a change applies at the next pod restart.
+                            When this list is set, it replaces a WATCHER_ALERT_EXCLUDE entry in
+                            spec.deployment.env; a move between the two rolls the pod once.
                           items:
                             description: |-
                               EventWatcherAlertExcludeRule is one alertExclude entry. Every part is
@@ -9955,6 +9966,107 @@ spec:
                         Tuning sets per-persona execution limits. Unset values keep the defaults
                         baked into the agent image.
                       properties:
+                        admission:
+                          description: |-
+                            Admission is the memory admission the kanban dispatcher applies to its own
+                            workers, board-wide like MaxInProgress: the pod memory budget it classifies
+                            pressure against, the resident-memory cap one running worker may reach, how
+                            long a ready card may wait on memory or a full board before it is refused, and
+                            what a tick does when it cannot read memory at all. Past the budget the
+                            dispatcher refuses rather than spawns: the card is blocked with kind
+                            "capacity" and a reason that names the figures, so the thread that filed it is
+                            told it is throttled instead of losing the worker to an eviction. Unset, every
+                            field takes the operator's default, and the budget is the agent container's
+                            memory request (spec.deployment.resources, 4Gi unless set).
+
+                            The block is rendered into the managed scope whatever this field says, so the
+                            dispatcher never runs without one: an install that sets nothing runs the
+                            defaults, and removing a field here puts its default back.
+                          properties:
+                            failClosed:
+                              description: |-
+                                FailClosed is what a tick does when it cannot read the memory counters
+                                at all: true spawns nothing on that tick and logs why; false keeps
+                                Hermes' upstream behaviour, where an unreadable sample imposes no
+                                restriction. Absent means true.
+
+                                Closed is the default because the counters go unreadable on exactly the
+                                installs the budget exists for: a sandbox runtime that hides the cgroup
+                                files is also the one that hides the pressure, and an open tick there
+                                spawns into the eviction the budget was meant to prevent. Set it false
+                                only to diagnose a dispatcher that spawns nothing and logs the read
+                                failure.
+                              type: boolean
+                            memoryBudgetMiB:
+                              description: |-
+                                MemoryBudgetMiB is the pod memory budget, in MiB, the dispatcher
+                                classifies memory pressure against before it spawns a worker: on every
+                                tick it reads the container's working set (its cgroup memory usage less
+                                the inactive file cache, the figure the kubelet evicts on) and counts it
+                                against this figure. Absent means the agent container's resolved memory request
+                                in MiB (4096 at the operator's default resources), so a CR that raises
+                                the request raises the budget with it.
+
+                                Two bounds act on the budget. Each tick admits one new worker per
+                                512 MiB of headroom under it, so with the container's working set at W
+                                the tick spawns at most (budget - W) / 512 workers and none once the
+                                headroom is under 512 MiB; and Hermes' own classification
+                                (gateway/memory_status.py) permits at most one worker with less than
+                                15% of the budget, or 128 MiB, left and none with less than 5%, or
+                                64 MiB. At the default budget the headroom bound acts first. A budget
+                                under the container's idle working set plus 512 MiB therefore admits
+                                no worker and refuses every card after QueueBoundSeconds; the schema's
+                                minimum of 512 is left there for a test install that wants exactly
+                                that, and a derived budget under it is clamped to it. A card the tick
+                                cannot spawn waits, and is refused after QueueBoundSeconds. Set the
+                                budget below the request to keep headroom for the gateway's own growth,
+                                or above it, up to the limit, on a node pool where eviction is not the
+                                risk; past the limit the OOM killer, not this budget, is what stops a
+                                worker.
+                              format: int32
+                              maximum: 65536
+                              minimum: 512
+                              type: integer
+                            queueBoundSeconds:
+                              description: |-
+                                QueueBoundSeconds is how long a ready card may wait, in seconds, on ticks
+                                that could not spawn it because of memory pressure or an exhausted slot
+                                budget, before it is blocked with kind "capacity" instead of left in the
+                                queue. A card that waits for another reason is not touched: one that is
+                                unassigned, not spawnable, held by the respawn guard, by a per-profile
+                                cap or by the per-class slot reservation stays ready, and so does a child
+                                of a request already running (a fan-out's per-cluster cards), whose wait
+                                belongs to the coordinator the thread is subscribed to. Absent means 600.
+
+                                Ten minutes is 120 ticks at the 5s dispatch interval. On a board busy
+                                with other work a card waits minutes for a slot in ordinary operation:
+                                the presubmit install showed two to four while memory was healthy, and a
+                                two-minute bound refused eighteen ordinary cards in one run. The thread
+                                has read the queued line since the first wait; ten minutes is past any
+                                answer it was still waiting for, and a strategy change serves it better.
+                              format: int32
+                              maximum: 3600
+                              minimum: 10
+                              type: integer
+                            workerRssCapMiB:
+                              description: |-
+                                WorkerRssCapMiB is the most resident memory, in MiB, one running
+                                worker's process tree may hold: the worker and every descendant, its MCP
+                                proxies included. A worker past it is stopped (SIGTERM, a grace period,
+                                then SIGKILL) and its card is blocked with kind "capacity" and a reason
+                                that names the figure and the cap, so the thread that filed it is told.
+                                Absent means 1536.
+
+                                The default is three and a half times the 430 MiB a worker measured on
+                                a live install: a fleet-wide audit that holds a large listing fits, and
+                                one worker cannot take the whole of the default budget by itself. A
+                                worker stopped here has done nothing a retry would fix; the reason it
+                                leaves on the card offers a smaller scope instead.
+                              format: int32
+                              maximum: 65536
+                              minimum: 256
+                              type: integer
+                          type: object
                         cluster:
                           description: |-
                             Cluster applies to every `cluster-*` profile (the Cluster Agents). Delivered as a
@@ -10049,7 +10161,7 @@ spec:
                             over the gateway's 1.8 GiB idle set, about 4.4 GiB under its 8Gi memory limit; a
                             coordinator waiting on its own children gives its slot back but stays resident, so
                             processes can sit above six. The credential proxy at its default 2Gi memory limit
-                            admits 9 brokered commands at once, held to 8 by its slot cap, which the stall
+                            admits 10 brokered commands at once, held to 8 by its slot cap, which the stall
                             watch's and cluster-agent reconcile's four-wide listings share. Per-install model
                             rate limits are not measured: a small quota may see 429s at 6, so lower this if
                             worker logs show them.
@@ -10061,9 +10173,9 @@ spec:
                             slot cap binds, and no CR field moves it, so raising the memory limit in
                             spec.deployment.credentialProxy.resources does not help: a command beyond eight
                             waits up to 60 s for a slot and is then refused busy. Keep that limit at 2Gi or
-                            more, since below it the memory budget (176 MiB per command after 320 MiB of fixed
-                            reserves) binds first. Set it to 1 to serialise all delegated work. When quota rather than
-                            memory binds, note the related failure mode: workers that exhaust their retry
+                            more, since below it the memory budget (176 MiB per command after the 192 MiB
+                            resident reserve) binds first. Set it to 1 to serialise all delegated work. When
+                            quota rather than memory binds, note the related failure mode: workers that exhaust their retry
                             budget exit without calling a terminal kanban tool, and the dispatcher reports that
                             as a "protocol violation" rather than as the quota exhaustion it actually is.
                           minimum: 1
@@ -12387,9 +12499,9 @@ spec:
                         LastActiveTime is the time of the last poll in which a counter above
                         moved: a brokered command ran or was refused, a proposal was opened, a
                         chat message reached the gateway, or an event was accepted for triage;
-                        BrokerFailuresTotal, ChatTurnsErroredTotal, BackgroundTasksGaveUpTotal
-                        and NegativeFeedbackTotal alone leave it where it was, and the six
-                        proposal readings never move it.
+                        BrokerFailuresTotal, ChatTurnsErroredTotal, BackgroundTasksGaveUpTotal,
+                        NegativeFeedbackTotal and PositiveFeedbackTotal alone leave it where it
+                        was, and the six proposal readings never move it.
                         Scheduled maintenance jobs that run brokered commands move it too --
                         the Controller Stall Watch cron runs some every 30 minutes by default
                         -- so it marks agent activity of any origin, not human or operator use
@@ -12414,21 +12526,22 @@ spec:
                       type: string
                     negativeFeedbackTotal:
                       description: |-
-                        NegativeFeedbackTotal is the cumulative count of thumbs-down reactions
-                        put on one of the bot's Slack messages: the chat_feedback_reactions hook
-                        on the Hermes gateway counts a -1 or thumbsdown reaction, skin tone or
-                        not, whose reactor is not the bot and whose message is the bot's, once
-                        per reactor and message within one gateway process (a thumbs-down taken
-                        off and put back is one; after a restart the same one counts again, and
-                        a reaction before the first inbound message after a start is not
-                        counted), into the
-                        chat_metrics plugin's kubeagents_chat_feedback_negative_total, which is
-                        read every five minutes and kept monotonic the same way as
-                        ToolExecutionsTotal. Slack through the Hermes gateway only: Google Chat
-                        delivers no reaction events, and the A2A gateway's Slack adapter does not
-                        subscribe to them, so on a next-mode install with Slack through A2A this
-                        stays at 0. Does not move LastActiveTime: the message the person
-                        reacted to already did.
+                        NegativeFeedbackTotal is the cumulative count of thumbs-downs people
+                        gave the bot's answers. On the Hermes gateway the
+                        chat_feedback_reactions hook counts a -1 or thumbsdown reaction on one
+                        of the bot's Slack messages, skin tone or not, whose reactor is not the
+                        bot, once per reactor and message within one gateway process (a
+                        thumbs-down taken off and put back is one; after a restart the same one
+                        counts again, and a reaction before the first inbound message after a
+                        start is not counted), into the chat_metrics plugin's
+                        kubeagents_chat_feedback_negative_total; Google Chat delivers no
+                        reaction events. On a next-mode install the A2A gateway's
+                        kubeagents_a2a_gateway_answer_feedback_total under rating down joins
+                        it: one count each time a verified sender's rating of one of its
+                        answers becomes Bad answer, so a repeated tap adds nothing. Read every
+                        five minutes and kept monotonic the same way as ToolExecutionsTotal.
+                        Does not move
+                        LastActiveTime: the message the person rated already did.
                       format: int64
                       type: integer
                     peopleSeen7d:
@@ -12451,6 +12564,18 @@ spec:
                         kubeagents_a2a_gateway_people_seen under window 30d, the largest reading
                         across gateway pods. A 0 is a reading. Absent on the same terms as
                         PeopleSeen7d. Moves neither LastActiveTime nor LastHumanActiveTime.
+                      format: int64
+                      type: integer
+                    positiveFeedbackTotal:
+                      description: |-
+                        PositiveFeedbackTotal is the cumulative count of times a verified
+                        sender's rating of one of the A2A gateway's answers became Good answer,
+                        so a repeated tap adds nothing:
+                        kubeagents_a2a_gateway_answer_feedback_total under rating up, summed
+                        over its other labels; read every five minutes and kept monotonic the
+                        same way as ToolExecutionsTotal. Next mode only: the Hermes gateway counts no thumbs-up, so on a today-mode
+                        install this stays at 0. Does not move LastActiveTime: the message the
+                        person rated already did.
                       format: int64
                       type: integer
                     proposalHumanTouches:

@@ -30,6 +30,11 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The upgrade-table check reads the commits that added each row and
+          # the release tags; fetch-depth 0 fetches all history and tags, and a
+          # shallow, tagless clone would fail it.
+          fetch-depth: 0
 
       # Tables that mirror jobs.json, images.json, the skill frontmatter, or
       # the provisioning scripts must match their source.
@@ -74,3 +79,10 @@ jobs:
       # A conditional section names the one-line answer the rest write instead.
       - name: Every pull-request template section is answerable
         run: make docs-check-pr-template
+
+      # Each row of the upgrade page's breaking-changes table names the release
+      # an operator first meets the change in. A label written before its
+      # release is cut can name a release that was cut from an earlier commit;
+      # once that release is tagged, the row must be in it.
+      - name: Upgrade-table rows name a release that contains them
+        run: make docs-check-upgrade-releases

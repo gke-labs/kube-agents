@@ -41,14 +41,31 @@ readonly EVAL_NIGHTLY_CASES_FILE="eval/nightly-cases.txt"
 readonly EVAL_GITLAB_CASES_FILE="eval/gitlab-cases.txt"
 readonly EVAL_GHES_CASES_FILE="eval/ghes-cases.txt"
 readonly EVAL_CERTIFICATION_CASES_FILE="eval/certification-cases.txt"
-# The stack-bearing cases of the nightly's main part that run in main-b, when
-# EVAL_NIGHTLY_PART splits that part in two (#3384).
+# What the replay lane runs (EVAL_REPLAY_LANE=true, hack/ci-env.sh): each entry
+# a registered case, replayed from the nightlies' recordings, gating nothing.
+readonly EVAL_REPLAY_LANE_CASES_FILE="eval/replay-lane-cases.txt"
+# The stack-bearing cases of the nightly's main part that run in main-b,
+# main-c, main-d and main-e, when EVAL_NIGHTLY_PART splits that part in five
+# (#3384, #4238): a stack-bearing case on no list runs in main-a, which
+# otherwise holds only the onboarding cases' chain (unit_state_lock).
 readonly EVAL_NIGHTLY_MAIN_B_FILE="eval/nightly-main-b.txt"
-# Which bit of a name's cksum places a case without a stack in main-a or
-# main-b: any bit is a coin toss per name, and bit 2 splits the matrix of
-# 2026-10-19 near evenly where bit 0 did not. scripts/test_ci_eval_nightly.py
-# holds the split within a fifth; if the matrix drifts past that, change it.
-readonly NIGHTLY_HALF_CKSUM_BIT=2
+readonly EVAL_NIGHTLY_MAIN_C_FILE="eval/nightly-main-c.txt"
+readonly EVAL_NIGHTLY_MAIN_D_FILE="eval/nightly-main-d.txt"
+readonly EVAL_NIGHTLY_MAIN_E_FILE="eval/nightly-main-e.txt"
+# The cases of the nightly's writers part that run in writers-b and in
+# writers-c, when EVAL_NIGHTLY_PART splits that part in three (#4238); a
+# writer on neither list runs in writers-a.
+readonly EVAL_NIGHTLY_WRITERS_B_FILE="eval/nightly-writers-b.txt"
+readonly EVAL_NIGHTLY_WRITERS_C_FILE="eval/nightly-writers-c.txt"
+# How many shards a name's cksum deals the main part's cases without a stack
+# into (the cksum shifted right by NIGHTLY_MAIN_CKSUM_SHIFT, modulo this: 0
+# main-a, 1 main-b, 2 main-c, 3 main-d, 4 main-e): a coin toss per name. The
+# shift picks the coin: shift 3 dealt the matrix of 2026-11-06 32/29/29/25/31
+# where no shift dealt it 37/38/21/30/20. scripts/test_ci_eval_nightly.py
+# holds the spread within a quarter of a shard's share; if the matrix
+# drifts past that, change it.
+readonly NIGHTLY_MAIN_SHARDS=5
+readonly NIGHTLY_MAIN_CKSUM_SHIFT=3
 # A fifth file, read beside them and applied on one lane only (#2039): the
 # cases the inject lane does not run, because their premise needs the chat
 # front door. The lane is the one EVAL_INJECT_TRANSPORT below names.
@@ -240,7 +257,8 @@ readonly EVAL_ROLLBACK_LANE_END_MODE="today"
 # pod's shell container, the scratch directory audit_report.py writes its
 # in-flight note under, the bound on one `kubectl exec` round trip, and how
 # long a unit waits for a live run to release its own note before removing
-# it. The unit's delegation ceiling is not the worker's death -- the record
+# it; a unit with no ledger spends it once per stream it declares. The
+# unit's delegation ceiling is not the worker's death -- the record
 # under AGENT_DELEGATION_TIMEOUT below shows a worker rewriting its ledger
 # five minutes after the wait gave up -- so a note found at the next unit's
 # start may still be a live run's; 300s covers that record. The lock
@@ -681,6 +699,10 @@ publish_eval_dashboard() {
   fi
   if [ "${EVAL_TIER:-}" = "certification" ]; then
     echo "eval-dashboard publish skipped: EVAL_TIER=certification: the certification lane's record is its logs bucket, read by the certified-capabilities page, not the nightly dashboard"
+    return 0
+  fi
+  if [ "${EVAL_REPLAY_LANE:-}" = "true" ]; then
+    echo "eval-dashboard publish skipped: EVAL_REPLAY_LANE=true: replayed runs repeat the nightly's recordings, which is not main's live history"
     return 0
   fi
   if [ -z "${EVAL_DASHBOARD_TARGET:-}" ]; then
@@ -1154,6 +1176,10 @@ export AGENT_CLUSTER_CONTEXT="gke_${PROJECT_ID}_${REGION}_${HOST_CLUSTER_NAME}"
 # From here to the EXIT trap, a replaced agent pod or restarted container is
 # on record however early it happens (collect_agent_pod_diagnostics).
 start_agent_pod_watch
+# On the replay lane, the nightlies' recorded answers go into every proxy pod
+# before any case runs; with nothing to replay the lane stops here, having
+# measured nothing (hack/ci-env.sh). A no-op on every other run.
+prepare_replay_lane_cache || exit 1
 # Under EVAL_REPLAY_SHADOW=true, the shadow proxy's lines and stored text go
 # to the private bucket from here on, while the eval runs (hack/ci-env.sh).
 start_replay_shadow_collector
@@ -3070,22 +3096,65 @@ case "${EVAL_TIER}" in
     ;;
 esac
 
+# ─── The replay lane (examples/inference-replay/eval-design.md, Rollout 2) ───
+# EVAL_REPLAY_LANE=true replaces the matrix with hack/eval/replay-lane-cases.txt:
+# registered cases (a presubmit or nightly entry), each replayed from what the
+# nightlies recorded. The lane gates nothing and records nothing as main's
+# history (the recorder decision and the dashboard hook below both skip it);
+# its report is the collector's, in the private shadow bucket. It runs on the
+# presubmit tier's defaults and GitHub only.
+case "${EVAL_REPLAY_LANE:-false}" in
+  false) ;;
+  true)
+    if [ "${EVAL_TIER}" != "presubmit" ] || [ -n "${LANE_CASES_FILE}" ]; then
+      echo "ERROR: EVAL_REPLAY_LANE=true runs its own roster on GitHub; unset EVAL_TIER (${EVAL_TIER}) and EVAL_FORGE (${EVAL_FORGE})." >&2
+      exit 1
+    fi
+    REPLAY_LANE_CASES_FILE="${SCRIPT_DIR}/${EVAL_REPLAY_LANE_CASES_FILE}"
+    REPLAY_LANE_ENTRIES="$(roster_entries "${REPLAY_LANE_CASES_FILE}")"
+    REPLAY_LANE_TASKS=()
+    while IFS= read -r ENTRY; do
+      if [ -n "${ENTRY}" ]; then REPLAY_LANE_TASKS+=("${ENTRY}"); fi
+    done <<< "${REPLAY_LANE_ENTRIES}"
+    if [ "${#REPLAY_LANE_TASKS[@]}" -eq 0 ]; then
+      echo "ERROR: ${REPLAY_LANE_CASES_FILE} names no case; the replay lane would replay nothing." >&2
+      exit 1
+    fi
+    for ENTRY in "${REPLAY_LANE_TASKS[@]}"; do
+      if ! printf '%s\n' "${PRESUBMIT_ENTRIES}" "${NIGHTLY_ENTRIES}" | grep -qxF -- "${ENTRY}"; then
+        echo "ERROR: ${REPLAY_LANE_CASES_FILE}: '${ENTRY}' is in neither ${PRESUBMIT_CASES_FILE} nor ${NIGHTLY_CASES_FILE}; the lane replays what the nightly records." >&2
+        exit 1
+      fi
+    done
+    TASKS=("${REPLAY_LANE_TASKS[@]}")
+    echo "EVAL_REPLAY_LANE=true: the replay lane replays ${#TASKS[@]} case(s) (${EVAL_REPLAY_LANE_CASES_FILE}); nothing it grades is recorded or gates anything"
+    ;;
+  *)
+    echo "ERROR: EVAL_REPLAY_LANE must be 'true' or 'false', got '${EVAL_REPLAY_LANE}'." >&2
+    exit 1
+    ;;
+esac
+
 # Which part of the nightly matrix this run takes, so the nightly can run as
-# two periodics on two leased projects: the cases that request a pull request
+# several periodics on leased projects of their own: the cases that request a pull request
 # run one unit at a time after every other unit (unit_phase, below), and on
 # one project that phase and the infra lock's stretch did not fit the then-480m
 # deadline together. "all", the default, is the whole matrix; "main" leaves
-# those cases out and "writers" runs them alone. "main-a" and "main-b" split
-# "main" again, so it can run as two periodics on two leased projects:
-# its length is set by the stack-bearing units, which run one at a time under
-# lock-infra, and each project has a lock of its own (#3384). The split is
+# those cases out and "writers" runs them alone. "main-a" to "main-e" split
+# "main" again, so it can run as five periodics on five leased projects: its
+# length is set by the stack-bearing units, which run one at a time under
+# lock-infra, and by the onboarding cases' chain under their state lock, and
+# each project has locks of its own (#3384, #4238). "writers-a",
+# "writers-b" and "writers-c" split "writers" in three the same way: its
+# units run one at a time, each after the project's one GitOps repository is
+# reset, and each project has a repository of its own (#4238). The split is
 # applied after the lane step, which is what names the writers. A part
 # outside the nightly would silently run a subset of the presubmit, so it
 # stops the job, as does any other value.
 EVAL_NIGHTLY_PART="${EVAL_NIGHTLY_PART:-all}"
 case "${EVAL_NIGHTLY_PART}" in
   all) ;;
-  main | main-a | main-b | writers)
+  main | main-a | main-b | main-c | main-d | main-e | writers | writers-a | writers-b | writers-c)
     if [ "${EVAL_TIER}" != "nightly" ]; then
       echo "ERROR: EVAL_NIGHTLY_PART=${EVAL_NIGHTLY_PART} selects part of the nightly matrix, but EVAL_TIER=${EVAL_TIER}; unset it, or set it to 'all', outside the nightly." >&2
       exit 1
@@ -3096,7 +3165,7 @@ case "${EVAL_NIGHTLY_PART}" in
     fi
     ;;
   *)
-    echo "ERROR: EVAL_NIGHTLY_PART must be 'all', 'main', 'main-a', 'main-b' or 'writers', got '${EVAL_NIGHTLY_PART}'." >&2
+    echo "ERROR: EVAL_NIGHTLY_PART must be 'all', 'main', 'main-a', 'main-b', 'main-c', 'main-d', 'main-e', 'writers', 'writers-a', 'writers-b' or 'writers-c', got '${EVAL_NIGHTLY_PART}'." >&2
     exit 1
     ;;
 esac
@@ -3524,21 +3593,37 @@ fi
 # The "Nightly part:" line is the record of which part a night ran, and
 # names the cases the part left out.
 #
-# main-a and main-b halve the main part. A stack-bearing case (task_stack,
-# off infra_lock_exempt) runs in main-b when NIGHTLY_MAIN_B_FILE lists it and
-# in main-a otherwise: their one-at-a-time chain under lock-infra is what sets
-# the part's length, and that file is chosen to balance it. A case without a
-# stack goes by one bit of its name's cksum (NIGHTLY_HALF_CKSUM_BIT). The
-# onboarding cases (unit_state_lock) all go to main-a: they rewrite one
-# install's onboarding state, and only a run on one install keeps them apart.
-# No rule reads the matrix's order or size: a case's half follows from its
-# name, its task file's stack line, NIGHTLY_MAIN_B_FILE and the helpers below.
-# So the two halves, two periodics that each check out main for themselves,
-# agree on the split when a merge that adds or drops other cases lands between
-# their checkouts. A merge between them that edits one of those inputs for a
-# case can run that case in both halves, or in neither, for one night. The
-# three helpers are defined here, ahead of the fan-out further down that also
-# uses them, because the split runs first.
+# main-a to main-e shard the main part. Two chains set a shard's length: the
+# stack-bearing units' one-at-a-time chain under lock-infra, and the
+# onboarding cases' chain under their state lock (unit_state_lock), which
+# rewrite one install's onboarding state and so all run in main-a, the one
+# install that keeps them apart. The onboarding chain alone ran 380-480 min
+# of wall clock on the nights of 2026-11-04 to 11-06, and beside main-a's
+# half of the stack chain it put main-a at 672-843 min while main-b, with the
+# same number of stack cases and no onboarding chain, took 449-749. So main-a
+# carries the onboarding chain and no other stack case: a stack-bearing case
+# (task_stack, off infra_lock_exempt) runs in the shard whose list names it,
+# NIGHTLY_MAIN_B_FILE to NIGHTLY_MAIN_E_FILE, and in main-a otherwise (a new
+# one, until a list moves it); the four lists are chosen to balance the four
+# stack chains, each about a quarter of the old half, so a new stack case
+# has room. A case without a stack goes by its name's cksum (shifted by
+# NIGHTLY_MAIN_CKSUM_SHIFT, modulo NIGHTLY_MAIN_SHARDS). No rule reads the
+# matrix's order or size: a case's shard follows from its name, its task
+# file's stack line, the four lists and the helpers below. So the five shards,
+# five periodics that each check out main for themselves, agree on the split
+# when a merge that adds or drops other cases lands between their checkouts.
+# A merge between them that edits one of those inputs for a case can run that
+# case in two shards, or in none, for one night. The three helpers are
+# defined here, ahead of the fan-out further down that also uses them,
+# because the split runs first.
+#
+# writers-a, writers-b and writers-c third the writers part by name alone: a
+# writer runs in writers-b when NIGHTLY_WRITERS_B_FILE lists it, in writers-c
+# when NIGHTLY_WRITERS_C_FILE does, and in writers-a otherwise, so a new
+# writer (a requesting case, a stopped ask or a writes_alone case) lands in
+# writers-a until a list moves it.
+# The thirds agree between checkouts as the main shards do, with the same
+# one-night exception for a merge that edits a list.
 
 # Reads infrastructure.stack out of a task file. The nightly part split uses
 # it to tell a stack-bearing case, and the fan-out's loop to decide whether
@@ -3585,13 +3670,32 @@ unit_state_lock() { # <task-name>
 }
 
 NIGHTLY_MAIN_B_FILE="${SCRIPT_DIR}/${EVAL_NIGHTLY_MAIN_B_FILE}"
+NIGHTLY_MAIN_C_FILE="${SCRIPT_DIR}/${EVAL_NIGHTLY_MAIN_C_FILE}"
+NIGHTLY_MAIN_D_FILE="${SCRIPT_DIR}/${EVAL_NIGHTLY_MAIN_D_FILE}"
+NIGHTLY_MAIN_E_FILE="${SCRIPT_DIR}/${EVAL_NIGHTLY_MAIN_E_FILE}"
+NIGHTLY_WRITERS_B_FILE="${SCRIPT_DIR}/${EVAL_NIGHTLY_WRITERS_B_FILE}"
+NIGHTLY_WRITERS_C_FILE="${SCRIPT_DIR}/${EVAL_NIGHTLY_WRITERS_C_FILE}"
 NIGHTLY_PART_DROPPED=""
 if [ "${EVAL_TIER}" = "nightly" ]; then
   NIGHTLY_MATRIX_SIZE="${#TASKS[@]}"
   if [ "${EVAL_NIGHTLY_PART}" != "all" ]; then
     NIGHTLY_MAIN_B=""
+    NIGHTLY_MAIN_C=""
+    NIGHTLY_MAIN_D=""
+    NIGHTLY_MAIN_E=""
+    NIGHTLY_WRITERS_B=""
+    NIGHTLY_WRITERS_C=""
     case "${EVAL_NIGHTLY_PART}" in
-      main-a | main-b) NIGHTLY_MAIN_B="$(roster_entries "${NIGHTLY_MAIN_B_FILE}")" ;;
+      main-a | main-b | main-c | main-d | main-e)
+        NIGHTLY_MAIN_B="$(roster_entries "${NIGHTLY_MAIN_B_FILE}")"
+        NIGHTLY_MAIN_C="$(roster_entries "${NIGHTLY_MAIN_C_FILE}")"
+        NIGHTLY_MAIN_D="$(roster_entries "${NIGHTLY_MAIN_D_FILE}")"
+        NIGHTLY_MAIN_E="$(roster_entries "${NIGHTLY_MAIN_E_FILE}")"
+        ;;
+      writers-a | writers-b | writers-c)
+        NIGHTLY_WRITERS_B="$(roster_entries "${NIGHTLY_WRITERS_B_FILE}")"
+        NIGHTLY_WRITERS_C="$(roster_entries "${NIGHTLY_WRITERS_C_FILE}")"
+        ;;
     esac
     NIGHTLY_PART_KEPT=()
     for ENTRY in "${TASKS[@]}"; do
@@ -3601,15 +3705,38 @@ if [ "${EVAL_TIER}" = "nightly" ]; then
         *) ENTRY_PART="main" ;;
       esac
       case "${EVAL_NIGHTLY_PART}:${ENTRY_PART}" in
-        main-a:main | main-b:main)
+        main-a:main | main-b:main | main-c:main | main-d:main | main-e:main)
           if [ "$(unit_state_lock "${NAME}")" = "onboarding" ]; then
             ENTRY_PART="main-a"
           elif [ -n "$(task_stack "${BENCH_DIR}/${ENTRY}")" ] && ! infra_lock_exempt "${NAME}"; then
-            if grep -qxF -- "${NAME}" <<< "${NIGHTLY_MAIN_B}"; then ENTRY_PART="main-b"; else ENTRY_PART="main-a"; fi
-          elif [ $(( ($(printf '%s' "${NAME}" | cksum | cut -d' ' -f1) >> NIGHTLY_HALF_CKSUM_BIT) & 1 )) -eq 1 ]; then
-            ENTRY_PART="main-b"
+            if grep -qxF -- "${NAME}" <<< "${NIGHTLY_MAIN_B}"; then
+              ENTRY_PART="main-b"
+            elif grep -qxF -- "${NAME}" <<< "${NIGHTLY_MAIN_C}"; then
+              ENTRY_PART="main-c"
+            elif grep -qxF -- "${NAME}" <<< "${NIGHTLY_MAIN_D}"; then
+              ENTRY_PART="main-d"
+            elif grep -qxF -- "${NAME}" <<< "${NIGHTLY_MAIN_E}"; then
+              ENTRY_PART="main-e"
+            else
+              ENTRY_PART="main-a"
+            fi
           else
-            ENTRY_PART="main-a"
+            case $(( ($(printf '%s' "${NAME}" | cksum | cut -d' ' -f1) >> NIGHTLY_MAIN_CKSUM_SHIFT) % NIGHTLY_MAIN_SHARDS )) in
+              1) ENTRY_PART="main-b" ;;
+              2) ENTRY_PART="main-c" ;;
+              3) ENTRY_PART="main-d" ;;
+              4) ENTRY_PART="main-e" ;;
+              *) ENTRY_PART="main-a" ;;
+            esac
+          fi
+          ;;
+        writers-a:writers | writers-b:writers | writers-c:writers)
+          if grep -qxF -- "${NAME}" <<< "${NIGHTLY_WRITERS_B}"; then
+            ENTRY_PART="writers-b"
+          elif grep -qxF -- "${NAME}" <<< "${NIGHTLY_WRITERS_C}"; then
+            ENTRY_PART="writers-c"
+          else
+            ENTRY_PART="writers-a"
           fi
           ;;
       esac
@@ -3932,6 +4059,11 @@ BLOCKING_ROSTER_ON_LANE=""
 if [ "${EVAL_TIER}" = "certification" ]; then
   echo "EVAL_TIER=certification: no blocking-roster case is in the certification matrix, so rung 4 is disarmed on this lane (rungs 1-3 and rung 5 still red it)."
 fi
+# The replay lane gates nothing: no roster name is armed on it, whatever its
+# roster shares with the presubmit's.
+if [ "${EVAL_REPLAY_LANE:-}" = "true" ]; then
+  echo "EVAL_REPLAY_LANE=true: rung 4 is disarmed on the replay lane, which gates nothing."
+fi
 # Set when the inject lane's exclusion list drops a ROSTER case: what the
 # every-roster-case-excluded guard below tests, since an empty
 # BLOCKING_ROSTER_ON_LANE has a second cause on the GitLab lane.
@@ -3941,6 +4073,9 @@ while IFS= read -r NAME; do
   if ! grep -qxF -- "${NAME}" <<< "${PRESUBMIT_CASE_NAMES}"; then
     echo "ERROR: ${BLOCKING_ROSTER_FILE}: '${NAME}' is not a case in ${PRESUBMIT_CASES_FILE}; the blocking roster is a subset of the presubmit." >&2
     exit 1
+  fi
+  if [ "${EVAL_REPLAY_LANE:-}" = "true" ]; then
+    continue
   fi
   # A roster case the inject lane's exclusion step dropped from the matrix
   # (INJECT_LANE_DROPPED, empty on every other lane) leaves the export too:
@@ -4061,6 +4196,12 @@ fi
 if [ "${EVAL_ROLLBACK_LANE:-}" = "1" ]; then
   EVAL_IS_MAIN_RUN="false"
 fi
+# The replay lane never appends: a replayed run repeats a recording that
+# passed, so its passes would inflate the very rates the gate admits on
+# (examples/inference-replay/eval-design.md, "A replay lane that gates nothing").
+if [ "${EVAL_REPLAY_LANE:-}" = "true" ]; then
+  EVAL_IS_MAIN_RUN="false"
+fi
 # The certification lane never appends either: its record is the logs
 # bucket, read by the certified-capabilities page per case and model, and
 # none of its cases is on the blocking roster, so the admission window has
@@ -4101,8 +4242,8 @@ fi
 
 # Launch-order hints, longest first, from measured runs (2026-08-27/28).
 # A wrong hint costs packing efficiency, never correctness. The hints also
-# price the main-a/main-b split, so scripts/test_ci_eval_nightly.py can fail
-# on a hint edit that leaves the two halves unbalanced.
+# price the main shards' split, so scripts/test_ci_eval_nightly.py can fail
+# on a hint edit that leaves the four stack chains unbalanced.
 unit_cost_hint() {
   case "$1" in
     # The two tofu incumbents, nightly-only since #1218: ~20 and ~15 min a
@@ -4197,8 +4338,8 @@ unit_cost_hint() {
     # repetitions (243s, 66-448s over the 15 on gemini-4-argon). Priced at
     # 600s rather than the 200s default it ran the nightly at: the
     # hint sets its launch order and its share of the presubmit wall estimate
-    # in scripts/eval_rosters.py, and the main-a/main-b balance test in
-    # scripts/test_ci_eval_nightly.py sums it into main-b's stack chain.
+    # in scripts/eval_rosters.py, and the main shards' balance test in
+    # scripts/test_ci_eval_nightly.py sums it into its shard's stack chain.
     monitoring-alert-policy-read) echo 600 ;;
     consistency-no-environment-label) echo 900 ;;
     # Not measured yet: the same stream as the case above, plus a stack that
@@ -4676,10 +4817,40 @@ stream_stack_wait() { # <audit-id>
 # (wait_platform_runs); a unit with none never waits, so a dead holder's
 # successor gives up as soon as it did before. For the stream a case grades,
 # or none, it is the task lock's too.
-stream_lock_deadline() { # <task-name> <audit-id> <the unit's streams>
-  local run_wait=0
+# How many in-flight notes the holder of a stream's lock may spend a grace on
+# before its run (run_one_unit): one for a ledger case, one per declared
+# stream for a case with no ledger. The largest over every case declaring the
+# stream and the waiter's own declared count, so a waiter on a stream a
+# five-stream ledgerless unit holds outlasts all five graces, whichever lock
+# it is taking (the task lock passes the ledger id, a stream lock the stream).
+# A ledger case that declares more streams than it writes counts them too,
+# which only lengthens a deadline. 1 for an empty id, a stream no case
+# declares, or a unit on no stream.
+stream_note_count() { # <audit-id or stream> <the waiter's own streams>
+  local id="$1" own="$2" n=1 t c
+  # shellcheck disable=SC2086 # audit ids carry no spaces or glob characters
+  set -- ${own}
+  c=$#
+  if [ "${c}" -gt "${n}" ]; then n="${c}"; fi
+  if [ -n "${id}" ]; then
+    for t in "${TASK_STREAMS[@]}"; do
+      case " ${t} " in
+        *" ${id} "*)
+          # shellcheck disable=SC2086 # audit ids carry no spaces or glob characters
+          set -- ${t}
+          c=$#
+          if [ "${c}" -gt "${n}" ]; then n="${c}"; fi ;;
+      esac
+    done
+  fi
+  echo "${n}"
+}
+
+stream_lock_deadline() { # <task-name> <audit-id or stream> <the unit's streams>
+  local run_wait=0 notes
   if [ -n "${3:-}" ]; then run_wait="${EVAL_PLATFORM_RUN_WAIT_SECONDS}"; fi
-  echo $(( $(stream_case_count "$2") * ($(unit_delegation_timeout "$1") + UNIT_LOCK_ALLOWANCE_SECONDS + EVAL_INFLIGHT_GRACE_SECONDS + run_wait) + $(stream_stack_wait "$2") ))
+  notes="$(stream_note_count "$2" "${3:-}")"
+  echo $(( $(stream_case_count "$2") * ($(unit_delegation_timeout "$1") + UNIT_LOCK_ALLOWANCE_SECONDS + EVAL_INFLIGHT_GRACE_SECONDS * notes + run_wait) + $(stream_stack_wait "$2") ))
 }
 
 release_streams() { # <space-separated audit ids>
@@ -5064,8 +5235,18 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # same stream out: repetitions 2 and 3 audit from the empty ledger
   # repetition 1 had (the lease-time reset above). Only this stream's label,
   # so an audit case on another stream in another lane keeps its own.
+  # A case that grades its stream through the report store (audit_report_stored
+  # with audit_streams:, no ledger check) has no audit id, and a left note
+  # refuses its `start` all the same: the install's own 06:20 UTC
+  # compliance-audit run died with the gateway the scope patch rolled, and
+  # its two-hour note refused every repetition that launched inside it
+  # (#4268). Such a unit releases the note of each stream it declares; the
+  # reset stays a ledger case's.
+  local note_stream
+  for note_stream in ${audit_id:-${streams}}; do
+    release_inflight_note "${name} rep ${rep}" "${note_stream}"
+  done
   if [ -n "${audit_id}" ]; then
-    release_inflight_note "${name} rep ${rep}" "${audit_id}"
     reset_audit_ledgers "${name} rep ${rep}" "${audit_id}"
   fi
   # The repository this unit's agent writes to, emptied of every agent pull
@@ -5601,8 +5782,8 @@ profile_begin "record + final gate"
 # install today's window measures. `bench-gate record` refuses it too.
 #
 # A next-mode run on main does record. The main nightly
-# (ci-kube-agents-eval-nightly, its -main-b half and its -writers part,
-# EVAL_MODE_NEXT=1) is a periodic with no PULL_NUMBER, and its matrix runs over the inject transport,
+# (ci-kube-agents-eval-nightly, its -main-b to -main-e shards and its
+# -writers, -writers-b and -writers-c thirds, EVAL_MODE_NEXT=1) is a periodic with no PULL_NUMBER, and its matrix runs over the inject transport,
 # which `bench-gate` reads as the version key's `next` mode: its lines file
 # under a key of their own, never today's, and are the window an inject-lane
 # run at the same agent model (setupId) is compared with. No job records

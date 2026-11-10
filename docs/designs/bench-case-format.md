@@ -62,8 +62,8 @@ the front door there under `spec.mode: next` too. A `session: fresh` answer carr
 thread context, which next's door does not send, so a case with one stays in
 `hack/eval/inject-lane-exclusions.txt`. Under next the reply to a wake is posted nowhere, but the
 same front door writes it, so a case that grades that reply still runs on the inject lane. A
-first line of `[bench:card-block-wake]`, with `title`, `kind` (`transient`, `capability` or
-`dependency`) and `reason`, plants a card blocked that way instead: nothing is posted, no answer
+first line of `[bench:card-block-wake]`, with `title`, `kind` (`transient`, `capability`,
+`dependency` or `capacity`) and `reason`, plants a card blocked that way instead: nothing is posted, no answer
 is sent, and the wake's reply is the run's one turn. A
 first line of
 `[bench:stop-after-first-card]`, optionally with `observe=<seconds>`, makes the rest of the
@@ -94,7 +94,7 @@ rather than for a merge decision.
 presubmit seconds rather than a cluster; `deployer: tofu` names a stack under `bench/tf/`
 and costs what that stack takes to apply and destroy on every pull request, minutes for a
 cluster and seconds for a single alert policy. `task_stack` in `hack/ci-eval-pr.sh` reads
-`infrastructure.stack` out of the file text for the infra lock and the nightly halves, so
+`infrastructure.stack` out of the file text for the infra lock and the nightly's main shards, so
 keep it on one line; `bench-gate` reads `deployer` through a YAML parse
 (`bench/kube_agents_bench/cases.py`) to classify a crashed run.
 
@@ -315,7 +315,10 @@ command, a log line or a tagged call alike, before the forbidden list reads it, 
 command it touched out of the required list, for a command that can fetch and
 send nothing but carries a forbidden word as its argument, such as a plain
 `grep` exempted through its pattern argument so that whatever else shares the
-line is still graded; or with `required_runs` a script by its basename and the flags that must
+line is still graded (`exempt_grep_patterns: true` does that by the command's
+shell words: it removes only the pattern argument of a command that is one
+grep and nothing else, and refuses a control operator, a redirect other than
+`>` to `/dev/null`, a comment, a substitution and a collapsed chain); or with `required_runs` a script by its basename and the flags that must
 follow it on the same shell segment, read from the command's argv as the shell splits
 it, so a quoted mention of the invocation is one word and not a run, and a run made through a script file or a shell's standard input is not read, since the argv names the file or the shell; each flag is read as the exact word, so the script named is built with `allow_abbrev=False`; `word_patterns` are regular expressions each of which some later word of the segment must match on its own, and `forbidden_runs` is the same shape for a run no worker may make, such as a `kubectl get` of the objects a script grades; with `after_result_pattern` the commands come from the workers' tagged `terminal` and `execute_code` calls in the trajectory instead, with their results as the record stores them, a JSON string with newlines escaped, and the forbidden set applies only to the calls after the first whose result matched, failed or not, one window per delegated card and the cards its worker fanned out; `forbidden_result_patterns` then grade the later results too; a trajectory with no tagged call at all, none readable (every code-tool argument withheld), a call with no numeric time, or a capture with gaps and no hit, is `status: "error"`, where a worker whose tagged calls are all MCP calls grades as zero commands), `worker_agents` (regular expressions every one of which must match the
 profile at least one delegated worker ran as, read from the tags the harness puts on the

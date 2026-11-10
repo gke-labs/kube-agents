@@ -75,7 +75,7 @@ NAMESPACE_CHECK_JSONPATH = "jsonpath={.metadata.name}"
 
 # Batching tuning: 35 CRDs per `kubectl get crd1,crd2,...` reduces ~233 KCC CRDs to 8 RPCs
 # across 4 worker threads (~3-5s total). MAX_PARALLEL_WORKERS matches collect.py's 4-slot
-# cap under the credential proxy's default 704 MiB child memory budget
+# cap under the credential proxy's default 832 MiB child memory budget
 # (docs/designs/credential-proxy-child-memory-budget.md §2.2).
 BATCH_CHUNK_SIZE = 35
 MAX_PARALLEL_WORKERS = 4
