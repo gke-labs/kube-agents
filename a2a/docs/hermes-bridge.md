@@ -478,7 +478,7 @@ store can be found from the terminal alone. The bridge keeps at most 8 MiB of th
 that prints without end cannot grow the bridge's heap with it; a clean exit whose stdout went
 past the cap ends `failed` with `reason: hermes-cli-oversize`, the limit named, refused rather
 than published cut; a non-zero exit past it keeps the terminal above, whose stdout tail is read
-from its own 2 KiB writer and so is the stream's end, with the bytes the cap dropped noted. Exit
+from its own writer and so is the stream's end, with the bytes the cap dropped noted. Exit
 75 is Hermes's `EX_TEMPFAIL` for a turn that gave up on the provider's rate limit or billing; it
 is named `reason: hermes-rate-limited` instead,
 which the eval harness classes as infrastructure rather than the persona's failure (the image patch
@@ -674,8 +674,11 @@ shown and the copy the stream keeps are the same message. The bridge scrubs it o
 published (`scrubAnswer` in `answer_scrub.go`, #5280). That covers the `result` artifact and the
 chat message folded from it, each `turn` artifact, and the card reports a turn folds into its
 answer. The same scrub runs over a failure's status tails, which can carry the answer's own bytes:
-a failed CLI run's stdout and stderr tails, and an API error's body or error tail. The rest of a
-status message is the bridge's own text. There are two passes:
+a failed CLI run's stdout and stderr tails, and an API error's body or error tail. Each is
+scrubbed before it is cut to its tail: the CLI executor keeps the last 64 KiB of each stream
+(`failureScrubWindowBytes`), scrubs that, then keeps 2 KiB, so a private key whose header is
+further from the end than the tail, or a value the cut would split, is still redacted. The rest of
+a status message is the bridge's own text. There are two passes:
 
 1. **Seen values.** The bridge keeps a per-task set of secret values from the task's tool results,
    and exact-matches them out of the answer in both plain and base64 form. This catches a secret
@@ -699,8 +702,13 @@ status message is the bridge's own text. There are two passes:
      key, flag or prose noun in front of it names a credential outright (password, passwd,
      passphrase, token, api key, secret as a key's last component, with a digit or a value
      qualifier allowed), or where the rule's own shape is a credential's (a token prefix, a URL's
-     password, a password flag, an `Authorization` header pair). A string under a JSON key that
-     names a credential outright counts too. The bare word secret, a plural (`Mountable secrets`)
+     password, a password flag, an `Authorization` header pair). JSON text is read both as a
+     structure and as text, so a pair that spans fields or list items (an env entry's name and
+     value, a flag and its value in `args`, a header list) is caught from `-o json` as from
+     `-o yaml`. A string under a JSON key that names a credential outright counts too, as
+     decoded, and also with its quotes and trailing punctuation taken off when that changes it,
+     unless the whole string is a state word (`disabled`, `required`) or an upper-case environment
+     variable reference (`${DB_PASSWORD}`). The bare word secret, a plural (`Mountable secrets`)
      and a key naming a Secret object (`existingSecret`, `imagePullSecret`) do not, so a Secret's
      name is never tracked. Neither is a value with a space in it (`14 bytes` in
      `kubectl describe secret`, a phrase after a label), nor what the auth-scheme, password-file
