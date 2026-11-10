@@ -1785,14 +1785,18 @@ func kvSecretSpans(s string, code [][2]int, rec func(lo, hi int, named bool)) {
 }
 
 var (
-	// envNameValuePattern is a Kubernetes env entry, a name followed by a
-	// literal value sibling, in YAML (- name: X, then value: y on the next
-	// line, a comment after the name allowed), JSON or a flow mapping;
-	// envValueNamePattern is the same with the value first (JSON or a flow
-	// mapping). valueFrom is not a value. An unquoted value is matched to
-	// the line's end and cut by envUnquotedValue.
-	envNameValuePattern = regexp.MustCompile(`(?:^|[\s{,\[-])["']?name["']?[ \t]*:[ \t]*["']?([A-Za-z_][A-Za-z0-9_.-]*)["']?[ \t]*(,[ \t]*(?:\r?\n[ \t]*)?|(?:[ \t]+#[^\r\n]*)?\r?\n[ \t]*)["']?value["']?[ \t]*:[ \t]*("(?:[^"\\\r\n]|\\.)*"|'[^'\r\n]*'|[^\r\n]*[^\r\n \t])`)
-	envValueNamePattern = regexp.MustCompile(`(?:^|[\s{,\[-])["']?value["']?[ \t]*:[ \t]*("(?:[^"\\\r\n]|\\.)*"|'[^'\r\n]*'|[^,}\]\r\n]*[^,}\]\r\n \t])[ \t]*,[ \t]*(?:\r?\n[ \t]*)?["']?name["']?[ \t]*:[ \t]*["']?([A-Za-z_][A-Za-z0-9_.-]*)["']?`)
+	// envNameValueFlowPattern is a Kubernetes env entry, a name followed by
+	// a literal value sibling, in JSON or a flow mapping (a comma between),
+	// an unquoted value ending at , } or ]; envNameValueBlockPattern is the
+	// same in block YAML (- name: X, then value: y on the next line, a
+	// comment after the name allowed), an unquoted value running to its
+	// line's end, comment and all, for envUnquotedValue to cut;
+	// envValueNamePattern is the flow one with the value first. valueFrom
+	// is not a value. Each value match ends within its own line or at a
+	// flow separator, so a scan of one long line stays linear.
+	envNameValueFlowPattern  = regexp.MustCompile(`(?:^|[\s{,\[-])["']?name["']?[ \t]*:[ \t]*["']?([A-Za-z_][A-Za-z0-9_.-]*)["']?[ \t]*,[ \t]*(?:\r?\n[ \t]*)?["']?value["']?[ \t]*:[ \t]*("(?:[^"\\\r\n]|\\.)*"|'[^'\r\n]*'|[^,}\]\r\n]*[^,}\]\r\n \t])`)
+	envNameValueBlockPattern = regexp.MustCompile(`(?:^|[\s{,\[-])["']?name["']?[ \t]*:[ \t]*["']?([A-Za-z_][A-Za-z0-9_.-]*)["']?[ \t]*(?:[ \t]+#[^\r\n]*)?\r?\n[ \t]*["']?value["']?[ \t]*:[ \t]*("(?:[^"\\\r\n]|\\.)*"|'[^'\r\n]*'|[^\r\n]*[^\r\n \t])`)
+	envValueNamePattern      = regexp.MustCompile(`(?:^|[\s{,\[-])["']?value["']?[ \t]*:[ \t]*("(?:[^"\\\r\n]|\\.)*"|'[^'\r\n]*'|[^,}\]\r\n]*[^,}\]\r\n \t])[ \t]*,[ \t]*(?:\r?\n[ \t]*)?["']?name["']?[ \t]*:[ \t]*["']?([A-Za-z_][A-Za-z0-9_.-]*)["']?`)
 )
 
 // scrubEnvNameValuePairs redacts the literal value of a Kubernetes env
@@ -1804,33 +1808,16 @@ func scrubEnvNameValuePairs(s string, sink secretSink) string {
 		return s
 	}
 	var spans [][2]int
-	pair := func(re *regexp.Regexp, nameG, valueG, sepG int) {
-		// Each scan resumes where the last value ended, not at the end of
-		// its match: an unquoted value is matched to the line's end, and a
-		// flow mapping may hold a later entry on the same line.
-		for pos := 0; pos < len(s); {
-			m := re.FindStringSubmatchIndex(s[pos:])
-			if m == nil {
-				break
-			}
-			for k := range m {
-				if m[k] >= 0 {
-					m[k] += pos
-				}
-			}
-			pos = m[1]
+	pair := func(re *regexp.Regexp, nameG, valueG int) {
+		for _, m := range re.FindAllStringSubmatchIndex(s, -1) {
 			name := s[m[2*nameG]:m[2*nameG+1]]
 			lo, hi := m[2*valueG], m[2*valueG+1]
 			var decoded string
 			if hi-lo >= 2 && (s[lo] == '"' || s[lo] == '\'') && s[hi-1] == s[lo] {
 				decoded, _, _ = yamlQuoted(s[lo:hi])
 				lo, hi = lo+1, hi-1
-			} else if sepG > 0 {
-				hi = lo + envUnquotedValue(s[lo:hi], strings.Contains(s[m[2*sepG]:m[2*sepG+1]], ","))
-				pos = max(hi, m[2*valueG]+1)
-				if hi <= lo {
-					continue
-				}
+			} else if hi = lo + envUnquotedValue(s[lo:hi]); hi <= lo {
+				continue
 			}
 			if sloc := inlineAuthSchemePrefixPattern.FindStringIndex(s[lo:hi]); sloc != nil {
 				lo += sloc[1] // the scheme word stays, as under a key
@@ -1850,21 +1837,16 @@ func scrubEnvNameValuePairs(s string, sink secretSink) string {
 			}
 		}
 	}
-	pair(envNameValuePattern, 1, 3, 2)
-	pair(envValueNamePattern, 2, 1, 0)
+	pair(envNameValueFlowPattern, 1, 2)
+	pair(envNameValueBlockPattern, 1, 2)
+	pair(envValueNamePattern, 2, 1)
 	return redactSpans(s, spans)
 }
 
-// envUnquotedValue is the length of an unquoted env value matched to its
-// line's end: in a flow mapping or JSON (flow) up to a , } or ], in block
-// YAML the whole line, either way with a trailing comment (a # after a
-// blank, or one opening the value) and the blanks before it taken off.
-func envUnquotedValue(v string, flow bool) int {
-	if flow {
-		if i := strings.IndexAny(v, ",}]"); i >= 0 {
-			v = v[:i]
-		}
-	}
+// envUnquotedValue is the length of an unquoted env value with a trailing
+// comment (a # after a blank, or one opening the value) and the blanks
+// before it taken off.
+func envUnquotedValue(v string) int {
 	if strings.HasPrefix(v, "#") {
 		return 0
 	}
@@ -2018,18 +2000,16 @@ func markdownTableCells(s string, lo, hi int, codeAware bool) [][2]int {
 	// Under codeAware, a pipe inside a paired code span is the cell's
 	// content: the answer is published as written, so a value it pushes
 	// past is still there.
-	var code [][2]int
+	var inSpan []bool
 	if codeAware {
-		code = markPairedMarkdownRuns(line, 0, len(line), make([]bool, len(line)), nil)
-	}
-	inCode := func(i int) bool {
-		for _, c := range code {
-			if i >= c[0] && i < c[1] {
-				return true
+		inSpan = make([]bool, len(line))
+		for _, c := range markPairedMarkdownRuns(line, 0, len(line), make([]bool, len(line)), nil) {
+			for i := c[0]; i < c[1]; i++ {
+				inSpan[i] = true
 			}
 		}
-		return false
 	}
+	inCode := func(i int) bool { return inSpan != nil && inSpan[i] }
 	var pipes []int
 	for i := 0; i < len(line); i++ {
 		if line[i] == '\\' {
@@ -2196,7 +2176,9 @@ func tableCellSpans(s string, cell [2]int, class secretKeyClass, named bool, sin
 	cands := [][2]int{{valueLo, cellHi}, {cellLo, cellHi}}
 	if end, ok := codeSpanEnd(code, valueLo); ok {
 		span := [2]int{valueLo, end}
-		if end >= cellHi || n[end] == ' ' || n[end] == '\t' {
+		// Another code span after it in the cell: the value is not the
+		// first span alone.
+		if len(code) == 1 && (end >= cellHi || n[end] == ' ' || n[end] == '\t') {
 			cands = [][2]int{span, {cellLo, cellHi}}
 		} else {
 			cands = [][2]int{{cellLo, cellHi}, span}

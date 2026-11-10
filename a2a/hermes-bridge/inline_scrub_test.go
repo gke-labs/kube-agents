@@ -1,8 +1,10 @@
 package hermesbridge
 
 import (
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The shape classes scrubInlineSecrets must catch, and the ordinary ops text
@@ -637,6 +639,19 @@ func TestScrubEnvNameValuePairsReadsTheValueAsYAMLDoes(t *testing.T) {
 		{"- name: DB_PASSWORD\n  value: # none\n", "- name: DB_PASSWORD\n  value: # none\n", nil},
 		{"- name: LOG_LEVEL\n  value: debug # verbose\n", "- name: LOG_LEVEL\n  value: debug # verbose\n", nil},
 	}
+	var long strings.Builder
+	long.WriteString("env: [")
+	for i := 0; i < 20000; i++ {
+		fmt.Fprintf(&long, "{name: FLAG_%d, value: %d}, ", i, i)
+	}
+	long.WriteString("]")
+	start := time.Now()
+	scrubEnvNameValuePairs(long.String(), nil)
+	// Linear: about 3s under -race with the whole suite running; the
+	// quadratic scan this guards against took minutes on this input.
+	if d := time.Since(start); d > 30*time.Second {
+		t.Errorf("a %d-byte one-line flow list took %v", long.Len(), d)
+	}
 	for _, tc := range cases {
 		var got []string
 		if out := scrubEnvNameValuePairs(tc.in, func(v string) { got = append(got, v) }); out != tc.want {
@@ -665,6 +680,8 @@ func TestScrubInlineSecretsTableCellsSchemeCodeSpanAndPipes(t *testing.T) {
 		// Backticks pairing across cells merge them under the code-aware
 		// split; the every-pipe split still finds the value's column.
 		{"| Note | Password | Extra |\n|---|---|---|\n| see `x | quietpasture | y` |\n", "| Note | Password | Extra |\n|---|---|---|\n| see `x | [redacted] | y` |\n"},
+		// Two code spans in the cell: not the first alone, the whole cell.
+		{"| Key | Value |\n|---|---|\n| password | `appuser` / `quietpasture0001` |\n", "| Key | Value |\n|---|---|\n| password | `[redacted]` |\n"},
 		// A code span that does not read as a value, a value after it:
 		// the whole cell is tested and redacted.
 		{"| Key | Value |\n|---|---|\n| password | `none` quietpasture0001 |\n", "| Key | Value |\n|---|---|\n| password | `[redacted] |\n"},

@@ -484,7 +484,7 @@ func (c *toolResultCollector) text(t string, depth int) {
 		var v any
 		if json.Unmarshal([]byte(trimmed), &v) == nil {
 			c.value(v, depth+1)
-			c.shapeScan(jsonPairingText(v))
+			c.shapeScan(blankMultilineJSONStrings(scan))
 			return
 		}
 		if strings.Contains(trimmed, "Secret") {
@@ -497,45 +497,44 @@ func (c *toolResultCollector) text(t string, depth int) {
 	c.shapeScan(scan)
 }
 
-// jsonPairingText is v re-encoded for the shape rules that pair sibling
-// fields (an env entry's name and value, a flag and its value in an args
-// list): a string holding a line break is blanked, since c.value already
-// reads it as text of its own and its escaped \n would run one line's
-// value into the next, and a Secret's data and stringData are left out,
-// read exactly by secretObject.
-func jsonPairingText(v any) string {
-	var strip func(x any) any
-	strip = func(x any) any {
-		switch t := x.(type) {
-		case string:
-			if strings.ContainsAny(t, "\r\n") {
-				return ""
-			}
-			return t
-		case map[string]any:
-			secret := t["kind"] == "Secret"
-			out := make(map[string]any, len(t))
-			for k, e := range t {
-				if secret && (k == "data" || k == "stringData") {
-					continue
-				}
-				out[k] = strip(e)
-			}
-			return out
-		case []any:
-			out := make([]any, len(t))
-			for i, e := range t {
-				out[i] = strip(e)
-			}
-			return out
-		}
-		return x
+// blankMultilineJSONStrings is JSON text t for the shape rules that pair
+// sibling fields (an env entry's name and value, a flag and its value in an
+// args list): every string token holding an escaped line break is emptied
+// in place, since c.value already reads it as text of its own and its \n
+// would run one line's value into the next. Keys keep their order; a
+// string cut short at the end of t is left as it is.
+func blankMultilineJSONStrings(t string) string {
+	if !strings.Contains(t, `\n`) && !strings.Contains(t, `\r`) {
+		return t
 	}
 	var sb strings.Builder
-	enc := json.NewEncoder(&sb)
-	enc.SetEscapeHTML(false)
-	if enc.Encode(strip(v)) != nil {
-		return ""
+	sb.Grow(len(t))
+	for i := 0; i < len(t); {
+		if t[i] != '"' {
+			sb.WriteByte(t[i])
+			i++
+			continue
+		}
+		end, multiline := i+1, false
+		for end < len(t) && t[end] != '"' {
+			if t[end] == '\\' && end+1 < len(t) {
+				if t[end+1] == 'n' || t[end+1] == 'r' {
+					multiline = true
+				}
+				end++
+			}
+			end++
+		}
+		if end >= len(t) {
+			sb.WriteString(t[i:])
+			break
+		}
+		if multiline {
+			sb.WriteString(`""`)
+		} else {
+			sb.WriteString(t[i : end+1])
+		}
+		i = end + 1
 	}
 	return sb.String()
 }

@@ -946,6 +946,30 @@ func TestSeenSecrets_RawJSONIsNotReadAsOneLine(t *testing.T) {
 	}
 }
 
+// The pairing scan reads JSON in its own key order: an env-like entry
+// whose other keys sort between name and value is still paired, and a long
+// one-line result is scanned in linear time.
+func TestSeenSecrets_JSONPairingKeepsKeyOrderAndScalesLinearly(t *testing.T) {
+	var s seenSecrets
+	s.collectToolResult(terminalResult(t, `{"env":[{"name":"DB_PASSWORD","value":"`+synthSecretPlain+`","type":"literal"}],"note":"a\nb"}`))
+	if !s.has(synthSecretPlain) {
+		t.Error("an env entry with a key sorting between name and value was not paired")
+	}
+	var env []map[string]any
+	for i := 0; i < 16000; i++ {
+		env = append(env, map[string]any{"name": fmt.Sprintf("FLAG_%d", i), "value": i%2 == 0})
+	}
+	b, _ := json.Marshal(map[string]any{"env": env})
+	start := time.Now()
+	var big seenSecrets
+	big.collectToolResult(terminalResult(t, string(b)+"\nnote: done"))
+	// Linear is a second or two even under -race; the quadratic scan this
+	// guards against took 7s on a quarter of this input without -race.
+	if d := time.Since(start); d > 30*time.Second {
+		t.Errorf("a %d-byte one-line result took %v", len(b), d)
+	}
+}
+
 // A quoted stringData value is read with its YAML escapes: a double-quoted
 // one's backslash escapes, a single-quoted one's doubled quotes.
 func TestSeenSecrets_QuotedYAMLStringDataIsUnescaped(t *testing.T) {

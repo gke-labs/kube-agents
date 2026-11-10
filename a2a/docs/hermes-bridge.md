@@ -708,8 +708,7 @@ a status message is the bridge's own text. There are two passes:
      password, a password flag, an `Authorization` header pair). JSON text is read both as a
      structure and as text, so a pair that spans fields or list items (an env entry's name and
      value, a flag and its value in `args`, a header list) is caught from `-o json` as from
-     `-o yaml`. The text read is the structure re-encoded, with a string holding a line break
-     blanked (it is read as text of its own) and a Secret's data left out. A string under a JSON key that names a credential outright counts too, as
+     `-o yaml`. In that text each string holding an escaped line break is emptied (it is read as text of its own), so one line's value never runs into the next. A string under a JSON key that names a credential outright counts too, as
      decoded, and also with its quotes and trailing punctuation taken off when that changes it,
      unless the whole string is a state word (`disabled`, `required`) or an upper-case environment
      variable reference (`${DB_PASSWORD}`). The bare word secret, a plural (`Mountable secrets`)
