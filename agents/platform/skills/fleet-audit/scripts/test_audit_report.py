@@ -26052,6 +26052,8 @@ class TestScopeNotesReachTheReader(HarnessTestCase):
         self.assertIn("1 of these the collector does not flag", comment)
         self.assertNotIn("still flagged by the collector", comment)
         self.assertNotIn("the collector itself still flags", comment)
+        self.assertIn(f"NOT VISIBLE: {derived_id(fid='a')}", self.err)
+        self.assertNotIn("STILL FLAGGED:", self.err)
 
     def test_a_remediate_on_a_noted_object_gets_its_own_reason(self):
         self.previous_a()
@@ -26134,6 +26136,40 @@ class TestScopeNotesReachTheReader(HarnessTestCase):
         rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(self.noted_manifest(noted_objects))])
         self.assertEqual(rc, 0, self.err)
         return self.stdout_json()
+
+    def test_a_carried_noted_finding_is_not_uncorroborated_and_not_swept(self):
+        """The collector read the object but could not see it, so it did not
+        pass it: the finding is not uncorroborated. Nothing this run backs an
+        unattended fix either, so the sweep opens none."""
+        self.previous_a()
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        doc = make_doc(findings=[make_finding(fid="a", title="Alpha finding")])
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(self.noted_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertNotIn(derived_id(fid="a"), payload["uncorroborated_findings"])
+        self.assertEqual(payload["prs_opened"], [])
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+
+    def test_a_noted_finding_the_body_cut_for_space_keeps_its_fix_open(self):
+        """The previous body cut `a` for space: its id is in the complete
+        block, not the rendered one. A noted `a` is still carried, so its
+        pull request stays open."""
+        previous_body = published_body(make_doc(findings=[make_finding(fid="b", title="Bravo finding")]), generated_at=NOW)
+        previous_body += f'\n<!-- audit-findings-all: {json.dumps([derived_id(fid="a"), derived_id(fid="b")])} -->\n'
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
+            "proposal-list": proposals_view(
+                [pr(8, "platform-agent/fix-a", body=audit_report.delta_block([derived_id(fid="a")]))]
+            ),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        doc = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(self.noted_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["prs_closed"], [])
+        self.assertEqual(self.harness.forge_calls("proposal-close"), [])
 
     def test_an_omitted_finding_on_a_noted_object_is_held_not_resolved(self):
         """The collector could not see `a`, so a run with other findings does
@@ -35469,6 +35505,25 @@ class TestStoreLedger(HarnessTestCase):
         self.assertEqual(out["status"], audit_report.STORE_LEDGER_STATUS)
         self.assertEqual(out["prs_closed"], [])
         self.assertEqual([], self.harness.forge_calls("proposal-close"))
+
+    def test_a_clean_run_logs_a_noted_finding_as_not_visible(self):
+        self.claim()
+        self.touch(self.NETPOL)
+        self.run_once(make_doc(findings=[make_finding(fid="a")]))
+        manifest = _full_manifest()
+        manifest["clusters"][0][audit_report.NOTED_OBJECTS_KEY] = [
+            {"check": "netpol-missing", "namespace": "payments", "object": "Namespace/a"}
+        ]
+        manifest_path = self.tmp_path / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        self.start()
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(make_doc(findings=[])), encoding="utf-8")
+        self.new_process()
+        rc = self.run_main(["finish", "--audit", AUDIT, "--findings-file", path, "--manifest-file", str(manifest_path)])
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn(f"NOT VISIBLE: {derived_id(fid='a')}", self.err)
+        self.assertNotIn("STILL FLAGGED:", self.err)
 
     def test_a_scoped_install_leaves_another_installs_unlabelled_fix_on_the_store_path(self):
         # The store ledger on a forge with proposals and labels but no issue

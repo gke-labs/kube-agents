@@ -235,6 +235,7 @@ REASON_CEILING = "did not finish within %ds; tofu was interrupted, and killed if
 # (they run one at a time), which its ceiling was charged for.
 REASON_CEILING_INIT = "did not finish within %ds: its init was cut after %ds queued for the init slot behind other projects' inits; nothing was changed and nothing is locked"
 REASON_RUNNER = "could not run tofu (%s: %s)"
+REASON_NO_STDERR = "no error output"
 REASON_NOT_REACHED_BUDGET = "not started: %ds left in the run's budget, under the %ds per-project ceiling; the next run takes it"
 REASON_NOT_REACHED_BUDGET_MARK = "left in the run's budget"
 REASON_NOT_REACHED_MOVED = "not started: the fleet stack under bench/tf/fleet on %s is now %s and this run applies %s; the next run takes it"
@@ -487,7 +488,7 @@ class TerminatedBeforeTofu(boskos_pool.Terminated):
         self.step = step
 
 
-def _tofu(args, runner, deadline, ok=(0,), env=None):
+def _tofu(args, runner, deadline, ok=(0,), env=None, stdout_in_errors=True):
     # A worker between two steps, or just out of its acquire, when the
     # termination landed: the forward reached only the children alive then,
     # so the next child is simply not started.
@@ -496,7 +497,10 @@ def _tofu(args, runner, deadline, ok=(0,), env=None):
     timeout = max(1, deadline - clock())
     result = runner([TOFU] + list(args), cwd=str(FLEET_DIR), env=env, timeout=timeout, capture_output=True, text=True)
     if result.returncode not in ok:
-        raise ReconcileError("tofu %s exited %d: %s" % (args[0], result.returncode, _tail(result.stderr or result.stdout)))
+        # `stdout_in_errors=False` for a command whose output holds secrets
+        # (`tofu show -json` of a state): its stdout never reaches a message.
+        detail = result.stderr or (result.stdout if stdout_in_errors else "")
+        raise ReconcileError("tofu %s exited %d: %s" % (args[0], result.returncode, _tail(detail) or REASON_NO_STDERR))
     return result
 
 
@@ -718,7 +722,7 @@ def reconcile_project(project, runner=tofu_runner, dry_run=False, timeout=PROJEC
                 # start costs the reset only: a warning, and the plan runs. A
                 # termination still propagates.
                 try:
-                    state = _tofu(["show", "-json", "-no-color"], runner, min(deadline, clock() + STATE_READ_TIMEOUT_SECONDS), env=env)
+                    state = _tofu(["show", "-json", "-no-color"], runner, min(deadline, clock() + STATE_READ_TIMEOUT_SECONDS), env=env, stdout_in_errors=False)
                     extras[EXTRA_STARTUP_FAIL_INSTANCE] = startup_fail_instance(state.stdout)
                 except ReconcileError as exc:
                     extras[EXTRA_STARTUP_FAIL_LOOKUP_ERROR] = str(exc)

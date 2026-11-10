@@ -7884,7 +7884,7 @@ def scope_note_entries(data: dict) -> list[dict]:
             continue
         note = publishable_text(str(cluster.get(SCOPE_NOTES_KEY) or "")).strip()
         if note:
-            name = str(cluster.get("name", "")).strip() or "(unnamed)"
+            name = str(cluster.get("name", "")).strip() or UNNAMED_EVIDENCE_TARGET
             out.append({NOTE_TARGET_FIELD: name, NOTE_TEXT_FIELD: note[:MAX_NOTE_CHARS]})
     return out
 
@@ -7933,6 +7933,15 @@ def _noted_objects(manifest: dict | None):
                     "namespace": str(item.get("namespace") or ""),
                     "object": str(item["object"]),
                 }, str(item.get("command") or "").strip()
+
+
+def noted_finding_ids(findings: list[dict], manifest: dict | None) -> set[str]:
+    """The ids of the document's findings on a noted object (`noted_ids`).
+
+    The sweep passes over them: the collector could not see their result.
+    """
+    noted = noted_ids(manifest)
+    return {str(f.get("id") or "") for f in findings if isinstance(f, dict) and published_id(f) in noted}
 
 
 def noted_ids(manifest: dict | None) -> set[str]:
@@ -8461,11 +8470,14 @@ def uncorroborated_findings(findings: list[dict], manifest: dict | None) -> set[
             if isinstance(command, dict) and command.get("rc") == 0
         )
     flagged = _flagged_identities(manifest)
+    # A noted object was read but not seen, so its check did not pass it: a
+    # finding carried on one is not uncorroborated (`noted_ids`).
+    noted = {derive_finding_id(identity) for _entry, identity, _command in _noted_objects(manifest)}
     return {
         str(finding.get("id") or "")
         for finding in findings
         if str(finding.get("check") or "") in ran.get(str(finding.get("cluster") or ""), set())
-        and derive_finding_id(finding) not in flagged
+        and derive_finding_id(finding) not in flagged | noted
     }
 
 
@@ -11911,6 +11923,7 @@ def promotion_candidates(
     triage_marked: set[str] | None = None,
     vouched: set[str] | None = None,
     sweep_off: bool = False,
+    not_visible: set[str] | None = None,
 ) -> PromotionPlan:
     """Decide which findings become pull requests this run.
 
@@ -12012,6 +12025,12 @@ def promotion_candidates(
     for finding in sort_findings(findings) if auto_promote else []:
         fid = str(finding.get("id", ""))
         if fid in requested_set:
+            continue
+        # A finding on a noted object (`noted_finding_ids`) is carried from a
+        # previous run: the collector could not see its result, so nothing
+        # this run backs a fix opened unattended. It is in no block; the
+        # ledger shows it, and `/remediate` still opens it.
+        if fid in (not_visible or set()):
             continue
         if (finding.get("remediation") or {}).get("kind") != "manifest":
             continue
@@ -22584,6 +22603,7 @@ def _handle_finish_dry_run(
         {},
         sweep_off=not sweep_on,
         uncorroborated=uncorroborated_findings(findings, manifest),
+        not_visible=noted_finding_ids(findings, manifest),
         triage_marked=set(triage_reasons),
         vouched=collector_vouched_findings(findings, manifest),
     )
@@ -24256,7 +24276,11 @@ def _finish_store_ledger(
             unaccounted + [e for e in held_entries if e["id"] not in already_held],
             key=lambda entry: entry["id"],
         )
+        noted_held = {e["id"] for e in held_entries if e.get(NOTED_HELD_KEY)}
         for fid in sorted(held_ids):
+            if fid in noted_held:
+                log(f"NOT VISIBLE: {fid} is on the stored ledger and {NOTED_HOLD_CAUSE}; no fix is closed over it.")
+                continue
             log(
                 f"STILL FLAGGED: {fid} is on the stored ledger and the collector still "
                 "flags it, so it is not resolved whatever the document says; no fix is "
@@ -24387,6 +24411,7 @@ def _finish_store_ledger(
         requested_at={},
         sweep_off=not sweep_on,
         uncorroborated=uncorroborated_findings(findings, manifest),
+        not_visible=noted_finding_ids(findings, manifest),
         triage_marked=set(triage_reasons),
         vouched=collector_vouched_findings(findings, manifest),
     )
@@ -25559,9 +25584,6 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
     memory_lost = not delta_known
     previous_body = str(memory["ledger_body"]) if memory else ""
     previous_ids = parse_delta_block(previous_body)
-    # Now that the previous ids are known: a noted object a previous finding
-    # carries is held as a still-flagged one is (`noted_ids`).
-    still_flagged |= still_flagged_ids(manifest, data, previous_ids)
     # The body's headings name what it rendered; the stored document also names
     # what the body budget cut, which a resolved finding may be.
     previous_titles = {**report_finding_titles(memory), **parse_finding_titles(previous_body)}
@@ -25592,6 +25614,10 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
     ledger_ids_known = sorted(
         set(previous_ids) | set(_stored_finding_places(memory)) | filed_cut | body_filed_ids(previous_body)
     )
+    # A noted object a previous finding carries is held as a still-flagged one
+    # is (`noted_ids`). Every id the ledger carried, not only the body's
+    # block: a finding the body cut for space has a fix to keep open too.
+    still_flagged |= still_flagged_ids(manifest, data, ledger_ids_known)
     # Where the last scheduled run's ids are read from (see `scheduled_ids`
     # below). Read here, so the run's first `finish` saves what it read with
     # the baseline.
@@ -25918,6 +25944,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
                     "collector manifest and this run passed none, so it is not "
                     "resolved whatever the document says; the ledger stays open."
                 )
+            elif fid in noted_held:
+                log(f"NOT VISIBLE: {fid} is on the ledger and {NOTED_HOLD_CAUSE}; the ledger stays open.")
             else:
                 log(
                     f"STILL FLAGGED: {fid} is on the ledger and the collector still "
@@ -26570,6 +26598,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
         requested_at=requests.requested_at,
         sweep_off=not sweep_on,
         uncorroborated=uncorroborated_findings(findings, manifest),
+        not_visible=noted_finding_ids(findings, manifest),
         triage_marked=set(triage_reasons),
         vouched=collector_vouched_findings(findings, manifest),
     )

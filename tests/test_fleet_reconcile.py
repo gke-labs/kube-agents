@@ -2131,6 +2131,27 @@ class FixtureRefreshTest(unittest.TestCase):
         self.assertIn("startup-fail VM not reset", outcomes[P7][1])
         self.assertNotIn("not json", outcomes[P7][1])
 
+    def test_a_failed_state_read_never_carries_the_state_into_a_message(self):
+        """`tofu show -json` exits non-zero with the state on stdout and
+        nothing on stderr: the state holds secrets, so no message names it."""
+        secret = '{"values": {"password": "hunter2-very-secret"}}'
+
+        class FailingShow(_Tofu):
+            def __call__(self, argv, cwd=None, timeout=None, **kw):
+                if argv[1] == "show" and "-no-color" in argv and "-json" in argv and len(argv) == 4:
+                    self.calls.append(list(argv))
+                    return subprocess.CompletedProcess(argv, 1, secret, "")
+                return super().__call__(argv, cwd=cwd, timeout=timeout, **kw)
+
+        calls = []
+        tofu = FailingShow({P7: UPDATE_ONLY})
+        outcomes, run = self._reconcile(tofu, self._gcloud(calls))
+        self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_APPLIED)
+        self.assertNotIn("hunter2", outcomes[P7][1])
+        self.assertNotIn("hunter2", json.dumps(run.extras[P7]))
+        self.assertIn("startup-fail VM not reset", outcomes[P7][1])
+        self.assertEqual(calls, [])
+
     def test_a_state_read_that_times_out_or_cannot_start_is_a_warning(self):
         for failure in (subprocess.TimeoutExpired(["tofu", "show"], 5), OSError("tofu: not found")):
             with self.subTest(type(failure).__name__):
