@@ -248,6 +248,19 @@ SOURCES: dict[str, Source] = {
         "charts/kube-agents/templates/a2a-gateway-pod-admission-policy.yaml",
         ("kube-agents.a2aGatewayPodPolicyEnabled", "policyName"),
     ),
+    # C1 reads the guard on the hindsight-postgresql NetworkPolicy, the only
+    # thing between a passwordless Postgres and the namespace. The template
+    # carries multi-line Helm comments, which helm_documents() cannot read, so
+    # the test slices the policy's block by these anchors instead.
+    "chart_hindsight": Source(
+        "charts/kube-agents/templates/hindsight.yaml",
+        (
+            "$postgresqlNetworkPolicy :=",
+            "{{- if $postgresqlNetworkPolicy }}",
+            "name: hindsight-postgresql",
+            "POSTGRES_HOST_AUTH_METHOD",
+        ),
+    ),
     # --- rendered output the operator is asserted against -----------------
     "shell_sandbox_manifests_go": Source(
         "k8s-operator/internal/controller/shell_sandbox_manifests.go",

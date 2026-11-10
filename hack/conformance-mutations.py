@@ -1178,6 +1178,20 @@ Mutation(
         "destination while still looking like an allowlist entry",
     ),
     Mutation(
+        "C1-postgres-guard-tied-to-api-toggle",
+        "charts/kube-agents/templates/hindsight.yaml",
+        (
+            "{{- $postgresqlNetworkPolicy := and $hindsightNetworkPolicy "
+            ".Values.hindsight.postgresql.networkPolicy.enabled }}",
+            "{{- $postgresqlNetworkPolicy := $apiNetworkPolicy }}",
+        ),
+        "test_C1_the_passwordless_postgres_guard_answers_to_its_own_values_alone",
+        "render the Postgres guard under the api policy's toggle, so the "
+        "bring-your-own-gateway escape (api policy off) takes the only guard on "
+        "the passwordless database with it -- the one-boolean shape the chart "
+        "had before the toggles were split",
+    ),
+    Mutation(
         "C1-cidr-guard-inert",
         "k8s-operator/internal/controller/platformagent_egress_policy.go",
         ("\tif reason := ipv4MappedRefusal(prefix, cidr); reason != \"\" {\n\t\treturn reason\n\t}\n", ""),

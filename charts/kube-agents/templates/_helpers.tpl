@@ -242,6 +242,40 @@ true
 {{- end }}
 
 {{/*
+hindsight.api.networkPolicy.additionalEgress as NetworkPolicyEgressRule items,
+one YAML list. The values take the shape of spec.networkPolicy.additionalEgress
+on the PlatformAgent CR -- to[].cidr with an optional to[].except, and
+ports[].protocol / ports[].port -- so an install that already names a peer for
+the agent's gateway policy writes the same thing here. Peers are CIDR blocks
+only, as the CR's are, and values.schema.json bounds them the way the CRD
+does; a rule without ports opens every port to its peers, which is the
+NetworkPolicy API's own reading of it.
+*/}}
+{{- define "kube-agents.hindsightAdditionalEgress" -}}
+{{- $rules := list -}}
+{{- range . -}}
+{{- $peers := list -}}
+{{- range .to -}}
+{{- $block := dict "cidr" .cidr -}}
+{{- with .except -}}
+{{- $_ := set $block "except" . -}}
+{{- end -}}
+{{- $peers = append $peers (dict "ipBlock" $block) -}}
+{{- end -}}
+{{- $rule := dict "to" $peers -}}
+{{- with .ports -}}
+{{- $ports := list -}}
+{{- range . -}}
+{{- $ports = append $ports (dict "port" .port "protocol" .protocol) -}}
+{{- end -}}
+{{- $_ := set $rule "ports" $ports -}}
+{{- end -}}
+{{- $rules = append $rules $rule -}}
+{{- end -}}
+{{- toYaml $rules -}}
+{{- end }}
+
+{{/*
 Whether the agent's PodMonitorings render, the gateway's and the credential
 broker's. platformAgent.podMonitoring is a
 tri-state: true and false are answers, and null (the default) follows the
