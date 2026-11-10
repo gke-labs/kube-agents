@@ -463,10 +463,6 @@ SOURCES: dict[str, Source] = {
     # authenticates through the callout, so it is in no served config, and
     # its publish list is appended to a per-profile slice that the identity
     # reader above can't parse; the writer tests read its body directly.
-    "a2a_dispatcher": Source(
-        "k8s-operator/internal/controller/platformagent_a2a_dispatcher.go",
-        ("func dispatcherIdentity(", "a2a.dispatch.*.*.*"),
-    ),
     "a2a_identities": Source(
         "k8s-operator/internal/controller/platformagent_a2a_identities.go",
         (
@@ -487,6 +483,7 @@ SOURCES: dict[str, Source] = {
         "k8s-operator/internal/controller/platformagent_a2a_dispatcher.go",
         (
             "func dispatcherIdentity(",
+            "a2a.dispatch.*.*.*",
             "a2aDispatcherUser",
             "var perProfile []string",
         ),
