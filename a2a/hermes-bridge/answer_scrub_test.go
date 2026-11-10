@@ -883,3 +883,26 @@ func TestSeenSecrets_QuotedYAMLStringDataRawFormIsTracked(t *testing.T) {
 		t.Errorf("an unclosed quote: the value is not tracked without its quote; set %q", s.values())
 	}
 }
+
+// A line-leading credential key followed on its line by other key: value
+// pairs hands its own value to the set, and only that value is redacted.
+func TestSeenSecrets_ALineLeadingKeyWithLaterPairsIsTracked(t *testing.T) {
+	for _, line := range []string{
+		"password: " + synthCardToken + ", host: db.internal",
+		"password: " + synthCardToken + " host: db.internal port: 5432",
+		"password: " + synthCardToken + ", token: " + synthSecretPlain2,
+	} {
+		var s seenSecrets
+		s.collectToolResult(terminalResult(t, line+"\n"))
+		if !s.has(synthCardToken) {
+			t.Errorf("%q: the value is not tracked; set %q", line, s.values())
+		}
+	}
+	if got, want := scrubInlineSecrets("password: "+synthCardToken+", host: db.internal"), "password: [redacted], host: db.internal"; got != want {
+		t.Errorf("scrubInlineSecrets = %q, want %q", got, want)
+	}
+	// A value with a space in it and no later pair is redacted whole.
+	if got, want := scrubInlineSecrets("password: correct horse battery staple"), "password: [redacted]"; got != want {
+		t.Errorf("scrubInlineSecrets = %q, want %q", got, want)
+	}
+}

@@ -2278,6 +2278,11 @@ func isLineLeadingKVKey(s string, matchStart int) bool {
 	return prefix == "" || prefix == "-"
 }
 
+// hasLaterInlineKVAssignment says whether the rest of a line after a
+// line-leading key holds another pair after the value's first token: a
+// credential key anywhere after it, or a key of any kind straight after
+// it ("password: x, host: y"). The value is then that first token, not the
+// line.
 func hasLaterInlineKVAssignment(lineRest string) bool {
 	ws := strings.IndexAny(lineRest, " \t")
 	if ws < 0 {
@@ -2285,7 +2290,13 @@ func hasLaterInlineKVAssignment(lineRest string) bool {
 	}
 	afterFirstToken := strings.TrimLeft(lineRest[ws:], " \t")
 	if loc := inlineKVSecretPattern.FindStringSubmatchIndex(afterFirstToken); loc != nil {
-		return inlineSecretKey(afterFirstToken[loc[4]:loc[5]])
+		if inlineSecretKey(afterFirstToken[loc[4]:loc[5]]) {
+			return true
+		}
+		// Any key straight after the first token: unquoted, starting with a
+		// letter, then a colon.
+		c := afterFirstToken[0]
+		return loc[0] == 0 && loc[2] == loc[3] && loc[6] == loc[7] && afterFirstToken[loc[10]] == ':' && (c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z')
 	}
 	return false
 }
