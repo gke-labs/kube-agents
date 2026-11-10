@@ -933,6 +933,13 @@ def test_worker_commands_grep_cut_refuses_a_row_whose_pattern_opened_a_typed_lin
     # word in front of it.
     for typed in ('grep -rn\nroute=1 X="\n"\ncurl x', "grep -rn\nroute=1 X='\n'\ncurl x"):
         assert _grep_cut_status(['grep -rn route=1 X=" " curl x'], [typed]) == "fail", typed
+    # A dangling option takes the next line's first word as its value, and
+    # the line's second word as the pattern: the value opened the line.
+    assert _grep_cut_status(["grep -rn -m curl route x"], ["grep -rn -m\ncurl route x"]) == "fail"
+    # The row and the trajectory are redacted apart: the words are compared
+    # ahead of the first redaction mark on either side.
+    assert _grep_cut_status(["grep -rn U=http://u:pw@route curl x"], ["grep -rn\nU=http://u:[REDACTED_SECRET]@route\ncurl x"]) == "fail"
+    assert _grep_cut_status(["grep -rn U=sk-p...7890route curl x"], ["grep -rn\nU=sk-proj1234567890route\ncurl x"]) == "fail"
     # Rows that name no card are read against every typed call.
     assert _grep_cut_status([row], ["grep -rn\nroute=1\ncurl x"], card=None) == "fail"
 
@@ -942,8 +949,23 @@ def test_worker_commands_grep_cut_refuses_the_rows_of_a_card_with_an_unread_call
     # gone: the card's grep rows are graded whole.
     assert _grep_cut_status(["grep -rn route f"], ["grep -rn route f"], clipped=True) == "fail"
     assert _grep_cut_status(["grep -rn route f"], ["grep -rn route f"], card=None, clipped=True) == "fail"
-    # A call whose quotes do not balance has no lines to read either.
+    # A call the shell reader cannot split has no lines to read either.
     assert _grep_cut_status(["grep -rn route f"], ["grep -rn route f", "cat <<EOF\ndon't\nEOF"]) == "fail"
+
+
+def test_worker_commands_grep_cut_reads_no_execute_code_program_as_shell():
+    # An ``execute_code`` program is Python, so its quotes say nothing about
+    # the card's shell lines.
+    calls = [
+        {"agent": "w", "name": "terminal", "task": "t_1", "args": {"command": "grep -rn route f"}, "at": 0.0},
+        {"agent": "w", "name": "execute_code", "task": "t_1", "args": {"code": "msg = 'can\\'t parse'\nprint(msg)"}, "at": 1.0},
+    ]
+    transcript.set("", calls, worker_commands=[{"task": "t_1", "command": "grep -rn route f"}])
+    try:
+        res = WorkerCommandsVerifier(type="worker_commands", forbidden_patterns=["route"], exempt_grep_patterns=True).verify(5.0)
+    finally:
+        transcript.clear()
+    assert res.status == "pass", res.reason
 
 
 def test_worker_commands_grep_cut_keeps_a_pattern_that_opened_no_typed_line():

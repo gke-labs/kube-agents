@@ -398,8 +398,9 @@ def _grep_cut(command: str) -> tuple[str, list[str]] | None:
     onto the row. Quotes come off, as the shell reads the line; a line bash refuses yields None.
     A card log row that joined a second typed line onto the grep is one row here, so a line
     that reads the removed word back (``$_``, a variable the pattern assigned) is read as an
-    operand: the limit ``exempt_patterns`` had too. The removed words come second, as the shell
-    reads them."""
+    operand: the limit ``exempt_patterns`` had too. Second come the words from the first after
+    the program up to the last removed one, the options and their values included, as the shell
+    reads them: a card log row can have joined any of them on from the next typed line."""
     if _COLLAPSED_CHAIN_RE.search(command):
         return None
     # The reader keeps every quoted, escaped or in-word `#` and a span's text whole, so a `#` it
@@ -463,7 +464,7 @@ def _grep_cut(command: str) -> tuple[str, list[str]] | None:
     removed = set(patterns) if given else set(positionals[:1])
     if not removed:
         return None
-    return " ".join(word for k, word in enumerate(words) if k not in removed), [words[k] for k in sorted(removed)]
+    return " ".join(word for k, word in enumerate(words) if k not in removed), list(words[1 : max(removed) + 1])
 
 
 def _typed_line_openings(command: str) -> list[str] | None:

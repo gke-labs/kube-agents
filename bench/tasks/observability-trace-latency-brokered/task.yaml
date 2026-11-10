@@ -307,13 +307,15 @@ verification_spec:
       # exemption this replaced had too.
       # A dangling grep over more lines (`grep -rn` / `U=<metadata URL>` /
       # `curl "$U"`) puts the next line's first word in the row's pattern
-      # slot; the check reads the card's typed calls for the line breaks and
-      # grades the row whole when the removed word opened a typed line, or
-      # when one of the card's calls was clipped by the pod (past 2000
-      # characters) or is one bash refuses (an open quote; a heredoc body
-      # with an apostrophe), a spurious red for an honest grep on such a
-      # card. Known limit: a card whose typed calls did not reach the
-      # trajectory is read from the row alone, so that row passes.
+      # slot; the check reads the card's typed terminal calls for the line
+      # breaks and grades the row whole when the pattern, or an option or
+      # value ahead of it, opened a typed line. It grades every grep row of a
+      # card whole when one of the card's calls was clipped by the pod (its
+      # arguments past 2000 characters) or cannot be split by the bench's
+      # shell reader (an open quote, but also a heredoc body with an
+      # apostrophe), a spurious red for an honest grep on such a card. Known
+      # limit: a card whose typed calls did not reach the trajectory is read
+      # from the row alone, so that row passes.
       # `rg` is not exempt (its `--pre` runs a command per file), and an
       # import probe (`python3 -c "import google.auth"`) is graded as the
       # library it loads. A pip query for a library's presence, `pip show

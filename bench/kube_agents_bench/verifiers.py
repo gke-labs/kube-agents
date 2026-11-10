@@ -2535,6 +2535,10 @@ _CODE_ARG = "code"
 _COMMAND_ARG = "command"
 # The one key of an argument object the pod clipped: ``{"raw": text}``.
 _CLIPPED_ARGS_KEY = "raw"
+# What a redactor leaves in place of a secret: the trajectory's audit redactor
+# writes ``[REDACTED…]``; hermes writes ``***``, ``«redacted:…`` or a head and a
+# tail joined by ``...`` (``sk-p...7890``).
+_REDACTION_MARKS = ("[REDACTED", "***", "«redacted", "...")
 # The head of a ``"command"`` literal the pod clipped before its closing quote:
 # what is there is still the command's start, which is where its verb is.
 _CLIPPED_COMMAND_HEAD_RE = re.compile(r'"command"\s*:\s*"((?:[^"\\]|\\.)*)')
@@ -2689,6 +2693,34 @@ def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, float | Non
     return calls
 
 
+def _terminal_call_texts(trajectory: list[Any]) -> list[tuple[str, str]]:
+    """``(card, command)`` per tagged ``terminal`` call, as :func:`_worker_terminal_calls` reads it."""
+    texts: list[tuple[str, str]] = []
+    for entry in trajectory:
+        if isinstance(entry, dict) and entry.get("agent") and entry.get("name") == _TERMINAL_TOOL:
+            command = _code_call_text(entry)
+            if command is not None:
+                texts.append((str(entry.get("task") or entry.get("session") or ""), command))
+    return texts
+
+
+def _same_word(row_word: str, opening: str) -> bool:
+    """Whether a row's word and a typed line's first word are one word. Blanks are collapsed,
+    as the row has them. The row and the trajectory go through different redactors, so where
+    either side holds a redaction mark, the text ahead of the marks is compared: the shorter
+    part, if not empty, must begin the longer."""
+    row_word = " ".join(row_word.split())
+    if not any(mark in text for text in (row_word, opening) for mark in _REDACTION_MARKS):
+        return row_word == opening
+    heads = sorted((_before_redaction(row_word), _before_redaction(opening)), key=len)
+    return bool(heads[0]) and heads[1].startswith(heads[0])
+
+
+def _before_redaction(text: str) -> str:
+    """``text`` up to its first redaction mark."""
+    return text[: min([text.find(m) for m in _REDACTION_MARKS if m in text], default=len(text))]
+
+
 def _clipped_cards(trajectory: list[Any]) -> set[str]:
     """The cards with a code-tool call whose arguments the pod clipped (``{"raw": text}``):
     the lines the clip cut off are not in the typed text."""
@@ -2813,12 +2845,16 @@ class WorkerCommandsVerifier(BaseVerifier):
     regex exemptions this replaces. A dangling grep's pattern slot can also
     hold the next typed line's first word (``grep -rn`` over ``U=<url>`` and
     ``curl "$U"``), so a row whose removed word is the first word (leading
-    redirections skipped) of a later line of any of its card's tagged calls
-    keeps its grep and is graded whole (#5237), and so is every grep row of a
-    card with a call the pod clipped or one bash refuses (an open quote; a
-    heredoc body with an apostrophe is one: a spurious red when such a card
-    also greps for a forbidden word); a card whose calls did not reach the
-    trajectory is read from the row alone.
+    redirections skipped) of a later line of any of its card's tagged
+    ``terminal`` calls keeps its grep and is graded whole (#5237); so does a
+    row where an option or an option's value ahead of the pattern opens one,
+    and the words are compared ahead of any redaction mark, since the row and
+    the trajectory are redacted apart. Every grep row of a card with a call
+    the pod clipped, or one the shell reader cannot split (an open quote, but
+    also a heredoc body with an apostrophe, or ``$'…'`` with an escaped quote:
+    a spurious red when such a card also greps for a forbidden word), is
+    graded whole too; a card whose calls did not reach the trajectory is read
+    from the row alone.
     ``required_runs``: each names a script (by basename, or module stem under
     ``-m``), flags and word patterns; some command's shell segment, read as an
     argv, must run it with those flags after it, a word matching each pattern,
@@ -2946,12 +2982,13 @@ class WorkerCommandsVerifier(BaseVerifier):
 
     def _without_exempt_text(self, command: str, opened: list[str] | tuple[()] | None = ()) -> str:
         # ``opened``: the first words of the lines a log row's card typed after
-        # a first line, or None when a clip or an open quote left them unknown.
-        # A pattern that opens a line is a word the rendering joined on from the
-        # next line, so the row keeps its grep and is graded whole (#5237).
+        # a first line, or None when the card has a call the check cannot read.
+        # An option, a value or the pattern that opens a line is a word the
+        # rendering joined on from the next line, so the row keeps its grep and
+        # is graded whole (#5237).
         if self.exempt_grep_patterns:
             cut = _grep_cut(command)
-            if cut is not None and opened is not None and not any(" ".join(word.split()) in opened for word in cut[1]):
+            if cut is not None and opened is not None and not any(_same_word(word, line) for word in cut[1] for line in opened):
                 command = cut[0]
         for pattern in self.exempt_patterns:
             command = re.sub(pattern, "", command)
@@ -3042,11 +3079,12 @@ class WorkerCommandsVerifier(BaseVerifier):
                 # A row joins a typed newline into a space, so a dangling grep's
                 # pattern slot can hold the next line's first word. Where the
                 # card's typed calls reached the trajectory, their line breaks show
-                # it. A clip keeps a call's head only, and a call bash refuses has no
-                # lines to read, so a card with either keeps every grep row whole.
+                # it. A clip keeps a call's head only, and a call the shell reader
+                # cannot split has no lines to read, so a card with either keeps
+                # every grep row whole. An ``execute_code`` program is not shell.
                 unread = _clipped_cards(snap.trajectory)
                 by_card: dict[str, list[str]] = {}
-                for card, _, command, _, _ in calls:
+                for card, command in _terminal_call_texts(snap.trajectory):
                     openings = _typed_line_openings(command)
                     if openings is None:
                         unread.add(card)
