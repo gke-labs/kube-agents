@@ -71,9 +71,10 @@ func TestDecodeGchatLegacyClick(t *testing.T) {
 	}
 	check("as captured", ev)
 	// The clicked message's own buttons name the clicked one, and its link.
-	links, label, _ := gchatMessageButtons(ev.Message, 1, "fallback")
-	if label != "platform-agent-host" || len(links) != 1 || links[0].Text != "Cloud Console" {
-		t.Errorf("buttons read back: label %q links %v", label, links)
+	label, _ := gchatMessageButtons(ev.Message, 1, "fallback")
+	links := gchatEventLayout(ev.Message).Widgets
+	if label != "platform-agent-host" || len(links) != 1 || !strings.Contains(fmt.Sprint(links), "Cloud Console") {
+		t.Errorf("buttons read back: label %q widgets %v", label, links)
 	}
 	// Without common, action alone carries the function and parameters.
 	var wire map[string]any
@@ -634,11 +635,11 @@ func TestGchatWidgetsRoundTrip(t *testing.T) {
 	if err := json.Unmarshal([]byte(`{"accessoryWidgets":`+string(raw)+`}`), &m); err != nil {
 		t.Fatal(err)
 	}
-	links, label, _ := gchatMessageButtons(m, 1, "fallback")
-	if label != "B" || len(links) != 1 || links[0].URL != "https://x.example/d" || links[0].Text != "docs" {
-		t.Errorf("round trip: label %q links %v", label, links)
+	label, _ := gchatMessageButtons(m, 1, "fallback")
+	if widgets := fmt.Sprint(gchatEventLayout(m).Widgets); label != "B" || !strings.Contains(widgets, "https://x.example/d") || !strings.Contains(widgets, "docs") {
+		t.Errorf("round trip: label %q widgets %s", label, widgets)
 	}
-	if _, label, _ := gchatMessageButtons(m, gchatChoiceUnknown, "fallback"); label != "fallback" {
+	if label, _ := gchatMessageButtons(m, gchatChoiceUnknown, "fallback"); label != "fallback" {
 		t.Errorf("an unknown index names no button: %q", label)
 	}
 }

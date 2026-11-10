@@ -1508,17 +1508,14 @@ func TestGchatMessageButtonsTellTheKindsApartByFunction(t *testing.T) {
 		m.AccessoryWidgets[0].ButtonList.Buttons = buttons
 		return m
 	}
-	links, label, rating := gchatMessageButtons(withRating(gchatRating{task: "t-root"}), 1, "fallback")
-	if len(links) != 1 || links[0].Text != "board" || links[0].URL != "https://x.example/b" {
-		t.Errorf("links = %+v, want the link alone", links)
-	}
+	label, rating := gchatMessageButtons(withRating(gchatRating{task: "t-root"}), 1, "fallback")
 	if label != "Skip" {
 		t.Errorf("label = %q, want the choice at index 1", label)
 	}
 	if rating != (gchatRating{task: "t-root"}) {
 		t.Errorf("rating = %+v, want t-root unchosen", rating)
 	}
-	if _, _, rating := gchatMessageButtons(withRating(gchatRating{task: "t-root", chosen: "down"}), 1, "fallback"); rating != (gchatRating{task: "t-root", chosen: "down"}) {
+	if _, rating := gchatMessageButtons(withRating(gchatRating{task: "t-root", chosen: "down"}), 1, "fallback"); rating != (gchatRating{task: "t-root", chosen: "down"}) {
 		t.Errorf("rating with 👎 FILLED = %+v, want chosen down", rating)
 	}
 }

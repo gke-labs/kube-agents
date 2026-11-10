@@ -1882,11 +1882,12 @@ Chat refuses falls back to the text as any does.
 
 The adapter keeps one layout record per message, in this process: the text and the buttons the
 message shows now, rating buttons included, as the adapter last created or patched it
-(`gchat_layout.go`). Every create and every patch that lands writes it (a create, an edit, the
-answered rewrite, a rating tap's patch, a board row's edit), and every rewrite reads it as its
-base under the message's rewrite lock, falling back to the event's copy of the message, text and
-buttons, only when there is no record (a message posted before a restart), which is then on record
-too. Each rewrite changes only its own part of it: the answered rewrite drops the choice buttons,
+(`gchat_layout.go`). Every laid-out create (`createLaidOut`) and every patch that lands writes it
+(an edit, the answered rewrite, a rating tap's patch, a board row's edit), and every rewrite reads
+it as its base under the message's rewrite lock, falling back to the event's copy of the message,
+text and buttons, only when there is no record (a message posted before a restart, or a rated text
+answer or a Stop line, which are created outside the layout path), which is then on record too.
+Each rewrite changes only its own part of it: the answered rewrite drops the choice buttons,
 adds the `✓` line under the text and draws the rating buttons last; a rating tap replaces the rating
 buttons with the tapped one filled (and drops the choice buttons of an answered message, so a tap
 never restores choices the answer removed); a board tap sets its row's line and drops that row's
@@ -1926,8 +1927,11 @@ same surface rule as a typed message, to the thread the event names, in the kind
 names, or, where the adapter clears the thread (an unthreaded space, a click event with no
 thread name), to the shared space, as a typed message there does, so the binding survives a restart without any mark, and a typed reply in its thread
 does not answer it; its buttons do. A
-rewrite that fails posts the line in the conversation instead, as does a typed reply to a
-question whose layout record has gone. The questions, answers and layout records
+rewrite that fails posts the line in the conversation instead. A question closes with its layout
+record (the record's ring is the busier one, since every edit writes it): the message is then as
+one from before a restart, its buttons answer from the click's copy and a typed reply in its
+thread is a turn of its own; a reply already pending when the record went posts its line in the
+conversation. The questions, answers and layout records
 are held in the process: after a restart a question keeps its buttons until clicked, the click
 is still a turn, and the rewrite reads the message the event carries, its text and buttons,
 and the clicked button's label. A click on a button the adapter did not draw is
@@ -2628,7 +2632,7 @@ in the same thread.
 
 The Google Chat rewrites keep the rating buttons. The answered rewrite a choice click or typed
 reply makes (`gchatAnsweredLayout`) and a later edit that lays out no choices (`answeredLayout`)
-put them back after the link buttons, filled as last rated, from the adapter's record. For a
+put them back after the message's other buttons, filled as last rated, from the adapter's record. For a
 message from before a restart the click's rewrite reads them from the event's copy
 (`gchatMessageButtons`, which reads the `task` parameter and the `FILLED` button) and remembers
 them, so a later edit draws the same. Buttons are told

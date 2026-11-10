@@ -43,7 +43,7 @@ const (
 	gchatButtonListKey    = "buttonList"
 	gchatButtonsKey       = "buttons"
 	// The keys a drawn button names its action's function under, which
-	// gchatWithoutRating reads to find the rating buttons.
+	// gchatButtonFunction reads to tell the buttons apart.
 	gchatOnClickKey  = "onClick"
 	gchatActionKey   = "action"
 	gchatFunctionKey = "function"
@@ -196,17 +196,6 @@ func gchatWithRating(widgets []map[string]any, r gchatRating) []map[string]any {
 		out = append(out, map[string]any{gchatButtonListKey: map[string]any{gchatButtonsKey: gchatRatingButtons(r)}})
 	}
 	return out
-}
-
-// gchatWithoutRating is layout with its rating buttons removed, and a button
-// list left empty by that removed with them, so gchatWithRating draws one
-// pair on it again (gchatWithoutButtons).
-func gchatWithoutRating(layout gchatChatLayout) gchatChatLayout {
-	unrated := layout
-	unrated.Widgets = gchatWithoutButtons(layout.Widgets, func(b map[string]any) bool {
-		return gchatButtonFunction(b) == gchatFeedbackFunction
-	})
-	return unrated
 }
 
 // classifyGchatButton tells what a decoded button does by its function, or

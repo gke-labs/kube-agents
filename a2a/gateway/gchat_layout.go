@@ -13,8 +13,9 @@ import (
 // included. So a message with choices, links and acting rows keeps its row
 // buttons through its answer, keeps its answered line through a tap, and
 // keeps a tapped row's line through a rating. A message with no record
-// (posted before a restart, or forgotten after a board edit whose answer
-// was lost) is rebuilt from the event's copy of it, text and buttons
+// (posted before a restart, forgotten after a board edit whose answer was
+// lost, or created outside the layout path: a rated text answer, a Stop
+// line) is rebuilt from the event's copy of it, text and buttons
 // (gchatEventLayout), and is on record from then on.
 
 // rememberLayout records layout as what message shows now.
@@ -24,10 +25,15 @@ func (a *GoogleChatAdapter) rememberLayout(message string, layout gchatChatLayou
 	a.uxLocked().rememberLayoutLocked(message, layout)
 }
 
-// rememberLayoutLocked is rememberLayout under the adapter's lock.
+// rememberLayoutLocked is rememberLayout under the adapter's lock. The
+// ring's eviction closes the question the evicted message asked
+// (closeUnrecordedLocked).
 func (ux *gchatUX) rememberLayoutLocked(message string, layout gchatChatLayout) {
 	ux.layouts[message] = layout
-	remember(&ux.layoutsOrder, message, func(k string) { delete(ux.layouts, k) })
+	remember(&ux.layoutsOrder, message, func(k string) {
+		delete(ux.layouts, k)
+		ux.closeUnrecordedLocked(k)
+	})
 }
 
 // forgetLayout drops message's record: an edit whose answer did not come
@@ -38,6 +44,17 @@ func (a *GoogleChatAdapter) forgetLayout(message string) {
 	ux := a.uxLocked()
 	delete(ux.layouts, message)
 	forget(&ux.layoutsOrder, message)
+	ux.closeUnrecordedLocked(message)
+}
+
+// closeUnrecordedLocked closes the question a message with no record asked:
+// a typed reply has no copy of the message to rewrite, so the question goes
+// with the record, as one evicted from its own ring does, and the message
+// is as one from before a restart: its buttons still answer, from the
+// click's copy, and a typed reply in its thread is a turn of its own.
+func (ux *gchatUX) closeUnrecordedLocked(message string) {
+	ux.dropQuestionLocked(message)
+	forget(&ux.questionsOrder, message)
 }
 
 // layoutOf is the layout message shows now, when the adapter has a record

@@ -419,7 +419,7 @@ func (a *GoogleChatAdapter) classifyClick(ev *gchatEvent) (InboundMessage, strin
 	} else {
 		// Posted before a restart: the clicked button's own label names
 		// the choice, and the message's buttons its rating.
-		_, p.label, p.rating = gchatMessageButtons(ev.Message, index, p.label)
+		p.label, p.rating = gchatMessageButtons(ev.Message, index, p.label)
 	}
 	ux.pending[id] = p
 	ux.waiting[ev.Message.Name] = true
@@ -469,17 +469,15 @@ func gchatClickMessage(id string) string {
 }
 
 // gchatMessageButtons reads a clicked message's own buttons, told apart by
-// their function (classifyGchatButton): the link buttons it shows, as
-// links; the label of the choice at index, or fallback when no button
-// carries that index (or the index is unknown); and its rating buttons, the
-// task they rate and the one drawn filled.
-func gchatMessageButtons(m gchatMessage, index int, fallback string) (links []chatmsg.Link, label string, rating gchatRating) {
+// their function (classifyGchatButton): the label of the choice at index,
+// or fallback when no button carries that index (or the index is unknown),
+// and its rating buttons, the task they rate and the one drawn filled. The
+// buttons themselves are the rewrite's base as a layout (gchatEventLayout).
+func gchatMessageButtons(m gchatMessage, index int, fallback string) (label string, rating gchatRating) {
 	label = fallback
 	for _, w := range m.AccessoryWidgets {
 		for _, b := range w.ButtonList.Buttons {
 			switch classifyGchatButton(b) {
-			case gchatButtonLink:
-				links = append(links, chatmsg.Link{Text: b.Text, URL: b.OnClick.OpenLink.URL})
 			case gchatButtonRating:
 				params := buttonParameters(b)
 				if task := params[gchatFeedbackParamTask]; task != "" {
@@ -498,7 +496,7 @@ func gchatMessageButtons(m gchatMessage, index int, fallback string) (links []ch
 			}
 		}
 	}
-	return links, label, rating
+	return label, rating
 }
 
 // buttonParameters is a decoded button's action parameters by key.
@@ -547,9 +545,11 @@ func (a *GoogleChatAdapter) InboundVerified(conversation, messageID string, veri
 		// click may have filled. A message it has no record of (posted
 		// before a restart) is rewritten from the click's copy, and keeps
 		// the rating buttons that copy showed, on record from here, so a
-		// later edit keeps them as drawn (answeredLayout). A typed reply
-		// to a question whose record has gone has no copy to rewrite from,
-		// so its line goes in the conversation instead.
+		// later edit keeps them as drawn (answeredLayout). A question
+		// closes with its record (closeUnrecordedLocked), so a typed reply
+		// meets one only when the record went while the reply was pending;
+		// it has no copy to rewrite from, so its line goes in the
+		// conversation instead.
 		base, remembered, _ := a.layoutOf(p.message)
 		if !remembered {
 			base = p.layout

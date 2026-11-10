@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -176,5 +177,39 @@ func TestGchatMovedFollowsTheRecordsButtons(t *testing.T) {
 	stale := gchatBoardTapAt(t, "drop", 2, "t_3", gchatButtonLine(t, layout, "drop", 2))
 	if _, reason := a.classify(stale); reason != gchatBoardStale {
 		t.Errorf("a tap after the settle: %q", reason)
+	}
+}
+
+// A question closes with its layout record: once the record is evicted from
+// its ring, or forgotten after a board edit whose answer was lost, the
+// message asks no typed reply (a click still answers from its copy), so no
+// typed answer is left without a layout to rewrite.
+func TestGchatQuestionClosesWithItsLayoutRecord(t *testing.T) {
+	const conversation = "gchat:dm/spaces/_c2fixtureAA"
+	open := func(a *GoogleChatAdapter) (asked, isOpen bool) {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		ux := a.uxLocked()
+		_, asked = ux.questions[gchatBoardMessage]
+		return asked, ux.open[conversation] == gchatBoardMessage
+	}
+	a, _, _ := newMixedGchatAdapter(t)
+	if asked, isOpen := open(a); !asked || !isOpen {
+		t.Fatalf("asked %v open %v after the create, want the question open", asked, isOpen)
+	}
+	for i := 0; i < uxCap; i++ {
+		a.rememberLayout(fmt.Sprintf("spaces/S1/messages/other-%d", i), gchatChatLayout{Text: "other"})
+	}
+	if _, remembered, _ := a.layoutOf(gchatBoardMessage); remembered {
+		t.Fatal("the record survived uxCap newer ones")
+	}
+	if asked, isOpen := open(a); asked || isOpen {
+		t.Errorf("asked %v open %v after the record's eviction, want the question closed", asked, isOpen)
+	}
+
+	a, _, _ = newMixedGchatAdapter(t)
+	a.forgetLayout(gchatBoardMessage)
+	if asked, isOpen := open(a); asked || isOpen {
+		t.Errorf("asked %v open %v after the record was forgotten, want the question closed", asked, isOpen)
 	}
 }
