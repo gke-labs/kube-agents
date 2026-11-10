@@ -1593,7 +1593,7 @@ func scrubProseSecrets(s string, sink secretSink) string {
 	return scrubNormalized(s, sink, func(n string, code [][2]int, rec func(lo, hi int, named bool)) {
 		for _, m := range proseSecretPattern.FindAllStringSubmatchIndex(n, -1) {
 			lo, hi := m[4], m[5]
-			if end, ok := codeSpanEnd(code, lo); ok {
+			if end, ok := codeSpanEnd(code, lo); ok && n[lo:end] != redactedValue && proseValueRedacted(n[lo:end]) {
 				hi = end // a code-spanned value ends at its closing backtick
 			}
 			if n[lo:hi] != redactedValue && proseValueRedacted(n[lo:hi]) {
@@ -1656,9 +1656,15 @@ func kvSecretSpans(s string, code [][2]int, rec func(lo, hi int, named bool)) {
 			return classValueRedacted(class, v, sep == ':' && runsOnAsSentence(after))
 		}
 		// A code-spanned value is bounded by its backticks, like a quoted
-		// one.
+		// one: the span is redacted whole when it reads as the value, or
+		// when its first word does (a credential and a note after it).
 		if coded && codeEnd > matchEnd {
-			if !strings.Contains(s[matchEnd:codeEnd], redactedValue) && redacts(s[matchEnd:codeEnd], "") {
+			span := s[matchEnd:codeEnd]
+			first := span
+			if ws := strings.IndexAny(span, " \t"); ws >= 0 {
+				first = span[:ws]
+			}
+			if span != redactedValue && (redacts(span, "") || first != span && redacts(first, "")) {
 				rec(matchEnd, codeEnd, named)
 				pos = codeEnd
 			}

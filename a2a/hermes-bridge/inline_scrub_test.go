@@ -535,3 +535,18 @@ func TestScrubInlineSecretsCodeSpannedValueIsBoundedByItsBackticks(t *testing.T)
 		t.Errorf("sink got %q, want the whole value", got)
 	}
 }
+
+// A code span holding a credential token and more words after it, under a
+// key whose class needs a token-shaped value, is redacted whole: the span
+// is read for its first word when the whole span is not a value.
+func TestScrubInlineSecretsCodeSpanWithACredentialAndMoreWords(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"- **github_token_id**: `Synth3t1cT0kenValue01 rotated daily`", "- **github_token_id**: `[redacted]`"},
+		{"note github_token_id: `Synth3t1cT0kenValue01 (prod)` here", "note github_token_id: `[redacted]` here"},
+	}
+	for _, tc := range cases {
+		if got := scrubInlineSecrets(tc.in); got != tc.want {
+			t.Errorf("scrubInlineSecrets(%q)\n got %q\nwant %q", tc.in, got, tc.want)
+		}
+	}
+}
