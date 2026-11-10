@@ -396,8 +396,8 @@ already written.
   `--manifests-dir` scans a local tree instead of, or as well as, repositories.
 - It reads one revision of each repository through the credential broker, with no history, into a
   temporary directory of its own, and deletes it, so it never touches a copy another skill is
-  working in. The broker reads the whole tree, and refuses a repository whose tree is over its
-  snapshot ceiling: that repository is listed under errors, not as partial. When
+  working in. A tree over the broker's snapshot ceiling is read in the parts that hold manifests; a
+  part it could not read is a `partial` line with the reason, and sets exit code 1. When
   `CREDENTIAL_PROXY_URL` is not set (a run outside the pod), the script reads a leased checkout of
   its own instead, for GitHub repositories only; `--lease` names that lease. It runs no `gcloud`
   and writes to no repository. A repository the broker or git cannot serve is listed under errors
@@ -421,10 +421,11 @@ members affected, which are the members whose control plane is still below that 
 is an apiVersion removed after the floor and no later than the target; a removal at or below
 the floor has already happened on every member and is not reported. A clean section says so
 with the file and document counts it read. Under either, `skipped` lines name the files it did
-not read and why, and a `partial` line means a size cap stopped the scan; a clean section with
-skipped files is clean for what it read, so say that. A section headed `not scanned` means this
-run did not read that repository: report it as not read, with the error the section gives, and
-never answer for it from a scan file this run did not write or from another card's result.
+not read and why, and a `partial` line means a size cap stopped the scan or names a part it did
+not read; a clean section with either is clean for what it read, so say that. A section headed
+`not scanned` means this run did not read that repository: report it as not read, with the error
+the section gives, and never answer for it from a scan file this run did not write or from another
+card's result.
 
 The scan reads what Git declares. Whether a client is still calling a deprecated API on a live
 cluster is a different question, answered by GKE Deprecation Insights from the cluster's audit

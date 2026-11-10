@@ -182,6 +182,12 @@ def _drop_bridge(docs):
     spec["containers"] = [c for c in spec["containers"] if c["name"] != "hermes-bridge"]
 
 
+def _drop_console_cpu_limit(docs):
+    doc = _find_doc(docs, "Deployment", "platformagent-a2a-console")
+    for container in doc["spec"]["template"]["spec"]["containers"]:
+        container.get("resources", {}).get("limits", {}).pop("cpu", None)
+
+
 def _add_callout_container(docs):
     doc = _find_doc(docs, "Deployment", "platformagent-a2a-callout")
     doc["spec"]["template"]["spec"]["containers"].append(
@@ -572,7 +578,7 @@ class NextModeFootprintTest(unittest.TestCase):
         self.assertEqual(self.data["operatorRendered"]["storage"]["persistentVolumeClaims"], 4)
 
     def test_the_standing_delta_is_the_documented_figure(self):
-        """The A2A stack's standing requests, provisioning Job aside: 650m and 1152Mi."""
+        """The A2A stack's standing requests, provisioning Job aside: 850m and 1472Mi."""
         standing = [k for k in self.following if k not in ("storage", "a2aProvision")]
         cpu = sum(
             self.following[k]["hermesBridge"]["cpuMillisRequest"] if k == "agentPod"
@@ -584,7 +590,7 @@ class NextModeFootprintTest(unittest.TestCase):
             else self.following[k]["memoryBytesRequest"]
             for k in standing
         )
-        self.assertEqual((cpu, memory), (650, 1152 * _MIB))
+        self.assertEqual((cpu, memory), (850, 1472 * _MIB))
 
     def test_replicas_scale_a_workload(self):
         with _goldens_with(following=_scale_callout_deployment):
@@ -605,6 +611,16 @@ class NextModeFootprintTest(unittest.TestCase):
             with self.assertRaises(ValueError) as caught:
                 gcf.extract_footprint()
         self.assertIn("RunSettledGoldenTest", str(caught.exception))
+
+    def test_a_summed_container_without_a_cpu_limit_is_an_error(self):
+        """A limits.cpu quota refuses such a pod, and the preflight would sum its limit as
+        zero and never see it (#3847, the console)."""
+        with _goldens_with(following=_drop_console_cpu_limit):
+            with self.assertRaises(ValueError) as caught:
+                gcf.extract_footprint()
+        message = str(caught.exception)
+        self.assertIn("'console'", message)
+        self.assertIn("declares no cpu limit", message)
 
     def test_an_unaccounted_a2a_container_is_an_error(self):
         with _goldens_with(following=_add_callout_container):
@@ -748,6 +764,15 @@ class CompletenessGuardTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.baseline = gcf.extract_footprint()
+
+    def test_the_limits_guard_names_each_missing_limit(self):
+        spec = {"containers": [_container("box", requests={"cpu": "10m", "memory": "16Mi"}, limits={"memory": "32Mi"})]}
+        with self.assertRaises(ValueError) as caught:
+            gcf._check_limits({"Deployment/box": spec}, {gcf._container_key("Deployment/box", "box")})
+        self.assertIn("'box' in Deployment/box declares no cpu limit", str(caught.exception))
+        self.assertNotIn("no memory limit", str(caught.exception))
+        # An unsummed container is the completeness guard's business, not this one's.
+        gcf._check_limits({"Deployment/box": spec}, set())
 
     def test_the_committed_golden_passes(self):
         """Every pod-bearing workload the operator renders today is summed or ignored."""

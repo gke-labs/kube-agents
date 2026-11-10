@@ -71,6 +71,9 @@ readonly KUBE_AGENTS_VALUES_SCHEMA="charts/kube-agents/values.schema.json"
 # helpers. tests/test_upgrade_script.py checks the two agree.
 readonly BREAKING_CHANGE_SUBJECT_REGEX='^[a-z]+(\([^)]+\))?!:'
 readonly BREAKING_CHANGE_FOOTER_REGEX='^[[:space:]]*BREAKING[ -]CHANGE:[[:space:]]+'
+# The site's rollback page, which a refused downgrade names: it has the steps a
+# breaking change asks for, such as going through `today` first.
+readonly ROLLBACK_DOC="https://gke-labs.github.io/kube-agents/deploy/rollback/"
 # The downgrade check reads commit messages and ancestry only, so a history it
 # has to fetch carries commits and no trees or file contents.
 readonly DOWNGRADE_HISTORY_FETCH_FILTER="--filter=tree:0"
@@ -1054,7 +1057,7 @@ remote_release_tag_commit() {
 # object name is self-verifying — a checkout cannot hold a different tree under
 # the same SHA — so it needs no second opinion from the remote.
 ref_is_commit_sha() {
-  printf '%s' "${1:-}" | grep -Eq '^[0-9a-fA-F]{40}$'
+  grep -Eq '^[0-9a-fA-F]{40}$' <<<"${1:-}"
 }
 
 verify_local_source_ref() {
@@ -1385,6 +1388,7 @@ check_downgrade() {
     return 0
   fi
   print_info "Each can leave state on the cluster that ${target} cannot read. Read them, then re-run with --allow-breaking-downgrade to move anyway."
+  print_info "Rolling back a release (${ROLLBACK_DOC}) has the steps a breaking change can need, such as going through today first."
   exit 1
 }
 
@@ -1857,6 +1861,12 @@ main() {
   # preview reads its engine from a temporary copy, which has no install.env.
   local install_env_file
   install_env_file="$(resolve_install_env_file "$repo_dir" "$install_checkout")"
+  # Absolute now, as install.sh makes it: the chat checklist's re-run command
+  # names this path for a paste from any directory.
+  case "$install_env_file" in
+    /*) ;;
+    *) install_env_file="$(pwd)/${install_env_file}" ;;
+  esac
   # Clear any shell-exported coordinates before sourcing the file: load_install_env
   # only unsets NAMESPACE, so without this an install.env that omits REGION while
   # the caller's shell exports REGION=europe-west1 would make the cross-check
@@ -2423,6 +2433,24 @@ main() {
   write_report "SUCCESS"
 
   print_step "🎉 Upgrade Complete!"
+  # A full apply renders the chat keys from install.env, so a key edited since
+  # the last apply turns a chat platform on, or moves it between the agent and
+  # the A2A gateway, with nothing after it to say what the chat app still
+  # needs. The retag arms reuse the recorded values and change neither.
+  # Guarded: an older target's installer_common.sh lacks the helper. The DM
+  # link in the Google Chat checklist is the project's number, which
+  # install.env never records. The topic is the one the generator rendered: a
+  # file that names none renders the default, which the helper must be handed,
+  # since the generator keeps it local.
+  if [ "$PARAM_UPGRADE_MODE" = "full" ] && declare -F print_chat_setup_checklists >/dev/null; then
+    local project_number=""
+    if is_truthy "${GOOGLE_CHAT_ENABLED:-}"; then
+      project_number="$(gcloud projects describe "$PROJECT_ID" --format="value(projectNumber)" 2>/dev/null || echo "")"
+    fi
+    CHAT_TOPIC_NAME="${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}" \
+      PROJECT_NUMBER="$project_number" INSTALL_ENV_FILE="$install_env_file" \
+      print_chat_setup_checklists "${PLATFORM_AGENT_MODE_AFTER_APPLY:-${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}}"
+  fi
   if declare -F print_next_home_channel_unset_summary >/dev/null; then
     print_next_home_channel_unset_summary
   fi

@@ -9,7 +9,7 @@ than that only queues the rest at the broker, where a check still waiting at its
 admitted count, read from `GET /v1/exec/admission`, rather than a constant.
 
 The count differs by install. At the operator's default 2Gi limit the budget
-fits 9 and the slot cap of 8 binds. On GKE Autopilot without bursting the limit
+fits 10 and the slot cap of 8 binds. On GKE Autopilot without bursting the limit
 is the memory request, 2Gi by default, so the same holds; an override with a
 smaller request fits fewer. Only the broker sees the effective limit, so only
 the broker can say.
@@ -27,6 +27,12 @@ whose interactive cap is under four sweeps narrower than four. This doesn't coor
 run at the same time: each sizes its own pool, and they share the interactive
 cap with the live reads.
 
+With the exec tier on, the sweep reads the exec URL, and one replica answers
+for the tier. Its report then carries the replica count and the tier's admitted
+count and interactive cap, and the sweep sizes against those, with the session
+cap free on each replica (`read_report` says why). A broker that does not
+report them gives the per-replica width, as before.
+
 A broker that predates the route, or any failure to read it, gives today's
 width of four.
 """
@@ -35,7 +41,6 @@ from __future__ import annotations
 
 import http.client
 import json
-import os
 import urllib.error
 import urllib.request
 
@@ -88,10 +93,16 @@ def _positive_int(value: object) -> int | None:
 
 
 def read_report(endpoint: str | None = None) -> tuple[int, int, int | None] | None:
-    """The broker's admitted count, session cap and interactive cap, or None
+    """The broker's admitted count, chat headroom and interactive cap, or None
     when they can't be read. A report without a usable session cap gives
-    CHAT_HEADROOM; one without a usable interactive cap gives None."""
-    endpoint = (endpoint if endpoint is not None else os.environ.get("CREDENTIAL_PROXY_URL", "")).strip()
+    CHAT_HEADROOM; one without a usable interactive cap gives None. With no
+    ``endpoint``, the exec tier's URL when one is set, else the stateful
+    broker's (`credential_proxy_client.exec_endpoints`). A failure to read the
+    exec tier does not fall back to the stateful broker: it gives None, and the
+    sweep reads four wide."""
+    if endpoint is None:
+        endpoint = credential_proxy_client.exec_endpoints()[0] or ""
+    endpoint = endpoint.strip()
     if not endpoint:
         return None
     try:
@@ -117,11 +128,22 @@ def read_report(endpoint: str | None = None) -> tuple[int, int, int | None] | No
     admitted = _positive_int(report.get("admitted"))
     if admitted is None:
         return None
-    return (
-        admitted,
-        _positive_int(report.get("session_cap")) or CHAT_HEADROOM,
-        _positive_int(report.get("interactive_cap")),
-    )
+    session_cap = _positive_int(report.get("session_cap")) or CHAT_HEADROOM
+    replicas = _positive_int(report.get(credential_proxy_client.ADMISSION_REPLICAS_KEY))
+    tier_admitted = _positive_int(report.get(credential_proxy_client.ADMISSION_TIER_ADMITTED_KEY))
+    tier_interactive_cap = _positive_int(report.get(credential_proxy_client.ADMISSION_TIER_INTERACTIVE_CAP_KEY))
+    if replicas is not None and tier_admitted is not None and tier_interactive_cap is not None:
+        # The headroom is per replica, so the tier keeps the session cap free on
+        # each replica. The shim opens one connection per command and the
+        # Service balances by connection, so a chat read can land on any
+        # replica, and the room it needs must be free on that one. A single
+        # session cap taken from the tier total would leave on average
+        # session_cap / replicas per replica. With the headroom times the
+        # replica count, each replica carries what one pod carries today: at
+        # the 2 GiB default (admitted 8, interactive cap 7, session cap 2),
+        # five sweep reads per replica.
+        return tier_admitted, session_cap * replicas, tier_interactive_cap
+    return admitted, session_cap, _positive_int(report.get("interactive_cap"))
 
 
 def sweep_width() -> int:

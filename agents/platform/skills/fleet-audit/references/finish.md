@@ -11,13 +11,26 @@ Part of the `fleet-audit` skill (`/opt/data/profiles/platform/skills/fleet-audit
   [--repo "<owner>/<repo>"] \
   [--manifest-file <path> | --no-collector-manifest "<why>"] \
   [--decline-fix <finding-id> "<why>" ...] \
+  [--no-promote] \
   [--scheduled]
 ```
+
+Pass `--no-promote` when the card that asked for the run says not to open a pull request (the
+Planning Agent's propose-only line). The ledger publishes as on any run; the automatic remediation
+sweep opens nothing on that run, and the ledger lists those fixes under "Awaiting `/remediate`" with
+the reason. The install's own switch (`KUBEAGENTS_AUDIT_AUTO_PROMOTE`) is not changed.
 
 Pass `--scheduled` only when the cron prompt tells you to: it says that the run is a scheduled run,
 and only a scheduled run can get `silent_ok: true` (see [The clean run](clean-run.md#the-clean-run)). Do not
 pass it on a run that a person asked for. A fleet-audit cron job that you create on request must
-carry the same sentence as the shipped jobs in its prompt.
+carry the same sentence as the shipped jobs in its prompt. The same flag goes to `precheck`, which
+runs this `finish` itself on a scheduled run whose collector manifest digests the same as the last
+scheduled run's ([`draft` and `precheck`](lifecycle.md#between-the-collector-and-finish-draft-and-precheck)): the
+document is that run's stored one, the manifest is this run's, and every rule below applies as it
+is. The line such a run prints is this command's, plus `precheck: unchanged`; a `finish` you run
+yourself never carries that key. A scheduled `finish` with a manifest also records the manifest's
+digest for the next run's `precheck`; one that waived the manifest removes the record, so the next
+run drafts in full.
 
 The last pair belongs to a stream whose SOP runs a collector (the repository's collector-manifest
 design says what the manifest holds), and on such a stream one of the two is **required**:
@@ -44,18 +57,32 @@ goes in neither `checks_run` nor `checks_not_applicable` but in that target's `l
 keeps the run partial and leaves open every finding that check filed there. `finish` rejects the
 slug anywhere else.
 
+The compliance collector, and the drift, patch readiness and stockout collectors with
+`--config-connector` or while this run is in flight, also give `kcc_unready`, the Config Connector
+objects whose `Ready` condition is `False`, to a cluster that serves a kind they read: any Config
+Connector kind for compliance, `ContainerCluster` or `ContainerNodePool` for the other three. A
+cluster whose read failed, also at the discovery, gets `kcc_unread` with the reason. You copy
+neither into the document. `finish` reads them: any fix whose finding's own object is among them
+gets a last paragraph that starts "**Config Connector is not applying this file.**" (it names the
+declaring file when the fix is not a manifest fix of it) or, when `finish` finds no single
+declaration, "**Config Connector is not applying the declaration of this object.**". The fix keeps
+its kind. Do not write either paragraph yourself, and do not copy it from an earlier ledger:
+`finish` removes it and writes it again from this run's manifest.
+
 The script validates the document, reconciles every finding against the pull requests already open
 for this stream, rewrites (or opens) the ledger issue, comments the delta, opens pull requests for
 the fixes that qualify, and closes the ones whose findings have stopped reproducing. It prints one
 JSON line — `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_still_open` (remediation
 pull requests already open on findings this run still carries; empty on a clean run), `prs_closed`,
-`partial`, `coverage_gaps`, `unreported_under_gap` (only when not empty), `since_last_scheduled` (only on a scheduled run whose findings changed since the last scheduled run while `new` and `resolved` do not say it, or `null` when that is not known; absent when every id that moved left under a coverage gap; see [The clean run](clean-run.md#the-clean-run)), `silent_ok`, `declared`, the number of postures a repository
+`partial`, `coverage_gaps`, `precheck` (only on a run `precheck` closed from the stored document; its value is `unchanged`), `unreported_under_gap` (only when not empty), `since_last_scheduled` (only on a scheduled run whose findings changed since the last scheduled run while `new` and `resolved` do not say it, or `null` when that is not known; absent when every id that moved left under a coverage gap; see [The clean run](clean-run.md#the-clean-run)), `silent_ok`, `declared`, the number of postures a repository
 declaration kept off the ledger (it never decides silence), `postures_withheld`, the ids of the
 posture findings `finish` held back because the document recorded no complete declared-intent
 search (empty everywhere but on a declaring stream that skipped the step; see
-[`declared_intent_searched`](findings-document.md#declared_intent_searched)), and `unaccounted`, the ids of the previous
+[`declared_intent_searched`](findings-document.md#declared_intent_searched)), `unaccounted`, the ids of the previous
 findings a clean run was refused its close over (empty on every other outcome; see
-[The clean run](clean-run.md#the-clean-run)). A `finish` that follows an earlier `finish` of the same
+[The clean run](clean-run.md#the-clean-run)), and `retired_unlisted` (only when not empty), the ids
+of the previous findings a clean close retired unread because their cluster was in neither scope
+list (see [The clean run](clean-run.md#the-clean-run)). A `finish` that follows an earlier `finish` of the same
 repository in the run also carries `refinish: true`; when that earlier `finish` wrote the report
 store, `new` and `resolved` count against it. When that earlier `finish` reported news or opened a
 pull request, the line also carries `silent_floor: true`: its `silent_ok` stays `false` and its

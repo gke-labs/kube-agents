@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -306,7 +307,7 @@ func a2aProvisionLikeTheScript(t *testing.T, url, seedPassword string) {
 // reproduced on this server.
 func TestBridgeJetStreamGrantOnARealServer(t *testing.T) {
 	creds := a2aFullCreds("a", "1")
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := a2aWithProvisionStandIn(t, string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t), nil).Data["nats.conf"]))
 	bridgePW := string(creds.Data["bridge-password"])
 	seedPW := string(creds.Data["seed-password"])
 	gatewayPW := string(creds.Data["gateway-password"])
@@ -314,15 +315,16 @@ func TestBridgeJetStreamGrantOnARealServer(t *testing.T) {
 
 	s, log := a2aStartRenderedServer(t, conf)
 	a2aProvisionLikeTheScript(t, s.ClientURL(), seedPW)
+	a2aPreCreateLikeTheProvisionJob(t, s.ClientURL(), log)
 	_, gw := a2aConnectAs(t, s.ClientURL(), "gateway", gatewayPW)
 	// The consumer-info oracle. It was `gateway` while that user held
 	// $JS.API.>; the narrowing #1666 asked for scoped it and took
 	// CONSUMER.INFO with it, so reading
 	// a consumer back moved to `web`, which holds CONSUMER.INFO.TASKS.* by
 	// enumeration and is now the only principal that can answer. `gateway`
-	// stays for what it still holds and what this test needs it for: owning
-	// the relay durable, publishing a submission, and the subscribe grants
-	// the deliver-subject cases turn on.
+	// stays for what it still holds and what this test needs it for:
+	// publishing a submission, owning a per-task durable, and the subscribe
+	// grants the deliver-subject cases turn on.
 	_, webJS := a2aConnectAs(t, s.ClientURL(), "web", webPW)
 	bridge, js := a2aConnectAs(t, s.ClientURL(), "bridge", bridgePW)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -332,19 +334,10 @@ func TestBridgeJetStreamGrantOnARealServer(t *testing.T) {
 		inSubject     = "a2a.tasks.platform.t1.in"
 		eventsSubject = "a2a.tasks.platform.t1.events"
 	)
-	bridgeDurable := jetstream.ConsumerConfig{
-		Durable: "bridge-platform", FilterSubject: "a2a.tasks.platform.*.in", AckPolicy: jetstream.AckExplicitPolicy,
-	}
-
-	// The gateway's own durable, so the CONSUMER.DELETE refusal below is
-	// measured against a real consumer another principal owns; and a
-	// submission for the bridge to consume, from the principal that may
-	// publish one.
-	if _, err := gw.CreateOrUpdateConsumer(ctx, "TASKS", jetstream.ConsumerConfig{
-		Durable: "gateway-relay", FilterSubject: "a2a.tasks.*.*.events", AckPolicy: jetstream.AckExplicitPolicy,
-	}); err != nil {
-		t.Fatalf("gateway relay durable: %v", err)
-	}
+	// The provision Job made the gateway's relay and the bridge's intake
+	// (#4173), so the CONSUMER.DELETE refusal below is measured against a
+	// real consumer; and a submission for the bridge to consume, from the
+	// principal that may publish one.
 	if _, err := gw.Publish(ctx, inSubject, []byte(`{"kind":"message"}`)); err != nil {
 		t.Fatalf("gateway submission: %v", err)
 	}
@@ -363,10 +356,10 @@ func TestBridgeJetStreamGrantOnARealServer(t *testing.T) {
 	stream, err := js.Stream(ctx, "TASKS")
 	allowed("STREAM.INFO TASKS (js.Stream)", err)
 
-	cons, err := js.CreateOrUpdateConsumer(ctx, "TASKS", bridgeDurable)
-	allowed("CONSUMER.CREATE TASKS durable bridge-platform (SubscribeDurable)", err)
-	_, err = js.CreateOrUpdateConsumer(ctx, "TASKS", bridgeDurable)
-	allowed("CONSUMER.CREATE TASKS same durable again (the rebuild path)", err)
+	cons, err := js.Consumer(ctx, "TASKS", "bridge-platform")
+	allowed("CONSUMER.INFO TASKS bridge-platform, the bind (SubscribeDurable, Precreated)", err)
+	_, err = js.Consumer(ctx, "TASKS", "bridge-platform")
+	allowed("CONSUMER.INFO TASKS same durable again (the rebuild path)", err)
 
 	batch, err := cons.Fetch(1, jetstream.FetchMaxWait(5*time.Second))
 	allowed("CONSUMER.MSG.NEXT TASKS (Fetch)", err)
@@ -378,8 +371,8 @@ func TestBridgeJetStreamGrantOnARealServer(t *testing.T) {
 		t.Fatalf("the pull delivered nothing: %v", batch.Error())
 	}
 	allowed("$JS.ACK TASKS (msg.Ack)", delivered.Ack())
-	// The ack landed, read from web's side because bridge holds no
-	// CONSUMER.INFO (and, since #1666, neither does gateway).
+	// The ack landed, read from web's side, the observer for every consumer
+	// in this test.
 	relayView, err := webJS.Consumer(ctx, "TASKS", "bridge-platform")
 	if err != nil {
 		t.Fatal(err)
@@ -699,39 +692,60 @@ func TestBridgeJetStreamGrantOnARealServer(t *testing.T) {
 	// this route uses a subject the grant permits. The server has no
 	// ownership concept for a consumer name, so within a stream the bridge
 	// may create consumers on, every consumer on that stream is the bridge's
-	// to reconfigure -- the gateway's relay durable included. Two outcomes,
-	// both measured here rather than argued, because withholding
-	// CONSUMER.DELETE.TASKS.* is only worth what this subtest says it is
-	// worth.
+	// to reconfigure -- except the two durables the provision Job pre-creates
+	// (#4173), whose names are denied to it outright. Both halves measured
+	// here rather than argued, because withholding CONSUMER.DELETE.TASKS.*
+	// is only worth what this subtest says it is worth.
 	//
 	// This is the residue the `web` block in the render and
 	// docs/designs/spec-nats-deployment.md already record for `web`; the
-	// bridge holds it on TASKS for the same reason and, unlike web, has
-	// another principal's durable on the stream to aim at. It is not a
-	// regression -- $JS.API.> permitted all of it -- and there is no narrower
-	// grant: nats.go's ordered consumers take server-generated names, so the
-	// last token has to be `>`, and NATS wildcards match whole tokens, so a
-	// prefix grant is not available either.
-	t.Run("CONSUMER.CREATE on TASKS is create-or-update, so it reaches the gateway's durable", func(t *testing.T) {
-		const relaySubject = "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay"
-		// The relay's config as the gateway created it. An update carries the
-		// whole config, not a patch: a body naming only filter_subject is
+	// bridge holds it on TASKS for the same reason. It is not a regression
+	// -- $JS.API.> permitted all of it -- and there is no narrower grant:
+	// nats.go's ordered consumers take server-generated names, so the last
+	// token has to be `>`, and NATS wildcards match whole tokens, so a prefix
+	// grant is not available either. A name that is fixed can be denied
+	// exactly, which is what the pre-created durables get.
+	t.Run("CONSUMER.CREATE on TASKS is create-or-update, so it reaches every durable but the pre-created ones", func(t *testing.T) {
+		// A whole config, not a patch: a body naming only filter_subject is
 		// refused by the SERVER (not by the grant) with "ack policy can not
 		// be updated", because the zero value of ack_policy is `none`. That
 		// is a JSON-assembly detail, not a boundary, so the bodies below are
 		// what a real caller sends.
-		relayConfig := func(extra string) []byte {
-			return fmt.Appendf(nil, `{"stream_name":"TASKS","config":{"durable_name":"gateway-relay","name":"gateway-relay",`+
-				`"ack_policy":"explicit","deliver_policy":"all","replay_policy":"instant",%s}}`, extra)
+		configOf := func(name, extra string) []byte {
+			return fmt.Appendf(nil, `{"stream_name":"TASKS","config":{"durable_name":%q,"name":%q,`+
+				`"ack_policy":"explicit","deliver_policy":"all","replay_policy":"instant",%s}}`, name, name, extra)
 		}
+
+		// 0. The gateway's relay: the provision Job made it, and the bridge
+		// is refused the update by name.
+		const relaySubject = "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay"
+		if _, err := bridge.Request(relaySubject, configOf("gateway-relay", `"filter_subject":"a2a.tasks.none"`), 250*time.Millisecond); err == nil ||
+			!log.refusedPublish("bridge", relaySubject) {
+			t.Fatalf("the bridge's update of the pre-created relay was not refused by the server (%v)", err)
+		}
+		if relay, err := webJS.Consumer(ctx, "TASKS", "gateway-relay"); err != nil || !slices.Equal(relay.CachedInfo().Config.FilterSubjects,
+			[]string{a2aGatewayEventsFilter, a2aGatewaySupervisorFilter}) {
+			t.Fatalf("gateway-relay after the refused update: %v", err)
+		}
+		t.Log("the pre-created relay: the bridge's create-as-update is refused by name")
+
+		// Any other durable is reachable: a per-task durable the gateway
+		// made.
+		const other = "task-t9"
+		if _, err := gw.CreateOrUpdateConsumer(ctx, "TASKS", jetstream.ConsumerConfig{
+			Durable: other, FilterSubject: "a2a.tasks.platform.t9.events", AckPolicy: jetstream.AckExplicitPolicy,
+		}); err != nil {
+			t.Fatalf("a per-task durable as gateway: %v", err)
+		}
+		otherSubject := "$JS.API.CONSUMER.CREATE.TASKS." + other
 		update := func(what string, body []byte) {
 			t.Helper()
-			msg, err := bridge.Request(relaySubject, body, 2*time.Second)
+			msg, err := bridge.Request(otherSubject, body, 2*time.Second)
 			if err != nil {
 				t.Fatalf("%s: no reply (%v); server violations for bridge: %q", what, err, log.publishViolations("bridge"))
 			}
-			if log.refusedPublish("bridge", relaySubject) {
-				t.Fatalf("%s: the server refused %s", what, relaySubject)
+			if log.refusedPublish("bridge", otherSubject) {
+				t.Fatalf("%s: the server refused %s", what, otherSubject)
 			}
 			var resp struct {
 				Error *struct {
@@ -747,16 +761,16 @@ func TestBridgeJetStreamGrantOnARealServer(t *testing.T) {
 			t.Logf("%-58s ALLOWED by the grant and applied by the server", what)
 		}
 
-		// 1. Retune another principal's durable: the gateway stops seeing
-		// task events, and no permissions violation is logged anywhere,
-		// because the call is inside the allow-list.
-		update("retune gateway-relay's filter_subject", relayConfig(`"filter_subject":"a2a.tasks.none"`))
-		relay, err := webJS.Consumer(ctx, "TASKS", "gateway-relay")
+		// 1. Retune another principal's durable, and no permissions
+		// violation is logged anywhere, because the call is inside the
+		// allow-list.
+		update("retune task-t9's filter_subject", configOf(other, `"filter_subject":"a2a.tasks.none"`))
+		view, err := webJS.Consumer(ctx, "TASKS", other)
 		if err != nil {
-			t.Fatalf("gateway-relay after the bridge's update: %v", err)
+			t.Fatalf("task-t9 after the bridge's update: %v", err)
 		}
-		if got := relay.CachedInfo().Config.FilterSubject; got != "a2a.tasks.none" {
-			t.Errorf("gateway-relay's filter subject is %q; the bridge's create-as-update did not take. "+
+		if got := view.CachedInfo().Config.FilterSubject; got != "a2a.tasks.none" {
+			t.Errorf("task-t9's filter subject is %q; the bridge's create-as-update did not take. "+
 				"If the server has gained an ownership check, a2aBridgeJetStreamGrants's comment can stop "+
 				"recording this residue", got)
 		}
@@ -765,26 +779,26 @@ func TestBridgeJetStreamGrantOnARealServer(t *testing.T) {
 		// a config field, so the same permitted subject sets it and the
 		// server reaps the durable -- the outcome withholding
 		// CONSUMER.DELETE.TASKS.* is meant to prevent.
-		update("set gateway-relay's inactive_threshold to 1s", relayConfig(
-			`"filter_subject":"a2a.tasks.*.*.events","inactive_threshold":1000000000`))
+		update("set task-t9's inactive_threshold to 1s", configOf(other,
+			`"filter_subject":"a2a.tasks.platform.t9.events","inactive_threshold":1000000000`))
 		deadline := time.Now().Add(30 * time.Second)
 		var gone bool
 		for time.Now().Before(deadline) {
-			if _, err := webJS.Consumer(ctx, "TASKS", "gateway-relay"); errors.Is(err, jetstream.ErrConsumerNotFound) {
+			if _, err := webJS.Consumer(ctx, "TASKS", other); errors.Is(err, jetstream.ErrConsumerNotFound) {
 				gone = true
 				break
 			}
 			time.Sleep(200 * time.Millisecond)
 		}
 		if !gone {
-			t.Error("gateway-relay survived a 1s inactive_threshold set through CONSUMER.CREATE; " +
+			t.Error("task-t9 survived a 1s inactive_threshold set through CONSUMER.CREATE; " +
 				"if that is now true, withholding CONSUMER.DELETE.TASKS.* closes the route rather than raising its price")
 		} else {
-			t.Log("gateway-relay was reaped by the threshold the bridge set; the ack floor went with it")
+			t.Log("task-t9 was reaped by the threshold the bridge set; the ack floor went with it")
 		}
 		// The contrast, in one assertion: the table above had this same
-		// bridge refused on CONSUMER.DELETE.TASKS.gateway-relay, and the
-		// durable is gone anyway.
+		// bridge refused on CONSUMER.DELETE.TASKS, and the durable is gone
+		// anyway.
 		if !log.refusedPublish("bridge", "$JS.API.CONSUMER.DELETE.TASKS.gateway-relay") {
 			t.Error("the refusal table above no longer measures CONSUMER.DELETE.TASKS.gateway-relay, " +
 				"so this row has nothing to contrast the create-as-update route with")
@@ -859,6 +873,11 @@ func TestBridgeJetStreamGrantOnARealServer(t *testing.T) {
 
 	t.Run("the wildcard this replaces let the bridge delete the directory", func(t *testing.T) {
 		before := strings.Replace(conf, a2aNATSConfGrantLines(a2aBridgeJetStreamGrants()), fmt.Sprintf(a2aNATSConfGrantLine, "$JS.API.>"), 1)
+		// Also widen the account export/import in the negative-control config so
+		// putting $JS.API.> back into bridge's user permissions tests the user
+		// grant rather than the account export list.
+		before = strings.Replace(before, `{ service: "$JS.API.INFO", accounts: [ APP, CONSOLE ] }`, `{ service: "$JS.API.>", accounts: [ APP, CONSOLE ] }`, 1)
+		before = strings.Replace(before, `{ service: { account: TRUSTED, subject: "$JS.API.INFO" } }`, `{ service: { account: TRUSTED, subject: "$JS.API.>" } }`, 2)
 		if before == conf {
 			t.Fatal("could not put $JS.API.> back into the bridge block; the control is gone")
 		}
@@ -889,7 +908,8 @@ func TestBridgeJetStreamGrantOnARealServer(t *testing.T) {
 // TestBridgeConsumersSurviveABusRestart is the reconnect canary for the grant.
 // The question review asked: does the scoped list starve a client's own
 // recovery path? An older nats.go re-verified a consumer with CONSUMER.INFO
-// after every reconnect, and the bridge holds no CONSUMER.INFO. In the pinned
+// after every reconnect, and the bridge holds no CONSUMER.INFO beyond its
+// intake's bind (#4173). In the pinned
 // nats.go (a2a/go.mod), Consume re-issues its pull on CONNECTED, Messages
 // resets its counters, and the ordered consumer re-creates itself through
 // CONSUMER.CREATE; none of them asks for consumer info. This test is what
@@ -902,7 +922,7 @@ func TestBridgeJetStreamGrantOnARealServer(t *testing.T) {
 // re-verify back fails here with the subject named.
 func TestBridgeConsumersSurviveABusRestart(t *testing.T) {
 	creds := a2aFullCreds("a", "1")
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := a2aWithProvisionStandIn(t, string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t), nil).Data["nats.conf"]))
 	bridgePW := string(creds.Data["bridge-password"])
 	seedPW := string(creds.Data["seed-password"])
 	gatewayPW := string(creds.Data["gateway-password"])
@@ -919,6 +939,7 @@ func TestBridgeConsumersSurviveABusRestart(t *testing.T) {
 
 	first, firstLog := a2aStartRenderedServerAt(t, conf, port, store)
 	a2aProvisionLikeTheScript(t, url, seedPW)
+	a2aPreCreateLikeTheProvisionJob(t, url, firstLog)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
@@ -939,11 +960,9 @@ func TestBridgeConsumersSurviveABusRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The bridge's durable under Consume, and an ordered Messages iterator
-	// left open across the bounce.
-	cons, err := js.CreateOrUpdateConsumer(ctx, "TASKS", jetstream.ConsumerConfig{
-		Durable: "bridge-platform", FilterSubject: "a2a.tasks.platform.*.in", AckPolicy: jetstream.AckExplicitPolicy,
-	})
+	// The bridge's durable under Consume, bound as the provision Job made it
+	// (#4173), and an ordered Messages iterator left open across the bounce.
+	cons, err := js.Consumer(ctx, "TASKS", "bridge-platform")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1057,5 +1076,97 @@ func TestBridgeConsumersSurviveABusRestart(t *testing.T) {
 		default:
 			t.Errorf("unexpected violation after the restart: %s", line)
 		}
+	}
+}
+
+// TestJetStreamStoreMigrationFromAPPToTRUSTED verifies that a store moved from
+// `jetstream/APP` to `jetstream/TRUSTED` (the move the startup script makes;
+// TestTheBusStartupScriptMovesTheStoreOnce runs the script itself) keeps a
+// bus provisioned under the single-account layout, where `APP` owned
+// `jetstream: enabled`: its streams, messages, consumers and KV entries are
+// all readable under the three-account layout (`TRUSTED`, `CONSOLE`, `APP`).
+func TestJetStreamStoreMigrationFromAPPToTRUSTED(t *testing.T) {
+	creds := a2aFullCreds("a", "1")
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t), nil).Data["nats.conf"])
+	seedPW := string(creds.Data["seed-password"])
+	gatewayPW := string(creds.Data["gateway-password"])
+	bridgePW := string(creds.Data["bridge-password"])
+
+	// Build a pre-upgrade config in which APP holds `jetstream: enabled` (by
+	// renaming TRUSTED -> OLD_JS in the rendered config, then renaming APP
+	// -> LEGACY_APP and OLD_JS -> APP so seed and gateway provision
+	// directly under `/data/jetstream/APP`).
+	legacyConf := strings.Replace(conf, "  TRUSTED {\n    jetstream: enabled", "  OLD_JS {\n    jetstream: enabled", 1)
+	legacyConf = strings.ReplaceAll(legacyConf, "account: TRUSTED", "account: OLD_JS")
+	legacyConf = strings.ReplaceAll(legacyConf, "accounts: [ TRUSTED ]", "accounts: [ OLD_JS ]")
+	legacyConf = strings.Replace(legacyConf, "  APP {\n", "  LEGACY_APP {\n", 1)
+	legacyConf = strings.ReplaceAll(legacyConf, "account: APP", "account: LEGACY_APP")
+	legacyConf = strings.ReplaceAll(legacyConf, "[ APP, CONSOLE ]", "[ LEGACY_APP, CONSOLE ]")
+	legacyConf = strings.ReplaceAll(legacyConf, "[ APP ]", "[ LEGACY_APP ]")
+	legacyConf = strings.Replace(legacyConf, "  OLD_JS {\n    jetstream: enabled", "  APP {\n    jetstream: enabled", 1)
+	legacyConf = strings.ReplaceAll(legacyConf, "account: OLD_JS", "account: APP")
+	legacyConf = strings.ReplaceAll(legacyConf, "accounts: [ OLD_JS ]", "accounts: [ APP ]")
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	_ = l.Close()
+	store := t.TempDir()
+	url := "nats://127.0.0.1:" + strconv.Itoa(port)
+
+	first, _ := a2aStartRenderedServerAt(t, legacyConf, port, store)
+	a2aProvisionLikeTheScript(t, url, seedPW)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	_, gw := a2aConnectAs(t, url, "gateway", gatewayPW)
+	if _, err := gw.Publish(ctx, "a2a.tasks.platform.migrated-1.in", []byte(`{"kind":"message","text":"survives-upgrade"}`)); err != nil {
+		t.Fatalf("publish before migration: %v", err)
+	}
+	kvBefore, err := gw.KeyValue(ctx, "session-state")
+	if err != nil {
+		t.Fatalf("open session-state before migration: %v", err)
+	}
+	if _, err := kvBefore.Put(ctx, "conv-1", []byte(`{"pod":"session-1"}`)); err != nil {
+		t.Fatalf("put session-state before migration: %v", err)
+	}
+	first.Shutdown()
+	first.WaitForShutdown()
+
+	appDir := filepath.Join(store, "jetstream", a2aAccountApp)
+	trustedDir := filepath.Join(store, "jetstream", a2aAccountControl)
+	if _, err := os.Stat(appDir); err != nil {
+		t.Fatalf("expected legacy store at %s: %v", appDir, err)
+	}
+	if err := os.Rename(appDir, trustedDir); err != nil {
+		t.Fatalf("migrating %s -> %s: %v", appDir, trustedDir, err)
+	}
+
+	second, _ := a2aStartRenderedServerAt(t, conf, port, store)
+	defer func() {
+		second.Shutdown()
+		second.WaitForShutdown()
+	}()
+
+	_, gwAfter := a2aConnectAs(t, url, "gateway", gatewayPW)
+	kvAfter, err := gwAfter.KeyValue(ctx, "session-state")
+	if err != nil {
+		t.Fatalf("open session-state after migration: %v", err)
+	}
+	entry, err := kvAfter.Get(ctx, "conv-1")
+	if err != nil || string(entry.Value()) != `{"pod":"session-1"}` {
+		t.Fatalf("session-state entry after migration = %v, %v", entry, err)
+	}
+
+	_, bridgeAfter := a2aConnectAs(t, url, "bridge", bridgePW)
+	tasksAfter, err := bridgeAfter.Stream(ctx, "TASKS")
+	if err != nil {
+		t.Fatalf("open TASKS from APP after migration: %v", err)
+	}
+	msg, err := tasksAfter.GetLastMsgForSubject(ctx, "a2a.tasks.platform.migrated-1.in")
+	if err != nil || string(msg.Data) != `{"kind":"message","text":"survives-upgrade"}` {
+		t.Fatalf("TASKS message from APP after migration = %+v, %v", msg, err)
 	}
 }

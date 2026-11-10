@@ -53,7 +53,7 @@ func authMapTestAgent() *agentv1alpha1.PlatformAgent {
 // render that cuts more than one is a failure here, not a thing to pick from.
 func singleA2AAuthMapShard(t *testing.T, agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) (*corev1.ConfigMap, string) {
 	t.Helper()
-	cms, version, err := buildA2AAuthMapConfigMaps(agent, profiles)
+	cms, version, err := buildA2AAuthMapConfigMaps(agent, profiles, nil)
 	if err != nil {
 		t.Fatalf("buildA2AAuthMapConfigMaps: %v", err)
 	}
@@ -240,7 +240,7 @@ func TestRenderedAuthMapMatchesTheCalloutFixture(t *testing.T) {
 const natsConfFixturePath = "../../../a2a/authcallout/testdata/rendered-nats.conf"
 
 func TestRenderedNATSConfMatchesTheCalloutFixture(t *testing.T) {
-	conf := string(buildA2ANATSConfigSecret(authMapTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(authMapTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 
 	// The generated keys differ on every run, so the committed fixture is
 	// normalised to a stable placeholder. The consuming test replaces these
@@ -313,7 +313,7 @@ func TestTheRenderTimeMapCheckRefusesWhatTheCalloutWouldRefuse(t *testing.T) {
 			{
 				ServiceAccount: "system:serviceaccount:kubeagents-system:agent-a2a-gateway",
 				User:           "gateway",
-				Account:        a2aAccountApp,
+				Account:        a2aAccountControl,
 				Grants: a2aAuthMapGrants{
 					Publish:   []string{"a2a.tasks.>"},
 					Subscribe: []string{"_INBOX.gateway.>"},
@@ -339,6 +339,14 @@ func TestTheRenderTimeMapCheckRefusesWhatTheCalloutWouldRefuse(t *testing.T) {
 		},
 		"a narrowed entry carrying only a subscribe": func(ids []a2aAuthMapIdentity) []a2aAuthMapIdentity {
 			ids[1].Grants.Subscribe = []string{"a2a.tasks.>"}
+			return ids
+		},
+		"a narrowed entry in the control account": func(ids []a2aAuthMapIdentity) []a2aAuthMapIdentity {
+			ids[1].Account = a2aAccountControl
+			return ids
+		},
+		"an entry in the console account": func(ids []a2aAuthMapIdentity) []a2aAuthMapIdentity {
+			ids[0].Account = a2aAccountConsole
 			return ids
 		},
 		"a narrowing the callout does not implement": func(ids []a2aAuthMapIdentity) []a2aAuthMapIdentity {

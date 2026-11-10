@@ -458,6 +458,12 @@ func a2aExecutorSidecarEnv(containers []corev1.Container) []corev1.Container {
 			{Name: a2aCapabilityRequiredEnvVar, Value: a2aCapabilityRequired()},
 			a2aNATSCAFileEnvVar(),
 		}
+		// A declared bridge binds its intake durable as the rendered one does:
+		// the provision Job creates it, and the bridge principal is refused
+		// creating it (#4173).
+		if a2aIsBridgeSidecar(c) {
+			switchOverride = append(switchOverride, corev1.EnvVar{Name: a2aBridgeDurablePrecreatedEnvVar, Value: "true"})
+		}
 		// mergeEnvVars' second argument wins, so the nesting IS the
 		// precedence: the container's own env beats the namespace default,
 		// and the switch beats both.
@@ -771,7 +777,7 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent, taskSigningPu
 							// clamps task deadlines with, so the dispatcher never
 							// issues a credential this callout refuses. A callout
 							// from before #3889 ignores it.
-							{Name: "A2A_TASK_CREDENTIAL_MAX_LIFETIME", Value: resolveProfileMaxTaskDeadline(agent).String()},
+							a2aTaskCredentialMaxLifetimeEnv(agent),
 							// The static nats.conf users, which no identity map
 							// carries: a narrowed pod named after one would
 							// hold its inbox. Plain names, no password.
@@ -810,7 +816,11 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent, taskSigningPu
 							}}},
 						},
 						VolumeMounts: []corev1.VolumeMount{a2aNATSCABundleMount()},
-						Ports:        []corev1.ContainerPort{{Name: "status", ContainerPort: a2aCalloutStatusPort}},
+						// The operator GETs /status on this port by pod IP, from
+						// every Ready replica, for A2AIdentityMapApplied (#4487):
+						// a NetworkPolicy added here later must admit the
+						// operator, or the condition turns StatusUnreadable.
+						Ports: []corev1.ContainerPort{{Name: "status", ContainerPort: a2aCalloutStatusPort}},
 						ReadinessProbe: &corev1.Probe{
 							ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
 								Path: "/readyz", Port: intstr.FromInt32(a2aCalloutStatusPort),

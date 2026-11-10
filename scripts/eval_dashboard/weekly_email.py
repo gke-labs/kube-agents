@@ -15,8 +15,8 @@ default the Sunday before today, UTC), and **last week** the seven before
 it. A night is dated as ``nightly.night_date`` dates it.
 
 **A counted night** ran to its verdict: none of its parts was cut off at
-the job deadline (``nightly.run_truncated``), it has both halves of the
-main matrix it owed (main, and main-b once that job runs: the night's
+the job deadline (``nightly.run_truncated``), it has every shard of the
+main matrix it owed (main, and main-b to main-e once those jobs run: the night's
 ``verdict_withheld_by``, as the digest reads it), and it is not a
 run-level event (``classify.is_run_event``: nearly every graded
 case failed). Two counted nights on one date are one night: per case the
@@ -135,6 +135,12 @@ TOKENS_TOTAL = "total"
 TOKENS_INPUT = "input"
 TOKENS_OUTPUT = "output"
 TOKENS_PARTIAL = "partial"
+# The cache hit rate: cache reads over the whole prompt, ``cached / (input +
+# cached + cache_write)`` summed over the full counts that carry ``cached``
+# (SCHEMA.md: only a record whose ``input`` excludes cache reads does), so a
+# long run weighs by its tokens. A missing ``cache_write`` counts as zero.
+TOKENS_CACHED = "cached"
+TOKENS_CACHE_WRITE = "cache_write"
 THOUSAND = 1_000
 MILLION = 1_000_000
 TOKENS_UNITS = "{count}"
@@ -232,6 +238,7 @@ TILE_TOKENS_UP = "; &#9650; {pct}% vs last week on the same scenarios"
 TILE_TOKENS_DOWN = "; &#9660; {pct}% vs last week on the same scenarios"
 TILE_TOKENS_SAME = "; flat vs last week on the same scenarios"
 TILE_TOKENS_PARTIAL = "; {count} partial left out"
+TILE_TOKENS_CACHE = "; {pct}% of prompt tokens read from cache ({count} runs)"
 TILE_TOKENS_NONE = "n/a"
 TILE_TOKENS_NONE_SUB = "no full count; {count} partial left out"
 # Three tiles share the row, or four with the tokens tile.
@@ -305,8 +312,12 @@ ROWS_JOIN = "\n"
 WHY_CUT = "cut off"
 WHY_NO_MAIN = "no main part"
 WHY_NO_MAIN_B = "no main-b part"
-# The half of the main matrix a night lacks (``verdict_withheld_by``) -> why.
-WHY_NO_PART = {nightly.PART_MAIN: WHY_NO_MAIN, nightly.PART_MAIN_B: WHY_NO_MAIN_B}
+WHY_NO_MAIN_C = "no main-c part"
+WHY_NO_MAIN_D = "no main-d part"
+WHY_NO_MAIN_E = "no main-e part"
+# The shard of the main matrix a night lacks (``verdict_withheld_by``) -> why.
+WHY_NO_PART = {nightly.PART_MAIN: WHY_NO_MAIN, nightly.PART_MAIN_B: WHY_NO_MAIN_B, nightly.PART_MAIN_C: WHY_NO_MAIN_C,
+               nightly.PART_MAIN_D: WHY_NO_MAIN_D, nightly.PART_MAIN_E: WHY_NO_MAIN_E}
 WHY_RUN_EVENT = "nearly every scenario failed"
 WHY_NO_RUN = "no run on record"
 
@@ -326,7 +337,7 @@ CHAT_NO_TREND = "No week-over-week trend: only {counted} of {dates} nights count
 CHAT_NO_TREND_PREV = "No week-over-week trend: only {counted} of last week's {dates} nights counted ({why})."
 CHAT_LEFT_OUT = "{count} {why}"
 # Why a night is not counted, as the post words it.
-CHAT_WHY = {WHY_CUT: "cut off", WHY_NO_MAIN: "missing the main part", WHY_NO_MAIN_B: "missing the main-b part",
+CHAT_WHY = {WHY_CUT: "cut off", WHY_NO_MAIN: "missing the main part", WHY_NO_MAIN_B: "missing the main-b part", WHY_NO_MAIN_C: "missing the main-c part", WHY_NO_MAIN_D: "missing the main-d part", WHY_NO_MAIN_E: "missing the main-e part",
             WHY_RUN_EVENT: "failed run-wide", WHY_NO_RUN: "not run"}
 CHAT_ATTENTION_TITLE = "*Needs attention*"
 CHAT_ATTENTION_ITEM = "• {name}: {state}, <{url}|{bugs}>"
@@ -351,6 +362,7 @@ CHAT_TOKENS_UP = " (▲ {pct}% vs last week on the same scenarios)"
 CHAT_TOKENS_DOWN = " (▼ {pct}% vs last week on the same scenarios)"
 CHAT_TOKENS_SAME = " (flat vs last week on the same scenarios)"
 CHAT_TOKENS_PARTIAL = " · {count} partial"
+CHAT_TOKENS_CACHE = " · {pct}% of prompt from cache"
 CHAT_LINKS = "<{report}|full report> · <{dashboard}|dashboard>"
 CHAT_JOIN = " · "
 CHAT_BLOCK_JOIN = "\n\n"
@@ -524,6 +536,23 @@ def rep_tokens(rep: dict) -> tuple[int | None, bool] | None:
     return None
 
 
+def rep_cache(rep: dict) -> tuple[int, int] | None:
+    """``(cached, prompt)`` for a repetition whose token record carries the
+    prompt split, or None: ``prompt`` is ``input + cached + cache_write``."""
+    tokens = rep.get(TOKENS_KEY)
+    if not isinstance(tokens, dict):
+        return None
+
+    def count(key):
+        value = tokens.get(key)
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+    cached, inp, write = count(TOKENS_CACHED), count(TOKENS_INPUT), count(TOKENS_CACHE_WRITE)
+    if cached is None or inp is None:
+        return None
+    return cached, inp + cached + (write or 0)
+
+
 def tokens_text(count: float) -> str:
     """135000 -> "135k", 1250000 -> "1.2M"; rounded before the unit is
     picked, so 999600 is "1.0M", not "1000k"."""
@@ -553,8 +582,10 @@ def tokens_figures(overall: dict) -> dict | None:
     if overall["tokens_median"] is None and not partial:
         return None
     typical = tokens_text(overall["tokens_median"]) if overall["tokens_median"] is not None else None
+    prompt = overall["prompt_tokens"]
+    cache_pct = round(overall["cached_tokens"] * PERCENT / prompt) if prompt else None
     return {"typical": typical, "pct": tokens_change(overall) if typical else None, "partial": partial,
-            "counted": overall["counted_runs"]}
+            "counted": overall["counted_runs"], "cache_pct": cache_pct, "cache_runs": overall["cache_runs"]}
 
 
 def short_date(day: datetime.date) -> str:
@@ -675,9 +706,9 @@ def bugs_url(repo: str, slug: str) -> str:
 
 def night_status(night: dict[str, dict], data: dict) -> str | None:
     """None for a counted night, else why it is left out. A night without a
-    half of the main matrix it owed is the night ``nightly`` withholds a
-    verdict for (``verdict_withheld_by``): no main part, or main-b missing
-    while main-b runs."""
+    shard of the main matrix it owed is the night ``nightly`` withholds a
+    verdict for (``verdict_withheld_by``): no main part, or another main
+    shard missing while its job runs."""
     parts = nightly.night_parts(night)
     if any(nightly.run_truncated(run) for run in parts):
         return WHY_CUT
@@ -714,10 +745,11 @@ def nights_by_date(data: dict) -> tuple[dict[datetime.date, list[dict]], dict[da
 
 
 def night_reps(night: dict[str, dict]) -> dict[str, dict]:
-    """``{case: {passed, graded, agent_s: [...], tokens: [...], tokens_partial}}``
-    for every case the night graded (``rep_tokens``: full counts listed,
-    short ones counted); a case both parts recorded counts as the main part
-    recorded it."""
+    """``{case: {passed, graded, agent_s: [...], tokens: [...], tokens_partial,
+    cached, prompt, cache_runs}}`` for every case the night graded
+    (``rep_tokens``: full counts listed, short ones counted; ``rep_cache``
+    summed over the full counts that carry the split); a case both parts
+    recorded counts as the main part recorded it."""
     out: dict[str, dict] = {}
     for run in nightly.night_parts(night):
         for task in classify.run_tasks(run):
@@ -730,9 +762,12 @@ def night_reps(night: dict[str, dict]) -> dict[str, dict]:
                 continue
             reps = [rep for rep in classify.task_reps(task) if classify.rep_kind(rep) in (classify.REP_PASS, classify.REP_FAIL)]
             times = [rep["agent_s"] for rep in reps if isinstance(rep.get("agent_s"), (int, float))]
-            tokens = [t for t in map(rep_tokens, reps) if t is not None]
+            counted = [(rep, t) for rep, t in zip(reps, map(rep_tokens, reps)) if t is not None]
+            tokens = [t for _, t in counted]
+            cache = [c for c in (rep_cache(rep) for rep, (_, short) in counted if not short) if c is not None]
             out[name] = {"passed": counts["pass"], "graded": graded, "agent_s": times,
-                         "tokens": [n for n, short in tokens if not short], "tokens_partial": sum(short for _, short in tokens)}
+                         "tokens": [n for n, short in tokens if not short], "tokens_partial": sum(short for _, short in tokens),
+                         "cached": sum(c for c, _ in cache), "prompt": sum(p for _, p in cache), "cache_runs": len(cache)}
     return out
 
 
@@ -747,17 +782,21 @@ def date_reps(nights: list[dict]) -> dict[str, dict]:
 
 
 def week_cases(counted: dict[datetime.date, list[dict]], days: list[datetime.date]) -> dict[str, dict]:
-    """``{case: {passed, graded, agent_s, tokens, tokens_partial}}`` summed
-    over the week's counted dates."""
+    """``{case: {passed, graded, agent_s, tokens, tokens_partial, cached,
+    prompt, cache_runs}}`` summed over the week's counted dates."""
     out: dict[str, dict] = {}
     for day in days:
         for name, reps in date_reps(counted.get(day, [])).items():
-            row = out.setdefault(name, {"passed": 0, "graded": 0, "agent_s": [], "tokens": [], "tokens_partial": 0})
+            row = out.setdefault(name, {"passed": 0, "graded": 0, "agent_s": [], "tokens": [], "tokens_partial": 0,
+                                        "cached": 0, "prompt": 0, "cache_runs": 0})
             row["passed"] += reps["passed"]
             row["graded"] += reps["graded"]
             row["agent_s"] += reps["agent_s"]
             row["tokens"] += reps["tokens"]
             row["tokens_partial"] += reps["tokens_partial"]
+            row["cached"] += reps["cached"]
+            row["prompt"] += reps["prompt"]
+            row["cache_runs"] += reps["cache_runs"]
     return out
 
 
@@ -912,6 +951,9 @@ def build_week(data: dict, store: dict | None, domain_rows: list[dict], week_end
     overall["prev_paired_tokens_median"] = statistics.median(prev_paired_tokens) if prev_paired_tokens else None
     overall["counted_runs"] = len(tokens)
     overall["tokens_partial"] = sum(this_cases[c]["tokens_partial"] for c in common)
+    overall["cached_tokens"] = sum(this_cases[c]["cached"] for c in common)
+    overall["prompt_tokens"] = sum(this_cases[c]["prompt"] for c in common)
+    overall["cache_runs"] = sum(this_cases[c]["cache_runs"] for c in common)
     week["overall"] = overall
 
     known = {row["slug"]: row for row in domain_rows}
@@ -1245,7 +1287,8 @@ def tokens_tile_text(figures: dict | None) -> tuple[str, str] | None:
     if figures["typical"] is None:
         return TILE_TOKENS_NONE, TILE_TOKENS_NONE_SUB.format(count=partial)
     change = "" if pct is None else TILE_TOKENS_UP.format(pct=pct) if pct > 0 else TILE_TOKENS_DOWN.format(pct=-pct) if pct < 0 else TILE_TOKENS_SAME
-    sub = TILE_TOKENS_SUB.format(count=figures["counted"]) + change + (TILE_TOKENS_PARTIAL.format(count=partial) if partial else "")
+    cache = "" if figures["cache_pct"] is None else TILE_TOKENS_CACHE.format(pct=figures["cache_pct"], count=figures["cache_runs"])
+    sub = TILE_TOKENS_SUB.format(count=figures["counted"]) + change + cache + (TILE_TOKENS_PARTIAL.format(count=partial) if partial else "")
     return figures["typical"], sub
 
 
@@ -1303,7 +1346,8 @@ def chat_tokens(week: dict) -> str | None:
     if figures["typical"] is None:
         return CHAT_TOKENS_NONE.format(partial=partial_text)
     change = "" if pct is None else CHAT_TOKENS_UP.format(pct=pct) if pct > 0 else CHAT_TOKENS_DOWN.format(pct=-pct) if pct < 0 else CHAT_TOKENS_SAME
-    return CHAT_TOKENS.format(typical=figures["typical"], change=change, partial=partial_text)
+    cache = "" if figures["cache_pct"] is None else CHAT_TOKENS_CACHE.format(pct=figures["cache_pct"])
+    return CHAT_TOKENS.format(typical=figures["typical"], change=change + cache, partial=partial_text)
 
 
 def chat_text(week: dict) -> str:

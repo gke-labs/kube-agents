@@ -1,5 +1,6 @@
-"""Inbound chat messages, new sessions and failed turns by platform, and the board's
-cards that gave up, in the Prometheus text exposition.
+"""Inbound chat messages, new sessions and failed turns by platform, the board's
+cards that gave up, and the proposals ledger by origin, read from Session KV,
+in the Prometheus text exposition.
 
 Hand-rolled, like the credential broker's registry: prometheus_client is not in
 the agent image, and four small counters do not justify a dependency
@@ -19,11 +20,14 @@ no listener, and a line in the log says so.
 
 from __future__ import annotations
 
+import http.client
+import json
 import logging
 import os
 import sqlite3
 import threading
 import time
+import urllib.request
 from pathlib import Path
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -75,6 +79,31 @@ HERMES_HOME_ENV = "HERMES_HOME"
 DEFAULT_HERMES_HOME = "/opt/data"
 # A scrape waits this long on a locked board before keeping the last value.
 BOARD_BUSY_TIMEOUT_SECONDS = 1.0
+# Pull requests the agent opened, by the origin of the work behind each and,
+# for chat, its platform: Session KV's proposals_opened ledger, which the
+# pr_opened hook writes one row per verified and claimed proposal, counted at
+# scrape time. The ledger is on the pod's volume, so a restart of this process
+# serves the same counts; the family is a gauge because a leadership change
+# swaps one pod's ledger for another's. The read is Session KV's loopback
+# counts endpoint, not the SQLite file, whose volume this process may not see.
+# ORIGINS is session_kv_server.ORIGINS in its order (a test pins the two).
+PROPOSALS_OPENED_METRIC = "kubeagents_proposals_opened"
+ORIGIN_LABEL = "origin"
+ORIGINS = ("chat", "console", "api", "event", "drift", "audit", "scheduled", "issue", "other")
+PROPOSALS_COUNTS_URL = "http://127.0.0.1:8699/v1/proposals/opened/counts"
+SESSION_KV_KEY_ENV = "SESSION_KV_API_KEY"
+PROPOSALS_READ_TIMEOUT_SECONDS = 2
+# Beside the counts, rendered only with them: seconds since the last
+# successful ledger read, on a monotonic clock. 0 right after a good read; it
+# grows while failed reads keep serving the last counts, so a scraper can tell
+# stale counts from fresh (as kubeagents_vcs_readings_age_seconds does for the
+# broker's readings). The family is unlabelled; the consumer sets the limit.
+PROPOSALS_READ_AGE_METRIC = "kubeagents_proposals_opened_read_age_seconds"
+PROPOSALS_READ_AGE_HELP = "Seconds since the proposals ledger was last read successfully; present with kubeagents_proposals_opened, and growing while a failed read keeps its last counts."
+PROPOSALS_READ_AGE_DECIMALS = 3
+# The platform label of an origin the ledger has no row for, and of a row with
+# no platform.
+NO_PLATFORM = ""
 # The series the operator reads status.usage.negativeFeedbackTotal from
 # (usage_counters_scrape.go's chatFeedbackNegativeSeries): thumbs-down
 # reactions a person put on one of the bot's messages, by platform, counted by
@@ -170,6 +199,94 @@ class KanbanGaveUpCounter:
             return len(self._seen)
 
 
+class ProposalsReadError(ValueError):
+    """The counts endpoint could not be asked, or its answer is not `{origin: {platform: n}}`."""
+
+
+def _zero_filled(counts: dict[tuple[str, str], int]) -> dict[tuple[str, str], int]:
+    """counts with a (origin, NO_PLATFORM) 0 for every origin that has no series."""
+    filled = dict(counts)
+    present = {origin for origin, _ in counts}
+    for origin in ORIGINS:
+        if origin not in present:
+            filled[(origin, NO_PLATFORM)] = 0
+    return filled
+
+
+class ProposalsOpenedGauge:
+    """The proposals ledger by (origin, platform), read from Session KV at scrape time.
+
+    Each successful read replaces the previous counts, zero-filled so every
+    origin has a series. A read that fails (no API key, a connection error, a
+    non-200, a truncated or malformed HTTP answer, an answer of the wrong
+    shape) keeps the last counts and logs the
+    exception type once per failure streak. Before the first successful read
+    there are no counts: :meth:`counts` returns None and the family is not
+    rendered, so a scraper sees a miss rather than nine zero readings. The
+    gauge holds nothing the ledger does not: a new process reads the same.
+    :meth:`reading` also returns the seconds since the last successful read,
+    on ``clock`` (monotonic by default), so kept counts are marked stale.
+    """
+
+    def __init__(self, url: str = PROPOSALS_COUNTS_URL, clock: Callable[[], float] = time.monotonic) -> None:
+        self._url = url
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._counts: Optional[dict[tuple[str, str], int]] = None
+        self._read_at = 0.0
+        self._failing = False
+
+    def _read(self) -> dict[tuple[str, str], int]:
+        key = os.environ.get(SESSION_KV_KEY_ENV, "").strip()
+        if not key:
+            raise ProposalsReadError(f"{SESSION_KV_KEY_ENV} is not set")
+        request = urllib.request.Request(self._url, headers={"Authorization": f"Bearer {key}"})
+        with urllib.request.urlopen(request, timeout=PROPOSALS_READ_TIMEOUT_SECONDS) as response:  # nosec B310 -- a fixed loopback http URL
+            if response.status != HTTPStatus.OK:
+                raise ProposalsReadError(f"status {response.status}")
+            answer = json.loads(response.read())
+        if not isinstance(answer, dict):
+            raise ProposalsReadError("the answer is not an object")
+        counts: dict[tuple[str, str], int] = {}
+        for origin, platforms in answer.items():
+            if not isinstance(platforms, dict):
+                raise ProposalsReadError("an origin's counts are not an object")
+            for platform, n in platforms.items():
+                if not isinstance(n, int) or isinstance(n, bool) or n < 0:
+                    raise ProposalsReadError("a count is not a non-negative integer")
+                counts[(origin, platform)] = n
+        return _zero_filled(counts)
+
+    def counts(self) -> Optional[dict[tuple[str, str], int]]:
+        """The ledger's counts, the last ones on a failed read, or None before any read succeeded."""
+        reading = self.reading()
+        return None if reading is None else reading[0]
+
+    def reading(self) -> Optional[tuple[dict[tuple[str, str], int], float]]:
+        """The counts as :meth:`counts` returns them and the seconds since the last successful read, or None before one."""
+        with self._lock:
+            try:
+                counts = self._read()
+            # URLError and timeouts are OSError; JSON errors and ProposalsReadError are ValueError;
+            # IncompleteRead, BadStatusLine and LineTooLong are HTTPException.
+            except (OSError, ValueError, http.client.HTTPException) as exc:
+                if not self._failing:
+                    logger.warning("chat_metrics: the proposals ledger could not be read, keeping the last counts: %s", type(exc).__name__)
+                    self._failing = True
+                if self._counts is None:
+                    return None
+                return dict(self._counts), max(self._clock() - self._read_at, 0.0)
+            self._failing = False
+            self._counts = counts
+            self._read_at = self._clock()
+            return dict(counts), 0.0
+
+
+def _label_value(value: str) -> str:
+    """value escaped for a Prometheus label: backslash, double quote and newline."""
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
 def platform_label(hermes_platform: str) -> str:
     """The label value for a Hermes platform name: one of the values of HERMES_PLATFORM_LABELS, or LABEL_OTHER."""
     return HERMES_PLATFORM_LABELS.get(str(hermes_platform or "").strip().lower(), LABEL_OTHER)
@@ -177,10 +294,12 @@ def platform_label(hermes_platform: str) -> str:
 
 class ChatMetrics:
     """Four counters, by platform: inbound messages, new sessions, errored turns
-    and thumbs-downs; and the board's gave_up cards, read at scrape time."""
+    and thumbs-downs; the board's gave_up cards and the proposals ledger, read
+    at scrape time."""
 
-    def __init__(self, kanban: Optional[KanbanGaveUpCounter] = None) -> None:
+    def __init__(self, kanban: Optional[KanbanGaveUpCounter] = None, proposals: Optional[ProposalsOpenedGauge] = None) -> None:
         self._kanban = kanban or KanbanGaveUpCounter()
+        self._proposals = proposals or ProposalsOpenedGauge()
         self._lock = threading.Lock()
         self._inbound: dict[str, int] = {}
         self._sessions: dict[str, int] = {}
@@ -242,6 +361,20 @@ class ChatMetrics:
             f"# TYPE {KANBAN_GAVE_UP_METRIC} counter",
             f"{KANBAN_GAVE_UP_METRIC} {self._kanban.count()}",
         ]
+        reading = self._proposals.reading()
+        if reading is not None:
+            proposals, read_age = reading
+            lines += [
+                f"# HELP {PROPOSALS_OPENED_METRIC} Pull requests the agent opened, by the origin of the work and, for chat, its platform, read from the pod's proposals ledger at scrape time.",
+                f"# TYPE {PROPOSALS_OPENED_METRIC} gauge",
+            ]
+            for (origin, platform), count in sorted(proposals.items()):
+                lines.append(f'{PROPOSALS_OPENED_METRIC}{{{ORIGIN_LABEL}="{_label_value(origin)}",{PLATFORM_LABEL}="{_label_value(platform)}"}} {count}')
+            lines += [
+                f"# HELP {PROPOSALS_READ_AGE_METRIC} {PROPOSALS_READ_AGE_HELP}",
+                f"# TYPE {PROPOSALS_READ_AGE_METRIC} gauge",
+                f"{PROPOSALS_READ_AGE_METRIC} {read_age:.{PROPOSALS_READ_AGE_DECIMALS}f}",
+            ]
         lines += [
             f"# HELP {CHAT_FEEDBACK_NEGATIVE_METRIC} Thumbs-down reactions a person put on one of the bot's messages, by platform, once per person and message.",
             f"# TYPE {CHAT_FEEDBACK_NEGATIVE_METRIC} counter",

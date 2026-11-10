@@ -65,6 +65,12 @@
 # fixture that was never planted leaves the role unresolvable, which is an
 # error about the environment, not a failure blamed on the agent.
 #
+# A project-scoped role (`cluster_slot: null` in the catalog) is a Compute
+# Engine object that no cluster carries: a VM, a firewall rule. Its probes are
+# `<kind>/<name-prefix>*`, read with `gcloud compute ... list` in the project.
+# It has no kubeconfig, so the role is published as "<role>.confirmed" alone,
+# with the same warnings and the same counts as a cluster role.
+#
 # Usage:
 #   source hack/fleet-kubeconfigs.sh && write_fleet_kubeconfigs
 #   hack/fleet-kubeconfigs.sh            # same thing; prints the directory
@@ -132,6 +138,11 @@ _FLEET_CRED_API_VERSION="client.authentication.k8s.io/v1"
 # whitespace (they are `<kind>/<name>` or `<kind>?<selector>`), which is what
 # lets the caller read the tail with plain word splitting.
 #
+# A project-scoped role (`cluster_slot: null`: a Compute Engine object that no
+# cluster carries) is emitted with `-` as its slot and no namespace. Its probes
+# are `<kind>/<name-prefix>*`, and the `*` is a glob character, so the caller
+# reads them into an array with `read -a`, never with word splitting.
+#
 # Parsed with the standard library rather than jq: the Prow image is not
 # guaranteed to carry jq, and it already runs python3 for every task-file read
 # in ci-eval-pr.sh.
@@ -143,6 +154,8 @@ NAME = re.compile(r'[a-z0-9]+(-[a-z0-9]+)*')
 # Anchored so nothing in the catalog can smuggle a flag, a space or a shell
 # metacharacter into that command line.
 PROBE = re.compile(r'[a-z][a-z0-9.]*(/[a-z0-9][a-z0-9.-]*|\?[A-Za-z0-9][A-Za-z0-9._/=,-]*)')
+# A project-scoped role's probe: a Compute Engine kind and a name prefix.
+PROJECT_PROBE = re.compile(r'(instance|firewall)/[a-z0-9][a-z0-9-]*\*')
 with open(sys.argv[1]) as fh:
     catalog = json.load(fh)
 roles = catalog.get('roles') or {}
@@ -159,17 +172,25 @@ for role, spec in sorted(roles.items()):
     if not NAME.fullmatch(role):
         sys.exit(f'fleet catalog role {role!r} is not a lowercase-hyphen name')
     slot = spec.get('cluster_slot')
-    if slot not in slots:
+    project_scoped = slot is None
+    if not project_scoped and slot not in slots:
         sys.exit(f'fleet catalog role {role!r} names unknown cluster slot {slot!r}')
     namespace = spec.get('namespace')
     if namespace is not None and not NAME.fullmatch(str(namespace)):
         sys.exit(f'fleet catalog role {role!r} names a malformed namespace {namespace!r}')
+    if project_scoped and namespace is not None:
+        sys.exit(f'fleet catalog role {role!r} is project-scoped and names a namespace {namespace!r}')
     probes = spec.get('probes')
     if not isinstance(probes, list):
         sys.exit(f'fleet catalog role {role!r} declares no probes list')
+    if project_scoped and not probes:
+        sys.exit(f'fleet catalog role {role!r} is project-scoped and declares no probe')
+    shape = PROJECT_PROBE if project_scoped else PROBE
     for probe in probes:
-        if not isinstance(probe, str) or not PROBE.fullmatch(probe):
+        if not isinstance(probe, str) or not shape.fullmatch(probe):
             sys.exit(f'fleet catalog role {role!r} declares a malformed probe {probe!r}')
+    if project_scoped:
+        slot = '-'
     if namespace:
         probes = [f'namespace/{namespace}'] + probes
     print(role, slot, namespace if namespace else '-', *probes)
@@ -232,6 +253,39 @@ _fleet_probe_present() {
       return 1
       ;;
   esac
+}
+
+# Is the Compute Engine object a project-scoped probe names present in project
+# $1 right now? The probe is `<kind>/<name-prefix>*`; it is present when the
+# project holds at least one object of that kind whose name starts with the
+# prefix. 0 present, 1 absent, 2 the list itself failed (a 403 says nothing
+# about the fixture). The kind and the prefix come from the catalog, whose
+# parser above accepts only lowercase names and hyphens, so neither can carry
+# a flag or a regular-expression metacharacter into the filter.
+_fleet_project_probe_present() {
+  local project="$1" probe="$2" kind prefix collection errors probe_rc
+  kind="${probe%%/*}"
+  prefix="${probe#*/}"
+  prefix="${prefix%\*}"
+  case "$kind" in
+    instance) collection="instances" ;;
+    firewall) collection="firewall-rules" ;;
+    *)
+      _FLEET_PROBE_ERR="unknown project probe kind ${kind}"
+      return 2
+      ;;
+  esac
+  errors="$(mktemp)" || { _FLEET_PROBE_ERR="mktemp failed"; return 2; }
+  probe_rc=0
+  _FLEET_PROBE_OUT="$(gcloud compute "$collection" list --project "$project" \
+    --filter="name ~ ^${prefix}" --format='value(name)' 2>"$errors")" || probe_rc=$?
+  if [ "$probe_rc" -ne 0 ]; then
+    _FLEET_PROBE_ERR="$(cat "$errors")"
+    rm -f "$errors"
+    return 2
+  fi
+  rm -f "$errors"
+  [ -n "$_FLEET_PROBE_OUT" ]
 }
 
 # The leased project's seeded clusters, as "<slot>\t<name>\t<location>" lines, for
@@ -420,7 +474,7 @@ _fleet_refuse_opt_in_under_prow() {
 # An OAuth2 bearer token is a run of unreserved characters; anything else is
 # gcloud's stderr leaked into stdout.
 _fleet_bare_token() {
-  [ -n "$1" ] && ! printf '%s' "$1" | LC_ALL=C grep -q '[^A-Za-z0-9._~+/=-]'
+  [ -n "$1" ] && ! LC_ALL=C grep -q '[^A-Za-z0-9._~+/=-]' <<<"$1"
 }
 
 # Refuse to write kubeconfigs that would carry the caller's own credential.
@@ -497,7 +551,8 @@ write_fleet_kubeconfigs() {
   # unreachable cluster below is weather and does not.
   local rows slots
   rows="$(_fleet_catalog_rows "$catalog")" || return 1
-  slots="$(printf '%s\n' "$rows" | awk '{print $2}' | sort -u)"
+  # `-` is the slot of a project-scoped role, not a cluster slot.
+  slots="$(printf '%s\n' "$rows" | awk '$2 != "-" {print $2}' | sort -u)"
 
   # Rebuilt from scratch: a file left by a previous run is a credential for a
   # previous project, and pointing a check at the wrong project's fixture is
@@ -524,7 +579,7 @@ write_fleet_kubeconfigs() {
   # appended below as each slot resolves, never a missing slot record a
   # reader would take for an older runner or an uncatalogued role.
   printf 'project=%s\n' "$project" >"${dir}/.fleet-context"
-  printf '%s\n' "$rows" | awk 'NF >= 2 { printf "slot.%s=%s\n", $1, $2 }' >>"${dir}/.fleet-context"
+  printf '%s\n' "$rows" | awk 'NF >= 2 && $2 != "-" { printf "slot.%s=%s\n", $1, $2 }' >>"${dir}/.fleet-context"
   chmod 600 "${dir}/${_FLEET_MARKER}" "${dir}/.fleet-context"
 
   local slot cluster location slot_config listing discovered errors named
@@ -607,8 +662,49 @@ write_fleet_kubeconfigs() {
     done
   fi
 
+  local project_probes
   while read -r role slot namespace probes; do
     [ -n "$role" ] || continue
+    if [ "$slot" = "-" ]; then
+      # A project-scoped role: Compute Engine objects no cluster carries, read
+      # with gcloud in the project, as the caller (on the CI health bot's scan,
+      # the reader account, which holds roles/compute.viewer for this). No
+      # kubeconfig: the role is published as `<role>.confirmed` alone, which
+      # hack/fleet-fixture-state.py reads as published for such a role. The
+      # probes go into an array with `read -a`, because `*` is a glob
+      # character and word splitting would expand it.
+      read -r -a project_probes <<<"$probes"
+      confirmed=""
+      missing=""
+      unreadable=""
+      unreadable_why=""
+      for probe in "${project_probes[@]}"; do
+        probe_rc=0
+        _fleet_project_probe_present "$project" "$probe" || probe_rc=$?
+        case $probe_rc in
+          0) confirmed+="${probe}"$'\n' ;;
+          1) missing+="${probe} " ;;
+          *)
+            unreadable+="${probe} "
+            unreadable_why="$(printf '%s' "$_FLEET_PROBE_ERR" | tail -n 1 | tr -d '\r')"
+            ;;
+        esac
+      done
+      if [ -n "$unreadable" ]; then
+        echo "WARNING: ${unreadable% } could not be read from project ${project} (${unreadable_why:-no error text}), so fixture role '${role}' could not be checked. Its checks will report status=error rather than blaming the run." >&2
+        unresolved=$((unresolved + 1))
+        continue
+      fi
+      if [ -n "$missing" ]; then
+        echo "WARNING: ${missing% } absent from project ${project}, so fixture role '${role}' was never planted (or has already been destroyed). Its checks will report status=error rather than blaming the run." >&2
+        unplanted=$((unplanted + 1))
+        continue
+      fi
+      printf '%s' "$confirmed" >"${dir}/${role}.confirmed"
+      chmod 600 "${dir}/${role}.confirmed"
+      written=$((written + 1))
+      continue
+    fi
     slot_config="${dir}/clusters/${slot}.kubeconfig"
     if [ ! -f "$slot_config" ]; then
       unresolved=$((unresolved + 1))

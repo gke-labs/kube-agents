@@ -142,13 +142,26 @@ class VcsError(RuntimeError):
     """
 
     def __init__(
-        self, message: str, *, code: str | None = None, detail: str | None = None, revision: str | None = None
+        self,
+        message: str,
+        *,
+        code: str | None = None,
+        detail: str | None = None,
+        revision: str | None = None,
+        entries: list | None = None,
+        ceiling: int | None = None,
     ):
         super().__init__(message)
         self.code = code or None
         self.detail = detail or None
         # The commit the broker read, on a refusal that has one (`PATH_NOT_FOUND`).
         self.revision = revision or None
+        # On `SNAPSHOT_TOO_LARGE`: the entries one level down, each with what a
+        # snapshot of it alone measures, and the ceiling, for a caller that
+        # asks again with `paths`. Not printed: a listing is for a script, and
+        # it can name thousands of entries.
+        self.entries = entries if isinstance(entries, list) else None
+        self.ceiling = ceiling if isinstance(ceiling, int) and not isinstance(ceiling, bool) else None
 
     def as_json(self) -> dict:
         answer = {"error": str(self)}
@@ -179,20 +192,35 @@ BROKER_ENDPOINT_VAR = "CREDENTIAL_PROXY_URL"
 #: The verb that opens a change proposal, and the record `call()` writes to stderr
 #: when the broker answers it with one: a single compact JSON object on its own
 #: line, `{"kube-agents.event": "proposal-opened", "proposal": {url, number,
-#: title}}`. Every caller that opens a pull request or merge request -- `vcs.py`,
+#: title, claim, repo}}`. Every caller that opens a pull request or merge request -- `vcs.py`,
 #: submit-suggestion, the fleet audit -- reaches the broker through `call()`, so
 #: this is the one place that knows a proposal was opened, with the forge's own
 #: url. The agent pod's `pr_opened` plugin (agents/platform/plugins/pr_opened)
-#: checks the proposal with the forge, records it on the worker's card and takes
-#: the line out of the terminal output, which is how the thread's PR message is
-#: posted without reading the worker's words. The line proves nothing alone --
-#: any text in the output can take its shape -- which is why the plugin checks. A JSON value rather than a prefixed line, so a pipeline that
-#: merges stderr into `jq` reads one more document instead of failing. The
-#: plugin holds the same three names; its test reads these to keep them equal.
+#: presents the line's claim to the broker's `proposal-claim` verb, and the
+#: broker checks the proposal with the forge. A worker then records the claimed
+#: proposal on its card and takes the line out of the terminal output, which is
+#: how the thread's PR message is posted without reading the worker's words;
+#: every other process keeps the line without its claim. The line proves nothing
+#: alone -- any text in the output can take its shape -- which is why the claim
+#: is checked. A JSON value rather than a prefixed line, so a pipeline that
+#: merges stderr into `jq` reads one more document instead of failing.
+#: The claim is the one-time token the broker issues with each proposal it opens
+#: (`CLAIM_TOKEN_FIELD`), which the hook presents back to the broker: `call()`
+#: takes it out of the answer, so it never reaches what a caller prints, and a
+#: line without a valid claim counts nothing. The plugin holds the same names;
+#: its test reads these to keep them equal.
 PROPOSAL_CREATE_VERB = "proposal-create"
 PROPOSAL_OPENED_KEY = "kube-agents.event"
 PROPOSAL_OPENED_EVENT = "proposal-opened"
-PROPOSAL_OPENED_FIELDS = ("url", "number", "title")
+#: The top-level key of a `proposal-create` answer that holds the claim token
+#: (credential_proxy.py `CLAIM_TOKEN_FIELD`), and its field on the record.
+CLAIM_TOKEN_FIELD = "claim"
+#: The top-level key of a `proposal-create` answer that names the managed
+#: repository as the broker resolved it (`vcs_broker.Binding.stamp`), and its
+#: field on the record. The hook sends it back with the claim, so it needs no
+#: per-forge grammar for the proposal's url.
+REPO_FIELD = "repo"
+PROPOSAL_OPENED_FIELDS = ("url", "number", "title", CLAIM_TOKEN_FIELD, REPO_FIELD)
 
 
 @functools.lru_cache(maxsize=1)
@@ -236,12 +264,22 @@ def call(verb: str, payload: dict) -> dict:
     """`POST /v1/vcs/<verb>`, and the stderr record of a proposal it opened (`PROPOSAL_OPENED_KEY`)."""
     answer = _call(verb, payload)
     if verb.replace("_", "-") == PROPOSAL_CREATE_VERB:
-        _say_opened(answer)
+        claim = None
+        if isinstance(answer, dict) and CLAIM_TOKEN_FIELD in answer:
+            answer = dict(answer)
+            claim = answer.pop(CLAIM_TOKEN_FIELD)
+        _say_opened(answer, claim)
     return answer
 
 
-def _say_opened(answer: object) -> None:
+def _say_opened(answer: object, claim: object = None) -> None:
     """Write the `PROPOSAL_OPENED_KEY` record for the proposal in `answer`, if it names one.
+
+    `claim` is the token `call()` took from the answer's top level. An answer
+    with none -- a broker older than the token -- still records the proposal,
+    with the `claim` field absent rather than null. `repo` comes from the
+    answer's top level too (`REPO_FIELD`), and is absent when the answer has
+    no such string.
 
     Never raises: the proposal is open whatever happens to this line, and a
     caller told otherwise would try to open it again.
@@ -249,10 +287,17 @@ def _say_opened(answer: object) -> None:
     proposal = answer.get("proposal") if isinstance(answer, dict) else None
     if not isinstance(proposal, dict) or not proposal.get("url"):
         return
-    record = {
-        PROPOSAL_OPENED_KEY: PROPOSAL_OPENED_EVENT,
-        "proposal": {field: proposal.get(field) for field in PROPOSAL_OPENED_FIELDS},
+    fields = {
+        field: proposal.get(field)
+        for field in PROPOSAL_OPENED_FIELDS
+        if field not in (CLAIM_TOKEN_FIELD, REPO_FIELD)
     }
+    if claim is not None:
+        fields[CLAIM_TOKEN_FIELD] = claim
+    repo = answer.get(REPO_FIELD)
+    if isinstance(repo, str) and repo:
+        fields[REPO_FIELD] = repo
+    record = {PROPOSAL_OPENED_KEY: PROPOSAL_OPENED_EVENT, "proposal": fields}
     # A process started with fd 2 closed has no `sys.stderr`, and `print` would then
     # write to stdout, ahead of the one JSON document the callers print there.
     stream = sys.stderr
@@ -327,6 +372,8 @@ def _call(verb: str, payload: dict) -> dict:
             code=code,
             detail=payload.get("detail"),
             revision=payload.get("revision"),
+            entries=payload.get("entries"),
+            ceiling=payload.get("ceiling"),
         ) from exc
     except credential_proxy_client.TokenUnavailable as exc:
         # The projected token is missing or empty -- the kubelet mid-rewrite,
@@ -390,8 +437,7 @@ def local_git(cwd: Path, *args: str, check: bool = True, text: bool = True) -> s
     repository supplied. A bundle carries objects and refs and no config, so the
     only config this copy has is the one git just wrote — which means a
     `.gitattributes` naming `filter.foo.clean` finds no `foo` defined and is
-    inert, the same reasoning `content_workspace` makes about the broker's
-    trees. `core.hooksPath` is pointed at an empty directory rather than left to
+    inert. `core.hooksPath` is pointed at an empty directory rather than left to
     default, because a hook is the one thing that would not need a config entry
     to have been supplied. `safe.bareRepository=explicit` stops git from
     opening a directory of files laid out as a bare repository, and so from
@@ -1146,6 +1192,11 @@ def snapshot(
             code=DESTINATION_NOT_EMPTY,
         )
     payload: dict = {"repository": repository}
+    # The broker refuses a tree whose files pass this bound, with the entries a
+    # caller can ask for one by one; a tree it served and this side then
+    # refused would come with none. A bound below 0 is this side's alone.
+    if max_bytes >= 0:
+        payload["maxBytes"] = max_bytes
     if ref:
         payload["ref"] = ref
     if paths:

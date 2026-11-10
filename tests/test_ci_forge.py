@@ -24,6 +24,10 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 HACK = REPO_ROOT / "hack"
 PROJECT = "kube-agents-evals-2"
 FORGE_IP = "10.128.0.251"
+# How long the kubectl stub holds the keeper's `wait` back before recording it:
+# the keeper issues `run` and `wait` as two processes, so the call log can be
+# read between them, and the keeper test keeps that window open on purpose.
+KEEPER_WAIT_DELAY_SECONDS = "0.3"
 
 # gcloud: records argv; answers the reads `up` makes from a per-test state
 # directory (what exists is a file in GCLOUD_STATE), and the serial console from
@@ -76,7 +80,7 @@ FORGE_KNOBS_ABSENT = (
     "JOB_NAME", "EVAL_GHES_HOST", "EVAL_GITLAB_CE_HOST", "FORGE_SKIP_CLUSTER_CHECK", "FORGE_VM_ZONE", "AR_REPO",
     "FORGE_IMAGE_TAG", "GHES_READY_TIMEOUT_SECONDS", "GITLAB_CE_READY_TIMEOUT_SECONDS", "FORGE_BUILD_TIMEOUT_SECONDS",
     "FORGE_BUILD_CLIENT_BOUND_SECONDS", "FORGE_READY_POLL_SECONDS", "FORGE_TUNNEL_HOSTS_FILE",
-    "FORGE_TUNNEL_POLL_SECONDS", "KUBECTL_CODE", "KUBECTL_EXIT", "CURL_CODE", "MAKE_CERTS_LEAF_ONLY",
+    "FORGE_TUNNEL_POLL_SECONDS", "KUBECTL_CODE", "KUBECTL_EXIT", "CURL_CODE", "MAKE_CERTS_LEAF_ONLY", "STUB_WAIT_DELAY_SECONDS",
 )
 
 # kubectl: the in-cluster check answers the code the test puts in KUBECTL_CODE
@@ -86,6 +90,9 @@ FORGE_KNOBS_ABSENT = (
 STUB_KUBECTL = textwrap.dedent(
     """\
     #!/usr/bin/env bash
+    # STUB_WAIT_DELAY_SECONDS: the keeper's `wait` is recorded that long after
+    # its `run` returned, as on a busy runner.
+    case "$*" in "--context "*" wait "*) [ -z "${STUB_WAIT_DELAY_SECONDS:-}" ] || sleep "${STUB_WAIT_DELAY_SECONDS}" ;; esac
     printf 'kubectl %s\\n' "$*" >> "${STUB_CALLS}"
     case "$*" in
       "--context "*" port-forward "*)
@@ -264,6 +271,17 @@ class ForgeScriptTest(unittest.TestCase):
             "host=ghes.eval.internal", "enterprise-version=3.17.0", "block-project-ssh-keys=TRUE", "startup-script=", "tls-crt=", "tls-key=", "ca-crt=",
         ):
             self.assertIn(flag, create)
+        # The registry helper writes its config to /var before the pull: Container-Optimized OS mounts /root
+        # read-only, and without the config docker pulls the proxy image unauthenticated and is refused.
+        startup = (self.gstate / "startup-script").read_text()
+        self.assertIn("export DOCKER_CONFIG=/var/", startup)
+        self.assertLess(startup.index("export DOCKER_CONFIG="), startup.index("docker-credential-gcr configure-docker"))
+        self.assertLess(startup.index("docker-credential-gcr configure-docker"), startup.index('docker pull "$IMAGE"'))
+        # Both steps print their cause on failure, before the `FORGE failed` line `up` stops reading at;
+        # the login's line is not itself a `FORGE failed`, so `up` waits for the pull's.
+        login = next(line for line in startup.splitlines() if "FORGE registry-login" in line)
+        self.assertNotIn("FORGE failed", login)
+        self.assertLess(startup.index("FORGE pull: "), startup.index("FORGE failed pull"))
         # Readiness from the serial console, the key out of metadata, then one curl from a pod in the host cluster, with the CA.
         self.assertTrue(self.calls_of("get-serial-port-output forge-ghes"))
         self.assertTrue(self.calls_of("compute instances remove-metadata forge-ghes --zone=us-central1-a"))
@@ -385,10 +403,18 @@ class ForgeScriptTest(unittest.TestCase):
         self.assertFalse(self.state_dir.exists())
 
     def test_up_takes_the_vm_down_when_the_serial_console_reports_a_failure(self):
-        self.provision(serial="startup-script: FORGE script-start t=1s\nstartup-script: FORGE failed pull us-central1-docker.pkg.dev/x\n")
+        self.provision(serial=(
+            "startup-script: FORGE script-start t=1s\n"
+            "startup-script: FORGE registry-login rc=1: ERROR: Unable to save docker config\n"
+            "startup-script: FORGE pull: denied: Unauthenticated request\n"
+            "startup-script: FORGE failed pull us-central1-docker.pkg.dev/x\n"
+        ))
         proc = self.run_forge("up")
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("startup failed: FORGE failed pull", proc.stderr)
+        # The cause the VM printed before the failed line reaches the job's log.
+        self.assertIn("FORGE registry-login rc=1: ERROR: Unable to save docker config", proc.stderr)
+        self.assertIn("FORGE pull: denied: Unauthenticated request", proc.stderr)
         self.assertTrue(self.calls_of("compute instances delete forge-ghes --zone=us-central1-a"))
         self.assertFalse(self.state_dir.exists())
         self.assertFalse(self.calls_of("kubectl run"), "no in-cluster check on a forge that never came up")
@@ -552,16 +578,17 @@ class ForgeScriptTest(unittest.TestCase):
     def test_the_keeper_re_creates_a_relay_pod_that_is_gone(self):
         self.provision()
         marker = self.dir / "relay-gone"
-        self.assertEqual(self.run_forge("up", forge="gitlab-ce", STUB_RELAY_GONE=str(marker)).returncode, 0)
-        recreated = []
-        for _ in range(100):  # the keeper's restart pause is 2 s
+        self.assertEqual(self.run_forge("up", forge="gitlab-ce", STUB_RELAY_GONE=str(marker), STUB_WAIT_DELAY_SECONDS=KEEPER_WAIT_DELAY_SECONDS).returncode, 0)
+        recreated, waited = [], []
+        for _ in range(100):  # the keeper's restart pause is 2 s, and its `wait` follows its `run` as a second process
             recreated = self.calls_of("kubectl --context host-ctx run forge-relay ")
-            if recreated:
+            waited = self.calls_of("kubectl --context host-ctx wait --for=condition=Ready pod/forge-relay")
+            if recreated and waited:
                 break
             time.sleep(0.1)
         self.assertTrue(recreated, "a relay the drain took is re-created, in the recorded context")
         self.assertIn("TCP-LISTEN:8443,fork,reuseaddr", recreated[0])
-        self.assertTrue(self.calls_of("kubectl --context host-ctx wait --for=condition=Ready pod/forge-relay"))
+        self.assertTrue(waited, "the re-created relay is waited for, in the recorded context")
         self.assertEqual(self.run_forge("down", forge="gitlab-ce").returncode, 0)
 
     def test_down_on_ghes_deletes_a_relay_pod_a_dead_gitlab_ce_run_left(self):

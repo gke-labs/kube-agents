@@ -36,6 +36,9 @@ const (
 
 	// maxPollSeconds bounds poll_events' wait for a new frame.
 	maxPollSeconds = 60
+
+	metaConversationIDKey    = "conversation_id"
+	metaConversationIDSuffix = "/conversation_id"
 )
 
 // MaxTurnWait is the longest a turn tool holds a request: the wait for the
@@ -49,6 +52,7 @@ const MaxTurnWait = submissionWait + noticeGrace + maxWaitSeconds*time.Second
 type TurnBus interface {
 	SendTurn(ctx context.Context, convs *Conversations, token, text string, wait time.Duration) (TurnResult, *turnWatch, error)
 	WaitForTurn(ctx context.Context, w *turnWatch, root TaskRef, wait time.Duration) (TurnOutcome, error)
+	WaitForTurnStep(ctx context.Context, convs *Conversations, w *turnWatch, root TaskRef, wait time.Duration) (TurnStepOutcome, error)
 	SendStop(ctx context.Context, convs *Conversations, token string) (TurnResult, error)
 	ReadTask(ctx context.Context, ref TaskRef) (*lib.Task, error)
 	WaitForTask(ctx context.Context, ref TaskRef, wait time.Duration) (*lib.Task, error)
@@ -60,6 +64,22 @@ type sendMessageArgs struct {
 	Conversation      string `json:"conversation"`
 	ConversationToken string `json:"conversation_token"`
 	WaitSeconds       int    `json:"wait_seconds"`
+	StreamSteps       *bool  `json:"stream_steps,omitempty"`
+}
+
+func shouldStreamSteps(ctx context.Context, explicit *bool) bool {
+	if explicit != nil {
+		return *explicit
+	}
+	meta := CallMetaFromContext(ctx)
+	for k, v := range meta {
+		if k == metaConversationIDKey || strings.HasSuffix(k, metaConversationIDSuffix) {
+			if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // SendMessageTool sends one turn to the install's agents and waits a while
@@ -82,6 +102,7 @@ func SendMessageTool(bus TurnBus, convs *Conversations) Tool {
 					"conversation":       map[string]any{"type": "string", "description": "A name for the conversation; turns with the same name continue it. Default: " + DefaultConversation + "."},
 					"conversation_token": map[string]any{"type": "string", "description": "Continue a conversation by the token a previous answer reported, instead of by name."},
 					"wait_seconds":       map[string]any{"type": "integer", "description": fmt.Sprintf("How long to wait for the answer, %d at most. Default %d.", maxWaitSeconds, defaultWaitSeconds)},
+					"stream_steps":       map[string]any{"type": "boolean", "description": "When true, return a custom step envelope after the next step so the caller can stream progress step-by-step with task_control get."},
 				},
 			},
 		},
@@ -92,9 +113,47 @@ func SendMessageTool(bus TurnBus, convs *Conversations) Tool {
 			if err := json.Unmarshal(orEmptyObject(raw), &a); err != nil {
 				return "", fmt.Errorf("arguments: %w", err)
 			}
+			if shouldStreamSteps(ctx, a.StreamSteps) {
+				return sendAndStreamStep(ctx, bus, convs, a.Conversation, a.ConversationToken, a.Text, waitFor(a.WaitSeconds))
+			}
 			return sendAndWait(ctx, bus, convs, a.Conversation, a.ConversationToken, a.Text, waitFor(a.WaitSeconds))
 		},
 	}
+}
+
+func sendAndStreamStep(ctx context.Context, bus TurnBus, convs *Conversations, alias, token, text string, wait time.Duration) (string, error) {
+	token, byToken, err := convs.ResolveCall(alias, token)
+	if err != nil {
+		return "", err
+	}
+	start := time.Now()
+	res, w, err := bus.SendTurn(ctx, convs, token, text, wait)
+	if err != nil {
+		return "", err
+	}
+	if res.Task == nil {
+		var sb strings.Builder
+		writeConversation(&sb, alias, token, byToken)
+		writeNotices(&sb, res.Notices)
+		if len(res.Notices) == 0 {
+			sb.WriteString("The gateway answered with no task and no notice.\n")
+		}
+		return sb.String(), nil
+	}
+	convs.initTaskStepState(*res.Task, token, alias, byToken, res.Notices, w)
+	stepOut, err := bus.WaitForTurnStep(ctx, convs, w, *res.Task, max(wait-time.Since(start), minAnswerWait))
+	if err != nil {
+		if tooLargeToRead(err) {
+			convs.closeTaskStepState(*res.Task)
+		}
+		var sb strings.Builder
+		writeConversation(&sb, alias, token, byToken)
+		writeNotices(&sb, res.Notices)
+		fmt.Fprintf(&sb, "Task `%s` carries the turn, but reading it failed: %v\n", res.Task, err)
+		return sb.String(), nil
+	}
+	title, md, resText := FormatTurnCustomToolEnvelope(stepOut)
+	return MarshalCustomToolResult(title, md, resText), nil
 }
 
 // sendAndWait sends text as one turn of the conversation named by alias or
@@ -153,8 +212,11 @@ func writeReports(sb *strings.Builder, out TurnOutcome, token string) {
 		fmt.Fprintf(sb, "\nThe turn's tasks were still running when the wait ended, so the card reports shown are only those that "+
 			"had arrived by then (%d); %s.\n", len(out.Reports), later)
 	case reportsNoCards:
-		fmt.Fprintf(sb, "\nThe turn's tasks ended, and the gateway's result for task %s said no work was handed to cards, "+
+		fmt.Fprintf(sb, "\nThe turn's tasks ended, and the gateway's result for task %s said no cards were left pending, "+
 			"so gathering stopped at once; %s.\n", cell(out.Root.TaskID), later)
+	case reportsNoCardSignal:
+		fmt.Fprintf(sb, "\nThe turn's tasks ended with no handoff or card subtask seen on them, and no result from the gateway "+
+			"had been heard yet, so gathering stopped at once; %s.\n", later)
 	case reportsQuiet:
 		if len(out.Reports) == 0 {
 			fmt.Fprintf(sb, "\n%s No card report came within %s of the end; a card's report can take minutes: %s.\n",
@@ -307,11 +369,14 @@ func writeEventPage(sb *strings.Builder, page EventPage, heard bool, since uint6
 }
 
 type taskControlArgs struct {
-	Action            string `json:"action"`
-	Task              string `json:"task"`
-	Conversation      string `json:"conversation"`
-	ConversationToken string `json:"conversation_token"`
-	WaitSeconds       int    `json:"wait_seconds"`
+	Action             string `json:"action"`
+	Task               string `json:"task"`
+	TaskID             string `json:"task_id,omitempty"`
+	Conversation       string `json:"conversation"`
+	ConversationToken  string `json:"conversation_token"`
+	WaitSeconds        int    `json:"wait_seconds"`
+	WaitTimeoutSeconds int    `json:"wait_timeout_seconds,omitempty"`
+	StreamSteps        *bool  `json:"stream_steps,omitempty"`
 }
 
 // TaskControlTool reads a task, or stops a conversation's running task.
@@ -325,11 +390,14 @@ func TaskControlTool(bus TurnBus, convs *Conversations) Tool {
 				"type":     "object",
 				"required": []string{"action"},
 				"properties": map[string]any{
-					"action":             map[string]any{"type": "string", "enum": []string{actionGet, actionStop}},
-					"task":               map[string]any{"type": "string", "description": "The task to read (get): <addressee>/<task-id> as send_message reports it, or a task id alone."},
-					"conversation":       map[string]any{"type": "string", "description": "The conversation whose task to stop (stop). Default: " + DefaultConversation + "."},
-					"conversation_token": map[string]any{"type": "string", "description": "The conversation, by token (stop)."},
-					"wait_seconds":       map[string]any{"type": "integer", "description": fmt.Sprintf("For get: wait up to this long for the task to finish, %d at most. Default 0.", maxWaitSeconds)},
+					"action":               map[string]any{"type": "string", "enum": []string{actionGet, actionStop}},
+					"task":                 map[string]any{"type": "string", "description": "The task to read (get): <addressee>/<task-id> as send_message reports it, or a task id alone."},
+					"task_id":              map[string]any{"type": "string", "description": "Alias for task: <addressee>/<task-id> or a task id alone."},
+					"conversation":         map[string]any{"type": "string", "description": "The conversation whose task to stop (stop). Default: " + DefaultConversation + "."},
+					"conversation_token":   map[string]any{"type": "string", "description": "The conversation, by token (stop)."},
+					"wait_seconds":         map[string]any{"type": "integer", "description": fmt.Sprintf("For get: wait up to this long for the task to finish, %d at most. Default 0.", maxWaitSeconds)},
+					"wait_timeout_seconds": map[string]any{"type": "integer", "description": fmt.Sprintf("Alias for wait_seconds (%d at most).", maxWaitSeconds)},
+					"stream_steps":         map[string]any{"type": "boolean", "description": "When true, return a custom step envelope for the next step of the task."},
 				},
 			},
 		},
@@ -340,15 +408,31 @@ func TaskControlTool(bus TurnBus, convs *Conversations) Tool {
 			if err := json.Unmarshal(orEmptyObject(raw), &a); err != nil {
 				return "", fmt.Errorf("arguments: %w", err)
 			}
+			waitSecs := a.WaitSeconds
+			if waitSecs == 0 && a.WaitTimeoutSeconds > 0 {
+				waitSecs = a.WaitTimeoutSeconds
+			}
 			switch a.Action {
 			case actionGet:
-				ref, err := resolveTask(ctx, bus, a.Task)
+				taskArg := a.Task
+				if taskArg == "" {
+					taskArg = a.TaskID
+				}
+				ref, err := resolveTaskWithConvs(ctx, bus, convs, taskArg)
 				if err != nil {
 					return "", err
 				}
+				if shouldStreamSteps(ctx, a.StreamSteps) {
+					stepOut, err := bus.WaitForTurnStep(ctx, convs, nil, ref, waitFor(waitSecs))
+					if err != nil {
+						return "", err
+					}
+					title, md, resText := FormatTurnCustomToolEnvelope(stepOut)
+					return MarshalCustomToolResult(title, md, resText), nil
+				}
 				var task *lib.Task
-				if a.WaitSeconds > 0 {
-					task, err = bus.WaitForTask(ctx, ref, waitFor(a.WaitSeconds))
+				if waitSecs > 0 {
+					task, err = bus.WaitForTask(ctx, ref, waitFor(waitSecs))
 				} else {
 					task, err = bus.ReadTask(ctx, ref)
 				}
@@ -367,6 +451,11 @@ func TaskControlTool(bus TurnBus, convs *Conversations) Tool {
 				if err != nil {
 					return "", err
 				}
+				// Only a stop that went out closes the streamed state; it
+				// cancels an in-flight poll rather than wait for it, and keeps
+				// the steps already shown so the closing poll does not repeat
+				// them.
+				convs.stopTaskStepState(token)
 				var sb strings.Builder
 				writeConversation(&sb, a.Conversation, token, byToken)
 				sb.WriteString("Sent stop.\n")
@@ -377,6 +466,15 @@ func TaskControlTool(bus TurnBus, convs *Conversations) Tool {
 			}
 		},
 	}
+}
+
+func resolveTaskWithConvs(ctx context.Context, bus TurnBus, convs *Conversations, task string) (TaskRef, error) {
+	if task != "" && !strings.Contains(task, taskRefSep) {
+		if ref, ok := convs.knownTaskRef(task); ok {
+			return ref, nil
+		}
+	}
+	return resolveTask(ctx, bus, task)
 }
 
 // resolveTask reads a task reference, resolving a bare id's addressee from its
@@ -474,6 +572,10 @@ func writeTask(sb *strings.Builder, ref TaskRef, t *lib.Task) {
 func writeOutcome(sb *strings.Builder, out TurnOutcome) {
 	if len(out.Followed) == 0 || out.AnswerFrom == nil || *out.AnswerFrom == out.Root {
 		writeTask(sb, out.Root, out.Task)
+		if out.Unfollowed {
+			sb.WriteString("\nThis is a re-read of a finished turn: its delegated tasks were not followed live, so their answers " +
+				"are not shown here; read them with task_control get on each child task.\n")
+		}
 		writeFollowed(sb, out.Followed)
 		return
 	}

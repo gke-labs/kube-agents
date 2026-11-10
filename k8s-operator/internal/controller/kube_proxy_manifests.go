@@ -19,6 +19,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -28,37 +29,85 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/memlimit"
 )
 
 const (
-	kubeProxyPort             int32 = 8443
-	kubeProxyMetricsPort      int32 = 8444
-	kubeProxyMetricsPortName        = "kube-metrics"            // #nosec G101 -- Container port name, not a credential
-	kubeProxyMetricsPortEnv         = "KUBE_PROXY_METRICS_PORT" // #nosec G101 -- Environment variable name, not a credential
-	kubeProxyImageEnvVar            = "KUBE_PROXY_IMAGE"
-	kubeProxyRepositoryName         = "kube-proxy"
-	kubeProxyTLSSecretSuffix        = "-kube-proxy-tls" // #nosec G101 -- Secret name suffix, not a credential
-	kubeProxyTLSVolumeName          = "kube-proxy-tls"  // #nosec G101 -- Volume name, not a credential
-	kubeProxyTLSMountPath           = "/var/run/secrets/kubeagents/kube-proxy-tls"
-	kubeProxyCAVolumeName           = "kube-proxy-ca"
-	kubeProxyCAMountPath            = "/var/run/secrets/kubeagents/kube-proxy-ca"
-	kubeProxyCACertFile             = kubeProxyCAMountPath + "/ca.crt"
-	kubeProxyCPURequest             = "100m"
-	kubeProxyMemoryRequest          = "256Mi"
-	kubeProxyCPULimit               = "1"
-	kubeProxyMemoryLimit            = "512Mi"
-	kubeProxyTLSHashAnnotation      = "kubeagents.x-k8s.io/tls-cert-hash"
-	kubeProxyTLSClockSkew           = 5 * time.Minute
-	kubeProxyTLSValidity            = 10 * 365 * 24 * time.Hour
-	kubeProxySecretDefaultMode      = int32(0440)
-	kubeAPITokenExpirationSeconds   = int64(3600)
-	kubeAPITokenVolumeName          = "event-watcher-ksa-token"
-	kubeRootCAConfigMapName         = "kube-root-ca.crt"
-	kubeProxyProbeInitialDelay      = int32(2)
-	kubeProxyProbePeriod            = int32(10)
-	kubeProxyProbeTimeout           = int32(5)
-	kubeProxyProbeFailureThreshold  = int32(3)
+	kubeProxyPort                  int32 = 8443
+	kubeProxyMetricsPort           int32 = 8444
+	kubeProxyMetricsPortName             = "kube-metrics"            // #nosec G101 -- Container port name, not a credential
+	kubeProxyMetricsPortEnv              = "KUBE_PROXY_METRICS_PORT" // #nosec G101 -- Environment variable name, not a credential
+	kubeProxyImageEnvVar                 = "KUBE_PROXY_IMAGE"
+	kubeProxyRepositoryName              = "kube-proxy"
+	kubeProxyTLSSecretSuffix             = "-kube-proxy-tls" // #nosec G101 -- Secret name suffix, not a credential
+	kubeProxyTLSVolumeName               = "kube-proxy-tls"  // #nosec G101 -- Volume name, not a credential
+	kubeProxyTLSMountPath                = "/var/run/secrets/kubeagents/kube-proxy-tls"
+	kubeProxyCAVolumeName                = "kube-proxy-ca"
+	kubeProxyCAMountPath                 = "/var/run/secrets/kubeagents/kube-proxy-ca"
+	kubeProxyCACertFile                  = kubeProxyCAMountPath + "/ca.crt"
+	kubeProxyCPURequest                  = "100m"
+	kubeProxyMemoryRequest               = "512Mi"
+	kubeProxyCPULimit                    = "1"
+	kubeProxyMemoryLimit                 = "1Gi"
+	kubeProxyTLSHashAnnotation           = "kubeagents.x-k8s.io/tls-cert-hash"
+	kubeProxyTLSClockSkew                = 5 * time.Minute
+	kubeProxyTLSValidity                 = 10 * 365 * 24 * time.Hour
+	kubeProxySecretDefaultMode           = int32(0440)
+	kubeAPITokenExpirationSeconds        = int64(3600)
+	kubeAPITokenVolumeName               = "event-watcher-ksa-token"
+	kubeRootCAConfigMapName              = "kube-root-ca.crt"
+	kubeProxyProbeInitialDelay           = int32(2)
+	kubeProxyProbePeriod                 = int32(10)
+	kubeProxyProbeTimeout                = int32(5)
+	kubeProxyProbeFailureThreshold       = int32(3)
+
+	// kubeProxyReplicas is two because every sandbox kubectl goes through
+	// this proxy: on one replica a rollout or an eviction drops them all.
+	// What the proxy holds is per-pod cache (TokenReview results, upstream
+	// endpoints, token sources) that each replica fills on its own, so
+	// either replica answers any request.
+	kubeProxyReplicas = int32(2)
+	// kubeProxyPreStopSleepSeconds holds SIGTERM until the terminating
+	// replica's endpoint removal has propagated, so connections opened in
+	// that window still reach a listening server. It plus the proxy's 10s
+	// shutdown timeout fits the default 30s grace period. The native sleep
+	// handler, because the image is distroless and has no sleep binary; it
+	// is on by default from Kubernetes 1.30. A 1.29 apiserver drops it, and
+	// a kubelet older than 1.30 logs FailedPreStopHook and skips the wait.
+	kubeProxyPreStopSleepSeconds = int64(5)
+	// kubeProxyRolloutMaxUnavailable rolls one replica at a time with no
+	// surge (kubeProxyRolloutMaxSurge), so a rollout never needs pod or
+	// CPU quota beyond the running count: a surge pod in a namespace at its
+	// ResourceQuota pends and wedges the rollout. The other replica keeps
+	// serving while the first restarts.
+	kubeProxyRolloutMaxUnavailable = int32(1)
+	kubeProxyRolloutMaxSurge       = int32(0)
+	// kubeProxyPDBMaxUnavailable lets a drain evict one replica and makes
+	// it wait for that one to be Ready before the second goes. Always
+	// maxUnavailable, never minAvailable:
+	// agents/platform/governance/obtainability_audit_sop.md §3.3 and §3.4.
+	kubeProxyPDBMaxUnavailable = int32(1)
+	// The spread is advisory (ScheduleAnyway) so a single-node install still
+	// schedules both replicas; pod-template-hash scopes the skew to one
+	// ReplicaSet, as a2aVerifierSpreadMatchLabelKey explains.
+	kubeProxySpreadTopologyKey   = "kubernetes.io/hostname"
+	kubeProxySpreadMaxSkew       = int32(1)
+	kubeProxySpreadMatchLabelKey = "pod-template-hash"
 )
+
+// GOMEMLIMIT, the Go runtime's soft heap limit, is set to
+// kubeProxyGoMemLimitPercent of kubeProxyMemoryLimit (kubeProxyGoMemLimit), so
+// the collector works harder as the response cache and in-flight bodies push
+// the heap toward the container's limit.
+const kubeProxyGoMemLimitPercent = 85
+
+// kubeProxyGoMemLimit is the kube-proxy container's GOMEMLIMIT:
+// kubeProxyGoMemLimitPercent of its memory limit, in bytes (912680550 for
+// 1Gi), derived from kubeProxyMemoryLimit so a change to the limit carries over.
+func kubeProxyGoMemLimit() string {
+	limit := resource.MustParse(kubeProxyMemoryLimit)
+	return strconv.FormatInt(limit.Value()*kubeProxyGoMemLimitPercent/100, 10)
+}
 
 func kubeProxyName(agent *agentv1alpha1.PlatformAgent) string {
 	return agent.Name + "-kube-proxy"
@@ -172,8 +221,6 @@ func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent, otlpEndpoint s
 		pullPolicy = *agent.Spec.Deployment.ImagePullPolicy
 	}
 
-	defaultCluster := hostClusterContextName(agent)
-
 	envVars := []corev1.EnvVar{
 		{Name: "KUBE_PROXY_LISTEN_ADDR", Value: fmt.Sprintf(":%d", kubeProxyPort)},
 		{Name: kubeProxyMetricsPortEnv, Value: strconv.Itoa(int(kubeProxyMetricsPort))},
@@ -181,7 +228,7 @@ func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent, otlpEndpoint s
 		{Name: "KUBE_PROXY_TLS_KEY_FILE", Value: kubeProxyTLSMountPath + "/tls.key"},
 		{Name: "KUBE_PROXY_MODE", Value: "read-only-dry-run"},
 		{Name: "KUBE_PROXY_REDACT_SECRETS", Value: "true"},
-		{Name: "KUBE_PROXY_DEFAULT_CLUSTER", Value: defaultCluster},
+		{Name: memlimit.GoMemLimitEnv, Value: kubeProxyGoMemLimit()},
 		{Name: "CREDENTIAL_PROXY_AUDIENCE", Value: credentialProxyAudience},
 		{Name: "CREDENTIAL_PROXY_ALLOWED_CALLERS", Value: allowedBrokerCallers(agent, brokerCallerOwnership{})},
 		{Name: "CREDENTIAL_PROXY_KUBE_CA_FILE", Value: kubeAPIAccessMountPath + "/ca.crt"},
@@ -300,6 +347,11 @@ func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent, otlpEndpoint s
 			},
 		},
 		VolumeMounts: volumeMounts,
+		Lifecycle: &corev1.Lifecycle{
+			PreStop: &corev1.LifecycleHandler{
+				Sleep: &corev1.SleepAction{Seconds: kubeProxyPreStopSleepSeconds},
+			},
+		},
 		SecurityContext: &corev1.SecurityContext{
 			AllowPrivilegeEscalation: ptr.To(false),
 			ReadOnlyRootFilesystem:   ptr.To(true),
@@ -311,8 +363,14 @@ func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent, otlpEndpoint s
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
 		ObjectMeta: metav1.ObjectMeta{Name: kubeProxyName(agent), Namespace: agent.Namespace},
 		Spec: appsv1.DeploymentSpec{
-			Replicas: ptr.To(int32(1)),
-			Strategy: appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType},
+			Replicas: ptr.To(kubeProxyReplicas),
+			Strategy: appsv1.DeploymentStrategy{
+				Type: appsv1.RollingUpdateDeploymentStrategyType,
+				RollingUpdate: &appsv1.RollingUpdateDeployment{
+					MaxUnavailable: ptr.To(intstr.FromInt32(kubeProxyRolloutMaxUnavailable)),
+					MaxSurge:       ptr.To(intstr.FromInt32(kubeProxyRolloutMaxSurge)),
+				},
+			},
 			Selector: &metav1.LabelSelector{MatchLabels: kubeProxySelector(agent)},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
@@ -332,8 +390,15 @@ func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent, otlpEndpoint s
 					Affinity:         affinity,
 					NodeSelector:     nodeSelector,
 					Tolerations:      tolerations,
-					Containers:       []corev1.Container{container},
-					Volumes:          volumes,
+					TopologySpreadConstraints: []corev1.TopologySpreadConstraint{{
+						MaxSkew:           kubeProxySpreadMaxSkew,
+						TopologyKey:       kubeProxySpreadTopologyKey,
+						WhenUnsatisfiable: corev1.ScheduleAnyway,
+						LabelSelector:     &metav1.LabelSelector{MatchLabels: kubeProxySelector(agent)},
+						MatchLabelKeys:    []string{kubeProxySpreadMatchLabelKey},
+					}},
+					Containers: []corev1.Container{container},
+					Volumes:    volumes,
 				},
 			},
 		},
@@ -341,6 +406,24 @@ func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent, otlpEndpoint s
 	withCommonLabels(dep, agent)
 	dep.Labels["app"] = kubeProxyName(agent)
 	return dep
+}
+
+// buildKubeProxyPDB renders the proxy's PodDisruptionBudget with the
+// Deployment's name and selector, so the budget cannot select another
+// workload's pods. AlwaysAllow lets a Running but NotReady replica be evicted,
+// so a broken rollout does not hold a node drain.
+func buildKubeProxyPDB(agent *agentv1alpha1.PlatformAgent) *policyv1.PodDisruptionBudget {
+	pdb := &policyv1.PodDisruptionBudget{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "policy/v1", Kind: "PodDisruptionBudget"},
+		ObjectMeta: metav1.ObjectMeta{Name: kubeProxyName(agent), Namespace: agent.Namespace},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			MaxUnavailable:             ptr.To(intstr.FromInt32(kubeProxyPDBMaxUnavailable)),
+			Selector:                   &metav1.LabelSelector{MatchLabels: kubeProxySelector(agent)},
+			UnhealthyPodEvictionPolicy: ptr.To(policyv1.AlwaysAllow),
+		},
+	}
+	withCommonLabels(pdb, agent)
+	return pdb
 }
 
 func buildKubeProxyNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1.NetworkPolicy {
@@ -503,11 +586,17 @@ func (r *PlatformAgentReconciler) reconcileKubeProxy(ctx context.Context, agent 
 	objs := []client.Object{
 		buildKubeProxyService(agent),
 		buildKubeProxyDeployment(agent, otlpEndpoint, otlpDisabled, tlsHash),
+		buildKubeProxyPDB(agent),
 		buildKubeProxyNetworkPolicy(agent),
 	}
 	for _, obj := range objs {
 		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
 			return fmt.Errorf("failed to set controller reference on kube-proxy %T %s/%s: %w", obj, obj.GetNamespace(), obj.GetName(), err)
+		}
+		if pdb, isPDB := obj.(*policyv1.PodDisruptionBudget); isPDB {
+			if err := r.clearForeignPDBBudgetField(ctx, pdb); err != nil {
+				return err
+			}
 		}
 		if err := r.applyManaged(ctx, agent, obj); err != nil {
 			return fmt.Errorf("failed to apply kube-proxy %T %s/%s: %w", obj, obj.GetNamespace(), obj.GetName(), err)

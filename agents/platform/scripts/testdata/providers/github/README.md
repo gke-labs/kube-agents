@@ -45,7 +45,9 @@ ways and never regenerated wholesale:
   states the contract asserts (open, merged, closed-and-draft) and
   `issue-list.json` carries an issue-shaped pull request — GitHub returns both
   from `/issues` — so the filtering has something to filter. Those are
-  arrangements of real responses, not invented ones.
+  arrangements of real responses, not invented ones. The open pull request
+  carries a `merge_commit_sha`, as GitHub sends for its test merge, so the
+  translation has to leave it out until a merge.
 
 - **Refusals are recorded too.** A response of the form
   `{"__status__": 404, "__detail__": "..."}` is what the transport would have

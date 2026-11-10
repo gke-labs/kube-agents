@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
 	"regexp"
 	"strings"
 	"time"
@@ -60,6 +61,15 @@ const (
 	slackHomePickMalformed       = "That is not a channel."
 	slackHomePickGuest           = "Only a member of this workspace can move the home channel."
 	slackHomePickNoMemberCheck   = "Could not check your account with Slack; pick again."
+
+	// The answer to a typed "/sethome" (answerSetHome): the panel's state in one
+	// sentence (the panel's own lines for no home and not armed), then where
+	// the channel moves and who may move it. The id is plain: the reply goes
+	// through the backend's markdown, which escapes a <#C…> mention; the
+	// Home tab names the channel.
+	slackHomeNoticeHome  = "Home channel now: `%s` (the Home tab's view)."
+	slackHomeNoticeMove  = "`/sethome` does not set it under `next`. Move it from the app's Home tab (the Home channel panel), or set `spec.integration.slack.homeChannel` on the PlatformAgent. A member on `allowedUsers` can move it (every full member when the list is empty); a guest account never can."
+	slackHomeNoticeNoSet = "`/sethome` does not change it."
 
 	// homePickedLine goes into the new home; homeMovedLine into the old one.
 	// Posted raw, as homeLearnedLine is: the ids are checked channel ids.
@@ -127,6 +137,54 @@ func (s *SlackAdapter) homeForView() string {
 		return file
 	}
 	return p.channel
+}
+
+// homeNotice answers a typed "/sethome" (answerSetHome): the Home tab
+// panel's state, read as the panel draws it (a move made seconds ago shows
+// over the lagging file), then where the channel moves and who may move it.
+// Fixed text, no Slack call, no model.
+func (s *SlackAdapter) homeNotice() string {
+	if !s.homePickArmed() {
+		return slackHomeLineNotArmed + " " + slackHomeNoticeNoSet
+	}
+	state := slackHomeLineNoHome
+	if home := s.homeForView(); home != "" {
+		state = fmt.Sprintf(slackHomeNoticeHome, home)
+	}
+	return state + " " + slackHomeNoticeMove
+}
+
+// answerSetHome answers a typed "/sethome" or "/hermes sethome"
+// (chattext.IsSetHomeCommand) from an admitted author in the thread it was
+// typed in, before the text becomes a turn: nothing downstream sees it, so no
+// task starts, no open question is marked answered, no home is learned from
+// it and no asker is noted. Admission is the gateway's own rule for an
+// inbound message (the SetHome closure) on the author foreignSender already
+// settled, so it needs no Slack call and cannot be undecided: an author the
+// rule does not admit is not answered here, and the gateway refuses the
+// turn as it refuses any. The post runs off the event pump (goSession), which
+// only enqueues.
+func (s *SlackAdapter) answerSetHome(author, conversation, text string) bool {
+	if !chattext.IsSetHomeCommand(text) {
+		return false
+	}
+	s.home.mu.Lock()
+	admits := s.home.admits
+	s.home.mu.Unlock()
+	if admits == nil {
+		return false
+	}
+	if admitted, _ := admits(author); !admitted {
+		return false
+	}
+	s.log.Info("slack: sethome notice", "author", author, "conversation", conversation)
+	notice := s.homeNotice()
+	s.goSession(func() {
+		if _, err := s.Post(conversation, notice); err != nil {
+			s.log.Warn("slack: sethome notice not posted", "conversation", conversation, "err", err)
+		}
+	})
+	return true
 }
 
 // homeChannelBlocks draws the Home channel panel: the picker and the line

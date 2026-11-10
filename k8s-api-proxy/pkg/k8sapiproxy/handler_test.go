@@ -109,12 +109,10 @@ func TestNewHandlerValidatesConfig(t *testing.T) {
 		t.Fatalf("NewHandler(valid) = %v", err)
 	}
 	for name, mutate := range map[string]func(*Config){
-		"no authenticator":      func(c *Config) { c.Authenticator = nil },
-		"no upstream":           func(c *Config) { c.Upstream = nil },
-		"no mode":               func(c *Config) { c.Policy.Mode = "" },
-		"unknown mode":          func(c *Config) { c.Policy.Mode = "READ-ONLY" },
-		"invalid default ID":    func(c *Config) { c.DefaultClusterID = "bad$cluster" },
-		"upper-case default ID": func(c *Config) { c.DefaultClusterID = "kind-Dev" },
+		"no authenticator": func(c *Config) { c.Authenticator = nil },
+		"no upstream":      func(c *Config) { c.Upstream = nil },
+		"no mode":          func(c *Config) { c.Policy.Mode = "" },
+		"unknown mode":     func(c *Config) { c.Policy.Mode = "READ-ONLY" },
 	} {
 		cfg := ok
 		mutate(&cfg)
@@ -131,7 +129,7 @@ func TestHandlerAuthentication(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			h, upstream := newTestHandler(t, Config{Authenticator: auth})
-			rec := serve(h, httptest.NewRequest(http.MethodGet, "/api/v1/pods", nil))
+			rec := serve(h, httptest.NewRequest(http.MethodGet, "/clusters/in-cluster/api/v1/pods", nil))
 			if rec.Code != http.StatusUnauthorized {
 				t.Fatalf("code = %d, want 401", rec.Code)
 			}
@@ -147,15 +145,16 @@ func TestHandlerAuthentication(t *testing.T) {
 
 func TestHandlerRoutes(t *testing.T) {
 	tests := []struct {
-		name, defaultID, target, wantCluster, wantPath string
+		name, target, wantCluster, wantPath, wantQuery string
 	}{
-		{"prefix", gkeHost, "/clusters/" + gkeFleet + "/api/v1/namespaces/kube-system/pods?limit=5", gkeFleet, "/api/v1/namespaces/kube-system/pods"},
-		{"default cluster", gkeHost, "/apis/apps/v1/deployments?limit=5", gkeHost, "/apis/apps/v1/deployments"},
-		{"no default", "", "/api/v1/pods?limit=5", InClusterID, "/api/v1/pods"},
+		{"prefix", "/clusters/" + gkeFleet + "/api/v1/namespaces/kube-system/pods?limit=5", gkeFleet, "/api/v1/namespaces/kube-system/pods", "limit=5"},
+		{"in-cluster prefix", "/clusters/in-cluster/apis/apps/v1/deployments?limit=5", InClusterID, "/apis/apps/v1/deployments", "limit=5"},
+		{"metrics in-cluster prefix", "/clusters/in-cluster/metrics", InClusterID, "/metrics", ""},
+		{"metrics cluster prefix", "/clusters/" + gkeFleet + "/metrics", gkeFleet, "/metrics", ""},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			h, upstream := newTestHandler(t, Config{DefaultClusterID: tc.defaultID})
+			h, upstream := newTestHandler(t, Config{})
 			rec := serve(h, httptest.NewRequest(http.MethodGet, tc.target, nil))
 			if rec.Code != http.StatusOK {
 				t.Fatalf("code = %d: %s", rec.Code, rec.Body.String())
@@ -163,13 +162,34 @@ func TestHandlerRoutes(t *testing.T) {
 			if upstream.clusterID != tc.wantCluster {
 				t.Errorf("cluster = %q, want %q", upstream.clusterID, tc.wantCluster)
 			}
-			if upstream.req.URL.Path != tc.wantPath || upstream.req.URL.RawQuery != "limit=5" {
-				t.Errorf("upstream URL = %q, want %q?limit=5", upstream.req.URL.String(), tc.wantPath)
+			if upstream.req.URL.Path != tc.wantPath || upstream.req.URL.RawQuery != tc.wantQuery {
+				t.Errorf("upstream URL = %q, want path=%q query=%q", upstream.req.URL.String(), tc.wantPath, tc.wantQuery)
 			}
 			if upstream.req.Host != "" {
 				t.Errorf("upstream Host = %q, want it left to the transport", upstream.req.Host)
 			}
 		})
+	}
+}
+
+// A request with no /clusters/<id> prefix is refused, not routed to some default
+// cluster: kubectl before 1.34 drops the kubeconfig server's base path on `get --raw`
+// (#4739), and a default answered that fleet read with the host cluster's data and no
+// error. The refusal says what's wrong, and nothing reaches an upstream.
+func TestHandlerRefusesAPathWithNoCluster(t *testing.T) {
+	h, upstream := newTestHandler(t, Config{})
+	for _, target := range []string{"/api/v1/pods", "/apis/metrics.k8s.io/v1beta1/nodes", "/version", "/"} {
+		rec := serve(h, httptest.NewRequest(http.MethodGet, target, nil))
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("%s: code = %d, want 400", target, rec.Code)
+			continue
+		}
+		if s := decodeStatus(t, rec); !strings.Contains(s.Message, "/clusters/<context>") {
+			t.Errorf("%s: message = %q, want it to name /clusters/<context>", target, s.Message)
+		}
+	}
+	if upstream.calls != 0 {
+		t.Errorf("%d requests with no cluster reached an upstream", upstream.calls)
 	}
 }
 
@@ -179,12 +199,13 @@ func TestHandlerRefusals(t *testing.T) {
 		wantCode             int
 		wantReason           metav1.StatusReason
 	}{
-		{"invalid path", http.MethodGet, "/api/v1/namespaces/%2e%2e/secrets", http.StatusBadRequest, metav1.StatusReasonBadRequest},
+		{"invalid path", http.MethodGet, "/clusters/in-cluster/api/v1/namespaces/%2e%2e/secrets", http.StatusBadRequest, metav1.StatusReasonBadRequest},
 		{"invalid cluster", http.MethodGet, "/clusters/bad$id/api/v1/pods", http.StatusBadRequest, metav1.StatusReasonBadRequest},
-		{"write without dry run", http.MethodPost, "/api/v1/namespaces/default/configmaps", http.StatusForbidden, metav1.StatusReasonForbidden},
-		{"exec", http.MethodPost, "/api/v1/namespaces/default/pods/p/exec?command=sh", http.StatusForbidden, metav1.StatusReasonForbidden},
-		{"non-discovery path", http.MethodGet, "/metrics", http.StatusForbidden, metav1.StatusReasonForbidden},
-		{"unclassifiable path", http.MethodGet, "/api/v1/watch", http.StatusBadRequest, metav1.StatusReasonBadRequest},
+		{"write without dry run", http.MethodPost, "/clusters/in-cluster/api/v1/namespaces/default/configmaps", http.StatusForbidden, metav1.StatusReasonForbidden},
+		{"exec", http.MethodPost, "/clusters/in-cluster/api/v1/namespaces/default/pods/p/exec?command=sh", http.StatusForbidden, metav1.StatusReasonForbidden},
+		{"non-discovery path", http.MethodGet, "/clusters/in-cluster/debug/pprof", http.StatusForbidden, metav1.StatusReasonForbidden},
+		{"POST to /metrics", http.MethodPost, "/clusters/in-cluster/metrics", http.StatusForbidden, metav1.StatusReasonForbidden},
+		{"unclassifiable path", http.MethodGet, "/clusters/in-cluster/api/v1/watch", http.StatusBadRequest, metav1.StatusReasonBadRequest},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -206,7 +227,7 @@ func TestHandlerRefusals(t *testing.T) {
 
 func TestHandlerDropsAbsoluteURLAuthority(t *testing.T) {
 	h, upstream := newTestHandler(t, Config{})
-	rec := serve(h, httptest.NewRequest(http.MethodGet, "http://user:pw@attacker.example/api/v1/pods?limit=5", nil))
+	rec := serve(h, httptest.NewRequest(http.MethodGet, "http://user:pw@attacker.example/clusters/in-cluster/api/v1/pods?limit=5", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("code = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -219,7 +240,7 @@ func TestHandlerDropsAbsoluteURLAuthority(t *testing.T) {
 func TestHandlerForwardsDryRunWrite(t *testing.T) {
 	h, upstream := newTestHandler(t, Config{})
 	const body = `{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"c"}}`
-	rec := serve(h, httptest.NewRequest(http.MethodPost, "/api/v1/namespaces/default/configmaps?dryRun=All", strings.NewReader(body)))
+	rec := serve(h, httptest.NewRequest(http.MethodPost, "/clusters/in-cluster/api/v1/namespaces/default/configmaps?dryRun=All", strings.NewReader(body)))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("code = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -230,10 +251,10 @@ func TestHandlerForwardsDryRunWrite(t *testing.T) {
 
 func TestHandlerStripsCallerHeaders(t *testing.T) {
 	h, upstream := newTestHandler(t, Config{})
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil)
+	req := httptest.NewRequest(http.MethodGet, "/clusters/in-cluster/api/v1/namespaces/default/pods", nil)
 	for k, v := range map[string]string{
 		"Authorization":          "Bearer sandbox-token",
-		"Proxy-Authorization":    "Basic dXNlcjpwYXNz",
+		"Proxy-Authorization":    basicAuthHeader(placeholderBasicUser, placeholderBasicPass),
 		"Cookie":                 "session=s",
 		"Audit-ID":               "forged",
 		"Sec-WebSocket-Protocol": "base64url.bearer.authorization.k8s.io.dG9rZW4, v5.channel.k8s.io",
@@ -276,7 +297,7 @@ func TestHandlerStripsCallerHeaders(t *testing.T) {
 }
 
 func TestHandlerUpgrade(t *testing.T) {
-	const target = "/api/v1/namespaces/default/pods/p/exec?command=sh"
+	const target = "/clusters/in-cluster/api/v1/namespaces/default/pods/p/exec?command=sh"
 	newReq := func() *http.Request {
 		req := httptest.NewRequest(http.MethodPost, target, nil)
 		req.Header.Set("Upgrade", "SPDY/3.1")
@@ -306,8 +327,8 @@ func TestHandlerUpgrade(t *testing.T) {
 
 func TestHandlerUpstreamError(t *testing.T) {
 	upstream := &recordingTransport{err: errors.New("dial tcp: i/o timeout")}
-	h, _ := newTestHandler(t, Config{Upstream: upstream, DefaultClusterID: gkeHost})
-	rec := serve(h, httptest.NewRequest(http.MethodGet, "/api/v1/pods", nil))
+	h, _ := newTestHandler(t, Config{Upstream: upstream})
+	rec := serve(h, httptest.NewRequest(http.MethodGet, "/clusters/"+gkeHost+"/api/v1/pods", nil))
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("code = %d, want 502", rec.Code)
 	}

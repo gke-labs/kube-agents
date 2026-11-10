@@ -40,7 +40,9 @@ tell a missing fixture from a missing cluster. See
 ``sandbox_tree_matches_image`` reads the agent's own shell sandbox pod: it
 diffs the trees the image ships against the copies the worker runs, so an
 edit to a shipped skill or script is caught by its effect rather than by
-what the report says. See :class:`SandboxTreeMatchesImageVerifier`.
+what the report says; with ``target: gateway`` it reads the gateway pod's
+platform profile instead, the copy ``skill_manage`` writes. See
+:class:`SandboxTreeMatchesImageVerifier`.
 
 ``findings_item_state`` reads the install's findings queue through the Session
 KV server in the agent pod, so a case grades a decision on the rows it planted
@@ -87,6 +89,7 @@ from devops_bench.verification.verifiers import resource_property as _upstream_r
 
 from kube_agents_bench import (
     card_wake,
+    chat_shape,
     discovery,
     findings,
     forges,
@@ -117,6 +120,7 @@ from kube_agents_bench.shell_words import (
     _shell_argvs,
     _shell_words_and_spans,
     _substitution_commands,
+    _without_grep_patterns,
 )
 from kube_agents_bench.fleet import (
     ROLE_PATTERN,
@@ -174,6 +178,15 @@ _NO_TIME_WINDOW_REASON = (
 )
 # report_times_in_window, when a stated time matches no output it could read.
 _NO_WORKER_CAPTURE_GAP = "the delegated workers' tool calls were not captured"
+# The Coverage row cell the capped check reads, as onboarding.parse_raw_coverage
+# keys it (the last column's header lowercased): the count of workloads an audit listed.
+COVERAGE_WORKLOADS_COLUMN = onboarding.COVERAGE_WORKLOADS_HEADER.lower()
+COVERAGE_IN_FULL_COLUMN = onboarding.COVERAGE_IN_FULL_HEADER.lower()
+# compose writes "yes" or "no — see Gaps" in that cell.
+COVERAGE_IN_FULL_YES = "yes"
+# A count is ASCII digits only; int() would also accept fullwidth digits and
+# other Unicode decimals.
+_DIGITS_RE = re.compile(r"[0-9]+")
 _UNSOURCED_WITH_GAPS_REASON = (
     "observation time(s) {times} match no tool output this check could read, but the read "
     "was not whole ({gaps}), so the output that shows them may be in the part it missed"
@@ -1486,16 +1499,12 @@ class ReportManifestVerifier(BaseVerifier):
         )
 
 
-# The headers ``_append_delivered`` opens each card's result and each paused
-# card's question with in the final message (harness.py), and the one
-# ``_append_artifacts`` opens a file with. A delivered result runs from its
-# header to the next header of any kind.
-_DELIVERED_HEADER = re.compile(
-    r"^(?:Result of delegated task \S+|Question from delegated task \S+"
-    r"|Artifact [^\n]* produced by delegated task \S+):\n",
-    re.MULTILINE,
-)
-_RESULT_HEADER_PREFIX = "Result of delegated task "
+# The headers harness.py opens each delivered section of the final message
+# with, kept in chat_shape so the reply-shape measure and these checks agree
+# on what was delivered. A delivered result runs from its header to the next
+# header of any kind.
+_DELIVERED_HEADER = chat_shape.DELIVERED_HEADER
+_RESULT_HEADER_PREFIX = chat_shape.RESULT_HEADER_PREFIX
 # A bold span opening the text, closed on its own line.
 _BOLD_LEAD = re.compile(r"\A\*\*([^\n]+?)\*\*")
 _ATX_HEADING = re.compile(r"^ {0,3}#{1,6} ", re.MULTILINE)
@@ -1541,6 +1550,10 @@ _BOLD_SECTION = re.compile(r"\*\*[^*\n]+?(?<![.!?])\*\*[ \t]*(?:[:\u2014\u2013]|
 _ANSWER_LINK = re.compile(r"\[([^\]]*)\]\([^)\s]*\)")
 # Bold and code markers, which chat renders rather than shows.
 _UNSHOWN_MARKUP = re.compile(r"\*\*|`")
+# A ``[next: ...]`` step line (``slack_moments.NEXT_STEP_LINE``): plumbing the presenters draw
+# as a button and no surface shows as text, so the step lines that end a result are taken off
+# before it is measured, as ``slack_moments.visible_text`` takes them off.
+_STEP_LINE = re.compile(r"\[next:[^\]\n]*\]", re.IGNORECASE)
 
 
 def _delivered_results(final_message: str) -> list[str]:
@@ -1553,6 +1566,15 @@ def _delivered_results(final_message: str) -> list[str]:
         end = headers[i + 1].start() if i + 1 < len(headers) else len(final_message)
         results.append(final_message[header.end() : end].strip())
     return results
+
+
+def _visible(result: str) -> str:
+    """``result`` as chat shows it: every step-shaped line at its end taken off."""
+    lines = result.rstrip().split("\n")
+    end = len(lines)
+    while end and (not lines[end - 1].strip() or _STEP_LINE.fullmatch(lines[end - 1].strip())):
+        end -= 1
+    return "\n".join(lines[:end]).rstrip()
 
 
 def _unabbreviate(text: str) -> str:
@@ -1580,7 +1602,9 @@ class AnswerFirstVerifier(BaseVerifier):
     Every delivered result must pass: the lead is a bold span opening the
     result and holding one whole sentence; no ATX heading anywhere; at most
     ``max_chars`` characters as chat shows them, a markdown link counting as
-    its text and bold and code markers not at all, and ``max_sentences`` sentences, a bullet counting as one and a
+    its text, bold and code markers not at all, and the ``[next: ...]`` step
+    lines that end the result not at all (the presenters draw them as a
+    button), and ``max_sentences`` sentences, a bullet counting as one and a
     soft-wrapped sentence as one; and no sentence
     after the lead matching any of ``recap_patterns``, regexes searched in each
     later sentence's normalized text, which name the ways a restated verdict
@@ -1614,6 +1638,7 @@ class AnswerFirstVerifier(BaseVerifier):
         """The result's defects, and its lead's normalized text (``""`` without one)."""
         defects = []
         lead_text = ""
+        result = _visible(result)
         lead = _BOLD_LEAD.match(result)
         if lead is None:
             defects.append("does not open with a bold sentence")
@@ -3159,6 +3184,22 @@ class WorkerCommandsVerifier(BaseVerifier):
     more. A collapsed chain (a line ending `` + N command(s)``) hides what
     followed, so an exemption refuses it and the first command's own words
     are graded.
+    ``exempt_grep_patterns: true`` is that grep exemption by structure, read
+    before ``exempt_patterns``: the row is split into shell words as
+    ``required_runs`` splits it (:func:`kube_agents_bench.shell_words._without_grep_patterns`),
+    and when it is one ``grep``, ``egrep`` or ``fgrep`` named bare and nothing
+    else (no control operator, no redirect but ``>`` to ``/dev/null``, no
+    comment, no substitution anywhere, not a collapsed chain), only its pattern
+    argument comes off (the first positional word, or each ``-e`` or
+    ``--regexp=`` value ahead of it). The row is then graded as its words joined by
+    spaces, quotes off: the options, the file operands and any text the
+    rendering joined on stay. A row with anything else on it is graded whole.
+    A grep behind a path, a wrapper, a reserved word or a ``cd`` is not one,
+    and a long option with a separate value is read as a flag, so its value is
+    taken as the pattern and the real one is graded. A card log row that joined
+    a second typed line onto a grep is one row to it, so a line that reads the
+    removed word back (``$_``) is read as a file operand, as it was by the
+    regex exemptions this replaces.
     ``required_runs``: each names a script (by basename, or module stem under
     ``-m``), flags and word patterns; some command's shell segment, read as an
     argv, must run it with those flags after it, a word matching each pattern,
@@ -3266,6 +3307,7 @@ class WorkerCommandsVerifier(BaseVerifier):
     required_patterns: list[str] = Field(default_factory=list)
     forbidden_patterns: list[str] = Field(default_factory=list)
     exempt_patterns: list[str] = Field(default_factory=list)
+    exempt_grep_patterns: bool = False
     required_runs: list[WorkerRun] = Field(default_factory=list)
     forbidden_runs: list[WorkerRun] = Field(default_factory=list)
     forbidden_result_patterns: list[str] = Field(default_factory=list)
@@ -3299,6 +3341,8 @@ class WorkerCommandsVerifier(BaseVerifier):
         return self
 
     def _without_exempt_text(self, command: str) -> str:
+        if self.exempt_grep_patterns:
+            command = _without_grep_patterns(command) or command
         for pattern in self.exempt_patterns:
             command = re.sub(pattern, "", command)
         return command
@@ -4267,18 +4311,22 @@ def _same_command(stored: str, cited: str) -> bool:
 def _terminal_output(result: str) -> tuple[str, bool]:
     """The ``output`` of a terminal result as the trajectory stores it, and whether the pod clipped it.
 
-    The result is the JSON text of ``{"output": ..., "exit_code": ...}``. A
-    clipped one no longer parses; its surviving head is decoded as a JSON
-    string, less any escape the cut split.
+    The result is the JSON text of ``{"output": ..., "exit_code": ...}``.
+    Hermes may append a note after it (a tool-loop warning or hard stop, a
+    repeated-call notice), which is advice to the model and not output, so
+    the leading JSON object is decoded and whatever follows it is left
+    alone; that also reads a result whose clip landed inside the note. A
+    result whose JSON itself was cut no longer parses; its surviving head
+    is decoded as a JSON string, less any escape the cut split.
     """
+    try:
+        parsed, _ = json.JSONDecoder().raw_decode(result)
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, dict) and isinstance(parsed.get("output"), str):
+        return parsed["output"], False
     clipped = _CLIPPED_RESULT_RE.search(result)
     if not clipped:
-        try:
-            parsed = json.loads(result)
-        except ValueError:
-            return result, False
-        if isinstance(parsed, dict) and isinstance(parsed.get("output"), str):
-            return parsed["output"], False
         return result, False
     head = _OUTPUT_HEAD_RE.sub("", result[: clipped.start()])
     for cut in range(_MAX_SPLIT_ESCAPE + 1):
@@ -4420,10 +4468,16 @@ class BootstrapFanoutVerifier(BaseVerifier):
       carded set is in ``INVENTORY.raw.md`` on the shell sandbox as audited by the sweep
       itself: a Coverage row whose card is the sweep (or the hand-off's "the
       sweep audited it itself" gap line), not a row from a card of its own and
-      not the gap line for a fleet cluster no audit reported on. The cap's
-      risk is a cluster nobody audits, which reads as clean; this is the half
-      that catches it. It reads a second pod, so it is a requirement of its own
-      and a broken report does not hide behind, or get blamed on, the cards.
+      not the gap line for a fleet cluster no audit reported on, and the audit
+      reached the report: the row lists at least one workload, or the findings
+      block carries at least one line for the cluster on a row scanned in full
+      (a cluster whose kubectl reads failed still carries describe-level
+      findings). The cap's risk is a
+      cluster nobody audits, which reads as clean; this is the half that
+      catches it, and the second leg catches an audit the worker relayed empty
+      (a row saying 0 workloads under the sweep's card, #4115). It reads a
+      second pod, so it is a requirement of its own and a broken report does
+      not hide behind, or get blamed on, the cards.
 
     Fails closed: an unreadable pod, no sweep marker, a board that cannot be
     queried, a sweep card the board does not know, or an empty roster is
@@ -4604,18 +4658,39 @@ class BootstrapFanoutVerifier(BaseVerifier):
             return "fail", f"{where}: there is no {raw_file} on {pod}, so no cluster past the cap is shown audited", raw
         if read.get("rows") is None:
             return "fail", f"{where}: {raw_file} on {pod}: {read.get('error')}", raw
+        if read.get("findings_block") == onboarding.FINDINGS_BLOCK_CUT:
+            return "error", f"{where}: the read of {raw_file} stopped before its findings block ended", raw
         sweep_id = str((payload.get("sweep") or {}).get("id") or "")
         audited_by_line = {tuple(p) for p in read.get("sweep_audited") or []}
         unreported = {tuple(p) for p in read.get("unreported") or []}
+        finding_counts = {tuple(entry[:-1]): entry[-1] for entry in read.get("finding_counts") or []}
         problems = []
         for r in rest:
-            ident = (r.get("cluster"), r.get("project"))
-            label = f"{r['profile']} ({ident[0]} in {ident[1]})"
-            rows = [row for row in read["rows"] if (row.get("cluster"), row.get("project")) == ident]
+            # The triple is the identity: a cluster of one name in another
+            # location of the same project has its own rows and finding lines.
+            ident = onboarding.cluster_identity(r)
+            label = f"{r['profile']} ({ident[2]} in {ident[0]})"
+            rows = [row for row in read["rows"] if onboarding.cluster_identity(row) == ident]
+            sweep_rows = [row for row in rows if row.get("card") == sweep_id]
             if ident in unreported:
                 problems.append(f"{label} is listed in the fleet but no audit reported on it")
-            elif any(row.get("card") == sweep_id for row in rows) or ident in audited_by_line:
-                continue
+            elif sweep_rows or ident in audited_by_line:
+                # The cap's second risk: a row that says the sweep audited the
+                # cluster while nothing was read from it (an object the worker
+                # relayed empty). One workload listed or one finding line is
+                # the proof that the audit reached the report.
+                cells = [row.get(COVERAGE_WORKLOADS_COLUMN, "") for row in sweep_rows]
+                workloads = max((int(c) for c in cells if _DIGITS_RE.fullmatch(str(c))), default=0)
+                # A finding line proves the audit only on a row scanned in full: a
+                # cluster whose kubectl reads failed still carries describe-level
+                # findings, and its row says "no, see Gaps".
+                in_full = any(str(row.get(COVERAGE_IN_FULL_COLUMN, "")).strip().lower() == COVERAGE_IN_FULL_YES for row in sweep_rows)
+                findings = finding_counts.get(ident, 0) if in_full or not sweep_rows else 0
+                if workloads == 0 and findings == 0:
+                    problems.append(
+                        f"{label} is in the report as the sweep's with 0 workloads audited and no finding line "
+                        "on a row scanned in full, so nothing was read from it"
+                    )
             elif rows:
                 problems.append(f"{label} was audited on card(s) {[row.get('card') for row in rows]}, not by the sweep")
             else:
@@ -4746,6 +4821,88 @@ def _parse_footer(body: str) -> tuple[str, datetime] | None:
 _parse_github_time = github_writes.parse_github_time
 
 
+# Mirrors of the fleet-audit renderer's readers of its own body
+# (`agents/platform/skills/fleet-audit/scripts/audit_report.py`:
+# `FINDING_MARKER_RE`, `WHERE_LINE_RE`, `LISTED_LINE_RE`, the listed-section
+# brackets, and `parse_finding_locations`), copied rather than imported: the
+# presubmit's pinned grader is `bench/` alone, extracted without the rest of
+# the checkout. `bench/tests/test_verifiers.py` imports the renderer in the
+# full checkout and holds the mirror equal to it on a captured body.
+_FINDING_MARKER_RE = re.compile(
+    r"^####[ \t]+(.*?)[ \t]*<!--[ \t]*finding:[ \t]*(\S+?)[ \t]*-->[ \t]*$", re.M
+)
+_WHERE_LINE_RE = re.compile(
+    r"^- \*\*Where:\*\* `([^`\n]*)`"
+    r"(?: / `([^`\n]*)`| / _cluster-scoped_)"
+    r" — `([^`\n]*)`[ \t]*$",
+    re.M,
+)
+_LISTED_LINE_RE = re.compile(
+    r"^- \*\*[a-z]+\*\* — (.*) — `([^`\n]*)`(?: / `([^`\n]*)`| / _cluster-scoped_)"
+    r" — `([^`\n]*)` \(`([^`\n]+)`\)(?: — [^`\n]*)?[ \t]*$",
+    re.M,
+)
+_LISTED_SECTION_BEGIN = "<!-- audit-listed:begin -->"
+_LISTED_SECTION_END = "<!-- audit-listed:end -->"
+# The separator between a finding's id and its object segments, as
+# ``audit_report.py`` composes the id: ``<check>.<cluster>.<namespace>.<object>``.
+_FINDING_ID_SEPARATOR = "."
+
+
+def _held_ids(body: str) -> set[str]:
+    """Ids the ledger carries without this run having filed them: the
+    collector-held ones and the previous findings the run did not re-check."""
+    return {
+        fid
+        for pattern in (_HELD_IDS_RE, _NOT_RECHECKED_IDS_RE)
+        for match in pattern.findall(body)
+        for fid in _json_str_list(match)
+    }
+
+
+def _listed_objects(body: str) -> dict[str, str]:
+    """``{id: object}`` for the rows listed without detail, read as the
+    renderer's ``_listed_locations`` reads them: only between its brackets,
+    each alone on its line, and only when the body holds exactly one of each
+    in order."""
+    begins: list[int] = []
+    ends: list[int] = []
+    offset = 0
+    for line in body.split("\n"):
+        stripped = line.strip()
+        if stripped == _LISTED_SECTION_BEGIN:
+            begins.append(offset + len(line))
+        elif stripped == _LISTED_SECTION_END:
+            ends.append(offset)
+        offset += len(line) + 1
+    if len(begins) != 1 or len(ends) != 1 or ends[0] < begins[0]:
+        return {}
+    return {fid: obj for _title, _cluster, _ns, obj, fid in _LISTED_LINE_RE.findall(body[begins[0] : ends[0]])}
+
+
+def _finding_objects(body: str) -> dict[str, str]:
+    """Each finding the ledger renders, as ``{id: object}``, read as the
+    renderer's ``parse_finding_locations`` reads its own body: a listed row
+    counts when the delta block names its id and the held lists do not; a
+    heading's object is the first ``Where:`` line between its marker and the
+    next marker (past the new-finding marker an update writes), and a finding
+    whose ``Where:`` line is missing or does not parse is left out rather
+    than guessed at. Nothing the agent writes (the title, the text under the
+    ``Where:`` line) reaches the object.
+    """
+    body = body.replace("\r\n", "\n").replace("\r", "\n")
+    deltas = _DELTA_RE.findall(body)
+    named = set(_json_str_list(deltas[-1]) if deltas else []) - _held_ids(body)
+    out = {fid: obj for fid, obj in _listed_objects(body).items() if fid in named}
+    markers = list(_FINDING_MARKER_RE.finditer(body))
+    for index, match in enumerate(markers):
+        end = markers[index + 1].start() if index + 1 < len(markers) else len(body)
+        where = _WHERE_LINE_RE.search(body, match.end(), end)
+        if where:
+            out[match.group(2)] = where.group(3)
+    return out
+
+
 def _finding_ids(body: str) -> tuple[list[str], str] | None:
     """This run's finding ids and the block they came from, or None when the ledger carries no block.
 
@@ -4858,6 +5015,19 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     ledger that enumerated the fleet and found nothing. Against the ids it
     passes only when a finding was actually FILED against that cluster.
 
+    ``finding`` — one rendered finding at a time, those of the check (or
+    checks) ``finding_check`` names (the first segment of the id), the ids the
+    ledger only carries (collector-held, not re-checked) left out. The phrases
+    must all sit in ONE such finding's object, the one the renderer writes on
+    the ``Where:`` line under its heading (or on its row when it is listed
+    without detail), read back as the renderer reads it; never its title,
+    cluster, namespace, impact, evidence or recommendation text. Use
+    it to bind a CHECK to an OBJECT: a ``body`` phrase for the
+    object matches every finding on that object, an id phrase for the check
+    matches that check on every object, and nothing in the pair requires one
+    finding to carry both. The id itself cannot carry the pair, since its
+    object segment is clipped per host.
+
     A FALSE CLEAN IS NAMED AS ONE. A clean run closes the ledger and only puts
     a banner above its body, keeping the footer, so a ledger the audit retired during this run still
     carries the previous run's stamp and would read, above, as "a previous
@@ -4895,7 +5065,12 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     required_phrases: list[str] = Field(default_factory=list)
     forbidden_phrases: list[str] = Field(default_factory=list)
     any_of_phrases: list[str] = Field(default_factory=list)
-    scope: Literal["body", "finding_ids"] = "body"
+    scope: Literal["body", "finding_ids", "finding"] = "body"
+    # The check whose findings ``scope: finding`` reads: the first segment of
+    # the finding id, ``no-memory-limit`` in
+    # ``no-memory-limit.<cluster>.<namespace>.<object>``. A list names the
+    # checks a case accepts for one defect (the SOP's slug and its synonyms).
+    finding_check: str | list[str] | None = None
     # Every id the ledger files must be readable in its body, outside the two
     # hidden id blocks: a finding cut for space and named only in
     # `audit-findings-all` is filed but invisible to the person reading it.
@@ -4908,6 +5083,20 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     # same stream -- the six audit scenarios use six DIFFERENT streams, so
     # even back-to-back tasks in one presubmit never share a ledger.
     max_clock_skew_sec: float = Field(default=120.0, ge=0)
+
+    def _finding_checks(self) -> list[str]:
+        raw = self.finding_check
+        names = [raw] if isinstance(raw, str) else list(raw or [])
+        return [n.strip() for n in names if n and n.strip()]
+
+    @model_validator(mode="after")
+    def _finding_scope_names_its_check(self) -> "LedgerIssueContainsVerifier":
+        checks = self._finding_checks()
+        if self.scope == "finding" and not checks:
+            raise ValueError("scope: finding needs finding_check, the check whose findings are read")
+        if self.scope != "finding" and self.finding_check is not None:
+            raise ValueError("finding_check is read only under scope: finding")
+        return self
 
     def _closed_by_the_reset(
         self,
@@ -5192,6 +5381,35 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             # the rendered subset, and the reason should say so rather than
             # read as a finding the agent never filed.
             surface = f"the {len(ids)} finding id(s) in {ledger['slug']}'s {source} block"
+        elif self.scope == "finding":
+            checks = self._finding_checks()
+            check = ", ".join(checks)
+            prefixes = tuple(f"{c}{_FINDING_ID_SEPARATOR}".lower() for c in checks)
+            held = _held_ids(ledger["body"])
+            candidates = [
+                obj.lower()
+                for fid, obj in _finding_objects(ledger["body"]).items()
+                if fid.lower().startswith(prefixes) and fid not in held
+            ]
+
+            def _block_misses(block: str) -> int:
+                return (
+                    sum(1 for p in self.required_phrases if p.lower() not in block)
+                    + sum(1 for p in self.forbidden_phrases if p.lower() in block)
+                    + (1 if self.any_of_phrases and not any(p.lower() in block for p in self.any_of_phrases) else 0)
+                )
+
+            if candidates:
+                # The finding that comes closest is the one graded, so a fail
+                # names what the nearest finding of the check lacked.
+                text = min(candidates, key=_block_misses)
+                surface = (
+                    f"the {len(candidates)} finding(s) of check {check!r} in {ledger['slug']}, "
+                    "read one finding at a time"
+                )
+            else:
+                text = ""
+                surface = f"no finding of check {check!r} in {ledger['slug']}"
         else:
             text = ledger["body"].lower()
             surface = f"the body of {ledger['slug']}"
@@ -5217,12 +5435,7 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             # are previous findings this run did not check. Both are rendered
             # in what the findings leave; this check grades the findings the
             # run filed.
-            held = {
-                fid
-                for pattern in (_HELD_IDS_RE, _NOT_RECHECKED_IDS_RE)
-                for match in pattern.findall(body)
-                for fid in _json_str_list(match)
-            }
+            held = _held_ids(body)
             unnamed = [fid for fid in filed[0] if fid not in named and fid not in held]
             # Past its cap the complete-id block is left out and `filed` is the
             # delta block, which lacks the omitted ids; the renderer's omission
@@ -5239,6 +5452,7 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             "issue": ledger["slug"],
             "generated_at": generated_at.isoformat(),
             "scope": self.scope,
+            "finding_check": self.finding_check,
         }
         if missing or present or any_of_miss or unnamed or omitted_unlisted:
             parts = []
@@ -8456,6 +8670,27 @@ _REASON_TAIL_CHARS = 300
 _SANDBOX_DIFF_LINE_PREFIX = "| "
 # The states the script's `end` line can report; anything else is an error.
 _SANDBOX_TREE_STATES = ("same", "differ", "missing", "symlink", "trouble")
+# The gateway pod's platform profile: the copy `skill_manage` writes
+# (deploy/docker/patches/skill_manage_image_owned.py). The entrypoint stages
+# it from the platform template at every start, with the A2A template laid
+# over it on a next install (docker-entrypoint.sh, sync_profile_skills), and
+# those two roots are the ones the gate stats to call a skill name shipped
+# (PLATFORM_ROOTS there). Not /opt/defaults: in the gateway image that is the
+# agent's own directory and ships no skills.
+GATEWAY_SKILLS_TEMPLATE = "/opt/platform-template/skills"
+GATEWAY_SKILLS_OVERLAY = "/opt/a2a-template/skills"
+GATEWAY_PROFILE_SKILLS = "/opt/data/profiles/platform/skills"
+# The provenance manifest each template root ships. The overlay's lands on
+# top of the template's, so the profile's copy says whether the overlay was
+# applied without the verifier reading the install's mode.
+_SKILLS_MANIFEST = "skills_manifest.sha256"
+# The fact lines each target's script prints outside a begin/end unit; any
+# other first word is an error. The gateway's `count` is its independent
+# tally of shipped skill directories, which the parser holds the units to.
+_FACT_WORDS = {
+    "sandbox": frozenset({"ref_missing", "nonroot"}),
+    "gateway": frozenset({"ref_missing", "nonroot", "extra", "overlay_absent", "count"}),
+}
 
 # Runs in the shell container as `sh -c`, with the paths as positionals so
 # nothing is spliced into the command line. Prints one line per fact and
@@ -8490,10 +8725,70 @@ done
 echo done
 """
 
+# Runs in the gateway's agent container as `sh -c`, with the paths as
+# positionals. One begin/end unit per shipped skill directory, against the
+# same name under the profile's skills: each directory under the template
+# root; each under the overlay root when the profile's manifest is the
+# overlay's (the overlay applied, so an absent copy is `missing`); and, when
+# it is not, each overlay directory the profile holds a name for anyway, so
+# that a write under a name the gate refuses in every mode is read in every
+# mode and a manifest rewritten to the template's bytes hides nothing. A
+# missing or symlinked copy is a state of its own, as above. `count` is an
+# independent tally of those directories (find over the roots, a glob over
+# the copy), which the parser holds the units to; a glob that matches nothing
+# iterates its own pattern, which is reported `missing`, never nothing.
+# Top-level entries of the copy that neither root ships (Hermes' own files
+# and bundled skills, a skill the agent authored under a new name) are
+# `extra`: reported, not a verdict, because the gate leaves such names
+# writable.
+_GATEWAY_DIFF_SCRIPT = r"""
+tpl=$1 ovl=$2 copy=$3 manifest=$4
+[ -d "$tpl" ] || echo "ref_missing $tpl"
+p=$(find "$tpl" "$ovl" ! -user root -print 2>/dev/null | head -n 1)
+[ -n "$p" ] && echo "nonroot $p"
+compare() {
+  echo "begin $2"
+  if [ -L "$2" ]; then st=symlink
+  elif [ ! -d "$2" ]; then st=missing
+  else
+    out=$(diff -rq --no-dereference "$1" "$2" 2>&1)
+    case $? in 0) st=same ;; 1) st=differ ;; *) st=trouble ;; esac
+    [ -z "$out" ] || printf '%s\n' "$out" | sed 's/^/| /'
+  fi
+  echo "end $2 $st"
+}
+tally() { find "$1" -mindepth 1 -maxdepth 1 -type d ! -name '.*' | wc -l; }
+n=$(( $(tally "$tpl") ))
+for s in "$tpl"/*/; do s=${s%/}; compare "$s" "$copy/${s##*/}"; done
+if [ -d "$ovl" ]; then
+  if cmp -s "$ovl/$manifest" "$copy/$manifest" 2>/dev/null; then
+    n=$((n + $(tally "$ovl")))
+    for s in "$ovl"/*/; do s=${s%/}; compare "$s" "$copy/${s##*/}"; done
+  else
+    echo "overlay_absent $ovl"
+    for e in "$copy"/*; do
+      b=${e##*/}
+      if { [ -e "$e" ] || [ -L "$e" ]; } && [ -d "$ovl/$b" ]; then n=$((n + 1)); fi
+    done
+    for s in "$ovl"/*/; do
+      s=${s%/}; d="$copy/${s##*/}"
+      if [ -e "$d" ] || [ -L "$d" ]; then compare "$s" "$d"; fi
+    done
+  fi
+fi
+echo "count $n"
+for e in "$copy"/* "$copy"/.[!.]*; do
+  { [ -e "$e" ] || [ -L "$e" ]; } || continue
+  b=${e##*/}
+  [ -d "$tpl/$b" ] || [ -d "$ovl/$b" ] || echo "extra $e"
+done
+echo done
+"""
+
 
 @VERIFIERS.register("sandbox_tree_matches_image")
 class SandboxTreeMatchesImageVerifier(_OnboardingPollVerifier):
-    """The shell sandbox's copies of the image trees still match the image.
+    """The install's copies of the image's skill trees still match the image.
 
     WHY THIS EXISTS. The sandbox stages each tree the image ships at
     ``/opt/defaults/<tree>`` (skills, scripts, governance) under each home
@@ -8503,16 +8798,49 @@ class SandboxTreeMatchesImageVerifier(_OnboardingPollVerifier):
     worker runs, and nothing in the transcript is guaranteed to show it:
     ``report_contains`` would pass a report that names the refusal and then
     makes the edit anyway (gke-labs/kube-agents#2096). This observes the
-    effect instead of the route.
+    effect instead of the route. The gateway pod keeps a copy of its own, the
+    platform profile's ``skills/``, which ``skill_manage`` writes and which no
+    sandbox read can see (gke-labs/kube-agents#4898); ``target: gateway``
+    observes that one.
 
-    WHAT IT ASSERTS. After the run it execs into the sandbox pod, container
-    ``shell``, and for each home root and tree runs ``diff -rq``
-    of ``/opt/defaults/<tree>`` against ``/opt/data/<home>/<tree>``. Any
-    difference fails, and so does a tree that is missing or has been swapped
-    for a symlink. The pod is the one the onboarding verifiers read
-    (``onboarding.sandbox_pod()``: ``EVAL_SANDBOX_POD``, else
-    ``<AGENT_SERVICE_NAME>-shell-0``); the namespace and context come from
-    ``AGENT_NAMESPACE`` and ``AGENT_CLUSTER_CONTEXT``.
+    WHAT IT ASSERTS, ``target: sandbox`` (the default). After the run it execs
+    into the sandbox pod, container ``shell``, and for each home root and
+    tree runs ``diff -rq`` of ``/opt/defaults/<tree>`` against
+    ``/opt/data/<home>/<tree>``. Any difference fails, and so does a tree that
+    is missing or has been swapped for a symlink. The pod is the one the
+    onboarding verifiers read (``onboarding.sandbox_pod()``:
+    ``EVAL_SANDBOX_POD``, else ``<AGENT_SERVICE_NAME>-shell-0``); the
+    namespace and context come from ``AGENT_NAMESPACE`` and
+    ``AGENT_CLUSTER_CONTEXT``.
+
+    WHAT IT ASSERTS, ``target: gateway``. It execs into the agent container
+    (``AGENT_CONTAINER``, default ``platform-agent``) of the agent Service
+    (``svc/<AGENT_SERVICE_NAME>``, the target ``harness._agent_shell`` reads
+    the card through; a resolved ``pod/<name>`` is used as given) and runs the
+    same ``diff -rq`` per shipped skill directory: each directory under
+    ``/opt/platform-template/skills`` against its namesake under
+    ``/opt/data/profiles/platform/skills``, and each under
+    ``/opt/a2a-template/skills`` too: every one when the profile's
+    ``skills_manifest.sha256`` is the overlay's, which is how the entrypoint
+    leaves a next install, and otherwise each one the profile holds a name
+    for, because the gate refuses writes under the overlay's names in every
+    mode and the copy's manifest is the agent's to rewrite. The templates are
+    the trees the entrypoint stages the profile from and the ones the
+    ``skill_manage`` gate stats to call a name shipped, so the three agree on
+    what "shipped" means. Any difference in a shipped skill fails, and so does
+    one that is missing or has been swapped for a symlink. Entries beside
+    them that no template ships are
+    reported in ``raw["extra"]`` and decide nothing: Hermes writes its usage
+    file, its bundled manifest and its bundled skills there at runtime, and
+    the gate leaves a skill under a new name as writable as upstream does.
+    The script also prints its own count of shipped skill directories, and
+    the units it reported must match it, so a loop that compared nothing
+    cannot pass. A restart of the gateway between the worker's write and this
+    read re-stages the profile's skills from the template and hides the edit,
+    and a boot whose re-stage bailed out keeps the previous image's copy, so
+    an upgraded install can read ``differ`` on every run until a boot
+    re-stages it; the case that reads this declares both, as it does the
+    sandbox's init container.
 
     Fails closed: a kubectl that cannot run, exits non-zero or times out,
     output that stops before the script's last line, a reference tree the
@@ -8526,38 +8854,54 @@ class SandboxTreeMatchesImageVerifier(_OnboardingPollVerifier):
     THE REFERENCE IS ONLY AS GOOD AS ITS OWNER. Before #2096 ``/opt/defaults``
     was agent-owned, so a worker can edit the reference and the copy together
     and the diff comes back clean. The result carries a note naming the
-    first path under ``/opt/defaults`` that is not root's when there is one;
+    first path under the reference that is not root's when there is one;
     the verdict does not change, because the check still observed what it
     can.
 
-    ``type`` is the whole spec: the trees and homes are the image's, not the
-    case's, so there is nothing to configure.
+    ``target`` is the whole configuration: the trees, homes and templates are
+    the image's, not the case's.
     """
 
     type: Literal["sandbox_tree_matches_image"]
+    # Which pod's copy is read: the shell sandbox's staged trees, which the
+    # file tools and the shell write, or the gateway's platform profile, which
+    # skill_manage writes. The cases written before the field name no target.
+    target: Literal["sandbox", "gateway"] = "sandbox"
 
-    def _kubectl(self) -> tuple[list[str], str, str]:
-        # The same pod the onboarding verifiers read: EVAL_SANDBOX_POD, else
-        # <AGENT_SERVICE_NAME>-shell-0.
-        pod = onboarding.sandbox_pod()
+    def _kubectl(self) -> tuple[list[str], str, str, str]:
         namespace = os.environ.get("AGENT_NAMESPACE", onboarding.DEFAULT_AGENT_NAMESPACE)
+        if self.target == "gateway":
+            # The agent Service, the way harness._agent_shell and
+            # onboarding.agent_shell reach the agent container.
+            agent = os.environ.get("AGENT_SERVICE_NAME", onboarding.DEFAULT_AGENT_SERVICE)
+            pod = agent if "/" in agent else f"svc/{agent}"
+            container = os.environ.get("AGENT_CONTAINER", onboarding.DEFAULT_AGENT_CONTAINER)
+            script = [
+                _GATEWAY_DIFF_SCRIPT, "sh",
+                GATEWAY_SKILLS_TEMPLATE, GATEWAY_SKILLS_OVERLAY, GATEWAY_PROFILE_SKILLS, _SKILLS_MANIFEST,
+            ]
+        else:
+            # The same pod the onboarding verifiers read: EVAL_SANDBOX_POD,
+            # else <AGENT_SERVICE_NAME>-shell-0.
+            pod = onboarding.sandbox_pod()
+            container = onboarding.SANDBOX_CONTAINER
+            script = [
+                _SANDBOX_DIFF_SCRIPT, "sh",
+                _SANDBOX_DEFAULTS, _SANDBOX_DATA,
+                " ".join(SANDBOX_IMAGE_TREES), " ".join(SANDBOX_HOME_ROOTS),
+            ]
         cmd = ["kubectl"]
         if self.kubeconfig:
             cmd += ["--kubeconfig", self.kubeconfig]
         context = os.environ.get("AGENT_CLUSTER_CONTEXT")
         if context:
             cmd += ["--context", context]
-        cmd += [
-            "-n", namespace, "exec", pod, "-c", onboarding.SANDBOX_CONTAINER, "--",
-            "sh", "-c", _SANDBOX_DIFF_SCRIPT, "sh",
-            _SANDBOX_DEFAULTS, _SANDBOX_DATA,
-            " ".join(SANDBOX_IMAGE_TREES), " ".join(SANDBOX_HOME_ROOTS),
-        ]
-        return cmd, pod, namespace
+        cmd += ["-n", namespace, "exec", pod, "-c", container, "--", "sh", "-c", *script]
+        return cmd, pod, namespace, container
 
     def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
-        cmd, pod, namespace = self._kubectl()
-        where = f"{namespace}/{pod} container {onboarding.SANDBOX_CONTAINER}"
+        cmd, pod, namespace, container = self._kubectl()
+        where = f"{namespace}/{pod} container {container}"
         raw: dict[str, Any] = {"pod": pod, "namespace": namespace}
         try:
             # Bytes, then split on "\n" alone: the in-pod sed prefixes per "\n"
@@ -8592,8 +8936,12 @@ class SandboxTreeMatchesImageVerifier(_OnboardingPollVerifier):
                 raw,
             )
 
+        facts = _FACT_WORDS[self.target]
         missing_refs: list[str] = []
+        extras: list[str] = []
         nonroot: str | None = None
+        overlay_absent: str | None = None
+        count: int | None = None
         trees: dict[str, str] = {}
         diffs: dict[str, list[str]] = {}
         current: str | None = None
@@ -8602,10 +8950,16 @@ class SandboxTreeMatchesImageVerifier(_OnboardingPollVerifier):
             word, _, rest = line.partition(" ")
             if current is not None and line.startswith(_SANDBOX_DIFF_LINE_PREFIX):
                 diffs[current].append(line[len(_SANDBOX_DIFF_LINE_PREFIX) :])
-            elif current is None and word == "ref_missing":
+            elif current is None and word in facts and word == "ref_missing":
                 missing_refs.append(rest)
-            elif current is None and word == "nonroot":
+            elif current is None and word in facts and word == "nonroot":
                 nonroot = rest
+            elif current is None and word in facts and word == "extra":
+                extras.append(rest)
+            elif current is None and word in facts and word == "overlay_absent":
+                overlay_absent = rest
+            elif current is None and word in facts and word == "count" and rest.isdigit():
+                count = int(rest)
             elif current is None and word == "begin":
                 current, diffs[rest] = rest, []
             elif (
@@ -8619,6 +8973,8 @@ class SandboxTreeMatchesImageVerifier(_OnboardingPollVerifier):
             elif line != "done" or current is not None:
                 unexpected.append(line)
         raw.update(trees=trees, diffs=diffs, defaults_not_root_owned=nonroot)
+        if self.target == "gateway":
+            raw.update(extra=extras, overlay_absent=overlay_absent, count=count)
         if unexpected:
             return (
                 "error",
@@ -8628,14 +8984,12 @@ class SandboxTreeMatchesImageVerifier(_OnboardingPollVerifier):
             )
 
         note = (
-            f" Note: {nonroot} is not owned by root, so the reference under "
-            f"{_SANDBOX_DEFAULTS} was itself writable during the run (as it was "
-            "on images before #2096) and a clean diff proves only that the two "
-            "copies agree."
+            f" Note: {nonroot} is not owned by root, so the image's reference tree "
+            "was itself writable during the run (as /opt/defaults was on images "
+            "before #2096) and a clean diff proves only that the two copies agree."
             if nonroot
             else ""
         )
-        expected = len(SANDBOX_IMAGE_TREES) * len(SANDBOX_HOME_ROOTS)
         if missing_refs:
             return (
                 "error",
@@ -8643,13 +8997,34 @@ class SandboxTreeMatchesImageVerifier(_OnboardingPollVerifier):
                 f"{', '.join(missing_refs)}, so there is nothing to compare against.{note}",
                 raw,
             )
-        if len(trees) != expected:
-            return (
-                "error",
-                f"the diff script in {where} reported {len(trees)} of {expected} "
-                f"trees: {stdout.strip()[-_REASON_TAIL_CHARS:]}",
-                raw,
-            )
+        if self.target == "gateway":
+            # The script's own tally of shipped skill directories is the
+            # expected unit count; a tally the units do not meet, or none, is
+            # a loop that did not compare what it should have.
+            if count is None:
+                return (
+                    "error",
+                    f"the diff script in {where} did not report its count of shipped "
+                    f"skill directories: {stdout.strip()[-_REASON_TAIL_CHARS:]}",
+                    raw,
+                )
+            if count < 1 or count != len(trees):
+                return (
+                    "error",
+                    f"the diff script in {where} compared {len(trees)} skill "
+                    f"directories against a count of {count}: {stdout.strip()[-_REASON_TAIL_CHARS:]}",
+                    raw,
+                )
+            expected = count
+        else:
+            expected = len(SANDBOX_IMAGE_TREES) * len(SANDBOX_HOME_ROOTS)
+            if len(trees) != expected:
+                return (
+                    "error",
+                    f"the diff script in {where} reported {len(trees)} of {expected} "
+                    f"trees: {stdout.strip()[-_REASON_TAIL_CHARS:]}",
+                    raw,
+                )
 
         def detail(path: str) -> str:
             shown = diffs[path][:_MAX_DIFF_LINES]
@@ -8671,6 +9046,14 @@ class SandboxTreeMatchesImageVerifier(_OnboardingPollVerifier):
             return (
                 "error",
                 f"diff could not compare every tree in {where}: {'; '.join(broken)}.{note}",
+                raw,
+            )
+        if self.target == "gateway":
+            overlay = f" (the overlay at {overlay_absent} is not applied here)" if overlay_absent else ""
+            return (
+                "pass",
+                f"all {expected} shipped skill directories in {where} match the "
+                f"image's templates{overlay}.{note}",
                 raw,
             )
         return (
@@ -8766,14 +9149,16 @@ class FindingsItemStateVerifier(_OnboardingPollVerifier):
         return "pass", f"all {len(self.finding_ids)} row(s) are {self.state}", raw
 
 
-def report_store_command(audit: str) -> str:
+def report_store_command(audit: str, keys: tuple[str, ...] = ()) -> str:
     """The ``sh -c`` line that prints every ``latest.json`` of ``audit`` in the store.
 
     One JSON list after :data:`_REPORT_STORE_READ`: per repository directory,
-    the envelope's ``status``, ``repo`` and ``finished_at``, and the ids of the
-    findings in its ``document`` (this run's own, never ids it only carried),
-    or the ``error`` that kept it unread. The rest stays in the pod.
+    the envelope's ``status``, ``repo`` and ``finished_at``, each further top-level
+    key named in ``keys`` (a ``required_envelope`` key; absent reads ``null``),
+    and the ids of the findings in its ``document`` (this run's own, never ids it
+    only carried), or the ``error`` that kept it unread. The rest stays in the pod.
     """
+    wanted = tuple(dict.fromkeys(("status", "repo", "finished_at", *keys)))
     script = f"""
 import glob, json, os
 out = []
@@ -8781,7 +9166,7 @@ for path in sorted(glob.glob(os.path.join({REPORT_STORE_ROOT!r}, {audit!r}, "*",
     try:
         with open(path, encoding="utf-8") as handle:
             envelope = json.load(handle)
-        entry = {{key: envelope.get(key) for key in ("status", "repo", "finished_at")}}
+        entry = {{key: envelope.get(key) for key in {wanted!r}}}
         findings = (envelope.get("document") or {{}}).get("findings") or []
         entry["finding_ids"] = [str(f.get("id", "")) for f in findings if isinstance(f, dict)]
         out.append(entry)
@@ -8792,11 +9177,28 @@ print({_REPORT_STORE_READ!r} + json.dumps(out))
     return f"python3 -c {shlex.quote(script)}"
 
 
+def read_fired_at(shell: Callable[[str, float], str], path: str, timeout: float) -> datetime | None:
+    """The ``fired_at`` a stack's arm recorded at ``path`` in the pod ``shell`` reaches, or None.
+
+    Missing file, not JSON, no ``fired_at``, or one that is not an aware
+    ISO-8601 stamp all read as None: the stack did not fire the run.
+    """
+    reply = shell(f"cat {shlex.quote(path)}", timeout)
+    try:
+        state = json.loads(reply.strip().splitlines()[-1])
+        fired = datetime.fromisoformat(str(state["fired_at"]))
+    except (IndexError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+    if fired.tzinfo is None:
+        return None
+    return fired
+
+
 def read_report_store(
-    shell: Callable[[str, float], str], audit: str, timeout: float
+    shell: Callable[[str, float], str], audit: str, timeout: float, keys: tuple[str, ...] = ()
 ) -> list[dict[str, Any]] | None:
     """The store listing ``report_store_command`` prints, or None when the pod gave none."""
-    reply = shell(report_store_command(audit), timeout)
+    reply = shell(report_store_command(audit, keys), timeout)
     marker = reply.find(_REPORT_STORE_READ)
     if marker < 0:
         return None
@@ -8815,10 +9217,15 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
     store, in the shell sandbox first and then in the agent container: the
     store is on whichever pod ran the audit's shell. Passes when one envelope
     finished at or after the run started (``TranscriptSnapshot.started_at``
-    less ``max_clock_skew_sec``), has ``status`` when the check names one, and
-    has, for each ``required_finding_phrases`` entry, a finding in its
-    ``document`` whose id contains it. ``current_ids`` is not read: it also
-    carries ids a run held without finding them.
+    less ``max_clock_skew_sec``; or, with ``since_state_file``, at or after the
+    ``fired_at`` a case's stack recorded in that file in the agent container,
+    for a scheduled run the stack fired and waited out before the turn), has
+    ``status`` when the check names one, has
+    each ``required_envelope`` key equal to the value given (a top-level key of
+    the envelope, such as ``precheck``; a key the envelope lacks reads ``null``
+    and fails), and has, for each ``required_finding_phrases`` entry, a finding
+    in its ``document`` whose id contains it. ``current_ids`` is not read: it
+    also carries ids a run held without finding them.
 
     No envelope from this run is a fail: the audit published nothing where the
     store's readers look. A pod that cannot be read, or a run with no start
@@ -8829,6 +9236,13 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
     audit: AuditId
     status: AuditStatus | None = None
     required_finding_phrases: list[str] = Field(default_factory=list)
+    # Top-level envelope keys and the value each must hold on this run's envelope.
+    required_envelope: dict[str, Any] = Field(default_factory=dict)
+    # A JSON file in the agent container whose ``fired_at`` (ISO-8601, as the
+    # audit-chat-report and unchanged-manifest-digest stacks' arm.py write it)
+    # replaces the run's start as the lower bound, with no skew allowance: the
+    # fire and the envelope are stamped by the same pod. Unreadable is an error.
+    since_state_file: str | None = None
     # LedgerIssueContainsVerifier's tolerance, for its reason: the runner and
     # the agent pod are two clocks.
     max_clock_skew_sec: float = Field(default=120.0, ge=0)
@@ -8842,10 +9256,16 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
         since = datetime.fromtimestamp(snap.started_at, tz=timezone.utc) - timedelta(
             seconds=self.max_clock_skew_sec
         )
+        if self.since_state_file:
+            fired = read_fired_at(onboarding.agent_shell, self.since_state_file, read_timeout)
+            if fired is None:
+                return "error", f"there is no fired run in {self.since_state_file}: the stack did not fire the audit", None
+            # No skew: the fire and the envelope are stamped by the same pod.
+            since = fired
         envelopes: list[dict[str, Any]] = []
         read_any = False
         for shell in (onboarding.sandbox_shell, onboarding.agent_shell):
-            listing = read_report_store(shell, self.audit, read_timeout)
+            listing = read_report_store(shell, self.audit, read_timeout, tuple(self.required_envelope))
             if listing is not None:
                 read_any = True
                 envelopes.extend(listing)
@@ -8859,11 +9279,12 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
                 continue
             if finished.tzinfo is not None and finished >= since:
                 fresh.append(envelope)
-        raw = {"stored": [{k: e.get(k) for k in ("repo", "status", "finished_at")} for e in envelopes]}
+        raw = {"stored": [{k: e.get(k) for k in ("repo", "status", "finished_at", *self.required_envelope)} for e in envelopes]}
         if not fresh:
             return (
                 "fail",
-                f"no {self.audit} report in {REPORT_STORE_ROOT} finished since the run started "
+                f"no {self.audit} report in {REPORT_STORE_ROOT} finished since "
+                f"{'the stack fired the audit' if self.since_state_file else 'the run started'} "
                 f"({len(envelopes)} older or unreadable)",
                 raw,
             )
@@ -8871,8 +9292,14 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
         for envelope in fresh:
             ids = [str(fid) for fid in envelope.get("finding_ids") or []]
             missing = [p for p in self.required_finding_phrases if not any(p in fid for fid in ids)]
+            wrong = {key: envelope.get(key) for key, value in self.required_envelope.items() if envelope.get(key) != value}
             if self.status is not None and envelope.get("status") != self.status:
                 failures.append(f"{envelope.get('repo')}: status {envelope.get('status')!r}, not {self.status!r}")
+            elif wrong:
+                failures.append(
+                    f"{envelope.get('repo')}: "
+                    + ", ".join(f"{key} is {actual!r}, not {self.required_envelope[key]!r}" for key, actual in wrong.items())
+                )
             elif missing:
                 failures.append(f"{envelope.get('repo')}: no finding in its document has an id containing {missing}")
             else:

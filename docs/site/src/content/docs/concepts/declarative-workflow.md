@@ -14,6 +14,16 @@ The Platform Agent's `SOUL.md` forbids direct infrastructure mutations. When the
 - **Compatibility with your existing GitOps.** ArgoCD, Flux, RootSync — whichever reconciler you already run applies the merged change. The agent doesn't compete with your reconciler.
 - **Least privilege on the cluster.** The agent's Kubernetes identity cannot mutate workloads or cluster state — its only write grant is a leader-election housekeeping Role confined to its own namespace — so even a misled persona cannot change a cluster through the Kubernetes API. Its GCP identity is a separate question, governed by the install-time permission set (`read-only` by default; `custom`, where you name every role, is the only way to widen it). See [Security &amp; IAM](/kube-agents/reference/security-and-iam/#what-the-agent-can-and-cannot-do).
 
+## Write scope shapes a diagnosis
+
+The repositories in [`spec.integration.repositories`](/kube-agents/operator/platformagent-crd/#specintegration) set two boundaries, and they are not the same. A `gitops` or `managed` repository is where a pull request can go. A `context` repository is where the agent may read to find out where a value comes from. So is a public repository that a managed declaration points at: a Flux `GitRepository`, an Argo CD `source.repoURL`, a Terraform module `source`. The agent reads such a repository with the `inspect-repository` skill, through the credential broker, with a context repository's read-only credential or none. Nothing writes there: the broker [refuses a context repository every write](/kube-agents/operator/platformagent-crd/#specintegrationrepositories).
+
+What you declare therefore decides which faults the agent can fix and which it can only locate. A tenant workload is often declared in a repository the install does not manage. A Helm release's values and templates live in the chart's repository. A shared default lives in a module. The agent traces the value to the file that defines it. When that file is outside its write scope, it reports the repository, file, line and change, and opens no pull request.
+
+It does not substitute an edit it can make for the one that is needed: an override of a shared default, a post-render patch, a second copy of the object. That edit reaches a different layer, or none. Declare the repository that holds the fix as `context` if it is private, so the agent can read it. Declare it as `managed` only if you want pull requests there.
+
+Two more rules follow from the same boundary. A pull request that changes a value every environment inherits names the consumers the agent checked and why each wants the new value. Otherwise it scopes the change to the affected cluster's overlay. And a credential the agent lacks is treated differently from one it must never hold. A repository that is not registered is reported as a gap to close. A SOPS, GPG, age or KMS decryption key is never requested, imported or waited for. The agent reads an encrypted file as metadata, and the decrypted edit stays with a person who holds the key.
+
 ## The `submit-suggestion` skill
 
 Source: [`agents/platform/skills/submit-suggestion/`](https://github.com/gke-labs/kube-agents/tree/main/agents/platform/skills/submit-suggestion).
@@ -87,7 +97,7 @@ The ledger issue and every remediation pull request (a merge request on GitLab) 
 
 ### Tier 1 — the ledger issue
 
-Each audit stream owns exactly one **GitHub issue**, rewritten in place on every run and labelled `agent:audit`, `audit:<audit-id>`, and `severity:<highest severity present>`. Its title is generated (`[audit] <human name> — <n> findings (<c> critical)`). Its body carries the scope table, a findings table with a state column whose every row links to the finding it names, and per-finding detail. The detail is evidence, impact, the finding's own id, recommendation, remediation, and a link to that finding's remediation PR where one exists.
+Each audit stream owns exactly one **GitHub issue** per install, rewritten in place on every run and labelled `agent:audit`, `audit:<audit-id>`, `audit-scope:<slug>` (the install's host cluster, from `spec.harness`) and `severity:<highest severity present>`. Its title is generated (`[audit] <human name> (<host cluster>) — <n> findings (<c> critical)`). Its body carries the scope table, a findings table with a state column whose every row links to the finding it names, and per-finding detail. The detail is evidence, impact, the finding's own id, recommendation, remediation, and a link to that finding's remediation PR where one exists.
 
 A run that finds nothing **closes the issue as completed**, and closes any remediation PRs still open for the stream. That is the point of the shape: a closed issue reads as _done_.
 
@@ -100,9 +110,9 @@ Unless the run could not see the whole fleet. A cluster that was skipped, or one
 
 #### Where a manual fix belongs
 
-A `manual` finding from the obtainability, compliance and AI security audits and the fleet-wide cost analysis gets notes that say where to make the fix. A `manifest` or `gcloud` finding gets no such note. Neither does a finding whose fix an open remediation pull request carries: a pull request whose delta block names the finding, or one on the branch the audit promised for the fix. A pull request opened by hand, outside the audit, does not count, and the row keeps its notes.
+A `manual` finding from the obtainability, compliance and AI security audits and the fleet-wide cost analysis gets notes that say where to make the fix. A `manifest` or `gcloud` finding gets no such note (the [Config Connector paragraph](#when-config-connector-is-not-applying-a-file) is a different note). Neither does a finding whose fix an open remediation pull request carries: a pull request whose delta block names the finding, or one on the branch the audit promised for the fix. A pull request opened by hand, outside the audit, does not count, and the row keeps its notes.
 
-The notes come from the audit's collector, which reads the GitOps repository and the live object. You configure nothing beyond the GitOps repository. Context repositories are not read. A standard install reads the repository in content mode: the shell sandbox has no clone, so the collector copies the repository's `.yaml` and `.yml` files, and the files named `Kustomization`, through the [credential broker](/kube-agents/reference/credential-isolation/). The broker holds the repository for the sandbox.
+The notes come from the audit's collector, which reads the GitOps repository and the live object. You configure nothing beyond the GitOps repository. The collector does not read context repositories. A standard install reads the repository in content mode: the shell sandbox has no clone, so the collector copies the repository's `.yaml` and `.yml` files, and the files named `Kustomization`, through the [credential broker](/kube-agents/reference/credential-isolation/). The broker sends one revision of the repository and keeps no copy of it.
 
 The collector writes no location note when:
 
@@ -144,6 +154,36 @@ _(Reconciled by the Argo CD Application `web`. The next sync or upgrade can reve
 For a Kustomize overlay the release note says "the Kustomize overlay" in place of "the chart release". When the namespace directory is a local Kustomize root (the second source in rule 3), its note also says to list the new file in the `resources:` of that root. When it is the directory for the whole cluster (the third source), the note says "A new object for this cluster" and that a namespaced object there must set `metadata.namespace`.
 
 A note shows a path or a name only when it has letters, digits and `_./-` and is not longer than 512 characters. It must also not look like a credential to the redaction of the stored findings (for example, `sk-` in `task-` with 32 or more characters after it). Another path gives no location note. Another reconciler, or one that is not one of the forms above, shows as "a controller whose name the audit does not show". The notes go in a paragraph of their own below the finding's remediation text.
+
+#### When Config Connector is not applying a file
+
+A `manifest` fix that edits a Config Connector declaration changes the cloud resource only when Config Connector applies that object. When the controller cannot apply it, the pull request merges and nothing changes. So the collectors of the drift, patch readiness, stockout and compliance audits read Config Connector on each cluster they sweep, and record each object whose `Ready` condition is `False`, with the reason the controller gives. The read finds the Config Connector kinds through the API server's discovery, then lists them, a few kinds at a time. The compliance collector lists every kind; the drift, patch readiness and stockout collectors list only `ContainerCluster` and `ContainerNodePool`, the kinds their findings can own.
+
+The compliance collector always reads Config Connector, because its own check needs the read. The drift, patch readiness and stockout collectors read it when the audit's SOP command passes `--config-connector`, or while an audit run of their stream is in flight, scheduled or on demand. A fleet question in chat about drift or stockout reads it only while that stream's audit is in flight; the patch posture chat route never reads it.
+
+The paragraph goes on a fix whose finding's own object Config Connector does not apply: the object of a cluster or node pool finding, or the object of a `kcc-object-wedged` finding on that finding's cluster. A finding with no Config Connector object of its own (a `Deployment`, for example) never gets the paragraph, also when its file declares a Config Connector object. When the file of a `manifest` fix declares the object, the fix gets a last paragraph like this:
+
+```text
+**Config Connector is not applying this file.** When the audit ran, Config Connector reported `Ready=False` on `ContainerCluster infra/prod-usc1` (`DependencyNotReady: reference PubSubTopic infra/fleet-events is not ready`), which waits on `PubSubTopic infra/fleet-events` (`UpdateFailed: …`). The cloud resource does not change after the merge until Config Connector applies the object again. If the reason rejects the change in this file, correct the declaration. Otherwise the change takes effect when Config Connector applies the object again, and this finding comes back on each run until then.
+```
+
+The fix keeps its kind, and a `manifest` fix can still open a pull request, which carries the same paragraph. A `manual` fix, a `gcloud` fix (after its command), a fix that fell back to `manual`, and a `manifest` fix to another file get the paragraph too.
+
+For these fixes, the audit looks for the object's declaration in the `.yaml`, `.yml` and `.json` files of the GitOps repository. When exactly one file declares it, the paragraph names that file. Otherwise it starts "**Config Connector is not applying the declaration of this object.**" and says that more than one file declares the object, or that the audit names no declaration file. It never says that no file declares the object, because the search skips a file that it cannot parse, for example a template.
+
+The paragraph does not say that the change is correct: the reason can reject the change itself, for example a node pool change that sets both `spec.autoscaling.maxNodeCount` and `spec.autoscaling.totalMaxNodeCount`. When the reason is `DependencyNotReady`, the paragraph also names the unready object at the root of the chain.
+
+To fit the [note cap of 2,000 characters](#where-a-manual-fix-belongs), the audit cuts only the fix's own text, which then ends with `…(truncated)`. The text of a Kustomize note, a note that a fix fell back to `manual`, a note about a reverted `gcloud` command, and the reconciler note is never cut. When there is still no room, the paragraph becomes shorter, and the copy of the file in a Kustomize note can become shorter by whole lines. When even the shortest paragraph does not fit, it goes after the other text, past the cap, and the `finish` log has a warning. The next run after the stall clears shows the fix's whole text again.
+
+The match must be certain, so some fixes get no paragraph. One case is the same object not ready on more than one cluster with nothing to tell them apart: Config Controller puts the objects of each instance in `config-control`. Another is a file that sets no namespace when more than one object fits. A third is an object whose known project differs from the project that the file or the finding gives.
+
+For a cluster or node pool finding, when more than one swept cluster can run Config Connector, the object's project must also be known. A cluster that the audit could not read or reach counts as such a cluster, and so does a project whose cluster list failed.
+
+The collectors take the project of an object from its `cnrm.cloud.google.com/project-id` annotation, else from its `spec.projectRef`, else from its namespace. An object with a `spec.projectRef` that the audit cannot resolve has no known project, and its namespace does not give one. To give an object a known project, set the annotation on the object, or, for an object with no `spec.projectRef`, on its Namespace. An object with no `Ready` condition yet, or one that Config Connector is still updating or deleting, does not count. The [issue-ledger design](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/fleet-audit-issue-ledger.md), section 6, has the full rules for the match and the fit.
+
+When the audit cannot read a cluster (the read times out, is refused, or has no time left before the collector must stop), no paragraph names an object on that cluster. The `finish` log then has a warning that names the cluster. A fix with no paragraph does not prove that Config Connector applies its file.
+
+The read needs no install setting: on a cluster that does not run Config Connector, the cluster serves no Config Connector kind and is skipped. The audits read only the clusters they sweep, so the cluster that runs Config Connector must be in the install's scope. The identity the collectors use must be able to list the Config Connector objects on that cluster; [Security and IAM](/kube-agents/reference/security-and-iam/#roles-per-set) says which roles give it.
 
 ### Tier 2 — remediation pull requests
 
@@ -189,7 +229,7 @@ A refusal says which of the reasons applies. A request the parser cannot honour 
 Each finding's state is recomputed every run from two facts — whether it still reproduces, and what its remediation PR is doing — and never stored. The ledger renders exactly one of `open`, `fix proposed`, `⚠ fix merged, still reproduces`, `resolved (fix merged)`, `resolved`, `fix refused`, or `fix withdrawn, awaiting re-proposal`. Two of those act on the PR side, and the second is one the old PR-as-report model had no way to express:
 
 - A remediation PR whose finding no longer reproduces is **closed automatically**, with a comment naming the command that no longer reproduces. The branch is deliberately **not** deleted, so any human fixup pushed to it survives and the PR can be reopened.
-- A finding that still reproduces after its PR merged is rendered with a **"fix merged, still reproduces"** warning and the merged PR gets one comment. It is never reopened.
+- A finding that still reproduces after its PR merged is rendered with a **"fix merged, still reproduces"** warning and the merged PR gets one comment. It is never reopened. The warning and the comment say that either the fix was not complete or something outside the repository reverted it. When Config Connector does not apply the finding's own object, in the fix's file or elsewhere, they name the object and the reason instead. They do the same, for a fix of any kind, when the finding's own object is not ready: its cluster, its node pool, or the Config Connector object of a `kcc-object-wedged` finding ([details](#when-config-connector-is-not-applying-a-file)). If the reason rejects the change, they say to correct the declaration.
 
 The last two states are the same event seen from opposite sides: a fix PR that is closed, unmerged, while the finding is still there. Who closed it decides everything, and the `audit:stale-closed` label is how the harness tells its own work apart from a person's. Its own stale-closes carry that label and render as **`fix withdrawn, awaiting re-proposal`** — the finding is treated as having no PR at all, so it is promotable again on the usual terms.
 
@@ -199,7 +239,7 @@ A PR a **human** closed renders as **`fix refused`** and is final: re-proposing 
 
 Three properties follow from the script owning the artefacts rather than the model:
 
-- **One ledger per audit stream.** The `--audit` id is checked against a fixed allowlist, and the branch and label names are derived from it rather than passed in, so a typo cannot open an unregistered stream. The agent never calls `gh issue create` itself.
+- **One ledger per audit stream per install.** The `--audit` id is checked against a fixed allowlist; the branch names are derived from it and the labels from it and from the install's host cluster, rather than passed in, so a typo cannot open an unregistered stream. The agent never calls `gh issue create` itself.
 - **A computable delta.** The issue body carries a hidden `<!-- audit-findings: [...] -->` block, and the harness keeps its own copy of each body it publishes in a report store on the agent's volume. The next run diffs finding ids against that stored copy, so a hand edit to the public issue cannot change what the harness believes it published.
 
   Only a run for a stream and repository the store has never held, as the first after an upgrade or on a replaced volume is, reads the block back once to seed it. A stored record that is missing, unreadable, or does not match the issue is never re-seeded from the issue: the run treats its memory as lost and withholds the delta rather than trusting the public body.
@@ -221,7 +261,7 @@ Minty is a small in-cluster service that brokers GitHub App installation tokens 
 ### How it works
 
 1. A GitHub App is created (once, by you) with the needed permissions (`contents:write`, `pull_requests:write`, `issues:write` — `fleet-audit` publishes its ledger as an issue) and installed on the target repo.
-2. The App's private key is imported into a **GCP KMS asymmetric signing key** (keyring `github-token-minter-keyring`, key `github-token-minter-key`, created by the [`github-minter` Terraform module](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/github-minter)) — the raw key material never lives outside KMS.
+2. The App's private key is imported into a **GCP KMS asymmetric signing key** (keyring `<cluster>-minter-keyring`, key `<cluster>-minter-key` on a new install, created by the [`github-minter` Terraform module](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/github-minter)) — the raw key material never lives outside KMS.
 3. When `submit-suggestion` needs a token, the credential broker calls Minty (default endpoint `http://github-token-minter.kubeagents-system.svc.cluster.local:8080/token`) using the agent's Workload Identity.
 4. Minty asks KMS to sign a JWT with the imported private key.
 5. Minty exchanges the JWT with GitHub for a **short-lived installation token scoped to the target repository**.

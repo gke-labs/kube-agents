@@ -6,7 +6,9 @@ profile_name is a pure, deterministic function; the module imports without pyyam
 (that import is lazy, only on the scaffold path).
 """
 
+import contextlib
 import io
+import json
 import os
 import random
 import re
@@ -28,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "deploy" / "shared"
 
 import cluster_agent_profile as cap  # noqa: E402
 import credential_proxy_client  # noqa: E402
+import profile_scaffold  # noqa: E402
 import terminal_env_pin  # noqa: E402
 import gke_endpoint  # noqa: E402
 
@@ -326,6 +329,176 @@ class DeleteProfileTest(unittest.TestCase):
             worker.join(10)
             self.assertFalse(worker.is_alive())
         self.assertEqual(self.removed, [self.NAME])
+
+
+class DeleteProfilesTest(unittest.TestCase):
+    """A prune's deletes, with the sandbox removals batched into one mirror call (#4574)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.home_root = self.tmp / "data"
+        (self.home_root / "profiles").mkdir(parents=True)
+        for attr, value in (("HERMES_HOME", self.home_root), ("PROFILES_BASE", self.home_root / "profiles")):
+            original = getattr(cap, attr)
+            setattr(cap, attr, value)
+            self.addCleanup(setattr, cap, attr, original)
+        self.calls = []
+        self.answer = lambda names: {n: "removed" for n in names}
+        self.keep_home = set()
+
+        def delete_here(name):
+            if name not in self.keep_home:
+                shutil.rmtree(cap.profile_home(name), ignore_errors=True)
+
+        self.all_names = []
+
+        def remove(names):
+            # #4467's guarantee, per name: its lock is held while its sandbox home goes.
+            held = []
+            for n in names:
+                with profile_scaffold.profile_lock(self.home_root, n, blocking=False) as free:
+                    held.append(not free)
+            busy = 0
+            for n in self.all_names:
+                with profile_scaffold.profile_lock(self.home_root, n, blocking=False) as free:
+                    busy += not free
+            self.calls.append((list(names), held))
+            self.busy.append(busy)
+            return self.answer(names)
+
+        self.busy = []
+
+        for target, replacement in (("_delete_profile", delete_here), ("_remove_sandbox_layouts", remove)):
+            patcher = mock.patch.object(cap, target, replacement)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def profiles(self, *names):
+        self.all_names += names
+        for name in names:
+            (self.home_root / "profiles" / name / "workspace").mkdir(parents=True)
+        return list(names)
+
+    def delete(self, names):
+        with redirect_stderr(io.StringIO()) as err:
+            outcomes = cap.delete_profiles(names)
+        self.log = err.getvalue()
+        return outcomes
+
+    def test_one_mirror_call_for_the_whole_prune(self):
+        names = self.profiles("cluster-c", "cluster-a", "cluster-b")
+        self.assertEqual(self.delete(names), {n: "deleted" for n in names})
+        self.assertEqual(self.calls, [(["cluster-a", "cluster-b", "cluster-c"], [True, True, True])])
+        for name in names:
+            self.assertFalse(cap.profile_home(name).exists())
+
+    def test_a_large_prune_runs_in_chunks_with_one_chunk_of_locks_held(self):
+        names = self.profiles(*(f"cluster-{i}" for i in range(5)))
+        with mock.patch.object(cap, "DELETE_BATCH_MAX", 2):
+            outcomes = self.delete(names)
+        self.assertEqual(outcomes, {n: "deleted" for n in names})
+        self.assertEqual([len(c) for c, _ in self.calls], [2, 2, 1])
+        for chunk, held in self.calls:
+            self.assertTrue(all(held), chunk)
+        # No more locks held at any call than one chunk: earlier chunks' are released.
+        self.assertEqual(self.busy, [2, 2, 1])
+        for name in names:
+            with profile_scaffold.profile_lock(self.home_root, name, blocking=False) as free:
+                self.assertTrue(free, f"{name}'s lock was still held after the batch")
+
+    def test_a_held_lock_skips_that_name_alone(self):
+        names = self.profiles("cluster-a", "cluster-busy", "cluster-c")
+        with profile_scaffold.profile_lock(self.home_root, "cluster-busy") as held:
+            self.assertTrue(held)
+            outcomes = self.delete(names)
+        self.assertEqual(outcomes["cluster-busy"], "locked")
+        self.assertTrue(cap.profile_home("cluster-busy").exists())
+        self.assertEqual(self.calls[0][0], ["cluster-a", "cluster-c"])
+        self.assertEqual(outcomes["cluster-a"], "deleted")
+        self.assertIn("cluster-busy: not deleted this run, its profile lock is held", self.log)
+
+    def test_a_home_that_survives_the_delete_keeps_its_sandbox_home(self):
+        names = self.profiles("cluster-a", "cluster-stays")
+        self.keep_home.add("cluster-stays")
+        outcomes = self.delete(names)
+        self.assertEqual(outcomes, {"cluster-a": "deleted", "cluster-stays": "home-remains"})
+        self.assertEqual(self.calls[0][0], ["cluster-a"])
+
+    def test_an_unopenable_lock_deletes_here_and_keeps_the_sandbox_home(self):
+        # As delete_profile without its lock; skipping outright would keep the
+        # project retiring for as long as the lock directory stays broken.
+        names = self.profiles("cluster-a", "cluster-b")
+        real = profile_scaffold.profile_lock
+
+        def lock(root, name, blocking=True, on_error=None):
+            if name == "cluster-b":
+                on_error(OSError(30, "Read-only file system"))
+                return contextlib.nullcontext(False)
+            return real(root, name, blocking=blocking, on_error=on_error)
+
+        with mock.patch.object(cap, "profile_lock", side_effect=lock):
+            outcomes = self.delete(names)
+        self.assertEqual(outcomes, {"cluster-a": "deleted", "cluster-b": "sandbox-unlocked"})
+        self.assertFalse(cap.profile_home("cluster-b").exists())
+        self.assertEqual(self.calls[0][0], ["cluster-a"])
+
+    def test_the_mirror_s_answer_is_reported_per_name(self):
+        names = self.profiles("cluster-a", "cluster-b", "cluster-c", "cluster-d")
+        self.answer = lambda ns: {"cluster-a": "removed", "cluster-b": "left",
+                                  "cluster-c": "refused", "cluster-d": "unreached"}
+        self.assertEqual(self.delete(names), {"cluster-a": "deleted", "cluster-b": "sandbox-left",
+                                              "cluster-c": "sandbox-refused", "cluster-d": "sandbox-unreached"})
+
+
+class RemoveSandboxLayoutsTest(unittest.TestCase):
+    """The batched mirror call: one argv for every name, one result line read back."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        mirror = self.tmp / "sandbox_mirror.py"
+        mirror.write_text("")
+        patcher = mock.patch.object(cap, "SANDBOX_MIRROR", mirror)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_with(self, stdout, returncode=0):
+        with mock.patch.object(subprocess, "run") as run, redirect_stderr(io.StringIO()):
+            run.return_value = subprocess.CompletedProcess([], returncode, stdout, "")
+            outcomes = cap._remove_sandbox_layouts(["cluster-a", "cluster-b", "cluster-c"])
+        return outcomes, run
+
+    def test_one_call_names_every_profile_and_reads_each_outcome(self):
+        line = cap.MIRROR_REMOVE_RESULT_PREFIX + json.dumps(
+            {"removed": ["cluster-a"], "left": ["cluster-b"], "refused": []})
+        outcomes, run = self.run_with(f"sandbox-mirror: some log line\n{line}\n", returncode=2)
+        self.assertEqual(outcomes, {"cluster-a": "removed", "cluster-b": "left", "cluster-c": "unreached"})
+        argv = run.call_args.args[0]
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual([argv[i + 1] for i, a in enumerate(argv) if a == "--remove-profile"],
+                         ["cluster-a", "cluster-b", "cluster-c"])
+        self.assertEqual(run.call_args.kwargs["timeout"], cap.SANDBOX_MIRROR_TIMEOUT_SECONDS)
+
+    def test_an_install_with_no_sandbox_has_nothing_to_remove(self):
+        # The mirror exits 0 before reading the names when there is no sandbox.
+        outcomes, _ = self.run_with("sandbox-mirror: no ssh terminal backend in the managed config; no sandbox to mirror\n")
+        self.assertEqual(set(outcomes.values()), {"removed"})
+
+    def test_no_result_line_is_every_name_unreached(self):
+        for out in ("", "sandbox-mirror: the sandbox did not answer\n", cap.MIRROR_REMOVE_RESULT_PREFIX + "not json\n"):
+            with self.subTest(out=out):
+                outcomes, _ = self.run_with(out, returncode=2)
+                self.assertEqual(set(outcomes.values()), {"unreached"})
+
+    def test_the_prefix_is_the_mirror_s(self):
+        import importlib.util
+
+        mirror = Path(__file__).resolve().parents[3] / "deploy" / "shared" / "sandbox_mirror.py"
+        spec = importlib.util.spec_from_file_location("sandbox_mirror_for_prefix", mirror)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertEqual(cap.MIRROR_REMOVE_RESULT_PREFIX, module.REMOVE_RESULT_PREFIX)
 
 # --- The runtime scaffold path --------------------------------------------------
 #
@@ -729,7 +902,7 @@ class CreateProfileTest(unittest.TestCase):
                      "credential proxy token unavailable: no token file",
                      "credential proxy error (HTTP 502): non-JSON response",
                      "credential proxy throttled: gave up after 2 attempts (HTTP 503): the credential proxy is at "
-                     "its child memory budget (704 MiB in use of 704 MiB) and this request timed out waiting"):
+                     "its child memory budget (704 MiB in use of 832 MiB) and this request timed out waiting"):
             self.assertTrue(cap.NOT_A_CONNECTION_FAILURE_RE.search(shim), shim)
         for not_shim in ("timed out after 95s, the preflight's cap on one brokered call (the credential proxy's 60s admission wait plus 30s)",
                          BUSY_RETRY_LINE):

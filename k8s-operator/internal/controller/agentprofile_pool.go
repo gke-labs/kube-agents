@@ -1,0 +1,493 @@
+package controller
+
+// The AgentProfile workers (#3655, PR 5b): one builder for the worker pod,
+// which the warm pools here and PR 6's Jobs both render, and the warm pool
+// itself, a Deployment per (profile, interactive tier) in the profile
+// namespace. The pod's shape is contract addendum 10 on #3655, and the worker
+// it runs is the adapter's profile mode (a2a/worker-adapter/profile.go).
+
+import (
+	"context"
+	goerrors "errors"
+	"fmt"
+	"strconv"
+	"strings"
+
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/profilepod"
+)
+
+// profileWorkerMode is how a worker pod runs: a warm pool's pods serve task
+// after task, a Job's pod serves one (PROFILE_WORKER_ONE_SHOT).
+type profileWorkerMode int
+
+const (
+	profileWorkerPool profileWorkerMode = iota
+	profileWorkerOneShot
+)
+
+const (
+	profileWorkerContainer = "worker"
+	// profileWorkerResetPathsEnv is lib.EnvProfileResetPaths: the
+	// directories the worker empties after every task.
+	profileWorkerResetPathsEnv = "A2A_PROFILE_RESET_PATHS"
+	// profileWorkerUID is the worker image's user (a2a-worker, node:22's
+	// node user), and its FSGroup.
+	profileWorkerUID = 1000
+	// profileWorkerStatusPort is lib.ProfileWorkerStatusPort: /readyz and
+	// /healthz, pod-local.
+	profileWorkerStatusPort = 8080
+
+	profileWorkerScratchVolume = "scratch"
+	profileWorkerScratchPath   = "/scratch"
+	// 2Gi: the session worker, the same image and harness, left its 1Gi
+	// scratch at 4 KiB over a week of dev-lane sessions (a2a/gateway/
+	// spawn.go), and the image has no git to clone with. Twice that floor
+	// keeps the worker's whole ephemeral request inside Autopilot's 10Gi
+	// per pod with up to profileWorkerAutopilotToolLimit tools.
+	profileWorkerScratchSizeLimit = "2Gi"
+	// profileWorkerAutopilotToolLimit is how many tools a profile can carry
+	// before the worker's ephemeral-storage request passes Autopilot's 10Gi
+	// per-pod ceiling, with image volumes off (Autopilot's case), where each
+	// tool is staged into its own emptyDir (profilepod's toolStagingSizeLimit).
+	profileWorkerAutopilotToolLimit = 10
+
+	// The root filesystem is read-only, so what the harness and its tools
+	// write outside the volumes above needs a volume of its own: $HOME (the
+	// image user's, for tool caches and config) and /tmp.
+	profileWorkerHomeVolume       = "home"
+	profileWorkerHomePath         = "/home/node"
+	profileWorkerTmpVolume        = "tmp"
+	profileWorkerTmpPath          = "/tmp"
+	profileWorkerHomeTmpSizeLimit = "1Gi"
+
+	// The harness's per-task config directories (its CLAUDE_CONFIG_DIR):
+	// an emptyDir of their own, apart from the working directory, which the
+	// worker renders the persona into read-only (lib.ProfileConfigRoot).
+	profileWorkerConfigVolume = "harness-config"
+	profileWorkerConfigPath   = "/var/run/kube-agents/harness-config"
+
+	// The proxy token the confirm carries (addendum 8), written by the
+	// worker for the task's lifetime. Memory-backed, so it never lands on a
+	// node disk.
+	profileWorkerTaskTokenVolume = "task-token"
+	profileWorkerTaskTokenPath   = "/var/run/kube-agents/task-token" // #nosec G101 -- Mount path, not a credential
+
+	// The worker's broker token: a projected ServiceAccount token for the
+	// broker's profile audience (#4257).
+	profileWorkerBrokerTokenVolume = "credential-proxy-token"            // #nosec G101 -- Volume name, not a credential
+	profileWorkerBrokerTokenPath   = "/var/run/secrets/credential-proxy" // #nosec G101 -- Mount path, not a credential
+	profileWorkerBrokerTokenFile   = "token"
+	profileWorkerBrokerTokenExpiry = 3600
+
+	// profileWorkerImagePath is the worker image's PATH, which the tools'
+	// bin directories go in front of.
+	// The credential proxy's shims come first, as the image puts them
+	// (a2a/Dockerfile.worker): kubectl and gcloud resolve to them, and the
+	// image ships no native binary under those names.
+	profileWorkerImagePath = "/opt/credential-proxy/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+	// profileWorkerModelKey only satisfies the harness's "an API key exists"
+	// check: the install's inference gateway runs keyless (the session
+	// worker's default, a2a/cmd/worker-adapter).
+	profileWorkerModelKey = "a2a-playground" // #nosec G101 -- placeholder, not a credential
+)
+
+// profileWorkerLabels are a worker pod's labels: the agent's, the worker
+// component, and the profile and tier the dispatcher's pool selects on
+// (lib.ProfilePoolSelector).
+func profileWorkerLabels(agent *agentv1alpha1.PlatformAgent, profile, tier string) map[string]string {
+	labels := a2aLabels(agent, agentProfileWorkerComponent)
+	labels[agentProfileNameLabel] = profile
+	labels[agentProfileTierLabel] = tier
+	return labels
+}
+
+// buildProfileWorkerPodSpec is the worker pod for one (profile, tier), as a
+// warm pool or a Job renders it. serviceAccount is the (profile, tier)'s,
+// from the identity resolution. imageVolumes says whether the persona and
+// tools mount as image volumes or are staged by init containers
+// (profilepod.RenderPersonaAndTools).
+func buildProfileWorkerPodSpec(agent *agentv1alpha1.PlatformAgent, profile *agentv1alpha1.AgentProfile, tier, serviceAccount string, mode profileWorkerMode, imageVolumes bool) corev1.PodSpec {
+	rendered := profilepod.RenderPersonaAndTools(profile, imageVolumes)
+	env := []corev1.EnvVar{
+		{Name: "PROFILE", Value: profile.Name},
+		{Name: "NATS_URL", Value: a2aNATSClientURL(agent)},
+		a2aNATSCAFileEnvVar(),
+		{Name: "A2A_POD_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}},
+		{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"}}},
+		{Name: "A2A_PROFILE_EXECUTOR", Value: "true"},
+		{Name: "A2A_PROFILE_WORKER", Value: "true"},
+		{Name: "A2A_PROFILE_TIER", Value: tier},
+		{Name: "A2A_WORKDIR", Value: profileWorkerScratchPath},
+		{Name: "HOME", Value: profileWorkerHomePath},
+		{Name: "A2A_PROFILE_CONFIG_ROOT", Value: profileWorkerConfigPath},
+		// Children of a profile task go through the gateway, which a later
+		// change wires; until then the worker has no delegate tool.
+		{Name: "A2A_DELEGATE_TOOL", Value: "off"},
+		// The install's inference gateway, by its full name: the worker runs
+		// in the profile namespace, where the session worker's short default
+		// doesn't resolve.
+		{Name: "ANTHROPIC_BASE_URL", Value: fmt.Sprintf("http://%s.%s.svc.cluster.local", inferenceGatewayServiceName, agent.Namespace)},
+		{Name: "ANTHROPIC_API_KEY", Value: profileWorkerModelKey},
+		{Name: "CREDENTIAL_PROXY_URL", Value: credentialProxyURL(agent)},
+		{Name: "CREDENTIAL_PROXY_TOKEN_FILE", Value: profileWorkerBrokerTokenPath + "/" + profileWorkerBrokerTokenFile},
+		{Name: "CREDENTIAL_PROXY_TASK_TOKEN_FILE", Value: profileWorkerTaskTokenPath + "/token"},
+	}
+	// The exec tier, while it renders, as for the sandbox: read at start, so a
+	// change between 0 and a positive count rolls the warm pools.
+	if credentialProxyExecTierEnabled(agent) {
+		env = append(env, corev1.EnvVar{Name: credentialProxyExecURLEnv, Value: credentialProxyExecTierURL(agent)})
+	}
+	if m := profile.Spec.Harness.Model; m != "" {
+		env = append(env, corev1.EnvVar{Name: "A2A_MODEL", Value: m})
+	}
+	if n := profile.Spec.Harness.MaxTurns; n > 0 {
+		env = append(env, corev1.EnvVar{Name: "A2A_MAX_TURNS", Value: strconv.Itoa(int(n))})
+	}
+	if rendered.PathPrefix != "" {
+		env = append(env, corev1.EnvVar{Name: "PATH", Value: rendered.PathPrefix + ":" + profileWorkerImagePath})
+	}
+	restart := corev1.RestartPolicyAlways
+	if mode == profileWorkerOneShot {
+		env = append(env, corev1.EnvVar{Name: "PROFILE_WORKER_ONE_SHOT", Value: "1"})
+		restart = corev1.RestartPolicyNever
+	}
+
+	mounts := []corev1.VolumeMount{
+		{Name: profileWorkerScratchVolume, MountPath: profileWorkerScratchPath},
+		{Name: profileWorkerHomeVolume, MountPath: profileWorkerHomePath},
+		{Name: profileWorkerTmpVolume, MountPath: profileWorkerTmpPath},
+		{Name: profileWorkerConfigVolume, MountPath: profileWorkerConfigPath},
+		{Name: profileWorkerTaskTokenVolume, MountPath: profileWorkerTaskTokenPath},
+		a2aBusTokenVolumeMount(),
+		{Name: profileWorkerBrokerTokenVolume, MountPath: profileWorkerBrokerTokenPath, ReadOnly: true},
+		a2aNATSCABundleMount(),
+	}
+	mounts = append(mounts, rendered.Mounts...)
+	volumes := []corev1.Volume{
+		{Name: profileWorkerScratchVolume, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
+			SizeLimit: ptr.To(resource.MustParse(profileWorkerScratchSizeLimit)),
+		}}},
+		{Name: profileWorkerHomeVolume, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
+			SizeLimit: ptr.To(resource.MustParse(profileWorkerHomeTmpSizeLimit)),
+		}}},
+		{Name: profileWorkerTmpVolume, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
+			SizeLimit: ptr.To(resource.MustParse(profileWorkerHomeTmpSizeLimit)),
+		}}},
+		{Name: profileWorkerConfigVolume, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
+			SizeLimit: ptr.To(resource.MustParse("256Mi")),
+		}}},
+		{Name: profileWorkerTaskTokenVolume, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
+			Medium: corev1.StorageMediumMemory, SizeLimit: ptr.To(resource.MustParse("1Mi")),
+		}}},
+		a2aBusTokenVolumeSource(),
+		{Name: profileWorkerBrokerTokenVolume, VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+			Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
+				Audience:          credentialProxyProfileAudience,
+				ExpirationSeconds: ptr.To(int64(profileWorkerBrokerTokenExpiry)),
+				Path:              profileWorkerBrokerTokenFile,
+			}}},
+		}}},
+		a2aNATSCABundleVolume(agent),
+	}
+	volumes = append(volumes, rendered.Volumes...)
+	// Every writable mount is emptied by the worker after each task, so one
+	// task's files never reach the next on a warm pod. The list is derived
+	// from the mounts, so a writable mount added later is on it too.
+	env = append(env, corev1.EnvVar{Name: profileWorkerResetPathsEnv, Value: strings.Join(profileWorkerResetPaths(mounts, volumes), ":")})
+
+	res := profile.Spec.Resources
+	ephemeral := profileWorkerEphemeralStorage(volumes)
+	return corev1.PodSpec{
+		ServiceAccountName:           serviceAccount,
+		AutomountServiceAccountToken: ptr.To(false),
+		RestartPolicy:                restart,
+		RuntimeClassName:             shellSandboxRuntimeClassName(agent),
+		SecurityContext: &corev1.PodSecurityContext{
+			RunAsNonRoot:   ptr.To(true),
+			RunAsUser:      ptr.To(int64(profileWorkerUID)),
+			FSGroup:        ptr.To(int64(profileWorkerUID)),
+			SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+		},
+		Volumes:        volumes,
+		InitContainers: rendered.InitContainers,
+		Containers: []corev1.Container{{
+			Name:         profileWorkerContainer,
+			Image:        profile.Spec.Harness.Image,
+			Env:          env,
+			VolumeMounts: mounts,
+			Ports:        []corev1.ContainerPort{{Name: "status", ContainerPort: profileWorkerStatusPort}},
+			// Ready only once the worker is listening on its dispatch
+			// subject, so the dispatcher never offers into a pod that would
+			// drop the offer.
+			ReadinessProbe: &corev1.Probe{
+				ProbeHandler:  corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/readyz", Port: intstr.FromInt32(profileWorkerStatusPort)}},
+				PeriodSeconds: 2,
+			},
+			LivenessProbe: &corev1.Probe{
+				ProbeHandler:  corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/healthz", Port: intstr.FromInt32(profileWorkerStatusPort)}},
+				PeriodSeconds: 20, FailureThreshold: 3,
+			},
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceCPU: res.Requests.CPU, corev1.ResourceMemory: res.Requests.Memory, corev1.ResourceEphemeralStorage: ephemeral},
+				Limits:   corev1.ResourceList{corev1.ResourceCPU: res.Limits.CPU, corev1.ResourceMemory: res.Limits.Memory, corev1.ResourceEphemeralStorage: ephemeral},
+			},
+			SecurityContext: &corev1.SecurityContext{
+				AllowPrivilegeEscalation: ptr.To(false),
+				Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+				SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+				ReadOnlyRootFilesystem:   ptr.To(true),
+			},
+		}},
+	}
+}
+
+// profileWorkerEphemeralStorage is the worker's ephemeral-storage request and
+// limit: the sizeLimits of every disk-backed emptyDir in the pod, which the
+// pod's usage is charged against while it runs (the staged persona and tools
+// included), plus emptyDirLogsAllowance, as emptydir_limits.go has it for
+// every writing container. Without it Autopilot defaults the container to
+// 1Gi, well under the volumes it mounts.
+func profileWorkerEphemeralStorage(volumes []corev1.Volume) resource.Quantity {
+	total := resource.MustParse(emptyDirLogsAllowance)
+	for _, v := range volumes {
+		if v.EmptyDir != nil && v.EmptyDir.Medium != corev1.StorageMediumMemory && v.EmptyDir.SizeLimit != nil {
+			total.Add(*v.EmptyDir.SizeLimit)
+		}
+	}
+	return total
+}
+
+// profileWorkerResetPaths is every mount of the worker that is writable and
+// backed by an emptyDir: what a task can leave behind for the next. A mount
+// marked read-only, or of any other kind of volume, holds nothing a task
+// wrote.
+func profileWorkerResetPaths(mounts []corev1.VolumeMount, volumes []corev1.Volume) []string {
+	emptyDirs := map[string]bool{}
+	for _, v := range volumes {
+		if v.EmptyDir != nil {
+			emptyDirs[v.Name] = true
+		}
+	}
+	var paths []string
+	for _, m := range mounts {
+		if !m.ReadOnly && emptyDirs[m.Name] {
+			paths = append(paths, m.MountPath)
+		}
+	}
+	return paths
+}
+
+// profileWorkerToolsProblem says why a profile's worker pod, a pool's or a
+// Job's, would never schedule, or "": past profileWorkerAutopilotToolLimit
+// tools with image volumes off, its ephemeral request passes Autopilot's 10Gi.
+func profileWorkerToolsProblem(p *agentv1alpha1.AgentProfile, imageVolumes bool) string {
+	if n := len(p.Spec.Tools); !imageVolumes && n > profileWorkerAutopilotToolLimit {
+		return fmt.Sprintf("AgentProfile %s has %d tools; without image volumes a worker fits Autopilot's 10Gi of ephemeral storage with at most %d",
+			p.Name, n, profileWorkerAutopilotToolLimit)
+	}
+	return ""
+}
+
+// profilePoolName is the warm pool Deployment for one (profile, tier).
+func profilePoolName(profile, tier string) string {
+	return "agentprofile-" + profile + "-" + tier
+}
+
+// buildProfilePool is one (profile, interactive tier)'s warm pool: warmReplicas
+// pods of the worker, in the profile namespace. It has no owner reference,
+// since an owner can't be in another namespace, so the operator removes it by
+// its labels (deleteProfilePools).
+func buildProfilePool(agent *agentv1alpha1.PlatformAgent, profile *agentv1alpha1.AgentProfile, tier, serviceAccount string, imageVolumes bool) *appsv1.Deployment {
+	labels := profileWorkerLabels(agent, profile.Name, tier)
+	return &appsv1.Deployment{
+		TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      profilePoolName(profile.Name, tier),
+			Namespace: profileNamespaceName(agent),
+			Labels:    labels,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: ptr.To(int32(resolveProfileWarmReplicas(agent))), // #nosec G115 -- the CRD bounds warmReplicas to 0-100
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{
+				a2aComponentLabel:     agentProfileWorkerComponent,
+				agentProfileNameLabel: profile.Name,
+				agentProfileTierLabel: tier,
+			}},
+			// One surge pod per pool, which the profile quota budgets for
+			// (profileQuotaHard), and no pod taken down before its
+			// replacement is Ready, so a rollout never leaves the pool empty.
+			Strategy: appsv1.DeploymentStrategy{
+				Type: appsv1.RollingUpdateDeploymentStrategyType,
+				RollingUpdate: &appsv1.RollingUpdateDeployment{
+					MaxSurge:       ptr.To(intstr.FromInt32(1)),
+					MaxUnavailable: ptr.To(intstr.FromInt32(0)),
+				},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: labels},
+				Spec:       buildProfileWorkerPodSpec(agent, profile, tier, serviceAccount, profileWorkerPool, imageVolumes),
+			},
+		},
+	}
+}
+
+// interactiveTier reports whether a tier runs on a warm pool. The unattended
+// tier runs as a Job per task (PR 6).
+func interactiveTier(tier string) bool {
+	return tier == agentv1alpha1.AgentProfileTierRead
+}
+
+// profileCABundleComponent labels the NATS CA bundle's copy in the profile
+// namespace.
+const profileCABundleComponent = "profile-nats-ca-bundle"
+
+// buildProfileCABundle is the agent namespace's NATS CA bundle, copied into
+// the profile namespace: a pod mounts a ConfigMap from its own namespace
+// only.
+func buildProfileCABundle(agent *agentv1alpha1.PlatformAgent, data map[string]string) *corev1.ConfigMap {
+	return &corev1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      a2aNATSCABundleName(agent),
+			Namespace: profileNamespaceName(agent),
+			Labels:    a2aLabels(agent, profileCABundleComponent),
+		},
+		Data: data,
+	}
+}
+
+// reconcileProfilePools renders a warm pool for every admitted profile's
+// interactive tiers, with the CA bundle they mount, and removes this agent's
+// pools that no longer have a profile or tier. Only with the dispatcher, which
+// is the pools' only source of work. keepBundle says dispatcher Jobs may still
+// mount the bundle (Job mode signalled, even if revoked, since a revoke leaves
+// running Jobs to finish; or a gate-off sweep that didn't finish): it is then
+// kept even with no pool. bundleCopied says the caller copied the bundle this
+// pass (before publishing Job templates), so it isn't copied again.
+func (r *PlatformAgentReconciler) reconcileProfilePools(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, resolved map[string]agentProfileResolution, bundleCopied, keepBundle bool) error {
+	imageVolumes := r.imageVolumeSupported(agent)
+	var pools []*appsv1.Deployment
+	var errs []error
+	want := map[string]bool{}
+	for i := range profiles {
+		res := resolved[profiles[i].Name]
+		if res.refused != nil {
+			continue
+		}
+		for _, id := range res.identities {
+			if !interactiveTier(id.tier) {
+				continue
+			}
+			pool := buildProfilePool(agent, &profiles[i], id.tier, id.serviceAccount, imageVolumes)
+			want[pool.Name] = true
+			// Past the tool limit with image volumes off, the worker's
+			// ephemeral request passes Autopilot's 10Gi and its pods would
+			// never schedule. The pool isn't applied, and the error names the
+			// profile, like a pool the API server refuses (which stays
+			// wanted too, so an earlier pool isn't swept).
+			if problem := profileWorkerToolsProblem(&profiles[i], imageVolumes); problem != "" {
+				errs = append(errs, fmt.Errorf("the warm pool %s: %s", pool.Name, problem))
+				continue
+			}
+			pools = append(pools, pool)
+		}
+	}
+	if len(want) == 0 {
+		if keepBundle {
+			return r.deleteProfilePoolsExcept(ctx, agent, nil)
+		}
+		// Nothing left to mount the bundle copy either.
+		return goerrors.Join(r.deleteProfilePoolsExcept(ctx, agent, nil), r.deleteProfileCABundle(ctx, agent))
+	}
+	// The CA bundle the pools mount, copied before the pools that need it.
+	// A copy that fails skips the pool applies (they would mount nothing)
+	// but not the sweep, which needs nothing from it.
+	var copyErr error
+	if !bundleCopied {
+		copyErr = r.copyProfileCABundle(ctx, agent)
+	}
+	if copyErr != nil {
+		errs = append(errs, copyErr)
+	} else {
+		// One pool the API server refuses (a profile whose requests exceed
+		// its limits, a webhook) doesn't hold up the others or the sweep: a
+		// pool it failed to apply is still wanted, so the sweep leaves it.
+		for _, pool := range pools {
+			if err := r.applyManaged(ctx, agent, pool); err != nil {
+				errs = append(errs, fmt.Errorf("the warm pool %s: %w", pool.Name, err))
+			}
+		}
+	}
+	errs = append(errs, r.deleteProfilePoolsExcept(ctx, agent, want))
+	return goerrors.Join(errs...)
+}
+
+// deleteProfilePoolsExcept deletes this agent's warm pools in the profile
+// namespace whose names aren't in keep. A pool without this agent's labels is
+// someone else's and stays. Read uncached: the profile namespace's
+// Deployments aren't in the manager's cache.
+// copyProfileCABundle copies the agent's NATS CA bundle into the profile
+// namespace, where the pools' pods can mount it.
+func (r *PlatformAgentReconciler) copyProfileCABundle(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	src := &corev1.ConfigMap{}
+	if err := r.a2aReader().Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aNATSCABundleName(agent)}, src); err != nil {
+		return fmt.Errorf("reading the NATS CA bundle to copy into the profile namespace: %w", err)
+	}
+	if err := r.applyManaged(ctx, agent, buildProfileCABundle(agent, src.Data)); err != nil {
+		return fmt.Errorf("the profile namespace's NATS CA bundle: %w", err)
+	}
+	return nil
+}
+
+func (r *PlatformAgentReconciler) deleteProfilePoolsExcept(ctx context.Context, agent *agentv1alpha1.PlatformAgent, keep map[string]bool) error {
+	pools := &appsv1.DeploymentList{}
+	if err := r.a2aReader().List(ctx, pools, client.InNamespace(profileNamespaceName(agent)),
+		client.MatchingLabels{a2aComponentLabel: agentProfileWorkerComponent}); err != nil {
+		return fmt.Errorf("listing the warm pools: %w", err)
+	}
+	// Every unwanted pool is tried: one delete that's refused doesn't keep
+	// the ones after it running.
+	var errs []error
+	for i := range pools.Items {
+		pool := &pools.Items[i]
+		if keep[pool.Name] || !agentLabelsMarkComponent(pool, agent, agentProfileWorkerComponent) {
+			continue
+		}
+		if err := client.IgnoreNotFound(r.Delete(ctx, pool, client.PropagationPolicy(metav1.DeletePropagationBackground))); err != nil {
+			errs = append(errs, fmt.Errorf("deleting the warm pool %s: %w", pool.Name, err))
+		}
+	}
+	return goerrors.Join(errs...)
+}
+
+// deleteProfilePools removes every warm pool of this agent's, and the CA
+// bundle's copy, from the profile namespace: the gate turned off, the flip to
+// today, and PlatformAgent deletion (through deleteDispatcherPodsRBAC).
+func (r *PlatformAgentReconciler) deleteProfilePools(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	return goerrors.Join(r.deleteProfilePoolsExcept(ctx, agent, nil), r.deleteProfileCABundle(ctx, agent))
+}
+
+// deleteProfileCABundle removes the CA bundle's copy from the profile
+// namespace, if this agent made it.
+func (r *PlatformAgentReconciler) deleteProfileCABundle(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	bundle := &corev1.ConfigMap{}
+	key := types.NamespacedName{Namespace: profileNamespaceName(agent), Name: a2aNATSCABundleName(agent)}
+	if err := r.a2aReader().Get(ctx, key, bundle); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	if !agentLabelsMarkComponent(bundle, agent, profileCABundleComponent) {
+		return nil
+	}
+	return client.IgnoreNotFound(r.Delete(ctx, bundle))
+}

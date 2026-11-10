@@ -22,15 +22,21 @@ import (
 // copied from the credential broker's (CREDENTIAL_PROXY_METRICS_PORT in
 // agents/platform/scripts/credential_proxy.py), so that the collector
 // scraping it, and the operator's usage poller, are admitted to a port that
-// serves counters and nothing else.
+// serves counters (MetricsPath) and a readiness line for the kubelet
+// (ReadyzPath) and nothing else.
 // The doors keep their own loopback listeners and never serve these series.
 // The operator renders A2A_METRICS_PORT from the constant that also declares
 // the container port and the collector's ingress rule
 // (a2aGatewayMetricsPort in platformagent_a2a_manifests.go); unset means no
 // listener, which is what an older operator that declares no port gets.
 const (
-	// MetricsPath is the one path the metrics listener serves.
+	// MetricsPath is the counters' path on the metrics listener.
 	MetricsPath = "/metrics"
+
+	// ReadyzPath is the readiness path on the same listener: 200 once the
+	// gateway has bound its event relay, 503 with the reason until then. The
+	// operator's readinessProbe reads it (a2aGatewayReadyzPath).
+	ReadyzPath = "/readyz"
 
 	// metricsNamespace and metricsSubsystem prefix every series, so the
 	// gateway's sit beside the broker's kubeagents_* names and cannot be
@@ -53,7 +59,8 @@ const (
 	// Hermes-side ingress (docs/designs/usage-counters-producer.md).
 	messagesInboundName = "messages_inbound_total"
 	// answerFeedbackName counts the ratings chat users gave answers, by
-	// platform and rating (feedback.go): the dashboard's 👍/👎 series.
+	// platform, rating and answer (feedback.go): the dashboard's 👍/👎
+	// series.
 	answerFeedbackName = "answer_feedback_total"
 	// sessionsName counts the conversations the gateway minted a session
 	// record for, by platform: the next-mode chat half of status.usage's
@@ -83,6 +90,7 @@ const (
 	labelOutcome  = "outcome"
 	labelPlatform = "platform"
 	labelRating   = "rating"
+	labelAnswer   = "answer"
 	labelWindow   = "window"
 	// The platform label's values: the chat backends, under the names the
 	// operator's activeInterfaces vocabulary and the chat_metrics plugin use
@@ -93,6 +101,12 @@ const (
 	platformSlack      = "slack"
 	platformDiscord    = "discord"
 	platformConsole    = "console"
+	// The answer label's values: what the rated message answered with, the
+	// chain's own reply or a card's report that settled the ask (TaskRef.CardsAnswer).
+	// A rating no session record names the rated task for (unreadable, reaped,
+	// or the root aged out of its history) is counted as other.
+	answerReply = "reply"
+	answerCard  = "card"
 	// The window label's values: peopleWindowShort and peopleWindowLong.
 	peopleWindowShortLabel = "7d"
 	peopleWindowLongLabel  = "30d"
@@ -162,6 +176,10 @@ var (
 	metricsChatOutcomes    = []string{chatRendered, chatTextOnly, chatRefused, chatInvalid}
 	metricsPlatforms       = []string{platformGoogleChat, platformSlack, platformDiscord, platformConsole}
 	metricsRatings         = []string{FeedbackUp, FeedbackDown}
+	metricsAnswers         = []string{answerReply, answerCard}
+	// metricsRatedPlatforms are the backends that draw rating controls, each
+	// given a zero answer_feedback_total series per rating and answer.
+	metricsRatedPlatforms = []string{platformGoogleChat, platformSlack}
 	// metricsBackendPlatforms maps each chat backend to its platform label; a
 	// backend outside it is a door and is not counted.
 	metricsBackendPlatforms = map[string]string{
@@ -270,8 +288,8 @@ func NewMetrics() *Metrics {
 			Namespace: metricsNamespace,
 			Subsystem: metricsSubsystem,
 			Name:      answerFeedbackName,
-			Help:      "Ratings verified chat users gave the gateway's answers, by platform (googlechat, slack, discord, console, other) and rating (up, down, other); a rating changed is counted again.",
-		}, []string{labelPlatform, labelRating}),
+			Help:      "Ratings verified chat users gave the gateway's answers, by platform (googlechat, slack, discord, console, other), rating (up, down, other) and answer (reply, the chain's own; card, a card's report that settled the ask; other, no session record names the rated task); counted once per rating change, so a repeated rating and one the gateway did not keep are not counted.",
+		}, []string{labelPlatform, labelRating, labelAnswer}),
 		sessions: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Subsystem: metricsSubsystem,
@@ -304,8 +322,12 @@ func NewMetrics() *Metrics {
 	for _, outcome := range metricsGchatOutcomes {
 		m.gchatPulls.WithLabelValues(outcome)
 	}
-	for _, rating := range metricsRatings {
-		m.answerFeedback.WithLabelValues(platformSlack, rating)
+	for _, platform := range metricsRatedPlatforms {
+		for _, rating := range metricsRatings {
+			for _, answer := range metricsAnswers {
+				m.answerFeedback.WithLabelValues(platform, rating, answer)
+			}
+		}
 	}
 	return m
 }
@@ -419,9 +441,10 @@ func metricsTerminalSourceLabel(source TerminalSource) string {
 	return metricsLabelOther
 }
 
-// MetricsServer is the metrics-only listener: MetricsPath and nothing else,
-// on its own port, so the NetworkPolicy rule that admits the collector to it
-// admits the collector and the operator to counters and nothing else.
+// MetricsServer is the metrics-only listener: MetricsPath, plus ReadyzPath
+// for the kubelet, on its own port, so the NetworkPolicy rule that admits the
+// collector to it admits the collector and the operator to counters and a
+// readiness line (whether the relay has bound) and nothing else.
 type MetricsServer struct {
 	listen  string
 	metrics *Metrics
@@ -430,13 +453,34 @@ type MetricsServer struct {
 	// listener, when set, is an already-bound listener Run serves on
 	// instead of binding listen. Test injection only.
 	listener net.Listener
+
+	// readiness answers ReadyzPath; nil answers ready (SetReadiness).
+	readiness func() (bool, string)
+}
+
+// SetReadiness sets what ReadyzPath reports: the gateway's Readiness. Call
+// before Run.
+func (s *MetricsServer) SetReadiness(readiness func() (bool, string)) { s.readiness = readiness }
+
+// serveReadyz answers ReadyzPath: 200 or 503, with the reason as the body so
+// a probe failure in `kubectl describe` and a curl both say what it waits on.
+func (s *MetricsServer) serveReadyz(w http.ResponseWriter, _ *http.Request) {
+	ready, reason := true, "ready"
+	if s.readiness != nil {
+		ready, reason = s.readiness()
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	if !ready {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}
+	fmt.Fprintln(w, reason)
 }
 
 // NewMetricsServer builds the listener for a port. It binds every interface,
 // unlike the doors' loopback binds, because its callers, the collector and
 // the operator's poller, are on the pod network; what keeps anyone else off
 // it is the NetworkPolicy, and
-// what it serves is counters.
+// what it serves is counters and a readiness line.
 func NewMetricsServer(port int, metrics *Metrics, log *slog.Logger) (*MetricsServer, error) {
 	if port < metricsPortMin || port > metricsPortMax {
 		return nil, fmt.Errorf("metrics listener port %d is not in %d-%d", port, metricsPortMin, metricsPortMax)
@@ -450,11 +494,12 @@ func NewMetricsServer(port int, metrics *Metrics, log *slog.Logger) (*MetricsSer
 	return &MetricsServer{listen: fmt.Sprintf(":%d", port), metrics: metrics, log: log}, nil
 }
 
-// Run serves MetricsPath until ctx is done. Every other path is 404, and
+// Run serves MetricsPath and ReadyzPath until ctx is done. Every other path is 404, and
 // every method on it but GET (and the HEAD the mux answers with it) 405.
 func (s *MetricsServer) Run(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.Handle(http.MethodGet+" "+MetricsPath, s.metrics.Handler())
+	mux.HandleFunc(http.MethodGet+" "+ReadyzPath, s.serveReadyz)
 	srv := &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: metricsConnectionDeadline,
@@ -494,9 +539,9 @@ func (s *MetricsServer) Run(ctx context.Context) error {
 	}
 }
 
-// answerRated counts one rating. Both labels come from closed lists: a
-// platform or rating outside them is counted as other.
-func (m *Metrics) answerRated(platform, rating string) {
+// answerRated counts one rating. Every label comes from a closed list: a
+// platform, rating or answer outside them is counted as other.
+func (m *Metrics) answerRated(platform, rating, answer string) {
 	if m == nil {
 		return
 	}
@@ -506,5 +551,8 @@ func (m *Metrics) answerRated(platform, rating string) {
 	if !slices.Contains(metricsRatings, rating) {
 		rating = metricsLabelOther
 	}
-	m.answerFeedback.WithLabelValues(platform, rating).Inc()
+	if !slices.Contains(metricsAnswers, answer) {
+		answer = metricsLabelOther
+	}
+	m.answerFeedback.WithLabelValues(platform, rating, answer).Inc()
 }

@@ -57,7 +57,7 @@ func fieldErrorMessage(t *testing.T, err error, path string) string {
 	return ""
 }
 
-// The floor at the operator's defaults: 192Mi + 128Mi + 2 × (128Mi + 6 × 8Mi)
+// The floor at the operator's defaults: 192Mi + 2 × (128Mi + 6 × 8Mi)
 // (docs/designs/credential-proxy-child-memory-budget.md §2.5). Under it the
 // broker does not run a smaller budget: it turns the budget off and admits by
 // the slot cap alone, and the refusal says so.
@@ -67,7 +67,7 @@ func TestCredentialProxyMemoryLimitBelowTheFloorIsRefusedWithTheNumbers(t *testi
 		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("512Mi")},
 	}))
 	msg := fieldErrorMessage(t, err, "spec.deployment.credentialProxy.resources.limits.memory")
-	for _, want := range []string{"a 512Mi memory limit is under the 672Mi floor at which the budget admits 2 commands", "turns the budget off and admits by the slot cap alone"} {
+	for _, want := range []string{"a 512Mi memory limit is under the 544Mi floor at which the budget admits 2 commands", "turns the budget off and admits by the slot cap alone"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("message %q does not say %q", msg, want)
 		}
@@ -82,8 +82,8 @@ func TestCredentialProxyMemoryLimitBelowTheFloorIsRefusedOnce(t *testing.T) {
 	path := field.NewPath("spec", "deployment", "credentialProxy", "resources")
 	errs, warnings := controller.ValidateCredentialProxyResources(proxyResourcesAgent(&corev1.ResourceRequirements{
 		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("400Mi")},
-	}).Spec.Deployment, path)
-	if len(errs) != 1 || errs[0].Field != "spec.deployment.credentialProxy.resources.limits.memory" || !strings.Contains(errs[0].Detail, "672Mi floor") {
+	}), path)
+	if len(errs) != 1 || errs[0].Field != "spec.deployment.credentialProxy.resources.limits.memory" || !strings.Contains(errs[0].Detail, "544Mi floor") {
 		t.Errorf("expected the floor refusal alone, got %v", errs)
 	}
 	for _, w := range warnings {
@@ -101,7 +101,7 @@ func TestCredentialProxyCrossedMemoryPairIsRefusedWithoutABandWarning(t *testing
 	errs, warnings := controller.ValidateCredentialProxyResources(proxyResourcesAgent(&corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("16Gi")},
 		Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")},
-	}).Spec.Deployment, path)
+	}), path)
 	if len(errs) != 1 || errs[0].Field != "spec.deployment.credentialProxy.resources.requests.memory" {
 		t.Errorf("expected the crossed-pair refusal alone, got %v", errs)
 	}
@@ -111,13 +111,13 @@ func TestCredentialProxyCrossedMemoryPairIsRefusedWithoutABandWarning(t *testing
 }
 
 // A limit exactly at the floor is admitted, with the request lowered to meet
-// it. The pair is equal, so no Autopilot clamp note, and 672Mi per 500m is
+// it. The pair is equal, so no Autopilot clamp note, and 544Mi per 500m is
 // inside the band, so no band warning either.
 func TestCredentialProxyMemoryLimitAtTheFloorIsAdmitted(t *testing.T) {
 	val := &PlatformAgentCustomValidator{}
 	warnings, err := val.ValidateCreate(context.Background(), proxyResourcesAgent(&corev1.ResourceRequirements{
-		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("672Mi")},
-		Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("672Mi")},
+		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("544Mi")},
+		Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("544Mi")},
 	}))
 	if err != nil {
 		t.Fatalf("a limit exactly at the floor was refused: %v", err)
@@ -135,10 +135,10 @@ func TestCredentialProxyMemoryLimitAtTheFloorIsAdmitted(t *testing.T) {
 func TestCredentialProxyMemoryLimitUnderTheDefaultRequestLowersTheRequest(t *testing.T) {
 	val := &PlatformAgentCustomValidator{}
 	warnings, err := val.ValidateCreate(context.Background(), proxyResourcesAgent(&corev1.ResourceRequirements{
-		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("672Mi")},
+		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("544Mi")},
 	}))
 	if err != nil {
-		t.Fatalf("a 672Mi limit set alone was refused: %v", err)
+		t.Fatalf("a 544Mi limit set alone was refused: %v", err)
 	}
 	if len(warnings) != 0 {
 		t.Errorf("expected no warnings, got %v", warnings)
@@ -240,15 +240,15 @@ func TestCredentialProxyLimitEqualToTheRequestIsNotNoted(t *testing.T) {
 }
 
 // A request raised past a limit the CR never wrote: the merged result is what
-// is checked, and the error names the operator's default as the other side.
+// is checked, and the error names the sizing profile row's figure as the other side.
 func TestCredentialProxyRequestAboveTheDefaultLimitIsRefused(t *testing.T) {
 	val := &PlatformAgentCustomValidator{}
 	_, err := val.ValidateCreate(context.Background(), proxyResourcesAgent(&corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("3Gi")},
 	}))
 	msg := fieldErrorMessage(t, err, "spec.deployment.credentialProxy.resources.requests.memory")
-	if !strings.Contains(msg, "operator's default 2Gi memory limit") || !strings.Contains(msg, "set limits.memory as well") {
-		t.Errorf("message %q does not name the default limit it collides with", msg)
+	if !strings.Contains(msg, "sizing profile row's 2Gi memory limit") || !strings.Contains(msg, "set limits.memory as well") {
+		t.Errorf("message %q does not name the row's limit it collides with", msg)
 	}
 }
 
@@ -441,7 +441,7 @@ func TestCredentialProxyUnrepresentableCPUIsRefused(t *testing.T) {
 	errs, warnings := controller.ValidateCredentialProxyResources(proxyResourcesAgent(&corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("10E")},
 		Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("10E")},
-	}).Spec.Deployment, path)
+	}), path)
 	if len(errs) != 2 {
 		t.Fatalf("expected the two cpu refusals alone, got %v", errs)
 	}
@@ -519,6 +519,33 @@ func TestAgentAPIAuthUnknownResourceNameIsRefusedAtAdmission(t *testing.T) {
 		Limits: corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("1")},
 	}))
 	assertFieldError(t, err, "spec.deployment.agentAPIAuth.resources.limits.nvidia.com/gpu")
+}
+
+// With the exec tier on, an agent name past 36 characters is refused at
+// apply, naming the limit; with the tier off it is not.
+func TestAnAgentNameTooLongForTheExecTierIsRefused(t *testing.T) {
+	agentWith := func(nameLen int, replicas int32) *agentv1alpha1.PlatformAgent {
+		return &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: strings.Repeat("a", nameLen), Namespace: "default"},
+			Spec: agentv1alpha1.PlatformAgentSpec{AgentSpec: agentv1alpha1.AgentSpec{
+				Deployment: &agentv1alpha1.DeploymentSpec{
+					CredentialProxy: &agentv1alpha1.CredentialProxySpec{Exec: &agentv1alpha1.CredentialProxyExecSpec{Replicas: &replicas}},
+				},
+			}},
+		}
+	}
+	val := &PlatformAgentCustomValidator{}
+	if _, err := val.ValidateCreate(context.Background(), agentWith(36, 2)); err != nil {
+		t.Errorf("a 36-character name with the tier on is refused: %v", err)
+	}
+	if _, err := val.ValidateCreate(context.Background(), agentWith(37, 0)); err != nil {
+		t.Errorf("a 37-character name with the tier off is refused: %v", err)
+	}
+	_, err := val.ValidateCreate(context.Background(), agentWith(37, 2))
+	msg := fieldErrorMessage(t, err, "metadata.name")
+	if !strings.Contains(msg, "must be at most 36") {
+		t.Errorf("message %q does not name the limit", msg)
+	}
 }
 
 func sandboxResourcesAgent(override *corev1.ResourceRequirements) *agentv1alpha1.PlatformAgent {
@@ -600,4 +627,29 @@ func TestShellSandboxLimitAloneDrawsTheNote(t *testing.T) {
 	if !noted {
 		t.Errorf("warnings = %v; want the limit-without-request note naming the shell", warnings)
 	}
+}
+
+// TestCredentialProxyOverrideIsValidatedAgainstTheLatchedRow: the row an
+// override is checked against is the one the CR renders, read off the status
+// the object carries. A 3 CPU request crosses the small row's 2 CPU limit and
+// sits under the fleet row's 8: an explicit fleet switched to auto keeps it,
+// since the latch stays at fleet, and auto with no latch yet refuses it.
+func TestCredentialProxyOverrideIsValidatedAgainstTheLatchedRow(t *testing.T) {
+	val := &PlatformAgentCustomValidator{}
+	override := &corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3")}}
+	explicitFleet := proxyResourcesAgent(override)
+	explicitFleet.Spec.Deployment.SizingProfile = "fleet"
+	explicitFleet.Status.EffectiveSizingTier = "fleet"
+	if _, err := val.ValidateUpdate(context.Background(), explicitFleet.DeepCopy(), explicitFleet); err != nil {
+		t.Fatalf("an explicit fleet refused a 3 CPU request: %v", err)
+	}
+	switchedToAuto := explicitFleet.DeepCopy()
+	switchedToAuto.Spec.Deployment.SizingProfile = "auto"
+	if _, err := val.ValidateUpdate(context.Background(), explicitFleet, switchedToAuto); err != nil {
+		t.Fatalf("the switch from fleet to auto was refused for an override the latched fleet row admits: %v", err)
+	}
+	unlatched := switchedToAuto.DeepCopy()
+	unlatched.Status.EffectiveSizingTier = ""
+	_, err := val.ValidateUpdate(context.Background(), explicitFleet, unlatched)
+	assertFieldError(t, err, "spec.deployment.credentialProxy.resources.requests.cpu")
 }

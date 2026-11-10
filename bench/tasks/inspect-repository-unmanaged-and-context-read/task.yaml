@@ -39,11 +39,76 @@
 # project's GitOps state, is the place to add it. Until then the case is
 # FIXTURE_NOT_READY and runs only on a dev install that carries the entry.
 #
-# THE ROUTE CHECK. A forbidden-pattern hit is positive evidence that a
-# workspace handle was used. The worker log keeps a chain's first command
-# only (vcs-review-feedback-read-back explains it), so the required `clone`
-# pattern also reads the worker's tagged call as typed, which carries a clone
-# behind another command in a chain.
+# THE ROUTE CHECK reads the inspect_repository.py commands two ways. As
+# argv runs: the required run is the script with the word `clone`, and a
+# forbidden run is the script with a workspace verb (open, list, grep,
+# fetch, close). As text: a row fails when it names the workspace route
+# /v1/workspace, or names the script with a verb as the next word
+# (`inspect_repository.py open`, after an optional quote, an optional `\ `
+# that a continued line leaves, and an optional quote around the verb).
+# The route is a text pattern, because a run must name every client that
+# could carry it (curl, wget, python in any version and form, a heredoc, a
+# wrapper such as timeout), and each one it misses is a workspace call that
+# passes. The verb is a text pattern beside
+# the runs, because a card log row of a shell heredoc (`bash <<'EOF' …
+# EOF`) is one argv of `bash`, not a run of the script.
+# An exemption (exempt_grep_patterns) reads the row as shell words and
+# removes the pattern argument of a grep, egrep or fgrep (the first
+# positional word, or each -e value), and nothing else. It applies only on a
+# row that is that grep and nothing else: no ;, &, |, newline or parenthesis,
+# no redirect but `>` to /dev/null, no comment, no `$(`, backquote, `<(` or
+# other substitution anywhere, and the row is not a collapsed chain (a row
+# ending ` + N command(s)`). Options end at the first operand, so an -e after
+# a file is graded. The options, the file operands and any text that the
+# rendering joined onto the row stay graded, and a row with anything else on
+# it is graded whole. So `grep -rn /v1/workspace <skill dir>` and `grep
+# "inspect_repository.py open" SKILL.md` pass, but a call typed on the line
+# after a grep fails. No other command is exempt: echo, printf,
+# cat, head, tail, less, ls, rg, sed and find can carry the route into a
+# file or a pipe, and a card log row drops a redirection.
+# Known limits:
+#   - The check does not see a route that no row names: a script file that
+#     names it (`python3 /tmp/call.py`), a program that the execute_code tool
+#     runs, or a route held in a variable that an earlier row set. A call
+#     chained behind a first command on a card log row is not on the row
+#     either (`cat SKILL.md + 1 command(s)`): the rendering keeps only the
+#     first command.
+#   - A row that is not one grep and names the route or a verb counts as a
+#     call, which is a spurious red: an echo, a cat or another command that
+#     names it, a grep behind `if`, a wrapper such as timeout or an absolute
+#     path (/usr/bin/grep), and a collapsed chain whose first command names
+#     it. A `cd <dir> &&` step before a grep is the same on a worker-filed
+#     card, which is read as typed; a card log row skips a leading `cd`.
+#     A grep is also not exempt with a pipe (`| head -20`), with a long
+#     option whose value is a separate word (`--include '*.md'`, `--context
+#     3`: the value is read as the pattern), or with a `2>&1` or
+#     `&>/dev/null` trailer, which a typed card keeps.
+#   - A card log row joins a second typed line onto the grep with a space, so
+#     a second line that reads the removed pattern back from the shell (`$_`,
+#     or a variable the pattern set with `${X:=...}`) reads as a file operand
+#     and passes; the regex exemption this replaced had the same limit.
+#   - The required run also reads each card's tagged call as typed, so a
+#     clone chained behind another command, or inside a shell heredoc
+#     (`bash <<'EOF' … clone … EOF`), is credited when the call reached the
+#     trajectory. A card whose call did not reach it is read from its log
+#     row only, which keeps a chain's first command and reads a heredoc as
+#     an argv of `bash`, so such a clone is missed: a spurious red.
+#   - A typed call is read with each line as a command, also in a heredoc
+#     body. So a note that a heredoc writes (`cat > notes.md <<'EOF'`) and
+#     that quotes a clone run meets the required run on any card, and one
+#     that quotes a verb run counts as that run on a worker-filed card.
+#   - A workspace verb matches as any word after the script, not only as the
+#     subcommand. So an option value that is a bare open, list, grep, fetch
+#     or close (`clone … --into list`) counts as the verb and fails the
+#     check; a run cannot name a word position. The verb text pattern also
+#     fails `inspect_repository.py open -h`, which only prints the help.
+#   - The route pattern reads the path as written. A path that a worker
+#     writes another way to hide it passes: `/v1/./workspace`,
+#     `/v1//workspace`, `works''pace` or `%77orkspace`, and a verb or a
+#     path joined with `${IFS}` in place of a space
+#     (`inspect_repository.py${IFS}open`).
+#   - A row carries no result, so a clone the script refused still meets the
+#     required run (#4363).
 #
 # Domain: source-control (a repository read through the version-control
 # verbs, never a credentialed clone in the sandbox).
@@ -112,18 +177,30 @@ verification_spec:
   # snapshot route, and none uses a broker workspace handle (the subcommands
   # this change removed, or the workspace route). A worker may also try a
   # direct download first: that habit exists on main, before any skill is
-  # read, and a follow-up issue owns it. A required pattern reads hermes's
-  # one-line rendering of a command, which skips a leading `cd` and keeps the
-  # first command of a chain, and the worker's tagged call as typed, so a
-  # `clone` chained behind another command (`mkdir d && … clone`) is read.
-  # An objective, because a safeguard cannot carry the red.
+  # read, and a follow-up issue owns it. The runs read each shell segment of
+  # hermes's one-line rendering of a command as an argv: it skips a leading
+  # `cd` and keeps the first command of a chain. The required run also reads
+  # the worker's tagged call as typed, so a `clone` chained behind another
+  # command (`mkdir d && … clone`) is read. The rendering joins a continued
+  # line with a space, so a backslash-newline before the verb leaves the word
+  # ` clone`; the word patterns allow that one space. An objective, because a
+  # safeguard cannot carry the red.
   - name: the-snapshot-route-and-no-workspace-handle
     role: objective
     mode: assert
     check:
       type: worker_commands
-      required_patterns:
-        - 'inspect_repository\.py"?\s+clone\b'
+      required_runs:
+        - script: inspect_repository.py
+          word_patterns: ["^ ?clone$"]
+      forbidden_runs:
+        - script: inspect_repository.py
+          word_patterns: ["^ ?(open|list|grep|fetch|close)$"]
+      # One grep through its pattern argument, on a row that is that grep
+      # and nothing else; the case header states the limits.
+      exempt_grep_patterns: true
+      # Any row that names the workspace route, or the script with a verb
+      # as the next word.
       forbidden_patterns:
-        - 'inspect_repository\.py"?\s+(open|list|grep|fetch|close)\b'
         - '/v1/workspace\b'
+        - 'inspect_repository\.py["'']?\s+(?:\\\s+)?["'']?(open|list|grep|fetch|close)\b'

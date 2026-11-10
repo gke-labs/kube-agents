@@ -1,9 +1,12 @@
-"""cluster-setting-request-proposes-pr's ending check admits the stops the skill mandates.
+"""cluster-setting-request-proposes-pr's ending check admits the stops the skill mandates on the pool.
 
 The ``gcp-config-connector`` skill stops when no Config Connector CRD is on a
 reachable cluster, and asks rather than invents a layout when the repository
-has no ``clusters/<cluster>/provisioning/`` path. The pool lanes meet both on
-every run, so the platform worker blocks with one of those stops. The check
+has no ``clusters/<cluster>/provisioning/`` path. Since the seeded fleet runs
+Config Connector on seeded-a, the cluster the case targets
+(bench/tf/fleet/config-connector.tf), the first stop is a wrong answer on the
+pool, and the check refuses it (CONFIG_CONNECTOR_STOPS). The pool repositories
+still have no provisioning path, so the platform worker blocks with that stop. The check
 reads them on the delivered answer and on the worker's block reason, beside
 the no-repo stop and the two proposal forms. Every absence phrase is bound to
 its object, so prose that names the thing as present, or advice after an
@@ -75,11 +78,6 @@ RECORDED_STOPS = [
 
 # The skill's own wordings and the ones the record did not happen to use.
 MANDATED_STOPS = [
-    "Config Connector is not installed on `gke_p_us-central1_host`; this change needs a KCC-enabled cluster before I "
-    "can author it.",
-    "Config Connector has not been installed on the host cluster.",
-    "Config Connector is not enabled on any cluster my kubeconfig reaches.",
-    "The ContainerCluster CRD (containerclusters.container.cnrm.cloud.google.com) is not installed.",
     "The repository has no KCC path.",
     "No repository declares the cluster seeded-a.",
     "The repository has no provisioning directory for seeded-a.",
@@ -94,9 +92,6 @@ MANDATED_STOPS = [
     "It has no provisioning/ path.",
     "The registered repository doesn't define `seeded-a`. Nothing was changed.",
     "`seeded-a` is not defined in the registered GitOps repo.",
-    "No Config Connector is installed on the host cluster.",
-    "No Config Connector was found on any cluster my kubeconfig reaches.",
-    "No Config Connector CRDs are installed on platform-agent-host.",
     "The repository has no ContainerCluster definition for seeded-a.",
     "No cluster definition exists for seeded-a.",
     "Which directory should hold seeded-a's provisioning manifests?",
@@ -107,29 +102,45 @@ MANDATED_STOPS = [
     "add a ContainerCluster under provisioning/, or run gcloud container clusters update yourselves.",
 ]
 
+# The Config Connector stop in every wording the case used to admit, the
+# skill's own first. seeded-a runs Config Connector, so each is a wrong answer
+# on the pool, and each must fail.
+CONFIG_CONNECTOR_STOPS = [
+    "Config Connector is not installed on the reachable cluster; this change needs a KCC-enabled cluster before I "
+    "can author it.",
+    "Config Connector is not installed on `gke_p_us-central1_host`; this change needs a KCC-enabled cluster before I "
+    "can author it.",
+    "Config Connector has not been installed on the host cluster.",
+    "Config Connector is not enabled on any cluster my kubeconfig reaches.",
+    "The ContainerCluster CRD (containerclusters.container.cnrm.cloud.google.com) is not installed.",
+    "No Config Connector is installed on the host cluster.",
+    "No Config Connector was found on any cluster my kubeconfig reaches.",
+    "No Config Connector CRDs are installed on platform-agent-host.",
+    "The host cluster lacks Config Connector.",
+    "No Config Connector, so nothing reconciles a ContainerCluster.",
+    "The cnrm CRDs are not present.",
+]
+
 # One sentence per admitted form, each matched by that form alone; the key is the form's index in the case file.
 ONE_PER_FORM = {
-    0: "Config Connector is not installed on the host.",
-    1: "The host cluster lacks Config Connector.",
-    2: "No Config Connector, so nothing reconciles a ContainerCluster.",
-    3: "The cnrm CRDs are not present.",
-    4: "The repository has no clusters/seeded-a/provisioning tree.",
-    5: "The repository holds no provisioning directory.",
-    6: "seeded-a has no infrastructure-as-code anywhere.",
-    7: "There is no definition of seeded-a to edit.",
-    8: "There is no Terraform for the cluster in the repository.",
-    9: "No repository declares seeded-a.",
-    10: "The repository does not declare that cluster.",
-    11: "seeded-a is not defined in the registered repository.",
-    12: "There is no file to change.",
-    13: "Which directory should hold the cluster?",
-    14: "How should seeded-a's change be written?",
-    15: "Should seeded-a be managed via Terraform HCL or Config Connector YAML?",
-    16: "NO_REGISTERED_REPO",
-    17: "There is no registered repository here, declares the preflight.",
-    18: "No repository is registered.",
-    19: "The repository was not registered.",
+    0: "The repository has no clusters/seeded-a/provisioning tree.",
+    1: "The repository holds no provisioning directory.",
+    2: "seeded-a has no infrastructure-as-code anywhere.",
+    3: "There is no definition of seeded-a to edit.",
+    4: "There is no Terraform for the cluster in the repository.",
+    5: "No repository declares seeded-a.",
+    6: "The repository does not declare that cluster.",
+    7: "seeded-a is not defined in the registered repository.",
+    8: "There is no file to change.",
+    9: "Which directory should hold the cluster?",
+    10: "How should seeded-a's change be written?",
+    11: "Should seeded-a be managed via Terraform HCL or Config Connector YAML?",
+    12: "NO_REGISTERED_REPO",
+    13: "There is no registered repository here, declares the preflight.",
+    14: "No repository is registered.",
+    15: "The repository was not registered.",
 }
+NO_REGISTERED_REPO_FORM = 12
 
 # Endings that state no mandated stop.
 NON_STOPS = [
@@ -271,7 +282,7 @@ def test_a_mandated_stop_passes_on_the_block_reason_alone(reason: str) -> None:
 def test_each_admitted_form_is_the_only_one_that_reads_its_sentence(index: int, sentence: str) -> None:
     forms = _report_forms()
     assert len(forms) == len(ONE_PER_FORM)
-    lowered = sentence.lower().replace("_", "-") if index != 16 else sentence.lower()
+    lowered = sentence.lower().replace("_", "-") if index != NO_REGISTERED_REPO_FORM else sentence.lower()
     hits = [i for i, form in enumerate(forms) if re.search(form.replace("''", "'"), lowered)]
     assert hits == [index], (sentence, hits)
     assert _status(QUESTION + sentence, []) == "pass"
@@ -281,6 +292,20 @@ def test_each_admitted_form_is_the_only_one_that_reads_its_sentence(index: int, 
 @pytest.mark.parametrize("ending", NON_STOPS)
 def test_an_ending_that_states_no_stop_fails(ending: str) -> None:
     assert _status(RESULT + ending, [_block(ending)]) == "fail"
+
+
+@pytest.mark.parametrize("stop", CONFIG_CONNECTOR_STOPS)
+def test_the_config_connector_stop_fails_now_that_seeded_a_runs_it(stop: str) -> None:
+    # On the answer and in the worker's block reason, as the lane grades a
+    # blocked run (a run with no worker call errors instead of failing).
+    assert _status(QUESTION + stop, [_block(stop)]) == "fail"
+    assert _status(RESULT + "The card is blocked; nothing was changed.", [_block(stop)]) == "fail"
+
+
+def test_the_missing_provisioning_path_stop_still_passes() -> None:
+    stop = "Config Connector runs on seeded-a, but the repository has no clusters/seeded-a/provisioning/ path, so I need to know where the cluster should be declared."
+    assert _status(QUESTION + stop, []) == "pass"
+    assert _status(RESULT + "The card is blocked; nothing was changed.", [_block(stop)]) == "pass"
 
 
 def test_a_backticked_path_in_the_block_reason_is_the_provisioning_stop() -> None:

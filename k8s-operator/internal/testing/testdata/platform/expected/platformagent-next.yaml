@@ -376,6 +376,11 @@ data:
         timeout: 10
         url: http://127.0.0.1:8651/hermes/tool-events
     kanban:
+      admission:
+        fail_closed: true
+        memory_budget_mib: 4096
+        queue_bound_seconds: 600
+        worker_rss_cap_mib: 1536
       max_in_progress: 6
     model:
       api_key: none
@@ -612,6 +617,26 @@ metadata:
       name: platformagent
       uid: ""
 ---
+apiVersion: v1
+data:
+  rules.json: ""
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-event-watcher-alert-exclude
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -724,13 +749,16 @@ metadata:
       name: platformagent
       uid: ""
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: platformagent-kube-proxy
       kubeagents.x-k8s.io/component: kube-proxy
   strategy:
-    type: Recreate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+    type: RollingUpdate
   template:
     metadata:
       annotations:
@@ -758,8 +786,8 @@ spec:
               value: read-only-dry-run
             - name: KUBE_PROXY_REDACT_SECRETS
               value: "true"
-            - name: KUBE_PROXY_DEFAULT_CLUSTER
-              value: gke_example-project_us-central1-a_cluster-a
+            - name: GOMEMLIMIT
+              value: "912680550"
             - name: CREDENTIAL_PROXY_AUDIENCE
               value: kubeagents-credential-proxy
             - name: CREDENTIAL_PROXY_ALLOWED_CALLERS
@@ -776,6 +804,10 @@ spec:
               value: service.namespace=kubeagents-system,k8s.namespace.name=kubeagents-system,kubeagents.agent_type=platform,kubeagents.agent_name=platformagent
           image: ghcr.io/gke-labs/kube-agents/kube-proxy:latest
           imagePullPolicy: IfNotPresent
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
           name: kube-proxy
           ports:
             - containerPort: 8443
@@ -796,10 +828,10 @@ spec:
           resources:
             limits:
               cpu: "1"
-              memory: 512Mi
+              memory: 1Gi
             requests:
               cpu: 100m
-              memory: 256Mi
+              memory: 512Mi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -820,6 +852,16 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       serviceAccountName: kubeagents-platform-agent
+      topologySpreadConstraints:
+        - labelSelector:
+            matchLabels:
+              app: platformagent-kube-proxy
+              kubeagents.x-k8s.io/component: kube-proxy
+          matchLabelKeys:
+            - pod-template-hash
+          maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
       volumes:
         - name: kube-proxy-tls
           secret:
@@ -838,6 +880,36 @@ spec:
                       path: ca.crt
                   name: kube-root-ca.crt
 status: {}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-kube-proxy
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: platformagent-kube-proxy
+      kubeagents.x-k8s.io/component: kube-proxy
+  unhealthyPodEvictionPolicy: AlwaysAllow
+status:
+  currentHealthy: 0
+  desiredHealthy: 0
+  disruptionsAllowed: 0
+  expectedPods: 0
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -1374,8 +1446,6 @@ spec:
               value: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
             - name: CREDENTIAL_PROXY_KUBE_TOKEN_FILE
               value: /var/run/secrets/kubernetes.io/serviceaccount/token
-            - name: CREDENTIAL_PROXY_CONTENT_WORKSPACE
-              value: "1"
             - name: GKE_PROJECT_ID
               value: example-project
             - name: GKE_CLUSTER_NAME
@@ -1671,6 +1741,8 @@ spec:
               value: platformagent-gitops-state
             - name: GITOPS_STATE_PATH
               value: /etc/gitops/managed_repos
+            - name: INCIDENT_WORKLOAD_DEDUP_SECONDS
+              value: "3600"
             - name: SESSION_KV_API_KEY
               valueFrom:
                 secretKeyRef:
@@ -1726,6 +1798,8 @@ spec:
               value: /etc/a2a-nats-ca/ca.crt
             - name: A2A_BUS_USER
               value: agent
+            - name: A2A_NOTIFY_PLATFORM
+              value: google_chat
             - name: A2A_NOTIFY_CONVERSATIONS
               value: google_chat
             - name: A2A_ACTIVITY_SECRET
@@ -1776,7 +1850,7 @@ spec:
               memory: 8Gi
             requests:
               cpu: "1"
-              memory: 2Gi
+              memory: 4Gi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -1949,6 +2023,8 @@ spec:
               value: platformagent-gitops-state
             - name: GITOPS_STATE_PATH
               value: /etc/gitops/managed_repos
+            - name: INCIDENT_WORKLOAD_DEDUP_SECONDS
+              value: "3600"
             - name: SESSION_KV_API_KEY
               valueFrom:
                 secretKeyRef:
@@ -2000,6 +2076,8 @@ spec:
               value: example-project
             - name: NATS_CA_FILE
               value: /etc/a2a-nats-ca/ca.crt
+            - name: A2A_NOTIFY_PLATFORM
+              value: google_chat
             - name: A2A_NOTIFY_CONVERSATIONS
               value: google_chat
             - name: PATH
@@ -2028,6 +2106,8 @@ spec:
                   name: platformagent-a2a-nats-creds
             - name: BRIDGE_CONCURRENCY
               value: "10"
+            - name: BRIDGE_DURABLE_PRECREATED
+              value: "true"
             - name: A2A_ACTIVITY_SECRET
               valueFrom:
                 secretKeyRef:
@@ -2036,6 +2116,13 @@ spec:
                   optional: true
             - name: API_SERVER_KEY
               value: cluster-internal-trusted
+            - name: BRIDGE_MEMORY_LIMIT_BYTES
+              valueFrom:
+                resourceFieldRef:
+                  divisor: "0"
+                  resource: limits.memory
+            - name: BRIDGE_DEBUG_ERROR_TEXT
+              value: "false"
             - name: A2A_CAPABILITY_REQUIRED
               value: "true"
           image: ghcr.io/gke-labs/kube-agents/hermes-bridge:latest
@@ -2044,10 +2131,10 @@ spec:
           resources:
             limits:
               cpu: "1"
-              memory: 512Mi
+              memory: 1Gi
             requests:
-              cpu: 100m
-              memory: 256Mi
+              cpu: 250m
+              memory: 512Mi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -2195,6 +2282,13 @@ spec:
               value: http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765
             - name: WATCHER_BROKER_TOKEN_FILE
               value: /var/run/secrets/kubeagents/watcher-proxy/token
+            - name: WATCHER_ALERT_EXCLUDE
+              valueFrom:
+                configMapKeyRef:
+                  key: rules.json
+                  name: platformagent-event-watcher-alert-exclude
+            - name: WATCHER_ALERT_EXCLUDE_FILE
+              value: /etc/kube-agents/event-watcher/rules.json
             - name: CREDENTIAL_PROXY_WORKSPACE_ROOT
               value: /opt/data
             - name: EVENT_WATCHER_CLUSTER_NAME
@@ -2255,6 +2349,9 @@ spec:
               name: platform-agent-data-vol
             - mountPath: /var/run/secrets/kubeagents/watcher-proxy
               name: watcher-credential-proxy-token
+              readOnly: true
+            - mountPath: /etc/kube-agents/event-watcher
+              name: event-watcher-alert-exclude
               readOnly: true
       securityContext:
         fsGroup: 10000
@@ -2333,6 +2430,9 @@ spec:
                         apiVersion: v1
                         fieldPath: metadata.namespace
                       path: namespace
+        - configMap:
+            name: platformagent-event-watcher-alert-exclude
+          name: event-watcher-alert-exclude
         - name: agent-credential-proxy-token
           projected:
             defaultMode: 256
@@ -2620,6 +2720,7 @@ data:
   bridge-activity-key: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
   bridge-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
   callout-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
+  console-mcp-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
   console-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
   gateway-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
   seed-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
@@ -2761,14 +2862,14 @@ apiVersion: v1
 data:
   identities.json: |
     {
-      "version": "71bdbfab26d2d89d",
+      "version": "97c8c35dd2e8d6af",
       "shard": 0,
       "shards": 1,
       "identities": [
         {
           "serviceAccount": "system:serviceaccount:kubeagents-system:platformagent-a2a-provision",
           "user": "provision",
-          "account": "APP",
+          "account": "TRUSTED",
           "grants": {
             "publish": [
               "a2a.topics.agent.platform.upgrade-readiness",
@@ -2789,6 +2890,7 @@ data:
               "$JS.API.STREAM.CREATE.KV_people",
               "$JS.API.STREAM.CREATE.KV_PROFILE_LEASES",
               "$JS.API.STREAM.CREATE.PROFILE_SUBMITS",
+              "$JS.API.STREAM.CREATE.DISPATCH_STOPS",
               "$JS.API.STREAM.INFO.TASKS",
               "$JS.API.STREAM.INFO.DIRECTORY",
               "$JS.API.STREAM.INFO.TOPICS-STATE",
@@ -2800,6 +2902,13 @@ data:
               "$JS.API.STREAM.INFO.KV_people",
               "$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
               "$JS.API.STREAM.INFO.PROFILE_SUBMITS",
+              "$JS.API.STREAM.INFO.DISPATCH_STOPS",
+              "$JS.API.CONSUMER.INFO.TASKS.gateway-relay",
+              "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay",
+              "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay.>",
+              "$JS.API.CONSUMER.INFO.TASKS.bridge-platform",
+              "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform",
+              "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform.>",
               "_INBOX.provision.>"
             ],
             "subscribe": [
@@ -2847,7 +2956,7 @@ data:
         {
           "serviceAccount": "system:serviceaccount:kubeagents-system:platformagent-a2a-verifier",
           "user": "verifier",
-          "account": "APP",
+          "account": "TRUSTED",
           "grants": {
             "publish": [
               "a2a.cap.reply.>",
@@ -2869,7 +2978,7 @@ metadata:
   annotations:
     kubeagents.x-k8s.io/a2a-authmap-shard: "0"
     kubeagents.x-k8s.io/a2a-authmap-shards: "1"
-    kubeagents.x-k8s.io/a2a-authmap-version: 71bdbfab26d2d89d
+    kubeagents.x-k8s.io/a2a-authmap-version: 97c8c35dd2e8d6af
   labels:
     app.kubernetes.io/instance: kubeagents-system-platformagent
     app.kubernetes.io/managed-by: platformagent-controller
@@ -2885,646 +2994,6 @@ metadata:
       kind: PlatformAgent
       name: platformagent
       uid: ""
----
-apiVersion: v1
-kind: Secret
-metadata:
-  labels:
-    app.kubernetes.io/instance: kubeagents-system-platformagent
-    app.kubernetes.io/managed-by: platformagent-controller
-    app.kubernetes.io/name: platform-agent
-    app.kubernetes.io/part-of: a2a-next
-    kubeagents.x-k8s.io/a2a-component: nats-config
-  name: platformagent-a2a-nats-config
-  namespace: kubeagents-system
-  ownerReferences:
-    - apiVersion: kubeagents.x-k8s.io/v1alpha1
-      blockOwnerDeletion: true
-      controller: true
-      kind: PlatformAgent
-      name: platformagent
-      uid: ""
-stringData:
-  nats.conf: |
-    # PLAYGROUND POSTURE (stage 1): single-node R1 JetStream (production: 3-node
-    # R3), no audit exporter, no breaker, gateway sweep as the only janitor. Each
-    # has a decided design in the specs (spec-nats-deployment.md); none gates
-    # letting people play.
-    #
-    # Authentication is NOT on that list any more. The auth callout is armed: a
-    # client presents a projected Kubernetes ServiceAccount token, the callout
-    # validates it against the cluster with a TokenReview, and answers with the
-    # permission set the operator mapped that identity to. Session pods go through
-    # it, and a session's grants are derived from the pod the API server attested
-    # rather than read from a map, so two sessions on one account cannot reach each
-    # other.
-    #
-    # The users that remain static below are of two kinds, and each says which it
-    # is where it is defined. Some have nothing to present: a browser, an operator
-    # at a port-forward, the callout itself, which cannot authenticate through
-    # itself. The rest have a ServiceAccount and could move tomorrow, but no client
-    # that sends a token yet - moving the identity before the program that uses it
-    # would refuse the workload at connect.
-
-    server_name: platformagent-a2a-nats
-    port: 4222
-    http: 8222
-
-    # TLS on the client listener, required of every connection: the server
-    # advertises tls_required, so a client that dials nats:// is told to upgrade
-    # and one that cannot verify this certificate is refused. The serving pair is
-    # the operator-minted one in the platformagent-a2a-nats-tls Secret,
-    # mounted as a directory (platformagent_a2a_tls.go). The monitoring port above
-    # stays plain HTTP: it carries health and stats, not payloads or tokens.
-    tls {
-      cert_file: "/etc/nats-tls/tls.crt"
-      key_file: "/etc/nats-tls/tls.key"
-    }
-
-    # A ServiceAccount token travels inside the client's CONNECT frame, and the
-    # default max_control_line of 4096 bounds that whole frame - measured, the
-    # usable room for the token itself is around 3920 bytes once the rest of the
-    # CONNECT JSON is accounted for. A plain projected token fits with room to
-    # spare; one bound to several audiences, from a client with a long name, does
-    # not. The failure is not graceful: the server closes the connection with
-    # "Maximum Control Line Exceeded" before authentication happens at all, so it
-    # reads as the bus refusing a workload rather than as a size limit.
-    max_control_line: 65536
-
-    # Websocket listener for the console page and the read-only web user.
-    #
-    # TLS, from the same serving pair as the client listener (the tls block
-    # above): the CONNECT frame carries a password, so the pod-network leg from
-    # the console server is encrypted and verified against the bus CA. The
-    # Service is ClusterIP, so nothing OUTSIDE the cluster reaches this listener.
-    # An ingress NetworkPolicy fences the pod network too: 4222 from the
-    # enumerated bus clients, 9222 from the console server alone, and no
-    # pod-network peer for 8222. The console server is admitted because it is the
-    # page's proxy. A browser reaches it through a kubectl port-forward and it
-    # forwards the websocket here over wss, with the browser's headers intact. It
-    # is not an in-cluster door for anything else. A port-forward straight to
-    # 9222 still enters from the node, which NetworkPolicy does not govern, but it
-    # now needs a TLS client that trusts the bus CA and names the Service as its
-    # server name: a browser cannot, so the page always goes through the console.
-    #
-    # The origin allow-list is the console server's origin as the browser sees it
-    # through the documented port-forward. The proxy forwards Origin unchanged,
-    # so the list still applies. WebSockets are exempt from CORS, and for as long
-    # as a port-forward runs, every page the operator's browser visits can try to
-    # open a socket through it.
-    #
-    # allowed_origins, NOT same_origin: same_origin compares the browser's Origin
-    # against the Host this listener sees, and behind the proxy that is the bus's
-    # own service name, which no browser page is served from. A CLI or Node client
-    # sends no Origin header at all, which both settings permit.
-    #
-    # Origin is browser-asserted, so this stops a browser page and nothing else.
-    # The boundary is the grant lists below.
-    websocket {
-      port: 9222
-      tls {
-        cert_file: "/etc/nats-tls/tls.crt"
-        key_file: "/etc/nats-tls/tls.key"
-      }
-      allowed_origins: ["http://localhost:8080", "http://127.0.0.1:8080"]
-    }
-
-    jetstream {
-      store_dir: /data
-      # Under the 40Gi PV; the stream max_bytes caps (20+5+1+1 GiB) plus KV live
-      # inside this.
-      max_file_store: 34359738368
-    }
-    accounts {
-      # AUTH: the auth callout service and nothing else.
-      #
-      # A dedicated account, and that is a boundary rather than tidiness. The
-      # server publishes each authorization request into THIS account and takes
-      # the first answer that comes back on the reply inbox — and it does not
-      # check that the answer's outer envelope was signed by the configured
-      # issuer (measured; the inner user JWT's signature IS checked). So anything
-      # able to publish into this account's $SYS._INBOX.> and win the race can
-      # answer an authorization request. It could not forge a grant without the
-      # issuer seed, but it could refuse one. Nothing else belongs in here.
-      AUTH {
-        users [
-          {
-            # The callout cannot authenticate through itself, so it is exempt via
-            # auth_users below and carries a password. This permission pair is
-            # the entire surface it needs: read the requests, answer them.
-            user: callout
-            password: "<GENERATED:platformagent-a2a-nats-creds/callout-password>"
-            permissions {
-              subscribe { allow = [ "$SYS.REQ.USER.AUTH" ] }
-              publish { allow = [ "$SYS._INBOX.>" ] }
-            }
-          }
-        ]
-      }
-      APP {
-        jetstream: enabled
-        users [
-          # task requester, chat-session supervisor, session-registry owner.
-          # STATIC, and this one is a sequencing fact rather than a property of
-          # the gateway. It has a ServiceAccount and could authenticate with it
-          # tomorrow; what it does not yet have is a client that presents a token
-          # instead of a password, because the gateway program lands separately
-          # from this render. Moving the identity before the program that uses it
-          # would refuse the gateway at connect on every install.
-          # Its $JS.API grant is scoped to what it emits, by name and by verb
-          # (#1666): INFO, CONSUMER.CREATE, CONSUMER.MSG.NEXT and DIRECT.GET on
-          # TASKS, and INFO, DIRECT.GET and consumer create/delete on
-          # KV_session-state, its own registry, on KV_feedback, the kept
-          # answer ratings, and on KV_people, one hashed key per chat person.
-          # So no STREAM.DELETE, PURGE,
-          # UPDATE or MSG.DELETE on any stream - one STREAM.DELETE.TASKS here
-          # used to destroy every task's history and the five consumers on it -
-          # no CONSUMER.DELETE on TASKS, and nothing at all on DIRECTORY, the
-          # topic streams or the runtime-state, cap and PROFILE_LEASES buckets.
-          {
-            user: gateway
-            password: "<GENERATED:platformagent-a2a-nats-creds/gateway-password>"
-            permissions {
-              publish {
-                allow = [
-                  "a2a.tasks.*.*.in",
-                  "a2a.tasks.*.*.supervisor",
-                  "$KV.session-state.>",
-                  "$KV.feedback.>",
-                  "$KV.people.>",
-                  "chat.console.*.out",
-                  "chat.notify.reply.agent.>",
-                  "$KV.cap.root.*",
-                  "chat.board",
-                  "$JS.API.STREAM.INFO.TASKS",
-                  "$JS.API.CONSUMER.CREATE.TASKS.>",
-                  "$JS.API.CONSUMER.MSG.NEXT.TASKS.*",
-                  "$JS.API.DIRECT.GET.TASKS.>",
-                  "$JS.API.STREAM.INFO.KV_session-state",
-                  "$JS.API.DIRECT.GET.KV_session-state.>",
-                  "$JS.API.CONSUMER.CREATE.KV_session-state.>",
-                  "$JS.API.CONSUMER.DELETE.KV_session-state.*",
-                  "$JS.API.STREAM.INFO.KV_feedback",
-                  "$JS.API.DIRECT.GET.KV_feedback.>",
-                  "$JS.API.CONSUMER.CREATE.KV_feedback.>",
-                  "$JS.API.CONSUMER.DELETE.KV_feedback.*",
-                  "$JS.API.STREAM.INFO.KV_people",
-                  "$JS.API.DIRECT.GET.KV_people.>",
-                  "$JS.API.CONSUMER.CREATE.KV_people.>",
-                  "$JS.API.CONSUMER.DELETE.KV_people.*",
-                  "$JS.ACK.TASKS.>",
-                  "$JS.FC.>",
-                  "_INBOX.gateway.>"
-                ]
-                deny = [
-                  "$JS.API.*.*.KV_cap",
-                  "$JS.API.*.*.KV_cap.>",
-                  "$JS.API.*.*.*.KV_cap",
-                  "$JS.API.*.*.*.KV_cap.>"
-                ]
-              }
-              subscribe {
-                allow = [
-                  "a2a.tasks.*.*.events",
-                  "a2a.tasks.*.*.supervisor",
-                  "a2a.agents.>",
-                  "agents.hb.>",
-                  "$KV.session-state.>",
-                  "$KV.feedback.>",
-                  "$KV.people.>",
-                  "chat.console.*.in",
-                  "chat.notify.gchat",
-                  "chat.notify.slack",
-                  "chat.notify.console",
-                  "chat.board.reply.gateway.>",
-                  "_INBOX.gateway.>"
-                ]
-                deny = [
-                  "$KV.cap.>"
-                ]
-              }
-            }
-          }
-          # the Hermes bridge sidecar: executor for the `platform` addressee only.
-          # STATIC because it shares the agent pod, and a ServiceAccount token names a
-          # pod rather than a container — a callout identity here would be the agent
-          # container's grants and this one's added together, which is the credential
-          # the retired `worker` user was. Its WRITE is narrowed to one addressee:
-          # publishing another's events is refused. Its READ is not. The JetStream
-          # grants below name the TASKS stream, and both DIRECT.GET and a consumer's
-          # filter_subject reach every addressee on it, so a holder of this password
-          # can read every session's prompts. `worker` held the identical two grants.
-          {
-            user: bridge
-            password: "<GENERATED:platformagent-a2a-nats-creds/bridge-password>"
-            permissions {
-              publish {
-                allow = [
-                  "a2a.tasks.platform.*.events",
-                  "$KV.runtime-state.>",
-                  "$JS.API.STREAM.INFO.TASKS",
-                  "$JS.API.CONSUMER.CREATE.TASKS.>",
-                  "$JS.API.CONSUMER.MSG.NEXT.TASKS.*",
-                  "$JS.API.DIRECT.GET.TASKS.>",
-                  "$JS.API.STREAM.INFO.KV_runtime-state",
-                  "$JS.API.CONSUMER.CREATE.KV_runtime-state.>",
-                  "$JS.API.CONSUMER.DELETE.KV_runtime-state.*",
-                  "$JS.ACK.TASKS.>",
-                  "$JS.FC.>",
-                  "_INBOX.bridge.>",
-                  "a2a.cap.verify.platform",
-                  "chat.board.reply.gateway.>"
-                ]
-                deny = [
-                  "$JS.API.*.*.KV_cap",
-                  "$JS.API.*.*.KV_cap.>",
-                  "$JS.API.*.*.*.KV_cap",
-                  "$JS.API.*.*.*.KV_cap.>"
-                ]
-              }
-              subscribe {
-                allow = [
-                  "a2a.tasks.platform.*.in",
-                  "$KV.runtime-state.>",
-                  "a2a.cap.reply.platform.>",
-                  "chat.board",
-                  "_INBOX.bridge.>"
-                ]
-                deny = [
-                  "$KV.cap.>"
-                ]
-              }
-            }
-          }
-          # hand-applied seed tooling. STATIC because it is applied rather than
-          # rendered: it exists on installs today, and removing its user would refuse
-          # it at connect the next time it ran. The rendered provisioner beside it
-          # does the same job through the callout.
-          # Its $JS.API grant is scoped to the streams that provisioning creates, by
-          # name and by verb (#1306): CREATE and INFO on those and nothing else, so no
-          # RESTORE, no MSG.DELETE or PURGE, no CONSUMER.CREATE and no STREAM.DELETE.
-          # No ack grant either - seed creates no consumers, so one would be pure
-          # unused capability to +TERM other principals' deliveries (the same deletion
-          # the web user got).
-          # Seed also reads no topics. "a2a topics read" is a stream API call
-          # (GetLastMsgForSubject, so $JS.API.DIRECT.GET.<stream>.<subject> on these
-          # streams, or STREAM.MSG.GET as the fallback) and the scoped grant below
-          # refuses both. Nothing runs it as seed: the seed tooling does writes and
-          # info checks only, and the a2a CLI runs in the agent pod as agent.
-          {
-            user: seed
-            password: "<GENERATED:platformagent-a2a-nats-creds/seed-password>"
-            permissions {
-              publish {
-                allow = [
-                  "a2a.topics.agent.platform.upgrade-readiness",
-                  "a2a.topics.agent.platform.topology-skew",
-                  "a2a.topics.shared.blueprint",
-                  "a2a.topics.shared.annotations",
-                  "$JS.API.INFO",
-                  "$JS.API.STREAM.NAMES",
-                  "$JS.API.STREAM.CREATE.TASKS",
-                  "$JS.API.STREAM.INFO.TASKS",
-                  "$JS.API.STREAM.CREATE.DIRECTORY",
-                  "$JS.API.STREAM.INFO.DIRECTORY",
-                  "$JS.API.STREAM.CREATE.TOPICS-STATE",
-                  "$JS.API.STREAM.INFO.TOPICS-STATE",
-                  "$JS.API.STREAM.CREATE.TOPICS-JOURNAL",
-                  "$JS.API.STREAM.INFO.TOPICS-JOURNAL",
-                  "$JS.API.STREAM.CREATE.KV_runtime-state",
-                  "$JS.API.STREAM.INFO.KV_runtime-state",
-                  "$JS.API.STREAM.CREATE.KV_session-state",
-                  "$JS.API.STREAM.INFO.KV_session-state",
-                  "$JS.API.STREAM.CREATE.KV_cap",
-                  "$JS.API.STREAM.INFO.KV_cap",
-                  "$JS.API.STREAM.CREATE.KV_feedback",
-                  "$JS.API.STREAM.INFO.KV_feedback",
-                  "$JS.API.STREAM.CREATE.KV_people",
-                  "$JS.API.STREAM.INFO.KV_people",
-                  "$JS.API.STREAM.CREATE.KV_PROFILE_LEASES",
-                  "$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
-                  "$JS.API.STREAM.CREATE.PROFILE_SUBMITS",
-                  "$JS.API.STREAM.INFO.PROFILE_SUBMITS",
-                  "_INBOX.seed.>"
-                ]
-              }
-              subscribe {
-                allow = [
-                  "a2a.topics.>",
-                  "_INBOX.seed.>"
-                ]
-              }
-            }
-          }
-          # the read surface, and one of the two credentials published to a
-          # browser by design - console is the other. STATIC permanently: a browser holds no ServiceAccount token and
-          # there is no mechanism by which it could. Read-only is not expressible as
-          # a subject list - JetStream puts the reach in the request BODY - so the JS
-          # API grants are enumerated per stream and there is no ack grant.
-          {
-            user: web
-            password: "<GENERATED:platformagent-a2a-nats-creds/web-password>"
-            permissions {
-              publish {
-                allow = [
-                  "$JS.API.INFO",
-                  "$JS.API.STREAM.INFO.TASKS",
-                  "$JS.API.STREAM.INFO.DIRECTORY",
-                  "$JS.API.STREAM.INFO.TOPICS-STATE",
-                  "$JS.API.STREAM.INFO.TOPICS-JOURNAL",
-                  "$JS.API.CONSUMER.CREATE.TASKS.>",
-                  "$JS.API.CONSUMER.CREATE.DIRECTORY.>",
-                  "$JS.API.CONSUMER.CREATE.TOPICS-STATE.>",
-                  "$JS.API.CONSUMER.CREATE.TOPICS-JOURNAL.>",
-                  "$JS.API.CONSUMER.INFO.TASKS.*",
-                  "$JS.API.CONSUMER.INFO.DIRECTORY.*",
-                  "$JS.API.CONSUMER.INFO.TOPICS-STATE.*",
-                  "$JS.API.CONSUMER.INFO.TOPICS-JOURNAL.*",
-                  "$JS.API.CONSUMER.MSG.NEXT.TASKS.*",
-                  "$JS.API.CONSUMER.MSG.NEXT.DIRECTORY.*",
-                  "$JS.API.CONSUMER.MSG.NEXT.TOPICS-STATE.*",
-                  "$JS.API.CONSUMER.MSG.NEXT.TOPICS-JOURNAL.*",
-                  "_INBOX.web.>"
-                ]
-              }
-              subscribe {
-                allow = [
-                  "a2a.>",
-                  "_INBOX.web.>"
-                ]
-                deny = [
-                  "a2a.cap.>"
-                ]
-              }
-            }
-          }
-          # the web console: web's read surface plus one publish, chat.console.*.in,
-          # which is the gateway's console adapter's inbound subject. STATIC for
-          # web's reason. No JetStream verb on any KV_* stream: STREAM.INFO's
-          # subjects_filter would list every key.
-          {
-            user: console
-            password: "<GENERATED:platformagent-a2a-nats-creds/console-password>"
-            permissions {
-              publish {
-                allow = [
-                  "$JS.API.INFO",
-                  "$JS.API.STREAM.INFO.TASKS",
-                  "$JS.API.STREAM.INFO.DIRECTORY",
-                  "$JS.API.STREAM.INFO.TOPICS-STATE",
-                  "$JS.API.STREAM.INFO.TOPICS-JOURNAL",
-                  "$JS.API.CONSUMER.CREATE.TASKS.>",
-                  "$JS.API.CONSUMER.CREATE.DIRECTORY.>",
-                  "$JS.API.CONSUMER.CREATE.TOPICS-STATE.>",
-                  "$JS.API.CONSUMER.CREATE.TOPICS-JOURNAL.>",
-                  "$JS.API.CONSUMER.INFO.TASKS.*",
-                  "$JS.API.CONSUMER.INFO.DIRECTORY.*",
-                  "$JS.API.CONSUMER.INFO.TOPICS-STATE.*",
-                  "$JS.API.CONSUMER.INFO.TOPICS-JOURNAL.*",
-                  "$JS.API.CONSUMER.MSG.NEXT.TASKS.*",
-                  "$JS.API.CONSUMER.MSG.NEXT.DIRECTORY.*",
-                  "$JS.API.CONSUMER.MSG.NEXT.TOPICS-STATE.*",
-                  "$JS.API.CONSUMER.MSG.NEXT.TOPICS-JOURNAL.*",
-                  "$JS.API.DIRECT.GET.PROFILE_SUBMITS.>",
-                  "chat.console.*.in",
-                  "_INBOX.console.>"
-                ]
-              }
-              subscribe {
-                allow = [
-                  "a2a.>",
-                  "chat.console.*.out",
-                  "_INBOX.console.>"
-                ]
-                deny = [
-                  "a2a.cap.>"
-                ]
-              }
-            }
-          }
-        ]
-      }
-      # $SYS: human operators and monitoring only; no agent authenticates here.
-      SYS {
-        users [
-          # human operators and monitoring. No agent ever authenticates here.
-          # STATIC: the holder is a person with a port-forward or a scrape config.
-          {
-            user: sys
-            password: "<GENERATED:platformagent-a2a-nats-creds/sys-password>"
-          }
-        ]
-      }
-    }
-    system_account: SYS
-
-    # The auth callout: who a connection is, decided against the cluster that
-    # issued its identity rather than against a password this file rendered.
-    #
-    # What changes for a client: it presents a projected ServiceAccount token
-    # instead of a password, the callout validates that token with a TokenReview
-    # against the local API server, and the grants it gets back are the ones the
-    # operator rendered for that ServiceAccount. What does NOT change is where
-    # enforcement happens — the permission set still arrives before the connection
-    # is usable, and the server still refuses on it without consulting any
-    # application code.
-    authorization {
-      # Two seconds, and this is a ceiling rather than a preference.
-      #
-      # The server starts a first-ping timer on a connection that has not yet
-      # authenticated, at roughly two seconds. If the callout has not answered by
-      # then the client receives a PING where the Go client library requires a
-      # PONG, and it aborts the connect reporting "expected 'PONG', got 'PING'" —
-      # which names nothing about authorization and sends whoever is debugging it
-      # to the network layer. Measured: at timeout 2 the failure is a clean
-      # Authorization Violation at a predictable deadline; at 3 or above it is
-      # that message instead. A merely SLOW callout hits it too, so the real
-      # budget for a TokenReview round trip is under two seconds whatever this
-      # number says.
-      timeout: 2
-
-      auth_callout {
-        # Public halves only. The seeds live in the callout's own Secret, read by
-        # the callout Deployment and nothing else. The issuer signs the user JWTs
-        # that carry the permissions this server enforces, so its holder can mint a
-        # user with any grants at all — including publish on $KV.cap.root.> and read
-        # on $KV.cap.>, which is the whole capability store. See the callout-keys
-        # Secret for the custody note.
-        issuer: <GENERATED:platformagent-a2a-callout-keys/issuer-public>
-        account: AUTH
-
-        # The request carries the client's raw ServiceAccount token, so it is
-        # encrypted in flight to the callout. Note the server does not require the
-        # RESPONSE to be encrypted even with this set, so response confidentiality
-        # is the callout's own discipline rather than something enforced here.
-        xkey: <GENERATED:platformagent-a2a-callout-keys/xkey-public>
-
-        # Exempt from the callout: authenticated from this file, by username.
-        #
-        # This is a bypass and not a fallback — a listed user with a wrong
-        # password is refused statically and never reaches the callout at all.
-        # The list is the callout itself, which cannot authenticate through
-        # itself, plus every identity marked STATIC above. The session entry is
-        # absent exactly because it is not one: a session pod presents a
-        # pod-bound ServiceAccount token and the callout scopes it to its own
-        # task. Do not read this list as the session path.
-        #
-        # A name is here for one of three reasons, and each identity's own comment
-        # above says which. It can hold no projected token at all — the browser's
-        # two credentials, web and console, the $SYS login held by a person, the
-        # seed tooling that is applied rather than run. Or it is a sidecar, which
-        # a ServiceAccount token cannot name apart from the container beside it —
-        # the bridge, whose own comment above says what a callout entry there
-        # would merge. Or it could move and has not: gateway, which is the
-        # remaining migration. The first two reasons are permanent; only the
-        # third is a migration.
-        auth_users: [ callout, gateway, bridge, seed, web, console, sys ]
-      }
-    }
----
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  labels:
-    app.kubernetes.io/instance: kubeagents-system-platformagent
-    app.kubernetes.io/managed-by: platformagent-controller
-    app.kubernetes.io/name: platform-agent
-    app.kubernetes.io/part-of: a2a-next
-    kubeagents.x-k8s.io/a2a-component: nats
-  name: platformagent-a2a-nats
-  namespace: kubeagents-system
-  ownerReferences:
-    - apiVersion: kubeagents.x-k8s.io/v1alpha1
-      blockOwnerDeletion: true
-      controller: true
-      kind: PlatformAgent
-      name: platformagent
-      uid: ""
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: platformagent-a2a-nats
-  serviceName: platformagent-a2a-nats
-  template:
-    metadata:
-      annotations:
-        kubeagents.x-k8s.io/a2a-config-hash: <SHA256_FOR_TESTS>
-      labels:
-        app: platformagent-a2a-nats
-        app.kubernetes.io/instance: kubeagents-system-platformagent
-        app.kubernetes.io/managed-by: platformagent-controller
-        app.kubernetes.io/name: platform-agent
-        app.kubernetes.io/part-of: a2a-next
-        kubeagents.x-k8s.io/a2a-component: nats
-    spec:
-      automountServiceAccountToken: false
-      containers:
-        - args:
-            - -c
-            - /etc/nats/nats.conf
-          image: nats:2.10-alpine
-          name: nats
-          ports:
-            - containerPort: 4222
-              name: client
-            - containerPort: 8222
-              name: monitor
-            - containerPort: 9222
-              name: websocket
-          readinessProbe:
-            httpGet:
-              path: /healthz
-              port: monitor
-          resources:
-            limits:
-              cpu: "1"
-              memory: 1Gi
-            requests:
-              cpu: 250m
-              memory: 512Mi
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop:
-                - ALL
-            readOnlyRootFilesystem: true
-          volumeMounts:
-            - mountPath: /etc/nats
-              name: config
-              readOnly: true
-            - mountPath: /etc/nats-tls
-              name: tls
-              readOnly: true
-            - mountPath: /data
-              name: data
-      securityContext:
-        fsGroup: 1000
-        runAsNonRoot: true
-        runAsUser: 1000
-        seccompProfile:
-          type: RuntimeDefault
-      volumes:
-        - name: config
-          secret:
-            secretName: platformagent-a2a-nats-config
-        - name: tls
-          secret:
-            secretName: platformagent-a2a-nats-tls
-  updateStrategy: {}
-  volumeClaimTemplates:
-    - metadata:
-        labels:
-          app.kubernetes.io/instance: kubeagents-system-platformagent
-          app.kubernetes.io/managed-by: platformagent-controller
-          app.kubernetes.io/name: platform-agent
-          app.kubernetes.io/part-of: a2a-next
-          kubeagents.x-k8s.io/a2a-component: nats
-        name: data
-      spec:
-        accessModes:
-          - ReadWriteOnce
-        resources:
-          requests:
-            storage: 40Gi
-      status: {}
-status:
-  availableReplicas: 0
-  replicas: 0
----
-apiVersion: v1
-kind: Service
-metadata:
-  labels:
-    app.kubernetes.io/instance: kubeagents-system-platformagent
-    app.kubernetes.io/managed-by: platformagent-controller
-    app.kubernetes.io/name: platform-agent
-    app.kubernetes.io/part-of: a2a-next
-    kubeagents.x-k8s.io/a2a-component: nats
-  name: platformagent-a2a-nats
-  namespace: kubeagents-system
-  ownerReferences:
-    - apiVersion: kubeagents.x-k8s.io/v1alpha1
-      blockOwnerDeletion: true
-      controller: true
-      kind: PlatformAgent
-      name: platformagent
-      uid: ""
-spec:
-  ports:
-    - name: client
-      port: 4222
-      targetPort: 0
-    - name: monitor
-      port: 8222
-      targetPort: 0
-    - name: websocket
-      port: 9222
-      targetPort: 0
-  selector:
-    app: platformagent-a2a-nats
-status:
-  loadBalancer: {}
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -3709,7 +3178,7 @@ spec:
             - name: A2A_TASK_CREDENTIAL_MAX_LIFETIME
               value: 6h0m0s
             - name: A2A_RESERVED_PRINCIPALS
-              value: callout,gateway,bridge,seed,web,console,sys
+              value: callout,gateway,bridge,seed,web,console,console-mcp,sys
             - name: A2A_RESERVED_ADDRESSEES
               value: platform
             - name: A2A_TASK_SIGNING_PUBLIC_KEYS
@@ -3859,6 +3328,874 @@ subjects:
   - kind: ServiceAccount
     name: platformagent-a2a-callout
     namespace: kubeagents-system
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: nats-config
+  name: platformagent-a2a-nats-config
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+stringData:
+  nats.conf: |
+    # PLAYGROUND POSTURE (stage 1): single-node R1 JetStream (production: 3-node
+    # R3), no audit exporter, no breaker, gateway sweep as the only janitor. Each
+    # has a decided design in the specs (spec-nats-deployment.md); none gates
+    # letting people play.
+    #
+    # Authentication is NOT on that list any more. The auth callout is armed: a
+    # client presents a projected Kubernetes ServiceAccount token, the callout
+    # validates it against the cluster with a TokenReview, and answers with the
+    # permission set the operator mapped that identity to. Session pods go through
+    # it, and a session's grants are derived from the pod the API server attested
+    # rather than read from a map, so two sessions on one account cannot reach each
+    # other.
+    #
+    # The users that remain static below are of two kinds, and each says which it
+    # is where it is defined. Some have nothing to present: a browser, an operator
+    # at a port-forward, the callout itself, which cannot authenticate through
+    # itself. The rest have a ServiceAccount and could move tomorrow, but no client
+    # that sends a token yet - moving the identity before the program that uses it
+    # would refuse the workload at connect.
+
+    server_name: platformagent-a2a-nats
+    port: 4222
+    http: 8222
+
+    # TLS on the client listener, required of every connection: the server
+    # advertises tls_required, so a client that dials nats:// is told to upgrade
+    # and one that cannot verify this certificate is refused. The serving pair is
+    # the operator-minted one in the platformagent-a2a-nats-tls Secret,
+    # mounted as a directory (platformagent_a2a_tls.go). The monitoring port above
+    # stays plain HTTP: it carries health and stats, not payloads or tokens.
+    tls {
+      cert_file: "/etc/nats-tls/tls.crt"
+      key_file: "/etc/nats-tls/tls.key"
+    }
+
+    # A ServiceAccount token travels inside the client's CONNECT frame, and the
+    # default max_control_line of 4096 bounds that whole frame - measured, the
+    # usable room for the token itself is around 3920 bytes once the rest of the
+    # CONNECT JSON is accounted for. A plain projected token fits with room to
+    # spare; one bound to several audiences, from a client with a long name, does
+    # not. The failure is not graceful: the server closes the connection with
+    # "Maximum Control Line Exceeded" before authentication happens at all, so it
+    # reads as the bus refusing a workload rather than as a size limit.
+    max_control_line: 65536
+
+    # Websocket listener for the console page and the read-only web user.
+    #
+    # TLS, from the same serving pair as the client listener (the tls block
+    # above): the CONNECT frame carries a password, so the pod-network leg from
+    # the console server is encrypted and verified against the bus CA. The
+    # Service is ClusterIP, so nothing OUTSIDE the cluster reaches this listener.
+    # An ingress NetworkPolicy fences the pod network too: 4222 from the
+    # enumerated bus clients, 9222 from the console server alone, and no
+    # pod-network peer for 8222. The console server is admitted because it is the
+    # page's proxy. A browser reaches it through a kubectl port-forward and it
+    # forwards the websocket here over wss, with the browser's headers intact. It
+    # is not an in-cluster door for anything else. A port-forward straight to
+    # 9222 still enters from the node, which NetworkPolicy does not govern, but it
+    # now needs a TLS client that trusts the bus CA and names the Service as its
+    # server name: a browser cannot, so the page always goes through the console.
+    #
+    # The origin allow-list is the console server's origin as the browser sees it
+    # through the documented port-forward. The proxy forwards Origin unchanged,
+    # so the list still applies. WebSockets are exempt from CORS, and for as long
+    # as a port-forward runs, every page the operator's browser visits can try to
+    # open a socket through it.
+    #
+    # allowed_origins, NOT same_origin: same_origin compares the browser's Origin
+    # against the Host this listener sees, and behind the proxy that is the bus's
+    # own service name, which no browser page is served from. A CLI or Node client
+    # sends no Origin header at all, which both settings permit.
+    #
+    # Origin is browser-asserted, so this stops a browser page and nothing else.
+    # The boundary is the grant lists below.
+    websocket {
+      port: 9222
+      tls {
+        cert_file: "/etc/nats-tls/tls.crt"
+        key_file: "/etc/nats-tls/tls.key"
+      }
+      allowed_origins: ["http://localhost:8080", "http://127.0.0.1:8080"]
+    }
+
+    jetstream {
+      store_dir: /data
+      # Under the 40Gi PV; the stream max_bytes caps (20+5+1+1 GiB) plus KV live
+      # inside this.
+      max_file_store: 34359738368
+    }
+    accounts {
+      # AUTH: the auth callout service and nothing else.
+      #
+      # A dedicated account, and that is a boundary rather than tidiness. The
+      # server publishes each authorization request into THIS account and takes
+      # the first answer that comes back on the reply inbox — and it does not
+      # check that the answer's outer envelope was signed by the configured
+      # issuer (measured; the inner user JWT's signature IS checked). So anything
+      # able to publish into this account's $SYS._INBOX.> and win the race can
+      # answer an authorization request. It could not forge a grant without the
+      # issuer seed, but it could refuse one. Nothing else belongs in here.
+      AUTH {
+        users [
+          {
+            # The callout cannot authenticate through itself, so it is exempt via
+            # auth_users below and carries a password. This permission pair is
+            # the entire surface it needs: read the requests, answer them.
+            user: callout
+            password: "<GENERATED:platformagent-a2a-nats-creds/callout-password>"
+            permissions {
+              subscribe { allow = [ "$SYS.REQ.USER.AUTH" ] }
+              publish { allow = [ "$SYS._INBOX.>" ] }
+            }
+          }
+        ]
+      }
+      # TRUSTED: control-plane writers (gateway, provision, verifier, operator,
+      # seed, dispatcher) and the JetStream file store. Separating the control
+      # plane's account from APP and CONSOLE scopes cross-account traffic to the
+      # explicit stream and service exports declared below.
+      TRUSTED {
+        jetstream: enabled
+        # MSG.NEXT answers one pull with a batch, so its export streams
+        # responses; the default single response would cut every batch to one.
+        exports [
+          { service: "$JS.API.INFO", accounts: [ APP, CONSOLE ] }
+          { service: "$JS.API.STREAM.INFO.*", accounts: [ APP, CONSOLE ] }
+          { service: "$JS.API.CONSUMER.CREATE.DIRECTORY.>", accounts: [ APP, CONSOLE ] }
+          { service: "$JS.API.CONSUMER.CREATE.KV_runtime-state.>", accounts: [ APP, CONSOLE ] }
+          { service: "$JS.API.CONSUMER.CREATE.TASKS.>", accounts: [ APP, CONSOLE ] }
+          { service: "$JS.API.CONSUMER.CREATE.TOPICS-JOURNAL.>", accounts: [ APP, CONSOLE ] }
+          { service: "$JS.API.CONSUMER.CREATE.TOPICS-STATE.>", accounts: [ APP, CONSOLE ] }
+          { service: "$JS.API.CONSUMER.INFO.>", accounts: [ APP, CONSOLE ] }
+          { service: "$JS.API.CONSUMER.MSG.NEXT.>", accounts: [ APP, CONSOLE ], response_type: stream }
+          { service: "$JS.API.CONSUMER.DELETE.>", accounts: [ APP ] }
+          { service: "$JS.API.DIRECT.GET.>", accounts: [ APP, CONSOLE ] }
+          { service: "$JS.ACK.TASKS.>", accounts: [ APP ] }
+          { service: "$JS.FC.>", accounts: [ APP ] }
+          { service: "a2a.tasks.*.*.events", accounts: [ APP ] }
+          { service: "a2a.topics.>", accounts: [ APP ] }
+          { service: "$KV.runtime-state.>", accounts: [ APP ] }
+          { stream: "a2a.tasks.>", accounts: [ APP, CONSOLE ] }
+          { stream: "a2a.agents.>", accounts: [ APP, CONSOLE ] }
+          { stream: "a2a.topics.>", accounts: [ APP, CONSOLE ] }
+          { stream: "$KV.runtime-state.>", accounts: [ APP ] }
+          { stream: "a2a.dispatch.*.*.*", accounts: [ APP ] }
+          { stream: "a2a.cap.reply.>", accounts: [ APP ] }
+          { stream: "chat.notify.reply.agent.>", accounts: [ APP ] }
+          { stream: "chat.board", accounts: [ APP ] }
+          { stream: "_INBOX.bridge.>", accounts: [ APP ] }
+          { stream: "_INBOX.web.>", accounts: [ APP ] }
+          { stream: "chat.console.*.out", accounts: [ CONSOLE ] }
+          { stream: "_INBOX.console.>", accounts: [ CONSOLE ] }
+          { stream: "_INBOX.console-mcp.>", accounts: [ CONSOLE ] }
+        ]
+        imports [
+          { stream: { account: CONSOLE, subject: "chat.console.*.in" } }
+          { stream: { account: CONSOLE, subject: "chat.console.*.confirm" } }
+          { stream: { account: APP, subject: "a2a.dispatch.*.*.*.accept" } }
+          { stream: { account: APP, subject: "a2a.dispatch.*.*.*.lease" } }
+          { stream: { account: APP, subject: "a2a.cap.verify.*" } }
+          { stream: { account: APP, subject: "chat.notify.gchat" } }
+          { stream: { account: APP, subject: "chat.notify.slack" } }
+          { stream: { account: APP, subject: "chat.notify.console" } }
+          { stream: { account: APP, subject: "chat.board.reply.gateway.>" } }
+        ]
+        users [
+          # task requester, chat-session supervisor, session-registry owner.
+          # STATIC, and this one is a sequencing fact rather than a property of
+          # the gateway. It has a ServiceAccount and could authenticate with it
+          # tomorrow; what it does not yet have is a client that presents a token
+          # instead of a password, because the gateway program lands separately
+          # from this render. Moving the identity before the program that uses it
+          # would refuse the gateway at connect on every install.
+          # Its $JS.API grant is scoped to what it emits, by name and by verb
+          # (#1666): INFO, CONSUMER.CREATE, CONSUMER.MSG.NEXT and DIRECT.GET on
+          # TASKS, and INFO, DIRECT.GET and consumer create/delete on
+          # KV_session-state, its own registry, on KV_feedback, the kept
+          # answer ratings, and on KV_people, one hashed key per chat person.
+          # So no STREAM.DELETE, PURGE,
+          # UPDATE or MSG.DELETE on any stream - one STREAM.DELETE.TASKS here
+          # used to destroy every task's history and the five consumers on it -
+          # no CONSUMER.DELETE on TASKS, nothing on DIRECTORY but its subject list
+          # and a direct get on the card subjects, and nothing at all on the
+          # topic streams or the runtime-state, cap and PROFILE_LEASES buckets.
+          {
+            user: gateway
+            password: "<GENERATED:platformagent-a2a-nats-creds/gateway-password>"
+            permissions {
+              publish {
+                allow = [
+                  "a2a.tasks.*.*.in",
+                  "a2a.tasks.*.*.supervisor",
+                  "a2a.submit.*.*.*.*",
+                  "a2a.stop.*.*",
+                  "$KV.session-state.>",
+                  "$KV.feedback.>",
+                  "$KV.people.>",
+                  "chat.console.*.out",
+                  "chat.notify.reply.agent.>",
+                  "$KV.cap.root.*",
+                  "chat.board",
+                  "$JS.API.STREAM.INFO.TASKS",
+                  "$JS.API.CONSUMER.CREATE.TASKS.>",
+                  "$JS.API.CONSUMER.INFO.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.MSG.NEXT.TASKS.*",
+                  "$JS.API.DIRECT.GET.TASKS.>",
+                  "$JS.API.STREAM.INFO.KV_session-state",
+                  "$JS.API.DIRECT.GET.KV_session-state.>",
+                  "$JS.API.CONSUMER.CREATE.KV_session-state.>",
+                  "$JS.API.CONSUMER.DELETE.KV_session-state.*",
+                  "$JS.API.STREAM.INFO.KV_feedback",
+                  "$JS.API.DIRECT.GET.KV_feedback.>",
+                  "$JS.API.CONSUMER.CREATE.KV_feedback.>",
+                  "$JS.API.CONSUMER.DELETE.KV_feedback.*",
+                  "$JS.API.STREAM.INFO.KV_people",
+                  "$JS.API.DIRECT.GET.KV_people.>",
+                  "$JS.API.CONSUMER.CREATE.KV_people.>",
+                  "$JS.API.CONSUMER.DELETE.KV_people.*",
+                  "$JS.API.STREAM.INFO.DIRECTORY",
+                  "$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.*",
+                  "$JS.ACK.TASKS.>",
+                  "$JS.FC.>",
+                  "_INBOX.gateway.>"
+                ]
+                deny = [
+                  "$JS.API.*.*.KV_cap",
+                  "$JS.API.*.*.KV_cap.>",
+                  "$JS.API.*.*.*.KV_cap",
+                  "$JS.API.*.*.*.KV_cap.>",
+                  "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay.>",
+                  "$JS.API.CONSUMER.DURABLE.CREATE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.DELETE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform",
+                  "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform.>",
+                  "$JS.API.CONSUMER.DURABLE.CREATE.TASKS.bridge-platform",
+                  "$JS.API.CONSUMER.DELETE.TASKS.bridge-platform"
+                ]
+              }
+              subscribe {
+                allow = [
+                  "a2a.tasks.*.*.events",
+                  "a2a.tasks.*.*.supervisor",
+                  "a2a.agents.>",
+                  "agents.hb.>",
+                  "$KV.session-state.>",
+                  "$KV.feedback.>",
+                  "$KV.people.>",
+                  "chat.console.*.in",
+                  "chat.console.*.confirm",
+                  "chat.notify.gchat",
+                  "chat.notify.slack",
+                  "chat.notify.console",
+                  "chat.board.reply.gateway.>",
+                  "_INBOX.gateway.>"
+                ]
+                deny = [
+                  "$KV.cap.>"
+                ]
+              }
+            }
+          }
+          # hand-applied seed tooling. STATIC because it is applied rather than
+          # rendered: it exists on installs today, and removing its user would refuse
+          # it at connect the next time it ran. The rendered provisioner beside it
+          # does the same job through the callout.
+          # Its $JS.API grant is scoped to the streams that provisioning creates, by
+          # name and by verb (#1306): CREATE and INFO on those and nothing else, so no
+          # RESTORE, no MSG.DELETE or PURGE, no CONSUMER.CREATE and no STREAM.DELETE.
+          # No ack grant either - seed creates no consumers, so one would be pure
+          # unused capability to +TERM other principals' deliveries (the same deletion
+          # the web user got).
+          # Seed also reads no topics. "a2a topics read" is a stream API call
+          # (GetLastMsgForSubject, so $JS.API.DIRECT.GET.<stream>.<subject> on these
+          # streams, or STREAM.MSG.GET as the fallback) and the scoped grant below
+          # refuses both. Nothing runs it as seed: the seed tooling does writes and
+          # info checks only, and the a2a CLI runs in the agent pod as agent.
+          {
+            user: seed
+            password: "<GENERATED:platformagent-a2a-nats-creds/seed-password>"
+            permissions {
+              publish {
+                allow = [
+                  "a2a.topics.agent.platform.upgrade-readiness",
+                  "a2a.topics.agent.platform.topology-skew",
+                  "a2a.topics.shared.blueprint",
+                  "a2a.topics.shared.annotations",
+                  "$JS.API.INFO",
+                  "$JS.API.STREAM.NAMES",
+                  "$JS.API.STREAM.CREATE.TASKS",
+                  "$JS.API.STREAM.INFO.TASKS",
+                  "$JS.API.STREAM.CREATE.DIRECTORY",
+                  "$JS.API.STREAM.INFO.DIRECTORY",
+                  "$JS.API.STREAM.CREATE.TOPICS-STATE",
+                  "$JS.API.STREAM.INFO.TOPICS-STATE",
+                  "$JS.API.STREAM.CREATE.TOPICS-JOURNAL",
+                  "$JS.API.STREAM.INFO.TOPICS-JOURNAL",
+                  "$JS.API.STREAM.CREATE.KV_runtime-state",
+                  "$JS.API.STREAM.INFO.KV_runtime-state",
+                  "$JS.API.STREAM.CREATE.KV_session-state",
+                  "$JS.API.STREAM.INFO.KV_session-state",
+                  "$JS.API.STREAM.CREATE.KV_cap",
+                  "$JS.API.STREAM.INFO.KV_cap",
+                  "$JS.API.STREAM.CREATE.KV_feedback",
+                  "$JS.API.STREAM.INFO.KV_feedback",
+                  "$JS.API.STREAM.CREATE.KV_people",
+                  "$JS.API.STREAM.INFO.KV_people",
+                  "$JS.API.STREAM.CREATE.KV_PROFILE_LEASES",
+                  "$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
+                  "$JS.API.STREAM.CREATE.PROFILE_SUBMITS",
+                  "$JS.API.STREAM.INFO.PROFILE_SUBMITS",
+                  "$JS.API.STREAM.CREATE.DISPATCH_STOPS",
+                  "$JS.API.STREAM.INFO.DISPATCH_STOPS",
+                  "_INBOX.seed.>"
+                ]
+              }
+              subscribe {
+                allow = [
+                  "a2a.topics.>",
+                  "_INBOX.seed.>"
+                ]
+              }
+            }
+          }
+        ]
+      }
+      # CONSOLE: the web console and MCP server, isolated from both TRUSTED and
+      # APP so that neither can reach chat.console.*.in or chat.console.*.confirm.
+      CONSOLE {
+        exports [
+          { stream: "chat.console.*.in", accounts: [ TRUSTED ] }
+          { stream: "chat.console.*.confirm", accounts: [ TRUSTED ] }
+        ]
+        imports [
+          { service: { account: TRUSTED, subject: "$JS.API.INFO" } }
+          { service: { account: TRUSTED, subject: "$JS.API.STREAM.INFO.*" } }
+          { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.CREATE.DIRECTORY.>" } }
+          { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.CREATE.KV_runtime-state.>" } }
+          { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.CREATE.TASKS.>" } }
+          { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.CREATE.TOPICS-JOURNAL.>" } }
+          { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.CREATE.TOPICS-STATE.>" } }
+          { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.INFO.>" } }
+          { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.MSG.NEXT.>" } }
+          { service: { account: TRUSTED, subject: "$JS.API.DIRECT.GET.>" } }
+          { stream: { account: TRUSTED, subject: "a2a.tasks.>" } }
+          { stream: { account: TRUSTED, subject: "a2a.agents.>" } }
+          { stream: { account: TRUSTED, subject: "a2a.topics.>" } }
+          { stream: { account: TRUSTED, subject: "chat.console.*.out" } }
+          { stream: { account: TRUSTED, subject: "_INBOX.console.>" } }
+          { stream: { account: TRUSTED, subject: "_INBOX.console-mcp.>" } }
+        ]
+        users [
+          # the web console: web's read surface plus chat.console.*.in and
+          # chat.console.*.confirm, the gateway's console adapter's inbound subjects.
+          # STATIC for web's reason. No JetStream verb on any KV_* stream: STREAM.INFO's
+          # subjects_filter would list every key.
+          {
+            user: console
+            password: "<GENERATED:platformagent-a2a-nats-creds/console-password>"
+            permissions {
+              publish {
+                allow = [
+                  "$JS.API.INFO",
+                  "$JS.API.STREAM.INFO.TASKS",
+                  "$JS.API.STREAM.INFO.DIRECTORY",
+                  "$JS.API.STREAM.INFO.TOPICS-STATE",
+                  "$JS.API.STREAM.INFO.TOPICS-JOURNAL",
+                  "$JS.API.CONSUMER.CREATE.TASKS.>",
+                  "$JS.API.CONSUMER.CREATE.DIRECTORY.>",
+                  "$JS.API.CONSUMER.CREATE.TOPICS-STATE.>",
+                  "$JS.API.CONSUMER.CREATE.TOPICS-JOURNAL.>",
+                  "$JS.API.CONSUMER.INFO.TASKS.*",
+                  "$JS.API.CONSUMER.INFO.DIRECTORY.*",
+                  "$JS.API.CONSUMER.INFO.TOPICS-STATE.*",
+                  "$JS.API.CONSUMER.INFO.TOPICS-JOURNAL.*",
+                  "$JS.API.CONSUMER.MSG.NEXT.TASKS.*",
+                  "$JS.API.CONSUMER.MSG.NEXT.DIRECTORY.*",
+                  "$JS.API.CONSUMER.MSG.NEXT.TOPICS-STATE.*",
+                  "$JS.API.CONSUMER.MSG.NEXT.TOPICS-JOURNAL.*",
+                  "$JS.API.DIRECT.GET.PROFILE_SUBMITS.>",
+                  "chat.console.*.in",
+                  "chat.console.*.confirm",
+                  "_INBOX.console.>"
+                ]
+                deny = [
+                  "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay.>",
+                  "$JS.API.CONSUMER.DURABLE.CREATE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.DELETE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform",
+                  "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform.>",
+                  "$JS.API.CONSUMER.DURABLE.CREATE.TASKS.bridge-platform",
+                  "$JS.API.CONSUMER.DELETE.TASKS.bridge-platform"
+                ]
+              }
+              subscribe {
+                allow = [
+                  "a2a.>",
+                  "chat.console.*.out",
+                  "_INBOX.console.>"
+                ]
+                deny = [
+                  "a2a.cap.>",
+                  "a2a.dispatch.>",
+                  "a2a.stop.>"
+                ]
+              }
+            }
+          }
+          # the MCP server (a2a/cmd/mcp): console's read surface and chat.console.*.in,
+          # without chat.console.*.confirm, on its own password and inbox prefix.
+          {
+            user: console-mcp
+            password: "<GENERATED:platformagent-a2a-nats-creds/console-mcp-password>"
+            permissions {
+              publish {
+                allow = [
+                  "$JS.API.INFO",
+                  "$JS.API.STREAM.INFO.TASKS",
+                  "$JS.API.STREAM.INFO.DIRECTORY",
+                  "$JS.API.STREAM.INFO.TOPICS-STATE",
+                  "$JS.API.STREAM.INFO.TOPICS-JOURNAL",
+                  "$JS.API.CONSUMER.CREATE.TASKS.>",
+                  "$JS.API.CONSUMER.CREATE.DIRECTORY.>",
+                  "$JS.API.CONSUMER.CREATE.TOPICS-STATE.>",
+                  "$JS.API.CONSUMER.CREATE.TOPICS-JOURNAL.>",
+                  "$JS.API.CONSUMER.INFO.TASKS.*",
+                  "$JS.API.CONSUMER.INFO.DIRECTORY.*",
+                  "$JS.API.CONSUMER.INFO.TOPICS-STATE.*",
+                  "$JS.API.CONSUMER.INFO.TOPICS-JOURNAL.*",
+                  "$JS.API.CONSUMER.MSG.NEXT.TASKS.*",
+                  "$JS.API.CONSUMER.MSG.NEXT.DIRECTORY.*",
+                  "$JS.API.CONSUMER.MSG.NEXT.TOPICS-STATE.*",
+                  "$JS.API.CONSUMER.MSG.NEXT.TOPICS-JOURNAL.*",
+                  "$JS.API.DIRECT.GET.PROFILE_SUBMITS.>",
+                  "chat.console.*.in",
+                  "_INBOX.console-mcp.>"
+                ]
+                deny = [
+                  "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay.>",
+                  "$JS.API.CONSUMER.DURABLE.CREATE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.DELETE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform",
+                  "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform.>",
+                  "$JS.API.CONSUMER.DURABLE.CREATE.TASKS.bridge-platform",
+                  "$JS.API.CONSUMER.DELETE.TASKS.bridge-platform"
+                ]
+              }
+              subscribe {
+                allow = [
+                  "a2a.>",
+                  "chat.console.*.out",
+                  "_INBOX.console-mcp.>"
+                ]
+                deny = [
+                  "a2a.cap.>",
+                  "a2a.dispatch.>",
+                  "a2a.stop.>"
+                ]
+              }
+            }
+          }
+        ]
+      }
+      # APP: runtime executors and readers (session, agent, bridge, web, profile-*).
+      APP {
+        exports [
+          { stream: "a2a.dispatch.*.*.*.accept", accounts: [ TRUSTED ] }
+          { stream: "a2a.dispatch.*.*.*.lease", accounts: [ TRUSTED ] }
+          { stream: "a2a.cap.verify.*", accounts: [ TRUSTED ] }
+          { stream: "chat.notify.gchat", accounts: [ TRUSTED ] }
+          { stream: "chat.notify.slack", accounts: [ TRUSTED ] }
+          { stream: "chat.notify.console", accounts: [ TRUSTED ] }
+          { stream: "chat.board.reply.gateway.>", accounts: [ TRUSTED ] }
+        ]
+        imports [
+          { service: { account: TRUSTED, subject: "$JS.API.INFO" } }
+          { service: { account: TRUSTED, subject: "$JS.API.STREAM.INFO.*" } }
+          { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.CREATE.DIRECTORY.>" } }
+          { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.CREATE.KV_runtime-state.>" } }
+          { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.CREATE.TASKS.>" } }
+          { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.CREATE.TOPICS-JOURNAL.>" } }
+          { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.CREATE.TOPICS-STATE.>" } }
+          { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.INFO.>" } }
+          { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.MSG.NEXT.>" } }
+          { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.DELETE.>" } }
+          { service: { account: TRUSTED, subject: "$JS.API.DIRECT.GET.>" } }
+          { service: { account: TRUSTED, subject: "$JS.ACK.TASKS.>" } }
+          { service: { account: TRUSTED, subject: "$JS.FC.>" } }
+          { service: { account: TRUSTED, subject: "a2a.tasks.*.*.events" } }
+          { service: { account: TRUSTED, subject: "a2a.topics.>" } }
+          { service: { account: TRUSTED, subject: "$KV.runtime-state.>" } }
+          { stream: { account: TRUSTED, subject: "a2a.tasks.>" } }
+          { stream: { account: TRUSTED, subject: "a2a.agents.>" } }
+          { stream: { account: TRUSTED, subject: "a2a.topics.>" } }
+          { stream: { account: TRUSTED, subject: "$KV.runtime-state.>" } }
+          { stream: { account: TRUSTED, subject: "a2a.dispatch.*.*.*" } }
+          { stream: { account: TRUSTED, subject: "a2a.cap.reply.>" } }
+          { stream: { account: TRUSTED, subject: "chat.notify.reply.agent.>" } }
+          { stream: { account: TRUSTED, subject: "chat.board" } }
+          { stream: { account: TRUSTED, subject: "_INBOX.bridge.>" } }
+          { stream: { account: TRUSTED, subject: "_INBOX.web.>" } }
+        ]
+        users [
+          # the Hermes bridge sidecar: executor for the `platform` addressee only.
+          # STATIC because it shares the agent pod, and a ServiceAccount token names a
+          # pod rather than a container — a callout identity here would be the agent
+          # container's grants and this one's added together, which is the credential
+          # the retired `worker` user was. Its WRITE is narrowed to one addressee:
+          # publishing another's events is refused. Its READ is not. The JetStream
+          # grants below name the TASKS stream, and both DIRECT.GET and a consumer's
+          # filter_subject reach every addressee on it, so a holder of this password
+          # can read every session's prompts. `worker` held the identical two grants.
+          {
+            user: bridge
+            password: "<GENERATED:platformagent-a2a-nats-creds/bridge-password>"
+            permissions {
+              publish {
+                allow = [
+                  "a2a.tasks.platform.*.events",
+                  "$KV.runtime-state.>",
+                  "$JS.API.STREAM.INFO.TASKS",
+                  "$JS.API.CONSUMER.CREATE.TASKS.>",
+                  "$JS.API.CONSUMER.INFO.TASKS.bridge-platform",
+                  "$JS.API.CONSUMER.MSG.NEXT.TASKS.*",
+                  "$JS.API.DIRECT.GET.TASKS.>",
+                  "$JS.API.STREAM.INFO.KV_runtime-state",
+                  "$JS.API.CONSUMER.CREATE.KV_runtime-state.>",
+                  "$JS.API.CONSUMER.DELETE.KV_runtime-state.*",
+                  "$JS.ACK.TASKS.>",
+                  "$JS.FC.>",
+                  "_INBOX.bridge.>",
+                  "a2a.cap.verify.platform",
+                  "chat.board.reply.gateway.>"
+                ]
+                deny = [
+                  "$JS.API.*.*.KV_cap",
+                  "$JS.API.*.*.KV_cap.>",
+                  "$JS.API.*.*.*.KV_cap",
+                  "$JS.API.*.*.*.KV_cap.>",
+                  "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay.>",
+                  "$JS.API.CONSUMER.DURABLE.CREATE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.DELETE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform",
+                  "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform.>",
+                  "$JS.API.CONSUMER.DURABLE.CREATE.TASKS.bridge-platform",
+                  "$JS.API.CONSUMER.DELETE.TASKS.bridge-platform"
+                ]
+              }
+              subscribe {
+                allow = [
+                  "a2a.tasks.platform.*.in",
+                  "$KV.runtime-state.>",
+                  "a2a.cap.reply.platform.>",
+                  "chat.board",
+                  "_INBOX.bridge.>"
+                ]
+                deny = [
+                  "$KV.cap.>"
+                ]
+              }
+            }
+          }
+          # the read surface, and one of the two credentials published to a
+          # browser by design - console is the other. STATIC permanently: a browser holds no ServiceAccount token and
+          # there is no mechanism by which it could. Read-only is not expressible as
+          # a subject list - JetStream puts the reach in the request BODY - so the JS
+          # API grants are enumerated per stream and there is no ack grant.
+          {
+            user: web
+            password: "<GENERATED:platformagent-a2a-nats-creds/web-password>"
+            permissions {
+              publish {
+                allow = [
+                  "$JS.API.INFO",
+                  "$JS.API.STREAM.INFO.TASKS",
+                  "$JS.API.STREAM.INFO.DIRECTORY",
+                  "$JS.API.STREAM.INFO.TOPICS-STATE",
+                  "$JS.API.STREAM.INFO.TOPICS-JOURNAL",
+                  "$JS.API.CONSUMER.CREATE.TASKS.>",
+                  "$JS.API.CONSUMER.CREATE.DIRECTORY.>",
+                  "$JS.API.CONSUMER.CREATE.TOPICS-STATE.>",
+                  "$JS.API.CONSUMER.CREATE.TOPICS-JOURNAL.>",
+                  "$JS.API.CONSUMER.INFO.TASKS.*",
+                  "$JS.API.CONSUMER.INFO.DIRECTORY.*",
+                  "$JS.API.CONSUMER.INFO.TOPICS-STATE.*",
+                  "$JS.API.CONSUMER.INFO.TOPICS-JOURNAL.*",
+                  "$JS.API.CONSUMER.MSG.NEXT.TASKS.*",
+                  "$JS.API.CONSUMER.MSG.NEXT.DIRECTORY.*",
+                  "$JS.API.CONSUMER.MSG.NEXT.TOPICS-STATE.*",
+                  "$JS.API.CONSUMER.MSG.NEXT.TOPICS-JOURNAL.*",
+                  "_INBOX.web.>"
+                ]
+                deny = [
+                  "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay.>",
+                  "$JS.API.CONSUMER.DURABLE.CREATE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.DELETE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform",
+                  "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform.>",
+                  "$JS.API.CONSUMER.DURABLE.CREATE.TASKS.bridge-platform",
+                  "$JS.API.CONSUMER.DELETE.TASKS.bridge-platform"
+                ]
+              }
+              subscribe {
+                allow = [
+                  "a2a.>",
+                  "_INBOX.web.>"
+                ]
+                deny = [
+                  "a2a.cap.>",
+                  "a2a.dispatch.>",
+                  "a2a.stop.>"
+                ]
+              }
+            }
+          }
+        ]
+      }
+      # $SYS: human operators and monitoring only; no agent authenticates here.
+      SYS {
+        users [
+          # human operators and monitoring. No agent ever authenticates here.
+          # STATIC: the holder is a person with a port-forward or a scrape config.
+          {
+            user: sys
+            password: "<GENERATED:platformagent-a2a-nats-creds/sys-password>"
+          }
+        ]
+      }
+    }
+    system_account: SYS
+
+    # The auth callout: who a connection is, decided against the cluster that
+    # issued its identity rather than against a password this file rendered.
+    #
+    # What changes for a client: it presents a projected ServiceAccount token
+    # instead of a password, the callout validates that token with a TokenReview
+    # against the local API server, and the grants it gets back are the ones the
+    # operator rendered for that ServiceAccount. What does NOT change is where
+    # enforcement happens — the permission set still arrives before the connection
+    # is usable, and the server still refuses on it without consulting any
+    # application code.
+    authorization {
+      # Two seconds, and this is a ceiling rather than a preference.
+      #
+      # The server starts a first-ping timer on a connection that has not yet
+      # authenticated, at roughly two seconds. If the callout has not answered by
+      # then the client receives a PING where the Go client library requires a
+      # PONG, and it aborts the connect reporting "expected 'PONG', got 'PING'" —
+      # which names nothing about authorization and sends whoever is debugging it
+      # to the network layer. Measured: at timeout 2 the failure is a clean
+      # Authorization Violation at a predictable deadline; at 3 or above it is
+      # that message instead. A merely SLOW callout hits it too, so the real
+      # budget for a TokenReview round trip is under two seconds whatever this
+      # number says.
+      timeout: 2
+
+      auth_callout {
+        # Public halves only. The seeds live in the callout's own Secret, read by
+        # the callout Deployment and nothing else. The issuer signs the user JWTs
+        # that carry the permissions this server enforces, so its holder can mint a
+        # user with any grants at all — including publish on $KV.cap.root.> and read
+        # on $KV.cap.>, which is the whole capability store. See the callout-keys
+        # Secret for the custody note.
+        issuer: <GENERATED:platformagent-a2a-callout-keys/issuer-public>
+        account: AUTH
+
+        # The request carries the client's raw ServiceAccount token, so it is
+        # encrypted in flight to the callout. Note the server does not require the
+        # RESPONSE to be encrypted even with this set, so response confidentiality
+        # is the callout's own discipline rather than something enforced here.
+        xkey: <GENERATED:platformagent-a2a-callout-keys/xkey-public>
+
+        # Exempt from the callout: authenticated from this file, by username.
+        #
+        # This is a bypass and not a fallback — a listed user with a wrong
+        # password is refused statically and never reaches the callout at all.
+        # The list is the callout itself, which cannot authenticate through
+        # itself, plus every identity marked STATIC above. The session entry is
+        # absent exactly because it is not one: a session pod presents a
+        # pod-bound ServiceAccount token and the callout scopes it to its own
+        # task. Do not read this list as the session path.
+        #
+        # A name is here for one of three reasons, and each identity's own comment
+        # above says which. It can hold no projected token at all — the browser's
+        # two credentials, web and console, the $SYS login held by a person, the
+        # seed tooling that is applied rather than run. Or it is a sidecar, which
+        # a ServiceAccount token cannot name apart from the container beside it —
+        # the bridge, whose own comment above says what a callout entry there
+        # would merge. Or it could move and has not: gateway, which is the
+        # remaining migration. The first two reasons are permanent; only the
+        # third is a migration.
+        auth_users: [ callout, gateway, bridge, seed, web, console, console-mcp, sys ]
+      }
+    }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: nats
+  name: platformagent-a2a-nats
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: platformagent-a2a-nats
+  serviceName: platformagent-a2a-nats
+  template:
+    metadata:
+      annotations:
+        kubeagents.x-k8s.io/a2a-config-hash: <SHA256_FOR_TESTS>
+      labels:
+        app: platformagent-a2a-nats
+        app.kubernetes.io/instance: kubeagents-system-platformagent
+        app.kubernetes.io/managed-by: platformagent-controller
+        app.kubernetes.io/name: platform-agent
+        app.kubernetes.io/part-of: a2a-next
+        kubeagents.x-k8s.io/a2a-component: nats
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - command:
+            - /bin/sh
+            - -c
+            - "if [ -d /data/jetstream/APP ] && [ ! -e /data/jetstream/TRUSTED ]; then
+              mv /data/jetstream/APP /data/jetstream/TRUSTED; elif [ -d /data/jetstream/APP
+              ]; then echo 'both /data/jetstream/APP and /data/jetstream/TRUSTED exist:
+              starting on TRUSTED, APP left in place' >&2; fi && exec nats-server -c
+              /etc/nats/nats.conf"
+          image: nats:2.10-alpine
+          name: nats
+          ports:
+            - containerPort: 4222
+              name: client
+            - containerPort: 8222
+              name: monitor
+            - containerPort: 9222
+              name: websocket
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: monitor
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+            requests:
+              cpu: 250m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - mountPath: /etc/nats
+              name: config
+              readOnly: true
+            - mountPath: /etc/nats-tls
+              name: tls
+              readOnly: true
+            - mountPath: /data
+              name: data
+      securityContext:
+        fsGroup: 1000
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        - name: config
+          secret:
+            secretName: platformagent-a2a-nats-config
+        - name: tls
+          secret:
+            secretName: platformagent-a2a-nats-tls
+  updateStrategy: {}
+  volumeClaimTemplates:
+    - metadata:
+        labels:
+          app.kubernetes.io/instance: kubeagents-system-platformagent
+          app.kubernetes.io/managed-by: platformagent-controller
+          app.kubernetes.io/name: platform-agent
+          app.kubernetes.io/part-of: a2a-next
+          kubeagents.x-k8s.io/a2a-component: nats
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 40Gi
+      status: {}
+status:
+  availableReplicas: 0
+  replicas: 0
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: nats
+  name: platformagent-a2a-nats
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  ports:
+    - name: client
+      port: 4222
+      targetPort: 0
+    - name: monitor
+      port: 8222
+      targetPort: 0
+    - name: websocket
+      port: 9222
+      targetPort: 0
+  selector:
+    app: platformagent-a2a-nats
+status:
+  loadBalancer: {}
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -4300,6 +4637,11 @@ spec:
               value: localhost:8080,127.0.0.1:8080
             - name: NATS_CA_FILE
               value: /etc/a2a-nats-ca/ca.crt
+            - name: WEB_CONSOLE_MEMORY_LIMIT_BYTES
+              valueFrom:
+                resourceFieldRef:
+                  divisor: "0"
+                  resource: limits.memory
           image: ghcr.io/gke-labs/kube-agents/a2a-console:latest
           livenessProbe:
             failureThreshold: 6
@@ -4319,10 +4661,11 @@ spec:
             periodSeconds: 5
           resources:
             limits:
-              memory: 128Mi
+              cpu: 500m
+              memory: 256Mi
             requests:
-              cpu: 50m
-              memory: 64Mi
+              cpu: 100m
+              memory: 128Mi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -4427,7 +4770,7 @@ metadata:
       uid: ""
 spec:
   hard:
-    pods: "26"
+    pods: "36"
 status: {}
 ---
 apiVersion: v1
@@ -4504,6 +4847,15 @@ rules:
       - get
       - patch
   - apiGroups:
+      - coordination.k8s.io
+    resourceNames:
+      - platformagent-a2a-gateway
+    resources:
+      - leases
+    verbs:
+      - get
+      - update
+  - apiGroups:
       - ""
     resourceNames:
       - platformagent-resolved-scope
@@ -4579,6 +4931,27 @@ metadata:
       name: platformagent
       uid: ""
 ---
+apiVersion: coordination.k8s.io/v1
+kind: Lease
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: gateway
+    kubeagents.x-k8s.io/a2a-gateway-lease: "true"
+  name: platformagent-a2a-gateway
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec: {}
+---
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -4588,7 +4961,7 @@ metadata:
     app.kubernetes.io/name: platform-agent
     app.kubernetes.io/part-of: a2a-next
     kubeagents.x-k8s.io/a2a-component: provision
-  name: platformagent-a2a-provision-75f02ec0
+  name: platformagent-a2a-provision-0e62f5d7
   namespace: kubeagents-system
   ownerReferences:
     - apiVersion: kubeagents.x-k8s.io/v1alpha1
@@ -4721,10 +5094,35 @@ spec:
               2>&1 || $NATS stream add TASKS --allow-direct \\\n  --subjects='a2a.tasks.>'
               --storage=file --retention=limits \\\n  --max-age=72h --max-bytes=21474836480
               --discard=old --replicas=1 \\\n  --max-msgs-per-subject=4096 \\\n  --max-consumers=110
-              --defaults\n\n# DIRECTORY: last-value — the tombstone replaces the card.
-              1GiB cap.\n$NATS stream info DIRECTORY >/dev/null 2>&1 || $NATS stream add
-              DIRECTORY --allow-direct \\\n  --subjects='a2a.agents.>' --storage=file
-              --retention=limits \\\n  --max-msgs-per-subject=1 --max-bytes=1073741824
+              --defaults\n\n# The TASKS durables whose name and filter are fixed (#4173):
+              the gateway's\n# event relay and the bridge's intake. Made here, so their
+              readers bind to them\n# and create nothing, and every principal that may
+              create consumers on TASKS is\n# denied these names (a2aTasksFixedDurableDenyPublish).
+              Pull, explicit ack,\n# every message from the start: what the readers ask
+              for. A consumer add on a\n# durable that exists updates it to these settings,
+              so one an older gateway or\n# bridge made (one filter, the server's max-pending)
+              converges here.\n#\n# When the add fails, what matters is whether the durable
+              exists. A missing one\n# leaves its reader waiting for it, so the run fails
+              and the Job retries\n# (a timeout, TASKS at max_consumers, a grant gone
+              wrong): a run reported\n# complete would never be retried. One that exists
+              but won't take these\n# settings is left as it is: its reader refuses to
+              bind it and names the\n# difference, which is louder than anything this
+              could report.\nfixed_durable() { # name reader [consumer add flags...]\n
+              \ name=$1\n  reader=$2\n  shift 2\n  $NATS consumer add TASKS \"${name}\"
+              \"$@\" >/dev/null && return 0\n  if ! $NATS consumer info TASKS \"${name}\"
+              >/dev/null 2>&1; then\n    echo \"could not create TASKS ${name}, and it
+              does not exist: the ${reader} waits for it, so this run fails and the Job
+              retries\" >&2\n    exit 1\n  fi\n  echo \"WARN: TASKS ${name} exists but
+              could not be brought to this render's settings; the ${reader} refuses to
+              bind it and names the difference\" >&2\n}\nfixed_durable gateway-relay gateway
+              --pull \\\n  --filter='a2a.tasks.*.*.events' --filter='a2a.tasks.*.*.supervisor'
+              \\\n  --ack=explicit --deliver=all --replay=instant --max-deliver=-1 \\\n
+              \ --max-pending=8192 --defaults\nfixed_durable bridge-platform bridge --pull
+              \\\n  --filter='a2a.tasks.platform.*.in' \\\n  --ack=explicit --deliver=all
+              --replay=instant --max-deliver=-1 --defaults\n\n# DIRECTORY: last-value
+              — the tombstone replaces the card. 1GiB cap.\n$NATS stream info DIRECTORY
+              >/dev/null 2>&1 || $NATS stream add DIRECTORY --allow-direct \\\n  --subjects='a2a.agents.>'
+              --storage=file --retention=limits \\\n  --max-msgs-per-subject=1 --max-bytes=1073741824
               --discard=old --replicas=1 --max-consumers=64 --defaults\n\n# TOPICS-STATE:
               current answer plus short history, no age limit. 1GiB cap.\n# State-class
               topics (provisioned registry): upgrade-readiness, topology-skew, blueprint,
@@ -4803,41 +5201,52 @@ spec:
               stream add PROFILE_SUBMITS --allow-direct \\\n  --subjects='a2a.submit.>'
               --storage=file --retention=limits \\\n  --max-age=72h --max-bytes=1073741824
               --discard=old --replicas=1 \\\n  --max-msgs-per-subject=1 --dupe-window=2m
-              \\\n  --max-consumers=64 --defaults\n\n# TASKS older than this render: the
-              limits the create above could not apply.\n#\n# Provisioning is create-only
-              convergence - the info-then-add guards never\n# edit an existing stream,
-              which buildA2AProvisionJob says in terms - so an\n# install whose TASKS
-              predates a limit keeps the stream it was created with\n# and gains nothing
-              from a re-run. Both limits this render puts on TASKS are\n# in exactly that
-              position on every install that already has the stream, and\n# the two gaps
-              are not the same kind:\n#\n#   max_consumers short is a capacity shortfall
-              with a load-time failure\n#   attached. A legitimate session's consumer
-              create is refused, surfaced as\n#   a task failure, with nothing in it pointing
-              at the stream. Worth\n#   refusing over here, where the number that caused
-              it is in hand.\n#\n#   max_msgs_per_subject absent is a missing bound, not
-              a broken one: the\n#   install behaves exactly as it did before this render
-              carried the flag.\n#   Applying it would be a TIGHTENING, and a tightening
-              evicts: a\n#   stream edit that lowers max_msgs_per_subject drops every
-              message over\n#   the new limit on every subject the moment it lands. Truncating
-              a running\n#   install's task history as an automatic side effect of an
-              operator\n#   upgrade is not a decision this script takes on an operator's
-              behalf. It\n#   reports, names the edit and what the edit costs, and moves
-              on.\n#\n# This runs LAST, after every other stream and bucket, so the refusal
-              below\n# leaves a fully provisioned bus short one limit rather than a bus
-              missing\n# DIRECTORY, the topic streams and the KV buckets. The refusal
-              is reached on\n# an operator upgrade alone, with no CR edit involved - an
-              install already\n# running maxSessions above what its stream holds has been
-              under-provisioned\n# the whole time, and this is the first thing that says
-              so.\n#\n# Parsed with grep rather than jq: nats-box is the image, and grep
-              is in\n# busybox for certain. An unparseable answer FAILS - a check that
-              silently\n# skips when its extractor stops matching is not a check.\ntasks_json=\"$($NATS
-              stream info TASKS --json | tr -d ' \\t\\r\\n')\"\n\nlive_subject_cap=\"$(printf
-              '%s' \"${tasks_json}\" \\\n  | grep -o '\"max_msgs_per_subject\":-\\{0,1\\}[0-9]\\{1,\\}'
-              | head -n1 | cut -d: -f2 || true)\"\nif [ -z \"${live_subject_cap}\" ];
-              then\n  echo \"could not read max_msgs_per_subject off the TASKS stream;
-              refusing to report this install as provisioned\" >&2\n  exit 1\nfi\n#\n#
-              Unbounded and merely different are not the same report. An unbounded stream\n#
-              is the gap: nothing stops one task evicting another session's history, which\n#
+              \\\n  --max-consumers=64 --defaults\n\n# DISPATCH_STOPS: the gateway's stop
+              records for AgentProfile tasks, one per\n# task (a2a.stop.<profile>.<task>),
+              read by the dispatcher by subject (contract\n# addendum 9). It is outside
+              a2a.dispatch. on purpose: the dispatcher publishes\n# there, and a stop
+              must have one writer, the gateway (granted with #4127). A\n# record outlives
+              any task (24h against the 6h deadline cap). Nothing makes a\n# consumer
+              here; --max-consumers=1 is the tightest cap JetStream has, since 0\n# means
+              unlimited.\n$NATS stream info DISPATCH_STOPS >/dev/null 2>&1 || $NATS stream
+              add DISPATCH_STOPS --allow-direct \\\n  --subjects='a2a.stop.>' --storage=file
+              --retention=limits \\\n  --max-age=24h --max-bytes=67108864 --discard=old
+              --replicas=1 \\\n  --max-msgs-per-subject=1 --max-consumers=1 --defaults\n\n#
+              TASKS older than this render: the limits the create above could not apply.\n#\n#
+              Provisioning is create-only convergence - the info-then-add guards never\n#
+              edit an existing stream, which buildA2AProvisionJob says in terms - so an\n#
+              install whose TASKS predates a limit keeps the stream it was created with\n#
+              and gains nothing from a re-run. Both limits this render puts on TASKS are\n#
+              in exactly that position on every install that already has the stream, and\n#
+              the two gaps are not the same kind:\n#\n#   max_consumers short is a capacity
+              shortfall with a load-time failure\n#   attached. A legitimate session's
+              consumer create is refused, surfaced as\n#   a task failure, with nothing
+              in it pointing at the stream. Worth\n#   refusing over here, where the number
+              that caused it is in hand.\n#\n#   max_msgs_per_subject absent is a missing
+              bound, not a broken one: the\n#   install behaves exactly as it did before
+              this render carried the flag.\n#   Applying it would be a TIGHTENING, and
+              a tightening evicts: a\n#   stream edit that lowers max_msgs_per_subject
+              drops every message over\n#   the new limit on every subject the moment
+              it lands. Truncating a running\n#   install's task history as an automatic
+              side effect of an operator\n#   upgrade is not a decision this script takes
+              on an operator's behalf. It\n#   reports, names the edit and what the edit
+              costs, and moves on.\n#\n# This runs LAST, after every other stream and
+              bucket, so the refusal below\n# leaves a fully provisioned bus short one
+              limit rather than a bus missing\n# DIRECTORY, the topic streams and the
+              KV buckets. The refusal is reached on\n# an operator upgrade alone, with
+              no CR edit involved - an install already\n# running maxSessions above what
+              its stream holds has been under-provisioned\n# the whole time, and this
+              is the first thing that says so.\n#\n# Parsed with grep rather than jq:
+              nats-box is the image, and grep is in\n# busybox for certain. An unparseable
+              answer FAILS - a check that silently\n# skips when its extractor stops matching
+              is not a check.\ntasks_json=\"$($NATS stream info TASKS --json | tr -d '
+              \\t\\r\\n')\"\n\nlive_subject_cap=\"$(printf '%s' \"${tasks_json}\" \\\n
+              \ | grep -o '\"max_msgs_per_subject\":-\\{0,1\\}[0-9]\\{1,\\}' | head -n1
+              | cut -d: -f2 || true)\"\nif [ -z \"${live_subject_cap}\" ]; then\n  echo
+              \"could not read max_msgs_per_subject off the TASKS stream; refusing to
+              report this install as provisioned\" >&2\n  exit 1\nfi\n#\n# Unbounded and
+              merely different are not the same report. An unbounded stream\n# is the
+              gap: nothing stops one task evicting another session's history, which\n#
               is the whole reason the render carries the flag. A stream carrying some
               other\n# finite cap is bounded already, and telling the operator who chose
               it that\n# their stream \"predates the limit\" is telling them something
@@ -4889,19 +5298,37 @@ spec:
               >&2\n  echo \"  Provisioning does not edit an existing stream; to append
               the subject to its current subjects:\" >&2\n  echo \"    nats stream edit
               TOPICS-STATE --subjects=\\\"${topics_state_subjects},a2a.topics.agent.platform.topology-skew\\\"\"
-              >&2\nfi\nreport=\"{${report_findings}}\"\n# Written only where the kubelet
-              has mounted the file: outside a pod there is\n# nothing to write to, and
-              a copy of a report is not a reason to fail a fully\n# provisioned bus. Nor
-              is a write that fails (a full or faulting disk under\n# the kubelet's file):
-              under set -e that would exit 1 on a bus this script\n# just finished provisioning,
-              and exit 1 matches no podFailurePolicy rule, so\n# the Job would burn its
-              backoff into BackoffLimitExceeded. A pod that has no\n# file, or whose write
-              failed, leaves no message, and the reconcile logs that\n# rather than reading
-              it as clean.\nif [ -w \"/dev/termination-log\" ]; then\n  printf '%s' \"${report}\"
-              > \"/dev/termination-log\" \\\n    || echo \"WARNING: could not write the
-              provision report to the termination log; the log above is this run's only
-              record\" >&2\nfi\n\nrequired_consumers=110\nlive_consumers=\"$(printf '%s'
-              \"${tasks_json}\" \\\n  | grep -o '\"max_consumers\":-\\{0,1\\}[0-9]\\{1,\\}'
+              >&2\nfi\n#\n# PROFILE_SUBMITS older than this render: read its live max
+              age back. The\n# dispatcher keeps a finished task's tombstone for the max
+              age the operator\n# renders, and a submission still on the stream past its
+              tombstone would be\n# run again; provisioning never edits the stream (lowering
+              a max age evicts\n# queued submissions), so a stream an older operator created
+              longer than this\n# render's 259200s is reported, and the operator\n# renders
+              the longer one (#4948). 0 is no age limit. Same stance as the\n# extractors
+              above: an answer with no readable max_age FAILS.\nsubmits_json=\"$($NATS
+              stream info PROFILE_SUBMITS --json | tr -d ' \\t\\r\\n')\"\nlive_submit_max_age_ns=\"$(printf
+              '%s' \"${submits_json}\" \\\n  | grep -o '\"max_age\":[0-9]\\{1,\\}' | head
+              -n1 | cut -d: -f2 || true)\"\nif [ -z \"${live_submit_max_age_ns}\" ]; then\n
+              \ echo \"could not read max_age off the PROFILE_SUBMITS stream; refusing
+              to report this install as provisioned\" >&2\n  exit 1\nfi\nlive_submit_max_age=$((live_submit_max_age_ns
+              / 1000000000))\nif [ \"${live_submit_max_age_ns}\" = \"0\" ] || [ \"${live_submit_max_age}\"
+              -gt 259200 ]; then\n  report_findings=\"${report_findings}${report_findings:+,}\\\"submit_max_age\\\":{\\\"live\\\":${live_submit_max_age}}\"\n
+              \ echo \"NOTE: PROFILE_SUBMITS keeps submissions for ${live_submit_max_age}s
+              (0 is no limit); this render creates it at 259200s.\" >&2\n  echo \"  The
+              dispatcher is told the longer one, so a finished task's tombstone outlives
+              its submission.\" >&2\nfi\nreport=\"{${report_findings}}\"\n# Written only
+              where the kubelet has mounted the file: outside a pod there is\n# nothing
+              to write to, and a copy of a report is not a reason to fail a fully\n# provisioned
+              bus. Nor is a write that fails (a full or faulting disk under\n# the kubelet's
+              file): under set -e that would exit 1 on a bus this script\n# just finished
+              provisioning, and exit 1 matches no podFailurePolicy rule, so\n# the Job
+              would burn its backoff into BackoffLimitExceeded. A pod that has no\n# file,
+              or whose write failed, leaves no message, and the reconcile logs that\n#
+              rather than reading it as clean.\nif [ -w \"/dev/termination-log\" ]; then\n
+              \ printf '%s' \"${report}\" > \"/dev/termination-log\" \\\n    || echo \"WARNING:
+              could not write the provision report to the termination log; the log above
+              is this run's only record\" >&2\nfi\n\nrequired_consumers=110\nlive_consumers=\"$(printf
+              '%s' \"${tasks_json}\" \\\n  | grep -o '\"max_consumers\":-\\{0,1\\}[0-9]\\{1,\\}'
               | head -n1 | cut -d: -f2 || true)\"\nif [ -z \"${live_consumers}\" ]; then\n
               \ echo \"could not read max_consumers off the TASKS stream; refusing to
               report this install as provisioned\" >&2\n  exit 1\nfi\nif [ \"${live_consumers}\"
@@ -4965,20 +5392,23 @@ spec:
               delegations and spawning session pods while relaying no events, the\" >&2\n
               \ echo \"     bridge dispatches nothing, and the CR reads Ready over both.
               Session pods\" >&2\n  echo \"     recover by themselves, which hides it
-              rather than helping.\" >&2\n  echo \"     Restarting before TASKS is back
-              only fails the subscribe, so the order holds.\" >&2\n  # Exit 2, and the
-              convention it establishes: 2 means \"this will fail the\n  # same way next
-              time\", anything else is worth retrying. The Job's\n  # podFailurePolicy
-              matches on 2 and fails the Job from the first pod\n  # (buildA2AProvisionJob),
-              so a refusal nothing about a re-run can change\n  # does not spend the backoffLimit
-              before it is heard. This refusal is in\n  # that class: the budget's two
-              inputs, maxSessions and the bridge's worker\n  # count, and the stream's
-              max_consumers are all fixed until an operator\n  # lowers maxSessions, declares
-              the bridge sidecar with fewer workers where\n  # it declared more than the
-              default, or recreates the stream, and\n  # provisioning does none of those.
-              Note that\n  # set -euo pipefail exits with the failing command's own status,
-              which is\n  # not 2, so an unexpected failure stays on the retry budget.\n
-              \ exit 2\nfi\n\necho \"a2a provisioning complete\"\n"
+              rather than helping.\" >&2\n  echo \"     The gateway, restarted early,
+              waits for TASKS and its durable and binds once this\" >&2\n  echo \"     Job
+              has made them. The bridge can restart in a loop until TASKS is back, so
+              restart\" >&2\n  echo \"     its workload after the stream is back.\" >&2\n
+              \ # Exit 2, and the convention it establishes: 2 means \"this will fail
+              the\n  # same way next time\", anything else is worth retrying. The Job's\n
+              \ # podFailurePolicy matches on 2 and fails the Job from the first pod\n
+              \ # (buildA2AProvisionJob), so a refusal nothing about a re-run can change\n
+              \ # does not spend the backoffLimit before it is heard. This refusal is
+              in\n  # that class: the budget's two inputs, maxSessions and the bridge's
+              worker\n  # count, and the stream's max_consumers are all fixed until an
+              operator\n  # lowers maxSessions, declares the bridge sidecar with fewer
+              workers where\n  # it declared more than the default, or recreates the stream,
+              and\n  # provisioning does none of those. Note that\n  # set -euo pipefail
+              exits with the failing command's own status, which is\n  # not 2, so an
+              unexpected failure stays on the retry budget.\n  exit 2\nfi\n\necho \"a2a
+              provisioning complete\"\n"
           env:
             - name: HOME
               value: /tmp
@@ -5099,6 +5529,7 @@ metadata:
       name: platformagent
       uid: ""
 spec:
+  progressDeadlineSeconds: 1800
   replicas: 1
   selector:
     matchLabels:
@@ -5137,6 +5568,8 @@ spec:
               value: "true"
             - name: A2A_MAX_SESSIONS
               value: "10"
+            - name: A2A_GATEWAY_RELAY_PRECREATED
+              value: "true"
             - name: A2A_BUSY_NOTICE_AT
               value: "10"
             - name: A2A_METRICS_PORT
@@ -5167,6 +5600,10 @@ spec:
               value: platformagent-a2a-gateway
             - name: A2A_SESSION_SERVICE_ACCOUNT
               value: platformagent-a2a-session
+            - name: A2A_SCOPE_FILE
+              value: /etc/kube-agents/scope.json
+            - name: A2A_MANAGEMENT_PROJECT
+              value: example-project
             - name: A2A_PRINCIPAL_MAP
               value: /etc/a2a/principal-map
             - name: A2A_GCHAT_RELAY_URL
@@ -5180,11 +5617,23 @@ spec:
               value: /var/run/secrets/a2a-chat-relay/token
             - name: A2A_RESOLVED_SCOPE_CONFIGMAP
               value: platformagent-resolved-scope
+            - name: A2A_GATEWAY_LEASE
+              value: platformagent-a2a-gateway
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.name
           image: ghcr.io/gke-labs/kube-agents/a2a-gateway:latest
           name: gateway
           ports:
             - containerPort: 9096
               name: a2a-metrics
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: a2a-metrics
+            periodSeconds: 5
           resources:
             limits:
               cpu: 500m
@@ -5205,6 +5654,9 @@ spec:
             - mountPath: /etc/a2a-nats-ca
               name: a2a-nats-ca
               readOnly: true
+            - mountPath: /etc/kube-agents
+              name: a2a-gateway-scope
+              readOnly: true
             - mountPath: /var/run/secrets/a2a-chat-relay
               name: a2a-chat-relay-token
               readOnly: true
@@ -5215,6 +5667,15 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       serviceAccountName: platformagent-a2a-gateway
+      topologySpreadConstraints:
+        - labelSelector:
+            matchLabels:
+              app: platformagent-a2a-gateway
+          matchLabelKeys:
+            - pod-template-hash
+          maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
       volumes:
         - configMap:
             name: principal-map
@@ -5223,6 +5684,14 @@ spec:
         - configMap:
             name: platformagent-a2a-nats-ca-bundle
           name: a2a-nats-ca
+        - configMap:
+            defaultMode: 292
+            items:
+              - key: scope.json
+                path: scope.json
+            name: platformagent-config
+            optional: true
+          name: a2a-gateway-scope
         - name: a2a-chat-relay-token
           projected:
             defaultMode: 256

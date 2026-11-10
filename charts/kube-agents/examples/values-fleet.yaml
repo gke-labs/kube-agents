@@ -56,18 +56,17 @@ platformAgent:
     # The operator copies spec.deployment.env onto the agent container only for
     # names on its allowlist, forwards KUBEAGENTS_AUDIT_AUTO_PROMOTE to the
     # shell sandbox, where the audits run, and passes every name it does not
-    # reserve to the credential-proxy and agent-api-auth containers. Both names
-    # here reach the container that reads them. CLOUDSDK_CORE_DISABLE_FILE_LOGGING
+    # reserve to the credential-proxy and agent-api-auth containers. The name
+    # here reaches the container that reads it. CLOUDSDK_CORE_DISABLE_FILE_LOGGING
     # and MALLOC_ARENA_MAX are not on the agent container's allowlist: set here
     # they would reach the proxy pod, where gcloud and kubectl run, and not the
-    # agent container. This file leaves them out.
+    # agent container. This file leaves them out. The fold window that bounds
+    # the triage turns a flapping workload can cause, INCIDENT_WORKLOAD_DEDUP_SECONDS,
+    # is an hour on every install through
+    # platformAgent.deployment.incidentWorkloadDedupSeconds and is not repeated
+    # here: an env entry with that name would override the key, so setting the
+    # key to 0 would no longer turn folding off.
     env:
-      # Seconds an admitted workload event folds its later events into the
-      # same incident instead of opening another: an hour, against the default
-      # of no folding, bounds the triage turns and chat messages a flapping
-      # workload can cause across a large fleet. Capped at a day.
-      - name: INCIDENT_WORKLOAD_DEDUP_SECONDS
-        value: "3600"
       # Fleet audits report findings without opening remediation pull requests
       # on their own; `/remediate` on a ledger still opens one. At 25 clusters
       # or more an automatic promotion sweeps every cluster's findings into

@@ -17,8 +17,8 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
-// consolePublish and consoleSubscribe are the console principal's grants as
-// the operator renders them. TestTheGrantsAreTheRenderedOnes holds them to the
+// consolePublish and consoleSubscribe are the grants of console-mcp, the user
+// the MCP server connects as, as the operator renders them. TestTheGrantsAreTheRenderedOnes holds them to the
 // rendered nats.conf, so a status read that needs more than the console has
 // fails here rather than on a cluster.
 var consolePublish = []string{
@@ -41,17 +41,27 @@ var consolePublish = []string{
 	"$JS.API.CONSUMER.MSG.NEXT.TOPICS-JOURNAL.*",
 	"$JS.API.DIRECT.GET.PROFILE_SUBMITS.>",
 	"chat.console.*.in",
-	"_INBOX.console.>",
+	"_INBOX.console-mcp.>",
 }
 
-var consoleSubscribe = []string{"a2a.>", "chat.console.*.out", "_INBOX.console.>"}
+var consoleSubscribe = []string{"a2a.>", "chat.console.*.out", "_INBOX.console-mcp.>"}
 
-// consolePublishDeny and consoleSubscribeDeny are the console's deny lists as
+// consolePublishDeny and consoleSubscribeDeny are console-mcp's deny lists as
 // rendered. A deny the operator adds must be mirrored here, or the test server
 // would grant what the cluster refuses.
 var (
-	consolePublishDeny   []string
-	consoleSubscribeDeny = []string{"a2a.cap.>"}
+	// The TASKS durables the provision Job pre-creates (#4173).
+	consolePublishDeny = []string{
+		"$JS.API.CONSUMER.CREATE.TASKS.gateway-relay",
+		"$JS.API.CONSUMER.CREATE.TASKS.gateway-relay.>",
+		"$JS.API.CONSUMER.DURABLE.CREATE.TASKS.gateway-relay",
+		"$JS.API.CONSUMER.DELETE.TASKS.gateway-relay",
+		"$JS.API.CONSUMER.CREATE.TASKS.bridge-platform",
+		"$JS.API.CONSUMER.CREATE.TASKS.bridge-platform.>",
+		"$JS.API.CONSUMER.DURABLE.CREATE.TASKS.bridge-platform",
+		"$JS.API.CONSUMER.DELETE.TASKS.bridge-platform",
+	}
+	consoleSubscribeDeny = []string{"a2a.cap.>", "a2a.dispatch.>", "a2a.stop.>"}
 )
 
 // renderedConf is the operator's render the callout suite starts from.
@@ -63,9 +73,9 @@ func TestTheGrantsAreTheRenderedOnes(t *testing.T) {
 		t.Fatal(err)
 	}
 	conf := string(raw)
-	start := strings.Index(conf, "user: console")
+	start := strings.Index(conf, "user: console-mcp\n")
 	if start < 0 {
-		t.Fatal("the rendered conf has no console user")
+		t.Fatal("the rendered conf has no console-mcp user")
 	}
 	block := conf[start:]
 	// The console user's block ends where the next user's begins.
@@ -127,8 +137,8 @@ func TestTheGrantsAreTheRenderedOnes(t *testing.T) {
 }
 
 const (
-	testUser = "console"
-	testPass = "pw-console"
+	testUser = "console-mcp"
+	testPass = "pw-console-mcp"
 	// directoryMaxConsumers is the cap the operator provisions DIRECTORY
 	// with.
 	directoryMaxConsumers = 64

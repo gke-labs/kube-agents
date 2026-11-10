@@ -306,7 +306,7 @@ resolve_state_location() {
     # Remote state where the installer keeps it (or where the caller pointed
     # us): pin the backend for lifecycle.sh.
     export KUBE_AGENTS_STATE_BUCKET="${KUBE_AGENTS_STATE_BUCKET:-$DEFAULT_KUBE_AGENTS_STATE_BUCKET}"
-  elif ! printf '%s' "$probe_err" | grep -qiE "$GCS_OBJECT_ABSENT_PATTERN"; then
+  elif ! grep -qiE "$GCS_OBJECT_ABSENT_PATTERN" <<<"$probe_err"; then
     # Anything that is not a clean "absent" — refuse rather than report an
     # empty target. Reaching the local-state branches below on a permission
     # error would be the same mistake one level down.
@@ -971,6 +971,10 @@ main() {
     export MODEL_PROVIDER="$DEFAULT_MODEL_PROVIDER" MODEL_DEFAULT_NAME=""
   fi
   export WEB_CONSOLE_ENABLED="false"
+  # The minter keys a lifecycle.sh refusal asks an operator to type into
+  # install.env by hand: the composition refuses either one in the wrong shape,
+  # and a destroy has no use for them, since both only steer adoption.
+  export MINTER_SHARED_KEY="" MINTER_ADOPT_KEY=""
   write_tfvars_from_state "${compose_dir}/terraform.tfvars"
   (
     cd "$compose_dir"

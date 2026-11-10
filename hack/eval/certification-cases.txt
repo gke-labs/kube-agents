@@ -1,0 +1,96 @@
+# The certification suite: the cases behind the certified-capabilities page
+# (#3978). hack/ci-eval-pr.sh runs this file, and nothing else, under
+# EVAL_TIER=certification, which only the ci-kube-agents-certification
+# periodics in oss-test-infra export; no pull request and no nightly runs a
+# case named here.
+#
+# One `./tasks/<id>/task.yaml` path per line, relative to bench/. `#` starts
+# a comment, blank lines are skipped. A `# part N` line on its own starts
+# section N; a periodic runs one section under EVAL_CERTIFICATION_PART=N,
+# and entries above the first marker are part 1. The script refuses to start
+# on a line that names no case directory, on an entry that is also in
+# presubmit-cases.txt or nightly-cases.txt (one case, one lane, one record),
+# and on an empty file when this tier is the one running.
+#
+# WHAT BELONGS HERE. A top-level case under bench/tasks/ whose task.yaml
+# carries `suite: certification` (scripts/validate_bench_cases.py refuses an
+# entry without it) and a reason block above its line: the capability row it
+# grades and, for an `expected_fail: true` case, the issue that owns the gap.
+# The rules a case meets are the "Certification suite" section of
+# bench/README.md.
+#
+# WHO APPROVES. The normal approvers (root OWNERS), like nightly-cases.txt:
+# this file changes what one weekly lane records, never what can red a
+# pull request.
+
+# part 1
+# Capability row: cost, idle and over-requested resources; a request cut on two
+# named workloads names the dependency each cut would change (the seeded fleet's
+# HPA-scaled inference-server in seeded-capacity and the Guaranteed-QoS
+# ledger-writer in seeded-qos; no stack). A baseline: no gap declared; moved in
+# from the nightly file on its record there: 43 of 45 repetitions pass,
+# 2026-10-23 to 2026-11-09 (the case of #3507, for #3199).
+./tasks/cost-rightsizing-names-dependencies/task.yaml
+# Capability row: networking fabric, load balancers and Gateway; the
+# obtainability audit on an HTTPRoute whose Service maps to a numeric targetPort
+# no backing container declares or serves (the planted backend-api-svc in
+# seeded-networking, route unattached, no load balancer). A declared gap,
+# expected_fail: no audit reads the mismatch; the gap is #2576 (item 3).
+./tasks/networking-gateway-ingress-port-mismatch/task.yaml
+# Capability row: observability, logging and Managed Prometheus; the
+# obtainability audit on a Deployment whose container is OOM-killed in a loop
+# (the planted kube-state-metrics in seeded-observability, busybox under a 64Mi
+# limit). A declared gap, expected_fail: no audit reads a container's OOMKilled
+# last termination or restart count; the gap is #2579.
+./tasks/observability-gmp-kube-state-metrics-oom/task.yaml
+# Capability row: security, Workload Identity, RBAC and CVEs; the compliance
+# audit's default-sa-automount check on a Deployment that runs under the
+# default ServiceAccount with its token mounted (the planted
+# metrics-agent-deploy in seeded-sa-token). A declared gap, expected_fail: the
+# collector lists the workload, but the ledger body drops every major and
+# minor finding once the criticals fill its budget; the gap is #5052.
+./tasks/security-default-sa-token-mount-baseline/task.yaml
+# Capability row: security, Workload Identity, RBAC and CVEs; the compliance
+# audit on an admission webhook whose CA bundle certificate has expired (the
+# planted ValidatingWebhookConfiguration bench-expiring-webhook-ca, failurePolicy
+# Ignore on an inert group). A declared gap, expected_fail: no compliance check
+# reads a CA bundle's notAfter; the gap is #4960.
+./tasks/security-expiring-node-bootstrap-and-webhook-certs/task.yaml
+# Capability row: security, Workload Identity, RBAC and CVEs; the compliance
+# audit on a ServiceAccount whose Workload Identity annotation names a Google
+# service account with no workloadIdentityUser binding behind it (the planted
+# kms-signer-sa and the kms-signer Deployment in seeded-identity). A declared
+# gap, expected_fail: no compliance check reads the binding behind an
+# annotation; the gap is #5027.
+./tasks/security-wi-ksa-gsa-iam-binding-missing/task.yaml
+# Capability row: storage, CSI drivers and PVCs; the obtainability audit names a
+# one-replica Deployment under the default RollingUpdate strategy that mounts a
+# ReadWriteOnce claim (the planted single-writer-app and single-writer-data in
+# seeded-storage). A baseline: no gap declared.
+./tasks/storage-rwo-pvc-rollingupdate-multiattach-deadlock/task.yaml
+# Capability row: cluster and node upgrades; the obtainability audit names a
+# three-replica Deployment that no PodDisruptionBudget selects (the planted
+# stateless-ingest-service in seeded-upgrades). A baseline: no gap declared.
+./tasks/upgrade-missing-pdb-drain-outage-baseline/task.yaml
+# Capability row: workloads, OOM, probes and HPA; the obtainability audit on a
+# Deployment whose HorizontalPodAutoscaler scales down with no stabilization
+# window and whose containers have no preStop hook (the planted web-api-server
+# and web-api-server-hpa in seeded-autoscaling). A declared gap, expected_fail:
+# no obtainability check reads the scale-down behavior; the gap is #4941.
+./tasks/workload-hpa-scaledown-and-missing-prestop/task.yaml
+# Capability row: workloads, OOM, probes and HPA; the compliance audit on a
+# Deployment that pulls an Artifact Registry image through the node identity
+# alone and is refused for lack of the registry reader role (the planted
+# streamed-image-service in seeded-streaming, its pods in ErrImagePull). A
+# declared gap, expected_fail: no compliance check reads the pattern; the gap
+# is #5028.
+./tasks/workload-image-streaming-token-iam-expiry/task.yaml
+# Capability row: workloads, OOM, probes and HPA; the obtainability audit names a
+# Deployment whose containers set no memory limit (the planted
+# memory-unbounded-worker in seeded-workloads). A baseline: no gap declared.
+./tasks/workload-missing-memory-limits-oom-baseline/task.yaml
+# Capability row: workloads, OOM, probes and HPA; the compliance audit on a
+# Deployment whose private-registry pull secret no longer works (the planted
+# private-image-worker in seeded-registry, pods in ErrImagePull). A declared
+# gap, expected_fail: no compliance check names it; the gap is #4809.
+./tasks/workload-private-registry-pull-secret-expired/task.yaml

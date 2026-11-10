@@ -88,6 +88,13 @@ class DenialClassifierTest(unittest.TestCase):
         # either refusal, so these are the stubs and not observed lines.
         "ERROR: (gcloud.kms.keys.versions.list) PERMISSION_DENIED: Permission denied on resource",
         "ERROR: (gcloud.services.list) PERMISSION_DENIED: Permission denied to list services",
+        # The Secret Manager and API Keys refusals check_gemini_api_key reads
+        # through; the same gRPC form, stubbed, not observed.
+        "ERROR: (gcloud.secrets.versions.list) PERMISSION_DENIED: Permission "
+        "'secretmanager.versions.list' denied for resource "
+        "'projects/kube-agents-evals-6/secrets/kube-agents-eval-gemini-api-key' (or it may not exist).",
+        "ERROR: (gcloud.services.api-keys.list) PERMISSION_DENIED: Permission 'apikeys.keys.list' "
+        "denied on resource '//apikeys.googleapis.com/projects/kube-agents-evals-6/locations/global' (or it may not exist).",
         "ERROR: (gcloud.projects.describe) User [x] does not have permission to access projects "
         "instance [y] (or it may not exist)",
         # Observed on 2026-08-27 against an existing SA in kube-agents-evals-6.
@@ -161,6 +168,45 @@ class DenialClassifierTest(unittest.TestCase):
         "ERROR: gcloud crashed (SSLError): [SSL: DECRYPTION_FAILED_OR_BAD_RECORD_MAC] decryption failed",
         "ERROR: gcloud crashed (ReadTimeout): HTTPSConnectionPool(host='container.googleapis.com', port=443): Read timed out.",
     )
+    # A disabled API: gcloud's PERMISSION_DENIED with reason SERVICE_DISABLED.
+    # The general classifier keeps it a refusal; check_gemini_api_key alone
+    # reads it as absence (GEMINI_KEY_SERVICE_DISABLED): on a project the key
+    # script never ran against, these two APIs are off.
+    SERVICE_DISABLED = (
+        "ERROR: (gcloud.services.api-keys.list) PERMISSION_DENIED: API Keys API has not been used in "
+        "project 123456789012 before or it is disabled. Enable it by visiting "
+        "https://console.developers.google.com/apis/api/apikeys.googleapis.com/overview?project=123456789012 "
+        "then retry. If you enabled this API recently, wait a few minutes for the action to propagate to "
+        "our systems and retry. This command is authenticated as x@y.iam.gserviceaccount.com using the "
+        "credentials in ..., specified by the [auth/credential_file_override] property.\n"
+        "- '@type': type.googleapis.com/google.rpc.ErrorInfo\n"
+        "  domain: googleapis.com\n"
+        "  metadata:\n"
+        "    consumer: projects/123456789012\n"
+        "    service: apikeys.googleapis.com\n"
+        "  reason: SERVICE_DISABLED",
+        "ERROR: (gcloud.secrets.versions.list) PERMISSION_DENIED: Secret Manager API has not been used in "
+        "project 123456789012 before or it is disabled. Enable it by visiting "
+        "https://console.developers.google.com/apis/api/secretmanager.googleapis.com/overview?project=123456789012 "
+        "then retry. If you enabled this API recently, wait a few minutes for the action to propagate to "
+        "our systems and retry.\n"
+        "- '@type': type.googleapis.com/google.rpc.ErrorInfo\n"
+        "  domain: googleapis.com\n"
+        "  metadata:\n"
+        "    consumer: projects/123456789012\n"
+        "    service: secretmanager.googleapis.com\n"
+        "  reason: SERVICE_DISABLED",
+    )
+
+    def test_a_disabled_api_is_a_refusal_and_only_the_gemini_check_reads_it_as_absence(self):
+        for err in self.SERVICE_DISABLED:
+            with self.subTest(err=err[:60]):
+                self.assertIsNotNone(checker._denial_reason(err), err)
+                self.assertTrue(checker.GEMINI_KEY_SERVICE_DISABLED.search(err), err)
+        for err in self.REFUSALS + self.ABSENCES + self.TRANSIENTS:
+            with self.subTest(err=err[:60]):
+                self.assertIsNone(checker.GEMINI_KEY_SERVICE_DISABLED.search(err), err)
+
     # A status code inside a resource name is not a status.
     NUMBERED_ABSENCES = (
         "ERROR: (gcloud.storage.buckets.describe) gs://kube-agents-evals-500-tf-state not found: 404.",
@@ -267,6 +313,14 @@ class RequiredApisTest(unittest.TestCase):
         # relay on roles/cloudtrace.user; a project with the role and the API
         # off fails it with SERVICE_DISABLED, which this check exists to catch.
         self.assertIn("cloudtrace.googleapis.com", checker.REQUIRED_APIS)
+
+    def test_the_gemini_key_apis_are_required(self):
+        # The runs under MODEL_PROVIDER=gemini call the Gemini Developer API
+        # with a key held in Secret Manager. With Secret Manager off the deploy
+        # stops at its FATAL line before Helm; with the Generative Language
+        # API off the first agent call fails.
+        for api in ("apikeys.googleapis.com", "secretmanager.googleapis.com", "generativelanguage.googleapis.com"):
+            self.assertIn(api, checker.REQUIRED_APIS)
 
     def test_all_apis_enabled_passes(self):
         with mock.patch.object(checker, "run_cmd") as run:
@@ -458,10 +512,12 @@ class GkeAndCmekTest(unittest.TestCase):
         # missing grant fails only the hourly sweep.
         self.assertEqual(
             checker.LEASE_SILENT_FINDINGS,
-            frozenset({checker.FINDING_HOST_OTEL_SCOPE, checker.FINDING_COMPUTE_SWEEPER_MISSING, checker.FINDING_DNS_API}) | checker.FORGE_FINDINGS,
+            frozenset({checker.FINDING_HOST_OTEL_SCOPE, checker.FINDING_COMPUTE_SWEEPER_MISSING, checker.FINDING_DNS_API})
+            | checker.FORGE_FINDINGS,
         )
         # The forge pieces serve the self-managed lanes alone (docs 5.8): the two
         # public lanes read none of them, so a leased run passes with any of them.
+        # The Gemini key findings red runs (GeminiApiKeyCheckTest).
 
     def test_fleet_clusters_are_not_held_to_the_otel_scope(self):
         # Nothing reads the seeded clusters' traces, and bench/tf/fleet does not
@@ -3890,7 +3946,7 @@ class IamGrantsTest(unittest.TestCase):
         # The gap every pool project provisioned before model_provider =
         # "vertex_ai" landed in provision_ci_pool_project.sh's tfvars carries:
         # the deploy annotates the kubeagents-litellm KSA, no binding backs
-        # it, and every leased presubmit reds at the model-call gate (#1097).
+        # it, and every leased run on Vertex AI reds at the model-call gate (#1097).
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
                 _ok(self._wi_policy("kube-agents-evals-3")),
@@ -4431,7 +4487,9 @@ FLEET_RESOURCE_ROLES = {
     "google_project_iam_member": {"roles/resourcemanager.projectIamAdmin"},
     # terraform_data.scaled_zero_status's local-exec runs
     # bench/tf/fleet/gateway_status.py, which writes the Gateway and HTTPRoute
-    # status subresources on seeded-a as the reconciler.
+    # status subresources on seeded-a as the reconciler, and
+    # terraform_data.config_connector's runs config_connector.py, which applies
+    # seeded-a's ConfigConnector object the same way.
     "terraform_data": {"roles/container.admin"},
     # Data sources: reads the plan makes before anything is created. external
     # runs bench/tf/fleet/seeded_b_pin.py, whose reads are `gcloud container
@@ -4460,9 +4518,10 @@ class FleetResourceTypesAreCoveredByReconcilerRolesTest(unittest.TestCase):
     # The names tofu's loader skips are skipped here too, so a parked file
     # neither demands a role nor keeps one accounted for.
     # seeded_b_pin.py is the program data.external runs, and gateway_status.py
-    # the one a terraform_data local-exec runs, not something tofu loads; their
-    # calls are accounted for on the external and terraform_data types above.
-    _INERT_FILES = {"README.md", ".terraform.lock.hcl", "fixtures.json", "reconcile-allow.json", "seeded_b_pin.py", "gateway_status.py"}
+    # and config_connector.py the ones the terraform_data local-execs run, not
+    # something tofu loads; their calls are accounted for on the external and
+    # terraform_data types above.
+    _INERT_FILES = {"README.md", ".terraform.lock.hcl", "fixtures.json", "reconcile-allow.json", "seeded_b_pin.py", "gateway_status.py", "config_connector.py"}
     _READ_BLOCKS = {"resource", "data"}
     # moved renames a state address and declares no resource: the type it
     # names is read from the resource block it points at.
@@ -5005,6 +5064,7 @@ class RunChecksTest(unittest.TestCase):
              mock.patch.object(checker, "check_gitops_workload_manifest", return_value=checker.CheckResult("w", True)), \
              mock.patch.object(checker, "check_gitlab_workload_manifest", return_value=checker.CheckResult("gl", True)), \
              mock.patch.object(checker, "check_ledger_read_credential", return_value=checker.CheckResult("l", True)), \
+             mock.patch.object(checker, "check_gemini_api_key", return_value=checker.CheckResult("gk", True)), \
              mock.patch.object(checker, "check_token_minter", return_value=checker.CheckResult("k", True)):
             results = checker.run_checks("kube-agents-evals-3")
         # IAM, Artifact Registry and the warm-cache readers all need the
@@ -5031,6 +5091,7 @@ class RunChecksTest(unittest.TestCase):
              mock.patch.object(checker, "check_gitops_workload_manifest", return_value=checker.CheckResult("w", True)), \
              mock.patch.object(checker, "check_gitlab_workload_manifest", return_value=checker.CheckResult("gl", True)), \
              mock.patch.object(checker, "check_ledger_read_credential", return_value=checker.CheckResult("l", True)), \
+             mock.patch.object(checker, "check_gemini_api_key", return_value=checker.CheckResult("gk", True)), \
              mock.patch.object(checker, "check_forge_pieces", return_value=checker.CheckResult("fp", True)), \
              mock.patch.object(checker, "check_token_minter", return_value=checker.CheckResult("k", True)):
             results = checker.run_checks("kube-agents-evals-6")
@@ -5049,7 +5110,7 @@ class ChecksSelectionTest(unittest.TestCase):
     def _mocks(self):
         return {
             name: mock.patch.object(checker, name, return_value=checker.CheckResult(name, True))
-            for name in ("check_codebase_mapping", "check_gke_and_state", "check_seeded_fleet_fixtures", "check_github_repo_and_app", "check_gitops_default_branch", "check_gitops_declaration", "check_gitops_workload_manifest", "check_gitlab_workload_manifest", "check_ledger_read_credential", "check_warm_cache_readers", "check_forge_pieces")
+            for name in ("check_codebase_mapping", "check_gke_and_state", "check_seeded_fleet_fixtures", "check_github_repo_and_app", "check_gitops_default_branch", "check_gitops_declaration", "check_gitops_workload_manifest", "check_gitlab_workload_manifest", "check_ledger_read_credential", "check_gemini_api_key", "check_warm_cache_readers", "check_forge_pieces")
         }
 
     def test_parse_checks_orders_and_refuses_unknown_ids(self):
@@ -5093,13 +5154,14 @@ class ChecksSelectionTest(unittest.TestCase):
              mock.patch.object(checker, "check_artifact_registry", return_value=checker.CheckResult("a", True)) as ar, \
              mock.patch.object(checker, "check_token_minter", return_value=checker.CheckResult("k", True)) as minter, \
              mocks["check_codebase_mapping"] as mapping, mocks["check_gke_and_state"] as gke, mocks["check_seeded_fleet_fixtures"] as fleet, \
-             mocks["check_github_repo_and_app"] as app, mocks["check_gitops_default_branch"] as branch, mocks["check_gitops_declaration"] as note, mocks["check_gitops_workload_manifest"] as manifest, mocks["check_gitlab_workload_manifest"] as gitlab_manifest, mocks["check_ledger_read_credential"] as ledger, \
+             mocks["check_github_repo_and_app"] as app, mocks["check_gitops_default_branch"] as branch, mocks["check_gitops_declaration"] as note, mocks["check_gitops_workload_manifest"] as manifest, mocks["check_gitlab_workload_manifest"] as gitlab_manifest, mocks["check_ledger_read_credential"] as ledger, mocks["check_gemini_api_key"] as gemini, \
              mocks["check_warm_cache_readers"] as warm, mocks["check_forge_pieces"] as forge, mock.patch.object(checker, "run_cmd", side_effect=AssertionError("a check ran a real command")):
             results = checker.run_checks("kube-agents-evals-3", checks=list(checker.POOL_STATE_CHECKS))
             self.assertEqual(warm.call_count, 0, "the warm-cache check is not in the scan's set")
             branch.assert_called_once_with("kube-agents-evals-3")
             forge.assert_called_once_with("kube-agents-evals-3", "us-central1")
             self.assertEqual([r.check_id for r in results], list(checker.POOL_STATE_CHECKS))
+            gemini.assert_called_once_with("kube-agents-evals-3")
             for never in (mapping, fleet, app, note, manifest, gitlab_manifest, ledger):
                 never.assert_not_called()
             minter.assert_called_once_with("kube-agents-evals-3", checker.DEFAULT_GITHUB_APP_ID, "us-central1", probe_app=False)
@@ -5205,6 +5267,7 @@ class ReportDocumentTest(unittest.TestCase):
              mock.patch.object(checker, "check_artifact_registry", return_value=checker.CheckResult("a", True)), \
              mock.patch.object(checker, "check_gke_and_state", return_value=checker.CheckResult("g", True)), \
              mock.patch.object(checker, "check_gitops_default_branch", return_value=checker.CheckResult("d", True)), \
+             mock.patch.object(checker, "check_gemini_api_key", return_value=checker.CheckResult("gk", True)), \
              mock.patch.object(checker, "check_token_minter", return_value=checker.CheckResult("k", True)):
             results = checker.run_checks("kube-agents-evals-3", checks=list(checker.POOL_STATE_CHECKS), deadline=time.monotonic() + 60)
         self.assertEqual(iam.call_count, 1)
@@ -5878,6 +5941,278 @@ class ForgePiecesTest(unittest.TestCase):
         forge = (pathlib.Path(__file__).resolve().parent.parent / "hack" / "ci-forge.sh").read_text()
         for name, value in (("FORGE_FIREWALL_RULE", checker.FORGE_FIREWALL_RULE), ("FORGE_DENY_RULE", checker.FORGE_DENY_RULE), ("FORGE_DNS_ZONE", checker.FORGE_DNS_ZONE), ("FORGE_VM_SERVICE_ACCOUNT_ID", checker.FORGE_VM_SA_ID), ("FORGE_NETWORK_TAG", checker.FORGE_NETWORK_TAG), ("FORGE_VM_NETWORK", checker.FORGE_NETWORK)):
             self.assertIn(f'readonly {name}="{value}"', forge, name)
+
+
+class GeminiApiKeyCheckTest(unittest.TestCase):
+    """The eval nightlies' Gemini Developer API key: minted and stored by
+    scripts/provision_ci_pool_gemini_key.sh, read back here from metadata and
+    IAM alone, never the key string or the secret's value."""
+
+    PROJECT = "kube-agents-evals-2"
+    KEY_NAME = "projects/123/locations/global/keys/abc"
+    ACCESSORS = (
+        "serviceAccount:prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com",
+        "serviceAccount:eval-baseline-recorder@kube-agents-prow.iam.gserviceaccount.com",
+    )
+    SCRIPT = pathlib.Path(__file__).resolve().parent / "provision_ci_pool_gemini_key.sh"
+
+    def _answers(self, targets=("generativelanguage.googleapis.com",), keys=1, version="ENABLED", accessors=ACCESSORS, keys_answer=None, clients=None):
+        restrictions = {"apiTargets": [{"service": t} for t in targets]}
+        restrictions.update(clients or {})
+        key = {"name": self.KEY_NAME, "displayName": "kube-agents-eval-gemini", "restrictions": restrictions}
+        probe = {"name": "projects/123/locations/global/keys/probe", "displayName": "kube-agents-eval-gemini-probe", "restrictions": {}}
+        out = [keys_answer or _ok(json.dumps([key] * keys + [probe]))]
+        out.append(_ok(json.dumps([{"name": "projects/123/secrets/kube-agents-eval-gemini-api-key/versions/1", "state": version}] if version else [])))
+        policy = {"bindings": [{"role": "roles/secretmanager.secretAccessor", "members": list(accessors)}]} if accessors else {}
+        out.append(_ok(json.dumps(policy)))
+        return out
+
+    def _check(self, answers):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = answers
+            result = checker.check_gemini_api_key(self.PROJECT)
+        return result, [" ".join(c.args[0]) for c in run.call_args_list]
+
+    def test_a_project_with_key_secret_and_grants_passes(self):
+        result, argv = self._check(self._answers())
+        self.assertTrue(result.passed, result.details)
+        self.assertEqual(result.findings, [])
+        self.assertTrue(result.read)
+        self.assertEqual(result.warnings, [])
+        self.assertIn("gcloud services api-keys list", argv[0])
+        self.assertNotIn("--filter", argv[0])
+        self.assertIn("gcloud secrets versions list kube-agents-eval-gemini-api-key", argv[1])
+        self.assertIn("--limit=1", argv[1])
+        self.assertIn("gcloud secrets get-iam-policy kube-agents-eval-gemini-api-key", argv[2])
+        self.assertEqual(len(argv), 3)
+        # Metadata and IAM only: neither the key string nor the secret value.
+        for line in argv:
+            self.assertNotIn("get-key-string", line)
+            self.assertNotIn("versions access", line)
+            self.assertIn(f"--project={self.PROJECT}", line)
+
+    def test_a_key_whose_display_name_only_starts_with_the_name_is_ignored(self):
+        # _answers lists kube-agents-eval-gemini-probe, unrestricted, beside the key.
+        result, _ = self._check(self._answers())
+        self.assertTrue(result.passed, result.details)
+        self.assertFalse(any("probe" in d for d in result.details), result.details)
+        result, _ = self._check(self._answers(keys=0))
+        self.assertEqual([f.id for f in result.findings], [checker.FINDING_GEMINI_KEY_MISSING])
+
+    def test_a_missing_key_is_the_missing_finding_with_the_script_as_repair(self):
+        result, _ = self._check(self._answers(keys=0))
+        self.assertFalse(result.passed)
+        self.assertEqual([f.id for f in result.findings], [checker.FINDING_GEMINI_KEY_MISSING])
+        self.assertEqual(checker.FINDING_GEMINI_KEY_MISSING, "apikeys/gemini/missing")
+        self.assertIn(f"scripts/provision_ci_pool_gemini_key.sh {self.PROJECT}", result.findings[0].repair)
+
+    def test_a_key_with_an_extra_api_target_is_the_restriction_finding(self):
+        result, _ = self._check(self._answers(targets=("generativelanguage.googleapis.com", "aiplatform.googleapis.com")))
+        self.assertFalse(result.passed)
+        self.assertEqual([f.id for f in result.findings], ["apikeys/gemini/restriction"])
+        finding = result.findings[0]
+        self.assertIn("aiplatform.googleapis.com", finding.observed)
+        self.assertIn(f"gcloud services api-keys update {self.KEY_NAME} --project={self.PROJECT} --api-target=service=generativelanguage.googleapis.com", finding.repair)
+        # A key with no restriction at all is the same finding.
+        result, _ = self._check(self._answers(targets=()))
+        self.assertEqual([f.id for f in result.findings], ["apikeys/gemini/restriction"])
+
+    def test_a_missing_secret_version_is_the_secret_missing_finding(self):
+        for version in ("", "DISABLED"):
+            with self.subTest(version=version):
+                result, _ = self._check(self._answers(version=version))
+                self.assertFalse(result.passed)
+                self.assertEqual([f.id for f in result.findings], [checker.FINDING_GEMINI_KEY_SECRET_MISSING])
+                self.assertIn(f"scripts/provision_ci_pool_gemini_key.sh {self.PROJECT}", result.findings[0].repair)
+        # An absent secret is the same finding, and its policy is not read.
+        answers = self._answers()
+        answers[1] = _fail("ERROR: (gcloud.secrets.versions.list) NOT_FOUND: Secret [projects/123/secrets/kube-agents-eval-gemini-api-key] not found or has no versions.")
+        result, argv = self._check(answers[:2])
+        self.assertEqual([f.id for f in result.findings], [checker.FINDING_GEMINI_KEY_SECRET_MISSING])
+        self.assertEqual(len(argv), 2)
+
+    def test_a_runner_without_accessor_is_an_accessor_finding_per_member(self):
+        result, _ = self._check(self._answers(accessors=self.ACCESSORS[:1]))
+        self.assertFalse(result.passed)
+        self.assertEqual([f.id for f in result.findings], [checker.FINDING_GEMINI_KEY_SECRET_ACCESSOR_PREFIX + self.ACCESSORS[1]])
+        self.assertTrue(result.findings[0].id.endswith(self.ACCESSORS[1]))
+        self.assertEqual(checker.FINDING_GEMINI_KEY_SECRET_ACCESSOR_PREFIX, "secrets/gemini-api-key/accessor/")
+        result, _ = self._check(self._answers(accessors=()))
+        self.assertEqual({f.id for f in result.findings}, {checker.FINDING_GEMINI_KEY_SECRET_ACCESSOR_PREFIX + m for m in self.ACCESSORS})
+
+    def test_a_denied_api_keys_list_is_unread_not_failed(self):
+        denied = _fail(next(e for e in DenialClassifierTest.REFUSALS if "(gcloud.services.api-keys.list)" in e))
+        result, _ = self._check(self._answers(keys_answer=denied))
+        self.assertTrue(result.passed, result.details)
+        self.assertEqual(result.findings, [])
+        self.assertTrue(any(isinstance(w, checker.Unread) and "PERMISSION_DENIED" in w for w in result.warnings), result.warnings)
+        self.assertIn("not checked", result.message)
+        # Every read refused: nothing read at all.
+        result, _ = self._check([denied] * 3)
+        self.assertTrue(result.passed)
+        self.assertFalse(result.read)
+        self.assertEqual(result.message, "Not checked")
+
+    # The target's number as `projects describe --format=value(projectNumber)`
+    # prints it; DenialClassifierTest.SERVICE_DISABLED names this number.
+    TARGET_NUMBER = _ok("123456789012\n")
+    OTHER_NUMBER = _ok("999999999999\n")
+
+    def test_a_project_the_key_script_never_ran_on_is_the_missing_findings_not_unread(self):
+        # The key script enables both APIs, so an unrepaired project answers
+        # SERVICE_DISABLED to both reads; that is the drift this check reports.
+        keys_off, secrets_off = DenialClassifierTest.SERVICE_DISABLED
+        self.assertIn("(gcloud.services.api-keys.list)", keys_off)
+        self.assertIn("(gcloud.secrets.versions.list)", secrets_off)
+        result, argv = self._check([_fail(keys_off), self.TARGET_NUMBER, _fail(secrets_off)])
+        self.assertFalse(result.passed)
+        self.assertTrue(result.read)
+        self.assertEqual([f.id for f in result.findings], [checker.FINDING_GEMINI_KEY_MISSING, checker.FINDING_GEMINI_KEY_SECRET_MISSING])
+        for finding in result.findings:
+            self.assertEqual(finding.repair, f"scripts/provision_ci_pool_gemini_key.sh {self.PROJECT}")
+        self.assertEqual(result.warnings, [])
+        # The number is read once, and the secret is absent, so its policy is not read.
+        self.assertEqual(len(argv), 3)
+        self.assertEqual(argv[1], f"gcloud projects describe {self.PROJECT} --format=value(projectNumber)")
+        # Each read alone: the other half still reads normally.
+        result, _ = self._check([_fail(keys_off), self.TARGET_NUMBER] + self._answers()[1:])
+        self.assertEqual([f.id for f in result.findings], [checker.FINDING_GEMINI_KEY_MISSING])
+        answers = self._answers()
+        result, _ = self._check([answers[0], _fail(secrets_off), self.TARGET_NUMBER])
+        self.assertEqual([f.id for f in result.findings], [checker.FINDING_GEMINI_KEY_SECRET_MISSING])
+
+    def test_a_service_disabled_that_names_the_project_by_id_needs_no_number(self):
+        keys_off = DenialClassifierTest.SERVICE_DISABLED[0].replace("123456789012", self.PROJECT)
+        result, argv = self._check([_fail(keys_off)] + self._answers()[1:])
+        self.assertEqual([f.id for f in result.findings], [checker.FINDING_GEMINI_KEY_MISSING])
+        self.assertFalse(any("projects describe" in line for line in argv), argv)
+
+    def test_a_service_disabled_that_names_another_project_is_unread(self):
+        # The caller's quota project (kube-agents-prow has no API Keys API)
+        # answers SERVICE_DISABLED for a project whose key is fine.
+        keys_off = DenialClassifierTest.SERVICE_DISABLED[0]
+        result, _ = self._check([_fail(keys_off), self.OTHER_NUMBER] + self._answers()[1:])
+        self.assertTrue(result.passed, result.details)
+        self.assertEqual(result.findings, [])
+        self.assertIn("the API key not checked", result.message)
+        self.assertTrue(
+            any(isinstance(w, checker.Unread) and "names project 123456789012, not kube-agents-evals-2 (999999999999)" in w for w in result.warnings),
+            result.warnings,
+        )
+        # A number that could not be read leaves it unread too.
+        denied = _fail(next(e for e in DenialClassifierTest.REFUSALS if "PERMISSION_DENIED" in e))
+        result, _ = self._check([_fail(keys_off), denied] + self._answers()[1:])
+        self.assertEqual(result.findings, [])
+        self.assertTrue(any(isinstance(w, checker.Unread) and "number could not be read" in w for w in result.warnings), result.warnings)
+
+    def test_a_bare_service_disabled_naming_no_project_is_unread(self):
+        bare = "ERROR: (gcloud.services.api-keys.list) PERMISSION_DENIED: The caller does not have permission.\n  reason: SERVICE_DISABLED"
+        result, argv = self._check([_fail(bare)] + self._answers()[1:])
+        self.assertTrue(result.passed, result.details)
+        self.assertEqual(result.findings, [])
+        self.assertTrue(any(isinstance(w, checker.Unread) and "names no project" in w for w in result.warnings), result.warnings)
+        self.assertFalse(any("projects describe" in line for line in argv), argv)
+
+    def test_a_failed_policy_read_leaves_the_accessors_unverified(self):
+        answers = self._answers()
+        answers[2] = _fail("boom")
+        result, _ = self._check(answers)
+        self.assertTrue(result.passed, result.details)
+        self.assertEqual(result.findings, [])
+        self.assertIn("the secret's accessors not checked", result.message)
+        self.assertTrue(any(isinstance(w, checker.Unread) and "accessors are unverified" in w for w in result.warnings), result.warnings)
+
+    def test_the_check_is_in_the_default_set_and_the_pool_state_checks(self):
+        self.assertEqual(checker.CHECK_GEMINI_KEY, "gemini_api_key")
+        self.assertEqual(checker.CHECK_DISPLAY_NAMES[checker.CHECK_GEMINI_KEY], "Gemini Developer API Key")
+        self.assertIn(checker.CHECK_GEMINI_KEY, checker.CHECK_IDS)
+        self.assertIn(checker.CHECK_GEMINI_KEY, checker.DEFAULT_CHECKS)
+        self.assertIn(checker.CHECK_GEMINI_KEY, checker.GCP_CHECKS)
+        self.assertIn(checker.CHECK_GEMINI_KEY, checker.POOL_STATE_CHECKS)
+        with mock.patch.object(checker, "check_gemini_api_key", return_value=checker.CheckResult("Gemini Developer API Key", True)) as check:
+            results = checker.run_checks(self.PROJECT, checks=[checker.CHECK_GEMINI_KEY])
+        check.assert_called_once_with(self.PROJECT)
+        self.assertEqual([r.check_id for r in results], [checker.CHECK_GEMINI_KEY])
+
+    def test_no_gemini_finding_is_lease_silent(self):
+        for finding_id in (
+            checker.FINDING_GEMINI_KEY_MISSING,
+            checker.FINDING_GEMINI_KEY_RESTRICTION,
+            checker.FINDING_GEMINI_KEY_SECRET_MISSING,
+            *(checker.FINDING_GEMINI_KEY_SECRET_ACCESSOR_PREFIX + m for m in self.ACCESSORS),
+        ):
+            self.assertIn(finding_id, checker.GEMINI_KEY_FINDINGS)
+            self.assertNotIn(finding_id, checker.LEASE_SILENT_FINDINGS)
+        # And every id the check can emit, so a new one cannot slip past.
+        cases = (self._answers(keys=0), self._answers(targets=()), self._answers(version="", accessors=()))
+        for answers in cases:
+            result, _ = self._check(answers)
+            self.assertTrue(result.findings)
+            for finding in result.findings:
+                self.assertIn(finding.id, checker.GEMINI_KEY_FINDINGS)
+                self.assertNotIn(finding.id, checker.LEASE_SILENT_FINDINGS)
+
+    def test_the_names_match_the_key_script(self):
+        script = self.SCRIPT.read_text()
+
+        def value(name):
+            match = re.search(rf'^readonly {name}="(.*)"$', script, re.M)
+            self.assertIsNotNone(match, f"{name} is gone from {self.SCRIPT.name}")
+            return match.group(1)
+
+        self.assertEqual(checker.GEMINI_KEY_DISPLAY_NAME, value("GEMINI_KEY_DISPLAY_NAME"))
+        self.assertEqual(checker.GEMINI_KEY_SECRET_NAME, value("GEMINI_KEY_SECRET_NAME"))
+        self.assertEqual(checker.GEMINI_KEY_API_TARGET, value("GEMINI_KEY_API_TARGET"))
+        self.assertEqual(checker.GEMINI_KEY_ACCESSOR_ROLE, value("GEMINI_KEY_ACCESSOR_ROLE"))
+        self.assertEqual(
+            list(checker.GEMINI_KEY_SECRET_ACCESSORS),
+            [f"serviceAccount:{email}" for email in value("GEMINI_KEY_SECRET_ACCESSORS").split()],
+        )
+        self.assertEqual(checker.GEMINI_KEY_SECRET_ACCESSORS, (checker.PROW_RUNNER_MEMBER, checker.NIGHTLY_RUNNER_MEMBER))
+        self.assertEqual(list(checker.GEMINI_KEY_CLIENT_RESTRICTIONS), value("GEMINI_KEY_CLIENT_RESTRICTIONS").split())
+        self.assertEqual(checker.GEMINI_KEY_SCRIPT, "scripts/provision_ci_pool_gemini_key.sh")
+        self.assertTrue((checker._ROOT / checker.GEMINI_KEY_SCRIPT).is_file())
+
+    def test_the_health_bot_reads_the_check_without_a_role_that_reads_key_strings(self):
+        # securityReviewer carries apikeys.keys.list, secretmanager.versions.list
+        # and secretmanager.secrets.getIamPolicy. apiKeysViewer carries
+        # apikeys.keys.getKeyString, so the bot never holds it.
+        self.assertNotIn("roles/serviceusage.apiKeysViewer", checker.POOL_STATE_READER_ROLES)
+        self.assertNotIn("roles/secretmanager.viewer", checker.POOL_STATE_READER_ROLES)
+        self.assertEqual(checker.GCLOUD_SURFACE_READ_ROLES["secrets"], ("roles/iam.securityReviewer",))
+        self.assertEqual(checker.GCLOUD_SURFACE_READ_ROLES["services"], ("roles/iam.securityReviewer",))
+        script = self.SCRIPT.read_text()
+        self.assertNotIn("roles/secretmanager.viewer", script)
+        self.assertNotIn(checker.CI_HEALTH_BOT_MEMBER.split(":", 1)[1], script)
+
+    def test_a_key_with_a_client_restriction_is_the_restriction_finding_with_two_commands(self):
+        for field in checker.GEMINI_KEY_CLIENT_RESTRICTIONS:
+            with self.subTest(field=field):
+                result, _ = self._check(self._answers(clients={field: {}}))
+                self.assertFalse(result.passed)
+                self.assertEqual([f.id for f in result.findings], [checker.FINDING_GEMINI_KEY_RESTRICTION])
+                finding = result.findings[0]
+                self.assertIn(field, finding.observed)
+                clear = f"gcloud services api-keys update {self.KEY_NAME} --project={self.PROJECT} --clear-restrictions"
+                target = f"gcloud services api-keys update {self.KEY_NAME} --project={self.PROJECT} --api-target=service=generativelanguage.googleapis.com"
+                self.assertEqual(finding.repair, f"{clear} && {target}")
+        self.assertEqual(
+            set(checker.GEMINI_KEY_CLIENT_RESTRICTIONS),
+            {"browserKeyRestrictions", "serverKeyRestrictions", "androidKeyRestrictions", "iosKeyRestrictions"},
+        )
+
+    def test_the_generative_language_api_is_the_project_checks_read_not_this_ones(self):
+        # REQUIRED_APIS carries it, so check_project_and_apis reports it off as
+        # apis/generativelanguage.googleapis.com; this check does not list services.
+        self.assertIn(checker.GEMINI_KEY_API_TARGET, checker.REQUIRED_APIS)
+        _, argv = self._check(self._answers())
+        self.assertFalse(any("gcloud services list" in line for line in argv), argv)
+        enabled = checker.REQUIRED_APIS - {checker.GEMINI_KEY_API_TARGET}
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok(json.dumps({"projectNumber": "123456"})), _ok("\n".join(sorted(enabled)))]
+            _, result = checker.check_project_and_apis(self.PROJECT)
+        self.assertFalse(result.passed)
+        self.assertEqual([f.id for f in result.findings], [f"apis/{checker.GEMINI_KEY_API_TARGET}"])
 
 
 if __name__ == "__main__":

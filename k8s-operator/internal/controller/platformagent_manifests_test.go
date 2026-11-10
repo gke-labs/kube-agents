@@ -1267,6 +1267,33 @@ func TestSafeSandboxEnvOverridesPassesHermesOtelEnabled(t *testing.T) {
 	}
 }
 
+func TestSafeSandboxEnvOverridesPassesTheCronIdleThresholds(t *testing.T) {
+	// The site documents CRON_IDLE_THROTTLE_DAYS and CRON_IDLE_HIBERNATE_DAYS
+	// as spec.deployment.env entries, and the opt-out for an install driven
+	// only through the A2A inject door is the throttle at 0; neither reaches
+	// the ticker except through this allowlist.
+	got := safeSandboxEnvOverrides([]corev1.EnvVar{
+		{Name: "CRON_IDLE_THROTTLE_DAYS", Value: "0"},
+		{Name: "CRON_IDLE_HIBERNATE_DAYS", Value: "30"},
+	})
+	if len(got) != 2 || got[0].Name != "CRON_IDLE_THROTTLE_DAYS" || got[0].Value != "0" ||
+		got[1].Name != "CRON_IDLE_HIBERNATE_DAYS" || got[1].Value != "30" {
+		t.Fatalf("expected both cron idle thresholds to survive the allowlist, got %#v", got)
+	}
+}
+
+func TestSafeSandboxEnvOverridesPassesTheCronCatchUpStep(t *testing.T) {
+	// The site documents CRON_CATCH_UP_STAGGER_MINUTES as a spec.deployment.env
+	// entry, and `0` is how an install that wants every catch-up on resume
+	// turns the policy off; it reaches the ticker only through this allowlist.
+	got := safeSandboxEnvOverrides([]corev1.EnvVar{
+		{Name: "CRON_CATCH_UP_STAGGER_MINUTES", Value: "0"},
+	})
+	if len(got) != 1 || got[0].Name != "CRON_CATCH_UP_STAGGER_MINUTES" || got[0].Value != "0" {
+		t.Fatalf("expected CRON_CATCH_UP_STAGGER_MINUTES to survive the allowlist, got %#v", got)
+	}
+}
+
 func TestSafeSandboxEnvOverridesPassesTheReconcileCreateCap(t *testing.T) {
 	// BOOTSTRAP_MAX_CREATES_PER_TICK bounds how many Cluster Agent profiles one
 	// reconcile run scaffolds; the site documents it as a spec.deployment.env
@@ -1515,6 +1542,52 @@ func TestSafeSandboxEnvOverridesPassesRosterSummaryThreshold(t *testing.T) {
 	}
 }
 
+// dedupWindowEntries returns every INCIDENT_WORKLOAD_DEDUP_SECONDS entry in
+// the platform container's env, in order.
+func dedupWindowEntries(t *testing.T, agent *agentv1alpha1.PlatformAgent) []string {
+	t.Helper()
+	pod := buildPodTemplateSpec(agent, "cfg", "fb", "settings", "policy", nil, renderOptions{})
+	container := containerByName(t, pod.Spec.Containers, "platform-agent")
+	var values []string
+	for _, env := range container.Env {
+		if env.Name == "INCIDENT_WORKLOAD_DEDUP_SECONDS" {
+			values = append(values, env.Value)
+		}
+	}
+	return values
+}
+
+func TestPlatformContainerFoldsWorkloadEventsByDefault(t *testing.T) {
+	// The window is on for every install at an hour, as the daemon's own
+	// fallback and the chart's key both say; the Deployment shows the value.
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{ProjectID: "p", ClusterName: "c", Location: "us-central1"},
+		},
+	}
+	if got := dedupWindowEntries(t, agent); len(got) != 1 || got[0] != "3600" {
+		t.Fatalf("expected one INCIDENT_WORKLOAD_DEDUP_SECONDS=3600 entry, got %v", got)
+	}
+}
+
+func TestPlatformContainerDedupWindowOverrideReplacesTheDefault(t *testing.T) {
+	// A spec.deployment.env entry replaces the default rather than joining it:
+	// the API server refuses a duplicate env name, and "0" has to turn it off.
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{ProjectID: "p", ClusterName: "c", Location: "us-central1"},
+			Deployment: &agentv1alpha1.DeploymentSpec{
+				Env: []corev1.EnvVar{{Name: "INCIDENT_WORKLOAD_DEDUP_SECONDS", Value: "0"}},
+			},
+		},
+	}
+	if got := dedupWindowEntries(t, agent); len(got) != 1 || got[0] != "0" {
+		t.Fatalf("expected one INCIDENT_WORKLOAD_DEDUP_SECONDS=0 entry, got %v", got)
+	}
+}
+
 func TestBuildCredentialProxyContainer(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
@@ -1548,7 +1621,7 @@ func TestBuildCredentialProxyContainer(t *testing.T) {
 	// whatever the builder renders, so a request that drifted back down would
 	// otherwise pass every test. This is the Standard render: 500m lets a mint
 	// finish inside its timeouts while an evicted pod's replacement warms up,
-	// 1Gi is above the budget's 672Mi floor, and the 2 CPU limit is the load
+	// 1Gi is above the budget's 544Mi floor, and the 2 CPU limit is the load
 	// measurement's figure (#4106), which the broker bursts to.
 	if got := container.Resources.Requests.Cpu().String(); got != "500m" {
 		t.Errorf("expected a 500m CPU request on the proxy container, got %s", got)
@@ -1703,19 +1776,19 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 
 	// The child term (docs/designs/credential-proxy-child-memory-budget.md
 	// §2.5), in the broker's own arithmetic: the limit, less the broker's
-	// two fixed reserves, has to admit at least two requests at once, each
+	// resident reserve, has to admit at least two requests at once, each
 	// with its child reserve and its output allowance, or a listing phase
 	// cannot parallelise at all. The slot cap above is an upper bound on the
-	// count and enters this rule only as that. The four figures and the
+	// count and enters this rule only as that. The three figures and the
 	// floor are declared in credential_proxy_manifests.go as copies of the
 	// broker's (credential_proxy.py: BROKER_RESIDENT_RESERVE_BYTES,
-	// CONTENT_WORKSPACE_RESERVE_BYTES, REQUEST_CHILD_MEMORY_RESERVE_BYTES,
-	// OUTPUT_COPIES_PER_COMMAND, BUDGET_MINIMUM_ADMITTED_REQUESTS), and
+	// REQUEST_CHILD_MEMORY_RESERVE_BYTES, OUTPUT_COPIES_PER_COMMAND,
+	// BUDGET_MINIMUM_ADMITTED_REQUESTS), and
 	// tests/test_credential_proxy_sizing_parity.py fails when the two drift.
 	admitted := credentialProxyAdmittedRequests(limit, int64(capBytes))
 	if admitted < credentialProxyMinimumAdmittedRequests {
-		t.Errorf("the proxy's %d-byte limit admits %d requests at once under the child memory budget (%d MiB resident + %d MiB workspace reserves, %d MiB per request plus %d x %d-byte output); at least %d are needed — raise the limit or lower the output cap",
-			limit, admitted, credentialProxyResidentReserveBytes>>20, credentialProxyWorkspaceReserveBytes>>20, credentialProxyRequestReserveBytes>>20, credentialProxyOutputCopiesPerCommand, capBytes, credentialProxyMinimumAdmittedRequests)
+		t.Errorf("the proxy's %d-byte limit admits %d requests at once under the child memory budget (%d MiB resident reserve, %d MiB per request plus %d x %d-byte output); at least %d are needed — raise the limit or lower the output cap",
+			limit, admitted, credentialProxyResidentReserveBytes>>20, credentialProxyRequestReserveBytes>>20, credentialProxyOutputCopiesPerCommand, capBytes, credentialProxyMinimumAdmittedRequests)
 	}
 	if minimum := credentialProxyMinimumMemoryLimitBytes(int64(capBytes)); minimum > limit {
 		t.Errorf("the child memory budget's floor is %d bytes and the proxy's limit is %d", minimum, limit)
@@ -5546,10 +5619,11 @@ func TestMaxInProgressIsPinnedInTheManagedScope(t *testing.T) {
 		if !ok {
 			t.Fatalf("the managed scope carries no kanban block, got:\n%v", managed)
 		}
-		if len(kanban) != 1 {
-			// Only the cap is board-wide. The rest of the block (tick, wake set, stale
-			// timeout) belongs to whichever profile the gateway is homed at.
-			t.Errorf("the managed scope must pin kanban.max_in_progress alone, got %v", kanban)
+		// Only the cap and the dispatcher's admission are board-wide
+		// (TestKanbanAdmissionIsPinnedInTheManagedScope). The rest of the block (tick,
+		// wake set, stale timeout) belongs to whichever profile the gateway is homed at.
+		if got := slices.Sorted(maps.Keys(kanban)); !slices.Equal(got, []string{"admission", "max_in_progress"}) {
+			t.Errorf("the managed scope must pin kanban.max_in_progress and kanban.admission alone, got %v", kanban)
 		}
 		return kanban["max_in_progress"]
 	}
@@ -5567,6 +5641,138 @@ func TestMaxInProgressIsPinnedInTheManagedScope(t *testing.T) {
 		agent := agentWithTuning(&agentv1alpha1.TuningSpec{MaxInProgress: ptr.To(want)})
 		if got := managedCap(t, agent); fmt.Sprint(got) != fmt.Sprint(want) {
 			t.Errorf("max_in_progress = %v, want the CR's %d", got, want)
+		}
+	}
+}
+
+// spec.harness.tuning.admission is pinned in the managed scope as kanban.admission, always:
+// the CR's values where it sets them, the operator's defaults where it does not, so the
+// dispatcher never runs without a block. The budget's default is derived rather than
+// constant: the agent container's resolved memory request in MiB, the figure the kubelet
+// evicts the pod against under node pressure, so a CR that raises the request raises the
+// budget and the two cannot drift apart.
+func TestKanbanAdmissionIsPinnedInTheManagedScope(t *testing.T) {
+	managedAdmission := func(t *testing.T, agent *agentv1alpha1.PlatformAgent) map[string]any {
+		t.Helper()
+		var managed map[string]any
+		if err := yaml.Unmarshal([]byte(buildConfigMapData(agent, nil)[managedConfigKey]), &managed); err != nil {
+			t.Fatalf("unmarshal managed scope: %v", err)
+		}
+		kanban, _ := managed["kanban"].(map[string]any)
+		admission, ok := kanban["admission"].(map[string]any)
+		if !ok {
+			t.Fatalf("the managed scope carries no kanban.admission block, got:\n%v", managed)
+		}
+		return admission
+	}
+	assertAdmission := func(t *testing.T, name string, got map[string]any, budget, rssCap, bound int, failClosed bool) {
+		t.Helper()
+		want := map[string]any{
+			"memory_budget_mib":   budget,
+			"worker_rss_cap_mib":  rssCap,
+			"queue_bound_seconds": bound,
+			"fail_closed":         failClosed,
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("%s: kanban.admission = %v, want %v", name, got, want)
+		}
+	}
+	withResources := func(resources corev1.ResourceRequirements) *agentv1alpha1.PlatformAgent {
+		agent := newTestPlatformAgent()
+		agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Resources: &resources}
+		return agent
+	}
+
+	// Untuned: every default, and the budget is the operator's default memory request in MiB.
+	// The 4096 is asserted against resolveResources rather than written twice, so a change to
+	// the default request fails here with the reason rather than as a bare mismatch.
+	if defaultRequest := resolveResources(nil).Requests[corev1.ResourceMemory]; defaultRequest.Value() != 4096<<20 {
+		t.Fatalf("the operator's default memory request is %s; this test assumes 4Gi, so update its budget figures with the default", defaultRequest.String())
+	}
+	assertAdmission(t, "untuned", managedAdmission(t, newTestPlatformAgent()),
+		4096, defaultAdmissionWorkerRssCapMiB, defaultAdmissionQueueBoundSeconds, defaultAdmissionFailClosed)
+	if !defaultAdmissionFailClosed {
+		t.Error("fail_closed defaults open; the admission exists for installs whose memory counters are unreadable, and an open default spawns into the eviction there")
+	}
+
+	// A raised request raises the budget with it; the limit does not enter into it.
+	raised := withResources(corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("6Gi")},
+		Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("16Gi")},
+	})
+	assertAdmission(t, "raised request", managedAdmission(t, raised),
+		6144, defaultAdmissionWorkerRssCapMiB, defaultAdmissionQueueBoundSeconds, defaultAdmissionFailClosed)
+
+	// A resources block that sets only a limit: the kubelet gives the container a request
+	// equal to it, so the budget follows the limit rather than the operator's default.
+	limitOnly := withResources(corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("3Gi")},
+	})
+	assertAdmission(t, "limit only", managedAdmission(t, limitOnly),
+		3072, defaultAdmissionWorkerRssCapMiB, defaultAdmissionQueueBoundSeconds, defaultAdmissionFailClosed)
+
+	// A resources block with no memory at all falls back to the operator's default request:
+	// spec.deployment.resources replaces the defaults as a block, so nothing else would
+	// give the budget a figure.
+	cpuOnly := withResources(corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")},
+	})
+	assertAdmission(t, "cpu only", managedAdmission(t, cpuOnly),
+		4096, defaultAdmissionWorkerRssCapMiB, defaultAdmissionQueueBoundSeconds, defaultAdmissionFailClosed)
+
+	// A request that is not a whole number of MiB rounds down: the dispatcher must not be
+	// told a budget larger than the request it stands for.
+	decimal := withResources(corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2000M")},
+	})
+	assertAdmission(t, "decimal request", managedAdmission(t, decimal),
+		1907, defaultAdmissionWorkerRssCapMiB, defaultAdmissionQueueBoundSeconds, defaultAdmissionFailClosed)
+
+	// A request the operator cannot read as a budget is clamped to the CRD's floor rather
+	// than rendered as 0, which the dispatcher reads as no budget and answers with the
+	// meminfo guard in silence; at the floor it refuses every card, loudly, with the figures
+	// in the reason. A bare "2" is two bytes, 256Mi is under the floor, and an explicit "0"
+	// beside a limit is a request of zero, not an unset request the limit stands in for.
+	for name, quantity := range map[string]string{"bare number request": "2", "sub-floor request": "256Mi", "explicit zero request": "0"} {
+		small := withResources(corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse(quantity)},
+			Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("4Gi")},
+		})
+		assertAdmission(t, name, managedAdmission(t, small),
+			admissionMemoryBudgetFloorMiB, defaultAdmissionWorkerRssCapMiB, defaultAdmissionQueueBoundSeconds, defaultAdmissionFailClosed)
+	}
+	if admissionMemoryBudgetFloorMiB != 512 {
+		t.Errorf("admissionMemoryBudgetFloorMiB = %d; the CRD's Minimum on memoryBudgetMiB is 512, keep the two equal", admissionMemoryBudgetFloorMiB)
+	}
+
+	// The CR's values win over every default, the derived budget included, and a false
+	// fail_closed is rendered rather than dropped: an absent key would read as the default.
+	tuned := agentWithTuning(&agentv1alpha1.TuningSpec{Admission: &agentv1alpha1.AdmissionSpec{
+		MemoryBudgetMiB:   ptr.To[int32](6144),
+		WorkerRssCapMiB:   ptr.To[int32](2048),
+		QueueBoundSeconds: ptr.To[int32](300),
+		FailClosed:        ptr.To(false),
+	}})
+	tuned.Spec.Deployment = raised.Spec.Deployment
+	assertAdmission(t, "tuned", managedAdmission(t, tuned), 6144, 2048, 300, false)
+	if !strings.Contains(buildConfigMapData(tuned, nil)[managedConfigKey], "fail_closed: false") {
+		t.Errorf("fail_closed: false must be rendered as a key, got:\n%s", buildConfigMapData(tuned, nil)[managedConfigKey])
+	}
+
+	// A partial block keeps the defaults for the fields it leaves out, the derived budget
+	// included: setting one field is not a way to lose the others.
+	partial := agentWithTuning(&agentv1alpha1.TuningSpec{Admission: &agentv1alpha1.AdmissionSpec{
+		WorkerRssCapMiB: ptr.To[int32](1024),
+	}})
+	partial.Spec.Deployment = raised.Spec.Deployment
+	assertAdmission(t, "partial", managedAdmission(t, partial),
+		6144, 1024, defaultAdmissionQueueBoundSeconds, defaultAdmissionFailClosed)
+
+	// One route only: an overlay copy would be merged into a profile's config.yaml and then
+	// overruled by the pin, and would outlive the CR field.
+	for key, overlay := range buildConfigMapData(tuned, nil) {
+		if key != managedConfigKey && strings.Contains(overlay, "memory_budget_mib") {
+			t.Errorf("%s must not carry kanban.admission; it belongs to the managed scope alone", key)
 		}
 	}
 }
@@ -6044,6 +6250,34 @@ func TestDeploymentEnvCannotOverrideTheEventWatcherSwitch(t *testing.T) {
 				t.Errorf("the operator's value must win over spec.deployment.env, got %q", found[0])
 			}
 		})
+	}
+}
+
+// The chart's platformAgent.deployment.eventWatcher renders the watcher's tuning
+// settings as WATCHER_* entries in spec.deployment.env, and
+// deploy/shared/start-services.sh reads them in this container. So each entry,
+// a valueFrom entry included, has to arrive here once and unchanged: a reserved
+// name or a prefix filter would make every chart setting do nothing.
+func TestDeploymentEnvReachesTheEventWatcherSettings(t *testing.T) {
+	fromConfigMap := &corev1.EnvVarSource{ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+		LocalObjectReference: corev1.LocalObjectReference{Name: "watcher"}, Key: "span",
+	}}
+	custom := []corev1.EnvVar{
+		{Name: "WATCHER_SETTLE", Value: "3m"},
+		{Name: "WATCHER_BACKOFF_MIN_COUNT", Value: "4"},
+		{Name: "WATCHER_FAILEDSCHEDULING_MIN_SPAN", ValueFrom: fromConfigMap},
+	}
+	agent := newTestPlatformAgent()
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Env: custom}
+
+	got := map[string][]corev1.EnvVar{}
+	for _, e := range buildAgentAPIAuthSidecar(agent, "/opt/data").Env {
+		got[e.Name] = append(got[e.Name], e)
+	}
+	for _, want := range custom {
+		if entries := got[want.Name]; len(entries) != 1 || !reflect.DeepEqual(entries[0], want) {
+			t.Errorf("agent-api-auth env %s = %+v, want exactly %+v", want.Name, entries, want)
+		}
 	}
 }
 

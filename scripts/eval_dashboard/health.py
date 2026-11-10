@@ -597,6 +597,20 @@ DASHBOARD_URL = "https://storage.cloud.google.com/kube-agents-dashboards/evals/i
 # Cause and advice text. Plain language: the reader is whoever is deciding
 # whether to type /retest.
 CAUSE_SHARED_BREAK = "shared fixture/environment break: {cases}"
+# The same cause as the public tracking issue states it (gate_issue.py):
+# the failing cases stay on the incident brief, since the repository is
+# public.
+CAUSE_SHARED_BREAK_PUBLIC = "shared fixture/environment break"
+# The fixed text of the evidence lines that grade a case (shared_break's
+# per-case collapse line, its coverage line, and the PR-caused lines).
+# gate_issue.public_evidence drops a line carrying one of these from every
+# public issue body, so the lines below are built on them.
+EVIDENCE_CASE_COLLAPSE = " failed all graded reps on "
+EVIDENCE_CASES_EXPLAIN = "these cases explain "
+EVIDENCE_PR_CAUSED = "PR-caused: "
+# The fixed start of lost_pods' evidence line; the lost-pods issue body
+# keeps only the lines that start with it (gate_issue.public_evidence).
+EVIDENCE_LOST_PODS = "lost pods: "
 CAUSE_STORM = "quota storm window {start}–{end} UTC"
 CAUSE_SETUP = "setup/clone failures on {count} runs ({prs})"
 CAUSE_LOST_PODS = "lost pods: {count} runs on {prs} PRs died with their build node {start}–{end} UTC"
@@ -720,6 +734,14 @@ UTC = timezone.utc
 # --------------------------------------------------------------------------- #
 
 
+def public_cause(health_doc: dict) -> str:
+    """``health["cause"]`` as a public text may carry it: a shared break
+    names no case (CAUSE_SHARED_BREAK_PUBLIC); every other cause as is."""
+    if health_doc.get("condition") == SHARED_BREAK:
+        return CAUSE_SHARED_BREAK_PUBLIC
+    return health_doc.get("cause") or CAUSE_SHARED_BREAK_PUBLIC
+
+
 def parse_iso(value) -> datetime | None:
     """ISO 8601 to an aware UTC datetime; None for anything unparseable."""
     if not value or not isinstance(value, str):
@@ -810,11 +832,14 @@ class Task:
 
 
 class Run:
-    __slots__ = ("base_sha", "build_id", "duration", "eval_verdict", "eval_verdict_recorded", "finished", "has_build_log", "merge_conflict", "not_evaluated", "not_evaluated_cases", "pod_last_event", "pod_node", "pr", "result", "started", "tasks")
+    __slots__ = ("base_sha", "build_id", "duration", "eval_verdict", "eval_verdict_recorded", "finished", "gcs_base", "has_build_log", "merge_conflict", "not_evaluated", "not_evaluated_cases", "pod_last_event", "pod_node", "pr", "result", "started", "tasks")
 
     def __init__(self, run: dict):
         self.build_id = str(run.get("build_id") or "")
         self.pr = run.get("pr")
+        # The build directory the run was read from (SCHEMA.md, optional):
+        # the comment's build link follows it. Absent on older documents.
+        self.gcs_base = run.get("gcs_base") if isinstance(run.get("gcs_base"), str) else None
         # The main commit the run was built on (SCHEMA.md, optional): rule 4
         # compares a PR's red with passes on the same base. Absent is unknown.
         self.base_sha = run.get("base_sha") if isinstance(run.get("base_sha"), str) else None
@@ -1076,11 +1101,11 @@ def shared_break(full_runs, now: datetime, roster: Roster) -> dict:
         path, others, solid = pr_caused_path(case, runs, window)
         if path == PR_CAUSED_SAME_BASE:
             pr_caused.append(
-                f"PR-caused: {case} failing only on #{_prs(runs)[0]} (passing on {len(_prs(others))} other PRs built on the same main commit)"
+                f"{EVIDENCE_PR_CAUSED}{case} failing only on #{_prs(runs)[0]} (passing on {len(_prs(others))} other PRs built on the same main commit)"
             )
         elif path == PR_CAUSED_REPEATED:
             pr_caused.append(
-                f"PR-caused: {case} failing on {len(solid)} runs of #{_prs(runs)[0]} (passing on {len(_prs(others))} other PRs)"
+                f"{EVIDENCE_PR_CAUSED}{case} failing on {len(solid)} runs of #{_prs(runs)[0]} (passing on {len(_prs(others))} other PRs)"
             )
         if path is not None:
             pr_caused_latest.append(max(run.finished for run in solid))
@@ -1100,12 +1125,12 @@ def shared_break(full_runs, now: datetime, roster: Roster) -> dict:
         runs = collapses[case]
         prs = _prs(runs)
         evidence.append(
-            f"{case} failed all graded reps on {len(runs)} runs from {len(prs)} PRs ({_pr_list(prs)})"
+            f"{case}{EVIDENCE_CASE_COLLAPSE}{len(runs)} runs from {len(prs)} PRs ({_pr_list(prs)})"
         )
     if cases and reds:
         hours = int(SHARED_BREAK_WINDOW.total_seconds() // 3600)
         evidence.append(
-            f"these cases explain {len(covered)} of {len(reds)} red runs"
+            f"{EVIDENCE_CASES_EXPLAIN}{len(covered)} of {len(reds)} red runs"
             f" ({len(reds)} of {len(concluded)} concluded runs red) in the last {hours}h"
         )
     return {
@@ -1314,7 +1339,7 @@ def lost_pods(runs, now: datetime) -> dict:
     evidence = []
     if lost:
         line = (
-            f"lost pods: {len(lost)} runs on {len(prs)} PRs died with their build node"
+            f"{EVIDENCE_LOST_PODS}{len(lost)} runs on {len(prs)} PRs died with their build node"
             f" {hhmm(start)}–{hhmm(end)} UTC (nodes {node_list(nodes)}; {_pr_list(prs)})"
         )
         more = len(recent) - len(lost)
@@ -1971,11 +1996,25 @@ def pool_note(artifact: dict | None, now: datetime, prev: dict | None) -> dict |
         "lease_failures_hours": _count(recent.get("hours")),
         "no_build_id": _held_count(artifact.get("no_build_id")),
         "cause": artifact.get("cause"),
-        # The cap the newest run in the window ran under. Only the
-        # CONCURRENCY_CAP message quotes it, and without it that message
-        # cannot say what to raise the cap from.
+        # The cap the newest run in the window ran under; the CONCURRENCY_CAP
+        # message names it as the limit the presubmit ran at.
         "max_concurrency": artifact.get("max_concurrency"),
+        # What that message says about the harm: the days the periodic
+        # breached on, the longest wait among them (the window's when none
+        # is a day's), and how many runs are queued right now.
+        "breached_days": [d for d in _rows(trend, "breached_days") if isinstance(d, str)],
+        "worst_s": _worst_breached_s(trend),
+        "waiting": _count(_section(artifact, "queue").get("waiting")),
     }
+
+
+def _worst_breached_s(trend: dict) -> int | None:
+    """The longest wait among the days that breached, else the window's; each
+    value through `_as_seconds`, as the neighbouring readers do, so a bad one
+    neither wins nor blocks the fallback."""
+    days = [d for d in _rows(trend) if isinstance(d, dict) and d.get("breached")]
+    worst = [s for d in days if (s := _as_seconds(d.get("worst_minutes"))) is not None]
+    return max(worst) if worst else _as_seconds(trend.get("worst_minutes"))
 
 
 def _count(value) -> int | None:

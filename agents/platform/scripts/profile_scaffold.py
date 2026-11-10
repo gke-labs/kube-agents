@@ -15,14 +15,17 @@
 
 import argparse
 import contextlib
+import errno
 import fcntl
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Callable
 
@@ -49,8 +52,15 @@ DEFAULT_HERMES_HOME = "/opt/data"
 PROCESS_HOME = "home"
 NPM_HOME_CACHE = ".npm"
 NPM_SHARED_CACHE = Path(".cache", "npm")
-# Where the start-up sweep moves an old per-profile cache before it deletes it.
-NPM_RECLAIM_NAME = ".npm.reclaim"
+# The start-up sweep moves an old per-profile cache to a directory it names itself,
+# this stem and a random UUID's 32 hex digits, before it deletes it. It deletes every
+# such directory an earlier start-up left, and the bare prefix, the fixed name an
+# older image used, and nothing else under the prefix: a name a person picks, such as
+# ~/.npm.reclaimed or ~/.npm.reclaim.previous, does not have that shape.
+NPM_RECLAIM_PREFIX = ".npm.reclaim"
+NPM_RECLAIM_STEM = NPM_RECLAIM_PREFIX + "."
+NPM_RECLAIM_GLOB = NPM_RECLAIM_PREFIX + "*"
+NPM_RECLAIM_MOVED_RE = re.compile(re.escape(NPM_RECLAIM_STEM) + r"[0-9a-f]{32}")
 
 _jobs_lock_state = threading.local()
 
@@ -299,8 +309,13 @@ def share_npm_cache(process_home: Path, hermes_home: Path, reclaim: bool = False
     over ~/.npm. A real ~/.npm directory is the old per-profile cache. With `reclaim`,
     it is moved aside, the link takes its place, and then the moved copy is deleted,
     so a delete that fails leaves an orphan directory, never a home with no link.
-    The next run with `reclaim` deletes an orphan that an earlier run left, before
-    anything else. Only the start-up sweep sets `reclaim`, because a process of the
+    Each move goes to a new name (NPM_RECLAIM_STEM and a random UUID), so an orphan,
+    or a file something else put at the old fixed name, never sits where the next
+    move lands. The next run with `reclaim` deletes every orphan directory with the
+    prefix, before anything else. One that another start-up is still moving into is
+    deleted too, which is harmless: that copy is deleted anyway, and a rename onto
+    a missing name still succeeds. With `reclaim`, a home left without the link
+    gets one log line naming what is at ~/.npm. Only the start-up sweep sets `reclaim`, because a process of the
     profile can be using the directory at any other time. On an install with more
     than one replica, a pod that has not restarted yet can still be using it during
     the sweep; no shipped agent runs an npx MCP server, and such a server starts
@@ -311,20 +326,28 @@ def share_npm_cache(process_home: Path, hermes_home: Path, reclaim: bool = False
     if not process_home.is_dir():
         return
     link = process_home / NPM_HOME_CACHE
-    aside = process_home / NPM_RECLAIM_NAME
     shared = hermes_home / NPM_SHARED_CACHE
     try:
         # Also when the link exists: npm fails on every command when its cache is a dangling link.
         shared.mkdir(parents=True, exist_ok=True)
-        if reclaim and aside.is_dir() and not aside.is_symlink():
-            # Left by an earlier start-up whose delete failed or that stopped
-            # before the link; it would also block the rename below.
-            _delete_reclaimed_npm_cache(aside)
+        if reclaim:
+            for orphan in sorted(process_home.glob(NPM_RECLAIM_GLOB)):
+                # Left by an earlier start-up whose delete failed or that stopped
+                # before the link. A file or symlink with the prefix is not ours
+                # and no longer blocks anything, so it stays.
+                if _is_reclaim_dir(orphan):
+                    _delete_reclaimed_npm_cache(orphan)
         if link.is_symlink():
+            if reclaim and not _points_at(link, shared):
+                log(f"WARN: left npm in {process_home} as it is: ~/.npm is {_symlink_shape(link)} "
+                    f"({os.readlink(link)}), not the shared cache {shared}")
             return
         if link.exists():
             if not (reclaim and link.is_dir()):
+                if reclaim:
+                    log(f"WARN: left npm in {process_home} as it is: ~/.npm is not a directory, so it is not replaced by the shared cache {shared}")
                 return
+            aside = process_home / f"{NPM_RECLAIM_STEM}{uuid.uuid4().hex}"
             link.rename(aside)
             link.symlink_to(os.path.relpath(shared.resolve(), process_home.resolve()), target_is_directory=True)
             log(f"pointed npm in {process_home} at the shared cache {shared}")
@@ -334,6 +357,40 @@ def share_npm_cache(process_home: Path, hermes_home: Path, reclaim: bool = False
         log(f"pointed npm in {process_home} at the shared cache {shared}")
     except OSError as exc:
         log(f"WARN: could not point npm in {process_home} at the shared cache {shared} ({exc})")
+
+
+def _points_at(link: Path, target: Path) -> bool:
+    """Whether the symlink `link` resolves to `target`, which exists.
+
+    RuntimeError too: before Python 3.13, resolve(strict=True) raises it, not
+    OSError, for a symlink loop, and the sweep must not stop at one home.
+    """
+    try:
+        return link.resolve(strict=True) == target.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return False
+
+
+def _symlink_shape(link: Path) -> str:
+    """How a ~/.npm symlink that is not the shared cache looks, for the sweep's log line."""
+    try:
+        link.stat()
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            return "a symlink loop"
+        if exc.errno == errno.ENOENT:
+            return "a dangling symlink"
+        # ENOTDIR, EACCES and the rest: the target is there but cannot be reached.
+        return f"a symlink whose target cannot be reached ({exc.strerror})"
+    return "a symlink to somewhere other than the shared cache"
+
+
+def _is_reclaim_dir(path: Path) -> bool:
+    """Whether `path` is a directory the sweep named, or an older image's fixed name."""
+    name = path.name
+    if name != NPM_RECLAIM_PREFIX and not NPM_RECLAIM_MOVED_RE.fullmatch(name):
+        return False
+    return path.is_dir() and not path.is_symlink()
 
 
 def _delete_reclaimed_npm_cache(aside: Path) -> None:

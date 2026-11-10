@@ -1,0 +1,26 @@
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: payments
+  namespace: demo-shop
+spec:
+  interval: 10m
+  releaseName: payments
+  targetNamespace: demo-shop
+  install:
+    createNamespace: true
+  chart:
+    spec:
+      chart: services/payments/chart
+      version: 0.4.2
+      sourceRef:
+        kind: GitRepository
+        name: platform-charts
+        namespace: flux-system
+  # The per-environment values. The Secret is SOPS-encrypted in this
+  # repository (values.enc.yaml) and decrypted by Flux's kustomize-controller
+  # on the cluster; nothing in this repository holds it in clear.
+  valuesFrom:
+    - kind: Secret
+      name: payments-values
+      valuesKey: values.yaml

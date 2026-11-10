@@ -551,7 +551,8 @@ func (r *AgentProfileReconciler) deleteOwnServiceAccount(ctx context.Context, p 
 	return client.IgnoreNotFound(r.Delete(ctx, &sa, client.Preconditions{UID: &sa.UID}))
 }
 
-// writeStatus records both conditions.
+// writeStatus records the three conditions: IdentityReady, CardPublished and
+// JobResourcesFit.
 func (r *AgentProfileReconciler) writeStatus(ctx context.Context, p *agentv1alpha1.AgentProfile, agent *agentv1alpha1.PlatformAgent, sa, idReason, idMsg, cardReason, cardMsg string, identityReady bool) error {
 	before := p.Status.DeepCopy()
 	p.Status.ObservedGeneration = p.Generation
@@ -572,6 +573,17 @@ func (r *AgentProfileReconciler) writeStatus(ctx context.Context, p *agentv1alph
 		Status:             conditionStatus(cardReason == reasonAgentProfilePublished),
 		Reason:             cardReason,
 		Message:            cardMsg,
+		ObservedGeneration: p.Generation,
+	})
+	fitReason, fitMsg := reasonAgentProfileJobResourcesFit, "the profile's resource requests meet GKE Autopilot's cpu-to-memory ratio, or it runs no Jobs"
+	if problem := autopilotRatioProblem(p); problem != "" {
+		fitReason, fitMsg = reasonAgentProfileOutsideAutopilotRatio, problem
+	}
+	meta.SetStatusCondition(&p.Status.Conditions, metav1.Condition{
+		Type:               agentv1alpha1.AgentProfileConditionJobResourcesFit,
+		Status:             conditionStatus(fitReason == reasonAgentProfileJobResourcesFit),
+		Reason:             fitReason,
+		Message:            fitMsg,
 		ObservedGeneration: p.Generation,
 	})
 	if equalAgentProfileStatus(before, &p.Status) {

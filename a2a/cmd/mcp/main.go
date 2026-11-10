@@ -40,8 +40,8 @@ const (
 
 	defaultListen       = ":8089"
 	defaultTokenFile    = "/var/run/secrets/a2a-mcp/token"
-	defaultBusUser      = "console"
-	defaultPasswordFile = "/var/run/secrets/a2a-mcp-bus/console-password" // #nosec G101 -- a path, not a credential
+	defaultBusUser      = "console-mcp"
+	defaultPasswordFile = "/var/run/secrets/a2a-mcp-bus/console-mcp-password" // #nosec G101 -- a path, not a credential
 
 	networkTCP = "tcp"
 	busScheme  = "tls://"
@@ -111,7 +111,7 @@ func configFromEnv(getenv func(string) string) (settings, error) {
 	if url == "" {
 		return settings{}, fmt.Errorf("%s is required", envBusURL)
 	}
-	// TLS by construction: the server sends the console password at
+	// TLS by construction: the server sends its console-mcp password at
 	// connect, so a plaintext URL is refused rather than left to the bus to
 	// upgrade.
 	if !strings.HasPrefix(url, busScheme) {
@@ -250,7 +250,7 @@ func dialWithRetry[B any](ctx context.Context, log *slog.Logger, backoff time.Du
 		// log rather than retrying for minutes as "not reachable yet".
 		if mcp.DialRefused(err) {
 			var zero B
-			return zero, fmt.Errorf("the bus refused the connection (check the console credential and the bus CA): %w", err)
+			return zero, fmt.Errorf("the bus refused the connection (check the console-mcp credential and the bus CA): %w", err)
 		}
 		log.Warn("the bus is not reachable yet; retrying", "in", backoff, "err", err)
 		select {

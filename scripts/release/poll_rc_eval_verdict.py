@@ -24,6 +24,10 @@ WHAT IS READ, AND WHY NOT THE EXIT STATUS. Three artifacts per build:
   finished.json  says the build is over. Its absence means still in flight.
   artifacts/rc-eval-summary.md
                  carries the verdict word, and it is the one that decides.
+  artifacts/eval-verdict.json
+                 bench-gate's per-case roll-up. Read once more after a settled
+                 RED, to print the blocking cases into the log for the
+                 broken-stage notifier; it never moves the verdict.
 
 The build's own pass/fail is deliberately NOT the verdict. It collapses two
 outcomes an operator must not have collapsed: a candidate whose eval catalog
@@ -131,6 +135,28 @@ FINISHED_FILE = "finished.json"
 # other half of this pair.
 ARTIFACTS_DIR = "artifacts/"
 RC_SUMMARY_FILE = "rc-eval-summary.md"
+# bench-gate's per-case roll-up beside the summary (RC_VERDICT_JSON_FILE in
+# hack/ci-eval-rc.sh). Read once, after a settled RED is decided, so the
+# notifier can name the cases that made it; it never moves the verdict.
+RC_VERDICT_JSON_FILE = "eval-verdict.json"
+VERDICT_CASES_FIELD = "cases"
+VERDICT_PARTIAL_FIELD = "partial"
+CASE_BLOCKING_FIELD = "blocking"
+# What the red-cases line carries per case, in the roll-up's own names, and
+# the vocabulary each value is accepted in: bench-gate's, the roll-up's one
+# producer. A case id is the shape a `bench/tasks/<id>` directory name takes
+# (`scripts/case_owner.py` requires the same; `scripts/
+# test_notify_release_stage_broken.py` holds the two patterns equal), a rung
+# is an int, a rung name is spelled as `Rung.name` is. An entry outside it
+# is never printed, here into the step summary or by the notifier into the
+# issue: the whole line is withheld with a warning, so nothing from the
+# archive reaches Markdown unchecked.
+RED_CASE_NAME_KEY = "case"
+RED_CASE_RUNG_KEY = "rung"
+RED_CASE_RUNG_NAME_KEY = "rung_name"
+RED_CASE_KEYS = (RED_CASE_NAME_KEY, RED_CASE_RUNG_KEY, RED_CASE_RUNG_NAME_KEY)
+CASE_ID_RE = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._-]*")
+RUNG_NAME_RE = re.compile(r"[A-Z_]+")
 
 # started.json's scalar commit fields. `repos` is handled separately: its values
 # are `<ref>:<sha>` for a tag-push postsubmit and a bare sha otherwise.
@@ -175,6 +201,21 @@ VERDICT_RED = "red"
 VERDICT_NOT_RUN = "not_run"
 VERDICT_TIMEOUT = "timeout"
 VERDICT_NEVER_RAN = "never_ran"
+# The line printed into the step-5 job log on the way out.
+# `scripts/release/notify_release_stage_broken.py` imports it and reads the
+# build id and link of a settled RED back out of the log.
+VERDICT_LINE_FORMAT = "verdict={verdict} settled={settled} build_id={build_id} {url}"
+# The `settled` output and the verdict line's `settled=` field.
+SETTLED_TRUE = "true"
+SETTLED_FALSE = "false"
+# The line after it on a settled RED: the blocking cases of the roll-up as
+# one compact JSON object, `{"cases": [{case, domain, rung, rung_name}...],
+# "partial": bool}`, keys sorted. The notifier imports this format too and
+# parses the object back; `tests/test_poll_rc_eval_verdict.py` pins the
+# literal line.
+RED_CASES_LINE_FORMAT = "red_cases={cases}"
+RED_CASES_CASES_KEY = "cases"
+RED_CASES_PARTIAL_KEY = "partial"
 
 # Exit codes, one per verdict. Distinct so a workflow can tell "the release is
 # bad" from "the eval lane is broken" without parsing the summary, and none of
@@ -704,6 +745,79 @@ _SETTLED = {
 }
 
 
+def is_red_case(case):
+    """True when the entry is one bench-gate could have written: a case id,
+    an integer rung, a rung name. `bool` is an int in Python and is refused."""
+    if not isinstance(case, dict):
+        return False
+    name, rung, rung_name = case.get(RED_CASE_NAME_KEY), case.get(RED_CASE_RUNG_KEY), case.get(RED_CASE_RUNG_NAME_KEY)
+    return (
+        isinstance(name, str)
+        and CASE_ID_RE.fullmatch(name) is not None
+        and isinstance(rung, int)
+        and not isinstance(rung, bool)
+        and isinstance(rung_name, str)
+        and RUNG_NAME_RE.fullmatch(rung_name) is not None
+    )
+
+
+def red_cases(verdict_text):
+    """The blocking cases of one build's eval-verdict.json, as
+    `{"cases": [...], "partial": bool}`, or None when the text is not a
+    roll-up (absent, unreadable, not JSON, no `cases` list) or a blocking
+    entry is outside the vocabulary above.
+
+    Blocking, not "any rung below GREEN": the roll-up also lists cases on
+    the two non-rungs INFRA and NOT_GRADED_ON_TRANSPORT, which never block
+    and are not why the night was RED. `partial` is what bench-gate writes
+    into the roll-up when the run stopped before grading every case
+    (hack/ci-eval-rc.sh reads the same flag); the notifier says so beside
+    the names.
+    """
+    if not isinstance(verdict_text, str):
+        return None
+    try:
+        data = json.loads(verdict_text)
+    except ValueError:
+        return None
+    cases = data.get(VERDICT_CASES_FIELD) if isinstance(data, dict) else None
+    if not isinstance(cases, list):
+        return None
+    blocking = [case for case in cases if isinstance(case, dict) and case.get(CASE_BLOCKING_FIELD) is True]
+    if not all(is_red_case(case) for case in blocking):
+        return None
+    return {
+        RED_CASES_CASES_KEY: [{key: case[key] for key in RED_CASE_KEYS} for case in blocking],
+        RED_CASES_PARTIAL_KEY: data.get(VERDICT_PARTIAL_FIELD) is True,
+    }
+
+
+def red_cases_line(cases):
+    """The red-cases log line for what `red_cases` returned."""
+    return RED_CASES_LINE_FORMAT.format(cases=json.dumps(cases, separators=(",", ":"), sort_keys=True))
+
+
+def report_red_cases(base, read_file):
+    """Print the red-cases line for a settled RED at `base`, and return what
+    it carried, or None with a warning.
+
+    Called only after the verdict line and the outputs are written: nothing
+    here may move the verdict, so every failure, a read that errors, a file
+    that is absent, a roll-up that does not parse, is a warning on stderr
+    and no line. The notifier then shows the night's cases as unavailable.
+    """
+    try:
+        cases = red_cases(read_file(base + ARTIFACTS_DIR + RC_VERDICT_JSON_FILE))
+    except Exception as exc:  # noqa: BLE001 - the verdict is already out; this line is best-effort
+        print(f"warning: reading {RC_VERDICT_JSON_FILE} failed ({exc!r}); the red cases are not reported", file=sys.stderr, flush=True)
+        return None
+    if cases is None:
+        print(f"warning: {base}{ARTIFACTS_DIR}{RC_VERDICT_JSON_FILE} is absent, not a case roll-up, or names a blocking case outside bench-gate's vocabulary; the red cases are not reported", file=sys.stderr, flush=True)
+        return None
+    print(red_cases_line(cases), flush=True)
+    return cases
+
+
 def _write_kv(path, pairs):
     """Append `k=v` lines to a GitHub Actions file, when the runner set one."""
     if not path:
@@ -736,7 +850,7 @@ def main(argv=None):
         outputs_path,
         [
             ("verdict", VERDICT_NOT_RUN),
-            ("settled", "false"),
+            ("settled", SETTLED_FALSE),
             ("build_id", ""),
             ("log_url", ""),
         ],
@@ -802,8 +916,8 @@ def main(argv=None):
     )
 
     url = spyglass_url(base) or ""
-    settled = "true" if _SETTLED[verdict] else "false"
-    print(f"verdict={verdict} settled={settled} build_id={build_id or ''} {url}".rstrip(), flush=True)
+    settled = SETTLED_TRUE if _SETTLED[verdict] else SETTLED_FALSE
+    print(VERDICT_LINE_FORMAT.format(verdict=verdict, settled=settled, build_id=build_id or "", url=url).rstrip(), flush=True)
 
     _write_kv(
         outputs_path,
@@ -815,12 +929,22 @@ def main(argv=None):
         ],
     )
 
+    # After the verdict line and the outputs on purpose: a failure in this
+    # read must not turn a settled RED into the internal-error exit, whose
+    # seeded `settled=false` would withdraw the nomination of a candidate the
+    # eval rejected.
+    cases = None
+    if verdict == VERDICT_RED and base:
+        cases = report_red_cases(base, read_file=lambda url: _gcloud_storage(["cat", url], args.gcloud))
+
     lines = [f"### Release-candidate eval: `{verdict.upper()}`", ""]
     if args.evalcand_tag:
         lines.append(f"Candidate: `{args.evalcand_tag}` (`{commit}`)")
     lines += ["", _SUMMARY[verdict]]
     if url:
         lines += ["", f"[Eval build {build_id}]({url})"]
+    if cases and cases[RED_CASES_CASES_KEY]:
+        lines += ["", "Red cases: " + ", ".join(f"`{case[RED_CASE_NAME_KEY]}` (rung `{case[RED_CASE_RUNG_KEY]} {case[RED_CASE_RUNG_NAME_KEY]}`)" for case in cases[RED_CASES_CASES_KEY])]
     _write_summary(os.environ.get("GITHUB_STEP_SUMMARY"), lines)
 
     return _EXIT[verdict]

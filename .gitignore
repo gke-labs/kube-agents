@@ -96,6 +96,10 @@ a2a/cmd/worker-adapter/worker-adapter
 k8s-operator/drift-detector
 k8s-operator/cmd/drift-detector/drift-detector
 
+# kwok-seed, the scale lane's seeder (tests/scale/kwok), built the same two ways.
+k8s-operator/kwok-seed
+k8s-operator/cmd/kwok-seed/kwok-seed
+
 # Per-developer Claude Code state (session settings). The shared
 # slash commands in .claude/commands/ and the review skills in .agents/skills/
 # are committed; .claude/settings.json and .claude/settings.local.json stay
@@ -116,3 +120,6 @@ k8s-operator/cmd/drift-detector/drift-detector
 !.claude/settings.json.example
 !.claude/skills
 !.claude/rules
+
+# The scale lane's local baseline records (tests/scale/kwok/baseline.sh); CI uploads them as artifacts.
+tests/scale/kwok/results/

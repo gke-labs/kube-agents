@@ -1,9 +1,11 @@
 # Proposal origin: which feature opened each pull request
 
-**Status:** proposed, 2026-11-03. Workstream 3 of the telemetry epic that asked who starts the
-agent's pull requests. Lands after the second pull request of `human-interaction-readings.md`
-(the readings slot with a target per reading kind) and after `install-model-reading.md` (the
-summary audit that removes a fixed line); it builds on both. Builds on [`usage-counters-producer.md`](usage-counters-producer.md) (the
+**Status:** implemented, 2026-11-04: the first pull request landed the origin record, the
+claim token, the ledger and its series (2.1, 2.2); the second the operator's origins reading, the
+nine fields, their gauges and the summary line (2.3, 2.4). Proposed 2026-11-03. Workstream 3 of the
+telemetry epic that asked who starts the agent's pull requests. It follows the second pull request
+of `human-interaction-readings.md` (the readings slot with a target per reading kind) and
+`install-model-reading.md` (the summary audit that removes a fixed line). Builds on [`usage-counters-producer.md`](usage-counters-producer.md) (the
 status block, its fold rules, its gauges and its zero-PII contract),
 [`proposal-outcome-readings.md`](proposal-outcome-readings.md) (the broker's exact
 `proposal-create` count, which this design leaves alone) and
@@ -69,7 +71,8 @@ Three kinds of unit carry the record, each written by in-pod code inside one tru
   that, or a continuation whose parent row is gone, resolves as `other`, which is accepted. The web console and the admin console's chat page run outside the pod and mint their session ids themselves (`web-console-*` and `portal_*`), so they write no record: the in-pod reader takes `console` from those id prefixes, the convention the web console's activity view already reads for its own, until the agent-API door writes a record for the sessions it admits. Any caller holding the external agent-API key can mint such an id and count as `console` rather than `api`; both are operator-side callers, the sandbox holds no such key, and the bridge forces its own prefix, so that is accepted until the door's record replaces the convention. A caller holding that key can also join an existing session by id (an alert's `k8s-evt-*` session, a chat session), and its work then counts as that session's origin; the sandbox holds no key, so that too is accepted as operator-side. The `session_store` plugin runs only on gateway dispatch, which an agent-API turn may
   not pass through; `api` for agent-API turns is therefore written by that door when its design
   lands, and until then such work resolves as `other`. A person who replies in an alert's thread runs in the gateway's own chat session (the alert's report is pasted in; nothing maps the reply to the `k8s-evt-*` session), so a proposal they ask for there counts as `chat`.
-- **A card**, as two columns the board patch writes at insert, beside the priority
+- **A card**, as a row of the board side table `kanban_task_origins` (task id, origin, platform)
+  that the board patch writes at insert, in the insert's own transaction, beside the priority
   `kanban_priority` already stamps from trusted context and never from the `session_id` argument
   the model passes. The origin is never an argument of a create command: the `/kanban create`
   parser serves chat users and in-pod scripts alike, so a flag on it would let anyone who can
@@ -83,11 +86,13 @@ Three kinds of unit carry the record, each written by in-pod code inside one tru
   stamp, so a chat user who files a card under the gate's predictable key before the gate's tick
   gets a `chat` card, not an `issue` one. That endpoint is reachable with the pod's Session KV key, which the sandbox and chat commands do not hold and the platform MCP server and the hermes-bridge do; no MCP tool exposes it, and none may. A card with no stamp, one filed before this lands, is `other`.
   A worker's origin is its card's, so a cron job dispatched as a worker counts under its card,
-  which the run stamped.
+  which the run stamped. A worker reads its card's stamp first; an unstamped card falls through
+  to the turn's own resolution (the run's context, the session record, the console convention).
+  A cron job that a worker creates or runs directly therefore records its card's origin.
 - **A cron run**, as a trusted per-run context the Hermes scheduler sets for a run its own tick
   started (the run ledger already tells a tick's run from a direct one, `source` other than
   `direct`), `audit` or `scheduled` only for a job whose definition equals the image's template
-  entry in `/opt/platform-template/cron/jobs.json` (same id, same prompt and skills; the profile's
+  entry in `/opt/platform-template/cron/jobs.json` (same id, prompt, skills and script; the profile's
   own jobs file is the agent's to write, so an id alone proves nothing), the way the api_server
   sets the request-scoped session id `trusted_origin_session` reads. The Platform Agent's model
   can create jobs, edit them, and run any job directly, synchronously or in the background, so:
@@ -96,7 +101,8 @@ Three kinds of unit carry the record, each written by in-pod code inside one tru
   or editing session's, in a table of the Session KV server written by the in-pod handler of the
   `cronjob` tool from trusted context, never in the jobs file the agent writes; a job id with no
   such record and no template match resolves as `other`; a direct run is not tick-started and
-  resolves as the session that asked for it.
+  resolves as the session that asked for it. A job created inside a tick-started run records
+  that run's origin, so a job that a scheduled audit run creates records `audit`.
   A tick-started run has no Session KV metadata row of its own and no gateway dispatch, so
   neither of the other two records can reach it.
 
@@ -131,11 +137,15 @@ is the agent's, not that this process opened it, so a worker that echoed another
 record line could claim that proposal for its own origin. The broker therefore mints a one-time claim token with each `proposal-create` answer and keeps it
 with the url for the window; `vcs_client` takes the token out of the answer it returns and prints
 (so `vcs.py`'s stdout never carries it) and puts it on the stderr record line alone; the hook
-presents the tokens it sees to a new `proposal-claim` verb, which does the forge check itself
+presents each token it sees to a new `proposal-claim` verb, addressed to the record line's `repo`
+field. That field is the managed repository the broker resolved for the create, taken from the
+`proposal-create` answer, so the hook needs no grammar for each forge's url shape. A record with
+no `repo` (one an older client wrote) falls back to the repository its GitHub- or GitLab-shaped url
+names, and a record with neither takes no claim. The verb does the forge check itself
 with the credential it holds and accepts each token once, so the hook no longer makes its own
 forge reads. The claim is one broker call through the sandbox hop per record line, made in line
 before the command returns, so the hook keeps today's cap of five record lines per output: the
-first five are claimed, or burned, before the model reads them, and the hook strips the token
+first five are claimed, or burned, before the model reads them, none starts after the hook's 20 s claim budget, and each claim's hop is bounded so the hook answers inside Hermes' 30 s callback timeout. The hook strips the token
 from every record line in the output it did not claim, those past the cap and those whose claim
 failed, in every process, so no live token reaches what the model reads. A proposal whose line
 went unclaimed counts as missed. A line without a valid token is left as text
@@ -164,8 +174,12 @@ origin). Under the experimental platform-profile front door a chat turn does run
 terminal; its session record then resolves it, `chat` with its platform. A Prometheus reader can split chat by platform; the status does not. The hook is enabled on every profile that has the terminal.
 
 What the count misses, stated so the numbers are read right: a pull request opened by a
-background process (the hook reads foreground output only); one whose record line the model kept from the hook, or whose token the model burned; one past the five record lines the hook claims per command output; one whose claim failed the forge check or arrived after the fifteen-minute window; and one opened by a request the model wrote itself
-instead of `vcs_client.call`. So the origin counts sit at or below
+background process (the hook reads foreground output only); one whose record line the model kept from the hook, or whose token the model burned; one past the five record lines the hook claims per command output, or past its claim budget; one whose claim failed the forge check or arrived after the fifteen-minute window; and one opened by a request the model wrote itself
+instead of `vcs_client.call`. Three windows in the mechanism lose a count too. A claim that
+succeeds and a ledger write that then fails loses that proposal's count, since the token is
+spent. A broker restart between the mint and the claim loses the claims in flight, since the
+broker holds its tokens in memory. During a rollout, a broker older than the claim token answers
+without one, so a worker's record line stays in the output with no card event and no count. So the origin counts sit at or below
 `remediationsProposedTotal` in the usual case, and the difference reads as "proposals the agent
 did not see itself open"; it is approximate, since the broker's total is itself folded from a
 counter the poller can under-read across a gap while the ledger is durable.
@@ -180,17 +194,30 @@ what that needs: it treats a process it has not seen as counting from zero and a
 sample, so a durable count served as a counter would be re-added in full on every gateway
 restart or pod roll. So the nine are **readings**, not counters, through the readings slot
 ([`proposal-outcome-readings.md`](proposal-outcome-readings.md) §6) as
-[`human-interaction-readings.md`](human-interaction-readings.md) §2.2 generalises it in its second pull request, a target per reading with the miss rule following the target, which this design depends on: a new reading kind, `origins`, on the chat plugin's target, present when all nine origins
-resolved from the body (the listener serves every origin's series, zero included, so the kind
-needs no age series, like the `people` kind), one miss per poll without them, cleared after
-two, the largest reading across pods, and its own pruning record ("the nine origin readings"),
-so a served CRD that predates them keeps the rest of the block landing.
+[`human-interaction-readings.md`](human-interaction-readings.md) §2.2 generalises it in its second pull request, a target per reading with the miss rule following the target, which this design depends on: a new reading kind, `origins`, on the chat plugin's target (its metrics listener, read on the pod
+that runs the gateway), present when all nine origins resolved from the body, each on at least
+one sample and summed over `platform` (the listener serves every origin's series, zero included,
+from its first ledger read), and the body carries `kubeagents_proposals_opened_read_age_seconds`,
+the seconds since the plugin's last successful ledger read, not above two poll intervals; one miss
+per poll without them, cleared after two, the largest reading across the bodies read, and its own
+pruning record ("the nine origin readings"), so a served CRD that predates them keeps the rest of
+the block landing. Presence does
+not prove freshness by itself: a failed ledger read still serves the last counts, which is why the
+plugin serves the read age and the presence rule requires it fresh, so stale counts clear like a
+miss two polls after its read age passes two poll intervals, about twenty minutes after the
+ledger stops answering.
 
 The fields, named like the block's other readings: `proposalsFromChat`,
 `proposalsFromConsole`, `proposalsFromApi`, `proposalsFromEvent`, `proposalsFromDrift`,
 `proposalsFromAudit`, `proposalsFromScheduled`, `proposalsFromIssue`, `proposalsFromOther`. Each
-is a pointer field: a 0 is a reading; absent until the first reading and while the served CRD
-predates it. They move neither `lastActiveTime` nor `lastHumanActiveTime`, as readings do not.
+is a pointer field: a 0 is a reading; absent until the first reading, after two polls in a row
+without one, and while the served CRD predates it. They move neither `lastActiveTime` nor `lastHumanActiveTime`, as readings do not.
+A ledger read that fails after the plugin's first success keeps serving the last counts, and the
+read age grows with each failed read. Once the age passes two poll intervals the poll is a miss,
+so the fields clear two polls later, as for any miss. A body with the counts and no age series, from a
+plugin older than the operator, keeps the old rule and is present: an agent image can be pinned apart
+from the operator, and nine fields absent with no cause would be worse than counts the plugin still
+vouches for.
 Each gets a row in the per-field gauge `kubeagents_platformagent_usage{field=...}`, so a shared
 Prometheus reads the split with one `sum by (field)`.
 
@@ -198,19 +225,21 @@ Prometheus reads the split with one `sum by (field)`.
 
 ### 2.4 The summary
 
-Both summary copies print one line after the proposal readings:
+Both summary copies print one line after the readings, before `lastActive`:
 `  proposals by origin: chat 3, event 1, audit 2 (as the agent reports)`, listing the origins
 whose reading is above zero in the table's order, `none` when every reading is zero, and
-`no reading` when they are absent. One line rather than nine reads as the answer to one
-question. The script's full block is at its forty-line cap today, and the people readings' pull request
-adds its own rows first, so both copies' caps rise by one from wherever that pull request leaves
-them, said in the commit body. The nine field names are a list pinned between the copies by the
-existing copy test, beside the counters and the readings. The privacy audit removes this line
-before it checks the block, the removal
+`no reading` when none is present. One line rather than nine reads as the answer to one
+question. Each copy's line cap rises by one: the script's `SUMMARY_MAX_LINES` from 43 to 44, the
+gateway's `usageSummaryMaxLines` from 41 to 42. The nine field names are a list pinned between the
+copies by the existing copy test, beside the counters and the readings. The privacy audit removes
+this line before it checks the block, the removal
 [`install-model-reading.md`](install-model-reading.md) §2.2 adds for the model line and this
-design depends on: the line carries only fixed text (its label, the nine origin words, `none`, `no reading`, the
-suffix) and digits, so nothing on it can leak, and a cluster or project named `chat` or `drift`
-is still refused anywhere else in the block.
+design depends on: the line carries only fixed text (its label, the nine origin words, `none`,
+`no reading`, the suffix) and digits, so nothing on it can leak. Its label and suffix join each
+copy's own vocabulary, which the audit never refuses. An identifier spelled like an origin word is
+still refused on every other line, except where that word is already the copy's own: the gateway's
+block prints `chat turns`, so the gateway never refuses `chat` on any line, while the script
+refuses it everywhere but the two removed lines.
 
 ### 2.5 Trust and privacy
 
@@ -228,8 +257,8 @@ holds as it stands.
   key (with the platform) and its write for `k8s-evt-*` sessions at the first inject; the parent
   walk for continuations; the `proposals_opened` table and the endpoint the hook writes it
   through; the stamped-insert endpoint for cards; the drift backlog's `drift` stamp; the per-job-id origin table the `cronjob` handler writes.
-- **Board patch** (`deploy/docker/patches/`, beside `kanban_priority.py`): the card's `origin`
-  and `origin_platform` columns written at insert from the creating turn's session record, run
+- **Board patch** (`deploy/docker/patches/`, beside `kanban_priority.py`): the card's origin and
+  platform, a row of the side table `kanban_task_origins` written at insert from the creating turn's session record, run
   context or dashboard, the worker's and the child's inheritance, and the insert-only stamp a
   trusted writer passes.
 - **Credential broker** (`agents/platform/scripts/credential_proxy.py`) and `vcs_client`: the
@@ -251,10 +280,12 @@ holds as it stands.
   record line in every process (the forge check moves to the broker); the origin resolution in
   the order of §2.2; the ledger write.
 - **Chat metrics plugin** (`agents/chat/defaults/plugins/chat_metrics/metrics.py`): the
-  `kubeagents_proposals_opened{origin,platform}` gauge family, read from the ledger at scrape.
+  `kubeagents_proposals_opened{origin,platform}` gauge family, read from the ledger at scrape,
+  and `kubeagents_proposals_opened_read_age_seconds`, the seconds since the last successful read.
 - **Operator** (`usage_counters_scrape.go`, `usage_counters_poller.go`, `usage_gauges.go`,
   `common_types.go`, the CRD copies): the `origins` reading kind on the chat target, nine
-  specs, nine pointer fields, one pruning record, nine gauge rows.
+  specs, nine pointer fields, one pruning record, nine gauge rows, and the presence rule's
+  fresh-age requirement on `kubeagents_proposals_opened_read_age_seconds`.
 - **Summary** (`feedback_summary.py`, `a2a/gateway/feedback_summary.go`): the one line, the
   pinned field list, the audit's removal of the line, the caps.
 - **Docs**: the observability page (nine rows, the gauge, the one-line answer to "who started
@@ -280,7 +311,7 @@ A deterministic guard in the sense of `.agents/rules/eval_driven_development.md`
 record, a verified ledger, a reading and a status field, with no model call in any path. The one text the model sees change is a machine record line it already reads today, from which the hook now strips an opaque token field; no prompt, instruction, tool text or
 skill text changes, and a worker's output has the line removed exactly as today. Unit tests cover every origin's resolution, the inheritance through a
 card, a child card and a continuation, the `other` fallback, the ledger's once-per-url rule, the
-reading's presence rule and the summary line.
+reading's presence rule (the nine counts beside a fresh read age) and the summary line.
 
 ## 6. Left to the builder
 
