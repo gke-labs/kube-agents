@@ -5,8 +5,12 @@ read them; all use the names here, so a renamed field breaks the tests instead
 of the analysis.
 """
 
-# 2: litellm_config_checksum became model_behaviour_checksum.
-LOG_SCHEMA_VERSION = 2
+# 2: litellm_config_checksum became model_behaviour_checksum, a checksum that
+#    treated the Gemini Developer API and Vertex AI routes as one.
+# 3: back to litellm_config_checksum, the LiteLLM pods' checksum/config. Not 1
+#    again, since the bucket holds schema-2 lines. The readers group lines by
+#    fingerprint and read neither name, so schema-2 lines still read.
+LOG_SCHEMA_VERSION = 3
 
 REQUEST_EVENT = "replay_shadow_request"
 START_EVENT = "replay_shadow_start"
@@ -20,7 +24,7 @@ JOB = "job"
 MODEL = "model"
 STREAM = "stream"
 NORMALIZER_VERSION = "normalizer_version"
-MODEL_BEHAVIOUR_CHECKSUM = "model_behaviour_checksum"
+LITELLM_CONFIG_CHECKSUM = "litellm_config_checksum"
 LITELLM_IMAGE = "litellm_image"
 STATUS = "status"
 LATENCY_MS = "latency_ms"
@@ -139,6 +143,13 @@ RECORDED = "recorded"
 # RECORD_ERROR_BUDGET when the data budget is spent and nothing was saved.
 RECORD_ERROR = "record_error"
 RECORD_ERROR_BUDGET = "budget_spent"
+# In record mode: [context, answer] identifying this request's answer as a
+# later request's history holds it (normalizer.answer_variant), and the same
+# pair for the last assistant message this request holds. A later request's
+# PRIOR_ANSWER equal to an earlier line's ANSWER_VARIANT says its conversation
+# went on from that very answer (hack/replay-proxy/run_attribution.py).
+ANSWER_VARIANT = "answer_variant"
+PRIOR_ANSWER = "prior_answer"
 # On a replay miss: the closest saved request and where this one differed.
 MISS = "miss"
 MISS_CLOSEST_FINGERPRINT = "closest_fingerprint"

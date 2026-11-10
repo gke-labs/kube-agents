@@ -62,7 +62,7 @@ What the install creates in your project:
 
 - The agent's service account, `kubeagents-platform-gsa`, always. Its roles are the [permission set](/kube-agents/reference/security-and-iam/#gcp-iam-permission-sets) you choose.
 - `kubeagents-litellm-gsa`, the model gateway's, with `--model-provider=vertex_ai` only.
-- `kubeagents-github-minter-gsa`, the GitHub token minter's, with the GitHub integration only.
+- `<cluster>-minter`, the GitHub token minter's, with the GitHub integration only. An install from an earlier release keeps `kubeagents-github-minter-gsa`.
 - One reader service account per project in scope, with `--scoped-sa-pool-enabled` only.
 - The Google-managed service agents the grants above name: GKE's for CMEK, Logging's for the drift sink, and Google Chat's with Chat.
 - A versioned Cloud Storage bucket, `<PROJECT_ID>-kube-agents-tfstate`, for the Terraform state.
@@ -134,11 +134,11 @@ Totals by install profile, as the chart's quota preflight sums them (the operato
 
 | Profile | Pods | CPU requests | Memory requests | CPU limits | Memory limits | Ephemeral storage requests / limits | Claims | `requests.storage` | Session quota `pods` |
 | ------- | ---- | ------------ | --------------- | ---------- | ------------- | ----------------------------------- | ------ | ------------------ | -------------------- |
-| `today`, GKE Standard | 9 | 2756m | 10048Mi | 13200m | 25472Mi | 14912Mi / 14912Mi | 4 | 102Gi | — |
-| `today`, GKE Autopilot | 9 | 4256m | 11072Mi | 13200m | 25472Mi | 14912Mi / 14912Mi | 4 | 102Gi | — |
-| `next`, GKE Standard | 18 | 3706m | 11648Mi | 18900m | 30080Mi | 15040Mi / 15040Mi | 5 | 142Gi | 36 |
-| `next`, GKE Autopilot | 18 | 5206m | 12672Mi | 18900m | 30080Mi | 15040Mi / 15040Mi | 5 | 142Gi | 36 |
-| `next` with Hindsight and the GitHub minter, GKE Standard | 22 | 4556m | 14080Mi | 24900m | 35712Mi | 16192Mi / 16192Mi | 6 | 150Gi | 42 |
+| `today`, GKE Standard | 9 | 2756m | 12096Mi | 13200m | 25472Mi | 14912Mi / 14912Mi | 4 | 102Gi | — |
+| `today`, GKE Autopilot | 9 | 4256m | 13120Mi | 13200m | 25472Mi | 14912Mi / 14912Mi | 4 | 102Gi | — |
+| `next`, GKE Standard | 18 | 3706m | 13696Mi | 18900m | 30080Mi | 15040Mi / 15040Mi | 5 | 142Gi | 36 |
+| `next`, GKE Autopilot | 18 | 5206m | 14720Mi | 18900m | 30080Mi | 15040Mi / 15040Mi | 5 | 142Gi | 36 |
+| `next` with Hindsight and the GitHub minter, GKE Standard | 22 | 4556m | 16128Mi | 24900m | 35712Mi | 16192Mi / 16192Mi | 6 | 150Gi | 42 |
 
 The session quota is `spec.harness.tuning.maxSessions` (10 by default) plus the pods the operator runs for the agent, the chart's pods in the namespace with their rollout surges (5 when the operator cannot read the chart's count), and a margin of 7 for the operator's rollout surges, its Jobs and the gateway's count-then-create overshoot.
 
@@ -152,7 +152,7 @@ Under `spec.mode: next`, per pod:
 | A2A gateway | 2 | 50m | 64Mi | 500m | 512Mi | — | Standing; one fewer with the operator's `A2A_GATEWAY_ELECTION=false` |
 | Console | 1 | 100m | 128Mi | 500m | 256Mi | — | Standing |
 | Bus provisioning Job | 1 | 50m | 64Mi | 200m | 256Mi | 128Mi / 128Mi | At install, again whenever its spec changes, and about daily |
-| `hermes-bridge` container | in the agent pod | 250m | 512Mi | 1 | 1Gi | — | Under the default `api` executor; `A2A_BRIDGE_EXECUTOR=cli` raises it to 1 CPU and 2Gi memory (limits 3 and 8Gi), and `A2A_BRIDGE_RESOURCES` overrides either |
+| `hermes-bridge` container | in the agent pod | 250m | 512Mi | 1 | 1Gi | — | Under the default `api` executor; `A2A_BRIDGE_EXECUTOR=cli` raises it to 1 CPU and 4Gi memory (limits 3 and 8Gi), and `A2A_BRIDGE_RESOURCES` overrides either |
 | MCP server | 1 | 100m | 128Mi | 500m | 256Mi | — | With the operator's `A2A_MCP_DOOR=true` |
 | Profile dispatcher | 1 | 50m | 64Mi | 500m | 256Mi | — | With the operator's `A2A_DISPATCHER_IMAGE` set |
 | Scope publisher Job | 1 | 50m | 192Mi | 500m | 512Mi | — | One pod at a time, every 15 minutes, where `platformAgent.scope` names a folder, organization, Shared VPC host or Metrics Scope |
@@ -304,7 +304,7 @@ The declarative workflow routes infrastructure mutations through pull requests v
 - **GitHub Organization:** A GitHub repo **owned by an organization**. Minty queries `/orgs/{org}/installation`, so personal accounts fail token minting with HTTP 404 — see [Token minter](/kube-agents/deploy/token-minter/). A free organization is sufficient.
 - **GitHub App:** A GitHub App with `contents:write`, `pull_requests:write`, and `issues:write` permissions, installed on that repo and on any repository you later register under `context_repos` (see upstream [`abcxyz/github-token-minter`](https://github.com/abcxyz/github-token-minter#readme) and [Read-only tokens for context repositories](/kube-agents/deploy/token-minter/#read-only-tokens-for-context-repositories)).
 - **GitHub App ID:** Numeric ID of the created App.
-- **Cloud KMS Key & Private Key Import:** The App's private key imported into a Cloud KMS asymmetric signing key in your cluster's region (default `github-token-minter-keyring` / `github-token-minter-key`). Because Cloud KMS keys cannot be deleted in GCP, this import is a permanent one-time step.
+- **Cloud KMS Key & Private Key Import:** The App's private key imported into a Cloud KMS asymmetric signing key in your cluster's region (default on a new install `<cluster>-minter-keyring` / `<cluster>-minter-key`). Because Cloud KMS keys cannot be deleted in GCP, this import is a permanent one-time step.
   - **Option 1 (Automated import via `install.sh`):** Provide `--github-pem-path="/path/to/app-private-key.pem"` during install. `install.sh` creates the KMS key, runs the Minty CLI to import the key, and you can delete the local `.pem` file immediately after. Needs Go 1.21+ on the installer host — the Minty CLI asks for Go 1.24, and 1.21 onwards downloads that toolchain on demand. Distribution packages are often older (Debian 12 ships 1.19, Ubuntu 22.04 ships 1.18); `install.sh` checks before it builds and tells you if yours cannot work. This is unrelated to the Go version needed to build the operator.
   - **Option 2 (Pre-provisioned Ahead-Of-Time):** Pre-provision the KMS key and import the private key upfront following the [upstream guide](https://github.com/abcxyz/github-token-minter#readme) and [Google Cloud KMS documentation](https://cloud.google.com/kms/docs/importing-a-key) (recommended for CI/CD and release pipelines). `install.sh` detects the existing `ENABLED` version and skips `.pem` handling.
 

@@ -142,6 +142,24 @@ class MinterGuardTest(unittest.TestCase):
         self.assertEqual(rc, 0, log)
         self.assertEqual(parse(text)["GITHUB_APP_ID"], "12345")
 
+    def test_an_environment_with_the_minter_names_the_project_wide_key(self):
+        """A rebuild has no minter in state, so unnamed it would derive new names; it names the old ones."""
+        rc, log, text = render(
+            {**_COORDS, **_STRICT_OK, "GITHUB_APP_ID": "12345",
+             "GITOPS_ORG": "gke-agentic", "GITOPS_REPO": "gke-fleet-iac"},
+            strict=True)
+        self.assertEqual(rc, 0, log)
+        got = parse(text)
+        self.assertEqual((got["KMS_KEYRING"], got["KMS_KEY"], got["GITHUB_MINTER_GSA_NAME"]),
+                         ("github-token-minter-keyring", "github-token-minter-key", "kubeagents-github-minter-gsa"))
+        # Names the environment sets are kept, and an install without a minter gets none.
+        _, _, text = render(
+            {**_COORDS, **_STRICT_OK, "GITHUB_APP_ID": "12345", "GITOPS_ORG": "o", "GITOPS_REPO": "r",
+             "KMS_KEYRING": "env-ring", "KMS_KEY": "env-key"}, strict=True)
+        self.assertEqual((parse(text)["KMS_KEYRING"], parse(text)["KMS_KEY"]), ("env-ring", "env-key"))
+        _, _, text = render({**_COORDS, **_STRICT_OK}, strict=True)
+        self.assertNotIn("KMS_KEYRING", parse(text))
+
     def test_none_of_the_three_is_an_install_without_a_minter(self):
         rc, log, _ = render({**_COORDS, **_STRICT_OK}, strict=True)
         self.assertEqual(rc, 0, log)

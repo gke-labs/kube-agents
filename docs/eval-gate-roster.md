@@ -15,7 +15,7 @@ them, since the merge-blocking presubmit runs on that lane (below).
 `hack/replay-proxy/` carries it as well, because its normalizer decides which requests match a
 recorded answer ([`eval-design.md`](../examples/inference-replay/eval-design.md#the-proxy-cant-come-from-the-pull-request)).
 Nothing else carries the rule: `hack/ci-eval-pr.sh` and the scripts it runs,
-`hack/eval/nightly-cases.txt`, `hack/eval/certification-cases.txt`, `hack/eval/api-lane-exclusions.txt` and a new case directory under `bench/tasks/` need only the normal approvers
+`hack/eval/nightly-cases.txt`, `hack/eval/certification-cases.txt`, `hack/eval/api-lane-exclusions.txt`, `hack/eval/replay-lane-cases.txt` and a new case directory under `bench/tasks/` need only the normal approvers
 ([#1546](https://github.com/gke-labs/kube-agents/issues/1546), decided 2026-09-15). This
 page lives under `docs/` on purpose: the presubmit's step 0 (`hack/ci-revalidate.sh`) treats
 `docs/` as inert (and the Prow path filter in `oss-test-infra` does today too), so a review finding
@@ -172,7 +172,7 @@ roster line on 2026-11-02 (its bullet stays for the record):
   2026-10-28, agent on gemini-4-argon), because that lane sets the route check aside and the
   current models read the block correctly on their own, so a presubmit seat could not fail when
   the fix it guards is undone. It stays a nightly case; the domain's seat is
-  consistency-drift-outlier's. No CI lane grades its route check today: the nightly halves run
+  consistency-drift-outlier's. No CI lane grades its route check today: the nightly's main shards run
   through the inject door since #3783, and since #3969 retired the today-mode nightly the
   api-lane jobs that remain carry the presubmit list (the GitLab nightly its own list), not the
   nightly file, so the route is graded only on an api-lane run that carries the case, as #3975's
@@ -297,8 +297,9 @@ Admitted on the record since the split:
   `gcp.read-only`, which is the red it guards against; its red run on `main` is #3633's, on a
   dev install (`run_20261019_201435_772300`: both report objectives failed, the agent answering
   that its command and API proxy policies did not allow reading alert policies). The record is
-  the main nightly's `-main-b` half (`ci-kube-agents-eval-nightly-main-b`, where the case runs as
-  a stack case; that periodic's first night is 2026-10-27), read from each build's
+  the main nightly's `-main-b` half as it then was (`ci-kube-agents-eval-nightly-main-b`, where the case
+  ran as a stack case; that periodic's first night is 2026-10-27; since the main part runs as five
+  shards the case is in main-e, `hack/eval/nightly-main-e.txt`), read from each build's
   `case-monitoring-alert-policy-read.json` and dated by the build's UTC start: 21 of 21 graded
   repetitions on the seven nights 2026-10-27 to 11-02, every night 3/3, no infra repetition, all
   under `spec.mode next` on the inject lane; 6/6 on the two nights at
@@ -317,9 +318,11 @@ recorded run(s), 5 more needed …` at the presubmit's key (gemini-4-argon, mode
   alone (`read-from-monitoring-not-the-audit-log`, a `worker_commands` check that read one
   command and no `gcloud`) with the two report objectives passing and the answer naming the
   policy as disabled, and the judge reading `gcloud alpha monitoring policies list` in the
-  worker's trajectory. That objective and the `no-monitoring-write` safeguard are set aside on
-  the inject lane, so the merge-blocking presubmit and the main nightly grade neither, and the
-  seat blocks there on the two report objectives. The today lane ([below](#the-inject-lane))
+  worker's trajectory. That objective and the `no-monitoring-write` safeguard were set aside on
+  the inject lane until #5236, so the merge-blocking presubmit and the main nightly graded neither, and the
+  seat blocked there on the two report objectives alone. Since #5236 both grade on an inject record
+  that carries the workers' entries, so the seat blocks on all four: on the 381 inject presubmit
+  repetitions of 2026-11-07 to 11-09 both passed on every record. The today lane ([below](#the-inject-lane))
   runs the presubmit matrix over the api transport, where both are graded: this seat puts the
   case on that matrix with the route objective live and its one api-transport record at 0/3,
   so a collapse there reds `ci-kube-agents-eval-today` (a periodic on `main`, not a merge
@@ -432,7 +435,8 @@ across 5 recorded run(s), 5 more needed before this case can collapse`; and, bec
   repository held no manifest for it, or named an older pull request it had not opened).
   [#3145](https://github.com/gke-labs/kube-agents/pull/3145), merged 2026-10-23 00:36 UTC, seeds
   that manifest into every pool repository. The record is the writers nightly
-  (`ci-kube-agents-eval-nightly-writers`, where the case runs because it opens a pull request),
+  (`ci-kube-agents-eval-nightly-writers`, where the case runs because it opens a pull request; its
+  writers-a third since the part runs in thirds),
   read from each build's `case-pdb-remediation-pr.json` and dated, as the dashboard's Nightly page
   dates it, by the build's UTC start (8 PM ET the evening before): 3/3 on each of the three nights
   since #3145, 2026-10-24, 10-25 and 10-26 (builds 2113782591684349952, 2114144983022833664 and
@@ -474,7 +478,9 @@ across 5 recorded run(s), 5 more needed before this case can collapse`; and, bec
   writers nightly). The same case under `spec.mode next`, the presubmit's lane, passed 18 of 18
   on the retired next-mode nightly 2026-10-16 to 10-21, with
   `the-forge-was-reached-without-a-cli` (a `worker_commands` check) set aside as blind on that
-  transport, as it will be on the presubmit; and 15 of 15 on the five GitLab nightlies that
+  transport, as it was on the presubmit until #5236. Since #5236 it grades on an inject record that
+  carries the workers' entries: it passed on 322 of the 323 inject presubmit repetitions of
+  2026-11-07 to 11-09, and was set aside on the other; and 15 of 15 on the five GitLab nightlies that
   graded, 2026-10-17 to 10-22. `deployer: noop`, and it seeds its own spent branch inside the
   run, so it reads no seeded cluster and no fixture: none of the fleet-drift exposure that
   demoted the upgrades and consistency probes. What it costs: it was the presubmit's one case
@@ -698,7 +704,7 @@ version key carries the mode ([`bench/baselines/README.md`](../bench/baselines/R
 presubmit's `next` is compared only with lines a next-mode run on `main` recorded at its key, and
 the today lane's `today` only with today's; a case with no line at its key contributes nothing to
 `main`'s side, with one exception below. The main nightly (`ci-kube-agents-eval-nightly`, its
-`-main-b` half and its `-writers` part) is the next-mode run on `main` that records, on the presubmit's agent model. A case
+`-main-b` to `-main-e` shards and its three writers thirds) is the next-mode run on `main` that records, on the presubmit's agent model. A case
 with no line at its next key (one the inject lane excludes, or whose window has not filled) falls
 back, for this number only, to its today-mode lines at the same key otherwise, which the store
 already holds (no job appends them now), and the verdict names those cases in a note; rung 6
@@ -782,10 +788,13 @@ graded there, but the job does not block a merge.
 
 A check the transport blinds is the scorer's business. The harness reads no card ids, no worker's
 entries and no results off the door's trace. The delegation wait now reads the cards and the workers from the pod
-when the turn ran under the bridge's `api` executor, but the scorer still treats
-`worker_commands`, `worker_agents`, `worker_budget`, `report_times_in_window`, a `tool_called` in the `workers` or `all` scope, and a
-`tool_called` with a `result` pattern as blind on
-every inject record, and a door that shows no tool-call trace leaves a `tool_called` in its
+when the turn ran under the bridge's `api` executor and puts the workers' calls on the record, so the
+scorer grades `worker_commands`, `worker_agents`, `worker_budget` and a `tool_called` in the
+`workers` scope on an inject record that carries those entries with no capture gap. It still
+treats them as blind on any other inject record, and treats `report_times_in_window`, a
+router-scope `tool_called` with a `result` pattern, and one with an `arguments` pattern in an entry
+that also reads the workers as blind on every inject record.
+A door that shows no tool-call trace leaves a `tool_called` in its
 default `router` scope nothing to read; `bench-gate` sets
 those entries aside as not applicable on that transport and grades the rest, and a case whose
 only objectives are of that kind is reported `NOT_GRADED_ON_TRANSPORT` rather than collapsed —
@@ -793,9 +802,8 @@ evaluated, outside the pass rate, never weather
 ([`docs/designs/eval-scorer.md`](designs/eval-scorer.md), "The inject lane sets aside what its
 transport cannot show"). No roster edit is involved. The half of the rule for a router-scope
 `tool_called` without a `result` pattern retires on a record whose door showed the whole trace (the transport's `a2a.activity` marker,
-reporting no loss), whether or not the run made a call. The delegation wait for this path is
-rebuilt, but the worker half stays until `scoring.py` takes those entries out of
-`worker_blind_checks` for a record that carries the workers.
+reporting no loss), whether or not the run made a call. The worker half retires on a record that
+carries the workers' tagged entries and no `harness_worker_capture_gaps` entry (#5236).
 
 A premise the transport removes is the lane's exclusion list,
 `hack/eval/inject-lane-exclusions.txt`. The front door's delegation cases are not on it: the
@@ -992,6 +1000,15 @@ the evidence store and publishes no dashboard; its record is its logs bucket. A 
 earns a seat here; a capability the presubmit must guard gets a case of its own in the catalogue.
 The file needs the normal approvers, like `nightly-cases.txt`. The rules a certification fixture
 meets are in [`bench/README.md`](../bench/README.md#certification-suite).
+
+## The replay lane
+
+`hack/eval/replay-lane-cases.txt` is what the replay lane replays (`EVAL_REPLAY_LANE=true`; the
+[inference-replay design](../examples/inference-replay/eval-design.md), Rollout step 2). Every entry
+is a registered case the inject lane runs, so the nightly has recorded it. The roster above never
+reaches it: the script arms no roster case there, and the lane appends nothing to the evidence
+store and publishes no dashboard. Its record is its report in the shadow bucket
+([`hack/replay-proxy/README.md`](../hack/replay-proxy/README.md#record-and-replay-the-replay-lane)).
 
 ## Demoting a flaky case
 

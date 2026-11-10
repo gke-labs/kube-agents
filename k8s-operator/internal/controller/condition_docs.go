@@ -59,6 +59,11 @@ var platformAgentConditionDocs = []conditionDoc{
 		Meaning: "Whether every replica the callout Deployment asks for is ready, and therefore both serving an identity map and attached to the bus. `Reason: CalloutServing` (`True`), `CalloutUnavailable`, or `CalloutAbsent`. The operator's own gates do not read it, and it reads `False` with `1 of 2 replicas ready` while the gateway exists and dispatches; [What `BusCredentialsReady` reports](#what-buscredentialsready-reports) has the gate it differs from and when it is removed.",
 	},
 	{
+		Type:    dispatcherJobModeCondition,
+		Written: "Under `mode: next`, while the operator runs the profile dispatcher (`A2A_DISPATCHER_IMAGE`) with the chart's `A2A_DISPATCHER_JOB_POLICY` signal set, from the first pass that reaches the dispatcher",
+		Meaning: "Whether the dispatcher runs unattended profile tasks as Jobs. `Reason: InPlace` (`True`), `PolicyMissing`, `NamespaceNotSelected`, `NamespaceNotReady`, `ForeignJobTemplate`, or `GrantFailed`; [What `DispatcherJobMode` reports](#what-dispatcherjobmode-reports) has each.",
+	},
+	{
 		Type:    a2aIdentityMapAppliedConditionType,
 		Written: "Under `mode: next`, once the operator renders an identity map",
 		Meaning: "Whether the auth callout took the identity map this operator rendered, read from every Ready callout pod's `/status` by pod IP, again every 30 seconds while unsettled. `True`, `Serving`: every Ready pod answered and serves it. `False`, `Refused`: a pod refused it and serves its previous map, which can be wider; the message quotes the refusal. `False`, `Pending`: a pod is still on an older map or mid-way through its shards. `Unknown`, `StatusUnreadable`: a Ready pod didn't answer and may hold a refusal, so turning to it is a Warning event (a NetworkPolicy on the callout must admit the operator). `Unknown`, `NoReadyCallout`: no pod is Ready. Removed when the A2A stack is off.",
@@ -97,6 +102,11 @@ var platformAgentConditionDocs = []conditionDoc{
 		Type:    dataVolumeNearlyFullCondition,
 		Written: "While the operator has a reading of the data volume",
 		Meaning: "`True` (`NearlyFull`) from 90% used, back to `False` (`HasSpace`) only below 85%, so a volume at the line does not flap. A full volume fails every task-board and session write with a bare `disk I/O error`, so this is the early warning. It does not change `phase` or `Ready`, since the agent still answers. The message carries the figures from when the status last changed; `storageStatus.freeBytes` is current to within a hundredth of the volume. The reading comes from the event watcher, so with the watcher disabled or unreachable the condition is absent. The Session KV server in the agent container makes the same check and posts to the home channel when usage crosses 90% and when it is back below 85%.",
+	},
+	{
+		Type:    kanbanDispatcherFailingCondition,
+		Written: "From the first time the task-board dispatcher fails for a whole poll",
+		Meaning: "`True` (`TicksFailing`) once the dispatcher has failed 60 ticks in a row on a board, about one five-minute poll at its 5-second interval. The message names the board, the streak and the last error class. Cards on that board are not dispatched; a full data volume is a common cause. `False` (`Ticking`) at the first poll where every streak is below 60. A good tick resets a streak, and a board the dispatcher stops ticking drops out after ten minutes. It does not change `phase` or `Ready`. A poll that cannot read the gateway's chat metrics listener leaves the condition as it is. A board quarantined as corrupt is not counted.",
 	},
 	{
 		Type:    scopeUndeclaredCondition,

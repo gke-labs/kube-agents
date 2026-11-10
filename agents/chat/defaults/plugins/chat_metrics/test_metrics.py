@@ -120,6 +120,72 @@ class TurnErrorTest(unittest.TestCase):
         self.assertEqual([], _ERRORED_LINE.findall(exposition))
 
 
+_DISPATCH_LINE = re.compile(r'^kubeagents_kanban_dispatcher_failed_ticks\{board="((?:[^"\\]|\\.)*)",error="([^"]*)"\} (\d+)$', re.M)
+
+
+class DispatcherFailedTicksTest(unittest.TestCase):
+    """The dispatcher's failed-tick streak, by board: a failure adds one, a good
+    tick drops the board's series."""
+
+    def test_failures_add_up_and_carry_the_last_class(self):
+        registry = metrics.ChatMetrics()
+        registry.record_dispatch_tick("default", "OperationalError")
+        registry.record_dispatch_tick("default", "DatabaseError")
+        registry.record_dispatch_tick("ops", "OperationalError")
+        exposition = registry.render()
+        self.assertIn("# TYPE kubeagents_kanban_dispatcher_failed_ticks gauge", exposition)
+        self.assertEqual([("default", "DatabaseError", "2"), ("ops", "OperationalError", "1")], _DISPATCH_LINE.findall(exposition))
+
+    def test_a_good_tick_drops_the_boards_series_and_the_next_failure_starts_at_one(self):
+        registry = metrics.ChatMetrics()
+        registry.record_dispatch_tick("default", "OperationalError")
+        registry.record_dispatch_tick("default", "OperationalError")
+        registry.record_dispatch_tick("default", "")
+        self.assertEqual([], _DISPATCH_LINE.findall(registry.render()))
+        registry.record_dispatch_tick("default", "OperationalError")
+        self.assertEqual([("default", "OperationalError", "1")], _DISPATCH_LINE.findall(registry.render()))
+
+    def test_a_board_slug_is_escaped_in_its_label(self):
+        registry = metrics.ChatMetrics()
+        registry.record_dispatch_tick('a"b\\c', "OSError")
+        self.assertEqual([('a\\"b\\\\c', "OSError", "1")], _DISPATCH_LINE.findall(registry.render()))
+
+    def test_a_board_the_dispatcher_stopped_ticking_is_dropped(self):
+        now = [100.0]
+        registry = metrics.ChatMetrics(clock=lambda: now[0])
+        registry.record_dispatch_tick("archived", "OperationalError")
+        registry.record_dispatch_tick("live", "OperationalError")
+        now[0] += metrics.DISPATCH_FAILURE_STALE_SECONDS
+        registry.record_dispatch_tick("live", "OperationalError")
+        self.assertEqual(2, len(_DISPATCH_LINE.findall(registry.render())))
+        now[0] += 1
+        self.assertEqual([("live", "OperationalError", "2")], _DISPATCH_LINE.findall(registry.render()))
+
+    def test_failures_a_busy_timeout_apart_keep_counting(self):
+        # A locked board: each failed tick waits Hermes' 120 s busy timeout, then the 5 s interval.
+        now = [100.0]
+        registry = metrics.ChatMetrics(clock=lambda: now[0])
+        for _ in range(60):
+            registry.record_dispatch_tick("default", "OperationalError")
+            registry.render()
+            now[0] += 125
+        self.assertEqual([("default", "OperationalError", "60")], _DISPATCH_LINE.findall(registry.render()))
+
+    def test_a_stale_streak_restarts_even_when_no_render_ran_in_between(self):
+        now = [100.0]
+        registry = metrics.ChatMetrics(clock=lambda: now[0])
+        for _ in range(70):
+            registry.record_dispatch_tick("default", "OperationalError")
+        now[0] += metrics.DISPATCH_FAILURE_STALE_SECONDS + 1
+        registry.record_dispatch_tick("default", "OperationalError")
+        self.assertEqual([("default", "OperationalError", "1")], _DISPATCH_LINE.findall(registry.render()))
+
+    def test_an_idle_registry_renders_the_family_with_no_series(self):
+        exposition = metrics.ChatMetrics().render()
+        self.assertIn("# TYPE kubeagents_kanban_dispatcher_failed_ticks gauge", exposition)
+        self.assertEqual([], _DISPATCH_LINE.findall(exposition))
+
+
 _GAVE_UP_LINE = re.compile(r"^kubeagents_kanban_tasks_gave_up_total (\d+)$", re.M)
 
 

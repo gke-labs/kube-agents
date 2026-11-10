@@ -36,6 +36,25 @@ a segment for the pod, the proxy's start time and a sequence number. So an
 object already in the bucket under a name holds what the pod's file holds, and
 `--no-clobber` skipping it loses nothing.
 
+The proxy's mode adds to that (`--mode`; examples/inference-replay/eval-design.md,
+Rollout step 2):
+
+- `record`, on a trusted nightly: each pass also copies the answers the proxy
+  saved (the cache directory, replay_cache.py's layout) out of the pod into
+  `--keep-dir` on this machine, empties each copied file in the pod (an empty
+  file still holds its name, so the first write for a key still wins), and
+  keeps a copy of every line and stored request it fetched. Every
+  `--publish-interval` seconds, and once in the last pass, publish_cache.py
+  uploads the answers from runs that passed, as graded so far under
+  `--verdicts-dir`, to the shared cache bucket. The cache never goes to the
+  shadow bucket.
+- `replay`, in the replay lane: each pass seeds any proxy pod that has not got
+  the cache (a pod that replaced one starts empty) from `--seed-dir`, which
+  fetch_cache.py filled, and keeps the lines and stored requests. The last
+  pass writes lane_report.py's report and uploads it under the job's prefix,
+  in `report/`. `--seed-once` seeds every pod and exits, 0 only when every
+  pod took the cache, so the lane can stop before its cases.
+
 It never fails the eval: every command has a timeout, an error is counted and
 retried on the next pass, and the exit status is always 0. The job's stdout
 and the artifacts are public through Prow's web UI, so what this prints is
@@ -57,22 +76,30 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+import replay_cache
 
 BUCKET_ROOT = "replay-shadow"
 # One folder each, so an IAM condition on the object name can confine each
 # runner to its own: nightly/ is written by the nightly runner alone, and a
 # scheduled run as any other account is nightly-untrusted (hack/ci-env.sh,
-# resolve_replay_shadow).
-JOB_KINDS = ("nightly", "nightly-untrusted", "presubmit")
+# resolve_replay_shadow). The replay lane is its own folder too.
+JOB_KINDS = ("nightly", "nightly-untrusted", "presubmit", "replay-lane")
+MODE_SHADOW = "shadow"
+MODE_RECORD = "record"
+MODE_REPLAY = "replay"
+MODES = (MODE_SHADOW, MODE_RECORD, MODE_REPLAY)
 DATE_FORMAT = "%Y-%m-%d"
 JOB_MANIFEST_PREFIX = "job-"
 JSON_SUFFIX = ".json"
 SEGMENT_SUFFIX = ".jsonl"
 OPEN_SUFFIX = ".open"
 LOGS_DIR = "logs"
+STORE_DIR = "store"
 STORE_REQUESTS_DIR = "store/requests"
 STORE_BLOBS_DIR = "store/blobs"
 # What a pod's data volume may hold that is ours to copy, by directory, and the
@@ -86,6 +113,29 @@ SAFE_NAME = re.compile(
     r"^(?:logs/[A-Za-z0-9][A-Za-z0-9._-]*\.jsonl(?:\.open)?"
     r"|store/(?:requests|blobs)/[A-Za-z0-9][A-Za-z0-9._-]*\.json)$"
 )
+
+# The proxy's saved answers, under the cache directory in the data volume
+# (replay_cache.py): what record mode copies out and replay mode seeds. Every
+# file is one plain name under one of four directories, variants one level
+# deeper, so a name is checked like the others before it becomes a path.
+DEFAULT_CACHE_SUBDIR = "replay-cache"
+CACHE_SUBDIR_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+CACHE_REL_RE = replay_cache.CACHE_REL_RE
+CACHE_SEED_MARKER = ".seeded"
+# The kept copy on this machine: one directory per pod (its lines and its
+# saved answers), and the store, whose names are unique across pods.
+KEEP_PODS_DIR = "pods"
+KEEP_LOGS_DIR = "logs"
+KEEP_CACHE_DIR = "cache"
+POD_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$")
+DEFAULT_PUBLISH_INTERVAL_SECONDS = 300.0
+PUBLISH_THREAD_NAME = "replay-cache-publish"
+# A file being written: the store's, and the collector's own kept copies.
+TMP_SUFFIX = ".tmp"
+# Stands for TMP_SUFFIX in the in-pod scripts' text, filled in where they are defined.
+TMP_SUFFIX_PLACEHOLDER = "__TMP_SUFFIX__"
+SEED_TAR_NAME = "seed.tar"
+REPORT_DIR = "report"
 
 # The chart closes a segment 30 s after its first line
 # (REPLAY_LOG_SEGMENT_SECONDS), so at this interval a line is in the bucket
@@ -201,7 +251,7 @@ entries = [e for e in sys.stdin.buffer.read().decode().split("\0") if e]
 emptied = 0
 for entry in entries:
     size, _, rel = entry.partition("\t")
-    if not rel or rel.endswith(".open") or rel.endswith(".tmp"):
+    if not rel or rel.endswith(".open") or rel.endswith("__TMP_SUFFIX__"):
         continue
     full = os.path.realpath(os.path.join(root, rel))
     if not full.startswith(root + os.sep):
@@ -214,7 +264,81 @@ for entry in entries:
     except (OSError, ValueError):
         pass
 print(emptied)
+""".replace(TMP_SUFFIX_PLACEHOLDER, TMP_SUFFIX)
+
+
+# `python3 -c <script> <data dir> <cache subdir> <rel regex>`: prints
+# [[relative path, size], ...] for every saved-answer file, empty ones too (a
+# variant is an empty file), skipping temporary files.
+CACHE_LIST_SCRIPT = r"""
+import json, os, re, sys
+root, sub, rel_re = sys.argv[1], sys.argv[2], re.compile(sys.argv[3])
+base = os.path.join(root, sub)
+out = []
+for dirpath, dirnames, names in os.walk(base):
+    dirnames[:] = [d for d in dirnames if not os.path.islink(os.path.join(dirpath, d))]
+    for name in names:
+        full = os.path.join(dirpath, name)
+        rel = os.path.relpath(full, base).replace(os.sep, "/")
+        if not rel_re.match(rel):
+            continue
+        try:
+            st = os.lstat(full)
+        except OSError:
+            continue
+        if (st.st_mode & 0o170000) == 0o100000:
+            out.append([sub + "/" + rel, st.st_size])
+print(json.dumps(out))
 """
+
+# `python3 -c <script> <data dir> <cache subdir> <marker>`: prints 1 when the
+# cache has been seeded (the marker is there), else 0.
+SEEDED_SCRIPT = r"""
+import os, sys
+print(1 if os.path.isfile(os.path.join(sys.argv[1], sys.argv[2], sys.argv[3])) else 0)
+"""
+
+# `python3 -c <script> <data dir> <cache subdir> <marker> <rel regex>`, a tar
+# stream on stdin: writes each regular member whose name fits the cache layout
+# into the cache directory (atomically, so the proxy never reads half a file),
+# then the marker, which tells the proxy to rebuild its miss index; prints how
+# many were written. Any other member is skipped.
+SEED_SCRIPT = r"""
+import os, re, sys, tarfile
+root, sub, marker, rel_re = sys.argv[1], sys.argv[2], sys.argv[3], re.compile(sys.argv[4])
+base = os.path.join(root, sub)
+written = 0
+with tarfile.open(fileobj=sys.stdin.buffer, mode="r|") as tar:
+    for member in tar:
+        if not member.isfile() or not rel_re.match(member.name):
+            continue
+        handle = tar.extractfile(member)
+        if handle is None:
+            continue
+        path = os.path.join(base, member.name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".seed.tmp"
+        with open(tmp, "wb") as out:
+            out.write(handle.read())
+        os.replace(tmp, path)
+        written += 1
+mark = os.path.join(base, marker)
+with open(mark + ".tmp", "w") as out:
+    out.write(str(written))
+os.replace(mark + ".tmp", mark)
+print(written)
+"""
+
+
+def _copy_atomically(src: str, target: str) -> None:
+    """Copy so a reader (the publisher's thread) never sees half a file: a temporary name, then a rename."""
+    tmp = f"{target}.{os.getpid()}.{threading.get_ident()}{TMP_SUFFIX}"
+    try:
+        shutil.copyfile(src, tmp)
+        os.replace(tmp, target)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 def mask(text: str) -> str:
@@ -265,17 +389,23 @@ Runner = Callable[..., subprocess.CompletedProcess]
 
 def default_runner(cmd: Sequence[str], input: Optional[bytes] = None,
                    remaining: Callable[[], float] = lambda: float("inf"),
-                   env: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess:
+                   env: Optional[Dict[str, str]] = None,
+                   stdin_path: Optional[str] = None) -> subprocess.CompletedProcess:
     """Run `cmd`, killing it once `remaining()` reaches 0.
 
     `remaining` is asked again every SLEEP_SLICE_SECONDS rather than once, so a
     SIGTERM that brings the collector's deadline forward also cuts a command
-    already running.
+    already running. `stdin_path` feeds a file instead of `input`, for a stream
+    too large to hold in memory (a seeded cache).
     """
     merged = dict(os.environ)
     merged.update(env or {})
-    proc = subprocess.Popen(list(cmd), stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=merged)
+    if stdin_path is not None:
+        with open(stdin_path, "rb") as stdin:
+            proc = subprocess.Popen(list(cmd), stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=merged)
+    else:
+        proc = subprocess.Popen(list(cmd), stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=merged)
     pending = input
     while True:
         left = remaining()
@@ -299,6 +429,8 @@ class Totals:
     uploaded_files: int = 0
     uploaded_bytes: int = 0
     emptied: int = 0
+    kept_cache: int = 0
+    seeded: int = 0
     errors: Dict[str, int] = field(default_factory=dict)
 
     def error(self, kind: str) -> int:
@@ -311,7 +443,10 @@ class Collector:
     def __init__(
         self, *, namespace: str, selector: str, container: str, dest: str, staging: str,
         context: str = "", data_dir: str = DEFAULT_DATA_DIR, runner: Runner = default_runner,
-        out=None, clock: Callable[[], float] = time.monotonic,
+        out=None, clock: Callable[[], float] = time.monotonic, mode: str = MODE_SHADOW,
+        keep_dir: str = "", cache_subdir: str = DEFAULT_CACHE_SUBDIR, seed_dir: str = "",
+        publisher=None, publish_interval: float = DEFAULT_PUBLISH_INTERVAL_SECONDS,
+        lane_report: Optional[Callable[[str], Optional[str]]] = None,
     ):
         self.kubectl = ["kubectl"] + (["--context", context] if context else []) + ["-n", namespace]
         self.selector = selector
@@ -326,6 +461,22 @@ class Collector:
         self.totals = Totals()
         # Set when the last pass begins; every command after it is cut to fit.
         self.deadline: Optional[float] = None
+        self.mode = mode
+        self.keep_dir = keep_dir
+        self.cache_subdir = cache_subdir
+        self.seed_dir = seed_dir
+        self.seed_tar: Optional[str] = None
+        # (pod, path in the pod) of every saved answer copied out already.
+        self.kept_cache: Set[Tuple[str, str]] = set()
+        self.publisher = publisher
+        self.publish_interval = publish_interval
+        self.last_publish: Optional[float] = None
+        # Ordinary publishes run beside collection, so emptying the pods never
+        # waits on one; the last pass waits for any still running, then publishes.
+        self.publish_in_background = True
+        self.publish_thread: Optional[threading.Thread] = None
+        # Writes the lane's report into a directory and returns its summary.
+        self.lane_report = lane_report
 
     # --- plumbing ---------------------------------------------------------
 
@@ -355,14 +506,16 @@ class Collector:
             self.emit({"event": "error", "kind": kind, **detail})
 
     def run(self, kind: str, cmd: Sequence[str], default_timeout: float, input: Optional[bytes] = None,
-            env: Optional[Dict[str, str]] = None) -> Optional[subprocess.CompletedProcess]:
+            env: Optional[Dict[str, str]] = None, stdin_path: Optional[str] = None) -> Optional[subprocess.CompletedProcess]:
         """Run one command; None (and an error counted and printed by class) when it fails."""
         started = self.clock()
         if self._remaining(started, default_timeout) <= 0:
             self.fail(f"{kind}_deadline")
             return None
+        extra = {"stdin_path": stdin_path} if stdin_path is not None else {}
         try:
-            proc = self.runner(cmd, input=input, remaining=lambda: self._remaining(started, default_timeout), env=env)
+            proc = self.runner(cmd, input=input, remaining=lambda: self._remaining(started, default_timeout), env=env,
+                               **extra)
         except subprocess.TimeoutExpired:
             self.fail(f"{kind}_timeout")
             return None
@@ -375,10 +528,11 @@ class Collector:
         return proc
 
     def exec_in(self, kind: str, pod: str, script: str, args: Sequence[str],
-                stdin: Optional[bytes] = None) -> Optional[subprocess.CompletedProcess]:
-        cmd = self.kubectl + ["exec"] + (["-i"] if stdin is not None else []) + [
+                stdin: Optional[bytes] = None, stdin_path: Optional[str] = None) -> Optional[subprocess.CompletedProcess]:
+        piped = stdin is not None or stdin_path is not None
+        cmd = self.kubectl + ["exec"] + (["-i"] if piped else []) + [
             pod, "-c", self.container, "--", "python3", "-c", script, *args]
-        return self.run(kind, cmd, KUBECTL_TIMEOUT_SECONDS, input=stdin)
+        return self.run(kind, cmd, KUBECTL_TIMEOUT_SECONDS, input=stdin, stdin_path=stdin_path)
 
     # --- steps ------------------------------------------------------------
 
@@ -416,11 +570,14 @@ class Collector:
             self.fail("list_files_unsafe_name")
         return sorted(safe)
 
-    def fetch(self, pod: str, batch: Sequence[Tuple[str, int]], root: str) -> Dict[str, int]:
+    def fetch(self, pod: str, batch: Sequence[Tuple[str, int]], root: str,
+              safe: Callable[[str], bool] = lambda name: bool(SAFE_NAME.match(name)),
+              keep_empty: bool = False) -> Dict[str, int]:
         """Copy `batch` out of the pod into `root`; returns {object name: bytes written}.
 
         A member the stream cut short is not written: tarfile raises reading
-        it, and only members read whole reach the disk.
+        it, and only members read whole reach the disk. `keep_empty` writes an
+        empty member too (a saved answer's variant is an empty file).
         """
         wanted = {rel for rel, _ in batch}
         proc = self.exec_in("fetch", pod, TAR_SCRIPT, [self.data_dir], stdin=NUL.join(r.encode() for r in sorted(wanted)))
@@ -430,13 +587,13 @@ class Collector:
         try:
             with tarfile.open(fileobj=io.BytesIO(proc.stdout), mode="r|") as tar:
                 for member in tar:
-                    if member.name not in wanted or not member.isfile() or not SAFE_NAME.match(member.name):
+                    if member.name not in wanted or not member.isfile() or not safe(member.name):
                         continue
                     handle = tar.extractfile(member)
                     data = handle.read() if handle is not None else b""
                     if member.name.endswith(OPEN_SUFFIX):
                         data = whole_lines(data)
-                    if not data:
+                    if not data and not keep_empty:
                         continue
                     name = object_name(member.name)
                     path = os.path.join(root, name)
@@ -482,6 +639,176 @@ class Collector:
             except ValueError:
                 self.fail("empty_parse")
 
+    # --- record and replay modes -----------------------------------------
+
+    def keep(self, pod: str, root: str, written: Dict[str, int]) -> None:
+        """Copy fetched lines (per pod) and stored requests into the kept copy on this machine."""
+        if not self.keep_dir or not POD_NAME_RE.match(pod):
+            return
+        for name in written:
+            if name.startswith(LOGS_DIR + "/"):
+                target = os.path.join(self.keep_dir, KEEP_PODS_DIR, pod, name)
+            else:
+                target = os.path.join(self.keep_dir, name)
+            try:
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                _copy_atomically(os.path.join(root, name), target)
+            except OSError:
+                self.fail("keep_write")
+
+    def cache_safe(self, name: str) -> bool:
+        prefix = self.cache_subdir + "/"
+        return name.startswith(prefix) and bool(CACHE_REL_RE.match(name[len(prefix):]))
+
+    def collect_cache(self, pod: str, budget: int, final: bool) -> int:
+        """Record mode: copy new saved answers out of the pod into the kept copy, then empty them there.
+
+        Returns the bytes copied. A file is emptied only once it is on this
+        machine, and an emptied file keeps its name, so the proxy still sees
+        its key as written and never saves a second answer under it.
+        """
+        if not POD_NAME_RE.match(pod):
+            self.fail("cache_pod_name")
+            return 0
+        proc = self.exec_in("list_cache", pod, CACHE_LIST_SCRIPT, [self.data_dir, self.cache_subdir, CACHE_REL_RE.pattern])
+        if proc is None:
+            return 0
+        try:
+            listed = [(str(rel), int(size)) for rel, size in json.loads(proc.stdout)]
+        except (ValueError, TypeError):
+            self.fail("list_cache_parse")
+            return 0
+        files = sorted((rel, size) for rel, size in listed if self.cache_safe(rel))
+        if len(files) != len(listed):
+            self.fail("list_cache_unsafe_name")
+        new = [(rel, size) for rel, size in files if (pod, rel) not in self.kept_cache]
+        emptiable = [(rel, size) for rel, size in files if (pod, rel) in self.kept_cache and size > 0]
+        copied = 0
+        for batch in batches(new, BATCH_MAX_BYTES):
+            if copied >= budget or self.cut_short(final):
+                break
+            copied += sum(size for _, size in batch)
+            root = tempfile.mkdtemp(dir=self.staging)
+            try:
+                written = self.fetch(pod, batch, root, safe=self.cache_safe, keep_empty=True)
+                for rel, _ in batch:
+                    if rel not in written:
+                        continue
+                    target = os.path.join(self.keep_dir, KEEP_PODS_DIR, pod, KEEP_CACHE_DIR,
+                                          rel[len(self.cache_subdir) + 1:])
+                    try:
+                        os.makedirs(os.path.dirname(target), exist_ok=True)
+                        _copy_atomically(os.path.join(root, rel), target)
+                    except OSError:
+                        self.fail("keep_write")
+                        continue
+                    self.kept_cache.add((pod, rel))
+                    self.totals.kept_cache += 1
+                    if written[rel] > 0:
+                        emptiable.append((rel, written[rel]))
+            finally:
+                shutil.rmtree(root, ignore_errors=True)
+        self.empty(pod, emptiable)
+        return copied
+
+    def _seed_tar(self) -> Optional[str]:
+        """The seed directory as one tar file in staging, built once: only files in the cache layout."""
+        if self.seed_tar is not None or not self.seed_dir:
+            return self.seed_tar
+        path = os.path.join(self.staging, SEED_TAR_NAME)
+        count = 0
+        try:
+            with tarfile.open(path, "w") as tar:
+                for dirpath, _, names in os.walk(self.seed_dir):
+                    for name in sorted(names):
+                        full = os.path.join(dirpath, name)
+                        rel = os.path.relpath(full, self.seed_dir).replace(os.sep, "/")
+                        if CACHE_REL_RE.match(rel) and os.path.isfile(full) and not os.path.islink(full):
+                            tar.add(full, arcname=rel, recursive=False)
+                            count += 1
+        except OSError:
+            self.fail("seed_tar")
+            return None
+        self.seed_tar = path
+        self.emit({"event": "seed_ready", "files": count})
+        return path
+
+    def seeded(self, pod: str) -> bool:
+        proc = self.exec_in("seeded", pod, SEEDED_SCRIPT, [self.data_dir, self.cache_subdir, CACHE_SEED_MARKER])
+        return proc is not None and proc.stdout.strip() == b"1"
+
+    def seed(self, pod: str) -> bool:
+        """Replay mode: write the seed into the pod's cache, then its marker. True when the pod took it."""
+        tar_path = self._seed_tar()
+        if tar_path is None:
+            return False
+        proc = self.exec_in("seed", pod, SEED_SCRIPT,
+                            [self.data_dir, self.cache_subdir, CACHE_SEED_MARKER, CACHE_REL_RE.pattern],
+                            stdin_path=tar_path)
+        if proc is None:
+            return False
+        self.totals.seeded += 1
+        return True
+
+    def seed_all(self) -> Tuple[int, int]:
+        """Seed every proxy pod now; (pods, pods that took it)."""
+        pods = self.pods()
+        return len(pods), sum(1 for pod in pods if self.seed(pod))
+
+    def _publish(self, final: bool) -> None:
+        try:
+            self.publisher.publish(final=final)  # type: ignore[union-attr]
+        except Exception as exc:  # a failed publish is retried by the next one
+            self.fail("publish_crashed", reason=type(exc).__name__)
+
+    def maybe_publish(self, final: bool) -> None:
+        """Record mode: publish every publish_interval seconds, beside collection, and always in the last pass."""
+        if self.publisher is None:
+            return
+        running = self.publish_thread is not None and self.publish_thread.is_alive()
+        if final:
+            if running:
+                self.publish_thread.join(max(0.0, self.deadline - self.clock()) if self.deadline else None)  # type: ignore[union-attr]
+                if self.publish_thread.is_alive():  # type: ignore[union-attr]
+                    self.fail("publish_overran")
+                    return
+            self.last_publish = self.clock()
+            self._publish(final=True)
+            return
+        now = self.clock()
+        if running or (self.last_publish is not None and now - self.last_publish < self.publish_interval):
+            return
+        self.last_publish = now
+        if not self.publish_in_background:
+            self._publish(final=False)
+            return
+        self.publish_thread = threading.Thread(target=self._publish, args=(False,), name=PUBLISH_THREAD_NAME,
+                                               daemon=True)
+        self.publish_thread.start()
+
+    def write_lane_report(self) -> None:
+        """Replay mode's last step: the lane's report, into the job's prefix under report/."""
+        if self.lane_report is None:
+            return
+        root = tempfile.mkdtemp(dir=self.staging)
+        try:
+            try:
+                summary = self.lane_report(root)
+            except Exception as exc:  # the report is never the eval's problem
+                self.fail("lane_report_crashed", reason=type(exc).__name__)
+                return
+            names = sorted(n for n in os.listdir(root) if os.path.isfile(os.path.join(root, n)))
+            if names:
+                paths = "\n".join(os.path.join(root, n) for n in names).encode() + NEWLINE
+                cmd = ["gcloud", "storage", "cp", "--no-clobber", "-I", f"{self.dest}/{REPORT_DIR}/"]
+                uploaded = self.run("report", cmd, GCLOUD_TIMEOUT_SECONDS, input=paths, env=GCLOUD_ENV) is not None
+                self.emit({"event": "lane_report", "uploaded": uploaded, "files": len(names)})
+            if summary:
+                for line in summary.splitlines():
+                    self.emit({"event": "lane_summary", "line": line})
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
     def write_manifest(self, job: Dict[str, str], started: float) -> bool:
         """Upload `job-<start ms>.json`, which says this build ran with the proxy even if it logged nothing."""
         root = tempfile.mkdtemp(dir=self.staging)
@@ -503,6 +830,8 @@ class Collector:
             if self.cut_short(final):
                 break
             stats["pods"] += 1
+            if self.mode == MODE_REPLAY and self.seed_dir and not self.seeded(pod):
+                self.seed(pod)
             files = self.list_files(pod, with_open=final)
             stats["listed"] += len(files)
             new = [(rel, size) for rel, size in files if object_name(rel) not in self.uploaded]
@@ -517,6 +846,7 @@ class Collector:
                 root = tempfile.mkdtemp(dir=self.staging)
                 try:
                     written = self.fetch(pod, batch, root)
+                    self.keep(pod, root, written)
                     uploaded = set(self.upload(root, written))
                     for name in uploaded:
                         self.uploaded.add(name)
@@ -529,7 +859,10 @@ class Collector:
                 finally:
                     shutil.rmtree(root, ignore_errors=True)
             self.empty(pod, emptiable)
+            if self.mode == MODE_RECORD and self.keep_dir and budget > 0 and not self.cut_short(final):
+                budget -= self.collect_cache(pod, budget, final)
         self.totals.passes += 1
+        self.maybe_publish(final)
         return stats
 
     def report(self, stats: Dict[str, int], final: bool) -> None:
@@ -538,6 +871,8 @@ class Collector:
             "total_uploaded_files": self.totals.uploaded_files,
             "total_uploaded_bytes": self.totals.uploaded_bytes,
             "total_emptied": self.totals.emptied,
+            "total_kept_cache": self.totals.kept_cache,
+            "total_seeded": self.totals.seeded,
             "errors": self.totals.errors,
         })
 
@@ -570,6 +905,8 @@ def run_loop(collector: Collector, interval: float, final_deadline: float, paren
             if not manifest_done:
                 manifest_done = bool(manifest())  # type: ignore[misc]
             collector.report(collector.collect_pass(final=final), final=final)
+            if final:
+                collector.write_lane_report()
         except Exception as exc:  # one bad pass is not the end of collection
             collector.fail("pass_crashed", reason=type(exc).__name__)
 
@@ -607,7 +944,58 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--interval", type=float, default=DEFAULT_INTERVAL_SECONDS)
     parser.add_argument("--final-deadline", type=float, default=DEFAULT_FINAL_DEADLINE_SECONDS)
     parser.add_argument("--parent-pid", type=int, default=0, help="stop when this process is gone")
-    return parser.parse_args(argv)
+    parser.add_argument("--mode", choices=MODES, default=MODE_SHADOW, help="the proxy's REPLAY_MODE")
+    parser.add_argument("--keep-dir", default="", help="record and replay: keep lines, stored text and answers here")
+    parser.add_argument("--cache-subdir", default=DEFAULT_CACHE_SUBDIR, help="the cache directory, in the data volume")
+    parser.add_argument("--verdicts-dir", default="", help="where bench-gate writes case-<name>.json")
+    parser.add_argument("--publish-bucket", default="", help="record: the shared replay cache bucket")
+    parser.add_argument("--publish-interval", type=float, default=DEFAULT_PUBLISH_INTERVAL_SECONDS)
+    parser.add_argument("--job-name", default="", help="record: the Prow job name, written into each record")
+    parser.add_argument("--eval-mode-next", default="", help="record and replay: EVAL_MODE_NEXT (1 is next mode)")
+    parser.add_argument("--forge", default="", help="record and replay: EVAL_FORGE (empty is github)")
+    parser.add_argument("--seed-dir", default="", help="replay: the cache fetch_cache.py filled, seeded into each pod")
+    parser.add_argument("--seed-once", action="store_true", help="replay: seed every pod, then exit")
+    parser.add_argument("--nightly-runs", default="", help="replay: fetch_cache.py's runs per recording build")
+    args = parser.parse_args(argv)
+    if not CACHE_SUBDIR_RE.match(args.cache_subdir) or args.cache_subdir in (LOGS_DIR, STORE_DIR):
+        parser.error("--cache-subdir must be one plain directory name other than logs and store")
+    if args.mode != MODE_SHADOW and not args.keep_dir:
+        parser.error(f"--mode {args.mode} needs --keep-dir")
+    if args.mode == MODE_RECORD and not (args.publish_bucket and args.verdicts_dir):
+        parser.error("--mode record needs --publish-bucket and --verdicts-dir")
+    if args.mode == MODE_REPLAY and not args.seed_dir:
+        parser.error("--mode replay needs --seed-dir")
+    if args.seed_once and args.mode != MODE_REPLAY:
+        parser.error("--seed-once is for --mode replay")
+    return args
+
+
+def make_publisher(args: argparse.Namespace, collector: "Collector"):
+    """Record mode's publisher (publish_cache.py), uploading through the collector's bounded commands."""
+    if args.mode != MODE_RECORD:
+        return None
+    import publish_cache  # only record mode needs it, and its imports
+
+    if not publish_cache.valid_bucket_and_build(args.publish_bucket, args.build):
+        collector.fail("publish_bad_arguments")
+        return None
+    return publish_cache.Publisher(keep_dir=args.keep_dir, verdicts_dir=args.verdicts_dir,
+                                   bucket=args.publish_bucket, build=args.build, run=collector.run,
+                                   env=GCLOUD_ENV, emit=collector.emit,
+                                   job=publish_cache.job_identity(args.job_name, args.eval_mode_next, args.forge))
+
+
+def make_lane_report(args: argparse.Namespace) -> Optional[Callable[[str], Optional[str]]]:
+    """Replay mode's last step (lane_report.py), when the verdicts are known to it."""
+    if args.mode != MODE_REPLAY or not args.verdicts_dir:
+        return None
+
+    def report(out_dir: str) -> Optional[str]:
+        import lane_report
+
+        return lane_report.write_report(args.keep_dir, args.verdicts_dir, args.nightly_runs, out_dir)
+
+    return report
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -628,10 +1016,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     signal.signal(signal.SIGTERM, on_term)
     signal.signal(signal.SIGINT, on_term)
+    # --seed-once answers a question (did every pod take the cache?), so it
+    # exits 1 on anything but yes; everything else never fails the eval.
+    seed_once = "--seed-once" in (sys.argv[1:] if argv is None else argv)
+    status = 1 if seed_once else 0
     try:
         args = parse_args(argv)
     except SystemExit:  # argparse has said what was wrong; still never the eval's problem
-        return 0
+        return status
     final_deadline = args.final_deadline
     started = time.time()
     day = time.strftime(DATE_FORMAT, time.gmtime(started))
@@ -640,7 +1032,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         staging = tempfile.mkdtemp(prefix=STAGING_PREFIX)
         collector = Collector(namespace=args.namespace, selector=args.selector, container=args.container,
                               dest=job_prefix(args.bucket, args.kind, day, args.build), staging=staging,
-                              context=args.context, data_dir=args.data_dir)
+                              context=args.context, data_dir=args.data_dir, mode=args.mode,
+                              keep_dir=args.keep_dir, cache_subdir=args.cache_subdir, seed_dir=args.seed_dir,
+                              publish_interval=args.publish_interval, lane_report=make_lane_report(args))
+        collector.publisher = make_publisher(args, collector)
+        if args.seed_once:
+            pods, took = collector.seed_all()
+            collector.emit({"event": "seed_once", "pods": pods, "seeded": took, "errors": collector.totals.errors})
+            status = 0 if pods and took == pods else 1
+            return status
         if stopping["flag"]:
             start_last_pass()
         collector.emit({"event": "start", "kind": args.kind, "day": day, "interval": args.interval})
@@ -657,7 +1057,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             collector.emit({"event": "stop", "uploaded_files": collector.totals.uploaded_files,
                             "uploaded_bytes": collector.totals.uploaded_bytes,
                             "emptied": collector.totals.emptied, "errors": collector.totals.errors})
-    return 0
+    return status
 
 
 if __name__ == "__main__":
