@@ -548,8 +548,10 @@ writable entry by the shared parser; a key no write path reads is read-only by c
 minter policy does read it, for a `contents: read` grant the broker's own clone presents).
 The document may carry a `declared` list beside `findings` — a finding's four identity fields plus
 the `repo`, `path` and `excerpt` of the declaration — validated for scope, a non-overlapping
-identity, and a `check` in the stream's `declarable` set (its posture checks, held in `AUDITS`
-beside the roster; a fault check or a stream with no declared-intent step is rejected), and never
+identity, a `check` in the stream's `declarable` set (its posture checks, held in `AUDITS`
+beside the roster; a fault check or a stream with no declared-intent step is rejected), and an
+`object` of a kind the check files where the check fixes one (`DECLARABLE_OBJECT_KINDS`: the cost
+checks' kinds and `NodePool/` for the stockout pool check), and never
 given an id, so it enters no delta and no pull request. The obtainability SOP (§4a) is the pilot;
 the schema and the ledger section it renders to are stated in the skill file, and `finish` reports
 the list's length as `declared`.
@@ -579,7 +581,11 @@ completely (every note under the searched paths arrived and was read) under `sea
 record, and `finish` unions that list into the document and moves each covered finding to
 `declared` before the withhold (#1576, #1577). The join moves `hpa-cannot-scale` only at the
 severity the SOP fixes for its `min == max` shape; the dangling-target fault shares the slug and
-stays a finding. An item may carry `expires`, an ISO 8601 date (`YYYY-MM-DD`, UTC) that is the
+stays a finding. It moves `netpol-missing` only on a `Namespace/` object, and `single-zone-nodepool`
+only when the collector's excerpt opens with `single-zone (` and carries no `at its autoscaling
+ceiling:` clause — the one rule read off the excerpt rather than the identity or the severity,
+because the two arms of that check share both; the prefixes are the collector's own constants,
+pinned by a test. An item may carry `expires`, an ISO 8601 date (`YYYY-MM-DD`, UTC) that is the
 last day it stands: `start` files the date and `finish` holds it to the day the run started, from
 `start`'s record, whatever day the join or a later `remediate` happens to run on, so a lapsed item
 moves nothing, declares no collector candidate and shields no sibling, and the finding
