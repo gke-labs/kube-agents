@@ -427,13 +427,13 @@ reads every project as it did before.
 
 The poster sends one line when the note appears, and again if its verdict
 changes inside the episode. The header names the cause, because the four
-causes have four different remedies and one of them spends money:
+causes call for different things and one of them spends money:
 
 ```text
 ⏳ Smoke gate: pool full — all 30 projects are leased and runs are queuing.
 Consider onboarding a project.
 Last 3h: median wait 24 min against a 15 min limit; p95 157 min against 45.
-2 runs waiting right now, past the 45 min p95 limit.
+2 of 4 waiting runs are past the 45 min p95 limit.
 Runs still pass; /retest makes the queue longer.
 ```
 
@@ -483,10 +483,15 @@ The dashboard dates
 a jam from its own oldest queued run rather than from the episode, for the same
 reason: the episode can have opened days before the backlog being described.
 
-`concurrency cap` (raise it), `runs not starting` (projects were free, so the
-delay is Prow's; the message names the build cluster) and `queue backed up`
-(the job could not read how many projects were in use) carry the same lines
-under a different first one.
+`queue` at the presubmit's cap (runs waited while the presubmit sat at its
+`max_concurrency`; while Deck sees a backlog the message says how many wait
+and the longest wait, otherwise how long runs waited on which days and
+whether the queue was read, and the cap either way; it gives no remedy,
+because the pool is shared and the gap below the cap is the other jobs'
+share), `runs not starting` (projects were free, so the delay is Prow's; the
+message names the build cluster) and `queue backed up` (the job could not
+read how many projects were in use) carry the same lines under a different
+first one.
 
 Unlike the slow note, this one also says when it is over. The window is a
 rolling seven days, so an episode outlives the bad day by up to a week:
@@ -511,8 +516,8 @@ artifact.
 
 This note files no `presubmit-gate` issue, unlike an OUTAGE, lost pods, fixture
 drift and pool drift. A full pool is a capacity fact, not a defect a code change
-closes; its remedies are onboarding and raising the cap, which are planned
-work. Chat, the Brief and the digest carry it, and nothing opens.
+closes; its remedy is onboarding, which is planned work, or a cap the operator
+weighs. Chat, the Brief and the digest carry it, and nothing opens.
 
 The digest carries the median wait every morning whether or not anything is
 wrong (`typical wait`, beside `typical run`), and repeats a one-line version

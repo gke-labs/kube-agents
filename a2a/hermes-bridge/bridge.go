@@ -188,6 +188,11 @@ type Config struct {
 	// KVBucket holds the in-flight registry the sweep reads (default
 	// "runtime-state", the provisioned bucket).
 	KVBucket string
+	// DurablePrecreated binds the intake to the durable the provision Job
+	// created rather than creating it (#4173): the operator sets
+	// BRIDGE_DURABLE_PRECREATED=true beside a grant that denies this
+	// principal the create on that name. Off, the bridge creates it as before.
+	DurablePrecreated bool
 	// ResultChunkSize bounds one result artifact-update's text part so a
 	// large answer never trips the client-side max-message-size gate
 	// (default 256KiB).
@@ -609,6 +614,9 @@ func (b *Bridge) Run(ctx context.Context) error {
 		Subject: fmt.Sprintf("a2a.tasks.%s.*.in", b.cfg.Profile),
 		Durable: "bridge-" + b.cfg.Profile,
 		Session: b.cfg.Profile,
+		// The provision Job creates it on a deployed install; the bind then
+		// waits for the operator rather than creating it.
+		Precreated: b.cfg.DurablePrecreated,
 	}, func(env *lib.Envelope) { b.deliver(ctx, env) })
 	if err != nil {
 		return fmt.Errorf("subscribe: %w", err)

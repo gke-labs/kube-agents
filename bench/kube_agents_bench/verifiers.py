@@ -100,7 +100,7 @@ from kube_agents_bench import (
     worker_trajectory,
 )
 from kube_agents_bench.parsing import DELEGATION_TOOL
-from kube_agents_bench.shell_words import _INTERPRETER_RE, _command_word_index, _shell_argvs
+from kube_agents_bench.shell_words import _INTERPRETER_RE, _command_word_index, _shell_argvs, _without_grep_patterns
 from kube_agents_bench.fleet import (
     ROLE_PATTERN,
     FleetRoleUnresolved,
@@ -2779,6 +2779,22 @@ class WorkerCommandsVerifier(BaseVerifier):
     more. A collapsed chain (a line ending `` + N command(s)``) hides what
     followed, so an exemption refuses it and the first command's own words
     are graded.
+    ``exempt_grep_patterns: true`` is that grep exemption by structure, read
+    before ``exempt_patterns``: the row is split into shell words as
+    ``required_runs`` splits it (:func:`kube_agents_bench.shell_words._without_grep_patterns`),
+    and when it is one ``grep``, ``egrep`` or ``fgrep`` named bare and nothing
+    else (no control operator, no redirect but ``>`` to ``/dev/null``, no
+    comment, no substitution anywhere, not a collapsed chain), only its pattern
+    argument comes off (the first positional word, or each ``-e`` or
+    ``--regexp=`` value ahead of it). The row is then graded as its words joined by
+    spaces, quotes off: the options, the file operands and any text the
+    rendering joined on stay. A row with anything else on it is graded whole.
+    A grep behind a path, a wrapper, a reserved word or a ``cd`` is not one,
+    and a long option with a separate value is read as a flag, so its value is
+    taken as the pattern and the real one is graded. A card log row that joined
+    a second typed line onto a grep is one row to it, so a line that reads the
+    removed word back (``$_``) is read as a file operand, as it was by the
+    regex exemptions this replaces.
     ``required_runs``: each names a script (by basename, or module stem under
     ``-m``), flags and word patterns; some command's shell segment, read as an
     argv, must run it with those flags after it, a word matching each pattern,
@@ -2878,6 +2894,7 @@ class WorkerCommandsVerifier(BaseVerifier):
     required_patterns: list[str] = Field(default_factory=list)
     forbidden_patterns: list[str] = Field(default_factory=list)
     exempt_patterns: list[str] = Field(default_factory=list)
+    exempt_grep_patterns: bool = False
     required_runs: list[WorkerRun] = Field(default_factory=list)
     forbidden_runs: list[WorkerRun] = Field(default_factory=list)
     forbidden_result_patterns: list[str] = Field(default_factory=list)
@@ -2904,6 +2921,8 @@ class WorkerCommandsVerifier(BaseVerifier):
         return self
 
     def _without_exempt_text(self, command: str) -> str:
+        if self.exempt_grep_patterns:
+            command = _without_grep_patterns(command) or command
         for pattern in self.exempt_patterns:
             command = re.sub(pattern, "", command)
         return command
