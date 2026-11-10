@@ -86,7 +86,10 @@ The rules behind the numbers:
 - **Failing Pods.** A few Pods fail on purpose (an image that does not exist, a command that exits
   1), so the audits and the stall watch have real findings. M has 5, as the real-install test did.
   At 20 failing Pods that test measured $69.5 of triage tokens in one hour, so the count stays low.
-- **Machine type.** `e2-medium` (2 vCPU, 4 GB) for every node.
+- **Machine type.** `n1-standard-1` (1 vCPU, 3.75 GB) for every node, at every size, so only the
+  counts change between sizes. The workloads need little CPU, and N1 machines draw on the general
+  CPU quota: 500 vCPU at L fits it, where 500 nodes of a 2-vCPU E2 type would need 1,000 vCPU of
+  the separate, smaller E2 quota.
 
 The sizes live in one file, `bench/scale/fleet-sizes.yaml`, as M's values and the two multipliers.
 The runner reads the size from `SCALE_FLEET_SIZE` (`S`, `M` or `L`, default `M`).
@@ -177,13 +180,14 @@ one night M does not, so the two never share the install or the project:
 S has no scheduled run; it is for a run by hand on a smaller budget.
 
 **Where it runs.** A Prow periodic, beside the eval nightlies, in its own GCP project. The eval pool
-projects cannot hold the fleet: L needs 16 clusters and 1,000 vCPU, and the pool's projects are
+projects cannot hold the fleet: L needs 16 clusters and 500 vCPU, and the pool's projects are
 leased by the eval jobs. The periodic's configuration is in `oss-test-infra`, outside this
 repository; this repository holds the script it runs, `hack/ci-scale-nightly.sh`. Every test
 cluster carries the plan's `cluster_label`, and the runner creates and deletes no cluster without
 it.
 
-**Quota and network.** At L: 16 clusters, 500 nodes, 1,000 vCPU, 500 node IP addresses. Each
+**Quota and network.** At L: 16 clusters, 500 nodes, 500 vCPU of the general CPU quota, 500 node IP
+addresses. Each
 cluster gets its own subnet and small Pod and Service ranges, as Phase 4 did
 (`bench/scale/phase4.yaml`), so the project's default network does not cap the cluster count.
 
@@ -198,6 +202,7 @@ The run writes `scale-verdict.json`. It is red when any check fails:
 | The first-run flow ends | The inventory scan settles and each audit in `FIRST_RUN_AUDITS` has an ended run within 3 hours of the install's start, as `oobe.py` records them.             |
 | The run itself is sound | The fleet reached its size, the churn ran at its rate (within 10 %), and the teardown deleted every test cluster.                                              |
 
+A red run goes to haoxuw, the owner of the `harness-scale` row in `docs/designs/domains.yaml`.
 The last check keeps a broken fixture from reading as a pass or as a regression. Kubernetes keeps an
 event for about an hour, so the runner reads `SandboxChanged` events and the nodes' `OOMKilling`
 lines from Cloud Logging over the whole run, not from the API at the end. Restarts and OOMKilled
@@ -213,25 +218,38 @@ does, and prints a one-line summary of each to the job's log:
   window's real length. Each record's key gains the fleet size and the window, beside its commit,
   mode, factor, level, operation and run. `bench/scale/harness-limits.json` stays the file a person
   merges chosen runs into.
-- **The cost record:** `scale-cost.json`. Node-hours and cluster-hours from each cluster's create
-  and delete times; model tokens by model and kind (input, cached input, output) from LiteLLM's
-  counters for each window; and the cost of each, from a price table in the repository with its
-  source and date. This is the run's own estimate.
+- **The cost record:** `scale-cost.json`, computed by the run's own code. The run reads no billing
+  data: the project has no billing export, so the code measures the inputs and prices them.
 
-The billed cost is the check on that estimate. Every test cluster carries two GCP resource labels,
-`kube-agents-scale-run=<run id>` and `kube-agents-scale-size=<S, M or L>`, which reach its nodes and
-its billing lines. The project's billing export to BigQuery then gives the billed cost of each run by
-its labels, a day later. A small query in the repository compares it with the run's estimate.
+  | Input                      | Measured from                                                                                | Priced from                                      |
+  | -------------------------- | -------------------------------------------------------------------------------------------- | ------------------------------------------------ |
+  | Node-hours                 | Each node's create and delete time, from the Compute Engine instances the run's clusters own | The machine type's on-demand price in the region |
+  | Cluster-hours              | Each cluster's create and delete time, from its GKE operations                               | The GKE cluster fee                              |
+  | Disk-hours                 | Each node's boot disk size and lifetime                                                      | The disk type's price                            |
+  | Model tokens               | LiteLLM's token counters for each window, by model and kind (input, cached input, output)    | The model's price per token                      |
+  | Model spend, a cross-check | LiteLLM's own spend counter for each window (`litellm_spend_metric`)                         | LiteLLM's price map                              |
+
+  The infrastructure prices come from the Cloud Billing Catalog API, which publishes list prices
+  by SKU and needs no billing account access; the run stores the prices it used and their date in
+  the record. The model prices are a table in the repository, with its source and date. The record
+  gives each input, its price and its cost, and their sum for the run, so a reader can check the
+  arithmetic. When the run's token cost and LiteLLM's spend counter differ by more than 10 %, the
+  record says so.
+
+Every test cluster also carries two GCP resource labels, `kube-agents-scale-run=<run id>` and
+`kube-agents-scale-size=<S, M or L>`. The run finds its own instances, disks and clusters by them,
+and they keep any later billing data attributable to a run.
 
 ## Cost
 
-List prices, to check against the billing export after the first runs: an on-demand `e2-medium`
-node is about $0.034 an hour in us-central1, and a GKE cluster fee is $0.10 an hour.
+List prices, which the cost record replaces with the Catalog API's figures from the first run: an
+on-demand `n1-standard-1` node is about $0.048 an hour in us-central1, and a GKE cluster fee is $0.10
+an hour.
 
 | Size | Runs a month | Nodes | Hours a run | Node cost a run | Cluster fees a run | Infrastructure a month |
 | ---- | ------------ | ----- | ----------- | --------------- | ------------------ | ---------------------- |
-| M    | about 26     | 250   | about 3.5   | ≈ $30           | ≈ $3               | ≈ $860                 |
-| L    | about 4.3    | 500   | about 4     | ≈ $68           | ≈ $6               | ≈ $320                 |
+| M    | about 26     | 250   | about 3.5   | ≈ $42           | ≈ $3               | ≈ $1,150               |
+| L    | about 4.3    | 500   | about 4     | ≈ $95           | ≈ $6               | ≈ $440                 |
 
 Model tokens come on top. At 40 clusters the real-install test measured $111 of tokens in its first
 5 hours; M has 8 clusters and a 2-hour run, so its tokens should cost much less. The cost record
@@ -242,7 +260,7 @@ gives the real figure for every run.
 Each item is its own pull request after this design merges.
 
 1. **Sizes and the fleet builder.** `bench/scale/fleet-sizes.yaml`; the runner creates each
-   cluster with one node pool of the right node count and the two resource labels; `fixtures.py`
+   cluster with one node pool of `n1-standard-1` nodes and the two resource labels; `fixtures.py`
    gains the HTTP Deployments with their Services, the CronJob clients with spread start minutes,
    and the failing Pods. One live M run is the evidence.
 2. **The run plan and the verdict.** `bench/scale/nightly.yaml` (the five steps and the two
@@ -262,7 +280,5 @@ Each item is its own pull request after this design merges.
 ## Open questions
 
 - **The Prow job's time limit.** A run takes 3 to 4 hours, longer than most eval nightlies.
-- **Who owns a red run.** `docs/designs/domains.yaml` has no row for fleet-scale harness behaviour;
-  one is needed, with an owner and a backup.
 - **Typical runs.** The install is reset each night, so every audit run is a first run, which reads
   every cluster as new. A weekly run without the reset would measure typical runs.
