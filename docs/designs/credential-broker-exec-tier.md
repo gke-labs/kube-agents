@@ -292,14 +292,19 @@ shim always takes the fallback and nothing reports it.
   condition. Once callers are given the tier's URL (§9), the shell sandbox also restarts when the
   tier turns on, and needs room on the node pool too.
 - Ephemeral storage per replica: a state emptyDir capped at 1 GiB, `/tmp` at 256 MiB, and a 2 GiB
-  limit, not the broker's 5 GiB, 2 GiB and 8 GiB; the request follows the limit. A command's
-  output is held in memory and its `TMPDIR` is on the state volume, so the state volume holds the
-  command HOME: gcloud's config, kubeconfigs and kubectl's discovery cache (about 0.3 MiB a
-  cluster, 1.9 MiB with the OpenAPI schemas). gcloud's per-command log files would grow it without
-  bound: at the 8-slot cap they measured about 386 KiB a command, some 3.3 GiB a day, kept 30
-  days. So the exec role runs its commands with gcloud file logging off
-  (`CLOUDSDK_CORE_DISABLE_FILE_LOGGING`); errors still reach the caller on stderr and in the audit
-  line. Decided (#4536). The stateful broker keeps file logging and its figures (#5417).
+  limit, not the broker's 5 GiB, 2 GiB and 8 GiB; the request follows the limit, and an override
+  of the broker's ephemeral storage does not reach the tier. A command's output is held in memory,
+  so the state volume holds the command HOME (gcloud's config and kubectl's discovery cache, about
+  0.3 MiB a cluster, 1.9 MiB with the OpenAPI schemas), the kubeconfigs and the commands' `TMPDIR`;
+  `/tmp` holds only Envoy's rendered config. gcloud's per-command log files would grow the state
+  volume without bound: at the 8-slot cap they measured about 386 KiB a command, some 3.3 GiB a
+  day at about 6 commands a minute, kept 30 days [measured, #4536]. So the exec role runs its
+  commands with gcloud file logging off (`CLOUDSDK_CORE_DISABLE_FILE_LOGGING`); the caller still
+  gets gcloud's stderr and the audit line records the exit code, but gcloud's own debug log is no
+  longer kept on the pod. A sweep reaches every cluster on every replica, and nothing else frees
+  kubectl's cache, so the resource watermark gate's soft mark reclaims it on an exec pod: the
+  cache is renamed and removed, and the next command rebuilds it. Decided (#4536). The stateful
+  broker keeps gcloud's default file logging and its own figures.
 - A NetworkPolicy target for the exec tier: ingress on 8765 from the sandbox, from session pods
   only under the cluster-view flag (the condition the stateful broker has today), and the metrics
   port from GMP. The egress rules that select the broker's pod labels also need the exec tier as a

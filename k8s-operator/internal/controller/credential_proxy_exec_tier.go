@@ -43,12 +43,14 @@ import (
 // 2Gi /tmp, 8Gi limit). An exec command's output is held in memory, its
 // TMPDIR is on the state volume, and its gcloud writes no log files
 // (GCLOUD_FILE_LOGGING_OFF_ENV in credential_proxy.py), so the state volume
-// holds only the command HOME: gcloud's config, kubeconfigs, and kubectl's
-// discovery cache (about 0.3MiB a cluster, 1.9MiB with the OpenAPI schemas).
+// holds the command HOME (gcloud's config, kubectl's discovery cache: about
+// 0.3MiB a cluster, 1.9MiB with the OpenAPI schemas), the kubeconfigs and
+// the commands' TMPDIR.
 // Measured at the 8-slot cap with file logging on, gcloud's logs alone grew
 // about 386KiB a command, some 3.3GiB a day (#4536); with it off the volume
-// stays at the HOME's size. /tmp is unused. The limit holds both caps and
-// leaves the rest for the writable layer and the logs. Fixed, as cpu and
+// stays at the HOME's size. /tmp holds only Envoy's rendered config. The
+// limit holds both caps and leaves the rest for the writable layer and the
+// logs. Fixed, as cpu and
 // memory are: an override of the broker's ephemeral-storage does not reach
 // the tier.
 const (
@@ -258,7 +260,9 @@ func credentialProxyExecTierLimitBytes(size string) string {
 //     admits, not for the broker's bounded drain;
 //   - CREDENTIAL_PROXY_ROLE=exec, and the replica count mounted from the
 //     ConfigMap;
-//   - cpu and memory fixed at the tier's figures (other keys as the broker's);
+//   - cpu, memory and ephemeral-storage fixed at the tier's figures, its own
+//     state and /tmp emptyDir caps (credentialProxyExecTierStateSizeLimit),
+//     and the watermark gate's two limits set to those caps;
 //   - no Secret: no Secret-backed volume (forge credentials and CA bundles
 //     included) and no env read from one (chat, Teams and plugin credentials),
 //     dropped by source rather than by name so a Secret the broker gains later

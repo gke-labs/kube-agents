@@ -18,7 +18,6 @@ package controller
 
 import (
 	"context"
-	"k8s.io/apimachinery/pkg/api/equality"
 	"reflect"
 	"strconv"
 	"strings"
@@ -28,6 +27,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -783,5 +783,61 @@ func TestTheExecTierCarriesItsOwnEphemeralStorage(t *testing.T) {
 	}
 	if !equality.Semantic.DeepEqual(broker, brokerBefore) {
 		t.Error("building the exec tier changed the broker's Deployment")
+	}
+}
+
+// TestABrokerEphemeralStorageOverrideDoesNotReachTheExecTier: the tier's figures
+// are fixed, as its cpu and memory are, so an override that raises, lowers or
+// only requests the broker's ephemeral storage leaves the exec pod at its own
+// caps, its gate at the same caps, and its request no larger than its limit.
+func TestABrokerEphemeralStorageOverrideDoesNotReachTheExecTier(t *testing.T) {
+	for name, res := range map[string]corev1.ResourceRequirements{
+		"raised": {
+			Requests: corev1.ResourceList{corev1.ResourceEphemeralStorage: resource.MustParse("10Gi")},
+			Limits:   corev1.ResourceList{corev1.ResourceEphemeralStorage: resource.MustParse("12Gi")},
+		},
+		"lowered":      {Limits: corev1.ResourceList{corev1.ResourceEphemeralStorage: resource.MustParse("1Gi")}},
+		"request only": {Requests: corev1.ResourceList{corev1.ResourceEphemeralStorage: resource.MustParse("6Gi")}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			agent := execTierTestAgent(ptr.To(int32(1)))
+			agent.Spec.Deployment.CredentialProxy.Resources = &res
+			dep := buildCredentialProxyExecTierDeployment(agent, buildCredentialProxyDeployment(agent, brokerTestPolicyHash))
+			want := resource.MustParse(credentialProxyExecTierEphemeralStorageLimit)
+			for _, c := range dep.Spec.Template.Spec.Containers {
+				if c.Name != credentialProxyContainerName {
+					continue
+				}
+				if got := c.Resources.Limits.StorageEphemeral(); !got.Equal(want) {
+					t.Errorf("exec ephemeral-storage limit = %v, want %v", got, &want)
+				}
+				if req, ok := c.Resources.Requests[corev1.ResourceEphemeralStorage]; ok && req.Cmp(want) > 0 {
+					t.Errorf("exec ephemeral-storage request %v is above its %v limit", &req, &want)
+				}
+				for _, e := range c.Env {
+					if e.Name == credentialProxyStateLimitEnv && e.Value != credentialProxyExecTierLimitBytes(credentialProxyExecTierStateSizeLimit) {
+						t.Errorf("%s = %s, want the tier's state cap", e.Name, e.Value)
+					}
+					if e.Name == credentialProxyTmpLimitEnv && e.Value != credentialProxyExecTierLimitBytes(credentialProxyExecTierTmpSizeLimit) {
+						t.Errorf("%s = %s, want the tier's /tmp cap", e.Name, e.Value)
+					}
+				}
+			}
+			for _, v := range dep.Spec.Template.Spec.Volumes {
+				if v.EmptyDir == nil {
+					continue
+				}
+				switch v.Name {
+				case credentialProxyStateVolumeName:
+					if !v.EmptyDir.SizeLimit.Equal(resource.MustParse(credentialProxyExecTierStateSizeLimit)) {
+						t.Errorf("exec state sizeLimit = %v", v.EmptyDir.SizeLimit)
+					}
+				case credentialProxyTmpVolumeName:
+					if !v.EmptyDir.SizeLimit.Equal(resource.MustParse(credentialProxyExecTierTmpSizeLimit)) {
+						t.Errorf("exec /tmp sizeLimit = %v", v.EmptyDir.SizeLimit)
+					}
+				}
+			}
+		})
 	}
 }
