@@ -90,6 +90,8 @@ Today: [`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §1 ("Don't re-say wha
 says", "Handle pure conversation yourself") and §2 steps 4 and 5. In code,
 `deploy/docker/patches/slack_boilerplate.py` strips Hermes' cron wrapper and its job id from Slack,
 and `busyNotice*` in `a2a/gateway/busy.go` is worded without a task id.
+[`agents/cluster/SOUL.md`](../../agents/cluster/SOUL.md) §6 ("Absent is an answer when presence was the
+question") keeps the command out of a one-line presence finding and sends it to `verified_claims`.
 
 ## Choices are buttons
 
