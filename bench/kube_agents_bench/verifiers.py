@@ -2535,6 +2535,11 @@ _CODE_ARG = "code"
 _COMMAND_ARG = "command"
 # The one key of an argument object the pod clipped: ``{"raw": text}``.
 _CLIPPED_ARGS_KEY = "raw"
+# What the pod leaves for an escaped space when it stores a terminal call
+# (``worker_transcript.SHELL_ESCAPED_SPACE_FOLD``). Its continuation fold also
+# turns an escaped backslash at a line end into one, so a stored call that holds
+# it may have lost a line break.
+_ESCAPED_SPACE_FOLD = "\ue000"
 # What a redactor leaves in place of a secret: the trajectory's audit redactor
 # writes ``[REDACTED…]``; hermes writes ``***``, ``«redacted:…`` or a head and a
 # tail joined by ``...`` (``sk-p...7890``).
@@ -2853,8 +2858,11 @@ class WorkerCommandsVerifier(BaseVerifier):
     the pod clipped, or one the shell reader cannot split (an open quote, but
     also a heredoc body with an apostrophe, or ``$'…'`` with an escaped quote:
     a spurious red when such a card also greps for a forbidden word), is
-    graded whole too; a card whose calls did not reach the trajectory is read
-    from the row alone.
+    graded whole too, and so is every grep row of a card with a stored call
+    that holds the pod's escaped-space fold: the pod folds an escaped space,
+    and an escaped backslash at a line end, into it, so a line break may be
+    gone (an honest escaped space is a spurious red the same way); a card
+    whose calls did not reach the trajectory is read from the row alone.
     ``required_runs``: each names a script (by basename, or module stem under
     ``-m``), flags and word patterns; some command's shell segment, read as an
     argv, must run it with those flags after it, a word matching each pattern,
@@ -3079,13 +3087,14 @@ class WorkerCommandsVerifier(BaseVerifier):
                 # A row joins a typed newline into a space, so a dangling grep's
                 # pattern slot can hold the next line's first word. Where the
                 # card's typed calls reached the trajectory, their line breaks show
-                # it. A clip keeps a call's head only, and a call the shell reader
-                # cannot split has no lines to read, so a card with either keeps
-                # every grep row whole. An ``execute_code`` program is not shell.
+                # it. A clip keeps a call's head only, a call the shell reader cannot
+                # split has no lines to read, and a call with the pod's escaped-space
+                # fold may have lost one, so a card with any of them keeps every grep
+                # row whole. An ``execute_code`` program is not shell.
                 unread = _clipped_cards(snap.trajectory)
                 by_card: dict[str, list[str]] = {}
                 for card, command in _terminal_call_texts(snap.trajectory):
-                    openings = _typed_line_openings(command)
+                    openings = None if _ESCAPED_SPACE_FOLD in command else _typed_line_openings(command)
                     if openings is None:
                         unread.add(card)
                     else:

@@ -52,6 +52,9 @@ python3 ...`` chain first, and the typed lists are graded as calls.
 
 from __future__ import annotations
 
+import importlib.util
+from pathlib import Path
+
 import pytest
 import yaml
 
@@ -420,11 +423,21 @@ def _stash(commands: list[str]) -> None:
     transcript.set("ok", [], worker_commands=[{"task": "t_1", "command": c} for c in commands])
 
 
+# The pod stores each typed terminal call through this fold before it reaches the
+# trajectory (``worker_trajectory``'s scrub), so the tests store their calls the same way.
+_TRANSCRIPT_SPEC = importlib.util.spec_from_file_location(
+    "worker_transcript_for_tests", Path(__file__).resolve().parents[2] / "agents" / "platform" / "scripts" / "worker_transcript.py"
+)
+_TRANSCRIPT = importlib.util.module_from_spec(_TRANSCRIPT_SPEC)
+_TRANSCRIPT_SPEC.loader.exec_module(_TRANSCRIPT)
+_stored = _TRANSCRIPT.fold_shell_command
+
+
 def _call(command: str, at: float) -> dict:
     """One tagged terminal call of the worker card, as worker_trajectory records it."""
     return {
         "name": "terminal",
-        "args": {"command": command},
+        "args": {"command": _stored(command)},
         "result": "",
         "status": "completed",
         "agent": "platform",

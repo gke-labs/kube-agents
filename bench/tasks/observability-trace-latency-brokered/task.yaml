@@ -311,9 +311,11 @@ verification_spec:
       # breaks and grades the row whole when the pattern, or an option or
       # value ahead of it, opened a typed line. It grades every grep row of a
       # card whole when one of the card's calls was clipped by the pod (its
-      # arguments past 2000 characters) or cannot be split by the bench's
+      # arguments past 2000 characters), cannot be split by the bench's
       # shell reader (an open quote, but also a heredoc body with an
-      # apostrophe), a spurious red for an honest grep on such a card. Known
+      # apostrophe), or holds an escaped space (the pod stores one, and an
+      # escaped backslash at a line end, as the same mark), a spurious red
+      # for an honest grep on such a card. Known
       # limit: a card whose typed calls did not reach the trajectory is read
       # from the row alone, so that row passes.
       # `rg` is not exempt (its `--pre` runs a command per file), and an

@@ -12,8 +12,10 @@ client, interpreter, wrapper, pipe, heredoc or assignment carries it.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 from pathlib import Path
+
 
 import yaml
 from kube_agents_bench import transcript
@@ -31,12 +33,22 @@ CLONE_PUBLIC = f"python3 {SCRIPT} clone --repo gke-labs/kube-agents --ref 0.13.0
 CLONE_CONTEXT = f"python3 {SCRIPT} clone --repo kubernetes-sigs/kind --ref v0.24.0 --into ./kind"
 
 
+# The pod stores each typed terminal call through this fold before it reaches the
+# trajectory (``worker_trajectory``'s scrub), so the tests store their calls the same way.
+_TRANSCRIPT_SPEC = importlib.util.spec_from_file_location(
+    "worker_transcript_for_tests", Path(__file__).resolve().parents[2] / "agents" / "platform" / "scripts" / "worker_transcript.py"
+)
+_TRANSCRIPT = importlib.util.module_from_spec(_TRANSCRIPT_SPEC)
+_TRANSCRIPT_SPEC.loader.exec_module(_TRANSCRIPT)
+_stored = _TRANSCRIPT.fold_shell_command
+
+
 def _passes(*rows: str, typed: tuple[str, ...] = ()) -> bool:
     """The verdict on one card's log rows, and its tagged calls as typed when given."""
     doc = yaml.safe_load(TASK.read_text())
     (check,) = [c for c in doc["verification_spec"] if c.get("name") == CHECK]
     calls = [
-        {"agent": "platform", "name": "terminal", "task": "t_1", "args": {"command": c}, "at": float(i)}
+        {"agent": "platform", "name": "terminal", "task": "t_1", "args": {"command": _stored(c)}, "at": float(i)}
         for i, c in enumerate(typed)
     ]
     transcript.set("", calls, worker_commands=[{"task": "t_1", "command": row} for row in rows])

@@ -36,6 +36,7 @@ The load-bearing properties, in rough order of what they cost if wrong:
 from __future__ import annotations
 
 import io
+import importlib.util
 import json
 import os
 import re
@@ -45,6 +46,7 @@ import tomllib
 from datetime import datetime, timezone
 import sys
 from pathlib import Path
+
 from unittest import mock
 
 import pytest
@@ -892,6 +894,16 @@ def test_worker_commands_exempt_command_does_not_satisfy_a_required_pattern():
     assert "across 0 command(s) (1 exempted)" in res.reason
 
 
+# The pod stores each typed terminal call through this fold before it reaches the
+# trajectory (``worker_trajectory``'s scrub), so the tests store their calls the same way.
+_TRANSCRIPT_SPEC = importlib.util.spec_from_file_location(
+    "worker_transcript_for_tests", Path(__file__).resolve().parents[2] / "agents" / "platform" / "scripts" / "worker_transcript.py"
+)
+_TRANSCRIPT = importlib.util.module_from_spec(_TRANSCRIPT_SPEC)
+_TRANSCRIPT_SPEC.loader.exec_module(_TRANSCRIPT)
+_stored = _TRANSCRIPT.fold_shell_command
+
+
 def _grep_cut_status(rows: list[str], typed: list[str], card: str | None = "t_1", clipped: bool = False) -> str:
     """The verdict of a grep-cut check whose forbidden word is ``route``, on one card's rows
     and typed calls; ``card=None`` stashes the rows with no card, as an older capture did,
@@ -901,7 +913,7 @@ def _grep_cut_status(rows: list[str], typed: list[str], card: str | None = "t_1"
             "agent": "w",
             "name": "terminal",
             "task": "t_1",
-            "args": {"raw": json.dumps({"command": c})[:-2] + " ...[clipped 9 chars]"} if clipped else {"command": c},
+            "args": {"raw": json.dumps({"command": c})[:-2] + " ...[clipped 9 chars]"} if clipped else {"command": _stored(c)},
             "at": float(i),
         }
         for i, c in enumerate(typed)
@@ -949,6 +961,13 @@ def test_worker_commands_grep_cut_refuses_the_rows_of_a_card_with_an_unread_call
     # gone: the card's grep rows are graded whole.
     assert _grep_cut_status(["grep -rn route f"], ["grep -rn route f"], clipped=True) == "fail"
     assert _grep_cut_status(["grep -rn route f"], ["grep -rn route f"], card=None, clipped=True) == "fail"
+    # The pod folds an escaped space, and an escaped backslash at a line end,
+    # into one mark before the call reaches the trajectory, so a call that
+    # holds the mark may have lost a line break: its card's grep rows are
+    # graded whole, an honest escaped space included.
+    assert _grep_cut_status(["grep -rn\\\\ route=1 curl x"], ["grep -rn\\\\\nroute=1\ncurl x"]) == "fail"
+    assert _grep_cut_status(["grep -rn X=\\ route=1 curl x"], ["grep -rn\nX=\\  route=1\ncurl x"]) == "fail"
+    assert _grep_cut_status(["grep -rn route f"], ["grep -rn route f", "ls my\\ file"]) == "fail"
     # A call the shell reader cannot split has no lines to read either.
     assert _grep_cut_status(["grep -rn route f"], ["grep -rn route f", "cat <<EOF\ndon't\nEOF"]) == "fail"
 

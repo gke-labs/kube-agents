@@ -94,9 +94,11 @@
 #     whole when the pattern, or an option or value ahead of it, opened a
 #     typed line. It also grades every grep row of a card whole when one of
 #     the card's calls was clipped by the pod (its arguments past 2000
-#     characters) or cannot be split by the bench's shell reader (an open
-#     quote, but also a heredoc body with an apostrophe): a spurious red for
-#     an honest grep on such a card. A card whose typed calls did not reach
+#     characters), cannot be split by the bench's shell reader (an open
+#     quote, but also a heredoc body with an apostrophe), or holds an
+#     escaped space (the pod stores one, and an escaped backslash at a line
+#     end, as the same mark, so a line break may be gone): a spurious red
+#     for an honest grep on such a card. A card whose typed calls did not reach
 #     the trajectory is read from the row alone, so its row passes. The same
 #     class: a bare `grep` over `…/inspect_repository.py list`, `grep -e`
 #     over `node -e "…" x`, and `grep -m` over `curl …`.
