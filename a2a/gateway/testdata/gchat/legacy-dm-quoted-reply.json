@@ -1,0 +1,85 @@
+{
+ "type": "MESSAGE",
+ "eventTime": "2026-11-08T17:35:01.308418Z",
+ "message": {
+  "name": "spaces/rj0PRyAAAAE/messages/eU4g-jRGHss.eU4g-jRGHss",
+  "sender": {
+   "name": "users/100000000000000000042",
+   "displayName": "Test Sender",
+   "avatarUrl": "https://lh3.googleusercontent.com/a/REDACTED=k-no",
+   "email": "sender@example.com",
+   "type": "HUMAN",
+   "domainId": "REDACTED"
+  },
+  "createTime": "2026-11-08T17:35:01.308418Z",
+  "text": "what was this about?",
+  "thread": {
+   "name": "spaces/rj0PRyAAAAE/threads/eU4g-jRGHss",
+   "retentionSettings": {
+    "state": "PERMANENT"
+   }
+  },
+  "space": {
+   "name": "spaces/rj0PRyAAAAE",
+   "type": "DM",
+   "singleUserBotDm": true,
+   "spaceThreadingState": "THREADED_MESSAGES",
+   "spaceType": "DIRECT_MESSAGE",
+   "spaceHistoryState": "HISTORY_ON",
+   "lastActiveTime": "2026-11-08T17:35:01.308418Z",
+   "membershipCount": {
+    "joinedDirectHumanUserCount": 1
+   },
+   "spaceUri": "https://chat.google.com/dm/rj0PRyAAAAE?cls=11"
+  },
+  "argumentText": "what was this about?",
+  "retentionSettings": {
+   "state": "PERMANENT"
+  },
+  "quotedMessageMetadata": {
+   "name": "spaces/rj0PRyAAAAE/messages/ooygSHQq_qM.ooygSHQq_qM",
+   "lastUpdateTime": "2026-11-08T04:25:55.116399Z",
+   "quoteType": "REPLY",
+   "quotedMessageSnapshot": {
+    "sender": "Kage (bhoekstra)",
+    "text": "\u2705 stall cleared in `kube-agents-evals-2/platform-agent-host` (us-central1) / `eval-controller-stall`: Deployment/eval-stalled-workload; card `t_8ba511a8` closed"
+   }
+  },
+  "messageHistoryState": "HISTORY_ON",
+  "formattedText": "what was this about?",
+  "markupSyntax": "MARKUP_SYNTAX_CHAT"
+ },
+ "user": {
+  "name": "users/100000000000000000042",
+  "displayName": "Test Sender",
+  "avatarUrl": "https://lh3.googleusercontent.com/a/REDACTED=k-no",
+  "email": "sender@example.com",
+  "type": "HUMAN",
+  "domainId": "REDACTED"
+ },
+ "space": {
+  "name": "spaces/rj0PRyAAAAE",
+  "type": "DM",
+  "singleUserBotDm": true,
+  "spaceThreadingState": "THREADED_MESSAGES",
+  "spaceType": "DIRECT_MESSAGE",
+  "spaceHistoryState": "HISTORY_ON",
+  "lastActiveTime": "2026-11-08T17:35:01.308418Z",
+  "membershipCount": {
+   "joinedDirectHumanUserCount": 1
+  },
+  "spaceUri": "https://chat.google.com/dm/rj0PRyAAAAE?cls=11"
+ },
+ "configCompleteRedirectUrl": "https://chat.google.com/api/bot_config_complete?token=REDACTED%3D%3D",
+ "common": {
+  "userLocale": "en",
+  "hostApp": "CHAT",
+  "timeZone": {
+   "id": "America/Toronto",
+   "offset": -18000000
+  }
+ },
+ "thread": {
+  "name": "spaces/rj0PRyAAAAE/threads/eU4g-jRGHss"
+ }
+}

@@ -692,7 +692,10 @@ The clone stays under `CREDENTIAL_PROXY_MAX_CLONE_BYTES`: it is measured while
 git writes, about every half second, and killed past the ceiling, because the
 repository can be anyone's and a clone left to finish could fill the scratch
 volume first. The tar stays under
-`CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES` (32 MiB, refused as `SNAPSHOT_TOO_LARGE`).
+`CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES` (32 MiB, refused as `SNAPSHOT_TOO_LARGE`),
+and its files under the request's `maxBytes` when the caller sends one: `vcs_client`
+sends its unpack bound, so a tree it would refuse after the transfer is refused here
+first, with entries.
 The tar is smaller than the bundle ceiling because the answer is base64 inside
 one JSON body, and the broker holds several copies of it. The tar is sized from
 `git ls-tree` before `git archive` writes it, because the clone ceiling measures
@@ -913,7 +916,7 @@ it; `ROLE_VCS_VERBS` refuses it to the `mcp` role.
 | ------------------------------------ | -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
 | `capabilities`                       | `{repository}`                                                       | `{forge, repo, proposalNoun, verbs, acknowledge, labels, missing, baseBranch, fileUrl?}` |
 | `clone`                              | `{repository, branch?}`                                              | `{forge, repo, branch, revision, size, bundleBase64, baseBranch}`                        |
-| `snapshot`                           | `{repository, ref?, paths?}`                                         | `{forge, repo, role, ref, revision, size, archiveBase64, history: "none"}`               |
+| `snapshot`                           | `{repository, ref?, paths?, maxBytes?}`                              | `{forge, repo, role, ref, revision, size, archiveBase64, history: "none"}`               |
 | `publish`                            | `{repository, branch, target, baseRevision, bundleBase64, advance?}` | `{forge, repo, branch, revision}`                                                        |
 | `proposal-create`                    | `{repository, source, target, title, body?, draft?}`                 | `{proposal, forge, repo, claim?}`                                                        |
 | `proposal-claim`                     | `{claim, url}`                                                       | `{url, number, title}`                                                                   |
@@ -1053,7 +1056,9 @@ Refusals carry a code: 501 `FORGE_UNSUPPORTED`, 413 `CLONE_TOO_LARGE`,
 `BUNDLE_TOO_LARGE` and `SNAPSHOT_TOO_LARGE` (when the measure listed the tree, the
 refusal carries `ceiling`, the `revision` it measured, and `entries`: each entry one
 level below what was asked, with its `path`, its `type`, its count of `manifests`, and
-the `bytes` a snapshot of it alone measures; past 4096 entries it carries none),
+the `bytes` a snapshot of it alone measures; past 4096 entries it carries none; a request's
+`maxBytes`, the bytes the caller unpacks at most, refuses a tree whose files pass it the same
+way, with the install's `ceiling`),
 400 `PATH_NOT_FOUND` (a `snapshot` path that names nothing at the ref; the refusal
 carries the `revision` it read), 409 `NOT_FAST_FORWARD`, `BASE_MOVED`, `BRANCH_DIVERGED`,
 `TARGET_IS_BRANCH`, `CLONED_BRANCH`, `PROTECTED_BRANCH`, `TARGET_NOT_BASE`,
