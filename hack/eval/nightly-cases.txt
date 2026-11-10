@@ -1025,6 +1025,13 @@
 # card.
 ./tasks/chat-tabular-answer-keeps-its-table/task.yaml
 
+# A presence answer from a Cluster Agent names the missing namespace and the
+# cluster it was looked for on, and quotes no kubectl command: the card's
+# result is posted into the thread verbatim, and a command there is plumbing
+# (#5094). deployer: noop, read-only, the slot b role standing for its
+# cluster, one card.
+./tasks/chat-voice-absent-answer-quotes-no-command/task.yaml
+
 # The front door's "what can you do?" calls a per-cluster agent "the <cluster>
 # cluster agent", not its profile id (#3082). deployer: noop, transcript-only,
 # one front-door turn with no card: +3 units.
