@@ -1001,7 +1001,47 @@ def _memory_pr_card(record: dict, repo: str) -> Card:
     )
 
 
-def _extract_reviewer_reason(comments: list, viewer: str) -> str:
+_SITUATIONAL_CLOSE_RE = re.compile(
+    r"\b(?:"
+    r"closing\s+(?:stale|old|duplicate|superseded|obsolete)|"
+    r"stale\s+(?:pr|mr|branch|pull\s+request)|"
+    r"superseded\s+by|"
+    r"duplicate\s+of|"
+    r"change\s+freeze|code\s+freeze|holiday\s+freeze|"
+    r"merge\s+conflict|needs?\s+rebase|wrong\s+branch"
+    r")\b",
+    re.I,
+)
+
+
+def _comment_author_can_write(
+    comment: dict, provider: object = None, repo: str = ""
+) -> bool:
+    if not isinstance(comment, dict):
+        return False
+    if comment.get("bot") or comment.get("is_bot"):
+        return False
+    if "can_write" in comment:
+        return (
+            comment.get("can_write") is True
+            and comment.get("can_write_known", True) is not False
+        )
+    author = str(comment.get("author") or "").strip()
+    if not author:
+        return False
+    if provider is not None and repo and hasattr(provider, "_has_write"):
+        access = provider._has_write(repo, author, bool(comment.get("bot")))
+        return access is True
+    return False
+
+
+def _extract_reviewer_reason(
+    comments: list,
+    viewer: str,
+    *,
+    provider: object = None,
+    repo: str = "",
+) -> str | None:
     viewer_key = forge.normalise_login(viewer) if viewer else ""
     for comment in reversed(comments or []):
         if not isinstance(comment, dict):
@@ -1009,10 +1049,18 @@ def _extract_reviewer_reason(comments: list, viewer: str) -> str:
         author = str(comment.get("author") or "")
         if viewer_key and forge.normalise_login(author) == viewer_key:
             continue
+        if not _comment_author_can_write(comment, provider=provider, repo=repo):
+            continue
         text = str(comment.get("body") or "").strip()
         if text:
             return text[:500]
-    return "Proposal closed unmerged by reviewer."
+    return None
+
+
+def _is_situational_close_reason(reason: str | None) -> bool:
+    if not reason or not reason.strip():
+        return True
+    return bool(_SITUATIONAL_CLOSE_RE.search(reason))
 
 
 SOAK_WINDOWS_SECONDS = {
@@ -1048,7 +1096,13 @@ def _extract_rule_from_markdown(md: str) -> str:
 
 
 def _detect_human_modification(
-    rec: dict, prop: dict, view_ans: dict, viewer: str
+    rec: dict,
+    prop: dict,
+    view_ans: dict,
+    viewer: str,
+    *,
+    provider: object = None,
+    repo: str = "",
 ) -> dict | None:
     """Detect whether a reviewer modified an agent PR before merging (`edit-before-merge`)."""
     viewer_key = forge.normalise_login(viewer) if viewer else ""
@@ -1097,8 +1151,10 @@ def _detect_human_modification(
         comments = prop.get("comments") or []
     reason = ""
     if comments:
-        cand = _extract_reviewer_reason(comments, viewer)
-        if cand != "Proposal closed unmerged by reviewer.":
+        cand = _extract_reviewer_reason(
+            comments, viewer, provider=provider, repo=repo
+        )
+        if cand:
             reason = cand
     if not reason:
         editor_label = f" by {human_editor}" if human_editor else ""
@@ -1261,23 +1317,9 @@ def sweep_memory_proposals(
 
         if pr_num is None:
             if not _gitops_prs_enabled():
-                if not dry_run:
-                    subprocess.run(
-                        [
-                            curator_bin,
-                            "emit",
-                            "--kind",
-                            "approved",
-                            "--id",
-                            rec_id,
-                            "--repo",
-                            repo,
-                        ],
-                        capture_output=True,
-                        text=True,
-                        timeout=8,
-                        check=False,
-                    )
+                # Security invariant: when GitOps PR creation is disabled, records
+                # remain status:proposed (advisory warn) in Hindsight and are never
+                # auto-promoted to status:active without a merged knowledge/ PR.
                 continue
             try:
                 ans = forge.call(
@@ -1328,15 +1370,39 @@ def sweep_memory_proposals(
             pr_ref = f"{pr_url} (#{pr_num})"
 
         if state == "merged":
-            is_lesson = (
-                str(rec.get("type") or "").strip().lower() == "lesson"
-                or rec_id.startswith("LES-")
-                or bool(rec.get("finding_id"))
-                or bool(rec.get("soak_window"))
-                or bool(prop.get("soak_window"))
-                or bool(prop.get("post_merge_status"))
+            already_soaked = str(rec.get("outcome") or "").strip().lower() in (
+                "resolved-merged",
+                "pr-merged-persists",
+                "modified-merged",
             )
-            if is_lesson:
+            prop_source = str(
+                prop.get("source")
+                or prop.get("source_branch")
+                or prop.get("headRefName")
+                or ""
+            ).strip()
+            has_soak_signal = bool(
+                rec.get("finding_id")
+                or rec.get("soak_window")
+                or prop.get("soak_window")
+                or prop.get("post_merge_status")
+            )
+            is_knowledge_pr = bool(
+                prop.get("knowledge_pr")
+                or already_soaked
+                or (prop_source and prop_source == branch and not has_soak_signal)
+                or (
+                    not has_soak_signal
+                    and str(rec.get("type") or "").strip().lower() != "lesson"
+                    and not rec_id.startswith("LES-")
+                )
+            )
+            is_remediation_soak = not is_knowledge_pr and (
+                has_soak_signal
+                or str(rec.get("type") or "").strip().lower() == "lesson"
+                or rec_id.startswith("LES-")
+            )
+            if is_remediation_soak:
                 soak_state, soak_reason = _evaluate_post_merge_soak(
                     rec, prop, view_ans, now=now
                 )
@@ -1378,7 +1444,9 @@ def sweep_memory_proposals(
                     )
                     continue
 
-            mod = _detect_human_modification(rec, prop, view_ans, viewer)
+            mod = _detect_human_modification(
+                rec, prop, view_ans, viewer, provider=provider, repo=repo
+            )
             if mod is not None:
                 if dry_run:
                     sys.stderr.write(
@@ -1399,6 +1467,8 @@ def sweep_memory_proposals(
                     "--reason",
                     mod["reason"],
                 ]
+                if is_knowledge_pr:
+                    cmd.append("--knowledge-pr")
                 if mod.get("initial_proposal"):
                     cmd.extend(["--initial-proposal", mod["initial_proposal"]])
                 if mod.get("rule"):
@@ -1412,7 +1482,7 @@ def sweep_memory_proposals(
                 )
                 continue
 
-            emit_kind = "resolved-merged" if is_lesson else "approved"
+            emit_kind = "resolved-merged" if is_remediation_soak else "approved"
             if dry_run:
                 sys.stderr.write(
                     f"github_scan_gate: would emit {emit_kind} for {rec_id} from merged {pr_ref}\n"
@@ -1430,7 +1500,9 @@ def sweep_memory_proposals(
                 "--pr",
                 pr_ref,
             ]
-            if is_lesson:
+            if is_knowledge_pr:
+                emit_cmd.append("--knowledge-pr")
+            if is_remediation_soak:
                 soak_key = str(rec.get("soak_window") or prop.get("soak_window") or "24h").strip()
                 emit_cmd.extend(["--soak-window", soak_key])
                 finding_id = str(rec.get("finding_id") or prop.get("finding_id") or "").strip()
@@ -1447,7 +1519,41 @@ def sweep_memory_proposals(
             comments = view_ans.get("comments")
             if not isinstance(comments, list):
                 comments = prop.get("comments") or []
-            reason = _extract_reviewer_reason(comments, viewer)
+            reason = _extract_reviewer_reason(
+                comments, viewer, provider=provider, repo=repo
+            )
+            if _is_situational_close_reason(reason):
+                # Administrative or uncommented closes (freeze, stale branch,
+                # merge conflict, or comments only from non-write users) retire
+                # the pending proposal rather than recording a policy rejection.
+                if dry_run:
+                    sys.stderr.write(
+                        f"github_scan_gate: would retire {rec_id} from situational/uncommented close {pr_ref}\n"
+                    )
+                    continue
+                retire_cmd = [
+                    curator_bin,
+                    "emit",
+                    "--kind",
+                    "retired",
+                    "--id",
+                    rec_id,
+                    "--repo",
+                    repo,
+                    "--pr",
+                    pr_ref,
+                ]
+                if reason:
+                    retire_cmd.extend(["--reason", reason])
+                subprocess.run(
+                    retire_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=8,
+                    check=False,
+                )
+                continue
+            assert reason is not None
             if dry_run:
                 sys.stderr.write(f"github_scan_gate: would refuse {rec_id} from closed {pr_ref}: {reason}\n")
                 continue

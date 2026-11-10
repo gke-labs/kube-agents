@@ -62,9 +62,20 @@ const (
 	// SubjectMemoryQueryPublic is the top-level NATS request-reply subject for
 	// semantic memory queries when bus policy grants a2a.memory.query.
 	SubjectMemoryQueryPublic = "a2a.memory.query"
+
+	// SubjectCuratorOutcomes is the dedicated NATS outcome subject within the
+	// agent principal's reserved _INBOX.agent.> namespace. Session pods and
+	// AgentProfile worker pods are refused _INBOX.agent.> by NATS auth callout,
+	// preventing worker pods from forging approved, resolved-merged,
+	// modified-merged, or refused outcome transitions.
+	SubjectCuratorOutcomes = "_INBOX.agent.curator.outcomes"
+
+	// SubjectCuratorOutcomesPublic is an optional top-level Curator outcome
+	// subject when bus policy explicitly grants a2a.curator.outcomes.
+	SubjectCuratorOutcomesPublic = "a2a.curator.outcomes"
 )
 
-// OutcomeKind classifies a learning event published on a2a.topics.shared.annotations.
+// OutcomeKind classifies a learning event processed by the Curator.
 type OutcomeKind string
 
 const (
@@ -74,6 +85,7 @@ const (
 	OutcomeResolvedMerged   OutcomeKind = "resolved-merged"
 	OutcomePRMergedPersists OutcomeKind = "pr-merged-persists"
 	OutcomeRefused          OutcomeKind = "refused"
+	OutcomeRetired          OutcomeKind = "retired"
 )
 
 // RecordType classifies an OKF record ("decision", "lesson", "runbook", "cluster-blueprint", "tenancy-model", "metric-definition", "escalation", or "observation").
@@ -119,8 +131,10 @@ type OutcomeEvent struct {
 	Verification   string       `json:"verification,omitempty"`
 	Prevention     string       `json:"prevention,omitempty"`
 	Rule           string       `json:"rule,omitempty"`
-	PullRequest    string       `json:"pull_request,omitempty"`
-	PRNumber       int          `json:"pr_number,omitempty"`
+	PullRequest     string       `json:"pull_request,omitempty"`
+	RemediationPR   string       `json:"remediation_pr,omitempty"`
+	KnowledgePR     bool         `json:"knowledge_pr,omitempty"`
+	PRNumber        int          `json:"pr_number,omitempty"`
 	BreakingPR      string       `json:"breaking_pr,omitempty"`
 	Incident        string       `json:"incident,omitempty"`
 	Commit          string       `json:"commit,omitempty"`
@@ -161,6 +175,7 @@ type RecordGuard struct {
 // RecordEvidence links a record to pull requests, commits, and incidents.
 type RecordEvidence struct {
 	PullRequest       string   `json:"pull_request,omitempty" yaml:"pull_request,omitempty"`
+	RemediationPR     string   `json:"remediation_pr,omitempty" yaml:"remediation_pr,omitempty"`
 	BreakingPR        string   `json:"breaking_pr,omitempty" yaml:"breaking_pr,omitempty"`
 	Incident          string   `json:"incident,omitempty" yaml:"incident,omitempty"`
 	Commit            string   `json:"commit,omitempty" yaml:"commit,omitempty"`
@@ -233,6 +248,7 @@ type BlueprintRecordDigest struct {
 	Paths          []string     `json:"paths,omitempty"`
 	GuardRule      string       `json:"guard_rule,omitempty"`
 	PullRequest    string       `json:"pull_request,omitempty"`
+	RemediationPR  string       `json:"remediation_pr,omitempty"`
 	FindingID      string       `json:"finding_id,omitempty"`
 	Outcome        string       `json:"outcome,omitempty"`
 	SoakWindow     string       `json:"soak_window,omitempty"`
@@ -535,16 +551,17 @@ func (r Record) ProposalBranch() string {
 }
 
 // RenderForPR renders the Markdown document to commit on a proposal pull request
-// branch. In Git, a proposed record is committed with status: active (and a
-// blocking guard) so that merging the pull request activates the record on the
-// default branch without requiring a second post-merge commit.
+// branch. In Git, a proposed record is committed with status: active and preserves
+// its classified guard severity ("warn" by default, or "block" for verified crash
+// invariants) so merging the pull request activates the record on the default
+// branch without requiring a second post-merge commit.
 func (r Record) RenderForPR() string {
 	meta := r.Meta
 	meta.Status = StatusActive
 	if r.Meta.Guard != nil {
 		g := *r.Meta.Guard
-		if g.Severity == "" || g.Severity == "warn" {
-			g.Severity = "block"
+		if g.Severity == "" {
+			g.Severity = "warn"
 		}
 		meta.Guard = &g
 	}
@@ -1052,6 +1069,7 @@ func BuildBlueprintDigest(repoID string, records []Record, lastEvent string, gra
 			Paths:          r.Meta.Scope.Paths,
 			GuardRule:      guardRule,
 			PullRequest:    r.Meta.Evidence.PullRequest,
+			RemediationPR:  r.Meta.Evidence.RemediationPR,
 			FindingID:      r.Meta.Evidence.FindingID,
 			Outcome:        r.Meta.Evidence.Outcome,
 			SoakWindow:     r.Meta.Evidence.SoakWindow,

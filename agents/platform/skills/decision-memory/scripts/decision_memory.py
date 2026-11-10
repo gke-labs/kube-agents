@@ -1600,7 +1600,7 @@ def _llm_synthesize_record(
             '"context": "<why the decision was needed>", '
             '"decision": "<the architectural rule and trade-offs>", '
             '"consequences": "<how future changes must comply>", '
-            '"guard": {"rule": "<1-line invariant>", "severity": "block", '
+            '"guard": {"rule": "<1-line invariant>", "severity": "<warn_or_block>", '
             '"expect": {"file": "<path>", "path": "<yaml_path_or_$text>", "op": "<op>", "value": "<val>"}}}'
         )
     else:
@@ -1610,13 +1610,18 @@ def _llm_synthesize_record(
             '"fix": "<what change resolved it>", '
             '"verification": "<how resolution was verified>", '
             '"prevention": "<rule to prevent repeat outage>", '
-            '"guard": {"rule": "<1-line invariant>", "severity": "block", '
+            '"guard": {"rule": "<1-line invariant>", "severity": "<warn_or_block>", '
             '"expect": {"file": "<path>", "path": "<yaml_path_or_$text>", "op": "<op>", "value": "<val>"}}}'
         )
     prompt = (
         "You are synthesizing a Kubernetes GitOps Operational Knowledge Format (OKF) "
         f"{record_type} record from pull request and incident history.\n"
         "Preserve all exact identifiers, PR/issue numbers, file paths, and resource quantities.\n"
+        "Set guard.severity to \"warn\" by default (for reviewer comments, edit-before-merge adjustments, "
+        "naming/quota conventions, and general operational guidance).\n"
+        "Set guard.severity to \"block\" ONLY when the pull request resolved a verified crash, outage, "
+        "or availability failure with a concrete root cause (such as OOMKilled, CrashLoopBackOff, "
+        "quorum loss, or pod eviction deadlock).\n"
         "Return ONLY valid JSON matching this schema (omit 'guard' if no machine-checkable invariant applies):\n"
         f"{schema_hint}\n\n"
         f"Input evidence:\n{json.dumps(context_payload, indent=2, default=str)}"
@@ -1707,8 +1712,8 @@ def cmd_from_outcome(a) -> Dict[str, Any]:
             guard = cand_guard
     if guard and outcome_kind not in ("pr-merged-persists", "refused"):
         g = dict(guard)
-        if g.get("severity") in (None, "", "warn"):
-            g["severity"] = "block"
+        if not g.get("severity"):
+            g["severity"] = "warn"
         meta["guard"] = g
 
     rej_proposals: List[str] = [str(x) for x in (o.get("rejected_proposals") or []) if x]
@@ -1936,7 +1941,9 @@ def _flatten_yaml_leaves(obj: Any, prefix: str = "") -> Dict[str, Any]:
     return out
 
 
-def _infer_guard_from_commit(repo: Path, commit_sha: str, target_file: str) -> Optional[Dict[str, Any]]:
+def _infer_guard_from_commit(
+    repo: Path, commit_sha: str, target_file: str, default_severity: str = "warn"
+) -> Optional[Dict[str, Any]]:
     try:
         old_raw = git(repo, "show", f"{commit_sha}^:{target_file}")
         new_raw = git(repo, "show", f"{commit_sha}:{target_file}")
@@ -1949,7 +1956,7 @@ def _infer_guard_from_commit(repo: Path, commit_sha: str, target_file: str) -> O
             res_name, key_name, val = m_named.group(1), m_named.group(2), m_named.group(3)
             return {
                 "rule": f"Keep {res_name} {key_name} = {val} in {target_file}.",
-                "severity": "block",
+                "severity": default_severity,
                 "expect": {
                     "file": target_file,
                     "path": "$text",
@@ -1962,7 +1969,7 @@ def _infer_guard_from_commit(repo: Path, commit_sha: str, target_file: str) -> O
             key_name, val = m.group(1), m.group(2)
             return {
                 "rule": f"Keep {key_name} = {val} in {target_file}.",
-                "severity": "block",
+                "severity": default_severity,
                 "expect": {
                     "file": target_file,
                     "path": "$text",
@@ -1993,7 +2000,7 @@ def _infer_guard_from_commit(repo: Path, commit_sha: str, target_file: str) -> O
         if "limits.cpu" in rk:
             return {
                 "rule": f"Do not set {rk} in {target_file} (must remain absent to prevent CFS throttling).",
-                "severity": "block",
+                "severity": default_severity,
                 "expect": {"file": target_file, "path": rk, "op": "absent", "value": True},
             }
 
@@ -2009,18 +2016,18 @@ def _infer_guard_from_commit(repo: Path, commit_sha: str, target_file: str) -> O
             op = ">=" if nq > oq else "<="
             return {
                 "rule": f"Keep {ck} {op} {nval} in {target_file} (was {oval} in breaking change).",
-                "severity": "block",
+                "severity": default_severity,
                 "expect": {"file": target_file, "path": ck, "op": op, "value": nval},
             }
         if oval is None and (".env[" in ck or ck.startswith("env[")):
             return {
                 "rule": f"Keep {ck} present in {target_file}.",
-                "severity": "block",
+                "severity": default_severity,
                 "expect": {"file": target_file, "path": ck, "op": "present", "value": True},
             }
         return {
             "rule": f"Keep {ck} == {nval!r} in {target_file}.",
-            "severity": "block",
+            "severity": default_severity,
             "expect": {"file": target_file, "path": ck, "op": "==", "value": nval},
         }
     return None
@@ -2245,6 +2252,13 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
         re.I,
     )
     re_eval_noise = re.compile(r"eval-spend|probe:|\[withdrawn-eval-probe\]", re.I)
+    re_situational_close = re.compile(
+        r"\b(?:closing\s+(?:stale|old|duplicate|superseded|obsolete)|"
+        r"stale\s+(?:pr|mr|branch|pull\s+request)|superseded\s+by|duplicate\s+of|"
+        r"change\s+freeze|code\s+freeze|holiday\s+freeze|merge\s+conflict|needs?\s+rebase|wrong\s+branch)\b",
+        re.I,
+    )
+    bootstrap_sev = "block" if getattr(a, "strict_block", False) else "warn"
 
     written: List[str] = []
     triage_counts = {"revert-lesson": 0, "decision": 0, "superseded": 0, "routine": 0}
@@ -2370,7 +2384,7 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
             q_path, q_val = _infer_quota_ceiling(repo, target_file, comments + "\n" + body)
             guard = {
                 "rule": f"Do not raise {target_file} above {q_val}; right-size offending workloads instead (rejected in PR #{rej_num}, fixed in PR #{num}).",
-                "severity": "block",
+                "severity": bootstrap_sev,
                 "expect": {
                     "file": target_file,
                     "path": q_path,
@@ -2386,7 +2400,8 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
             if synth:
                 llm_synthesized_count += 1
                 if isinstance(synth.get("guard"), dict) and _guard_passes_on_head(repo, synth["guard"], []):
-                    guard = synth["guard"]
+                    guard = dict(synth["guard"])
+                    guard["severity"] = bootstrap_sev
             rec_title = str(
                 (synth or {}).get("title")
                 or f"Hard multi-tenant quota ceiling on {target_file} (rejected PR #{rej_num})"
@@ -2443,7 +2458,7 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
             scoped_files = sorted(set(files + (brk_pr.get("_files") or [])))
             target_file = scoped_files[0] if scoped_files else ""
             commit_sha = pr.get("merge_commit_sha") or ""
-            guard = _infer_guard_from_commit(repo, commit_sha, target_file) if (commit_sha and target_file) else None
+            guard = _infer_guard_from_commit(repo, commit_sha, target_file, bootstrap_sev) if (commit_sha and target_file) else None
             synth = _llm_synthesize_record(
                 llm_url, llm_model, llm_key, "lesson",
                 {"pr_number": num, "title": title, "body": body, "breaking_pr": brk_num,
@@ -2453,7 +2468,8 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
             if synth:
                 llm_synthesized_count += 1
                 if not guard and isinstance(synth.get("guard"), dict) and _guard_passes_on_head(repo, synth["guard"], []):
-                    guard = synth["guard"]
+                    guard = dict(synth["guard"])
+                    guard["severity"] = bootstrap_sev
             rid = _alloc_id("lesson", year)
             rec_title = str((synth or {}).get("title") or inc.get("title") or title).strip()
             evidence = {
@@ -2520,7 +2536,7 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
             inc = issue_by_num.get(inc_num, {}) if inc_num else {}
             target_file = live_files[0]
             commit_sha = pr.get("merge_commit_sha") or ""
-            guard = _infer_guard_from_commit(repo, commit_sha, target_file) if (commit_sha and target_file) else None
+            guard = _infer_guard_from_commit(repo, commit_sha, target_file, bootstrap_sev) if (commit_sha and target_file) else None
             if guard and not _guard_passes_on_head(repo, guard, []):
                 guard = None
             synth = _llm_synthesize_record(
@@ -2530,7 +2546,8 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
             if synth:
                 llm_synthesized_count += 1
                 if not guard and isinstance(synth.get("guard"), dict) and _guard_passes_on_head(repo, synth["guard"], []):
-                    guard = synth["guard"]
+                    guard = dict(synth["guard"])
+                    guard["severity"] = bootstrap_sev
                 rid = _alloc_id(rec_kind, year)
                 rec_title = str(synth.get("title") or inc.get("title") or title).strip()
                 evidence = {
@@ -2592,7 +2609,14 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
 
         # Case 5: Closed-unmerged (rejected) PR with reviewer/rejection comments
         if not merged and pr.get("state") == "closed" and not re_eval_noise.search(title + " " + body):
-            comments_text = "\n\n".join(str(c.get("body") or "") for c in (pr.get("_comments") or [])).strip()
+            valid_comments = [
+                str(c.get("body") or "")
+                for c in (pr.get("_comments") or [])
+                if isinstance(c, dict)
+                and not c.get("bot")
+                and c.get("can_write", True) is True
+            ]
+            comments_text = "\n\n".join(valid_comments).strip()
             cited_ids = sorted(set(re.findall(r"\b(?:DEC|LES)-\d{4}-\d{3,}\b", comments_text + "\n" + body)))
             rej_ref = _format_proposal_ref(pr, num, gh_repo)
             if cited_ids and a.write:
@@ -2612,21 +2636,30 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
                 if matched_existing:
                     triage_counts["revert-lesson"] += 1
                     continue
-            if llm_url and comments_text and live_files and re.search(r"\b(?:reject|violat|do not|must not|cannot|blocked)\b", comments_text, re.I):
+            if (
+                llm_url
+                and comments_text
+                and not re_situational_close.search(comments_text)
+                and live_files
+                and re.search(r"\b(?:reject|violat|do not|must not|cannot|blocked)\b", comments_text, re.I)
+            ):
                 synth = _llm_synthesize_record(
                     llm_url, llm_model, llm_key, "lesson",
                     {"rejected_pr": num, "title": title, "body": body, "rejection_comments": comments_text, "files": live_files},
                 )
                 if synth:
                     llm_synthesized_count += 1
-                    guard = synth.get("guard") if (isinstance(synth.get("guard"), dict) and _guard_passes_on_head(repo, synth["guard"], [])) else None
+                    guard = None
+                    if isinstance(synth.get("guard"), dict) and _guard_passes_on_head(repo, synth["guard"], []):
+                        guard = dict(synth["guard"])
+                        guard["severity"] = "warn"
                     rid = _alloc_id("lesson", year)
                     rec_title = str(synth.get("title") or f"Rejected proposal #{num}: {title}").strip()
                     meta = {
                         "type": "lesson",
                         "id": rid,
                         "title": rec_title,
-                        "status": "active",
+                        "status": "rejected",
                         "date": date_str,
                         "scope": {"paths": live_files},
                         "evidence": {
@@ -2788,6 +2821,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--since", default="2y", help="history window to harvest (for example, 2y or 180d)")
     p.add_argument("--budget-minutes", type=int, default=120, help="wall-clock budget in minutes for bootstrap")
     p.add_argument("--write", action="store_true", help="write harvested records into knowledge/")
+    p.add_argument("--strict-block", action="store_true",
+                   help="emit bootstrapped guards with severity: block instead of the safe default severity: warn")
     p.add_argument("--unmanaged-namespaces", nargs="*", default=[],
                    help="explicit out-of-scope tenant namespaces to block in STATE_OF_BEING.md")
     p.add_argument("--enforce-namespace-boundary", action="store_true",

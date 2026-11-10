@@ -28,7 +28,7 @@ import (
 const curatorUsage = `curator - Go OKF Decision & Lesson Memory Curator for kube-agents
 
 usage:
-  curator daemon [flags]         subscribe to a2a.topics.shared.annotations, index into Hindsight, serve NATS memory queries, and publish blueprint digests
+  curator daemon [flags]         subscribe to SubjectCuratorOutcomes, index into Hindsight, serve NATS memory queries, and publish blueprint digests
   curator emit [flags]           publish a kube-agents.memory.outcome/v1 event and return the synthesized record metadata
   curator pending [flags]        list status:proposed OKF records awaiting pull request creation or review
   curator check [flags]          evaluate active and proposed OKF guards against changed files (exits 2 on block)
@@ -228,7 +228,7 @@ func runDaemon(args []string) error {
 
 func runEmit(args []string) error {
 	fs := flag.NewFlagSet("curator emit", flag.ContinueOnError)
-	kind := fs.String("kind", string(memory.OutcomeProposed), "outcome kind: proposed|approved|modified-merged|resolved-merged|pr-merged-persists|refused")
+	kind := fs.String("kind", string(memory.OutcomeProposed), "outcome kind: proposed|approved|modified-merged|resolved-merged|pr-merged-persists|refused|retired")
 	recordID := fs.String("id", "", "record ID (for example, DEC-2026-004 or LES-2026-011)")
 	recordType := fs.String("type", "", "record type: decision|lesson")
 	repo := fs.String("repo", defaultRepoID(), "repository identifier")
@@ -239,6 +239,8 @@ func runEmit(args []string) error {
 	summary := fs.String("summary", "", "human summary text")
 	rule := fs.String("rule", "", "guard rule text")
 	pr := fs.String("pr", "", "pull request reference")
+	remediationPR := fs.String("remediation-pr", "", "operational remediation pull request reference")
+	knowledgePR := fs.Bool("knowledge-pr", false, "true when the merged PR is the knowledge/ proposal PR itself")
 	reason := fs.String("reason", "", "reviewer or persistence reason")
 	initialProposal := fs.String("initial-proposal", "", "superseded initial agent proposal when modified before merge")
 	soakWindow := fs.String("soak-window", "", "post-merge soak window (for example, 10m, 24h, or 7d)")
@@ -247,7 +249,7 @@ func runEmit(args []string) error {
 	guardPath := fs.String("guard-path", "", "guard expect YAML path")
 	guardOp := fs.String("guard-op", "", "guard expect operator")
 	guardValue := fs.String("guard-value", "", "guard expect value")
-	guardSeverity := fs.String("guard-severity", "block", "guard severity: block|warn|info")
+	guardSeverity := fs.String("guard-severity", "warn", "guard severity: warn|block|info")
 	jsonSpec := fs.String("json", "", "raw OutcomeEvent JSON (inline or @file)")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -286,6 +288,8 @@ func runEmit(args []string) error {
 			Summary:         *summary,
 			Rule:            *rule,
 			PullRequest:     *pr,
+			RemediationPR:   *remediationPR,
+			KnowledgePR:     *knowledgePR,
 			ReviewerReason:  *reason,
 			InitialProposal: *initialProposal,
 			SoakWindow:      *soakWindow,
@@ -315,10 +319,6 @@ func runEmit(args []string) error {
 	if ev.Schema == "" {
 		ev.Schema = memory.OutcomeSchema
 	}
-	summaryText := ev.Summary
-	if summaryText == "" {
-		summaryText = fmt.Sprintf("Memory outcome %s (%s): %s", ev.Kind, ev.RecordID, ev.Title)
-	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -330,40 +330,22 @@ func runEmit(args []string) error {
 	defer client.Close()
 
 	corr := lib.NewCorrelationID()
-	action := "resolve"
-	if ev.Kind == memory.OutcomeProposed {
-		action = "propose"
+	outcomeRes, err := memory.PublishOutcome(ctx, client, ev)
+	if err != nil {
+		return err
 	}
-	var outcomeRes *memory.OutcomeProcessResult
-	if qResp, qErr := memory.QueryViaNATS(ctx, client, memory.MemoryQueryRequest{
-		Schema:  memory.MemoryQuerySchema,
-		Action:  action,
-		Outcome: &ev,
-	}); qErr == nil && qResp.Outcome != nil {
-		outcomeRes = qResp.Outcome
-		if ev.RecordID == "" {
-			ev.RecordID = outcomeRes.RecordID
-		}
-		if ev.Title == "" {
-			ev.Title = outcomeRes.Title
-		}
-	} else {
-		art, err := lib.NewTopicArtifact("annotations", summaryText, ev)
-		if err != nil {
-			return err
-		}
-		if err := client.PublishTopic(ctx, memory.SubjectAnnotations,
-			lib.Party{Session: busUser(), Profile: os.Getenv("A2A_PROFILE")},
-			"", "", corr, art); err != nil {
-			return err
-		}
+	if ev.RecordID == "" && outcomeRes.RecordID != "" {
+		ev.RecordID = outcomeRes.RecordID
+	}
+	if ev.Title == "" && outcomeRes.Title != "" {
+		ev.Title = outcomeRes.Title
 	}
 	out := map[string]any{
-		"published":      memory.SubjectAnnotations,
+		"published":      memory.SubjectCuratorOutcomes,
 		"correlation_id": corr,
 		"event":          ev,
 	}
-	if outcomeRes != nil {
+	if outcomeRes.RecordID != "" {
 		out["record_id"] = outcomeRes.RecordID
 		out["status"] = outcomeRes.Status
 		out["path"] = outcomeRes.Path

@@ -424,7 +424,7 @@ class WhyAndOutcomeTests(unittest.TestCase):
         self.assertEqual(out["outcome"], "modified-merged")
         rec = dm.parse_record((self.r.path / out["path"]).read_text(), out["path"])
         self.assertEqual(rec.status, "active")
-        self.assertEqual(rec.guard["severity"], "block")
+        self.assertEqual(rec.guard["severity"], "warn")
         self.assertEqual(rec.guard["expect"]["value"], "512Mi")
         self.assertEqual(rec.evidence.get("outcome"), "modified-merged")
         self.assertEqual(rec.evidence.get("rejected_proposals"), ["requests.memory: 384Mi"])
@@ -774,11 +774,13 @@ class MultiForgeTests(unittest.TestCase):
         self.assertIn("LES-2026-002", records)
         les = records["LES-2026-002"]
         self.assertIn("clusters/prod-eu/payments/checkout.yaml", les.scope["paths"])
+        self.assertEqual(les.guard["severity"], "warn")
         self.assertIn("!12", str(les.evidence.get("pull_request", "")))
         self.assertIn("!10", str(les.evidence.get("breaking_pr", "")))
         self.assertIn("DEC-2026-002", records)
         dec = records["DEC-2026-002"]
         self.assertIn("clusters/prod-eu/payments/namespace-quota.yaml", dec.scope["paths"])
+        self.assertEqual(dec.guard["severity"], "warn")
         self.assertIn("!15", str(dec.evidence.get("breaking_pr", "")))
 
 

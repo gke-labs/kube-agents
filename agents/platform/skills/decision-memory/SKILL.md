@@ -83,5 +83,5 @@ python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py --repo 
 ```
 
 Pass `--hindsight-url` (or set `HINDSIGHT_API_URL`) to query the `kube-agents-decisions` Hindsight bank.
-When `NATS_URL` is set, semantic recall queries route over NATS (`curator recall` on `_INBOX.agent.memory.query` / `a2a.memory.query`) with automatic cache invalidation when outcomes arrive on `a2a.topics.shared.annotations`.
+When `NATS_URL` is set, semantic recall queries route over NATS (`curator recall` on `_INBOX.agent.memory.query` / `a2a.memory.query`) with automatic cache invalidation when outcomes arrive on `_INBOX.agent.curator.outcomes` (`SubjectCuratorOutcomes`).
 Without Hindsight, `check`, `why`, and `dream` operate from git alone.

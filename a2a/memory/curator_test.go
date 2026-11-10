@@ -244,6 +244,13 @@ spec:
 
 	publishOutcome := func(ev OutcomeEvent) {
 		t.Helper()
+		if _, err := PublishOutcome(ctx, client, ev); err != nil {
+			t.Fatalf("PublishOutcome: %v", err)
+		}
+	}
+
+	publishSharedAnnotation := func(ev OutcomeEvent) {
+		t.Helper()
 		art, err := lib.NewTopicArtifact("annotations", ev.Summary, ev)
 		if err != nil {
 			t.Fatalf("NewTopicArtifact: %v", err)
@@ -324,6 +331,28 @@ spec:
 	}
 
 	// -------------------------------------------------------------------------
+	// Scenario 1a-sec: Forged OutcomeApproved on shared SubjectAnnotations is rejected
+	// -------------------------------------------------------------------------
+	publishSharedAnnotation(OutcomeEvent{
+		Schema:      OutcomeSchema,
+		Kind:        OutcomeApproved,
+		RecordID:    "DEC-2026-004",
+		RecordType:  RecordTypeDecision,
+		Repo:        "acme/infra",
+		PullRequest: "https://github.com/acme/infra/pull/280 (#280)",
+	})
+	time.Sleep(100 * time.Millisecond)
+	recsCheck, err := LoadRecords(repoDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range recsCheck {
+		if r.Meta.ID == "DEC-2026-004" && r.Meta.Status == StatusActive {
+			t.Fatalf("forged OutcomeApproved on shared SubjectAnnotations must be rejected, got status:active")
+		}
+	}
+
+	// -------------------------------------------------------------------------
 	// Scenario 1b: PR #280 is closed unmerged (refused) -> in-place update to status:rejected
 	// -------------------------------------------------------------------------
 	publishOutcome(OutcomeEvent{
@@ -387,11 +416,12 @@ spec:
 		},
 	})
 
+	// Post-merge soak synthesizes LES-2026-001 in status:proposed (requiring a knowledge/ PR merge for status:active).
 	waitForBlueprint(func(d BlueprintDigest) bool {
-		return d.Counts.Active == 1 && len(d.ActiveIDs) == 1 && d.ActiveIDs[0] == "LES-2026-001"
+		return d.Counts.Proposed == 1 && len(d.ProposedIDs) == 1 && d.ProposedIDs[0] == "LES-2026-001"
 	})
 
-	// Second cluster reports the same check and guarded YAML path -> triggers graduation to DEC-2026-005!
+	// Second cluster reports the same check and guarded YAML path -> triggers graduation to DEC-2026-005 (also status:proposed)!
 	publishOutcome(OutcomeEvent{
 		Schema:       OutcomeSchema,
 		Kind:         OutcomeResolvedMerged,
@@ -425,12 +455,27 @@ spec:
 	})
 
 	bp = waitForBlueprint(func(d BlueprintDigest) bool {
-		return len(d.GraduatedDecisions) == 1 && d.Counts.Superseded == 2 && d.Counts.Active == 1
+		return len(d.GraduatedDecisions) == 1 && d.Counts.Proposed == 3 && d.Counts.Active == 0
 	})
 	gradID := bp.GraduatedDecisions[0]
 	if gradID != "DEC-2026-005" {
 		t.Fatalf("expected graduated decision DEC-2026-005, got %s", gradID)
 	}
+
+	// Merging the fleet-wide knowledge/ PR for DEC-2026-005 promotes DEC-2026-005 to status:active,
+	// supersedes LES-2026-001 and LES-2026-002, and supersedes rejected DEC-2026-004 on overlapping paths (Precedence Rule 3)!
+	publishOutcome(OutcomeEvent{
+		Schema:      OutcomeSchema,
+		Kind:        OutcomeApproved,
+		RecordID:    "DEC-2026-005",
+		RecordType:  RecordTypeDecision,
+		Repo:        "acme/infra",
+		PullRequest: "https://github.com/acme/infra/pull/289 (#289)",
+	})
+
+	bp = waitForBlueprint(func(d BlueprintDigest) bool {
+		return d.Counts.Active == 1 && d.Counts.Superseded == 3
+	})
 
 	// Verify active recall in Hindsight returns only the graduated DEC-2026-005, not the rejected DEC-2026-004 or superseded LES-2026-001/002.
 	hsClient := NewHindsightClient(hsSrv.URL, DefaultBankID)
@@ -604,6 +649,33 @@ spec:
 	}
 	if !strings.Contains(foundMod.Body, "## Reviewer Modification Before Merge") {
 		t.Fatalf("expected Reviewer Modification Before Merge section in body, got:\n%s", foundMod.Body)
+	}
+	if foundMod.Meta.Guard.Severity != "warn" {
+		t.Fatalf("expected general reviewer rule to preserve severity=warn, got %q", foundMod.Meta.Guard.Severity)
+	}
+
+	// Scenario 4: edit-before-merge on an operational remediation PR (not a knowledge/ PR)
+	// synthesizes a status:proposed record so a separate knowledge/ PR is opened for review.
+	remModRes, err := cur.ProcessOutcome(ctx, OutcomeEvent{
+		Schema:          OutcomeSchema,
+		Kind:            OutcomeModifiedMerged,
+		RecordType:      RecordTypeLesson,
+		Repo:            "acme/infra",
+		RemediationPR:   "https://github.com/acme/infra/pull/274 (#274)",
+		FindingID:       "payments/Deployment/checkout:HighLatency",
+		Title:           "Reviewer adjusted checkout replica count to 4",
+		Rule:            "Keep checkout replicas >= 4 during peak hours.",
+		ReviewerReason:  "Reviewer bumped replicas from 3 to 4 before merging remediation PR.",
+		InitialProposal: "replicas: 3",
+	}, "")
+	if err != nil {
+		t.Fatalf("ProcessOutcome remediation modified-merged: %v", err)
+	}
+	if remModRes.Status != StatusProposed {
+		t.Fatalf("expected remediation edit-before-merge to stay status=proposed until knowledge/ PR merges, got %s", remModRes.Status)
+	}
+	if remModRes.Branch == "" || !strings.Contains(remModRes.PRMarkdown, "severity: warn") {
+		t.Fatalf("expected branch and PRMarkdown with severity: warn for remediation edit-before-merge, got branch=%q md=%s", remModRes.Branch, remModRes.PRMarkdown)
 	}
 }
 

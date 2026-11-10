@@ -833,9 +833,17 @@ func DetectCrossClusterRecurrences(records []Record, threshold int) []Recurrence
 	if threshold < 2 {
 		threshold = 2
 	}
+	coveredLessons := map[string]bool{}
+	for _, r := range records {
+		if r.Meta.Type == RecordTypeDecision && (r.Meta.Status == StatusProposed || r.Meta.Status == StatusActive) {
+			for _, sup := range r.Meta.Supersedes {
+				coveredLessons[sup] = true
+			}
+		}
+	}
 	byKey := map[string][]Record{}
 	for _, r := range records {
-		if r.Meta.Type != RecordTypeLesson {
+		if r.Meta.Type != RecordTypeLesson || coveredLessons[r.Meta.ID] {
 			continue
 		}
 		if r.Meta.Status != StatusActive && !(r.Meta.Status == StatusProposed && r.Meta.Evidence.Outcome == string(OutcomeResolvedMerged)) {
