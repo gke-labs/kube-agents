@@ -859,3 +859,27 @@ func TestSeenSecrets_QuotedYAMLStringDataIsUnescaped(t *testing.T) {
 		}
 	}
 }
+
+// A quoted stringData value with escapes in it is tracked as written too,
+// so an answer that quotes the manifest's raw form has it redacted; a quote
+// that never closes is not tracked with it.
+func TestSeenSecrets_QuotedYAMLStringDataRawFormIsTracked(t *testing.T) {
+	cases := []struct{ yaml, raw string }{
+		{`"synth\"pass\"0001"`, `synth\"pass\"0001`},
+		{`'synth''pass''0001'`, `synth''pass''0001`},
+		{`"synth\qpass-0001"`, `synth\qpass-0001`}, // not a YAML escape: kept as written
+	}
+	for _, tc := range cases {
+		var s seenSecrets
+		s.collectToolResult(terminalResult(t, "apiVersion: v1\nkind: Secret\nmetadata:\n  name: app-db\nstringData:\n  password: "+tc.yaml+"\n"))
+		answer := "The manifest sets password to " + tc.raw + " here."
+		if got := scrubAnswerText(answer, &s); strings.Contains(got, tc.raw) {
+			t.Errorf("stringData %s: the raw form survived: %q", tc.yaml, got)
+		}
+	}
+	var s seenSecrets
+	s.collectToolResult(terminalResult(t, "apiVersion: v1\nkind: Secret\nmetadata:\n  name: app-db\nstringData:\n  password: \"synthetic-open-0006\n"))
+	if !s.has("synthetic-open-0006") {
+		t.Errorf("an unclosed quote: the value is not tracked without its quote; set %q", s.values())
+	}
+}

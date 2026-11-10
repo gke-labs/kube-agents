@@ -703,27 +703,35 @@ func (c *toolResultCollector) yamlScope(lines []string) {
 		if em == nil || seenSecretKeySkipped(em[1], saToken) {
 			continue
 		}
-		v := yamlScalar(em[2])
-		if block == "data" {
-			c.addSecretEncoded(v)
-		} else {
-			c.addSecret(v)
+		// Both forms of a quoted value with escapes in it: an answer may
+		// repeat the value or quote the manifest as written.
+		v, raw := yamlScalar(em[2])
+		for _, x := range slices.Compact([]string{v, raw}) {
+			if block == "data" {
+				c.addSecretEncoded(x)
+			} else {
+				c.addSecret(x)
+			}
 		}
 	}
 }
 
-// yamlScalar is an entry's value: a quoted one's contents, its escapes
-// read (yamlQuoted), else the value with a trailing comment taken off.
-func yamlScalar(v string) string {
+// yamlScalar is an entry's value: a quoted one's contents with its escapes
+// read, and raw, the contents as written between the quotes (yamlQuoted),
+// else the value with a trailing comment taken off (and an opening quote
+// that never closes), raw the same.
+func yamlScalar(v string) (value, raw string) {
 	if len(v) >= 2 && (v[0] == '"' || v[0] == '\'') {
-		if q, ok := yamlQuoted(v); ok {
-			return q
+		if q, r, ok := yamlQuoted(v); ok {
+			return q, r
 		}
+		v = v[1:]
 	}
 	if i := strings.Index(v, " #"); i >= 0 {
 		v = v[:i]
 	}
-	return strings.TrimSpace(v)
+	v = strings.TrimSpace(v)
+	return v, v
 }
 
 func yamlIndent(l string) int {
@@ -737,53 +745,68 @@ var yamlEscapes = map[byte]string{
 	'_': "\u00a0", 'L': "\u2028", 'P': "\u2029",
 }
 
-// yamlQuoted is the content of the quoted scalar v opens with: in double
-// quotes with its backslash escapes read, in single quotes with each
-// doubled quote read as one. ok is false when the quote does not close or
-// an escape is not YAML's.
-func yamlQuoted(v string) (string, bool) {
-	var sb strings.Builder
-	if v[0] == '\'' {
-		for i := 1; i < len(v); i++ {
-			if v[i] != '\'' {
-				sb.WriteByte(v[i])
-				continue
-			}
-			if i+1 < len(v) && v[i+1] == '\'' {
-				sb.WriteByte('\'')
-				i++
-				continue
-			}
-			return sb.String(), true
-		}
-		return "", false
-	}
-	for i := 1; i < len(v); i++ {
-		switch v[i] {
-		case '"':
-			return sb.String(), true
-		case '\\':
-			if i+1 >= len(v) {
-				return "", false
-			}
+// yamlQuoted reads the quoted scalar v opens with: raw is its contents as
+// written, value the same with its escapes read (in double quotes the
+// backslash escapes, in single quotes each doubled quote as one), or raw
+// again when an escape is not YAML's. ok is false when the quote does not
+// close.
+func yamlQuoted(v string) (value, raw string, ok bool) {
+	q := v[0]
+	end := -1
+	for i := 1; i < len(v) && end < 0; i++ {
+		switch {
+		case q == '"' && v[i] == '\\':
 			i++
-			if e, ok := yamlEscapes[v[i]]; ok {
-				sb.WriteString(e)
-				continue
-			}
-			n := map[byte]int{'x': 2, 'u': 4, 'U': 8}[v[i]]
-			if n == 0 || i+n >= len(v) {
-				return "", false
-			}
-			r, err := strconv.ParseUint(v[i+1:i+1+n], 16, 32)
-			if err != nil || !utf8.ValidRune(rune(r)) {
-				return "", false
-			}
-			sb.WriteRune(rune(r))
-			i += n
+		case v[i] != q:
+		case q == '\'' && i+1 < len(v) && v[i+1] == '\'':
+			i++
 		default:
-			sb.WriteByte(v[i])
+			end = i
 		}
 	}
-	return "", false
+	if end < 0 {
+		return "", "", false
+	}
+	raw = v[1:end]
+	if q == '\'' {
+		return strings.ReplaceAll(raw, "''", "'"), raw, true
+	}
+	if value, ok = yamlUnescape(raw); !ok {
+		value = raw
+	}
+	return value, raw, true
+}
+
+// yamlUnescape reads the backslash escapes of a double-quoted scalar's
+// contents; ok is false when one is not YAML's.
+func yamlUnescape(raw string) (string, bool) {
+	if !strings.Contains(raw, "\\") {
+		return raw, true
+	}
+	var sb strings.Builder
+	for i := 0; i < len(raw); i++ {
+		if raw[i] != '\\' {
+			sb.WriteByte(raw[i])
+			continue
+		}
+		if i+1 >= len(raw) {
+			return "", false
+		}
+		i++
+		if e, ok := yamlEscapes[raw[i]]; ok {
+			sb.WriteString(e)
+			continue
+		}
+		n := map[byte]int{'x': 2, 'u': 4, 'U': 8}[raw[i]]
+		if n == 0 || i+n >= len(raw) {
+			return "", false
+		}
+		r, err := strconv.ParseUint(raw[i+1:i+1+n], 16, 32)
+		if err != nil || !utf8.ValidRune(rune(r)) {
+			return "", false
+		}
+		sb.WriteRune(rune(r))
+		i += n
+	}
+	return sb.String(), true
 }
