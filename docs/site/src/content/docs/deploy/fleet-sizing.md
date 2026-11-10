@@ -92,7 +92,8 @@ Two optional stacks add to the total:
   Each NATS server's metrics exporter is sized for up to about 2,000 JetStream consumers, which
   is about 1,000 clusters at two consumers per AgentProfile. Its memory and CPU grow with the
   consumer count, and past that it nears its 192 MiB limit. On an Autopilot cluster without Pod
-  bursting, the limit becomes the 96 MiB request, so the ceiling there is lower.
+  bursting, the limit becomes the 96 MiB request, so the ceiling there is about 1,500 consumers,
+  or about 750 clusters.
 
 ## The host cluster
 

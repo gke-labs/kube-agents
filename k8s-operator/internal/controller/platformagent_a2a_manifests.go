@@ -215,11 +215,13 @@ const (
 	// ceiling (about 1,000 clusters' profiles); past it the exporter nears
 	// its memory limit, and an OOM kill takes the container and so the pod's
 	// readiness. On an Autopilot cluster without Pod bursting the limit is
-	// rewritten to the request, so the ceiling there is lower: the exporter
-	// nears 96Mi before 2,000 consumers. The CPU request is the stack's
-	// floor, 50m, rather than what the exporter uses idle, so a namespace
-	// LimitRange that admits the bus's other containers admits this one: a
-	// refused sidecar would keep its server out of the bus.
+	// rewritten to the request, so the ceiling there is lower: about 1,500
+	// consumers (about 750 clusters), from the measurements above with
+	// headroom under 96Mi, since GOMEMLIMIT sits above that limit and
+	// collects no earlier. The CPU request is the stack's floor, 50m,
+	// rather than what the exporter uses idle, so a namespace LimitRange
+	// that admits the bus's other containers admits this one: a refused
+	// sidecar would keep its server out of the bus.
 	a2aNATSExporterCPURequest    = "50m"
 	a2aNATSExporterMemoryRequest = "96Mi"
 	a2aNATSExporterCPULimit      = "500m"
