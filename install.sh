@@ -505,8 +505,9 @@ PARAM_KMS_KEY="${KMS_KEY:-}"
 # a default name the file records never counts as given: an older install
 # turning the minter on (by flag, the interview, or a GITHUB_APP_ID added to
 # the file by hand) would otherwise adopt, as its own, the unlabelled default
-# key another install may hold. Named by a flag or the environment, as an
-# environment rebuild names it, the default still counts.
+# key another install may hold. Named by a flag, or by the environment when
+# the file has no line for it (an environment rebuild), the default still
+# counts; a line in the file overwrites what the shell exported.
 #
 # Fails closed when the default isn't known yet (a first curl | bash run, before
 # install.defaults.env is on disk): a name the file records then doesn't count
@@ -6070,6 +6071,12 @@ validate_non_interactive_minter_config() {
     print_error "GitHub App ID ('${app_id}') was provided in non-interactive mode, but no ENABLED KMS key exists in ${keyring}/${key} and no --github-pem-path was provided."
     print_minter_restore_advice "$key" "$keyring" "$kms_loc" "$project_id" ||
       print_info "To enable the token minter, provide --github-pem-path=<path-to-pem> for automated import, or pre-import the private key into Cloud KMS (AOT)."
+    # Derived names on a key that doesn't exist are what a re-run gets after an
+    # earlier run chose the project-wide default names by flag: install.env
+    # records them, and recorded defaults don't count (minter_name_given).
+    if [ "${PARAM_KMS_KEYRING_GIVEN:-false}" != "true" ] || [ "${PARAM_KMS_KEY_GIVEN:-false}" != "true" ]; then
+      print_info "If an earlier run named this install's key with --kms-keyring and --kms-key, pass both again: install.env doesn't keep a choice of the default names."
+    fi
     print_info "To install without the token minter, omit --github-app-id."
     return 1
   fi

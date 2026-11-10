@@ -1673,6 +1673,14 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
         proc4 = self._run_install_func(cmd4)
         self.assertEqual(proc4.returncode, 1, proc4.stderr)
         self.assertIn("provided in non-interactive mode, but no ENABLED KMS key exists", proc4.stdout + proc4.stderr)
+        # Names this run didn't give: maybe an earlier run's default names, which
+        # install.env doesn't keep as a choice (#3504). Named by flag, no such hint.
+        self.assertIn("pass both again", proc4.stdout + proc4.stderr)
+        proc4g = self._run_install_func(
+            f'{_SOURCE_INSTALLER_COMMON}kms_key_enabled_version() {{ echo ""; }}; '
+            'PARAM_KMS_KEYRING_GIVEN=true PARAM_KMS_KEY_GIVEN=true; '
+            'validate_non_interactive_minter_config "12345" "" "ring" "key" "us-central1" "p1" "my-org"')
+        self.assertNotIn("pass both again", proc4g.stdout + proc4g.stderr)
 
         # 4b. The same, but the key's versions are scheduled for destruction -> the
         # restore is named instead of the import, and the run still stops.
