@@ -170,7 +170,8 @@ is this loop and nothing less, unless one of the two agent-behaviour exemptions 
 
 - the case id, and whether it is new or existing;
 - red: the install and the `main` commit it ran against, the failing check's name, and the run's
-  build id or directory path (the record stays in the run: [`public_surfaces.md`](public_surfaces.md));
+  build id or directory path (the record stays in the run: [`public_surfaces.md`](public_surfaces.md);
+  a dev run's directory is shared with the reviewer who asks, off GitHub);
 - green: the three runs' build ids or directory paths against the branch's build;
 - where the case is registered, or the exemption (one line, or the fuller record the two
   agent-behaviour exemptions take).
