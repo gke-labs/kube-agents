@@ -174,8 +174,9 @@ the sized fleet's install in the soak window, once each, through the eval harnes
 `upgrade-chat-request-runs-collector` checks the commands the agent runs, so it runs as it is. The
 other two check that the answer names the pool's clusters (`seeded-a`, `seeded-b`, `seeded-c`), so
 the lane runs a variant of each, `chat-routing-fleet-question-sized` and `agent-kanban-smoke-sized`,
-whose checks name the sized fleet's clusters instead. The runner names a size's clusters the same
-way every night (`scale-m-01` to `scale-m-08` at M), so a variant's names are fixed in its case file.
+whose checks address the sized fleet by its fixture role (`sized-fleet-m`) instead, as the case
+format asks ([`bench-case-format.md`](bench-case-format.md)): the runner resolves the role to the
+size's cluster names from the fixture catalogue.
 The originals stay on the eval nightlies; this lane is one more run of each question, at fleet scale. A file,
 `hack/eval/sized-fleet-cases.txt`, lists them, so a case joins or leaves in one line. Their results
 are eval records, in the eval dashboard under their own lane; they do not change the scale verdict.
@@ -192,12 +193,9 @@ one night M does not, so the two never share the install or the project:
 
 S has no scheduled run; it is for a run by hand on a smaller budget.
 
-**Where it runs.** A Prow periodic, beside the eval nightlies, in its own GCP project. The eval pool
-projects cannot hold the fleet: L needs 16 clusters and 500 vCPU, and the pool's projects are
-leased by the eval jobs. The periodic's configuration is in `oss-test-infra`, outside this
-repository; this repository holds the script it runs, `hack/ci-scale-nightly.sh`. Every test
-cluster carries the plan's `cluster_label`, and the runner creates and deletes no cluster without
-it.
+**Where it runs.** Two Prow periodics in `oss-test-infra`, one for M and one for L, in the scale
+project rather than the eval pool: L needs 16 clusters and 500 vCPU, and the eval jobs lease the
+pool's projects. This repository holds the script they run, `hack/ci-scale-nightly.sh`.
 
 **Quota and network.** At L: 16 clusters, 500 nodes, 500 vCPU of the general CPU quota, 500 node IP
 addresses. Each
@@ -220,6 +218,44 @@ The last check keeps a broken fixture from reading as a pass or as a regression.
 event for about an hour, so the runner reads `SandboxChanged` events and the nodes' `OOMKilling`
 lines from Cloud Logging over the whole run, not from the API at the end. Restarts and OOMKilled
 terminations come from the Pods' status, which the runner already collects.
+
+## How the fleet is built, and who may build it
+
+The sized fleet follows the seeded fleet's pattern (`bench/tf/fleet/`, `docs/ci-pool-projects.md`
+section 6), with one difference: the seeded fleet stands, and the sized fleet is built and deleted
+on every run, because 250 nodes standing all month would cost about 25 times a nightly's nodes.
+
+| Part                | Seeded fleet                                                                                           | Sized fleet                                                                                                                                                                                                                                                   |
+| ------------------- | ------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Declaration         | An OpenTofu stack, `bench/tf/fleet/`                                                                   | An OpenTofu stack, `bench/tf/sized-fleet/`: the subnets, the clusters and their one node pool each, sized by a `size` variable from `bench/scale/fleet-sizes.yaml`. The runner applies the workloads with `kubectl`, because their count is in the thousands. |
+| State               | Remote, in the project's `<project>-tf-state` bucket, prefix `seeded-fleet`                            | The same bucket, prefix `sized-fleet-<size>`                                                                                                                                                                                                                  |
+| The only writer     | `hack/fleet_reconcile.py`, from a `main` checkout                                                      | `hack/sized_fleet.py up` and `down`, from a `main` checkout; a run by hand goes through it too                                                                                                                                                                |
+| Who runs it         | `seeded-fleet-reconciler`, its own identity, in `main`-only Prow jobs                                  | `sized-fleet-runner`, its own identity, in the two `main`-only periodics. No presubmit runs as it, because a presubmit runs a pull request's code.                                                                                                            |
+| Job logs            | `kube-agents-periodic-logs`, a bucket kube-agents owns                                                 | The same bucket                                                                                                                                                                                                                                               |
+| Labels              | `managed-by=kube-agents-seeded-fleet`, apart from the bench clusters' label                            | `managed-by=kube-agents-sized-fleet`, apart from both, so neither the bench sweep nor the seeded fleet's tooling matches a sized cluster                                                                                                                      |
+| Fixture catalogue   | Roles in `bench/tf/fleet/fixtures.json`, each with a designed state that a scan checks                 | Roles `sized-fleet-s`, `sized-fleet-m` and `sized-fleet-l`, with their designed state (cluster count, node count, workloads ready, churn rate); the run's soundness check is that scan                                                                        |
+| Kubeconfigs by role | `hack/fleet-kubeconfigs.sh`                                                                            | The same script, which learns the sized roles, so the eval harness reaches the sized fleet by role                                                                                                                                                            |
+| Orphans             | The standing fleet has none                                                                            | `down` runs in the script's exit trap, and a sweep at the start of each run deletes any cluster with the sized label older than 8 hours                                                                                                                       |
+| Watching            | The CI health bot reads each run and posts a failed or overdue one ([`ci-health.md`](../ci-health.md)) | The same bot watches the two periodics                                                                                                                                                                                                                        |
+
+**The identity.** `sized-fleet-runner` is set up as the seeded fleet's reconciler and the eval
+baseline recorder were ([`eval-scorer.md`](eval-scorer.md) has the recipe): a service account in the
+Prow project, a Kubernetes service account of the same name in the build cluster's `test-pods`
+namespace bound to it through Workload Identity, and object admin on `kube-agents-periodic-logs`. On
+the scale project it holds only what a run needs:
+
+| Role                                                                          | Why                                                                                 |
+| ----------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| `roles/container.admin`                                                       | Create and delete the test clusters; reset the install's state on the host cluster. |
+| `roles/compute.networkAdmin`                                                  | Create and delete each cluster's subnet.                                            |
+| `roles/iam.serviceAccountUser`, on the nodes' service account                 | Create node pools that run as that account.                                         |
+| `roles/logging.viewer`, `roles/monitoring.viewer`                             | Read the events, node OOM kills and container figures the verdict and records use.  |
+| `roles/serviceusage.serviceUsageConsumer`                                     | Bill its API calls, such as the Catalog API's price reads, to the project.          |
+| Object admin under `sized-fleet-` in the state bucket, and list on the bucket | Keep the OpenTofu state, and nothing else in that bucket.                           |
+| Object admin on the results bucket                                            | Write the verdict, the measurements and the cost record.                            |
+
+Like the reconciler, the identity could do more on the scale project than one run needs; what
+bounds it is that only `main`-only jobs run as it.
 
 ## Logs and records
 
@@ -272,10 +308,12 @@ gives the real figure for every run.
 
 Each item is its own pull request after this design merges.
 
-1. **Sizes and the fleet builder.** `bench/scale/fleet-sizes.yaml`; the runner creates each
-   cluster with one node pool of `n1-standard-1` nodes and the two resource labels; `fixtures.py`
-   gains the HTTP Deployments with their Services, the CronJob clients with spread start minutes,
-   and the failing Pods. One live M run is the evidence.
+1. **Sizes and the fleet stack.** `bench/scale/fleet-sizes.yaml`; `bench/tf/sized-fleet/` (the
+   subnets, the clusters, one node pool of `n1-standard-1` nodes each, the labels) and
+   `hack/sized_fleet.py up` and `down`; `fixtures.py` gains the HTTP Deployments with their
+   Services, the CronJob clients with spread start minutes, and the failing Pods; the
+   `sized-fleet-*` roles in the fixture catalogue and in `hack/fleet-kubeconfigs.sh`. One live M
+   run by hand is the evidence.
 2. **The run plan and the verdict.** `bench/scale/nightly.yaml` (the five steps and the two
    windows) and `bench/kube_agents_bench/scale/verdict.py`, with unit tests for each check. The
    runner already has `reset_soak` and `trigger_soak`, and in `operations.py` `trigger_jobs`,
@@ -283,12 +321,13 @@ Each item is its own pull request after this design merges.
    every job at once, so the 5-minute stagger is new. The Cloud Logging reads for events and node
    OOM kills are new.
 3. **The records.** The upload to the results bucket, the size and window in the record key, the
-   cost record with its price table, and the billing-export query.
+   cost record with its price table.
 4. **The chat cases.** The two `-sized` variants, `hack/eval/sized-fleet-cases.txt`, and the soak
    window's call to the eval harness against the sized install.
-5. **The nightly.** `hack/ci-scale-nightly.sh`, the GCP project's provisioning, and the periodic
-   in `oss-test-infra`. The script always deletes the fleet, also when a step fails, and the sweep
-   in step 1 deletes clusters an aborted run left.
+5. **The nightly.** `hack/ci-scale-nightly.sh`, the `sized-fleet-runner` identity and its grants,
+   the two periodics in `oss-test-infra`, and the CI health bot's watch on them. The script always
+   runs `down`, also when a step fails, and the sweep in step 1 deletes clusters an aborted run
+   left.
 
 ## Open questions
 
