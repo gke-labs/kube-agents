@@ -1071,11 +1071,10 @@
 # agent model of the day it missed on unrelated pull requests and on main's
 # eval-next across 42 runs, the store's record at would-demote. Part of the
 # misses were provider 429s (#3399, a fix proposed in #3448); the rest were
-# real: the agent read seeded-c's leftover masterAuthorizedNetworksConfig
-# {gcpPublicCidrsAccessEnabled: true} (no `enabled`) as configured or open
-# and said seeded-c matches its peers, or named the wrong facet, or a tool
-# error. The nightlies since the model change of 2026-10-19 pass it. The
-# fix landed in #3609 (2026-10-23); #3448 closed unmerged. Measured green on
+# the agent's own (#3598 has the shapes; the fixture fact behind them is
+# seeded-c's leftover masterAuthorizedNetworksConfig block with no
+# `enabled`). The nightlies since the model change of 2026-10-19 pass it.
+# The fix landed in #3609 (2026-10-23); #3448 closed unmerged. Measured green on
 # #3975's two lanes, then green on the inject lane with the route reverted
 # (#4116), so a presubmit seat could not fail when the fix is undone:
 # the case stays nightly by the decision on #3975's review thread. No CI lane
@@ -1109,7 +1108,7 @@
 # does not exist (scope_exclude, absent: 1): three excluded against the three
 # a pool install still manages. One stream by its SOP (compliance-audit), so
 # the session runs it and the report store shows the outcome. Not reproduced
-# on demand (three passes on main on a dev install); a red is #3933 evidence
+# on demand (clean on main on a dev install); a red is #3933 evidence
 # only when its answer reads the managed clusters as excluded (the case header
 # says how to read one). deployer: noop; an audit, so 3000 s of delegation wait.
 ./tasks/fleet-audit-as-many-excluded-as-managed/task.yaml

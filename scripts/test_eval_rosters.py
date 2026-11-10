@@ -1472,6 +1472,12 @@ ROSTER_COMMENT_FILES = sorted(eval_rosters.EVAL_DIR.glob("*.txt"))
 # (`1.36.3`, `v0.17.0`, `GKE 1.36`), a section reference (`§1.5`) or a
 # longer number.
 JUDGE_READING_RE = re.compile(r"(?<!GKE )(?<![\w.§])[01]\.\d+(?![\w.])")
+# A result counted in words (`three passes`, `two failed repetitions`, `one
+# repetition failed`); `three repetitions` alone is the run's configuration.
+WORD_NUMBERS = "one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve"
+WORD_COUNT_RE = re.compile(
+    rf"\b({WORD_NUMBERS}) ((failed |passing |scored |graded )repetitions?|passes|misses)\b"
+    rf"|\b({WORD_NUMBERS}) repetitions? (passed|failed|pass|fail)\b")
 RESULT_SHAPES = {
     "a pass ratio (N/M)": re.compile(r"\b\d+/\d+\b"),
     "a count of passes (N of M)": re.compile(r"\b\d+ of \d+\b"),
@@ -1481,6 +1487,7 @@ RESULT_SHAPES = {
     "a repetition count": re.compile(r"\b\d+ (graded |passing )?repetitions?\b"),
     "a miss count": re.compile(r"\b\d+ misses\b"),
     "a per-repetition verdict": re.compile(r"passed every|failed every|fails every|nights in a row"),
+    "a count of passes or misses in words": WORD_COUNT_RE,
 }
 # Exact substrings of the comment lines where a number is a budget or
 # infrastructure fact, not a run's result. Short on purpose: a new entry
@@ -1494,6 +1501,8 @@ RESULT_SHAPE_ALLOWLIST = {
     "The chain is 72 to 85% of the build, 79% summed",
     # nightly-cases.txt: the fixture scan over the pool projects, infrastructure.
     "reads the role healthy on 40 of 40",
+    # blocking-roster.txt: rung 4's definition, a rule constant.
+    "three failed repetitions red the job",
 }
 RESULT_SHAPE_RULE = (
     "a roster comment states the outcome and cites the run; the numbers are on the "

@@ -179,9 +179,9 @@ layout and are collected from the moment they start running.
       (`classify.py`, `health.py`) count it apart from the storm reps — it is
       not lost to 429s — and outside every pass-rate denominator; `classify.py`
       classes a case whose ungraded reps are all of this kind
-      `delegation-ceiling`. The run page, the PR view and the PR comment's
-      result cell count it in a case's total and name it apart; the Cases
-      page's per-run counts (`render.rep_counts`) still fold it into `infra`.
+      `delegation-ceiling`. The run page and the PR view count it in a case's
+      total and name it apart; the Cases page's per-run counts
+      (`render.rep_counts`) still fold it into `infra`.
       An `infra` rep whose `reason` carries `fixture-drift:<role>` is a
       **fixture** rep: `hack/ci-eval-pr.sh` recorded it without running it
       because the lease-time seeded-fleet scan saw a fixture the case needs

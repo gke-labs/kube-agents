@@ -107,9 +107,8 @@
 # twelve main nightlies that graded it 2026-10-13 to 10-26 (UTC build start;
 # 10-21's build uploaded nothing and 10-25's hit its deadline before
 # grading): a miss on the 10-16 nightly, before the model change, the
-# agent's own (the Platform Agent fanned the audit out to cluster agents;
-# one filed the right ledger, and the final answer carried no ledger URL);
-# clean on the five graded nights since the model change of 2026-10-19 and
+# agent's own (a ledger-path miss, no issue filed); clean on the five
+# graded nights since the model change of 2026-10-19 and
 # under spec.mode next on 10-24 (one infra repetition set aside) and 10-26,
 # median repetition 198s (165-397s) over those nights. The record is on the
 # domain scorecard. The evidence store reads `collecting`

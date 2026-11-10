@@ -89,7 +89,8 @@ cleaned up.
 For a genuinely graphical surface (admin console, docs site, chat), capture and link a
 screenshot with `scripts/pr_evidence_screenshot.sh` — it publishes the image and prints
 Markdown stamped with the commit and capture time. Command output stays as fenced text
-transcripts, not screenshots.
+transcripts, not screenshots, for runtime changes; an eval run's output stays in its run
+directory (.agents/rules/public_surfaces.md).
 
 If the install is shared with other agents, take the lease first: see
 docs/designs/live-test-lease.md.

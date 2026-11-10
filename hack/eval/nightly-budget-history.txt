@@ -207,8 +207,8 @@
 # against its 2400s hint, most of it the stack's apply waiting out the four
 # audits. The main part's infra-lock chain ran from 00:22 to 07:54 with four
 # stack repetitions still owed, and the deadline cut the night at 32 of 73
-# cases graded; the same chain without the case measured ~288 minutes. All
-# three repetitions also graded blocked: the prompt asks for a turn with no
+# cases graded; the same chain without the case measured ~288 minutes. Every
+# repetition also graded blocked: the prompt asks for a turn with no
 # tool call, and the gate's liveness rung reads an empty trajectory as no
 # agent run (bench/kube_agents_bench/scoring.py, _liveness_failures), so the
 # case cannot record a pass or a fail as written (#2699's tool_calls_optional

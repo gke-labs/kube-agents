@@ -152,14 +152,12 @@ roster line on 2026-11-02 (its bullet stays for the record):
   2026-10-20, across 42 runs, the store's record at `would-demote`. Part of the misses were
   provider 429s
   ([#3399](https://github.com/gke-labs/kube-agents/issues/3399), a fix proposed in
-  [#3448](https://github.com/gke-labs/kube-agents/pull/3448)). The rest were the agent
-  being wrong, not a narrow reference: seeded-c, which never enabled authorized networks,
-  still returns `masterAuthorizedNetworksConfig: {gcpPublicCidrsAccessEnabled: true}` with no
-  `enabled`, and the agent read that leftover block as configured or open and said seeded-c
-  matches its peers, or named the wrong facet (NetworkPolicies, Pod Security, database
-  encryption), or once, a tool error (a grep that missed seeded-c in its own saved cluster
-  list). The rung-4 collapses include #2997; `main`'s red was rung 6. The nightlies since the
-  agent model change of 2026-10-19 passed every scored repetition. Its removal left
+  [#3448](https://github.com/gke-labs/kube-agents/pull/3448)). The rest were the agent's
+  own, not a narrow reference (#3598 has the shapes; the fixture fact behind them is that
+  seeded-c, which never enabled authorized networks, still returns
+  `masterAuthorizedNetworksConfig: {gcpPublicCidrsAccessEnabled: true}` with no `enabled`).
+  The rung-4 collapses include #2997; `main`'s red was rung 6. The nightlies since the
+  agent model change of 2026-10-19 are clean. Its removal left
   `consistency` with no presubmit case, so the domain was on the `domains.yaml` allowlist until
   consistency-drift-outlier took a roster seat on 2026-10-26 (below). The agent-side fix landed
   in [#3609](https://github.com/gke-labs/kube-agents/pull/3609) on 2026-10-23: a named-cluster
@@ -724,7 +722,8 @@ Admitted-case pass rate: <rate> (main: <main rate>, margin 10.0%)
 
 The margin is `EVAL_AGGREGATE_MARGIN`, default 0.10, measured on 2026-09-29 against 94 green
 presubmit runs since 2026-09-26 and the four clean nightlies: the worst unchanged run fell 0.063
-below `main` (five failed repetitions of 36; the 0.05 the rule shipped with would have redded it),
+below `main` (that window's failed repetitions are on the dashboard; the 0.05 the rule shipped
+with would have redded it),
 and 0.10 reds none of them while redding the seventh failed repetition at `main`'s rate that day,
 the sixth once `main` sits near 0.94. The measurement and the two-proportion alternative are in
 [the scorer design](designs/eval-scorer.md#sizing-the-aggregate-margin-measured-2026-09-29).
@@ -1136,9 +1135,9 @@ to have shown all of the following first, and the decision is still a team one a
    nights since oss-test-infra#2707, 20 of the 45 cases with all four nights moved 0 points
    and 31 moved at most one repetition, so the bar moved from 0.95 (19 of 20, a number nobody
    had chosen from data) to 0.90, the bar the entries above already hold a case to. At 0.95
-   the record would have demoted 6 of the 12 roster cases (17/21, 19/21, 18/21, 18/21, 18/20,
-   16/20); at 0.90 it demotes 4, and the two that flip are the ones one miss short of the
-   old bar. This item is not "holds" yet: one reading, and the four that remain below the
+   the record would have demoted half the roster cases, read over their windows at the time;
+   at 0.90 fewer, the ones that flip being one miss short of the old bar (the numbers are on
+   the dashboard). This item is not "holds" yet: one reading, and the four that remain below the
    bar are not one story — the two crashloop cases miss this week only, capacity misses in
    both weeks, and upgrades-lagging-master-probe's misses are all from 09-20 to 09-25, clean
    since.
