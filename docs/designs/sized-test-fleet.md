@@ -30,6 +30,19 @@ run writes logs of its cost and its resource use. A second design, the capabilit
 attribution design, uses the same two windows to divide memory and model tokens among the agent's
 capabilities.
 
+## Success criteria
+
+Ten questions define success for this design and the capability usage attribution design together.
+They are numbered C1 to C10 in both. This design owns C5, C6 and C7; the attribution design owns
+the other seven, which are about cost and use. A criterion is met when the reports answer it for M
+on 7 nights in a row and for L on 4 weeks in a row, from runs that the verdict marks sound.
+
+| #   | Question                                                                     | The report shows                                                                                                                                                  |
+| --- | ---------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| C5  | Does the install fit its documented container sizes, and with what headroom? | For each container and size, the peak memory and CPU in each window against its limit, as a percentage. A container above 80 % of its limit at a size is flagged. |
+| C6  | Does every audit still finish, and does nothing crash, at each size?         | The verdict for each run: each check passed or failed, with the audits' end times and any restart, OOMKill or node OOM kill named.                                |
+| C7  | How long does a new install take to deliver its first reports, at each size? | From the install's start: the inventory scan's settle time, each first-run audit's end time, and the burst window's length, for each size.                        |
+
 ## Why
 
 The scale work in [`agent-harness-bottlenecks.md`](agent-harness-bottlenecks.md) measured limits
