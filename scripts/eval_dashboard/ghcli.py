@@ -15,16 +15,39 @@ carries on. Nothing here raises past a caller.
 `--dry-run` turns writes into a printed description of the request; reads
 still happen, so a dry run can say "would edit comment 123" rather than
 "would post".
+
+Two repositories. SOURCE_REPO is this one: the pull requests, the case
+notes' issues and the domains.yaml allowlist issues live there whatever else
+is set. DEFAULT_REPO is where the bots file and read their own issues:
+SOURCE_REPO unless KUBE_AGENTS_ISSUES_REPO names another (a private triage
+repository), in which case the workflow also mints a token that can write
+there. The issue filers and their readers follow it through their `--repo`
+default: nightly_bugs, coverage_gaps, post_health and gate_issue,
+understudies, weekly_email, and nightly_digest through the Gh they are
+handed. gate_comment does not: it comments on pull requests, which stay in
+SOURCE_REPO. Every issue the bots mention is written as a full URL
+(issue_url), so it resolves wherever it is read.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import re
 import subprocess
 import sys
 
 GH_BIN = "gh"
-DEFAULT_REPO = "gke-labs/kube-agents"
+SOURCE_REPO = "gke-labs/kube-agents"
+ISSUES_REPO_ENV = "KUBE_AGENTS_ISSUES_REPO"
+DEFAULT_REPO = os.environ.get(ISSUES_REPO_ENV) or SOURCE_REPO
+ISSUE_URL = "https://github.com/{repo}/issues/{number}"
+# The two forms an issue reference takes: "#N", an issue of SOURCE_REPO (how
+# case-notes.yaml and the domains.yaml allowlist write theirs), or the full
+# URL the bots write. issue_key reads either to (repo, number), so a list
+# can be searched for an issue whichever form it was written in.
+ISSUE_REF_RE = re.compile(r"^(?:#|https://github\.com/(?P<repo>[^/\s]+/[^/\s]+)/issues/)(?P<number>\d+)$")
+HTTPS_PREFIX = "https://"
 # Where gh reads the token; the workflow sets it from `github.token`.
 TOKEN_ENV = "GH_TOKEN"
 # One call's ceiling; a hung `gh` must not eat the 30-minute job.
@@ -42,6 +65,45 @@ VALIDATION_FAILED = "HTTP 422"
 
 def log(message: str) -> None:
     print(message, file=sys.stderr)
+
+
+def issue_url(repo: str, number) -> str:
+    """The issue's page, the one form of an issue reference the bots write."""
+    return ISSUE_URL.format(repo=repo, number=number)
+
+
+def issue_key(ref) -> tuple[str, int] | None:
+    """``(repo, number)`` for "#N" (SOURCE_REPO) or an issue URL; None for
+    anything else."""
+    match = ISSUE_REF_RE.match(ref.strip()) if isinstance(ref, str) else None
+    if not match:
+        return None
+    return (match["repo"] or SOURCE_REPO, int(match["number"]))
+
+
+def has_issue(refs, ref) -> bool:
+    """Whether ``refs`` names the issue ``ref`` does, in either form."""
+    key = issue_key(ref)
+    return key is not None and any(issue_key(each) == key for each in refs or [])
+
+
+def issue_repo(issue) -> str:
+    """The repository an {number, url} issue lives in, read from its `url`;
+    SOURCE_REPO for a record without a GitHub issue URL (one written before
+    the issues repository existed)."""
+    key = issue_key((issue or {}).get("url")) if isinstance(issue, dict) else None
+    return key[0] if key else SOURCE_REPO
+
+
+def issue_tag(issue) -> str | None:
+    """How the bots write a reference to the {number, url} issue they filed
+    or adopted: "#N" for an issue of SOURCE_REPO (unchanged while no issues
+    repository is set), its full URL for one elsewhere, so the reference
+    resolves wherever it is read; None for anything that is not one."""
+    if not isinstance(issue, dict) or not issue.get("number"):
+        return None
+    repo = issue_repo(issue)
+    return f"#{issue['number']}" if repo == SOURCE_REPO else issue_url(repo, issue["number"])
 
 
 class Gh:

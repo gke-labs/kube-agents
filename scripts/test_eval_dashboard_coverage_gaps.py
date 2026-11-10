@@ -297,7 +297,7 @@ class FilingTest(Harness):
         self.assertTrue(beta["body"].startswith(coverage_gaps.MARKER.format(slug="beta")))
         self.assertIn("for 9 days (since 2026-10-17)", beta["body"])
         self.assertIn("Backup: @dave.", beta["body"])
-        self.assertIn("for #3120 since 2026-10-17", beta["body"])
+        self.assertIn("for https://github.com/gke-labs/kube-agents/issues/3120 since 2026-10-17", beta["body"], "the allowlist issue, a source-repository issue, as a URL")
         self.assertIn("| Candidate (best first) |\n|---|\n| `beta-good` |", beta["body"])
         self.assertNotIn("21/21", beta["body"], "the record stays on the Nightly report")
         self.assertIn("`gamma-held` still runs on the presubmit as a held-out seat.", gamma["body"])
@@ -680,7 +680,8 @@ class WorkflowTest(unittest.TestCase):
         self.assertNotIn("if", step, "runs every tick, dry when unarmed")
         self.assertLessEqual(step.get("timeout-minutes"), 3)
         self.assertLess(names.index(STEP_NAME), names.index(POST_STEP_NAME))
-        self.assertEqual(step["env"], {"GH_TOKEN": "${{ github.token }}"}, "the workflow's own token, nothing new")
+        self.assertEqual(step["env"], {"KUBE_AGENTS_ISSUES_REPO": "${{ vars.KUBE_AGENTS_ISSUES_REPO }}", "GH_TOKEN": "${{ steps.issues_token.outputs.token || github.token }}"},
+                         "the issues repository and its token, the workflow's own when unset (tests/test_ci_health_issues_repo.py)")
         text = textwrap.dedent(WORKFLOW.read_text())
         self.assertNotIn("COVERAGE_GAPS_LIVE", text, "no switch of its own")
 
