@@ -423,10 +423,15 @@ leave open:
   `A2A_DISPATCHER_IMAGE` the override), and off only at `A2A_PROFILE_DISPATCHER=false`, which
   the chart sets from `operator.profileDispatcher.enabled`. Its identity-map entry grows with
   the profile count, and one entry can't be split across shards, so it fills one shard near 700
-  profiles at two tiers. The `DispatcherCeiling` condition warns at four fifths of the shard
-  budget, and past it the operator runs no dispatcher rather than write a map the API server
-  refuses. #5381 lifts the ceiling, by deriving the grants per connection as sessions are, and
-  blocks the 2,500-profile target.
+  profiles at two tiers. The operator binds profiles oldest first (creation time, then name)
+  while the entry fits, less a reserve for draining profiles, and refuses newer ones with
+  `IdentityReady` reason `DispatcherCeiling`; the dispatcher serves the rest. The PlatformAgent's
+  `DispatcherCeiling` condition warns at four fifths of the shard budget and reads
+  `ProfilesRefused` while any profile is left out. Past the budget anyway, which only draining
+  profiles can cause, the operator runs no dispatcher rather than write a map the API server
+  refuses. Adding a tier to an older profile can leave the newest one out. #5381 lifts the
+  ceiling, by deriving the grants per connection as sessions are, and blocks the 2,500-profile
+  target.
 - **Terminal notice.** A task the dispatcher ends gets a final status on its `.supervisor`
   subject (`lib.TaskSupervisorSubject`, contract addendum 6), never its `.events`, which stays
   the executor's alone: `rejected` when it is refused at admission (nothing ran), `failed`

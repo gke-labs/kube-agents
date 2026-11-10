@@ -22,6 +22,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -52,8 +53,9 @@ func ceilingProfiles(agent *agentv1alpha1.PlatformAgent, n int) []agentv1alpha1.
 // TestTheDispatcherCeiling: the dispatcher's identity entry is measured as a
 // shard carries it. Well under the budget the condition says so; at four
 // fifths of it the condition warns, naming the profile count and #5381; past
-// it the condition refuses, and the map leaves the dispatcher out rather than
-// write a shard the API server refuses (gke-labs/kube-agents#5381).
+// what the live profiles may take, the newest profiles are refused and the
+// dispatcher serves the rest, with every shard under the budget
+// (gke-labs/kube-agents#5381).
 func TestTheDispatcherCeiling(t *testing.T) {
 	withOperatorBusPrincipal(t)
 	t.Setenv(a2aProfileDispatcherEnvVar, "")
@@ -62,11 +64,10 @@ func TestTheDispatcherCeiling(t *testing.T) {
 		profiles int
 		reason   string
 		status   metav1.ConditionStatus
-		inMap    bool
 	}{
-		{100, dispatcherCeilingReasonWithin, metav1.ConditionTrue, true},
-		{600, dispatcherCeilingReasonNear, metav1.ConditionTrue, true},
-		{800, dispatcherCeilingReasonOver, metav1.ConditionFalse, false},
+		{100, dispatcherCeilingReasonWithin, metav1.ConditionTrue},
+		{600, dispatcherCeilingReasonNear, metav1.ConditionTrue},
+		{800, dispatcherCeilingReasonRefused, metav1.ConditionFalse},
 	} {
 		t.Run(fmt.Sprint(tc.profiles), func(t *testing.T) {
 			profiles := ceilingProfiles(agent, tc.profiles)
@@ -74,41 +75,118 @@ func TestTheDispatcherCeiling(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if cond.Type != dispatcherCeilingCondition || cond.Reason != tc.reason || cond.Status != tc.status || over == tc.inMap {
+			if cond.Type != dispatcherCeilingCondition || cond.Reason != tc.reason || cond.Status != tc.status || over {
 				t.Fatalf("at %d profiles: %s/%s over=%v, want %s/%s", tc.profiles, cond.Status, cond.Reason, over, tc.status, tc.reason)
-			}
-			if !strings.Contains(cond.Message, fmt.Sprintf("for %d profiles", tc.profiles)) {
-				t.Errorf("the message doesn't name the profile count: %q", cond.Message)
 			}
 			if tc.reason != dispatcherCeilingReasonWithin && !strings.Contains(cond.Message, dispatcherCeilingIssue) {
 				t.Errorf("the message doesn't name %s: %q", dispatcherCeilingIssue, cond.Message)
 			}
-			if tc.reason == dispatcherCeilingReasonOver && !strings.Contains(cond.Message, "operator.profileDispatcher.enabled: false") {
-				t.Errorf("the refusal doesn't say how to switch the dispatcher off: %q", cond.Message)
+			refused := a2aDispatcherCeilingRefused(agent, profiles)
+			if (len(refused) > 0) != (tc.reason == dispatcherCeilingReasonRefused) {
+				t.Errorf("at %d profiles %d are refused", tc.profiles, len(refused))
 			}
 			doc, err := renderA2AAuthMap(agent, profiles)
 			if err != nil {
 				t.Fatal(err)
 			}
-			var users []string
+			users := map[string]bool{}
 			for _, id := range doc.Identities {
-				users = append(users, id.User)
+				users[id.User] = true
 			}
-			if slices.Contains(users, a2aDispatcherUser) != tc.inMap {
-				t.Errorf("at %d profiles the dispatcher is in the map: %v, want %v", tc.profiles, !tc.inMap, tc.inMap)
+			if !users[a2aDispatcherUser] {
+				t.Errorf("at %d profiles the dispatcher isn't in the map; past the ceiling it serves the bound profiles", tc.profiles)
 			}
-			if !tc.inMap {
-				cms, _, err := buildA2AAuthMapConfigMaps(agent, profiles, nil)
-				if err != nil {
-					t.Fatal(err)
-				}
-				for _, cm := range cms {
-					if len(cm.Data[a2aAuthMapKey]) > a2aAuthMapShardByteBudget {
-						t.Errorf("past the ceiling a shard is still %d bytes", len(cm.Data[a2aAuthMapKey]))
+			for _, name := range refused {
+				for user := range users {
+					if strings.HasPrefix(user, "profile-"+name+"-") {
+						t.Errorf("refused profile %s still has identity %s in the map", name, user)
 					}
 				}
 			}
+			cms, _, err := buildA2AAuthMapConfigMaps(agent, profiles, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, cm := range cms {
+				if len(cm.Data[a2aAuthMapKey]) > a2aAuthMapShardByteBudget {
+					t.Errorf("a shard is %d bytes, over the budget", len(cm.Data[a2aAuthMapKey]))
+				}
+			}
 		})
+	}
+}
+
+// The cut measures each profile's share on its own; the shares have to add up
+// to the entry the map writes for the same profiles, or the cut is wrong.
+func TestTheDispatcherProfileSharesAddUp(t *testing.T) {
+	withOperatorBusPrincipal(t)
+	t.Setenv(a2aProfileDispatcherEnvVar, "")
+	agent := authMapTestAgent()
+	profiles := ceilingProfiles(agent, 40)
+	profiles[3].Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead}
+	sorted := sortedOldestFirst(profiles)
+	ptrs := make([]*agentv1alpha1.AgentProfile, len(sorted))
+	for i := range sorted {
+		ptrs[i] = &sorted[i]
+	}
+	base, shares, err := a2aDispatcherProfileShares(agent, ptrs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := base
+	for _, s := range shares {
+		want += s
+	}
+	entry, _ := a2aDispatcherMapEntry(agent, profiles, nil)
+	got, err := a2aAuthMapEntryBytes(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Errorf("the entry is %d bytes, base plus shares %d", got, want)
+	}
+}
+
+// The newest profiles are the ones refused, by creation time with name
+// breaking ties, so a pass never reshuffles which; deleting an older profile
+// readmits the oldest refused one.
+func TestTheCeilingRefusesTheNewestProfiles(t *testing.T) {
+	withOperatorBusPrincipal(t)
+	t.Setenv(a2aProfileDispatcherEnvVar, "")
+	agent := authMapTestAgent()
+	profiles := ceilingProfiles(agent, 800)
+	start := metav1.Now()
+	for i := range profiles {
+		// Created in reverse name order, so creation time, not name, decides.
+		profiles[i].CreationTimestamp = metav1.NewTime(start.Add(time.Duration(len(profiles)-i) * time.Second))
+	}
+	refused := a2aDispatcherCeilingRefused(agent, profiles)
+	if len(refused) == 0 {
+		t.Fatal("800 profiles fit; the fixture no longer crosses the ceiling")
+	}
+	newest := sortedOldestFirst(profiles)
+	newest = newest[len(newest)-len(refused):]
+	for i, p := range newest {
+		if refused[i] != p.Name {
+			t.Fatalf("refused %v, want the newest %d", refused[:min(3, len(refused))], len(refused))
+		}
+	}
+	// Shuffled input, same answer.
+	shuffled := append([]agentv1alpha1.AgentProfile(nil), profiles...)
+	slices.Reverse(shuffled)
+	if again := a2aDispatcherCeilingRefused(agent, shuffled); !slices.Equal(again, refused) {
+		t.Error("the refused set depends on list order")
+	}
+	// Deleting the oldest profile readmits the oldest refused one.
+	oldest := sortedOldestFirst(profiles)[0].Name
+	var rest []agentv1alpha1.AgentProfile
+	for _, p := range profiles {
+		if p.Name != oldest {
+			rest = append(rest, p)
+		}
+	}
+	if after := a2aDispatcherCeilingRefused(agent, rest); slices.Contains(after, refused[0]) {
+		t.Errorf("deleting the oldest profile didn't readmit %s", refused[0])
 	}
 }
 
@@ -157,9 +235,10 @@ func TestTheDispatcherCeilingWarnsOncePerTransition(t *testing.T) {
 	}
 }
 
-// Past the ceiling the dispatcher step runs no dispatcher: what a pass under
-// it rendered is torn down, as though the dispatcher were switched off.
-func TestPastTheCeilingTheDispatcherStepTearsItDown(t *testing.T) {
+// Past the ceiling the dispatcher keeps serving the bound profiles; only the
+// draining profiles' grants can push the entry past the budget, and then the
+// dispatcher step tears it down rather than leave it without a map entry.
+func TestTheDispatcherOutlivesTheCeilingAndOnlyDrainingTearsItDown(t *testing.T) {
 	withDispatcher(t)
 	agent := a2aTestAgent()
 	scheme := setupScheme()
@@ -171,19 +250,30 @@ func TestPastTheCeilingTheDispatcherStepTearsItDown(t *testing.T) {
 	// Rendered first with no profiles, as its sibling tests do (with some, the
 	// step also copies the bus CA bundle, which this fixture doesn't carry).
 	if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, nil, true); err != nil || profileErr != nil {
-		t.Fatalf("under the ceiling: %v / %v", err, profileErr)
+		t.Fatalf("render: %v / %v", err, profileErr)
 	}
 	if err := c.Get(ctx, key, &appsv1.Deployment{}); err != nil {
-		t.Fatalf("precondition: no dispatcher under the ceiling: %v", err)
+		t.Fatalf("precondition: no dispatcher: %v", err)
 	}
 	over := ceilingProfiles(agent, 800)
-	if _, isOver, err := a2aDispatcherCeiling(agent, over, nil); err != nil || !isOver {
-		t.Fatalf("800 profiles read as within the ceiling (%v); the fixture no longer crosses it", err)
+	if len(a2aDispatcherCeilingRefused(agent, over)) == 0 {
+		t.Fatal("800 profiles fit; the fixture no longer crosses the ceiling")
 	}
-	if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, over, true); err != nil || profileErr != nil {
-		t.Fatalf("past the ceiling: %v / %v", err, profileErr)
+	if _, isOver, err := a2aDispatcherCeiling(agent, over, nil); err != nil || isOver {
+		t.Fatalf("with the newest refused, the entry still reads as over the budget (%v)", err)
+	}
+	// Draining profiles past the reserve the cut leaves them.
+	var draining []a2aDispatchProfile
+	for i := 0; i < 600; i++ {
+		draining = append(draining, a2aDispatchProfile{Name: fmt.Sprintf("gone-%04d", i)})
+	}
+	if _, isOver, err := a2aDispatcherCeiling(agent, over, draining); err != nil || !isOver {
+		t.Fatalf("600 draining profiles don't push the entry over (%v); the fixture no longer reaches the backstop", err)
+	}
+	if profileErr, err := r.reconcileA2ADispatcherDraining(ctx, agent, over, true, draining); err != nil || profileErr != nil {
+		t.Fatalf("past the budget: %v / %v", err, profileErr)
 	}
 	if err := c.Get(ctx, key, &appsv1.Deployment{}); !apierrors.IsNotFound(err) {
-		t.Errorf("the dispatcher's Deployment survived the ceiling: %v", err)
+		t.Errorf("the dispatcher's Deployment survived an entry past the budget: %v", err)
 	}
 }

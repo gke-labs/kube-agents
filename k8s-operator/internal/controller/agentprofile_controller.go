@@ -101,6 +101,9 @@ const (
 	reasonAgentProfileBusError        = "BusUnavailable"
 	reasonAgentProfileIdentityMissing = "IdentityNotRendered"
 	reasonAgentProfileNamespaceAbsent = "ProfileNamespaceAbsent"
+	// reasonAgentProfileDispatcherCeiling: the profile is newer than the ones
+	// the dispatcher's identity can carry (refuseOverDispatcherCeiling).
+	reasonAgentProfileDispatcherCeiling = "DispatcherCeiling"
 )
 
 // AgentProfileReconciler reconciles AgentProfile objects.

@@ -225,6 +225,11 @@ func shippedProfileSubscribeTopics(t *testing.T) []string {
 // reach the gate.
 func fleetScaleProfileFixtures(t *testing.T, agent *agentv1alpha1.PlatformAgent) []agentv1alpha1.AgentProfile {
 	t.Helper()
+	// With the dispatcher off: on, only the profiles its identity can carry
+	// are bound (refuseOverDispatcherCeiling, gke-labs/kube-agents#5381), so
+	// the gate would measure some 800 profiles rather than 2,500.
+	// TestTheDispatcherCeiling holds the dispatcher's side.
+	t.Setenv(a2aProfileDispatcherEnvVar, "false")
 	topics := shippedProfileSubscribeTopics(t)
 	profiles := make([]agentv1alpha1.AgentProfile, 0, fleetScaleProfiles)
 	for i := 1; i <= fleetScaleProfiles; i++ {
@@ -356,12 +361,8 @@ func TestTheMinterPolicyConfigMapAtFleetScale(t *testing.T) {
 // check. The shard count and the placement of the entries are
 // TestTheIdentityMapShardsStayUnderTheConfigMapLimitAtFleetScale's.
 func TestTheIdentityMapConfigMapAtFleetScale(t *testing.T) {
-	// The shipped shape: the dispatcher on, as by default. At this many
-	// profiles its entry is past what one shard carries, so the map leaves it
-	// out and the operator runs no dispatcher (a2aDispatcherCeiling,
-	// gke-labs/kube-agents#5381); TestTheDispatcherCeiling holds the
-	// thresholds.
-	t.Setenv(a2aProfileDispatcherEnvVar, "")
+	// The dispatcher is off for the whole fleet render
+	// (fleetScaleProfileFixtures says why).
 	agent := a2aTestAgent()
 	profiles := fleetScaleProfileFixtures(t, agent)
 
