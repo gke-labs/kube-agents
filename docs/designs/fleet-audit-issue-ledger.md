@@ -1005,6 +1005,12 @@ make `remediate --finding one-id` open up to six pull requests, five of them for
 operator never mentioned and cannot tell apart from the one they did, on the command whose entire
 purpose is to act on a specific request.
 
+A named `no-pdb` finding the worker left `manual` because the collector found its declaration is
+the one non-`manifest` target `remediate` accepts. `finish` writes that PodDisruptionBudget itself,
+and given `--manifest-file`, `remediate` writes it the same way, with the same planner and the same
+refusals, and opens it. Without this, a direct ask could not open the budget on an install whose
+automatic sweep is off, or past the sweep's cap.
+
 `remediate` degrades the same way, for the same reason at a smaller scale. A named target whose fix
 is not a readable file inside the clone is refused **by name** — logged, and returned in the
 `refused` key of its exit JSON so the acknowledgement comment can say so — while the rest of the

@@ -38012,6 +38012,31 @@ class TestRemediateWritesTheGeneratedBudget(HarnessTestCase):
         self.assertEqual(self.harness.calls, [])
         self.assertFalse((self.stream_tree() / self.GENERATED).exists())
 
+    def test_a_budget_named_over_the_declaration_is_written_beside_it(self):
+        """The worker named the Deployment's own file as the budget's path: a
+        merge would replace the workload, so it is demoted and written beside,
+        as `finish` does."""
+        finding = self.finding()
+        finding["remediation"] = {"kind": "manifest", "path": self.DECLARATION, "note": "x"}
+        self.record_run(context=["acme/fleet"])
+        path = self.write_findings(searched_doc(findings=[finding]))
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/9"),
+        }
+        rc = self.run_main(
+            ["remediate", "--audit", self.STREAM, "--findings-file", path, "--finding", self.fid(),
+             "--manifest-file", self.manifest_file()]
+        )
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn("written beside it instead", self.err)
+        self.assertTrue((self.stream_tree() / self.GENERATED).is_file())
+        self.assertFalse((self.stream_tree() / self.DECLARATION).exists())
+
+    def test_a_withheld_selector_is_not_planned(self):
+        manifest = json.loads(pathlib.Path(self.manifest_file(pod_selector_withheld="other pods match")).read_text())
+        self.assertEqual(audit_report.requested_generated_fixes([self.finding()], manifest, [self.fid()]), {})
+
     def test_a_manifest_finding_is_untouched_by_the_planner(self):
         """Only a `manual` finding is planned; a worker-written file is opened as written."""
         finding = self.finding()

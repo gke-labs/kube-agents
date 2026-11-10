@@ -19376,7 +19376,11 @@ def requested_generated_fixes(
     declared_at = {
         _candidate_identity(entry, candidate): str((candidate.get("declaration") or {}).get("path") or "")
         for entry, candidate in _candidates(manifest)
-        if candidate.get("check") == GENERATED_FIX_CHECK and isinstance(candidate.get("declaration"), dict)
+        if candidate.get("check") == GENERATED_FIX_CHECK
+        and isinstance(candidate.get("declaration"), dict)
+        # A budget whose selector reaches another controller's pods is one
+        # SOP §3.4 says must not exist; it stays `manual` and is refused.
+        and not candidate.get("pod_selector_withheld")
     }
     fixes: dict[str, UnwrittenFix] = {}
     for finding in findings:
@@ -22715,6 +22719,15 @@ def handle_remediate(args: argparse.Namespace) -> None:
             f"--finding: {', '.join(unknown)} not in {args.findings_file}; "
             f"known ids are {', '.join(sorted(by_id)) or '(none)'}"
         )
+    # A budget the worker named at the workload's own declaration would replace
+    # the Deployment on merge: demoted to `manual` as `finish` demotes it, so
+    # the planner below writes it beside the declaration instead.
+    for fid in demote_fixes_over_declarations(findings, manifest):
+        if fid in args.finding:
+            log(
+                f"{fid} names its PodDisruptionBudget at the workload's own "
+                "declaration; the budget is written beside it instead."
+            )
     # A declared budget the worker left `manual` for `finish` to write is
     # written here the same way, below, rather than refused.
     generated = requested_generated_fixes(findings, manifest, args.finding)
@@ -27083,7 +27096,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "The collector manifest finish was given. Optional; with it an id the "
             "document lacks that the collector still flags is refused as held on "
-            "the ledger rather than as unknown."
+            "the ledger rather than as unknown, and a declared no-pdb finding left "
+            "manual gets the PodDisruptionBudget finish writes."
         ),
     )
     return parser

@@ -125,7 +125,8 @@ agent relaying an ask it cannot tie to a GitHub identity never passes that flag.
 ledger issue there is no such comment, so a human close stands until a person at the terminal
 passes that flag. There `remediate` looks up no ledger issue, and the pull request links none.
 
-`refused` names the targets whose remediation is not a readable file inside the workspace — either the
+`refused` names the targets that cannot become a pull request: a `no-pdb` budget the command would
+not write (its `REFUSED` line says why), or a remediation that is not a readable file inside the workspace — either the
 audit promised a manifest and never wrote it, or the path does not resolve inside the repository at
 all. Both leave nothing to put in a diff; a `SECURITY:` line in the log says which one happened. A
 target is also refused when its fix adds a new file that its kustomization does not list, or the
