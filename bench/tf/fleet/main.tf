@@ -530,6 +530,57 @@ resource "google_container_node_pool" "pinned_inference_pool" {
   }
 }
 
+# Posture (capacity): a single-zone autoscaling pool that is zone-locked and
+# nothing else -- no NAP on the cluster, tainted so no multi-zone pool counts
+# as its fallback, and held at zero nodes so it never nears its ceiling (the
+# stockout SOP's 3.9 flags a pool at 90% of its ceiling as a second arm, and
+# a declaration covers the zone-locked arm alone). The pool project's GitOps
+# repository declares it on purpose in knowledge/notification-relay-no-pdb.md,
+# so the capacity audit lists it under Declared intent, not as a finding;
+# pinned-inference-pool above cannot play this part because its Pending
+# backlog and its 1/1 ceiling are the defect stockout-pinned-pool grades.
+# Zero nodes cost nothing; the taint keeps the autoscaler from ever adding
+# one for a stray pod. Catalogue role: declared-single-zone-pool.
+resource "google_container_node_pool" "declared_zonal_pool" {
+  name       = "declared-zonal-pool"
+  location   = var.zone
+  cluster    = google_container_cluster.seeded_a.name
+  node_count = 0
+
+  autoscaling {
+    min_node_count = 0
+    max_node_count = 2
+  }
+
+  node_config {
+    machine_type    = "e2-small"
+    disk_size_gb    = 20
+    resource_labels = local.fleet_labels
+    service_account = google_service_account.fleet_nodes.email
+    oauth_scopes    = ["https://www.googleapis.com/auth/cloud-platform"]
+
+    workload_metadata_config {
+      mode = "GKE_METADATA"
+    }
+
+    # trivy GCP-0048. See seeded_a_default above for why this is a zero-diff
+    # write and why a second key in this map must never be added to a live
+    # pool.
+    metadata = {
+      disable-legacy-endpoints = "true"
+    }
+    labels = {
+      "seeded-role" = "declared-zonal"
+    }
+
+    taint {
+      key    = "seeded-role"
+      value  = "declared-zonal"
+      effect = "NO_SCHEDULE"
+    }
+  }
+}
+
 # Defect (upgrades): held one minor behind the REGULAR channel default --
 # and ENROLLED in REGULAR, which is what makes the lag visible at all. The
 # upgrade SOP's master-behind check grades (b) and (c) off the cluster's

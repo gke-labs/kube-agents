@@ -6977,9 +6977,10 @@ func TestA2AInjectBackendIsRemovedWhenTheFlagGoesOff(t *testing.T) {
 }
 
 // TestA2AInjectFlagOffRemovalReadsTheSecretUncached: the flag-off path reads
-// four objects before deleting them, and the fourth is a Secret. The operator
-// ships secrets with get only, so a cached Get of one starts an informer
-// whose LIST is forbidden and blocks the single reconcile worker for good --
+// four objects before deleting them, and the fourth is a Secret. The manager
+// does not watch Secrets, so a cached Get of one starts a cluster-wide Secret
+// informer that holds every Secret in memory and blocks the single reconcile
+// worker in WaitForCacheSync wherever list/watch on secrets is trimmed --
 // the fake client cannot show that hang (its cache is the store), so this
 // test fails the cached path outright and passes only if the Secret is read
 // through the reader the other A2A Secrets use.
@@ -7000,7 +7001,7 @@ func TestA2AInjectFlagOffRemovalReadsTheSecretUncached(t *testing.T) {
 	cached := interceptor.NewClient(base, interceptor.Funcs{
 		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 			if _, ok := obj.(*corev1.Secret); ok && strict.Load() {
-				return fmt.Errorf("cached Get of Secret %s: on the shipped RBAC this starts an informer whose LIST is forbidden, and the reconcile worker blocks in WaitForCacheSync", key)
+				return fmt.Errorf("cached Get of Secret %s: starts an unwatched cluster-wide Secret informer instead of reading through APIReader", key)
 			}
 			return c.Get(ctx, key, obj, opts...)
 		},

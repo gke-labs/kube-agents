@@ -1558,6 +1558,29 @@ class TestPace(QueueTestCase):
         plan = fq.pace(rows[1:2] + rows[3:], at(6, 16), self.LIMITS, NONE_ADDED, announced=announced[:1])
         self.assertEqual(plan.add, [])
 
+    def test_a_row_that_joined_an_announced_line_later_is_a_new_item(self):
+        # #4262: K was announced with m0, whose decision left m1 (queued) open.
+        # m1 was never announced, so it is added and named like any new item,
+        # and it holds nothing back.
+        rows = [row("m1", "major", check="K"), row("n0", "major", score=80)]
+        key = fq.item_key(rows[0])
+        plan = fq.pace(rows, at(6, 17), self.LIMITS, {"critical": 0, "noncritical": 1}, announced=[key], announced_ids=["m0"])
+        self.assertEqual(ids(plan.add), [["m1"], ["n0"]])
+
+    def test_an_announced_member_still_new_keeps_its_line_unrecorded(self):
+        # Every mark of m0 failed, and m1 joined the line since: the line is
+        # still the announced item, which stops additions as before.
+        rows = [row("m0", "major", check="K"), row("m1", "major", check="K"), row("n0", "major", score=80)]
+        plan = fq.pace(rows, at(6, 17), self.LIMITS, NONE_ADDED, announced=[fq.item_key(rows[0])], announced_ids=["m0"])
+        self.assertEqual(plan.add, [])
+        self.assertEqual(ids(plan.waiting), [["n0"]])
+
+    def test_announced_keys_without_ids_match_on_the_key_alone(self):
+        # A record from before the ids were kept: the joined row is held back, as it was.
+        rows = [row("m1", "major", check="K"), row("n0", "major", score=80)]
+        plan = fq.pace(rows, at(6, 17), self.LIMITS, {"critical": 0, "noncritical": 1}, announced=[fq.item_key(rows[0])])
+        self.assertEqual(plan.add, [])
+
     def test_an_announced_but_unrecorded_noncritical_stops_every_addition(self):
         rows = [row("c-new", score=400), row("m0", "major")]
         plan = fq.pace(rows, at(6, 17), self.LIMITS, NONE_ADDED, announced=[fq.item_key(rows[1])])

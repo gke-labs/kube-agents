@@ -28,8 +28,8 @@
 # named workloads names the dependency each cut would change (the seeded fleet's
 # HPA-scaled inference-server in seeded-capacity and the Guaranteed-QoS
 # ledger-writer in seeded-qos; no stack). A baseline: no gap declared; moved in
-# from the nightly file on its record there: 43 of 45 repetitions pass,
-# 2026-10-23 to 2026-11-09 (the case of #3507, for #3199).
+# from the nightly file on its record there: above the bar on the nightlies
+# of 2026-10-23 to 2026-11-09 (the case of #3507, for #3199).
 ./tasks/cost-rightsizing-names-dependencies/task.yaml
 # Capability row: networking fabric, load balancers and Gateway; the
 # obtainability audit on an HTTPRoute whose Service maps to a numeric targetPort
@@ -85,6 +85,13 @@
 # gap, expected_fail: no compliance check reads the binding behind an
 # annotation; the gap is #5027.
 ./tasks/security-wi-ksa-gsa-iam-binding-missing/task.yaml
+# Capability row: storage, CSI drivers and PVCs; the obtainability audit on a
+# Deployment that mounts a bucket through the gcsfuse CSI driver with no sidecar
+# memory-limit annotation and no file-cache capacity (the planted
+# bucket-reader-app in seeded-fuse). A declared gap, expected_fail: no
+# obtainability check reads a gcsfuse volume's cache or sidecar limits; the gap
+# is item 3 of #2577.
+./tasks/storage-gcsfuse-unbounded-cache-oom/task.yaml
 # Capability row: storage, CSI drivers and PVCs; the obtainability audit names a
 # one-replica Deployment under the default RollingUpdate strategy that mounts a
 # ReadWriteOnce claim (the planted single-writer-app and single-writer-data in

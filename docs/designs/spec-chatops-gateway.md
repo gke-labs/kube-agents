@@ -2147,22 +2147,30 @@ or a "why?" to its answer, so it gets the quote as context and no rule sentence.
 message this process remembers posting, on any surface, or in a DM a `REPLY` quote by an app,
 since the DM has one app in it: the read says the poster's kind, and the snapshot names the
 poster, who in a DM is the app when not the member. A quote this cannot place keeps the rule.
-A command the gateway answers without an agent, sent as a quote-reply to one of the bot's posts,
-is the command: the words go over unchanged, with no read and no frame, so `routeTurn`'s
-matchers see them. The set is `routeTurn`'s own (`gchatQuotedWordsAreACommand`): a stop, a bare
-`/feedback` and `/feedback summary`, `/session` bare or `off`, the exact status phrases, and a
-delegation with its task or as the bare word, which framed would read as a delegation of the
-frame. It is narrower than `chattext.IsCommand` on purpose: the wide status rule there would take
-"what is happening here?" over an alert, strip its quote, and reach no one, since `routeTurn`
-reads that form only on a running task. The read runs off the
-event pump under a ten-second budget, after the dedupe. A quote that yields nothing, the read
+The quote travels beside the words: the adapter hands the turn over with the member's words as
+typed on `InboundMessage.Text` (empty for a bare quote) and the composed ask on
+`InboundMessage.Quoted`, and the gateway's own routing decides what reaches an agent. `routeTurn`'s
+matchers read the words, so a command the gateway answers without an agent is answered on the
+words alone, a "stop" or a status ask quoted onto an alert included, under the conditions the
+router already has (a status phrase is answered without an agent only on a running task, or at the
+top of a DM with none); anything that reaches an agent, a task, a steer, a session's first turn or
+a delegation, carries the quote (`agentText`), with a command word a matcher took off the words
+("/session", "delegate") off the quoted ask's head too (`wordsAfter`). The adapter does not know
+the conversation's task state, so no gate in it re-spells that set; the one command it knows is a
+stop, which reaches no agent whatever is running and goes over inline with no read
+(`quotedReadNeeded`), so a cancel never waits on the relay. The read runs off the event pump
+under a ten-second budget, after the dedupe. A quote that yields nothing, the read
 refused or timed out or the message empty (a card or an image alone), is never silent for a
-sender the gateway admits: one line posts in the conversation, `I couldn't read the message you
-quoted, so I'm answering your words alone.` and the turn goes ahead on the words, or `I couldn't
-read the message you quoted. Paste its text, or ask again in a moment.` and no turn, logged with
-the reason. The adapter reads the gateway's admission gate for that (`SenderAdmission`, wired as
-the session lookup is) and posts nothing ahead of the gateway for a sender it would refuse: their
-words go over unchanged to the refusal any message gets, and their bare quote is dropped. A read
+sender the gateway admits when an agent would have read it: with words, the turn goes ahead on
+the words, marked (`InboundMessage.QuotedUnread`), and the router posts `I couldn't read the
+message you quoted, so I'm answering your words alone.` in the conversation as it hands them to
+an agent (`noteUnreadQuote`, at `startTask` and `steerTask`), so a "stop" or a status ask it
+answers itself gets no line about a quote it never needed; a bare quote is no turn, and the
+adapter posts `I couldn't read the message you quoted. Paste its text, or ask again in a moment.`
+and logs the reason. The adapter reads the gateway's admission gate for that line
+(`SenderAdmission`, wired as the session lookup is) and posts nothing ahead of the gateway for a
+sender it would refuse: their words go over to the refusal any message gets, and their bare quote
+is dropped. A read
 cut short by the gateway's shutdown posts no line and makes no turn: `quotedAsk` returns the
 shutdown reason when its context is cancelled on entry or when the cancel cut its read short, and
 `Run` drops a turn `quotedAsk` composed before the cancel with the same reason, so nothing is
@@ -2220,7 +2228,9 @@ write to this table grants a principal - it is an impersonation primitive, and i
 emails besides. Write access is the install admin's, through the install path. No
 product ServiceAccount (gateway, platform-agent, broker, session workers) gets write on
 it, so nothing an agent can be talked into doing edits its own identity table; the
-conformance suite's D1 holds that no Role the operator mints names `secrets`. A
+conformance suite's D1 holds that no Role the operator mints grants write verbs on
+`secrets` (only `kubeagents:minimal` holds read-only `get`/`list`/`watch` on `secrets` for
+`<agent>-kube-proxy`'s redacted metadata path). A
 `principalMapSecretRef` on `spec.integration.slack`, not built, would let an install bind
 another name and make write authority "may write the PlatformAgent CR", with changes in
 the API server audit log. Generating

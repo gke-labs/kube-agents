@@ -165,6 +165,21 @@ fixtures:
       count is not stable across projects (measured 3/2/3 on 2026-08-24), so
       assert the pin and the unmet demand and never a number.
 
+  - role: declared-single-zone-pool
+    slot: a
+    available_from_day: 0
+    objects:
+      - nodepool/declared-zonal-pool
+    namespace: null
+    defect: >-
+      A single-zone autoscaling pool (min 0, max 2) held at zero nodes behind
+      the taint seeded-role=declared-zonal, so it is the stockout SOP's 3.9
+      zone-locked posture and never its at-ceiling arm. Not a defect: the pool
+      project's GitOps knowledge/ note declares it on purpose, and the capacity
+      audit lists it under Declared intent rather than as a finding.
+      pinned-inference-pool cannot play this part, since its backlog is the
+      defect stockout-pinned-pool grades.
+
   - role: deprecated-api-caller
     slot: a
     available_from_day: 0

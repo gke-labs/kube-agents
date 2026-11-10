@@ -288,8 +288,9 @@ SETTLE_RE = re.compile(r"^readonly EVAL_GITHUB_WRITE_SETTLE_SECONDS=(\d+)$", re.
 REPETITIONS_RE = re.compile(r'^EVAL_REPETITIONS="\$\{EVAL_REPETITIONS:-(\d+)\}"', re.MULTILINE)
 # The check types that request a pull request, as
 # bench/kube_agents_bench/lane.py's REQUESTING_CHECK_TYPES names them. A
-# case with such a leaf, or with an allowance in the safeguards file's
-# `requesting:` map, runs in the fan-out's serial second phase.
+# case with such a leaf, with a `requested_pull_requests:` key of its own, or
+# with an allowance in the safeguards file's `requesting:` map, runs in the
+# fan-out's serial second phase.
 # scripts/test_eval_rosters.py holds this text read to lane.py's YAML one.
 REQUESTING_CHECK_RE = re.compile(r"\btype:\s*[\"']?(pull_request_opened|pull_request_diff_contains)\b")
 # Build, deploy and lease, outside the fan-out: "~15min of build and deploy
@@ -371,6 +372,9 @@ def is_stopped_ask(case: str, tasks_dir: pathlib.Path = TASKS_DIR) -> bool:
 # unit_phase reads it through STOPPED_ASK_CASES); scripts/test_eval_rosters.py
 # holds this text read to lane.runs_alone.
 WRITES_ALONE_RE = re.compile(r"^writes_alone:\s*true\s*$")
+# The task's own total of requested pull requests (bench/kube_agents_bench/lane.py's
+# REQUESTED_KEY), for a case that opens more than its checks grade.
+REQUESTED_PULL_REQUESTS_RE = re.compile(r"^requested_pull_requests:\s*(0|[1-9][0-9]*)\s*$")
 
 
 def declares_writes_alone(case: str, tasks_dir: pathlib.Path = TASKS_DIR) -> bool:
@@ -385,10 +389,25 @@ def runs_alone(case: str, tasks_dir: pathlib.Path = TASKS_DIR) -> bool:
     return is_stopped_ask(case, tasks_dir) or declares_writes_alone(case, tasks_dir)
 
 
+def declared_pull_requests_in(text: str) -> int:
+    """The count a task file's text declares under ``requested_pull_requests``
+    on a top-level line; 0 when no such line."""
+    for line in text.splitlines():
+        m = REQUESTED_PULL_REQUESTS_RE.match(line.split("#", 1)[0].rstrip())
+        if m:
+            return int(m.group(1))
+    return 0
+
+
+def declared_pull_requests(case: str, tasks_dir: pathlib.Path = TASKS_DIR) -> int:
+    """The count the case's task.yaml declares under ``requested_pull_requests``; 0 when absent."""
+    return declared_pull_requests_in((tasks_dir / case / "task.yaml").read_text(encoding="utf-8"))
+
+
 def requests_a_pull_request(case: str, lane_requesting: dict[str, int], tasks_dir: pathlib.Path = TASKS_DIR) -> bool:
-    """Whether the case requests a pull request: its own checks, or the lane
-    file's ``requesting:`` allowance."""
-    if lane_requesting.get(case, 0) > 0:
+    """Whether the case requests a pull request: its own checks, its own
+    ``requested_pull_requests`` key, or the lane file's ``requesting:`` allowance."""
+    if lane_requesting.get(case, 0) > 0 or declared_pull_requests(case, tasks_dir) > 0:
         return True
     text = (tasks_dir / case / "task.yaml").read_text(encoding="utf-8")
     return any(REQUESTING_CHECK_RE.search(line.split("#", 1)[0]) for line in text.splitlines())

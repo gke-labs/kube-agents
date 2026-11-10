@@ -640,6 +640,7 @@ PARAM_ENABLE_DRIFT_DETECTOR="${ENABLE_DRIFT_DETECTOR:-}"
 # answer and the run's answer are distinguishable.
 SHELL_ENABLE_DRIFT_DETECTOR="${ENABLE_DRIFT_DETECTOR:-}"
 PARAM_ENABLE_GKE_BACKUP_PLAN="${ENABLE_GKE_BACKUP_PLAN:-}"
+PARAM_DISALLOW_SECRETS_READ="${DISALLOW_SECRETS_READ:-}"
 # Set-ness, never ${VAR:-...}: `--enable-gvisor=` with no value sets this to the empty
 # string, and that has to survive to the validator in main rather than being
 # silently read back as the default. The default itself comes from
@@ -952,6 +953,11 @@ Flags for AI Agents & Automation:
   --enable-gke-backup-plan[=true|false]
                                 Provision a GKE Backup Plan for the cluster
                                 (default: DEFAULT_ENABLE_GKE_BACKUP_PLAN, currently false)
+  --disallow-secrets-read[=true|false]
+                                Omit core secrets (get, list, watch) from the reader
+                                ClusterRole (kubeagents:minimal:<ns>:<name>); when unset,
+                                new installs grant secrets read access and existing installs
+                                keep their current ClusterRole permissions
   --user-profile-enabled=BOOL   Enable user profile persona extensions
                                 (default: DEFAULT_USER_PROFILE_ENABLED,
                                 currently false)
@@ -1291,6 +1297,9 @@ parse_args() {
       --enable-gke-backup-plan|--enable-gke-backup-plan=*)
         PARAM_ENABLE_GKE_BACKUP_PLAN="$(flag_bool_value "$1")"
         validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_GKE_BACKUP_PLAN"; shift ;;
+      --disallow-secrets-read|--disallow-secrets-read=*)
+        PARAM_DISALLOW_SECRETS_READ="$(flag_bool_value "$1")"
+        validate_bool_flag_value "${1%%=*}" "$PARAM_DISALLOW_SECRETS_READ"; shift ;;
       --enable-pubsub-platform|--enable-pubsub|--enable-pubsub-platform=*|--enable-pubsub=*)
         PARAM_ENABLE_PUBSUB_PLATFORM="$(flag_bool_value "$1")"
         validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_PUBSUB_PLATFORM"; shift ;;
@@ -2719,6 +2728,11 @@ bootstrap_install_env_file() {
       "A later run without it re-reads the recorded value and plans the BackupPlan's destruction; once a backup has been taken the API refuses that destroy and the apply fails partway instead." \
       true \
       "every later install.sh run"
+    warn_flag_beats_unrecorded_file_value "$destination" DISALLOW_SECRETS_READ --disallow-secrets-read \
+      "${PARAM_DISALLOW_SECRETS_READ:-}" \
+      "A later run without it renders the PlatformAgent from what the file records; upgrade.sh and --menu take no --disallow-secrets-read, so the next of either puts the reader ClusterRole's secrets rule back to the recorded or existing state." \
+      true \
+      "every later install.sh run"
     warn_flag_beats_unrecorded_file_value "$destination" WEB_CONSOLE_ENABLED --enable-web-console \
       "${PARAM_ENABLE_WEB_CONSOLE:-}" \
       "A later run without it renders the web console from what the file records; upgrade.sh and --menu take no --enable-web-console, so the next of either puts the console back to the recorded or default state." \
@@ -3074,6 +3088,9 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" WEB_CONSOLE_ENABLED "${WEB_CONSOLE_ENABLED:-$DEFAULT_ENABLE_WEB_CONSOLE}"
   write_env_var "$tmp" ENABLE_GVISOR "${ENABLE_GVISOR:-$DEFAULT_ENABLE_GVISOR}"
   write_env_var "$tmp" ENABLE_GKE_BACKUP_PLAN "${ENABLE_GKE_BACKUP_PLAN:-$DEFAULT_ENABLE_GKE_BACKUP_PLAN}"
+  if [ -n "${DISALLOW_SECRETS_READ:-}" ]; then
+    write_env_var "$tmp" DISALLOW_SECRETS_READ "${DISALLOW_SECRETS_READ}"
+  fi
   write_env_var "$tmp" ENABLE_PUBSUB_PLATFORM "${PARAM_ENABLE_PUBSUB_PLATFORM:-$DEFAULT_ENABLE_PUBSUB_PLATFORM}"
   write_env_var "$tmp" ENABLE_STOCKOUT_INVESTIGATOR "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}"
   write_env_var "$tmp" ENABLE_DRIFT_DETECTOR "${PARAM_ENABLE_DRIFT_DETECTOR:-$DEFAULT_ENABLE_DRIFT_DETECTOR}"
@@ -8412,6 +8429,9 @@ main() {
   # the generator's DEFAULT_ENABLE_GKE_BACKUP_PLAN decides as it did before.
   if [ -n "${PARAM_ENABLE_GKE_BACKUP_PLAN:-}" ]; then
     export ENABLE_GKE_BACKUP_PLAN="$PARAM_ENABLE_GKE_BACKUP_PLAN"
+  fi
+  if [ -n "${PARAM_DISALLOW_SECRETS_READ:-}" ]; then
+    export DISALLOW_SECRETS_READ="$PARAM_DISALLOW_SECRETS_READ"
   fi
   export MODEL_PROVIDER="$model_provider"
   export MODEL_DEFAULT_NAME="$model_default_name"
