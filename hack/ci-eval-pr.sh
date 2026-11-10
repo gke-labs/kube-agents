@@ -40,7 +40,16 @@ readonly EVAL_BLOCKING_ROSTER_FILE="eval/blocking-roster.txt"
 readonly EVAL_NIGHTLY_CASES_FILE="eval/nightly-cases.txt"
 readonly EVAL_GITLAB_CASES_FILE="eval/gitlab-cases.txt"
 readonly EVAL_GHES_CASES_FILE="eval/ghes-cases.txt"
-readonly EVAL_CERTIFICATION_CASES_FILE="eval/certification-cases.txt"
+# The certification suite has no roster file: a case is on its lane when its
+# task file carries the bare line `suite: certification` (and in part N when
+# it carries `certification_part: N`; absent is part 1). The two line
+# patterns below are the whole grammar; scripts/eval_rosters.py and
+# scripts/validate_bench_cases.py read the same two lines, and the validator
+# refuses any other spelling (a quoted or commented value), so a case the
+# validator registers is a case this grep sees.
+readonly CERTIFICATION_SUITE_LINE_RE='^suite: certification$'
+readonly CERTIFICATION_PART_KEY='certification_part'
+readonly CERTIFICATION_PART_LINE_RE="^${CERTIFICATION_PART_KEY}: [1-9][0-9]*$"
 # The stack-bearing cases of the nightly's main part that run in main-b,
 # main-c, main-d and main-e, when EVAL_NIGHTLY_PART splits that part in five
 # (#3384, #4238): a stack-bearing case on no list runs in main-a, which
@@ -2809,7 +2818,7 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 
 # 6. Task Matrix Execution Loop
-# The matrix is data, not code: six files under hack/eval/, read here at
+# The matrix is data, not code: five files under hack/eval/, read here at
 # startup (#1546, 2026-09-15). presubmit-cases.txt is what every pull request
 # runs (TASKS), gitlab-cases.txt is what the GitLab lane runs in
 # its place under EVAL_FORGE=gitlab (#2394, at the tier switch),
@@ -2832,12 +2841,13 @@ fi
 # ./tasks/<id>/task.yaml path, a path with no case directory behind it, or a
 # nightly entry that is also a presubmit one (it would run twice a night) all
 # stop the job here, before it spends a cluster, rather than running a wrong
-# matrix and reporting green around it. certification-cases.txt is what
-# EVAL_TIER=certification runs on its own (the certification tier, below).
+# matrix and reporting green around it. The certification suite is the one
+# matrix read from the task files themselves: `suite: certification` in a
+# task file is what EVAL_TIER=certification runs (the certification tier,
+# below).
 BENCH_DIR="${SCRIPT_DIR}/../bench"
 PRESUBMIT_CASES_FILE="${SCRIPT_DIR}/${EVAL_PRESUBMIT_CASES_FILE}"
 NIGHTLY_CASES_FILE="${SCRIPT_DIR}/${EVAL_NIGHTLY_CASES_FILE}"
-CERTIFICATION_CASES_FILE="${SCRIPT_DIR}/${EVAL_CERTIFICATION_CASES_FILE}"
 BLOCKING_ROSTER_FILE="${SCRIPT_DIR}/${EVAL_BLOCKING_ROSTER_FILE}"
 # Which lane list a forge runs (kube-agents#3682): the GitLab list on either
 # GitLab, gitlab.com or a self-managed instance, since the cases grade the
@@ -2956,22 +2966,45 @@ done
 # The certification suite: the cases behind the certified-capabilities page,
 # graded on their own lane (the ci-kube-agents-certification periodics in
 # oss-test-infra, EVAL_TIER=certification) and never on a pull request or a
-# nightly. Every entry is a top-level case under bench/tasks/ whose task file
-# carries `suite: certification` (scripts/validate_bench_cases.py holds the
-# roster to that); an entry that is also a presubmit or nightly case stops the
+# nightly. Membership is read from the task files, not from a roster: every
+# top-level case under bench/tasks/ whose task file carries the bare line
+# `suite: certification` is in the suite, in case-id order (LC_ALL=C, the
+# order scripts/eval_rosters.py sorts in), so a case pull request edits no
+# shared file. An entry that is also a presubmit or nightly case stops the
 # job, since a case graded on two lanes would hold two records under one
-# name. The file may be empty between the tier landing and its first case,
+# name. The suite may be empty between the tier landing and its first case,
 # so the empty read is refused only when this tier is the one running.
-# `# part N` lines (N from 1, the line on its own) split the file into
-# sections, one periodic each (EVAL_CERTIFICATION_PART below); an entry
-# above the first marker is part 1. scripts/eval_rosters.py reads the same
-# grammar (PART_MARKER_RE); the two must stay twins.
-CERTIFICATION_ENTRIES="$(roster_entries "${CERTIFICATION_CASES_FILE}")"
+# `certification_part: N` in a task file (N from 1, the bare line) puts the
+# case in section N, one periodic each (EVAL_CERTIFICATION_PART below); a
+# case without the line is part 1. scripts/eval_rosters.py reads the same
+# two lines (CERTIFICATION_SUITE_LINE_RE, CERTIFICATION_PART_LINE_RE); the
+# two must stay twins.
+certification_entries() {
+  # grep -l exits 1 when no task file matches; that is the empty suite, not
+  # an error, and the tier switch below is what refuses it. Exit 2 (a task
+  # file it could not read) is an error: a case dropped in silence would
+  # grade green around a missing record. Sorted on the id field, not the
+  # path: `tasks/foo-bar/` sorts before `tasks/foo/` as text (`-` before
+  # `/`), and scripts/eval_rosters.py sorts by id.
+  (
+    cd "${BENCH_DIR}" || exit 1
+    local files rc=0
+    files="$(LC_ALL=C grep -lE "${CERTIFICATION_SUITE_LINE_RE}" tasks/*/task.yaml)" || rc=$?
+    if [ "${rc}" -gt 1 ]; then
+      echo "ERROR: could not read every task file under bench/tasks/ for the certification suite (grep exit ${rc})." >&2
+      exit 1
+    fi
+    if [ -n "${files}" ]; then
+      LC_ALL=C sort -t/ -k2,2 <<< "${files}" | sed 's|^|./|'
+    fi
+  )
+}
+CERTIFICATION_ENTRIES="$(certification_entries)"
 CERTIFICATION_TASKS=()
 while IFS= read -r ENTRY; do
   if [ -n "${ENTRY}" ]; then CERTIFICATION_TASKS+=("${ENTRY}"); fi
 done <<< "${CERTIFICATION_ENTRIES}"
-check_case_entries "${CERTIFICATION_CASES_FILE}" ${CERTIFICATION_TASKS[@]+"${CERTIFICATION_TASKS[@]}"}
+check_case_entries "bench/tasks (suite: certification)" ${CERTIFICATION_TASKS[@]+"${CERTIFICATION_TASKS[@]}"}
 # A here-string, not `printf | grep -q`: grep exits on its first match, a
 # producer still writing dies of SIGPIPE, and under pipefail the duplicate
 # reads as absent. printf hands the pipe a few KiB per write, so on today's
@@ -2979,22 +3012,25 @@ check_case_entries "${CERTIFICATION_CASES_FILE}" ${CERTIFICATION_TASKS[@]+"${CER
 # it is every run.
 for ENTRY in ${CERTIFICATION_TASKS[@]+"${CERTIFICATION_TASKS[@]}"}; do
   if grep -qxF -- "${ENTRY}" <<< "${PRESUBMIT_ENTRIES}"$'\n'"${NIGHTLY_ENTRIES}"; then
-    echo "ERROR: ${CERTIFICATION_CASES_FILE}: '${ENTRY}' is also in ${PRESUBMIT_CASES_FILE} or ${NIGHTLY_CASES_FILE}; a certification case runs on the certification lane only, or it holds two records under one name." >&2
+    echo "ERROR: ${ENTRY} carries 'suite: certification' and is also in ${PRESUBMIT_CASES_FILE} or ${NIGHTLY_CASES_FILE}; a certification case runs on the certification lane only, or it holds two records under one name." >&2
     exit 1
   fi
 done
 
-# The entries of one `# part N` section of the certification file, in file
-# order, with the same comment and whitespace rules as roster_entries.
-certification_part_entries() { # <file> <N>
-  awk -v want="$2" '
-    BEGIN { part = 1 }
-    /^#[[:space:]]+part[[:space:]]+[1-9][0-9]*[[:space:]]*$/ { part = $3 + 0; next }
-    {
-      sub(/#.*$/, ""); gsub(/^[[:space:]]+|[[:space:]]+$/, "")
-      if ($0 != "" && part == want + 0) print
-    }
-  ' "$1"
+# The part a certification case is in: the N of its bare
+# `certification_part: N` line, 1 when it has none.
+certification_part_of() { # <entry>
+  local part
+  part="$(grep -E "${CERTIFICATION_PART_LINE_RE}" "${BENCH_DIR}/$1" | head -n 1 | sed "s/^${CERTIFICATION_PART_KEY}: //" || true)"
+  echo "${part:-1}"
+}
+
+# The entries of section N of the suite, in case-id order.
+certification_part_entries() { # <N>
+  local entry
+  for entry in ${CERTIFICATION_TASKS[@]+"${CERTIFICATION_TASKS[@]}"}; do
+    if [ "$(certification_part_of "${entry}")" = "$1" ]; then echo "${entry}"; fi
+  done
 }
 
 # Which matrix this run gets. "presubmit" -- the default, and what every
@@ -3073,7 +3109,7 @@ case "${EVAL_TIER}" in
       exit 1
     fi
     if [ "${#CERTIFICATION_TASKS[@]}" -eq 0 ]; then
-      echo "ERROR: ${CERTIFICATION_CASES_FILE} names no case; the certification tier would run nothing and report green." >&2
+      echo "ERROR: no task file under bench/tasks/ carries the bare line 'suite: certification'; the certification tier would run nothing and report green." >&2
       exit 1
     fi
     TASKS=("${CERTIFICATION_TASKS[@]}")
@@ -3121,11 +3157,12 @@ case "${EVAL_NIGHTLY_PART}" in
 esac
 
 # ─── The certification part ──────────────────────────────────────────────────
-# Which `# part N` section of the certification file this run takes, applied
+# Which section of the certification suite this run takes (the cases whose
+# task file carries `certification_part: N`; none means part 1), applied
 # to TASKS here, before the exclusions and TASK_NAMES are built from it, so
 # the suite can run as one periodic per section on one leased project each: a
 # week's worth of runs at three repetitions is longer than any single job
-# here. "all", the default, is the whole file. A part outside the
+# here. "all", the default, is the whole suite. A part outside the
 # certification tier would be a typo that silently ran the wrong matrix, so
 # it stops the job, as does any value that is not "all" or a whole number.
 EVAL_CERTIFICATION_PART="${EVAL_CERTIFICATION_PART:-all}"
@@ -3143,9 +3180,9 @@ case "${EVAL_CERTIFICATION_PART}" in
     TASKS=()
     while IFS= read -r ENTRY; do
       if [ -n "${ENTRY}" ]; then TASKS+=("${ENTRY}"); fi
-    done <<< "$(certification_part_entries "${CERTIFICATION_CASES_FILE}" "${EVAL_CERTIFICATION_PART}")"
+    done <<< "$(certification_part_entries "${EVAL_CERTIFICATION_PART}")"
     if [ "${#TASKS[@]}" -eq 0 ]; then
-      echo "ERROR: EVAL_CERTIFICATION_PART=${EVAL_CERTIFICATION_PART} selects no case of the ${#CERTIFICATION_TASKS[@]}-case certification file; the run would grade nothing and report green." >&2
+      echo "ERROR: EVAL_CERTIFICATION_PART=${EVAL_CERTIFICATION_PART} selects no case of the ${#CERTIFICATION_TASKS[@]}-case certification suite; the run would grade nothing and report green." >&2
       exit 1
     fi
     echo "Certification part: ${EVAL_CERTIFICATION_PART} (${#TASKS[@]} of ${#CERTIFICATION_TASKS[@]} cases)"

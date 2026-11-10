@@ -66,12 +66,18 @@ YAML_MERGE_TAG = "tag:yaml.org,2002:merge"
 # runs, what the nightly adds. A case is registered by being in one of them.
 PRESUBMIT_CASES_FILE = eval_rosters.PRESUBMIT_CASES_FILE
 NIGHTLY_CASES_FILE = eval_rosters.NIGHTLY_CASES_FILE
-# The certification suite's file: a case there is registered too, on a lane
-# of its own, and its task file must say so with `suite: certification`.
-CERTIFICATION_CASES_FILE = eval_rosters.CERTIFICATION_CASES_FILE
-ROSTER_FILES = (PRESUBMIT_CASES_FILE, NIGHTLY_CASES_FILE, CERTIFICATION_CASES_FILE)
+ROSTER_FILES = (PRESUBMIT_CASES_FILE, NIGHTLY_CASES_FILE)
+# The certification suite has no roster file: the bare line
+# `suite: certification` in a task file registers the case on that lane, and
+# `certification_part: N` puts it in section N. hack/ci-eval-pr.sh reads the
+# two lines with grep, so the lines must be those exact spellings; the YAML
+# read below catches any other, since a case the YAML parse registers and the
+# grep cannot see would be a case the lane never runs.
 SUITE_KEY = "suite"
 CERTIFICATION_SUITE = eval_rosters.CERTIFICATION_SUITE
+CERTIFICATION_SUITE_LINE_RE = eval_rosters.CERTIFICATION_SUITE_LINE_RE
+CERTIFICATION_PART_KEY = eval_rosters.CERTIFICATION_PART_KEY
+CERTIFICATION_PART_LINE_RE = eval_rosters.CERTIFICATION_PART_LINE_RE
 # The synthetic result key validate_all() reports a broken roster parse under,
 # so a tree whose roster files cannot be read fails loudly instead of calling
 # every case an orphan.
@@ -992,20 +998,23 @@ def fixture_catalog_disagreements() -> list[str]:
 
 
 def registered_cases() -> set[str] | None:
-    """Case names the eval runs: the presubmit, nightly and certification files.
+    """Case names the eval runs: the presubmit and nightly files, and the
+    certification suite's task files.
 
-    An entry in any of them is registered; the presubmit one runs on every
+    An entry in either file is registered; the presubmit one runs on every
     pull request, the nightly one every night (EVAL_TIER=nightly in
-    hack/ci-eval-pr.sh), the certification one on its own lane
-    (EVAL_TIER=certification). A commented-out path counts for nothing -- that
-    parking state is retired; a case whose fixture does not exist waits in
-    FIXTURE_NOT_READY instead, and commented_out_registrations() reports the
-    comment as a finding.
+    hack/ci-eval-pr.sh). A case whose task file carries the bare line
+    `suite: certification` is registered on the certification lane
+    (EVAL_TIER=certification) and sits in no file. A commented-out path counts
+    for nothing -- that parking state is retired; a case whose fixture does
+    not exist waits in FIXTURE_NOT_READY instead, and
+    commented_out_registrations() reports the comment as a finding.
 
     The files are read with the same parse the script applies
     (scripts/eval_rosters.py). Returns None when a file is missing or holds a
     line that is not a ./tasks/<id>/task.yaml path, so a broken roster fails
-    loudly rather than calling every case an orphan.
+    loudly rather than calling every case an orphan; a task file that cannot
+    be read is left out of the suite set and keeps its own finding.
     """
     names: set[str] = set()
     for path in ROSTER_FILES:
@@ -1013,15 +1022,26 @@ def registered_cases() -> set[str] | None:
             names |= set(eval_rosters.case_names(path.read_text(encoding="utf-8")))
         except (OSError, ValueError):
             return None
+    return names | certification_cases()
+
+
+def certification_cases() -> set[str]:
+    """Case names whose task file carries the bare `suite: certification` line,
+    as the lane reads them."""
+    return set(eval_rosters.certification_cases())
+
+
+def roster_file_cases() -> set[str]:
+    """Case names in the presubmit and nightly files, the lanes a certification
+    case must stay off; empty when a file cannot be read (registered_cases()
+    reports that)."""
+    names: set[str] = set()
+    for path in ROSTER_FILES:
+        try:
+            names |= set(eval_rosters.case_names(path.read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            return set()
     return names
-
-
-def certification_cases() -> set[str] | None:
-    """Case names in hack/eval/certification-cases.txt; None when it cannot be read."""
-    try:
-        return set(eval_rosters.certification_cases())
-    except (OSError, ValueError):
-        return None
 
 
 def commented_out_registrations() -> dict[str, str]:
@@ -1269,36 +1289,58 @@ def _entry_vocabulary(entry: dict[str, Any], where: str, problems: list[str]) ->
 def validate_case(
     name: str, path: pathlib.Path, *, registered: set[str] | None, certification: set[str] | None = None
 ) -> list[str]:
-    """Every problem with one case file, as reader-facing sentences."""
+    """Every problem with one case file, as reader-facing sentences.
+
+    ``certification`` is the set of case names the presubmit and nightly files
+    hold, which a suite case must stay off; None skips that rule."""
     problems: list[str] = []
     spec = _load_yaml(path)
     if not isinstance(spec, dict):
         return [f"{path}: does not parse to a mapping"]
 
-    # The suite. A certification case says so in its file and sits in the
-    # certification roster; one without the other is a case on the wrong lane.
+    # The suite. The bare line `suite: certification` is the registration on
+    # the certification lane: hack/ci-eval-pr.sh greps for that exact line,
+    # so the YAML key and the text must agree, or the validator would register
+    # a case the lane never runs. The part line is held the same way.
     suite = spec.get(SUITE_KEY)
+    # newline="" keeps a CRLF file's `\r`, so the bare-line regex misses it
+    # the way the lane's grep does and the spelling rule below reports it.
+    with path.open(encoding="utf-8", newline="") as handle:
+        text = handle.read()
+    suite_line = CERTIFICATION_SUITE_LINE_RE.search(text) is not None
     if suite is not None and suite != CERTIFICATION_SUITE:
         problems.append(f"declares '{SUITE_KEY}: {suite}'; the only suite is '{CERTIFICATION_SUITE}'")
-    if certification is not None:
-        if name in certification and suite != CERTIFICATION_SUITE:
+    if suite == CERTIFICATION_SUITE and not suite_line:
+        problems.append(
+            f"declares the certification suite in a spelling the lane does not read; write the bare "
+            f"line '{SUITE_KEY}: {CERTIFICATION_SUITE}' (no quotes, no trailing comment), which is what "
+            f"hack/ci-eval-pr.sh greps for"
+        )
+    part = spec.get(CERTIFICATION_PART_KEY)
+    if part is not None:
+        if suite != CERTIFICATION_SUITE:
+            problems.append(f"sets '{CERTIFICATION_PART_KEY}:' without '{SUITE_KEY}: {CERTIFICATION_SUITE}'; the part is a section of that lane")
+        if not isinstance(part, int) or isinstance(part, bool) or part < 1:
+            problems.append(f"'{CERTIFICATION_PART_KEY}:' {part!r} is not a whole number from 1; write the bare integer")
+        elif not CERTIFICATION_PART_LINE_RE.search(text):
             problems.append(
-                f"is in {_display(CERTIFICATION_CASES_FILE)} but declares no "
-                f"'{SUITE_KEY}: {CERTIFICATION_SUITE}'; add the line, or take the case off the roster"
+                f"sets '{CERTIFICATION_PART_KEY}:' in a spelling the lane does not read; write the bare line "
+                f"'{CERTIFICATION_PART_KEY}: {part}', which is what hack/ci-eval-pr.sh greps for"
             )
-        # A parked case (FIXTURE_NOT_READY, KNOWN_UNREGISTERED) may carry its
-        # suite line before its roster line lands; the registration check
-        # below leaves a suite case to this finding, so the two never ask for
-        # a nightly line and a certification line at once.
-        if (
-            name not in certification
-            and suite == CERTIFICATION_SUITE
-            and name not in KNOWN_UNREGISTERED
-            and name not in FIXTURE_NOT_READY
-        ):
+    if suite_line:
+        # One lane: a case the lane runs sits in no roster file and in no
+        # parking list, since the lane would run a parked case without its
+        # fixture.
+        if name in KNOWN_UNREGISTERED or name in FIXTURE_NOT_READY:
             problems.append(
-                f"declares '{SUITE_KEY}: {CERTIFICATION_SUITE}' but is not in "
-                f"{_display(CERTIFICATION_CASES_FILE)}; a certification case runs on that lane only"
+                f"carries '{SUITE_KEY}: {CERTIFICATION_SUITE}' and is parked in KNOWN_UNREGISTERED or "
+                f"FIXTURE_NOT_READY; the lane would run it, so drop the line until the case can run"
+            )
+        if certification is not None and name in certification:
+            problems.append(
+                f"carries '{SUITE_KEY}: {CERTIFICATION_SUITE}' and is also in "
+                f"{_display(PRESUBMIT_CASES_FILE)} or {_display(NIGHTLY_CASES_FILE)}; a certification case "
+                f"runs on that lane only, or it holds two records under one name"
             )
 
     # The id key. devops-bench accepts task_id as an alias for id
@@ -1610,10 +1652,10 @@ def validate_case(
 
     # Registration. hack/ci-eval-pr.sh runs the cases in
     # hack/eval/presubmit-cases.txt and, on the nightly tier,
-    # hack/eval/nightly-cases.txt, and on the certification tier those in
-    # hack/eval/certification-cases.txt -- and only those. A `suite:
-    # certification` case is reported by the suite check above instead,
-    # which names the right file.
+    # hack/eval/nightly-cases.txt, and on the certification tier every task
+    # file with the bare suite line -- and only those. A `suite:
+    # certification` case is registered by its line; the suite checks above
+    # hold the line's spelling.
     if (
         registered is not None
         and name not in registered
@@ -1678,14 +1720,14 @@ def validate_paths(paths: list[pathlib.Path]) -> dict[str, list[str]]:
     findings that matter.
     """
     registered = registered_cases()
-    certification = certification_cases()
+    other_lanes = roster_file_cases()
     out: dict[str, list[str]] = {}
     for path in paths:
         resolved = path.resolve()
         in_tree = resolved.parent.parent == TASKS_DIR
         name = resolved.parent.name if resolved.name == "task.yaml" else resolved.stem
         out[name] = validate_case(
-            name, resolved, registered=registered if in_tree else None, certification=certification if in_tree else None
+            name, resolved, registered=registered if in_tree else None, certification=other_lanes if in_tree else None
         )
     return out
 
@@ -1696,27 +1738,27 @@ def validate_all() -> dict[str, list[str]]:
     if registered is None:
         return {
             ROSTER_PARSE_KEY: [
-                "could not read hack/eval/presubmit-cases.txt, "
-                "hack/eval/nightly-cases.txt and hack/eval/certification-cases.txt "
-                "as case lists -- a file is missing or holds a line that is not a "
-                "./tasks/<id>/task.yaml path"
+                "could not read hack/eval/presubmit-cases.txt and "
+                "hack/eval/nightly-cases.txt as case lists -- a file is missing or "
+                "holds a line that is not a ./tasks/<id>/task.yaml path"
             ]
         }
     if not registered:
         return {
             ROSTER_PARSE_KEY: [
-                "hack/eval/presubmit-cases.txt, hack/eval/nightly-cases.txt and "
-                "hack/eval/certification-cases.txt parsed to no cases -- either "
-                "all three are empty or this parse has drifted"
+                "hack/eval/presubmit-cases.txt and hack/eval/nightly-cases.txt parsed "
+                "to no cases and no task file carries 'suite: certification' -- either "
+                "everything is empty or this parse has drifted"
             ]
         }
     results: dict[str, list[str]] = {}
     cases = bench_cases()
-    certification = certification_cases()
+    # The one-lane rule: a suite case named in a roster file runs on two lanes.
+    other_lanes = roster_file_cases()
     for name, path in cases.items():
         # One unreadable file must not hide every other case's findings.
         try:
-            results[name] = validate_case(name, path, registered=registered, certification=certification)
+            results[name] = validate_case(name, path, registered=registered, certification=other_lanes)
         except CaseError as exc:
             results[name] = [str(exc)]
     for name, problems in greet_phrase_collisions(cases).items():
@@ -1907,11 +1949,12 @@ def stale_allowlist_entries() -> list[str]:
         ("FIXTURE_NOT_READY", FIXTURE_NOT_READY),
     ):
         stale += [f"{label}: {name}" for name in sorted(entries) if name not in existing]
-    # A FIXTURE_NOT_READY entry that a roster file also names is a case that
-    # runs: the fixture landed and the entry outlived it.
+    # A FIXTURE_NOT_READY entry that is also registered (a roster file names
+    # it, or its task file carries the suite line) is a case that runs: the
+    # fixture landed and the entry outlived it.
     registered = registered_cases() or set()
     stale += [
-        f"FIXTURE_NOT_READY: {name} (also in a roster file)"
+        f"FIXTURE_NOT_READY: {name} (also registered: a roster file or the suite line)"
         for name in sorted(FIXTURE_NOT_READY)
         if name in registered
     ]

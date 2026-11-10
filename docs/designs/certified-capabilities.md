@@ -2,7 +2,7 @@
 
 > **STATUS: design of record, lane in review, page not checked in.** The suite's tier, roster
 > and first cases are on `main` (`EVAL_TIER=certification` in `hack/ci-eval-pr.sh`,
-> `hack/eval/certification-cases.txt`, the "Certification suite" section of
+> the `suite: certification` line in each case's task file, the "Certification suite" section of
 > [`bench/README.md`](../../bench/README.md#certification-suite)). The lane is the Prow periodic
 > `ci-kube-agents-certification-1` proposed in GoogleCloudPlatform/oss-test-infra#2768. The page
 > and its rating reader exist as a local prototype only; the constants this document cites from
@@ -30,8 +30,9 @@ commits no customer installs. This document separates the two.
 - **Scenario.** One bench case under `bench/tasks/<id>/` with `suite: certification` in its
   `task.yaml`, graded by deterministic checks on the product's own artifacts (the audit ledger,
   the pull request, the chat answer). A row has one or more scenarios as its tests.
-- **Roster.** `hack/eval/certification-cases.txt`: the scenarios the lane runs, in `# part N`
-  sections, each line under a reason block that names the row it grades.
+- **Roster.** The task files: a scenario is on the lane when its task file carries the bare line
+  `suite: certification`, in the section its `certification_part: N` line names (none is part 1),
+  with the row it grades in the task file's header comment.
 - **Release window.** All scored repetitions of one scenario on one GA release and one model,
   across every build of the lane that graded that release. One release, one window; a Rerun on
   the same release pools into it, never into a neighbouring release's window. A model change

@@ -15,7 +15,7 @@ them, since the merge-blocking presubmit runs on that lane (below).
 `hack/replay-proxy/` carries it as well, because its normalizer decides which requests match a
 recorded answer ([`eval-design.md`](../examples/inference-replay/eval-design.md#the-proxy-cant-come-from-the-pull-request)).
 Nothing else carries the rule: `hack/ci-eval-pr.sh` and the scripts it runs,
-`hack/eval/nightly-cases.txt`, `hack/eval/certification-cases.txt`, `hack/eval/api-lane-exclusions.txt` and a new case directory under `bench/tasks/` need only the normal approvers
+`hack/eval/nightly-cases.txt`, `hack/eval/api-lane-exclusions.txt` and a new case directory under `bench/tasks/` need only the normal approvers
 ([#1546](https://github.com/gke-labs/kube-agents/issues/1546), decided 2026-09-15). This
 page lives under `docs/` on purpose: the presubmit's step 0 (`hack/ci-revalidate.sh`) treats
 `docs/` as inert (and the Prow path filter in `oss-test-infra` does today too), so a review finding
@@ -978,21 +978,20 @@ grow a lane-only seat.
 
 ## The certification suite
 
-The certification suite, the cases behind the certified-capabilities page, is the one list
-under `hack/eval/` that is not a view of the catalogue: `hack/eval/certification-cases.txt`
-registers its own cases, each a top-level case under
-`bench/tasks/` with `suite: certification` in its task file, and `EVAL_TIER=certification` in
-`hack/ci-eval-pr.sh` runs that file alone, in `# part N` sections under `EVAL_CERTIFICATION_PART`,
-one Prow periodic per section, weekly on a Saturday cron and on Rerun from Deck. The script refuses an entry
-that is also in `presubmit-cases.txt` or `nightly-cases.txt`, and `scripts/validate_bench_cases.py`
-refuses a rostered case without the suite line, so a case holds one record on one lane. The roster
+The certification suite, the cases behind the certified-capabilities page, has no list under
+`hack/eval/`: each case is a top-level case under `bench/tasks/` whose task file carries the
+bare line `suite: certification`, that line is its registration, and `EVAL_TIER=certification` in
+`hack/ci-eval-pr.sh` runs those cases alone, in sections by their `certification_part: N` line under `EVAL_CERTIFICATION_PART`,
+one Prow periodic per section, weekly on a Saturday cron and on Rerun from Deck. The script refuses a suite
+case that is also in `presubmit-cases.txt` or `nightly-cases.txt`, and `scripts/validate_bench_cases.py`
+refuses any other spelling of the two lines, so a case holds one record on one lane. The roster
 above never reaches it: the blocking roster is a subset of the presubmit, so rung 4 is disarmed on
 the lane by construction and the script exports no roster name there; rungs 1 to 3 red a run like
 every case, as does rung 5 (an `expected_fail: true` case that passes every repetition), and a
 failing certification case is a record for the page rather than a red. The lane appends nothing to
 the evidence store and publishes no dashboard; its record is its logs bucket. A certification case never
 earns a seat here; a capability the presubmit must guard gets a case of its own in the catalogue.
-The file needs the normal approvers, like `nightly-cases.txt`. The rules a certification fixture
+A case's task file needs the normal approvers, like `nightly-cases.txt`. The rules a certification fixture
 meets are in [`bench/README.md`](../bench/README.md#certification-suite).
 
 ## Demoting a flaky case

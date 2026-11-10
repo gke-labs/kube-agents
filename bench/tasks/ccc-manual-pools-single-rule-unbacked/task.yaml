@@ -8,7 +8,8 @@
 # referenced pools lack the class label: one labelled pool satisfies it, so
 # the one-pool-of-many shape passes both. A declared gap: expected_fail until
 # the check lands; its gap issue is filed with the fixture. Parked
-# (FIXTURE_NOT_READY on gke-labs/kube-agents#5143): the shape needs a
+# (FIXTURE_NOT_READY on gke-labs/kube-agents#5143; the bare `suite: certification`
+# line is the lane's registration, so a parked case carries none): the shape needs a
 # Standard cluster with a manual node pool under the class, which the lane's
 # Autopilot hosts refuse, so it is a seeded fleet fixture addressed by role,
 # not a stack on the host; the sibling gap is gke-labs/kube-agents#4943. The
@@ -16,7 +17,6 @@
 id: ccc-manual-pools-single-rule-unbacked
 name: "ComputeClass With Auto-Creation Off Backed by a Manual Pool for Only One Priority Rule (ccc-manual-pools-unbacked)"
 domain: capacity
-suite: certification
 expected_fail: true
 audit_streams:
   - stockout-prevention

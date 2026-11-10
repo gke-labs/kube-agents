@@ -169,22 +169,24 @@ Thresholds are named environment variables, all with the documented default: `EV
 ## Certification suite
 
 The certification suite is the set of cases behind the certified-capabilities page. It has its
-own lane and nothing else: `hack/eval/certification-cases.txt` is its roster, `EVAL_TIER=certification` in
-`hack/ci-eval-pr.sh` runs that file alone (one `# part N` section of it under
-`EVAL_CERTIFICATION_PART=N`, one Prow periodic per section, weekly on a Saturday cron and on Rerun from Deck),
-and no pull request and no nightly runs a case named there. A certification case is an ordinary
-case under `bench/tasks/<id>/` whose `task.yaml` carries `suite: certification`;
-`scripts/validate_bench_cases.py` refuses a rostered case without the line and a case with the line
-outside the roster, and the script refuses an entry that is also in `presubmit-cases.txt` or
-`nightly-cases.txt`, so one case holds one record on one lane. The roster starts with cases of its own; a nightly case
-joins it in a later change by moving its line out of the nightly file, and until then the page
-certifies a nightly case from its nightly record. The blocking roster is a subset of
+own lane and no roster file: a certification case is an ordinary case under `bench/tasks/<id>/`
+whose `task.yaml` carries the bare line `suite: certification`, and that line is its registration.
+`EVAL_TIER=certification` in `hack/ci-eval-pr.sh` runs every such case and nothing else, in case-id
+order (a section other than 1 is the bare line `certification_part: N`; `EVAL_CERTIFICATION_PART=N`
+runs one section, one Prow periodic per section, weekly on a Saturday cron and on Rerun from Deck),
+and no pull request and no nightly runs a case carrying the line. The lane greps for the two lines,
+so `scripts/validate_bench_cases.py` refuses any other spelling of them (a quoted value, a trailing
+comment), a suite case that a roster file also names, and a parked case (`FIXTURE_NOT_READY`,
+`KNOWN_UNREGISTERED`) that carries the line, so one case holds one record on one lane and a case
+pull request edits no shared file. The suite starts with cases of its own; a nightly case joins it in
+a later change by adding the line and dropping its nightly entry, and until then the page certifies
+a nightly case from its nightly record. The blocking roster is a subset of
 the presubmit, so nothing on this lane arms rung 4: a failing certification case is a record for
 the page, not a red. What does red a run of the lane is the same as anywhere: rungs 1 to 3 (a
 forbidden write, a check that never ran, inconsistent liveness) and rung 5, a case marked
 `expected_fail: true` that passes every repetition, which says its marker is stale. A case the
-suite declares as a known gap carries that marker and names its gap issue in the roster's reason
-block. The lane's record is its logs bucket, read by the page per case, release and model: the tier is
+suite declares as a known gap carries that marker and names its gap issue in its task file's
+header comment, beside the capability row it grades. The lane's record is its logs bucket, read by the page per case, release and model: the tier is
 kept out of the baseline evidence store and the nightly dashboard, as the GitLab and rollback
 lanes are.
 

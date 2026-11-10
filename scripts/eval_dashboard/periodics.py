@@ -366,7 +366,7 @@ WATCHED = (
     Periodic(
         CERTIFICATION_SLICE_JOB, "certification lane (slice 1)", CERTIFICATION_STALE_AFTER, None,
         "Certification lane", "the certification suite's weekly run is not recording", "the certification suite's weekly run is recording again",
-        "runs weekly on Saturday 14:00 UTC and on Rerun, grading part 1 of hack/eval/certification-cases.txt at 60 repetitions against the newest GA release on a leased pool project",
+        "runs weekly on Saturday 14:00 UTC and on Rerun, grading part 1 of the certification suite (the task files carrying suite: certification) at 60 repetitions against the newest GA release on a leased pool project",
         "the certified-capabilities page's suite tests stop accruing runs, and a forbidden write or an unrun check on the lane is a failed build nobody reads.",
         f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#59-the-certification-lane",
         logs_root=EVAL_NIGHTLY_LOGS_ROOT,

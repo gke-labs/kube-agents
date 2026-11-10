@@ -10,8 +10,9 @@ The files under hack/eval/ hold what the eval gate runs and what blocks (#1546, 
   (``NIGHTLY_TASKS``);
 - ``hack/eval/blocking-roster.txt`` -- one case id per line, the default of
   ``BOOTSTRAP_ADMITTED``;
-- ``hack/eval/certification-cases.txt`` -- what ``EVAL_TIER=certification``
-  runs on its own, in ``# part N`` sections, one periodic each.
+- the certification suite has no file: ``EVAL_TIER=certification`` runs every
+  task file under ``bench/tasks/`` carrying the bare line ``suite: certification``,
+  in sections by its ``certification_part: N`` line, one periodic each.
 
 In every file ``#`` starts a comment and blank lines are skipped, which is
 exactly the ``sed | grep`` the script applies; this module is the Python copy
@@ -50,11 +51,19 @@ GITLAB_CASES_FILE = EVAL_DIR / "gitlab-cases.txt"
 # The GHES lane's matrix (kube-agents#3684): what EVAL_FORGE=ghes runs, the
 # same rules as the GitLab lane's.
 GHES_CASES_FILE = EVAL_DIR / "ghes-cases.txt"
-# The certification suite's file: what EVAL_TIER=certification runs alone,
-# never a presubmit or nightly case. `# part N` lines split it into the
-# sections the ci-kube-agents-certification periodics run one each.
-CERTIFICATION_CASES_FILE = EVAL_DIR / "certification-cases.txt"
+# The certification suite has no roster file: a case is on its lane when its
+# task file carries the bare line `suite: certification`, and in section N
+# (one ci-kube-agents-certification periodic each) when it carries
+# `certification_part: N`; no line is part 1. The two patterns are the
+# whole grammar, the twins of CERTIFICATION_SUITE_LINE_RE and
+# CERTIFICATION_PART_LINE_RE in hack/ci-eval-pr.sh; the validator refuses a
+# task file whose YAML says the suite or the part in any other spelling, so
+# what this module lists is what the shell runs.
 CERTIFICATION_SUITE = "certification"
+CERTIFICATION_SUITE_LINE_RE = re.compile(r"^suite: certification$", re.M)
+CERTIFICATION_PART_KEY = "certification_part"
+CERTIFICATION_PART_LINE_RE = re.compile(r"^certification_part: ([1-9][0-9]*)$", re.M)
+CERTIFICATION_DEFAULT_PART = 1
 # The inject lane's exclusions (#2039): case ids the script drops from TASKS
 # under AGENT_TRANSPORT=inject, each with its reason as the comment block
 # directly above it.
@@ -78,11 +87,6 @@ CASE_ENTRY_RE = re.compile(r"^\./tasks/([A-Za-z0-9_-]+)/task\.yaml$")
 # A case path anywhere on a line, comment or not: how the validator finds a
 # commented-out registration, the parking state that is retired.
 CASE_PATH_ANYWHERE_RE = re.compile(r"tasks/([A-Za-z0-9_-]+)/task\.yaml")
-# A `# part N` section marker in the certification file: the line on its
-# own, N from 1, the twin of the awk pattern in the script's
-# certification_part_entries(). `#part 2`, an indented marker and `# part 0`
-# are comments to both.
-PART_MARKER_RE = re.compile(r"^#\s+part\s+([1-9]\d*)\s*$")
 # The old script's default line, for text from before the split.
 SCRIPT_ROSTER_RE = re.compile(r'BOOTSTRAP_ADMITTED="\$\{BOOTSTRAP_ADMITTED:-([^}]*)\}"')
 # bench-gate accepts comma- or whitespace-separated ids in the variable.
@@ -177,31 +181,50 @@ def ghes_cases(path: pathlib.Path = GHES_CASES_FILE) -> list[str]:
     return case_names(path.read_text(encoding="utf-8"))
 
 
-def certification_cases(path: pathlib.Path = CERTIFICATION_CASES_FILE) -> list[str]:
-    return case_names(path.read_text(encoding="utf-8"))
+def certification_part(text: str) -> int:
+    """The part a task file's text puts its case in: the N of its bare
+    ``certification_part: N`` line, CERTIFICATION_DEFAULT_PART without one."""
+    match = CERTIFICATION_PART_LINE_RE.search(text)
+    return int(match.group(1)) if match else CERTIFICATION_DEFAULT_PART
 
 
-def parse_certification_parts(text: str) -> dict[int, list[str]]:
-    """Case ids of the certification file by ``# part N`` section, in file order.
+def certification_cases(tasks_dir: pathlib.Path | None = None) -> list[str]:
+    """Case ids whose task file carries the bare suite line, in case-id order
+    (the order the shell's ``LC_ALL=C sort`` gives the same names). A task
+    file that cannot be read is left out here; the validator reports it."""
+    tasks_dir = TASKS_DIR if tasks_dir is None else tasks_dir
+    names = []
+    # Sorted by case id, the shell's `sort -t/ -k2,2`: sorting the paths
+    # would put `foo-bar` before `foo` (`-` sorts before `/`), the shell's
+    # field sort and this key agree. The text is read with newline="" so a
+    # CRLF file keeps its `\r` and the bare-line regex does not match it,
+    # as grep does not; the validator reports the spelling.
+    for task in sorted(tasks_dir.glob("*/task.yaml"), key=lambda path: path.parent.name):
+        text = _task_text(task)
+        if text is not None and CERTIFICATION_SUITE_LINE_RE.search(text):
+            names.append(task.parent.name)
+    return names
 
-    An entry above the first marker is part 1, as in the script; a section
-    that names nothing is left out, since the script refuses to run it. The
-    marker is matched on the raw line, as the script's awk does.
-    """
+
+def _task_text(task: pathlib.Path) -> str | None:
+    """A task file's text as the shell sees it (line endings kept); None when
+    it cannot be read, which the validator reports on its own."""
+    try:
+        with task.open(encoding="utf-8", newline="") as handle:
+            return handle.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def certification_parts(tasks_dir: pathlib.Path | None = None) -> dict[int, list[str]]:
+    """Case ids of the suite by part, each list in case-id order; a part
+    nobody names is absent, since the script refuses to run it."""
+    tasks_dir = TASKS_DIR if tasks_dir is None else tasks_dir
     parts: dict[int, list[str]] = {}
-    part = 1
-    for raw in text.splitlines():
-        marker = PART_MARKER_RE.match(raw)
-        if marker:
-            part = int(marker.group(1))
-            continue
-        for name in case_names(raw):
-            parts.setdefault(part, []).append(name)
+    for name in certification_cases(tasks_dir):
+        part = certification_part(_task_text(tasks_dir / name / "task.yaml") or "")
+        parts.setdefault(part, []).append(name)
     return parts
-
-
-def certification_parts(path: pathlib.Path = CERTIFICATION_CASES_FILE) -> dict[int, list[str]]:
-    return parse_certification_parts(path.read_text(encoding="utf-8"))
 
 
 def parse_lane_exclusions(text: str) -> dict[str, str]:
