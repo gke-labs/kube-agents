@@ -179,9 +179,9 @@ layout and are collected from the moment they start running.
       (`classify.py`, `health.py`) count it apart from the storm reps — it is
       not lost to 429s — and outside every pass-rate denominator; `classify.py`
       classes a case whose ungraded reps are all of this kind
-      `delegation-ceiling`. The run page, the PR view and the PR comment's
-      result cell count it in a case's total and name it apart; the Cases
-      page's per-run counts (`render.rep_counts`) still fold it into `infra`.
+      `delegation-ceiling`. The run page and the PR view count it in a case's
+      total and name it apart; the Cases page's per-run counts
+      (`render.rep_counts`) still fold it into `infra`.
       An `infra` rep whose `reason` carries `fixture-drift:<role>` is a
       **fixture** rep: `hack/ci-eval-pr.sh` recorded it without running it
       because the lease-time seeded-fleet scan saw a fixture the case needs
@@ -1322,6 +1322,10 @@ read is final.
 verdict: the Brief says no verdict is published and shows the last 24
 hours in numbers and the runs, the PR view classifies from the runs alone
 and shows no gate banner. Only a `GREEN` verdict reads as healthy. For
+`storm` the `incident` also carries `causes`, the repetitions' own words for
+how they died with counts (`[[words, n], …]`, every phrasing, commonest first,
+scrubbed and cut as the periodics' quoted log line is), which the Chat
+sentence names short. For
 `lost_pods` the `incident` also carries `nodes` (`{node name: runs lost on
 it}`) and `event` (`true` when the loss counts as a build-cluster event);
 the pages give it the same 2-hour lead on the Brief's window as a storm and

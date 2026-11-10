@@ -1641,6 +1641,15 @@ platformAgent:
       # roles. The federated principal needs only roles/iam.workloadIdentityUser
       # on it.
       serviceAccountEmail: ""
+    # Omit core `secrets` (`get`, `list`, `watch`) from the reader ClusterRole
+    # (`kubeagents:minimal:<ns>:<name>`).
+    # - `null` (unset): new installs grant `secrets` read access (`<name>-kube-proxy`
+    #   strips secret payloads from every response with `KUBE_PROXY_REDACT_SECRETS=true`).
+    #   Existing installs keep the `secrets` permission their ClusterRole already holds.
+    # - `true`: omit `secrets` from the reader ClusterRole.
+    # - `false`: grant `secrets` on the reader ClusterRole, including on upgraded
+    #   existing installs.
+    disallowSecretsRead: null
   # The GCP projects, folders, organisations, Shared VPC hosts and Metrics
   # Scopes, beyond the project the agent runs in, whose GKE clusters the hourly
   # Cluster Agent reconcile enumerates, and what it leaves unmanaged: rendered

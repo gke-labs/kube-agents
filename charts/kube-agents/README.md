@@ -1198,6 +1198,18 @@ Exactly one owner creates the broker's KSA, depending on
   does not create it — the **chart** renders it instead, so a default install
   still starts.
 
+### Secret metadata read access (`platformAgent.security.disallowSecretsRead`)
+
+`platformAgent.security.disallowSecretsRead` sets `spec.security.disallowSecretsRead` on the
+`PlatformAgent` CR. When unset (`null`, the default), a new install grants `get`, `list`, and
+`watch` on core `secrets` to `kubeagents:minimal:<ns>:<name>` so `<name>-kube-proxy` can serve
+redacted `Secret` metadata (`KUBE_PROXY_REDACT_SECRETS=true`), while an existing install keeps
+whatever `secrets` permission its `kubeagents:minimal:<ns>:<name>` `ClusterRole` already holds.
+Set `--set platformAgent.security.disallowSecretsRead=true` (or `--disallow-secrets-read=true` /
+`DISALLOW_SECRETS_READ=true` in `install.sh`) to omit `secrets` from the reader `ClusterRole`, or
+set `--set platformAgent.security.disallowSecretsRead=false` to grant `secrets` on an upgraded
+existing install.
+
 ### Admission policies
 
 `admissionPolicy.enabled` (default `true`) installs three cluster-scoped

@@ -155,6 +155,9 @@ SHARED_BREAK_CAUSE = "the same cases fail on every PR since {since} ({prs} PRs s
 # same sentence without the count, built from the same incident fields.
 CEILING_PUBLIC_CAUSE = "runs on {prs} PRs ended with the worker still running {window}; nothing was graded and nothing counts against a case."
 CEILING_WINDOW_SINCE = "since {since}"
+# health.json incident field the storm sentence quotes (the reps' words and
+# counts); dropped before the sentence is rendered here.
+STORM_CAUSES_KEY = "causes"
 BOX_HEALTHY = "🟢 **Gate healthy.**"
 ALL_THEIRS = "**Your failures are exactly the gate's, so this red is not your code.** Don't retest yet; run `/retest` once #kube-agents-ci-health says the gate is healthy again."
 SOME_THEIRS = "**Some of your failures are the gate's; {yours_text}.** Fix those; don't retest for the rest until the gate is healthy."
@@ -335,8 +338,10 @@ def newest_red_per_pr(data: dict, since: datetime, now: datetime) -> list[dict]:
 
 
 def cause_text(health_doc: dict) -> str:
-    """post_health.cause_sentence, except that a shared break names no case
-    and a delegation ceiling counts no repetitions."""
+    """post_health.cause_sentence, except that a shared break names no case,
+    a delegation ceiling counts no repetitions, and a storm prints no
+    repetition count or reason: the incident's `causes` are the reps' own
+    words, which this comment keeps off the public record."""
     incident = health_doc.get("incident") or {}
     since = post_health.clock(post_health.parse_iso(health_doc.get("since")))
     if health_doc.get("condition") == health.SHARED_BREAK:
@@ -345,6 +350,8 @@ def cause_text(health_doc: dict) -> str:
         start, end = post_health.parse_iso(incident.get("window_start")), post_health.parse_iso(incident.get("window_end"))
         window = post_health.clock_range(start, end) if start and end else CEILING_WINDOW_SINCE.format(since=since)
         return CEILING_PUBLIC_CAUSE.format(prs=len(incident.get("prs") or []), window=window)
+    if health_doc.get("condition") == health.STORM:
+        return post_health.cause_sentence(dict(health_doc, incident={k: v for k, v in incident.items() if k != STORM_CAUSES_KEY}))
     return post_health.cause_sentence(health_doc)
 
 
