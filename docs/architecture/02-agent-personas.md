@@ -202,9 +202,9 @@ loosely coupled and is what makes failure isolation
 ([04-workflow-model.md](04-workflow-model.md) §6) possible: no agent depends on another being online
 at request time.
 
-> **Why OKF for v1 (mem0 deferred):** OKF is the durable, human-curatable, git-backed _knowledge_
+> **Why OKF for v1 (cross-tier mem0 deferred):** OKF is the durable, human-curatable, git-backed _knowledge_
 > layer — a natural fit for read-only agents that propose via PR and humans who review as code, and it
-> adds no required infrastructure. Cross-tier **mem0/Qdrant coordination remains deferred post-v1** (optional single-install Hindsight verbatim indexing of `knowledge/` into `kube-agents-decisions` under `--memory=hindsight` is specified in [`docs/designs/memory.md`](../designs/memory.md) and [06](06-api-and-data-contracts.md) §5–§6; `--memory=file` and `--memory=off` evaluate OKF directly from Git). (The
+> adds no required infrastructure. Cross-tier **mem0/Qdrant coordination remains deferred post-v1**, while [`docs/designs/memory.md`](../designs/memory.md) and [06](06-api-and-data-contracts.md) §5–§6 propose indexing `knowledge/` verbatim into single-install Hindsight (`kube-agents-decisions`) whenever `--memory=hindsight` is enabled (`--memory=file` and `--memory=off` evaluate OKF directly from Git). (The
 > conversational memory provider choice handles **per-user session isolation in the shared gateway**,
 > separate from cross-tier coordination.)
 

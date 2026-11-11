@@ -435,15 +435,15 @@ is no fleet state left over from the model it replaces.
 
 The ledger renders each finding in exactly one state. Transitions are computed per run, never stored.
 
-| State                | Condition                                             | Rendered as                           | Action taken                                            |
-| -------------------- | ----------------------------------------------------- | ------------------------------------- | ------------------------------------------------------- |
-| `open`               | reproduces; no PR on its branch                       | `open`                                | none, unless it qualifies for auto-promotion            |
-| `pr-open`            | reproduces; branch has an open PR                     | `fix proposed` + link                 | **labels re-asserted** — the PR itself is untouched     |
-| `pr-merged-persists` | reproduces; branch PR is merged                       | `⚠ fix merged, still reproduces`      | comment once on the merged PR; never reopen it          |
-| `refused`            | reproduces; branch PR closed unmerged by a **person** | `fix refused` + link                  | none — the close stands until someone says `/remediate` |
-| `withdrawn`          | reproduces; branch PR closed unmerged by the harness  | `fix withdrawn, awaiting re-proposal` | eligible for promotion again, exactly as if it had none |
-| `resolved`           | no longer reproduces; PR open or absent               | not rendered — see below              | close any open PR (§3.3), keep the branch               |
-| `resolved-merged`    | no longer reproduces; branch PR is merged             | not rendered — see below              | none; a merged fix that worked is the expected ending   |
+| State                | Condition                                                             | Rendered as                           | Action taken                                            |
+| -------------------- | --------------------------------------------------------------------- | ------------------------------------- | ------------------------------------------------------- |
+| `open`               | reproduces; no PR on its branch                                       | `open`                                | none, unless it qualifies for auto-promotion            |
+| `pr-open`            | reproduces; branch has an open PR                                     | `fix proposed` + link                 | **labels re-asserted** — the PR itself is untouched     |
+| `pr-merged-persists` | reproduces; branch PR is merged                                       | `⚠ fix merged, still reproduces`      | comment once on the merged PR; never reopen it          |
+| `refused`            | reproduces; branch PR closed unmerged by a collaborator (`can_write`) | `fix refused` + link                  | none — the close stands until someone says `/remediate` |
+| `withdrawn`          | reproduces; branch PR closed unmerged by the harness                  | `fix withdrawn, awaiting re-proposal` | eligible for promotion again, exactly as if it had none |
+| `resolved`           | no longer reproduces; PR open or absent                               | not rendered — see below              | close any open PR (§3.3), keep the branch               |
+| `resolved-merged`    | no longer reproduces; branch PR is merged                             | not rendered — see below              | none; a merged fix that worked is the expected ending   |
 
 Every row that names a PR state applies only when that PR claims the finding; a merged or closed PR
 claims only the ids in its delta block (§2). An `open` finding can also sit on a branch whose merged
@@ -468,9 +468,9 @@ Three of the rendered rows are easy to misread, and two of them were wrong in an
   index of what it still owns rather than anything a reviewer authored, and a stripped `agent:audit`
   or a `severity:` frozen at what the group used to be loses the pull request from the views triage
   works from. Labels only — no push, no rewritten body — so the promise above still holds.
-- **`refused` is a human decision, not a rejected command.** It is what a finding looks like when
-  someone closed its fix without merging — a considered "no" the harness must not overrule by
-  re-proposing the same fix tomorrow. (A refused `/remediate` is a _reply_, not a finding state;
+- **`refused` is a collaborator decision, not a rejected command.** It is what a finding looks like when
+  a reviewer with write access (`can_write`) closed its fix without merging — a considered "no" the harness must not overrule by
+  re-proposing the same fix tomorrow. When Decision Memory ([`memory.md`](memory.md)) ingests an unmerged close, a collaborator close carrying a non-situational technical reason records an advisory `status:rejected` lesson (superseded when a later PR merges on that path), whereas uncommented, situational, or non-writer closes retire the pending lesson candidate (`status:retired`). (A refused `/remediate` is a _reply_, not a finding state;
   there is no finding to put in a state, which is why the draft's condition for this row did not
   correspond to anything the renderer could compute.)
 - **`withdrawn` is the other half of that row**, and splitting the two is not cosmetic. A closed

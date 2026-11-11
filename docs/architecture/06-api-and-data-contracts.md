@@ -16,8 +16,8 @@ The exact interfaces a builder implements against: the **`Agent` CRD** (per pers
 harness, reconciled by the kube-agents controller), the **identity contract** (read-only per tier;
 pre-created KSA/RBAC/WI the controller references by name), the **user-authorization** contract
 (_deferred hardening_ — down-scope to the requester), the **GitOps repo layout** + actuation/IaC
-conventions, the **OKF** knowledge schema, **session and long-term memory** state (`kube_agents_memory`
-and optional `kube-agents-decisions` Hindsight indexing; multi-tier `mem0/Qdrant` coordination deferred
+conventions, the **OKF** knowledge schema, **session and long-term memory** state (`kube_agents_memory`,
+plus proposed `kube-agents-decisions` Hindsight indexing; multi-tier `mem0/Qdrant` coordination deferred
 post-v1), the **review-gate** contract, and the **MCP tool** changes that make agents read-only.
 Namespace convention `kubeagents-system`; agent labels use the `kube-agents/…` prefix.
 
@@ -318,25 +318,25 @@ optional for later). It lives outside the paths the pipeline deploys (`clusters/
 `fleet/`), so it is never applied to a cluster. Required frontmatter field: `type`. Convention for
 kube-agents knowledge types:
 
-| `type`              | Purpose                               | Key frontmatter                             |
-| ------------------- | ------------------------------------- | ------------------------------------------- |
-| `cluster-blueprint` | Standard cluster config baseline      | `title, tags, resource, timestamp`          |
-| `tenancy-model`     | Namespace isolation standard          | `title, tags`                               |
-| `runbook`           | Operational procedure (SRE CUJ)       | `title, tags, timestamp`                    |
-| `metric-definition` | Named metric/KPI definition           | `title, tags, resource`                     |
-| `escalation`        | A cross-tier request not yet a change | `title, tags, timestamp, resource`          |
-| `observation`       | A durable finding worth sharing       | `title, tags, timestamp`                    |
-| `decision`          | Forward-looking architectural choice  | `id, title, status, scope, guard`           |
-| `lesson`            | Verified incident / PR outcome lesson | `id, title, status, scope, guard, evidence` |
+| `type`              | Purpose                                            | Key frontmatter                             |
+| ------------------- | -------------------------------------------------- | ------------------------------------------- |
+| `cluster-blueprint` | Standard cluster config baseline                   | `title, tags, resource, timestamp`          |
+| `tenancy-model`     | Namespace isolation standard                       | `title, tags`                               |
+| `runbook`           | Operational procedure (SRE CUJ)                    | `title, tags, timestamp`                    |
+| `metric-definition` | Named metric/KPI definition                        | `title, tags, resource`                     |
+| `escalation`        | A cross-tier request not yet a change              | `title, tags, timestamp, resource`          |
+| `observation`       | A durable finding worth sharing                    | `title, tags, timestamp`                    |
+| `decision`          | Forward-looking architectural choice _(proposed)_  | `id, title, status, scope, guard`           |
+| `lesson`            | Verified incident / PR outcome lesson _(proposed)_ | `id, title, status, scope, guard, evidence` |
 
 The six baseline types (`cluster-blueprint`, `tenancy-model`, `runbook`, `metric-definition`,
-`escalation`, `observation`) plus `decision` and `lesson` form the canonical set; `type` is an **open convention, not a hard enum** — new
+`escalation`, `observation`) ship today, and [`docs/designs/memory.md`](../designs/memory.md) proposes adding `decision` and `lesson`; `type` is an **open convention, not a hard enum** — new
 types are added by PR as needs arise. Layout mirrors OKF: `knowledge/{index.md, <type>/…}` (singular `<type>/` canonical, with plural aliases such as `decisions/` and `lessons/` also accepted when ingesting existing repos); markdown
 links form the knowledge graph; optional `log.md` for history. Agents **read** OKF for context and
 **propose** updates via PR (curate-as-code); humans approve. OKF holds durable knowledge only —
-**not** session state. An entry of any type may carry `declares:`, a list of
+**not** session state. Baseline posture entries may carry `declares:`, a list of
 `{check, namespace, object}` items (plus `cluster` for a one-cluster choice and `expires`, a `YYYY-MM-DD`
-UTC date, for one that lapses unless renewed) that an audit reads as a declared posture; `.kube-agents/intent.yaml` at the repository root names the paths it reads them from. Entries of type `decision` and `lesson` additionally carry `scope` and `guard` frontmatter that the VCS publish broker evaluates against proposed manifest diffs before pushing a branch (specified in [`docs/designs/memory.md`](../designs/memory.md)).
+UTC date, for one that lapses unless renewed) that an audit reads as a declared posture; `.kube-agents/intent.yaml` at the repository root names the paths it reads them from. In the proposed Layer 2 design ([`docs/designs/memory.md`](../designs/memory.md)), entries of type `decision` and `lesson` carry separate `scope` and `guard.expect` frontmatter so the VCS publish broker (`/v1/vcs/publish` in `credential-proxy`) can run deterministic manifest checks against the protected base branch before pushing a branch.
 
 ## 6. Session-state and long-term memory contract
 
@@ -346,9 +346,9 @@ each scope mapped to its own collection or access-controlled key, never a sandbo
 (a cross-scope read would be an isolation escape, [03](03-security-model.md)) — and TTL entries
 (default ~30–90 days) that graduate durable observations to OKF via a human-reviewed PR.
 
-**Session state & Hindsight banks (`kube_agents_memory` and `kube-agents-decisions`):** `session_db.sqlite` is keyed by
+**Session state & Hindsight banks (`kube_agents_memory`, plus proposed `kube-agents-decisions`):** `session_db.sqlite` is keyed by
 platform/space/thread; when `--memory=hindsight` is enabled, per-user conversational memory lives in `kube-agents-memory` on self-hosted Hindsight, isolated by a `user:<id>` scope tag
-deterministically derived by `kube_agents_memory` (`session.py`) from the gateway-verified caller identity (never supplied by the LLM or tool sandbox; see [`docs/designs/memory.md`](../designs/memory.md) for gateway-only intra-namespace `hindsight-api` port `8888` `NetworkPolicy` hardening while preserving `gke-gmp-system` Prometheus scraping, and verbatim OKF indexing into `kube-agents-decisions`). When `--memory=file` (default) or `--memory=off` is selected, OKF `decision` and `lesson` guards enforce directly from Git with no database dependency. The gateway also uses these keys (`thread_id` / `chat_id`) for **routing thread
+deterministically derived by `kube_agents_memory` (`session.py`) from the gateway-verified caller identity (never supplied by the LLM or tool sandbox). [`docs/designs/memory.md`](../designs/memory.md) proposes narrowing intra-namespace `hindsight-api` port `8888` `NetworkPolicy` ingress to the gateway pods (`app: <agent>-gateway`, `kubeagents.x-k8s.io/a2a-component: gateway`) and the credential-free `curator` pod (`kubeagents.x-k8s.io/component: curator`) while preserving `gke-gmp-system` Prometheus scraping, and indexing OKF records verbatim into a second Hindsight bank (`kube-agents-decisions`). Under that proposed Layer 2 contract, when `--memory=file` (default) or `--memory=off` is selected, OKF `decision` and `lesson` guards evaluate deterministically from Git with no database dependency. The gateway also uses these keys (`thread_id` / `chat_id`) for **routing thread
 affinity** — a thread stays bound to the agent it was first routed to (§2b) until re-addressed.
 
 ## 7. Review-gate contract ([04](04-workflow-model.md) §3)

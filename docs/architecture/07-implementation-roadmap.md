@@ -146,7 +146,7 @@ acceptance criteria pass.
 
 ### Phase 4 — Coordination & knowledge
 
-- **Goal:** turn on indirect coordination (GitOps + OKF; cross-tier mem0/Qdrant deferred post-v1, optional Hindsight `kube-agents-decisions` index under `--memory=hindsight` per [06](06-api-and-data-contracts.md) §6).
+- **Goal:** turn on indirect coordination (GitOps + OKF; cross-tier mem0/Qdrant deferred post-v1, with proposed Hindsight `kube-agents-decisions` indexing under `--memory=hindsight` per [06](06-api-and-data-contracts.md) §6).
 - **Work:** wire OKF read/update into all tiers ([06](06-api-and-data-contracts.md) §5); **wire the
   push-first event triggers** ([04](04-workflow-model.md) §4) — Kubernetes watches/informers on each
   agent's read-only SA (the `k8s-event-watcher` binary already built into the agent image, `deploy/docker/`)
@@ -251,7 +251,7 @@ Built end-to-end means all of these pass — the concrete form of [01](01-vision
     silently pauses a spoke's agents (reconciled state keeps running). Validate hub connectivity as an
     explicit step of the Phase-2 spoke bootstrap, not an afterthought.
 - **mem0/Qdrant operational cost (deferred)** — cross-tier Qdrant was the cost concern; v1
-  **defers mem0/Qdrant** and coordinates across tiers on GitOps + OKF (with `--memory=file` default requiring zero extra database pods, and optional Hindsight indexing under `--memory=hindsight` documented in [`docs/designs/memory.md`](../designs/memory.md)).
+  **defers cross-tier mem0/Qdrant** and coordinates across tiers on GitOps + OKF, while [`docs/designs/memory.md`](../designs/memory.md) proposes single-install verbatim OKF indexing into Hindsight (`kube-agents-decisions`) whenever `--memory=hindsight` is enabled (`--memory=file` default requires zero extra database pods).
 - **Hub is a shared-fate dependency for agent reasoning** — inference + Minty are hub-hosted
   ([05](05-system-architecture.md) §3), so a hub outage pauses spoke _agents_ (reconciled cluster
   state keeps running). Phase 6 chaos tests must assert the honest property ([04](04-workflow-model.md)
