@@ -1355,14 +1355,14 @@ class GroupTest(Harness):
             self.assertIsNone(RESULTS_RE.search(text), text)
         self.assertIn("filed 1,", out)
 
-    def test_the_group_recovers_with_one_comment_and_each_case_with_its_own(self):
+    def test_the_group_recovers_with_one_comment_and_no_per_case_comments(self):
         gh, _, _ = self.run_once(self.cluster())
         [filed] = self.filed(gh)
         issue = self.opened(filed)
         gh, out, _ = self.run_once(self.cluster(clear=(9,), clear_b=(9,)), FakeGh(open_issues=[issue]))
         comments = [body for _, body in self.comments(gh)]
-        self.assertEqual(len(comments), 6, "one per case, and one for the group")
-        [group] = [c for c in comments if "Every case here is clear again" in c]
+        [group] = comments
+        self.assertIn("Every case here is clear again", group)
         self.assertIn("night=2026-10-06 clear=2026-10-09", group)
         for case in MAIN_CASES + MAIN_B_CASES:
             self.assertIn(f"`{case}` on the 2026-10-09 nightly ([run](", group)
@@ -1384,8 +1384,7 @@ class GroupTest(Harness):
         lost_b = night(9, [infra_task(c) for c in MAIN_B_CASES], job=MAIN_B_JOB)
         gh, _, _ = self.run_once(self.cluster(clear=(9,), more=(lost_b,)), FakeGh(open_issues=[issue]))
         comments = [body for _, body in self.comments(gh)]
-        self.assertEqual(len(comments), 3, "the main cases' own recoveries only")
-        self.assertFalse([c for c in comments if "Every case here" in c])
+        self.assertEqual(comments, [], "main-b's cases are not clear, and a group issue gets no per-case comment")
         # Night 10: main-b runs green, and the group is clear.
         gh, _, _ = self.run_once(self.cluster(clear=(9, 10), clear_b=(10,), more=(lost_b,)),
                                  FakeGh(open_issues=[issue], comments={4000: [{"body": c} for c in comments]}))
@@ -1408,6 +1407,23 @@ class GroupTest(Harness):
         self.assertIn("clear=2026-10-23", group)
         self.assertIn("`case-noowner` on the 2026-10-23 nightly", group)
         self.assertIn("`case-red` on the 2026-10-10 nightly", group, "its first pass the window still holds")
+
+    def test_a_three_case_group_that_recovers_leaves_exactly_one_comment(self):
+        runs = [night(d, [tripped(c) for c in MAIN_CASES]) for d in (6, 7, 8)]
+        gh, _, _ = self.run_once(data(*runs))
+        [filed] = self.filed(gh)
+        cleared = data(*runs, night(9, [green(c) for c in MAIN_CASES]))
+        gh, _, _ = self.run_once(cleared, FakeGh(open_issues=[self.opened(filed)]))
+        [(path, body)] = self.comments(gh)
+        self.assertEqual(path, f"{ISSUES}/4000/comments")
+        self.assertIn("Every case here is clear again", body)
+
+    def test_a_group_issue_with_every_marker_deleted_is_not_matched_by_name(self):
+        gh, _, _ = self.run_once(self.cluster())
+        [filed] = self.filed(gh)
+        body = "\n".join(line for line in filed["body"].splitlines() if "nightly-red case=" not in line)
+        gh, _, _ = self.run_once(self.cluster(), FakeGh(open_issues=[self.opened(filed, body=body)]))
+        self.assertEqual(len(self.filed(gh)), 1, "the cases listed in its body are split off and file again, as one group")
 
     def test_one_domain_goes_to_its_owner_with_the_case_owners_mentioned(self):
         runs = [night(d, [tripped(c) for c in MAIN_CASES]) for d in (6, 7, 8)]

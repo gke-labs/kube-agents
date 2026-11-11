@@ -34,11 +34,14 @@ one issue instead of one each (``Filer.file_group``)::
        case's effective owner @-mentioned
 
     every case an open group issue names has recovered (``recovery_night``)
-    -> one comment saying so, beside each case's own recovery comment
+    -> one comment listing each case's clear night; no per-case recovery
+       comment on a group issue, so ten cases do not make eleven comments
 
-The group issue carries each case's marker, so the dedupe and the per-case
-recovery read it as they read a per-case issue, and its own marker
-(GROUP_MARKER) for the all-clear. It names no check: the repository is
+The group issue carries each case's marker, so the dedupe reads it as it
+reads a per-case issue, and its own marker (GROUP_MARKER) for the all-clear.
+A case that reaches the streak a tick after its group was filed, with the
+same first night and check, files on its own: GROUP_MARKER carries the night
+only, by design, so no key matches it to the group (a known follow-up). It names no check: the repository is
 public, and the check is on the dashboard behind the run links. On
 2026-11-09 the filer opened 12 issues, 10 of them for one grader change
 (#4973, fixed by #5179), sent to five owners.
@@ -401,7 +404,7 @@ Nightly report: {nightly_url}
 - **Infra:** close this issue and point to the infra issue.
 - **A case that does not belong here:** delete its `kube-agents-bot:nightly-red case=` line from this body; it is filed on its own if it stays red.
 
-Filed automatically by `scripts/eval_dashboard/nightly_bugs.py` (docs/ci-health.md, "Nightly bugs") in place of one issue per case. It comments here as each case is clear again, and once when every case is; it never closes the issue. Closing this one issue closes it for every case listed.
+Filed automatically by `scripts/eval_dashboard/nightly_bugs.py` (docs/ci-health.md, "Nightly bugs") in place of one issue per case. It comments here once every case is clear again; it never closes the issue. Closing this one issue closes it for every case listed.
 """
 GROUP_CASE_LINE = "- `{case}` (`{domain}`)"
 GROUP_DOMAIN = "**{name}** (`{slug}`)"
@@ -697,7 +700,9 @@ def names_case(issue: dict, case: str, kind: str = KIND_RED) -> bool:
     runs whose URLs name the job."""
     body = issue.get("body") or ""
     markers = BOT_MARKER_RE.findall(body)
-    if markers or kind != KIND_RED:
+    # A group issue is matched on its case markers alone, even with none
+    # left: a case still listed in its body after its marker went is split off.
+    if markers or kind != KIND_RED or GROUP_MARKER_RE.search(body):
         return (kind, case) in markers
     text = f"{issue.get('title') or ''}\n{body}"
     return any(re.search(pattern.format(name=re.escape(case)), text, re.IGNORECASE) for pattern in (NAME_IN_TEXT_RE, NAME_IN_TRANSCRIPT_RE))
@@ -960,7 +965,9 @@ class Filer:
                 else:
                     pending.append({"case": case, "fields": fields, "streak": streak, "verdicts": verdicts})
                 continue
-            recovered = recovery_night(verdicts, lambda v: opened_before(issue, v)) if issue else None
+            # A group issue gets one all-clear (recover_groups) instead.
+            grouped = bool(issue and GROUP_MARKER_RE.search(issue.get("body") or ""))
+            recovered = recovery_night(verdicts, lambda v: opened_before(issue, v)) if issue and not grouped else None
             if recovered and issue:
                 done = self.recover(case, issue, recovered)
                 if done:

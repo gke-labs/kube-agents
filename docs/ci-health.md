@@ -931,14 +931,17 @@ place of one each, labelled `nightly-red`, each case's `domain:<slug>` and
 `needs-triage`, and listing each case's nights as a per-case issue does. It goes to the
 domain's `owner:` when the cases share a domain, and to `infra_owner` in
 `domains.yaml` when they span domains, with each case's effective owner
-@-mentioned. The issue carries every case's marker, so the dedupe and the
-per-case recovery comments treat it as each case's issue; a triager who
+@-mentioned. The issue carries every case's marker, so the dedupe treats it as each
+case's issue (matched on those markers alone, never on a case named in its
+text); a triager who
 deletes a case's marker line splits that case off, and it files on its own if
 it stays red. Once every case it names has a recovery night after the issue
 opened (or, once a case's red nights have left the 14-night window, a pass
-after the issue opened), the bot comments once more, listing each case's clear night; a part
+after the issue opened), the bot comments once, listing each case's clear
+night; a group issue gets no per-case recovery comment. A part
 that graded nothing that night (no project, a setup death) is skipped, as for
-one case, so it does not count as clear. The issue names no check: the
+one case, so it does not count as clear. A case that reaches 3 red nights a
+tick after its group was filed files on its own. The issue names no check: the
 check is used to group and stays on the dashboard. Three, not two: two cases
 sharing a check from one night are often a probe and its audit in one domain,
 one owner either way, and three unrelated cases breaking the same check the
