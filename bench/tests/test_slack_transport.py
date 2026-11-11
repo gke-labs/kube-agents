@@ -23,7 +23,7 @@ reaction removed once the work succeeded.
 import json
 
 import pytest
-from kube_agents_bench import harness
+from kube_agents_bench import harness, stop_hook
 from kube_agents_bench import slack_transport as slack
 
 BOT = "UBOT"
@@ -213,3 +213,14 @@ def test_a_bot_token_is_refused_as_infrastructure(monkeypatch):
         monkeypatch.setenv(name, "v")
     monkeypatch.setenv(slack.USER_TOKEN_ENV, "xoxb-bot")
     assert harness._execute_slack("q").errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+
+
+def test_an_inject_only_directive_is_refused_before_anything_is_posted(monkeypatch):
+    monkeypatch.setenv("AGENT_TRANSPORT", harness.TRANSPORT_SLACK)
+
+    def posted(prompt):
+        raise AssertionError("the Slack transport ran a stopped ask")
+
+    monkeypatch.setattr(harness, "_execute_slack", posted)
+    result = harness.KubeAgentsHarness()._execute(f"{stop_hook.STOP_DIRECTIVE} observe=60\nscale it", opening_turn=True)
+    assert result.has_errors() and "needs AGENT_TRANSPORT=inject" in result.errors[0]

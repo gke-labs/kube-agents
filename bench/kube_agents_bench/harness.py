@@ -3018,8 +3018,6 @@ class KubeAgentsHarness(AgentHarness):
             result = self._execute_inject(prompt)
             _fold_worker_total(result.tokens)
             return result
-        if transport == TRANSPORT_SLACK:
-            return _execute_slack(prompt)
         if stop_hook.is_stopped_ask(prompt):
             return AgentResult.errored(
                 f"a stopped ask ({stop_hook.STOP_DIRECTIVE} or {stop_hook.MID_TURN_DIRECTIVE}) "
@@ -3029,6 +3027,8 @@ class KubeAgentsHarness(AgentHarness):
             return AgentResult.errored(
                 f"{pushed_report.DIRECTIVE} needs AGENT_TRANSPORT={TRANSPORT_INJECT}, got {transport!r}"
             )
+        if transport == TRANSPORT_SLACK:
+            return _execute_slack(prompt)
         return self._execute_api(prompt, workspace_path, opening_turn=opening_turn)
 
     def _execute_api(
