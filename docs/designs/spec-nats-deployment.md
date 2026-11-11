@@ -365,8 +365,9 @@ there is an offline target the day a password is hand-set. That binds every rend
 this stack, not one function - the rollout hash on the NATS pod template is over the
 config rendered with placeholders in the passwords' place plus the credentials Secret's
 `resourceVersion`, which is what lets a config change and a rotation both roll the bus
-without a credential reaching the digest. The gateway's per-profile deny is left out of
-that hash, since a reload applies it (below).
+without a credential reaching the digest. On a single server the gateway's per-profile
+deny is left out of that hash, since a reload applies it; on a cluster it is in, so a
+profile change rolls the servers (below).
 
 Layout:
 
@@ -1128,7 +1129,9 @@ The pod template's config hash leaves out the per-profile gateway deny, so an Ag
 added, removed or done draining changes the config Secret and not the template: the bus is
 reloaded, not rolled. Every other config change still rolls it. The operator records the
 reload it asked for on the Secret, with the `config_load_time` it read just before writing,
-and confirms the reload when that value moves. If it hasn't moved within three minutes, or
+and confirms the reload when that value moves. A config written while a reload is still
+pending can't be confirmed by that move, which may be the earlier write landing, so the move
+restarts the wait from the new value. If it hasn't moved within three minutes, or
 can't be read, the operator deletes the bus pod so it restarts onto the new config, and
 writes a `BusConfigReloadFailed` Warning. The kubelet takes up to about a minute to write
 an updated Secret into a running pod, so a newly added profile's deny lands that long after

@@ -15,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -156,11 +157,11 @@ func TestAClusterHasLoadedTheProfilesEveryServersRevisionLists(t *testing.T) {
 			b.sts.Status.UpdateRevision = "bus-b"
 			b.pod(0, "bus-gone")
 		}, ""},
-		{"a pod the StatefulSet doesn't control is not a server", func(t *testing.T, b *holdBus) {
+		{"a bus pod the StatefulSet doesn't control loads nothing", func(t *testing.T, b *holdBus) {
 			b.revision(t, "bus-b", "x,y", true)
 			b.sts.Status.UpdateRevision = "bus-b"
 			b.pod(0, "bus-other", func(p *corev1.Pod) { p.OwnerReferences = nil })
-		}, "x,y"},
+		}, ""},
 		{"no revision yet loads nothing", func(t *testing.T, b *holdBus) {}, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -182,6 +183,12 @@ func TestWithNoBusEveryProfileCountsAsLoaded(t *testing.T) {
 		c := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent).Build()
 		if l := loadedOrFatal(t, c, agent); !l.has("anything") {
 			t.Errorf("%d servers, no StatefulSet: loaded = %s, want every profile", replicas, loadedList(l))
+		}
+		// A StatefulSet deleted without its pods: they still serve.
+		orphan := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent) + "-1", Namespace: agent.Namespace}}
+		c = fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, orphan).Build()
+		if l := loadedOrFatal(t, c, agent); l.has("anything") {
+			t.Errorf("%d servers, no StatefulSet but a bus pod left: loaded = %s, want nothing", replicas, loadedList(l))
 		}
 	}
 }
@@ -445,5 +452,95 @@ func TestANewlyBoundProfilesCardWaitsForTheBus(t *testing.T) {
 	h.reconcile(agent.Namespace, "auditor")
 	if got := condition(h.profile(agent.Namespace, "auditor"), agentv1alpha1.AgentProfileConditionCardPublished); got.Reason != reasonAgentProfilePublished {
 		t.Errorf("CardPublished reason = %s after the bus read changed, want %s: a published card stays", got.Reason, reasonAgentProfilePublished)
+	}
+}
+
+// The whole pass: with a bus running whose servers haven't loaded a newly
+// bound profile, the dispatch config and the dispatcher's grant leave it out,
+// the bus config carries it, and the pass asks to look again at the recheck.
+func TestTheReconcileHoldsANewProfileOutOfTheDispatcherUntilTheBusHasIt(t *testing.T) {
+	withDispatcher(t)
+	withOperatorBusPrincipal(t)
+	agent := a2aTestAgent()
+	b := newHoldBus(agent)
+	b.revision(t, "bus-a", "", true)
+	b.sts.Status.UpdateRevision = "bus-a"
+	b.pod(0, "bus-a")
+	p := testAgentProfile(agent.Namespace, "auditor")
+	extra := append([]client.Object{b.sts, chartProfileNamespace(agent), &p}, b.objs...)
+	r, cl, req := a2aGateTestReconciler(t, agent, extra...)
+	ctx := context.Background()
+
+	var res ctrl.Result
+	for i := range 3 {
+		var err error
+		if res, err = r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d: %v", i+1, err)
+		}
+	}
+	if res.RequeueAfter <= 0 || res.RequeueAfter > a2aBusReloadRecheck {
+		t.Errorf("RequeueAfter = %v, want at most %v while a profile is held", res.RequeueAfter, a2aBusReloadRecheck)
+	}
+	cm := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aDispatchConfigName(agent)}, cm); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(cm.Data[a2aDispatchConfigKey], `"auditor"`) {
+		t.Errorf("the dispatch config lists the held profile: %s", cm.Data[a2aDispatchConfigKey])
+	}
+	shard := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aAuthMapShardName(agent, 0)}, shard); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(shard.Data[a2aAuthMapKey], `"a2a.tasks.auditor.*.supervisor"`) {
+		t.Error("the dispatcher's grant carries the held profile's supervisor subjects")
+	}
+	config := &corev1.Secret{}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aNATSConfigSecretName(agent)}, config); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(config.Data[a2aNATSConfKey]), "a2a.tasks.auditor.*.supervisor") {
+		t.Error("the bus config lacks the held profile's deny; nothing would ever load it")
+	}
+}
+
+// A reload a later config was folded into is not confirmed by one load-time
+// move: the move may be the earlier write landing, so the wait re-arms off
+// the new load time, and the profile it would admit stays held.
+func TestAFoldedReloadIsNotConfirmedByTheFirstMove(t *testing.T) {
+	r, agent, sts, _ := a2aReloadFixture(t, "v1", map[string]string{
+		a2aBusReloadRequestedAnnotation: time.Date(2026, 11, 9, 22, 0, 0, 0, time.UTC).Format(time.RFC3339Nano),
+		a2aBusReloadBaselineAnnotation:  "t0",
+	})
+	now := time.Date(2026, 11, 9, 22, 0, 30, 0, time.UTC)
+	r.busConfigLoadTime = func(context.Context, *agentv1alpha1.PlatformAgent) (string, error) { return "t0", nil }
+	config := a2aDesiredConfig(agent, "v2")
+	if _, err := r.planA2ABusReload(context.Background(), agent, config, sts.DeepCopy(), now); err != nil {
+		t.Fatal(err)
+	}
+	if config.Annotations[a2aBusReloadFoldedAnnotation] == "" {
+		t.Fatalf("a write into a pending reload is not marked folded: %v", config.Annotations)
+	}
+
+	// v2 is live with the fold recorded; the load time moves.
+	live := &corev1.Secret{}
+	if err := r.Get(context.Background(), types.NamespacedName{Name: config.Name, Namespace: config.Namespace}, live); err != nil {
+		t.Fatal(err)
+	}
+	live.Data[a2aNATSConfKey], live.Annotations = []byte("v2"), config.Annotations
+	if err := r.Update(context.Background(), live); err != nil {
+		t.Fatal(err)
+	}
+	r.busConfigLoadTime = func(context.Context, *agentv1alpha1.PlatformAgent) (string, error) { return "t1", nil }
+	config = a2aDesiredConfig(agent, "v2")
+	plan, err := r.planA2ABusReload(context.Background(), agent, config, sts.DeepCopy(), now.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.reloaded || plan.restartPod {
+		t.Fatalf("plan = %+v: the first move confirmed a folded reload", plan)
+	}
+	if config.Annotations[a2aBusReloadBaselineAnnotation] != "t1" || config.Annotations[a2aBusReloadFoldedAnnotation] != "" {
+		t.Errorf("the wait didn't re-arm off the new load time: %v", config.Annotations)
 	}
 }

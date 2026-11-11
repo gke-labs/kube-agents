@@ -155,6 +155,15 @@ func a2aBusLoadedProfiles(ctx context.Context, reader client.Reader, agent *agen
 	sts := &appsv1.StatefulSet{}
 	err := reader.Get(ctx, types.NamespacedName{Name: a2aNATSName(agent), Namespace: agent.Namespace}, sts)
 	if apierrors.IsNotFound(err) {
+		// A StatefulSet deleted without its pods leaves them serving
+		// their old config: no server only when no bus pod is left either.
+		left, err := a2aBusPodsLeft(ctx, reader, agent)
+		if err != nil && !apierrors.IsForbidden(err) {
+			return a2aLoadedProfiles{}, err
+		}
+		if left || err != nil {
+			return loadedNames(map[string]bool{}), nil
+		}
 		return a2aNoBusServer, nil
 	}
 	var loaded map[string]bool
@@ -195,8 +204,10 @@ func a2aClusterLoadedProfiles(ctx context.Context, reader client.Reader, sts *ap
 			}
 			return nil, err
 		}
+		// A bus pod this StatefulSet doesn't control (left by an earlier
+		// one, or orphaned) runs a config nothing here records.
 		if owner := metav1.GetControllerOf(pod); owner == nil || owner.UID != sts.UID {
-			continue
+			return map[string]bool{}, nil
 		}
 		revision := pod.Labels[appsv1.ControllerRevisionHashLabelKey]
 		if revision == "" {
@@ -324,9 +335,24 @@ func a2aSingleBusSettled(ctx context.Context, reader client.Reader, agent *agent
 		return false, err
 	}
 	if owner := metav1.GetControllerOf(pod); owner == nil || owner.UID != sts.UID {
-		return true, nil
+		return false, nil
 	}
 	return pod.DeletionTimestamp == nil, nil
+}
+
+// a2aBusPodsLeft reports whether any bus pod name is taken, by whatever
+// pod, with no StatefulSet to account for it.
+func a2aBusPodsLeft(ctx context.Context, reader client.Reader, agent *agentv1alpha1.PlatformAgent) (bool, error) {
+	for i := range a2aNATSMaxReplicas {
+		err := reader.Get(ctx, types.NamespacedName{Name: a2aNATSName(agent) + "-" + strconv.Itoa(i), Namespace: agent.Namespace}, &corev1.Pod{})
+		if err == nil {
+			return true, nil
+		}
+		if !apierrors.IsNotFound(err) {
+			return false, err
+		}
+	}
+	return false, nil
 }
 
 // stampA2ABusPreviousProfiles records on config, a single server's config

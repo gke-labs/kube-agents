@@ -53,6 +53,12 @@ const (
 	// recorded one is the reload landing.
 	a2aBusReloadRequestedAnnotation = "kubeagents.x-k8s.io/a2a-reload-requested-at"
 	a2aBusReloadBaselineAnnotation  = "kubeagents.x-k8s.io/a2a-reload-baseline"
+	// a2aBusReloadFoldedAnnotation marks a pending reload that a later
+	// config was folded into before it was confirmed. One load-time move
+	// can't say which of the two writes it applied, so the move re-arms the
+	// wait for the newest write rather than confirm it
+	// (platformagent_a2a_profile_hold.go relies on that).
+	a2aBusReloadFoldedAnnotation = "kubeagents.x-k8s.io/a2a-reload-folded"
 
 	// How long a reload may take before the operator restarts the bus pod
 	// instead. The kubelet writes an updated Secret into a running pod
@@ -178,6 +184,9 @@ func (r *PlatformAgentReconciler) planA2ABusReload(ctx context.Context, agent *a
 			baseline = ""
 		}
 		stampA2ABusReload(config, now.UTC().Format(time.RFC3339Nano), baseline)
+		if _, pending := live.Annotations[a2aBusReloadRequestedAnnotation]; pending {
+			config.Annotations[a2aBusReloadFoldedAnnotation] = "true"
+		}
 		return a2aBusReload{requeue: a2aBusReloadRecheck, busUID: busUID}, nil
 	}
 	requestedAt, pending := live.Annotations[a2aBusReloadRequestedAnnotation]
@@ -187,10 +196,18 @@ func (r *PlatformAgentReconciler) planA2ABusReload(ctx context.Context, agent *a
 	baseline := live.Annotations[a2aBusReloadBaselineAnnotation]
 	loaded, err := r.a2aBusConfigLoadTime(ctx, agent)
 	// A moved load time is taken as this config landing. When a second
-	// change was folded into a pending one before the first reached the
-	// pod, the first reload landing can clear both; the reloader still
-	// applies the second when the kubelet writes it.
+	// change was folded into a pending one before it was confirmed, the
+	// move may be the first write landing, so it re-arms the wait off the
+	// new load time instead; the reloader applies the second write when the
+	// kubelet makes it, and if that write had already been applied, the
+	// bound restarts the pod onto it.
 	if err == nil && baseline != "" && loaded != baseline {
+		if _, folded := live.Annotations[a2aBusReloadFoldedAnnotation]; folded {
+			// The move may be the earlier write landing: wait for one off
+			// this load time, or restart past the bound, for the newest.
+			stampA2ABusReload(config, now.UTC().Format(time.RFC3339Nano), loaded)
+			return a2aBusReload{requeue: a2aBusReloadRecheck, busUID: busUID}, nil
+		}
 		return a2aBusReload{reloaded: true, busUID: busUID}, nil
 	}
 	since, perr := time.Parse(time.RFC3339Nano, requestedAt)
@@ -198,6 +215,9 @@ func (r *PlatformAgentReconciler) planA2ABusReload(ctx context.Context, agent *a
 		return a2aBusReload{restartPod: true, busUID: busUID}, nil
 	}
 	stampA2ABusReload(config, requestedAt, baseline)
+	if _, folded := live.Annotations[a2aBusReloadFoldedAnnotation]; folded {
+		config.Annotations[a2aBusReloadFoldedAnnotation] = "true"
+	}
 	return a2aBusReload{requeue: min(a2aBusReloadRecheck, a2aBusReloadBound-now.Sub(since)), busUID: busUID}, nil
 }
 
