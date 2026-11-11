@@ -805,10 +805,12 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		if !isConsoleConversation(rec.Key) {
 			if ref.TerminalObserved && result == completedNonTextResult {
 				// The heal already posted the status card; skip completedNonTextResult.
-			} else if line := g.answerLineFor(rec, taskID); line != "" && g.answerOnLine(rec.Key, line, answer) {
-				// The task's live message is the answer now, and takes
-				// no terminal edit below (LineAnswerer).
-				lineAnswered = true
+			} else if line := g.answerLineFor(rec, taskID); line != "" && result != completedNonTextResult {
+				// The task's live message becomes the answer, and takes
+				// no terminal edit below (LineAnswerer); an edit that does
+				// not land posts the answer instead. The stand-in for a
+				// non-text result is a notice, not an answer, and posts.
+				lineAnswered = g.answerOnLine(rec.Key, line, answer)
 			} else {
 				g.postMessage(rec.Key, answer)
 			}
@@ -1204,7 +1206,8 @@ func terminalLine(state lib.TaskState, progress string) string {
 	line := fmt.Sprintf("%s **%s**", icon, state)
 	// No tail on completed: the result is posted as its own message right
 	// before this edit on every backend that posts one at all (the console
-	// does not - it reads answers off TASKS), and the worker adapter's
+	// does not - it reads answers off TASKS; on one that answers on the
+	// line the result became the line and this edit is not made), and the worker adapter's
 	// progress deviation (no
 	// explicit progress tool — assistant text becomes `progress`, the final
 	// text becomes `result`) makes the last narration routinely BE the

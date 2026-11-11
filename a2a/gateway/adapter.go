@@ -224,7 +224,8 @@ type VerifiedObserver interface {
 
 // StatusShower is the optional extension an Adapter implements when its
 // backend shows a task's status itself, so the relay's rolling line ("⏳
-// submitted…" edited on to "✅ completed") would only repeat it. The Slack
+// submitted…" edited on to "✅ completed", or into the answer on a
+// LineAnswerer) would only repeat it. The Slack
 // adapter does, with Agent Sessions' Working… status, the ask's reaction and
 // the plan rows, as the today path shows no receipt either. With it true the
 // gateway posts no placeholder for a task, so the relay has no line to edit

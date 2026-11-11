@@ -133,40 +133,36 @@ func TestAnAnswerOnLineBackendGetsTheHandOffLineOnTheLine(t *testing.T) {
 	}
 }
 
-// An answer longer than one message puts its first chunk on the line and
-// posts the rest, the rating controls on the last, as postMessage posts it.
-func TestAnAnswerOnLineBackendPostsTheRestOfALongAnswer(t *testing.T) {
+// A long text answer goes on the line whole: the line is one message, and
+// the backend's own cap, not the chunk size, bounds it.
+func TestAnAnswerOnLineBackendPutsALongAnswerOnTheLineWhole(t *testing.T) {
 	r := startLineAnsweringRig(t)
 	origin := startChatTask(t, r, "discord:g1/answer-on-line-long", false)
 	line := lineID(t, r)
 	long := strings.Repeat("the fleet is fine, cluster by cluster.\n", 120)
-	chunks := chatChunks(long, discordChunk)
-	if len(chunks) < 3 {
-		t.Fatalf("chunks = %d, want an answer of several", len(chunks))
+	if len(chatChunks(long, discordChunk)) < 3 {
+		t.Fatalf("want an answer of several chunks")
 	}
 	completeTask(t, r.execFor(t, origin, "platform"), long)
-	waitFor(t, "the last chunk posted", func() bool { return hasPost(r.adapter, chunks[len(chunks)-1]) })
-	if edits := editsOf(r, line); len(edits) == 0 || edits[len(edits)-1] != chunks[0] {
-		t.Fatalf("line edits = %q, want the first chunk last", edits)
-	}
-	for _, c := range chunks[1:] {
-		if !hasPost(r.adapter, c) {
-			t.Fatalf("posts = %q, want every chunk after the first", r.adapter.postTexts())
+	waitFor(t, "the whole answer on the line", func() bool {
+		edits := editsOf(r, line)
+		return len(edits) > 0 && edits[len(edits)-1] == long
+	})
+	for _, p := range r.adapter.postTexts() {
+		if strings.Contains(p, "cluster by cluster") {
+			t.Fatalf("posts = %d, want no part of the answer posted", len(r.adapter.postTexts()))
 		}
-	}
-	if hasPost(r.adapter, chunks[0]) {
-		t.Fatalf("posts = %q, want the first chunk on the line only", r.adapter.postTexts())
 	}
 	r.adapter.mu.Lock()
 	marked := append([]string(nil), r.adapter.markedTexts...)
 	r.adapter.mu.Unlock()
-	if len(marked) != 1 || marked[0] != chunks[len(chunks)-1] {
-		t.Fatalf("marked texts = %q, want the last chunk alone", marked)
+	if len(marked) != 1 || marked[0] != long {
+		t.Fatalf("marked texts = %d, want the one edit", len(marked))
 	}
 }
 
 // An edit that does not land leaves the answer to be posted as on any
-// backend, and the line takes the terminal edit.
+// backend, with its rating controls, and the line takes the terminal edit.
 func TestAnAnswerOnLineBackendPostsTheAnswerWhenTheEditFails(t *testing.T) {
 	r := startLineAnsweringRig(t)
 	origin := startChatTask(t, r, "discord:g1/answer-on-line-fails", false)
@@ -178,6 +174,35 @@ func TestAnAnswerOnLineBackendPostsTheAnswerWhenTheEditFails(t *testing.T) {
 	r.adapter.mu.Lock()
 	r.adapter.failEdits = 1
 	r.adapter.mu.Unlock()
+	completeTask(t, r.execFor(t, origin, "platform"), "the fleet is fine")
+	waitFor(t, "the answer posted", postedContaining(r, "the fleet is fine"))
+	waitFor(t, "the terminal edit", func() bool {
+		edits := editsOf(r, line)
+		return len(edits) > 0 && strings.Contains(edits[len(edits)-1], "completed")
+	})
+	r.adapter.mu.Lock()
+	marked := append([]string(nil), r.adapter.markedTexts...)
+	r.adapter.mu.Unlock()
+	if len(marked) != 2 || marked[1] != "the fleet is fine" {
+		t.Fatalf("marked texts = %q, want the failed edit's mark and then the post's", marked)
+	}
+}
+
+// A task its requester asked to stop, which completed anyway, keeps the
+// post and the terminal edit: its line said "cancel sent", and a stale
+// press rewrites such a line as canceled.
+func TestAnAnswerOnLineBackendPostsTheAnswerOfAStoppedTask(t *testing.T) {
+	r := startLineAnsweringRig(t)
+	origin := startChatTask(t, r, "discord:g1/answer-on-line-stopped", false)
+	line := lineID(t, r)
+	rec := waitForRecord(t, r, "discord:g1/answer-on-line-stopped", "the task on record", func(rec *SessionRecord) bool {
+		_, ok := rec.TaskRefFor(origin.TaskID)
+		return ok
+	})
+	rec.MarkCanceled(origin.TaskID)
+	if err := r.g.reg.Put(context.Background(), rec); err != nil {
+		t.Fatal(err)
+	}
 	completeTask(t, r.execFor(t, origin, "platform"), "the fleet is fine")
 	waitFor(t, "the answer posted", postedContaining(r, "the fleet is fine"))
 	waitFor(t, "the terminal edit", func() bool {

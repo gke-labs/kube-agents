@@ -106,15 +106,7 @@ func (g *Gateway) postMessage(conversation string, m OutMessage) {
 		g.post(conversation, m.Text)
 		return
 	}
-	g.postChunks(conversation, chatChunks(m.Text, discordChunk), m.Feedback)
-}
-
-// postChunks posts chunks in order, the last with the answer's rating
-// controls when feedback marks one.
-func (g *Gateway) postChunks(conversation string, chunks []string, feedback string) {
-	if len(chunks) == 0 {
-		return
-	}
+	chunks := chatChunks(m.Text, discordChunk)
 	last := len(chunks) - 1
 	for _, chunk := range chunks[:last] {
 		if _, err := g.adapter.Post(conversation, chunk); err != nil {
@@ -122,13 +114,9 @@ func (g *Gateway) postChunks(conversation string, chunks []string, feedback stri
 			return
 		}
 	}
-	if feedback == "" {
-		g.post(conversation, chunks[last])
-		return
-	}
 	// A backend that draws no rating controls posts the text as Post would
 	// (postTextOnly); one whose API refuses them leaves the chunk to Post.
-	if _, err := g.adapter.PostMessage(conversation, OutMessage{Text: chunks[last], Feedback: feedback}); err != nil {
+	if _, err := g.adapter.PostMessage(conversation, OutMessage{Text: chunks[last], Feedback: m.Feedback}); err != nil {
 		g.log.Warn("posting an answer's last chunk with its rating controls failed; posting it as text",
 			"conversation", conversation, "err", err)
 		g.post(conversation, chunks[last])
@@ -138,49 +126,52 @@ func (g *Gateway) postChunks(conversation string, chunks []string, feedback stri
 // answerLineFor is the live message a completed task's answer replaces on a
 // backend that answers on the line (LineAnswerer): the task's own line, or
 // the line of a delegating turn whose child took the active task; "" when
-// the backend posts its answers, or the task has no line (its placeholder
-// post failed, or the backend shows the status itself).
+// the backend posts its answers, the task has no line (its placeholder post
+// failed, or the backend shows the status itself), or its requester asked
+// to stop it (TaskRef.Canceled): that line says "cancel sent", a later
+// stale press rewrites it as canceled (chatStopStale), and an answer there
+// could be written over, so the answer posts.
 func (g *Gateway) answerLineFor(rec *SessionRecord, taskID string) string {
 	answerer, ok := g.adapter.(LineAnswerer)
 	if !ok || !answerer.AnswersOnLine(rec.Key) {
 		return ""
 	}
+	ref, known := rec.TaskRefFor(taskID)
+	if known && ref.Canceled {
+		return ""
+	}
 	if active := rec.ActiveTask; active != nil && active.TaskID == taskID {
 		return active.StatusMsgID
 	}
-	if parent, ok := rec.TaskRefFor(taskID); ok {
-		return parent.StatusMsgID
+	if known {
+		return ref.StatusMsgID
 	}
 	return ""
 }
 
-// answerOnLine edits messageID, the task's live message, into the answer m,
-// as postMessage would post it: laid out when m carries a chat message the
-// backend lays out, else as text, the first chunk on the line and the rest
-// posted, the rating controls on the one message or on the last chunk. The
+// answerOnLine edits messageID, the task's live message, into the answer m:
+// laid out when m carries a chat message the backend lays out, with the
+// rating controls m marks; as text otherwise, whole, with the controls. The
 // edit carries no Stop, so the control comes off as at the terminal edit.
-// It reports whether the line carries the answer; false means nothing was
-// edited, and the caller posts the answer whole and makes the terminal edit.
+// It reports whether the line carries the answer. An edit that does not
+// land (a refused layout retries as text first, as a refused post does)
+// posts the answer as postMessage would, without a layout the edit already
+// had refused, and reports false, so the caller makes the terminal edit.
 func (g *Gateway) answerOnLine(conversation, messageID string, m OutMessage) bool {
-	if strings.TrimSpace(m.Text) == "" {
-		return false
-	}
-	if m.Chat != nil {
+	if m.Chat != nil && strings.TrimSpace(m.Text) != "" {
 		err := g.adapter.EditMessage(conversation, messageID, OutMessage{Text: m.Text, Chat: m.Chat, Feedback: m.Feedback})
 		if g.chatOutcome(conversation, err) {
 			return true
 		}
+		if errors.Is(err, ErrLayoutRefused) {
+			m.Chat = nil
+		}
 	}
-	chunks := chatChunks(m.Text, discordChunk)
-	first := OutMessage{Text: chunks[0]}
-	if len(chunks) == 1 {
-		first.Feedback = m.Feedback
-	}
-	if err := g.adapter.EditMessage(conversation, messageID, first); err != nil {
+	if err := g.adapter.EditMessage(conversation, messageID, OutMessage{Text: m.Text, Feedback: m.Feedback}); err != nil {
 		g.log.Warn("editing the answer onto the task's line failed; posting it", "conversation", conversation, "err", err)
+		g.postMessage(conversation, m)
 		return false
 	}
-	g.postChunks(conversation, chunks[1:], m.Feedback)
 	return true
 }
 
