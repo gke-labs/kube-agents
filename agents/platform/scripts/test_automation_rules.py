@@ -115,6 +115,8 @@ class TestParse(unittest.TestCase):
         self.assertEqual(len(rules.warnings), 1)
         self.assertIn("no-pbd", rules.warnings[0])
         self.assertFalse(ar.decide(rules, "no-pdb", "dev").allowed)
+        # Asked about the unknown type itself, the rule still does not match.
+        self.assertFalse(ar.decide(rules, "no-pbd", "dev").allowed)
 
 
 class TestDecide(unittest.TestCase):
