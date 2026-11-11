@@ -151,11 +151,27 @@ func run() int {
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	slog.SetDefault(log)
 
-	// `worker-adapter mcp` is not a task run: it is the stdio MCP server the
-	// harness launches as a subprocess of itself, forwarding the session's
-	// one delegate tool call to this adapter process over a unix socket
-	// (worker-adapter/mcp.go). It has none of the task env below, so it is
-	// dispatched before configFromEnv rather than folded into it.
+	// The two subcommands are not task runs: each is a stdio MCP server the
+	// harness launches as a subprocess of itself, with none of the task env
+	// below, so they are dispatched before configFromEnv rather than folded
+	// into it.
+	//
+	// `worker-adapter mcp-relay <url>` is what a profile persona's broker
+	// servers are rendered as (worker-adapter/mcprelay.go): it carries
+	// messages to the broker's relay with the pod's credentials.
+	if len(os.Args) > 1 && os.Args[1] == workeradapter.MCPRelayCommand {
+		if len(os.Args) != 3 {
+			fmt.Fprintln(os.Stderr, "usage: worker-adapter mcp-relay <broker relay URL>")
+			return 2
+		}
+		if err := workeradapter.ServeMCPRelay(context.Background(), os.Args[2], os.Stdin, os.Stdout, log); err != nil && !errors.Is(err, io.EOF) {
+			fmt.Fprintln(os.Stderr, "mcp-relay:", err)
+			return 1
+		}
+		return 0
+	}
+	// `worker-adapter mcp` forwards the session's one delegate tool call to
+	// this adapter process over a unix socket (worker-adapter/mcp.go).
 	if len(os.Args) > 1 && os.Args[1] == "mcp" {
 		if err := serveMCP(context.Background(), os.Stdin, os.Stdout, log); err != nil && !errors.Is(err, io.EOF) {
 			fmt.Fprintln(os.Stderr, "mcp:", err)
@@ -205,7 +221,9 @@ func run() int {
 			ConfigRoot: envOrDefault(lib.EnvProfileConfigRoot, lib.ProfileConfigRoot),
 			// The broker's task-token file (#3889's proxy confinement).
 			TaskTokenFile: os.Getenv("CREDENTIAL_PROXY_TASK_TOKEN_FILE"),
-			ResetPaths:    resetPaths(os.Getenv(lib.EnvProfileResetPaths)),
+			// The persona's MCP servers through the broker's relay (#5495).
+			Relay:      workeradapter.ProfileRelay(selfPath(), os.Getenv),
+			ResetPaths: resetPaths(os.Getenv(lib.EnvProfileResetPaths)),
 		}
 		if err := workeradapter.RunProfileWorker(ctx, cfg, pw); err != nil {
 			log.Error("profile worker failed", "err", err)
@@ -448,10 +466,7 @@ func harnessCommand() []string {
 		// and speaks MCP to it over stdio; strictMCPConfigFlag above keeps a
 		// stray project or user MCP config from adding tools the gateway
 		// never vetted.
-		self, err := os.Executable()
-		if err != nil || self == "" {
-			self = "/usr/local/bin/worker-adapter"
-		}
+		self := selfPath()
 		sock := workeradapter.DelegateSocketPath()
 		mcpCfg, _ := json.Marshal(map[string]any{workeradapter.MCPServersKey: map[string]any{
 			workeradapter.DelegateMCPServer: map[string]any{
@@ -695,4 +710,15 @@ func envOrDefault(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// selfPath is this binary's path, for the harness to launch it again as an
+// MCP server (`mcp`, `mcp-relay`): the image's install path when the running
+// executable can't be found.
+func selfPath() string {
+	self, err := os.Executable()
+	if err != nil || self == "" {
+		return "/usr/local/bin/worker-adapter"
+	}
+	return self
 }
