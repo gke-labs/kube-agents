@@ -11,6 +11,8 @@ A `Tier` names what a task may do. An `AgentProfile` lists the tiers it allows i
 
 The built-in `read` and `unattended` tiers, and the legacy ones, are compiled in: a `Tier` with one of their names changes nothing, and a missing or unreadable file leaves the built-in set. A profile can list a tier in `allowedTiers` (see [AgentProfile](/kube-agents/operator/agentprofile-crd/)), and it renders worker pools for an `interactive` tier and Jobs for an `unattended` one. Every person still runs at `read`, so a task reaches a new tier only once people are mapped to tiers. (The full name is `tiers.kubeagents.x-k8s.io`, since Calico has a `tiers` resource of its own.) Later changes map people to tiers and enforce `writeMode`.
 
+**Deleting a `Tier` is not a revoke.** A profile that served it drains it: nothing new starts there, but tasks already running at it finish, and the tier stays in the tiers file at its mode until the drain ends, so they're still judged at it. To stop running work now, use the stop. See [AgentProfile](/kube-agents/operator/agentprofile-crd/).
+
 **A tier's `mode` can't change.** A grant already minted at the tier would gain or lose verbs with it, so the API server refuses the edit: a tier that needs the other mode is a new tier. Deleting a tier and recreating it under the same name with the other mode still re-scopes live grants, until they expire (`GrantTTL`, an hour). A `Tier` the components would skip, such as one named after a legacy tier or a built-in tier under another mode, reports `Accepted=False` with the reason.
 
 A `Tier` lives in the install's namespace:

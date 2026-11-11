@@ -90,6 +90,9 @@ func (d *Dispatcher) noRunner(prof lib.DispatchProfile, tier string) bool {
 func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.DispatchConfig, prof lib.DispatchProfile, hk holdKey, now time.Time) (cluster *taskcred.Target, _ *refusal, _ error) {
 	env := del.Envelope()
 	tier := hk.tier
+	if prof.DrainsTier(tier) {
+		return nil, &refusal{ReasonTierWithdrawn, fmt.Sprintf("profile %s no longer runs tier %s; it is draining, so tasks already running at it finish and nothing new starts", prof.Name, tier)}, nil
+	}
 	if !allowsTier(prof, tier) {
 		return nil, &refusal{ReasonTierNotAllowed, fmt.Sprintf("profile %s does not allow tier %s", prof.Name, tier)}, nil
 	}

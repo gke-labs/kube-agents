@@ -429,7 +429,8 @@ leave open:
   the gateway's relay and the MCP server's task reader read `.supervisor` beside `.events`,
   under an agreement policy that names the dispatcher (`lib.DispatcherSession`) as a
   supervisor beside the gateway. The codes are
-  `tier-not-allowed`, `no-worker` (an unattended task with no runner, under Job mode below),
+  `tier-not-allowed`, `tier-withdrawn` (queued at a tier its profile now drains, #3659),
+  `no-worker` (an unattended task with no runner, under Job mode below),
   `verifier-refused`, `parameters-invalid` and `queue-timeout` at admission, and `lease-expired`
   and `deadline-exceeded` while it holds. A terminal is retried until it lands, except for a
   profile that has left the install config: its `.supervisor` grant goes at the next reconnect,

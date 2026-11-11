@@ -541,6 +541,16 @@ type a2aDispatchProfile struct {
 	// DrainingUntil is lib.DispatchProfile's (#5074): set on a profile that
 	// has left the install, which is listed with no durables until then.
 	DrainingUntil time.Time `json:"drainingUntil,omitzero"`
+	// DrainingTiers is lib.DispatchProfile's (#3659, 2b-ii): tiers that left
+	// a live profile and still drain (agentprofile_tier_drain.go).
+	DrainingTiers []a2aDrainingTier `json:"drainingTiers,omitempty"`
+}
+
+// a2aDrainingTier is lib.DrainingTier.
+type a2aDrainingTier struct {
+	Tier  string    `json:"tier"`
+	Mode  string    `json:"mode"`
+	Until time.Time `json:"until"`
 }
 
 type a2aDispatchDurable struct {
@@ -632,7 +642,7 @@ func desiredDispatchConfigWith(agent *agentv1alpha1.PlatformAgent, profiles []ag
 		}
 		dp := a2aDispatchProfile{
 			Name:                  p.Name,
-			Tiers:                 p.AllowedTierList(),
+			Tiers:                 liveTiersOf(p),
 			UnattendedTier:        unattendedTier,
 			Concurrency:           int(p.Spec.Concurrency),
 			QueueTimeoutSeconds:   int(p.QueueTimeout()),
@@ -643,7 +653,15 @@ func desiredDispatchConfigWith(agent *agentv1alpha1.PlatformAgent, profiles []ag
 		for _, param := range p.Spec.Parameters {
 			dp.Parameters = append(dp.Parameters, a2aCardParameter{Name: param.Name, Required: param.Required})
 		}
-		for _, tier := range dp.Tiers {
+		drains := drainingTiersOf(p)
+		for _, tier := range p.AllowedTierList() {
+			if until, ok := drains[tier]; ok {
+				dp.DrainingTiers = append(dp.DrainingTiers, a2aDrainingTier{Tier: tier, Mode: tierModeOf(p, tier), Until: until})
+			}
+		}
+		// The draining tiers' durables too, so what is queued at them is
+		// read and refused tier-withdrawn rather than left with no terminal.
+		for _, tier := range p.AllowedTierList() {
 			for _, kind := range a2aSubmitKinds {
 				dp.Durables = append(dp.Durables, a2aDispatchDurable{Tier: tier, Kind: kind, Name: profileDurableName(p.Name, tier, kind)})
 			}

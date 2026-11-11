@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 )
@@ -413,6 +414,32 @@ type DispatchProfile struct {
 	// it, but it stays listed, and keeps its .supervisor grant, until then,
 	// so the terminals of the tasks it still holds reach their requesters.
 	DrainingUntil time.Time `json:"drainingUntil,omitzero"`
+	// DrainingTiers are tiers that left a live profile and still drain
+	// (#3659, 2b-ii): dropped from allowedTiers, or their Tier deleted. Their
+	// durables stay listed, so what is queued at them is read and refused
+	// tier-withdrawn rather than left with no terminal, and nothing new
+	// starts at them; a task already held at one runs to its end. Not in
+	// Tiers.
+	DrainingTiers []DrainingTier `json:"drainingTiers,omitempty"`
+}
+
+// DrainingTier is one tier a live profile drains, until Until.
+type DrainingTier struct {
+	Tier string `json:"tier"`
+	// Mode is the tier's mode when it left, interactive or unattended: what
+	// the operator keeps rendering for it while it drains.
+	Mode  string    `json:"mode"`
+	Until time.Time `json:"until"`
+}
+
+// DrainsTier reports whether tier is one p drains (DrainingTiers).
+func (p DispatchProfile) DrainsTier(tier string) bool {
+	for _, d := range p.DrainingTiers {
+		if d.Tier == tier {
+			return true
+		}
+	}
+	return false
 }
 
 // Draining reports whether the profile is draining (DrainingUntil).
@@ -483,6 +510,13 @@ func (c DispatchConfig) Validate() error {
 		}
 		if p.Draining() != (len(p.Durables) == 0) {
 			return fmt.Errorf("dispatch config: profile %s has %d durables; a live profile needs one, a draining one has none", p.Name, len(p.Durables))
+		}
+		drains := map[string]bool{}
+		for _, d := range p.DrainingTiers {
+			if !ValidSubjectToken(d.Tier) || drains[d.Tier] || slices.Contains(p.Tiers, d.Tier) || d.Until.IsZero() {
+				return fmt.Errorf("dispatch config: profile %s drains tier %q, which is not a subject token, is listed twice or live, or has no end", p.Name, d.Tier)
+			}
+			drains[d.Tier] = true
 		}
 		for _, d := range p.Durables {
 			if d.Name != ProfileDurableName(p.Name, d.Tier, d.Kind) {

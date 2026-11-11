@@ -6,7 +6,9 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -31,8 +33,10 @@ import (
 // narrowed to its renderable tiers, carrying their modes, so identities,
 // durables, pools, Job templates and the dispatch config follow without each
 // learning the rules. A profile with no renderable tier is left out, which is
-// how a removed profile is treated. A dropped tier is removed on the next pass,
-// as read and unattended always were; draining it instead is 2b-ii's.
+// how a removed profile is treated.
+//
+// A tier that leaves a profile still rendering others drains (2b-ii): see
+// agentprofile_tier_drain.go.
 
 // The tier modes, as the Tier CRD and the capability library spell them.
 const (
@@ -108,8 +112,11 @@ type tierVerdict struct {
 	// unknown are listed names with no usable tier; conflict are
 	// unattended-mode tiers refused beside the one the profile serves.
 	unknown, conflict []string
-	// modes is each renderable tier's mode.
+	// modes is each renderable or draining tier's mode.
 	modes map[string]string
+	// draining are tiers that left the profile and still drain, each until
+	// its end (decideDrains); never in renderable.
+	draining map[string]time.Time
 }
 
 // decideTiers decides p's tiers from cat, with rendered the tiers it was last
@@ -160,32 +167,45 @@ func decideTiers(p *agentv1alpha1.AgentProfile, cat tierCatalog, rendered []stri
 // ServiceAccounts, so "status empty" is never read as "nothing rendered".
 // Only ServiceAccounts carrying this profile's label and UID count, so a
 // forged one confers nothing.
-func renderedTiersOf(ctx context.Context, c client.Reader, p *agentv1alpha1.AgentProfile) ([]string, error) {
+func renderedTiersOf(p *agentv1alpha1.AgentProfile, owned map[string]string) []string {
 	if len(p.Status.RenderedTiers) > 0 {
-		return p.Status.RenderedTiers, nil
+		return p.Status.RenderedTiers
 	}
+	out := make([]string, 0, len(owned))
+	for tier := range owned {
+		out = append(out, tier)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// ownedTierServiceAccounts is the tiers p has its own operator-created
+// ServiceAccounts for, each with the mode its agentProfileTierModeLabel
+// records ("" on one created before the label). Only ServiceAccounts carrying
+// this profile's label and UID count, so a forged one confers nothing. A
+// profile on a named ServiceAccount has none.
+func ownedTierServiceAccounts(ctx context.Context, c client.Reader, p *agentv1alpha1.AgentProfile) (map[string]string, error) {
+	out := map[string]string{}
 	if p.Spec.Identity.ServiceAccountName != "" {
 		// A named ServiceAccount serves one tier: the one allowedTiers lists.
-		return nil, nil
+		return out, nil
 	}
 	var sas corev1.ServiceAccountList
 	if err := c.List(ctx, &sas, client.InNamespace(profileNamespaceOf(p)), client.MatchingLabels{agentProfileNameLabel: p.Name}); err != nil {
 		if isCRDNotInstalledError(err) {
-			return nil, nil
+			return out, nil
 		}
 		return nil, err
 	}
 	prefix := agentProfileServiceAccountPrefix + p.Name + "-"
-	var out []string
 	for i := range sas.Items {
 		sa := &sas.Items[i]
 		tier, ok := strings.CutPrefix(sa.Name, prefix)
 		if !ok || !agentProfileOwnsServiceAccount(sa, p) || !allowedTierNameRE.MatchString(tier) {
 			continue
 		}
-		out = append(out, tier)
+		out[tier] = sa.Labels[agentProfileTierModeLabel]
 	}
-	sort.Strings(out)
 	return out, nil
 }
 
@@ -200,20 +220,29 @@ const renderedTierModesAnnotation = "kubeagents.x-k8s.io/internal-rendered-tier-
 // renderableAgentProfiles narrows each profile to its renderable tiers and
 // leaves out a profile with none. It returns each profile's verdict, keyed
 // by name, for its conditions.
-func renderableAgentProfiles(ctx context.Context, c client.Reader, ns string, profiles []agentv1alpha1.AgentProfile, unreadable bool) ([]agentv1alpha1.AgentProfile, map[string]tierVerdict, error) {
-	cat, err := loadTierCatalog(ctx, c, ns, unreadable)
+func renderableAgentProfiles(ctx context.Context, c client.Reader, agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, unreadable bool) ([]agentv1alpha1.AgentProfile, map[string]tierVerdict, error) {
+	cat, err := loadTierCatalog(ctx, c, agent.Namespace, unreadable)
 	if err != nil {
 		return nil, nil, err
 	}
+	applied, err := appliedDispatchProfiles(ctx, c, agent)
+	if err != nil {
+		return nil, nil, err
+	}
+	now := time.Now()
 	verdicts := make(map[string]tierVerdict, len(profiles))
 	var out []agentv1alpha1.AgentProfile
 	for i := range profiles {
 		p := &profiles[i]
-		rendered, err := renderedTiersOf(ctx, c, p)
+		owned, err := ownedTierServiceAccounts(ctx, c, p)
 		if err != nil {
 			return nil, nil, err
 		}
-		v := decideTiers(p, cat, rendered)
+		prev, hasPrev := applied[p.Name]
+		v := decideTiers(p, cat, renderedTiersOf(p, withoutDraining(owned, prev)))
+		if hasPrev {
+			decideDrains(p, &v, &prev, owned, cat, now)
+		}
 		verdicts[p.Name] = v
 		if len(v.renderable) == 0 {
 			continue
@@ -225,17 +254,27 @@ func renderableAgentProfiles(ctx context.Context, c client.Reader, ns string, pr
 
 // narrowedCopy is p with allowedTiers narrowed to v's renderable tiers and
 // their modes carried for the renderers. p is not changed.
+//
+// Draining tiers follow the renderable ones in allowedTiers, so identities,
+// durables and pools keep them, and are named in drainingTiersAnnotation, so
+// the card, the dispatch config's live tiers and the Job template leave them
+// out (liveTiersOf).
 func narrowedCopy(p *agentv1alpha1.AgentProfile, v tierVerdict) *agentv1alpha1.AgentProfile {
 	cp := p.DeepCopy()
-	cp.Spec.AllowedTiers = append([]string(nil), v.renderable...)
+	drains := v.drainingTiers()
+	cp.Spec.AllowedTiers = append(append([]string(nil), v.renderable...), drains...)
 	if cp.Annotations == nil {
 		cp.Annotations = map[string]string{}
 	}
-	var pairs []string
-	for _, tier := range v.renderable {
+	var pairs, ends []string
+	for _, tier := range cp.Spec.AllowedTiers {
 		pairs = append(pairs, tier+"="+v.modes[tier])
 	}
+	for _, tier := range drains {
+		ends = append(ends, tier+"="+strconv.FormatInt(v.draining[tier].Unix(), 10))
+	}
 	cp.Annotations[renderedTierModesAnnotation] = strings.Join(pairs, ",")
+	cp.Annotations[drainingTiersAnnotation] = strings.Join(ends, ",")
 	return cp
 }
 
@@ -255,10 +294,12 @@ func tierModeOf(p *agentv1alpha1.AgentProfile, tier string) string {
 	return ""
 }
 
-// unattendedTierOf is the profile's unattended-mode tier, "" for none: at most
-// one, since decideTiers refuses a second.
+// unattendedTierOf is the profile's live unattended-mode tier, "" for none: at
+// most one, since decideTiers refuses a second. A draining one isn't: the Job
+// template is for new tasks, and its own running Jobs keep the ServiceAccount
+// they were made with.
 func unattendedTierOf(p *agentv1alpha1.AgentProfile) string {
-	for _, tier := range p.AllowedTierList() {
+	for _, tier := range liveTiersOf(p) {
 		if tierModeOf(p, tier) == tierModeUnattended {
 			return tier
 		}
@@ -310,6 +351,13 @@ func (v tierVerdict) message() string {
 			parts = append(parts, "a profile serves at most one unattended-mode tier, and none of these renders until all but one are removed: "+
 				strings.Join(v.conflict, ", "))
 		}
+	}
+	if drains := v.drainingTiers(); len(drains) > 0 {
+		var ends []string
+		for _, tier := range drains {
+			ends = append(ends, tier+" until "+v.draining[tier].UTC().Format(time.RFC3339))
+		}
+		parts = append(parts, "draining, so tasks running at them finish and nothing new starts: "+strings.Join(ends, ", "))
 	}
 	return strings.Join(parts, "; ")
 }

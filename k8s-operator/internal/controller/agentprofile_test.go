@@ -1072,7 +1072,7 @@ func TestEnsureServiceAccountSettlesACreateCollisionUncached(t *testing.T) {
 			},
 		})
 		r := &AgentProfileReconciler{Client: cached, APIReader: base, Scheme: scheme, Cards: newFakeDirectory()}
-		err := r.ensureServiceAccount(context.Background(), &p, profileNamespaceName(agent), agentProfileTierIdentity{tier: agentv1alpha1.AgentProfileTierRead, serviceAccount: landed.Name})
+		err := r.ensureServiceAccount(context.Background(), &p, profileNamespaceName(agent), agentProfileTierIdentity{tier: agentv1alpha1.AgentProfileTierRead, serviceAccount: landed.Name}, tierModeInteractive)
 		switch {
 		case !created:
 			t.Error("the Create path was never reached; the test is not exercising the race")

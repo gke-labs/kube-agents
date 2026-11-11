@@ -49,3 +49,14 @@ func TestATierDroppedFromItsProfileMayStillHaveAJob(t *testing.T) {
 		}
 	}
 }
+
+// A draining unattended-mode tier stays on the unattended side for the tasks
+// it still holds; a draining interactive one doesn't.
+func TestADrainingUnattendedTierStaysUnattended(t *testing.T) {
+	c := DefaultConfig()
+	prof := lib.DispatchProfile{Name: "tse", Tiers: []string{"read", "weekly"}, UnattendedTier: "weekly",
+		DrainingTiers: []lib.DrainingTier{{Tier: "nightly", Mode: "unattended"}, {Tier: "oncall", Mode: "interactive"}}}
+	if !c.unattendedFor(prof, "nightly") || c.unattendedFor(prof, "oncall") || !c.unattendedFor(prof, "weekly") {
+		t.Error("draining nightly must be unattended, draining oncall not, live weekly unattended")
+	}
+}

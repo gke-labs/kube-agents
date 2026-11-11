@@ -90,7 +90,8 @@ func TestRenderedTiersAreDerivedFromOwnServiceAccountsWhenStatusIsGone(t *testin
 		own("agentprofile-tse-unattended", "uid-tse"),
 		own("agentprofile-tse-nightly", "uid-someone-else"), // copied label, wrong UID
 	).Build()
-	got, err := renderedTiersOf(context.Background(), c, p)
+	owned, err := ownedTierServiceAccounts(context.Background(), c, p)
+	got := renderedTiersOf(p, owned)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +103,7 @@ func TestRenderedTiersAreDerivedFromOwnServiceAccountsWhenStatusIsGone(t *testin
 		t.Fatalf("after a restore the incumbent lost: %+v", v)
 	}
 	p.Status.RenderedTiers = []string{"read"}
-	if got, _ := renderedTiersOf(context.Background(), c, p); !slices.Equal(got, []string{"read"}) {
+	if got := renderedTiersOf(p, nil); !slices.Equal(got, []string{"read"}) {
 		t.Errorf("a present status was overridden by derivation: %v", got)
 	}
 }
@@ -117,7 +118,7 @@ func TestRenderableProfilesAreNarrowedAndCarryTheirModes(t *testing.T) {
 	a := testAgentProfile("test-ns", "a", func(p *agentv1alpha1.AgentProfile) { p.Spec.AllowedTiers = []string{"oncall", "nightly"} })
 	b := testAgentProfile("test-ns", "b", func(p *agentv1alpha1.AgentProfile) { p.Spec.AllowedTiers = []string{"ghost"} })
 	pl := testAgentProfile("test-ns", "pl", func(p *agentv1alpha1.AgentProfile) { p.Spec.AllowedTiers = []string{"platform"} })
-	got, verdicts, err := renderableAgentProfiles(context.Background(), c, "test-ns", []agentv1alpha1.AgentProfile{a, b, pl}, false)
+	got, verdicts, err := renderableAgentProfiles(context.Background(), c, &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "agent", Namespace: "test-ns"}}, []agentv1alpha1.AgentProfile{a, b, pl}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +135,7 @@ func TestRenderableProfilesAreNarrowedAndCarryTheirModes(t *testing.T) {
 		t.Error("the caller's profile was mutated; only the copy carries modes")
 	}
 	// A role that can't read Tiers: custom tiers fail closed.
-	got, _, _ = renderableAgentProfiles(context.Background(), c, "test-ns", []agentv1alpha1.AgentProfile{a}, true)
+	got, _, _ = renderableAgentProfiles(context.Background(), c, &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "agent", Namespace: "test-ns"}}, []agentv1alpha1.AgentProfile{a}, true)
 	if len(got) != 0 {
 		t.Errorf("with Tiers unreadable a custom-tier profile rendered: %v", got)
 	}

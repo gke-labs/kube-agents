@@ -74,6 +74,13 @@ const (
 	// the profile namespace is for.
 	agentProfileTierLabel = "kubeagents.x-k8s.io/agentprofile-tier"
 
+	// agentProfileTierModeLabel is the mode of the tier an operator-created
+	// ServiceAccount is for, as the operator rendered it. A tier whose Tier
+	// was deleted drains at this mode (agentprofile_tier_drain.go): the
+	// ServiceAccount is the profile's own (agentProfileOwnsServiceAccount),
+	// so the mode isn't read back from anything a user writes.
+	agentProfileTierModeLabel = "kubeagents.x-k8s.io/agentprofile-tier-mode"
+
 	// agentProfileUIDAnnotation marks an operator-created ServiceAccount in
 	// the profile namespace with its profile's UID, the ownership test that
 	// stands in for an owner reference across namespaces
@@ -187,7 +194,7 @@ func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 	// Each profile narrowed to the tiers it renders (agentprofile_tiers.go).
-	renderable, verdicts, err := renderableAgentProfiles(ctx, r.Client, profile.Namespace, all.Items, r.TiersUnreadable)
+	renderable, verdicts, err := renderableAgentProfiles(ctx, r.Client, agent, all.Items, r.TiersUnreadable)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -239,7 +246,7 @@ func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		keep := map[string]bool{}
 		for _, id := range resolution.identities {
 			keep[id.serviceAccount] = true
-			err := r.ensureServiceAccount(ctx, &profile, profilesNS, id)
+			err := r.ensureServiceAccount(ctx, &profile, profilesNS, id, verdict.modes[id.tier])
 			if errors.Is(err, errForeignServiceAccount) {
 				cardReason, cardMsg, busErr := r.withdrawCard(ctx, agent, &profile)
 				if err := r.writeStatus(ctx, &profile, agent, &verdict, "", reasonAgentProfileRefused, err.Error(), cardReason, cardMsg, false); err != nil {
@@ -251,7 +258,8 @@ func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request
 				return ctrl.Result{}, err
 			}
 		}
-		// A tier the profile no longer allows loses its ServiceAccount.
+		// A tier the profile no longer renders or drains loses its
+		// ServiceAccount: a dropped tier once its drain ends.
 		if err := r.deleteProfileServiceAccounts(ctx, &profile, profilesNS, keep); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -389,7 +397,8 @@ func (r *AgentProfileReconciler) publishCard(ctx context.Context, agent *agentv1
 		}
 	}
 	// The profile's durables, once the dispatcher that reads them exists:
-	// one per (allowed tier, kind), and a dropped tier's deleted.
+	// one per (rendered or draining tier, kind), and a dropped tier's
+	// deleted once its drain ends.
 	if a2aDispatcherEnabled() {
 		if err := r.cards().SyncDurables(ctx, agent, p.Name, desiredProfileDurables(p)); err != nil {
 			// Drop the connection: callout grants are fixed when it opens,
@@ -449,7 +458,7 @@ var errForeignServiceAccount = errors.New("a ServiceAccount under the operator-c
 // foreignness check and the write. Create refuses that case outright with
 // AlreadyExists, and an existing ServiceAccount is only ever updated when the
 // profile already controls it.
-func (r *AgentProfileReconciler) ensureServiceAccount(ctx context.Context, p *agentv1alpha1.AgentProfile, ns string, id agentProfileTierIdentity) error {
+func (r *AgentProfileReconciler) ensureServiceAccount(ctx context.Context, p *agentv1alpha1.AgentProfile, ns string, id agentProfileTierIdentity, mode string) error {
 	sa := &corev1.ServiceAccount{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ServiceAccount"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -464,6 +473,9 @@ func (r *AgentProfileReconciler) ensureServiceAccount(ctx context.Context, p *ag
 			Annotations: map[string]string{agentProfileUIDAnnotation: string(p.UID)},
 		},
 		AutomountServiceAccountToken: ptr.To(false),
+	}
+	if mode != "" {
+		sa.Labels[agentProfileTierModeLabel] = mode
 	}
 	var existing corev1.ServiceAccount
 	err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: id.serviceAccount}, &existing)
@@ -620,11 +632,12 @@ func (r *AgentProfileReconciler) writeStatus(ctx context.Context, p *agentv1alph
 	fitOn := p
 	if verdict != nil {
 		fitOn = narrowedCopy(p, *verdict)
-	} else if _, set := p.Annotations[renderedTierModesAnnotation]; set {
-		// The modes annotation is narrowedCopy's; one on the stored
-		// object is the user's and says nothing.
+	} else if len(p.Annotations) > 0 {
+		// The modes and draining annotations are narrowedCopy's; one on
+		// the stored object is the user's and says nothing.
 		fitOn = p.DeepCopy()
 		delete(fitOn.Annotations, renderedTierModesAnnotation)
+		delete(fitOn.Annotations, drainingTiersAnnotation)
 	}
 	if problem := autopilotRatioProblem(fitOn); problem != "" {
 		fitReason, fitMsg = reasonAgentProfileOutsideAutopilotRatio, problem

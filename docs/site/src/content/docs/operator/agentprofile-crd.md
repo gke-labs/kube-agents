@@ -96,7 +96,11 @@ The operator decides what each listed name renders, and reports it in the `Tiers
 
 - **A name with no tier** renders nothing (reason `TierUnknown`). The profile's other tiers render as usual, and a profile left with none renders nothing at all.
 - **At most one unattended-mode tier** per profile, because unattended tasks run as Jobs from one template per profile. If a profile lists a second one, the one it already serves keeps serving and the newcomer renders nothing (reason `TierModeConflict`). A new profile listing two renders neither until one is removed.
-- **A tier dropped from the list**, or one whose `Tier` is deleted, has its ServiceAccount, queues and pool removed on the next pass, as `read` and `unattended` always were. Tasks running on it are not drained first; a later change drains them.
+- **A tier dropped from the list drains.** That covers one whose `Tier` is deleted, and one that stops rendering. The card stops advertising it, and nothing new starts at it at once. A task already queued at it is refused with the reason `tier-withdrawn`. A task already running at it keeps its ServiceAccount, queues and pool, and finishes. The tier drains for the longest deadline a task can carry plus 15 minutes, then everything it rendered is removed within a few minutes. `TiersRendered` names each draining tier and when its drain ends.
+
+  Listing the tier again ends the drain once it renders again: not while its `Tier` is missing, and not while it conflicts with the profile's live unattended-mode tier. A running task that delegates to its own profile at the draining tier is refused like any new task; delegating to another profile still works. A profile left with no tier that renders drains as a removed profile does. A profile on a named ServiceAccount (`spec.identity`) serves one tier, so its tier is replaced at once rather than drained.
+
+  **This is not an emergency revoke.** Deleting a `Tier`, or dropping it from a profile, doesn't cut off work already running at it: that work carries on until the drain ends. To stop it now, use the stop (or the dispatcher's breaker).
 
 `status.renderedTiers` records what the last pass rendered. The operator uses it to tell the tier a profile already serves from a newcomer. If status is lost (a restore, a GitOps apply), it reads the profile's own ServiceAccounts once instead.
 

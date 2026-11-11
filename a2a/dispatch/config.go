@@ -195,5 +195,15 @@ func (c Config) unattended(tier string) bool { return slices.Contains(c.Unattend
 // the process's UnattendedTiers, or the profile's own unattended-mode tier
 // (#3659).
 func (c Config) unattendedFor(prof lib.DispatchProfile, tier string) bool {
-	return c.unattended(tier) || (prof.UnattendedTier != "" && prof.UnattendedTier == tier)
+	if c.unattended(tier) || (prof.UnattendedTier != "" && prof.UnattendedTier == tier) {
+		return true
+	}
+	// A draining unattended-mode tier (#3659, 2b-ii): its tasks still held,
+	// adopted after a restart above all, count on the unattended side.
+	for _, d := range prof.DrainingTiers {
+		if d.Tier == tier && d.Mode == "unattended" {
+			return true
+		}
+	}
+	return false
 }

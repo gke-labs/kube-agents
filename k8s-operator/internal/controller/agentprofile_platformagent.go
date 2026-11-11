@@ -71,7 +71,7 @@ func boundAgentProfiles(ctx context.Context, c client.Reader, agent *agentv1alph
 	}
 	// Each profile narrowed to the tiers it renders (agentprofile_tiers.go):
 	// an unknown or conflicting tier renders nothing downstream.
-	renderable, _, err := renderableAgentProfiles(ctx, c, agent.Namespace, bound, tiersUnreadable)
+	renderable, _, err := renderableAgentProfiles(ctx, c, agent, bound, tiersUnreadable)
 	if err != nil {
 		return nil, err
 	}
