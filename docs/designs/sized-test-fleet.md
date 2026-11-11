@@ -304,6 +304,39 @@ Model tokens come on top. At 40 clusters the real-install test measured $111 of 
 5 hours; M has 8 clusters and a 2-hour run, so its tokens should cost much less. The cost record
 gives the real figure for every run.
 
+## Rollout
+
+The sized fleet starts in one project of its own and reaches the shared eval projects in stages,
+and the presubmit last, because the eval pool's projects are shared with every pull request's
+presubmit.
+
+**Stage 1: one scale project.** The two periodics build the fleet in a single project that no other
+job uses, with its own kube-agents install as the host. A project of its own keeps the fleet's
+quota, IAM and network apart from people's work. Until such a project exists, a developer's project
+stands in. Runs by hand come first (`hack/sized_fleet.py run --down`), then the periodics.
+
+**Stage 2: the nightly eval projects.** The eval nightlies lease pool projects through Boskos, the
+same projects the presubmit leases. The lease is what keeps the two apart:
+
+1. A nightly sized lane leases a pool project, builds the sized fleet in it, runs, and deletes the
+   fleet before it releases the lease. A presubmit that leases the same project later finds no
+   trace of it.
+2. Each pool project is provisioned for it as for the seeded fleet:
+   `scripts/provision_ci_pool_project.sh` creates the nodes' service account and the state prefix,
+   and checks the CPU quota for M (250 vCPU of N1); `scripts/verify_ci_pool_project.py` checks
+   them, so a project without them fails verification before it is leased.
+3. `sized-fleet-runner` holds its roles on every pool project, as `seeded-fleet-reconciler` does.
+4. A case that needs the sized fleet names the fixture role `sized-fleet-m` and is registered in
+   the nightly lists only.
+
+This gives every contributor a shared test bed for scaling evals: a nightly lane's records, and
+a pool project that can build the fleet for a run by hand under a lease.
+
+**Stage 3: the presubmit, last,** once the nightly lane has a clean record (two weeks green). Even S
+adds about 20 minutes of build and the run's windows to a presubmit, so the first step is a few
+sized-fleet cases on the blocking roster, admitted by the roster's own rules
+([`eval-gate-roster.md`](../eval-gate-roster.md)), rather than a sized run on every pull request.
+
 ## What is built, in order
 
 Each item is its own pull request after this design merges.
