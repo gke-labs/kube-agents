@@ -382,7 +382,8 @@ rendered manifest; keep it true of every shape the values can render.
 # litellm.enabled, or when additionalEgress names the peers a bring-your-own
 # gateway install (litellm.enabled=false) reaches; with neither, the policy is
 # Ingress-only, so the custom gateway's egress is confined rather than
-# dropped. hindsight-postgresql's policy renders under its own switch.
+# dropped. hindsight-postgresql's policy renders under its own switch and the
+# hindsight.networkPolicy umbrella, not under this policy's.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

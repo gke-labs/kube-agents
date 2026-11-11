@@ -399,12 +399,16 @@ class HindsightNetworkPolicyTest(unittest.TestCase):
             "--set",
             f"{_ADDITIONAL_EGRESS}[1].to[0].cidr=fd00::/48",
         ]
+        # A bare address renders with its host prefix, as the operator
+        # canonicalises one on the CR: the NetworkPolicy API rejects an
+        # ipBlock whose cidr has no prefix.
+        rule_sets += ["--set", f"{_ADDITIONAL_EGRESS}[0].to[0].except[1]=10.200.2.9"]
         expected_tail = [
             {
                 "ports": [{"port": 8443, "protocol": "TCP"}],
                 "to": [
-                    {"ipBlock": {"cidr": "10.200.0.0/16", "except": ["10.200.1.0/24"]}},
-                    {"ipBlock": {"cidr": "192.168.5.7"}},
+                    {"ipBlock": {"cidr": "10.200.0.0/16", "except": ["10.200.1.0/24", "10.200.2.9/32"]}},
+                    {"ipBlock": {"cidr": "192.168.5.7/32"}},
                 ],
             },
             {"to": [{"ipBlock": {"cidr": "fd00::/48"}}]},
@@ -430,14 +434,15 @@ class HindsightNetworkPolicyTest(unittest.TestCase):
     @unittest.skipUnless(shutil.which("helm"), "helm is not on PATH")
     def test_the_schema_refuses_an_additional_egress_rule_the_crd_would(self):
         """Helm refuses the shapes the CRD refuses at admission, and the render
-        refuses the peers the operator drops after it.
+        refuses the peers litellm.openaiCompatible.egressCIDRs refuses.
 
         The schema half: Helm 3 prints the path dotted and Helm 4 as a JSON
         pointer; both carry the leaf, which is what is asserted. The render
         half is the helper's `fail`, which names the peer: an IPv4-mapped IPv6
         block (the whole internet to a dataplane that unmaps it), a peer in a
         link-local range or in fd20:ce::/48 (the metadata server), with or
-        without a prefix.
+        without a prefix. The nearest accepted neighbour of each refused range
+        still renders, so a widened refusal cannot ship green.
         """
         schema_refusals = {
             "a whole-internet peer": (
@@ -474,7 +479,9 @@ class HindsightNetworkPolicyTest(unittest.TestCase):
         refusals = {what: (sets, leaf, "schema") for what, (sets, leaf) in schema_refusals.items()}
         refusals.update(
             {
-                what: ([f"{_ADDITIONAL_EGRESS}[0].to[0].cidr={cidr}"], reason, f"peer \"{cidr}\"")
+                # The message names the peer as rendered: a bare address with
+                # its /32 or /128, so the closing quote is left off the match.
+                what: ([f"{_ADDITIONAL_EGRESS}[0].to[0].cidr={cidr}"], reason, f'peer "{cidr}')
                 for what, (cidr, reason) in render_refusals.items()
             }
         )
@@ -487,6 +494,19 @@ class HindsightNetworkPolicyTest(unittest.TestCase):
                 self.assertNotEqual(0, proc.returncode, f"{what} rendered: {proc.stdout[:200]}")
                 self.assertIn(origin, proc.stderr)
                 self.assertIn(leaf, proc.stderr)
+
+        accepted_neighbours = (
+            "169.253.0.0/16",
+            "169.0.0.0/12",
+            "fec0::/48",
+            "fd20:cd::/48",
+            "2001:db8::ffff:0:0/96",
+        )
+        for cidr in accepted_neighbours:
+            with self.subTest(accepted=cidr):
+                netpols = _hindsight_netpols(_render_chart("--set", f"{_ADDITIONAL_EGRESS}[0].to[0].cidr={cidr}"))
+                last_rule = netpols[_HINDSIGHT_API_POLICY]["spec"]["egress"][-1]
+                self.assertEqual({"to": [{"ipBlock": {"cidr": cidr}}]}, last_rule)
 
     @unittest.skipUnless(shutil.which("helm"), "helm is not on PATH")
     def test_the_install_notes_warn_when_postgres_renders_unguarded(self):
