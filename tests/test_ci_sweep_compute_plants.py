@@ -2,12 +2,15 @@
 
 Verifies that:
 1. Resource identification strictly matches the fixed description prefix
-   ("kube-agents-bench plant") with age gating rooted on the parent VPC network
+   ("kube-agents-bench plant"), or the managed-by=kube-agents-bench label where
+   the kind takes one, with age gating rooted on the parent plant object
    (and standalone/orphan resources).
-2. Deletion order is strictly dependency-ordered:
+2. Deletion order is strictly dependency-ordered: clusters, then consumer
+   forwarding rules -> service attachments -> producer forwarding rules ->
+   backend services -> health checks (ChainSweepTest), then
    Addresses -> Subnets -> Networks, then alert policies labelled
    managed-by=kube-agents-bench (#3797), gated on their own creation time.
-3. Regional vs global addresses are correctly scoped.
+3. Regional vs global addresses, rules, backend services and health checks are correctly scoped.
 4. Dry-run runs list commands and invokes no delete commands.
 5. Failures (list error, delete failure) are handled and reported without unhandled crashes.
 6. Boskos pool walk, stranded resets, and report generation follow repository standards.
@@ -1023,10 +1026,6 @@ REGION = "https://www.googleapis.com/compute/v1/projects/p/regions/us-central1"
 NETWORK_URL = "https://www.googleapis.com/compute/v1/projects/p/global/networks/"
 PLANT = "kube-agents-bench plant (networking-psc-routing-deadlock-baseline); safe to delete when no eval run holds the infra lock"
 LABELS = {"managed-by": "kube-agents-bench", "build-id": "7"}
-
-
-def _delete_argv(cmd):
-    return cmd if "delete" in cmd else None
 
 
 class ChainSweepTest(unittest.TestCase):

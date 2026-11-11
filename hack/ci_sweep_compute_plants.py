@@ -874,7 +874,7 @@ def main(argv=None) -> int:
         "--max-age-hours",
         type=parse_max_age_hours,
         default=DEFAULT_MAX_AGE_HOURS,
-        help=f"minimum age in hours of plant networks and alert policies to sweep (default: {DEFAULT_MAX_AGE_HOURS}, min: {MIN_MAX_AGE_HOURS})",
+        help=f"minimum age in hours of a plant object to sweep (default: {DEFAULT_MAX_AGE_HOURS}, min: {MIN_MAX_AGE_HOURS})",
     )
     parser.add_argument("--dry-run", action="store_true", help="report what would be deleted, delete nothing")
     parser.add_argument(
