@@ -1,12 +1,17 @@
 package controller
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -110,5 +115,50 @@ func TestTheThreeTierCheckersMountTheTiersFile(t *testing.T) {
 		if env != a2aTiersMountPath+"/"+a2aTiersKey {
 			t.Errorf("%s: %s = %q", name, a2aTiersFileEnvVar, env)
 		}
+	}
+}
+
+// listFailsOnTiers fails every Tier list, as a role without the verb (or an
+// informer that would never sync) does.
+type listFailsOnTiers struct {
+	client.Client
+	lists int
+}
+
+func (c *listFailsOnTiers) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	if _, ok := list.(*agentv1alpha1.TierList); ok {
+		c.lists++
+		return apierrors.NewForbidden(schema.GroupResource{Group: "kubeagents.x-k8s.io", Resource: "tiers"}, "", errors.New("denied"))
+	}
+	return c.Client.List(ctx, list, opts...)
+}
+
+// A role that can't read Tiers (#1009's case: the operator deployed ahead of
+// its ClusterRole) doesn't stall the reconcile: with tiersUnreadable set, the
+// tiers file renders an empty list without listing. Without the flag, a
+// Forbidden list is an error, not an empty file, so a role gap isn't
+// mistaken for "no tiers defined".
+func TestAnUnreadableTierRoleRendersAnEmptyTiersFileWithoutListing(t *testing.T) {
+	agent := a2aTestAgent()
+	r, cl, _ := a2aGateTestReconciler(t, agent)
+	failing := &listFailsOnTiers{Client: cl}
+	r.Client = failing
+	r.tiersUnreadable = true
+	if err := r.applyA2ATiers(context.Background(), agent); err != nil {
+		t.Fatalf("applyA2ATiers with tiersUnreadable: %v", err)
+	}
+	if failing.lists != 0 {
+		t.Errorf("listed Tiers %d times under tiersUnreadable", failing.lists)
+	}
+	var cm corev1.ConfigMap
+	if err := cl.Get(context.Background(), client.ObjectKey{Namespace: agent.Namespace, Name: a2aTiersName(agent)}, &cm); err != nil {
+		t.Fatalf("the tiers ConfigMap: %v", err)
+	}
+	if cm.Data[a2aTiersKey] != "{\n  \"tiers\": []\n}\n" {
+		t.Errorf("tiers file %q, want an empty list", cm.Data[a2aTiersKey])
+	}
+	r.tiersUnreadable = false
+	if err := r.applyA2ATiers(context.Background(), agent); err == nil {
+		t.Error("a Forbidden Tier list without the flag rendered a file; it should fail the reconcile")
 	}
 }
