@@ -164,15 +164,21 @@ def test_a_jsonrpc_error_is_a_door_error(door_server):
 
 
 class _FakeDoor:
-    """A door whose task works for ``working`` gets, then ends ``after``."""
+    """A door whose task reads ``states`` in order (the last repeats)."""
 
-    def __init__(self, states, cancel_error=None):
+    def __init__(self, states, cancel_error=None, after_cancel="canceled", send_errors=()):
         self.states = list(states)
         self.cancels = 0
+        self.sends = []
         self.cancel_error = cancel_error
+        self.after_cancel = after_cancel
+        self.send_errors = list(send_errors)
 
     def send(self, text, *, message_id, context_id=None):
-        return {"id": "t-1", "contextId": "ctx-door", "status": {"state": "submitted"}}
+        self.sends.append((message_id, context_id))
+        if self.send_errors:
+            raise self.send_errors.pop(0)
+        return {"id": "t-1", "contextId": context_id, "status": {"state": "submitted"}}
 
     def get(self, task_id):
         state = self.states.pop(0) if len(self.states) > 1 else self.states[0]
@@ -182,7 +188,7 @@ class _FakeDoor:
         self.cancels += 1
         if self.cancel_error:
             raise self.cancel_error
-        self.states = ["canceled"]
+        self.states = [self.after_cancel]
         return {"id": task_id}
 
 
@@ -196,9 +202,16 @@ def card_wait(monkeypatch):
     monkeypatch.setattr(harness.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(harness.time, "sleep", lambda s: clock.__setitem__(0, clock[0] + s))
     seen = {}
+    cleaned = {"archived": [], "purged": []}
+    monkeypatch.setattr(harness, "_archive_stalled_cards", lambda ids, timeout, floor=None: cleaned["archived"].extend(ids))
+    monkeypatch.setattr(harness, "_purge_card_state", lambda ids, timeout, floor=None: cleaned["purged"].extend(ids))
+    monkeypatch.setattr(
+        harness.board, "read_session_cards",
+        lambda shell, sid, timeout, **kw: board.SessionCards(session_found=True, card_ids=["c-1"], cards={"c-1": {"status": "running"}}, source="state.db"),
+    )
 
-    def run(states, sessions, *, prompt=None, cancel_error=None):
-        door = _FakeDoor(states, cancel_error)
+    def run(states, sessions, *, prompt=None, cancel_error=None, after_cancel="canceled", send_errors=()):
+        door = _FakeDoor(states, cancel_error, after_cancel, send_errors)
         reads = list(sessions)
         monkeypatch.setattr(harness.a2a_door, "Door", lambda *a, **k: door)
         monkeypatch.setattr(
@@ -212,6 +225,7 @@ def card_wait(monkeypatch):
 
         monkeypatch.setattr(harness.KubeAgentsHarness, "_stop_after_first_card", fake_stop)
         got = harness.KubeAgentsHarness()._execute(prompt or f"{CW} deadline=60 observe=5\nscale it")
+        seen["cleaned"] = cleaned
         return got, door, seen
 
     return run
@@ -239,17 +253,18 @@ def test_the_card_wait_ignores_the_lanes_transport(card_wait, monkeypatch):
 
 def test_a_task_that_ends_before_any_card_is_a_setup_error_not_a_pass(card_wait):
     result, door, _ = card_wait(["working", "completed"], [[]])
-    assert _infra(result) and "setup" in result.errors[0] and door.cancels == 0
+    # Infrastructure, and the abandoned task is cancelled so it doesn't run on.
+    assert _infra(result) and "setup" in result.errors[0] and door.cancels == 1
 
 
 def test_no_card_by_the_deadline_is_a_setup_error(card_wait):
     result, door, _ = card_wait(["working"], [[]], prompt=f"{CW} deadline=10\nscale it")
-    assert _infra(result) and "within 10s" in result.errors[0] and door.cancels == 0
+    assert _infra(result) and "within 10s" in result.errors[0] and door.cancels == 1
 
 
 def test_two_sessions_with_cards_since_the_send_is_a_setup_error(card_wait):
     result, door, _ = card_wait(["working"], [["a2a-a", "a2a-b"]])
-    assert _infra(result) and "2 sessions" in result.errors[0] and door.cancels == 0
+    assert _infra(result) and "2 sessions" in result.errors[0] and door.cancels == 1
 
 
 def test_a_refused_cancel_is_reported_to_the_stop_verdict(card_wait):
@@ -266,3 +281,35 @@ def test_no_token_is_infrastructure(card_wait, monkeypatch):
 def test_the_token_never_reaches_the_result(card_wait):
     result, _, _ = card_wait(["working"], [["a2a-x"]])
     assert TOKEN not in json.dumps({"t": result.trajectory, "e": result.errors, "m": result.metadata, "o": result.output}, default=str)
+
+
+def test_a_refusal_the_door_answered_is_not_retried(card_wait):
+    result, door, _ = card_wait(["working"], [[]], send_errors=[a2a_door.DoorUnavailable("401", retryable=False)])
+    assert _infra(result) and len(door.sends) == 1
+
+
+def test_a_jsonrpc_refusal_of_the_send_is_not_retried(card_wait):
+    result, door, _ = card_wait(["working"], [[]], send_errors=[a2a_door.DoorError(-32010, "caller not mapped")])
+    assert _infra(result) and len(door.sends) == 1 and "caller not mapped" in result.errors[0]
+
+
+def test_a_retried_send_reuses_the_message_id_and_a_fixed_context(card_wait):
+    _, door, _ = card_wait(["working"], [["a2a-x"]], send_errors=[a2a_door.DoorUnavailable("503")])
+    assert len(door.sends) == 2 and door.sends[0] == door.sends[1] and door.sends[0][1]
+
+
+def test_a_cancel_that_never_reaches_the_door_is_infrastructure_and_cleans_up(card_wait):
+    result, door, seen = card_wait(["working"], [["a2a-x"]], cancel_error=a2a_door.DoorUnavailable("timeout"))
+    assert _infra(result) and door.cancels >= 1
+    assert seen["cleaned"]["purged"] == ["c-1"]
+
+
+def test_a_task_that_finishes_on_its_own_after_the_cancel_is_a_setup_error(card_wait):
+    result, door, _ = card_wait(["working"], [["a2a-x"]], after_cancel="completed")
+    assert _infra(result) and "not canceled" in result.errors[0]
+
+
+def test_an_abandoned_run_cancels_its_task_and_purges_its_cards(card_wait):
+    result, door, seen = card_wait(["working"], [["a2a-a", "a2a-b"]])
+    assert _infra(result) and door.cancels == 1
+    assert seen["cleaned"]["archived"] and seen["cleaned"]["purged"]

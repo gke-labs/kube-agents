@@ -696,7 +696,10 @@ lane's exclusion list (`hack/eval/inject-lane-exclusions.txt`, keyed on `AGENT_T
 than on this flag) leaves out the cases whose premise needs the chat front door, and its mirror
 (`hack/eval/api-lane-exclusions.txt`) keeps the cases only the door can carry off every other
 lane; the deploy also arms the card stop (`A2A_CARD_STOP`) on the install, which those cases
-grade. The lane safeguards (`hack/eval/inject-lane-safeguards.yaml`) hang off neither the flag
+grade, and turns on the gateway's A2A door (`A2A_AGENT_DOOR`) for the card-wait stopped ask, which
+cancels a door task while its turn holds for its cards. The script exports that door's own token
+(`AGENT_A2A_DOOR_TOKEN`) beside the inject one. An eval install therefore runs with a door a
+default install doesn't have. The lane safeguards (`hack/eval/inject-lane-safeguards.yaml`) hang off neither the flag
 nor the transport: on both lanes they are appended to a scratch copy of every remaining task
 file, which the unit hands devops-bench, over the leased project's GitOps repository exported as
 `BENCH_GITOPS_REPO` (the run refuses to start without one), with the cases that request a pull

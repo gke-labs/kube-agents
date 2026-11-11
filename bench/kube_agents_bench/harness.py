@@ -150,6 +150,7 @@ from __future__ import annotations
 import atexit
 import fcntl
 import http.client
+import hashlib
 import json
 import logging
 import os
@@ -345,6 +346,10 @@ _A2A_DOOR_CANCEL_SETTLE = 120.0
 _CARD_WAIT_CLOCK_SKEW = 30.0
 # The slowest the card-wait poll goes, whatever the delegation poll interval.
 _CARD_WAIT_POLL_CEILING = 5.0
+# Seconds the harness waits after first seeing a card before it cancels: the
+# coordinator turn that filed it may still be generating, and the bridge's
+# in-turn hold starts when that turn ends.
+_CARD_WAIT_SETTLE = 15.0
 # The Secret the operator renders the door's bearer token into, named in the
 # message a run without the token fails with. Suffix and key, so the message
 # can spell the whole kubectl read.
@@ -3039,22 +3044,29 @@ class KubeAgentsHarness(AgentHarness):
         def _tunnel(reset: bool) -> None:
             if not own_tunnel:
                 return
-            target[0] = _gateway_door_target(agent_service, service) or f"svc/{service}"
+            if reset or target[0] == f"svc/{service}":
+                # Resolved on the first spawn and on a respawn only, not on
+                # every call: three kubectl reads per poll is waste.
+                target[0] = _gateway_door_target(agent_service, service) or f"svc/{service}"
             forward = _reset_port_forward if reset else _ensure_port_forward
             forward(local_port, service=target[0], remote_port=a2a_door.REMOTE_PORT)
 
         door = a2a_door.Door(base_url or f"http://127.0.0.1:{local_port}", token)
 
         def _with_retries(call: Callable[[], dict[str, Any]], what: str) -> dict[str, Any]:
+            last: Exception | None = None
             for attempt in range(1, _MAX_TRANSPORT_FAILURES + 1):
                 try:
                     _tunnel(reset=attempt > 1)
                     return call()
-                except RuntimeError as exc:  # a tunnel that won't come up
-                    last: Exception = exc
+                except a2a_door.DoorError:
+                    # The door answered: a refusal, not a transport fault.
+                    raise
                 except a2a_door.DoorUnavailable as exc:
                     if not exc.retryable:
                         raise _TransportError(f"A2A door {what}: {exc}") from None
+                    last = exc
+                except RuntimeError as exc:  # a tunnel that won't come up
                     last = exc
                 _log.warning("A2A door %s failed (%d/%d): %s", what, attempt, _MAX_TRANSPORT_FAILURES, last)
                 time.sleep(max(0.0, poll_interval))
@@ -3062,10 +3074,42 @@ class KubeAgentsHarness(AgentHarness):
 
         run_id, case_id, repetition = _inject_identity()
         message_id = inject.message_id(run_id, case_id, repetition)
+        # A fixed context, so a retried send (the first reply lost after the
+        # door took it) is the same message on the same context, which the
+        # door dedupes, not a second turn the door refuses.
+        context_id = "bench-" + hashlib.sha256(message_id.encode()).hexdigest()[:24]
         result = AgentResult(output="", trajectory=[], errors=[], metadata={"transport": "a2a-door"})
+        task_id = ""
+
+        def _abandon(detail: str) -> AgentResult:
+            """Infrastructure, after cancelling a task the send started and
+            archiving and purging any card filed since, so nothing of this
+            run keeps running into the next unit."""
+            if task_id:
+                try:
+                    door.cancel(task_id)
+                except (a2a_door.DoorError, a2a_door.DoorUnavailable) as exc:
+                    _log.warning("A2A door: cancel of abandoned task %s failed: %s", task_id, exc)
+            sessions = board.sessions_with_cards_since(_agent_shell, since, _EXEC_TIMEOUT) or []
+            for sid in sessions:
+                got = board.read_session_cards(_agent_shell, sid, _EXEC_TIMEOUT)
+                if got is not None and got.session_found and got.card_ids:
+                    live = [t for t in got.card_ids if str(got.cards.get(t, {}).get("status")) not in _TERMINAL_STATUSES]
+                    if live:
+                        _archive_stalled_cards(live, _EXEC_TIMEOUT, floor=self._pod_floor)
+                    _purge_card_state(list(got.card_ids), _EXEC_TIMEOUT, floor=self._pod_floor)
+            return _infra_failure(detail)
+
+        # The pod's clock at the run's start, when known: the board's
+        # created_at is the pod's, and every earlier unit's cards predate it.
+        since = float(self._pod_floor) if self._pod_floor is not None else time.time() - _CARD_WAIT_CLOCK_SKEW
         try:
-            since = time.time() - _CARD_WAIT_CLOCK_SKEW
-            task = _with_retries(lambda: door.send(stop.prompt, message_id=message_id), "message/send")
+            try:
+                task = _with_retries(
+                    lambda: door.send(stop.prompt, message_id=message_id, context_id=context_id), "message/send"
+                )
+            except a2a_door.DoorError as exc:
+                return _infra_failure(f"the A2A door refused message/send: {exc}")
             task_id = str(task.get("id") or "")
             if not task_id:
                 return _infra_failure("the A2A door's message/send answered with no task id")
@@ -3082,21 +3126,21 @@ class KubeAgentsHarness(AgentHarness):
                 task = _with_retries(lambda: door.get(task_id), "tasks/get")
                 state = a2a_door.task_state(task)
                 if state in a2a_door.TERMINAL_STATES:
-                    return _infra_failure(
+                    return _abandon(
                         f"setup: the A2A door task ended {state} before any card was seen on the board, "
                         "so the stop never landed during the card wait"
                     )
                 sessions = board.sessions_with_cards_since(_agent_shell, since, _EXEC_TIMEOUT)
                 if sessions is not None and len(sessions) > 1:
-                    return _infra_failure(
-                        f"setup: {len(sessions)} sessions filed cards since the send ({', '.join(sessions)}); "
+                    return _abandon(
+                        f"setup: {len(sessions)} sessions filed cards since the run started ({', '.join(sessions)}); "
                         "a card-wait stop needs to run alone to know which is the case's"
                     )
                 if sessions and state == a2a_door.STATE_WORKING:
                     session = sessions[0]
                     break
                 if time.monotonic() >= deadline:
-                    return _infra_failure(
+                    return _abandon(
                         f"setup: no card was seen on the board within {stop.card_wait_deadline:.0f}s "
                         f"while the task worked (last state {state or 'unknown'})"
                     )
@@ -3104,32 +3148,63 @@ class KubeAgentsHarness(AgentHarness):
                 # the stop has to land inside it.
                 time.sleep(min(max(poll_interval, 1.0), _CARD_WAIT_POLL_CEILING))
 
+            # A card is filed, but the coordinator turn that filed it may
+            # still be generating: the bridge's hold starts when that turn
+            # ends. A short settle biases the cancel into the hold. The
+            # bridge archives the session's cards on a cancel in either phase,
+            # so this is a known limit, not a false pass: the case shows the
+            # cancel stops the card, and #5529's unit test pins the cancel
+            # inside the wait itself.
+            time.sleep(_CARD_WAIT_SETTLE)
+            task = _with_retries(lambda: door.get(task_id), "tasks/get")
+            if a2a_door.task_state(task) in a2a_door.TERMINAL_STATES:
+                return _abandon(
+                    f"setup: the A2A door task ended {a2a_door.task_state(task)} within the {_CARD_WAIT_SETTLE:.0f}s "
+                    "settle after its card was filed, before the stop could land"
+                )
+
             # 2. The stop: the door's cancel on the task, then its terminal.
+            # A transport failure here still goes through the stop's finish
+            # (send_stop raises it there), so the cards are archived and
+            # purged and the run is infrastructure.
+            cancel_error: Exception | None = None
             try:
-                door.cancel(task_id)
-                cancel = (True, "tasks/cancel accepted while the turn held for its card")
+                _with_retries(lambda: door.cancel(task_id), "tasks/cancel")
+                cancel = (True, "tasks/cancel accepted after the turn filed its card")
             except a2a_door.DoorError as exc:
                 cancel = (False, f"tasks/cancel refused: {exc}")
+            except _TransportError as exc:
+                cancel, cancel_error = (False, str(exc)), exc
             final = task
-            end = time.monotonic() + _A2A_DOOR_CANCEL_SETTLE
-            while time.monotonic() < end:
-                final = _with_retries(lambda: door.get(task_id), "tasks/get")
-                if a2a_door.task_state(final) in a2a_door.TERMINAL_STATES:
-                    break
-                time.sleep(max(poll_interval, 1.0))
+            if cancel_error is None:
+                end = time.monotonic() + _A2A_DOOR_CANCEL_SETTLE
+                while time.monotonic() < end:
+                    final = _with_retries(lambda: door.get(task_id), "tasks/get")
+                    if a2a_door.task_state(final) in a2a_door.TERMINAL_STATES:
+                        break
+                    time.sleep(max(poll_interval, 1.0))
+            final_state = a2a_door.task_state(final)
             result.trajectory.append({
                 "name": _A2A_DOOR_STATUS_ENTRY,
-                "args": {"state": a2a_door.task_state(final), "final": a2a_door.task_state(final) in a2a_door.TERMINAL_STATES},
+                "args": {"state": final_state, "final": final_state in a2a_door.TERMINAL_STATES},
                 "status": "completed",
             })
+            if cancel[0] and final_state in a2a_door.TERMINAL_STATES and final_state != "canceled":
+                # The turn finished on its own before the cancel took: the
+                # stop never landed, which is the setup's miss, not the agent's.
+                return _abandon(f"setup: the A2A door task ended {final_state}, not canceled, after the cancel was accepted")
             result.output = a2a_door.task_text(final)
             result.metadata["final_message"] = result.output
+
+            def _send_stop() -> tuple[bool, str]:
+                if cancel_error is not None:
+                    raise cancel_error
+                return cancel
+
             card_wait = stop_hook.Stop(prompt=stop.prompt, observe_seconds=stop.observe_seconds)
-            self._stop_after_first_card(
-                result, session, card_wait, send_stop=lambda: cancel, poll_interval=poll_interval
-            )
+            self._stop_after_first_card(result, session, card_wait, send_stop=_send_stop, poll_interval=poll_interval)
         except _TransportError as exc:
-            return _infra_failure(str(exc))
+            return _abandon(str(exc))
         return result
 
     def _execute_api(
