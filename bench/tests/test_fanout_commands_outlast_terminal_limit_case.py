@@ -148,6 +148,19 @@ def test_a_total_with_a_word_between_passes():
     assert _status(COUNTS, _fanout(SLEPT), output=total) == "pass"
 
 
+def test_a_name_digit_or_list_number_is_not_a_count():
+    for answer in (
+        "Could not list kube-system pods on cluster-1.",
+        "cluster-1: failed to query kube-system pods",
+        "1. Failed to count kube-system pods",
+    ):
+        assert _status(COUNTS, _fanout(SLEPT), output=answer) == "fail", answer
+
+
+def test_a_count_closing_a_sentence_passes():
+    assert _status(COUNTS, _fanout(SLEPT), output="cluster-1 kube-system pods: 58.") == "pass"
+
+
 def test_the_answer_needs_the_namespace_and_a_count():
     assert _status(COUNTS, _fanout(SLEPT)) == "pass"
     assert _status(COUNTS, _fanout(SLEPT), output="All clusters look fine.") == "fail"

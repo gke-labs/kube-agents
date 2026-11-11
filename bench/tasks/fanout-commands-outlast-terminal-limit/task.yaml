@@ -74,7 +74,9 @@ verification_spec:
       type: report_contains
       # A count beside the word pods on one line ("140 running pods",
       # "pods: 58"), or a table row whose second cell is a number, the shape
-      # a per-cluster answer takes ("| cluster-1 | 58 |").
+      # a per-cluster answer takes ("| cluster-1 | 58 |"). A count stands
+      # alone: the digit of a name (`cluster-1`) is not one, and neither is a
+      # list number (`1.`) ahead of the word.
       required_patterns:
         - '\bkube-system\b'
-        - '(?m)\b\d+\b[^\n]{0,30}?\bpods?\b|\bpods?\b[^\n]{0,40}?\b\d+\b|^\|[^|\n]+\|\s*\d+\b'
+        - '(?m)(?<![\w-])\d+(?![\w.-])[^\n]{0,30}?\bpods?\b|\bpods?\b[^\n]{0,40}?(?<![\w-])\d+(?![\w-])|^\|[^|\n]+\|\s*\d+\b'
