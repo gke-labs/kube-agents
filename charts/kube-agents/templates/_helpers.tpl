@@ -2858,6 +2858,25 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
 {{- end -}}
 {{- end }}
 
+{{- /* kube-agents.crdFieldGuard's twin for a top-level AgentProfile spec field the
+       chart renders: helm upgrade doesn't apply crds/, and an AgentProfile CRD from
+       before the field prunes it silently, which for a routing field like
+       yieldToPinned changes where tasks go with no error. */ -}}
+{{- define "kube-agents.agentProfileFieldGuard" -}}
+{{- $crd := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "agentprofiles.kubeagents.x-k8s.io" -}}
+{{- if $crd -}}
+{{- $props := dict -}}
+{{- range $crd.spec.versions -}}
+{{- if .storage -}}
+{{- $props = dig "schema" "openAPIV3Schema" "properties" "spec" "properties" (dict) . -}}
+{{- end -}}
+{{- end -}}
+{{- if not (hasKey $props .field) -}}
+{{- fail (printf "%s renders spec.%s, but the installed AgentProfile CRD predates it and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/, or run upgrade.sh, which does). Otherwise the API server prunes the field silently" .value .field) -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
 {{- define "kube-agents.credentialProxyMemoryFloorBytes" -}}
 570425344
 {{- end }}
