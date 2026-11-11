@@ -8796,6 +8796,43 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     assert _shell_argvs_with_exit_propagation("env -C /tmp setsid python3 f.py --readiness") == [
         (["env", "-C", "/tmp", "setsid", "python3", "f.py", "--readiness"], False),
     ]
+    assert _shell_argvs_with_exit_propagation("env -iu FOO setsid python3 f.py --readiness") == [
+        (["env", "-iu", "FOO", "setsid", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("timeout -vs TERM 30 setsid python3 f.py --readiness") == [
+        (["timeout", "-vs", "TERM", "30", "setsid", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("env -C /tmp/time python3 f.py --readiness") == [
+        (["env", "-C", "/tmp/time", "python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("exec -a watch python3 f.py --readiness") == [
+        (["exec", "-a", "watch", "python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation('nice "$DIR/f.py" --readiness -v time') == [
+        (["nice", "$DIR/f.py", "--readiness", "-v", "time"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation('chroot "$NEWROOT" ./f.py --readiness -v time') == [
+        (["chroot", "$NEWROOT", "./f.py", "--readiness", "-v", "time"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation('bash -nc "python3 f.py --readiness"') == [
+        (["bash", "-nc", "python3 f.py --readiness"], True),
+        (["python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation('sh -n -c "python3 f.py --readiness"') == [
+        (["sh", "-n", "-c", "python3 f.py --readiness"], True),
+        (["python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation('bash --help -c "python3 f.py --readiness"') == [
+        (["bash", "--help", "-c", "python3 f.py --readiness"], True),
+        (["python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation('bash --version -c "python3 f.py --readiness"') == [
+        (["bash", "--version", "-c", "python3 f.py --readiness"], True),
+        (["python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation('bash /tmp/s.sh -c "python3 f.py --readiness"') == [
+        (["bash", "/tmp/s.sh", "-c", "python3 f.py --readiness"], True),
+    ]
     assert _shell_argvs_with_exit_propagation("env -C /tmp ./f.py --readiness") == [
         (["env", "-C", "/tmp", "./f.py", "--readiness"], True),
     ]

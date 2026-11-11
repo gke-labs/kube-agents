@@ -323,11 +323,31 @@ def _shell_argvs(command: str) -> list[list[str]]:
             continue
         if index is None or os.path.basename(argv[index]) not in _SHELL_PROGRAMS_WITH_COMMAND_STRING:
             continue
-        for flag_index in range(index + 1, len(argv) - 1):
-            flag = argv[flag_index]
-            if flag.startswith("-") and not flag.startswith("--") and "c" in flag[1:]:
-                argvs.extend(_shell_argvs(argv[flag_index + 1]))
+        flag_idx = index + 1
+        takes_val = False
+        while flag_idx < len(argv):
+            word = argv[flag_idx]
+            if takes_val:
+                takes_val = False
+                flag_idx += 1
+                continue
+            if word == "--":
                 break
+            if word.startswith("--"):
+                if word == "--rcfile":
+                    takes_val = True
+                flag_idx += 1
+                continue
+            if word.startswith("-") and len(word) > 1:
+                if "c" in word[1:]:
+                    if flag_idx + 1 < len(argv):
+                        argvs.extend(_shell_argvs(argv[flag_idx + 1]))
+                    break
+                if word[-1] in "oO":
+                    takes_val = True
+                flag_idx += 1
+                continue
+            break
     for span in spans:
         inner = _substitution_commands(span)
         if inner is not None:

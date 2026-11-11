@@ -2850,6 +2850,10 @@ def _has_detaching_wrapper(seg: list[str]) -> bool:
                     inner_redirect_target = not w.isdigit()
                     idx += 1
                     continue
+                if takes_val:
+                    takes_val = False
+                    idx += 1
+                    continue
                 if os.path.basename(w) in _SHELL_EXEC_WRAPPERS:
                     break
                 if w == "--":
@@ -2860,7 +2864,7 @@ def _has_detaching_wrapper(seg: list[str]) -> bool:
                         if w.startswith("--"):
                             opt_name, _, _ = w.partition("=")
                             takes_val = (opt_name in _GENERIC_WRAPPER_VAL_OPTS[base] and "=" not in w)
-                        elif len(w) == 2 and w in _GENERIC_WRAPPER_VAL_OPTS[base]:
+                        elif len(w) >= 2 and f"-{w[-1]}" in _GENERIC_WRAPPER_VAL_OPTS[base]:
                             takes_val = True
                         else:
                             takes_val = False
@@ -2868,18 +2872,11 @@ def _has_detaching_wrapper(seg: list[str]) -> bool:
                         takes_val = False
                     idx += 1
                     continue
-                if takes_val:
-                    takes_val = False
-                    idx += 1
-                    continue
-                if _SHELL_COUNT_RE.match(w) or w.startswith(_SHELL_EXPANSION_PREFIX):
-                    idx += 1
-                    continue
                 if positionals:
                     positionals -= 1
                     idx += 1
                     continue
-                if _SHELL_ASSIGNMENT_RE.match(w):
+                if _SHELL_COUNT_RE.match(w):
                     idx += 1
                     continue
                 w_base = os.path.basename(w)
@@ -2890,6 +2887,12 @@ def _has_detaching_wrapper(seg: list[str]) -> bool:
                     or (not w.startswith("-") and not _SHELL_ASSIGNMENT_RE.match(w) and ("." in w_base or "/" in w))
                 ):
                     break
+                if w.startswith(_SHELL_EXPANSION_PREFIX):
+                    idx += 1
+                    continue
+                if _SHELL_ASSIGNMENT_RE.match(w):
+                    idx += 1
+                    continue
                 break
             continue
         else:
@@ -2986,15 +2989,45 @@ def _shell_argvs_with_exit_propagation(
 
         index = _command_word_index(seg)
         if index is not None and os.path.basename(seg[index]) in _SHELL_PROGRAMS_WITH_COMMAND_STRING:
-            for flag_index in range(index + 1, len(seg) - 1):
-                flag = seg[flag_index]
-                if flag.startswith("-") and not flag.startswith("--") and "c" in flag[1:]:
-                    inner_cmd = seg[flag_index + 1]
-                    for inner_argv, inner_carries in _shell_argvs_with_exit_propagation(
-                        inner_cmd, outer_spans=(*outer_spans, *spans)
-                    ):
-                        results.append((inner_argv, carries_exit and inner_carries))
+            flag_idx = index + 1
+            has_noexec = False
+            has_help_or_version = False
+            takes_val = False
+            cmd_string = None
+            while flag_idx < len(seg):
+                word = seg[flag_idx]
+                if takes_val:
+                    takes_val = False
+                    flag_idx += 1
+                    continue
+                if word == "--":
                     break
+                if word.startswith("--"):
+                    if word in ("--help", "--version"):
+                        has_help_or_version = True
+                    if word == "--rcfile":
+                        takes_val = True
+                    flag_idx += 1
+                    continue
+                if word.startswith("-") and len(word) > 1:
+                    if "n" in word[1:]:
+                        has_noexec = True
+                    if "c" in word[1:]:
+                        if flag_idx + 1 < len(seg):
+                            cmd_string = seg[flag_idx + 1]
+                        break
+                    if word[-1] in "oO":
+                        takes_val = True
+                    flag_idx += 1
+                    continue
+                break
+
+            if cmd_string is not None:
+                shell_carries = carries_exit and not has_noexec and not has_help_or_version
+                for inner_argv, inner_carries in _shell_argvs_with_exit_propagation(
+                    cmd_string, outer_spans=(*outer_spans, *spans)
+                ):
+                    results.append((inner_argv, shell_carries and inner_carries))
 
     remaining_spans = list(spans)
     for val in handled_spans:

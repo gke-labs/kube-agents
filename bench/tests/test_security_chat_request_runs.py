@@ -112,6 +112,10 @@ def _ledger_flagged(command: str) -> bool:
         f"python3 {COLLECT} compliance-audit;",
         f"python3 {COLLECT} compliance-audit 'quoted && inside; quotes'",
         f"OUT=$(python3 {COLLECT} compliance-audit)",
+        f"env -C /tmp/time python3 {COLLECT} compliance-audit",
+        f"exec -a watch python3 {COLLECT} compliance-audit",
+        f'nice "$DIR/{COLLECT}" compliance-audit',
+        f'chroot "$NEWROOT" python3 {COLLECT} compliance-audit',
     ],
 )
 def test_collector_run_is_credited(command):
@@ -174,6 +178,13 @@ def test_collector_run_is_credited(command):
         f"flock -n -E 0 /tmp/lock python3 {COLLECT} compliance-audit",
         f"command -v python3 {COLLECT} compliance-audit",
         f"command -V {COLLECT} compliance-audit",
+        f"env -iu FOO setsid python3 {COLLECT} compliance-audit",
+        f"timeout -vs TERM 30 setsid python3 {COLLECT} compliance-audit",
+        f'bash -nc "python3 {COLLECT} compliance-audit"',
+        f'sh -n -c "python3 {COLLECT} compliance-audit"',
+        f'bash --help -c "python3 {COLLECT} compliance-audit"',
+        f'bash --version -c "python3 {COLLECT} compliance-audit"',
+        f'bash /tmp/s.sh -c "python3 {COLLECT} compliance-audit"',
     ],
 )
 def test_mention_help_or_other_script_is_not_credited(command):
