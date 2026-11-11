@@ -2867,6 +2867,9 @@ MANIFEST_STARTED_KEY = "started_at"
 # so a reader can tell a report from a run that started before its own window
 # from one this run produced, where `finished_at` alone cannot.
 ENVELOPE_STARTED_KEY = "started_at"
+# `report_envelope`'s default for `started_at`: read the run start when the
+# envelope is built. `_finish` passes the start it read before its checks.
+RUN_START_UNREAD = object()
 # Two keys the upgrade retrospective's collector writes that say the manifest
 # is not one the SOP files from, so `load_manifest` refuses it for `draft`
 # and `finish` alike. `scoped`: the run was narrowed (no `--full`, or
@@ -4288,6 +4291,7 @@ def report_envelope(
     scheduled_coverage_gaps: list[str] | None = None,
     scheduled_published_ids: list[str] | None = None,
     scheduled_reported_under_gap: list[str] | None = None,
+    started_at: str | None | object = RUN_START_UNREAD,
     open_issue_number: int | None = None,
     not_rechecked: list[dict] | None = None,
 ) -> dict:
@@ -4323,7 +4327,9 @@ def report_envelope(
     `finished_at` is the run's own generation timestamp, the one the ledger
     footer prints, so the envelope and the body agree about when it ran.
     `started_at` (`ENVELOPE_STARTED_KEY`) is when the run opened
-    (`run_started_iso`), or None when no record of it reads.
+    (`run_started_iso`), or None when no record of it reads. `_finish` passes
+    the value it read before its own checks, so a later `start` that rewrites
+    the run record while this run publishes does not put its stamp here.
     The phase timers (`PHASE_TIMER_KEYS`) are copied from `payload`, and a
     timer that `payload` does not have is left out.
 
@@ -4342,7 +4348,7 @@ def report_envelope(
         "audit_id": audit_id,
         "repo": repo,
         "finished_at": now.isoformat(),
-        ENVELOPE_STARTED_KEY: run_started_iso(audit_id, now),
+        ENVELOPE_STARTED_KEY: run_started_iso(audit_id, now) if started_at is RUN_START_UNREAD else started_at,
         "status": payload.get("status"),
         "issue_number": issue_number,
         "issue_url": payload.get("issue_url"),
@@ -23748,6 +23754,7 @@ def _finish_without_forge(
     data: dict,
     now: datetime,
     *,
+    run_started: str | None,
     manifest: dict | None,
     waiver: str,
     timers: Callable[[], dict],
@@ -23942,6 +23949,7 @@ def _finish_without_forge(
         scheduled_coverage_gaps=next_scheduled_value(scheduled, gaps, scheduled_gaps_baseline(record)),
         scheduled_published_ids=next_scheduled_value(scheduled, stored_ids, scheduled_ids),
         not_rechecked=unread_entries,
+        started_at=run_started,
     )
     envelope.update(marker)
     # A diverted run wrote nothing to the ledger, so when its write fails the
@@ -24127,6 +24135,7 @@ def _finish_store_ledger(
     data: dict,
     now: datetime,
     *,
+    run_started: str | None,
     manifest: dict | None,
     record: dict | None,
     root: Path,
@@ -24677,6 +24686,7 @@ def _finish_store_ledger(
         scheduled_published_ids=next_scheduled_ids,
         scheduled_reported_under_gap=next_scheduled_reported,
         not_rechecked=not_rechecked,
+        started_at=run_started,
     )
     envelope[LEDGER_KEY] = LEDGER_STORE
     if listing_refusal:
@@ -25210,6 +25220,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
     # False and the person who asked gets an answer.
     scheduled = bool(getattr(args, "scheduled", False))
     set_sweep_waived(getattr(args, "no_promote", False))
+    # Read before the checks below tie this run to its `start`: a later
+    # `start` can rewrite the run record while this run publishes.
+    run_started = run_started_iso(audit_id, datetime.now(timezone.utc))
     data = load_findings(args.findings_file, audit_id, command="finish", expiry_day=run_start_day(audit_id))
     stale_since = findings_predate_run(args.findings_file, audit_id)
     if stale_since:
@@ -25397,6 +25410,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
             audit_id,
             data,
             now,
+            run_started=run_started,
             manifest=manifest,
             waiver=waiver,
             timers=timer_payload,
@@ -25586,6 +25600,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
             args,
             data,
             now,
+            run_started=run_started,
             manifest=manifest,
             record=record,
             root=root,
@@ -26518,6 +26533,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
             scheduled_reported_under_gap=next_scheduled_reported,
             open_issue_number=open_issue,
             not_rechecked=not_rechecked,
+            started_at=run_started,
         )
         stored = write_report(audit_id, envelope, now, ledger_unchanged=body_untouched)
         # A HELD line prints no counts, so it keeps its own label.
@@ -27073,6 +27089,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
         scheduled_reported_under_gap=next_scheduled_reported,
         # Their places, which the note and id-only tiers do not render.
         not_rechecked=unread_entries,
+        started_at=run_started,
     )
     stored = write_report(audit_id, envelope, now)
     run_counts = None

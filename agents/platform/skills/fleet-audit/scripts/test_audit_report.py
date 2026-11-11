@@ -32855,6 +32855,32 @@ class TestNoForge(BaseTestCase):
         self.assertEqual(len(latest["document"]["findings"]), 4)
         self.assertEqual(self.recorder.calls, [])
 
+    def test_a_later_start_while_this_run_publishes_does_not_stamp_its_envelope(self):
+        """#4268: `finish` reads its run's start before its checks. A later
+        `start` that rewrites the run record before the envelope is built
+        leaves the envelope with this run's own start."""
+        self.start()
+        record = Path(audit_report.run_record_path_for(AUDIT))
+        own = json.loads(record.read_text())[audit_report.RUN_RECORD_STARTED_KEY]
+        real = audit_report.report_envelope
+
+        def next_start_lands_first(*args, **kwargs):
+            data = json.loads(record.read_text())
+            data[audit_report.RUN_RECORD_STARTED_KEY] = "2099-01-01T00:00:00Z"
+            record.write_text(json.dumps(data))
+            return real(*args, **kwargs)
+
+        self.patch_attr("report_envelope", next_start_lands_first)
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(make_doc(findings=THREE_SEVERITIES)), encoding="utf-8")
+        self.assertEqual(self.run_main(["finish", "--audit", AUDIT, "--findings-file", path, "--scheduled"]), 0, self.err)
+
+        latest = json.loads((self.store() / "latest.json").read_text())
+        self.assertEqual(
+            latest[audit_report.ENVELOPE_STARTED_KEY],
+            datetime.fromtimestamp(audit_report._utc_seconds(own), timezone.utc).isoformat(),
+        )
+
     def test_the_delta_runs_against_the_previous_no_forge_report(self):
         doc = make_doc(findings=THREE_SEVERITIES)
         self.finish(doc)

@@ -138,6 +138,12 @@ def test_a_start_that_is_not_an_aware_time_fails(root, started):
     assert _verify().status == "fail"
 
 
+def test_a_report_whose_start_is_after_its_finish_fails(root):
+    """A start later than the finish is a later run's stamp, not this report's run."""
+    _store(root, finished=STARTED + timedelta(minutes=2), started=STARTED + timedelta(minutes=3))
+    assert _verify().status == "fail"
+
+
 def test_an_older_images_report_with_no_start_key_is_read_by_finished_at(root):
     _store(root, finished=STARTED + timedelta(minutes=2))
     assert _verify().status == "pass"
@@ -363,6 +369,20 @@ def test_an_envelope_older_than_the_fire_fails_with_the_fire_named(root, monkeyp
     result = _verify_envelope(root, required_envelope={"precheck": "unchanged"}, since_state_file="/opt/data/.bench-x.json")
     assert result.status == "fail"
     assert "since the stack fired the audit" in result.reason
+
+
+def test_a_whole_second_start_in_the_second_of_the_fire_passes(root, monkeypatch):
+    """The run record stamps whole seconds; a start in the same second as a fire
+    at .7 s is this run's, not an earlier one."""
+    fired = (STARTED - timedelta(hours=2)).replace(microsecond=700000)
+    monkeypatch.setattr(onboarding, "agent_shell", _state_shell({"job_id": AUDIT, "fired_at": fired.isoformat()}))
+    _store_with(
+        root,
+        {"precheck": "unchanged", "started_at": fired.replace(microsecond=0).isoformat()},
+        fired + timedelta(minutes=9),
+    )
+    result = _verify_envelope(root, required_envelope={"precheck": "unchanged"}, since_state_file="/opt/data/.bench-x.json")
+    assert result.status == "pass", result.reason
 
 
 @pytest.mark.parametrize("state", [None, {}, {"fired_at": "yesterday"}, {"fired_at": "2026-10-13T18:00:00"}])

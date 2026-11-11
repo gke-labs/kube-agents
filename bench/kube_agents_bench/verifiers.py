@@ -8948,14 +8948,21 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
             # An envelope that names its run's start counts only when that run
             # opened inside the window: a run from an earlier repetition can
             # finish inside this one. One with the key and no start is such a
-            # late finish too; an older image writes no key and is read by
-            # `finished_at` alone.
+            # late finish too, and so is one whose start is after its finish (a
+            # later run's stamp); an older image writes no key and is read by
+            # `finished_at` alone. The start is stamped in whole seconds, so the
+            # bound is floored to the second for it.
             if _ENVELOPE_STARTED_KEY in envelope:
                 try:
                     began = datetime.fromisoformat(str(envelope.get(_ENVELOPE_STARTED_KEY)))
                 except ValueError:
                     began = None
-                if began is None or began.tzinfo is None or began < since:
+                if (
+                    began is None
+                    or began.tzinfo is None
+                    or began < since.replace(microsecond=0)
+                    or began > finished
+                ):
                     started_early += 1
                     continue
             fresh.append(envelope)
