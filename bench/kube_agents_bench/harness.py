@@ -230,7 +230,7 @@ TRANSPORT_API = "api"
 TRANSPORT_INJECT = "inject"
 # ``slack`` goes the way a person does: a test user's post in a CI channel, the
 # reply read back from the thread (slack_transport.py). Advisory, for the Slack
-# lane only (hack/eval/slack-lane.sh).
+# lane only (hack/slack-lane/run.sh).
 TRANSPORT_SLACK = "slack"
 _TRANSPORTS = frozenset({TRANSPORT_API, TRANSPORT_INJECT, TRANSPORT_SLACK})
 # The Slack transport's whole-turn budget when AGENT_SLACK_TIMEOUT is unset.
@@ -2848,7 +2848,7 @@ def _execute_slack(prompt: str) -> AgentResult:
     if missing:
         return _infra_failure(f"slack transport not configured: {', '.join(missing)} unset")
     token = os.environ[slack.USER_TOKEN_ENV]
-    if not token.startswith(slack.USER_TOKEN_PREFIX):
+    if not token.startswith(slack.USER_TOKEN_PREFIXES):
         return _infra_failure(f"{slack.USER_TOKEN_ENV} is not a user token")
     try:
         timeout = _numeric_env("AGENT_SLACK_TIMEOUT", _SLACK_DEFAULT_TIMEOUT, float)

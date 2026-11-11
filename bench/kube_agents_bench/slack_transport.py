@@ -57,7 +57,8 @@ USER_TOKEN_ENV = "BENCH_SLACK_USER_TOKEN"
 CHANNEL_ENV = "BENCH_SLACK_CHANNEL_ID"
 BOT_USER_ENV = "BENCH_SLACK_BOT_USER_ID"
 REQUIRED_ENV = (USER_TOKEN_ENV, CHANNEL_ENV, BOT_USER_ENV)
-USER_TOKEN_PREFIX = "xoxp-"
+# A user token, rotating (xoxe.xoxp-) or not; never the bot's.
+USER_TOKEN_PREFIXES = ("xoxp-", "xoxe.xoxp-")
 # Where the turn's three Slack legs are written as JSON, when set; the lane
 # script sets it beside the run's KUBE_AGENTS_TIMING_FILE, which carries only
 # the post-to-answer leg the scorer reads.
