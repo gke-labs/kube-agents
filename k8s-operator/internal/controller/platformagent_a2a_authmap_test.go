@@ -29,6 +29,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	"time"
 )
 
 // calloutFixturePath is the rendered map the a2a module's callout parses in its
@@ -414,6 +415,7 @@ var a2aIdentityMapSchemaKeys = map[string][]string{
 	"3": {"account", "grants", "identities", "narrowing", "profile", "publish", "serviceAccount", "subscribe", "topics", "user", "version"},
 	"4": {"account", "grants", "identities", "narrowing", "profile", "publish", "serviceAccount", "subscribe", "tier", "topics", "user", "version"},
 	"5": {"account", "grants", "identities", "narrowing", "profile", "publish", "serviceAccount", "shard", "shards", "subscribe", "tier", "topics", "user", "version"},
+	"6": {"account", "draining", "grants", "identities", "narrowing", "profile", "publish", "serviceAccount", "shard", "shards", "subscribe", "tier", "topics", "user", "version"},
 }
 
 // a2aJSONKeys walks a decoded document and collects every object key in it.
@@ -442,13 +444,23 @@ func a2aJSONKeys(v any, into map[string]bool) {
 func TestTheIdentityMapShapeMatchesTheSchemaTheCalloutPodTemplatePins(t *testing.T) {
 	agent := a2aTestAgent()
 
-	// With a profile that has topics, so every key the renderer can emit is
+	// With a profile that has topics, and the dispatcher's bucketed entry
+	// with a draining profile, so every key the renderer can emit is
 	// emitted: a map rendered with no profiles would pass on the old schema
 	// and roll nothing.
-	cm, _ := singleA2AAuthMapShard(t, agent, []agentv1alpha1.AgentProfile{testAgentProfile(agent.Namespace, "auditor", func(p *agentv1alpha1.AgentProfile) {
+	withDispatcher(t)
+	withBucketedGrants(t)
+	auditor := testAgentProfile(agent.Namespace, "auditor", func(p *agentv1alpha1.AgentProfile) {
 		p.Spec.Bus.PublishTopics = []string{"agent.auditor.findings"}
 		p.Spec.Bus.SubscribeTopics = []string{"shared.blueprint"}
-	})})
+	})
+	draining := []a2aDispatchProfile{{Name: "gone", Concurrency: 1, Tiers: []string{"read"}, ActiveDeadlineSeconds: 1800,
+		Durables: []a2aDispatchDurable{}, DrainingUntil: time.Date(2026, 11, 6, 12, 45, 0, 0, time.UTC)}}
+	cms, _, err := buildA2AAuthMapConfigMaps(agent, []agentv1alpha1.AgentProfile{auditor}, draining)
+	if err != nil || len(cms) != 1 {
+		t.Fatalf("rendering the auth map: %d shards, %v", len(cms), err)
+	}
+	cm := cms[0]
 	var doc any
 	if err := json.Unmarshal([]byte(cm.Data[a2aAuthMapKey]), &doc); err != nil {
 		t.Fatalf("decoding the rendered auth map: %v", err)

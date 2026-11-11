@@ -29,6 +29,13 @@ const DispatcherBuckets = 32
 
 // DispatcherBucket is the bucket a profile's grants ride on: fnv32a(name)
 // mod DispatcherBuckets.
+//
+// Known limit: the hash is unkeyed, so whoever names AgentProfiles can pick
+// names that all land in one bucket. At about 1.1 KB of grants per profile
+// tier, a bucket's user JWT passes the callout's 1 MiB reply at roughly 450
+// two-tier profiles. Past that the mint fails closed, and every profile in
+// that bucket stops dispatching. Creating AgentProfiles is already an admin's
+// act. An even spread of 2,500 profiles puts about 80 in each bucket.
 func DispatcherBucket(profile string) int {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(profile))

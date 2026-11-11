@@ -183,3 +183,34 @@ func TestTheIdentityMapAtFleetScaleWithBucketedGrants(t *testing.T) {
 	}
 	t.Logf("dispatcher entry %d bytes at N=%d; map in %d shards", len(b), fleetScaleProfiles, len(cms))
 }
+
+// An applied dispatch config naming a reserved addressee as a profile (the
+// bridge's) is not one this operator wrote: it is dropped from the draining
+// set rather than granted that addressee's .supervisor subject, with the flag
+// on or off. The mirror refuses it on the entry too.
+func TestAReservedAddresseeIsNeverADrainingProfile(t *testing.T) {
+	now := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
+	applied := &a2aDispatchConfig{Profiles: []a2aDispatchProfile{
+		{Name: a2aBridgeAddressee, Tiers: []string{"read"}},
+		{Name: "gone", Tiers: []string{"read"}},
+	}}
+	got := drainingDispatchProfiles(applied, map[string]bool{}, now)
+	if len(got) != 1 || got[0].Name != "gone" {
+		t.Fatalf("draining = %+v, want gone alone", got)
+	}
+
+	withDispatcher(t)
+	withBucketedGrants(t)
+	withOperatorBusPrincipal(t)
+	agent := authMapTestAgent()
+	doc, err := renderA2AAuthMap(agent, []agentv1alpha1.AgentProfile{testAgentProfile(agent.Namespace, "tse")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := doc.Identities
+	i := slices.IndexFunc(ids, func(id a2aAuthMapIdentity) bool { return id.User == a2aDispatcherUser })
+	ids[i].Draining = []string{a2aBridgeAddressee}
+	if err := validateA2AAuthMapIdentities(ids); err == nil {
+		t.Fatal("the mirror accepted a draining reserved addressee")
+	}
+}

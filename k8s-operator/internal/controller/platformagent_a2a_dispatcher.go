@@ -757,7 +757,12 @@ func drainingDispatchProfiles(applied *a2aDispatchConfig, live map[string]bool, 
 	var out []a2aDispatchProfile
 	seen := map[string]bool{}
 	for _, a := range applied.Profiles {
+		// A reserved addressee is no profile's name (the operator refuses a
+		// live profile named for one), so an applied entry naming one is
+		// not one this operator wrote, and would grant the dispatcher that
+		// addressee's .supervisor subject.
 		if live[a.Name] || seen[a.Name] || !isDNS1123LabelToken(a.Name) || len(a.Tiers) == 0 ||
+			slices.Contains(a2aReservedAddressees(), a.Name) ||
 			slices.ContainsFunc(a.Tiers, func(t string) bool { return !isDNS1123LabelToken(t) }) {
 			continue
 		}

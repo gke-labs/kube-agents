@@ -107,7 +107,10 @@ const a2aIdentityMapSchemaAnnotation = "a2a.kubeagents.x-k8s.io/identity-map-sch
 //	4 -> adds tier (one AgentProfile entry per tier, #3655)
 //	5 -> adds shard and shards (the map is cut into numbered ConfigMaps;
 //	     a callout from before it watches a name no longer rendered)
-const a2aIdentityMapSchema = "5"
+//	6 -> adds draining, and the narrowing value "dispatcher" (#5381,
+//	     behind A2A_DISPATCHER_BUCKETED_GRANTS); a callout from before it
+//	     refuses both
+const a2aIdentityMapSchema = "6"
 
 const (
 	// Release surface, resolved by a2aReleaseImage like the gateway and the

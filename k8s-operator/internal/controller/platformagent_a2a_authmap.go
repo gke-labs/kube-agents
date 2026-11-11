@@ -29,6 +29,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	"slices"
 )
 
 // The identity-to-permissions map: what the operator renders and the auth
@@ -211,7 +212,7 @@ type a2aAuthMapDocument struct {
 	// watches each name, and refuses a document whose stamps disagree with
 	// what it was told or with the name it arrived under. Plain ints
 	// rather than omitted at zero, so shard 0 of 1 carries the keys too
-	// and the schema is one shape (a2aIdentityMapSchema, schema 5).
+	// and the schema is one shape (a2aIdentityMapSchema, since schema 5).
 	Shard  int `json:"shard"`
 	Shards int `json:"shards"`
 
@@ -543,8 +544,8 @@ func validateA2AAuthMapIdentities(identities []a2aAuthMapIdentity) error {
 			}
 			seenDraining := map[string]bool{}
 			for _, p := range id.Draining {
-				if !isDNS1123LabelToken(p) || seenDraining[p] {
-					return fmt.Errorf("identity %d: user %q lists draining profile %q, which is not a dot-free DNS-1123 label or is listed twice", i, id.User, p)
+				if !isDNS1123LabelToken(p) || seenDraining[p] || slices.Contains(a2aReservedAddressees(), p) {
+					return fmt.Errorf("identity %d: user %q lists draining profile %q, which is not a dot-free DNS-1123 label, is listed twice, or is a reserved addressee", i, id.User, p)
 				}
 				seenDraining[p] = true
 			}

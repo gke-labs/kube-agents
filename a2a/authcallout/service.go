@@ -602,7 +602,22 @@ func (s *Service) authorize(ctx context.Context, req *jwt.AuthorizationRequestCl
 				// the client asked for a bucket and gets it or nothing.
 				return decision{}, fmt.Errorf("%s presented a dispatcher bucket that was refused: %w", att.ServiceAccount, err)
 			}
-			grants, user = dispatcherBucketGrants(m, id, bucket), dispatcherBucketUser(id.User, bucket)
+			user = dispatcherBucketUser(id.User, bucket)
+			// The map reserves the bucket users against its own entries and
+			// profiles (validateIdentities), but not against the static
+			// principals and addressees this callout was started with. Nor
+			// can it check the draining names against them, and a draining
+			// name becomes a2a.tasks.<name>.*.supervisor. So both are
+			// checked here, and a hit refuses the connection.
+			if kind, ok := s.reserved[user]; ok {
+				return decision{}, fmt.Errorf("%s asked for dispatcher bucket user %q, which is the name of %s", att.ServiceAccount, user, kind)
+			}
+			for _, p := range id.Draining {
+				if kind, ok := s.reserved[p]; ok {
+					return decision{}, fmt.Errorf("%s's entry lists draining profile %q, which is the name of %s; its grants would be that name's", att.ServiceAccount, p, kind)
+				}
+			}
+			grants = dispatcherBucketGrants(m, id, bucket)
 		}
 	} else if id.Narrowing != "" {
 		// A narrowed entry holds no grants; they are built here from what

@@ -349,8 +349,10 @@ func (id Identity) validate() error {
 		// The entry's grants are the control connection's, and are served
 		// as written, so they get the un-narrowed entry's both-sides check.
 		// No per-profile subject is in the map: a bucket connection's grants
-		// come from the profile entries alone. So this entry cannot be
-		// widened to a profile by editing it, only by adding a profile.
+		// come from the profile entries and the draining names. The
+		// draining names are checked here for shape. The callout checks
+		// them against its reserved names at the mint, since the map can't
+		// see those.
 		if len(id.Grants.Publish) == 0 || len(id.Grants.Subscribe) == 0 {
 			return fmt.Errorf("user %q has %d publish and %d subscribe grants; an empty side is minted as unrestricted on that side, not as closed",
 				id.User, len(id.Grants.Publish), len(id.Grants.Subscribe))
@@ -434,11 +436,6 @@ func (m *IdentityMap) Users() []string {
 	return users
 }
 
-// servesUser reports whether name is a user of one of this map's entries.
-// ParseIdentityMap builds the set, and Store.Update installs nothing else, but
-// a map built any other way (a test writing the store directly) has no set; it
-// falls back to scanning the entries rather than reporting no users, so the
-// refusal fails closed.
 // servedUsers is the set servesUser answers from: every entry's user, and a
 // dispatcher entry's bucket users, whose inboxes no narrowed pod may take.
 func servedUsers(m *IdentityMap) map[string]struct{} {
@@ -456,6 +453,12 @@ func servedUsers(m *IdentityMap) map[string]struct{} {
 	return users
 }
 
+// servesUser reports whether name is a user of one of this map's entries, or
+// one of a dispatcher entry's bucket users.
+// ParseIdentityMap builds the set, and Store.Update installs nothing else, but
+// a map built any other way (a test writing the store directly) has no set; it
+// falls back to scanning the entries rather than reporting no users, so the
+// refusal fails closed.
 func (m *IdentityMap) servesUser(name string) bool {
 	users := m.users
 	if users == nil {

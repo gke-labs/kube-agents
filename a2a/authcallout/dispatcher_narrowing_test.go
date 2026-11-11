@@ -79,7 +79,7 @@ func profileHashingTo(bucket int, skip ...string) string {
 	}
 }
 
-func newDispatcherTestService(t *testing.T, rawMap []byte, tokens map[string]Attested) *Service {
+func newDispatcherTestService(t *testing.T, rawMap []byte, tokens map[string]Attested, extraPrincipals ...string) *Service {
 	t.Helper()
 	issuerKP, _ := nkeys.CreateAccount()
 	issuerSeed, _ := issuerKP.Seed()
@@ -94,7 +94,7 @@ func newDispatcherTestService(t *testing.T, rawMap []byte, tokens map[string]Att
 	}
 	svc, err := NewService(store, validator, Config{
 		IssuerSeed:         string(issuerSeed),
-		ReservedPrincipals: renderedFixtureAuthUsers(t),
+		ReservedPrincipals: append(renderedFixtureAuthUsers(t), extraPrincipals...),
 		ReservedAddressees: renderedFixtureAddressees(t),
 	}, log)
 	if err != nil {
@@ -411,5 +411,34 @@ func TestTheOperatorsBucketedDispatcherMapParsesAndDerives(t *testing.T) {
 		if strings.Contains(s, "PROFILE_SUBMITS") && strings.Contains(s, "gone") {
 			t.Errorf("draining gone still holds a durable grant %q", s)
 		}
+	}
+}
+
+// A draining name the callout reserves (an addressee such as the bridge's,
+// or a static principal) would grant the bucket that name's .supervisor
+// subject and stop grants. The map can't see the callout's reserved names,
+// so the mint refuses the bucket instead.
+func TestADrainingNameTheCalloutReservesRefusesTheBucket(t *testing.T) {
+	for _, reserved := range append(renderedFixtureAddressees(t)[:1], renderedFixtureAuthUsers(t)[0]) {
+		svc := newDispatcherTestService(t, renderMap(t, dispatcherEntry(reserved), profileEntry("a", "read")), dispatcherTokens())
+		if _, err := connect(svc, dispatcherToken, lib.DispatcherBucketCredential(lib.DispatcherBucket(reserved))); err == nil || !strings.Contains(err.Error(), reserved) {
+			t.Errorf("draining %q: %v", reserved, err)
+		}
+		// The control connection doesn't derive from the draining names.
+		if _, err := connect(svc, dispatcherToken, ""); err != nil {
+			t.Errorf("draining %q refused the control connection: %v", reserved, err)
+		}
+	}
+}
+
+// A bucket user that names a static principal is refused: its inbox would
+// be that principal's.
+func TestABucketUserNamedForAStaticPrincipalIsRefused(t *testing.T) {
+	svc := newDispatcherTestService(t, renderMap(t, dispatcherEntry(), profileEntry("a", "read")), dispatcherTokens(), "dispatcher-b3")
+	if _, err := connect(svc, dispatcherToken, lib.DispatcherBucketCredential(3)); err == nil || !strings.Contains(err.Error(), "dispatcher-b3") {
+		t.Fatalf("bucket 3 with a static principal dispatcher-b3: %v", err)
+	}
+	if _, err := connect(svc, dispatcherToken, lib.DispatcherBucketCredential(4)); err != nil {
+		t.Fatalf("bucket 4 refused: %v", err)
 	}
 }
