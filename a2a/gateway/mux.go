@@ -279,6 +279,18 @@ func (m *MultiAdapter) PostPrivate(conversation, viewer, text string) error {
 	return poster.PostPrivate(conversation, viewer, text)
 }
 
+// AnswersOnLine answers for the backend that owns the conversation
+// (LineAnswerer); one that does not implement it keeps the post and the
+// terminal edit.
+func (m *MultiAdapter) AnswersOnLine(conversation string) bool {
+	a, err := m.pick(conversation)
+	if err != nil {
+		return false
+	}
+	answerer, ok := a.(LineAnswerer)
+	return ok && answerer.AnswersOnLine(conversation)
+}
+
 func (m *MultiAdapter) InboundVerified(conversation, messageID string, verified bool) {
 	if a, err := m.pick(conversation); err == nil {
 		if observer, ok := a.(VerifiedObserver); ok {

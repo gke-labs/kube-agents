@@ -302,6 +302,16 @@ func (s *sideDoorAdapter) PostPrivate(conversation, viewer, text string) error {
 	return poster.PostPrivate(conversation, viewer, text)
 }
 
+// AnswersOnLine answers for the primary's own conversations; a door keeps
+// the terminal edit, which its caller reads.
+func (s *sideDoorAdapter) AnswersOnLine(conversation string) bool {
+	if s.doorFor(conversation) != nil {
+		return false
+	}
+	answerer, ok := s.primary.(LineAnswerer)
+	return ok && answerer.AnswersOnLine(conversation)
+}
+
 func (s *sideDoorAdapter) InboundVerified(conversation, messageID string, verified bool) {
 	if s.doorFor(conversation) != nil {
 		return

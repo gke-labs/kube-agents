@@ -137,6 +137,11 @@ var requiredPermissions = []requiredPermission{
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentprofiles"}, Verbs: []string{"get", "list", "watch", "update", "patch"}},
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentprofiles/status"}, Verbs: []string{"get", "update", "patch"}},
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentprofiles/finalizers"}, Verbs: []string{"update"}},
+	// tiers: the Tier reconciler reads each tier and writes its Accepted
+	// condition (#3659). Nothing else: tiers are cluster administrators' to
+	// write.
+	{Group: "kubeagents.x-k8s.io", Resources: []string{"tiers"}, Verbs: rbacReadVerbs},
+	{Group: "kubeagents.x-k8s.io", Resources: []string{"tiers/status"}, Verbs: []string{"get", "update", "patch"}},
 	{Group: "apps", Resources: []string{"deployments", "statefulsets"}, Verbs: rbacWriteVerbs},
 	{Group: "apps", Resources: []string{"daemonsets", "replicasets"}, Verbs: rbacReadVerbs},
 	{Group: "", Resources: []string{"serviceaccounts", "persistentvolumeclaims", "configmaps", "services", "pods"}, Verbs: rbacWriteVerbs},
@@ -376,6 +381,23 @@ func AgentProfileAccessDenied(c *RBACChecker) []string {
 	var out []string
 	for _, tuple := range flattenRequiredPermissions() {
 		if tuple.resource == "agentprofiles" && slices.Contains(denied, tuple.label) {
+			out = append(out, tuple.label)
+		}
+	}
+	return out
+}
+
+// TierAccessDenied returns the boot probe's denials on tiers, as
+// AgentProfileAccessDenied does for agentprofiles: an operator image deployed
+// ahead of its ClusterRole skips the Tier controller rather than crashloop.
+func TierAccessDenied(c *RBACChecker) []string {
+	denied := c.Denied()
+	if len(denied) == 0 {
+		return nil
+	}
+	var out []string
+	for _, tuple := range flattenRequiredPermissions() {
+		if tuple.resource == "tiers" && slices.Contains(denied, tuple.label) {
 			out = append(out, tuple.label)
 		}
 	}

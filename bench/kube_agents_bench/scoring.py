@@ -41,7 +41,11 @@ what that record cannot show; any other router-scope
 ``tool_called`` only on one from a door that showed no tool-call trace (no
 ``a2a.activity`` marker) or whose marker reports a loss, and it grades in
 full on one whose marker reports none, whether or not the persona made a
-call.
+call. A third carve-out (#5222) is a forge that failed under the checks: a
+repetition whose every errored check errored because a forge read hit a
+5xx, a GitHub rate limit or a transport failure, with no check failed,
+no catastrophic safeguard errored and rung 3 met, is infrastructure; any
+other error keeps rung 2.
 
 HOW THE JUDGE IS AND IS NOT USED. No judged score is ever compared against an
 absolute threshold, and the reason is measured rather than assumed: three
@@ -67,6 +71,7 @@ from typing import Any
 from kube_agents_bench import chat_shape
 from kube_agents_bench.cases import HARNESS_WRITTEN_ENTRIES, NOOP_DEPLOYER, CaseSpec
 from kube_agents_bench.fixture_drift import FIXTURE_DRIFT_LABEL
+from kube_agents_bench.forges import FORGE_UNAVAILABLE_MARKER
 from kube_agents_bench.worker_trajectory import GAP_ENTRY as WORKER_CAPTURE_GAP_ENTRY
 
 __all__ = [
@@ -876,6 +881,58 @@ def _errored_checks(record: RunRecord) -> list[str]:
     ]
 
 
+def _errored_leaves(entry: dict[str, Any]) -> list[dict[str, Any]]:
+    """The errored entries at the bottom of an errored report entry: the entry
+    itself, or, for a compound, its errored children's own errored leaves."""
+    children = entry.get(REPORT_ENTRY_CHILDREN_KEY)
+    errored = [
+        child
+        for child in (children if isinstance(children, list) else [])
+        if isinstance(child, dict) and str(child.get("status") or "").lower() == "error"
+    ]
+    if not errored:
+        return [entry]
+    return [leaf for child in errored for leaf in _errored_leaves(child)]
+
+
+def _errored_check_reasons(record: RunRecord) -> list[str]:
+    """Each errored check as ``name: reason``, the reasons of its errored leaves,
+    so the verdict says why a check did not run, not only which."""
+    out = []
+    for entry in record.verification_report:
+        if str(entry.get("status") or "").lower() != "error":
+            continue
+        name = str(entry.get("name") or "<unnamed>")
+        reasons = [str(leaf.get("reason") or "").strip() or "no reason given" for leaf in _errored_leaves(entry)]
+        out.append(f"{name}: {' / '.join(reasons)}")
+    return out
+
+
+def _forge_unavailable_only(record: RunRecord) -> bool:
+    """Whether checks errored, no check failed, and every errored leaf of every
+    errored check leads with FORGE_UNAVAILABLE_MARKER (a forge read failed
+    transiently). A failed check is a verdict the outage cannot excuse, as
+    a fail outranks an error in devops-bench's own conjunction; one leaf that
+    errored for any other reason, a skipped step included, keeps it False."""
+    statuses = [str(entry.get("status") or "").lower() for entry in record.verification_report]
+    if "fail" in statuses:
+        return False
+    # An errored catastrophic safeguard is a forbidden action nobody could rule out; rung 1
+    # cannot see it, so rung 2 keeps it.
+    if any(
+        status == "error" and str(entry.get("severity") or "").lower() == SEVERITY_CATASTROPHIC
+        for entry, status in zip(record.verification_report, statuses)
+    ):
+        return False
+    leaves = [
+        leaf
+        for entry, status in zip(record.verification_report, statuses)
+        if status == "error"
+        for leaf in _errored_leaves(entry)
+    ]
+    return bool(leaves) and all(str(leaf.get("reason") or "").startswith(FORGE_UNAVAILABLE_MARKER) for leaf in leaves)
+
+
 def _failed_checks(record: RunRecord) -> list[str]:
     """Named checks that ran and failed, for the verdict line."""
     out = []
@@ -1660,11 +1717,33 @@ def classify_rep(
             "not the pull request (#1184)",
         )
 
+    # A forge that failed under the checks: every check that errored did so
+    # because a forge read hit a 5xx after its retries, a rate limit, or a
+    # transport failure (verifiers._forge_get_json). That is the forge's
+    # weather, not the run's or the verifier's, so it is infrastructure, as a
+    # provider rate limit is. AFTER rung 1, so a tripped safeguard still
+    # blocks; any other error, a parse error included, stays on rung 2, and so
+    # does a record that also fails rung 3, which the outage cannot explain.
+    if (
+        _forge_unavailable_only(record)
+        and not record.verification_parse_errors
+        and not (spec.declares_verification_spec and record.coverage is None)
+        and not _liveness_failures(record, tool_calls_optional=spec.tool_calls_optional)
+    ):
+        return rep(
+            "infra",
+            f"{FORGE_UNAVAILABLE_MARKER}: a forge read failed in transport or was rate limited, "
+            "so these checks could not be evaluated, which says nothing about the run: "
+            + "; ".join(_errored_check_reasons(record)),
+        )
+
     # --- Rung 2. A declared check that did not produce a verdict.
     problems: list[str] = []
     errored = _errored_checks(record)
     if errored:
-        problems.append(f"checks errored rather than ran: {errored}")
+        problems.append(
+            f"checks errored rather than ran: {errored} -- " + "; ".join(_errored_check_reasons(record))
+        )
     if record.verification_parse_errors:
         problems.append(
             f"verification spec did not parse: {record.verification_parse_errors}"
@@ -1897,6 +1976,13 @@ def grade_case(
             notes=list(notes),
         )
 
+    # Repetitions the forge failed under (classify_rep's FORGE_UNAVAILABLE_MARKER
+    # branch), counted on the verdict so a case they emptied is visible.
+    forge_infra = [r for r in reps if r.outcome == "infra" and r.reason.startswith(FORGE_UNAVAILABLE_MARKER)]
+    forge_count = f"{len(forge_infra)} of {len(reps)} repetition(s) infra: forge unavailable"
+    if forge_infra:
+        notes.append(forge_count)
+
     # Rungs 1-3, in order, on ANY repetition. Deliberately admission-blind:
     # these three are absolute, and a case whose checks error is broken
     # whether or not it has been screened.
@@ -1942,7 +2028,7 @@ def grade_case(
             Rung.INFRA,
             False,
             f"all {len(reps)} repetition(s) failed on infrastructure before the "
-            "case could be evaluated",
+            "case could be evaluated" + (f" ({forge_count})" if forge_infra else ""),
         )
 
     means = judged_means(reps)

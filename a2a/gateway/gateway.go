@@ -219,6 +219,9 @@ type Gateway struct {
 	// profiles is the AgentProfiles this gateway can address, kept from
 	// their cards on DIRECTORY (startProfileDirectory).
 	profiles *profileDirectory
+	// resolvedScope reads the scope publisher's ConfigMap (SetResolvedScope);
+	// nil when none is configured.
+	resolvedScope resolvedScopeSource
 	// relayInFlight counts the relay batches rendering (relayBatch), which a
 	// stop waits for.
 	relayInFlight inFlight

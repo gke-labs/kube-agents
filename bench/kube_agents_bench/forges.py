@@ -56,6 +56,7 @@ __all__ = [
     "FORGE_ENV_VAR",
     "FORGE_GITHUB",
     "FORGE_GITLAB",
+    "FORGE_UNAVAILABLE_MARKER",
     "GITHUB_API_ROOT",
     "GITHUB_API_ROOT_ENV_VAR",
     "GITHUB_DEFAULT_HOST",
@@ -67,6 +68,7 @@ __all__ = [
     "GITLAB_HOST_ENV_VAR",
     "GITLAB_TOKEN_ENV_VARS",
     "UnknownForge",
+    "file_token",
     "forge_name",
     "forge_ssl_context",
     "github_api_root",
@@ -89,6 +91,14 @@ FORGE_ENV_VAR = "BENCH_FORGE"
 FORGE_GITHUB = "github"
 FORGE_GITLAB = "gitlab"
 FORGES = (FORGE_GITHUB, FORGE_GITLAB)
+#: What a check's reason starts with when it could not be evaluated and every
+#: forge read of it that failed did so in a way that says nothing about the
+#: run: a 5xx after the retries, a transport failure, or, on GitHub with the
+#: CI-minted grading token (the ledger App's, which the agent cannot spend),
+#: a 429 or a 403 that says it is rate limited. The scoring ladder grades a
+#: repetition whose every errored check carries it, with no check failed and
+#: no catastrophic safeguard errored, as infrastructure.
+FORGE_UNAVAILABLE_MARKER = "KUBE_AGENTS_FORGE_UNAVAILABLE"
 
 GITHUB_API_ROOT = "https://api.github.com"
 #: The GitHub host the reply's URLs are on: github.com, or a GitHub
@@ -201,13 +211,13 @@ def read_token(forge: str, environ: Mapping[str, str] | None = None) -> str | No
     token, and an embedded newline or a non-Latin-1 character would otherwise
     raise out of the HTTP request's header instead of grading."""
     env = _env(environ)
-    token = _file_token(forge, env)
+    token = file_token(forge, env)
     if token:
         return token
     return next((v for v in (env.get(n) for n in token_env_vars(forge)) if v), None)
 
 
-def _file_token(forge: str, env: Mapping[str, str]) -> str | None:
+def file_token(forge: str, env: Mapping[str, str]) -> str | None:
     """GITHUB_TOKEN_FILE_ENV_VAR's token when it names a file holding one."""
     token_file = env.get(GITHUB_TOKEN_FILE_ENV_VAR)
     if forge == FORGE_GITLAB or not token_file:
@@ -226,7 +236,7 @@ def token_source(forge: str, environ: Mapping[str, str] | None = None) -> str:
     the file when it supplied the token, else the first variable that is set
     (the forge's first variable when none is)."""
     env = _env(environ)
-    if _file_token(forge, env):
+    if file_token(forge, env):
         return f"the token in the file {GITHUB_TOKEN_FILE_ENV_VAR} names ({env[GITHUB_TOKEN_FILE_ENV_VAR]})"
     names = token_env_vars(forge)
     name = next((n for n in names if env.get(n)), names[0])
