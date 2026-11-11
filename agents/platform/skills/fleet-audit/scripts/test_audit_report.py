@@ -23287,6 +23287,9 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
                 self.assertFalse(self.harness.forge_calls("proposal-create"))
                 body = "".join(self.harness.bodies_for("issue-*"))
                 self.assertIn("## Awaiting `/remediate`", body)
+                # The worker is told the direct ask still opens these: a task that asked
+                # for the fixes runs `remediate` rather than stopping at the ledger.
+                self.assertIn("when this task asks you to open fixes, run `remediate --finding", self.err)
                 self.assertIn(f"`{audit_report.AUTO_PROMOTE_ENV}={audit_report.AUTO_PROMOTE_OFF}`", body)
                 self.assertIn(derived_id(), body[body.index("## Awaiting `/remediate`"):])
 
@@ -38465,6 +38468,245 @@ class TestRetiredUnlistedOnClose(HarnessTestCase):
         for answer in answers:
             self.assertNotIn("no longer reproduces", answer)
         self.assertTrue(any("not confirmed fixed" in a for a in answers))
+
+
+class TestRemediateWritesTheGeneratedBudget(HarnessTestCase):
+    """A direct ask for a declared `no-pdb` finding the worker left `manual`,
+    as the SOP tells it to: `remediate` writes the PodDisruptionBudget `finish`
+    would write and opens it, instead of refusing the finding as not a
+    `manifest`. This is the only way a chat ask reaches that budget on an
+    install whose automatic sweep is off (`KUBEAGENTS_AUDIT_AUTO_PROMOTE=false`),
+    which is every eval lane since #3439."""
+
+    SELECTOR = {"matchLabels": {"app": "checkout-gateway"}}
+    DECLARATION = "clusters/prod-us-east/payments/checkout-gateway.yaml"
+    GENERATED = "clusters/prod-us-east/payments/checkout-gateway-pdb.yaml"
+    STREAM = "obtainability-audit"
+
+    def finding(self):
+        return make_finding(
+            fid="checkout-gateway",
+            check="no-pdb",
+            severity="major",
+            obj="Deployment/checkout-gateway",
+            remediation={"kind": "manual", "note": "Let finish write the budget."},
+        )
+
+    def stream_tree(self):
+        """The obtainability stream's clone; `self.workspace` is the default stream's."""
+        return self.workspace.parent.parent / self.STREAM / self.workspace.name
+
+    def fid(self):
+        return derived_id(check="no-pdb", obj="Deployment/checkout-gateway")
+
+    def manifest_file(self, **fields):
+        candidate = {
+            "check": "no-pdb",
+            "cluster": "prod-us-east",
+            "namespace": "payments",
+            "object": "Deployment/checkout-gateway",
+            "severity": "major",
+            "excerpt": "replicas=2, no PodDisruptionBudget",
+            "impact": "x",
+            "needs_triage": None,
+            "declaration": {"path": self.DECLARATION, "directory": "clusters/prod-us-east/payments"},
+            "pod_selector": self.SELECTOR,
+            **fields,
+        }
+        path = self.tmp_path / "manifest.json"
+        path.write_text(json.dumps(_full_manifest(candidates=[candidate], audit=self.STREAM)), encoding="utf-8")
+        return str(path)
+
+    def run_remediate(self, extra=()):
+        self.record_run(context=["acme/fleet"])
+        path = self.write_findings(searched_doc(findings=[self.finding()]))
+        return self.run_main(
+            ["remediate", "--audit", self.STREAM, "--findings-file", path, "--finding", self.fid(), *extra]
+        )
+
+    def test_it_writes_the_budget_beside_the_declaration_and_opens_it(self):
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
+        }
+        rc = self.run_remediate(["--manifest-file", self.manifest_file()])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["prs_opened"], ["https://github.com/acme/fleet/pull/8"])
+        self.assertEqual(self.stdout_json()["refused"], [])
+        self.assertIn("GENERATED: " + self.fid(), self.err)
+        document = pytest_yaml().safe_load((self.stream_tree() / self.GENERATED).read_text())
+        self.assertEqual(document["kind"], "PodDisruptionBudget")
+        self.assertEqual(document["metadata"], {"name": "checkout-gateway-pdb", "namespace": "payments"})
+        self.assertEqual(document["spec"], {"maxUnavailable": 1, "selector": self.SELECTOR})
+        self.assertEqual(len(self.harness.forge_calls("proposal-create")), 1)
+
+    def test_without_the_manifest_it_is_refused_and_says_to_pass_it(self):
+        self.assertEqual(self.run_remediate(), 2)
+        self.assertIn("pass the collector's --manifest-file", self.err)
+        self.assertEqual(self.harness.calls, [])
+        self.assertFalse((self.stream_tree() / self.GENERATED).exists())
+
+    def test_a_budget_the_planner_will_not_write_is_refused_with_its_reason(self):
+        self.harness.replies = {"issue-list": self.issue_list()}
+        rc = self.run_remediate(["--manifest-file", self.manifest_file(namespace_pdbs=["checkout-gateway-pdb"])])
+        self.assertEqual(rc, 2)
+        self.assertIn(f"REFUSED {self.fid()}: the namespace already has a PodDisruptionBudget", self.err)
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+        self.assertFalse((self.stream_tree() / self.GENERATED).exists())
+
+    def test_the_dry_run_says_it_would_write_the_budget_and_writes_nothing(self):
+        rc = self.run_remediate(["--dry-run", "--manifest-file", self.manifest_file()])
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn("the real run writes its PodDisruptionBudget beside " + self.DECLARATION, self.err)
+        self.assertEqual(self.harness.calls, [])
+        self.assertFalse((self.stream_tree() / self.GENERATED).exists())
+
+    WORKER_BUDGET = (
+        "apiVersion: policy/v1\nkind: PodDisruptionBudget\nmetadata:\n"
+        "  name: checkout-gateway-pdb\n  namespace: payments\nspec:\n  maxUnavailable: 1\n"
+    )
+
+    def run_over_declaration(self, extra=()):
+        """The worker wrote its budget over the Deployment's own file, under the
+        conventional `<workload>-pdb` name, and named that file as the fix."""
+        # An existing clone (it has `.git`), so `ensure_workspace` reuses it and the
+        # worker's file is still there when the name search runs; a first clone would
+        # remove it, and the test could not tell `probe.ignored` from its absence.
+        (self.stream_tree() / ".git").mkdir(parents=True, exist_ok=True)
+        declaration = self.stream_tree() / self.DECLARATION
+        declaration.parent.mkdir(parents=True, exist_ok=True)
+        declaration.write_text(self.WORKER_BUDGET, encoding="utf-8")
+        finding = self.finding()
+        finding["remediation"] = {"kind": "manifest", "path": self.DECLARATION, "note": "x"}
+        self.record_run(context=["acme/fleet"])
+        path = self.write_findings(searched_doc(findings=[finding]))
+        return self.run_main(
+            ["remediate", "--audit", self.STREAM, "--findings-file", path, "--finding", self.fid(),
+             "--manifest-file", self.manifest_file(), *extra]
+        )
+
+    def test_a_budget_named_over_the_declaration_is_written_beside_it(self):
+        """A merge of the worker's file would replace the workload, so it is
+        demoted and the budget written beside, as `finish` does. The name search
+        reads past the worker's file, which names nothing the repository holds."""
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/9"),
+        }
+        rc = self.run_over_declaration()
+        self.assertEqual(rc, 0, self.err)
+        self.assertNotIn("already names an object", self.err)
+        self.assertIn("the budget is planned beside it instead", self.err)
+        self.assertEqual(self.stdout_json()["prs_opened"], ["https://github.com/acme/fleet/pull/9"])
+        self.assertTrue((self.stream_tree() / self.GENERATED).is_file())
+        # The worker's file was there for the name search, so `probe.ignored` was what let it pass.
+        self.assertEqual((self.stream_tree() / self.DECLARATION).read_text(), self.WORKER_BUDGET)
+
+    def test_the_dry_run_says_so_for_a_budget_over_the_declaration(self):
+        rc = self.run_over_declaration(["--dry-run"])
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn("DRY RUN: " + self.fid() + " names its PodDisruptionBudget", self.err)
+        self.assertNotIn("the budget is planned beside it instead", self.err)
+        self.assertFalse((self.stream_tree() / self.GENERATED).exists())
+
+    def test_a_withheld_selector_over_the_declaration_is_not_announced_as_written(self):
+        self.manifest_file = lambda real=self.manifest_file: real(pod_selector_withheld="other pods match")
+        self.assertEqual(self.run_over_declaration(), 2)
+        self.assertNotIn("beside it instead", self.err)
+
+    def human_closed_own_branch(self):
+        branch = audit_report.group_branch_for(
+            self.STREAM, [{"id": self.fid(), "remediation": {"kind": "manifest", "path": self.GENERATED}}]
+        )
+        return proposals_view(
+            [
+                {
+                    **pr(8, branch, state="CLOSED", body=audit_report.delta_block([self.fid()])),
+                    "closedAt": "2026-07-15T00:00:00Z",
+                    "labels": [],
+                }
+            ]
+        )
+
+    def test_a_human_close_on_the_budgets_own_branch_is_superseded(self):
+        self.harness.replies = {"issue-list": self.issue_list(), "proposal-list": self.human_closed_own_branch()}
+        rc = self.run_remediate(["--manifest-file", self.manifest_file()])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["superseded"], [self.fid()])
+        self.assertEqual(self.stdout_json()["refused"], [])
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+
+    def test_the_override_flag_revives_a_human_closed_budget(self):
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "proposal-list": self.human_closed_own_branch(),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/10"),
+        }
+        rc = self.run_remediate(["--manifest-file", self.manifest_file(), "--override-human-close"])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["superseded"], [])
+        self.assertEqual(self.stdout_json()["prs_opened"], ["https://github.com/acme/fleet/pull/10"], self.err)
+
+    def test_a_withheld_selector_is_not_planned(self):
+        manifest = json.loads(pathlib.Path(self.manifest_file(pod_selector_withheld="other pods match")).read_text())
+        self.assertEqual(audit_report.requested_generated_fixes([self.finding()], manifest, [self.fid()]), {})
+
+    def test_a_refusal_names_what_the_collector_did_not_find(self):
+        """A direct ask refused as not a `manifest` says why the budget is not written."""
+        cases = {
+            "no declaration": ({"declaration": None}, "candidate for it carries no `declaration`"),
+            "withheld selector": ({"pod_selector_withheld": "other pods match"}, "withheld the workload's selector: other pods match"),
+            "no candidate": ({"object": "Deployment/other"}, "has no no-pdb candidate for"),
+        }
+        for name, (fields, phrase) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(self.run_remediate(["--manifest-file", self.manifest_file(**fields)]), 2)
+                self.assertIn(phrase, self.err)
+                self.assertEqual(self.harness.calls, [])
+
+    def budget_pr(self, branch, state="OPEN"):
+        return proposals_view([{**pr(21, branch, state=state, body=audit_report.delta_block([self.fid()])), "labels": []}])
+
+    def own_branch(self):
+        return audit_report.group_branch_for(
+            self.STREAM, [{"id": self.fid(), "remediation": {"kind": "manifest", "path": self.GENERATED}}]
+        )
+
+    def test_a_rerun_meeting_its_own_open_pull_request_reports_it_already_open(self):
+        self.harness.replies = {"issue-list": self.issue_list(), "proposal-list": self.budget_pr(self.own_branch())}
+        self.assertEqual(self.run_remediate(["--manifest-file", self.manifest_file()]), 0, self.err)
+        self.assertEqual(self.stdout_json()["already_open"], [self.fid()])
+        self.assertEqual(self.stdout_json()["prs_opened"], [])
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+
+    def test_a_pull_request_on_another_branch_carrying_the_finding_answers_it(self):
+        self.harness.replies = {"issue-list": self.issue_list(), "proposal-list": self.budget_pr("someone/their-budget")}
+        self.assertEqual(self.run_remediate(["--manifest-file", self.manifest_file()]), 2)
+        self.assertIn("already carries it", self.err)
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+
+    def test_a_budget_already_in_the_repository_reads_as_already_fixed(self):
+        (self.stream_tree() / ".git").mkdir(parents=True, exist_ok=True)
+        existing = self.stream_tree() / self.GENERATED
+        existing.parent.mkdir(parents=True, exist_ok=True)
+        existing.write_text("kind: PodDisruptionBudget\n", encoding="utf-8")
+        self.harness.replies = {"issue-list": self.issue_list()}
+        self.assertEqual(self.run_remediate(["--manifest-file", self.manifest_file()]), 2)
+        self.assertIn(f"REFUSED {self.fid()}: already fixed: {self.GENERATED} exists", self.err)
+
+    def test_only_named_findings_are_planned(self):
+        named, other = self.finding(), self.finding()
+        other["object"] = "Deployment/other"
+        manifest = json.loads(pathlib.Path(self.manifest_file()).read_text())
+        fixes = audit_report.requested_generated_fixes([named, other], manifest, [str(named["id"])])
+        self.assertEqual(list(fixes), [str(named["id"])])
+
+    def test_a_manifest_finding_is_untouched_by_the_planner(self):
+        """Only a `manual` finding is planned; a worker-written file is opened as written."""
+        finding = self.finding()
+        finding["remediation"] = {"kind": "manifest", "path": "clusters/prod-us-east/payments/own-pdb.yaml", "note": "x"}
+        manifest = json.loads(pathlib.Path(self.manifest_file()).read_text())
+        self.assertEqual(audit_report.requested_generated_fixes([finding], manifest, [str(finding["id"])]), {})
 
 
 if __name__ == "__main__":

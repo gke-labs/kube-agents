@@ -21,7 +21,9 @@ One open issue per workflow at a time, found by a hidden marker in its body
 rather than by title. The body names the stage (the failing job that
 completed last, leaving aside the compensation and non-gating jobs named in
 `COMPENSATION_JOB_MARKERS` unless nothing else failed), the step inside it,
-the candidate the run tested, the first failure line the job's log shows,
+the candidate the run tested, the step that failed with a pointer at its
+log (the issue is public, so it never quotes the log line itself; the Chat
+line, which is internal, does),
 and the runs of the current streak; hidden stamps list the
 run ids the body already reflects and the stage that failed, so handling a
 run twice writes nothing. An issue a person closed while the pipeline was
@@ -68,6 +70,11 @@ with the candidate unknown rather than left unreported. The first failure
 line is read from the failing step's slice of the log, by the timestamps
 every log line carries, before the whole log: a pytest summary line first,
 then the runner's `##[error]` annotation, then a script's own error line.
+That line goes to Chat only. The issue is public, and a public post names
+the failing stage or step and where its record is, never the reason text
+(.agents/rules/public_surfaces.md): no word list can say in advance which
+lines name a model, a count or a verdict, so the issue's first-failure cell
+names the step and points at the job log, whatever the line says.
 
 A sweep rather than a `workflow_run` trigger. Posting to Chat needs
 `id-token: write` to mint the token, and `tests/conformance/test_B_write_path.py`
@@ -307,6 +314,12 @@ _FAILURE_LINE_RES = (
     re.compile(r"^.*(?:❌|ERROR:).*$"),
     re.compile(r"^##\[error\].*$"),
 )
+# What the issue body and its comments say in place of the first failure
+# line: the issue is public, and a public post names the failing stage or
+# step and where its record is, never the reason text
+# (.agents/rules/public_surfaces.md). The line itself is read for the Chat
+# message, which is internal; the Stage cell and the Run row keep the links.
+FIRST_FAILURE_PUBLIC = "see the job log"
 
 CHAT_BROKEN = "🔴 *Release pipeline: {workflow} failed* — {stage}: {failure}"
 # Chat parses the text for paired `*`, `_`, `~` and backticks; a failure line
@@ -708,11 +721,13 @@ def _inline(text: str) -> str:
 
 
 def failure_text(details: dict) -> str:
-    if details.get("failure"):
-        return f"`{_inline(details['failure'])}`"
+    """The first-failure cell of the issue body and its comments: the failing
+    step by name, when the log named one, and a pointer at the job log; never
+    the log line, whatever it says (FIRST_FAILURE_PUBLIC). The Chat line
+    reads `details["failure"]` itself."""
     if details.get("step"):
-        return f"step `{_inline(details['step'])}` failed; the log has no failure line this reads"
-    return "no failure line found; read the run"
+        return f"step `{_inline(details['step'])}` failed; {FIRST_FAILURE_PUBLIC}"
+    return FIRST_FAILURE_PUBLIC
 
 
 def stage_text(details: dict) -> str:
