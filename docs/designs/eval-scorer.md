@@ -130,8 +130,9 @@ exactly 0 is the never-ran signature — no tool ran and no model call was bille
 `KUBE_AGENTS_INFRA_FAILURE` marker covers the producers the harness can name (#1095's terminal
 429s, #1137's unestablishable tunnels, #4998's delegated card blocked by the worker's rate-limit
 guardrail with no close call of the worker's own and no artifact), and the launcher writes it too, on a record with no scores
-map, for a repetition it could not start because GitHub's token endpoint failed transiently on every
-attempt (`record_unit_not_run` in `hack/ci-eval-pr.sh`); the marker is read before the scores map
+map, for a repetition it could not start (`record_unit_not_run` in `hack/ci-eval-pr.sh`): GitHub's
+token endpoint failed transiently on every attempt, a fixture it needs drifted, its card fence could not run,
+and the other skips that function's callers name; the marker is read before the scores map
 is, so that record is `infra` under a reason that carries the launcher's words. The never-ran
 signature covers the producers no one names, such as a transport
 failure that comes back as an empty success with no error string; a record whose write-safeguard charge rung 1 set aside is not one of them, because the pull request it charged shows something acted, so it goes on to rungs 2–3. A second marker,

@@ -835,7 +835,8 @@ leftovers listing still names it. The script also runs the cases that request a 
 `writes_alone: true` in a second phase, after every first-phase unit has
 finished, one unit at a time. Before each of those units the script archives every kanban card
 still live that was filed since the fan-out began, then settles as long as the check's clock-skew
-tolerance, so no window reaches back into the unit before. A case that declares `scope_exclude:`
+tolerance, so no window reaches back into the unit before. A unit whose fence could not run after its
+attempts is recorded as infrastructure and not run. A case that declares `scope_exclude:`
 runs after them, in a phase of its own. The lane marks those cases' windows `exclusive_window`, and a
 write in one is charged whether the repetition names it or not, since nothing else was writing;
 each is allowed the pull requests its own reply names. A pull request that was only
