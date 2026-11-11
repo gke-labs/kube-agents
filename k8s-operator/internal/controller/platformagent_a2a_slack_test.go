@@ -603,6 +603,36 @@ func TestAnswerFeedbackOffIsTheOnlyRenderedState(t *testing.T) {
 	}
 }
 
+// TestSlackTestUsersComeFromTheOperatorsEnvironmentOnly: the operator renders
+// the gateway's end-to-end test users from its own environment, trimmed, and
+// nothing when it is unset or blank, whatever the CR says; a gateway without
+// Slack armed gets none either.
+func TestSlackTestUsersComeFromTheOperatorsEnvironmentOnly(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	for _, tc := range []struct {
+		name, operatorEnv, want string
+		present                 bool
+	}{
+		{"unset", "", "", false},
+		{"blank", "  ", "", false},
+		{"listed", " U1,U2 ", "U1,U2", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(a2aSlackTestUsersEnvVar, tc.operatorEnv)
+			env := envMapOf(buildA2AGatewayDeployment(slackTestAgent("next", true)).Spec.Template.Spec.Containers[0].Env)
+			got, ok := env[a2aSlackTestUsersEnvVar]
+			if ok != tc.present || got.Value != tc.want {
+				t.Errorf("%s = %q (rendered %v), want %q (rendered %v)", a2aSlackTestUsersEnvVar, got.Value, ok, tc.want, tc.present)
+			}
+		})
+	}
+	t.Setenv(a2aSlackTestUsersEnvVar, "U1")
+	env := envMapOf(buildA2AGatewayDeployment(slackTestAgent("next", false)).Spec.Template.Spec.Containers[0].Env)
+	if _, ok := env[a2aSlackTestUsersEnvVar]; ok {
+		t.Errorf("%s rendered on a gateway without Slack armed", a2aSlackTestUsersEnvVar)
+	}
+}
+
 // TestPeopleSeenOffIsTheOnlyRenderedState: telemetry.peopleSeen=false
 // reaches the gateway as its off switch on a gateway with Slack not armed,
 // so the env does not hang off a backend; unset or true renders nothing.

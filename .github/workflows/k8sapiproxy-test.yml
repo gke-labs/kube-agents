@@ -13,6 +13,12 @@ name: k8s-api-proxy Tests
 # main-broken-notify.yml read the push history. Keep the `paths:` list and the
 # `k8sapiproxy:` filter below identical; tests/test_push_paths_match_change_filter.py
 # fails when they differ.
+#
+# gosec runs here, inside the required check, for the reason the header of
+# k8s-operator-test.yml gives. This module declares no gosec of its own, so the
+# binary is built from k8s-operator/go.mod's pin, which makes that module's
+# go.mod and go.sum inputs of this check: a gosec bump there runs it here,
+# instead of leaving a new finding for the next proxy pull request to inherit.
 on:
   pull_request:
     branches: [main, "release/**"]
@@ -22,6 +28,8 @@ on:
     branches: [main]
     paths:
       - "k8s-api-proxy/**"
+      - "k8s-operator/go.mod"
+      - "k8s-operator/go.sum"
       - ".github/workflows/k8sapiproxy-test.yml"
   workflow_dispatch:
 
@@ -64,6 +72,8 @@ jobs:
           filters: |
             k8sapiproxy:
               - "k8s-api-proxy/**"
+              - "k8s-operator/go.mod"
+              - "k8s-operator/go.sum"
               - ".github/workflows/k8sapiproxy-test.yml"
 
       - name: Set up Go
@@ -71,7 +81,10 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: "k8s-api-proxy/go.mod"
-          cache-dependency-path: "k8s-api-proxy/go.sum"
+          # Both modules: the gosec step below builds from the operator's.
+          cache-dependency-path: |
+            k8s-api-proxy/go.sum
+            k8s-operator/go.sum
 
       - name: Check formatting
         if: steps.filter.outputs.k8sapiproxy == 'true'
@@ -80,6 +93,14 @@ jobs:
       - name: Vet
         if: steps.filter.outputs.k8sapiproxy == 'true'
         run: go vet ./...
+
+      # No exclusions: the G703/G706 reasoning in k8s-operator-test.yml is
+      # about the operator's argv, not this module's.
+      - name: Run gosec
+        if: steps.filter.outputs.k8sapiproxy == 'true'
+        run: |
+          go -C ../k8s-operator build -o "$RUNNER_TEMP/gosec" github.com/securego/gosec/v2/cmd/gosec
+          "$RUNNER_TEMP/gosec" ./...
 
       - name: Test
         if: steps.filter.outputs.k8sapiproxy == 'true'

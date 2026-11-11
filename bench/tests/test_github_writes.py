@@ -1008,6 +1008,74 @@ def test_a_listing_the_forge_failed_marks_the_error(env, github, monkeypatch, tm
     assert res.reason.startswith(forges.FORGE_UNAVAILABLE_MARKER) is marked
 
 
+def test_a_handled_404_does_not_keep_a_later_outage_on_rung_2(env, github, monkeypatch, tmp_path):
+    """#5346: #38's pull page is not there, which the check reads as "not
+    there"; the branch listing's outage after it still marks the error."""
+    (tmp_path / "ledger-token").write_text("ghs_fake\n")
+    monkeypatch.setenv(forges.GITHUB_TOKEN_FILE_ENV_VAR, str(tmp_path / "ledger-token"))
+    stash()
+    route_listing(github, "pulls-unrequested.json")
+    github.routes[f"{API}/pulls/38"] = (404, {"message": "Not Found"})
+    github.routes[REFS_LISTING] = (503, {"message": "Service Unavailable"})
+    res = check().verify(5.0)
+    assert res.status == "error"
+    assert res.reason.startswith(forges.FORGE_UNAVAILABLE_MARKER)
+
+
+@pytest.mark.parametrize("status", [403, 404])
+def test_a_branch_listing_or_tip_it_cannot_read_leaves_the_decision(env, github, status):
+    """#5346: the branch listing and a branch tip answered 403 or 404 are read
+    as "will not say", a note, so their reads are not behind any error."""
+    github.routes[REFS_LISTING] = (status, {"message": "x"})
+    github.routes[f"{API}/branches/platform-agent%2Ffix"] = (status, {"message": "x"})
+    client = github_writes.client_for(forges.FORGE_GITHUB, "ghs_fake", verifiers._forge_get_json, 5.0)
+    seen: list[tuple[bool, str]] = []
+    token = verifiers._forge_unavailable.set(seen)
+    try:
+        assert client.branches_under(REPO, "platform-agent/") is None
+        assert client.branch_tip_date(REPO, "platform-agent/fix") is None
+    finally:
+        verifiers._forge_unavailable.reset(token)
+    assert seen == []
+
+
+def test_a_head_commit_page_that_is_not_there_leaves_the_decision(env, github):
+    """#5346: #38's pull object answers, its commit page is not there: a note."""
+    github.routes[f"{API}/pulls/38"] = (200, fixture("pull-38.json"))
+    github.routes[f"{API}/pulls/38/commits?per_page=100&page=1"] = (404, {"message": "Not Found"})
+    client = github_writes.client_for(forges.FORGE_GITHUB, "ghs_fake", verifiers._forge_get_json, 5.0)
+    seen: list[tuple[bool, str]] = []
+    token = verifiers._forge_unavailable.set(seen)
+    try:
+        assert client.head_commit_date(REPO, 38) is None
+    finally:
+        verifiers._forge_unavailable.reset(token)
+    assert seen == []
+
+
+def test_gitlab_answers_it_cannot_give_leave_the_decision(github, monkeypatch):
+    """#5346, GitLab's client: a merge request or head commit not there (404),
+    and a branch listing (403) or tip (404) it will not give, are notes."""
+    monkeypatch.setenv(forges.FORGE_ENV_VAR, forges.FORGE_GITLAB)
+    client = github_writes.client_for(forges.FORGE_GITLAB, "glpat-fake", verifiers._forge_get_json, 5.0)
+    project = forges.gitlab_api_root() + client.project_path("example-group/infra")
+    github.routes[f"{project}/repository/branches?search=%5Eplatform-agent%2F&per_page=100&page=1"] = (
+        403, {"message": "403 Forbidden"},
+    )
+    github.routes[f"{project}/merge_requests/3"] = (200, {"sha": "c" * 40})
+    seen: list[tuple[bool, str]] = []
+    token = verifiers._forge_unavailable.set(seen)
+    try:
+        assert client.head_commit_date("example-group/infra", 4) is None  # the merge request: 404
+        assert client.head_commit_date("example-group/infra", 3) is None  # its head commit: 404
+        assert client.branches_under("example-group/infra", "platform-agent/") is None
+        assert client.branch_tip_date("example-group/infra", "platform-agent/fix") is None
+    finally:
+        verifiers._forge_unavailable.reset(token)
+    assert seen == []
+    assert len(github.calls) == 5
+
+
 def test_a_listing_that_is_not_a_list_is_an_error(env, github):
     stash()
     github.routes[WINDOWED_LISTING] = (200, {"message": "odd"})

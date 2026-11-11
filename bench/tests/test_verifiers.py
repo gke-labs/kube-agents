@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import http.client
 import io
+import importlib.util
 import json
 import os
 import re
@@ -49,6 +50,7 @@ import urllib.error
 from datetime import datetime, timezone
 import sys
 from pathlib import Path
+
 from unittest import mock
 
 import pytest
@@ -895,6 +897,123 @@ def test_worker_commands_exempt_command_does_not_satisfy_a_required_pattern():
     res = v.verify(5.0)
     assert res.status == "fail" and not res.success
     assert "across 0 command(s) (1 exempted)" in res.reason
+
+
+# The pod stores each typed terminal call through ``worker_trajectory``'s scrub (the audit
+# redactor, then ``worker_transcript.scrub_step_text``) before it reaches the trajectory, so
+# the tests store their calls the same way.
+def _pod_module(name: str, *parts: str):
+    spec = importlib.util.spec_from_file_location(name, Path(__file__).resolve().parents[2].joinpath(*parts))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_REDACTOR = _pod_module("kube_agents_audit_redactor_for_tests", "agents", "chat", "defaults", "plugins", "common", "redactor.py").AuditRedactor
+_TRANSCRIPT = _pod_module("worker_transcript_for_tests", "agents", "platform", "scripts", "worker_transcript.py")
+
+
+def _stored(command: str) -> str:
+    return json.loads(_TRANSCRIPT.scrub_step_text(_REDACTOR, "tool_call", json.dumps({"command": command}), "withheld"))["command"]
+
+
+def _grep_cut_status(rows: list[str], typed: list[str], card: str | None = "t_1", clipped: bool = False) -> str:
+    """The verdict of a grep-cut check whose forbidden word is ``route``, on one card's rows
+    and typed calls; ``card=None`` stashes the rows with no card, as an older capture did,
+    and ``clipped`` sends each call as the pod sends one whose arguments it clipped."""
+    calls = [
+        {
+            "agent": "w",
+            "name": "terminal",
+            "task": "t_1",
+            "args": {"raw": json.dumps({"command": c})[:-2] + " ...[clipped 9 chars]"} if clipped else {"command": _stored(c)},
+            "at": float(i),
+        }
+        for i, c in enumerate(typed)
+    ]
+    transcript.set("", calls, worker_commands=[{"task": card, "command": r} if card else {"command": r} for r in rows])
+    try:
+        res = WorkerCommandsVerifier(type="worker_commands", forbidden_patterns=["route"], exempt_grep_patterns=True).verify(5.0)
+    finally:
+        transcript.clear()
+    return res.status
+
+
+def test_worker_commands_grep_cut_grades_the_rows_of_a_card_with_a_multi_line_call_whole():
+    # The row joins a typed newline into a space, so a dangling grep's pattern
+    # slot can hold the next line's first word (#5237). Every spelling that got
+    # past a comparison of first words stays graded whole: a quote that spans
+    # lines, a leading redirection, a dangling value option, a redaction mark,
+    # and rows that name no card.
+    row = "grep -rn route=1 curl x"
+    assert _grep_cut_status([row], []) == "pass"
+    for rows, typed in (
+        ([row], "grep -rn\nroute=1\ncurl x"),
+        ([row], "grep -rn\n   route=1 curl x"),
+        (['grep -rn "route =1" curl x'], 'grep -rn\n"route   =1"\ncurl x'),
+        ([row], "grep -rn\n> /dev/null route=1\ncurl x"),
+        ([row], "grep -rn\n2>&1 route=1\ncurl x"),
+        (['grep -rn route=1 X=" " curl x'], 'grep -rn\nroute=1 X="\n"\ncurl x'),
+        (["grep -rn -m curl route x"], "grep -rn -m\ncurl route x"),
+        (["grep -rn U=http://u:pw@route curl x"], "grep -rn\nU=http://u:pw@route\ncurl x"),
+    ):
+        assert _grep_cut_status(rows, [typed]) == "fail", typed
+    assert _grep_cut_status([row], ["grep -rn\nroute=1\ncurl x"], card=None) == "fail"
+
+
+def test_worker_commands_grep_cut_refuses_the_rows_of_a_card_with_an_unread_call():
+    # A clip keeps a call's head, so the lines that would show the join may be
+    # gone: the card's grep rows are graded whole.
+    assert _grep_cut_status(["grep -rn route f"], ["grep -rn route f"], clipped=True) == "fail"
+    assert _grep_cut_status(["grep -rn route f"], ["grep -rn route f"], card=None, clipped=True) == "fail"
+    # The pod's scrub stores an escaped backslash at a line end as an escaped
+    # space, so a backslash before a blank may hide a line break: its card's
+    # grep rows are graded whole, an honest escaped space included.
+    assert _grep_cut_status(["grep -rn\\\\ route=1 curl x"], ["grep -rn\\\\\nroute=1\ncurl x"]) == "fail"
+    assert _grep_cut_status(["grep -rn X=\\ route=1 curl x"], ["grep -rn\nX=\\  route=1\ncurl x"]) == "fail"
+    assert _grep_cut_status(["grep -rn route f"], ["grep -rn route f", "ls my\\ file"]) == "fail"
+    assert _grep_cut_status(["grep -rn route f"], ["grep -rn route f", "ls my\\\tfile"]) == "fail"
+    # A call the shell reader cannot split has no lines to read either.
+    assert _grep_cut_status(["grep -rn route f"], ["grep -rn route f", "cat <<EOF\ndon't\nEOF"]) == "fail"
+
+
+def test_worker_commands_grep_cut_reads_no_execute_code_program_as_shell():
+    # An ``execute_code`` program is Python, so its quotes say nothing about
+    # the card's shell lines.
+    calls = [
+        {"agent": "w", "name": "terminal", "task": "t_1", "args": {"command": "grep -rn route f"}, "at": 0.0},
+        {"agent": "w", "name": "execute_code", "task": "t_1", "args": {"code": "msg = 'can\\'t parse'\nprint(msg)"}, "at": 1.0},
+    ]
+    transcript.set("", calls, worker_commands=[{"task": "t_1", "command": "grep -rn route f"}])
+    try:
+        res = WorkerCommandsVerifier(type="worker_commands", forbidden_patterns=["route"], exempt_grep_patterns=True).verify(5.0)
+    finally:
+        transcript.clear()
+    assert res.status == "pass", res.reason
+
+
+def test_worker_commands_grep_cut_keeps_the_rows_of_a_card_whose_calls_are_one_line():
+    # A grep typed on one line, piped to a pager the row drops, or continued
+    # with a backslash (the pod folds the continuation) keeps the cut.
+    for typed in ("grep -rn route f", "grep -rn route f | head -20", "grep -rn \\\nroute f", "grep -rn route f\n"):
+        assert _grep_cut_status(["grep -rn route f"], [typed]) == "pass", typed
+    # Rows that name no card, beside one-line calls only, are cut too.
+    assert _grep_cut_status(["grep -rn route f"], ["grep -rn route f"], card=None) == "pass"
+
+
+def test_worker_commands_grep_cut_grades_a_multi_line_card_whole():
+    # Any multi-line call on the card grades its grep rows whole, whatever the
+    # next line starts with: a glob, a clobber redirect, an escaped blank. An
+    # honest multi-line call on the card is a spurious red the same way.
+    for typed in (
+        "grep\n***/route list",
+        "grep -rn\n>| /dev/null route=1\ncurl x",
+        "grep -rn\nX=\\\t route=1\ncurl x",
+        "grep -rn route f\nls",
+    ):
+        row = " ".join(typed.split())
+        assert _grep_cut_status([row], [typed]) == "fail", typed
 
 
 def test_worker_commands_is_registered_under_its_type():
@@ -6938,6 +7057,69 @@ def test_a_rate_limit_is_noted_only_under_the_ci_grading_token_on_github(monkeyp
     assert seen == [(noted, "answered 429")]
 
 
+def test_a_handled_issues_404_does_not_keep_a_later_outage_on_rung_2(minted_token, github):
+    """_resolve falls back from /issues to /pulls on a 404; the 404 is a route."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (404, {"message": "Not Found"})
+    github.routes[_pr_api("pulls")] = (503, {"message": "Service Unavailable"})
+    res = _pr_check().verify(5.0)
+    assert res.status == "error"
+    assert res.reason.startswith(forges.FORGE_UNAVAILABLE_MARKER)
+
+
+def test_an_absent_commits_page_does_not_keep_a_later_outage_on_rung_2(minted_token, github):
+    """_head_push reads a 404 commits page as "dates nothing"; the closed-head
+    listing's outage after it still marks the error."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github)
+    github.routes[_commits_of()] = (404, {"message": "Not Found"})
+    github.routes[_closed_from()] = (503, {"message": "Service Unavailable"})
+    res = _pr_check(reuses_spent_branch=True).verify(5.0)
+    assert _commits_of() in [url for url, _ in github.calls]
+    assert res.status == "error"
+    assert res.reason.startswith(forges.FORGE_UNAVAILABLE_MARKER)
+
+
+def _three_pr_reply():
+    return "Opened " + ", ".join(_PR_URL.replace("/7", f"/{n}") for n in (5, 6, 7))
+
+
+def test_a_rejected_candidate_drops_only_its_own_reads(minted_token, github):
+    """#5 is unevaluable on a malformed answer (a plain entry), #6 is rejected
+    on a 404, #7 hits a 503. #6's rejection must not take #5's entry with it,
+    so the error stays plain."""
+    _stash_pr_report(final_message=_three_pr_reply())
+    github.routes[_pr_api(number=5)] = (200, ["not", "an", "object"])
+    github.routes[_pr_api("pulls", number=5)] = (200, ["not", "an", "object"])
+    github.routes[_pr_api(number=7)] = (503, {"message": "Service Unavailable"})
+    res = _pr_check().verify(5.0)
+    assert res.status == "error"
+    assert forges.FORGE_UNAVAILABLE_MARKER not in res.reason
+
+
+def test_a_rejected_404_candidate_does_not_keep_a_later_outage_on_rung_2(minted_token, github):
+    _stash_pr_report(final_message="Opened " + _PR_URL.replace("/7", "/6") + " and " + _PR_URL)
+    github.routes[_pr_api()] = (503, {"message": "Service Unavailable"})
+    res = _pr_check().verify(5.0)
+    assert res.status == "error"
+    assert res.reason.startswith(forges.FORGE_UNAVAILABLE_MARKER)
+
+
+def test_a_handled_404_is_dropped_only_for_its_own_read():
+    """handled() takes the entry of the read just made, and only a plain one."""
+    seen = [(True, "answered 503")]
+    token = verifiers._forge_unavailable.set(seen)
+    try:
+        verifiers._forge_read_handled(404)
+        assert seen == [(True, "answered 503")]
+        seen.append((False, "answered 404"))
+        verifiers._forge_read_handled(404)
+        assert seen == [(True, "answered 503")]
+    finally:
+        verifiers._forge_unavailable.reset(token)
+
+
 def test_the_commit_page_the_head_date_read_is_not_read_again(token, github):
     """`_head_push` already read the whole listing of a one-page proposal to
     date its head; the revision clause reuses it."""
@@ -11002,6 +11184,44 @@ def test_issue_state_an_earlier_candidates_outage_does_not_excuse_a_malformed_an
     else:
         github.routes[_ticket_api(709)] = (200, _ticket() | {"number": 709})
         github.routes[_ticket_comments_api(709)] = (200, {"message": "not a list"})
+    res = _state_check().verify(5.0)
+    assert res.status == "error"
+    assert forges.FORGE_UNAVAILABLE_MARKER not in res.reason
+
+
+# #5346: a read the check handled, or a candidate it rejected, leaves the
+# forge-unavailable decision, so a later outage on the read that errors is
+# marked. A rejection beside a transient read keeps the error plain.
+
+
+def test_ledger_a_rejected_404_candidate_does_not_keep_a_later_outage_on_rung_2(token, github):
+    _stash_report(final_message=f"Ledger: {_LEDGER_URL.replace('/42', '/41')} and {_LEDGER_URL}")
+    github.routes[_api(41)] = (404, {"message": "Not Found"})
+    github.routes[_api()] = (503, {"message": "Service Unavailable"})
+    res = _ledger_check(required_phrases=["debug-binding"]).verify(5.0)
+    assert res.status == "error"
+    assert res.reason.startswith(forges.FORGE_UNAVAILABLE_MARKER)
+
+
+def test_issue_state_a_rejected_candidate_does_not_keep_a_later_outage_on_rung_2(token, gitops_repo, github):
+    _stash_report(final_message=_two_ticket_reply())
+    github.routes[_ticket_api()] = (404, {"message": "Not Found"})
+    github.routes[_ticket_api(709)] = (503, {"message": "Service Unavailable"})
+    res = _state_check().verify(5.0)
+    assert res.status == "error"
+    assert res.reason.startswith(forges.FORGE_UNAVAILABLE_MARKER)
+
+
+def test_issue_state_a_candidate_rejected_beside_a_transient_read_keeps_the_error_plain(
+    token, gitops_repo, github
+):
+    """#708 is rejected on its state while its comment read answered 503: the
+    code cannot tell that rejection from an outage, so its reads stay, and
+    #709's outage does not mark the error."""
+    _stash_report(final_message=_two_ticket_reply())
+    github.routes[_ticket_api()] = (200, _ticket(state="open", labels=("status:in-progress",)))
+    github.routes[_ticket_comments_api()] = (503, {"message": "Service Unavailable"})
+    github.routes[_ticket_api(709)] = (503, {"message": "Service Unavailable"})
     res = _state_check().verify(5.0)
     assert res.status == "error"
     assert forges.FORGE_UNAVAILABLE_MARKER not in res.reason

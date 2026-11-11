@@ -302,6 +302,27 @@ class RepKinds(unittest.TestCase):
         self.assertEqual((r.storm_reps, r.total_reps), (0, 3))
 
 
+    def test_the_forge_marker_is_the_bench_modules(self):
+        module = SCORER.parent / "forges.py"
+        marker = next(
+            line.split("=", 1)[1].strip().strip('"')
+            for line in module.read_text(encoding="utf-8").splitlines()
+            if line.startswith("FORGE_UNAVAILABLE_MARKER = ")
+        )
+        self.assertEqual(health.FORGE_UNAVAILABLE_MARKER, marker)
+
+    def test_forge_reps_are_neither_graded_nor_storms(self):
+        forge = {"result": "infra", "reason": f"{health.FORGE_UNAVAILABLE_MARKER}: a forge read failed in transport or was rate limited, so these checks could not be evaluated, which says nothing about the run: a-check: answered 503"}
+        self.assertEqual(health.rep_kind(forge), "forge")
+        self.assertEqual(health.rep_kind({"result": "infra", "reason": f"{RETRIES} {health.FORGE_UNAVAILABLE_MARKER}"}), "storm", "the marker must lead")
+        reps = [dict(forge, n=i + 1) for i in range(3)]
+        t = health.Task({"name": "x", "result": "infra", "reps": reps})
+        self.assertEqual((t.passes, t.fails, t.storms, t.forges, t.graded), (0, 0, 0, 3, 0))
+        self.assertFalse(t.collapsed)
+        r = health.Run({"build_id": "1", "pr": 1, "result": "SUCCESS", "tasks": [{"name": "x", "result": "infra", "reps": reps}]})
+        self.assertEqual((r.storm_reps, r.total_reps), (0, 3), "out of the storm signature, in the run's total")
+
+
 # --------------------------------------------------------------------------- #
 # Rule 1: shared break
 # --------------------------------------------------------------------------- #
