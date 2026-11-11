@@ -1476,7 +1476,8 @@ platformAgent:
       # pods are given its address, and a change between 0 and a positive value
       # restarts the shell sandbox and the profile warm pools (and the A2A
       # gateway under the cluster view). Each replica requests and is
-      # limited to 2 CPU and 2Gi. On an
+      # limited to 2 CPU and 2Gi, which the quota preflight counts; it does not
+      # check that a node has room for a 2 CPU pod. On an
       # existing install the chart fails the upgrade when the installed CRD
       # predates the field; apply crds/ first (upgrade.sh does).
       exec:
@@ -1645,6 +1646,15 @@ platformAgent:
       # roles. The federated principal needs only roles/iam.workloadIdentityUser
       # on it.
       serviceAccountEmail: ""
+    # Omit core `secrets` (`get`, `list`, `watch`) from the reader ClusterRole
+    # (`kubeagents:minimal:<ns>:<name>`).
+    # - `null` (unset): new installs grant `secrets` read access (`<name>-kube-proxy`
+    #   strips secret payloads from every response with `KUBE_PROXY_REDACT_SECRETS=true`).
+    #   Existing installs keep the `secrets` permission their ClusterRole already holds.
+    # - `true`: omit `secrets` from the reader ClusterRole.
+    # - `false`: grant `secrets` on the reader ClusterRole, including on upgraded
+    #   existing installs.
+    disallowSecretsRead: null
   # The GCP projects, folders, organisations, Shared VPC hosts and Metrics
   # Scopes, beyond the project the agent runs in, whose GKE clusters the hourly
   # Cluster Agent reconcile enumerates, and what it leaves unmanaged: rendered
@@ -1696,11 +1706,9 @@ platformAgent:
   #         - projectId: payments-staging
   #           location: us-central1
   #           clusterName: scratch-cluster
-  # An excluded cluster is left out of what the agents look at, but that is not
-  # yet enforced: the agent's read roles still reach it, so a worker that
-  # fetches its credentials itself can read it. Only a project where the agent
-  # holds no roles, bound there or through a folder or organization, keeps it
-  # off a cluster; the management project always holds them.
+  # The credential broker and kube-proxy refuse every route to an excluded
+  # cluster's Kubernetes API; the project's cluster list and a cluster's
+  # describe stay readable. Spell the project by its ID.
   scope: null
   credentials:
     # Secret holding the agent's credential keys: API_SERVER_KEY plus the

@@ -260,9 +260,26 @@ def _created(hours: float = 24 * 30) -> str:
 _OPEN_BLOCK = {"enabled": True, "cidrBlocks": [{"displayName": "open-for-eval", "cidrBlock": "0.0.0.0/0"}]}
 
 
+# seeded-a's declared-zonal-pool as `clusters describe` reports it (main.tf):
+# autoscaling on, tainted, no node. The declared-single-zone-pool role reads
+# it off the cluster document, the one place a pool with no node shows.
+_DECLARED_ZONAL_POOL = {
+    "name": "declared-zonal-pool",
+    "status": "RUNNING",
+    "locations": ["us-central1-a"],
+    "autoscaling": {"enabled": True, "minNodeCount": 0, "maxNodeCount": 2},
+    "config": {"machineType": "e2-small", "taints": [{"key": "seeded-role", "value": "declared-zonal", "effect": "NO_SCHEDULE"}]},
+}
+
+
 def _peer(*, block: dict | None = _OPEN_BLOCK, created: str | None = None) -> dict:
-    """A drift-cohort peer's cluster document (slot a or d)."""
-    doc = {"currentMasterVersion": "1.34.1-gke.1", "createTime": created or _created()}
+    """A drift-cohort peer's cluster document (slot a or d).
+
+    Carries seeded-a's declared pool so a peer document a test rewrites for
+    its authorized-networks block still converges the pool's role; slot d's
+    document carries it too, which no role on slot d reads.
+    """
+    doc = {"currentMasterVersion": "1.34.1-gke.1", "createTime": created or _created(), "nodePools": [_DECLARED_ZONAL_POOL]}
     if block is not None:
         doc["masterAuthorizedNetworksConfig"] = block
     return doc
@@ -298,7 +315,7 @@ def _cluster_b(*, master: str = "1.33.4-gke.1134000", channel: str | None = "REG
         # that heals the fixture. The readiness-lb-drain-timeout role asserts
         # the default pool's status, the pool its backend service fronts.
         "nodePools": [
-            {"name": "default-pool", "status": "RUNNING", "upgradeSettings": {"maxSurge": 1}},
+            {"name": "default-pool", "status": "RUNNING", "upgradeSettings": {"maxSurge": 2}},
             {"name": "no-surge-pool", "upgradeSettings": no_surge},
         ],
         "maintenancePolicy": {
@@ -848,7 +865,7 @@ class PassTest(_Harness):
     def test_a_healthy_fleet_converges_on_the_first_pass(self):
         done = self.run_script(_healthy_world())
         assert done.returncode == 0, done.stderr
-        assert "Seeded-fleet fixture state: 41 role(s) in their designed state, 0 drifted, 0 not checked (project kube-agents-evals)" in done.stderr
+        assert "Seeded-fleet fixture state: 42 role(s) in their designed state, 0 drifted, 0 not checked (project kube-agents-evals)" in done.stderr
         assert self.drift_files() == {}
         assert "WARNING" not in done.stderr
         # One read per distinct subject, and the channel default once.
@@ -878,7 +895,7 @@ class PassTest(_Harness):
         ]
         done = self.run_script(world, "--wait", "20", "--interval", "0.1")
         assert done.returncode == 0, done.stderr
-        assert "41 role(s) in their designed state, 0 drifted" in done.stderr
+        assert "42 role(s) in their designed state, 0 drifted" in done.stderr
         assert self.drift_files() == {}
         # Only the pending role is re-read; converged roles are not asked again.
         assert self.log.read_text().count("get deployment checkout-gateway") == 1
@@ -910,7 +927,7 @@ class PassTest(_Harness):
         world["kubectl"]["deployment/checkout-gateway"] = "UNREACHABLE"
         done = self.run_script(world)
         assert done.returncode == 0, done.stderr
-        assert "40 role(s) in their designed state, 0 drifted, 1 not checked" in done.stderr
+        assert "41 role(s) in their designed state, 0 drifted, 1 not checked" in done.stderr
         assert self.drift_files() == {}
         assert "WARNING: fixture role 'no-pdb-workload' could not be checked" in done.stderr
         assert "Unable to connect" in done.stderr
@@ -936,7 +953,7 @@ class PassTest(_Harness):
         ]
         done = self.run_script(world, "--wait", "20", "--interval", "0.1")
         assert done.returncode == 0, done.stderr
-        assert "41 role(s) in their designed state, 0 drifted, 0 not checked" in done.stderr
+        assert "42 role(s) in their designed state, 0 drifted, 0 not checked" in done.stderr
 
     def test_a_read_failure_beside_a_failed_assertion_is_still_drift(self):
         world = _healthy_world()
@@ -960,7 +977,7 @@ class PassTest(_Harness):
     def test_the_idle_pool_needs_a_ready_tainted_node(self):
         world = _healthy_world()
         done = self.run_script(world)
-        assert "41 role(s) in their designed state" in done.stderr, done.stderr
+        assert "42 role(s) in their designed state" in done.stderr, done.stderr
         # The label key carries a slash: the subject is a selector, not kind/name.
         assert "get node -l cloud.google.com/gke-nodepool=idle-batch-pool" in self.log.read_text()
         world["kubectl"]["node?cloud.google.com/gke-nodepool=idle-batch-pool"] = {"items": [_node(ready="False")]}
@@ -974,7 +991,7 @@ class PassTest(_Harness):
     def test_the_default_pool_needs_room_for_the_next_fixture(self):
         world = _healthy_world()
         done = self.run_script(world)
-        assert "41 role(s) in their designed state" in done.stderr, done.stderr
+        assert "42 role(s) in their designed state" in done.stderr, done.stderr
         # The pods are read once, across every namespace, not once per node.
         assert self.log.read_text().count("get pod -A") == 1, self.log.read_text()
         # 2026-10-20's shape on kube-agents-evals-11: 940m nodes, the busier one 4m from full.
@@ -990,7 +1007,7 @@ class PassTest(_Harness):
         world = _healthy_world()
         world["kubectl"]["pod?"] = "UNREACHABLE"
         done = self.run_script(world)
-        assert "40 role(s) in their designed state, 0 drifted, 1 not checked" in done.stderr, done.stderr
+        assert "41 role(s) in their designed state, 0 drifted, 1 not checked" in done.stderr, done.stderr
         assert "default-pool-headroom" in done.stderr and "kubectl get pod -A failed" in done.stderr, done.stderr
         assert "default-pool-headroom" not in self.drift_files()
 
@@ -1003,7 +1020,7 @@ class PassTest(_Harness):
     def test_a_retained_failed_writer_job_is_drift(self):
         world = _healthy_world()
         done = self.run_script(world)
-        assert "41 role(s) in their designed state" in done.stderr, done.stderr
+        assert "42 role(s) in their designed state" in done.stderr, done.stderr
         # The Jobs are read by label, in the role's namespace; nothing named.
         assert "get job -l app=legacy-endpoints-writer -n seeded-deprecation" in self.log.read_text()
         # failedJobsHistoryLimit 1: one retained failure is what a broken caller leaves.
@@ -1035,7 +1052,7 @@ class PassTest(_Harness):
         registry that still exists, a CSI-provisioned volume) reads as drift."""
         world = _healthy_world()
         done = self.run_script(world)
-        assert "41 role(s) in their designed state" in done.stderr, done.stderr
+        assert "42 role(s) in their designed state" in done.stderr, done.stderr
         heals = {
             "node-local-state": (
                 "deployment/cache-on-emptydir",
@@ -1226,7 +1243,7 @@ class PassTest(_Harness):
         world["kubectl"]["deployment/arch-pinned-worker"]["spec"]["template"]["spec"]["nodeSelector"]["cloud.google.com/gke-nodepool"] = "default-pool"
         done = self.run_script(world)
         assert done.returncode == 0, done.stderr
-        assert "41 role(s) in their designed state, 0 drifted" in done.stderr
+        assert "42 role(s) in their designed state, 0 drifted" in done.stderr
         assert self.drift_files() == {}
 
     def test_the_cluster_subject_reads_the_recorded_cluster(self):
@@ -1317,10 +1334,20 @@ class PassTest(_Harness):
     def test_a_block_lost_beside_a_young_outlier_still_holds_the_wait(self):
         world = _healthy_world()
         world["describe"]["seeded-c"]["createTime"] = _created(2)
-        world["describe"]["seeded-a"] = [_peer(block={"enabled": False}), _peer()]
+        # Every slot-a role with a `cluster` subject reads the document once
+        # on the first pass (the read cache is per role), so the lost block is
+        # served to each of them; the second pass re-reads the one role that
+        # drifted, drift-peer-a, and gets the restored block.
+        slot_a_cluster_roles = sum(
+            1
+            for spec in self.catalog["roles"].values()
+            if spec["cluster_slot"] == "a" and any(entry["subject"] == "cluster" for entry in spec["state"])
+        )
+        assert slot_a_cluster_roles >= 2, slot_a_cluster_roles
+        world["describe"]["seeded-a"] = [_peer(block={"enabled": False})] * slot_a_cluster_roles + [_peer()]
         done = self.run_script(world, "--wait", "60", "--interval", "1")
         assert set(self.drift_files()) == {"drift-outlier"}, done.stderr
-        assert self.log.read_text().count("clusters describe seeded-a") == 2
+        assert self.log.read_text().count("clusters describe seeded-a") == slot_a_cluster_roles + 1
 
     def test_an_unreadable_peer_is_not_checked(self):
         world = _healthy_world()
@@ -1417,7 +1444,7 @@ class PassTest(_Harness):
     def test_a_context_without_the_slots_cluster_is_not_checked(self):
         (self.fleet / ".fleet-context").write_text("project=kube-agents-evals\n")
         done = self.run_script(_healthy_world())
-        assert "33 role(s) in their designed state, 0 drifted, 8 not checked" in done.stderr
+        assert "33 role(s) in their designed state, 0 drifted, 9 not checked" in done.stderr
         assert "records no cluster for slot" in done.stderr
 
     def test_only_published_roles_are_asserted(self):
@@ -1462,7 +1489,7 @@ class PassTest(_Harness):
         }
         done = subprocess.run([sys.executable, str(_SCRIPT)], capture_output=True, text=True, env=env, check=False)
         assert done.returncode == 0, done.stderr
-        assert "41 role(s) in their designed state" in done.stderr
+        assert "42 role(s) in their designed state" in done.stderr
 
     def test_stalled_controller_fixture_detects_drift_on_missing_deadline(self):
         world = _healthy_world()
@@ -1582,7 +1609,7 @@ class ProjectScopedRoleTest(_Harness):
         world["compute"]["instances"] = "UNREACHABLE"
         done = self.run_script(world)
         assert self.drift_files() == {}, done.stderr
-        assert "39 role(s) in their designed state, 0 drifted, 2 not checked" in done.stderr
+        assert "40 role(s) in their designed state, 0 drifted, 2 not checked" in done.stderr
         assert "fixture role 'startup-fail-vm' could not be checked" in done.stderr
 
     def test_a_project_role_without_its_confirmed_list_is_not_asserted(self):
@@ -1636,6 +1663,7 @@ class ReportTest(_Harness):
                 "cuda-pinned-gpu-job": "converged",
                 "declared-no-pdb-workload": "converged",
                 "declared-overrequest-workload": "converged",
+                "declared-single-zone-pool": "converged",
                 "guaranteed-qos-workload": "converged",
                 "declared-token-workload": "converged",
                 "default-pool-headroom": "converged",
@@ -1678,7 +1706,7 @@ class ReportTest(_Harness):
         self.assertTrue(doc["roles"]["drift-outlier"]["detail"][0].startswith("cluster: clusters describe seeded-c failed"), doc["roles"]["drift-outlier"])
         self.assertEqual(doc["roles"]["idle-nodepool"], {"cluster_slot": "a", "state": "unpublished", "detail": []})
         self.assertEqual(doc["roles"]["version-laggard"]["cluster_slot"], "b")
-        self.assertEqual(doc["summary"], {"converged": 37, "drifted": 1, "unchecked": 2})
+        self.assertEqual(doc["summary"], {"converged": 38, "drifted": 1, "unchecked": 2})
         self.assertEqual(doc["roles"]["startup-fail-vm"]["cluster_slot"], None)
         self.assertIn("1 drifted, 2 not checked", done.stderr)
 

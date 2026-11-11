@@ -265,7 +265,7 @@ func TestEnvironmentDoesNotCacheACancelledRefresh(t *testing.T) {
 
 func TestRolloutDeploymentsFollowTheInstallNames(t *testing.T) {
 	got := rolloutDeployments("ops-agent", "ka-prod")
-	for _, name := range []string{"ka-prod-controller-manager", "ops-agent-gateway", "ops-agent-credential-proxy", "litellm"} {
+	for _, name := range []string{"ka-prod-controller-manager", "ops-agent-gateway", "ops-agent-credential-proxy", "ops-agent-credential-proxy-exec-tier", "litellm"} {
 		if !got[name] {
 			t.Errorf("%s missing from %v", name, got)
 		}

@@ -344,7 +344,8 @@ there is an offline target the day a password is hand-set. That binds every rend
 this stack, not one function - the rollout hash on the NATS pod template is over the
 config rendered with placeholders in the passwords' place plus the credentials Secret's
 `resourceVersion`, which is what lets a config change and a rotation both roll the bus
-without a credential reaching the digest.
+without a credential reaching the digest. The gateway's per-profile deny is left out of
+that hash, since a reload applies it (below).
 
 Layout:
 
@@ -604,7 +605,8 @@ Layout:
   `app.kubernetes.io/component: profiles` label, admitted only once that namespace's own
   fence (DNS, the bus and LiteLLM out, nothing in) is in place), and ~~**no pod-network peer for 8222 or 9222**~~ **no
   pod-network peer for 8222, and one for 9222: the console server (amended 9/24,
-  below)**. The demo's
+  below)**; **amended 11/09:** 8222 admits the operator's pod, the same peer as 4222, which
+  reads `config_load_time` there to confirm a config reload (below). The demo's
   `kubectl port-forward` and the kubelet's readiness probe both enter from the node,
   which NetworkPolicy does not govern, so the ws surface stays reachable through
   kubectl and, in-cluster, through the console server alone. The enumeration is today's client
@@ -1091,7 +1093,25 @@ Every connection to the client listener on 4222 is TLS. nats.conf carries a top-
 clear; a client that dials `nats://` is told to upgrade, and one that cannot verify the
 certificate is refused. Every client the operator renders is handed `tls://` on the NATS
 Service name and trusts the bus CA. The monitoring port, 8222, stays plain HTTP: it carries
-health and stats, not payloads or tokens. The websocket listener on 9222, the console's
+health and stats, not payloads or tokens. The operator reads it for one thing, `config_load_time` in
+`/varz`.
+
+**Reloading permissions without a restart.** The bus pod runs nats-io's
+`nats-server-config-reloader` beside nats-server, in one PID namespace. When the kubelet
+writes a new `nats.conf` into the pod, the reloader sends nats-server the reload signal,
+and the server applies the new users and permissions to the connections it already holds.
+It also runs the auth callout again for each connection the callout authenticated; on
+2.10.29 those connections dropped at the reload and reconnected within a second.
+The pod template's config hash leaves out the per-profile gateway deny, so an AgentProfile
+added, removed or done draining changes the config Secret and not the template: the bus is
+reloaded, not rolled. Every other config change still rolls it. The operator records the
+reload it asked for on the Secret, with the `config_load_time` it read just before writing,
+and confirms the reload when that value moves. If it hasn't moved within three minutes, or
+can't be read, the operator deletes the bus pod so it restarts onto the new config, and
+writes a `BusConfigReloadFailed` Warning. The kubelet takes up to about a minute to write
+an updated Secret into a running pod, so a newly added profile's deny lands that long after
+the profile does. On the roll path it landed when the new pod came up, tens of seconds
+later, with the bus down for the roll. The websocket listener on 9222, the console's
 door, serves the same certificate from the same files (below).
 
 **Certificate source.** The operator mints the certificates itself, with no dependency on
