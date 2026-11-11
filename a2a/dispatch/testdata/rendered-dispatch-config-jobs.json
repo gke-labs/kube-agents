@@ -1,5 +1,5 @@
 {
-  "version": "030b0deb4e6c3436",
+  "version": "c3a8144cc675ae3f",
   "namespace": "test-ns",
   "profileNamespace": "test-ns-profiles",
   "ceiling": 6,
@@ -368,7 +368,15 @@
               "value": "amd64",
               "effect": "NoSchedule"
             }
-          ]
+          ],
+          "dnsConfig": {
+            "options": [
+              {
+                "name": "ndots",
+                "value": "3"
+              }
+            ]
+          }
         }
       }
     }

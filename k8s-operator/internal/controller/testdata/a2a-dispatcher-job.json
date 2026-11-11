@@ -347,7 +347,15 @@
             "value": "amd64",
             "effect": "NoSchedule"
           }
-        ]
+        ],
+        "dnsConfig": {
+          "options": [
+            {
+              "name": "ndots",
+              "value": "3"
+            }
+          ]
+        }
       }
     },
     "ttlSecondsAfterFinished": 300

@@ -54,6 +54,44 @@ func TestSpawnSetsPodDeadlineMirroringTheAdapters(t *testing.T) {
 	}
 }
 
+// TestSpawnedSessionPodsSetNdots3: a session pod dials the broker and the
+// kube-api proxy by their 4-dot service names, so it lowers ndots to 3 and
+// the names are asked as written first (#5590). Only ndots changes: the DNS
+// policy stays ClusterFirst, with the cluster's nameservers and search list.
+func TestSpawnedSessionPodsSetNdots3(t *testing.T) {
+	cs := k8sfake.NewSimpleClientset()
+	cfg := &Config{Namespace: "test-ns", WorkerImage: "img", SessionServiceAccount: "agent-a2a-session",
+		TaskDeadline: 15 * time.Minute}
+	s := &podSpawner{cfg: cfg, client: cs, log: slog.Default()}
+	rec := &SessionRecord{Key: "discord:g1/t", ContextID: "ctx-1", BusSession: "chat-otter-abcd", Addressee: "chat-otter-abcd"}
+	if _, err := s.Spawn(context.Background(), rec, "task-1", "", 1); err != nil {
+		t.Fatal(err)
+	}
+	pod, err := cs.CoreV1().Pods("test-ns").Get(context.Background(), "chat-otter-abcd", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pod.Spec.DNSPolicy != "" && pod.Spec.DNSPolicy != corev1.DNSClusterFirst {
+		t.Errorf("dnsPolicy %q, want the default ClusterFirst", pod.Spec.DNSPolicy)
+	}
+	dns := pod.Spec.DNSConfig
+	if dns == nil {
+		t.Fatal("session pod has no dnsConfig, so the resolver keeps ndots:5")
+	}
+	if len(dns.Nameservers) != 0 || len(dns.Searches) != 0 {
+		t.Errorf("dnsConfig adds nameservers %v or searches %v; it should change only ndots", dns.Nameservers, dns.Searches)
+	}
+	var ndots []string
+	for _, o := range dns.Options {
+		if o.Name == "ndots" && o.Value != nil {
+			ndots = append(ndots, *o.Value)
+		}
+	}
+	if len(ndots) != 1 || ndots[0] != "3" {
+		t.Errorf("ndots options %v, want exactly one, 3", ndots)
+	}
+}
+
 // TestSpawnCarriesTheOriginSequence: the pod is told which message on its
 // ...in subject is the submission it exists to run. Without it the worker
 // scans the subject and, past TASKS's per-subject cap, cannot tell the

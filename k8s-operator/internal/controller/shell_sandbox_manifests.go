@@ -644,6 +644,8 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 					Annotations: annotations,
 				},
 				Spec: corev1.PodSpec{
+					// ndots:3, see brokerCallerPodDNSConfig.
+					DNSConfig: brokerCallerPodDNSConfig(),
 					// Unannotated, so the metadata server has no GSA to hand
 					// either container. See shellSandboxServiceAccountName.
 					ServiceAccountName: shellSandboxServiceAccountName(agent),
