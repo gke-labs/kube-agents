@@ -587,7 +587,7 @@ func (s *Service) authorize(ctx context.Context, req *jwt.AuthorizationRequestCl
 	// it is refused, not ignored: a client presenting one believes it is
 	// getting a narrower scope.
 	if taskToken != "" && id.Narrowing != NarrowingProfile && id.Narrowing != NarrowingDispatcher {
-		return decision{}, fmt.Errorf("%s presented a task credential, but its entry is neither a profile worker's nor the dispatcher's", att.ServiceAccount)
+		return decision{}, fmt.Errorf("%s presented a task credential, but its entry is not a profile worker's or the dispatcher's", att.ServiceAccount)
 	}
 
 	grants, user := id.Grants, id.User
