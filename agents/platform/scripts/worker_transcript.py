@@ -101,13 +101,27 @@ TEXT_ARG_KEYS = ("content",)
 # does not split, and a value rule reading one word masks the value either
 # way. The CLI flag rules also read a flag right after the mark as a new
 # word, in a second pass after every other supplement rule (the
-# `*_AT_FOLD_RE` rules), which covers the plain reading. A last pass, not a
+# `*_AT_FOLD_RE` rules), which covers the plain reading; the values they would
+# mask are also read before the redactor runs (`at_fold_flag_secrets`), since
+# its key-value rule can take the flag word first. A last pass, not a
 # wider first one: a match that started at the mark could take the text a
 # real flag's match needs (`my\ -prod.cnf -p S`), or a command word a later
 # rule reads. Masking a value too many is harmless, and
 # missing one is not.
 SHELL_ESCAPED_SPACE = "\\ "
 SHELL_ESCAPED_SPACE_FOLD = "\ue000"
+# A served value ends a word: the next character is whitespace, a quote, a
+# shell operator or the end (`mask_served_values`).
+SERVED_VALUE_END = r"(?=[\s\"';|&)]|\Z)"
+# The length of a short credential flag word (`-p`, `-a`).
+SHORT_P_FLAG_WORD_LEN = 2
+# Words a flag rule may read as a value that are shell operators, not
+# values; the after-pipeline mask leaves them alone.
+SHELL_OPERATOR_WORDS = frozenset({"&&", "||", "&", "|", ";"})
+# The most values one step's command keeps for the after-pipeline mask: past
+# it, a command full of escaped flags would cost time quadratic in its length,
+# and a value left out is served as it was before #5535.
+MAX_AT_FOLD_FLAG_VALUES = 32
 # A line that opens a JSON document; the manifest marker that licenses the
 # text-form `data` rule is looked for from the nearest such line before the
 # object, so a `"kind":` on an earlier log line says nothing about a later one.
@@ -890,6 +904,87 @@ def blank_named_values(redactor: Any, text: str, value_span: str = VALUE_SPAN_TO
     return text.replace(SHELL_ESCAPED_SPACE_FOLD, SHELL_ESCAPED_SPACE)
 
 
+def at_fold_flag_secrets(redactor: Any, folded: str) -> list[tuple[str, tuple[str, ...]]]:
+    """The values the CLI flag rules would mask after the escaped-space mark
+    in `folded`, each with the leads it may follow in the served text: its
+    own flag and separator (`--password `, `-p`, `-u admin:`), and the secret
+    marker in front of what follows the flag word, for when the redactor
+    masked the flag word with the value before it. Spelled as the served
+    text spells them (the mark given back as `\\ `).
+
+    The redactor runs before the flag rules and its key-value rule reads a
+    bare value up to whitespace, which the mark is not: in
+    `DB_PASSWORD=x\\ --password S` it masks `x\\<mark>--password` and leaves
+    `S`. Read before the redactor, these values are masked after the whole
+    pipeline where they still follow one of their leads, in each command
+    argument they were read from (`mask_served_values`). Nothing here changes
+    the text the redactor and the other rules read, so no mask is lost.
+    """
+    found: list[tuple[str, tuple[str, ...]]] = []
+
+    def unfold(text: str) -> str:
+        return text.replace(SHELL_ESCAPED_SPACE_FOLD, SHELL_ESCAPED_SPACE)
+
+    def keep(raw: str, lead: str, after_flag: str) -> None:
+        if len(found) >= MAX_AT_FOLD_FLAG_VALUES:
+            return
+        value = unfold(raw)
+        if value and not value.startswith(REDACTED_MARKER_PREFIX) and value not in SHELL_OPERATOR_WORDS:
+            found.append((value, (unfold(lead), REDACTED_SECRET_MARKER + unfold(after_flag))))
+
+    for match in CLI_LONG_FLAG_AT_FOLD_RE.finditer(folded):
+        unquoted = unquote_token(match.group("val"))
+        if (
+            not unquoted.startswith(CLI_FLAG_LEAD_CHAR)
+            and cli_flag_is_sensitive(redactor, match.group("flag"))
+            and redactor._is_credential_value(unquoted)
+        ):
+            flag_word = match.group("prefix")[len(SHELL_ESCAPED_SPACE_FOLD) :] + match.group("flag")
+            keep(match.group("val"), flag_word + match.group("sep"), match.group("sep"))
+
+    def read_userpass(segment: "re.Match[str]", source: str) -> str:
+        for match in CLI_USERPASS_ARG_AT_FOLD_RE.finditer(source[segment.start() : segment.end()]):
+            quote = match.group("quote") or ""
+            val = match.group("qval") if quote else unquote_token(match.group("val"))
+            if not val.startswith(CLI_FLAG_LEAD_CHAR) and redactor._is_credential_value(val):
+                prefix = match.group("prefix")[len(SHELL_ESCAPED_SPACE_FOLD) :]
+                flag_word = prefix.rstrip(INLINE_WHITESPACE + EQUALS_SEPARATOR)
+                user = quote + (match.group("quser") if quote else match.group("user"))
+                keep(val, prefix + user, prefix[len(flag_word) :] + user)
+        return source[segment.start() : segment.end()]
+
+    def read_short_p(match: "re.Match[str]", source: str) -> str:
+        raw = source[match.start("val") : match.end("val")]
+        unquoted = unquote_token(raw)
+        if not unquoted.startswith(CLI_FLAG_LEAD_CHAR) and redactor._is_credential_value(unquoted):
+            mark = source.rfind(SHELL_ESCAPED_SPACE_FOLD, match.start(), match.start("val"))
+            lead = source[mark + len(SHELL_ESCAPED_SPACE_FOLD) : match.start("val")]
+            keep(raw, lead, lead[SHORT_P_FLAG_WORD_LEN:])
+        return source[match.start() : match.end()]
+
+    sub_shell_segments(CLI_USERPASS_FLAG_RE, folded, read_userpass)
+    sub_shell_segments(CLI_SHORT_P_AT_FOLD_RE, folded, read_short_p)
+    return found
+
+
+def mask_served_values(text: str, values: Sequence[tuple[str, tuple[str, ...]]]) -> str:
+    """`text` with each of `values` replaced by the secret marker where it
+    still follows one of its leads (see `at_fold_flag_secrets`) and ends a
+    word: the value after its flag, not the same string elsewhere in the
+    command; more masks only. One pass over `text`, longest lead and value
+    first, so a shorter value cannot split a longer one."""
+    replacements: dict[str, str] = {}
+    for value, leads in values[:MAX_AT_FOLD_FLAG_VALUES]:
+        for lead in leads:
+            replacements.setdefault(lead + value, lead + REDACTED_SECRET_MARKER)
+    if not replacements:
+        return text
+    pattern = re.compile(
+        "(?:" + "|".join(re.escape(key) for key in sorted(replacements, key=len, reverse=True)) + ")" + SERVED_VALUE_END
+    )
+    return pattern.sub(lambda match: replacements[match.group(0)], text)
+
+
 def as_json_structure(text: str) -> Any:
     if text.lstrip()[:1] not in JSON_STRUCTURE_OPENERS:
         return None
@@ -1095,7 +1190,8 @@ def fold_shell_command(command: str) -> str:
 
 
 def scrub_step_text(redactor: Any, kind: str, text: str, withheld: str) -> str:
-    """Scrub one worker step's text: `redactor.redact` first, then the supplement.
+    """Scrub one worker step's text: `redactor.redact` first, then the supplement
+    (and, for a tool call, the flag values read before the redactor, masked last).
 
     `kind` is the step kind (`thinking`, `tool_call`, `tool_result`, `reply`);
     a `tool_call` has its command's shell continuations and escaped spaces
@@ -1114,6 +1210,7 @@ def scrub_step_text(redactor: Any, kind: str, text: str, withheld: str) -> str:
     value_span = VALUE_SPAN_LINE if is_result else VALUE_SPAN_TOKEN
     shell_keys = COMMAND_ARG_KEYS if is_call else ()
     line_keys = TEXT_ARG_KEYS if is_call else ()
+    flag_secrets: list[tuple[str, tuple[str, ...]]] = []
     try:
         parsed = as_json_structure(text)
         if is_call:
@@ -1122,31 +1219,43 @@ def scrub_step_text(redactor: Any, kind: str, text: str, withheld: str) -> str:
             # `--password pass`) reads the command the shell would run and an
             # escaped-space value is one token; `as_json_structure` returns a
             # fresh object, so the fold does not touch the row.
+            # The values a flag after the escaped-space mark carries are
+            # read here (`at_fold_flag_secrets`), before the redactor can take
+            # the flag into a key-value value, and masked after the pipeline
+            # where they still follow their flag (`mask_served_values`).
             if isinstance(parsed, dict):
                 for arg_key in COMMAND_ARG_KEYS:
                     if isinstance(parsed.get(arg_key), str):
                         parsed[arg_key] = fold_shell_command(parsed[arg_key])
+                        flag_secrets += at_fold_flag_secrets(redactor, parsed[arg_key])
             elif parsed is None:
                 text = fold_shell_command(text)
+                flag_secrets += at_fold_flag_secrets(redactor, text)
         if parsed is not None:
-            return json.dumps(
+            served = supplement_redact(
+                redactor,
+                redactor.redact(parsed),
+                is_tool_result=is_result,
+                value_span=value_span,
+                shell_keys=shell_keys,
+                line_keys=line_keys,
+            )
+            if flag_secrets and isinstance(served, dict):
+                for arg_key in COMMAND_ARG_KEYS:
+                    if isinstance(served.get(arg_key), str):
+                        served[arg_key] = mask_served_values(served[arg_key], flag_secrets)
+            return json.dumps(served)
+        # A bare-string tool call is the shell line itself.
+        return mask_served_values(
+            str(
                 supplement_redact(
                     redactor,
-                    redactor.redact(parsed),
+                    redactor.redact(text),
                     is_tool_result=is_result,
-                    value_span=value_span,
-                    shell_keys=shell_keys,
-                    line_keys=line_keys,
+                    value_span=VALUE_SPAN_SHELL if is_call else value_span,
                 )
-            )
-        # A bare-string tool call is the shell line itself.
-        return str(
-            supplement_redact(
-                redactor,
-                redactor.redact(text),
-                is_tool_result=is_result,
-                value_span=VALUE_SPAN_SHELL if is_call else value_span,
-            )
+            ),
+            flag_secrets,
         )
     except RecursionError:
         return withheld

@@ -426,6 +426,77 @@ class TestScrubStepText(unittest.TestCase):
                 if "S3cretValue9" not in old_out:
                     self.assertNotIn("S3cretValue9", new_out)
 
+    def test_a_flag_after_a_masked_key_value_keeps_its_value_masked(self):
+        # #5535: the redactor runs first, and its key-value rule reads a bare
+        # value up to whitespace, which the escaped-space mark is not, so it
+        # took the flag word into the value it masked and served the flag's
+        # value. The flag rules now read those values before the redactor.
+        for run in (1, 2, 4):
+            plain_cmds = (
+                "DB_PASSWORD=x" + "\\\\" * run + " --password S3cretValue9",
+                "mysql DB_PASSWORD=x" + "\\\\" * run + " -p S3cretValue9",
+                "curl TOKEN=x" + "\\\\" * run + " -u admin:S3cretValue9 https://x",
+            )
+            for plain in plain_cmds:
+                for wrapper, cmd in (("", plain), ("eval", "eval " + plain), ("bash -c", f'bash -c "{plain}"')):
+                    for text in (json.dumps({"command": cmd}), cmd):
+                        with self.subTest(cmd=cmd, form=text[:1]):
+                            out = _scrub("tool_call", text)
+                            # Known limit, the same before: inside a quoted
+                            # `bash -c "…"` script the short and user:pass
+                            # flag rules do not run (`sub_shell_segments`).
+                            if wrapper == "bash -c" and not plain.startswith("DB_PASSWORD"):
+                                self.assertIn("S3cretValue9", out)
+                            else:
+                                self.assertNotIn("S3cretValue9", out)
+
+    def test_a_value_read_before_the_redactor_is_masked_only_after_its_flag(self):
+        # The same string elsewhere in the command is not the flag's value:
+        # a short value must not mask letters in other words, spaces or the
+        # markers already there.
+        cases = (
+            ("cd mysql && TOKEN=x\\\\ --password mysql ls mysql", ("cd mysql &&", "ls mysql")),
+            ("mysql -h db.example.com -u root\\ -pe -e 'select 1'", ("db.example.com", "'select 1'")),
+            ("mysql -u r\\ -p1 -h 10.0.0.1", ("10.0.0.1",)),
+        )
+        for cmd, kept in cases:
+            for text in (json.dumps({"command": cmd}), cmd):
+                with self.subTest(cmd=cmd, form=text[:1]):
+                    out = _scrub("tool_call", text)
+                    for word in kept:
+                        self.assertIn(word, out)
+                    self.assertNotIn("[R[", out)
+
+    def test_reading_flag_values_first_never_masks_less(self):
+        # A property check with redactor-only secrets in the mix: the
+        # redactor and every rule read the same text as before, so with the
+        # early read off (the rules as before #5535) no command masks a
+        # secret the early read does not.
+        import random
+
+        secrets = (
+            "S3cretValue9",
+            "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8",
+            "AKIA" + "IOSFODNN7EXAMPLE",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.c2lnbmF0dXJlc2lnbmF0dXJl",
+            "-----BEGIN RSA PRIVATE KEY-----",
+            "https://admin:Pa55wordQ9@host",
+        )
+        rng = random.Random(5535)
+        words = ["mysql ", "curl ", "redis-cli ", "ls ", "--password ", "--token=", "-p", "-u ", "-a ", "admin:", "x",
+                 "DB_PASSWORD=", "TOKEN=", "password: ", "\\", "\\\\", "\\ ", "\\\\ ", " ", "=", '"', "'",
+                 "eval ", "-n prod", "-prod.cnf ", "--draft ", "my\\ ", "; ", "| ", *secrets]
+        commands = ["".join(rng.choice(words) for _ in range(rng.randint(2, 12))) for _ in range(3000)]
+        for cmd in commands:
+            for text in (json.dumps({"command": cmd}), cmd):
+                new_out = _scrub("tool_call", text)
+                with mock.patch.object(worker_transcript, "at_fold_flag_secrets", return_value=[]):
+                    old_out = _scrub("tool_call", text)
+                with self.subTest(cmd=cmd, form=text[:1]):
+                    for secret in secrets:
+                        if secret not in old_out:
+                            self.assertNotIn(secret, new_out)
+
     def test_a_tool_calls_prose_argument_keeps_its_diagnosis(self):
         # A worker reports through `kanban_complete(result=...)`: prose, as a reply is.
         report = "## Why\n- Secret: db-credentials is missing the key 'password'\n- Token: expired at 10:00\n"
