@@ -11,7 +11,7 @@ Every image an install pulls or a rebuild needs, and how their tags are managed.
 
 [`images.json`](https://github.com/gke-labs/kube-agents/blob/main/images.json) at the repository root is the source of truth for this list. It is what `make mirror-images` copies from, what the chart and the dev tooling resolve their third-party pins from, and what the table below is generated from — so there is one pin per image, not one per install path.
 
-The A2A `next` stack pulls NATS, nats-box, the gateway, the session worker, the auth callout,
+The A2A `next` stack pulls NATS, nats-box, the NATS config reloader, the gateway, the session worker, the auth callout,
 the capability verifier, the AgentProfile dispatcher, the console server and the Hermes bridge sidecar, and each is in the
 tables below. The first-party ones (`a2a-gateway`, `a2a-worker`, `a2a-authcallout`,
 `a2a-verifier`, `a2a-dispatcher`, `a2a-console`, `hermes-bridge`) are built and tagged with the rest of the
@@ -33,10 +33,11 @@ the agent image instead, and `A2A_BRIDGE_IMAGE` on the operator overrides it. A 
 that declares its own `hermes-bridge` sidecar keeps it, and that sidecar's image is whatever the
 resource names.
 
-NATS and nats-box are ordinary third-party pins, in the table as `nats` and `nats-box`, so
-`make mirror-images` copies them. The chart does not set their env vars, so a mirrored `next`
-install still points `A2A_NATS_IMAGE` and `A2A_PROVISION_IMAGE` at the copies itself, through the
-operator's environment
+NATS, nats-box and the NATS config reloader are ordinary third-party pins, in the table as `nats`,
+`nats-box` and `nats-server-config-reloader`, so `make mirror-images` copies them. The chart does
+not set their env vars, so a mirrored `next` install still points `A2A_NATS_IMAGE`,
+`A2A_PROVISION_IMAGE` and `A2A_NATS_RELOADER_IMAGE` at the copies itself, through the operator's
+environment
 ([Operator settings](/kube-agents/install/quickstart-gke/#operator-settings) shows how).
 
 The bases those images are built from are inventory entries too. `golang`, `node` and
@@ -88,6 +89,7 @@ Pinned here so `make mirror-images` and the install ask for the same version.
 | `fluent-bit` | `docker.io/fluent/fluent-bit` | `5.1.2` | `FLUENT_BIT_IMAGE` | The logging sidecar the operator injects into every agent pod. |
 | `nats` | `docker.io/library/nats` | `2.10-alpine` | `A2A_NATS_IMAGE` | The NATS StatefulSet the operator renders under spec.mode: next, and nothing under spec.mode: today. |
 | `nats-box` | `docker.io/natsio/nats-box` | `0.14.5` | `A2A_PROVISION_IMAGE` | The provision Job the operator runs against that NATS under spec.mode: next, and nothing under spec.mode: today. |
+| `nats-server-config-reloader` | `docker.io/natsio/nats-server-config-reloader` | `0.25.0@sha256:24bacde6b844f8875f93424ed153d33b3d9e9367fcccc14b683eb71fab3a4d8c` | `A2A_NATS_RELOADER_IMAGE` | A sidecar in the NATS pod the operator renders under spec.mode: next, and nothing under spec.mode: today. |
 | `k8s` | `docker.io/alpine/k8s` | `1.36.5` | — | The chart's pre-delete cleanup hook Job. |
 | `github-token-minter-server` | `us-docker.pkg.dev/abcxyz-artifacts/docker-images/github-token-minter-server` | `v2.7.1-amd64` | `GITHUB_MINTER_IMAGE` | The optional GitHub integration. |
 | `hindsight-api` | `ghcr.io/vectorize-io/hindsight-api` | `0.10.2@sha256:1ba631f950a04460feff6b1e212bad3cdf127b0cfb3d765bdcba12f512481d7b` | `HINDSIGHT_API_IMAGE` | The chart, when the memory provider uses Hindsight (make deploy-hindsight for the kustomize dev path). |

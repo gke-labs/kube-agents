@@ -136,9 +136,9 @@ Totals by install profile, as the chart's quota preflight sums them (the operato
 | ------- | ---- | ------------ | --------------- | ---------- | ------------- | ----------------------------------- | ------ | ------------------ | -------------------- |
 | `today`, GKE Standard | 9 | 2756m | 12096Mi | 13200m | 25472Mi | 14912Mi / 14912Mi | 4 | 102Gi | — |
 | `today`, GKE Autopilot | 9 | 4256m | 13120Mi | 13200m | 25472Mi | 14912Mi / 14912Mi | 4 | 102Gi | — |
-| `next`, GKE Standard | 18 | 3706m | 13696Mi | 18900m | 30080Mi | 15040Mi / 15040Mi | 5 | 142Gi | 36 |
-| `next`, GKE Autopilot | 18 | 5206m | 14720Mi | 18900m | 30080Mi | 15040Mi / 15040Mi | 5 | 142Gi | 36 |
-| `next` with Hindsight and the GitHub minter, GKE Standard | 22 | 4556m | 16128Mi | 24900m | 35712Mi | 16192Mi / 16192Mi | 6 | 150Gi | 42 |
+| `next`, GKE Standard | 18 | 3716m | 13712Mi | 18950m | 30112Mi | 15104Mi / 15104Mi | 5 | 142Gi | 36 |
+| `next`, GKE Autopilot | 18 | 5216m | 14736Mi | 18950m | 30112Mi | 15104Mi / 15104Mi | 5 | 142Gi | 36 |
+| `next` with Hindsight and the GitHub minter, GKE Standard | 22 | 4566m | 16144Mi | 24950m | 35744Mi | 16256Mi / 16256Mi | 6 | 150Gi | 42 |
 
 The session quota is `spec.harness.tuning.maxSessions` (10 by default) plus the pods the operator runs for the agent, the chart's pods in the namespace with their rollout surges (5 when the operator cannot read the chart's count), and a margin of 7 for the operator's rollout surges, its Jobs and the gateway's count-then-create overshoot.
 
@@ -146,7 +146,7 @@ Under `spec.mode: next`, per pod:
 
 | Workload | Pods | CPU request | Memory request | CPU limit | Memory limit | Ephemeral storage request / limit | Runs |
 | -------- | ---- | ----------- | -------------- | --------- | ------------ | --------------------------------- | ---- |
-| NATS server | 1 | 250m | 512Mi | 1 | 1Gi | — | Standing, one JetStream claim each (40Gi) |
+| NATS server | 1 | 260m | 528Mi | 1050m | 1056Mi | 64Mi / 64Mi | Standing, one JetStream claim each (40Gi) |
 | Auth callout | 2 | 50m | 64Mi | 500m | 256Mi | — | Standing |
 | Capability verifier | 2 | 50m | 64Mi | 500m | 256Mi | — | Standing |
 | A2A gateway | 2 | 50m | 64Mi | 500m | 512Mi | — | Standing; one fewer with the operator's `A2A_GATEWAY_ELECTION=false` |

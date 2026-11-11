@@ -252,7 +252,7 @@ Three properties follow from the script owning the artefacts rather than the mod
 
 - **No invented output.** The model never writes the title, body, commit message, or any timestamp — so two runs against an unchanged fleet produce an unchanged ledger.
 
-The `agent:audit` label is also what keeps the issue-writing jobs apart: the `github-issue-resolver` poll query excludes it, and `agent:delivery-watch` with it, so it never tries to "resolve" an audit ledger or the chat-delivery ledger.
+The `agent:audit` label is also what keeps the issue-writing jobs apart: the `github-issue-resolver` poll query excludes it, and `agent:delivery-watch` and `agent:onboarding` with it. So it never tries to "resolve" an audit ledger, the chat-delivery ledger, or the first-run inventory report onboarding files when no chat thread took it.
 
 `fleet-audit` shares `submit-suggestion`'s guardrails: same Minty token path, the same refusal of `git add .` / `git add -A`, and the same hard block on force-pushing `main`, `master`, or `production`.
 

@@ -2086,7 +2086,7 @@ That split is now the smaller half of what has already happened. `resolver.py` r
 sandbox today; what is left to move is the script around them.
 
 `bootstrap_delivery.py` takes the same shape. Its gating markers, `.user_aligned` and
-`.bootstrap_completed`, are written agent-side and stay on the PVC, so it checks them
+`.bootstrap_completed` (and, for a report nobody aligned to, the age of `.bootstrap_scan_filed`), are written agent-side and stay on the PVC, so it checks them
 first; only once they say a delivery is due does it read `INVENTORY.md` out of the
 sandbox with `sandbox_exec.read_bytes`, claim the delivery on the PVC, print the report,
 and rename it to `INVENTORY.delivered.md` in the sandbox. Before the claim it reads the
