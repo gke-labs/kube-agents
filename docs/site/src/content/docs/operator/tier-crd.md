@@ -22,11 +22,11 @@ spec:
   writeMode: propose # or none; not enforced yet
 ```
 
-- `mode` is whether people or triggers run at the tier. An `interactive` tier runs interactive profile tasks. An `unattended` tier, a trigger's (the event watcher, a named cron), only starts profile tasks. What a tier may do follows from its mode, so a tier can't name an action of its own.
+- `mode` is whether people or triggers run at the tier. Once tiers are enforced, an `interactive` tier will run interactive profile tasks, and an `unattended` tier, a trigger's (the event watcher, a named cron), will only start profile tasks. What a tier may do will follow from its mode, so a tier can't name an action of its own.
 - `writeMode` is whether a task at the tier may propose a change it finds (`propose`, the default) or only explain it (`none`). It isn't enforced yet; until it is, only the install-level setting applies.
 
 A tier's name is a token in the task submission subject, so it must be a DNS-1123 label.
 
-The chart creates `read` (`interactive`) and `unattended`, and owns them: an edit to either is reverted on the next upgrade. It creates them only when the API server serves the `Tier` kind, so apply `charts/kube-agents/crds/` before a hand `helm upgrade`, as `upgrade.sh` does.
+With `platformAgent.enabled`, the chart creates `read` (`interactive`) and `unattended`, and owns them: an edit to either is reverted on the next upgrade. It creates them only when the API server serves the `Tier` kind, so apply `charts/kube-agents/crds/` before a hand `helm upgrade`, as `upgrade.sh` does.
 
-**Who may write tiers.** A tier is authority, so only cluster administrators should write one. No agent ServiceAccount gets a verb on `tiers`. The operator reads them and writes their status, and nothing in the install aggregates `tiers` into the `admin` or `edit` roles, so a namespace admin doesn't get them by default. The operator reports each tier it has read with an `Accepted` condition.
+**Who may write tiers.** A tier is authority, so only cluster administrators should write one. No agent ServiceAccount gets a verb on `tiers`. The operator reads them and writes their status, and nothing in the install aggregates `tiers` into the `admin` or `edit` roles, so a namespace admin doesn't get them by default. The operator reports each tier it has read with an `Accepted` condition. It looks for the `Tier` kind once, at startup: if the CRD isn't installed or its role can't read tiers, it skips the Tier controller and keeps running everything else, until it restarts.

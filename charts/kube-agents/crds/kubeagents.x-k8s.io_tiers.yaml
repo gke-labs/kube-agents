@@ -63,8 +63,9 @@ spec:
               properties:
                 mode:
                   description: |-
-                    Mode is whether people or triggers run at this tier. interactive runs
-                    interactive profile tasks; unattended only starts profile tasks.
+                    Mode is whether people or triggers run at this tier. Once tiers are
+                    enforced, interactive will run interactive profile tasks and unattended
+                    will only start profile tasks.
                   enum:
                     - interactive
                     - unattended

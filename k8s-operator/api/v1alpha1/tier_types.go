@@ -47,8 +47,9 @@ const (
 // and the capability verifier and the gateway still use the read and
 // unattended tiers built into them.
 type TierSpec struct {
-	// Mode is whether people or triggers run at this tier. interactive runs
-	// interactive profile tasks; unattended only starts profile tasks.
+	// Mode is whether people or triggers run at this tier. Once tiers are
+	// enforced, interactive will run interactive profile tasks and unattended
+	// will only start profile tasks.
 	// +kubebuilder:validation:Enum=interactive;unattended
 	// +required
 	Mode string `json:"mode"`
