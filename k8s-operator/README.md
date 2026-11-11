@@ -93,7 +93,7 @@ is unset.
 ## Local Development (Fast Iteration)
 
 The operator is a standard Kubebuilder project; `make help` lists every target. `make manifests`
-writes to `config/crd/bases/`, `config/rbac/` and `config/webhook/`, then regenerates the three CRD
+writes to `config/crd/bases/`, `config/rbac/` and `config/webhook/`, then regenerates the CRD
 field reference pages under `docs/site/src/content/docs/operator/` from the API types (it needs
 `python3` and exits with an error without it), and `make test` downloads the envtest binaries to
 `bin/` on first run. `make test` also runs the event watcher's fleet soak, ten fake clusters watched
