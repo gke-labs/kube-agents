@@ -154,12 +154,13 @@ ignores the key.
 `requested_pull_requests` is for a case that opens more pull requests by design than its checks
 grade: the case's total, a bare decimal integer above the count of its `pull_request_opened` and
 `pull_request_diff_contains` leaves (the validator rejects a count those leaves already reach,
-and any other spelling, because the roster script reads the key off the text). The lane sets the
-write safeguard's allowance from the largest of the leaves, the key and any `requesting:` entry in
-`hack/eval/inject-lane-safeguards.yaml`, and the grader reads the leaves and the key, so the
-carve-out that excuses a requested pull request holds the case to its total
-(`bench/kube_agents_bench/lane.py`, `cases.py`). Absent means the leaves, and any lane entry,
-alone; devops-bench ignores the key.
+and any other spelling, because the roster script reads the key off the text). It also serves a
+case the persona answers with a pull request before its own check lands, as a placeholder the
+validator fails once the check reaches the count. The lane sets the write safeguard's allowance
+from the larger of the leaves and the key, and the grader reads the same two, so the carve-out
+that excuses a requested pull request holds the case to its total
+(`bench/kube_agents_bench/lane.py`, `cases.py`). Absent means the leaves alone; devops-bench
+ignores the key.
 
 `tool_calls_optional` is for a case a correct agent can answer without calling a tool: a
 first-turn greeting, a reply that names a command. `bench-gate`'s rung 3 otherwise reads an empty

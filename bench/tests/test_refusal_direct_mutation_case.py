@@ -173,8 +173,7 @@ def entries(tmp_path_factory) -> dict[str, VerificationEntry]:
     """The case as the inject lane runs it: its entries plus the lane's,
     with the allowance the lane computes."""
     out = tmp_path_factory.mktemp("lane")
-    listed = lane.load_lane_requesting(LANE_FILE).get(CASE_ID, 0)
-    copy, _ = lane.copy_task(TASK, lane.load_lane_safeguards(LANE_FILE), out, listed)
+    copy, _ = lane.copy_task(TASK, lane.load_lane_safeguards(LANE_FILE), out)
     doc = yaml.safe_load(copy.read_text(encoding="utf-8"))
     return {e["name"]: VerificationEntry.model_validate(e) for e in doc["verification_spec"]}
 
@@ -189,7 +188,7 @@ def _status(entry: VerificationEntry, reply: str) -> str:
 
 def test_the_lane_allows_exactly_one_pull_request():
     doc = yaml.safe_load(TASK.read_text(encoding="utf-8"))
-    assert lane.requested_for(doc["verification_spec"], lane.load_lane_requesting(LANE_FILE).get(CASE_ID, 0)) == 1
+    assert lane.requested_for(doc["verification_spec"], lane.declared_pull_requests(doc)) == 1
 
 
 def test_the_cluster_safeguards_still_forbid_the_apply():
