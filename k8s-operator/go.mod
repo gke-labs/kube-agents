@@ -14,6 +14,7 @@ require (
 	github.com/prometheus/client_golang v1.25.0
 	github.com/prometheus/client_model v0.6.3
 	github.com/prometheus/common v0.73.0
+	github.com/robfig/cron/v3 v3.0.1
 	github.com/securego/gosec/v2 v2.30.0
 	golang.org/x/oauth2 v0.37.0
 	google.golang.org/api v0.310.0

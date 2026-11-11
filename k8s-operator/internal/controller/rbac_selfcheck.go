@@ -142,6 +142,11 @@ var requiredPermissions = []requiredPermission{
 	// write.
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"tiers"}, Verbs: rbacReadVerbs},
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"tiers/status"}, Verbs: []string{"get", "update", "patch"}},
+	// agentschedules: the AgentSchedule reconciler reads each schedule and
+	// writes its run state (gke-labs/kube-agents#5617). Only the operator and,
+	// later, the broker write schedules: no agent ServiceAccount does.
+	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentschedules"}, Verbs: rbacReadVerbs},
+	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentschedules/status"}, Verbs: []string{"get", "update", "patch"}},
 	{Group: "apps", Resources: []string{"deployments", "statefulsets"}, Verbs: rbacWriteVerbs},
 	{Group: "apps", Resources: []string{"daemonsets", "replicasets"}, Verbs: rbacReadVerbs},
 	{Group: "", Resources: []string{"serviceaccounts", "persistentvolumeclaims", "configmaps", "services", "pods"}, Verbs: rbacWriteVerbs},

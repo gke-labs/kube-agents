@@ -39,6 +39,7 @@ CRD_FILES = {
     "AgentProfile": CRD_DIR / "kubeagents.x-k8s.io_agentprofiles.yaml",
     "AgentPlugin": CRD_DIR / "kubeagents.x-k8s.io_agentplugins.yaml",
     "Tier": CRD_DIR / "kubeagents.x-k8s.io_tiers.yaml",
+    "AgentSchedule": CRD_DIR / "kubeagents.x-k8s.io_agentschedules.yaml",
 }
 
 FIXTURE = textwrap.dedent(

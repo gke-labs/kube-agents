@@ -1,0 +1,374 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.1
+  name: agentschedules.kubeagents.x-k8s.io
+spec:
+  group: kubeagents.x-k8s.io
+  names:
+    kind: AgentSchedule
+    listKind: AgentScheduleList
+    plural: agentschedules
+    singular: agentschedule
+  scope: Namespaced
+  versions:
+    - additionalPrinterColumns:
+        - jsonPath: .spec.schedule
+          name: Schedule
+          type: string
+        - jsonPath: .spec.profileRef.name
+          name: Profile
+          type: string
+        - jsonPath: .spec.suspend
+          name: Suspend
+          type: boolean
+        - jsonPath: .status.nextScheduleTime
+          name: Next
+          type: date
+        - jsonPath: .status.lastOutcome
+          name: Last
+          type: string
+      name: v1alpha1
+      schema:
+        openAPIV3Schema:
+          description: |-
+            AgentSchedule runs a prompt on an AgentProfile on a cron schedule, each run
+            an Unattended task submitted through the A2A gateway
+            (docs/designs/scheduling-on-profiles.md).
+          properties:
+            apiVersion:
+              description: |-
+                APIVersion defines the versioned schema of this representation of an object.
+                Servers should convert recognized schemas to the latest internal value, and
+                may reject unrecognized values.
+                More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+              type: string
+            kind:
+              description: |-
+                Kind is a string value representing the REST resource this object represents.
+                Servers may infer this from the endpoint the client submits requests to.
+                Cannot be updated.
+                In CamelCase.
+                More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+              type: string
+            metadata:
+              type: object
+            spec:
+              description: |-
+                AgentScheduleSpec is a recurring task: when it runs, which profile runs
+                it, and what it asks (docs/designs/scheduling-on-profiles.md, section 1).
+                Each run is submitted through the A2A gateway as an Unattended task.
+              properties:
+                activeDeadlineSeconds:
+                  default: 3600
+                  description: |-
+                    ActiveDeadlineSeconds bounds a run. Past it, plus a grace, a run that
+                    never reported a terminal is recorded Lost and the schedule moves on.
+                    Defaults to 3600.
+                  format: int64
+                  maximum: 86400
+                  minimum: 60
+                  type: integer
+                concurrencyPolicy:
+                  default: Forbid
+                  description: |-
+                    ConcurrencyPolicy is Forbid, the one policy: a slot that comes due
+                    while a run is still going is skipped and counted.
+                  enum:
+                    - Forbid
+                  type: string
+                delivery:
+                  description: Delivery is where each run's report goes.
+                  properties:
+                    jobKey:
+                      description: |-
+                        JobKey groups a schedule's posts into one thread per UTC day. It
+                        defaults to the schedule's name.
+                      maxLength: 63
+                      type: string
+                    mode:
+                      default: chat
+                      description:
+                        Mode is chat (the home channel) or local (kept, not
+                        posted).
+                      enum:
+                        - chat
+                        - local
+                      type: string
+                    silentWhenClean:
+                      description:
+                        SilentWhenClean posts nothing for a run that found
+                        nothing.
+                      type: boolean
+                  type: object
+                maxTurns:
+                  description: MaxTurns caps the run's model turns.
+                  format: int32
+                  maximum: 1000
+                  minimum: 1
+                  type: integer
+                parameters:
+                  additionalProperties:
+                    type: string
+                  description: |-
+                    Parameters are passed to each run as task parameters. `stream` names
+                    the run's audit report stream.
+                  maxProperties: 32
+                  type: object
+                profileRef:
+                  description: |-
+                    ProfileRef is the AgentProfile the runs go to. It must allow the
+                    unattended tier.
+                  properties:
+                    name:
+                      description:
+                        Name is the AgentProfile's name, in the schedule's
+                        namespace.
+                      maxLength: 63
+                      minLength: 1
+                      type: string
+                  required:
+                    - name
+                  type: object
+                prompt:
+                  description: Prompt is what each run asks.
+                  maxLength: 16384
+                  minLength: 1
+                  type: string
+                schedule:
+                  description: Schedule is a 5-field cron expression, read in UTC.
+                  maxLength: 128
+                  type: string
+                  x-kubernetes-validations:
+                    - message:
+                        schedule must be a 5-field cron expression (minute hour
+                        day-of-month month day-of-week)
+                      rule: self.trim().split(' ').filter(f, f != '').size() == 5
+                skills:
+                  description: Skills the run asks the profile to use.
+                  items:
+                    type: string
+                  maxItems: 16
+                  type: array
+                  x-kubernetes-list-type: set
+                startingDeadlineSeconds:
+                  default: 900
+                  description: |-
+                    StartingDeadlineSeconds is how late a slot may still start. A slot
+                    missed by more (an operator outage, a gateway that stayed down) is
+                    counted and skipped. Defaults to 900.
+                  format: int64
+                  maximum: 86400
+                  minimum: 60
+                  type: integer
+                suspend:
+                  description: |-
+                    Suspend skips every run while true. A slot that passes while
+                    suspended is counted, not run later.
+                  type: boolean
+              required:
+                - profileRef
+                - prompt
+                - schedule
+              type: object
+            status:
+              description: |-
+                AgentScheduleStatus is the schedule's run state. It is the run ledger: no
+                state lives in a pod.
+              properties:
+                activeTaskID:
+                  description: ActiveTaskID is the run in flight, if any.
+                  type: string
+                activeTaskStartedAt:
+                  description: ActiveTaskStartedAt is when the run in flight was accepted.
+                  format: date-time
+                  type: string
+                conditions:
+                  description: Conditions are the latest observations of the schedule.
+                  items:
+                    description:
+                      Condition contains details for one aspect of the current
+                      state of this API Resource.
+                    properties:
+                      lastTransitionTime:
+                        description: |-
+                          lastTransitionTime is the last time the condition transitioned from one status to another.
+                          This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                        format: date-time
+                        type: string
+                      message:
+                        description: |-
+                          message is a human readable message indicating details about the transition.
+                          This may be an empty string.
+                        maxLength: 32768
+                        type: string
+                      observedGeneration:
+                        description: |-
+                          observedGeneration represents the .metadata.generation that the condition was set based upon.
+                          For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                          with respect to the current state of the instance.
+                        format: int64
+                        minimum: 0
+                        type: integer
+                      reason:
+                        description: |-
+                          reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                          Producers of specific condition types may define expected values and meanings for this field,
+                          and whether the values are considered a guaranteed API.
+                          The value should be a CamelCase string.
+                          This field may not be empty.
+                        maxLength: 1024
+                        minLength: 1
+                        pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                        type: string
+                      status:
+                        description: status of the condition, one of True, False, Unknown.
+                        enum:
+                          - "True"
+                          - "False"
+                          - Unknown
+                        type: string
+                      type:
+                        description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                        maxLength: 316
+                        pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                        type: string
+                    required:
+                      - lastTransitionTime
+                      - message
+                      - reason
+                      - status
+                      - type
+                    type: object
+                  type: array
+                  x-kubernetes-list-map-keys:
+                    - type
+                  x-kubernetes-list-type: map
+                lastCompletionTime:
+                  description: LastCompletionTime is when the most recent run ended.
+                  format: date-time
+                  type: string
+                lastHandledRunNow:
+                  description: LastHandledRunNow is the last run-now token acted on.
+                  type: string
+                lastOutcome:
+                  description: LastOutcome is how the most recent run ended.
+                  enum:
+                    - Succeeded
+                    - Failed
+                    - Cancelled
+                    - Lost
+                  type: string
+                lastScheduleTime:
+                  description: LastScheduleTime is the last slot that was run.
+                  format: date-time
+                  type: string
+                lastTaskID:
+                  description: LastTaskID is the most recent run's task.
+                  type: string
+                nextScheduleTime:
+                  description: NextScheduleTime is the next slot due.
+                  format: date-time
+                  type: string
+                observedGeneration:
+                  description: ObservedGeneration is the .metadata.generation last reconciled.
+                  format: int64
+                  type: integer
+                pendingSlot:
+                  description:
+                    PendingSlot is a claimed run not yet accepted by the
+                    gateway.
+                  properties:
+                    claimedAt:
+                      description: |-
+                        ClaimedAt is when the slot was claimed; the starting deadline is
+                        counted from it for a run-now.
+                      format: date-time
+                      type: string
+                    idempotencyKey:
+                      description: IdempotencyKey identifies this run to the gateway.
+                      type: string
+                    runNow:
+                      description:
+                        RunNow is the run-now token this slot answers, when
+                        it is one.
+                      type: string
+                    slotTime:
+                      description: SlotTime is the slot being run (now, for a run-now).
+                      format: date-time
+                      type: string
+                  required:
+                    - claimedAt
+                    - idempotencyKey
+                    - slotTime
+                  type: object
+                recentRuns:
+                  description: RecentRuns are the last ten runs, newest first.
+                  items:
+                    description: AgentScheduleRun is one run in the recent-runs ring.
+                    properties:
+                      completionTime:
+                        description: CompletionTime is when it ended.
+                        format: date-time
+                        type: string
+                      outcome:
+                        description: Outcome is how it ended.
+                        type: string
+                      slotTime:
+                        description: SlotTime is the slot it ran for.
+                        format: date-time
+                        type: string
+                      taskID:
+                        description: TaskID is the run's task.
+                        type: string
+                    required:
+                      - outcome
+                      - slotTime
+                      - taskID
+                    type: object
+                  maxItems: 10
+                  type: array
+                skipCounts:
+                  description: SkipCounts counts slots that did not run.
+                  properties:
+                    alreadyRunning:
+                      description: "AlreadyRunning: the last run was still going (Forbid)."
+                      format: int64
+                      type: integer
+                    gatewayUnavailable:
+                      description: |-
+                        GatewayUnavailable: the gateway did not accept the run within the
+                        starting deadline.
+                      format: int64
+                      type: integer
+                    missedWindow:
+                      description:
+                        "MissedWindow: the slot was more than the starting
+                        deadline late."
+                      format: int64
+                      type: integer
+                    rateLimited:
+                      description:
+                        "RateLimited: the gateway refused the run under the
+                        trigger's cap."
+                      format: int64
+                      type: integer
+                    suspended:
+                      description: "Suspended: the schedule was suspended."
+                      format: int64
+                      type: integer
+                  required:
+                    - alreadyRunning
+                    - gatewayUnavailable
+                    - missedWindow
+                    - rateLimited
+                    - suspended
+                  type: object
+              type: object
+          type: object
+      served: true
+      storage: true
+      subresources:
+        status: {}
