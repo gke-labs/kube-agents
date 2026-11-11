@@ -684,7 +684,7 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent, taskSigningPu
 		podLabels[k] = v
 	}
 
-	return &appsv1.Deployment{
+	dep := &appsv1.Deployment{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: agent.Namespace, Labels: labels},
 		Spec: appsv1.DeploymentSpec{
@@ -862,6 +862,8 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent, taskSigningPu
 			},
 		},
 	}
+	withA2ATiersFile(agent, &dep.Spec.Template.Spec, "callout")
+	return dep
 }
 
 // buildA2ACalloutService fronts the status endpoints. The bus reaches the

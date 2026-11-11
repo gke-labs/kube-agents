@@ -6262,6 +6262,24 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		}
 	}
 
+	// Tiers feed the tiers ConfigMap (platformagent_a2a_tiers.go), so a Tier
+	// created, edited or deleted re-renders it. Registered only when the CRD
+	// is installed.
+	tierGVK := agentv1alpha1.GroupVersion.WithKind("Tier")
+	if mgr != nil && mgr.GetRESTMapper() != nil {
+		if _, err := mgr.GetRESTMapper().RESTMapping(tierGVK.GroupKind(), tierGVK.Version); err == nil {
+			bld = bld.Watches(
+				&agentv1alpha1.Tier{},
+				handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+					return enqueueAgentsInNamespace(ctx, obj.GetNamespace())
+				}),
+				// The Tier reconciler writes status; only spec changes,
+				// creates and deletes change the file.
+				builder.WithPredicates(predicate.GenerationChangedPredicate{}),
+			)
+		}
+	}
+
 	// AgentProfiles feed the identity map, so a profile created, edited or
 	// deleted re-renders it. Registered only when the CRD is installed, like
 	// AgentPlugin's watch above.

@@ -7,7 +7,9 @@ sidebar:
 
 A `Tier` names what a task may do. An `AgentProfile` lists the tiers it allows in `allowedTiers`, and a task runs at its requester's tier.
 
-**Nothing enforces a `Tier` yet.** The capability verifier and the gateway still use their built-in `read` and `unattended` tiers, and `allowedTiers` still accepts only those two names. Editing a `Tier` changes what `kubectl get tiers.kubeagents.x-k8s.io` shows and nothing else (the full name, since Calico has a `tiers` resource of its own). Later changes make the tier set data, map people to tiers, and enforce `writeMode`.
+**A `Tier` is loaded but not yet usable.** Under `spec.mode: next`, the operator renders every `Tier` in the install's namespace into the ConfigMap `<agent>-a2a-tiers`. The capability verifier, the gateway and the auth callout read it and add each tier to their tier table, at the verb set its `mode` gives: `interactive` gets what `read` permits, and `unattended` what `unattended` permits.
+
+The built-in `read` and `unattended` tiers, and the legacy ones, are compiled in: a `Tier` with one of their names changes nothing, and a missing or unreadable file leaves the built-in set. `allowedTiers` still accepts only `read` and `unattended`, and every person still runs at `read`, so a new tier changes nothing an install does yet. (The full name is `tiers.kubeagents.x-k8s.io`, since Calico has a `tiers` resource of its own.) Later changes let profiles name new tiers, map people to tiers, and enforce `writeMode`.
 
 A `Tier` lives in the install's namespace:
 
