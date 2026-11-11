@@ -163,3 +163,13 @@ class EpochTest(unittest.TestCase):
                 time.tzset()
                 self.assertEqual(sf.epoch("2026-07-10T20:30:27Z"), expected)
         time.tzset()
+
+
+class ChurnMessageTest(unittest.TestCase):
+    def test_a_measurement_that_rounds_into_the_band_passes(self):
+        f = sf.fleet("S")
+        designed = {c.name: sf.Observed(c.nodes, c.deployments, c.cronjobs, c.failing_pods) for c in f.clusters}
+        self.assertTrue(sf.check(f, designed, 44.97)["sound"])  # rounds to 45.0, the edge of 50 within 10 %
+        result = sf.check(f, designed, 44.9)
+        self.assertFalse(result["sound"])
+        self.assertIn("churn 44.9", result["findings"][0])

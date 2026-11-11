@@ -306,10 +306,12 @@ def check(the_fleet: Fleet, observed: dict[str, Observed], churn_per_minute: flo
             findings.append(f"{c.name}: {o.failing_pods} failing Pods, designed {c.failing_pods}")
     churn: dict[str, Any] = {"designed_per_minute": the_fleet.churn_per_minute}
     if churn_per_minute is not None:
-        churn["measured_per_minute"] = round(churn_per_minute, 1)
-        if abs(churn_per_minute - the_fleet.churn_per_minute) > CHURN_TOLERANCE * the_fleet.churn_per_minute:
+        # The check and its message use the same rounded figure, so a finding never reads as a pass.
+        measured = round(churn_per_minute, 1)
+        churn["measured_per_minute"] = measured
+        if abs(measured - the_fleet.churn_per_minute) > CHURN_TOLERANCE * the_fleet.churn_per_minute:
             findings.append(
-                f"churn {churn_per_minute:.1f} Pods a minute, designed {the_fleet.churn_per_minute:.1f} "
+                f"churn {measured:.1f} Pods a minute, designed {the_fleet.churn_per_minute:.1f} "
                 f"within {CHURN_TOLERANCE:.0%}"
             )
     return {

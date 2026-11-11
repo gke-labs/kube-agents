@@ -175,10 +175,14 @@ def _snapshot(install: collect.Install | None, errors: list[str]) -> collect.Sna
     if install is None:
         return None
     try:
-        return install.snapshot(["litellm"])
+        snap = install.snapshot(["litellm"])
     except kube.CommandError as exc:
         errors.append(f"could not read LiteLLM's counters: {exc}")
         return None
+    # A missing pod, port or scrape is reported inside the snapshot, not raised: without this the
+    # window would show no tokens and $0 of spend with nothing to say the read failed.
+    errors.extend(f"LiteLLM counters: {e}" for e in snap.errors)
+    return snap
 
 
 def _window(install: collect.Install | None, start: float, end: float, before: collect.Snapshot | None,

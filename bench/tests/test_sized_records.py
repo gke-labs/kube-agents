@@ -65,3 +65,40 @@ class CostTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RegionTest(unittest.TestCase):
+    def test_skus_follow_the_region(self):
+        europe = {key: (description, region) for key, _s, description, region in sr.skus("europe-west1")}
+        self.assertEqual(europe["n1_core_hour"], ("N1 Predefined Instance Core running in EMEA", "europe-west1"))
+        self.assertEqual(europe["zonal_cluster_hour"][1], "global")
+
+    def test_an_unknown_region_is_an_error_not_a_wrong_price(self):
+        with self.assertRaises(LookupError):
+            sr.skus("mars-north1")
+
+
+class RetryTest(unittest.TestCase):
+    def test_a_body_cut_off_part_way_is_retried(self):
+        import http.client
+        from unittest import mock
+        calls = []
+
+        class Body:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                calls.append(1)
+                if len(calls) == 1:
+                    raise http.client.IncompleteRead(b"partial")
+                return b'{"skus": []}'
+
+        with mock.patch.object(sr, "_token", return_value="t"), \
+                mock.patch.object(sr.urllib.request, "urlopen", return_value=Body()), \
+                mock.patch.object(sr.time, "sleep"):
+            self.assertEqual(sr._get("https://example.invalid", "p"), {"skus": []})
+        self.assertEqual(len(calls), 2)

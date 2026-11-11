@@ -11,6 +11,7 @@ by hand.
 
 from __future__ import annotations
 
+import http.client
 import json
 import subprocess
 import time
@@ -26,13 +27,27 @@ CATALOG = "https://cloudbilling.googleapis.com/v1/services/{service}/skus?curren
 QUOTA_HEADER = "x-goog-user-project"
 COMPUTE_SERVICE = "6F81-5844-456A"
 GKE_SERVICE = "CCD8-9BF1-090E"
-# (record key, service, SKU description, region) for each price the record uses.
-SKUS = (
-    ("n1_core_hour", COMPUTE_SERVICE, "N1 Predefined Instance Core running in Americas", "us-central1"),
-    ("n1_ram_gib_hour", COMPUTE_SERVICE, "N1 Predefined Instance Ram running in Americas", "us-central1"),
-    ("pd_standard_gib_month", COMPUTE_SERVICE, "Storage PD Capacity", "us-central1"),
-    ("zonal_cluster_hour", GKE_SERVICE, "Zonal Kubernetes Clusters", "global"),
+GLOBAL_REGION = "global"
+DEFAULT_REGION = "us-central1"
+# The catalog names N1 SKUs by continent ("running in Americas"); a region's prefix says which.
+CONTINENTS = (
+    (("us-", "northamerica-", "southamerica-"), "Americas"),
+    (("europe-", "me-", "africa-"), "EMEA"),
+    (("asia-", "australia-"), "APAC"),
 )
+
+
+def skus(region: str) -> tuple[tuple[str, str, str, str], ...]:
+    """(record key, service, SKU description, region) for each price the record uses, in ``region``."""
+    continent = next((name for prefixes, name in CONTINENTS if region.startswith(prefixes)), None)
+    if continent is None:
+        raise LookupError(f"no catalog continent for region {region!r}")
+    return (
+        ("n1_core_hour", COMPUTE_SERVICE, f"N1 Predefined Instance Core running in {continent}", region),
+        ("n1_ram_gib_hour", COMPUTE_SERVICE, f"N1 Predefined Instance Ram running in {continent}", region),
+        ("pd_standard_gib_month", COMPUTE_SERVICE, "Storage PD Capacity", region),
+        ("zonal_cluster_hour", GKE_SERVICE, "Zonal Kubernetes Clusters", GLOBAL_REGION),
+    )
 # n1-standard-1's shape, as the price is per core and per GiB.
 N1_SHAPES = {"n1-standard-1": (1, 3.75), "n1-standard-2": (2, 7.5), "n1-standard-4": (4, 15.0)}
 HOURS_PER_MONTH = 730
@@ -58,7 +73,8 @@ def _get(url: str, project: str) -> dict[str, Any]:
         try:
             with urllib.request.urlopen(request, timeout=60) as response:  # noqa: S310 -- a fixed Google API URL
                 return json.loads(response.read())
-        except (ConnectionError, TimeoutError, urllib.error.URLError):
+        # IncompleteRead (an HTTPException) is the body cut off part-way, the usual way a large page fails.
+        except (ConnectionError, TimeoutError, urllib.error.URLError, http.client.HTTPException):
             if attempt == GET_ATTEMPTS:
                 raise
             time.sleep(GET_RETRY_SECONDS * attempt)
@@ -70,25 +86,27 @@ def _unit_price(sku: dict[str, Any]) -> float:
     return int(rate.get("units", "0")) + rate.get("nanos", 0) / NANOS
 
 
-def pick_prices(skus_by_service: dict[str, list[dict[str, Any]]]) -> dict[str, dict[str, Any]]:
+def pick_prices(skus_by_service: dict[str, list[dict[str, Any]]],
+                region: str = DEFAULT_REGION) -> dict[str, dict[str, Any]]:
     """The record's prices from the catalog's SKUs: each by its description, region and on-demand use."""
     prices = {}
-    for key, service, description, region in SKUS:
+    for key, service, description, sku_region in skus(region):
         match = next(
             (s for s in skus_by_service.get(service, [])
-             if s["description"] == description and region in s.get("serviceRegions", [])
+             if s["description"] == description and sku_region in s.get("serviceRegions", [])
              and s.get("category", {}).get("usageType", ON_DEMAND) == ON_DEMAND),
             None,
         )
         if match is None:
-            raise LookupError(f"no {description!r} SKU in {region}")
+            raise LookupError(f"no {description!r} SKU in {sku_region}")
         prices[key] = {"usd": _unit_price(match), "sku": match["skuId"], "description": description}
     return prices
 
 
-def catalog_prices(project: str, get: Callable[[str, str], dict[str, Any]] = _get) -> dict[str, Any]:
+def catalog_prices(project: str, region: str = DEFAULT_REGION,
+                   get: Callable[[str, str], dict[str, Any]] = _get) -> dict[str, Any]:
     by_service: dict[str, list[dict[str, Any]]] = {}
-    for service in {s[1] for s in SKUS}:
+    for service in {s[1] for s in skus(region)}:
         url, skus = CATALOG.format(service=service), []
         while url:
             page = get(url, project)
@@ -97,7 +115,7 @@ def catalog_prices(project: str, get: Callable[[str, str], dict[str, Any]] = _ge
             url = f"{CATALOG.format(service=service)}&pageToken={token}" if token else ""
         by_service[service] = skus
     return {"source": "Cloud Billing Catalog API", "read": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-            "prices": pick_prices(by_service)}
+            "region": region, "prices": pick_prices(by_service, region)}
 
 
 @dataclass
@@ -187,10 +205,10 @@ def window(install: collect.Install, start: float, end: float,
 
 
 def cost_record(project: str, run_id: str, windows: dict[str, dict[str, Any]],
-                until: float | None = None) -> dict[str, Any]:
-    """The run's cost: the fleet's infrastructure, priced from the catalog, and its model spend by window."""
+                until: float | None = None, region: str = DEFAULT_REGION) -> dict[str, Any]:
+    """The run's cost: the fleet's infrastructure, priced from the catalog in its region, and its model spend."""
     until = until or time.time()
-    prices = catalog_prices(project)
+    prices = catalog_prices(project, region)
     infra = fleet_cost(instances(project, run_id, until), cluster_hours(project, run_id, until), prices)
     model = {name: w.get("model_spend_usd", 0.0) for name, w in windows.items()}
     return {
@@ -208,6 +226,7 @@ def safe(fn: Callable[[], dict[str, Any]], errors: list[str], what: str) -> dict
     """Run one record step; a failure is noted in the run's errors instead of losing the run."""
     try:
         return fn()
-    except (kube.CommandError, LookupError, ValueError, OSError, subprocess.SubprocessError) as exc:
+    except (kube.CommandError, LookupError, ValueError, OSError, subprocess.SubprocessError,
+            http.client.HTTPException) as exc:
         errors.append(f"{what}: {exc}")
         return {}

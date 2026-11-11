@@ -32,6 +32,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -40,7 +41,7 @@ sys.path.insert(0, str(REPO / "bench"))
 
 from kube_agents_bench.scale import collect, kube  # noqa: E402
 from kube_agents_bench.scale import sized_fleet as sf  # noqa: E402
-from kube_agents_bench.scale import sized_records, sized_run  # noqa: E402
+from kube_agents_bench.scale import runner, sized_records, sized_run  # noqa: E402
 
 LOG = logging.getLogger("sized-fleet")
 STACK_DIR = REPO / "bench" / "tf" / "sized-fleet"
@@ -56,6 +57,10 @@ DEFAULT_NAMESPACE = "kubeagents-system"
 KUBECONFIG_FORMAT = "sized-fleet-{size}.kubeconfig"
 NETWORK_FORMAT = "sized-fleet-{size}"
 VERDICT_FILE = "scale-verdict.json"
+# The label a host cluster carries when its install exists to be measured: a run resets the
+# install's state volumes, and refuses a host without it, as the scale runner does.
+HOST_LABEL = "purpose=harness-scale"
+LEASE_NOTE = "sized fleet run {run_id} ({size})"
 MEASUREMENTS_FILE = "scale-measurements.json"
 COST_FILE = "scale-cost.json"
 PRIVATE_MODE = 0o600
@@ -202,7 +207,8 @@ def measure_churn(args: argparse.Namespace, fleet: sf.Fleet, minutes: int) -> fl
     """Client Pods started a minute: the distinct client Pods seen created inside the window."""
     ctx = contexts(args, fleet)
     selector = f"{sf.PART_OF_LABEL}={sf.PART_OF},{sf.COMPONENT_LABEL}={sf.CLIENT}"
-    start = time.time()
+    # Whole seconds, as Kubernetes timestamps are: a fractional start drops the Pods created in its own second.
+    start = float(int(time.time()))
     seen: set[str] = set()
 
     def names(context: str) -> set[str]:
@@ -214,13 +220,18 @@ def measure_churn(args: argparse.Namespace, fleet: sf.Fleet, minutes: int) -> fl
                 out.add(f"{context}/{p['metadata']['namespace']}/{p['metadata']['name']}")
         return out
 
-    while time.time() - start < minutes * SECONDS_PER_MINUTE:
+    def poll() -> float:
         with ThreadPoolExecutor(CLUSTER_PARALLELISM) as pool:
             for found in pool.map(names, ctx.values()):
-                seen |= found
+                seen.update(found)
+        return time.time()
+
+    polled = poll()
+    while polled - start < minutes * SECONDS_PER_MINUTE:
         time.sleep(CHURN_POLL_SECONDS)
-    elapsed = (time.time() - start) / SECONDS_PER_MINUTE
-    return len(seen) / elapsed
+        polled = poll()
+    # The window ends at the last poll, so no time after it counts without its Pods.
+    return len(seen) / ((polled - start) / SECONDS_PER_MINUTE)
 
 
 def cmd_plan(args: argparse.Namespace) -> int:
@@ -272,32 +283,80 @@ def leftover_clusters(args: argparse.Namespace) -> list[str]:
     return out.split()
 
 
+def check_host(args: argparse.Namespace) -> None:
+    """Refuse a host cluster without HOST_LABEL: the run resets its install's state volumes."""
+    key, _, value = HOST_LABEL.partition("=")
+    labels = kube.cluster_labels(args.project, args.host_location, args.host_cluster)
+    if labels.get(key) != value:
+        raise SystemExit(f"host cluster {args.host_cluster} does not carry {HOST_LABEL}; refusing to reset its install")
+
+
+def host_lease(args: argparse.Namespace):
+    """The host install's live-test lease, held and renewed for the run, as the scale runner holds it."""
+    host_context = kube.context_name(args.project, args.host_location, args.host_cluster)
+    plan = SimpleNamespace(target={"host_context": host_context, "namespace": args.namespace,
+                                   "host_cluster": args.host_cluster}, settings={})
+    return runner.hold_lease(plan, LEASE_NOTE.format(run_id=args.run_id, size=args.size))
+
+
+def interruptible() -> None:
+    """SIGTERM and SIGHUP (a closed terminal) end the run through the same paths as an error does.
+
+    Installed only around the run itself: during a `tofu` call the handler would make Python
+    SIGKILL tofu, which leaves its state lock held.
+    """
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda signum, _frame: sys.exit(SIGNAL_EXIT_BASE + signum))
+
+
+def shielded() -> None:
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(sig, signal.SIG_IGN)
+
+
 def cmd_run(args: argparse.Namespace) -> int:
-    if not args.down:
-        return run_once(args)[0]
+    kube.gcloud("container", "clusters", "get-credentials", args.host_cluster, f"--location={args.host_location}",
+                project=args.project)
+    check_host(args)
+    with host_lease(args):
+        if not args.down:
+            interruptible()
+            try:
+                return run_once(args)[0]
+            finally:
+                shielded()
+        return run_and_delete(args)
+
+
+def run_and_delete(args: argparse.Namespace) -> int:
     # A run that stops for any reason, an exception or a closed session's signal, still
     # deletes the fleet: a fleet left standing costs its whole size every hour.
-    rc, out = EXIT_UNSOUND, None
+    rc, out, down_error = EXIT_UNSOUND, None, ""
+    interruptible()
     try:
         rc, out = run_once(args)
     finally:
         # A second signal must not cut the destroy short: that leaves tofu's state lock held
         # and the fleet standing.
-        for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
-            signal.signal(sig, signal.SIG_IGN)
+        shielded()
         LOG.info("deleting the fleet (--down)")
-        cmd_down(args)
+        try:
+            cmd_down(args)
+        except (TofuFailed, subprocess.SubprocessError, kube.CommandError) as exc:
+            down_error = str(exc)
+            LOG.error("the fleet could not be deleted: %s", exc)
     left = leftover_clusters(args)
     if out is not None:
         verdict_path = out / VERDICT_FILE
         verdict = json.loads(verdict_path.read_text())
-        verdict["checks"]["teardown"] = {"passed": not left, "failures": [f"{name} still exists" for name in left]}
-        verdict["green"] = verdict["green"] and not left
+        failures = [f"{name} still exists" for name in left] + ([f"down failed: {down_error}"] if down_error else [])
+        verdict["checks"]["teardown"] = {"passed": not failures, "failures": failures}
+        verdict["green"] = verdict["green"] and not failures
         verdict_path.write_text(json.dumps(verdict, indent=2) + "\n")
         LOG.info("%s: %s", VERDICT_FILE, summary(VERDICT_FILE, verdict))
         if args.results_bucket:
             kube.run([kube.GCLOUD, "storage", "cp", str(verdict_path), results_prefix(args)])
-    return EXIT_UNSOUND if left else rc
+    return EXIT_UNSOUND if left or down_error else rc
 
 
 def results_prefix(args: argparse.Namespace) -> str:
@@ -307,8 +366,6 @@ def results_prefix(args: argparse.Namespace) -> str:
 def run_once(args: argparse.Namespace) -> tuple[int, Path]:
     fleet = sf.fleet(args.size)
     credentials(args, fleet)
-    kube.gcloud("container", "clusters", "get-credentials", args.host_cluster, f"--location={args.host_location}",
-                project=args.project)
     host_context = kube.context_name(args.project, args.host_location, args.host_cluster)
 
     def check_fleet() -> dict:
@@ -320,11 +377,12 @@ def run_once(args: argparse.Namespace) -> tuple[int, Path]:
                                    namespace=args.namespace, check_fleet=check_fleet, install=install,
                                    soak_seconds=args.soak_minutes * SECONDS_PER_MINUTE)
     # Before `down`: the cost record reads the fleet's own instances and clusters.
-    cost = sized_records.safe(lambda: sized_records.cost_record(args.project, args.run_id, record.windows),
-                              record.errors, "cost record")
+    cost = sized_records.safe(
+        lambda: sized_records.cost_record(args.project, args.run_id, record.windows, region=region_of(args.zone)),
+        record.errors, "cost record")
+    result["errors"] = list(record.errors)
     records = {
-        VERDICT_FILE: {"size": args.size, "run_id": args.run_id, "fleet": record.fleet_check, **result,
-                       "notes": list(record.errors)},
+        VERDICT_FILE: {"size": args.size, "run_id": args.run_id, "fleet": record.fleet_check, **result},
         MEASUREMENTS_FILE: {"size": args.size, "run_id": args.run_id, "windows": record.windows},
         COST_FILE: cost,
     }
@@ -430,9 +488,6 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     use_ca_bundle()
-    # SIGTERM and SIGHUP (a closed terminal) end the run through the same finally as an error does.
-    for sig in (signal.SIGTERM, signal.SIGHUP):
-        signal.signal(sig, lambda signum, _frame: sys.exit(SIGNAL_EXIT_BASE + signum))
     return COMMANDS[args.command](args)
 
 
