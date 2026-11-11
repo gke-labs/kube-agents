@@ -153,8 +153,30 @@ class SlackAgentTestLogic(unittest.TestCase):
         with mock.patch.dict("os.environ", {"E2E_SLACK_MODE": ""}):
             with mock.patch.object(MOD, "_kubectl_json", lambda *a: {"items": [{"spec": {"mode": "next"}}]}):
                 self.assertEqual("next", MOD.install_mode())
-            with mock.patch.object(MOD, "_kubectl_json", lambda *a: None):
+            with mock.patch.object(MOD, "_kubectl_json", lambda *a: {"items": [{"spec": {}}]}):
                 self.assertEqual("", MOD.install_mode())
+            with mock.patch.object(MOD, "_kubectl_json", lambda *a: None):
+                self.assertIsNone(MOD.install_mode())
+
+    def test_on_next_a_status_line_quoting_the_result_is_not_the_answer(self):
+        working = {"ts": "1800000001.000100", "user": _BOT, "bot_id": "B1", "text": "⚙️ *working* — 2 + 3 = 5"}
+        done = dict(working, text="✅ *completed*")
+        fake = FakeSlack([{}, {"replies": [working]}, {"reaction": "eyes", "replies": [done, _ANSWER]}])
+        _run(fake, mode="next")
+        self.assertGreaterEqual(fake.polls, 3)  # the preflight, the working line, then the answer
+
+    def test_on_next_a_failed_turn_fails_at_once(self):
+        failed = {"ts": "1800000001.000100", "user": _BOT, "bot_id": "B1", "text": "❌ *failed*"}
+        notice = {"ts": "1800000002.000100", "user": _BOT, "bot_id": "B1", "text": "❌ failed: the model returned 5xx"}
+        fake = FakeSlack([{"replies": [failed, notice]}])
+        with self.assertRaises(_Failed) as caught:
+            _run(fake, mode="next")
+        self.assertIn("failure", str(caught.exception))
+
+    def test_an_unknown_mode_skips_the_modes_own_checks(self):
+        answer = {"ts": _ANSWER_TS, "user": _BOT, "text": "It is 5."}
+        with mock.patch.object(MOD, "install_mode", lambda: None):
+            _run(FakeSlack([{"replies": [answer]}]), mode="")
 
     def test_timing_legs_are_measured_from_the_post(self):
         t = MOD.Timeline(posted=MOD.live.ts_value(_ASK_TS), first_reply=MOD.live.ts_value("1800000001.000100"), answer=MOD.live.ts_value(_ANSWER_TS))

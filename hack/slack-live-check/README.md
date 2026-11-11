@@ -1,6 +1,6 @@
 # Slack live check
 
-A by-hand live check of the A2A gateway's Slack backend on a `spec.mode: next` install. Two Slack user accounts talk to the gateway's bot. A person types each of their turns in Slack, and the harness checks the typed message and judges the gateway's reply. Each check prints a named PASS or FAIL with its evidence. It runs as a Kubernetes Job on the target cluster, so no workstation ever holds the user tokens. It is never run in CI and is not part of the `tests/e2e/` release gate.
+A by-hand live check of the A2A gateway's Slack backend on a `spec.mode: next` install. Two Slack user accounts talk to the gateway's bot. A person types each of their turns in Slack, and the harness checks the typed message and judges the gateway's reply. Each check prints a named PASS or FAIL with its evidence. It runs as a Kubernetes Job on the target cluster, so no workstation ever holds the user tokens. It is never run in CI itself, but `tests/e2e/slack_agent_test.py`, part of the `tests/e2e/` release gate, imports `harness.py`'s Slack client and reply readers, so a change to their API reaches the release gate.
 
 | File                         | Runs where             | What it does                                                                               |
 | ---------------------------- | ---------------------- | ------------------------------------------------------------------------------------------ |

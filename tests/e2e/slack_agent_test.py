@@ -6,9 +6,9 @@ a post made with a user token through an app to that app (bot_id), which the A2A
 drops as bot traffic unless the install lists the test user in A2A_SLACK_TEST_USERS (the
 chart's operator.slackTestUsers); a preflight reads the posted ask back and fails at
 once, naming that, when the install does not. The test polls the thread, fails at once
-when the bot's first reply is a refusal, a failure or a not-started notice (quoting it),
-and asserts an answer arrived in time and, on next, that it opens on a bold headline; it
-records Slack's timestamps for each leg.
+when the bot's first reply is a refusal or a not-started notice, or on next when the turn
+fails (quoting it), and asserts an answer saying 5 arrived in time and, on next, that it
+opens on a bold headline; it records Slack's timestamps for each leg.
 
 The bot's reaction on the ask is asserted on today, where the arrival reaction stays up
 for the turn. On next it comes only from the hermes-bridge's 60-second progress
@@ -114,14 +114,15 @@ def _kubectl_json(*args: str) -> dict | None:
     return json.loads(res.stdout)
 
 
-def install_mode() -> str:
-    """E2E_SLACK_MODE when set, else the PlatformAgent's spec.mode ("" reads as today)."""
+def install_mode() -> str | None:
+    """E2E_SLACK_MODE when set, else the PlatformAgent's spec.mode ("" reads as today), or
+    None when neither says, in which case the mode's own checks are skipped."""
     if os.environ.get(MODE_ENV):
         return os.environ[MODE_ENV]
-    agents = _kubectl_json(PLATFORM_AGENT_RESOURCE) or {}
-    for item in agents.get("items") or []:
+    agents = _kubectl_json(PLATFORM_AGENT_RESOURCE)
+    for item in (agents or {}).get("items") or []:
         return (item.get("spec") or {}).get("mode", "")
-    return ""
+    return None
 
 
 def gateway_test_users() -> list[str] | None:
@@ -132,6 +133,8 @@ def gateway_test_users() -> list[str] | None:
     for container in deployment["spec"]["template"]["spec"].get("containers", []):
         for env in container.get("env") or []:
             if env.get("name") == TEST_USERS_ENV_ON_GATEWAY:
+                if "value" not in env:
+                    return None  # from a ConfigMap or Secret: unknown here, so not a refusal
                 return [u.strip() for u in env.get("value", "").split(",") if u.strip()]
     return []
 
@@ -197,6 +200,20 @@ def _thread(client, channel: str, ts: str) -> list[dict]:
     return client.call("conversations.replies", channel=channel, ts=ts, limit=REPLIES_PAGE_LIMIT).get("messages") or []
 
 
+def _turn(replies: list[dict], next_mode: bool) -> tuple[dict, str] | None:
+    """The bot's reply to the ask and its kind, once there is one, from its messages oldest
+    first. On next, the gateway's grammar decides (harness.read_turn): a refusal, a
+    not-started notice or a failed status line ends the turn, and the answer is the post
+    after the status line once it reads completed, so a status line quoting the result is
+    never taken for it. Elsewhere, the first-reply check stands and any bot message
+    containing the expected answer is the answer."""
+    if next_mode:
+        has_line = any(live.status_state(m.get("text", "")) for m in replies)
+        return live.read_turn(replies, live.WAIT_ANSWER, lineless=not has_line)
+    msg = _answer(replies)
+    return (msg, live.KIND_ANSWER) if msg is not None else None
+
+
 def _answer(replies: list[dict]) -> dict | None:
     for msg in reversed(replies):
         if EXPECTED_ANSWER_PATTERN.search(msg.get("text", "")):
@@ -228,9 +245,13 @@ def preflight_ask(client, channel: str, ask_ts: str) -> None:
 
 def test_slack_agent_math_response(slack_settings) -> None:
     client, channel, bot_user = slack_settings
-    next_mode = install_mode() == MODE_NEXT
+    mode = install_mode()
+    next_mode = mode == MODE_NEXT
     prompt = PROMPT_TEMPLATE.format(bot=bot_user, stamp=datetime.now(timezone.utc).strftime("%H:%M:%S UTC"))
-    print(f"\n[E2E Slack] channel={channel} bot={bot_user} next={next_mode}")
+    print(f"\n[E2E Slack] channel={channel} bot={bot_user} mode={mode!r}")
+    if mode is None:
+        print(f"[E2E Slack] {MODE_ENV} is unset and kubectl cannot read the PlatformAgent, so the mode's "
+              "own checks (headline, reaction) are skipped")
     print(f"[E2E Slack] prompt: {prompt!r}")
 
     try:
@@ -267,7 +288,12 @@ def test_slack_agent_math_response(slack_settings) -> None:
                 if timeline.ack_kind in ACK_REFUSED_KINDS:
                     pytest.fail(f"The bot's first reply is a {timeline.ack_kind}, so the turn never ran: "
                                 f"{replies[0].get('text', '')[:300]!r}")
-            answer = _answer(replies)
+            turn = _turn(replies, next_mode)
+            if turn is not None:
+                msg, kind = turn
+                if kind != live.KIND_ANSWER:
+                    pytest.fail(f"The turn ended as a {kind}: {msg.get('text', '')[:300]!r}")
+                answer = msg
         if answer is not None:
             edited = (answer.get("edited") or {}).get("ts")
             timeline.answer = live.ts_value(edited) or live.ts_value(answer.get("ts"))
@@ -276,8 +302,11 @@ def test_slack_agent_math_response(slack_settings) -> None:
     finally:
         record_timing(timeline)
 
-    assert answer is not None, f"No answer containing '5' in the thread within {TEST_TIMEOUT_SEC}s"
-    if next_mode:
+    assert answer is not None, f"No answer in the thread within {TEST_TIMEOUT_SEC}s"
+    assert EXPECTED_ANSWER_PATTERN.search(timeline.answer_text), f"The answer does not say 5: {timeline.answer_text[:300]!r}"
+    if mode is None:
+        pass
+    elif next_mode:
         assert timeline.answer_headline, f"The answer does not open on a bold headline: blocks={json.dumps(answer.get('blocks'))[:400]}"
         if timeline.reaction:
             print(f"[E2E Slack] the bot reacted on next; {REACTION_GAP_ISSUE} may be fixed, so make this check hard")
