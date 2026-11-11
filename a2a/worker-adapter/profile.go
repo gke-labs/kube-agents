@@ -243,7 +243,7 @@ func (w *profileWorker) taskConfigDir(task string) (string, func(), error) {
 		// removed.
 		_ = filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
 			if err == nil && d.IsDir() {
-				_ = os.Chmod(p, 0o755)
+				_ = os.Chmod(p, 0o755) // #nosec G122 G302 -- gives the owner write back on the worker's own temp tree so it can be removed
 			}
 			return nil
 		})
@@ -271,7 +271,7 @@ func lockRendered(dir string) error {
 			return err
 		}
 		if d.IsDir() {
-			return os.Chmod(p, 0o555)
+			return os.Chmod(p, 0o555) // #nosec G122 G302 -- 0555 locks the worker's own rendered tree read-only; that is the point
 		}
 		info, err := d.Info()
 		if err != nil {
@@ -281,7 +281,7 @@ func lockRendered(dir string) error {
 		if info.Mode()&0o100 != 0 {
 			mode = 0o555
 		}
-		return os.Chmod(p, mode)
+		return os.Chmod(p, mode) // #nosec G122 -- the worker's own rendered tree, as above
 	})
 }
 
@@ -660,7 +660,7 @@ func (w *profileWorker) resetTimeout() time.Duration {
 func removeAllWritable(path string) error {
 	_ = filepath.WalkDir(path, func(p string, d fs.DirEntry, err error) error {
 		if err == nil && d.IsDir() {
-			_ = os.Chmod(p, 0o700)
+			_ = os.Chmod(p, 0o700) // #nosec G122 G302 -- gives the owner write back on the worker's own tree so it can be removed
 		}
 		return nil
 	})

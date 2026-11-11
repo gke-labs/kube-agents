@@ -339,7 +339,7 @@ forge: the shared install has a repository, and removing it mid-run would break 
 ## 9. Open questions
 
 - **Chain length.** Each audit took one to eight minutes on a four-cluster install with
-  `gemini-3.1-flash-lite`, so with the retrospective fifth the stage is done, the four audits ended
+  the install's default model, so with the retrospective fifth the stage is done, the four audits ended
   and the fifth started, within about forty minutes of the scan there, inside the eval stack's
   hour-long wait. On a large fleet the last audit may land an hour or more after the scan.
 - **Output volume.** How many pull requests and chat lines a first run produces on a real fleet. If
