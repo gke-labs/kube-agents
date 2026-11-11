@@ -105,7 +105,8 @@ verification_spec:
       type: report_contains
       any_of_patterns:
         - '(?m)^(?!checking\b).*(?<![:\d-])\b\d{1,4} (?:(?!projects?\b)\S+ ){0,3}clusters?\b'
-        - '(?m)^(?!checking\b).*\bclusters?(?: \S+){0,2}[:=] \d{1,4}\b'
+        - '(?m)^(?!checking\b).*\bclusters?(?: \S+){0,4}[:=] \d{1,4}\b'
+        - '(?m)^(?!checking\b).*\bclusters? \(\d{1,4}\)'
   # An answer drawn from an earlier card says when the count was taken, as a
   # duration or a clock time ("about two hours ago", "two hours old", "14:02
   # UTC" however it is introduced, a date); a bare "earlier" or "today" tells the reader nothing
@@ -119,4 +120,4 @@ verification_spec:
       type: report_contains
       any_of_patterns:
         - '(?m)^result of delegated task\b'
-        - '\b(?:ago|(?:\d+|an?|one|two|three|four|five|six|seven|eight|nine|ten|twelve|half an?) (?:minutes?|hours?|days?) old|yesterday|just now|this (?:morning|afternoon|evening)|last night|\d{1,2}:\d{2}|\d{4}-\d{2}-\d{2}|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]* \d{1,2})\b'
+        - '\b(?:ago|(?:\d+|an?|one|two|three|four|five|six|seven|eight|nine|ten|twelve|half an?|a few|several|a couple of) (?:minutes?|hours?|days?) old|yesterday|just now|this (?:morning|afternoon|evening)|last night|\d{1,2}:\d{2}|\d{4}-\d{2}-\d{2}|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]* \d{1,2})\b'

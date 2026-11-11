@@ -66,6 +66,8 @@ GOOD = (
     "platform counted 12 running GKE clusters around 14:02 UTC.",
     "platform counted 12 running GKE clusters (14:02 UTC).",
     "**12 GKE clusters**, counted by platform on 2026-11-11.",
+    "platform's count, a few hours old: running GKE clusters (12) across 4 projects.",
+    "platform counted gke clusters across 4 projects: 12, about an hour ago.",
 )
 # A fresh card: the ack, then the result the harness folds under its header.
 FRESH = (
