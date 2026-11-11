@@ -98,6 +98,21 @@ const (
 	// not found, which is the protocol's own answer for a task the server
 	// no longer holds.
 	a2aMaxTasks = 4096
+	// The reasons in a not-found error's data (a2aTaskNotHeld), which a client
+	// reads instead of parsing the message. Neither says the task failed: the
+	// door forgot it, and the task may have run, or may still be running.
+	// a2aNotHeldEvicted: the door held the caller's task and evicted it to
+	// stay inside its bounds, running or not.
+	a2aNotHeldEvicted = "evicted"
+	// a2aNotHeldSinceServing: this gateway holds no record of the id. The
+	// door keeps tasks in the active gateway's memory only, so a task
+	// submitted before servingSince, before a restart or failover, is
+	// unknown here: its executor may have finished it or may still be
+	// running it. Also the answer for an id that is another caller's or
+	// that no door minted, so it confirms nothing about ids the caller
+	// can't read.
+	a2aNotHeldSinceServing = "not-held-since-serving"
+
 	// a2aMaxEvictedIDs bounds the ids the door remembers having evicted,
 	// so a caller asking after one is told it was evicted, not that the
 	// door never held it (a2aTaskNotHeld).
@@ -1457,23 +1472,6 @@ func (d *A2ADoor) rememberEvictedLocked(taskID, caller string) {
 		d.evictedOrder = d.evictedOrder[1:]
 	}
 }
-
-// The reasons in a not-found error's data (a2aTaskNotHeld), which a client
-// reads instead of parsing the message. Neither says the task failed: the
-// door forgot it, and the task may have run, or may still be running.
-const (
-	// a2aNotHeldEvicted: the door held the caller's task and evicted it to
-	// stay inside its bounds, running or not.
-	a2aNotHeldEvicted = "evicted"
-	// a2aNotHeldSinceServing: this gateway holds no record of the id. The
-	// door keeps tasks in the active gateway's memory only, so a task
-	// submitted before servingSince, before a restart or failover, is
-	// unknown here: its executor may have finished it or may still be
-	// running it. Also the answer for an id that is another caller's or
-	// that no door minted, so it confirms nothing about ids the caller
-	// can't read.
-	a2aNotHeldSinceServing = "not-held-since-serving"
-)
 
 // a2aNotHeldData is the data of a door not-found error: why the door
 // doesn't hold the task, when this gateway started serving the door, and
