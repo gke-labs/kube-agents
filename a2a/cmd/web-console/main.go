@@ -1419,7 +1419,7 @@ func (s *server) hermes(ctx context.Context, method, path string, body any) (*ht
 		}
 		reader = bytes.NewReader(b)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, s.cfg.HermesURL+path, reader)
+	req, err := http.NewRequestWithContext(ctx, method, s.cfg.HermesURL+path, reader) // #nosec G704 -- the host is HERMES_URL, the console's own gateway address; a request-supplied path segment is PathEscape'd by its caller
 	if err != nil {
 		return nil, err
 	}
@@ -1429,7 +1429,7 @@ func (s *server) hermes(ctx context.Context, method, path string, body any) (*ht
 	if s.cfg.APIServerKey != "" {
 		req.Header.Set("Authorization", bearerPrefix+s.cfg.APIServerKey)
 	}
-	return s.client.Do(req)
+	return s.client.Do(req) // #nosec G704 -- same URL as above
 }
 
 type upstreamError struct {

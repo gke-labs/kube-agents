@@ -679,7 +679,7 @@ func readPrimer(log *slog.Logger) string {
 	if path == "" {
 		return ""
 	}
-	b, err := os.ReadFile(path) // #nosec G304 -- the spawner's own mount path
+	b, err := os.ReadFile(path) // #nosec G304 G703 -- the spawner's own mount path (lib.EnvPrimerFile)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			log.Warn("could not read the transcript primer; this turn runs without the conversation so far", "path", path, "error", err)
