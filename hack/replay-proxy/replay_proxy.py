@@ -578,9 +578,11 @@ class ShadowProxy:
             )
         self.config = config
         self.cache = replay_cache.AnswerCache(config.cache_dir) if config.mode != F.MODE_SHADOW else None
-        # Replay reads a cache another job recorded; its index is built once, at start.
+        # Replay reads a cache another job recorded; its index is built at start,
+        # and again whenever the seed marker changes (refresh_index).
         self.index = replay_cache.PrefixIndex(self.cache.entries()) if config.mode == F.MODE_REPLAY else None
         self.index_empty = not (self.index and self.index.by_prefix)
+        self._index_stamp: Optional[int] = self._seed_stamp() if config.mode == F.MODE_REPLAY else None
         self.key_context = normalizer.KeyContext(config.litellm_config_checksum, config.litellm_image)
         self.scrubber = request_store.Scrubber(config.redactor_path, config.transcript_rules_path)
         self.budget: Optional[spool.DataBudget] = None
@@ -682,10 +684,27 @@ class ShadowProxy:
         process, on when the prefix arrived), so it is kept by their digests:
         each turn normalizes only its new answer's prefix, not every earlier one.
         """
+        for variant in self.history_variants(body, messages, digests, first_seen, received):
+            if not self.cache.has_variant(*variant):
+                return False
+        return True
+
+    def history_variants(
+        self, body: Dict[str, Any], messages: List[Any], digests: List[str], first_seen: List[float], received: float,
+        last_only: bool = False,
+    ):
+        """(context, answer) of each assistant message, as record mode noted the answer to the request before it.
+
+        Memoized by the digests of the prefix, so each answer is normalized once
+        per process. With `last_only`, only the last assistant message's.
+        """
         settings = {k: v for k, v in body.items() if k not in normalizer.KEY_DROP_FIELDS and k != normalizer.MESSAGES_FIELD}
         chain = normalizer.stable_hash(settings)
+        indices = [i for i, m in enumerate(messages)
+                   if isinstance(m, dict) and m.get(ROLE_KEY) == normalizer.ASSISTANT_ROLE]
+        wanted = set(indices[-1:] if last_only else indices)
         for index, message in enumerate(messages):
-            if isinstance(message, dict) and message.get(ROLE_KEY) == normalizer.ASSISTANT_ROLE:
+            if index in wanted:
                 memo_key = normalizer.stable_hash([chain, digests[index]])
                 with self._variant_lock:
                     variant = self._variants.get(memo_key)
@@ -698,10 +717,8 @@ class ShadowProxy:
                         self._variants[memo_key] = variant
                         while len(self._variants) > VARIANT_MEMO_CAPACITY:
                             self._variants.popitem(last=False)
-                if not self.cache.has_variant(*variant):
-                    return False
+                yield variant
             chain = normalizer.stable_hash([chain, digests[index]])
-        return True
 
     def submit(
         self, body: Dict[str, Any], received: float, upstream: Dict[str, Any], request_bytes: int,
@@ -869,7 +886,8 @@ class ShadowProxy:
         # fallback's answer or any other unstorable one. Each recording notes its
         # own, so two that answered differently both count, even where the first
         # write of the saved answer won.
-        self.cache.add_variant(*normalizer.answer_variant(normalized, upstream["message"], self.key_context))
+        variant = entry.get(F.ANSWER_VARIANT) or normalizer.answer_variant(normalized, upstream["message"], self.key_context)
+        self.cache.add_variant(*variant)
         slot_key, slots = normalizer.answer_slots(normalized, self.key_context)
         if slots:
             self.cache.save_slot(slot_key, entry[F.FINGERPRINT])
@@ -896,12 +914,35 @@ class ShadowProxy:
             block[F.MISS_REFUSED] = refused
         return block
 
+    def _seed_stamp(self) -> Optional[int]:
+        try:
+            return os.stat(os.path.join(self.config.cache_dir, replay_cache.SEED_MARKER)).st_mtime_ns
+        except OSError:
+            return None
+
+    def refresh_index(self) -> None:
+        """Rebuild the miss index when the cache was seeded since it was built.
+
+        The replay lane seeds the cache after the proxy has started (and again
+        into a pod that replaced one), so an index built only at start would
+        report every miss as `no_saved_request`. Serving never needs this:
+        every lookup reads the cache as it is. Runs on the analysis thread.
+        """
+        stamp = self._seed_stamp()
+        if stamp is None or stamp == self._index_stamp:
+            return
+        self._index_stamp = stamp
+        index = replay_cache.PrefixIndex(self.cache.entries())
+        self.index, self.index_empty = index, not index.by_prefix
+
     def _closest(self, entry: Dict[str, Any], raw_messages: List[Any], diag_walked: List[Any]) -> Dict[str, Any]:
         """The closest saved request and where this one first differs from it."""
-        if self.index_empty:
+        self.refresh_index()
+        index = self.index
+        if self.index_empty or index is None:
             return {F.MISS_ROLE: F.MISS_ROLE_NO_CACHE}
         hashes = entry[F.DIAG_MESSAGE_HASHES]
-        candidates, matched = self.index.candidates(entry[F.DIAG_SETTINGS_HASH], hashes)
+        candidates, matched = index.candidates(entry[F.DIAG_SETTINGS_HASH], hashes)
         if not candidates:
             return {F.MISS_ROLE: F.MISS_ROLE_SETTINGS, F.MISS_MATCHED_MESSAGES: 0}
         current = None
@@ -1053,6 +1094,12 @@ class ShadowProxy:
         entry[F.DIAG_MESSAGE_HASHES] = diag_hashes
         entry[F.DIAG_SETTINGS_HASH] = self.diagnosis.settings_hash(body, self.key_context.as_dict(), received)
         if self.config.mode == F.MODE_RECORD:
+            if upstream["message"]:
+                entry[F.ANSWER_VARIANT] = list(normalizer.answer_variant(normalized, upstream["message"], self.key_context))
+            digests, first_seen = self.diagnosis.first_seen_with_digests(raw_messages, received)
+            prior = list(self.history_variants(body, raw_messages, digests, first_seen, received, last_only=True))
+            if prior:
+                entry[F.PRIOR_ANSWER] = list(prior[0])
             entry[F.RECORDED] = self.record(entry, upstream, normalized, stored, raw_messages, diag_walked, received)
         if self.config.mode == F.MODE_REPLAY and served is None:
             entry[F.MISS] = self.miss_block(entry, raw_messages, diag_walked, upstream.get("refused"))

@@ -618,7 +618,9 @@ CHAT_REPORT_MAX_BYTES = 1024 * 1024
 # created at runtime keeps posting its final message.
 IMAGE_PLATFORM_ROSTER = "/opt/platform-template/cron/jobs.json"
 # The field the relay plugin (deploy/docker/plugins/chat/adapter.py) sends on
-# every scheduled delivery and `report_to_chat` never does.
+# every scheduled delivery, and onboarding's lost-summaries stage
+# (bootstrap_delivery.resend_lost_summaries) when it re-posts a first-run
+# audit that found no home channel; `report_to_chat` never does.
 SCHEDULER_LEG_KEY = "also_delivered_to"
 # deploy/docker/plugins/chat/adapter.py: SCHEDULER_FAILURE_FIELD, set when the
 # delivery is the scheduler's failure line for the run.
@@ -6593,7 +6595,8 @@ def submit_cron_report(request_data: Dict[str, Any]) -> Dict[str, str]:
     """Relay a specialist's finished scheduled report to chat, and say whether it landed.
 
     Synchronous on purpose, unlike `/inject`. This route's caller is not an agent
-    turn waiting on a tool result — it is the cron scheduler's delivery step, and
+    turn waiting on a tool result — it is the cron scheduler's delivery step (or
+    onboarding's lost-summaries stage re-posting one of its deliveries), and
     its return value is what decides whether the run is recorded as delivered.
     Answering `accepted` before doing the work made every failure past this line
     invisible: `hermes send` exiting non-zero, unparseable `--json` stdout, or an
@@ -10865,7 +10868,7 @@ def mark_finding_surfaced(finding_id: str, body: Dict[str, Any] | None = None) -
 
 @app.get("/v1/findings/additions", dependencies=[Depends(verify_api_key)])
 def get_finding_additions(day: str = "") -> Dict[str, Any]:
-    """Items added on a UTC day (default today) by class, across every state (§7.2)."""
+    """Items added on a UTC day (default today) by class, and the line of each, across every state (§7.2)."""
     day = day or datetime.now(timezone.utc).date().isoformat()
     try:
         with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:

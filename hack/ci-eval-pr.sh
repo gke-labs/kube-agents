@@ -41,6 +41,9 @@ readonly EVAL_NIGHTLY_CASES_FILE="eval/nightly-cases.txt"
 readonly EVAL_GITLAB_CASES_FILE="eval/gitlab-cases.txt"
 readonly EVAL_GHES_CASES_FILE="eval/ghes-cases.txt"
 readonly EVAL_CERTIFICATION_CASES_FILE="eval/certification-cases.txt"
+# What the replay lane runs (EVAL_REPLAY_LANE=true, hack/ci-env.sh): each entry
+# a registered case, replayed from the nightlies' recordings, gating nothing.
+readonly EVAL_REPLAY_LANE_CASES_FILE="eval/replay-lane-cases.txt"
 # The stack-bearing cases of the nightly's main part that run in main-b,
 # main-c, main-d and main-e, when EVAL_NIGHTLY_PART splits that part in five
 # (#3384, #4238): a stack-bearing case on no list runs in main-a, which
@@ -249,6 +252,14 @@ readonly EVAL_ROLLBACK_SKIP_JOB_TYPES="presubmit batch"
 # next, the round trip runs before the matrix and ends with the install at
 # this mode, and the matrix then grades today over the agent API.
 readonly EVAL_ROLLBACK_LANE_END_MODE="today"
+
+# stop_model_calls_on_cancel (beside the TERM trap): the job types whose
+# cancelled run is thrown away, so a SIGTERM may cut model access at once, and
+# the bound on the gateway scale-down's API call, the one the other LiteLLM
+# calls on the exit path take (LITELLM_LOG_REQUEST_TIMEOUT, hack/ci-env.sh):
+# long enough for a slow API server, short against the 5m grace period.
+readonly EVAL_CANCEL_CUTS_MODEL_JOB_TYPES="presubmit batch"
+readonly EVAL_CANCEL_SCALE_REQUEST_TIMEOUT="30s"
 
 # release_inflight_note (beside the ledger reset, section 5): the sandbox
 # pod's shell container, the scratch directory audit_report.py writes its
@@ -698,6 +709,10 @@ publish_eval_dashboard() {
     echo "eval-dashboard publish skipped: EVAL_TIER=certification: the certification lane's record is its logs bucket, read by the certified-capabilities page, not the nightly dashboard"
     return 0
   fi
+  if [ "${EVAL_REPLAY_LANE:-}" = "true" ]; then
+    echo "eval-dashboard publish skipped: EVAL_REPLAY_LANE=true: replayed runs repeat the nightly's recordings, which is not main's live history"
+    return 0
+  fi
   if [ -z "${EVAL_DASHBOARD_TARGET:-}" ]; then
     echo "eval-dashboard publish skipped: EVAL_DASHBOARD_TARGET is not set (the Prow job config arms this later)"
     return 0
@@ -931,7 +946,76 @@ trap profile_and_dump_on_exit EXIT
 # night of 2026-09-21 six units finished up to three minutes after the trap
 # had run. A unit that completes its case in that window grades it itself
 # (finish_case), so its block lands in the grading artifact after the cut-off line.
-trap 'exit 143' TERM INT
+#
+# A run that grades a change is the exception (stop_model_calls_on_cancel,
+# below): there the SIGTERM is almost always Prow cancelling the build for a
+# newer push, the verdict is thrown away, and the units, the agents and the
+# judge used to run on for the rest of the grace period (a median 2.7 min over
+# 608 cancelled presubmits, Oct 22-30) with nothing to show for it. The same
+# SIGTERM at a presubmit's own 360m deadline is treated alike: its cut-off
+# table holds the cases graded before the signal, not those a unit would
+# have finished in the grace period.
+trap 'stop_model_calls_on_cancel || true; exit 143' TERM INT
+
+# The fan-out's units without a stack, by PID, as launch_units starts them,
+# finished or not. A unit with a stack is never killed: its devops-bench
+# destroys the stack on the way out, and a kill skips that and leaves the
+# stack's cloud resources in the project for the next lease. The scale-down
+# below still takes its agent's model access.
+FANOUT_STACKLESS_UNIT_PIDS=""
+
+# Freezes <pid> and every process under it, top down, and prints their PIDs.
+# Frozen first so a unit cannot start its next command (the judge, after its
+# kubectl exec dies) between the kill of a child and the kill of the unit.
+freeze_process_tree() { # <pid>
+  local child
+  kill -STOP "$1" 2>/dev/null || return 0
+  echo "$1"
+  for child in $(pgrep -P "$1" 2>/dev/null); do
+    freeze_process_tree "${child}"
+  done
+}
+
+# On a SIGTERM to a run that grades a change: kill the fan-out's stackless
+# units (and the judge calls they make), take the LiteLLM log, then scale the LiteLLM
+# Deployment to zero so no agent in the install can reach a model. The log
+# comes first because the scale-down takes the pods that hold it;
+# collect_litellm_log runs once, so the EXIT trap's call is then a no-op. A
+# main-branch run keeps the behaviour above: its deadline cut-off is graded
+# from the units that finish in the grace period. Never fatal; called with
+# `|| true`, so errexit is off inside.
+stop_model_calls_on_cancel() {
+  local job_type cuts=""
+  for job_type in ${EVAL_CANCEL_CUTS_MODEL_JOB_TYPES}; do
+    [ "${job_type}" = "${JOB_TYPE:-}" ] && cuts=1
+  done
+  [ -n "${cuts}" ] || return 0
+  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Cancelled (JOB_TYPE=${JOB_TYPE}): stopping the fan-out and the model gateway before collecting artifacts ==="
+  # Only the units still in this shell's job table: a finished unit's PID may
+  # since belong to some other process.
+  local pid frozen="" running
+  running=" $(jobs -rp | tr '\n' ' ') "
+  for pid in ${FANOUT_STACKLESS_UNIT_PIDS:-}; do
+    case "${running}" in *" ${pid} "*) ;; *) continue ;; esac
+    frozen="${frozen} $(freeze_process_tree "${pid}" | tr '\n' ' ')"
+  done
+  if [ -n "${frozen// /}" ]; then
+    # shellcheck disable=SC2086 # one PID per word
+    kill -TERM ${frozen} 2>/dev/null
+    # shellcheck disable=SC2086
+    kill -CONT ${frozen} 2>/dev/null
+  fi
+  # Pinned to the leased project's cluster, as scheduled_audits is.
+  case "${AGENT_CLUSTER_CONTEXT:-}" in
+    "gke_${PROJECT_ID:-}_"?*) ;;
+    *) return 0 ;;
+  esac
+  [ -n "${PROJECT_ID:-}" ] || return 0
+  declare -F collect_litellm_log >/dev/null && collect_litellm_log
+  kubectl --context "${AGENT_CLUSTER_CONTEXT}" -n "${TARGET_NAMESPACE:-${NAMESPACE:-kubeagents-system}}" \
+    scale "${LITELLM_LOG_DEPLOYMENT}" --replicas=0 --request-timeout="${EVAL_CANCEL_SCALE_REQUEST_TIMEOUT}" \
+    || echo "WARNING: could not scale ${LITELLM_LOG_DEPLOYMENT} to zero; the install keeps model access until the teardown removes it" >&2
+}
 
 # ─── Boskos lease heartbeat for the eval's own lifetime ──────────────────────
 # The Prow wrapper's `boskosctl heartbeat` covers this step, but boskosctl
@@ -1169,6 +1253,10 @@ export AGENT_CLUSTER_CONTEXT="gke_${PROJECT_ID}_${REGION}_${HOST_CLUSTER_NAME}"
 # From here to the EXIT trap, a replaced agent pod or restarted container is
 # on record however early it happens (collect_agent_pod_diagnostics).
 start_agent_pod_watch
+# On the replay lane, the nightlies' recorded answers go into every proxy pod
+# before any case runs; with nothing to replay the lane stops here, having
+# measured nothing (hack/ci-env.sh). A no-op on every other run.
+prepare_replay_lane_cache || exit 1
 # Under EVAL_REPLAY_SHADOW=true, the shadow proxy's lines and stored text go
 # to the private bucket from here on, while the eval runs (hack/ci-env.sh).
 start_replay_shadow_collector
@@ -1214,9 +1302,9 @@ run_rollback_lane() {
     ${bound[@]+"${bound[@]}"} bash "${SCRIPT_DIR}/${EVAL_ROLLBACK_SCRIPT}" "${TARGET_NAMESPACE}" "${AGENT_SERVICE_NAME}" \
     > >(tee "${artifacts}/${EVAL_ROLLBACK_LOG}") 2>&1 &
   EVAL_ROLLBACK_PID=$!
-  trap 'kill -TERM "${EVAL_ROLLBACK_PID}" 2>/dev/null || true; wait "${EVAL_ROLLBACK_PID}" 2>/dev/null || true; exit 143' TERM INT
+  trap 'kill -TERM "${EVAL_ROLLBACK_PID}" 2>/dev/null || true; wait "${EVAL_ROLLBACK_PID}" 2>/dev/null || true; stop_model_calls_on_cancel || true; exit 143' TERM INT
   wait "${EVAL_ROLLBACK_PID}" || status=$?
-  trap 'exit 143' TERM INT
+  trap 'stop_model_calls_on_cancel || true; exit 143' TERM INT
   if [ "${status}" -ne 0 ]; then
     echo "ERROR: the rollback lane's round trip failed (exit ${status}): the next install did not roll back to ${EVAL_ROLLBACK_LANE_END_MODE} cleanly, so its matrix is not run. The last FAIL line above names the check, or says the run was stopped at its ${EVAL_ROLLBACK_TIMEOUT_SECONDS}s bound (transcript: ${artifacts}/${EVAL_ROLLBACK_LOG})." >&2
     exit 1
@@ -3085,6 +3173,45 @@ case "${EVAL_TIER}" in
     ;;
 esac
 
+# ─── The replay lane (examples/inference-replay/eval-design.md, Rollout 2) ───
+# EVAL_REPLAY_LANE=true replaces the matrix with hack/eval/replay-lane-cases.txt:
+# registered cases (a presubmit or nightly entry), each replayed from what the
+# nightlies recorded. The lane gates nothing and records nothing as main's
+# history (the recorder decision and the dashboard hook below both skip it);
+# its report is the collector's, in the private shadow bucket. It runs on the
+# presubmit tier's defaults and GitHub only.
+case "${EVAL_REPLAY_LANE:-false}" in
+  false) ;;
+  true)
+    if [ "${EVAL_TIER}" != "presubmit" ] || [ -n "${LANE_CASES_FILE}" ]; then
+      echo "ERROR: EVAL_REPLAY_LANE=true runs its own roster on GitHub; unset EVAL_TIER (${EVAL_TIER}) and EVAL_FORGE (${EVAL_FORGE})." >&2
+      exit 1
+    fi
+    REPLAY_LANE_CASES_FILE="${SCRIPT_DIR}/${EVAL_REPLAY_LANE_CASES_FILE}"
+    REPLAY_LANE_ENTRIES="$(roster_entries "${REPLAY_LANE_CASES_FILE}")"
+    REPLAY_LANE_TASKS=()
+    while IFS= read -r ENTRY; do
+      if [ -n "${ENTRY}" ]; then REPLAY_LANE_TASKS+=("${ENTRY}"); fi
+    done <<< "${REPLAY_LANE_ENTRIES}"
+    if [ "${#REPLAY_LANE_TASKS[@]}" -eq 0 ]; then
+      echo "ERROR: ${REPLAY_LANE_CASES_FILE} names no case; the replay lane would replay nothing." >&2
+      exit 1
+    fi
+    for ENTRY in "${REPLAY_LANE_TASKS[@]}"; do
+      if ! printf '%s\n' "${PRESUBMIT_ENTRIES}" "${NIGHTLY_ENTRIES}" | grep -qxF -- "${ENTRY}"; then
+        echo "ERROR: ${REPLAY_LANE_CASES_FILE}: '${ENTRY}' is in neither ${PRESUBMIT_CASES_FILE} nor ${NIGHTLY_CASES_FILE}; the lane replays what the nightly records." >&2
+        exit 1
+      fi
+    done
+    TASKS=("${REPLAY_LANE_TASKS[@]}")
+    echo "EVAL_REPLAY_LANE=true: the replay lane replays ${#TASKS[@]} case(s) (${EVAL_REPLAY_LANE_CASES_FILE}); nothing it grades is recorded or gates anything"
+    ;;
+  *)
+    echo "ERROR: EVAL_REPLAY_LANE must be 'true' or 'false', got '${EVAL_REPLAY_LANE}'." >&2
+    exit 1
+    ;;
+esac
+
 # Which part of the nightly matrix this run takes, so the nightly can run as
 # several periodics on leased projects of their own: the cases that request a pull request
 # run one unit at a time after every other unit (unit_phase, below), and on
@@ -3423,8 +3550,9 @@ fi
 export BENCH_GITOPS_REPO="${INJECT_LANE_REPO}"
 INJECT_LANE_TASKS_DIR="$(mktemp -d)"
 # One `<requested> <case> <copy>` line per task: how many pull requests
-# the case requests (its own checks, or the file's `requesting:` list for
-# a case the persona answers with one before its checks say so), the case,
+# the case requests (the larger of its own checks and its top-level
+# `requested_pull_requests` key, which also stands in for a case the
+# persona answers with one before its checks say so), the case,
 # and the copy's path. The cases with a non-zero count are the fan-out's
 # second phase (INJECT_LANE_REQUESTING, read where the unit queue is built):
 # they run only after every other unit has finished, so a repetition of a
@@ -4009,6 +4137,11 @@ BLOCKING_ROSTER_ON_LANE=""
 if [ "${EVAL_TIER}" = "certification" ]; then
   echo "EVAL_TIER=certification: no blocking-roster case is in the certification matrix, so rung 4 is disarmed on this lane (rungs 1-3 and rung 5 still red it)."
 fi
+# The replay lane gates nothing: no roster name is armed on it, whatever its
+# roster shares with the presubmit's.
+if [ "${EVAL_REPLAY_LANE:-}" = "true" ]; then
+  echo "EVAL_REPLAY_LANE=true: rung 4 is disarmed on the replay lane, which gates nothing."
+fi
 # Set when the inject lane's exclusion list drops a ROSTER case: what the
 # every-roster-case-excluded guard below tests, since an empty
 # BLOCKING_ROSTER_ON_LANE has a second cause on the GitLab lane.
@@ -4018,6 +4151,9 @@ while IFS= read -r NAME; do
   if ! grep -qxF -- "${NAME}" <<< "${PRESUBMIT_CASE_NAMES}"; then
     echo "ERROR: ${BLOCKING_ROSTER_FILE}: '${NAME}' is not a case in ${PRESUBMIT_CASES_FILE}; the blocking roster is a subset of the presubmit." >&2
     exit 1
+  fi
+  if [ "${EVAL_REPLAY_LANE:-}" = "true" ]; then
+    continue
   fi
   # A roster case the inject lane's exclusion step dropped from the matrix
   # (INJECT_LANE_DROPPED, empty on every other lane) leaves the export too:
@@ -4138,8 +4274,14 @@ fi
 if [ "${EVAL_ROLLBACK_LANE:-}" = "1" ]; then
   EVAL_IS_MAIN_RUN="false"
 fi
+# The replay lane never appends: a replayed run repeats a recording that
+# passed, so its passes would inflate the very rates the gate admits on
+# (examples/inference-replay/eval-design.md, "A replay lane that gates nothing").
+if [ "${EVAL_REPLAY_LANE:-}" = "true" ]; then
+  EVAL_IS_MAIN_RUN="false"
+fi
 # The certification lane never appends either: its record is the logs
-# bucket, read by the certified-capabilities page per case and model, and
+# bucket, read by the certified-capabilities page per case and release, and
 # none of its cases is on the blocking roster, so the admission window has
 # nothing to decide for them. It reads the store like a presubmit.
 if [ "${EVAL_TIER}" = "certification" ]; then
@@ -5541,6 +5683,9 @@ EOF_UNIT_QUEUE
     UNIT_SEQ=$((${UNIT_SEQ:-0} + 1))
     run_one_unit "${TASKS[IDX]}" "${TASK_NAMES[IDX]}" "${REP}" "${TASK_REUSE[IDX]}" "${TASK_HAS_STACK[IDX]}" "${UNIT_SEQ}" "${TASK_STREAMS[IDX]}" &
     task_jobs="${task_jobs} $!:${IDX}"
+    # A stack's unit, lock taker or exempt, is never killed (FANOUT_STACKLESS_UNIT_PIDS).
+    unit_takes_infra_lock "${IDX}" || infra_lock_exempt "${TASK_NAMES[IDX]}" \
+      || FANOUT_STACKLESS_UNIT_PIDS="${FANOUT_STACKLESS_UNIT_PIDS:-} $!"
     if [ "${counted}" = 1 ]; then
       infra_pids="${infra_pids} $!"
     fi
@@ -5937,9 +6082,9 @@ run_rollback_roundtrip() {
     ${bound[@]+"${bound[@]}"} bash "${SCRIPT_DIR}/${EVAL_ROLLBACK_SCRIPT}" "${TARGET_NAMESPACE}" "${AGENT_SERVICE_NAME}" \
     > >(tee "${log}") 2>&1 &
   EVAL_ROLLBACK_PID=$!
-  trap 'kill -TERM "${EVAL_ROLLBACK_PID}" 2>/dev/null || true; wait "${EVAL_ROLLBACK_PID}" 2>/dev/null || true; exit 143' TERM INT
+  trap 'kill -TERM "${EVAL_ROLLBACK_PID}" 2>/dev/null || true; wait "${EVAL_ROLLBACK_PID}" 2>/dev/null || true; stop_model_calls_on_cancel || true; exit 143' TERM INT
   wait "${EVAL_ROLLBACK_PID}" || status=$?
-  trap 'exit 143' TERM INT
+  trap 'stop_model_calls_on_cancel || true; exit 143' TERM INT
   if [ "${status}" -eq 0 ]; then
     outcome="passed"
   else

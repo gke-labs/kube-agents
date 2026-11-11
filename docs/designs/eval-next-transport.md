@@ -77,7 +77,7 @@ store reads, or the collecting turn, which is a model call the customer never ma
 
 The consequence, measured: the presubmit matrix ran under `mode: next` with the A2A gateway in
 `ErrImagePull`, the auth callout in `ImagePullBackOff` and the provisioning Job in `Error`, and
-the job went GREEN (build `2100310325382352896`, admitted-case pass rate 90.0%, no case
+the job went GREEN (build `2100310325382352896`: the admitted-case pass rate inside the margin, no case
 collapsed, every failing repetition a phrase miss the same cases carry under `today`). The gate
 cannot red on a broken next stack until a case sends through it. The same measurement found
 nothing that passed under `today` and failed reproducibly under `next`, which is the other half
@@ -472,12 +472,12 @@ with the `platform_toolsets.cli` bundle: `terminal`, `read_file`, `patch`, `proc
 from the one today's evals reach. The api transport posts to the API server, which runs the
 default profile, the Planning Agent: its model-facing tools are the kanban set, it delegates fleet
 work to the platform persona over a card, and it relays the worker's report. Same prompt, two
-agents reading it: `obtainability-remediation-proposal` is 12 of 12 on the first, where the
-Planning Agent inlines a manifest, and was 0 of 3 on the second, where the persona followed its own
+agents reading it: `obtainability-remediation-proposal` is clean on the first, where the
+Planning Agent inlines a manifest, and collapsed on the second, where the persona followed its own
 rule and opened a pull request (the rule has since been scoped, in `agents/platform/SOUL.md` §3: a
 request to investigate or report is answered in the reply, and a pull request is opened only when
 the request asks for one or for a change to be submitted or fixed; the unattended case is
-`fleet-audit`'s own path); the first run's 94.4% against 77.8% is withdrawn as a like-for-like
+`fleet-audit`'s own path); the first run's rate comparison of the two is withdrawn as a like-for-like
 comparison. The lane now runs the bridge's `api` executor, the default a customer install runs,
 so the turn is the API server's and the agent that answers is the Planning Agent, the one the api
 transport reaches. The delegation wait reads the cards the turn filed from the Planning Agent's
@@ -743,7 +743,7 @@ the batch runs Tide started, the main nightly's eight parts
 `ci-kube-agents-eval-nightly`, `ci-kube-agents-eval-nightly-main-b` to `-main-e`,
 `ci-kube-agents-eval-nightly-writers`, `-writers-b` and `-writers-c`, the GitLab lane's nightly
 under next, the GHES and GitLab CE lanes' weekly jobs under next (`ci-kube-agents-eval-weekly-ghes-next`, `ci-kube-agents-eval-weekly-gitlab-ce-next`), the certification lane's first slice (`ci-kube-agents-certification-1`), and the release-candidate eval's postsubmit, which grades a candidate in the mode a new
-install gets), and refuses it on any other Prow run, so the flag mis-set on the today-mode GitLab nightly or another
+install gets), and refuses it on any other Prow run, so the flag mis-set on another periodic or
 postsubmit still stops the deploy before anything is built. A next-mode run has a record of its own: the baseline version key carries the mode, which
 `bench-gate` reads off the inject transport ([`bench/baselines/README.md`](../../bench/baselines/README.md)),
 so the main nightly appends under a `next` key that today's window never reads, and rung 6 on the

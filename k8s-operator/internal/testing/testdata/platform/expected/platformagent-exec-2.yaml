@@ -62,6 +62,7 @@ rules:
       - limitranges
       - configmaps
       - serviceaccounts
+      - secrets
     verbs:
       - get
       - list
@@ -366,6 +367,11 @@ data:
           memory_notifications: "off"
           tool_progress: "off"
     kanban:
+      admission:
+        fail_closed: true
+        memory_budget_mib: 4096
+        queue_bound_seconds: 600
+        worker_rss_cap_mib: 1536
       max_in_progress: 6
     model:
       api_key: none
@@ -691,6 +697,26 @@ metadata:
 type: Opaque
 ---
 apiVersion: v1
+data:
+  ca.crt: <GENERATED_FOR_TESTS>
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-kube-proxy-ca-bundle
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
+apiVersion: v1
 kind: Service
 metadata:
   labels:
@@ -784,7 +810,7 @@ spec:
             - name: CREDENTIAL_PROXY_AUDIENCE
               value: kubeagents-credential-proxy
             - name: CREDENTIAL_PROXY_ALLOWED_CALLERS
-              value: system:serviceaccount:kubeagents-system:platformagent-gateway-agent,system:serviceaccount:kubeagents-system:platformagent-shell
+              value: system:serviceaccount:kubeagents-system:platformagent-shell
             - name: CREDENTIAL_PROXY_KUBE_CA_FILE
               value: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
             - name: CREDENTIAL_PROXY_KUBE_TOKEN_FILE
@@ -795,6 +821,10 @@ spec:
               value: "true"
             - name: OTEL_RESOURCE_ATTRIBUTES
               value: service.namespace=kubeagents-system,k8s.namespace.name=kubeagents-system,kubeagents.agent_type=platform,kubeagents.agent_name=platformagent
+            - name: KUBE_PROXY_SCOPE_FILE
+              value: /etc/kube-agents/scope/scope.json
+            - name: KUBE_PROXY_EXCLUDE_HOST_CLUSTER_ID
+              value: gke_example-project_us-central1-a_cluster-a
           image: ghcr.io/gke-labs/kube-agents/kube-proxy:latest
           imagePullPolicy: IfNotPresent
           lifecycle:
@@ -838,6 +868,9 @@ spec:
             - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
               name: event-watcher-ksa-token
               readOnly: true
+            - mountPath: /etc/kube-agents/scope
+              name: platform-agent-scope-vol
+              readOnly: true
       securityContext:
         fsGroup: 10000
         runAsNonRoot: true
@@ -856,6 +889,14 @@ spec:
           topologyKey: kubernetes.io/hostname
           whenUnsatisfiable: ScheduleAnyway
       volumes:
+        - configMap:
+            defaultMode: 292
+            items:
+              - key: scope.json
+                path: scope.json
+            name: platformagent-config
+            optional: true
+          name: platform-agent-scope-vol
         - name: kube-proxy-tls
           secret:
             defaultMode: 288
@@ -1439,6 +1480,8 @@ spec:
               value: system:serviceaccount:kubeagents-system:platformagent-gateway-agent,system:serviceaccount:kubeagents-system:platformagent-shell
             - name: CREDENTIAL_PROXY_WATCHER_AUDIENCE
               value: kubeagents-credential-proxy-watcher
+            - name: CREDENTIAL_PROXY_SCOPE_FILE
+              value: /etc/kube-agents/scope/scope.json
             - name: CREDENTIAL_PROXY_KUBE_CA_FILE
               value: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
             - name: CREDENTIAL_PROXY_KUBE_TOKEN_FILE
@@ -1518,6 +1561,9 @@ spec:
             - mountPath: /etc/gitops
               name: gitops-state-volume
               readOnly: true
+            - mountPath: /etc/kube-agents/scope
+              name: platform-agent-scope-vol
+              readOnly: true
       securityContext:
         fsGroup: 10000
         runAsNonRoot: true
@@ -1574,6 +1620,14 @@ spec:
             defaultMode: 420
             name: platformagent-gitops-state
           name: gitops-state-volume
+        - configMap:
+            defaultMode: 292
+            items:
+              - key: scope.json
+                path: scope.json
+            name: platformagent-config
+            optional: true
+          name: platform-agent-scope-vol
 status: {}
 ---
 apiVersion: policy/v1
@@ -1853,6 +1907,8 @@ spec:
               value: system:serviceaccount:kubeagents-system:platformagent-gateway-agent,system:serviceaccount:kubeagents-system:platformagent-shell
             - name: CREDENTIAL_PROXY_WATCHER_AUDIENCE
               value: kubeagents-credential-proxy-watcher
+            - name: CREDENTIAL_PROXY_SCOPE_FILE
+              value: /etc/kube-agents/scope/scope.json
             - name: CREDENTIAL_PROXY_KUBE_CA_FILE
               value: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
             - name: CREDENTIAL_PROXY_KUBE_TOKEN_FILE
@@ -1894,8 +1950,8 @@ spec:
               path: /healthz
               port: cred-health
             initialDelaySeconds: 5
-            periodSeconds: 10
-            timeoutSeconds: 5
+            periodSeconds: 3
+            timeoutSeconds: 2
           resources:
             limits:
               cpu: "2"
@@ -1928,6 +1984,9 @@ spec:
               readOnly: true
             - mountPath: /etc/gitops
               name: gitops-state-volume
+              readOnly: true
+            - mountPath: /etc/kube-agents/scope
+              name: platform-agent-scope-vol
               readOnly: true
             - mountPath: /etc/credential-proxy-exec-tier
               name: credential-proxy-exec-tier-replicas
@@ -1980,6 +2039,14 @@ spec:
             defaultMode: 420
             name: platformagent-gitops-state
           name: gitops-state-volume
+        - configMap:
+            defaultMode: 292
+            items:
+              - key: scope.json
+                path: scope.json
+            name: platformagent-config
+            optional: true
+          name: platform-agent-scope-vol
         - configMap:
             name: platformagent-credential-proxy-exec-tier-replicas
           name: credential-proxy-exec-tier-replicas
@@ -2181,7 +2248,7 @@ spec:
               memory: 8Gi
             requests:
               cpu: "1"
-              memory: 2Gi
+              memory: 4Gi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

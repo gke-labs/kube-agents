@@ -573,6 +573,7 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 				// DataVolume rides with Clusters: both come from the
 				// watcher's body alone.
 				DataVolume: reading.DataVolume,
+				Dispatcher: reading.Dispatcher,
 				ToolPairs:  reading.ToolPairs,
 			})
 		}
@@ -589,6 +590,7 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 	watcherDown := p.noteGatewayReading(cached, gatewayRead)
 	gauges, gaugesKnown := usageClusterGaugesForPoll(cached, scraped, watcherDown)
 	volume, volumeKnown := usageDataVolumeForPoll(cached, scraped, gatewayRead, watcherDown)
+	dispatcher := usageDispatcherForPoll(scraped)
 	clusterRefs, clusterRefsKnown := usageClusterRefsForPoll(cached, scraped, gatewayRead, watcherDown)
 	misses := p.noteReadings(cached, scraped)
 	readings, readingsKnown := usageReadingsForPoll(cached, scraped, misses)
@@ -645,6 +647,9 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 		return err
 	}
 	if err := p.projectDataVolume(ctx, agent, volume, volumeKnown); err != nil {
+		return err
+	}
+	if err := p.projectKanbanDispatcher(ctx, agent, dispatcher); err != nil {
 		return err
 	}
 	return p.projectScope(ctx, agent, clusterRefs, clusterRefsKnown)
@@ -944,6 +949,11 @@ func (p *UsageCounterPoller) targets(ctx context.Context, agent *agentv1alpha1.P
 		// elsewhere.
 		{a2aGatewayPodSelector(agent), usageA2AChatCounters, []usageReadingKind{usageReadingPeople}, a2aGatewayContainerName, a2aGatewayMetricsPortName, true, everyPod},
 		{credentialProxySelector(agent), usageBrokerCounters, []usageReadingKind{usageReadingOutcomes, usageReadingDetails, usageReadingTopTools}, credentialProxyContainerName, credentialProxyMetricsPortName, true, everyPod},
+		// The exec tier's pods, which run the commands the callers send there.
+		// Its selector matches no pod while the tier is off. An exec pod serves
+		// the tool counter, so its pairs join topTools, but none of the
+		// broker's proposal readings.
+		{credentialProxyExecTierSelector(agent), usageExecTierCounters, []usageReadingKind{usageReadingTopTools}, credentialProxyContainerName, credentialProxyMetricsPortName, true, everyPod},
 	}
 	live := map[string]bool{}
 	var targets []usageTarget

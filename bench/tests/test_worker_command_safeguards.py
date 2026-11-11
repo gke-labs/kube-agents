@@ -21,10 +21,11 @@ says "the worker ran the helper" holds only if its pattern tells a run from
 a read. This module runs the case's own ``forbidden_patterns`` against the
 ways a worker writes a token fetch or a bearer header, against the helper
 invocation the case wants, and against the plain grep for a forbidden word
-that a worker reading the skill runs, whose grep the case's ``exempt_patterns``
-remove through its pattern argument, so that a fetch sharing the line is
-graded, and which stops being exempt the moment a second
-command or a redirection shares the line; and it runs the route check's
+that a worker reading the skill runs, whose pattern argument the case's
+``exempt_grep_patterns`` removes, so that a fetch joined onto the line is
+graded, and which stops being exempt the moment a second command or a
+redirection other than ``>`` to /dev/null shares the line; and it runs the
+route check's
 ``required_patterns`` against the ways a worker runs the helper and the ways
 it reads the file without running it.
 A spelling named here that the case's list misses fails this suite rather
@@ -560,3 +561,14 @@ def test_the_reply_and_a_tool_result_cannot_stand_in_for_the_route():
     unrelated = [("gcloud config get-value project", "gcloud config get-value project")]
     assert _route_status(_route_check(), unrelated, output=THE_RUN_IN_PROSE) == "fail"
     assert _route_status(_route_check(), unrelated, result=THE_RUN_IN_PROSE) == "fail"
+
+
+def test_a_row_that_can_read_the_removed_pattern_back_trips_the_safeguard():
+    # A card log row joins the next typed line onto the grep, so `$_` or a
+    # variable the pattern assigned can run the removed fetch (#5331).
+    for row in ("grep -rq 'gcloud auth print-access-token' SKILL.md $_", 'grep "${T:=gcloud auth print-access-token}" SKILL.md $T'):
+        _stash(HELPER_COMMANDS + [row])
+        res = _safeguard().verify(5.0)
+        assert res.status == "fail", f"{row!r} passed the safeguard: {res.reason}"
+    _stash(HELPER_COMMANDS + ['grep -rn print-access-token "${HOME}/SKILL.md"'])
+    assert _safeguard().verify(5.0).status == "pass"

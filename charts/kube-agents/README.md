@@ -246,6 +246,12 @@ under every primary alias the same way (the fallback alias carries
 On a Gemini 2.5 or 3.x model the gateway asks for the model's thoughts with a
 `thinking` key under every primary alias, which a `reasoningEffort` value replaces
 ([why](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#geminis-thoughts)).
+`litellm.budget.usd` (default `0`, meaning none) with `litellm.budget.period`
+(default `1d`) puts a spend ceiling on the gateway, LiteLLM's provider budget
+for the model's provider split evenly across `litellm.replicaCount`; a replica
+whose share is spent refuses model calls until the window ends, and exports the
+remaining share as `litellm_provider_remaining_budget_metric`
+([details](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#setting-a-spend-ceiling)).
 On a Claude model the gateway
 drops `temperature`, `top_p` and `top_k` from every request
 ([why](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#setting-the-default-model)),
@@ -482,7 +488,7 @@ Old agent pods continue routing through `Service/litellm` until the operator upd
 kubectl delete svc litellm -n <namespace>
 ```
 
-**Custom-gateway installs (`litellm.enabled=false`):** If you exposed your own gateway as a Service named `litellm` in the release namespace (the documented path before this release), expose a parallel `inference-gateway` Service (for example, an `ExternalName` pointing at your existing Service) before upgrading. Once the upgrade completes and the operator has reconciled — agent pods are resolving `inference-gateway` — remove the old `litellm` Service. Renaming `litellm` before the upgrade cuts off the active name that running agent pods depend on. When Hindsight is enabled alongside `litellm.enabled=false`, `hindsight-api`'s `NetworkPolicy` renders as `Ingress`-only (omitting the `Egress` rules that pin `app: litellm` / `app: standalone-replay` pods in the release namespace) while still confining `hindsight-api` ingress on port 8888 and rendering `hindsight-postgresql`; apply an egress `NetworkPolicy` of your own for `hindsight-api` if you want to restrict its outbound traffic to your custom gateway.
+**Custom-gateway installs (`litellm.enabled=false`):** If you exposed your own gateway as a Service named `litellm` in the release namespace (the documented path before this release), expose a parallel `inference-gateway` Service (for example, an `ExternalName` pointing at your existing Service) before upgrading. Once the upgrade completes and the operator has reconciled — agent pods are resolving `inference-gateway` — remove the old `litellm` Service. Renaming `litellm` before the upgrade cuts off the active name that running agent pods depend on. When Hindsight is enabled alongside `litellm.enabled=false`, `hindsight-api`'s `NetworkPolicy` renders as `Ingress`-only (omitting the `Egress` rules that pin `app: litellm` / `app: standalone-replay` pods in the release namespace) while still confining `hindsight-api` ingress on port 8888 and rendering `hindsight-postgresql`. To confine its egress to your gateway instead, name the gateway in `hindsight.api.networkPolicy.additionalEgress` ([Hindsight memory store](#hindsight-memory-store)); to replace the policy with one of your own, set `hindsight.api.networkPolicy.enabled=false`, which leaves `hindsight-postgresql` in place.
 
 #### Upgrade notes: static to dynamic NetworkPolicy
 
@@ -517,6 +523,37 @@ with it and everything else renders nothing; `true`/`false` override. The
 image pins mirror `images.json`; `hindsight.postgresql.storage` sizes the
 volumeClaimTemplate (immutable once the StatefulSet exists), and the PVC —
 which **is** the memory — survives uninstall.
+
+`hindsight.networkPolicy` is the umbrella over both policies: `false` renders
+neither. Each policy also has its own switch, `hindsight.api.networkPolicy.enabled`
+and `hindsight.postgresql.networkPolicy.enabled`, so an install can drop
+`hindsight-api`'s policy and keep `hindsight-postgresql`'s, the only guard on a
+database that takes no password. Leave the Postgres switch on; the install
+notes warn when the store renders without it.
+
+`hindsight.api.networkPolicy.additionalEgress` appends egress rules to
+`hindsight-api`'s policy in the shape of the `PlatformAgent` CR's
+`spec.networkPolicy.additionalEgress` (`to[].cidr` with an optional `except`,
+`ports[].protocol` and `port`), bounded as the CRD bounds them: 32 rules, 16
+peers and 16 ports each, a `/12` (IPv4) or `/48` (IPv6) prefix floor, and an
+`except` that must lie inside its peer or the API server rejects the policy.
+The render also refuses what `litellm.openaiCompatible.egressCIDRs` refuses: a
+malformed address, an IPv4-mapped IPv6 block, and a peer in a
+link-local range (`169.254.0.0/16`, `fe80::/10`) or inside `fd20:ce::/48`; the
+first and last of those ranges hold the metadata server's addresses. A bare
+address renders as a `/32` or `/128`. Peers are CIDR blocks, so a gateway in
+another namespace is named by its Pod range. A non-empty list also turns the egress
+half on under `litellm.enabled=false`, after the DNS, Postgres and in-cluster
+gateway rules:
+
+```yaml
+hindsight:
+  api:
+    networkPolicy:
+      additionalEgress:
+        - to: [{ cidr: "10.200.0.0/16" }]
+          ports: [{ protocol: TCP, port: 443 }]
+```
 
 `hindsight.api.rollingUpdate.maxUnavailable` defaults to `0` to keep the
 existing Pod serving while the replacement pulls its image and loads models (up
@@ -1197,6 +1234,18 @@ Exactly one owner creates the broker's KSA, depending on
   does not create it — the **chart** renders it instead, so a default install
   still starts.
 
+### Secret metadata read access (`platformAgent.security.disallowSecretsRead`)
+
+`platformAgent.security.disallowSecretsRead` sets `spec.security.disallowSecretsRead` on the
+`PlatformAgent` CR. When unset (`null`, the default), a new install grants `get`, `list`, and
+`watch` on core `secrets` to `kubeagents:minimal:<ns>:<name>` so `<name>-kube-proxy` can serve
+redacted `Secret` metadata (`KUBE_PROXY_REDACT_SECRETS=true`), while an existing install keeps
+whatever `secrets` permission its `kubeagents:minimal:<ns>:<name>` `ClusterRole` already holds.
+Set `--set platformAgent.security.disallowSecretsRead=true` (or `--disallow-secrets-read=true` /
+`DISALLOW_SECRETS_READ=true` in `install.sh`) to omit `secrets` from the reader `ClusterRole`, or
+set `--set platformAgent.security.disallowSecretsRead=false` to grant `secrets` on an upgraded
+existing install.
+
 ### Admission policies
 
 `admissionPolicy.enabled` (default `true`) installs three cluster-scoped
@@ -1283,6 +1332,13 @@ starts from, and the operator checks the quota itself before each later promotio
 though note that if a namespace ResourceQuota restricts that compute resource (such as
 `limits.cpu` or `limits.memory`), Kubernetes quota admission requires every container to
 declare it (or a `LimitRange` to default it), and will reject the pod if omitted.
+The credential broker's exec tier is counted as `platformAgent.deployment.credentialProxy.exec.replicas`
+times one replica's footprint (`operatorRenderedPerReplica.credentialProxyExecTier`), and not at
+all at `0`. An ephemeral-storage key in `platformAgent.deployment.credentialProxy.resources`
+moves each replica too, because the operator gives the tier the broker's other resource keys; its
+cpu and memory are fixed. It needs no surge headroom: it rolls with `maxSurge: 0` and `maxUnavailable: 1`, so a
+rollout replaces a pod in place and adds none. The check counts the
+quota only; whether a node has room for each 2 CPU replica is the scheduler's.
 The two data claims are counted at `platformAgent.storage.size` when it is set: footprint.yaml
 records how many claims follow it (`dataClaims`) and their default size, and each one moves by
 the difference, so a raise of 30Gi adds 60Gi to `requests.storage`.
@@ -1600,8 +1656,9 @@ helm uninstall kube-agents -n kubeagents-system
   holds its size, its one-at-a-time count and its scope fields to the operator.
 - `files/footprint.yaml` is generated too, but from a different source: it is summed from
   the operator's **golden manifests**
-  (`k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml`, and
-  `platformagent-next.yaml` for its `nextMode` section),
+  (`k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml`,
+  `platformagent-next.yaml` for its `nextMode` section, and
+  `platformagent-exec-1.yaml` for the exec tier's per-replica entry),
   not from `k8s-operator/config/` and not from a live render. Changing the operator's
   resources therefore takes two steps in order — re-bless the goldens
   (`cd k8s-operator && go test ./internal/testing/... -update`), then `make chart-sync`.

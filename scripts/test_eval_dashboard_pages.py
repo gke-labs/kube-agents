@@ -1013,9 +1013,8 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("<td><code>ci-kube-agents-eval-nightly-gitlab-ce-next</code></td>", page)
         self.assertIn("<td><code>ci-kube-agents-eval-weekly-ghes-next</code></td>", page)
         self.assertIn('href="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/ci-kube-agents-eval-weekly-ghes-next/2097282860221206802"', page)
-        # The GitLab lane's next nightly is a table of its own; its today nightly says it has no night yet.
+        # The GitLab lane's next nightly is a table of its own.
         self.assertIn("1 night on record: 0 green, 1 not", page)
-        self.assertIn("No night of", page)
         self.assertIn('href="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/ci-kube-agents-eval-nightly-gitlab-next/2097282860221206801"', page)
 
     def test_a_case_lost_to_the_delegation_ceiling_says_so_on_the_run_page(self):
@@ -1825,7 +1824,15 @@ class CasesAndGridPagesTest(unittest.TestCase):
         data["generated_at"] = NOW
         data["cases"] = [{"name": n, "domain": "cluster-debugging", "active": True} for n in CRASHLOOP_TRIO]
         data["cases"].append({"name": "retired-probe", "domain": "cost", "active": False})
-        data["releases"] = [RC_RELEASE, dict(RC_RELEASE, build_id="7", rc_tag="hostile", artifacts_url="javascript:alert(1)", verdict=None, started="2026-09-09T03:35:01+00:00")]
+        data["releases"] = [
+            RC_RELEASE,
+            dict(RC_RELEASE, build_id="7", rc_tag="hostile", artifacts_url="javascript:alert(1)", verdict=None, started="2026-09-09T03:35:01+00:00"),
+            # A release read from the lane's private bucket (SCHEMA.md,
+            # releases[].gcs_base): its row links the Console, not Spyglass.
+            dict(RC_RELEASE, build_id="2097891568546484225", rc_tag="evalcand_2611100000_5b5ad10", started="2026-09-09T01:35:01+00:00",
+                 gcs_base="gs://kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/2097891568546484225/",
+                 artifacts_url="https://oss.gprow.dev/view/gs/kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/2097891568546484225"),
+        ]
         data["pending_builds"] = [{"build_id": "2097300000000000000", "first_seen": "2026-09-08T14:00:00+00:00"}]
         # A green run that recorded no cases (the gate revalidated the
         # branch's earlier run) sits inside the live window: no Grid column.
@@ -2010,6 +2017,8 @@ class CasesAndGridPagesTest(unittest.TestCase):
         app = dom_text(self.out / "index.html")
         self.assertIn("Release candidates", app)
         self.assertIn('href="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/post-kube-agents-eval-rc/2097891568546484224"', app)
+        self.assertIn('href="https://console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/2097891568546484225"', app)
+        self.assertNotIn("oss.gprow.dev/view/gs/kube-agents-evals-presubmit-logs", app)
         self.assertIn('<span class="pill p-pass">GREEN</span>', app)
         self.assertIn("90.0%", app)
         self.assertIn("baselines maturing", app)

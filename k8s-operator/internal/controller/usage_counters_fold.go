@@ -115,6 +115,10 @@ var (
 	// them.
 	usageA2AChatCounters = []string{usageCounterChatMessagesInbound, usageCounterSessionsChat, usageCounterChatTurnsErrored, usageCounterNegativeFeedback, usageCounterPositiveFeedback}
 	usageBrokerCounters  = []string{usageCounterToolExecutions, usageCounterRemediationsProposed, usageCounterToolExecutionsBlocked, usageCounterBrokerFailures}
+	// usageExecTierCounters are the broker counters the exec tier's pods move:
+	// the commands they run, refuse or fail. The version-control counters are
+	// the stateful broker's alone, because /v1/vcs is not served on an exec pod.
+	usageExecTierCounters = []string{usageCounterToolExecutions, usageCounterToolExecutionsBlocked, usageCounterBrokerFailures}
 	// usageCounters is every counter the document keeps and the status seeds.
 	usageCounters = []string{usageCounterToolExecutions, usageCounterEventsIngested, usageCounterRemediationsProposed, usageCounterChatMessagesInbound, usageCounterSessionsTriage, usageCounterSessionsChat, usageCounterToolExecutionsBlocked, usageCounterBrokerFailures, usageCounterChatTurnsErrored, usageCounterBackgroundTasksGaveUp, usageCounterNegativeFeedback, usageCounterPositiveFeedback}
 	// usageRetiredCounters are the counters an earlier release kept and this
@@ -412,6 +416,9 @@ type usageScrapedPod struct {
 	// DataVolume is the watcher's data volume reading, nil for any pod but a
 	// gateway's and for a watcher body that carried none. Not folded either.
 	DataVolume *usageDataVolume
+	// Dispatcher is the chat plugin's kanban dispatcher reading, nil for any
+	// pod but the gateway's chat_metrics body. Not folded either.
+	Dispatcher *usageDispatcherReading
 	// ToolPairs is the broker's tool counter by tool and subcommand, nil for
 	// any pod but a broker's. Not folded either: the poll sums it across the
 	// broker pods read and projects the top rows (usageTopToolsForPoll).

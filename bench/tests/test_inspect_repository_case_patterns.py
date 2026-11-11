@@ -97,6 +97,13 @@ def test_no_clone_at_all_fails():
     assert not _passes("curl -s https://raw.githubusercontent.com/gke-labs/kube-agents/0.13.0/tags.env")
 
 
+def test_a_clone_chained_behind_an_exempt_grep_is_still_the_clone_run():
+    # A row with a chain on it is no lone grep, so the exemption leaves it
+    # whole and the clone behind the grep is credited.
+    assert _passes(f"grep -n clone SKILL.md && {CLONE_PUBLIC}")
+    assert _passes(f"grep -n clone SKILL.md; {CLONE_CONTEXT}")
+
+
 def test_a_quoted_path_or_a_continued_line_is_still_the_clone_run():
     # A quoted path is one word whichever quote it has. hermes joins a
     # backslash-newline with a space, so the row carries `\ clone`.
@@ -400,3 +407,12 @@ def test_any_interpreter_or_flag_form_that_names_the_route_fails():
         f"http POST {url}",
     ):
         assert not _passes(row, CLONE_PUBLIC), row
+
+
+def test_a_row_that_can_read_the_removed_pattern_back_fails():
+    # A card log row joins the next typed line onto the grep, so `$_` or a
+    # variable the pattern assigned can run the removed route (#5331).
+    url = "http://127.0.0.1:8080/v1/workspace/open"
+    for row in (f"grep -rq 'curl -s -X POST {url}' SKILL.md $_", f'grep "${{X:=curl -s -X POST {url}}}" SKILL.md $X'):
+        assert not _passes(row, CLONE_PUBLIC), row
+    assert _passes('grep -rn "${HOME}/v1/workspace" SKILL.md', CLONE_PUBLIC)

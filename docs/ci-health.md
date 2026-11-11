@@ -103,7 +103,10 @@ archive alongside until that leaves the window; the pool-pressure check and step
 read the new bucket only, so a green from before the move is not reused and the pool gauge's window
 fills over its first week. A run in that bucket records where it lives (`runs[].gcs_base`), and
 the dashboard's and the health bot's build links open that directory in the Cloud Console for a
-project reader; a run in the old bucket keeps its Prow link, which still renders it. The nightly's
+project reader; a run in the old bucket keeps its Prow link, which still renders it. The
+release-candidate lane moves to the same bucket under `logs/`; the collector reads its old archive in
+`gs://kube-agents-prow` alongside until the newest `--rc-limit` builds are all in the new one, and a
+release read from the new one records `releases[].gcs_base` and links the Console the same way. The nightly's
 bucket (`gs://kube-agents-evals-nightly-logs`) is private the same way, so the Nightly report's
 and the nightly issues' run and transcript links open the Console too; for a record whose Prow
 link points into it, the Nightly report, the nightly issues and the lane rows link the Console
@@ -184,7 +187,11 @@ below a storm because a 429-starved worker hits the same wait; the storm
 also needs the pool's peak hourly Vertex 429 share to clear 10 % over the hours
 those runs spent on their calls, when the 429 reading below covers them; a
 reading that does not, and no reading, leaves the runs to decide and the
-evidence says the storm is unconfirmed), or setup
+evidence says the storm is unconfirmed; the evidence line and the Chat
+sentence also quote the repetitions' own words for how they died, as the
+harness wrote them and after the same scrub as the periodics' quoted log line,
+commonest first, so a batch that said `hermes-rate-limited` reads as that and
+not as the bot's guess), or setup
 deaths (3+ runs that concluded `FAILURE` under 5 minutes with no tasks, on 2+
 pull requests, in 2 hours, #1172; an aborted zero-task run is a superseded
 push), or seeded
@@ -254,8 +261,7 @@ towards a distinct-PR floor, and a nightly collapsing is a case's record on
 `main`, not a gate incident. It carries the forge lanes' runs too, one tier
 each (`tiers.FORGE_TIERS`): the GitLab lane (`pull-kube-agents-smoke-test-gitlab`, `tier: gitlab`), on a pull request the
 forge-grading cases of `hack/eval/gitlab-cases.txt` (registered cases, not only presubmit ones) against a pool project's
-GitLab repository, with its nightlies `ci-kube-agents-eval-nightly-gitlab` and `ci-kube-agents-eval-nightly-gitlab-next`
-running the same list; and the self-managed GHES and GitLab CE lanes (`pull-kube-agents-smoke-test-ghes`, `tier: ghes`;
+GitLab repository, with its next-mode nightly `ci-kube-agents-eval-nightly-gitlab-next` running the same list; and the self-managed GHES and GitLab CE lanes (`pull-kube-agents-smoke-test-ghes`, `tier: ghes`;
 `pull-kube-agents-smoke-test-gitlab-ce`, `tier: gitlab-ce`; `docs/ci-pool-projects.md` 5.8), each with a next-mode
 weekly job (`ci-kube-agents-eval-weekly-ghes-next`, `ci-kube-agents-eval-weekly-gitlab-ce-next`). The GitLab lane has a
 section of the Brief, its pull-request runs and then each nightly's nights; the GHES and GitLab CE lanes share one
@@ -427,13 +433,13 @@ reads every project as it did before.
 
 The poster sends one line when the note appears, and again if its verdict
 changes inside the episode. The header names the cause, because the four
-causes have four different remedies and one of them spends money:
+causes call for different things and one of them spends money:
 
 ```text
 ⏳ Smoke gate: pool full — all 30 projects are leased and runs are queuing.
 Consider onboarding a project.
 Last 3h: median wait 24 min against a 15 min limit; p95 157 min against 45.
-2 runs waiting right now, past the 45 min p95 limit.
+2 of 4 waiting runs are past the 45 min p95 limit.
 Runs still pass; /retest makes the queue longer.
 ```
 
@@ -483,10 +489,15 @@ The dashboard dates
 a jam from its own oldest queued run rather than from the episode, for the same
 reason: the episode can have opened days before the backlog being described.
 
-`concurrency cap` (raise it), `runs not starting` (projects were free, so the
-delay is Prow's; the message names the build cluster) and `queue backed up`
-(the job could not read how many projects were in use) carry the same lines
-under a different first one.
+`queue` at the presubmit's cap (runs waited while the presubmit sat at its
+`max_concurrency`; while Deck sees a backlog the message says how many wait
+and the longest wait, otherwise how long runs waited on which days and
+whether the queue was read, and the cap either way; it gives no remedy,
+because the pool is shared and the gap below the cap is the other jobs'
+share), `runs not starting` (projects were free, so the delay is Prow's; the
+message names the build cluster) and `queue backed up` (the job could not
+read how many projects were in use) carry the same lines under a different
+first one.
 
 Unlike the slow note, this one also says when it is over. The window is a
 rolling seven days, so an episode outlives the bad day by up to a week:
@@ -511,8 +522,8 @@ artifact.
 
 This note files no `presubmit-gate` issue, unlike an OUTAGE, lost pods, fixture
 drift and pool drift. A full pool is a capacity fact, not a defect a code change
-closes; its remedies are onboarding and raising the cap, which are planned
-work. Chat, the Brief and the digest carry it, and nothing opens.
+closes; its remedy is onboarding, which is planned work, or a cap the operator
+weighs. Chat, the Brief and the digest carry it, and nothing opens.
 
 The digest carries the median wait every morning whether or not anything is
 wrong (`typical wait`, beside `typical run`), and repeats a one-line version
@@ -528,13 +539,15 @@ rule existed they reported nowhere but TestGrid: `ci-kube-agents-pull-sweep`
 reconcile, as a postsubmit on every merge that changes the stack and as a
 daily pass over every project. A fourth, `ci-kube-agents-certification-1`, is
 not a pool job but the certification lane's weekly slice, watched here because
-its record is its logs bucket and nothing else reads a failed build of it. `scripts/eval_dashboard/periodics.py` lists them in `WATCHED`, one entry
+its record is its logs bucket and nothing else reads a failed build of it. A fifth,
+`ci-kube-agents-eval-replay-lane`, is the inference-replay lane, watched because it gates nothing
+and publishes no dashboard data, so nothing else reads a failed build of it either. `scripts/eval_dashboard/periodics.py` lists them in `WATCHED`, one entry
 per job with its label, its stale window, the report it writes, and the words
 its messages are built from, so adding the next periodic is one entry. The 15-minute tick's `Fetch the watched periodics'
 latest builds` step reads each job's `latest-build.txt` from
 `gs://kube-agents-periodic-logs`, the bucket the pool jobs log to (their own
 identities cannot write the Prow archive), or from the nightlies' bucket
-`gs://kube-agents-evals-nightly-logs` for the certification slice, which is
+`gs://kube-agents-evals-nightly-logs` for the certification slice and the replay lane, which are
 decorated like the nightlies (each `WATCHED` entry names its root),
 walks back to a build with a `finished.json` (the newest is often still
 running), keeps the job's report when the build wrote one (the reconcile's
@@ -567,7 +580,7 @@ notes any failed build rather than hide one already told. A
 recovery needs a build that passed: a failed check under the threshold writes
 no note and is not one. One whose latest finished
 build is older than its stale window (two hours for the sweep, 36 hours for the
-daily reconcile, eight days for the weekly certification slice; the postsubmit runs on merges, so no age makes it stale) is `STALE`, whatever that build's
+daily reconcile and the daily replay lane, eight days for the weekly certification slice; the postsubmit runs on merges, so no age makes it stale) is `STALE`, whatever that build's
 verdict, measured on the wall clock rather than data.json's horizon, as the
 pool note is. The note carries the build, when it finished, `since` (kept for
 the job across ticks through the previous `health.json`, ticks with no reading
@@ -634,8 +647,7 @@ when there are several). Three shapes outside that filter also get one, below:
 a not-evaluated run, a lost pod and a deadline kill.
 
 - a heading, `❌ Smoke gate: failed`, or `· hard failure` when the run failed
-  with no gate case failing all of its repetitions (an absolute check, or a
-  truncated log);
+  with no gate case collapsing (an absolute check, or a truncated log);
 - a health box: during an OUTAGE or DEGRADED state whose signature the run
   carries, that the red is not the author's code and not to retest yet; when
   the gate is healthy and what failed passes on other pull requests' recent
@@ -643,10 +655,10 @@ a not-evaluated run, a lost pod and a deadline kill.
 - the run's wall clock and links: the build log, `run.html#build=<build id>`
   on the dashboard, and the incident brief when there is an incident.
 
-The pull request is public, so the comment names no case and prints no count,
-reason or agent text: which cases failed, how many repetitions, why, and on
-which pool project are on the dashboard's run page behind the link, for a
-project reader. The incident brief link carries no case names either.
+The pull request is public, so the comment names no case and prints no case
+count, repetition count, reason or agent text: which cases failed, how many
+repetitions, why, and on which pool project are on the dashboard's run page
+behind the link, for a project reader. The incident brief link carries no case names either.
 
 An ordinary red that reaches a verdict during a deadline-kill OUTAGE gets the
 outage box with the kills' sentence ("N runs on M PRs were killed at the
@@ -688,8 +700,8 @@ link has the list), and that nothing about the change is implied:
 ```text
 ### ⚪ Smoke gate: run not evaluated
 
-> Some cases lost every repetition to infrastructure before the agent could
-> be graded. The suite could certify nothing, so Prow reports the run red;
+> Some cases could not be graded: infrastructure failed before the agent
+> ran. The suite could certify nothing, so Prow reports the run red;
 > nothing was graded for them and nothing about your change is implied.
 > Retest once the environment is healthy. [Details →](run.html#build=<build id>)
 
@@ -699,10 +711,10 @@ Ran 27 min · build log
 When every recorded case was lost the box says so. While `health.json`'s
 condition is `storm` it adds "a quota storm is declared on the gate right
 now" and links the brief, with no case names in the link. A gate case that
-failed every graded repetition on the same run (the dashboard's roster can be
-newer than the branch's) gets a second sentence, unnamed, pointing at the
-transcripts to read before retesting; the heading stays ⚪, because the suite
-is the verdict's owner.
+went red on the same run (the dashboard's roster can be newer than the
+branch's) gets a second sentence, unnamed and with no per-repetition verdict,
+pointing at the run page; the heading stays ⚪, because the suite is the
+verdict's owner.
 
 The second is a lost pod (the build node went away under the job, #1478), a
 zero-task run:
@@ -1149,6 +1161,33 @@ It opens no roster pull request: the job holds no branch write path, and the
 eval crew approves every roster line. Locally,
 `python3 scripts/eval_dashboard/coverage_gaps.py --data data.json [--store store.json]`
 is a dry run; `--live` writes.
+
+## Scrubbing the bots' older posts
+
+The posts above carried pass ratios, repetition counts, failing-check reasons and, on the
+outage issue, the failing cases and the evidence lines until the bots stopped writing them.
+`scripts/eval_dashboard/scrub_bot_posts.py` is the one-off that brings the posts already on
+GitHub to the current shape, run by a person with a repository-write token (`GH_TOKEN`) against
+`--repo` (default `GITHUB_REPOSITORY`, else `gke-labs/kube-agents`): dry run by default and
+`--live` to write, `--pace` seconds between writes (default 2, under GitHub's secondary limits
+of about 80 content writes a minute and 500 an hour), `--limit` writes at most (default none),
+`--since` bounding the repository-wide comment listing (default 2026-09-01), `--show-bodies`
+printing each edit's new body; it stops after three writes in a row fail. It plans one action
+per post from the post's own markers. Comments are deleted, issues are edited: the smoke-gate
+pull-request comments go (the verdict lives in the private bucket and on the dashboard; one on
+an open pull request is left for the next red tick to rewrite, and so is one already in the
+current shape), and
+so do the bot's recovery and later-night comments on the nightly issues (an edited comment
+would keep its history, and the issue's nights list carries the dates and links); the
+nightly-red and kept-case issues are rewritten to the current templates with their run and
+transcript links in Console form, the lost-nights issues get the same links; a coverage-gap
+issue gets the current candidates sentence and the first column of its table; the outage
+issue is retitled and its body rewritten with the marker; the lost-pods, deadline,
+fixture-drift and pool-drift issues keep only their own evidence lines. A post already in the
+current shape plans as a skip, so a second run finds nothing to do. GitHub keeps an edited
+issue's revision history, which the script cannot clear: it prints the edited issues' URLs,
+and that step is done by hand in the web UI. Human posts and the review bot's comments are
+out of scope.
 
 ## The domain scorecard
 

@@ -21,6 +21,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -1330,5 +1331,64 @@ func TestPodUsageSource_TheOriginsReadingNeedsAFreshReadAge(t *testing.T) {
 				t.Errorf("chat samples = %v, want the counters read beside it", reading.Samples)
 			}
 		})
+	}
+}
+
+// The chat listener's body carries the kanban dispatcher's failing boards; the
+// reading is empty, not nil, for a chat body with none, and nil for every
+// other body. A body past the board ceiling fails the scrape.
+func TestPodUsageSource_ReadsTheDispatchersFailingBoards(t *testing.T) {
+	chat := func(series ...string) string {
+		return strings.Join(append([]string{
+			"# TYPE kubeagents_chat_messages_inbound_total counter",
+			`kubeagents_chat_messages_inbound_total{platform="slack"} 4`,
+			"# TYPE kubeagents_kanban_tasks_gave_up_total counter",
+			"kubeagents_kanban_tasks_gave_up_total 0",
+			"# TYPE kubeagents_kanban_dispatcher_failed_ticks gauge",
+		}, append(series, "")...), "\n")
+	}
+	scrape := func(body string, counters []string) (usageReading, error) {
+		return newPodUsageSource().Scrape(context.Background(), serveBody(t, http.StatusOK, body), counters, nil)
+	}
+
+	reading, err := scrape(chat(
+		`kubeagents_kanban_dispatcher_failed_ticks{board="default",error="OperationalError"} 61`,
+		`kubeagents_kanban_dispatcher_failed_ticks{board="o\"ps",error="DatabaseError"} 3`,
+	), usageChatCounters)
+	if err != nil {
+		t.Fatalf("Scrape: %v", err)
+	}
+	want := []usageDispatcherFailure{{Board: "default", Error: "OperationalError", Ticks: 61}, {Board: `o"ps`, Error: "DatabaseError", Ticks: 3}}
+	if reading.Dispatcher == nil || !reflect.DeepEqual(reading.Dispatcher.Failing, want) {
+		t.Fatalf("dispatcher = %+v, want %+v", reading.Dispatcher, want)
+	}
+	if reading.Samples[usageCounterChatMessagesInbound] != 4 {
+		t.Errorf("samples = %v, want the messages counted from the same body", reading.Samples)
+	}
+
+	reading, err = scrape(chat(), usageChatCounters)
+	if err != nil || reading.Dispatcher == nil || len(reading.Dispatcher.Failing) != 0 {
+		t.Fatalf("idle dispatcher: reading %+v, err %v; want an empty reading", reading.Dispatcher, err)
+	}
+
+	reading, err = scrape(chat(`kubeagents_kanban_dispatcher_failed_ticks{board="default",error="OSError"} 9`), usageA2AChatCounters)
+	if err != nil || reading.Dispatcher != nil {
+		t.Fatalf("A2A gateway body: reading %+v, err %v; want none", reading.Dispatcher, err)
+	}
+
+	_, err = scrape(chat(`kubeagents_kanban_dispatcher_failed_ticks{board="default",error="OSError"} 1e20`), usageChatCounters)
+	var hugeErr *usageScrapeError
+	if !errors.As(err, &hugeErr) || hugeErr.Kind != usageScrapeKindSample {
+		t.Fatalf("a streak past int64: err %v, want a sample error", err)
+	}
+
+	many := make([]string, 0, usageDispatcherBoardCeiling+1)
+	for i := 0; i <= usageDispatcherBoardCeiling; i++ {
+		many = append(many, fmt.Sprintf(`kubeagents_kanban_dispatcher_failed_ticks{board="b%d",error="OSError"} 1`, i))
+	}
+	_, err = scrape(chat(many...), usageChatCounters)
+	var scrapeErr *usageScrapeError
+	if !errors.As(err, &scrapeErr) || scrapeErr.Kind != usageScrapeKindSample {
+		t.Fatalf("past the board ceiling: err %v, want a sample error", err)
 	}
 }

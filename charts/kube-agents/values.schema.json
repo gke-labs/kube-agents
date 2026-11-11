@@ -215,6 +215,20 @@
             }
           }
         },
+        "budget": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "usd": {
+              "type": "number",
+              "anyOf": [{ "const": 0 }, { "minimum": 0.01 }]
+            },
+            "period": {
+              "type": "string",
+              "pattern": "^([1-9][0-9]*(s|m|h|d|w|mo))?$"
+            }
+          }
+        },
         "vertex": {
           "type": "object",
           "additionalProperties": false,
@@ -434,13 +448,33 @@
                 }
               }
             },
+            "mode": {
+              "type": "string",
+              "enum": ["shadow", "record", "replay"]
+            },
+            "cacheDir": {
+              "type": "string",
+              "pattern": "^/data/[A-Za-z0-9][A-Za-z0-9._-]*$",
+              "not": {
+                "enum": ["/data/logs", "/data/store"]
+              }
+            },
+            "allowServe": {
+              "type": "boolean"
+            },
             "job": {
               "type": "object",
               "additionalProperties": false,
               "properties": {
                 "kind": {
                   "type": "string",
-                  "enum": ["", "nightly", "nightly-untrusted", "presubmit"]
+                  "enum": [
+                    "",
+                    "nightly",
+                    "nightly-untrusted",
+                    "presubmit",
+                    "replay-lane"
+                  ]
                 },
                 "project": {
                   "type": "string"
@@ -483,12 +517,109 @@
                 "required": ["kind"],
                 "properties": {
                   "kind": {
-                    "enum": ["nightly", "nightly-untrusted", "presubmit"]
+                    "enum": [
+                      "nightly",
+                      "nightly-untrusted",
+                      "presubmit",
+                      "replay-lane"
+                    ]
                   }
                 }
               }
             }
-          }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "mode": {
+                    "const": "replay"
+                  }
+                },
+                "required": ["mode"]
+              },
+              "then": {
+                "required": ["allowServe", "job"],
+                "properties": {
+                  "allowServe": {
+                    "const": true
+                  },
+                  "job": {
+                    "required": ["kind"],
+                    "properties": {
+                      "kind": {
+                        "const": "replay-lane"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "allowServe": {
+                    "const": true
+                  }
+                },
+                "required": ["allowServe"]
+              },
+              "then": {
+                "required": ["mode"],
+                "properties": {
+                  "mode": {
+                    "const": "replay"
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "mode": {
+                    "const": "record"
+                  }
+                },
+                "required": ["mode"]
+              },
+              "then": {
+                "required": ["job"],
+                "properties": {
+                  "job": {
+                    "required": ["kind"],
+                    "properties": {
+                      "kind": {
+                        "const": "nightly"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "job": {
+                    "properties": {
+                      "kind": {
+                        "const": "replay-lane"
+                      }
+                    },
+                    "required": ["kind"]
+                  }
+                },
+                "required": ["job"]
+              },
+              "then": {
+                "required": ["mode"],
+                "properties": {
+                  "mode": {
+                    "const": "replay"
+                  }
+                }
+              }
+            }
+          ]
         }
       }
     },
@@ -532,6 +663,73 @@
             },
             "resources": {
               "type": "object"
+            },
+            "networkPolicy": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "additionalEgress": {
+                  "type": ["array", "null"],
+                  "maxItems": 32,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["to"],
+                    "properties": {
+                      "to": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 16,
+                        "items": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": ["cidr"],
+                          "properties": {
+                            "cidr": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 49,
+                              "pattern": "^((((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])(/(1[2-9]|2[0-9]|3[0-2]))?)|(([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}(/(4[89]|[5-9][0-9]|1[01][0-9]|12[0-8]))?))$"
+                            },
+                            "except": {
+                              "type": "array",
+                              "maxItems": 16,
+                              "items": {
+                                "type": "string",
+                                "maxLength": 49,
+                                "pattern": "^((((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])(/([0-9]|[12][0-9]|3[0-2]))?)|(([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}(/([0-9]|[1-9][0-9]|1[01][0-9]|12[0-8]))?))$"
+                              }
+                            }
+                          }
+                        }
+                      },
+                      "ports": {
+                        "type": "array",
+                        "maxItems": 16,
+                        "items": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": ["port", "protocol"],
+                          "properties": {
+                            "protocol": {
+                              "type": "string",
+                              "enum": ["TCP", "UDP", "SCTP"]
+                            },
+                            "port": {
+                              "type": "integer",
+                              "minimum": 1,
+                              "maximum": 65535
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
             }
           }
         },
@@ -559,6 +757,15 @@
             },
             "storage": {
               "type": ["string", "integer"]
+            },
+            "networkPolicy": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                }
+              }
             }
           }
         },
@@ -1079,6 +1286,30 @@
                   "minimum": 1,
                   "maximum": 10000
                 },
+                "admission": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "memoryBudgetMiB": {
+                      "type": "integer",
+                      "minimum": 512,
+                      "maximum": 65536
+                    },
+                    "workerRssCapMiB": {
+                      "type": "integer",
+                      "minimum": 256,
+                      "maximum": 65536
+                    },
+                    "queueBoundSeconds": {
+                      "type": "integer",
+                      "minimum": 10,
+                      "maximum": 3600
+                    },
+                    "failClosed": {
+                      "type": "boolean"
+                    }
+                  }
+                },
                 "profiles": {
                   "type": "object",
                   "additionalProperties": false,
@@ -1424,6 +1655,9 @@
                   "type": "string"
                 }
               }
+            },
+            "disallowSecretsRead": {
+              "type": ["boolean", "null"]
             }
           }
         },

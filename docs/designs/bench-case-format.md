@@ -24,7 +24,7 @@ in silence — no error, no warning. The fields it reads are `id`, `name`, `prom
 means no coercion: `critical: yes` is a string, not a boolean, and fails validation.
 
 **This repository's lints** read the same file for fields devops-bench discards: `domain`,
-`fixtures`, `owner`, `expected_fail`, `tool_calls_optional`, `writes_alone`, `audit_streams` and `scope_exclude`. Those are ours. A typo in any of them cannot fail a run, which is
+`fixtures`, `owner`, `expected_fail`, `tool_calls_optional`, `writes_alone`, `requested_pull_requests`, `audit_streams`, `scope_exclude`, `suite` and `task_version`. Those are ours. A typo in any of them cannot fail a run, which is
 exactly why `scripts/validate_bench_cases.py` exists.
 
 ## The id key
@@ -62,8 +62,8 @@ the front door there under `spec.mode: next` too. A `session: fresh` answer carr
 thread context, which next's door does not send, so a case with one stays in
 `hack/eval/inject-lane-exclusions.txt`. Under next the reply to a wake is posted nowhere, but the
 same front door writes it, so a case that grades that reply still runs on the inject lane. A
-first line of `[bench:card-block-wake]`, with `title`, `kind` (`transient`, `capability` or
-`dependency`) and `reason`, plants a card blocked that way instead: nothing is posted, no answer
+first line of `[bench:card-block-wake]`, with `title`, `kind` (`transient`, `capability`,
+`dependency` or `capacity`) and `reason`, plants a card blocked that way instead: nothing is posted, no answer
 is sent, and the wake's reply is the run's one turn. A
 first line of
 `[bench:stop-after-first-card]`, optionally with `observe=<seconds>`, makes the rest of the
@@ -149,6 +149,17 @@ boolean: `"false"` is a string, and truthy, and the validator rejects it.
 the reply never names: the lane runs it alone in its second phase and marks the write
 safeguard's window exclusive, so any write in the window is charged to it
 (`bench/kube_agents_bench/lane.py`). A bare YAML boolean, `false` by default; devops-bench
+ignores the key.
+
+`requested_pull_requests` is for a case that opens more pull requests by design than its checks
+grade: the case's total, a bare decimal integer above the count of its `pull_request_opened` and
+`pull_request_diff_contains` leaves (the validator rejects a count those leaves already reach,
+and any other spelling, because the roster script reads the key off the text). It also serves a
+case the persona answers with a pull request before its own check lands, as a placeholder the
+validator fails once the check reaches the count. The lane sets the write safeguard's allowance
+from the larger of the leaves and the key, and the grader reads the same two, so the carve-out
+that excuses a requested pull request holds the case to its total
+(`bench/kube_agents_bench/lane.py`, `cases.py`). Absent means the leaves alone; devops-bench
 ignores the key.
 
 `tool_calls_optional` is for a case a correct agent can answer without calling a tool: a
@@ -303,7 +314,7 @@ trajectory), `ledger_issue_contains` (the GitHub ledger issue a fleet audit
 published), `forge_issue_state` (the state, labels and in-run comments of the issue the reply
 names, read from the forge), `pull_request_opened` (the remediation pull request the run opened,
 resolved through GitHub and required to be this run's rather than an earlier
-repetition's, unless the case sets `accepts_stream_pull_request` and runs on an audit stream, which also admits one an earlier run on its audit stream opened in the job's GitOps repository on that audit's remediation branch; `unchanged_paths` also fails one whose diff changes a listed path, `changed_paths_only` fails one whose diff changes any path matching none of its listed globs, `removed_paths` one that does not delete every listed path, and `content` asserts over the YAML or text in the files it adds), `github_writes` (every pull request or branch under the agent's
+repetition's, unless the case sets `accepts_stream_pull_request` and runs on an audit stream, which also admits one an earlier run on its audit stream opened in the job's GitOps repository on that audit's remediation branch; `unchanged_paths` also fails one whose diff changes a listed path, `changed_paths_only` fails one whose diff changes any path matching none of its listed globs, `removed_paths` one that does not delete every listed path, and `content` asserts over the YAML or text in the files it adds, including whether an added PodDisruptionBudget lets the planted workload drain), `github_writes` (every pull request or branch under the agent's
 prefix written to the case's GitOps repository since the repetition started that
 the repetition's reply, or its or its workers' call that created the write, names
 (a read's arguments do not count), or every one when its window is marked exclusive; it passes on a write, so
@@ -315,11 +326,20 @@ command, a log line or a tagged call alike, before the forbidden list reads it, 
 command it touched out of the required list, for a command that can fetch and
 send nothing but carries a forbidden word as its argument, such as a plain
 `grep` exempted through its pattern argument so that whatever else shares the
-line is still graded; or with `required_runs` a script by its basename and the flags that must
+line is still graded (`exempt_grep_patterns: true` does that by the command's
+shell words: it removes only the pattern argument of a command that is one
+grep and nothing else, and refuses a control operator, a redirect other than
+`>` to `/dev/null`, a comment, a substitution, a collapsed chain, a braced expansion other than
+`${NAME}` or `${NAME:-…}`, a read of the last argument (`$_`) or of a variable through another
+(`${!NAME}`), and an ANSI-C quote); or with `required_runs` a script by its basename and the flags that must
 follow it on the same shell segment, read from the command's argv as the shell splits
 it, so a quoted mention of the invocation is one word and not a run, and a run made through a script file or a shell's standard input is not read, since the argv names the file or the shell; each flag is read as the exact word, so the script named is built with `allow_abbrev=False`; `word_patterns` are regular expressions each of which some later word of the segment must match on its own, and `forbidden_runs` is the same shape for a run no worker may make, such as a `kubectl get` of the objects a script grades; with `after_result_pattern` the commands come from the workers' tagged `terminal` and `execute_code` calls in the trajectory instead, with their results as the record stores them, a JSON string with newlines escaped, and the forbidden set applies only to the calls after the first whose result matched, failed or not, one window per delegated card and the cards its worker fanned out; `forbidden_result_patterns` then grade the later results too; a trajectory with no tagged call at all, none readable (every code-tool argument withheld), a call with no numeric time, or a capture with gaps and no hit, is `status: "error"`, where a worker whose tagged calls are all MCP calls grades as zero commands), `worker_agents` (regular expressions every one of which must match the
 profile at least one delegated worker ran as, read from the tags the harness puts on the
-workers' trajectory entries), `worker_budget` (the turn budget a delegated worker ran under,
+workers' trajectory entries), `delegated_to` (regular expressions every one of which must match,
+and none of which may match, an addressee the delegating turn's chain delegated to, read from the
+inject read route's `childAddressees`: the profile each child resolved to, or `platform`; an
+error on the api transport, so a case using it is listed in `hack/eval/api-lane-exclusions.txt`),
+`worker_budget` (the turn budget a delegated worker ran under,
 read from two records: Hermes' one-shot checkpoint notice, `You have used N of M iterations`,
 which a kanban worker gets in its newest tool result at 90% of a finite cap and the worker
 capture carries in the tagged call's `result`, and the run row a worker that goes on to exhaust
@@ -454,7 +474,9 @@ splits with an empty quote inside it is one word to the shell and none to the pa
 worker filed it reads the tagged call, which is the command as typed, so a `^`-anchored pattern
 written against the rendering can miss that card's command behind a `cd … &&` or on a second
 line, and a capture gap on that card does not change the result (#3406). `worker_agents` reads only which profile made the workers' tagged entries, and the
-judged metrics receive those entries as the execution trace.
+judged metrics receive those entries as the execution trace. `delegated_to` reads only whom the
+delegating turn's chain delegated to, by profile name, from the inject read route's
+`childAddressees`.
 
 Every one fails closed. A check that cannot observe its subject returns `status: "error"`,
 never a pass and never a fail, and an errored check drops `VerificationCoverage` below
@@ -610,7 +632,8 @@ id that disagrees with its directory, a `domain:` that is missing or not in
 case that declares no `fixtures:` at all, a missing, empty or inline `verification_spec`,
 a check that carries no assertion and so can only pass, an `owner:` that is `maintainers`,
 written as a mention or not a login, an `expected_fail:`, `tool_calls_optional:` or `writes_alone:`
-that is not a bare YAML boolean, a `resource_property` or `fleet_resource_property` check that
+that is not a bare YAML boolean, a `requested_pull_requests:` that is not a bare decimal integer above
+the case's own requesting leaves, a `resource_property` or `fleet_resource_property` check that
 compares a known boolean field such as `spec.suspend` to the string `"true"` or `"false"` under
 `op: eq` or `ne` (the string never compares equal to the API's boolean, so the check asserts
 nothing; the judged fields are the validator's `BOOLEAN_FIELD_PAIRS` table, and a path with recursive
@@ -630,7 +653,9 @@ string matching the token-shaped subset of `AuditRedactor`'s patterns, with
 that rule — the ranges, the shapes, the skip list, the marker, and what review covers that
 the scan cannot. The scan is tree-level rather than per case, like the fixture-catalogue
 drift check, so `validate_all()` does not carry it; the lint asserts on
-`sanitization_findings()` in its own right.
+`sanitization_findings()` in its own right. The same way, it rejects any file committed under
+a case's `evidence/` directory (`committed_run_records()`): a run's record stays in the bucket
+or on the dev install, and the case cites the run by its directory name or build id.
 
 `scripts/test_task_registration.py` calls the same module in CI and asserts that it
 returned no findings at all, so the fast local check and the gating lint cannot disagree.

@@ -1061,6 +1061,14 @@ resource "helm_release" "kube_agents" {
           }
           rules = [for r in var.litellm_redaction.rules : { for k, v in r : k => v if v != null }]
         }
+      } : {},
+      # Only above zero, for the same reason: an install without a spend
+      # ceiling renders the gateway ConfigMap, and its checksum, as before.
+      var.litellm_budget.usd > 0 ? {
+        budget = {
+          usd    = var.litellm_budget.usd
+          period = var.litellm_budget.period
+        }
       } : {}
     )
     # merge(), so "today" adds no key and the values this composition hands the
@@ -1143,6 +1151,7 @@ resource "helm_release" "kube_agents" {
         serviceAccountAnnotations = {
           "iam.gke.io/gcp-service-account" = module.kube_agents_iam.service_account_email
         }
+        disallowSecretsRead = var.disallow_secrets_read
         # The mapping the credential broker selects from, one row per project
         # the module provisioned a member for. It has to reach the cluster as
         # data rather than being recomputed there: the broker refuses a

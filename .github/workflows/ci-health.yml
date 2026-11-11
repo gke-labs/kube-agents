@@ -30,7 +30,8 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 #      account with a read grant on gs://kube-agents-prow (the OSS Prow
 #      project's bucket; the grant cannot be copied from here). It reads the
 #      archive there, the smoke lanes' own bucket
-#      gs://kube-agents-evals-presubmit-logs, the nightly's own bucket
+#      gs://kube-agents-evals-presubmit-logs (the release-candidate lane's
+#      too, under logs/, once it moves there), the nightly's own bucket
 #      gs://kube-agents-evals-nightly-logs and the watched periodics'
 #      gs://kube-agents-periodic-logs (all three
 #      kube-agents-owned; it holds objectViewer on each, and whichever
@@ -245,11 +246,10 @@ env:
   NIGHTLY_MAIN_E_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-main-e/
   NIGHTLY_WRITERS_B_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-writers-b/
   NIGHTLY_WRITERS_C_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-writers-c/
-  # The GitLab lane's nightly (kube-agents#2832): the lane's list once a night,
-  # tier gitlab with no pull request, listed under the Brief's GitLab section.
-  GITLAB_NIGHTLY_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/
-  # Its next-mode nightly, listed beside it under its own job; the job sets no
-  # gcs_configuration, so it logs to Prow's bucket.
+  # The GitLab lane's nightly, next mode (kube-agents#2832): the lane's list
+  # once a night, tier gitlab with no pull request, listed under the Brief's
+  # GitLab section; the job sets no gcs_configuration, so it logs to Prow's
+  # bucket.
   GITLAB_NIGHTLY_NEXT_PREFIX: gs://kube-agents-prow/logs/ci-kube-agents-eval-nightly-gitlab-next/
   # The self-managed forge lanes (kube-agents#3682), a tier each and one
   # Brief section together: their presubmits log to the lanes' own bucket,
@@ -259,9 +259,14 @@ env:
   GHES_WEEKLY_PREFIX: gs://kube-agents-prow/logs/ci-kube-agents-eval-weekly-ghes-next/
   GITLAB_CE_PR_GLOB: gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-gitlab-ce/*
   GITLAB_CE_WEEKLY_PREFIX: gs://kube-agents-prow/logs/ci-kube-agents-eval-weekly-gitlab-ce-next/
-  # The release-candidate lane's archive. A postsubmit, so logs/ rather than
-  # pr-logs/. Bounded by --rc-limit rather than by the presubmit watermark.
-  RC_GLOB: gs://kube-agents-prow/logs/post-kube-agents-eval-rc/*
+  # The release-candidate lane's archives: the presubmit lanes' private
+  # bucket it moves to, and the Prow cluster's default it logs to until
+  # then, kept until the newest --rc-limit builds are all in the new one
+  # (the merge carries the recorded releases forward without it). A
+  # postsubmit, so logs/ rather than pr-logs/. Bounded by --rc-limit rather
+  # than by the presubmit watermark.
+  RC_GLOB: gs://kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/*
+  RC_GLOB_PREVIOUS: gs://kube-agents-prow/logs/post-kube-agents-eval-rc/*
   SINCE_DAYS: "14"
   STALE_AFTER_S: "2400"
   # The eval evidence store the nightly appends to (docs/designs/
@@ -409,13 +414,13 @@ jobs:
             --nightly-main-e-prefix "$NIGHTLY_MAIN_E_PREFIX" \
             --nightly-writers-b-prefix "$NIGHTLY_WRITERS_B_PREFIX" \
             --nightly-writers-c-prefix "$NIGHTLY_WRITERS_C_PREFIX" \
-            --gitlab-nightly-prefix "$GITLAB_NIGHTLY_PREFIX" \
             --lane-nightly-prefix "gitlab=$GITLAB_NIGHTLY_NEXT_PREFIX" \
             --lane-pr-glob "ghes=$GHES_PR_GLOB" \
             --lane-nightly-prefix "ghes=$GHES_WEEKLY_PREFIX" \
             --lane-pr-glob "gitlab-ce=$GITLAB_CE_PR_GLOB" \
             --lane-nightly-prefix "gitlab-ce=$GITLAB_CE_WEEKLY_PREFIX" \
             --rc-glob "$RC_GLOB" \
+            --rc-glob "$RC_GLOB_PREVIOUS" \
             --merge-with work/prior-data.json \
             --since-days "$SINCE_DAYS" \
             --stale-after-s "$STALE_AFTER_S" \
@@ -515,7 +520,7 @@ jobs:
 
       # The watched Prow periodics (scripts/eval_dashboard/periodics.py:
       # the pull sweep, the daily seeded-fleet reconcile and its postsubmit run,
-      # and the certification lane's weekly slice, read from the nightlies' bucket): their latest
+      # the certification lane's weekly slice and the replay lane, both read from the nightlies' bucket): their latest
       # finished build each, for the note health.py carries and the poster
       # sends once when one fails or stops running. Best-effort like the
       # read above: a job that has never run writes nothing, a denied read
