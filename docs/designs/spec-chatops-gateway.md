@@ -705,9 +705,12 @@ queued runs when a slot frees, or is refused at its queue timeout. The cards are
 published while the gateway's connection was down is picked up, and a profile no longer on
 `DIRECTORY` is forgotten. Each turn the gateway submits to a session pod carries the agents its
 requester may delegate to (the `delegateTargets` part, `spec-a2a-payloads.md`), built from those
-cards, for the delegate tool the worker adapter serves to name in its addressee description.
-The tool still offers no `parameters`, so a session can delegate to a pinned profile or one that
-takes no target; offering the field is text the model reads and lands with its own eval case.
+cards, for the delegate tool the worker adapter serves to name in its addressee description. The
+tool offers `parameters`, a map of names to values, and the adapter holds a call's set only to the
+bounds every reader holds it to. The gateway holds the names to the resolved profile's card, on a
+delegation and on a console turn addressed to a profile alike: a name the card doesn't declare is
+refused, and so is a required one left out, and the refusal names what the profile takes. A pinned profile takes its own cluster's `project`, `location` and `cluster`
+whether its card declares them or not.
 
 ## Session lifecycle
 
@@ -2264,7 +2267,10 @@ unmentioned Slack reply under one of the bot's own posts, #3246), which is dropp
 info-level log line only and does not count as the sender's notice. A shortcut's
 conversation is a thread under someone else's message, so the gateway posts no notice
 there either (`Shortcut`); the adapter sends it to the clicker alone through the
-shortcut's `response_url`, every time. A silent drop of a real user is a support burden. Per sender, not per
+shortcut's `response_url`, every time. Nor for a press of a Stop button, Slack's or Google
+Chat's: the press asked the bot for nothing, and the notice, which names the presser, would land
+in a thread the channel reads; the press is dropped with the log line, does not count as the
+sender's notice, and their first typed message gets it. A silent drop of a real user is a support burden. Per sender, not per
 conversation - a channel mention mints a fresh conversation every time, so a
 conversation-scoped dedupe would be no bound at all. The memory is capped and evicted
 wholesale at the cap, so the worst an unverified sender can do is make one notice

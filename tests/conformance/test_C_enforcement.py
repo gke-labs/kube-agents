@@ -1791,12 +1791,13 @@ class C1IsolationIsStructural(unittest.TestCase):
             self.assertNotRegex(body, magic_number, f"{what} hand-spells the delegate text cap")
 
     def test_C1_the_delegate_tool_schema_names_agree_with_the_wire_shape(self) -> None:
-        """The MCP tool schema and `lib.DelegateRequest` spell the same fields, bar `parameters`.
+        """The MCP tool schema and `lib.DelegateRequest` spell the same fields.
 
         The session's harness speaks MCP to the worker-adapter's own server,
-        which answers `tools/list` with `delegateToolSchema` -- a
-        `map[string]any` literal, because that is what an MCP tool definition
-        is on the wire, so it cannot reference `lib.DelegateRequest`'s json
+        which answers `tools/list` with `delegateToolSchema` -- built from
+        `map[string]any` literals (per turn, to name that turn's delegate
+        targets), because that is what an MCP tool definition is on the
+        wire, so it cannot reference `lib.DelegateRequest`'s json
         tags the way Go code can. The two are independent spellings of one
         shape: the model calls the tool using the schema's field names, the
         adapter decodes the call straight into `lib.DelegateRequest`
@@ -1815,30 +1816,22 @@ class C1IsolationIsStructural(unittest.TestCase):
             all_tags,
             "lib.DelegateRequest's wire shape changed; this test compared nothing",
         )
-        # `parameters` is on the wire struct but not the tool: the worker
-        # adapter refuses a request carrying any until a gateway reads them
-        # (validateDelegate), so the model is not offered the field. The
-        # exemption holds only while that refusal does.
-        self.assertIn(
-            "if len(req.Parameters) > 0 {",
-            h.text("a2a_worker_adapter_delegate"),
-            "the adapter no longer refuses delegate parameters; declare them in delegateToolSchema",
-        )
-        tags = [t for t in all_tags if t != "parameters"]
-
         mcp = h.text("a2a_worker_adapter_mcp")
-        schema = mcp.split("var delegateToolSchema")[1].split("\n}\n")[0]
-        properties = sorted(re.findall(r'"(\w+)":\s*map\[string\]any\{"type": "string"', schema))
+        schema = mcp.split("func delegateToolSchema(")[1].split("\n}\n")[0]
+        # A property opens its own line; `additionalProperties` inside one doesn't.
+        properties = sorted(re.findall(r'^\s*"(\w+)":\s*map\[string\]any\{"type": "(?:string|object)"', schema, re.M))
         self.assertEqual(
-            tags,
+            all_tags,
             properties,
             "the tool schema's declared properties no longer match lib.DelegateRequest's json tags",
         )
+        # `parameters` is optional on both sides: platform takes none, and the
+        # wire struct's tag is omitempty.
         required_block = re.search(r'"required":\s*\[\]string\{([^}]*)\}', schema)
         self.assertIsNotNone(required_block, "delegateToolSchema's required list moved or changed shape")
         required = sorted(re.findall(r'"(\w+)"', required_block.group(1)))
         self.assertEqual(
-            tags,
+            [t for t in all_tags if t != "parameters"],
             required,
             "the tool schema's required list no longer matches lib.DelegateRequest's json tags",
         )
@@ -2201,6 +2194,68 @@ class C1IsolationIsStructural(unittest.TestCase):
             "shares with the agent container, so both would resolve to one map "
             "entry holding the union of their grants, which is `worker` rebuilt",
         )
+
+    def test_C1_the_passwordless_postgres_guard_answers_to_its_own_values_alone(self) -> None:
+        """No value set for the gateway's sake unguards the Hindsight database.
+
+        hindsight-postgresql takes no password; its NetworkPolicy, which admits
+        the hindsight-api pod on 5432 and nobody else, is the whole of its
+        access control. The chart renders that policy and hindsight-api's
+        under separate guards because a bring-your-own gateway install has to
+        widen or drop the api policy, and one boolean over both would take the
+        database guard along with it. The refusal asserted: the guard on this
+        policy is built from hindsight.networkPolicy and
+        hindsight.postgresql.networkPolicy.enabled and nothing else -- not
+        litellm.enabled, not the api toggle, not additionalEgress -- and the
+        block it opens holds the policy that admits only the api component, so
+        no other peer is rendered into it.
+
+        The template carries multi-line Helm comments, which helm_documents()
+        cannot read, so the policy's block is sliced out by its guard and
+        stripped of directive lines the way tests/test_hindsight_network_policy.py
+        does; that file holds the rendered-output tests behind a helm binary.
+        """
+        template = h.text("chart_hindsight")
+        umbrella = self._one_match(
+            r"\{\{-\s*\$hindsightNetworkPolicy\s*:=\s*(.+?)\s*\}\}", template, "the umbrella definition"
+        )
+        self.assertEqual(".Values.hindsight.networkPolicy", umbrella)
+        guard = self._one_match(
+            r"\{\{-\s*\$postgresqlNetworkPolicy\s*:=\s*(.+?)\s*\}\}", template, "the postgres guard definition"
+        )
+        self.assertEqual(
+            "and $hindsightNetworkPolicy .Values.hindsight.postgresql.networkPolicy.enabled",
+            guard,
+            "the postgres guard reads a value set for another component's sake",
+        )
+        block = self._one_match(
+            r"(?s)\{\{-\s*if \$postgresqlNetworkPolicy\s*\}\}\n(.*?)\n\{\{-\s*end\s*\}\}",
+            template,
+            "the postgres policy block",
+        )
+        body = "\n".join(line for line in block.splitlines() if "{{" not in line)
+        documents = [d for d in yaml.safe_load_all(body) if isinstance(d, dict)]
+        self.assertEqual(["hindsight-postgresql"], [d["metadata"]["name"] for d in documents])
+        (policy,) = documents
+        self.assertEqual("NetworkPolicy", policy["kind"])
+        spec = policy["spec"]
+        self.assertIn("Ingress", spec["policyTypes"])
+        self.assertTrue(spec["ingress"], "the policy admits no peer at all; the invariant is exactly one peer, not none")
+        for rule in spec["ingress"]:
+            self.assertEqual([{"port": 5432, "protocol": "TCP"}], rule["ports"])
+            for peer in rule["from"]:
+                self.assertEqual(
+                    {
+                        "podSelector": {
+                            "matchLabels": {
+                                "app.kubernetes.io/name": "hindsight",
+                                "app.kubernetes.io/component": "api",
+                            }
+                        }
+                    },
+                    peer,
+                    "a peer other than the hindsight-api pod reaches the passwordless database",
+                )
 
 
 class C2FailClosed(unittest.TestCase):
