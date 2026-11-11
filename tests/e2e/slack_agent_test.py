@@ -26,7 +26,7 @@ import pathlib
 import re
 import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -155,7 +155,6 @@ class Timeline:
     answer: Decimal | None = None
     answer_text: str = ""
     answer_headline: bool = False
-    notes: list[str] = field(default_factory=list)
 
     def legs(self) -> dict:
         def since_post(t: Decimal | None) -> float | None:
@@ -241,7 +240,9 @@ def preflight_ask(client, channel: str, ask_ts: str) -> None:
         pytest.fail(
             f"the ask carries bot_id={ask['bot_id']} (a user-token post through an app), and the gateway's "
             f"{TEST_USERS_ENV_ON_GATEWAY} does not list its author {ask.get('user')}, so the gateway drops it as "
-            "bot traffic: add the test user to the install's operator.slackTestUsers"
+            "bot traffic. Either the install does not list the test user in operator.slackTestUsers, or the "
+            "A2A gateway is not running Slack: under next, Google Chat holds the gateway when both are enabled, "
+            "and Slack then stays on the Hermes path, which has no such list"
         )
 
 
@@ -287,7 +288,9 @@ def test_slack_agent_math_response(slack_settings) -> None:
                 timeline.first_reply = live.ts_value(replies[0].get("ts"))
                 timeline.ack_kind = live.classify(replies[0].get("text", ""))
                 print(f"[E2E Slack] first bot reply is a {timeline.ack_kind}: {replies[0].get('text', '')[:120]!r}")
-                if timeline.ack_kind in ACK_REFUSED_KINDS:
+                # On next a failed status line is left to _turn, which quotes the
+                # failure notice that follows it rather than the bare line.
+                if timeline.ack_kind in ACK_REFUSED_KINDS and not (next_mode and timeline.ack_kind == live.KIND_FAILURE):
                     pytest.fail(f"The bot's first reply is a {timeline.ack_kind}, so the turn never ran: "
                                 f"{replies[0].get('text', '')[:300]!r}")
             turn = _turn(replies, next_mode)

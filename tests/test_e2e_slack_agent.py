@@ -133,6 +133,7 @@ class SlackAgentTestLogic(unittest.TestCase):
         with self.assertRaises(_Failed) as caught:
             _run(fake, listed=[])
         self.assertIn("operator.slackTestUsers", str(caught.exception))
+        self.assertIn("Google Chat holds the gateway", str(caught.exception))
         _run(FakeSlack([{"reaction": "eyes", "replies": [_ANSWER]}], ask_bot_id="BDRIVER"), listed=[_TEST_USER])
         # kubectl unavailable: the run goes on and says what it relies on.
         _run(FakeSlack([{"reaction": "eyes", "replies": [_ANSWER]}], ask_bot_id="BDRIVER"), listed=None)
@@ -172,6 +173,7 @@ class SlackAgentTestLogic(unittest.TestCase):
         with self.assertRaises(_Failed) as caught:
             _run(fake, mode="next")
         self.assertIn("failure", str(caught.exception))
+        self.assertIn("the model returned 5xx", str(caught.exception))
 
     def test_an_unknown_mode_skips_the_modes_own_checks(self):
         answer = {"ts": _ANSWER_TS, "user": _BOT, "text": "It is 5."}
