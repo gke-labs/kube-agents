@@ -2218,7 +2218,7 @@ def read_stdin_if_requested(argv: list[str]) -> str | None:
         return None
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args():
     import argparse
 
     parser = argparse.ArgumentParser()
