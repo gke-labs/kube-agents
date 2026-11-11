@@ -1,4 +1,4 @@
-"""The install's track record: clean merges of each kind of fix, read from the post-merge records.
+"""The track record: clean merges of each kind of fix, per repository and environment, from the post-merge records.
 
 The post-merge check (designed in gke-labs/kube-agents#5054) keeps one
 row per fix pull request in Session KV's ``post_merge_records`` table. This
@@ -19,9 +19,16 @@ job. That keeps the loop testable in days rather than weeks. ``settled`` is the
 subset whose window has already closed at ``now``, for a reader that wants to
 wait it out.
 
-A kind is ``ready`` with :data:`CLEAN_MERGES_NEEDED` clean merges on at least
-:data:`DAYS_NEEDED` different UTC days, so a single burst does not earn it.
-Records are per install, so the count is too.
+Merges are counted per ``(repository, kind, environment)``: a customer keeps a
+workload repository, a cluster repository and many more per business group, and
+trust earned in one of them says nothing about another. Repositories are compared
+by :func:`repo_key`, so ``https://github.com/org/infra.git`` and
+``https://github.com/org/infra`` are one. A record without a repository or a kind
+is not counted; one without an environment counts under ``""``.
+
+A ``(repository, kind, environment)`` is ``ready`` with :data:`CLEAN_MERGES_NEEDED`
+clean merges on at least :data:`DAYS_NEEDED` different UTC days, so a single burst
+does not earn it.
 
 ``session_kv_server.py`` serves :func:`track_record` as
 ``GET /v1/post-merge/clean-merges``. No HTTP here. It reads and never writes,
@@ -30,6 +37,7 @@ and nothing user-visible depends on it until a caller does.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -42,11 +50,24 @@ DAYS_NEEDED = 2
 
 # The columns this reader needs. A table without one of them cannot say which
 # merges are clean, so it is an error rather than a count of zero.
-REQUIRED_COLUMNS = ("kind", "outcome", "merged_at", "human_edited", "reverted_at")
+REQUIRED_COLUMNS = ("repo", "kind", "environment", "outcome", "merged_at", "human_edited", "reverted_at")
 
 
 class SchemaIncomplete(RuntimeError):
     """The records table exists but lacks a column the count needs."""
+
+
+def repo_key(url: Any) -> str:
+    """A repository url as one comparable key: host and path, lower-case, no scheme, user, ``.git`` or trailing slash."""
+    text = str(url or "").strip().lower()
+    text = re.sub(r"^[a-z+]+://", "", text)
+    if "@" in text.split("/", 1)[0]:
+        text = text.split("@", 1)[1].replace(":", "/", 1)
+    return re.sub(r"(\.git)?/*$", "", text)
+
+
+def _empty() -> dict[str, Any]:
+    return {"clean": 0, "days": 0, "settled": 0, "ready": False}
 
 
 def _parse_time(value: Any) -> datetime | None:
@@ -80,32 +101,38 @@ def is_clean(row: dict[str, Any], now: datetime) -> bool:
     return reverted_at is not None and reverted_at - merged > REVERT_WINDOW
 
 
-def count(rows: list[dict[str, Any]], now: datetime) -> dict[str, dict[str, Any]]:
-    """``{kind: {clean, days, settled, ready}}`` for every kind with at least one record."""
-    kinds: dict[str, dict[str, Any]] = {}
-    days: dict[str, set] = {}
+def count(rows: list[dict[str, Any]], now: datetime) -> dict[tuple[str, str, str], dict[str, Any]]:
+    """``{(repo_key, kind, environment): {repo, clean, days, settled, ready}}`` for every one with a record.
+
+    ``repo`` is the first url seen for the key, for display.
+    """
+    groups: dict[tuple[str, str, str], dict[str, Any]] = {}
+    days: dict[tuple[str, str, str], set] = {}
     for row in rows:
-        kind = row.get("kind")
-        if not isinstance(kind, str) or not kind:
+        kind, key = row.get("kind"), repo_key(row.get("repo"))
+        if not isinstance(kind, str) or not kind or not key:
             continue
-        entry = kinds.setdefault(kind, {"clean": 0, "days": 0, "settled": 0, "ready": False})
-        days.setdefault(kind, set())
+        environment = row.get("environment") if isinstance(row.get("environment"), str) else ""
+        group = (key, kind, environment)
+        entry = groups.setdefault(group, {"repo": str(row.get("repo")).strip(), **_empty()})
+        days.setdefault(group, set())
         if not is_clean(row, now):
             continue
         merged = _parse_time(row["merged_at"])
         entry["clean"] += 1
-        days[kind].add(merged.date())
+        days[group].add(merged.date())
         if now - merged > REVERT_WINDOW:
             entry["settled"] += 1
-    for kind, entry in kinds.items():
-        entry["days"] = len(days[kind])
+    for group, entry in groups.items():
+        entry["days"] = len(days[group])
         entry["ready"] = entry["clean"] >= CLEAN_MERGES_NEEDED and entry["days"] >= DAYS_NEEDED
-    return kinds
+    return groups
 
 
-def read_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+def read_rows(conn: sqlite3.Connection, repo: str | None = None) -> list[dict[str, Any]]:
     """Every record's counted columns; an empty list when the table does not exist yet.
 
+    With ``repo``, only the records of fixes in that repository (by :func:`repo_key`).
     Raises :class:`SchemaIncomplete` when the table lacks a :data:`REQUIRED_COLUMNS` column.
     """
     present = {row[1] for row in conn.execute(f"PRAGMA table_info({RECORDS_TABLE})")}
@@ -115,14 +142,40 @@ def read_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     if missing:
         raise SchemaIncomplete(f"{RECORDS_TABLE} has no column {', '.join(missing)}")
     cursor = conn.execute(f"SELECT {', '.join(REQUIRED_COLUMNS)} FROM {RECORDS_TABLE}")
-    return [dict(zip(REQUIRED_COLUMNS, values)) for values in cursor.fetchall()]
+    rows = [dict(zip(REQUIRED_COLUMNS, values)) for values in cursor.fetchall()]
+    if repo is not None:
+        wanted = repo_key(repo)
+        rows = [row for row in rows if repo_key(row.get("repo")) == wanted]
+    return rows
 
 
-def track_record(conn: sqlite3.Connection, now: datetime | None = None) -> dict[str, Any]:
-    """The install's clean merges per kind of fix, with the thresholds they are measured against."""
+def ready_in(
+    conn: sqlite3.Connection, repo: str, kind: str, environment: str, now: datetime | None = None
+) -> dict[str, Any]:
+    """``count``'s entry for one kind of fix in one repository and environment.
+
+    The auto-merge offer is made per repository and environment, so five clean
+    merges spread across two repositories, or across dev and prod, have earned
+    it in neither. ``repo`` is the fix's repository; a key with no records is 0.
+    """
     now = now or datetime.now(timezone.utc)
+    entry = count(read_rows(conn, repo), now).get((repo_key(repo), kind, environment))
+    return {key: value for key, value in entry.items() if key != "repo"} if entry else _empty()
+
+
+def track_record(conn: sqlite3.Connection, now: datetime | None = None, repo: str | None = None) -> dict[str, Any]:
+    """Clean merges per repository, kind of fix and environment, with the thresholds they are measured against.
+
+    ``counts`` is a list sorted by ``(repo_key, kind, environment)``; ``repo``
+    narrows it to one repository.
+    """
+    now = now or datetime.now(timezone.utc)
+    counts = [
+        {"repo_key": key, "kind": kind, "environment": environment, **entry}
+        for (key, kind, environment), entry in sorted(count(read_rows(conn, repo), now).items())
+    ]
     return {
-        "kinds": count(read_rows(conn), now),
+        "counts": counts,
         "clean_merges_needed": CLEAN_MERGES_NEEDED,
         "days_needed": DAYS_NEEDED,
         "revert_window_days": REVERT_WINDOW.days,

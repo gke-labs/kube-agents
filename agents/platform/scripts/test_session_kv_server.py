@@ -14183,25 +14183,34 @@ class TestCleanMergesRoute(unittest.TestCase):
         with closing_db() as conn, conn:
             conn.execute("DROP TABLE IF EXISTS post_merge_records")
 
-    def test_no_records_table_yet_is_no_kinds(self):
+    def test_no_records_table_yet_is_an_empty_list(self):
         resp = self.client.get("/v1/post-merge/clean-merges")
         self.assertEqual(resp.status_code, 200, resp.text)
-        self.assertEqual(resp.json()["kinds"], {})
+        self.assertEqual(resp.json()["counts"], [])
         self.assertEqual(resp.json()["clean_merges_needed"], 5)
 
-    def test_counts_the_clean_merges_in_the_table(self):
+    def test_counts_the_clean_merges_per_repository_and_narrows_to_one(self):
         with closing_db() as conn, conn:
             conn.execute(
-                "CREATE TABLE post_merge_records (url TEXT PRIMARY KEY, kind TEXT, outcome TEXT, "
-                "outcome_at TEXT, merged_at TEXT, human_edited INTEGER, reverted_at TEXT)"
+                "CREATE TABLE post_merge_records (url TEXT PRIMARY KEY, repo TEXT, kind TEXT, environment TEXT, "
+                "outcome TEXT, outcome_at TEXT, merged_at TEXT, human_edited INTEGER, reverted_at TEXT)"
             )
-            conn.execute(
-                "INSERT INTO post_merge_records VALUES ('https://github.com/a/b/pull/1', 'no-pdb', "
-                "'verified_fixed', '2026-11-01T10:30:00+00:00', '2026-11-01T10:00:00+00:00', 0, NULL)"
-            )
+            for url, repo in (("https://github.com/a/b/pull/1", "https://github.com/a/b"),
+                              ("https://github.com/a/c/pull/2", "https://github.com/a/c"),
+                              ("https://github.com/a/c/pull/3", "https://github.com/a/c")):
+                conn.execute(
+                    "INSERT INTO post_merge_records VALUES (?, ?, 'no-pdb', 'dev', 'verified_fixed', "
+                    "'2026-11-01T10:30:00+00:00', '2026-11-01T10:00:00+00:00', 0, NULL)",
+                    (url, repo),
+                )
         resp = self.client.get("/v1/post-merge/clean-merges")
         self.assertEqual(resp.status_code, 200, resp.text)
-        self.assertEqual(resp.json()["kinds"]["no-pdb"]["clean"], 1)
+        self.assertEqual(
+            [(c["repo"], c["kind"], c["environment"], c["clean"]) for c in resp.json()["counts"]],
+            [("https://github.com/a/b", "no-pdb", "dev", 1), ("https://github.com/a/c", "no-pdb", "dev", 2)],
+        )
+        resp = self.client.get("/v1/post-merge/clean-merges", params={"repo": "https://github.com/a/c.git"})
+        self.assertEqual([c["clean"] for c in resp.json()["counts"]], [2])
 
     def test_a_table_missing_a_counted_column_is_a_503(self):
         with closing_db() as conn, conn:
