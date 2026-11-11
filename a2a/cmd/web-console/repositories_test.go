@@ -742,3 +742,33 @@ func TestReconnectingOnAnotherForgeTakesThatForgesHost(t *testing.T) {
 		t.Errorf("link %q after moving to gt2, want %q", got, want)
 	}
 }
+
+func TestConnectTakesTheDeclaredForgesProvider(t *testing.T) {
+	s, _, _ := fakeForgeCluster(t, map[string]any{
+		"forges": []any{
+			map[string]any{"name": "github", "provider": "github", "namespace": "org"},
+			map[string]any{"name": "bbdc", "provider": "bitbucket-datacenter", "host": "bitbucket.corp.example",
+				"namespace": "OPS", "credentialsRef": map[string]any{"name": "bbdc-token"}},
+		},
+		"repositories": []any{map[string]any{"forge": "github", "repository": "org/infra", "role": "gitops"}},
+	})
+	// The request names the Data Center forge but says github: the forge decides.
+	rec := postJSON(t, s.handleRepositoriesConnect, "/api/repositories/connect",
+		repoConnectRequest{Repository: "OPS/infra", Role: "managed", Forge: "bbdc", Provider: "github"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("connect: status %d: %s", rec.Code, rec.Body)
+	}
+	var answer repositoriesResponse
+	if err := json.NewDecoder(rec.Body).Decode(&answer); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range answer.Repositories {
+		if r.Repository == "OPS/infra" {
+			if r.Provider != "bitbucket-datacenter" || r.URL != "https://bitbucket.corp.example/projects/OPS/repos/infra" {
+				t.Errorf("entry provider %q url %q, want the forge's provider and its Data Center link", r.Provider, r.URL)
+			}
+			return
+		}
+	}
+	t.Fatalf("the answer does not list OPS/infra: %+v", answer.Repositories)
+}

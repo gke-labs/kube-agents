@@ -386,7 +386,7 @@ func parseRepositories(raw string) []repositoryInfo {
 // /projects/<PROJECT>/repos/<repo>; no link when either is missing.
 func repositoryURL(r repositoryInfo) string {
 	repo := strings.TrimSuffix(r.Repository, ".git")
-	host := r.Host
+	host := browseHost(r.Provider, r.Host)
 	browseScheme := ""
 	if scheme, _, isURL := strings.Cut(repo, "://"); isURL {
 		web := browseSchemes[strings.ToLower(scheme)]
@@ -397,16 +397,16 @@ func repositoryURL(r repositoryInfo) string {
 		if err != nil || u.Hostname() == "" {
 			return ""
 		}
-		host, repo = u.Hostname(), u.Path
+		host, repo = browseHost(r.Provider, u.Hostname()), u.Path
 		if web {
 			// A Data Center clone URL (https://<host>/<PROJECT>/<repo>) is
 			// browsed on the same scheme and port, at its browse path.
-			browseScheme, host = strings.ToLower(u.Scheme), u.Host
+			browseScheme, host = strings.ToLower(u.Scheme), strings.ToLower(u.Host)
 		}
 	} else if m := scpRemotePattern.FindStringSubmatch(repo); m != nil && !portPathPattern.MatchString(m[2]) {
-		host, repo = m[1], m[2]
-	} else if first, rest, ok := strings.Cut(repo, "/"); ok && strings.Contains(first, ".") && strings.Contains(rest, "/") && (host == "" || first == host) {
-		host, repo = first, rest
+		host, repo = browseHost(r.Provider, m[1]), m[2]
+	} else if first, rest, ok := strings.Cut(repo, "/"); ok && strings.Contains(first, ".") && strings.Contains(rest, "/") && (host == "" || browseHost(r.Provider, first) == host) {
+		host, repo = browseHost(r.Provider, first), rest
 	}
 	scheme := "https"
 	if host == "" {
@@ -437,6 +437,33 @@ func repositoryURL(r repositoryInfo) string {
 		return scheme + "://" + host + fmt.Sprintf(bitbucketDataCenterRepoPath, project, slug)
 	}
 	return scheme + "://" + host + "/" + strings.Trim(repo, "/")
+}
+
+// providerHostSpellings are each provider's own host spellings; the first is
+// its default host. They are the Hosts and DefaultHost tables of the
+// operator's k8s-operator/api/v1alpha1/gitprovider.go, which folds a host the
+// same way (canonicalHost): keep the two in step.
+var providerHostSpellings = map[string][]string{
+	"github":          {"github.com", "www.github.com", "ssh.github.com"},
+	"gitlab":          {"gitlab.com", "www.gitlab.com"},
+	providerBitbucket: {bitbucketCloudHost, "www.bitbucket.org"},
+}
+
+// browseHost is host as the operator reads it for provider: lowercased (a
+// port stays), and one of the provider's own spellings folded to its default
+// host. An empty provider is github, as on the PlatformAgent.
+func browseHost(provider, host string) string {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if provider == "" {
+		provider = "github"
+	}
+	spellings := providerHostSpellings[provider]
+	for _, h := range spellings {
+		if host == h {
+			return spellings[0]
+		}
+	}
+	return host
 }
 
 // splitList splits a separated list, trimming each item and dropping empty
