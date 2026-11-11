@@ -38,12 +38,6 @@ const (
 	// submissionSubjects is every task's .in subject, which the console grant
 	// lets the server watch (a2a.>): submissions, follow-ups and cancels.
 	submissionSubjects = "a2a.tasks.*.*." + lib.TaskClassIn
-	// profileSubmissionSubjects is every AgentProfile task's submission,
-	// a2a.submit.<profile>.<tier>.<top|child>.<task> (lib.TaskSubmitSubject):
-	// with the profile dispatcher on, the gateway submits a task for a
-	// profile there and not on its .in, a delegated child included. The
-	// console grant's a2a.> covers it.
-	profileSubmissionSubjects = lib.SubmitSubjectPrefix + "*.*.*.*"
 	// submissionSubjectParts is a2a.tasks.<addressee>.<task>.in; the
 	// addressee is field 2.
 	submissionSubjectParts = 5
@@ -1266,7 +1260,12 @@ type turnWatch struct {
 	mu       sync.Mutex
 	followed []TaskRef
 	known    map[string]bool
-	stop     chan struct{}
+	// chainCorr is the turn's own submission's correlationId, once seen:
+	// the gateway gives each new turn its own, and every task it starts in
+	// that turn's service inherits it (a delegated child, the wake that
+	// carries the child's answer back). Guarded by mu.
+	chainCorr string
+	stop      chan struct{}
 	// results is the result frames heard on the conversation, by the task
 	// each names (its taskId, or the r-<task> of its message id): whether
 	// any said cards are pending. Bounded by maxTurnResults.
@@ -1350,14 +1349,10 @@ func (b *NATSBus) openTurn(token string, texts []string, submissions bool) (*tur
 	// matcher and then its follower. A settled turn has neither, and an
 	// undrained subscription on a busy install is a slow consumer on the
 	// connection every tool shares, so it takes the notices alone.
-	var sub, psub *nats.Subscription
+	var sub *nats.Subscription
 	if submissions {
 		var err error
 		if sub, err = nc.ChanSubscribe(submissionSubjects, w.subs); err != nil {
-			return nil, err
-		}
-		if psub, err = nc.ChanSubscribe(profileSubmissionSubjects, w.subs); err != nil {
-			_ = sub.Unsubscribe()
 			return nil, err
 		}
 	}
@@ -1385,20 +1380,16 @@ func (b *NATSBus) openTurn(token string, texts []string, submissions bool) (*tur
 		default:
 		}
 	})
-	unsubscribeSubmissions := func() {
+	if err != nil {
 		if sub != nil {
 			_ = sub.Unsubscribe()
 		}
-		if psub != nil {
-			_ = psub.Unsubscribe()
-		}
-	}
-	if err != nil {
-		unsubscribeSubmissions()
 		return nil, err
 	}
 	w.unsubscribe = func() {
-		unsubscribeSubmissions()
+		if sub != nil {
+			_ = sub.Unsubscribe()
+		}
 		_ = nsub.Unsubscribe()
 	}
 	if err := nc.Flush(); err != nil {
@@ -1687,25 +1678,23 @@ func (w *turnWatch) close() {
 	}
 }
 
-// submission parses an .in message, or a profile task's submission, into
-// its task, conversation, the task it was delegated from (if any) and its
-// text. Only a message counts: a cancel, or anything else on the subject,
-// is not a turn. A profile submission's addressee is its profile, whose
-// task's stream stays on a2a.tasks.<profile>.<task>.
+// submission parses an .in message into its task, conversation, the task it
+// was delegated from (if any) and its text. Only a message counts: a cancel,
+// or anything else on the subject, is not a turn.
 func submission(m *nats.Msg) (ref TaskRef, a submissionAuthority, text string, ok bool) {
-	var addressee, subjectTask string
-	if profile, _, _, taskID, isSubmit := lib.ParseSubmitSubject(m.Subject); isSubmit {
-		addressee, subjectTask = profile, taskID
-	} else if parts := strings.Split(m.Subject, "."); len(parts) == submissionSubjectParts {
-		addressee = parts[submissionAddressee]
-	} else {
+	ref, a, text, _, ok = submissionWithCorrelation(m)
+	return
+}
+
+// submissionWithCorrelation is submission, also returning the envelope's
+// correlationId.
+func submissionWithCorrelation(m *nats.Msg) (ref TaskRef, a submissionAuthority, text, corr string, ok bool) {
+	parts := strings.Split(m.Subject, ".")
+	if len(parts) != submissionSubjectParts {
 		return
 	}
 	env, err := lib.ParseEnvelope(m.Data)
 	if err != nil || env.Kind != lib.KindMessage || env.TaskID == "" || len(env.Authority) == 0 {
-		return
-	}
-	if subjectTask != "" && subjectTask != env.TaskID {
 		return
 	}
 	if json.Unmarshal(env.Authority, &a) != nil {
@@ -1715,7 +1704,7 @@ func submission(m *nats.Msg) (ref TaskRef, a submissionAuthority, text string, o
 	if json.Unmarshal(env.Payload, &msg) != nil {
 		return
 	}
-	return TaskRef{Addressee: addressee, TaskID: env.TaskID}, a, strings.TrimSpace(partsText(msg.Parts)), true
+	return TaskRef{Addressee: parts[submissionAddressee], TaskID: env.TaskID}, a, strings.TrimSpace(partsText(msg.Parts)), env.CorrelationID, true
 }
 
 // ownSubmission reports whether m carries this turn: a message in this
@@ -1723,11 +1712,14 @@ func submission(m *nats.Msg) (ref TaskRef, a submissionAuthority, text string, o
 // message for a task already running is the gateway sending the text into
 // it, and that task is where the turn's answer is.
 func (w *turnWatch) ownSubmission(m *nats.Msg) (TaskRef, bool) {
-	ref, a, text, ok := submission(m)
+	ref, a, text, corr, ok := submissionWithCorrelation(m)
 	if !ok || a.Audience.Conversation != w.conversation || a.Via != nil || !slices.Contains(w.texts, text) {
 		return TaskRef{}, false
 	}
+	w.mu.Lock()
 	w.known[ref.TaskID] = true
+	w.chainCorr = corr
+	w.mu.Unlock()
 	return ref, true
 }
 
@@ -1735,18 +1727,26 @@ func (w *turnWatch) ownSubmission(m *nats.Msg) (TaskRef, bool) {
 // turn already knows, as their submissions arrive, until the watch closes. It
 // keeps the subscription drained, so a busy install's submissions never back
 // up into a slow-consumer drop.
+//
+// A delegated submission is linked by its via, or, when the task its via
+// names was never seen here, by the turn's correlationId: an AgentProfile's
+// child is submitted on a2a.submit, which the console account does not
+// import, so a session's wake (via the child) is the first of the chain this
+// server sees after the root. Only the gateway publishes on .in, so the
+// correlationId a submission there carries is the gateway's (#5494).
 func (w *turnWatch) follow() {
 	for {
 		select {
 		case <-w.stop:
 			return
 		case m := <-w.subs:
-			ref, a, _, ok := submission(m)
+			ref, a, _, corr, ok := submissionWithCorrelation(m)
 			if !ok || a.Audience.Conversation != w.conversation || a.Via == nil {
 				continue
 			}
 			w.mu.Lock()
-			if w.known[a.Via.TaskID] && !w.known[ref.TaskID] && len(w.followed) < maxFollowedTasks {
+			linked := w.known[a.Via.TaskID] || (w.chainCorr != "" && corr == w.chainCorr)
+			if linked && !w.known[ref.TaskID] && len(w.followed) < maxFollowedTasks {
 				w.known[ref.TaskID] = true
 				w.followed = append(w.followed, ref)
 			}

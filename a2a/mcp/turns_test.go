@@ -88,8 +88,16 @@ func pause(t *testing.T, d time.Duration) bool {
 // publishSubmission puts a submission on TASKS as the gateway would.
 func publishSubmission(t *testing.T, js jetstream.JetStream, addressee, taskID, conversation, text, viaTask string) {
 	t.Helper()
+	publishSubmissionCorr(t, js, addressee, taskID, conversation, text, viaTask, "corr-"+taskID)
+}
+
+// publishSubmissionCorr is publishSubmission with the envelope's
+// correlationId given: the gateway gives a task started in a turn's service
+// (a child, its wake) the turn's own.
+func publishSubmissionCorr(t *testing.T, js jetstream.JetStream, addressee, taskID, conversation, text, viaTask, corr string) {
+	t.Helper()
 	msg := mustJSON(t, lib.Message{Role: "user", Parts: []lib.Part{{Kind: "text", Text: text}}, MessageID: "m-" + taskID})
-	env, err := lib.NewMessageEnvelope(fakeGateway, taskID, "ctx-"+taskID, "corr-"+taskID, msg, lib.WithAuthority(authorityFor(t, conversation, viaTask)))
+	env, err := lib.NewMessageEnvelope(fakeGateway, taskID, "ctx-"+taskID, corr, msg, lib.WithAuthority(authorityFor(t, conversation, viaTask)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,8 +105,10 @@ func publishSubmission(t *testing.T, js jetstream.JetStream, addressee, taskID, 
 }
 
 // publishProfileSubmission puts a profile task's submission where the
-// gateway puts it with the profile dispatcher on: a2a.submit, off TASKS. A
-// core publish, as a watch reads that subject with a core subscription.
+// gateway puts it with the profile dispatcher on: a2a.submit, off TASKS,
+// which the console account the MCP server runs in does not import. The
+// watch does not read it, so a test that uses it sees the chain as that
+// account does. A core publish, as JetStream here holds TASKS alone.
 func publishProfileSubmission(t *testing.T, nc *nats.Conn, profile, taskID, conversation, text, viaTask string) {
 	t.Helper()
 	msg := mustJSON(t, lib.Message{Role: "user", Parts: []lib.Part{{Kind: "text", Text: text}}, MessageID: "m-" + taskID})
@@ -287,7 +297,11 @@ func runFakeGateway(t *testing.T, url string, js jetstream.JetStream, sc gateway
 			}
 			publishRun(t, js, "cluster-a", child, "child notes", true)
 			wake := fmt.Sprintf("task-wake%d", i)
-			publishSubmission(t, js, fakeAddressee, wake, conv, "child finished", child)
+			if sc.profileChild {
+				publishSubmissionCorr(t, js, fakeAddressee, wake, conv, "child finished", child, "corr-"+root)
+			} else {
+				publishSubmission(t, js, fakeAddressee, wake, conv, "child finished", child)
+			}
 			publishRun(t, js, fakeAddressee, wake, wakeAnswer, true)
 		case sc.handoff:
 			publishRun(t, js, fakeAddressee, root, "", false)
@@ -370,7 +384,10 @@ func TestADelegationsAnswerComesFromTheWakeTask(t *testing.T) {
 			if res.IsError {
 				t.Fatalf("send_message failed: %s", res.Content[0].Text)
 			}
-			mustContain(t, res.Content[0].Text, "answer came from a delegated task", fakeAddressee+"/task-wake1", wakeAnswer, "cluster-a/task-deleg1")
+			mustContain(t, res.Content[0].Text, "answer came from a delegated task", fakeAddressee+"/task-wake1", wakeAnswer)
+			if !profileChild {
+				mustContain(t, res.Content[0].Text, "cluster-a/task-deleg1")
+			}
 		})
 	}
 }
@@ -1883,7 +1900,12 @@ func TestAStreamedDelegationSettlesOnTheWakeTasksAnswer(t *testing.T) {
 				}
 				go func() {
 					time.Sleep(tc.lag)
-					publishSubmission(t, js, fakeAddressee, wakeID, conv, "child finished", childID)
+					if tc.profileSubmit {
+						// The gateway gives the wake the turn's correlationId.
+						publishSubmissionCorr(t, js, fakeAddressee, wakeID, conv, "child finished", childID, "corr-"+rootID)
+					} else {
+						publishSubmission(t, js, fakeAddressee, wakeID, conv, "child finished", childID)
+					}
 					publishRun(t, js, fakeAddressee, wakeID, wakeAnswer, true)
 				}()
 			})
@@ -1919,6 +1941,8 @@ func TestAStreamedDelegationSettlesOnTheWakeTasksAnswer(t *testing.T) {
 			}
 			_, _, txt := FormatTurnCustomToolEnvelope(out)
 			if out.Outcome.AnswerFrom == nil || out.Outcome.AnswerFrom.TaskID != wakeID {
+				// (With profileSubmit the child is not followed, as on a
+				// real install; the wake carries the answer.)
 				t.Errorf("answer from %v; want %s/%s", out.Outcome.AnswerFrom, fakeAddressee, wakeID)
 			}
 			mustContain(t, txt, wakeAnswer)
@@ -2744,5 +2768,40 @@ func TestAPollOnCachedFinalTasksDoesNotReparseThem(t *testing.T) {
 	// finds them cached.
 	if n := collects.Load(); n > 2 {
 		t.Errorf("the poll parsed the cached tasks' steps %d times, want at most 2", n)
+	}
+}
+
+// A delegated submission whose via names a task this watch never saw is
+// followed only when it carries the turn's correlationId: a session's wake
+// after an AgentProfile child the console account cannot see (#5494) is,
+// and another turn's late wake in the same conversation is not.
+func TestFollowLinksAnUnseenViaByTheTurnsCorrelation(t *testing.T) {
+	conv := "console:corr-link"
+	msgFor := func(taskID, via, corr string) *nats.Msg {
+		msg := mustJSON(t, lib.Message{Role: "user", Parts: []lib.Part{{Kind: "text", Text: "x"}}, MessageID: "m-" + taskID})
+		env, err := lib.NewMessageEnvelope(fakeGateway, taskID, "ctx-"+taskID, corr, msg, lib.WithAuthority(authorityFor(t, conv, via)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := json.Marshal(env)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &nats.Msg{Subject: lib.TaskInSubject(fakeAddressee, taskID), Data: data}
+	}
+	w := &turnWatch{conversation: conv, subs: make(chan *nats.Msg, 4), known: map[string]bool{"task-root": true}, chainCorr: "corr-turn", stop: make(chan struct{})}
+	done := make(chan struct{})
+	go func() { w.follow(); close(done) }()
+	w.subs <- msgFor("task-old-wake", "task-old-child", "corr-earlier-turn")
+	w.subs <- msgFor("task-wake", "task-unseen-child", "corr-turn")
+	deadline := time.Now().Add(2 * time.Second)
+	for len(w.followedTasks()) < 1 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	close(w.stop)
+	<-done
+	got := w.followedTasks()
+	if len(got) != 1 || got[0].TaskID != "task-wake" {
+		t.Fatalf("followed %v; want only task-wake, linked by the turn's correlationId", got)
 	}
 }
