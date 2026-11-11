@@ -56,7 +56,8 @@ class FakeSlack:
             return {"ok": True, "ts": ASK_TS}
         step = self.steps[min(self.polls, len(self.steps) - 1)]
         if method == "reactions.get":
-            reactions = [{"name": "eyes", "users": [BOT]}] if step.get("reacting") else []
+            name = step.get("reaction") or ("eyes" if step.get("reacting") else "")
+            reactions = [{"name": name, "users": [BOT]}] if name else []
             return {"ok": True, "message": {"reactions": reactions}}
         if method == "conversations.replies":
             self.polls += 1
@@ -97,6 +98,35 @@ def test_a_reaction_still_on_keeps_the_turn_open_until_the_deadline():
     ex = _turn(fake, FakeClock()).run("q", 10)
     assert ex.outcome == "timeout"
     assert ex.timing()["slack_post_to_answer_s"] is None
+
+
+@pytest.mark.parametrize("mark", ["double_vertical_bar", "x"])
+def test_a_blocked_or_failed_mark_ends_the_turn(mark):
+    fake = FakeSlack([{"reacting": True, "replies": [STATUS]}, {"reaction": mark, "replies": [STATUS, ANSWER]}])
+    ex = _turn(fake, FakeClock()).run("q", 60)
+    assert ex.outcome == "settled" and ex.deliverable == "*Three clusters.*"
+
+
+def test_another_apps_post_in_the_thread_is_not_the_bots():
+    other = {"ts": "1800000010.000100", "user": "UOTHER", "bot_id": "BOTHER", "text": "noise"}
+    fake = FakeSlack([{"replies": [STATUS, ANSWER, other]}])
+    ex = _turn(fake, FakeClock()).run("q", 30)
+    assert ex.outcome == "settled" and ex.deliverable == "*Three clusters.*"
+
+
+def test_a_long_thread_is_read_to_its_end():
+    class Paged(FakeSlack):
+        def call(self, method, **params):
+            if method == "conversations.replies" and not params.get("cursor"):
+                self.polls += 1
+                return {"ok": True, "messages": [{"ts": ASK_TS, "user": "UTEST", "text": "ask"}, STATUS],
+                        "response_metadata": {"next_cursor": "page2"}}
+            if method == "conversations.replies":
+                return {"ok": True, "messages": [ANSWER]}
+            return super().call(method, **params)
+
+    ex = _turn(Paged([{}]), FakeClock()).run("q", 30)
+    assert ex.deliverable == "*Three clusters.*"
 
 
 def test_no_reply_at_all():

@@ -11,7 +11,14 @@
 # Secret Manager in ${SLACK_LANE_SECRETS_PROJECT}, the project the nightly
 # already reads its shared GitLab tokens from (hack/ci-eval-pr.sh,
 # read_gitlab_token). Absent any of them, the lane prints one skip line and
-# exits 0, so a nightly part without the Slack test account is unchanged.
+# exits 0. Nothing runs it on a schedule yet: it runs by hand against an
+# install, and a nightly part is to call it once the Slack test account exists.
+#
+# Beside the three Slack values it needs what any devops-bench run against the
+# install needs: PROJECT_ID, CLUSTER_NAME, AGENT_CLUSTER_CONTEXT (the harness
+# still reads the agent pod, and a case's prompt may name the context),
+# BENCH_TF_ROOT, the judge's GCP_PROJECT_ID, JUDGE_PROVIDER and JUDGE_MODEL, and
+# BENCH_FLEET_KUBECONFIG_DIR for a case that reads the seeded fleet.
 #
 # The install it runs against must have Slack enabled with its own Slack app,
 # the bot and the test user in the channel, the test user on
@@ -62,6 +69,8 @@ main() {
     log="${dir}/run.log"
     timing="${dir}/${SLACK_TIMING_FILE_NAME}"
     rc=0
+    # A run that fails before writing its timing must not report the last run's.
+    rm -f -- "${dir}/${TIMING_FILE_NAME}" "${timing}"
     # The token reaches the child's environment only, never a file or argv.
     (cd "${BENCH_DIR}" && AGENT_TRANSPORT=slack \
       BENCH_SLACK_USER_TOKEN="${token}" BENCH_SLACK_CHANNEL_ID="${channel}" BENCH_SLACK_BOT_USER_ID="${bot}" \

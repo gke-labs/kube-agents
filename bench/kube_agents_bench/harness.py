@@ -79,7 +79,10 @@ Environment:
         or a run that delivered nothing, and nothing is written.
     PLATFORM_AGENT_TOKEN: Bearer token for the endpoint.
 
-    AGENT_TRANSPORT: ``api`` (default; everything above) or ``inject``, which
+    AGENT_TRANSPORT: ``api`` (default; everything above), ``slack`` (advisory, for
+        the Slack lane: a test user's post in a CI channel, read back from the
+        thread, :mod:`kube_agents_bench.slack_transport`; its whole-turn budget is
+        ``AGENT_SLACK_TIMEOUT``, 600 s unset) or ``inject``, which
         hands the prompt to the agent through the A2A gateway's inject backend
         instead -- ``POST /inject`` with the prompt, then the conversation's
         transcript folded until the task's terminal, the way the gateway
@@ -222,7 +225,7 @@ INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
 # trend lives.
 SKIP_REPORT_ONLY_JUDGES_ENV = "KUBE_AGENTS_SKIP_REPORT_ONLY_JUDGES"
 
-# The two doors ``AGENT_TRANSPORT`` selects between. ``api`` is the agent's own
+# The doors ``AGENT_TRANSPORT`` selects between. ``api`` is the agent's own
 # HTTP endpoint, which is identical under both modes and therefore says nothing
 # about the next stack; ``inject`` goes through the A2A gateway, which is the
 # stack the mode renders.

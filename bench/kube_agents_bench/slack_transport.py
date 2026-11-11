@@ -30,8 +30,10 @@ the test user in ``A2A_SLACK_TEST_USERS`` (the chart's
 bot and the user must both be in the channel.
 
 A turn has settled once the thread holds a bot reply, the bot's reaction on the
-ask is gone (the gateway removes it once work succeeds; it marks work in
-flight), and no bot message has arrived or changed for :data:`SETTLE_QUIET_SECONDS`.
+ask is gone or is one of the settle marks (the gateway removes the in-flight
+mark once work succeeds, and leaves ⏸️ on a blocked turn and ❌ on a failed one,
+a2a/gateway/slack_reactions.go), and no bot message has arrived or changed for
+:data:`SETTLE_QUIET_SECONDS`.
 
 Advisory: the lane this transport serves gates nothing. Only the standard
 library is used, like the inject transport and ``hack/slack-live-check``.
@@ -65,6 +67,9 @@ USER_TOKEN_PREFIXES = ("xoxp-", "xoxe.xoxp-")
 TIMING_FILE_ENV = "BENCH_SLACK_TIMING_FILE"
 
 POLL_SECONDS = 2.0
+# The bot's reactions that end a turn rather than mark it in flight: blocked and
+# failed (slackMarkEmoji in a2a/gateway/slack_reactions.go).
+SETTLE_REACTIONS = frozenset({"double_vertical_bar", "x"})
 # How long the thread must stay unchanged, after the reaction is gone, for the
 # turn to count as settled: long enough to cover the gap between a status line's
 # last edit and the answer's post.
@@ -140,7 +145,9 @@ def ts_value(ts: str | None) -> Decimal | None:
 
 
 def is_bot_message(msg: dict, bot_user: str) -> bool:
-    return msg.get("user") == bot_user or bool(msg.get("bot_id"))
+    """Whether the install's bot posted it: by its member id, never by a bot_id alone,
+    which another app's post, or a test user's post through one, also carries."""
+    return msg.get("user") == bot_user
 
 
 def has_buttons(msg: dict) -> bool:
@@ -228,7 +235,7 @@ class SlackTurn:
                 raise
             if name and not ex.reaction:
                 ex.reaction, ex.reaction_seen = name, Decimal(str(self._wall()))
-            reacting = bool(name)
+            reacting = bool(name) and name not in SETTLE_REACTIONS
             shape = tuple((p.get("ts"), (p.get("edited") or {}).get("ts"), p.get("text")) for p in ex.posts)
             if shape != last_shape:
                 last_shape, quiet_since = shape, self._clock()
@@ -246,8 +253,17 @@ class SlackTurn:
         return ""
 
     def _bot_replies(self, ts: str) -> list[dict]:
-        messages = self.client.call("conversations.replies", channel=self.channel, ts=ts,
-                                    limit=str(REPLIES_PAGE_LIMIT)).get("messages") or []
+        messages: list[dict] = []
+        cursor = ""
+        while True:
+            params = {"channel": self.channel, "ts": ts, "limit": str(REPLIES_PAGE_LIMIT)}
+            if cursor:
+                params["cursor"] = cursor
+            page = self.client.call("conversations.replies", **params)
+            messages.extend(page.get("messages") or [])
+            cursor = (page.get("response_metadata") or {}).get("next_cursor") or ""
+            if not cursor:
+                break
         return [m for m in messages if m.get("ts") != ts and is_bot_message(m, self.bot_user)]
 
 
