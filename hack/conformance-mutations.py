@@ -336,6 +336,33 @@ MUTATIONS: list[Mutation] = [
         "reach tiers through a wildcard resource, which a resource-name match misses",
     ),
     Mutation(
+        # Next mode reads tiers through an operator-rendered ConfigMap, so no
+        # role it mints needs them. A builder that grants them shows up in the
+        # next golden when it is regenerated, which is what this edits.
+        "A4-next-gateway-reads-tiers",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent-next.yaml",
+        ("rules:\n  - apiGroups:\n      - \"\"\n    resources:\n      - pods\n    verbs:\n"
+         "      - create\n      - get\n      - list\n      - watch\n      - delete",
+         "rules:\n  - apiGroups:\n      - kubeagents.x-k8s.io\n    resources:\n      - tiers\n"
+         "    verbs:\n      - get\n      - list\n      - watch\n"
+         "  - apiGroups:\n      - \"\"\n    resources:\n      - pods\n    verbs:\n"
+         "      - create\n      - get\n      - list\n      - watch\n      - delete"),
+        "test_A4_only_cluster_administrators_write_tiers",
+        "let the next-mode A2A gateway read tiers directly, as tier-aware "
+        "routing might, instead of through the operator's ConfigMap",
+    ),
+    Mutation(
+        "A4-next-callout-wildcard-resource",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent-next.yaml",
+        ("rules:\n  - apiGroups:\n      - \"\"\n    resourceNames:\n      - platformagent-a2a-authmap-0\n",
+         "rules:\n  - apiGroups:\n      - kubeagents.x-k8s.io\n    resources:\n      - '*'\n"
+         "    verbs:\n      - get\n"
+         "  - apiGroups:\n      - \"\"\n    resourceNames:\n      - platformagent-a2a-authmap-0\n"),
+        "test_A4_only_cluster_administrators_write_tiers",
+        "give the next-mode auth callout a wildcard read on the operator's API "
+        "group, which reaches tiers without naming them",
+    ),
+    Mutation(
         "A4-operator-tiers-wildcard-subresource",
         "charts/kube-agents/templates/operator-rbac.yaml",
         ("  # END GENERATED RULES",

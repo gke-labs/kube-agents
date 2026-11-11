@@ -1795,9 +1795,11 @@ class A4DelegationAttenuates(unittest.TestCase):
 
         The Tier CRD (#3659) is for cluster administrators alone, so:
 
-          - no Role or ClusterRole in the `spec.mode: today` goldens or in the
-            chart's own templates names `tiers`, by name or by a wildcard
-            group, resource or subresource, at any verb;
+          - no Role or ClusterRole in the `spec.mode: today` goldens, in the
+            `spec.mode: next` golden or in the chart's own templates names
+            `tiers`, by name or by a wildcard group, resource or subresource,
+            at any verb. Next mode reads tiers through an operator-rendered
+            ConfigMap, so none of its workload roles needs them either;
           - the operator's RBAC, on both delivery paths (role.yaml plus the
             leader-election Role for kustomize, operator-rbac.yaml for the
             chart), reads tiers and writes their status, and nothing more,
@@ -1810,10 +1812,11 @@ class A4DelegationAttenuates(unittest.TestCase):
         resources and verbs: a templated field would leave the predicate
         reading a placeholder.
 
-        Not covered yet: the roles the operator mints for `spec.mode: next`
-        (buildA2AGatewayRole, buildA2ACalloutRole, buildScopePublisherRole and
-        the dispatcher roles). The goldens render only the today-mode
-        fixtures in _GOLDEN_KEYS, so those builders are outside this read.
+        The next golden renders the A2A gateway's and the auth callout's
+        Roles (buildA2AGatewayRole, buildA2ACalloutRole), and the dispatcher's
+        once it renders by default. Not covered yet, because no golden renders
+        them: the scope publisher's Role (buildScopePublisherRole), the A2A
+        MCP server's, and the dispatcher's Jobs Role in the profile namespace.
         """
         def reaches_tiers(rule: dict) -> set[str]:
             """The tier resources a rule reaches, wildcards included."""
@@ -1857,9 +1860,15 @@ class A4DelegationAttenuates(unittest.TestCase):
                          if isinstance(d, dict))
 
         product_roles = []
-        for name, documents in h.golden_documents().items():
+        goldens = dict(h.golden_documents(), golden_next=h.yaml_documents("golden_next"))
+        for name, documents in goldens.items():
             for kind in ("Role", "ClusterRole"):
                 product_roles += [(name, role) for role in h.objects_of_kind(documents, kind)]
+        # The next golden is read for the A2A roles in it: losing them would
+        # leave this checking the base roles today's goldens already cover.
+        next_roles = {role["metadata"]["name"] for name, role in product_roles if name == "golden_next"}
+        for a2a_role in ("platformagent-a2a-gateway", "platformagent-a2a-callout"):
+            self.assertIn(a2a_role, next_roles, "the next golden no longer renders the A2A roles A4 reads")
         # The chart's own roles (the web console's, the cleanup hook's). A
         # template that declares a role and won't parse fails here rather than
         # being skipped, since a skipped role is an unchecked one.
