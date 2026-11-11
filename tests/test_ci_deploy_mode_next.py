@@ -441,12 +441,11 @@ class FlagSetIsNextTest(unittest.TestCase):
             "--set-string",
             f"operator.extraEnv[10].value={_AR_REPO}/a2a-dispatcher:{_TAG}",
         ]
-        # The profiles' images, at this build: the cluster profile's persona and
-        # worker, and tse's worker. Unset, the chart would take ghcr at the CI tag.
+        # The cluster profile's images, at this build: its persona and worker.
+        # Unset, the chart would take ghcr at the CI tag.
         for key, image in (
             ("profiles.cluster.persona", "persona-cluster"),
             ("profiles.cluster.harness", "a2a-worker"),
-            ("profiles.tse.harness", "a2a-worker"),
         ):
             expected += [
                 "--set-string",
@@ -917,9 +916,10 @@ class TasksBudgetSizingTest(unittest.TestCase):
         assert block is not None
         self.assertIn('--set-string "platformAgent.deployment.env[4].name=KUBEAGENTS_AUDIT_AUTO_PROMOTE"', block.group(1))
         self.assertIn('--set-string "platformAgent.deployment.env[4].value=false"', block.group(1))
-        self.assertIn('--set "profiles.tse.enabled=true"', block.group(1))
-        # The cluster profile too, which a delegation case reads (#5194).
+        # The cluster profile, which a delegation case reads (#5194). Not tse,
+        # whose placeholder persona a dispatched worker can't stage (#3842).
         self.assertIn('--set "profiles.cluster.enabled=true"', block.group(1))
+        self.assertNotIn("profiles.tse", block.group(1))
         self.assertIn('${MODE_NEXT_ENV_ARGS[@]+"${MODE_NEXT_ENV_ARGS[@]}"}', script)
         root = _CI_DEPLOY.parent.parent
         self.assertIn('envAuditAutoPromote = "KUBEAGENTS_AUDIT_AUTO_PROMOTE"', (root / "k8s-operator/internal/controller/shell_sandbox_manifests.go").read_text())

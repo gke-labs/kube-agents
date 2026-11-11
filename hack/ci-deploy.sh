@@ -790,9 +790,11 @@ A2A_OPERATOR_ENV_ARGS=()
 # first-run chain included) writes one whenever a pool repository declares a
 # workload with a major finding (#3439). spec.deployment.env carries the
 # switch; the operator forwards it to the shell sandbox, where finish runs.
-# It also enables the optional `tse` AgentProfile so `mode: next` eval lanes
-# scaffold `/opt/data/profiles/tse` (#3492), and the `cluster` one, which the
-# profile dispatcher serves (its images are set with the A2A overrides below). Empty on the today lane, so that
+# It also enables the `cluster` AgentProfile, which the profile dispatcher
+# serves (its images are set with the A2A overrides below). Not the optional
+# `tse` one: its chart persona image is a placeholder a dispatched worker can't
+# stage, so the lane leaves it off, and its case parked, until #3842 gives it a
+# real one (#3492 enabled it here for the Kanban scaffold). Empty on the today lane, so that
 # release stays byte-for-byte the same.
 # env[3], set on every lane in the install below, turns the broker's proposal
 # readings sweep off (CREDENTIAL_PROXY_VCS_READINGS=off). Its hourly forge
@@ -804,7 +806,6 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   MODE_NEXT_ENV_ARGS=(
     --set-string "platformAgent.deployment.env[4].name=KUBEAGENTS_AUDIT_AUTO_PROMOTE"
     --set-string "platformAgent.deployment.env[4].value=false"
-    --set "profiles.tse.enabled=true"
     --set "profiles.cluster.enabled=true"
   )
 fi
@@ -1779,13 +1780,11 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     # The profiles' images. Unset, the chart takes each from ghcr at the agent
     # image's tag, which on this lane is a CI tag ghcr never has, and the
     # profile's worker never pulls. The cluster profile runs this build's
-    # persona and worker; tse runs this build's worker.
+    # persona and worker.
     --set-string "profiles.cluster.persona.image.repository=${A2A_IMAGE_PREFIX}/${PERSONA_CLUSTER_IMAGE_NAME}"
     --set-string "profiles.cluster.persona.image.tag=${TAG}"
     --set-string "profiles.cluster.harness.image.repository=${A2A_IMAGE_PREFIX}/${A2A_WORKER_IMAGE_NAME}"
     --set-string "profiles.cluster.harness.image.tag=${TAG}"
-    --set-string "profiles.tse.harness.image.repository=${A2A_IMAGE_PREFIX}/${A2A_WORKER_IMAGE_NAME}"
-    --set-string "profiles.tse.harness.image.tag=${TAG}"
   )
 fi
 

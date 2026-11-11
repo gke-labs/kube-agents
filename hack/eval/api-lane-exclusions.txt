@@ -44,3 +44,8 @@ chat-question-asked-to-choose-pauses
 # to. Leaves this list when the api lane can send a second message on the
 # same conversation.
 chat-reply-under-pushed-report
+
+# #5191: graded by delegated_to, which reads the inject lane's read route for
+# whom the session delegated to; the api transport can't report it. Leaves this
+# list when the api lane can read a turn's delegations.
+session-delegates-to-the-profile-asked-for

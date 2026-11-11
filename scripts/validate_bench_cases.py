@@ -180,13 +180,12 @@ SCENARIO_BATCH_WAIT = (
 )
 
 KNOWN_UNREGISTERED = {
-    # Grades whom a /session turn delegated to (delegated_to); the cluster child
-    # it delegates to only runs where the AgentProfile dispatcher does, which the
-    # CI next lane turns on, with profiles.cluster, in the dispatcher flip (#5394). That pull request
-    # registers the case in hack/eval/nightly-cases.txt and on
-    # hack/eval/api-lane-exclusions.txt, and removes this entry.
-    "session-delegates-to-the-profile-asked-for": (
-        "#5394: needs the AgentProfile dispatcher, which the CI next lane gets from #5394; registered there"
+    # Parked from hack/eval/nightly-cases.txt by the dispatcher flip (#5394):
+    # its tse profile's persona image is a placeholder a dispatched worker can't
+    # stage, so the CI next lane stops enabling tse until #3842 gives it a real
+    # one. #3842 re-enables tse on the lane, puts the case back and removes this.
+    "tse-node-notready-pleg-probe": (
+        "#3842: the CI next lane enables tse again once #3842 gives it a real persona image"
     ),
     # Provisions its own cluster, so registering it costs every pull request
     # a second multi-minute provision. Whether it belongs in presubmit or

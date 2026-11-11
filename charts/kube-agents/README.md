@@ -1484,6 +1484,11 @@ limit. A cluster with bursting admits the manifest as rendered.
 controlling its `AgentProfile` spec. When bound, the operator passes
 `KUBE_AGENTS_ENABLED_PROFILES=tse` to the gateway Deployment so the entrypoint
 scaffolds `/opt/data/profiles/tse` from `/opt/tse-template` on startup.
+Its default persona image is still a placeholder with no persona payload, and the
+profile dispatcher, on by default, gives every bound profile a warm worker. So until
+#3842 gives tse a real persona image, enabling `profiles.tse` leaves a tse warm pod
+crash-looping at its persona step. Handing work to tse through Kanban still works,
+since that runs in the scaffolded profile, not in the worker.
 
 `profiles.cluster.enabled` (default `false`) renders `AgentProfile/cluster`, the
 generic cluster agent: one profile for every cluster in scope, with the
