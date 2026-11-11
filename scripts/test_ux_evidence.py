@@ -144,7 +144,7 @@ class BodyTest(unittest.TestCase):
     def test_comment_marker_in_code_does_not_hide_a_real_image(self):
         self.assertTrue(ux.has_image(f"```\n<!--\n```\n\n{SHOT}\n"))
 
-    def test_an_unclosed_fence_does_not_hide_a_later_image(self):
+    def test_a_fence_opened_inside_a_comment_ends_with_it(self):
         self.assertTrue(ux.has_image(f"<!--\n```bash\n-->\n\n{SHOT}\n"))
 
     def test_an_info_string_line_does_not_close_a_fence(self):
@@ -171,6 +171,10 @@ class BodyTest(unittest.TestCase):
     def test_bracketed_alt_text_counts(self):
         self.assertTrue(ux.has_image("![chat reply [after]](https://example.com/shot.png)"))
 
+    def test_an_unclosed_fence_hides_the_images_after_it(self):
+        self.assertFalse(ux.has_image(f"```\n{SHOT}\n"))
+        self.assertFalse(ux.has_image(f"text\n\n  ~~~bash\nrun\n\n{SHOT}\n"))
+
     def test_a_link_is_not_an_image(self):
         self.assertFalse(ux.has_image("[screenshot](https://example.com/a.png)"))
 
@@ -187,6 +191,12 @@ class VerdictTest(unittest.TestCase):
     def test_no_surface_passes_with_an_empty_body(self):
         passed, chat, _ = ux.verdict(["scripts/merge_gate.py"], "", chat=CHAT)
         self.assertEqual((passed, chat), (True, False))
+
+    def test_a_chat_case_change_runs_the_chat_job_without_a_screenshot(self):
+        for path in ("tests/conformance/chat-ux/lint.json", "tests/conformance/chat/answer-markdown-detail.json"):
+            with self.subTest(path=path):
+                passed, chat, _ = ux.verdict([path], "", chat=CHAT)
+                self.assertEqual((passed, chat), (True, True))
 
     def test_surface_without_evidence_fails_and_names_the_path(self):
         passed, chat, message = ux.verdict(["a2a/gateway/slack_stop.go"], "- [ ] No user-visible change", chat=CHAT)

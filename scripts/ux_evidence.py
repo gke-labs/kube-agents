@@ -52,6 +52,14 @@ SURFACES = (
 )
 
 # Tests anywhere: a golden file or a fixture changes because a surface did.
+# The shared chat cases the chatmsg lint and the conformance tests read. A
+# change to them is a test, so it needs no screenshot, but it is exactly what
+# the chat job exists to run.
+CHAT_CASES = (
+    "tests/conformance/chat/**",
+    "tests/conformance/chat-ux/**",
+)
+
 TEST_PATHS = (
     "**/test_*.py",
     "**/*_test.go",
@@ -86,11 +94,11 @@ LIST_ITEM_RE = re.compile(r"""^\s+-\s+["']?([^"'\s]+)["']?\s*$""")
 # a fenced block at any indent (list items indent theirs), closed by a line of
 # at least the same markers and nothing else, so a "```python" line opens and
 # never closes; a code span, closed by a backtick run of its own length before
-# a blank line ends the paragraph. An unclosed fence is not a block here, so it
-# hides no image after it.
+# a blank line ends the paragraph. An unclosed fence runs to the end of the
+# body, as GitHub renders it, so an image after it shows as text.
 HIDDEN_RE = re.compile(
     r"<!--.*?(?:-->|\Z)"
-    r"|^[ \t]*(?P<fence>`{3,}|~{3,})[^\n]*\n.*?^[ \t]*(?P=fence)[`~]*[ \t]*$"
+    r"|^[ \t]*(?P<fence>`{3,}|~{3,})[^\n]*(?:\n.*?^[ \t]*(?P=fence)[`~]*[ \t]*$|.*\Z)"
     r"|(?P<ticks>`+)(?!`)(?:(?!\n[ \t]*\n).)+?(?<!`)(?P=ticks)(?!`)",
     re.DOTALL | re.MULTILINE,
 )
@@ -166,6 +174,10 @@ def _matches(path, globs):
     return any(glob_to_regex(g).match(path) for g in globs)
 
 
+def _any_matches(files, globs):
+    return any(_matches(path, globs) for path in files)
+
+
 def classify(files, chat=None, surfaces=SURFACES):
     """Split changed files into (chat, other surfaces); files a user never sees drop out."""
     chat = chat_globs() if chat is None else chat
@@ -197,14 +209,15 @@ def no_change_ticked(body):
 def verdict(files, body, chat=None):
     """(passed, chat_changed, message) for one pull request."""
     chat_hits, surface_hits = classify(files, chat=chat)
+    chat_changed = bool(chat_hits) or _any_matches(files, CHAT_CASES)
     seen = chat_hits + surface_hits
     if not seen:
-        return True, False, "No user-facing path changed."
+        return True, chat_changed, "No user-facing path changed."
     listing = "\n".join(f"  {p}" for p in seen)
     if has_image(body):
-        return True, bool(chat_hits), f"User-facing paths changed and the body has a screenshot:\n{listing}"
+        return True, chat_changed, f"User-facing paths changed and the body has a screenshot:\n{listing}"
     if no_change_ticked(body):
-        return True, bool(chat_hits), f"User-facing paths changed; the author ticked 'No user-visible change':\n{listing}"
+        return True, chat_changed, f"User-facing paths changed; the author ticked 'No user-visible change':\n{listing}"
     message = (
         "This pull request changes what a user sees, and its body has no screenshot:\n"
         f"{listing}\n"
@@ -212,7 +225,7 @@ def verdict(files, body, chat=None):
         "changes existing output), or tick 'No user-visible change' if nothing a user sees moved. "
         "Mechanics: .agents/rules/pre_pr_review.md, 'UX change'."
     )
-    return False, bool(chat_hits), message
+    return False, chat_changed, message
 
 
 def main(argv=None):

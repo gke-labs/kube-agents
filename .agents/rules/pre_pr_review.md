@@ -48,9 +48,10 @@ The rule, and the requirement to fill in the template's **Self-Review** section,
   or press a button. `/pr-preflight` decides from the range and runs it; its violations join the
   one disposition list. The `Chat output follows the chat UX rules` check in
   [`ux-evidence.yml`](../../.github/workflows/ux-evidence.yml) runs `a2a/lib/chatmsg`'s lint and
-  the chat conformance and golden tests on the same paths. The lint reads the shared cases in
-  `tests/conformance/chat-ux/`, so a new kind of message is checked by code only once a case
-  carries it; the pass reads the rest.
+  the chat conformance and golden tests on the same paths, and on a change to the shared cases in
+  `tests/conformance/chat/` and `tests/conformance/chat-ux/`, which needs no screenshot. The lint
+  reads those cases, so a new kind of message is checked by code only once a case carries it; the
+  pass reads the rest.
 - **If your harness will not spawn one without a human's approval, go and get the approval.** A
   setting that requires sign-off before starting a subagent blocks this step; it does not waive
   it. Ask when you hit it, not after the review, and say what you are blocked on. Quietly running
@@ -143,7 +144,7 @@ it is a developer tool that runs on your own machine.
 - **When nothing a user sees moved** — a refactor of a renderer, a console handler's backend
   logic — tick **No user-visible change** instead. The reviewer holds the tick to the diff.
 - **[`ux-evidence.yml`](../../.github/workflows/ux-evidence.yml) checks the body.** It fails when
-  the diff changes a user-facing path and the body, outside comments and code fences, has neither
+  the diff changes a user-facing path and the body, outside comments, code fences (an unclosed one runs to the end) and code spans, has neither
   an image nor the ticked box; editing the body re-runs it. The paths are the `paths:` of
   [`chat_ux.md`](chat_ux.md) plus `SURFACES` in
   [`scripts/ux_evidence.py`](../../scripts/ux_evidence.py); test files never count, and the docs
