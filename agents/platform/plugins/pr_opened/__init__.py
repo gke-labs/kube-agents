@@ -235,17 +235,19 @@ LEDGER_TIMEOUT_SECONDS = 2.0
 #: (``kubeagents_switches``). The record's ``target`` (``vcs_client.TARGET_FIELD``)
 #: names the finding the proposal fixes; Session KV derives the kind from the
 #: finding id's check segment and the cluster's project and location from the
-#: Cluster Agent profiles, so the kind is never read from the opener's word. The
-#: record is written only for a claimed proposal whose finding is of a known kind
+#: Cluster Agent profiles and ignores a sent kind. The finding id itself is still
+#: the opener's word (the claim proves the url, not the target), so the check
+#: re-checks the workload rather than trusting the row. The record is written only for a claimed proposal whose finding is of a known kind
 #: while the switch is not ``off``; the check still verifies the fix itself.
 #: ``session_kv_server.POST_MERGE_KINDS`` is the server's copy; a test pins them.
 POST_MERGE_PATH = "/v1/post-merge/records"
 POST_MERGE_KINDS = frozenset({"no-pdb"})
 POST_MERGE_SWITCH = "POST_MERGE_CHECK"
-#: What the record costs at most: the card's thread read and the write. Skipped
-#: when less than this is left before the claim deadline, so the ledger write,
-#: the card record and the strip keep their CLAIM_RESERVE_SECONDS.
-POST_MERGE_COST_SECONDS = 2.5
+#: What the record costs at most: the card's thread read and the write, plus
+#: half a second of margin. Skipped when less than this is left before the claim
+#: deadline, so the ledger write, the card record and the strip keep their
+#: CLAIM_RESERVE_SECONDS.
+POST_MERGE_COST_SECONDS = 3.0
 CARD_THREAD_BUSY_MS = 500
 POST_MERGE_TIMEOUT_SECONDS = 2.0
 #: The target fields forwarded, each a string.
