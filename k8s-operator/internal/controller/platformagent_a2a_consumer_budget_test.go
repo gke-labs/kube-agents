@@ -1240,30 +1240,65 @@ func profileSubmitsInfoJSON(maxAge time.Duration) string {
 }
 
 // stubNatsAnswering is stubNats with the TOPICS-STATE and PROFILE_SUBMITS
-// answers chosen by the caller; every other stream gets liveJSON.
+// answers chosen by the caller; every other stream gets liveJSON, except
+// TOPICS-JOURNAL, which answers at this render's cap holding nothing.
+//
+// The byte-cap step (#4476) reads max_bytes and bytes off TASKS and
+// TOPICS-JOURNAL and fails on an answer without them. A liveJSON without
+// "max_bytes" is a test shaping some other field, so the stub gives it the
+// render's cap and nothing held, and the cap step stays out of its way.
+//
+// A test of the cap step puts its own answers in dir/streams: <STREAM>.N.json
+// is the stream's Nth --json answer (1-based), <STREAM>.json any answer
+// without a numbered file. A `stream edit` call answers with the exit status
+// in dir/streams/edit-exit, 0 without one.
 func stubNatsAnswering(t *testing.T, dir, liveJSON, topicsStateJSON, submitsJSON string) string {
 	t.Helper()
 	bin := filepath.Join(dir, "bin")
 	if err := os.MkdirAll(bin, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	streams := filepath.Join(dir, "streams")
+	if err := os.MkdirAll(streams, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(liveJSON, `"max_bytes"`) && strings.HasPrefix(strings.TrimSpace(liveJSON), "{") {
+		liveJSON = fmt.Sprintf(`{"max_bytes":%d,"state":{"bytes":0},`, a2aTasksMaxBytes) + strings.TrimPrefix(strings.TrimSpace(liveJSON), "{")
+	}
+	journalJSON := fmt.Sprintf(`{"config":{"name":"TOPICS-JOURNAL","max_bytes":%d},"state":{"messages":0,"bytes":0}}`, a2aTopicsJournalMaxBytes)
 	log := filepath.Join(dir, "nats-calls.log")
 	stub := fmt.Sprintf(`#!/bin/sh
 echo "$*" >> %q
 json=0
+edit=0
 stream=""
 for a in "$@"; do
   case "$a" in
     --json) json=1 ;;
+    edit) edit=1 ;;
     TASKS|TOPICS-STATE|DIRECTORY|TOPICS-JOURNAL|PROFILE_SUBMITS) stream="$a" ;;
   esac
 done
+if [ "$edit" = "1" ]; then
+  if [ -f %q/edit-exit ]; then exit "$(cat %q/edit-exit)"; fi
+  exit 0
+fi
 if [ "$json" = "1" ]; then
+  if [ -n "$stream" ]; then
+    n=$(( $(cat %q/"$stream".count 2>/dev/null || echo 0) + 1 ))
+    echo "$n" > %q/"$stream".count
+    if [ -f %q/"$stream"."$n".json ]; then cat %q/"$stream"."$n".json; exit 0; fi
+    if [ -f %q/"$stream".json ]; then cat %q/"$stream".json; exit 0; fi
+  fi
   if [ "$stream" = "TOPICS-STATE" ]; then
     cat <<'JSON'
 %s
 JSON
   elif [ "$stream" = "PROFILE_SUBMITS" ]; then
+    cat <<'JSON'
+%s
+JSON
+  elif [ "$stream" = "TOPICS-JOURNAL" ]; then
     cat <<'JSON'
 %s
 JSON
@@ -1275,7 +1310,7 @@ JSON
   exit 0
 fi
 exit 0
-`, log, topicsStateJSON, submitsJSON, liveJSON)
+`, log, streams, streams, streams, streams, streams, streams, streams, streams, topicsStateJSON, submitsJSON, journalJSON, liveJSON)
 	if err := os.WriteFile(filepath.Join(bin, "nats"), []byte(stub), 0o700); err != nil {
 		t.Fatal(err)
 	}

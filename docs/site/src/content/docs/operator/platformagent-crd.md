@@ -1736,6 +1736,13 @@ running unbounded, and the pass that first sees the Job complete records a `Warn
 closes the gap with what that edit costs. A stream carrying some other finite cap is drift, not that
 gap, and stays in the Job's pod log.
 
+The byte caps of `TASKS` (8 GiB) and `TOPICS-JOURNAL` (1 GiB) are the one limit provisioning changes
+on an existing stream. A stream above its cap is lowered only while it holds under half the new
+cap, which evicts nothing, and the Job records a `Normal` Event, reason `A2ABusStreamCapLowered`,
+naming the stream and its old and new `max_bytes`. A stream holding more keeps its cap, and the
+Event is a `Warning`, reason `A2ABusStreamCapNotLowered`, with the `nats stream edit` to run once it
+holds less.
+
 The Event is recorded once per Job run, so roughly daily while the gap stands, because the finished
 Job is removed by its TTL and run again; Events themselves expire on the cluster's event TTL (an hour
 by default), so between runs it can be gone, and the next run records it again. Read it with

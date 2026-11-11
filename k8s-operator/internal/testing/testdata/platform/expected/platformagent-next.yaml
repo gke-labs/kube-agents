@@ -3506,8 +3506,9 @@ stringData:
 
     jetstream {
       store_dir: /data
-      # Under the 40Gi PV; the stream max_bytes caps (20+5+1+1 GiB) plus KV live
-      # inside this.
+      # Under the 40Gi PV. Every stream's and bucket's max_bytes is reserved
+      # against this at create; TestProvisionedJetStreamCapsFitTheStore holds
+      # their sum under it, with room for the next one.
       max_file_store: 34359738368
     }
     accounts {
@@ -5171,7 +5172,7 @@ metadata:
     app.kubernetes.io/name: platform-agent
     app.kubernetes.io/part-of: a2a-next
     kubeagents.x-k8s.io/a2a-component: provision
-  name: platformagent-a2a-provision-27d90fb8
+  name: platformagent-a2a-provision-ced7b4a3
   namespace: kubeagents-system
   ownerReferences:
     - apiVersion: kubeagents.x-k8s.io/v1alpha1
@@ -5258,76 +5259,78 @@ spec:
               even though it is the CLI's\n# default: the bus grants are written for the
               direct-get\n# route (nats.go picks DIRECT.GET or STREAM.MSG.GET from the
               stream's own\n# config), so the bit the grant rests on is set here, not
-              inherited.\n\n# TASKS: a2a.tasks.>, 72h dev window, 20GiB cap.\n#\n# max_msgs_per_subject
-              bounds ONE SUBJECT, which on this stream is one class of\n# one task: a2a.tasks.{addressee}.{taskId}.{in,events,supervisor}.
-              Read what it\n# does and does not buy, because the two are easy to swap.\n#\n#
+              inherited.\n\n# TASKS: a2a.tasks.>, 72h dev window, 8GiB cap (a2aTasksMaxBytes).\n#\n#
+              max_msgs_per_subject bounds ONE SUBJECT, which on this stream is one class
+              of\n# one task: a2a.tasks.{addressee}.{taskId}.{in,events,supervisor}. Read
+              what it\n# does and does not buy, because the two are easy to swap.\n#\n#
               It buys: a runaway executor - a loop, a harness streaming forever - can
-              no\n# longer push 20GiB through the stream on one task and, with discard=old,
-              evict\n# every other session's history on the way. The runaway now pays
-              for its own\n# runaway and nobody else's.\n#\n# It does NOT buy containment
-              of a session that means it. A session's publish\n# grant is a2a.tasks.<pod>.*.events
-              (authcallout/session.go, sessionGrants: the\n# task id is not in the attested
-              claim, so the grant cannot name one), so a\n# session can mint unbounded
-              distinct subjects by inventing task ids. A\n# per-subject cap is not a per-publisher
-              budget, and JetStream has no per-\n# publisher budget to reach for. Closing
-              that means putting the task id in the\n# claim, which is a change to the
-              callout's narrowing and not to a stream flag.\n#\n# 4096, sized against
-              the publisher that means it rather than the well-behaved\n# one: the render
-              sets no max_payload, so NATS' 1MiB default is the per-message\n# ceiling
-              and 4096 messages is a ~4GiB worst case on one subject, a fifth of the\n#
-              stream. The worker adapter's own result chunks are resultChunkSize (256
-              KiB),\n# so a task built out of those reaches nearer 1GiB at the same count
-              - but that\n# is a property of one publisher and not a bound the bus enforces.
-              A chat-driven\n# task emits single digits to low hundreds of events; reaching
-              4096 is already a\n# loop or a gigabyte of streamed artifact text.\n#\n#
-              What happens at the limit, because discard=old evicts the OLDEST message
-              on\n# the subject first: the oldest event on a task's ...events subject
-              is its\n# 'submitted' status-update, which assertion 9 requires and which
-              FoldTask\n# folds into StatusHistory[0]. A truncated task therefore replays
-              without its\n# head. That is only acceptable because the fold now SAYS so
-              - lib.Task's\n# SubmittedMissing is the assertion-9 observation, the sibling
-              of\n# PostFinalDropped for assertion 10 - so the eviction is a degradation
-              a reader\n# can see rather than a short history it cannot distinguish from
-              a real one.\n#\n# The same eviction on the ...in class is quieter and worse,
-              and this flag\n# does not ship without the check that answers it. That subject's
-              oldest\n# message is the task's originating kind:message, which the worker
-              re-reads on\n# every start. Steers are kind:message too and nothing on the
-              envelope marks\n# the submission, so a scan past the cap returns the oldest
-              surviving steer and\n# the worker executes that as the request - with no
-              SubmittedMissing to show\n# for it, because nothing folds ...in. No stream
-              flag closes that: per-subject\n# discard:new would refuse the steer instead
-              of the submission, which breaks\n# steering, and there is no 'keep the head'
-              policy. It is closed on the client\n# side instead. The gateway publishes
-              the submission before it spawns the pod,\n# so the ack names the sequence;
-              it passes that to the pod as A2A_ORIGIN_SEQ\n# and the adapter opens its
-              origin consumer there and refuses to run if the\n# message it gets back
-              is a different sequence. See a2a/worker-adapter\n# fetchOriginAtSeq and
-              docs/designs/spec-nats-deployment.md.\n$NATS stream info TASKS >/dev/null
-              2>&1 || $NATS stream add TASKS --allow-direct \\\n  --subjects='a2a.tasks.>'
-              --storage=file --retention=limits \\\n  --max-age=72h --max-bytes=21474836480
-              --discard=old --replicas=\"${STREAM_REPLICAS}\" \\\n  --max-msgs-per-subject=4096
-              \\\n  --max-consumers=110 --defaults\n\n# The TASKS durables whose name
-              and filter are fixed (#4173): the gateway's\n# event relay and the bridge's
-              intake. Made here, so their readers bind to them\n# and create nothing,
-              and every principal that may create consumers on TASKS is\n# denied these
-              names (a2aTasksFixedDurableDenyPublish). Pull, explicit ack,\n# every message
-              from the start: what the readers ask for. A consumer add on a\n# durable
-              that exists updates it to these settings, so one an older gateway or\n#
-              bridge made (one filter, the server's max-pending) converges here.\n#\n#
-              When the add fails, what matters is whether the durable exists. A missing
-              one\n# leaves its reader waiting for it, so the run fails and the Job retries\n#
-              (a timeout, TASKS at max_consumers, a grant gone wrong): a run reported\n#
-              complete would never be retried. One that exists but won't take these\n#
-              settings is left as it is: its reader refuses to bind it and names the\n#
-              difference, which is louder than anything this could report.\nfixed_durable()
-              { # name reader [consumer add flags...]\n  name=$1\n  reader=$2\n  shift
-              2\n  $NATS consumer add TASKS \"${name}\" \"$@\" >/dev/null && return 0\n
-              \ if ! $NATS consumer info TASKS \"${name}\" >/dev/null 2>&1; then\n    echo
-              \"could not create TASKS ${name}, and it does not exist: the ${reader} waits
-              for it, so this run fails and the Job retries\" >&2\n    exit 1\n  fi\n
-              \ echo \"WARN: TASKS ${name} exists but could not be brought to this render's
-              settings; the ${reader} refuses to bind it and names the difference\" >&2\n}\nfixed_durable
-              gateway-relay gateway --pull \\\n  --filter='a2a.tasks.*.*.events' --filter='a2a.tasks.*.*.supervisor'
+              no\n# longer push the whole cap through the stream on one task and, with
+              discard=old, evict\n# every other session's history on the way. The runaway
+              now pays for its own\n# runaway and nobody else's.\n#\n# It does NOT buy
+              containment of a session that means it. A session's publish\n# grant is
+              a2a.tasks.<pod>.*.events (authcallout/session.go, sessionGrants: the\n#
+              task id is not in the attested claim, so the grant cannot name one), so
+              a\n# session can mint unbounded distinct subjects by inventing task ids.
+              A\n# per-subject cap is not a per-publisher budget, and JetStream has no
+              per-\n# publisher budget to reach for. Closing that means putting the task
+              id in the\n# claim, which is a change to the callout's narrowing and not
+              to a stream flag.\n#\n# 4096, sized against the publisher that means it
+              rather than the well-behaved\n# one: the render sets no max_payload, so
+              NATS' 1MiB default is the per-message\n# ceiling and 4096 messages is a
+              ~4GiB worst case on one subject, half the\n# stream. The worker adapter's
+              own result chunks are resultChunkSize (256 KiB),\n# so a task built out
+              of those reaches nearer 1GiB at the same count - but that\n# is a property
+              of one publisher and not a bound the bus enforces. A chat-driven\n# task
+              emits single digits to low hundreds of events; reaching 4096 is already
+              a\n# loop or a gigabyte of streamed artifact text.\n#\n# What happens at
+              the limit, because discard=old evicts the OLDEST message on\n# the subject
+              first: the oldest event on a task's ...events subject is its\n# 'submitted'
+              status-update, which assertion 9 requires and which FoldTask\n# folds into
+              StatusHistory[0]. A truncated task therefore replays without its\n# head.
+              That is only acceptable because the fold now SAYS so - lib.Task's\n# SubmittedMissing
+              is the assertion-9 observation, the sibling of\n# PostFinalDropped for assertion
+              10 - so the eviction is a degradation a reader\n# can see rather than a
+              short history it cannot distinguish from a real one.\n#\n# The same eviction
+              on the ...in class is quieter and worse, and this flag\n# does not ship
+              without the check that answers it. That subject's oldest\n# message is the
+              task's originating kind:message, which the worker re-reads on\n# every start.
+              Steers are kind:message too and nothing on the envelope marks\n# the submission,
+              so a scan past the cap returns the oldest surviving steer and\n# the worker
+              executes that as the request - with no SubmittedMissing to show\n# for it,
+              because nothing folds ...in. No stream flag closes that: per-subject\n#
+              discard:new would refuse the steer instead of the submission, which breaks\n#
+              steering, and there is no 'keep the head' policy. It is closed on the client\n#
+              side instead. The gateway publishes the submission before it spawns the
+              pod,\n# so the ack names the sequence; it passes that to the pod as A2A_ORIGIN_SEQ\n#
+              and the adapter opens its origin consumer there and refuses to run if the\n#
+              message it gets back is a different sequence. See a2a/worker-adapter\n#
+              fetchOriginAtSeq and docs/designs/spec-nats-deployment.md.\n$NATS stream
+              info TASKS >/dev/null 2>&1 || $NATS stream add TASKS --allow-direct \\\n
+              \ --subjects='a2a.tasks.>' --storage=file --retention=limits \\\n  --max-age=72h
+              --max-bytes=8589934592 --discard=old --replicas=\"${STREAM_REPLICAS}\" \\\n
+              \ --max-msgs-per-subject=4096 \\\n  --max-consumers=110 --defaults\n\n#
+              The TASKS durables whose name and filter are fixed (#4173): the gateway's\n#
+              event relay and the bridge's intake. Made here, so their readers bind to
+              them\n# and create nothing, and every principal that may create consumers
+              on TASKS is\n# denied these names (a2aTasksFixedDurableDenyPublish). Pull,
+              explicit ack,\n# every message from the start: what the readers ask for.
+              A consumer add on a\n# durable that exists updates it to these settings,
+              so one an older gateway or\n# bridge made (one filter, the server's max-pending)
+              converges here.\n#\n# When the add fails, what matters is whether the durable
+              exists. A missing one\n# leaves its reader waiting for it, so the run fails
+              and the Job retries\n# (a timeout, TASKS at max_consumers, a grant gone
+              wrong): a run reported\n# complete would never be retried. One that exists
+              but won't take these\n# settings is left as it is: its reader refuses to
+              bind it and names the\n# difference, which is louder than anything this
+              could report.\nfixed_durable() { # name reader [consumer add flags...]\n
+              \ name=$1\n  reader=$2\n  shift 2\n  $NATS consumer add TASKS \"${name}\"
+              \"$@\" >/dev/null && return 0\n  if ! $NATS consumer info TASKS \"${name}\"
+              >/dev/null 2>&1; then\n    echo \"could not create TASKS ${name}, and it
+              does not exist: the ${reader} waits for it, so this run fails and the Job
+              retries\" >&2\n    exit 1\n  fi\n  echo \"WARN: TASKS ${name} exists but
+              could not be brought to this render's settings; the ${reader} refuses to
+              bind it and names the difference\" >&2\n}\nfixed_durable gateway-relay gateway
+              --pull \\\n  --filter='a2a.tasks.*.*.events' --filter='a2a.tasks.*.*.supervisor'
               \\\n  --ack=explicit --deliver=all --replay=instant --max-deliver=-1 \\\n
               \ --max-pending=8192 --defaults\nfixed_durable bridge-platform bridge --pull
               \\\n  --filter='a2a.tasks.platform.*.in' \\\n  --ack=explicit --deliver=all
@@ -5357,7 +5360,7 @@ spec:
               TOPICS-JOURNAL: append-only, ages out at 30d. 5GiB cap.\n# Journal-class
               topics: annotations.\n$NATS stream info TOPICS-JOURNAL >/dev/null 2>&1 ||
               $NATS stream add TOPICS-JOURNAL --allow-direct \\\n  --subjects='a2a.topics.shared.annotations'
-              --storage=file --retention=limits \\\n  --max-age=720h --max-bytes=5368709120
+              --storage=file --retention=limits \\\n  --max-age=720h --max-bytes=1073741824
               --discard=old --replicas=\"${STREAM_REPLICAS}\" --max-consumers=64 --defaults\n\n#
               Heartbeats (agents.hb.>) are core NATS, outside JetStream — no stream.\n\n#
               KV buckets: runtime-state (who is alive), session-state (the gateway's\n#
@@ -5428,7 +5431,9 @@ spec:
               --defaults\n\n# TASKS older than this render: the limits the create above
               could not apply.\n#\n# Provisioning is create-only convergence - the info-then-add
               guards never\n# edit an existing stream, which buildA2AProvisionJob says
-              in terms - so an\n# install whose TASKS predates a limit keeps the stream
+              in terms, with one\n# guarded exception: TASKS' and TOPICS-JOURNAL's byte
+              caps are lowered while\n# the stream holds under half the new cap (cap_check,
+              below) - so an\n# install whose TASKS predates a limit keeps the stream
               it was created with\n# and gains nothing from a re-run. Both limits this
               render puts on TASKS are\n# in exactly that position on every install that
               already has the stream, and\n# the two gaps are not the same kind:\n#\n#
@@ -5529,18 +5534,69 @@ spec:
               \ echo \"NOTE: PROFILE_SUBMITS keeps submissions for ${live_submit_max_age}s
               (0 is no limit); this render creates it at 259200s.\" >&2\n  echo \"  The
               dispatcher is told the longer one, so a finished task's tombstone outlives
-              its submission.\" >&2\nfi\nreport=\"{${report_findings}}\"\n# Written only
-              where the kubelet has mounted the file: outside a pod there is\n# nothing
-              to write to, and a copy of a report is not a reason to fail a fully\n# provisioned
-              bus. Nor is a write that fails (a full or faulting disk under\n# the kubelet's
-              file): under set -e that would exit 1 on a bus this script\n# just finished
-              provisioning, and exit 1 matches no podFailurePolicy rule, so\n# the Job
-              would burn its backoff into BackoffLimitExceeded. A pod that has no\n# file,
-              or whose write failed, leaves no message, and the reconcile logs that\n#
-              rather than reading it as clean.\nif [ -w \"/dev/termination-log\" ]; then\n
-              \ printf '%s' \"${report}\" > \"/dev/termination-log\" \\\n    || echo \"WARNING:
-              could not write the provision report to the termination log; the log above
-              is this run's only record\" >&2\nfi\n\nrequired_consumers=110\nlive_consumers=\"$(printf
+              its submission.\" >&2\nfi\n# TASKS and TOPICS-JOURNAL above this render's
+              byte caps (#4476): the one\n# guarded exception to provisioning never editing
+              an existing stream. A\n# lower is safe exactly when the stream holds less
+              than the new cap, since\n# max_bytes with discard=old evicts only what is
+              over it; the script lowers a\n# cap only when the stream holds under HALF
+              the new cap, read twice, the\n# second time right before the edit, so writes
+              landing between the two\n# commands would have to fill the other half. A
+              stream holding more is left\n# and reported with the edit to run once it
+              drains. A stream at or under the\n# cap is left alone, whoever sized it.
+              An unreadable answer FAILS, like the\n# extractors above.\ncap_check() {
+              # stream want\n  cap_stream=$1\n  cap_want=$2\n  cap_over=0\n  cap_lower=0\n
+              \ cap_json=\"$($NATS stream info \"${cap_stream}\" --json | tr -d ' \\t\\r\\n')\"\n
+              \ cap_live=\"$(printf '%s' \"${cap_json}\" | grep -o '\"max_bytes\":-\\{0,1\\}[0-9]\\{1,\\}'
+              | head -n1 | cut -d: -f2 || true)\"\n  cap_held=\"$(printf '%s' \"${cap_json}\"
+              | grep -o '\"bytes\":[0-9]\\{1,\\}' | head -n1 | cut -d: -f2 || true)\"\n
+              \ if [ -z \"${cap_live}\" ] || [ -z \"${cap_held}\" ]; then\n    echo \"could
+              not read max_bytes and bytes off the ${cap_stream} stream; refusing to report
+              this install as provisioned\" >&2\n    exit 1\n  fi\n  if [ \"${cap_live}\"
+              != \"-1\" ] && [ \"${cap_live}\" -le \"${cap_want}\" ]; then\n    return
+              0\n  fi\n  cap_over=1\n  if [ \"${cap_held}\" -ge $((cap_want / 2)) ]; then\n
+              \   return 0\n  fi\n  cap_json=\"$($NATS stream info \"${cap_stream}\" --json
+              | tr -d ' \\t\\r\\n')\"\n  cap_held=\"$(printf '%s' \"${cap_json}\" | grep
+              -o '\"bytes\":[0-9]\\{1,\\}' | head -n1 | cut -d: -f2 || true)\"\n  if [
+              -z \"${cap_held}\" ]; then\n    echo \"could not re-read bytes off the ${cap_stream}
+              stream; refusing to report this install as provisioned\" >&2\n    exit 1\n
+              \ fi\n  if [ \"${cap_held}\" -lt $((cap_want / 2)) ]; then\n    cap_lower=1\n
+              \ fi\n}\ncap_check TASKS 8589934592\ncap_lowered=0\nif [ \"${cap_lower}\"
+              = \"1\" ]; then\n  if $NATS stream edit TASKS --max-bytes=8589934592 --force
+              >/dev/null; then\n    cap_lowered=1\n    echo \"NOTE: lowered TASKS max_bytes
+              from ${cap_live} to 8589934592; it held ${cap_held} bytes, so nothing was
+              evicted.\" >&2\n  else\n    echo \"WARNING: could not lower TASKS max_bytes
+              from ${cap_live} to 8589934592; it keeps its cap. The edit:\" >&2\n    echo
+              \"    nats stream edit TASKS --max-bytes=8589934592\" >&2\n  fi\nelif [
+              \"${cap_over}\" = \"1\" ]; then\n  echo \"NOTE: TASKS keeps max_bytes=${cap_live},
+              above this render's 8589934592: it holds ${cap_held} bytes, half the new
+              cap or more,\" >&2\n  echo \"  and a lower that close to what it holds could
+              evict. Once it holds less than 8589934592 bytes:\" >&2\n  echo \"    nats
+              stream edit TASKS --max-bytes=8589934592\" >&2\nfi\nif [ \"${cap_over}\"
+              = \"1\" ]; then\n  report_findings=\"${report_findings}${report_findings:+,}\\\"tasks_max_bytes\\\":{\\\"live\\\":${cap_live},\\\"held\\\":${cap_held},\\\"want\\\":8589934592,\\\"lowered\\\":${cap_lowered}}\"\nfi\ncap_check
+              TOPICS-JOURNAL 1073741824\ncap_lowered=0\nif [ \"${cap_lower}\" = \"1\"
+              ]; then\n  if $NATS stream edit TOPICS-JOURNAL --max-bytes=1073741824 --force
+              >/dev/null; then\n    cap_lowered=1\n    echo \"NOTE: lowered TOPICS-JOURNAL
+              max_bytes from ${cap_live} to 1073741824; it held ${cap_held} bytes, so
+              nothing was evicted.\" >&2\n  else\n    echo \"WARNING: could not lower
+              TOPICS-JOURNAL max_bytes from ${cap_live} to 1073741824; it keeps its cap.
+              The edit:\" >&2\n    echo \"    nats stream edit TOPICS-JOURNAL --max-bytes=1073741824\"
+              >&2\n  fi\nelif [ \"${cap_over}\" = \"1\" ]; then\n  echo \"NOTE: TOPICS-JOURNAL
+              keeps max_bytes=${cap_live}, above this render's 1073741824: it holds ${cap_held}
+              bytes, half the new cap or more,\" >&2\n  echo \"  and a lower that close
+              to what it holds could evict. Once it holds less than 1073741824 bytes:\"
+              >&2\n  echo \"    nats stream edit TOPICS-JOURNAL --max-bytes=1073741824\"
+              >&2\nfi\nif [ \"${cap_over}\" = \"1\" ]; then\n  report_findings=\"${report_findings}${report_findings:+,}\\\"topics_journal_max_bytes\\\":{\\\"live\\\":${cap_live},\\\"held\\\":${cap_held},\\\"want\\\":1073741824,\\\"lowered\\\":${cap_lowered}}\"\nfi\nreport=\"{${report_findings}}\"\n#
+              Written only where the kubelet has mounted the file: outside a pod there
+              is\n# nothing to write to, and a copy of a report is not a reason to fail
+              a fully\n# provisioned bus. Nor is a write that fails (a full or faulting
+              disk under\n# the kubelet's file): under set -e that would exit 1 on a bus
+              this script\n# just finished provisioning, and exit 1 matches no podFailurePolicy
+              rule, so\n# the Job would burn its backoff into BackoffLimitExceeded. A
+              pod that has no\n# file, or whose write failed, leaves no message, and the
+              reconcile logs that\n# rather than reading it as clean.\nif [ -w \"/dev/termination-log\"
+              ]; then\n  printf '%s' \"${report}\" > \"/dev/termination-log\" \\\n    ||
+              echo \"WARNING: could not write the provision report to the termination
+              log; the log above is this run's only record\" >&2\nfi\n\nrequired_consumers=110\nlive_consumers=\"$(printf
               '%s' \"${tasks_json}\" \\\n  | grep -o '\"max_consumers\":-\\{0,1\\}[0-9]\\{1,\\}'
               | head -n1 | cut -d: -f2 || true)\"\nif [ -z \"${live_consumers}\" ]; then\n
               \ echo \"could not read max_consumers off the TASKS stream; refusing to

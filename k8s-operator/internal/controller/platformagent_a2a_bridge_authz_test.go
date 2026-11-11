@@ -246,7 +246,7 @@ func a2aSeedStreamConfigs() []jetstream.StreamConfig {
 	return []jetstream.StreamConfig{
 		{Name: "TASKS", Subjects: []string{"a2a.tasks.>"},
 			Storage: jetstream.FileStorage, Retention: jetstream.LimitsPolicy, Discard: jetstream.DiscardOld,
-			MaxAge: 72 * time.Hour, MaxBytes: 21474836480, Replicas: 1,
+			MaxAge: 72 * time.Hour, MaxBytes: a2aTasksMaxBytes, Replicas: 1,
 			MaxConsumers:      a2aTasksMaxConsumers(a2aTestAgent()),
 			MaxMsgsPerSubject: a2aTasksMaxMsgsPerSubject, AllowDirect: true},
 		{Name: "DIRECTORY", Subjects: []string{"a2a.agents.>"},
@@ -257,7 +257,7 @@ func a2aSeedStreamConfigs() []jetstream.StreamConfig {
 			MaxMsgsPerSubject: 8, MaxBytes: 1073741824, Replicas: 1, MaxConsumers: 64, AllowDirect: true},
 		{Name: "TOPICS-JOURNAL", Subjects: []string{"a2a.topics.shared.annotations"},
 			Storage: jetstream.FileStorage, Retention: jetstream.LimitsPolicy, Discard: jetstream.DiscardOld,
-			MaxAge: 720 * time.Hour, MaxBytes: 5368709120, Replicas: 1, MaxConsumers: 64, AllowDirect: true},
+			MaxAge: 720 * time.Hour, MaxBytes: a2aTopicsJournalMaxBytes, Replicas: 1, MaxConsumers: 64, AllowDirect: true},
 	}
 }
 
