@@ -11,7 +11,9 @@ The files under hack/eval/ hold what the eval gate runs and what blocks (#1546, 
 - ``hack/eval/blocking-roster.txt`` -- one case id per line, the default of
   ``BOOTSTRAP_ADMITTED``;
 - ``hack/eval/certification-cases.txt`` -- what ``EVAL_TIER=certification``
-  runs on its own, in ``# part N`` sections, one periodic each.
+  runs on its own, in ``# part N`` sections, one periodic each;
+- ``hack/eval/replay-lane-cases.txt`` -- what ``EVAL_REPLAY_LANE=true`` replays
+  from the nightlies' recordings, registered cases, gating nothing.
 
 In every file ``#`` starts a comment and blank lines are skipped, which is
 exactly the ``sed | grep`` the script applies; this module is the Python copy
@@ -55,6 +57,9 @@ GHES_CASES_FILE = EVAL_DIR / "ghes-cases.txt"
 # sections the ci-kube-agents-certification periodics run one each.
 CERTIFICATION_CASES_FILE = EVAL_DIR / "certification-cases.txt"
 CERTIFICATION_SUITE = "certification"
+# The replay lane's matrix (examples/inference-replay/eval-design.md, Rollout
+# step 2): registered cases, replayed from the nightlies' recordings.
+REPLAY_LANE_CASES_FILE = EVAL_DIR / "replay-lane-cases.txt"
 # The inject lane's exclusions (#2039): case ids the script drops from TASKS
 # under AGENT_TRANSPORT=inject, each with its reason as the comment block
 # directly above it.
@@ -181,6 +186,10 @@ def certification_cases(path: pathlib.Path = CERTIFICATION_CASES_FILE) -> list[s
     return case_names(path.read_text(encoding="utf-8"))
 
 
+def replay_lane_cases(path: pathlib.Path = REPLAY_LANE_CASES_FILE) -> list[str]:
+    return case_names(path.read_text(encoding="utf-8"))
+
+
 def parse_certification_parts(text: str) -> dict[int, list[str]]:
     """Case ids of the certification file by ``# part N`` section, in file order.
 
@@ -279,8 +288,9 @@ SETTLE_RE = re.compile(r"^readonly EVAL_GITHUB_WRITE_SETTLE_SECONDS=(\d+)$", re.
 REPETITIONS_RE = re.compile(r'^EVAL_REPETITIONS="\$\{EVAL_REPETITIONS:-(\d+)\}"', re.MULTILINE)
 # The check types that request a pull request, as
 # bench/kube_agents_bench/lane.py's REQUESTING_CHECK_TYPES names them. A
-# case with such a leaf, or with an allowance in the safeguards file's
-# `requesting:` map, runs in the fan-out's serial second phase.
+# case with such a leaf, with a `requested_pull_requests:` key of its own, or
+# with an allowance in the safeguards file's `requesting:` map, runs in the
+# fan-out's serial second phase.
 # scripts/test_eval_rosters.py holds this text read to lane.py's YAML one.
 REQUESTING_CHECK_RE = re.compile(r"\btype:\s*[\"']?(pull_request_opened|pull_request_diff_contains)\b")
 # Build, deploy and lease, outside the fan-out: "~15min of build and deploy
@@ -362,6 +372,9 @@ def is_stopped_ask(case: str, tasks_dir: pathlib.Path = TASKS_DIR) -> bool:
 # unit_phase reads it through STOPPED_ASK_CASES); scripts/test_eval_rosters.py
 # holds this text read to lane.runs_alone.
 WRITES_ALONE_RE = re.compile(r"^writes_alone:\s*true\s*$")
+# The task's own total of requested pull requests (bench/kube_agents_bench/lane.py's
+# REQUESTED_KEY), for a case that opens more than its checks grade.
+REQUESTED_PULL_REQUESTS_RE = re.compile(r"^requested_pull_requests:\s*(0|[1-9][0-9]*)\s*$")
 
 
 def declares_writes_alone(case: str, tasks_dir: pathlib.Path = TASKS_DIR) -> bool:
@@ -376,10 +389,25 @@ def runs_alone(case: str, tasks_dir: pathlib.Path = TASKS_DIR) -> bool:
     return is_stopped_ask(case, tasks_dir) or declares_writes_alone(case, tasks_dir)
 
 
+def declared_pull_requests_in(text: str) -> int:
+    """The count a task file's text declares under ``requested_pull_requests``
+    on a top-level line; 0 when no such line."""
+    for line in text.splitlines():
+        m = REQUESTED_PULL_REQUESTS_RE.match(line.split("#", 1)[0].rstrip())
+        if m:
+            return int(m.group(1))
+    return 0
+
+
+def declared_pull_requests(case: str, tasks_dir: pathlib.Path = TASKS_DIR) -> int:
+    """The count the case's task.yaml declares under ``requested_pull_requests``; 0 when absent."""
+    return declared_pull_requests_in((tasks_dir / case / "task.yaml").read_text(encoding="utf-8"))
+
+
 def requests_a_pull_request(case: str, lane_requesting: dict[str, int], tasks_dir: pathlib.Path = TASKS_DIR) -> bool:
-    """Whether the case requests a pull request: its own checks, or the lane
-    file's ``requesting:`` allowance."""
-    if lane_requesting.get(case, 0) > 0:
+    """Whether the case requests a pull request: its own checks, its own
+    ``requested_pull_requests`` key, or the lane file's ``requesting:`` allowance."""
+    if lane_requesting.get(case, 0) > 0 or declared_pull_requests(case, tasks_dir) > 0:
         return True
     text = (tasks_dir / case / "task.yaml").read_text(encoding="utf-8")
     return any(REQUESTING_CHECK_RE.search(line.split("#", 1)[0]) for line in text.splitlines())
@@ -444,6 +472,7 @@ def summary(repetitions: int = 3) -> dict[str, int]:
         "presubmit units": len(presubmit) * repetitions,
         "gitlab lane cases": len(gitlab_cases()),
         "ghes lane cases": len(ghes_cases()),
+        "replay lane cases": len(replay_lane_cases()),
         "inject lane exclusions": len(inject_lane_exclusions()),
         "presubmit serial-phase cases": len(wall["requesting"]),
         "presubmit wall estimate, minutes": -(-wall["total"] // 60),

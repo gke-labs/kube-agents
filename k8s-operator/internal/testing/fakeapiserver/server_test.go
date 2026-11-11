@@ -612,7 +612,8 @@ func TestUnknownPathIs404(t *testing.T) {
 
 // A client built from Config opens a connection per request and pools none:
 // the keep-alive race Config's comment names needs a reused connection, so a
-// config that goes back to pooling fails here rather than once a day in CI.
+// config that goes back to pooling fails here rather than as a stall on a
+// Go without the fix.
 func TestConfig_OneConnectionPerRequest(t *testing.T) {
 	const requests = 3
 	s := startSmall(t, 1)

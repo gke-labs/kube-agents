@@ -78,6 +78,8 @@ class WatcherRelayOverTheSocketTest(unittest.TestCase):
         self.k8s_requests = []
         self.pod_status, self.pod_body = 200, json.dumps(POD_METADATA_UPSTREAM).encode()
         self.stream_unread = False
+        # The fake API server takes the request and closes with no status line.
+        self.close_before_status = False
 
         class Google(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
@@ -109,6 +111,9 @@ class WatcherRelayOverTheSocketTest(unittest.TestCase):
 
             def do_GET(self):  # noqa: N802
                 owner.k8s_requests.append((self.path, dict(self.headers)))
+                if owner.close_before_status:
+                    self.close_connection = True
+                    return
                 if owner.stream_unread:
                     # A stream wider than any socket buffer, for the peer
                     # that stops reading it: written until the broker
@@ -299,6 +304,30 @@ class WatcherRelayOverTheSocketTest(unittest.TestCase):
         self._request("GET", "/v1/k8s/kagents-dev/us-east4/fleet-a/api/v1/namespaces/default/configmaps/app")
         self.assertEqual(len(self.k8s_requests), 2)
         self.assertEqual(sum("/clusters/" in p for _, p, _, _ in self.google_requests), 1)
+
+    def test_an_excluded_cluster_is_refused_before_its_endpoint_or_api_is_reached(self):
+        import os
+        import tempfile
+
+        import scope_exclude
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        scope_file = os.path.join(directory.name, "scope.json")
+        with open(scope_file, "w", encoding="utf-8") as stream:
+            json.dump({"exclude": {"projects": [], "clusters": [
+                {"projectId": "kagents-dev", "location": "us-east4", "clusterName": "fleet-a"}]}}, stream)
+        original = CredentialProxyHandler.__dict__.get("exclusions")
+        self.addCleanup(setattr, CredentialProxyHandler, "exclusions", original)
+        CredentialProxyHandler.exclusions = scope_exclude.Exclusions(path=lambda: scope_file)
+        for path in ("/v1/k8s/kagents-dev/us-east4/fleet-a/api/v1/events?limit=500",
+                     "/v1/k8s/kagents-dev/us-east4/fleet-a/api/v1/events?watch=true"):
+            with self.subTest(path=path):
+                status, body = self._request("GET", path)
+                self.assertEqual(status, 403, body)
+                self.assertIn(scope_exclude.RULE_EXCLUDED_CLUSTER, json.loads(body)["message"])
+        self.assertEqual(self.k8s_requests, [])
+        self.assertEqual(sum("/clusters/" in p for _, p, _, _ in self.google_requests), 0)
 
     def test_a_watch_streams_each_event_as_it_arrives(self):
         connection = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=10)
@@ -548,6 +577,45 @@ class WatcherRelayOverTheSocketTest(unittest.TestCase):
             CredentialProxyHandler._watcher_k8s_connection = original
         self.assertEqual(status, 502)
         self.assertNotIn(("kagents-dev", "us-east4", "fleet-a"), CredentialProxyHandler.watcher_endpoints)
+
+    def test_a_read_that_fails_after_the_status_line_keeps_the_cached_address(self):
+        # The status line proves the cached host and CA reached the API
+        # server: a buffered Pod read cut mid-body is a 502, and the next
+        # request reuses the address with no new GKE describe.
+        key = ("kagents-dev", "us-east4", "fleet-a")
+        self._request("GET", "/v1/k8s/kagents-dev/us-east4/fleet-a/api/v1/events")
+        self.assertIn(key, CredentialProxyHandler.watcher_endpoints)
+        describes = sum("/clusters/" in p for _, p, _, _ in self.google_requests)
+        # The status line comes over the socket; the broker's bounded body
+        # read then resets. The test's own client reads unbounded and is
+        # left alone.
+        real_read = http.client.HTTPResponse.read
+
+        def reset_mid_body(response, amt=None):
+            if amt == credential_proxy.WATCHER_POD_METADATA_MAX_BYTES + 1:
+                raise ConnectionResetError("reset mid-body")
+            return real_read(response, amt)
+
+        with mock.patch.object(http.client.HTTPResponse, "read", reset_mid_body):
+            status, body = self._pod_metadata()
+        self.assertEqual(status, 502, body)
+        self.assertEqual(json.loads(body)["code"], "UPSTREAM_UNAVAILABLE")
+        self.assertIn(key, CredentialProxyHandler.watcher_endpoints)
+        status, _ = self._request("GET", "/v1/k8s/kagents-dev/us-east4/fleet-a/api/v1/events")
+        self.assertEqual(status, 200)
+        self.assertEqual(sum("/clusters/" in p for _, p, _, _ in self.google_requests), describes)
+
+    def test_an_api_server_that_closes_before_its_status_line_is_forgotten(self):
+        # The lower edge of the rule above: with no status line, nothing
+        # proves the cached address, so it is forgotten as on a failed connect.
+        key = ("kagents-dev", "us-east4", "fleet-a")
+        self._request("GET", "/v1/k8s/kagents-dev/us-east4/fleet-a/api/v1/events")
+        self.assertIn(key, CredentialProxyHandler.watcher_endpoints)
+        self.close_before_status = True
+        status, body = self._pod_metadata()
+        self.assertEqual(status, 502, body)
+        self.assertEqual(json.loads(body)["code"], "UPSTREAM_UNAVAILABLE")
+        self.assertNotIn(key, CredentialProxyHandler.watcher_endpoints)
 
     def test_a_cached_ca_that_will_not_load_is_answered_and_forgotten(self):
         # The real connection builder, so the TLS context is built from the

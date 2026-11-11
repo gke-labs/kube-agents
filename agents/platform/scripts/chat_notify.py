@@ -80,8 +80,9 @@ HERMES_CLI = "hermes"
 # post may or may not have landed, so a caller must not post it again.
 NOTIFY_OUTCOME_UNKNOWN = 3
 # The exit status `a2a notify` uses when the route is not there right now: no
-# gateway subscribed (a roll, or its bind retry) or the bus unreachable. Nothing
-# was posted, and waiting may help where retrying a refusal would not.
+# gateway subscribed (a roll, or its bind retry), the bus unreachable, or a
+# refusal the gateway marks retry (stopping, a record it couldn't read in time).
+# Nothing was posted, and waiting may help where retrying a refusal would not.
 NOTIFY_ROUTE_UNAVAILABLE = 4
 # `a2a notify`'s exit when the gateway refused a home post for want of a home
 # channel and kept it for the digest it posts once one is set: nothing posted

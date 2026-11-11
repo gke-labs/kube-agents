@@ -9,7 +9,7 @@ operatorRendered:
     base:
       requests:
         cpu: 1250m
-        memory: 2560Mi
+        memory: 4608Mi
         ephemeral-storage: 3Gi
       limits:
         cpu: 4500m
@@ -17,7 +17,7 @@ operatorRendered:
         ephemeral-storage: 3Gi
       cpuMillisRequest: 1250
       cpuMillisLimit: 4500
-      memoryBytesRequest: 2684354560
+      memoryBytesRequest: 4831838208
       memoryBytesLimit: 11005853696
       ephemeralStorageBytesRequest: 3221225472
       ephemeralStorageBytesLimit: 3221225472
@@ -73,16 +73,16 @@ operatorRendered:
   kubeProxy:
     requests:
       cpu: 200m
-      memory: 512Mi
+      memory: 1Gi
       ephemeral-storage: "0"
     limits:
       cpu: "2"
-      memory: 1Gi
+      memory: 2Gi
       ephemeral-storage: "0"
     cpuMillisRequest: 200
     cpuMillisLimit: 2000
-    memoryBytesRequest: 536870912
-    memoryBytesLimit: 1073741824
+    memoryBytesRequest: 1073741824
+    memoryBytesLimit: 2147483648
     ephemeralStorageBytesRequest: 0
     ephemeralStorageBytesLimit: 0
     pods: 2
@@ -93,6 +93,23 @@ operatorRendered:
     dataClaims: 2
     dataClaimRequest: 50Gi
     dataClaimBytesRequest: 53687091200
+operatorRenderedPerReplica:
+  credentialProxyExecTier:
+    requests:
+      cpu: "2"
+      memory: 2Gi
+      ephemeral-storage: 8Gi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+      ephemeral-storage: 8Gi
+    cpuMillisRequest: 2000
+    cpuMillisLimit: 2000
+    memoryBytesRequest: 2147483648
+    memoryBytesLimit: 2147483648
+    ephemeralStorageBytesRequest: 8589934592
+    ephemeralStorageBytesLimit: 8589934592
+    pods: 1
 nextMode:
   agentPod:
     hermesBridge:
@@ -114,7 +131,7 @@ nextMode:
     hermesBridgeCli:
       requests:
         cpu: "1"
-        memory: 2Gi
+        memory: 4Gi
         ephemeral-storage: "0"
       limits:
         cpu: "3"
@@ -122,26 +139,26 @@ nextMode:
         ephemeral-storage: "0"
       cpuMillisRequest: 1000
       cpuMillisLimit: 3000
-      memoryBytesRequest: 2147483648
+      memoryBytesRequest: 4294967296
       memoryBytesLimit: 8589934592
       ephemeralStorageBytesRequest: 0
       ephemeralStorageBytesLimit: 0
       pods: 0
   a2aNats:
     requests:
-      cpu: 250m
-      memory: 512Mi
-      ephemeral-storage: "0"
+      cpu: 260m
+      memory: 528Mi
+      ephemeral-storage: 64Mi
     limits:
-      cpu: "1"
-      memory: 1Gi
-      ephemeral-storage: "0"
-    cpuMillisRequest: 250
-    cpuMillisLimit: 1000
-    memoryBytesRequest: 536870912
-    memoryBytesLimit: 1073741824
-    ephemeralStorageBytesRequest: 0
-    ephemeralStorageBytesLimit: 0
+      cpu: 1050m
+      memory: 1056Mi
+      ephemeral-storage: 64Mi
+    cpuMillisRequest: 260
+    cpuMillisLimit: 1050
+    memoryBytesRequest: 553648128
+    memoryBytesLimit: 1107296256
+    ephemeralStorageBytesRequest: 67108864
+    ephemeralStorageBytesLimit: 67108864
     pods: 1
     surges: false
   a2aCallout:

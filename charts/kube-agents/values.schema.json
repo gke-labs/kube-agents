@@ -101,6 +101,15 @@
             }
           }
         },
+        "mcpServer": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          }
+        },
         "webhooks": {
           "type": "object",
           "additionalProperties": false,
@@ -203,6 +212,20 @@
             "retryAfterSeconds": {
               "type": "integer",
               "minimum": 0
+            }
+          }
+        },
+        "budget": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "usd": {
+              "type": "number",
+              "anyOf": [{ "const": 0 }, { "minimum": 0.01 }]
+            },
+            "period": {
+              "type": "string",
+              "pattern": "^([1-9][0-9]*(s|m|h|d|w|mo))?$"
             }
           }
         },
@@ -425,13 +448,33 @@
                 }
               }
             },
+            "mode": {
+              "type": "string",
+              "enum": ["shadow", "record", "replay"]
+            },
+            "cacheDir": {
+              "type": "string",
+              "pattern": "^/data/[A-Za-z0-9][A-Za-z0-9._-]*$",
+              "not": {
+                "enum": ["/data/logs", "/data/store"]
+              }
+            },
+            "allowServe": {
+              "type": "boolean"
+            },
             "job": {
               "type": "object",
               "additionalProperties": false,
               "properties": {
                 "kind": {
                   "type": "string",
-                  "enum": ["", "nightly", "presubmit"]
+                  "enum": [
+                    "",
+                    "nightly",
+                    "nightly-untrusted",
+                    "presubmit",
+                    "replay-lane"
+                  ]
                 },
                 "project": {
                   "type": "string"
@@ -474,12 +517,109 @@
                 "required": ["kind"],
                 "properties": {
                   "kind": {
-                    "enum": ["nightly", "presubmit"]
+                    "enum": [
+                      "nightly",
+                      "nightly-untrusted",
+                      "presubmit",
+                      "replay-lane"
+                    ]
                   }
                 }
               }
             }
-          }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "mode": {
+                    "const": "replay"
+                  }
+                },
+                "required": ["mode"]
+              },
+              "then": {
+                "required": ["allowServe", "job"],
+                "properties": {
+                  "allowServe": {
+                    "const": true
+                  },
+                  "job": {
+                    "required": ["kind"],
+                    "properties": {
+                      "kind": {
+                        "const": "replay-lane"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "allowServe": {
+                    "const": true
+                  }
+                },
+                "required": ["allowServe"]
+              },
+              "then": {
+                "required": ["mode"],
+                "properties": {
+                  "mode": {
+                    "const": "replay"
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "mode": {
+                    "const": "record"
+                  }
+                },
+                "required": ["mode"]
+              },
+              "then": {
+                "required": ["job"],
+                "properties": {
+                  "job": {
+                    "required": ["kind"],
+                    "properties": {
+                      "kind": {
+                        "const": "nightly"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "job": {
+                    "properties": {
+                      "kind": {
+                        "const": "replay-lane"
+                      }
+                    },
+                    "required": ["kind"]
+                  }
+                },
+                "required": ["job"]
+              },
+              "then": {
+                "required": ["mode"],
+                "properties": {
+                  "mode": {
+                    "const": "replay"
+                  }
+                }
+              }
+            }
+          ]
         }
       }
     },
@@ -1029,7 +1169,7 @@
                   "items": {
                     "type": "string",
                     "maxLength": 253,
-                    "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+                    "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*|\\*(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)+)$"
                   }
                 }
               }
@@ -1069,6 +1209,30 @@
                   "type": "integer",
                   "minimum": 1,
                   "maximum": 10000
+                },
+                "admission": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "memoryBudgetMiB": {
+                      "type": "integer",
+                      "minimum": 512,
+                      "maximum": 65536
+                    },
+                    "workerRssCapMiB": {
+                      "type": "integer",
+                      "minimum": 256,
+                      "maximum": 65536
+                    },
+                    "queueBoundSeconds": {
+                      "type": "integer",
+                      "minimum": 10,
+                      "maximum": 3600
+                    },
+                    "failClosed": {
+                      "type": "boolean"
+                    }
+                  }
                 },
                 "profiles": {
                   "type": "object",
@@ -1415,6 +1579,9 @@
                   "type": "string"
                 }
               }
+            },
+            "disallowSecretsRead": {
+              "type": ["boolean", "null"]
             }
           }
         },

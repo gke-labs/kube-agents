@@ -13,6 +13,7 @@ import io
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -23,6 +24,11 @@ import unittest.mock
 
 import yaml
 from eval_dashboard import nightly_bugs
+
+# What a public post must never carry: a pass ratio, a repetition count, a
+# percentage, a streak, a failing-check reason, or the wording the posts
+# carried before. "every repetition" in a rule's wording is not a count.
+RESULTS_RE = re.compile(r"\d+/\d+|\d+ of \d+|\d+ repetitions?|\d+ ?%|\bpassed\b|failed every|failed all|fails every|nights in a row|RESOURCE_EXHAUSTED|\b429\b")
 
 TESTDATA = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "testdata_nightly_bugs"
 JOB = "ci-kube-agents-eval-nightly"
@@ -202,16 +208,16 @@ class StreakTest(Harness):
         [issue] = self.filed(gh)
         self.assertEqual(issue["labels"], ["nightly-red", "domain:capacity", "needs-triage"])
         self.assertEqual(issue["assignees"], ["alice"])
-        self.assertIn("case-red", issue["title"])
+        self.assertEqual(issue["title"], "Nightly: case-red needs triage")
         body = issue["body"]
         self.assertIn("<!-- kube-agents-bot:nightly-red case=case-red -->", body)
         self.assertIn("@carol", body, "the domain owner is mentioned")
         self.assertIn("backup @dave", body)
         for day in (15, 16, 17):
-            self.assertIn(f"2026-10-{day}: 0/3 passed", body)
+            self.assertIn(f"- 2026-10-{day} · [run](", body)
         self.assertIn(f"/logs/{JOB}/30000000000000170001", body, "the run link")
         self.assertIn("eval_case-red_rep1.log", body, "the transcript link")
-        self.assertIn("failed: `names-the-pool: required phrases absent`", body, "the check's reason, score prefix dropped")
+        self.assertNotIn("names-the-pool", body, "the check's reason stays on the dashboard")
         self.assertIn("**Broken test:**", body)
         self.assertLess(body.index("2026-10-17"), body.index("2026-10-15"), "newest night first")
         self.assertIn("filed 1,", out)
@@ -270,7 +276,7 @@ class StreakTest(Harness):
         # say nothing: three real reds around them still file.
         gh, _, _ = self.run_once(data(night(13, [red()]), night(14, [all_infra]), night(15, [storm_graded_fail]), night(16, [red()]), night(17, [task("case-red", "fail", "infra", "fail")])))
         [issue] = self.filed(gh)
-        self.assertIn("2026-10-17: 0/2 passed, 1 infra", issue["body"])
+        self.assertIn("- 2026-10-17 · [run](", issue["body"])
         self.assertNotIn("2026-10-14", issue["body"])
         self.assertNotIn("2026-10-15", issue["body"])
         # Without the real reds, the infra nights alone file no domain bug
@@ -471,7 +477,7 @@ class DedupeTest(Harness):
         gh, _, _ = self.run_once(after, FakeGh(closed_issues=[closed]))
         [issue] = self.filed(gh)
         for day in (18, 19, 20):
-            self.assertIn(f"2026-10-{day}: 0/3 passed", issue["body"])
+            self.assertIn(f"- 2026-10-{day} · [run](", issue["body"])
         self.assertNotIn("2026-10-17", issue["body"])
 
     def test_another_cases_bot_issue_quoting_this_case_is_not_a_match(self):
@@ -935,10 +941,12 @@ class InfraCaseTest(Harness):
         self.assertIn("<!-- kube-agents-bot:nightly-infra case=case-red -->", body)
         self.assertIn("Infra backup: @iris", body)
         self.assertIn("owner @carol", body, "the domain owner is named for a hand-off")
-        self.assertIn("`3 of 3 repetitions infrastructure: agent run failed: http 429 RESOURCE_EXHAUSTED`", body)
+        self.assertIn("- 2026-10-17 · [run](", body)
+        self.assertNotIn("3 of 3", body, "the repetition count stays on the dashboard")
+        self.assertNotIn("RESOURCE_EXHAUSTED", body, "and so does the classifier's reason")
         self.assertIn("eval_case-red_rep1.log", body)
 
-    def test_a_drifted_fixture_files_no_domain_bug_and_one_infra_issue_naming_the_role(self):
+    def test_a_drifted_fixture_files_no_domain_bug_and_one_infra_issue_without_the_role(self):
         # hack/ci-eval-pr.sh recorded every repetition without running it:
         # the lease-time scan saw version-laggard drifted on each night.
         reason = (
@@ -952,8 +960,9 @@ class InfraCaseTest(Harness):
         gh, _, _ = self.run_once(data(*(night(d, [drifted()]) for d in (15, 16, 17))))
         self.assertEqual(self.filed(gh), [], "never a nightly-red bug against the case")
         [issue] = self.filed(gh, infra=True)
-        self.assertIn("3 of 3 repetitions infrastructure: ", issue["body"])
-        self.assertIn("fixture-drift:version-laggard", issue["body"])
+        self.assertEqual(issue["title"], "Nightly infra: case-red kept from running")
+        self.assertNotIn("fixture-drift", issue["body"], "the classifier's reason stays on the dashboard")
+        self.assertNotIn("3 of 3", issue["body"])
 
     def test_a_case_with_no_line_on_clean_nights_files(self):
         gh, _, _ = self.run_once(data(night(14, [green("case-red")]), *(night(d, []) for d in (15, 16, 17))))
@@ -1076,7 +1085,8 @@ class InfraCaseTest(Harness):
         doc = data(night(15, [red()]), night(16, [green("case-red")]), night(17, [infra_task("case-red")]))
         gh, _, _ = self.run_once(doc, FakeGh(open_issues=[issue]))
         [(_, comment)] = self.comments(gh)
-        self.assertIn("Again on the 2026-10-17 nightly: `3 of 3 repetitions infrastructure", comment)
+        self.assertIn("Again on the 2026-10-17 nightly: `case-red` was kept from running · [run](", comment)
+        self.assertNotIn("429", comment)
 
     def test_a_human_issue_about_the_case_neither_blocks_nor_receives_infra(self):
         human = {"number": 3950, "title": "case-red fails on main", "body": "see the nightly", "created_at": "2026-10-01T00:00:00Z"}
@@ -1196,8 +1206,7 @@ class InfraCaseTest(Harness):
         gh, _, _ = self.run_once(data(*sorted(main + main_b, key=lambda r: r["build_id"])), FakeGh(open_issues=[issue]))
         [(_, comment)] = self.comments(gh)
         self.assertIn("Again on the 2026-10-17 nightly", comment)
-        self.assertIn("the main-b part ran to its verdict", comment)
-        self.assertIn(f"/logs/{MAIN_B_JOB}/30000000000000170902)", comment)
+        self.assertIn(f"/logs/{MAIN_B_JOB}/30000000000000170902)", comment, "read on the main-b part: its run is linked")
 
     def test_a_lost_half_is_not_vouched_for_by_a_clean_sibling_job(self):
         # Two jobs of the main part each date: the first runs clean, the
@@ -1280,6 +1289,56 @@ class RunAsAScript(Harness):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("warning: gh api GET repos/gke-labs/kube-agents/issues?labels=nightly-red", proc.stderr)
         self.assertIn("nightly bugs (dry run): would file 0", proc.stdout)
+
+
+
+class PublicIssueCarriesNoCaseResultsTest(Harness):
+    """The repository is public. A nightly-red issue names the case and links
+    the run, the transcript and the nightly report; the per-night pass counts
+    and the checks' reasons stay on the dashboard behind those links."""
+
+    def test_the_issue_body_has_no_counts_and_no_reasons(self):
+        gh, _, _ = self.run_once(data(night(15, [red(), green()]), night(16, [red(), green()]), night(17, [red(), green()])))
+        [issue] = self.filed(gh)
+        body = issue["body"]
+        self.assertIn("case-red", issue["title"])
+        for day in (15, 16, 17):
+            self.assertIn(f"- 2026-10-{day} · [run](", body)
+        self.assertNotIn("passed", body.split("**Nights**")[1].split("Nightly report")[0], body)
+        self.assertNotIn("failed: ", body)
+        self.assertNotIn("names-the-pool", body, "the check's reason stays off the public issue")
+        self.assertIn(f"/logs/{JOB}/30000000000000170001", body)
+        self.assertIn("eval_case-red_rep1.log", body)
+        self.assertIn("Nightly report:", body)
+
+    def test_the_recovery_comment_has_no_counts(self):
+        issue = {"number": 3990, "title": "Nightly: case-red", "body": nightly_bugs.MARKER.format(case="case-red"), "created_at": "2026-10-16T12:00:00Z"}
+        recovered = data(night(14, [red()]), night(15, [red()]), night(16, [red()]), night(17, [green("case-red")]), night(18, [green("case-red")]))
+        gh, _, _ = self.run_once(recovered, FakeGh(open_issues=[issue]))
+        [(_, _, body)] = gh.writes()
+        self.assertIn("`case-red` is clear on the 2026-10-17 nightly: [run](", body["body"])
+        self.assertNotIn("3/3", body["body"])
+
+    def test_the_red_issue_and_its_recovery_carry_no_result(self):
+        gh, _, _ = self.run_once(data(night(15, [red(), green()]), night(16, [red(), green()]), night(17, [red(), green()])))
+        [issue] = self.filed(gh)
+        for text in (issue["title"], issue["body"]):
+            self.assertIsNone(RESULTS_RE.search(text), text)
+        issue = {"number": 3990, "title": "Nightly: case-red", "body": nightly_bugs.MARKER.format(case="case-red"), "created_at": "2026-10-16T12:00:00Z"}
+        recovered = data(night(14, [red()]), night(15, [red()]), night(16, [red()]), night(17, [green("case-red")]))
+        gh, _, _ = self.run_once(recovered, FakeGh(open_issues=[issue]))
+        [(_, _, body)] = gh.writes()
+        self.assertIsNone(RESULTS_RE.search(body["body"]), body["body"])
+
+    def test_the_infra_case_issue_and_its_night_comment_carry_no_result(self):
+        gh, _, _ = self.run_once(data(*(night(d, [infra_task("case-red")]) for d in (15, 16, 17))))
+        [issue] = self.filed(gh, infra=True)
+        for text in (issue["title"], issue["body"]):
+            self.assertIsNone(RESULTS_RE.search(text), text)
+        issue = {"number": 3971, "title": "t", "body": "<!-- kube-agents-bot:nightly-infra case=case-red -->", "created_at": "2026-10-14T12:00:00Z"}
+        gh, _, _ = self.run_once(data(night(15, [red()]), night(16, [green("case-red")]), night(17, [infra_task("case-red")])), FakeGh(open_issues=[issue]))
+        [(_, comment)] = self.comments(gh)
+        self.assertIsNone(RESULTS_RE.search(comment), comment)
 
 
 if __name__ == "__main__":

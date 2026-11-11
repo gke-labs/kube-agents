@@ -286,7 +286,7 @@ class Builder:
     def latency_block(self, fields: dict, nights: list[dict]) -> list[str]:
         """The night line and the slow cases (``nightly_latency.py``), or
         nothing when last night carried no timing. ``nights`` is
-        ``nightly.night_reports``: ``last_night``'s night is the newest of
+        ``nightly.night_dates``: ``last_night``'s night is the newest of
         them, read further back for the typicals."""
         line = nightly_latency.night_line(nights)
         if not line:
@@ -318,7 +318,7 @@ class Builder:
         """The latency block, then the reply-shape lines (``nightly_tone.py``,
         every case and the chat-and-routing cases) when last night measured
         a reply, over one build of the reports."""
-        nights = nightly.night_reports(self.data, running=nightly.running_nights(self.data, self.now))
+        nights = nightly.night_dates(self.data, running=nightly.running_nights(self.data, self.now))
         tone = [line for line in (nightly_tone.night_line(nights), nightly_tone.focus_line(nights)) if line]
         return [*self.latency_block(fields, nights), *tone]
 
@@ -388,7 +388,7 @@ class Builder:
         if ungraded:
             notes.append(NOT_GRADED_NOTE.format(count=ungraded))
         cut = [PART_CUT_NOTE.format(part=nightly.PART_WORDS.get(p.get("part"), p.get("part"))) for p in night.get("parts") or [] if p.get("truncated")]
-        # A writers part missing or still running is named too (main halves
+        # A writers part missing or still running is named too (main shards
         # held the section back above), and keeps the night from being quiet.
         cut += nightly.part_notes(night, cut=False)
         notes += cut

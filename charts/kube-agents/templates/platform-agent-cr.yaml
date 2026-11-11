@@ -16,7 +16,7 @@ metadata:
     wins because it drives the rest of the release too: litellm.networkPolicy is
     the static render gate, telemetry.collectorNamespace the static policy's
     egress namespace, litellm.openaiCompatible the static policy's rule to
-    the model server, and the chart's pods (standing plus one surge pod per surging workload) the session quota's count. A platformAgent.annotations entry that disagrees with the
+    the model server, and the chart's pods (standing plus each workload's rollout surge pods) the session quota's count. A platformAgent.annotations entry that disagrees with the
     value it duplicates fails the render rather than being overwritten in silence.
   */}}
   {{- $litellmPolicyKey := "kubeagents.x-k8s.io/enable-litellm-network-policy" }}
@@ -56,8 +56,8 @@ metadata:
   {{- end }}
   {{- end }}
   {{- /*
-    The chart's pods in this namespace, with a surge pod for each that rolls
-    with one (kube-agents.chartQuotaPods), which share the next-mode
+    The chart's pods in this namespace, with the surge pods each one's
+    rollout can add (kube-agents.chartQuotaPods), which share the next-mode
     namespace pod quota with the session pods; the operator sizes that quota's
     headroom from it (#3848). Stamped on the CR rather than the operator, because
     the CR is in the namespace those pods run in and the chart renders it even
@@ -74,7 +74,7 @@ metadata:
          the values, and the operator's A2AQuotaChartPodsDiscarded Warning
          covers a mode set on the PlatformAgent by hand. */}}
   {{- if and (eq (toString .Values.platformAgent.mode) "next") (gt (int $chartPods) 64) }}
-  {{- fail (printf "the chart would run %s pods at once in this namespace, counting a surge pod for each workload that rolls with one, past the operator's cap of 64 for the session quota's chart count (a2aMaxChartPods); the quota would fall back to the default of 5 and refuse pods the release needs. Lower the replica counts, or run some of these components in another namespace." $chartPods) }}
+  {{- fail (printf "the chart would run %s pods at once in this namespace, counting each workload's rollout surge pods, past the operator's cap of 64 for the session quota's chart count (a2aMaxChartPods); the quota would fall back to the default of 5 and refuse pods the release needs. Lower the replica counts or a workload's rollingUpdate.maxSurge, or run some of these components in another namespace." $chartPods) }}
   {{- end }}
   {{- with get $annotations $chartPodsKey }}
   {{- if ne (toString . | trim) $chartPods }}
@@ -216,9 +216,9 @@ spec:
     {{- end }}
     {{- $alertExcludeValues := .Values.platformAgent.harness.eventWatcher | default dict }}
     {{- /*
-      Rendered only when an install sets a rule: with none the operator writes
-      no WATCHER_ALERT_EXCLUDE, so an absent block and an empty list are the
-      same. The same CRD guard as stallWatch's above, one level down:
+      Rendered only when an install sets a rule: with none the operator
+      renders an empty rules file, so an absent block and an empty list are
+      the same. The same CRD guard as stallWatch's above, one level down:
       spec.harness.eventWatcher is older than its alertExclude field.
     */}}
     {{- if $alertExcludeValues.alertExclude }}
@@ -266,7 +266,7 @@ spec:
     {{- $defaultStockoutTuning := dict "maxInProgress" 3 "platform" (dict "apiMaxRetries" 8 "maxTurns" 200) "cluster" (dict "apiMaxRetries" 8 "maxTurns" 150) }}
     {{- $tuning = merge $tuning $defaultStockoutTuning }}
     {{- end }}
-    {{- if or (hasKey $tuning "maxInProgress") (hasKey $tuning "maxSessions") $tuning.platform $tuning.cluster $tuning.default $tuning.profiles }}
+    {{- if or (hasKey $tuning "maxInProgress") (hasKey $tuning "maxSessions") $tuning.platform $tuning.cluster $tuning.default $tuning.profiles $tuning.admission }}
     tuning:
       {{- if hasKey $tuning "maxInProgress" }}
       maxInProgress: {{ $tuning.maxInProgress }}
@@ -288,6 +288,28 @@ spec:
       {{- end }}
       {{- with $tuning.profiles }}
       profiles:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $tuning.admission }}
+      {{- /*
+        The same CRD guard as retention's above, one level down: an installed CRD
+        that predates spec.harness.tuning.admission prunes the block silently while
+        the release record keeps it, and the dispatcher runs on the operator's
+        defaults as if nothing had been set.
+      */}}
+      {{- $crd := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "platformagents.kubeagents.x-k8s.io" }}
+      {{- if $crd }}
+      {{- $tuningProps := dict }}
+      {{- range $crd.spec.versions }}
+      {{- if .storage }}
+      {{- $tuningProps = dig "schema" "openAPIV3Schema" "properties" "spec" "properties" "harness" "properties" "tuning" "properties" (dict) . }}
+      {{- end }}
+      {{- end }}
+      {{- if not (hasKey $tuningProps "admission") }}
+      {{- fail "platformAgent.harness.tuning.admission is set, but the installed PlatformAgent CRD predates spec.harness.tuning.admission and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/, or run upgrade.sh, which does). Otherwise the API server prunes the value silently while the release record keeps it" }}
+      {{- end }}
+      {{- end }}
+      admission:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     {{- end }}
@@ -647,7 +669,7 @@ spec:
       then, for the reason the resources block is: 0 is the operator's default,
       and an empty block on every CR is noise a reader takes for a setting.
     */}}
-    {{- $execReplicas := dig "exec" "replicas" 0 (.Values.platformAgent.deployment.credentialProxy | default dict) | int }}
+    {{- $execReplicas := include "kube-agents.credentialProxyExecReplicas" . | int }}
     {{- if $proxyQuantities }}
     {{- include "kube-agents.crdFieldGuard" (dict "value" "platformAgent.deployment.credentialProxy.resources" "path" (list "deployment" "credentialProxy") "field" "resources") }}
     {{- end }}
@@ -753,6 +775,10 @@ spec:
     workloadIdentityFederation:
       audience: {{ $wif.audience | quote }}
       serviceAccountEmail: {{ $wif.serviceAccountEmail | quote }}
+    {{- end }}
+    {{- if kindIs "bool" .Values.platformAgent.security.disallowSecretsRead }}
+    {{- include "kube-agents.crdFieldGuard" (dict "value" "platformAgent.security.disallowSecretsRead" "path" (list "security") "field" "disallowSecretsRead") }}
+    disallowSecretsRead: {{ .Values.platformAgent.security.disallowSecretsRead }}
     {{- end }}
   {{- /*
     Rendered whenever the install carries the value, empty lists included, and never

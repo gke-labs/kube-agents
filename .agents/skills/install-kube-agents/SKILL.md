@@ -408,10 +408,14 @@ kubectl exec -it deployment/platform-agent-gateway -n kubeagents-system -c platf
   command the installer prints.)
 - Say what the operator does not get until they enable a platform: scheduled reports and
   alert-driven triage reach chat only; meanwhile the audit reports stay in the report store on the
-  data volume and the triage runs on the board (the `NoChatPlatform` condition says so), and the first-run inventory report waits on a
-  human connecting over chat — read it with
+  data volume and the triage runs on the board (the `NoChatPlatform` condition says so), and the first-run inventory report waits a
+  day for a human connecting over chat — read it meanwhile with
   `kubectl exec platform-agent-shell-0 -n kubeagents-system -c shell -- cat /opt/data/INVENTORY.md`
-  (the report is on the shell sandbox pod, not the agent pod).
+  (the report is on the shell sandbox pod, not the agent pod); a day after the sweep it is filed as
+  an issue labelled `agent:onboarding` in the GitOps repository when that is on GitHub (else in the
+  install's one managed GitHub repository), and a report
+  that could not be filed is retired a week after the sweep (INSTALL.md, "What to Expect After
+  Installation").
 
 ## GitOps Repository & GitHub Token Minter Configuration
 
@@ -455,8 +459,12 @@ For CI/CD pipelines and anywhere runners must not handle raw private keys, the k
   --model-provider="gemini" \
   --gitops-org="YOUR_GITHUB_ORG" \
   --gitops-repo="YOUR_GITOPS_REPO" \
-  --github-app-id="YOUR_GITHUB_APP_ID"
+  --github-app-id="YOUR_GITHUB_APP_ID" \
+  --kms-keyring="YOUR_KEY_RING" \
+  --kms-key="YOUR_KEY"
 ```
+
+Pass both KMS flags with the names the operator pre-provisioned. A pre-provisioned key carries no owner labels, and the installer adopts one only when both names are given explicitly.
 
 ### GitHub Enterprise Server
 
@@ -607,8 +615,8 @@ Defaults marked "`installer_common.sh`" reach the installer through
 | `--gitops-ca-file=PATH`                   | Regular PEM file with the CA certificates of a self-managed GitLab or a GitHub Enterprise Server behind a private CA. Stored in Secret `gitlab-forge-ca` or `github-forge-ca`, and trusted by the credential broker for that host only. Needs a self-managed `--gitops-host`. On a GitHub Enterprise Server the token minter trusts it too, and the installer restarts the minter | _unset_                                                                                                                                            |
 | `--github-app-id=ID`                      | Numeric GitHub App ID for the token minter                                                                                                                                                                                                                                                                                                                                        | _unset_                                                                                                                                            |
 | `--github-pem-path=PATH`                  | Path to downloaded GitHub App private key (`.pem`) for initial Cloud KMS import                                                                                                                                                                                                                                                                                                   | _unset_                                                                                                                                            |
-| `--kms-keyring=NAME`                      | Cloud KMS Key Ring name for the token minter key                                                                                                                                                                                                                                                                                                                                  | `installer_common.sh` `DEFAULT_KMS_KEYRING`                                                                                                        |
-| `--kms-key=NAME`                          | Cloud KMS CryptoKey name for the token minter signing key                                                                                                                                                                                                                                                                                                                         | `installer_common.sh` `DEFAULT_KMS_KEY`                                                                                                            |
+| `--kms-keyring=NAME`                      | Cloud KMS Key Ring name for the token minter key                                                                                                                                                                                                                                                                                                                                  | `<cluster>-minter-keyring` (new install)                                                                                                           |
+| `--kms-key=NAME`                          | Cloud KMS CryptoKey name for the token minter signing key                                                                                                                                                                                                                                                                                                                         | `<cluster>-minter-key` (new install)                                                                                                               |
 | `--enable-google-chat`                    | Enable the Google Chat integration                                                                                                                                                                                                                                                                                                                                                | `false`                                                                                                                                            |
 | `--google-chat-allowed-users=EMAILS`      | Comma-separated chat users allowed to reach the agent; empty allows everyone                                                                                                                                                                                                                                                                                                      | _unset_                                                                                                                                            |
 | `--enable-slack[=true\|false]`            | Enable the Slack socket-mode relay (non-interactive runs require `--slack-bot-token` and `--slack-app-token`)                                                                                                                                                                                                                                                                     | `false`                                                                                                                                            |

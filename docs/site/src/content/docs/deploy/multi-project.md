@@ -95,7 +95,8 @@ them before they followed the scope, and on an installer-made install, which
 always carries a `spec.scope` block, it no longer does. `SCOPE_EXCLUDE_PROJECTS` and
 `SCOPE_EXCLUDE_CLUSTERS` (`project/location/cluster`) declare exclusions the
 same way, and an excluded cluster is left out of fleet answers and the per-cluster audits as well as getting no
-Cluster Agent; a project a `SCOPE_EXCLUDE_PROJECTS` entry names, or a glob there
+Cluster Agent (the credential broker and `kube-proxy` refuse every route to its Kubernetes API;
+see [`spec.scope`](/kube-agents/operator/platformagent-crd/#specscope)); a project a `SCOPE_EXCLUDE_PROJECTS` entry names, or a glob there
 matches, gets no drift sink. To keep a project in the scope and out of the
 export, add
 `TF_VAR_drift_pubsub_source_exclude_projects=<project id>` to `install.env`: the
@@ -222,6 +223,9 @@ on the project's clusters are not reported.
 
 You can also exclude specific project globs or individual clusters under
 `spec.scope.exclude`; see [`spec.scope` in the `PlatformAgent` CRD reference](/kube-agents/operator/platformagent-crd/#specscope).
+An install that declares no project, folder or selector still adopts every cluster in its
+own project; the `PlatformAgent`'s `ScopeUndeclared` condition names the ones beyond the
+host cluster, and clears once you name the project in `spec.scope.projects` or exclude them.
 
 #### Option B: Onboard individual clusters on demand in chat
 
@@ -303,7 +307,7 @@ On an install you manage with Helm or `kubectl` directly:
    (`projectId`, `location`, `clusterName`). A profile the scope never
    produced is kept (listed under `unmanaged` in `fleet_scope.json`), so
    dropping the project alone leaves it in place; an excluded cluster loses its
-   profile on the next run.
+   profile on the next run. From then on the credential broker and `kube-proxy` refuse the agents its Kubernetes API.
 3. Revoke the IAM bindings on the target project so the Platform Agent stops
    querying it. The scheduled audits stopped when the project left `spec.scope`;
    on a `PlatformAgent` with no `scope` block they stop here. A folder-level

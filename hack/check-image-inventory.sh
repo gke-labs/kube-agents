@@ -224,7 +224,7 @@ check_literal_from() {
   got="$(normalise "$ref")"
   if [ "$(printf '%s\n' "$body" | wc -l | tr -d ' ')" != 2 ] || [ "$ref" = "$first" ] || [ -z "$got" ] ||
     [ "$ref" != "${ref%% *}" ] || [ "$second" != "COPY $src $dest" ] ||
-    printf '%s\n' "$body" | LC_ALL=C grep -q '[^[:print:]]'; then
+    LC_ALL=C grep -q '[^[:print:]]' <<<"$body"; then
     fail "$dockerfile: after comment and blank lines, a plugin or persona Dockerfile must be exactly two lines, 'FROM <ref>' (one space, nothing after the reference) and 'COPY $src $dest', the shape docker build and the crane reader in agentplugins/lib/plugin_image.sh read alike; found: $(printf '%s\n' "$body" | LC_ALL=C cat -vet | tr '\n' ' ')"
     return
   fi
@@ -278,8 +278,7 @@ check_plugin_dockerfiles_are_fenced
 check_go_directive() {
   local dockerfile=$1 version_arg=$2 go_mod=${3:-$GO_MOD}
   local builder_tag directive builder_ver builder_mm directive_mm
-  awk -v img="\${$GOLANG_IMAGE_ARG}" '/^FROM / { in_stage = index($0, img) > 0; next } /^RUN / { in_stage = 0 } in_stage' "$dockerfile" |
-    grep -qx "$GOTOOLCHAIN_PIN" ||
+  grep -qx "$GOTOOLCHAIN_PIN" <<<"$(awk -v img="\${$GOLANG_IMAGE_ARG}" '/^FROM / { in_stage = index($0, img) > 0; next } /^RUN / { in_stage = 0 } in_stage' "$dockerfile")" ||
     fail "$dockerfile: no line exactly '$GOTOOLCHAIN_PIN' between the FROM \${$GOLANG_IMAGE_ARG} line and that stage's first RUN, so a substituted $GOLANG_IMAGE_ARG without that default downloads a toolchain the pin does not name instead of failing."
   builder_tag="$(arg_default "$dockerfile" "$version_arg")"
   directive="$(sed -n 's/^go[[:space:]][[:space:]]*\([0-9][0-9A-Za-z.]*\).*$/\1/p' "$go_mod" | head -n1)"
@@ -339,7 +338,7 @@ jq -r '.images[] | select(.tagFrom) | "\(.name)\t\(.tagFrom.file)\t\(.tagFrom.ke
 # 2. The pins compiled into the operator. Each is an image the operator falls
 #    back to when its env var is unset, so a drift here mirrors the wrong tag
 #    with nothing to catch it at render time. fluent-bit reaches every agent
-#    pod. nats and nats-box reach only a `spec.mode: next` install, which no
+#    pod. nats, nats-box and the config reloader reach only a `spec.mode: next` install, which no
 #    chart render in check 3 turns on, so this is the only check that sees
 #    them (#1557). The constants keep Docker Hub's short spelling because that
 #    is the string the operator renders into the pod template; the comparison
@@ -364,6 +363,7 @@ check_operator_pin() {
 check_operator_pin fluent-bit k8s-operator/internal/controller/manifest_helpers.go fallbackFluentBitImage
 check_operator_pin nats k8s-operator/internal/controller/platformagent_a2a_manifests.go defaultA2ANATSImage
 check_operator_pin nats-box k8s-operator/internal/controller/platformagent_a2a_manifests.go defaultA2AProvisionImage
+check_operator_pin nats-server-config-reloader k8s-operator/internal/controller/platformagent_a2a_nats_reload.go defaultA2ANATSReloaderImage
 
 # A compiled image name for a release image the operator renders: the
 # constant must be the inventory entry's name, and the entry's repository

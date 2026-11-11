@@ -38,8 +38,10 @@ Two things a copy does that a plain append would not. An entry whose name a
 case already declares would be refused by devops-bench as a duplicate -- a
 parse error that reds every repetition of that case at rung 2, after the
 cluster lease -- so the collision is refused here, before it. And a case that requests a pull
-request (a leaf of a type in :data:`REQUESTING_CHECK_TYPES` in its own spec)
-has that many requested writes: every ``github_writes`` leaf appended to it
+request (a leaf of a type in :data:`REQUESTING_CHECK_TYPES` in its own spec,
+a total it declares under :data:`REQUESTED_KEY`, or a ``requesting:`` entry
+in the lane file) has that many requested writes, the largest of the three:
+every ``github_writes`` leaf appended to it
 gets ``requested_pull_requests`` set to that count, so the lane's safeguard
 leaves the case's own pull request out and fails the repetition on anything
 beyond it, and ``exclusive_window``, since such a case runs alone and a
@@ -75,6 +77,7 @@ __all__ = [
     "append_lane_safeguards",
     "check_repository",
     "copy_task",
+    "declared_pull_requests",
     "load_lane_requesting",
     "load_lane_safeguards",
     "main",
@@ -95,6 +98,13 @@ CHECK_CHILD_KEYS = ("checks", "check")
 REQUESTING_CHECK_TYPES = frozenset({"pull_request_opened", "pull_request_diff_contains"})
 WRITES_CHECK_TYPE = "github_writes"
 REQUESTED_FIELD = "requested_pull_requests"
+#: The same name at the top of a task.yaml is the case's own declaration of
+#: how many pull requests it opens by design -- a case that opens more than
+#: its checks grade -- so the count lives in the one file both the lane and
+#: the pinned grader read (``cases.load_case`` reads it too). The larger of
+#: this, the case's requesting leaves and the lane file's ``requesting:``
+#: entry is the allowance.
+REQUESTED_KEY = REQUESTED_FIELD
 EXCLUSIVE_WINDOW_FIELD = "exclusive_window"
 #: A case's own declaration that it runs alone in the lane's second phase
 #: (`writes_alone: true` at the top of its task.yaml): a case that requests
@@ -263,9 +273,26 @@ def runs_alone(doc: dict[str, Any]) -> bool:
     return stop_hook.is_stopped_ask(str(doc.get("prompt") or "")) or declares_writes_alone(doc)
 
 
+def declared_pull_requests(doc: dict[str, Any], *, where: str = TASK_FILE) -> int:
+    """The count a task declares at its top level under ``REQUESTED_KEY``; 0
+    when absent. A bool, a string or a negative number is refused: PyYAML
+    reads an unquoted number as int, so anything else was typed wrong, and a
+    permissive read would hand the case an allowance it did not ask for."""
+    value = doc.get(REQUESTED_KEY)
+    if value is None:
+        return 0
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise LaneSafeguardsError(
+            f"{where}: `{REQUESTED_KEY}:` must be a non-negative integer, got {value!r}"
+        )
+    return value
+
+
 def requested_for(spec: Any, listed_allowance: int = 0) -> int:
     """How many pull requests a case requests: the larger of what its own
-    checks say and the count the lane file's ``requesting:`` gives it."""
+    checks say and ``listed_allowance`` -- the count the task declares under
+    ``REQUESTED_KEY``, the lane file's ``requesting:`` entry, or the larger of
+    the two when the caller passes that."""
     return max(requested_pull_requests(spec), listed_allowance)
 
 
@@ -297,8 +324,9 @@ def copy_task(
 ) -> tuple[Path, int]:
     """Write ``<out_dir>/<case>/task.yaml``: the task with the lane's entries
     appended. Returns the copy's path and how many pull requests the case
-    requests: the larger of what its own checks say and ``listed_allowance``,
-    the count the lane file's ``requesting:`` gives it.
+    requests: the largest of what its own checks say, the count the task
+    declares under ``REQUESTED_KEY``, and ``listed_allowance``, the count the
+    lane file's ``requesting:`` gives it.
 
     The case is the task file's directory name, which is what devops-bench
     records as ``folder`` and the scorer joins on, so the copy keeps it.
@@ -310,7 +338,7 @@ def copy_task(
     spec = doc.get(SPEC_KEY)
     existing = list(spec) if isinstance(spec, list) else []
     taken = {str(e.get("name")) for e in existing if isinstance(e, dict) and e.get("name")}
-    requested = requested_for(existing, listed_allowance)
+    requested = requested_for(existing, max(listed_allowance, declared_pull_requests(doc, where=str(source))))
     # A stopped ask, or a case that declares `writes_alone`, runs alone in the
     # second phase as well (hack/ci-eval-pr.sh reads both through
     # kube_agents_bench.stop_hook), so its window is exclusive with no allowance.
@@ -347,7 +375,8 @@ def main(argv: list[str] | None = None) -> int:
     """Materialise every task given with the lane's safeguards appended.
 
     Prints ``<requested> <case> <path>`` per task -- how many pull requests
-    the case's own checks request, which the script uses to run those cases
+    the case requests (the largest of its own checks, its ``requested_pull_requests``
+    key and the lane file's ``requesting:`` entry), which the script uses to run those cases
     in the fan-out's second phase, then the copy's path, last because it may
     hold spaces; exits
     non-zero, naming the file and the fault, when the lane file or a task

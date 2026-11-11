@@ -136,8 +136,8 @@
 # Isolation class: namespace-scoped. Eligible tier: nightly.
 #
 # REGISTERED in hack/eval/nightly-cases.txt on 2026-10-20, at the 900s drift
-# band, and listed in hack/eval/nightly-main-b.txt so the two halves' chains
-# stay balanced. It holds lock-infra for its whole run, as every case with a
+# band, and listed in hack/eval/nightly-main-c.txt so the main shards' stack
+# chains stay balanced. It holds lock-infra for its whole run, as every case with a
 # `stack:` does.
 #
 # What it waited for was room on that chain, and what provided it was the
@@ -386,7 +386,7 @@ verification_spec:
         - "eval-operator@example.com"
         # The recorder nightly plants under this identity, so the audit log names it.
         - "eval-baseline-recorder@kube-agents-prow.iam.gserviceaccount.com"
-        # The Claude nightly twins plant under this identity.
+        # The next-mode nightly twins plant under this identity.
         - "prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com"
 
   - name: triage-names-the-loosened-setting

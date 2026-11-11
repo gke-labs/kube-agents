@@ -174,6 +174,44 @@ true
 {{- end }}
 
 {{/*
+Whether the chart renders the A2A dispatcher's Job admission policy
+(templates/a2a-dispatcher-job-admission-policy.yaml): the same condition, and
+on an upgrade, its param kind's CRD (DispatchJobTemplate) already installed.
+`helm upgrade` never applies crds/, and a policy naming a kind the API server
+doesn't serve refuses every Job in the profile namespace; left out, the
+operator's A2A_DISPATCHER_JOB_POLICY (set from this helper) is too, and
+unattended tasks have no worker (they are refused no-worker) until crds/ is applied (upgrade.sh does) and
+the release upgraded again. `lookup` is empty under `helm template`, which is
+no upgrade, so the template renders there as on a fresh install.
+*/}}
+{{- define "kube-agents.a2aDispatcherJobPolicyEnabled" -}}
+{{- if and .Values.admissionPolicy.enabled (semverCompare ">=1.30.0-0" .Capabilities.KubeVersion.Version) -}}
+{{- if or (not .Release.IsUpgrade) (lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "dispatchjobtemplates.kubeagents.x-k8s.io") -}}
+true
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+The operator flags the chart sets from first-class values, as a YAML env list (empty when
+none is on). operator-deployment.yaml renders it ahead of operator.extraEnv, and the quota
+preflight reads it ahead of extraEnv, so the two agree on which flagged pods run. A flag
+operator.extraEnv already names is left out: extraEnv wins either way, and leaving it out
+keeps the container's env free of a duplicate name. `| default dict` because
+`helm upgrade --reuse-values` renders against a release that predates operator.mcpServer.
+*/}}
+{{- define "kube-agents.operatorFlagEnv" -}}
+{{- $named := dict -}}
+{{- range $e := (.Values.operator.extraEnv | default list) -}}
+{{- $_ := set $named (toString (index ($e | default dict) "name")) true -}}
+{{- end -}}
+{{- if and (.Values.operator.mcpServer | default dict).enabled (not (hasKey $named "A2A_MCP_DOOR")) -}}
+- name: A2A_MCP_DOOR
+  value: "true"
+{{- end -}}
+{{- end }}
+
+{{/*
 Whether the web console's PlatformAgent policy renders: the admissionPolicy values
 gate, on Kubernetes >= 1.30, where the console's ServiceAccount and its Role on the
 CR render (webConsole.enabled and webConsole.environment.enabled).
@@ -919,6 +957,49 @@ callbacks is the formatted list of LiteLLM callbacks, built by the caller.
 {{- if and (gt $retryAfter 0) (gt (add $gatewayHoldSeconds $firstChunkAllowanceSeconds) $workerStaleSeconds) -}}
 {{- fail (printf "litellm.fallback.numRetries %d with retryAfterSeconds %d holds a rate-limited call %ds at the gateway; with %ds for the model's first chunk that crosses the agents' %ds stale-stream bound (stale_timeout_seconds), and the agent would drop the stream before it sees the 429" $numRetries $retryAfter $gatewayHoldSeconds $firstChunkAllowanceSeconds $workerStaleSeconds) -}}
 {{- end -}}
+{{- /*
+  The spend ceiling, as router_settings.provider_budget_config for the one
+  provider every alias routes to. LiteLLM's router budget limiter
+  (litellm/router_strategy/budget_limiter.py, v1.106.0) adds each response's
+  cost to a per-provider counter in the router's cache, filters the provider's
+  deployments out once the counter reaches budget_limit, and lets the counter
+  expire time_period after the window opened (at router start for the first
+  window, at the first spend after expiry for the next); its spend comes from
+  the standard logging payload, so streamed calls count, and lands when a call
+  completes, so the calls in flight when the share is crossed are charged past
+  it. Chosen over
+  litellm_settings.max_budget, which without a database counts only
+  non-streamed calls, from the completion text alone, and exports nothing.
+  The cache is in-process (the chart runs no Redis), so the ceiling is split
+  evenly across the gateway's replicas: each replica refuses on its share, so
+  the install's spend per window is bounded by .budget.usd plus the in-flight
+  calls above, and a restarted pod starts its count over. The share is
+  rendered with four decimals, always with a
+  dot, so PyYAML reads a float; a share that rounds to 0 is refused, because
+  LiteLLM treats a budget_limit of 0 as no limit. The schema's floor of 0.01
+  (shared by the installer and the Terraform example, which refuse less before
+  any apply) keeps that out of reach up to 100 replicas; this is the backstop.
+*/}}
+{{- $budget := .budget | default dict -}}
+{{- $budgetUSD := float64 ($budget.usd | default 0) -}}
+{{- $budgetPeriod := $budget.period | default "" -}}
+{{- $budgetReplicas := max (int (.replicas | default 1)) 1 -}}
+{{- $budgetPeriodPattern := `^[1-9][0-9]*(s|m|h|d|w|mo)$` -}}
+{{- $budgetShareFormat := "%.4f" -}}
+{{- $budgetShareZero := "0.0000" -}}
+{{- $budgetShare := "" -}}
+{{- if lt $budgetUSD 0.0 -}}
+{{- fail (printf "litellm.budget.usd %v is negative; 0 turns the ceiling off" $budget.usd) -}}
+{{- end -}}
+{{- if gt $budgetUSD 0.0 -}}
+{{- if not (regexMatch $budgetPeriodPattern $budgetPeriod) -}}
+{{- fail (printf "litellm.budget.period %q is not a LiteLLM duration (a whole number and s, m, h, d, w or mo, such as 1d); litellm.budget.usd %v needs one" $budgetPeriod $budget.usd) -}}
+{{- end -}}
+{{- $budgetShare = printf $budgetShareFormat (divf $budgetUSD (float64 $budgetReplicas)) -}}
+{{- if eq $budgetShare $budgetShareZero -}}
+{{- fail (printf "litellm.budget.usd %v split across %d gateway replicas is under 0.0001 USD per replica, which LiteLLM reads as no ceiling; raise the budget or lower litellm.replicaCount" $budget.usd $budgetReplicas) -}}
+{{- end -}}
+{{- end -}}
 {{- $primaries := list "model-default" "hermes-agent" .model -}}
 {{- if and $fallbackName (has $fallbackName $primaries) -}}
 {{- fail (printf "litellm.fallback.modelName %q is already a primary alias (%s); a model cannot fall back to itself" $fallbackName (join ", " $primaries)) -}}
@@ -986,7 +1067,7 @@ litellm_settings:
   only in its anthropic overlay; see that file for why the breakpoints live
   here rather than in the agent's own config.
 */}}
-{{- if or $claude $fallbackName (gt $timeout 0) (gt $numRetries 0) (gt $retryAfter 0) }}
+{{- if or $claude $fallbackName (gt $timeout 0) (gt $numRetries 0) (gt $retryAfter 0) $budgetShare }}
 router_settings:
   {{- if $fallbackName }}
   fallbacks:
@@ -1010,6 +1091,17 @@ router_settings:
   {{- if gt $retryAfter 0 }}
   retry_after: {{ $retryAfter }}
   {{- end }}
+  {{- /*
+    The spend ceiling's share for this replica; see the budget block above.
+    Keyed on the provider prefix every alias carries, which is what LiteLLM
+    resolves for the deployment and records on the logging payload.
+  */}}
+  {{- if $budgetShare }}
+  provider_budget_config:
+    {{ $litellmProvider }}:
+      budget_limit: {{ $budgetShare }}
+      time_period: {{ $budgetPeriod | quote }}
+  {{- end }}
   {{- if $claude }}
   default_litellm_params:
     cache_control_injection_points:
@@ -1024,102 +1116,6 @@ router_settings:
         index: -1
   {{- end }}
 {{- end }}
-{{- end }}
-
-{{/*
-Every LiteLLM callback entry the chart can register, named once and sorted by
-whether the shadow replay proxy's key covers it
-(kube-agents.replayModelBehaviourChecksum). replayKeyed: the hooks that change
-what the model is sent or what comes back (thinking replay, cache-marker strip,
-redaction). replayUnkeyed: telemetry (otel, prometheus, the trace logger), the
-OAuth2 credential hook, and session affinity, which only picks a Vertex
-serving replica. templates/litellm.yaml registers callbacks only through these
-names, and tests/test_chart_replay_shadow.py fails on a rendered entry that is
-in neither set, so a new hook has to be put in one.
-
-Takes the root context; returns JSON.
-*/}}
-{{- define "kube-agents.litellmCallbacks" -}}
-{{- toJson (dict
-  "replayKeyed" (dict
-    "thinkingReplay" "litellm_thinking_replay_callback.proxy_handler_instance"
-    "cacheControlStrip" "litellm_cache_control_strip_callback.proxy_handler_instance"
-    "redaction" "litellm_redaction_callback.proxy_handler_instance")
-  "replayUnkeyed" (dict
-    "otel" "otel"
-    "prometheus" "prometheus"
-    "oauth2" "litellm_oauth2_callback.proxy_handler_instance"
-    "sessionAffinity" "litellm_session_affinity_callback.proxy_handler_instance"
-    "traceLog" "llm_trace_logger.proxy_handler_instance")) -}}
-{{- end }}
-
-{{/*
-The shadow replay proxy's checksum of what decides the model's answer
-(REPLAY_MODEL_BEHAVIOUR_CHECKSUM in litellm.yaml). The pods' checksum/config
-covers the whole config; this one treats the two LiteLLM routes to Google's
-Gemini models, gemini/ (the Gemini Developer API) and vertex_ai/ (Vertex AI),
-as one, so a nightly and a presubmit serving the same model with the same
-settings get the same replay key. Without that, the eval nightlies (Gemini
-Developer API) record answers no presubmit (Vertex AI) can ever look up.
-
-TODO(#4988): temporary. Once the nightlies and presubmits call the model
-through one API, key replay on the full checksum/config again and delete this.
-
-From the parsed rendered config it changes, and keeps everything else:
-  - a model's gemini/ or vertex_ai/ prefix becomes one shared token
-    ($sharedGoogleRoute); every other provider prefix stays as rendered, so
-    openai_compatible against gemini, or two servers behind two api_base
-    values, keep apart (the chart renders api_base for openai_compatible
-    only, so it stays in);
-  - the Vertex route keys ($vertexRouteParams) are dropped defensively: the
-    chart renders none of them into the config today (the project and
-    location reach the pod as env vars);
-  - the router's timeout and retry settings, which decide when a call is
-    retried, not what the answer says ($deliverySettings), are dropped;
-  - callbacks become .callbacks, the replayKeyed entries of
-    kube-agents.litellmCallbacks in registration order.
-Each keyed hook's source, and the redaction rule file when redaction is on,
-arrive in .sources and are hashed with the config, so an edit to one changes
-the key the way it rolls the pods.
-
-Takes a dict of config (the rendered gateway config), callbacks (the kept
-callback entries, in order) and sources (a list of strings).
-*/}}
-{{- define "kube-agents.replayModelBehaviourChecksum" -}}
-{{- $vertexRouteParams := list "vertex_project" "vertex_location" "vertex_credentials" -}}
-{{- $deliverySettings := list "timeout" "num_retries" "retry_after" -}}
-{{- $googleRoutePattern := "^(gemini|vertex_ai)/" -}}
-{{- $sharedGoogleRoute := "gemini-or-vertex_ai/" -}}
-{{- $parsed := .config | fromYaml -}}
-{{- if hasKey $parsed "Error" -}}
-{{- fail (printf "the rendered LiteLLM config does not parse as YAML, so the replay checksum cannot be computed: %s" (get $parsed "Error")) -}}
-{{- end -}}
-{{- $behaviour := deepCopy $parsed -}}
-{{- $models := list -}}
-{{- range $parsed.model_list -}}
-{{- $params := deepCopy .litellm_params -}}
-{{- range $vertexRouteParams -}}
-{{- $_ := unset $params . -}}
-{{- end -}}
-{{- $_ := set $params "model" (regexReplaceAll $googleRoutePattern $params.model $sharedGoogleRoute) -}}
-{{- $models = append $models (set (deepCopy .) "litellm_params" $params) -}}
-{{- end -}}
-{{- $_ := set $behaviour "model_list" $models -}}
-{{- $settings := deepCopy ($parsed.litellm_settings | default dict) -}}
-{{- $_ := set $settings "callbacks" .callbacks -}}
-{{- $_ := set $behaviour "litellm_settings" $settings -}}
-{{- if $parsed.router_settings -}}
-{{- $router := deepCopy $parsed.router_settings -}}
-{{- range $deliverySettings -}}
-{{- $_ := unset $router . -}}
-{{- end -}}
-{{- if $router -}}
-{{- $_ := set $behaviour "router_settings" $router -}}
-{{- else -}}
-{{- $_ := unset $behaviour "router_settings" -}}
-{{- end -}}
-{{- end -}}
-{{- printf "%s%s" (toJson $behaviour) (join "" .sources) | sha256sum -}}
 {{- end }}
 
 {{/*
@@ -2056,7 +2052,7 @@ and the chart's own replicaCount keys take one too. Only an absent value default
 
 {{/*
 The chart's own workloads in the release namespace, as a JSON list of (name, resources
-subtree, pod count, rolls-with-a-surge-pod, standing). Two readers, so a workload is added
+subtree, pod count, rolls-with-a-surge-pod, standing, maxSurge as its template renders it). Two readers, so a workload is added
 once (#4893): kube-agents.quotaRequirements sums them for the quota preflight, and
 kube-agents.chartQuotaPods counts the standing ones and their surge pods for the operator's
 session quota. One list rather than a block per workload: the blocks it replaced were
@@ -2066,36 +2062,78 @@ wrong key and how the replay proxy came to be left out of the operator's count.
 cleanup hook is a Job that runs at uninstall while the release still stands: the preflight
 needs headroom for it, but it is not standing, so the session quota leaves it out.
 */}}
+{{/*
+The surge pods a rollout of one workload can add, from its maxSurge and its replicas
+(#4876): an integer as written, or a percentage of the replicas rounded up, as the
+Deployment controller rounds it, and never more than the replicas, since the controller
+never scales the new ReplicaSet past the desired count. None for a workload scaled to zero.
+A maxSurge that is neither a whole number nor a whole percentage counts as the replicas, the
+most a rollout can add: the schema admits it, and validate.yml requires such a value to
+render rather than be refused, so the count bounds it from above. Takes a dict with
+"maxSurge" and "replicas".
+*/}}
+{{- define "kube-agents.surgePods" -}}
+{{- $replicas := .replicas | int64 -}}
+{{- $v := .maxSurge -}}
+{{- $raw := "" -}}
+{{- /* A Deployment's replicas are an int32, so a maxSurge of 11 or more digits, or a
+       percentage of 1000% or more, already reaches past any replica count: it counts as the
+       replicas outright, with no conversion that could overflow. Only smaller values are
+       converted, which keeps every number well inside int64 and float64 (#4876's review:
+       a 20-digit value wrapped through int64, and a 309-digit one read 0 through float64). */ -}}
+{{- if or (kindIs "float64" $v) (kindIs "int64" $v) (kindIs "int" $v) -}}
+  {{- /* A number past int64 doesn't survive the round trip, so it keeps its float spelling
+         ("1e+20"), which isn't digits and counts as the replicas below. */ -}}
+  {{- $raw = toString ($v | int64) -}}
+  {{- if ne (float64 ($v | int64)) (float64 $v) -}}{{- $raw = toString $v -}}{{- end -}}
+{{- else -}}
+  {{- $raw = trim (toString $v) -}}
+{{- end -}}
+{{- $n := $replicas -}}
+{{- if regexMatch "^[0-9]+%?$" $raw -}}
+  {{- $digits := regexReplaceAll "^0+([0-9])" (trimSuffix "%" $raw) "${1}" -}}
+  {{- if hasSuffix "%" $raw -}}
+    {{- if lt (len $digits) 4 -}}
+      {{- $n = include "kube-agents.clampInt64" (ceil (divf (mulf ($digits | float64) (float64 $replicas)) 100.0)) | int64 -}}
+    {{- end -}}
+  {{- else if lt (len $digits) 11 -}}
+    {{- $n = $digits | int64 -}}
+  {{- end -}}
+{{- end -}}
+{{- if le $replicas (int64 0) -}}0{{- else -}}{{- min $n $replicas -}}{{- end -}}
+{{- end }}
+
 {{- define "kube-agents.chartWorkloads" -}}
 {{- $w := list -}}
 {{- if .Values.operator.enabled -}}
-  {{- $w = append $w (dict "name" "operator" "standing" true "values" .Values.operator "pods" (include "kube-agents.replicaCount" .Values.operator.replicaCount | int64) "surges" true) -}}
+  {{- $w = append $w (dict "name" "operator" "standing" true "values" .Values.operator "pods" (include "kube-agents.replicaCount" .Values.operator.replicaCount | int64) "surges" true "maxSurge" (include "kube-agents.rollingUpdateFenceposts" (dict "rollingUpdate" .Values.operator.rollingUpdate "defaultSurge" 1 "defaultUnavailable" 0 "scope" "operator.rollingUpdate") | fromYaml).maxSurge) -}}
 {{- end -}}
 {{- if .Values.litellm.enabled -}}
-  {{- $w = append $w (dict "name" "litellm" "standing" true "values" .Values.litellm "pods" (include "kube-agents.replicaCount" .Values.litellm.replicaCount | int64) "surges" true) -}}
+  {{- $w = append $w (dict "name" "litellm" "standing" true "values" .Values.litellm "pods" (include "kube-agents.replicaCount" .Values.litellm.replicaCount | int64) "surges" true "maxSurge" (include "kube-agents.rollingUpdateFenceposts" (dict "rollingUpdate" .Values.litellm.rollingUpdate "defaultSurge" 1 "defaultUnavailable" 1 "scope" "litellm.rollingUpdate") | fromYaml).maxSurge) -}}
 {{- end -}}
 {{- /* The shadow-mode replay proxy (litellm.replayShadow), rendered in templates/litellm.yaml
        beside LiteLLM and only with it. */ -}}
 {{- $replayShadow := .Values.litellm.replayShadow | default dict -}}
 {{- if and .Values.litellm.enabled $replayShadow.enabled -}}
-  {{- $w = append $w (dict "name" "litellm-replay-shadow" "standing" true "values" $replayShadow "pods" (include "kube-agents.replicaCount" $replayShadow.replicaCount | int64) "surges" true) -}}
+  {{- $w = append $w (dict "name" "litellm-replay-shadow" "standing" true "values" $replayShadow "pods" (include "kube-agents.replicaCount" $replayShadow.replicaCount | int64) "surges" true "maxSurge" (include "kube-agents.rollingUpdateFenceposts" (dict "rollingUpdate" $replayShadow.rollingUpdate "defaultSurge" 1 "defaultUnavailable" 0 "scope" "litellm.replayShadow.rollingUpdate") | fromYaml).maxSurge) -}}
 {{- end -}}
 {{- if include "kube-agents.hindsightEnabled" . -}}
-  {{- $w = append $w (dict "name" "hindsight-api" "standing" true "values" .Values.hindsight.api "pods" 1 "surges" true) -}}
-  {{- $w = append $w (dict "name" "hindsight-postgresql" "standing" true "values" .Values.hindsight.postgresql "pods" 1 "surges" false) -}}
+  {{- $w = append $w (dict "name" "hindsight-api" "standing" true "values" .Values.hindsight.api "pods" 1 "surges" true "maxSurge" (include "kube-agents.rollingUpdateFenceposts" (dict "rollingUpdate" .Values.hindsight.api.rollingUpdate "defaultSurge" 1 "defaultUnavailable" 0 "scope" "hindsight.api.rollingUpdate") | fromYaml).maxSurge) -}}
+  {{- $w = append $w (dict "name" "hindsight-postgresql" "standing" true "values" .Values.hindsight.postgresql "pods" 1 "surges" false "maxSurge" 0) -}}
 {{- end -}}
 {{- if .Values.githubMinter.enabled -}}
-  {{- $w = append $w (dict "name" "github-minter" "standing" true "values" .Values.githubMinter "pods" (include "kube-agents.replicaCount" .Values.githubMinter.replicaCount | int64) "surges" true) -}}
+  {{- $w = append $w (dict "name" "github-minter" "standing" true "values" .Values.githubMinter "pods" (include "kube-agents.replicaCount" .Values.githubMinter.replicaCount | int64) "surges" true "maxSurge" 1) -}}
 {{- end -}}
 {{- if .Values.webConsole.enabled -}}
-  {{- /* templates/web-console.yaml renders exactly one replica; see the note there. */ -}}
-  {{- $w = append $w (dict "name" "web-console" "standing" true "values" .Values.webConsole "pods" 1 "surges" true) -}}
+  {{- /* templates/web-console.yaml renders exactly one replica; see the note there. It sets no
+         strategy, so it rolls with Kubernetes' default maxSurge of 25%. */ -}}
+  {{- $w = append $w (dict "name" "web-console" "standing" true "values" .Values.webConsole "pods" 1 "surges" true "maxSurge" "25%") -}}
 {{- end -}}
 {{- if and .Values.platformAgent.enabled .Values.platformAgent.cleanupHook.enabled -}}
   {{- /* Pre-delete hook Job in templates/platform-agent-cr-cleanup.yaml: runs at helm uninstall
          while every release pod still exists, so quota admission needs headroom for it. */ -}}
   {{- $cleanupRes := dict "resources" (dict "requests" (dict "cpu" "50m" "memory" "64Mi" "ephemeral-storage" "1088Mi") "limits" (dict "cpu" "200m" "memory" "128Mi" "ephemeral-storage" "1088Mi")) -}}
-  {{- $w = append $w (dict "name" "cleanup-hook" "standing" false "values" $cleanupRes "pods" 1 "surges" false) -}}
+  {{- $w = append $w (dict "name" "cleanup-hook" "standing" false "values" $cleanupRes "pods" 1 "surges" false "maxSurge" 0) -}}
 {{- end -}}
 {{- toJson $w -}}
 {{- end }}
@@ -2103,12 +2141,13 @@ needs headroom for it, but it is not standing, so the session quota leaves it ou
 {{/*
 The pods the chart may run at once in the release namespace, for the next-mode session quota:
 the standing workloads in kube-agents.chartWorkloads at their replica counts (every one but
-the pre-delete cleanup hook, which runs only at uninstall), plus one surge pod for each that
-rolls surge-first and runs at least one replica (every one but Hindsight's PostgreSQL
-StatefulSet). quotaRequirements reads the same list, so a workload added there is counted
+the pre-delete cleanup hook, which runs only at uninstall), plus the surge pods each one's
+rollout can add: its maxSurge, a percentage rounded up against its replicas, none at zero
+replicas, and none for Hindsight's PostgreSQL StatefulSet (#4876). quotaRequirements reads the same list, so a workload added there is counted
 here too. A chart bump rolls several of them in one upgrade, since the chart's version label
 is in their pod templates, and each surge pod counts against the quota while it starts.
-platform-agent-cr.yaml stamps it on the PlatformAgent as kubeagents.x-k8s.io/a2a-quota-chart-pods,
+platform-agent-cr.yaml stamps it on the PlatformAgent as kubeagents.x-k8s.io/a2a-quota-chart-pods
+(and a2a-quota-chart-pods.yaml renders it in a ConfigMap when the chart renders no PlatformAgent),
 and the operator sizes the quota above the session cap from it (#3848): those pods share the
 quota, and only the chart knows which of them it renders. tests/test_quota_preflight.py ties
 it to the Deployments and StatefulSets a render actually puts in the release namespace.
@@ -2119,12 +2158,14 @@ it to the Deployments and StatefulSets a render actually puts in the release nam
 {{- range $w := include "kube-agents.chartWorkloads" . | fromJsonArray -}}
   {{- if $w.standing -}}
     {{- $n := $w.pods | int64 -}}
-    {{- $pods = add $pods $n -}}
-    {{- /* A workload scaled to zero has no pod to surge from. */ -}}
-    {{- if and $w.surges (gt $n (int64 0)) -}}{{- $surges = add $surges 1 -}}{{- end -}}
+    {{- $pods = include "kube-agents.satAdd" (dict "a" $pods "b" $n) | int64 -}}
+    {{- /* As many surge pods as its maxSurge allows; none at zero replicas. */ -}}
+    {{- if $w.surges -}}
+      {{- $surges = include "kube-agents.satAdd" (dict "a" $surges "b" (include "kube-agents.surgePods" (dict "maxSurge" $w.maxSurge "replicas" $n) | int64)) | int64 -}}
+    {{- end -}}
   {{- end -}}
 {{- end -}}
-{{- add $pods $surges -}}
+{{- include "kube-agents.satAdd" (dict "a" $pods "b" $surges) -}}
 {{- end }}
 
 {{/*
@@ -2495,7 +2536,7 @@ platformAgent.deployment.credentialProxy.resources. Copies of the operator's:
 credentialProxyCPURequest, credentialProxyMemoryRequest, credentialProxyCPULimit,
 credentialProxyMemoryLimit and credentialProxyEphemeralStorageLimit, and
 credentialProxyMemoryFloorBytesAtDefaultCap, credentialProxyMinimumMemoryLimitBytes at the
-default output cap, 672Mi (k8s-operator/internal/controller/credential_proxy_manifests.go).
+default output cap, 544Mi (k8s-operator/internal/controller/credential_proxy_manifests.go).
 tests/test_credential_proxy_sizing_parity.py holds them equal, the floor to the operator's and
 the broker's declared copies; each side's own test holds its copy to its formula. Change all
 sides together.
@@ -2504,6 +2545,15 @@ autopilotRequests are the requests on GKE Autopilot (credentialProxyAutopilotCPU
 credentialProxyAutopilotMemoryRequest), where the limits are clamped to the requests and only
 the request buys CPU; the quota preflight counts them where kube-agents.gkeAutopilot holds.
 */}}
+{{- /*
+kube-agents.credentialProxyExecReplicas is
+platformAgent.deployment.credentialProxy.exec.replicas, 0 when unset: the exec
+tier's replica count, which gates the tier's scrape objects and its quota term.
+*/}}
+{{- define "kube-agents.credentialProxyExecReplicas" -}}
+{{- dig "exec" "replicas" 0 (.Values.platformAgent.deployment.credentialProxy | default dict) | int -}}
+{{- end -}}
+
 {{- define "kube-agents.credentialProxyDefaults" -}}
 {{- dict
       "requests" (dict "cpu" "500m" "memory" "1Gi")
@@ -2735,7 +2785,7 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
 {{- end }}
 
 {{- define "kube-agents.credentialProxyMemoryFloorBytes" -}}
-704643072
+570425344
 {{- end }}
 
 {{- define "kube-agents.quotaRequirements" -}}
@@ -2775,7 +2825,8 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
        used+required fits the release at rest and then stalls its first rollout, which is the
        failure values.yaml warns about under hindsight.api.rollingUpdate. Rollouts are
        per-workload, so room for one surge Pod at a time is enough. */ -}}
-{{- /* How many chart workloads roll with a surge pod: kube-agents.chartQuotaPods counts one each. */ -}}
+{{- /* The surge pods every chart workload's rollout can add (kube-agents.surgePods), the figure
+       kube-agents.chartQuotaPods stamps. */ -}}
 {{- $chartSurgePods := 0 -}}
 {{- $surgeCpuReq := 0 -}}
 {{- $surgeCpuLim := 0 -}}
@@ -2798,8 +2849,16 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
   {{- $reqEph = add $reqEph (mul $res.ephemeralRequest $replicas) -}}
   {{- $limEph = add $limEph (mul $res.ephemeralLimit $replicas) -}}
   {{- /* A workload scaled to zero has no pod to surge from, so it sizes no patch. */ -}}
-  {{- if and $workload.surges (gt $replicas (int64 0)) -}}
-    {{- $chartSurgePods = add $chartSurgePods 1 -}}
+  {{- $surgePods := 0 -}}
+  {{- if $workload.surges -}}
+    {{- $surgePods = include "kube-agents.surgePods" (dict "maxSurge" $workload.maxSurge "replicas" $replicas) | int64 -}}
+  {{- end -}}
+  {{- if gt $surgePods (int64 0) -}}
+    {{- /* chartSurgePods totals every rollout's surge pods, the figure chartQuotaPods stamps
+           for the operator's session quota. The patch's surge room stays one pod of the
+           largest surging workload: enough for a rollout to make progress, since the
+           ReplicaSet controller creates the next surge pod as quota frees up. */ -}}
+    {{- $chartSurgePods = include "kube-agents.satAdd" (dict "a" $chartSurgePods "b" $surgePods) | int64 -}}
     {{- $surgeCpuReq = max $surgeCpuReq $res.cpuRequest -}}
     {{- $surgeCpuLim = max $surgeCpuLim $res.cpuLimit -}}
     {{- $surgeMemReq = max $surgeMemReq $res.memoryRequest -}}
@@ -3135,6 +3194,44 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
     {{- end -}}
   {{- end -}}
 
+  {{- /* The credential broker's exec tier: one replica's worth from the footprint
+         (operatorRenderedPerReplica, read from the operator's one-replica golden),
+         times platformAgent.deployment.credentialProxy.exec.replicas. Outside the loop
+         above, which sums each operatorRendered entry once. A positive count with no
+         entry fails rather than counting the tier as zero. Its cpu and memory are
+         fixed, but the operator gives the tier the broker's other resource keys, so
+         an ephemeral-storage override on the broker moves each replica too: merged
+         as kube-agents.credentialProxyFootprint does, keeping the entry's cpu and
+         memory. No surge term: the tier rolls with maxSurge 0 and maxUnavailable 1, so
+         a rollout replaces a pod in place and adds none. This
+         counts the quota only; whether the nodes have room for a 2 CPU pod is the
+         scheduler's, which this cannot see. */ -}}
+  {{- $execReplicas := include "kube-agents.credentialProxyExecReplicas" . | int64 -}}
+  {{- if gt $execReplicas 0 -}}
+    {{- $exec := index ((index $footprint "operatorRenderedPerReplica") | default dict) "credentialProxyExecTier" | default dict -}}
+    {{- if not $exec -}}
+      {{- fail "quota preflight: platformAgent.deployment.credentialProxy.exec.replicas is set, but footprint.yaml has no operatorRenderedPerReplica.credentialProxyExecTier entry to size it. Reinstall from an intact chart, or set quotaPreflight.enabled=false to skip the check." -}}
+    {{- end -}}
+    {{- if $proxyOverride -}}
+      {{- /* Refused or merged against the sizing tier's row, as the broker's check is above;
+             only the ephemeral-storage figures are taken from it. */ -}}
+      {{- $execSized := include "kube-agents.sizingTierFootprintEntry" (dict "workload" $exec "tier" $sizingTier "container" "credentialProxy") | fromJson -}}
+      {{- $merged := include "kube-agents.credentialProxyFootprint" (dict "workload" $execSized "override" $proxyOverride "tier" $sizingTier) | fromJson -}}
+      {{- $exec = dict
+            "cpuMillisRequest" $exec.cpuMillisRequest "cpuMillisLimit" $exec.cpuMillisLimit
+            "memoryBytesRequest" $exec.memoryBytesRequest "memoryBytesLimit" $exec.memoryBytesLimit
+            "ephemeralStorageBytesRequest" $merged.ephemeralStorageBytesRequest
+            "ephemeralStorageBytesLimit" $merged.ephemeralStorageBytesLimit
+            "pods" $exec.pods -}}
+    {{- end -}}
+    {{- $reqPods = include "kube-agents.satAdd" (dict "a" $reqPods "b" (include "kube-agents.satMul" (dict "a" ($exec.pods | default 1 | int64) "b" $execReplicas))) | int64 -}}
+    {{- $reqCpu = include "kube-agents.satAdd" (dict "a" $reqCpu "b" (include "kube-agents.satMul" (dict "a" ($exec.cpuMillisRequest | default 0 | int64) "b" $execReplicas))) | int64 -}}
+    {{- $limCpu = include "kube-agents.satAdd" (dict "a" $limCpu "b" (include "kube-agents.satMul" (dict "a" ($exec.cpuMillisLimit | default 0 | int64) "b" $execReplicas))) | int64 -}}
+    {{- $reqMem = include "kube-agents.satAdd" (dict "a" $reqMem "b" (include "kube-agents.satMul" (dict "a" ($exec.memoryBytesRequest | default 0 | int64) "b" $execReplicas))) | int64 -}}
+    {{- $limMem = include "kube-agents.satAdd" (dict "a" $limMem "b" (include "kube-agents.satMul" (dict "a" ($exec.memoryBytesLimit | default 0 | int64) "b" $execReplicas))) | int64 -}}
+    {{- $reqEph = include "kube-agents.satAdd" (dict "a" $reqEph "b" (include "kube-agents.satMul" (dict "a" ($exec.ephemeralStorageBytesRequest | default 0 | int64) "b" $execReplicas))) | int64 -}}
+    {{- $limEph = include "kube-agents.satAdd" (dict "a" $limEph "b" (include "kube-agents.satMul" (dict "a" ($exec.ephemeralStorageBytesLimit | default 0 | int64) "b" $execReplicas))) | int64 -}}
+  {{- end -}}
   {{- /* Next mode's own workloads: NATS, the auth callouts, the verifiers, the console,
          the A2A gateway and the provisioning Job, each a total over its replicas, plus the
          JetStream claim. None has a sizing override in the chart. An entry marked `surges`
@@ -3163,8 +3260,8 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
   {{- end -}}
   {{- /* Standing pods behind an operator flag (files/flagged-pods.yaml: the MCP server,
          #3869; the profile dispatcher, #4808). The operator renders each only while
-         operator.extraEnv sets its flag, so no golden renders it and footprint.yaml has no
-         entry for it. An entry's flag is read as the operator reads it, the last setting
+         its flag is set (operator.mcpServer.enabled or operator.extraEnv), so no golden
+         renders it and footprint.yaml has no entry for it. An entry's flag is read as the operator reads it, the last setting
          winning: enabledWhen "true" takes only that value, nonBlank any value that isn't blank.
          A setting the chart cannot read -- a valueFrom, a non-string value, a string holding
          a $(VAR) reference the kubelet expands -- counts as on; none, null or another literal
@@ -3183,9 +3280,16 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
       {{- fail "quota preflight: flagged-pods.yaml is missing or unreadable in the chart, so the pods the operator renders behind a flag cannot be sized. Reinstall from an intact chart, or set quotaPreflight.enabled=false to skip the check." -}}
     {{- end -}}
     {{- $flagged := index $flaggedFile "pods" -}}
+    {{- /* The flags first-class values set (operator.mcpServer.enabled), then extraEnv: the
+           order operator-deployment.yaml renders them in, so the last setting wins here too. */ -}}
+    {{- $flagEnv := list -}}
+    {{- with (include "kube-agents.operatorFlagEnv" .) -}}
+      {{- $flagEnv = fromYamlArray . -}}
+    {{- end -}}
+    {{- $operatorEnv := concat $flagEnv (.Values.operator.extraEnv | default list) -}}
     {{- range $w := $flagged -}}
       {{- $on := false -}}
-      {{- range $e := ($.Values.operator.extraEnv | default list) -}}
+      {{- range $e := $operatorEnv -}}
         {{- if eq (toString (index ($e | default dict) "name")) $w.env -}}
           {{- $v := index $e "value" -}}
           {{- $literal := ternary (eq (toString $v) "true") (ne (trim (toString $v)) "") (eq (toString $w.enabledWhen) "true") -}}
@@ -3202,6 +3306,86 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
         {{- $reqEph = include "kube-agents.satAdd" (dict "a" $reqEph "b" (mul $n ($w.ephemeralStorageBytesRequest | default 0 | int64))) | int64 -}}
         {{- $limEph = include "kube-agents.satAdd" (dict "a" $limEph "b" (mul $n ($w.ephemeralStorageBytesLimit | default 0 | int64))) | int64 -}}
       {{- end -}}
+    {{- end -}}
+  {{- end -}}
+  {{- /* The scope publisher's Job pod (files/transient-pods.yaml, #4816): the operator
+         starts one every 15 minutes, never two at once, where the gateway pod policy is on
+         and the scope names something to resolve. No golden declares such a scope, so
+         footprint.yaml has no entry for it. The policy is on where the chart renders it, or
+         where operator.extraEnv sets A2A_GATEWAY_POD_POLICY to "true" or in a form the chart
+         cannot read. extraEnv overrides the chart's entry, so one setting it off would turn the
+         publisher off; this counts the pod anyway, an over-count by design. A list declared on
+         the PlatformAgent by hand, outside platformAgent.scope, is not seen here. */ -}}
+  {{- if $next -}}
+    {{- $transientFile := .Files.Get "files/transient-pods.yaml" | fromYaml -}}
+    {{- $sp := index $transientFile "scopePublisher" -}}
+    {{- $spOK := and (kindIs "map" $sp) (kindIs "slice" (index $sp "scopeMembers")) -}}
+    {{- range $field := (ternary (index ($sp | default dict) "scopeMembers") list $spOK) -}}
+      {{- $spOK = and $spOK (kindIs "string" $field) -}}
+    {{- end -}}
+    {{- range $key := list "pods" "cpuMillisRequest" "cpuMillisLimit" "memoryBytesRequest" "memoryBytesLimit" "ephemeralStorageBytesRequest" "ephemeralStorageBytesLimit" -}}
+      {{- $spOK = and $spOK (or (kindIs "float64" (index ($sp | default dict) $key)) (kindIs "int64" (index ($sp | default dict) $key)) (kindIs "int" (index ($sp | default dict) $key))) -}}
+    {{- end -}}
+    {{- if not $spOK -}}
+      {{- fail "quota preflight: transient-pods.yaml is missing or unreadable in the chart, so the scope publisher's Job pod cannot be sized. Reinstall from an intact chart, or set quotaPreflight.enabled=false to skip the check." -}}
+    {{- end -}}
+    {{- $policy := not (empty (include "kube-agents.a2aGatewayPodPolicyEnabled" .)) -}}
+    {{- range $e := (.Values.operator.extraEnv | default list) -}}
+      {{- if eq (toString (index ($e | default dict) "name")) "A2A_GATEWAY_POD_POLICY" -}}
+        {{- $v := index $e "value" -}}
+        {{- $policy = or $policy (hasKey $e "valueFrom") (and (hasKey $e "value") (not (kindIs "string" $v)) (not (kindIs "invalid" $v))) (and (kindIs "string" $v) (or (eq $v "true") (contains "$(" $v))) -}}
+      {{- end -}}
+    {{- end -}}
+    {{- $scope := .Values.platformAgent.scope -}}
+    {{- $members := false -}}
+    {{- if kindIs "map" $scope -}}
+      {{- range $field := $sp.scopeMembers -}}
+        {{- if gt (len (index $scope $field | default list)) 0 -}}
+          {{- $members = true -}}
+        {{- end -}}
+      {{- end -}}
+    {{- end -}}
+    {{- if and $policy $members -}}
+      {{- $n := $sp.pods | default 1 | int64 -}}
+      {{- $reqPods = include "kube-agents.satAdd" (dict "a" $reqPods "b" $n) | int64 -}}
+      {{- $reqCpu = include "kube-agents.satAdd" (dict "a" $reqCpu "b" (mul $n ($sp.cpuMillisRequest | default 0 | int64))) | int64 -}}
+      {{- $limCpu = include "kube-agents.satAdd" (dict "a" $limCpu "b" (mul $n ($sp.cpuMillisLimit | default 0 | int64))) | int64 -}}
+      {{- $reqMem = include "kube-agents.satAdd" (dict "a" $reqMem "b" (mul $n ($sp.memoryBytesRequest | default 0 | int64))) | int64 -}}
+      {{- $limMem = include "kube-agents.satAdd" (dict "a" $limMem "b" (mul $n ($sp.memoryBytesLimit | default 0 | int64))) | int64 -}}
+      {{- $reqEph = include "kube-agents.satAdd" (dict "a" $reqEph "b" (mul $n ($sp.ephemeralStorageBytesRequest | default 0 | int64))) | int64 -}}
+      {{- $limEph = include "kube-agents.satAdd" (dict "a" $limEph "b" (mul $n ($sp.ephemeralStorageBytesLimit | default 0 | int64))) | int64 -}}
+    {{- end -}}
+  {{- end -}}
+  {{- /* The A2A gateway's standby: the operator runs it at two replicas under the
+         election (on unless operator.extraEnv sets A2A_GATEWAY_ELECTION to "false"),
+         rolling with a surge pod, once a gateway on its image holds the Lease. No golden
+         renders that (no pod holds the Lease there), so footprint.yaml counts one gateway
+         pod and no surge, and the second pod and the surge room are added here. The chart
+         sets no availability.a2aGateway.replicas, so this counts the default of two. */ -}}
+  {{- if $next -}}
+    {{- $election := true -}}
+    {{- range $e := (.Values.operator.extraEnv | default list) -}}
+      {{- if eq (toString (index ($e | default dict) "name")) "A2A_GATEWAY_ELECTION" -}}
+        {{- $v := index $e "value" -}}
+        {{- $election = not (and (hasKey $e "value") (kindIs "string" $v) (eq $v "false")) -}}
+      {{- end -}}
+    {{- end -}}
+    {{- $gw := $next.a2aGateway | default dict -}}
+    {{- $gwPods := $gw.pods | default 0 | int64 -}}
+    {{- if and $election (gt $gwPods (int64 0)) -}}
+      {{- $reqPods = include "kube-agents.satAdd" (dict "a" $reqPods "b" (int64 1)) | int64 -}}
+      {{- $reqCpu = include "kube-agents.satAdd" (dict "a" $reqCpu "b" (div ($gw.cpuMillisRequest | default 0 | int64) $gwPods)) | int64 -}}
+      {{- $limCpu = include "kube-agents.satAdd" (dict "a" $limCpu "b" (div ($gw.cpuMillisLimit | default 0 | int64) $gwPods)) | int64 -}}
+      {{- $reqMem = include "kube-agents.satAdd" (dict "a" $reqMem "b" (div ($gw.memoryBytesRequest | default 0 | int64) $gwPods)) | int64 -}}
+      {{- $limMem = include "kube-agents.satAdd" (dict "a" $limMem "b" (div ($gw.memoryBytesLimit | default 0 | int64) $gwPods)) | int64 -}}
+      {{- $reqEph = include "kube-agents.satAdd" (dict "a" $reqEph "b" (div ($gw.ephemeralStorageBytesRequest | default 0 | int64) $gwPods)) | int64 -}}
+      {{- $limEph = include "kube-agents.satAdd" (dict "a" $limEph "b" (div ($gw.ephemeralStorageBytesLimit | default 0 | int64) $gwPods)) | int64 -}}
+      {{- $surgeCpuReq = max $surgeCpuReq (div ($gw.cpuMillisRequest | default 0 | int64) $gwPods) -}}
+      {{- $surgeCpuLim = max $surgeCpuLim (div ($gw.cpuMillisLimit | default 0 | int64) $gwPods) -}}
+      {{- $surgeMemReq = max $surgeMemReq (div ($gw.memoryBytesRequest | default 0 | int64) $gwPods) -}}
+      {{- $surgeMemLim = max $surgeMemLim (div ($gw.memoryBytesLimit | default 0 | int64) $gwPods) -}}
+      {{- $surgeEphReq = max $surgeEphReq (div ($gw.ephemeralStorageBytesRequest | default 0 | int64) $gwPods) -}}
+      {{- $surgeEphLim = max $surgeEphLim (div ($gw.ephemeralStorageBytesLimit | default 0 | int64) $gwPods) -}}
     {{- end -}}
   {{- end -}}
   {{- with $next.storage -}}

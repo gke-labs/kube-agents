@@ -95,7 +95,8 @@ const (
 	remoteMCPPath               = "/mcp"
 	remoteMCPSwarmPath          = "/mcp/swarm"
 	remoteMCPHealthPath         = "/healthz"
-	StreamingStepContinuePrefix = "⏳ **[STREAMING_STEP_CONTINUE]**"
+	// StreamingStepContinuePrefix marks a tool response whose remote A2A task is still streaming.
+	StreamingStepContinuePrefix = "STREAMING_STEP_CONTINUE: "
 	// staleStreamingTaskAge is how long a tracked task no call has touched is kept.
 	staleStreamingTaskAge = 10 * time.Minute
 )
@@ -373,7 +374,7 @@ func (g *gatewayBridgeSession) callRemoteTool(
 		_ = json.Unmarshal(rawArgs, &argsAny)
 	}
 	// Only the called conversation's entry goes upstream, never the rest of the local table
-	// (the in-cluster server reads nothing from _meta today).
+	// (the in-cluster server reads _meta.conversation_id to auto-enable step streaming).
 	metaMap := map[string]any{}
 	if alias := calledConversation(argsAny); alias != "" {
 		if entry, ok := snap.Conversations[alias]; ok {
@@ -393,8 +394,15 @@ func (g *gatewayBridgeSession) callRemoteTool(
 	}
 	if meta.ProgressToken != nil {
 		metaMap["progressToken"] = meta.ProgressToken
-	} else {
+	} else if onProgress != nil {
 		metaMap["progressToken"] = "bridge-progress"
+	}
+	if meta.ConversationID != "" && (toolName == ToolSendMessage || toolName == ToolTaskControl) {
+		if m, ok := argsAny.(map[string]any); ok {
+			if _, has := m["stream_steps"]; !has {
+				m["stream_steps"] = true
+			}
+		}
 	}
 
 	rpcPayload, err := json.Marshal(map[string]any{
@@ -1138,6 +1146,8 @@ func (s *Server) CallTool(ctx context.Context, name string, rawArgs json.RawMess
 		}
 	}
 
+	// Only the server's own prefix counts: the text goes on to the agent's answer, which may
+	// mention the marker.
 	isStreamingStep := strings.HasPrefix(text, StreamingStepContinuePrefix)
 	if s.host != nil {
 		text, customMarkdown = s.host.OnAfterToolCall(ctx, s, name, isStreamingStep, text, customMarkdown)
@@ -1695,7 +1705,7 @@ func (s *Server) finishStreamingCall(key, convAlias, hostConvID, artifactsDir, r
 		return
 	}
 	extractedTaskID := extractStreamingTaskID(responseText)
-	isContinue := strings.HasPrefix(responseText, StreamingStepContinuePrefix) || strings.Contains(responseText, "STREAMING_STEP_CONTINUE")
+	isContinue := strings.HasPrefix(responseText, StreamingStepContinuePrefix)
 	// The in-cluster server reports a turn still running as its task line (a2a/mcp writeTask).
 	if ref := runningTaskRef(responseText); ref != "" {
 		extractedTaskID, isContinue = ref, true
@@ -1760,6 +1770,12 @@ func (s *Server) finishStreamingCall(key, convAlias, hostConvID, artifactsDir, r
 		}
 	}
 	s.mu.Unlock()
+	if callErr == nil && convAlias != "" && s.store != nil {
+		// A get names the task it read: a worker on another task's line is not this one's.
+		if wid, ref := extractTaskSessionWorkerID(responseText); wid != "" && (entry == nil || entry.TaskID == "" || sameTaskRef(ref, entry.TaskID)) {
+			s.store.SetConversationSessionWorkerID(convAlias, wid)
+		}
+	}
 }
 
 // taskOwnerConversation is the conversation alias a tracked streaming task was started on (a
@@ -1798,14 +1814,53 @@ func (s *Server) taskOwnerConversation(taskID string) string {
 }
 
 // runningTaskRefRegex matches the in-cluster server's line for a task still running
-// (a2a/mcp writeTask): "Task `<addressee>/<id>`: **<state>** (still running; ...".
-var runningTaskRefRegex = regexp.MustCompile("(?m)^Task `([^`\\s]+)`: \\*\\*[^*\\n]+\\*\\* \\(still running")
+// (a2a/mcp writeTask or FormatTurnCustomToolEnvelope):
+// "Task `<addressee>/<id>`: **<state>** (still running; ..." or
+// "STREAMING_STEP_CONTINUE: Task `<addressee>/<id>` is actively running...", or for a turn
+// it sent but could not read yet (a2a/mcp sendAndStreamStep, sendAndWait):
+// "Task `<addressee>/<id>` carries the turn, but reading it failed: ...".
+// Both regexes are matched against serverTaskLine only, never the whole text.
+var (
+	runningTaskRefRegex       = regexp.MustCompile("^(?:Task `([^`\\s]+)`: \\*\\*[^*\\n]+\\*\\* \\(still running|" + StreamingStepContinuePrefix + "Task `([^`\\s]+)` is actively running|Task `([^`\\s]+)` carries the turn, but reading it failed)")
+	taskSessionWorkerRefRegex = regexp.MustCompile("^(?:" + StreamingStepContinuePrefix + ")?Task `(((?:chat|s)-[A-Za-z0-9_-]+)/task-[A-Za-z0-9_-]+)`")
+)
 
-// runningTaskRef is the task reference of the first task the server reports still running in
-// text, or "".
+// serverTaskLine is the in-cluster server's own task line in a tool response: the line a
+// streamed step opens with (STREAMING_STEP_CONTINUE), else the first line that opens with
+// "Task `" (a2a/mcp writeTask or writeOutcome). What comes before it is the server's too (the
+// conversation line, quoted gateway notices, rendered steps, none opening with "Task `"); the
+// agent's answer comes only after it, so no line of the answer is read as the server's.
+func serverTaskLine(text string) string {
+	if strings.HasPrefix(text, StreamingStepContinuePrefix) {
+		line, _, _ := strings.Cut(text, "\n")
+		return line
+	}
+	for line := range strings.SplitSeq(text, "\n") {
+		if strings.HasPrefix(line, "Task `") {
+			return line
+		}
+	}
+	return ""
+}
+
+// extractTaskSessionWorkerID is the s-<id> / chat-<id> worker the server's task line names,
+// and that line's task reference, or "".
+func extractTaskSessionWorkerID(text string) (workerID, taskRef string) {
+	if m := taskSessionWorkerRefRegex.FindStringSubmatch(serverTaskLine(text)); len(m) == 3 {
+		return m[2], m[1]
+	}
+	return "", ""
+}
+
+// runningTaskRef is the task reference of the task the server's task line reports still
+// running, or "".
 func runningTaskRef(text string) string {
-	if m := runningTaskRefRegex.FindStringSubmatch(text); len(m) == 2 {
-		return m[1]
+	if m := runningTaskRefRegex.FindStringSubmatch(serverTaskLine(text)); m != nil {
+		for _, ref := range m[1:] {
+			if ref != "" {
+				return ref
+			}
+		}
 	}
 	return ""
 }

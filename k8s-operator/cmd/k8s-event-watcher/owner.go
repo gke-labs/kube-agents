@@ -34,10 +34,9 @@ const (
 	// podMetadataAccept asks for one Pod's ObjectMeta as JSON, never its spec
 	// or status. The broker's watcher route admits a named Pod GET only under
 	// this Accept (watcher_policy.evaluate_k8s), and relays only the fields
-	// read here (watcher_policy.project_pod_metadata): the controller
-	// ownerReference and, for a ReplicaSet, the pod-template-hash label. The
-	// in-cluster client reads the ObjectMeta whole, and this file reads the
-	// same fields of it.
+	// read here (watcher_policy.project_pod_metadata; the POD_METADATA_KIND
+	// comment there names each one). The in-cluster client reads the
+	// ObjectMeta whole, and this file reads the same fields of it.
 	podMetadataAccept = "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1"
 	// ownerLookupTimeout bounds the one GET an admitted Pod event costs. The
 	// lookup runs inline before the inject, so a slow API server delays one

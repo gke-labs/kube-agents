@@ -2155,6 +2155,12 @@ func TestKubeProxyObservabilityManifests(t *testing.T) {
 	if !hasMetricsPort {
 		t.Errorf("expected container port %s=%d on kube-proxy container, got %#v", kubeProxyMetricsPortName, kubeProxyMetricsPort, c.Ports)
 	}
+	if got := c.Resources.Requests.Memory().String(); got != "512Mi" {
+		t.Errorf("kube-proxy memory request = %q, want 512Mi", got)
+	}
+	if got := c.Resources.Limits.Memory().String(); got != "1Gi" {
+		t.Errorf("kube-proxy memory limit = %q, want 1Gi", got)
+	}
 
 	disabledDep := buildKubeProxyDeployment(agent, "", true, "tls-hash")
 	disabledEnvs := make(map[string]string)
@@ -2172,6 +2178,28 @@ func TestKubeProxyObservabilityManifests(t *testing.T) {
 	if len(np.Spec.Ingress[0].From) != 1 || np.Spec.Ingress[0].From[0].PodSelector == nil ||
 		np.Spec.Ingress[0].From[0].PodSelector.MatchLabels["app"] != shellSandboxName(agent) {
 		t.Errorf("expected kube-proxy NetworkPolicy port 8443 ingress only from %q, got %#v", shellSandboxName(agent), np.Spec.Ingress[0].From)
+	}
+
+	nextAgent := agent.DeepCopy()
+	nextAgent.Spec.Mode = ptr.To("next")
+	t.Setenv(a2aSessionClusterViewEnvVar, "true")
+	sessDep := buildKubeProxyDeployment(nextAgent, "", true, "tls-hash")
+	sessEnvs := make(map[string]string)
+	for _, e := range sessDep.Spec.Template.Spec.Containers[0].Env {
+		sessEnvs[e.Name] = e.Value
+	}
+	if got := sessEnvs["CREDENTIAL_PROXY_SESSION_AUDIENCE"]; got != credentialProxySessionAudience {
+		t.Errorf("CREDENTIAL_PROXY_SESSION_AUDIENCE = %q, want %q", got, credentialProxySessionAudience)
+	}
+	if got := sessEnvs["CREDENTIAL_PROXY_SESSION_CALLERS"]; got != "system:serviceaccount:test-ns:test-agent-a2a-session" {
+		t.Errorf("CREDENTIAL_PROXY_SESSION_CALLERS = %q, want session SA", got)
+	}
+	if got := sessEnvs["CREDENTIAL_PROXY_ALLOWED_CALLERS"]; got != "system:serviceaccount:test-ns:test-agent-shell" {
+		t.Errorf("CREDENTIAL_PROXY_ALLOWED_CALLERS = %q, want only shell SA", got)
+	}
+	sessNP := buildKubeProxyNetworkPolicy(nextAgent)
+	if len(sessNP.Spec.Ingress[0].From) != 2 {
+		t.Fatalf("expected 2 peers (shell, a2a-session) on kube-proxy NetworkPolicy, got %#v", sessNP.Spec.Ingress[0].From)
 	}
 }
 

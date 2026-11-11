@@ -103,6 +103,9 @@ type holdKey struct{ profile, tier, kind, taskID string }
 type holding struct {
 	profile, tier, kind, taskID string
 	unattended                  bool
+	// onJob is a task run on a Job of its own (job.go), whose Job endJob
+	// deletes; a pool task has none.
+	onJob bool
 	// lease and renew are what the task was offered (or, re-adopted, what
 	// its record shows): a config change never moves them.
 	lease, renew time.Duration
@@ -176,6 +179,9 @@ type Dispatcher struct {
 	verifier Verifier
 	log      *slog.Logger
 	now      func() time.Time
+	// onSend, set (tests only), sees each dispatch message just before it is
+	// published, in the order the dispatcher sends them.
+	onSend func(subject string, msg lib.DispatchMessage)
 	// mint signs one task credential with the task-signing key, and
 	// taskKeys is that key's public half, which the dispatcher reads back
 	// each credential it mints with. mint is nil with no key: confirms then
@@ -230,8 +236,9 @@ type Dispatcher struct {
 	// running is set while Run holds its answer subscriptions.
 	running atomic.Bool
 	// breakers hold back a (profile, tier) whose tasks keep losing their
-	// workers (breaker.go).
+	// workers (breaker.go), and jobs runs unattended tasks (job.go).
 	breakers *breakers
+	jobs     JobRunner
 	// stopSubs is the live subscription to each profile's stop subject, and
 	// stopped the stops heard live, by profile/task (stop.go).
 	stopSubs map[string]lib.Subscription
@@ -240,6 +247,9 @@ type Dispatcher struct {
 	// one succeeds), and stopReadRetry when to read it again (stop.go).
 	stopStreamErr string
 	stopReadRetry time.Time
+	// jobAdmissionErr is the last refusal of a Job by the admission
+	// policy, "" once one is admitted (job.go).
+	jobAdmissionErr string
 }
 
 // New builds a dispatcher on bus. src is the install config, pool the
@@ -626,8 +636,11 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 	prof, ok := profileOf(snap, profile)
 	if !ok {
 		// A durable for a profile the config doesn't know yet (or any
-		// more): the config lags the operator, so the task stays held.
+		// more): the config lags the operator, so the task stays held. A
+		// Job an earlier pass launched for it, never confirmed, goes (as at
+		// a drain); a started task's Job stays until the task ends.
 		log.Warn("no config for this profile; the submission stays queued")
+		d.dropUnconfirmedJob(ctx, log, hk)
 		_ = del.Nak(d.cfg.RetryDelay)
 		return
 	}
@@ -654,10 +667,24 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 		d.adopt(ctx, log, del, snap, prof, hk, rec, key)
 		return
 	}
+	if prof.Draining() {
+		// Draining (#5074): listed so its held tasks' terminals still land,
+		// but nothing new is dispatched for it. Its durable goes at the next
+		// refresh; until then a new delivery, or a redelivered one from its
+		// backlog, stays queued as an unknown profile's does. No lease record,
+		// so never started: a Job an earlier pass launched for it goes, or
+		// its pod would wait for an offer until its deadline, outside every
+		// cap.
+		log.Info("the profile is draining; the submission stays queued")
+		d.dropUnstartedJob(ctx, log, hk)
+		_ = del.Nak(d.cfg.RetryDelay)
+		return
+	}
 
 	now := d.now()
 	cluster, ref, err := d.admit(ctx, del, snap, prof, hk, now)
 	if errors.Is(err, errStopped) {
+		d.dropUnstartedJob(ctx, log, hk)
 		d.stopQueued(ctx, log, del, hk)
 		return
 	}
@@ -680,6 +707,7 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 	if ref != nil {
 		log.Info("submission refused at admission", "reason", ref.reason, "detail", ref.detail)
 		d.clearWaiting(hk)
+		d.dropUnstartedJob(ctx, log, hk)
 		d.reject(ctx, log, del, hk, ref)
 		return
 	}
@@ -718,7 +746,23 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 	d.offeringWaiting(hk)
 	h.cluster = cluster
 
-	rec, key, err = d.handOff(ctx, log, del, snap, prof, h)
+	// Job mode needs the profile's Job template; without it (the chart
+	// didn't install the Job admission policy) the task goes to the (profile,
+	// tier)'s pool. The operator builds pools for the read tier only, so an
+	// unattended task with no pool pod was refused at admission (noRunner).
+	if h.unattended && d.jobs != nil && len(prof.JobTemplate) > 0 {
+		h.onJob = true
+		var ended bool
+		rec, key, ended, err = d.runJob(ctx, log, del, snap, prof, h)
+		if ended {
+			// The Job path ended the task itself (no worker): it no
+			// longer waits.
+			d.clearWaiting(hk)
+			return
+		}
+	} else {
+		rec, key, err = d.handOff(ctx, log, del, snap, prof, h)
+	}
 	if errors.Is(err, errStopped) {
 		// Stopped while being handed out: ended as one stopped in the
 		// queue is, since no worker ever started it.
@@ -730,7 +774,9 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 		d.clearWaiting(hk)
 	}
 	if err != nil || key == "" {
-		d.release(h, false)
+		// The wait is noted before the holding goes: while it is held, Health
+		// keeps the waiting entry as one on offer, so a Health in between
+		// never sees the submission neither offered nor waiting.
 		if err != nil {
 			d.noteWaiting(hk, del.Received(), waitHandOffFailed)
 			log.Warn("hand-off failed; the submission stays queued", "err", err)
@@ -738,6 +784,7 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 			d.noteWaiting(hk, del.Received(), ReasonNoWorker)
 			log.Info("no worker took the task; the submission stays queued")
 		}
+		d.release(h, false)
 		if ctx.Err() == nil {
 			_ = del.Nak(d.cfg.RetryDelay)
 		}
@@ -747,6 +794,7 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 	d.lastAdmit[lib.ProfileDurableName(profile, tier, kind)] = d.now()
 	d.mu.Unlock()
 	d.hold(ctx, log, del, h, rec, key, time.Time{})
+	d.endJob(ctx, log, h)
 }
 
 // holder is the holding for a submission, if this process has one.
@@ -1001,7 +1049,7 @@ func (d *Dispatcher) registerOfferLocked(h *holding, pod string) chan lib.Dispat
 // offerTo offers h's task to pod, whose offer registerOfferLocked made, and
 // waits up to acceptTimeout for its answer: offer, accept, then the lease
 // record and the confirm, or an abandon (contract addendum 5). The pool's
-// hand-off tries pods in turn with it.
+// hand-off tries pods in turn with it; a Job offers its own pod once.
 func (d *Dispatcher) offerTo(ctx context.Context, log *slog.Logger, envelope []byte, snap lib.DispatchConfig,
 	prof lib.DispatchProfile, h *holding, pod string, ch chan lib.DispatchAccept, acceptTimeout time.Duration) (lib.LeaseRecord, string, offerOutcome, error) {
 	ok := offerKey{h.profile, h.tier, pod, h.taskID}
@@ -1210,7 +1258,7 @@ func (d *Dispatcher) adopt(ctx context.Context, log *slog.Logger, del lib.Delive
 	if renew <= 0 {
 		renew = min(seconds(snap.RenewSeconds), lease/3)
 	}
-	h := &holding{profile: hk.profile, tier: hk.tier, kind: hk.kind, taskID: hk.taskID, unattended: d.cfg.unattended(hk.tier),
+	h := &holding{profile: hk.profile, tier: hk.tier, kind: hk.kind, taskID: hk.taskID, unattended: d.cfg.unattended(hk.tier), onJob: d.cfg.unattended(hk.tier) && d.jobs != nil,
 		lease: lease, renew: renew, pod: pod, confirmed: true,
 		renewals: make(chan renewal, renewalBuffer), done: make(chan struct{})}
 	d.mu.Lock()
@@ -1227,19 +1275,18 @@ func (d *Dispatcher) adopt(ctx context.Context, log *slog.Logger, del lib.Delive
 	if released {
 		log.Info("re-adopted a task its worker had already finished; settling it", "pod", pod)
 		d.settle(ctx, log, del, h, key, rec)
+		d.endJob(ctx, log, h)
 		return
 	}
 	if rec.Deadline.IsZero() {
-		// A record that doesn't say (unreadable, or not this dispatcher's
-		// shape): the profile's current limit from the confirm, or from now
-		// when the record names no time at all, or the first tick would fail
-		// a live task before the restart grace could protect it.
+		// A record with no offer terms (an unreadable one decodes as written
+		// at its entry's write, decodeLease): the profile's current limit
+		// from the confirm, or from the renewal for a record that names no
+		// confirm. Every running record decodeLease returns has a renewal,
+		// so the limit always counts from a time the record gives.
 		started := rec.ConfirmedAt
 		if started.IsZero() {
 			started = rec.RenewedAt
-		}
-		if started.IsZero() {
-			started = d.now()
 		}
 		rec.Deadline = started.Add(seconds(prof.ActiveDeadlineSeconds))
 	}
@@ -1250,6 +1297,7 @@ func (d *Dispatcher) adopt(ctx context.Context, log *slog.Logger, del lib.Delive
 		d.mu.Unlock()
 	}
 	d.hold(ctx, log, del, h, rec, key, graceUntil)
+	d.endJob(ctx, log, h)
 }
 
 // hold keeps a running task's submission held (the lib sends the in-progress
@@ -1379,11 +1427,30 @@ func (d *Dispatcher) failAs(ctx context.Context, log *slog.Logger, del lib.Deliv
 }
 
 // publishTerminalRetry publishes a held task's terminal until it lands or
-// ctx ends, and says whether it landed.
+// ctx ends, and says whether the task may be settled: it landed, or its
+// profile has been gone from the install config for DroppedTerminalGiveUp.
+// A dropped profile's .supervisor grant goes at the next reconnect, so its
+// terminal could be refused for good; it is given up on, logged as an
+// error, and the task settled anyway, rather than hold its slot until a
+// restart. A profile still listed is retried for as long as it takes.
 func (d *Dispatcher) publishTerminalRetry(ctx context.Context, log *slog.Logger, del lib.Delivery, h *holding, state lib.TaskState, reason, detail string) bool {
+	var droppedAt time.Time
 	for {
-		err := d.publishTerminal(ctx, h.key(), del.Envelope(), state, reason, detail)
+		// Each attempt is bounded on its own: a refused publish is never
+		// acked, and the caller's context may have no deadline at all.
+		actx, cancel := context.WithTimeout(ctx, kvOpTimeout)
+		err := d.publishTerminal(actx, h.key(), del.Envelope(), state, reason, detail)
+		cancel()
 		if err == nil {
+			return true
+		}
+		if _, listed := profileOf(d.src.Config(), h.profile); listed {
+			droppedAt = time.Time{}
+		} else if droppedAt.IsZero() {
+			droppedAt = d.now()
+		} else if d.now().Sub(droppedAt) >= d.cfg.DroppedTerminalGiveUp {
+			log.Error("gave up on the terminal of a task whose profile left the install config; settling it without one",
+				"state", state, "reason", reason, "after", d.cfg.DroppedTerminalGiveUp, "err", err)
 			return true
 		}
 		log.Warn("publish the failure terminal; retrying", "err", err)
@@ -1674,9 +1741,8 @@ func (d *Dispatcher) renewOrphan(profile, tier, pod, key string, r lib.LeaseRene
 		}
 		return
 	}
-	var rec lib.LeaseRecord
-	recErr := json.Unmarshal(entry.Value(), &rec)
-	if recErr == nil && rec.Finished() {
+	rec, readable := d.decodeLease(key, entry.Value(), entry.Created())
+	if rec.Finished() {
 		// The task is over: a tombstone is never renewed back to life.
 		if logIt {
 			d.log.Warn("ignored a renewal for a finished task", "key", key, "final", r.Final)
@@ -1695,11 +1761,12 @@ func (d *Dispatcher) renewOrphan(profile, tier, pod, key string, r lib.LeaseRene
 		}
 		return
 	}
-	if err := recErr; err != nil {
-		if logIt {
-			d.log.Warn("renewal for a task not held here: unreadable record", "key", key, "err", err)
-		}
-		return
+	if !readable {
+		// The renewal is the task's sign of life, from the pod its key
+		// names: the record is written back readable (the dispatcher is the
+		// bucket's one writer, by compare-and-set as for any refresh), or a
+		// re-adoption after the restart grace would fail a live task.
+		d.log.Warn("renewal for a task not held here rewrites its unreadable record", "key", key)
 	}
 	now := d.now()
 	rec.RenewedAt, rec.ExpiresAt = now, now.Add(recordLease(rec, seconds(d.src.Config().LeaseSeconds)))
@@ -1760,8 +1827,11 @@ func (d *Dispatcher) prune() {
 //   - a running lease expired for longer than SweepAfter, held by no hold
 //     here, in a (profile, tier) whose durables are all bound (so a
 //     submission still on the stream would have come back and been
-//     re-adopted long since). An unreadable record counts as running and
-//     waits SweepAfter from its own write.
+//     re-adopted long since). An unreadable record is one written when its
+//     entry was (decodeLease), so it waits the same.
+//
+// It reads the bucket in one pass, under one kvOpTimeout; a pass cut short
+// is logged, and the next sweep reads everything again.
 func (d *Dispatcher) sweep(ctx context.Context) {
 	kctx, cancel := context.WithTimeout(ctx, kvOpTimeout)
 	defer cancel()
@@ -1770,21 +1840,15 @@ func (d *Dispatcher) sweep(ctx context.Context) {
 		d.log.Warn("lease sweep: bucket unavailable", "err", err)
 		return
 	}
-	lister, err := kv.ListKeys(kctx)
-	if err != nil {
-		d.log.Warn("lease sweep: list the records", "err", err)
-		return
-	}
-	var keys []string
-	for k := range lister.Keys() {
-		keys = append(keys, k)
-	}
 	cfg := d.src.Config()
 	now := d.now()
-	for _, k := range keys {
+	read := 0
+	err = watchLeases(kctx, kv, ">", func(entry jetstream.KeyValueEntry) {
+		read++
+		k := entry.Key()
 		t := strings.Split(k, ".")
 		if len(t) != 4 {
-			continue
+			return
 		}
 		profile, tier, taskID := t[0], t[1], t[3]
 		d.mu.Lock()
@@ -1792,53 +1856,72 @@ func (d *Dispatcher) sweep(ctx context.Context) {
 		bound := d.tierBoundLocked(cfg, profile, tier)
 		d.mu.Unlock()
 		if held {
-			continue
+			return
 		}
-		entry, err := kv.Get(kctx, k)
-		if err != nil {
-			continue
-		}
-		var rec lib.LeaseRecord
-		readable := json.Unmarshal(entry.Value(), &rec) == nil
-		if readable && rec.Finished() {
+		rec, _ := d.decodeLease(k, entry.Value(), entry.Created())
+		if rec.Finished() {
 			// Bound or not: the stream drops the submission at its age
 			// limit either way.
 			if keepUntil := rec.FinishedAt.Add(submitRetention(cfg) + tombstoneMargin); now.Before(keepUntil) {
-				continue
+				return
 			}
 			if err := kv.Delete(kctx, k, jetstream.LastRevision(entry.Revision())); err != nil {
 				d.log.Debug("lease sweep: tombstone moved meanwhile", "key", k, "err", err)
-				continue
+				return
 			}
 			d.log.Info("swept a tombstone past the submit stream's retention", "key", k, "finishedAt", rec.FinishedAt)
-			continue
+			return
 		}
-		if !bound {
-			continue
-		}
-		// An unreadable record still says its task started (findLease), so
-		// it gets the same wait, counted from the entry's own write: no
-		// renewal can rewrite it, so that is its last sign of life.
-		if readable && !rec.Expired(now, d.cfg.SweepAfter) ||
-			!readable && now.Sub(entry.Created()) <= d.cfg.SweepAfter {
-			continue
+		if !bound || !rec.Expired(now, d.cfg.SweepAfter) {
+			return
 		}
 		if err := kv.Delete(kctx, k, jetstream.LastRevision(entry.Revision())); err != nil {
 			d.log.Debug("lease sweep: record moved meanwhile", "key", k, "err", err)
-			continue
+			return
 		}
 		d.log.Info("swept a lease record nothing holds", "key", k, "expiresAt", rec.ExpiresAt)
+	})
+	if err != nil {
+		// The next sweep starts over; say so, rather than leave the rest
+		// unread without a word.
+		d.log.Warn("lease sweep cut short; the next sweep reads the rest", "read", read, "err", err)
+	}
+}
+
+// watchLeases calls fn with each record in the lease bucket under filter, in
+// one pass (a watch's initial values, never one round trip each), and
+// returns once they are all in, or with the error that cut the pass short.
+func watchLeases(ctx context.Context, kv jetstream.KeyValue, filter string, fn func(jetstream.KeyValueEntry)) error {
+	w, err := kv.WatchFiltered(ctx, []string{filter}, jetstream.IgnoreDeletes())
+	if err != nil {
+		return err
+	}
+	defer func() { _ = w.Stop() }()
+	for {
+		select {
+		case entry, open := <-w.Updates():
+			if !open {
+				// The watch ended before its initial values did.
+				return errors.Join(errWatchEnded, ctx.Err())
+			}
+			if entry == nil {
+				// The initial values are all in.
+				return nil
+			}
+			fn(entry)
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 }
 
 // submitRetention is how long the submit stream keeps a submission, which
 // a tombstone must outlive: the max age the operator renders in the install
-// config, from the constant it creates the stream with. It is never less
-// than lib.ProfileSubmitRetention, so a config can't take a tombstone below
-// the compiled 72h. Both are the binaries' values, not the live stream's,
-// and the operator never edits an existing stream: a constant raised and
-// later lowered leaves the streams created in between longer than this
-// (#4948). A config with no value (an older operator) gets the fixed value.
+// config, the longer of the constant it creates the stream with and the
+// live stream's own when its provision Job reports a longer one (#4948). It
+// is never less than lib.ProfileSubmitRetention, so a config can't take a
+// tombstone below the compiled 72h. A config with no value (an older
+// operator) gets the fixed value.
 func submitRetention(cfg lib.DispatchConfig) time.Duration {
 	return max(time.Duration(cfg.SubmitRetentionSeconds)*time.Second, lib.ProfileSubmitRetention)
 }
@@ -1872,6 +1955,33 @@ func answerSubject(subject, class string) (profile, tier, pod string, ok bool) {
 	return t[2], t[3], t[4], true
 }
 
+// decodeLease is how every reader sees a PROFILE_LEASES value. A record
+// that doesn't decode, or decodes as neither a tombstone nor a running
+// record with a renewal and an expiry (not this dispatcher's shape), has
+// one meaning everywhere: a started task that is not over, whose last sign
+// of life is the entry's own write. So it has the times a record written
+// then would have: confirmed and renewed at
+// written, expiring a configured lease later, with no offer terms. readable
+// is false for it, for the logs. Corruption and an incompatible change to
+// lib.LeaseRecord are the only ways to reach it.
+func (d *Dispatcher) decodeLease(key string, value []byte, written time.Time) (rec lib.LeaseRecord, readable bool) {
+	if json.Unmarshal(value, &rec) == nil && (rec.Finished() || !rec.RenewedAt.IsZero() && !rec.ExpiresAt.IsZero()) {
+		return rec, true
+	}
+	lease := seconds(d.src.Config().LeaseSeconds)
+	return lib.LeaseRecord{TaskID: keyTask(key), Pod: keyPod(key),
+		ConfirmedAt: written, RenewedAt: written, ExpiresAt: written.Add(lease)}, false
+}
+
+// keyTask is the task token of a lease key, <profile>.<tier>.<pod>.<task>.
+func keyTask(key string) string {
+	t := strings.Split(key, ".")
+	if len(t) != strings.Count(lib.ProfileLeaseKey("p", "t", "x", "k"), ".")+1 {
+		return ""
+	}
+	return t[3]
+}
+
 // keyPod is the pod token of a lease key, <profile>.<tier>.<pod>.<task>:
 // the key, which only the dispatcher writes, is the pod's identity, not
 // the record's Pod field.
@@ -1894,6 +2004,9 @@ func (d *Dispatcher) send(subject string, msg lib.DispatchMessage) error {
 	nc := d.bus.Conn()
 	if nc == nil {
 		return errors.New("not connected")
+	}
+	if d.onSend != nil {
+		d.onSend(subject, msg)
 	}
 	return nc.Publish(subject, data)
 }
@@ -1930,11 +2043,9 @@ func (d *Dispatcher) findLease(ctx context.Context, profile, tier, taskID string
 		if err != nil {
 			return lib.LeaseRecord{}, "", false, err
 		}
-		var rec lib.LeaseRecord
-		if err := json.Unmarshal(entry.Value(), &rec); err != nil {
-			// A record nobody can read still says the task started.
-			d.log.Warn("unreadable lease record; treating the task as started", "key", k, "err", err)
-			rec = lib.LeaseRecord{TaskID: taskID, Pod: keyPod(k)}
+		rec, readable := d.decodeLease(k, entry.Value(), entry.Created())
+		if !readable {
+			d.log.Warn("unreadable lease record; treating the task as started at its write", "key", k, "written", entry.Created())
 		}
 		if bestKey == "" || (rec.Finished() && !best.Finished()) ||
 			(rec.Finished() == best.Finished() && rec.RenewedAt.After(best.RenewedAt)) {
@@ -1964,39 +2075,22 @@ func (d *Dispatcher) leasedPods(ctx context.Context, profile, tier string, grace
 	if err != nil {
 		return nil, err
 	}
-	w, err := kv.WatchFiltered(kctx, []string{lib.ProfileLeaseKeyFilter(profile, tier, "*")}, jetstream.IgnoreDeletes())
+	now := d.now()
+	pods := map[string]bool{}
+	err = watchLeases(kctx, kv, lib.ProfileLeaseKeyFilter(profile, tier, "*"), func(entry jetstream.KeyValueEntry) {
+		pod := keyPod(entry.Key())
+		if pod == "" || pods[pod] {
+			return
+		}
+		if rec, _ := d.decodeLease(entry.Key(), entry.Value(), entry.Created()); rec.Expired(now, grace) {
+			return
+		}
+		pods[pod] = true
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = w.Stop() }()
-	now := d.now()
-	pods := map[string]bool{}
-	for {
-		var entry jetstream.KeyValueEntry
-		var open bool
-		select {
-		case entry, open = <-w.Updates():
-		case <-kctx.Done():
-			return nil, kctx.Err()
-		}
-		if !open {
-			// The watch ended before its initial values did.
-			return nil, errors.Join(errWatchEnded, kctx.Err())
-		}
-		if entry == nil {
-			// The initial values are all in.
-			return pods, nil
-		}
-		pod := keyPod(entry.Key())
-		if pod == "" || pods[pod] {
-			continue
-		}
-		var rec lib.LeaseRecord
-		if err := json.Unmarshal(entry.Value(), &rec); err == nil && rec.Expired(now, grace) {
-			continue
-		}
-		pods[pod] = true
-	}
+	return pods, nil
 }
 
 func (d *Dispatcher) putLease(ctx context.Context, key string, rec lib.LeaseRecord) error {

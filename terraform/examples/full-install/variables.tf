@@ -453,6 +453,34 @@ variable "model_max_tokens" {
   }
 }
 
+variable "litellm_budget" {
+  description = "The LiteLLM gateway's spend ceiling, the chart's litellm.budget: usd is the most the gateway spends, in US dollars as LiteLLM prices each response, in every window of period (a LiteLLM duration: a whole number and s, m, h, d, w or mo). Rendered only while usd is above 0, so an install without a ceiling keeps the gateway config it had; the chart splits the ceiling evenly across the gateway's replicas, and a replica whose share is spent refuses model calls until its window ends. What the agent sees and how to read the remaining budget: the site's inference-gateway page, \"Setting a spend ceiling\"."
+  type = object({
+    usd    = optional(number, 0)
+    period = optional(string, "1d")
+  })
+  nullable = false
+  default  = {}
+
+  # The same checks as the chart's values.schema.json, so a bad value fails the
+  # plan rather than the helm_release apply. The period is checked only beside
+  # an amount above zero: the chart reads it then and not otherwise.
+  # 0.01 is the least a ceiling can be when it is on: the chart splits the
+  # amount across the gateway replicas and renders each share with four
+  # decimals, refusing a share that rounds to 0 at the helm_release apply. A
+  # cent keeps the share above that floor at up to 100 replicas, and the
+  # refusal happens at the plan. The installer's LITELLM_BUDGET_MIN_USD and the
+  # chart's values.schema.json carry the same floor.
+  validation {
+    condition     = var.litellm_budget.usd == 0 || var.litellm_budget.usd >= 0.01
+    error_message = "litellm_budget.usd must be 0 (no ceiling) or an amount in US dollars of at least 0.01."
+  }
+  validation {
+    condition     = var.litellm_budget.usd == 0 || can(regex("^[1-9][0-9]*(s|m|h|d|w|mo)$", var.litellm_budget.period))
+    error_message = "litellm_budget.period must be a LiteLLM duration: a whole number and s, m, h, d, w or mo, such as 1d."
+  }
+}
+
 variable "alert_daily_limits" {
   description = "Daily alert ceilings for the Platform Agent, one per bucket: critical, warning, info and drift. The chart renders each key that is set as ALERT_DAILY_LIMIT_<KEY> in the PlatformAgent's spec.deployment.env. A key that is not set keeps the default in the agent image, and 0 removes the cap for that bucket. Each apply that changes the env list that the chart renders replaces the full env list on the CR, and entries added to the CR by hand are lost; set those through platformAgent.deployment.env in extra_helm_values. Buckets, defaults and a sizing method: the site's chatops page, \"Daily alert ceiling\"."
   # A map, not an object type: Terraform drops an unknown attribute of an
@@ -813,6 +841,28 @@ variable "github_minter_kms_key" {
   default     = "github-token-minter-key"
 }
 
+variable "github_minter_shared_kms_key" {
+  description = "A minter signing key this install shares on purpose, as <keyring>/<key>: one provisioned for the project outside any install, as the CI pool projects' is. lifecycle.sh's adoption step imports a minter key ring or key that another install's labels claim, or that carries no owner labels, only when it is the one named here. Empty adopts only this install's own. When it names the key this install uses, the composition sets no owner labels on that key, so they stay its owner's."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = can(regex("^$|^[a-zA-Z0-9_-]{1,63}/[a-zA-Z0-9_-]{1,63}$", var.github_minter_shared_kms_key))
+    error_message = "github_minter_shared_kms_key must be empty or <keyring>/<key>."
+  }
+}
+
+variable "github_minter_adopt_unlabelled_kms_key" {
+  description = "A minter signing key with no owner labels that this install adopts as its own, as <keyring>/<key>. The installer sets it when the key ring and key were named explicitly (KMS_KEYRING and KMS_KEY), and the apply then labels the key as this install's. A key another install's labels claim is refused whatever this says. Terraform itself reads nothing from it."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = can(regex("^$|^[a-zA-Z0-9_-]{1,63}/[a-zA-Z0-9_-]{1,63}$", var.github_minter_adopt_unlabelled_kms_key))
+    error_message = "github_minter_adopt_unlabelled_kms_key must be empty or <keyring>/<key>."
+  }
+}
+
 variable "github_app_id" {
   description = "GitHub App ID the minter signs as. Set, the chart creates the github-app-credentials Secret; empty, that Secret must already exist in the release namespace before the minter pod can start."
   type        = string
@@ -1011,4 +1061,10 @@ variable "extra_helm_values" {
   description = "Extra values for the kube-agents Helm release, covering chart settings this composition does not expose as its own variable (telemetry.otlpEndpoint, litellm.otel, the resource blocks, the PlatformAgent harness knobs). Passed as a second values document, so Helm deep-merges it key by key over the ones computed here and anything set wins. Setting a key the composition also computes — platformAgent.harness.clusterName, say — overrides it, which is rarely what you want."
   type        = any
   default     = {}
+}
+
+variable "disallow_secrets_read" {
+  description = "Omit core secrets (get, list, watch) from the reader ClusterRole (spec.security.disallowSecretsRead on the PlatformAgent CR). Null leaves the field unset on the CR so new installs grant secrets read access and existing installs keep their current ClusterRole permissions."
+  type        = bool
+  default     = null
 }

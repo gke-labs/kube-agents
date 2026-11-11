@@ -48,13 +48,13 @@ declared column from the two files and fails when the page falls behind them.
 | Workload                                                     | Pods | Runtime                                                                | Default (declared)                  | Fleet (modeled)                                | Ephemeral (declared)     | Persistent                                               |
 | ------------------------------------------------------------ | ---- | ---------------------------------------------------------------------- | ----------------------------------- | ---------------------------------------------- | ------------------------ | -------------------------------------------------------- |
 | Credential proxy (Envoy and the broker)                      | 1    | standard                                                               | 0.5 / 1 then 2 / 2                  | 4 / 8 then 8 / 8                               | 8 GiB, request and limit | none                                                     |
-| Gateway pod: agent, dashboard, log sidecar, `agent-api-auth` | 1    | gVisor under the installer default `runtimeClassName`                  | 1.506 / 3 then 5.5 / 12.25          | 1.9 / 8.6 then 5.5 / 18.25                     | 3 GiB (the two sidecars) | data claim 50 GiB default, 100 GiB fleet; 1 GiB metadata |
+| Gateway pod: agent, dashboard, log sidecar, `agent-api-auth` | 1    | gVisor under the installer default `runtimeClassName`                  | 1.506 / 5 then 5.5 / 12.25          | 1.9 / 8.6 then 5.5 / 18.25                     | 3 GiB (the two sidecars) | data claim 50 GiB default, 100 GiB fleet; 1 GiB metadata |
 | Shell sandbox `<name>-shell-0`                               | 1    | node default; its own `shellSandbox.runtimeClassName` opts into gVisor | 0.2 / 0.5 then 2 / 2                | unchanged; its own `resources` field raises it | none declared            | data claim follows the gateway's; 1 GiB for `sshd`       |
-| Kubernetes API proxy                                         | 2    | standard                                                               | 0.1 / 0.25 then 1 / 0.5, each       | unchanged                                      | none declared            | none                                                     |
+| Kubernetes API proxy                                         | 2    | standard                                                               | 0.1 / 0.5 then 1 / 1, each          | unchanged                                      | none declared            | none                                                     |
 | Operator                                                     | 1    | standard                                                               | 0.1 / 0.25 then 0.5 / 0.5           | 0.25 / 1 then 0.5 / 1                          | none declared            | none                                                     |
 | LiteLLM                                                      | 2    | standard                                                               | 0.1 / 2 then 0.5 / 3, each          | unchanged                                      | 1.25 GiB each            | none                                                     |
 | GitHub token minter                                          | 2    | standard                                                               | 0.05 / 0.0625 then 0.5 / 0.25, each | unchanged                                      | none declared            | none                                                     |
-| **Total**                                                    | 10   |                                                                        | **2.806 / 9.375 then 14 / 24.25**   | **6.8 / 22.75 then 20 / 36.75**                | **13.5 GiB**             | **102 GiB default, 202 GiB fleet**                       |
+| **Total**                                                    | 10   |                                                                        | **2.806 / 11.875 then 14 / 25.25**  | **6.8 / 23.25 then 20 / 37.75**                | **13.5 GiB**             | **102 GiB default, 202 GiB fleet**                       |
 
 On GKE Autopilot the operator renders the credential proxy's requests at 2 vCPU and 2 GiB
 instead of 0.5 and 1, because Autopilot without bursting clamps a container's limits to its
@@ -65,10 +65,14 @@ The gateway pod's fleet row raises two containers. `agent-api-auth` is the examp
 `agentAPIAuth.resources`, 0.5 vCPU and 2 GiB requests with a 4 GiB memory limit. The agent
 container is the CR's `spec.deployment.resources`, which the chart has no value for; the row
 models it at 1 vCPU and 6 GiB requests and 3 vCPU and 12 GiB limits. That field replaces the
-operator's defaults (1 vCPU and 2 GiB requests, 3 vCPU and 8 GiB limits) as a whole block, so
+operator's defaults (1 vCPU and 4 GiB requests, 3 vCPU and 8 GiB limits) as a whole block, so
 set every key you want to keep. Set it on the CR with `kubectl edit`; a later `helm upgrade`
 leaves it alone, because Helm patches only the fields its render changes. The
 [CRD page](/kube-agents/operator/platformagent-crd/#specdeployment) describes the field.
+
+The memory request is also the dispatcher's admission budget, so the row's 6 GiB admits workers
+up to about 6 GiB of container memory
+([`tuning.admission`](/kube-agents/operator/platformagent-crd/#specharnesstuning)).
 
 The shell sandbox's 2 vCPU and 2 GiB limits are the operator's defaults.
 [`shellSandbox.resources`](/kube-agents/operator/platformagent-crd/#shellsandbox) raises them one
@@ -84,10 +88,10 @@ Two optional stacks add to the total:
 - **Hindsight memory** (`platformAgent.harness.memory.provider: kube_agents_memory`): the API
   at 0.5 vCPU and 2 GiB requests, 4 vCPU and 4 GiB limits; Postgres at 0.25 vCPU and 256 MiB
   requests, 1 vCPU and 1 GiB limits, 1.1 GiB ephemeral and an 8 GiB claim. Declared.
-- **`spec.mode: next`**: about 0.9 vCPU and 1.4 GiB of standing requests across seven pods, and
-  a 40 GiB NATS claim. Each delegation adds a session pod at 0.25 vCPU and 512 MiB requests with
-  2 vCPU and 2 GiB limits, up to `maxSessions` (default 10) at once. The
-  [prerequisites page](/kube-agents/install/prerequisites/#cluster-requirements) itemises them.
+- **`spec.mode: next`**: the A2A stack's standing pods, a container in the agent pod and a
+  JetStream claim per NATS server. Each delegation adds a session pod, up to `maxSessions` at
+  once. The prerequisites page's [Footprint](/kube-agents/install/prerequisites/#footprint)
+  gives the totals and each pod's requests and limits, generated from the chart.
 
 ## The host cluster
 

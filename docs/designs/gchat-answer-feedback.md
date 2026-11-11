@@ -91,9 +91,9 @@ false`, with the same effect as the Slack field. The chart carries the value.
   thread reply, may be posted in a one-to-one DM, or may be patched by the app afterwards. The
   live run proves those three, and the design keeps a fallback for each.
 - The chosen-button acknowledgement is an edit of the answer. The adapter rebuilds the message
-  from its own record of the layout when it has one (a question it tracks, an answered line it
-  drew) and from the click event's copy of the message otherwise, so a tap after a restart still
-  patches. The filled state is a hint; the bucket is the record.
+  from the message's one layout record when it has one (`spec-chatops-gateway.md`, "The Google
+  Chat adapter") and from the click event's copy of the message otherwise, so a tap after a
+  restart still patches. The filled state is a hint; the bucket is the record.
 - The Slack adapter's strings (the labels, the kept line, the thanks line, the form line and
   URL) move to a shared file so both backends read one copy; the Slack constants keep their
   names as aliases or are renamed in the same change, builder's choice, with no wording change.
@@ -165,14 +165,18 @@ and later edits drop choice buttons and keep link buttons today; both now also k
 buttons, filled state included. The rewrite is built from memory. The task id and the filled
 state live in a per-message rating memory (`ux.rated`), set when the answer is posted, when a tap
 is recorded, and when a choice click's rewrite reads the buttons of a message the adapter does
-not remember. A tap older than the one that filled the buttons on record does not move it. The answered rewrite's layout is kept per message (`ux.shown`), without the
-rating buttons. A rewrite after a restart of a question the adapter
+not remember. A tap older than the one that filled the buttons on record does not move it. The answered rewrite writes the message's one layout record (`ux.layouts`,
+`gchat_layout.go`), rating buttons included, and a tap replaces the rating buttons in it. A
+rewrite after a restart of a question the adapter
 no longer remembers takes its buttons from the event's copy of the message, for which the button
 struct also decodes `type` and `altText`. The rating memory starts empty after a restart, so
-the filled state then comes from the event's copy, and the bucket still holds the rating. The restart-recovery of a choice click's link
-buttons (`gchatMessageButtons`) tells the three kinds apart by function and link, not by index.
-Buttons are classified by `onClick.action.function` (`kage.choice`, `kage.feedback`,
-`kage.feedback-note`) or `onClick.openLink`.
+the filled state then comes from the event's copy, and the bucket still holds the rating. After a
+restart a choice click's rewrite takes every button from the event's copy of the message
+(`gchatEventLayout`), and `gchatMessageButtons` reads the clicked choice's label and the rating
+from it, telling the kinds apart by function and link, not by index. Buttons are classified by `onClick.action.function` (`kage.choice`, `kage.feedback`,
+`kage.feedback-note`) or `onClick.openLink`; a click on the Stop button's `kage.stop` never reaches
+this, since `classifyClick` dispatches it by that function first (spec-chatops-gateway.md "The Stop
+button").
 
 **Call 6: the switch.** `spec.integration.googleChat.answerFeedback *bool`, default `true`, the
 Slack field's twin. The operator renders `A2A_GOOGLE_CHAT_ANSWER_FEEDBACK=false` on the gateway

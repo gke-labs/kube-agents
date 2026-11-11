@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"math/big"
 	"os"
+	"path"
 	"strconv"
 	"time"
 
@@ -29,6 +30,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/memlimit"
 )
 
 const (
@@ -39,15 +41,16 @@ const (
 	kubeProxyImageEnvVar                 = "KUBE_PROXY_IMAGE"
 	kubeProxyRepositoryName              = "kube-proxy"
 	kubeProxyTLSSecretSuffix             = "-kube-proxy-tls" // #nosec G101 -- Secret name suffix, not a credential
-	kubeProxyTLSVolumeName               = "kube-proxy-tls"  // #nosec G101 -- Volume name, not a credential
+	kubeProxyCABundleSuffix              = "-kube-proxy-ca-bundle"
+	kubeProxyTLSVolumeName               = "kube-proxy-tls" // #nosec G101 -- Volume name, not a credential
 	kubeProxyTLSMountPath                = "/var/run/secrets/kubeagents/kube-proxy-tls"
 	kubeProxyCAVolumeName                = "kube-proxy-ca"
 	kubeProxyCAMountPath                 = "/var/run/secrets/kubeagents/kube-proxy-ca"
 	kubeProxyCACertFile                  = kubeProxyCAMountPath + "/ca.crt"
 	kubeProxyCPURequest                  = "100m"
-	kubeProxyMemoryRequest               = "256Mi"
+	kubeProxyMemoryRequest               = "512Mi"
 	kubeProxyCPULimit                    = "1"
-	kubeProxyMemoryLimit                 = "512Mi"
+	kubeProxyMemoryLimit                 = "1Gi"
 	kubeProxyTLSHashAnnotation           = "kubeagents.x-k8s.io/tls-cert-hash"
 	kubeProxyTLSClockSkew                = 5 * time.Minute
 	kubeProxyTLSValidity                 = 10 * 365 * 24 * time.Hour
@@ -94,12 +97,30 @@ const (
 	kubeProxySpreadMatchLabelKey = "pod-template-hash"
 )
 
+// GOMEMLIMIT, the Go runtime's soft heap limit, is set to
+// kubeProxyGoMemLimitPercent of kubeProxyMemoryLimit (kubeProxyGoMemLimit), so
+// the collector works harder as the response cache and in-flight bodies push
+// the heap toward the container's limit.
+const kubeProxyGoMemLimitPercent = 85
+
+// kubeProxyGoMemLimit is the kube-proxy container's GOMEMLIMIT:
+// kubeProxyGoMemLimitPercent of its memory limit, in bytes (912680550 for
+// 1Gi), derived from kubeProxyMemoryLimit so a change to the limit carries over.
+func kubeProxyGoMemLimit() string {
+	limit := resource.MustParse(kubeProxyMemoryLimit)
+	return strconv.FormatInt(limit.Value()*kubeProxyGoMemLimitPercent/100, 10)
+}
+
 func kubeProxyName(agent *agentv1alpha1.PlatformAgent) string {
 	return agent.Name + "-kube-proxy"
 }
 
 func kubeProxyTLSSecretName(agent *agentv1alpha1.PlatformAgent) string {
 	return agent.Name + kubeProxyTLSSecretSuffix
+}
+
+func kubeProxyCABundleName(agent *agentv1alpha1.PlatformAgent) string {
+	return agent.Name + kubeProxyCABundleSuffix
 }
 
 func kubeProxySelector(agent *agentv1alpha1.PlatformAgent) map[string]string {
@@ -170,6 +191,18 @@ func hostClusterContextName(agent *agentv1alpha1.PlatformAgent) string {
 	return inClusterContextName
 }
 
+// kubeProxyHostClusterID is the gke_ ID of the cluster the install runs in, from the
+// harness's project, location and cluster name, or "" when any is unset (kind, or an
+// install that names none). kube-proxy checks in-cluster against the exclusions as it;
+// with none, in-cluster is refused while any cluster is excluded.
+func kubeProxyHostClusterID(agent *agentv1alpha1.PlatformAgent) string {
+	harness := agent.Spec.Harness
+	if harness == nil || harnessOnKind(harness) || harness.ProjectID == "" || harness.Location == "" || harness.ClusterName == "" {
+		return ""
+	}
+	return "gke_" + harness.ProjectID + "_" + harness.Location + "_" + harness.ClusterName
+}
+
 func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent, otlpEndpoint string, otlpDisabled bool, tlsCertHash string) *appsv1.Deployment {
 	saName := agentServiceAccountName(agent)
 	podLabels := commonLabels(agent)
@@ -206,6 +239,7 @@ func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent, otlpEndpoint s
 		pullPolicy = *agent.Spec.Deployment.ImagePullPolicy
 	}
 
+	allowedCallers := fmt.Sprintf("system:serviceaccount:%s:%s", agent.Namespace, shellSandboxServiceAccountName(agent))
 	envVars := []corev1.EnvVar{
 		{Name: "KUBE_PROXY_LISTEN_ADDR", Value: fmt.Sprintf(":%d", kubeProxyPort)},
 		{Name: kubeProxyMetricsPortEnv, Value: strconv.Itoa(int(kubeProxyMetricsPort))},
@@ -213,19 +247,35 @@ func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent, otlpEndpoint s
 		{Name: "KUBE_PROXY_TLS_KEY_FILE", Value: kubeProxyTLSMountPath + "/tls.key"},
 		{Name: "KUBE_PROXY_MODE", Value: "read-only-dry-run"},
 		{Name: "KUBE_PROXY_REDACT_SECRETS", Value: "true"},
+		{Name: memlimit.GoMemLimitEnv, Value: kubeProxyGoMemLimit()},
 		{Name: "CREDENTIAL_PROXY_AUDIENCE", Value: credentialProxyAudience},
-		{Name: "CREDENTIAL_PROXY_ALLOWED_CALLERS", Value: allowedBrokerCallers(agent, brokerCallerOwnership{})},
+		{Name: "CREDENTIAL_PROXY_ALLOWED_CALLERS", Value: allowedCallers},
 		{Name: "CREDENTIAL_PROXY_KUBE_CA_FILE", Value: kubeAPIAccessMountPath + "/ca.crt"},
 		{Name: "CREDENTIAL_PROXY_KUBE_TOKEN_FILE", Value: kubeAPIAccessMountPath + "/token"},
 	}
+	if a2aSessionClusterViewEnabled(agent) {
+		envVars = append(envVars,
+			corev1.EnvVar{Name: "CREDENTIAL_PROXY_SESSION_AUDIENCE", Value: credentialProxySessionAudience},
+			corev1.EnvVar{Name: "CREDENTIAL_PROXY_SESSION_CALLERS", Value: a2aSessionBrokerCaller(agent)},
+		)
+	}
 	envVars = append(envVars, kubeProxyOTelEnvVars(agent, otlpEndpoint, otlpDisabled)...)
+	// spec.scope.exclude.clusters: kube-proxy refuses every request to an excluded
+	// cluster's API from the same scope.json the credential broker reads, and checks
+	// in-cluster as the cluster the harness names (kubeProxyHostClusterID).
+	envVars = append(envVars, corev1.EnvVar{Name: "KUBE_PROXY_SCOPE_FILE", Value: path.Join(brokerScopeDir, scopeFileName)})
+	if host := kubeProxyHostClusterID(agent); host != "" {
+		envVars = append(envVars, corev1.EnvVar{Name: "KUBE_PROXY_EXCLUDE_HOST_CLUSTER_ID", Value: host})
+	}
 
 	volumeMounts := []corev1.VolumeMount{
 		{Name: kubeProxyTLSVolumeName, MountPath: kubeProxyTLSMountPath, ReadOnly: true},
 		{Name: kubeAPITokenVolumeName, MountPath: kubeAPIAccessMountPath, ReadOnly: true},
+		scopeConfigMount(brokerScopeDir),
 	}
 
 	volumes := []corev1.Volume{
+		scopeConfigVolume(agent),
 		{
 			Name: kubeProxyTLSVolumeName,
 			VolumeSource: corev1.VolumeSource{
@@ -415,6 +465,11 @@ func buildKubeProxyNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networking
 	callers := []networkingv1.NetworkPolicyPeer{
 		{PodSelector: &metav1.LabelSelector{MatchLabels: shellSandboxSelector(agent)}},
 	}
+	if a2aSessionClusterViewEnabled(agent) {
+		callers = append(callers, networkingv1.NetworkPolicyPeer{
+			PodSelector: &metav1.LabelSelector{MatchLabels: a2aSessionPodSelector()},
+		})
+	}
 	np := &networkingv1.NetworkPolicy{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
 		ObjectMeta: metav1.ObjectMeta{Name: kubeProxyName(agent), Namespace: agent.Namespace},
@@ -523,6 +578,9 @@ func (r *PlatformAgentReconciler) ensureKubeProxyTLSSecret(ctx context.Context, 
 			return "", fmt.Errorf("kube-proxy TLS Secret %s/%s already exists and is not owned by PlatformAgent %s", agent.Namespace, secretName, agent.Name)
 		}
 		if len(existing.Data["ca.crt"]) > 0 && len(existing.Data["tls.crt"]) > 0 && len(existing.Data["tls.key"]) > 0 {
+			if err := r.ensureKubeProxyCABundle(ctx, agent, existing.Data["ca.crt"]); err != nil {
+				return "", err
+			}
 			return kubeProxyTLSSecretHash(existing.Data), nil
 		}
 	} else if !errors.IsNotFound(err) {
@@ -554,11 +612,36 @@ func (r *PlatformAgentReconciler) ensureKubeProxyTLSSecret(ctx context.Context, 
 		if err := ctrl.SetControllerReference(agent, secret, r.Scheme); err != nil {
 			return "", err
 		}
-		return bundleHash, r.Create(ctx, secret)
+		if err := r.Create(ctx, secret); err != nil {
+			return "", err
+		}
+		return bundleHash, r.ensureKubeProxyCABundle(ctx, agent, caPEM)
 	}
 
 	existing.Data = bundleData
-	return bundleHash, r.Update(ctx, existing)
+	if err := r.Update(ctx, existing); err != nil {
+		return "", err
+	}
+	return bundleHash, r.ensureKubeProxyCABundle(ctx, agent, caPEM)
+}
+
+func (r *PlatformAgentReconciler) ensureKubeProxyCABundle(ctx context.Context, agent *agentv1alpha1.PlatformAgent, caPEM []byte) error {
+	bundle := &corev1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      kubeProxyCABundleName(agent),
+			Namespace: agent.Namespace,
+			Labels:    commonLabels(agent),
+		},
+		Data: map[string]string{"ca.crt": string(caPEM)},
+	}
+	if err := ctrl.SetControllerReference(agent, bundle, r.Scheme); err != nil {
+		return err
+	}
+	if err := r.applyManaged(ctx, agent, bundle); err != nil {
+		return fmt.Errorf("failed to apply kube-proxy CA bundle ConfigMap: %w", err)
+	}
+	return nil
 }
 
 func (r *PlatformAgentReconciler) reconcileKubeProxy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, otlpEndpoint string, otlpDisabled bool) error {

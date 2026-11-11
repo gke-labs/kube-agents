@@ -89,6 +89,10 @@ class StallWatchBlockRenderTest(unittest.TestCase):
         kinds = {"kinds": ["eventsources.argoproj.io", "secretstores.external-secrets.io", "leasesets"]}
         self.assertEqual(self._block_of(self._render("-f", self._values_file(kinds))), kinds)
 
+    def test_a_group_wildcard_renders(self):
+        kinds = {"kinds": ["deployments", "*.cnrm.cloud.google.com"]}
+        self.assertEqual(self._block_of(self._render("-f", self._values_file(kinds))), kinds)
+
     def test_all_renders_as_the_one_kind(self):
         self.assertEqual(self._block_of(self._render("-f", self._values_file({"kinds": ["all"]}))), {"kinds": ["all"]})
 
@@ -109,6 +113,10 @@ class StallWatchBlockRenderTest(unittest.TestCase):
             {"kinds": ["configmaps.v1"]},
             {"kinds": ["leases.v1.coordination.k8s.io"]},
             {"kinds": ["deployments", "deployments"]},
+            {"kinds": ["*"]},
+            {"kinds": ["*."]},
+            {"kinds": ["sql*.cnrm.cloud.google.com"]},
+            {"kinds": ["all", "*.cnrm.cloud.google.com"]},
             {"excludeNamespaces": ["payments", "payments"]},
             {"unknown": True},
         ):

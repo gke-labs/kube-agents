@@ -15,7 +15,8 @@ of the tools themselves is the same kind of fetch and failed the same way once
 `NatsCliInstallRetryTest` runs a2a-test.yml's nats CLI step the same way. So
 did the module fetch inside the injector seam's `go test` (#4800):
 `OperatorModuleDownloadRetryTest` runs python-tests.yml's download steps the
-same way.
+same way. So did a provider download in `terraform init` (#5142):
+`TerraformInitRetryTest` runs validate.yml's Terraform step the same way.
 
 So the loop is *run*, not read: `RetryLoopBehaviourTest` points the recipe at a
 stub `setup-envtest` and counts invocations, which is what catches a backoff
@@ -25,7 +26,10 @@ is the same pattern.
 
 The Dockerfile and shell guard is a pure function over text with its own
 fixtures (`DownloadCheckerTest`), for the same reason: a walk that silently
-matches nothing passes just as well as one that finds everything.
+matches nothing passes just as well as one that finds everything. A GitHub
+release download in an image build must also keep retrying for minutes, not
+seconds (`GITHUB_RELEASE_RETRY_FLOOR_SECONDS`); `TirithDownloadRetryTest` runs
+the one such download that is a wget loop rather than a curl line.
 """
 
 import functools
@@ -83,6 +87,7 @@ ENVTEST_FETCH_TARGETS = ("envtest-path", "setup-envtest")
 #: downloads something is not covered until it is added here, and nothing in
 #: the repository notices that it is missing.
 DOWNLOAD_SOURCES = (
+    REPO_ROOT / "a2a" / "Dockerfile.worker",
     REPO_ROOT / "deploy" / "docker" / "Dockerfile",
     REPO_ROOT / "deploy" / "sandbox" / "Dockerfile",
     REPO_ROOT / "hack" / "ci-env.sh",
@@ -147,6 +152,60 @@ RETRY_ALL_ERRORS = "--retry-all-errors"
 
 #: A line the shell continues onto the next one.
 CONTINUATION = "\\"
+
+#: The image builds, which the Docker Build job, the image publishes and Cloud
+#: Build all run. A download that fails in one fails the image. Hand-maintained,
+#: as DOWNLOAD_SOURCES is.
+AGENT_DOCKERFILE = REPO_ROOT / "deploy" / "docker" / "Dockerfile"
+SANDBOX_DOCKERFILE = REPO_ROOT / "deploy" / "sandbox" / "Dockerfile"
+IMAGE_BUILDS = (AGENT_DOCKERFILE, SANDBOX_DOCKERFILE)
+
+#: A GitHub release download. github.com redirects it to the release-asset CDN.
+GITHUB_RELEASE_DOWNLOAD = re.compile(r"https://github\.com/[^/\s\"']+/[^/\s\"']+/releases/download/")
+
+#: Seconds of backoff a GitHub release download in an image build waits through
+#: before it fails. The release-asset CDN can answer HTTP 504 to one runner for
+#: minutes while it serves the same file to others: on 2026-11-05 it failed the
+#: leeway tarball on three runners for 146 seconds each, through both attempts
+#: of the Docker Build job's sandbox step, while other runners downloaded it.
+#: curl's backoff doubles from one second, so `--retry 8` waits 255 seconds;
+#: `--retry 5`, which passes the flag rule above, waits 31.
+GITHUB_RELEASE_RETRY_FLOOR_SECONDS = 240
+
+#: The literal values of the three flags that set how long curl retries. A
+#: count held in a variable has none, so a GitHub release download with one
+#: fails the floor: the walk cannot evaluate it. `--retry-max-time` only
+#: shortens the wait -- curl stops retrying once that much time has passed --
+#: so it cannot stand in for a larger count.
+RETRY_COUNT_VALUE = re.compile(r"--retry[ =]([0-9]+)(?![0-9])")
+RETRY_DELAY_VALUE = re.compile(r"--retry-delay[ =]([0-9]+)(?![0-9])")
+RETRY_MAX_TIME_VALUE = re.compile(r"--retry-max-time[ =]([0-9]+)(?![0-9])")
+
+#: The tirith download in AGENT_DOCKERFILE, found by its target file. It is a
+#: wget loop rather than a curl line, because the a2a-tools stage builds on the
+#: Go Alpine image, which has busybox wget and no curl.
+TIRITH_DOWNLOAD = "/tmp/tirith.tar.gz"
+DOCKERFILE_RUN = "RUN "
+
+#: Where the tirith RUN stops fetching and starts checking what it fetched. The
+#: test runs only the part before it, so nothing it runs touches the host's /tmp.
+TIRITH_CHECK_STEP = 'echo "${sum}  '
+
+#: The build arguments the tirith RUN reads under `set -u`. Placeholders: the
+#: stub wget fails before anything is checked against them.
+TIRITH_BUILD_ARGS = {
+    "TARGETARCH": "amd64",
+    "TIRITH_VERSION": "v0.0.0",
+    "TIRITH_SHA256_AMD64": "0" * 64,
+    "TIRITH_SHA256_ARM64": "0" * 64,
+}
+
+#: Stands in for wget under the tirith RUN: records each call and fails, as
+#: every attempt did on a runner the CDN was failing.
+FAILING_FETCH_STUB = """#!/bin/sh
+echo call >> "%s"
+exit 1
+"""
 
 MAKE_TIMEOUT_SECONDS = 60
 
@@ -284,6 +343,42 @@ echo "unexpected: go $*" >&2
 exit 2
 """
 
+#: The step in validate.yml that formats, initialises and validates every
+#: Terraform directory, found by name.
+TERRAFORM_WORKFLOW = "validate.yml"
+TERRAFORM_STEP = "Validate Terraform Modules"
+
+#: The tree the step walks in place of the checkout's: a module and an example,
+#: walked in that order, and a file beside them that the step skips. The root's
+#: name is what the stub records for the `fmt` call made from it.
+TERRAFORM_FIXTURE_ROOT = "checkout"
+TERRAFORM_FIXTURE_DIRS = ("terraform/modules/alpha", "terraform/examples/beta")
+TERRAFORM_FIXTURE_FILE = "terraform/modules/README.md"
+
+#: Stands in for terraform under the step. Each call appends its verb and the
+#: name of the directory it ran in to a calls file. `init` fails until that
+#: directory has more init calls on record than the failure count the test
+#: asked for, so each directory's attempts are counted apart; `fmt` and
+#: `validate` exit with the status the test asked for. Any other verb fails,
+#: so a step that stops running one of the three cannot pass.
+TERRAFORM_STUB = """#!/bin/sh
+dir=$(basename "$(pwd -P)")
+echo "$1 $dir" >> "%(calls)s"
+case "$1" in
+  fmt) exit %(fmt_status)d ;;
+  init)
+    if [ "$(grep -cxF "init $dir" "%(calls)s")" -le %(failures)d ]; then
+      echo "Error while installing hashicorp/google-beta v7.46.2: read: connection reset by peer" >&2
+      exit 1
+    fi
+    exit 0
+    ;;
+  validate) exit %(validate_status)d ;;
+esac
+echo "unexpected: terraform $*" >&2
+exit 2
+"""
+
 
 
 def _joined_commands(text):
@@ -371,6 +466,44 @@ def unretried_downloads(text):
         number
         for number, own_text, piped in network_fetches(text)
         if not piped and (not RETRY_COUNT.search(own_text) or RETRY_ALL_ERRORS not in own_text)
+    ]
+
+
+def curl_retry_seconds(own_text):
+    """Seconds of backoff curl waits through before it gives up, or None.
+
+    None when the retry count is missing or held in a variable. A zero
+    `--retry-delay` means curl's own backoff and a zero `--retry-max-time`
+    means no cap, as curl reads both.
+    """
+    count = RETRY_COUNT_VALUE.search(own_text)
+    if not count:
+        return None
+    retries = int(count.group(1))
+    delay = RETRY_DELAY_VALUE.search(own_text)
+    if delay and int(delay.group(1)):
+        total = retries * int(delay.group(1))
+    else:
+        # 1 + 2 + 4 + ...; curl stops doubling at ten minutes, which only a
+        # count far above any floor reaches.
+        total = 2**retries - 1
+    cap = RETRY_MAX_TIME_VALUE.search(own_text)
+    if cap and int(cap.group(1)):
+        total = min(total, int(cap.group(1)))
+    return total
+
+
+def short_github_release_retries(text):
+    """Line numbers of GitHub release downloads that retry for less than the floor.
+
+    Piped fetches are excluded, as unretried_downloads excludes them.
+    """
+    return [
+        number
+        for number, own_text, piped in network_fetches(text)
+        if not piped
+        and GITHUB_RELEASE_DOWNLOAD.search(own_text)
+        and (curl_retry_seconds(own_text) or 0) < GITHUB_RELEASE_RETRY_FLOOR_SECONDS
     ]
 
 
@@ -1074,6 +1207,141 @@ class ShippedDownloadsRetryTest(unittest.TestCase):
         )
 
 
+class GitHubReleaseRetryCheckerTest(unittest.TestCase):
+    """The floor check, against text the repository does not contain."""
+
+    def test_curl_backoff_doubles_from_one_second(self):
+        self.assertEqual(curl_retry_seconds("-fL --retry 5 --retry-all-errors"), 31)
+        self.assertEqual(curl_retry_seconds("-fL --retry 8 --retry-all-errors"), 255)
+
+    def test_a_fixed_delay_replaces_the_backoff(self):
+        self.assertEqual(curl_retry_seconds("--retry 6 --retry-delay 40"), 240)
+        self.assertEqual(curl_retry_seconds("--retry 8 --retry-delay 0"), 255)
+
+    def test_a_max_time_only_caps_the_wait(self):
+        self.assertEqual(curl_retry_seconds("--retry 8 --retry-max-time 30"), 30)
+        self.assertEqual(curl_retry_seconds("--retry 5 --retry-max-time 300"), 31)
+        self.assertEqual(curl_retry_seconds("--retry 8 --retry-max-time 0"), 255)
+
+    def test_a_count_it_cannot_read_has_no_wait(self):
+        self.assertIsNone(curl_retry_seconds('--retry "$RETRIES" --retry-all-errors'))
+        self.assertIsNone(curl_retry_seconds("--retry-all-errors"))
+
+    def test_it_flags_only_github_release_downloads_under_the_floor(self):
+        planted = "\n".join(
+            [
+                'RUN curl -fL --retry 5 --retry-all-errors -o /tmp/a "https://github.com/o/r/releases/download/v1/a"',
+                'RUN curl -fL --retry 8 --retry-all-errors -o /tmp/b "https://github.com/o/r/releases/download/v1/b"',
+                'RUN curl -fL --retry 8 --retry-max-time 60 --retry-all-errors -o /tmp/c "https://github.com/o/r/releases/download/v1/c"',
+                'RUN curl -fL --retry 5 --retry-all-errors -o /tmp/d "https://dl.k8s.io/release/v1/d"',
+                'RUN curl -fL --retry "$N" --retry-all-errors -o /tmp/e "https://github.com/o/r/releases/download/v1/e"',
+            ]
+        )
+        self.assertEqual(short_github_release_retries(planted), [1, 3, 5])
+
+
+class ShippedGitHubReleaseRetryTest(unittest.TestCase):
+    """Every GitHub release download in the image builds retries past the floor."""
+
+    def test_no_short_github_release_retries(self):
+        for source in IMAGE_BUILDS:
+            with self.subTest(source=source.name):
+                short = short_github_release_retries(source.read_text())
+                self.assertEqual(
+                    short,
+                    [],
+                    "%s downloads a GitHub release asset at line(s) %s with less than %d "
+                    "seconds of curl backoff, which one runner's run of 504s outlasted "
+                    "on 2026-11-05; `--retry 8` gives 255" % (source, short, GITHUB_RELEASE_RETRY_FLOOR_SECONDS),
+                )
+
+    def test_the_floor_reads_every_github_release_download(self):
+        """Every release URL is on a curl line the walk reads or in the tirith RUN.
+
+        A wget loop, an ADD or a piped curl anywhere else would pass both checks
+        unseen.
+        """
+        for source in IMAGE_BUILDS:
+            with self.subTest(source=source.name):
+                unread = []
+                for command, marks in _joined_commands(source.read_text()):
+                    tirith = command.startswith(DOCKERFILE_RUN) and TIRITH_DOWNLOAD in command
+                    curl = [own_text for _, own_text, piped in network_fetches(command) if not piped]
+                    read = int(tirith) + sum(len(GITHUB_RELEASE_DOWNLOAD.findall(own_text)) for own_text in curl)
+                    if len(GITHUB_RELEASE_DOWNLOAD.findall(command)) > read:
+                        unread.append(marks[0][1])
+                self.assertEqual(
+                    unread,
+                    [],
+                    "%s fetches a GitHub release asset in the instruction at line(s) %s in a way the "
+                    "floor cannot read, such as wget, ADD or a piped curl: fetch it to a file with curl, "
+                    "or run it against stubs as TirithDownloadRetryTest runs tirith" % (source, unread),
+                )
+
+    def test_the_walk_actually_reaches_the_github_release_downloads(self):
+        """A floor, so a walk that matches nothing cannot report success."""
+        found = [
+            own_text
+            for source in IMAGE_BUILDS
+            for _, own_text, _ in network_fetches(source.read_text())
+            if GITHUB_RELEASE_DOWNLOAD.search(own_text)
+        ]
+        self.assertGreaterEqual(
+            len(found),
+            4,
+            "expected at least the gh, yq, leeway and OpenTofu downloads; a walk "
+            "finding fewer is matching the wrong shape",
+        )
+
+
+class TirithDownloadRetryTest(unittest.TestCase):
+    """The tirith download, a wget loop the curl walk cannot read, waits as long.
+
+    The RUN's fetch is lifted out of AGENT_DOCKERFILE and run under sh with a
+    stub wget that fails every attempt and a stub sleep that records its delay
+    instead of waiting, the way NatsCliInstallRetryTest runs the nats CLI step.
+    A loop that fell through after its last attempt would exit 0 here.
+    """
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp(prefix="tirith-retry-")).resolve()
+        self.calls = self.tmp / "calls"
+        self.calls.write_text("")
+        self.sleeps = self.tmp / "sleeps"
+        self.sleeps.write_text("")
+        self.toolchain = self.tmp / "toolchain"
+        self.toolchain.mkdir()
+        _executable(self.toolchain / "wget", FAILING_FETCH_STUB % self.calls)
+        _executable(self.toolchain / "sleep", SLEEP_STUB % self.sleeps)
+        runs = [
+            command
+            for command, _ in _joined_commands(AGENT_DOCKERFILE.read_text())
+            if command.startswith(DOCKERFILE_RUN) and TIRITH_DOWNLOAD in command
+        ]
+        self.assertEqual(len(runs), 1, "expected exactly one RUN that downloads %s" % TIRITH_DOWNLOAD)
+        self.assertIn(TIRITH_CHECK_STEP, runs[0], "the tirith RUN no longer checks its download where this test cuts it")
+        self.script = runs[0][len(DOCKERFILE_RUN) : runs[0].index(TIRITH_CHECK_STEP)]
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_a_failing_download_waits_out_the_floor_before_it_fails(self):
+        env = dict(os.environ, PATH="%s%s%s" % (self.toolchain, os.pathsep, os.environ["PATH"]), **TIRITH_BUILD_ARGS)
+        result = subprocess.run(["sh", "-c", self.script], capture_output=True, text=True, env=env, timeout=MAKE_TIMEOUT_SECONDS)
+        delays = [int(line) for line in self.sleeps.read_text().split()]
+        self.assertNotEqual(result.returncode, 0, "a download that never succeeds must fail the RUN")
+        self.assertEqual(
+            len(self.calls.read_text().splitlines()),
+            len(delays) + 1,
+            "each wait should be followed by another attempt; stderr was:\n%s" % result.stderr,
+        )
+        self.assertGreaterEqual(
+            sum(delays),
+            GITHUB_RELEASE_RETRY_FLOOR_SECONDS,
+            "the tirith loop waits %ss in all (%s) before it gives up" % (sum(delays), delays),
+        )
+
+
 class GoInstallRetryTest(unittest.TestCase):
     """go-install-tool retries `go install`, the fetch #1603 left unretried (#3029).
 
@@ -1348,6 +1616,81 @@ class OperatorModuleDownloadRetryTest(unittest.TestCase):
                 self.assertEqual(self._calls(), 3, "it should stop at the first success")
                 self.assertEqual(self._delays(), [delay, delay * 2])
                 self.assertEqual(result.stdout.count("::warning::"), 2, "each retry should leave a warning, the record of a rescued attempt")
+
+
+class TerraformInitRetryTest(unittest.TestCase):
+    """validate.yml's Terraform step retries `terraform init` alone, on the Makefile's schedule (#5142).
+
+    No directory the step walks commits a lock file, so each `terraform init`
+    downloads its providers, and one connection reset during a download failed
+    the step on main. The step is a `run:` block, so its loop is run the way
+    NatsCliInstallRetryTest runs the nats CLI step: lifted out of the workflow
+    and executed under `bash -e` in a fixture tree, with a stub `terraform` and
+    a stub `sleep`. fmt and validate make no network call, so a failure in
+    either is a verdict, and each still runs once.
+    """
+
+    def setUp(self):
+        steps = [step for step in _steps(_load_workflow(TERRAFORM_WORKFLOW)) if step.get("name") == TERRAFORM_STEP]
+        self.assertEqual(len(steps), 1, "%s should have exactly one %r step" % (TERRAFORM_WORKFLOW, TERRAFORM_STEP))
+        self.tmp = pathlib.Path(tempfile.mkdtemp(prefix="terraform-init-retry-")).resolve()
+        self.calls = self.tmp / "calls"
+        self.sleeps = self.tmp / "sleeps"
+        self.toolchain = self.tmp / "toolchain"
+        self.toolchain.mkdir()
+        self.checkout = self.tmp / TERRAFORM_FIXTURE_ROOT
+        for directory in TERRAFORM_FIXTURE_DIRS:
+            (self.checkout / directory).mkdir(parents=True)
+        (self.checkout / TERRAFORM_FIXTURE_FILE).write_text("")
+        self.script = self.tmp / "step.sh"
+        self.script.write_text(steps[0]["run"])
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run(self, init_failures, fmt_status=0, validate_status=0):
+        self.calls.write_text("")
+        self.sleeps.write_text("")
+        _executable(
+            self.toolchain / "terraform",
+            TERRAFORM_STUB % {"calls": self.calls, "failures": init_failures, "fmt_status": fmt_status, "validate_status": validate_status},
+        )
+        _executable(self.toolchain / "sleep", SLEEP_STUB % self.sleeps)
+        env = dict(os.environ, PATH="%s%s%s" % (self.toolchain, os.pathsep, os.environ["PATH"]))
+        return subprocess.run(["bash", "-e", str(self.script)], cwd=self.checkout, capture_output=True, text=True, env=env, timeout=MAKE_TIMEOUT_SECONDS)
+
+    def _calls(self):
+        return self.calls.read_text().splitlines()
+
+    def _delays(self):
+        return [int(line) for line in self.sleeps.read_text().split()]
+
+    def test_a_failing_init_stops_at_the_makefile_ceiling_with_its_doubling_delay(self):
+        attempts, delay = _declared_retry_schedule()
+        result = self._run(NEVER_SUCCEEDS)
+        self.assertNotEqual(result.returncode, 0, "exhausting the attempts must fail the step")
+        self.assertEqual(self._calls(), ["fmt checkout"] + ["init alpha"] * attempts, result.stdout + result.stderr)
+        self.assertEqual(self._delays(), [delay * 2**i for i in range(attempts - 1)], "the step's delays should follow the Makefile's")
+        self.assertIn("::error::", result.stdout)
+
+    def test_each_directory_starts_its_schedule_afresh_and_stops_at_its_first_success(self):
+        _, delay = _declared_retry_schedule()
+        result = self._run(2)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            self._calls(),
+            ["fmt checkout"] + ["init alpha"] * 3 + ["validate alpha"] + ["init beta"] * 3 + ["validate beta"],
+        )
+        self.assertEqual(self._delays(), [delay, delay * 2] * 2)
+        self.assertEqual(result.stdout.count("::warning::"), 4, "each retry should leave a warning, the record of a rescued attempt")
+
+    def test_a_failing_fmt_or_validate_fails_the_step_without_a_retry(self):
+        for verb, calls in (("fmt", ["fmt checkout"]), ("validate", ["fmt checkout", "init alpha", "validate alpha"])):
+            with self.subTest(verb=verb):
+                result = self._run(0, **{"%s_status" % verb: 1})
+                self.assertNotEqual(result.returncode, 0, "a failed %s must fail the step" % verb)
+                self.assertEqual(self._calls(), calls, "%s makes no network call, so it runs once" % verb)
+                self.assertEqual(self._delays(), [])
 
 
 if __name__ == "__main__":

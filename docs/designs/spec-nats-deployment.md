@@ -342,7 +342,8 @@ there is an offline target the day a password is hand-set. That binds every rend
 this stack, not one function - the rollout hash on the NATS pod template is over the
 config rendered with placeholders in the passwords' place plus the credentials Secret's
 `resourceVersion`, which is what lets a config change and a rotation both roll the bus
-without a credential reaching the digest.
+without a credential reaching the digest. The gateway's per-profile deny is left out of
+that hash, since a reload applies it (below).
 
 Layout:
 
@@ -366,6 +367,11 @@ Layout:
   and the read-only principals. The static user blocks are rendered per account, still from
   `platformagent_a2a_identities.go`, so where this document says the config's APP and `$SYS`
   static user blocks, read the `TRUSTED`, `CONSOLE`, `APP` and `$SYS` blocks.
+  Amended 11/9 (#4173): `TRUSTED` exports consumer create to `APP` and `CONSOLE` per stream,
+  naming only the streams a principal in those accounts may create consumers on
+  (`DIRECTORY`, `KV_runtime-state`, `TASKS`, `TOPICS-JOURNAL`, `TOPICS-STATE`), instead of
+  `$JS.API.CONSUMER.CREATE.>`. The list is derived from the identities' grants, so a new
+  grant brings its stream into the export with it.
 - **One user per agent identity** inside the account. Permissions are exact subject lists,
   deny by default: publish only to the subjects its role emits on, subscribe only to its own
   addressee prefix on the task subjects (`a2a.tasks.<its name>.>`) plus the shared topics it
@@ -404,8 +410,10 @@ Layout:
   invites squaring the render against prose. Two consequences of the split the render does
   not show on its face. First, the supervisor grant is a wildcard over the ADDRESSEE
   (`a2a.tasks.*.*.supervisor`), not a scope to the sessions the gateway spawned, which a
-  static render cannot express - so it reaches every profile's supervisor subject too, and
-  a profile task's `…supervisor` must not be modelled as unreachable. Second, the class
+  static render cannot express. The render subtracts each bound or draining profile by name
+  (`a2a.tasks.<profile>.*.supervisor` on the gateway's publish deny), so the gateway cannot
+  publish directly to a profile's supervisor subject. The deny covers direct publishes
+  only, so a profile task's `…supervisor` must still not be modelled as unreachable. Second, the class
   that is not yet single-writer is `…events`, and the holder is the static `worker`
   credential the Hermes bridge authenticates with: its `a2a.tasks.*.*.events` wildcards the
   addressee token, so it reaches session and profile subjects alike until that credential
@@ -413,7 +421,10 @@ Layout:
   callout and reaches only its own pod's `…events`. `spec-a2a-payloads.md` states the
   consumer rule that rests on all of this and enumerates what is not yet decision-grade -
   including a redirection route onto `…supervisor` that no assertion pins. Read that
-  section before treating any class as closed.
+  section before treating any class as closed. A profile task's submission has a subject of its own,
+  `a2a.submit.<profile>.<tier>.<kind>.<task>` on the `PROFILE_SUBMITS` stream, and the gateway is its one writer: the
+  dispatcher reads it through its durables, and no executor's grant reaches it
+  (`test_A3_the_submit_subject_has_exactly_one_writer`).
 - **The JetStream tax.** Deny-by-default reaches JetStream's own plumbing, and three
   grants are part of being a JetStream client at all: the `$JS.API` subjects a role's
   streams and buckets need, enumerated per stream and per verb where the caller set is
@@ -534,7 +545,11 @@ Layout:
   reaches the gateway's relay durable from `bridge` too, measured on the render: one
   permitted `$JS.API.CONSUMER.CREATE.TASKS.gateway-relay` retunes its filter subject, and
   one carrying `inactive_threshold` has the server reap it, ack floor and all, with
-  `CONSUMER.DELETE` refused in the same run; and a consumer's
+  `CONSUMER.DELETE` refused in the same run (amended 11/9, #4173: no longer for the relay or
+  the bridge's intake. The provision Job pre-creates both on `TASKS`, create-only, their
+  readers bind them and never create, and every principal that may create consumers on
+  `TASKS` is denied create, update and delete on those two names. The route still reaches
+  every other consumer on the four streams); and a consumer's
   deliver subject can aim replay of stored messages at another stream's subject, which is
   a persisted write under the messages' original subjects - not forgery, since a read by
   subject never sees them, but an eviction lever against the capturing stream. Delivery
@@ -555,7 +570,9 @@ Layout:
   tokens, so a `web-*` grant matches a consumer literally named `web-*` and nothing else -
   measured, not assumed. The session principal is the case where it does work, and why:
   its consumer names are derived from the pod the API server attested rather than chosen
-  by the client, so the grant can name them exactly instead of by prefix. The real close is a
+  by the client, so the grant can name them exactly instead of by prefix. The two
+  pre-created `TASKS` durables are the other case: their names are fixed, so a deny can name
+  them exactly too. The real close is a
   separate account with an export/import, which stays open.
 
   **The probe subject.** `a2a.topics.shared.probe` is provisioned into `TOPICS-STATE`
@@ -586,7 +603,8 @@ Layout:
   `app.kubernetes.io/component: profiles` label, admitted only once that namespace's own
   fence (DNS, the bus and LiteLLM out, nothing in) is in place), and ~~**no pod-network peer for 8222 or 9222**~~ **no
   pod-network peer for 8222, and one for 9222: the console server (amended 9/24,
-  below)**. The demo's
+  below)**; **amended 11/09:** 8222 admits the operator's pod, the same peer as 4222, which
+  reads `config_load_time` there to confirm a config reload (below). The demo's
   `kubectl port-forward` and the kubelet's readiness probe both enter from the node,
   which NetworkPolicy does not govern, so the ws surface stays reachable through
   kubectl and, in-cluster, through the console server alone. The enumeration is today's client
@@ -924,7 +942,7 @@ on a new config, every client reconnects, and whichever callout replica answers 
 places it by the map that replica holds. A connection placed by the previous map stays in
 that map's account until it next reconnects. So a running bus moves to a new config only
 once the callout's current spec is observed and no pod of an older ReplicaSet can still answer
-(`a2aBusWaitsForCallout`). Readiness does not hold it: a current replica that is not ready places
+(`a2aBusWaitsForCallout`). Readiness alone does not hold it: a current replica that is not ready places
 nobody, and a callout cannot be ready while the bus it connects to is down. The config Secret waits with the StatefulSet, and the callout is
 reconciled ahead of both. A fresh install is not held, since there is no running bus. The
 wait is bounded. A rollout the Deployment controller has given up on (its progress deadline,
@@ -933,6 +951,11 @@ key change. The release records a Warning event, and the `A2ACalloutRolloutStall
 stays on the PlatformAgent while the rollout is past its deadline. A stall counts only once the
 Deployment controller has observed the current spec. Only pods an older ReplicaSet of the callout controls are counted, and a
 terminating one only until its deletion deadline.
+A bus that is down does not wait either: when its pod has not been Ready for two minutes and no
+callout replica is Ready, the bus admits no new connection and the hold can only end at the
+progress deadline, since a callout replica is not Ready without the bus. The release records an
+`A2ABusHoldSkipped` Warning event. Once the bus is back, a pod of an older ReplicaSet can answer a
+reconnect until the callout's rollout finishes, the same window the stall release opens.
 While the bus waits, a reconnect is placed by the current map, which can name an account the
 running config does not have yet. That connection is refused until the bus moves, which
 fails closed.
@@ -1068,7 +1091,25 @@ Every connection to the client listener on 4222 is TLS. nats.conf carries a top-
 clear; a client that dials `nats://` is told to upgrade, and one that cannot verify the
 certificate is refused. Every client the operator renders is handed `tls://` on the NATS
 Service name and trusts the bus CA. The monitoring port, 8222, stays plain HTTP: it carries
-health and stats, not payloads or tokens. The websocket listener on 9222, the console's
+health and stats, not payloads or tokens. The operator reads it for one thing, `config_load_time` in
+`/varz`.
+
+**Reloading permissions without a restart.** The bus pod runs nats-io's
+`nats-server-config-reloader` beside nats-server, in one PID namespace. When the kubelet
+writes a new `nats.conf` into the pod, the reloader sends nats-server the reload signal,
+and the server applies the new users and permissions to the connections it already holds.
+It also runs the auth callout again for each connection the callout authenticated; on
+2.10.29 those connections dropped at the reload and reconnected within a second.
+The pod template's config hash leaves out the per-profile gateway deny, so an AgentProfile
+added, removed or done draining changes the config Secret and not the template: the bus is
+reloaded, not rolled. Every other config change still rolls it. The operator records the
+reload it asked for on the Secret, with the `config_load_time` it read just before writing,
+and confirms the reload when that value moves. If it hasn't moved within three minutes, or
+can't be read, the operator deletes the bus pod so it restarts onto the new config, and
+writes a `BusConfigReloadFailed` Warning. The kubelet takes up to about a minute to write
+an updated Secret into a running pod, so a newly added profile's deny lands that long after
+the profile does. On the roll path it landed when the new pod came up, tens of seconds
+later, with the bus down for the roll. The websocket listener on 9222, the console's
 door, serves the same certificate from the same files (below).
 
 **Certificate source.** The operator mints the certificates itself, with no dependency on

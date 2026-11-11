@@ -139,6 +139,11 @@ type ConsoleInFrame struct {
 	MessageID string `json:"messageId"`
 	Text      string `json:"text"`
 	Kind      string `json:"kind,omitempty"`
+	// Addressee, when set, names the AgentProfile the turn is for, and
+	// Parameters are its task parameters (InboundMessage.Profile). Absent,
+	// the turn goes to the conversation's route, as every page turn does.
+	Addressee  string            `json:"addressee,omitempty"`
+	Parameters map[string]string `json:"parameters,omitempty"`
 }
 
 // ConsoleOutFrame is what the gateway publishes back. Edit true means
@@ -484,9 +489,17 @@ func (a *ConsoleAdapter) inbound(m *nats.Msg) (InboundMessage, string, bool) {
 	// one: the console runs beside whichever chat backend the process was
 	// configured for, so a frame that said nothing would be attributed to
 	// that backend and verified against its mapping table (Gateway.backendFor).
+	// The addressee is sender-chosen and becomes a subject token, so it is
+	// held to a profile name's shape here; the parameters are checked where
+	// the turn is routed (resolveProfile), which says why in the room.
+	if f.Addressee != "" && !lib.ValidSubjectToken(f.Addressee) {
+		a.log.Warn("console frame dropped", "reason", "addressee", "addressee", truncateRunes(f.Addressee, consoleMessageIDCap), "conversation", conversation, "messageId", f.MessageID)
+		return InboundMessage{}, "", false
+	}
 	msg := InboundMessage{
 		Conversation: conversation, Kind: "dm", Backend: consoleBackend,
 		AuthorID: consoleAuthor, MessageID: f.MessageID,
+		Profile: f.Addressee, Parameters: f.Parameters,
 	}
 	if len(text) > consoleTextCap {
 		a.log.Warn("console frame dropped", "reason", "oversize", "conversation", conversation, "messageId", f.MessageID, "bytes", len(text))

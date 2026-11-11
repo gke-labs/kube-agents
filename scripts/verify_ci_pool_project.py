@@ -214,13 +214,12 @@ GCP_CHECKS = frozenset(CHECK_IDS) - {CHECK_CODEBASE_MAPPING, CHECK_GITOPS_DEFAUL
 # gitops_workload_manifest, the ledger App's key for ledger_read_credential), not the minter's signing half
 # (token_minter; the scan runs token_minter_kms), not the mapping (that is
 # about the checkout, not the project), and not the warm-cache check, whose
-# read is in another project the bot holds nothing on. Not the Gemini key
-# check yet: the registered projects get the key after it lands, and until
-# then it would report drift on every one. The GitOps default-branch read is
-# in: one metadata call the job makes with whatever GitHub credential it
+# read is in another project the bot holds nothing on. The Gemini key check
+# is in: securityReviewer carries its reads (GCLOUD_SURFACE_READ_ROLES). The
+# GitOps default-branch read is in: one metadata call the job makes with whatever GitHub credential it
 # carries (GITOPS_READ_TOKEN_ENV), and records as not checked when it carries
 # none.
-POOL_STATE_CHECKS = (CHECK_PROJECT_AND_APIS, CHECK_IAM, CHECK_ARTIFACT_REGISTRY, CHECK_GKE_AND_STATE, CHECK_FORGE_PIECES, CHECK_GITOPS_DEFAULT_BRANCH, CHECK_TOKEN_MINTER_KMS)
+POOL_STATE_CHECKS = (CHECK_PROJECT_AND_APIS, CHECK_IAM, CHECK_ARTIFACT_REGISTRY, CHECK_GKE_AND_STATE, CHECK_FORGE_PIECES, CHECK_GITOPS_DEFAULT_BRANCH, CHECK_GEMINI_KEY, CHECK_TOKEN_MINTER_KMS)
 # --report's document (docs/ci-health.md, "The pool-state scan").
 REPORT_SCHEMA_VERSION = 1
 REPORT_STATUS_PASS = "pass"
@@ -356,6 +355,11 @@ REQUIRED_APIS = {
     "gkehub.googleapis.com",
     "iam.googleapis.com",
     "cloudkms.googleapis.com",
+    # The eval nightlies' Gemini Developer API key (check_gemini_api_key): the
+    # key, the secret that holds its string, and the API the key calls.
+    "apikeys.googleapis.com",
+    "secretmanager.googleapis.com",
+    "generativelanguage.googleapis.com",
 }
 
 HOST_CLUSTER = "platform-agent-host"
@@ -498,12 +502,21 @@ GEMINI_KEY_CLIENT_RESTRICTIONS = (
     "androidKeyRestrictions",
     "iosKeyRestrictions",
 )
-# The key script enables the API Keys and Secret Manager APIs, and nothing else
-# in the pool does, so on a project it never ran against both reads answer
+# REQUIRED_APIS holds the API Keys and Secret Manager APIs, and the key script
+# enables them, but on a project neither ran against both reads answer
 # PERMISSION_DENIED with reason SERVICE_DISABLED. The general classifier keeps
-# that a refusal; check_gemini_api_key alone reads it as the key absent.
+# that a refusal; check_gemini_api_key alone reads it as the key absent, and
+# only when the refusal names the target project (GEMINI_KEY_DISABLED_IN).
 GEMINI_KEY_SERVICE_DISABLED = re.compile(
     r"\bSERVICE_DISABLED\b|API has not been used in project \S+ before or it is disabled"
+)
+# The project a SERVICE_DISABLED refusal names, by number or id: gcloud's
+# message line and the ErrorInfo's consumer. A refusal that names another
+# project (the caller's quota project, such as kube-agents-prow before its
+# API Keys API was enabled on 2026-11-06) or none says nothing about the
+# target, so it stays unread.
+GEMINI_KEY_DISABLED_IN = re.compile(
+    r"API has not been used in project ([a-z0-9-]+) before or it is disabled|consumer: projects/([a-z0-9-]+)"
 )
 FINDING_GEMINI_KEY_MISSING = "apikeys/gemini/missing"
 FINDING_GEMINI_KEY_RESTRICTION = "apikeys/gemini/restriction"
@@ -527,14 +540,14 @@ GITOPS_SEED_CONTENT = "# GitOps Infrastructure Repo"
 # declared-intent cases (GITOPS_INTENT_NOTE_CASES) fail on a project whose
 # repository lacks it.
 GITOPS_INTENT_NOTE_PATH = "knowledge/notification-relay-no-pdb.md"
-GITOPS_INTENT_NOTE_MESSAGE = "Declare seeded-intent's missing PodDisruptionBudget and NetworkPolicy, token-reader's mounted token, seeded-c's missing upgrade notifications, and burst-ingest's headroom, as intended"
+GITOPS_INTENT_NOTE_MESSAGE = "Declare seeded-intent's missing PodDisruptionBudget and NetworkPolicy, token-reader's mounted token, seeded-c's missing upgrade notifications, burst-ingest's headroom, and declared-zonal-pool's single zone, as intended"
 # The script's GITOPS_INTENT_NOTE_CONTENT, byte for byte, so the repair this
 # verifier prints is the note provisioning seeds; a test pins the two copies
 # to each other. The body read back is judged by the audit's parser, not
 # compared to this text.
 GITOPS_INTENT_NOTE_CONTENT = """---
 type: decision
-title: seeded-intent, seeded-token, seeded-c and seeded-headroom carry five postures on purpose
+title: seeded-intent, seeded-token, seeded-c, seeded-headroom and the declared-zonal-pool of seeded-a carry six postures on purpose
 declares:
   - check: no-pdb
     namespace: seeded-intent
@@ -551,6 +564,9 @@ declares:
   - check: overrequest
     namespace: seeded-headroom
     object: Deployment/burst-ingest
+  - check: single-zone-nodepool
+    namespace: ""
+    object: NodePool/declared-zonal-pool
 ---
 
 `notification-relay` in `seeded-intent` runs two replicas with no PodDisruptionBudget by design:
@@ -560,9 +576,10 @@ in `seeded-token` runs on the default ServiceAccount of its namespace with the t
 design: it reads the API server with that identity. Its neighbour `token-sidecar` is not declared.
 `seeded-c` publishes no GKE upgrade notifications by design: this fleet learns about upgrades from
 the weekly audit. `burst-ingest` in `seeded-headroom` requests far more memory than it uses by
-design: it is sized for an ingest burst the measured week does not show. The obtainability,
-compliance, upgrade readiness and waste audits list the five postures under Declared intent rather
-than as findings."""
+design: it is sized for an ingest burst the measured week does not show. `declared-zonal-pool` on
+`seeded-a` is an autoscaling pool kept in one zone by design: the cluster is single-zone, and the
+pool stays empty until a zonal batch needs it. The obtainability, compliance, upgrade readiness,
+waste and capacity audits list the six postures under Declared intent rather than as findings."""
 # The declarations the audits' parser (audit_report.py parse_declarations) must
 # find in the note's `declares` list, each with the stream whose `declarable`
 # set is the policy for it. A file that has the path but not these declares
@@ -578,6 +595,7 @@ GITOPS_INTENT_NOTE_CASES = (
     "compliance-declared-token-shields-siblings",
     "patch-declared-intent-no-finding",
     "cost-declared-intent-no-finding",
+    "stockout-declared-intent-no-finding",
 )
 GITOPS_INTENT_NOTE_DECLARATIONS = (
     ("obtainability-audit", {"check": "no-pdb", "namespace": "seeded-intent", "object": "Deployment/notification-relay"}),
@@ -585,6 +603,7 @@ GITOPS_INTENT_NOTE_DECLARATIONS = (
     ("compliance-audit", {"check": "default-sa-automount", "namespace": "seeded-token", "object": "Deployment/token-reader"}),
     ("security-patch-orchestrator", {"check": "no-notifications", "namespace": "", "object": "Cluster/seeded-c"}),
     ("fleet-wide-cost-analysis", {"check": "overrequest", "namespace": "seeded-headroom", "object": "Deployment/burst-ingest"}),
+    ("stockout-prevention", {"check": "single-zone-nodepool", "namespace": "", "object": "NodePool/declared-zonal-pool"}),
 )
 # checkout-gateway's declaration, which provisioning seeds beside the note
 # (GITOPS_WORKLOAD_MANIFEST_* in scripts/provision_ci_pool_project.sh). The
@@ -801,15 +820,18 @@ NIGHTLY_RUNNER_MEMBER = "serviceAccount:eval-baseline-recorder@kube-agents-prow.
 # The two runners read the eval nightlies' Gemini key secret, so each holds
 # GEMINI_KEY_ACCESSOR_ROLE on it.
 GEMINI_KEY_SECRET_ACCESSORS = (PROW_RUNNER_MEMBER, NIGHTLY_RUNNER_MEMBER)
-# Lease-silent while the registered projects are repaired: the key script runs
-# against each of them after this check lands, so until then every project
-# carries these findings and the pool-drift advice would blame the pool. A
-# later change makes them blocking, tracked in #4850.
+# Every finding check_gemini_api_key emits. None is lease-silent: the health
+# bot classes a run that leased a project with one as the pool's. The runs that
+# export MODEL_PROVIDER=gemini read the key: the five eval nightlies, the RC
+# postsubmit and the two Argon smoke presubmits (pull-kube-agents-smoke-test
+# and -today). pull-kube-agents-smoke-test-claude, -flash and the forge smoke variants
+# stay on Vertex AI and do not read it. A missing secret or accessor grant
+# stops hack/ci-deploy.sh at its FATAL line before Helm; a restriction finding,
+# or a key deleted while its secret remains, fails at the first agent call.
 GEMINI_KEY_FINDINGS = frozenset(
     {FINDING_GEMINI_KEY_MISSING, FINDING_GEMINI_KEY_RESTRICTION, FINDING_GEMINI_KEY_SECRET_MISSING}
     | {FINDING_GEMINI_KEY_SECRET_ACCESSOR_PREFIX + member for member in GEMINI_KEY_SECRET_ACCESSORS}
 )
-LEASE_SILENT_FINDINGS = LEASE_SILENT_FINDINGS | GEMINI_KEY_FINDINGS
 
 # The pull-request sweep (hack/ci_sweep_agent_pulls.py, the periodic
 # ci-kube-agents-pull-sweep on main) signs the agent's App through each
@@ -923,7 +945,7 @@ POOL_STATE_READER_ROLES = {
 # securityReviewer lacks and clusterViewer carries. The `kms` surface also
 # covers the KMS sign in check_ledger_read_credential, which the scan does not run.
 # securityReviewer also carries the three reads check_gemini_api_key makes
-# beside the service listing (apikeys.keys.list, secretmanager.versions.list,
+# (apikeys.keys.list, secretmanager.versions.list,
 # secretmanager.secrets.getIamPolicy). roles/serviceusage.apiKeysViewer is not
 # used: it carries apikeys.keys.getKeyString, which reads the key string.
 GCLOUD_SURFACE_READ_ROLES = {
@@ -1747,7 +1769,8 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
     # "vertex_ai" (provision_ci_pool_project.sh writes it into the tfvars).
     # hack/ci-deploy.sh's per-lease helm upgrade annotates the
     # kubeagents-litellm KSA with this GSA, so a project missing the pair
-    # reds every presubmit it leases at the deploy's model-call gate (#1097).
+    # reds every run on Vertex AI that leases it (the Claude and Flash smoke
+    # jobs and the forge smoke variants) at the deploy's model-call gate (#1097).
     litellm_gsa_email = f"kubeagents-litellm-gsa@{project_id}.iam.gserviceaccount.com"
     rc, out, err = run_cmd([
         "gcloud", "iam", "service-accounts", "get-iam-policy",
@@ -4230,10 +4253,11 @@ def check_ledger_read_credential(project_id: str, timeout: int = 15) -> CheckRes
 def check_gemini_api_key(project_id: str) -> CheckResult:
     """The eval nightlies' Gemini Developer API key in this project: one key
     named GEMINI_KEY_DISPLAY_NAME restricted to GEMINI_KEY_API_TARGET alone with
-    no client restriction, that API enabled, an enabled latest version of
+    no client restriction, an enabled latest version of
     GEMINI_KEY_SECRET_NAME, and the runners' accessor
     grant on that secret. Metadata and IAM only: no read here returns the key
-    string or the secret's value.
+    string or the secret's value. Whether GEMINI_KEY_API_TARGET is enabled is
+    CHECK_PROJECT_AND_APIS's read (REQUIRED_APIS), not repeated here.
     """
     name = CHECK_DISPLAY_NAMES[CHECK_GEMINI_KEY]
     details: List[str] = []
@@ -4242,14 +4266,49 @@ def check_gemini_api_key(project_id: str) -> CheckResult:
     passed = True
     read_any = False
     repair = f"{GEMINI_KEY_SCRIPT} {project_id}"
+    # The target's number and why it is unknown, read once, and only when a
+    # SERVICE_DISABLED refusal names a project other than project_id.
+    number: Optional[Tuple[Optional[str], str]] = None
+
+    def target_number() -> Tuple[Optional[str], str]:
+        """(project number, why it is unknown)."""
+        nonlocal number
+        if number is None:
+            rc, out, err = run_cmd(["gcloud", "projects", "describe", project_id, "--format=value(projectNumber)"])
+            value = out.strip() if rc == 0 else ""
+            why = "" if value else (_unread_reason(err) or (err or "").strip()[:GEMINI_KEY_ERR_EXCERPT] or NO_OUTPUT_REASON)
+            number = (value or None, why)
+        return number
+
+    def disabled_in_target(err: str) -> Tuple[bool, str]:
+        """(the SERVICE_DISABLED refusal names the target alone, why not)."""
+        named = {m for pair in GEMINI_KEY_DISABLED_IN.findall(err) for m in pair if m}
+        if not named:
+            return False, "the refusal names no project"
+        others = named - {project_id}
+        if not others:
+            return True, ""
+        value, why = target_number()
+        if value is None:
+            return False, f"the refusal names project {', '.join(sorted(others))} and {project_id}'s number could not be read ({why})"
+        others -= {value}
+        if others:
+            return False, f"the refusal names project {', '.join(sorted(others))}, not {project_id} ({value})"
+        return True, ""
 
     def read(cmd: List[str], what: str) -> Tuple[Optional[object], bool]:
         """(parsed JSON, read): None with read True when the resource is absent
-        (its API disabled included); read False when the command could not tell."""
+        (its API disabled in project_id included); read False when the command
+        could not tell, a SERVICE_DISABLED that names another project or none
+        included."""
         nonlocal read_any
         rc, out, err = run_cmd(cmd)
         if rc != 0:
             if GEMINI_KEY_SERVICE_DISABLED.search(err or ""):
+                in_target, why = disabled_in_target(err)
+                if not in_target:
+                    warnings.append(Unread(f"Could not read {what} in {project_id}: SERVICE_DISABLED, but {why}"))
+                    return None, False
                 read_any = True
                 details.append(f"{what} absent: its API is disabled in {project_id}")
                 return None, True
@@ -4276,11 +4335,10 @@ def check_gemini_api_key(project_id: str) -> CheckResult:
         ["gcloud", "services", "api-keys", "list", f"--project={project_id}", "--format=json"],
         f"the API key {GEMINI_KEY_DISPLAY_NAME}",
     )
-    missing: List[str] = []
     if keys_checked:
         keys = [key for key in (keys or []) if key.get("displayName") == GEMINI_KEY_DISPLAY_NAME]
         if not keys:
-            missing.append(f"No API key named {GEMINI_KEY_DISPLAY_NAME} in {project_id}; the eval nightly has no Gemini Developer API key here")
+            drift(FINDING_GEMINI_KEY_MISSING, f"No API key named {GEMINI_KEY_DISPLAY_NAME} in {project_id}; the eval nightly has no Gemini Developer API key here")
         if len(keys) > 1:
             warnings.append(
                 f"{len(keys)} API keys are named {GEMINI_KEY_DISPLAY_NAME} in {project_id}: "
@@ -4310,25 +4368,6 @@ def check_gemini_api_key(project_id: str) -> CheckResult:
                 )
             else:
                 details.append(f"✓ API key {key_name} restricted to {GEMINI_KEY_API_TARGET}")
-
-    # The key script enables the Generative Language API with the other two;
-    # a key on a project without it answers every call SERVICE_DISABLED.
-    rc, out, err = run_cmd(
-        ["gcloud", "services", "list", "--enabled", f"--project={project_id}", f"--filter=config.name={GEMINI_KEY_API_TARGET}", "--format=value(config.name)"]
-    )
-    api_checked = rc == 0
-    if not api_checked:
-        # A failed listing says nothing about the API, refused or not.
-        reason = _unread_reason(err) or (err or "").strip()[:GEMINI_KEY_ERR_EXCERPT]
-        warnings.append(Unread(f"Could not read whether {GEMINI_KEY_API_TARGET} is enabled in {project_id}: {reason}"))
-    else:
-        read_any = True
-        if GEMINI_KEY_API_TARGET in out.split():
-            details.append(f"✓ {GEMINI_KEY_API_TARGET} is enabled")
-        else:
-            missing.append(f"{GEMINI_KEY_API_TARGET} is not enabled in {project_id}, so the Gemini key there serves no call")
-    if missing:
-        drift(FINDING_GEMINI_KEY_MISSING, "; ".join(missing))
 
     secret = GEMINI_KEY_SECRET_NAME
     versions, versions_checked = read(
@@ -4386,7 +4425,6 @@ def check_gemini_api_key(project_id: str) -> CheckResult:
     partial = _partial_summary(
         [
             ("the API key", keys_checked),
-            (f"the {GEMINI_KEY_API_TARGET} API", api_checked),
             ("the secret's latest version", versions_checked),
             ("the secret's accessors", grants_checked),
         ]

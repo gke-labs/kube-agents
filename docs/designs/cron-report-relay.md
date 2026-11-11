@@ -201,9 +201,9 @@ only when its text is the report being relayed, with the flag on and a channel k
 leg routed through the gateway), on Slack and, under `spec.mode: next`, on Google Chat.
 `_post_board_health_card` posts it as Block Kit through the relay (`blocks_from_card`), or
 under `spec.mode: next` as a chat message whose rows carry `tasks` and `actions`
-(`chat_from_card`), with Retry and Drop under each row on Slack; the Google Chat renderer
-draws no row actions yet, so there the rows post with their card ids carried and no buttons.
-Its outcomes, and the report going out as text where the card does not post, are the audit
+(`chat_from_card`), with Retry and Drop under each row on Slack and, on Google Chat, under
+the message and labelled by the row's number (`a2a/gateway/slack_board.go`,
+`a2a/gateway/gchat_board.go`). Its outcomes, and the report going out as text where the card does not post, are the audit
 card's. A tap on either is no turn:
 it unblocks or archives the row's cards through session-kv's `POST /v1/board/actions` and
 edits the row
@@ -310,7 +310,9 @@ place of the final message. A read of the file
 that fails, rather than finding none, posts a second notice naming the failure,
 and leaves the run unposted. `[SILENT]` is unchanged: the scheduler drops a
 silent run before delivery. Only the scheduler's delivery leg is replaced: the relay plugin sends
-`also_delivered_to` on every delivery and `report_to_chat` never does, so a
+`also_delivered_to` on every delivery, as does onboarding's lost-summaries stage
+(`bootstrap_delivery.resend_lost_summaries`) when it re-posts a first-run audit
+that found no home channel, and `report_to_chat` never does, so a
 mid-run `report_to_chat` is posted as written.
 
 The scheduler's failure line names a CLI and a config file nobody in the
@@ -753,7 +755,8 @@ standalone sender: the relayed stand-in, when `GOOGLE_CHAT_RELAY_URL` is set,
 drops a dressed marker with the Slack sender's predicate, and upstream's, on an
 install without the relay, carries no such guard; no roster job uses `"all"`.
 
-The fleet-audit prompts carry one sentence that tells the worker to pass `--scheduled` to `finish`.
+The fleet-audit prompts carry one sentence that tells the worker to pass `--scheduled` to `finish`
+(and, where the SOP runs the gate, to `precheck`).
 That sentence controls silence, not delivery: a prompt without it only makes the job noisier
 ([ledger design §7.5](fleet-audit-issue-ledger.md#75-silent_ok-and-who-is-listening)).
 

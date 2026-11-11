@@ -78,6 +78,48 @@ Slack back to the credential broker, and the Slack app back to its `today` setti
 that section gives, instead of leaving you to find the app without its slash commands after the
 rollback.
 
+### A bus left down by a rollback under `next`
+
+Since the release that separates the bus's accounts, the bus keeps its stored streams under a
+`TRUSTED` account that earlier releases do not configure, and `upgrade.sh` refuses a direct rollback
+past that change unless it is given `--allow-breaking-downgrade`. If one ran under `next` anyway, the bus pod `<name>-a2a-nats-0` stays
+not Ready with `JetStream account 'TRUSTED' could not be resolved` in its log, and the auth callouts,
+the A2A gateway and the agent's bridge fail behind it.
+
+Upgrade forward to the release you came from. The operator then replaces the stuck pod: once the
+StatefulSet carries the forward template, it deletes a bus pod that has not been Ready for two
+minutes on an earlier revision, and records an `A2ABusPodReplaced` event on the `PlatformAgent`. The
+forward upgrade usually rolls the auth callouts too, and they cannot become Ready without the bus.
+The operator does not make a bus that has not been Ready for two minutes wait for callouts that
+cannot become Ready: it moves the bus to the forward template at once and records an
+`A2ABusHoldSkipped` event.
+The bus is back within about two minutes of the forward upgrade, and the callouts follow it.
+
+A forward run in harness or full mode waits for the agent, and completes once the bus is back.
+To see the replacement:
+
+```bash
+kubectl get events -n kubeagents-system --field-selector reason=A2ABusPodReplaced
+```
+
+An operator that predates this repair does not replace the pod. If the pod is still not Ready about
+fifteen minutes after the forward upgrade was applied, run the checks below. Delete the pod once its
+`controller-revision-hash` label differs from the StatefulSet's `status.updateRevision` (the default
+agent name is `platform-agent`); a pod deleted before then comes back on the earlier template. The
+delete is the same one the operator makes, so it is safe with either operator:
+
+```bash
+kubectl get statefulset platform-agent-a2a-nats -n kubeagents-system \
+  -o jsonpath='{.status.updateRevision}{"\n"}'
+kubectl get pod platform-agent-a2a-nats-0 -n kubeagents-system \
+  -o jsonpath='{.metadata.labels.controller-revision-hash}{"\n"}'
+kubectl delete pod platform-agent-a2a-nats-0 -n kubeagents-system
+```
+
+Then roll back as this page says: switch to `today` first, and move the bus's store back as the
+bus-accounts entry under [Upgrade → Breaking changes](/kube-agents/install/upgrade/#breaking-changes-in-recent-releases)
+says before you return to `next`.
+
 ## The rollback
 
 From the `N-1` checkout, a dry run, then operator and harness back to back:
@@ -220,9 +262,16 @@ harness step rather than staying and failing on use
 ([Skills](/kube-agents/concepts/skills/#importing-external-skills) says the same of an injected
 skill).
 
-The platform profile's persona files, governance and hindsight configuration are overwritten with
-`N-1`'s copies too, though a governance file only `N` shipped stays, because that overlay prunes
-nothing. The default profile's persona files and the shared scripts are overwritten the same way.
+The platform profile's persona files, governance, hindsight configuration and plugin directories
+are overwritten with `N-1`'s copies too, though a governance file only `N` shipped stays, because
+that overlay prunes nothing. The default profile's persona files and the shared scripts are
+overwritten the same way.
+Its plugin directories depend on `N-1`. A release after `0.27.0` cut from `main` overwrites every
+plugin directory the image ships, except `hermes_otel`, which follows the `cp -ru` rule below. A
+plugin or module only `N` shipped stays, and a plugin's own state files survive, because that copy
+prunes nothing. Releases `0.21.0` to `0.27.0` overwrite `bootstrap_onboarding` only, and `0.20.0`
+and earlier overwrite none, so with those every other default-profile plugin directory follows the
+`cp -ru` rule.
 
 Cron definitions are merged per job id: `N-1`'s image wins every key
 it ships, the scheduler's own state stays, and a job only `N` shipped keeps its entry and keeps

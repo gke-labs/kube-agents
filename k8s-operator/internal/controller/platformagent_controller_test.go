@@ -563,6 +563,100 @@ func TestReconcileRBAC_DeletesLegacyRBAC_ServiceAccountSwap(t *testing.T) {
 	}
 }
 
+func TestReconcileRBAC_DisallowSecretsReadAndExistingInstallPreservation(t *testing.T) {
+	scheme := setupScheme()
+	roleName := "kubeagents:minimal:test-ns:test-agent"
+
+	t.Run("new install with unset DisallowSecretsRead grants secrets", func(t *testing.T) {
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		}
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+		r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+		if err := r.reconcileRBAC(context.Background(), agent); err != nil {
+			t.Fatalf("reconcileRBAC failed: %v", err)
+		}
+		var role rbacv1.ClusterRole
+		if err := cl.Get(context.Background(), client.ObjectKey{Name: roleName}, &role); err != nil {
+			t.Fatalf("Get ClusterRole failed: %v", err)
+		}
+		if !clusterRoleGrantsCoreSecrets(&role) {
+			t.Fatalf("expected new install ClusterRole to grant secrets, got %v", role.Rules[0].Resources)
+		}
+	})
+
+	t.Run("existing install without secrets keeps existing RBAC when DisallowSecretsRead is unset", func(t *testing.T) {
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		}
+		existingRole := buildMinimalPlatformRoleWithSecrets(agent, false)
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, existingRole).WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+		r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+		if err := r.reconcileRBAC(context.Background(), agent); err != nil {
+			t.Fatalf("reconcileRBAC failed: %v", err)
+		}
+		var role rbacv1.ClusterRole
+		if err := cl.Get(context.Background(), client.ObjectKey{Name: roleName}, &role); err != nil {
+			t.Fatalf("Get ClusterRole failed: %v", err)
+		}
+		if clusterRoleGrantsCoreSecrets(&role) {
+			t.Fatalf("expected existing ClusterRole without secrets to omit secrets when DisallowSecretsRead is unset, got %v", role.Rules[0].Resources)
+		}
+	})
+
+	t.Run("existing install without secrets adds secrets when DisallowSecretsRead is false", func(t *testing.T) {
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+			Spec: agentv1alpha1.PlatformAgentSpec{
+				AgentSpec: agentv1alpha1.AgentSpec{
+					Security: &agentv1alpha1.SecuritySpec{
+						DisallowSecretsRead: ptr.To(false),
+					},
+				},
+			},
+		}
+		existingRole := buildMinimalPlatformRoleWithSecrets(agent, false)
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, existingRole).WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+		r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+		if err := r.reconcileRBAC(context.Background(), agent); err != nil {
+			t.Fatalf("reconcileRBAC failed: %v", err)
+		}
+		var role rbacv1.ClusterRole
+		if err := cl.Get(context.Background(), client.ObjectKey{Name: roleName}, &role); err != nil {
+			t.Fatalf("Get ClusterRole failed: %v", err)
+		}
+		if !clusterRoleGrantsCoreSecrets(&role) {
+			t.Fatalf("expected DisallowSecretsRead=false to grant secrets on existing ClusterRole, got %v", role.Rules[0].Resources)
+		}
+	})
+
+	t.Run("DisallowSecretsRead=true omits secrets on new and existing installs", func(t *testing.T) {
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+			Spec: agentv1alpha1.PlatformAgentSpec{
+				AgentSpec: agentv1alpha1.AgentSpec{
+					Security: &agentv1alpha1.SecuritySpec{
+						DisallowSecretsRead: ptr.To(true),
+					},
+				},
+			},
+		}
+		existingRole := buildMinimalPlatformRoleWithSecrets(agent, true)
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, existingRole).WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+		r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+		if err := r.reconcileRBAC(context.Background(), agent); err != nil {
+			t.Fatalf("reconcileRBAC failed: %v", err)
+		}
+		var role rbacv1.ClusterRole
+		if err := cl.Get(context.Background(), client.ObjectKey{Name: roleName}, &role); err != nil {
+			t.Fatalf("Get ClusterRole failed: %v", err)
+		}
+		if clusterRoleGrantsCoreSecrets(&role) {
+			t.Fatalf("expected DisallowSecretsRead=true to omit secrets, got %v", role.Rules[0].Resources)
+		}
+	})
+}
+
 func TestPlatformAgentReconciler_Reconcile_MissingRuntimeClass(t *testing.T) {
 	scheme := setupScheme()
 
@@ -7739,13 +7833,14 @@ func TestReconcileRendersTheCredentialProxyRequestsForTheClusterMode(t *testing.
 		}},
 	}
 	tests := []struct {
-		name    string
-		dc      discovery.DiscoveryInterface
-		wantCPU string
-		wantMem string
+		name     string
+		dc       discovery.DiscoveryInterface
+		wantCPU  string
+		wantMem  string
+		wantType string
 	}{
-		{name: "standard", dc: &mockAutopilotDiscovery{}, wantCPU: "500m", wantMem: "1Gi"},
-		{name: "autopilot", dc: autopilot, wantCPU: "2", wantMem: "2Gi"},
+		{name: "standard", dc: &mockAutopilotDiscovery{}, wantCPU: "500m", wantMem: "1Gi", wantType: credentialProxyClusterTypeStandard},
+		{name: "autopilot", dc: autopilot, wantCPU: "2", wantMem: "2Gi", wantType: credentialProxyClusterTypeAutopilot},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -7781,6 +7876,128 @@ func TestReconcileRendersTheCredentialProxyRequestsForTheClusterMode(t *testing.
 			assertQuantity(t, proxy.Resources.Requests, corev1.ResourceCPU, tt.wantCPU)
 			assertQuantity(t, proxy.Resources.Requests, corev1.ResourceMemory, tt.wantMem)
 			assertQuantity(t, proxy.Resources.Limits, corev1.ResourceCPU, "2")
+			if got := dep.Annotations[credentialProxyClusterTypeAnnotation]; got != tt.wantType {
+				t.Errorf("%s = %q, want %q", credentialProxyClusterTypeAnnotation, got, tt.wantType)
+			}
+			if _, onPod := dep.Spec.Template.Annotations[credentialProxyClusterTypeAnnotation]; onPod {
+				t.Errorf("%s is on the pod template, where a change restarts the proxy", credentialProxyClusterTypeAnnotation)
+			}
+		})
+	}
+}
+
+// TestReconcileKeepsTheRunningProxyRequestsWhileDiscoveryFails: when
+// discovery cannot say whether the cluster is Autopilot, Reconcile renders the
+// proxy at the cluster type the running proxy was rendered for: the one its
+// cluster-type annotation records, or, on a Deployment without one, the one
+// whose requests it carries. So a failed check after an operator restart does
+// not restart the proxy. With no proxy yet it renders the Standard requests.
+func TestReconcileKeepsTheRunningProxyRequestsWhileDiscoveryFails(t *testing.T) {
+	lowerMemory := &corev1.ResourceRequirements{Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1536Mi")}}
+	cpuOnly := &corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")}}
+	cpuHalf := &corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m")}}
+	memory2Gi := &corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")}}
+	bothRequests := &corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("1Gi")}}
+	tests := []struct {
+		name      string
+		resources *corev1.ResourceRequirements
+		running   *bool
+		// editedMeanwhile renders the running proxy without the CR's override,
+		// as before a CR edit made while discovery fails; runningResources, when
+		// set, is the override the running proxy was rendered from instead.
+		editedMeanwhile  bool
+		runningResources *corev1.ResourceRequirements
+		unannotated      bool
+		wantCPU          string
+		wantMem          string
+		// wantType is the cluster-type annotation after the reconcile; "" is
+		// none. A guess from the requests is never recorded.
+		wantType string
+	}{
+		{name: "running at the Autopilot requests", running: ptr.To(true), wantCPU: "2", wantMem: "2Gi", wantType: credentialProxyClusterTypeAutopilot},
+		{name: "running at the Standard requests", running: ptr.To(false), wantCPU: "500m", wantMem: "1Gi", wantType: credentialProxyClusterTypeStandard},
+		{name: "no proxy yet", running: nil, wantCPU: "500m", wantMem: "1Gi"},
+		// The annotation holds across a CR edit that moves the requests, which
+		// the request comparison cannot follow.
+		{name: "Autopilot, the CR edited meanwhile", resources: lowerMemory, running: ptr.To(true), editedMeanwhile: true, wantCPU: "1500m", wantMem: "1536Mi", wantType: credentialProxyClusterTypeAutopilot},
+		// A Standard proxy at 500m / 2Gi (requests.memory 2Gi), whose CR now
+		// sets only requests.cpu 500m: the new CR's Autopilot render is also
+		// 500m / 2Gi, so only the annotation keeps it Standard.
+		{
+			name: "Standard, the CR edited meanwhile", resources: cpuHalf, running: ptr.To(false), editedMeanwhile: true,
+			runningResources: memory2Gi, wantCPU: "500m", wantMem: "1Gi", wantType: credentialProxyClusterTypeStandard,
+		},
+		// A Deployment an older operator wrote has no annotation, so its
+		// requests decide.
+		{name: "unannotated, at the Autopilot requests", running: ptr.To(true), unannotated: true, wantCPU: "2", wantMem: "2Gi"},
+		{name: "unannotated, at the Standard requests", running: ptr.To(false), unannotated: true, wantCPU: "500m", wantMem: "1Gi"},
+		// requests.cpu 2 on Standard runs at 2 / 1Gi: the CPU matches the
+		// Autopilot render (2 / 2Gi) and the memory does not, so it is Standard.
+		{name: "unannotated, only the CPU matches the Autopilot render", resources: cpuOnly, running: ptr.To(false), unannotated: true, wantCPU: "2", wantMem: "1Gi"},
+		// A CR that sets both requests renders the same on either type, so the
+		// comparison matches Autopilot on a Standard proxy; that guess must not
+		// be written down, or a later CR edit would render the Autopilot
+		// defaults while discovery still fails.
+		{name: "unannotated, the requests match both renders", resources: bothRequests, running: ptr.To(false), unannotated: true, wantCPU: "1", wantMem: "1Gi"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scheme := setupScheme()
+			agent := &agentv1alpha1.PlatformAgent{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-agent-proxy-mode", Namespace: "test-ns"},
+				Spec: agentv1alpha1.PlatformAgentSpec{
+					Harness: &agentv1alpha1.HarnessSpec{ProjectID: "test-project", Location: "us-central1", ClusterName: "test-cluster"},
+				},
+			}
+			if tt.resources != nil {
+				agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{CredentialProxy: &agentv1alpha1.CredentialProxySpec{Resources: tt.resources}}
+			}
+			objs := []client.Object{agent, shellSandboxKeysSecret(agent)}
+			if tt.running != nil {
+				source := agent.DeepCopy()
+				if tt.editedMeanwhile {
+					source.Spec.Deployment = nil
+					if tt.runningResources != nil {
+						source.Spec.Deployment = &agentv1alpha1.DeploymentSpec{CredentialProxy: &agentv1alpha1.CredentialProxySpec{Resources: tt.runningResources}}
+					}
+				}
+				live := buildCredentialProxyDeploymentForPlugins(source, "policy-hash", nil, allBrokerCallersOwned, credentialProxyProfileConfig{}, *tt.running)
+				if tt.unannotated {
+					delete(live.Annotations, credentialProxyClusterTypeAnnotation)
+				}
+				objs = append(objs, live)
+			}
+			cl := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(objs...).
+				WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+				WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+				Build()
+			failing := &mockAutopilotDiscovery{serverGroupsErr: fmt.Errorf("503 Service Unavailable")}
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(64), DiscoveryClient: failing}
+			req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(agent)}
+			ctx := context.Background()
+			for i := range 2 {
+				if _, err := r.Reconcile(ctx, req); err != nil {
+					t.Fatalf("Reconcile %d failed: %v", i+1, err)
+				}
+			}
+			if r.autopilotResolved {
+				t.Fatal("an undetermined discovery answer was cached")
+			}
+			dep := &appsv1.Deployment{}
+			if err := cl.Get(ctx, client.ObjectKey{Name: credentialBrokerName(agent), Namespace: agent.Namespace}, dep); err != nil {
+				t.Fatalf("get the proxy Deployment: %v", err)
+			}
+			proxy, found := findContainer(dep.Spec.Template.Spec, credentialProxyContainerName)
+			if !found {
+				t.Fatalf("no %s container in the proxy Deployment", credentialProxyContainerName)
+			}
+			assertQuantity(t, proxy.Resources.Requests, corev1.ResourceCPU, tt.wantCPU)
+			assertQuantity(t, proxy.Resources.Requests, corev1.ResourceMemory, tt.wantMem)
+			if got := dep.Annotations[credentialProxyClusterTypeAnnotation]; got != tt.wantType {
+				t.Errorf("%s = %q, want %q", credentialProxyClusterTypeAnnotation, got, tt.wantType)
+			}
 		})
 	}
 }

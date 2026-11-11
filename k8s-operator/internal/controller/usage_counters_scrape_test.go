@@ -21,7 +21,9 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -180,6 +182,12 @@ func TestPodUsageSource_CountsTheWatchersClusterGauge(t *testing.T) {
 	if reading.Clusters == nil || reading.Clusters.Registered != 3 || reading.Clusters.Monitored != 2 {
 		t.Fatalf("clusters = %+v, want 3 registered and 2 monitored", reading.Clusters)
 	}
+	// The series' labels ride along as the triples, in body order, for the
+	// ScopeUndeclared condition.
+	wantRefs := []usageClusterRef{{Name: "a", Project: "p", Location: "l"}, {Name: "b", Project: "p", Location: "l"}, {Name: "c", Project: "p", Location: "l2"}}
+	if !slices.Equal(reading.Clusters.Refs, wantRefs) {
+		t.Fatalf("cluster refs = %+v, want %+v", reading.Clusters.Refs, wantRefs)
+	}
 
 	empty := serveBody(t, http.StatusOK, "# TYPE k8s_event_watcher_events_injected_total counter\n")
 	reading, err = newPodUsageSource().Scrape(context.Background(), empty, []string{usageCounterEventsIngested}, nil)
@@ -302,6 +310,10 @@ func TestPodUsageSource_ReadsTheBrokersReadings(t *testing.T) {
 		`kubeagents_vcs_readings_age_seconds{reading="details"} 340.000`,
 		"# TYPE kubeagents_vcs_readings_failures_total counter",
 		`kubeagents_vcs_readings_failures_total{reason="forge"} 3`,
+		// The chat plugin's ledger age, stale, which the broker's readings
+		// do not read.
+		"# TYPE kubeagents_proposals_opened_read_age_seconds gauge",
+		"kubeagents_proposals_opened_read_age_seconds 99999",
 		"# TYPE process_start_time_seconds gauge",
 		"process_start_time_seconds 1759400000.25",
 		"",
@@ -597,6 +609,11 @@ func TestPodUsageSource_ReadsTheSessionsFamiliesIntoTheChatSessions(t *testing.T
 	if reading.Samples[usageCounterChatMessagesInbound] != 9 || reading.Samples[usageCounterSessionsChat] != 3 || reading.Samples[usageCounterChatTurnsErrored] != 3 || reading.Samples[usageCounterBackgroundTasksGaveUp] != 2 || reading.Samples[usageCounterNegativeFeedback] != 2 {
 		t.Fatalf("chat samples = %v, want 9 messages, 3 sessions, 3 turns errored, 2 cards given up and 2 thumbs-downs", reading.Samples)
 	}
+	// The reaction hook counts no thumbs-up, so the chat listener is not
+	// asked for the positive counter.
+	if _, asked := reading.Samples[usageCounterPositiveFeedback]; asked {
+		t.Fatalf("the chat listener was asked for the thumbs-ups it never serves: %v", reading.Samples)
+	}
 	a2a := strings.Join([]string{
 		"# TYPE kubeagents_a2a_gateway_messages_inbound_total counter",
 		`kubeagents_a2a_gateway_messages_inbound_total{platform="discord"} 5`,
@@ -610,6 +627,11 @@ func TestPodUsageSource_ReadsTheSessionsFamiliesIntoTheChatSessions(t *testing.T
 		`kubeagents_a2a_gateway_task_terminals_total{state="failed",source="supervisor"} 1`,
 		`kubeagents_a2a_gateway_task_terminals_total{state="rejected",source="gateway"} 1`,
 		`kubeagents_a2a_gateway_task_terminals_total{state="canceled",source="gateway"} 4`,
+		"# TYPE kubeagents_a2a_gateway_answer_feedback_total counter",
+		`kubeagents_a2a_gateway_answer_feedback_total{platform="slack",rating="up"} 6`,
+		`kubeagents_a2a_gateway_answer_feedback_total{platform="slack",rating="down"} 2`,
+		`kubeagents_a2a_gateway_answer_feedback_total{platform="other",rating="down"} 1`,
+		`kubeagents_a2a_gateway_answer_feedback_total{platform="slack",rating="other"} 3`,
 		"",
 	}, "\n")
 	reading, err = newPodUsageSource().Scrape(context.Background(), serveBody(t, http.StatusOK, a2a), usageA2AChatCounters, nil)
@@ -625,10 +647,11 @@ func TestPodUsageSource_ReadsTheSessionsFamiliesIntoTheChatSessions(t *testing.T
 	if _, asked := reading.Samples[usageCounterBackgroundTasksGaveUp]; asked {
 		t.Fatalf("the A2A gateway was asked for the board's counter it never serves: %v", reading.Samples)
 	}
-	// The A2A gateway carries no reactions, so its target is not asked for the
-	// feedback counter: no sample, no idle baseline entry, no field in its Warning.
-	if _, asked := reading.Samples[usageCounterNegativeFeedback]; asked {
-		t.Fatalf("the A2A gateway was asked for the feedback counter it never serves: %v", reading.Samples)
+	// The answer ratings are the feedback counters' family on this pod: down
+	// into the thumbs-downs, up into the thumbs-ups, each over every
+	// platform; a rating outside the two counts into neither.
+	if reading.Samples[usageCounterNegativeFeedback] != 3 || reading.Samples[usageCounterPositiveFeedback] != 6 {
+		t.Fatalf("a2a samples = %v, want 3 thumbs-downs (2 + 1) and 6 thumbs-ups", reading.Samples)
 	}
 	if reading.Samples[usageCounterChatMessagesInbound] != 5 || reading.Samples[usageCounterSessionsChat] != 5 {
 		t.Fatalf("A2A samples = %v, want 5 messages and 5 sessions", reading.Samples)
@@ -1152,5 +1175,220 @@ func TestToolInvocationsVocabularyIsClosed(t *testing.T) {
 		if slices.Contains(subcommands, toolSubcommandNone) || slices.Contains(subcommands, toolLabelOther) {
 			t.Errorf("%s lists a fallback word among its subcommands: %v", tool, subcommands)
 		}
+	}
+}
+
+// usageOriginsAge is the ledger read age line the chat plugin serves beside
+// its rows, at age seconds.
+func usageOriginsAge(age string) []string {
+	return []string{
+		"# TYPE kubeagents_proposals_opened_read_age_seconds gauge",
+		"kubeagents_proposals_opened_read_age_seconds " + age,
+	}
+}
+
+// usageOriginsFresh is the nine origins' rows with a fresh read age.
+func usageOriginsFresh(rows ...string) []string {
+	return append(slices.Clone(rows), usageOriginsAge("0.000")...)
+}
+
+// usageOriginsBody is the chat metrics listener's text exposition: the chat
+// counters' families and the start time, with the proposals ledger's rows
+// appended.
+func usageOriginsBody(rows ...string) string {
+	lines := []string{
+		"# TYPE kubeagents_chat_messages_inbound_total counter",
+		`kubeagents_chat_messages_inbound_total{platform="googlechat"} 9`,
+		"# TYPE kubeagents_chat_sessions_total counter",
+		`kubeagents_chat_sessions_total{platform="googlechat"} 2`,
+		"# TYPE process_start_time_seconds gauge",
+		"process_start_time_seconds 1759400000.25",
+	}
+	if len(rows) > 0 {
+		lines = append(lines, "# TYPE kubeagents_proposals_opened gauge")
+		lines = append(lines, rows...)
+	}
+	return strings.Join(append(lines, ""), "\n")
+}
+
+// usageOriginsRows is one ledger row per origin, chat split over two
+// platforms, every other origin under the empty platform, and a row for an
+// origin outside the nine, which resolves no field.
+var usageOriginsRows = []string{
+	`kubeagents_proposals_opened{origin="chat",platform="googlechat"} 4`,
+	`kubeagents_proposals_opened{origin="chat",platform="slack"} 3`,
+	`kubeagents_proposals_opened{origin="console",platform=""} 1`,
+	`kubeagents_proposals_opened{origin="robot",platform=""} 40`,
+	`kubeagents_proposals_opened{origin="api",platform=""} 0`,
+	`kubeagents_proposals_opened{origin="event",platform=""} 5`,
+	`kubeagents_proposals_opened{origin="drift",platform=""} 2`,
+	`kubeagents_proposals_opened{origin="audit",platform=""} 6`,
+	`kubeagents_proposals_opened{origin="scheduled",platform=""} 8`,
+	`kubeagents_proposals_opened{origin="issue",platform=""} 9`,
+	`kubeagents_proposals_opened{origin="other",platform=""} 10`,
+}
+
+// The chat listener's ledger series lands in the nine origin fields, chat
+// summed over its platforms, a zero as a zero, an unknown origin ignored, and
+// marks the origins reading present beside a read age of 0. The chat
+// counters read beside it are the body's, as without it.
+func TestPodUsageSource_ReadsTheNineOriginReadingsFromTheChatBody(t *testing.T) {
+	addr := serveBody(t, http.StatusOK, usageOriginsBody(usageOriginsFresh(usageOriginsRows...)...))
+	reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageChatCounters, []usageReadingKind{usageReadingOrigins})
+	if err != nil {
+		t.Fatalf("Scrape: %v", err)
+	}
+	want := map[string]int64{
+		"proposalsFromChat": 7, "proposalsFromConsole": 1, "proposalsFromApi": 0,
+		"proposalsFromEvent": 5, "proposalsFromDrift": 2, "proposalsFromAudit": 6,
+		"proposalsFromScheduled": 8, "proposalsFromIssue": 9, "proposalsFromOther": 10,
+	}
+	if len(reading.Readings) != len(want) {
+		t.Fatalf("readings = %v, want %v", reading.Readings, want)
+	}
+	for field, value := range want {
+		if got, ok := reading.Readings[field]; !ok || got != value {
+			t.Errorf("%s = %d (present %v), want %d", field, got, ok, value)
+		}
+	}
+	if !reading.ReadingsPresent[usageReadingOrigins] || len(reading.ReadingsPresent) != 1 {
+		t.Errorf("present = %v, want the origins reading alone", reading.ReadingsPresent)
+	}
+	if reading.Samples[usageCounterChatMessagesInbound] != 9 || reading.Samples[usageCounterSessionsChat] != 2 {
+		t.Errorf("chat samples = %v, want 9 messages and 2 sessions", reading.Samples)
+	}
+	if reading.StartTime == nil || *reading.StartTime != 1759400000.25 {
+		t.Errorf("start time = %v, want the listener's", reading.StartTime)
+	}
+}
+
+// The listener serves no ledger family before its first ledger read, and a
+// row per origin after; a body missing an origin, or without the family, is
+// no origins reading, and an origin outside the nine resolves no field. Each
+// body but the first carries a fresh read age, so the origins alone decide.
+func TestPodUsageSource_AMissingOriginIsNotPresent(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		rows []string
+	}{
+		{"no ledger family", nil},
+		{"the other origin missing", usageOriginsFresh(usageOriginsRows[:len(usageOriginsRows)-1]...)},
+		{"the chat origin missing", usageOriginsFresh(usageOriginsRows[2:]...)},
+		{"an unknown origin in place of other", usageOriginsFresh(append(slices.Clone(usageOriginsRows[:len(usageOriginsRows)-1]), `kubeagents_proposals_opened{origin="robot",platform=""} 10`)...)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			addr := serveBody(t, http.StatusOK, usageOriginsBody(tc.rows...))
+			reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageChatCounters, []usageReadingKind{usageReadingOrigins})
+			if err != nil {
+				t.Fatalf("Scrape: %v", err)
+			}
+			if reading.ReadingsPresent[usageReadingOrigins] || len(reading.Readings) != 0 {
+				t.Errorf("present %v, readings %v; want no origins reading", reading.ReadingsPresent, reading.Readings)
+			}
+			if reading.Samples[usageCounterChatMessagesInbound] != 9 {
+				t.Errorf("chat samples = %v, want the counters read beside it", reading.Samples)
+			}
+		})
+	}
+}
+
+// The origins reading is present only beside a read age at or below
+// proposalsReadAgeLimit: the plugin keeps serving its last counts while its
+// ledger reads fail, and a plugin from before the age serves the counts with
+// no age at all. The age alone, with no counts, is no reading either.
+func TestPodUsageSource_TheOriginsReadingNeedsAFreshReadAge(t *testing.T) {
+	limit := strconv.FormatFloat(proposalsReadAgeLimit.Seconds(), 'f', 3, 64)
+	if limit != "600.000" {
+		t.Fatalf("the limit is %s seconds, want two five-minute poll intervals", limit)
+	}
+	for _, tc := range []struct {
+		name    string
+		rows    []string
+		present bool
+	}{
+		{"an age at the limit", append(slices.Clone(usageOriginsRows), usageOriginsAge(limit)...), true},
+		{"an age past the limit", append(slices.Clone(usageOriginsRows), usageOriginsAge("600.001")...), false},
+		{"a repeated age, one sample past the limit", append(append(slices.Clone(usageOriginsRows), usageOriginsAge("600.001")...), usageOriginsAge("0.000")[1]), false},
+		{"the counts with no age series keep the old rule", usageOriginsRows, true},
+		{"the age series with no counts", usageOriginsAge("0.000"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			addr := serveBody(t, http.StatusOK, usageOriginsBody(tc.rows...))
+			reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageChatCounters, []usageReadingKind{usageReadingOrigins})
+			if err != nil {
+				t.Fatalf("Scrape: %v", err)
+			}
+			if got := reading.ReadingsPresent[usageReadingOrigins]; got != tc.present {
+				t.Fatalf("present = %v, want %v (readings %v)", got, tc.present, reading.Readings)
+			}
+			if tc.present && (len(reading.Readings) != 9 || reading.Readings[usageExportProposalsFromChat] != 7) {
+				t.Errorf("readings = %v, want the nine origins, chat 7", reading.Readings)
+			}
+			if !tc.present && len(reading.Readings) != 0 {
+				t.Errorf("readings = %v, want none", reading.Readings)
+			}
+			if reading.Samples[usageCounterChatMessagesInbound] != 9 {
+				t.Errorf("chat samples = %v, want the counters read beside it", reading.Samples)
+			}
+		})
+	}
+}
+
+// The chat listener's body carries the kanban dispatcher's failing boards; the
+// reading is empty, not nil, for a chat body with none, and nil for every
+// other body. A body past the board ceiling fails the scrape.
+func TestPodUsageSource_ReadsTheDispatchersFailingBoards(t *testing.T) {
+	chat := func(series ...string) string {
+		return strings.Join(append([]string{
+			"# TYPE kubeagents_chat_messages_inbound_total counter",
+			`kubeagents_chat_messages_inbound_total{platform="slack"} 4`,
+			"# TYPE kubeagents_kanban_tasks_gave_up_total counter",
+			"kubeagents_kanban_tasks_gave_up_total 0",
+			"# TYPE kubeagents_kanban_dispatcher_failed_ticks gauge",
+		}, append(series, "")...), "\n")
+	}
+	scrape := func(body string, counters []string) (usageReading, error) {
+		return newPodUsageSource().Scrape(context.Background(), serveBody(t, http.StatusOK, body), counters, nil)
+	}
+
+	reading, err := scrape(chat(
+		`kubeagents_kanban_dispatcher_failed_ticks{board="default",error="OperationalError"} 61`,
+		`kubeagents_kanban_dispatcher_failed_ticks{board="o\"ps",error="DatabaseError"} 3`,
+	), usageChatCounters)
+	if err != nil {
+		t.Fatalf("Scrape: %v", err)
+	}
+	want := []usageDispatcherFailure{{Board: "default", Error: "OperationalError", Ticks: 61}, {Board: `o"ps`, Error: "DatabaseError", Ticks: 3}}
+	if reading.Dispatcher == nil || !reflect.DeepEqual(reading.Dispatcher.Failing, want) {
+		t.Fatalf("dispatcher = %+v, want %+v", reading.Dispatcher, want)
+	}
+	if reading.Samples[usageCounterChatMessagesInbound] != 4 {
+		t.Errorf("samples = %v, want the messages counted from the same body", reading.Samples)
+	}
+
+	reading, err = scrape(chat(), usageChatCounters)
+	if err != nil || reading.Dispatcher == nil || len(reading.Dispatcher.Failing) != 0 {
+		t.Fatalf("idle dispatcher: reading %+v, err %v; want an empty reading", reading.Dispatcher, err)
+	}
+
+	reading, err = scrape(chat(`kubeagents_kanban_dispatcher_failed_ticks{board="default",error="OSError"} 9`), usageA2AChatCounters)
+	if err != nil || reading.Dispatcher != nil {
+		t.Fatalf("A2A gateway body: reading %+v, err %v; want none", reading.Dispatcher, err)
+	}
+
+	_, err = scrape(chat(`kubeagents_kanban_dispatcher_failed_ticks{board="default",error="OSError"} 1e20`), usageChatCounters)
+	var hugeErr *usageScrapeError
+	if !errors.As(err, &hugeErr) || hugeErr.Kind != usageScrapeKindSample {
+		t.Fatalf("a streak past int64: err %v, want a sample error", err)
+	}
+
+	many := make([]string, 0, usageDispatcherBoardCeiling+1)
+	for i := 0; i <= usageDispatcherBoardCeiling; i++ {
+		many = append(many, fmt.Sprintf(`kubeagents_kanban_dispatcher_failed_ticks{board="b%d",error="OSError"} 1`, i))
+	}
+	_, err = scrape(chat(many...), usageChatCounters)
+	var scrapeErr *usageScrapeError
+	if !errors.As(err, &scrapeErr) || scrapeErr.Kind != usageScrapeKindSample {
+		t.Fatalf("past the board ceiling: err %v, want a sample error", err)
 	}
 }

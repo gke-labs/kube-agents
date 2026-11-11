@@ -276,11 +276,107 @@ func TestDeskKeepsADownRatingWithItsNoteAndAnUpReplacesIt(t *testing.T) {
 		t.Errorf("a note sent after a 👍 was kept: %q", rec.Note)
 	}
 	m := r.g.Metrics()
-	if got := counterValue(t, m.answerFeedback.WithLabelValues(platformSlack, FeedbackDown)); got != 1 {
+	// The chain answered with its own reply.
+	if got := counterValue(t, m.answerFeedback.WithLabelValues(platformSlack, FeedbackDown, answerReply)); got != 1 {
 		t.Errorf("down ratings counted = %v, want 1", got)
 	}
-	if got := counterValue(t, m.answerFeedback.WithLabelValues(platformSlack, FeedbackUp)); got != 1 {
+	if got := counterValue(t, m.answerFeedback.WithLabelValues(platformSlack, FeedbackUp, answerReply)); got != 1 {
 		t.Errorf("up ratings counted = %v, want 1", got)
+	}
+}
+
+// The metric's answer label says what the rated message answered with: a
+// card's report on a chain that handed its ask to cards, and other when no
+// session record names the rated task.
+func TestDeskCountsACardAnswerAndAnUnknownOneApart(t *testing.T) {
+	r := startRigWith(t, withFeedbackBucket(t, 24*time.Hour))
+	waitFor(t, "feedback on", func() bool { return r.g.feedback.Load() != nil })
+	desk := r.g.feedback.Load()
+	origin := completeTurn(t, r, "discord:g1/fb12", "d-1", "on it")
+	// Marked as the relay marks a chain that handed its ask to cards, once
+	// the relay's last write of the record has landed.
+	rec := waitForRecord(t, r, "discord:g1/fb12", "the turn to end", func(rec *SessionRecord) bool {
+		return rec.ActiveTask == nil
+	})
+	rec.markCardsAnswer(origin.TaskID)
+	if err := r.g.reg.Put(context.Background(), rec); err != nil {
+		t.Fatal(err)
+	}
+	card := FeedbackRating{Platform: platformSlack, Backend: "discord", Rater: "1001", Conversation: "discord:g1/fb12",
+		MessageID: "m1", TaskID: origin.TaskID, Rating: FeedbackDown, Answer: "the card's report"}
+	if _, err := desk.Rate(card); err != nil {
+		t.Fatal(err)
+	}
+	unknown := FeedbackRating{Platform: platformSlack, Backend: "discord", Rater: "1001", Conversation: "discord:g1/none",
+		MessageID: "m2", TaskID: "t-9", Rating: FeedbackUp, Answer: "x"}
+	if _, err := desk.Rate(unknown); err != nil {
+		t.Fatal(err)
+	}
+	m := r.g.Metrics()
+	for _, c := range []struct {
+		rating, answer string
+		want           float64
+	}{
+		{FeedbackDown, answerCard, 1}, {FeedbackDown, answerReply, 0},
+		{FeedbackUp, metricsLabelOther, 1}, {FeedbackUp, answerReply, 0},
+	} {
+		if got := counterValue(t, m.answerFeedback.WithLabelValues(platformSlack, c.rating, c.answer)); got != c.want {
+			t.Errorf("%s ratings of a %s answer = %v, want %v", c.rating, c.answer, got, c.want)
+		}
+	}
+}
+
+// The metric counts rating changes: a first rating and each flip count once,
+// a repeat of the rating already kept does not.
+func TestDeskCountsOnlyARatingChange(t *testing.T) {
+	r := startRigWith(t, withFeedbackBucket(t, 24*time.Hour))
+	waitFor(t, "feedback on", func() bool { return r.g.feedback.Load() != nil })
+	desk := r.g.feedback.Load()
+	origin := completeTurn(t, r, "discord:g1/fb13", "d-1", "it is OOMKilled")
+	rate := func(rating string) {
+		t.Helper()
+		if _, err := desk.Rate(FeedbackRating{Platform: platformSlack, Backend: "discord", Rater: "1001", Conversation: "discord:g1/fb13",
+			MessageID: "m1", TaskID: origin.TaskID, Rating: rating, Answer: "it is OOMKilled"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m := r.g.Metrics()
+	counted := func(rating string) float64 {
+		return counterValue(t, m.answerFeedback.WithLabelValues(platformSlack, rating, answerReply))
+	}
+	for _, step := range []struct {
+		rating   string
+		up, down float64
+	}{
+		{FeedbackDown, 0, 1}, // first rating
+		{FeedbackDown, 0, 1}, // repeat: not counted
+		{FeedbackUp, 1, 1},   // flip
+		{FeedbackUp, 1, 1},   // repeat
+		{FeedbackDown, 1, 2}, // flip back
+	} {
+		rate(step.rating)
+		if up, down := counted(FeedbackUp), counted(FeedbackDown); up != step.up || down != step.down {
+			t.Fatalf("after %s: up %v down %v, want %v and %v", step.rating, up, down, step.up, step.down)
+		}
+	}
+}
+
+// A rating the bucket did not keep is not counted.
+func TestDeskDoesNotCountARatingItCouldNotKeep(t *testing.T) {
+	r := startRig(t)
+	// A completed turn first, so the gateway is running (Rate reads its run
+	// context) and the rated task has a session record.
+	origin := completeTurn(t, r, "discord:g1/fb14", "d-1", "it is OOMKilled")
+	desk := &feedbackDesk{g: r.g, ttl: time.Hour}
+	_, err := desk.Rate(FeedbackRating{Platform: platformSlack, Backend: "discord", Rater: "1001",
+		Conversation: "discord:g1/fb14", TaskID: origin.TaskID, Rating: FeedbackDown, Answer: "x"})
+	if err == nil {
+		t.Fatal("Rate with no feedback bucket succeeded")
+	}
+	for _, answer := range []string{answerReply, answerCard, metricsLabelOther} {
+		if got := counterValue(t, r.g.Metrics().answerFeedback.WithLabelValues(platformSlack, FeedbackDown, answer)); got != 0 {
+			t.Errorf("a rating the bucket did not keep was counted under %s: %v", answer, got)
+		}
 	}
 }
 
@@ -438,8 +534,10 @@ func TestDeskRefusesAnUnverifiedRater(t *testing.T) {
 	if n, _ := ExportFeedback(context.Background(), r.client, 0, time.Now(), io.Discard, io.Discard); n != 0 {
 		t.Errorf("an unverified rating was kept")
 	}
-	if got := counterValue(t, r.g.Metrics().answerFeedback.WithLabelValues(platformSlack, FeedbackDown)); got != 0 {
-		t.Errorf("an unverified rating was counted: %v", got)
+	for _, answer := range []string{answerReply, answerCard, metricsLabelOther} {
+		if got := counterValue(t, r.g.Metrics().answerFeedback.WithLabelValues(platformSlack, FeedbackDown, answer)); got != 0 {
+			t.Errorf("an unverified rating was counted under %s: %v", answer, got)
+		}
 	}
 }
 

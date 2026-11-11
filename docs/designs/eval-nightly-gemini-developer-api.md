@@ -1,11 +1,18 @@
 # The nightly evals' agent on the Gemini Developer API
 
-> **STATUS — partly built; the move is tracked in #4850.** Approved in conversation on
+> **STATUS — built; all four steps done as of 2026-11-06.** Approved in conversation on
 > 2026-11-04. The repository change ships the key script, the provisioning step, the verifier
-> check, the deploy's `gemini` path and the documentation. Three steps are pending: the
-> `oss-test-infra` change that exports `MODEL_PROVIDER=gemini` on the nightlies, the repair of the
-> registered projects, and the flip of the verifier findings to blocking. The one precondition that
-> could have made the design moot was probed on 2026-11-04 (see "What the probe showed").
+> check, the deploy's `gemini` path and the documentation. The registered projects carry the key
+> (repaired 2026-11-05), the five nightlies export `MODEL_PROVIDER=gemini` from the night of
+> 2026-11-06, and the verifier findings block and run in the hourly pool-state scan. The flip on
+> 2026-11-06 moved the three APIs into `REQUIRED_APIS` and section 1's enable block and made the
+> findings blocking; sections 1, 4 and 8 keep the original plan as history. On 2026-11-06
+> `post-kube-agents-eval-rc` (GoogleCloudPlatform/oss-test-infra#2774) and the two Argon smoke
+> presubmits `pull-kube-agents-smoke-test` and `-today` (GoogleCloudPlatform/oss-test-infra#2775)
+> moved the same way, so "Presubmits stay on Vertex" below is history too: only the Claude and
+> Flash smoke jobs and the forge smoke variants stay on Vertex AI. One item stays open: the
+> version key does not carry the serving provider (#4932). The one precondition that could
+> have made the design moot was probed on 2026-11-04 (see "What the probe showed").
 
 ## Intent
 
@@ -28,12 +35,14 @@ single shared key's fixed Tier 3 quota was 8,000,000 input tokens per minute for
 (#1097; the diagnosis is on #1184). The move to Vertex was the fix, because Vertex's dynamic
 shared quota had no fixed wall. Vertex is now the wall.
 
-The nightly is three jobs that start together at 00:00 UTC, `ci-kube-agents-eval-nightly`
+The nightly was three jobs that started together at 00:00 UTC, `ci-kube-agents-eval-nightly`
 (`main-a`), `-main-b` and `-writers`, each at task parallelism 6, so 18 concurrent agent turns at
-the peak, close to September's shape. One shared key at 20M TPM is about 2.5 times the ceiling
+the peak, close to September's shape; since the main part runs as five shards and the writers part
+as three thirds it is eight jobs, each on its own project's key: five main shards at parallelism 6
+and three writers thirds whose units run one at a time, so 33 turns at the peak across eight keys and at most 6 on any one. One shared key at 20M TPM is about 2.5 times the ceiling
 that failed; September's load works out near 400k input tokens per minute per concurrent stream,
-which puts 18 streams near 7M. That is headroom, not isolation. A key per project is isolation:
-each nightly leases a different project, so each gets its own 20M window and the three never
+which put 18 streams near 7M. That is headroom, not isolation. A key per project is isolation:
+each nightly leases a different project, so each gets its own 20M window and the eight never
 share a minute. The `-gitlab` nightly at 02:00 and `-gitlab-next` at 04:00 run alone in their
 windows and move on the same mechanism.
 
@@ -60,7 +69,7 @@ folder-level grants above give for every pool project. The repair section names 
 
 ## Goals
 
-- The five nightly periodics' agent model calls reach the Gemini Developer API through LiteLLM,
+- The nightly periodics' agent model calls reach the Gemini Developer API through LiteLLM,
   authenticated by an API key that belongs to the leased pool project.
 - Every pool project, the 40 registered ones and every new one, carries such a key, and the pool
   verifier fails a project without one.
@@ -72,12 +81,13 @@ folder-level grants above give for every pool project. The repair section names 
 
 - The judge. It keeps the shared key from the job env (`JUDGE_API_KEY` in `hack/ci-eval-pr.sh`)
   and is pinned independently of the agent; nothing here touches its serving path.
-- The presubmits. They stay on Vertex for now; they have the same Tier 0 problem and are the
-  follow-on, which this design's per-project keys already make possible.
+- The presubmits. They stayed on Vertex for this design; they had the same Tier 0 problem and
+  were the follow-on the per-project keys made possible. The two Argon smoke presubmits moved on
+  2026-11-06 (see the status above).
 - The model. `gemini-4-argon` stays; `MODEL_DEFAULT_NAME` and `AGENT_MODEL_OVERRIDE` do not
-  change on the four jobs that export them. `ci-kube-agents-eval-nightly-gitlab-next` exports
+  change on the jobs that export them. `ci-kube-agents-eval-nightly-gitlab-next` exports
   neither and so runs the deploy's default, `gemini-3.1-pro-preview`; the job-env change gives it
-  the same two exports as its siblings, so the five nightlies agree on the model.
+  the same two exports as its siblings, so every nightly agrees on the model.
 - The evidence-store version key. It names the agent model, the judge, and the harness, not the
   serving path, and none of those change. Nights after the switch pool with nights before it in
   the same window (the call, and why, is under Decisions).
@@ -132,8 +142,8 @@ seed files) are bash in the provisioning script for the same reason.
 
 The project needs three APIs it does not enable today: `apikeys.googleapis.com`,
 `secretmanager.googleapis.com` and `generativelanguage.googleapis.com`. The key script enables
-them. They stay out of section 1's enable block and out of `REQUIRED_APIS` until the flip to
-blocking; until then the key check reports a project without them as missing the key.
+them. The plan kept them out of section 1's enable block and out of `REQUIRED_APIS` until the
+flip to blocking, and until then the key check reported a project without them as missing the key.
 
 ### 2. Where the key lives
 
@@ -159,23 +169,25 @@ same script after deleting the key.
 ### 4. The verifier
 
 A new check in `scripts/verify_ci_pool_project.py`: the key exists with exactly the one API
-target and no client restriction, `generativelanguage.googleapis.com` is enabled, the secret
+target and no client restriction, the secret
 exists with a current version, and both runner identities hold the accessor on it. It reads
 metadata and IAM only; it never reads the key string. `scripts/test_verify_ci_pool_project.py`
 pins it with fake gcloud answers for each finding and for refused reads, and holds its names
 equal to the key script's constants.
+Whether `generativelanguage.googleapis.com` is enabled is the project check's read: the three
+APIs the key needs are in `REQUIRED_APIS` and the provisioning script's enable block.
 
 The verifier's classification is two-valued: a finding either passes leases (`LEASE_SILENT_FINDINGS`)
 or the health bot reads it as one that reds the run that leases the project. Between the
 repository merge and the end of the 40 repairs, a blocking finding would mark every project as
-pool drift and blame the pool for failures that are this change's. So the finding lands
-lease-silent, in the verifier's default set from day one, and a second one-line change flips it
-to blocking once the repairs are done and verified. It is kept out of the hourly pool-state scan
+pool drift and blame the pool for failures that are this change's. So the finding landed
+lease-silent, in the verifier's default set from day one, and a second change flipped it to
+blocking once the repairs were done and verified. It was kept out of the hourly pool-state scan
 until that flip.
 
 The scan runs as `eval-dashboard-publisher`, which already holds `roles/iam.securityReviewer`
-on every pool project. That role carries the three reads the check makes beside the service
-listing: `apikeys.keys.list`, `secretmanager.versions.list` and
+on every pool project. That role carries the three reads the check makes:
+`apikeys.keys.list`, `secretmanager.versions.list` and
 `secretmanager.secrets.getIamPolicy`. So this change grants the bot no new role, and the
 verifier maps the `secrets` surface to `roles/iam.securityReviewer`. The design first named
 `roles/serviceusage.apiKeysViewer` for the key listing. That role was rejected: it carries
@@ -199,9 +211,9 @@ as the floor and is not re-tuned until the first night's 429 count says otherwis
 
 ### 6. The job env
 
-In `oss-test-infra`, the five eval nightlies export `MODEL_PROVIDER=gemini`:
-`ci-kube-agents-eval-nightly`, `-main-b`, `-writers`, `-gitlab`, `-gitlab-next`. Nothing else in
-the job changes. Rollback is the same five lines back to `vertex_ai`; the per-project keys and
+In `oss-test-infra`, the eval nightlies export `MODEL_PROVIDER=gemini`:
+`ci-kube-agents-eval-nightly`, `-main-b` to `-main-e`, `-writers`, `-writers-b`, `-writers-c`,
+`-gitlab`, `-gitlab-next`. Nothing else in the job changes. Rollback is the same lines back to `vertex_ai`; the per-project keys and
 secrets stay, harmless and ready. The `oss-test-infra` change merges after the repository change
 that reads the secret, and after the 40 repairs: a nightly that leases an unrepaired project with
 the export already set fails at the deploy by design.
@@ -222,12 +234,12 @@ project, and the share of cached input tokens, come from the project's own usage
 Monitoring's quota usage for the Generative Language API, and AI Studio's usage page for the
 project, both of which report per minute. The expected result is zero 429s and a peak minute well
 under 20M for every leased project. If the peak minute is within a factor of two of the wall,
-parallelism comes down before anything else is tried. The three numbers go on the issue that
-tracks the move, beside the last Vertex night's.
+parallelism comes down before anything else is tried. The three numbers go on the dashboard digest; the
+issue that tracks the move names the night and its build id.
 
 ### 8. Documentation
 
-- `docs/ci-pool-projects.md`: section 1 names the three APIs, outside its enable block; section 3 gains the key as a
+- `docs/ci-pool-projects.md`: section 1 named the three APIs, outside its enable block, until the flip; section 3 gains the key as a
   prerequisite beside the LiteLLM Vertex identity, with the repair; the sentence saying eval
   installs route model traffic through Vertex becomes "the presubmits route through Vertex; the
   nightlies through the Developer API with the project's own key, and why".
