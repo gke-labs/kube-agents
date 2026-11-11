@@ -1351,6 +1351,7 @@ class TestSessionKvServerAuth(unittest.TestCase):
         ("GET", "/v1/cron/jobs/j-1/origin", None),
         ("POST", "/v1/proposals/opened", {"url": "https://example.invalid/pull/1", "origin": "other"}),
         ("GET", "/v1/proposals/opened/counts", None),
+        ("POST", "/v1/post-merge/records", {"url": "https://github.com/a/b/pull/1", "kind": "no-pdb", "origin": "audit"}),
         ("POST", "/v1/board/stamp-tickets", {"origin": "issue"}),
         ("POST", "/v1/board/stamp-tickets/tk-1/redeem", None),
     )
@@ -14069,6 +14070,59 @@ class TestProposalOrigin(unittest.TestCase):
         self.assertEqual(counts["chat"], {"": 0})
         self.assertEqual(self.client.post("/v1/proposals/opened", json=dict(body, url="")).status_code, 400)
         self.assertEqual(self.client.post("/v1/proposals/opened", json=dict(body, url=url + "8", origin="eval")).status_code, 400)
+
+    def test_post_merge_record_is_written_once_per_url_with_its_fields(self):
+        import sqlite3
+
+        url = "https://github.com/example/fleet/pull/12"
+        body = {
+            "url": url, "kind": "no-pdb", "origin": "audit", "platform": "", "opened_at": "2026-11-10T10:00:00+00:00",
+            "task_id": "t_1", "thread_platform": "slack", "thread_chat_id": "C1", "thread_id": "17.1",
+            "repo": "https://evil.example/forged",
+        }
+        first = self.client.post("/v1/post-merge/records", json=body)
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(first.json(), {"recorded": True})
+        second = self.client.post("/v1/post-merge/records", json=dict(body, thread_chat_id="C2"))
+        self.assertEqual(second.json(), {"recorded": False})
+        with sqlite3.connect(temp_db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = [dict(row) for row in conn.execute("SELECT * FROM post_merge_records WHERE url = ?", (url,))]
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(
+            (row["repo"], row["number"], row["kind"], row["origin"], row["opened_at"], row["task_id"],
+             row["thread_platform"], row["thread_chat_id"], row["thread_id"]),
+            ("https://github.com/example/fleet", 12, "no-pdb", "audit", "2026-11-10T10:00:00+00:00", "t_1",
+             "slack", "C1", "17.1"),
+        )
+        for column in ("environment", "merged_at", "human_edited", "reverted_at", "outcome", "outcome_at"):
+            self.assertIn(column, row)
+        self.assertIsNone(row["outcome"])
+
+    def test_post_merge_kinds_match_the_pr_opened_plugin(self):
+        spec = importlib.util.spec_from_file_location(
+            "pr_opened_for_kinds", Path(__file__).resolve().parents[1] / "plugins" / "pr_opened" / "__init__.py"
+        )
+        plugin = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(plugin)
+        self.assertEqual(set(plugin.POST_MERGE_KINDS), set(session_kv_server.POST_MERGE_KINDS))
+        self.assertEqual(plugin.POST_MERGE_PATH, "/v1/post-merge/records")
+
+    def test_post_merge_record_refuses_what_is_not_a_known_fix_pull_request(self):
+        good = {"url": "https://github.com/example/fleet/pull/13", "kind": "no-pdb", "origin": "audit"}
+        for change in (
+            {"url": "https://github.com/example/fleet/issues/13"},
+            {"url": ""},
+            {"kind": "no-hpa"},
+            {"kind": None},
+            {"origin": "eval"},
+            {"number": 0},
+            {"number": "13"},
+            {"thread_id": "x" * 300},
+        ):
+            with self.subTest(change=change):
+                self.assertEqual(self.client.post("/v1/post-merge/records", json={**good, **change}).status_code, 400)
 
     def test_proposals_opened_counts_zero_fill_every_origin(self):
         for n, (origin, platform) in enumerate((("chat", "slack"), ("chat", "slack"), ("chat", "googlechat"), ("drift", ""))):

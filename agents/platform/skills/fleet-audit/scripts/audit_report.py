@@ -14689,6 +14689,13 @@ def _select_pr_by_head(prs: list[dict], branch: str, alternate: str | None = Non
     return None
 
 
+def remediation_kind(group: list[dict]) -> str | None:
+    """The kind of fix a group is, for the post-merge check: GENERATED_FIX_CHECK
+    when every finding in it is that check, else None (a mixed group is no one kind)."""
+    checks = {str(f.get("check", "")) for f in group}
+    return GENERATED_FIX_CHECK if checks == {GENERATED_FIX_CHECK} else None
+
+
 def remediation_pr_title(audit_id: str, group: list[dict]) -> str:
     """One subject for the whole group, named after what it fixes."""
     ordered = sort_findings(group)
@@ -15151,8 +15158,11 @@ def broker_lost(exc: BaseException) -> bool:
 _LAST_REFUSAL: dict[str, str] = {}
 
 
-def forge(verb: str, repo: str, payload: dict) -> dict:
+def forge(verb: str, repo: str, payload: dict, kind: str | None = None) -> dict:
     """One forge verb against `repo`, through the broker. Raises ForgeError.
+
+    `kind` names the kind of fix a `proposal-create` opens, for the record
+    the agent pod's hook reads (`vcs_client.KIND_FIELD`); it is not sent.
 
     Issues, pull requests, comments and labels all go this way. There is no
     `gh` in the sandbox to run: the broker holds the credential and answers in
@@ -15174,6 +15184,8 @@ def forge(verb: str, repo: str, payload: dict) -> dict:
     # call it just made failed.
     _LAST_REFUSAL.pop(repo, None)
     try:
+        if kind:
+            return vcs_client.forge(verb, dict(payload), repository=repo, kind=kind)
         return vcs_client.forge(verb, dict(payload), repository=repo)
     except vcs_client.VcsError as exc:
         _LAST_REFUSAL[repo] = exc.code or ""
@@ -17532,6 +17544,7 @@ def open_remediation_pr(
                 "proposal-create",
                 repo,
                 {"source": branch, "target": base, "title": title, "body": body},
+                kind=remediation_kind(group),
             ).get("proposal") or {}
         except ForgeError:
             # The forge refuses a second pull request from one branch. One is

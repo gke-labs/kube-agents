@@ -35,7 +35,7 @@ TASK = "t_9f2a"
 TITLE = "Raise the checkout memory limit"
 
 
-def _vcs_record(url=URL, number=99, title=TITLE, claim=None, repo=None):
+def _vcs_record(url=URL, number=99, title=TITLE, claim=None, repo=None, kind=None):
     """The stderr line ``vcs_client.call`` writes for a proposal it opened, with ``claim`` as its token.
 
     ``repo`` is the answer's top-level repository; None writes the line an older client wrote.
@@ -47,7 +47,7 @@ def _vcs_record(url=URL, number=99, title=TITLE, claim=None, repo=None):
     if repo is not None:
         answer["repo"] = repo
     with mock.patch.object(vcs_client, "_call", lambda verb, payload: answer), mock.patch("sys.stderr", stderr):
-        vcs_client.call("proposal-create", {})
+        vcs_client.call("proposal-create", {}, kind=kind)
     return stderr.getvalue()
 
 
@@ -108,8 +108,8 @@ class _Broker:
         self.live[token] = url
         return token
 
-    def line(self, url=URL, number=99, title=TITLE, repo=REPO_NAME):
-        return _vcs_record(url=url, number=number, title=title, claim=self.mint(url), repo=repo)
+    def line(self, url=URL, number=99, title=TITLE, repo=REPO_NAME, kind=None):
+        return _vcs_record(url=url, number=number, title=title, claim=self.mint(url), repo=repo, kind=kind)
 
     def module(self):
         forge = types.ModuleType("forge")
@@ -149,7 +149,7 @@ class PrOpenedTest(unittest.TestCase):
         env = {plugin.TASK_ENV: task} if task else {}
         modules = {**kanban.modules(), "forge": (broker or _Broker()).module(), "kanban_origin": origins}
 
-        def post(path, payload):
+        def post(path, payload, **_):
             self.ledger.append((path, payload))
             return {"recorded": True}
 
@@ -174,6 +174,70 @@ class PrOpenedTest(unittest.TestCase):
         self.ledger.clear()
         self.run_hook(broker.line(), _Kanban(), task="", broker=broker, origins=origins)
         self.assertEqual(self.ledger, [("/v1/proposals/opened", {"url": URL, "origin": "chat", "platform": "slack"})])
+
+    def test_a_no_pdb_fix_is_recorded_for_the_post_merge_check_only_with_the_switch_on(self):
+        thread = ("slack", "C123", "1700000000.1")
+        with mock.patch.object(plugin, "card_thread", return_value=thread):
+            broker = _Broker()
+            self.run_hook(broker.line(kind="no-pdb"), _Kanban(), broker=broker)
+            self.assertEqual([path for path, _ in self.ledger], ["/v1/proposals/opened"])
+            self.ledger.clear()
+            with mock.patch.object(plugin, "post_merge_check_on", return_value=True):
+                self.run_hook(broker.line(kind="no-pdb"), _Kanban(), broker=broker)
+        self.assertEqual([path for path, _ in self.ledger], ["/v1/proposals/opened", "/v1/post-merge/records"])
+        self.assertEqual(
+            self.ledger[1][1],
+            {"url": URL, "number": 99, "kind": "no-pdb", "origin": "other", "platform": "", "task_id": TASK,
+             "thread_platform": "slack", "thread_chat_id": "C123", "thread_id": "1700000000.1"},
+        )
+
+    def test_a_proposal_with_no_known_kind_is_not_recorded_for_the_post_merge_check(self):
+        with mock.patch.object(plugin, "post_merge_check_on", return_value=True), \
+                mock.patch.object(plugin, "card_thread", return_value=plugin.NO_THREAD):
+            for kind in (None, "no-hpa"):
+                with self.subTest(kind=kind):
+                    self.ledger.clear()
+                    broker = _Broker()
+                    self.run_hook(broker.line(kind=kind), _Kanban(), broker=broker)
+                    self.assertEqual([path for path, _ in self.ledger], ["/v1/proposals/opened"])
+
+    def test_no_post_merge_record_when_the_claim_left_too_little_time(self):
+        with mock.patch.object(plugin, "post_merge_check_on", return_value=True), \
+                mock.patch.object(plugin, "card_thread", return_value=plugin.NO_THREAD), \
+                mock.patch.object(plugin, "POST_MERGE_COST_SECONDS", plugin.HOOK_CALLBACK_SECONDS):
+            broker = _Broker()
+            self.run_hook(broker.line(kind="no-pdb"), _Kanban(), broker=broker)
+        self.assertEqual([path for path, _ in self.ledger], ["/v1/proposals/opened"])
+
+    def test_a_kind_that_is_not_a_string_is_ignored_not_raised(self):
+        with mock.patch.object(plugin, "post_merge_check_on", return_value=True):
+            for kind in (["no-pdb"], {"k": 1}, 7):
+                with self.subTest(kind=kind):
+                    plugin.write_post_merge_record({"url": URL, "number": 99}, kind, ("audit", ""), TASK)
+
+    def test_an_unclaimed_record_is_never_recorded_for_the_post_merge_check(self):
+        with mock.patch.object(plugin, "post_merge_check_on", return_value=True):
+            self.run_hook(_vcs_record(claim="forged", repo=REPO_NAME, kind="no-pdb"), _Kanban())
+        self.assertEqual(self.ledger, [])
+
+    def test_the_switch_is_read_through_kubeagents_switches(self):
+        for value, on in (("", False), ("off", False), ("silent", True), ("report", True), ("bogus", False)):
+            with self.subTest(value=value), mock.patch.dict(os.environ, {"KUBEAGENTS_POST_MERGE_CHECK": value}):
+                self.assertEqual(plugin.post_merge_check_on(), on)
+
+    def test_card_thread_reads_the_card_s_first_subscription(self):
+        import sqlite3
+
+        db = sqlite3.connect(":memory:")
+        db.execute("CREATE TABLE kanban_notify_subs (task_id TEXT, platform TEXT, chat_id TEXT, thread_id TEXT)")
+        db.execute("INSERT INTO kanban_notify_subs VALUES (?, 'slack', 'C1', NULL)", (TASK,))
+        connect = types.ModuleType("hermes_cli.kanban_db_connect")
+        connect.connect_closing = contextlib.contextmanager(lambda: (yield db))
+        with mock.patch.dict(sys.modules, {"hermes_cli": types.ModuleType("hermes_cli"),
+                                           "hermes_cli.kanban_db_connect": connect}):
+            self.assertEqual(plugin.card_thread(TASK), ("slack", "C1", ""))
+            self.assertEqual(plugin.card_thread("t_other"), plugin.NO_THREAD)
+            self.assertEqual(plugin.card_thread(""), plugin.NO_THREAD)
 
     def test_a_non_worker_process_claims_and_keeps_the_line_without_its_token(self):
         kanban, broker = _Kanban(), _Broker()
@@ -794,7 +858,7 @@ class SandboxClaimTimeoutTest(unittest.TestCase):
         broker, kanban, ledger = _Broker(), _Kanban(), []
         output = "".join(broker.line(url=f"{REPOSITORY}/pull/{n}", number=n) for n in (1, 2))
 
-        def post(path, payload):
+        def post(path, payload, **_):
             ledger.append((path, payload))
             return {"recorded": True}
 

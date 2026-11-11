@@ -83,6 +83,13 @@ ORIGIN_PLATFORM_MAX_CHARS = 64
 ORIGIN_JOB_ID_MAX_CHARS = 256
 PROPOSAL_URL_MAX_CHARS = 2048
 PROPOSAL_OPENED_AT_MAX_CHARS = 64
+# The post-merge check's records (design gke-labs/kube-agents#5054, step 1,
+# "Record it"): one row per fix pull request, written when its proposal is
+# claimed and the install's POST_MERGE_CHECK switch is not off. The kinds of
+# fix the check knows, by the fleet audit's check id; the pr_opened plugin holds
+# a copy (POST_MERGE_KINDS), which a test pins to this one.
+POST_MERGE_KINDS = ("no-pdb",)
+POST_MERGE_FIELD_MAX_CHARS = 256
 # The upward compression walk `_session_origin` takes, as
 # deploy/docker/patches/kanban_event_routing.py `_compression_ancestors` takes it.
 ORIGIN_COMPRESSION_END_REASON = "compression"
@@ -1857,6 +1864,33 @@ def init_db() -> None:
                 )
                 """
             )
+            # The post-merge check's records, one per fix pull request: what it
+            # fixes, where it came from and which thread asked, written at open
+            # (POST /v1/post-merge/records). The environment, merge, edit,
+            # revert and outcome columns are filled later by the check itself.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS post_merge_records (
+                    url             TEXT PRIMARY KEY,
+                    repo            TEXT,
+                    number          INTEGER,
+                    kind            TEXT,
+                    environment     TEXT,
+                    origin          TEXT,
+                    origin_platform TEXT,
+                    opened_at       TEXT,
+                    task_id         TEXT,
+                    thread_platform TEXT,
+                    thread_chat_id  TEXT,
+                    thread_id       TEXT,
+                    merged_at       TEXT,
+                    human_edited    INTEGER,
+                    reverted_at     TEXT,
+                    outcome         TEXT,
+                    outcome_at      TEXT
+                )
+                """
+            )
             # One-time stamp tickets for a card's board origin; spent or
             # expired rows are removed by `cleanup_old_records`.
             conn.execute(
@@ -1896,6 +1930,7 @@ def cleanup_old_records(conn: sqlite3.Connection) -> None:
     # the next sweep re-offers. Their lifecycle is `state`, not age.
     # `cron_job_origins` and `proposals_opened` are absent too: a job's origin
     # holds for as long as the job exists, and the ledger is a durable count.
+    # So is `post_merge_records`: each row is a durable record of a fix pull request.
     try:
         # Delete incident reports and session metadata older than CLEANUP_TTL_DAYS
         param = f"-{CLEANUP_TTL_DAYS} days"
@@ -8346,6 +8381,67 @@ def post_proposal_opened(request_data: Dict[str, Any]) -> Dict[str, bool]:
             cursor = conn.execute(
                 "INSERT OR IGNORE INTO proposals_opened (url, origin, origin_platform, opened_at) VALUES (?, ?, ?, ?)",
                 (url.strip(), origin, platform, opened_at),
+            )
+    return {"recorded": cursor.rowcount > 0}
+
+
+def _bounded_text(request_data: Dict[str, Any], field: str) -> str:
+    """``field`` as a string of at most POST_MERGE_FIELD_MAX_CHARS, empty when absent, else a 400."""
+    value = request_data.get(field) or ""
+    if not isinstance(value, str) or len(value) > POST_MERGE_FIELD_MAX_CHARS:
+        raise HTTPException(
+            status_code=400, detail=f"{field} must be a string of at most {POST_MERGE_FIELD_MAX_CHARS} characters"
+        )
+    return value.strip()
+
+
+@app.post("/v1/post-merge/records", dependencies=[Depends(verify_api_key)])
+def post_post_merge_record(request_data: Dict[str, Any]) -> Dict[str, bool]:
+    """Record one fix pull request for the post-merge check; the first record of a url stands.
+
+    The url must be a pull request url (PROPOSAL_URL_RE) and the kind one the
+    check knows (POST_MERGE_KINDS). 200 either way, so a retry after a lost
+    answer is not told it failed.
+    """
+    url = request_data.get("url")
+    match = PROPOSAL_URL_RE.match(url.strip()) if isinstance(url, str) and len(url) <= PROPOSAL_URL_MAX_CHARS else None
+    if match is None:
+        raise HTTPException(status_code=400, detail="url must be a pull request url")
+    number = request_data.get("number")
+    if number is None:
+        number = int(match.group(2))
+    if not isinstance(number, int) or isinstance(number, bool) or number < 1:
+        raise HTTPException(status_code=400, detail="number must be a positive integer")
+    kind = request_data.get("kind")
+    if kind not in POST_MERGE_KINDS:
+        raise HTTPException(status_code=400, detail=f"kind must be one of {list(POST_MERGE_KINDS)}")
+    origin, platform = _origin_fields(request_data)
+    opened_at = request_data.get("opened_at") or datetime.now(timezone.utc).isoformat()
+    if not isinstance(opened_at, str) or len(opened_at) > PROPOSAL_OPENED_AT_MAX_CHARS:
+        raise HTTPException(
+            status_code=400, detail=f"opened_at must be a string of at most {PROPOSAL_OPENED_AT_MAX_CHARS} characters"
+        )
+    row = (
+        url.strip(),
+        match.group(1),
+        number,
+        kind,
+        _bounded_text(request_data, "environment"),
+        origin,
+        platform,
+        opened_at,
+        _bounded_text(request_data, "task_id"),
+        _bounded_text(request_data, "thread_platform"),
+        _bounded_text(request_data, "thread_chat_id"),
+        _bounded_text(request_data, "thread_id"),
+    )
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=ORIGIN_DB_TIMEOUT_SECONDS)) as conn:
+        with conn:
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO post_merge_records (url, repo, number, kind, environment, origin, "
+                "origin_platform, opened_at, task_id, thread_platform, thread_chat_id, thread_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                row,
             )
     return {"recorded": cursor.rowcount > 0}
 

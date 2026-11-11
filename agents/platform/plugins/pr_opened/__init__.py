@@ -24,7 +24,11 @@ proposal counts: it is written to the Session KV ledger
 (:func:`resolve_origin`), and in a kanban worker it is also appended to the card
 as a ``pr_opened`` event, carrying the forge's fields and never the line's, and
 the line is taken out of the output. Outside a worker the line stays, without
-its token. The gateway's notifier claims the event kind and, with
+its token. While the install's ``POST_MERGE_CHECK`` switch is not ``off``, a
+claimed proposal whose record names a kind of fix the post-merge check knows
+(``kind``, set by the fleet audit for a ``no-pdb`` fix) is also written to
+``POST /v1/post-merge/records`` with the thread its card reports to
+(:func:`write_post_merge_record`). The gateway's notifier claims the event kind and, with
 ``KAGE_SLACK_UX`` on, posts the PR as its own message in the thread the card
 reports to (``gateway/kanban_progress_lines.py``, ``gateway/slack_ux_moments.py``).
 
@@ -88,7 +92,7 @@ logger = logging.getLogger(__name__)
 #: path. ``test_pr_opened.py`` fails when the two drift.
 PROPOSAL_OPENED_KEY = "kube-agents.event"
 PROPOSAL_OPENED_EVENT = "proposal-opened"
-PROPOSAL_OPENED_FIELDS = ("url", "number", "title", "claim", "repo")
+PROPOSAL_OPENED_FIELDS = ("url", "number", "title", "claim", "repo", "kind")
 
 #: The record's field that holds the broker's one-time claim token
 #: (``vcs_client.CLAIM_TOKEN_FIELD``).
@@ -226,6 +230,28 @@ LEDGER_PATH = "/v1/proposals/opened"
 #: The ledger write waits at most this long, on loopback.
 LEDGER_TIMEOUT_SECONDS = 2.0
 
+#: The post-merge check's record route (design gke-labs/kube-agents#5054,
+#: step 1), the kinds of fix it records (the record's ``kind``, the fleet audit's
+#: check id, ``vcs_client.KIND_FIELD``), and the install switch that turns it on
+#: (``kubeagents_switches``). The record is written only for a claimed proposal
+#: of a known kind while the switch is not ``off``. The kind is the opener's
+#: word, not the forge's: the check must verify the fix, never trust the kind.
+#: ``session_kv_server.POST_MERGE_KINDS`` is the server's copy; a test pins them.
+POST_MERGE_PATH = "/v1/post-merge/records"
+POST_MERGE_KINDS = frozenset({"no-pdb"})
+POST_MERGE_SWITCH = "POST_MERGE_CHECK"
+#: What the record costs at most: the card's thread read and the write. Skipped
+#: when less than this is left before the claim deadline, so the ledger write,
+#: the card record and the strip keep their CLAIM_RESERVE_SECONDS.
+POST_MERGE_COST_SECONDS = 2.5
+CARD_THREAD_BUSY_MS = 500
+POST_MERGE_TIMEOUT_SECONDS = 2.0
+
+#: The chat thread a card reports to (Hermes' ``kanban_notify_subs``): the
+#: thread a post-merge outcome goes back to. The first subscription stands.
+CARD_THREAD_SQL = "SELECT platform, chat_id, thread_id FROM kanban_notify_subs WHERE task_id = ? LIMIT 1"
+NO_THREAD = ("", "", "")
+
 
 def register(ctx):
     ctx.register_hook("transform_terminal_output", on_terminal_output)
@@ -250,7 +276,7 @@ def _record_of(line):
 
 
 def opened(line):
-    """The ``{url, number, title, claim, repo}`` a proposal-opened record on ``line`` names, else None.
+    """The ``{url, number, title, claim, repo, kind}`` a proposal-opened record on ``line`` names, else None.
 
     ``claim`` is None when the line carries no token (a broker older than the
     token); ``repo`` is None when the line names no repository (an older client).
@@ -295,14 +321,30 @@ def _strip_all(output):
     return "".join(kept)
 
 
-def _forge():
-    """The agent pod's ``forge`` module, which reaches the broker through the sandbox."""
+def _on_scripts_path():
     for directory in SCRIPTS_DIRS:
         if directory not in sys.path:
             sys.path.append(directory)
+
+
+def _forge():
+    """The agent pod's ``forge`` module, which reaches the broker through the sandbox."""
+    _on_scripts_path()
     import forge
 
     return forge
+
+
+def post_merge_check_on():
+    """True when the install's POST_MERGE_CHECK switch is not ``off``. An unreadable switch is off."""
+    try:
+        _on_scripts_path()
+        import kubeagents_switches
+
+        return kubeagents_switches.switch(POST_MERGE_SWITCH) != kubeagents_switches.OFF
+    except Exception as exc:  # noqa: BLE001 — no switch module here: the check stays off
+        logger.warning("pr_opened: the %s switch is unreadable: %r", POST_MERGE_SWITCH, exc)
+        return False
 
 
 def claim_repository(record):
@@ -402,7 +444,7 @@ def resolve_origin():
         return NO_ORIGIN
 
 
-def _session_kv_post(path, payload):
+def _session_kv_post(path, payload, timeout_s=LEDGER_TIMEOUT_SECONDS):
     """POST ``payload`` to the Session KV server with the pod's key; the JSON answer. Raises on failure."""
     token = (os.environ.get(SESSION_KV_KEY_ENV) or "").strip()
     if not token:
@@ -413,7 +455,7 @@ def _session_kv_post(path, payload):
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=LEDGER_TIMEOUT_SECONDS) as response:
+    with urllib.request.urlopen(request, timeout=timeout_s) as response:
         loaded = json.loads(response.read() or b"{}")
     return loaded if isinstance(loaded, dict) else {}
 
@@ -424,6 +466,52 @@ def write_ledger(url, origin):
         _session_kv_post(LEDGER_PATH, {"url": url, "origin": origin[0], "platform": origin[1]})
     except Exception as exc:  # noqa: BLE001 — the PR is open; this url's count is lost
         logger.warning("pr_opened: the ledger did not record %s: %r", url, exc)
+
+
+def card_thread(task_id):
+    """``(platform, chat_id, thread_id)`` card ``task_id`` reports to; NO_THREAD when none or unreadable."""
+    if not task_id:
+        return NO_THREAD
+    try:
+        from hermes_cli.kanban_db_connect import connect_closing
+
+        with connect_closing() as conn:
+            conn.execute(f"PRAGMA busy_timeout={CARD_THREAD_BUSY_MS}")
+            row = conn.execute(CARD_THREAD_SQL, (task_id,)).fetchone()
+    except Exception as exc:  # noqa: BLE001 — the record stands without its thread
+        logger.warning("pr_opened: the thread of card %s is unreadable: %r", task_id, exc)
+        return NO_THREAD
+    return tuple(str(value or "") for value in row) if row else NO_THREAD
+
+
+def write_post_merge_record(confirmed, kind, origin, task_id):
+    """Record the claimed fix at ``confirmed`` for the post-merge check. Logged, never raised.
+
+    Nothing is written unless ``kind`` is one the check knows and the switch is on.
+    A scheduled run is not a kanban worker, so its record has no thread.
+    """
+    if not isinstance(kind, str) or kind not in POST_MERGE_KINDS or not post_merge_check_on():
+        return
+    platform, chat_id, thread_id = card_thread(task_id)
+    payload = {
+        "url": confirmed["url"],
+        "number": confirmed.get("number"),
+        "kind": kind,
+        "origin": origin[0],
+        "platform": origin[1],
+        "task_id": task_id,
+        "thread_platform": platform,
+        "thread_chat_id": chat_id,
+        "thread_id": thread_id,
+    }
+    try:
+        _session_kv_post(
+            POST_MERGE_PATH,
+            {key: value for key, value in payload.items() if value is not None},
+            timeout_s=POST_MERGE_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:  # noqa: BLE001 — the PR is open; the check will not follow it
+        logger.warning("pr_opened: the post-merge check did not record %s: %r", confirmed["url"], exc)
 
 
 def record(task_id, proposal):
@@ -501,6 +589,10 @@ def _claim_output(output):
             if confirmed is not None:
                 origin = origin or resolve_origin()
                 write_ledger(confirmed["url"], origin)
+                if answer_by - time.monotonic() >= POST_MERGE_COST_SECONDS:
+                    write_post_merge_record(confirmed, proposal.get("kind"), origin, task_id)
+                elif proposal.get("kind"):
+                    logger.warning("pr_opened: no time left to record %s for the post-merge check", confirmed["url"])
                 if task_id and _recorded(task_id, confirmed):
                     removed.add(proposal["url"])
                     changed = True
