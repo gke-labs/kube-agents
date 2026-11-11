@@ -583,7 +583,9 @@ class SiblingGatewayRolloutGatesTest(unittest.TestCase):
             (
                 "e2e-manual-runner.yml:run-e2e",
                 int(manual_minutes),
-                gates_paid_twice + _E2E_RUNNER_SETUP_SECONDS + _E2E_ALL_SUITES_ALLOWANCE_SECONDS,
+                # Its `mode` input can be `next`, so its gate is budgeted too.
+                gates_paid_twice + _E2E_RUNNER_SETUP_SECONDS + _E2E_ALL_SUITES_ALLOWANCE_SECONDS
+                + _mode_next_gate_seconds(),
             )
         )
 

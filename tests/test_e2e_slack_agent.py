@@ -175,6 +175,12 @@ class SlackAgentTestLogic(unittest.TestCase):
         self.assertIn("failure", str(caught.exception))
         self.assertIn("the model returned 5xx", str(caught.exception))
 
+    def test_on_a_lineless_next_thread_a_notice_before_the_answer_is_not_it(self):
+        note = {"ts": "1800000001.000100", "user": _BOT, "bot_id": "B1", "text": "ℹ️ looking at the cluster"}
+        fake = FakeSlack([{}, {"reaction": "eyes", "replies": [note]}, {"reaction": "eyes", "replies": [note, _ANSWER]}])
+        _run(fake, mode="next")
+        self.assertEqual(3, fake.polls)  # the preflight, the poll with only the notice, then the answer
+
     def test_an_unknown_mode_skips_the_modes_own_checks(self):
         answer = {"ts": _ANSWER_TS, "user": _BOT, "text": "It is 5."}
         with mock.patch.object(MOD, "install_mode", lambda: None):

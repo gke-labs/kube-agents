@@ -209,8 +209,18 @@ def _turn(replies: list[dict], next_mode: bool) -> tuple[dict, str] | None:
     never taken for it. Elsewhere, the first-reply check stands and any bot message
     containing the expected answer is the answer."""
     if next_mode:
-        has_line = any(live.status_state(m.get("text", "")) for m in replies)
-        return live.read_turn(replies, live.WAIT_ANSWER, lineless=not has_line)
+        if any(live.status_state(m.get("text", "")) for m in replies):
+            return live.read_turn(replies, live.WAIT_ANSWER)
+        # No status line (the gateway keeps none in a Slack thread): a notice or an
+        # earlier post also reads as an answer by text, so only a refusal or failure
+        # ends the turn early, and the answer is the latest answer-shaped post that
+        # says what was asked; until one does, the poll goes on.
+        turn = live.read_turn(replies, live.WAIT_ANSWER, lineless=True)
+        if turn is None or turn[1] != live.KIND_ANSWER:
+            return turn
+        answers = [m for m in replies if live.classify(m.get("text", "")) == live.KIND_ANSWER
+                   and EXPECTED_ANSWER_PATTERN.search(m.get("text", ""))]
+        return (answers[-1], live.KIND_ANSWER) if answers else None
     msg = _answer(replies)
     return (msg, live.KIND_ANSWER) if msg is not None else None
 
