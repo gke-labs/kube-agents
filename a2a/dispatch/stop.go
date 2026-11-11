@@ -91,7 +91,7 @@ func (d *Dispatcher) syncStops() {
 		sub.Stop()
 	}
 	for _, profile := range add {
-		sub, err := d.bus.SubscribeCore(lib.DispatchStopPrefix+profile+".*", func(m *nats.Msg) { d.onStop(profile, m) })
+		sub, err := d.busFor(profile).SubscribeCore(lib.DispatchStopPrefix+profile+".*", func(m *nats.Msg) { d.onStop(profile, m) })
 		if err != nil {
 			d.log.Warn("subscribe to a profile's stops; retrying", "profile", profile, "err", err)
 			continue
@@ -225,7 +225,7 @@ func (d *Dispatcher) stopRequested(ctx context.Context, log *slog.Logger, profil
 	rctx, cancel := context.WithTimeout(ctx, stopCheckTimeout)
 	defer cancel()
 	subject := lib.DispatchStopSubject(profile, taskID)
-	msg, err := d.bus.Conn().RequestWithContext(rctx, directGetPrefix+lib.DispatchStopStream+"."+subject, nil)
+	msg, err := d.busFor(profile).Conn().RequestWithContext(rctx, directGetPrefix+lib.DispatchStopStream+"."+subject, nil)
 	switch {
 	case errors.Is(err, nats.ErrConnectionClosed), errors.Is(err, nats.ErrConnectionDraining),
 		errors.Is(err, nats.ErrInvalidConnection), errors.Is(err, nats.ErrConnectionReconnecting):

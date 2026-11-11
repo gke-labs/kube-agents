@@ -26,6 +26,7 @@ import (
 	"math"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -63,13 +64,16 @@ const (
 	// prefix and its verifier caller name. The binary spells the same string.
 	a2aDispatcherUser = "dispatcher"
 
-	// a2aDispatcherBucketedGrantsEnvVar turns on the dispatcher's bucketed
-	// grants (#5381). With it on, the dispatcher's map entry carries only its
-	// control connection's fixed grants and the draining profiles' names, and
-	// the callout derives each bucket connection's per-profile grants from
-	// the profile entries. Off by default. Turning it on needs a dispatcher
-	// that opens its bucket connections (#5381's second PR): an older one
-	// loses every profile grant.
+	// a2aDispatcherBucketedGrantsEnvVar switches the dispatcher's bucketed
+	// grants (#5381). On (the default), the dispatcher's map entry carries
+	// only its control connection's fixed grants and the draining profiles'
+	// names, the callout derives each bucket connection's per-profile grants
+	// from the profile entries, and the operator renders the same switch onto
+	// the dispatcher, which opens its bucket connections. "false" restores
+	// the single connection with every grant in the map. The dispatcher's
+	// image must move with the operator's: one from before the bucket
+	// connections ignores the switch, binds no durable on its control
+	// connection, and stays not Ready, which is loud, not silent.
 	a2aDispatcherBucketedGrantsEnvVar = "A2A_DISPATCHER_BUCKETED_GRANTS"
 
 	// a2aNarrowingDispatcher is the callout's NarrowingDispatcher, and
@@ -116,10 +120,10 @@ func a2aDispatcherReleaseImage() string {
 func a2aDispatcherEnabled() bool { return a2aDispatcherImage() != "" }
 
 // a2aDispatcherBucketedGrants reports whether the dispatcher's entry narrows
-// on "dispatcher" (A2A_DISPATCHER_BUCKETED_GRANTS=true). Only the exact
-// string turns it on.
+// on "dispatcher": on unless A2A_DISPATCHER_BUCKETED_GRANTS is exactly
+// "false". Any other value, unset included, is on.
 func a2aDispatcherBucketedGrants() bool {
-	return strings.TrimSpace(os.Getenv(a2aDispatcherBucketedGrantsEnvVar)) == "true"
+	return strings.TrimSpace(os.Getenv(a2aDispatcherBucketedGrantsEnvVar)) != "false"
 }
 
 // dispatcherMapEntry is the dispatcher's identity-map entry. With bucketed
@@ -363,6 +367,10 @@ func buildA2ADispatcherDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.De
 							{Name: "DISPATCH_CONFIGMAP", Value: a2aDispatchConfigName(agent)},
 							{Name: a2aTaskSigningSeedFileEnvVar, Value: a2aTaskSigningSeedMountPath + "/" + a2aTaskSigningSeedFile},
 							a2aTaskCredentialMaxLifetimeEnv(agent),
+							// The same switch as the dispatcher's map entry,
+							// so the process opens its bucket connections
+							// exactly when the callout splits its grants.
+							{Name: a2aDispatcherBucketedGrantsEnvVar, Value: strconv.FormatBool(a2aDispatcherBucketedGrants())},
 						},
 						VolumeMounts: []corev1.VolumeMount{a2aBusTokenVolumeMount(), a2aNATSCABundleMount(),
 							{Name: a2aTaskSigningSeedVolume, MountPath: a2aTaskSigningSeedMountPath, ReadOnly: true}},

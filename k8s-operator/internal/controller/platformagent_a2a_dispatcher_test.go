@@ -230,6 +230,10 @@ func TestTheDispatchConfigIsResolvedAndListsTheDurables(t *testing.T) {
 // config, which lib decodes and validates.
 func TestRenderedDispatcherFixtures(t *testing.T) {
 	withDispatcher(t)
+	// The flag-off render: the callout's dispatcher contract suite runs a
+	// real server against these grants (the bucketed render has its own
+	// fixture).
+	t.Setenv(a2aDispatcherBucketedGrantsEnvVar, "false")
 	// With the operator, whose durable grants come with the dispatcher.
 	withOperatorBusPrincipal(t)
 	agent := authMapTestAgent()

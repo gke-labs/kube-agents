@@ -3,7 +3,6 @@ package authcallout
 import (
 	"fmt"
 	"slices"
-	"strconv"
 
 	lib "github.com/gke-labs/kube-agents/a2a/lib"
 )
@@ -31,7 +30,7 @@ import (
 // _INBOX.<user>-b<n>.> is disjoint from the control connection's
 // _INBOX.<user>.>.
 func dispatcherBucketUser(user string, bucket int) string {
-	return user + "-b" + strconv.Itoa(bucket)
+	return lib.DispatcherBucketUser(user, bucket)
 }
 
 // dispatcherBucketUsers is every bucket user a dispatcher entry can issue.

@@ -95,5 +95,5 @@ func (d *Dispatcher) publishTerminal(ctx context.Context, hk holdKey, sub *lib.E
 	if err != nil {
 		return fmt.Errorf("build the %s terminal: %w", reason, err)
 	}
-	return d.bus.Publish(ctx, lib.TaskSupervisorSubject(hk.profile, sub.TaskID), env)
+	return d.busFor(hk.profile).Publish(ctx, lib.TaskSupervisorSubject(hk.profile, sub.TaskID), env)
 }

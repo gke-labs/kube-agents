@@ -53,6 +53,13 @@ const (
 	// callout's setting of the same name, parsed by the callout's parser so
 	// the two never disagree on what a value means.
 	envTaskCredentialMaxLifetime = "A2A_TASK_CREDENTIAL_MAX_LIFETIME" // #nosec G101 -- an env var name, not a credential
+	// envBucketedGrants is set to "true" by the operator when it renders the
+	// dispatcher's identity-map entry narrowed on "dispatcher" (#5381): the
+	// callout then grants the per-profile subjects only on bucket
+	// connections, and this process opens lib.DispatcherBuckets of them
+	// beside its control connection. Only the exact string turns it on, as
+	// on the operator.
+	envBucketedGrants = "A2A_DISPATCHER_BUCKETED_GRANTS"
 
 	// configWait bounds the wait for the first config at startup: past it
 	// the process exits and the kubelet's restart says so.
@@ -150,6 +157,10 @@ type settings struct {
 	// caps the credentials it signs (zero is the callout's default).
 	taskKey         nkeys.KeyPair
 	taskMaxLifetime time.Duration
+	// bucketAuth is each bucket connection's credentials, in bucket order,
+	// when the grants are bucketed; nil when every grant rides the one
+	// connection.
+	bucketAuth [][]nats.Option
 }
 
 // taskSigning loads the task-signing key from envTaskSigningSeedFile and the
@@ -203,6 +214,22 @@ func readSettings(getenv func(string) string) (settings, error) {
 		return s, fmt.Errorf("bus credentials: %w", err)
 	}
 	s.auth = auth
+	if strings.TrimSpace(getenv(envBucketedGrants)) == "true" {
+		if getenv("NATS_USER") != "" {
+			return s, fmt.Errorf("%s needs the bus token: a static NATS_USER has no callout to split its grants", envBucketedGrants)
+		}
+		tokenFile := getenv(lib.EnvBusTokenFile)
+		if tokenFile == "" {
+			tokenFile = lib.BusTokenPath
+		}
+		for b := 0; b < lib.DispatcherBuckets; b++ {
+			opts, err := lib.DispatcherBucketNATSOptions(tokenFile, natsUser, b)
+			if err != nil {
+				return s, fmt.Errorf("bus credentials for bucket %d: %w", b, err)
+			}
+			s.bucketAuth = append(s.bucketAuth, opts)
+		}
+	}
 	return s, nil
 }
 
@@ -240,12 +267,37 @@ func serve(ctx context.Context, log *slog.Logger, s settings, kube kubernetes.In
 		return stopped(ctx, fmt.Errorf("bus connect: %w", err))
 	}
 	defer client.Close()
-	pr.setBus(func() bool { return client.Conn().IsConnected() })
+	buckets, err := connectBuckets(ctx, log, s)
+	for _, b := range buckets {
+		defer b.Close()
+	}
+	if err != nil {
+		return stopped(ctx, fmt.Errorf("bus connect: %w", err))
+	}
+	// Ready needs every connection: a bucket that's down holds back its
+	// profiles' durables, stops and terminals.
+	pr.setBus(func() bool {
+		if !client.Conn().IsConnected() {
+			return false
+		}
+		for _, b := range buckets {
+			if !b.Conn().IsConnected() {
+				return false
+			}
+		}
+		return true
+	})
 	cfg := dispatch.DefaultConfig()
 	cfg.TaskSigningKey, cfg.TaskCredentialMaxLifetime = s.taskKey, s.taskMaxLifetime
 	d, err := dispatch.New(cfg, client, store, pool, busVerifier{conn: client.Conn, log: log}, log)
 	if err != nil {
 		return err
+	}
+	if buckets != nil {
+		if err := d.UseBuckets(buckets); err != nil {
+			return err
+		}
+		log.Info("bucketed grants: per-profile subjects ride the bucket connections", "buckets", len(buckets))
 	}
 	// Job mode for the unattended tier. It runs only for a profile with a
 	// Job template in the config, which the operator renders (with this
@@ -262,6 +314,28 @@ func serve(ctx context.Context, log *slog.Logger, s settings, kube kubernetes.In
 		return cause
 	}
 	return nil
+}
+
+// connectBuckets opens the bucket connections when the grants are bucketed,
+// in bucket order, each named for its bucket; nil, nil when they aren't. On
+// an error it returns the ones it opened, for the caller to close.
+func connectBuckets(ctx context.Context, log *slog.Logger, s settings) ([]*lib.Client, error) {
+	if s.bucketAuth == nil {
+		return nil, nil
+	}
+	var out []*lib.Client
+	for b, auth := range s.bucketAuth {
+		c, err := connectWithRetry(ctx, log, dialBackoff, func(ctx context.Context) (*lib.Client, error) {
+			return lib.Connect(ctx, s.natsURL, lib.WithName(fmt.Sprintf("%s-b%d", clientName, b)), lib.WithLogger(log),
+				lib.WithAgreementPolicy(lib.AgreementPolicy{Submitter: dispatch.DefaultSubmitter}),
+				lib.WithNATSOptions(append(auth, nats.ReconnectWait(reconnectWait), nats.ReconnectJitter(reconnectJitter, reconnectJitter))...))
+		})
+		if err != nil {
+			return out, fmt.Errorf("bucket %d: %w", b, err)
+		}
+		out = append(out, c)
+	}
+	return out, nil
 }
 
 // stopped is err from a wait before dispatching starts (the config, the

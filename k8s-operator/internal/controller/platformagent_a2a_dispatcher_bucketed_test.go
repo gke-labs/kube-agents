@@ -75,22 +75,35 @@ func TestBucketedGrantsRenderTheFixedSetAndTheDrainingNames(t *testing.T) {
 	checkFixture(t, dispatcherMapBucketedFixturePath, shards[0].Data[a2aAuthMapKey])
 }
 
-// Off is today's render, byte for byte: the flag changes nothing until set,
-// and only the exact string "true" sets it.
-func TestBucketedGrantsOffIsTodaysEntry(t *testing.T) {
+// Bucketed grants are on by default (#5381's second PR). Only "false" turns
+// them off, which restores today's entry; any other value, unset included, is
+// on. The dispatcher's own Deployment carries the same switch.
+func TestBucketedGrantsAreOnUnlessFalse(t *testing.T) {
 	withDispatcher(t)
 	withOperatorBusPrincipal(t)
 	agent := authMapTestAgent()
 	tse := testAgentProfile(agent.Namespace, "tse")
-	for _, v := range []string{"", "false", "TRUE", "1", "yes", " true1"} {
+	for _, v := range []string{"", "true", "TRUE", "1", "False", "false", " false "} {
 		t.Setenv(a2aDispatcherBucketedGrantsEnvVar, v)
 		doc, err := renderA2AAuthMap(agent, []agentv1alpha1.AgentProfile{tse})
 		if err != nil {
 			t.Fatal(err)
 		}
 		id := dispatcherEntryOf(t, doc)
-		if id.Narrowing != "" || len(id.Draining) != 0 || !slices.Contains(id.Grants.Subscribe, "a2a.stop.tse.*") {
+		want := strings.TrimSpace(v) != "false"
+		if got := id.Narrowing == a2aNarrowingDispatcher; got != want {
+			t.Errorf("%s=%q: bucketed = %v, want %v", a2aDispatcherBucketedGrantsEnvVar, v, got, want)
+		}
+		if !want && (len(id.Draining) != 0 || !slices.Contains(id.Grants.Subscribe, "a2a.stop.tse.*")) {
 			t.Errorf("%s=%q rendered %+v; want today's entry", a2aDispatcherBucketedGrantsEnvVar, v, id)
+		}
+		env := map[string]string{}
+		for _, e := range buildA2ADispatcherDeployment(agent).Spec.Template.Spec.Containers[0].Env {
+			env[e.Name] = e.Value
+		}
+		if env[a2aDispatcherBucketedGrantsEnvVar] != fmt.Sprint(want) {
+			t.Errorf("%s=%q: the dispatcher's env says %q, want %v; the process must open its buckets exactly when the map is split",
+				a2aDispatcherBucketedGrantsEnvVar, v, env[a2aDispatcherBucketedGrantsEnvVar], want)
 		}
 	}
 }

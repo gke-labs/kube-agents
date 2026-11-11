@@ -420,10 +420,11 @@ leave open:
   stream when the dispatcher restarts mid-drain has no durable to come back on.
 - **Off by default.** The operator renders the dispatcher only when its `A2A_DISPATCHER_IMAGE`
   is set, until profiles dispatch end to end; with it unset there is no dispatcher and no
-  identity for one. `A2A_DISPATCHER_BUCKETED_GRANTS` (off by default) moves its
-  per-profile grants out of the identity map and onto per-bucket connections the callout
-  derives (spec-nats-deployment.md); a dispatcher that doesn't open them loses every
-  profile grant, so it stays off until the dispatcher opens its bucket connections.
+  identity for one. Its per-profile grants are out of the identity map and on 32 bucket
+  connections the callout derives (spec-nats-deployment.md); `A2A_DISPATCHER_BUCKETED_GRANTS=false`
+  on the operator puts them back in the map on one connection. The operator and the dispatcher
+  move together: a dispatcher from before the bucket connections binds nothing under a split map
+  and stays not Ready.
 - **Terminal notice.** A task the dispatcher ends gets a final status on its `.supervisor`
   subject (`lib.TaskSupervisorSubject`, contract addendum 6), never its `.events`, which stays
   the executor's alone: `rejected` when it is refused at admission (nothing ran), `failed`

@@ -222,12 +222,16 @@ type Dispatcher struct {
 	grantedProfiles map[string]bool
 	// bindRetry paces the retries of durables that failed to bind.
 	bindRetry map[string]bindBackoff
-	// regrantNotBefore holds off another round of reconnects after one
-	// that left a durable unbindable.
-	regrantNotBefore time.Time
-	reconnects       atomic.Int64
-	// regranting is set while a regrant runs, off the Run loop.
-	regranting atomic.Bool
+	// regrants is each connection's regrant state: one slot for the single
+	// connection, or one per bucket connection (UseBuckets, #5381), so a
+	// profile change reconnects only its own bucket and a bucket's cooldown
+	// holds back no other.
+	regrants   []*regrantSlot
+	reconnects atomic.Int64
+	// buckets are the bucket connections, indexed by lib.DispatcherBucket,
+	// when the callout splits the dispatcher's grants (#5381); nil when
+	// every grant rides bus.
+	buckets []*lib.Client
 	// bg is Run's background work (a regrant, a sweep), waited for on the
 	// way out.
 	bg sync.WaitGroup
@@ -250,6 +254,63 @@ type Dispatcher struct {
 	// jobAdmissionErr is the last refusal of a Job by the admission
 	// policy, "" once one is admitted (job.go).
 	jobAdmissionErr string
+}
+
+// regrantSlot is one connection's regrant state.
+type regrantSlot struct {
+	// notBefore holds off another round of reconnects after one that left
+	// a durable unbindable.
+	notBefore time.Time
+	// regranting is set while a regrant runs, off the Run loop.
+	regranting atomic.Bool
+	// reconnects counts the reconnects config changes cost this connection.
+	reconnects atomic.Int64
+}
+
+// UseBuckets moves every per-profile subject (the durables, the stop
+// subscriptions and reads, the supervisor terminal) onto bucket connections,
+// one per lib.DispatcherBucket, which the callout grants per bucket (#5381).
+// bus keeps the rest. Call it before Run, with exactly lib.DispatcherBuckets
+// connected clients in bucket order.
+func (d *Dispatcher) UseBuckets(clients []*lib.Client) error {
+	if len(clients) != lib.DispatcherBuckets {
+		return fmt.Errorf("dispatch: %d bucket connections, want %d", len(clients), lib.DispatcherBuckets)
+	}
+	for i, c := range clients {
+		if c == nil {
+			return fmt.Errorf("dispatch: bucket connection %d is nil", i)
+		}
+	}
+	d.buckets = clients
+	d.regrants = make([]*regrantSlot, len(clients))
+	for i := range d.regrants {
+		d.regrants[i] = &regrantSlot{}
+	}
+	return nil
+}
+
+// slotOf is the connection slot a profile's grants ride on.
+func (d *Dispatcher) slotOf(profile string) int {
+	if d.buckets == nil {
+		return 0
+	}
+	return lib.DispatcherBucket(profile)
+}
+
+// busFor is the connection a profile's per-profile subjects go over.
+func (d *Dispatcher) busFor(profile string) *lib.Client {
+	if d.buckets == nil {
+		return d.bus
+	}
+	return d.buckets[lib.DispatcherBucket(profile)]
+}
+
+// busForSlot is the connection in slot i.
+func (d *Dispatcher) busForSlot(i int) *lib.Client {
+	if d.buckets == nil {
+		return d.bus
+	}
+	return d.buckets[i]
 }
 
 // New builds a dispatcher on bus. src is the install config, pool the
@@ -296,6 +357,7 @@ func New(cfg Config, bus *lib.Client, src Source, pool Pool, verifier Verifier, 
 		granted:    map[string]bool{},
 
 		grantedProfiles: map[string]bool{},
+		regrants:        []*regrantSlot{{}},
 		bindRetry:       map[string]bindBackoff{},
 		breakers:        newBreakers(),
 		stopSubs:        map[string]lib.Subscription{},
@@ -416,28 +478,42 @@ func (d *Dispatcher) syncBindings(ctx context.Context) {
 	cfg := d.src.Config()
 	want := map[string]string{} // durable name -> profile
 	durables := map[string]lib.DispatchDurable{}
-	var added, addedProfiles []string
+	// What each connection slot lacks a grant for: one slot, or one per
+	// bucket, so only the buckets whose profiles changed reconnect.
+	added := map[int][]string{}
+	addedProfiles := map[int][]string{}
 	d.mu.Lock()
 	for _, p := range cfg.Profiles {
+		slot := d.slotOf(p.Name)
 		if !d.grantedProfiles[p.Name] {
-			addedProfiles = append(addedProfiles, p.Name)
+			addedProfiles[slot] = append(addedProfiles[slot], p.Name)
 		}
 		for _, dur := range p.Durables {
 			want[dur.Name], durables[dur.Name] = p.Name, dur
 			if !d.granted[dur.Name] {
-				added = append(added, dur.Name)
+				added[slot] = append(added[slot], dur.Name)
 			}
 		}
 	}
-	cooling := d.now().Before(d.regrantNotBefore)
+	now := d.now()
+	var start []int
+	for slot, rs := range d.regrants {
+		if (len(added[slot]) > 0 || len(addedProfiles[slot]) > 0) && !now.Before(rs.notBefore) {
+			start = append(start, slot)
+		}
+	}
 	d.mu.Unlock()
-	if (len(added) > 0 || len(addedProfiles) > 0) && !cooling && d.regranting.CompareAndSwap(false, true) {
+	for _, slot := range start {
+		rs := d.regrants[slot]
+		if !rs.regranting.CompareAndSwap(false, true) {
+			continue
+		}
 		d.bg.Add(1)
-		go func() {
+		go func(slot int, durs, profiles []string) {
 			defer d.bg.Done()
-			defer d.regranting.Store(false)
-			d.regrant(ctx, want, durables, added, addedProfiles)
-		}()
+			defer rs.regranting.Store(false)
+			d.regrant(ctx, slot, want, durables, durs, profiles)
+		}(slot, added[slot], addedProfiles[slot])
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -451,7 +527,7 @@ func (d *Dispatcher) syncBindings(ctx context.Context) {
 			delete(d.granted, name)
 		}
 	}
-	now := d.now()
+	now = d.now()
 	for name, profile := range want {
 		if !d.granted[name] || d.subs[name] != nil || d.binding[name] || now.Before(d.bindRetry[name].next) {
 			continue
@@ -475,7 +551,8 @@ func (d *Dispatcher) syncBindings(ctx context.Context) {
 // the held bind refuses) gets another reconnect, with backoff, up to
 // RegrantAttempts; then it is logged as an error and left for the next
 // refresh. Held work is untouched throughout (lib.Client.Reconnect).
-func (d *Dispatcher) regrant(ctx context.Context, want map[string]string, durables map[string]lib.DispatchDurable, added, addedProfiles []string) {
+func (d *Dispatcher) regrant(ctx context.Context, slot int, want map[string]string, durables map[string]lib.DispatchDurable, added, addedProfiles []string) {
+	rs := d.regrants[slot]
 	backoff := d.cfg.RegrantBackoff
 	pending := added
 	for attempt := 1; attempt <= d.cfg.RegrantAttempts; attempt++ {
@@ -486,11 +563,12 @@ func (d *Dispatcher) regrant(ctx context.Context, want map[string]string, durabl
 			backoff *= 2
 		}
 		rctx, cancel := context.WithTimeout(ctx, d.cfg.ReconnectTimeout)
-		err := d.bus.Reconnect(rctx)
+		err := d.busForSlot(slot).Reconnect(rctx)
 		cancel()
 		d.reconnects.Add(1)
+		rs.reconnects.Add(1)
 		if err != nil {
-			d.log.Warn("reconnect for new durables' grants", "attempt", attempt, "err", err)
+			d.log.Warn("reconnect for new durables' grants", "connection", d.slotName(slot), "attempt", attempt, "err", err)
 			continue
 		}
 		// A profile's `.supervisor` grant can't be probed without publishing;
@@ -527,13 +605,13 @@ func (d *Dispatcher) regrant(ctx context.Context, want map[string]string, durabl
 		}
 		d.mu.Unlock()
 		if len(refused) == 0 {
-			d.log.Info("reconnected for new durables and profiles", "durables", added, "profiles", addedProfiles, "attempts", attempt)
+			d.log.Info("reconnected for new durables and profiles", "connection", d.slotName(slot), "durables", added, "profiles", addedProfiles, "attempts", attempt)
 			return
 		}
 		pending = refused
 	}
 	d.mu.Lock()
-	d.regrantNotBefore = d.now().Add(d.cfg.RegrantCooldown)
+	rs.notBefore = d.now().Add(d.cfg.RegrantCooldown)
 	d.mu.Unlock()
 	d.log.Error("durables still not bindable after reconnecting; trying again after the cooldown",
 		"durables", pending, "attempts", d.cfg.RegrantAttempts, "cooldown", d.cfg.RegrantCooldown)
@@ -575,7 +653,7 @@ func (d *Dispatcher) bindNow(ctx context.Context, profile string, dur lib.Dispat
 }
 
 func (d *Dispatcher) subscribe(ctx context.Context, profile string, dur lib.DispatchDurable) (lib.HeldSubscription, error) {
-	return d.bus.SubscribeHeld(ctx, lib.SubscribeConfig{
+	return d.busFor(profile).SubscribeHeld(ctx, lib.SubscribeConfig{
 		Stream:    d.cfg.Stream,
 		Durable:   dur.Name,
 		Subject:   lib.ProfileDurableFilter(profile, dur.Tier, dur.Kind),
@@ -586,6 +664,23 @@ func (d *Dispatcher) subscribe(ctx context.Context, profile string, dur lib.Disp
 
 // Reconnects counts the reconnects config changes have cost.
 func (d *Dispatcher) Reconnects() int64 { return d.reconnects.Load() }
+
+// BucketReconnects is the reconnects config changes cost bucket b's
+// connection; 0 for a dispatcher with no buckets or a bucket out of range.
+func (d *Dispatcher) BucketReconnects(b int) int64 {
+	if d.buckets == nil || b < 0 || b >= len(d.regrants) {
+		return 0
+	}
+	return d.regrants[b].reconnects.Load()
+}
+
+// slotName names a connection slot in logs.
+func (d *Dispatcher) slotName(slot int) string {
+	if d.buckets == nil {
+		return "single"
+	}
+	return lib.DispatcherBucketCredential(slot)
+}
 
 func (d *Dispatcher) bind(ctx context.Context, profile string, dur lib.DispatchDurable) {
 	name := dur.Name
