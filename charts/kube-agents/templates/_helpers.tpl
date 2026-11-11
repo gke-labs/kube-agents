@@ -250,36 +250,29 @@ the agent's gateway policy writes the same thing here. Peers are CIDR blocks
 only, as the CR's are, and values.schema.json bounds them the way the CRD
 does. The schema admits what the CRD admits, so each peer also goes through
 openaiCompatibleCIDRRefusal, the check the gateway's egressCIDRs take (the
-operator's own check on those upstream CIDRs): a peer that is not in CIDR
-notation, an IPv4-mapped IPv6 block, a peer in a link-local range or inside
-fd20:ce::/48 fails the render rather than rendering as the whole internet or
-a path to the metadata server. A bare address is written out as a /32 or
-/128, as the operator canonicalises one on the CR; the NetworkPolicy API
-rejects an ipBlock without a prefix. A rule without ports opens every port
-to its peers, which is the NetworkPolicy API's own reading of it.
+operator's own check on those upstream CIDRs): a malformed address, an
+IPv4-mapped IPv6 block, a peer in a link-local range or inside fd20:ce::/48
+fails the render rather than rendering as the whole internet or a path to
+the metadata server. A bare address, as a peer or an except, is written out
+as a /32 or /128, as the operator canonicalises one on the CR; the
+NetworkPolicy API rejects an ipBlock without a prefix. An except is widened
+but not checked: one outside its peer is rejected by the API server, as the
+values comment says. A rule without ports opens every port to its peers,
+which is the NetworkPolicy API's own reading of it.
 */}}
 {{- define "kube-agents.hindsightAdditionalEgress" -}}
-{{- $ipv4HostPrefix := 32 -}}
-{{- $ipv6HostPrefix := 128 -}}
 {{- $rules := list -}}
 {{- range . -}}
 {{- $peers := list -}}
 {{- range .to -}}
-{{- $cidr := toString .cidr | trim -}}
-{{- if not (contains "/" $cidr) -}}
-{{- $cidr = printf "%s/%d" $cidr (ternary $ipv6HostPrefix $ipv4HostPrefix (contains ":" $cidr)) -}}
-{{- end -}}
+{{- $cidr := include "kube-agents.cidrWithHostPrefix" .cidr -}}
 {{- with include "kube-agents.openaiCompatibleCIDRRefusal" $cidr -}}
 {{- fail (printf "hindsight.api.networkPolicy.additionalEgress peer %q %s." $cidr .) -}}
 {{- end -}}
 {{- $block := dict "cidr" $cidr -}}
 {{- $excepts := list -}}
 {{- range .except -}}
-{{- $except := toString . | trim -}}
-{{- if not (contains "/" $except) -}}
-{{- $except = printf "%s/%d" $except (ternary $ipv6HostPrefix $ipv4HostPrefix (contains ":" $except)) -}}
-{{- end -}}
-{{- $excepts = append $excepts $except -}}
+{{- $excepts = append $excepts (include "kube-agents.cidrWithHostPrefix" .) -}}
 {{- end -}}
 {{- with $excepts -}}
 {{- $_ := set $block "except" . -}}
@@ -297,6 +290,23 @@ to its peers, which is the NetworkPolicy API's own reading of it.
 {{- $rules = append $rules $rule -}}
 {{- end -}}
 {{- toYaml $rules -}}
+{{- end }}
+
+{{/*
+A CIDR as written, or a bare address with its host prefix appended: /32 for
+IPv4, /128 for IPv6. The NetworkPolicy API rejects an ipBlock without a
+prefix, and the operator canonicalises a bare address on the CR the same way.
+Takes the value; returns the string, trimmed.
+*/}}
+{{- define "kube-agents.cidrWithHostPrefix" -}}
+{{- $ipv4HostPrefix := 32 -}}
+{{- $ipv6HostPrefix := 128 -}}
+{{- $cidr := toString . | trim -}}
+{{- if contains "/" $cidr -}}
+{{- $cidr -}}
+{{- else -}}
+{{- printf "%s/%d" $cidr (ternary $ipv6HostPrefix $ipv4HostPrefix (contains ":" $cidr)) -}}
+{{- end -}}
 {{- end }}
 
 {{/*

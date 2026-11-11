@@ -149,6 +149,13 @@ def _render_notes(*extra):
     return proc.stdout
 
 
+def _with_host_prefix(cidr):
+    """A bare address as the chart renders it: with /32 (IPv4) or /128 (IPv6)."""
+    if "/" in cidr:
+        return cidr
+    return f"{cidr}/{128 if ':' in cidr else 32}"
+
+
 def _crd_additional_egress_schema():
     crd = yaml.safe_load(_CHART_CRD.read_text())
     (version,) = crd["spec"]["versions"]
@@ -402,7 +409,12 @@ class HindsightNetworkPolicyTest(unittest.TestCase):
         # A bare address renders with its host prefix, as the operator
         # canonicalises one on the CR: the NetworkPolicy API rejects an
         # ipBlock whose cidr has no prefix.
-        rule_sets += ["--set", f"{_ADDITIONAL_EGRESS}[0].to[0].except[1]=10.200.2.9"]
+        rule_sets += [
+            "--set",
+            f"{_ADDITIONAL_EGRESS}[0].to[0].except[1]=10.200.2.9",
+            "--set",
+            f"{_ADDITIONAL_EGRESS}[1].to[1].cidr=fd00::1",
+        ]
         expected_tail = [
             {
                 "ports": [{"port": 8443, "protocol": "TCP"}],
@@ -411,7 +423,7 @@ class HindsightNetworkPolicyTest(unittest.TestCase):
                     {"ipBlock": {"cidr": "192.168.5.7/32"}},
                 ],
             },
-            {"to": [{"ipBlock": {"cidr": "fd00::/48"}}]},
+            {"to": [{"ipBlock": {"cidr": "fd00::/48"}}, {"ipBlock": {"cidr": "fd00::1/128"}}]},
         ]
         default_egress = self.kustomize[_HINDSIGHT_API_POLICY]["spec"]["egress"]
 
@@ -480,8 +492,8 @@ class HindsightNetworkPolicyTest(unittest.TestCase):
         refusals.update(
             {
                 # The message names the peer as rendered: a bare address with
-                # its /32 or /128, so the closing quote is left off the match.
-                what: ([f"{_ADDITIONAL_EGRESS}[0].to[0].cidr={cidr}"], reason, f'peer "{cidr}')
+                # its /32 or /128.
+                what: ([f"{_ADDITIONAL_EGRESS}[0].to[0].cidr={cidr}"], reason, f'peer "{_with_host_prefix(cidr)}"')
                 for what, (cidr, reason) in render_refusals.items()
             }
         )

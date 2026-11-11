@@ -538,7 +538,7 @@ notes warn when the store renders without it.
 peers and 16 ports each, a `/12` (IPv4) or `/48` (IPv6) prefix floor, and an
 `except` that must lie inside its peer or the API server rejects the policy.
 The render also refuses what `litellm.openaiCompatible.egressCIDRs` refuses: a
-peer that is not in CIDR notation, an IPv4-mapped IPv6 block, and a peer in a
+malformed address, an IPv4-mapped IPv6 block, and a peer in a
 link-local range (`169.254.0.0/16`, `fe80::/10`) or inside `fd20:ce::/48`; the
 first and last of those ranges hold the metadata server's addresses. A bare
 address renders as a `/32` or `/128`. Peers are CIDR blocks, so a gateway in
