@@ -227,6 +227,18 @@ end woke the session (not the turn that asked), and `session` is still the sessi
 Like `requester` and `audience` it is populated by the gateway only and advisory; absent on a
 task a human turn started.
 
+`authority.trigger` (added 11/11, #4685) is the unattended trigger that submitted the task:
+`{"name": "schedule/compliance-audit", "origin": "builtin", "stream": "compliance-audit"}`.
+`name` is `schedule/<name>` or a bare trigger source, `origin` is `builtin` or `user`, and
+`stream` is the report stream the grant binds, absent when it binds none. The gateway writes it
+on a trigger's submission and nowhere else; it is absent on every other task. It is a claim,
+not authority: the dispatcher passes it to the verifier with `profile.run`
+(`capability.TriggerFromAuthority`), and the verifier permits only when it equals the trigger
+the grant itself binds, both ways (a trigger the grant lacks, and a grant trigger the block
+omits, are each refused). Only then does the dispatcher copy it into the task's
+credential-proxy credential, where the broker reads it ([`scheduling-on-profiles.md`](scheduling-on-profiles.md)).
+A block whose `trigger` is present but malformed is refused at admission, never read as none.
+
 **The rule.** A consumer MAY treat `authority.grants` as decision-grade, subject to all
 four of:
 

@@ -56,6 +56,11 @@ class GoldenFixtureTest(unittest.TestCase):
                     self.assertEqual(
                         task_credential.TaskTarget(**want["target"]), claims.target
                     )
+                    want_trigger = want.get("trigger")
+                    self.assertEqual(
+                        task_credential.TaskTrigger(**want_trigger) if want_trigger else None,
+                        claims.trigger,
+                    )
                     self.assertTrue(claims.jti)
                 else:
                     with self.assertRaises(TaskCredentialError):
@@ -86,12 +91,32 @@ class GoldenFixtureTest(unittest.TestCase):
             "a span past the ceiling, with exp-now inside it",
             "expiry past the ceiling plus skew from now",
             "the nats audience",
+            "a builtin schedule trigger",
+            "an unknown trigger claim",
+            "a case-variant trigger key",
+            "a null trigger stream",
+            "a trigger stream under another path",
         ):
             with self.subTest(name=name):
                 self.assertIn(name, names)
 
     def _case(self, name):
         return next(case for case in self.doc["cases"] if case["name"] == name)
+
+    def test_a_verifier_without_the_trigger_claim_refuses_one(self):
+        # Version skew fails closed: a broker older than the trigger claim
+        # refuses a credential that carries one, rather than ignoring it,
+        # because every nats key it doesn't know is refused. Pinned here so a
+        # later loosening of the unknown-key rule is a visible test change.
+        case = self._case("a builtin schedule trigger")
+        old_shape = task_credential.NATS_CLAIMS - {"trigger"}
+        original = task_credential.NATS_CLAIMS
+        task_credential.NATS_CLAIMS = old_shape
+        try:
+            with self.assertRaisesRegex(TaskCredentialError, "unknown key 'trigger'"):
+                self.verify(case)
+        finally:
+            task_credential.NATS_CLAIMS = original
 
     def test_a_valid_token_from_an_untrusted_key_is_refused(self):
         with self.assertRaisesRegex(TaskCredentialError, "not a trusted"):

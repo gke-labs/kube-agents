@@ -153,13 +153,13 @@ func TestProfileTurn_IsMintedForTheResolvedProfileAndSubmittedOnSubmit(t *testin
 		t.Fatalf("grant = %+v, want read for prod-east at its cluster, delegated to the dispatcher", entry)
 	}
 	// The grant answers the dispatcher's question for this task and no other.
-	if err := capability.PermitsProfile(entry, "prod-east", capability.TierRead, "project/p1/location/us-east1/cluster/prod"); err != nil {
+	if err := capability.PermitsProfile(entry, "prod-east", capability.TierRead, "project/p1/location/us-east1/cluster/prod", nil); err != nil {
 		t.Fatalf("PermitsProfile for the minted target: %v", err)
 	}
-	if err := capability.PermitsProfile(entry, "prod-east", capability.TierRead, "project/p1/location/us-east1/cluster/dev"); err == nil {
+	if err := capability.PermitsProfile(entry, "prod-east", capability.TierRead, "project/p1/location/us-east1/cluster/dev", nil); err == nil {
 		t.Fatal("the grant permits a cluster it wasn't minted for")
 	}
-	if err := capability.PermitsProfile(entry, "cluster", capability.TierRead, "project/p1/location/us-east1/cluster/prod"); err == nil {
+	if err := capability.PermitsProfile(entry, "cluster", capability.TierRead, "project/p1/location/us-east1/cluster/prod", nil); err == nil {
 		t.Fatal("the grant permits a profile it wasn't minted for")
 	}
 }

@@ -112,6 +112,10 @@ type holding struct {
 	// cluster is the cluster admission checked the task against, nil when
 	// it names none: the target of its credential-proxy token (#3889).
 	cluster *taskcred.Target
+	// trigger is the trigger the verifier found equal to the grant's, nil
+	// when the submission names none: its credential-proxy token carries it
+	// (#4685).
+	trigger *taskcred.Trigger
 
 	// Guarded by Dispatcher.mu. pod is set from the offer on, so a pod
 	// with an offer out is busy before anything is written; confirmed is
@@ -682,7 +686,7 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 	}
 
 	now := d.now()
-	cluster, ref, err := d.admit(ctx, del, snap, prof, hk, now)
+	adm, ref, err := d.admit(ctx, del, snap, prof, hk, now)
 	if errors.Is(err, errStopped) {
 		d.dropUnstartedJob(ctx, log, hk)
 		d.stopQueued(ctx, log, del, hk)
@@ -744,7 +748,8 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 		return
 	}
 	d.offeringWaiting(hk)
-	h.cluster = cluster
+	h.cluster = adm.cluster
+	h.trigger = adm.trigger
 
 	// Job mode needs the profile's Job template; without it (the chart
 	// didn't install the Job admission policy) the task goes to the (profile,
@@ -1194,12 +1199,12 @@ func (d *Dispatcher) taskCredentials(log *slog.Logger, h *holding, pod, uid stri
 		expires = limit
 	}
 	base := taskcred.Claims{Task: h.taskID, Profile: h.profile, Tier: h.tier, Pod: pod, PodUID: uid, Expires: expires}
-	natsToken, err = d.mintOne(log, base, taskcred.AudienceNATS, nil, now)
+	natsToken, err = d.mintOne(log, base, taskcred.AudienceNATS, nil, nil, now)
 	if err != nil {
 		return "", "", err
 	}
 	if h.cluster != nil {
-		proxyToken, err = d.mintOne(log, base, taskcred.AudienceCredentialProxy, h.cluster, now)
+		proxyToken, err = d.mintOne(log, base, taskcred.AudienceCredentialProxy, h.cluster, h.trigger, now)
 		if err != nil {
 			return "", "", err
 		}
@@ -1208,11 +1213,15 @@ func (d *Dispatcher) taskCredentials(log *slog.Logger, h *holding, pod, uid stri
 }
 
 // mintOne mints one credential for aud, reads it back and logs its jti.
-func (d *Dispatcher) mintOne(log *slog.Logger, c taskcred.Claims, aud taskcred.Audience, target *taskcred.Target, now time.Time) (string, error) {
+func (d *Dispatcher) mintOne(log *slog.Logger, c taskcred.Claims, aud taskcred.Audience, target *taskcred.Target, trigger *taskcred.Trigger, now time.Time) (string, error) {
 	c.Audience = aud
 	if target != nil {
 		t := *target
 		c.Target = &t
+	}
+	if trigger != nil {
+		t := *trigger
+		c.Trigger = &t
 	}
 	token, err := d.mint(c)
 	if err != nil {

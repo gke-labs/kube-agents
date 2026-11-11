@@ -14,12 +14,12 @@ import (
 )
 
 // Verifier is the one verifier call the dispatcher makes: may the grant at
-// ref run profile at tier for target. It is capability.Client's
+// ref run profile at tier for target, started by trigger (nil for none). It is capability.Client's
 // CheckProfileRun (#3734); a nil error means permitted, an error wrapping
 // ErrVerifierUnreachable means no verifier answered, and anything else is a
 // refusal.
 type Verifier interface {
-	CheckProfileRun(ctx context.Context, ref capability.Ref, profile string, tier capability.Tier, target capability.Scope) error
+	CheckProfileRun(ctx context.Context, ref capability.Ref, profile string, tier capability.Tier, target capability.Scope, trigger *capability.Trigger) error
 }
 
 // The task parameters that make a cluster target, and the target shapes the
@@ -87,22 +87,22 @@ func (d *Dispatcher) noRunner(prof lib.DispatchProfile, tier string) bool {
 // retries over a cap, so a queue waiting on a cap doesn't call the verifier
 // once per retry delay, but only while the retry asks for the same ref and
 // target the permit was given for; the cheap checks run every time.
-func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.DispatchConfig, prof lib.DispatchProfile, hk holdKey, now time.Time) (cluster *taskcred.Target, _ *refusal, _ error) {
+func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.DispatchConfig, prof lib.DispatchProfile, hk holdKey, now time.Time) (_ admitted, _ *refusal, _ error) {
 	env := del.Envelope()
 	tier := hk.tier
 	if !allowsTier(prof, tier) {
-		return nil, &refusal{ReasonTierNotAllowed, fmt.Sprintf("profile %s does not allow tier %s", prof.Name, tier)}, nil
+		return admitted{}, &refusal{ReasonTierNotAllowed, fmt.Sprintf("profile %s does not allow tier %s", prof.Name, tier)}, nil
 	}
 	if d.noRunner(prof, tier) {
-		return nil, &refusal{ReasonNoWorker, fmt.Sprintf("no runner for %s on this install: Job mode is off for profile %s, and no %s worker pool serves it", tier, prof.Name, tier)}, nil
+		return admitted{}, &refusal{ReasonNoWorker, fmt.Sprintf("no runner for %s on this install: Job mode is off for profile %s, and no %s worker pool serves it", tier, prof.Name, tier)}, nil
 	}
 	if rec := del.Received(); !rec.IsZero() {
 		if age, limit := now.Sub(rec), queueTimeout(prof); age > limit {
-			return nil, &refusal{ReasonQueueTimeout, fmt.Sprintf("queued %s, over the profile's %s", age.Round(time.Second), limit)}, nil
+			return admitted{}, &refusal{ReasonQueueTimeout, fmt.Sprintf("queued %s, over the profile's %s", age.Round(time.Second), limit)}, nil
 		}
 	}
 	if d.stopRequested(ctx, d.log, prof.Name, hk.taskID) {
-		return nil, nil, errStopped
+		return admitted{}, nil, errStopped
 	}
 	// After the age check: a submission a breaker holds still ends at its
 	// queue timeout.
@@ -116,63 +116,91 @@ func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.Dispa
 	if !d.probesChild(prof.Name, tier, hk.kind, env.CorrelationID) {
 		if wait, _ := d.breakers.wait(prof.Name, tier, now, func() bool { return d.probing(prof.Name, tier) },
 			func() bool { return d.olderWaiting(hk, queued) }); wait {
-			return nil, nil, errHeldBack
+			return admitted{}, nil, errHeldBack
 		}
 	}
 	target, cluster, bad := taskTarget(env, prof, snap.Namespace)
 	if bad != "" {
-		return nil, &refusal{ReasonParametersInvalid, bad}, nil
+		return admitted{}, &refusal{ReasonParametersInvalid, bad}, nil
 	}
 	ref, present, err := capability.RefFromAuthority(env.Authority)
+	if err != nil {
+		return admitted{}, &refusal{ReasonVerifierRefused, "the authority block is not well-formed"}, nil
+	}
+	// The trigger the submission claims is asked about, not trusted: the
+	// verifier permits only when it is the grant's own (#4685).
+	trigger, err := capability.TriggerFromAuthority(env.Authority)
 	switch {
 	case err != nil:
-		return nil, &refusal{ReasonVerifierRefused, "the authority block is not well-formed"}, nil
+		return admitted{}, &refusal{ReasonVerifierRefused, "the authority block's trigger is not well-formed"}, nil
 	case !present:
-		return nil, &refusal{ReasonVerifierRefused, "the submission carries no capability"}, nil
+		return admitted{}, &refusal{ReasonVerifierRefused, "the submission carries no capability"}, nil
 	case d.verifier == nil:
-		return nil, &refusal{ReasonVerifierRefused, "no verifier is configured"}, nil
+		return admitted{}, &refusal{ReasonVerifierRefused, "no verifier is configured"}, nil
 	}
 	// The permit is for what the verifier was asked: this ref, this target.
 	// The stream keeps one submission per subject and a newer one replaces
 	// it, so a retry can carry another capability or another cluster under
 	// the same key: that is a cache miss, checked afresh, never the old
 	// permit stretched over an unchecked target.
-	asked := permit{ref: ref, target: target, cluster: cluster}
+	asked := permit{ref: ref, target: target, cluster: cluster, trigger: trigger}
+	adm := admitted{cluster: cluster, trigger: credentialTrigger(trigger)}
 	d.mu.Lock()
 	p, cached := d.verified[hk]
 	d.mu.Unlock()
 	if cached && now.Sub(p.at) <= verifiedFor && p.covers(asked) {
-		return cluster, nil, nil
+		return adm, nil, nil
 	}
-	if err := d.verifier.CheckProfileRun(ctx, ref, prof.Name, capability.Tier(tier), target); err != nil {
+	if err := d.verifier.CheckProfileRun(ctx, ref, prof.Name, capability.Tier(tier), target, trigger); err != nil {
 		if ctx.Err() != nil {
-			return nil, nil, errStopping
+			return admitted{}, nil, errStopping
 		}
 		if errors.Is(err, ErrVerifierUnreachable) {
-			return nil, nil, err
+			return admitted{}, nil, err
 		}
-		return nil, &refusal{ReasonVerifierRefused, capability.Reason(err)}, nil
+		return admitted{}, &refusal{ReasonVerifierRefused, capability.Reason(err)}, nil
 	}
 	asked.at = now
 	d.mu.Lock()
 	d.verified[hk] = asked
 	d.mu.Unlock()
-	return cluster, nil, nil
+	return adm, nil, nil
+}
+
+// admitted is what an admitted submission hands on to its holding: the
+// cluster and the trigger its credential-proxy token carries, each nil when
+// the submission names none.
+type admitted struct {
+	cluster *taskcred.Target
+	trigger *taskcred.Trigger
+}
+
+// credentialTrigger is the verifier-checked trigger in the credential's
+// shape, nil for none.
+func credentialTrigger(t *capability.Trigger) *taskcred.Trigger {
+	if t == nil {
+		return nil
+	}
+	return &taskcred.Trigger{Name: t.Name, Origin: t.Origin, Stream: t.Stream}
 }
 
 // permit is a verifier permit admission reuses: when it was given, and the
-// ref, target and cluster it was given for.
+// ref, target, cluster and trigger it was given for.
 type permit struct {
 	at      time.Time
 	ref     capability.Ref
 	target  capability.Scope
 	cluster *taskcred.Target
+	trigger *capability.Trigger
 }
 
 // covers says p was given for exactly what q asks: the same ref, the same
-// verifier target and the same cluster fields.
+// verifier target, the same cluster fields and the same trigger.
 func (p permit) covers(q permit) bool {
 	if p.ref != q.ref || p.target != q.target || (p.cluster == nil) != (q.cluster == nil) {
+		return false
+	}
+	if (p.trigger == nil) != (q.trigger == nil) || (p.trigger != nil && *p.trigger != *q.trigger) {
 		return false
 	}
 	return p.cluster == nil || *p.cluster == *q.cluster

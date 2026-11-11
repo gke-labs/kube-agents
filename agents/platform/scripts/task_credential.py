@@ -97,12 +97,21 @@ ED25519_PUBLIC_LENGTH = 32
 ED25519_SIGNATURE_LENGTH = 64
 
 # The claim keys a credential may carry, exactly as spelled, at each level:
-# taskcred's topLevelClaims, natsClaims and targetClaims. A key outside the set
+# taskcred's topLevelClaims, natsClaims, targetClaims and triggerClaims. A key outside the set
 # is refused at every level (taskcred refuses an unknown nats or target key in
 # decodePayload, and a case variant of an allowed one in checkStrictClaims).
 TOP_LEVEL_CLAIMS = frozenset({"jti", "iat", "iss", "name", "sub", "aud", "exp", "nbf", "nats"})
-NATS_CLAIMS = frozenset({"type", "version", "task", "profile", "tier", "pod", "pod_uid", "target"})
+NATS_CLAIMS = frozenset({"type", "version", "task", "profile", "tier", "pod", "pod_uid", "target", "trigger"})
+# Every nats key but trigger is required: target is optional in Go for this
+# audience and required here (stricter), and trigger is optional in both.
+NATS_REQUIRED = frozenset({"type", "version", "task", "profile", "tier", "pod", "pod_uid", "target"})
 TARGET_CLAIMS = frozenset({"project", "location", "cluster"})
+TRIGGER_CLAIMS = frozenset({"name", "origin", "stream"})
+TRIGGER_REQUIRED = frozenset({"name", "origin"})
+# taskcred.TriggerOriginBuiltin and TriggerOriginUser.
+TRIGGER_ORIGINS = frozenset({"builtin", "user"})
+# The one path an origin-user schedule's stream may take: user/<name>.
+USER_STREAM_PREFIX = "user/"
 HEADER_KEYS = frozenset({"typ", "alg"})
 
 # int64, the width of jwt/v2's time claims. A JSON integer outside it fails
@@ -141,6 +150,21 @@ class TaskTarget:
 
 
 @dataclass(frozen=True)
+class TaskTrigger:
+    """The unattended trigger the grant binds (taskcred.Trigger).
+
+    ``name`` is ``schedule/<name>`` or a bare source, ``origin`` is
+    ``builtin`` or ``user``, and ``stream`` is the report stream the grant
+    binds, "" when it binds none. The shape is checked here; whether the
+    stream belongs to the trigger is the broker's rule at write.
+    """
+
+    name: str
+    origin: str
+    stream: str = ""
+
+
+@dataclass(frozen=True)
 class TaskClaims:
     """A verified credential's content (taskcred.Claims)."""
 
@@ -154,6 +178,8 @@ class TaskClaims:
     jti: str
     issuer: str
     target: TaskTarget
+    # The unattended trigger that started the task, when one did (#4685).
+    trigger: TaskTrigger | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +373,11 @@ def _label(value: str, name: str) -> str:
     return value
 
 
+def _is_label(value: str) -> bool:
+    """_label's test without the refusal: taskcred's lib.ValidSubjectToken."""
+    return len(value) <= MAX_LABEL and bool(_LABEL.match(value))
+
+
 def _target_field(value: str, name: str) -> str:
     if not value or len(value) > MAX_TARGET_FIELD or any(not ("!" <= c <= "~") for c in value):
         raise TaskCredentialError(f"task credential target {name} is empty, too long or not printable")
@@ -415,7 +446,7 @@ def verify(
     nats = claims["nats"]
     if not isinstance(nats, dict):
         raise TaskCredentialError("task credential nats claim is not an object")
-    _exact_keys(nats, NATS_CLAIMS, NATS_CLAIMS, "nats")
+    _exact_keys(nats, NATS_CLAIMS, NATS_REQUIRED, "nats")
     if _string(nats, "type", "nats") != TOKEN_TYPE:
         raise TaskCredentialError("task credential type is not a task credential")
     if _integer(nats, "version", "nats") != JWT_CLAIMS_VERSION:
@@ -424,6 +455,7 @@ def verify(
     if not isinstance(target_claim, dict):
         raise TaskCredentialError("task credential target is not an object")
     _exact_keys(target_claim, TARGET_CLAIMS, TARGET_CLAIMS, "nats.target")
+    trigger = _trigger(nats["trigger"]) if "trigger" in nats else None
 
     audience = claims["aud"]
     if type(audience) is not str or audience != AUDIENCE:
@@ -473,7 +505,28 @@ def verify(
             location=_target_field(_string(target_claim, "location", "nats.target"), "location"),
             cluster=_target_field(_string(target_claim, "cluster", "nats.target"), "cluster"),
         ),
+        trigger=trigger,
     )
+
+
+def _trigger(claim: Any) -> TaskTrigger:
+    """The nats.trigger claim, shape-checked as taskcred's Trigger.validate."""
+    if not isinstance(claim, dict):
+        raise TaskCredentialError("task credential trigger is not an object")
+    _exact_keys(claim, TRIGGER_CLAIMS, TRIGGER_REQUIRED, "nats.trigger")
+    name = _string(claim, "name", "nats.trigger")
+    source, slash, rest = name.partition("/")
+    if not _is_label(source) or (slash and not _is_label(rest)):
+        raise TaskCredentialError("task credential trigger name is not <source> or <source>/<name> of labels")
+    origin = _string(claim, "origin", "nats.trigger")
+    if origin not in TRIGGER_ORIGINS:
+        raise TaskCredentialError("task credential trigger origin is not builtin or user")
+    stream = _string(claim, "stream", "nats.trigger") if "stream" in claim else ""
+    if stream:
+        bare = stream[len(USER_STREAM_PREFIX):] if stream.startswith(USER_STREAM_PREFIX) else stream
+        if not _is_label(bare):
+            raise TaskCredentialError("task credential trigger stream is not a label or user/<label>")
+    return TaskTrigger(name=name, origin=origin, stream=stream)
 
 
 # ---------------------------------------------------------------------------

@@ -122,6 +122,14 @@ type Entry struct {
 	// naming the child's own profile at the parent's tier.
 	Profile string `json:"profile,omitempty"`
 
+	// Trigger is the unattended trigger the gateway minted this grant for
+	// (#4685): set only at the unattended tier, and only on a grant a
+	// trigger's submission started. profile.run is refused unless the
+	// request names this same trigger, or none when this is nil, so the
+	// trigger the dispatcher puts in the task credential is the grant's.
+	// A hop carries its parent's trigger unchanged, as it does Profile.
+	Trigger *Trigger `json:"trigger,omitempty"`
+
 	// Parent pins the entry this one descends from. Nil for a root.
 	Parent *Ref `json:"parent,omitempty"`
 }
@@ -245,6 +253,10 @@ func (e Entry) Validate() error {
 		return refuse("entry names a profile at a tier that is not a profile tier")
 	case e.Profile != "" && !validProfileName(e.Profile):
 		return refuse("entry carries a profile name that is not a DNS label")
+	case e.Trigger != nil && e.Tier != TierUnattended:
+		return refuse("entry names a trigger at a tier that is not unattended")
+	case e.Trigger != nil && e.Trigger.validate() != nil:
+		return refuse("entry carries a trigger whose shape is not valid")
 	}
 	if e.Parent != nil {
 		if e.Parent.Key == "" {
@@ -328,6 +340,9 @@ func Narrows(parent, child Entry) error {
 	}
 	if child.Profile != parent.Profile {
 		return refuse("child changes or drops the parent's profile")
+	}
+	if !child.Trigger.equal(parent.Trigger) {
+		return refuse("child changes or drops the parent's trigger")
 	}
 	if !parent.Scope.Contains(child.Scope) {
 		return refuse("child widens the scope")

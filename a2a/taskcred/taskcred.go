@@ -154,6 +154,24 @@ type Target struct {
 	Cluster  string `json:"cluster"`
 }
 
+// Trigger is the unattended trigger that started a task, as the grant the
+// verifier checked binds it (#4685): Name is "schedule/<name>" or a bare
+// source ("stall-watch"), Origin is "builtin" or "user", and Stream is the
+// report stream the grant binds, empty when it binds none. The broker reads it
+// to decide which audit stream a task may write. Only AudienceCredentialProxy
+// carries one.
+type Trigger struct {
+	Name   string `json:"name"`
+	Origin string `json:"origin"`
+	Stream string `json:"stream,omitempty"`
+}
+
+// The trigger origins a credential may name, lib's.
+const (
+	TriggerOriginBuiltin = lib.TriggerOriginBuiltin
+	TriggerOriginUser    = lib.TriggerOriginUser
+)
+
 // Claims is a task credential's content.
 type Claims struct {
 	// Task is the task id: a2a.tasks.<Profile>.<Task>.… on the bus.
@@ -173,6 +191,10 @@ type Claims struct {
 	// Target is for AudienceCredentialProxy only, and optional there.
 	Target *Target
 
+	// Trigger is for AudienceCredentialProxy only, and optional there: set
+	// when an unattended trigger started the task.
+	Trigger *Trigger
+
 	// IssuedAt, ID (the jti) and Issuer are set by Mint and read back by
 	// Verify; Mint ignores what a caller puts in them.
 	IssuedAt time.Time
@@ -188,13 +210,14 @@ type payload struct {
 	// Version is jwt/v2's own: GenericClaims.Encode writes nats.version as
 	// the library's JWT version (updateVersion), so every credential Mint
 	// produces carries it, and Verify requires exactly that value.
-	Version int     `json:"version"`
-	Task    string  `json:"task"`
-	Profile string  `json:"profile"`
-	Tier    string  `json:"tier"`
-	Pod     string  `json:"pod"`
-	PodUID  string  `json:"pod_uid"`
-	Target  *Target `json:"target,omitempty"`
+	Version int      `json:"version"`
+	Task    string   `json:"task"`
+	Profile string   `json:"profile"`
+	Tier    string   `json:"tier"`
+	Pod     string   `json:"pod"`
+	PodUID  string   `json:"pod_uid"`
+	Target  *Target  `json:"target,omitempty"`
+	Trigger *Trigger `json:"trigger,omitempty"`
 }
 
 // Mint signs a credential with a task-signing key.
@@ -243,6 +266,9 @@ func Mint(kp nkeys.KeyPair, c Claims) (string, error) {
 	if c.Target != nil {
 		gc.Data["target"] = *c.Target
 	}
+	if c.Trigger != nil {
+		gc.Data["trigger"] = *c.Trigger
+	}
 	return gc.Encode(kp)
 }
 
@@ -263,7 +289,7 @@ func Mint(kp nkeys.KeyPair, c Claims) (string, error) {
 //   - task, profile, tier and pod must be single subject tokens (dot-free
 //     DNS-1123 labels: no ".", "*", ">" or whitespace, at most 63 bytes), and
 //     pod_uid a bounded UID.
-//   - target may appear only under AudienceCredentialProxy.
+//   - target and trigger may appear only under AudienceCredentialProxy.
 func Verify(token string, trusted []string, aud Audience, now time.Time, maxLifetime, skew time.Duration) (Claims, error) {
 	if !aud.known() {
 		return Claims{}, fmt.Errorf("audience %q is not one this package verifies", aud)
@@ -355,6 +381,7 @@ func Verify(token string, trusted []string, aud Audience, now time.Time, maxLife
 		Audience: got,
 		Expires:  exp,
 		Target:   p.Target,
+		Trigger:  p.Trigger,
 		IssuedAt: iat,
 		ID:       gc.ID,
 		Issuer:   gc.Issuer,
@@ -394,6 +421,22 @@ func (c Claims) validate() error {
 			}
 		}
 	}
+	if c.Trigger != nil {
+		if c.Audience != AudienceCredentialProxy {
+			return fmt.Errorf("a %q task credential may not carry a trigger; only %q does", c.Audience, AudienceCredentialProxy)
+		}
+		if err := c.Trigger.validate(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validate is a trigger's shape check, lib.ValidateTrigger's.
+func (t Trigger) validate() error {
+	if err := lib.ValidateTrigger(t.Name, t.Origin, t.Stream); err != nil {
+		return fmt.Errorf("task credential %w", err)
+	}
 	return nil
 }
 
@@ -424,8 +467,9 @@ func checkHeader(token string) error {
 // claims jwt/v2's ClaimsData emits, the nats block's fields, and the target's.
 var (
 	topLevelClaims = map[string]bool{"jti": true, "iat": true, "iss": true, "name": true, "sub": true, "aud": true, "exp": true, "nbf": true, "nats": true}
-	natsClaims     = map[string]bool{"type": true, "version": true, "task": true, "profile": true, "tier": true, "pod": true, "pod_uid": true, "target": true}
+	natsClaims     = map[string]bool{"type": true, "version": true, "task": true, "profile": true, "tier": true, "pod": true, "pod_uid": true, "target": true, "trigger": true}
 	targetClaims   = map[string]bool{"project": true, "location": true, "cluster": true}
+	triggerClaims  = map[string]bool{"name": true, "origin": true, "stream": true}
 )
 
 // checkStrictClaims re-reads the raw payload segment before anything trusts
@@ -464,7 +508,7 @@ func strictValue(dec *json.Decoder, path string) error {
 	}
 	switch tok {
 	case json.Delim('{'):
-		allowed := map[string]map[string]bool{"": topLevelClaims, "nats": natsClaims, "nats.target": targetClaims}[path]
+		allowed := map[string]map[string]bool{"": topLevelClaims, "nats": natsClaims, "nats.target": targetClaims, "nats.trigger": triggerClaims}[path]
 		seen := map[string]bool{}
 		for dec.More() {
 			kt, err := dec.Token()

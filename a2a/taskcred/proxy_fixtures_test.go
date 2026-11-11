@@ -81,13 +81,14 @@ type proxyFixture struct {
 }
 
 type proxyFixtureClaims struct {
-	Task    string  `json:"task"`
-	Profile string  `json:"profile"`
-	Tier    string  `json:"tier"`
-	Pod     string  `json:"pod"`
-	PodUID  string  `json:"pod_uid"`
-	Expires int64   `json:"exp"`
-	Target  *Target `json:"target"`
+	Task    string   `json:"task"`
+	Profile string   `json:"profile"`
+	Tier    string   `json:"tier"`
+	Pod     string   `json:"pod"`
+	PodUID  string   `json:"pod_uid"`
+	Expires int64    `json:"exp"`
+	Target  *Target  `json:"target"`
+	Trigger *Trigger `json:"trigger,omitempty"`
 }
 
 // fixtureKey is a task-signing key from a fixed 32-byte seed.
@@ -160,6 +161,31 @@ func buildProxyFixtures(t *testing.T) proxyFixtureFile {
 	add(proxyFixture{Name: "the second of two trusted keys (rotation)", Token: sign(base), Now: fixtureNow, GoOK: true, ProxyOK: true,
 		Trusted: []string{otherPub, pub}, Claims: wantClaims})
 	add(proxyFixture{Name: "expired inside the skew", Token: sign(base), Now: exp + 29, GoOK: true, ProxyOK: true, Claims: wantClaims})
+	trig := `,"target":{"project":"proj-a","location":"us-central1","cluster":"cluster-a"}`
+	withTrigger := func(trigger string) string {
+		return edited(trig, trig+`,"trigger":`+trigger)
+	}
+	builtin := Trigger{Name: "schedule/compliance-audit", Origin: TriggerOriginBuiltin, Stream: "compliance-audit"}
+	builtinClaims := *wantClaims
+	builtinClaims.Trigger = &builtin
+	add(proxyFixture{Name: "a builtin schedule trigger", Token: withTrigger(`{"name":"schedule/compliance-audit","origin":"builtin","stream":"compliance-audit"}`),
+		Now: fixtureNow, GoOK: true, ProxyOK: true, Claims: &builtinClaims})
+	user := Trigger{Name: "schedule/nightly", Origin: TriggerOriginUser}
+	userClaims := *wantClaims
+	userClaims.Trigger = &user
+	add(proxyFixture{Name: "a user schedule trigger with no stream", Token: withTrigger(`{"name":"schedule/nightly","origin":"user"}`),
+		Now: fixtureNow, GoOK: true, ProxyOK: true, Claims: &userClaims})
+	mintedTrigger, err := Mint(kp, Claims{
+		Task: "task-1", Profile: "auditor", Tier: "read", Pod: "auditor-read-x7k2p",
+		PodUID: "0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0", Audience: AudienceCredentialProxy,
+		Expires: mintNow.Add(10 * time.Minute), Target: &fixtureTarget, Trigger: &builtin,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mintedTriggerClaims := mintedClaims
+	mintedTriggerClaims.Trigger = &builtin
+	add(proxyFixture{Name: "a trigger minted by taskcred.Mint", Token: mintedTrigger, Now: mintNow.Unix(), GoOK: true, ProxyOK: true, Claims: &mintedTriggerClaims})
 	add(proxyFixture{Name: "a lowercase typ (jwt/v2 upper-cases it)", Token: signWithHeader(t, kp, `{"typ":"jwt","alg":"ed25519-nkey"}`, base),
 		Now: fixtureNow, GoOK: true, ProxyOK: true, Claims: wantClaims})
 
@@ -169,6 +195,7 @@ func buildProxyFixtures(t *testing.T) proxyFixtureFile {
 	add(proxyFixture{Name: "a null name", Token: edited(`"sub":"fixturenonce"`, `"sub":"fixturenonce","name":null`), Now: fixtureNow, GoOK: true})
 	add(proxyFixture{Name: "a header key beyond typ and alg", Token: signWithHeader(t, kp, `{"typ":"JWT","alg":"ed25519-nkey","kid":"x"}`, base),
 		Now: fixtureNow, GoOK: true})
+	add(proxyFixture{Name: "a null trigger stream", Token: withTrigger(`{"name":"schedule/nightly","origin":"user","stream":null}`), Now: fixtureNow, GoOK: true})
 	add(proxyFixture{Name: "a non-canonical base64url signature", Token: nonCanonicalSignature(t, sign(base)), Now: fixtureNow, GoOK: true})
 
 	// Signature and issuer.
@@ -199,6 +226,9 @@ func buildProxyFixtures(t *testing.T) proxyFixtureFile {
 	add(refused("an unknown top-level claim", edited(`"sub":"fixturenonce"`, `"sub":"fixturenonce","grants":"a2a.>"`)))
 	add(refused("an unknown nats claim", edited(`"tier":"read"`, `"tier":"read","grants":"a2a.>"`)))
 	add(refused("an unknown target claim", edited(`"cluster":"cluster-a"`, `"cluster":"cluster-a","server":"https://x"`)))
+	add(refused("an unknown trigger claim", withTrigger(`{"name":"schedule/a","origin":"builtin","scope":"fleet"}`)))
+	add(refused("a case-variant trigger key", withTrigger(`{"Name":"schedule/a","origin":"builtin"}`)))
+	add(refused("a duplicate trigger key", withTrigger(`{"name":"schedule/b","name":"schedule/a","origin":"builtin"}`)))
 	add(refused("a NaN", edited(`"version":2`, `"version":NaN`)))
 
 	// Types.
@@ -237,6 +267,14 @@ func buildProxyFixtures(t *testing.T) proxyFixtureFile {
 	add(refused("a pod name past 63 bytes", edited(`"pod":"auditor-read-x7k2p"`, `"pod":"`+strings.Repeat("p", 64)+`"`)))
 	add(refused("a pod_uid with a slash", edited(`"pod_uid":"0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0"`, `"pod_uid":"a/b"`)))
 	add(refused("a target field with a space", edited(`"project":"proj-a"`, `"project":"proj a"`)))
+	add(refused("a trigger that is not an object", withTrigger(`"schedule/a"`)))
+	add(refused("a trigger with no name", withTrigger(`{"origin":"builtin"}`)))
+	add(refused("a trigger name with a dot", withTrigger(`{"name":"schedule/a.b","origin":"builtin"}`)))
+	add(refused("a trigger name with three segments", withTrigger(`{"name":"schedule/a/b","origin":"builtin"}`)))
+	add(refused("a trigger with an unknown origin", withTrigger(`{"name":"schedule/a","origin":"admin"}`)))
+	add(refused("a trigger with no origin", withTrigger(`{"name":"schedule/a"}`)))
+	add(refused("a trigger stream under another path", withTrigger(`{"name":"schedule/a","origin":"user","stream":"team/a"}`)))
+	add(refused("a trigger origin as a number", withTrigger(`{"name":"schedule/a","origin":1}`)))
 	add(refused("an empty target field", edited(`"cluster":"cluster-a"`, `"cluster":""`)))
 
 	return proxyFixtureFile{
@@ -312,7 +350,8 @@ func TestCredentialProxyFixtures(t *testing.T) {
 		if err == nil && c.Claims != nil {
 			w := c.Claims
 			if got.Task != w.Task || got.Profile != w.Profile || got.Tier != w.Tier || got.Pod != w.Pod ||
-				got.PodUID != w.PodUID || got.Expires.Unix() != w.Expires || got.Target == nil || *got.Target != *w.Target {
+				got.PodUID != w.PodUID || got.Expires.Unix() != w.Expires || got.Target == nil || *got.Target != *w.Target ||
+				(got.Trigger == nil) != (w.Trigger == nil) || (got.Trigger != nil && *got.Trigger != *w.Trigger) {
 				t.Errorf("%s: claims = %+v (target %+v), fixture says %+v", c.Name, got, got.Target, w)
 			}
 		}

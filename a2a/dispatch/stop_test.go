@@ -426,7 +426,7 @@ type stopDuringVerify struct {
 	b *bus
 }
 
-func (v *stopDuringVerify) CheckProfileRun(_ context.Context, _ capability.Ref, profile string, _ capability.Tier, _ capability.Scope) error {
+func (v *stopDuringVerify) CheckProfileRun(_ context.Context, _ capability.Ref, profile string, _ capability.Tier, _ capability.Scope, _ *capability.Trigger) error {
 	body, err := json.Marshal(lib.DispatchStop{V: 1, TaskID: "task-1"})
 	if err != nil {
 		return err
