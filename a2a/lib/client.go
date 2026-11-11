@@ -53,8 +53,9 @@ func TaskSupervisorSubject(addressee, taskID string) string {
 // tokens, so the gateway's five-token grant on a2a.tasks.*.*.supervisor can
 // never match a profile task's supervisor subject, which the dispatcher alone
 // writes, and the subject stays on TASKS (a2a.tasks.>) beside the task's
-// events, in one stream order for tasks/get. A session name is never "p" on
-// its own: session names carry hyphens.
+// events, in one stream order for tasks/get. The token count is what keeps the
+// two forms apart (a five-token subject whose addressee is "p" still parses as
+// five tokens); task ids are single subject tokens everywhere they enter.
 const TaskProfileSupervisorToken = "p"
 
 // ProfileSupervisorSubject is a profile task's supervisor subject in its

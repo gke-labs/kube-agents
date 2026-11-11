@@ -411,7 +411,9 @@ Layout:
   not show on its face. First, the supervisor grant is a wildcard over the ADDRESSEE
   (`a2a.tasks.*.*.supervisor`), not a scope to the sessions the gateway spawned, which a
   static render cannot express. The render subtracts each bound or draining profile by name
-  (`a2a.tasks.<profile>.*.supervisor` on the gateway's publish deny), so the gateway cannot
+  (`a2a.tasks.<profile>.*.supervisor` on the gateway's publish deny; #5301 moves profile
+  supervisors to the six-token `a2a.tasks.p.<profile>.*.supervisor`, which the gateway
+  subscribes to read only and can never publish), so the gateway cannot
   publish directly to a profile's supervisor subject. The deny covers direct publishes
   only, so a profile task's `…supervisor` must still not be modelled as unreachable. Second, the class
   that is not yet single-writer is `…events`, and the holder is the static `worker`
