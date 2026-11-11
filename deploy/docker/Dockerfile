@@ -906,8 +906,9 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
 # Slack: with KUBEAGENTS_DIAL=on (off unless set to on), the app's Home tab
 # shows the autonomy dial: Explain, Propose fixes or Auto-merge proven fixes,
 # changeable only by an install admin (KUBEAGENTS_DIAL_ADMINS, else an admin or
-# owner of the install's own Slack workspace) and read-only for everyone else. Off, the Home tab is
-# ignored as upstream ignores it. Also rides this COPY and RUN. See
+# owner of the install's own Slack workspace) and read-only for everyone else. Off, opening the Home
+# tab shows one line saying the dial is off, so a stale dial is cleared, and
+# nothing is read or recorded. Also rides this COPY and RUN. See
 # deploy/docker/patches/slack_dial_home.py.
 # Slack, flag or not: a message_changed that is not an edit (no `edited`, or
 # the same `edited.ts` as previous_message, since Slack keeps it once set, or
