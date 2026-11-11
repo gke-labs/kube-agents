@@ -393,7 +393,13 @@ member with its `via`, its probe `outcome`, and `confirmedAt`, the last run in w
 listed it and its probe answered `ok`. Explicit projects and the management project have no rows.
 A failed source carries its members' rows forward with their outcome and `confirmedAt`, and two
 fields the gateway does not read carry the rest of what the reconcile's own snapshot carries: the
-number-to-ID memo and the members counted against the cap that have no row. The operator starts
+number-to-ID memo and the members counted against the cap that have no row. A third field the
+gateway and the operator do not read, `clusters` (added 11/11, #5621), keeps what each member's
+probe listed, `{"<project>": {"at": <when>, "clusters": [[location, name], ...]}}`, for the
+agent's helper scripts ([`scheduling-on-profiles.md`](scheduling-on-profiles.md), section 8). It
+covers member projects only, since the management project and explicit projects are never
+probed. A probe that fails keeps the previous entry, `at` included, and never writes an empty list
+for a project it could not read. The `projects` rows don't change with it. The operator starts
 it as a Job every 15 minutes, when the membership fields change, and at creation. The broker's
 `scope` caller role admits only the lookups' five argv shapes, each on an argument the broker's
 own copy of `scope.json` declares or an earlier lookup returned. The gateway checks a profile

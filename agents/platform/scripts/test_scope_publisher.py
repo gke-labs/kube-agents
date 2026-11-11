@@ -1392,5 +1392,90 @@ class MainTest(unittest.TestCase):
         written.assert_not_called()
 
 
+class ClustersMapTest(unittest.TestCase):
+    """The `clusters` map: member projects' clusters, from the probes the run already makes (#5621)."""
+
+    setUp = BuildDocumentTest.setUp
+    _build = BuildDocumentTest._build
+
+    def test_a_probed_member_lists_its_clusters(self):
+        broker = FakeBroker(assets={FOLDER_A: ["team-a", "team-b"]})
+        document = self._build(broker, _scope(folders=[FOLDER_A.split("/")[1]]))
+        self.assertEqual(document["clusters"], {
+            "team-a": {"at": document["resolvedAt"], "clusters": [["us-central1", "prod"]]},
+            "team-b": {"at": document["resolvedAt"], "clusters": [["us-central1", "prod"]]},
+        })
+
+    def test_management_and_explicit_projects_are_not_in_the_map(self):
+        broker = FakeBroker(assets={FOLDER_A: ["team-a", "explicit-1", MANAGEMENT]})
+        document = self._build(broker, _scope(projects=["explicit-1"], folders=[FOLDER_A.split("/")[1]]))
+        self.assertEqual(list(document["clusters"]), ["team-a"])
+
+    def test_a_failed_probe_keeps_the_last_good_list_never_an_empty_one(self):
+        previous = {"v": 1, "resolvedAt": PREVIOUS_TIME, "state": "ok", "projects": [
+            {"id": "team-a", "via": [FOLDER_A], "outcome": "ok", "confirmedAt": PREVIOUS_TIME}],
+            "clusters": {"team-a": {"at": PREVIOUS_TIME, "clusters": [["us-east1", "a"], ["us-east1", "b"]]}}}
+        for name, broker in {
+            "denied": FakeBroker(assets={FOLDER_A: ["team-a"]}, probes={"team-a": DENIED_STDERR}),
+            "timed out": FakeBroker(assets={FOLDER_A: ["team-a"]}, timeouts={"team-a"}),
+            "source failed": FakeBroker(fail={FOLDER_A: "connection reset by peer"}),
+        }.items():
+            with self.subTest(name):
+                document = self._build(broker, _scope(folders=[FOLDER_A.split("/")[1]]), previous)
+                self.assertEqual(document["clusters"]["team-a"],
+                                 {"at": PREVIOUS_TIME, "clusters": [["us-east1", "a"], ["us-east1", "b"]]})
+
+    def test_a_failed_probe_with_no_earlier_list_has_no_entry(self):
+        broker = FakeBroker(assets={FOLDER_A: ["team-a", "team-b"]}, probes={"team-b": DENIED_STDERR})
+        document = self._build(broker, _scope(folders=[FOLDER_A.split("/")[1]]))
+        self.assertEqual(list(document["clusters"]), ["team-a"])
+
+    def test_a_project_that_left_the_scope_leaves_the_map(self):
+        previous = {"v": 1, "resolvedAt": PREVIOUS_TIME, "state": "ok", "projects": [
+            {"id": "gone", "via": [FOLDER_A], "outcome": "ok", "confirmedAt": PREVIOUS_TIME}],
+            "clusters": {"gone": {"at": PREVIOUS_TIME, "clusters": [["us-east1", "a"]]}}}
+        broker = FakeBroker(assets={FOLDER_A: ["team-a"]})
+        document = self._build(broker, _scope(folders=[FOLDER_A.split("/")[1]]), previous)
+        self.assertEqual(list(document["clusters"]), ["team-a"])
+
+    def test_the_projects_rows_are_the_same_with_and_without_the_map(self):
+        # The map is for readers that list clusters. It must never change the rows, which
+        # are what the gateway and the operator admit.
+        declared = _scope(projects=["explicit-1"], folders=[FOLDER_A.split("/")[1]])
+        assets = {FOLDER_A: ["team-a", "team-b", "explicit-1", MANAGEMENT]}
+        with_map = self._build(FakeBroker(assets=assets, probes={"team-b": DENIED_STDERR}), declared)
+        with mock.patch.object(pub, "_clusters_map", return_value={}):
+            without = self._build(FakeBroker(assets=assets, probes={"team-b": DENIED_STDERR}), declared)
+        self.assertNotIn("clusters", without)
+        for key in ("projects", "excludedProjects", "state", "memberHash"):
+            self.assertEqual(json.dumps(with_map[key]), json.dumps(without[key]), key)
+
+    def test_a_previous_documents_map_is_cleaned_on_read(self):
+        raw = json.dumps({"v": 1, "resolvedAt": PREVIOUS_TIME, "state": "ok", "projects": [], "clusters": {
+            "ok": {"at": PREVIOUS_TIME, "clusters": [["us-east1", "a"]]},
+            "no-at": {"clusters": [["us-east1", "a"]]},
+            "bad-pair": {"at": PREVIOUS_TIME, "clusters": [["us-east1"]]},
+            "bad-type": {"at": PREVIOUS_TIME, "clusters": "us-east1/a"},
+            "not-a-dict": ["us-east1", "a"],
+        }})
+        self.assertEqual(pub.parse_document(raw)["clusters"],
+                         {"ok": {"at": PREVIOUS_TIME, "clusters": [["us-east1", "a"]]}})
+        self.assertNotIn("clusters", pub.parse_document(json.dumps(
+            {"v": 1, "resolvedAt": PREVIOUS_TIME, "state": "ok", "projects": []})))
+
+    def test_a_thousand_clusters_fit_well_inside_the_budget(self):
+        # The design's target: about 40 bytes a cluster, so 1,000 clusters across 100
+        # member projects cost about 40 KiB of the 900 KiB the ConfigMap allows.
+        base = {"v": 1, "resolvedAt": PREVIOUS_TIME, "memberHash": MEMBER_HASH_VECTOR_HASH,
+                "state": pub.STATE_OK, "excludedProjects": [], "projects": []}
+        clusters = {f"p{i:029d}": {"at": PREVIOUS_TIME,
+                                   "clusters": [["us-central1", f"cluster-{j:02d}"] for j in range(10)]}
+                    for i in range(100)}
+        without = len(pub.encode_document(base).encode())
+        text = pub.encode_document({**base, "clusters": clusters})
+        self.assertEqual(json.loads(text)["state"], pub.STATE_OK)
+        self.assertLess(len(text.encode()) - without, 48 * 1024)
+
+
 if __name__ == "__main__":
     unittest.main()

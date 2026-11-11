@@ -84,6 +84,17 @@ ROW_CONFIRMED_AT = "confirmedAt"
 # declared source still lists every member it admits.
 DOC_NUMBERS = rec.NUMBERS_KEY
 DOC_CARRIED = "carried"
+# A third optional key the gateway and the operator do not read (#5621): the clusters of each
+# **member project** a probe listed, for the agent's helper scripts, which read them through
+# `fleet_scope_targets.py`. Member projects only: the management project and explicit projects
+# are never probed here (the broker's `scope` role runs `clusters list` only for a project an
+# earlier lookup returned), so a reader lists those itself. Keyed by project ID:
+# {"at": <when the listing was read>, "clusters": [[location, name], ...]}. A probe that fails
+# keeps the previous entry, `at` included, so a reader can tell its age; it never writes an
+# empty list for a project it could not read, and a project with no entry is unread.
+DOC_CLUSTERS = "clusters"
+CLUSTERS_AT = "at"
+CLUSTERS_LIST = "clusters"
 ROW_NUMBER = rec.NUMBER_KEY
 STATE_OK = "ok"
 STATE_TOO_LARGE = "too-large"
@@ -364,8 +375,9 @@ def parse_document(raw) -> dict | None:
     numbers = document.get(DOC_NUMBERS)
     clean[DOC_NUMBERS] = ({n: p for n, p in numbers.items() if isinstance(n, str) and isinstance(p, str)}
                           if isinstance(numbers, dict) else {})
-    # The two optional keys stay out when empty, as in the documents this program writes.
-    for key in (DOC_CARRIED, DOC_NUMBERS):
+    clean[DOC_CLUSTERS] = _clean_clusters(document.get(DOC_CLUSTERS))
+    # The optional keys stay out when empty, as in the documents this program writes.
+    for key in (DOC_CARRIED, DOC_NUMBERS, DOC_CLUSTERS):
         if not clean[key]:
             del clean[key]
     return clean
@@ -379,6 +391,43 @@ def _clean_row(row) -> dict | None:
     clean = {key: row[key] for key in (ROW_ID, ROW_VIA, ROW_OUTCOME)}
     clean.update({key: row[key] for key in (ROW_CONFIRMED_AT, ROW_NUMBER) if isinstance(row.get(key), str)})
     return clean
+
+
+def _clean_clusters(value) -> dict:
+    """A previous document's `clusters` map with only its well-formed entries."""
+    if not isinstance(value, dict):
+        return {}
+    clean = {}
+    for project, entry in value.items():
+        if not (isinstance(project, str) and isinstance(entry, dict) and isinstance(entry.get(CLUSTERS_AT), str)
+                and isinstance(entry.get(CLUSTERS_LIST), list)):
+            continue
+        pairs = entry[CLUSTERS_LIST]
+        if not all(isinstance(p, list) and len(p) == 2 and all(isinstance(v, str) for v in p) for p in pairs):
+            continue
+        clean[project] = {CLUSTERS_AT: entry[CLUSTERS_AT], CLUSTERS_LIST: [list(p) for p in pairs]}
+    return clean
+
+
+def _clusters_map(rows: list, probes: dict, previous: dict | None, resolved_at: str) -> dict:
+    """The `clusters` map for this run's member rows.
+
+    A member this run listed gets its clusters as (location, name) pairs, sorted. One it did
+    not list (its probe failed, or its source failed and it was carried unprobed) keeps the
+    previous document's entry when there is one, and otherwise has none: never an empty list
+    standing in for a listing that did not happen. Projects that are no longer rows drop out.
+    """
+    before = (previous or {}).get(DOC_CLUSTERS) or {}
+    out = {}
+    for row in rows:
+        project = row[ROW_ID]
+        found, outcome = probes.get(project, (None, None))
+        if found is not None and outcome == rec.OUTCOME_OK:
+            out[project] = {CLUSTERS_AT: resolved_at,
+                            CLUSTERS_LIST: sorted([location, name] for _, name, location in found)}
+        elif project in before:
+            out[project] = before[project]
+    return out
 
 
 def read_previous(namespace: str, name: str) -> tuple[dict | None, str | None]:
@@ -645,6 +694,9 @@ def build_document(declared: dict, management: str | None, previous: dict | None
         document[DOC_NUMBERS] = numbers
     if carried:
         document[DOC_CARRIED] = carried
+    clusters = _clusters_map(rows, probes, previous, resolved_at)
+    if clusters:
+        document[DOC_CLUSTERS] = clusters
     if groups and all(found is None for found, _ in groups.values()):
         # Every source lookup failed (a broker that refuses the `scope` caller, for one): the
         # run learned nothing, so it does not restamp the document. A short outage then
