@@ -192,6 +192,11 @@ class RepKinds(unittest.TestCase):
         self.assertEqual(health.rep_kind({"result": "fail", "reason": None}), "fail")
         self.assertEqual(health.rep_kind({"result": "pass", "reason": None}), "pass")
 
+    def test_a_rung_2_block_quoting_a_rate_limit_is_a_graded_fail(self):
+        # The scorer gives each errored check's reason, which can quote a 429.
+        reason = "blocked -- checks errored rather than ran: ['either-read'] -- either-read: KUBE_AGENTS_FORGE_UNAVAILABLE (answered 403): GitHub said API rate limit exceeded / GitHub denied ..."
+        self.assertEqual(health.rep_kind({"result": "fail", "reason": reason}), "fail")
+
     def test_a_broken_replay_is_a_graded_fail_not_a_storm(self):
         broken_reasons = (
             (

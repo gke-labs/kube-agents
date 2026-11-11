@@ -52,13 +52,15 @@ on:
       - "agents/platform/scripts/command_policy.py"
       - "agents/platform/scripts/credential_proxy.py"
       # lib/persona/claudecode's cluster persona tests read the persona, the
-      # cluster skills its copies must match, and the two scripts its skills
-      # carry byte-identical copies of; cmd/session-persona's
+      # cluster skills its copies must match, the two scripts its skills
+      # carry byte-identical copies of, and mcp_policy.py, whose
+      # PROFILE_SERVER_TOOLS bounds its servers; cmd/session-persona's
       # TestSourceSkillsTeachNoWrites reads the persona's skills too. An edit
       # to any of them alone has to run those tests.
       - "agents/cluster/persona/**"
       - "agents/platform/scripts/stall_report.py"
       - "agents/platform/skills/gke-workload-security/scripts/audit_cluster.sh"
+      - "agents/platform/scripts/mcp_policy.py"
       # hermes-bridge's incident_test.go reads the incident_context hook to
       # keep the bridge's copy of its frame and token list in step; an edit
       # to the hook alone has to run that test.
@@ -124,6 +126,7 @@ jobs:
               - "agents/cluster/persona/**"
               - "agents/platform/scripts/stall_report.py"
               - "agents/platform/skills/gke-workload-security/scripts/audit_cluster.sh"
+              - "agents/platform/scripts/mcp_policy.py"
               - "agents/platform/plugins/incident_context/**"
               - "tests/conformance/chat/**"
               - "tests/conformance/chat-ux/**"

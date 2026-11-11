@@ -47,7 +47,7 @@ slots:
     carries: The held-back control plane, and the upgrade-readiness drain defects
   - slot: c
     suffix: c
-    carries: The configuration outlier, on the control plane and its default pool, and no workloads
+    carries: The configuration outlier, on the control plane and its default pool, and the ComputeClass fixtures over that pool
   - slot: d
     suffix: d
     carries: Nodes in two zones, and the zonal-skew workloads
@@ -291,6 +291,82 @@ fixtures:
       the cohort's 24-hour age gate. A separate role, so this half drifting
       excuses nothing from the case that lists drift-outlier; until the
       reconcile rolls the change every project reads it drifted.
+
+  - role: untargeted-compute-class-workload
+    slot: c
+    available_from_day: 0
+    objects:
+      - deployment/app-worker-a
+      - computeclass/general-ccc
+    namespace: seeded-compute-class
+    defect: >-
+      A three-replica Deployment with no cloud.google.com/compute-class
+      nodeSelector and no compute-class affinity, in a namespace with no
+      default class, on the cluster whose only untainted pool carries the
+      general-ccc label: the untargeted workload the Cluster Autoscaler's
+      ComputeClass pre-filter leaves out of its scale-up simulation. The pods
+      run on the labelled node; the checks read the manifest, never the phase.
+
+  - role: compute-class-affinity-workload
+    slot: c
+    available_from_day: 0
+    objects:
+      - deployment/app-worker-b
+      - computeclass/general-ccc
+    namespace: seeded-compute-class
+    defect: >-
+      A Deployment naming ComputeClass general-ccc only in a required
+      nodeAffinity term and never in nodeSelector, which is the one field the
+      pre-filter reads.
+
+  - role: compute-class-toleration-workload
+    slot: c
+    available_from_day: 0
+    objects:
+      - deployment/batch-worker-a
+      - computeclass/general-ccc
+    namespace: seeded-compute-class
+    defect: >-
+      A Deployment targeted through the nodeSelector with a hand-written
+      toleration for the class taint that names key, value and effect and no
+      operator. The pool it targets carries no taint, so the pod runs; the
+      toleration's shape is the fixture.
+
+  - role: untainted-compute-class-pool
+    slot: c
+    available_from_day: 0
+    objects:
+      - nodepool/default-pool
+      - computeclass/general-ccc
+    defect: >-
+      Slot c's default-pool labelled cloud.google.com/compute-class=general-ccc
+      with no matching NoSchedule taint, so the scheduler fills it with
+      untargeted pods before the pre-filter drops them. The label is also what
+      leaves the cluster with no untainted pool without a class label, which
+      the obtainability audit's 3.24 needs before it files anything.
+
+  - role: manual-pools-compute-class
+    slot: c
+    available_from_day: 0
+    objects:
+      - computeclass/general-ccc
+    defect: >-
+      ComputeClass general-ccc with nodePoolAutoCreation off and priority
+      rules across the nodepools rule default-pool backs and two machine
+      families no pool backs, so a stockout on the first rule leaves pods with
+      no fallback GKE can create.
+
+  - role: no-nodelocal-dnscache
+    slot: c
+    available_from_day: 0
+    objects:
+      - cluster/self
+    defect: >-
+      The NodeLocal DNSCache add-on off on slot c, where GKE turns it on by
+      default on Standard from 1.34.1 and Autopilot cannot turn it off, so it
+      is the one cluster in a pool project without it. Inert for the other
+      fixtures; GKE re-creates the pool's node once for the change, inside the
+      maintenance window.
 
   - role: drift-peer-a
     slot: a
