@@ -151,6 +151,13 @@ REP_FIXTURE = "fixture"
 # Matched with the opening parenthesis the scorer words it with
 # ("... nothing to grade (fixture-drift:<role>: ...)"), as classify.py does.
 FIXTURE_DRIFT_MARKER = "(fixture-drift:"
+# The sixth kind: an `infra` repetition whose checks errored on a forge read
+# that failed for a while during grading; the scorer leads its reason with
+# this marker (bench/kube_agents_bench/forges.py). Not a storm rep: nothing
+# was lost to the model provider's 429s, and a forge outage is not a verdict.
+# Out of rule 2's count and every pass-rate denominator, as classify.py has it.
+REP_FORGE = "forge"
+FORGE_UNAVAILABLE_MARKER = "KUBE_AGENTS_FORGE_UNAVAILABLE"
 
 # A rung-2 block's reason: the scorer gives each errored check's reason after
 # this phrase, and a check's reason can quote a rate limit or a 429 from the
@@ -847,6 +854,8 @@ def rep_kind(rep: dict) -> str:
         return REP_CEILING
     if result == REP_RESULT_INFRA and FIXTURE_DRIFT_MARKER in reason:
         return REP_FIXTURE
+    if result == REP_RESULT_INFRA and reason.startswith(FORGE_UNAVAILABLE_MARKER):
+        return REP_FORGE
     if result != REP_RESULT_INFRA and "KUBE_AGENTS_INFRA_FAILURE" not in reason and REPLAY_ERROR_RE.search(reason):
         return REP_FAIL
     if result == REP_RESULT_INFRA:
@@ -910,11 +919,11 @@ def storm_cause(rep: dict) -> str:
 
 
 class Task:
-    __slots__ = ("ceilings", "fails", "fixtures", "name", "passes", "storm_causes", "storms")
+    __slots__ = ("ceilings", "fails", "fixtures", "forges", "name", "passes", "storm_causes", "storms")
 
     def __init__(self, task: dict):
         self.name = task.get("name") or ""
-        self.passes = self.fails = self.storms = self.ceilings = self.fixtures = 0
+        self.passes = self.fails = self.storms = self.ceilings = self.fixtures = self.forges = 0
         # Each storm repetition's own words, counted (storm_cause).
         self.storm_causes: Counter = Counter()
         reps = task.get("reps")
@@ -935,6 +944,8 @@ class Task:
                 self.ceilings += 1
             elif kind == REP_FIXTURE:
                 self.fixtures += 1
+            elif kind == REP_FORGE:
+                self.forges += 1
             else:
                 self.fails += 1
 
@@ -1020,7 +1031,9 @@ class Run:
 
     @property
     def total_reps(self) -> int:
-        return sum(task.passes + task.fails + task.storms + task.ceilings + task.fixtures for task in self.tasks)
+        return sum(
+            task.passes + task.fails + task.storms + task.ceilings + task.fixtures + task.forges for task in self.tasks
+        )
 
     @property
     def lost_pod(self) -> bool:

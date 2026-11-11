@@ -1037,6 +1037,21 @@ class BrowserTest(unittest.TestCase):
         self.assertNotIn("all 0 reps", page)
         self.assertNotIn("0 reps lost", page)
 
+    def test_a_case_lost_to_a_forge_outage_says_so_on_the_run_page(self):
+        """Forge reps sit under their own key in `reps` (#5342); the card is
+        tagged and worded as a forge outage, not as unexplained or lost."""
+        data = copy.deepcopy(self.data)
+        run = next(r for r in data["runs"] if r["build_id"] == "2097282860221206528")
+        task = next(t for t in run["tasks"] if t["name"] == CRASHLOOP_TRIO[0])
+        task["result"] = "infra"
+        reason = "KUBE_AGENTS_FORGE_UNAVAILABLE: a forge read failed in transport or was rate limited, so these checks could not be evaluated, which says nothing about the run: a-check: answered 503"
+        task["reps"] = [{"n": n, "result": "infra", "reason": reason} for n in (1, 2, 3)]
+        out = render_to(pathlib.Path(self.tmp.name) / "forge", data, health=health_doc())
+        page = dom_text(out / "run.html", query="build=2097282860221206528")
+        self.assertIn("all 3 reps not graded: a forge read failed during grading", page)
+        self.assertIn('class="tag storm">forge unavailable<', page)
+        self.assertNotIn('class="tag unclear">unexplained<', page)
+
     def test_a_delegation_ceiling_wave_has_its_own_brief_and_banner(self):
         health = health_doc(
             "DEGRADED", condition="delegation_ceiling", failing_cases=[], tracking_issues=[],
