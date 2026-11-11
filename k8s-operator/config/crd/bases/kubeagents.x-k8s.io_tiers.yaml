@@ -1,0 +1,171 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.1
+  name: tiers.kubeagents.x-k8s.io
+spec:
+  group: kubeagents.x-k8s.io
+  names:
+    kind: Tier
+    listKind: TierList
+    plural: tiers
+    singular: tier
+  scope: Namespaced
+  versions:
+    - additionalPrinterColumns:
+        - jsonPath: .spec.mode
+          name: Mode
+          type: string
+        - jsonPath: .spec.writeMode
+          name: WriteMode
+          type: string
+        - jsonPath: .metadata.creationTimestamp
+          name: Age
+          type: date
+      name: v1alpha1
+      schema:
+        openAPIV3Schema:
+          description: |-
+            Tier is a set of what a task may do, which an AgentProfile allows and a
+            requester runs at. It lives in the install's namespace. Only cluster
+            administrators should write it: no agent ServiceAccount gets a verb on
+            tiers, and its RBAC does not aggregate to the admin or edit roles.
+          properties:
+            apiVersion:
+              description: |-
+                APIVersion defines the versioned schema of this representation of an object.
+                Servers should convert recognized schemas to the latest internal value, and
+                may reject unrecognized values.
+                More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+              type: string
+            kind:
+              description: |-
+                Kind is a string value representing the REST resource this object represents.
+                Servers may infer this from the endpoint the client submits requests to.
+                Cannot be updated.
+                In CamelCase.
+                More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+              type: string
+            metadata:
+              type: object
+            spec:
+              description: |-
+                TierSpec is what a tier lets the tasks that run at it do
+                (docs/designs/spec-profiles-dispatch.md, "Tiers and identity"). A tier's
+                verb set follows from its mode, so a tier can't name a verb of its own and
+                the vocabulary stays closed.
+
+                This is the first of the tier work (#3659): no component reads a Tier yet,
+                and the capability verifier and the gateway still use the read and
+                unattended tiers built into them.
+              properties:
+                mode:
+                  description: |-
+                    Mode is whether people or triggers run at this tier. interactive runs
+                    interactive profile tasks; unattended only starts profile tasks.
+                  enum:
+                    - interactive
+                    - unattended
+                  type: string
+                writeMode:
+                  default: propose
+                  description: |-
+                    WriteMode is what a task at this tier may do with a change it finds:
+                    propose it (the default), or explain only (none). Not enforced yet:
+                    the VCS broker reads it in a later change (#3659), and until then the
+                    install-level setting is the only one that applies.
+                  enum:
+                    - none
+                    - propose
+                  type: string
+              required:
+                - mode
+              type: object
+            status:
+              description: TierStatus is the operator's view of the tier.
+              properties:
+                conditions:
+                  description:
+                    Conditions represent the latest available observations
+                    of the tier.
+                  items:
+                    description:
+                      Condition contains details for one aspect of the current
+                      state of this API Resource.
+                    properties:
+                      lastTransitionTime:
+                        description: |-
+                          lastTransitionTime is the last time the condition transitioned from one status to another.
+                          This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                        format: date-time
+                        type: string
+                      message:
+                        description: |-
+                          message is a human readable message indicating details about the transition.
+                          This may be an empty string.
+                        maxLength: 32768
+                        type: string
+                      observedGeneration:
+                        description: |-
+                          observedGeneration represents the .metadata.generation that the condition was set based upon.
+                          For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                          with respect to the current state of the instance.
+                        format: int64
+                        minimum: 0
+                        type: integer
+                      reason:
+                        description: |-
+                          reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                          Producers of specific condition types may define expected values and meanings for this field,
+                          and whether the values are considered a guaranteed API.
+                          The value should be a CamelCase string.
+                          This field may not be empty.
+                        maxLength: 1024
+                        minLength: 1
+                        pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                        type: string
+                      status:
+                        description: status of the condition, one of True, False, Unknown.
+                        enum:
+                          - "True"
+                          - "False"
+                          - Unknown
+                        type: string
+                      type:
+                        description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                        maxLength: 316
+                        pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                        type: string
+                    required:
+                      - lastTransitionTime
+                      - message
+                      - reason
+                      - status
+                      - type
+                    type: object
+                  type: array
+                  x-kubernetes-list-map-keys:
+                    - type
+                  x-kubernetes-list-type: map
+                observedGeneration:
+                  description: |-
+                    ObservedGeneration is the .metadata.generation the status was last
+                    computed from.
+                  format: int64
+                  type: integer
+              type: object
+          type: object
+          x-kubernetes-validations:
+            - message:
+                "Tier name must be a DNS-1123 label (lowercase letters, digits
+                and hyphens, at most 63 characters): it is a token in the task submission
+                subject"
+              rule:
+                self.metadata.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$') && self.metadata.name.size()
+                <= 63
+      served: true
+      storage: true
+      subresources:
+        status: {}

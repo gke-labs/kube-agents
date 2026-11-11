@@ -306,6 +306,18 @@ MUTATIONS: list[Mutation] = [
         "role does not carry -- one delivery path quietly grows a ceiling",
     ),
     Mutation(
+        # A tier is authority (#3659): the operator reads tiers and writes
+        # their status, and only cluster administrators write them.
+        "A4-operator-writes-tiers",
+        "charts/kube-agents/templates/operator-rbac.yaml",
+        ("  # END GENERATED RULES",
+         "  # END GENERATED RULES\n  - apiGroups:\n      - kubeagents.x-k8s.io\n"
+         "    resources:\n      - tiers\n    verbs:\n      - create"),
+        "test_A4_only_cluster_administrators_write_tiers",
+        "let the operator create Tiers, so a compromised operator sets what "
+        "tasks may do instead of a cluster administrator",
+    ),
+    Mutation(
         # The chart half was three literal string scans until #1319; this is
         # the spelling that walked past them. Flow style is not exotic -- it is
         # what `helm create` scaffolds and what a hand-edit reaches for.

@@ -1790,6 +1790,59 @@ class A4DelegationAttenuates(unittest.TestCase):
                     "an unrestricted bind grant reached a delivery path",
                 )
 
+    def test_A4_only_cluster_administrators_write_tiers(self) -> None:
+        """A tier is authority: whoever writes one sets what tasks at it may do.
+
+        The Tier CRD (#3659) is for cluster administrators alone, so:
+
+          - no Role or ClusterRole the product mints names `tiers`, by name or
+            by a wildcard resource, at any verb;
+          - the operator's ClusterRole, on both delivery paths, reads tiers and
+            writes their status, and nothing more;
+          - nothing in the chart or the operator's config aggregates a role
+            naming `tiers` into `admin`, `edit` or `view`, which would hand
+            tiers to every namespace admin by default.
+        """
+        checked = 0
+        for name, documents in h.golden_documents().items():
+            for kind in ("Role", "ClusterRole"):
+                for role in h.objects_of_kind(documents, kind):
+                    for rule in role.get("rules") or []:
+                        checked += 1
+                        resources = set(rule.get("resources") or [])
+                        with self.subTest(fixture=name, role=role["metadata"]["name"], rule=rule):
+                            self.assertFalse(resources & {"tiers", "tiers/status"},
+                                             "a product role reaches tiers")
+                            if "kubeagents.x-k8s.io" in (rule.get("apiGroups") or []) or "*" in (rule.get("apiGroups") or []):
+                                self.assertNotIn("*", resources, "a wildcard resource reaches tiers")
+        self.assertGreater(checked, 0, "no product role was read; the goldens moved")
+
+        want = {"tiers": {"get", "list", "watch"}, "tiers/status": {"get", "update", "patch"}}
+        for source, documents in (("operator_clusterrole", h.yaml_documents("operator_clusterrole")),
+                                  ("chart_operator_rbac", h.helm_documents("chart_operator_rbac"))):
+            got: dict[str, set[str]] = {}
+            for role in h.objects_of_kind(documents, "ClusterRole"):
+                for rule in role.get("rules") or []:
+                    if "kubeagents.x-k8s.io" not in (rule.get("apiGroups") or []):
+                        continue
+                    for resource in rule.get("resources") or []:
+                        if resource.startswith("tiers"):
+                            got.setdefault(resource, set()).update(rule.get("verbs") or [])
+            with self.subTest(source=source):
+                self.assertEqual(got, want, f"{source}: the operator's verbs on tiers")
+
+        aggregating = re.compile(r"rbac\.authorization\.k8s\.io/aggregate-to-(admin|edit|view)")
+        roots = [h.REPO_ROOT / "charts/kube-agents/templates", h.REPO_ROOT / "k8s-operator/config"]
+        scanned = 0
+        for root in roots:
+            for path in sorted(root.rglob("*.yaml")):
+                scanned += 1
+                for document in re.split(r"^---\s*$", path.read_text(), flags=re.M):
+                    with self.subTest(path=str(path.relative_to(h.REPO_ROOT))):
+                        self.assertFalse(aggregating.search(document) and re.search(r"\btiers\b", document),
+                                         "a role naming tiers aggregates into admin, edit or view")
+        self.assertGreater(scanned, 0)
+
     def test_A4_triggering_is_covered_by_the_A3_inject_finding(self) -> None:
         """The second half of A4 has one instance in this codebase, already named.
 
