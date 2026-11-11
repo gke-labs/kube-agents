@@ -414,12 +414,22 @@ const (
 	dataVolumeExpansionBlockedReason = "StorageClassCannotExpand"
 	// dataVolumeExpansionMessageFormat takes the claim, its current request,
 	// the resolved size and one of the three sentences below that say why.
-	dataVolumeExpansionMessageFormat = "Claim %s requests %s, and the data volume size (spec.storage.size, or the " +
-		"operator default) is %s. %s The operator leaves the claim at its current size."
+	dataVolumeExpansionMessageFormat = "Claim %s requests %s, and the data volume size (spec.storage.size or the " +
+		"operator default, raised for spec.storage.expectedClusterProfiles on the agent's claim) is %s. %s The " +
+		"operator leaves the claim at its current size."
 	dataVolumeNoStorageClassReason  = "The claim names no StorageClass, so it cannot expand."
 	dataVolumeStorageClassGoneFmt   = "StorageClass %q does not exist, so the claim cannot expand."
 	dataVolumeStorageClassFixedFmt  = "StorageClass %q does not allow volume expansion. Set allowVolumeExpansion: true on the class to let the claim grow."
 	dataVolumeExpansionMsgSeparator = " "
+	// The Warning Event for an agent data claim below
+	// ResolveAgentDataStorageSize that will not grow: a claim the operator does
+	// not control (made or adopted by hand), or one whose StorageClass cannot
+	// expand it, which DataVolumeNotExpanded also reports. An Event rather than
+	// a second condition reason, so the condition's API is unchanged.
+	dataVolumeUndersizedReason   = "DataVolumeUndersized"
+	dataVolumeUndersizedFormat   = "Claim %s requests %s, below the %s the data volume should have (spec.storage.size or the operator default, raised for spec.storage.expectedClusterProfiles). %s"
+	dataVolumeUnownedSentence    = "The claim is not controlled by this PlatformAgent, so the operator leaves its size to whoever made it; resize it by hand."
+	dataVolumeCannotGrowSentence = "Its StorageClass cannot expand it; see the DataVolumeNotExpanded condition."
 
 	conditionReasonInvalidGitRepoURL   = "InvalidGitRepoURL"
 	conditionReasonCorruptManagedRepos = "CorruptManagedRepos"
@@ -585,6 +595,13 @@ type PlatformAgentReconciler struct {
 	// then leave the condition as it stands. Cleared when the CR is deleted.
 	dataVolumeExpansion sync.Map
 
+	// dataVolumeUndersizedWarned records, per data claim, the
+	// DataVolumeUndersized Event this process last wrote, so a claim that stays
+	// in the same state is warned about once rather than on every pass. Keyed by
+	// the claim's ObjectKey, value string; removed when the claim is no longer
+	// undersized and cleared when the CR is deleted.
+	dataVolumeUndersizedWarned sync.Map
+
 	// gatewayLeaseSeen records each A2A gateway Lease this process has seen
 	// exist, and gatewayLeaseGoneAt when it first saw a seen one missing:
 	// a deletion's recreate is held back from then (ensureA2AGatewayLease).
@@ -612,6 +629,12 @@ type PlatformAgentReconciler struct {
 	// the identity map renders no profiles rather than listing a kind whose
 	// informer would never sync.
 	agentProfilesUnreadable bool
+
+	// tiersUnreadable is the same for Tiers (TierAccessDenied): the Tier
+	// watch is skipped and the tiers file renders an empty list, which serves
+	// the compiled-in tiers, rather than listing a kind whose informer would
+	// never sync and stall every next-mode reconcile.
+	tiersUnreadable bool
 
 	// Recorder writes Events on the PlatformAgent. Nil records nothing, which
 	// is what tests and the golden harness supply (recordEvent).
@@ -1664,18 +1687,22 @@ func (r *PlatformAgentReconciler) reconcilePVC(ctx context.Context, agent *agent
 			return err
 		}
 	}
-	// The data claim follows ResolveDataStorageSize on an existing install too.
+	// The data claim follows ResolveAgentDataStorageSize on an existing install too.
 	// reconcilePersistentVolumeClaim is create-only, so without this a size
 	// raised to stop the volume filling would reach new installs only, and
 	// every install that already had the problem would keep it.
 	//
 	// The sandbox's claim grows first. It is the destination of the mirror, so
-	// a park, an error or a refusal between the two grows leaves the sandbox
-	// claim the larger one, never the smaller. This also runs before
+	// a park, an error or a refusal between the two grows leaves it at its full
+	// size before the agent's grows. The agent's claim can be the larger one by
+	// spec.storage.expectedClusterProfiles: that budget is for the session
+	// stores, which the mirror does not copy. This also runs before
 	// reconcileShellSandbox applies the StatefulSet.
 	r.growShellSandboxDataClaim(ctx, agent)
 	key := client.ObjectKeyFromObject(dataClaim)
-	r.noteDataClaimGrowth(key, r.growDataClaim(ctx, key, dataClaim.Spec.Resources.Requests[corev1.ResourceStorage], agent))
+	growth := r.growDataClaim(ctx, key, dataClaim.Spec.Resources.Requests[corev1.ResourceStorage], agent)
+	r.noteDataClaimGrowth(key, growth)
+	r.warnUndersizedDataClaim(agent, key, growth)
 	return nil
 }
 
@@ -2698,7 +2725,7 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 	}
 	opts.heldGitHubOrg = held
 	if a2aStackRendering(agent) && !r.agentProfilesUnreadable {
-		profiles, err := boundAgentProfiles(ctx, r.Client, agent)
+		profiles, err := boundAgentProfiles(ctx, r.Client, agent, r.tiersUnreadable)
 		if err != nil {
 			return err
 		}
@@ -3023,7 +3050,9 @@ func (r *PlatformAgentReconciler) ungatedDNSClusterIPs(ctx context.Context, agen
 	return r.resolveNetpolProfile(ctx, ungated).DNSClusterIPs
 }
 
-// growShellSandboxDataClaim widens the sandbox's data claim to match the agent's.
+// growShellSandboxDataClaim widens the sandbox's data claim to ResolveDataStorageSize:
+// the agent's claim without the per-profile budget, which covers session stores
+// the mirror does not copy.
 //
 // A StatefulSet's volumeClaimTemplate sizes only the claims it creates, so an
 // install from before the current ResolveDataStorageSize keeps the size it was
@@ -3044,6 +3073,9 @@ func (r *PlatformAgentReconciler) growShellSandboxDataClaim(ctx context.Context,
 type dataClaimGrowth struct {
 	claim      string
 	have, want resource.Quantity
+	// unowned is true for a claim the owner passed to growDataClaim does not
+	// control, which growDataClaim leaves at its size.
+	unowned bool
 	// cannotExpand is "" unless the claim is below want and its StorageClass
 	// cannot expand it. Then it is the sentence that says why.
 	cannotExpand string
@@ -3091,11 +3123,42 @@ func (r *PlatformAgentReconciler) dataVolumeExpansionMessage(agent *agentv1alpha
 func (r *PlatformAgentReconciler) forgetDataVolumeExpansion(agent *agentv1alpha1.PlatformAgent) {
 	for _, key := range dataClaimKeys(agent) {
 		r.dataVolumeExpansion.Delete(key)
+		r.dataVolumeUndersizedWarned.Delete(key)
 	}
 }
 
-// dataClaimKeys are the two claims ResolveDataStorageSize sizes: the agent's
-// own data claim and the sandbox's.
+// warnUndersizedDataClaim writes one DataVolumeUndersized Warning Event when
+// the agent's data claim is below the size it should have and will not grow,
+// and again only when what it says changes. A nil growth (the claim could not
+// be read) leaves the record alone; a claim that is not undersized, or that
+// growDataClaim patched, clears it, so a later shortfall is warned about anew.
+func (r *PlatformAgentReconciler) warnUndersizedDataClaim(agent *agentv1alpha1.PlatformAgent, key client.ObjectKey, growth *dataClaimGrowth) {
+	if growth == nil {
+		return
+	}
+	var why string
+	switch {
+	case growth.have.IsZero() || growth.have.Cmp(growth.want) >= 0:
+	case growth.unowned:
+		why = dataVolumeUnownedSentence
+	case growth.cannotExpand != "":
+		why = dataVolumeCannotGrowSentence
+	}
+	if why == "" {
+		r.dataVolumeUndersizedWarned.Delete(key)
+		return
+	}
+	msg := fmt.Sprintf(dataVolumeUndersizedFormat, growth.claim, growth.have.String(), growth.want.String(), why)
+	if previous, ok := r.dataVolumeUndersizedWarned.Load(key); ok && previous.(string) == msg {
+		return
+	}
+	r.dataVolumeUndersizedWarned.Store(key, msg)
+	r.recordEvent(agent, corev1.EventTypeWarning, dataVolumeUndersizedReason, msg)
+}
+
+// dataClaimKeys are the two data claims: the agent's own, which
+// ResolveAgentDataStorageSize sizes, and the sandbox's, which
+// ResolveDataStorageSize sizes.
 func dataClaimKeys(agent *agentv1alpha1.PlatformAgent) []client.ObjectKey {
 	return []client.ObjectKey{
 		client.ObjectKeyFromObject(buildPVC(agent)),
@@ -3202,13 +3265,14 @@ func (r *PlatformAgentReconciler) growDataClaim(ctx context.Context, key client.
 		}
 		return growth
 	}
+	have := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
+	growth.have = have
 	if owner != nil && !metav1.IsControlledBy(pvc, owner) {
 		log.Info("the data claim is not the operator's; leaving its size alone", "claim", key.Name)
+		growth.unowned = true
 		return growth
 	}
 
-	have := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
-	growth.have = have
 	if have.Cmp(want) >= 0 {
 		// The spec asks for enough. Whether the volume has it is a different
 		// question: the API server admits a resize on the StorageClass alone, and
@@ -6263,6 +6327,29 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		}
 	}
 
+	// Tiers feed the tiers ConfigMap (platformagent_a2a_tiers.go), so a Tier
+	// created, edited or deleted re-renders it. Registered only when the CRD
+	// is installed.
+	tierGVK := agentv1alpha1.GroupVersion.WithKind("Tier")
+	if denied := TierAccessDenied(r.RBAC); len(denied) > 0 {
+		r.tiersUnreadable = true
+		logf.Log.WithName("platformagent-controller").Info(
+			"The operator's role cannot read Tiers; skipping the Tier watch and rendering no install-defined tiers. Restart the operator after applying the current ClusterRole.",
+			"denied", denied)
+	} else if mgr != nil && mgr.GetRESTMapper() != nil {
+		if _, err := mgr.GetRESTMapper().RESTMapping(tierGVK.GroupKind(), tierGVK.Version); err == nil {
+			bld = bld.Watches(
+				&agentv1alpha1.Tier{},
+				handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+					return enqueueAgentsInNamespace(ctx, obj.GetNamespace())
+				}),
+				// The Tier reconciler writes status; only spec changes,
+				// creates and deletes change the file.
+				builder.WithPredicates(predicate.GenerationChangedPredicate{}),
+			)
+		}
+	}
+
 	// AgentProfiles feed the identity map, so a profile created, edited or
 	// deleted re-renders it. Registered only when the CRD is installed, like
 	// AgentPlugin's watch above.
@@ -6283,8 +6370,11 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
 					return enqueueAgentsInNamespace(ctx, obj.GetNamespace())
 				}),
-				// The AgentProfile reconciler writes status; only spec
-				// changes, creates and deletes change the map.
+				// The AgentProfile reconciler writes status. Spec changes,
+				// creates and deletes change the map; status.renderedTiers
+				// also picks the incumbent unattended tier, but it changes
+				// only on a pass that a spec or Tier change started, which
+				// enqueues this controller too.
 				builder.WithPredicates(predicate.GenerationChangedPredicate{}),
 			).Watches(
 				// Whether a profile gets a map entry also depends on its

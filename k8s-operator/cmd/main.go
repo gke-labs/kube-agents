@@ -383,6 +383,9 @@ func main() {
 			Client:    mgr.GetClient(),
 			Scheme:    mgr.GetScheme(),
 			APIReader: mgr.GetAPIReader(),
+			// A role that can't read Tiers lists none: a cached list would
+			// start an informer that never syncs (#3659, #1009's case).
+			TiersUnreadable: len(controller.TierAccessDenied(rbacChecker)) > 0,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to create controller", "controller", "agentprofile")
 			os.Exit(1)
@@ -391,6 +394,25 @@ func main() {
 		setupLog.Info("AgentProfile CRD is not installed on cluster; skipping the AgentProfile controller. Restart the operator after installing the CRD to enable it.")
 	default:
 		setupLog.Error(mapErr, "Failed to discover the AgentProfile kind")
+		os.Exit(1)
+	}
+
+	// The Tier reconciler, gated as the AgentProfile one is (#3659).
+	tierGVK := agentv1alpha1.GroupVersion.WithKind("Tier")
+	_, tierMapErr := mgr.GetRESTMapper().RESTMapping(tierGVK.GroupKind(), tierGVK.Version)
+	tierDenied := controller.TierAccessDenied(rbacChecker)
+	switch {
+	case tierMapErr == nil && len(tierDenied) > 0:
+		setupLog.Error(nil, "The operator's role cannot read Tiers; skipping the Tier controller. Restart the operator after applying the current ClusterRole.", "denied", tierDenied)
+	case tierMapErr == nil:
+		if err := (&controller.TierReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to create controller", "controller", "tier")
+			os.Exit(1)
+		}
+	case meta.IsNoMatchError(tierMapErr):
+		setupLog.Info("Tier CRD is not installed on cluster; skipping the Tier controller. Restart the operator after installing the CRD to enable it.")
+	default:
+		setupLog.Error(tierMapErr, "Failed to discover the Tier kind")
 		os.Exit(1)
 	}
 

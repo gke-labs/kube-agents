@@ -181,7 +181,7 @@ func buildA2AVerifierDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Depl
 		podLabels[k] = v
 	}
 
-	return &appsv1.Deployment{
+	dep := &appsv1.Deployment{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: agent.Namespace, Labels: labels},
 		Spec: appsv1.DeploymentSpec{
@@ -292,6 +292,8 @@ func buildA2AVerifierDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Depl
 			},
 		},
 	}
+	withA2ATiersFile(agent, &dep.Spec.Template.Spec, a2aVerifierContainerName)
+	return dep
 }
 
 // buildA2AVerifierPDB is the eviction-side half of the availability statement

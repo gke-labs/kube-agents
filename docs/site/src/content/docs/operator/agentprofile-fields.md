@@ -40,7 +40,7 @@ Every field of the `AgentProfile` resource's `spec` and `status`, generated from
 | `lifecycle.ttlSecondsAfterFinished` | `integer` | yes |  | min `0` | TTLSecondsAfterFinished is how long a finished Job lingers for inspection before garbage collection. |
 | `queueTimeoutSeconds` | `integer` | no |  | min `0` | QueueTimeoutSeconds is how stale a queued submission may be, by its JetStream server ingest time, before the dispatcher refuses to run it. Absent or zero means DefaultAgentProfileQueueTimeoutSeconds. |
 | `concurrency` | `integer` | yes |  | min `1` | Concurrency is the most pods this profile runs at once. |
-| `allowedTiers` | `[]string` | no |  | min items `1`; max items `2`; items one of `read`, `unattended` | AllowedTiers are the tiers this profile may run at. A task runs at its requester's tier, and the dispatcher refuses one whose tier is not listed here; a pinned production profile might allow only read. Tier is authority, so it lives on the CR, never in the persona. Absent means read alone (AllowedTierList). |
+| `allowedTiers` | `[]string` | no |  | min items `1`; max items `4`; items max length `10`; items pattern `^[a-z0-9]+$` | AllowedTiers are the tiers this profile may run at. A task runs at its requester's tier, and the dispatcher refuses one whose tier is not listed here; a pinned production profile might allow only read. Tier is authority, so it lives on the CR, never in the persona. Absent means read alone (AllowedTierList). |
 | `parameters` | `[]object` | no |  | max items `16` | Parameters are the task parameters this profile's persona declares, as the gateway and the dispatcher need them without reading the persona image: the gateway routes cluster work to a profile that declares project, location and cluster, and the dispatcher refuses a submission missing a required one. The worker checks this list against the persona's at start and refuses to run a task when they differ. |
 | `parameters[].name` | `string` | yes |  | pattern `^[a-z][a-z0-9_]{0,62}$` |  |
 | `parameters[].required` | `boolean` | no |  |  | Required means a submission without it is refused. |
@@ -58,7 +58,8 @@ Every field of the `AgentProfile` resource's `spec` and `status`, generated from
 | ----- | ---- | -------- | ------- | ----------- | ----------- |
 | `observedGeneration` | `integer` | no |  |  | ObservedGeneration is the .metadata.generation the status was last computed from. |
 | `agentRef` | `string` | no |  |  | AgentRef is the PlatformAgent this profile is bound to: the one in its namespace. |
-| `serviceAccountName` | `string` | no |  |  | ServiceAccountName lists the ServiceAccounts the profile's pods run as, in the profile namespace: one per allowed tier, comma-separated, or the one named in spec.identity. |
+| `serviceAccountName` | `string` | no |  |  | ServiceAccountName lists the ServiceAccounts the profile's pods run as, in the profile namespace: one per rendered tier, comma-separated, or the one named in spec.identity. |
+| `renderedTiers` | `[]string` | no |  | max items `4`; items max length `10`; items pattern `^[a-z0-9]+$` | RenderedTiers are the tiers the operator last rendered this profile's identities, durables and pools for, kept through a pass whose identities aren't ready. The operator reads it to tell an incumbent unattended-mode tier from a newcomer. It is a hint, not authority: a tier here never creates anything the spec and the Tier catalog don't, cleanup still acts only on objects carrying this profile's labels, and when it is absent (a restore that dropped status) the operator derives it once from the profile's own objects. |
 | `conditions` | `[]metav1.Condition` | no |  |  | Conditions represent the latest available observations of the profile. |
 
 <!-- prettier-ignore-end -->

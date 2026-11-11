@@ -24,6 +24,7 @@ import (
 
 	"github.com/nats-io/nats.go"
 
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/gateway"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"k8s.io/client-go/kubernetes"
@@ -135,6 +136,9 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		log.Error("config", "err", err)
 		return err
 	}
+	// The install's Tier resources, rendered by the operator (#3659): the
+	// mint validates every grant against the tier table.
+	capability.StartTierFile(ctx, os.Getenv, log)
 
 	natsOpts := gatewayNATSOptions(cfg)
 	client, err := lib.Connect(ctx, cfg.NATSURL,
@@ -245,6 +249,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		log.Error("gateway", "err", err)
 		return err
 	}
+	armResolvedScope(cfg, gw, log)
 	// lead is all of the gateway's work: the chat.notify routes and Run.
 	// Under the election it runs only while this replica holds the lease.
 	lead := func(ctx context.Context, opts gateway.RunOptions) error {
@@ -393,6 +398,29 @@ func chatNotifier(cfg *gateway.Config, backend gateway.Adapter, conversations fu
 	}
 	n.SetConversations(conversations(gchat))
 	return n
+}
+
+// armResolvedScope points the profile-route scope check at the scope
+// publisher's ConfigMap (Config.ResolvedScopeConfigMap), read with the pod's
+// own ServiceAccount, whose Role allows get on that one name. Without it, or
+// when the client cannot be built, a target only a resolution can confirm is
+// refused as unconfirmed.
+func armResolvedScope(cfg *gateway.Config, gw *gateway.Gateway, log *slog.Logger) {
+	if cfg.ResolvedScopeConfigMap == "" {
+		return
+	}
+	rc, err := rest.InClusterConfig()
+	if err != nil {
+		log.Error("resolved scope not armed: no in-cluster config", "err", err)
+		return
+	}
+	cs, err := kubernetes.NewForConfig(rc)
+	if err != nil {
+		log.Error("resolved scope not armed: no Kubernetes client", "err", err)
+		return
+	}
+	gw.SetResolvedScope(cs, cfg.Namespace, cfg.ResolvedScopeConfigMap)
+	log.Info("resolved scope armed", "configmap", cfg.ResolvedScopeConfigMap)
 }
 
 // armHomeLearn lets a Slack gateway learn its home channel from the first

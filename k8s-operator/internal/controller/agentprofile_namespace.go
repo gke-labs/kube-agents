@@ -170,13 +170,12 @@ func resolveProfileWarmReplicas(agent *agentv1alpha1.PlatformAgent) int {
 }
 
 // interactiveProfileTiers counts the warm pools the profiles need: one per
-// (profile, tier) whose tier is interactive. Read is the only interactive
-// tier until tiers are CR data (#3659).
+// (profile, tier) whose tier's mode is interactive (#3659).
 func interactiveProfileTiers(profiles []agentv1alpha1.AgentProfile) int {
 	n := 0
 	for i := range profiles {
 		for _, tier := range profiles[i].AllowedTierList() {
-			if tier == agentv1alpha1.AgentProfileTierRead {
+			if interactiveTier(&profiles[i], tier) {
 				n++
 			}
 		}
@@ -203,7 +202,7 @@ func profileQuotaHard(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alph
 	pools := interactiveProfileTiers(profiles)
 	jobs := resolveProfileCeiling(agent)
 	if dispatcherJobPolicyRendered() && slices.ContainsFunc(profiles, func(p agentv1alpha1.AgentProfile) bool {
-		return slices.Contains(p.AllowedTierList(), agentv1alpha1.AgentProfileTierUnattended)
+		return unattendedTierOf(&p) != ""
 	}) {
 		jobs *= 2
 	}

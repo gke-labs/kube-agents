@@ -61,12 +61,23 @@ spec:
                     refuses one whose tier is not listed here; a pinned production profile
                     might allow only read. Tier is authority, so it lives on the CR, never
                     in the persona. Absent means read alone (AllowedTierList).
+
+                    Each is a tier: the built-in read or unattended, or a Tier resource in
+                    the install's namespace (#3659). A name with neither is refused by the
+                    operator, which reports TierUnknown. A tier name listed here is at most
+                    10 characters, the length of "unattended": it becomes part of the
+                    profile's bus identity, profile-<name>-<tier>, which must fit one
+                    63-character label beside the profile's name, and of its pools' and
+                    Jobs' names and labels, whose budgets assume no longer tier. It has no
+                    hyphen either: the profile's durables are named
+                    profile-<name>-<tier>-<kind>, and a hyphen would let profile a with tier
+                    b-c and profile a-b with tier c share one. A longer or hyphenated Tier
+                    resource can exist but can't be listed.
                   items:
-                    enum:
-                      - read
-                      - unattended
+                    maxLength: 10
+                    pattern: ^[a-z0-9]+$
                     type: string
-                  maxItems: 2
+                  maxItems: 4
                   minItems: 1
                   type: array
                   x-kubernetes-list-type: set
@@ -431,10 +442,27 @@ spec:
                     computed from.
                   format: int64
                   type: integer
+                renderedTiers:
+                  description: |-
+                    RenderedTiers are the tiers the operator last rendered this profile's
+                    identities, durables and pools for (#3659), kept through a pass whose
+                    identities aren't ready. The operator reads it to tell an incumbent
+                    unattended-mode tier from a newcomer. It is a hint, not authority: a tier here never creates
+                    anything the spec and the Tier catalog don't, cleanup still acts only on
+                    objects carrying this profile's labels, and when it is absent (a
+                    restore that dropped status) the operator derives it once from the
+                    profile's own objects.
+                  items:
+                    maxLength: 10
+                    pattern: ^[a-z0-9]+$
+                    type: string
+                  maxItems: 4
+                  type: array
+                  x-kubernetes-list-type: set
                 serviceAccountName:
                   description: |-
                     ServiceAccountName lists the ServiceAccounts the profile's pods run as,
-                    in the profile namespace: one per allowed tier, comma-separated, or the
+                    in the profile namespace: one per rendered tier, comma-separated, or the
                     one named in spec.identity.
                   type: string
               type: object
@@ -454,14 +482,24 @@ spec:
             - message:
                 "AgentProfile name is too long for its tiers: each tier's bus
                 identity is profile-<name>-<tier>, which must fit one 63-character label,
-                so a name is at most 50 characters, or 44 if allowedTiers includes unattended"
+                so the name plus its longest allowed tier is at most 54 characters (50
+                with read alone, 44 with a 10-character tier such as unattended)"
               optionalOldSelf: true
               rule:
-                "self.metadata.name.size() <= (has(self.spec.allowedTiers) && self.spec.allowedTiers.exists(t,
-                t == 'unattended') ? 44 : 50) || (oldSelf.hasValue() && oldSelf.value().metadata.name.size()
-                > ((has(oldSelf.value().spec.allowedTiers) && (size(oldSelf.value().spec.allowedTiers)
-                == 2 || oldSelf.value().spec.allowedTiers[0] == 'unattended')) ? 44
-                : 50))"
+                "(!has(self.spec.allowedTiers) ? self.metadata.name.size() <= 50 :
+                (self.metadata.name.size() + self.spec.allowedTiers[0].size() <= 54 &&
+                (size(self.spec.allowedTiers) < 2 || self.metadata.name.size() + self.spec.allowedTiers[1].size()
+                <= 54) && (size(self.spec.allowedTiers) < 3 || self.metadata.name.size()
+                + self.spec.allowedTiers[2].size() <= 54) && (size(self.spec.allowedTiers)
+                < 4 || self.metadata.name.size() + self.spec.allowedTiers[3].size() <=
+                54))) || (oldSelf.hasValue() && !(!has(oldSelf.value().spec.allowedTiers)
+                ? oldSelf.value().metadata.name.size() <= 50 : (oldSelf.value().metadata.name.size()
+                + oldSelf.value().spec.allowedTiers[0].size() <= 54 && (size(oldSelf.value().spec.allowedTiers)
+                < 2 || oldSelf.value().metadata.name.size() + oldSelf.value().spec.allowedTiers[1].size()
+                <= 54) && (size(oldSelf.value().spec.allowedTiers) < 3 || oldSelf.value().metadata.name.size()
+                + oldSelf.value().spec.allowedTiers[2].size() <= 54) && (size(oldSelf.value().spec.allowedTiers)
+                < 4 || oldSelf.value().metadata.name.size() + oldSelf.value().spec.allowedTiers[3].size()
+                <= 54))))"
       served: true
       storage: true
       subresources:

@@ -434,7 +434,7 @@ func TestAForeignServiceAccountIsNotAdopted(t *testing.T) {
 	if sa.Annotations[agentProfileUIDAnnotation] != "" {
 		t.Errorf("the foreign ServiceAccount was adopted: %v", sa.Annotations)
 	}
-	bound, err := boundAgentProfiles(context.Background(), h.c, agent)
+	bound, err := boundAgentProfiles(context.Background(), h.c, agent, false)
 	if err != nil || len(bound) != 0 {
 		t.Errorf("boundAgentProfiles = %v, %v; want the profile left out of the map", bound, err)
 	}
@@ -1009,7 +1009,7 @@ func TestAProfileWithNoSinglePlatformAgentRendersNothing(t *testing.T) {
 	if entries := renderedMapEntries(t, a1, nil); len(entries) == 0 {
 		t.Fatal("precondition")
 	}
-	profiles, err := boundAgentProfiles(context.Background(), h2.c, a1)
+	profiles, err := boundAgentProfiles(context.Background(), h2.c, a1, false)
 	if err != nil || len(profiles) != 0 {
 		t.Errorf("boundAgentProfiles with two agents = %v, %v; want none", profiles, err)
 	}
@@ -1072,7 +1072,7 @@ func TestEnsureServiceAccountSettlesACreateCollisionUncached(t *testing.T) {
 			},
 		})
 		r := &AgentProfileReconciler{Client: cached, APIReader: base, Scheme: scheme, Cards: newFakeDirectory()}
-		err := r.ensureServiceAccount(context.Background(), &p, profileNamespaceName(agent), agentProfileTierIdentity{tier: agentv1alpha1.AgentProfileTierRead, serviceAccount: landed.Name})
+		err := r.ensureServiceAccount(context.Background(), &p, profileNamespaceName(agent), agentProfileTierIdentity{tier: agentv1alpha1.AgentProfileTierRead, serviceAccount: landed.Name}, tierModeInteractive)
 		switch {
 		case !created:
 			t.Error("the Create path was never reached; the test is not exercising the race")

@@ -141,9 +141,9 @@ func TestSyncingAProfilesDurablesDropsATiersQueue(t *testing.T) {
 		return err == nil
 	}
 	sync(desiredProfileDurables(&both))
-	for _, name := range allProfileDurableNames("tse") {
-		if !exists(name) {
-			t.Fatalf("%s missing with both tiers", name)
+	for _, d := range desiredProfileDurables(&both) {
+		if !exists(d.name) {
+			t.Fatalf("%s missing with both tiers", d.name)
 		}
 	}
 	readOnly := testAgentProfile("ns", "tse")
@@ -152,9 +152,51 @@ func TestSyncingAProfilesDurablesDropsATiersQueue(t *testing.T) {
 		t.Error("dropping unattended didn't leave exactly the read durables")
 	}
 	sync(nil)
-	for _, name := range allProfileDurableNames("tse") {
-		if exists(name) {
-			t.Errorf("%s survived the profile's withdrawal", name)
+	for _, d := range desiredProfileDurables(&both) {
+		if exists(d.name) {
+			t.Errorf("%s survived the profile's withdrawal", d.name)
+		}
+	}
+}
+
+// A durable of a tier that is neither read nor unattended (a Tier resource,
+// since deleted or dropped) is found by listing and removed, while another
+// profile's durables, including one whose name shares a prefix, and a durable
+// the operator didn't make, are left alone (#3659).
+func TestADroppedCustomTiersDurablesAreFoundAndOthersLeftAlone(t *testing.T) {
+	js := jetStreamWithProfileSubmits(t)
+	ctx := context.Background()
+	nightly := testAgentProfile("ns", "tse", func(p *agentv1alpha1.AgentProfile) { p.Spec.AllowedTiers = []string{"read", "nightly"} })
+	neighbour := testAgentProfile("ns", "tse-b", func(p *agentv1alpha1.AgentProfile) { p.Spec.AllowedTiers = []string{"read"} })
+	if err := syncDurables(ctx, js, "tse", desiredProfileDurables(&nightly)); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncDurables(ctx, js, "tse-b", desiredProfileDurables(&neighbour)); err != nil {
+		t.Fatal(err)
+	}
+	// A consumer under this profile's name pattern that the operator didn't make.
+	if _, err := js.CreateOrUpdateConsumer(ctx, a2aProfileSubmitStream, jetstream.ConsumerConfig{
+		Durable: "profile-tse-hand-top", FilterSubject: "a2a.submit.tse.hand.top.*",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	readOnly := testAgentProfile("ns", "tse")
+	if err := syncDurables(ctx, js, "tse", desiredProfileDurables(&readOnly)); err != nil {
+		t.Fatal(err)
+	}
+	exists := func(name string) bool { _, err := js.Consumer(ctx, a2aProfileSubmitStream, name); return err == nil }
+	if exists("profile-tse-nightly-top") || exists("profile-tse-nightly-child") {
+		t.Error("the dropped custom tier's durables survived")
+	}
+	if !exists("profile-tse-read-top") || !exists("profile-tse-b-read-top") || !exists("profile-tse-hand-top") {
+		t.Error("a kept, a neighbour's or an unmarked durable was deleted")
+	}
+	for name, want := range map[string]bool{
+		"profile-tse-read-top": true, "profile-tse-nightly-child": true, "profile-tse-b-read-top": false,
+		"profile-tse-read": false, "profile-tse-read-top-x": false, "profile-tse-ni-ght-top": false,
+	} {
+		if got := profileDurableOf("tse", name); got != want {
+			t.Errorf("profileDurableOf(tse, %s) = %v, want %v", name, got, want)
 		}
 	}
 }

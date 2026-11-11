@@ -240,12 +240,14 @@ func TestAnUnarmedGatewayRendersAsBefore(t *testing.T) {
 			if scopePublisherRendered(tc.agent) {
 				want = append(want, a2aResolvedScopeConfigMapEnvVar)
 			}
+			// The tiers file (#3659), appended after the gateway is built.
+			want = append(want, a2aTiersFileEnvVar)
 			if strings.Join(names, ",") != strings.Join(want, ",") {
 				t.Errorf("unarmed env order %v, want %v", names, want)
 			}
-			if len(c.VolumeMounts) != 3 || c.VolumeMounts[0].Name != "principal-map" || c.VolumeMounts[1].Name != a2aNATSCABundleVolumeName ||
-				c.VolumeMounts[2].Name != a2aGatewayScopeVolumeName {
-				t.Errorf("unarmed mounts %v, want the principal map, the bus CA and the scope file alone", c.VolumeMounts)
+			if len(c.VolumeMounts) != 4 || c.VolumeMounts[0].Name != "principal-map" || c.VolumeMounts[1].Name != a2aNATSCABundleVolumeName ||
+				c.VolumeMounts[2].Name != a2aGatewayScopeVolumeName || c.VolumeMounts[3].Name != a2aTiersVolume {
+				t.Errorf("unarmed mounts %v, want the principal map, the bus CA, the scope file and the tiers file alone", c.VolumeMounts)
 			}
 		})
 	}

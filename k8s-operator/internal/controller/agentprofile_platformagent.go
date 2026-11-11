@@ -43,7 +43,7 @@ import (
 // namespace; with two agents in one namespace (possible only with the
 // singleton webhook off) a profile cannot say which it belongs to, and
 // neither renders it. A cluster without the AgentProfile CRD has no profiles.
-func boundAgentProfiles(ctx context.Context, c client.Reader, agent *agentv1alpha1.PlatformAgent) ([]agentv1alpha1.AgentProfile, error) {
+func boundAgentProfiles(ctx context.Context, c client.Reader, agent *agentv1alpha1.PlatformAgent, tiersUnreadable bool) ([]agentv1alpha1.AgentProfile, error) {
 	var agents agentv1alpha1.PlatformAgentList
 	if err := c.List(ctx, &agents, client.InNamespace(agent.Namespace)); err != nil {
 		return nil, err
@@ -69,7 +69,13 @@ func boundAgentProfiles(ctx context.Context, c client.Reader, agent *agentv1alph
 			bound = append(bound, profiles.Items[i])
 		}
 	}
-	return bound, nil
+	// Each profile narrowed to the tiers it renders (agentprofile_tiers.go):
+	// an unknown or conflicting tier renders nothing downstream.
+	renderable, _, err := renderableAgentProfiles(ctx, c, agent, bound, tiersUnreadable)
+	if err != nil {
+		return nil, err
+	}
+	return renderable, nil
 }
 
 // agentProfileServiceAccountIsForeign reports whether a profile with no

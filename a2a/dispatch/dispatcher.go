@@ -896,7 +896,7 @@ const capHeld = "already held here"
 // delivery that raced the first past handle's check) is refused as capHeld,
 // never given a second holding.
 func (d *Dispatcher) reserve(snap lib.DispatchConfig, prof lib.DispatchProfile, tier, kind, taskID string) (*holding, string) {
-	unattended := d.cfg.unattended(tier)
+	unattended := d.cfg.unattendedFor(prof, tier)
 	shared := snap.Ceiling - snap.ChildReserve - snap.InteractiveReserve
 
 	d.mu.Lock()
@@ -1258,7 +1258,7 @@ func (d *Dispatcher) adopt(ctx context.Context, log *slog.Logger, del lib.Delive
 	if renew <= 0 {
 		renew = min(seconds(snap.RenewSeconds), lease/3)
 	}
-	h := &holding{profile: hk.profile, tier: hk.tier, kind: hk.kind, taskID: hk.taskID, unattended: d.cfg.unattended(hk.tier), onJob: d.cfg.unattended(hk.tier) && d.jobs != nil,
+	h := &holding{profile: hk.profile, tier: hk.tier, kind: hk.kind, taskID: hk.taskID, unattended: d.cfg.unattendedFor(prof, hk.tier), onJob: d.cfg.jobPossible(prof, hk.tier) && d.jobs != nil,
 		lease: lease, renew: renew, pod: pod, confirmed: true,
 		renewals: make(chan renewal, renewalBuffer), done: make(chan struct{})}
 	d.mu.Lock()

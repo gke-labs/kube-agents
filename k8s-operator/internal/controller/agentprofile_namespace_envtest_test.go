@@ -122,7 +122,13 @@ func TestTheAgentProfileCRDBoundsAllowedTiers(t *testing.T) {
 		{nil, true},
 		{[]string{"read"}, true},
 		{[]string{"read", "unattended"}, true},
-		{[]string{"admin"}, false},
+		// Any DNS label up to 10 characters (#3659): a name with no Tier is
+		// the operator's to refuse (TierUnknown), not the CRD's.
+		{[]string{"admin"}, true},
+		{[]string{"read", "unattended", "oncall", "nightly"}, true},
+		{[]string{"tooverylong"}, false},              // 11 characters
+		{[]string{"on-call"}, false},                  // a hyphen: durable names would collide
+		{[]string{"read", "a", "b", "c", "d"}, false}, // 5 items
 		{[]string{"Read"}, false},
 		{[]string{"read", "read"}, false},
 		{[]string{}, true}, // omitempty: an empty list is absent, which means read

@@ -416,6 +416,9 @@ data:
     API_SERVER_KEY=cluster-internal-trusted
     HERMES_HOME_MODE=2770
     KUBEAGENTS_MODE=next
+    KUBEAGENTS_POST_MERGE_CHECK=off
+    KUBEAGENTS_AUTOMERGE=off
+    KUBEAGENTS_DIAL=off
     KUBEAGENTS_SCOPE_FILE=/etc/kube-agents/scope.json
     RECONCILE_PROJECT=
     GKE_PROJECT_ID=example-project
@@ -3229,6 +3232,8 @@ spec:
                 secretKeyRef:
                   key: xkey-seed
                   name: platformagent-a2a-callout-keys
+            - name: A2A_TIERS_FILE
+              value: /etc/a2a-tiers/tiers.json
           image: ghcr.io/gke-labs/kube-agents/a2a-authcallout:latest
           livenessProbe:
             failureThreshold: 6
@@ -3265,6 +3270,9 @@ spec:
             - mountPath: /etc/a2a-nats-ca
               name: a2a-nats-ca
               readOnly: true
+            - mountPath: /etc/a2a-tiers
+              name: a2a-tiers
+              readOnly: true
           workingDir: /
       securityContext:
         runAsNonRoot: true
@@ -3285,6 +3293,10 @@ spec:
         - configMap:
             name: platformagent-a2a-nats-ca-bundle
           name: a2a-nats-ca
+        - configMap:
+            name: platformagent-a2a-tiers
+            optional: true
+          name: a2a-tiers
 status: {}
 ---
 apiVersion: policy/v1
@@ -4342,6 +4354,8 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            - name: A2A_TIERS_FILE
+              value: /etc/a2a-tiers/tiers.json
           image: ghcr.io/gke-labs/kube-agents/a2a-verifier:latest
           livenessProbe:
             failureThreshold: 6
@@ -4379,6 +4393,9 @@ spec:
             - mountPath: /etc/a2a-nats-ca
               name: a2a-nats-ca
               readOnly: true
+            - mountPath: /etc/a2a-tiers
+              name: a2a-tiers
+              readOnly: true
           workingDir: /
       securityContext:
         runAsNonRoot: true
@@ -4406,6 +4423,10 @@ spec:
         - configMap:
             name: platformagent-a2a-nats-ca-bundle
           name: a2a-nats-ca
+        - configMap:
+            name: platformagent-a2a-tiers
+            optional: true
+          name: a2a-tiers
 status: {}
 ---
 apiVersion: policy/v1
@@ -5028,6 +5049,30 @@ metadata:
       name: platformagent
       uid: ""
 spec: {}
+---
+apiVersion: v1
+data:
+  tiers.json: |
+    {
+      "tiers": []
+    }
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: tiers
+  name: platformagent-a2a-tiers
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
 ---
 apiVersion: batch/v1
 kind: Job
@@ -5701,6 +5746,8 @@ spec:
                 fieldRef:
                   apiVersion: v1
                   fieldPath: metadata.name
+            - name: A2A_TIERS_FILE
+              value: /etc/a2a-tiers/tiers.json
           image: ghcr.io/gke-labs/kube-agents/a2a-gateway:latest
           name: gateway
           ports:
@@ -5736,6 +5783,9 @@ spec:
               readOnly: true
             - mountPath: /var/run/secrets/a2a-chat-relay
               name: a2a-chat-relay-token
+              readOnly: true
+            - mountPath: /etc/a2a-tiers
+              name: a2a-tiers
               readOnly: true
           workingDir: /
       securityContext:
@@ -5777,4 +5827,8 @@ spec:
                   audience: kubeagents-credential-proxy-a2a-chat
                   expirationSeconds: 3600
                   path: token
+        - configMap:
+            name: platformagent-a2a-tiers
+            optional: true
+          name: a2a-tiers
 status: {}

@@ -227,7 +227,8 @@ func writerOf(key string) (principal string, isRoot bool, err error) {
 // has no verb set, and treating that as an empty set would make it a subset of
 // every parent's.
 func (e Entry) Validate() error {
-	if _, ok := tierVerbs[e.Tier]; !ok {
+	t := tiers()
+	if _, ok := t.verbs[e.Tier]; !ok {
 		return refuse("entry carries a tier that is not a known tier")
 	}
 	if err := e.Scope.validate(); err != nil {
@@ -237,11 +238,11 @@ func (e Entry) Validate() error {
 		return err
 	}
 	switch {
-	case profileTiers[e.Tier] && e.Profile == "":
+	case t.profile[e.Tier] && e.Profile == "":
 		// Without this a read root with no profile would let the first
 		// hop choose any profile its chain may run.
 		return refuse("entry at a profile tier names no profile")
-	case !profileTiers[e.Tier] && e.Profile != "":
+	case !t.profile[e.Tier] && e.Profile != "":
 		return refuse("entry names a profile at a tier that is not a profile tier")
 	case e.Profile != "" && !validProfileName(e.Profile):
 		return refuse("entry carries a profile name that is not a DNS label")
@@ -312,18 +313,19 @@ func (s Scope) Contains(other Scope) bool {
 // do. What this rule buys is the bound that makes that survivable — a hop
 // cannot exceed what it was delegated.
 func Narrows(parent, child Entry) error {
-	ps, ok := tierVerbs[parent.Tier]
+	t := tiers()
+	ps, ok := t.verbs[parent.Tier]
 	if !ok {
 		return refuse("parent carries a tier that is not a known tier")
 	}
-	cs, ok := tierVerbs[child.Tier]
+	cs, ok := t.verbs[child.Tier]
 	if !ok {
 		return refuse("child carries a tier that is not a known tier")
 	}
 	if !cs.subsetOf(ps) {
 		return refuse("child widens the tier: its verb set is not inside the parent's")
 	}
-	if (profileTiers[parent.Tier] || profileTiers[child.Tier]) && child.Tier != parent.Tier {
+	if (t.profile[parent.Tier] || t.profile[child.Tier]) && child.Tier != parent.Tier {
 		return refuse("child widens the tier: a profile tier narrows only to itself")
 	}
 	if child.Profile != parent.Profile {

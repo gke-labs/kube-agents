@@ -146,7 +146,7 @@ func agentCardSubject(profile string) string {
 
 // desiredAgentCard is the card the profile's spec renders.
 func desiredAgentCard(p *agentv1alpha1.AgentProfile) a2aAgentCard {
-	card := a2aAgentCard{Name: p.Name, Description: p.Spec.Description, Tiers: p.AllowedTierList()}
+	card := a2aAgentCard{Name: p.Name, Description: p.Spec.Description, Tiers: liveTiersOf(p)}
 	if ref := p.Spec.ClusterRef; ref != nil {
 		card.ClusterRef = &a2aCardClusterRef{ProjectID: ref.ProjectID, Location: ref.Location, Cluster: ref.Cluster}
 	}
