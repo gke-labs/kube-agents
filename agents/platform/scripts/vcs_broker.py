@@ -1069,8 +1069,11 @@ class VcsBroker:
 
         `writeMode` is the install's write mode (:func:`write_mode`), so a caller
         learns that branch and proposal writes are refused before it clones.
+        `writeModeDetail` says why when that `none` comes from a value that is
+        neither mode, as the broker's refusal does.
         """
-        mode = write_mode()[0]
+        mode, raw = write_mode()
+        detail = write_mode_detail(raw)
         try:
             forge, repo = self.registry.resolve(payload.get("repository"))
         except ForgeUnsupported as exc:
@@ -1082,10 +1085,13 @@ class VcsBroker:
                 "missing": [str(exc)],
                 "baseBranch": None,
                 "writeMode": mode,
+                **({"writeModeDetail": detail} if detail else {}),
             }
         answer = forge.capabilities(repo)
         answer["baseBranch"] = self._pinned_base(forge, repo)
         answer["writeMode"] = mode
+        if detail:
+            answer["writeModeDetail"] = detail
         return answer
 
     def clone(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -2462,8 +2468,7 @@ WRITE_VERBS = frozenset(
 # and labels stay open to it, because an issue is how an audit reports.
 # Read on every request through write_mode(), the one place a second source
 # (a runtime setting) can be added. Today its only source is the broker's env,
-# so on a pod a change applies once the operator has rolled the broker (and the
-# agent pod, which gets the same spec.deployment.env).
+# so on a pod a change applies once the operator has rolled the broker.
 WRITE_MODE_ENV = "KUBEAGENTS_WRITE_MODE"
 WRITE_MODE_PROPOSE = "propose"
 WRITE_MODE_NONE = "none"
@@ -2493,6 +2498,17 @@ def write_mode(environ: Mapping[str, str] | None = None) -> tuple[str, str]:
     if not value:
         return WRITE_MODE_PROPOSE, raw
     return (value if value in WRITE_MODES else WRITE_MODE_NONE), raw
+
+
+def write_mode_detail(raw: str) -> str:
+    """Why `raw` reads as `none` when it is neither mode, or "" when it is one (or unset)."""
+    value = raw.strip().lower()
+    if not value or value in WRITE_MODES:
+        return ""
+    return (
+        f"{WRITE_MODE_ENV} is set to a value that is neither "
+        f"{' nor '.join(WRITE_MODES)}, so the broker treats it as none"
+    )
 
 
 # The verbs the HTTP layer answers for a repository this install does not
@@ -2599,6 +2615,7 @@ __all__ = [
     "WRITE_MODES",
     "WRITE_VERBS",
     "write_mode",
+    "write_mode_detail",
     "max_bundle_bytes",
     "route_table",
 ]

@@ -13928,6 +13928,15 @@ class TestRemediateSubcommand(HarnessTestCase):
             },
         )
 
+    def test_an_explain_only_install_is_refused_before_anything_is_cloned(self):
+        # Review: at writeMode none this cloned, was refused at the publish, and
+        # still printed REMEDIATED.
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.harness.replies = {"capabilities": {"forge": "github", "writeMode": "none"}}
+        self.assertEqual(self.run_remediate(make_doc(), [derived_id()]), 2)
+        self.assertIn("explain-only", self.err)
+        self.assertEqual(["capabilities"], [call[1] for call in self.harness.calls])
+
     def human_closed_pr_reply(self, doc):
         """A pull request on this finding's own branch, closed by a person."""
         branch = audit_report.group_branch_for(AUDIT, doc["findings"])
@@ -17471,6 +17480,76 @@ class TestContentWorkspaceReachesEveryForge(unittest.TestCase):
             refusal = audit_report.remediation_refusal("gitlab.example.com/acme/infra")
         self.assertIn("not a forge this install serves", refusal)
         self.assertIn("a retry will not change this", refusal)
+
+
+class TestExplainOnlyInstallTakesNoRemediation(unittest.TestCase):
+    """Review: on an install at writeMode none, remediation cloned per group, and
+    /remediate was answered with a retry the broker would refuse every time."""
+
+    def setUp(self):
+        audit_report._CAPABILITIES.clear()
+        self.addCleanup(audit_report._CAPABILITIES.clear)
+
+    def _broker(self, write_mode):
+        asked = []
+
+        def forge(verb, repo, payload):
+            asked.append(verb)
+            if verb != "capabilities":
+                raise AssertionError(f"{verb} reached the broker on an explain-only install")
+            answer = {"forge": "github", "verbs": ["issue-list"]}
+            if write_mode is not None:
+                answer["writeMode"] = write_mode
+            return answer
+
+        return forge, asked
+
+    def test_none_is_a_refusal_with_no_retry(self):
+        forge, _ = self._broker("none")
+        with patch.object(audit_report, "forge", forge):
+            refusal = audit_report.write_mode_refusal("acme/fleet")
+        self.assertIn("explain-only", refusal)
+        self.assertIn("a retry will not change this", refusal)
+
+    def test_the_reply_to_remediate_names_the_write_mode_and_promises_no_retry(self):
+        forge, _ = self._broker("none")
+        requests = type("R", (), {"targets": ["f1"]})()
+        plan = type("P", (), {"already_open": set(), "superseded": set()})()
+        with patch.object(audit_report, "forge", forge):
+            refusal = audit_report.write_mode_refusal("acme/fleet")
+        outcomes = audit_report._remediation_outcomes(requests, plan, {}, [], "pull request", refusal)
+        self.assertIn("explain-only", outcomes["f1"])
+        self.assertNotIn("will retry", outcomes["f1"])
+
+    def test_promoted_groups_are_not_cloned_at_none(self):
+        forge, asked = self._broker("none")
+        with patch.object(audit_report, "forge", forge):
+            opened = audit_report._open_promoted_prs(
+                "acme/fleet",
+                "compliance-audit",
+                [{"id": "f1"}],
+                ["f1"],
+                {},
+                root=Path("/nonexistent"),
+                issue_number=None,
+                generated_at=datetime(2026, 11, 11, tzinfo=timezone.utc),
+            )
+        self.assertEqual([], opened)
+        self.assertEqual(["capabilities"], asked)
+
+    def test_propose_or_an_older_broker_refuses_nothing(self):
+        for mode in ("propose", None):
+            audit_report._CAPABILITIES.clear()
+            forge, _ = self._broker(mode)
+            with self.subTest(mode=mode), patch.object(audit_report, "forge", forge):
+                self.assertEqual("", audit_report.write_mode_refusal("acme/fleet"))
+
+    def test_an_unreadable_answer_refuses_nothing(self):
+        def forge(verb, repo, payload):
+            raise audit_report.ForgeError("broker down")
+
+        with patch.object(audit_report, "forge", forge):
+            self.assertEqual("", audit_report.write_mode_refusal("acme/fleet"))
 
 
 class TestWorkspaceGetsGitHubsBareSlug(unittest.TestCase):

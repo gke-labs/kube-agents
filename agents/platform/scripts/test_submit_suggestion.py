@@ -1007,6 +1007,18 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         self.assertIn("explain-only", str(caught.exception))
         self.assertEqual(["capabilities"], [verb for verb, _ in self.broker.calls])
 
+    def test_prepare_carries_the_brokers_reason_for_a_misspelt_write_mode(self):
+        # Review: a misspelt value read as none, and prepare hid why.
+        self.broker.capabilities = lambda payload: {
+            "forge": "local",
+            "writeMode": "none",
+            "writeModeDetail": "KUBEAGENTS_WRITE_MODE is set to a value that is neither none nor propose",
+        }
+        with self.assertRaises(vcs_client.VcsError) as caught:
+            self.run_subject("prepare", "--branch", "platform-agent/scale-web")
+        self.assertEqual("WRITE_MODE_NONE", caught.exception.code)
+        self.assertIn("neither none nor propose", caught.exception.detail)
+
     def test_prepare_goes_ahead_when_the_broker_does_not_report_a_write_mode(self):
         self.broker.capabilities = lambda payload: {"forge": "local"}
         self.assertEqual("platform-agent/scale-web", self.prepare()["branch"])

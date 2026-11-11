@@ -2430,6 +2430,22 @@ class CollaborationTest(unittest.TestCase):
                 with mock.patch.dict(os.environ, {vcs_broker.WRITE_MODE_ENV: ""}):
                     self.assertEqual("propose", broker.capabilities({"repository": repository})["writeMode"])
 
+    def test_capabilities_says_why_a_misspelt_write_mode_reads_none(self):
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        broker = vcs_broker.VcsBroker(
+            Path(scratch.name), git_runner=lambda *a, **k: None, refresh=lambda provider, repo: None
+        )
+        for repository in ("acme/infra", "https://git.example.invalid/a/b"):
+            with self.subTest(repository=repository):
+                with mock.patch.dict(os.environ, {vcs_broker.WRITE_MODE_ENV: "read-only"}):
+                    answer = broker.capabilities({"repository": repository})
+                self.assertEqual("none", answer["writeMode"])
+                self.assertIn("neither none nor propose", answer["writeModeDetail"])
+                for value in ("none", "propose", ""):
+                    with mock.patch.dict(os.environ, {vcs_broker.WRITE_MODE_ENV: value}):
+                        self.assertNotIn("writeModeDetail", broker.capabilities({"repository": repository}))
+
     def test_propose_verbs_are_writes_that_move_a_branch_or_touch_a_proposal(self):
         self.assertLess(vcs_broker.PROPOSE_VERBS, vcs_broker.WRITE_VERBS)
         self.assertEqual(

@@ -15341,7 +15341,8 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         # The install's write mode (`vcs_broker.write_mode`), here for the same
         # reason as the role check: ahead of anything that spends, and in the
         # one process that can push. At `none` a branch or proposal write is
-        # refused whoever asks; the refusal is worded for the agent to relay.
+        # refused whoever asks. The refusal states the fact and instructs
+        # nothing: what the agent says instead is the dial eval's to decide.
         if verb in vcs_broker.PROPOSE_VERBS:
             mode, raw = vcs_broker.write_mode()
             if mode == vcs_broker.WRITE_MODE_NONE:
@@ -15354,18 +15355,13 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                     "status": "blocked",
                     "error": (
                         "this install is explain-only (writeMode: none): kube-agents does not push "
-                        "branches or open, update or comment on pull requests here. Do not retry "
-                        "or find another way to make the change. Reply with what you would change "
-                        "and why, so a person can make it."
+                        "branches or open, update or comment on pull requests here."
                     ),
                     "code": "WRITE_MODE_NONE",
                     "rule": RULE_VCS_WRITE_MODE,
                 }
-                if raw.strip().lower() != vcs_broker.WRITE_MODE_NONE:
-                    refusal["detail"] = (
-                        f"{vcs_broker.WRITE_MODE_ENV} is set to a value that is neither "
-                        f"{' nor '.join(vcs_broker.WRITE_MODES)}, so the broker treats it as none"
-                    )
+                if detail := vcs_broker.write_mode_detail(raw):
+                    refusal["detail"] = detail
                 self._json(HTTPStatus.FORBIDDEN, refusal)
                 return TOOL_STATUS_BLOCKED
         if self.vcs is None:

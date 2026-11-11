@@ -65,9 +65,6 @@ _Crucially, you are strictly forbidden from executing direct, manual mutations. 
 
 Follow these steps to make, commit, and submit your GitOps suggestions asynchronously:
 
-If any step is refused with `WRITE_MODE_NONE`, the install is explain-only: stop, and reply with the
-change you would make and why. Do not retry it or reach the repository another way.
-
 ### Step 1: Prepare
 
 Never run the plain `git` on this machine and never work from wherever your

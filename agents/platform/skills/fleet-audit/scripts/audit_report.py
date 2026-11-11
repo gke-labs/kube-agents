@@ -22596,6 +22596,11 @@ def _open_promoted_prs(
     """
     if not promote:
         return []
+    # An explain-only install refuses every publish; asking first saves a clone
+    # and a commit per group that could never be delivered.
+    if refused := write_mode_refusal(repo):
+        log(f"no remediation pull request opened: {refused}")
+        return []
 
     promoted = set(promote)
     groups = [
@@ -22745,6 +22750,23 @@ def _unserved_host_refusal(repo: str, host: str) -> str:
     )
 
 
+def write_mode_refusal(repo: str) -> str:
+    """Why `repo` takes no remediation proposal on this install's write mode, or "".
+
+    An explain-only install (`writeMode: none` in the broker's `capabilities`)
+    refuses every branch push and pull request, and no retry changes that. An
+    answer that cannot be read, or a broker too old to report the field,
+    refuses nothing here; the broker still refuses the publish itself.
+    """
+    answer = capabilities_answer(repo)
+    if isinstance(answer, dict) and answer.get("writeMode") == "none":
+        return (
+            "this install is explain-only (writeMode: none): it does not push branches "
+            "or open pull requests, so a retry will not change this."
+        )
+    return ""
+
+
 def remediation_refusal(repo: str) -> str:
     """Why no remediation proposal can be published to `repo`, or "".
 
@@ -22874,6 +22896,11 @@ def handle_remediate(args: argparse.Namespace) -> None:
             "remediation; only a fix that is a file in this repository can become "
             "a pull request"
         )
+    # Asked only once the ids are known good, and never on a dry run, which
+    # sends nothing: an explain-only install refuses every publish, and a run
+    # that reached it would report REMEDIATED with nothing opened.
+    if not args.dry_run and (refused := write_mode_refusal(repo_hint)):
+        raise ValidationError(refused)
 
     now = datetime.now(timezone.utc)
     # As `finish` does before it renders: a relative age in the finding's
@@ -26693,7 +26720,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
                 pr_by_finding,
                 prs_opened,
                 noun,
-                remediation_refusal(repo),
+                remediation_refusal(repo) or write_mode_refusal(repo),
             ),
             ledger_comments,
             now,

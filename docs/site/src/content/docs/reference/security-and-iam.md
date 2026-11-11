@@ -418,18 +418,18 @@ The agent never has direct write access to running infrastructure — see [Decla
 Set `KUBEAGENTS_WRITE_MODE` to `none` to stop the agent proposing changes. Set it in the chart value
 `platformAgent.deployment.env` (on the Terraform install, through `extra_helm_values`); edit the
 PlatformAgent's `spec.deployment.env` directly only on an install without the chart, because a chart
-apply can replace that list. A change applies once the operator has rolled the broker and the agent
-pod, which both read the variable from that list.
+apply can replace that list. A change applies once the operator has rolled the broker, the one
+component that reads it; the gateway Pod rolls with it.
 
 At `none` the credential broker refuses every branch push and branch delete and every pull request
-write, including comments and reactions, with the code `WRITE_MODE_NONE`. The agent replies with
-the change it would make instead. Issues and reads are unaffected, so an audit still publishes its
+write, including comments and reactions, with the code `WRITE_MODE_NONE`, and the refusal tells the
+agent the install is explain-only. Issues and reads are unaffected, so an audit still publishes its
 report issue. Unset or `propose` is the default: the agent pushes branches and opens pull requests.
 Any other value is treated as `none`.
 
 ## Change control & safety
 
-- **No direct cluster writes.** Enforced by RBAC (above) and by the persona's automation-first stance — the agent does not `kubectl apply`; a change you asked for becomes a pull request, and a diagnostic request gets its fix in the reply rather than on your repository. An [explain-only](#explain-only-mode) install answers a change request in the reply too. See [Platform Agent](/kube-agents/concepts/platform-agent/) and [Declarative workflow](/kube-agents/concepts/declarative-workflow/).
+- **No direct cluster writes.** Enforced by RBAC (above) and by the persona's automation-first stance — the agent does not `kubectl apply`; a change you asked for becomes a pull request, and a diagnostic request gets its fix in the reply rather than on your repository. On an [explain-only](#explain-only-mode) install the broker refuses that pull request. See [Platform Agent](/kube-agents/concepts/platform-agent/) and [Declarative workflow](/kube-agents/concepts/declarative-workflow/).
 - **No merging its own work.** The agent may open pull requests, issues, and comments; the proxy refuses the verbs that would let it merge, approve, trigger a pipeline, or administer the repository. This is what keeps the review gate a gate rather than a convention. See [Credential isolation](/kube-agents/reference/credential-isolation/).
 - **The sandbox's native CLIs reach nothing.** `helm`, `yq` and OpenTofu's `tofu` run natively in the sandbox, outside the command and `kube-proxy` policies that govern `gcloud` and `kubectl`. They hold no credential, so `helm install` has no cluster to talk to and `tofu plan` or `apply` has no cloud identity. Where the sandbox's NetworkPolicy is enforced it allows only DNS, `<name>-kube-proxy`, and the credential broker out, so `tofu init` cannot download a provider plugin either. On a cluster without a NetworkPolicy implementation that policy is inert ([Credential isolation](/kube-agents/reference/credential-isolation/)), and the skills' own rules are what keep the agent to `tofu fmt`. The agent uses `tofu` only for its `fmt` subcommand (`tofu fmt -check -diff`, then `tofu fmt`), which needs neither.
 - **No credential in the sandbox but the broker's token.** API keys, chat tokens and the cloud identity live in the credential broker Pod; the sandbox's one ServiceAccount token is bound to the broker's audience, which only `<name>-kube-proxy` and the broker accept. The agent container has no `gcloud`, `kubectl`, `gh` or `git` at all. The sandbox Pod gets a broker wrapper for `gcloud`, routes stock `kubectl` through `<name>-kube-proxy`, reaches repositories through the broker's verbs, and keeps a credential-less local `git`.

@@ -504,9 +504,9 @@ def refuse_an_explain_only_install(repo: str) -> None:
     if answer.get("writeMode") == "none":
         raise vcs_client.VcsError(
             "this install is explain-only (writeMode: none): it does not push branches or "
-            "open pull requests. Do not retry or find another way to make the change. "
-            "Reply with what you would change and why, so a person can make it.",
+            "open pull requests.",
             code="WRITE_MODE_NONE",
+            detail=answer.get("writeModeDetail"),
         )
 
 
