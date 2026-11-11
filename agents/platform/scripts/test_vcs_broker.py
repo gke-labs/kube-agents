@@ -4382,15 +4382,14 @@ class DecisionMemoryBrokerPublishTest(unittest.TestCase):
         git(work, "commit", "--quiet", "-m", "lower mem and delete guard")
         bundle = self.bundle_of(work, "platform-agent/lower-mem", cloned["revision"])
 
-        with mock.patch.object(self.broker, "_resolve_curator_bin", return_value=None):
-            with self.assertRaises(WorkspaceError) as caught:
-                self.broker.publish({
-                    "repository": self.REPOSITORY,
-                    "branch": "platform-agent/lower-mem",
-                    "target": "main",
-                    "baseRevision": cloned["revision"],
-                    "bundleBase64": bundle,
-                })
+        with self.assertRaises(WorkspaceError) as caught:
+            self.broker.publish({
+                "repository": self.REPOSITORY,
+                "branch": "platform-agent/lower-mem",
+                "target": "main",
+                "baseRevision": cloned["revision"],
+                "bundleBase64": bundle,
+            })
         self.assertEqual(caught.exception.status, 409)
         self.assertEqual(caught.exception.fields.get("code"), "DECISION_MEMORY_BLOCKED")
         self.assertIn("LES-2026-001", str(caught.exception))
@@ -4403,16 +4402,55 @@ class DecisionMemoryBrokerPublishTest(unittest.TestCase):
         git(work, "commit", "--quiet", "-m", "move guarded file")
         bundle = self.bundle_of(work, "platform-agent/rename-evade", cloned["revision"])
 
-        with mock.patch.object(self.broker, "_resolve_curator_bin", return_value=None):
-            with self.assertRaises(WorkspaceError) as caught:
-                self.broker.publish({
-                    "repository": self.REPOSITORY,
-                    "branch": "platform-agent/rename-evade",
-                    "target": "main",
-                    "baseRevision": cloned["revision"],
-                    "bundleBase64": bundle,
-                })
+        with self.assertRaises(WorkspaceError) as caught:
+            self.broker.publish({
+                "repository": self.REPOSITORY,
+                "branch": "platform-agent/rename-evade",
+                "target": "main",
+                "baseRevision": cloned["revision"],
+                "bundleBase64": bundle,
+            })
         self.assertEqual(caught.exception.fields.get("code"), "DECISION_MEMORY_BLOCKED")
+
+    def test_publish_fetches_remote_default_branch_when_target_differs(self):
+        self._seed_guard_on_main()
+        # Push an auxiliary remote branch without the guard to verify publish() still
+        # fetches `main` (via _default_branch_of_remote) and blocks against `main`'s guard.
+        git(self.seed, "checkout", "--quiet", "-b", "release-branch")
+        (self.seed / "knowledge" / "lessons" / "LES-2026-001-checkout-mem.md").unlink()
+        git(self.seed, "add", "-A")
+        git(self.seed, "commit", "--quiet", "-m", "branch without guard")
+        git(self.seed, "push", "--quiet", "origin", "release-branch")
+        git(self.seed, "checkout", "--quiet", "main")
+
+        cloned = self.broker.clone({"repository": self.REPOSITORY, "branch": "release-branch"})
+        work_aux = Path(self.tmp.name) / "work-release"
+        bundle_path = Path(self.tmp.name) / "release.bundle"
+        bundle_path.write_bytes(base64.b64decode(cloned["bundleBase64"]))
+        git(self.tmp.name, "clone", "--quiet", "--branch", "release-branch", str(bundle_path), str(work_aux))
+
+        git(work_aux, "checkout", "--quiet", "-b", "platform-agent/target-evade")
+        (work_aux / "clusters" / "prod" / "checkout.yaml").write_text(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: checkout\nspec:\n"
+            "  template:\n    spec:\n      containers:\n      - name: checkout\n"
+            "        resources:\n          requests:\n            memory: 512Mi\n",
+            encoding="utf-8",
+        )
+        git(work_aux, "add", "-A")
+        git(work_aux, "commit", "--quiet", "-m", "lower mem against release-branch")
+        bundle = self.bundle_of(work_aux, "platform-agent/target-evade", cloned["revision"])
+
+        with self.assertRaises(WorkspaceError) as caught:
+            self.broker.publish({
+                "repository": self.REPOSITORY,
+                "branch": "platform-agent/target-evade",
+                "target": "release-branch",
+                "baseRevision": cloned["revision"],
+                "bundleBase64": bundle,
+            })
+        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual(caught.exception.fields.get("code"), "DECISION_MEMORY_BLOCKED")
+        self.assertIn("LES-2026-001", str(caught.exception))
 
     def test_publish_returns_decision_memory_markdown_on_consistent_change(self):
         self._seed_guard_on_main()
@@ -4430,14 +4468,13 @@ class DecisionMemoryBrokerPublishTest(unittest.TestCase):
         git(work, "commit", "--quiet", "-m", "raise mem to 4Gi")
         bundle = self.bundle_of(work, "platform-agent/raise-mem", cloned["revision"])
 
-        with mock.patch.object(self.broker, "_resolve_curator_bin", return_value=None):
-            ans = self.broker.publish({
-                "repository": self.REPOSITORY,
-                "branch": "platform-agent/raise-mem",
-                "target": "main",
-                "baseRevision": cloned["revision"],
-                "bundleBase64": bundle,
-            })
+        ans = self.broker.publish({
+            "repository": self.REPOSITORY,
+            "branch": "platform-agent/raise-mem",
+            "target": "main",
+            "baseRevision": cloned["revision"],
+            "bundleBase64": bundle,
+        })
         self.assertIn("LES-2026-001", ans.get("decisionMemoryMarkdown", ""))
 
 

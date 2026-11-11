@@ -145,8 +145,6 @@ DECISION_MEMORY_CHECK_FAILED = "DECISION_MEMORY_CHECK_FAILED"
 DECISION_MEMORY_HEADING = "### Prior decisions and lessons"
 DECISION_OVERRIDE_PREFIX = "decision-override:"
 FORBIDDEN_LABEL = "FORBIDDEN_LABEL"
-CURATOR_BIN_PATHS = ("/usr/local/bin/curator", "/opt/defaults/bin/curator")
-CURATOR_CHECK_TIMEOUT_SECONDS = 30
 DM_MAX_GUARD_FILE_BYTES = 4 << 20  # 4 MiB ceiling per inspected text/YAML file
 
 # What `git ls-remote --exit-code` exits with when the remote answered and holds
@@ -1769,28 +1767,19 @@ class VcsBroker:
             result["decisionMemoryMarkdown"] = dm_markdown
         return bound.stamp(result)
 
-    def _resolve_curator_bin(self) -> str | None:
-        env_bin = os.environ.get("CURATOR_BIN", "").strip()
-        if env_bin and os.path.isfile(env_bin) and os.access(env_bin, os.X_OK):
-            return env_bin
-        for p in CURATOR_BIN_PATHS:
-            if os.path.isfile(p) and os.access(p, os.X_OK):
-                return p
-        return None
-
     @staticmethod
     def _extract_revision_paths_to_dir(
         git: Callable,
         root: Path,
         rev: str,
         paths: list[str],
-        out_dir: Path,
+        out_dir: Path | None,
         scratch_dir: Path,
     ) -> dict[str, str]:
-        """Materialize `paths` at `rev` into `out_dir` via `git archive` without checkout.
+        """Extract `paths` at `rev` with `git archive` without repository checkout.
 
         Uses `git archive --output` instead of stdout capture so binary files and
-        non-UTF-8 bytes never pass through the text-mode git runner, and writes
+        non-UTF-8 bytes do not pass through the text-mode git runner. Writes
         `SNAPSHOT_ATTRIBUTES` to `.git/info/attributes` so repository `.gitattributes`
         rules (`export-ignore`, `export-subst`, `working-tree-encoding`) cannot hide
         or alter guarded manifests.
@@ -1829,15 +1818,19 @@ class VcsBroker:
                             rel = validate_path(member.name)
                         except WorkspaceError:
                             continue
-                        dest = out_dir / rel
-                        dest.parent.mkdir(parents=True, exist_ok=True)
                         if member.size > DM_MAX_GUARD_FILE_BYTES:
-                            dest.write_bytes(b"")
+                            if out_dir is not None:
+                                dest = out_dir / rel
+                                dest.parent.mkdir(parents=True, exist_ok=True)
+                                dest.write_bytes(b"")
                             extracted[rel] = ""
                             continue
                         fobj = tf.extractfile(member)
                         raw_bytes = fobj.read(DM_MAX_GUARD_FILE_BYTES) if fobj is not None else b""
-                        dest.write_bytes(raw_bytes)
+                        if out_dir is not None:
+                            dest = out_dir / rel
+                            dest.parent.mkdir(parents=True, exist_ok=True)
+                            dest.write_bytes(raw_bytes)
                         extracted[rel] = raw_bytes.decode("utf-8", errors="replace")
             finally:
                 tar_path.unlink(missing_ok=True)
@@ -1850,12 +1843,13 @@ class VcsBroker:
         policy_base_rev: str,
         tip: str,
     ) -> str:
-        """Run the out-of-sandbox OKF guard check against base-branch `knowledge/`.
+        """Run deterministic OKF `scope` and `guard.expect` checks against base `knowledge/`.
 
-        Reads `knowledge/` and `.kube-agents/intent.yaml` strictly from `policy_base_rev`
-        (the operator-pinned `baseBranch` or remote default branch on `origin`, never a
-        caller-supplied `target`) via `git ls-tree` and `git archive` without checking out
-        the repository, and accepts no sandbox-supplied override parameter.
+        Reads `knowledge/` and `.kube-agents/intent.yaml` from `policy_base_rev` (the
+        operator-pinned `baseBranch` or `_default_branch_of_remote` on `origin`, never a
+        caller-supplied `target`) via `git ls-tree` and `git archive` without checkout.
+        Runs `okf_guard.check_changed_files` in-process with zero LLM calls, zero
+        subprocesses, and zero sandbox-supplied override flags.
         """
         tree_ls = git(
             root, "--literal-pathspecs", "ls-tree", "-r", "--name-only", policy_base_rev, "--",
@@ -1883,9 +1877,7 @@ class VcsBroker:
         check_dir = self._scratch("dmcheck")
         try:
             k_root = check_dir / "base"
-            w_root = check_dir / "head"
             k_root.mkdir(parents=True, exist_ok=True)
-            w_root.mkdir(parents=True, exist_ok=True)
 
             self._extract_revision_paths_to_dir(
                 git, root, policy_base_rev, base_knowledge_files, k_root, check_dir,
@@ -1939,7 +1931,7 @@ class VcsBroker:
                     non_deleted.append(rel)
 
             extracted_head = self._extract_revision_paths_to_dir(
-                git, root, tip, non_deleted, w_root, check_dir,
+                git, root, tip, non_deleted, None, check_dir,
             )
             changed_map: dict[str, str | None] = {}
             for rel in rel_args:
@@ -1948,54 +1940,19 @@ class VcsBroker:
                 else:
                     changed_map[rel] = extracted_head.get(rel)
 
-            curator_bin = self._resolve_curator_bin()
-            if curator_bin:
-                cmd = [
-                    curator_bin,
-                    "check",
-                    "--repo",
-                    str(w_root),
-                    "--knowledge-repo",
-                    str(k_root),
-                    "--",
-                    *rel_args,
-                ]
-                res = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    timeout=CURATOR_CHECK_TIMEOUT_SECONDS,
-                )
-                if res.returncode not in (0, 2) or not (res.stdout or "").strip():
-                    detail = (res.stderr or res.stdout or f"exit code {res.returncode}").strip()
-                    raise WorkspaceError(
-                        f"Decision Memory Overseer check failed against base branch: {detail}",
-                        status=409,
-                        code=DECISION_MEMORY_CHECK_FAILED,
-                    )
-                try:
-                    out = json.loads(res.stdout)
-                except ValueError as exc:
-                    raise WorkspaceError(
-                        f"Decision Memory Overseer returned invalid JSON: {exc}",
-                        status=500,
-                        code=DECISION_MEMORY_CHECK_FAILED,
-                    ) from exc
-            else:
-                try:
-                    out = okf_guard.check_changed_files(k_root, changed_map)
-                except ValueError as exc:
-                    raise WorkspaceError(
-                        f"Decision Memory Overseer check failed against base branch: {exc}",
-                        status=409,
-                        code=DECISION_MEMORY_CHECK_FAILED,
-                    ) from exc
+            try:
+                out = okf_guard.check_changed_files(k_root, changed_map)
+            except ValueError as exc:
+                raise WorkspaceError(
+                    f"Decision Memory guard check failed against base branch: {exc}",
+                    status=409,
+                    code=DECISION_MEMORY_CHECK_FAILED,
+                ) from exc
 
             markdown = str(out.get("markdown") or "") if out.get("findings") else ""
             if out.get("verdict") == "block":
                 msg = (
-                    "DECISION MEMORY OVERSEER BLOCKED THIS CHANGE:\n\n"
+                    "DECISION MEMORY GUARD BLOCKED THIS CHANGE:\n\n"
                     f"{markdown}\n\n"
                     "Do NOT open this Pull Request. In your final response, quote the "
                     "record IDs (DEC-... / LES-...), Breaking PR (#...), Incident Issue (#...), "
