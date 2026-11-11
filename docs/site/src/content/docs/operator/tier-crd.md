@@ -1,6 +1,6 @@
 ---
 title: Tier CRD
-description: Custom resource naming what a task may do at a tier. Defined but not yet enforced.
+description: Custom resource naming what a task may do at a tier. Loaded by the components; profiles can't list one yet.
 sidebar:
   order: 7
 ---
@@ -24,7 +24,7 @@ spec:
   writeMode: propose # or none; not enforced yet
 ```
 
-- `mode` is whether people or triggers run at the tier. Once tiers are enforced, an `interactive` tier will run interactive profile tasks, and an `unattended` tier, a trigger's (the event watcher, a named cron), will only start profile tasks. What a tier may do will follow from its mode, so a tier can't name an action of its own.
+- `mode` is whether people or triggers run at the tier. Once profiles can list tiers, an `interactive` tier will run interactive profile tasks, and an `unattended` tier, a trigger's (the event watcher, a named cron), will only start profile tasks. What a tier may do will follow from its mode, so a tier can't name an action of its own.
 - `writeMode` is whether a task at the tier may propose a change it finds (`propose`, the default) or only explain it (`none`). It has no effect yet.
 
 A tier's name is a token in the task submission subject, so it must be a DNS-1123 label.
