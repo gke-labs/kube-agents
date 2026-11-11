@@ -24,7 +24,7 @@ _CHART = _REPO_ROOT / "charts" / "kube-agents"
 
 _BEGIN_MARKER = "# --- reasoning effort: begin"
 _END_MARKER = "# --- reasoning effort: end"
-_HELM_LINE = '--set-string "litellm.reasoningEffort=${EVAL_REASONING_EFFORT}"'
+_HELM_LINE = '--set-string "litellm.reasoningEffort=${EVAL_REASONING_EFFORT:-}"'
 _MODEL_HELM_LINE = '--set-string "litellm.modelDefaultName=${MODEL_DEFAULT_NAME}"'
 # The CI health digest quotes a FATAL line cut at this many characters.
 _FATAL_LINE_MAX_CHARS = 200
