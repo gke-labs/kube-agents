@@ -87,6 +87,9 @@ class ClassifyTest(unittest.TestCase):
                 "a2a/lib/chatmsg/testdata/x.json",
                 "a2a/cmd/web-console/static/app_test.go",
                 "a2a/web/package-lock.json",
+                "a2a/web/src/App.test.tsx",
+                "a2a/web/dev/seed.mjs",
+                "a2a/web/vite.config.ts",
                 "a2a/web/README.md",
                 "admin_console/ui.py",
                 "docs/site/src/content/docs/install.md",
@@ -140,6 +143,12 @@ class BodyTest(unittest.TestCase):
 
     def test_comment_marker_in_code_does_not_hide_a_real_image(self):
         self.assertTrue(ux.has_image(f"```\n<!--\n```\n\n{SHOT}\n"))
+
+    def test_an_unclosed_fence_does_not_hide_a_later_image(self):
+        self.assertTrue(ux.has_image(f"<!--\n```bash\n-->\n\n{SHOT}\n"))
+
+    def test_an_info_string_line_does_not_close_a_fence(self):
+        self.assertFalse(ux.has_image(f"```\n```python\n{SHOT}\n```\n"))
 
     def test_a_link_is_not_an_image(self):
         self.assertFalse(ux.has_image("[screenshot](https://example.com/a.png)"))

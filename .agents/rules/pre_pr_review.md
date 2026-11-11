@@ -130,7 +130,8 @@ in `AGENTS.md` under Pull Request Hygiene.
 
 A pull request that changes what a user sees shows it. That covers chat replies and cards in Slack
 and Google Chat, the docs site's rendering, the two browser UIs an install ships (the web
-console and the A2A console), and the installer's prompts.
+console and the A2A console), and the installer's prompts. The admin console is not in scope:
+it is a developer tool that runs on your own machine.
 
 - **At least one screenshot of the new UX goes under Testing → UX change**, and a before shot
   beside it when the change alters output that exists today. Show the moment the change touches —

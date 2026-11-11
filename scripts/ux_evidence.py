@@ -55,6 +55,8 @@ SURFACES = (
 TEST_PATHS = (
     "**/test_*.py",
     "**/*_test.go",
+    "**/*.test.*",
+    "**/*.spec.*",
     "**/tests/**",
     "**/testdata/**",
 )
@@ -65,6 +67,9 @@ NOT_RENDERED = (
     "**/*.md",
     "**/package.json",
     "**/package-lock.json",
+    "**/tsconfig*.json",
+    "**/vite.config.*",
+    "a2a/web/dev/**",
 )
 
 # Glob syntax glob_to_regex does not translate; a pattern using it is refused
@@ -75,10 +80,12 @@ FRONTMATTER_MARK = "---"
 PATHS_KEY = "paths:"
 LIST_ITEM_RE = re.compile(r"""^\s+-\s+["']?([^"'\s]+)["']?\s*$""")
 
-# A fenced block at any indent (list items indent theirs), closed by the same
-# run of markers or by the end of the body; then inline code; then comments.
-# Code first, so a `<!--` shown in a code block cannot swallow a real image.
-FENCE_RE = re.compile(r"^[ \t]*(`{3,}|~{3,}).*?(?:^[ \t]*\1[^\n]*$|\Z)", re.DOTALL | re.MULTILINE)
+# A fenced block at any indent (list items indent theirs), closed by a line of
+# at least the same markers and nothing else (a "```python" line opens, never
+# closes); then inline code; then comments. Code first, so a `<!--` shown in a
+# code block cannot swallow a real image. An unclosed fence is left in place
+# rather than run to the end, where it would hide every image after it.
+FENCE_RE = re.compile(r"^[ \t]*(`{3,}|~{3,})[^\n]*\n.*?^[ \t]*\1[`~]*[ \t]*$", re.DOTALL | re.MULTILINE)
 INLINE_CODE_RE = re.compile(r"`[^`\n]+`")
 COMMENT_RE = re.compile(r"<!--.*?(-->|\Z)", re.DOTALL)
 IMAGE_RES = (
