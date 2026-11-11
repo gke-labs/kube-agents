@@ -27,8 +27,9 @@ import (
 
 // AccountControl and AccountApp are the two NATS accounts the callout will
 // issue a user into: control-plane writers in TRUSTED and runtime workloads in
-// APP. Narrowed identities (session and profile workers) may only be minted
-// into AccountApp.
+// APP. Session and profile workers' narrowed identities are minted only into
+// AccountApp, and the dispatcher's (NarrowingDispatcher) only into
+// AccountControl.
 const (
 	AccountControl = "TRUSTED"
 	AccountApp     = "APP"
@@ -94,7 +95,10 @@ type Identity struct {
 	// NarrowingProfile. Such an entry MUST carry no
 	// grants, and the map is refused if it does — see session.go for why an
 	// entry that could hold real grants AND be narrowed is one skipped code
-	// path away from handing every session everything.
+	// path away from handing every session everything. NarrowingDispatcher
+	// is the exception: its grants are its control connection's and are
+	// required on both sides, and only its bucket connections' per-profile
+	// grants are derived (dispatcher_narrowing.go).
 	Narrowing string `json:"narrowing,omitempty"`
 
 	// Profile is the AgentProfile a NarrowingProfile entry executes for: the

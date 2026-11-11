@@ -301,16 +301,18 @@ every spawned session pod, the platform agent container, the capability verifier
 The dispatcher's grants name each profile durable it reads on `PROFILE_SUBMITS` and each
 profile it dispatches for; it reconnects when its config adds one, and tasks it holds keep
 running across the reconnect. Listing them all in its map entry grows the entry about
-1.1 KB per profile, and past about 1,000 profiles no single user JWT can carry them (#5381).
+1.1 KB per profile tier, and past about 1,000 profiles no single user JWT can carry them (#5381).
 With `A2A_DISPATCHER_BUCKETED_GRANTS=true` on the operator, the entry narrows on
 `dispatcher` instead. It carries only the fixed grants, which are its control connection's,
 and the draining profiles' names. A connection that sends the bucket `<b>/32` as its
-CONNECT password beside the token gets the per-profile grants of the profiles that hash to
-bucket b (fnv32a of the name, mod 32): the callout derives them from the map's profile
-entries with `lib.DispatcherGrants`, plus the bucket's own inbox. The password picks a
-slice of what the token already allows; it is not a credential. A bucket the callout
-doesn't accept is refused, never served the control grants. The switch is off by default,
-and stays off until the dispatcher opens its bucket connections (#5381's second PR). With a dispatcher the
+CONNECT password beside the token gets the per-profile grants, draining profiles' included,
+of the profiles that hash to bucket b (fnv32a of the name, mod 32): the callout derives them
+from the map's profile entries with `lib.DispatcherGrants`, plus the bucket's own inbox. The
+password picks a slice of what the token already allows; it is not a credential. A bucket the
+callout doesn't accept is refused, never served the control grants. The hash is unkeyed, so
+names chosen to collide fill one bucket, whose mint fails closed at roughly 450 two-tier
+profiles. The switch is off by default, and stays off until the dispatcher opens its bucket
+connections. With a dispatcher the
 operator principal also creates and deletes those durables, and it is the only principal
 with a consumer verb on that stream. **Statically**, from `nats.conf` and listed in `auth_users`:
 the callout itself, which cannot authenticate through the thing it is; the chatops
@@ -791,7 +793,8 @@ changed value changes the pod template, which rolls the callout. The same check 
 refuses a narrowed pod named after a user in the callout's own identity map (`provision`,
 `agent`, `verifier`, `session`, and any user the map gains), because the callout mints
 each entry that is not narrowed under its `user` and that entry's grants carry
-`_INBOX.<user>.>`; the narrowed entry's own user, `session`, is never minted and is
+`_INBOX.<user>.>` (the dispatcher's entry, though narrowed, is minted under its `user` too,
+and its bucket users `<user>-b0` to `<user>-b31` are reserved with the rest); the narrowed entry's own user, `session`, is never minted and is
 reserved with the rest because one check covers every map user. Those names
 come from the map being served, not from the variable: they are built when the map is
 parsed and installed with it, so a reload that adds or removes a user moves the reserved

@@ -172,7 +172,9 @@ type a2aAuthMapIdentity struct {
 	// Narrowing is omitted for the ordinary principals, so adding it changed
 	// no existing entry's bytes and therefore no existing version. Where it
 	// is set, the callout ignores Grants entirely and derives them from the
-	// claim it attested — and refuses the map if Grants is not empty.
+	// claim it attested — and refuses the map if Grants is not empty. The
+	// exception is "dispatcher" (#5381): its Grants are served as written to
+	// its control connection, and its per-profile grants are derived.
 	Narrowing string `json:"narrowing,omitempty"`
 
 	// Profile and Topics are set only on an AgentProfile's entry, which
@@ -440,7 +442,9 @@ func encodeA2AJSONPrefixed(v any, prefix, indent string) ([]byte, error) {
 //
 //   - An empty map would refuse every connection on a callout that reports
 //     itself perfectly healthy.
-//   - A narrowed entry MUST carry no grants. If it could carry both, one map
+//   - A narrowed entry MUST carry no grants, except a `dispatcher` entry,
+//     whose grants are its control connection's and must be non-empty on
+//     both sides (#5381). If any other could carry both, one map
 //     edit -- or one code path that forgot to narrow -- would hand every
 //     session pod whatever was written there, which is the shared `worker`
 //     credential reborn. This is the rule most likely to be tripped by an
@@ -455,7 +459,8 @@ func encodeA2AJSONPrefixed(v any, prefix, indent string) ([]byte, error) {
 //     normally in every other respect.
 //   - The account becomes the audience of the user JWT the callout signs, so
 //     it decides which account a connection lands in. Only APP and TRUSTED
-//     are mintable, a narrowed entry only into APP; SYS above all is not.
+//     are mintable, a narrowed entry only into APP (a `dispatcher` entry
+//     only into TRUSTED); SYS above all is not.
 //   - Duplicate ServiceAccounts make the grant set a function of map order,
 //     and duplicate users re-create the shared-credential problem and collide
 //     on each other's inbox prefix.

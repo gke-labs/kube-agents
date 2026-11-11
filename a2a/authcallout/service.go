@@ -535,8 +535,9 @@ func (s *Service) authorize(ctx context.Context, req *jwt.AuthorizationRequestCl
 	// A profile worker's task connection presents a second credential, the
 	// task credential, and it rides the password beside a token. So: a token
 	// is the ServiceAccount token and the password, if any, the task
-	// credential; with no token, the password is the ServiceAccount token
-	// and there is no task credential.
+	// credential (or, on the dispatcher's entry, a bucket selector "<b>/32",
+	// which is not a credential); with no token, the password is the
+	// ServiceAccount token and there is no task credential.
 	//
 	// Why the password and not CONNECT's jwt field, which nats-server
 	// v2.15.1 also forwards to the callout in this (non-operator) mode:
@@ -581,11 +582,12 @@ func (s *Service) authorize(ctx context.Context, req *jwt.AuthorizationRequestCl
 		return decision{}, fmt.Errorf("%s is not in the identity map (version %s)", att.ServiceAccount, m.Version)
 	}
 
-	// A task credential means something only on a profile worker's entry.
-	// Anywhere else it is refused, not ignored: a client presenting one
-	// believes it is getting a task's scope.
+	// A password beside a token means something only on a profile worker's
+	// entry (a task credential) or the dispatcher's (a bucket). Anywhere else
+	// it is refused, not ignored: a client presenting one believes it is
+	// getting a narrower scope.
 	if taskToken != "" && id.Narrowing != NarrowingProfile && id.Narrowing != NarrowingDispatcher {
-		return decision{}, fmt.Errorf("%s presented a task credential, but its entry is not a profile worker's", att.ServiceAccount)
+		return decision{}, fmt.Errorf("%s presented a task credential, but its entry is neither a profile worker's nor the dispatcher's", att.ServiceAccount)
 	}
 
 	grants, user := id.Grants, id.User
