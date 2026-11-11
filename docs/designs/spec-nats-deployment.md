@@ -300,7 +300,17 @@ every spawned session pod, the platform agent container, the capability verifier
 (`A2A_DISPATCHER_IMAGE`; off by default until profiles dispatch end to end).
 The dispatcher's grants name each profile durable it reads on `PROFILE_SUBMITS` and each
 profile it dispatches for; it reconnects when its config adds one, and tasks it holds keep
-running across the reconnect. With a dispatcher the
+running across the reconnect. Listing them all in its map entry grows the entry about
+1.1 KB per profile, and past about 1,000 profiles no single user JWT can carry them (#5381).
+With `A2A_DISPATCHER_BUCKETED_GRANTS=true` on the operator, the entry narrows on
+`dispatcher` instead. It carries only the fixed grants, which are its control connection's,
+and the draining profiles' names. A connection that sends the bucket `<b>/32` as its
+CONNECT password beside the token gets the per-profile grants of the profiles that hash to
+bucket b (fnv32a of the name, mod 32): the callout derives them from the map's profile
+entries with `lib.DispatcherGrants`, plus the bucket's own inbox. The password picks a
+slice of what the token already allows; it is not a credential. A bucket the callout
+doesn't accept is refused, never served the control grants. The switch is off by default,
+and stays off until the dispatcher opens its bucket connections (#5381's second PR). With a dispatcher the
 operator principal also creates and deletes those durables, and it is the only principal
 with a consumer verb on that stream. **Statically**, from `nats.conf` and listed in `auth_users`:
 the callout itself, which cannot authenticate through the thing it is; the chatops

@@ -186,6 +186,12 @@ type a2aAuthMapIdentity struct {
 	// Tier is the tier a profile entry's pods run at (#3655): one entry, and
 	// one ServiceAccount, per tier the profile allows. Omitted elsewhere.
 	Tier string `json:"tier,omitempty"`
+
+	// Draining is set only on the dispatcher's entry when it narrows on
+	// "dispatcher" (#5381): the profiles it still drains, by name, which have
+	// no profile entry for the callout to derive their grants from. Omitted
+	// elsewhere.
+	Draining []string `json:"draining,omitempty"`
 }
 
 // a2aAuthMapTopics mirrors the callout's TopicGrants.
@@ -251,14 +257,7 @@ func renderA2AAuthMapDraining(agent *agentv1alpha1.PlatformAgent, profiles []age
 	// name each durable the operator creates, so it is built here, from the
 	// same profiles (platformagent_a2a_dispatcher.go).
 	if a2aDispatcherEnabled() {
-		names, durables := dispatcherGrantNames(agent, profiles, draining)
-		id := dispatcherIdentity(agent, agent.Namespace, names, durables)
-		identities = append(identities, a2aAuthMapIdentity{
-			ServiceAccount: id.serviceAccount,
-			User:           id.user,
-			Account:        id.account,
-			Grants:         a2aAuthMapGrants{Publish: id.publish, Subscribe: id.subscribe},
-		})
+		identities = append(identities, dispatcherMapEntry(agent, profiles, draining))
 	}
 
 	// Refuse here what the callout would refuse there.
@@ -481,8 +480,15 @@ func validateA2AAuthMapIdentities(identities []a2aAuthMapIdentity) error {
 		if id.Account != a2aAccountApp && id.Account != a2aAccountControl {
 			return fmt.Errorf("identity %d: user %q names account %q, which the callout will not mint into (allowed: [%s %s])", i, id.User, id.Account, a2aAccountControl, a2aAccountApp)
 		}
-		if id.Narrowing != "" && id.Account != a2aAccountApp {
+		if id.Narrowing == a2aNarrowingDispatcher {
+			if id.Account != a2aAccountControl {
+				return fmt.Errorf("identity %d: user %q narrows on %q and must land in account %q, not %q", i, id.User, id.Narrowing, a2aAccountControl, id.Account)
+			}
+		} else if id.Narrowing != "" && id.Account != a2aAccountApp {
 			return fmt.Errorf("identity %d: user %q narrows on %q and must land in account %q, not %q", i, id.User, id.Narrowing, a2aAccountApp, id.Account)
+		}
+		if id.Narrowing != a2aNarrowingDispatcher && len(id.Draining) > 0 {
+			return fmt.Errorf("identity %d: user %q lists draining profiles but narrows on %q; only %q reads them", i, id.User, id.Narrowing, a2aNarrowingDispatcher)
 		}
 		hasGrants := len(id.Grants.Publish) > 0 || len(id.Grants.Subscribe) > 0
 		if id.Narrowing != a2aNarrowingProfile && (id.Profile != "" || id.Topics != nil) {
@@ -527,6 +533,21 @@ func validateA2AAuthMapIdentities(identities []a2aAuthMapIdentity) error {
 					}
 				}
 			}
+		case a2aNarrowingDispatcher:
+			// The entry's grants are its control connection's, served as
+			// written, so both sides must be non-empty (the "" case's rule).
+			// Its per-profile grants are the callout's to derive.
+			if len(id.Grants.Publish) == 0 || len(id.Grants.Subscribe) == 0 {
+				return fmt.Errorf("identity %d: user %q has %d publish and %d subscribe grants; an empty side is minted as unrestricted on that side, not as closed",
+					i, id.User, len(id.Grants.Publish), len(id.Grants.Subscribe))
+			}
+			seenDraining := map[string]bool{}
+			for _, p := range id.Draining {
+				if !isDNS1123LabelToken(p) || seenDraining[p] {
+					return fmt.Errorf("identity %d: user %q lists draining profile %q, which is not a dot-free DNS-1123 label or is listed twice", i, id.User, p)
+				}
+				seenDraining[p] = true
+			}
 		default:
 			return fmt.Errorf("identity %d: user %q names narrowing %q, which the callout does not implement", i, id.User, id.Narrowing)
 		}
@@ -538,6 +559,28 @@ func validateA2AAuthMapIdentities(identities []a2aAuthMapIdentity) error {
 		}
 		seenSA[id.ServiceAccount] = true
 		seenUser[id.User] = true
+	}
+	// The callout's set rules for the dispatcher's entry: one per map, and
+	// its bucket users (<user>-b<n>) are names no entry or profile may hold.
+	dispatchers := 0
+	for i, id := range identities {
+		if id.Narrowing != a2aNarrowingDispatcher {
+			continue
+		}
+		if dispatchers++; dispatchers > 1 {
+			return fmt.Errorf("identity %d: a second entry narrows on %q", i, a2aNarrowingDispatcher)
+		}
+		for b := 0; b < a2aDispatcherBuckets; b++ {
+			u := fmt.Sprintf("%s-b%d", id.User, b)
+			if !isDNS1123LabelToken(u) {
+				return fmt.Errorf("identity %d: user %q is too long for its bucket user %q", i, id.User, u)
+			}
+			for j, other := range identities {
+				if other.User == u || (other.Narrowing == a2aNarrowingProfile && other.Profile == u) {
+					return fmt.Errorf("identity %d: %q is dispatcher %q's bucket user", j, u, id.User)
+				}
+			}
+		}
 	}
 	return nil
 }

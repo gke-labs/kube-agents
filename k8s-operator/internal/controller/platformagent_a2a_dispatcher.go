@@ -63,6 +63,22 @@ const (
 	// prefix and its verifier caller name. The binary spells the same string.
 	a2aDispatcherUser = "dispatcher"
 
+	// a2aDispatcherBucketedGrantsEnvVar turns on the dispatcher's bucketed
+	// grants (#5381). With it on, the dispatcher's map entry carries only its
+	// control connection's fixed grants and the draining profiles' names, and
+	// the callout derives each bucket connection's per-profile grants from
+	// the profile entries. Off by default. Turning it on needs a dispatcher
+	// that opens its bucket connections (#5381's second PR): an older one
+	// loses every profile grant.
+	a2aDispatcherBucketedGrantsEnvVar = "A2A_DISPATCHER_BUCKETED_GRANTS"
+
+	// a2aNarrowingDispatcher is the callout's NarrowingDispatcher, and
+	// a2aDispatcherBuckets is lib.DispatcherBuckets. This module can't import
+	// either; the callout suite parses the rendered map, and the bucket count
+	// is spelled again only to reserve the bucket users here.
+	a2aNarrowingDispatcher = "dispatcher"
+	a2aDispatcherBuckets   = 32
+
 	a2aDispatcherContainerName = "dispatcher"
 	a2aDispatcherStatusPort    = 8080
 
@@ -98,6 +114,48 @@ func a2aDispatcherReleaseImage() string {
 // only when A2A_DISPATCHER_IMAGE is set, so an empty image never renders a
 // Deployment with nothing to pull.
 func a2aDispatcherEnabled() bool { return a2aDispatcherImage() != "" }
+
+// a2aDispatcherBucketedGrants reports whether the dispatcher's entry narrows
+// on "dispatcher" (A2A_DISPATCHER_BUCKETED_GRANTS=true). Only the exact
+// string turns it on.
+func a2aDispatcherBucketedGrants() bool {
+	return strings.TrimSpace(os.Getenv(a2aDispatcherBucketedGrantsEnvVar)) == "true"
+}
+
+// dispatcherMapEntry is the dispatcher's identity-map entry. With bucketed
+// grants off, it lists every grant: the fixed set, plus every admitted and
+// draining profile's subjects (dispatcherIdentity). With them on (#5381), it
+// narrows on "dispatcher". Its grants are then the fixed set alone, for the
+// control connection, plus the draining profiles' names. The callout derives
+// every per-profile subject from the profile entries (lib.DispatcherGrants),
+// so the entry's size no longer grows with the profile count.
+func dispatcherMapEntry(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, draining []a2aDispatchProfile) a2aAuthMapIdentity {
+	if !a2aDispatcherBucketedGrants() {
+		names, durables := dispatcherGrantNames(agent, profiles, draining)
+		id := dispatcherIdentity(agent, agent.Namespace, names, durables)
+		return a2aAuthMapIdentity{
+			ServiceAccount: id.serviceAccount,
+			User:           id.user,
+			Account:        id.account,
+			Grants:         a2aAuthMapGrants{Publish: id.publish, Subscribe: id.subscribe},
+		}
+	}
+	id := dispatcherIdentity(agent, agent.Namespace, nil, nil)
+	var drainingNames []string
+	for _, d := range draining {
+		if !slices.Contains(drainingNames, d.Name) {
+			drainingNames = append(drainingNames, d.Name)
+		}
+	}
+	return a2aAuthMapIdentity{
+		ServiceAccount: id.serviceAccount,
+		User:           id.user,
+		Account:        id.account,
+		Grants:         a2aAuthMapGrants{Publish: id.publish, Subscribe: id.subscribe},
+		Narrowing:      a2aNarrowingDispatcher,
+		Draining:       drainingNames,
+	}
+}
 
 func a2aDispatcherName(agent *agentv1alpha1.PlatformAgent) string {
 	return agent.Name + "-a2a-dispatcher"

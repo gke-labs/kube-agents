@@ -12,6 +12,7 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nkeys"
 
+	lib "github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/taskcred"
 )
 
@@ -583,14 +584,27 @@ func (s *Service) authorize(ctx context.Context, req *jwt.AuthorizationRequestCl
 	// A task credential means something only on a profile worker's entry.
 	// Anywhere else it is refused, not ignored: a client presenting one
 	// believes it is getting a task's scope.
-	if taskToken != "" && id.Narrowing != NarrowingProfile {
+	if taskToken != "" && id.Narrowing != NarrowingProfile && id.Narrowing != NarrowingDispatcher {
 		return decision{}, fmt.Errorf("%s presented a task credential, but its entry is not a profile worker's", att.ServiceAccount)
 	}
 
 	grants, user := id.Grants, id.User
 	var task string
 	var notAfter time.Time
-	if id.Narrowing != "" {
+	if id.Narrowing == NarrowingDispatcher {
+		// The dispatcher's users are the map's own (its entry's user, or
+		// that user's bucket users, which the map reserves), not a pod
+		// name, so the narrowed-pod reserved check below does not apply.
+		if taskToken != "" {
+			bucket, err := lib.ParseDispatcherBucketCredential(taskToken)
+			if err != nil {
+				// Refused, never served the control connection's grants:
+				// the client asked for a bucket and gets it or nothing.
+				return decision{}, fmt.Errorf("%s presented a dispatcher bucket that was refused: %w", att.ServiceAccount, err)
+			}
+			grants, user = dispatcherBucketGrants(m, id, bucket), dispatcherBucketUser(id.User, bucket)
+		}
+	} else if id.Narrowing != "" {
 		// A narrowed entry holds no grants; they are built here from what
 		// the cluster attested about this connection specifically. The
 		// default arm cannot be reached through a parsed map — validate

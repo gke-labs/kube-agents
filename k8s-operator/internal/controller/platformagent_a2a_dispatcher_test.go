@@ -685,3 +685,64 @@ func TestARepairedSigningKeyRollsTheDispatcher(t *testing.T) {
 		t.Errorf("the signing key was repaired and the dispatcher's pod template didn't change (%s)", after)
 	}
 }
+
+// dispatcherGrantsGoldenPath is the per-profile half of the dispatcher's
+// grants at a small N, as the operator spells it with the bucketed-grants
+// flag off. lib.DispatcherGrants checks the same file
+// (a2a/lib/dispatchgrants_test.go): lib is the one spelling with the flag on
+// (#5381), and this module can't import it, so the file is what holds the
+// two spellings equal until the flag-off render is deleted.
+const dispatcherGrantsGoldenPath = "../../../a2a/lib/testdata/dispatcher-grants-golden.json"
+
+type dispatcherGrantsGoldenProfile struct {
+	Name     string   `json:"name"`
+	Tiers    []string `json:"tiers,omitempty"`
+	Draining bool     `json:"draining,omitempty"`
+}
+
+type dispatcherGrantsGolden struct {
+	Profiles  []dispatcherGrantsGoldenProfile `json:"profiles"`
+	Publish   []string                        `json:"publish"`
+	Subscribe []string                        `json:"subscribe"`
+}
+
+func TestDispatcherGrantsGoldenFixture(t *testing.T) {
+	agent := a2aTestAgent()
+	golden := dispatcherGrantsGolden{Profiles: []dispatcherGrantsGoldenProfile{
+		{Name: "alpha", Tiers: []string{agentv1alpha1.AgentProfileTierRead, agentv1alpha1.AgentProfileTierUnattended}},
+		{Name: "beta", Tiers: []string{agentv1alpha1.AgentProfileTierRead}},
+		{Name: "gone", Draining: true},
+	}}
+	var names, durables []string
+	for _, p := range golden.Profiles {
+		names = append(names, p.Name)
+		for _, tier := range p.Tiers {
+			for _, kind := range a2aSubmitKinds {
+				durables = append(durables, profileDurableName(p.Name, tier, kind))
+			}
+		}
+	}
+	fixed := dispatcherIdentity(agent, agent.Namespace, nil, nil)
+	full := dispatcherIdentity(agent, agent.Namespace, names, durables)
+	golden.Publish = without(full.publish, fixed.publish)
+	golden.Subscribe = without(full.subscribe, fixed.subscribe)
+	var buf strings.Builder
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(golden); err != nil {
+		t.Fatal(err)
+	}
+	checkFixture(t, dispatcherGrantsGoldenPath, buf.String())
+}
+
+// without is s with every element of drop removed, in s's order.
+func without(s, drop []string) []string {
+	out := []string{}
+	for _, x := range s {
+		if !slices.Contains(drop, x) {
+			out = append(out, x)
+		}
+	}
+	return out
+}
