@@ -151,14 +151,14 @@ func run() int {
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	slog.SetDefault(log)
 
-	// `worker-adapter mcp` is not a task run: it is the stdio MCP server the
-	// harness launches as a subprocess of itself, forwarding the session's
-	// one delegate tool call to this adapter process over a unix socket
-	// (worker-adapter/mcp.go). It has none of the task env below, so it is
-	// dispatched before configFromEnv rather than folded into it.
-	// `worker-adapter mcp-relay <url>` is the stdio MCP server a profile
-	// persona's broker servers are rendered as (worker-adapter/mcprelay.go):
-	// it carries messages to the broker's relay with the pod's credentials.
+	// The two subcommands are not task runs: each is a stdio MCP server the
+	// harness launches as a subprocess of itself, with none of the task env
+	// below, so they are dispatched before configFromEnv rather than folded
+	// into it.
+	//
+	// `worker-adapter mcp-relay <url>` is what a profile persona's broker
+	// servers are rendered as (worker-adapter/mcprelay.go): it carries
+	// messages to the broker's relay with the pod's credentials.
 	if len(os.Args) > 1 && os.Args[1] == workeradapter.MCPRelayCommand {
 		if len(os.Args) != 3 {
 			fmt.Fprintln(os.Stderr, "usage: worker-adapter mcp-relay <broker relay URL>")
@@ -170,6 +170,8 @@ func run() int {
 		}
 		return 0
 	}
+	// `worker-adapter mcp` forwards the session's one delegate tool call to
+	// this adapter process over a unix socket (worker-adapter/mcp.go).
 	if len(os.Args) > 1 && os.Args[1] == "mcp" {
 		if err := serveMCP(context.Background(), os.Stdin, os.Stdout, log); err != nil && !errors.Is(err, io.EOF) {
 			fmt.Fprintln(os.Stderr, "mcp:", err)

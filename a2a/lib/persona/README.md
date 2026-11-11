@@ -96,7 +96,7 @@ Run these from `a2a/`:
 ```sh
 go run ./cmd/persona validate --in <dir>
 go run ./cmd/persona render --harness claude-code --in <dir> --out /tmp/out \
-  --relay-url http://credential-proxy:8765/mcp \
+  --relay-url http://credential-proxy:8765/v1/mcp \
   --relay-command 'node /opt/mcp-remote/dist/proxy.js {url} --transport http-only'
 ```
 
@@ -109,8 +109,11 @@ one alone is a usage error.
 A dispatched profile worker renders with its own relay, not `mcp-remote`:
 each broker server becomes `worker-adapter mcp-relay <broker>/v1/mcp/<server>`
 (`a2a/worker-adapter/mcprelay.go`). It sends each message to the credential
-broker with the pod's ServiceAccount token and the task's credential, read
-from their files per request, and refuses any URL outside the broker's own
-`/v1/mcp/` route, so a model that edits its MCP config can't send those
-credentials elsewhere. The broker's `mcp_policy` still decides what a profile
+broker with the pod's projected ServiceAccount token and, when the task has
+one, its task credential, both read from their files on every request. It
+refuses any URL outside the broker's own `/v1/mcp/` route and follows no
+redirect. That is defence in depth: what keeps the credentials in the pod is
+the profile namespace's NetworkPolicy, which lets a worker reach only DNS, the
+bus, LiteLLM and the broker, since a model with a shell can read the token
+files itself. The broker's `mcp_policy` still decides what a profile
 worker may call.

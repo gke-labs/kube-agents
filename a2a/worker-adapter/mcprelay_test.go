@@ -10,9 +10,12 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/gke-labs/kube-agents/a2a/lib/persona"
 )
 
 // A relay URL that isn't under the broker's own /v1/mcp/ route is refused
@@ -268,5 +271,118 @@ func TestAProfileWorkerRendersItsServersThroughTheBridge(t *testing.T) {
 	}
 	if got := ProfileRelay("/usr/local/bin/worker-adapter", func(string) string { return "" }); got.URL != "" || got.Command != "" {
 		t.Errorf("a relay was built with no broker: %+v", got)
+	}
+}
+
+// The fix itself (#5495): the cluster persona, rendered the way a profile
+// worker renders it, reaches developer_knowledge through the bridge, and its
+// tools are granted. Rendered with no relay, the server is dropped.
+func TestTheClusterPersonaRendersItsServerThroughTheBridge(t *testing.T) {
+	env := map[string]string{
+		EnvCredentialProxyURL:       "http://credential-proxy.ns.svc:8765",
+		EnvCredentialProxyTokenFile: "/var/run/broker/token",
+		EnvCredentialProxyTaskToken: "/run/task/token",
+	}
+	pw := ProfileWorkerConfig{
+		PersonaDir: "../../agents/cluster/persona",
+		Harness:    persona.ClaudeCode,
+		Relay:      ProfileRelay("/usr/local/bin/worker-adapter", func(k string) string { return env[k] }),
+	}
+	out, err := renderPersona(pw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg struct {
+		MCPServers map[string]struct {
+			Command string            `json:"command"`
+			Args    []string          `json:"args"`
+			Env     map[string]string `json:"env"`
+		} `json:"mcpServers"`
+	}
+	i := slices.Index(out.Args, "--mcp-config")
+	if i < 0 || i+1 >= len(out.Args) {
+		t.Fatalf("no --mcp-config in %v", out.Args)
+	}
+	if err := json.Unmarshal([]byte(out.Args[i+1]), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	dk, ok := cfg.MCPServers["developer_knowledge"]
+	if !ok {
+		t.Fatalf("developer_knowledge isn't rendered: %v (warnings %v)", cfg.MCPServers, out.Warnings)
+	}
+	if dk.Command != "/usr/local/bin/worker-adapter" ||
+		strings.Join(dk.Args, " ") != "mcp-relay http://credential-proxy.ns.svc:8765/v1/mcp/developer_knowledge" {
+		t.Errorf("developer_knowledge = %+v", dk)
+	}
+	if dk.Env[EnvCredentialProxyTokenFile] != "/var/run/broker/token" || dk.Env[EnvCredentialProxyTaskToken] != "/run/task/token" {
+		t.Errorf("developer_knowledge env = %v", dk.Env)
+	}
+	if !slices.Contains(out.Allowed, "mcp__developer_knowledge__search_documents") {
+		t.Errorf("search_documents isn't granted: %v", out.Allowed)
+	}
+	for _, w := range out.Warnings {
+		if strings.Contains(w, "developer_knowledge") {
+			t.Errorf("render warned about developer_knowledge: %s", w)
+		}
+	}
+
+	pw.Relay = persona.Relay{}
+	bare, err := renderPersona(pw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.ContainsFunc(bare.Warnings, func(w string) bool { return strings.Contains(w, "gave no broker MCP relay") }) {
+		t.Errorf("with no relay the render dropped nothing: %v", bare.Warnings)
+	}
+}
+
+// A message over the size limit is skipped and the bridge keeps serving; a
+// request the broker answers with an empty body gets an error, not silence;
+// and a broker refusal carries its reason.
+func TestTheRelaySurvivesBadFramingAndSaysWhyItFailed(t *testing.T) {
+	b := newRelayBroker(t)
+	b.reply = func(w http.ResponseWriter, body []byte) {
+		switch {
+		case bytes.Contains(body, []byte(`"empty"`)):
+			w.WriteHeader(http.StatusOK)
+		case bytes.Contains(body, []byte(`"refused"`)):
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = io.WriteString(w, `{"rule":"gcp.mcp.profile-server","message":"a profile worker may not reach gke"}`)
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"jsonrpc":"2.0","id":9,"result":{}}`)
+		}
+	}
+	relayEnv(t, b.URL, "a.b.c")
+	huge := `{"jsonrpc":"2.0","id":1,"method":"x","params":"` + strings.Repeat("a", maxRelayMessageBytes) + `"}`
+	out, err := runRelay(t, b.URL+"/v1/mcp/developer_knowledge",
+		huge+"\n"+
+			`{"jsonrpc":"2.0","id":2,"method":"empty"}`+"\n"+
+			`{"jsonrpc":"2.0","id":3,"method":"refused"}`+"\n"+
+			`{"jsonrpc":"2.0","id":9,"method":"ping"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("got %d replies, want 3 (the oversized one skipped): %q", len(lines), out)
+	}
+	assertRelayError(t, lines[0], 2, "no reply")
+	assertRelayError(t, lines[1], 3, "gcp.mcp.profile-server")
+	if lines[2] != `{"jsonrpc":"2.0","id":9,"result":{}}` {
+		t.Errorf("the bridge stopped serving after the oversized message: %q", lines[2])
+	}
+	if len(b.bodies) != 3 {
+		t.Errorf("the oversized message reached the broker: %d requests", len(b.bodies))
+	}
+}
+
+// No proxy from the environment sits between the pod and the broker; Go's
+// default transport would use HTTPS_PROXY and see both credentials.
+func TestTheRelayClientUsesNoProxy(t *testing.T) {
+	tr, ok := newRelayClient().Transport.(*http.Transport)
+	if !ok || tr.Proxy != nil {
+		t.Fatalf("relay transport = %#v, want one with no proxy", newRelayClient().Transport)
 	}
 }

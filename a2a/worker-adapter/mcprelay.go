@@ -124,20 +124,24 @@ func ServeMCPRelay(ctx context.Context, target string, in io.Reader, out io.Writ
 	if err != nil {
 		return err
 	}
-	client := &http.Client{
-		Timeout: mcpRelayTimeout,
-		// An in-cluster Service: a proxy from the environment would sit
-		// between the pod and the broker and see both credentials.
-		Transport: &http.Transport{Proxy: nil},
-		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return errRelayRedirect
-		},
-	}
-	scanner := bufio.NewScanner(in)
-	scanner.Buffer(make([]byte, 64<<10), maxRelayMessageBytes)
+	client := newRelayClient()
+	r := bufio.NewReaderSize(in, 64<<10)
 	w := bufio.NewWriter(out)
-	for scanner.Scan() {
-		line := bytes.TrimSpace(scanner.Bytes())
+	for {
+		line, err := readRelayLine(r)
+		if errors.Is(err, errRelayLineTooLong) {
+			// No id can be read from a message this size, so it gets no
+			// reply; the bridge stays up for the rest of the task.
+			log.Warn("mcp-relay: dropped a message over the size limit", "limit", maxRelayMessageBytes)
+			continue
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+		line = bytes.TrimSpace(line)
 		if len(line) == 0 {
 			continue
 		}
@@ -145,10 +149,15 @@ func ServeMCPRelay(ctx context.Context, target string, in io.Reader, out io.Writ
 			ID json.RawMessage `json:"id"`
 		}
 		if err := json.Unmarshal(line, &probe); err != nil {
+			// A batch array lands here too: MCP has no batching since
+			// 2025-06-18, and no harness this runs under sends one.
 			log.Warn("mcp-relay: dropped a message that isn't one JSON object", "err", err)
 			continue
 		}
 		replies, err := relayOne(ctx, client, u, line)
+		if err == nil && len(replies) == 0 && len(probe.ID) > 0 && string(probe.ID) != "null" {
+			err = errors.New("the broker sent no reply to a request")
+		}
 		if err != nil {
 			log.Warn("mcp-relay: request failed", "server", path.Base(u.Path), "err", err)
 			if len(probe.ID) > 0 && string(probe.ID) != "null" {
@@ -164,7 +173,49 @@ func ServeMCPRelay(ctx context.Context, target string, in io.Reader, out io.Writ
 			return err
 		}
 	}
-	return scanner.Err()
+}
+
+var errRelayLineTooLong = errors.New("message over the size limit")
+
+// readRelayLine reads one newline-terminated message, discarding the rest of
+// one over maxRelayMessageBytes and saying so. The last line needs no
+// newline.
+func readRelayLine(r *bufio.Reader) ([]byte, error) {
+	var line []byte
+	for {
+		chunk, err := r.ReadSlice('\n')
+		if len(line)+len(chunk) > maxRelayMessageBytes {
+			for errors.Is(err, bufio.ErrBufferFull) {
+				_, err = r.ReadSlice('\n')
+			}
+			if err != nil && !errors.Is(err, io.EOF) {
+				return nil, err
+			}
+			return nil, errRelayLineTooLong
+		}
+		line = append(line, chunk...)
+		switch {
+		case errors.Is(err, bufio.ErrBufferFull):
+			continue
+		case errors.Is(err, io.EOF) && len(line) > 0:
+			return line, nil
+		default:
+			return line, err
+		}
+	}
+}
+
+// newRelayClient is the bridge's HTTP client: no proxy from the environment
+// (an in-cluster Service, and a proxy between the pod and the broker would see
+// both credentials), and no redirect followed.
+func newRelayClient() *http.Client {
+	return &http.Client{
+		Timeout:   mcpRelayTimeout,
+		Transport: &http.Transport{Proxy: nil},
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return errRelayRedirect
+		},
+	}
 }
 
 // relayOne POSTs one message with the pod's credentials and returns the
@@ -198,7 +249,7 @@ func relayOne(ctx context.Context, client *http.Client, u *url.URL, message []by
 		return nil, fmt.Errorf("the broker's reply passed %d bytes", maxRelayReplyBytes)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return nil, fmt.Errorf("the broker answered HTTP %d", resp.StatusCode)
+		return nil, fmt.Errorf("the broker answered HTTP %d%s", resp.StatusCode, brokerErrorDetail(body))
 	}
 	if len(bytes.TrimSpace(body)) == 0 {
 		return nil, nil
@@ -295,6 +346,35 @@ func eventStreamMessages(body []byte) [][]byte {
 	}
 	flush()
 	return out
+}
+
+// brokerErrorDetail is the broker's own reason from an error body
+// ({"error"|"message", "rule", "code"}), bounded, so the model sees which rule
+// refused it rather than a bare status.
+func brokerErrorDetail(body []byte) string {
+	var e struct {
+		Error   string `json:"error"`
+		Message string `json:"message"`
+		Rule    string `json:"rule"`
+		Code    string `json:"code"`
+	}
+	if json.Unmarshal(body, &e) != nil {
+		return ""
+	}
+	var parts []string
+	for _, p := range []string{e.Rule, e.Code, e.Message, e.Error} {
+		if p = strings.TrimSpace(p); p != "" {
+			parts = append(parts, p)
+		}
+	}
+	detail := strings.Join(parts, ": ")
+	if len(detail) > 300 {
+		detail = detail[:300]
+	}
+	if detail == "" {
+		return ""
+	}
+	return " (" + detail + ")"
 }
 
 // relayUserAgent is the product, build and mode the platform agent's MCP
