@@ -14,6 +14,11 @@ crashed run left.
   run        on a fleet that is up: reset the install on the host cluster, run the
              burst window (the first-run flow and every audit) and the soak window,
              and write the verdict; exit 1 when it is red
+  install    upgrade the host cluster's install to the newest `main` commit whose
+             images are published, at the size's tier (the release's other values
+             are kept, so no secret is needed)
+  sweep      delete any sized fleet older than --max-age-hours, whatever its size:
+             what an aborted run left
   down       destroy the stack
   plan       show what `up` would change, and change nothing
 
@@ -32,6 +37,9 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
+from datetime import datetime
 from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -54,6 +62,28 @@ DEFAULT_ZONE = "us-central1-f"
 DEFAULT_HOST_CLUSTER = "scale-host"
 DEFAULT_HOST_LOCATION = "us-central1-c"
 DEFAULT_NAMESPACE = "kubeagents-system"
+RELEASE = "kube-agents"
+CHART_DIR = REPO / "charts" / "kube-agents"
+CRD_DIR = CHART_DIR / "crds"
+REGISTRY = "ghcr.io"
+IMAGE_REPO = "gke-labs/kube-agents/k8s-operator"
+MANIFEST_ACCEPT = ("application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, "
+                   "application/vnd.docker.distribution.manifest.list.v2+json, "
+                   "application/vnd.docker.distribution.manifest.v2+json")
+REGISTRY_TIMEOUT_SECONDS = 30
+HTTP_NOT_FOUND = 404
+# The image tags the release sets, each to the commit under test.
+IMAGE_TAG_KEYS = ("agentSandbox.image.tag", "operator.image.tag", "platformAgent.deployment.image.tag",
+                  "plugins.pubsubPlatform.image.tag", "plugins.stockoutInvestigator.image.tag")
+SIZING_KEY = "platformAgent.deployment.sizingProfile"
+# The fleet-sizing page's tier for each size, by its fleet-controllers row.
+TIERS = {"S": "medium", "M": "medium", "L": "fleet"}
+# How far back in `main` to look for a commit whose images are published.
+IMAGE_LOOKBACK = 30
+HELM_TIMEOUT = "20m"
+HELM_TIMEOUT_SECONDS = 25 * 60
+DEFAULT_MAX_AGE_HOURS = 8
+SIZE_LABEL = "kube-agents-scale-size"
 KUBECONFIG_FORMAT = "sized-fleet-{size}.kubeconfig"
 VERDICT_FILE = "scale-verdict.json"
 # The label a host cluster carries when its install exists to be measured: a run resets the
@@ -80,6 +110,7 @@ CHURN_POLL_SECONDS = 20
 CHURN_WARMUP_SECONDS = 10 * 60
 DEFAULT_CHURN_MINUTES = 6
 SECONDS_PER_MINUTE = 60
+SECONDS_PER_HOUR = 3600
 CLUSTER_PARALLELISM = 8
 EXIT_UNSOUND = 1
 POD_FAILING_REASONS = ("ImagePullBackOff", "ErrImagePull", "CrashLoopBackOff", "Error")
@@ -441,6 +472,67 @@ def summary(name: str, body: dict) -> str:
                      for w, v in windows.items())
 
 
+def image_published(sha: str) -> bool:
+    """Whether the operator image for ``sha`` is in the registry; the release workflow publishes them together."""
+    token_url = f"https://{REGISTRY}/token?scope=repository:{IMAGE_REPO}:pull&service={REGISTRY}"
+    with urllib.request.urlopen(token_url, timeout=REGISTRY_TIMEOUT_SECONDS) as response:  # noqa: S310 -- fixed URL
+        token = json.loads(response.read())["token"]
+    request = urllib.request.Request(f"https://{REGISTRY}/v2/{IMAGE_REPO}/manifests/{sha}",
+                                     headers={"Authorization": f"Bearer {token}", "Accept": MANIFEST_ACCEPT})
+    try:
+        with urllib.request.urlopen(request, timeout=REGISTRY_TIMEOUT_SECONDS):  # noqa: S310
+            return True
+    except urllib.error.HTTPError as exc:
+        if exc.code == HTTP_NOT_FOUND:
+            return False
+        raise
+
+
+def newest_published(ref: str = "HEAD") -> str:
+    """The newest commit at or before ``ref`` whose images are published: a merge's images take minutes."""
+    shas = subprocess.run(["git", "-C", str(REPO), "log", "--format=%H", f"-{IMAGE_LOOKBACK}", ref],
+                          capture_output=True, text=True, check=True).stdout.split()
+    for sha in shas:
+        if image_published(sha):
+            return sha
+    raise SystemExit(f"no commit in the last {IMAGE_LOOKBACK} of {ref} has published images")
+
+
+def cmd_install(args: argparse.Namespace) -> int:
+    """Upgrade the host install to the commit under test, at the size's tier, under its lease."""
+    sha = args.sha or newest_published()
+    tier = TIERS[args.size]
+    host_context = kube.context_name(args.project, args.host_location, args.host_cluster)
+    kube.gcloud("container", "clusters", "get-credentials", args.host_cluster, f"--location={args.host_location}",
+                project=args.project)
+    check_host(args)
+    with host_lease(args):
+        LOG.info("installing %s at the %s tier on %s", sha[:12], tier, args.host_cluster)
+        kube.run(["kubectl", "--context", host_context, "apply", "--server-side", "--force-conflicts", "-f",
+                  str(CRD_DIR)], timeout=HELM_TIMEOUT_SECONDS)
+        sets = [f"--set={key}={sha}" for key in IMAGE_TAG_KEYS] + [f"--set={SIZING_KEY}={tier}"]
+        kube.run(["helm", "--kube-context", host_context, "-n", args.namespace, "upgrade", RELEASE, str(CHART_DIR),
+                  "--reuse-values", *sets, "--wait", f"--timeout={HELM_TIMEOUT}"], timeout=HELM_TIMEOUT_SECONDS)
+    LOG.info("installed %s", sha)
+    return 0
+
+
+def cmd_sweep(args: argparse.Namespace) -> int:
+    """Delete every sized fleet with a cluster older than --max-age-hours, by its size's state."""
+    out = kube.gcloud("container", "clusters", "list", "--filter=resourceLabels.managed-by=kube-agents-sized-fleet",
+                      "--format=json", project=args.project)
+    now, stale = time.time(), set()
+    for cluster in json.loads(out or "[]"):
+        created = datetime.fromisoformat(cluster["createTime"].replace("Z", "+00:00")).timestamp()
+        if now - created > args.max_age_hours * SECONDS_PER_HOUR:
+            stale.add(cluster["resourceLabels"].get(SIZE_LABEL, "").upper())
+    for size in sorted(s for s in stale if s in TIERS):
+        LOG.warning("deleting the %s fleet an earlier run left", size)
+        cmd_down(argparse.Namespace(**{**vars(args), "size": size}))
+    LOG.info("sweep: %s", ", ".join(sorted(stale)) or "nothing to delete")
+    return 0
+
+
 def cmd_down(args: argparse.Namespace) -> int:
     started = time.time()
     init(args.project, args.size)
@@ -451,7 +543,7 @@ def cmd_down(args: argparse.Namespace) -> int:
 
 
 COMMANDS = {"plan": cmd_plan, "up": cmd_up, "workloads": cmd_workloads, "verify": cmd_verify, "run": cmd_run,
-            "down": cmd_down}
+            "down": cmd_down, "install": cmd_install, "sweep": cmd_sweep}
 
 
 def use_ca_bundle() -> None:
@@ -488,6 +580,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--soak-minutes", type=int, default=sized_run.SOAK_SECONDS // SECONDS_PER_MINUTE)
     parser.add_argument("--out", help="run: the folder for the three records; default a new temp folder")
     parser.add_argument("--results-bucket", help="run: also copy the records to <bucket>/<size>/<run id>/")
+    parser.add_argument("--sha", help="install: the commit to install; default the newest published one")
+    parser.add_argument("--max-age-hours", type=float, default=DEFAULT_MAX_AGE_HOURS,
+                        help="sweep: delete a fleet with a cluster older than this")
     parser.add_argument("--down", action="store_true",
                         help="run: delete the fleet when the run ends, whether it passed, failed or was interrupted")
     args = parser.parse_args(argv)
