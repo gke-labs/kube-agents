@@ -113,9 +113,18 @@ readonly EVAL_GRADER_TREE="bench"
 readonly EVAL_GRADER_CASES_DIR="tasks"
 # The seeded fleet's catalog inside that tree, which the fleet step reads.
 readonly EVAL_FLEET_CATALOG="tf/fleet/fixtures.json"
+# Where `uv sync` builds the grader's environment inside that tree, relative
+# to it. The export may carry an entry by this name that is not a directory
+# (bench/.venv has been a committed link to a developer's machine since
+# c418002ff), and uv cannot create the directory over it;
+# drop_stray_grader_venv removes such an entry from the exported tree before
+# the sync.
+readonly EVAL_GRADER_VENV_DIR=".venv"
 
-# A repetition the launcher could not start because GitHub's token endpoint
-# failed transiently (record_unit_not_run, beside run_one_unit). The unit
+# A repetition the launcher could not start (record_unit_not_run, beside
+# run_one_unit): GitHub's token endpoint failed transiently, a fixture it needs
+# drifted, its card fence could not run, and the other skips that function's
+# callers name. The unit
 # writes a record in place of the run that carries the harness's own
 # infrastructure marker -- bench/kube_agents_bench/harness.py's and
 # scoring.py's INFRA_FAILURE_MARKER, which tests/test_ci_eval_ledger_mint.py
@@ -141,6 +150,11 @@ readonly EVAL_LEASE_FIXTURE_SCAN_TIMEOUT_SECONDS=300
 readonly EVAL_FIXTURE_STATE_PUBLISHED="gs://kube-agents-dashboards/evals/fixture-state.json"
 readonly EVAL_FIXTURE_STATE_PUBLISHED_COPY="fixture-state-published.json"
 readonly EVAL_FIXTURE_DRIFT_DIR="fixture-drift"
+# Where a second-phase unit whose card fence could not reach the gateway is
+# noted (fence_live_cards), one file per unit, read by run_one_unit, which
+# records the unit as infrastructure rather than launching it into a window the
+# fence did not clear.
+readonly EVAL_FENCE_UNFENCED_DIR="fence-unfenced"
 readonly EVAL_FIXTURE_DRIFT_CHANGED_FILES="fixture-drift-changed-files.txt"
 # The opening chat turn's seconds beside results.json, where
 # bench/kube_agents_bench/scoring.py (_TIMING_FILE) reads them.
@@ -317,10 +331,27 @@ readonly EVAL_INSTALL_GONE_MARKER="install-gone"
 # kubectl, not the helper in the pod, so the helper must end by itself first or
 # a later pass could archive the card of the unit launched next. The margin
 # covers the exec's setup, the interpreter's start and the last board read; a
-# helper that runs out names the cards it did not reach, and the warning says so.
+# helper that runs out names the cards it did not reach, exits
+# EVAL_FENCE_DECIDED_EXIT (its EXIT_LEFT_LIVE; scripts/test_ci_fence_cards.py
+# holds the two equal), and the warning says so: the fence ran, and the unit
+# launches as it did before the fence.
 readonly EVAL_FENCE_CARD_PASSES=3
 readonly EVAL_FENCE_TIMEOUT_SECONDS=180
 readonly EVAL_FENCE_BUDGET_MARGIN_SECONDS=30
+readonly EVAL_FENCE_DECIDED_EXIT=3
+# Any other exit is a fence that did not run to its verdict, most often an exec
+# that did not reach the container (#5508): a gateway preempted or rolled during
+# the second phase has no pod for some minutes, and a fence that ran against none
+# would let the earlier unit's card, retried on the new pod, write into the next
+# window. So each attempt first waits for a Ready gateway pod, the way the
+# scheduled-audits exec does, and a fence that still could not run after its
+# attempts marks the unit unfenced (EVAL_FENCE_UNFENCED_DIR) instead of launching
+# it. Once a unit has gone unfenced the latch below holds the next fences
+# to one attempt each, until one succeeds: an outage that outlasts the phase then
+# costs one wait per unit, not three.
+readonly EVAL_FENCE_ATTEMPTS=3
+readonly EVAL_FENCE_POD_WAIT_SECONDS=300
+readonly EVAL_FENCE_GATEWAY_AWAY_LATCH=".gateway-away"
 # scheduled_audits: how long one exec that pauses or resumes the clock-started audits
 # may take. Each is a `hermes cron` call of a few seconds, bounded at 30s by the
 # script, so five stalled calls still finish and name themselves inside this.
@@ -1138,13 +1169,34 @@ grader_pin_applies() { # -> 0 when this run grades a change against a merge targ
   [ -n "${PULL_NUMBER:-}" ] || [ "${JOB_TYPE:-}" = "presubmit" ] || [ "${JOB_TYPE:-}" = "batch" ]
 }
 
+# Removes <bench dir>/.venv from an exported grader tree when it is not a real
+# directory (a symbolic link, dangling or not, or a file): the scratch tree's
+# venv is uv's to build, and `uv sync` fails with "failed to create directory
+# ... File exists" over anything else by that name. A real directory is left
+# alone; a fresh export never holds one, since nothing has synced there yet.
+# Prints one line saying what went and why, nothing when there was nothing.
+drop_stray_grader_venv() { # <bench dir>
+  local venv="$1/${EVAL_GRADER_VENV_DIR}" kind
+  if [ -L "${venv}" ]; then
+    kind="a symbolic link to $(readlink "${venv}")"
+  elif [ -e "${venv}" ] && [ ! -d "${venv}" ]; then
+    kind="a file"
+  else
+    return 0
+  fi
+  echo "Grader: removed ${venv} from the exported tree: it was ${kind}, not a directory, and uv sync cannot create the venv over it."
+  rm -f "${venv}"
+}
+
 # main's bench/ at <sha>, with the change's bench/tasks/ in place of main's,
 # extracted to <out>/bench. Replaced, not overlaid: a case the change deletes
-# is gone, and one it adds is there.
+# is gone, and one it adds is there. A `.venv` the archive carried goes
+# (drop_stray_grader_venv), so the sync in section 6 starts from none.
 pin_grader() { # <repo root> <sha> <out>
   local repo="$1" sha="$2" out="$3"
   git -C "${repo}" archive "${sha}" "${EVAL_GRADER_TREE}" | tar -x -C "${out}" || return 1
   [ -d "${out}/${EVAL_GRADER_TREE}" ] || return 1
+  drop_stray_grader_venv "${out}/${EVAL_GRADER_TREE}" || return 1
   rm -rf "${out:?}/${EVAL_GRADER_TREE}/${EVAL_GRADER_CASES_DIR}"
   cp -R "${repo}/${EVAL_GRADER_TREE}/${EVAL_GRADER_CASES_DIR}" "${out}/${EVAL_GRADER_TREE}/${EVAL_GRADER_CASES_DIR}"
 }
@@ -2273,15 +2325,19 @@ wait_platform_runs() { # <label> <space-separated audit ids>
 # exchange is cut and the harness cannot send the cancel over the failed
 # transport (pull-kube-agents-smoke-test 2116235582324609024 on #4323 and
 # 2117358437963665408 on #3846), at the delegation ceiling, and through a
-# worker's own fan-out. The exec goes to the gateway pod, not through the
+# worker's own fan-out. The exec goes to a Ready gateway pod (ready_gateway_pod), not through the
 # port-forward the cut exchange used. hack/ci_fence_cards.py does the work and
 # says what it archived; the settle that follows in launch_units covers a push
 # already in flight when a worker stops. Pinned to AGENT_CLUSTER_CONTEXT and
 # refused for a context that does not name PROJECT_ID, as wait_platform_runs
-# is. Returns 0 whatever happens: a fence that fails is a warning, and the
-# unit runs as it did before the fence.
-fence_live_cards() { # <label>
-  local label="$1" ns ctx out rc=0
+# is. Returns 0 whatever happens. A fence skipped for a missing prerequisite or
+# a foreign context, or one that ran and left cards it names (the helper's
+# decided exit), is a warning, and the unit runs as it did before the fence. A
+# fence that could not run to its verdict after its attempts notes the unit
+# under FENCE_UNFENCED_DIR, and run_one_unit records it as infrastructure
+# instead of launching it (#5508).
+fence_live_cards() { # <label> [<task-name> <rep>]
+  local label="$1" name="${2:-}" rep="${3:-}" ns ctx out rc=0 pod attempt
   ns="${TARGET_NAMESPACE:-}"
   ctx="${AGENT_CLUSTER_CONTEXT:-}"
   if [ -z "${PROJECT_ID:-}" ] || [ -z "${ctx}" ] || [ -z "${ns}" ] || [ -z "${EVAL_FANOUT_STARTED_EPOCH:-}" ] || ! command -v kubectl >/dev/null 2>&1; then
@@ -2296,17 +2352,55 @@ fence_live_cards() { # <label>
   esac
   local bound=(timeout --foreground "${EVAL_FENCE_TIMEOUT_SECONDS}")
   command -v timeout >/dev/null 2>&1 || bound=()
-  out="$(${bound[@]+"${bound[@]}"} kubectl --context "${ctx}" -n "${ns}" exec -i "deployment/${AGENT_SERVICE_NAME}-gateway" \
-    -c "${EVAL_GATEWAY_CONTAINER}" --request-timeout="${EVAL_SANDBOX_EXEC_TIMEOUT}" -- \
-    "${EVAL_GATEWAY_PYTHON}" - "${EVAL_GATEWAY_HOME}" "${EVAL_FANOUT_STARTED_EPOCH}" "${EVAL_FENCE_CARD_PASSES}" \
-    "$((EVAL_FENCE_TIMEOUT_SECONDS - EVAL_FENCE_BUDGET_MARGIN_SECONDS))" \
-    < "${SCRIPT_DIR}/ci_fence_cards.py" 2>&1)" || rc=$?
-  if [ "${rc}" -eq 0 ]; then
-    echo "Card fence (${label}): ${out}"
-    return 0
+  # Each attempt first waits for a Ready gateway pod and execs into that pod, as the
+  # scheduled-audits exec does: a gateway preempted or rolled mid-phase (#5508) has no
+  # container to exec into for some minutes, and the card the earlier unit left runs
+  # again on the pod that replaces it. After a unit has gone unfenced, the latch holds
+  # each later fence to one attempt until one succeeds.
+  local attempts="${EVAL_FENCE_ATTEMPTS}" latch=""
+  if [ -n "${FENCE_UNFENCED_DIR:-}" ]; then
+    latch="${FENCE_UNFENCED_DIR}/${EVAL_FENCE_GATEWAY_AWAY_LATCH}"
+    [ ! -e "${latch}" ] || attempts=1
   fi
-  [ "${rc}" -eq 124 ] && out="timed out after ${EVAL_FENCE_TIMEOUT_SECONDS}s${out:+; ${out}}"
-  echo "WARNING: Card fence (${label}): kubectl exec into ${ns}/${AGENT_SERVICE_NAME}-gateway exited ${rc} (${out}); a card an earlier unit left running may still open a pull request in this unit's window, where the GitHub-write safeguard charges it (#4425)" >&2
+  for attempt in $(seq 1 "${attempts}"); do
+    rc=0
+    pod="$(ready_gateway_pod "${ctx}" "${ns}" "${EVAL_FENCE_POD_WAIT_SECONDS}")" || {
+      rc=1
+      out="no Ready gateway pod within ${EVAL_FENCE_POD_WAIT_SECONDS}s"
+      [ "${attempt}" -lt "${attempts}" ] && sleep "${EVAL_PLATFORM_RUN_POLL_SECONDS}"
+      continue
+    }
+    out="$(${bound[@]+"${bound[@]}"} kubectl --context "${ctx}" -n "${ns}" exec -i "${pod}" \
+      -c "${EVAL_GATEWAY_CONTAINER}" --request-timeout="${EVAL_SANDBOX_EXEC_TIMEOUT}" -- \
+      "${EVAL_GATEWAY_PYTHON}" - "${EVAL_GATEWAY_HOME}" "${EVAL_FANOUT_STARTED_EPOCH}" "${EVAL_FENCE_CARD_PASSES}" \
+      "$((EVAL_FENCE_TIMEOUT_SECONDS - EVAL_FENCE_BUDGET_MARGIN_SECONDS))" \
+      < "${SCRIPT_DIR}/ci_fence_cards.py" 2>&1)" || rc=$?
+    if [ "${rc}" -eq 0 ]; then
+      echo "Card fence (${label}): ${out}"
+      [ -z "${latch}" ] || rm -f "${latch}" 2>/dev/null || true
+      return 0
+    fi
+    if [ "${rc}" -eq "${EVAL_FENCE_DECIDED_EXIT}" ]; then
+      # The helper ran and says what it could not archive: the fence did its work,
+      # and the unit launches as it did before the fence existed.
+      echo "WARNING: Card fence (${label}): ${out}; a card still live may open a pull request in this unit's window, where the GitHub-write safeguard charges it (#4425)" >&2
+      [ -z "${latch}" ] || rm -f "${latch}" 2>/dev/null || true
+      return 0
+    fi
+    [ "${rc}" -eq 124 ] && out="timed out after ${EVAL_FENCE_TIMEOUT_SECONDS}s${out:+; ${out}}"
+    echo "WARNING: Card fence (${label}): kubectl exec into ${pod} exited ${rc} on attempt ${attempt} of ${attempts} (${out})" >&2
+    [ "${attempt}" -lt "${attempts}" ] && sleep "${EVAL_PLATFORM_RUN_POLL_SECONDS}"
+  done
+  # Not launched into a window the fence did not clear: run_one_unit records the
+  # unit as infrastructure from this note (#4425, #5508). A caller that named no
+  # unit gets the warning alone.
+  echo "WARNING: Card fence (${label}): could not run after ${attempts} attempt(s) (${out}); a card an earlier unit left running may still open a pull request in this unit's window, where the GitHub-write safeguard charges it, so the unit is not launched (#4425, #5508)" >&2
+  if [ -n "${name}" ] && [ -n "${rep}" ] && [ -n "${FENCE_UNFENCED_DIR:-}" ]; then
+    mkdir -p "${FENCE_UNFENCED_DIR}" 2>/dev/null || true
+    printf '%s\n' "the card fence could not run before this unit (${out}); not launched into a window it did not clear (#5508)" \
+      > "${FENCE_UNFENCED_DIR}/${name}.rep${rep}" 2>/dev/null || true
+    : > "${latch}" 2>/dev/null || true
+  fi
   return 0
 }
 
@@ -2883,6 +2977,9 @@ if [ -n "${PULL_NUMBER:-}" ] && ! grep -qwE 'ToolInvocation|ChecklistScore|Outco
   export KUBE_AGENTS_SKIP_REPORT_ONLY_JUDGES=1
 fi
 export AGENT_PROVIDER="google"
+# A Prow job brings AGENT_MODEL_OVERRIDE from the build cluster's eval-model
+# Secret; hack/ci-deploy.sh, which runs first in every lane, refuses a Prow
+# job without it, so the default here serves local runs only.
 export AGENT_MODEL="${AGENT_MODEL_OVERRIDE:-gemini-3.1-pro-preview}"
 
 # Unset NAMESPACE so devops-bench OpenTofu deployer does not pass -var namespace=... to stacks that don't declare it
@@ -3478,9 +3575,10 @@ if [ -n "${GRADER_BENCH_DIR}" ]; then
   BENCH_DIR="${GRADER_BENCH_DIR}"
   EVAL_GRADER_SHA="${PULL_BASE_SHA}"
   echo "Grader: ${EVAL_GRADER_TREE}/ at PULL_BASE_SHA=${PULL_BASE_SHA}, with this change's ${EVAL_GRADER_TREE}/${EVAL_GRADER_CASES_DIR}/, in ${BENCH_DIR}"
-  # The scratch directory has no venv yet, and syncing one fetches over the
-  # network: one retry absorbs a transient failure, so the check below fails
-  # only on itself.
+  # The scratch directory has no venv yet (pin_grader dropped any entry the
+  # archive carried by that name), and syncing one fetches over the network:
+  # one retry absorbs a transient failure, so the check below fails only on
+  # itself.
   if ! (cd "${BENCH_DIR}" && uv sync --quiet) && ! (cd "${BENCH_DIR}" && uv sync --quiet); then
     echo "ERROR: could not sync main's grader's venv in ${BENCH_DIR} (twice, above); the run does not start." >&2
     exit 1
@@ -3550,9 +3648,9 @@ fi
 export BENCH_GITOPS_REPO="${INJECT_LANE_REPO}"
 INJECT_LANE_TASKS_DIR="$(mktemp -d)"
 # One `<requested> <case> <copy>` line per task: how many pull requests
-# the case requests (the largest of its own checks, its top-level
-# `requested_pull_requests` key, and the file's `requesting:` list for a
-# case the persona answers with one before its checks say so), the case,
+# the case requests (the larger of its own checks and its top-level
+# `requested_pull_requests` key, which also stands in for a case the
+# persona answers with one before its checks say so), the case,
 # and the copy's path. The cases with a non-zero count are the fan-out's
 # second phase (INJECT_LANE_REQUESTING, read where the unit queue is built):
 # they run only after every other unit has finished, so a repetition of a
@@ -4439,6 +4537,12 @@ unit_cost_hint() {
     # orders it only among that phase's units.
     gce-startup-script-failure | networking-world-open-ingress) echo 900 ;;
     obtainability-pdb-kustomize-overlay) echo 900 ;;
+    # One delegated card that reads the live Deployment, the GitOps directory
+    # and the chart repository (about six minutes on a dev install, #5161),
+    # plus the stack's plant and teardown (four commits, a workload, a
+    # ConfigMap mount wait). writes_alone, so the hint orders it only among
+    # the writers part's units.
+    remediation-context-repository-owns-the-fix) echo 600 ;;
     fleet-cost-idle-pool) echo 900 ;;
     # A plain chat request that runs the compliance collector's sweep (#2386):
     # the audit band, without the ledger write.
@@ -4769,6 +4873,11 @@ echo "Infra lock: ${STACK_CONTENDERS} stack-bearing task(s); a unit waits up to 
 # silently un-gate transcript-read checks.
 STATE_DIR="$(mktemp -d)"
 
+# The units the card fence could not run before (fence_live_cards): one reason
+# file each under EVAL_FENCE_UNFENCED_DIR, read by run_one_unit beside the
+# fixture-drift marks below. Set apart from them: tests lift the drift step
+# from its first assignment to its closing fi.
+FENCE_UNFENCED_DIR="${STATE_DIR}/${EVAL_FENCE_UNFENCED_DIR}"
 # The cases that need a fixture the lease-time scan saw drifted
 # (scan_lease_fixtures): one reason file each under EVAL_FIXTURE_DRIFT_DIR,
 # read by run_one_unit. The module grades every case as usual, and says so,
@@ -5201,6 +5310,22 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
     lock_release "${STATE_DIR}/lock-task-${name}"
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} did not run: a fixture it needs drifted on the leased project" >&2
     if [ "${drift_reps}" -ge "${EVAL_REPETITIONS}" ]; then
+      finish_case "${task}" "${name}"
+    fi
+    return 0
+  fi
+  # The card fence before this second-phase unit could not reach the gateway
+  # (fence_live_cards, #5508): the unit is recorded as infrastructure under the
+  # fence's note and never launched, since a card an earlier unit left running
+  # would write into its exclusive window and be charged to it. Unwound as the
+  # drift skip above is.
+  local unfenced_file="${FENCE_UNFENCED_DIR:-}/${name}.rep${rep}" unfenced_reps=0
+  if [ -n "${FENCE_UNFENCED_DIR:-}" ] && [ -s "${unfenced_file}" ]; then
+    record_unit_not_run "${name}" "${rep}" "$(head -n 1 "${unfenced_file}")"
+    unfenced_reps="$(finished_rep_count "${name}")"
+    lock_release "${STATE_DIR}/lock-task-${name}"
+    echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} did not run: its card fence could not run before it" >&2
+    if [ "${unfenced_reps}" -ge "${EVAL_REPETITIONS}" ]; then
       finish_case "${task}" "${name}"
     fi
     return 0
@@ -5673,11 +5798,13 @@ EOF_UNIT_QUEUE
     # Staggered, so N units do not open their first model call in the same
     # second -- burst 429s at the model quota are the fan-out's failure mode;
     # in the second phase the pause is the writer pause instead (the settle).
-    # A unit of a case marked for a drifted fixture makes no model call and no
-    # write, so it skips the pause.
+    # A unit of a case marked for a drifted fixture, or one its fence left
+    # unfenced, makes no model call and no write, so it skips the pause.
     if [ -z "${FIXTURE_DRIFT_DIR:-}" ] || [ ! -s "${FIXTURE_DRIFT_DIR}/${TASK_NAMES[IDX]}" ]; then
-      [ -z "${fence}" ] || fence_live_cards "${TASK_NAMES[IDX]} rep ${REP}"
-      sleep "${pause}"
+      [ -z "${fence}" ] || fence_live_cards "${TASK_NAMES[IDX]} rep ${REP}" "${TASK_NAMES[IDX]}" "${REP}"
+      if [ -z "${FENCE_UNFENCED_DIR:-}" ] || [ ! -s "${FENCE_UNFENCED_DIR}/${TASK_NAMES[IDX]}.rep${REP}" ]; then
+        sleep "${pause}"
+      fi
     fi
     echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] launching ${TASK_NAMES[IDX]} rep ${REP}/${EVAL_REPETITIONS}"
     UNIT_SEQ=$((${UNIT_SEQ:-0} + 1))

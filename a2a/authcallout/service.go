@@ -174,7 +174,7 @@ type Config struct {
 
 // envTaskCredentialMaxLifetimeName is the variable ParseTaskCredentialMaxLifetime
 // reads, named in its errors so a refusal says which setting to fix.
-const envTaskCredentialMaxLifetimeName = "A2A_TASK_CREDENTIAL_MAX_LIFETIME"
+const envTaskCredentialMaxLifetimeName = "A2A_TASK_CREDENTIAL_MAX_LIFETIME" // #nosec G101 -- an env var name, not a credential
 
 // ParseTaskCredentialMaxLifetime reads the task credential lifetime #4121's
 // operator will render (time.Duration.String, e.g. "6h0m0s"). Empty is
@@ -803,6 +803,6 @@ func (s *Service) mint(req *jwt.AuthorizationRequestClaims, d decision) (string,
 }
 
 func (s *Service) grantExpiry() time.Time {
-	jitter := time.Duration(rand.Float64() * grantTTLJitter * float64(s.grantTTL))
+	jitter := time.Duration(rand.Float64() * grantTTLJitter * float64(s.grantTTL)) // #nosec G404 -- jitter on an expiry, not a secret
 	return s.now().Add(s.grantTTL - jitter)
 }

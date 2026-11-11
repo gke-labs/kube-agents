@@ -150,6 +150,11 @@ type a2aBusReload struct {
 // also what happens when the monitoring endpoint can't be read at all. The
 // Secret and the StatefulSet are read uncached (a2aReader).
 func (r *PlatformAgentReconciler) planA2ABusReload(ctx context.Context, agent *agentv1alpha1.PlatformAgent, config *corev1.Secret, sts *appsv1.StatefulSet, now time.Time) (a2aBusReload, error) {
+	if a2aNATSReplicas(agent) > 1 {
+		// A cluster rolls onto every config change (a2aConfigRolloutHash):
+		// one config_load_time can't confirm three servers reloaded.
+		return a2aBusReload{}, nil
+	}
 	live := &corev1.Secret{}
 	if err := r.a2aReader().Get(ctx, types.NamespacedName{Name: config.Name, Namespace: config.Namespace}, live); err != nil {
 		return a2aBusReload{}, client.IgnoreNotFound(err)

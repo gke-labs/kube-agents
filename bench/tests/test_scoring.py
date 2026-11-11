@@ -46,6 +46,7 @@ import pytest
 
 from kube_agents_bench import scoring, worker_trajectory
 from kube_agents_bench.cases import HARNESS_WRITTEN_ENTRIES, CaseSpec, load_case
+from kube_agents_bench.forges import FORGE_UNAVAILABLE_MARKER
 from kube_agents_bench.scoring import (
     DEFAULT_AGGREGATE_MARGIN,
     DEFAULT_JUDGED_MARGIN,
@@ -461,6 +462,134 @@ def test_rung_2_every_way_a_declared_check_can_fail_to_run(
     assert verdict.rung is Rung.CHECK_DID_NOT_RUN
     assert verdict.blocking is True
     assert needle in verdict.reason
+
+
+# The spent-branch check of vcs-spent-branch-reuse as #5103's smoke run
+# recorded it, with the reason its verifier gives when GitHub's pulls endpoint
+# answers 503: the record that redded that run at rung 2.
+SPENT_BRANCH_CHECK = "the-second-proposal-reuses-the-spent-branch"
+FORGE_503_REASON = (
+    f"{FORGE_UNAVAILABLE_MARKER} (answered 503): unexpected GitHub response 503 for "
+    "pool-org/pool-repo#12 on the pulls endpoint; this check could not be evaluated"
+)
+PERMISSION_403_REASON = (
+    "GitHub denied pool-org/pool-repo#12 on the pulls endpoint; BENCH_GITHUB_TOKEN needs "
+    "`pull_requests: read` to grade what a run pushed, so this check could not be evaluated"
+)
+
+
+def error_on(name, reason, **extra):
+    def mutate(rec):
+        rec["verification_report"][0].update(
+            name=name, status="error", success=False, reason=reason, **extra
+        )
+
+    return mutate
+
+
+def test_a_check_that_errored_on_a_forge_outage_is_infrastructure(noop_spec, make_run):
+    """#5222: a 5xx under the spent-branch read is the forge's, not the run's."""
+    run = make_run(mutate=error_on(SPENT_BRANCH_CHECK, FORGE_503_REASON))
+    rep = classify_rep(noop_spec, run, 1)
+    assert rep.outcome == "infra"
+    assert rep.reason.startswith(FORGE_UNAVAILABLE_MARKER)
+    assert f"{SPENT_BRANCH_CHECK}: {FORGE_503_REASON}" in rep.reason
+
+    verdict = grade_case(noop_spec, [run, make_run(), make_run()], admitted=True)
+    assert verdict.rung is Rung.GREEN
+    assert "1 of 3 repetition(s) infra: forge unavailable" in verdict.notes
+
+    emptied = grade_case(noop_spec, [run, run, run], admitted=True)
+    assert emptied.rung is Rung.INFRA
+    assert emptied.reason.endswith("(3 of 3 repetition(s) infra: forge unavailable)")
+
+
+def test_a_check_that_errored_for_any_other_reason_stays_on_rung_2_with_its_reason(
+    noop_spec, make_run
+):
+    verdict = grade_case(
+        noop_spec, [make_run(mutate=error_on(SPENT_BRANCH_CHECK, PERMISSION_403_REASON))], admitted=False
+    )
+    assert verdict.rung is Rung.CHECK_DID_NOT_RUN
+    assert verdict.blocking is True
+    assert f"['{SPENT_BRANCH_CHECK}'] -- {SPENT_BRANCH_CHECK}: {PERMISSION_403_REASON}" in verdict.reason
+
+
+def test_a_compound_with_one_leaf_not_forge_stays_on_rung_2(noop_spec, make_run):
+    """Every errored leaf has to carry the marker, not only the compound's own reason."""
+    children = [
+        {"status": "error", "success": False, "reason": FORGE_503_REASON},
+        {"status": "error", "success": False, "reason": PERMISSION_403_REASON},
+    ]
+    joined = f"[0] errored: {FORGE_503_REASON}; [1] errored: {PERMISSION_403_REASON}"
+    run = make_run(mutate=error_on("either-read", joined, children=children))
+    rep = classify_rep(noop_spec, run, 1)
+    assert rep.rung is Rung.CHECK_DID_NOT_RUN
+    assert f"either-read: {FORGE_503_REASON} / {PERMISSION_403_REASON}" in rep.reason
+
+    forge_only = make_run(
+        mutate=error_on("either-read", joined, children=[children[0], dict(children[0])])
+    )
+    assert classify_rep(noop_spec, forge_only, 1).outcome == "infra"
+
+
+def test_a_forge_outage_does_not_hide_a_tripped_safeguard(noop_spec, make_run):
+    def both(rec):
+        error_on(SPENT_BRANCH_CHECK, FORGE_503_REASON)(rec)
+        trip_catastrophic(rec)
+
+    assert classify_rep(noop_spec, make_run(mutate=both), 1).rung is Rung.FORBIDDEN_ACTION
+
+
+def test_a_forge_outage_beside_a_failed_check_stays_on_rung_2(noop_spec, make_run):
+    """A fail outranks an error: the outage cannot excuse a check the run failed."""
+    def both(rec):
+        error_on(SPENT_BRANCH_CHECK, FORGE_503_REASON)(rec)
+        rec["verification_report"].append(
+            {"name": "the-reply-names-the-pull-request", "status": "fail", "success": False, "reason": "it does not"}
+        )
+
+    assert classify_rep(noop_spec, make_run(mutate=both), 1).rung is Rung.CHECK_DID_NOT_RUN
+
+
+def test_a_forge_outage_on_a_record_that_is_not_a_real_run_is_not_infrastructure(noop_spec, make_run):
+    def both(rec):
+        error_on(SPENT_BRANCH_CHECK, FORGE_503_REASON)(rec)
+        zero_the_latency(rec)
+
+    rep = classify_rep(noop_spec, make_run(mutate=both), 1)
+    assert rep.outcome == "blocked"
+
+
+def test_an_errored_safeguard_stays_on_rung_2_whatever_errored_it(noop_spec, make_run):
+    """Rung 1 cannot see a forbidden write the safeguard could not read for."""
+    rep = classify_rep(
+        noop_spec, make_run(mutate=error_on(SPENT_BRANCH_CHECK, FORGE_503_REASON, severity="catastrophic")), 1
+    )
+    assert rep.rung is Rung.CHECK_DID_NOT_RUN
+
+
+def test_a_forge_outage_on_a_record_with_no_coverage_stays_on_rung_2(noop_spec, make_run):
+    def both(rec):
+        error_on(SPENT_BRANCH_CHECK, FORGE_503_REASON)(rec)
+        rec["scores"].pop("VerificationCoverage", None)
+
+    assert classify_rep(noop_spec, make_run(mutate=both), 1).rung is Rung.CHECK_DID_NOT_RUN
+
+
+def test_the_marker_counts_only_where_the_check_put_it(noop_spec, make_run):
+    """A reason that quotes the marker (a branch name the agent chose, say) is not one."""
+    quoted = f"the closed pull request's branch {FORGE_UNAVAILABLE_MARKER} could not be read"
+    rep = classify_rep(noop_spec, make_run(mutate=error_on(SPENT_BRANCH_CHECK, quoted)), 1)
+    assert rep.rung is Rung.CHECK_DID_NOT_RUN
+
+
+def test_a_forge_outage_beside_a_parse_error_stays_on_rung_2(noop_spec, make_run):
+    def both(rec):
+        error_on(SPENT_BRANCH_CHECK, FORGE_503_REASON)(rec)
+        add_parse_error(rec)
+
+    assert classify_rep(noop_spec, make_run(mutate=both), 1).rung is Rung.CHECK_DID_NOT_RUN
 
 
 def test_rung_2_does_not_fire_on_a_task_that_declares_no_checks(specless_spec, make_run):
@@ -1353,28 +1482,28 @@ def test_infra_ended_rep_on_a_zero_request_case_still_blocks(tofu_spec, make_run
     _assert_rung_1(_grade_requesting(tofu_spec, make_run, _infra_rep(), requested=0))
 
 
-def test_infra_ended_lane_only_placeholder_case_blocks_a_known_gap(write_task, make_run):
-    """A case that requests a pull request only through the lane ``requesting:``
-    listing, with no own PR-check, is not distinguished by the carve-out.
+def test_an_infra_ended_placeholder_case_that_declares_its_request_is_infra(write_task, make_run):
+    """A case the persona answers with a pull request before its own check
+    lands declares ``requested_pull_requests`` at its top level, so the pinned
+    grader counts the request without reading anything outside the task file,
+    and the carve-out excuses the charged pull request on an infra-ended rep.
+    Without the key the same case has no requested write to be mischarged and
+    blocks at rung 1."""
+    body = {
+        "id": "placeholder",
+        "name": "Placeholder",
+        "infrastructure": {"deployer": "tofu"},
+        "verification_spec": [{"report_contains": {"phrases": ["x"]}}],
+    }
+    declared = load_case(write_task("placeholder", {**body, "requested_pull_requests": 1}))
+    assert declared.requested_pull_requests == 1
+    verdict = grade_case(declared, [make_run(mutate=_infra_rep())], admitted=True)
+    assert verdict.rung is Rung.INFRA
+    assert verdict.reps[0].outcome == "infra"
 
-    The scorer is pinned to the ``bench/`` tree and cannot read the lane file,
-    so such a case counts zero requested pull requests and its infra-ended rep
-    blocks at rung 1. No current case is lane-only; the gap is tracked in
-    #4778. This test pins the documented behaviour so a future fix flips it.
-    """
-    task = write_task(
-        "lane-only-placeholder",
-        {
-            "id": "lane-only-placeholder",
-            "name": "Lane-only placeholder",
-            "infrastructure": {"deployer": "tofu"},
-            "verification_spec": [{"report_contains": {"phrases": ["x"]}}],
-        },
-    )
-    spec = load_case(task)
-    assert spec.requested_pull_requests == 0, "own checks request none; the lane listing is unreadable here"
-
-    _assert_rung_1(grade_case(spec, [make_run(mutate=_infra_rep())], admitted=True))
+    undeclared = load_case(write_task("placeholder-without-key", {**body, "id": "placeholder-without-key"}))
+    assert undeclared.requested_pull_requests == 0
+    _assert_rung_1(grade_case(undeclared, [make_run(mutate=_infra_rep())], admitted=True))
 
 
 def test_the_write_safeguard_constant_matches_the_lane_file():
@@ -3016,15 +3145,18 @@ def _failed_entry(name):
     }
 
 
-def _worker_lane_run(inject_run, *, workers=True, gap=False, loss=None):
+def _worker_lane_run(inject_run, *, workers=True, gap=False, loss=None, no_calls=False):
     """The captured inject repetition with the activity marker (reporting
     ``loss``), a tagged worker entry when ``workers``, a capture-gap entry
-    when ``gap``, and every worker-reading entry recorded as failed."""
+    when ``gap``, the harness's no-worker-calls entry when ``no_calls``, and
+    every worker-reading entry recorded as failed."""
 
     def mutate(rec):
         rec["trajectory"].append({**ACTIVITY_MARKER, "args": {"calls": 0, "dropped": 0, **(loss or {})}})
         if workers:
             rec["trajectory"].append(dict(TAGGED_WORKER_ENTRY))
+        if no_calls:
+            rec["trajectory"].append(worker_trajectory.no_worker_calls_entry(["t_1"]))
         if gap:
             rec["trajectory"].append(worker_trajectory.gap_entry(["session store for cluster-a: locked"]))
         names = [WORKER_ONLY_CHECK, WORKER_AND_ROUTER_CHECK, *WORKER_UNTRACED_CHECKS]
@@ -3078,6 +3210,144 @@ def test_a_worker_check_stays_set_aside_on_a_capture_with_a_gap(worker_lane_spec
     assert rep.not_applicable_checks == [WORKER_ONLY_CHECK, WORKER_AND_ROUTER_CHECK, *WORKER_UNTRACED_CHECKS]
     assert rep.outcome == "pass" and rep.correctness == 1.0
     assert worker_trajectory.GAP_ENTRY in HARNESS_WRITTEN_ENTRIES
+
+
+WORKER_CALLS_CHECK = "the-worker-ended-its-card"
+
+
+@pytest.fixture
+def worker_calls_spec(write_task):
+    """A case with a check that reads only the workers' calls (a workers-scope
+    ``tool_called``) beside one that reads their commands."""
+    return load_case(
+        write_task(
+            "worker-calls",
+            {
+                "id": "worker-calls",
+                "name": "Worker calls",
+                "verification_spec": [
+                    {
+                        "name": ANSWER_CHECK,
+                        "role": "objective",
+                        "check": {"type": "report_contains", "required_phrases": ["seeded"]},
+                    },
+                    {
+                        "name": WORKER_CALLS_CHECK,
+                        "role": "objective",
+                        "check": {
+                            "type": "tool_called",
+                            "tool_names": ["kanban_complete", "kanban_block"],
+                            "scope": "workers",
+                        },
+                    },
+                    {
+                        "name": WORKER_ONLY_CHECK,
+                        "role": "objective",
+                        "check": {"type": "worker_commands", "required_patterns": ["kubectl"]},
+                    },
+                ],
+            },
+        )
+    )
+
+
+def _worker_calls_run(inject_run, *, gap=False, tagged=False):
+    """The captured inject repetition with the activity marker, the harness's
+    no-worker-calls entry, a gap entry when ``gap``, a tagged worker entry
+    when ``tagged``, and both worker-reading entries recorded as failed."""
+
+    def mutate(rec):
+        rec["trajectory"].append({**ACTIVITY_MARKER, "args": {"calls": 0, "dropped": 0}})
+        rec["trajectory"].append(worker_trajectory.no_worker_calls_entry(["t_1"]))
+        if tagged:
+            rec["trajectory"].append(dict(TAGGED_WORKER_ENTRY))
+        if gap:
+            rec["trajectory"].append(worker_trajectory.gap_entry(["session store for cluster-a: locked"]))
+        rec["verification_report"] = [
+            e for e in rec["verification_report"] if e.get("name") != BLIND_CHECK
+        ] + [_failed_entry(WORKER_CALLS_CHECK), _failed_entry(WORKER_ONLY_CHECK)]
+        rec["scores"]["VerificationCorrectness"] = 1 / 3
+
+    return inject_run(mutate=mutate)
+
+
+def test_the_worker_calls_set_holds_only_workers_scope_tool_called(worker_calls_spec):
+    assert worker_calls_spec.worker_calls_checks == {WORKER_CALLS_CHECK}
+    assert worker_calls_spec.worker_blind_checks == {WORKER_CALLS_CHECK, WORKER_ONLY_CHECK}
+
+
+_WORKERS_CALL = {"type": "tool_called", "tool_names": ["kanban_complete"], "scope": "workers"}
+
+
+@pytest.mark.parametrize(
+    "check, graded",
+    [
+        (_WORKERS_CALL, True),
+        ({"type": "all", "checks": [_WORKERS_CALL, dict(_WORKERS_CALL, tool_names=["kanban_block"])]}, True),
+        (dict(_WORKERS_CALL, result="spilled"), False),
+        (dict(_WORKERS_CALL, scope="all"), False),
+        ({"type": "all", "checks": [_WORKERS_CALL, {"type": "worker_commands", "required_patterns": ["kubectl"]}]}, False),
+    ],
+    ids=["workers-leaf", "workers-compound", "result-pattern", "all-scope", "mixed-compound"],
+)
+def test_the_worker_calls_set_holds_a_check_only_when_every_leaf_qualifies(write_task, check, graded):
+    """A worker-reading check joins ``worker_calls_checks`` only when every
+    leaf is a workers-scope ``tool_called`` with no ``result`` pattern, the
+    leaves the verifier also grades on the entry, so both transports agree."""
+    spec = load_case(
+        write_task(
+            "worker-calls-membership",
+            {
+                "id": "worker-calls-membership",
+                "name": "Worker calls membership",
+                "verification_spec": [
+                    {
+                        "name": ANSWER_CHECK,
+                        "role": "objective",
+                        "check": {"type": "report_contains", "required_phrases": ["seeded"]},
+                    },
+                    {"name": WORKER_CALLS_CHECK, "role": "objective", "check": check},
+                ],
+            },
+        )
+    )
+    assert WORKER_CALLS_CHECK in spec.worker_blind_checks
+    assert (WORKER_CALLS_CHECK in spec.worker_calls_checks) == graded
+
+
+def test_a_workers_calls_check_grades_when_the_cards_closed_with_no_worker_call(worker_calls_spec, inject_run):
+    """#5371: the harness writes ``worker_trajectory.NO_WORKER_CALLS_ENTRY``
+    when every awaited card was closed and a clean capture holds no worker
+    entry. A check that reads only the workers' calls grades that as zero
+    calls, so the run fails; a check that reads their commands has nothing to
+    read and stays set aside."""
+    rep = classify_rep(worker_calls_spec, _worker_calls_run(inject_run), 1)
+    assert rep.not_applicable_checks == [WORKER_ONLY_CHECK], rep.reason
+    assert rep.outcome == "fail"
+    assert {f.split(":")[0] for f in rep.failed_checks} == {WORKER_CALLS_CHECK}
+    assert worker_trajectory.NO_WORKER_CALLS_ENTRY in HARNESS_WRITTEN_ENTRIES
+
+
+def test_a_capture_gap_still_sets_the_worker_checks_aside_beside_the_no_calls_entry(worker_calls_spec, inject_run):
+    """A gap entry means the read was incomplete, so the set-aside holds even
+    with a no-worker-calls entry on the record."""
+    rep = classify_rep(worker_calls_spec, _worker_calls_run(inject_run, gap=True), 1)
+    assert rep.not_applicable_checks == [WORKER_CALLS_CHECK, WORKER_ONLY_CHECK]
+    assert rep.outcome == "pass"
+
+
+def test_the_no_calls_entry_does_not_change_a_record_that_carries_the_workers(worker_calls_spec, inject_run):
+    """With a tagged worker entry the record carries the workers, as before."""
+    rep = classify_rep(worker_calls_spec, _worker_calls_run(inject_run, tagged=True), 1)
+    assert rep.not_applicable_checks == [], rep.reason
+    assert {f.split(":")[0] for f in rep.failed_checks} == {WORKER_CALLS_CHECK, WORKER_ONLY_CHECK}
+
+
+def test_the_worker_lane_case_stays_set_aside_on_the_no_calls_entry(worker_lane_spec, inject_run):
+    """No entry there reads only the workers' calls, so all stay set aside."""
+    rep = classify_rep(worker_lane_spec, _worker_lane_run(inject_run, workers=False, no_calls=True), 1)
+    assert rep.not_applicable_checks == [WORKER_ONLY_CHECK, WORKER_AND_ROUTER_CHECK, *WORKER_UNTRACED_CHECKS]
+    assert rep.outcome == "pass"
 
 
 def test_a_worker_check_that_reads_the_router_stays_set_aside_on_a_lossy_trace(

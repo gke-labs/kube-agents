@@ -2,7 +2,7 @@
   {
     "expected": 0,
     "carrier": "notify",
-    "text": "⚙️ reading pod state in seeded-a · step 2 ▸\n  ✓ found it on seeded-a\n  ◌ reading pod state in seeded-a",
+    "text": "⚙️ reading pod state in seeded-a · step 2 ▸\n  ✓ found it on seeded-a",
     "widgets": null
   }
 ]

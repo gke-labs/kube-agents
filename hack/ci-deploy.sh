@@ -460,6 +460,10 @@ readonly MODE_NEXT_HELM_TIMEOUT="600s"
 readonly MODE_NEXT_GENERATION_ATTEMPTS=60
 readonly MODE_NEXT_POLL_SECONDS=5
 readonly MODE_NEXT_ROLLOUT_TIMEOUT="600s"
+# The bus's servers past its quorum: each waits Pending for a node of its own
+# (the operator's hostname spread), and on Autopilot that node is a scale-up
+# that can take longer than one rollout budget (gate_mode_next_bus).
+readonly MODE_NEXT_BUS_FULL_TIMEOUT="900s"
 # The inject door: one name for its Service, token Secret, principal map and
 # NetworkPolicy, and the key the token sits under (a2aInjectName,
 # a2aInjectTokenKey). hack/ci-eval-pr.sh reads the same Secret for the
@@ -940,6 +944,26 @@ fi
 # Anyone flipping MODEL_DEFAULT_NAME: ci-eval-pr.sh stamps records with its
 # own AGENT_MODEL_OVERRIDE, so flip both or the eval version key names a
 # model the install is not serving.
+# --- agent model required in a Prow job: begin
+# In a Prow job (JOB_NAME is set by Prow and by nothing else, as the flag
+# guard below says) the lane's config sets all three, read from the build
+# cluster's eval-model Secret, and this public script names none: a job that
+# arrives without them stops here, before the image build and the Helm
+# install, instead of deploying the local default below, a model nobody
+# chose. AGENT_MODEL_OVERRIDE is hack/ci-eval-pr.sh's, checked here too so
+# the lease is not spent on a deploy whose records would stamp the default.
+# A local run keeps the defaults.
+if [ -n "${JOB_NAME:-}" ]; then
+  for required_model_var in MODEL_PROVIDER MODEL_DEFAULT_NAME AGENT_MODEL_OVERRIDE; do
+    if [ -z "${!required_model_var:-}" ]; then
+      # Two lines: the CI health digest quotes the FATAL line cut at 200 characters.
+      echo "FATAL: ${required_model_var} is unset or empty; a Prow job sets it from the build cluster's eval-model Secret (docs/ci-pool-projects.md 5.10)." >&2
+      echo "The lane's config in oss-test-infra reads the Secret; this repository's scripts default the model only outside Prow." >&2
+      exit 1
+    fi
+  done
+fi
+# --- agent model required in a Prow job: end
 export MODEL_PROVIDER="${MODEL_PROVIDER:-vertex_ai}"
 # --- agent key: begin
 # Sets AGENT_GEMINI_API_KEY, the key the agent's credentials secret carries.
@@ -2335,6 +2359,59 @@ gate_mode_next_rollout() {
   echo "✓ ${workload} rolled out $((gate_start - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the mode switch"
 }
 
+# Waits for the A2A bus, then for the rest of its servers; on failure
+# describes it, dumps the stack and stops the deploy. A multi-server bus
+# serves once a quorum of its servers (two of three) is Ready, and each
+# server waits Pending for a node of its own (the operator's hostname spread
+# is DoNotSchedule, so two servers never share a node): on Autopilot every
+# further server waits on a node scale-up, which can outlast one rollout
+# budget. So the bus passes at a quorum within MODE_NEXT_ROLLOUT_TIMEOUT, and
+# the remaining servers get MODE_NEXT_BUS_FULL_TIMEOUT more. Meanwhile the
+# PlatformAgent's Ready message names each server that is not Ready and the
+# scheduler's reason (a2aNATSShortNote), which the dump prints on failure.
+gate_mode_next_bus() {
+  local workload="$1"
+  local gate_start=$SECONDS want ready quorum deadline
+  for _ in $(seq 1 "${MODE_NEXT_GENERATION_ATTEMPTS}"); do
+    kubectl get "${workload}" -n "${NAMESPACE}" >/dev/null 2>&1 && break
+    sleep "${MODE_NEXT_POLL_SECONDS}"
+  done
+  want="$(kubectl get "${workload}" -n "${NAMESPACE}" -o jsonpath='{.spec.replicas}' 2>/dev/null)" || want=""
+  want="${want:-1}"
+  quorum=$(( want / 2 + 1 ))
+  deadline=$(( gate_start + ${MODE_NEXT_ROLLOUT_TIMEOUT%s} ))
+  while :; do
+    # A read the API drops is one more poll, not the end of the deploy.
+    ready="$(kubectl get "${workload}" -n "${NAMESPACE}" -o jsonpath='{.status.readyReplicas}' 2>/dev/null)" || ready=""
+    ready="${ready:-0}"
+    [ "${ready}" -ge "${quorum}" ] && break
+    if [ "${SECONDS}" -ge "${deadline}" ]; then
+      echo "ERROR: ${workload} has ${ready} of ${want} servers Ready, short of its quorum of ${quorum}, after ${MODE_NEXT_ROLLOUT_TIMEOUT} under mode: next"
+      kubectl describe "${workload}" -n "${NAMESPACE}" || true
+      dump_mode_next_state
+      exit 1
+    fi
+    sleep "${MODE_NEXT_POLL_SECONDS}"
+  done
+  echo "✓ ${workload} serving on ${ready} of ${want} servers (quorum ${quorum}) $((gate_start - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the mode switch"
+  if [ "${ready}" -lt "${want}" ]; then
+    deadline=$(( SECONDS + ${MODE_NEXT_BUS_FULL_TIMEOUT%s} ))
+    while :; do
+      ready="$(kubectl get "${workload}" -n "${NAMESPACE}" -o jsonpath='{.status.readyReplicas}' 2>/dev/null)" || ready=""
+      ready="${ready:-0}"
+      [ "${ready}" -ge "${want}" ] && break
+      if [ "${SECONDS}" -ge "${deadline}" ]; then
+        echo "ERROR: ${workload} still has ${ready} of ${want} servers Ready ${MODE_NEXT_BUS_FULL_TIMEOUT} after reaching its quorum under mode: next; the PlatformAgent's Ready message names the missing server and why"
+        kubectl describe "${workload}" -n "${NAMESPACE}" || true
+        dump_mode_next_state
+        exit 1
+      fi
+      sleep "${MODE_NEXT_POLL_SECONDS}"
+    done
+  fi
+  echo "✓ ${workload} rolled out: ${want} of ${want} servers Ready $((SECONDS - MODE_NEXT_START))s after the mode switch"
+}
+
 # Waits for the agent Deployment's generation to move past the one given,
 # which is the operator having reconciled the CR patch named; stops the deploy
 # if it never does. Prints the new generation.
@@ -2644,7 +2721,7 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   kubectl get configmap "${PLATFORM_AGENT_CR_NAME}-config" -n "${NAMESPACE}" -o jsonpath='{.data.managed\.env}' || true
   echo
 
-  gate_mode_next_rollout "statefulset/${PLATFORM_AGENT_CR_NAME}-a2a-nats"
+  gate_mode_next_bus "statefulset/${PLATFORM_AGENT_CR_NAME}-a2a-nats"
   gate_mode_next_rollout "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-callout"
 
   # The one run, against a bus with no streams. Its budget already counts
