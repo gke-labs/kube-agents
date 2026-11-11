@@ -105,3 +105,65 @@ class TestCaseDocument:
         assert rc == 2
         assert doc is None
         assert REASONING_EFFORT_ENV in capsys.readouterr().err
+
+
+#: A complete version key, the shape `bench-gate record` files a line under.
+RECORD_KEY = {
+    "setup_id": "gemini-3-1-pro-preview-kubeagents-mcp",
+    "scoring_version": "v1",
+    "judge_model": JUDGE,
+    "fleet": 1,
+    "verifiers": 1,
+}
+
+
+def _store(tmp_path: Path) -> Path:
+    root = tmp_path / "baselines"
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "VERSIONS.json").write_text(json.dumps({"fleet": 1, "verifiers": 1}), encoding="utf-8")
+    return root
+
+
+def _green_case_file(tmp_path: Path, name: str) -> Path:
+    doc = {
+        "case": name, "name": name, "domain": "obtainability",
+        "rung": 7, "rung_name": "GREEN", "blocking": False, "reason": "passed",
+        "admitted": True, "expected_fail": False,
+        "passes": 1, "scored": 1, "pass_rate": 1.0,
+        "version_key": RECORD_KEY, "reps": [{"outcome": "pass"}],
+    }
+    path = tmp_path / f"case-{name}.json"
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    return path
+
+
+class TestRecordRefusal:
+    """A run at a named effort never appends: the fourth refusal inside
+    `bench-gate record`, beside PULL_NUMBER, RC_COMMIT_SHA and the rollback lane."""
+
+    @pytest.fixture(autouse=True)
+    def _clean(self, monkeypatch):
+        for name in ("PULL_NUMBER", "RC_COMMIT_SHA", "EVAL_ROLLBACK_LANE", "EVAL_BASELINE_STORE", REASONING_EFFORT_ENV):
+            monkeypatch.delenv(name, raising=False)
+
+    def test_a_named_effort_is_refused_and_writes_nothing(self, tmp_path, monkeypatch, capsys) -> None:
+        monkeypatch.setenv(REASONING_EFFORT_ENV, "low")
+        store = _store(tmp_path)
+        rc = main(["record", "--baseline-dir", str(store), "--case-result", str(_green_case_file(tmp_path, "a"))])
+        assert rc == 2
+        assert "default-effort window" in capsys.readouterr().err
+        assert list(store.glob("*.jsonl")) == []
+
+    def test_an_empty_effort_records_as_before(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setenv(REASONING_EFFORT_ENV, "")
+        store = _store(tmp_path)
+        rc = main(["record", "--baseline-dir", str(store), "--case-result", str(_green_case_file(tmp_path, "a"))])
+        assert rc == 0
+        assert (store / "a.jsonl").is_file()
+
+    def test_force_is_the_escape_hatch(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setenv(REASONING_EFFORT_ENV, "high")
+        store = _store(tmp_path)
+        rc = main(["record", "--baseline-dir", str(store), "--case-result", str(_green_case_file(tmp_path, "a")), "--force"])
+        assert rc == 0
+        assert (store / "a.jsonl").is_file()

@@ -1118,6 +1118,19 @@ def _cmd_record(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    if (os.environ.get(REASONING_EFFORT_ENV) or "").strip() and not args.force:
+        # Fourth way in, mirrored from the same decision: a run at a named
+        # reasoning effort would file its lines under the default-effort key,
+        # because the version key carries no effort. The effort in the key is
+        # a later change; until then such a run reads the store and never
+        # writes it.
+        print(
+            f"::error::refusing to record a baseline with {REASONING_EFFORT_ENV}="
+            f"{os.environ[REASONING_EFFORT_ENV]}: the version key carries no "
+            "reasoning effort, so the lines would pool with the default-effort window",
+            file=sys.stderr,
+        )
+        return 2
 
     cases = _read_case_results(args.case_result)
     if isinstance(cases, str):
