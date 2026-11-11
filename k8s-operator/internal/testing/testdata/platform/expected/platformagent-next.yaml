@@ -3393,6 +3393,9 @@ stringData:
     server_name: platformagent-a2a-nats
     port: 4222
     http: 8222
+    # For the reloader in the same pod, which signals this PID when the mounted
+    # config changes.
+    pid_file: "/var/run/nats/nats.pid"
 
     # TLS on the client listener, required of every connection: the server
     # advertises tls_required, so a client that dials nats:// is told to upgrade
@@ -3422,8 +3425,8 @@ stringData:
     # the console server is encrypted and verified against the bus CA. The
     # Service is ClusterIP, so nothing OUTSIDE the cluster reaches this listener.
     # An ingress NetworkPolicy fences the pod network too: 4222 from the
-    # enumerated bus clients, 9222 from the console server alone, and no
-    # pod-network peer for 8222. The console server is admitted because it is the
+    # enumerated bus clients, 9222 from the console server alone, and 8222 from
+    # the operator's pod alone. The console server is admitted because it is the
     # page's proxy. A browser reaches it through a kubectl port-forward and it
     # forwards the websocket here over wss, with the browser's headers intact. It
     # is not an in-cluster door for anything else. A port-forward straight to
@@ -4150,13 +4153,51 @@ spec:
               readOnly: true
             - mountPath: /data
               name: data
+            - mountPath: /var/run/nats
+              name: nats-pid
+        - args:
+            - -pid
+            - /var/run/nats/nats.pid
+            - -config
+            - /etc/nats/nats.conf
+          image: natsio/nats-server-config-reloader:0.25.0@sha256:24bacde6b844f8875f93424ed153d33b3d9e9367fcccc14b683eb71fab3a4d8c
+          name: reloader
+          resources:
+            limits:
+              cpu: 50m
+              ephemeral-storage: 64Mi
+              memory: 32Mi
+            requests:
+              cpu: 10m
+              ephemeral-storage: 64Mi
+              memory: 16Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - mountPath: /etc/nats
+              name: config
+              readOnly: true
+            - mountPath: /etc/nats-tls
+              name: tls
+              readOnly: true
+            - mountPath: /var/run/nats
+              name: nats-pid
+              readOnly: true
       securityContext:
         fsGroup: 1000
         runAsNonRoot: true
         runAsUser: 1000
         seccompProfile:
           type: RuntimeDefault
+      shareProcessNamespace: true
       volumes:
+        - emptyDir:
+            sizeLimit: 1Mi
+          name: nats-pid
         - name: config
           secret:
             secretName: platformagent-a2a-nats-config
