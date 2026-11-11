@@ -132,7 +132,7 @@ func TestSyncingAProfilesDurablesDropsATiersQueue(t *testing.T) {
 	})
 	sync := func(want []profileDurable) {
 		t.Helper()
-		if err := syncDurables(ctx, js, "tse", want); err != nil {
+		if err := syncDurables(ctx, js, "tse", want, a2aBuiltinTierNames); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -160,7 +160,7 @@ func TestSyncingAProfilesDurablesDropsATiersQueue(t *testing.T) {
 }
 
 // A durable of a tier that is neither read nor unattended (a Tier resource,
-// since deleted or dropped) is found by listing and removed, while another
+// since deleted or dropped) is found by name from the probe tiers and removed, while another
 // profile's durables, including one whose name shares a prefix, and a durable
 // the operator didn't make, are left alone (#3659).
 func TestADroppedCustomTiersDurablesAreFoundAndOthersLeftAlone(t *testing.T) {
@@ -168,10 +168,11 @@ func TestADroppedCustomTiersDurablesAreFoundAndOthersLeftAlone(t *testing.T) {
 	ctx := context.Background()
 	nightly := testAgentProfile("ns", "tse", func(p *agentv1alpha1.AgentProfile) { p.Spec.AllowedTiers = []string{"read", "nightly"} })
 	neighbour := testAgentProfile("ns", "tse-b", func(p *agentv1alpha1.AgentProfile) { p.Spec.AllowedTiers = []string{"read"} })
-	if err := syncDurables(ctx, js, "tse", desiredProfileDurables(&nightly)); err != nil {
+	probe := []string{"read", "nightly"}
+	if err := syncDurables(ctx, js, "tse", desiredProfileDurables(&nightly), probe); err != nil {
 		t.Fatal(err)
 	}
-	if err := syncDurables(ctx, js, "tse-b", desiredProfileDurables(&neighbour)); err != nil {
+	if err := syncDurables(ctx, js, "tse-b", desiredProfileDurables(&neighbour), probe); err != nil {
 		t.Fatal(err)
 	}
 	// A consumer under this profile's name pattern that the operator didn't make.
@@ -181,7 +182,7 @@ func TestADroppedCustomTiersDurablesAreFoundAndOthersLeftAlone(t *testing.T) {
 		t.Fatal(err)
 	}
 	readOnly := testAgentProfile("ns", "tse")
-	if err := syncDurables(ctx, js, "tse", desiredProfileDurables(&readOnly)); err != nil {
+	if err := syncDurables(ctx, js, "tse", desiredProfileDurables(&readOnly), probe); err != nil {
 		t.Fatal(err)
 	}
 	exists := func(name string) bool { _, err := js.Consumer(ctx, a2aProfileSubmitStream, name); return err == nil }
@@ -274,7 +275,7 @@ func TestATierSwapFitsOnAFullStream(t *testing.T) {
 	if _, err := js.CreateStream(ctx, jetstream.StreamConfig{Name: a2aProfileSubmitStream, Subjects: []string{a2aProfileSubmitPrefix + ">"}, MaxConsumers: 2}); err != nil {
 		t.Fatal(err)
 	}
-	sync := func(want []profileDurable) error { return syncDurables(ctx, js, "tse", want) }
+	sync := func(want []profileDurable) error { return syncDurables(ctx, js, "tse", want, a2aBuiltinTierNames) }
 	read := testAgentProfile("ns", "tse")
 	if err := sync(desiredProfileDurables(&read)); err != nil {
 		t.Fatalf("read tier: %v", err)
@@ -314,4 +315,77 @@ func TestRenderedHeldDurableFixture(t *testing.T) {
 		t.Fatal(err)
 	}
 	checkFixture(t, heldDurableFixturePath, string(body)+"\n")
+}
+
+var a2aBuiltinTierNames = []string{agentv1alpha1.AgentProfileTierRead, agentv1alpha1.AgentProfileTierUnattended}
+
+// The operator's durable sync works under the operator's own bus grants
+// (operatorIdentity, with a dispatcher): consumer create, info and delete on
+// PROFILE_SUBMITS and nothing more. A sync that listed the stream's consumers
+// (stream info, consumer names) was refused on a live install and held every
+// profile's card and finalizer (#3659, 2b-i's live run).
+func TestTheDurableSyncNeedsOnlyTheOperatorsGrants(t *testing.T) {
+	withOperatorBusPrincipal(t)
+	t.Setenv(a2aDispatcherImageEnvVar, "dispatcher:test")
+	id, ok := operatorIdentity()
+	if !ok {
+		t.Fatal("no operator identity")
+	}
+	s, err := natsserver.NewServer(&natsserver.Options{Port: -1, JetStream: true, StoreDir: t.TempDir(),
+		Users: []*natsserver.User{
+			{Username: "admin", Password: "admin"},
+			{Username: "operator", Password: "operator", Permissions: &natsserver.Permissions{
+				Publish:   &natsserver.SubjectPermission{Allow: id.publish},
+				Subscribe: &natsserver.SubjectPermission{Allow: []string{"_INBOX.>"}},
+			}},
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go s.Start()
+	if !s.ReadyForConnections(5 * time.Second) {
+		t.Fatal("nats-server not ready")
+	}
+	t.Cleanup(s.Shutdown)
+	ctx := context.Background()
+	admin, err := nats.Connect(s.ClientURL(), nats.UserInfo("admin", "admin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(admin.Close)
+	ajs, _ := jetstream.New(admin)
+	if _, err := ajs.CreateStream(ctx, jetstream.StreamConfig{Name: a2aProfileSubmitStream, Subjects: []string{a2aProfileSubmitPrefix + ">"}}); err != nil {
+		t.Fatal(err)
+	}
+	op, err := nats.Connect(s.ClientURL(), nats.UserInfo("operator", "operator"), nats.CustomInboxPrefix("_INBOX."+a2aOperatorBusUser))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(op.Close)
+	ojs, _ := jetstream.New(op)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	// The grants refuse a list, which is what the live install hit: the
+	// sync below must not need one.
+	probeCtx, probeCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	_, err = ojs.Stream(probeCtx, a2aProfileSubmitStream)
+	probeCancel()
+	if err == nil {
+		t.Fatal("the operator's grants allow stream info; this test no longer guards the list")
+	}
+	nightly := testAgentProfile("ns", "tse", func(p *agentv1alpha1.AgentProfile) { p.Spec.AllowedTiers = []string{"read", "nightly"} })
+	probe := []string{"read", "unattended", "nightly"}
+	if err := syncDurables(ctx, ojs, "tse", desiredProfileDurables(&nightly), probe); err != nil {
+		t.Fatalf("create under the operator's grants: %v", err)
+	}
+	readOnly := testAgentProfile("ns", "tse")
+	if err := syncDurables(ctx, ojs, "tse", desiredProfileDurables(&readOnly), probe); err != nil {
+		t.Fatalf("drop a tier under the operator's grants: %v", err)
+	}
+	if _, err := ajs.Consumer(ctx, a2aProfileSubmitStream, "profile-tse-nightly-top"); err == nil {
+		t.Error("the dropped tier's durable survived")
+	}
+	if err := syncDurables(ctx, ojs, "tse", nil, probe); err != nil {
+		t.Fatalf("withdraw under the operator's grants: %v", err)
+	}
 }

@@ -400,7 +400,11 @@ func (r *AgentProfileReconciler) publishCard(ctx context.Context, agent *agentv1
 	// one per (rendered or draining tier, kind), and a dropped tier's
 	// deleted once its drain ends.
 	if a2aDispatcherEnabled() {
-		if err := r.cards().SyncDurables(ctx, agent, p.Name, desiredProfileDurables(p)); err != nil {
+		probe, err := r.durableProbeTiers(ctx, agent, p)
+		if err != nil {
+			return reasonAgentProfileBusError, "the agent card is published, but its durables are not: " + err.Error(), err
+		}
+		if err := r.cards().SyncDurables(ctx, agent, p.Name, desiredProfileDurables(p), probe); err != nil {
 			// Drop the connection: callout grants are fixed when it opens,
 			// and one opened before the callout served the map that grants
 			// the operator its durables would be refused forever. The retry
@@ -436,12 +440,57 @@ func (r *AgentProfileReconciler) withdrawCard(ctx context.Context, agent *agentv
 	// A profile with no identity has no queue: its durables go with its
 	// card, held submissions and all. Only the ones this operator made.
 	if a2aDispatcherEnabled() {
-		if err := r.cards().SyncDurables(ctx, agent, p.Name, nil); err != nil {
+		probe, err := r.durableProbeTiers(ctx, agent, p)
+		if err != nil {
+			return reasonAgentProfileBusError, "the card is withdrawn, but the durables are not deleted: " + err.Error(), err
+		}
+		if err := r.cards().SyncDurables(ctx, agent, p.Name, nil, probe); err != nil {
 			r.forgetBus(agent.Namespace) // as in publishCard
 			return reasonAgentProfileBusError, "the card is withdrawn, but the durables are not deleted: " + err.Error(), err
 		}
 	}
 	return reasonAgentProfileIdentityMissing, "no card is published while the profile's identity is not rendered", nil
+}
+
+// durableProbeTiers is every tier p could still have a durable at, so a
+// dropped tier's durables are found by name (profileDurableNamesFor): the
+// built-ins, what p lists, what it was last rendered for (status), the tiers
+// it still has its own ServiceAccounts for, every Tier in the catalog, and
+// every tier the applied dispatch config lists for it, live or draining,
+// ended or not, so a tier whose drain has just ended, Tier deleted and
+// ServiceAccount gone with it, still has its durables found.
+// A tier that is in none of these (its Tier deleted and the profile's status
+// lost) leaves an inert durable behind: nothing routes to a tier no card
+// advertises.
+func (r *AgentProfileReconciler) durableProbeTiers(ctx context.Context, agent *agentv1alpha1.PlatformAgent, p *agentv1alpha1.AgentProfile) ([]string, error) {
+	cat, err := loadTierCatalog(ctx, r.Client, agent.Namespace, r.TiersUnreadable)
+	if err != nil {
+		return nil, err
+	}
+	owned, err := ownedTierServiceAccounts(ctx, r.Client, p)
+	if err != nil {
+		return nil, err
+	}
+	tiers := append(append([]string(nil), p.AllowedTierList()...), p.Spec.AllowedTiers...)
+	tiers = append(tiers, p.Status.RenderedTiers...)
+	for tier := range owned {
+		tiers = append(tiers, tier)
+	}
+	for tier := range cat {
+		tiers = append(tiers, tier)
+	}
+	applied, err := appliedDispatchProfiles(ctx, r.Client, agent)
+	if err != nil {
+		return nil, err
+	}
+	if prev, ok := applied[p.Name]; ok {
+		tiers = append(tiers, prev.Tiers...)
+		for _, d := range prev.DrainingTiers {
+			tiers = append(tiers, d.Tier)
+		}
+	}
+	slices.Sort(tiers)
+	return slices.Compact(tiers), nil
 }
 
 // errForeignServiceAccount is ensureServiceAccount's refusal: a ServiceAccount
