@@ -4,8 +4,8 @@ The exemption reads a row as shell words and removes only the pattern argument
 of a row that is one grep and nothing else. These pin the plain mentions it
 exempts, the rows from the regex exemption's review rounds that stay graded,
 and each shape it refuses: a pipe, a later command, a redirect other than
-``>`` to /dev/null, a comment, a substitution in the removed word, and a
-collapsed chain.
+``>`` to /dev/null, a comment, a substitution in the removed word, a
+collapsed chain, and a row that can read the removed pattern back (#5331).
 """
 
 from __future__ import annotations
@@ -158,6 +158,56 @@ def test_a_single_quoted_lookalike_of_a_substitution_is_exempt():
     for row in ("grep -rn '`inspect_repository.py open`' SKILL.md", f"grep -rn '$(echo {ROUTE})' SKILL.md"):
         passed, reason = _verdict(row)
         assert passed, reason
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        # A row that joined a typed `$_` line: `$_` reads the grep's last argument back.
+        pytest.param(f"grep -rq 'curl -s -X POST {URL}' SKILL.md $_", id="last-argument"),
+        pytest.param(f"grep -rq {URL} SKILL.md ${{_}}", id="last-argument-braced"),
+        # A pattern that assigns a variable as it expands, and a joined line that runs it.
+        pytest.param(f'grep "${{X:=curl -s -X POST {URL}}}" SKILL.md $X', id="assigning-expansion"),
+        pytest.param(f'grep "${{X=curl {URL}}}" SKILL.md', id="assigning-expansion-unset-only"),
+        pytest.param(f'grep "${{A[0]:=curl -s -X POST {URL}}}" SKILL.md $A', id="assigning-array-element"),
+        # A subscript is arithmetic and can nest brackets or braces, so any is refused.
+        pytest.param(f'grep "${{A[a[0]]:=curl {URL}}}" SKILL.md $A', id="assigning-nested-subscript"),
+        pytest.param(f'grep "${{A[${{i}}]:=curl {URL}}}" SKILL.md $A', id="assigning-braced-subscript"),
+        # `$_` spelled through an ANSI-C escape, or read through another variable.
+        pytest.param(f"grep -rq 'curl -s -X POST {URL}' eval $'\\x24_'", id="ansi-c-quote"),
+        pytest.param(f"grep -rq 'curl {URL}' ${{!x}}", id="indirect-expansion"),
+        # A quote or a backslash after `$_` ends the name in bash, then glues text on.
+        pytest.param(f"grep -rq 'curl -s -X POST {URL} -s' $_'S'", id="last-argument-quote-glued"),
+        pytest.param(f'grep -rq \'curl {URL}\' "$_"S', id="last-argument-double-quote-glued"),
+        pytest.param(f"grep -rq 'curl {URL}' $_\\S", id="last-argument-backslash-glued"),
+        # An indirect assignment, and an assignment nested in a default.
+        pytest.param(f'grep "${{!USER:=curl {URL}}}" SKILL.md $hermes', id="indirect-assignment"),
+        pytest.param(f'grep "${{X:-${{Y:=curl {URL}}}}}" SKILL.md $Y', id="assignment-in-a-default"),
+        # A line continuation inside `$'…'`, which bash removes first.
+        pytest.param(f"grep -rq {URL} SKILL.md $\\\n'\\x24_'", id="ansi-c-quote-across-a-continuation"),
+        # An arithmetic assignment is a substitution, which the exemption already refuses.
+        pytest.param(f"grep -rq $((N=1)){URL} SKILL.md", id="arithmetic-assignment"),
+    ],
+)
+def test_a_row_that_can_read_the_removed_pattern_back_is_graded_whole(row):
+    assert _without_grep_patterns(row) is None
+    passed, reason = _verdict(row)
+    assert not passed, reason
+
+
+def test_a_plain_expansion_or_a_lookalike_variable_stays_exempt():
+    # `${NAME}` and `${NAME:-…}` assign nothing, `$_dir` is another variable, and a `$`
+    # anchor before a closing quote, or `$'` inside double quotes, is no ANSI-C quote.
+    for row in (
+        f'grep -rn "${{HOME}}{ROUTE}" SKILL.md',
+        f'grep -rn {ROUTE} "${{DIR:-.}}"',
+        f"grep -rn {ROUTE} $_dir/SKILL.md",
+        f'grep -rn {ROUTE} "${{_DIR}}"',
+        f"grep -rn '{ROUTE}$' SKILL.md",
+        f'grep -rn {ROUTE} "$\'" SKILL.md',
+    ):
+        passed, reason = _verdict(row)
+        assert passed, (row, reason)
 
 
 def test_a_run_chained_behind_an_exempt_grep_meets_the_required_run():
