@@ -59,7 +59,7 @@ const (
 	// The LiteLLM counters the banner adds up. Each has one series per
 	// model, key and team label set; every series is summed.
 	metricInputTokens  = "litellm_input_tokens_metric_total"
-	metricOutputTokens = "litellm_output_tokens_metric_total"
+	metricOutputTokens = "litellm_output_tokens_metric_total" // #nosec G101 -- a metric name, not a credential
 	metricTotalTokens  = "litellm_total_tokens_metric_total"
 	metricSpendUSD     = "litellm_spend_metric_total"
 

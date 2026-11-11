@@ -90,7 +90,7 @@ const (
 	// slackShortcutCredit names the clicker in the thread as the shortcut's
 	// task starts, so the channel sees who asked: a small line just above the
 	// bot's first reply, the clicker by their Slack name, never a mention.
-	slackShortcutCredit = "%s asked me to look at this"
+	slackShortcutCredit = "%s asked me to look at this" // #nosec G101 -- a message format, not a credential
 )
 
 // slackShortcutPlaceholderNames are the names Slack gives a conversation that
