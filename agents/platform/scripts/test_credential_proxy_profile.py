@@ -1919,6 +1919,14 @@ class ProfileVcsRouteTest(unittest.TestCase):
             with self.subTest(verb=verb):
                 self.reset()
                 status, body = self.vcs_post(verb, None)
+                if verb == credential_proxy.PROPOSAL_CLAIM_VERB:
+                    # proposal-claim burns a claim token before its route
+                    # runs, and this request presents none, so it stops at
+                    # the verb's own check: past every caller gate, which is
+                    # what this test is about.
+                    self.assertEqual(404, status, body)
+                    self.assertEqual("CLAIM_UNKNOWN", body.get("code"), body)
+                    continue
                 self.assert_ran(verb, status, body)
 
 
