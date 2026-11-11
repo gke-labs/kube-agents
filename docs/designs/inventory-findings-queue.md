@@ -959,7 +959,7 @@ card, written to `/opt/data/INVENTORY.limits.json`. `select` also writes the lis
 `/opt/data/INVENTORY.shown.json`, and `bootstrap_delivery.py` marks each of them shown, with
 publisher `first_report` and class `critical`, right after it claims delivery and before it posts.
 The items count as shown when the report's delivery is claimed, not when it is written, so a report
-that is never claimed leaves them new for the nudge; one claimed and then lost in posting does not. The claim ends the nudge's hold, so a nudge run in the
+that is never claimed leaves them new for the nudge, as does one retired unread a week after the sweep (`bootstrap_delivery._retire_undelivered` registers them and claims without marking); one claimed and then lost in posting does not. The claim ends the nudge's hold, so a nudge run in the
 moment between the claim and the marks can announce the report's items as new. Under
 `spec.mode: next`, where the report goes into the conversation the user first wrote in, the marks
 follow the post instead: a claim there can be released and retried (Rule 5 in the plugin README),
@@ -984,15 +984,17 @@ or, failing that, its mtime: a report still undelivered by then means onboarding
 holding on would add nothing ever again. Each run that is held, or would be but for that limit, says
 which on stderr. And a run that fails before it posts, a failed queue read included, exits non-zero,
 which the scheduler posts, at most once a UTC day; later failures that day go to stderr. The day's
-state (the daily part sent, the items added today, the failure reported) is a file in the platform
-profile home, written before the rows are marked. An addition whose mark fails is not announced
+state (the daily part sent, the items added today and the ids of the findings they named, the
+failure reported) is a file in the platform profile home, written before the rows are marked. An addition whose mark fails is not announced
 again that day and still counts against that day's limit, though `findings_additions` has no row
 for it. It also holds additions back as a pending item of its class would: a critical one holds
 non-criticals back, and a non-critical one stops every addition, though the stop-add notice does not
 name it. Unlike a recorded addition, it counts only while it stays undecided and under the class
 it has now: a decision on it the same day refunds its slot, and a re-score can move it between
-the two counts. It comes back as new the next day. If the state file cannot be written either,
-the additions and the daily part repeat every hour.
+the two counts. It comes back as new the next day. A finding that joins an added line later, which
+a decision can leave open, was not named: once no finding the addition named is still new, it is a
+new item of its own and holds nothing back. If the state file cannot be written either, the
+additions and the daily part repeat every hour.
 
 What this costs is the starvation §7.3 measured, brought back deliberately, from two sources. An
 ignored non-critical holds every new finding back until someone decides, and the daily notice is

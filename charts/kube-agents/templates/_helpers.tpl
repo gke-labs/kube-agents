@@ -957,6 +957,49 @@ callbacks is the formatted list of LiteLLM callbacks, built by the caller.
 {{- if and (gt $retryAfter 0) (gt (add $gatewayHoldSeconds $firstChunkAllowanceSeconds) $workerStaleSeconds) -}}
 {{- fail (printf "litellm.fallback.numRetries %d with retryAfterSeconds %d holds a rate-limited call %ds at the gateway; with %ds for the model's first chunk that crosses the agents' %ds stale-stream bound (stale_timeout_seconds), and the agent would drop the stream before it sees the 429" $numRetries $retryAfter $gatewayHoldSeconds $firstChunkAllowanceSeconds $workerStaleSeconds) -}}
 {{- end -}}
+{{- /*
+  The spend ceiling, as router_settings.provider_budget_config for the one
+  provider every alias routes to. LiteLLM's router budget limiter
+  (litellm/router_strategy/budget_limiter.py, v1.106.0) adds each response's
+  cost to a per-provider counter in the router's cache, filters the provider's
+  deployments out once the counter reaches budget_limit, and lets the counter
+  expire time_period after the window opened (at router start for the first
+  window, at the first spend after expiry for the next); its spend comes from
+  the standard logging payload, so streamed calls count, and lands when a call
+  completes, so the calls in flight when the share is crossed are charged past
+  it. Chosen over
+  litellm_settings.max_budget, which without a database counts only
+  non-streamed calls, from the completion text alone, and exports nothing.
+  The cache is in-process (the chart runs no Redis), so the ceiling is split
+  evenly across the gateway's replicas: each replica refuses on its share, so
+  the install's spend per window is bounded by .budget.usd plus the in-flight
+  calls above, and a restarted pod starts its count over. The share is
+  rendered with four decimals, always with a
+  dot, so PyYAML reads a float; a share that rounds to 0 is refused, because
+  LiteLLM treats a budget_limit of 0 as no limit. The schema's floor of 0.01
+  (shared by the installer and the Terraform example, which refuse less before
+  any apply) keeps that out of reach up to 100 replicas; this is the backstop.
+*/}}
+{{- $budget := .budget | default dict -}}
+{{- $budgetUSD := float64 ($budget.usd | default 0) -}}
+{{- $budgetPeriod := $budget.period | default "" -}}
+{{- $budgetReplicas := max (int (.replicas | default 1)) 1 -}}
+{{- $budgetPeriodPattern := `^[1-9][0-9]*(s|m|h|d|w|mo)$` -}}
+{{- $budgetShareFormat := "%.4f" -}}
+{{- $budgetShareZero := "0.0000" -}}
+{{- $budgetShare := "" -}}
+{{- if lt $budgetUSD 0.0 -}}
+{{- fail (printf "litellm.budget.usd %v is negative; 0 turns the ceiling off" $budget.usd) -}}
+{{- end -}}
+{{- if gt $budgetUSD 0.0 -}}
+{{- if not (regexMatch $budgetPeriodPattern $budgetPeriod) -}}
+{{- fail (printf "litellm.budget.period %q is not a LiteLLM duration (a whole number and s, m, h, d, w or mo, such as 1d); litellm.budget.usd %v needs one" $budgetPeriod $budget.usd) -}}
+{{- end -}}
+{{- $budgetShare = printf $budgetShareFormat (divf $budgetUSD (float64 $budgetReplicas)) -}}
+{{- if eq $budgetShare $budgetShareZero -}}
+{{- fail (printf "litellm.budget.usd %v split across %d gateway replicas is under 0.0001 USD per replica, which LiteLLM reads as no ceiling; raise the budget or lower litellm.replicaCount" $budget.usd $budgetReplicas) -}}
+{{- end -}}
+{{- end -}}
 {{- $primaries := list "model-default" "hermes-agent" .model -}}
 {{- if and $fallbackName (has $fallbackName $primaries) -}}
 {{- fail (printf "litellm.fallback.modelName %q is already a primary alias (%s); a model cannot fall back to itself" $fallbackName (join ", " $primaries)) -}}
@@ -1024,7 +1067,7 @@ litellm_settings:
   only in its anthropic overlay; see that file for why the breakpoints live
   here rather than in the agent's own config.
 */}}
-{{- if or $claude $fallbackName (gt $timeout 0) (gt $numRetries 0) (gt $retryAfter 0) }}
+{{- if or $claude $fallbackName (gt $timeout 0) (gt $numRetries 0) (gt $retryAfter 0) $budgetShare }}
 router_settings:
   {{- if $fallbackName }}
   fallbacks:
@@ -1047,6 +1090,17 @@ router_settings:
   */}}
   {{- if gt $retryAfter 0 }}
   retry_after: {{ $retryAfter }}
+  {{- end }}
+  {{- /*
+    The spend ceiling's share for this replica; see the budget block above.
+    Keyed on the provider prefix every alias carries, which is what LiteLLM
+    resolves for the deployment and records on the logging payload.
+  */}}
+  {{- if $budgetShare }}
+  provider_budget_config:
+    {{ $litellmProvider }}:
+      budget_limit: {{ $budgetShare }}
+      time_period: {{ $budgetPeriod | quote }}
   {{- end }}
   {{- if $claude }}
   default_litellm_params:
@@ -2491,6 +2545,15 @@ autopilotRequests are the requests on GKE Autopilot (credentialProxyAutopilotCPU
 credentialProxyAutopilotMemoryRequest), where the limits are clamped to the requests and only
 the request buys CPU; the quota preflight counts them where kube-agents.gkeAutopilot holds.
 */}}
+{{- /*
+kube-agents.credentialProxyExecReplicas is
+platformAgent.deployment.credentialProxy.exec.replicas, 0 when unset: the exec
+tier's replica count, which gates the tier's scrape objects and its quota term.
+*/}}
+{{- define "kube-agents.credentialProxyExecReplicas" -}}
+{{- dig "exec" "replicas" 0 (.Values.platformAgent.deployment.credentialProxy | default dict) | int -}}
+{{- end -}}
+
 {{- define "kube-agents.credentialProxyDefaults" -}}
 {{- dict
       "requests" (dict "cpu" "500m" "memory" "1Gi")
@@ -3131,6 +3194,44 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
     {{- end -}}
   {{- end -}}
 
+  {{- /* The credential broker's exec tier: one replica's worth from the footprint
+         (operatorRenderedPerReplica, read from the operator's one-replica golden),
+         times platformAgent.deployment.credentialProxy.exec.replicas. Outside the loop
+         above, which sums each operatorRendered entry once. A positive count with no
+         entry fails rather than counting the tier as zero. Its cpu and memory are
+         fixed, but the operator gives the tier the broker's other resource keys, so
+         an ephemeral-storage override on the broker moves each replica too: merged
+         as kube-agents.credentialProxyFootprint does, keeping the entry's cpu and
+         memory. No surge term: the tier rolls with maxSurge 0 and maxUnavailable 1, so
+         a rollout replaces a pod in place and adds none. This
+         counts the quota only; whether the nodes have room for a 2 CPU pod is the
+         scheduler's, which this cannot see. */ -}}
+  {{- $execReplicas := include "kube-agents.credentialProxyExecReplicas" . | int64 -}}
+  {{- if gt $execReplicas 0 -}}
+    {{- $exec := index ((index $footprint "operatorRenderedPerReplica") | default dict) "credentialProxyExecTier" | default dict -}}
+    {{- if not $exec -}}
+      {{- fail "quota preflight: platformAgent.deployment.credentialProxy.exec.replicas is set, but footprint.yaml has no operatorRenderedPerReplica.credentialProxyExecTier entry to size it. Reinstall from an intact chart, or set quotaPreflight.enabled=false to skip the check." -}}
+    {{- end -}}
+    {{- if $proxyOverride -}}
+      {{- /* Refused or merged against the sizing tier's row, as the broker's check is above;
+             only the ephemeral-storage figures are taken from it. */ -}}
+      {{- $execSized := include "kube-agents.sizingTierFootprintEntry" (dict "workload" $exec "tier" $sizingTier "container" "credentialProxy") | fromJson -}}
+      {{- $merged := include "kube-agents.credentialProxyFootprint" (dict "workload" $execSized "override" $proxyOverride "tier" $sizingTier) | fromJson -}}
+      {{- $exec = dict
+            "cpuMillisRequest" $exec.cpuMillisRequest "cpuMillisLimit" $exec.cpuMillisLimit
+            "memoryBytesRequest" $exec.memoryBytesRequest "memoryBytesLimit" $exec.memoryBytesLimit
+            "ephemeralStorageBytesRequest" $merged.ephemeralStorageBytesRequest
+            "ephemeralStorageBytesLimit" $merged.ephemeralStorageBytesLimit
+            "pods" $exec.pods -}}
+    {{- end -}}
+    {{- $reqPods = include "kube-agents.satAdd" (dict "a" $reqPods "b" (include "kube-agents.satMul" (dict "a" ($exec.pods | default 1 | int64) "b" $execReplicas))) | int64 -}}
+    {{- $reqCpu = include "kube-agents.satAdd" (dict "a" $reqCpu "b" (include "kube-agents.satMul" (dict "a" ($exec.cpuMillisRequest | default 0 | int64) "b" $execReplicas))) | int64 -}}
+    {{- $limCpu = include "kube-agents.satAdd" (dict "a" $limCpu "b" (include "kube-agents.satMul" (dict "a" ($exec.cpuMillisLimit | default 0 | int64) "b" $execReplicas))) | int64 -}}
+    {{- $reqMem = include "kube-agents.satAdd" (dict "a" $reqMem "b" (include "kube-agents.satMul" (dict "a" ($exec.memoryBytesRequest | default 0 | int64) "b" $execReplicas))) | int64 -}}
+    {{- $limMem = include "kube-agents.satAdd" (dict "a" $limMem "b" (include "kube-agents.satMul" (dict "a" ($exec.memoryBytesLimit | default 0 | int64) "b" $execReplicas))) | int64 -}}
+    {{- $reqEph = include "kube-agents.satAdd" (dict "a" $reqEph "b" (include "kube-agents.satMul" (dict "a" ($exec.ephemeralStorageBytesRequest | default 0 | int64) "b" $execReplicas))) | int64 -}}
+    {{- $limEph = include "kube-agents.satAdd" (dict "a" $limEph "b" (include "kube-agents.satMul" (dict "a" ($exec.ephemeralStorageBytesLimit | default 0 | int64) "b" $execReplicas))) | int64 -}}
+  {{- end -}}
   {{- /* Next mode's own workloads: NATS, the auth callouts, the verifiers, the console,
          the A2A gateway and the provisioning Job, each a total over its replicas, plus the
          JetStream claim. None has a sizing override in the chart. An entry marked `surges`

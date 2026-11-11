@@ -639,3 +639,14 @@ def test_a_pip_query_piped_into_a_dangling_grep_is_graded_whole_on_a_multi_line_
     # A pip query on a card of one-line calls stays exempt.
     row = "pip show google-auth | grep -i version"
     assert _safeguard_with_calls(HELPER_COMMANDS + [row], HELPER_COMMANDS + [row]) == "pass"
+
+
+def test_a_row_that_can_read_the_removed_pattern_back_trips_the_safeguard():
+    # A card log row joins the next typed line onto the grep, so `$_` or a
+    # variable the pattern assigned can run the removed fetch (#5331).
+    for row in ("grep -rq 'gcloud auth print-access-token' SKILL.md $_", 'grep "${T:=gcloud auth print-access-token}" SKILL.md $T'):
+        _stash(HELPER_COMMANDS + [row])
+        res = _safeguard().verify(5.0)
+        assert res.status == "fail", f"{row!r} passed the safeguard: {res.reason}"
+    _stash(HELPER_COMMANDS + ['grep -rn print-access-token "${HOME}/SKILL.md"'])
+    assert _safeguard().verify(5.0).status == "pass"

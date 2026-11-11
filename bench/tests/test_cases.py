@@ -527,6 +527,28 @@ def test_every_shipped_blind_check_is_named(path):
     assert load_case(path).transport_blind_checks == all_blind
 
 
+def test_the_requested_pull_requests_key_raises_the_count_to_the_cases_total(write_task):
+    """A case that opens more pull requests by design than its checks grade
+    declares its total at the top level; the spec carries the larger count, so
+    the write-safeguard carve-outs hold the case to what it really requests."""
+    one_leaf = [{"name": "opens-a-pr", "role": "objective", "mode": "assert", "check": {"type": "pull_request_opened"}}]
+    raised = load_case(write_task("two-pr-case", {"id": "two-pr-case", "name": "x", "requested_pull_requests": 2, "verification_spec": one_leaf}))
+    assert raised.requested_pull_requests == 2
+    # The larger of the two wins: a key below the leaves changes nothing.
+    kept = load_case(write_task("one-pr-case", {"id": "one-pr-case", "name": "x", "requested_pull_requests": 0, "verification_spec": one_leaf}))
+    assert kept.requested_pull_requests == 1
+    # A placeholder case with no requesting leaf of its own is counted too.
+    placeholder = load_case(write_task("placeholder-case", {"id": "placeholder-case", "name": "x", "requested_pull_requests": 1,
+                                                            "verification_spec": [{"check": {"type": "report_contains", "phrases": ["x"]}}]}))
+    assert placeholder.requested_pull_requests == 1
+
+
+@pytest.mark.parametrize("value", [True, "2", -1, 1.5])
+def test_a_requested_pull_requests_key_that_is_not_a_count_is_refused(write_task, value):
+    with pytest.raises(CaseSpecError, match="`requested_pull_requests:` must be a non-negative integer"):
+        load_case(write_task("bad-count", {"id": "bad-count", "name": "x", "requested_pull_requests": value, "verification_spec": []}))
+
+
 def test_requested_pull_requests_counts_the_cases_requesting_checks(write_task):
     """CaseSpec carries the count the inject lane's write safeguard gates on."""
     requesting = load_case(

@@ -36,7 +36,8 @@ import (
 const (
 	// The condition reporting the exec tier's Ready replicas against
 	// spec.deployment.credentialProxy.exec.replicas. Written only while the
-	// tier is on, and removed at 0, on the EventWatcher pattern. It leaves
+	// tier is on, and removed at 0, on the EventWatcher pattern; a Degraded
+	// park above the broker's reconcile leaves it as it stands. It leaves
 	// Ready and the phase alone: a tier short of its count still serves,
 	// because a caller that cannot reach it falls back to the stateful broker
 	// (docs/designs/credential-broker-exec-tier.md §3.2), so the agent works

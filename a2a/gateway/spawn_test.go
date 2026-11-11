@@ -312,7 +312,11 @@ func TestClusterViewProjectsOnlyTheSessionAudience(t *testing.T) {
 	cs := k8sfake.NewSimpleClientset()
 	cfg := &Config{Namespace: "test-ns", WorkerImage: "img", SessionServiceAccount: "agent-a2a-session",
 		TaskDeadline: 15 * time.Minute, NATSURL: "nats://bus:4222",
-		SessionClusterView: true, CredentialProxyURL: "http://agent-credential-proxy.test-ns.svc.cluster.local:8765"}
+		SessionClusterView:   true,
+		CredentialProxyURL:   "http://agent-credential-proxy.test-ns.svc.cluster.local:8765",
+		KubeProxyURL:         "https://agent-kube-proxy.test-ns.svc.cluster.local:8443",
+		KubeProxyCAConfigMap: "agent-kube-proxy-ca-bundle",
+		KubeProxyHostContext: "in-cluster"}
 	s := &podSpawner{cfg: cfg, client: cs, log: slog.Default()}
 	rec := &SessionRecord{Key: "discord:g1/t", ContextID: "ctx-9", BusSession: "chat-otter-1a2b", Addressee: "chat-otter-1a2b"}
 	if _, err := s.Spawn(context.Background(), rec, "task-9", "", 1); err != nil {
@@ -349,17 +353,26 @@ func TestClusterViewProjectsOnlyTheSessionAudience(t *testing.T) {
 	}
 	if env["CREDENTIAL_PROXY_URL"] != cfg.CredentialProxyURL ||
 		env["CREDENTIAL_PROXY_TOKEN_FILE"] != credentialProxyTokenMountPath+"/"+credentialProxyTokenFile ||
+		env["KUBE_PROXY_URL"] != cfg.KubeProxyURL ||
+		env["KUBE_PROXY_CA_FILE"] != kubeProxyCAMountPath+"/"+kubeProxyCAFile ||
+		env["KUBE_PROXY_HOST_CONTEXT"] != cfg.KubeProxyHostContext ||
 		env["HERMES_HOME"] != sessionHermesHome || env[lib.EnvClusterView] != "true" {
 		t.Fatalf("cluster-view env = %v", env)
 	}
-	var mounted bool
+	var mounted, caMounted bool
 	for _, m := range c.VolumeMounts {
 		if m.MountPath == credentialProxyTokenMountPath && m.ReadOnly {
 			mounted = true
 		}
+		if m.Name == kubeProxyCAVolume && m.MountPath == kubeProxyCAMountPath && m.ReadOnly {
+			caMounted = true
+		}
 	}
 	if !mounted {
 		t.Fatal("the session token is not mounted read-only at the path the shim reads")
+	}
+	if !caMounted {
+		t.Fatal("the kube-proxy CA bundle is not mounted read-only")
 	}
 }
 

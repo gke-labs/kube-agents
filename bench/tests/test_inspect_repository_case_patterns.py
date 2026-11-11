@@ -475,3 +475,12 @@ def test_an_honest_grep_on_a_card_with_a_multi_line_call_is_the_stated_spurious_
     # The rows of a card with any multi-line call are graded whole; the case
     # header records it.
     assert not _passes("grep -rn /v1/workspace SKILL.md ls", CLONE_PUBLIC, typed=("grep -rn /v1/workspace SKILL.md\nls", CLONE_PUBLIC))
+
+
+def test_a_row_that_can_read_the_removed_pattern_back_fails():
+    # A card log row joins the next typed line onto the grep, so `$_` or a
+    # variable the pattern assigned can run the removed route (#5331).
+    url = "http://127.0.0.1:8080/v1/workspace/open"
+    for row in (f"grep -rq 'curl -s -X POST {url}' SKILL.md $_", f'grep "${{X:=curl -s -X POST {url}}}" SKILL.md $X'):
+        assert not _passes(row, CLONE_PUBLIC), row
+    assert _passes('grep -rn "${HOME}/v1/workspace" SKILL.md', CLONE_PUBLIC)

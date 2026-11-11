@@ -192,7 +192,7 @@ func (s *stubUsageSource) Scrape(ctx context.Context, addr string, counters []st
 		return usageReading{}, &usageScrapeError{Kind: usageScrapeKindConnect}
 	}
 	// set's sample is the pod group's first counter; setSample names the rest.
-	out := usageReading{Samples: map[string]int64{}, StartTime: reading.StartTime, Clusters: reading.Clusters, DataVolume: reading.DataVolume}
+	out := usageReading{Samples: map[string]int64{}, StartTime: reading.StartTime, Clusters: reading.Clusters, DataVolume: reading.DataVolume, Dispatcher: reading.Dispatcher}
 	out.Readings, out.ReadingsPresent = stubReadingsOf(reading, kinds)
 	if slices.Contains(kinds, usageReadingTopTools) {
 		out.ToolPairs = reading.ToolPairs
@@ -322,6 +322,16 @@ func (s *stubUsageSource) setClusters(addr string, registered, monitored int64) 
 	defer s.mu.Unlock()
 	reading := s.readings[addr]
 	reading.Clusters = &usageClusterGauges{Registered: registered, Monitored: monitored}
+	s.readings[addr] = reading
+}
+
+// setDispatcher gives addr's reading the chat plugin's failing boards (none
+// for an idle dispatcher), which set leaves in place.
+func (s *stubUsageSource) setDispatcher(addr string, failing ...usageDispatcherFailure) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	reading := s.readings[addr]
+	reading.Dispatcher = &usageDispatcherReading{Failing: failing}
 	s.readings[addr] = reading
 }
 
@@ -4382,6 +4392,72 @@ func TestUsagePoller_NoA2AStackLeavesThePairAbsentWithoutAMissAndAMissingGateway
 			t.Fatalf("two polls without the gateway pod: %d people misses, want 2", misses)
 		}
 	})
+}
+
+// usageExecTierPod is a running exec-tier pod, with the broker's container
+// and metrics port under the tier's own selector.
+func usageExecTierPod(name, uid, ip string, created time.Time) *corev1.Pod {
+	pod := usageBrokerPod(name, uid, ip, created)
+	pod.Labels = credentialProxyExecTierSelector(usageTestAgent(created))
+	return pod
+}
+
+// The exec tier's commands count toward toolExecutionsTotal beside the
+// stateful broker's, each pod read as its own target; the version-control
+// counters are not asked of an exec pod.
+func TestUsagePoller_CountsTheExecTiersCommands(t *testing.T) {
+	const execIP = "10.0.0.30"
+	execAddr := execIP + ":8766"
+	created := usageClock(0).Add(-time.Hour)
+	objs := append(usageDefaultObjects(created), usageExecTierPod("agent-credential-proxy-exec-tier-ccc", "exec-c", execIP, created))
+	h := newUsageHarness(t, usageTestAgent(created), objs...)
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(brokerAddr(), 10, ptr.To(200.0))
+	h.stub.set(execAddr, 4, ptr.To(300.0))
+	h.poll(5)
+	h.stub.set(brokerAddr(), 12, ptr.To(200.0))
+	h.stub.set(execAddr, 9, ptr.To(300.0))
+	h.poll(10)
+	if got := h.status().ToolExecutionsTotal; got != 7 {
+		t.Fatalf("toolExecutionsTotal = %d, want 7 (2 on the broker, 5 on the exec tier)", got)
+	}
+	var counters []string
+	for _, entry := range h.document().Pods {
+		if entry.PodUID == "exec-c" {
+			counters = append(counters, entry.Counter)
+		}
+	}
+	slices.Sort(counters)
+	want := slices.Clone(usageExecTierCounters)
+	slices.Sort(want)
+	if !slices.Equal(counters, want) {
+		t.Fatalf("the exec-tier pod feeds %v, want %v and no version-control counter", counters, want)
+	}
+}
+
+// The exec tier's tool pairs join the broker's in topTools, as its commands
+// join the totals: with the tier on, the callers' commands run there.
+func TestUsagePoller_TopToolsCountTheExecTiersCommands(t *testing.T) {
+	const execIP = "10.0.0.30"
+	execAddr := execIP + ":8766"
+	created := usageClock(0).Add(-time.Hour)
+	objs := append(usageDefaultObjects(created), usageExecTierPod("agent-credential-proxy-exec-tier-ccc", "exec-c", execIP, created))
+	h := newUsageHarness(t, usageTestAgent(created), objs...)
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(brokerAddr(), 0, ptr.To(200.0))
+	h.stub.set(execAddr, 0, ptr.To(300.0))
+	get := usageToolPair{Tool: "kubectl", Subcommand: "get"}
+	clusters := usageToolPair{Tool: "gcloud", Subcommand: "container"}
+	h.stub.setTopTools(brokerAddr(), map[usageToolPair]usageToolCounts{get: {"success": 2}})
+	h.stub.setTopTools(execAddr, map[usageToolPair]usageToolCounts{get: {"success": 5}, clusters: {"success": 3, "error": 1}})
+	h.poll(5)
+	want := []agentv1alpha1.ToolUsageSummary{
+		{Tool: "kubectl", Subcommand: "get", Total: 7, Success: 7},
+		{Tool: "gcloud", Subcommand: "container", Total: 4, Success: 3, Error: 1},
+	}
+	if got := h.status().TopTools; !usageTopToolsEqual(got, want) {
+		t.Fatalf("topTools = %+v, want %+v (the broker's and the exec pod's pairs)", got, want)
+	}
 }
 
 // usageTestSecondBrokerIP is a second broker pod, for the sum across pods.

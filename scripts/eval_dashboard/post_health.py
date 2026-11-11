@@ -87,6 +87,7 @@ Test: cd scripts && python3 -m unittest test_eval_dashboard_post_health
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import os
 import pathlib
@@ -193,6 +194,15 @@ DEFAULT_SLOW_BASELINE_DAYS = 7
 # them rather than printing the label.
 CAUSE_CAPACITY = "CAPACITY"
 CAUSE_CONCURRENCY_CAP = "CONCURRENCY_CAP"
+# The storm sentence names each phrasing the repetitions died with
+# (health.json incident.causes), short: the harness's "the executor's own
+# failure (<token>)" shell is peeled to the token, and a sentence-shaped
+# phrasing is cut at a word boundary. Past STORM_CHAT_PHRASINGS the rest is
+# a count, so one line stays one line.
+EXECUTOR_FAILURE_SHELL_RE = re.compile(r"^the executor's own failure \(([^()]+)\)$")
+STORM_CHAT_WORDS_MAX_CHARS = 40
+STORM_CHAT_WORDS_ELLIPSIS = "…"
+STORM_CHAT_PHRASINGS = 4
 CAUSE_CONTROL_PLANE = "CONTROL_PLANE"
 # The periodic's own "I could not tell", distinct from a label added later that
 # this file has no remedy for. Both ask for nothing; only this one knows why.
@@ -843,6 +853,18 @@ def pool_drift_retest(health: dict) -> str:
     return POOL_NO_RETEST if pool_drift_passes_leases(health) else POOL_RETEST
 
 
+def storm_words(words: str) -> str:
+    """One phrasing as the Chat sentence carries it: the executor-failure
+    shell peeled to its token, else the words cut at a word boundary."""
+    shell = EXECUTOR_FAILURE_SHELL_RE.match(words)
+    if shell:
+        return shell.group(1)
+    if len(words) <= STORM_CHAT_WORDS_MAX_CHARS:
+        return words
+    head = words[:STORM_CHAT_WORDS_MAX_CHARS]
+    return (head[: head.rfind(" ")] if " " in head else head).rstrip() + STORM_CHAT_WORDS_ELLIPSIS
+
+
 def cause_sentence(health: dict) -> str:
     """One sentence a reader can answer "is it me?" from."""
     incident = health.get("incident") or {}
@@ -870,7 +892,20 @@ def cause_sentence(health: dict) -> str:
     if condition == "storm":
         start, end = parse_iso(incident.get("window_start")), parse_iso(incident.get("window_end"))
         window = clock_range(start, end) if start and end else f"since {since}"
-        return f"quota storm {window} hit {prs} PRs."
+        # The repetitions' own words (health.json incident.causes), when the
+        # records carried any: "27 hermes-rate-limited, 1 delegated worker…".
+        # Counted by the form the reader sees, so two phrasings the cut makes
+        # identical are one item.
+        shown: Counter = Counter()
+        for words, n in (incident.get("causes") or []):
+            if isinstance(words, str) and words:
+                shown[storm_words(words)] += n
+        items = shown.most_common()
+        said = ", ".join(f"{n} {words}" for words, n in items[:STORM_CHAT_PHRASINGS])
+        rest = items[STORM_CHAT_PHRASINGS:]
+        if rest:
+            said += f", and {sum(n for _, n in rest)} reps in {len(rest)} other phrasings"
+        return f"quota storm {window} hit {prs} PRs" + (f"; reps: {said}." if said else ".")
     if condition == "setup_deaths":
         return f"{incident.get('runs', 0)} runs on {prs} PRs died during setup since {since}."
     if condition == CONDITION_FIXTURE_DRIFT:

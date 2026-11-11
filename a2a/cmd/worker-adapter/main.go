@@ -124,7 +124,8 @@ const (
 	delegateToolID = "mcp__" + workeradapter.DelegateMCPServer + "__" + workeradapter.DelegateToolName
 	// delegatePrompt tells the model the tool exists and when to reach for
 	// it; the tool's own schema (mcp.go) covers how to call it.
-	delegatePrompt = "You can hand a task to another agent with the `delegate` tool (addressee `platform` is the platform agent, which can read and act on the fleet). " +
+	delegatePrompt = "You can hand a task to another agent with the `delegate` tool. Its addressee field lists the agents you may use this turn: usually `platform`, the platform agent, which can read and act on the fleet, and any agent profile this conversation can reach. If it says no agent is available, don't call it. " +
+		"When the person asks for one of those agents by name, delegate to it under that name. " +
 		"The gateway checks that the user may reach that agent before anything runs. Calling `delegate` ends your turn; the agent's result arrives as your next turn, so say what you are delegating and why in one line first. " +
 		"Delegate when the ask needs the fleet, a cluster or privileges you do not have; answer yourself when you can."
 
@@ -139,6 +140,13 @@ func main() {
 	os.Exit(run())
 }
 
+// serveMCP is `worker-adapter mcp`: the delegate MCP server over in and out,
+// at the socket the adapter named and with the delegate targets it wrote into
+// this process's env for the turn.
+func serveMCP(ctx context.Context, in io.Reader, out io.Writer, log *slog.Logger) error {
+	return workeradapter.ServeDelegateMCP(ctx, in, out, workeradapter.DelegateSocketPath(), workeradapter.DelegateTargetsFromEnv(log), log)
+}
+
 func run() int {
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	slog.SetDefault(log)
@@ -149,7 +157,7 @@ func run() int {
 	// (worker-adapter/mcp.go). It has none of the task env below, so it is
 	// dispatched before configFromEnv rather than folded into it.
 	if len(os.Args) > 1 && os.Args[1] == "mcp" {
-		if err := workeradapter.ServeDelegateMCP(context.Background(), os.Stdin, os.Stdout, workeradapter.DelegateSocketPath(), log); err != nil && !errors.Is(err, io.EOF) {
+		if err := serveMCP(context.Background(), os.Stdin, os.Stdout, log); err != nil && !errors.Is(err, io.EOF) {
 			fmt.Fprintln(os.Stderr, "mcp:", err)
 			return 1
 		}
