@@ -414,12 +414,22 @@ const (
 	dataVolumeExpansionBlockedReason = "StorageClassCannotExpand"
 	// dataVolumeExpansionMessageFormat takes the claim, its current request,
 	// the resolved size and one of the three sentences below that say why.
-	dataVolumeExpansionMessageFormat = "Claim %s requests %s, and the data volume size (spec.storage.size, or the " +
-		"operator default) is %s. %s The operator leaves the claim at its current size."
+	dataVolumeExpansionMessageFormat = "Claim %s requests %s, and the data volume size (spec.storage.size or the " +
+		"operator default, raised for spec.storage.expectedClusterProfiles on the agent's claim) is %s. %s The " +
+		"operator leaves the claim at its current size."
 	dataVolumeNoStorageClassReason  = "The claim names no StorageClass, so it cannot expand."
 	dataVolumeStorageClassGoneFmt   = "StorageClass %q does not exist, so the claim cannot expand."
 	dataVolumeStorageClassFixedFmt  = "StorageClass %q does not allow volume expansion. Set allowVolumeExpansion: true on the class to let the claim grow."
 	dataVolumeExpansionMsgSeparator = " "
+	// The Warning Event for an agent data claim below
+	// ResolveAgentDataStorageSize that will not grow: a claim the operator does
+	// not control (made or adopted by hand), or one whose StorageClass cannot
+	// expand it, which DataVolumeNotExpanded also reports. An Event rather than
+	// a second condition reason, so the condition's API is unchanged.
+	dataVolumeUndersizedReason   = "DataVolumeUndersized"
+	dataVolumeUndersizedFormat   = "Claim %s requests %s, below the %s the data volume should have (spec.storage.size or the operator default, raised for spec.storage.expectedClusterProfiles). %s"
+	dataVolumeUnownedSentence    = "The claim is not controlled by this PlatformAgent, so the operator leaves its size to whoever made it; resize it by hand."
+	dataVolumeCannotGrowSentence = "Its StorageClass cannot expand it; see the DataVolumeNotExpanded condition."
 
 	conditionReasonInvalidGitRepoURL   = "InvalidGitRepoURL"
 	conditionReasonCorruptManagedRepos = "CorruptManagedRepos"
@@ -585,6 +595,13 @@ type PlatformAgentReconciler struct {
 	// then leave the condition as it stands. Cleared when the CR is deleted.
 	dataVolumeExpansion sync.Map
 
+	// dataVolumeUndersizedWarned records, per data claim, the
+	// DataVolumeUndersized Event this process last wrote, so a claim that stays
+	// in the same state is warned about once rather than on every pass. Keyed by
+	// the claim's ObjectKey, value string; removed when the claim is no longer
+	// undersized and cleared when the CR is deleted.
+	dataVolumeUndersizedWarned sync.Map
+
 	// gatewayLeaseSeen records each A2A gateway Lease this process has seen
 	// exist, and gatewayLeaseGoneAt when it first saw a seen one missing:
 	// a deletion's recreate is held back from then (ensureA2AGatewayLease).
@@ -696,29 +713,43 @@ type PlatformAgentReconciler struct {
 	otelProbedAt   time.Time
 }
 
+// The markers below are the operator's whole Kubernetes authority: controller-gen renders them
+// into config/rbac/role.yaml, and hack/sync-chart-manifests.sh copies that into the chart. Every
+// rule is cluster-scoped unless it carries `namespace=`, and each cluster-scoped rule is here for
+// one of four reasons, named on the rule or the group it sits in:
+//
+//   - CR: the PlatformAgent, AgentPlugin and AgentProfile resources, which the manager watches
+//     in every namespace because nothing fixes the namespace a CR is created in.
+//   - render: an object kind the operator creates for an agent, in that agent's namespace or
+//     the profile namespace beside it, and watches through a cluster-wide informer for drift.
+//   - escalation prevention: a read the operator never does itself but must hold, because
+//     buildMinimalPlatformRole grants it to the agent's audit ClusterRole and the API server
+//     refuses to let a subject grant a permission it does not hold.
+//   - operator read: something the operator reads by name or lists for itself.
+//
+// Secrets are split: the read verbs stay cluster-scoped, because the agent's audit ClusterRole
+// grants them and escalation prevention needs the operator to hold what it grants; the write
+// verbs are a namespaced Role (the last marker below), because the operator only ever writes a
+// Secret in the namespace of the PlatformAgent it is reconciling. The ClusterRole carries no
+// Secret write verb. tests/test_operator_secrets_grant.py and the C5 conformance test pin that
+// shape.
+//
+// CR.
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents/status,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents/finalizers,verbs=update
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentplugins,verbs=get;list;watch
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentplugins/status,verbs=get;update;patch
+// Render: the agent, broker, gateway and bus workloads; escalation prevention for the reads.
 // +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=get;list;watch;create;update;patch;delete
+// Escalation prevention, with two operator reads on the same grant: resolveNetpolProfile
+// reads the gke-metadata-server DaemonSet to discover its port (issue #747 B4), and
+// a2aCalloutHasOlderPods lists ReplicaSets to tell an old callout pod from a new one.
 // +kubebuilder:rbac:groups=apps,resources=daemonsets;replicasets,verbs=get;list;watch
-// apps/daemonsets is also read by resolveNetpolProfile to discover the gke-metadata-server
-// DaemonSet port (issue #747 B4) — a second consumer of a grant that already existed for
-// buildMinimalPlatformRole's escalation-prevention requirement.
+// Render: the agent's ServiceAccounts, data claims, config, Services and (mode next) session
+// pods; escalation prevention for the reads.
 // +kubebuilder:rbac:groups="",resources=serviceaccounts;persistentvolumeclaims;configmaps;services;pods,verbs=get;list;watch;create;update;patch;delete
-// `secrets` and full `jobs` verbs exist for the mode-next A2A stack (the
-// generated NATS credentials/config Secrets and the provisioning Job),
-// `ensureKubeProxyTLSSecret`, `checkShellSandboxKeys`, and `stampSecretEnvHash`.
-// `list` and `watch` are held so the operator satisfies Kubernetes RBAC
-// escalation prevention when reconciling `buildMinimalPlatformRole`, which
-// grants `get`/`list`/`watch` on `secrets` to `<agent>-kube-proxy` (where
-// `KUBE_PROXY_REDACT_SECRETS=true` strips `.data`, `.stringData`, and
-// `last-applied-configuration`). The operator itself still reads Secrets by
-// name through `r.APIReader` and `r.a2aReader()` rather than the manager's
-// informer cache, so it never caches every Secret in memory or blocks
-// `WaitForCacheSync` when `list`/`watch` is trimmed.
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
+// Render: full `jobs` verbs for the mode-next provisioning Job.
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // `dispatchjobtemplates` are the dispatcher Job admission policy's params in
 // <ns>-profiles (agentprofile_job_template.go), which the operator alone
@@ -737,28 +768,45 @@ type PlatformAgentReconciler struct {
 // as rendered (dispatcherJobPolicyInPlace). Read by name, uncached; no list,
 // watch or write. Pending @bnaylor's sign-off (#3655 PR 6).
 // +kubebuilder:rbac:groups=admissionregistration.k8s.io,resources=validatingadmissionpolicies;validatingadmissionpolicybindings,resourceNames=kube-agents-a2a-dispatcher-job,verbs=get
-// `nodes` is still required: buildMinimalPlatformRole grants it to the agent audit
-// ClusterRole, and RBAC escalation-prevention needs the operator to hold it to apply that.
+// Escalation prevention for `nodes`, `namespaces`, `events`, `persistentvolumes` and `pods/log`,
+// which buildMinimalPlatformRole grants to the agent audit ClusterRole (the operator never reads
+// an Event; the Recorder's writes are the next marker). Operator reads: `limitranges` (the sizing
+// profile reads the agent namespace's LimitRange) and `endpoints` (the control-plane endpoint for
+// the egress policy).
 // +kubebuilder:rbac:groups="",resources=namespaces;nodes;events;persistentvolumes;limitranges;endpoints;pods/log,verbs=get;list;watch
 // events create;patch: the Recorder's writes (see the field); patch is what
 // the recorder uses to bump the count on a repeat of the same Event.
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
-// Full `resourcequotas` verbs exist for the mode-next session-pod quota (the
+// Render: full `resourcequotas` verbs exist for the mode-next session-pod quota (the
 // enforcement half of the session cap); everything else only reads quotas.
 // +kubebuilder:rbac:groups="",resources=resourcequotas,verbs=get;list;watch;create;update;patch;delete
-// storageclasses get: growDataClaim reads a data claim's class by name, around
+// Operator read. storageclasses get: growDataClaim reads a data claim's class by name, around
 // the cache, to learn whether the claim can expand. Read-only, and no list or
 // watch, so a cached read cannot be added by accident.
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get
+// Escalation prevention: the audit ClusterRole's read set. The operator itself reads none of
+// these but `runtimeclasses` (validateRuntimeClass resolves the sandbox's class by name).
 // +kubebuilder:rbac:groups=metrics.k8s.io,resources=nodes;pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch
 // +kubebuilder:rbac:groups=batch,resources=cronjobs;jobs,verbs=get;list;watch
-// +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=node.k8s.io,resources=runtimeclasses,verbs=get;list;watch
-// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch
+// Render: the agent's leader Role grants `leases` in its namespace, so the operator must hold
+// the verbs it grants; the operator's own election lease is in its namespace too.
+// +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
+// Render: the agent's egress and ingress policies and its disruption budget.
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=networking.gke.io,resources=fqdnnetworkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
+// Render: the agent's RBAC. The cluster-scoped objects are the audit ClusterRole and its
+// binding (kubeagents:minimal:<ns>:<name>), the broker's TokenReview ClusterRole and binding
+// (kubeagents:tokenreview:<ns>:<name>) and, under mode next, the callout's binding
+// (kubeagents:a2a-callout-tokenreview:<ns>:<name>); the namespaced ones are the local, leader,
+// gateway, callout, dispatcher and scope-publisher Roles. Every name carries the agent's
+// namespace and name, so `resourceNames` cannot pin them, and the informers that watch them for
+// drift need unscoped `list` and `watch`. What bounds this grant is the API server's escalation
+// check: the operator holds no `escalate`, so no role it authors or binds can carry a
+// permission the operator does not itself hold, and the one `bind` below is scoped by name.
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings;roles;rolebindings,verbs=get;list;watch;create;update;patch;delete
 // The split credential broker verifies its callers with a TokenReview. The operator has to
 // hold that permission in order to grant it; it confers no read access and cannot mint a token.
@@ -775,6 +823,7 @@ type PlatformAgentReconciler struct {
 // `bind` scoped by resourceNames is the narrow form — it permits granting this one role and
 // confers none of its permissions on the operator itself.
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,resourceNames="system:auth-delegator",verbs=bind
+// Escalation prevention: buildMinimalPlatformRole grants CRD reads to the agent.
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch
 // The GitOps reconcilers' objects, read-only, for the same escalation-prevention reason
 // as `nodes` above: buildMinimalPlatformRole grants them to the agent, so the operator
@@ -783,6 +832,36 @@ type PlatformAgentReconciler struct {
 // +kubebuilder:rbac:groups=kustomize.toolkit.fluxcd.io,resources=kustomizations,verbs=get;list;watch
 // +kubebuilder:rbac:groups=source.toolkit.fluxcd.io,resources=gitrepositories;ocirepositories,verbs=get;list;watch
 // +kubebuilder:rbac:groups=configsync.gke.io,resources=rootsyncs;reposyncs,verbs=get;list;watch
+//
+// Secrets, read, cluster-wide. `get` is for two by-name readers: checkShellSandboxKeys asks
+// whether the sandbox's authorized-keys Secret exists so the status can say so, and never reads
+// a value out of one; stampSecretEnvHash reads the values of the Secret keys a pod consumes as
+// environment and digests them onto the pod template, so rotating one rolls the pod
+// (platformagent_secret_hash.go). `list` and `watch` are escalation prevention only:
+// buildMinimalPlatformRole grants `get`/`list`/`watch` on `secrets` to the agent's audit
+// ClusterRole (read through `<agent>-kube-proxy`, where KUBE_PROXY_REDACT_SECRETS=true strips
+// `.data`, `.stringData` and `last-applied-configuration`), and the API server refuses a grant
+// the operator does not hold. The operator itself never lists or watches a Secret: every read
+// goes by name through r.APIReader (a2aReader), never the manager's cache, because a cached Get
+// of a type the manager does not watch would start a cluster-wide Secret informer and hold
+// every Secret in the cluster in memory. tests/test_operator_secrets_grant.py refuses a
+// Secret list call or a Secret informer in controller code. resolveMinimalRoleSecretsRead reads the
+// self-check's denial of these two verbs (rbacSecretsListLabel, rbacSecretsWatchLabel) to keep
+// an upgraded install's minimal role as it is, which is why this marker stays cluster-scoped:
+// a namespaced tuple is labelled differently and the match would miss.
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+//
+// Secrets, write, namespaced. The operator writes a Secret only in the namespace of the
+// PlatformAgent it reconciles (every call site builds its key from agent.Namespace), so the
+// write verbs are a Role in the install namespace: `namespace=` makes controller-gen render a
+// Role beside the ClusterRole in role.yaml, the kustomize overlay rewrites the literal to the
+// deployed namespace, and the chart renders the same rules as a Role in the release namespace.
+// A PlatformAgent in any other namespace needs that Role and a RoleBinding there. The writers:
+// ensureKubeProxyTLSSecret creates and renews the kube-proxy TLS Secret on every install; the
+// mode-next A2A stack creates, repairs, patches and deletes the NATS credentials, config, TLS,
+// callout-key, inject-token, door-token and MCP-access Secrets it generates. Because the Role
+// grants the four verbs in one namespace, the operator can write a Secret nowhere else.
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=create;update;patch;delete,namespace=kubeagents-system
 
 // isPlatformAgentConflict reports whether err is an optimistic concurrency conflict
 // (409 Conflict) specifically on a PlatformAgent custom resource (Group: kubeagents.x-k8s.io,
@@ -1501,6 +1580,10 @@ func pluginStatusNeedsRecheck(plugins []*agentv1alpha1.AgentPlugin, agentReady b
 
 func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (ctrl.Result, error) {
 	if controllerutil.ContainsFinalizer(agent, platformAgentFinalizer) {
+		// The self-check stops probing this agent's namespace: once the agent
+		// is gone its RoleBinding may go too, and that must not stand as a
+		// denial on the agents that remain.
+		r.RBAC.Forget(agent.Namespace)
 		// Delete the credential broker's TokenReview grant, if the split ever
 		// created one. cleanupAgentRBAC's label-driven pass also reaps it under
 		// deleteAll, but only when the grant carries the instance labels — one
@@ -1663,18 +1746,22 @@ func (r *PlatformAgentReconciler) reconcilePVC(ctx context.Context, agent *agent
 			return err
 		}
 	}
-	// The data claim follows ResolveDataStorageSize on an existing install too.
+	// The data claim follows ResolveAgentDataStorageSize on an existing install too.
 	// reconcilePersistentVolumeClaim is create-only, so without this a size
 	// raised to stop the volume filling would reach new installs only, and
 	// every install that already had the problem would keep it.
 	//
 	// The sandbox's claim grows first. It is the destination of the mirror, so
-	// a park, an error or a refusal between the two grows leaves the sandbox
-	// claim the larger one, never the smaller. This also runs before
+	// a park, an error or a refusal between the two grows leaves it at its full
+	// size before the agent's grows. The agent's claim can be the larger one by
+	// spec.storage.expectedClusterProfiles: that budget is for the session
+	// stores, which the mirror does not copy. This also runs before
 	// reconcileShellSandbox applies the StatefulSet.
 	r.growShellSandboxDataClaim(ctx, agent)
 	key := client.ObjectKeyFromObject(dataClaim)
-	r.noteDataClaimGrowth(key, r.growDataClaim(ctx, key, dataClaim.Spec.Resources.Requests[corev1.ResourceStorage], agent))
+	growth := r.growDataClaim(ctx, key, dataClaim.Spec.Resources.Requests[corev1.ResourceStorage], agent)
+	r.noteDataClaimGrowth(key, growth)
+	r.warnUndersizedDataClaim(agent, key, growth)
 	return nil
 }
 
@@ -3022,7 +3109,9 @@ func (r *PlatformAgentReconciler) ungatedDNSClusterIPs(ctx context.Context, agen
 	return r.resolveNetpolProfile(ctx, ungated).DNSClusterIPs
 }
 
-// growShellSandboxDataClaim widens the sandbox's data claim to match the agent's.
+// growShellSandboxDataClaim widens the sandbox's data claim to ResolveDataStorageSize:
+// the agent's claim without the per-profile budget, which covers session stores
+// the mirror does not copy.
 //
 // A StatefulSet's volumeClaimTemplate sizes only the claims it creates, so an
 // install from before the current ResolveDataStorageSize keeps the size it was
@@ -3043,6 +3132,9 @@ func (r *PlatformAgentReconciler) growShellSandboxDataClaim(ctx context.Context,
 type dataClaimGrowth struct {
 	claim      string
 	have, want resource.Quantity
+	// unowned is true for a claim the owner passed to growDataClaim does not
+	// control, which growDataClaim leaves at its size.
+	unowned bool
 	// cannotExpand is "" unless the claim is below want and its StorageClass
 	// cannot expand it. Then it is the sentence that says why.
 	cannotExpand string
@@ -3090,11 +3182,42 @@ func (r *PlatformAgentReconciler) dataVolumeExpansionMessage(agent *agentv1alpha
 func (r *PlatformAgentReconciler) forgetDataVolumeExpansion(agent *agentv1alpha1.PlatformAgent) {
 	for _, key := range dataClaimKeys(agent) {
 		r.dataVolumeExpansion.Delete(key)
+		r.dataVolumeUndersizedWarned.Delete(key)
 	}
 }
 
-// dataClaimKeys are the two claims ResolveDataStorageSize sizes: the agent's
-// own data claim and the sandbox's.
+// warnUndersizedDataClaim writes one DataVolumeUndersized Warning Event when
+// the agent's data claim is below the size it should have and will not grow,
+// and again only when what it says changes. A nil growth (the claim could not
+// be read) leaves the record alone; a claim that is not undersized, or that
+// growDataClaim patched, clears it, so a later shortfall is warned about anew.
+func (r *PlatformAgentReconciler) warnUndersizedDataClaim(agent *agentv1alpha1.PlatformAgent, key client.ObjectKey, growth *dataClaimGrowth) {
+	if growth == nil {
+		return
+	}
+	var why string
+	switch {
+	case growth.have.IsZero() || growth.have.Cmp(growth.want) >= 0:
+	case growth.unowned:
+		why = dataVolumeUnownedSentence
+	case growth.cannotExpand != "":
+		why = dataVolumeCannotGrowSentence
+	}
+	if why == "" {
+		r.dataVolumeUndersizedWarned.Delete(key)
+		return
+	}
+	msg := fmt.Sprintf(dataVolumeUndersizedFormat, growth.claim, growth.have.String(), growth.want.String(), why)
+	if previous, ok := r.dataVolumeUndersizedWarned.Load(key); ok && previous.(string) == msg {
+		return
+	}
+	r.dataVolumeUndersizedWarned.Store(key, msg)
+	r.recordEvent(agent, corev1.EventTypeWarning, dataVolumeUndersizedReason, msg)
+}
+
+// dataClaimKeys are the two data claims: the agent's own, which
+// ResolveAgentDataStorageSize sizes, and the sandbox's, which
+// ResolveDataStorageSize sizes.
 func dataClaimKeys(agent *agentv1alpha1.PlatformAgent) []client.ObjectKey {
 	return []client.ObjectKey{
 		client.ObjectKeyFromObject(buildPVC(agent)),
@@ -3201,13 +3324,14 @@ func (r *PlatformAgentReconciler) growDataClaim(ctx context.Context, key client.
 		}
 		return growth
 	}
+	have := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
+	growth.have = have
 	if owner != nil && !metav1.IsControlledBy(pvc, owner) {
 		log.Info("the data claim is not the operator's; leaving its size alone", "claim", key.Name)
+		growth.unowned = true
 		return growth
 	}
 
-	have := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
-	growth.have = have
 	if have.Cmp(want) >= 0 {
 		// The spec asks for enough. Whether the volume has it is a different
 		// question: the API server admits a resize on the StorageClass alone, and
@@ -4040,7 +4164,7 @@ func (r *PlatformAgentReconciler) resolveMinimalRoleSecretsRead(ctx context.Cont
 	}
 	if r.RBAC != nil {
 		denied := r.RBAC.Denied()
-		if slices.Contains(denied, "list secrets") || slices.Contains(denied, "watch secrets") {
+		if slices.Contains(denied, rbacSecretsListLabel) || slices.Contains(denied, rbacSecretsWatchLabel) {
 			return false, nil
 		}
 	}

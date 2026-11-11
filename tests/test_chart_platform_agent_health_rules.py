@@ -278,6 +278,14 @@ class HealthRulesRenderTest(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(subprocess.CalledProcessError):
                 _render(*_ON, "--set", f"platformAgent.healthRules.thresholds.ratiosFor={bad}")
 
+    def test_the_slack_window_refuses_a_zero_duration(self):
+        """`[0s]` is no PromQL range, so Managed Prometheus would refuse the whole rule."""
+        for bad in ("0s", "0m", "00m", "0h0m"):
+            with self.subTest(bad=bad), self.assertRaises(subprocess.CalledProcessError):
+                _render(*_ON, "--set", f"platformAgent.healthRules.thresholds.slackDisconnectedFor={bad}")
+        rule = _alerts(_rules(_render(*_ON, "--set", "platformAgent.healthRules.thresholds.slackDisconnectedFor=1h0m"))[0])[_SLACK_ALERT]
+        self.assertIn("[1h0m]", rule["expr"])
+
     def test_metric_names_and_fields_are_the_operators(self):
         """The template hand-copies the gauge families and field names; hold them to
         the operator's declarations in usage_gauges.go."""

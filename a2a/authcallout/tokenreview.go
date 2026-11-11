@@ -59,8 +59,12 @@ const (
 // A successful review is remembered for reviewCacheTTL, keyed by an HMAC of
 // the token under a key drawn at construction so the token itself is not held
 // on the heap (see cacheKey), and concurrent requests for one token share one
-// review. It is safe for concurrent use; the callout's worker pool calls it
-// from many goroutines at once.
+// review. The memory is checked twice on a miss, once before the shared call
+// and once more as its first step, because a review writes the memory before
+// singleflight forgets its key and a presentation can slip between the two;
+// without the second check it would start a review of its own. It is safe
+// for concurrent use; the callout's worker pool calls it from many goroutines
+// at once.
 type TokenValidator struct {
 	client   kubernetes.Interface
 	audience string
@@ -69,6 +73,13 @@ type TokenValidator struct {
 	// a test that has to see every review.
 	now      func() time.Time
 	cacheTTL time.Duration
+
+	// afterMiss, when set, runs after the first check of the memory has
+	// missed and before the shared call is joined. It is nil outside tests;
+	// a test sets it to hold a presentation in the window the second check
+	// closes, where a review of its token completes and is remembered
+	// before it joins.
+	afterMiss func()
 
 	// group collapses concurrent reviews of one token into one call.
 	group singleflight.Group
@@ -85,6 +96,14 @@ type TokenValidator struct {
 type cachedReview struct {
 	att     Attested
 	expires time.Time
+}
+
+// reviewed is what one shared call hands to every presentation waiting on
+// it: the attestation and whether the call reviewed the token or found it
+// remembered on its second check of the memory.
+type reviewed struct {
+	att    Attested
+	source reviewSource
 }
 
 // NewTokenValidator builds a validator bound to one audience.
@@ -160,6 +179,9 @@ func (v *TokenValidator) validate(ctx context.Context, token string) (Attested, 
 	if att, ok := v.remembered(key); ok {
 		return att, reviewCached, nil
 	}
+	if v.afterMiss != nil {
+		v.afterMiss()
+	}
 
 	// One review per token however many connections present it at once:
 	// the others wait for the first's answer. DoChan rather than Do so a
@@ -171,6 +193,16 @@ func (v *TokenValidator) validate(ctx context.Context, token string) (Attested, 
 	// The review gets the decision budget of its own from the moment it
 	// starts.
 	results := v.group.DoChan(string(key[:]), func() (any, error) {
+		// The memory is read once more here, under the key, before the
+		// API server is asked. A review remembers its answer and then
+		// returns, and only then does singleflight drop the key; a
+		// presentation that missed the memory before that write and
+		// reached here after the drop would otherwise review a token
+		// the memory already answers. The check before DoChan stays
+		// as the fast path: a hit there costs one mutex and no call.
+		if att, ok := v.remembered(key); ok {
+			return reviewed{att: att, source: reviewCached}, nil
+		}
 		reviewCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), authDecisionBudget)
 		defer cancel()
 		att, err := v.review(reviewCtx, token)
@@ -178,14 +210,15 @@ func (v *TokenValidator) validate(ctx context.Context, token string) (Attested, 
 			return nil, err
 		}
 		v.remember(key, att)
-		return att, nil
+		return reviewed{att: att, source: reviewFresh}, nil
 	})
 	select {
 	case r := <-results:
 		if r.Err != nil {
 			return Attested{}, "", r.Err
 		}
-		return r.Val.(Attested), reviewFresh, nil
+		answer := r.Val.(reviewed)
+		return answer.att, answer.source, nil
 	case <-ctx.Done():
 		return Attested{}, "", fmt.Errorf("TokenReview call failed: %w", ctx.Err())
 	}

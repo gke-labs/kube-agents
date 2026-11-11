@@ -1596,7 +1596,9 @@ class TestPace(QueueTestCase):
         # nothing back, and is not added again today.
         rows = [row("m1", "major", check="K"), row("n0", "major", score=80)]
         key = fq.item_key(rows[0])
-        added = {"critical": 0, "noncritical": 1, "lines": [list(key)]}
+        # Two additions today under a cap of three: counting K again would
+        # fill the cap and leave n0 out.
+        added = {"critical": 0, "noncritical": 2, "lines": [list(key), ["other", "", "prod"]]}
         plan = fq.pace(rows, at(6, 17), self.LIMITS, added, announced=[key], announced_ids=["m0", "m1"])
         self.assertEqual(ids(plan.add), [["n0"]])
         self.assertEqual(ids(plan.waiting), [["m1"]])

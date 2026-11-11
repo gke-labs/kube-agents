@@ -883,6 +883,16 @@ still works and wins over the value. The
 [MCP server page](https://gke-labs.github.io/kube-agents/reference/a2a-mcp/) is canonical for
 what it renders and how a client connects.
 
+### Slack end-to-end test users (`operator.slackTestUsers`)
+
+Meant for CI and eval installs. `operator.slackTestUsers` lists Slack member ids (`U…`) whose
+posts the A2A gateway reads as theirs even though they carry an app's `bot_id`, which a post
+made with a user token through an app does; the gateway otherwise drops those as bot traffic.
+It renders as `A2A_SLACK_TEST_USERS` on the controller manager, which hands it to the gateway
+when the gateway runs the Slack adapter under `next`. Empty by default, and an `operator.extraEnv` entry of that name wins. A listed
+user still has to be on `integration.slack.allowedUsers`. Nothing but the value itself keeps it
+off a real install, and a listed member's posts through any app in the workspace read as theirs.
+
 ### Data volume size (`platformAgent.storage.size`)
 
 `platformAgent.storage.size` is the CR's `spec.storage.size`: the request of the agent's
@@ -899,6 +909,11 @@ default. The render fails on a size of zero or above `64Ti`, and on a live insta
 predates `spec.storage`. The
 [PlatformAgent CRD page](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#specstorage)
 is canonical for the behaviour.
+
+`platformAgent.storage.expectedClusterProfiles` (CR: `spec.storage.expectedClusterProfiles`, 1 to 20000) raises the agent's claim alone to at least `8Gi` plus `400Mi` per expected Cluster Agent
+profile, rounded up to whole GiB, the size the session stores settle at under 90-day retention.
+The claim takes the larger of that and `size` (or the default), and the formula passes the 50Gi
+default above 107 profiles. The quota preflight counts the raised claim.
 
 ### Sizing for a fleet (`examples/values-fleet.yaml`)
 
@@ -1327,9 +1342,8 @@ though note that if a namespace ResourceQuota restricts that compute resource (s
 declare it (or a `LimitRange` to default it), and will reject the pod if omitted.
 The credential broker's exec tier is counted as `platformAgent.deployment.credentialProxy.exec.replicas`
 times one replica's footprint (`operatorRenderedPerReplica.credentialProxyExecTier`), and not at
-all at `0`. An ephemeral-storage key in `platformAgent.deployment.credentialProxy.resources`
-moves each replica too, because the operator gives the tier the broker's other resource keys; its
-cpu and memory are fixed. It needs no surge headroom: it rolls with `maxSurge: 0` and `maxUnavailable: 1`, so a
+all at `0`. Its cpu, memory and ephemeral storage are fixed: a key in
+`platformAgent.deployment.credentialProxy.resources` moves the stateful broker, not the tier. It needs no surge headroom: it rolls with `maxSurge: 0` and `maxUnavailable: 1`, so a
 rollout replaces a pod in place and adds none. The check counts the
 quota only; whether a node has room for each 2 CPU replica is the scheduler's.
 The two data claims are counted at `platformAgent.storage.size` when it is set: footprint.yaml
