@@ -24,6 +24,25 @@
 # pull request.
 
 # part 1
+# Capability row: autoscaling, ComputeClass and accelerators; the stockout
+# audit on a one-replica Deployment that names ComputeClass general-ccc only
+# in a required nodeAffinity term and never in nodeSelector, the documented
+# way a Pod requests a class (the fleet's app-worker-b in
+# seeded-compute-class on slot c, role compute-class-affinity-workload;
+# nothing planted by the run). A declared gap, expected_fail: no audit reads
+# the affinity form (the obtainability audit's 3.24 skips it); the gap is
+# #4943, its affinity signal.
+./tasks/ccc-prefilter-nodeaffinity-bypass/task.yaml
+# Capability row: autoscaling, ComputeClass and accelerators; the stockout
+# audit on a class-targeted Deployment whose hand-written toleration for the
+# class taint names key, value and effect and no operator (the fleet's
+# batch-worker-a in seeded-compute-class on slot c, role
+# compute-class-toleration-workload; nothing planted by the run; the pool
+# carries no taint, so the shape and not a scheduling failure is the
+# fixture). A declared gap whose premise the gap issue puts to the capacity
+# owner, expected_fail: no stockout check reads a toleration's operator; the
+# gap is #5601.
+./tasks/ccc-toleration-missing-equal-operator/task.yaml
 # Capability row: cost, idle and over-requested resources; a request cut on two
 # named workloads names the dependency each cut would change (the seeded fleet's
 # HPA-scaled inference-server in seeded-capacity and the Guaranteed-QoS
