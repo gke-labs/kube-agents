@@ -162,6 +162,15 @@ class OwnEntriesTest(RuleTestCase):
             result = self.rule(CHILD, many, retry=True)[1]
         self.assertNotIn("past the limit", result)
 
+    def test_a_redacted_or_repeated_entry_past_the_limit_is_counted_once(self):
+        many = [{**HPA_ENTRY, "workload": f"w{i}"} for i in range(krc.MAX_ENTRIES)]
+        many += [{**HPA_ENTRY, "workload": "w0"}, {**HPA_ENTRY, "workload": "x9"}, {**HPA_ENTRY, "workload": "x9"}]
+        redact = lambda value: value.replace("w0", "REDACTED")
+        with self.assertLogs(krc.logger, "WARNING"):
+            result = krc.rightsizing_rule(task_id=CHILD, args={krc.PARAM: many}, result="**Answer.**", metadata=None,
+                                          calls=[], retry=True, redact=redact, connect=self.connect)[1]
+        self.assertIn(f"- 1 of this card's entries past the limit of {krc.MAX_ENTRIES} not shown.", result)
+
     def test_past_the_limit_is_said_when_every_entry_failed(self):
         bad = [{**HPA_ENTRY, "dependency_kind": "maybe"}] * (krc.MAX_ENTRIES + 1)
         with self.assertLogs(krc.logger, "WARNING"):
@@ -296,6 +305,17 @@ class InheritedEntriesTest(RuleTestCase):
         conn.close()
         result = self.rule(PARENT)[1]
         self.assertIn(f"- 3 entries of the cards below past the limit of {krc.MAX_ENTRIES} not shown.", result)
+
+    def test_a_card_that_quotes_the_past_limit_line_gets_no_second_section(self):
+        conn = sqlite3.connect(self.path)
+        conn.execute("UPDATE task_runs SET metadata = ? WHERE task_id = ?",
+                     (json.dumps({krc.METADATA_KEY: [HPA_ENTRY, QOS_ENTRY], krc.PAST_LIMIT_KEY: 3}), CHILD))
+        conn.commit()
+        conn.close()
+        quoted = "Result of delegated task:\n\n" + krc.render(
+            [{**HPA_ENTRY, "card": CHILD}, {**QOS_ENTRY, "card": CHILD}], inherited_past_limit=3)
+        result = self.rule(PARENT, result=quoted)[1]
+        self.assertEqual(result, quoted)
 
     def test_a_model_written_past_limit_key_is_dropped(self):
         metadata = self.rule(CHILD, [HPA_ENTRY], metadata={krc.PAST_LIMIT_KEY: 99})[2]

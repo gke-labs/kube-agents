@@ -113,6 +113,8 @@ DROP_FIRST = ("none", "not_on_cluster")
 #: before the evidence rule, so a clipped result loses evidence first.
 MAX_ENTRIES = 8
 MAX_SHOWN = 12
+#: The words every past-limit line ends with, whichever card it counts for.
+PAST_LIMIT_NOTICE = f"past the limit of {MAX_ENTRIES} not shown"
 MAX_FIELD_CHARS = 200
 
 #: The order that picks one ``dependency_kind`` when several apply.
@@ -374,12 +376,17 @@ def rightsizing_rule(
         stored.append(safe)
     body = str(result).rstrip() if result else ""
     own_plain = {_line(entry, card=False) for entry in stored}
-    # An entry past the limit that repeats a shown one is not missing.
-    past_limit = 0
+    # An entry past the limit that repeats a shown one, or another one past the
+    # limit, is not missing; lines compare as stored, redacted.
+    past_limit, counted = 0, set()
     for item in items[MAX_ENTRIES:]:
         entry, _reason = _check_entry(item)
-        if entry is None or _line(entry, card=False) not in own_plain:
-            past_limit += 1
+        if entry is not None:
+            line = _line({**entry, "workload": redact(entry["workload"]), "dependency": redact(entry["dependency"])}, card=False)
+            if line in own_plain or line in counted:
+                continue
+            counted.add(line)
+        past_limit += 1
     shown, seen = [], set()
     for entry in stored + inherited:
         plain = _line(entry, card=False)
@@ -407,6 +414,10 @@ def rightsizing_rule(
         if past_limit:
             added[PAST_LIMIT_KEY] = past_limit
         metadata = {**(metadata or {}), **added}
+    if PAST_LIMIT_NOTICE in body:
+        # The text already relays a card's past-limit line (the front door
+        # quoting the Platform card's section): it is not said twice.
+        inherited_past_limit = 0
     if not shown and not past_limit and not inherited_past_limit:
         return [], result, metadata
     section = render(shown, hidden, own_hidden, past_limit, inherited_past_limit)
