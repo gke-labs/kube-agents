@@ -22,7 +22,9 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -65,8 +67,8 @@ const (
 	// a2aGatewayTasksWaitMsgFmt takes the gateway Deployment's name and the
 	// threshold. No elapsed time: the Degraded write is gated on the
 	// message, so a figure that moved would write status on every pass.
-	a2aGatewayTasksWaitMsgFmt = "A2A gateway Deployment %s has not turned ready for more than %s since the bus was recorded " +
-		"provisioned (BusProvisioned=True), with the NATS server up. Its readiness is its event relay binding the TASKS stream, " +
+	a2aGatewayTasksWaitMsgFmt = "A2A gateway Deployment %s: pod %s, the one that binds the event relay, has not turned ready for more than %s " +
+		"since the bus was recorded provisioned (BusProvisioned=True), with the NATS server up. Its readiness is its event relay binding the TASKS stream, " +
 		"which the provision Job created, so the gateway most likely cannot see that stream: its NATS identity lands in a " +
 		"different account than the streams, its credentials are wrong, or a JetStream domain or prefix does not match. " +
 		"Read the gateway's /readyz body on its metrics port, which names what it waits on, and its log"
@@ -81,6 +83,104 @@ const (
 	a2aBusStreamsPresentConditionType = "BusStreamsPresent"
 )
 
+// a2aGatewayLeaderRead is the A2A gateway's elected leader as the operator
+// reads it: the pod named by the gateway Lease's holderIdentity, whether its
+// gateway container is ready, and when the Lease was acquired. Shared by the
+// Degraded reason here and by anything else that has to know whether the
+// gateway that does the work is serving (Ready following the leader, #5593):
+// with leader election on, a standby reads Ready while the leader may not,
+// so the Deployment's ready count says nothing about the relay.
+type a2aGatewayLeaderRead struct {
+	Pod        *corev1.Pod
+	Ready      bool
+	AcquiredAt time.Time
+}
+
+// a2aGatewayLeader reads the A2A gateway's elected leader. It returns nil
+// with no error when there is none to read: no Lease, no holder, a holder
+// whose pod is gone or terminating, or a pod that is not this gateway's.
+// The Lease comes from the cache (the operator watches it), the pod from
+// the live reader, since its readiness is the question. A read that failed
+// for another reason is returned as the error.
+func (r *PlatformAgentReconciler) a2aGatewayLeader(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (*a2aGatewayLeaderRead, error) {
+	lease := &coordinationv1.Lease{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aGatewayLeaseName(agent)}, lease); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity == "" {
+		return nil, nil
+	}
+	pod := &corev1.Pod{}
+	if err := r.podReader().Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: *lease.Spec.HolderIdentity}, pod); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if pod.Labels["app"] != a2aGatewayName(agent) || !pod.DeletionTimestamp.IsZero() {
+		return nil, nil
+	}
+	read := &a2aGatewayLeaderRead{Pod: pod}
+	if lease.Spec.AcquireTime != nil {
+		read.AcquiredAt = lease.Spec.AcquireTime.Time
+	}
+	if gateway := a2aGatewayContainerStatus(pod); gateway != nil {
+		read.Ready = gateway.Ready
+	}
+	return read, nil
+}
+
+// a2aGatewayContainerStatus is the pod's gateway container status, or nil.
+func a2aGatewayContainerStatus(pod *corev1.Pod) *corev1.ContainerStatus {
+	for i := range pod.Status.ContainerStatuses {
+		if pod.Status.ContainerStatuses[i].Name == a2aGatewayContainerName {
+			return &pod.Status.ContainerStatuses[i]
+		}
+	}
+	return nil
+}
+
+// a2aGatewayLeaderTasksWait is a2aGatewayTasksWait for an elected gateway:
+// the leader alone binds the relay, so it alone is read, and a standby that
+// reads Ready changes nothing. The clock starts at the latest of
+// BusProvisioned's transition, the leader container's start and the Lease's
+// acquisition, so a standby promoted a moment ago is given the threshold to
+// bind from its promotion. A leader whose container is not running is the
+// pod fault scan's.
+func a2aGatewayLeaderTasksWait(agent *agentv1alpha1.PlatformAgent, leader *a2aGatewayLeaderRead) (time.Time, bool) {
+	since, ok := a2aGatewayProvisionedAt(agent)
+	if !ok || leader == nil || leader.Ready || leader.Pod.Status.Phase != corev1.PodRunning {
+		return time.Time{}, false
+	}
+	gateway := a2aGatewayContainerStatus(leader.Pod)
+	if gateway == nil || gateway.State.Running == nil {
+		return time.Time{}, false
+	}
+	for _, at := range []time.Time{gateway.State.Running.StartedAt.Time, leader.AcquiredAt} {
+		if at.After(since) {
+			since = at
+		}
+	}
+	return since, true
+}
+
+// a2aGatewayProvisionedAt is BusProvisioned's transition to True on a
+// rendering stack, false when the stack does not render or the bus is not
+// recorded provisioned.
+func a2aGatewayProvisionedAt(agent *agentv1alpha1.PlatformAgent) (time.Time, bool) {
+	if !a2aStackRendering(agent) {
+		return time.Time{}, false
+	}
+	provisioned := meta.FindStatusCondition(agent.Status.Conditions, busProvisionedConditionType)
+	if provisioned == nil || provisioned.Status != metav1.ConditionTrue {
+		return time.Time{}, false
+	}
+	return provisioned.LastTransitionTime.Time, true
+}
+
 // a2aGatewayTasksWait reports whether the A2A gateway is waiting for TASKS
 // on a provisioned bus, and since when: the later of BusProvisioned's
 // transition to True and the youngest gateway container's start. Waiting
@@ -89,14 +189,10 @@ const (
 // pulling, crash looping, terminated) is the pod fault scan's to name, so
 // such a pod makes this false, as does any ready pod, or none at all.
 func a2aGatewayTasksWait(agent *agentv1alpha1.PlatformAgent, pods []corev1.Pod) (time.Time, bool) {
-	if !a2aStackRendering(agent) {
+	since, ok := a2aGatewayProvisionedAt(agent)
+	if !ok {
 		return time.Time{}, false
 	}
-	provisioned := meta.FindStatusCondition(agent.Status.Conditions, busProvisionedConditionType)
-	if provisioned == nil || provisioned.Status != metav1.ConditionTrue {
-		return time.Time{}, false
-	}
-	since := provisioned.LastTransitionTime.Time
 	live := 0
 	for _, pod := range pods {
 		if !pod.DeletionTimestamp.IsZero() {
@@ -106,12 +202,7 @@ func a2aGatewayTasksWait(agent *agentv1alpha1.PlatformAgent, pods []corev1.Pod) 
 		if pod.Status.Phase != corev1.PodRunning {
 			return time.Time{}, false
 		}
-		var gateway *corev1.ContainerStatus
-		for i := range pod.Status.ContainerStatuses {
-			if pod.Status.ContainerStatuses[i].Name == a2aGatewayContainerName {
-				gateway = &pod.Status.ContainerStatuses[i]
-			}
-		}
+		gateway := a2aGatewayContainerStatus(&pod)
 		if gateway == nil || gateway.Ready || gateway.State.Running == nil {
 			return time.Time{}, false
 		}
@@ -136,8 +227,10 @@ func a2aGatewayTasksWaitDue(since, now time.Time) (bool, time.Duration) {
 // gateway's pods at all: the stack renders, BusProvisioned is True, the NATS
 // StatefulSet has a ready replica (a bus that is down is a different fault,
 // and the gateway would wait on its connection, not on TASKS), and the A2A
-// gateway Deployment exists with no ready replica. Read from the cache, so a
-// settled install pays no live pod list for this on any pass.
+// gateway Deployment exists with fewer ready replicas than it asks for: a
+// standby can read Ready while the leader does not, so zero ready is not
+// the test, but every replica ready includes the leader. Read from the
+// cache, so a settled install pays no live read for this on any pass.
 func (r *PlatformAgentReconciler) a2aGatewayTasksWaitApplies(ctx context.Context, agent *agentv1alpha1.PlatformAgent) bool {
 	if !a2aStackRendering(agent) || !busProvisioned(agent) {
 		return false
@@ -150,7 +243,46 @@ func (r *PlatformAgentReconciler) a2aGatewayTasksWaitApplies(ctx context.Context
 	if err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aGatewayName(agent)}, gateway); err != nil {
 		return false
 	}
-	return gateway.Status.ReadyReplicas == 0
+	want := int32(1)
+	if gateway.Spec.Replicas != nil {
+		want = *gateway.Spec.Replicas
+	}
+	return gateway.Status.ReadyReplicas < want
+}
+
+// a2aGatewayTasksWaitRead is whether the gateway is waiting for TASKS, since
+// when, and the pod the message names. With leader election on (the
+// default), only the elected leader is read (a2aGatewayLeaderTasksWait);
+// with it off, every gateway pod (a2aGatewayTasksWait). Call it only past
+// a2aGatewayTasksWaitApplies.
+func (r *PlatformAgentReconciler) a2aGatewayTasksWaitRead(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, time.Time, bool, error) {
+	if a2aGatewayElectionEnabled() {
+		leader, err := r.a2aGatewayLeader(ctx, agent)
+		if err != nil {
+			return "", time.Time{}, false, err
+		}
+		since, waiting := a2aGatewayLeaderTasksWait(agent, leader)
+		if !waiting {
+			return "", time.Time{}, false, nil
+		}
+		return leader.Pod.Name, since, true, nil
+	}
+	pods, err := r.a2aGatewayTasksWaitPods(ctx, agent)
+	if err != nil {
+		return "", time.Time{}, false, err
+	}
+	since, waiting := a2aGatewayTasksWait(agent, pods)
+	if !waiting {
+		return "", time.Time{}, false, nil
+	}
+	name := ""
+	for _, pod := range pods {
+		if pod.DeletionTimestamp.IsZero() {
+			name = pod.Name
+			break
+		}
+	}
+	return name, since, true, nil
 }
 
 // a2aGatewayTasksWaitPods lists the A2A gateway's pods from the live reader
@@ -173,23 +305,22 @@ func (r *PlatformAgentReconciler) a2aGatewayTasksWaitMessage(ctx context.Context
 	if !r.a2aGatewayTasksWaitApplies(ctx, agent) {
 		return ""
 	}
-	pods, err := r.a2aGatewayTasksWaitPods(ctx, agent)
+	pod, since, waiting, err := r.a2aGatewayTasksWaitRead(ctx, agent)
 	if err != nil {
-		logf.FromContext(ctx).Error(err, "could not list the A2A gateway's pods for the TASKS wait; the Degraded reason is left as the CR last reported it")
+		logf.FromContext(ctx).Error(err, "could not read the A2A gateway's pods for the TASKS wait; the Degraded reason is left as the CR last reported it")
 		if held := meta.FindStatusCondition(agent.Status.Conditions, degradedConditionType); held != nil &&
 			held.Status == metav1.ConditionTrue && held.Reason == conditionReasonA2AGatewayWaitingForTasks {
 			return held.Message
 		}
 		return ""
 	}
-	since, waiting := a2aGatewayTasksWait(agent, pods)
 	if !waiting {
 		return ""
 	}
 	if due, _ := a2aGatewayTasksWaitDue(since, time.Now()); !due {
 		return ""
 	}
-	msg := fmt.Sprintf(a2aGatewayTasksWaitMsgFmt, a2aGatewayName(agent), a2aGatewayTasksWaitThreshold)
+	msg := fmt.Sprintf(a2aGatewayTasksWaitMsgFmt, a2aGatewayName(agent), pod, a2aGatewayTasksWaitThreshold)
 	if streams := meta.FindStatusCondition(agent.Status.Conditions, a2aBusStreamsPresentConditionType); streams != nil && streams.Status != metav1.ConditionTrue {
 		msg += fmt.Sprintf(a2aGatewayTasksWaitStreamsSuffixFmt, streams.Status, streams.Reason)
 	}
@@ -212,12 +343,8 @@ func (r *PlatformAgentReconciler) a2aGatewayTasksWaitRequeue(ctx context.Context
 	if !r.a2aGatewayTasksWaitApplies(ctx, agent) {
 		return none
 	}
-	pods, err := r.a2aGatewayTasksWaitPods(ctx, agent)
-	if err != nil {
-		return none
-	}
-	since, waiting := a2aGatewayTasksWait(agent, pods)
-	if !waiting {
+	_, since, waiting, err := r.a2aGatewayTasksWaitRead(ctx, agent)
+	if err != nil || !waiting {
 		return none
 	}
 	if due, left := a2aGatewayTasksWaitDue(since, time.Now()); !due {

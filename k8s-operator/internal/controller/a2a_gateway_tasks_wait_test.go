@@ -24,10 +24,12 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
@@ -220,13 +222,47 @@ func setNATSReady(t *testing.T, r *PlatformAgentReconciler, agent *agentv1alpha1
 	}
 }
 
+// waitingLeader creates an A2A gateway pod, started ago, not ready, and makes
+// it the Lease holder from the same moment: the elected gateway waiting.
+func waitingLeader(t *testing.T, r *PlatformAgentReconciler, agent *agentv1alpha1.PlatformAgent, ago time.Duration) *corev1.Pod {
+	t.Helper()
+	started := time.Now().Add(-ago)
+	pod := a2aGatewayPod(agent, a2aGatewayName(agent)+"-abc", &started, false)
+	if err := r.Create(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	holdLease(t, r, agent, pod.Name, started)
+	return pod
+}
+
+// holdLease sets the A2A gateway Lease's holder and acquire time; "" clears
+// the holder.
+func holdLease(t *testing.T, r *PlatformAgentReconciler, agent *agentv1alpha1.PlatformAgent, holder string, at time.Time) {
+	t.Helper()
+	ctx := context.Background()
+	lease := &coordinationv1.Lease{}
+	key := client.ObjectKey{Namespace: agent.Namespace, Name: a2aGatewayLeaseName(agent)}
+	if err := r.Get(ctx, key, lease); err != nil {
+		lease = buildA2AGatewayLease(agent)
+		if err := r.Create(ctx, lease); err != nil {
+			t.Fatalf("the gateway Lease: %v", err)
+		}
+	}
+	if holder == "" {
+		lease.Spec.HolderIdentity = nil
+	} else {
+		lease.Spec.HolderIdentity = ptr.To(holder)
+	}
+	lease.Spec.AcquireTime = &metav1.MicroTime{Time: at}
+	if err := r.Update(ctx, lease); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestAGatewayStillWaitingForTasksReadsDegraded(t *testing.T) {
 	r, stored, state := settledA2AInstall(t)
 	ctx := context.Background()
-	started := time.Now().Add(-10 * time.Minute)
-	if err := r.Create(ctx, a2aGatewayPod(stored, a2aGatewayName(stored)+"-abc", &started, false)); err != nil {
-		t.Fatal(err)
-	}
+	waitingLeader(t, r, stored, 10*time.Minute)
 	if _, err := r.updateStatusReady(ctx, stored, "", otlpSourceNone, r.resolveNetpolProfile(ctx, stored), state); err != nil {
 		t.Fatal(err)
 	}
@@ -264,10 +300,7 @@ func TestAGatewayStillWaitingForTasksReadsDegraded(t *testing.T) {
 func TestAGatewayWaitingUnderTheThresholdIsNotDegraded(t *testing.T) {
 	r, stored, state := settledA2AInstall(t)
 	ctx := context.Background()
-	started := time.Now().Add(-time.Minute)
-	if err := r.Create(ctx, a2aGatewayPod(stored, a2aGatewayName(stored)+"-abc", &started, false)); err != nil {
-		t.Fatal(err)
-	}
+	waitingLeader(t, r, stored, time.Minute)
 	if _, err := r.updateStatusReady(ctx, stored, "", otlpSourceNone, r.resolveNetpolProfile(ctx, stored), state); err != nil {
 		t.Fatal(err)
 	}
@@ -283,10 +316,7 @@ func TestAGatewayWaitingUnderTheThresholdIsNotDegraded(t *testing.T) {
 func TestTheTasksWaitRanksBelowTheReasonsAboveIt(t *testing.T) {
 	r, stored, state := settledA2AInstall(t)
 	ctx := context.Background()
-	started := time.Now().Add(-10 * time.Minute)
-	if err := r.Create(ctx, a2aGatewayPod(stored, a2aGatewayName(stored)+"-abc", &started, false)); err != nil {
-		t.Fatal(err)
-	}
+	waitingLeader(t, r, stored, 10*time.Minute)
 	// A refused credential-proxy override ranks below it.
 	stored.Spec.Deployment = &agentv1alpha1.DeploymentSpec{CredentialProxy: &agentv1alpha1.CredentialProxySpec{
 		Resources: &corev1.ResourceRequirements{Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1Mi")}},
@@ -305,10 +335,7 @@ func TestTheTasksWaitRanksBelowTheReasonsAboveIt(t *testing.T) {
 func TestTheTasksWaitPointsAtBusStreamsPresent(t *testing.T) {
 	r, stored, _ := settledA2AInstall(t)
 	ctx := context.Background()
-	started := time.Now().Add(-10 * time.Minute)
-	if err := r.Create(ctx, a2aGatewayPod(stored, a2aGatewayName(stored)+"-abc", &started, false)); err != nil {
-		t.Fatal(err)
-	}
+	waitingLeader(t, r, stored, 10*time.Minute)
 	if msg := r.a2aGatewayTasksWaitMessage(ctx, stored); msg == "" || strings.Contains(msg, "BusStreamsPresent") {
 		t.Fatalf("message without the condition = %q", msg)
 	}
@@ -328,10 +355,7 @@ func TestTheTasksWaitPointsAtBusStreamsPresent(t *testing.T) {
 func TestABusThatIsDownIsNotBlamedOnTheGateway(t *testing.T) {
 	r, stored, _ := settledA2AInstall(t)
 	ctx := context.Background()
-	started := time.Now().Add(-10 * time.Minute)
-	if err := r.Create(ctx, a2aGatewayPod(stored, a2aGatewayName(stored)+"-abc", &started, false)); err != nil {
-		t.Fatal(err)
-	}
+	waitingLeader(t, r, stored, 10*time.Minute)
 	setNATSReady(t, r, stored, 0)
 	if msg := r.a2aGatewayTasksWaitMessage(ctx, stored); msg != "" {
 		t.Errorf("a bus with no ready server produced %q", msg)
@@ -347,10 +371,7 @@ func TestABusThatIsDownIsNotBlamedOnTheGateway(t *testing.T) {
 func TestAHigherDegradedReasonStopsTheRequeue(t *testing.T) {
 	r, stored, _ := settledA2AInstall(t)
 	ctx := context.Background()
-	started := time.Now().Add(-10 * time.Minute)
-	if err := r.Create(ctx, a2aGatewayPod(stored, a2aGatewayName(stored)+"-abc", &started, false)); err != nil {
-		t.Fatal(err)
-	}
+	waitingLeader(t, r, stored, 10*time.Minute)
 	if due := r.a2aGatewayTasksWaitRequeue(ctx, stored); due != time.Second {
 		t.Fatalf("precondition: requeue = %v for a due, unwritten reason", due)
 	}
@@ -372,7 +393,14 @@ func TestAFailedPodReadKeepsTheReason(t *testing.T) {
 			}
 			return c.List(ctx, list, opts...)
 		},
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*corev1.Pod); ok {
+				return fmt.Errorf("the API server refused the get")
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
 	})
+	waitingLeader(t, r, stored, 10*time.Minute)
 	blind := &PlatformAgentReconciler{Client: refusing, APIReader: refusing, Scheme: r.Scheme}
 	if msg := blind.a2aGatewayTasksWaitMessage(ctx, stored); msg != "" {
 		t.Errorf("a failed read with no reason held produced %q", msg)
@@ -393,7 +421,7 @@ func TestAReadyGatewayCostsNoPodList(t *testing.T) {
 	if err := r.Get(ctx, client.ObjectKey{Namespace: stored.Namespace, Name: a2aGatewayName(stored)}, gw); err != nil {
 		t.Fatal(err)
 	}
-	gw.Status.ReadyReplicas = 1
+	gw.Status.ReadyReplicas = *gw.Spec.Replicas
 	if err := r.Status().Update(ctx, gw); err != nil {
 		t.Fatal(err)
 	}
@@ -405,11 +433,127 @@ func TestAReadyGatewayCostsNoPodList(t *testing.T) {
 			}
 			return c.List(ctx, list, opts...)
 		},
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*corev1.Pod); ok {
+				lists++
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
 	})
 	counted := &PlatformAgentReconciler{Client: counting, APIReader: counting, Scheme: r.Scheme}
 	_ = counted.a2aGatewayTasksWaitMessage(ctx, stored)
 	_ = counted.a2aGatewayTasksWaitRequeue(ctx, stored)
 	if lists != 0 {
-		t.Errorf("a ready gateway cost %d pod lists", lists)
+		t.Errorf("a ready gateway cost %d pod reads", lists)
+	}
+}
+
+// TestTheElectedLeaderIsTheGatewayThatIsRead is the shape seen live on an HA
+// install: two replicas, the leader waiting and not ready, the standby
+// Ready. The Deployment reads 1/2 ready and the CR read Ready; the reason
+// fires on the leader and names it.
+func TestTheElectedLeaderIsTheGatewayThatIsRead(t *testing.T) {
+	r, stored, state := settledA2AInstall(t)
+	ctx := context.Background()
+	leader := waitingLeader(t, r, stored, 10*time.Minute)
+	started := time.Now().Add(-10 * time.Minute)
+	standby := a2aGatewayPod(stored, a2aGatewayName(stored)+"-standby", &started, true)
+	if err := r.Create(ctx, standby); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.updateStatusReady(ctx, stored, "", otlpSourceNone, r.resolveNetpolProfile(ctx, stored), state); err != nil {
+		t.Fatal(err)
+	}
+	d := meta.FindStatusCondition(stored.Status.Conditions, degradedConditionType)
+	if d == nil || d.Reason != conditionReasonA2AGatewayWaitingForTasks {
+		t.Fatalf("Degraded = %+v, want %s with a Ready standby", d, conditionReasonA2AGatewayWaitingForTasks)
+	}
+	if !strings.Contains(d.Message, leader.Name) || strings.Contains(d.Message, standby.Name) {
+		t.Errorf("message names the wrong pod: %s", d.Message)
+	}
+
+	// The standby is what reads not ready instead: nothing to report.
+	holdLease(t, r, stored, standby.Name, started)
+	if msg := r.a2aGatewayTasksWaitMessage(ctx, stored); msg != "" {
+		t.Errorf("a ready leader produced %q", msg)
+	}
+}
+
+// No leader to read is no wait to report: a Lease with no holder, or a
+// holder whose pod is gone.
+func TestNoLeaderIsNoTasksWait(t *testing.T) {
+	r, stored, _ := settledA2AInstall(t)
+	ctx := context.Background()
+	waitingLeader(t, r, stored, 10*time.Minute)
+	holdLease(t, r, stored, "", time.Now().Add(-time.Hour))
+	if msg := r.a2aGatewayTasksWaitMessage(ctx, stored); msg != "" {
+		t.Errorf("no holder produced %q", msg)
+	}
+	holdLease(t, r, stored, a2aGatewayName(stored)+"-gone", time.Now().Add(-time.Hour))
+	if msg := r.a2aGatewayTasksWaitMessage(ctx, stored); msg != "" {
+		t.Errorf("a stale holder produced %q", msg)
+	}
+	if due := r.a2aGatewayTasksWaitRequeue(ctx, stored); due != 24*time.Hour {
+		t.Errorf("requeue = %v with a stale holder, want none", due)
+	}
+}
+
+// A standby promoted a moment ago gets the threshold from its promotion,
+// however long its container has run.
+func TestAFreshlyElectedLeaderGetsTheThresholdFromItsElection(t *testing.T) {
+	r, stored, _ := settledA2AInstall(t)
+	ctx := context.Background()
+	pod := waitingLeader(t, r, stored, time.Hour)
+	holdLease(t, r, stored, pod.Name, time.Now().Add(-30*time.Second))
+	if msg := r.a2aGatewayTasksWaitMessage(ctx, stored); msg != "" {
+		t.Errorf("a leader elected 30s ago produced %q", msg)
+	}
+	if due := r.a2aGatewayTasksWaitRequeue(ctx, stored); due <= 4*time.Minute || due > a2aGatewayTasksWaitThreshold {
+		t.Errorf("requeue = %v, want ~4.5 minutes from the election", due)
+	}
+}
+
+// With leader election switched off every pod is read, as on a gateway
+// that runs one replica with no Lease.
+func TestWithoutElectionEveryPodIsRead(t *testing.T) {
+	t.Setenv(a2aGatewayElectionEnvVar, "false")
+	r, stored, _ := settledA2AInstall(t)
+	ctx := context.Background()
+	started := time.Now().Add(-10 * time.Minute)
+	if err := r.Create(ctx, a2aGatewayPod(stored, a2aGatewayName(stored)+"-only", &started, false)); err != nil {
+		t.Fatal(err)
+	}
+	if msg := r.a2aGatewayTasksWaitMessage(ctx, stored); !strings.Contains(msg, a2aGatewayName(stored)+"-only") {
+		t.Errorf("message = %q, want the one pod named", msg)
+	}
+}
+
+// No leader clears a reason the CR holds: it is evidence, not a failed read.
+func TestNoLeaderClearsAHeldReason(t *testing.T) {
+	r, stored, _ := settledA2AInstall(t)
+	ctx := context.Background()
+	waitingLeader(t, r, stored, 10*time.Minute)
+	meta.SetStatusCondition(&stored.Status.Conditions, metav1.Condition{Type: degradedConditionType, Status: metav1.ConditionTrue,
+		Reason: conditionReasonA2AGatewayWaitingForTasks, Message: "held message"})
+	for name, holder := range map[string]string{"no holder": "", "a stale holder": a2aGatewayName(stored) + "-gone"} {
+		holdLease(t, r, stored, holder, time.Now().Add(-time.Hour))
+		if msg := r.a2aGatewayTasksWaitMessage(ctx, stored); msg != "" {
+			t.Errorf("%s kept %q", name, msg)
+		}
+	}
+}
+
+// A leader whose container is not running (crash looping, in a pod that
+// still reads Running) is the pod fault scan's to name.
+func TestACrashLoopingLeaderIsTheFaultScans(t *testing.T) {
+	r, stored, _ := settledA2AInstall(t)
+	ctx := context.Background()
+	pod := waitingLeader(t, r, stored, 10*time.Minute)
+	pod.Status.ContainerStatuses[0].State = corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: reasonCrashLoopBackOff}}
+	if err := r.Status().Update(ctx, pod); err != nil {
+		t.Fatal(err)
+	}
+	if msg := r.a2aGatewayTasksWaitMessage(ctx, stored); msg != "" {
+		t.Errorf("a crash-looping leader produced %q", msg)
 	}
 }
