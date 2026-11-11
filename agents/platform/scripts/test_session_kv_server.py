@@ -11238,14 +11238,12 @@ class TestCardStop(unittest.TestCase):
         # #5528: the gateway's card-stop control and the bridge's cancel
         # archive both stop one session; the later one must not read
         # "stopped 0" against the cards the earlier one stopped.
-        import sqlite3
-
-        self.the_tree()
         # Filed a while before the stop, as real cards are: one filed in the
         # stop's own second counts as possibly new (whole-second stamps).
-        with sqlite3.connect(self.board) as conn:
-            conn.execute("UPDATE tasks SET created_at = created_at - 10")
+        self.card("t_a", "ready", session=self.SESSION, created=time.time() - 10)
+        self.card("t_b", "todo", session=self.SESSION, created=time.time() - 10)
         first = self.stop().json()
+        self.assertEqual(self.stopped_ids(first), ["t_a", "t_b"])
         second = self.stop()
         self.assertEqual(second.status_code, 200)
         body = second.json()
@@ -11309,6 +11307,52 @@ class TestCardStop(unittest.TestCase):
         self.assertEqual(out["a"]["stopped"], out["b"]["stopped"])
         self.assertNotIn("joined", out["a"])
         self.assertTrue(out["b"]["joined"])
+
+    def test_a_partial_first_stop_is_never_reused(self):
+        # A card archived mid-claim (unresolved) may still get a worker: the
+        # second stop runs afresh rather than repeating a partial answer.
+        self.card("t_claimed", "running", session=self.SESSION, created=time.time() - 10)
+        first = self.stop().json()
+        self.assertEqual([c["id"] for c in first["unresolved"]], ["t_claimed"])
+        second = self.stop().json()
+        self.assertNotIn("joined", second)
+
+    def test_joining_a_running_stop_rescans_when_a_card_was_filed_since(self):
+        import threading as _threading
+
+        release, entered = _threading.Event(), _threading.Event()
+        calls = []
+
+        def run():
+            calls.append(1)
+            if len(calls) == 1:
+                entered.set()
+                release.wait(5)
+            return {"session_id": self.SESSION, "stopped": [{"id": f"t_{len(calls)}"}]}
+
+        out = {}
+
+        def caller(name):
+            out[name] = session_kv_server._card_stop_single_flight(self.SESSION, self.CONVERSATION, run)
+
+        with patch.object(session_kv_server, "_card_stop_tree_has_card_since", lambda *a: True):
+            a = _threading.Thread(target=caller, args=("a",))
+            a.start()
+            self.assertTrue(entered.wait(5))
+            b = _threading.Thread(target=caller, args=("b",))
+            b.start()
+            time.sleep(0.2)
+            release.set()
+            a.join(5)
+            b.join(5)
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("joined", out["b"])
+
+    def test_a_truncated_tree_read_counts_as_a_new_card(self):
+        self.card("t_a", "ready", session=self.SESSION, created=time.time() - 10)
+        truncated = session_kv_server._CardTree({}, [], True)
+        with patch.object(session_kv_server, "_collect_card_tree", lambda *a, **k: truncated):
+            self.assertTrue(session_kv_server._card_stop_tree_has_card_since(self.SESSION, self.CONVERSATION, time.time()))
 
     def test_another_conversation_never_joins(self):
         calls = []

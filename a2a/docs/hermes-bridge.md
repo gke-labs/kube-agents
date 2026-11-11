@@ -754,8 +754,9 @@ hold at once. A2A door `tasks/cancel` returns before the terminal, so the hold d
 asks first. A cancel outside the wait still stops the cards in the background.
 
 session-kv's stop is single-flight per session and conversation. A stop that arrives while
-another runs, or within 60 s of one with no card filed since its first scan began, answers with
-that stop's result, marked `joined`. So the control and a typed stop's cancel, which both run when
+another runs, or within 60 s of one, answers with that stop's result, marked `joined`, only when
+that result is complete (nothing failed, pending, unresolved, past the deadline or truncated) and
+no card was filed since its first scan began. Anything else gets a fresh stop. So the control and a typed stop's cancel, which both run when
 the gateway's card stop is armed, report the same cards rather than one of them "stopped 0".
 
 ## Sizing against the eval harness
