@@ -10831,15 +10831,16 @@ def get_board() -> Dict[str, Any]:
 
 
 @app.get("/v1/post-merge/clean-merges", dependencies=[Depends(verify_api_key)])
-def get_clean_merges() -> Dict[str, Any]:
-    """The install's clean merges per kind of fix (`clean_merges.py`), for the auto-merge offer and the dial.
+def get_clean_merges(repo: str = "") -> Dict[str, Any]:
+    """Clean merges per repository, kind of fix and environment (`clean_merges.py`), for the offer and the dial.
 
-    A database that cannot be read, or a records table without a column the count
-    needs, is a 503, never zero clean merges.
+    `repo` narrows the answer to one repository. A database that cannot be read,
+    or a records table without a column the count needs, is a 503, never zero
+    clean merges.
     """
     try:
         with closing(_read_only(SESSION_KV_DB_PATH)) as conn:
-            return clean_merges.track_record(conn, datetime.now(timezone.utc))
+            return clean_merges.track_record(conn, datetime.now(timezone.utc), repo=repo.strip() or None)
     except (sqlite3.Error, clean_merges.SchemaIncomplete) as exc:
         raise HTTPException(status_code=503, detail=f"the post-merge records could not be read: {exc}") from None
 
