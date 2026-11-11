@@ -17511,6 +17511,15 @@ class TestExplainOnlyInstallTakesNoRemediation(unittest.TestCase):
         self.assertIn("explain-only", refusal)
         self.assertIn("a retry will not change this", refusal)
 
+    def test_a_misspelt_value_carries_the_brokers_reason(self):
+        def forge(verb, repo, payload):
+            return {"forge": "github", "writeMode": "none", "writeModeDetail": "KUBEAGENTS_WRITE_MODE is set to a value that is neither none nor propose"}
+
+        with patch.object(audit_report, "forge", forge):
+            refusal = audit_report.write_mode_refusal("acme/fleet")
+        self.assertIn("explain-only", refusal)
+        self.assertIn("neither none nor propose", refusal)
+
     def test_the_reply_to_remediate_names_the_write_mode_and_promises_no_retry(self):
         forge, _ = self._broker("none")
         requests = type("R", (), {"targets": ["f1"]})()

@@ -22756,15 +22756,20 @@ def write_mode_refusal(repo: str) -> str:
     An explain-only install (`writeMode: none` in the broker's `capabilities`)
     refuses every branch push and pull request, and no retry changes that. An
     answer that cannot be read, or a broker too old to report the field,
-    refuses nothing here; the broker still refuses the publish itself.
+    refuses nothing here; the broker still refuses the publish itself. A
+    misspelt value carries the broker's `writeModeDetail`.
     """
     answer = capabilities_answer(repo)
-    if isinstance(answer, dict) and answer.get("writeMode") == "none":
-        return (
-            "this install is explain-only (writeMode: none): it does not push branches "
-            "or open pull requests, so a retry will not change this."
-        )
-    return ""
+    if not isinstance(answer, dict) or answer.get("writeMode") != "none":
+        return ""
+    refusal = (
+        "this install is explain-only (writeMode: none): it does not push branches "
+        "or open pull requests, so a retry will not change this."
+    )
+    # The broker's reason when that `none` comes from a misspelt value.
+    if detail := answer.get("writeModeDetail"):
+        refusal += f" ({detail})"
+    return refusal
 
 
 def remediation_refusal(repo: str) -> str:
