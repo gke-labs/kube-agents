@@ -210,6 +210,21 @@ def check_fix(
         )
         return answer
     name, selector = budget
+    # Byte for byte what `finish` writes for this finding, or nothing is read:
+    # a worker-written budget, another namespace, another min or max, or a
+    # second document is a fix for a person to read.
+    generated = recheck.audit_report._pdb_manifest(
+        {
+            "cluster": str(finding.get("cluster") or ""),
+            "object": str(finding.get("object") or ""),
+            "namespace": str(finding.get("namespace") or ""),
+            "pod_selector": selector,
+        },
+        str(finding.get("id", "")),
+    )
+    if generated is None or generated[1] != file_text:
+        answer["checks"] = _unanswered("the fix's file is not the budget the audit generates for this finding, byte for byte")
+        return answer
     target = recheck.Target(
         CHECK_ID,
         str(finding.get("cluster") or ""),
@@ -233,7 +248,9 @@ def check_fix(
     return answer
 
 
-def render_section(answers: list[dict], *, eligible: bool, noun: str, clean: Callable[[str], str] = str) -> str:
+def render_section(
+    answers: list[dict], *, eligible: bool, noun: str, clean: Callable[[str], str] = str, practice: bool = False
+) -> str:
     """The body section for a group's answers, closed by the hidden marker.
 
     `clean` is applied to every detail and command, which carry cluster
@@ -255,7 +272,7 @@ def render_section(answers: list[dict], *, eligible: bool, noun: str, clean: Cal
             out += ["", "Reproduce with (read-only):", "", "```bash", clean(_shown_command(answer["command"])), "```"]
     out += [
         "",
-        "**Auto-merge:** eligible."
+        ("**Would auto-merge (practice).**" if practice else "**Auto-merge:** eligible.")
         if eligible
         else f"**Auto-merge:** not eligible; this {noun} waits for a person to review it.",
         "",

@@ -2778,6 +2778,7 @@ def _manifest_delta():
 # request opens, and the answer written into the body (pdb_safety.py).
 AUTOMERGE_SWITCH = "AUTOMERGE"
 SWITCH_OFF = "off"
+AUTOMERGE_PRACTICE = "practice"
 # The collector outcome that says it read a cluster under the install's scope.
 COLLECTED_OUTCOME = "collected"
 
@@ -2843,7 +2844,9 @@ def pdb_safety_section(group: list[dict], snapshot: dict[str, bytes], manifest: 
         answers.append(answer)
     eligible = len(budgets) == len(group) and all(a["eligible"] for a in answers)
     log(f"SAFETY: {', '.join(a['finding_id'] for a in answers)}: auto-merge {'eligible' if eligible else 'not eligible'}")
-    return pdb_safety.render_section(answers, eligible=eligible, noun=noun, clean=publishable_text)
+    return pdb_safety.render_section(
+        answers, eligible=eligible, noun=noun, clean=publishable_text, practice=automerge_switch() == AUTOMERGE_PRACTICE
+    )
 
 
 def set_sweep_waived(waived: bool) -> None:
