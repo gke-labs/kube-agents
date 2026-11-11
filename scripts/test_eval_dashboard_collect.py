@@ -2208,6 +2208,35 @@ class TestReleaseCollection(_MergeBase):
         self.assertNotIn("gcs_base", by_id["10"])
         self.assertEqual(by_id["20"]["gcs_base"], new_prefix + "20/")
 
+    def test_the_rc_limit_is_taken_across_the_globs_not_per_glob(self):
+        """collect trims releases[] to rc_limit across every glob, so the reads
+        must be trimmed the same way: with the limit applied per glob, the old
+        bucket's builds that the new bucket's had pushed out of releases[]
+        would be read again on every tick and thrown away again."""
+        old_prefix = "gs://kube-agents-prow/logs/post-kube-agents-eval-rc/"
+        new_prefix = "gs://kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/"
+        files = {}
+        for prefix, build_id in ((old_prefix, "10"), (old_prefix, "20"), (old_prefix, "30"), (new_prefix, "40")):
+            for path in (RC_TESTDATA / BUILD_RC_GREEN).rglob("*"):
+                if path.is_file():
+                    files[f"{prefix}{build_id}/{path.relative_to(RC_TESTDATA / BUILD_RC_GREEN).as_posix()}"] = path.read_text()
+        reads = []
+
+        def fake_call(args, gcloud=collect.DEFAULT_GCLOUD, runner=None):
+            if args[0] == "ls":
+                prefix = args[1].rstrip("*")
+                dirs = sorted({url[len(prefix):].split("/", 1)[0] for url in files if url.startswith(prefix)})
+                return "".join(f"{prefix}{d}/\n" for d in dirs), ""
+            reads.append(args[1])
+            text = files.get(args[1])
+            return (text, "") if text is not None else (None, "matched no objects")
+
+        with mock.patch.object(collect, "_gcloud_storage_call", fake_call), contextlib.redirect_stderr(io.StringIO()) as err:
+            releases = collect.releases_from_gcs([old_prefix + "*", new_prefix + "*"], limit=2)
+        self.assertEqual([r["build_id"] for r in releases], ["40", "30"], "the newest two across both prefixes")
+        self.assertFalse([r for r in reads if "/10/" in r or "/20/" in r], "the builds the caller would trim are never read")
+        self.assertIn("4 release-candidate builds listed under 2 prefix(es), reading the newest 2", err.getvalue())
+
     def test_a_failed_listing_warns_and_keeps_the_rest_of_the_collect(self):
         gcloud, _ = self.fake_rc_gcloud([])
         os.environ["FAKE_GCLOUD_DENY"] = "nowhere"

@@ -2081,7 +2081,13 @@ def releases_from_gcs(
     release is final (build_release records nothing without a finished.json),
     so re-reading one buys nothing and costs three gcloud storage calls.
     """
-    releases = []
+    # Every glob is listed before anything is read, and the trim to `limit`
+    # is taken across them all, by build id: it is the same trim the caller
+    # applies to releases[] (collect's rc_limit), so a build the caller would
+    # drop is never read. Trimming each glob on its own would re-read, on
+    # every tick, the old bucket's builds that the newer bucket's had already
+    # pushed out of releases[].
+    dirs = []
     for glob in rc_globs:
         listing, stderr = _gcloud_storage_call(["ls", glob], gcloud)
         if listing is None:
@@ -2093,31 +2099,33 @@ def releases_from_gcs(
             else:
                 print(f"warning: gcloud storage ls failed for {glob}; skipping", file=sys.stderr)
             continue
-        dirs = sorted(_build_dirs(listing), key=lambda d: int(d[0]), reverse=True)
-        if len(dirs) > limit:
-            print(
-                f"note: {glob}: {len(dirs)} release-candidate builds listed,"
-                f" reading the newest {limit}",
-                file=sys.stderr,
-            )
-            dirs = dirs[:limit]
-        dirs = [d for d in dirs if d[0] not in known]
-        for build_id, line in dirs:
-            try:
-                release = build_release(build_id, _gcs_reader(line, gcloud))
-            except Exception as exc:  # noqa: BLE001 -- one bad build must not kill the sweep
-                print(f"warning: rc build {build_id}: {exc}; skipping", file=sys.stderr)
-                continue
-            if release is None:
-                print(f"note: rc build {build_id}: no finished.json; skipping", file=sys.stderr)
-                continue
-            # Where the build lives, by the same rule as runs[] (SCHEMA.md,
-            # releases[].gcs_base): only for a bucket Deck cannot read, so the
-            # Brief's row links the Console; a release in the old bucket
-            # keeps its Spyglass artifacts_url, which still renders it.
-            if records_location(line):
-                release["gcs_base"] = line
-            releases.append(release)
+        dirs.extend(_build_dirs(listing))
+    dirs = sorted(dirs, key=lambda d: int(d[0]), reverse=True)
+    if len(dirs) > limit:
+        print(
+            f"note: {len(dirs)} release-candidate builds listed under {len(rc_globs)} prefix(es),"
+            f" reading the newest {limit}",
+            file=sys.stderr,
+        )
+        dirs = dirs[:limit]
+    dirs = [d for d in dirs if d[0] not in known]
+    releases = []
+    for build_id, line in dirs:
+        try:
+            release = build_release(build_id, _gcs_reader(line, gcloud))
+        except Exception as exc:  # noqa: BLE001 -- one bad build must not kill the sweep
+            print(f"warning: rc build {build_id}: {exc}; skipping", file=sys.stderr)
+            continue
+        if release is None:
+            print(f"note: rc build {build_id}: no finished.json; skipping", file=sys.stderr)
+            continue
+        # Where the build lives, by the same rule as runs[] (SCHEMA.md,
+        # releases[].gcs_base): only for a bucket Deck cannot read, so the
+        # Brief's row links the Console; a release in the old bucket
+        # keeps its Spyglass artifacts_url, which still renders it.
+        if records_location(line):
+            release["gcs_base"] = line
+        releases.append(release)
     return releases
 
 
