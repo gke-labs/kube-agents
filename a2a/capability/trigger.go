@@ -45,7 +45,7 @@ var triggerKeys = []string{"name", "origin", "stream"}
 // envelope's authority block. The gateway writes it there on a trigger's
 // submission and nowhere else (that half is Track 2 of #4685, not yet built); it is a claim, not authority, until the
 // verifier finds it equal to the grant's (profile.run). nil when the block
-// names none (absent or null).
+// names none: the block absent or null, or its trigger absent or null.
 //
 // It reads the block strictly, the way taskcred reads a credential: no key
 // twice and no key that equals "trigger" (or one of the trigger's own keys)
@@ -59,7 +59,21 @@ func TriggerFromAuthority(raw json.RawMessage) (*Trigger, error) {
 		return nil, nil
 	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
-	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, fmt.Errorf("authority block is not a JSON object")
+	}
+	// A null block is what every producer but the gateway's ingress sends
+	// (lib.WithAuthority), and RefFromAuthority reads it as no capability:
+	// it names no trigger either, so admission refuses it for the missing
+	// capability rather than as a malformed trigger.
+	if tok == nil {
+		if _, err := dec.Token(); err != io.EOF {
+			return nil, fmt.Errorf("authority block: trailing data")
+		}
+		return nil, nil
+	}
+	if tok != json.Delim('{') {
 		return nil, fmt.Errorf("authority block is not a JSON object")
 	}
 	var found *Trigger

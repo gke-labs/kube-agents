@@ -107,6 +107,8 @@ func TestAHopCannotChangeTheTrigger(t *testing.T) {
 func TestTriggerFromAuthority(t *testing.T) {
 	for name, raw := range map[string]string{
 		"no block":        ``,
+		"a null block":    `null`,
+		"a spaced null":   ` null `,
 		"no trigger":      `{"grants":{"capability":{"key":"k","rev":1}}}`,
 		"a null trigger":  `{"grants":null,"trigger":null}`,
 		"grants and none": `{"grants":null}`,
@@ -138,6 +140,7 @@ func TestTriggerFromAuthority(t *testing.T) {
 		"a user origin":              `{"trigger":{"name":"schedule/a","origin":"user"}}`,
 		"another schedule's stream":  `{"trigger":{"name":"schedule/a","origin":"builtin","stream":"b"}}`,
 		"trailing data in the block": `{"trigger":{"name":"schedule/a","origin":"builtin"}} {}`,
+		"data after a null block":    `null {}`,
 	} {
 		if _, err := TriggerFromAuthority(json.RawMessage(raw)); err == nil {
 			t.Errorf("%s: accepted", name)

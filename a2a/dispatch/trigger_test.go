@@ -139,3 +139,18 @@ func TestTheProxyTokenCarriesTheAdmittedTrigger(t *testing.T) {
 		t.Errorf("the bus credential carries a trigger %+v", *natsC.Trigger)
 	}
 }
+
+// An authority block of null, what every producer but the gateway's ingress
+// sends, is refused for the missing capability, not as a malformed trigger.
+func TestANullAuthorityIsRefusedAsNoCapability(t *testing.T) {
+	d, v, snap, prof, hk := triggerAdmission(t)
+	env := submissionEnv(t, "tse", "task-1", "", clusterParams)
+	env.Authority = json.RawMessage(`null`)
+	_, ref, err := d.admit(context.Background(), &envDelivery{env: env}, snap, prof, hk, time.Now())
+	if err != nil || ref == nil || ref.reason != ReasonVerifierRefused || ref.detail != "the submission carries no capability" {
+		t.Fatalf("refusal %+v, err %v; want the no-capability refusal", ref, err)
+	}
+	if n := len(v.callList()); n != 0 {
+		t.Errorf("%d verifier calls; want none", n)
+	}
+}
