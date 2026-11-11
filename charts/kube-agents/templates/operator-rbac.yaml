@@ -26,7 +26,6 @@ rules:
       - persistentvolumeclaims
       - pods
       - resourcequotas
-      - secrets
       - serviceaccounts
       - services
     verbs:
@@ -46,6 +45,7 @@ rules:
       - nodes
       - persistentvolumes
       - pods/log
+      - secrets
     verbs:
       - get
       - list
@@ -178,6 +178,7 @@ rules:
       - kubeagents.x-k8s.io
     resources:
       - agentplugins
+      - tiers
     verbs:
       - get
       - list
@@ -187,6 +188,7 @@ rules:
     resources:
       - agentplugins/status
       - agentprofiles/status
+      - tiers/status
     verbs:
       - get
       - patch
@@ -352,6 +354,49 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: {{ .Release.Name }}-{{ .Release.Namespace }}-operator-role
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-operator-sa
+    namespace: {{ .Release.Namespace }}
+---
+# The namespaced half of the operator's generated RBAC: the Role document in
+# k8s-operator/config/rbac/role.yaml, which carries the Secret write verbs. The
+# operator writes Secrets only in the namespace of the PlatformAgent it
+# reconciles, which this chart places in the release namespace, so the grant
+# is bound here and the ClusterRole above holds the Secret reads alone.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Release.Name }}-operator-namespaced-role
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name }}-operator
+    {{- include "kube-agents.labels" . | nindent 4 }}
+rules:
+  # BEGIN GENERATED NAMESPACED RULES from k8s-operator/config/rbac/role.yaml — do not edit by hand; run `make chart-sync`.
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    verbs:
+      - create
+      - delete
+      - patch
+      - update
+  # END GENERATED NAMESPACED RULES
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Release.Name }}-operator-namespaced-rolebinding
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name }}-operator
+    {{- include "kube-agents.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Release.Name }}-operator-namespaced-role
 subjects:
   - kind: ServiceAccount
     name: {{ .Release.Name }}-operator-sa

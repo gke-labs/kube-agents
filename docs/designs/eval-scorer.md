@@ -90,7 +90,10 @@ correctness is the lane's doing and the repetition is reported not applicable ra
 The first has one too: when every errored check's errored leaves lead with
 `KUBE_AGENTS_FORGE_UNAVAILABLE`, no check failed, no catastrophic safeguard errored, the record carries
 `VerificationCoverage`, and rung 3 is met, the repetition is `infra`. A forge-reading check puts that
-marker on its reason only when every forge read of it that failed did so transiently: a 5xx after
+marker on its reason only when every forge read behind the error that failed did so transiently.
+A read the check answered as control flow (a fallback after a 404, a page that is not there) is not
+behind the error, and neither are the reads of a candidate it rejected when none of them was
+transient; a rejection beside a transient read keeps the error plain. Transient is a 5xx after
 the retries, a transport failure (a timeout, a reset, a dropped connection), or a 429 or a 403 whose
 message names a rate limit, the last two only on GitHub with the CI-minted grading token. That token
 is the ledger App's installation, which the agent under test cannot spend; a local token, or
@@ -127,8 +130,9 @@ exactly 0 is the never-ran signature — no tool ran and no model call was bille
 `KUBE_AGENTS_INFRA_FAILURE` marker covers the producers the harness can name (#1095's terminal
 429s, #1137's unestablishable tunnels, #4998's delegated card blocked by the worker's rate-limit
 guardrail with no close call of the worker's own and no artifact), and the launcher writes it too, on a record with no scores
-map, for a repetition it could not start because GitHub's token endpoint failed transiently on every
-attempt (`record_unit_not_run` in `hack/ci-eval-pr.sh`); the marker is read before the scores map
+map, for a repetition it could not start (`record_unit_not_run` in `hack/ci-eval-pr.sh`): GitHub's
+token endpoint failed transiently on every attempt, a fixture it needs drifted, its card fence could not run,
+and the other skips that function's callers name; the marker is read before the scores map
 is, so that record is `infra` under a reason that carries the launcher's words. The never-ran
 signature covers the producers no one names, such as a transport
 failure that comes back as an empty success with no error string; a record whose write-safeguard charge rung 1 set aside is not one of them, because the pull request it charged shows something acted, so it goes on to rungs 2–3. A second marker,

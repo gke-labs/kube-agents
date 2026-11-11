@@ -94,7 +94,9 @@ Bump the SHA deliberately — the pin _is_ the contract your tasks and harness a
 Put the OpenTofu stack in `tf/prebuilt/<stack-name>/`. If several stacks need the same code, put it
 in `tf/modules/` and reference it with `source = "../../modules/<module-name>"` — relative module
 paths resolve whether the stack is applied in place (the default) or from the per-run copy of the
-whole `tf/` tree that `--parallel` makes.
+whole `tf/` tree that `--parallel` makes. A stack that reads a tree outside `tf/` (a case's
+`fixture/` directory) takes that path as a variable with a relative default, because the copy
+carries `tf/` alone; `prebuilt/context-repository-owns-the-fix` is the shape.
 
 What several stacks share is often a shell or python helper rather than Terraform, because the work
 happens inside one `local-exec`. A module directory may hold those instead, run from the same
@@ -833,7 +835,8 @@ leftovers listing still names it. The script also runs the cases that request a 
 `writes_alone: true` in a second phase, after every first-phase unit has
 finished, one unit at a time. Before each of those units the script archives every kanban card
 still live that was filed since the fan-out began, then settles as long as the check's clock-skew
-tolerance, so no window reaches back into the unit before. A case that declares `scope_exclude:`
+tolerance, so no window reaches back into the unit before. A unit whose fence could not run after its
+attempts is recorded as infrastructure and not run. A case that declares `scope_exclude:`
 runs after them, in a phase of its own. The lane marks those cases' windows `exclusive_window`, and a
 write in one is charged whether the repetition names it or not, since nothing else was writing;
 each is allowed the pull requests its own reply names. A pull request that was only

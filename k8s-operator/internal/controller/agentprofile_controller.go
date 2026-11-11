@@ -167,11 +167,10 @@ func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if !profile.DeletionTimestamp.IsZero() {
 		return r.finalize(ctx, &profile, agent)
 	}
-	if controllerutil.AddFinalizer(&profile, agentProfileFinalizer) {
-		if err := r.Update(ctx, &profile); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{Requeue: true}, nil
+	if added, err := r.patchFinalizers(ctx, &profile, func(o client.Object) bool {
+		return controllerutil.AddFinalizer(o, agentProfileFinalizer)
+	}); err != nil || added {
+		return ctrl.Result{Requeue: added}, err
 	}
 
 	var all agentv1alpha1.AgentProfileList
@@ -325,10 +324,10 @@ func (r *AgentProfileReconciler) renderNothing(ctx context.Context, p *agentv1al
 		return err
 	}
 	if !p.DeletionTimestamp.IsZero() {
-		if controllerutil.RemoveFinalizer(p, agentProfileFinalizer) {
-			return r.Update(ctx, p)
-		}
-		return nil
+		_, err := r.patchFinalizers(ctx, p, func(o client.Object) bool {
+			return controllerutil.RemoveFinalizer(o, agentProfileFinalizer)
+		})
+		return err
 	}
 	return r.writeStatus(ctx, p, agent, "", reason, msg, reason, msg, false)
 }
@@ -353,8 +352,24 @@ func (r *AgentProfileReconciler) finalize(ctx context.Context, p *agentv1alpha1.
 	if err := r.deleteProfileServiceAccounts(ctx, p, profileNamespaceOf(p), nil); err != nil {
 		return ctrl.Result{}, err
 	}
-	controllerutil.RemoveFinalizer(p, agentProfileFinalizer)
-	return ctrl.Result{}, r.Update(ctx, p)
+	_, err := r.patchFinalizers(ctx, p, func(o client.Object) bool {
+		return controllerutil.RemoveFinalizer(o, agentProfileFinalizer)
+	})
+	return ctrl.Result{}, err
+}
+
+// patchFinalizers applies change to p's finalizers and, when it changed them,
+// writes them alone as a merge patch. An Update would send back the whole
+// object as this operator's Go type knows it, and so drop any spec field a
+// newer CRD added: an older operator adding its finalizer to a profile created
+// in the same upgrade stripped yieldToPinned that way (#5435). The optimistic
+// lock keeps Update's conflict on a stale read.
+func (r *AgentProfileReconciler) patchFinalizers(ctx context.Context, p *agentv1alpha1.AgentProfile, change func(client.Object) bool) (bool, error) {
+	before := p.DeepCopy()
+	if !change(p) {
+		return false, nil
+	}
+	return true, r.Patch(ctx, p, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
 }
 
 func (r *AgentProfileReconciler) cards() cardPublisher {

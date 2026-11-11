@@ -581,6 +581,12 @@ const (
 	// carried the way Chat's is (a2aGchatAllowedUsersEnvVar).
 	a2aSlackAllowedUsersEnvVar  = "A2A_SLACK_ALLOWED_USERS"
 	a2aSlackAllowAllUsersEnvVar = "A2A_SLACK_ALLOW_ALL_USERS"
+	// a2aSlackTestUsersEnvVar names the end-to-end test users whose
+	// app-attributed posts the gateway reads as theirs. The operator reads it
+	// from its own environment (as a2aInjectBackendEnvVar) and renders it onto
+	// the gateway under the same name; a2a/gateway/config.go's
+	// EnvSlackTestUsers.
+	a2aSlackTestUsersEnvVar = "A2A_SLACK_TEST_USERS"
 	// The principal map the gateway resolves Discord and Slack senders
 	// through: one path (A2A_PRINCIPAL_MAP, the gateway's default spelled
 	// out), one volume, and one source in it, the armed backend's table
@@ -6144,6 +6150,12 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		// gateway's env, and its pod, as they were.
 		if slack.AnswerFeedback != nil && !*slack.AnswerFeedback {
 			backendEnv = append(backendEnv, corev1.EnvVar{Name: a2aSlackAnswerFeedbackEnvVar, Value: strconv.FormatBool(false)})
+		}
+		// End-to-end test users, from the operator's own environment and
+		// never from the CR, so only an operator deployed for CI or eval
+		// renders it; unset, the gateway's env and pod are as they were.
+		if users := strings.TrimSpace(os.Getenv(a2aSlackTestUsersEnvVar)); users != "" {
+			backendEnv = append(backendEnv, corev1.EnvVar{Name: a2aSlackTestUsersEnvVar, Value: users})
 		}
 		// The learned-home contract (platformagent_home_channel_record.go):
 		// whether the gateway may learn a home channel from the first
