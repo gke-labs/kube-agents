@@ -106,7 +106,7 @@ var platformAgentConditionDocs = []conditionDoc{
 	{
 		Type:    kanbanDispatcherFailingCondition,
 		Written: "From the first time the task-board dispatcher fails for a whole poll",
-		Meaning: "`True` (`TicksFailing`) once the dispatcher has failed 60 ticks in a row on a board, about one five-minute poll at its 5-second interval. The message names the board, the streak and the last error class. Cards on that board are not dispatched; a full data volume is a common cause. `False` (`Ticking`) at the first poll where every streak is below 60. A good tick resets a streak, and a board the dispatcher stops ticking drops out after ten minutes. It does not change `phase` or `Ready`. A poll that cannot read the gateway's chat metrics listener leaves the condition as it is. A board quarantined as corrupt is not counted.",
+		Meaning: "`True` (`TicksFailing`) once a board's dispatcher fails 60 ticks in a row (about one five-minute poll), or 3 in a streak at least a poll old, as on a locked board. A fully locked board fails only every 20 to 36 minutes, so there it turns `True` after about an hour. The message names the board, the streak and the last error class. Cards on that board are not dispatched; a full data volume is a common cause. `False` (`Ticking`) at the first poll where no board meets either rule. A good tick resets a streak; a board the dispatcher stops trying drops out after ten minutes. It does not change `phase` or `Ready`. A poll that cannot read the gateway's chat metrics listener leaves it as it is. A board quarantined as corrupt is not counted.",
 	},
 	{
 		Type:    scopeUndeclaredCondition,
@@ -165,7 +165,7 @@ var platformAgentConditionDocs = []conditionDoc{
 	},
 	{
 		Type:    dataVolumeExpansionConditionType,
-		Written: "Only while a data claim is smaller than `spec.storage.size` (or the 50Gi default) and its StorageClass cannot expand it",
-		Meaning: "`status: True`, `Reason: StorageClassCannotExpand`. The message names each blocked claim, its current request, the size asked for, and why the class cannot expand it. Not `Degraded`: the agent runs on the smaller volume. Written on whichever status the pass ends on, `Ready` or `Degraded`, and removed once the claims can grow or the size no longer asks for more. After an operator restart it is left as it stands until the next pass reads the claims. Set `allowVolumeExpansion: true` on the class to clear it.",
+		Written: "Only while a data claim is smaller than `spec.storage.size` (or the 50Gi default, raised by `expectedClusterProfiles` for the agent's claim) and its StorageClass cannot expand it",
+		Meaning: "`status: True`, `Reason: StorageClassCannotExpand`. The message names each blocked claim, its current request, the size asked for, and why the class cannot expand it. Not `Degraded`: the agent runs on the smaller volume. Written on whichever status the pass ends on, `Ready` or `Degraded`, and removed once the claims can grow or the size no longer asks for more. After an operator restart it is left as it stands until the next pass reads the claims. Set `allowVolumeExpansion: true` on the class to clear it. The agent's claim, when it is below that size and will not grow (its class cannot expand it, or this PlatformAgent does not control it), also gets one `DataVolumeUndersized` Warning Event per state.",
 	},
 }

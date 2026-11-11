@@ -38,10 +38,12 @@ same test checks both. The skills run their scripts by skill-relative paths
 What it holds:
 
 - [`persona.yaml`](persona.yaml): the manifest, with the three parameters and
-  the tools it grants (`read_file`, `shell`, `web_search` and the two servers);
+  the tools it grants (`read_file`, `shell`, `web_search` and `developer_knowledge`);
 - [`instructions.md`](instructions.md): the instructions;
-- [`mcp.yaml`](mcp.yaml): the `gke` and `developer_knowledge` servers on the
-  broker's relay, each limited to its read tools;
+- [`mcp.yaml`](mcp.yaml): the `developer_knowledge` server on the broker's
+  relay, limited to the two document reads a profile worker may use. The `gke`
+  server is left out: the broker refuses it to profile workers, whose `kubectl`
+  and `gcloud` reach the task's target instead;
 - the skills:
   [`gke-load-bearing-change`](skills/gke-load-bearing-change/SKILL.md),
   [`gke-observability`](skills/gke-observability/SKILL.md),
@@ -62,6 +64,6 @@ Check it from `a2a/`:
 ```sh
 go run ./cmd/persona validate --in ../agents/cluster/persona
 go run ./cmd/persona render --harness claude-code --in ../agents/cluster/persona --out "$(mktemp -d)" \
-  --relay-url http://credential-proxy:8765/mcp \
+  --relay-url http://credential-proxy:8765/v1/mcp \
   --relay-command 'node /opt/mcp-remote/dist/proxy.js {url} --transport http-only'
 ```

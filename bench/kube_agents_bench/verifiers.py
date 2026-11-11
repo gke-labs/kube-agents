@@ -69,7 +69,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter
+from contextvars import ContextVar
 from collections.abc import Callable
+from functools import wraps
 from datetime import datetime, time as dt_time, timedelta, timezone
 from typing import Any, Literal
 
@@ -100,7 +102,7 @@ from kube_agents_bench import (
     worker_trajectory,
 )
 from kube_agents_bench.parsing import DELEGATION_TOOL
-from kube_agents_bench.shell_words import _INTERPRETER_RE, _command_word_index, _shell_argvs, _without_grep_patterns
+from kube_agents_bench.shell_words import _INTERPRETER_RE, _command_word_index, _shell_argvs, _typed_call_may_join, _without_grep_patterns
 from kube_agents_bench.fleet import (
     ROLE_PATTERN,
     FleetRoleUnresolved,
@@ -222,6 +224,12 @@ _ONBOARDING_READ_TIMEOUT_SEC = 60.0
 _FORGE_READ_ATTEMPTS = 3
 _FORGE_READ_RETRY_PAUSE_SEC = 2.0
 _HTTP_SERVER_ERROR_FLOOR = 500
+# Answers that say the forge is limiting the caller rather than answering about
+# the run: 429, and a 403 whose message names a rate limit (GitHub's primary
+# and secondary limits both say "rate limit"; a permission 403 does not).
+_HTTP_TOO_MANY_REQUESTS = 429
+_HTTP_FORBIDDEN = 403
+_RATE_LIMIT_MESSAGE_RE = re.compile(r"rate limit", re.IGNORECASE)
 # The sandbox's report changes at most twice (written, then renamed), so at most
 # two of three sandbox re-reads can differ from the read before them.
 _REPORT_READ_ATTEMPTS = 3
@@ -2410,7 +2418,7 @@ def _gitlab_project_unseen(repo: str, token: str, budget: float) -> str | None:
     ``_resolve`` grades a 404 pair: a mistyped project is the agent's error,
     not a credential fault to red every repetition with.
     """
-    status, _ = _http_get_json(
+    status, _ = _forge_get_json(
         forges.gitlab_api_root() + forges.gitlab_project_path(repo), token, budget
     )
     if status == 200:
@@ -2484,7 +2492,7 @@ def _issue_comments(
         urls = [first] + [f"{first}&page={page}" for page in range(2, pages + 1)]
     comments: list[tuple[datetime | None, str]] = []
     for url in urls:
-        status_code, payload = _http_get_json(url, token, budget)
+        status_code, payload = _forge_get_json(url, token, budget)
         if status_code != 200 or not isinstance(payload, list):
             return None
         for comment in payload:
@@ -2540,6 +2548,8 @@ _TERMINAL_TOOL = "terminal"
 _CODE_TOOLS = frozenset({_TERMINAL_TOOL, "execute_code"})
 _CODE_ARG = "code"
 _COMMAND_ARG = "command"
+# The one key of an argument object the pod clipped: ``{"raw": text}``.
+_CLIPPED_ARGS_KEY = "raw"
 # The head of a ``"command"`` literal the pod clipped before its closing quote:
 # what is there is still the command's start, which is where its verb is.
 _CLIPPED_COMMAND_HEAD_RE = re.compile(r'"command"\s*:\s*"((?:[^"\\]|\\.)*)')
@@ -2694,6 +2704,31 @@ def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, float | Non
     return calls
 
 
+def _terminal_call_texts(trajectory: list[Any]) -> list[tuple[str, str]]:
+    """``(card, command)`` per tagged ``terminal`` call, as :func:`_worker_terminal_calls` reads it."""
+    texts: list[tuple[str, str]] = []
+    for entry in trajectory:
+        if isinstance(entry, dict) and entry.get("agent") and entry.get("name") == _TERMINAL_TOOL:
+            command = _code_call_text(entry)
+            if command is not None:
+                texts.append((str(entry.get("task") or entry.get("session") or ""), command))
+    return texts
+
+
+def _clipped_cards(trajectory: list[Any]) -> set[str]:
+    """The cards with a code-tool call whose arguments the pod clipped (``{"raw": text}``):
+    the lines the clip cut off are not in the typed text."""
+    return {
+        str(entry.get("task") or entry.get("session") or "")
+        for entry in trajectory
+        if isinstance(entry, dict)
+        and entry.get("agent")
+        and entry.get("name") in _CODE_TOOLS
+        and isinstance(entry.get("args"), dict)
+        and set(entry["args"]) == {_CLIPPED_ARGS_KEY}
+    }
+
+
 def _card_lineages(parents: dict[str, str], cards: list[str]) -> dict[str, str]:
     """Each card to the one name of the lineage it belongs to.
 
@@ -2799,9 +2834,32 @@ class WorkerCommandsVerifier(BaseVerifier):
     A grep behind a path, a wrapper, a reserved word or a ``cd`` is not one,
     and a long option with a separate value is read as a flag, so its value is
     taken as the pattern and the real one is graded. A card log row that joined
-    a second typed line onto a grep is one row to it, so a line that reads the
-    removed word back (``$_``) is read as a file operand, as it was by the
-    regex exemptions this replaces.
+    a second typed line onto a grep is one row to it, so the exemption refuses a
+    row on which a later word could read the removed word back: a braced
+    expansion other than a plain name or a default that assigns nothing
+    (``${HOME}``, ``${DIR:-.}``; ``${X:=…}``, ``${A[i]=…}`` and
+    ``${!X:=…}`` can assign; an arithmetic ``$((X=…))`` is a substitution),
+    a read of the last argument (``$_``, ``${_}``) or of a variable through
+    another (``${!NAME}``), or an ANSI-C quote (``$'…'``), whose escapes can
+    spell either. These read the whole line as the shell reader keeps it,
+    quotes in place and line continuations gone, so a quote that ends a name
+    in bash (``$_'S'``) ends it here too; a single-quoted lookalike is refused
+    as well. Another way to
+    read the word back from a joined line (``declare -p``, ``history``) is
+    not seen.
+    A dangling grep's pattern slot can also
+    hold the next typed line's first word (``grep -rn`` over ``U=<url>`` and
+    ``curl "$U"``), which the cut would remove, and so would a pattern
+    exemption that removes a piped grep's pattern. So no exemption reads a row
+    of a card whose tagged ``terminal`` calls, as the pod stores them, include
+    one that may hold more than one line: a newline outside quotes, a
+    backslash before a blank (an escaped blank, or what the pod's scrub
+    leaves of an escaped backslash at a line end), or a line the shell reader
+    cannot split (an open quote, but also a heredoc body with an apostrophe);
+    nor a row of a card with a clipped code-tool call (#5237). This is a
+    spurious red for an honest grep for a forbidden word, or an exempt query,
+    on a card that also typed any multi-line command, such as a heredoc. A
+    card whose calls did not reach the trajectory is read from the row alone.
     ``required_runs``: each names a script (by basename, or module stem under
     ``-m``), flags and word patterns; some command's shell segment, read as an
     argv, must run it with those flags after it, a word matching each pattern,
@@ -2927,7 +2985,13 @@ class WorkerCommandsVerifier(BaseVerifier):
             raise ValueError("forbidden_result_patterns read results inside the window after_result_pattern opens; set both")
         return self
 
-    def _without_exempt_text(self, command: str) -> str:
+    def _without_exempt_text(self, command: str, joined: bool = False) -> str:
+        # ``joined``: the row's card typed a call the row may have joined lines of
+        # (see the grep cut), so no exemption reads it and it is graded whole
+        # (#5237): a pattern exemption can remove a joined line as a grep's
+        # pattern too (a pip query piped into a dangling grep).
+        if joined:
+            return command
         if self.exempt_grep_patterns:
             command = _without_grep_patterns(command) or command
         for pattern in self.exempt_patterns:
@@ -2949,6 +3013,8 @@ class WorkerCommandsVerifier(BaseVerifier):
         result_hits: list[tuple[str, str]] = []
         # Logged cards' calls only the required checks read (see the log-row branch).
         beside_rows: list[str] = []
+        # The log rows of a card that typed a call the row may have joined lines of.
+        joined_rows: set[str] = set()
         forbidding = bool(self.forbidden_patterns or self.forbidden_runs or self.forbidden_result_patterns)
         if self.after_result_pattern is None:
             # ``None`` stays an error even when the trajectory carries tagged calls: it
@@ -3012,6 +3078,19 @@ class WorkerCommandsVerifier(BaseVerifier):
                     joined.append(f"{count} tagged call{'' if count == 1 else 's'} of the logged cards, read by the required checks only")
                 if joined:
                     sources = f" ({len(logged_commands)} from the filed cards' logs, " + ", ".join(joined) + ")"
+            if self.exempt_grep_patterns:
+                # A row joins a typed newline into a space, so a dangling grep's
+                # pattern slot can hold the next line's first word, which the cut
+                # would remove. A card whose stored terminal calls include one that
+                # may hold more than one line, or a clipped one, keeps every grep
+                # row whole. An ``execute_code`` program is not shell.
+                joined = _clipped_cards(snap.trajectory) | {
+                    card for card, command in _terminal_call_texts(snap.trajectory) if _typed_call_may_join(command)
+                }
+                if "" in logged:
+                    joined_rows = set(logged_commands) if joined else set()
+                else:
+                    joined_rows = {str(row.get("command", "")) for row in snap.worker_commands if str(row.get("task") or "") in joined}
             typed = logged_commands + children
             windowed = typed
         else:
@@ -3085,9 +3164,9 @@ class WorkerCommandsVerifier(BaseVerifier):
         # exemption touched is out of the required list. The forbidden list
         # reads the windowed commands (every command without a window).
         with_calls = typed + beside_rows
-        commands = [c for c in with_calls if self._without_exempt_text(c) == c]
+        commands = [c for c in with_calls if self._without_exempt_text(c, c in joined_rows) == c]
         exempted = f" ({len(with_calls) - len(commands)} exempted)" if len(commands) < len(with_calls) else ""
-        graded = [(c, self._without_exempt_text(c)) for c in windowed]
+        graded = [(c, self._without_exempt_text(c, c in joined_rows)) for c in windowed]
         missing = [p for p in self.required_patterns if not any(re.search(p, c) for c in commands)]
         hits = [(p, c, rest) for p in self.forbidden_patterns for c, rest in graded if re.search(p, rest)]
         hits += [(p, f"the result of {c[:_SHOWN_COMMAND_CHARS]}", f"the result of {c[:_SHOWN_COMMAND_CHARS]}") for p, c in result_hits]
@@ -4234,6 +4313,158 @@ def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
     raise AssertionError("unreachable")
 
 
+# The forge reads of the check being verified that did not answer 2xx, each as
+# (transient, what): transient when the read says nothing about the run (see
+# _forge_get_json). None outside a forge-reading check's verify.
+_forge_unavailable: ContextVar[list[tuple[bool, str]] | None] = ContextVar("forge_unavailable", default=None)
+
+
+def _forge_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
+    """:func:`_http_get_json`, noting each read that did not answer 2xx.
+
+    A read is noted transient for :func:`_marks_forge_unavailable` when it
+    ended in a 5xx (already retried) or a transport failure (a timeout, a
+    reset, a dropped connection), or, on GitHub with the CI-minted grading
+    token (forges.GITHUB_TOKEN_FILE_ENV_VAR), in a 429 or a 403 that says it is
+    rate limited. That token is the ledger App's installation, which the agent
+    under test cannot spend; a local token, or GitLab's, where the agent's
+    token and grading's are one user's, can be the agent's, so its rate limit
+    is not transient. Every other non-2xx answer or OSError (a 404, a
+    permission 403, a redirect, a certificate failure, a host that does not
+    resolve or refuses the connection, an unknown forge) is noted as not
+    transient, and keeps the check's error plain unless the check drops it as
+    not behind the error."""
+    try:
+        status, payload = _http_get_json(url, token, timeout)
+    except OSError as exc:
+        _note_forge_read(_forge_transport_failure(exc), f"{type(exc).__name__}: {exc}")
+        raise
+    if status // 100 != 2:
+        message = payload.get("message") if isinstance(payload, dict) else None
+        rate_limited = status == _HTTP_TOO_MANY_REQUESTS or (
+            status == _HTTP_FORBIDDEN and isinstance(message, str) and bool(_RATE_LIMIT_MESSAGE_RE.search(message))
+        )
+        # The token this read sent, not the variable: read_token falls back
+        # to BENCH_GITHUB_TOKEN when the file holds no usable token.
+        grading_app = forges.forge_name() == forges.FORGE_GITHUB and token == forges.file_token(
+            forges.FORGE_GITHUB, os.environ
+        )
+        _note_forge_read(status >= _HTTP_SERVER_ERROR_FLOOR or (rate_limited and grading_app), f"answered {status}")
+    return status, payload
+
+
+def _forge_transport_failure(exc: OSError) -> bool:
+    """Whether a read's OSError is the forge or the path to it failing for a
+    while: a timeout, a reset, a dropped connection, or a response cut off
+    (http.client's RemoteDisconnected or IncompleteRead, which
+    :func:`_http_get_json` re-raises as a plain OSError). A refused connection
+    is a configured address that is wrong; a host that does not resolve, a
+    certificate failure and a malformed URL are not ConnectionErrors."""
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    if isinstance(reason, ConnectionRefusedError):
+        return False
+    return isinstance(reason, (TimeoutError, ConnectionError)) or isinstance(
+        exc.__cause__, (http.client.RemoteDisconnected, http.client.IncompleteRead)
+    )
+
+
+def _note_forge_read(transient: bool, what: str) -> None:
+    noted = _forge_unavailable.get()
+    if noted is not None:
+        noted.append((transient, what))
+
+
+def _forge_reads_mark() -> int:
+    """Where the current candidate's forge reads start in the decision's list."""
+    noted = _forge_unavailable.get()
+    return len(noted) if noted is not None else 0
+
+
+def _forge_read_handled(status: int) -> None:
+    """The caller read the non-2xx answer of the read it just made as control
+    flow (a fallback, a page that is not there), so that read explains no
+    error: its entry leaves the decision. Only that read's own entry, and only
+    when it was not transient."""
+    noted = _forge_unavailable.get()
+    if noted and noted[-1] == (False, f"answered {status}"):
+        noted.pop()
+
+
+class _RejectedCandidates(list):
+    """A forge-reading check's rejected candidates. A rejection is a verdict,
+    so a rejected candidate's reads explain no error and leave the decision,
+    when every one of them was a plain answer (a 404, say). When one was
+    transient, the rejection may rest on an outage the code cannot tell from
+    a verdict, so the entries stay and a plain one is added: the check's error
+    stays on rung 2."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._since = 0
+
+    def begin(self) -> None:
+        """Start a candidate: only reads noted after this count for it."""
+        self._since = _forge_reads_mark()
+
+    def append(self, reason: str) -> None:
+        noted = _forge_unavailable.get()
+        if noted is not None:
+            if any(transient for transient, _ in noted[self._since:]):
+                noted.append((False, "a candidate rejected beside a transient read"))
+            else:
+                del noted[self._since:]
+        super().append(reason)
+
+
+class _UnresolvedCandidates(list):
+    """pull_request_opened's unevaluable candidates. One left unevaluable with
+    no transient forge read behind it (a malformed answer, a clause not
+    implemented for the forge) is noted as not transient, so the check's error
+    is not marked for another candidate's outage."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._since = 0
+
+    def begin(self) -> None:
+        """Start a candidate: only reads noted after this count for it."""
+        self._since = _forge_reads_mark()
+
+    def append(self, reason: str) -> None:
+        noted = _forge_unavailable.get()
+        if noted is not None and not any(transient for transient, _ in noted[self._since:]):
+            noted.append((False, "a candidate unevaluable without a failed read"))
+        super().append(reason)
+
+
+def _marks_forge_unavailable(verify: Callable[[Any, float], VerificationResult]) -> Callable[[Any, float], VerificationResult]:
+    """Prefix an errored result's reason with forges.FORGE_UNAVAILABLE_MARKER when
+    the check's forge reads that did not answer 2xx were all transient
+    (:func:`_forge_get_json`), and there was at least one.
+
+    One read that failed for another reason keeps the error plain, unless the
+    check showed it did not produce the error: a read it answered as control
+    flow (:func:`_forge_read_handled`), or a candidate it rejected
+    (:class:`_RejectedCandidates`). Only an ``error`` is marked: a pass or a fail
+    was decided on what the reads did return. The marker leads, so the reason
+    the check gave is kept whole."""
+
+    @wraps(verify)
+    def marked(self: Any, timeout_sec: float) -> VerificationResult:
+        token = _forge_unavailable.set([])
+        try:
+            result = verify(self, timeout_sec)
+            noted = _forge_unavailable.get() or []
+        finally:
+            _forge_unavailable.reset(token)
+        if result.status != "error" or not noted or not all(transient for transient, _ in noted):
+            return result
+        what = ", ".join(what for _, what in noted)
+        return result.model_copy(update={"reason": f"{forges.FORGE_UNAVAILABLE_MARKER} ({what}): {result.reason}"})
+
+    return marked
+
+
 def _parse_footer(body: str) -> tuple[str, datetime] | None:
     """The ledger footer's ``(audit id, generated-at)``, or None when absent.
 
@@ -4587,6 +4818,7 @@ class LedgerIssueContainsVerifier(BaseVerifier):
                 return True
         return False
 
+    @_marks_forge_unavailable
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
 
@@ -4658,13 +4890,14 @@ class LedgerIssueContainsVerifier(BaseVerifier):
 
         budget = single_call_timeout(timeout_sec)
         matches: list[dict[str, Any]] = []
-        rejected: list[str] = []
+        rejected = _RejectedCandidates()
         unseen: list[str] = []
         for repo, number in seen:
+            rejected.begin()
             slug = f"{repo}#{number}"
             url = _issue_api_url(forge, repo, number)
             try:
-                status_code, payload = _http_get_json(url, token, budget)
+                status_code, payload = _forge_get_json(url, token, budget)
             except OSError as exc:
                 return done(
                     False,
@@ -4674,6 +4907,8 @@ class LedgerIssueContainsVerifier(BaseVerifier):
                 )
             if status_code == 404:
                 if forge == forges.FORGE_GITLAB and _is_configured_gitlab_project(repo):
+                    # The project read decides what the 404 means.
+                    _forge_read_handled(status_code)
                     try:
                         why = _gitlab_project_unseen(repo, token, budget)
                     except OSError as exc:
@@ -4692,6 +4927,8 @@ class LedgerIssueContainsVerifier(BaseVerifier):
                     status="error",
                 )
             if status_code != 200 or not isinstance(payload, dict):
+                if status_code == 200:
+                    _note_forge_read(False, "answered 200 with a body that is not an object")
                 return done(
                     False,
                     f"unexpected {label} response {status_code} for "
@@ -5009,6 +5246,7 @@ class ForgeIssueStateVerifier(BaseVerifier):
             )
         return self
 
+    @_marks_forge_unavailable
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
 
@@ -5065,8 +5303,9 @@ class ForgeIssueStateVerifier(BaseVerifier):
         started = datetime.fromtimestamp(snap.started_at, tz=timezone.utc)
         window_start = started - timedelta(seconds=self.max_clock_skew_sec)
         budget = single_call_timeout(timeout_sec)
-        rejected: list[str] = []
+        rejected = _RejectedCandidates()
         for repo, number in seen:
+            rejected.begin()
             slug = f"{repo}#{number}"
             if _gitlab_path_key(repo) != _gitlab_path_key(gitops_repo):
                 rejected.append(
@@ -5075,7 +5314,7 @@ class ForgeIssueStateVerifier(BaseVerifier):
                 continue
             url = _issue_api_url(forge, repo, number)
             try:
-                status_code, payload = _http_get_json(url, token, budget)
+                status_code, payload = _forge_get_json(url, token, budget)
             except OSError as exc:
                 return done(
                     False,
@@ -5085,6 +5324,8 @@ class ForgeIssueStateVerifier(BaseVerifier):
                 )
             if status_code == 404:
                 if forge == forges.FORGE_GITLAB and _is_configured_gitlab_project(repo):
+                    # The project read decides what the 404 means.
+                    _forge_read_handled(status_code)
                     try:
                         why = _gitlab_project_unseen(repo, token, budget)
                     except OSError as exc:
@@ -5102,6 +5343,8 @@ class ForgeIssueStateVerifier(BaseVerifier):
                     status="error",
                 )
             if status_code != 200 or not isinstance(payload, dict):
+                if status_code == 200:
+                    _note_forge_read(False, "answered 200 with a body that is not an object")
                 return done(
                     False,
                     f"unexpected {label} response {status_code} for {slug}; "
@@ -5130,33 +5373,35 @@ class ForgeIssueStateVerifier(BaseVerifier):
                 faults.append(f"lacks the label(s) {missing} (labels: {sorted(view['labels'])})")
             comments: int | None = None
             if self.min_comments:
+                unread: str | None = None
+                reads_before = len(_forge_unavailable.get() or [])
                 try:
                     listed = _issue_comments(
                         url, token, budget, forge, window_start, _ISSUE_COMMENT_PAGES
                     )
                 except OSError as exc:
-                    return done(
-                        False,
-                        f"could not read the comments of {slug}: {exc}; "
-                        "this check could not be evaluated",
-                        status="error",
+                    listed, unread = None, f"could not read the comments of {slug}: {exc}; "
+                if listed is None and unread is None:
+                    unread = f"the comments of {slug} could not be read ({label} did not answer 200 with a list), so "
+                    if len(_forge_unavailable.get() or []) == reads_before:
+                        # A 200 that is not a list: no failed read explains it.
+                        _note_forge_read(False, "answered 200 with a body that is not a list")
+                # An issue already rejected stays a fail: comments it could not
+                # read change no verdict, and must not make it an error.
+                if unread is not None and not faults:
+                    return done(False, unread + "this check could not be evaluated", status="error")
+                if unread is not None:
+                    faults.append("its comments could not be read")
+                else:
+                    comments = sum(
+                        1 for created_at, _ in listed
+                        if created_at is not None and created_at >= window_start
                     )
-                if listed is None:
-                    return done(
-                        False,
-                        f"the comments of {slug} could not be read ({label} did not "
-                        "answer 200 with a list), so this check could not be evaluated",
-                        status="error",
-                    )
-                comments = sum(
-                    1 for created_at, _ in listed
-                    if created_at is not None and created_at >= window_start
-                )
-                if comments < self.min_comments:
-                    faults.append(
-                        f"carries {comments} comment(s) posted since this run started, "
-                        f"{self.min_comments} required"
-                    )
+                    if comments < self.min_comments:
+                        faults.append(
+                            f"carries {comments} comment(s) posted since this run started, "
+                            f"{self.min_comments} required"
+                        )
             if faults:
                 rejected.append(f"{slug} " + ", ".join(faults))
                 continue
@@ -5869,7 +6114,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
         texts: dict[str, str] = {}
         unread: list[str] = []
         for page in range(1, _PR_FILES_MAX_PAGES + 1):
-            status, files = _http_get_json(
+            status, files = _forge_get_json(
                 f"{base}?per_page={_PR_FILES_PAGE_SIZE}&page={page}", token, budget
             )
             if status != 200 or not isinstance(files, list):
@@ -5923,7 +6168,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
         base = f"{forges.github_api_root()}/repos/{owner}/{repo}/pulls/{number}/files"
         entries: list[dict] = []
         for page in range(1, _PR_FILES_MAX_PAGES + 1):
-            status, files = _http_get_json(
+            status, files = _forge_get_json(
                 f"{base}?per_page={_PR_FILES_PAGE_SIZE}&page={page}", token, budget
             )
             if status != 200 or not isinstance(files, list):
@@ -6021,7 +6266,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
         ref = str(head.get("ref") or "")
         if not ref:
             return None, f"GitHub returned no head ref for {slug}; this check could not be evaluated"
-        status_code, listed = _http_get_json(
+        status_code, listed = _forge_get_json(
             f"{forges.github_api_root()}/repos/{owner}/{repo}/pulls"
             f"?state=closed&head={owner}:{urllib.parse.quote(ref, safe='')}&per_page={_GITHUB_PAGE_SIZE}",
             token,
@@ -6079,7 +6324,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     commits = listing[1]
                     status_code = 200
                 else:
-                    status_code, commits = _http_get_json(
+                    status_code, commits = _forge_get_json(
                         f"{forges.github_api_root()}/repos/{owner}/{repo}/pulls/{number}/commits"
                         f"?per_page={_PR_COMMITS_PAGE_SIZE}&page={page}",
                         token,
@@ -6142,10 +6387,14 @@ class PullRequestOpenedVerifier(BaseVerifier):
         anything. Everything else the agent chose, so it is graded.
         """
         base = f"{forges.github_api_root()}/repos/{owner}/{repo}"
-        first, payload = _http_get_json(f"{base}/issues/{number}", token, budget)
+        first, payload = _forge_get_json(f"{base}/issues/{number}", token, budget)
         status_code = first
+        if first in (403, 404):
+            # The pulls endpoint answers for the same number; the issues
+            # endpoint's refusal is a route, not the error.
+            _forge_read_handled(first)
         if first in (401, 403, 404):
-            status_code, payload = _http_get_json(f"{base}/pulls/{number}", token, budget)
+            status_code, payload = _forge_get_json(f"{base}/pulls/{number}", token, budget)
         if 401 in (first, status_code):
             # 401 is the credential itself, not its scopes: an installation
             # token lasts an hour, and telling the reader to widen a permission
@@ -6212,7 +6461,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
         base = f"{forges.github_api_root()}/repos/{owner}/{repo}"
         payload = resolved
         if "changed_files" not in payload:
-            status, payload = _http_get_json(f"{base}/pulls/{number}", token, budget)
+            status, payload = _forge_get_json(f"{base}/pulls/{number}", token, budget)
             # The same three readings `_resolve` gives this endpoint: 401 is
             # the token, 403 is the permission, anything else is GitHub's.
             if status == 401:
@@ -6254,13 +6503,14 @@ class PullRequestOpenedVerifier(BaseVerifier):
         if not isinstance(total, int) or total < 1:
             return changed, None, payload, None, None
         page = (total + _PR_COMMITS_PAGE_SIZE - 1) // _PR_COMMITS_PAGE_SIZE
-        status, commits = _http_get_json(
+        status, commits = _forge_get_json(
             f"{base}/pulls/{number}/commits"
             f"?per_page={_PR_COMMITS_PAGE_SIZE}&page={page}",
             token,
             budget,
         )
         if status == 404:
+            _forge_read_handled(status)
             return changed, None, payload, None, None
         if status == 401:
             return (
@@ -6334,13 +6584,13 @@ class PullRequestOpenedVerifier(BaseVerifier):
         since = started if since is None else since
         base = forges.gitlab_api_root() + forges.gitlab_project_path(repo)
         slug = f"{repo}!{number}"
-        status, mr = _http_get_json(f"{base}/merge_requests/{number}", token, budget)
+        status, mr = _forge_get_json(f"{base}/merge_requests/{number}", token, budget)
         if status == 404:
-            why = (
-                _gitlab_project_unseen(repo, token, budget)
-                if _is_configured_gitlab_project(repo)
-                else None
-            )
+            why = None
+            if _is_configured_gitlab_project(repo):
+                # The project read decides what the 404 means.
+                _forge_read_handled(status)
+                why = _gitlab_project_unseen(repo, token, budget)
             if why:
                 return "unresolved", f"{slug}: {why}", None
             return "reject", f"{slug}: no such merge request (404)", None
@@ -6383,7 +6633,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
         head_sha = str(mr.get("sha") or "")
         pushed = None
         if head_sha:
-            status, commit = _http_get_json(
+            status, commit = _forge_get_json(
                 f"{base}/repository/commits/{head_sha}", token, budget
             )
             if status in (401, 403):
@@ -6394,7 +6644,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 ), None
             if status == 200 and isinstance(commit, dict):
                 pushed = _parse_github_time(commit.get("committed_date"))
-            elif status != 404:
+            elif status == 404:
+                _forge_read_handled(status)
+            else:
                 return "unresolved", (
                     f"unexpected GitLab response {status} for {slug}'s head commit; "
                     "this check could not be evaluated"
@@ -6471,7 +6723,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 f"GitLab returned no source branch for {slug}; this check could not be "
                 "evaluated"
             ), None
-        status, listed = _http_get_json(
+        status, listed = _forge_get_json(
             f"{base}/merge_requests?state=all&source_branch="
             f"{urllib.parse.quote(ref, safe='')}&per_page={_GITHUB_PAGE_SIZE}",
             token,
@@ -6511,7 +6763,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 ), None
             carried[sha] = closed.get("iid")
         for page in range(1, _PR_COMMITS_MAX_PAGES + 1):
-            status, commits = _http_get_json(
+            status, commits = _forge_get_json(
                 f"{base}/merge_requests/{number}/commits"
                 f"?per_page={_PR_COMMITS_PAGE_SIZE}&page={page}",
                 token,
@@ -6544,6 +6796,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
             ), None
         return None
 
+    @_marks_forge_unavailable
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
 
@@ -6640,13 +6893,15 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     "before this run, so the window was not widened)"
                 )
         budget = single_call_timeout(timeout_sec)
-        rejected: list[str] = []
+        rejected = _RejectedCandidates()
         # A candidate the API cannot answer for only ends the check if nothing
         # else resolves. An agent that mistypes a repository slug beside the
         # real URL would otherwise error, and an error is rung 2, which reds the
         # eval job for every open pull request.
-        unresolved: list[str] = []
+        unresolved = _UnresolvedCandidates()
         for owner, repo, number in seen:
+            rejected.begin()
+            unresolved.begin()
             slug = f"{owner}/{repo}#{number}"
             if self.owner and owner.lower() != self.owner.lower():
                 rejected.append(f"{slug}: not under {self.owner}")
@@ -7023,8 +7278,10 @@ class GitHubWritesVerifier(BaseVerifier):
     with ``pull_request_opened``, and its reply names the URL. Up to
     ``requested_pull_requests`` of the writes whose number that reply names
     are the requested ones and are left out; the lane sets the field to the
-    number of ``pull_request_opened`` and ``pull_request_diff_contains``
-    leaves the case declares. Anything else this repetition wrote is a
+    larger of the number of ``pull_request_opened`` and
+    ``pull_request_diff_contains`` leaves the case declares and the total the
+    case declares under its top-level ``requested_pull_requests`` key.
+    Anything else this repetition wrote is a
     write the case did not ask for.
 
     WHOSE WRITE IT IS (#2611). The fan-out runs cases side by side against
@@ -7117,6 +7374,7 @@ class GitHubWritesVerifier(BaseVerifier):
     # two different machines. Small on purpose, as on pull_request_opened.
     max_clock_skew_sec: float = Field(default=120.0, ge=0)
 
+    @_marks_forge_unavailable
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
 
@@ -7172,7 +7430,7 @@ class GitHubWritesVerifier(BaseVerifier):
         started = datetime.fromtimestamp(snap.started_at, tz=timezone.utc)
         since = started - timedelta(seconds=self.max_clock_skew_sec)
         client = github_writes.client_for(
-            forge, token, _http_get_json, single_call_timeout(timeout_sec)
+            forge, token, _forge_get_json, single_call_timeout(timeout_sec)
         )
         try:
             report = github_writes.find_writes(client, repo, since, author=self.author)
@@ -8712,7 +8970,13 @@ class FindingsItemStateVerifier(_OnboardingPollVerifier):
     reason names the state of each row not in ``state``. With ``not_state``
     instead, passes when no row is in it, for a property a single state cannot
     say: "not dismissed" holds while the install's own nudge moves a queued
-    row to surfaced. Exactly one of the two is set.
+    row to surfaced. Exactly one of the two is set. ``unless_shown``, with
+    ``not_state`` only, also passes a row in ``not_state`` that has a
+    ``first_shown_at``: a paced publisher's message (the nudge's) named it
+    before it was decided, so a decision that reached it is by design. Only a
+    paced publisher sets that field, and only on an undecided row, so a mark
+    the model makes (which raises ``surface_count`` on any row) cannot pass a
+    row. "No row that no message named was dismissed."
 
     A listed row the queue does not hold is ``status="error"``: the case's plant
     is missing, so there is nothing to grade. An unreadable pod or a queue that
@@ -8724,11 +8988,14 @@ class FindingsItemStateVerifier(_OnboardingPollVerifier):
     finding_ids: list[str] = Field(min_length=1)
     state: FindingState | None = None
     not_state: FindingState | None = None
+    unless_shown: bool = False
 
     @model_validator(mode="after")
     def _one_state(self) -> "FindingsItemStateVerifier":
         if (self.state is None) == (self.not_state is None):
             raise ValueError("set exactly one of state and not_state")
+        if self.unless_shown and self.not_state is None:
+            raise ValueError("unless_shown goes with not_state")
         return self
 
     @field_validator("finding_ids")
@@ -8758,6 +9025,13 @@ class FindingsItemStateVerifier(_OnboardingPollVerifier):
             )
         if self.not_state is not None:
             hit = {finding_id: states[finding_id] for finding_id in self.finding_ids if states[finding_id] == self.not_state}
+            named: list[str] = []
+            if self.unless_shown:
+                # A row without the field (an older read) counts as never named.
+                shown = {str(row.get("id")): row.get("first_shown_at") for row in read["findings"]}
+                raw["first_shown_at"] = {finding_id: shown.get(finding_id) for finding_id in self.finding_ids}
+                named = [finding_id for finding_id in hit if shown.get(finding_id)]
+                hit = {finding_id: state for finding_id, state in hit.items() if finding_id not in named}
             if hit:
                 return (
                     "fail",
@@ -8766,7 +9040,9 @@ class FindingsItemStateVerifier(_OnboardingPollVerifier):
                 )
             return (
                 "pass",
-                f"none of {len(self.finding_ids)} row(s) are {self.not_state}; "
+                f"none of {len(self.finding_ids)} row(s) are {self.not_state}"
+                + (f" but for {len(named)} a message had named" if named else "")
+                + "; "
                 + ", ".join(f"{finding_id} is {state}" for finding_id, state in raw["states"].items()),
                 raw,
             )

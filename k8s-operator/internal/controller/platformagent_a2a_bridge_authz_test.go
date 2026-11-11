@@ -140,9 +140,9 @@ func a2aSingleServerTestConf(t *testing.T, conf string) string {
 	conf = strings.Replace(conf, "server_name: $POD_NAME", "server_name: a2a-test-nats-0", 1)
 	// The pid file lives on the pod's data volume, which a test process
 	// cannot write; a server that cannot write it does not start.
-	pid := `pid_file: "` + a2aNATSPidFile + `"`
+	pid := `pid_file: "` + a2aNATSPIDFile + `"`
 	if !strings.Contains(conf, pid) {
-		t.Fatal("the rendered nats.conf no longer writes its pid to " + a2aNATSPidFile + "; the substitution below would be inert")
+		t.Fatal("the rendered nats.conf no longer writes its pid to " + a2aNATSPIDFile + "; the substitution below would be inert")
 	}
 	conf = strings.Replace(conf, pid, `pid_file: "`+filepath.Join(t.TempDir(), "nats-server.pid")+`"`, 1)
 	return a2aClusterBlockRe.ReplaceAllString(conf, "")
@@ -186,6 +186,8 @@ func a2aStartRenderedServerAt(t *testing.T, conf string, port int, store string)
 	opts.Websocket.Port = 0
 	opts.StoreDir = store
 	opts.NoSigs = true
+	// The rendered pid_file is the pod's path.
+	opts.PidFile = filepath.Join(t.TempDir(), "nats.pid")
 	s, err := natsserver.NewServer(opts)
 	if err != nil {
 		t.Fatalf("nats-server refused the rendered config: %v", err)

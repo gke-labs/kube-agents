@@ -170,6 +170,14 @@ operator:
   # "MCP server" reference page.
   mcpServer:
     enabled: false
+  # Slack member ids of end-to-end test users, meant for CI and eval installs;
+  # integration.slack.allowedUsers is still the gate on who is served.
+  # A post such a user makes with a user token through an app carries the
+  # app's bot_id, which the A2A gateway otherwise drops as bot traffic; from a
+  # listed member it is read as theirs. The allowlist still has to admit them.
+  # Rendered as the operator's A2A_SLACK_TEST_USERS, which it hands the
+  # gateway; an A2A_SLACK_TEST_USERS entry in extraEnv wins.
+  slackTestUsers: []
   # The manager's own metrics listener, port 8080, plain HTTP on the pod
   # network: controller-runtime's series plus the operator's view of every
   # PlatformAgent, status.usage and status.phase as three gauge families
@@ -239,8 +247,8 @@ operator:
   # were. What stays: Deployments, StatefulSets,
   # Services, ServiceAccounts, ConfigMaps, PersistentVolumeClaims,
   # NetworkPolicies and PodDisruptionBudgets; ClusterRoles,
-  # ClusterRoleBindings, Roles and RoleBindings; and the three custom
-  # resources themselves (PlatformAgent always, AgentPlugin and AgentProfile
+  # ClusterRoleBindings, Roles and RoleBindings; and the custom resources
+  # themselves (PlatformAgent always, AgentPlugin, AgentProfile and Tier
   # where their CRDs are installed). Deployments, StatefulSets, Services and
   # PersistentVolumeClaims grow with the cluster's workloads, a Deployment
   # carrying a whole pod template, so a cluster with thousands of them is the
@@ -816,6 +824,33 @@ hindsight:
       limits:
         cpu: "4"
         memory: 4Gi
+    # The hindsight-api NetworkPolicy alone. It renders when this and the
+    # hindsight.networkPolicy umbrella below are both true; false drops it and
+    # leaves hindsight-postgresql's in place, for an install whose gateway
+    # the policy's egress rules cannot name.
+    networkPolicy:
+      enabled: true
+      # Egress rules appended to hindsight-api's policy, in the shape of
+      # spec.networkPolicy.additionalEgress on the PlatformAgent CR: CIDR
+      # peers with optional excepts, and a port list (omit it and every port
+      # to those peers is open). The schema bounds them as the CRD does: 32
+      # rules, 16 peers and 16 ports each, a /12 (IPv4) or /48 (IPv6) prefix
+      # floor; an except must sit inside its peer or the API server rejects
+      # the policy. The render also refuses what
+      # litellm.openaiCompatible.egressCIDRs refuses: a malformed address,
+      # an IPv4-mapped IPv6 block, and a peer in a link-local
+      # range (169.254.0.0/16, fe80::/10) or inside fd20:ce::/48; the first
+      # and last of those ranges hold the metadata server's addresses. A bare
+      # address renders as a /32 or /128. A non-empty list also turns the
+      # egress half on under
+      # litellm.enabled=false, which otherwise renders the policy
+      # Ingress-only, so a bring-your-own gateway is named here rather than
+      # by dropping the policy.
+      #
+      #   additionalEgress:
+      #     - to: [{ cidr: "10.200.0.0/16" }]
+      #       ports: [{ protocol: TCP, port: 443 }]
+      additionalEgress: []
   postgresql:
     # Keep in step with images.json (`make mirror-images` copies from it), where
     # the entry is named hindsight-postgresql and carries the constraints on
@@ -838,11 +873,21 @@ hindsight:
         ephemeral-storage: 1152Mi
     # volumeClaimTemplate size. Immutable once the StatefulSet exists.
     storage: 8Gi
-  # Disable podMonitoring off-GKE, same caveat as litellm.podMonitoring.
-  # When litellm.enabled=false, hindsight-api's NetworkPolicy renders as
-  # Ingress-only (because its gateway egress rule selects app: litellm /
-  # app: standalone-replay pods in the release namespace).
+    # The hindsight-postgresql NetworkPolicy alone, under the same umbrella.
+    # It is the only guard on a database that takes no password, so leave it
+    # true: an install whose gateway the hindsight-api policy cannot name
+    # edits hindsight.api.networkPolicy above, not this. The chart warns in
+    # its install notes when the store renders without it.
+    networkPolicy:
+      enabled: true
+  # The umbrella over both Hindsight NetworkPolicies: false renders neither,
+  # whatever api.networkPolicy.enabled and postgresql.networkPolicy.enabled
+  # say. When litellm.enabled=false and api.networkPolicy.additionalEgress is
+  # empty, hindsight-api's policy renders as Ingress-only (because its
+  # gateway egress rule selects app: litellm / app: standalone-replay pods in
+  # the release namespace).
   networkPolicy: true
+  # Disable podMonitoring off-GKE, same caveat as litellm.podMonitoring.
   podMonitoring: true
   podDisruptionBudget:
     # Renders maxUnavailable: 1 for both store workloads. Deliberately not
@@ -965,7 +1010,8 @@ platformAgent:
   storage:
     # The PlatformAgent's spec.storage.size: the request of the agent's
     # <name>-data claim and of the shell sandbox's data claim. The operator
-    # requests the same size for both. null, the default, leaves the field out
+    # requests the same size for both, and raises the agent's alone for
+    # expectedClusterProfiles below. null, the default, leaves the field out
     # of the CR, and the operator default applies (50Gi). Raising it expands both
     # existing claims online where their StorageClass sets allowVolumeExpansion.
     # Where it does not, the claims keep their size and the CR's
@@ -978,6 +1024,16 @@ platformAgent:
     # counts it so. A Kubernetes quantity above zero and at most 64Ti, the
     # largest persistent disk, for example 80Gi.
     size: null
+    # The PlatformAgent's spec.storage.expectedClusterProfiles: how many Cluster
+    # Agent profiles the install is expected to hold, one per cluster in scope.
+    # It raises the agent's own data claim (not the sandbox's) to at least
+    # 8Gi + 400Mi per profile, rounded up to whole GiB, the size Hermes' session
+    # stores settle at under the default 90-day retention. The claim
+    # takes the larger of that and size (or the 50Gi default), so this only
+    # raises it, and the formula passes 50Gi above 107 profiles. Raising it
+    # expands the existing claim online where its StorageClass allows. null, the
+    # default, renders no field. An integer from 1 to 20000.
+    expectedClusterProfiles: null
   # Annotations to add to the PlatformAgent custom resource metadata. The
   # operator reads its kubeagents.x-k8s.io/* keys from here (chart README,
   # "PlatformAgent annotations"). Four of them the chart also derives from
@@ -1468,7 +1524,8 @@ platformAgent:
       # pods are given its address, and a change between 0 and a positive value
       # restarts the shell sandbox and the profile warm pools (and the A2A
       # gateway under the cluster view). Each replica requests and is
-      # limited to 2 CPU and 2Gi. On an
+      # limited to 2 CPU and 2Gi, which the quota preflight counts; it does not
+      # check that a node has room for a 2 CPU pod. On an
       # existing install the chart fails the upgrade when the installed CRD
       # predates the field; apply crds/ first (upgrade.sh does).
       exec:
@@ -1637,6 +1694,15 @@ platformAgent:
       # roles. The federated principal needs only roles/iam.workloadIdentityUser
       # on it.
       serviceAccountEmail: ""
+    # Omit core `secrets` (`get`, `list`, `watch`) from the reader ClusterRole
+    # (`kubeagents:minimal:<ns>:<name>`).
+    # - `null` (unset): new installs grant `secrets` read access (`<name>-kube-proxy`
+    #   strips secret payloads from every response with `KUBE_PROXY_REDACT_SECRETS=true`).
+    #   Existing installs keep the `secrets` permission their ClusterRole already holds.
+    # - `true`: omit `secrets` from the reader ClusterRole.
+    # - `false`: grant `secrets` on the reader ClusterRole, including on upgraded
+    #   existing installs.
+    disallowSecretsRead: null
   # The GCP projects, folders, organisations, Shared VPC hosts and Metrics
   # Scopes, beyond the project the agent runs in, whose GKE clusters the hourly
   # Cluster Agent reconcile enumerates, and what it leaves unmanaged: rendered
@@ -1688,11 +1754,9 @@ platformAgent:
   #         - projectId: payments-staging
   #           location: us-central1
   #           clusterName: scratch-cluster
-  # An excluded cluster is left out of what the agents look at, but that is not
-  # yet enforced: the agent's read roles still reach it, so a worker that
-  # fetches its credentials itself can read it. Only a project where the agent
-  # holds no roles, bound there or through a folder or organization, keeps it
-  # off a cluster; the management project always holds them.
+  # The credential broker and kube-proxy refuse every route to an excluded
+  # cluster's Kubernetes API; the project's cluster list and a cluster's
+  # describe stay readable. Spell the project by its ID.
   scope: null
   credentials:
     # Secret holding the agent's credential keys: API_SERVER_KEY plus the
@@ -1764,6 +1828,9 @@ platformAgent:
     # forges:
     #   - name: github            # what repositories[].forge refers to
     #     provider: github        # github (default), gitlab, or gitea; required when host is not github.com
+    #                             # (bitbucket and bitbucket-datacenter forges are declared on the
+    #                             # PlatformAgent resource's spec.integration.forges; the chart does
+    #                             # not render them yet)
     #     host: ""                # empty is the provider's default (github.com), or a GitHub Enterprise
     #                             # Server hostname; required for gitea, which has none
     #     scheme: https           # https (default); http only for gitea on an

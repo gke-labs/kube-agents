@@ -79,7 +79,10 @@ What is read, under ``agents/`` with the mirrored ``gke-*`` skills skipped
 The reads the tree carried when the check arrived are pinned in
 ``scripts/cluster_reads_allowlist.txt``: one line per file and rule, with the
 count that file has today and the reason it is still there. The list only
-shrinks. A file with more findings than its entry fails as a rise; a file
+shrinks for the dumps and unpaged lists; the one addition it takes is an
+``unresolved-kinds`` read whose kind is a runtime value, when the read is one
+kind per call and bounded or falls back on a cut reply, pinned with a reason
+that says so (the hint for the rule names that route). A file with more findings than its entry fails as a rise; a file
 with fewer fails until the entry is lowered or removed; an entry naming a
 file that is gone, an unknown rule, a zero count, a repeated file and rule,
 or a malformed line fails the run. A file with no entry is held at zero.

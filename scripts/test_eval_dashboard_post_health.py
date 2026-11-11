@@ -364,6 +364,28 @@ class Shapes(RunHarness):
             f"{URL}#since=2026-09-03T18:30:00Z&view=gate",
         )
 
+    def test_storm_says_what_the_reps_said(self):
+        doc = storm()
+        doc["incident"]["causes"] = [["the executor's own failure (hermes-rate-limited)", 27], ["delegated worker hit infrastructure failure (rate_limit): card on board…", 1]]
+        self.tick(doc, T0)
+        self.assertTrue(self.opener.texts[0].startswith(
+            "🟡 *Smoke gate: flaky* — quota storm 1:15 PM–2:25 PM ET hit 3 PRs; reps: 27 hermes-rate-limited, 1 delegated worker hit infrastructure….  Passing runs still count;"
+        ), self.opener.texts[0])
+
+    def test_storm_names_four_phrasings_and_counts_the_rest(self):
+        # A short sentence is kept whole; past four phrasings the rest is a count.
+        doc = storm()
+        doc["incident"]["causes"] = [["the executor's own failure (hermes-rate-limited)", 9], ["the kanban board could not be read", 4], ["the executor's own failure (bridge-shutdown)", 3], ["no agent ever ran", 2], ["x", 1], ["y", 1]]
+        self.tick(doc, T0)
+        self.assertIn("; reps: 9 hermes-rate-limited, 4 the kanban board could not be read, 3 bridge-shutdown, 2 no agent ever ran, and 2 reps in 2 other phrasings.  Passing", self.opener.texts[0])
+
+    def test_storm_counts_by_the_form_the_reader_sees(self):
+        # Two phrasings the cut makes identical are one item with both counts.
+        doc = storm()
+        doc["incident"]["causes"] = [["the executor's own failure (hermes-rate-limited)", 5], ["the inject exchange on [run]/case-a/[rep] failed: URLError from http://10.0.0.1", 3], ["the inject exchange on [run]/case-b/[rep] failed: URLError from http://10.0.0.2", 2]]
+        self.tick(doc, T0)
+        self.assertTrue("; reps: 5 hermes-rate-limited, 5 the inject exchange on….  Passing" in self.opener.texts[0], self.opener.texts[0])
+
     def test_setup_deaths(self):
         self.tick(deaths(), T0)
         self.assertEqual(
@@ -1766,7 +1788,9 @@ class LostPods(RunHarness):
         self.assertIn("lost the node(s) below at Fri 10:05 AM ET; 12 `pull-kube-agents-smoke-test` runs on 12 pull requests died mid-run. Each pod's last event is `NodeNotReady`, or the pod never uploaded a build log.", text)
         self.assertIn("- `gke-kube-agents-prow-default-pool-eb220b2a-6uhg` (1 run)\n- `gke-kube-agents-prow-default-pool-eb220b2a-93sl` (2 runs)\n- `gke-kube-agents-prow-default-pool-eb220b2a-er33` (3 runs)", text)
         self.assertIn("**Window:** 10:05 AM–10:19 AM ET (2026-09-11T14:05:52+00:00 – 2026-09-11T14:19:16+00:00).", text)
-        self.assertIn("**Affected PRs:** #926, #1118, #1246, #1258, #1319, #1351, #1362, #1439, #1451, #1456, #1460, #1471.", text)
+        # Pull requests stay in this repository, and the issue may be filed in another: full URLs.
+        self.assertIn("**Affected PRs:** " + ", ".join(f"https://github.com/gke-labs/kube-agents/pull/{n}" for n in (926, 1118, 1246, 1258, 1319, 1351, 1362, 1439, 1451, 1456, 1460, 1471)) + ".", text)
+        self.assertNotIn(" #926", text)
         self.assertIn("- lost pods: 12 runs on 12 PRs died with their build node 14:05–14:19 UTC", text)
         self.assertIn("**Advice for authors:** nothing about your change; `/retest` once new jobs are progressing.", text)
         self.assertIn(f"Incident brief: {URL}#since=2026-09-11T14:05:52Z&view=gate", text)

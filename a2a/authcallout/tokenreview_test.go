@@ -439,6 +439,52 @@ func TestConcurrentPresentationsOfOneTokenShareOneReview(t *testing.T) {
 	}
 }
 
+// A presentation that misses the memory just before a review of its token is
+// remembered, and reaches singleflight just after that review's call is gone,
+// reads the remembered answer rather than starting a second review. The
+// afterMiss hook puts the presentation in that window on purpose: while it is
+// held there, another presentation of the same token runs a review to the end
+// and is remembered, so the only way the held one can come out with one review
+// counted is the second check inside the shared call.
+func TestAPresentationThatMissedTheMemoryBeforeAReviewWasRememberedReadsIt(t *testing.T) {
+	c, reviews := countingReviewer(t, boundToPod(gatewaySA, "chat-otter-1a2b", "uid-1234", testAudience))
+	v, _ := NewTokenValidator(c, testAudience)
+
+	var first Attested
+	held := false
+	v.afterMiss = func() {
+		// Only the presentation under test is held; the one that reviews
+		// the token while it waits misses the memory too and must not be
+		// held in turn.
+		if held {
+			return
+		}
+		held = true
+		att, source, err := v.validate(context.Background(), "a-token")
+		if err != nil || source != reviewFresh {
+			t.Errorf("the review made during the window = %+v, %q, %v; want a fresh review", att, source, err)
+		}
+		first = att
+	}
+
+	att, source, err := v.validate(context.Background(), "a-token")
+	if err != nil {
+		t.Fatalf("the held presentation failed: %v", err)
+	}
+	if !held {
+		t.Fatal("afterMiss did not run; the presentation never entered the window")
+	}
+	if source != reviewCached {
+		t.Errorf("the held presentation was answered %q; want %q, the review remembered while it waited", source, reviewCached)
+	}
+	if att != first {
+		t.Errorf("the held presentation got %+v; want the remembered %+v", att, first)
+	}
+	if got := reviews.Load(); got != 1 {
+		t.Errorf("TokenReviews = %d for a presentation that joined after its token was remembered; want 1", got)
+	}
+}
+
 // Distinct tokens are distinct reviews: the memory is keyed by the token, and
 // one pod's attestation is never handed to another's presentation.
 func TestDistinctTokensAreReviewedSeparately(t *testing.T) {

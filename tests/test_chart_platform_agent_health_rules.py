@@ -168,6 +168,17 @@ class HealthRulesRenderTest(unittest.TestCase):
         for job in jobs:
             self.assertIn(job, expr, f"the scrape alert does not watch {job}")
 
+    def test_the_scrape_alert_watches_the_exec_tier_only_while_it_renders(self):
+        exec_set = ["--set", "platformAgent.deployment.credentialProxy.exec.replicas=2"]
+        for extra, watched in (([], False), (exec_set, True)):
+            docs = _render(*_ON, *extra)
+            expr = _alerts(_rules(docs)[0])[_SCRAPE_ALERT]["expr"]
+            agent = next(d for d in docs if d.get("kind") == "PlatformAgent")["metadata"]["name"]
+            job = f"{agent}-credential-proxy-exec-tier-monitoring"
+            rendered = any(d.get("kind") == "PodMonitoring" and d["metadata"]["name"] == job for d in docs)
+            self.assertEqual(rendered, watched, f"exec PodMonitoring rendered={rendered} with {extra}")
+            self.assertEqual(job in expr, watched, f"scrape alert watches the exec tier={job in expr} with {extra}")
+
     def test_the_scrape_alert_watches_the_nats_exporter_only_where_it_runs(self):
         # The operator omits the exporter sidecar when A2A_NATS_IMAGE is set
         # and A2A_NATS_EXPORTER_IMAGE is not (a2aNATSExporterOmitted). There

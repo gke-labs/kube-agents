@@ -155,7 +155,7 @@ class FetchTest(unittest.TestCase):
 
     def test_a_record_naming_something_outside_the_layout_refuses(self):
         for name in ("answers/../../etc.json", f"answers/{fp(1)}.tmp", f"variants/{fp(1)}/{'a' * 16}.json",
-                     "store/requests/x.json"):
+                     "store/requests/x.json", f"answers/{fp(1)}.json\n"):
             with self.subTest(name=name):
                 self.record("101", 1, {VERSION: [(name, 1, "")]})
                 with self.assertRaises(FC.Refused):

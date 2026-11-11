@@ -338,9 +338,9 @@ jq -r '.images[] | select(.tagFrom) | "\(.name)\t\(.tagFrom.file)\t\(.tagFrom.ke
 # 2. The pins compiled into the operator. Each is an image the operator falls
 #    back to when its env var is unset, so a drift here mirrors the wrong tag
 #    with nothing to catch it at render time. fluent-bit reaches every agent
-#    pod. nats, nats-box and prometheus-nats-exporter reach only a
-#    `spec.mode: next` install, which no chart render in check 3 turns on, so
-#    this is the only check that sees them (#1557). The constants keep Docker Hub's short spelling because that
+#    pod. nats, nats-box, the config reloader and prometheus-nats-exporter reach
+#    only a `spec.mode: next` install, which no chart render in check 3 turns on,
+#    so this is the only check that sees them (#1557). The constants keep Docker Hub's short spelling because that
 #    is the string the operator renders into the pod template; the comparison
 #    is on the normalised form, the same way check 1 reads a Dockerfile ARG.
 #    The first-party next defaults (gateway, worker, callout, capability
@@ -363,6 +363,7 @@ check_operator_pin() {
 check_operator_pin fluent-bit k8s-operator/internal/controller/manifest_helpers.go fallbackFluentBitImage
 check_operator_pin nats k8s-operator/internal/controller/platformagent_a2a_manifests.go defaultA2ANATSImage
 check_operator_pin nats-box k8s-operator/internal/controller/platformagent_a2a_manifests.go defaultA2AProvisionImage
+check_operator_pin nats-server-config-reloader k8s-operator/internal/controller/platformagent_a2a_nats_reload.go defaultA2ANATSReloaderImage
 check_operator_pin prometheus-nats-exporter k8s-operator/internal/controller/platformagent_a2a_manifests.go defaultA2ANATSExporterImage
 
 # A compiled image name for a release image the operator renders: the

@@ -1069,10 +1069,12 @@ func TestProbeTopicIsProvisionedAndWriterless(t *testing.T) {
 
 // Without this policy every pod in the cluster reaches 4222/8222/9222 while
 // the bus grants do the real refusing. The network layer now agrees with
-// them: 4222 from exactly the enumerated bus clients, and no pod-network
-// peer at all for 8222 (monitor) or 9222 (ws) — the demo port-forward and
-// the kubelet readiness probe both enter via the node, which NetworkPolicy
-// does not govern, and that is the decided posture rather than an accident.
+// them: 4222 from exactly the enumerated bus clients, 9222 (ws) from the
+// console server, and 8222 (monitor) from the operator's pod, and only when
+// the operator knows its own namespace, which this test's environment
+// doesn't set (TestTheMonitorPortAdmitsTheOperatorAlone covers that case).
+// The demo port-forward and the kubelet readiness probe both enter via the
+// node, which NetworkPolicy does not govern.
 func TestBuildA2ANATSNetworkPolicy(t *testing.T) {
 	np := buildA2ANATSNetworkPolicy(a2aTestAgent())
 
@@ -1340,7 +1342,7 @@ func TestGatewayIsToldAboutTheClusterViewOnlyUnderTheFlag(t *testing.T) {
 	}
 	t.Setenv(a2aSessionClusterViewEnvVar, "")
 	off := envOf()
-	for _, name := range []string{"A2A_SESSION_CLUSTER_VIEW", "A2A_CREDENTIAL_PROXY_URL"} {
+	for _, name := range []string{"A2A_SESSION_CLUSTER_VIEW", "A2A_CREDENTIAL_PROXY_URL", "A2A_KUBE_PROXY_URL", "A2A_KUBE_PROXY_CA_CONFIGMAP", "A2A_KUBE_PROXY_HOST_CONTEXT"} {
 		if _, ok := off[name]; ok {
 			t.Errorf("%s rendered with the flag off", name)
 		}
@@ -1352,6 +1354,15 @@ func TestGatewayIsToldAboutTheClusterViewOnlyUnderTheFlag(t *testing.T) {
 	}
 	if on["A2A_CREDENTIAL_PROXY_URL"].Value != credentialProxyBaseURL(agent) {
 		t.Errorf("A2A_CREDENTIAL_PROXY_URL = %+v, want %s", on["A2A_CREDENTIAL_PROXY_URL"], credentialProxyBaseURL(agent))
+	}
+	if on["A2A_KUBE_PROXY_URL"].Value != kubeProxyURL(agent) {
+		t.Errorf("A2A_KUBE_PROXY_URL = %+v, want %s", on["A2A_KUBE_PROXY_URL"], kubeProxyURL(agent))
+	}
+	if on["A2A_KUBE_PROXY_CA_CONFIGMAP"].Value != kubeProxyCABundleName(agent) {
+		t.Errorf("A2A_KUBE_PROXY_CA_CONFIGMAP = %+v, want %s", on["A2A_KUBE_PROXY_CA_CONFIGMAP"], kubeProxyCABundleName(agent))
+	}
+	if on["A2A_KUBE_PROXY_HOST_CONTEXT"].Value != hostClusterContextName(agent) {
+		t.Errorf("A2A_KUBE_PROXY_HOST_CONTEXT = %+v, want %s", on["A2A_KUBE_PROXY_HOST_CONTEXT"], hostClusterContextName(agent))
 	}
 }
 
@@ -1466,8 +1477,8 @@ func TestSessionNetworkPolicyReachesTheBrokerOnlyUnderTheFlag(t *testing.T) {
 	}
 	t.Setenv(a2aSessionClusterViewEnvVar, "true")
 	np := buildA2ASessionNetworkPolicy(agent, []string{"10.96.0.10"})
-	if len(np.Spec.Egress) != 4 {
-		t.Fatalf("flag on: %d egress rules, want 4", len(np.Spec.Egress))
+	if len(np.Spec.Egress) != 5 {
+		t.Fatalf("flag on: %d egress rules, want 5", len(np.Spec.Egress))
 	}
 	if len(np.Spec.Ingress) != 0 {
 		t.Fatalf("the view opened ingress: %+v", np.Spec.Ingress)
@@ -1479,6 +1490,14 @@ func TestSessionNetworkPolicyReachesTheBrokerOnlyUnderTheFlag(t *testing.T) {
 	if len(broker.To) != 1 || broker.To[0].PodSelector == nil ||
 		!reflect.DeepEqual(broker.To[0].PodSelector.MatchLabels, credentialProxySelector(agent)) {
 		t.Fatalf("broker rule peer = %+v, want the broker pod selector %v", broker.To, credentialProxySelector(agent))
+	}
+	kubeProxy := np.Spec.Egress[4]
+	if len(kubeProxy.Ports) != 1 || int32(kubeProxy.Ports[0].Port.IntValue()) != kubeProxyPort {
+		t.Fatalf("kube-proxy rule ports = %+v, want %d only", kubeProxy.Ports, kubeProxyPort)
+	}
+	if len(kubeProxy.To) != 1 || kubeProxy.To[0].PodSelector == nil ||
+		!reflect.DeepEqual(kubeProxy.To[0].PodSelector.MatchLabels, kubeProxySelector(agent)) {
+		t.Fatalf("kube-proxy rule peer = %+v, want the kube-proxy pod selector %v", kubeProxy.To, kubeProxySelector(agent))
 	}
 }
 
@@ -6995,9 +7014,10 @@ func TestA2AInjectBackendIsRemovedWhenTheFlagGoesOff(t *testing.T) {
 }
 
 // TestA2AInjectFlagOffRemovalReadsTheSecretUncached: the flag-off path reads
-// four objects before deleting them, and the fourth is a Secret. The operator
-// ships secrets with get only, so a cached Get of one starts an informer
-// whose LIST is forbidden and blocks the single reconcile worker for good --
+// four objects before deleting them, and the fourth is a Secret. The manager
+// does not watch Secrets, so a cached Get of one starts a cluster-wide Secret
+// informer that holds every Secret in memory and blocks the single reconcile
+// worker in WaitForCacheSync wherever list/watch on secrets is trimmed --
 // the fake client cannot show that hang (its cache is the store), so this
 // test fails the cached path outright and passes only if the Secret is read
 // through the reader the other A2A Secrets use.
@@ -7018,7 +7038,7 @@ func TestA2AInjectFlagOffRemovalReadsTheSecretUncached(t *testing.T) {
 	cached := interceptor.NewClient(base, interceptor.Funcs{
 		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 			if _, ok := obj.(*corev1.Secret); ok && strict.Load() {
-				return fmt.Errorf("cached Get of Secret %s: on the shipped RBAC this starts an informer whose LIST is forbidden, and the reconcile worker blocks in WaitForCacheSync", key)
+				return fmt.Errorf("cached Get of Secret %s: starts an unwatched cluster-wide Secret informer instead of reading through APIReader", key)
 			}
 			return c.Get(ctx, key, obj, opts...)
 		},
@@ -8930,12 +8950,12 @@ func TestTheNATSPodCarriesTheExporterSidecar(t *testing.T) {
 				t.Fatalf("rendered %d servers, want %d", got, replicas)
 			}
 			spec := sts.Spec.Template.Spec
-			if len(spec.Containers) != 2 || spec.Containers[0].Name != "nats" {
-				names := make([]string, 0, len(spec.Containers))
-				for _, c := range spec.Containers {
-					names = append(names, c.Name)
-				}
-				t.Fatalf("containers = %v, want the server first and the exporter beside it", names)
+			names := make([]string, 0, len(spec.Containers))
+			for _, c := range spec.Containers {
+				names = append(names, c.Name)
+			}
+			if !slices.Equal(names, []string{"nats", buildA2ANATSReloaderContainer().Name, a2aNATSExporterContainerName}) {
+				t.Fatalf("containers = %v, want the server first, its config reloader, then the exporter", names)
 			}
 			exporter := a2aNATSExporterOf(spec)
 			if exporter == nil {
@@ -9123,39 +9143,67 @@ func TestTheBusFenceAdmitsTheCollectorOnTheExporterPortAlone(t *testing.T) {
 	}
 }
 
-// 8222 has no pod-network peer: no ingress rule on the bus fence names it,
-// by number or by the container port's name, covers it with a range, or
-// opens every port. The readiness probe enters from the node and the
-// exporter over loopback, neither of which the fence governs.
+// 8222 is reached through the operator's own rule alone (#4226's reload
+// confirmation; TestTheMonitorPortAdmitsTheOperatorAlone holds its peer): no
+// other ingress rule on the bus fence names it, by number or by the container
+// port's name, covers it with a range, or opens every port. Without the
+// operator's identity there is no such rule and nothing names 8222 at all.
+// The readiness probe enters from the node and the exporter over loopback,
+// neither of which the fence governs.
 func TestTheBusFenceAdmitsNoPeerOnTheMonitorPort(t *testing.T) {
-	for _, replicas := range []int{1, 3} {
-		t.Run(fmt.Sprintf("busReplicas %d", replicas), func(t *testing.T) {
-			np := buildA2ANATSNetworkPolicy(a2aTestAgentWithBusReplicas(replicas))
-			for i, rule := range np.Spec.Ingress {
-				if len(rule.Ports) == 0 {
-					t.Errorf("ingress rule %d opens every port, 8222 included: %+v", i, rule)
+	for _, identity := range []bool{false, true} {
+		for _, replicas := range []int{1, 3} {
+			t.Run(fmt.Sprintf("operator identity %v, busReplicas %d", identity, replicas), func(t *testing.T) {
+				if identity {
+					t.Setenv(operatorNamespaceEnvVar, "kube-agents-system")
+					t.Setenv(operatorServiceAccountEnvVar, "kube-agents-controller-manager")
+				} else {
+					t.Setenv(operatorNamespaceEnvVar, "")
+					t.Setenv(operatorServiceAccountEnvVar, "")
 				}
-				for _, p := range rule.Ports {
-					if p.Port == nil {
-						t.Errorf("ingress rule %d opens every port, 8222 included: %+v", i, p)
+				operatorRules := 0
+				np := buildA2ANATSNetworkPolicy(a2aTestAgentWithBusReplicas(replicas))
+				for i, rule := range np.Spec.Ingress {
+					// The operator's own 8222 rule: that one port, by
+					// number, from the operator's peer and nothing else.
+					if len(rule.Ports) == 1 && rule.Ports[0].Port != nil && rule.Ports[0].Port.Type == intstr.Int &&
+						rule.Ports[0].Port.IntValue() == a2aNATSMonitorPort && rule.Ports[0].EndPort == nil &&
+						reflect.DeepEqual(rule.From, a2aOperatorNATSPeers()) && len(rule.From) > 0 {
+						operatorRules++
 						continue
 					}
-					if p.Port.Type == intstr.String {
-						if p.Port.StrVal == "monitor" {
-							t.Errorf("ingress rule %d admits the monitor port by name: %+v", i, rule)
+					if len(rule.Ports) == 0 {
+						t.Errorf("ingress rule %d opens every port, 8222 included: %+v", i, rule)
+					}
+					for _, p := range rule.Ports {
+						if p.Port == nil {
+							t.Errorf("ingress rule %d opens every port, 8222 included: %+v", i, p)
+							continue
 						}
-						continue
-					}
-					lo, hi := p.Port.IntValue(), p.Port.IntValue()
-					if p.EndPort != nil {
-						hi = int(*p.EndPort)
-					}
-					if lo <= a2aNATSMonitorPort && a2aNATSMonitorPort <= hi {
-						t.Errorf("ingress rule %d admits %d: %+v", i, a2aNATSMonitorPort, rule)
+						if p.Port.Type == intstr.String {
+							if p.Port.StrVal == "monitor" {
+								t.Errorf("ingress rule %d admits the monitor port by name: %+v", i, rule)
+							}
+							continue
+						}
+						lo, hi := p.Port.IntValue(), p.Port.IntValue()
+						if p.EndPort != nil {
+							hi = int(*p.EndPort)
+						}
+						if lo <= a2aNATSMonitorPort && a2aNATSMonitorPort <= hi {
+							t.Errorf("ingress rule %d admits %d: %+v", i, a2aNATSMonitorPort, rule)
+						}
 					}
 				}
-			}
-		})
+				want := 0
+				if identity {
+					want = 1
+				}
+				if operatorRules != want {
+					t.Errorf("%d operator rules on 8222, want %d", operatorRules, want)
+				}
+			})
+		}
 	}
 }
 
