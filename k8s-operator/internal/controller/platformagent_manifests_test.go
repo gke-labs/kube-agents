@@ -1428,24 +1428,39 @@ func TestSafeSandboxEnvOverridesPassesSlackUxFlag(t *testing.T) {
 	}
 }
 
-func TestSafeSandboxEnvOverridesPassesDialAdmins(t *testing.T) {
-	// The dial's admin list is read by the gateway's Slack adapter in this
-	// container. Off the allowlist, the documented override renders on the CR
-	// and never reaches it, and the dial falls back to workspace admins.
-	custom := []corev1.EnvVar{
-		{Name: "KUBEAGENTS_DIAL_ADMINS", Value: "U0123ABCD,U0456EFGH"},
-		{
-			Name: "KUBEAGENTS_DIAL_ADMINS",
-			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
-				LocalObjectReference: corev1.LocalObjectReference{Name: "s"},
-				Key:                  "k",
-			}},
-		},
+// The dial's admin list reaches the agent through the managed .env only, on
+// every render: unpinned, a line in the PVC .env (which Hermes applies over the
+// container env, and save_env_value can write) would name who may move the dial.
+func TestManagedEnvPinsTheDialAdmins(t *testing.T) {
+	pinned := func(agent *agentv1alpha1.PlatformAgent) []string {
+		var got []string
+		for _, line := range strings.Split(renderManagedEnv(agent), "\n") {
+			if value, ok := strings.CutPrefix(line, dialAdminsEnvKey+"="); ok {
+				got = append(got, value)
+			}
+		}
+		return got
 	}
-
-	got := safeSandboxEnvOverrides(custom)
-	if len(got) != 1 || got[0].Name != "KUBEAGENTS_DIAL_ADMINS" || got[0].Value != "U0123ABCD,U0456EFGH" || got[0].ValueFrom != nil {
-		t.Errorf("expected only the literal KUBEAGENTS_DIAL_ADMINS to pass, got %#v", got)
+	agent := newTestPlatformAgent()
+	if got := pinned(agent); !slices.Equal(got, []string{""}) {
+		t.Errorf("dial admins with none set = %q, want one empty pin", got)
+	}
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Env: []corev1.EnvVar{
+		{Name: dialAdminsEnvKey, Value: " U0123ABCD , not-an-id,W0456EFGH\nKUBEAGENTS_DIAL=on,u0lower"},
+		{Name: dialAdminsEnvKey, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{Key: "k"}}},
+	}}
+	if got := pinned(agent); !slices.Equal(got, []string{"U0123ABCD"}) {
+		t.Errorf("dial admins = %q, want [U0123ABCD]", got)
+	}
+	// A list with no member id names nobody, rather than falling back to every
+	// workspace admin.
+	agent.Spec.Deployment.Env = []corev1.EnvVar{{Name: dialAdminsEnvKey, Value: "alice@corp.com, u0lower"}}
+	if got := pinned(agent); !slices.Equal(got, []string{dialAdminsNone}) {
+		t.Errorf("dial admins with no valid entry = %q, want [%s]", got, dialAdminsNone)
+	}
+	// One delivery path: the container env does not carry it.
+	if got := safeSandboxEnvOverrides([]corev1.EnvVar{{Name: dialAdminsEnvKey, Value: "U0123ABCD"}}); len(got) != 0 {
+		t.Errorf("%s passed the agent container's env allowlist, got %#v; the managed .env is its only path", dialAdminsEnvKey, got)
 	}
 }
 
@@ -4033,9 +4048,9 @@ func TestManagedEnvPinsPlatformKeysButNotHome(t *testing.T) {
 	// A deployment with no chat integration pins no PLATFORM key — an agent with no chat
 	// integration has no platform credential worth freezing, and a pin invented for one
 	// would only be a key the agent is refused permission to set. What survives is the
-	// ten unconditional pins, none of which is about chat: the loopback bearer (see
+	// eleven unconditional pins, none of which is about chat: the loopback bearer (see
 	// the next test), the PVC's directory mode, the mode switch, the scope path, the
-	// empty management-project override, the stall watch's three knobs, empty, the
+	// empty management-project override, the dial's admin list, empty, the stall watch's three knobs, empty, the
 	// Pub/Sub platform relay URL, empty, and the project that qualifies its routes.
 	bare := renderManagedEnv(newTestPlatformAgent())
 	want := "API_SERVER_KEY=" + loopbackAgentAPIKey + "\n" +
@@ -4043,6 +4058,7 @@ func TestManagedEnvPinsPlatformKeysButNotHome(t *testing.T) {
 		kubeagentsModeEnvKey + "=today\n" +
 		scopeFileEnvKey + "=" + scopeDir + "/" + scopeFileName + "\n" +
 		reconcileProjectEnvKey + "=\n" +
+		dialAdminsEnvKey + "=\n" +
 		stallWatchExcludeNamespacesEnvKey + "=\n" +
 		stallWatchMinAgeEnvKey + "=\n" +
 		stallWatchKindsEnvKey + "=\n" +
@@ -4115,7 +4131,8 @@ func assertManagedEnvAgrees(t *testing.T, agent *agentv1alpha1.PlatformAgent) {
 	// The mode key is pinned-only by design: the managed .env is the one path the
 	// mode takes into the runtime (spec-mode-switch.md), so a container-env copy
 	// would be a second answer to a question that must have exactly one. The stall
-	// watch's knobs take the same single path to stall_watch.py.
+	// watch's knobs take the same single path to stall_watch.py, and the dial's
+	// admin list its own to the Slack adapter.
 	pinnedOnly := map[string]bool{
 		"GATEWAY_ALLOWED_USERS":           true,
 		"GATEWAY_ALLOW_ALL_USERS":         true,
@@ -4123,6 +4140,7 @@ func assertManagedEnvAgrees(t *testing.T, agent *agentv1alpha1.PlatformAgent) {
 		stallWatchExcludeNamespacesEnvKey: true,
 		stallWatchMinAgeEnvKey:            true,
 		stallWatchKindsEnvKey:             true,
+		dialAdminsEnvKey:                  true,
 	}
 
 	for _, line := range strings.Split(strings.TrimSpace(renderManagedEnv(agent)), "\n") {

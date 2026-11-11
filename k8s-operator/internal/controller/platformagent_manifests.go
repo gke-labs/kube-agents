@@ -708,6 +708,42 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 	return renderManagedEnvForPlugins(agent, nil)
 }
 
+// dialAdminsEnvKey names the Slack members who may move the autonomy dial.
+const dialAdminsEnvKey = "KUBEAGENTS_DIAL_ADMINS"
+
+// slackMemberID is the shape of a Slack member id the dial's admin list keeps.
+var slackMemberID = regexp.MustCompile(`^[UW][A-Z0-9]{2,20}$`)
+
+// dialAdminsNone is pinned when the CR names admins but none of its entries is
+// a member id: the adapter then matches nobody, so the dial stays read-only,
+// rather than an empty list falling back to every workspace admin.
+const dialAdminsNone = "none"
+
+// dialAdmins is spec.deployment.env's literal KUBEAGENTS_DIAL_ADMINS, reduced
+// to the comma-separated entries shaped like a Slack member id, in order;
+// anything else in the value is dropped, and a valueFrom is ignored. A value
+// with no such entry fails closed (dialAdminsNone).
+func dialAdmins(agent *agentv1alpha1.PlatformAgent) string {
+	raw := ""
+	if agent.Spec.Deployment != nil {
+		for _, env := range agent.Spec.Deployment.Env {
+			if env.Name == dialAdminsEnvKey && env.ValueFrom == nil {
+				raw = env.Value
+			}
+		}
+	}
+	var kept []string
+	for _, part := range strings.Split(raw, ",") {
+		if part = strings.TrimSpace(part); slackMemberID.MatchString(part) {
+			kept = append(kept, part)
+		}
+	}
+	if len(kept) == 0 && strings.TrimSpace(raw) != "" {
+		return dialAdminsNone
+	}
+	return strings.Join(kept, ",")
+}
+
 // renderManagedEnvForPlugins pins the platform settings that decide whether the agent can reach
 // chat at all, for the ones that have no config.yaml equivalent.
 //
@@ -828,6 +864,13 @@ func renderManagedEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agentPlugins
 	// empty costs no install anything; the script treats an empty value as unset and
 	// reads GKE_PROJECT_ID next.
 	add(reconcileProjectEnvKey, "")
+
+	// The Slack autonomy dial's admin list (ADMINS_ENV in
+	// deploy/docker/patches/slack_dial_home.py), pinned and unconditional for
+	// the reason the switches are: unpinned, one line in the PVC .env written
+	// by the agent would name who may change what the agent may change. Empty
+	// when unset, which the adapter reads as "the workspace's admins".
+	add(dialAdminsEnvKey, dialAdmins(agent))
 
 	// GKE_PROJECT_ID, pinned to the harness's own value, for the same reason. The
 	// reconcile reads it as the management project once RECONCILE_PROJECT is empty: the
@@ -5399,14 +5442,6 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		// does not parse, is negative or is 0 means no limit, so it bounds a
 		// count of pull requests and reaches nothing else.
 		"INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS": {},
-
-		// The Slack members who may change the autonomy dial on the Home tab
-		// (ADMINS_ENV in deploy/docker/patches/slack_dial_home.py), read by
-		// the gateway's Slack adapter in this container. A comma-separated
-		// list of member ids, compared literally against the clicker; any
-		// value only narrows who may record the dial's level, and none names a
-		// path, a URL, a credential or an image.
-		"KUBEAGENTS_DIAL_ADMINS": {},
 
 		// How many Cluster Agent profiles one reconcile run scaffolds before it
 		// leaves the rest for the next run (MAX_CREATES_PER_RUN_ENV in
