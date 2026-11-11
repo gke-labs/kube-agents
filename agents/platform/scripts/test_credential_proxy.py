@@ -21419,5 +21419,140 @@ class SessionToolBudgetRouteTest(unittest.TestCase):
         self.assertIn(credential_proxy.LOOP_BREAKER_CODE, credential_proxy_client.POLICY_BLOCKED_CODES)
 
 
+class ExcludedClusterPathTest(unittest.TestCase):
+    """spec.scope.exclude.clusters at the broker: every route to a cluster's API.
+
+    The same stubbed gcloud and kubectl as ScopedServiceAccountPathTest, borrowed
+    rather than copied, so a refused fetch is asserted by an empty call log and
+    not only by the exception. `EXCLUDED` and `ALLOWED` share a project and
+    location: the exclusion is a cluster's, not its project's.
+    """
+
+    PROJECT = "kagents-dev"
+    LOCATION = "us-east4"
+    EXCLUDED = "excluded-cluster"
+    ALLOWED = "allowed-cluster"
+
+    fake_gcloud = ScopedServiceAccountPathTest.fake_gcloud
+    fake_kubectl = ScopedServiceAccountPathTest.fake_kubectl
+    gke_calls = ScopedServiceAccountPathTest.gke_calls
+    pool = ScopedServiceAccountPathTest.pool
+    EMAIL = ScopedServiceAccountPathTest.EMAIL
+    OTHER_EMAIL = ScopedServiceAccountPathTest.OTHER_EMAIL
+    OTHER_PROJECT = ScopedServiceAccountPathTest.OTHER_PROJECT
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.minted = []
+        self.get_credentials_log = Path(self.temp_dir.name) / "get-credentials.log"
+        self.scope_file = Path(self.temp_dir.name) / "scope.json"
+        self.exclude()
+
+    def exclude(self, *clusters):
+        """Rewrite scope.json, as an edit to spec.scope lands in the ConfigMap mount."""
+        text = json.dumps({"present": True, "projects": [], "exclude": {"projects": [], "clusters": [
+            {"projectId": self.PROJECT, "location": self.LOCATION, "clusterName": cluster} for cluster in clusters
+        ]}})
+        self.scope_file.write_text(text, encoding="utf-8")
+        stamp = time.time_ns() + 1_000_000 * len(clusters)
+        os.utime(self.scope_file, ns=(stamp, stamp))
+
+    def executor(self, scoped_pool=None):
+        import scope_exclude
+
+        executor = CommandExecutor(
+            timeout_seconds=30,
+            max_output_bytes=1 << 16,
+            state_dir=str(Path(self.temp_dir.name) / "state"),
+            scoped_pool=scoped_pool,
+            exclusions=scope_exclude.Exclusions(path=lambda: str(self.scope_file)),
+        )
+        executor.environment["GET_CREDENTIALS_LOG"] = str(self.get_credentials_log)
+        self.fake_gcloud(executor)
+        self.fake_kubectl(executor)
+        return executor
+
+    def context(self, cluster):
+        return f"gke_{self.PROJECT}_{self.LOCATION}_{cluster}"
+
+    def get_credentials(self, cluster):
+        return ["gcloud", "container", "clusters", "get-credentials", cluster,
+                f"--project={self.PROJECT}", f"--location={self.LOCATION}"]
+
+    def assert_excluded(self, call):
+        import scope_exclude
+
+        with self.assertRaises(scope_exclude.ExcludedCluster) as caught:
+            call()
+        self.assertEqual(scope_exclude.RULE_EXCLUDED_CLUSTER, caught.exception.rule)
+
+    def test_a_kubectl_naming_an_excluded_cluster_is_refused_before_gke_is_asked(self):
+        self.exclude(self.EXCLUDED)
+        executor = self.executor()
+        self.assert_excluded(lambda: executor.execute(
+            ["kubectl", "get", "pods"], kubeconfig_context=self.context(self.EXCLUDED)))
+        self.assertEqual([], self.gke_calls())
+        result = executor.execute(["kubectl", "get", "pods"], kubeconfig_context=self.context(self.ALLOWED))
+        self.assertEqual(0, result.exit_code, result.stderr)
+        self.assertEqual([self.context(self.ALLOWED)], self.gke_calls())
+
+    def test_a_cluster_excluded_after_its_kubeconfig_was_cached_is_refused(self):
+        executor = self.executor()
+        result = executor.execute(["kubectl", "get", "pods"], kubeconfig_context=self.context(self.EXCLUDED))
+        self.assertEqual(0, result.exit_code, result.stderr)
+        self.exclude(self.EXCLUDED)
+        self.assert_excluded(lambda: executor.execute(
+            ["kubectl", "get", "pods"], kubeconfig_context=self.context(self.EXCLUDED)))
+
+    def test_the_kubeconfig_flag_naming_an_excluded_cluster_is_refused(self):
+        self.exclude(self.EXCLUDED)
+        executor = self.executor()
+        self.assert_excluded(lambda: executor.execute(
+            ["kubectl", "get", "pods", f"--kubeconfig={self.context(self.EXCLUDED)}"]))
+        self.assertEqual([], self.gke_calls())
+
+    def test_get_credentials_for_an_excluded_cluster_never_runs(self):
+        self.exclude(self.EXCLUDED)
+        executor = self.executor()
+        self.assert_excluded(lambda: executor.execute(self.get_credentials(self.EXCLUDED), wants_kubeconfig=True))
+        self.assertEqual([], self.gke_calls())
+        result = executor.execute(self.get_credentials(self.ALLOWED), wants_kubeconfig=True)
+        self.assertEqual(0, result.exit_code, result.stderr)
+        self.assertIn(self.context(self.ALLOWED), result.kubeconfig)
+
+    def test_get_credentials_on_gcloud_defaults_is_refused_once_its_context_names_the_cluster(self):
+        """No --location in argv: the target is only known from what gcloud wrote."""
+        self.exclude(self.EXCLUDED)
+        executor = self.executor()
+        stub = Path(executor.executables["gcloud"])
+        stub.write_text(stub.read_text(encoding="utf-8").replace(
+            'location=""', f'location="{self.LOCATION}"'), encoding="utf-8")
+        argv = ["gcloud", "container", "clusters", "get-credentials", self.EXCLUDED, f"--project={self.PROJECT}"]
+        self.assert_excluded(lambda: executor.execute(argv, wants_kubeconfig=True))
+        self.assertFalse(executor._managed_kubeconfig(
+            credential_proxy_client.parse_gke_context(self.context(self.EXCLUDED))).exists(),
+            "an excluded cluster's kubeconfig was filed")
+
+    def test_a_kubectl_naming_no_cluster_is_refused_when_the_broker_s_own_cluster_is_excluded(self):
+        for scoped_pool in (None, "pool"):
+            with self.subTest(pool=scoped_pool is not None):
+                self.exclude(self.EXCLUDED)
+                executor = self.executor(self.pool() if scoped_pool else None)
+                executor.host_context = self.context(self.EXCLUDED)
+                self.assert_excluded(lambda: executor.execute(["kubectl", "get", "pods"]))
+                self.exclude()
+                result = executor.execute(["kubectl", "get", "pods"])
+                self.assertNotIn("ExcludedCluster", result.stderr)
+
+    def test_a_gcloud_metadata_read_of_an_excluded_cluster_is_allowed(self):
+        """Control-plane reads are the project's, and stay allowed."""
+        self.exclude(self.EXCLUDED)
+        executor = self.executor()
+        result = executor.execute(["gcloud", "container", "clusters", "describe", self.EXCLUDED,
+                                   f"--project={self.PROJECT}", f"--location={self.LOCATION}"])
+        self.assertEqual(0, result.exit_code, result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
