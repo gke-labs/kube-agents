@@ -160,32 +160,44 @@ func decideTiers(p *agentv1alpha1.AgentProfile, cat tierCatalog, rendered []stri
 // ServiceAccounts, so "status empty" is never read as "nothing rendered".
 // Only ServiceAccounts carrying this profile's label and UID count, so a
 // forged one confers nothing.
-func renderedTiersOf(ctx context.Context, c client.Reader, p *agentv1alpha1.AgentProfile) ([]string, error) {
+func renderedTiersOf(p *agentv1alpha1.AgentProfile, owned map[string]string) []string {
 	if len(p.Status.RenderedTiers) > 0 {
-		return p.Status.RenderedTiers, nil
+		return p.Status.RenderedTiers
 	}
+	out := make([]string, 0, len(owned))
+	for tier := range owned {
+		out = append(out, tier)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// ownedTierServiceAccounts is the tiers p has its own operator-created
+// ServiceAccounts for. Only ServiceAccounts carrying this profile's label and
+// UID count, so a forged one confers nothing. A profile on a named
+// ServiceAccount has none.
+func ownedTierServiceAccounts(ctx context.Context, c client.Reader, p *agentv1alpha1.AgentProfile) (map[string]string, error) {
+	out := map[string]string{}
 	if p.Spec.Identity.ServiceAccountName != "" {
 		// A named ServiceAccount serves one tier: the one allowedTiers lists.
-		return nil, nil
+		return out, nil
 	}
 	var sas corev1.ServiceAccountList
 	if err := c.List(ctx, &sas, client.InNamespace(profileNamespaceOf(p)), client.MatchingLabels{agentProfileNameLabel: p.Name}); err != nil {
 		if isCRDNotInstalledError(err) {
-			return nil, nil
+			return out, nil
 		}
 		return nil, err
 	}
 	prefix := agentProfileServiceAccountPrefix + p.Name + "-"
-	var out []string
 	for i := range sas.Items {
 		sa := &sas.Items[i]
 		tier, ok := strings.CutPrefix(sa.Name, prefix)
 		if !ok || !agentProfileOwnsServiceAccount(sa, p) || !allowedTierNameRE.MatchString(tier) {
 			continue
 		}
-		out = append(out, tier)
+		out[tier] = ""
 	}
-	sort.Strings(out)
 	return out, nil
 }
 
@@ -209,11 +221,11 @@ func renderableAgentProfiles(ctx context.Context, c client.Reader, ns string, pr
 	var out []agentv1alpha1.AgentProfile
 	for i := range profiles {
 		p := &profiles[i]
-		rendered, err := renderedTiersOf(ctx, c, p)
+		owned, err := ownedTierServiceAccounts(ctx, c, p)
 		if err != nil {
 			return nil, nil, err
 		}
-		v := decideTiers(p, cat, rendered)
+		v := decideTiers(p, cat, renderedTiersOf(p, owned))
 		verdicts[p.Name] = v
 		if len(v.renderable) == 0 {
 			continue

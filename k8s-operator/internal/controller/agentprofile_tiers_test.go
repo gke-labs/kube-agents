@@ -90,7 +90,8 @@ func TestRenderedTiersAreDerivedFromOwnServiceAccountsWhenStatusIsGone(t *testin
 		own("agentprofile-tse-unattended", "uid-tse"),
 		own("agentprofile-tse-nightly", "uid-someone-else"), // copied label, wrong UID
 	).Build()
-	got, err := renderedTiersOf(context.Background(), c, p)
+	owned, err := ownedTierServiceAccounts(context.Background(), c, p)
+	got := renderedTiersOf(p, owned)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +103,7 @@ func TestRenderedTiersAreDerivedFromOwnServiceAccountsWhenStatusIsGone(t *testin
 		t.Fatalf("after a restore the incumbent lost: %+v", v)
 	}
 	p.Status.RenderedTiers = []string{"read"}
-	if got, _ := renderedTiersOf(context.Background(), c, p); !slices.Equal(got, []string{"read"}) {
+	if got := renderedTiersOf(p, nil); !slices.Equal(got, []string{"read"}) {
 		t.Errorf("a present status was overridden by derivation: %v", got)
 	}
 }

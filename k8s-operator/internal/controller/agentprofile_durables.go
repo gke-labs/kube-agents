@@ -79,29 +79,25 @@ func desiredProfileDurables(p *agentv1alpha1.AgentProfile) []profileDurable {
 	return out
 }
 
-// profileDurableNames lists the durables on the submit stream that are this
-// profile's by name, whatever tier they were made for: a dropped tier, a
-// built-in or a Tier resource since deleted (#3659). deleteDurable still
-// deletes only one carrying the operator's held marker.
-func profileDurableNames(ctx context.Context, js jetstream.JetStream, profile string) ([]string, error) {
-	stream, err := js.Stream(ctx, a2aProfileSubmitStream)
-	if errors.Is(err, jetstream.ErrStreamNotFound) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("listing the profile's durables: %w", err)
-	}
-	lister := stream.ConsumerNames(ctx)
+// profileDurableNamesFor are the durable names a profile could have at
+// tiers: one per (tier, kind). The operator finds a profile's durables by
+// name, never by listing the stream: its bus identity holds only the
+// consumer create, info and delete verbs on PROFILE_SUBMITS
+// (a2aOperatorIdentity), and a list would need the stream's info and the
+// consumer-names verb besides. A name allowedTiers couldn't list is skipped.
+func profileDurableNamesFor(profile string, tiers []string) []string {
 	var out []string
-	for name := range lister.Name() {
-		if profileDurableOf(profile, name) {
-			out = append(out, name)
+	seen := map[string]bool{}
+	for _, tier := range tiers {
+		if !allowedTierNameRE.MatchString(tier) || seen[tier] {
+			continue
+		}
+		seen[tier] = true
+		for _, kind := range a2aSubmitKinds {
+			out = append(out, profileDurableName(profile, tier, kind))
 		}
 	}
-	if err := lister.Err(); err != nil {
-		return nil, fmt.Errorf("listing the profile's durables: %w", err)
-	}
-	return out, nil
+	return out
 }
 
 // ensureDurable creates the durable, or updates an existing one's
@@ -207,9 +203,11 @@ func deleteDurable(ctx context.Context, js jetstream.JetStream, name string) err
 }
 
 // SyncDurables makes the profile's durables on the bus exactly want: each
-// one created or its cap updated, and every other name the profile could
-// have deleted if this operator made it. want empty deletes them all.
-func (n *natsCardPublisher) SyncDurables(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profile string, want []profileDurable) error {
+// one created or its cap updated, and the profile's durable at every tier in
+// probe that want doesn't name deleted if this operator made it. want empty
+// deletes them all. probe is every tier the profile could have a durable at
+// (durableProbeTiers): the operator finds durables by name, not by listing.
+func (n *natsCardPublisher) SyncDurables(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profile string, want []profileDurable, probe []string) error {
 	nc, err := n.conn(agent)
 	if err != nil {
 		return err
@@ -220,22 +218,18 @@ func (n *natsCardPublisher) SyncDurables(ctx context.Context, agent *agentv1alph
 	}
 	ctx, cancel := context.WithTimeout(ctx, cardBusTimeout)
 	defer cancel()
-	return syncDurables(ctx, js, profile, want)
+	return syncDurables(ctx, js, profile, want, probe)
 }
 
 // syncDurables is SyncDurables on a JetStream handle.
-func syncDurables(ctx context.Context, js jetstream.JetStream, profile string, want []profileDurable) error {
+func syncDurables(ctx context.Context, js jetstream.JetStream, profile string, want []profileDurable, probe []string) error {
 	keep := map[string]bool{}
 	for _, d := range want {
 		keep[d.name] = true
 	}
 	// Dropped names first: on a stream with no spare consumer slot, a tier
 	// swap needs the old tier's slots before the new tier's durables fit.
-	existing, err := profileDurableNames(ctx, js, profile)
-	if err != nil {
-		return err
-	}
-	for _, name := range existing {
+	for _, name := range profileDurableNamesFor(profile, probe) {
 		if keep[name] {
 			continue
 		}
