@@ -406,7 +406,7 @@ CREATE TABLE post_merge_records(    -- POST /v1/post-merge/records
   task_id TEXT, thread_platform TEXT, thread_chat_id TEXT, thread_id TEXT,
   merged_at TEXT, merge_commit TEXT, closed_at TEXT, merge_checked_at TEXT,
   applied_at TEXT, sync_state TEXT, health_baseline TEXT, health_result TEXT, health_detail TEXT,
-  health_at TEXT,
+  health_at TEXT, health_checked_at TEXT,
   human_edited INTEGER, reverted_at TEXT, outcome TEXT, outcome_at TEXT
 );
 ```

@@ -1901,6 +1901,7 @@ def init_db() -> None:
                     health_result   TEXT,
                     health_detail   TEXT,
                     health_at       TEXT,
+                    health_checked_at TEXT,
                     human_edited    INTEGER,
                     reverted_at     TEXT,
                     outcome         TEXT,
