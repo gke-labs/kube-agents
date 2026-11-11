@@ -183,11 +183,17 @@ func (s *SlackAdapter) uxLocked() *slackUX {
 // rather than gaining a second slot, whose older twin's eviction would
 // otherwise drop the live entry (a map entry deleted without retiring its
 // slot, then added again). The rings hold at most uxCap keys, so the
-// scan is bounded.
+// scan is bounded; a ring with a cap of its own uses rememberUpTo.
 func remember(order *[]string, key string, drop func(string)) {
+	rememberUpTo(order, key, uxCap, drop)
+}
+
+// rememberUpTo is remember with the ring's cap given: the ring holds at
+// most limit keys.
+func rememberUpTo(order *[]string, key string, limit int, drop func(string)) {
 	forget(order, key)
 	*order = append(*order, key)
-	if len(*order) > uxCap {
+	if len(*order) > limit {
 		drop((*order)[0])
 		*order = (*order)[1:]
 	}

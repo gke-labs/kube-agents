@@ -3299,7 +3299,7 @@ func TestBuildMinimalPlatformRole(t *testing.T) {
 		t.Errorf("expected APIGroups [''], got %v", ruleCore.APIGroups)
 	}
 
-	expectedCoreResources := []string{"nodes", "namespaces", "pods", "pods/log", "services", "endpoints", "events", "persistentvolumes", "persistentvolumeclaims", "resourcequotas", "limitranges", "configmaps", "serviceaccounts"}
+	expectedCoreResources := []string{"nodes", "namespaces", "pods", "pods/log", "services", "endpoints", "events", "persistentvolumes", "persistentvolumeclaims", "resourcequotas", "limitranges", "configmaps", "serviceaccounts", "secrets"}
 	if !slices.Equal(ruleCore.Resources, expectedCoreResources) {
 		t.Errorf("expected Resources %v, got %v", expectedCoreResources, ruleCore.Resources)
 	}
@@ -3322,13 +3322,45 @@ func TestBuildMinimalPlatformRole(t *testing.T) {
 	if !slices.Equal(ruleMetrics.Verbs, expectedMetricsVerbs) {
 		t.Errorf("expected Metrics Verbs %v, got %v", expectedMetricsVerbs, ruleMetrics.Verbs)
 	}
+
+	// DisallowSecretsRead=true omits secrets from the core group rule.
+	disallowedAgent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{
+				Security: &agentv1alpha1.SecuritySpec{
+					DisallowSecretsRead: ptr.To(true),
+				},
+			},
+		},
+	}
+	disallowedRole := buildMinimalPlatformRole(disallowedAgent)
+	if slices.Contains(disallowedRole.Rules[0].Resources, "secrets") {
+		t.Errorf("expected DisallowSecretsRead=true to omit secrets, got %v", disallowedRole.Rules[0].Resources)
+	}
+
+	// DisallowSecretsRead=false includes secrets in the core group rule.
+	allowedAgent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{
+				Security: &agentv1alpha1.SecuritySpec{
+					DisallowSecretsRead: ptr.To(false),
+				},
+			},
+		},
+	}
+	allowedRole := buildMinimalPlatformRole(allowedAgent)
+	if !slices.Contains(allowedRole.Rules[0].Resources, "secrets") {
+		t.Errorf("expected DisallowSecretsRead=false to include secrets, got %v", allowedRole.Rules[0].Resources)
+	}
 }
 
 // The agent reads the GitOps reconcilers' sync objects to learn which repository
-// and directory syncs a cluster. Nothing in that grant may write or reach a Secret
-// (Argo CD keeps cluster and repository credentials in Secrets), and the kinds the
-// sync lookup does not need stay out, so the readable inline values are bounded
-// to what Applications and Kustomizations carry.
+// and directory syncs a cluster. Nothing in that grant may write (and only the
+// core API group may read Secrets for `<agent>-kube-proxy`'s redacted metadata
+// path), and the kinds the sync lookup does not need stay out, so the readable
+// inline values are bounded to what Applications and Kustomizations carry.
 func TestMinimalPlatformRoleReadsTheGitOpsReconcilers(t *testing.T) {
 	role := buildMinimalPlatformRole(&agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
@@ -3348,8 +3380,8 @@ func TestMinimalPlatformRoleReadsTheGitOpsReconcilers(t *testing.T) {
 	readOnly := []string{"get", "list", "watch"}
 	seen := map[string]bool{}
 	for _, rule := range role.Rules {
-		if slices.Contains(rule.Resources, "secrets") {
-			t.Errorf("minimal role grants secrets in %v", rule.APIGroups)
+		if slices.Contains(rule.Resources, "secrets") && (!slices.Equal(rule.APIGroups, []string{""}) || !slices.Equal(rule.Verbs, readOnly)) {
+			t.Errorf("minimal role grants secrets outside read-only core group: groups=%v verbs=%v", rule.APIGroups, rule.Verbs)
 		}
 		if slices.Contains(rule.Resources, "*") || slices.Contains(rule.APIGroups, "*") || slices.Contains(rule.Verbs, "*") {
 			t.Errorf("minimal role carries a wildcard: %+v", rule)

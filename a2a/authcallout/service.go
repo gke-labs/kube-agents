@@ -109,11 +109,14 @@ type Config struct {
 	// GrantTTL bounds an issued connection's life.
 	//
 	// This is the deployment's revocation window, and it is the only one it
-	// has. Permissions are fixed when a connection authenticates and the
-	// callout is never consulted again, so a narrowed grant or a removed
-	// identity does not reach a connection that is already established —
-	// until it expires and the client reconnects, re-presenting a token the
-	// cluster gets to refuse. Zero means the default; a grant that never
+	// has. Permissions are fixed when a connection authenticates, so a
+	// narrowed grant or a removed identity does not reach a connection that
+	// is already established — until it expires and the client reconnects,
+	// re-presenting a token the cluster gets to refuse. The one other time
+	// the callout is consulted for a live connection is a server config
+	// reload, which runs it again for every connection it authenticated. On
+	// nats-server 2.10.29 those connections were dropped at the reload and
+	// reconnected through the callout within a second. Zero means the default; a grant that never
 	// expires means a map change never reaches anything already connected.
 	GrantTTL time.Duration
 

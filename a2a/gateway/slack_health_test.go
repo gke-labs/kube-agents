@@ -2,8 +2,11 @@ package gateway
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -149,6 +152,47 @@ func TestTheSlackPumpReportsTheConnection(t *testing.T) {
 	if v, ok := gaugeValue(t, m, slackConnectedSeries); !ok || v != 0 {
 		t.Fatalf("slack_connected after Run failed = %v, %v; want 0", v, ok)
 	}
+}
+
+// A token Slack rejects does not take the gateway down: behind the mux the
+// Slack backend is contained and run again after a backoff, and between those
+// runs the gauge stays armed at 0, so the slack-disconnected alert has a
+// sample to read for as long as the token is bad.
+func TestARejectedTokenKeepsTheGaugeAtZeroAcrossTheMuxsRestarts(t *testing.T) {
+	var opens atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		opens.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":false,"error":"invalid_auth"}`))
+	}))
+	t.Cleanup(srv.Close)
+	sl := newTestSlackAdapter(&fakeSlackAPI{})
+	m := NewMetrics()
+	sl.SetMetrics(m)
+	sl.sm = socketmode.New(slack.New("xoxb-stub", slack.OptionAPIURL(srv.URL+"/")))
+	mux, err := NewMultiAdapter(slackBackend, consoleBackend, map[string]Adapter{slackBackend: sl, consoleBackend: newFakeAdapter()}, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux.restartBase, mux.restartMax = time.Millisecond, 5*time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	returned := make(chan error, 1)
+	go func() { returned <- mux.Run(ctx, func(InboundMessage) {}) }()
+	waitFor(t, "several rejected dials", func() bool { return opens.Load() >= 5 })
+	for range 20 {
+		if v, ok := gaugeValue(t, m, slackConnectedSeries); !ok || v != 0 {
+			t.Fatalf("slack_connected between restarts = %v, %v; want an armed 0", v, ok)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case err := <-returned:
+		t.Fatalf("the mux returned on a rejected Slack token: %v", err)
+	default:
+	}
+	cancel()
+	<-returned
 }
 
 // A Run ended by its caller's context, as a replica's is when it loses the

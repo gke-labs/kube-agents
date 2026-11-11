@@ -1,0 +1,12 @@
+# Rows of the "Breaking changes in recent releases" table on
+# docs/site/src/content/docs/install/upgrade.md that scripts/check_upgrade_table_releases.py
+# cannot trace to a commit their release contains. One entry per line:
+#
+#     <full 40-character commit> <change text, exactly as in the row's change cell>
+#
+# Add an entry only for one of two cases, and in both name the commit that shipped the row's change
+# (on main, or its cherry-pick on the release branch):
+#   - a shipped row whose change cell was reworded;
+#   - a row added after its release was tagged.
+# The check then requires the row's release to contain the named commit. A reviewer must check that
+# the commit is the one that shipped the row's change. Remove the entry when its row goes.

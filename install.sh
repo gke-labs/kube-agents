@@ -640,6 +640,7 @@ PARAM_ENABLE_DRIFT_DETECTOR="${ENABLE_DRIFT_DETECTOR:-}"
 # answer and the run's answer are distinguishable.
 SHELL_ENABLE_DRIFT_DETECTOR="${ENABLE_DRIFT_DETECTOR:-}"
 PARAM_ENABLE_GKE_BACKUP_PLAN="${ENABLE_GKE_BACKUP_PLAN:-}"
+PARAM_DISALLOW_SECRETS_READ="${DISALLOW_SECRETS_READ:-}"
 # Set-ness, never ${VAR:-...}: `--enable-gvisor=` with no value sets this to the empty
 # string, and that has to survive to the validator in main rather than being
 # silently read back as the default. The default itself comes from
@@ -952,6 +953,11 @@ Flags for AI Agents & Automation:
   --enable-gke-backup-plan[=true|false]
                                 Provision a GKE Backup Plan for the cluster
                                 (default: DEFAULT_ENABLE_GKE_BACKUP_PLAN, currently false)
+  --disallow-secrets-read[=true|false]
+                                Omit core secrets (get, list, watch) from the reader
+                                ClusterRole (kubeagents:minimal:<ns>:<name>); when unset,
+                                new installs grant secrets read access and existing installs
+                                keep their current ClusterRole permissions
   --user-profile-enabled=BOOL   Enable user profile persona extensions
                                 (default: DEFAULT_USER_PROFILE_ENABLED,
                                 currently false)
@@ -1291,6 +1297,9 @@ parse_args() {
       --enable-gke-backup-plan|--enable-gke-backup-plan=*)
         PARAM_ENABLE_GKE_BACKUP_PLAN="$(flag_bool_value "$1")"
         validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_GKE_BACKUP_PLAN"; shift ;;
+      --disallow-secrets-read|--disallow-secrets-read=*)
+        PARAM_DISALLOW_SECRETS_READ="$(flag_bool_value "$1")"
+        validate_bool_flag_value "${1%%=*}" "$PARAM_DISALLOW_SECRETS_READ"; shift ;;
       --enable-pubsub-platform|--enable-pubsub|--enable-pubsub-platform=*|--enable-pubsub=*)
         PARAM_ENABLE_PUBSUB_PLATFORM="$(flag_bool_value "$1")"
         validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_PUBSUB_PLATFORM"; shift ;;
@@ -2719,6 +2728,11 @@ bootstrap_install_env_file() {
       "A later run without it re-reads the recorded value and plans the BackupPlan's destruction; once a backup has been taken the API refuses that destroy and the apply fails partway instead." \
       true \
       "every later install.sh run"
+    warn_flag_beats_unrecorded_file_value "$destination" DISALLOW_SECRETS_READ --disallow-secrets-read \
+      "${PARAM_DISALLOW_SECRETS_READ:-}" \
+      "A later run without it renders the PlatformAgent from what the file records; upgrade.sh and --menu take no --disallow-secrets-read, so the next of either puts the reader ClusterRole's secrets rule back to the recorded or existing state." \
+      true \
+      "every later install.sh run"
     warn_flag_beats_unrecorded_file_value "$destination" WEB_CONSOLE_ENABLED --enable-web-console \
       "${PARAM_ENABLE_WEB_CONSOLE:-}" \
       "A later run without it renders the web console from what the file records; upgrade.sh and --menu take no --enable-web-console, so the next of either puts the console back to the recorded or default state." \
@@ -3074,6 +3088,9 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" WEB_CONSOLE_ENABLED "${WEB_CONSOLE_ENABLED:-$DEFAULT_ENABLE_WEB_CONSOLE}"
   write_env_var "$tmp" ENABLE_GVISOR "${ENABLE_GVISOR:-$DEFAULT_ENABLE_GVISOR}"
   write_env_var "$tmp" ENABLE_GKE_BACKUP_PLAN "${ENABLE_GKE_BACKUP_PLAN:-$DEFAULT_ENABLE_GKE_BACKUP_PLAN}"
+  if [ -n "${DISALLOW_SECRETS_READ:-}" ]; then
+    write_env_var "$tmp" DISALLOW_SECRETS_READ "${DISALLOW_SECRETS_READ}"
+  fi
   write_env_var "$tmp" ENABLE_PUBSUB_PLATFORM "${PARAM_ENABLE_PUBSUB_PLATFORM:-$DEFAULT_ENABLE_PUBSUB_PLATFORM}"
   write_env_var "$tmp" ENABLE_STOCKOUT_INVESTIGATOR "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}"
   write_env_var "$tmp" ENABLE_DRIFT_DETECTOR "${PARAM_ENABLE_DRIFT_DETECTOR:-$DEFAULT_ENABLE_DRIFT_DETECTOR}"
@@ -5058,8 +5075,8 @@ adopt_live_platform_agent_mode() {
 }
 
 # A first install that mirrors its third-party images ($1, the prefix)
-# defaults to today. next's NATS bus runs two images (nats, nats-box) that
-# are the operator's compiled defaults, which neither this installer nor the
+# defaults to today. next's NATS bus runs three images (nats, nats-box,
+# nats-server-config-reloader) that are the operator's compiled defaults, which neither this installer nor the
 # chart points at a mirror, so on a cluster that pulls only from the mirror
 # the bus would sit in ImagePullBackOff. Only the fallback moves: --mode, an
 # exported PLATFORM_AGENT_MODE, a recorded key and the cluster's live mode all win.
@@ -5694,17 +5711,16 @@ apply_gitlab_token_secret() {
 
 # github.com presents a certificate the public CAs sign, and the later flag
 # check refuses a CA file with no host. Called by the forge menu's github.com
-# and no-repository answers: an exported GITOPS_CA_FILE is dropped without a
-# word, as the GitLab validator drops one for gitlab.com (a CA file typed for
-# an Enterprise Server host never reaches here: the validator's refusal puts
-# the entry value back); one given by flag is dropped with a line, since
-# refusing it after the whole interview would be the alternative. The CA
-# Secret name goes with it: a recorded forge, org, App or host flag settles
-# the forge before the menu, so the only name here is the default the early
-# flag check derived from an exported host and CA file (a refused attempt
-# at the menu derives none: the validator names the Secret only after it
-# accepts the file), and the later flag check would otherwise report it
-# dropped as a recorded one.
+# and no-repository answers, and by the Enterprise Server answer when the
+# entered host is a github.com spelling: an exported GITOPS_CA_FILE is dropped
+# without a word, as the GitLab validator drops one for gitlab.com (a CA file
+# is never prompted for a github.com host; for an Enterprise Server host, the
+# validator's refusal puts the entry value back); one given by flag is dropped
+# with a line, since refusing it after the whole interview would be the
+# alternative. The CA Secret name goes with it (whether derived from an exported
+# file or named in the environment): a recorded forge, org, App or host flag
+# settles the forge before the menu, and the later flag check would otherwise
+# report it dropped as a recorded one.
 drop_gitops_ca_file_for_github_com() {
   if [ -n "${PARAM_GITOPS_CA_FILE:-}" ] && [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" = "true" ]; then
     print_info "Dropping --gitops-ca-file '${PARAM_GITOPS_CA_FILE}': this run's GitOps forge is github.com, which uses the public CAs."
@@ -5732,12 +5748,13 @@ ask_gitops_forge() {
   # What the menu was first shown over. An option 2 attempt the validator
   # refuses puts these back, so the next answer -- option 2 again, github.com
   # or no repository -- starts from here and not from the refused host and
-  # CA file. The hostname prompt's default is the host the menu was shown
+  # CA file. The hostname and CA prompts' defaults are what the menu was shown
   # over on the first attempt and nothing after a refusal: prompt_read
-  # substitutes a default for an empty answer, so a refused host offered
+  # substitutes a default for an empty answer, so a refused host or file offered
   # again would make enter resubmit it instead of returning to the menu.
   local host_on_entry="${PARAM_GITOPS_HOST:-}" ca_file_on_entry="${PARAM_GITOPS_CA_FILE:-}"
-  local ghes_host="${PARAM_GITOPS_HOST:-}"
+  local ca_secret_on_entry="${PARAM_GITOPS_CA_SECRET:-}"
+  local ghes_host="${PARAM_GITOPS_HOST:-}" ghes_ca_file="${PARAM_GITOPS_CA_FILE:-}"
   while true; do
     prompt_menu "Where does the GitOps repository live?" \
       "GitHub (github.com)" \
@@ -5770,14 +5787,30 @@ ask_gitops_forge() {
         fi
         PARAM_GITOPS_FORGE="github"
         PARAM_GITOPS_HOST="$ghes_host"
-        # The CA prompt has no default, so empty stays a way to answer "a
-        # public CA signed it" on every pass.
-        if [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" != "true" ]; then
-          PARAM_GITOPS_CA_FILE=""
-          if [ -z "${PARAM_GITOPS_CA_SECRET:-}" ]; then
-            prompt_read "PEM CA file that signed the instance's certificate (empty if a public CA signed it)" PARAM_GITOPS_CA_FILE ""
-          fi
-        fi
+        case "$PARAM_GITOPS_HOST" in
+          github.com|www.github.com|ssh.github.com)
+            drop_gitops_ca_file_for_github_com
+            ;;
+          *)
+            if [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" != "true" ]; then
+              local ca_prompt="PEM CA file that signed the instance's certificate"
+              if [ -n "$ghes_ca_file" ]; then
+                ca_prompt="$ca_prompt (empty keeps the file; a path replaces it)"
+              elif [ -z "$ca_file_on_entry" ] && [ -n "$PARAM_GITOPS_CA_SECRET" ]; then
+                ca_prompt="$ca_prompt (empty keeps Secret '$PARAM_GITOPS_CA_SECRET'; a path replaces it)"
+              else
+                ca_prompt="$ca_prompt (empty if a public CA signed it)"
+              fi
+              prompt_read "$ca_prompt" PARAM_GITOPS_CA_FILE "$ghes_ca_file"
+              # An empty answer means a public CA signed the certificate: clear
+              # any Secret name the early flag check derived from an exported file.
+              # Leave an operator-named Secret alone if it arrived without a file.
+              if [ -z "$PARAM_GITOPS_CA_FILE" ] && [ -n "$ca_file_on_entry" ]; then
+                PARAM_GITOPS_CA_SECRET=""
+              fi
+            fi
+            ;;
+        esac
         if validate_gitops_forge_flags; then
           # A github.com spelling clears the host: the install is then github.com.
           if [ -n "${PARAM_GITOPS_HOST:-}" ]; then
@@ -5791,9 +5824,11 @@ ask_gitops_forge() {
         # CA file themselves; option 3 does not, and without this it would
         # offer the refused Enterprise Server host as the GitLab host's default.
         ghes_host=""
+        ghes_ca_file=""
         PARAM_GITOPS_HOST="$host_on_entry"
         if [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" != "true" ]; then
           PARAM_GITOPS_CA_FILE="$ca_file_on_entry"
+          PARAM_GITOPS_CA_SECRET="$ca_secret_on_entry"
         fi
         has_controlling_tty || exit 1
         ;;
@@ -8395,6 +8430,9 @@ main() {
   if [ -n "${PARAM_ENABLE_GKE_BACKUP_PLAN:-}" ]; then
     export ENABLE_GKE_BACKUP_PLAN="$PARAM_ENABLE_GKE_BACKUP_PLAN"
   fi
+  if [ -n "${PARAM_DISALLOW_SECRETS_READ:-}" ]; then
+    export DISALLOW_SECRETS_READ="$PARAM_DISALLOW_SECRETS_READ"
+  fi
   export MODEL_PROVIDER="$model_provider"
   export MODEL_DEFAULT_NAME="$model_default_name"
   export MODEL_MAX_TOKENS="$model_max_tokens"
@@ -8403,13 +8441,14 @@ main() {
   export LITELLM_REDACTION_IP_ALLOW_CIDRS="$PARAM_LITELLM_REDACTION_IP_ALLOW_CIDRS"
   platform_agent_mode="${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}"
   export PLATFORM_AGENT_MODE="$platform_agent_mode"
-  # The bus's two third-party images are the operator's compiled defaults
-  # (A2A_NATS_IMAGE and A2A_PROVISION_IMAGE in images.json), which neither
-  # this installer nor the chart points at a mirror, so a next install that
-  # mirrors its third-party images still pulls those two from Docker Hub.
+  # The bus's three third-party images are the operator's compiled defaults
+  # (A2A_NATS_IMAGE, A2A_PROVISION_IMAGE and A2A_NATS_RELOADER_IMAGE in
+  # images.json), which neither this installer nor the chart points at a
+  # mirror, so a next install that mirrors its third-party images still pulls
+  # those three from Docker Hub.
   if [ "$platform_agent_mode" = "next" ] && [ -n "$third_party_registry_prefix" ]; then
-    print_warning "spec.mode next with a third-party registry prefix: the operator still pulls the NATS bus's two images (nats, nats-box) from Docker Hub. Nothing in this install points them at ${third_party_registry_prefix}."
-    print_info "On a cluster that can pull only from the mirror, the bus stays in ImagePullBackOff until the operator's A2A_NATS_IMAGE and A2A_PROVISION_IMAGE name the mirrored copies (images.json lists both)."
+    print_warning "spec.mode next with a third-party registry prefix: the operator still pulls the NATS bus's three images (nats, nats-box, nats-server-config-reloader) from Docker Hub. Nothing in this install points them at ${third_party_registry_prefix}."
+    print_info "On a cluster that can pull only from the mirror, the bus stays in ImagePullBackOff until the operator's A2A_NATS_IMAGE, A2A_PROVISION_IMAGE and A2A_NATS_RELOADER_IMAGE name the mirrored copies (images.json lists all three)."
   fi
   export VERTEX_PROJECT_ID="$vertex_project_id"
   export VERTEX_LOCATION="$vertex_location"

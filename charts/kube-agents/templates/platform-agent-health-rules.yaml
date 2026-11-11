@@ -75,15 +75,21 @@ the operator's scrape, so enabling them without it is refused at render.
 {{- $slackFor := $t.slackDisconnectedFor | default "5m" }}
 {{- /*
 The Slack alert is the one window in an expression here, against the
-day-long rule below, on purpose: a gateway whose token Slack rejects exits and
-crash-loops, so its gauge is a 0 between gaps, and a `for` on the instant value
-resets at every gap and never fires. The window's max reads 0 whenever no 1
-landed in it, gaps or not; a standby serves no sample and the leader's 1
+day-long rule below, on purpose. A token Slack rejects does not exit the
+gateway: the mux restarts the Slack backend with a backoff while the console
+stays up (MultiAdapter), and the gauge stays armed at 0 across those restarts.
+But a `for` on the instant value resets at any gap in the series (a missed
+scrape, a pod rescheduled mid-outage), where the window's max reads 0 whenever
+no 1 landed in it, gaps or not; a standby serves no sample and the leader's 1
 clears it. The cost is the young-series case: a new pod that has never
 connected can fire after `for` alone, which for a pod that never connected is
 true.
 */}}
 {{- $jobs := list (printf "%s-gateway-monitoring" $agent) (printf "%s-gateway-chat-monitoring" $agent) (printf "%s-credential-proxy-monitoring" $agent) (printf "%s-kube-proxy-monitoring" $agent) (printf "%s-a2a-gateway-monitoring" $agent) (printf "%s-operator-monitoring" .Release.Name) }}
+{{- /* The exec tier's scrape job, while the tier renders: an exec tier no scrape reaches is as dark as a broker. */}}
+{{- if gt (include "kube-agents.credentialProxyExecReplicas" . | int) 0 }}
+{{- $jobs = append $jobs (printf "%s-credential-proxy-exec-tier-monitoring" $agent) }}
+{{- end }}
 {{- $who := "{{ $labels.agent_namespace }}/{{ $labels.agent }}" }}
 apiVersion: monitoring.googleapis.com/v1
 kind: Rules

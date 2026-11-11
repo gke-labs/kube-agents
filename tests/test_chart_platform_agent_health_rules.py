@@ -196,8 +196,8 @@ class HealthRulesRenderTest(unittest.TestCase):
 
     # promtool is on neither the host nor the CI image, so the gappy series is
     # held by the rule's text: the window carries the threshold and the `for`
-    # stays short, since a `for` over an instant value resets at every gap a
-    # crash-looping gateway leaves and never fires.
+    # stays short, since a `for` over an instant value resets at every gap in
+    # the series (a missed scrape, a rescheduled pod).
     def test_the_slack_alert_survives_a_gappy_series(self):
         rule = _alerts(_rules(_render(*_ON))[0])[_SLACK_ALERT]
         self.assertIn("max_over_time(", rule["expr"])
@@ -211,6 +211,17 @@ class HealthRulesRenderTest(unittest.TestCase):
         rule = _alerts(_rules(docs)[0])[_SLACK_ALERT]
         self.assertIn("[5m]", rule["expr"])
         self.assertEqual("5m", yaml.safe_load((_CHART / "values.yaml").read_text())["platformAgent"]["healthRules"]["thresholds"]["slackDisconnectedFor"], "the template's default and values.yaml's must agree")
+
+    def test_the_scrape_alert_watches_the_exec_tier_only_while_it_renders(self):
+        exec_set = ["--set", "platformAgent.deployment.credentialProxy.exec.replicas=2"]
+        for extra, watched in (([], False), (exec_set, True)):
+            docs = _render(*_ON, *extra)
+            expr = _alerts(_rules(docs)[0])[_SCRAPE_ALERT]["expr"]
+            agent = next(d for d in docs if d.get("kind") == "PlatformAgent")["metadata"]["name"]
+            job = f"{agent}-credential-proxy-exec-tier-monitoring"
+            rendered = any(d.get("kind") == "PodMonitoring" and d["metadata"]["name"] == job for d in docs)
+            self.assertEqual(rendered, watched, f"exec PodMonitoring rendered={rendered} with {extra}")
+            self.assertEqual(job in expr, watched, f"scrape alert watches the exec tier={job in expr} with {extra}")
 
     def test_vector_matching_names_the_agent_labels(self):
         """Under Managed Prometheus scoping a recorded series carries project, cluster
