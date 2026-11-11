@@ -308,7 +308,7 @@ when a prefix is in effect:
 `CREDENTIAL_PROXY_IMAGE` and `KUBE_PROXY_IMAGE` need nothing: the operator derives them from the agent image
 by swapping the trailing name (`platform-agent` to `credential-proxy` and `kube-proxy`), which lands on the mirror
 on its own. The A2A `next` images the operator renders (`a2a-gateway`, `a2a-worker`,
-`a2a-authcallout`, `a2a-verifier`, `a2a-console`) follow `OPERATOR_IMAGE`, else `PLATFORM_AGENT_IMAGE`, the same way, so they need
+`a2a-authcallout`, `a2a-verifier`, `a2a-console`, `a2a-dispatcher`) follow `OPERATOR_IMAGE`, else `PLATFORM_AGENT_IMAGE`, the same way, so they need
 no env of their own on a mirror. The sandbox is a separate repository, so it gets no such
 derivation. Setting it explicitly still wins, which is why `install.sh` leaves it unset. One
 explicit value pins the sidecar for every agent in the cluster, and the per-CR derivation is what

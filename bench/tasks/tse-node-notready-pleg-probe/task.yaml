@@ -3,10 +3,11 @@
 # and verify it produces the 5-section Google Cloud Support Escalation Bundle.
 #
 # Precondition: a spec.mode: next install with the optional AgentProfile/tse
-# bound (profiles.tse.enabled=true, set on EVAL_MODE_NEXT=1 installs by
-# MODE_NEXT_ENV_ARGS in hack/ci-deploy.sh, so the operator projects
+# bound (profiles.tse.enabled=true, so the operator projects
 # KUBE_AGENTS_ENABLED_PROFILES=tse and the entrypoint scaffolds
-# /opt/data/profiles/tse). Registered in hack/eval/nightly-cases.txt (#3492).
+# /opt/data/profiles/tse). Parked: the CI lane doesn't enable tse and the case
+# is out of hack/eval/nightly-cases.txt (KNOWN_UNREGISTERED in
+# scripts/validate_bench_cases.py) until tse has a real persona image (#3842).
 id: tse-node-notready-pleg-probe
 name: GKE Support Agent (tse) node NotReady PLEG triage and escalation bundle
 

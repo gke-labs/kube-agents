@@ -150,7 +150,8 @@ type agentProfileTierIdentity struct {
 //
 // Each is reserved whether or not this agent renders it now (the session
 // account only on next, the MCP account only under A2A_MCP_DOOR, the scope
-// publisher's only while a publisher may run): a flip or a flag turned on
+// publisher's only while a publisher may run, the dispatcher's only while it
+// is switched on): a flip or a flag turned on
 // later must not find a profile or an override already holding the name.
 //
 // `default` is reserved because every pod in the namespace that names no
@@ -169,6 +170,7 @@ func reservedProfileServiceAccounts(agent *agentv1alpha1.PlatformAgent) map[stri
 		shellSandboxServiceAccountName(agent): "the shell sandbox's ServiceAccount",
 		a2aMCPServiceAccountName(agent):       "the A2A MCP server's ServiceAccount, the broker's mcp caller",
 		scopePublisherName(agent):             "the scope publisher's ServiceAccount, the broker's scope caller",
+		a2aDispatcherName(agent):              "the profile dispatcher's ServiceAccount, which carries its bus principal and Jobs RBAC",
 	}
 }
 

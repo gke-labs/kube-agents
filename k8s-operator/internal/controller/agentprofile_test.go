@@ -1482,10 +1482,11 @@ func TestAProfileServiceAccountChangeWakesItsProfile(t *testing.T) {
 	}
 }
 
-// An unlabeled ServiceAccount in a profile namespace may be one a profile
-// would land on and doesn't own, which refuses that profile and moves the
-// dispatcher ceiling's cut for every newer one: its event re-reconciles every
-// profile in the agent's namespace. A labeled one still wakes only its own.
+// A ServiceAccount in a profile namespace named like a profile's may be one a
+// profile would land on and doesn't own, whatever its labels say, which
+// refuses that profile and moves the dispatcher ceiling's cut for every newer
+// one: its event re-reconciles every profile in the agent's namespace. One
+// with another name wakes only its labelled profile, or none.
 func TestAProfileNamedServiceAccountWakesEveryProfile(t *testing.T) {
 	agent := a2aTestAgent()
 	a, b := testAgentProfile(agent.Namespace, "auditor"), testAgentProfile(agent.Namespace, "triage")

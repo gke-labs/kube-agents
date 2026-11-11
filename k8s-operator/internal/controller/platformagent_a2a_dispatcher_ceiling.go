@@ -426,9 +426,9 @@ func a2aDispatcherCeiling(agent *agentv1alpha1.PlatformAgent, profiles []agentv1
 		over = true
 		condition.Status = metav1.ConditionFalse
 		condition.Reason = dispatcherCeilingReasonOver
-		condition.Message = fmt.Sprintf("the profile dispatcher's config for %d profiles and %d draining ones is %d bytes, over the %d bytes one ConfigMap can hold, "+
+		condition.Message = fmt.Sprintf("the profile dispatcher's config for %d profiles and %d draining ones is %d bytes, over the %d bytes one ConfigMap can hold less its envelope, "+
 			"so the operator runs no dispatcher, and profile tasks aren't dispatched, until those drains run out. Lifting the ceiling is %s",
-			fit, len(draining), withDraining, a2aDispatchConfigLimitBytes, dispatchConfigCeilingIssue)
+			fit, len(draining), withDraining, a2aDispatchConfigLimitBytes-a2aDispatchConfigEnvelopeBytes, dispatchConfigCeilingIssue)
 	case len(refused) > 0:
 		condition.Status = metav1.ConditionFalse
 		condition.Reason = dispatcherCeilingReasonRefused

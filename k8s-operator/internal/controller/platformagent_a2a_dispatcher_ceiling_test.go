@@ -545,3 +545,22 @@ func TestTheCutFollowsAProfileSpecChange(t *testing.T) {
 		t.Errorf("the cut didn't move when the ten oldest profiles dropped a tier (%d refused both times): a cached cut outlived the spec it was made for", len(after))
 	}
 }
+
+// The dispatcher's ServiceAccount is reserved like the operator's other
+// accounts: an override naming it would put the credential broker and the
+// dispatcher on one ServiceAccount, each with the other's identity, and a
+// profile naming it is refused too.
+func TestTheDispatchersServiceAccountIsReserved(t *testing.T) {
+	agent := a2aTestAgent()
+	sa := a2aDispatcherName(agent)
+	p := testAgentProfile(agent.Namespace, "sneaky", func(p *agentv1alpha1.AgentProfile) {
+		p.Spec.Identity.ServiceAccountName = sa
+	})
+	if got := resolveAgentProfileIdentities(agent, []agentv1alpha1.AgentProfile{p})["sneaky"]; got.refused == nil {
+		t.Errorf("a profile naming %q resolved to %+v, want refused", sa, got)
+	}
+	agent.Spec.Security = &agentv1alpha1.SecuritySpec{ServiceAccountName: sa}
+	if msg := ReservedServiceAccountOverride(agent); msg == "" {
+		t.Errorf("an override naming %q is not refused", sa)
+	}
+}
