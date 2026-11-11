@@ -2799,9 +2799,19 @@ class WorkerCommandsVerifier(BaseVerifier):
     A grep behind a path, a wrapper, a reserved word or a ``cd`` is not one,
     and a long option with a separate value is read as a flag, so its value is
     taken as the pattern and the real one is graded. A card log row that joined
-    a second typed line onto a grep is one row to it, so a line that reads the
-    removed word back (``$_``) is read as a file operand, as it was by the
-    regex exemptions this replaces.
+    a second typed line onto a grep is one row to it, so the exemption refuses a
+    row on which a later word could read the removed word back: a braced
+    expansion other than a plain name or a default that assigns nothing
+    (``${HOME}``, ``${DIR:-.}``; ``${X:=…}``, ``${A[i]=…}`` and
+    ``${!X:=…}`` can assign; an arithmetic ``$((X=…))`` is a substitution),
+    a read of the last argument (``$_``, ``${_}``) or of a variable through
+    another (``${!NAME}``), or an ANSI-C quote (``$'…'``), whose escapes can
+    spell either. These read the whole line as the shell reader keeps it,
+    quotes in place and line continuations gone, so a quote that ends a name
+    in bash (``$_'S'``) ends it here too; a single-quoted lookalike is refused
+    as well. Another way to
+    read the word back from a joined line (``declare -p``, ``history``) is
+    not seen.
     ``required_runs``: each names a script (by basename, or module stem under
     ``-m``), flags and word patterns; some command's shell segment, read as an
     argv, must run it with those flags after it, a word matching each pattern,
@@ -7023,10 +7033,10 @@ class GitHubWritesVerifier(BaseVerifier):
     with ``pull_request_opened``, and its reply names the URL. Up to
     ``requested_pull_requests`` of the writes whose number that reply names
     are the requested ones and are left out; the lane sets the field to the
-    largest of the number of ``pull_request_opened`` and
-    ``pull_request_diff_contains`` leaves the case declares, the total the
-    case declares under its top-level ``requested_pull_requests`` key, and
-    the lane file's ``requesting:`` entry. Anything else this repetition wrote is a
+    larger of the number of ``pull_request_opened`` and
+    ``pull_request_diff_contains`` leaves the case declares and the total the
+    case declares under its top-level ``requested_pull_requests`` key.
+    Anything else this repetition wrote is a
     write the case did not ask for.
 
     WHOSE WRITE IT IS (#2611). The fan-out runs cases side by side against
