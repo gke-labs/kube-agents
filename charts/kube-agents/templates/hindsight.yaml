@@ -350,7 +350,25 @@ spec:
         resources:
           requests:
             storage: {{ .Values.hindsight.postgresql.storage }}
-{{- if .Values.hindsight.networkPolicy }}
+{{- /*
+The two NetworkPolicies render independently under one umbrella:
+hindsight.networkPolicy=false drops both, and each component's own
+networkPolicy.enabled drops that one alone, so an install that cannot keep
+hindsight-api's policy (a gateway its egress rules do not name) still keeps
+hindsight-postgresql's, the only guard on a database that takes no password.
+
+hindsight-api's egress half renders when litellm.enabled, or when
+hindsight.api.networkPolicy.additionalEgress names the peers a bring-your-own
+gateway install reaches instead; the rules it names are appended after the
+in-cluster gateway rule. The comment on the policy below is part of the
+rendered manifest; keep it true of every shape the values can render.
+*/}}
+{{- $hindsightNetworkPolicy := .Values.hindsight.networkPolicy }}
+{{- $apiNetworkPolicy := and $hindsightNetworkPolicy .Values.hindsight.api.networkPolicy.enabled }}
+{{- $postgresqlNetworkPolicy := and $hindsightNetworkPolicy .Values.hindsight.postgresql.networkPolicy.enabled }}
+{{- $apiAdditionalEgress := .Values.hindsight.api.networkPolicy.additionalEgress | default list }}
+{{- $apiEgress := or .Values.litellm.enabled (gt (len $apiAdditionalEgress) 0) }}
+{{- if $apiNetworkPolicy }}
 ---
 # Confines hindsight-api's ingress to pods in the release namespace (the agent
 # gateway and its workers) and the GKE Managed Prometheus collector namespace
@@ -358,11 +376,14 @@ spec:
 # and the in-cluster inference gateway (LiteLLM or standalone-replay) on TCP
 # 80, 4000, and 8080. Models are baked into the image (HF_HUB_OFFLINE=1,
 # TRANSFORMERS_OFFLINE=1) and the pod holds no cloud identity, so neither
-# external HTTPS nor the metadata server's credential ports are permitted.
-# The egress half is gated on litellm.enabled so a bring-your-own gateway
-# install (litellm.enabled=false) still gets the ingress confinement and the
-# hindsight-postgresql guard below without having its custom inference-gateway
-# egress dropped (#4946).
+# external HTTPS nor the metadata server's credential ports are permitted
+# unless hindsight.api.networkPolicy.additionalEgress names an external peer;
+# the metadata ranges it refuses. The egress half renders when
+# litellm.enabled, or when additionalEgress names the peers a bring-your-own
+# gateway install (litellm.enabled=false) reaches; with neither, the policy is
+# Ingress-only, so the custom gateway's egress is confined rather than
+# dropped. hindsight-postgresql's policy renders under its own switch and the
+# hindsight.networkPolicy umbrella, not under this policy's.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -379,7 +400,7 @@ spec:
       app.kubernetes.io/component: api
   policyTypes:
     - Ingress
-    {{- if .Values.litellm.enabled }}
+    {{- if $apiEgress }}
     - Egress
     {{- end }}
   ingress:
@@ -395,7 +416,7 @@ spec:
       ports:
         - port: 8888
           protocol: TCP
-  {{- if .Values.litellm.enabled }}
+  {{- if $apiEgress }}
   egress:
     - ports:
         - port: 53
@@ -456,7 +477,12 @@ spec:
         - podSelector:
             matchLabels:
               app: standalone-replay
+    {{- with $apiAdditionalEgress }}
+    {{- include "kube-agents.hindsightAdditionalEgress" . | nindent 4 }}
+    {{- end }}
   {{- end }}
+{{- end }}
+{{- if $postgresqlNetworkPolicy }}
 ---
 # The database takes no password, so this is what keeps it private: only the
 # Hindsight API pod may open a connection to it. Ingress only — Postgres makes
