@@ -19,7 +19,7 @@ import (
 const clusterPersonaDir = "../../../../agents/cluster/persona"
 
 // The cluster persona loads, and renders for Claude Code without a warning:
-// every skill with its scripts, both broker servers, and the built-ins it
+// every skill with its scripts, the developer_knowledge server, and the built-ins it
 // does not grant denied.
 func TestTheClusterPersonaRendersWhole(t *testing.T) {
 	p := load(t, clusterPersonaDir)
@@ -63,10 +63,8 @@ func TestTheClusterPersonaRendersWhole(t *testing.T) {
 	if err := json.Unmarshal([]byte(flagValueRaw(t, out.Args, MCPConfigFlag)), &cfg); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"gke", "developer_knowledge"} {
-		if _, ok := cfg.MCPServers[name]; !ok {
-			t.Errorf("--mcp-config lacks %s", name)
-		}
+	if _, ok := cfg.MCPServers["developer_knowledge"]; !ok {
+		t.Error("--mcp-config lacks developer_knowledge")
 	}
 	if slices.Contains(out.Allowed, "mcp__developer_knowledge__answer_query") {
 		t.Error("answer_query is granted; the persona's include list leaves it out")
@@ -114,7 +112,7 @@ func TestTheClusterPersonaStatesItsRedLines(t *testing.T) {
 	text := load(t, clusterPersonaDir).Instructions
 	for what, phrase := range map[string]string{
 		"target cluster only":        "**The target cluster only.**",
-		"never wildcard the project": "`projects/-` is refused",
+		"never wildcard the project": "a wildcard or another project is refused",
 		"read-only":                  "Never mutate cluster state",
 		"a denial is terminal":       "**A denial is terminal.**",
 		"a refused read is a gap":    "re-run it with a spelling the policy allows, or report it as a gap",
@@ -493,4 +491,39 @@ func flagValueRaw(t *testing.T, args []string, flag string) string {
 		t.Fatalf("no %s in %v", flag, args)
 	}
 	return args[i+1]
+}
+
+// The cluster persona offers only servers and tools the credential broker
+// gives a profile worker, so no turn is spent on a tool it will be refused.
+// The relay a server reaches is its broker name, and an empty include list
+// grants the whole server, so both are checked, as are tools persona.yaml
+// names one by one.
+func TestTheClusterPersonaOffersOnlyWhatAProfileWorkerMayReach(t *testing.T) {
+	allowed := profileServerTools(t)
+	p := load(t, clusterPersonaDir)
+	for name, server := range p.MCP.Servers {
+		tools, ok := allowed[server.Broker]
+		if !ok {
+			t.Errorf("mcp.yaml's %s reaches %s, which a profile worker is refused", name, server.Broker)
+			continue
+		}
+		if len(server.Include) == 0 {
+			t.Errorf("mcp.yaml's %s has no include list, so it grants all of %s; a profile worker may reach only %v", name, server.Broker, tools)
+		}
+		for _, tool := range server.Include {
+			if !slices.Contains(tools, tool) {
+				t.Errorf("mcp.yaml's %s offers %s's %s, which a profile worker is refused", name, server.Broker, tool)
+			}
+		}
+	}
+	for _, entry := range p.Manifest.Tools {
+		name, tool, scoped := strings.Cut(entry, ".")
+		server, ok := p.MCP.Servers[name]
+		if !scoped || !ok {
+			continue
+		}
+		if !slices.Contains(allowed[server.Broker], tool) {
+			t.Errorf("persona.yaml grants %s, which a profile worker is refused", entry)
+		}
+	}
 }

@@ -122,6 +122,7 @@ hand-written. Never edit inside the markers — edit the source and regenerate.
 | `docs/site/src/content/docs/operator/platformagent-fields.md` | `<!-- BEGIN GENERATED: crd-fields-platformagent -->` | The `PlatformAgent` spec and status structs in `k8s-operator/api/v1alpha1/`, read by `scripts/gen_crd_docs.go` |
 | `docs/site/src/content/docs/operator/agentprofile-fields.md` | `<!-- BEGIN GENERATED: crd-fields-agentprofile -->` | The `AgentProfile` spec and status structs in `k8s-operator/api/v1alpha1/`, read by `scripts/gen_crd_docs.go` |
 | `docs/site/src/content/docs/operator/agentplugin-fields.md` | `<!-- BEGIN GENERATED: crd-fields-agentplugin -->` | The `AgentPlugin` spec and status structs in `k8s-operator/api/v1alpha1/`, read by `scripts/gen_crd_docs.go` |
+| `docs/site/src/content/docs/operator/tier-fields.md` | `<!-- BEGIN GENERATED: crd-fields-tier -->` | The `Tier` spec and status structs in `k8s-operator/api/v1alpha1/`, read by `scripts/gen_crd_docs.go` |
 | `docs/site/src/content/docs/operator/platformagent-crd.md` | `<!-- BEGIN GENERATED: crd-conditions-platformagent -->` | `platformAgentConditionDocs` in `k8s-operator/internal/controller/condition_docs.go`, read by `scripts/gen_condition_docs.go`; `TestEveryWrittenConditionIsDocumented` holds it complete against the condition types the controller writes |
 | `docs/site/src/content/docs/install/prerequisites.md` | `<!-- BEGIN GENERATED: install-footprint -->` | `kube-agents.quotaRequirements` rendered by `helm template` per install profile, the chart's `files/footprint.yaml`, `files/flagged-pods.yaml` and `files/transient-pods.yaml`, the session quota in the operator's next-mode golden, and `a2a/gateway/spawn.go`, by `scripts/install_footprint.py` |
 | `tests/data/footprint_profiles.json` (whole file) | none | The same profiles' `kube-agents.quotaRequirements` totals, which the installer's footprint summary test reads |
@@ -216,7 +217,12 @@ CI enforcement: `make docs-check` runs the same checks as
   release contains it, and the message names the release to write. For a
   reworded shipped row or a row added after its release was tagged,
   `scripts/upgrade_table_traces.txt` names the commit that shipped the change,
-  and the tag must contain that commit instead. A wrong label fails a push to
+  and the tag must contain that commit instead. A pull request or merge group
+  that removes the text of a `pending` row a release already contains fails: a
+  reword needs the new row labelled with that release and a trace entry, and a
+  removal needs a relabel first; while an open release candidate (a
+  `staging_*` tag no release contains yet) holds the row, the text stays until
+  the release is tagged. A wrong label fails a push to
   `main` and a pull request that adds or relabels the row or edits its entry;
   on any other pull request it is a warning. It reads the history and the
   release tags, so it fails on a shallow or tagless clone; run

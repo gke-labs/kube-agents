@@ -239,8 +239,8 @@ operator:
   # were. What stays: Deployments, StatefulSets,
   # Services, ServiceAccounts, ConfigMaps, PersistentVolumeClaims,
   # NetworkPolicies and PodDisruptionBudgets; ClusterRoles,
-  # ClusterRoleBindings, Roles and RoleBindings; and the three custom
-  # resources themselves (PlatformAgent always, AgentPlugin and AgentProfile
+  # ClusterRoleBindings, Roles and RoleBindings; and the custom resources
+  # themselves (PlatformAgent always, AgentPlugin, AgentProfile and Tier
   # where their CRDs are installed). Deployments, StatefulSets, Services and
   # PersistentVolumeClaims grow with the cluster's workloads, a Deployment
   # carrying a whole pod template, so a cluster with thousands of them is the
@@ -1002,7 +1002,8 @@ platformAgent:
   storage:
     # The PlatformAgent's spec.storage.size: the request of the agent's
     # <name>-data claim and of the shell sandbox's data claim. The operator
-    # requests the same size for both. null, the default, leaves the field out
+    # requests the same size for both, and raises the agent's alone for
+    # expectedClusterProfiles below. null, the default, leaves the field out
     # of the CR, and the operator default applies (50Gi). Raising it expands both
     # existing claims online where their StorageClass sets allowVolumeExpansion.
     # Where it does not, the claims keep their size and the CR's
@@ -1015,6 +1016,16 @@ platformAgent:
     # counts it so. A Kubernetes quantity above zero and at most 64Ti, the
     # largest persistent disk, for example 80Gi.
     size: null
+    # The PlatformAgent's spec.storage.expectedClusterProfiles: how many Cluster
+    # Agent profiles the install is expected to hold, one per cluster in scope.
+    # It raises the agent's own data claim (not the sandbox's) to at least
+    # 8Gi + 400Mi per profile, rounded up to whole GiB, the size Hermes' session
+    # stores settle at under the default 90-day retention. The claim
+    # takes the larger of that and size (or the 50Gi default), so this only
+    # raises it, and the formula passes 50Gi above 107 profiles. Raising it
+    # expands the existing claim online where its StorageClass allows. null, the
+    # default, renders no field. An integer from 1 to 20000.
+    expectedClusterProfiles: null
   # Annotations to add to the PlatformAgent custom resource metadata. The
   # operator reads its kubeagents.x-k8s.io/* keys from here (chart README,
   # "PlatformAgent annotations"). Four of them the chart also derives from

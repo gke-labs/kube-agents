@@ -1330,7 +1330,13 @@ read is final.
 `state` (`GREEN|DEGRADED|OUTAGE`), `condition`
 (`shared_break|storm|setup_deaths|lost_pods|fixture_drift|pool_drift|delegation_ceiling|deadline_kill`), `since`, `cause`, `advice`,
 `failing_cases`, `tracking_issues`, `incident`, `recovering`, `stale`,
-`slow`, `near_deadline`, `pool`, `generated_at`, `tick`. Any other state, or an unreadable file, means no
+`slow`, `near_deadline`, `pool`, `generated_at`, `tick`. A `tracking_issues`
+entry is `#N` for an issue of this repository (one `case-notes.yaml` names,
+or one the bot filed here) and the full URL of one the bot filed or adopted
+in the issues repository; `issues_repo` names that repository
+(`ghcli.DEFAULT_REPO`, `KUBE_AGENTS_ISSUES_REPO` when set) and is
+informational: the pages read nothing from it, a reference carries its own
+repository. Any other state, or an unreadable file, means no
 verdict: the Brief says no verdict is published and shows the last 24
 hours in numbers and the runs, the PR view classifies from the runs alone
 and shows no gate banner. Only a `GREEN` verdict reads as healthy. For
