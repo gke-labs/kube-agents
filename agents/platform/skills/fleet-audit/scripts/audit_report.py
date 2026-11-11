@@ -2412,13 +2412,21 @@ KCC_READABLE_STATUSES = frozenset({"RUNNING", "RECONCILING"})
 KCC_DEPENDENCY_PATTERN = re.compile(
     r"\breference (?P<kind>[A-Za-z0-9]+) (?:(?P<namespace>[A-Za-z0-9.-]+)/)?(?P<name>[A-Za-z0-9.-]+) is not ready\b"
 )
+# How every first sentence of the Config Connector paragraph starts, in all
+# its forms. The strip-and-rewrite pattern and the log look for it.
+KCC_STALLED_MARK_PREFIX = "**Config Connector is not applying "
 # The note `disclose_stalled_kcc_remediations` adds after a `manifest` fix
 # whose file declares an object Config Connector does not apply. One line, so
-# `KCC_STALLED_NOTE_PATTERN` removes all of it.
-KCC_STALLED_NOTE_MARK = "**Config Connector is not applying this file.**"
+# `KCC_STALLED_NOTE_PATTERN` removes all of it. Only this form says "this
+# file": the fix edits the declaring file.
+KCC_STALLED_NOTE_MARK = KCC_STALLED_MARK_PREFIX + "this file.**"
 # Each paragraph is a core and a tail. The tail is the part a note can lose
 # when the core does not fit otherwise (`_fit_kcc_paragraph`).
-KCC_STALLED_NOTE_CORE = KCC_STALLED_NOTE_MARK + " When the audit ran, Config Connector reported {objects}."
+# What follows the first sentence in every paragraph `finish` writes, in each
+# form and at each step of `KCC_PARAGRAPH_STEPS`. The strip pattern requires
+# it, so a worker sentence that only starts like the paragraph stays.
+KCC_STALLED_CONTINUATION = " When the audit ran, Config Connector reported "
+KCC_STALLED_NOTE_CORE = KCC_STALLED_NOTE_MARK + KCC_STALLED_CONTINUATION + "{objects}."
 KCC_STALLED_NOTE_TAIL = (
     "The cloud resource does not change after the merge until Config Connector applies the object again. "
     "If the reason rejects the change in this file, correct the declaration. Otherwise the change takes "
@@ -2427,13 +2435,13 @@ KCC_STALLED_NOTE_TAIL = (
 KCC_STALLED_NOTE = KCC_STALLED_NOTE_CORE + " " + KCC_STALLED_NOTE_TAIL
 # The paragraph for any other fix of a finding whose own object Config
 # Connector does not apply: a `manual` or `gcloud` fix, a fix degraded to
-# `manual`, or a `manifest` fix to another file. When exactly one file in the
-# repository declares the object, the paragraph keeps the first sentence above
-# and names that file; otherwise it starts with `KCC_STALLED_OBJECT_MARK` and
-# names no file.
-KCC_STALLED_DECLARED_CORE = (
-    KCC_STALLED_NOTE_MARK + " The declaration is {path}. When the audit ran, Config Connector reported {objects}."
-)
+# `manual`, or a `manifest` fix to another file. The fix's file is not the
+# declaration, so the first sentence does not say "this file". When exactly
+# one file in the repository declares the object, the first sentence names
+# that file (`KCC_STALLED_DECLARED_MARK`); otherwise it is
+# `KCC_STALLED_OBJECT_MARK` and the paragraph names no file.
+KCC_STALLED_DECLARED_MARK = KCC_STALLED_MARK_PREFIX + "{path}.**"
+KCC_STALLED_DECLARED_CORE = KCC_STALLED_DECLARED_MARK + KCC_STALLED_CONTINUATION + "{objects}."
 KCC_STALLED_OBJECT_TAIL = (
     "Config Connector does not apply the object until that reason is gone, so a change to the declaration "
     "does not take effect before then, and this finding comes back on each run until then."
@@ -2441,8 +2449,8 @@ KCC_STALLED_OBJECT_TAIL = (
 KCC_STALLED_DECLARED_NOTE = (
     KCC_STALLED_DECLARED_CORE + " " + KCC_STALLED_OBJECT_TAIL + " If the reason rejects the declaration, correct it there."
 )
-KCC_STALLED_OBJECT_MARK = "**Config Connector is not applying the declaration of this object.**"
-KCC_STALLED_UNDECLARED_CORE = KCC_STALLED_OBJECT_MARK + " When the audit ran, Config Connector reported {objects}. {search}"
+KCC_STALLED_OBJECT_MARK = KCC_STALLED_MARK_PREFIX + "the declaration of this object.**"
+KCC_STALLED_UNDECLARED_CORE = KCC_STALLED_OBJECT_MARK + KCC_STALLED_CONTINUATION + "{objects}. {search}"
 # What the paragraph says when it names no file: that more than one file
 # declares the object, or only that it names none. It never says that no
 # file declares the object: a search can skip a file it cannot parse (a
@@ -2454,9 +2462,6 @@ KCC_STALLED_UNDECLARED_NOTE = (
 )
 # How the paragraph names a declaration in a context repository.
 KCC_DECLARATION_IN_REPO = "{path} in the repository {repo}"
-# The first sentences of both paragraphs, which the strip-and-rewrite pattern
-# and the log look for.
-KCC_STALLED_NOTE_MARKS = (KCC_STALLED_NOTE_MARK, KCC_STALLED_OBJECT_MARK)
 # The finding field that holds the paragraph of a `gcloud` fix: its note is
 # the command, which renders in a bash block, so the paragraph renders after
 # the block. Only `finish` writes it: `validate_findings` removes it.
@@ -2464,8 +2469,27 @@ KCC_STALLED_PARAGRAPH_FIELD = "kcc_stalled_paragraph"
 # An earlier copy of either paragraph, which a worker can copy from the
 # previous ledger. The pass removes it from every note and writes it again
 # when the stall is still there, as the route-note pass does with its notes.
+# Each first sentence is matched to its exact end ("this file.**", "the
+# declaration of this object.**", or a file in a code span, also with
+# " in the repository `<repo>`": `KCC_STALLED_DECLARED_MARK`,
+# `KCC_DECLARATION_IN_REPO`), and then the text every paragraph `finish`
+# writes goes on with (`KCC_STALLED_CONTINUATION`). So a worker sentence that
+# only starts the same way is not a copied paragraph. The rest of the
+# paragraph's line goes with it.
+# An earlier release wrote the paragraph for a fix of another file as "this
+# file.**" and then `KCC_STALLED_OLD_DECLARATION_SENTENCE`, which names the
+# file, before the continuation. A previous ledger can hold that form, and
+# `carry_unchanged_findings` copies it, so the pattern also accepts that
+# sentence between "this file.**" and the continuation.
+KCC_STALLED_OLD_DECLARATION_SENTENCE = r" The declaration is `[^`\n]+`(?: in the repository `[^`\n]+`)?\."
 KCC_STALLED_NOTE_PATTERN = re.compile(
-    r"[ \t]*(?:" + "|".join(re.escape(mark) for mark in KCC_STALLED_NOTE_MARKS) + r")[^\n]*"
+    r"[ \t]*"
+    + re.escape(KCC_STALLED_MARK_PREFIX)
+    + r"(?:this file\.\*\*(?:"
+    + KCC_STALLED_OLD_DECLARATION_SENTENCE
+    + r")?|the declaration of this object\.\*\*|`[^`\n]+`(?: in the repository `[^`\n]+`)?\.\*\*)"
+    + re.escape(KCC_STALLED_CONTINUATION)
+    + r"[^\n]*"
 )
 # What the merged-but-persisting line and comment say in place of the two
 # causes they guess at, when the finding's object is one of those objects.
@@ -2863,6 +2887,18 @@ def sweep_enabled_for_run() -> bool:
 def sweep_off_reason() -> str:
     """Why no automatic pull request opened, in the ledger's words: the waiver names the run, else the install."""
     return SWEEP_WAIVED_REASON if _SWEEP_WAIVED else SWEEP_OFF_ON_INSTALL_REASON
+
+
+def sweep_off_next_step(noun: str) -> str:
+    """What the worker reads when the sweep opens nothing: the two ways a fix
+    still opens. A worker that read only "`/remediate` requests" stopped at the
+    ledger when its own task had asked for the fixes, and opened nothing."""
+    return (
+        f"the automatic sweep opens nothing. A `/remediate` comment on the ledger opens a {noun}, and so "
+        "does a direct ask: when this task asks you to open fixes, run `remediate --finding <id> "
+        "--manifest-file <the collector manifest>` for each one the ledger lists as awaiting `/remediate`, "
+        "a PodDisruptionBudget `finish` writes itself included. Never post `/remediate` yourself."
+    )
 
 # The collector manifest (docs/designs/fleet-audit-collector-manifest.md).
 # `finish` reads it when `--manifest-file` names one; every constant below is
@@ -8148,7 +8184,7 @@ def _strip_route_notes(remediation: object) -> None:
     # The Config Connector note is stripped and written again the same way
     # (`disclose_stalled_kcc_remediations`), so a carried note never keeps a
     # stall that this run's manifest does not show.
-    if any(mark in note for mark in KCC_STALLED_NOTE_MARKS):
+    if KCC_STALLED_NOTE_PATTERN.search(note):
         note = KCC_STALLED_NOTE_PATTERN.sub("", note).strip()
     if isinstance(uncut, str) or note != remediation.get("note"):
         remediation["note"] = note
@@ -19591,6 +19627,103 @@ def unwritten_sweep_fixes(
     return unwritten
 
 
+# How `plan_generated_fixes` ends the reason for a path a file already holds.
+ALREADY_EXISTS_SUFFIX = " already exists"
+
+
+def requested_generated_fixes(
+    findings: list[dict], manifest: dict | None, requested: list[str]
+) -> dict[str, UnwrittenFix]:
+    """Finding id to its declaration, for each named finding whose budget
+    `finish` writes itself: a `manual` `GENERATED_FIX_CHECK` finding whose
+    collector candidate carries a `declaration`.
+
+    The SOP tells the worker to leave such a finding `manual` and let `finish`
+    write its PodDisruptionBudget, so the worker's findings file never calls it
+    a `manifest`. `remediate` plans it the way `finish` does instead of
+    refusing it as not a `manifest`. Without that, a direct ask could not open
+    the budget on an install whose automatic sweep is off, past the sweep's
+    cap, or on a forge with no ledger to comment `/remediate` on. Only with
+    the collector manifest, which holds the selector the budget is written
+    from. The sweep's floor and corroboration tests do not apply: a person
+    named the finding.
+    """
+    if manifest is None:
+        return {}
+    named = set(requested)
+    declared_at = {
+        _candidate_identity(entry, candidate): str((candidate.get("declaration") or {}).get("path") or "")
+        for entry, candidate in _candidates(manifest)
+        if candidate.get("check") == GENERATED_FIX_CHECK
+        and isinstance(candidate.get("declaration"), dict)
+        # A budget whose selector reaches another controller's pods is one
+        # SOP §3.4 says must not exist; it stays `manual` and is refused.
+        and not candidate.get("pod_selector_withheld")
+    }
+    fixes: dict[str, UnwrittenFix] = {}
+    for finding in findings:
+        fid = str(finding.get("id", ""))
+        if fid not in named or (finding.get("remediation") or {}).get("kind") != "manual":
+            continue
+        declared = declared_at.get(derive_finding_id(finding), "")
+        if declared:
+            fixes[fid] = UnwrittenFix(declared, declared=True)
+    return fixes
+
+
+def generated_fix_gap(finding: dict, manifest: dict | None) -> str:
+    """Why `requested_generated_fixes` does not take a `manual` `no-pdb`
+    finding, in a refusal's words; empty for any other finding.
+
+    A direct ask that is refused as "not a `manifest`" leaves the worker
+    nothing to act on; naming the missing piece says whether the collector
+    attached no `declaration` to the candidate, withheld its selector, or never
+    produced a candidate the finding joins to."""
+    if str(finding.get("check") or "") != GENERATED_FIX_CHECK:
+        return ""
+    if (finding.get("remediation") or {}).get("kind") != "manual":
+        return ""
+    if manifest is None:
+        return "pass the collector's --manifest-file so this command can write the PodDisruptionBudget finish writes"
+    identity = derive_finding_id(finding)
+    candidate = next(
+        (c for entry, c in _candidates(manifest) if c.get("check") == GENERATED_FIX_CHECK and _candidate_identity(entry, c) == identity),
+        None,
+    )
+    if candidate is None:
+        return f"the collector manifest has no {GENERATED_FIX_CHECK} candidate for {identity}"
+    if candidate.get("pod_selector_withheld"):
+        return f"the collector withheld the workload's selector: {candidate['pod_selector_withheld']}"
+    if not isinstance(candidate.get("declaration"), dict):
+        return (
+            "the collector manifest's candidate for it carries no `declaration`, so there is no "
+            "directory to write its PodDisruptionBudget beside"
+        )
+    return ""
+
+
+def _generated_fix_branches(
+    findings: list[dict], manifest: dict | None, generated: dict[str, UnwrittenFix], audit_id: str
+) -> set[str]:
+    """The branches the budgets in `generated` would be opened on, in both the
+    plain and the install-scoped spelling, as `plan_generated_fixes` names them."""
+    candidates = {_candidate_identity(entry, candidate): candidate for entry, candidate in _candidates(manifest)}
+    branches: set[str] = set()
+    for finding in findings:
+        fid = str(finding.get("id", ""))
+        fix = generated.get(fid)
+        built = _pdb_manifest(candidates.get(derive_finding_id(finding)) or {}, fid) if fix else None
+        if built is None:
+            continue
+        path = str(PurePosixPath(fix.path).parent / f"{built[0]}{GENERATED_PDB_EXTENSION}")
+        as_written = [{"id": fid, "remediation": {"kind": "manifest", "path": path}}]
+        branches.add(group_branch_for(audit_id, as_written))
+        scoped = scoped_group_branch_for(audit_id, as_written)
+        if scoped:
+            branches.add(scoped)
+    return branches
+
+
 def _delta_carried_fixes(prs: list[dict], *, open_only: bool = False) -> set[str]:
     """Every finding id that the delta block of a pull request names, when the
     harness did not close that pull request: open, merged, or closed by a person.
@@ -21034,7 +21167,7 @@ def kcc_stalled_objects(
 def _without_kcc_paragraph(note: str) -> str:
     """`note` with either paragraph of `disclose_stalled_kcc_remediations`
     removed."""
-    if any(mark in note for mark in KCC_STALLED_NOTE_MARKS):
+    if KCC_STALLED_NOTE_PATTERN.search(note):
         return KCC_STALLED_NOTE_PATTERN.sub("", note).strip()
     return note
 
@@ -21045,7 +21178,7 @@ def _strip_kcc_stalled_note(remediation: object) -> None:
     if not isinstance(remediation, dict):
         return
     note = str(remediation.get("note") or "")
-    if any(mark in note for mark in KCC_STALLED_NOTE_MARKS):
+    if KCC_STALLED_NOTE_PATTERN.search(note):
         remediation["note"] = _without_kcc_paragraph(note)
 
 
@@ -21057,12 +21190,12 @@ def _fit_kcc_paragraph(remediation: dict, paragraphs: list[str]) -> str:
     worker's own text and never the text `finish` wrote (the Kustomize note
     and its copied file, the closing text of `degrade_missing_remediations`,
     the note of `degrade_reverted_gcloud_remediations`, `GENERATED_FIX_NOTE`),
-    and never inside a code block. The route notes already on the note stay,
-    and a paragraph that would push out the reconciler note does not fit, so
-    the reconciler note is always shown. When even the core does not fit
-    beside the text `finish` wrote and the note carries the Kustomize note's
-    copied file, that block is made shorter by whole lines, with its fences
-    closed, to make room for the core and the reconciler note, as
+    and never inside a code block. Every route note already on the note
+    stays: a paragraph step that would push one out (a location note or the
+    reconciler note) does not fit. When even the core does not fit beside the
+    text `finish` wrote and the note carries the Kustomize note's copied file,
+    that block is made shorter by whole lines, with its fences closed, to make
+    room for the core and the route notes, as
     `_fit_route_notes` does for the reconciler note (`_sized_manifest_block`).
     Only when that does not fit either does the core go after the text
     `finish` wrote, past `MAX_NOTE_CHARS`. The worker's note before a cut goes
@@ -21076,7 +21209,6 @@ def _fit_kcc_paragraph(remediation: dict, paragraphs: list[str]) -> str:
     uncut = remediation.get(ROUTE_UNCUT_NOTE_FIELD)
     route = [found.group(0) for found in ROUTE_NOTE_PATTERN.finditer(note)]
     worker = uncut if isinstance(uncut, str) else ROUTE_NOTE_SPACED_PATTERN.sub("", note).strip()
-    reconciler = [text for text in route if text.startswith(RECONCILED_NOTE_LEDE)]
     fitted, added = _fit_route_notes(worker, route)
     outcome = KCC_FIT_PAST_CAP
     for step, paragraph in enumerate(paragraphs):
@@ -21084,12 +21216,14 @@ def _fit_kcc_paragraph(remediation: dict, paragraphs: list[str]) -> str:
         # strip of it (`KCC_STALLED_NOTE_PATTERN`) leaves them whole.
         shown = ROUTE_PARAGRAPH_BREAK + paragraph if route else paragraph
         candidate, candidate_added = _fit_route_notes(worker, [*route, shown])
-        if shown in candidate_added and all(text in candidate_added for text in reconciler):
+        # Every route note already on the note stays: a step that pushes one
+        # out (a location note or the reconciler note) does not fit.
+        if shown in candidate_added and all(text in candidate_added for text in route):
             fitted, added = candidate, candidate_added.replace(NOTE_SEPARATOR + ROUTE_PARAGRAPH_BREAK, ROUTE_PARAGRAPH_BREAK)
             outcome = KCC_FIT_WHOLE if step == 0 else KCC_FIT_SHORTER
             break
     else:
-        shortened = _kcc_core_with_shorter_block(worker, reconciler, paragraphs[-1])
+        shortened = _kcc_core_with_shorter_block(worker, route, paragraphs[-1])
         if shortened is not None:
             fitted, added = shortened
             outcome = KCC_FIT_SHORTER
@@ -21105,18 +21239,19 @@ def _fit_kcc_paragraph(remediation: dict, paragraphs: list[str]) -> str:
     return outcome
 
 
-def _kcc_core_with_shorter_block(worker: str, reconciler: list[str], core: str) -> "tuple[str, str] | None":
+def _kcc_core_with_shorter_block(worker: str, route: list[str], core: str) -> "tuple[str, str] | None":
     """The worker's note with its Kustomize copied file made shorter by whole
-    lines (`_sized_manifest_block`, fences closed) so that the reconciler
-    note and the paragraph's `core` fit `MAX_NOTE_CHARS`, as `(note, added)`;
+    lines (`_sized_manifest_block`, fences closed) so that every route note
+    already on the note (`route`) and the paragraph's `core` fit
+    `MAX_NOTE_CHARS`, as `(note, added)`;
     None when the note has no copied file or even an empty block leaves no
     room. Only the block is shortened; the Kustomize note's own text stays
     whole, and the worker's text after it is cut as needed."""
     head = _split_kustomize_head(worker)
     if head.lines is None:
         return None
-    shown = ROUTE_PARAGRAPH_BREAK + core if reconciler else core
-    added = NOTE_SEPARATOR.join([*reconciler, shown]).replace(NOTE_SEPARATOR + ROUTE_PARAGRAPH_BREAK, ROUTE_PARAGRAPH_BREAK)
+    shown = ROUTE_PARAGRAPH_BREAK + core if route else core
+    added = NOTE_SEPARATOR.join([*route, shown]).replace(NOTE_SEPARATOR + ROUTE_PARAGRAPH_BREAK, ROUTE_PARAGRAPH_BREAK)
     block = _sized_manifest_block(
         head.lines, head.whole, lambda shorter: _cut_worker_note(head.rest, "", added, head.prefix + shorter) is not None
     )
@@ -21257,7 +21392,7 @@ def disclose_stalled_kcc_and_log(
                 f"{prefix}WARNING: {fid}: Config Connector is not applying the finding's own object, and the "
                 "paragraph that says so does not fit beside the text the audit wrote; the renderer cuts its end."
             )
-        elif any(mark in note for mark in KCC_STALLED_NOTE_MARKS) or by_id[fid].get(KCC_STALLED_PARAGRAPH_FIELD):
+        elif KCC_STALLED_NOTE_PATTERN.search(note) or by_id[fid].get(KCC_STALLED_PARAGRAPH_FIELD):
             log(f"{prefix}{fid}: Config Connector is not applying the finding's own object; the fix says so.")
         else:
             log(f"{prefix}{fid}: removed a Config Connector note that its remediation copied from an earlier ledger.")
@@ -22519,7 +22654,7 @@ def _handle_finish_dry_run(
     triage_reasons = triage_markers(findings, manifest)
     sweep_on = sweep_enabled_for_run()
     if not sweep_on:
-        log(f"{sweep_off_reason()}: the automatic sweep opens nothing; only `/remediate` requests open a {noun}.")
+        log(f"{sweep_off_reason()}: {sweep_off_next_step(noun)}")
     plan = promotion_candidates(
         findings,
         {},
@@ -22927,16 +23062,31 @@ def handle_remediate(args: argparse.Namespace) -> None:
             f"--finding: {', '.join(unknown)} not in {args.findings_file}; "
             f"known ids are {', '.join(sorted(by_id)) or '(none)'}"
         )
+    # A budget the worker named at the workload's own declaration would replace
+    # the Deployment on merge: demoted to `manual` as `finish` demotes it, so
+    # the planner below writes it beside the declaration instead.
+    on_declaration = demote_fixes_over_declarations(findings, manifest)
+    # A declared budget the worker left `manual` for `finish` to write is
+    # written here the same way, below, rather than refused.
+    generated = requested_generated_fixes(findings, manifest, args.finding)
+    for fid in sorted(set(on_declaration) & set(generated)):
+        log(
+            f"{'DRY RUN: ' if args.dry_run else ''}{fid} names its PodDisruptionBudget at the "
+            "workload's own declaration; "
+            + ("the real run writes the budget beside it instead." if args.dry_run else "the budget is planned beside it instead.")
+        )
     not_manifest = [
         fid
         for fid in args.finding
-        if (by_id[fid].get("remediation") or {}).get("kind") != "manifest"
+        if (by_id[fid].get("remediation") or {}).get("kind") != "manifest" and fid not in generated
     ]
     if not_manifest:
+        gaps = {fid: generated_fix_gap(by_id[fid], manifest) for fid in not_manifest}
+        hint = "".join(f"; {fid}: {gap}" for fid, gap in gaps.items() if gap)
         raise ValidationError(
             f"--finding: {', '.join(not_manifest)} do not have a 'manifest' "
             "remediation; only a fix that is a file in this repository can become "
-            "a pull request"
+            f"a pull request{hint}"
         )
 
     now = datetime.now(timezone.utc)
@@ -22952,7 +23102,16 @@ def handle_remediate(args: argparse.Namespace) -> None:
         # blank preview and no explanation.
         dry_root = dry_run_repo_root(audit_id, repo=opt_repo)
         log(f"DRY RUN: resolving remediation paths under {dry_root}.")
+        for fid in sorted(generated):
+            log(
+                f"DRY RUN: {fid}: the real run writes its PodDisruptionBudget beside "
+                f"{generated[fid].path}, as finish does, unless a file, a name, a "
+                "Kustomize root or a pull request stands in the way. No body is "
+                "previewed for it."
+            )
         for fid in args.finding:
+            if fid in generated:
+                continue
             if remediation_file_problem(by_id[fid], dry_root):
                 log(
                     f"WOULD REFUSE {fid}: its remediation path is not a readable "
@@ -23006,6 +23165,51 @@ def handle_remediate(args: argparse.Namespace) -> None:
     # a forge with no labels gets no label call.
     on_forge = ledger_on_forge(repo)
     ensure_labels(repo, audit_id, noun=noun)
+    # Read here only when a budget is to be planned, which needs it; otherwise
+    # after the refusals, as before, so a refused request makes no listing.
+    remediation_prs = list_remediation_prs(repo, audit_id) if generated else None
+
+    # A declared budget the worker left `manual`: written by the planner
+    # `finish` uses, under the same rules, so it becomes this finding's
+    # `manifest` remediation. One the planner will not write is refused by
+    # name with its reason, as an unwritten manifest is below.
+    ungenerated: dict[str, str] = {}
+    # One probe for every repository question below, as in `finish`. The
+    # worker's budget is still in the declaration files it was demoted from;
+    # it names nothing the repository holds, so the name search reads past it.
+    probe = _RepositoryProbe(repo, root)
+    probe.ignored = set(on_declaration.values())
+    atexit.register(probe.close)
+    if generated:
+        skipped: dict[str, str] = {}
+        # A pull request on the budget's own branch is this command's to judge,
+        # not the planner's: `promotion_candidates` below reports a human close
+        # as superseded and honours --override-human-close, as for any fix.
+        own = _generated_fix_branches(findings, manifest, generated, audit_id)
+        planned, answered = plan_generated_fixes(
+            findings,
+            manifest,
+            generated,
+            {},
+            [pr for pr in remediation_prs or [] if pr.get("headRefName") not in own],
+            root,
+            probe,
+            audit_id,
+            skipped,
+        )
+        write_generated_fixes(findings, planned, root)
+        for fid in sorted(set(generated) - set(planned)):
+            why = skipped.get(fid) or ""
+            if why.endswith(ALREADY_EXISTS_SUFFIX):
+                # A file at the budget's path: most often the budget a merged pull
+                # request already added. Still refused, but said as what it is.
+                why = f"already fixed: {why[: -len(ALREADY_EXISTS_SUFFIX)]} exists"
+            ungenerated[fid] = why or (
+                f"a {noun} the harness did not close already carries it"
+                if fid in answered
+                else "its PodDisruptionBudget could not be written beside its declaration"
+            )
+            log(f"REFUSED {fid}: {ungenerated[fid]}.")
 
     # A named finding whose manifest was never written cannot become a pull
     # request, so it is refused — but only it. `/remediate all` expands to
@@ -23013,9 +23217,9 @@ def handle_remediate(args: argparse.Namespace) -> None:
     # file would answer a request for thirty fixes with zero, which is both
     # the least useful outcome and the hardest to act on. Refuse by name,
     # proceed with the rest, and let the operator see exactly which is which.
-    degraded = set(degrade_missing_remediations(findings, root, noun))
+    degraded = set(degrade_missing_remediations(findings, root, noun)) - set(ungenerated)
     refused = [fid for fid in args.finding if fid in degraded]
-    requested = [fid for fid in args.finding if fid not in degraded]
+    requested = [fid for fid in args.finding if fid not in degraded and fid not in ungenerated]
     for fid in refused:
         log(
             f"REFUSED {fid}: its remediation path is not a readable file inside "
@@ -23025,7 +23229,6 @@ def handle_remediate(args: argparse.Namespace) -> None:
         )
     # A new file its kustomization does not list renders nothing, so a pull
     # request for it is refused the same way: by name, with the rest kept.
-    probe = _RepositoryProbe(repo, root)
     try:
         unlisted = set(degrade_unlisted_kustomize_additions(findings, probe, noun))
         # A pull request that `remediate` opens carries the Config Connector
@@ -23047,9 +23250,15 @@ def handle_remediate(args: argparse.Namespace) -> None:
         log(f"REFUSED {fid}: {why}")
     refused += [fid for fid in requested if fid in unlisted]
     requested = [fid for fid in requested if fid not in unlisted]
+    refused += [fid for fid in args.finding if fid in ungenerated]
     if refused and not requested:
         # Nothing survives, so there is no partial success to report and an
         # exit 0 with an empty list would read as "done".
+        if set(ungenerated) & set(refused):
+            raise ValidationError(
+                f"--finding: {', '.join(refused)} cannot become a {noun}: the "
+                "REFUSED lines above say why for each"
+            )
         if unlisted & set(refused):
             raise ValidationError(
                 f"--finding: {', '.join(refused)} cannot become a {noun}: the "
@@ -23077,7 +23286,9 @@ def handle_remediate(args: argparse.Namespace) -> None:
         issue_number, _, _, _ = find_existing_issue(repo, audit_id)
 
     pr_by_finding, _ = reconcile_remediation_prs(
-        audit_id, findings, list_remediation_prs(repo, audit_id)
+        audit_id,
+        findings,
+        remediation_prs if remediation_prs is not None else list_remediation_prs(repo, audit_id),
     )
     # Routed through the same gate as every other promotion, so an explicit
     # request cannot force-push over a pull request someone is reviewing.
@@ -23885,7 +24096,7 @@ def _plan_remediation_files(
         remediation_prs = []
     sweep_on = sweep_enabled_for_run() and listing_refusal is None
     if not sweep_on and listing_refusal is None:
-        log(f"{sweep_off_reason()}: the automatic sweep opens nothing; only `/remediate` requests open a proposal.")
+        log(f"{sweep_off_reason()}: {sweep_off_next_step('proposal')}")
     # The last point before anything is published. A fix the sweep would open
     # and the worker did not write is refused until it is written or declined
     # by name with a reason: refused once, a worker re-ran `finish` unchanged
@@ -26456,7 +26667,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
     )
     triage_reasons = triage_markers(findings, manifest)
     if not sweep_on:
-        log(f"{AUTO_PROMOTE_ENV}={AUTO_PROMOTE_OFF} on this install: the automatic sweep opens nothing; only `/remediate` requests open a {noun}.")
+        log(f"{AUTO_PROMOTE_ENV}={AUTO_PROMOTE_OFF} on this install: {sweep_off_next_step(noun)}")
     plan = promotion_candidates(
         findings,
         pr_by_finding,
@@ -27247,7 +27458,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "The collector manifest finish was given. Optional; with it an id the "
             "document lacks that the collector still flags is refused as held on "
-            "the ledger rather than as unknown."
+            "the ledger rather than as unknown, and a declared no-pdb finding left "
+            "manual gets the PodDisruptionBudget finish writes."
         ),
     )
     return parser

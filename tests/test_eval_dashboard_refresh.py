@@ -177,6 +177,30 @@ class RefreshScriptTest(unittest.TestCase):
             self.assertNotIn(flag, argv)
         self.assertNotIn("<base href", (self.target / "index.html").read_text())
 
+    def test_the_bucket_path_hands_collect_both_rc_globs(self):
+        """EVAL_DASHBOARD_RC_GLOB holds two globs across the lane's move; the
+        script splits them into one --rc-glob each. The collector is reached
+        with a gcloud that fails, so the run ends at the empty-runs refusal:
+        what this pins is the argv, written before that."""
+        stubs = self.tmp / "stubs"
+        stubs.mkdir()
+        write_stub(stubs, "gcloud", "exit 1\n")
+        argv_log = self.tmp / "collect-argv.log"
+        recording_python(stubs, argv_log)
+        run_script(
+            env={"EVAL_DASHBOARD_TARGET": str(self.target), "JOB_TYPE": "periodic"},
+            path_prepend=str(stubs),
+        )
+        argv = collect_argv(argv_log)
+        globs = [argv[i + 1] for i, flag in enumerate(argv) if flag == "--rc-glob"]
+        self.assertEqual(
+            globs,
+            [
+                "gs://kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/*",
+                "gs://kube-agents-prow/logs/post-kube-agents-eval-rc/*",
+            ],
+        )
+
     def test_bucket_target_emits_derived_base_href(self):
         """gs:// target derives <base href> from the bucket URL rather than
         hardcoding production, so staging bucket targets point to staging."""
