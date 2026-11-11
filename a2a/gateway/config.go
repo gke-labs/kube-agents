@@ -639,6 +639,12 @@ type Config struct {
 	// extra.
 	ManagementProject string
 
+	// ResolvedScopeConfigMap names the ConfigMap the scope publisher writes
+	// the resolved scope into (A2A_RESOLVED_SCOPE_CONFIGMAP), which
+	// Gateway.checkScope reads for a target a folder, organization or selector
+	// reaches. Empty leaves such a target unconfirmed.
+	ResolvedScopeConfigMap string
+
 	// BusyNoticeAt is how many tasks have to be ahead of a new fixed-route
 	// turn before the gateway marks the turn's status line queued
 	// (A2A_BUSY_NOTICE_AT). The count is the fixed addressee's outstanding
@@ -736,6 +742,7 @@ func FromEnv() (*Config, error) {
 		CapabilityOptional:     capability.OptionalFromEnv(),
 		ScopeFile:              envOr("A2A_SCOPE_FILE", defaultScopeFile),
 		ManagementProject:      os.Getenv("A2A_MANAGEMENT_PROJECT"),
+		ResolvedScopeConfigMap: os.Getenv("A2A_RESOLVED_SCOPE_CONFIGMAP"),
 	}
 	cfg.GchatRelayURL = os.Getenv("A2A_GCHAT_RELAY_URL")
 	cfg.GchatTokenPath = envOr("A2A_GCHAT_TOKEN_PATH", defaultGchatTokenPath)
