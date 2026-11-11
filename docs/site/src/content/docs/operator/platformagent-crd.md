@@ -1127,18 +1127,29 @@ spec:
   cluster name is unique only within a project and location. This replaces the
   `RECONCILE_EXCLUDE` environment variable, which matched bare names across every project and keeps
   working for one release alongside it. An excluded cluster gets no Cluster Agent, and fleet answers,
-  the onboarding sweep and the fleet-audit collectors that list clusters leave it out. Still covering
-  it: the daily upgrade-readiness watch and the Saturday `upgrade-readiness-weekly-review`, whose reports enumerate by project (the review's findings on such a cluster reach the findings queue and the weekly brief); the networking audit's
-  subnet usage, since its pods still hold their IPs; the GCE audit's instance listing; and the
-  third-party `gke` MCP server's `list_clusters`.
+  the onboarding sweep and the fleet-audit collectors that list clusters leave it out.
 
-  Excluding a cluster narrows what the agents look at, but it is not yet enforced. The credential
-  proxy still issues a kubeconfig for an excluded cluster. So a worker that fetches the cluster's
-  credentials itself (`gcloud container clusters get-credentials`), or names it as a `kubectl`
-  context, can still read it with the agent's read roles. Those are granted per project or inherited
-  from a declared folder or organization, and reach every cluster beneath. Only a project where the
-  agent holds no roles, bound there or inherited, keeps the agent off a cluster. A cluster in the
-  management project can't be fenced off this way yet, since that project always holds the roles.
+  The credential broker and `kube-proxy` refuse every route to an excluded cluster's Kubernetes
+  API, for every caller, the agents' own commands included. That covers a kubeconfig the broker mints or uses, `gcloud container clusters get-credentials`, `kubectl` through `kube-proxy`,
+  the watchers' cluster relay and the `gke` MCP server's in-cluster tools, each refused as `scope.excluded-cluster`. While any cluster is excluded, a target that names its project by
+  number is refused too, and so is an in-cluster MCP call whose cluster the broker can't read.
+  Spell entries by project ID: an entry spelled by project number refuses its location and cluster
+  name in every project. A broker or `kube-proxy` that can't read the scope it was given reaches no
+  cluster until it can (`scope.exclude-unreadable`).
+
+  Reads of the GKE control plane stay allowed: the project's cluster list and a cluster's
+  describe. Exclusion keeps the agents out of a cluster's API and workloads, not out of the
+  project's cluster list. These still cover an excluded cluster, through those reads only:
+  - the daily upgrade-readiness watch and the Saturday `upgrade-readiness-weekly-review`, which
+    grade its versions and skip their in-cluster readiness rules;
+  - the networking audit's subnet usage, since its pods still hold their IPs;
+  - the GCE audit's instance listing;
+  - the third-party `gke` MCP server's `list_clusters`.
+
+  The upgrade-readiness watch used to read inside an excluded cluster too. It no longer does,
+  because the broker can't tell its reads from an agent's. The broker enforces the exclusion, not
+  IAM: the agent's read roles still reach the cluster. Only a project where the agent holds no
+  roles, bound there or inherited from a folder or organization, fences the service account off.
 
 ### Project outcomes
 
@@ -1196,6 +1207,20 @@ A monitored project whose ID the scope cannot carry, a legacy `example.com:name`
 
 **A selector the run cannot read** is frozen exactly as a container is: the members the previous snapshot reached through it are carried under that outcome, nothing is created under them, and the scope prune stays off for the run. The `containers` array carries a row for it under its `via` name (`sharedVpcHosts/<host>`, `metricsScopes/<id>`). There is no index and no lag behind either lookup: a project detached from the host or unlinked from the scope leaves the set on that run and retires over the ordinary two clean runs. A rollback to an operator that predates these fields keeps their members, as for containers.
 
+### How the A2A gateway checks a task's target
+
+Under `spec.mode: next`, the A2A gateway checks a profile task's cluster target against this
+block before it routes the task. A project named in `projects`, or the agent's own project, is
+admitted directly. An excluded project or cluster is refused.
+
+A project that only a folder, organisation, Shared VPC host or Metrics Scope reaches is admitted
+only from the resolved scope, which the operator publishes in the `<name>-resolved-scope`
+ConfigMap. The project must be listed there as readable. The list must match this `spec.scope`
+and be refreshed within two publisher cycles: 40 minutes at the default `maxProjects`, longer at
+a higher cap. Otherwise the task is refused as not confirmed in this install's scope, with the
+reason: the resolved scope is stale, it reads too large or failed, or the project cannot be read. The `ScopeResolved`
+condition on the `PlatformAgent` says whether the resolved scope is current.
+
 ### Rolling the release back past the scope fields
 
 Remove the whole `spec.scope` block from the CR first and re-add it after. A `cluster_agent_reconcile.py` from before `folders` and `organizations`, or from before `sharedVpcHosts` and `metricsScopes`, reads the same `scope.json`, ignores those keys, and finds every container or selector member in its previous snapshot but not in its resolved set, which is the ordinary two-run retire; a CR without the block marks nothing newly `retiring`. On a default install the agent image follows the operator's, so an operator rollback is an agent rollback too.
@@ -1243,7 +1268,8 @@ Raising it expands both existing claims online, with no pod restart, where the c
 StorageClass sets `allowVolumeExpansion: true`. The shell sandbox's StatefulSet is recreated once,
 because its claim template cannot change in place; the sandbox pod keeps running. Each GiB added
 counts twice against a namespace `requests.storage` quota and against the project's disk quota,
-once for each claim.
+once for each claim, except on the agent's claim while `expectedClusterProfiles` holds it above
+`size`.
 
 Where the class cannot expand the claim (`allowVolumeExpansion` false or unset, a claim with no
 StorageClass, or a class that does not exist), the operator leaves the claim at its size and sets
@@ -1267,6 +1293,19 @@ absent.
 The chart sets it from `platformAgent.storage.size`, the Terraform composition from
 `platform_agent_storage_size` and `install.sh` from `PLATFORM_AGENT_STORAGE_SIZE` in `install.env`.
 While the value is the default, the composition passes the chart nothing, so the CR carries no field.
+
+`expectedClusterProfiles` (1 to 20000) is how many Cluster Agent profiles the install is expected
+to hold, one per cluster in scope. It raises the agent's `<name>-data` claim, and not the sandbox's,
+to at least `8Gi` plus `400Mi` per profile, rounded up to whole GiB. That's the size the session
+stores settle at under the default 90-day retention
+([Fleet sizing → The data volume](/kube-agents/deploy/fleet-sizing/#the-data-volume)). The claim
+takes the larger of that and `size` (or the default), so the field only raises it, and the formula
+passes the `50Gi` default above 107 profiles.
+
+Raising it grows the existing claim online, as a
+raised `size` does, and the `DataVolumeNotExpanded` condition covers a class that can't expand it.
+The sandbox's claim holds no session stores; the copy it takes of the agent's working directories
+leaves them out. The chart sets it from `platformAgent.storage.expectedClusterProfiles`.
 
 ## `spec.telemetry`
 
@@ -1684,7 +1723,7 @@ fail when it writes a condition type that has no row there:
 | `ReplicasLimited` | Only while `spec.deployment.availability.replicas` is above 1, after a pass that rendered the gateway | `status: True`, `Reason: HighAvailabilityNotSupported`. The operator runs the gateway as a single replica, whatever the field asks for; the message names the requested count and why a second replica does not start. Not `Degraded`: the single replica runs. Written on whichever status the pass ends on, on the same terms as `VolumesDropped`: a refusal that returns before the render neither writes nor clears it. Set the field to 1, or remove it, to clear it. |
 | `CredentialProxyExecReady` | Only while `credentialProxy.exec.replicas` is above 0 and the agent's name is accepted for the tier | `status: True`, `Reason: AllReplicasReady` when every exec-tier replica is Ready. `status: False` otherwise: `Reason: Unschedulable` when the scheduler cannot place a replica, with the pod's name and the scheduler's message (often `Insufficient cpu`); `Reason: ReplicasUnavailable` for any other shortfall. The message counts the Ready replicas against the field. Re-read every 30 s while short; a failed read leaves it as it stands. Not `Degraded`: a caller that cannot reach the tier falls back to the stateful broker. Each replica needs a node with 2 free CPU. Removed when the field is 0 or unset, or when the name is refused (`InvalidCredentialProxyExec`). A park that returns before the broker is reconciled (`ReservedServiceAccountName`, `ForbiddenVolumeMount`, `ShellSandboxCannotBeDisabled`, `RuntimeClassNotFound`) leaves it as it stands, count included, until the park clears. |
 | `SizingCappedByQuota` | Only while `spec.deployment.sizingProfile` is `auto` and the cluster count earns a higher tier than the namespace's ResourceQuota has room for, or than a LimitRange bound admits, or after a quota refused the pod a step recreated | `status: True`, `Reason: ResourceQuotaShort` or `LimitRangeShort`. The message names the tier earned, the tier the step was measured from, the tier that stays, and the short quota and key or the LimitRange, bound, resource and container; the figures go in the Warning event. Not `Degraded`: the running tier keeps running. Written before the render, so an earlier refusal neither writes nor clears it. Cleared by the pass that finds room or whose count no longer earns the step; a pass with no reading leaves it, so a gateway outage neither clears nor re-records it. The event watcher switched off by spec clears it. Raise the quota or the bound, or name the tier in `sizingProfile`. |
-| `DataVolumeNotExpanded` | Only while a data claim is smaller than `spec.storage.size` (or the 50Gi default) and its StorageClass cannot expand it | `status: True`, `Reason: StorageClassCannotExpand`. The message names each blocked claim, its current request, the size asked for, and why the class cannot expand it. Not `Degraded`: the agent runs on the smaller volume. Written on whichever status the pass ends on, `Ready` or `Degraded`, and removed once the claims can grow or the size no longer asks for more. After an operator restart it is left as it stands until the next pass reads the claims. Set `allowVolumeExpansion: true` on the class to clear it. |
+| `DataVolumeNotExpanded` | Only while a data claim is smaller than `spec.storage.size` (or the 50Gi default, raised by `expectedClusterProfiles` for the agent's claim) and its StorageClass cannot expand it | `status: True`, `Reason: StorageClassCannotExpand`. The message names each blocked claim, its current request, the size asked for, and why the class cannot expand it. Not `Degraded`: the agent runs on the smaller volume. Written on whichever status the pass ends on, `Ready` or `Degraded`, and removed once the claims can grow or the size no longer asks for more. After an operator restart it is left as it stands until the next pass reads the claims. Set `allowVolumeExpansion: true` on the class to clear it. The agent's claim, when it is below that size and will not grow (its class cannot expand it, or this PlatformAgent does not control it), also gets one `DataVolumeUndersized` Warning Event per state. |
 
 <!-- prettier-ignore-end -->
 <!-- END GENERATED: crd-conditions-platformagent -->
@@ -2041,6 +2080,11 @@ The stall watch's three knobs from [`spec.harness.stallWatch`](#specharnessstall
 does not set them, and the watch reads an empty value as its default. Each one changes what the
 watch reads or when it alerts, so a line the agent wrote into the PVC `.env` could otherwise silence
 alerts for a namespace nobody excluded. They are not in the container env.
+
+The earned-autonomy switches `KUBEAGENTS_POST_MERGE_CHECK`, `KUBEAGENTS_AUTOMERGE` and
+`KUBEAGENTS_DIAL` are pinned the same way, on every install, from `spec.deployment.env`, each
+normalised to a value it knows or `off`. They are not in the container env; the
+[credential isolation reference](/kube-agents/reference/credential-isolation/) describes them.
 
 One consequence of the render is worth knowing: the managed overlay is a
 leaf-level merge, and a list is a leaf, so a list rendered here **replaces** the image's rather than

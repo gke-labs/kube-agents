@@ -112,15 +112,21 @@ spec:
     serving a CRD from before spec.storage prunes the block, and the claims
     stay at the default while the release record carries the size. `lookup`
     is empty under `helm template`, so the guard fires only against a live
-    install.
+    install. expectedClusterProfiles renders the same way, as an integer, and
+    has its own guard, since a CRD can have spec.storage without it.
   */}}
-  {{- with (.Values.platformAgent.storage | default dict).size }}
+  {{- $storageValues := .Values.platformAgent.storage | default dict }}
+  {{- $storageSize := $storageValues.size }}
+  {{- $expectedProfiles := $storageValues.expectedClusterProfiles }}
+  {{- with $storageSize }}
   {{- if le (include "kube-agents.parseBytes" . | int64) 0 }}
   {{- fail (printf "platformAgent.storage.size is %s, which reads as zero whole bytes; the data volume size must be at least one byte. Leave it null to keep the operator default" .) }}
   {{- end }}
   {{- if gt (include "kube-agents.parseBytes" . | int64) 70368744177664 }}
   {{- fail (printf "platformAgent.storage.size is %s; the data volume size must be at most 64Ti, the largest persistent disk size" .) }}
   {{- end }}
+  {{- end }}
+  {{- if or $storageSize $expectedProfiles }}
   {{- $crd := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "platformagents.kubeagents.x-k8s.io" }}
   {{- if $crd }}
   {{- $specProps := dict }}
@@ -130,11 +136,19 @@ spec:
   {{- end }}
   {{- end }}
   {{- if not (hasKey $specProps "storage") }}
-  {{- fail "platformAgent.storage.size needs a PlatformAgent CRD that has spec.storage, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/, or run upgrade.sh, which does). Otherwise the API server prunes the value silently while the release record keeps it" }}
+  {{- fail "platformAgent.storage.size or platformAgent.storage.expectedClusterProfiles needs a PlatformAgent CRD that has spec.storage, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/, or run upgrade.sh, which does). Otherwise the API server prunes the value silently while the release record keeps it" }}
+  {{- end }}
+  {{- if and $expectedProfiles (not (hasKey (dig "storage" "properties" (dict) $specProps) "expectedClusterProfiles")) }}
+  {{- fail "platformAgent.storage.expectedClusterProfiles needs a PlatformAgent CRD that has spec.storage.expectedClusterProfiles, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/, or run upgrade.sh, which does). Otherwise the API server prunes the value silently while the release record keeps it" }}
   {{- end }}
   {{- end }}
   storage:
+    {{- with $storageSize }}
     size: {{ . | quote }}
+    {{- end }}
+    {{- with $expectedProfiles }}
+    expectedClusterProfiles: {{ . | int }}
+    {{- end }}
   {{- end }}
   harness:
     clusterName: {{ required "platformAgent.harness.clusterName is required" .Values.platformAgent.harness.clusterName | quote }}
@@ -690,7 +704,7 @@ spec:
       then, for the reason the resources block is: 0 is the operator's default,
       and an empty block on every CR is noise a reader takes for a setting.
     */}}
-    {{- $execReplicas := dig "exec" "replicas" 0 (.Values.platformAgent.deployment.credentialProxy | default dict) | int }}
+    {{- $execReplicas := include "kube-agents.credentialProxyExecReplicas" . | int }}
     {{- if $proxyQuantities }}
     {{- include "kube-agents.crdFieldGuard" (dict "value" "platformAgent.deployment.credentialProxy.resources" "path" (list "deployment" "credentialProxy") "field" "resources") }}
     {{- end }}

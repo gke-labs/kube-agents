@@ -98,10 +98,12 @@
 #                              -- the offline path the unit tests use. It also
 #                              disarms EVAL_DASHBOARD_RC_GLOB, so a from-dir
 #                              run reaches no bucket at all.
-#   EVAL_DASHBOARD_RC_GLOB     release-candidate build-dir glob, feeding the
-#                              Brief's release-candidate table; default below is
-#                              post-kube-agents-eval-rc's archive. Empty =
-#                              leave releases[] to the prior data.json.
+#   EVAL_DASHBOARD_RC_GLOB     release-candidate build-dir globs, blank-
+#                              separated, feeding the Brief's release-candidate
+#                              table; default below is post-kube-agents-eval-rc's
+#                              two archives, the lane's bucket and the one it
+#                              logged to before the move. Empty = leave
+#                              releases[] to the prior data.json.
 #   EVAL_DASHBOARD_RC_FROM_DIR local release-candidate source, the offline
 #                              counterpart; wins over the glob when set.
 #   JOB_TYPE / PULL_NUMBER     Prow's; gate bucket writes as above.
@@ -185,11 +187,14 @@ EVAL_DASHBOARD_GITLAB_NIGHTLY_PREFIX="${EVAL_DASHBOARD_GITLAB_NIGHTLY_PREFIX-}"
 # lists them.
 EVAL_DASHBOARD_LANE_PR_GLOBS="${EVAL_DASHBOARD_LANE_PR_GLOBS-ghes=gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-ghes/* gitlab-ce=gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-gitlab-ce/*}"
 EVAL_DASHBOARD_LANE_NIGHTLY_PREFIXES="${EVAL_DASHBOARD_LANE_NIGHTLY_PREFIXES-gitlab=gs://kube-agents-prow/logs/ci-kube-agents-eval-nightly-gitlab-next/ ghes=gs://kube-agents-prow/logs/ci-kube-agents-eval-weekly-ghes-next/ gitlab-ce=gs://kube-agents-prow/logs/ci-kube-agents-eval-weekly-gitlab-ce-next/}"
-# The release-candidate archive, which feeds the Brief's release-candidate table.
-# post-kube-agents-eval-rc is a postsubmit, so its builds land under logs/
-# rather than pr-logs/. Set to the empty string to leave the section on its
-# placeholder; a sweep that finds nothing does the same thing.
-EVAL_DASHBOARD_RC_GLOB="${EVAL_DASHBOARD_RC_GLOB-gs://kube-agents-prow/logs/post-kube-agents-eval-rc/*}"
+# The release-candidate archives, which feed the Brief's release-candidate
+# table: the presubmit lanes' private bucket the lane logs to, then the Prow
+# cluster's default it logged to before the move (kept until the newest
+# --rc-limit builds are all in the new one). post-kube-agents-eval-rc is a
+# postsubmit, so its builds land under logs/ rather than pr-logs/. Set to the
+# empty string to leave the section on its placeholder; a sweep that finds
+# nothing does the same thing.
+EVAL_DASHBOARD_RC_GLOB="${EVAL_DASHBOARD_RC_GLOB-gs://kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/* gs://kube-agents-prow/logs/post-kube-agents-eval-rc/*}"
 EVAL_DASHBOARD_SINCE_DAYS="${EVAL_DASHBOARD_SINCE_DAYS:-14}"
 # Freshness contract with the rendered page: the badge turns amber this many
 # seconds after generated_at. Sized to the periodic's 15m cadence with slack
@@ -288,14 +293,15 @@ ${TIMEOUT_CMD[@]+"${TIMEOUT_CMD[@]}"} bash -c '
     [ -n "${22}" ] && src_args+=(--nightly-main-d-prefix "${22}")
     [ -n "${23}" ] && src_args+=(--nightly-main-e-prefix "${23}")
   fi
-  # The RC source. ${10} is the offline one and wins outright; the bucket glob
-  # in $9 is only armed on the bucket path, so EVAL_DASHBOARD_FROM_DIR stays
+  # The RC source. ${10} is the offline one and wins outright; the bucket globs
+  # in $9 are only armed on the bucket path, so EVAL_DASHBOARD_FROM_DIR stays
   # what it says it is -- a run that reaches no bucket at all. Neither set
   # leaves releases[] to whatever --merge-with carried forward.
   if [ -n "${10}" ]; then
     src_args+=(--rc-from-dir "${10}")
   elif [ -n "$9" ] && [ -z "$6" ]; then
-    src_args+=(--rc-glob "$9")
+    read -r -a rc_globs <<<"$9"
+    for g in ${rc_globs[@]+"${rc_globs[@]}"}; do src_args+=(--rc-glob "$g"); done
   fi
   python3 "$1/collect.py" "${src_args[@]}" \
     --merge-with "$2/prior-data.json" \

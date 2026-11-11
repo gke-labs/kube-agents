@@ -41,7 +41,7 @@ func LoadPrincipalMap(path string) (*PrincipalMap, error) {
 		return nil, fmt.Errorf("principal map %s: %w", path, err)
 	}
 	if !info.IsDir() {
-		data, err := os.ReadFile(path)
+		data, err := os.ReadFile(path) // #nosec G304 -- the principal map the operator mounts, not request data
 		if err != nil {
 			return nil, fmt.Errorf("principal map %s: %w", path, err)
 		}
@@ -63,7 +63,7 @@ func LoadPrincipalMap(path string) (*PrincipalMap, error) {
 		if strings.HasPrefix(e.Name(), ".") || e.IsDir() {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(path, e.Name()))
+		data, err := os.ReadFile(filepath.Join(path, e.Name())) // #nosec G304 -- an entry of that mounted directory
 		if err != nil {
 			return nil, fmt.Errorf("principal map entry %s: %w", e.Name(), err)
 		}
