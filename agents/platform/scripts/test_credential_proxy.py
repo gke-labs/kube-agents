@@ -37,6 +37,7 @@ import credential_proxy_client
 import feedback_broker
 import gke_endpoint
 import providers
+import scope_exclude
 import vcs_broker
 from credential_proxy import (
     MAX_REPOSITORY_LENGTH,
@@ -18695,6 +18696,56 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
         status, headers, body = self._request(*args, **kwargs)
         return status, headers, json.loads(body)
 
+    def _exclude(self, project, location, cluster):
+        """Point the handler's exclusions at a scope file that excludes one cluster."""
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        scope = directory / "scope.json"
+        scope.write_text(json.dumps({"exclude": {"clusters": [
+            {"projectId": project, "location": location, "clusterName": cluster}]}}), encoding="utf-8")
+        self.addCleanup(
+            self._restore, "exclusions", "exclusions" in CredentialProxyHandler.__dict__,
+            CredentialProxyHandler.__dict__.get("exclusions"),
+        )
+        CredentialProxyHandler.exclusions = scope_exclude.Exclusions(path=lambda: str(scope))
+
+    EXCLUDABLE_GET = "/v1/gcp/container.googleapis.com/v1/projects/acme-prod/locations/us-central1/clusters/{name}"
+    CHECK_HEADERS = {credential_proxy.GET_CREDENTIALS_CHECK_HEADER: "1"}
+
+    def test_the_get_credentials_check_is_refused_for_an_excluded_cluster(self):
+        # The shim then sends get-credentials to /v1/exec, whose own
+        # excluded-cluster refusal answers (#5305); nothing reaches GKE here.
+        self._exclude("acme-prod", "us-central1", "secret-cluster")
+        self.reply["body"] = b'{"name":"secret-cluster","location":"us-central1","status":"RUNNING"}'
+        status, _, body = self._json_request(self.EXCLUDABLE_GET.format(name="secret-cluster"), headers=self.CHECK_HEADERS)
+        self.assertEqual(403, status)
+        self.assertEqual(scope_exclude.RULE_EXCLUDED_CLUSTER, body["rule"])
+        self.assertEqual([], self.upstream_requests)
+
+    def test_without_the_check_header_an_excluded_clusters_read_is_unchanged(self):
+        # #5305 keeps control-plane reads allowed: the reconcile's existence
+        # check sends no header and is answered as before.
+        self._exclude("acme-prod", "us-central1", "secret-cluster")
+        self.reply["body"] = b'{"name":"secret-cluster","location":"us-central1","status":"RUNNING"}'
+        status, _, _ = self._request(self.EXCLUDABLE_GET.format(name="secret-cluster"))
+        self.assertEqual(200, status)
+        self.assertEqual(1, len(self.upstream_requests))
+
+    def test_the_check_header_leaves_a_cluster_that_is_not_excluded_alone(self):
+        self._exclude("acme-prod", "us-central1", "secret-cluster")
+        self.reply["body"] = b'{"name":"ka-a","location":"us-central1","status":"RUNNING"}'
+        status, _, _ = self._request(self.EXCLUDABLE_GET.format(name="ka-a"), headers=self.CHECK_HEADERS)
+        self.assertEqual(200, status)
+        self.assertEqual(1, len(self.upstream_requests))
+        # The header is the broker's to read, not the upstream's: the relay
+        # sends exactly its own two headers.
+        self.assertNotIn(credential_proxy.GET_CREDENTIALS_CHECK_HEADER, self.upstream_requests[0][1])
+
+    def test_the_shim_and_the_broker_name_the_check_header_alike(self):
+        self.assertEqual(
+            credential_proxy_client.GET_CREDENTIALS_CHECK_HEADER, credential_proxy.GET_CREDENTIALS_CHECK_HEADER
+        )
+
     def test_a_get_carrying_a_body_on_a_direct_write_route_announces_its_close(self):
         # The passthrough and the MCP 405 write their response without _json.
         # A GET drains nothing, so a body on it is unread when the response is
@@ -19569,6 +19620,14 @@ class KubeProxyClientTest(unittest.TestCase):
                     credential_proxy_client,
                     "open_broker_request",
                     return_value=contextlib.nullcontext(fake_resp),
+                ),
+                # This argv names its cluster in full, which the shim answers
+                # itself with the kube-api proxy in use (#5447); this test is
+                # the broker answer's path.
+                mock.patch.object(
+                    credential_proxy_client,
+                    "answer_get_credentials_locally",
+                    return_value=None,
                 ),
             ):
                 rc = credential_proxy_client.execute(
