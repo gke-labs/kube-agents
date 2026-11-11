@@ -5109,7 +5109,7 @@ def test_a_card_wake_refuses_an_unknown_transport(
 
     result = KubeAgentsHarness().run(_REPLAY_PROMPT)
 
-    assert result.errors == ["AGENT_TRANSPORT must be one of ['api', 'inject'], got 'smoke-signal'"]
+    assert result.errors == ["AGENT_TRANSPORT must be one of ['api', 'inject', 'slack'], got 'smoke-signal'"]
     # Only the run-start clock read: nothing planted.
     assert scripts == [harness._POD_CLOCK_SCRIPT]
     assert stub_agent.requests == []
