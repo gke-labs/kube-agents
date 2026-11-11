@@ -12,6 +12,10 @@ A finding whose `evidence` and `severity` are the same as in the previous run pu
 previous run's `title` and `impact`, and usually its `recommendation` and `remediation` together. So
 new words for an unchanged finding do not reach the ledger. Your `manifest` remediation and its
 `recommendation` always stay, and so does a `gcloud` command where the previous run wrote `manual`.
+A relative age in a finding's text ("completed 166 days ago") is dated by `finish`, and by
+`remediate` on a pull request body, to the run that published it ("166 days ago as of
+2026-11-06"), once; text inside a code span is left as written. Prefer an absolute date in what
+you write.
 
 | State                | Rendered as                           | Meaning                                    | What the harness does                                        |
 | -------------------- | ------------------------------------- | ------------------------------------------ | ------------------------------------------------------------ |
@@ -67,10 +71,12 @@ that cause in the ledger row and in the comment on the merged pull request inste
 
 Below the findings, a ledger whose document carried a `declared` list renders a **Declared intent**
 table: one row per entry, with the check, the cluster, the object, `repo:path`, and the title and
-excerpt. Rows have no state and no id — nothing in that table is tracked between runs — and the
+excerpt, followed by the date the note stands until when it carries `expires`. A finding that only a
+lapsed note covers stays in the findings and carries a _Declared intent expired_ line naming the
+note and the date in its block. Rows have no state and no id — nothing in that table is tracked between runs — and the
 table is capped at 50 rows and says how many it left out. On a clean run the ledger closes without
 being rewritten, so the all-clear comment lists the declared postures instead, with the same
-`repo:path` pointers — and that comment is the last ledger record: a later clean run with nothing
+`repo:path` pointers and the same until-date — and that comment is the last ledger record: a later clean run with nothing
 but declarations opens no ledger and posts nothing, because the ledger tracks findings and a
 standing declaration is the same every morning. From then on the declaration in the repository is
 the record, and `finish` reports the count as `declared`.
@@ -88,7 +94,8 @@ must not work around:
   while names fit; past that, and in the bands below, they may get no line, only the count.
 - **Findings are named while names fit, after the criticals' full blocks.** Findings without room
   for their full block are each listed on one line (severity, title, location, id, and any fix state
-  with its pull request) under `### Listed without detail`. Below the critical band, full blocks give
+  with its pull request) under `### Listed without detail`; a 2.7 finding the shared-account shield
+  made manual keeps the shield's note on an indented line under its row. Below the critical band, full blocks give
   way to names, so as many findings as possible are named; the critical band trades full blocks only
   for names of more criticals. Past what one line each can hold, the body gives a count.
 - **The title's counts stay true.** If the body omits findings it says so explicitly. Never

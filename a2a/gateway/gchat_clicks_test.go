@@ -71,9 +71,10 @@ func TestDecodeGchatLegacyClick(t *testing.T) {
 	}
 	check("as captured", ev)
 	// The clicked message's own buttons name the clicked one, and its link.
-	links, label := gchatMessageButtons(ev.Message, 1, "fallback")
-	if label != "platform-agent-host" || len(links) != 1 || links[0].Text != "Cloud Console" {
-		t.Errorf("buttons read back: label %q links %v", label, links)
+	label, _ := gchatMessageButtons(ev.Message, 1, "fallback")
+	links := gchatEventLayout(ev.Message).Widgets
+	if label != "platform-agent-host" || len(links) != 1 || !strings.Contains(fmt.Sprint(links), "Cloud Console") {
+		t.Errorf("buttons read back: label %q widgets %v", label, links)
 	}
 	// Without common, action alone carries the function and parameters.
 	var wire map[string]any
@@ -414,7 +415,7 @@ func TestGchatTypedReplyAnswersAndEditsClose(t *testing.T) {
 	}
 	msg, reason := a.classify(gchatClickEvent(t))
 	if reason != "" || msg.Conversation != side {
-		t.Errorf("click on a side-thread question = %+v (%s)", msg, reason)
+		t.Errorf("click on a question asked again in its DM thread = %+v (%s)", msg, reason)
 	}
 	a.InboundVerified(msg.Conversation, msg.MessageID, true)
 
@@ -455,8 +456,9 @@ func TestGchatTypedReplyAnswersAndEditsClose(t *testing.T) {
 	}
 
 	// Laid out again without choices, the question is closed: a late click
-	// is still a turn, rewritten from the event's own message, never from
-	// the old layout.
+	// is still a turn, and its line goes under what the message shows now
+	// (the layout record the edit left), never under the old question or
+	// the stale copy the client's click carries.
 	if err := a.EditMessage(side, "spaces/_c2fixtureAA/messages/BOT1.BOT1", OutMessage{Text: "settled", Chat: &chatmsg.Message{Schema: chatmsg.Schema, Headline: "Settled."}}); err != nil {
 		t.Fatal(err)
 	}
@@ -466,8 +468,8 @@ func TestGchatTypedReplyAnswersAndEditsClose(t *testing.T) {
 		t.Fatal(reason)
 	}
 	a.InboundVerified(msg.Conversation, msg.MessageID, true)
-	if body := f.call(calls).arguments["body"].(map[string]any); !strings.HasPrefix(body["text"].(string), "*Which cluster?*\n\nTwo clusters run one.") {
-		t.Errorf("late click rewrote from the old layout: %q", body["text"])
+	if body := f.call(calls).arguments["body"].(map[string]any); body["text"] != "*Settled.*\n\n✓ Test Sender: Look at the first one" {
+		t.Errorf("late click rewrote from something other than the settled layout: %q", body["text"])
 	}
 }
 
@@ -633,11 +635,11 @@ func TestGchatWidgetsRoundTrip(t *testing.T) {
 	if err := json.Unmarshal([]byte(`{"accessoryWidgets":`+string(raw)+`}`), &m); err != nil {
 		t.Fatal(err)
 	}
-	links, label := gchatMessageButtons(m, 1, "fallback")
-	if label != "B" || len(links) != 1 || links[0].URL != "https://x.example/d" || links[0].Text != "docs" {
-		t.Errorf("round trip: label %q links %v", label, links)
+	label, _ := gchatMessageButtons(m, 1, "fallback")
+	if widgets := fmt.Sprint(gchatEventLayout(m).Widgets); label != "B" || !strings.Contains(widgets, "https://x.example/d") || !strings.Contains(widgets, "docs") {
+		t.Errorf("round trip: label %q widgets %s", label, widgets)
 	}
-	if _, label := gchatMessageButtons(m, gchatChoiceUnknown, "fallback"); label != "fallback" {
+	if label, _ := gchatMessageButtons(m, gchatChoiceUnknown, "fallback"); label != "fallback" {
 		t.Errorf("an unknown index names no button: %q", label)
 	}
 }
@@ -658,7 +660,7 @@ func TestGchatSettlingAnUnrememberedQuestionForgetsItsPendingClick(t *testing.T)
 	if pending != 1 || !waiting {
 		t.Fatalf("pending = %d, waiting = %v; want the click held", pending, waiting)
 	}
-	a.trackQuestion(ev.Message.Name, "", &chatmsg.Message{Schema: chatmsg.Schema, Headline: "Settled"}, gchatChatLayout{Text: "*Settled*"})
+	a.trackQuestion(ev.Message.Name, "", &chatmsg.Message{Schema: chatmsg.Schema, Headline: "Settled"})
 	a.mu.Lock()
 	pending, waiting = len(a.uxLocked().pending), a.uxLocked().waiting[ev.Message.Name]
 	a.mu.Unlock()

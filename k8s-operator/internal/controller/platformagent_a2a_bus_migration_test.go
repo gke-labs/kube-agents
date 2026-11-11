@@ -1657,7 +1657,7 @@ func TestAFreezeTheCalloutNeverServesEndsAtTheDeadline(t *testing.T) {
 func TestTheFreezeRenders(t *testing.T) {
 	keys := a2aTestCalloutKeys(t)
 	agent := a2aTestAgent()
-	normalConf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), keys).Data["nats.conf"])
+	normalConf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), keys, nil).Data["nats.conf"])
 	normalReserved := renderA2AReservedPrincipals(agent)
 	for _, tc := range []struct {
 		phase                     busMigrationPhase
@@ -1686,7 +1686,7 @@ func TestTheFreezeRenders(t *testing.T) {
 			t.Errorf("%s: callout frozen %v (annotation %q, expect %q of %q)", name, got, dep.Spec.Template.Annotations[a2aBusFreezeAnnotation], env, frozenVersion.Version)
 		}
 
-		conf := string(buildA2ANATSConfigSecret(a, a2aTestCreds(), keys).Data["nats.conf"])
+		conf := string(buildA2ANATSConfigSecret(a, a2aTestCreds(), keys, nil).Data["nats.conf"])
 		sts := buildA2ANATSStatefulSet(a, "h")
 		if !tc.confFrozen {
 			if conf != normalConf || busNATSFrozenFor(sts) != "" {

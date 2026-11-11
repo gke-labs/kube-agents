@@ -13,11 +13,13 @@ import json
 import logging
 import multiprocessing
 import os
+import re
 import socket
 import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -121,14 +123,16 @@ JOB_TRIGGER_SCRIPT = (
     "missed = [job for job in sys.argv[1:] if not trigger_job(job)]\n"
     "if missed:\n    sys.exit('not marked: ' + ' '.join(missed))\n"
 )
-# Reads a roster's run rows: per job, the latest run claimed since a time, as "job status finished".
+# Reads a roster's run rows: per job, the latest run claimed since a time, as "job status finished started".
+# The run a trigger started: the first claimed since the trigger. A tick that finds the job still
+# running writes a skip row (status 'skipped', claimed and finished at once), which is not a run.
 JOB_RUNS_SCRIPT = (
     "import os, sqlite3, sys\n"
     "db = sqlite3.connect(os.path.join(os.environ['HERMES_HOME'], 'cron', 'executions.db'))\n"
     "for job in sys.argv[2:]:\n"
-    "    row = db.execute('select status, finished_at from executions where job_id = ? and claimed_at >= ? '\n"
-    "                     'order by claimed_at desc limit 1', (job, sys.argv[1])).fetchone()\n"
-    "    print(job, *(row or ('unclaimed', None)))\n"
+    "    row = db.execute('select status, finished_at, started_at from executions where job_id = ? and claimed_at >= ? '\n"
+    "                     \"and status != 'skipped' order by claimed_at asc limit 1\", (job, sys.argv[1])).fetchone()\n"
+    "    print(job, *(row or ('unclaimed', None, None)))\n"
 )
 JOB_TIMEOUT_SECONDS = 120
 JOB_COMPLETED = "completed"
@@ -137,10 +141,16 @@ JOB_RUNNING = "running"
 JOB_CLAIMED = "claimed"
 JOB_ACTIVE = (JOB_CLAIMED, JOB_RUNNING)
 JOB_UNCLAIMED = "unclaimed"
-# What a new install starts without: the agent's data and session metadata, the shell's data, the bus's data.
-RESET_CLAIMS = ("platform-agent-data", "system-metadata", "data-platform-agent-shell-0", "data-platform-agent-a2a-nats-0")
-RESET_STATEFUL_PODS = ("platform-agent-shell-0", "platform-agent-a2a-nats-0")
-NATS_POD = "platform-agent-a2a-nats-0"
+# A run line's fields after the job id (status, finished, started), and how Python prints a missing one.
+JOB_RUN_FIELDS = 3
+PYTHON_NONE = "None"
+# The bus runs up to three NATS servers (one with spec.harness.tuning.busReplicas: 1).
+NATS_PODS = tuple(f"platform-agent-a2a-nats-{i}" for i in range(3))
+NATS_POD = NATS_PODS[0]
+# What a new install starts without: the agent's data and session metadata, the shell's data, every bus server's data.
+RESET_CLAIMS = ("platform-agent-data", "system-metadata", "data-platform-agent-shell-0",
+                *(f"data-{pod}" for pod in NATS_PODS))
+RESET_STATEFUL_PODS = ("platform-agent-shell-0",)
 PROVISION_JOB_FRAGMENT = "a2a-provision"
 
 
@@ -230,8 +240,23 @@ def _prompt_worker(prompt: str, env: dict[str, str]) -> dict[str, Any]:
         "tokens": dict(result.tokens or {}),
         "errors": list(result.errors or []),
         "output_chars": len(result.output or ""),
-        "preview": (result.output or "")[:ANSWER_PREVIEW_CHARS],
+        "preview": answer_preview(result.output or ""),
     }
+
+
+def answer_preview(output: str) -> str:
+    """The start of an answer, cut before a word that the bound would split.
+
+    The runner scrubs the project ID from what is stored, and it can only find
+    a whole ID: a cut inside one would store its first characters. An answer
+    whose first `ANSWER_PREVIEW_CHARS` hold no space (a long URL, compact JSON)
+    has no word to cut before, and keeps the hard cut rather than an empty
+    preview that reads as a failed prompt.
+    """
+    cut = output[:ANSWER_PREVIEW_CHARS]
+    if len(output) <= ANSWER_PREVIEW_CHARS or output[ANSWER_PREVIEW_CHARS].isspace():
+        return cut
+    return re.sub(r"\S*\Z", "", cut) or cut
 
 
 def unfinished_reason(preview: str, errors: list[str]) -> str:
@@ -417,6 +442,22 @@ def job_statuses(context: str, namespace: str, home: str, jobs: tuple[str, ...],
     return statuses
 
 
+def job_seconds(context: str, namespace: str, home: str, jobs: tuple[str, ...], since: str) -> dict[str, float]:
+    """How long each job's run since ``since`` took, from its start to its end, for the runs that completed."""
+    pod = _gateway_pod(context, namespace)
+    if not pod:
+        raise kube.CommandError("no gateway pod to read the job runs in")
+    out = kube.kubectl(context, "exec", "-n", namespace, pod, "-c", AGENT_CONTAINER, "--", "env",
+                       f"HERMES_HOME={home}", JOB_PYTHON, "-c", JOB_RUNS_SCRIPT, since.replace("Z", ""), *jobs,
+                       timeout=JOB_TIMEOUT_SECONDS)
+    durations = {}
+    for line in out.splitlines():
+        job, status, finished, started, *_ = line.split() + [""] * JOB_RUN_FIELDS
+        if status == JOB_COMPLETED and finished not in ("", PYTHON_NONE) and started not in ("", PYTHON_NONE):
+            durations[job] = (datetime.fromisoformat(finished) - datetime.fromisoformat(started)).total_seconds()
+    return durations
+
+
 def unfinished_jobs(context: str, namespace: str, home: str, jobs: tuple[str, ...], since: str) -> list[str]:
     """The jobs whose run since ``since`` had not finished: still running, failed or never claimed."""
     try:
@@ -459,16 +500,22 @@ def reset(context: str, namespace: str) -> None:
     """
     for claim in RESET_CLAIMS:
         kube.kubectl(context, "delete", "pvc", claim, "-n", namespace, "--wait=false", "--ignore-not-found")
-    has_bus = bool(kube.kubectl(context, "get", "pod", NATS_POD, "-n", namespace, "--ignore-not-found", "-o", "name").strip())
+    servers = [pod for pod in NATS_PODS
+               if kube.kubectl(context, "get", "pod", pod, "-n", namespace, "--ignore-not-found", "-o", "name").strip()]
     for pod in RESET_STATEFUL_PODS:
         kube.kubectl(context, "delete", "pod", pod, "-n", namespace, "--wait=true", "--ignore-not-found",
                      timeout=RESET_TIMEOUT_SECONDS)
-    if not has_bus:  # a mode-today install runs no bus
+    if not servers:  # a mode-today install runs no bus
         restart(context, namespace)
         return
+    # Every server at once: one left running would copy its streams back to the emptied ones, and the
+    # "first run" would start on the previous run's state.
+    kube.kubectl(context, "delete", "pod", *servers, "-n", namespace, "--wait=true", "--ignore-not-found",
+                 timeout=RESET_TIMEOUT_SECONDS)
     # An empty bus has none of its JetStream buckets; the install creates them with a provision Job,
     # which the operator renders again once the completed one is deleted.
-    _wait_pod_ready(context, namespace, NATS_POD)
+    for pod in servers:
+        _wait_pod_ready(context, namespace, pod)
     jobs = kube.kubectl(context, "get", "jobs", "-n", namespace, "--no-headers", "-o", "name")
     for job in (line.strip() for line in jobs.splitlines()):
         if PROVISION_JOB_FRAGMENT in job:

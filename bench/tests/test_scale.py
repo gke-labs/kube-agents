@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
+import sqlite3
+import sys
+import subprocess
 import threading
 import time
 import types
@@ -312,6 +316,29 @@ def test_record_round_trips_through_its_dict():
     record = _record()
     again = records.Record.from_dict(record.to_dict())
     assert again.key == record.key and again.metrics[1].container == "agent-api-auth"
+
+
+def test_reset_empties_every_bus_server_at_once(monkeypatch):
+    # On a three-server bus, a server left running copies its streams back to an emptied one.
+    calls = []
+
+    def fake_kubectl(context, *args, **kwargs):
+        calls.append(args)
+        if args[:2] == ("get", "pod"):
+            return f"pod/{args[2]}" if args[2] in operations.NATS_PODS else ""
+        return ""
+
+    monkeypatch.setattr(operations.kube, "kubectl", fake_kubectl)
+    waited = []
+    monkeypatch.setattr(operations, "_wait_pod_ready", lambda c, n, pod: waited.append(pod))
+    monkeypatch.setattr(operations, "_wait_provisioned", lambda *a: None)
+    monkeypatch.setattr(operations, "restart", lambda *a: None)
+    operations.reset("ctx", "ns")
+    deleted_claims = {a[2] for a in calls if a[:2] == ("delete", "pvc")}
+    assert {f"data-platform-agent-a2a-nats-{i}" for i in range(3)} <= deleted_claims
+    nats_deletes = [a for a in calls if a[:2] == ("delete", "pod") and any(p in a for p in operations.NATS_PODS)]
+    assert len(nats_deletes) == 1 and all(p in nats_deletes[0] for p in operations.NATS_PODS)
+    assert waited == list(operations.NATS_PODS)
 
 
 def test_reset_is_refused_without_the_host_label(monkeypatch):
@@ -669,7 +696,7 @@ def test_cluster_creation_runs_at_most_the_bound_at_once(monkeypatch, tmp_path):
 
     monkeypatch.setattr(runner.kube, "clusters_with_prefix", lambda *a: [])
     monkeypatch.setattr(run, "_create_cluster", create)
-    monkeypatch.setattr(runner.kube, "has_context", lambda *a: True)
+    monkeypatch.setattr(runner.kube, "get_credentials", lambda *a: None)
     monkeypatch.setattr(run, "wait_registered", lambda count: None)
     run.ensure_clusters(5)
     assert peak[0] == 2
@@ -715,6 +742,23 @@ def test_a_stored_combined_run_of_another_point_is_pending(monkeypatch, tmp_path
     monkeypatch.setattr(runner.operations, "wait_gateway_ready", lambda *a, **k: None)
     specs = [s for s in plan.matrix() if s.factor == "combined" and s.operation.name == "fan_out"]
     assert [s.run for s in run.pending(specs)] == [2, 3]
+
+
+def test_a_combined_point_that_would_replace_another_plan_s_record_is_refused(monkeypatch, tmp_path):
+    plan = load_plan(PHASE2, environ=ENV)
+    path = tmp_path / "data.json"
+    commit = "eeb8a95ceb0a9efd66434161f87820b35b65360c"
+    records.merge(path, [records.Record(
+        commit=commit, mode="next", phase="phase4", factor="combined", level=1, operation="fan_out", run=1,
+        started="2026-10-27T00:00:00Z", ended="2026-10-27T00:10:00Z",
+        values={**plan.base, "clusters": 40.0, "objects": 100.0})])
+    run = runner.Runner(plan, path)
+    run.install = type("Install", (), {"image": lambda self: f"x:{commit}", "mode": lambda self: "next",
+                                       "context": "ctx", "namespace": "ns"})()
+    monkeypatch.setattr(runner.operations, "wait_gateway_ready", lambda *a, **k: None)
+    specs = [s for s in plan.matrix() if s.factor == "combined" and s.operation.name == "fan_out"]
+    with pytest.raises(SystemExit, match="holds phase4's record of another point"):
+        run.pending(specs)
 
 
 def test_a_proxy_load_needs_a_list_command(tmp_path):
@@ -926,6 +970,29 @@ def test_a_proxy_load_run_with_commands_from_outside_leaves_the_fits():
     assert shared.errors == ["brokered commands from outside the load ran during it: 3"]
 
 
+def test_a_run_without_its_totals_also_leaves_its_per_tool_and_throttle_readings():
+    window = ("2026-10-27T00:10:00Z", "2026-10-27T00:13:00Z")
+    readings = (("proxy_commands", 216.0), ("proxy_load_completed", 213.0), ("proxy_commands_gcloud", 216.0),
+                ("proxy_command_seconds_gcloud", 900.0), ("cpu_throttled_seconds", 40.0),
+                ("cpu_throttled_period_share", 0.9), ("proxy_slots_in_use_peak", 8.0))
+    # The slots peak is the shared broker's occupancy too, so it goes with the CPU totals.
+    split = {"proxy_commands_gcloud", "proxy_command_seconds_gcloud", "cpu_throttled_seconds",
+             "cpu_throttled_period_share", "proxy_slots_in_use_peak"}
+    shared = _short_run("proxy_load_gcloud", *window, metrics=readings, values={"proxy_concurrency": 16})
+    runner.Runner.mark_shared(shared, "proxy_load")
+    runner.Runner.cover_split_fits(shared)
+    assert split <= set(shared.excluded_from)
+    # A prompt answered without its operation leaves out the totals on another path.
+    unfinished = _short_run("fan_out", *window, metrics=readings)
+    unfinished.excluded_from = list(runner.RESOURCE_FITS)
+    runner.Runner.cover_split_fits(unfinished)
+    assert split <= set(unfinished.excluded_from)
+    clean = _short_run("fan_out", "2026-10-27T00:05:00Z", "2026-10-27T00:07:00Z", 2, metrics=readings)
+    runner.Runner.mark_shared(clean, "prompt")
+    runner.Runner.cover_split_fits(clean)
+    assert clean.excluded_from == []
+
+
 def test_cpu_seconds_sum_the_replicas_and_peaks_take_the_highest(monkeypatch):
     install = collect.Install("p", "ctx", "ns", "host", "zone")
 
@@ -1017,6 +1084,15 @@ def test_a_pod_unread_at_the_start_adds_no_growth():
     assert collect._growth(collect.Snapshot(), after, "proxy", "kubeagents_tool_execution_duration_seconds_count") == 500.0
 
 
+def test_job_seconds_are_read_for_completed_runs_only(monkeypatch):
+    out = ("compliance-audit completed 2026-10-28T20:30:32.450605+00:00 2026-10-28T20:10:28.731243+00:00\n"
+           "stall-watch running None 2026-10-28T20:30:28.731243+00:00\n"
+           "obtainability-audit unclaimed None None\n")
+    monkeypatch.setattr(operations, "_gateway_pod", lambda *a: "pod")
+    monkeypatch.setattr(operations.kube, "kubectl", lambda *a, **k: out)
+    durations = operations.job_seconds("ctx", "ns", "/home", ("compliance-audit", "stall-watch"), "2026-10-28T20:00:00Z")
+    assert durations == {"compliance-audit": pytest.approx(1203.72, abs=0.01)}
+
 
 def test_a_cluster_delete_writes_no_shared_kubeconfig(monkeypatch):
     seen = {}
@@ -1029,3 +1105,476 @@ def test_a_cluster_delete_writes_no_shared_kubeconfig(monkeypatch):
     monkeypatch.setenv("KUBECONFIG", "/shared/kubeconfig")
     kube.delete_cluster("p", "z", "scale-01")
     assert seen["kubeconfig"] and seen["kubeconfig"] != "/shared/kubeconfig"
+
+
+PHASE4 = REPO_BENCH / "scale" / "phase4.yaml"
+
+
+def test_a_triggered_window_writes_its_job_metrics_at_once(monkeypatch, tmp_path):
+    plan = load_plan(PHASE4, environ=ENV)
+    run = runner.Runner(plan, tmp_path / "data.json")
+    spec = next(s for s in plan.matrix() if s.factor == "clusters" and s.operation.kind == "trigger_soak")
+    stamped = records.Record(commit="e" * 40, mode="next", phase="phase4", factor=spec.factor, level=spec.level,
+                             operation=spec.operation.name, run=1, started="2026-10-29T00:00:00Z",
+                             ended="2026-10-29T00:10:00Z")
+    monkeypatch.setattr(run, "apply_level", lambda factor, level: {"clusters": spec.level})
+    monkeypatch.setattr(run, "backfill_peaks", lambda *a, **k: None)
+    monkeypatch.setattr(run, "pending", lambda specs: specs)
+    monkeypatch.setattr(run, "preflight", lambda: None)
+    monkeypatch.setattr(run, "wait_registered", lambda count: None)
+    monkeypatch.setattr(run, "execute", lambda s, values: stamped)
+    monkeypatch.setattr(run, "drain_jobs", lambda op, since: None)
+    monkeypatch.setattr(run, "flush_peaks", lambda awaiting, wait: [])
+    monkeypatch.setattr(runner.operations, "job_seconds", lambda *a: {"stall-watch": 418.5})
+    monkeypatch.setattr(runner.operations.Relay, "start", lambda self: None)
+    monkeypatch.setattr(runner.operations.Relay, "stop", lambda self: None)
+    assert run.run([spec], force=False) is True
+    [stored] = records.load(tmp_path / "data.json")["records"]
+    assert {m["name"]: m["value"] for m in stored["metrics"]} == {"jobs_completed": 1.0, "job_seconds": 418.5}
+
+
+@pytest.mark.parametrize("error", [kube.CommandError("exec failed"), ValueError("bad timestamp"), TypeError("None")])
+def test_a_job_log_that_cannot_be_read_costs_only_the_job_metrics(monkeypatch, tmp_path, error):
+    run = runner.Runner(load_plan(PHASE4, environ=ENV), tmp_path / "data.json")
+    run.install = type("Install", (), {"context": "ctx", "namespace": "ns"})()
+    op = next(o for o in run.plan.operations if o.kind == "trigger_soak")
+
+    def fail(*args):
+        raise error
+    monkeypatch.setattr(runner.operations, "job_seconds", fail)
+    assert run.job_metrics(op, "2026-10-29T00:00:00Z") == []
+
+
+def test_the_dry_run_lists_each_level_s_cluster_changes_and_runs(monkeypatch, tmp_path):
+    plan = load_plan(PHASE4, environ=ENV)
+    run = runner.Runner(plan, tmp_path / "data.json")
+    monkeypatch.setattr(runner.kube, "clusters_with_prefix", lambda *a: ["scale-01", "scale-02"])
+    lines = run.dry_run([s for s in plan.matrix() if s.factor == "clusters" and s.level in (40, 32)], force=True)
+    assert lines[0] == "8 runs to do (of 8); test clusters now: 2"
+    assert any(line.startswith("  create 38 clusters:") for line in lines)
+    assert any(line.startswith("  delete 8 clusters: scale-33") for line in lines)
+    assert sum("(prompt, model calls)" in line for line in lines) == 4
+
+
+def test_a_lease_held_elsewhere_refuses_the_run(monkeypatch):
+    plan = load_plan(PHASE4, environ=ENV)
+    calls = []
+
+    def lease(args, **kwargs):
+        calls.append(args[2])
+        return subprocess.CompletedProcess(args, 1, stdout="held by someone@host", stderr="")
+    monkeypatch.setattr(runner.subprocess, "run", lease)
+    with pytest.raises(SystemExit, match="could not take the install.s live-test lease"):
+        with runner.hold_lease(plan, "test"):
+            pytest.fail("the block ran without the lease")
+    assert calls == ["acquire"]
+
+
+def test_a_held_lease_is_released_when_the_block_ends(monkeypatch):
+    plan = load_plan(PHASE4, environ=ENV)
+    calls = []
+
+    def lease(args, **kwargs):
+        calls.append(args[2])
+        assert kwargs["env"]["KUBE_AGENTS_LIVE_TEST_ENVS"]
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+    monkeypatch.setattr(runner.subprocess, "run", lease)
+    with runner.hold_lease(plan, "test"):
+        assert calls == ["acquire"]
+    assert calls == ["acquire", "release"]
+
+
+def test_the_dry_run_stops_where_limit_stops_the_run(monkeypatch, tmp_path):
+    plan = load_plan(PHASE4, environ=ENV)
+    run = runner.Runner(plan, tmp_path / "data.json")
+    monkeypatch.setattr(runner.kube, "clusters_with_prefix", lambda *a: ["scale-01", "scale-02"])
+    specs = [s for s in plan.matrix() if s.factor == "clusters" and s.level in (40, 32)]
+    lines = run.dry_run(specs, force=True, limit=2)
+    assert lines[0] == "2 runs to do (of 8); test clusters now: 2"
+    assert sum(line.startswith("level ") for line in lines) == 1
+    assert sum(line.startswith("  run ") for line in lines) == 2
+
+
+@pytest.mark.parametrize("command", ["apply", "teardown"])
+def test_dry_run_is_refused_where_it_is_not_implemented(command, capsys):
+    with pytest.raises(SystemExit):
+        runner.main([command, str(PHASE4), "--dry-run", "--delete-fleet"])
+    assert "--dry-run applies to run only" in capsys.readouterr().err
+
+
+def test_the_lease_script_runs_where_no_install_env_can_be_found(monkeypatch):
+    plan = load_plan(PHASE4, environ=ENV)
+    monkeypatch.setenv("CLAUDE_CWD", "/some/checkout")
+    seen = []
+
+    def lease(args, **kwargs):
+        seen.append((kwargs["env"].get("CLAUDE_CWD"), kwargs["cwd"]))
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+    monkeypatch.setattr(runner.subprocess, "run", lease)
+    with runner.hold_lease(plan, "test"):
+        pass
+    assert all(cwd_var is None and cwd and "harness-scale-lease-" in cwd for cwd_var, cwd in seen)
+
+
+def test_the_lease_is_renewed_while_the_block_runs(monkeypatch):
+    plan = load_plan(PHASE4, environ=ENV)
+    monkeypatch.setitem(plan.settings, "lease_ttl_minutes", 1)
+    monkeypatch.setattr(runner, "SECONDS_PER_MINUTE", 0.03)
+    calls = []
+
+    def lease(args, **kwargs):
+        calls.append(args[2])
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+    monkeypatch.setattr(runner.subprocess, "run", lease)
+    with runner.hold_lease(plan, "test"):
+        time.sleep(0.1)
+    assert calls[0] == "acquire" and calls[-1] == "release"
+    assert "renew" in calls
+
+
+def test_a_lease_that_cannot_be_renewed_stops_the_run(monkeypatch):
+    plan = load_plan(PHASE4, environ=ENV)
+    monkeypatch.setitem(plan.settings, "lease_ttl_minutes", 1)
+    monkeypatch.setattr(runner, "SECONDS_PER_MINUTE", 0.03)
+
+    def lease(args, **kwargs):
+        code = 1 if args[2] == "renew" else 0
+        return subprocess.CompletedProcess(args, code, stdout="not the holder", stderr="")
+    monkeypatch.setattr(runner.subprocess, "run", lease)
+    with pytest.raises(KeyboardInterrupt):
+        with runner.hold_lease(plan, "test"):
+            time.sleep(1)
+            pytest.fail("the run went on without its lease")
+
+
+def test_a_triggered_run_is_read_past_the_skip_row_a_later_tick_writes(tmp_path):
+    (tmp_path / "cron").mkdir()
+    db = sqlite3.connect(tmp_path / "cron" / "executions.db")
+    db.execute("create table executions(job_id, status, claimed_at, started_at, finished_at)")
+    db.execute("insert into executions values('stall-watch', 'completed', '2026-01-01T00:05', '2026-01-01T00:05', "
+               "'2026-01-01T00:30')")
+    db.execute("insert into executions values('stall-watch', 'skipped', '2026-01-01T00:10', NULL, '2026-01-01T00:10')")
+    db.commit()
+    out = subprocess.run([sys.executable, "-c", runner.operations.JOB_RUNS_SCRIPT, "2026-01-01T00:00", "stall-watch"],
+                         env={**os.environ, "HERMES_HOME": str(tmp_path)}, capture_output=True, text=True, check=True)
+    assert out.stdout.split() == ["stall-watch", "completed", "2026-01-01T00:30", "2026-01-01T00:05"]
+
+
+def test_a_run_inside_a_measured_stall_watch_pass_is_marked_as_sharing_the_broker():
+    # Phase 4's 32-cluster fan-out started 1,301 s after the 02:00 tick, inside a pass at the measured
+    # rate of about 50 s per cluster; at 8 clusters the pass is over by 520 s.
+    assert runner._overlaps_stall_watch("2026-10-29T02:21:41Z", "2026-10-29T02:28:00Z", 32)
+    assert not runner._overlaps_stall_watch("2026-10-29T02:10:00Z", "2026-10-29T02:15:00Z", 8)
+
+
+def test_a_run_another_phase_recorded_is_skipped_with_a_warning(monkeypatch, tmp_path, caplog):
+    plan = load_plan(PHASE4, environ=ENV)
+    run = runner.Runner(plan, tmp_path / "data.json")
+    spec = next(s for s in plan.matrix() if s.operation.kind == "prompt" and s.factor == "clusters")
+    records.merge(tmp_path / "data.json", [records.Record(
+        commit="e" * 40, mode="next", phase="phase3", factor=spec.factor, level=spec.level,
+        operation=spec.operation.name, run=spec.run, started="2026-10-27T00:00:00Z", ended="2026-10-27T00:05:00Z")])
+    monkeypatch.setattr(runner.operations, "wait_gateway_ready", lambda *a: None)
+    run.install = type("Install", (), {"context": "ctx", "namespace": "ns", "image": lambda self: "img:" + "e" * 40,
+                                       "mode": lambda self: "next"})()
+    with caplog.at_level("WARNING"):
+        assert spec not in run.pending([spec])
+    assert "already recorded by phase3" in caplog.text
+
+
+def test_every_test_cluster_s_credentials_are_refreshed(monkeypatch, tmp_path):
+    run = runner.Runner(load_plan(PHASE4, environ=ENV), tmp_path / "data.json")
+    fetched = []
+    monkeypatch.setattr(runner.kube, "clusters_with_prefix", lambda *a: ["scale-01", "scale-02"])
+    monkeypatch.setattr(runner.kube, "has_context", lambda name: True)
+    monkeypatch.setattr(runner.kube, "get_credentials", lambda project, zone, name: fetched.append(name))
+    monkeypatch.setattr(run, "wait_registered", lambda count: None)
+    run.ensure_clusters(2)
+    # A cluster created again under an old name keeps no stale endpoint.
+    assert fetched == ["scale-01", "scale-02"]
+
+
+def test_kubectl_requests_time_out_except_streaming_ones(monkeypatch):
+    calls = []
+    monkeypatch.setattr(kube, "run", lambda args, **kwargs: calls.append(args) or "")
+    kube.kubectl("ctx", "get", "nodes", timeout=60)
+    kube.kubectl("ctx", "exec", "pod", "--", "true", timeout=60)
+    assert "--request-timeout=60s" in calls[0]
+    assert not any(arg.startswith("--request-timeout") for arg in calls[1])
+
+
+PROXY_TEXT = """kubeagents_tool_execution_duration_seconds_count{{tool="kubectl"}} {kubectl}
+kubeagents_tool_execution_duration_seconds_count{{tool="gcloud"}} {gcloud}
+kubeagents_tool_execution_duration_seconds_sum{{tool="kubectl"}} {kubectl_s}
+kubeagents_tool_execution_duration_seconds_sum{{tool="gcloud"}} {gcloud_s}
+kubeagents_credential_proxy_slot_cap 8
+"""
+
+
+def _proxy(pod: str, kubectl: int, gcloud: int, kubectl_s: float, gcloud_s: float) -> dict[str, list]:
+    text = PROXY_TEXT.format(kubectl=kubectl, gcloud=gcloud, kubectl_s=kubectl_s, gcloud_s=gcloud_s)
+    return {pod: collect.parse_prometheus(text)}
+
+
+def test_proxy_commands_are_split_by_tool_and_the_cap_is_read():
+    before = Snapshot(scraped={"proxy": _proxy("p", 10, 4, 20.0, 40.0)})
+    after = Snapshot(scraped={"proxy": _proxy("p", 25, 6, 50.0, 70.0)})
+    metrics = {(m.name, m.container): m.value for m in collect.counter_metrics(before, after)}
+    assert metrics[("proxy_commands", None)] == 17
+    assert metrics[("proxy_commands_kubectl", None)] == 15
+    assert metrics[("proxy_commands_gcloud", None)] == 2
+    assert metrics[("proxy_command_seconds_kubectl", None)] == 30.0
+    assert metrics[("proxy_command_seconds_gcloud", None)] == 30.0
+    assert metrics[("proxy_slot_cap", None)] == 8
+
+
+def test_a_new_proxy_pod_counts_its_tools_from_zero():
+    before = Snapshot(scraped={"proxy": _proxy("old", 100, 50, 1.0, 1.0)})
+    after = Snapshot(scraped={"proxy": _proxy("new", 3, 1, 1.0, 1.0)})
+    metrics = {(m.name, m.container): m.value for m in collect.counter_metrics(before, after)}
+    assert metrics[("proxy_commands_kubectl", None)] == 3
+    assert metrics[("proxy_commands_gcloud", None)] == 1
+
+
+@pytest.mark.parametrize(
+    ("text", "seconds"),
+    [
+        ("usage_usec 9\nnr_periods 100\nnr_throttled 25\nthrottled_usec 2500000\n", 2.5),
+        ("nr_periods 100\nnr_throttled 25\nthrottled_time 2500000000\n", 2.5),
+    ],
+)
+def test_parse_cpu_stat_reads_cgroup_v2_and_v1(text, seconds):
+    stat = collect.parse_cpu_stat(text)
+    assert stat == {"nr_periods": 100.0, "nr_throttled": 25.0, "throttled_seconds": seconds}
+
+
+def test_throttle_metrics_are_the_window_growth():
+    before = Snapshot(cpu_stat={"p": {"nr_periods": 100.0, "nr_throttled": 10.0, "throttled_seconds": 1.0}})
+    after = Snapshot(cpu_stat={"p": {"nr_periods": 300.0, "nr_throttled": 110.0, "throttled_seconds": 6.0}})
+    metrics = {(m.name, m.container): m.value for m in collect.throttle_metrics(before, after)}
+    assert metrics[("cpu_throttled_seconds", "envoy-credential-proxy")] == 5.0
+    assert metrics[("cpu_throttled_period_share", "envoy-credential-proxy")] == 0.5
+
+
+def test_no_cpu_stat_means_no_throttle_metrics():
+    assert collect.throttle_metrics(Snapshot(), Snapshot()) == []
+
+
+class _NoPrometheusInstall(collect.Install):
+    """Monitoring with container series but no Managed Prometheus metric."""
+
+    def _time_series(self, query, aligner, start, end):
+        if collect.PROXY_SLOTS_METRIC in query:
+            raise collect.urllib.error.HTTPError("url", 404, "Cannot find metric(s)", None, None)
+        if aligner == "ALIGN_MAX":
+            return [{"resource": {"labels": {"container_name": "envoy-credential-proxy"}},
+                     "points": [{"value": {"int64Value": "734003200"}}]}]
+        return []
+
+
+def test_a_missing_slots_metric_keeps_the_container_peaks():
+    install = _NoPrometheusInstall("p", "ctx", "ns", "scale-host", "us-central1-c")
+    peaks = install.container_peaks(0.0, 60.0)
+    assert peaks["envoy-credential-proxy"]["memory_peak_bytes"] == 734003200
+    assert "proxy_slots_in_use_peak" not in peaks["envoy-credential-proxy"]
+
+
+def test_remonitor_keeps_one_slots_peak_and_notes_a_missing_one(tmp_path):
+    path = tmp_path / "data.json"
+    records.merge(path, [records.Record(
+        commit="e" * 40, mode="next", phase="broker", factor="base", level=0, operation="audits_30m", run=1,
+        started="2026-10-28T20:00:00Z", ended="2026-10-28T20:30:00Z",
+        metrics=[records.Metric("proxy_slot_cap", 8.0), records.Metric("proxy_slots_in_use_peak", 3.0, "envoy-credential-proxy")])])
+    run = runner.Runner(load_plan(PHASE3, environ=ENV), path)
+    run.install = type("Install", (), {"container_peaks": lambda self, start, end: {
+        "envoy-credential-proxy": {"memory_peak_bytes": 2.0, "proxy_slots_in_use_peak": 5.0}}})()
+    run.remonitor()
+    run.remonitor()
+    stored = records.load(path)["records"][0]
+    slots = [m["value"] for m in stored["metrics"] if m["name"] == "proxy_slots_in_use_peak"]
+    assert slots == [5.0]
+    assert runner.SLOTS_UNKNOWN_NOTE not in stored["errors"]
+    run.install = type("Install", (), {"container_peaks": lambda self, start, end: {
+        "envoy-credential-proxy": {"memory_peak_bytes": 2.0}}})()
+    run.remonitor()
+    stored = records.load(path)["records"][0]
+    assert stored["errors"] == [runner.SLOTS_UNKNOWN_NOTE]
+
+
+def test_a_record_from_an_older_runner_gets_no_slots_note():
+    record = records.Record(commit="e" * 40, mode="next", phase="phase3", factor="base", level=0,
+                            operation="audits_30m", run=1, started="2026-10-27T00:00:00Z",
+                            ended="2026-10-27T00:30:00Z", metrics=[records.Metric("proxy_commands", 9.0)])
+    runner.Runner.note_slots(record)
+    assert record.errors == []
+
+
+def _scrubber(project="my-project-123"):
+    run = object.__new__(runner.Runner)
+    run.project = project
+    return run
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("image us-central1-docker.pkg.dev/my-project-123/repo/agent:abc", "image us-central1-docker.pkg.dev/<project>/repo/agent:abc"),
+    # Only an answer preview is cut, so an error or the image keeps its end.
+    ("context gke_my-proj", "context gke_my-proj"),
+])
+def test_scrub_removes_the_whole_project(text, expected):
+    assert _scrubber().scrub(text) == expected
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("in my-project-123 and cut inside the ID my-proj", "in <project> and cut inside the ID <project>"),
+    ("running in the project `my", "running in the project `<project>"),
+    ("under project m", "under project <project>"),
+    ("under the `my-pr", "under the `<project>"),
+    ("ends with my-p", "ends with my-p"),
+    ("as per the install's `m", "as per the install's `m"),
+    ("a word that ends xmy-proj", "a word that ends xmy-proj"),
+])
+def test_scrub_answer_removes_a_cut_off_start_of_the_project(text, expected):
+    assert _scrubber().scrub_answer(text) == expected
+
+
+@pytest.mark.parametrize("tail,expected_end", [
+    ("under the project `my-project-123`.", "under the project"),
+    ("under the project `my", "under the project `my"),
+])
+def test_an_answer_preview_never_ends_inside_a_word(tail, expected_end):
+    # The tail starts so that the bound falls inside the ID in the first case.
+    head = "x " * ((operations.ANSWER_PREVIEW_CHARS - len("under the project `my")) // 2)
+    output = head[: operations.ANSWER_PREVIEW_CHARS - len("under the project `my")] + tail
+    preview = operations.answer_preview(output)
+    assert len(preview) <= operations.ANSWER_PREVIEW_CHARS
+    assert preview.rstrip().endswith(expected_end)
+
+
+def test_a_new_preview_keeps_a_complete_last_word_that_starts_the_project():
+    # A new preview never ends inside a word, so only the whole ID is scrubbed: the cut-off
+    # scrub, for stored records, would rewrite this complete word.
+    run = _scrubber()
+    assert run.fresh_answers(["in my-project-123, owned by my-proj"]) == ["in <project>, owned by my-proj"]
+    assert run.scrub_answer("owned by my-proj") == "owned by <project>"
+
+
+def test_an_answer_preview_with_no_space_keeps_the_hard_cut():
+    # A long URL or compact JSON has no word to cut before; an empty preview would read as a
+    # failed prompt.
+    output = "https://example.com/" + "x" * 400
+    assert operations.answer_preview(output) == output[: operations.ANSWER_PREVIEW_CHARS]
+
+
+def test_scrub_answer_leaves_the_earlier_phases_answers_unchanged():
+    # A project ID that starts with the same letter as one of their cut-off previews.
+    run = _scrubber("f-sample-project")
+    data = json.loads((REPO_BENCH / "scale" / "harness-limits.json").read_text())
+    answers = [a for r in data["records"] if not r["phase"].startswith("broker") for a in r.get("answers", [])]
+    assert answers
+    assert [run.scrub_answer(a) for a in answers] == answers
+
+
+class _SlotsInstall(collect.Install):
+    def __init__(self, slots=None, error=None):
+        super().__init__("p", "ctx", "ns", "scale-host", "us-central1-c")
+        self.slots, self.error = slots, error
+
+    def _time_series(self, query, aligner, start, end):
+        if collect.PROXY_SLOTS_METRIC in query:
+            if self.error:
+                raise collect.urllib.error.HTTPError("url", self.error, "error", None, None)
+            return [{"resource": {"labels": {}}, "points": [{"value": {"doubleValue": v}} for v in self.slots]}]
+        return []
+
+
+def test_a_slots_series_becomes_the_proxy_slots_peak():
+    peaks = _SlotsInstall(slots=[3.0, 5.0]).container_peaks(0.0, 60.0)
+    assert peaks["envoy-credential-proxy"]["proxy_slots_in_use_peak"] == 5.0
+
+
+class _FailingSlotsInstall(_NoPrometheusInstall):
+    """Container series, and a slots query that fails with a status other than 404."""
+
+    def _time_series(self, query, aligner, start, end):
+        if collect.PROXY_SLOTS_METRIC in query:
+            raise collect.urllib.error.HTTPError("url", 503, "Service Unavailable", None, None)
+        return super()._time_series(query, aligner, start, end)
+
+
+def test_a_failed_slots_query_keeps_the_container_peaks_and_says_why(tmp_path):
+    install = _FailingSlotsInstall("p", "ctx", "ns", "scale-host", "us-central1-c")
+    peaks = install.container_peaks(0.0, 60.0)
+    assert peaks["envoy-credential-proxy"]["memory_peak_bytes"] == 734003200
+    assert "proxy_slots_in_use_peak" not in peaks["envoy-credential-proxy"]
+    assert install.slots_query_error.startswith("HTTPError: HTTP Error 503")
+    # The record keeps the peaks and notes the failed query, which is no monitoring error.
+    path = tmp_path / "data.json"
+    records.merge(path, [records.Record(
+        commit="e" * 40, mode="next", phase="broker", factor="base", level=0, operation="audits_30m", run=1,
+        started="2026-10-28T20:00:00Z", ended="2026-10-28T20:30:00Z",
+        metrics=[records.Metric("proxy_slot_cap", 8.0)])])
+    run = runner.Runner(load_plan(PHASE3, environ=ENV), path)
+    run.install = install
+    run.remonitor()
+    stored = records.load(path)["records"][0]
+    assert any(m["name"] == "memory_peak_bytes" for m in stored["metrics"])
+    [note] = stored["errors"]
+    assert note.startswith(runner.SLOTS_FAILED_NOTE) and "503" in note
+    assert not note.startswith(runner.MONITORING_ERROR)
+    # A later read that gets an answer drops the note.
+    run.install = _NoPrometheusInstall("p", "ctx", "ns", "scale-host", "us-central1-c")
+    run.remonitor()
+    assert records.load(path)["records"][0]["errors"] == [runner.SLOTS_UNKNOWN_NOTE]
+
+
+def test_a_pod_whose_cpu_stat_was_unread_at_the_start_adds_no_throttle():
+    before = Snapshot(cpu_unread={"p"})
+    after = Snapshot(cpu_stat={"p": {"nr_periods": 1e6, "nr_throttled": 4e5, "throttled_seconds": 9000.0}})
+    assert collect.throttle_metrics(before, after) == []
+
+
+BROKER_RAISED = REPO_BENCH / "scale" / "broker-proxy-raised.yaml"
+
+
+def _raised_runner(tmp_path, proxy_limits):
+    plan = load_plan(BROKER_RAISED, environ=ENV)
+    run = runner.Runner(plan, tmp_path / "data.json")
+    read = []
+
+    def limits():
+        read.append(True)
+        return {collect.PROXY_CONTAINER: proxy_limits}
+    run.install = types.SimpleNamespace(limits=limits)
+    return plan, run, read
+
+
+def test_a_run_starts_when_the_broker_carries_the_plan_s_limits(monkeypatch, tmp_path):
+    plan, run, read = _raised_runner(tmp_path, {"cpu_cores": 2.0, "memory_bytes": 2 * 1024**3})
+    started = []
+    monkeypatch.setattr(run, "run", lambda *a: started.append(True) or True)
+    args = types.SimpleNamespace(command="run", force=False, limit=None)
+    assert runner._mutate(run, args, []) == 0
+    assert started and read
+    monkeypatch.setattr(runner.kube, "clusters_with_prefix", lambda *a: [])
+    assert "expect_proxy_limits: the broker matches" in run.dry_run([], force=True)
+
+
+def test_a_run_refuses_to_start_while_the_broker_carries_other_limits(monkeypatch, tmp_path):
+    plan, run, read = _raised_runner(tmp_path, {"cpu_cores": 1.0})
+    started = []
+    monkeypatch.setattr(run, "run", lambda *a: started.append(True) or True)
+    for command in ("run", "apply"):
+        args = types.SimpleNamespace(command=command, force=False, limit=None, factor="clusters", level=8)
+        with pytest.raises(SystemExit, match="cpu: the plan expects 2, the broker has 1"):
+            runner._mutate(run, args, [])
+    assert started == []
+    monkeypatch.setattr(runner.kube, "clusters_with_prefix", lambda *a: [])
+    assert any("expect_proxy_limits: cpu: the plan expects 2" in line for line in run.dry_run([], force=True))
+
+
+def test_a_plan_that_names_no_limits_reads_none(tmp_path):
+    plan = load_plan(PHASE4, environ=ENV)
+    run = runner.Runner(plan, tmp_path / "data.json")
+    run.install = types.SimpleNamespace(limits=lambda: pytest.fail("a plan with no expect_proxy_limits read the limits"))
+    run.check_limits()
+    assert run.limit_mismatches() == []

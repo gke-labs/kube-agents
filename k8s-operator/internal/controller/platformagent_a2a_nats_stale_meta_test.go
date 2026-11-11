@@ -163,7 +163,7 @@ func TestStaleMetaStepIsRenderedOnlyOnAOneServerBus(t *testing.T) {
 			}
 		}
 	}
-	conf := renderA2ANATSConf(agent, func(string) string { return "pw" }, &a2aCalloutKeys{IssuerPublic: "A", XKeyPublic: "X"})
+	conf := renderA2ANATSConf(agent, func(string) string { return "pw" }, &a2aCalloutKeys{IssuerPublic: "A", XKeyPublic: "X"}, nil)
 	if !strings.Contains(conf, "store_dir: "+a2aNATSStoreDir+"\n") || !strings.Contains(conf, "system_account: "+a2aAccountSys+"\n") {
 		t.Error("nats.conf no longer renders the store_dir and system_account the step's path is built from")
 	}

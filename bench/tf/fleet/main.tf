@@ -120,8 +120,10 @@ resource "google_project_iam_member" "fleet_nodes_artifact_registry_reader" {
 # identity has to create GKE clusters for the eval tasks, so handing it to the
 # verifiers would be handing them cluster-admin on the shared fleet.
 #
-# roles/container.viewer is the whole grant, verified against the live role
-# rather than assumed: get/list only, no create/update/delete/patch on any
+# roles/container.viewer is the whole grant on the clusters, verified against
+# the live role rather than assumed (roles/compute.viewer, below, reads the
+# project-scoped Compute Engine fixtures): get/list only, no
+# create/update/delete/patch on any
 # Kubernetes object (its one *.create is container.tokenReviews.create, the
 # read-shaped token validation API), and no container.secrets.* at all -- so
 # this account cannot read a Secret on platform-agent-host either. It is
@@ -144,6 +146,20 @@ resource "google_service_account" "fleet_reader" {
 resource "google_project_iam_member" "fleet_reader_container_viewer" {
   project = var.project_id
   role    = "roles/container.viewer"
+  member  = "serviceAccount:${google_service_account.fleet_reader.email}"
+}
+
+# The project-scoped fixtures (the startup-fail VM, the world-open firewall
+# rule and its VM; fixtures.json roles with cluster_slot null) are Compute
+# Engine objects, which container.viewer cannot read. The CI health bot's scan
+# runs every gcloud read as this account, so the presence probe and the state
+# pass list instances and firewall rules as it (#2483, #2682).
+# roles/compute.viewer is get and list on Compute Engine resources, with no
+# create, update or delete. It does show instance metadata, so no secret goes
+# in this project's instance metadata.
+resource "google_project_iam_member" "fleet_reader_compute_viewer" {
+  project = var.project_id
+  role    = "roles/compute.viewer"
   member  = "serviceAccount:${google_service_account.fleet_reader.email}"
 }
 
@@ -321,6 +337,19 @@ resource "google_container_cluster" "seeded_a" {
     channel = "CHANNEL_STANDARD"
   }
 
+  # The GKE Config Connector add-on (#4218). The Config Connector eval cases
+  # need a cluster in the audited fleet that runs Config Connector, and only
+  # this cluster gets it. GKE installs the CRDs and the operator. The
+  # ConfigConnector object that turns on namespaced mode is in
+  # config-connector.tf. Not a drift facet (fleet_consistency_drift_sop.md
+  # section 4), so it changes no consistency finding. An in-place update.
+  # Workload Identity, which the add-on needs, is on above.
+  addons_config {
+    config_connector_config {
+      enabled = true
+    }
+  }
+
   # Upgrade-SOP background closure (3.4 no-channel, 3.7 no-window): a and c
   # enroll in REGULAR and take a maintenance window. Unlike seeded-b there
   # is no version fixture here, so auto-upgrade is welcome; enrollment also
@@ -359,13 +388,22 @@ resource "google_container_cluster" "seeded_a" {
 }
 
 resource "google_container_node_pool" "seeded_a_default" {
-  name       = "default-pool"
-  location   = var.zone
-  cluster    = google_container_cluster.seeded_a.name
-  node_count = 2
+  name     = "default-pool"
+  location = var.zone
+  cluster  = google_container_cluster.seeded_a.name
+  # Three since the Config Connector add-on (#4218), two before. Measured on
+  # a dev cluster that runs the add-on, its pods request about 1,020m CPU at
+  # all times (cnrm-webhook-manager 2 x 250m, cnrm-deletiondefender 250m,
+  # cnrm-unmanaged-detector 250m, cnrm-resource-stats-recorder 20m), 100m
+  # more for each namespaced controller while a ConfigConnectorContext
+  # exists, and the configconnector-operator pod: more than the core each
+  # node had spare, and default-pool-headroom requires 100m spare on every
+  # node. A node_count change is an in-place resize, not a
+  # replace: no reconcile-allow.json entry, and the machine type stays.
+  node_count = 3
 
   node_config {
-    # e2-standard-2, two of them (2026-10-20, #3607; two e2-mediums since
+    # e2-standard-2 (2026-10-20, #3607; two e2-mediums since
     # #1278, one before). The binding constraint is CPU *requests*: GKE's
     # system pods (kube-dns at 270m a replica, kube-proxy, metadata-server,
     # fluentbit, konnectivity, ...) take 700-860m of an e2-medium's 940m
@@ -492,6 +530,57 @@ resource "google_container_node_pool" "pinned_inference_pool" {
   }
 }
 
+# Posture (capacity): a single-zone autoscaling pool that is zone-locked and
+# nothing else -- no NAP on the cluster, tainted so no multi-zone pool counts
+# as its fallback, and held at zero nodes so it never nears its ceiling (the
+# stockout SOP's 3.9 flags a pool at 90% of its ceiling as a second arm, and
+# a declaration covers the zone-locked arm alone). The pool project's GitOps
+# repository declares it on purpose in knowledge/notification-relay-no-pdb.md,
+# so the capacity audit lists it under Declared intent, not as a finding;
+# pinned-inference-pool above cannot play this part because its Pending
+# backlog and its 1/1 ceiling are the defect stockout-pinned-pool grades.
+# Zero nodes cost nothing; the taint keeps the autoscaler from ever adding
+# one for a stray pod. Catalogue role: declared-single-zone-pool.
+resource "google_container_node_pool" "declared_zonal_pool" {
+  name       = "declared-zonal-pool"
+  location   = var.zone
+  cluster    = google_container_cluster.seeded_a.name
+  node_count = 0
+
+  autoscaling {
+    min_node_count = 0
+    max_node_count = 2
+  }
+
+  node_config {
+    machine_type    = "e2-small"
+    disk_size_gb    = 20
+    resource_labels = local.fleet_labels
+    service_account = google_service_account.fleet_nodes.email
+    oauth_scopes    = ["https://www.googleapis.com/auth/cloud-platform"]
+
+    workload_metadata_config {
+      mode = "GKE_METADATA"
+    }
+
+    # trivy GCP-0048. See seeded_a_default above for why this is a zero-diff
+    # write and why a second key in this map must never be added to a live
+    # pool.
+    metadata = {
+      disable-legacy-endpoints = "true"
+    }
+    labels = {
+      "seeded-role" = "declared-zonal"
+    }
+
+    taint {
+      key    = "seeded-role"
+      value  = "declared-zonal"
+      effect = "NO_SCHEDULE"
+    }
+  }
+}
+
 # Defect (upgrades): held one minor behind the REGULAR channel default --
 # and ENROLLED in REGULAR, which is what makes the lag visible at all. The
 # upgrade SOP's master-behind check grades (b) and (c) off the cluster's
@@ -590,11 +679,38 @@ resource "google_container_cluster" "seeded_b" {
 }
 
 resource "google_container_node_pool" "seeded_b_default" {
-  name       = "default-pool"
-  location   = var.zone
-  cluster    = google_container_cluster.seeded_b.name
-  node_count = 1
+  name     = "default-pool"
+  location = var.zone
+  cluster  = google_container_cluster.seeded_b.name
+  # Two nodes, so GKE's own kube-system pods have room. seeded-b has a second
+  # node (no-surge-pool, defects-b.tf) that only pinned-batch-runner
+  # tolerates, so kube-dns's autoscaler asks for two replicas and a system
+  # Deployment's rolling update needs surge room; one e2-small at about 92%
+  # requested left kube-dns's second replica and event-exporter Pending,
+  # which workload_triage.py reports as `system unhealthy` and the fleet
+  # health triage case cannot call a healthy cluster. A node_count change is
+  # an in-place resize. No planted fixture reads this pool's node count: the
+  # surge and drain fixtures live on no-surge-pool, and the LB drain fixture
+  # reads the pool's instance group, which keeps its URL.
+  node_count = 2
   version    = local.lagging_version
+
+  # Each node's step waits out the LB drain fixture's 720 seconds
+  # (defects-b.tf), about 18 minutes. GKE's default surge of 1 would roll
+  # the two nodes one after the other, about 36 minutes, which beside a
+  # master update in the same apply can pass the reconcile's one-hour
+  # ceiling. Surging both at once keeps the roll one step. This is not a
+  # node-first pool, so the readiness surge-capacity rule names only
+  # no-surge-pool.
+  upgrade_settings {
+    max_surge       = 2
+    max_unavailable = 0
+  }
+
+  # Headroom over the one-step roll for the provider's 30-minute default.
+  timeouts {
+    update = "45m"
+  }
 
   # The pool takes the SAME derived pin as the master, and is deliberately
   # not ignore_changes'd: min_master_version moves the control plane at a

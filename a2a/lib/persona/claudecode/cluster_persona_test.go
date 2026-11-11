@@ -19,7 +19,7 @@ import (
 const clusterPersonaDir = "../../../../agents/cluster/persona"
 
 // The cluster persona loads, and renders for Claude Code without a warning:
-// every skill with its scripts, both broker servers, and the built-ins it
+// every skill with its scripts, the developer_knowledge server, and the built-ins it
 // does not grant denied.
 func TestTheClusterPersonaRendersWhole(t *testing.T) {
 	p := load(t, clusterPersonaDir)
@@ -31,6 +31,8 @@ func TestTheClusterPersonaRendersWhole(t *testing.T) {
 	wantSkills := []string{
 		"gke-load-bearing-change", "gke-observability", "gke-reliability", "gke-stall-detection",
 		"gke-storage", "gke-workload-scaling", "gke-workload-security", "gke-workload-troubleshooting",
+		"pod-container-creating", "pod-crashloop-oom", "pod-pending-scheduling", "service-connectivity",
+		"workload-triage-scan",
 	}
 	var gotSkills []string
 	for _, s := range p.Skills {
@@ -47,6 +49,8 @@ func TestTheClusterPersonaRendersWhole(t *testing.T) {
 		MemoryFile,
 		path.Join(SkillsDir, "gke-stall-detection/scripts/stall_report.py"),
 		path.Join(SkillsDir, "gke-workload-security/scripts/audit_cluster.sh"),
+		path.Join(SkillsDir, "workload-triage-scan/scripts/workload_triage.py"),
+		path.Join(SkillsDir, "workload-triage-scan/references/reporting.md"),
 	} {
 		if !slices.Contains(files, want) {
 			t.Errorf("rendered files lack %s", want)
@@ -59,10 +63,8 @@ func TestTheClusterPersonaRendersWhole(t *testing.T) {
 	if err := json.Unmarshal([]byte(flagValueRaw(t, out.Args, MCPConfigFlag)), &cfg); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"gke", "developer_knowledge"} {
-		if _, ok := cfg.MCPServers[name]; !ok {
-			t.Errorf("--mcp-config lacks %s", name)
-		}
+	if _, ok := cfg.MCPServers["developer_knowledge"]; !ok {
+		t.Error("--mcp-config lacks developer_knowledge")
 	}
 	if slices.Contains(out.Allowed, "mcp__developer_knowledge__answer_query") {
 		t.Error("answer_query is granted; the persona's include list leaves it out")
@@ -110,7 +112,7 @@ func TestTheClusterPersonaStatesItsRedLines(t *testing.T) {
 	text := load(t, clusterPersonaDir).Instructions
 	for what, phrase := range map[string]string{
 		"target cluster only":        "**The target cluster only.**",
-		"never wildcard the project": "`projects/-` is refused",
+		"never wildcard the project": "a wildcard or another project is refused",
 		"read-only":                  "Never mutate cluster state",
 		"a denial is terminal":       "**A denial is terminal.**",
 		"a refused read is a gap":    "re-run it with a spelling the policy allows, or report it as a gap",
@@ -152,13 +154,14 @@ An investigation run against the wrong cluster produces a confident, wrong repor
 // every other file of a persona skill copies the same path under
 // agents/cluster/skills.
 var scriptSources = map[string]string{
-	"gke-stall-detection/scripts/stall_report.py":    "../../../../agents/platform/scripts/stall_report.py",
-	"gke-workload-security/scripts/audit_cluster.sh": "../../../../agents/platform/skills/gke-workload-security/scripts/audit_cluster.sh",
+	"gke-stall-detection/scripts/stall_report.py":     "../../../../agents/platform/scripts/stall_report.py",
+	"gke-workload-security/scripts/audit_cluster.sh":  "../../../../agents/platform/skills/gke-workload-security/scripts/audit_cluster.sh",
+	"workload-triage-scan/scripts/workload_triage.py": "../../../../agents/platform/scripts/workload_triage.py",
 }
 
-// Every file of a persona skill but its SKILL.md (the scripts and the assets)
-// is a byte-identical copy of its source, so a fix to one is not lost from the
-// other. A file with no known source fails.
+// Every file of a persona skill but its markdown files (the scripts and the
+// assets) is a byte-identical copy of its source, so a fix to one is not lost
+// from the other. A file with no known source fails.
 func TestTheClusterPersonaSkillFilesMatchTheirSources(t *testing.T) {
 	root := path.Join(clusterPersonaDir, persona.SkillsDir)
 	checked := 0
@@ -171,7 +174,7 @@ func TestTheClusterPersonaSkillFilesMatchTheirSources(t *testing.T) {
 			return err
 		}
 		rel = filepath.ToSlash(rel)
-		if path.Base(rel) == persona.SkillFile && path.Dir(path.Dir(rel)) == "." {
+		if persona.IsMarkdown(rel) {
 			return nil
 		}
 		source, ok := scriptSources[rel]
@@ -279,7 +282,32 @@ var (
 			{getCredentialsLine + "\n", "", 1},
 			{"/opt/data/scripts/stall_report.py", "scripts/stall_report.py", 4},
 		},
-		"gke-workload-troubleshooting": troubleshootingEdits,
+		"gke-workload-troubleshooting": {
+			{noGetCredentialsRule, "", 1},
+		},
+		"pod-container-creating": {
+			{noGetCredentialsRule, "", 1},
+		},
+		"pod-crashloop-oom": {
+			{"search `mcp-developer_knowledge` before a web search", "search the `developer_knowledge` MCP server's tools before a web search", 1},
+			{noGetCredentialsRule, "", 1},
+		},
+		"pod-pending-scheduling": {
+			{noGetCredentialsRule, "", 1},
+		},
+		"service-connectivity": {
+			{"block the card as `needs_input`", "stop and report", 1},
+			{noGetCredentialsRule, "", 1},
+		},
+		"workload-triage-scan": {
+			{"1. Run the scan once.", "1. Run the scan once, from this skill's directory (the base directory the harness gives when it loads the skill), where `scripts/workload_triage.py` is.", 1},
+			{"python3 /opt/data/scripts/workload_triage.py", "python3 scripts/workload_triage.py", 1},
+			{"block the card as `needs_input`", "stop and report", 1},
+			{noGetCredentialsScanRule, "", 1},
+		},
+		"workload-triage-scan/references/reporting.md": {
+			{" Read it with `skill_view(name=\"workload-triage-scan\", file_path=\"references/reporting.md\")`.", "", 1},
+		},
 		"gke-workload-security": {
 			{"/opt/data/scripts/audit_cluster.sh", "bash scripts/audit_cluster.sh", 1},
 			{"**Command:**", "**Command** (run from this skill's directory, the base directory the harness gives when it loads the skill):", 1},
@@ -287,22 +315,17 @@ var (
 			{"<gsa-name>@<project-id>", "GSA_NAME@PROJECT_ID", 2},
 		},
 	}
-	// gke-workload-troubleshooting names two things a profile pod does not
-	// have: SETTINGS.md and a Hermes toolset name. The persona copy asks the
-	// task's parameters and names the MCP server's tools.
-	troubleshootingEdits = []skillEdit{
-		{"from the user or active `SETTINGS.md` config:", "from the user or the task's parameters:", 1},
-		{"query `mcp-developer_knowledge` first", "query the `developer_knowledge` MCP server's tools first", 1},
-	}
-	allowedSkillRewrites = map[string][]skillRewrite{
+	noGetCredentialsRule     = "\n- Do not run `gcloud container clusters get-credentials`. Preflight has pinned the kubeconfig."
+	noGetCredentialsScanRule = "\n- Do not run `gcloud container clusters get-credentials`. Preflight has already pinned the kubeconfig to this cluster."
+	allowedSkillRewrites     = map[string][]skillRewrite{
 		"gke-stall-detection": {
 			{start: "## Recording the finding", end: "A report with no rows is a result", text: stallRecording},
 		},
-		"gke-workload-troubleshooting": {
-			{start: "Before running any diagnostics or `kubectl` commands", end: "#### Time Handling", text: troubleshootingTarget},
-			{start: "### Step 5:", end: "1. Synthesize the root cause analysis", text: troubleshootingReportIntro},
-			// Items 1 and 2 of Step 5 are compared as they stand.
-			{start: "3. **Complete the task with the RCA in `result`**", through: "do not duplicate an existing PR.", text: troubleshootingReportResult},
+		"workload-triage-scan/references/reporting.md": {
+			{start: "## Boundary", end: "## Finding", text: reportingBoundary},
+			{start: "3. Complete the task with the finding in `result`.", end: "## Healthy scan", text: reportingFinding},
+			{start: "When `workload_triage.py` ends with `unhealthy: 0`", end: "## Several findings", text: reportingHealthy},
+			{start: "## Cannot proceed", through: "open or update a pull request.", text: reportingCannotProceed},
 		},
 	}
 )
@@ -356,24 +379,28 @@ func normalizeMarkdown(s string) string {
 // final answer instead of a kanban card, and the target is checked against
 // the task instead of fetched.
 var (
-	troubleshootingTarget = `Credentials for the target are served by the credential proxy under the task's grant; you never fetch or configure them yourself. Before running any diagnostics, confirm the target: ` + "`" + `PROFILE_TASK_PROJECT` + "`" + `, ` + "`" + `PROFILE_TASK_LOCATION` + "`" + ` and ` + "`" + `PROFILE_TASK_CLUSTER` + "`" + ` must match the cluster the request names, and ` + "`" + `kubectl version -o json` + "`" + ` must answer. Pass ` + "`" + `--project "$PROFILE_TASK_PROJECT"` + "`" + ` to every ` + "`" + `gcloud` + "`" + ` call. On an empty value or a mismatch, or if the proxy denies that read or cannot reach the cluster, stop and say so, naming both clusters. Never investigate a cluster other than the target.
+	reportingBoundary = `## Boundary
+
+You work under a strict read-only boundary. Do not apply patches to the cluster and do not open pull requests: whoever asked for the investigation owns the GitOps write path. Report in your final answer.
 
 `
-	troubleshootingReportIntro = `### Step 5: Report the RCA & Proposed Correction
-
-You operate under a strict **read-only** boundary: **do not apply patches directly to the cluster, and do not open Pull Requests yourself.** Whoever asked for the investigation owns the GitOps write path.
+	reportingFinding = `3. Put the whole finding in your final answer: the root cause, the evidence that grounds it, and the proposed patch as a fenced ` + "`" + `yaml` + "`" + ` block. Aim under 2,000 characters (` + "`" + `instructions.md` + "`" + ` §9): tighten the prose, keep the cause, the evidence and the patch.
 
 `
-	troubleshootingReportResult = `3. **Put the whole RCA in your final answer**: the root cause, the evidence that grounds it, and the proposed patch as a fenced ` + "`" + `yaml` + "`" + ` block. Your instructions have the length budget — aim under 2,000 characters, tightening the prose around the cause, the evidence and the patch rather than dropping any of the three.
+	reportingHealthy = `When ` + "`" + `workload_triage.py` + "`" + ` ends with ` + "`" + `unhealthy: 0` + "`" + ` and ` + "`" + `system unhealthy: 0` + "`" + ` and either step 2 routed no ` + "`" + `WARNING EVENTS` + "`" + ` row or every routed ` + "`" + `gone` + "`" + `/` + "`" + `-` + "`" + ` warning row was confirmed recovered (for example, a replacement pod is ` + "`" + `Running` + "`" + ` and ` + "`" + `Ready` + "`" + `, a controller or ` + "`" + `Job` + "`" + ` converged, or the claim is now ` + "`" + `Bound` + "`" + `), put ` + "`" + `"No failing workloads."` + "`" + `, the scan's summary line, any initializing pods by name, any ` + "`" + `WARNING EVENTS` + "`" + ` rows (plus the confirming pod, controller or object read for each recovered ` + "`" + `gone` + "`" + `/` + "`" + `-` + "`" + ` row), the ` + "`" + `RESTARTED EARLIER` + "`" + ` and ` + "`" + `FAILED EARLIER` + "`" + ` rows when the question asks about restarts or failures, and the system-namespace lines in your final answer, with no patch and (unless the request asked about system namespaces) no ` + "`" + `[next: ...]` + "`" + ` line; stop your turn immediately with no follow-up command.
 
-   If you cannot proceed — missing input, ambiguous scope — say what you need in your final answer instead.
+When ` + "`" + `workload_triage.py` + "`" + ` ends with ` + "`" + `unhealthy: 0` + "`" + ` and ` + "`" + `system unhealthy: N` + "`" + ` (` + "`" + `N > 0` + "`" + `), do not use ` + "`" + `"No failing workloads."` + "`" + `: state that non-system namespaces have 0 unhealthy workloads while folded namespaces have ` + "`" + `N` + "`" + ` unhealthy pods or controllers below desired, and quote the ` + "`" + `SYSTEM NAMESPACES AND NODES` + "`" + ` lines as written in your final answer, with no patch.
+
 `
+	reportingCannotProceed = `## Cannot proceed
+
+If an input is missing or the scope is ambiguous, say what you need in your final answer instead. Do the same when nothing could be read from the cluster: ` + "`" + `workload_triage.py` + "`" + ` exiting 2, or the cluster API unreachable before any evidence is gathered. Quote the exact stderr line in your final answer. When an individual ` + "`" + `kubectl` + "`" + ` read mid-investigation is refused (` + "`" + `Error from server (Forbidden)` + "`" + `, HTTP 403), follow ` + "`" + `instructions.md` + "`" + ` §2 and §7 instead: treat the refusal as terminal for that query only, continue with what you can read, and complete your final answer naming that refusal as the gap.`
 	stallRecording = `## Recording the finding
 
 You work under a strict read-only boundary: no patches applied, no Pull Requests opened. Report in your final answer.
 
 - A request that gives a report format wins: format the answer exactly as it says. A stall alert raised through the Session KV server's ` + "`" + `controller-stall` + "`" + ` inject arrives as such a request, with the ` + "`" + `What's wrong` + "`" + ` / ` + "`" + `Why` + "`" + ` / ` + "`" + `What to do` + "`" + ` template and, when there is a fix, a ` + "`" + `To authorize:` + "`" + ` line; that shape is what gets the report saved so a reply of "apply" can act on it. Quote the scan's ` + "`" + `stalled resources: <count>` + "`" + ` line in ` + "`" + `Why` + "`" + `.
-- Otherwise, follow the shape in ` + "`" + `gke-workload-troubleshooting` + "`" + `: which objects are stalled, for how long, on which heuristic, and what each is waiting for (the missing Secret, the unmet condition), grounded in the report rows and the confirming kubectl reads; or the statement that the namespace has no stalled resources. Add YAML creating or correcting the missing reference when one is identifiable.
+- Otherwise, follow the shape in [` + "`" + `workload-triage-scan/references/reporting.md` + "`" + `](../workload-triage-scan/references/reporting.md): which objects are stalled, for how long, on which heuristic, and what each is waiting for (the missing Secret, the unmet condition), grounded in the report rows and the confirming kubectl reads; or the statement that the namespace has no stalled resources. Add YAML creating or correcting the missing reference when one is identifiable.
 
 `
 )
@@ -402,20 +429,31 @@ func rewriteSpan(t *testing.T, name, s string, r skillRewrite) string {
 	return s[:i] + normalizeMarkdown(r.text) + s[j:]
 }
 
-// Each persona skill is its source with only the allowed edits, so a fix to a
-// cluster skill reaches the persona or fails here.
+// Each persona skill markdown file is its source with only the allowed edits,
+// so a fix to a cluster skill reaches the persona or fails here.
 func TestTheClusterPersonaSkillsMatchTheirSources(t *testing.T) {
-	entries, err := os.ReadDir(path.Join(clusterPersonaDir, persona.SkillsDir))
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, e := range entries {
-		name := e.Name()
-		src, err := os.ReadFile(path.Join(clusterSkillsDir, name, persona.SkillFile))
+	root := path.Join(clusterPersonaDir, persona.SkillsDir)
+	err := filepath.WalkDir(root, func(full string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		rel, err := filepath.Rel(root, full)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		if !persona.IsMarkdown(rel) {
+			return nil
+		}
+		name := rel
+		if path.Base(rel) == persona.SkillFile && path.Dir(path.Dir(rel)) == "." {
+			name = path.Dir(rel)
+		}
+		src, err := os.ReadFile(path.Join(clusterSkillsDir, rel))
 		if err != nil {
 			t.Fatal(err)
 		}
-		dst, err := os.ReadFile(path.Join(clusterPersonaDir, persona.SkillsDir, name, persona.SkillFile))
+		dst, err := os.ReadFile(full)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -439,6 +477,10 @@ func TestTheClusterPersonaSkillsMatchTheirSources(t *testing.T) {
 			t.Errorf("%s: the persona copy diverges from its source beyond the allowed edits, near:\n source:  %q\n persona: %q",
 				name, want[lo:min(len(want), i+80)], got[lo:min(len(got), i+80)])
 		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -449,4 +491,39 @@ func flagValueRaw(t *testing.T, args []string, flag string) string {
 		t.Fatalf("no %s in %v", flag, args)
 	}
 	return args[i+1]
+}
+
+// The cluster persona offers only servers and tools the credential broker
+// gives a profile worker, so no turn is spent on a tool it will be refused.
+// The relay a server reaches is its broker name, and an empty include list
+// grants the whole server, so both are checked, as are tools persona.yaml
+// names one by one.
+func TestTheClusterPersonaOffersOnlyWhatAProfileWorkerMayReach(t *testing.T) {
+	allowed := profileServerTools(t)
+	p := load(t, clusterPersonaDir)
+	for name, server := range p.MCP.Servers {
+		tools, ok := allowed[server.Broker]
+		if !ok {
+			t.Errorf("mcp.yaml's %s reaches %s, which a profile worker is refused", name, server.Broker)
+			continue
+		}
+		if len(server.Include) == 0 {
+			t.Errorf("mcp.yaml's %s has no include list, so it grants all of %s; a profile worker may reach only %v", name, server.Broker, tools)
+		}
+		for _, tool := range server.Include {
+			if !slices.Contains(tools, tool) {
+				t.Errorf("mcp.yaml's %s offers %s's %s, which a profile worker is refused", name, server.Broker, tool)
+			}
+		}
+	}
+	for _, entry := range p.Manifest.Tools {
+		name, tool, scoped := strings.Cut(entry, ".")
+		server, ok := p.MCP.Servers[name]
+		if !scoped || !ok {
+			continue
+		}
+		if !slices.Contains(allowed[server.Broker], tool) {
+			t.Errorf("persona.yaml grants %s, which a profile worker is refused", entry)
+		}
+	}
 }

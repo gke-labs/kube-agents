@@ -1,16 +1,15 @@
-# FIXTURE_NOT_READY — an entry in scripts/validate_bench_cases.py under #2483,
-# beside gce-startup-script-failure, because the VM below exists in no pool
-# project yet. It moves to hack/eval/nightly-cases.txt with that case, once
-# the fleet re-apply plants the VM on every pool project
-# (docs/designs/bench-case-format.md, "Registration").
+# NIGHTLY-TIER: registered in hack/eval/nightly-cases.txt with
+# gce-startup-script-failure (docs/designs/bench-case-format.md,
+# "Registration"). The VM below is on every pool project: the fixture-state
+# scan of 2026-11-06 reads the startup-fail-vm role healthy on all 40.
 #
 # What this case grades (#2386): a plain chat question about the fleet's
 # Compute Engine VMs and instance groups, one that names no SOP, gets the
 # checks the scheduled GCE compute audit runs, answered in chat with no
 # ledger run. Main already does this: on main 8aabdadb all three runs loaded
 # gce-compute-fleet-audit, ran compute_fleet_audit.py, answered in chat and
-# opened no ledger (run_20261014_195809_279763, _202919_114569, _204137_182782), so the
-# audit-stream table in agents/platform/SOUL.md has no row for this stream.
+# opened no ledger (run_20261014_195809_279763, _202919_114569,
+# _204137_182782), so the audit-stream table in agents/platform/SOUL.md has no row for this stream.
 # This case guards that behaviour: a change that sends the question to a
 # ledger run, or to improvised `gcloud compute` reads, fails it.
 #
@@ -21,16 +20,17 @@
 # `audit_report.py start` and `finish`, since a recoverable safeguard does
 # not gate.
 #
-# Fixture: the startup-fail-vm role (docs/designs/fleet-fixtures.yaml), the
+# Fixture: the startup-fail-vm role (bench/tf/fleet/fixtures.json), the
 # standalone VM startup-fail-<prefix> from bench/tf/fleet/main.tf
 # `google_compute_instance.startup_fail`. Its startup script exits 1 on every
 # boot, so the collector's gce-startup-script-status check (critical) flags
 # it with no age gate. The role is project-scoped, with no cluster slot.
-# CI: no pool project has the VM until #2483's fleet re-apply, so no CI tier
-# can run the case. Dev: a targeted apply of bench/tf/fleet plants it in the
-# dev project. The dev install declares a scope, so the chat command passes
-# the fleet_scope tool's collector_args and the collector sweeps only the
-# declared projects; the VM has to be in one of them. Every candidate this
+# CI: every pool project has the VM (#2483), and the fixture-state scan reads
+# the role healthy on every pool project. Dev: a targeted apply of
+# bench/tf/fleet plants it in the dev project. The dev install declares a
+# scope, so the chat command passes the fleet_scope tool's collector_args and
+# the collector sweeps only the declared projects; the VM has to be in one of
+# them. Every candidate this
 # check emits carries needs_triage gke-managed-node, and the reply must not
 # drop the VM on that flag.
 #

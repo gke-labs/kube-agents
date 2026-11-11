@@ -24,7 +24,7 @@ type sharedCase struct {
 
 // TestEverySharedCaseIsValid loads every expected chat message in the
 // shared cases and checks it passes Validate for its carrier, mark
-// included. The cases pin no text fallback, so the rule that a chat message
+// included, and breaks none of Lint's rules. The cases pin no text fallback, so the rule that a chat message
 // needs one beside it is the emitter's to keep and Read's to enforce.
 func TestEverySharedCaseIsValid(t *testing.T) {
 	paths, err := filepath.Glob(filepath.Join(casesDir, "*.json"))
@@ -56,6 +56,9 @@ func TestEverySharedCaseIsValid(t *testing.T) {
 				}
 				if layout, mark := Validate(m, out.Carrier); layout != nil || mark != nil {
 					t.Errorf("expected[%d] on %s: layout %v, mark %v", i, out.Carrier, layout, mark)
+				}
+				if findings := Lint(m); len(findings) > 0 {
+					t.Errorf("expected[%d] breaks the chat UX rules: %v", i, findings)
 				}
 			}
 			if outputs == 0 {

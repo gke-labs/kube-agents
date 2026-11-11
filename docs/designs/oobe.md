@@ -17,13 +17,13 @@ The operator who ran the installer wants to know, on day one, whether kube-agent
 keeping; the first-run audit request, [#1866 "First-Run Quick Value Audit"](https://github.com/gke-labs/kube-agents/issues/1866), calls it
 the "wow moment that justifies the installation". What they get today:
 
-| When                     | What happens                                                        | Source                                                |
-| ------------------------ | ------------------------------------------------------------------- | ----------------------------------------------------- |
-| Install                  | Pods come up; a first boot can take over fifteen minutes            | INSTALL.md "What to Expect After Installation"        |
-| First message to the bot | Greeting; the inventory scan has been running since boot            | `agents/chat/defaults/onboarding/scan_in_progress.md` |
-| Scan finishes            | Ranked report posted into the thread of the first message           | `bootstrap_delivery.py`                               |
-| Next 06:20 UTC           | First scheduled audit (compliance); first remediation pull requests | `agents/platform/cron/jobs.json`                      |
-| Next Monday 07:50 UTC    | First cost audit                                                    | same                                                  |
+| When                     | What happens                                                                                                 | Source                                                |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------- |
+| Install                  | Pods come up; a first boot can take over fifteen minutes                                                     | INSTALL.md "What to Expect After Installation"        |
+| First message to the bot | Greeting; the inventory scan has been running since boot                                                     | `agents/chat/defaults/onboarding/scan_in_progress.md` |
+| Scan finishes            | Ranked report posted into the thread of the first message; a day on with no message, filed as a ledger issue | `bootstrap_delivery.py`                               |
+| Next 06:20 UTC           | First scheduled audit (compliance); first remediation pull requests                                          | `agents/platform/cron/jobs.json`                      |
+| Next Monday 07:50 UTC    | First cost audit                                                                                             | same                                                  |
 
 The gap between the report and the first audit is up to a day, and up to a week for cost. The
 only way to close it today is to know to start an audit by hand inside the pod
@@ -40,11 +40,12 @@ work once, and then the job removes itself. It lives on the Planning Agent's ros
 Platform Agent's, for the reason `bootstrap_scan_gate.py` gives: the onboarding markers are in the
 Chat Agent's home, and a job on another profile would gate itself on a different directory.
 
-| Stage                                                           | Done when                                    | Marker                                                     | Built in    |
-| --------------------------------------------------------------- | -------------------------------------------- | ---------------------------------------------------------- | ----------- |
-| Delivery: post the report to the first chat                     | Report claimed                               | `.bootstrap_completed` (kept)                              | Step 2 (§5) |
-| Inventory scan: file the sweep, hand off, file the ranking card | Ranking card filed                           | `.bootstrap_scan_filed`, `.bootstrap_handoff_filed` (kept) | Step 2 (§5) |
-| First-run audits                                                | All audits started, or skipped with a reason | `.oobe_audits_fired` (new)                                 | Step 1 (§4) |
+| Stage                                                                         | Done when                                    | Marker                                                     | Built in          |
+| ----------------------------------------------------------------------------- | -------------------------------------------- | ---------------------------------------------------------- | ----------------- |
+| Delivery: post the report to the first chat                                   | Report claimed                               | `.bootstrap_completed` (kept)                              | Step 2 (§5)       |
+| Inventory scan: file the sweep, hand off, file the ranking card               | Ranking card filed                           | `.bootstrap_scan_filed`, `.bootstrap_handoff_filed` (kept) | Step 2 (§5)       |
+| First-run audits                                                              | All audits started, or skipped with a reason | `.oobe_audits_fired` (new)                                 | Step 1 (§4)       |
+| Lost summaries: re-send a first-run audit's report that found no home channel | No re-send pending (its window bounds it)    | `.oobe_summaries_resent.json` (tries)                      | After step 2 (§7) |
 
 Stages this job takes over keep their `.bootstrap_*` markers, so an install upgraded mid-onboarding
 carries on from where it was. One whose `oobe` an earlier image already removed carries on through
@@ -53,7 +54,7 @@ first message: it greets, links the delivery to that chat, and holds delivery un
 ends (`.bootstrap_greeting_pending.<turn>`, dropped by delivery itself after `GREETING_WAIT_SECONDS`),
 so the report follows the greeting.
 
-Order within a tick: delivery, then the scan, then the audits (§5 says why delivery is first). The
+Order within a tick: delivery, then the scan, then the audits, then the lost summaries (§5 says why delivery is first). The
 audits wait for the scan rather than
 starting at boot for two reasons. The report is the operator's first result and should not compete
 for the model quota with four audits at once: on an API-key install, three workers running
@@ -78,7 +79,19 @@ sandbox's volume when the shell sandbox is on. `bootstrap-inventory-delivery`
 (`bootstrap_delivery.py`) posts it once a human has spoken (`.user_aligned`, or under `spec.mode: next`
 `.user_aligned_conversation`) and claims
 `.bootstrap_completed` with `O_CREAT | O_EXCL`; a run `RETIRE_AFTER_SECONDS` (about 16 minutes)
-later removes both jobs.
+later removes both jobs. When nobody has spoken a day after the sweep was filed
+(`UNSPOKEN_FILE_AFTER_SECONDS`), the report is filed as a dated ledger issue instead, in the GitOps
+repository when it is on GitHub or else in the install's one managed GitHub repository (so a
+GitOps repository on another forge still files into that one; several GitHub repositories with no
+GitOps role, or none on GitHub, files nothing; `ONBOARDING_LEDGER_REPO` names one outright), with one line linking it sent to the platform whose home posts route through
+the gateway (kept by the gateway for its digest when no home channel is set; a `spec.mode: today`
+install gets the issue and no line), and the same claim is taken; a week after the sweep
+(`UNDELIVERED_RETIRE_SECONDS`, the plugin's own priming limit) an undelivered report, whatever kept it
+from filing, has its findings registered, is claimed without a post, and the scheduled audits stand
+in for it. In between, a refused create releases the claim and is retried on the conversation path's
+waits, five tries in all; no repository, several, an unreadable mount or a body longer than an issue
+may be is recorded in the path's own attempts file and waits for the retire. A report retired that way leaves its items unmarked in the findings queue, so the nudge
+announces them later: nobody saw them.
 
 ## 4. First-run audits
 
@@ -98,8 +111,8 @@ Neither costs a call into the sandbox.
 
 Two things the trigger must not be:
 
-- **Delivery** (`.bootstrap_completed`). It waits for a human message, so an install nobody talks
-  to would never audit.
+- **Delivery** (`.bootstrap_completed`). It waits for a human message for a day (then files the
+  report as an issue, §3), so an install nobody talks to would audit a day late at best.
 - **The report file.** `INVENTORY.md` and `INVENTORY.raw.md` are on the sandbox's volume when the
   sandbox is on, the default. A gate that tests for them on the Chat Agent's volume never fires,
   and testing across the sandbox every minute costs an ssh call per tick.
@@ -243,8 +256,10 @@ claimed within seconds of that, as the old delivery job's was. Behind the scan a
 - **Removal.** `RETIRE_AFTER_SECONDS` (about 16 minutes) after the report is claimed
   (`.bootstrap_completed`), and, when the report goes to a recorded conversation, only once its post recorded an outcome
   (`.bootstrap_conversation_done`), the delivery stage removes the two disabled entries (`bootstrap_delivery._retire_jobs`). Once the first-run
-  audits stage is also done, `oobe` removes itself.
-  On an install nobody speaks to, the report is never claimed and `oobe` stays, doing nothing.
+  audits stage is also done and no lost summary can still be re-sent (`bootstrap_delivery.pending_resends`:
+  a first-run audit whose summary found no home channel, inside its `RESEND_WINDOW_SECONDS`), `oobe` removes itself.
+  On an install nobody speaks to, the report is claimed when it is filed as a ledger issue (a day
+  after the sweep) or retired (a week after it), and the same removal follows.
 - **Finished installs.** Already in step 1: the entrypoint passes `oobe` in `--assume-retired`
   when `.bootstrap_completed` exists, beside the two bootstrap ids, so an install that onboarded
   before the job existed never gets it.
@@ -254,15 +269,15 @@ times. It rides with the audits stage, whose eval case covers both.
 
 ## 6. Failure modes
 
-| Situation              | What the operator sees                                                                                                  | Recovery                                                                                              |
-| ---------------------- | ----------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| Audits running         | Nothing in chat until each posts its summary; `hermes cron list` in the platform profile shows them                     | None needed                                                                                           |
-| Marking an audit fails | Nothing; `oobe` logs and retries the missing ids each minute, five tries per audit                                      | Automatic                                                                                             |
-| An audit run fails     | The audit's own failure path; `chat-delivery-watch` opens a GitHub issue when reports stop reaching chat                | As today                                                                                              |
-| No GitOps repository   | Reports stay in the report store; a run that changed something posts a summary saying no GitOps repository is connected | None, or for ledger issues, re-run the installer with `--gitops-org` and `--gitops-repo` (INSTALL.md) |
-| No home channel        | Ledger issues and PRs in the repository; the first report names each unposted audit (see §7)                            | Set one (`/sethome`)                                                                                  |
-| Sweep stuck            | Audits start at the fallback                                                                                            | As today for the report                                                                               |
-| Ranking card blocked   | Audits start at the fallback, unless someone unblocks the card first                                                    | As today for the report                                                                               |
+| Situation              | What the operator sees                                                                                                                                                                                                                                                                                                                                                             | Recovery                                                                                              |
+| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| Audits running         | Nothing in chat until each posts its summary; `hermes cron list` in the platform profile shows them                                                                                                                                                                                                                                                                                | None needed                                                                                           |
+| Marking an audit fails | Nothing; `oobe` logs and retries the missing ids each minute, five tries per audit                                                                                                                                                                                                                                                                                                 | Automatic                                                                                             |
+| An audit run fails     | The audit's own failure path; `chat-delivery-watch` opens a GitHub issue when reports stop reaching chat                                                                                                                                                                                                                                                                           | As today                                                                                              |
+| No GitOps repository   | Reports stay in the report store, the first report included when nobody has spoken and no managed GitHub repository can hold it; a run that changed something posts a summary saying no GitOps repository is connected                                                                                                                                                             | None, or for ledger issues, re-run the installer with `--gitops-org` and `--gitops-repo` (INSTALL.md) |
+| No home channel        | Ledger issues and PRs in the repository; the first report names each unposted audit, and a first-run audit's summary is posted once a channel is projected (§7); when nobody has spoken for a day the first report is itself a ledger issue (GitHub only), linked by one line the gateway keeps for its digest (sent only where a platform's home posts route through the gateway) | Set one (`/sethome`)                                                                                  |
+| Sweep stuck            | Audits start at the fallback                                                                                                                                                                                                                                                                                                                                                       | As today for the report                                                                               |
+| Ranking card blocked   | Audits start at the fallback, unless someone unblocks the card first                                                                                                                                                                                                                                                                                                               | As today for the report                                                                               |
 
 ## 7. Not in this design
 
@@ -272,12 +287,17 @@ times. It rides with the audits stage, whose eval case covers both.
 - **[#1866](https://github.com/gke-labs/kube-agents/issues/1866)'s 30, 45 and 60 minute targets for cost, security and reliability findings.** The
   chain starts at scan completion in #1866's order, so each audit lands as soon as the ones before
   it end; nothing holds a finding back to meet a target.
-- **Reaching an install with no home channel.** Audit summaries go to the home channel only. An
-  audit that finishes before anyone opens the chat posts nothing, and nothing posts it later; the
-  onboarding report, sent on the first message, names every shipped fleet audit that ran since the
+- **Reaching an install with no home channel, beyond the first-run chain.** Audit summaries go to
+  the home channel only. An audit that finishes before anyone opens the chat posts nothing; the
+  onboarding report, sent on the first message or filed as an issue a day on (§3), names every shipped fleet audit that ran since the
   sweep was filed and whose summary was not posted, whether the stage started it, held it, gave up on
   it or skipped the chain, with a request that fetches those reports (`bootstrap_delivery._lost_audits`).
-  Posting the summaries themselves after the report is a separate change.
+  The lost-summaries stage (`bootstrap_delivery.resend_lost_summaries`) posts a first-run audit's
+  report after all once the operator projects a Slack home channel into the pod, by asking the chat
+  relay to post it as a scheduled delivery would, while the run's claim is under
+  `RESEND_WINDOW_SECONDS` (the relay posts a record older than two hours as a "did not finish" notice).
+  An audit outside the chain, a first mention later than that, today mode and Google Chat keep the
+  request sentence.
 - **An install self-check.** Not asked for by any issue.
 
 ## 8. Build order and evaluation
@@ -319,7 +339,7 @@ forge: the shared install has a repository, and removing it mid-run would break 
 ## 9. Open questions
 
 - **Chain length.** Each audit took one to eight minutes on a four-cluster install with
-  `gemini-3.1-flash-lite`, so with the retrospective fifth the stage is done, the four audits ended
+  the install's default model, so with the retrospective fifth the stage is done, the four audits ended
   and the fifth started, within about forty minutes of the scan there, inside the eval stack's
   hour-long wait. On a large fleet the last audit may land an hour or more after the scan.
 - **Output volume.** How many pull requests and chat lines a first run produces on a real fleet. If

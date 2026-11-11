@@ -39,11 +39,14 @@ import (
 // The subprocess executor stays as a fallback (Config.Executor); what this
 // one does not do, by design of the stopgap it is: steer a running turn (a
 // follow-up waits for the turn to end and runs as the next turn in the same
-// session; bridge.go, queueSteer). A kanban card's completion never reaches
-// the A2A task (the API server has no push channel); it goes back to the
-// conversation through the gateway's chat.notify route instead, on the route
-// this executor records before a task's first turn (route.go). Both are
-// named in a2a/docs/hermes-bridge.md.
+// session; bridge.go, queueSteer). On routed chat turns (Slack and Google
+// Chat), a kanban card's completion goes back to the conversation
+// asynchronously through the gateway's chat.notify route, using the route
+// this executor records before a task's first turn (route.go). On console,
+// MCP and A2A door turns only (waitsForCardsInTurn), runTaskAPI waits in-turn
+// for the session's kanban cards to settle and synthesizes their findings
+// into the task's answer (kanban.go); every other turn ends at its
+// acknowledgement. Both are named in a2a/docs/hermes-bridge.md.
 const (
 	// ExecutorAPI runs a task as a turn in the conversation's Hermes session
 	// through the pod's API server. The daemon's default.
@@ -120,6 +123,7 @@ const (
 	// it is absent, and the task ends hermes-api-unreachable.
 	DefaultAPIConnectRetry  = 2 * time.Minute
 	apiConnectRetryInterval = time.Second
+	kanbanStartGraceSeconds = 2
 )
 
 // errWaitingForTurn is the error a task whose context ended while it waited
@@ -383,11 +387,22 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 		return
 	}
 
+	// The session's origin and its conversation route are written side by
+	// side under one deadline, so a store that hangs delays the first turn
+	// by one timeout, not two.
+	recordCtx, cancelRecord := context.WithTimeout(taskCtx, routeTimeout)
+	originDone := make(chan struct{})
+	go func() {
+		defer close(originDone)
+		b.recordOrigin(recordCtx, sessionID, run.origin)
+	}()
 	// Recorded before the first turn, so a card any turn files finds it;
 	// every turn of the task is the same session and conversation. Best
 	// effort: the task runs either way, and a failure is said in the answer.
 	routeLost := false
-	routeErr := b.recordRoute(taskCtx, sessionID, run.origin)
+	routeErr := b.recordRoute(recordCtx, sessionID, run.origin)
+	<-originDone
+	cancelRecord()
 	if routeErr != nil && !errors.Is(routeErr, errNoChatConversation) && !errors.Is(routeErr, errRouteDisabled) {
 		b.cfg.Logger.Warn("conversation route not recorded; a card this task files cannot report back",
 			"task", taskID, "session", sessionID, "err", routeErr)
@@ -396,6 +411,13 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	// Only a recorded route lets a card's post reach the conversation, so only
 	// then may the terminal keep the ask for those posts to settle (cardsMark).
 	run.routeRecorded.Store(routeErr == nil)
+	// Only a console, MCP or A2A door turn waits on its cards in turn
+	// (#5170, #5180); every other turn ends at its acknowledgement, as
+	// before the in-turn wait.
+	waitKanbanInTurn := waitsForCardsInTurn(run.origin)
+	if waitKanbanInTurn {
+		b.rememberConsoleSession(sessionID, run.origin)
+	}
 	// The opening turn only: a follow-up runs in a session that has already
 	// read the report, and the hook this mirrors reads the thread once per
 	// message a person sends, which the opening turn is.
@@ -405,6 +427,7 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	// payload carries, signed with the pod's shared secret, and only while
 	// this task holds the session's turn - every turn of it.
 	act := newSessionActivityState(sessionID, b.apiTraced())
+	act.waitInTurn.Store(waitKanbanInTurn)
 	act.inTurn.Store(true)
 	defer act.inTurn.Store(false)
 	run.mu.Lock()
@@ -416,14 +439,38 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	go b.runActivity(run)
 	run.mu.Unlock()
 
+	carriedCards := false
+	if waitKanbanInTurn {
+		b.beginKanbanWait(sessionID)
+		defer func() {
+			if run.canceled.Load() && (act.cardsFiled.Load() || carriedCards) {
+				b.markSessionCanceled(sessionID)
+			}
+			b.endKanbanWait(sessionID)
+		}()
+	}
+	taskStartUnix := time.Now().Unix() - kanbanStartGraceSeconds
 	var steer *lib.Envelope // the follow-up this turn runs; nil on turn 1
 	var prev string         // the turn before's answer, published as a turn artifact
 	for turn := 1; ; turn++ {
 		// A follow-up's synthesis step needs work of its own (beginTurn).
 		act.beginTurn()
+		if waitKanbanInTurn {
+			act.cardsFiled.Store(false)
+		}
 		text, ok := b.apiTurn(run, taskCtx, sessionID, prompt, steer, turn, prev)
 		if !ok {
 			return
+		}
+		if waitKanbanInTurn {
+			text, ok = b.waitForKanbanCards(run, taskCtx, act, sessionID, taskStartUnix, turn, text)
+			if !ok {
+				return
+			}
+			carriedCards = act.cardsFiled.Load()
+			if !carriedCards {
+				taskStartUnix = time.Now().Unix() - kanbanStartGraceSeconds
+			}
 		}
 		next, nextPrompt := b.runnableSteer(ctx, run)
 		if next == nil {
@@ -526,7 +573,7 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 	// taskCtx stays cancelable through the body read: the server can send
 	// its headers before the body, and a cancel or shutdown in between must
 	// still end the request.
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, apiResponseCap+1))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, int64(b.responseCap)+1))
 	// The turn's wall time: from the connection the server answered on to
 	// the end of the body, before any lock below adds to it, and without
 	// the refused dials sendAPI retried first.
@@ -562,13 +609,13 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 			reason, resp.StatusCode, sessionID, turnNote(turn), tail(string(raw), apiBodyTailBytes)), nil)
 		return "", false
 	}
-	if len(raw) > apiResponseCap {
+	if len(raw) > b.responseCap {
 		// Refused, never truncated: a cut answer would fail to parse and
 		// read as a protocol fault, and a shortened one is worse than a
 		// loud failure.
 		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: hermes-api-oversize - HTTP %d; session: %s%s; "+
 			"the response body is over the %d-byte limit (apiResponseCap in api.go); the answer was refused rather than truncated",
-			resp.StatusCode, sessionID, turnNote(turn), apiResponseCap), nil)
+			resp.StatusCode, sessionID, turnNote(turn), b.responseCap), nil)
 		return "", false
 	}
 	var out apiChatResponse

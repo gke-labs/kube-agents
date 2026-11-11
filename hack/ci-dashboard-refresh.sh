@@ -49,9 +49,15 @@
 #                              gitlab, its own watermark); empty disables it
 #   EVAL_DASHBOARD_GITLAB_PR_GLOB_PREVIOUS  that lane's archive before the
 #                              move, read alongside; empty disables it
-#   EVAL_DASHBOARD_GITLAB_NIGHTLY_PREFIX  the GitLab lane's nightly periodic's
-#                              log prefix (tier gitlab, no pull request, its
-#                              own watermark); empty disables it
+#   EVAL_DASHBOARD_GITLAB_NIGHTLY_PREFIX  a GitLab nightly's log prefix read
+#                              as tier gitlab; empty (the default since the
+#                              lane's today-mode nightly retired) disables it
+#   EVAL_DASHBOARD_LANE_PR_GLOBS  the other forge lanes' build-dir globs,
+#                              space-separated TIER=GLOB (collect.py
+#                              --lane-pr-glob); empty disables them
+#   EVAL_DASHBOARD_LANE_NIGHTLY_PREFIXES  the forge lanes' other nightlies,
+#                              space-separated TIER=PREFIX (collect.py
+#                              --lane-nightly-prefix); empty disables them
 #   EVAL_DASHBOARD_NIGHTLY_PREFIX  the nightly periodic's Prow log prefix,
 #                              collected beside the presubmit as tier
 #                              "nightly" (default below: the live job's).
@@ -68,12 +74,21 @@
 #                              ci-kube-agents-eval-nightly-writers. Empty
 #                              disables it; offline as above.
 #   EVAL_DASHBOARD_NIGHTLY_MAIN_B_PREFIX  the same for the periodic that runs
-#                              the nightly main part's second half (main-b),
+#                              the nightly main part's main-b shard,
 #                              read the way the writers prefix is; its runs
 #                              count as the main-b part only when the
 #                              prefix's last segment is
 #                              ci-kube-agents-eval-nightly-main-b. Empty
 #                              disables it; offline as above.
+#   EVAL_DASHBOARD_NIGHTLY_MAIN_C_PREFIX, EVAL_DASHBOARD_NIGHTLY_MAIN_D_PREFIX,
+#   EVAL_DASHBOARD_NIGHTLY_MAIN_E_PREFIX, EVAL_DASHBOARD_NIGHTLY_WRITERS_B_PREFIX,
+#   EVAL_DASHBOARD_NIGHTLY_WRITERS_C_PREFIX
+#                              the same for the main part's other shards and
+#                              the writers part's other thirds, read the way
+#                              the main-b prefix is; their runs count as that
+#                              part only when the prefix's last segment is
+#                              the part's job. Empty disables one; offline
+#                              as above.
 #   EVAL_DASHBOARD_SINCE_DAYS  sweep bound when no usable prior data exists
 #                              (default 14).
 #   EVAL_DASHBOARD_STALE_AFTER_S  freshness-badge threshold written into
@@ -83,10 +98,12 @@
 #                              -- the offline path the unit tests use. It also
 #                              disarms EVAL_DASHBOARD_RC_GLOB, so a from-dir
 #                              run reaches no bucket at all.
-#   EVAL_DASHBOARD_RC_GLOB     release-candidate build-dir glob, feeding the
-#                              Brief's release-candidate table; default below is
-#                              post-kube-agents-eval-rc's archive. Empty =
-#                              leave releases[] to the prior data.json.
+#   EVAL_DASHBOARD_RC_GLOB     release-candidate build-dir globs, blank-
+#                              separated, feeding the Brief's release-candidate
+#                              table; default below is post-kube-agents-eval-rc's
+#                              two archives, the lane's bucket and the one it
+#                              logged to before the move. Empty = leave
+#                              releases[] to the prior data.json.
 #   EVAL_DASHBOARD_RC_FROM_DIR local release-candidate source, the offline
 #                              counterpart; wins over the glob when set.
 #   JOB_TYPE / PULL_NUMBER     Prow's; gate bucket writes as above.
@@ -159,12 +176,25 @@ EVAL_DASHBOARD_GITLAB_PR_GLOB_PREVIOUS="${EVAL_DASHBOARD_GITLAB_PR_GLOB_PREVIOUS
 EVAL_DASHBOARD_NIGHTLY_PREFIX="${EVAL_DASHBOARD_NIGHTLY_PREFIX-gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly/}"
 EVAL_DASHBOARD_NIGHTLY_WRITERS_PREFIX="${EVAL_DASHBOARD_NIGHTLY_WRITERS_PREFIX-gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-writers/}"
 EVAL_DASHBOARD_NIGHTLY_MAIN_B_PREFIX="${EVAL_DASHBOARD_NIGHTLY_MAIN_B_PREFIX-gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-main-b/}"
-EVAL_DASHBOARD_GITLAB_NIGHTLY_PREFIX="${EVAL_DASHBOARD_GITLAB_NIGHTLY_PREFIX-gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/}"
-# The release-candidate archive, which feeds the Brief's release-candidate table.
-# post-kube-agents-eval-rc is a postsubmit, so its builds land under logs/
-# rather than pr-logs/. Set to the empty string to leave the section on its
-# placeholder; a sweep that finds nothing does the same thing.
-EVAL_DASHBOARD_RC_GLOB="${EVAL_DASHBOARD_RC_GLOB-gs://kube-agents-prow/logs/post-kube-agents-eval-rc/*}"
+EVAL_DASHBOARD_NIGHTLY_MAIN_C_PREFIX="${EVAL_DASHBOARD_NIGHTLY_MAIN_C_PREFIX-gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-main-c/}"
+EVAL_DASHBOARD_NIGHTLY_MAIN_D_PREFIX="${EVAL_DASHBOARD_NIGHTLY_MAIN_D_PREFIX-gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-main-d/}"
+EVAL_DASHBOARD_NIGHTLY_MAIN_E_PREFIX="${EVAL_DASHBOARD_NIGHTLY_MAIN_E_PREFIX-gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-main-e/}"
+EVAL_DASHBOARD_NIGHTLY_WRITERS_B_PREFIX="${EVAL_DASHBOARD_NIGHTLY_WRITERS_B_PREFIX-gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-writers-b/}"
+EVAL_DASHBOARD_NIGHTLY_WRITERS_C_PREFIX="${EVAL_DASHBOARD_NIGHTLY_WRITERS_C_PREFIX-gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-writers-c/}"
+EVAL_DASHBOARD_GITLAB_NIGHTLY_PREFIX="${EVAL_DASHBOARD_GITLAB_NIGHTLY_PREFIX-}"
+# The self-managed forge lanes (kube-agents#3682) with their weekly jobs,
+# and the GitLab lane's next-mode nightly, as .github/workflows/ci-health.yml
+# lists them.
+EVAL_DASHBOARD_LANE_PR_GLOBS="${EVAL_DASHBOARD_LANE_PR_GLOBS-ghes=gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-ghes/* gitlab-ce=gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-gitlab-ce/*}"
+EVAL_DASHBOARD_LANE_NIGHTLY_PREFIXES="${EVAL_DASHBOARD_LANE_NIGHTLY_PREFIXES-gitlab=gs://kube-agents-prow/logs/ci-kube-agents-eval-nightly-gitlab-next/ ghes=gs://kube-agents-prow/logs/ci-kube-agents-eval-weekly-ghes-next/ gitlab-ce=gs://kube-agents-prow/logs/ci-kube-agents-eval-weekly-gitlab-ce-next/}"
+# The release-candidate archives, which feed the Brief's release-candidate
+# table: the presubmit lanes' private bucket the lane logs to, then the Prow
+# cluster's default it logged to before the move (kept until the newest
+# --rc-limit builds are all in the new one). post-kube-agents-eval-rc is a
+# postsubmit, so its builds land under logs/ rather than pr-logs/. Set to the
+# empty string to leave the section on its placeholder; a sweep that finds
+# nothing does the same thing.
+EVAL_DASHBOARD_RC_GLOB="${EVAL_DASHBOARD_RC_GLOB-gs://kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/* gs://kube-agents-prow/logs/post-kube-agents-eval-rc/*}"
 EVAL_DASHBOARD_SINCE_DAYS="${EVAL_DASHBOARD_SINCE_DAYS:-14}"
 # Freshness contract with the rendered page: the badge turns amber this many
 # seconds after generated_at. Sized to the periodic's 15m cadence with slack
@@ -231,11 +261,12 @@ BUDGET="${EVAL_DASHBOARD_TIMEOUT:-900}"
 TIMEOUT_CMD=(timeout "${BUDGET}")
 command -v timeout >/dev/null 2>&1 || TIMEOUT_CMD=()
 
-# Single quotes on purpose: $1..${16} are the child bash's own positionals, so
+# Single quotes on purpose: $1..${23} are the child bash's own positionals, so
 # no value ever meets an outer expansion. --merge-with always points at the
 # prior path; when the download above left nothing there, collect.py treats
 # it as a first run and bounds the sweep itself. The nightly prefixes and the
-# GitLab glob ride only with the GCS source: the from-dir path is the offline one.
+# forge lanes' globs and prefixes ride only with the GCS source: the from-dir
+# path is the offline one.
 rc=0
 # shellcheck disable=SC2016
 ${TIMEOUT_CMD[@]+"${TIMEOUT_CMD[@]}"} bash -c '
@@ -251,15 +282,26 @@ ${TIMEOUT_CMD[@]+"${TIMEOUT_CMD[@]}"} bash -c '
     [ -n "${16}" ] && src_args+=(--gitlab-pr-glob "${16}")
     [ -n "${13}" ] && src_args+=(--gitlab-nightly-prefix "${13}")
     [ -n "${14}" ] && src_args+=(--nightly-main-b-prefix "${14}")
+    # Split on blanks by read, which expands no glob in the values.
+    read -r -a lane_globs <<<"${17}"
+    for g in ${lane_globs[@]+"${lane_globs[@]}"}; do src_args+=(--lane-pr-glob "$g"); done
+    read -r -a lane_prefixes <<<"${18}"
+    for p in ${lane_prefixes[@]+"${lane_prefixes[@]}"}; do src_args+=(--lane-nightly-prefix "$p"); done
+    [ -n "${19}" ] && src_args+=(--nightly-main-c-prefix "${19}")
+    [ -n "${20}" ] && src_args+=(--nightly-writers-b-prefix "${20}")
+    [ -n "${21}" ] && src_args+=(--nightly-writers-c-prefix "${21}")
+    [ -n "${22}" ] && src_args+=(--nightly-main-d-prefix "${22}")
+    [ -n "${23}" ] && src_args+=(--nightly-main-e-prefix "${23}")
   fi
-  # The RC source. ${10} is the offline one and wins outright; the bucket glob
-  # in $9 is only armed on the bucket path, so EVAL_DASHBOARD_FROM_DIR stays
+  # The RC source. ${10} is the offline one and wins outright; the bucket globs
+  # in $9 are only armed on the bucket path, so EVAL_DASHBOARD_FROM_DIR stays
   # what it says it is -- a run that reaches no bucket at all. Neither set
   # leaves releases[] to whatever --merge-with carried forward.
   if [ -n "${10}" ]; then
     src_args+=(--rc-from-dir "${10}")
   elif [ -n "$9" ] && [ -z "$6" ]; then
-    src_args+=(--rc-glob "$9")
+    read -r -a rc_globs <<<"$9"
+    for g in ${rc_globs[@]+"${rc_globs[@]}"}; do src_args+=(--rc-glob "$g"); done
   fi
   python3 "$1/collect.py" "${src_args[@]}" \
     --merge-with "$2/prior-data.json" \
@@ -291,6 +333,13 @@ if not json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"runs\"):
   "${EVAL_DASHBOARD_NIGHTLY_MAIN_B_PREFIX}" \
   "${EVAL_DASHBOARD_PR_GLOB_PREVIOUS}" \
   "${EVAL_DASHBOARD_GITLAB_PR_GLOB_PREVIOUS}" \
+  "${EVAL_DASHBOARD_LANE_PR_GLOBS}" \
+  "${EVAL_DASHBOARD_LANE_NIGHTLY_PREFIXES}" \
+  "${EVAL_DASHBOARD_NIGHTLY_MAIN_C_PREFIX}" \
+  "${EVAL_DASHBOARD_NIGHTLY_WRITERS_B_PREFIX}" \
+  "${EVAL_DASHBOARD_NIGHTLY_WRITERS_C_PREFIX}" \
+  "${EVAL_DASHBOARD_NIGHTLY_MAIN_D_PREFIX}" \
+  "${EVAL_DASHBOARD_NIGHTLY_MAIN_E_PREFIX}" \
   >>"${REFRESH_LOG}" 2>&1 || rc=$?
 
 # The full stage log always goes to stdout too: on a periodic, the build log

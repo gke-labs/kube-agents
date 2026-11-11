@@ -1,0 +1,103 @@
+# The health signal this case grades is a REPOSITORY DECLARATION rather than
+# cluster posture: the stockout prevention SOP's declared-intent step (§4a)
+# reads the linked repositories before it reports a posture, and a node pool
+# kept in one zone on purpose, declared in the GitOps repo's knowledge/
+# directory, is not a finding — it is listed under the ledger's Declared
+# intent section with the file's path. The case runs the scheduled audit
+# itself and grades its ledger, because that is where the step lives: the
+# audit's `finish` on an agent without the step files the posture as a
+# finding.
+#
+# Two things outside this file make it gradable, both planted per pool
+# project:
+#   1. The fixture. declared-zonal-pool on seeded-a (role
+#      declared-single-zone-pool, bench/tf/fleet/fixtures.json): a
+#      single-zone autoscaling pool held at zero nodes behind a NoSchedule
+#      taint, so it is 3.9's zone-locked posture and never its at-ceiling arm.
+#      A second single-zone pool, because pinned-inference-pool's backlog and
+#      1/1 ceiling are the defect stockout-pinned-pool grades.
+#   2. The declaration. knowledge/notification-relay-no-pdb.md in each pool
+#      project's GitOps repo (gke-agentic/<project>-infra), whose `declares:`
+#      frontmatter carries {check: single-zone-nodepool, namespace: "",
+#      object: NodePool/declared-zonal-pool} beside the other streams' items;
+#      the harness reads the frontmatter, not the prose.
+#      scripts/provision_ci_pool_project.sh seeds it.
+#
+# Domain: capacity (stockout-prevention).
+# Journey: Declared-intent silence — a posture the audit would flag is
+# declared on purpose in the linked repository; the audit's ledger lists it
+# under Declared intent, naming the declaration, and not as a finding.
+#
+# Planted defect required: declared-zonal-pool on seeded-a (the fleet's
+# shipped state) plus the repository declaration above.
+# Isolation class: read-only.
+# Eligible tier: presubmit once admitted; nightly from registration.
+id: stockout-declared-intent-no-finding
+name: Capacity audit lists a declared single-zone pool under Declared intent, not as a finding
+owner: bradhoekstra
+prompt: >-
+  Run the fleet stockout prevention and capacity audit, following the
+  stockout-prevention SOP.
+expected_output: >-
+  The audit runs to its ledger. The declared-zonal-pool node pool on seeded-a,
+  which is kept in one zone by design, is listed in the ledger's Declared
+  intent section with the repository and the knowledge/ path of the note that
+  declares it, and no single-zone-nodepool finding names it. The
+  pinned-inference-pool finding on the same cluster is still a finding.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: capacity
+
+# The seeded-fleet fixture this scenario rests on, named by ROLE rather than
+# by cluster (docs/designs/bench-fleet-catalog.md). The role probes nothing
+# in-cluster — a pool with no node has no object there — and its state is
+# read off `clusters describe` by hack/fleet-fixture-state.py.
+fixtures:
+  - declared-single-zone-pool
+
+verification_spec:
+  - name: the-posture-is-not-a-finding
+    role: objective
+    mode: assert
+    check:
+      # The finding id the audit composes for this posture ends in the object
+      # segment, which names the pool; the cluster segment before it varies
+      # per project (and the validator empties the namespace segment on this
+      # cluster-scoped check), so the id is matched on the object alone, the
+      # one segment the same on every project. Nothing else in this stream
+      # names the pool.
+      type: ledger_issue_contains
+      audit: stockout-prevention
+      scope: finding_ids
+      forbidden_phrases: ["nodepool-declared-zonal-pool"]
+  - name: the-undeclared-pool-is-still-a-finding
+    role: objective
+    mode: assert
+    check:
+      # The declaration names one pool. A run that lists no
+      # single-zone-nodepool finding at all declared more than the note did,
+      # or never ran the check; on the seeded fleet the finding left is
+      # seeded-a's pinned-inference-pool (role hpa-saturated).
+      type: ledger_issue_contains
+      audit: stockout-prevention
+      scope: finding_ids
+      required_phrases: ["single-zone-nodepool."]
+  - name: the-ledger-names-the-declaration
+    role: objective
+    mode: assert
+    check:
+      # The Declared intent table carries the object as
+      # `NodePool/declared-zonal-pool` and the `repo:path` pointer of the
+      # note. The object spelling appears only in a finding's detail or a
+      # Declared intent row, and the first check rules the finding out.
+      type: ledger_issue_contains
+      audit: stockout-prevention
+      required_phrases:
+        [
+          "## Declared intent",
+          "NodePool/declared-zonal-pool",
+          "notification-relay-no-pdb.md",
+        ]

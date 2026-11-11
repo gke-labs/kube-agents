@@ -434,13 +434,44 @@ class RenderTest(unittest.TestCase):
         self.assertIn(notifier.marker(STAGING["id"]), body)
         self.assertEqual(notifier.stamped_runs(body), {RUN_29["id"], RUN_30["id"]})
         self.assertEqual(notifier.stamped_stage(body), E2E_STAGE)
-        for expected in (E2E_STAGE, "Execute Blocking E2E Gate", "rc_1_abc", "a" * 40, "FAILED tests/e2e/x.py::test_y", RUN_30["html_url"], "[#29]", "[#30]", "2026-10-21 02:36 UTC"):
+        for expected in (E2E_STAGE, "Execute Blocking E2E Gate", "rc_1_abc", "a" * 40, notifier.FIRST_FAILURE_PUBLIC, RUN_30["html_url"], "[#29]", "[#30]", "2026-10-21 02:36 UTC"):
             self.assertIn(expected, body)
+        self.assertNotIn("FAILED tests/e2e/x.py::test_y", body, "the issue is public: the log line goes to Chat only")
 
     def test_log_text_cannot_break_the_code_span_or_the_table_cell(self):
-        text = notifier.failure_text({"failure": "FAILED t.py::test_x - assert 'a | b' == `c`"})
-        self.assertEqual(text, "`FAILED t.py::test_x - assert 'a \\| b' == 'c'`")
-        self.assertIn("step 'a \\| b'", notifier.failure_text({"step": "a | b"}).replace("`", "'"))
+        text = notifier.failure_text({"step": "a | `b`", "failure": "FAILED t.py::test_x - assert 'a | b' == `c`"})
+        self.assertEqual(text, f"step `a \\| 'b'` failed; {notifier.FIRST_FAILURE_PUBLIC}")
+
+    def test_the_issue_never_quotes_the_first_failure_line_and_chat_keeps_it(self):
+        """The issue is public; whatever the failing step printed (a count, a
+        verdict, a check, a score, a model, or an ordinary assertion), the
+        first-failure row and the still-failing comment name the step and
+        point at the log. Chat is internal and carries the line."""
+        lines = (
+            "##[error]rca-remediation-pr: 1/3 repetitions passed",
+            "##[error]judge gemini-3.1-pro-preview returned no verdict",
+            "ERROR: MODEL_PROVIDER=vertex_ai is not reachable",
+            "##[error]qwen3-32b on vllm did not answer",
+            "FAILED tests/e2e/test_stockout_investigation.py::test_stockout_ingress_alert_smoke - AssertionError: verify.sh failed with exit code 1",
+            "##[error]GEMINI_API_KEY missing",
+        )
+        for line in lines:
+            with self.subTest(line=line):
+                details = {"run": RUN_30, "stage": E2E_STAGE, "stage_url": None, "step": "Await", "failure": line, "candidate": {"tag": "rc_1_abc", "sha": "a" * 40}}
+                body = notifier.render_body(STAGING["name"], STAGING["id"], details, [RUN_30])
+                self.assertIn(f"| First failure | step `Await` failed; {notifier.FIRST_FAILURE_PUBLIC} |", body)
+                self.assertNotIn(line, body)
+                comment = notifier.render_still_failing(details)
+                self.assertIn(f"First failure: step `Await` failed; {notifier.FIRST_FAILURE_PUBLIC}", comment)
+                self.assertNotIn(line, comment)
+                for expected in (E2E_STAGE, "rc_1_abc", "a" * 40, RUN_30["html_url"]):
+                    self.assertIn(expected, body)
+                chat = notifier.render_chat_broken(STAGING["name"], details, 4001)
+                self.assertIn(notifier.chat_plain(line), chat)
+        no_step = {"run": RUN_30, "stage": E2E_STAGE, "stage_url": None, "step": None, "failure": lines[0], "candidate": {}}
+        body = notifier.render_body(STAGING["name"], STAGING["id"], no_step, [RUN_30])
+        self.assertIn(f"| First failure | {notifier.FIRST_FAILURE_PUBLIC} |", body)
+        self.assertNotIn(lines[0], body)
 
     def test_an_unknown_candidate_and_stage_are_said_not_omitted(self):
         details = {"run": RUN_30, "stage": None, "stage_url": None, "step": None, "failure": None, "candidate": {}}
@@ -486,7 +517,9 @@ class ReconcileTest(unittest.TestCase):
         self.assertEqual(notifier.stamped_runs(payload["body"]), {RUN_29["id"], RUN_30["id"]})
         self.assertEqual(notifier.stamped_stage(payload["body"]), E2E_STAGE)
         self.assertIn("rc_2610210024_8dc552a_validated", payload["body"])
-        self.assertIn("test_stockout_ingress_alert_smoke", payload["body"])
+        self.assertNotIn("test_stockout_ingress_alert_smoke", payload["body"], "the issue is public: the log line goes to Chat only")
+        self.assertIn(notifier.FIRST_FAILURE_PUBLIC, payload["body"])
+        self.assertIn("test_stockout_ingress_alert_smoke", chat.posted[0])
         self.assertEqual(len(github.writes), 2)
         self.assertEqual(len(chat.posted), 1)
         self.assertIn("Tracking #4001", chat.posted[0])
@@ -928,12 +961,31 @@ class ReconcileTest(unittest.TestCase):
 # replacing the last two digits with the run number.
 STEP5_BUILD = "1985733102944374784"
 SPYGLASS = "https://oss.gprow.dev/view/gs/kube-agents-prow/logs/post-kube-agents-eval-rc/"
+# The poller's link once the lane logs to the private bucket: the Console's
+# bucket browser (staging-red-step5-console.log is the same night in that form).
+CONSOLE = "https://console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/"
 SHA_31 = "e1ab9e5" + "1" * 33
 SHA_32 = "0cc8ee5" + "2" * 33
 SHA_33 = "3a8ba90" + "3" * 33
 STALL_TITLE_2 = "🔴 release chain stalled: the RC eval has returned RED 2 nights in a row"
 STALL_TITLE_3 = "🔴 release chain stalled: the RC eval has returned RED 3 nights in a row"
-STALL_FOOTER = "The failing cases are in each eval build's verdict; this issue names the nights, not the cases."
+STALL_FOOTER = "A case's owner is its `owner:` in `bench/tasks/<case>/task.yaml`, else its domain's owner in `docs/designs/domains.yaml`. The release pipeline owner is listed in `docs/ownership.md`."
+# The four recorded RED nights of 2026-11-01 to 11-04 (gke-labs/kube-agents#4761),
+# as bench-gate's roll-up listed their blocking case, and the owners the
+# checkout resolved them to on 2026-11-05. The tests patch the owner lookup
+# with this map so a later change of hands in domains.yaml does not move them.
+CASE_1101 = [{"case": "consistency-drift-outlier", "rung": 4, "rung_name": "COLLAPSE"}]
+CASE_1102 = [{"case": "pdb-remediation-pr", "rung": 1, "rung_name": "FORBIDDEN_ACTION"}]
+CASE_1104 = [{"case": "compliance-rbac-overgrant", "rung": 4, "rung_name": "COLLAPSE"}]
+OWNERS = {"consistency-drift-outlier": "lapis2002", "pdb-remediation-pr": "Fuxiao-Gao", "compliance-rbac-overgrant": "toshiowang"}
+CELL_1101 = "`consistency-drift-outlier` (rung `4 COLLAPSE`, @lapis2002)"
+CELL_1102 = "`pdb-remediation-pr` (rung `1 FORBIDDEN_ACTION`, @Fuxiao-Gao)"
+CELL_1104 = "`compliance-rbac-overgrant` (rung `4 COLLAPSE`, @toshiowang)"
+CASES_UNAVAILABLE = "(cases unavailable)"
+
+
+def stall_chat(title, cases, number=4001):
+    return f"{title}. Red cases: {notifier.chat_plain(cases)}. Tracking https://github.com/{REPO}/issues/{number}"
 E2E_SHORT = "Step 3 - Run Nightly E2E Matrix / Run E2E (rc)"
 STAGING_TAG_STAGE = "Step 6 - Create Staging Tag"
 
@@ -946,12 +998,14 @@ def night_run_id(number):
     return 41000000000 + number
 
 
-def night(number, day, sha, eval_log=True, run_conclusion="failure", **conclusions):
+def night(number, day, sha, eval_log=True, run_conclusion="failure", red_cases=None, **conclusions):
     """`(run, jobs, logs)` for one promotion night: by default a settled RED
     (step 5 failed, step 5b skipped, the rollback leg failed as it does on
     green nights), its step-1 log naming `sha`, its step-5 log carrying the
-    poller's verdict line. Job ids are the run's own, so two nights never
-    share a log."""
+    poller's verdict line and its red-cases line (the recorded 11-04 one;
+    `red_cases` replaces it with the poller's line for another case list, a
+    dict for the whole object, or False for no line). Job ids are the run's
+    own, so two nights never share a log."""
     run_id = night_run_id(number)
     run = dict(run_like(number, run_id, conclusion=run_conclusion), created_at=f"2026-11-{day:02d}T02:36:58Z")
     jobs = jobs_with(STAGING_26_JOBS, **(conclusions or {EVAL_STAGE: "failure"}))
@@ -960,7 +1014,15 @@ def night(number, day, sha, eval_log=True, run_conclusion="failure", **conclusio
     by_name = {job["name"]: job["id"] for job in jobs["jobs"]}
     logs = {by_name["Step 1 - Resolve Promotion Candidate"]: f"2026-11-{day:02d}T02:37:11.0000000Z Commit SHA:         {sha}\n"}
     if eval_log:
-        logs[by_name[EVAL_STAGE]] = fixture("staging-red-step5.log").replace(STEP5_BUILD, build_of(number))
+        text = fixture("staging-red-step5.log").replace(STEP5_BUILD, build_of(number))
+        if red_cases is not None:
+            recorded = next(line for line in text.splitlines() if " red_cases=" in line)
+            if red_cases is False:
+                text = text.replace(recorded + "\n", "")
+            else:
+                cases = red_cases if isinstance(red_cases, dict) else {"cases": red_cases, "partial": False}
+                text = text.replace(recorded, recorded[: recorded.index("red_cases=")] + poller.red_cases_line(cases))
+        logs[by_name[EVAL_STAGE]] = text
     return run, jobs, logs
 
 
@@ -996,6 +1058,11 @@ class StalledChainTest(unittest.TestCase):
     one issue; each later RED night adds a row; the next pass of the gate
     closes it."""
 
+    def setUp(self):
+        patcher = mock.patch.object(notifier, "effective_owner_of_case", side_effect=OWNERS.get)
+        self.owner_lookup = patcher.start()
+        self.addCleanup(patcher.stop)
+
     def _opened(self, chat=None):
         github = stalled_github(night(31, 1, SHA_31), night(32, 2, SHA_32))
         outcome, err = reconcile(github, chat or FakeChat())
@@ -1027,12 +1094,24 @@ class StalledChainTest(unittest.TestCase):
         self.assertEqual(
             rows_of(body),
             [
-                f"| 2026-11-02 | [#32](https://github.com/{REPO}/actions/runs/{night_run_id(32)}) | [`0cc8ee5`](https://github.com/{REPO}/commit/{SHA_32}) | [{build_of(32)}]({SPYGLASS}{build_of(32)}) |",
-                f"| 2026-11-01 | [#31](https://github.com/{REPO}/actions/runs/{night_run_id(31)}) | [`e1ab9e5`](https://github.com/{REPO}/commit/{SHA_31}) | [{build_of(31)}]({SPYGLASS}{build_of(31)}) |",
+                f"| 2026-11-02 | [#32](https://github.com/{REPO}/actions/runs/{night_run_id(32)}) | [`0cc8ee5`](https://github.com/{REPO}/commit/{SHA_32}) | [{build_of(32)}]({SPYGLASS}{build_of(32)}) | {CELL_1104} |",
+                f"| 2026-11-01 | [#31](https://github.com/{REPO}/actions/runs/{night_run_id(31)}) | [`e1ab9e5`](https://github.com/{REPO}/commit/{SHA_31}) | [{build_of(31)}]({SPYGLASS}{build_of(31)}) | {CELL_1104} |",
             ],
         )
+        self.assertIn("| Night (UTC) | Promotion run | Candidate | Eval build | Red cases (rung, owner) |", body)
         self.assertTrue(body.endswith(STALL_FOOTER), body)
-        self.assertEqual(chat.posted, [f"{STALL_TITLE_2} — https://github.com/{REPO}/issues/4001"])
+        self.assertEqual(chat.posted, [stall_chat(STALL_TITLE_2, CELL_1104)])
+
+    def test_the_stall_body_quotes_no_log_line(self):
+        """Documents the design rather than a path: the stall rows carry the
+        build id, its link and the poller's own case vocabulary, never a log
+        line, so there is no first-failure cell to keep out of it."""
+        body = self._opened().writes[1][2]["body"]
+        self.assertNotIn(notifier.FIRST_FAILURE_PUBLIC, body)
+        self.assertEqual(len(rows_of(body)), 2)
+        for row in rows_of(body):
+            self.assertTrue(row.endswith(f"| {CELL_1104} |"), row)
+            self.assertIn(SPYGLASS, row)
 
     def test_a_third_red_verdict_night_comments_adds_a_row_and_rewrites_the_title(self):
         github = stalled_github(night(31, 1, SHA_31), night(32, 2, SHA_32), night(33, 3, SHA_33), open_stall=[self._open_issue()])
@@ -1044,7 +1123,7 @@ class StalledChainTest(unittest.TestCase):
         self.assertEqual(len(comment.splitlines()), 1)
         self.assertTrue(comment.startswith("RED again: "), comment)
         self.assertTrue(comment.endswith("The RC eval has now returned RED 3 nights in a row."), comment)
-        self.assertIn(f"[#33](https://github.com/{REPO}/actions/runs/{night_run_id(33)})", comment)
+        self.assertIn(f"[#33](https://github.com/{REPO}/actions/runs/{night_run_id(33)}): {CELL_1104}", comment)
         patch = github.writes[1][2]
         self.assertEqual(patch["title"], STALL_TITLE_3)
         self.assertIn(f"<!-- release-stalled runs={night_run_id(33)}:1,{night_run_id(32)}:1,{night_run_id(31)}:1 -->", patch["body"])
@@ -1073,7 +1152,7 @@ class StalledChainTest(unittest.TestCase):
         self.assertEqual(payload["title"], STALL_TITLE_2)
         self.assertIn(f"<!-- release-stalled runs={night_run_id(33)}:1,{night_run_id(32)}:1,{night_run_id(31)}:1 -->", payload["body"])
         self.assertEqual([row[:12] for row in rows_of(payload["body"])], ["| 2026-11-02", "| 2026-11-01", "| 2026-11-01"])
-        self.assertEqual(chat.posted, [f"{STALL_TITLE_2} — https://github.com/{REPO}/issues/4001"])
+        self.assertEqual(chat.posted, [stall_chat(STALL_TITLE_2, CELL_1104)])
 
     def test_a_second_red_run_on_a_counted_night_adds_its_row_without_a_comment_or_a_new_count(self):
         github = stalled_github(night(31, 1, SHA_31), night(32, 2, SHA_32), night(33, 2, SHA_33), open_stall=[self._open_issue()])
@@ -1180,7 +1259,211 @@ class StalledChainTest(unittest.TestCase):
         rows = rows_of(github.writes[1][2]["body"])
         self.assertEqual(len(rows), 2)
         for row in rows:
-            self.assertTrue(row.endswith("| (eval link unavailable) |"), row)
+            self.assertTrue(row.endswith(f"| (eval link unavailable) | {CASES_UNAVAILABLE} |"), row)
+
+    def test_the_four_recorded_red_nights_name_each_nights_case_rung_and_owner(self):
+        """The 11-01 to 11-04 stall of gke-labs/kube-agents#4761, as the
+        roll-ups recorded it: one blocking case a night, three owners."""
+        github = stalled_github(
+            night(44, 1, SHA_31, red_cases=CASE_1101),
+            night(45, 2, SHA_32, red_cases=CASE_1102),
+            night(46, 3, SHA_33, red_cases=CASE_1101),
+            night(47, 4, SHA_33, red_cases=CASE_1104),
+        )
+        chat = FakeChat()
+        self.assertEqual(reconcile(github, chat)[0], "stall-opened")
+        payload = github.writes[1][2]
+        self.assertEqual(payload["title"], "🔴 release chain stalled: the RC eval has returned RED 4 nights in a row")
+        self.assertEqual([row.rsplit("| ", 1)[1] for row in rows_of(payload["body"])], [f"{CELL_1104} |", f"{CELL_1101} |", f"{CELL_1102} |", f"{CELL_1101} |"])
+        self.assertNotIn("assignees", payload)
+        self.assertEqual(chat.posted, [stall_chat("🔴 release chain stalled: the RC eval has returned RED 4 nights in a row", CELL_1104)])
+
+    def test_a_green_night_after_the_four_recorded_red_nights_closes_the_issue(self):
+        """Run #48 of 2026-11-05: the eval passed, the stall is over."""
+        opened = stalled_github(night(44, 1, SHA_31, red_cases=CASE_1101), night(45, 2, SHA_32, red_cases=CASE_1102), night(46, 3, SHA_33, red_cases=CASE_1101), night(47, 4, SHA_33, red_cases=CASE_1104))
+        self.assertEqual(reconcile(opened)[0], "stall-opened")
+        open_issue = dict(issue(4001, opened.writes[1][2]["body"]), title=opened.writes[1][2]["title"])
+        green = night(48, 5, SHA_33, eval_log=False, run_conclusion="success", **{ROLLBACK_LEG: "failure"})
+        github = stalled_github(night(47, 4, SHA_33, red_cases=CASE_1104), green, open_stall=[open_issue])
+        chat = FakeChat()
+        self.assertEqual(reconcile(github, chat)[0], "stall-closed")
+        self.assertEqual(github.writes[1][2], {"state": "closed"})
+        self.assertEqual(chat.posted, [notifier.CHAT_MOVING.format(run_number=48, url=f"https://github.com/{REPO}/issues/4001")])
+
+    def test_a_red_night_whose_step_5_log_has_no_red_cases_line_reads_cases_unavailable(self):
+        """A run before the poller printed the line, or a log cut short."""
+        github = stalled_github(night(31, 1, SHA_31, red_cases=False), night(32, 2, SHA_32))
+        chat = FakeChat()
+        self.assertEqual(reconcile(github, chat)[0], "stall-opened")
+        rows = rows_of(github.writes[1][2]["body"])
+        self.assertTrue(rows[0].endswith(f"| {CELL_1104} |"), rows[0])
+        self.assertTrue(rows[1].endswith(f"| {CASES_UNAVAILABLE} |"), rows[1])
+        self.assertTrue(rows[1].count("|") == rows[0].count("|"))
+
+    def test_a_red_cases_line_that_does_not_parse_reads_cases_unavailable_with_a_warning(self):
+        github = stalled_github(night(31, 1, SHA_31), night(32, 2, SHA_32))
+        github.logs[eval_job_id(32)] = github.logs[eval_job_id(32)].replace('red_cases={"cases"', 'red_cases={"cases"[')
+        outcome, err = reconcile(github)
+        self.assertEqual(outcome, "stall-opened")
+        rows = rows_of(github.writes[1][2]["body"])
+        self.assertTrue(rows[0].endswith(f"| {CASES_UNAVAILABLE} |"), rows[0])
+        self.assertTrue(rows[1].endswith(f"| {CELL_1104} |"), rows[1])
+        self.assertIn("red-cases line is not JSON", err)
+
+    def test_a_red_cases_line_of_the_wrong_shape_reads_cases_unavailable_with_a_warning(self):
+        github = stalled_github(night(31, 1, SHA_31), night(32, 2, SHA_32, red_cases={"cases": "none", "partial": False}))
+        outcome, err = reconcile(github)
+        self.assertEqual(outcome, "stall-opened")
+        self.assertTrue(rows_of(github.writes[1][2]["body"])[0].endswith(f"| {CASES_UNAVAILABLE} |"))
+        self.assertIn("has no 'cases' list", err)
+
+    def test_a_case_the_checkout_cannot_resolve_reads_no_owner(self):
+        unknown = [{"case": "a-case-renamed-since", "domain": "consistency", "rung": 4, "rung_name": "COLLAPSE"}]
+        github = stalled_github(night(31, 1, SHA_31), night(32, 2, SHA_32, red_cases=unknown))
+        self.assertEqual(reconcile(github)[0], "stall-opened")
+        rows = rows_of(github.writes[1][2]["body"])
+        self.assertTrue(rows[0].endswith("| `a-case-renamed-since` (rung `4 COLLAPSE`, (no owner)) |"), rows[0])
+
+    def test_an_owner_lookup_that_raises_is_a_warning_and_the_issue_still_files(self):
+        self.owner_lookup.side_effect = OSError("bench tree unreadable")
+        github = stalled_github(night(31, 1, SHA_31), night(32, 2, SHA_32))
+        chat = FakeChat()
+        with mock.patch("sys.stderr", new=io.StringIO()):
+            outcome, err = reconcile(github, chat)
+        self.assertEqual(outcome, "stall-opened", err)
+        self.assertEqual(len(github.writes), 2)
+        rows = rows_of(github.writes[1][2]["body"])
+        self.assertTrue(all(row.endswith("| `compliance-rbac-overgrant` (rung `4 COLLAPSE`, (no owner)) |") for row in rows), rows)
+        self.assertIn("owner lookup for case 'compliance-rbac-overgrant' failed", err)
+
+    def test_a_partial_roll_up_and_one_with_no_blocking_case_say_so(self):
+        partial = {"cases": CASE_1101, "partial": True}
+        empty = {"cases": [], "partial": False}
+        github = stalled_github(night(31, 1, SHA_31, red_cases=empty), night(32, 2, SHA_32, red_cases=partial))
+        self.assertEqual(reconcile(github)[0], "stall-opened")
+        rows = rows_of(github.writes[1][2]["body"])
+        self.assertTrue(rows[0].endswith(f"| {CELL_1101} (partial: the eval stopped before grading every case) |"), rows[0])
+        self.assertTrue(rows[1].endswith("| (no blocking case in the roll-up) |"), rows[1])
+
+    def test_two_red_cases_on_one_night_are_both_named(self):
+        github = stalled_github(night(31, 1, SHA_31), night(32, 2, SHA_32, red_cases=CASE_1101 + CASE_1102))
+        chat = FakeChat()
+        self.assertEqual(reconcile(github, chat)[0], "stall-opened")
+        self.assertTrue(rows_of(github.writes[1][2]["body"])[0].endswith(f"| {CELL_1101}; {CELL_1102} |"))
+        self.assertEqual(chat.posted, [stall_chat(STALL_TITLE_2, f"{CELL_1101}; {CELL_1102}")])
+
+    def test_rows_from_before_the_cases_column_are_padded_on_a_rewrite(self):
+        """An issue open when this column shipped keeps its old rows under
+        the old four-column header and rule; the next rewrite finds them
+        there, counts their nights, and pads them so the table stays
+        rectangular."""
+        new_body = self._opened().writes[1][2]["body"]
+        short = [row.rsplit(" | ", 1)[0] + " |" for row in rows_of(new_body)]
+        old_body = "\n".join(
+            [
+                *new_body.splitlines()[:2],
+                "",
+                "The promotion pipeline has cut no staging tag because the release-candidate eval verdict was RED on each of these nights.",
+                "",
+                "| Night (UTC) | Promotion run | Candidate | Eval build |",
+                "| --- | --- | --- | --- |",
+                *short,
+                "",
+                "The failing cases are in each eval build's verdict; this issue names the nights, not the cases.",
+            ]
+        )
+        self.assertEqual(rows_of(old_body), short)
+        self.assertTrue(all(row.count("|") == 5 for row in short))
+        github = stalled_github(night(31, 1, SHA_31), night(32, 2, SHA_32), night(33, 3, SHA_33), open_stall=[dict(issue(4001, old_body), title=STALL_TITLE_2)])
+        chat = FakeChat()
+        self.assertEqual(reconcile(github, chat)[0], "stall-updated")
+        comment, patch = github.writes[0][2]["body"], github.writes[1][2]
+        self.assertTrue(comment.endswith("The RC eval has now returned RED 3 nights in a row."), comment)
+        self.assertEqual(patch["title"], STALL_TITLE_3)
+        rows = rows_of(patch["body"])
+        self.assertEqual([row.count("|") for row in rows], [6, 6, 6])
+        self.assertTrue(rows[0].endswith(f"| {CELL_1104} |"), rows[0])
+        self.assertEqual(rows[1:], [f"{row} {CASES_UNAVAILABLE} |" for row in short])
+        self.assertIn("| --- | --- | --- | --- | --- |", patch["body"])
+        self.assertNotIn("\n| --- | --- | --- | --- |\n", patch["body"])
+
+    def test_an_entry_outside_bench_gates_vocabulary_reads_the_whole_night_as_unavailable_with_a_warning(self):
+        """All three fields come from the step-5 log through the poller's
+        JSON. Nothing outside a case id, an integer rung and a rung name is
+        rendered: a line break of any kind (the reader splits the body with
+        `splitlines()`), a pipe, a backtick, a mention, a link or a nameless
+        entry would otherwise reach the table or Markdown. One bad entry
+        makes the night unavailable, never a partial or a prettied row."""
+        good = {"case": "consistency-drift-outlier", "rung": 4, "rung_name": "COLLAPSE"}
+        bad_entries = [
+            dict(good, rung_name="COLLAPSE\u2028x"),
+            dict(good, rung_name="COLLAPSE\x85x"),
+            dict(good, rung_name="COLLAPSE\x0cx"),
+            dict(good, rung_name="COLLAPSE\nx|y"),
+            dict(good, rung_name="@x"),
+            dict(good, rung_name="[x](https://example.invalid)"),
+            dict(good, case="bad|name`@x"),
+            dict(good, case="#4821"),
+            dict(good, rung="4\r\n5"),
+            dict(good, rung=True),
+            {"rung": 4, "rung_name": "COLLAPSE"},
+            {"case": None, "rung": 4, "rung_name": "COLLAPSE"},
+            "not a dict",
+        ]
+        for bad in bad_entries:
+            with self.subTest(bad=bad):
+                github = stalled_github(night(31, 1, SHA_31), night(32, 2, SHA_32, red_cases=[good, bad]))
+                outcome, err = reconcile(github)
+                self.assertEqual(outcome, "stall-opened", err)
+                body = github.writes[1][2]["body"]
+                rows = rows_of(body)
+                self.assertEqual(len(rows), 2)
+                self.assertTrue(rows[0].endswith(f"| {CASES_UNAVAILABLE} |"), rows[0])
+                self.assertEqual(notifier.stall_rows_in(body), rows)
+                self.assertIn("outside bench-gate's vocabulary", err)
+                for text in ("\u2028", "\x85", "\x0c", "@x", "example.invalid", "#4821", "`@"):
+                    self.assertNotIn(text, body)
+
+    def test_a_vocabulary_entry_renders_and_a_rewrite_keeps_every_row(self):
+        github = stalled_github(night(31, 1, SHA_31), night(32, 2, SHA_32, red_cases=CASE_1101), night(33, 3, SHA_33, red_cases=CASE_1102))
+        self.assertEqual(reconcile(github)[0], "stall-opened")
+        body = github.writes[1][2]["body"]
+        self.assertEqual([row.rsplit("| ", 1)[1] for row in rows_of(body)], [f"{CELL_1102} |", f"{CELL_1101} |", f"{CELL_1104} |"])
+        github = stalled_github(night(31, 1, SHA_31), night(32, 2, SHA_32, red_cases=CASE_1101), night(33, 3, SHA_33, red_cases=CASE_1102), night(34, 4, SHA_33), open_stall=[dict(issue(4001, body), title=STALL_TITLE_3)])
+        self.assertEqual(reconcile(github)[0], "stall-updated")
+        self.assertEqual(github.writes[1][2]["title"], "🔴 release chain stalled: the RC eval has returned RED 4 nights in a row")
+        self.assertEqual(len(rows_of(github.writes[1][2]["body"])), 4)
+
+    def test_the_vocabulary_is_the_pollers_and_its_case_id_rule_is_case_owners(self):
+        """One shape check, the poller's, on both sides of the log line; and
+        its case-id pattern is the one `scripts/case_owner.py` requires of a
+        task directory, so a case the notifier renders is one it can look up."""
+        import case_owner
+
+        self.assertIs(notifier.is_red_case, poller.is_red_case)
+        self.assertEqual(poller.CASE_ID_RE.pattern, case_owner._CASE_NAME.pattern)
+        self.assertTrue(notifier.is_red_case(CASE_1104[0]))
+        self.assertTrue(notifier.is_red_case({"case": "a.b_c-1", "rung": 1, "rung_name": "FORBIDDEN_ACTION", "domain": "d"}))
+        for bad in ({"case": "a", "rung": "4", "rung_name": "COLLAPSE"}, {"case": "a", "rung": 4, "rung_name": "collapse"}, {"case": "", "rung": 4, "rung_name": "COLLAPSE"}, {"case": ".a", "rung": 4, "rung_name": "COLLAPSE"}, {"case": "a", "rung": 4.0, "rung_name": "COLLAPSE"}, []):
+            self.assertFalse(notifier.is_red_case(bad), bad)
+
+    def test_the_poller_red_cases_line_format_is_what_the_notifier_parses(self):
+        cases = {"cases": CASE_1104, "partial": False}
+        line = poller.red_cases_line(cases)
+        self.assertEqual(notifier.extract_red_cases(f"2026-11-04T07:48:03.1Z {line}\n"), cases)
+        with mock.patch("sys.stdout", new=io.StringIO()), mock.patch("sys.stderr", new=io.StringIO()):
+            self.assertIsNone(notifier.extract_red_cases("2026-11-04T07:48:03.1Z red_cases=not json\n"))
+        self.assertIsNone(notifier.extract_red_cases("2026-11-04T07:48:03.1Z verdict=red settled=true build_id=1 u\n"))
+
+    def test_the_owner_lookup_is_the_case_owner_resolver(self):
+        """Wiring: unpatched, the notifier asks `scripts/case_owner.py`, the
+        same resolver the nightly bug filer uses."""
+        import case_owner
+
+        self.owner_lookup.side_effect = case_owner.effective_owner_of_case
+        self.assertEqual(notifier.owner_of_case("pdb-remediation-pr"), case_owner.effective_owner_of_case("pdb-remediation-pr"))
+        self.assertIsNotNone(notifier.owner_of_case("pdb-remediation-pr"))
+        self.assertIsNone(notifier.owner_of_case("no-such-case-in-the-tree"))
 
     def test_a_dry_run_of_a_stall_writes_and_posts_nothing(self):
         github = stalled_github(night(31, 1, SHA_31), night(32, 2, SHA_32))
@@ -1225,6 +1508,17 @@ class StalledChainTest(unittest.TestCase):
         self.assertEqual(github.writes, [])
         self.assertEqual(chat.posted, [])
         self.assertIn("closed #3999", err)
+
+    def test_a_console_link_in_the_verdict_line_is_read_and_linked_as_is(self):
+        """Once the lane logs to the private bucket the poller's line carries
+        the Console's bucket-browser URL; the notifier reads the link as one
+        token and links it verbatim, so the row opens the build a project
+        reader can see rather than a Spyglass page that denies everyone."""
+        text = fixture("staging-red-step5-console.log")
+        self.assertEqual(notifier.extract_red_verdict_build(text), (STEP5_BUILD, CONSOLE + STEP5_BUILD))
+        self.assertEqual(notifier.extract_red_cases(text), {"cases": CASE_1104, "partial": False})
+        row = notifier.stall_row(REPO, {"run": run_like(44, night_run_id(44)), "candidate": {"sha": SHA_31}, "build": (STEP5_BUILD, CONSOLE + STEP5_BUILD), "cases_cell": CELL_1104})
+        self.assertIn(f"[{STEP5_BUILD}]({CONSOLE}{STEP5_BUILD})", row)
 
     def test_the_poller_verdict_line_format_is_what_the_notifier_parses(self):
         line = poller.VERDICT_LINE_FORMAT.format(verdict=poller.VERDICT_RED, settled=poller.SETTLED_TRUE, build_id=build_of(40), url=SPYGLASS + build_of(40))

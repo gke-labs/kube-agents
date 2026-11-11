@@ -1583,7 +1583,7 @@ class ImageOwnedForceSyncTest(unittest.TestCase):
         lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
         start = next(i for i, line in enumerate(lines) if line.startswith("# 2a. "))
         end = next(i for i in range(start, len(lines)) if lines[i] == "fi")
-        names = ("onboarding/scan_in_progress.md", "onboarding/scan_completed.md")
+        names = ("onboarding/scan_in_progress.md", "onboarding/scan_completed.md", "onboarding/report_filed.md")
         with tempfile.TemporaryDirectory() as tmp:
             image = pathlib.Path(tmp) / "defaults"
             pvc = pathlib.Path(tmp) / "data"
@@ -1604,12 +1604,165 @@ class ImageOwnedForceSyncTest(unittest.TestCase):
             for name in names:
                 self.assertEqual((pvc / name).read_text(encoding="utf-8"), "image\n", name)
 
+    def test_every_plugin_the_image_ships_is_refreshed_from_a_newer_stale_pvc_copy(self):
+        # Step 2's cp -ru skips a destination that looks newer, so a rollback, or a roll to
+        # an image built earlier than the volume's files, kept the previous image's plugin
+        # code live beside the new image's scripts. Every plugin directory the image ships
+        # is force-synced; the pinned external plugin and the top-level files are not, and
+        # a plugin's own runtime state on the volume survives the copy.
+        shipped = sorted(
+            p.name
+            for p in (_REPO / "agents" / "chat" / "defaults" / "plugins").iterdir()
+            if p.is_dir() and not p.name.startswith((".", "_"))
+        )
+        self.assertIn("chat_metrics", shipped)
+        # The pinned list is the set of plugins the Dockerfile installs from outside this
+        # repository, read from its `hermes plugins install` lines rather than pinned here.
+        dockerfile = (_REPO / "deploy" / "docker" / "Dockerfile").read_text(encoding="utf-8")
+        installed = re.findall(r"hermes plugins install\s+(?:--\S+\s+\S+\s+)*(\S+)", dockerfile)
+        installed = sorted({name.rsplit("/", 1)[-1] for name in installed})
+        self.assertEqual(installed, ["hermes_otel"], "the Dockerfile's external plugins changed; update PINNED_EXTERNAL_PLUGINS")
+        pinned = re.fullmatch(r'readonly PINNED_EXTERNAL_PLUGINS="([^"]*)"', _extract_readonly("PINNED_EXTERNAL_PLUGINS")).group(1).split()
+        self.assertEqual(sorted(pinned), installed)
+        external = "hermes_otel"
+        with tempfile.TemporaryDirectory() as tmp:
+            image = pathlib.Path(tmp) / "defaults"
+            pvc = pathlib.Path(tmp) / "data"
+            future = time.time() + 3600
+            for name in shipped + [external]:
+                (image / "plugins" / name).mkdir(parents=True)
+                (image / "plugins" / name / "plugin.py").write_text("image\n", encoding="utf-8")
+                (pvc / "plugins" / name).mkdir(parents=True)
+                (pvc / "plugins" / name / "plugin.py").write_text("stale\n", encoding="utf-8")
+                (pvc / "plugins" / name / "live.db").write_text("state\n", encoding="utf-8")
+                os.utime(pvc / "plugins" / name / "plugin.py", (future, future))
+            (image / "plugins" / ".install-metadata.json").write_text("image\n", encoding="utf-8")
+            (pvc / "plugins" / ".install-metadata.json").write_text("volume\n", encoding="utf-8")
+            subprocess.run(
+                ["bash", "-c", _plugin_refresh_block(image)],
+                env={**os.environ, "TARGET_DIR": str(pvc)},
+                check=True,
+                timeout=30,
+            )
+            for name in shipped:
+                self.assertEqual((pvc / "plugins" / name / "plugin.py").read_text(encoding="utf-8"), "image\n", name)
+                self.assertEqual((pvc / "plugins" / name / "live.db").read_text(encoding="utf-8"), "state\n", name)
+            self.assertEqual((pvc / "plugins" / external / "plugin.py").read_text(encoding="utf-8"), "stale\n")
+            self.assertEqual((pvc / "plugins" / ".install-metadata.json").read_text(encoding="utf-8"), "volume\n")
+
+    def test_a_failed_plugin_refresh_in_step_2b_leaves_the_old_file_whole(self):
+        # Replicas share the volume, so a file is copied to a temporary name and renamed over
+        # its target: a plugin folder the copy cannot write into keeps its old module whole,
+        # no temporary file is left behind, and the next plugin is still refreshed.
+        with tempfile.TemporaryDirectory() as tmp:
+            image = pathlib.Path(tmp) / "defaults"
+            pvc = pathlib.Path(tmp) / "data"
+            for name in ("agent_roster", "chat_metrics"):
+                (image / "plugins" / name).mkdir(parents=True)
+                (image / "plugins" / name / "plugin.py").write_text("image\n", encoding="utf-8")
+                (pvc / "plugins" / name).mkdir(parents=True)
+                (pvc / "plugins" / name / "plugin.py").write_text("stale\n", encoding="utf-8")
+            if os.geteuid() == 0:
+                self.skipTest("root writes into a read-only directory")
+            (pvc / "plugins" / "agent_roster").chmod(0o555)
+            try:
+                proc = subprocess.run(
+                    ["bash", "-c", "set -e\n" + _plugin_refresh_block(image) + "\necho reached-the-next-step"],
+                    env={**os.environ, "TARGET_DIR": str(pvc)},
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                kept = (pvc / "plugins" / "agent_roster" / "plugin.py").read_text(encoding="utf-8")
+                leftovers = sorted(p.name for p in (pvc / "plugins" / "agent_roster").iterdir() if ".refresh." in p.name)
+                refreshed = (pvc / "plugins" / "chat_metrics" / "plugin.py").read_text(encoding="utf-8")
+            finally:
+                (pvc / "plugins" / "agent_roster").chmod(0o755)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("reached-the-next-step", proc.stdout)
+        self.assertIn("WARN: could not refresh", proc.stderr)
+        self.assertEqual(kept, "stale\n", "a failed copy did not leave the old module whole")
+        self.assertEqual(leftovers, [], "a failed copy left a temporary file behind")
+        self.assertEqual(refreshed, "image\n", "one failed plugin stopped the loop")
+
+    def test_a_failed_rename_in_step_2b_removes_its_temporary_file(self):
+        # The copy lands first and the rename fails: the temporary file is removed, the old
+        # module stays whole, and the start continues with a warning.
+        with tempfile.TemporaryDirectory() as tmp:
+            image = pathlib.Path(tmp) / "defaults"
+            pvc = pathlib.Path(tmp) / "data"
+            (image / "plugins" / "chat_metrics").mkdir(parents=True)
+            (image / "plugins" / "chat_metrics" / "plugin.py").write_text("image\n", encoding="utf-8")
+            (pvc / "plugins" / "chat_metrics").mkdir(parents=True)
+            (pvc / "plugins" / "chat_metrics" / "plugin.py").write_text("stale\n", encoding="utf-8")
+            shims = pathlib.Path(tmp) / "bin"
+            shims.mkdir()
+            (shims / "mv").write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            (shims / "mv").chmod(0o755)
+            proc = subprocess.run(
+                ["bash", "-c", "set -e\n" + _plugin_refresh_block(image) + "\necho reached-the-next-step"],
+                env={**os.environ, "TARGET_DIR": str(pvc), "PATH": f"{shims}:{os.environ['PATH']}"},
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            kept = (pvc / "plugins" / "chat_metrics" / "plugin.py").read_text(encoding="utf-8")
+            leftovers = sorted(p.name for p in (pvc / "plugins" / "chat_metrics").iterdir() if ".refresh." in p.name)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("reached-the-next-step", proc.stdout)
+        self.assertIn("WARN: could not refresh", proc.stderr)
+        self.assertEqual(kept, "stale\n")
+        self.assertEqual(leftovers, [], "a failed rename left its temporary file behind")
+
+    def test_a_symlinked_plugin_destination_is_left_alone(self):
+        # A symlink at the destination is not the image's copy to refresh: the loop
+        # skips it, and the next plugin is still refreshed.
+        with tempfile.TemporaryDirectory() as tmp:
+            image = pathlib.Path(tmp) / "defaults"
+            pvc = pathlib.Path(tmp) / "data"
+            elsewhere = pathlib.Path(tmp) / "mounted"
+            for name in ("agent_roster", "chat_metrics"):
+                (image / "plugins" / name).mkdir(parents=True)
+                (image / "plugins" / name / "plugin.py").write_text("image\n", encoding="utf-8")
+            (pvc / "plugins").mkdir(parents=True)
+            elsewhere.mkdir()
+            (elsewhere / "plugin.py").write_text("mounted\n", encoding="utf-8")
+            (pvc / "plugins" / "agent_roster").symlink_to(elsewhere)
+            (pvc / "plugins" / "chat_metrics").mkdir()
+            (pvc / "plugins" / "chat_metrics" / "plugin.py").write_text("stale\n", encoding="utf-8")
+            subprocess.run(
+                ["bash", "-c", "set -e\n" + _plugin_refresh_block(image)],
+                env={**os.environ, "TARGET_DIR": str(pvc)},
+                check=True,
+                timeout=30,
+            )
+            self.assertEqual((elsewhere / "plugin.py").read_text(encoding="utf-8"), "mounted\n")
+            self.assertTrue((pvc / "plugins" / "agent_roster").is_symlink())
+            self.assertEqual((pvc / "plugins" / "chat_metrics" / "plugin.py").read_text(encoding="utf-8"), "image\n")
+
+    def test_a_refreshed_plugin_file_keeps_the_images_mtime(self):
+        # The copy preserves the image file's mtime (cp -p), as the cluster loop's does, so a
+        # later start reads the refreshed file as the image's, not as one written on the volume.
+        with tempfile.TemporaryDirectory() as tmp:
+            image = pathlib.Path(tmp) / "defaults"
+            pvc = pathlib.Path(tmp) / "data"
+            (image / "plugins" / "chat_metrics").mkdir(parents=True)
+            (image / "plugins" / "chat_metrics" / "plugin.py").write_text("image\n", encoding="utf-8")
+            image_time = time.time() - 86400
+            os.utime(image / "plugins" / "chat_metrics" / "plugin.py", (image_time, image_time))
+            (pvc / "plugins" / "chat_metrics").mkdir(parents=True)
+            (pvc / "plugins" / "chat_metrics" / "plugin.py").write_text("stale\n", encoding="utf-8")
+            subprocess.run(
+                ["bash", "-c", _plugin_refresh_block(image)],
+                env={**os.environ, "TARGET_DIR": str(pvc)},
+                check=True,
+                timeout=30,
+            )
+            self.assertEqual(int((pvc / "plugins" / "chat_metrics" / "plugin.py").stat().st_mtime), int(image_time))
+
     def test_a_newer_stale_pvc_copy_of_the_onboarding_plugin_is_replaced(self):
         # The plugin's hooks and bootstrap_delivery.py (step 2b) must come from one image:
         # an old plugin beside the new script writes no greeting hold.
-        lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
-        start = next(i for i, line in enumerate(lines) if line.startswith("# 2b, continued: the onboarding plugin is image-owned"))
-        end = next(i for i in range(start, len(lines)) if lines[i] == "fi")
         name = "plugins/bootstrap_onboarding/plugin.py"
         with tempfile.TemporaryDirectory() as tmp:
             image = pathlib.Path(tmp) / "defaults"
@@ -1620,7 +1773,7 @@ class ImageOwnedForceSyncTest(unittest.TestCase):
             (pvc / name).write_text("stale\n", encoding="utf-8")
             future = time.time() + 3600
             os.utime(pvc / name, (future, future))
-            block = "\n".join(lines[start : end + 1]).replace("/opt/defaults", str(image))
+            block = _plugin_refresh_block(image)
             subprocess.run(
                 ["bash", "-c", block],
                 env={**os.environ, "TARGET_DIR": str(pvc)},
@@ -1632,9 +1785,6 @@ class ImageOwnedForceSyncTest(unittest.TestCase):
     def test_a_plugins_directory_the_entrypoint_cannot_write_does_not_end_the_start(self):
         # On a fresh volume the kubelet creates $TARGET_DIR/plugins as root when a plugin
         # is mounted beneath it; under `set -e` an unguarded mkdir there ends the container.
-        lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
-        start = next(i for i, line in enumerate(lines) if line.startswith("# 2b, continued: the onboarding plugin is image-owned"))
-        end = next(i for i in range(start, len(lines)) if lines[i] == "fi")
         name = "plugins/bootstrap_onboarding/plugin.py"
         with tempfile.TemporaryDirectory() as tmp:
             image = pathlib.Path(tmp) / "defaults"
@@ -1649,7 +1799,7 @@ class ImageOwnedForceSyncTest(unittest.TestCase):
             else:
                 plugins.chmod(0o555)
             try:
-                block = "set -e\n" + "\n".join(lines[start : end + 1]).replace("/opt/defaults", str(image)) + "\necho reached-the-next-step"
+                block = "set -e\n" + _plugin_refresh_block(image) + "\necho reached-the-next-step"
                 proc = subprocess.run(
                     ["bash", "-c", block],
                     env={**os.environ, "TARGET_DIR": str(pvc)},
@@ -1738,6 +1888,21 @@ def _extract_readonly(name):
         if line.startswith(f"readonly {name}="):
             return line
     raise AssertionError(f"readonly {name} not found in {_ENTRYPOINT}")
+
+
+# Step 2b's plugin refresh: the comment line that opens it, and the two constants it reads.
+_PLUGIN_REFRESH_MARKER = "# 2b, continued: every plugin the image ships is image-owned too"
+
+
+def _plugin_refresh_block(image):
+    """Return step 2b's plugin refresh as a script that reads the image tree at `image`."""
+    lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith(_PLUGIN_REFRESH_MARKER))
+    end = next(i for i in range(start, len(lines)) if lines[i] == "fi")
+    block = "\n".join(
+        [_extract_readonly("DEFAULTS_PLUGINS_DIR"), _extract_readonly("PINNED_EXTERNAL_PLUGINS")] + lines[start : end + 1]
+    )
+    return block.replace("/opt/defaults", str(image))
 
 
 # The helpers step 2.6's cluster loop calls. A test that runs the loop defines every one,
@@ -3380,6 +3545,95 @@ class JournalModeConversionStepTest(_JournalModeCase):
         self.assertEqual(text.count('SQLITE_JOURNAL_MIGRATE_SCRIPT="/opt/defaults/scripts/sqlite_journal_migrate.py"'), 1)
         self.assertIn(_JOURNAL_WAIT_OPENER, text)
         self.assertLess(text.index(_JOURNAL_WAIT_OPENER), text.index(_JOURNAL_STEP_OPENER))
+
+
+_RETENTION_SCRIPT = _REPO / "agents" / "platform" / "scripts" / "session_retention.py"
+_PIN_STEP_OPENER = 'if [ -f "$SESSION_RETENTION_SCRIPT" ] && [ -x "$INSTALL_DIR/.venv/bin/python3" ]; then'
+
+
+def _session_store(path, rows):
+    """A state.db with the columns of Hermes' schema the pinning reads; rows are (id, parent)."""
+    import sqlite3
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        "CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, pinned INTEGER NOT NULL DEFAULT 0);"
+        "CREATE TABLE state_meta (key TEXT PRIMARY KEY, value TEXT);"
+    )
+    conn.executemany("INSERT INTO sessions (id, parent_session_id) VALUES (?, ?)", rows)
+    conn.commit()
+    conn.close()
+    return path
+
+
+def _pinned(path):
+    import sqlite3
+
+    conn = sqlite3.connect(path)
+    try:
+        return {row[0] for row in conn.execute("SELECT id FROM sessions WHERE pinned = 1")}
+    finally:
+        conn.close()
+
+
+class SessionParentPinStepTest(_JournalModeCase):
+    """Step 1.8: session parents are pinned before the gateway's first prune.
+
+    Same staging as the conversion: the shipped block drives the shipped script through
+    a wrapper at the venv path the entrypoint hard-codes.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._BLOCK = _extract_shell_block(_PIN_STEP_OPENER)
+
+    def _run(self, script=None):
+        env = {**self.env(), "SESSION_RETENTION_SCRIPT": str(script or _RETENTION_SCRIPT)}
+        return subprocess.run(
+            ["sh", "-c", f"set -e\n{self._BLOCK}\necho REACHED-EXEC\n"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
+        )
+
+    def test_a_parent_with_a_child_is_pinned_in_every_store(self):
+        machine = _session_store(self.target / "state.db", [("root", None), ("tip", "root"), ("alone", None)])
+        profile = _session_store(
+            self.target / "profiles" / "platform" / "state.db", [("p-root", None), ("p-tip", "p-root")]
+        )
+        proc = self._run()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(self.invoked.exists())
+        self.assertEqual(_pinned(machine), {"root"})
+        self.assertEqual(_pinned(profile), {"p-root"})
+        self.assertIn("REACHED-EXEC", proc.stdout)
+
+    def test_a_store_it_cannot_pin_warns_and_start_up_continues(self):
+        broken = self.target / "profiles" / "broken" / "state.db"
+        broken.parent.mkdir(parents=True)
+        broken.write_text("not a database", encoding="utf-8")
+        proc = self._run()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("WARN: pinning session parents did not finish", proc.stderr)
+        self.assertIn("REACHED-EXEC", proc.stdout)
+
+    def test_a_missing_script_is_skipped_not_fatal(self):
+        proc = self._run(script=self.tmp / "absent.py")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(self.invoked.exists())
+        self.assertIn("REACHED-EXEC", proc.stdout)
+
+    def test_the_step_follows_the_conversion_and_precedes_the_default_sync(self):
+        """After the WAL conversion, which wants the stores unopened; before anything that opens them."""
+        text = _ENTRYPOINT.read_text(encoding="utf-8")
+        conversion = text.index(_JOURNAL_STEP_OPENER)
+        step = text.index(_PIN_STEP_OPENER)
+        sync = text.index("# 2. Sync default agent files")
+        self.assertLess(conversion, step)
+        self.assertLess(step, sync)
+        self.assertEqual(text.count(_PIN_STEP_OPENER), 1)
 
 
 class JournalModeWaitTest(_JournalModeCase):

@@ -2,7 +2,7 @@
 """Wire tools/cron_run_scope.py into the Hermes source tree.
 
 Run by ``deploy/docker/Dockerfile`` against ``/opt/hermes``. Two AST locators
-and sixteen anchored string replacements across four files is past the point
+and twenty anchored string replacements across four files is past the point
 where an inline ``python3 -c`` stays readable, so the edits live here — but the
 guarantee is the same as the other patches in the Dockerfile: every anchor must
 be found the number of times expected, every edited file must still parse, and
@@ -101,6 +101,24 @@ SCHEDULER_RUN_JOB_PATCHED = (
     "        except BaseException:\n"
 )
 
+# The tick's own path. ``_process_due_job`` is what the scheduler's tick
+# submits for a due job (the run ledger records it ``source='builtin'``); the
+# cronjob tool's direct run calls ``run_one_job`` without passing through it,
+# and so does the scoped ``run_job`` above, which both paths share. The run's
+# origin is therefore set here and nowhere else: ``audit`` or ``scheduled`` for
+# a job that matches the image's template, else the job's recorded origin.
+# See tools/cron_run_scope.py ``cron_tick_origin_scope`` and
+# tools/cron_job_template.py.
+SCHEDULER_TICK_RUN = "    return run_one_job(claimed_job, adapters=adapters, loop=loop, verbose=verbose)\n"
+
+SCHEDULER_TICK_RUN_PATCHED = (
+    "    # kube-agents patch: a tick-started run carries its origin.\n"
+    "    # See tools/cron_run_scope.py and tools/cron_job_template.py.\n"
+    "    from tools.cron_run_scope import cron_tick_origin_scope\n"
+    "    with cron_tick_origin_scope(claimed_job):\n"
+    "        return run_one_job(claimed_job, adapters=adapters, loop=loop, verbose=verbose)\n"
+)
+
 # save_job_output moved out of the body into _save_compose_deliver, which does
 # not see the out-param. The saved path travels back on the _RunDelivery record
 # that function already fills in for the bookkeeping tail, so the record gains a
@@ -157,7 +175,7 @@ CRONJOB_IMPORT_ANCHOR = "def _notify_provider_jobs_changed_safe() -> None:"
 
 CRONJOB_IMPORT_PATCHED = (
     "# kube-agents patch: see tools/cron_run_scope.py\n"
-    "from tools.cron_run_scope import clip_cron_response, cron_run_scope\n"
+    "from tools.cron_run_scope import clip_cron_response, cron_run_scope, with_direct_origin\n"
     "\n"
     "\n" + CRONJOB_IMPORT_ANCHOR
 )
@@ -234,6 +252,22 @@ CRONJOB_RESULT_PATCHED = (
     '    return _dumps({"success": True, "job": result})\n'
 )
 
+# A direct run resolves as the session that asked for it. Inside the run,
+# Hermes' cron scope blanks the session platform and chat id and the cron
+# agent's own ``cron_<job>_<ts>`` id has no origin record, so the asking turn's
+# origin is resolved here, on the asking turn's thread before the run starts,
+# and bound for the run's context (``cron_direct_origin_scope``). A decorator on
+# the action, so both the background dispatch (its pool copies the context at
+# submit) and the inline fallback run inside it. The tick path does not pass
+# through this action. See tools/cron_run_scope.py.
+CRONJOB_ACTION_RUN_ANCHOR = "def _action_run(job: Dict[str, Any], a: Dict[str, Any]) -> str:\n"
+
+CRONJOB_ACTION_RUN_PATCHED = (
+    "# kube-agents patch: a direct run carries the asking turn's origin.\n"
+    "# See tools/cron_run_scope.py.\n"
+    "@with_direct_origin\n" + CRONJOB_ACTION_RUN_ANCHOR
+)
+
 # Allow runtime cronjob create to accept an explicit or default risk tier.
 # ``cronjob()`` now snapshots ``locals()`` into the dict every action helper
 # reads, so a parameter added here reaches ``_action_create`` as ``a["risk"]``
@@ -257,6 +291,40 @@ CRONJOB_CREATE_CALL_ANCHOR = '            reasoning_effort=a["reasoning_effort"]
 CRONJOB_CREATE_CALL_PATCHED = (
     '            reasoning_effort=a["reasoning_effort"],\n'
     '            risk=a["risk"],\n'
+)
+
+# Record the origin a job was created or last changed under, for its
+# tick-started runs once it no longer matches the template. Written by this
+# in-pod handler from the turn's trusted context into the Session KV server,
+# never into the jobs file the agent writes. After the create's refusal path,
+# so a refused create records nothing; after ``update_job``, only for a job it
+# found. See tools/cron_job_template.py.
+_RECORD_ORIGIN = (
+    "{indent}# kube-agents patch: record this turn's origin for the job id.\n"
+    "{indent}# See tools/cron_job_template.py.\n"
+    "{indent}try:\n"
+    "{indent}    from tools.cron_job_template import record_job_origin\n"
+    "{indent}    record_job_origin({job_id})\n"
+    "{indent}except Exception as _origin_exc:\n"
+    '{indent}    logger.warning("cron origin: job %s not recorded: %r", {job_id}, _origin_exc)\n'
+)
+
+CRONJOB_CREATE_REFUSED_ANCHOR = (
+    "    except CronSchedulerRegistrationError as exc:\n"
+    "        _partial = exc.to_dict()\n"
+    '        return tool_error(_partial.pop("error"), success=False, **_partial)\n'
+)
+
+CRONJOB_CREATE_REFUSED_PATCHED = CRONJOB_CREATE_REFUSED_ANCHOR + _RECORD_ORIGIN.format(
+    indent="    ", job_id='job["id"]'
+)
+
+CRONJOB_UPDATE_ANCHOR = '    updated = update_job(job["id"], updates)\n'
+
+CRONJOB_UPDATE_PATCHED = (
+    CRONJOB_UPDATE_ANCHOR
+    + "    if updated:\n"
+    + _RECORD_ORIGIN.format(indent="        ", job_id='job["id"]')
 )
 
 # --- cron/jobs.py: stamp default risk on newly created jobs -----------------
@@ -394,7 +462,10 @@ def apply(root: Path) -> None:
         SCHEDULER_SAVE_OUTPUT, SCHEDULER_SAVE_OUTPUT_PATCHED, label="saved output"
     )
     scheduler.substitute(SCHEDULER_TAIL, SCHEDULER_TAIL_PATCHED, label="run tail")
-    scheduler.commit("2 locators, 5 anchors")
+    scheduler.substitute(
+        SCHEDULER_TICK_RUN, SCHEDULER_TICK_RUN_PATCHED, label="tick run origin"
+    )
+    scheduler.commit("2 locators, 6 anchors")
 
     cronjob = patchlib.Patch(root, "tools/cronjob_tools.py", prefix=PREFIX)
     cronjob.substitute(
@@ -403,6 +474,11 @@ def apply(root: Path) -> None:
     cronjob.substitute(CRONJOB_EXECUTE, CRONJOB_EXECUTE_PATCHED, label="scoped run")
     cronjob.substitute(CRONJOB_RETURN, CRONJOB_RETURN_PATCHED, label="run report")
     cronjob.substitute(CRONJOB_RESULT, CRONJOB_RESULT_PATCHED, label="tool result")
+    cronjob.substitute(
+        CRONJOB_ACTION_RUN_ANCHOR,
+        CRONJOB_ACTION_RUN_PATCHED,
+        label="direct run origin",
+    )
     cronjob.substitute(
         CRONJOB_CREATE_PARAM_ANCHOR,
         CRONJOB_CREATE_PARAM_PATCHED,
@@ -413,7 +489,15 @@ def apply(root: Path) -> None:
         CRONJOB_CREATE_CALL_PATCHED,
         label="create call",
     )
-    cronjob.commit("6 anchors")
+    cronjob.substitute(
+        CRONJOB_CREATE_REFUSED_ANCHOR,
+        CRONJOB_CREATE_REFUSED_PATCHED,
+        label="create records origin",
+    )
+    cronjob.substitute(
+        CRONJOB_UPDATE_ANCHOR, CRONJOB_UPDATE_PATCHED, label="update records origin"
+    )
+    cronjob.commit("9 anchors")
 
     jobs = patchlib.Patch(root, "cron/jobs.py", prefix=PREFIX)
     jobs.substitute(

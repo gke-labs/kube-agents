@@ -798,6 +798,43 @@ Mutation(
         "the broker's credential",
     ),
     Mutation(
+        "C1-watcher-pod-metadata-accepts-a-full-body",
+        "agents/platform/scripts/watcher_policy.py",
+        ('        if not accepts_metadata_only(accept, POD_METADATA_ACCEPT_PARAMS, POD_METADATA_MEDIA_TYPE):\n',
+         '        if accept and not accepts_metadata_only(accept, POD_METADATA_ACCEPT_PARAMS, POD_METADATA_MEDIA_TYPE):\n'),
+        "test_C1_the_watcher_reads_a_named_pod_as_metadata_and_never_whole",
+        "let a named Pod read through when the caller sends no Accept at all -- the "
+        "Pod then comes back whole, spec, env and status, on the broker's credential",
+    ),
+    Mutation(
+        "C1-watcher-pod-metadata-any-group",
+        "agents/platform/scripts/watcher_policy.py",
+        ('    if match.re is _NAMED_CORE and match.group("ns") and match.group("resource") == POD_RESOURCE:\n',
+         '    if match.groupdict().get("ns") and match.group("resource") == POD_RESOURCE:\n'),
+        "test_C1_the_watcher_reads_a_named_pod_as_metadata_and_never_whole",
+        "drop the core-group guard on the named Pod rule, so any API group's "
+        "resource called pods (metrics.k8s.io's PodMetrics, a CRD's plural) is "
+        "relayed on the broker's credential",
+    ),
+    Mutation(
+        "C1-watcher-pod-metadata-unprojected-labels",
+        "agents/platform/scripts/watcher_policy.py",
+        ('                projected["labels"] = {POD_METADATA_HASH_LABEL: hash_value}\n',
+         '                projected["labels"] = dict(labels)\n'),
+        "test_C1_the_watcher_reads_a_named_pod_as_metadata_and_never_whole",
+        "relay every label of a named Pod instead of the owner lookup's one, "
+        "widening what the watcher token reads of any Pod in the fleet",
+    ),
+    Mutation(
+        "C1-watcher-pod-metadata-any-controller-kind",
+        "agents/platform/scripts/watcher_policy.py",
+        ('        if kind in POD_METADATA_OWNER_KINDS and (kind != POD_METADATA_HASH_OWNER_KIND or has_hash):\n',
+         '        if kind != POD_METADATA_HASH_OWNER_KIND or has_hash:\n'),
+        "test_C1_the_watcher_reads_a_named_pod_as_metadata_and_never_whole",
+        "relay a named Pod's controller whatever its kind (a static Pod's Node, a "
+        "custom controller), which the owner lookup never folds on",
+    ),
+    Mutation(
         "C1-watcher-count-list-widened-to-secrets",
         "agents/platform/scripts/watcher_policy.py",
         ('        "apis/batch/v1/cronjobs",\n    }\n)\n',
@@ -1139,6 +1176,20 @@ Mutation(
         "test_C1_the_rendered_egress_rules_are_shaped_to_deny_by_default",
         "strip the `to` from a rendered egress rule, which opens 443 to every "
         "destination while still looking like an allowlist entry",
+    ),
+    Mutation(
+        "C1-postgres-guard-tied-to-api-toggle",
+        "charts/kube-agents/templates/hindsight.yaml",
+        (
+            "{{- $postgresqlNetworkPolicy := and $hindsightNetworkPolicy "
+            ".Values.hindsight.postgresql.networkPolicy.enabled }}",
+            "{{- $postgresqlNetworkPolicy := $apiNetworkPolicy }}",
+        ),
+        "test_C1_the_passwordless_postgres_guard_answers_to_its_own_values_alone",
+        "render the Postgres guard under the api policy's toggle, so the "
+        "bring-your-own-gateway escape (api policy off) takes the only guard on "
+        "the passwordless database with it -- the one-boolean shape the chart "
+        "had before the toggles were split",
     ),
     Mutation(
         "C1-cidr-guard-inert",
@@ -1543,10 +1594,12 @@ Mutation(
     Mutation(
         "D1-platform-role-reaches-secrets",
         "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
-        ("      - configmaps\n      - serviceaccounts", "      - configmaps\n      - secrets\n      - serviceaccounts"),
+        (
+            "      - serviceaccounts\n      - secrets\n    verbs:\n      - get\n      - list\n      - watch",
+            "      - serviceaccounts\n      - secrets\n    verbs:\n      - get\n      - list\n      - watch\n      - patch",
+        ),
         "test_D1_no_product_role_can_write_the_identity_table",
-        "add secrets to the platform agent's minimal ClusterRole in the default golden, "
-        "beside the configmaps it already reads",
+        "grant a write verb on secrets in the platform agent's minimal ClusterRole",
     ),
     Mutation(
         "D2-workflow-mode",
@@ -2121,6 +2174,16 @@ Mutation(
         "each module's test compares its constant to itself",
     ),
     Mutation(
+        "C1-session-audience-env-renamed-in-kube-proxy",
+        "k8s-api-proxy/cmd/k8s-api-proxy/main.go",
+        ('sessionAudienceEnv      = "CREDENTIAL_PROXY_SESSION_AUDIENCE"',
+         'sessionAudienceEnv      = "KUBE_PROXY_SESSION_AUDIENCE"'),
+        "test_C1_the_session_broker_audience_and_view_env_agree_across_the_module_boundary",
+        "rename the session-audience env var in k8s-api-proxy while "
+        "k8s-operator still renders CREDENTIAL_PROXY_SESSION_AUDIENCE: both Go "
+        "suites pass while session kubectl fails with 401",
+    ),
+    Mutation(
         "C1-shim-token-env-renamed-in-the-spawner",
         "a2a/gateway/spawn.go",
         ('Name: "CREDENTIAL_PROXY_TOKEN_FILE"', 'Name: "CREDENTIAL_PROXY_TOKEN_PATH"'),
@@ -2241,8 +2304,8 @@ Mutation(
     Mutation(
         "C1-delegate-schema-property-renamed",
         "a2a/worker-adapter/mcp.go",
-        ('"addressee": map[string]any{"type": "string", "description": "The agent to hand the task to. Today only \\"platform\\"."},',
-         '"target": map[string]any{"type": "string", "description": "The agent to hand the task to. Today only \\"platform\\"."},'),
+        ('"addressee": map[string]any{"type": "string", "description": addresseeDescription(targets)},',
+         '"target": map[string]any{"type": "string", "description": addresseeDescription(targets)},'),
         "test_C1_the_delegate_tool_schema_names_agree_with_the_wire_shape",
         "rename the schema's addressee property to target without touching "
         "lib.DelegateRequest: the model calls the tool exactly as the schema "
@@ -2334,7 +2397,7 @@ Mutation(
     Mutation(
         "C1-rendered-bridge-inherits-the-agent-bus-user",
         "k8s-operator/internal/controller/platformagent_a2a_bridge.go",
-        ("\ta2aBusUserEnv:               true,\n", ""),
+        ("\ta2aBusUserEnv:                    true,\n", ""),
         "test_C1_the_rendered_bridge_is_not_the_agent_principal",
         "let the rendered bridge inherit A2A_BUS_USER=agent, the agent "
         "principal's name and inbox prefix",
@@ -2349,6 +2412,36 @@ Mutation(
         "helpful-looking change that lets a worker adapter finalise itself "
         "after a harness crash. An executor can then declare itself dead as "
         "infrastructure",
+    ),
+    Mutation(
+        "A3-bridge-writes-stop-records",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ('\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"$KV.runtime-state.>",',
+         '\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"a2a.stop.*.*",\n\t\t"$KV.runtime-state.>",'),
+        "test_A3_the_stop_record_has_exactly_one_writer",
+        "grant the static bridge publish on profiles' stop records, so the "
+        "platform agent can stop a profile task it delegated. It can then stop "
+        "tasks other requesters started",
+    ),
+    Mutation(
+        "A3-bridge-submits-profile-tasks",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ('\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"$KV.runtime-state.>",',
+         '\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"a2a.submit.*.*.*.*",\n\t\t"$KV.runtime-state.>",'),
+        "test_A3_the_submit_subject_has_exactly_one_writer",
+        "grant the static bridge publish on profiles' submit subject, so the "
+        "platform agent can hand a profile work without a gateway hop. It "
+        "then starts tasks under grants the gateway never minted for them",
+    ),
+    Mutation(
+        "A3-session-submits-profile-tasks",
+        "a2a/authcallout/session.go",
+        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t},',
+         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t\tlib.TaskSubmitSubject("*", "*", "*", "*"),\n\t\t},'),
+        "test_A3_the_submit_subject_has_exactly_one_writer",
+        "derive every executor a grant on profiles' submit subject, the "
+        "shortcut a worker delegating straight to a profile would take. A "
+        "worker can then start tasks of its own outside the gateway's checks",
     ),
     Mutation(
         "A3-bridge-sends-a-notify",

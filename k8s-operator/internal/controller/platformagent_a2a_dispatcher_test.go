@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -147,7 +148,15 @@ func TestTheDispatcherIdentityHoldsOnlyItsContractGrants(t *testing.T) {
 			t.Errorf("the dispatcher can't publish %s", want)
 		}
 	}
-	for _, want := range []string{"a2a.dispatch.*.*.*.accept", "a2a.dispatch.*.*.*.lease", "a2a.cap.reply.dispatcher.>"} {
+	if !slices.Contains(id.publish, "$JS.API.DIRECT.GET.DISPATCH_STOPS.a2a.stop.tse.*") {
+		t.Error("the dispatcher can't read its profile's stop records by subject")
+	}
+	for _, p := range id.publish {
+		if strings.HasPrefix(p, "a2a.stop.") || p == "$JS.API.DIRECT.GET.DISPATCH_STOPS.>" {
+			t.Errorf("the dispatcher publishes %s: stop records are the gateway's to write, and it reads only its own profiles'", p)
+		}
+	}
+	for _, want := range []string{"a2a.stop.tse.*", "a2a.dispatch.*.*.*.accept", "a2a.dispatch.*.*.*.lease", "a2a.cap.reply.dispatcher.>"} {
 		if !slices.Contains(id.subscribe, want) {
 			t.Errorf("the dispatcher can't subscribe %s", want)
 		}
@@ -229,7 +238,7 @@ func TestRenderedDispatcherFixtures(t *testing.T) {
 	})
 	cm, _ := singleA2AAuthMapShard(t, agent, []agentv1alpha1.AgentProfile{tse})
 	checkFixture(t, dispatcherMapFixturePath, cm.Data[a2aAuthMapKey])
-	cfgMap, err := buildA2ADispatchConfigMap(agent, []agentv1alpha1.AgentProfile{tse})
+	cfgMap, err := buildA2ADispatchConfigMap(agent, []agentv1alpha1.AgentProfile{tse}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -543,5 +552,136 @@ func TestHandleDeletionRemovesTheDispatchersPodReadRBAC(t *testing.T) {
 				t.Errorf("a foreign %T under the dispatcher's name was deleted: %v", obj, err)
 			}
 		}
+	}
+}
+
+// The task credential lifetime ceiling is one value for the minter and both
+// verifiers. A dispatcher minting longer than the callout or the broker
+// allows has every credential refused, which fails every profile task.
+func TestTheCredentialLifetimeIsOneValueForMinterAndVerifiers(t *testing.T) {
+	withDispatcher(t)
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+	agent.UID = "agent-uid"
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{
+		Profiles: &agentv1alpha1.ProfileTuning{MaxTaskDeadlineSeconds: ptr.To(900)},
+	}}
+	profile := testAgentProfile(agent.Namespace, "auditor")
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, &profile, profileNamespaceObject(agent)).Build()
+	cfg, err := (&PlatformAgentReconciler{Client: cl, Scheme: scheme}).credentialProxyProfileConfigFor(context.Background(), agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lifetime := func(env []corev1.EnvVar) string {
+		for _, e := range env {
+			if e.Name == credentialProxyTaskCredentialMaxLifetimeEnvVar {
+				return e.Value
+			}
+		}
+		return "(absent)"
+	}
+	got := map[string]string{
+		"callout":    lifetime(buildA2ACalloutDeployment(agent, "", 1).Spec.Template.Spec.Containers[0].Env),
+		"broker":     lifetime(credentialProxyProfileEnv(cfg)),
+		"dispatcher": lifetime(buildA2ADispatcherDeployment(agent).Spec.Template.Spec.Containers[0].Env),
+	}
+	for who, v := range got {
+		if v != "15m0s" {
+			t.Errorf("the %s's credential lifetime = %s, want the install's 900s cap (15m0s); all three: %v", who, v, got)
+		}
+	}
+}
+
+// The dispatch config's submission retention is the stream's max age, as the
+// provision script renders it: a dispatcher keeping tombstones for less than
+// the stream keeps submissions would let a re-created durable replay
+// finished tasks.
+func TestTheDispatchConfigsRetentionIsTheSubmitStreamsMaxAge(t *testing.T) {
+	agent := a2aTestAgent()
+	cfg, err := desiredDispatchConfig(agent, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := regexp.MustCompile(`stream add PROFILE_SUBMITS[^\n]*\n[^\n]*\n\s*--max-age=(\d+)h`).FindStringSubmatch(a2aProvisionScript(agent))
+	if m == nil {
+		t.Fatal("no PROFILE_SUBMITS --max-age in the provision script")
+	}
+	hours, _ := strconv.Atoi(m[1])
+	if cfg.SubmitRetentionSeconds != hours*3600 || cfg.SubmitRetentionSeconds == 0 {
+		t.Errorf("the dispatch config's submitRetentionSeconds = %d, the stream's max age %dh", cfg.SubmitRetentionSeconds, hours)
+	}
+}
+
+// DISPATCH_STOPS is provisioned exactly as the contract has it: the stop
+// subjects, a day's retention (longer than any task), one record per task,
+// 64MiB, direct get, and at most one consumer, the tightest cap JetStream
+// has.
+func TestTheStopStreamIsProvisionedToItsContract(t *testing.T) {
+	script := a2aProvisionScript(a2aTestAgent())
+	m := regexp.MustCompile(`stream add DISPATCH_STOPS((?:[^\n]*\\\n)*[^\n]*)`).FindStringSubmatch(script)
+	if m == nil {
+		t.Fatal("the provision script doesn't add DISPATCH_STOPS")
+	}
+	for _, flag := range []string{"--allow-direct", "--subjects='a2a.stop.>'", "--max-age=24h", "--max-bytes=67108864", "--max-msgs-per-subject=1", "--max-consumers=1", "--storage=file", "--discard=old", `--replicas="${STREAM_REPLICAS}"`} {
+		if !strings.Contains(m[1], flag) {
+			t.Errorf("DISPATCH_STOPS is added without %s: %s", flag, m[0])
+		}
+	}
+}
+
+// A CR's spec.deployment.env can't hand a broker-side container a seed file
+// of its choosing: A2A_TASK_SIGNING_SEED_FILE is reserved.
+func TestTheSeedFileEnvIsReserved(t *testing.T) {
+	merged := mergeCredentialProxyEnv(nil, []corev1.EnvVar{
+		{Name: a2aTaskSigningSeedFileEnvVar, Value: "/tmp/theirs"},
+		{Name: "HARMLESS_PLUGIN_SETTING", Value: "kept"},
+	})
+	if _, count := envValueCount(merged, a2aTaskSigningSeedFileEnvVar); count != 0 {
+		t.Errorf("%s survived the merge from spec.deployment.env", a2aTaskSigningSeedFileEnvVar)
+	}
+	if value, count := envValueCount(merged, "HARMLESS_PLUGIN_SETTING"); count != 1 || value != "kept" {
+		t.Error("the merge dropped an unrelated variable; the reserved list is too wide")
+	}
+}
+
+// A repaired task-signing key rolls the dispatcher: the seed is a file mount,
+// so only a pod-template change gets the new one to a running dispatcher.
+func TestARepairedSigningKeyRollsTheDispatcher(t *testing.T) {
+	withDispatcher(t)
+	agent := a2aTestAgent()
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, chartProfileNamespace(agent)).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+	hash := func() string {
+		t.Helper()
+		dep := &appsv1.Deployment{}
+		if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aDispatcherName(agent)}, dep); err != nil {
+			t.Fatalf("get the dispatcher: %v", err)
+		}
+		return dep.Spec.Template.Annotations[a2aTaskSigningKeyHashAnnotation]
+	}
+	if _, err := r.reconcileA2ADispatcher(ctx, agent, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	before := hash()
+	if before == "" {
+		t.Fatal("the dispatcher's pod template carries no signing-key hash")
+	}
+	// Damage the seed; the next pass repairs the key in place.
+	sec := &corev1.Secret{}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aTaskSigningKeyName(agent)}, sec); err != nil {
+		t.Fatal(err)
+	}
+	sec.Data["task-signing-seed"] = []byte("not a seed")
+	if err := cl.Update(ctx, sec); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.reconcileA2ADispatcher(ctx, agent, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	if after := hash(); after == before {
+		t.Errorf("the signing key was repaired and the dispatcher's pod template didn't change (%s)", after)
 	}
 }

@@ -86,7 +86,7 @@ docker tag "${SANDBOX_IMAGE}" "kind.local/agent-sandbox:${SANDBOX_TAG}"
 docker tag "${OPERATOR_IMAGE}" "kind.local/k8s-operator:${OPERATOR_TAG}"
 
 # ─── Cluster ─────────────────────────────────────────────────────────────────
-if ! kind get clusters 2>/dev/null | grep -qx "${CLUSTER_NAME}"; then
+if ! grep -qx "${CLUSTER_NAME}" <<<"$(kind get clusters 2>/dev/null)"; then
   log "creating kind cluster ${CLUSTER_NAME}"
   kind create cluster --name "${CLUSTER_NAME}" --wait 120s
 fi

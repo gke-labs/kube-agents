@@ -109,7 +109,9 @@ exhausting sweep listed (a sweep that fit without one of them, because its listi
 identity could not be read, says nothing about the fit and posts nothing, for up to three
 consecutive ticks, after which the missing project counts as a standing fault and the fit
 stands); the ledger's budget entry carries the same coverage on every tick that falls short,
-and says when and why the flag is held. A new stall's notice is the alert the Session KV server
+and says when and why the flag is held, and its `cluster_timings` and `tick_timing` entries
+record what each cluster and the last sweeping tick cost to read
+(`docs/designs/stall-watch-inject.md` §3.9). A new stall's notice is the alert the Session KV server
 posts. A namespace whose alert has produced no card a day after it was raised
 (the Planning Agent's turn failed) has its alert raised again, and the new
 alert replaces the episode once it is sent; a shorter retry would post a fresh alert every hour or so
@@ -188,8 +190,9 @@ because on an install that declares no scope the report script's own fallback
 is every project the credential can list. A roster spelling with a space, a semicolon, or a
 comma inside one project's name is not a project id or number, so it fails the tick with the
 places to correct it. Within those projects the report script
-enumerates every cluster, so a cluster `spec.scope.exclude.clusters` keeps a
-Cluster Agent from is still read here. On an install that declares a scope (a
+enumerates every cluster, so a cluster `spec.scope.exclude.clusters` excludes
+still gets its versions graded here, from `gcloud` cluster metadata, but none of
+its in-cluster reads (`--scope-readiness-excluded-clusters`). On an install that declares a scope (a
 `spec.scope` block), the report script, a fleet-audit collector, refuses a bare
 `--project` in the sandbox, so the job reads the declared scope on the agent
 pod (`fleet_scope_targets.declared_scope_targets()`) and hands the script the
@@ -205,7 +208,7 @@ for the version table and, on a report day, the readiness report's read set,
 the same as a run on request: three `gcloud` list reads per project (backend
 services, instances and GKE operations, projected to the fields the rules read)
 beside the server config per location, then one `get-credentials` and six
-`kubectl get`s per cluster (budgets, Deployments and StatefulSets; webhook configurations
+`kubectl get`s per cluster not excluded (budgets, Deployments and StatefulSets; webhook configurations
 with their Services, EndpointSlices and Namespaces; DaemonSets, CronJobs,
 claims, NetworkPolicies and Namespaces; every pod; the nodes through a
 jsonpath projection; StorageClasses and PersistentVolumes), plus
@@ -432,26 +435,40 @@ is reported like any other grant, and repeated daily like one.
 The `topology-drift` skill reads a `leeway report` on request and attributes
 the zonal skew it finds. `leeway_watch.py` (`no_agent: true`, `deliver:
 "chat"`, daily at 08:30 UTC) runs `leeway report --topology-tier-c-signals
---clusters <project>/<location>/<cluster>,…` in `agent-sandbox` across the fleet
-(`LEEWAY_WATCH_CLUSTERS` when set, else `LEEWAY_WATCH_PROJECTS` or the
-management project plus every project a Cluster Agent profile's identity names;
-a project with no Cluster Agent profiles is enumerated with `gcloud container
-clusters list` first, since the sandbox relays that and not the GKE API route
-leeway's own `--clusters-from <project>` would take) and gates notifications
-through `<profile home>/leeway/ledger.json`. The report's topology findings
-(`leeway.contract_violated`, `leeway.placement_drift`,
+--parallelism 2 --clusters <project>/<location>/<cluster>,…` in `agent-sandbox`
+across the fleet (`LEEWAY_WATCH_CLUSTERS` when set, else
+`LEEWAY_WATCH_PROJECTS` or the management project plus every project a Cluster
+Agent profile's identity names; a project with no Cluster Agent profiles is
+enumerated with `gcloud container clusters list` first, since the sandbox
+relays that and not the GKE API route leeway's own `--clusters-from <project>`
+would take) and gates notifications through `<profile home>/leeway/ledger.json`.
+`unknown`-cause topology findings at their pigeonhole floor
+(`observedSkew - minAchievableSkew < 1`) are suppressed before gating so
+balanced odd-replica workloads do not page, while `selector_confined` (`info`)
+findings bypass the drift floor so single-zone node-pool confinement still
+alerts once per refresh window; `LEEWAY_WATCH_MIN_SEVERITY`,
+`LEEWAY_WATCH_MIN_DRIFT`, `LEEWAY_WATCH_MIN_MAX_DOMAIN_SHARE`,
+`LEEWAY_WATCH_MIN_EXCESS_OVER_FLOOR`, and `LEEWAY_WATCH_REFRESH_DAYS` are for
+runs started by hand in the pod with `--dry-run` (the operator's
+`spec.deployment.env` allowlist does not carry them). The report's
+topology findings (`leeway.contract_violated`, `leeway.placement_drift`,
 `leeway.domain_unavailable`) are keyed by cluster, namespace, subject, topology
 key and kind; its ComputeClass rank findings (`leeway.rank_wedged`,
 `leeway.rank_degraded`, `leeway.rank_no_migration`, `leeway.rank_tier_unused`)
 by cluster, class, judging rule and kind. A finding earns a report under
 `<profile home>/leeway/reports/` (`<timestamp>.md` and `<timestamp>.json`, with
-`latest.md` and `latest.json` symlinks) and a chat summary line when it first
-appears, when its `suspectedCause` (a rank finding's `rule`) changes or its
-`severity` escalates, or when its 7-day refresh window
-(`LEEWAY_WATCH_REFRESH_DAYS`, with ten minutes of slack) comes round. Resolved
-findings on cleanly scanned (`status: "ok"`) clusters are retired with a single
-resolution line, while clusters whose scan failed retain their ledger entries so
-transient errors do not erase state and re-page tomorrow.
+`latest.md` and `latest.json` symlinks) and a chat summary line naming up to
+six due subjects with their cause and share when it first appears, when its
+`suspectedCause` (a rank finding's `rule`) changes or its `severity` escalates,
+or when its 7-day refresh window (`LEEWAY_WATCH_REFRESH_DAYS`, with ten minutes
+of slack) comes round. Resolved findings on cleanly scanned (`status: "ok"`)
+clusters are retired with a single resolution line (and a clean `latest.*`
+refresh once all clusters scan cleanly), while clusters whose scan failed
+retain their ledger entries so transient errors do not erase state and re-page
+tomorrow. When `NATS_URL` is set, the watch also writes `latest.json` to the
+`topology-skew` (`a2a.topics.agent.platform.topology-skew`) blackboard topic;
+if that write fails, it warns once in chat and retries on subsequent clean
+ticks until the write recovers.
 
 ## `session-retention` gives every profile's history an end
 
@@ -491,7 +508,15 @@ prune skips pinned rows, the prunes it runs at process start included. The job
 sets the flag on the one row (Hermes' own pin command pins the whole lineage and
 unhides it), and keeps the ids it pinned in the store's `state_meta`, so a pin
 set by hand is never cleared. A chain unwinds one parent a day once its newest
-session is pruned. A store whose pins cannot be set is not pruned that day.
+session is pruned. A store whose pins cannot be set is not pruned by the job that
+day.
+
+The entrypoint runs the same pinning (`session_retention.py --pins-only`) before
+the gateway starts, because Hermes prunes at gateway start and, on the first start
+after an upgrade, that prune would otherwise come before the job's first tick. It
+is best-effort and gives each store a few seconds. A store it cannot pin is
+named in a `WARN`, and the gateway's prune at that start can still delete an aged
+parent there.
 
 A blocked kanban card needs no exemption: its worker starts a
 fresh session on every run and reads its context from the card. A chat thread
@@ -555,9 +580,12 @@ is on the agent pod at `<agent home>/kanban.db`. `kanban_board_health.py` reads
 that file read-only, asks `hermes kanban diagnostics` for the shipped rule
 engine's findings, and prints only when something is wrong. One finding is
 reported whatever the severity floor says: a card `blocked` for more than a day
-with no comment or unblock since. A worker's or operator's block is sticky by
-design, nothing retries it, and #656 was a finished report parked that way for
-weeks because nothing periodically asked.
+with no comment or unblock since, and a card the circuit breaker parked (a
+`gave_up` as its newest stop, which the engine's rule cannot see) for as long.
+A `needs_input` or `capability` block is sticky by design and nothing retries
+it (a `transient` block or a breaker trip is retried once by
+`kanban-block-recheck`, below), and #656 was a finished report parked that way
+for weeks because nothing periodically asked.
 
 The stuck cards are said in plain words for whoever is in the channel: a
 headline counting them ("2 tasks are stuck and need someone to decide."), then
@@ -571,7 +599,7 @@ row ("Holding back: Open GitOps PR for x."). No task ids, block reasons or
 `hermes kanban` commands are shown in chat; `hermes kanban list` and `show` on
 the agent pod have them.
 
-In Slack, with `KAGE_SLACK_UX` on, each row carries Retry and Drop. When the
+In Slack, and on Google Chat under `spec.mode: next`, with `KAGE_SLACK_UX` on, each row carries Retry and Drop. When the
 stuck cards are all a run says, the script leaves a card file beside its record
 (`kanban_board_health.card.json`): each row as printed, with the ids of the
 cards it stands for, and the text it printed. The relay posts that card in
@@ -584,9 +612,11 @@ and acts on one that has blocked again. The row is edited in place
 to "✓ Retrying. <name>, <time>" or "Dropped. <name>, <time>" ("No longer
 stuck. <name>, <time>" when the cards had already moved). Whoever the gateway would answer may
 press: the Slack adapter's interactive authorization and channel gate under
-today, the Home tab's admission rule under `spec.mode: next`. A tap is never an
-agent turn. Google Chat, and a run that also reports the board's other
-findings, get the text.
+today, the Home tab's admission rule on Slack under `spec.mode: next`, and the
+allowed-users list (`resolvePrincipal`) on Google Chat under `spec.mode: next`,
+where the rows are numbered and the buttons read "Retry 1" and "Drop 1". A tap
+is never an agent turn. Google Chat under today, and a run that also reports
+the board's other findings, get the text.
 
 It runs daily but speaks about stuck cards only when one first gets stuck, then
 once a week while any stays stuck: a card said once in a busy channel can be
@@ -614,11 +644,59 @@ crossing and a daily repeat would be noise, and because it would turn a
 stuck-cards report into text without its buttons. A board that cannot be read
 for "database or disk is full" while the volume is past the line, or for "disk
 I/O error" with no space left at all, is said as a full disk, with the line,
-not as a bare read error.
+not as a bare read error. Any other read error keeps the bare line, and the
+volume line follows it while the volume is past the warn line.
 
 It sits here rather than on the Chat Agent's roster because that roster delivers
 `local`. `PLATFORM_AGENT_HOME`, not `HERMES_HOME`, is how it finds the board:
 under this roster `HERMES_HOME` is `profiles/platform`, which holds no board.
+
+## `kanban-block-recheck` retries a blocked card when its condition has cleared
+
+A blocked card stays blocked until a person acts, and nothing re-reads the condition the block
+described: cards have sat blocked for days on a condition that had cleared, re-reported by the
+digest above. `kanban_block_recheck.py` (`no_agent: true`, four times an hour at :07, :22, :37
+and :52) is the re-check. It keeps one record per blocked card in the board's
+`kanban_block_rechecks` table: the condition, when to check it, when to stop, and what the last
+check found. A condition that has cleared retries the card through Hermes' `unblock_task`, the
+call Retry makes, writes a `block_rechecked` event on the card, and prints one line, which
+`deliver: "chat"` posts ("Retried **Investigate web**: it blocked 1 hour ago and the wait has
+passed."). A condition that holds leaves the card blocked and refreshes the record, which the
+digest's row reads ("Re-checked 2 hours ago, still blocked."). The two ends at which a card stays
+blocked for a person are said once each the same way: a condition that cleared on a card already
+retried once, and a Kubernetes condition past its expiry. No comment is written: the digest's rule
+goes quiet after a comment, and the daily report is deliberate.
+
+Two condition kinds. A **time** condition is derived with no record from anyone, for the blocks
+the harness files itself: a circuit-breaker trip (`gave_up`) retries an hour after the trip, and a
+`transient` block (the rate-limit exit, or a worker's `kanban_block(kind="transient")`) thirty
+minutes after the block; cards blocked before this job existed are covered on its first run. A
+`needs_input`, `capability`, `dependency` or untyped block is a question for a person, or for
+`recompute_ready`, and gets no record. A
+**Kubernetes** condition names a pod or a deployment on a cluster and clears when the pod is
+`Ready` or the deployment `Available`, read with one `kubectl get -o json` through the shell
+sandbox on the per-cluster kubeconfig `stall-watch` keeps there; the credentials are fetched by
+`stall-watch`'s rule, once a day per cluster (the stamps live in
+`profiles/platform/cron/kanban_block_recheck.json`) or when a read says the kubeconfig itself is
+the problem. The resource is stored as kubectl is given it (`deployment/web`; a plural or padded
+spelling is normalised, a second `/` or an empty name refused). Record one on the pod:
+
+```bash
+PLATFORM_AGENT_HOME=/opt/data python3 /opt/data/scripts/kanban_block_recheck.py \
+  --watch t_1234abcd \
+  --project <project> --location <location> --cluster <cluster> \
+  --namespace shop --resource deployment/web \
+  --expires-in-hours 48
+```
+
+Without `--expires-in-hours` the checks stop after a week; after the expiry the digest says
+"Re-checks ended 3 days ago, still blocked." Bounds: one automatic retry per card for its life (a
+second cleared condition is recorded as `retry_limit` and waits for a person), at most three
+retries per run so the first run after an upgrade does not start every old breaker trip at once,
+and upstream's own unblock-loop breaker, which routes a second same-kind `kanban_block` to
+`triage`. A cluster the job cannot read is recorded as `unknown` and read again on the next run.
+A worker cannot record a Kubernetes condition when it blocks; that is a tool-text change and a
+follow-up. Design: [`docs/designs/kanban-block-recheck.md`](../../../docs/designs/kanban-block-recheck.md).
 
 ## `feedback-prompt` asks once, a week after it first runs
 
@@ -925,8 +1003,9 @@ The Planning Agent is the `default` profile, which is not scaffolded: it lives
 at `$HERMES_HOME` directly and the entrypoint seeds it with
 `cp -ru /opt/defaults/. "$TARGET_DIR/"` (`deploy/shared/docker-entrypoint.sh`,
 step 2). `cron/` is in neither force-sync list — step 2a covers `SOUL.md`,
-`AGENTS.md`, `CAPABILITIES.md` and `hindsight/config.json`, step 2b covers
-`scripts/` and `plugins/bootstrap_onboarding/` — and since the
+`AGENTS.md`, `CAPABILITIES.md`, `hindsight/config.json` and the onboarding prompts, step 2b covers
+`scripts/` and every plugin directory under `/opt/defaults/plugins`
+except `hermes_otel` — and since the
 scheduler writes `last_run` into the volume's copy on every tick, that copy's
 timestamp is permanently ahead of the image's, and `cp -u` skips it for good.
 
@@ -1010,15 +1089,24 @@ same numbers to go stale, and the test above checks the roster against the SOPs
 
 ## The `--scheduled` sentence in audit prompts
 
-Every fleet-audit prompt tells the worker to pass `--scheduled` to `finish`.
-Only a run with that flag can get `silent_ok: true`, so the sentence is what
-lets a quiet scheduled run answer `[SILENT]`. It is in the prompt and not in
-the SOP, because a scheduled run and an on-demand run read the same SOP: an SOP
-that passed the flag would let every on-demand run of its stream go silent.
+Every fleet-audit prompt tells the worker to pass `--scheduled` to `finish`,
+and every stream whose SOP runs `audit_report.py precheck` after its collector
+(every collector stream but `upgrade-retrospective`, whose recorded weeks move
+every run: `PRECHECK_STREAMS` in the test file below) tells it to pass the
+flag to `precheck` too. Only a run with that
+flag can get `silent_ok: true`, so the sentence is what lets a quiet scheduled
+run answer `[SILENT]`; and only a run with it is closed by `precheck` from the
+last scheduled run's stored document when the collector manifest digests the
+same, which is what spares a static fleet the by-hand drafting every day. It
+is in the prompt and not in the SOP, because a scheduled run and an on-demand
+run read the same SOP: an SOP that passed the flag would let every on-demand
+run of its stream go silent, or be closed from a stored document.
 `test_every_audit_cron_prompt_passes_scheduled_to_finish` in
 `../skills/fleet-audit/scripts/test_audit_report.py` checks that each audit
-prompt has the phrase `pass --scheduled to finish` and that no SOP passes the
-flag. A prompt without it
+prompt has the phrase `pass --scheduled to precheck and finish` (`pass
+--scheduled to finish` on a stream without the step) and that no SOP passes
+the flag; `test_every_collector_sop_runs_precheck_after_its_collector` beside
+it holds the step to exactly those SOPs. A prompt without the sentence
 only makes its job noisier. The rule is in
 [ledger design §7.5](../../../docs/designs/fleet-audit-issue-ledger.md#75-silent_ok-and-who-is-listening).
 

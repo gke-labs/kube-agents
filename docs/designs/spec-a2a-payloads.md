@@ -475,17 +475,17 @@ or unreported at its drain; `dropped` counts them all, and a delivery the execut
 read or refused over its body cap is outside it, logged, the call it belonged to in the trace
 as `interrupted` when its opening delivery arrived and whole from the closing one when the
 opening one was unreadable; over the cap the closing delivery is larger still, so that call is absent), `errorType` (the executor's own word for
-an error), `durationMs` and `at`; the library
+an error), `durationMs`, `at`, and (on the Hermes bridge's `api` executor) `title`, `sessionId`, `worker`, `cardId`, and `resultPreview` (`card_id=<id>` on a successful `kanban_create` only; no other tool output, and no error text (outside the bridge's off-by-default `BRIDGE_DEBUG_ERROR_TEXT` debugging switch), is published - `input` is the argument shape under both executors); the library
 validates the part kind (assertion 18), and a reader tolerates the keys it does not know.
 
 One unreserved name has a defined shape: `steps`, `kube-agents.step/v1` data parts
 ([`a2a/lib/stepmsg`](../../a2a/lib/stepmsg/stepmsg.go)), by which an executor may state what a turn
-planned, which of its subtasks settled, and when it synthesized an answer, so a renderer lists a
+planned (`kind: "plan"`), which of its subtasks settled (`kind: "subtask"`, with a `subtask` object carrying `id`, `title`, `status`, `verdict`, `summary`, `settled`, `total`, and `parentTaskId`; the hermes bridge leaves `summary` empty, keeping a card's report off `TASKS`), and when it synthesized an answer (`kind: "synthesis"`), along with an optional single-line `thought` (at most 4,096 UTF-8 bytes) and `callIds` (up to 64 tool call IDs), so a renderer lists a
 turn's steps without parsing them out of `thinking`. It carries no reserved semantics: the relay
 ignores it, the fold keeps it, and a reader that does not know it skips it. A later version of the record is a new
 schema, as with chat messages: a v1 reader skips a `kube-agents.step/v2` part rather than guess
 at it, and skips a v1 part with an unknown `kind`. The Hermes bridge publishes it from its
-tool-call trace and the turn's model requests, structure only
+tool-call trace and the turn's model requests (and, on the `api` executor, settled Kanban cards)
 ([`a2a/docs/hermes-bridge.md`](../../a2a/docs/hermes-bridge.md), "Activity").
 
 ## Verified identity (added 9/9)
@@ -678,7 +678,7 @@ table in markdown is text, never a table (use `fold.table`).
 | `note`     | Plain, one line, at most 300. A short qualifier on the headline; where it goes (same line, a context line) is the renderer's choice.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `detail`   | Markdown, at most 2,000, any number of lines. The body of a short message: a needs-you question's context, a report's extra line.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `tone`     | `success`, `attention` or `critical`; absent means none. The message's colour where a backend has one. On Slack, `success` is green (done, and yours to act on: a PR opened), `attention` yellow (waiting on you) and `critical` red (`#E01E5A`). Never the only place a fact is stated.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| `rows`     | At most 20. Each has `text` (markdown, one line, at most 300), optional `severity` (a token of 1-16 characters of `[a-z0-9-]`, rendered as inline code ahead of the text, eg `critical`) and optional `detail` (markdown, one line, at most 300). A row may also carry `tasks` (1-50 board card ids, each 1-64 characters of `[A-Za-z0-9_-]`, at most 2000 characters joined by commas) and `actions` (`retry` and `drop`, each at most once), both or neither: the renderer draws those buttons under the row, labelled itself, and a click acts on the cards instead of arriving as a turn (spec-chatops-gateway.md, "The board-health card's buttons").                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `rows`     | At most 20. Each has `text` (markdown, one line, at most 300), optional `severity` (a token of 1-16 characters of `[a-z0-9-]`, rendered as inline code ahead of the text, eg `critical`) and optional `detail` (markdown, one line, at most 300). A row may also carry `tasks` (1-50 board card ids, each 1-64 characters of `[A-Za-z0-9_-]`, at most 2000 characters joined by commas) and `actions` (`retry` and `drop`, each at most once), both or neither: the renderer draws those buttons under the row, or under the message and labelled by the row's number where the platform has one button list per message, labels them itself, and a click acts on the cards instead of arriving as a turn (spec-chatops-gateway.md, "The board-health card's buttons").                                                                                                                                                                                                                                                                                                        |
 | `after`    | At most 5 lines, markdown, one line each, at most 300. Rendered after the rows.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `fold`     | One collapsed section. `title` plain, at most 40 (default `why`). `text` markdown, at most 12,000. Optional `table`: 1-10 `columns` (plain, 1-40 each) and at most 50 `rows`, each exactly as wide as `columns`, cells plain, at most 200.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `choices`  | At most 10. `text` plain, 1-75 characters, the button's label. Optional `reply`, at most 400, which MUST contain `text`, so it names what the answer reaches (a card, an option: `apply Option B: <title>` behind an `<title>` button) without hiding much the clicker didn't see. A click arrives as a message from the clicker whose text is `reply`, or `text` without one: text, through the principal map, no new intent (#2149). A `text` or `reply` that the gateway would act on as a command is invalid, judged against the superset whatever the route or state, each function applied to the raw `text` and `reply` as the gateway would receive them (`IsStop` and `IsStatusQuery` normalize for themselves): a stop word (`IsStop`), a status ask in its wide form (`IsStatusQuery(s, true)`), the `/session` command (`IsSessionCommand`), a bare `/feedback` or `/feedback summary` (`IsFeedbackCommand` with nothing after the word, or `IsFeedbackSummaryCommand`; any other `/feedback <text>` is an ordinary turn) or the `delegate` prefix (`IsDelegate`). |
@@ -703,7 +703,8 @@ and the first 5 `after` lines, which the presenter leaves uncapped.
 choice's `reply` names whatever the answer needs to reach (a card, an option). The
 renderer adds only what is its backend's own: a "✓ name: choice" rewrite of an answered
 question (#2346), a "waiting on you" context line under an open one, which emoji a mark
-shows.
+shows, and the control a backend draws on a running task's line when the gateway asks for one
+(Google Chat's Stop button, spec-chatops-gateway, "The Google Chat adapter").
 
 ### `mark`
 
@@ -730,9 +731,8 @@ and only its `mark` is validated. When the newest task ends with no mark on its 
 ### Task parameters and child results
 
 Reserved 10/22 for the profile dispatcher (`spec-subagent-profiles.md`), and used from the gateway's
-delegation to profiles onward; nothing writes them yet. Until a gateway reads a `delegate` request's `parameters`, the
-worker adapter refuses a request carrying any, rather than publish one whose child would be minted
-without its target. Both are `data` parts, and only the gateway
+delegation to profiles onward. The gateway carries a `delegate` request's `parameters` into the
+child's submission once their names pass the target profile's declared ones. Both are `data` parts, and only the gateway
 writes them: the gateway strips any a client or a task supplies, and a reader refuses a message carrying two
 `taskParameters` parts.
 
@@ -768,6 +768,26 @@ chat session's turn ends when it delegates, so a session parent keeps the chatop
 turn on the session that carries the child's result, and it doesn't deliver a `childResult` to the
 finished turn's `…in`.
 
+**Delegate targets.** A turn the gateway submits to a conversation's own session pod carries
+`{"delegateTargets": {"targets": [{"name", "description"?, "parameters"?}, …], "truncated"?}}`: the
+agents that turn's requester may delegate to, `platform` first and then each AgentProfile whose card
+admits them, by the same checks a delegation meets (the target's list and the A2A door's own-list
+rule, for the requester and everyone else whose text reached the session, and the card's tiers). A
+wake carries none, since it runs without the tool. A profile's entry carries its card's routing
+blurb and the parameters the card declares (`{"name", "required"?}`). The session's delegate tool
+names them, so the model is told what it can address. The part is a hint, not a grant: the gateway
+checks the delegation again when it arrives. It rides every turn, so a reused pod keeps up with
+profiles added and removed, and its presence is the marker: a turn with one has exactly the agents
+listed, and a turn with none reads as `platform` only.
+
+- A name is an addressee (a subject token). A description is one line of at most 200 bytes, cut by
+  the gateway. A parameter is named like a task parameter, at most 16 a target.
+- A list has at most 32 targets, and its object encodes to at most 16 KiB, so the session pod can hand it to its
+  tool server in one environment variable. The gateway stops before either bound and sets
+  `truncated`; a card whose parameters break the rules is left out.
+- A reader that finds a part breaking these bounds ignores it (`lib.DelegateTargetsOf`), as though
+  the turn carried none.
+
 ### Card work after the task ends
 
 **A stopgap.** This retires when delegated work runs as bus tasks (cards as child tasks
@@ -775,8 +795,8 @@ through the delegation primitive and the profile dispatcher), at which point car
 ride the carriers above. The plan is on #2149
 ([the 10/8 comment](https://github.com/gke-labs/kube-agents/issues/2149#issuecomment-6065582878)).
 
-Under `next` the Planning Agent often answers "on it", hands the work to kanban cards, and
-its task ends. The cards keep going outside any A2A task, so none of the carriers above
+Under `next` on chat platforms (`slack` and `gchat`), the Planning Agent often answers "on it", hands the work to kanban cards, and
+its task ends (whereas on console, MCP and A2A door origins only, `waitsForCardsInTurn`, the `api` executor holds the turn open while polling `kanban.db`, emits `subtask` steps as cards settle, and synthesizes multi-card results into the task's `result` artifact; see `a2a/docs/hermes-bridge.md`). Where the task ends at the acknowledgement, the cards keep going outside that A2A task, so none of the carriers above
 reach them. Their updates reach the conversation on the chat.notify route instead,
 addressed to the asking conversation and checked against the gateway's session record
 (spec-chatops-gateway, the conversation-addressed notify of #2679). A notify request may
@@ -936,13 +956,22 @@ and only when the operator renders `A2A_CARD_STOP=true` (spec-chatops-gateway, S
   message posts the fallback, logged and counted, as for an invalid one, and never clips
   it or sends a card the API will refuse. The same goes for a post the backend's API
   refuses: the renderer retries it once as the fallback.
+- **Wording is linted, not validated.** A headline names no card id (`t_` and eight hex
+  digits), opens with no markdown heading or apology ("Sorry", "I apologize",
+  "Unfortunately") and carries no code fence; a choice's label is no slash command, code
+  span, or command line opening on a CLI's name (`kubectl`, `gcloud`, `git` and the like). Breaking one is an emitter bug, but not one a renderer acts on:
+  dropping the message for its wording would lose the answer. `chatmsg.Lint` and
+  `chat_cases.lint` check them, and the emitters' tests and the shared cases hold the
+  emitters to them. The Slack renderer keeps the buttons to five a row by wrapping.
 
-`a2a/lib/chatmsg` implements this section: the types, `Validate` for every rule above, the
+`a2a/lib/chatmsg` implements this section: the types, `Validate` for every rule above but
+the wording one, which `Lint` checks, the
 fallback each carrier pairs with a chat message, and the DataPart encoding. The command
 matchers and the label check it shares with the gateway are in `a2a/lib/chattext`. The shared
 cases in `tests/conformance/chat/` pair inputs from the `today` presenters' tests with the chat
-messages the emitter owes for them; `chatmsg` validates every one, and
+messages the emitter owes for them; `chatmsg` validates and lints every one, and
 `agents/platform/scripts/chat_cases.py` reads them for the Python presenters.
+`tests/conformance/chat-ux/lint.json` holds the lint's own cases, which both lints read.
 
 ## Topics
 

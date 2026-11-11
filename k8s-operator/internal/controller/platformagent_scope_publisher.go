@@ -157,8 +157,9 @@ const (
 	scopeProjectsPerBlock       = 100
 	scopePublisherDeadlineSlack = 120 * time.Second
 	// scopeActiveJobRecheck is the soonest the reconcile looks again at an
-	// active Job past its deadline, which the Job controller has yet to
-	// mark Failed.
+	// active Job past its deadline: one the Job controller has yet to mark
+	// Failed, or one its deadline failed less than a grace period ago
+	// (scopeJobActive).
 	scopeActiveJobRecheck       = 30 * time.Second
 	scopePublisherJobTTLSeconds = 3600
 	// scopeJobSuffixLength is the hex characters of the Job name's suffix.
@@ -601,12 +602,24 @@ type scopePublishDecision struct {
 	requeue time.Duration
 }
 
-// scopeJobActive is whether a Job is still running: neither its Complete nor
-// its Failed condition is true.
-func scopeJobActive(job *batchv1.Job) bool {
+// scopeJobActive is whether a Job is still running at now: neither its
+// Complete nor its Failed condition is true, or it failed at its deadline
+// less than its pod's termination grace period ago. Kubernetes 1.30 writes
+// Failed (DeadlineExceeded) in the same sync that deletes the pod, with
+// status.active and status.terminating both 0, so the status cannot show the
+// pod still terminating; a new Job in that window would run a second
+// publisher pod beside it. 1.31 and later hold Failed until the pod is gone.
+func scopeJobActive(job *batchv1.Job, now time.Time) bool {
 	for _, cond := range job.Status.Conditions {
-		if cond.Status == corev1.ConditionTrue && (cond.Type == batchv1.JobComplete || cond.Type == batchv1.JobFailed) {
+		if cond.Status != corev1.ConditionTrue {
+			continue
+		}
+		switch cond.Type {
+		case batchv1.JobComplete:
 			return false
+		case batchv1.JobFailed:
+			grace := time.Duration(ptr.Deref(job.Spec.Template.Spec.TerminationGracePeriodSeconds, corev1.DefaultTerminationGracePeriodSeconds)) * time.Second
+			return cond.Reason == batchv1.JobReasonDeadlineExceeded && now.Before(cond.LastTransitionTime.Add(grace))
 		}
 	}
 	return true
@@ -624,7 +637,7 @@ func decideScopePublish(jobs []batchv1.Job, memberHash string, now time.Time) sc
 	var newest *batchv1.Job
 	for i := range jobs {
 		job := &jobs[i]
-		if scopeJobActive(job) {
+		if scopeJobActive(job, now) {
 			requeue := scopePublishInterval
 			if job.Spec.ActiveDeadlineSeconds != nil {
 				deadline := job.CreationTimestamp.Add(time.Duration(*job.Spec.ActiveDeadlineSeconds) * time.Second)
@@ -741,15 +754,13 @@ func (r *PlatformAgentReconciler) scopePublisherIdentityOwned(ctx context.Contex
 	return metav1.IsControlledBy(existing, agent), nil
 }
 
-// scopeBrokerEnv is the broker's side of the publisher. Under mode next the
-// declaration's path, which the scope role reads to bound every argument;
+// scopeBrokerEnv is the broker's side of the publisher. In every mode the
+// declaration's path, from which the broker refuses an excluded cluster to
+// every caller and which the scope role reads to bound every argument;
 // while a publisher may run (scopePublisherMayRun), the audience and the
 // publisher's username bound to it both ways, as a2aMCPBrokerEnv binds the mcp role. Without the
 // pair the broker confers the scope role to nobody.
 func scopeBrokerEnv(agent *agentv1alpha1.PlatformAgent, owned bool) []corev1.EnvVar {
-	if !scopePublisherRendered(agent) {
-		return nil
-	}
 	env := []corev1.EnvVar{{Name: credentialProxyScopeFileEnvVar, Value: path.Join(brokerScopeDir, scopeFileName)}}
 	if scopePublisherMayRun(agent, owned) {
 		env = append(env,

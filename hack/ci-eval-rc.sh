@@ -68,8 +68,13 @@
 #                     release candidate; skip.
 #   ARTIFACTS         Prow's. When set, receives rc-target.env and the
 #                     summary below alongside the verdict ci-eval-pr.sh writes.
-#   JOB_NAME/BUILD_ID Prow's. Both set, the summary carries the run's Deck URL
-#                     so the verdict is findable without a credential.
+#   JOB_NAME/BUILD_ID Prow's. Both set, the summary carries a link to the
+#                     run's build directory so the verdict is findable.
+#   JOB_SPEC          Prow's. Names the bucket the job's decoration uploads
+#                     to (JOB_SPEC_BUCKET_KEYS below); unset or without it,
+#                     the Prow cluster's default. Decides the link's form:
+#                     Deck for a bucket it can read, the Cloud Console for a
+#                     private one (PRIVATE_LOG_BUCKETS below).
 #
 # NOT a whole job: the four steps stop at the verdict, and teardown is the job
 # config's to run -- as a separate step, unconditionally, whatever this script
@@ -132,7 +137,7 @@ set -euo pipefail
 # minutes at its 172 s median since #3145, ~69 at its 1250 s hint.
 # consistency-drift-outlier (roster since 2026-10-26) adds three units in the
 # first phase, beside the other cases and serialized on its task lock: a ~10
-# minute chain at its 198 s median on the claude-opus-5-5 nightlies, ~30 at
+# minute chain at its 198 s median on the nightlies after the 2026-10-19 model change, ~30 at
 # its 600 s hint. monitoring-alert-policy-read (roster since 2026-11-02) adds
 # three more first-phase units, serialized on its task lock and on
 # lock-infra, which no other case in this matrix takes; its stack is a few
@@ -171,11 +176,23 @@ readonly RC_TARGET_TAG_KEY="rc_tag"
 readonly RC_SUMMARY_FILE="rc-eval-summary.md"
 readonly RC_VERDICT_FILE="eval-verdict.md"
 
-# Deck serves what raw GCS refuses anonymously, so this is the form of the
-# link a reader can actually open. Periodic build directories live under
+# Where the run's build directory is linked from. Deck serves what raw GCS
+# refuses anonymously, so for the Prow cluster's default bucket that is the
+# form a reader can open; Deck has no read on the buckets kube-agents owns
+# (PRIVATE_LOG_BUCKETS, the set scripts/eval_dashboard/links.py holds), so a
+# build there links the Cloud Console's bucket browser, which a project
+# reader opens. Postsubmit and periodic build directories live under
 # logs/<job>/<build>; a presubmit's are elsewhere, which is why the summary
-# only builds a URL when Prow supplied both halves.
-readonly PROW_DECK_BUILD_BASE="https://oss.gprow.dev/view/gs/kube-agents-prow/logs"
+# only builds a URL when Prow supplied both halves. The bucket is read from
+# JOB_SPEC at the key path below, else the default, which keeps today's
+# output for a run outside Prow. tests/test_ci_eval_rc.py holds the bucket
+# list equal to links.PRIVATE_LOG_BUCKETS.
+readonly PROW_DECK_VIEW_BASE="https://oss.gprow.dev/view/gs"
+readonly GCS_BROWSER_BASE="https://console.cloud.google.com/storage/browser"
+readonly PROW_LOGS_DIR="logs"
+readonly PROW_LOG_BUCKET_DEFAULT="kube-agents-prow"
+readonly JOB_SPEC_BUCKET_KEYS="decoration_config gcs_configuration bucket"
+readonly PRIVATE_LOG_BUCKETS="kube-agents-evals-presubmit-logs kube-agents-evals-nightly-logs"
 
 # Grepped for in the CANDIDATE's ci-deploy.sh after the checkout. Its presence
 # is what says the candidate's tree can install published images instead of
@@ -215,7 +232,7 @@ readonly RC_VERDICT_JSON_FILE="eval-verdict.json"
 # be in memory before it happens, and control must never return to the file.
 main() {
   local script_dir repo_root rc_commit_sha rc_tag original_ref
-  local artifacts_dir summary_path verdict_path deck_url
+  local artifacts_dir summary_path verdict_path deck_url log_bucket
   local deploy_status eval_status eval_partial verdict suite_not_evaluated
 
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -411,10 +428,22 @@ main() {
     fi
   fi
 
-  # ─── Reporting: make the verdict findable without a credential ────────────
+  # ─── Reporting: make the verdict findable ─────────────────────────────────
   deck_url=""
   if [ -n "${JOB_NAME:-}" ] && [ -n "${BUILD_ID:-}" ]; then
-    deck_url="${PROW_DECK_BUILD_BASE}/${JOB_NAME}/${BUILD_ID}"
+    log_bucket=""
+    if [ -n "${JOB_SPEC:-}" ]; then
+      # Best effort: a JOB_SPEC without the field, or one that is not JSON,
+      # leaves the default rather than failing the reporting step.
+      # The keys are meant to split into separate argv words.
+# shellcheck disable=SC2086
+      log_bucket="$(printf '%s' "${JOB_SPEC}" | python3 -c 'import functools, json, sys; v = functools.reduce(lambda d, k: d.get(k) if isinstance(d, dict) else None, sys.argv[1:], json.load(sys.stdin)); print(v if isinstance(v, str) else "")' ${JOB_SPEC_BUCKET_KEYS} 2>/dev/null || true)"
+    fi
+    log_bucket="${log_bucket:-${PROW_LOG_BUCKET_DEFAULT}}"
+    case " ${PRIVATE_LOG_BUCKETS} " in
+      *" ${log_bucket} "*) deck_url="${GCS_BROWSER_BASE}/${log_bucket}/${PROW_LOGS_DIR}/${JOB_NAME}/${BUILD_ID}" ;;
+      *) deck_url="${PROW_DECK_VIEW_BASE}/${log_bucket}/${PROW_LOGS_DIR}/${JOB_NAME}/${BUILD_ID}" ;;
+    esac
   fi
 
   echo "======================================================================"

@@ -11,6 +11,7 @@ fake and the token is fixed.
 import dataclasses
 import http.client
 import json
+import socket
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -257,6 +258,66 @@ class McpRelayOverTheSocketTest(unittest.TestCase):
         self.assertEqual(json.loads(forwarded), tools_call("get_cluster"))
         self.assertNotIn(b" ", forwarded)
 
+    def exclude(self, *clusters):
+        """Hold the handler to a scope.json excluding these (project, location, cluster) triples."""
+        import os
+        import tempfile
+
+        import scope_exclude
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        scope_file = os.path.join(directory.name, "scope.json")
+        with open(scope_file, "w", encoding="utf-8") as stream:
+            json.dump({"exclude": {"projects": [], "clusters": [
+                {"projectId": p, "location": l, "clusterName": c} for p, l, c in clusters]}}, stream)
+        original = CredentialProxyHandler.__dict__.get("exclusions")
+        self.addCleanup(setattr, CredentialProxyHandler, "exclusions", original)
+        CredentialProxyHandler.exclusions = scope_exclude.Exclusions(path=lambda: scope_file)
+
+    def k8s_call(self, parent, name="get_k8s_resource", request_id=4):
+        return {"jsonrpc": "2.0", "id": request_id, "method": "tools/call",
+                "params": {"name": name, "arguments": {"parent": parent, "resourceType": "pod"}}}
+
+    def test_an_in_cluster_tool_on_an_excluded_cluster_never_reaches_the_upstream(self):
+        import scope_exclude
+
+        self.exclude(("p", "us-east4", "scratch"))
+        for message in (
+            self.k8s_call("projects/p/locations/us-east4/clusters/scratch"),
+            self.k8s_call("projects/p/locations/us-east4/clusters/scratch", name="get_k8s_logs"),
+            # One the broker can't tie to a cluster, while any is excluded.
+            self.k8s_call("projects/p/locations/-/clusters/scratch"),
+            self.k8s_call("scratch"),
+            # A readable allowed name can't vouch for one the broker can't read.
+            {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "get_k8s_resource", "arguments": {
+                "parent": "projects/p/locations/us-east4/clusters/%73cratch",
+                "context": "projects/p/locations/us-east4/clusters/other"}}},
+            self.k8s_call("projects/p/locations/us-east4/clusters/other/../scratch"),
+            self.k8s_call("projects/p/zones/us-east4-a/clusters/scratch"),
+            self.k8s_call("projects/P/locations/us-east4/clusters/scratch"),
+        ):
+            with self.subTest(message=message):
+                status, _, body = self._request(message=message)
+                self.assertEqual(status, 200)
+                reply = json.loads(body)
+                self.assertTrue(reply["result"]["isError"], reply)
+                self.assertIn(scope_exclude.RULE_EXCLUDED_CLUSTER, reply["result"]["content"][0]["text"])
+        self.assertEqual(self.upstream_requests, [])
+
+    def test_control_plane_tools_and_other_clusters_still_reach_the_upstream(self):
+        self.exclude(("p", "us-east4", "scratch"))
+        for message in (
+            self.k8s_call("projects/p/locations/us-east4/clusters/other"),
+            tools_call("get_cluster"),
+            tools_call("list_clusters"),
+        ):
+            with self.subTest(message=message):
+                status, _, body = self._request(message=message)
+                self.assertEqual(status, 200, body)
+                self.assertNotIn("isError", json.loads(body).get("result", {}))
+        self.assertEqual(len(self.upstream_requests), 3)
+
     def test_a_write_tool_never_reaches_the_upstream(self):
         with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
             status, _, body = self._request(message=tools_call("patch_k8s_resource", request_id=9))
@@ -341,6 +402,33 @@ class McpRelayOverTheSocketTest(unittest.TestCase):
         status, _, _ = self._request(body=b"{}", headers={"Content-Length": str(2 << 20)})
         self.assertEqual(status, 413)
         self.assertEqual(self.upstream_requests, [])
+
+    def test_a_relayed_message_whose_body_the_handler_cannot_frame_announces_its_close(self):
+        # The relay's direct write of the upstream's reply. The route reads
+        # Content-Length bytes before answering, so the one request on which
+        # the body counts as unread at that write is a POST carrying both
+        # Transfer-Encoding and a Content-Length: the handler frames no
+        # chunked body, so whatever it read, bytes may follow. The response
+        # must then say `Connection: close` itself, as the close is otherwise
+        # found by Envoy after it has pooled the connection as reusable.
+        body = json.dumps(tools_call("get_cluster")).encode()
+        with socket.create_connection(("127.0.0.1", self.server.server_address[1]), timeout=10) as sock:
+            sock.sendall(
+                b"POST " + GKE.encode("ascii") + b" HTTP/1.1\r\nHost: broker\r\n"
+                b"Authorization: Bearer chat-token\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Transfer-Encoding: chunked\r\n"
+                b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n" + body
+            )
+            response = http.client.HTTPResponse(sock)
+            response.begin()
+            self.assertEqual(200, response.status)
+            self.assertEqual(self.reply["body"], response.read())
+            self.assertEqual("close", (response.getheader("Connection") or "").lower(), response.getheaders())
+            self.assertEqual(b"", sock.recv(1), "the connection stayed open")
+        # The message itself reached the upstream: this is the relayed path,
+        # not a refusal written through _json.
+        self.assertEqual(1, len(self.upstream_requests))
 
 
 if __name__ == "__main__":

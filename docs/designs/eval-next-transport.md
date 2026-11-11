@@ -67,14 +67,17 @@ a card the front door's create returned that was created before the run started,
 clock read before the agent is invoked, is not this run's and stays, files included; this holds on
 both waits below. When the clock or the board cannot be read, such a card is taken like the run's
 own. A card keeps its rows while it runs, or while a card in the fan-out it made or belongs to can still run,
-other than a follow-up linked to its creator. A card still running when the wait ran out is archived
+other than a follow-up linked to its creator. What a purge keeps, or all of it when the board step
+fails, is written down in the agent pod, and the next repetition retries it before its agent is
+invoked, each purge under its own start time, so a card an earlier purge owes goes even when a later
+run's create returned it; anything owed for over a day is given up. A card still running when the wait ran out is archived
 first, which stops its worker, and so are the cards its worker fanned out. A
 customer sees the card result relayed to their thread; they never see the files, the
 store reads, or the collecting turn, which is a model call the customer never made.
 
 The consequence, measured: the presubmit matrix ran under `mode: next` with the A2A gateway in
 `ErrImagePull`, the auth callout in `ImagePullBackOff` and the provisioning Job in `Error`, and
-the job went GREEN (build `2100310325382352896`, admitted-case pass rate 90.0%, no case
+the job went GREEN (build `2100310325382352896`: the admitted-case pass rate inside the margin, no case
 collapsed, every failing repetition a phrase miss the same cases carry under `today`). The gate
 cannot red on a broken next stack until a case sends through it. The same measurement found
 nothing that passed under `today` and failed reproducibly under `next`, which is the other half
@@ -318,7 +321,8 @@ transport gives an exhausted transport retry, because they say the executor lost
 than the persona failing it, the same line the profiles spec draws with `worker-evicted`; the
 persona's reasons, `hermes-exited-nonzero` and `deadline-exceeded`, the API server's 5xx or failed turn,
 unparseable, broken-off or oversize answers (`hermes-api-failed`, `hermes-api-unreadable`,
-`hermes-api-read-failed`, `hermes-api-oversize`), an answer the bridge withheld as the model's own
+`hermes-api-read-failed`, `hermes-api-oversize`), a `cli` child's stdout over the same cap
+(`hermes-cli-oversize`), an answer the bridge withheld as the model's own
 reasoning (`hermes-unstructured-reasoning`), and any reason the harness does not know, are graded failures. A `rejected` terminal, which both executors publish for a
 submission with no text parts, is infrastructure and never graded, because it is the harness's
 own defect. A `canceled` terminal after the harness's own cancel is the graded timeout above, and
@@ -342,8 +346,8 @@ gate, an `authority` block that names a real principal, and the reply rendered i
 transport. `tool_called` reads the trajectory, which on this path carries tool-call data only
 when the executor publishes `activity` artifacts and the door's probe carries them: the relay
 never posts `activity` to a conversation, so the harness reads the trace off the read route when
-the probe body carries an `activity` key (`[]` for a run that called nothing), maps each entry to
-a trajectory item in the api path's shape, and writes one `a2a.activity` marker whenever the key
+the probe body carries an `activity` key (`[]` for a run that called nothing), maps each entry
+the bridge does not label with a card worker's session to a trajectory item in the api path's shape, and writes one `a2a.activity` marker whenever the key
 was present at all; a probe without the key leaves the record with no marker and no calls. Which
 executor publishes `activity`, and whether the door carries it, is each component's own to state
 (the payload spec reserves the artifact; `a2a/gateway/inject.go` defines the probe body); the
@@ -468,20 +472,20 @@ with the `platform_toolsets.cli` bundle: `terminal`, `read_file`, `patch`, `proc
 from the one today's evals reach. The api transport posts to the API server, which runs the
 default profile, the Planning Agent: its model-facing tools are the kanban set, it delegates fleet
 work to the platform persona over a card, and it relays the worker's report. Same prompt, two
-agents reading it: `obtainability-remediation-proposal` is 12 of 12 on the first, where the
-Planning Agent inlines a manifest, and was 0 of 3 on the second, where the persona followed its own
+agents reading it: `obtainability-remediation-proposal` is clean on the first, where the
+Planning Agent inlines a manifest, and collapsed on the second, where the persona followed its own
 rule and opened a pull request (the rule has since been scoped, in `agents/platform/SOUL.md` §3: a
 request to investigate or report is answered in the reply, and a pull request is opened only when
 the request asks for one or for a change to be submitted or fixed; the unattended case is
-`fleet-audit`'s own path); the first run's 94.4% against 77.8% is withdrawn as a like-for-like
+`fleet-audit`'s own path); the first run's rate comparison of the two is withdrawn as a like-for-like
 comparison. The lane now runs the bridge's `api` executor, the default a customer install runs,
 so the turn is the API server's and the agent that answers is the Planning Agent, the one the api
 transport reaches. The delegation wait reads the cards the turn filed from the Planning Agent's
 session store rather than from the trajectory (Completion signals), so a case whose answer is a
 delegated worker's report is graded on that report, as on the api lane. Two differences from the
 api lane remain, and both are the transport's rather than the agent's. A router-scope
-`tool_called` reads the Planning Agent's calls through the door's trace, which carries no worker's
-calls. And the GitHub-write safeguard charges a write to the repetition whose reply or creating
+`tool_called` reads the Planning Agent's calls through the door's trace, from which the harness leaves out the
+calls the bridge labels with a card worker's session. And the GitHub-write safeguard charges a write to the repetition whose reply or creating
 call names it, and the door's trace sends the Planning Agent's arguments as shapes, so on this
 lane what names a write is the reply and the workers' calls the harness reads back from the pod
 once the delegation wait has found the cards; a write neither names is recorded as unattributed
@@ -735,11 +739,11 @@ refuses `EVAL_ROLLBACK_LANE=1` without the flag, before anything is built.
 The flag admits those jobs by name and nothing else without a pull request: section 2b of the
 deploy accepts `EVAL_MODE_NEXT=1` on a run that carries a `PULL_NUMBER` or whose `JOB_NAME` is
 listed in `EVAL_MODE_NEXT_JOB_NAMES` in `hack/ci-deploy.sh` (the merge-blocking presubmit, for
-the batch runs Tide started, the main nightly's three parts
-`ci-kube-agents-eval-nightly`, `ci-kube-agents-eval-nightly-main-b` and
-`ci-kube-agents-eval-nightly-writers`, the GitLab lane's nightly
-under next, the GHES lane's nightly under next (`ci-kube-agents-eval-nightly-ghes-next`), and the release-candidate eval's postsubmit, which grades a candidate in the mode a new
-install gets), and refuses it on any other Prow run, so the flag mis-set on the today-mode GitLab nightly or another
+the batch runs Tide started, the main nightly's eight parts
+`ci-kube-agents-eval-nightly`, `ci-kube-agents-eval-nightly-main-b` to `-main-e`,
+`ci-kube-agents-eval-nightly-writers`, `-writers-b` and `-writers-c`, the GitLab lane's nightly
+under next, the GHES and GitLab CE lanes' weekly jobs under next (`ci-kube-agents-eval-weekly-ghes-next`, `ci-kube-agents-eval-weekly-gitlab-ce-next`), the certification lane's first slice (`ci-kube-agents-certification-1`), and the release-candidate eval's postsubmit, which grades a candidate in the mode a new
+install gets), and refuses it on any other Prow run, so the flag mis-set on another periodic or
 postsubmit still stops the deploy before anything is built. A next-mode run has a record of its own: the baseline version key carries the mode, which
 `bench-gate` reads off the inject transport ([`bench/baselines/README.md`](../../bench/baselines/README.md)),
 so the main nightly appends under a `next` key that today's window never reads, and rung 6 on the

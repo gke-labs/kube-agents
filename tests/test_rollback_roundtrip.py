@@ -1583,8 +1583,8 @@ class NamesMatchTheOperatorTest(unittest.TestCase):
         self.assertNotIn("a2aCredsSecretName", cleanup)
         self.assertNotIn("PersistentVolumeClaim", cleanup)
         # And the StatefulSet's PVC retention policy keeps the claim when the
-        # StatefulSet is deleted (a scale-down deletes the claims it removes,
-        # which a flip does not do).
+        # StatefulSet is deleted (and, in this release, on a scale-down too;
+        # #4225 changes WhenScaled with the migration).
         sts = text[text.index("func buildA2ANATSStatefulSet(") :]
         sts = sts[: sts.index("\nfunc ")]
         self.assertIn("WhenDeleted: appsv1.RetainPersistentVolumeClaimRetentionPolicyType", sts)

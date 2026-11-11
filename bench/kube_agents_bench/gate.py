@@ -71,6 +71,7 @@ from collections.abc import Collection, Sequence
 from pathlib import Path
 from typing import Any
 
+from kube_agents_bench import chat_shape
 from kube_agents_bench.baselines import (
     ADMITTED_BY_RECORD,
     MODE_NEXT,
@@ -223,12 +224,18 @@ REP_TIMING_TURN1_KEY = "turn1_s"
 # collector reads `0.0` as unknown.
 REP_TIMING_DECIMALS = 1
 # The keys of the `rep N tokens:` line, which the collector
-# (scripts/eval_dashboard/collect.py, _REP_TOKENS_KEYS) parses the same way:
-# the record's top-level counts, and the flag, printed only when set, that
-# says they are short of what the run billed.
+# (scripts/eval_dashboard/collect.py, _REP_TOKENS_KEYS and
+# _REP_TOKENS_SPLIT_KEYS) parses the same way: the record's top-level counts,
+# then its prompt split (cache reads, cache writes, reasoning) when its
+# `input` excludes cache reads, and the flag, printed only when set, that
+# says they are short of what the run billed. The split keys come after
+# `total`, so a line without them reads as it always did.
 REP_TOKENS_INPUT_KEY = "input"
 REP_TOKENS_OUTPUT_KEY = "output"
 REP_TOKENS_TOTAL_KEY = "total"
+REP_TOKENS_CACHED_KEY = "cached"
+REP_TOKENS_CACHE_WRITE_KEY = "cache_write"
+REP_TOKENS_REASONING_KEY = "reasoning"
 REP_TOKENS_PARTIAL_FIELD = "partial=1"
 
 # What must not reach the log line: C0 and C1 controls and DEL (a captured
@@ -547,14 +554,25 @@ def _cmd_case(args: argparse.Namespace) -> int:
                 (REP_TOKENS_INPUT_KEY, rep.input_tokens),
                 (REP_TOKENS_OUTPUT_KEY, rep.output_tokens),
                 (REP_TOKENS_TOTAL_KEY, token_count(rep.total_tokens)),
+                (REP_TOKENS_CACHED_KEY, rep.cached_tokens),
+                (REP_TOKENS_CACHE_WRITE_KEY, rep.cache_write_tokens),
+                (REP_TOKENS_REASONING_KEY, rep.reasoning_tokens),
             )
             if value is not None
         )
         if counts:
             partial = f" {REP_TOKENS_PARTIAL_FIELD}" if rep.tokens_partial else ""
             print(f"  rep {rep.index} tokens: {counts}{partial}")
+        # The delivered reply's shape under chat_shape.KEYS, a flag as 1 or
+        # 0, for the eval dashboard to collect. Reported, never scored; no line
+        # for a run that delivered nothing.
+        if rep.shape:
+            shape = " ".join(
+                f"{key}={int(rep.shape[key])}" for key in chat_shape.KEYS if key in rep.shape
+            )
+            print(f"  rep {rep.index} shape: {shape}")
         # The agent's own words, one line under the grading line (after the
-        # timing and tokens lines) of every repetition that did not pass, so the dashboard can quote the report
+        # timing, tokens and shape lines) of every repetition that did not pass, so the dashboard can quote the report
         # beside the check that failed. A pass needs no quote; an empty
         # report (a transport failure's, typically) prints nothing rather
         # than an empty line. Its own shape -- `rep N report:` -- so nothing

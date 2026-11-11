@@ -28,8 +28,9 @@
 #     -2 the same way; this run checks -0, which every bus has). The NATS StatefulSet's
 #     volumeClaimTemplate (a2aNATSDataClaim, "data") stamps it out, so it has
 #     no owner reference, and the StatefulSet's PVC retention policy keeps
-#     claims when the StatefulSet itself is deleted (WhenDeleted: Retain; a
-#     scale-down deletes the claims it removes, which a flip never does). The flip
+#     claims when the StatefulSet itself is deleted (WhenDeleted: Retain), and
+#     in this release on a scale-down too (WhenScaled: Retain; #4225 changes
+#     that with the migration). The flip
 #     forward renders the same template under the same StatefulSet name, and
 #     the StatefulSet controller binds the claim of that name that is already
 #     there.
@@ -873,7 +874,7 @@ inject_target() {
       note "svc/${INJECT_NAME} has no selector; forwarding to the service" >&2
     elif ! pods="$(k_read get pods -l "${selector%,}" -o name)"; then
       note "listing the pods svc/${INJECT_NAME} selects failed; forwarding to the service" >&2
-    elif printf '%s\n' "${pods}" | grep -qxF "pod/${holder}"; then
+    elif grep -qxF "pod/${holder}" <<<"${pods}"; then
       echo "pod/${holder}"
       return 0
     else
@@ -1011,7 +1012,7 @@ wait_bridges_consuming() {
   while :; do
     missing=""
     for sidecar in ${BUS_SIDECARS}; do
-      if ! k logs "deployment/${AGENT_DEPLOYMENT}" -c "${sidecar}" --tail="${BRIDGE_LOG_TAIL_LINES}" 2>/dev/null | grep -qF "${BRIDGE_CONSUMING_LOG_MSG}"; then
+      if ! grep -qF "${BRIDGE_CONSUMING_LOG_MSG}" <<<"$(k logs "deployment/${AGENT_DEPLOYMENT}" -c "${sidecar}" --tail="${BRIDGE_LOG_TAIL_LINES}" 2>/dev/null)"; then
         missing="${missing} ${sidecar}"
       fi
     done

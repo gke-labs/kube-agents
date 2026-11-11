@@ -440,7 +440,7 @@ check "python3 exists (execute_code probes for it)" "python3" \
   "$("${SSH[@]}" 'command -v python3' 2>&1)"
 check "tar exists (file sync is tar over ssh, not sftp)" "tar" \
   "$("${SSH[@]}" 'command -v tar' 2>&1)"
-check "leeway exists (topology drift CLI)" "v0.1.3" \
+check "leeway exists (topology drift CLI)" "v0.1.5" \
   "$("${SSH[@]}" 'leeway version' 2>&1)"
 # tar run as root keeps the owner an archive records unless told
 # --no-same-owner, and the helm and leeway archives both record uid 1001, which
@@ -935,7 +935,8 @@ check "leeway report dispatches cluster reads through stock kubectl" "kubectl ge
 # The kube-proxy kubeconfigs name the cluster in the server URL's path
 # (entrypoint.sh: `server: ${KUBE_PROXY_URL}/clusters/<ctx>`), and before
 # kubectl 1.34 `get --raw` replaced that path with the raw path, so every paged
-# collection read landed on the proxy's default cluster and nothing failed.
+# collection read reached the proxy with no cluster in it (#4739): it landed on
+# the host and nothing failed, and the proxy now refuses such a request.
 # Proved against the installed binary rather than its version string: a server
 # inside the container records the path it receives from a `--raw` read sent
 # through a kubeconfig whose server carries `/clusters/seeded-a`.

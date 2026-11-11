@@ -36,6 +36,17 @@ sandbox stays silent and is retried on the next tick. The first run
 ``RETIRE_AFTER_SECONDS`` or more after a delivery removes the two onboarding
 cron jobs; ``_retire_jobs`` says why the delivering run cannot.
 
+A report nobody aligns to takes a third path (#4058). Once the sweep has been
+filed for ``UNSPOKEN_FILE_AFTER_SECONDS`` with no human marker, the run files
+the report as a ledger issue, in the GitOps repository when it is on GitHub or
+else in the install's one managed GitHub repository, beside the first-run
+audits' own, claims the delivery, and sends one line linking the issue to the
+platform whose home posts route through the gateway (kept there for the digest
+when no home channel is set). An install with no such repository keeps the
+report in the store, and ``UNDELIVERED_RETIRE_SECONDS`` after the sweep, the
+age past which the plugin primes nothing, the report is claimed without a post
+and retired in favour of the scheduled audits.
+
 With the flag on and a Slack destination, the report goes out as a card instead,
 built by ``inventory_card`` from the files the prioritization worker left beside
 the report (the items, scores, limits and shown files, read once before the claim
@@ -76,9 +87,11 @@ an older stage's no-repository skip ran the workload checks in the scan), and a 
 otherwise read as a healthy fleet. It also names every shipped fleet audit that ran since the sweep
 was filed and whose summary was not posted, however its run started, with a request for those
 reports (``_lost_audits``): an audit that finished before anyone opened the chat had no home channel
-to post to, and nothing posts it later. The note is built before the claim. The text path appends it
-to the report; the
-card paths print it on their own, since the card leaves closing lines out.
+to post to. A first-run audit's summary is posted after all by the ``oobe`` tick's last stage,
+``resend_lost_summaries``, once the operator projects a home channel, while its run is inside
+``RESEND_WINDOW_SECONDS``; every other one keeps the request. The note is built before the claim. The
+text path appends it to the report; the card paths print it on their own, since the card leaves
+closing lines out.
 
 Just before the claim, the run registers the sweep's findings in the
 findings queue from this pod, from the items and scores the prioritization
@@ -128,6 +141,8 @@ from typing import NamedTuple
 import bootstrap_handoff  # beside this script in the pod
 import chat_notify  # beside this script in the pod
 import findings_queue as fq  # beside this script in the pod
+import forge  # beside this script in the pod
+import gitops_workspace  # beside this script in the pod
 import inventory_card  # beside this script in the pod
 import inventory_findings  # beside this script in the pod
 import oobe  # beside this script in the pod
@@ -365,6 +380,14 @@ RELAY_POSTED_AT_FORMAT = "%Y-%m-%d %H:%M:%S"
 # One ended run: (claimed_at, finished_at, delivery_outcome, status).
 AuditRun = tuple[float, float | None, str | None, str]
 
+
+class LostRun(NamedTuple):
+    """One audit whose newest run in its window posted nothing: a lost summary, or a crashed run's lost notice."""
+
+    audit: str
+    crashed: bool
+    claimed_at: float
+
 # The sentence that names the home channel, and what replaces it where the gateway has none to post
 # to (no A2A_NOTIFY_PLATFORM on the conversation path).
 AUDITS_HOME_SENTENCE = "Each posts a summary to the home channel when it finds something new."
@@ -372,6 +395,40 @@ AUDITS_NO_HOME_SENTENCE = (
     "Each one's summary goes to the home channel, and this install has none yet, so those summaries "
     "are not posted to chat."
 )
+
+# A first-run audit whose summary found no home channel is posted again by the re-send stage
+# (``resend_lost_summaries``) once the operator projects one: a request to the chat relay's own route,
+# on the findings endpoint's server, so the relay reads the audit's chat report record and posts it as a
+# scheduled run's delivery leg would, and records the post in ``audit_report_runs``.
+CRON_REPORTS_PATH = "/v1/cron-reports"
+# The relay reads the audit's record only for a request carrying this key (session_kv_server.SCHEDULER_LEG_KEY).
+SCHEDULER_LEG_KEY = "also_delivered_to"
+# What the relay posts when it cannot tell the job for a fleet audit (its roster unreadable): the request
+# that fetches the report, so the message still leads to it.
+RESEND_FALLBACK_REPORT = (
+    "The {label} ran during onboarding, before this channel was set. To see its report, send me: `{request}`"
+)
+# A run is re-sent only while its claim is this recent. The relay posts an audit's record only under its own
+# two-hour age (session_kv_server.CHAT_REPORT_MAX_AGE_S) and a "did not finish" notice past it; the record is
+# written during the run, after the claim, so a claim inside this window keeps the record inside the relay's.
+RESEND_WINDOW_SECONDS = 90 * 60
+# The request's fields, as the relay plugin (deploy/docker/plugins/chat/adapter.py) names them.
+REQUEST_JOB_KEY = "job_id"
+REQUEST_PROFILE_KEY = "profile"
+REQUEST_TITLE_KEY = "title"
+REQUEST_REPORT_KEY = "report"
+# How many times one audit's re-send is tried, one per tick. An answered request settles the audit
+# (``RESENT_POSTED_KEY``); for one whose answer was lost the relay's own record decides; the cap is for a
+# relay that keeps refusing. A refusal while the gateway's projected copy of the home file still lags the
+# agent's (one kubelet refresh) costs one of these, and the gateway keeps that post for its digest.
+RESEND_MAX_ATTEMPTS = 5
+# One request to the relay, which posts synchronously and answers when the post has landed or failed.
+RESEND_TIMEOUT_SECONDS = 180
+RELAY_ANSWER_MAX_CHARS = 300
+# ``audit -> {"tries": n, "posted": bool}``, beside the other markers; absent until the first try.
+RESENT_FILE = ".oobe_summaries_resent.json"
+RESENT_TRIES_KEY = "tries"
+RESENT_POSTED_KEY = "posted"
 
 # Under spec.mode next the plugin records the conversation the report goes to (its
 # CONVERSATION_FILE) and touches CONVERSATION_ALIGNED_MARKER in place of .user_aligned. Either one
@@ -429,6 +486,126 @@ THREAD_ID_KEY = "thread_id"
 # retries. A greeting that runs longer still arrives, after the report.
 GREETING_PENDING_GLOB = ".bootstrap_greeting_pending.*"
 GREETING_WAIT_SECONDS = 300
+
+
+# The report when no chat thread can take it (#4058). A human who speaks in
+# Slack or Google Chat binds the report to that thread (the plugin's
+# ``.user_aligned`` markers); an install nobody speaks to, or one with no chat
+# platform at all, would otherwise hold the report forever. So once the sweep
+# has been filed for UNSPOKEN_FILE_AFTER_SECONDS with nobody aligned, the report
+# is filed as a ledger issue (the GitOps repository when it is on GitHub, else
+# the one managed GitHub repository), beside the first-run audits' own, and one
+# line linking it goes to the home channel when a platform
+# routes there (kept by the gateway for its digest when no home channel is
+# set). The wait is what tells "nobody yet" from "nobody": a chat install's
+# first message usually comes within hours of install, and a report filed as an
+# issue before it would pre-empt the thread it was written for.
+SECONDS_PER_DAY = 24 * 60 * 60
+UNSPOKEN_FILE_AFTER_SECONDS = 1 * SECONDS_PER_DAY
+# Past this age the plugin primes nothing (bootstrap_onboarding
+# SCAN_MAX_AGE_SECONDS), so no thread can ever take the report: a run that
+# finds it still undelivered claims it without posting and lets the scheduled
+# audits, which by then say more, stand in. Pinned equal by a test.
+UNDELIVERED_RETIRE_SECONDS = 7 * SECONDS_PER_DAY
+# The ledger issue: found again by its label and body marker, so a run that
+# died between the create and its record reuses the issue rather than opening
+# a second. The label mirrors chat_delivery_watch's, which the same broker
+# verbs maintain.
+REPORT_ISSUE_LABEL = "agent:onboarding"
+REPORT_ISSUE_LABEL_COLOR = "0E8A16"
+REPORT_ISSUE_LABEL_DESCRIPTION = "Onboarding's first-run inventory report, filed when no chat thread could take it"
+REPORT_ISSUE_MARKER = "<!-- onboarding-first-report -->"
+# The marker that names this install's sweep, so an install that shares the
+# repository with another (dev projects reinstall onto one) reuses only its own
+# issue; REPORT_ISSUE_MARKER alone still finds an older build's issue.
+REPORT_ISSUE_SWEEP_MARKER = "<!-- onboarding-first-report sweep={sweep} -->"
+# Written by the retire path beside the claim; with REPORT_FILED_FILE it is
+# what tells a claim this path kept from one its run died holding.
+REPORT_RETIRED_FILE = ".bootstrap_report_retired"
+# Written by the no-human path just before it claims and removed with every
+# release of that claim: a claim beside it with neither record above is one a
+# run died holding, and the stale-claim rule releases it; the origin path, which
+# never writes it, keeps its claim settled the moment it exists, as before.
+REPORT_CLAIMING_FILE = ".bootstrap_report_claiming"
+REPORT_ISSUE_TITLE = "First-run inventory report ({date} UTC)"
+REPORT_ISSUE_INTRO = (
+    "Onboarding's first-run inventory report, filed here on {date} UTC because no chat thread could take it: "
+    "nobody had written to the agent on Slack or Google Chat since the sweep was filed on {filed} UTC. "
+    "It describes the fleet as it was then; the scheduled audits carry the current picture."
+)
+REPORT_ISSUE_LIST_LIMIT = 20
+# Ceiling on each of the no-human path's forge calls between its claim and its record (two
+# listings, the label, the create), so the claim-to-record window stays under the stale rule:
+# a slow broker must not let the next tick release a live run's claim and open a second issue.
+# ``test_bootstrap_onboarding_scripts`` pins four of these plus the margin under STALE_CLAIM_SECONDS.
+REPORT_FORGE_CALL_TIMEOUT_SECONDS = 90
+REPORT_FORGE_CALLS_BEFORE_RECORD = 4
+REPORT_ISSUE_DATE_FMT = "%Y-%m-%d %H:%M"
+# Where this stage records the issue it filed (repository, number, when), read
+# by a later run's log line and by an operator asking where the report went.
+REPORT_FILED_FILE = ".bootstrap_report_filed"
+FILED_REPO = "repo"
+FILED_NUMBER = "number"
+FILED_URL = "url"
+FILED_AT = "filed_at"
+# The issue's web address when the broker's answer carries none: github.com for
+# an `owner/name` slug, the named host for a GitHub Enterprise Server
+# `host/owner/name` one (gitops_workspace.get_managed_github_repo_names).
+ISSUE_URL_FORMAT = "https://{host}/{slug}/issues/{number}"
+ISSUE_URL_DEFAULT_HOST = "github.com"
+# The keys a broker answer may carry the issue's address under, and what an address starts with.
+ISSUE_URL_KEYS = ("html_url", "url")
+URL_SCHEME_PREFIX = "http"
+# GitHub refuses an issue body past this many characters; a report that long is
+# recorded as unfilable rather than retried five times for a 422.
+ISSUE_BODY_MAX_CHARS = 65536
+# This path's own record of attempts that released the claim (the conversation
+# path keeps CONVERSATION_ATTEMPTS_FILE): the two must not share a count, or
+# five refused creates would stop the thread delivery a human binds later.
+REPORT_ATTEMPTS_FILE = ".bootstrap_report_attempts.json"
+# The one line that goes to the home channel once the issue is up: a link, so a
+# reader opens the report from the message (chat_ux.md, no plumbing in user
+# text), and the user's own fact rather than the stage's. ``a2a notify`` exits
+# NOTIFY_KEPT when the gateway kept it for its digest, which is delivery
+# enough: the digest names it, dated, once a home channel is set.
+REPORT_ISSUE_HOME_POST = (
+    "First-run inventory report filed at {url} on {date} UTC: nobody had written to me in chat since the "
+    "first look at your fleet."
+)
+# The reasons this path records (REPORT_ATTEMPTS_FILE), one per tick at most.
+NO_LEDGER_REPO_REASON = (
+    "no chat thread took the first-run report and the install has no GitOps repository to file it in; "
+    "it stays in the report store"
+)
+REPORT_LEDGER_REPO_ENV = "ONBOARDING_LEDGER_REPO"
+LEDGER_REPO_AMBIGUOUS_REASON = (
+    "no chat thread took the first-run report and the install manages {count} GitHub repositories with no "
+    "GitOps role among them; not choosing one to file it in (set " + REPORT_LEDGER_REPO_ENV + " to name it)"
+)
+REPORT_RETIRED_NOTE = (
+    "the first-run report was not delivered within {days} days of the sweep and is retired; "
+    "the scheduled audits stand in for it"
+)
+REPORT_FILED_NOTE = "the first-run report went to {ref}: no chat thread took it"
+REPORT_RECORD_FAILED_NOTE = (
+    "the first-run report went to {ref}, but its record could not be written; the report stays until a later"
+    " run records the filing"
+)
+REPORT_UNLABELLED_NOTE = (
+    "the first-run report issue {ref} carries no " + REPORT_ISSUE_LABEL + " label (the repository refused it); "
+    "the issue resolver will not skip it"
+)
+REPORT_FILING_FAILED_REASON = "filing the first-run report in {repo} failed: {error!r}"
+REPORT_NO_ISSUE_AT_CAP_REASON = "no more tries: no issue of this sweep is open in {repo}; the report waits for the retire"
+LEDGER_REPO_UNREADABLE_REASON = "the managed repositories could not be read: {error}; the first-run report waits"
+REPORT_HOME_LINE_NOTE = "the home line for the filed report {outcome}"
+HOME_LINE_POSTED = "was posted"
+HOME_LINE_KEPT = "was kept by the gateway for its digest (no home channel yet)"
+HOME_LINE_FAILED = "was not posted (a2a notify exited {code}: {detail})"
+HOME_LINE_NO_EXIT = "none"
+REPORT_TOO_LONG_REASON = (
+    "the first-run report is longer than an issue body may be ({chars} characters, limit {limit}); not filing it"
+)
 
 
 def _data_dir() -> Path:
@@ -498,9 +675,9 @@ def _bound_conversation(data_dir: Path) -> dict | None:
     return {key: str(record.get(key) or "").strip() for key in CONVERSATION_KEYS}
 
 
-def _read_attempts(data_dir: Path) -> dict:
+def _read_attempts(data_dir: Path, name: str = CONVERSATION_ATTEMPTS_FILE) -> dict:
     try:
-        record = json.loads((data_dir / CONVERSATION_ATTEMPTS_FILE).read_text(encoding="utf-8"))
+        record = json.loads((data_dir / name).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
     return record if isinstance(record, dict) else {}
@@ -511,10 +688,10 @@ def _attempt_count(record: dict) -> int:
     return count if isinstance(count, int) and not isinstance(count, bool) and count > 0 else 0
 
 
-def _record_attempt(data_dir: Path, reason: str, counted: bool) -> None:
+def _record_attempt(data_dir: Path, reason: str, counted: bool, name: str = CONVERSATION_ATTEMPTS_FILE) -> None:
     """Record why the report is not out; ``counted`` adds one post that released the claim."""
     sys.stderr.write(f"bootstrap_delivery: {reason}\n")
-    record = _read_attempts(data_dir)
+    record = _read_attempts(data_dir, name)
     count = _attempt_count(record) + (1 if counted else 0)
     if not counted and record.get(ATTEMPTS_REASON) == reason:
         return  # the same block as the last tick's: no write each minute
@@ -524,7 +701,7 @@ def _record_attempt(data_dir: Path, reason: str, counted: bool) -> None:
         record[ATTEMPTS_AT] = time.time()
     if counted and count >= CONVERSATION_MAX_ATTEMPTS:
         _stage_note(data_dir, f"the report was not posted after {count} attempts and now waits: {reason}")
-    target = data_dir / CONVERSATION_ATTEMPTS_FILE
+    target = data_dir / name
     tmp = target.with_name(target.name + ".tmp")
     try:
         tmp.write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
@@ -538,34 +715,122 @@ def _outcome_recorded(data_dir: Path) -> bool:
 
 
 def delivery_settled(data_dir: Path) -> bool:
-    """Whether a taken claim may retire the jobs: always on the origin path, and
-    on the conversation path only once the report's post recorded an outcome."""
-    return _bound_conversation(data_dir) is None or _outcome_recorded(data_dir)
+    """Whether a taken claim may retire the jobs: always on the origin path (a human was aligned),
+    on the conversation path once the report's post recorded an outcome, and on the path with no
+    human once the filing or the retire is on record; a claim that run died holding is released
+    like a stale conversation claim."""
+    if (data_dir / REPORT_CLAIMING_FILE).exists():
+        # This path's claim: its own record settles it, whatever a conversation bound a moment
+        # later says; that conversation's run finds the report archived and posts nothing.
+        return (data_dir / REPORT_FILED_FILE).exists() or (data_dir / REPORT_RETIRED_FILE).exists()
+    if _bound_conversation(data_dir) is not None:
+        return _outcome_recorded(data_dir)
+    return True
 
 
-def _release_claim(data_dir: Path) -> None:
+def _mark_claiming(data_dir: Path) -> bool:
+    """Mark the claim about to be taken as this path's; without the mark no claim is taken, since an
+    unmarked claim that then dies would read as a delivered origin claim and retire the jobs.
+
+    ``O_EXCL``, so a marker already there is never overwritten: it is another no-human run's (a manual
+    run beside the tick), either holding the claim or about to take it, and this run yields to it. A
+    marker with no claim behind it that is older than ``STALE_CLAIM_SECONDS`` was left by a run that
+    died between its mark and its claim; it is taken over."""
+    marker = data_dir / REPORT_CLAIMING_FILE
+    for _ in range(2):
+        try:
+            fd = os.open(str(marker), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            if (data_dir / ".bootstrap_completed").exists():
+                return False
+            try:
+                if time.time() - marker.stat().st_mtime < STALE_CLAIM_SECONDS:
+                    return False
+                marker.unlink()
+            except OSError:
+                return False
+            continue
+        except OSError as e:
+            sys.stderr.write(f"bootstrap_delivery: could not record the claim's path, not claiming: {e}\n")
+            return False
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(f"{time.time()}\n")
+        except OSError as e:
+            # The marker exists but its write failed: take it back, or it holds every later run for
+            # STALE_CLAIM_SECONDS and makes a human's claim in that window read as a stale one of ours.
+            sys.stderr.write(f"bootstrap_delivery: could not write the claim's path marker, not claiming: {e}\n")
+            try:
+                marker.unlink()
+            except OSError:
+                pass
+            return False
+        return True
+    return False
+
+
+def _unmark_claiming(data_dir: Path) -> None:
+    """A lost claim is an origin run's (it got there first, with no marker of its own): the marker
+    this run wrote must not make theirs read as one of this path's with no record. A marker another
+    no-human run wrote is never this run's to remove: ``_mark_claiming`` does not write over one."""
     try:
-        (data_dir / ".bootstrap_completed").unlink()
+        (data_dir / REPORT_CLAIMING_FILE).unlink()
     except FileNotFoundError:
         pass
     except OSError as e:
-        sys.stderr.write(f"bootstrap_delivery: could not release the claim: {e}\n")
+        sys.stderr.write(f"bootstrap_delivery: could not drop the claim's path marker: {e}\n")
+
+
+def _claim_for_this_path(data_dir: Path) -> bool:
+    if not _mark_claiming(data_dir):
+        return False
+    if _claim_delivery(data_dir):
+        return True
+    _unmark_claiming(data_dir)
+    return False
+
+
+def _drop_orphan_claiming_marker(data_dir: Path) -> None:
+    """Remove a no-human path marker that has no claim behind it, before a human's claim."""
+    if (data_dir / ".bootstrap_completed").exists():
+        return
+    try:
+        (data_dir / REPORT_CLAIMING_FILE).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        sys.stderr.write(f"bootstrap_delivery: could not drop an orphan claim marker: {e}\n")
+
+
+def _release_claim(data_dir: Path) -> None:
+    for name in (".bootstrap_completed", REPORT_CLAIMING_FILE):
+        try:
+            (data_dir / name).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            sys.stderr.write(f"bootstrap_delivery: could not release the claim ({name}): {e}\n")
 
 
 def _release_stale_claim(data_dir: Path, claimed_at: float) -> None:
-    """Release a conversation-path claim whose run never recorded an outcome.
+    """Release a claim whose run never recorded an outcome: a conversation-path one, or a no-human
+    one (``REPORT_CLAIMING_FILE`` beside it), each recorded in its own record.
 
-    Only past ``STALE_CLAIM_SECONDS``, so a run still posting keeps it. It
-    counts as an attempt unless one was already recorded after the claim.
+    Only past ``STALE_CLAIM_SECONDS``, so a run still posting keeps it. A conversation-path release
+    counts as an attempt unless one was already recorded after the claim. A no-human release is
+    recorded but not counted: that run may have opened the issue before it died, and the count's cap
+    would stop the next run short of the lookup that finds the issue again.
     """
     if time.time() - claimed_at < STALE_CLAIM_SECONDS:
         return
+    no_human = (data_dir / REPORT_CLAIMING_FILE).exists()
+    name = REPORT_ATTEMPTS_FILE if no_human else CONVERSATION_ATTEMPTS_FILE
     try:
-        last = float(_read_attempts(data_dir).get(ATTEMPTS_AT))
+        last = float(_read_attempts(data_dir, name).get(ATTEMPTS_AT))
     except (TypeError, ValueError):
         last = 0.0
     if last <= claimed_at:
-        _record_attempt(data_dir, "a run claimed the report and recorded no outcome; trying again", counted=True)
+        _record_attempt(data_dir, "a run claimed the report and recorded no outcome; trying again", counted=not no_human, name=name)
     _release_claim(data_dir)
 
 
@@ -890,14 +1155,18 @@ def _mark_registered(data_dir: Path) -> None:
         sys.stderr.write(f"bootstrap_delivery: could not touch {FINDINGS_REGISTERED_MARKER}: {e}\n")
 
 
-def _post_surfaced(endpoint: str, finding_id: str, body: dict) -> None:
+def _session_kv_headers() -> dict[str, str]:
     headers = dict(JSON_HEADERS)
     token = (os.environ.get(SESSION_KV_AUTH_ENV) or "").strip()
     if token:
         headers[AUTH_HEADER] = f"{BEARER_PREFIX}{token}"
+    return headers
+
+
+def _post_surfaced(endpoint: str, finding_id: str, body: dict) -> None:
     path = SURFACED_PATH.format(id=urllib.parse.quote(finding_id, safe=""))
     request = urllib.request.Request(
-        f"{endpoint}{path}", data=json.dumps(body).encode("utf-8"), headers=headers, method="POST"
+        f"{endpoint}{path}", data=json.dumps(body).encode("utf-8"), headers=_session_kv_headers(), method="POST"
     )
     with urllib.request.urlopen(request, timeout=MARK_TIMEOUT_SECONDS) as response:
         response.read()
@@ -1100,8 +1369,8 @@ def _lost_sentences(data_dir: Path, state: dict) -> list[str]:
     if runs is None:
         return [AUDITS_UNREAD_NOTE.format(request=_request(audits))]
     lost = _lost_audits(audits, runs, _windows(data_dir, state, audits), _relay_posts(data_dir))
-    summaries = [a for a, crashed in lost if not crashed]
-    failed = [a for a, crashed in lost if crashed]
+    summaries = [run.audit for run in lost if not run.crashed]
+    failed = [run.audit for run in lost if run.crashed]
     sentences = []
     if summaries:
         labels = ", ".join(_audit_label(a) for a in summaries)
@@ -1292,8 +1561,8 @@ def _relay_posts(data_dir: Path) -> dict[str, float] | None:
 
 
 def _lost_audits(audits: tuple[str, ...], runs: dict[str, list[AuditRun]], windows: dict[str, float],
-                 posts: dict[str, float] | None) -> list[tuple[str, bool]]:
-    """``(audit, its run failed)`` for each audit whose newest run in its window with something to post did not post it.
+                 posts: dict[str, float] | None) -> list[LostRun]:
+    """A ``LostRun`` for each audit whose newest run in its window with something to post did not post it.
 
     A run that ends before anyone has opened the chat finds no home channel, the relay refuses
     it, and nothing posts it later; this delivery is the first message that user reads. Runs are
@@ -1327,15 +1596,146 @@ def _lost_audits(audits: tuple[str, ...], runs: dict[str, list[AuditRun]], windo
                 continue
             if kind == OUTCOME_LOST and status == RUN_FAILED_STATUS:
                 if not crashed:
-                    lost.append((audit, True))
+                    lost.append(LostRun(audit, True, claimed))
                 crashed = True
                 continue
             if kind == OUTCOME_LOST:
-                lost.append((audit, False))
+                lost.append(LostRun(audit, False, claimed))
                 break
             if posts is None and status != RUN_FAILED_STATUS:
                 break
     return lost
+
+
+def _resend_state(data_dir: Path) -> dict[str, dict]:
+    """``audit -> {"tries": n, "posted": bool}`` from ``RESENT_FILE``; empty when absent or unreadable."""
+    try:
+        raw = json.loads((data_dir / RESENT_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {k: v for k, v in raw.items() if isinstance(k, str) and isinstance(v, dict)}
+
+
+def _resend_tries(entry: dict) -> int:
+    tries = entry.get(RESENT_TRIES_KEY)
+    return tries if isinstance(tries, int) and not isinstance(tries, bool) else 0
+
+
+def _record_resend(data_dir: Path, audit: str, tried: bool, posted: bool) -> None:
+    """Count a try and settle ``audit`` once the relay answered, replacing the file whole so a run killed
+    mid-write leaves the previous one."""
+    state = _resend_state(data_dir)
+    entry = state.get(audit, {})
+    entry[RESENT_TRIES_KEY] = _resend_tries(entry) + (1 if tried else 0)
+    entry[RESENT_POSTED_KEY] = bool(entry.get(RESENT_POSTED_KEY)) or posted
+    state[audit] = entry
+    target = data_dir / RESENT_FILE
+    tmp = target.with_name(target.name + oobe.TMP_SUFFIX)
+    tmp.write_text(json.dumps(state, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.replace(target)
+
+
+class RelayAnswer(NamedTuple):
+    """One request's outcome: the line for the log, whether the relay answered (the audit is settled), and
+    whether the request counts as a try."""
+
+    outcome: str
+    posted: bool
+    tried: bool
+
+
+def pending_resends(data_dir: Path, state: dict, now: float) -> list[LostRun]:
+    """The first-run audits whose summary found no home channel and whose report the relay can still post.
+
+    ``_lost_audits`` over the first-run chain, less the crashed runs (a failure notice is not a report), the
+    runs claimed more than ``RESEND_WINDOW_SECONDS`` ago, and the audits tried ``RESEND_MAX_ATTEMPTS`` times.
+    Less the audits the relay answered for (``RESENT_POSTED_KEY``): a relay row settles the audit in
+    ``_lost_audits`` only until a later run of it fails, after which the earlier run reads as lost again, and
+    a relay that could not tell the job posted the request text and wrote no row. Nothing when the run records
+    or the relay's cannot be read: without the relay's record a post whose answer was lost cannot be told from
+    a lost one, and a second copy is what the record guards against.
+    """
+    audits = tuple(oobe.FIRST_RUN_AUDITS)
+    runs = _audit_runs(data_dir, audits)
+    if not runs:
+        return []
+    posts = _relay_posts(data_dir)
+    if posts is None:
+        return []
+    resent = _resend_state(data_dir)
+    return [
+        run
+        for run in _lost_audits(audits, runs, _windows(data_dir, state, audits), posts)
+        if not run.crashed
+        and now - run.claimed_at <= RESEND_WINDOW_SECONDS
+        and not resent.get(run.audit, {}).get(RESENT_POSTED_KEY)
+        and _resend_tries(resent.get(run.audit, {})) < RESEND_MAX_ATTEMPTS
+    ]
+
+
+def _job_titles(data_dir: Path) -> dict[str, str]:
+    """``job id -> name`` from the Platform Agent's roster, the title a scheduled delivery carries; empty when unreadable."""
+    jobs = oobe.roster_jobs(data_dir) or []
+    return {str(job["id"]): str(job.get("name") or "") for job in jobs if job.get("id")}
+
+
+def _post_cron_report(audit: str, title: str) -> RelayAnswer:
+    """Ask the relay to post ``audit``'s latest report as a scheduled run's delivery leg would.
+
+    A 2xx settles the audit: the relay posted the report, or a notice in its place, and asking again
+    would post a notice. A refusal is a try; so is an answer that does not come, which is not a
+    failure: the relay may have posted, and its record says so next tick.
+    """
+    body = {
+        REQUEST_JOB_KEY: audit,
+        REQUEST_PROFILE_KEY: oobe.PLATFORM_PROFILE,
+        REQUEST_TITLE_KEY: title,
+        REQUEST_REPORT_KEY: RESEND_FALLBACK_REPORT.format(label=title, request=_request([audit])),
+        SCHEDULER_LEG_KEY: [],
+    }
+    request = urllib.request.Request(
+        f"{_findings_endpoint()}{CRON_REPORTS_PATH}",
+        data=json.dumps(body).encode("utf-8"),
+        headers=_session_kv_headers(),
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=RESEND_TIMEOUT_SECONDS) as response:
+            answer = json.loads(response.read().decode("utf-8", "replace") or "{}")
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:RELAY_ANSWER_MAX_CHARS]
+        return RelayAnswer(f"the relay answered {e.code}: {detail}", False, True)
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        return RelayAnswer(f"no answer from the relay, which may have posted; its record decides the next tick: {e!r}", False, True)
+    status = answer.get("status") if isinstance(answer, dict) else None
+    return RelayAnswer(f"the relay answered {status or 'ok'}", True, True)
+
+
+def resend_lost_summaries(data_dir: Path, now: float) -> None:
+    """The ``oobe`` stage that posts the first-run audit summaries the want of a home channel lost.
+
+    A first-run audit that ends before anyone has opened the chat finds no home channel: under
+    ``spec.mode: next`` the gateway keeps the post for its digest, the run is recorded failed, and
+    nothing posts the summary once the channel is learned minutes later. This stage watches the home
+    channel the operator projects into the pod (``chat_notify.home_file``: Slack under next; today mode
+    and Google Chat project none, and get no re-send) and, once it names a channel, asks the chat relay
+    to post each pending run's report through the route a scheduled run's delivery leg takes, so the
+    relay reads the audit's own chat report record, posts it the same way, and records the post. The
+    relay's answer settles the audit in ``RESENT_FILE``; for a request whose answer was lost the relay's
+    record decides. Each outcome goes to the stage log.
+    """
+    if not chat_notify.home_file_value():
+        return
+    pending = pending_resends(data_dir, oobe.read_state(data_dir), now)
+    if not pending:
+        return
+    titles = _job_titles(data_dir)
+    for run in pending:
+        answer = _post_cron_report(run.audit, titles.get(run.audit) or run.audit)
+        _record_resend(data_dir, run.audit, answer.tried, answer.posted)
+        _stage_note(data_dir, f"re-sent the {run.audit} summary to the home channel: {answer.outcome}")
 
 
 def _stage_note(data_dir: Path, message: str) -> None:
@@ -1532,7 +1932,7 @@ def _notify_conversation(conversation: dict, text: str, chat: dict | None = None
             if not chat_notify.route_unavailable(res.returncode):
                 break
             if delay is None:
-                return NOT_POSTED, f"the gateway's notify route was not there: {(res.stderr or '').strip()}"
+                return NOT_POSTED, f"the gateway posted nothing for now (its route absent, or the record unreadable): {(res.stderr or '').strip()}"
             time.sleep(delay)
     except OSError as e:
         return NOT_POSTED, f"could not write the report card: {e}"
@@ -1609,6 +2009,424 @@ def _deliver_to_conversation(data_dir: Path, in_sandbox: bool, conversation: dic
     return True
 
 
+def _ledger_repo() -> str | None:
+    """Where the report is filed: the GitOps repository when it is on GitHub, else the install's one
+    managed GitHub repository (so a GitOps repository on another forge still files into that one, as
+    the chat-delivery ledger does); several GitHub repositories with no GitOps role among them is a
+    recorded reason, not a guess; none on GitHub files nothing."""
+    configured = os.environ.get(REPORT_LEDGER_REPO_ENV, "").strip()
+    if configured:
+        return configured
+    repos = sorted(gitops_workspace.get_managed_github_repo_names())
+    gitops = gitops_workspace.get_gitops_repo()
+    if gitops in repos:
+        return gitops
+    if len(repos) > 1:
+        raise LedgerRepoAmbiguous(len(repos))
+    return repos[0] if repos else None
+
+
+class LedgerRepoAmbiguous(RuntimeError):
+    def __init__(self, count: int) -> None:
+        super().__init__(LEDGER_REPO_AMBIGUOUS_REASON.format(count=count))
+        self.count = count
+
+
+def _filed_record(data_dir: Path) -> dict:
+    try:
+        record = json.loads((data_dir / REPORT_FILED_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return record if isinstance(record, dict) else {}
+
+
+def _record_filed(data_dir: Path, repo: str, number: int, url: str) -> bool:
+    """True once the record is on disk. Without it the caller must leave the report where it is:
+    ``delivery_settled`` waits for this record, the stale-claim rule then releases the claim, and the
+    next run finds the issue already open only by reading the report again."""
+    target = data_dir / REPORT_FILED_FILE
+    tmp = target.with_name(target.name + ".tmp")
+    try:
+        tmp.write_text(
+            json.dumps({FILED_REPO: repo, FILED_NUMBER: number, FILED_URL: url, FILED_AT: time.time()}, sort_keys=True)
+            + "\n",
+            encoding="utf-8",
+        )
+        tmp.replace(target)
+    except OSError as e:
+        sys.stderr.write(f"bootstrap_delivery: could not record the filed report: {e}\n")
+        return False
+    return True
+
+
+def _record_retired(data_dir: Path) -> bool:
+    """True once the retire is on disk; same contract as ``_record_filed``."""
+    try:
+        (data_dir / REPORT_RETIRED_FILE).write_text(f"{time.time()}\n", encoding="utf-8")
+    except OSError as e:
+        sys.stderr.write(f"bootstrap_delivery: could not record the retire: {e}\n")
+        return False
+    return True
+
+
+def _utc(stamp: float) -> str:
+    return datetime.fromtimestamp(stamp, timezone.utc).strftime(REPORT_ISSUE_DATE_FMT)
+
+
+def _issue_url(repo: str, number: int, issue: dict) -> str:
+    """The issue's web address: the broker's, or built from the slug when the answer carries none."""
+    for key in ISSUE_URL_KEYS:
+        value = issue.get(key)
+        if isinstance(value, str) and value.startswith(URL_SCHEME_PREFIX):
+            return value
+    host, slash, rest = repo.partition("/")
+    if slash and "/" in rest:  # host/owner/name
+        return ISSUE_URL_FORMAT.format(host=host, slug=rest, number=number)
+    return ISSUE_URL_FORMAT.format(host=ISSUE_URL_DEFAULT_HOST, slug=repo, number=number)
+
+
+def _existing_report_issue(repo: str, sweep: str) -> tuple[int, str, object] | None:
+    """The open issue a run before this one filed this sweep's report as, by label and the sweep
+    marker, or None; another install's issue in a shared repository names another sweep.
+
+    An entry without a usable number is skipped rather than raised on: the listing is the
+    broker's, and one odd row must not hold the report.
+    """
+    answer = forge.call(
+        "issue-list",
+        {"labels": [REPORT_ISSUE_LABEL], "state": "open", "limit": REPORT_ISSUE_LIST_LIMIT},
+        repo,
+        timeout_s=REPORT_FORGE_CALL_TIMEOUT_SECONDS,
+    )
+    marker = REPORT_ISSUE_SWEEP_MARKER.format(sweep=sweep)
+
+    def _matching(rows: list) -> list[tuple[int, dict]]:
+        matched: list[tuple[int, dict]] = []
+        for issue in rows:
+            if not isinstance(issue, dict) or marker not in str(issue.get("body") or ""):
+                continue
+            try:
+                matched.append((int(issue.get("number")), issue))
+            except (TypeError, ValueError):
+                continue
+        return matched
+
+    found = _matching(list(answer.get("issues") or []))
+    if not found:
+        # An earlier run's issue may carry no label (the repository refused it), while another
+        # install's labelled issue is open in a shared repository: one more listing without the
+        # label filter, by the sweep marker alone.
+        answer = forge.call(
+            "issue-list", {"state": "open", "limit": REPORT_ISSUE_LIST_LIMIT}, repo, timeout_s=REPORT_FORGE_CALL_TIMEOUT_SECONDS
+        )
+        found = _matching(list(answer.get("issues") or []))
+    if not found:
+        return None
+    number, issue = max(found, key=lambda pair: pair[0])
+    return number, _issue_url(repo, number, issue), issue.get("labels")
+
+
+def _issue_text(body: str, sweep: str, filed_at: float, now: float) -> str:
+    """The issue body as filed: the two markers, the intro, a blank line, the report with its note."""
+    date, filed = _utc(now), _utc(filed_at)
+    return "\n".join(
+        [REPORT_ISSUE_MARKER, REPORT_ISSUE_SWEEP_MARKER.format(sweep=sweep), REPORT_ISSUE_INTRO.format(date=date, filed=filed), "", body]
+    )
+
+
+def _issue_labelled(labels: object) -> bool:
+    """Whether a broker answer's label list carries the report label, in either shape the forge uses."""
+    names = []
+    for item in labels if isinstance(labels, list) else []:
+        names.append(item.get("name") if isinstance(item, dict) else item)
+    return REPORT_ISSUE_LABEL in names
+
+
+def _file_report_issue(repo: str, body: str, sweep: str, filed_at: float, now: float) -> tuple[int, str, object]:
+    """Open the ledger issue holding the report (or reuse the one already open): its number, URL and labels.
+
+    Raises ``forge.ForgeError`` when the broker refuses. The label is best effort: the issue is
+    worth opening without it, and a repository whose labels this credential may not touch is not
+    a reason to hold the report.
+    """
+    existing = _existing_report_issue(repo, sweep)
+    if existing is not None:
+        return existing
+    with contextlib.suppress(forge.ForgeError):
+        forge.call(
+            "label-ensure",
+            {"name": REPORT_ISSUE_LABEL, "color": REPORT_ISSUE_LABEL_COLOR, "description": REPORT_ISSUE_LABEL_DESCRIPTION},
+            repo,
+            timeout_s=REPORT_FORGE_CALL_TIMEOUT_SECONDS,
+        )
+    title = REPORT_ISSUE_TITLE.format(date=_utc(now))
+    text = _issue_text(body, sweep, filed_at, now)
+    answer = forge.call(
+        "issue-create",
+        {"title": title, "body": text, "labels": [REPORT_ISSUE_LABEL]},
+        repo,
+        timeout_s=REPORT_FORGE_CALL_TIMEOUT_SECONDS,
+    )
+    issue = answer.get("issue") if isinstance(answer.get("issue"), dict) else {}
+    try:
+        number = int(issue.get("number") or 0)
+    except (TypeError, ValueError):
+        number = 0
+    if not number:
+        raise forge.ForgeError(forge.REASON_UNREACHABLE, "issue-create answered with no issue number")
+    return number, _issue_url(repo, number, issue), issue.get("labels")
+
+
+def _post_home_line(data_dir: Path, url: str, now: float) -> None:
+    """One line naming the filed report, to the platform whose home posts route through the gateway.
+
+    After the claim and the issue, so best effort: the issue is the record. ``NOTIFY_KEPT`` is
+    the gateway holding the line for its digest, which is where a channel set later reads it.
+    """
+    platform = chat_notify.routed_platform()
+    if not platform:
+        return
+    text = REPORT_ISSUE_HOME_POST.format(url=url, date=_utc(now))
+    argv = chat_notify.command(platform, text, wait_seconds=chat_notify.NOTIFY_WAIT_SECONDS)
+    # A route that is not there right now (a gateway roll) is waited out as
+    # the conversation path waits it out; one that stays away is a log line.
+    for delay in (*chat_notify.NOTIFY_ROUTE_RETRY_DELAYS_SECONDS, None):
+        try:
+            res = subprocess.run(
+                argv, capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                timeout=chat_notify.NOTIFY_SUBPROCESS_TIMEOUT_SECONDS, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as e:
+            _stage_note(data_dir, REPORT_HOME_LINE_NOTE.format(outcome=HOME_LINE_FAILED.format(code=HOME_LINE_NO_EXIT, detail=e)))
+            return
+        if not chat_notify.route_unavailable(res.returncode) or delay is None:
+            break
+        time.sleep(delay)
+    if res.returncode == 0:
+        outcome = HOME_LINE_POSTED
+    elif chat_notify.kept(res.returncode):
+        outcome = HOME_LINE_KEPT
+    else:
+        detail = _gateway_error(res.stdout) or (res.stderr or "").strip()
+        outcome = HOME_LINE_FAILED.format(code=res.returncode, detail=detail)
+    _stage_note(data_dir, REPORT_HOME_LINE_NOTE.format(outcome=outcome))
+
+
+def _retire_undelivered(data_dir: Path, in_sandbox: bool) -> int:
+    """Claim the report without posting it and set it aside; the later run's retire removes the jobs.
+
+    Its findings still go into the queue first, as on the other paths, so the nudge brings them up
+    later: nobody saw this report.
+    """
+    try:
+        files = _read_sweep_files(data_dir, in_sandbox)
+    except (sandbox_exec.SandboxUnavailable, subprocess.TimeoutExpired) as e:
+        sys.stderr.write(f"bootstrap_delivery: the shell sandbox did not answer: {e}\n")
+        return 0
+    _register_findings(data_dir, _no_ranking(data_dir), files)
+    if not _claim_for_this_path(data_dir):
+        return 0
+    if _someone_is_here(data_dir):
+        # A human arrived during the reads above (a today platform has no sweep-age guard): their
+        # thread takes the report, late as it is.
+        _release_claim(data_dir)
+        return 0
+    if not _record_retired(data_dir):
+        # Same as a filed record that did not land: the report stays, the stale-claim rule releases
+        # the claim, and the next run retires it with its record.
+        return 0
+    _stage_note(data_dir, REPORT_RETIRED_NOTE.format(days=UNDELIVERED_RETIRE_SECONDS // SECONDS_PER_DAY))
+    _cleanup(data_dir, in_sandbox)
+    return 0
+
+
+def _record_issue_left_open(data_dir: Path, in_sandbox: bool, sweep: str, record: dict, now: float) -> int:
+    """At the attempt cap: find the issue a create-then-fail may have opened, and settle on it.
+
+    One lookup per retry wait (the last wait in the table), so a repository that keeps refusing
+    is not listed every tick. A hit is recorded as filed, the report set aside and the home
+    line sent, as a clean filing would have done; a miss changes nothing.
+    """
+    try:
+        last = float(record.get(ATTEMPTS_AT))
+    except (TypeError, ValueError):
+        last = 0.0
+    if now - last < CONVERSATION_RETRY_WAITS_SECONDS[-1]:
+        return 0
+    try:
+        repo = _ledger_repo()
+    except Exception:  # noqa: BLE001 - recorded by the filing path already; the lookup just waits
+        return 0
+    if not repo:
+        return 0
+    try:
+        found = _existing_report_issue(repo, sweep)
+    except forge.ForgeError as e:
+        _record_attempt(data_dir, f"issue-list on {repo} refused: {e.reason}: {e.value}", counted=False, name=REPORT_ATTEMPTS_FILE)
+        return 0
+    if found is None:
+        _record_attempt(data_dir, REPORT_NO_ISSUE_AT_CAP_REASON.format(repo=repo), counted=False, name=REPORT_ATTEMPTS_FILE)
+        return 0
+    if not _claim_for_this_path(data_dir):
+        return 0
+    if _someone_is_here(data_dir):
+        _release_claim(data_dir)
+        return 0
+    number, url, labels = found
+    ref = f"{repo}#{number}"
+    if not _record_filed(data_dir, repo, number, url):
+        _stage_note(data_dir, REPORT_RECORD_FAILED_NOTE.format(ref=ref))
+        return 0
+    _stage_note(data_dir, REPORT_FILED_NOTE.format(ref=ref))
+    if not _issue_labelled(labels):
+        _stage_note(data_dir, REPORT_UNLABELLED_NOTE.format(ref=ref))
+    _cleanup(data_dir, in_sandbox)
+    _post_home_line(data_dir, url, now)
+    return 0
+
+
+def _file_without_thread(data_dir: Path, in_sandbox: bool, sweep: str, filed_at: float, now: float) -> int:
+    """File the report as a ledger issue, after the claim, and say so in the home channel.
+
+    The reads come before the claim as on the other paths, so a sandbox that stopped answering
+    leaves no claim to undo. A refused create releases the claim and counts an attempt, with the
+    conversation path's waits between tries; past its last, the report waits for the retire.
+    """
+    record = _read_attempts(data_dir, REPORT_ATTEMPTS_FILE)
+    count = _attempt_count(record)
+    if count >= CONVERSATION_MAX_ATTEMPTS:
+        # Past the last try. A create that opened the issue and then failed (a timeout after the
+        # write) left it open and unrecorded, so each retry wait still gets one lookup for it.
+        return _record_issue_left_open(data_dir, in_sandbox, sweep, record, now)
+    if count:
+        try:
+            last = float(record.get(ATTEMPTS_AT))
+        except (TypeError, ValueError):
+            last = 0.0
+        if now - last < CONVERSATION_RETRY_WAITS_SECONDS[count - 1]:
+            return 0
+    try:
+        repo = _ledger_repo()
+    except LedgerRepoAmbiguous as e:
+        _record_attempt(data_dir, str(e), counted=False, name=REPORT_ATTEMPTS_FILE)
+        return 0
+    except Exception as e:  # noqa: BLE001 - an unreadable mount is a recorded reason, not a tick-long traceback
+        _record_attempt(data_dir, LEDGER_REPO_UNREADABLE_REASON.format(error=e), counted=False, name=REPORT_ATTEMPTS_FILE)
+        return 0
+    if repo is None:
+        _record_attempt(data_dir, NO_LEDGER_REPO_REASON, counted=False, name=REPORT_ATTEMPTS_FILE)
+        return 0
+
+    try:
+        raw = _read_report(data_dir, in_sandbox)
+    except (sandbox_exec.SandboxUnavailable, subprocess.TimeoutExpired) as e:
+        sys.stderr.write(f"bootstrap_delivery: the shell sandbox did not answer: {e}\n")
+        return 0
+    except (OSError, sandbox_exec.SandboxMisconfigured, sandbox_exec.SandboxReadFailed) as e:
+        sys.stderr.write(f"bootstrap_delivery: could not read INVENTORY.md: {e}\n")
+        return 1
+    if raw is None:
+        return 0  # the report is not written yet
+    if len(raw) > REPORT_MAX_BYTES:
+        sys.stderr.write(f"bootstrap_delivery: INVENTORY.md is larger than {REPORT_MAX_BYTES} bytes; not filing it\n")
+        return 1
+    content = raw.decode("utf-8", errors="replace")
+    # Sized as filed (markers, intro, report, note), before the second sandbox read and the
+    # findings registration; counted, so a report that will never fit stops after the waits.
+    no_ranking = _no_ranking(data_dir)
+    note = _safe_audits_note(data_dir, no_ranking is True, bool(chat_notify.routed_platform()))
+    body = _with_note(content, note)
+    composed = len(_issue_text(body, sweep, filed_at, now))
+    if composed > ISSUE_BODY_MAX_CHARS:
+        _record_attempt(
+            data_dir, REPORT_TOO_LONG_REASON.format(chars=composed, limit=ISSUE_BODY_MAX_CHARS), counted=True,
+            name=REPORT_ATTEMPTS_FILE,
+        )
+        return 0
+    try:
+        files = _read_sweep_files(data_dir, in_sandbox)
+    except (sandbox_exec.SandboxUnavailable, subprocess.TimeoutExpired) as e:
+        sys.stderr.write(f"bootstrap_delivery: the shell sandbox did not answer: {e}\n")
+        return 0
+    suppressed = _register_findings(data_dir, no_ranking, files)
+
+    if not _claim_for_this_path(data_dir):
+        return 0
+    if _someone_is_here(data_dir):
+        # A human arrived during the reads above: the report is theirs, through their thread.
+        _release_claim(data_dir)
+        return 0
+    # Anything that escapes between the claim and the record releases the claim; a run that dies
+    # holding it is released by the stale-claim rule, since ``delivery_settled`` waits for the record.
+    try:
+        number, url, labels = _file_report_issue(repo, body, sweep, filed_at, now)
+    except forge.ForgeError as e:
+        _record_attempt(data_dir, f"issue-create on {repo} refused: {e.reason}: {e.value}", counted=True, name=REPORT_ATTEMPTS_FILE)
+        _release_claim(data_dir)
+        return 0
+    except Exception as e:  # noqa: BLE001 - see above; the next tick retries after the wait
+        _record_attempt(data_dir, REPORT_FILING_FAILED_REASON.format(repo=repo, error=e), counted=True, name=REPORT_ATTEMPTS_FILE)
+        _release_claim(data_dir)
+        return 0
+    ref = f"{repo}#{number}"
+    if not _record_filed(data_dir, repo, number, url):
+        # The issue is open but nothing on disk says so: keep the report and the claim. The stale-claim
+        # rule releases the claim, and the next run reads the report, finds the issue by its sweep
+        # marker, records it and posts the home line once.
+        _stage_note(data_dir, REPORT_RECORD_FAILED_NOTE.format(ref=ref))
+        return 0
+    _stage_note(data_dir, REPORT_FILED_NOTE.format(ref=ref))
+    if not _issue_labelled(labels):
+        _stage_note(data_dir, REPORT_UNLABELLED_NOTE.format(ref=ref))
+    shown = _mark_shown(files, suppressed)
+    _cleanup(data_dir, in_sandbox, shown)
+    _post_home_line(data_dir, url, now)
+    return 0
+
+
+def _someone_is_here(data_dir: Path) -> bool:
+    """Whether a human has reached the install, whatever the greeting hold says.
+
+    The plugin binds the conversation and writes its hold before the aligned marker, and drops
+    the hold only once the greeting is on its way; ``_awaiting_delivery`` is False through all of
+    that. None of it is "nobody": the report belongs to that person's thread.
+    """
+    return (
+        (data_dir / ".user_aligned").exists()
+        or (data_dir / CONVERSATION_ALIGNED_MARKER).exists()
+        or _bound_conversation(data_dir) is not None
+        or _greeting_pending(data_dir)
+    )
+
+
+def _deliver_without_thread(data_dir: Path) -> int:
+    """The path for a report nobody has aligned to: silent until the wait, then filed, then retired.
+
+    Counted from when the sweep was filed, the one stamp the plugin's own age rule reads too.
+    """
+    if _someone_is_here(data_dir):
+        return 0  # a human's thread takes the report once the greeting is out
+    try:
+        filed = oobe.scan_filed(data_dir)
+    except (OSError, ValueError):
+        # A marker whose bytes do not decode (hand-edited): hold this path, not the whole tick.
+        return 0
+    if filed is None:
+        return 0  # the scan has not started
+    now = time.time()
+    age = now - filed[1]
+    if age < UNSPOKEN_FILE_AFTER_SECONDS:
+        return 0  # a human may still open the thread the report was written for
+    try:
+        in_sandbox = sandbox_exec.sandbox_enabled()
+    except sandbox_exec.SandboxMisconfigured as e:
+        sys.stderr.write(f"bootstrap_delivery: cannot tell where INVENTORY.md is: {e}\n")
+        return 1
+    if age >= UNDELIVERED_RETIRE_SECONDS:
+        return _retire_undelivered(data_dir, in_sandbox)
+    return _file_without_thread(data_dir, in_sandbox, filed[0], filed[1], now)
+
+
 def main(data_dir: Path | None = None) -> int:
     if data_dir is None:
         data_dir = _data_dir()
@@ -1622,7 +2440,7 @@ def main(data_dir: Path | None = None) -> int:
         return 0
 
     if not _awaiting_delivery(data_dir):
-        return 0  # silent run — nobody to deliver to yet
+        return _deliver_without_thread(data_dir)  # nobody to deliver to yet, or ever
     conversation = _bound_conversation(data_dir)
     if conversation is not None and not _conversation_ready(data_dir, conversation):
         return 0
@@ -1684,6 +2502,10 @@ def main(data_dir: Path | None = None) -> int:
     home = bool(chat_notify.routed_platform()) if conversation is not None else True
     note = _safe_audits_note(data_dir, no_ranking is True, home)
 
+    # A no-human run killed between its marker and its claim leaves the marker with no claim
+    # behind it; a claim taken beside it would read as that path's and never settle. A no-human
+    # run that is mid-claim right now re-checks for this human after its claim and releases.
+    _drop_orphan_claiming_marker(data_dir)
     # The cheap check above is advisory; this is the decision. Nothing may be
     # written to stdout before it succeeds.
     if not _claim_delivery(data_dir):

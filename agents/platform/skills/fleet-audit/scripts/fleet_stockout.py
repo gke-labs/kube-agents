@@ -9,7 +9,8 @@ governance/stockout_prevention_sop.md.
 
 **All twelve checks are converted.** Ten read structures this repository's
 other collectors already read with confidence — a `ComputeClass`/`Deployment`/
-`StatefulSet`/`StorageClass`/`Node` dump, `gcloud container node-pools list`,
+`StatefulSet`/`StorageClass`/`Node` dump, the node pools (the discovery
+`clusters list` item's `nodePools`, else `gcloud container node-pools list`),
 `gcloud compute reservations list`, `gcloud compute regions describe
 --format=json(quotas)`: `ccc-missing-fallbacks`, `ccc-no-ondemand-floor`,
 `ccc-large-vm-scarcity`, `ccc-priority-starvation`,
@@ -85,7 +86,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 
 MANIFEST_VERSION = 1
 # The stream this collector serves, as `audit_report.py finish --audit` names it.
@@ -187,6 +188,29 @@ SPOT_MAX_SHAPES = 8
 
 # The label GKE stamps on every node with the name of its node pool.
 NODEPOOL_LABEL = "cloud.google.com/gke-nodepool"
+# §3.9's live backlog: the pods the scheduler itself has given up on. The read
+# is server-filtered to Pending pods, never the whole pod list, and the
+# scheduler's own verdict narrows it further: a pod Pending on an image pull
+# or a volume attach has PodScheduled=True and does not count.
+PODS_KIND = "pods"
+# An unscheduled pod has no node yet, so the empty `spec.nodeName` narrows the
+# read to the pods the scheduler still holds.
+PENDING_PODS_QUERY = {"fieldSelector": "status.phase=Pending,spec.nodeName="}
+PENDING_PHASE = "Pending"
+POD_SCHEDULED_CONDITION = "PodScheduled"
+CONDITION_FALSE = "False"
+UNSCHEDULABLE_REASON = "Unschedulable"
+# The scheduler's own clauses for a refusal that a node, more of them or a
+# different pool would lift: capacity and placement. A refusal that names
+# none of these (an unbound claim, a volume binding wait) is not the pool's
+# backlog, whatever the pod's selector says.
+CAPACITY_REFUSAL_CLAUSES = (
+    "Insufficient ",
+    "untolerated taint",
+    "didn't match Pod's node affinity/selector",
+    "didn't match node selector",
+    "Too many pods",
+)
 
 # §3.3's ">32 cores", §3.4's "> 10" rules, §3.7's 90%, and §3.10(c)'s idle
 # reservation: at most half in use with at least this many instances idle.
@@ -373,6 +397,14 @@ _COMMITMENT_QUOTA_PREFIX = "COMMITTED_"
 # ceiling "a hard stop, not a soft one, so 'close to it' means measurably
 # close, not a judgment call".
 NODEPOOL_CEILING_FRACTION = 0.9
+# How each arm of §3.9 opens its excerpt clause. The arms share a slug, an
+# object kind and a severity, so the excerpt is the one field that says which
+# fired: audit_report.py's declared-intent join reads these two prefixes
+# (`ZONE_LOCKED_ARM_MARK`, `CEILING_ARM_MARK`) to move a declared zone-locked
+# pool and leave a pool at its ceiling a finding, and a test pins its copies
+# to these. Reword them here and there together, never one side alone.
+ZONE_LOCKED_ARM_PREFIX = "single-zone ("
+CEILING_ARM_PREFIX = "at its autoscaling ceiling:"
 
 # §3.9's Impact, one per arm. The arms share a slug and nothing else, so no
 # single sentence is true of both: the zone-locked arm is about a stockout in
@@ -521,6 +553,8 @@ def is_non_production(name: str, labels: dict | None = None, namespace: str = ""
 
 
 Run = collector_run.Run
+listing_fields = collector_run.listing_fields
+listed_node_pools = collector_run.listed_node_pools
 run_and_gate = collector_run.run_and_gate
 paged_dump = collector_run.paged_dump
 paged_command_text = collector_run.paged_command_text
@@ -777,12 +811,14 @@ def _advising_once(run: RunFn) -> RunFn:
 
 
 def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[dict]]:
-    result = run(
-        [
-            "gcloud", "container", "clusters", "list", "--project", project,
-            "--format", "json(name,location,locations,status,currentMasterVersion,autopilot.enabled,autoscaling.enableNodeAutoprovisioning,autoscaling.autoprovisioningLocations,addonsConfig.configConnectorConfig.enabled)",
-        ]
-    )
+    # `nodePools` so the Standard clusters' single-zone-nodepool read can take
+    # them from here (`collector_run.listed_node_pools`); the projection gains
+    # that sub-object and nothing else.
+    listing_argv = [
+        "gcloud", "container", "clusters", "list", "--project", project,
+        "--format", "json(name,location,locations,status,currentMasterVersion,autopilot.enabled,autoscaling.enableNodeAutoprovisioning,autoscaling.autoprovisioningLocations,addonsConfig.configConnectorConfig.enabled,nodePools)",
+    ]
+    result = run(listing_argv)
     if result.rc != 0:
         if _api_disabled(result):
             ours, why_not = refusal_owner(project, result.stderr, run=run)
@@ -818,6 +854,7 @@ def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[di
             "autoprovisioning_locations": (c.get("autoscaling") or {}).get("autoprovisioningLocations") or [],
             # Read first by the Config Connector read after the sweep.
             kcc_health.ADDON_FIELD: kcc_health.addon_enabled(c),
+            **listing_fields(c, listing_argv),
         }
         for c in clusters
         if c.get("status") in AUDITABLE_STATUSES
@@ -1307,7 +1344,127 @@ def _pool_ceiling(autoscaling: dict, locations: list) -> tuple[int | None, str]:
     return per_zone * zones, f"maxNodeCount {per_zone}/zone x {zones} zones"
 
 
-def check_single_zone_nodepool(pool: dict, has_nap: bool, current_node_count: int, *, multi_zone_machine_types: frozenset[str] = frozenset()) -> dict | None:
+def refused_for_capacity(message: str) -> bool:
+    """Whether the scheduler's message names a capacity or placement clause
+    (`CAPACITY_REFUSAL_CLAUSES`)."""
+    return any(clause in message for clause in CAPACITY_REFUSAL_CLAUSES)
+
+
+def is_unschedulable(pod: dict) -> bool:
+    """A Pending pod the scheduler has refused for capacity or placement:
+    `PodScheduled` is `False` with reason `Unschedulable` and a message naming
+    one of the scheduler's capacity or placement clauses. A Pending pod whose
+    `PodScheduled` is `True` is placed and waiting on something else (an
+    image, a volume attach); a pod with no such condition yet has not been
+    looked at; a pod refused for an unbound claim or a volume binding wait
+    is not held by the pool. None of those is backlog."""
+    status = pod.get("status") or {}
+    if status.get("phase") != PENDING_PHASE:
+        return False
+    for condition in status.get("conditions") or []:
+        if isinstance(condition, dict) and condition.get("type") == POD_SCHEDULED_CONDITION:
+            return (
+                condition.get("status") == CONDITION_FALSE
+                and condition.get("reason") == UNSCHEDULABLE_REASON
+                and refused_for_capacity(str(condition.get("message") or ""))
+            )
+    return False
+
+
+def workload_of(pod: dict) -> str:
+    """The name a reader knows the pod by: the cost collector's sizing owner
+    (the controller reference, a Deployment in place of its ReplicaSet, the
+    pod itself when unowned), so both streams name one workload the same way."""
+    # The cost stream's owner rule, shared rather than copied.
+    from fleet_waste import _sizing_owner
+
+    return _sizing_owner(pod.get("metadata") or {})[1]
+
+
+def pool_label_index(node_pools: list[dict], nodes: list[dict]) -> dict[tuple[str, str], set[str]]:
+    """Which pools carry each label, from the live `Node` objects plus each
+    pool's `config.labels`: the retrospective collector's reader, so a selector
+    resolves against the labels GKE stamped rather than a prediction of them."""
+    # The retrospective's label reader, shared rather than copied.
+    from upgrade_retrospective import pool_labels
+
+    index = pool_labels({"nodePools": node_pools}, nodes)
+    # A pool with no live node has no node to stamp its own name on; the
+    # record names it, so a selector on the pool label still finds it.
+    for pool in node_pools:
+        name = str(pool.get("name", ""))
+        if name:
+            index.setdefault((NODEPOOL_LABEL, name), set()).add(name)
+    return index
+
+
+def pool_taint_records(node_pools: list[dict]) -> dict[str, dict]:
+    """Each pool's config taints in the scheduler's shape, the retrospective's
+    reader, built once per cluster."""
+    from upgrade_retrospective import pool_records_of
+
+    return pool_records_of({"nodePools": node_pools})
+
+
+def pinned_pool(pod: dict, node_pools: list[dict], label_index: dict[tuple[str, str], set[str]], records: dict[str, dict] | None = None) -> str | None:
+    """The one pool the scheduler could place the pod on, or None. A pool is a
+    candidate when its nodes carry every pair of the pod's `nodeSelector` and
+    the pod tolerates the pool's blocking taints; the pod is this pool's
+    backlog only when it is the sole candidate. Two candidates pin it to
+    neither. On a cluster with one pool, every selected pod is that pool's.
+    An empty selector pins the pod nowhere; a pod held by affinity alone is
+    not read here. The question is where the pod can go, not which pool it
+    prefers, so the retrospective's narrowing rule does not apply. `records`
+    is `pool_taint_records(node_pools)`, built once per cluster by the caller."""
+    from upgrade_retrospective import _tolerates, pod_tolerations
+
+    spec = pod.get("spec") or {}
+    selector = spec.get("nodeSelector") or {}
+    if not selector:
+        return None
+    tolerations = pod_tolerations(spec)
+    if records is None:
+        records = pool_taint_records(node_pools)
+    candidates = []
+    for pool in node_pools:
+        name = str(pool.get("name", ""))
+        if not all(name in label_index.get((str(k), str(v)), set()) for k, v in selector.items()):
+            continue
+        if not all(_tolerates(tolerations, taint) for taint in records.get(name, {}).get("taints", [])):
+            continue
+        candidates.append(name)
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def read_unschedulable_pods(*, run: RunFn, env: dict) -> tuple[list[dict], str]:
+    """The cluster's Unschedulable pods, from one server-filtered paged read of
+    its Pending pods. `(pods, "")` on success; `([], why)` when the read
+    failed, for a `limitations` sentence: the arms grade without it, so the
+    failure costs the backlog clause and nothing else."""
+    parsed, result = paged_dump((PODS_KIND,), run=run, env=env, query=PENDING_PODS_QUERY)
+    if parsed is None:
+        return [], f"rc={result.rc}: {result.stderr.strip()[:STDERR_EXCERPT_CHARS] or 'no stderr'}"
+    return [p for p in parsed.get("items") or [] if isinstance(p, dict) and is_unschedulable(p)], ""
+
+
+def backlog_clause(pods: list[dict]) -> str:
+    """The harm a reader acts on, in one clause: how many pods the scheduler
+    refuses, which workload they belong to, and that this pool is where they
+    are pinned. One shape for every count, the noun plural even at 1: the
+    ledger is graded on the clause, and a count of one is the live state of
+    a fleet whose desired count sits one above the pool's capacity."""
+    counts: dict[str, int] = {}
+    for pod in pods:
+        workload = workload_of(pod)
+        counts[workload] = counts.get(workload, 0) + 1
+    if len(counts) == 1:
+        workloads = next(iter(counts))
+    else:
+        workloads = ", ".join(f"{w} ({n})" for w, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+    return f"{len(pods)} Unschedulable pods of {workloads} select this pool and cannot be placed"
+
+
+def check_single_zone_nodepool(pool: dict, has_nap: bool, current_node_count: int, *, multi_zone_machine_types: frozenset[str] = frozenset(), unschedulable_pods: Sequence[dict] = ()) -> dict | None:
     """`current_node_count` must be the pool's *live* node count (counted
     from the cluster's own `Node` objects, grouped by the
     `cloud.google.com/gke-nodepool` label) -- `initialNodeCount` is a
@@ -1328,6 +1485,12 @@ def check_single_zone_nodepool(pool: dict, has_nap: bool, current_node_count: in
     used to spare every zonal one, which let a GPU pool pinned to one zone
     beside a regional default pool pass -- the zone-locked pool this check is
     for. The excerpt names what was tested, a fact this call was given.
+
+    `unschedulable_pods` are the pods `pinned_pool` resolved to this pool that
+    the scheduler refuses right now. They decide nothing: the arms do.
+    They are the live backlog the excerpt then names, because "at its
+    ceiling" tells an operator the pool cannot grow and not that anything is
+    waiting on it.
     """
     locations = pool.get("locations") or []
     autoscaling = pool.get("autoscaling") or {}
@@ -1349,7 +1512,7 @@ def check_single_zone_nodepool(pool: dict, has_nap: bool, current_node_count: in
             why = f"tainted ({keys}), so no other pool is counted as its fallback"
         else:
             why = f"no multi-zone node pool of machine type {machine_type or 'unknown'} on the cluster"
-        excerpts.append(f"single-zone ({locations}), autoscaling enabled, no NAP, {why}")
+        excerpts.append(f"{ZONE_LOCKED_ARM_PREFIX}{locations}), autoscaling enabled, no NAP, {why}")
         impacts.append(_IMPACT_ZONE_LOCKED)
     if at_ceiling:
         # Name the arm and the zone span. This condition has nothing to do with
@@ -1359,10 +1522,12 @@ def check_single_zone_nodepool(pool: dict, has_nap: bool, current_node_count: in
         # 3.9 keys its impact and its remediation off this prefix, so a run
         # stops proposing multi-zone node pools to an operator who has them.
         excerpts.append(
-            f"at its autoscaling ceiling: {current_node_count}/{ceiling} live nodes "
+            f"{CEILING_ARM_PREFIX} {current_node_count}/{ceiling} live nodes "
             f"({current_node_count / ceiling * 100:.0f}% of {basis}), zones {locations}"
         )
         impacts.append(_ceiling_impact(ceiling, current_node_count, has_nap))
+    if unschedulable_pods:
+        excerpts.append(backlog_clause(list(unschedulable_pods)))
     return {
         "object": f"NodePool/{pool.get('name', '')}",
         "excerpt": "; ".join(excerpts),
@@ -1864,8 +2029,17 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     pools_record: dict | None = None
     pools_readable = False
     if not autopilot:
-        node_pools_argv = ["gcloud", "container", "node-pools", "list", "--cluster", name, "--location", location, "--project", project, "--format", "json"]
-        parsed_pools, pools_result = run_and_gate(node_pools_argv, run=run)
+        # Taken from the discovery listing when it carried the pools, and
+        # recorded against that listing's command, the read that returned them.
+        pools_result, unlisted = listed_node_pools(cluster)
+        if pools_result is not None:
+            parsed_pools = json.loads(pools_result.stdout)
+            pools_command = shlex.join(pools_result.argv)
+        else:
+            log(f"{project}/{location}/{name}: {unlisted}; reading node-pools list")
+            node_pools_argv = ["gcloud", "container", "node-pools", "list", "--cluster", name, "--location", location, "--project", project, "--format", "json"]
+            parsed_pools, pools_result = run_and_gate(node_pools_argv, run=run)
+            pools_command = shlex.join(node_pools_argv)
         # Empty output at exit 0 is a cluster with no pools; output that does
         # not parse to a list of objects (the shim's cut, an error object, a
         # stray string) is a failed read, filed below as unevaluated rather
@@ -1874,7 +2048,7 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         pools_unreadable = pools_result.rc == 0 and bool(pools_result.stdout.strip()) and not pools_listed
         pools_readable = pools_result.rc == 0 and not pools_unreadable
         node_pools = parsed_pools if pools_listed else []
-        pools_record = _record(shlex.join(node_pools_argv), pools_result)
+        pools_record = _record(pools_command, pools_result)
     pools_failure = ""
     if not autopilot and not pools_readable:
         pools_failure = (
@@ -2043,6 +2217,25 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         # for it makes an empty Standard cluster indistinguishable from one
         # whose pools nobody looked at.
         commands["single-zone-nodepool"] = pools_record
+        # The live backlog, read only where the check runs: one more
+        # server-filtered read per cluster, Pending pods only.
+        unschedulable_pods, backlog_failure = read_unschedulable_pods(run=run, env=env)
+        if backlog_failure:
+            limitations.append(
+                f"single-zone-nodepool's backlog count could not be measured on this cluster: "
+                f"the Pending pods read failed ({backlog_failure}), so its findings name no "
+                f"Unschedulable pods"
+            )
+        pods_command_text = paged_command_text((PODS_KIND,), query=PENDING_PODS_QUERY, kubeconfig=kubeconfig)
+        # Each pod resolves to one pool at most, once, so two pools never
+        # share a backlog.
+        label_index = pool_label_index(node_pools, [i for i in items if i.get("kind") == "Node"])
+        taint_records = pool_taint_records(node_pools)
+        pinned_by_pool: dict[str, list[dict]] = {}
+        for pending_pod in unschedulable_pods:
+            pinned_to = pinned_pool(pending_pod, node_pools, label_index, taint_records)
+            if pinned_to is not None:
+                pinned_by_pool.setdefault(pinned_to, []).append(pending_pod)
         # A tainted multi-zone pool is no fallback: the zonal pool's pods do
         # not tolerate its taints, so a stockout leaves them nowhere to go.
         multi_zone_machine_types = frozenset(
@@ -2052,8 +2245,14 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         ) - {""}
         for pool in node_pools:
             live_count = live_node_count_by_pool.get(pool.get("name", ""), 0)
-            for hit in [check_single_zone_nodepool(pool, has_nap, live_count, multi_zone_machine_types=multi_zone_machine_types)]:
+            pinned = pinned_by_pool.get(pool.get("name", ""), [])
+            for hit in [check_single_zone_nodepool(pool, has_nap, live_count, multi_zone_machine_types=multi_zone_machine_types, unschedulable_pods=pinned)]:
                 if hit:
+                    if pinned:
+                        # The excerpt now carries a count the pools list alone
+                        # cannot reproduce, so the evidence command names both
+                        # reads.
+                        hit["command"] = f"{pools_record['command']}; {pods_command_text}"
                     candidates.append(_emit("single-zone-nodepool", hit))
     else:
         unevaluated["single-zone-nodepool"] = pools_failure

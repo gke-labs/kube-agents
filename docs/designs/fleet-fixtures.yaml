@@ -10,8 +10,12 @@
 #
 # What this file adds on top of that catalogue is the part fixtures.json does
 # not carry: the day-N availability gate below, and the fixtures that are not
-# on a cluster at all (`orphan-disks`, `startup-fail-vm` and `world-open-ingress` are project-scoped,
-# so they have no cluster slot and no entry in a catalogue keyed by one).
+# on a cluster at all (`orphan-disks`, `startup-fail-vm` and
+# `world-open-ingress` are project-scoped, so they have no cluster slot).
+# fixtures.json carries `startup-fail-vm` and `world-open-ingress` as
+# project-scoped roles (`cluster_slot: null`), which the runner probes in the
+# project with gcloud; `orphan-disks` is in this file alone. A project-scoped
+# role in fixtures.json must appear here with `slot: null`.
 #
 # A case names a fixture by role and never by a cluster name or a project id.
 # Each eval project carries its own set of clusters (`bench/tf/fleet/`,
@@ -160,6 +164,21 @@ fixtures:
       is not the role slug, see bench-fleet-catalog.md. The desired replica
       count is not stable across projects (measured 3/2/3 on 2026-08-24), so
       assert the pin and the unmet demand and never a number.
+
+  - role: declared-single-zone-pool
+    slot: a
+    available_from_day: 0
+    objects:
+      - nodepool/declared-zonal-pool
+    namespace: null
+    defect: >-
+      A single-zone autoscaling pool (min 0, max 2) held at zero nodes behind
+      the taint seeded-role=declared-zonal, so it is the stockout SOP's 3.9
+      zone-locked posture and never its at-ceiling arm. Not a defect: the pool
+      project's GitOps knowledge/ note declares it on purpose, and the capacity
+      audit lists it under Declared intent rather than as a finding.
+      pinned-inference-pool cannot play this part, since its backlog is the
+      defect stockout-pinned-pool grades.
 
   - role: deprecated-api-caller
     slot: a
@@ -397,7 +416,15 @@ fixtures:
     objects:
       - nodepool/default-pool
     defect: >-
-      Not a defect: seeded-a's default pool itself, two e2-standard-2 nodes asserted to keep 100m CPU unrequested each so the next planted fixture can place; the one role whose drift means the pool is within ten fixtures of full and a re-apply changes nothing
+      Not a defect: seeded-a's default pool itself, three e2-standard-2 nodes asserted to keep 100m CPU unrequested each so the next planted fixture can place; the one role whose drift means the pool is within ten fixtures of full and a re-apply changes nothing
+
+  - role: config-connector-namespaced
+    slot: a
+    available_from_day: 0
+    objects:
+      - configconnector/configconnector.core.cnrm.cloud.google.com
+    defect: >-
+      Not a defect: the GKE Config Connector add-on on seeded-a, with its ConfigConnector object in namespaced mode. The Config Connector eval cases plant their objects on this cluster, each in a namespace of its own with a ConfigConnectorContext that names the kcc-eval-context service account, which holds no project role
 
   - role: intree-pd-volume
     slot: a

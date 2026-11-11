@@ -38,7 +38,7 @@ against the seeded test fleet. A hand-written story per case, or a `showcase:` f
 The badge is a level read from the case's nightly record over the last
 `CONFIDENCE_WINDOW_DAYS` (7) at its current version key, infra repetitions excluded. Admission pools
 to 20 repetitions whatever their age; this page measures a repository that changes daily, so it reads
-a week, which the nightly's halves cover for every case at least twice (measured 2026-10-28: the
+a week, which the nightly's main parts cover for every case at least twice (measured 2026-10-28: the
 median case had 6 repetitions in it and none had 0), and asks for `CONFIDENCE_MIN_RUNS` (6) of them
 before a reading counts. The key rule is admission's: when the agent model, the judge, the scoring
 version, the fleet, the verifiers or the door changes, the window holds only repetitions on the new

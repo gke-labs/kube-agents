@@ -11,7 +11,7 @@ Every image an install pulls or a rebuild needs, and how their tags are managed.
 
 [`images.json`](https://github.com/gke-labs/kube-agents/blob/main/images.json) at the repository root is the source of truth for this list. It is what `make mirror-images` copies from, what the chart and the dev tooling resolve their third-party pins from, and what the table below is generated from — so there is one pin per image, not one per install path.
 
-The A2A `next` stack pulls NATS, nats-box, the gateway, the session worker, the auth callout,
+The A2A `next` stack pulls NATS, nats-box, the NATS config reloader, the gateway, the session worker, the auth callout,
 the capability verifier, the AgentProfile dispatcher, the console server and the Hermes bridge sidecar, and each is in the
 tables below. The first-party ones (`a2a-gateway`, `a2a-worker`, `a2a-authcallout`,
 `a2a-verifier`, `a2a-dispatcher`, `a2a-console`, `hermes-bridge`) are built and tagged with the rest of the
@@ -33,10 +33,11 @@ the agent image instead, and `A2A_BRIDGE_IMAGE` on the operator overrides it. A 
 that declares its own `hermes-bridge` sidecar keeps it, and that sidecar's image is whatever the
 resource names.
 
-NATS and nats-box are ordinary third-party pins, in the table as `nats` and `nats-box`, so
-`make mirror-images` copies them. The chart does not set their env vars, so a mirrored `next`
-install still points `A2A_NATS_IMAGE` and `A2A_PROVISION_IMAGE` at the copies itself, through the
-operator's environment
+NATS, nats-box and the NATS config reloader are ordinary third-party pins, in the table as `nats`,
+`nats-box` and `nats-server-config-reloader`, so `make mirror-images` copies them. The chart does
+not set their env vars, so a mirrored `next` install still points `A2A_NATS_IMAGE`,
+`A2A_PROVISION_IMAGE` and `A2A_NATS_RELOADER_IMAGE` at the copies itself, through the operator's
+environment
 ([Operator settings](/kube-agents/install/quickstart-gke/#operator-settings) shows how).
 
 The bases those images are built from are inventory entries too. `golang`, `node` and
@@ -69,7 +70,7 @@ Tagged with the release version; `:latest` on every push to `main`.
 | `pubsub-platform` | `ghcr.io/gke-labs/kube-agents/pubsub-platform` | release tag | — | The pubsub-platform AgentPlugin. |
 | `gke-stockout-investigator` | `ghcr.io/gke-labs/kube-agents/gke-stockout-investigator` | release tag | — | The gke-stockout-investigator AgentPlugin. |
 | `a2a-gateway` | `ghcr.io/gke-labs/kube-agents/a2a-gateway` | release tag | `A2A_GATEWAY_IMAGE` | The A2A gateway Deployment the operator renders under spec.mode: next, and nothing under spec.mode: today. The operator derives it from its own image, else from the agent image it resolves (registry and tag), unless the override is set; the worker, the callout and the console resolve the same way. |
-| `a2a-worker` | `ghcr.io/gke-labs/kube-agents/a2a-worker` | release tag | `A2A_WORKER_IMAGE` | The session pods the A2A gateway spawns under spec.mode: next; the operator passes its resolution to the gateway as A2A_WORKER_IMAGE. The image also carries the credential broker's shim as `kubectl` and `gcloud`, used only when the operator's A2A_SESSION_CLUSTER_VIEW flag gives a session pod its read-only cluster view. |
+| `a2a-worker` | `ghcr.io/gke-labs/kube-agents/a2a-worker` | release tag | `A2A_WORKER_IMAGE` | The session pods the A2A gateway spawns under spec.mode: next; the operator passes its resolution to the gateway as A2A_WORKER_IMAGE. The image carries stock `kubectl` (wired to `&lt;name&gt;-kube-proxy` on session pods under A2A_SESSION_CLUSTER_VIEW, and falling back to the credential broker shim on AgentProfile workers) plus the credential broker's shim as `gcloud`. |
 | `persona-cluster` | `ghcr.io/gke-labs/kube-agents/persona-cluster` | release tag | — | The worker pods of the cluster AgentProfile under spec.mode: next, when the chart's profiles.cluster.enabled renders it: mounted at /persona, or copied there by a staging init container where image volumes are unavailable. |
 | `a2a-authcallout` | `ghcr.io/gke-labs/kube-agents/a2a-authcallout` | release tag | `A2A_CALLOUT_IMAGE` | The auth callout Deployment the operator renders under spec.mode: next, and nothing under spec.mode: today. |
 | `a2a-console` | `ghcr.io/gke-labs/kube-agents/a2a-console` | release tag | `A2A_CONSOLE_IMAGE` | The console server Deployment the operator renders under spec.mode: next, and nothing under spec.mode: today. |
@@ -88,6 +89,7 @@ Pinned here so `make mirror-images` and the install ask for the same version.
 | `fluent-bit` | `docker.io/fluent/fluent-bit` | `5.1.2` | `FLUENT_BIT_IMAGE` | The logging sidecar the operator injects into every agent pod. |
 | `nats` | `docker.io/library/nats` | `2.10-alpine` | `A2A_NATS_IMAGE` | The NATS StatefulSet the operator renders under spec.mode: next, and nothing under spec.mode: today. A one-server bus also runs its `stale-cluster-meta` init step on this image, which needs a shell with `du` and `cut`: mirror an `-alpine` tag, not the scratch-based `nats` tags. |
 | `nats-box` | `docker.io/natsio/nats-box` | `0.14.5` | `A2A_PROVISION_IMAGE` | The provision Job the operator runs against that NATS under spec.mode: next, and nothing under spec.mode: today. |
+| `nats-server-config-reloader` | `docker.io/natsio/nats-server-config-reloader` | `0.25.0@sha256:24bacde6b844f8875f93424ed153d33b3d9e9367fcccc14b683eb71fab3a4d8c` | `A2A_NATS_RELOADER_IMAGE` | A sidecar in the NATS pod the operator renders under spec.mode: next, and nothing under spec.mode: today. |
 | `k8s` | `docker.io/alpine/k8s` | `1.36.5` | — | The chart's pre-delete cleanup hook Job. |
 | `github-token-minter-server` | `us-docker.pkg.dev/abcxyz-artifacts/docker-images/github-token-minter-server` | `v2.7.1-amd64` | `GITHUB_MINTER_IMAGE` | The optional GitHub integration. |
 | `hindsight-api` | `ghcr.io/vectorize-io/hindsight-api` | `0.10.2@sha256:1ba631f950a04460feff6b1e212bad3cdf127b0cfb3d765bdcba12f512481d7b` | `HINDSIGHT_API_IMAGE` | The chart, when the memory provider uses Hindsight (make deploy-hindsight for the kustomize dev path). |
@@ -157,7 +159,9 @@ The Kubebuilder-generated operator manager image. Built from `k8s-operator/Docke
 
 ## Container entrypoint
 
-`platform-agent` — and `credential-proxy`, which inherits it from the shared `agent-base` stage — run [`deploy/shared/docker-entrypoint.sh`](https://github.com/gke-labs/kube-agents/blob/main/deploy/shared/docker-entrypoint.sh) as their `ENTRYPOINT`, with `CMD ["hermes", "gateway", "run"]`. Neither container built from that image reaches it under this operator: for both `envoy-credential-proxy` and `agent-api-auth` the operator sets `command` to `/usr/local/bin/start-services`, which replaces the image's `ENTRYPOINT` outright. Before it `exec`s whatever command it was handed, the entrypoint does its setup. It converts Hermes' SQLite databases out of WAL when the managed config pins `database.journal_mode: delete` (see `availability.runtimeClassName` on the [CRD reference](/kube-agents/operator/platformagent-crd/#specdeployment)), and seeds `$HERMES_HOME` from `/opt/defaults`. It then scaffolds the `platform` profile, reconciles optional built-in profiles (`KUBE_AGENTS_ENABLED_PROFILES`), links profile-targeted plugin volumes, merges the operator-rendered config overlays, copies the managed terminal settings into every profile's `.env`, and starts the Session KV server.
+`platform-agent` — and `credential-proxy`, which inherits it from the shared `agent-base` stage — run [`deploy/shared/docker-entrypoint.sh`](https://github.com/gke-labs/kube-agents/blob/main/deploy/shared/docker-entrypoint.sh) as their `ENTRYPOINT`, with `CMD ["hermes", "gateway", "run"]`. Neither container built from that image reaches it under this operator: for both `envoy-credential-proxy` and `agent-api-auth` the operator sets `command` to `/usr/local/bin/start-services`, which replaces the image's `ENTRYPOINT` outright.
+
+Before it `exec`s whatever command it was handed, the entrypoint does its setup. It converts Hermes' SQLite databases out of WAL when the managed config pins `database.journal_mode: delete` (see `availability.runtimeClassName` on the [CRD reference](/kube-agents/operator/platformagent-crd/#specdeployment)). It pins every session another session names as its parent, so the gateway's start-up prune keeps it, and seeds `$HERMES_HOME` from `/opt/defaults`. It then scaffolds the `platform` profile, reconciles optional built-in profiles (`KUBE_AGENTS_ENABLED_PROFILES`), links profile-targeted plugin volumes, merges the operator-rendered config overlays, copies the managed terminal settings into every profile's `.env`, and starts the Session KV server.
 
 Every one of those writes to the data volume, and a Pod runs this image in more than one container against a single copy of it. Exactly one container may do the setup. A second pass from a container that lacks the plugin volumes and the overlay ConfigMap does worse than duplicate the work. It reads the first container's fresh plugin links as dangling and unlinks them, and reverts the overlay whose source it cannot see. `AGENT_SHARED_STATE_SETUP` decides which container that is:
 

@@ -182,7 +182,7 @@ func NewConfigStore(configPath string) (*ConfigStore, error) {
 		configPath = filepath.Join(home, configDirRelPath, configFileName)
 	}
 	baseDir := filepath.Dir(configPath)
-	if err := os.MkdirAll(baseDir, DirPermMode); err != nil {
+	if err := os.MkdirAll(baseDir, DirPermMode); err != nil { // #nosec G703 -- the CLI's config directory from its flag, KUBE_AGENTS_MCP_CONFIG or the user's home
 		return nil, fmt.Errorf("creating config dir %s: %w", baseDir, err)
 	}
 	s := &ConfigStore{
@@ -368,7 +368,7 @@ func WriteFileAtomic(path string, data []byte) error {
 // WriteFileAtomicIfChanged atomically writes data to path only when the file does not exist
 // or its current contents differ from data.
 func WriteFileAtomicIfChanged(path string, data []byte) error {
-	if existing, err := os.ReadFile(path); err == nil && bytes.Equal(existing, data) {
+	if existing, err := os.ReadFile(path); err == nil && bytes.Equal(existing, data) { // #nosec G304 -- the workstation CLI's own state file under its config directory
 		return nil
 	}
 	return WriteFileAtomic(path, data)

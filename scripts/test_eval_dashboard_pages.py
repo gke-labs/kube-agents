@@ -27,7 +27,7 @@ import unittest.mock
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 
-from eval_dashboard import render
+from eval_dashboard import nightly, render
 
 FIXTURE = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "testdata_classify" / "incidents.json.gz"
 PAGES_JS = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "template" / "pages.js"
@@ -119,6 +119,22 @@ def brief_view_anchors(pages_js: str) -> frozenset:
 
 
 BRIEF_VIEW_ANCHORS = brief_view_anchors(PAGES_JS.read_text())
+
+
+def night_part_words(pages_js: str) -> dict:
+    """PAGE.nightPartWords from pages.js's text, a flat object of quoted
+    or bare keys to quoted words."""
+    match = re.search(r"^\s*nightPartWords:\s*\{([^{}]*)\}", pages_js, re.MULTILINE)
+    if match is None:
+        raise RuntimeError(f"{PAGES_JS}: PAGE.nightPartWords is not a flat object literal")
+    return dict(re.findall(r'"?([\w-]+)"?\s*:\s*"([^"]*)"', match.group(1)))
+
+
+class NightPartWordsTest(unittest.TestCase):
+    def test_the_pages_part_words_are_nightly_py_s(self):
+        # pages.js carries a hand copy of nightly.PART_WORDS; a part added to
+        # one alone would render as its raw id on the Nightly page.
+        self.assertEqual(night_part_words(PAGES_JS.read_text()), dict(nightly.PART_WORDS))
 # The Cases page's one polled call, in
 # test_cases_page_sorts_filters_and_the_hash_highlight: a row fragment,
 # the bare case name, under boot and two polls on the page's real clock.
@@ -943,8 +959,63 @@ class BrowserTest(unittest.TestCase):
         out = render_to(pathlib.Path(self.tmp.name) / "gitlab-night", data, health=health_doc())
         page = dom_text(out / "index.html")
         self.assertIn("1 night on record: 1 green, 0 not", page)
-        self.assertIn('href="https://oss.gprow.dev/view/gs/kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/2097282860221206700"', page)
+        # Its log_url is a Spyglass link into the private nightly bucket, which is dead: the row links the Console.
+        self.assertIn('href="https://console.cloud.google.com/storage/browser/kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/2097282860221206700"', page)
+        self.assertNotIn('href="https://oss.gprow.dev/view/gs/kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/2097282860221206700"', page)
         self.assertIn("1 run on record: 0 green, 1 not", page, "the night is not among the lane's pull-request runs")
+        # A night that records where it lives (gcs_base) links the Console the same way.
+        night["gcs_base"] = "gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/2097282860221206700/"
+        out = render_to(pathlib.Path(self.tmp.name) / "gitlab-night-console", data, health=health_doc())
+        page = dom_text(out / "index.html")
+        self.assertIn('href="https://console.cloud.google.com/storage/browser/kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/2097282860221206700"', page)
+        self.assertNotIn('href="https://oss.gprow.dev/view/gs/kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/2097282860221206700"', page)
+
+    def test_the_self_managed_forges_share_a_section_each_row_naming_its_forge(self):
+        """The GHES and GitLab CE lanes (kube-agents#3682) share one
+        "Self-managed lanes" section beside the GitLab one, saying how each is
+        run until one has a run; their rows name their forge, so a red says
+        which broke. The GitLab lane's nights are listed per nightly job."""
+        app = dom_text(self.index)
+        self.assertIn("Self-managed lanes", app)
+        self.assertNotIn(">GHES lane<", app)
+        self.assertIn("No run on record", app)
+        for job in ("pull-kube-agents-smoke-test-ghes", "pull-kube-agents-smoke-test-gitlab-ce"):
+            self.assertIn(f"/test {job}", app)
+        self.assertIn("No scheduled run on record", app)
+        self.assertIn("once a week", app)
+        self.assertNotIn("scheduled jobs are off", app, "no lane is paused")
+        # A paused lane says why, as the digest does.
+        from eval_dashboard import forge_lane, tiers
+        with unittest.mock.patch.dict(forge_lane.LANES[tiers.TIER_GHES], {"off": "the weekly job waits on a fix"}):
+            paused = render_to(pathlib.Path(self.tmp.name) / "paused", self.data, health=health_doc())
+        self.assertIn("GHES's scheduled jobs are off: the weekly job waits on a fix", dom_text(paused / "index.html"))
+        data = copy.deepcopy(self.data)
+        base = next(r for r in data["runs"] if r["build_id"] == "2097282860221206528")
+        lane_base = "gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/4480/pull-kube-agents-smoke-test-gitlab-ce/2097282860221206800/"
+        data["runs"] += [
+            dict(base, build_id="2097282860221206800", tier="gitlab-ce", job="pull-kube-agents-smoke-test-gitlab-ce", pr=4480, result="SUCCESS", eval_verdict="GREEN", gcs_base=lane_base),
+            dict(base, build_id="2097282860221206802", tier="ghes", job="ci-kube-agents-eval-weekly-ghes-next", pr=None, result="FAILURE", eval_verdict="RED", log_url="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/ci-kube-agents-eval-weekly-ghes-next/2097282860221206802"),
+            dict(base, build_id="2097282860221206803", tier="gitlab-ce", job="ci-kube-agents-eval-nightly-gitlab-ce-next", pr=None, result="SUCCESS", eval_verdict="GREEN", log_url="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/ci-kube-agents-eval-nightly-gitlab-ce-next/2097282860221206803"),
+            dict(base, build_id="2097282860221206801", tier="gitlab", job="ci-kube-agents-eval-nightly-gitlab-next", pr=None, result="FAILURE", eval_verdict="RED", log_url="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/ci-kube-agents-eval-nightly-gitlab-next/2097282860221206801"),
+        ]
+        out = render_to(pathlib.Path(self.tmp.name) / "lanes", data, health=health_doc())
+        page = dom_text(out / "index.html")
+        self.assertIn('href="https://console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/4480/pull-kube-agents-smoke-test-gitlab-ce/2097282860221206800"', page)
+        self.assertNotIn('href="run.html#build=2097282860221206800"', page, "not the gate's")
+        # One table each for the pull-request and the scheduled runs, each row naming its forge.
+        self.assertIn("<th>Forge</th>", page)
+        self.assertIn("<td>GitLab CE</td>", page)
+        self.assertIn("<td>GHES</td>", page)
+        self.assertIn("Scheduled runs", page)
+        self.assertIn("GHES 1 run, 0 green; GitLab CE 1 run, 1 green", page)
+        # Each scheduled row names its job, so a retired nightly's night reads as its own.
+        self.assertIn("<th>Job</th>", page)
+        self.assertIn("<td><code>ci-kube-agents-eval-nightly-gitlab-ce-next</code></td>", page)
+        self.assertIn("<td><code>ci-kube-agents-eval-weekly-ghes-next</code></td>", page)
+        self.assertIn('href="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/ci-kube-agents-eval-weekly-ghes-next/2097282860221206802"', page)
+        # The GitLab lane's next nightly is a table of its own.
+        self.assertIn("1 night on record: 0 green, 1 not", page)
+        self.assertIn('href="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/ci-kube-agents-eval-nightly-gitlab-next/2097282860221206801"', page)
 
     def test_a_case_lost_to_the_delegation_ceiling_says_so_on_the_run_page(self):
         """Ceiling reps sit under their own key in `reps` (#1874). The card's
@@ -1103,6 +1174,28 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("rca-names-the-oom", app)
         self.assertIn("Tracking <a", app)
         self.assertIn("issues/1278", app)
+
+    def test_history_lists_an_issue_once_whether_a_tick_wrote_its_number_or_its_url(self):
+        """health-history.jsonl across a rollout: the tick before wrote
+        "#1300", the tick after its URL; the incident names the issue once."""
+        ticks = [dict(health_doc("OUTAGE"), tick="2026-09-08T09:00:00Z", tracking_issues=["#1300"]),
+                 dict(health_doc("OUTAGE"), tick="2026-09-08T09:15:00Z", tracking_issues=["https://github.com/gke-labs/kube-agents/issues/1300", "#1278"])]
+        path = pathlib.Path(self.tmp.name) / "history.jsonl"
+        path.write_text("".join(json.dumps(t) + "\n" for t in ticks))
+        [incident] = render.history_incidents(render.load_health_history(path))
+        self.assertEqual(incident["tracking_issues"], ["#1300", "#1278"])
+
+    def test_a_tracking_issue_given_as_a_url_links_there_and_names_another_repository(self):
+        """health.json's tracking_issues: a bare #N is this repository's
+        (case-notes.yaml); the bot's own issues arrive as full URLs and may
+        live in the issues repository, which the link text then names."""
+        doc = health_doc("OUTAGE")
+        doc["tracking_issues"] = ["#1278", "https://github.com/gke-labs/kube-agents/issues/1300", "https://github.com/gke-labs/kube-agents-eval-triage/issues/12"]
+        out = render_to(pathlib.Path(self.tmp.name) / "issue-urls", self.data, health=doc)
+        app = dom_text(out / "index.html")
+        self.assertIn('<a href="https://github.com/gke-labs/kube-agents/issues/1278">#1278</a>', app)
+        self.assertIn('<a href="https://github.com/gke-labs/kube-agents/issues/1300">#1300</a>', app)
+        self.assertIn('<a href="https://github.com/gke-labs/kube-agents-eval-triage/issues/12">gke-labs/kube-agents-eval-triage#12</a>', app)
         self.assertIn("Runs in this window", app)
         self.assertIn('href="run.html#build=2097282860221206528"', app)
         self.assertIn('class="chip hit">cluster-agent-crashloop-debug', app)
@@ -1239,11 +1332,9 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("Smoke gate is healthy", app)
         sentence = "Runs are slow since Tue 8:00 AM ET: the last 5 full runs took a median of 183 min against a 7-day typical of 151. Nothing is broken; /retest won't make yours faster."
         self.assertIn(sentence, app)
-        # The 🐢 message's own link lands on this headline, not on a
-        # synthetic past incident: a `since` at the note's GREEN start would.
-        fragment = "#" + render.post_health.render_slow(health_doc("GREEN", slow=note)).rsplit("#", 1)[1]
-        self.assertEqual(fragment, "#view=agent")
-        linked = dom_text(out / "index.html", fragment=fragment)
+        # The bare agent view lands on this headline, not on a synthetic past
+        # incident: a `since` at the note's GREEN start would.
+        linked = dom_text(out / "index.html", fragment="#view=agent")
         self.assertIn("Smoke gate is healthy", linked)
         self.assertIn(sentence, linked)
         self.assertNotIn("PAST", linked.split('id="agent"', 1)[0], "the headline is the healthy one")
@@ -1755,7 +1846,15 @@ class CasesAndGridPagesTest(unittest.TestCase):
         data["generated_at"] = NOW
         data["cases"] = [{"name": n, "domain": "cluster-debugging", "active": True} for n in CRASHLOOP_TRIO]
         data["cases"].append({"name": "retired-probe", "domain": "cost", "active": False})
-        data["releases"] = [RC_RELEASE, dict(RC_RELEASE, build_id="7", rc_tag="hostile", artifacts_url="javascript:alert(1)", verdict=None, started="2026-09-09T03:35:01+00:00")]
+        data["releases"] = [
+            RC_RELEASE,
+            dict(RC_RELEASE, build_id="7", rc_tag="hostile", artifacts_url="javascript:alert(1)", verdict=None, started="2026-09-09T03:35:01+00:00"),
+            # A release read from the lane's private bucket (SCHEMA.md,
+            # releases[].gcs_base): its row links the Console, not Spyglass.
+            dict(RC_RELEASE, build_id="2097891568546484225", rc_tag="evalcand_2611100000_5b5ad10", started="2026-09-09T01:35:01+00:00",
+                 gcs_base="gs://kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/2097891568546484225/",
+                 artifacts_url="https://oss.gprow.dev/view/gs/kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/2097891568546484225"),
+        ]
         data["pending_builds"] = [{"build_id": "2097300000000000000", "first_seen": "2026-09-08T14:00:00+00:00"}]
         # A green run that recorded no cases (the gate revalidated the
         # branch's earlier run) sits inside the live window: no Grid column.
@@ -1940,6 +2039,8 @@ class CasesAndGridPagesTest(unittest.TestCase):
         app = dom_text(self.out / "index.html")
         self.assertIn("Release candidates", app)
         self.assertIn('href="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/post-kube-agents-eval-rc/2097891568546484224"', app)
+        self.assertIn('href="https://console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/2097891568546484225"', app)
+        self.assertNotIn("oss.gprow.dev/view/gs/kube-agents-evals-presubmit-logs", app)
         self.assertIn('<span class="pill p-pass">GREEN</span>', app)
         self.assertIn("90.0%", app)
         self.assertIn("baselines maturing", app)
@@ -1979,7 +2080,7 @@ class NotEvaluatedVerdictTest(unittest.TestCase):
 
 # --- the Scenarios page -----------------------------------------------------
 
-SCENARIO_KEY = {"setup_id": "claude-opus-5-5-kubeagents-mcp", "scoring_version": "v1", "judge_model": "gemini-3.1-pro-preview", "fleet": 1, "verifiers": 1, "mode": "next"}
+SCENARIO_KEY = {"setup_id": "other-model-kubeagents-mcp", "scoring_version": "v1", "judge_model": "gemini-3.1-pro-preview", "fleet": 1, "verifiers": 1, "mode": "next"}
 SCENARIO_OLD_KEY = dict(SCENARIO_KEY, setup_id="gemini-3-1-pro-preview-kubeagents-mcp", mode=None)
 SCENARIO_LEAD_IN = "critical requirements:\n- The reply names the cluster.\n  It cites a live read.\n- It says nothing else.\n"
 # The window's clock in the unit tests: records on Sep 1-10 at 05:00Z, the

@@ -87,8 +87,21 @@ func TestNotifyFailsWhenTheGatewayPostedNothing(t *testing.T) {
 	notifyEnv(t, s.ClientURL())
 	answerNotify(t, s.ClientURL(), lib.NotifyReply{Error: "thread is not a thread of the home channel"})
 	err := run([]string{"notify", "--platform", "google_chat", "x"})
-	if err == nil || !strings.Contains(err.Error(), "posted nothing") {
+	if err == nil || !strings.Contains(err.Error(), "posted nothing") || errors.Is(err, errNotifyRouteUnavailable) {
 		t.Errorf("err = %v, want the gateway's refusal", err)
+	}
+}
+
+// A refusal the gateway marks Retry (stopping, a record it couldn't read) is
+// route-unavailable, which a sender waits out instead of counting against
+// the destination; a plain refusal is not.
+func TestNotifyARetryRefusalIsRouteUnavailable(t *testing.T) {
+	s := startNotifyServer(t)
+	notifyEnv(t, s.ClientURL())
+	answerNotify(t, s.ClientURL(), lib.NotifyReply{Error: "the gateway is stopping; not posted", Retry: true})
+	err := run([]string{"notify", "--platform", "google_chat", "x"})
+	if !errors.Is(err, errNotifyRouteUnavailable) {
+		t.Errorf("err = %v, want route-unavailable", err)
 	}
 }
 
@@ -139,6 +152,28 @@ func TestNotifyWithNoAnswerIsOutcomeUnknown(t *testing.T) {
 	err = run([]string{"notify", "--platform", "google_chat", "--timeout", "200ms", "x"})
 	if !errors.Is(err, errNotifyOutcomeUnknown) {
 		t.Errorf("err = %v, want outcome-unknown", err)
+	}
+}
+
+// A home post the gateway refused and kept answers with kept set, and main
+// exits notifyExitKept so a sender that re-sends on failure stops.
+func TestNotifyAKeptRefusalExitsKept(t *testing.T) {
+	s := startNotifyServer(t)
+	notifyEnv(t, s.ClientURL())
+	nc, err := nats.Connect(s.ClientURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	if _, err := nc.Subscribe(lib.NotifySubjectGchat, func(m *nats.Msg) {
+		_ = m.Respond([]byte(`{"error":"no home channel is configured","kept":true}`))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_ = nc.Flush()
+	err = run([]string{"notify", "--platform", "google_chat", "x"})
+	if !errors.Is(err, errNotifyKept) {
+		t.Errorf("err = %v, want kept", err)
 	}
 }
 

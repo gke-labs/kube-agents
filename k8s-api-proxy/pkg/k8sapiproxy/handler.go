@@ -19,6 +19,7 @@ const (
 	authFailedMessage      = messagePrefix + "caller authentication failed"
 	authUnavailableMessage = messagePrefix + "caller authentication is unavailable; retry"
 	unclassifiedMessage    = messagePrefix + "the request path could not be classified"
+	throttledMessage       = messagePrefix + "too many requests in flight; retry"
 	upstreamFailed         = "kube-proxy could not reach cluster %q"
 
 	// flushImmediately streams each upstream write to the caller, which watch and log
@@ -27,6 +28,11 @@ const (
 
 	// HealthzPath is the unauthenticated health probe path for the proxy itself.
 	HealthzPath = "/_kube_proxy/healthz"
+
+	// headerRetryAfter on a 429 is what client-go waits on before it retries, so a throttled
+	// kubectl backs off and retries without the caller seeing the 429.
+	headerRetryAfter  = "Retry-After"
+	retryAfterSeconds = "1"
 )
 
 // Config configures NewHandler.
@@ -35,9 +41,6 @@ type Config struct {
 	Authenticator CallerAuthenticator
 	// Upstream forwards an approved request to its target cluster. Required.
 	Upstream UpstreamTransport
-	// DefaultClusterID is the cluster used when the request path does not start with
-	// /clusters/{id}; InClusterID when empty.
-	DefaultClusterID string
 	// Policy decides which requests are forwarded. Its Mode must be set.
 	Policy Policy
 	// Audit receives an AuditEvent for every request; NewSlogAuditSink(Logger) when nil.
@@ -49,20 +52,32 @@ type Config struct {
 	Metrics *Metrics
 	// TracerProvider emits OpenTelemetry server and upstream client spans; optional.
 	TracerProvider trace.TracerProvider
+	// Cache configures HTTP response caching and in-flight request coalescing; disabled when nil.
+	Cache *CacheConfig
+	// Exclusions refuses every request to a cluster spec.scope.exclude.clusters names,
+	// before policy, cache or upstream; nil excludes nothing.
+	Exclusions *Exclusions
+	// MaxInFlight caps the forwarded requests in flight; one over it is answered 429 with
+	// Retry-After. Each in-flight response holds upstream buffers in the proxy, so the cap
+	// bounds its memory. Watches and long-running subresources do not count. Zero is no cap.
+	MaxInFlight int
 }
 
 // auditEventKey carries the request's *AuditEvent to the transport and the error handler.
 type auditEventKey struct{}
 
 type handler struct {
-	authenticator    CallerAuthenticator
-	defaultClusterID string
-	policy           Policy
-	audit            AuditSink
-	metrics          *Metrics
-	tracerProvider   trace.TracerProvider
-	factory          *request.RequestInfoFactory
-	proxy            *httputil.ReverseProxy
+	authenticator  CallerAuthenticator
+	exclusions     *Exclusions
+	policy         Policy
+	audit          AuditSink
+	metrics        *Metrics
+	tracerProvider trace.TracerProvider
+	cache          *responseCache
+	factory        *request.RequestInfoFactory
+	proxy          *httputil.ReverseProxy
+	// slots holds one token per counted request in flight; nil when there is no cap.
+	slots chan struct{}
 }
 
 // NewHandler returns an http.Handler that authenticates the caller, resolves the target
@@ -79,8 +94,12 @@ func NewHandler(cfg Config) (http.Handler, error) {
 	if !cfg.Policy.Mode.valid() {
 		return nil, fmt.Errorf("k8sapiproxy: invalid Config.Policy.Mode %q", cfg.Policy.Mode)
 	}
-	if cfg.DefaultClusterID != "" && !validClusterID.MatchString(cfg.DefaultClusterID) {
-		return nil, fmt.Errorf("k8sapiproxy: invalid Config.DefaultClusterID %q", cfg.DefaultClusterID)
+	if cfg.MaxInFlight < 0 {
+		return nil, fmt.Errorf("k8sapiproxy: Config.MaxInFlight %d is negative", cfg.MaxInFlight)
+	}
+	var slots chan struct{}
+	if cfg.MaxInFlight > 0 {
+		slots = make(chan struct{}, cfg.MaxInFlight)
 	}
 
 	logger := cfg.Logger
@@ -95,14 +114,31 @@ func NewHandler(cfg Config) (http.Handler, error) {
 	upstream := cfg.Upstream
 	metrics := cfg.Metrics
 	tp := cfg.TracerProvider
+	cache := newResponseCache(cfg.Cache, metrics)
+	baseRoundTrip := func(req *http.Request) (*http.Response, error) {
+		ev := eventFrom(req)
+		upCtx, upSpan := startUpstreamSpan(req.Context(), tp, ev.ClusterID, req.Method)
+		defer upSpan.End()
+		resp, err := upstream.RoundTripCluster(upCtx, ev.ClusterID, req.WithContext(upCtx))
+		// Redacting here rather than in ModifyResponse keeps the plan off resp.Request,
+		// which a transport may replace with a request of its own.
+		if plan, ok := req.Context().Value(secretRedactionKey{}).(*secretRedaction); ok && resp != nil {
+			if redactSecretResponse(resp, plan, func(cause error) { ev.Err = cause }) {
+				metrics.recordSecretRedaction(SecretActionPayloadScrubbed)
+			}
+		}
+		return resp, err
+	}
 	return &handler{
-		authenticator:    cfg.Authenticator,
-		defaultClusterID: cfg.DefaultClusterID,
-		policy:           cfg.Policy,
-		audit:            audit,
-		metrics:          metrics,
-		tracerProvider:   tp,
-		factory:          NewRequestInfoFactory(),
+		authenticator:  cfg.Authenticator,
+		exclusions:     cfg.Exclusions,
+		policy:         cfg.Policy,
+		audit:          audit,
+		metrics:        metrics,
+		tracerProvider: tp,
+		cache:          cache,
+		factory:        NewRequestInfoFactory(),
+		slots:          slots,
 		proxy: &httputil.ReverseProxy{
 			// Rewrite rather than Director: the reverse proxy then also drops the caller's
 			// Forwarded, X-Forwarded-For, X-Forwarded-Host and X-Forwarded-Proto headers. The
@@ -113,18 +149,10 @@ func NewHandler(cfg Config) (http.Handler, error) {
 				pr.Out.URL = &url.URL{Path: pr.In.URL.Path, RawQuery: pr.In.URL.RawQuery}
 			},
 			Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-				ev := eventFrom(req)
-				upCtx, upSpan := startUpstreamSpan(req.Context(), tp, ev.ClusterID, req.Method)
-				defer upSpan.End()
-				resp, err := upstream.RoundTripCluster(upCtx, ev.ClusterID, req.WithContext(upCtx))
-				// Redacting here rather than in ModifyResponse keeps the plan off resp.Request,
-				// which a transport may replace with a request of its own.
-				if plan, ok := req.Context().Value(secretRedactionKey{}).(*secretRedaction); ok && resp != nil {
-					if redactSecretResponse(resp, plan, func(cause error) { ev.Err = cause }) {
-						metrics.recordSecretRedaction(SecretActionPayloadScrubbed)
-					}
+				if cache != nil {
+					return cache.roundTrip(req, baseRoundTrip)
 				}
-				return resp, err
+				return baseRoundTrip(req)
 			}),
 			FlushInterval: flushImmediately,
 			// The transport's error goes to the audit event, not to the caller: it can name
@@ -208,8 +236,9 @@ func (h *handler) recordObservability(r *http.Request, info *request.RequestInfo
 		}
 		spanReason = ev.Reason
 		h.metrics.recordRejection(ev.Reason, verbLabel, resLabel, subLabel, h.policy.Mode)
-	// Neither is the upstream failing: the TokenReview did (503), or the caller left, before or during the copy.
-	case ev.Outcome == OutcomeAuthUnavailable, ev.Outcome == OutcomeCanceled:
+	// Neither is the upstream failing: the TokenReview did (503), the caller left before or during the copy,
+	// or the in-flight cap turned the request away (429).
+	case ev.Outcome == OutcomeAuthUnavailable, ev.Outcome == OutcomeCanceled, ev.Outcome == OutcomeThrottled:
 		metricOutcome = string(ev.Outcome)
 	case ev.Outcome == OutcomeUpstreamError || ev.Outcome == OutcomeAborted || ev.StatusCode >= http.StatusInternalServerError:
 		metricOutcome = string(OutcomeUpstreamError)
@@ -237,12 +266,18 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request, ev *AuditEvent, 
 	}
 	ev.Caller = caller
 
-	clusterID, apiPath, perr := SplitClusterPath(r.URL, h.defaultClusterID)
+	clusterID, apiPath, perr := SplitClusterPath(r.URL)
 	if perr != nil {
 		refuse(w, ev, perr)
 		return
 	}
 	ev.ClusterID, ev.Path = clusterID, apiPath
+	// Before anything reads the request or a cached answer: an excluded cluster's API is
+	// never reached, whatever the request asks of it.
+	if perr := h.exclusions.check(clusterID); perr != nil {
+		refuse(w, ev, perr)
+		return
+	}
 
 	out := r.Clone(r.Context())
 	out.URL.Path = apiPath
@@ -265,9 +300,26 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request, ev *AuditEvent, 
 		return
 	}
 
+	if !isLongRunning(info) {
+		release, ok := h.acquireSlot()
+		if !ok {
+			ev.Outcome = OutcomeThrottled
+			w.Header().Set(headerRetryAfter, retryAfterSeconds)
+			writeStatus(w, http.StatusTooManyRequests, metav1.StatusReasonTooManyRequests, throttledMessage)
+			return
+		}
+		// The reverse proxy copies the whole response before it returns, so the slot covers
+		// the body the proxy buffers.
+		defer release()
+	}
+
 	sanitizeRequestHeaders(out.Header, h.policy.permitsUpgrade(info))
 	ev.Outcome = OutcomeForwarded
 	ctx := context.WithValue(out.Context(), auditEventKey{}, ev)
+	callerAccept := normalizeAcceptHeader(out.Header)
+	if h.cache != nil {
+		ctx = context.WithValue(ctx, cacheRequestMetaKey{}, cacheRequestMeta{info: info, callerAccept: callerAccept})
+	}
 	if secretRedacted {
 		plan := rewriteSecretRequest(out.Header, info)
 		if plan.view != viewTable {
@@ -277,6 +329,24 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request, ev *AuditEvent, 
 	}
 	out = out.WithContext(ctx)
 	h.proxy.ServeHTTP(w, out)
+}
+
+// acquireSlot takes an in-flight slot without waiting; ok is false when all are taken.
+func (h *handler) acquireSlot() (release func(), ok bool) {
+	if h.slots == nil {
+		return func() {}, true
+	}
+	select {
+	case h.slots <- struct{}{}:
+		return func() { <-h.slots }, true
+	default:
+		return nil, false
+	}
+}
+
+// isLongRunning reports a request that stays open for as long as the caller follows it.
+func isLongRunning(info *request.RequestInfo) bool {
+	return info.Verb == verbWatch || longRunningSubresources.Has(info.Subresource)
 }
 
 func refuse(w http.ResponseWriter, ev *AuditEvent, perr *PolicyError) {

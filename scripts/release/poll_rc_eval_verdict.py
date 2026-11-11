@@ -24,6 +24,10 @@ WHAT IS READ, AND WHY NOT THE EXIT STATUS. Three artifacts per build:
   finished.json  says the build is over. Its absence means still in flight.
   artifacts/rc-eval-summary.md
                  carries the verdict word, and it is the one that decides.
+  artifacts/eval-verdict.json
+                 bench-gate's per-case roll-up. Read once more after a settled
+                 RED, to print the blocking cases into the log for the
+                 broken-stage notifier; it never moves the verdict.
 
 The build's own pass/fail is deliberately NOT the verdict. It collapses two
 outcomes an operator must not have collapsed: a candidate whose eval catalog
@@ -69,23 +73,42 @@ candidate that was judged from one whose lane broke and which may be retried.
 Usage:
   poll_rc_eval_verdict.py --commit <sha> [--evalcand-tag <tag>]
 
-Requires `gcloud` (its `storage` group), authenticated against the archive bucket.
+Requires `gcloud` (its `storage` group), authenticated against the archive buckets.
 """
 
 import argparse
 import json
 import os
+import pathlib
 import re
 import subprocess
 import sys
 import time
 
-# The archive `post-kube-agents-eval-rc` uploads to, and the Prow UI that
-# renders one build directory from it. Both are the deployment's, not this
-# repository's: scripts/eval_dashboard/collect.py reads the same bucket for the
-# dashboard, and .github/workflows/ci-health.yml holds the credentials that
-# reach it.
-DEFAULT_LOGS_PREFIX = "gs://kube-agents-prow/logs/post-kube-agents-eval-rc/"
+# `scripts/` on the path, as scripts/release/notify_release_stage_broken.py
+# does: the link rule below is scripts/eval_dashboard/links.py's (stdlib
+# only), so the private-bucket set has one home.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+
+from eval_dashboard.links import console_url, is_private  # noqa: E402
+
+# The archives `post-kube-agents-eval-rc` uploads to. Both are the
+# deployment's, not this repository's: scripts/eval_dashboard/collect.py reads
+# the same prefixes for the dashboard, and .github/workflows/ci-health.yml
+# holds the credentials that reach them. The lane logged to the Prow cluster's
+# default bucket first and moves to the presubmit lanes' private bucket
+# (oss-test-infra, decoration_config.gcs_configuration), so by default both
+# are listed, the old one first, and a build found under either is the build.
+# The old prefix can be dropped from the default 14 days after the lane moves:
+# by then every candidate the pipeline can still ask about is in the new one.
+LEGACY_LOGS_PREFIX = "gs://kube-agents-prow/logs/post-kube-agents-eval-rc/"
+PRIVATE_LOGS_PREFIX = "gs://kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/"
+DEFAULT_LOGS_PREFIXES = (LEGACY_LOGS_PREFIX, PRIVATE_LOGS_PREFIX)
+# `--logs-prefix a,b` is the same as `--logs-prefix a --logs-prefix b`.
+LOGS_PREFIX_SEPARATOR = ","
+# The Prow UI that renders one build directory, for a bucket Deck can read.
+# A build in a private bucket (links.PRIVATE_LOG_BUCKETS) links the Cloud
+# Console instead; `build_url` chooses.
 SPYGLASS_VIEW = "https://oss.gprow.dev/view/gs/"
 GS_SCHEME = "gs://"
 
@@ -131,6 +154,28 @@ FINISHED_FILE = "finished.json"
 # other half of this pair.
 ARTIFACTS_DIR = "artifacts/"
 RC_SUMMARY_FILE = "rc-eval-summary.md"
+# bench-gate's per-case roll-up beside the summary (RC_VERDICT_JSON_FILE in
+# hack/ci-eval-rc.sh). Read once, after a settled RED is decided, so the
+# notifier can name the cases that made it; it never moves the verdict.
+RC_VERDICT_JSON_FILE = "eval-verdict.json"
+VERDICT_CASES_FIELD = "cases"
+VERDICT_PARTIAL_FIELD = "partial"
+CASE_BLOCKING_FIELD = "blocking"
+# What the red-cases line carries per case, in the roll-up's own names, and
+# the vocabulary each value is accepted in: bench-gate's, the roll-up's one
+# producer. A case id is the shape a `bench/tasks/<id>` directory name takes
+# (`scripts/case_owner.py` requires the same; `scripts/
+# test_notify_release_stage_broken.py` holds the two patterns equal), a rung
+# is an int, a rung name is spelled as `Rung.name` is. An entry outside it
+# is never printed, here into the step summary or by the notifier into the
+# issue: the whole line is withheld with a warning, so nothing from the
+# archive reaches Markdown unchecked.
+RED_CASE_NAME_KEY = "case"
+RED_CASE_RUNG_KEY = "rung"
+RED_CASE_RUNG_NAME_KEY = "rung_name"
+RED_CASE_KEYS = (RED_CASE_NAME_KEY, RED_CASE_RUNG_KEY, RED_CASE_RUNG_NAME_KEY)
+CASE_ID_RE = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._-]*")
+RUNG_NAME_RE = re.compile(r"[A-Z_]+")
 
 # started.json's scalar commit fields. `repos` is handled separately: its values
 # are `<ref>:<sha>` for a tag-push postsubmit and a bare sha otherwise.
@@ -182,6 +227,14 @@ VERDICT_LINE_FORMAT = "verdict={verdict} settled={settled} build_id={build_id} {
 # The `settled` output and the verdict line's `settled=` field.
 SETTLED_TRUE = "true"
 SETTLED_FALSE = "false"
+# The line after it on a settled RED: the blocking cases of the roll-up as
+# one compact JSON object, `{"cases": [{case, domain, rung, rung_name}...],
+# "partial": bool}`, keys sorted. The notifier imports this format too and
+# parses the object back; `tests/test_poll_rc_eval_verdict.py` pins the
+# literal line.
+RED_CASES_LINE_FORMAT = "red_cases={cases}"
+RED_CASES_CASES_KEY = "cases"
+RED_CASES_PARTIAL_KEY = "partial"
 
 # Exit codes, one per verdict. Distinct so a workflow can tell "the release is
 # bad" from "the eval lane is broken" without parsing the summary, and none of
@@ -231,6 +284,11 @@ _NOT_FOUND_PATTERNS = (
     "matched no objects",
     "not found: 404",
 )
+# Absences already noted this run, by gcloud argv. An absent object is a
+# normal state here, not a fault -- one of the two default prefixes is
+# empty for the whole transition, and finished.json is absent for as long
+# as the build runs -- so each is one `note:` line, not a warning per poll.
+_ABSENCE_NOTED = set()
 
 
 def _gcloud_storage(args, gcloud=DEFAULT_GCLOUD):
@@ -254,10 +312,14 @@ def _gcloud_storage(args, gcloud=DEFAULT_GCLOUD):
         return UNREADABLE
     if proc.returncode != 0:
         stderr = proc.stderr.strip()
-        print(f"warning: {gcloud} {STORAGE_GROUP} {' '.join(args)}: {stderr}", file=sys.stderr)
         lowered = stderr.lower()
         if any(pattern in lowered for pattern in _NOT_FOUND_PATTERNS):
+            key = tuple(args)
+            if key not in _ABSENCE_NOTED:
+                _ABSENCE_NOTED.add(key)
+                print(f"note: {' '.join(args)}: nothing there yet ({stderr.splitlines()[0] if stderr else 'absent'})", file=sys.stderr)
             return None
+        print(f"warning: {gcloud} {STORAGE_GROUP} {' '.join(args)}: {stderr}", file=sys.stderr)
         return UNREADABLE
     return proc.stdout
 
@@ -424,6 +486,56 @@ def spyglass_url(base):
     if not isinstance(base, str) or not base.startswith(GS_SCHEME):
         return None
     return SPYGLASS_VIEW + base[len(GS_SCHEME):].rstrip("/")
+
+
+def build_url(base):
+    """The link a reader can open for a build directory: Spyglass for a
+    bucket Deck reads, the Cloud Console's bucket browser for one it cannot
+    (the private set in scripts/eval_dashboard/links.py), where a Spyglass
+    link answers "Access denied" to everyone."""
+    if not isinstance(base, str) or not base.startswith(GS_SCHEME):
+        return None
+    if is_private(base):
+        return console_url(base)
+    return spyglass_url(base)
+
+
+def list_prefixes(prefixes, read_prefix):
+    """One listing over every archive prefix, for `scan_once`.
+
+    `read_prefix(prefix)` is one `gcloud storage ls`: its text, None when the
+    prefix holds nothing, UNREADABLE when the call failed. The results are
+    concatenated and `build_dirs` orders them by build id, so a build under
+    either prefix is found and the newest wins whichever bucket it is in.
+
+    One UNREADABLE prefix makes the whole listing UNREADABLE. The safe
+    direction, for the same reason a failed started.json read is: a listing
+    that silently lost the new bucket would let an older build in the old one
+    answer for the candidate. An absent prefix is just empty: the new one is
+    absent until the first build lands there and the old one once its builds
+    are reaped. Every prefix absent is no listing at all, as before.
+    """
+    parts = []
+    for prefix in prefixes:
+        listing = read_prefix(prefix)
+        if listing is UNREADABLE:
+            return UNREADABLE
+        if listing:
+            parts.append(listing if listing.endswith("\n") else listing + "\n")
+    return "".join(parts) or None
+
+
+def logs_prefixes(values):
+    """The archive prefixes from `--logs-prefix`: each value may carry
+    several, comma-separated; every one ends in a slash; none by default
+    means DEFAULT_LOGS_PREFIXES."""
+    prefixes = []
+    for value in values or ():
+        for part in value.split(LOGS_PREFIX_SEPARATOR):
+            part = part.strip()
+            if part:
+                prefixes.append(part if part.endswith("/") else part + "/")
+    return prefixes or list(DEFAULT_LOGS_PREFIXES)
 
 
 def read_verdict(base, read_file, finished):
@@ -621,7 +733,7 @@ def poll(
             # polls that follow it.
             seen_build = build_id
             seen_base = base
-            print(f"build {build_id} is running at {commit}: {spyglass_url(base)}", flush=True)
+            print(f"build {build_id} is running at {commit}: {build_url(base)}", flush=True)
 
         elapsed = now() - started_at
         if seen_build is None and now() >= appear_deadline:
@@ -711,6 +823,79 @@ _SETTLED = {
 }
 
 
+def is_red_case(case):
+    """True when the entry is one bench-gate could have written: a case id,
+    an integer rung, a rung name. `bool` is an int in Python and is refused."""
+    if not isinstance(case, dict):
+        return False
+    name, rung, rung_name = case.get(RED_CASE_NAME_KEY), case.get(RED_CASE_RUNG_KEY), case.get(RED_CASE_RUNG_NAME_KEY)
+    return (
+        isinstance(name, str)
+        and CASE_ID_RE.fullmatch(name) is not None
+        and isinstance(rung, int)
+        and not isinstance(rung, bool)
+        and isinstance(rung_name, str)
+        and RUNG_NAME_RE.fullmatch(rung_name) is not None
+    )
+
+
+def red_cases(verdict_text):
+    """The blocking cases of one build's eval-verdict.json, as
+    `{"cases": [...], "partial": bool}`, or None when the text is not a
+    roll-up (absent, unreadable, not JSON, no `cases` list) or a blocking
+    entry is outside the vocabulary above.
+
+    Blocking, not "any rung below GREEN": the roll-up also lists cases on
+    the two non-rungs INFRA and NOT_GRADED_ON_TRANSPORT, which never block
+    and are not why the night was RED. `partial` is what bench-gate writes
+    into the roll-up when the run stopped before grading every case
+    (hack/ci-eval-rc.sh reads the same flag); the notifier says so beside
+    the names.
+    """
+    if not isinstance(verdict_text, str):
+        return None
+    try:
+        data = json.loads(verdict_text)
+    except ValueError:
+        return None
+    cases = data.get(VERDICT_CASES_FIELD) if isinstance(data, dict) else None
+    if not isinstance(cases, list):
+        return None
+    blocking = [case for case in cases if isinstance(case, dict) and case.get(CASE_BLOCKING_FIELD) is True]
+    if not all(is_red_case(case) for case in blocking):
+        return None
+    return {
+        RED_CASES_CASES_KEY: [{key: case[key] for key in RED_CASE_KEYS} for case in blocking],
+        RED_CASES_PARTIAL_KEY: data.get(VERDICT_PARTIAL_FIELD) is True,
+    }
+
+
+def red_cases_line(cases):
+    """The red-cases log line for what `red_cases` returned."""
+    return RED_CASES_LINE_FORMAT.format(cases=json.dumps(cases, separators=(",", ":"), sort_keys=True))
+
+
+def report_red_cases(base, read_file):
+    """Print the red-cases line for a settled RED at `base`, and return what
+    it carried, or None with a warning.
+
+    Called only after the verdict line and the outputs are written: nothing
+    here may move the verdict, so every failure, a read that errors, a file
+    that is absent, a roll-up that does not parse, is a warning on stderr
+    and no line. The notifier then shows the night's cases as unavailable.
+    """
+    try:
+        cases = red_cases(read_file(base + ARTIFACTS_DIR + RC_VERDICT_JSON_FILE))
+    except Exception as exc:  # noqa: BLE001 - the verdict is already out; this line is best-effort
+        print(f"warning: reading {RC_VERDICT_JSON_FILE} failed ({exc!r}); the red cases are not reported", file=sys.stderr, flush=True)
+        return None
+    if cases is None:
+        print(f"warning: {base}{ARTIFACTS_DIR}{RC_VERDICT_JSON_FILE} is absent, not a case roll-up, or names a blocking case outside bench-gate's vocabulary; the red cases are not reported", file=sys.stderr, flush=True)
+        return None
+    print(red_cases_line(cases), flush=True)
+    return cases
+
+
 def _write_kv(path, pairs):
     """Append `k=v` lines to a GitHub Actions file, when the runner set one."""
     if not path:
@@ -752,7 +937,16 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--commit", required=True, help="Full SHA of the nominated candidate")
     parser.add_argument("--evalcand-tag", default="", help="Tag that nominated it, for the summary")
-    parser.add_argument("--logs-prefix", default=DEFAULT_LOGS_PREFIX)
+    parser.add_argument(
+        "--logs-prefix",
+        action="append",
+        default=None,
+        metavar="GS_PREFIX[,GS_PREFIX...]",
+        help=(
+            "archive prefix to list for the build, repeatable or comma-separated;"
+            f" default {LOGS_PREFIX_SEPARATOR.join(DEFAULT_LOGS_PREFIXES)}"
+        ),
+    )
     parser.add_argument("--deadline-minutes", type=int, default=DEFAULT_DEADLINE_MINUTES)
     parser.add_argument(
         "--appear-deadline-minutes", type=int, default=DEFAULT_APPEAR_DEADLINE_MINUTES
@@ -789,7 +983,7 @@ def main(argv=None):
             f" --deadline-minutes ({args.deadline_minutes}), so it could never fire"
         )
 
-    prefix = args.logs_prefix if args.logs_prefix.endswith("/") else args.logs_prefix + "/"
+    prefixes = logs_prefixes(args.logs_prefix)
     if args.not_before is None:
         print(
             "warning: no --not-before given, so a build from an earlier attempt at"
@@ -799,7 +993,7 @@ def main(argv=None):
         )
     verdict, build_id, base = poll(
         commit,
-        read_listing=lambda: _gcloud_storage(["ls", prefix], args.gcloud),
+        read_listing=lambda: list_prefixes(prefixes, lambda prefix: _gcloud_storage(["ls", prefix], args.gcloud)),
         read_file=lambda url: _gcloud_storage(["cat", url], args.gcloud),
         deadline_minutes=args.deadline_minutes,
         appear_deadline_minutes=args.appear_deadline_minutes,
@@ -808,7 +1002,7 @@ def main(argv=None):
         not_before=args.not_before,
     )
 
-    url = spyglass_url(base) or ""
+    url = build_url(base) or ""
     settled = SETTLED_TRUE if _SETTLED[verdict] else SETTLED_FALSE
     print(VERDICT_LINE_FORMAT.format(verdict=verdict, settled=settled, build_id=build_id or "", url=url).rstrip(), flush=True)
 
@@ -822,12 +1016,22 @@ def main(argv=None):
         ],
     )
 
+    # After the verdict line and the outputs on purpose: a failure in this
+    # read must not turn a settled RED into the internal-error exit, whose
+    # seeded `settled=false` would withdraw the nomination of a candidate the
+    # eval rejected.
+    cases = None
+    if verdict == VERDICT_RED and base:
+        cases = report_red_cases(base, read_file=lambda url: _gcloud_storage(["cat", url], args.gcloud))
+
     lines = [f"### Release-candidate eval: `{verdict.upper()}`", ""]
     if args.evalcand_tag:
         lines.append(f"Candidate: `{args.evalcand_tag}` (`{commit}`)")
     lines += ["", _SUMMARY[verdict]]
     if url:
         lines += ["", f"[Eval build {build_id}]({url})"]
+    if cases and cases[RED_CASES_CASES_KEY]:
+        lines += ["", "Red cases: " + ", ".join(f"`{case[RED_CASE_NAME_KEY]}` (rung `{case[RED_CASE_RUNG_KEY]} {case[RED_CASE_RUNG_NAME_KEY]}`)" for case in cases[RED_CASES_CASES_KEY])]
     _write_summary(os.environ.get("GITHUB_STEP_SUMMARY"), lines)
 
     return _EXIT[verdict]

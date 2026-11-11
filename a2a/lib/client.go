@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -148,13 +149,29 @@ const DialTimeout = 10 * time.Second
 const (
 	backoffBase = 200 * time.Millisecond
 	backoffCap  = 5 * time.Second
+)
 
-	// subscribeBindWindow bounds how long the FIRST bind of a durable retries
-	// before the error reaches the caller; see durableSub.startWithRetry.
-	subscribeBindWindow = 45 * time.Second
-
+// subscribeBindWindow bounds how long the FIRST bind of a durable retries
+// before the error reaches the caller; see durableSub.startWithRetry. A first
+// bind that waits for its stream (SubscribeConfig.WaitForStream) logs at most
+// once per streamWaitLogInterval, and warns once per streamWaitWarnEvery that
+// it is still waiting. Variables so a test can shorten them.
+var (
+	subscribeBindWindow   = 45 * time.Second
+	streamWaitLogInterval = 30 * time.Second
+	streamWaitWarnEvery   = 10 * time.Minute
+	// bindBackoff spaces the first bind's attempts; a test may fix it.
+	bindBackoff = fullJitterBackoff
 	// reconnectPoll paces Reconnect's wait for the rebuild to complete.
 	reconnectPoll = 20 * time.Millisecond
+	// afterBind, when set, runs between a first-bind attempt succeeding and
+	// startWithRetry checking that it landed on the current connection, so a
+	// test can replace the connection in that window. Nil outside tests.
+	afterBind func()
+	// beforeBindAttempt, when set, runs before each first-bind attempt with
+	// its number, so a test can end the caller's context on a chosen attempt.
+	// Nil outside tests.
+	beforeBindAttempt func(attempt int)
 )
 
 // fullJitterBackoff returns a delay drawn uniformly from [0, min(cap,
@@ -169,7 +186,7 @@ func fullJitterBackoff(attempt int) time.Duration {
 			ceil = d
 		}
 	}
-	return rand.N(ceil)
+	return rand.N(ceil) // #nosec G404 -- backoff jitter, not a secret
 }
 
 // msgIDHeaderOverhead is the wire cost of the Nats-Msg-Id header beyond the
@@ -415,6 +432,15 @@ func (c *Client) resubscribe(subs []*durableSub, js jetstream.JetStream, nc *nat
 			if s.stopped.Load() {
 				continue
 			}
+			// A durable whose first bind has not returned is its own
+			// startWithRetry's to bind: that loop reads the new connection
+			// on its next attempt. Binding it here too would retry a
+			// stream that does not exist yet for as long as a
+			// WaitForStream wait lasts, holding the rebuild open the whole
+			// time.
+			if !s.bound.Load() {
+				continue
+			}
 			if err := s.start(context.Background(), js); err != nil {
 				c.log.Error("nats rebuild re-subscribe failed; will retry", "durable", s.cfg.Durable, "err", err)
 				failed = append(failed, s)
@@ -430,6 +456,14 @@ func (c *Client) resubscribe(subs []*durableSub, js jetstream.JetStream, nc *nat
 		time.Sleep(fullJitterBackoff(attempt))
 	}
 	return !nc.IsClosed()
+}
+
+// currentJS is the client's JetStream context as it stands, which a rebuild
+// replaces.
+func (c *Client) currentJS() jetstream.JetStream {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.js
 }
 
 // Reconnect replaces the client's connection with a fresh dial and
@@ -616,6 +650,64 @@ type SubscribeConfig struct {
 	// each delivery until it settles it, so the cap bounds how much it can
 	// hold before the server stops delivering to every holder.
 	MaxAckPending int
+	// WaitForStream makes the first bind wait, however long, for a stream
+	// that does not exist yet, instead of failing once the bind window
+	// closes. Only a missing stream waits: every other error keeps the
+	// window, so a consumer config the server will never accept still fails
+	// the process. For a process that cannot serve until the stream exists
+	// and that someone else provisions (the gateway's relay, which the
+	// provision Job's TASKS stream can trail by more than the window while a
+	// three-server bus forms). The wait is logged; see startWithRetry.
+	WaitForStream bool
+	// Precreated binds to a durable the operator created and never creates
+	// or updates one (#4173): the subscriber needs no consumer-create grant
+	// for it, and holds none on its name. Until the operator has made it, the
+	// bind waits as WaitForStream waits for the stream.
+	Precreated bool
+}
+
+// ErrPrecreatedBindRefused is a Precreated bind refused because the durable
+// under the name is not the one this subscriber reads: retrying cannot
+// change it, so the bind fails at once.
+var ErrPrecreatedBindRefused = errors.New("pre-created durable refused")
+
+// checkPrecreated refuses a pre-created durable whose stored config is not
+// the one this subscriber would have created: its filters, explicit acks,
+// pull delivery, the MaxAckPending cap when one is set, and no inactivity
+// threshold, which would have the server delete a durable this subscriber
+// never re-creates. The provision Job brings a durable an older reader made
+// to these settings, so one that still differs was made some other way, and
+// would otherwise be bound as found and read with the wrong filter.
+func (cfg SubscribeConfig) checkPrecreated(got jetstream.ConsumerConfig) error {
+	want := cfg.filterSubjects()
+	have := got.FilterSubjects
+	if got.FilterSubject != "" {
+		have = []string{got.FilterSubject}
+	}
+	refuse := func(why string) error {
+		return fmt.Errorf("%w: %s on %s %s", ErrPrecreatedBindRefused, cfg.Durable, cfg.Stream, why)
+	}
+	switch {
+	case !slices.Equal(slices.Sorted(slices.Values(have)), slices.Sorted(slices.Values(want))):
+		return refuse(fmt.Sprintf("filters %q, not %q", have, want))
+	case got.AckPolicy != jetstream.AckExplicitPolicy:
+		return refuse(fmt.Sprintf("acks %s, not explicit", got.AckPolicy))
+	case got.DeliverSubject != "":
+		return refuse("is a push consumer")
+	case got.DeliverPolicy != jetstream.DeliverAllPolicy || got.OptStartSeq != 0 || got.OptStartTime != nil:
+		return refuse(fmt.Sprintf("starts at %s, not the start of the stream", got.DeliverPolicy))
+	case got.HeadersOnly:
+		return refuse("delivers headers only")
+	case got.ReplayPolicy != jetstream.ReplayInstantPolicy:
+		return refuse(fmt.Sprintf("replays %s, not instantly", got.ReplayPolicy))
+	case got.MaxDeliver > 0:
+		return refuse(fmt.Sprintf("stops redelivering after %d attempts", got.MaxDeliver))
+	case cfg.MaxAckPending > 0 && got.MaxAckPending != cfg.MaxAckPending:
+		return refuse(fmt.Sprintf("caps unacked deliveries at %d, not %d", got.MaxAckPending, cfg.MaxAckPending))
+	case got.InactiveThreshold > 0:
+		return refuse(fmt.Sprintf("is deleted after %s inactive, and this subscriber never re-creates it", got.InactiveThreshold))
+	}
+	return nil
 }
 
 // filterSubjects is the consumer's filter set, however it was spelled.
@@ -701,38 +793,192 @@ func (c *Client) subscribe(ctx context.Context, cfg SubscribeConfig, set func(*d
 // Bounded, unlike the rebuild path's retry: there the process is already up
 // and serving and giving up would leave it silently deaf, while here a
 // consumer config the server will never accept must still fail the process
-// rather than hang it. Every attempt is logged, so the delay is never silent.
+// rather than hang it. Every attempt is logged, so the delay is never silent
+// (except a WaitForStream wait, below, which logs on an interval instead).
 //
 // One error is not retried at all: a held bind refused on the durable's
 // stored config (ErrHeldBindRefused). That verdict was read from the
 // consumer the server already holds, so a retry reads the same one, and
-// retrying it for the window would hand the caller whichever error the last
-// attempt happened to end on (the context's, when a caller's deadline fires
-// mid-retry) in place of the refusal. A missing durable keeps the window.
+// spending the window on it would only delay the refusal; it is also never
+// recorded as the last answer below. A missing durable keeps the window.
+//
+// With cfg.WaitForStream, a missing stream does not count against the
+// window, and neither does a lost connection (connectionLost, or the
+// connection not connected when the attempt failed), across which nats.go
+// reconnects or the client rebuilds: the bind retries until the stream
+// appears or ctx ends, and the window restarts from the first attempt that
+// finds it. Either wait logs its first attempt, again when what it waits for
+// changes, and then at most once per streamWaitLogInterval, and warns once
+// per streamWaitWarnEvery, so a wait that never ends is loud, not silent; the
+// caller reports itself not ready meanwhile (Connected tells it which).
+//
+// Until it returns, this loop is the durable's only binder: a rebuild skips a
+// durable that is not yet bound (resubscribe). So each attempt reads the
+// client's current JetStream context, and a bind counts only if it landed on
+// the connection that is still current, checked under the lock a rebuild
+// swaps the connection and snapshots the durables under. A bind on a
+// connection a rebuild has just replaced is tried again on the new one;
+// otherwise the durable would read bound, be skipped, and consume from a
+// dead connection.
+//
+// When the loop stops because ctx ended, the error names the last verdict
+// the server gave as well, if the attempt it ended on got none: a caller
+// whose deadline fires during a look-up, after an earlier attempt was
+// answered with ErrConsumerNotFound, gets an error errors.Is finds both the
+// deadline and the missing durable in, rather than the bare deadline, which
+// reads as if the bus never answered (the dispatcher's regrant tells a
+// missing durable from a missing grant by exactly that). An attempt that
+// ended on the server's own verdict returns it as before, and a bind that
+// was never answered returns the context's error alone.
 func (s *durableSub) startWithRetry(ctx context.Context, js jetstream.JetStream) error {
 	deadline := time.Now().Add(subscribeBindWindow)
+	var waitStart, lastLog time.Time
+	var lastWaitingFor string
+	warned := 0
+	// lastAnswer is the most recent error the server answered an attempt
+	// with: neither the context's own nor a lost connection.
+	var lastAnswer error
 	for attempt := 1; ; attempt++ {
+		if beforeBindAttempt != nil {
+			beforeBindAttempt(attempt)
+		}
 		err := s.start(ctx, js)
 		if err == nil {
+			if afterBind != nil {
+				afterBind()
+			}
+			s.c.mu.RLock()
+			current := s.c.js
+			if current == js {
+				s.bound.Store(true)
+			}
+			s.c.mu.RUnlock()
+			if current != js {
+				js = current
+				continue
+			}
 			if attempt > 1 {
 				s.c.log.Info("durable bound after retry", "durable", s.cfg.Durable, "attempts", attempt)
 			}
 			return nil
 		}
-		if errors.Is(err, ErrHeldBindRefused) {
+		if errors.Is(err, ErrHeldBindRefused) || errors.Is(err, ErrPrecreatedBindRefused) {
 			return err
 		}
-		if ctx.Err() != nil || s.c.closing.Load() || s.stopped.Load() || time.Now().After(deadline) {
+		if serverAnswered(err) {
+			lastAnswer = err
+		}
+		// What a WaitForStream bind is waiting for, if anything: the stream,
+		// or the connection. Whether the stream exists is unknown while the
+		// connection is down, so an outage does not count against the window
+		// either. The state is read as well as the error: a connection that
+		// reconnects forever (Connect's MaxReconnects(-1)) never closes, and
+		// an attempt on it fails on jetstream's own API timeout, a
+		// context.DeadlineExceeded no error check can tell apart.
+		waitingFor := ""
+		if (s.cfg.WaitForStream || s.cfg.Precreated) && ctx.Err() == nil && !s.c.closing.Load() && !s.stopped.Load() {
+			switch {
+			case errors.Is(err, jetstream.ErrStreamNotFound):
+				waitingFor = "stream"
+			case s.cfg.Precreated && errors.Is(err, jetstream.ErrConsumerNotFound):
+				waitingFor = "consumer"
+			case connectionLost(err) || !s.c.Connected():
+				waitingFor = "connection"
+			}
+		}
+		if waitingFor != "" {
+			now := time.Now()
+			if waitStart.IsZero() {
+				waitStart = now
+			}
+			deadline = now.Add(subscribeBindWindow)
+			waited := now.Sub(waitStart)
+			switch {
+			case waited >= time.Duration(warned+1)*streamWaitWarnEvery:
+				warned++
+				lastLog = now
+				if waitingFor == "stream" {
+					s.c.log.Warn("still waiting for the stream; nothing has created it",
+						"stream", s.cfg.Stream, "durable", s.cfg.Durable, "waited", waited.Round(time.Second).String(), "attempt", attempt)
+				} else if waitingFor == "consumer" {
+					s.c.log.Warn("still waiting for the durable; the operator creates it",
+						"stream", s.cfg.Stream, "durable", s.cfg.Durable, "waited", waited.Round(time.Second).String(), "attempt", attempt)
+				} else {
+					s.c.log.Warn("still waiting for the bus connection to return",
+						"stream", s.cfg.Stream, "durable", s.cfg.Durable, "waited", waited.Round(time.Second).String(), "attempt", attempt, "err", err)
+				}
+			case lastLog.IsZero() || now.Sub(lastLog) >= streamWaitLogInterval || waitingFor != lastWaitingFor:
+				lastLog = now
+				if waitingFor == "stream" {
+					s.c.log.Info("waiting for the stream to be created",
+						"stream", s.cfg.Stream, "durable", s.cfg.Durable, "waited", waited.Round(time.Second).String(), "attempt", attempt)
+				} else if waitingFor == "consumer" {
+					s.c.log.Info("waiting for the operator to create the durable",
+						"stream", s.cfg.Stream, "durable", s.cfg.Durable, "waited", waited.Round(time.Second).String(), "attempt", attempt)
+				} else {
+					s.c.log.Info("waiting for the bus connection to return",
+						"stream", s.cfg.Stream, "durable", s.cfg.Durable, "waited", waited.Round(time.Second).String(), "attempt", attempt, "err", err)
+				}
+			}
+			lastWaitingFor = waitingFor
+			select {
+			case <-ctx.Done():
+				return bindEndedWith(err, lastAnswer)
+			case <-time.After(bindBackoff(attempt)):
+			}
+			js = s.c.currentJS()
+			continue
+		}
+		if ctx.Err() != nil {
+			return bindEndedWith(err, lastAnswer)
+		}
+		if s.c.closing.Load() || s.stopped.Load() || time.Now().After(deadline) {
 			return err
 		}
 		s.c.log.Warn("durable bind failed; retrying",
 			"durable", s.cfg.Durable, "attempt", attempt, "err", err)
 		select {
 		case <-ctx.Done():
-			return err
-		case <-time.After(fullJitterBackoff(attempt)):
+			return bindEndedWith(err, lastAnswer)
+		case <-time.After(bindBackoff(attempt)):
 		}
+		js = s.c.currentJS()
 	}
+}
+
+// serverAnswered is whether err is a verdict a server gave on a bind
+// attempt, rather than the caller's context ending or the attempt never
+// reaching a server that could answer (connectionLost).
+func serverAnswered(err error) bool {
+	return err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && !connectionLost(err)
+}
+
+// bindEndedWith is the error a first bind returns when the caller's context
+// ended on attempt err: err itself when the server answered that attempt or
+// no attempt was ever answered, otherwise err wrapped with lastAnswer so
+// errors.Is finds both the context's error and the server's last verdict.
+func bindEndedWith(err, lastAnswer error) error {
+	if lastAnswer == nil || serverAnswered(err) {
+		return err
+	}
+	return fmt.Errorf("%w (the last attempt the server answered: %w)", err, lastAnswer)
+}
+
+// Connected is whether the client's current connection is connected, rather
+// than reconnecting, closed or being rebuilt. A caller reporting readiness
+// reads it to tell a bus outage from a wait on its own streams.
+func (c *Client) Connected() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.nc != nil && c.nc.IsConnected()
+}
+
+// connectionLost is whether err says the attempt never reached a server
+// that could answer: the connection is closed, reconnecting or gone, or the
+// request found no responder or timed out.
+func connectionLost(err error) bool {
+	return errors.Is(err, nats.ErrConnectionClosed) || errors.Is(err, nats.ErrConnectionReconnecting) ||
+		errors.Is(err, nats.ErrDisconnected) || errors.Is(err, nats.ErrNoResponders) || errors.Is(err, nats.ErrTimeout)
 }
 
 type durableSub struct {
@@ -741,6 +987,9 @@ type durableSub struct {
 	handler func(subject string, env *Envelope)
 	seen    *dedupSet
 	stopped atomic.Bool
+	// bound is set once the first bind has landed on the current connection
+	// (startWithRetry); a rebuild re-binds only bound durables.
+	bound atomic.Bool
 	// held is the held-delivery mode (held.go); nil for auto-ack.
 	held *heldState
 	// deferred is the deferred-ack mode (deferred.go); nil for the others.
@@ -759,6 +1008,19 @@ func (s *durableSub) start(ctx context.Context, js jetstream.JetStream) error {
 		cons, err := s.held.bind(ctx, js, s.cfg)
 		if err != nil {
 			return err
+		}
+		return s.consume(cons)
+	}
+	if s.cfg.Precreated {
+		cons, err := js.Consumer(ctx, s.cfg.Stream, s.cfg.Durable)
+		if err != nil {
+			return fmt.Errorf("consumer %s on %s: %w", s.cfg.Durable, s.cfg.Stream, err)
+		}
+		if err := s.cfg.checkPrecreated(cons.CachedInfo().Config); err != nil {
+			return err
+		}
+		if s.deferred != nil {
+			s.deferred.bound(cons)
 		}
 		return s.consume(cons)
 	}
@@ -795,8 +1057,14 @@ func (s *durableSub) consume(cons jetstream.Consumer) error {
 	s.mu.Unlock()
 	if stopped {
 		// A Stop landed while this (re)bind was in flight: it saw the old
-		// context, so this one is nobody's to stop but ours.
-		cc.Stop()
+		// context, so this one is nobody's to stop but ours. A held one
+		// drains, as Stop does, so what this context already pulled is given
+		// back rather than dropped (#4849).
+		if s.held != nil {
+			s.drainOrStop(cc)
+		} else {
+			cc.Stop()
+		}
 	}
 	if old != nil {
 		// Usually already dead with its connection; stopping is a no-op then,
@@ -858,8 +1126,23 @@ func (s *durableSub) deliver(msg jetstream.Msg) {
 	_ = msg.Ack()
 }
 
-// Stop ends the subscription and removes it from the rebuild registry.
+// Stop ends the subscription and removes it from the rebuild registry (a
+// held one once its drain is done).
 func (s *durableSub) Stop() {
+	if s.held != nil {
+		// Held mode cancels its handlers only once the drain is done: a
+		// give-back sent while the consumer is still subscribed can come
+		// straight back to it and be dropped, leaving the task to wait out
+		// AckWait (#4849). Stop itself doesn't wait (callers hold their own
+		// locks); it stays registered meanwhile, so Close can still cancel.
+		s.drainIntake()
+		go func() {
+			s.awaitDrain(time.After(heldDrainTimeout))
+			s.held.cancel()
+			s.unregister()
+		}()
+		return
+	}
 	s.stopLocal()
 	s.unregister()
 }
@@ -909,6 +1192,63 @@ func (s *durableSub) stopDeferred() {
 		}
 	}
 	s.deferred.giveBack()
+}
+
+// drainIntake stops a held subscription's intake the way stopDeferred does
+// a deferred one's, without waiting: intake closes first, so whatever
+// arrives from here on is given back as it is dispatched, then the consume
+// context drains, so the deliveries already buffered or in flight are
+// dispatched (and given back) rather than dropped. A rebind in flight drains
+// its own context once it sees the stop (consume).
+func (s *durableSub) drainIntake() {
+	s.stopped.Store(true)
+	s.held.stopIntake()
+	s.mu.Lock()
+	cc := s.cc
+	s.mu.Unlock()
+	if cc != nil {
+		s.drainOrStop(cc)
+	}
+}
+
+// drainOrStop drains a held consume context while the connection is up. While
+// it's reconnecting, the drain's unsubscribe can't go out, and the client
+// subscribes the draining inbox again on reconnect and later drops it without
+// an unsubscribe, so the server would go on sending to it. A plain stop
+// removes the subscription at once instead, and the reconnect leaves it out.
+// A disconnect between the check and the drain's cleanup still leaves a small
+// window.
+func (s *durableSub) drainOrStop(cc jetstream.ConsumeContext) {
+	if nc, _ := s.c.conn(); nc != nil && nc.Status() == nats.CONNECTED {
+		cc.Drain()
+		return
+	}
+	cc.Stop()
+}
+
+// awaitDrain returns once the current consume context has drained, and the
+// server has its unsubscribe, or when timeout fires. A rebind can swap the
+// context meanwhile, so it follows whichever is current. A connection
+// already gone never finishes a drain; the timeout covers that.
+func (s *durableSub) awaitDrain(timeout <-chan time.Time) {
+	s.mu.Lock()
+	cc := s.cc
+	s.mu.Unlock()
+	for cc != nil {
+		select {
+		case <-cc.Closed():
+		case <-timeout:
+			return
+		}
+		s.mu.Lock()
+		cur := s.cc
+		s.mu.Unlock()
+		if cur == cc {
+			return
+		}
+		cc = cur
+		s.drainOrStop(cc) // consume does too; a second call is a no-op
+	}
 }
 
 // stopIntake stops taking deliveries.

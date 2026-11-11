@@ -74,14 +74,16 @@ const (
 	// authDecisionBudget, measured from receipt.
 	calloutWorkers = 16
 
-	// taskCredentialSkew is the clock skew a task credential's expiry and
+	// TaskCredentialSkew is the clock skew a task credential's expiry and
 	// issue time are allowed against this callout's clock: the dispatcher
-	// that signed it runs on another node.
-	taskCredentialSkew = 30 * time.Second
+	// that signed it runs on another node. The dispatcher adds the same
+	// allowance to a task's deadline when it mints the credential.
+	TaskCredentialSkew = 30 * time.Second
 
-	// defaultTaskCredentialMaxLifetime bounds how far out a task
-	// credential's expiry may be. See Config.TaskCredentialMaxLifetime.
-	defaultTaskCredentialMaxLifetime = 6 * time.Hour
+	// DefaultTaskCredentialMaxLifetime bounds how far out a task
+	// credential's expiry may be. See Config.TaskCredentialMaxLifetime. The
+	// dispatcher caps the expiries it mints at the same default.
+	DefaultTaskCredentialMaxLifetime = 6 * time.Hour
 
 	// maxTaskCredentialMaxLifetime is the most TaskCredentialMaxLifetime may
 	// be set to; see ParseTaskCredentialMaxLifetime.
@@ -107,11 +109,14 @@ type Config struct {
 	// GrantTTL bounds an issued connection's life.
 	//
 	// This is the deployment's revocation window, and it is the only one it
-	// has. Permissions are fixed when a connection authenticates and the
-	// callout is never consulted again, so a narrowed grant or a removed
-	// identity does not reach a connection that is already established —
-	// until it expires and the client reconnects, re-presenting a token the
-	// cluster gets to refuse. Zero means the default; a grant that never
+	// has. Permissions are fixed when a connection authenticates, so a
+	// narrowed grant or a removed identity does not reach a connection that
+	// is already established — until it expires and the client reconnects,
+	// re-presenting a token the cluster gets to refuse. The one other time
+	// the callout is consulted for a live connection is a server config
+	// reload, which runs it again for every connection it authenticated. On
+	// nats-server 2.10.29 those connections were dropped at the reload and
+	// reconnected through the callout within a second. Zero means the default; a grant that never
 	// expires means a map change never reaches anything already connected.
 	GrantTTL time.Duration
 
@@ -169,7 +174,7 @@ type Config struct {
 
 // envTaskCredentialMaxLifetimeName is the variable ParseTaskCredentialMaxLifetime
 // reads, named in its errors so a refusal says which setting to fix.
-const envTaskCredentialMaxLifetimeName = "A2A_TASK_CREDENTIAL_MAX_LIFETIME"
+const envTaskCredentialMaxLifetimeName = "A2A_TASK_CREDENTIAL_MAX_LIFETIME" // #nosec G101 -- an env var name, not a credential
 
 // ParseTaskCredentialMaxLifetime reads the task credential lifetime #4121's
 // operator will render (time.Duration.String, e.g. "6h0m0s"). Empty is
@@ -318,7 +323,7 @@ func NewService(store *Store, validator *TokenValidator, cfg Config, log *slog.L
 	case cfg.TaskCredentialMaxLifetime < 0:
 		svc.taskLifetimeErr = fmt.Errorf("the task credential max lifetime %s is negative", cfg.TaskCredentialMaxLifetime)
 	case cfg.TaskCredentialMaxLifetime == 0:
-		svc.taskMaxLifetime = defaultTaskCredentialMaxLifetime
+		svc.taskMaxLifetime = DefaultTaskCredentialMaxLifetime
 	default:
 		svc.taskMaxLifetime = cfg.TaskCredentialMaxLifetime
 	}
@@ -709,7 +714,7 @@ func (s *Service) verifyTaskCredential(raw string, id Identity, att Attested) (t
 		return taskcred.Claims{}, fmt.Errorf("this callout trusts no task-signing key")
 	}
 	now := s.now()
-	c, err := taskcred.Verify(raw, s.taskKeys, taskcred.AudienceNATS, now, s.taskMaxLifetime, taskCredentialSkew)
+	c, err := taskcred.Verify(raw, s.taskKeys, taskcred.AudienceNATS, now, s.taskMaxLifetime, TaskCredentialSkew)
 	if err != nil {
 		return taskcred.Claims{}, err
 	}
@@ -806,6 +811,6 @@ func (s *Service) mint(req *jwt.AuthorizationRequestClaims, d decision) (string,
 }
 
 func (s *Service) grantExpiry() time.Time {
-	jitter := time.Duration(rand.Float64() * grantTTLJitter * float64(s.grantTTL))
+	jitter := time.Duration(rand.Float64() * grantTTLJitter * float64(s.grantTTL)) // #nosec G404 -- jitter on an expiry, not a secret
 	return s.now().Add(s.grantTTL - jitter)
 }

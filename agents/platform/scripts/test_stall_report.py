@@ -159,6 +159,39 @@ class StaleConditions(unittest.TestCase):
         dep["status"]["conditions"] = [condition("Progressing", "True", 2, "ReplicaSetUpdated"), condition("Available", "False", 2)]
         self.assertEqual(analyze([dep]), [])
 
+    def test_config_connector_in_progress_states_are_not_stalls(self):
+        for reason in ("Updating", "Deleting"):
+            with self.subTest(reason=reason):
+                sql = obj("SQLInstance", "orders-db", spec={}, status={"observedGeneration": 1, "conditions": [condition("Ready", "False", 40, reason)]})
+                self.assertEqual(analyze([sql]), [])
+                # A create in progress lags its generation too; not a row either.
+                sql["metadata"]["generation"] = 2
+                sql["metadata"]["managedFields"] = [managed(40)]
+                self.assertEqual(analyze([sql]), [])
+        failed = obj("SQLInstance", "orders-db", status={"conditions": [condition("Ready", "False", 20, "UpdateFailed")]})
+        rows = analyze([failed])
+        self.assertEqual([r["detail"] for r in rows], ["Ready=False UpdateFailed"])
+
+    def test_dependency_not_ready_waits_an_hour(self):
+        pool = obj("ContainerNodePool", "pool-a", status={"conditions": [condition("Ready", "False", 40, "DependencyNotReady")]})
+        self.assertEqual(analyze([pool]), [])
+        pool = obj("ContainerNodePool", "pool-a", status={"conditions": [condition("Ready", "False", 70, "DependencyNotReady")]})
+        rows = analyze([pool])
+        self.assertEqual([r["detail"] for r in rows], ["Ready=False DependencyNotReady"])
+        self.assertEqual(rows[0]["stalled_for"], "1h10m")
+        # A run-wide threshold above the hour applies to it as to every kind.
+        pool = obj("ContainerNodePool", "pool-a", status={"conditions": [condition("Ready", "False", 70, "DependencyNotReady")]})
+        self.assertEqual(analyze([pool], override=120), [])
+        # Its generation lag waits the same hour, so a spec edit while it
+        # waits on its parent is not a row sooner than the condition.
+        pool = obj("ContainerNodePool", "pool-a", spec={}, status={"observedGeneration": 1, "conditions": [condition("Ready", "False", 40, "DependencyNotReady")]})
+        pool["metadata"]["generation"] = 2
+        pool["metadata"]["managedFields"] = [managed(40)]
+        self.assertEqual(analyze([pool]), [])
+        pool["metadata"]["managedFields"] = [managed(70)]
+        pool["status"]["conditions"] = [condition("Ready", "False", 70, "DependencyNotReady")]
+        self.assertEqual(sorted(r["heuristic"] for r in analyze([pool])), ["generation-lag", "stale-condition"])
+
     def test_unrelated_condition_types_are_ignored(self):
         hpa = obj("HorizontalPodAutoscaler", "web", status={"conditions": [condition("ScalingLimited", "False", 500)]})
         self.assertEqual(analyze([hpa]), [])

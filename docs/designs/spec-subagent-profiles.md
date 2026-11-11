@@ -336,10 +336,12 @@ What the operator renders per profile, as built (amended 10/6):
   which presents the ServiceAccount token alone, gets the dispatch subjects, its inbox and
   its topics. After it accepts a task it opens a task connection with the token as the
   connection token and a task credential as the password. The dispatcher signs the
-  credential (`a2a/taskcred`), and the callout refuses it unless its pod name and UID are
-  the pod the token is bound to, and its profile and tier are the entry's. The task
-  connection gets that one task's `.events` publish and its three consumers, filtered
-  exactly on the task. They and its inbox are named for the task, not the pod
+  credential (`a2a/taskcred`) and sends it on the confirm as `taskCredential`, with a
+  `proxyToken` for the credential proxy when the task names a cluster (contract addendum 8;
+  [the dispatch design](spec-profiles-dispatch.md) has the details). The callout refuses it
+  unless its pod name and UID are the pod the token is bound to, and its profile and tier
+  are the entry's. The task connection gets that one task's `.events` publish and its
+  three consumers, filtered exactly on the task. They and its inbox are named for the task, not the pod
   (`<pod>_<task>-origin`, `-in`, `-events`, and `_INBOX.<pod>_<task>`), because a consumer's
   info, pull and delete subjects carry only its name, and a pod-named consumer would be
   reachable from the pod's next task. A credential may run to the callout's maximum task
@@ -365,11 +367,12 @@ What the operator renders per profile, as built (amended 10/6):
   The operator renders the audience, an identity map from each tier's ServiceAccount to its
   (profile, tier) (`CREDENTIAL_PROXY_PROFILE_IDENTITIES`, from the callout map's profile
   entries), those ServiceAccounts on the broker's callers, and the task-signing public key
-  (`A2A_TASK_SIGNING_PUBLIC_KEYS`). It newly reserves four names against `spec.deployment.env`:
+  (`A2A_TASK_SIGNING_PUBLIC_KEYS`). It newly reserves five names against `spec.deployment.env`:
   `CREDENTIAL_PROXY_PROFILE_AUDIENCE`, `CREDENTIAL_PROXY_PROFILE_IDENTITIES`,
-  `A2A_TASK_SIGNING_PUBLIC_KEYS` and `A2A_TASK_CREDENTIAL_MAX_LIFETIME`;
-  `CREDENTIAL_PROXY_ALLOWED_CALLERS` was reserved already. The operator doesn't render the
-  max lifetime yet. The broker's fence admits the profile namespace and
+  `A2A_TASK_SIGNING_PUBLIC_KEYS`, `A2A_TASK_CREDENTIAL_MAX_LIFETIME` and
+  `A2A_TASK_SIGNING_SEED_FILE`; `CREDENTIAL_PROXY_ALLOWED_CALLERS` was reserved already.
+  **Amended 11/5 (#4471):** the operator renders the max lifetime, one value for the callout,
+  the broker and the dispatcher. The broker's fence admits the profile namespace and
   the profile namespace's fence lets it out to the broker's credentialed port.
   - The shim reads the dispatcher's `proxyToken` from `CREDENTIAL_PROXY_TASK_TOKEN_FILE` on
     every call and sends it in `X-Kube-Agents-Task-Credential`, never in the body. The
@@ -589,9 +592,10 @@ the dispatcher exists there is no janitor ROLE for profile-addressed tasks; the 
 bridge's startup sweep is the executor finalising its own predecessor's orphan and writes
 on `…events` as itself. No role is not the same as no writer, and the render is the thing
 to read: the gateway's supervisor grant is `a2a.tasks.*.*.supervisor`, a wildcard over the
-addressee, so the gateway can write every profile's supervisor subject even though nothing
-asks it to. Production would scope that grant to the sessions the gateway spawned; a static
-render cannot express it. A consumer with no configured supervisor name falls back to the
+addressee, which a static render cannot scope to the sessions the gateway spawned. The render
+instead denies the gateway `a2a.tasks.<profile>.*.supervisor` for each bound or draining
+profile, so it cannot publish directly to a profile's supervisor subject. That deny covers
+direct publishes only. A consumer with no configured supervisor name falls back to the
 negative form - `from` is not the addressee - which a gateway-credentialled terminal
 satisfies. So do not model a profile task's `…supervisor` as unreachable, and do not treat
 an envelope arriving there as impossible.
@@ -689,7 +693,7 @@ spec:
   persona:
     image: <registry>/kube-agents/persona-cluster:2026.08
     # /files: persona.yaml, instructions.md, the gke-* debugging skills, mcp.yaml
-    # (read-only gke MCP + developer_knowledge; platform_control deliberately absent)
+    # (developer_knowledge only: profile workers are refused gke and platform_control)
   harness:
     image: <registry>/kube-agents/agent-worker:2026.08
     model: model-default

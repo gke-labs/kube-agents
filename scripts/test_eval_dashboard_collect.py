@@ -25,6 +25,7 @@ import shutil
 import stat
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta, timezone
 
 from eval_dashboard import collect, nightly, tiers
@@ -985,6 +986,7 @@ class TestIndexDiscovery(_MergeBase):
         """gcs_base turns a build's links into Console links, which need a
         sign-in; a run in a bucket Spyglass still renders must not get it."""
         self.assertTrue(collect.records_location("gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/1/pull-kube-agents-smoke-test/2/"))
+        self.assertTrue(collect.records_location("gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly/2/"), "the nightly's bucket is private too")
         self.assertFalse(collect.records_location("gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/1/pull-kube-agents-smoke-test/2/"))
         self.assertFalse(collect.records_location(FAKE_BUCKET + "pr-logs/pull/gke-labs_kube-agents/1/pull-kube-agents-smoke-test/2/"))
         self.assertFalse(collect.records_location("/tmp/not-a-bucket/2/"))
@@ -1091,6 +1093,9 @@ FAKE_NIGHTLY_PREFIX = f"{FAKE_BUCKET}logs/{FAKE_NIGHTLY_JOB}/"
 FAKE_WRITERS_PREFIX = f"{FAKE_BUCKET}logs/{collect.DEFAULT_NIGHTLY_WRITERS_JOB}/"
 # The periodic that runs the main part's second half, under its live job name.
 FAKE_MAIN_B_PREFIX = f"{FAKE_BUCKET}logs/{collect.DEFAULT_NIGHTLY_MAIN_B_JOB}/"
+FAKE_MAIN_C_PREFIX = f"{FAKE_BUCKET}logs/{collect.DEFAULT_NIGHTLY_MAIN_C_JOB}/"
+FAKE_WRITERS_B_PREFIX = f"{FAKE_BUCKET}logs/{collect.DEFAULT_NIGHTLY_WRITERS_B_JOB}/"
+FAKE_WRITERS_C_PREFIX = f"{FAKE_BUCKET}logs/{collect.DEFAULT_NIGHTLY_WRITERS_C_JOB}/"
 
 
 class TestNightlySource(_MergeBase):
@@ -1402,6 +1407,103 @@ class TestNightlySource(_MergeBase):
         self.assertEqual(collect.DEFAULT_NIGHTLY_MAIN_B_JOB, nightly.NIGHTLY_MAIN_B_JOB, "the collector and the report name one job")
         self.assertEqual(collect.DEFAULT_NIGHTLY_MAIN_B_PREFIX, "gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-main-b/")
         self.assertNotIn("--nightly-main-b-prefix", stderr)
+
+    def test_the_main_c_prefix_is_collected_beside_the_others(self):
+        """The main part as five jobs (#4238): the main-c prefix is listed
+        after the main-b one, its build files as the main-c part, and the
+        main-c, main-d and main-e constants agree with the report's."""
+        gcloud, log = self.fake_gcloud([])
+        self.place_nightly_build(BUILD_956_TRUNCATED)
+        self.place_nightly_build(BUILD_998_FULL, periodic=FAKE_MAIN_C_PREFIX)
+        data, stderr = self.quiet_collect(
+            nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_main_b_prefix=FAKE_MAIN_B_PREFIX,
+            nightly_main_c_prefix=FAKE_MAIN_C_PREFIX, gcloud=gcloud, since_days=10000,
+        )
+        by_id = {run["build_id"]: run for run in data["runs"]}
+        self.assertEqual(by_id[BUILD_998_FULL]["job"], "ci-kube-agents-eval-nightly-main-c")
+        self.assertEqual(nightly.night_part(by_id[BUILD_998_FULL]), nightly.PART_MAIN_C)
+        calls = log.read_text().splitlines()
+        self.assertEqual([c for c in calls if c.startswith("ls ")], [f"ls {p}" for p in (FAKE_NIGHTLY_PREFIX, FAKE_MAIN_B_PREFIX, FAKE_MAIN_C_PREFIX)])
+        self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
+        self.assertEqual(collect.DEFAULT_NIGHTLY_MAIN_C_JOB, nightly.NIGHTLY_MAIN_C_JOB, "the collector and the report name one job")
+        self.assertEqual(collect.DEFAULT_NIGHTLY_MAIN_C_PREFIX, "gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-main-c/")
+        for letter in "de":
+            self.assertEqual(getattr(collect, f"DEFAULT_NIGHTLY_MAIN_{letter.upper()}_JOB"), getattr(nightly, f"NIGHTLY_MAIN_{letter.upper()}_JOB"))
+            self.assertEqual(getattr(collect, f"DEFAULT_NIGHTLY_MAIN_{letter.upper()}_PREFIX"), f"gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-main-{letter}/")
+            self.assertEqual(nightly.night_part({"job": f"ci-kube-agents-eval-nightly-main-{letter}"}), f"main-{letter}")
+            self.assertIn(f"main-{letter}", nightly.MAIN_PARTS)
+        # Each shard resumes above its own watermark, and its note says so.
+        prior_data = json.loads(pathlib.Path(self.prior_with([])).read_text())
+        prior_data["runs"] = [{"build_id": "2093050000000000000", "tier": "nightly", "job": "ci-kube-agents-eval-nightly-main-d", "pr": None, "tasks": []}]
+        _, stderr = self.quiet_collect(
+            nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_main_c_prefix=FAKE_MAIN_C_PREFIX,
+            nightly_main_d_prefix=f"{FAKE_BUCKET}logs/{collect.DEFAULT_NIGHTLY_MAIN_D_JOB}/",
+            nightly_main_e_prefix=f"{FAKE_BUCKET}logs/{collect.DEFAULT_NIGHTLY_MAIN_E_JOB}/",
+            merge_with=self.write_prior(prior_data), gcloud=gcloud, since_days=10000,
+        )
+        self.assertIn("main-c scan resumed above build None, 1 new", stderr)
+        self.assertIn("main-d scan resumed above build 2093050000000000000, 0 new", stderr)
+        self.assertIn("main-e scan resumed above build None, 0 new", stderr)
+
+    def test_the_writers_thirds_prefixes_are_collected_beside_the_others(self):
+        """A night whose writers part runs as three jobs (#4238): the
+        writers-b and writers-c prefixes are listed after the main-b one,
+        each build is a nightly run with its own job and link, each files as
+        its own part, and each resumes above its own watermark."""
+        gcloud, log = self.fake_gcloud([])
+        self.place_nightly_build(BUILD_956_TRUNCATED)
+        self.place_nightly_build(BUILD_998_INFRA, periodic=FAKE_WRITERS_B_PREFIX)
+        self.place_nightly_build(BUILD_998_FULL, periodic=FAKE_WRITERS_C_PREFIX)
+        data, stderr = self.quiet_collect(
+            nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_writers_prefix=FAKE_WRITERS_PREFIX,
+            nightly_main_b_prefix=FAKE_MAIN_B_PREFIX, nightly_writers_b_prefix=FAKE_WRITERS_B_PREFIX,
+            nightly_writers_c_prefix=FAKE_WRITERS_C_PREFIX, gcloud=gcloud, since_days=10000,
+        )
+        by_id = {run["build_id"]: run for run in data["runs"]}
+        self.assertEqual({b: (r["tier"], r["job"]) for b, r in by_id.items()}, {
+            BUILD_956_TRUNCATED: ("nightly", FAKE_NIGHTLY_JOB),
+            BUILD_998_INFRA: ("nightly", "ci-kube-agents-eval-nightly-writers-b"),
+            BUILD_998_FULL: ("nightly", "ci-kube-agents-eval-nightly-writers-c"),
+        })
+        self.assertEqual(by_id[BUILD_998_FULL]["log_url"], f"https://oss.gprow.dev/view/gs/fake-prow/logs/ci-kube-agents-eval-nightly-writers-c/{BUILD_998_FULL}")
+        self.assertEqual(nightly.night_part(by_id[BUILD_998_INFRA]), nightly.PART_WRITERS_B)
+        self.assertEqual(nightly.night_part(by_id[BUILD_998_FULL]), nightly.PART_WRITERS_C)
+        calls = log.read_text().splitlines()
+        self.assertEqual([c for c in calls if c.startswith("ls ")], [f"ls {p}" for p in (FAKE_NIGHTLY_PREFIX, FAKE_WRITERS_PREFIX, FAKE_MAIN_B_PREFIX, FAKE_WRITERS_B_PREFIX, FAKE_WRITERS_C_PREFIX)])
+        self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
+        self.assertEqual(collect.DEFAULT_NIGHTLY_WRITERS_B_JOB, nightly.NIGHTLY_WRITERS_B_JOB, "the collector and the report name one job")
+        self.assertEqual(collect.DEFAULT_NIGHTLY_WRITERS_C_JOB, nightly.NIGHTLY_WRITERS_C_JOB, "the collector and the report name one job")
+        self.assertEqual(collect.DEFAULT_NIGHTLY_WRITERS_B_PREFIX, "gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-writers-b/")
+        self.assertEqual(collect.DEFAULT_NIGHTLY_WRITERS_C_PREFIX, "gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-writers-c/")
+        self.assertNotIn("--nightly-writers-b-prefix", stderr)
+        self.assertNotIn("--nightly-writers-c-prefix", stderr)
+        # Each third resumes above its own watermark: a writers-c build on
+        # record does not lift writers-b's over a build the listing has not
+        # named yet, nor the other way round.
+        prior_data = json.loads(pathlib.Path(self.prior_with([])).read_text())
+        prior_data["runs"] = [
+            {"build_id": "1", "tier": "nightly", "job": FAKE_NIGHTLY_JOB, "pr": None, "tasks": []},
+            {"build_id": "2093050000000000000", "tier": "nightly", "job": "ci-kube-agents-eval-nightly-writers-c", "pr": None, "tasks": []},
+        ]
+        merged, stderr = self.quiet_collect(
+            nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_writers_b_prefix=FAKE_WRITERS_B_PREFIX,
+            nightly_writers_c_prefix=FAKE_WRITERS_C_PREFIX, merge_with=self.write_prior(prior_data), gcloud=gcloud, since_days=10000,
+        )
+        self.assertIn(BUILD_998_INFRA, {r["build_id"] for r in merged["runs"]}, "above the writers-b watermark, which the writers-c id does not set")
+        self.assertIn("writers-b scan resumed above build None, 1 new", stderr)
+        self.assertIn("writers-c scan resumed above build 2093050000000000000, 1 new", stderr)
+
+    def test_a_writers_third_prefix_naming_a_listed_job_is_listed_once(self):
+        gcloud, log = self.fake_gcloud([])
+        self.place_nightly_build(BUILD_998_INFRA, periodic=FAKE_MAIN_B_PREFIX)
+        _, stderr = self.quiet_collect(
+            nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_main_b_prefix=FAKE_MAIN_B_PREFIX,
+            nightly_writers_b_prefix=FAKE_MAIN_B_PREFIX, gcloud=gcloud,
+        )
+        self.assertIn(f"--nightly-writers-b-prefix {FAKE_MAIN_B_PREFIX} names job {collect.DEFAULT_NIGHTLY_MAIN_B_JOB}, not ci-kube-agents-eval-nightly-writers-b; the report files its runs as the main-b part", stderr)
+        self.assertIn(f"--nightly-writers-b-prefix names job {collect.DEFAULT_NIGHTLY_MAIN_B_JOB}, as --nightly-main-b-prefix does; listing it once", stderr)
+        calls = log.read_text().splitlines()
+        self.assertEqual([c for c in calls if c.startswith("ls ")], [f"ls {FAKE_NIGHTLY_PREFIX}", f"ls {FAKE_MAIN_B_PREFIX}"])
 
     def test_a_main_b_prefix_naming_another_job_is_warned_about(self):
         gcloud, _ = self.fake_gcloud([])
@@ -2076,14 +2178,85 @@ class TestReleaseCollection(_MergeBase):
         self.assertNotIn("/10/build-log.txt", calls)
         self.assertNotIn("/20/build-log.txt", calls)
 
+    def test_a_release_read_from_a_private_bucket_records_where_it_lives(self):
+        """The lane moves from the Prow cluster's default bucket to the
+        presubmit lanes' private one, and the collector reads both across the
+        move. A release read from the private one carries `gcs_base`, by the
+        rule runs[] use (records_location), so the Brief's row can link the
+        Console; one read from the old bucket keeps its Spyglass
+        artifacts_url and no `gcs_base`."""
+        old_prefix = "gs://kube-agents-prow/logs/post-kube-agents-eval-rc/"
+        new_prefix = "gs://kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/"
+        files = {}
+        for prefix, build_id in ((old_prefix, "10"), (new_prefix, "20")):
+            for path in (RC_TESTDATA / BUILD_RC_GREEN).rglob("*"):
+                if path.is_file():
+                    files[f"{prefix}{build_id}/{path.relative_to(RC_TESTDATA / BUILD_RC_GREEN).as_posix()}"] = path.read_text()
+
+        def fake_call(args, gcloud=collect.DEFAULT_GCLOUD, runner=None):
+            if args[0] == "ls":
+                prefix = args[1].rstrip("*")
+                dirs = sorted({url[len(prefix):].split("/", 1)[0] for url in files if url.startswith(prefix)})
+                return "".join(f"{prefix}{d}/\n" for d in dirs), ""
+            text = files.get(args[1])
+            return (text, "") if text is not None else (None, "matched no objects")
+
+        with mock.patch.object(collect, "_gcloud_storage_call", fake_call):
+            releases = collect.releases_from_gcs([old_prefix + "*", new_prefix + "*"])
+        by_id = {r["build_id"]: r for r in releases}
+        self.assertEqual(set(by_id), {"10", "20"})
+        self.assertNotIn("gcs_base", by_id["10"])
+        self.assertEqual(by_id["20"]["gcs_base"], new_prefix + "20/")
+
+    def test_the_rc_limit_is_taken_across_the_globs_not_per_glob(self):
+        """collect trims releases[] to rc_limit across every glob, so the reads
+        must be trimmed the same way: with the limit applied per glob, the old
+        bucket's builds that the new bucket's had pushed out of releases[]
+        would be read again on every tick and thrown away again."""
+        old_prefix = "gs://kube-agents-prow/logs/post-kube-agents-eval-rc/"
+        new_prefix = "gs://kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/"
+        files = {}
+        for prefix, build_id in ((old_prefix, "10"), (old_prefix, "20"), (old_prefix, "30"), (new_prefix, "40")):
+            for path in (RC_TESTDATA / BUILD_RC_GREEN).rglob("*"):
+                if path.is_file():
+                    files[f"{prefix}{build_id}/{path.relative_to(RC_TESTDATA / BUILD_RC_GREEN).as_posix()}"] = path.read_text()
+        reads = []
+
+        def fake_call(args, gcloud=collect.DEFAULT_GCLOUD, runner=None):
+            if args[0] == "ls":
+                prefix = args[1].rstrip("*")
+                dirs = sorted({url[len(prefix):].split("/", 1)[0] for url in files if url.startswith(prefix)})
+                return "".join(f"{prefix}{d}/\n" for d in dirs), ""
+            reads.append(args[1])
+            text = files.get(args[1])
+            return (text, "") if text is not None else (None, "matched no objects")
+
+        with mock.patch.object(collect, "_gcloud_storage_call", fake_call), contextlib.redirect_stderr(io.StringIO()) as err:
+            releases = collect.releases_from_gcs([old_prefix + "*", new_prefix + "*"], limit=2)
+        self.assertEqual([r["build_id"] for r in releases], ["40", "30"], "the newest two across both prefixes")
+        self.assertFalse([r for r in reads if "/10/" in r or "/20/" in r], "the builds the caller would trim are never read")
+        self.assertIn("4 release-candidate builds listed under 2 prefix(es), reading the newest 2", err.getvalue())
+
     def test_a_failed_listing_warns_and_keeps_the_rest_of_the_collect(self):
         gcloud, _ = self.fake_rc_gcloud([])
+        os.environ["FAKE_GCLOUD_DENY"] = "nowhere"
         data, err = self.quiet_collect(
             from_dir=TESTDATA, rc_globs=["gs://fake-prow/nowhere/*"], gcloud=gcloud
         )
         self.assertNotIn("releases", data)
         self.assertIn("gcloud storage ls failed", err)
         self.assertEqual(len(data["runs"]), 3)
+
+    def test_an_empty_prefix_is_a_note_not_a_failed_listing(self):
+        """One of the two RC globs lists nothing for the whole transition
+        (the new one before its first build, the old one once reaped)."""
+        gcloud, _ = self.fake_rc_gcloud([])
+        data, err = self.quiet_collect(
+            from_dir=TESTDATA, rc_globs=["gs://fake-prow/nowhere/*"], gcloud=gcloud
+        )
+        self.assertNotIn("releases", data)
+        self.assertIn("note: gs://fake-prow/nowhere/*: no release-candidate builds listed", err)
+        self.assertNotIn("warning", err)
 
 
 class TestRepParsing(unittest.TestCase):
@@ -2350,6 +2523,26 @@ class TestRepParsing(unittest.TestCase):
         self.assertNotIn("tokens", task["reps"][1], "no count parsed: no key, whatever partial says")
         self.assertNotIn("tokens", task["reps"][2], "no tokens line: the key is absent")
 
+    def test_a_tokens_line_carries_the_prompt_split_when_printed(self):
+        """`cached`, `cache_write` and `reasoning` follow `total` on a record
+        whose `input` excludes cache reads; each is added only when the line
+        carried it as a count, so an old line reads as it always did."""
+        log = (
+            "Task some-case Result: [FAILED] repetition 1: x\n"
+            "  rep 1: fail -- x\n"
+            "  rep 1 tokens: input=10 output=672 total=135281 cached=125204 cache_write=9395 reasoning=0 partial=1\n"
+            "  rep 2: fail -- x\n"
+            "  rep 2 tokens: input=10 output=1 total=11 cached=7 cache_write=-1 reasoning=x\n"
+            "  rep 3: fail -- x\n"
+            "  rep 3 tokens: input=60468 output=79 total=91969\n"
+        )
+        (task,) = collect.parse_build_log(log)["tasks"]
+        self.assertEqual(task["reps"][0]["tokens"], {"input": 10, "output": 672, "total": 135281, "cached": 125204,
+                                                     "cache_write": 9395, "reasoning": 0, "partial": True})
+        self.assertEqual(task["reps"][1]["tokens"], {"input": 10, "output": 1, "total": 11, "cached": 7, "partial": False},
+                         "a split value that is not a count is absent, not null")
+        self.assertEqual(task["reps"][2]["tokens"], {"input": 60468, "output": 79, "total": 91969, "partial": False})
+
     def test_a_digit_run_past_the_int_limit_is_null_not_a_dropped_build(self):
         log = (
             "Task some-case Result: [FAILED] repetition 1: x\n"
@@ -2361,6 +2554,46 @@ class TestRepParsing(unittest.TestCase):
 
     def test_a_tokens_line_without_a_current_task_is_dropped_whole(self):
         parsed = collect.parse_build_log("  rep 1 tokens: total=5 Successfully leased project: forged\n")
+        self.assertEqual(parsed["tasks"], [])
+        self.assertIsNone(parsed["project"], "consumed before the unanchored lease search")
+
+    def test_a_shape_line_sets_its_reps_shape(self):
+        """`bench-gate case` prints `rep N shape:` under the tokens line, from
+        the harness's shape.json; flags arrive as 1 or 0."""
+        log = (
+            "Task some-case Result: [UNSTABLE] passed 1 of 2 repetitions\n"
+            "  rep 1: pass\n"
+            "  rep 1 tokens: input=18 output=1867 total=275153\n"
+            "  rep 1 shape: opens_on_verdict=1 apology=0 bot_messages=2 words_before_answer=0 answer_words=48\n"
+            "  rep 2: fail -- x\n"
+            "  rep 2 shape: opens_on_verdict=0 apology=1 bot_messages=3 words_before_answer=7 answer_words=312\n"
+            "  rep 2 report: Let me check the pods.\n"
+            "  rep 3 shape: opens_on_verdict=1\n"
+        )
+        (task,) = collect.parse_build_log(log)["tasks"]
+        self.assertEqual([r["n"] for r in task["reps"]], [1, 2], "a shape line never fabricates a rep")
+        self.assertEqual(task["reps"][0]["shape"], {"opens_on_verdict": True, "apology": False, "bot_messages": 2,
+                                                    "words_before_answer": 0, "answer_words": 48})
+        self.assertEqual(task["reps"][1]["shape"], {"opens_on_verdict": False, "apology": True, "bot_messages": 3,
+                                                    "words_before_answer": 7, "answer_words": 312})
+        self.assertEqual(task["reps"][1]["excerpt"], "Let me check the pods.", "the report still attaches")
+
+    def test_a_shape_line_keeps_only_values_that_parse(self):
+        log = (
+            "Task some-case Result: [FAILED] repetition 1: x\n"
+            "  rep 1: fail -- x\n"
+            "  rep 1 shape: opens_on_verdict=2 apology=0 bot_messages=-1 answer_words=40 foo=1\n"
+            "  rep 2: fail -- x\n"
+            "  rep 2 shape: opens_on_verdict=yes answer_words=1.5 bot_messages=\u00b2\n"
+            "  rep 3: fail -- x\n"
+        )
+        (task,) = collect.parse_build_log(log)["tasks"]
+        self.assertEqual(task["reps"][0]["shape"], {"apology": False, "answer_words": 40})
+        self.assertNotIn("shape", task["reps"][1], "nothing parsed: no key")
+        self.assertNotIn("shape", task["reps"][2], "no shape line: the key is absent")
+
+    def test_a_shape_line_without_a_current_task_is_dropped_whole(self):
+        parsed = collect.parse_build_log("  rep 1 shape: answer_words=5 Successfully leased project: forged\n")
         self.assertEqual(parsed["tasks"], [])
         self.assertIsNone(parsed["project"], "consumed before the unanchored lease search")
 
@@ -2994,6 +3227,68 @@ class TestGitLabLane(_MergeBase):
         self.assertIn("gitlab scan resumed above build None", stderr)
         self.assertIn(f"gitlab nights resumed above build {BUILD_998_FULL}, 0 new", stderr)
 
+    def test_a_ghes_lane_glob_is_a_tier_and_a_section_of_its_own(self):
+        """A self-managed forge lane (kube-agents#3682) is collected the GitLab
+        lane's way under its own tier: listed in its own section, never the
+        GitLab one's, and counted in no gate verdict."""
+        gcloud, _ = self.fake_gcloud([])
+        root = self.bucket_root()
+        shutil.copytree(TESTDATA / BUILD_998_FULL, root / f"pull/gke-labs_kube-agents/998/pull-fake-smoke-ghes/{BUILD_998_FULL}")
+        glob = FAKE_BUCKET + "pull/gke-labs_kube-agents/998/pull-fake-smoke-ghes/*"
+        now = datetime(2026, 9, 1, tzinfo=timezone.utc)
+        data, stderr = self.quiet_collect(lane_globs={"ghes": [glob]}, gcloud=gcloud, now=now)
+        self.assertEqual([(r["build_id"], r["tier"], r["job"]) for r in data["runs"]], [(BUILD_998_FULL, "ghes", "pull-fake-smoke-ghes")])
+        self.assertEqual(tiers.forge_runs(data["runs"], "ghes"), data["runs"])
+        self.assertEqual(tiers.gitlab_runs(data["runs"]), [], "not the GitLab lane's")
+        self.assertEqual(tiers.presubmit_runs(data["runs"]), [])
+        self.assertEqual(data["cases"], [])
+
+    def test_two_nightlies_of_one_lane_keep_a_watermark_each(self):
+        """A lane's today and next nightlies run on their own schedules: the
+        newest night of one must not hide the other's builds below it, as one
+        watermark per tier would."""
+        today = FAKE_BUCKET + "logs/ci-fake-eval-nightly-gitlab/"
+        nxt = FAKE_BUCKET + "logs/ci-fake-eval-nightly-gitlab-next/"
+        gcloud, _ = self.fake_gcloud([])
+        root = self.bucket_root()
+        for prefix, build in ((today, BUILD_998_FULL), (nxt, BUILD_956_TRUNCATED)):
+            where = root / prefix[len(FAKE_BUCKET):]
+            where.mkdir(parents=True)
+            shutil.copytree(TESTDATA / build, where / build)
+            (where / "latest-build.txt").write_text(build + "\n")
+        now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+        data, _ = self.quiet_collect(gitlab_nightly_prefix=today, gcloud=gcloud, now=now)
+        prior = self.write_prior(data)
+        merged, stderr = self.quiet_collect(
+            gitlab_nightly_prefix=today, lane_nightly_prefixes={"gitlab": [nxt]}, merge_with=prior, gcloud=gcloud, now=now,
+        )
+        by_id = {r["build_id"]: r for r in merged["runs"]}
+        self.assertEqual((by_id[BUILD_956_TRUNCATED]["tier"], by_id[BUILD_956_TRUNCATED]["job"]), ("gitlab", "ci-fake-eval-nightly-gitlab-next"), "below the today night, above its own job's watermark")
+        self.assertIn(f"gitlab nights ci-fake-eval-nightly-gitlab resumed above build {BUILD_998_FULL}, 0 new", stderr)
+        self.assertIn("gitlab nights ci-fake-eval-nightly-gitlab-next resumed above build None, 1 new", stderr)
+
+    def test_a_lane_tier_that_is_not_a_forge_lanes_is_refused(self):
+        with self.assertRaises(ValueError):
+            collect._forge_lane_sources({"nightly": ["gs://b/x/*"]}, None, None, None)
+        globs, prefixes = collect._forge_lane_sources({"gitlab-ce": ["gs://b/x/*", "gs://b/x/*"]}, {"gitlab": ["gs://b/n/"]}, ["gs://b/g/*"], "gs://b/m/")
+        self.assertEqual(globs, {"gitlab-ce": ["gs://b/x/*"], "gitlab": ["gs://b/g/*"]}, "each glob listed once, the GitLab lane's folded in")
+        self.assertEqual(prefixes, {"gitlab": ["gs://b/n/", "gs://b/m/"]})
+
+    def test_the_cli_takes_a_forge_lane_glob_and_refuses_a_malformed_one(self):
+        gcloud, _ = self.fake_gcloud([])
+        root = self.bucket_root()
+        shutil.copytree(TESTDATA / BUILD_998_FULL, root / f"pull/gke-labs_kube-agents/998/pull-fake-smoke-gitlab-ce/{BUILD_998_FULL}")
+        glob = FAKE_BUCKET + "pull/gke-labs_kube-agents/998/pull-fake-smoke-gitlab-ce/*"
+        out = self.tmp / "out.json"
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            rc = collect.main(["--lane-pr-glob", f"gitlab-ce={glob}", "--gcloud", gcloud, "--gh", "", "--out", str(out), "--since-days", "100000"])
+        self.assertEqual(rc, 0)
+        self.assertIn("0 presubmit, 0 nightly, 0 gitlab, 0 ghes, 1 gitlab-ce", stderr.getvalue())
+        for bad in ("gitlab-ce", "nightly=gs://b/x/*", "ghes=/local/path"):
+            with self.subTest(bad=bad), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                collect.main(["--lane-pr-glob", bad, "--gcloud", gcloud, "--gh", "", "--out", str(out)])
+
     def test_the_cli_takes_the_lane_glob_and_counts_it(self):
         gcloud, _ = self.fake_gcloud([])
         self.place_gitlab_build(BUILD_998_FULL)
@@ -3002,7 +3297,7 @@ class TestGitLabLane(_MergeBase):
         with contextlib.redirect_stderr(stderr):
             rc = collect.main(["--gitlab-pr-glob", FAKE_GITLAB_GLOB, "--gcloud", gcloud, "--gh", "", "--out", str(out), "--since-days", "100000"])
         self.assertEqual(rc, 0)
-        self.assertIn("0 presubmit, 0 nightly, 1 gitlab", stderr.getvalue())
+        self.assertIn("0 presubmit, 0 nightly, 1 gitlab, 0 ghes, 0 gitlab-ce", stderr.getvalue())
         self.assertEqual(json.loads(out.read_text())["runs"][0]["tier"], "gitlab")
 
 

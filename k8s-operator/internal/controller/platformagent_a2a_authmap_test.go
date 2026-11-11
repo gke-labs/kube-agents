@@ -54,7 +54,7 @@ func authMapTestAgent() *agentv1alpha1.PlatformAgent {
 // render that cuts more than one is a failure here, not a thing to pick from.
 func singleA2AAuthMapShard(t *testing.T, agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) (*corev1.ConfigMap, string) {
 	t.Helper()
-	cms, version, err := buildA2AAuthMapConfigMaps(agent, profiles)
+	cms, version, err := buildA2AAuthMapConfigMaps(agent, profiles, nil)
 	if err != nil {
 		t.Fatalf("buildA2AAuthMapConfigMaps: %v", err)
 	}
@@ -252,12 +252,12 @@ func TestRenderedNATSConfMatchesTheCalloutFixture(t *testing.T) {
 		agent.Spec.Harness.Tuning = &agentv1alpha1.TuningSpec{}
 	}
 	agent.Spec.Harness.Tuning.BusReplicas = ptr.To(1)
-	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 
 	// The two values the pod supplies and a test process cannot: the server
 	// name, from the pod's env, and a pid file on the pod's data volume.
 	conf = strings.Replace(conf, "server_name: $POD_NAME", "server_name: a2a-nats-0", 1)
-	conf = strings.Replace(conf, `pid_file: "`+a2aNATSPidFile+`"`, `pid_file: ""`, 1)
+	conf = strings.Replace(conf, `pid_file: "`+a2aNATSPIDFile+`"`, `pid_file: ""`, 1)
 
 	// The generated keys differ on every run, so the committed fixture is
 	// normalised to a stable placeholder. The consuming test replaces these

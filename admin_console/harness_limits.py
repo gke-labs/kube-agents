@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import math
+import statistics
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -105,6 +106,10 @@ PROXY_LOAD_RATE = "proxy_load_per_second"
 PROXY_LOAD_P50 = "proxy_load_p50_seconds"
 PROXY_LOAD_P95 = "proxy_load_p95_seconds"
 PROXY_LOAD_MAX = "proxy_load_max_seconds"
+PROXY_SLOT_CAP = "proxy_slot_cap"
+PROXY_SLOTS_PEAK = "proxy_slots_in_use_peak"
+CPU_THROTTLED_SECONDS = "cpu_throttled_seconds"
+CPU_THROTTLED_SHARE = "cpu_throttled_period_share"
 WATCHER_SEEN = "watcher_events_seen"
 WATCHER_SEEN_RATE = "watcher_events_seen_per_minute"
 WATCHER_CREATES = "watcher_session_creates"
@@ -115,8 +120,9 @@ RUN_SLOT_REFUSALS = "run_slot_refusals"
 FAILED_PROMPTS = "failed_prompts"
 UNFINISHED_PROMPTS = "unfinished_prompts"
 RESPONSE = "response_seconds"
-# How long the slowest job a triggered window started took to run, in data that records it.
+# How long the slowest job a triggered window started took to run.
 JOB_SECONDS = "job_seconds"
+JOBS_COMPLETED = "jobs_completed"
 TOKENS_INPUT = "tokens_input"
 TOKENS_OUTPUT = "tokens_output"
 TOKENS_CACHED = "tokens_cached"
@@ -337,6 +343,10 @@ METRICS = MappingProxyType(
         PROXY_LOAD_P50: MetricSpec("Proxy load: command time, median", "s"),
         PROXY_LOAD_P95: MetricSpec("Proxy load: command time, 95th percentile", "s"),
         PROXY_LOAD_MAX: MetricSpec("Proxy load: command time, maximum", "s"),
+        PROXY_SLOT_CAP: MetricSpec("Credential proxy slot cap"),
+        PROXY_SLOTS_PEAK: MetricSpec("Credential proxy slots in use, peak"),
+        CPU_THROTTLED_SECONDS: MetricSpec("CPU throttled time", "s"),
+        CPU_THROTTLED_SHARE: MetricSpec("CPU periods throttled, share"),
         WATCHER_SEEN: MetricSpec("Watcher events seen"),
         WATCHER_SEEN_RATE: MetricSpec("Watcher events seen per minute"),
         WATCHER_CREATES: MetricSpec("Watcher session creates"),
@@ -347,6 +357,8 @@ METRICS = MappingProxyType(
         FAILED_PROMPTS: MetricSpec("Failed prompts"),
         UNFINISHED_PROMPTS: MetricSpec("Prompts answered without the operation"),
         RESPONSE: MetricSpec("Response time", "s"),
+        JOB_SECONDS: MetricSpec("Scheduled job run time", "s"),
+        JOBS_COMPLETED: MetricSpec("Scheduled jobs completed"),
         TOKENS_INPUT: MetricSpec("Input tokens, every caller (whole prompt)"),
         TOKENS_OUTPUT: MetricSpec("Output tokens, every caller"),
         TOKENS_CACHED: MetricSpec("Cached tokens, every caller"),
@@ -395,7 +407,7 @@ CAPACITY_METRICS = MappingProxyType({PVC_USED: PVC_CAPACITY})
 # The response-time gates are for typical queries: the plan's fan-out question
 # and the metadata question asked during it. The other operations are long
 # reports, such as a fleet audit; their response time is charted without a gate.
-QUERY_OPERATIONS = ("fan_out",)
+QUERY_OPERATIONS = ("fan_out", "daily_fan_out")
 QUERY_METRICS = (RESPONSE,)
 
 # How far a capacity search looks: up to this multiple of the input's base value.
@@ -976,6 +988,18 @@ def default_mode_index(available: Sequence[str]) -> int:
     return available.index(DEFAULT_MODE) if DEFAULT_MODE in available else 0
 
 
+def default_commit_index(records: Sequence[Record], available: Sequence[str]) -> int:
+    """The newest commit whose runs in its default mode have a factor axis, so a forecast can be drawn.
+
+    A commit that measured one fleet point (the real-install test) is evidence, not a forecast's input.
+    """
+    for index, commit in enumerate(available):
+        found = modes(records, commit)
+        if found and factors(select(records, commit, found[default_mode_index(found)])):
+            return index
+    return 0
+
+
 def select(records: Iterable[Record], commit: str, mode: str) -> tuple[Record, ...]:
     return tuple(
         record for record in records if record.commit == commit and record.mode == mode
@@ -1289,6 +1313,10 @@ def _contribution(
         return None
     fit = fit_line(points)
     base_x = _base_x(records, operation, factor)
+    if base_x is None:
+        # An operation with no base run grows from the data's base point, where the base value it is
+        # added to was measured; from its own lowest run it would leave out the growth below that.
+        base_x = fleet_value(factor, base_fleet(records))
     if base_x is None and fit is not None:
         base_x = fit.x_min
     fleet_x = fleet_value(factor, fleet)
@@ -1831,7 +1859,7 @@ def stall_watch_seconds_per_cluster(records: Iterable[Record]) -> float | None:
         and record.totals.get(CLUSTERS)
         and (seconds := record.value(JOB_SECONDS)) is not None
     )
-    return rates[len(rates) // 2] if rates else None
+    return statistics.median(rates) if rates else None
 
 
 @dataclass(frozen=True)
@@ -2171,6 +2199,8 @@ class ProxyLevel:
     shell_cpu_cores: float | None = None
     # The broker's largest median admission wait: near zero while its slots are free.
     wait_p50_seconds: float | None = None
+    # The load operation: a plan can load one tool per operation (`proxy_load_gcloud`).
+    operation: str = PROXY_LOAD_OPERATION
 
 
 @dataclass(frozen=True)
@@ -2267,14 +2297,17 @@ def _cpu_reading(record: Record, metric: str, container: str) -> float | None:
 
 
 def proxy_levels(records: Iterable[Record]) -> list[ProxyLevel]:
-    """The proxy load runs, one row per worker count, in rising order; a run that shared the broker is left out."""
-    groups: dict[float, list[Record]] = {}
+    """The proxy load runs, one row per operation and worker count, in rising order; a run that shared the broker is left out.
+
+    Each load operation keeps its own rows: one tool's throughput is no measure of another's.
+    """
+    groups: dict[tuple[str, float], list[Record]] = {}
     for record in records:
         workers = factor_value(record, PROXY_CONCURRENCY)
         if record.value(PROXY_LOAD_RATE) is not None and workers is not None and not record.excluded(PROXY_LOAD_RATE):
-            groups.setdefault(workers, []).append(record)
+            groups.setdefault((record.operation, workers), []).append(record)
     levels = []
-    for workers, runs in sorted(groups.items()):
+    for (operation, workers), runs in sorted(groups.items()):
         peaks = [value for run in runs if (value := _cpu_reading(run, CPU_PEAK, PROXY_CONTAINER)) is not None]
         shell = [value for run in runs if (value := _cpu_reading(run, CPU_PEAK, SHELL_CONTAINER)) is not None]
         waits = [value for run in runs if not run.excluded(PROXY_WAIT_P50) and (value := run.value(PROXY_WAIT_P50)) is not None]
@@ -2289,6 +2322,7 @@ def proxy_levels(records: Iterable[Record]) -> list[ProxyLevel]:
                 max(peaks) if peaks else None,
                 max(shell) if shell else None,
                 max(waits) if waits else None,
+                operation,
             )
         )
     return levels
@@ -2302,7 +2336,9 @@ def proxy_demand(records: Iterable[Record]) -> list[ProxyDemand]:
     """
     groups: dict[tuple[str, str, float], list[Record]] = {}
     for record in records:
-        if record.operation == PROXY_LOAD_OPERATION or record.value(PROXY_COMMANDS) is None:
+        # A load run is known by what only a load run writes, its rate, as `proxy_levels` knows
+        # it: an operation's name says nothing about its kind.
+        if record.value(PROXY_LOAD_RATE) is not None or record.value(PROXY_COMMANDS) is None:
             continue
         if record.excluded(PROXY_COMMANDS) or record.excluded(PROXY_COMMAND_SECONDS):
             continue
