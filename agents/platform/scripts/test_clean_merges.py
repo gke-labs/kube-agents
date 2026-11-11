@@ -202,35 +202,44 @@ class TwoRepositoriesTest(unittest.TestCase):
     def test_merges_in_repo_a_never_make_repo_b_ready(self):
         for n in range(6):
             self._merge(REPO, n)
-        self.assertTrue(clean_merges.ready_in(self.conn, REPO, "no-pdb", "dev", NOW)["ready"])
+        self.assertTrue(clean_merges.ready_in(self.conn, repo=REPO, kind="no-pdb", environment="dev", now=NOW)["ready"])
         self.assertEqual(
-            clean_merges.ready_in(self.conn, OTHER, "no-pdb", "dev", NOW),
+            clean_merges.ready_in(self.conn, repo=OTHER, kind="no-pdb", environment="dev", now=NOW),
             {"clean": 0, "days": 0, "settled": 0, "ready": False},
         )
         for n in range(4):
             self._merge(OTHER, 100 + n)
-        self.assertFalse(clean_merges.ready_in(self.conn, OTHER, "no-pdb", "dev", NOW)["ready"])
-        self.assertEqual(clean_merges.ready_in(self.conn, OTHER, "no-pdb", "dev", NOW)["clean"], 4)
+        self.assertFalse(clean_merges.ready_in(self.conn, repo=OTHER, kind="no-pdb", environment="dev", now=NOW)["ready"])
+        self.assertEqual(clean_merges.ready_in(self.conn, repo=OTHER, kind="no-pdb", environment="dev", now=NOW)["clean"], 4)
 
     def test_ready_in_with_no_table_or_an_unknown_kind_is_zero(self):
         self.conn.execute("DROP TABLE post_merge_records")
-        self.assertFalse(clean_merges.ready_in(self.conn, REPO, "no-pdb", "dev", NOW)["ready"])
+        self.assertFalse(clean_merges.ready_in(self.conn, repo=REPO, kind="no-pdb", environment="dev", now=NOW)["ready"])
         self.setUp()
         self._merge(REPO, 1)
-        self.assertEqual(clean_merges.ready_in(self.conn, REPO, "nope", "dev", NOW)["clean"], 0)
+        self.assertEqual(clean_merges.ready_in(self.conn, repo=REPO, kind="nope", environment="dev", now=NOW)["clean"], 0)
 
     def test_ready_in_matches_the_repository_however_it_is_spelled(self):
         for n in range(5):
             self._merge(REPO, n)
-        self.assertTrue(clean_merges.ready_in(self.conn, "https://GitHub.com/org/infra.git", "no-pdb", "dev", NOW)["ready"])
+        self.assertTrue(clean_merges.ready_in(self.conn, repo="https://GitHub.com/org/infra.git", kind="no-pdb", environment="dev", now=NOW)["ready"])
+
+    def test_ready_in_is_keyword_only(self):
+        with self.assertRaises(TypeError):
+            clean_merges.ready_in(self.conn, "no-pdb", "dev", NOW)
+
+    def test_environments_compare_lower_case(self):
+        for n in range(5):
+            self._merge(REPO, n, environment=" Dev")
+        self.assertTrue(clean_merges.ready_in(self.conn, repo=REPO, kind="no-pdb", environment="dev", now=NOW)["ready"])
 
     def test_ready_in_counts_only_the_environment_asked_for(self):
         for n in range(3):
             self._merge(REPO, n)
         for n in range(3, 6):
             self._merge(REPO, n, environment="prod")
-        self.assertEqual(clean_merges.ready_in(self.conn, REPO, "no-pdb", "dev", NOW)["clean"], 3)
-        self.assertFalse(clean_merges.ready_in(self.conn, REPO, "no-pdb", "prod", NOW)["ready"])
+        self.assertEqual(clean_merges.ready_in(self.conn, repo=REPO, kind="no-pdb", environment="dev", now=NOW)["clean"], 3)
+        self.assertFalse(clean_merges.ready_in(self.conn, repo=REPO, kind="no-pdb", environment="prod", now=NOW)["ready"])
 
     def test_track_record_lists_each_repository_and_narrows_to_one(self):
         self._merge(REPO, 1)

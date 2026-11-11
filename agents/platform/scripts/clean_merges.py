@@ -24,7 +24,8 @@ workload repository, a cluster repository and many more per business group, and
 trust earned in one of them says nothing about another. Repositories are compared
 by :func:`repo_key`, so ``https://github.com/org/infra.git`` and
 ``https://github.com/org/infra`` are one. A record without a repository or a kind
-is not counted; one without an environment counts under ``""``.
+is not counted; one without an environment counts under ``""``. Environments
+are compared lower-case and stripped, as the post-merge check stores them.
 
 A ``(repository, kind, environment)`` is ``ready`` with :data:`CLEAN_MERGES_NEEDED`
 clean merges on at least :data:`DAYS_NEEDED` different UTC days, so a single burst
@@ -65,6 +66,10 @@ def repo_key(url: Any) -> str:
     if "@" in text.split("/", 1)[0]:
         text = text.split("@", 1)[1].replace(":", "/", 1)
     return re.sub(r"(\.git)?/*$", "", text)
+
+
+def _environment(value: Any) -> str:
+    return value.strip().lower() if isinstance(value, str) else ""
 
 
 def _empty() -> dict[str, Any]:
@@ -113,8 +118,7 @@ def count(rows: list[dict[str, Any]], now: datetime) -> dict[tuple[str, str, str
         kind, key = row.get("kind"), repo_key(row.get("repo"))
         if not isinstance(kind, str) or not kind or not key:
             continue
-        environment = row.get("environment") if isinstance(row.get("environment"), str) else ""
-        group = (key, kind, environment)
+        group = (key, kind, _environment(row.get("environment")))
         entry = groups.setdefault(group, {"repo": str(row.get("repo")).strip(), **_empty()})
         days.setdefault(group, set())
         if not is_clean(row, now):
@@ -151,16 +155,18 @@ def read_rows(conn: sqlite3.Connection, repo: str | None = None) -> list[dict[st
 
 
 def ready_in(
-    conn: sqlite3.Connection, repo: str, kind: str, environment: str, now: datetime | None = None
+    conn: sqlite3.Connection, *, repo: str, kind: str, environment: str, now: datetime | None = None
 ) -> dict[str, Any]:
     """``count``'s entry for one kind of fix in one repository and environment.
 
     The auto-merge offer is made per repository and environment, so five clean
     merges spread across two repositories, or across dev and prod, have earned
     it in neither. ``repo`` is the fix's repository; a key with no records is 0.
+    Keyword-only, so a caller written for an older signature fails loudly
+    rather than counting the wrong key.
     """
     now = now or datetime.now(timezone.utc)
-    entry = count(read_rows(conn, repo), now).get((repo_key(repo), kind, environment))
+    entry = count(read_rows(conn, repo), now).get((repo_key(repo), kind, _environment(environment)))
     return {key: value for key, value in entry.items() if key != "repo"} if entry else _empty()
 
 
