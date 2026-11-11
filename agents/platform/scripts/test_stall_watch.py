@@ -2944,14 +2944,23 @@ class RelayListing(unittest.TestCase):
         self.assertEqual(stall_watch.GKE_READS_HELPER, gke_cluster_reads.SANDBOX_GKE_READS)
 
     def test_a_timeout_falls_back_to_gcloud_with_the_time_left(self):
+        timeouts = {}
+
         def run(argv, **kw):
+            timeouts[argv[0]] = kw["timeout"]
             if argv[0] == "python3":
                 raise subprocess.TimeoutExpired(argv, kw["timeout"])
             return completed(argv, json.dumps(self.GCLOUD_LIST))
-        with patch.object(stall_watch, "run_sandbox", run):
-            clusters, _ = stall_watch.list_clusters("p1")
+        clock = iter([100.0, 100.0 + 20.0])
+        with patch.object(stall_watch, "run_sandbox", run), \
+                patch.object(stall_watch.time, "monotonic", lambda: next(clock)):
+            clusters, _ = stall_watch.list_clusters("p1", timeout=80.0)
         self.assertEqual([c["name"] for c in clusters], ["a", "b"])
         self.assertFalse(stall_watch._relay_off)
+        # The relay gets its share (at most half, capped), and gcloud the rest:
+        # 80 s less the 20 s the relay spent.
+        self.assertEqual(timeouts["python3"], min(stall_watch.RELAY_LIST_TIMEOUT_SECONDS, 80.0 * stall_watch.RELAY_LIST_BUDGET_SHARE))
+        self.assertEqual(timeouts["gcloud"], 60.0)
 
     def test_output_that_is_not_json_turns_the_relay_off_and_gcloud_lists(self):
         run, calls = self.fake("not json")
