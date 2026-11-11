@@ -1822,6 +1822,46 @@ def _read_clipped_args(text: str) -> dict[str, Any]:
     return values
 
 
+def _read_clipped_arg_head(text: str, target: str) -> str | None:
+    """The head of a top-level string argument whose value was cut before closing."""
+    depth = 0
+    key: str | None = None
+    i = 0
+    while i < len(text):
+        char = text[i]
+        if char == '"':
+            literal = _JSON_STRING.match(text, i)
+            if literal is None:
+                if key == target and depth == 1:
+                    return _json_string_body(text[i + 1:])
+                return None
+            string = _json_string_body(literal.group(1))
+            colon = _JSON_KEY_COLON.match(text, literal.end())
+            if colon is not None:
+                key = string if depth == 1 else None
+                i = colon.end()
+                continue
+            key = None
+            i = literal.end()
+            continue
+        if char in "{[":
+            depth += 1
+            key = None
+        elif char in "}]":
+            depth -= 1
+            key = None
+        elif char == ",":
+            key = None
+        elif key is not None and not char.isspace():
+            scalar = _JSON_SCALAR.match(text, i)
+            if scalar is not None:
+                key = None
+                i = scalar.end()
+                continue
+        i += 1
+    return None
+
+
 def _args_withheld(entry: dict[str, Any]) -> bool:
     """Whether the pod withheld this call's arguments, so a filter on them cannot decide it."""
     args = entry.get("args")
@@ -2831,25 +2871,40 @@ def _code_call_text_and_clip(entry: dict[str, Any]) -> tuple[str | None, bool]:
     args = entry.get("args")
     if not isinstance(args, dict):
         return None, False
+    target = _COMMAND_ARG if entry.get("name") == _TERMINAL_TOOL else _CODE_ARG
     is_clipped = False
+    command: str | None = None
     if set(args) == {"raw"} and isinstance(args["raw"], str):
         raw = args["raw"]
-        args = _clipped_string_args(raw, {_COMMAND_ARG: "", _CODE_ARG: ""})
-        if _COMMAND_ARG not in args and _CODE_ARG not in args:
-            # The value itself was cut: read its head, as far as the clip kept it.
-            for name, head_re in ((_COMMAND_ARG, _CLIPPED_COMMAND_HEAD_RE), (_CODE_ARG, _CLIPPED_CODE_HEAD_RE)):
+        clip = _CLIPPED_RESULT.search(raw)
+        if clip is not None:
+            text = raw[: clip.start()]
+            parsed = _read_clipped_args(text)
+            if target in parsed and isinstance(parsed[target], str):
+                command = parsed[target]
+            else:
+                is_clipped = True
+                head = _read_clipped_arg_head(text, target)
+                if head is not None:
+                    command = head
+        else:
+            args_parsed = _clipped_string_args(raw, {_COMMAND_ARG: "", _CODE_ARG: ""})
+            if target in args_parsed and isinstance(args_parsed[target], str):
+                command = args_parsed[target]
+            else:
+                head_re = _CLIPPED_COMMAND_HEAD_RE if target == _COMMAND_ARG else _CLIPPED_CODE_HEAD_RE
                 head = head_re.search(raw)
                 if head is not None:
                     is_clipped = True
                     try:
-                        args = {name: json.loads('"' + head.group(1) + '"')}
+                        command = json.loads('"' + head.group(1) + '"')
                     except ValueError:
-                        args = {name: head.group(1)}
-                    break
-    command = args.get(_COMMAND_ARG)
-    if entry.get("name") != _TERMINAL_TOOL:
-        command = args.get(_CODE_ARG)  # ``execute_code``: the program text is the command
-    return (command if isinstance(command, str) else None), is_clipped
+                        command = head.group(1)
+    else:
+        val = args.get(target)
+        if isinstance(val, str):
+            command = val
+    return command, is_clipped
 
 
 def _code_call_text(entry: dict[str, Any]) -> str | None:

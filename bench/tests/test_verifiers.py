@@ -8938,6 +8938,57 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     assert _shell_argvs_with_exit_propagation("./f.py --readiness --exclude watch") == [
         (["./f.py", "--readiness", "--exclude", "watch"], True),
     ]
+    assert _shell_argvs_with_exit_propagation("env --version python3 f.py --readiness") == [
+        (["env", "--version", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("env --help python3 f.py --readiness") == [
+        (["env", "--help", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation('env --help bash -c "python3 f.py --readiness"') == [
+        (["env", "--help", "bash", "-c", "python3 f.py --readiness"], False),
+        (["python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("timeout --help python3 f.py --readiness") == [
+        (["timeout", "--help", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("ionice -V python3 f.py --readiness") == [
+        (["ionice", "-V", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation('bash -oc errexit "python3 collect.py compliance-audit"') == [
+        (["bash", "-oc", "errexit", "python3 collect.py compliance-audit"], True),
+        (["python3", "collect.py", "compliance-audit"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation('bash -co pipefail "python3 collect.py compliance-audit"') == [
+        (["bash", "-co", "pipefail", "python3 collect.py compliance-audit"], True),
+        (["python3", "collect.py", "compliance-audit"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation('bash -c -- "python3 collect.py compliance-audit"') == [
+        (["bash", "-c", "--", "python3 collect.py compliance-audit"], True),
+        (["python3", "collect.py", "compliance-audit"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation('bash -c -n "python3 collect.py compliance-audit"') == [
+        (["bash", "-c", "-n", "python3 collect.py compliance-audit"], True),
+        (["python3", "collect.py", "compliance-audit"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation('bash -Dc "python3 collect.py compliance-audit"') == [
+        (["bash", "-Dc", "python3 collect.py compliance-audit"], True),
+        (["python3", "collect.py", "compliance-audit"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation('bash -lD -c "python3 collect.py compliance-audit"') == [
+        (["bash", "-lD", "-c", "python3 collect.py compliance-audit"], True),
+        (["python3", "collect.py", "compliance-audit"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation('bash +o noexec -c "python3 collect.py compliance-audit"') == [
+        (["bash", "+o", "noexec", "-c", "python3 collect.py compliance-audit"], True),
+        (["python3", "collect.py", "compliance-audit"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation('bash -O noexec -c "python3 collect.py compliance-audit"') == [
+        (["bash", "-O", "noexec", "-c", "python3 collect.py compliance-audit"], True),
+        (["python3", "collect.py", "compliance-audit"], True),
+    ]
+    assert _shell_argvs('bash -oc errexit "python3 collect.py compliance-audit"')[-1] == ["python3", "collect.py", "compliance-audit"]
+    assert _shell_argvs('bash -co pipefail "python3 collect.py compliance-audit"')[-1] == ["python3", "collect.py", "compliance-audit"]
+    assert _shell_argvs('bash -c -- "python3 collect.py compliance-audit"')[-1] == ["python3", "collect.py", "compliance-audit"]
     assert _shell_argvs_with_exit_propagation('bash -o noexec -c "python3 f.py --readiness"') == [
         (["bash", "-o", "noexec", "-c", "python3 f.py --readiness"], True),
         (["python3", "f.py", "--readiness"], False),
@@ -9889,6 +9940,68 @@ def test_worker_commands_succeeded_no_trajectory_split_card_log_reporting():
     assert res.status == "error"
     assert "shows collect.py ran, but the worker trajectory did not capture the call" in res.reason
     assert "no card was delegated or the worker-trajectory capture did not run, so audit_report.py could not be verified" in res.reason
+
+
+def test_worker_commands_clipped_decoy_or_repeated_args_do_not_bypass_is_clipped():
+    from kube_agents_bench.verifiers import WorkerRun, _code_call_text_and_clip
+
+    # 1. Direct check of _code_call_text_and_clip:
+    # A decoy inside {"env": {"command": "true"}} must not be read as unclipped command
+    entry_decoy = {
+        "name": "terminal",
+        "args": {
+            "raw": '{"env": {"command": "true"}, "command": "python3 /opt/chat-collector/collect.py compliance-audit ...[clipped 15 chars]',
+        },
+    }
+    cmd, is_clipped = _code_call_text_and_clip(entry_decoy)
+    assert is_clipped is True
+    assert cmd == "python3 /opt/chat-collector/collect.py compliance-audit"
+
+    # Repeated key where earlier closed one was a decoy and cut dropped it
+    entry_repeat = {
+        "name": "terminal",
+        "args": {
+            "raw": '{"command": "echo decoy", "command": "python3 /opt/chat-collector/collect.py compliance-audit ...[clipped 15 chars]',
+        },
+    }
+    cmd_rep, is_clipped_rep = _code_call_text_and_clip(entry_repeat)
+    assert is_clipped_rep is True
+    assert cmd_rep == "python3 /opt/chat-collector/collect.py compliance-audit"
+
+    # Decoy where target key never appeared at depth 1
+    entry_no_depth1 = {
+        "name": "terminal",
+        "args": {
+            "raw": '{"env": {"command": "true"}, "other": "val ...[clipped 15 chars]',
+        },
+    }
+    cmd_none, is_clipped_none = _code_call_text_and_clip(entry_no_depth1)
+    assert is_clipped_none is True
+    assert cmd_none is None
+
+    # 2. End-to-end check through WorkerCommandsVerifier:
+    # A clipped call with decoy or repeated command that exited 0 must NOT pass under succeeded: true.
+    run = WorkerRun(script="collect.py", word_patterns=[r"^compliance-audit$"], succeeded=True)
+    v = WorkerCommandsVerifier(type="worker_commands", required_runs=[run])
+
+    traj = [
+        {
+            "agent": "worker",
+            "name": "terminal",
+            "task": "t_1",
+            "args": {
+                "raw": '{"env": {"command": "true"}, "command": "python3 /opt/chat-collector/collect.py compliance-audit ...[clipped 15 chars]',
+            },
+            "result": '{"exit_code": 0}',
+            "status": "completed",
+            "at": 1.0,
+        }
+    ]
+    transcript.set("ok", traj, worker_commands=[{"task": "t_1", "command": "python3 /opt/chat-collector/collect.py compliance-audit"}])
+    res = v.verify(5.0)
+    assert not res.success
+    assert res.status == "error"
+    assert "the call's command was clipped in the pod" in res.reason
 
 
 # ------------------------------- the retrospective's drained-budget case's line

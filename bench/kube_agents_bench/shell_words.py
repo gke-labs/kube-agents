@@ -72,12 +72,11 @@ _SHELL_ARITHMETIC_OPENER = "$(("
 _SHELL_BACKTICK = "`"
 _SUBSTITUTION_MARK = "\x00S{index}\x00"
 _SUBSTITUTION_MARK_RE = re.compile(r"\x00S(\d+)\x00")
-# After an exec wrapper, only the wrapper's own words are transparent: a flag, the word after a
-# flag (its value, as in `-u hermes` or `-s KILL`, unless that word is a flag itself; which flags take one is not tabled), a
-# duration or count (`timeout 600`, `timeout infinity`), an expansion the reader never resolves
-# (`timeout $T`, `"${TIMEOUT:-600}"`) and `--`, which ends its options. A redirect and its target
-# stand anywhere ahead of the command (`nohup > log python3 ...`). The first other word is the
-# command the wrapper runs.
+# After an exec wrapper, only the wrapper's own words are transparent: its flags and their tabled
+# values (attached or separate), a duration or count (`timeout 600`, `timeout infinity`), an
+# expansion the reader never resolves (`timeout $T`, `"${TIMEOUT:-600}"`), and `--`, which ends
+# options. A redirect and its target stand anywhere ahead of the command (`nohup > log python3 ...`).
+# The first other word is the command the wrapper runs.
 _SHELL_FLAG_PREFIX = "-"
 _SHELL_OPTIONS_END = "--"
 _SHELL_EXPANSION_PREFIX = "$"
@@ -325,6 +324,23 @@ _GENERIC_WRAPPER_VAL_OPTS = {
 }
 
 
+def _next_shell_arg(argv: list[str], idx: int) -> tuple[str | None, int]:
+    """Return the next argument in argv from idx, skipping redirects and their targets."""
+    redirect_target = False
+    while idx < len(argv):
+        w = argv[idx]
+        if redirect_target:
+            redirect_target = False
+            idx += 1
+            continue
+        if _is_redirect(w) or (w.isdigit() and idx + 1 < len(argv) and _is_redirect(argv[idx + 1])):
+            redirect_target = not w.isdigit()
+            idx += 1
+            continue
+        return w, idx
+    return None, idx
+
+
 def _extract_shell_command_string(
     argv: list[str], start_index: int
 ) -> tuple[str | None, bool, bool]:
@@ -332,78 +348,70 @@ def _extract_shell_command_string(
     Returns (cmd_string, has_noexec, has_help_or_version).
     Handles options starting with '-' or '+', options with values (-o, -O, +o, +O, --rcfile, --init-file),
     and skips redirects anywhere on the command line before -c."""
-    flag_idx = start_index
-    takes_val = False
-    redirect_target = False
+    idx = start_index
+    saw_c = False
     has_noexec = False
     has_help_or_version = False
     cmd_string = None
 
-    while flag_idx < len(argv):
-        word = argv[flag_idx]
-        if redirect_target:
-            redirect_target = False
-            flag_idx += 1
-            continue
-        if takes_val:
-            if word == "noexec":
-                has_noexec = True
-            takes_val = False
-            flag_idx += 1
-            continue
-        if _is_redirect(word) or (word.isdigit() and flag_idx + 1 < len(argv) and _is_redirect(argv[flag_idx + 1])):
-            redirect_target = not word.isdigit()
-            flag_idx += 1
-            continue
-        if word == "--":
+    while idx < len(argv):
+        word, idx = _next_shell_arg(argv, idx)
+        if word is None:
             break
+
+        if word == "--":
+            idx += 1
+            if saw_c:
+                cmd_word, idx = _next_shell_arg(argv, idx)
+                if cmd_word is not None:
+                    cmd_string = cmd_word
+            break
+
         if word.startswith("--"):
-            if word in ("--help", "--version"):
+            opt_name, _, _ = word.partition("=")
+            if opt_name in ("--help", "--version"):
                 has_help_or_version = True
-            elif word in ("--dump-strings", "--dump-po-strings"):
+            elif opt_name in ("--dump-strings", "--dump-po-strings"):
                 has_noexec = True
-            elif word in ("--rcfile", "--init-file"):
-                takes_val = True
-            elif word.startswith("--rcfile=") or word.startswith("--init-file="):
-                pass
-            flag_idx += 1
+            elif opt_name in ("--rcfile", "--init-file"):
+                if "=" not in word:
+                    idx += 1
+                    _, idx = _next_shell_arg(argv, idx)
+            idx += 1
             continue
-        if word == "-D":
-            has_noexec = True
-            flag_idx += 1
+
+        if word == "-":
+            idx += 1
+            if saw_c:
+                cmd_word, idx = _next_shell_arg(argv, idx)
+                if cmd_word is not None:
+                    cmd_string = cmd_word
+            break
+
+        if word.startswith(("-", "+")) and len(word) > 1:
+            is_plus = word.startswith("+")
+            idx += 1
+            val_needed = None
+            for c in word[1:]:
+                if c == "c" and not is_plus:
+                    saw_c = True
+                elif c in ("n", "D") and not is_plus:
+                    has_noexec = True
+                elif c == "o":
+                    val_needed = "set_o"
+                elif c == "O":
+                    val_needed = "shopt_O"
+
+            if val_needed is not None:
+                val_word, idx = _next_shell_arg(argv, idx)
+                if val_word is not None:
+                    idx += 1
+                    if val_needed == "set_o" and not is_plus and val_word == "noexec":
+                        has_noexec = True
             continue
-        if word.startswith(("-o", "+o")) and word[2:] == "noexec":
-            has_noexec = True
-            flag_idx += 1
-            continue
-        if word.startswith("+") and len(word) > 1:
-            if word[-1] in "oO":
-                takes_val = True
-            flag_idx += 1
-            continue
-        if word.startswith("-") and len(word) > 1:
-            if "n" in word[1:]:
-                has_noexec = True
-            if "c" in word[1:]:
-                c_idx = flag_idx + 1
-                c_redirect_target = False
-                while c_idx < len(argv):
-                    c_word = argv[c_idx]
-                    if c_redirect_target:
-                        c_redirect_target = False
-                        c_idx += 1
-                        continue
-                    if _is_redirect(c_word) or (c_word.isdigit() and c_idx + 1 < len(argv) and _is_redirect(argv[c_idx + 1])):
-                        c_redirect_target = not c_word.isdigit()
-                        c_idx += 1
-                        continue
-                    cmd_string = c_word
-                    break
-                break
-            if word[-1] in "oO":
-                takes_val = True
-            flag_idx += 1
-            continue
+
+        if saw_c:
+            cmd_string = word
         break
 
     return cmd_string, has_noexec, has_help_or_version
@@ -546,9 +554,13 @@ def _scan_command_prefix(
                     val_opts = _GENERIC_WRAPPER_VAL_OPTS.get(wrapper_name, frozenset())
                     if w.startswith("--"):
                         opt_name, _, _ = w.partition("=")
-                        if opt_name in val_opts and "=" not in w:
+                        if opt_name in ("--help", "--version"):
+                            detaches = True
+                        elif opt_name in val_opts and "=" not in w:
                             takes_val = True
                     elif w.startswith("-") and len(w) > 1:
+                        if wrapper_name == "ionice" and "V" in w[1:]:
+                            detaches = True
                         for ci, c in enumerate(w[1:]):
                             if f"-{c}" in val_opts:
                                 rest = w[1 + ci + 1:]
