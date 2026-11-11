@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/nats-io/jwt/v2"
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nkeys"
 
 	lib "github.com/gke-labs/kube-agents/a2a/lib"
@@ -441,4 +442,41 @@ func TestABucketUserNamedForAStaticPrincipalIsRefused(t *testing.T) {
 	if _, err := connect(svc, dispatcherToken, lib.DispatcherBucketCredential(4)); err != nil {
 		t.Fatalf("bucket 4 refused: %v", err)
 	}
+}
+
+// The dispatcher's real bucket options (lib.DispatcherBucketNATSOptions: the
+// token from its file, the bucket as the CONNECT password, the bucket user's
+// inbox) against a real server serving the operator's bucketed render: the
+// bucket connection reaches tse's subjects and is refused on another
+// profile's and on the control set.
+func TestTheRealBucketOptionsConnectAgainstTheOperatorsBucketedMap(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("testdata", "rendered-identity-map-dispatcher-bucketed.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := startHarness(t, string(raw), map[string]Attested{
+		dispatcherToken: {ServiceAccount: dispatcherSA, PodName: dispatcherPod, PodUID: "uid-d"},
+	})
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenFile, []byte(dispatcherToken), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b := lib.DispatcherBucket("tse")
+	opts, err := lib.DispatcherBucketNATSOptions(tokenFile, "dispatcher", b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	violations := make(chan error, 16)
+	nc, err := nats.Connect(h.url, append([]nats.Option{h.dial, nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, e error) { violations <- e })}, opts...)...)
+	if err != nil {
+		t.Fatalf("bucket %d with the real options was refused: %v", b, err)
+	}
+	t.Cleanup(nc.Close)
+	other := profileHashingTo((b + 1) % lib.DispatcherBuckets)
+	checkPublish(t, nc, violations, map[string]bool{
+		lib.TaskSupervisorSubject("tse", "task-1"):                                              false,
+		"$JS.API.CONSUMER.INFO.PROFILE_SUBMITS." + lib.ProfileDurableName("tse", "read", "top"): false,
+		lib.TaskSupervisorSubject(other, "task-1"):                                              true,
+		lib.DispatchSubject("tse", "read", "pod-1"):                                             true,
+	})
 }

@@ -1,8 +1,11 @@
 package dispatch
 
 import (
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/nats-io/nats.go"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
@@ -25,13 +28,7 @@ func TestBucketedAnAddedProfileReconnectsOnlyItsBucket(t *testing.T) {
 
 	var control grantSwitch
 	control.set("disp-old")
-	switches := make([]*grantSwitch, lib.DispatcherBuckets)
-	buckets := make([]*lib.Client, lib.DispatcherBuckets)
-	for i := range buckets {
-		switches[i] = &grantSwitch{}
-		switches[i].set("disp-old")
-		buckets[i] = b.connectAs(switches[i])
-	}
+	switches, buckets := connectBuckets(b, "disp-old")
 	ti := oneProfile("tse", 2, "tse-0")
 	d, _ := b.runPrepared(b.connectAs(&control), fastRegrant(), ti, &fakeVerifier{}, func(d *Dispatcher) {
 		if err := d.UseBuckets(buckets); err != nil {
@@ -72,24 +69,17 @@ func TestBucketedAnAddedProfileReconnectsOnlyItsBucket(t *testing.T) {
 	}
 }
 
-// The control connection alone can't read a profile's durables when the
-// grants are bucketed: the bucket connection is what the profile's subjects
-// go over, so a dispatcher that never opened its buckets (an image from before
-// them, under a bucketed map) binds nothing. It stays not Ready instead of
-// quietly dispatching nothing.
+// With buckets, a profile's subjects go over its bucket, not the control
+// connection, which under a bucketed map holds no profile's grants (the
+// callout's real-server tests show the refusal). UseBuckets takes exactly
+// one connected client per bucket.
 func TestBucketedSubjectsGoOverTheBucketNotTheControlConnection(t *testing.T) {
 	b := newBusWith(t, dispatcherUsers(), "tse2-0")
 	b.ensure("tse2", 2, 0, "read")
 	var control grantSwitch
 	control.set("disp-old") // denied tse2's durables, as a bucketed control connection is
 	ctl := b.connectAs(&control)
-	switches := make([]*grantSwitch, lib.DispatcherBuckets)
-	buckets := make([]*lib.Client, lib.DispatcherBuckets)
-	for i := range buckets {
-		switches[i] = &grantSwitch{}
-		switches[i].set("disp-new")
-		buckets[i] = b.connectAs(switches[i])
-	}
+	_, buckets := connectBuckets(b, "disp-new")
 	d, err := New(fastRegrant(), ctl, NewStaticSource(testDispatchConfig(6, testProfile("tse2", 2))), NewStaticPool(), &fakeVerifier{}, quietLog())
 	if err != nil {
 		t.Fatal(err)
@@ -109,4 +99,34 @@ func TestBucketedSubjectsGoOverTheBucketNotTheControlConnection(t *testing.T) {
 	if err := d.UseBuckets(append(buckets[:lib.DispatcherBuckets-1:lib.DispatcherBuckets-1], nil)); err == nil {
 		t.Error("UseBuckets took a nil connection")
 	}
+}
+
+// connectBuckets connects one client per bucket, each on its own grant
+// switch set to user, in parallel: 32 dials one after another can outlast a
+// loaded machine's dial timeout.
+func connectBuckets(b *bus, user string) ([]*grantSwitch, []*lib.Client) {
+	b.t.Helper()
+	switches := make([]*grantSwitch, lib.DispatcherBuckets)
+	buckets := make([]*lib.Client, lib.DispatcherBuckets)
+	errs := make([]error, lib.DispatcherBuckets)
+	var wg sync.WaitGroup
+	for i := range buckets {
+		switches[i] = &grantSwitch{}
+		switches[i].set(user)
+		wg.Add(1)
+		go func(i int) { // no t.Fatal off the test goroutine: errors come back
+			defer wg.Done()
+			g := switches[i]
+			buckets[i], errs[i] = lib.Connect(b.ctx, b.url, lib.WithName("dispatcher"), lib.WithLogger(quietLog()),
+				lib.WithNATSOptions(nats.UserInfoHandler(func() (string, string) { return g.user.Load().(string), dispPass })))
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			b.t.Fatalf("bucket %d connect: %v", i, err)
+		}
+		b.t.Cleanup(buckets[i].Close)
+	}
+	return switches, buckets
 }

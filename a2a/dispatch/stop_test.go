@@ -373,7 +373,7 @@ func TestAMissingStopStreamIsReported(t *testing.T) {
 	}
 	withStopStream(t, b)
 	d.mu.Lock()
-	d.stopReadRetry = time.Time{} // past the backoff
+	d.stopReadRetry = nil // past the backoff
 	d.mu.Unlock()
 	b.submit("tse", "read", lib.SubmitKindTop, "task-2")
 	b.waitTerminal("task-2", 10*time.Second)
@@ -535,7 +535,7 @@ func TestAClosedConnectionDoesNotBackTheStopStreamOff(t *testing.T) {
 	if d.stopRequested(context.Background(), quietLog(), "tse", "task-1") {
 		t.Fatal("a stop read on a closed connection reported a stop")
 	}
-	if d.stopStreamErr != "" || !d.stopReadRetry.IsZero() {
+	if d.stopStreamErr != "" || len(d.stopReadRetry) != 0 {
 		t.Errorf("stop stream error %q, retry at %v; want neither for a closed connection", d.stopStreamErr, d.stopReadRetry)
 	}
 }

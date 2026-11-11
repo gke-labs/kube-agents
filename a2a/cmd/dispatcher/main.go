@@ -57,8 +57,9 @@ const (
 	// dispatcher's identity-map entry narrowed on "dispatcher" (#5381): the
 	// callout then grants the per-profile subjects only on bucket
 	// connections, and this process opens lib.DispatcherBuckets of them
-	// beside its control connection. Only the exact string turns it on, as
-	// on the operator.
+	// beside its control connection. Only the exact string turns it on here;
+	// the operator renders exactly "true" or "false" (it reads anything but
+	// "false" as on).
 	envBucketedGrants = "A2A_DISPATCHER_BUCKETED_GRANTS"
 
 	// configWait bounds the wait for the first config at startup: past it
@@ -319,17 +320,23 @@ func serve(ctx context.Context, log *slog.Logger, s settings, kube kubernetes.In
 // connectBuckets opens the bucket connections when the grants are bucketed,
 // in bucket order, each named for its bucket; nil, nil when they aren't. On
 // an error it returns the ones it opened, for the caller to close.
+//
+// Each connection retries in the background (RetryOnFailedConnect) instead
+// of being waited for here: a bucket the callout refuses (its mint over the
+// reply cap, a bad entry) must stop only that bucket's profiles, as it does at
+// runtime, not hold the whole process before Run. Ready still needs every
+// connection up, so a bucket that never connects is visible, not silent.
 func connectBuckets(ctx context.Context, log *slog.Logger, s settings) ([]*lib.Client, error) {
 	if s.bucketAuth == nil {
 		return nil, nil
 	}
 	var out []*lib.Client
 	for b, auth := range s.bucketAuth {
-		c, err := connectWithRetry(ctx, log, dialBackoff, func(ctx context.Context) (*lib.Client, error) {
-			return lib.Connect(ctx, s.natsURL, lib.WithName(fmt.Sprintf("%s-b%d", clientName, b)), lib.WithLogger(log),
-				lib.WithAgreementPolicy(lib.AgreementPolicy{Submitter: dispatch.DefaultSubmitter}),
-				lib.WithNATSOptions(append(auth, nats.ReconnectWait(reconnectWait), nats.ReconnectJitter(reconnectJitter, reconnectJitter))...))
-		})
+		opts := append(append([]nats.Option{}, auth...),
+			nats.RetryOnFailedConnect(true), nats.ReconnectWait(reconnectWait), nats.ReconnectJitter(reconnectJitter, reconnectJitter))
+		c, err := lib.Connect(ctx, s.natsURL, lib.WithName(fmt.Sprintf("%s-b%d", clientName, b)), lib.WithLogger(log),
+			lib.WithAgreementPolicy(lib.AgreementPolicy{Submitter: dispatch.DefaultSubmitter}),
+			lib.WithNATSOptions(opts...))
 		if err != nil {
 			return out, fmt.Errorf("bucket %d: %w", b, err)
 		}

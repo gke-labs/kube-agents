@@ -217,7 +217,8 @@ func (d *Dispatcher) stopRequested(ctx context.Context, log *slog.Logger, profil
 	}
 	now := d.now()
 	d.mu.Lock()
-	backingOff := now.Before(d.stopReadRetry)
+	slot := d.slotOf(profile)
+	backingOff := now.Before(d.stopReadRetry[slot])
 	d.mu.Unlock()
 	if backingOff {
 		return false
@@ -234,13 +235,13 @@ func (d *Dispatcher) stopRequested(ctx context.Context, log *slog.Logger, profil
 		log.Debug("the stop stream read found the connection unready; reading again next time", "err", err)
 		return false
 	case err != nil:
-		d.stopStreamFailed(log, err.Error())
+		d.stopStreamFailed(log, slot, err.Error())
 		return false
 	case msg.Header.Get("Status") != "":
 		// 404: no record for the task; anything else (503: no stream) is
 		// an error status, read as no stop.
 		if s := msg.Header.Get("Status"); s != "404" {
-			d.stopStreamFailed(log, "status "+s+" "+msg.Header.Get("Description"))
+			d.stopStreamFailed(log, slot, "status "+s+" "+msg.Header.Get("Description"))
 			return false
 		}
 	default:
@@ -261,10 +262,13 @@ const stopReadBackoff = 30 * time.Second
 // stopStreamFailed records a failed read of the stop stream: reported in
 // Health and logged as an error, since every stop published while it lasts
 // is missed by any dispatcher that didn't hear it live.
-func (d *Dispatcher) stopStreamFailed(log *slog.Logger, why string) {
+func (d *Dispatcher) stopStreamFailed(log *slog.Logger, slot int, why string) {
 	d.mu.Lock()
 	first := d.stopStreamErr == ""
-	d.stopStreamErr, d.stopReadRetry = why, d.now().Add(stopReadBackoff)
+	if d.stopReadRetry == nil {
+		d.stopReadRetry = map[int]time.Time{}
+	}
+	d.stopStreamErr, d.stopReadRetry[slot] = why, d.now().Add(stopReadBackoff)
 	d.mu.Unlock()
 	if first {
 		log.Error("cannot read the stop stream; queued tasks are taken as not stopped, and a stop is honoured only if heard live",

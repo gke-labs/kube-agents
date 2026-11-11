@@ -248,9 +248,11 @@ type Dispatcher struct {
 	stopSubs map[string]lib.Subscription
 	stopped  map[string]time.Time
 	// stopStreamErr is why the last read of the stop stream failed ("" once
-	// one succeeds), and stopReadRetry when to read it again (stop.go).
+	// one succeeds), and stopReadRetry when each connection slot may read it
+	// again (stop.go): per slot, so one bucket's failed read holds back no
+	// other bucket's catch-up.
 	stopStreamErr string
-	stopReadRetry time.Time
+	stopReadRetry map[int]time.Time
 	// jobAdmissionErr is the last refusal of a Job by the admission
 	// policy, "" once one is admitted (job.go).
 	jobAdmissionErr string
@@ -273,6 +275,9 @@ type regrantSlot struct {
 // bus keeps the rest. Call it before Run, with exactly lib.DispatcherBuckets
 // connected clients in bucket order.
 func (d *Dispatcher) UseBuckets(clients []*lib.Client) error {
+	if d.running.Load() {
+		return errors.New("dispatch: UseBuckets after Run")
+	}
 	if len(clients) != lib.DispatcherBuckets {
 		return fmt.Errorf("dispatch: %d bucket connections, want %d", len(clients), lib.DispatcherBuckets)
 	}

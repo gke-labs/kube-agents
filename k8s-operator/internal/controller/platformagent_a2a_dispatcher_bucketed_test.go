@@ -75,7 +75,7 @@ func TestBucketedGrantsRenderTheFixedSetAndTheDrainingNames(t *testing.T) {
 	checkFixture(t, dispatcherMapBucketedFixturePath, shards[0].Data[a2aAuthMapKey])
 }
 
-// Bucketed grants are on by default (#5381's second PR). Only "false" turns
+// Bucketed grants are on by default (#5381). Only "false" turns
 // them off, which restores today's entry; any other value, unset included, is
 // on. The dispatcher's own Deployment carries the same switch.
 func TestBucketedGrantsAreOnUnlessFalse(t *testing.T) {
