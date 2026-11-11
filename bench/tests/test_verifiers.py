@@ -812,6 +812,51 @@ def test_worker_commands_absolute_local_git_is_not_the_bare_name():
     assert v.verify(5.0).status == "pass"
 
 
+def test_tool_called_on_the_workers_grades_zero_calls_on_the_no_worker_calls_entry():
+    """#5371: with the harness's no-worker-calls entry and no tagged entry,
+    a workers-scope check grades zero calls (a required call fails, a
+    forbidden one passes) instead of erroring as unobservable."""
+    from kube_agents_bench import worker_trajectory
+
+    marker = worker_trajectory.no_worker_calls_entry(["t_1"])
+    transcript.set("ok", [{"name": "kanban_create"}, marker], final_message="ok", started_at=1.0)
+    try:
+        required = ToolCalledVerifier(type="tool_called", tool_names=["kanban_complete"], scope="workers").verify(5.0)
+    finally:
+        transcript.clear()
+    assert required.status == "fail", required.reason
+    transcript.set("ok", [{"name": "kanban_create"}], final_message="ok", started_at=1.0)
+    try:
+        unobserved = ToolCalledVerifier(type="tool_called", tool_names=["kanban_complete"], scope="workers").verify(5.0)
+    finally:
+        transcript.clear()
+    assert unobserved.status == "error"
+    # A capture gap beside the entry still leaves the workers unobservable.
+    gap = worker_trajectory.gap_entry(["session store for cluster-a: locked"])
+    transcript.set("ok", [{"name": "kanban_create"}, marker, gap], final_message="ok", started_at=1.0)
+    try:
+        gapped = ToolCalledVerifier(type="tool_called", tool_names=["kanban_complete"], scope="workers").verify(5.0)
+    finally:
+        transcript.clear()
+    assert gapped.status == "error"
+    # A result pattern is not graded beside the entry, on either transport (the scorer sets it aside).
+    transcript.set("ok", [{"name": "kanban_create"}, marker], final_message="ok", started_at=1.0)
+    try:
+        with_result = ToolCalledVerifier(
+            type="tool_called", tool_names=["kanban_complete"], scope="workers", result="done"
+        ).verify(5.0)
+    finally:
+        transcript.clear()
+    assert with_result.status == "error"
+    # The ``all`` scope reads the router's calls too, which the entry does not speak for.
+    transcript.set("ok", [{"name": "kanban_create"}, marker], final_message="ok", started_at=1.0)
+    try:
+        both = ToolCalledVerifier(type="tool_called", tool_names=["kanban_complete"], scope="all").verify(5.0)
+    finally:
+        transcript.clear()
+    assert both.status == "error"
+
+
 def test_worker_commands_missing_required_fails_and_counts():
     _stash_commands(["cat README.md"])
     v = WorkerCommandsVerifier(type="worker_commands", required_patterns=[r"vcs\.py"])
