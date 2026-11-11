@@ -2668,7 +2668,7 @@ func a2aNATSRoutesName(agent *agentv1alpha1.PlatformAgent) string {
 func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret, keys *a2aCalloutKeys, profiles []string) *corev1.Secret {
 	conf := renderA2ANATSConf(agent, func(key string) string { return string(creds.Data[key]) }, keys, profiles)
 
-	return &corev1.Secret{
+	secret := &corev1.Secret{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      a2aNATSConfigSecretName(agent),
@@ -2677,6 +2677,10 @@ func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.
 		},
 		Data: map[string][]byte{a2aNATSConfKey: []byte(conf)},
 	}
+	// The profiles this config carries, for the single server's loaded set
+	// (a2aServerLoadedProfiles).
+	secret.Annotations = map[string]string{a2aConfigProfilesAnnotation: encodeA2AConfigProfiles(profiles)}
+	return secret
 }
 
 // a2aConfigRolloutHash is the digest that rides the StatefulSet pod template
@@ -6531,6 +6535,10 @@ type a2aProvisionState struct {
 	// busReloadRequeue is when to check again on a bus config reload still
 	// pending (planA2ABusReload). Zero when none is.
 	busReloadRequeue time.Duration
+	// profileHoldRequeue is when to check again on a newly bound profile
+	// held until every bus server has loaded its config
+	// (a2aDispatchableProfiles). Zero when none is held.
+	profileHoldRequeue time.Duration
 	// gatewayElected is the image the pod holding the gateway's Lease runs,
 	// as this pass read it, or nil when it couldn't tell
 	// (observeA2AGatewayElection). The status writers carry it as the
@@ -6759,7 +6767,22 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	if err != nil {
 		return state, err
 	}
-	authMaps, authMapVersion, err := buildA2AAuthMapConfigMaps(agent, profiles, draining)
+	// The profiles the dispatcher may take: a newly bound one waits until
+	// every bus server has loaded its config entry, the gateway's deny on its
+	// supervisor subjects (platformagent_a2a_profile_hold.go). The bus config
+	// below carries every bound profile; the dispatcher's grant here and its
+	// dispatch config carry only these. While any waits, the pass looks again
+	// at the reload's recheck.
+	dispatchable, held, err := r.a2aDispatchableProfiles(ctx, agent, profiles)
+	if err != nil {
+		return state, err
+	}
+	if len(held) > 0 {
+		state.profileHoldRequeue = a2aBusReloadRecheck
+		logf.FromContext(ctx).Info("holding newly bound AgentProfiles out of the dispatcher until every A2A bus server has loaded their config",
+			"profiles", held)
+	}
+	authMaps, authMapVersion, err := buildA2AAuthMapConfigMapsHeld(agent, profiles, dispatchable, draining)
 	if err != nil {
 		return state, fmt.Errorf("failed to render the A2A identity map: %w", err)
 	}
@@ -6823,6 +6846,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// onto it (a2aConfigRolloutHash).
 	profileNames, _ := dispatcherGrantNames(agent, profiles, draining)
 	sts := buildA2ANATSStatefulSet(agent, a2aConfigRolloutHash(agent, creds, calloutKeys, natsTLS.ServingFingerprint, profileNames))
+	annotateA2ABusProfiles(agent, sts, profileNames)
 	busHeld, err := r.a2aBusWaitsForCallout(ctx, agent, sts, calloutGeneration)
 	if err != nil {
 		return state, err
@@ -6838,6 +6862,9 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 			return state, err
 		}
 		if err := r.actOnA2ABusReload(ctx, agent, sts.Name, reload); err != nil {
+			return state, err
+		}
+		if err := r.stampA2ABusPreviousProfiles(ctx, agent, config); err != nil {
 			return state, err
 		}
 		if err := ctrl.SetControllerReference(agent, config, r.Scheme); err != nil {
@@ -6983,7 +7010,8 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// The dispatcher (platformagent_a2a_dispatcher.go), when this operator
 	// has an image for it. Its pod-read Role lives in the profile namespace,
 	// and a failure there follows the same rule as the quota's.
-	jobMode, dispatcherProfileErr, err := r.reconcileA2ADispatcherWithJobMode(ctx, agent, profiles, profileFenced, draining)
+	// It takes the profiles every bus server has loaded (dispatchable, above).
+	jobMode, dispatcherProfileErr, err := r.reconcileA2ADispatcherWithJobMode(ctx, agent, dispatchable, profileFenced, draining)
 	state.dispatcherJobMode = jobMode
 	if err != nil {
 		return state, err

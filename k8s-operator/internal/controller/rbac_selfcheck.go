@@ -139,6 +139,9 @@ var requiredPermissions = []requiredPermission{
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentprofiles/finalizers"}, Verbs: []string{"update"}},
 	{Group: "apps", Resources: []string{"deployments", "statefulsets"}, Verbs: rbacWriteVerbs},
 	{Group: "apps", Resources: []string{"daemonsets", "replicasets"}, Verbs: rbacReadVerbs},
+	// The bus StatefulSet's revisions: which profiles every server has
+	// loaded (a2aClusterLoadedProfiles).
+	{Group: "apps", Resources: []string{"controllerrevisions"}, Verbs: []string{"get"}},
 	{Group: "", Resources: []string{"serviceaccounts", "persistentvolumeclaims", "configmaps", "services", "pods"}, Verbs: rbacWriteVerbs},
 	{Group: "", Resources: []string{"namespaces", "nodes", "persistentvolumes", "limitranges", "endpoints", "pods/log"}, Verbs: rbacReadVerbs},
 	// events: read with the rest, plus create and patch for the Recorder's

@@ -117,6 +117,7 @@ type AgentProfileReconciler struct {
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentprofiles,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentprofiles/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentprofiles/finalizers,verbs=update
+// +kubebuilder:rbac:groups=apps,resources=controllerrevisions,verbs=get
 
 // Reconcile renders one profile.
 func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -255,6 +256,21 @@ func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		case err != nil:
 			return ctrl.Result{}, err
 		}
+	}
+
+	// A newly bound profile's card waits until every bus server has loaded
+	// its config entry, as the dispatcher's config does
+	// (platformagent_a2a_profile_hold.go): the gateway routes by the card.
+	held, err := r.agentProfileCardHeld(ctx, agent, &profile)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if held {
+		msg := "the A2A bus is loading this profile's config on every server; the card is published once it has"
+		if err := r.writeStatus(ctx, &profile, agent, resolution.serviceAccountList(), idReason, idMsg, reasonAgentProfileBusConfigPending, msg, idReason == reasonAgentProfileRendered); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: a2aBusReloadRecheck}, nil
 	}
 
 	cardReason, cardMsg, busErr := r.publishCard(ctx, agent, &profile)
