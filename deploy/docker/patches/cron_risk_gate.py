@@ -308,6 +308,9 @@ _TOOL_READ_VERBS = {
         # The leaf verbs the broker's read allowlist admits for the GCE fleet
         # and networking reads; a cron prompt that spells them is a read here too.
         "get-serial-port-output", "get-status", "list-nodes",
+        # The leaf verbs of the `storage` reads the broker admits (`storage
+        # ls`, `cat`, `du`); `objects`/`buckets` end in list/describe.
+        "ls", "cat", "du",
     },
     "gh": {"view", "list", "status", "diff"},
     "helm": {"list", "get", "status", "history", "show", "search", "version"},
@@ -315,11 +318,22 @@ _TOOL_READ_VERBS = {
     "bq": {"ls", "show", "head"},
 }
 
+# The broker's gcloud tables, read paths and flag arities alike, so a cron
+# prompt is classified by the same spellings the broker will execute: a flag
+# the broker learns is a flag this gate learns, with no second copy to drift.
 try:
-    from tools.command_policy import GCLOUD_READ_COMMANDS
+    from tools.command_policy import (
+        GCLOUD_READ_COMMANDS,
+        _GCLOUD_BOOLEAN_FLAGS as _BROKER_GCLOUD_BOOLEAN_FLAGS,
+        _GCLOUD_FLAGS_WITH_VALUE as _BROKER_GCLOUD_FLAGS_WITH_VALUE,
+    )
 except ImportError:
     try:
-        from command_policy import GCLOUD_READ_COMMANDS
+        from command_policy import (
+            GCLOUD_READ_COMMANDS,
+            _GCLOUD_BOOLEAN_FLAGS as _BROKER_GCLOUD_BOOLEAN_FLAGS,
+            _GCLOUD_FLAGS_WITH_VALUE as _BROKER_GCLOUD_FLAGS_WITH_VALUE,
+        )
     except ImportError:
         import sys
         from pathlib import Path
@@ -331,9 +345,19 @@ except ImportError:
             if _p.is_dir() and str(_p) not in sys.path:
                 sys.path.insert(0, str(_p))
         try:
-            from command_policy import GCLOUD_READ_COMMANDS
+            from command_policy import (
+                GCLOUD_READ_COMMANDS,
+                _GCLOUD_BOOLEAN_FLAGS as _BROKER_GCLOUD_BOOLEAN_FLAGS,
+                _GCLOUD_FLAGS_WITH_VALUE as _BROKER_GCLOUD_FLAGS_WITH_VALUE,
+            )
         except ImportError:
             GCLOUD_READ_COMMANDS = frozenset()
+            _BROKER_GCLOUD_BOOLEAN_FLAGS = frozenset()
+            _BROKER_GCLOUD_FLAGS_WITH_VALUE = frozenset()
+
+_TOOL_FLAGS_WITH_VALUE["gcloud"] = _TOOL_FLAGS_WITH_VALUE["gcloud"] | _BROKER_GCLOUD_FLAGS_WITH_VALUE
+#: The boolean flags the gcloud branch steps over: the shared set plus the broker's.
+_GCLOUD_KNOWN_BOOLEAN_FLAGS = _KNOWN_BOOLEAN_FLAGS | _BROKER_GCLOUD_BOOLEAN_FLAGS
 
 # Include compute instances reads if not already present in GCLOUD_READ_COMMANDS
 _CRON_GCLOUD_READ_COMMANDS = GCLOUD_READ_COMMANDS | frozenset({
@@ -639,17 +663,18 @@ def _segment_is_read_only(tokens: list[str]) -> bool:
 
     rest = cleaned[1:]
     flags_with_val = _TOOL_FLAGS_WITH_VALUE.get(exe, frozenset())
-    cmd, subcmd, flags, positionals, amb_flag = _extract_command_and_subcommand(rest, flags_with_val)
+    known_booleans = _GCLOUD_KNOWN_BOOLEAN_FLAGS if exe == "gcloud" else _KNOWN_BOOLEAN_FLAGS
+    cmd, subcmd, flags, positionals, amb_flag = _extract_command_and_subcommand(rest, flags_with_val, known_booleans)
 
     if amb_flag is None:
         return _evaluate_command_tokens(exe, cmd, subcmd, flags, positionals)
 
     # Dual-hypothesis evaluation: test ambiguous flag as value-taking and as boolean
     cmd_v, subcmd_v, flags_v, pos_v, amb_v = _extract_command_and_subcommand(
-        rest, flags_with_val | {amb_flag}
+        rest, flags_with_val | {amb_flag}, known_booleans
     )
     cmd_b, subcmd_b, flags_b, pos_b, amb_b = _extract_command_and_subcommand(
-        rest, flags_with_val, _KNOWN_BOOLEAN_FLAGS | {amb_flag}
+        rest, flags_with_val, known_booleans | {amb_flag}
     )
     if amb_v is not None or amb_b is not None:
         # Multiple cascading ambiguous flags: fail closed

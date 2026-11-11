@@ -604,6 +604,36 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         ("projects", "describe"),
         ("projects", "get-iam-policy"),
         ("projects", "list"),
+        # Cloud Storage reads: the first bucket access the Platform Agent's
+        # sandbox has had (a confined profile task is refused them: `storage`
+        # is a projectless surface in task_confinement.py).
+        # The sandbox image never shipped the legacy storage client, so the
+        # only expression of a storage read set was the cron gate's table for
+        # it -- ls, stat, cat, du, hash, version. These are its bucket reads as gcloud spells
+        # it, less `hash`, and nothing more: `cp`, `mv`, `rm`, `rsync`,
+        # `sign-url`, and every `buckets`, `objects` and `managed-folders`
+        # write stay refused, and the tests hold that door. `hash` is out
+        # because it also reads local files, and the command runs in the
+        # sidecar: `hash /etc/host*` would have enumerated and fingerprinted
+        # the container holding the credentials from the sandbox. The same
+        # risk is why every positional of these reads has to be a cloud URL
+        # (_STORAGE_CLOUD_URL_PREFIX below): gcloud refuses a local path on
+        # the others today, and this module does not lean on that staying so.
+        # The reads run on the agent's own identity, so what they reach is the
+        # storage grant it holds: the `read-only` set's `roles/iam.securityReviewer`
+        # lists buckets and object names (`ls`, `du`, `buckets list`, `objects
+        # list`), and `cat`, `objects describe` and `buckets describe` need
+        # `storage.objects.get` or `storage.buckets.get`, which no built-in
+        # set carries, so on a stock install they are admitted here and
+        # refused by IAM (site reference/security-and-iam.md, "Local State
+        # Security").
+        ("storage", "buckets", "describe"),
+        ("storage", "buckets", "list"),
+        ("storage", "cat"),
+        ("storage", "du"),
+        ("storage", "ls"),
+        ("storage", "objects", "describe"),
+        ("storage", "objects", "list"),
         ("version",),
     }
 )
@@ -680,6 +710,13 @@ _GCLOUD_FLAGS_WITH_VALUE = frozenset(
         "--accelerator-type", "--serving-stack", "--serving-stack-version",
         "--target-itl-milliseconds", "--target-ntpot-milliseconds",
         "--target-ttft-milliseconds", "--use-case", "--namespace", "--output",
+        # The valued flags of the `storage` reads, from their synopses: `cat
+        # --range`, `du --exclude-name-pattern`, and the `ls`/`objects list`
+        # selectors. Deliberately absent, so each refuses the command as
+        # unreadable: --exclude-name-pattern-file (reads a file the caller
+        # names in the sidecar), --additional-headers and --decryption-keys
+        # (shape the request itself; no shipped read needs either).
+        "--range", "--exclude-name-pattern", "--metadata-filter", "--next-page-token",
     }
 )
 
@@ -698,6 +735,12 @@ _GCLOUD_FILE_WRITE_FLAGS = frozenset({"--output-path", "--log-http-log-file"})
 # behind the broker enumerate every resource type in a container's asset index across
 # every project the operator granted `roles/cloudasset.viewer` on.
 _ASSET_SEARCH_VERB = ("asset", "search-all-resources")
+
+# The `storage` reads take cloud URLs and run in the sidecar, so a positional
+# that is not one would name a path in the container holding the credentials.
+# `ls` and `buckets list` may run with no positional; they then list the project.
+_STORAGE_SURFACE = "storage"
+_STORAGE_CLOUD_URL_PREFIX = "gs://"
 _ASSET_SEARCH_TYPE_FLAG = "--asset-types"
 _ASSET_SEARCH_REQUIRED_TYPE = "container.googleapis.com/Cluster"
 
@@ -739,6 +782,24 @@ _GCLOUD_BOOLEAN_FLAGS = frozenset(
         # a placeholder, and the fleet-waste collector that follows this change
         # emits it.
         "--global",
+        # The boolean flags of the `storage` reads, from their synopses. Two
+        # short spellings take a value on one read and none on another (`-r`
+        # is `--recursive` on `ls`, `--readable-sizes` on `du` and `--range
+        # RANGE` on `cat`; `-e` is `--etag` on `ls` and `--exclude-name-pattern
+        # PATTERN` on `du`). Both are listed as boolean: on the valued read the
+        # detached value becomes a positional, which the cloud-URL check
+        # refuses, and a value that is itself a cloud URL is one this module
+        # admits anyway. Neither reading reaches a local path.
+        # `--read-paths-from-stdin`/`-I` is left out: it moves the paths off
+        # the argv, where the cloud-URL check reads them, so it refuses the
+        # command as unreadable like any flag this module does not list.
+        "--all-versions", "-a", "--buckets", "-b", "--etag", "-e", "--exhaustive",
+        "--fetch-encrypted-object-hashes",
+        "--readable-sizes", "--recursive", "-R", "-r", "--soft-deleted",
+        "--full", "-L", "--json", "-j", "--long", "-l",
+        "--display-url", "-d",
+        "--summarize", "-s", "--total", "-c", "--zero-terminator", "-0",
+        "--raw", "--stat", "--uri",
     }
 )
 
@@ -996,6 +1057,12 @@ def _asset_search_type(argv: list[str]) -> str | None:
     return values[0] if len(values) == 1 else None
 
 
+def _storage_positionals(words: list[str]) -> list[str]:
+    """The words after the listed read a storage argv matches; the caller has
+    already established that it matches one."""
+    return words[_gcloud_read_length(words) or 0:]
+
+
 def _gcloud_verb_tuple(words: list[str]) -> tuple[str, ...]:
     """The surface words a refusal names: three past a release track, a fourth when it is a
     write verb that sits that deep (``compute instance-groups managed resize``)."""
@@ -1129,9 +1196,16 @@ def _gcloud_is_read_only(words: list[str]) -> bool:
     # process also carries the Chat relay and the Slack socket client, and
     # policy evaluation has no timeout around it (timeout_seconds bounds the
     # subprocess, which a refusal never reaches).
+    return _gcloud_read_length(words) is not None
+
+
+def _gcloud_read_length(words: list[str]) -> int | None:
+    """How many leading words spell a listed read, or None when none does."""
     longest = min(len(words), _LONGEST_GCLOUD_COMMAND)
-    return any(tuple(words[:length]) in GCLOUD_READ_COMMANDS
-               for length in range(1, longest + 1))
+    for length in range(1, longest + 1):
+        if tuple(words[:length]) in GCLOUD_READ_COMMANDS:
+            return length
+    return None
 
 
 def _nearest_gcloud_read(words: list[str]) -> str | None:
@@ -2021,6 +2095,20 @@ def _evaluate(argv: list[str], readings: bool = True) -> Decision:
                 + (_NEAREST_READ_HINT.format(command=nearest) if nearest else ""),
                 verb_tuple=_gcloud_verb_tuple(words),
             )
+        if _gcloud_surface(words) == _STORAGE_SURFACE:
+            local = [p for p in _storage_positionals(words) if not p.startswith(_STORAGE_CLOUD_URL_PREFIX)]
+            if local:
+                return Decision(
+                    allowed=False,
+                    rule_id="gcp.storage-cloud-url-required",
+                    message=(
+                        "gcloud storage reads take cloud URLs only: every argument "
+                        f"has to start with {_STORAGE_CLOUD_URL_PREFIX}. The command runs "
+                        "in the container holding the credentials, so a local path "
+                        "would read that container, not the sandbox."
+                    ),
+                    verb_tuple=_gcloud_verb_tuple(words),
+                )
         return _ALLOWED
 
     return _ALLOWED

@@ -172,6 +172,8 @@ The mapping reaches the broker through `spec.security.scopedServiceAccountPool` 
 
 **What the pool does not cover.** It scopes `kubectl`, and only `kubectl`, through the credential broker. `gcloud` also goes through the broker but stays on the agent's own identity: it names its target in argv, and deciding scope from argv would put a parser where the boundary belongs. So does the forge work the version-control verbs ask the broker to do. The sandbox's own `git` is local and holds no credential, and there is no `gh` in it.
 
+**Cloud Storage reads.** The broker admits `gcloud storage` reads from the Platform Agent's shell sandbox (`ls`, `cat`, `du`, `buckets`/`objects` `list` and `describe`), cloud URLs only, on the agent's identity; a confined profile task is refused them. The `read-only` set's `roles/iam.securityReviewer` lists bucket and object names. `cat` and the two `describe` reads need `storage.objects.get` or `storage.buckets.get`, which no built-in set carries, so on a stock install the broker admits them and IAM refuses them. [Local State Security](#local-state-security-installenv) says what that means for the Terraform state bucket.
+
 The `gke` MCP server goes through the broker too, on the broker's own credential rather than a pool member. What bounds it is the broker's per-tool allowlist, which relays the server's read-only tools only, and then the size of that grant. What bounds `gcloud` and the forge work is the size of the agent's own grant, which is the other half of why `roles/container.viewer` was to come off it.
 
 ## Kubernetes RBAC
@@ -563,7 +565,7 @@ The install configuration written during installer execution (`install.env`) is 
 
 - **File Permissions**: State files are created with strict POSIX permissions (`umask 077` and `chmod 600`), preventing non-owner access. The `terraform.tfvars` the installer generates from it gets the same `0600` treatment, and is regenerated on every run so the two cannot disagree.
 - **`PERSIST_SECRETS_ON_DISK`**: By default (`PERSIST_SECRETS_ON_DISK=true`), credentials entered during installation are stored in `install.env` for non-interactive re-runs. Set `PERSIST_SECRETS_ON_DISK=false` to prevent writing sensitive credentials to disk.
-- **Secrets also live in Terraform state.** Every credential passed through the composition is stored in plaintext in the Terraform state, which the installer keeps in a GCS bucket (`<project>-kube-agents-tfstate`, versioned). Restrict that bucket's IAM to the administrators who may read the credentials; see the [composition README](https://github.com/gke-labs/kube-agents/tree/main/terraform/examples/full-install)'s warning.
+- **Secrets also live in Terraform state.** Every credential passed through the composition is stored in plaintext in the Terraform state, which the installer keeps in a GCS bucket (`<project>-kube-agents-tfstate`, versioned). Restrict that bucket's IAM to the administrators who may read the credentials; see the [composition README](https://github.com/gke-labs/kube-agents/tree/main/terraform/examples/full-install)'s warning. The [Cloud Storage reads the broker admits](#the-scoped-service-account-pool) list this bucket's object names on the `read-only` set; a grant of `storage.objects.get` that reaches it, direct or inherited, lets the agent read the state file.
 
 ## Where to go next
 

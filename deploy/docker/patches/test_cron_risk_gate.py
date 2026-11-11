@@ -252,6 +252,8 @@ class CronRiskGateTest(unittest.TestCase):
             "helm uninstall my-release",
             "helm uninstall list",
             "helm --post-renderer list uninstall my-release",
+            "gcloud storage objects delete gs://bucket/obj",
+            "gcloud storage buckets delete gs://bucket",
             "gcloud compute instances delete prod",
             "gcloud compute instances DELETE prod",
             'gcloud compute instances delete foo --filter="status=list"',
@@ -270,6 +272,8 @@ class CronRiskGateTest(unittest.TestCase):
             "bq ls",
             "helm list",
             "helm get values my-release",
+            "gcloud storage ls gs://bucket",
+            "gcloud storage objects describe gs://bucket/obj",
             "gcloud compute instances list",
             "gcloud container clusters describe prod",
         ):
@@ -726,6 +730,9 @@ class CronRiskGateTest(unittest.TestCase):
             "helm search repo nginx",
             "helm version",
             "bq head -n 10 my_dataset.my_table",
+            "gcloud storage ls -l gs://my-bucket/prefix/",
+            "gcloud storage du --summarize --readable-sizes gs://my-bucket",
+            "gcloud storage buckets list",
         ]
         for cmd in allowed:
             with self.subTest(cmd=cmd):
@@ -756,6 +763,15 @@ class CronRiskGateTest(unittest.TestCase):
             "bq extract my_dataset.my_table gs://bucket/data.csv",
             "bq rm show",
             "bq mk ls",
+            "gcloud storage mv gs://my-bucket/file1 gs://my-bucket/file2",
+            "gcloud storage rsync --recursive /local gs://my-bucket/",
+            "gcloud storage buckets update --default-storage-class=NEARLINE gs://my-bucket",
+            "gcloud storage buckets add-iam-policy-binding gs://my-bucket --member=allUsers --role=roles/storage.objectViewer",
+            "gcloud storage objects update --predefined-acl=publicRead gs://my-bucket/file.txt",
+            "gcloud storage rm ls",
+            "gcloud storage cp file ls",
+            "gcloud storage objects delete describe",
+            "gcloud storage buckets delete list",
         ]
         for cmd in refused:
             with self.subTest(cmd=cmd):
@@ -1050,12 +1066,24 @@ class CronRiskGateTest(unittest.TestCase):
                 self.assertIsNotNone(block, f"{cmd} must be refused under high risk")
                 self.assertFalse(block["approved"])
 
-    def test_bq_deep_operations(self):
+    def test_bq_and_cloud_storage_deep_operations(self):
         allowed = [
             "bq ls -j",
             "bq ls -p my-project",
             "bq show --format=prettyjson my_dataset.table1",
             "bq head -n 25 my_dataset.table1",
+            "gcloud storage ls --recursive gs://my-bucket/dir/",
+            "gcloud storage ls -r -L gs://my-bucket/dir/",
+            "gcloud storage objects describe gs://my-bucket/data/file.json",
+            "gcloud storage objects list gs://my-bucket/data/** --raw",
+            "gcloud storage cat --range=0-1023 gs://my-bucket/report.txt",
+            "gcloud storage cat --range 0-1023 gs://my-bucket/report.txt",
+            "gcloud storage du --total --readable-sizes gs://my-bucket/logs/",
+            "gcloud storage du --exclude-name-pattern=.*tmp$ gs://my-bucket/logs/",
+            "gcloud storage buckets describe gs://my-bucket --raw",
+            # An unknown flag ahead of a broker boolean: the second parse keeps
+            # the broker's booleans, so one unknown flag stays one.
+            "gcloud storage ls --new-flag --long gs://my-bucket",
         ]
         for cmd in allowed:
             with self.subTest(cmd=cmd):
@@ -1073,6 +1101,20 @@ class CronRiskGateTest(unittest.TestCase):
             "bq rm ls",
             "bq mk head",
             "bq load show gs://b/f.csv",
+            "gcloud storage rm --recursive gs://my-bucket/logs/",
+            "gcloud storage cp /dev/null gs://my-bucket/deleted",
+            "gcloud storage mv gs://my-bucket/a gs://my-bucket/b",
+            "gcloud storage objects update --content-type=text/plain gs://my-bucket/file",
+            "gcloud storage objects update --predefined-acl=private gs://my-bucket/file",
+            "gcloud storage objects compose gs://my-bucket/a gs://my-bucket/b gs://my-bucket/c",
+            "gcloud storage buckets update --lifecycle-file=lc.json gs://my-bucket",
+            "gcloud storage buckets update --cors-file=cors.json gs://my-bucket",
+            "gcloud storage buckets notifications create --topic=top1 gs://my-bucket",
+            "gcloud storage sign-url gs://my-bucket/file",
+            "gcloud storage rm ls",
+            "gcloud storage rm cat",
+            "gcloud storage cp src ls",
+            "gcloud storage mv src ls",
         ]
         for cmd in refused:
             with self.subTest(cmd=cmd):
@@ -1185,6 +1227,7 @@ class CronRiskGateTest(unittest.TestCase):
             "gcloud compute instances describe $(cat /tmp/target)",
             "gh issue view $(whoami)",
             "helm get values $(cat /tmp/release)",
+            "gcloud storage objects describe $(cat /tmp/uri)",
             "bq show $(cat /tmp/table)",
         ]
         for cmd in refused:
@@ -1202,6 +1245,7 @@ class CronRiskGateTest(unittest.TestCase):
             "/usr/bin/gh issue list",
             "/usr/bin/helm list",
             "/usr/bin/bq ls",
+            "/usr/bin/gcloud storage ls gs://my-bucket",
             "/usr/bin/jq . /tmp/data.json",
             "/bin/cat /etc/os-release",
             "/bin/grep error /var/log/syslog",
@@ -1685,6 +1729,7 @@ class CronRiskGateTest(unittest.TestCase):
             "gcloud compute instances delete vm1 --dry-run",
             "helm uninstall my-release --dry-run",
             "gh issue close 123 --dry-run",
+            "gcloud storage rm --recursive gs://bucket --dry-run",
             "bq rm -f dataset.table --dry-run",
         ]
         for cmd in refused:

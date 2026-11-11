@@ -1137,7 +1137,7 @@ tier default fail-closed to `"high"` under `cron_run_scope.py` and `cron_risk_ga
 - `"high"`: Workloads with broad operational authority or untrusted input sources (such as
   `github-repo-watcher`), as well as unannotated dispatches. For agentic (prompt-driven) jobs,
   this applies a fail-closed read-only command policy (`cron_command_policy_block`): every command
-  segment must be an allowlisted inspection command (`kubectl get/describe/logs/top`, `gcloud … list/describe`,
+  segment must be an allowlisted inspection command (`kubectl get/describe/logs/top`, `gcloud … list/describe` and the `gcloud storage` reads the credential broker admits,
   read-only text utilities, `--dry-run` validations); mutating, unknown, or unanalyzable commands
   are refused while the run continues. For `no_agent: true` jobs like `github-repo-watcher`, there is
   no agent loop and therefore no tool-approval surface to gate; `"high"` is a threat classification of

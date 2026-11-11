@@ -2922,5 +2922,129 @@ class TheDeletionSectionStaysInsideThePolicy(unittest.TestCase):
         self.assertNotRegex(self._section(), r"kube-agents\.x-k8s\.io/|state: deleted")
 
 
+class CloudStorageReadsTest(unittest.TestCase):
+    """The Cloud Storage reads the broker admits, and the writes it does not.
+
+    The sandbox never had a route to a bucket; the cron gate's read table for
+    the legacy client -- ls, stat, cat, du, hash -- was the only storage read
+    set anywhere. These are those reads less `hash`, spelled as gcloud spells
+    them, with the flags each read's synopsis carries. Every other `gcloud
+    storage` verb, the writes and the reads alike (`hash`, `buckets
+    get-iam-policy`, `hmac list`, `operations list`), stays refused, and so is
+    any positional that is not a cloud URL: the command runs in the sidecar.
+    """
+
+    def test_the_storage_reads_are_allowed_with_their_flags(self):
+        for argv in (
+            ["gcloud", "storage", "ls"],
+            ["gcloud", "storage", "ls", "gs://fleet-logs"],
+            ["gcloud", "storage", "ls", "--recursive", "--long", "gs://fleet-logs/prefix/"],
+            ["gcloud", "storage", "ls", "-R", "-l", "gs://fleet-logs/prefix/"],
+            ["gcloud", "storage", "ls", "-r", "-e", "gs://fleet-logs/prefix/"],
+            ["gcloud", "storage", "ls", "-b", "-j", "-L", "-0", "gs://fleet-logs"],
+            ["gcloud", "storage", "cat", "gs://fleet-logs/report.txt", "-d"],
+            ["gcloud", "storage", "du", "-r", "gs://fleet-logs"],
+            ["gcloud", "storage", "ls", "--full", "--all-versions", "--buckets", "--etag", "gs://fleet-logs"],
+            ["gcloud", "storage", "ls", "--json", "--readable-sizes", "--soft-deleted", "--exhaustive", "gs://fleet-logs"],
+            ["gcloud", "storage", "ls", "--metadata-filter=status=ACTIVE", "--next-page-token", "abc", "gs://fleet-logs"],
+            ["gcloud", "storage", "ls", "--project=acme-fleet-host", "--format=json"],
+            ["gcloud", "storage", "cat", "gs://fleet-logs/report.txt"],
+            ["gcloud", "storage", "cat", "--range=0-1023", "--display-url", "gs://fleet-logs/report.txt"],
+            ["gcloud", "storage", "cat", "--range", "0-1023", "gs://fleet-logs/report.txt"],
+            ["gcloud", "storage", "du", "--summarize", "--readable-sizes", "--total", "gs://fleet-logs"],
+            ["gcloud", "storage", "du", "-s", "-c", "-a", "--zero-terminator", "gs://fleet-logs"],
+            ["gcloud", "storage", "du", "--exclude-name-pattern=.*\\.tmp$", "gs://fleet-logs"],
+            ["gcloud", "storage", "objects", "list", "gs://fleet-logs/**", "--raw", "--stat", "--limit=50"],
+            ["gcloud", "storage", "objects", "describe", "gs://fleet-logs/report.txt", "--raw", "--format=json"],
+            ["gcloud", "storage", "buckets", "list", "--filter=name:fleet", "--uri"],
+            ["gcloud", "storage", "buckets", "describe", "gs://fleet-logs", "--raw"],
+        ):
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertTrue(decision.allowed, (argv, decision.rule_id))
+
+    def test_the_storage_writes_are_refused(self):
+        for argv in (
+            ["gcloud", "storage", "cp", "gs://fleet-logs/report.txt", "/tmp/"],
+            ["gcloud", "storage", "cp", "/etc/hostname", "gs://fleet-logs/"],
+            ["gcloud", "storage", "mv", "gs://fleet-logs/a", "gs://fleet-logs/b"],
+            ["gcloud", "storage", "rm", "gs://fleet-logs/report.txt"],
+            ["gcloud", "storage", "rm", "--recursive", "gs://fleet-logs/"],
+            ["gcloud", "storage", "rsync", "--recursive", "/tmp", "gs://fleet-logs/"],
+            ["gcloud", "storage", "sign-url", "gs://fleet-logs/report.txt"],
+            ["gcloud", "storage", "buckets", "create", "gs://new-bucket"],
+            ["gcloud", "storage", "buckets", "delete", "gs://fleet-logs"],
+            ["gcloud", "storage", "buckets", "update", "--default-storage-class=NEARLINE", "gs://fleet-logs"],
+            ["gcloud", "storage", "buckets", "add-iam-policy-binding", "gs://fleet-logs", "--member=allUsers", "--role=roles/storage.objectViewer"],
+            ["gcloud", "storage", "buckets", "notifications", "create", "--topic=t", "gs://fleet-logs"],
+            ["gcloud", "storage", "objects", "delete", "gs://fleet-logs/report.txt"],
+            ["gcloud", "storage", "objects", "update", "--content-type=text/plain", "gs://fleet-logs/report.txt"],
+            ["gcloud", "storage", "objects", "compose", "gs://fleet-logs/a", "gs://fleet-logs/b", "gs://fleet-logs/c"],
+            ["gcloud", "storage", "managed-folders", "create", "gs://fleet-logs/folder/"],
+            # `hash` reads local files too, so it is not on the list; these
+            # three are reads the list does not carry either.
+            ["gcloud", "storage", "hash", "gs://fleet-logs/app.tar.gz"],
+            ["gcloud", "storage", "hash", "/etc/hostname"],
+            ["gcloud", "storage", "buckets", "get-iam-policy", "gs://fleet-logs"],
+            ["gcloud", "storage", "hmac", "list"],
+            ["gcloud", "storage", "operations", "list", "gs://fleet-logs"],
+            # The listed read's name as an argument of a write grants nothing.
+            ["gcloud", "storage", "rm", "ls"],
+            ["gcloud", "storage", "cp", "cat", "ls"],
+            ["gcloud", "storage"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertFalse(evaluate(argv).allowed, argv)
+
+    def test_a_storage_read_of_a_local_path_is_refused(self):
+        # The command runs in the sidecar, so a positional that is not a cloud
+        # URL names a file in the container holding the credentials. gcloud
+        # refuses these itself today; the broker does not lean on that.
+        for argv in (
+            ["gcloud", "storage", "cat", "/etc/hostname"],
+            ["gcloud", "storage", "cat", "gs://fleet-logs/a", "/etc/hostname"],
+            ["gcloud", "storage", "ls", "/etc/host*"],
+            ["gcloud", "storage", "ls", "--recursive", "/"],
+            ["gcloud", "storage", "du", "."],
+            ["gcloud", "storage", "objects", "describe", "/dev/zero"],
+            ["gcloud", "storage", "objects", "list", "file:///etc/hostname"],
+            ["gcloud", "storage", "buckets", "describe", "fleet-logs"],
+            # The two short flags that take a value on one read and none on
+            # another are listed as boolean, so the detached value is read as
+            # a positional and refused as not a cloud URL.
+            ["gcloud", "storage", "cat", "-r", "0-10", "gs://fleet-logs/a"],
+            ["gcloud", "storage", "du", "-e", ".*tmp$", "gs://fleet-logs"],
+            # Paths on stdin are paths the positional check never sees.
+            ["gcloud", "storage", "ls", "-I"],
+            ["gcloud", "storage", "ls", "--read-paths-from-stdin"],
+            ["gcloud", "storage", "cat", "--read-paths-from-stdin"],
+            ["gcloud", "storage", "objects", "list", "-I", "gs://fleet-logs"],
+        ):
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertFalse(decision.allowed, argv)
+                self.assertIn(decision.rule_id, ("gcp.storage-cloud-url-required", "gcp.unreadable-command"), argv)
+        # A storage read with no positional lists the project and is allowed.
+        self.assertTrue(evaluate(["gcloud", "storage", "ls"]).allowed)
+        self.assertTrue(evaluate(["gcloud", "storage", "buckets", "list", "--project=acme-fleet-host"]).allowed)
+        # The cloud-URL rule is the storage surface's alone.
+        self.assertTrue(evaluate(["gcloud", "container", "clusters", "describe", "prod", "--location=us-central1"]).allowed)
+
+    def test_a_storage_read_that_writes_a_file_or_adds_headers_is_refused(self):
+        # --exclude-name-pattern-file reads a file the caller names in the
+        # sidecar; --additional-headers and --decryption-keys shape the request
+        # itself. None is listed, so each refuses the command as unreadable
+        # rather than being stepped over.
+        for argv in (
+            ["gcloud", "storage", "du", "--exclude-name-pattern-file=/etc/passwd", "gs://fleet-logs"],
+            ["gcloud", "storage", "du", "-X", "/etc/passwd", "gs://fleet-logs"],
+            ["gcloud", "storage", "du", "-X=/etc/passwd", "gs://fleet-logs"],
+            ["gcloud", "storage", "ls", "--additional-headers=x-goog-user-project=other", "gs://fleet-logs"],
+            ["gcloud", "storage", "cat", "--decryption-keys=AAAA", "gs://fleet-logs/report.txt"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertFalse(evaluate(argv).allowed, argv)
+
+
 if __name__ == "__main__":
     unittest.main()
