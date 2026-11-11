@@ -13,7 +13,8 @@ after ``apply_slack_dial_home.py``. Two things are checked:
    ``register``, and the import the guards name is bound at
    module level.
 2. The runtime module, loaded by path from ``gateway/`` and driven with a stub
-   adapter: switch off it is disabled; on, an admin gets the radio and their
+   adapter: switch off it is disabled and opening the tab publishes only the
+   off line; on, an admin gets the radio and their
    pick is recorded; an admin of another workspace is not one; a member who is not an admin gets the page read-only and
    their pick records nothing; a member the adapter would not answer gets one
    line; with the switch off a click on a stale dial is answered with one line
@@ -145,7 +146,6 @@ def check_runtime(module) -> None:
         with mock.patch.dict(os.environ, {module.FLAG_ENV: "on"}):
             if not module.enabled():
                 raise _fail("enabled() is false with the switch on")
-        os.environ[module.FLAG_ENV] = "on"
         adapter = _Adapter(
             {"UADMIN", "UMEMBER", "UOTHER"},
             {
@@ -154,6 +154,13 @@ def check_runtime(module) -> None:
                 "UOTHER": {"is_admin": True, "team_id": "T2"},
             },
         )
+        os.environ[module.FLAG_ENV] = "off"
+        asyncio.run(module.opened(adapter, {"user": "UADMIN", "channel": "D1", "tab": "home"}))
+        if adapter.client.published[-1][1]["blocks"] != [module._section(module.OFF)]:
+            raise _fail("opening the Home tab with the switch off did not publish the off line")
+        if (Path(home) / module.STATE_NAME).exists():
+            raise _fail("opening the Home tab with the switch off wrote the record")
+        os.environ[module.FLAG_ENV] = "on"
         module.register(adapter)
         handler = adapter._app.actions.get(module.LEVEL_ACTION_ID)
         if handler is None:
