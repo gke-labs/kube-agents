@@ -1221,6 +1221,12 @@ class Filer:
                     break
                 clear.append((case, night))
             else:
+                # At least one case's red nights must still be on record, as
+                # for one case (LOOKBACK_NIGHTS): once they have all left the
+                # window, the fallback's clear night is the window's oldest
+                # date, which moves every night and would post again each time.
+                if not any(recovery_night(nights.get(case), lambda v, issue=issue: opened_before(issue, v)) for case in cases):
+                    continue
                 newest = max((night for _, night in clear), key=lambda v: v["date"])
                 marker = GROUP_RECOVERY_MARKER.format(first=marked.group(1), date=newest["date"])
                 comment = GROUP_RECOVERY_COMMENT.format(marker=marker, cases=", ".join(

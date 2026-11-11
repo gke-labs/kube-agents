@@ -1425,6 +1425,15 @@ class GroupTest(Harness):
         gh, _, _ = self.run_once(self.cluster(), FakeGh(open_issues=[self.opened(filed, body=body)]))
         self.assertEqual(len(self.filed(gh)), 1, "the cases listed in its body are split off and file again, as one group")
 
+    def test_a_long_recovered_group_is_not_commented_again_as_its_nights_scroll_past(self):
+        gh, _, _ = self.run_once(self.cluster())
+        [filed] = self.filed(gh)
+        green_nights = [night(d, [green(c) for c in MAIN_CASES]) for d in range(9, 25)]
+        green_nights += [night(d, [green(c) for c in MAIN_B_CASES], job=MAIN_B_JOB) for d in range(9, 25)]
+        # The window is nights 11-24: every red night has left it.
+        gh, _, _ = self.run_once(self.cluster(more=green_nights), FakeGh(open_issues=[self.opened(filed)]))
+        self.assertEqual(self.comments(gh), [])
+
     def test_one_domain_goes_to_its_owner_with_the_case_owners_mentioned(self):
         runs = [night(d, [tripped(c) for c in MAIN_CASES]) for d in (6, 7, 8)]
         gh, _, _ = self.run_once(data(*runs))
