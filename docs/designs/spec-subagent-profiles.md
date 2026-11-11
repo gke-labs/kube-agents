@@ -693,7 +693,7 @@ spec:
   persona:
     image: <registry>/kube-agents/persona-cluster:2026.08
     # /files: persona.yaml, instructions.md, the gke-* debugging skills, mcp.yaml
-    # (read-only gke MCP + developer_knowledge; platform_control deliberately absent)
+    # (developer_knowledge only: profile workers are refused gke and platform_control)
   harness:
     image: <registry>/kube-agents/agent-worker:2026.08
     model: model-default

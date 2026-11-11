@@ -93,12 +93,15 @@ is unset.
 ## Local Development (Fast Iteration)
 
 The operator is a standard Kubebuilder project; `make help` lists every target. `make manifests`
-writes to `config/crd/bases/`, `config/rbac/` and `config/webhook/`, then regenerates the three CRD
+writes to `config/crd/bases/`, `config/rbac/` and `config/webhook/`, then regenerates the CRD
 field reference pages under `docs/site/src/content/docs/operator/` from the API types (it needs
 `python3` and exits with an error without it), and `make test` downloads the envtest binaries to
 `bin/` on first run. `make test` also runs the event watcher's fleet soak, ten fake clusters watched
 from one process ([its README](cmd/k8s-event-watcher/README.md) has the numbers); `go test -short ./...`
 skips it.
+
+`make test` does not run gosec; `make gosec` at the repository root does, over every Go module in
+the tree, from this module's pin.
 
 `make build`, `make run` and `make test` all run `manifests`, `generate`, `fmt` and `vet` first, so
 generated code and manifests stay in sync automatically. `make install`, `make uninstall` and

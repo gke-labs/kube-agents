@@ -2892,6 +2892,9 @@ if [ -n "${PULL_NUMBER:-}" ] && ! grep -qwE 'ToolInvocation|ChecklistScore|Outco
   export KUBE_AGENTS_SKIP_REPORT_ONLY_JUDGES=1
 fi
 export AGENT_PROVIDER="google"
+# A Prow job brings AGENT_MODEL_OVERRIDE from the build cluster's eval-model
+# Secret; hack/ci-deploy.sh, which runs first in every lane, refuses a Prow
+# job without it, so the default here serves local runs only.
 export AGENT_MODEL="${AGENT_MODEL_OVERRIDE:-gemini-3.1-pro-preview}"
 
 # Unset NAMESPACE so devops-bench OpenTofu deployer does not pass -var namespace=... to stacks that don't declare it
@@ -3559,9 +3562,9 @@ fi
 export BENCH_GITOPS_REPO="${INJECT_LANE_REPO}"
 INJECT_LANE_TASKS_DIR="$(mktemp -d)"
 # One `<requested> <case> <copy>` line per task: how many pull requests
-# the case requests (the largest of its own checks, its top-level
-# `requested_pull_requests` key, and the file's `requesting:` list for a
-# case the persona answers with one before its checks say so), the case,
+# the case requests (the larger of its own checks and its top-level
+# `requested_pull_requests` key, which also stands in for a case the
+# persona answers with one before its checks say so), the case,
 # and the copy's path. The cases with a non-zero count are the fan-out's
 # second phase (INJECT_LANE_REQUESTING, read where the unit queue is built):
 # they run only after every other unit has finished, so a repetition of a

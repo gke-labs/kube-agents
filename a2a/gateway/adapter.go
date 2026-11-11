@@ -224,7 +224,8 @@ type VerifiedObserver interface {
 
 // StatusShower is the optional extension an Adapter implements when its
 // backend shows a task's status itself, so the relay's rolling line ("⏳
-// submitted…" edited on to "✅ completed") would only repeat it. The Slack
+// submitted…" edited on to "✅ completed", or on a LineAnswerer to the
+// acknowledgement or a bare mark) would only repeat it. The Slack
 // adapter does, with Agent Sessions' Working… status, the ask's reaction and
 // the plan rows, as the today path shows no receipt either. With it true the
 // gateway posts no placeholder for a task, so the relay has no line to edit
@@ -234,6 +235,27 @@ type VerifiedObserver interface {
 // the backend that owns it.
 type StatusShower interface {
 	ShowsTaskStatus(conversation string) bool
+}
+
+// LineAnswerer is the optional extension an Adapter implements when a
+// completed task's live message, the "⏳ submitted…" line, should end as
+// the ask's reaction comes off on Slack rather than read "✅ completed". A
+// backend with no reaction and no Working… status (Google Chat) has the
+// line as its only receipt of the ask, and the terminal edit left it
+// reading "✅ completed" under the question, above the answer, where Slack
+// shows no line at all. With it true the relay edits the line into the
+// acknowledgement of a turn that handed the ask to cards (the plan and the
+// report that follow are posts, and notify), and ends every other completed
+// task's line as a bare "✅" (lineDoneMark) after its answer posts: a Chat
+// edit raises no notification, so an answer that arrives minutes after the
+// ask has to post. An edit that does not land posts the acknowledgement as
+// on any backend, and the terminal edit follows. A failed, canceled or
+// rejected task keeps its terminal edit and its notice. Asked per
+// conversation, so a wrapper (the mux, the side door) answers for the
+// backend that owns it, and a door keeps its line, which its caller reads
+// as data.
+type LineAnswerer interface {
+	AnswersOnLine(conversation string) bool
 }
 
 // OutMessage is one post or edit as a value: the text, and the chat message

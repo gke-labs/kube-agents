@@ -306,6 +306,87 @@ MUTATIONS: list[Mutation] = [
         "role does not carry -- one delivery path quietly grows a ceiling",
     ),
     Mutation(
+        # A tier is authority (#3659): the operator reads tiers and writes
+        # their status, and only cluster administrators write them.
+        "A4-operator-writes-tiers",
+        "charts/kube-agents/templates/operator-rbac.yaml",
+        ("  # END GENERATED RULES",
+         "  # END GENERATED RULES\n  - apiGroups:\n      - kubeagents.x-k8s.io\n"
+         "    resources:\n      - tiers\n    verbs:\n      - create"),
+        "test_A4_only_cluster_administrators_write_tiers",
+        "let the operator create Tiers, so a compromised operator sets what "
+        "tasks may do instead of a cluster administrator",
+    ),
+    Mutation(
+        "A4-operator-writes-tiers-wildcard-group",
+        "charts/kube-agents/templates/operator-rbac.yaml",
+        ("  # END GENERATED RULES",
+         "  # END GENERATED RULES\n  - apiGroups:\n      - '*'\n"
+         "    resources:\n      - tiers\n    verbs:\n      - create"),
+        "test_A4_only_cluster_administrators_write_tiers",
+        "reach tiers through a wildcard API group, which a group-name match misses",
+    ),
+    Mutation(
+        "A4-operator-writes-tiers-wildcard-resource",
+        "charts/kube-agents/templates/operator-rbac.yaml",
+        ("  # END GENERATED RULES",
+         "  # END GENERATED RULES\n  - apiGroups:\n      - kubeagents.x-k8s.io\n"
+         "    resources:\n      - '*'\n    verbs:\n      - create"),
+        "test_A4_only_cluster_administrators_write_tiers",
+        "reach tiers through a wildcard resource, which a resource-name match misses",
+    ),
+    Mutation(
+        "A4-operator-tiers-wildcard-subresource",
+        "charts/kube-agents/templates/operator-rbac.yaml",
+        ("  # END GENERATED RULES",
+         "  # END GENERATED RULES\n  - apiGroups:\n      - kubeagents.x-k8s.io\n"
+         "    resources:\n      - '*/finalizers'\n    verbs:\n      - update"),
+        "test_A4_only_cluster_administrators_write_tiers",
+        "let the operator put finalizers on Tiers through `*/finalizers`, "
+        "which matches tiers/finalizers without spelling tiers or `*/status`",
+    ),
+    Mutation(
+        "A4-kustomize-leader-election-writes-tiers",
+        "k8s-operator/config/rbac/leader_election_role.yaml",
+        ("rules:\n",
+         "rules:\n  - apiGroups:\n      - kubeagents.x-k8s.io\n"
+         "    resources:\n      - tiers\n    verbs:\n      - create\n"),
+        "test_A4_only_cluster_administrators_write_tiers",
+        "give the kustomize leader-election Role a verb on tiers: the chart "
+        "reads its copy of that Role, so the kustomize side has to read this one",
+    ),
+    Mutation(
+        "A4-tiers-aggregated-by-wildcard",
+        "k8s-operator/config/rbac/role_binding.yaml",
+        ("    namespace: system\n",
+         "    namespace: system\n---\napiVersion: rbac.authorization.k8s.io/v1\n"
+         "kind: ClusterRole\nmetadata:\n  name: kube-agents-admin\n  labels:\n"
+         "    rbac.authorization.k8s.io/aggregate-to-admin: \"true\"\nrules:\n"
+         "  - apiGroups: [\"kubeagents.x-k8s.io\"]\n    resources: [\"*\"]\n"
+         "    verbs: [\"*\"]\n"),
+        "test_A4_only_cluster_administrators_write_tiers",
+        "aggregate a kubeagents.x-k8s.io wildcard into admin: every namespace "
+        "admin writes tiers, and the word tiers appears nowhere in the role",
+    ),
+    Mutation(
+        "A4-chart-role-templated-resources",
+        "charts/kube-agents/templates/web-console.yaml",
+        ('    resources: ["nodes", "namespaces", "pods"]\n',
+         '    resources: {{ toJson .Values.webConsole.clusterResources }}\n'),
+        "test_A4_only_cluster_administrators_write_tiers",
+        "template a chart role's resources, so the parse reads a placeholder "
+        "and a values file decides whether the role reaches tiers",
+    ),
+    Mutation(
+        "A4-web-console-reads-tiers",
+        "charts/kube-agents/templates/web-console.yaml",
+        ('    resources: ["nodes", "namespaces", "pods"]\n    verbs: ["list"]',
+         '    resources: ["nodes", "namespaces", "pods"]\n    verbs: ["list"]\n'
+         '  - apiGroups: ["kubeagents.x-k8s.io"]\n    resources: ["tiers"]\n    verbs: ["update"]'),
+        "test_A4_only_cluster_administrators_write_tiers",
+        "give a chart-shipped product role a verb on tiers, outside the operator's goldens",
+    ),
+    Mutation(
         # The chart half was three literal string scans until #1319; this is
         # the spelling that walked past them. Flow style is not exotic -- it is
         # what `helm create` scaffolds and what a hand-edit reaches for.
@@ -1176,6 +1257,20 @@ Mutation(
         "test_C1_the_rendered_egress_rules_are_shaped_to_deny_by_default",
         "strip the `to` from a rendered egress rule, which opens 443 to every "
         "destination while still looking like an allowlist entry",
+    ),
+    Mutation(
+        "C1-postgres-guard-tied-to-api-toggle",
+        "charts/kube-agents/templates/hindsight.yaml",
+        (
+            "{{- $postgresqlNetworkPolicy := and $hindsightNetworkPolicy "
+            ".Values.hindsight.postgresql.networkPolicy.enabled }}",
+            "{{- $postgresqlNetworkPolicy := $apiNetworkPolicy }}",
+        ),
+        "test_C1_the_passwordless_postgres_guard_answers_to_its_own_values_alone",
+        "render the Postgres guard under the api policy's toggle, so the "
+        "bring-your-own-gateway escape (api policy off) takes the only guard on "
+        "the passwordless database with it -- the one-boolean shape the chart "
+        "had before the toggles were split",
     ),
     Mutation(
         "C1-cidr-guard-inert",
@@ -2290,8 +2385,8 @@ Mutation(
     Mutation(
         "C1-delegate-schema-property-renamed",
         "a2a/worker-adapter/mcp.go",
-        ('"addressee": map[string]any{"type": "string", "description": "The agent to hand the task to. Today only \\"platform\\"."},',
-         '"target": map[string]any{"type": "string", "description": "The agent to hand the task to. Today only \\"platform\\"."},'),
+        ('"addressee": map[string]any{"type": "string", "description": addresseeDescription(targets)},',
+         '"target": map[string]any{"type": "string", "description": addresseeDescription(targets)},'),
         "test_C1_the_delegate_tool_schema_names_agree_with_the_wire_shape",
         "rename the schema's addressee property to target without touching "
         "lib.DelegateRequest: the model calls the tool exactly as the schema "

@@ -37,6 +37,7 @@ import credential_proxy_client
 import feedback_broker
 import gke_endpoint
 import providers
+import scope_exclude
 import vcs_broker
 from credential_proxy import (
     MAX_REPOSITORY_LENGTH,
@@ -8688,12 +8689,9 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
                 executor.refresh_forge_credential("github", "gke-agentic/infra")
         self.assertFalse(executor._refresh_lock.locked())
 
-    def _wait_until(self, condition, deadline_seconds=5):
-        deadline = time.monotonic() + deadline_seconds
-        while not condition():
-            if time.monotonic() > deadline:
-                self.fail("condition not reached before the deadline")
-            time.sleep(0.01)
+    def _wait_until(self, condition):
+        """The module's _wait_until at the close wait, for this class's callers."""
+        _wait_until(self, condition, lambda: "condition not reached before the deadline")
 
     def test_the_lock_is_held_while_its_holder_waits_for_the_budget_and_a_second_refresher_waits_on_it_unreserved(self):
         executor = self._budgeted_executor(admits=1)
@@ -11098,6 +11096,29 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
     def test_serve_arms_the_gate_by_default(self):
         CredentialProxyHandler.enforce_read_only = False
         self.assertTrue(self._serve_with(None))
+
+    def test_serve_turns_gcloud_file_logging_off_in_the_exec_role_only(self):
+        # An exec pod's state volume is sized for no gcloud log files; the
+        # broker and the sidecar roles keep gcloud's default.
+        for role, off in (
+            (credential_proxy_client.EXEC_ROLE, True),
+            ("broker", False),
+            ("combined", False),
+        ):
+            with self.subTest(role=role):
+                self._serve_with(None, extra_env={"CREDENTIAL_PROXY_ROLE": role})
+                env = CredentialProxyHandler.executor.environment
+                self.assertEqual(
+                    "1" if off else None, env.get(credential_proxy.GCLOUD_FILE_LOGGING_OFF_ENV)
+                )
+
+    def test_serve_gives_only_the_exec_role_the_kubectl_cache_reclaimer(self):
+        for role, wired in ((credential_proxy_client.EXEC_ROLE, True), ("broker", False)):
+            with self.subTest(role=role):
+                self._serve_with(None, extra_env={"CREDENTIAL_PROXY_ROLE": role})
+                executor = CredentialProxyHandler.executor
+                reclaimers = CredentialProxyHandler.watermark_gate._reclaimers
+                self.assertEqual(wired, executor.reclaim_kubectl_cache in reclaimers)
 
     def test_serve_hands_the_executor_the_container_limit(self):
         # The derivation runs in `serve`, not in the executor, so a test that
@@ -15372,6 +15393,19 @@ _DOOR_IDLE_SECONDS = 4 * _RESET_SETTLE_SECONDS
 _HEALTH_ANSWER_SECONDS = 1
 # Refusals made in quick succession, to show the cap writes one line for them.
 _REFUSAL_BURST = 3
+# The lag the stamped-late test puts between a refusal's 503, written on its
+# refusal thread, and the accept loop counting it, which is the stamp the
+# quiet interval is measured from. A refusal helper that returned on the 503
+# alone starts the quiet-interval sleep before the stamp, and the closed
+# holder's handler then finds the interval unexpired and says nothing, which
+# is the shape a loaded runner produced with no lag added. The lag has to
+# outlast the work between the last refusal and that sleep (a health request
+# and a few assertions, milliseconds idle) on any runner for the red to hold,
+# so it is half the loaded-runner settle rather than a margin over the idle
+# figure; and it stays inside the shortened interval, so that a red is the
+# issue's shape (the handler finds the interval unexpired and says nothing)
+# and not a stamp landing after the sleep and a line with the wrong count.
+_REFUSAL_STAMP_LAG_SECONDS = _RESET_SETTLE_SECONDS / 2
 # The small cap the saturation test builds its server with.
 _SMALL_THREAD_CAP = 4
 _KEEPALIVE_REQUESTS = 5
@@ -15399,6 +15433,22 @@ _PARTIAL_REQUEST_LINE = b"GET /"
 # the wait counted from admission and the window from the request's first
 # byte): a queue refusal always lands after the request's read deadline.
 _SLOT_WAIT_PAST_THE_WINDOW_SECONDS = 2 * _SHORT_IDLE_SECONDS
+
+
+def _wait_until(case, condition, failure, deadline_seconds=_CLOSE_WAIT_SECONDS):
+    """Poll ``condition`` every _POLL_SECONDS until it holds; past ``deadline_seconds``, fail ``case`` with ``failure()``.
+
+    The one loop for a test waiting on a server thread's work (a line a
+    handler writes as it returns, a stamp the accept loop sets, a request
+    queued behind a budget), so the deadline arithmetic and the poll interval
+    are not kept in step by hand at each site. ``failure`` is called only on
+    the way out, so a message can carry what the wait saw.
+    """
+    deadline = time.monotonic() + deadline_seconds
+    while not condition():
+        if time.monotonic() > deadline:
+            case.fail(failure())
+        time.sleep(_POLL_SECONDS)
 
 
 def _drip(sock, data, stop):
@@ -15930,14 +15980,35 @@ class ThreadCapTest(_CredentialedUnixServer):
         return _SMALL_THREAD_CAP
 
     def _refused(self):
-        """Connect past the cap and return what the connection read."""
+        """Connect past the cap and return what the connection read.
+
+        Returns once the connection has read the 503 and the close behind it,
+        both written on the refusal thread, and the accept loop has counted
+        the refusal. The count stamps the server's last refusal, which
+        connection_released measures the quiet interval from; a test that
+        timed that interval from the 503 alone would, when the accept loop
+        stamps late, close a holder whose handler finds the interval
+        unexpired and says nothing. Nothing here waits for the refusal
+        thread's drain to return or its slot to come back; a test that needs
+        the slot waits on _refusal_slots with _wait_for_a_free_slot.
+        """
+        before = self._last_refusal_stamp()
         extra = self.connect()
         with contextlib.suppress(BrokenPipeError, ConnectionResetError):
             self.send(extra, "GET", "/healthz")
         status, headers, body = self.response(extra)
         self.assertTrue(self.closed_by_server(extra), "the refused connection stayed open")
         extra.close()  # as Envoy does on reading the answer; the drain returns at once
+        _wait_until(
+            self, lambda: self._last_refusal_stamp() > before,
+            lambda: f"the accept loop did not count the refusal within {_CLOSE_WAIT_SECONDS}s",
+        )
         return status, headers, body
+
+    def _last_refusal_stamp(self):
+        """When the server last counted a refusal, read under the lock the count writes it under."""
+        with self.server._refused_lock:
+            return self.server._last_refusal_at
 
     def _wait_for_a_free_slot(self, slots):
         """Block until a closed connection's thread has given one of ``slots`` back; fail at _CLOSE_WAIT_SECONDS."""
@@ -15945,6 +16016,34 @@ class ThreadCapTest(_CredentialedUnixServer):
         slots.release()
 
     def test_the_connection_past_the_cap_reads_503_and_eof_while_health_answers(self):
+        self._burst_is_one_line_and_a_quiet_interval_ends_the_episode()
+
+    def test_the_release_line_is_written_when_the_accept_loop_counts_the_refusal_late(self):
+        # The refusal thread writes the 503 before the accept loop counts the
+        # refusal, and the count is the stamp the quiet interval is measured
+        # from. Here every count lands _REFUSAL_STAMP_LAG_SECONDS after its
+        # answer, as a loaded runner once arranged on its own: a refusal
+        # helper that returned on the 503 alone would start the quiet-interval
+        # sleep ahead of the last stamp, and the closed holder's handler would
+        # find the interval unexpired, say nothing, and leave no later handler
+        # to say it. The helper waits for the stamp, so the scenario holds.
+        count = self.server._count_refusal
+
+        def lagged_count(answered):
+            time.sleep(_REFUSAL_STAMP_LAG_SECONDS)
+            count(answered)
+
+        with mock.patch.object(self.server, "_count_refusal", lagged_count):
+            self._burst_is_one_line_and_a_quiet_interval_ends_the_episode()
+
+    def _burst_is_one_line_and_a_quiet_interval_ends_the_episode(self):
+        """Saturate the cap, refuse a burst, free one holder after a quiet interval.
+
+        The body of two tests: the burst is one ALERT line and the health
+        listener answers meanwhile; the first holder closed after an interval
+        with no refusal has its handler write the release line; the freed
+        slot serves the next connection.
+        """
         health = credential_proxy.start_health_listener("127.0.0.1", 0)
         self.addCleanup(health.server_close)
         self.addCleanup(health.shutdown)
@@ -15975,15 +16074,18 @@ class ThreadCapTest(_CredentialedUnixServer):
         # over only once an interval has passed with no refusal. The closed
         # holder's handler writes that line as it returns, so the test waits
         # for the line, inside the shortened interval, rather than sleeping.
+        # The sleep is one interval measured from after the last refusal's
+        # stamp (_refused returns only once the accept loop has written it),
+        # and the handler measures the interval after the sleep ends, so the
+        # handler always finds it elapsed.
         with mock.patch.object(credential_proxy, "THREAD_CAP_LOG_INTERVAL_SECONDS", _RESET_SETTLE_SECONDS):
             time.sleep(_RESET_SETTLE_SECONDS)
             with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
                 holders[0].close()
-                deadline = time.monotonic() + _CLOSE_WAIT_SECONDS
-                while not any("thread cap released" in line for line in logs.output):
-                    if time.monotonic() > deadline:
-                        self.fail(f"the closed holder's handler did not report the release: {logs.output}")
-                    time.sleep(_POLL_SECONDS)
+                _wait_until(
+                    self, lambda: any("thread cap released" in line for line in logs.output),
+                    lambda: f"the closed holder's handler did not report the release: {logs.output}",
+                )
             released = [line for line in logs.output if "thread cap released" in line]
             self.assertEqual(1, len(released), logs.output)
             self.assertIn(f"{_REFUSAL_BURST - 1} refused since the last line", released[0])
@@ -18594,6 +18696,56 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
         status, headers, body = self._request(*args, **kwargs)
         return status, headers, json.loads(body)
 
+    def _exclude(self, project, location, cluster):
+        """Point the handler's exclusions at a scope file that excludes one cluster."""
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        scope = directory / "scope.json"
+        scope.write_text(json.dumps({"exclude": {"clusters": [
+            {"projectId": project, "location": location, "clusterName": cluster}]}}), encoding="utf-8")
+        self.addCleanup(
+            self._restore, "exclusions", "exclusions" in CredentialProxyHandler.__dict__,
+            CredentialProxyHandler.__dict__.get("exclusions"),
+        )
+        CredentialProxyHandler.exclusions = scope_exclude.Exclusions(path=lambda: str(scope))
+
+    EXCLUDABLE_GET = "/v1/gcp/container.googleapis.com/v1/projects/acme-prod/locations/us-central1/clusters/{name}"
+    CHECK_HEADERS = {credential_proxy.GET_CREDENTIALS_CHECK_HEADER: "1"}
+
+    def test_the_get_credentials_check_is_refused_for_an_excluded_cluster(self):
+        # The shim then sends get-credentials to /v1/exec, whose own
+        # excluded-cluster refusal answers (#5305); nothing reaches GKE here.
+        self._exclude("acme-prod", "us-central1", "secret-cluster")
+        self.reply["body"] = b'{"name":"secret-cluster","location":"us-central1","status":"RUNNING"}'
+        status, _, body = self._json_request(self.EXCLUDABLE_GET.format(name="secret-cluster"), headers=self.CHECK_HEADERS)
+        self.assertEqual(403, status)
+        self.assertEqual(scope_exclude.RULE_EXCLUDED_CLUSTER, body["rule"])
+        self.assertEqual([], self.upstream_requests)
+
+    def test_without_the_check_header_an_excluded_clusters_read_is_unchanged(self):
+        # #5305 keeps control-plane reads allowed: the reconcile's existence
+        # check sends no header and is answered as before.
+        self._exclude("acme-prod", "us-central1", "secret-cluster")
+        self.reply["body"] = b'{"name":"secret-cluster","location":"us-central1","status":"RUNNING"}'
+        status, _, _ = self._request(self.EXCLUDABLE_GET.format(name="secret-cluster"))
+        self.assertEqual(200, status)
+        self.assertEqual(1, len(self.upstream_requests))
+
+    def test_the_check_header_leaves_a_cluster_that_is_not_excluded_alone(self):
+        self._exclude("acme-prod", "us-central1", "secret-cluster")
+        self.reply["body"] = b'{"name":"ka-a","location":"us-central1","status":"RUNNING"}'
+        status, _, _ = self._request(self.EXCLUDABLE_GET.format(name="ka-a"), headers=self.CHECK_HEADERS)
+        self.assertEqual(200, status)
+        self.assertEqual(1, len(self.upstream_requests))
+        # The header is the broker's to read, not the upstream's: the relay
+        # sends exactly its own two headers.
+        self.assertNotIn(credential_proxy.GET_CREDENTIALS_CHECK_HEADER, self.upstream_requests[0][1])
+
+    def test_the_shim_and_the_broker_name_the_check_header_alike(self):
+        self.assertEqual(
+            credential_proxy_client.GET_CREDENTIALS_CHECK_HEADER, credential_proxy.GET_CREDENTIALS_CHECK_HEADER
+        )
+
     def test_a_get_carrying_a_body_on_a_direct_write_route_announces_its_close(self):
         # The passthrough and the MCP 405 write their response without _json.
         # A GET drains nothing, so a body on it is unread when the response is
@@ -19468,6 +19620,14 @@ class KubeProxyClientTest(unittest.TestCase):
                     credential_proxy_client,
                     "open_broker_request",
                     return_value=contextlib.nullcontext(fake_resp),
+                ),
+                # This argv names its cluster in full, which the shim answers
+                # itself with the kube-api proxy in use (#5447); this test is
+                # the broker answer's path.
+                mock.patch.object(
+                    credential_proxy_client,
+                    "answer_get_credentials_locally",
+                    return_value=None,
                 ),
             ):
                 rc = credential_proxy_client.execute(
@@ -21394,6 +21554,141 @@ class SessionToolBudgetRouteTest(unittest.TestCase):
         self.assertEqual(credential_proxy.LOOP_BREAKER_CODE, credential_proxy_client.LOOP_BREAKER_CODE)
         self.assertIn(credential_proxy.SESSION_BUDGET_EXCEEDED_CODE, credential_proxy_client.POLICY_BLOCKED_CODES)
         self.assertIn(credential_proxy.LOOP_BREAKER_CODE, credential_proxy_client.POLICY_BLOCKED_CODES)
+
+
+class ExcludedClusterPathTest(unittest.TestCase):
+    """spec.scope.exclude.clusters at the broker: every route to a cluster's API.
+
+    The same stubbed gcloud and kubectl as ScopedServiceAccountPathTest, borrowed
+    rather than copied, so a refused fetch is asserted by an empty call log and
+    not only by the exception. `EXCLUDED` and `ALLOWED` share a project and
+    location: the exclusion is a cluster's, not its project's.
+    """
+
+    PROJECT = "kagents-dev"
+    LOCATION = "us-east4"
+    EXCLUDED = "excluded-cluster"
+    ALLOWED = "allowed-cluster"
+
+    fake_gcloud = ScopedServiceAccountPathTest.fake_gcloud
+    fake_kubectl = ScopedServiceAccountPathTest.fake_kubectl
+    gke_calls = ScopedServiceAccountPathTest.gke_calls
+    pool = ScopedServiceAccountPathTest.pool
+    EMAIL = ScopedServiceAccountPathTest.EMAIL
+    OTHER_EMAIL = ScopedServiceAccountPathTest.OTHER_EMAIL
+    OTHER_PROJECT = ScopedServiceAccountPathTest.OTHER_PROJECT
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.minted = []
+        self.get_credentials_log = Path(self.temp_dir.name) / "get-credentials.log"
+        self.scope_file = Path(self.temp_dir.name) / "scope.json"
+        self.exclude()
+
+    def exclude(self, *clusters):
+        """Rewrite scope.json, as an edit to spec.scope lands in the ConfigMap mount."""
+        text = json.dumps({"present": True, "projects": [], "exclude": {"projects": [], "clusters": [
+            {"projectId": self.PROJECT, "location": self.LOCATION, "clusterName": cluster} for cluster in clusters
+        ]}})
+        self.scope_file.write_text(text, encoding="utf-8")
+        stamp = time.time_ns() + 1_000_000 * len(clusters)
+        os.utime(self.scope_file, ns=(stamp, stamp))
+
+    def executor(self, scoped_pool=None):
+        import scope_exclude
+
+        executor = CommandExecutor(
+            timeout_seconds=30,
+            max_output_bytes=1 << 16,
+            state_dir=str(Path(self.temp_dir.name) / "state"),
+            scoped_pool=scoped_pool,
+            exclusions=scope_exclude.Exclusions(path=lambda: str(self.scope_file)),
+        )
+        executor.environment["GET_CREDENTIALS_LOG"] = str(self.get_credentials_log)
+        self.fake_gcloud(executor)
+        self.fake_kubectl(executor)
+        return executor
+
+    def context(self, cluster):
+        return f"gke_{self.PROJECT}_{self.LOCATION}_{cluster}"
+
+    def get_credentials(self, cluster):
+        return ["gcloud", "container", "clusters", "get-credentials", cluster,
+                f"--project={self.PROJECT}", f"--location={self.LOCATION}"]
+
+    def assert_excluded(self, call):
+        import scope_exclude
+
+        with self.assertRaises(scope_exclude.ExcludedCluster) as caught:
+            call()
+        self.assertEqual(scope_exclude.RULE_EXCLUDED_CLUSTER, caught.exception.rule)
+
+    def test_a_kubectl_naming_an_excluded_cluster_is_refused_before_gke_is_asked(self):
+        self.exclude(self.EXCLUDED)
+        executor = self.executor()
+        self.assert_excluded(lambda: executor.execute(
+            ["kubectl", "get", "pods"], kubeconfig_context=self.context(self.EXCLUDED)))
+        self.assertEqual([], self.gke_calls())
+        result = executor.execute(["kubectl", "get", "pods"], kubeconfig_context=self.context(self.ALLOWED))
+        self.assertEqual(0, result.exit_code, result.stderr)
+        self.assertEqual([self.context(self.ALLOWED)], self.gke_calls())
+
+    def test_a_cluster_excluded_after_its_kubeconfig_was_cached_is_refused(self):
+        executor = self.executor()
+        result = executor.execute(["kubectl", "get", "pods"], kubeconfig_context=self.context(self.EXCLUDED))
+        self.assertEqual(0, result.exit_code, result.stderr)
+        self.exclude(self.EXCLUDED)
+        self.assert_excluded(lambda: executor.execute(
+            ["kubectl", "get", "pods"], kubeconfig_context=self.context(self.EXCLUDED)))
+
+    def test_the_kubeconfig_flag_naming_an_excluded_cluster_is_refused(self):
+        self.exclude(self.EXCLUDED)
+        executor = self.executor()
+        self.assert_excluded(lambda: executor.execute(
+            ["kubectl", "get", "pods", f"--kubeconfig={self.context(self.EXCLUDED)}"]))
+        self.assertEqual([], self.gke_calls())
+
+    def test_get_credentials_for_an_excluded_cluster_never_runs(self):
+        self.exclude(self.EXCLUDED)
+        executor = self.executor()
+        self.assert_excluded(lambda: executor.execute(self.get_credentials(self.EXCLUDED), wants_kubeconfig=True))
+        self.assertEqual([], self.gke_calls())
+        result = executor.execute(self.get_credentials(self.ALLOWED), wants_kubeconfig=True)
+        self.assertEqual(0, result.exit_code, result.stderr)
+        self.assertIn(self.context(self.ALLOWED), result.kubeconfig)
+
+    def test_get_credentials_on_gcloud_defaults_is_refused_once_its_context_names_the_cluster(self):
+        """No --location in argv: the target is only known from what gcloud wrote."""
+        self.exclude(self.EXCLUDED)
+        executor = self.executor()
+        stub = Path(executor.executables["gcloud"])
+        stub.write_text(stub.read_text(encoding="utf-8").replace(
+            'location=""', f'location="{self.LOCATION}"'), encoding="utf-8")
+        argv = ["gcloud", "container", "clusters", "get-credentials", self.EXCLUDED, f"--project={self.PROJECT}"]
+        self.assert_excluded(lambda: executor.execute(argv, wants_kubeconfig=True))
+        self.assertFalse(executor._managed_kubeconfig(
+            credential_proxy_client.parse_gke_context(self.context(self.EXCLUDED))).exists(),
+            "an excluded cluster's kubeconfig was filed")
+
+    def test_a_kubectl_naming_no_cluster_is_refused_when_the_broker_s_own_cluster_is_excluded(self):
+        for scoped_pool in (None, "pool"):
+            with self.subTest(pool=scoped_pool is not None):
+                self.exclude(self.EXCLUDED)
+                executor = self.executor(self.pool() if scoped_pool else None)
+                executor.host_context = self.context(self.EXCLUDED)
+                self.assert_excluded(lambda: executor.execute(["kubectl", "get", "pods"]))
+                self.exclude()
+                result = executor.execute(["kubectl", "get", "pods"])
+                self.assertNotIn("ExcludedCluster", result.stderr)
+
+    def test_a_gcloud_metadata_read_of_an_excluded_cluster_is_allowed(self):
+        """Control-plane reads are the project's, and stay allowed."""
+        self.exclude(self.EXCLUDED)
+        executor = self.executor()
+        result = executor.execute(["gcloud", "container", "clusters", "describe", self.EXCLUDED,
+                                   f"--project={self.PROJECT}", f"--location={self.LOCATION}"])
+        self.assertEqual(0, result.exit_code, result.stderr)
 
 
 if __name__ == "__main__":

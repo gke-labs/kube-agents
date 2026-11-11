@@ -38,6 +38,7 @@ CRD_FILES = {
     "PlatformAgent": CRD_DIR / "kubeagents.x-k8s.io_platformagents.yaml",
     "AgentProfile": CRD_DIR / "kubeagents.x-k8s.io_agentprofiles.yaml",
     "AgentPlugin": CRD_DIR / "kubeagents.x-k8s.io_agentplugins.yaml",
+    "Tier": CRD_DIR / "kubeagents.x-k8s.io_tiers.yaml",
 }
 
 FIXTURE = textwrap.dedent(

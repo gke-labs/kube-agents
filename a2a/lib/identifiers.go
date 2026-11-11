@@ -55,7 +55,7 @@ var SessionNameWords = []string{
 // <profile>-<animal>, per the 8/24 ruling. The structure lives in
 // from.profile; this name is for humans, and callers treat it as opaque.
 func NewSessionName(profile string) string {
-	animal := SessionNameWords[mrand.N(len(SessionNameWords))]
+	animal := SessionNameWords[mrand.N(len(SessionNameWords))] // #nosec G404 -- a human-facing label, never a secret
 	if profile == "" {
 		return animal
 	}
