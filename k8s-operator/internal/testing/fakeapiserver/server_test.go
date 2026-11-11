@@ -610,6 +610,24 @@ func TestUnknownPathIs404(t *testing.T) {
 	}
 }
 
+// A client built from Config opens a connection per request and pools none:
+// the keep-alive race Config's comment names needs a reused connection, so a
+// config that goes back to pooling fails here rather than as a stall on a
+// Go without the fix.
+func TestConfig_OneConnectionPerRequest(t *testing.T) {
+	const requests = 3
+	s := startSmall(t, 1)
+	client := clientFor(t, s, k8sruntime.ContentTypeJSON)
+	for i := 0; i < requests; i++ {
+		if _, err := client.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if c := s.Counts(); c.Connections != requests || c.Requests != requests {
+		t.Fatalf("after %d lists: %+v; want a connection per request", requests, c)
+	}
+}
+
 // The refusals are Status bodies a client decodes, not broken responses: a
 // bad limit, continue token or timeout and an unsupported method on a
 // resource or on the review route.

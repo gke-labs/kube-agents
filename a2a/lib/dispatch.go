@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"regexp"
+	"strings"
 	"time"
 )
 
@@ -30,8 +33,17 @@ const ProfileLeaseBucket = "PROFILE_LEASES"
 // submission, acked or not: it mirrors the operator's `--max-age=72h` on
 // PROFILE_SUBMITS (a limits-retention stream). A durable re-created with
 // DeliverAll replays everything inside it, so the dispatcher keeps a
-// finished task's tombstone (LeaseRecord.FinishedAt) at least this long.
+// finished task's tombstone (LeaseRecord.FinishedAt) at least this long
+// when the dispatch config carries no SubmitRetentionSeconds, and never
+// less than this when it does. The operator renders the live stream's max
+// age when it is longer than its own constant (#4948), so a stream an older
+// operator created longer is covered by the config, not by this floor.
 const ProfileSubmitRetention = 72 * time.Hour
+
+// MaxSubmitRetention is the longest SubmitRetentionSeconds a dispatch
+// config may carry. It keeps the retention, and a tombstone's keep-until
+// time, well inside a time.Duration.
+const MaxSubmitRetention = 365 * 24 * time.Hour
 
 // ProfileLeaseRefusedPod is the pod token of the tombstone the dispatcher
 // writes for a submission it refused at admission, which no pod ever held.
@@ -256,7 +268,8 @@ type LeaseRecord struct {
 	// FinishedAt, set, makes the record a tombstone: the task ended (its
 	// final renewal came, or the dispatcher wrote its terminal: failed, or
 	// rejected at admission) at this time. A submission stream keeps acked
-	// submissions for ProfileSubmitRetention, so a durable re-created with
+	// submissions for its max age (DispatchConfig.SubmitRetentionSeconds,
+	// or ProfileSubmitRetention), so a durable re-created with
 	// DeliverAll replays finished tasks; the tombstone, kept under the same
 	// key at least that long, is how the dispatcher knows a replay is one
 	// and acks it without running or failing it again. A tombstone holds no
@@ -340,8 +353,33 @@ type DispatchConfig struct {
 	RenewSeconds         int `json:"renewSeconds"`
 	RestartGraceSeconds  int `json:"restartGraceSeconds"`
 	AcceptTimeoutSeconds int `json:"acceptTimeoutSeconds"`
+	// BreakerThreshold lease expiries in a row on one (profile, tier) open
+	// its breaker, which holds new submissions there queued for
+	// BreakerCooldownSeconds. 0 takes the dispatcher's defaults (3 and 300).
+	BreakerThreshold       int `json:"breakerThreshold,omitempty"`
+	BreakerCooldownSeconds int `json:"breakerCooldownSeconds,omitempty"`
+	// JobStartSeconds is how long an unattended task's Job may take to have
+	// a Ready worker pod before the task fails no-worker. 0 takes the
+	// dispatcher's default (300).
+	JobStartSeconds int `json:"jobStartSeconds,omitempty"`
+	// StopGraceSeconds is how long a running task's executor has to stop on
+	// its own after a stop record (contract addendum 9) before the
+	// dispatcher ends it. 0 takes the dispatcher's default (30).
+	StopGraceSeconds int `json:"stopGraceSeconds,omitempty"`
+	// SubmitRetentionSeconds is how long ProfileSubmitStream keeps a
+	// submission (the operator renders it from the same value as the
+	// stream's max age). A durable re-created over the stream replays
+	// everything inside it, so the dispatcher keeps a finished task's
+	// tombstone at least this long. Zero is from an operator that predates
+	// the field; the dispatcher then uses ProfileSubmitRetention.
+	SubmitRetentionSeconds int `json:"submitRetentionSeconds,omitempty"`
+	// JobLabels go on every Job the dispatcher creates: the operator's
+	// agent labels, by which a teardown deletes only this install's Jobs,
+	// and DispatchJobLabel. Set when some profile has a JobTemplate.
+	JobLabels map[string]string `json:"jobLabels,omitempty"`
 	// Profiles are the profiles bound to this install with a rendered
-	// identity. A profile absent here has no durables to read.
+	// identity, and those draining after they left it (DrainingUntil). A
+	// profile absent here has no durables to read.
 	Profiles []DispatchProfile `json:"profiles"`
 }
 
@@ -355,9 +393,29 @@ type DispatchProfile struct {
 	ActiveDeadlineSeconds int                `json:"activeDeadlineSeconds"`
 	Parameters            []ProfileParameter `json:"parameters,omitempty"`
 	// Durables are the shared durables the operator created for it, one
-	// per (tier, kind).
+	// per (tier, kind). A draining profile has none.
 	Durables []DispatchDurable `json:"durables"`
+	// JobTemplate is the pod template (a core/v1 PodTemplateSpec) the
+	// profile's unattended tasks run on as Jobs, rendered by the operator
+	// only where the chart installed the Job admission policy, which holds
+	// each Job to it exactly. The dispatcher uses it as it is. Absent, the
+	// profile's unattended tasks have no worker (the operator builds warm
+	// pools for the read tier only) and the dispatcher refuses them
+	// no-worker at admission.
+	JobTemplate json.RawMessage `json:"jobTemplate,omitempty"`
+	// DrainingUntil, set, makes the profile draining (#5074): it has left
+	// the install, so it has no durables and nothing new is dispatched for
+	// it, but it stays listed, and keeps its .supervisor grant, until then,
+	// so the terminals of the tasks it still holds reach their requesters.
+	DrainingUntil time.Time `json:"drainingUntil,omitzero"`
 }
+
+// Draining reports whether the profile is draining (DrainingUntil).
+func (p DispatchProfile) Draining() bool { return !p.DrainingUntil.IsZero() }
+
+// DispatchJobLabel marks a Job the dispatcher created (the operator's
+// dispatchJobLabel).
+const DispatchJobLabel = "kubeagents.x-k8s.io/dispatch-job"
 
 // DispatchDurable names one shared durable on ProfileSubmitStream.
 type DispatchDurable struct {
@@ -365,6 +423,11 @@ type DispatchDurable struct {
 	Kind string `json:"kind"`
 	Name string `json:"name"`
 }
+
+// MaxDispatchSeconds bounds every second count in a DispatchConfig, so each
+// converts to a time.Duration, and a sum of three to a Job's deadline,
+// without overflow.
+const MaxDispatchSeconds = math.MaxInt32
 
 // Validate reports the first way c can't be dispatched on, or nil. The
 // operator renders only configs that pass; the dispatcher checks again and
@@ -381,8 +444,22 @@ func (c DispatchConfig) Validate() error {
 		return fmt.Errorf("dispatch config: lease %ds must be at least three renewals of %ds", c.LeaseSeconds, c.RenewSeconds)
 	case c.RestartGraceSeconds < 2*c.RenewSeconds:
 		return fmt.Errorf("dispatch config: restart grace %ds must be at least two renewals of %ds", c.RestartGraceSeconds, c.RenewSeconds)
+	case c.JobStartSeconds < 0 || c.StopGraceSeconds < 0:
+		return fmt.Errorf("dispatch config: job start %ds and stop grace %ds may not be negative", c.JobStartSeconds, c.StopGraceSeconds)
+	case c.BreakerThreshold < 0 || c.BreakerCooldownSeconds < 0:
+		return fmt.Errorf("dispatch config: breaker threshold %d and cooldown %ds may not be negative", c.BreakerThreshold, c.BreakerCooldownSeconds)
 	case c.AcceptTimeoutSeconds <= 0:
 		return fmt.Errorf("dispatch config: acceptTimeoutSeconds %d", c.AcceptTimeoutSeconds)
+	case max(c.LeaseSeconds, c.RenewSeconds, c.RestartGraceSeconds, c.AcceptTimeoutSeconds,
+		c.BreakerCooldownSeconds, c.JobStartSeconds, c.StopGraceSeconds) > MaxDispatchSeconds:
+		return fmt.Errorf("dispatch config: a second count is over %d", MaxDispatchSeconds)
+	case c.SubmitRetentionSeconds < 0 || c.SubmitRetentionSeconds > int(MaxSubmitRetention/time.Second):
+		return fmt.Errorf("dispatch config: submitRetentionSeconds %d is outside 0 to %d", c.SubmitRetentionSeconds, int(MaxSubmitRetention/time.Second))
+	}
+	for k, v := range c.JobLabels {
+		if !validLabelKey(k) || !labelValue.MatchString(v) {
+			return fmt.Errorf("dispatch config: jobLabels %q=%q is not a valid label", k, v)
+		}
 	}
 	seen := map[string]bool{}
 	for _, p := range c.Profiles {
@@ -390,8 +467,17 @@ func (c DispatchConfig) Validate() error {
 			return fmt.Errorf("dispatch config: profile %q is not a subject token, or is listed twice", p.Name)
 		}
 		seen[p.Name] = true
-		if p.Concurrency < 1 || len(p.Tiers) == 0 || len(p.Durables) == 0 {
-			return fmt.Errorf("dispatch config: profile %s needs a concurrency, a tier and a durable", p.Name)
+		if len(p.JobTemplate) > 0 && !podTemplateWithContainers(p.JobTemplate) {
+			return fmt.Errorf("dispatch config: profile %s's jobTemplate is not a pod template with containers", p.Name)
+		}
+		if max(p.QueueTimeoutSeconds, p.ActiveDeadlineSeconds) > MaxDispatchSeconds {
+			return fmt.Errorf("dispatch config: profile %s has a second count over %d", p.Name, MaxDispatchSeconds)
+		}
+		if p.Concurrency < 1 || len(p.Tiers) == 0 {
+			return fmt.Errorf("dispatch config: profile %s needs a concurrency and a tier", p.Name)
+		}
+		if p.Draining() != (len(p.Durables) == 0) {
+			return fmt.Errorf("dispatch config: profile %s has %d durables; a live profile needs one, a draining one has none", p.Name, len(p.Durables))
 		}
 		for _, d := range p.Durables {
 			if d.Name != ProfileDurableName(p.Name, d.Tier, d.Kind) {
@@ -418,4 +504,33 @@ const (
 // ones a task can be offered to.
 func ProfilePoolSelector(profile, tier string) string {
 	return fmt.Sprintf("%s=%s,%s=%s,%s=%s", ProfileComponentLabel, ProfileWorkerComponent, ProfileNameLabel, profile, ProfileTierLabel, tier)
+}
+
+// podTemplateWithContainers reports whether raw is a JSON pod template with
+// at least one container: a null, an empty object or a scalar puts no
+// profile in Job mode.
+func podTemplateWithContainers(raw json.RawMessage) bool {
+	var t struct {
+		Spec *struct {
+			Containers []json.RawMessage `json:"containers"`
+		} `json:"spec"`
+	}
+	return json.Unmarshal(raw, &t) == nil && t.Spec != nil && len(t.Spec.Containers) > 0
+}
+
+// labelValue and labelName are Kubernetes' label value and name syntax.
+var (
+	labelValue  = regexp.MustCompile(`^(([A-Za-z0-9][-A-Za-z0-9_.]{0,61})?[A-Za-z0-9])?$`)
+	labelName   = regexp.MustCompile(`^([A-Za-z0-9][-A-Za-z0-9_.]{0,61})?[A-Za-z0-9]$`)
+	labelPrefix = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`)
+)
+
+// validLabelKey reports whether k is a Kubernetes label key: a name, with
+// an optional DNS-subdomain prefix and a slash.
+func validLabelKey(k string) bool {
+	prefix, name, found := strings.Cut(k, "/")
+	if !found {
+		return labelName.MatchString(k)
+	}
+	return len(prefix) <= 253 && labelPrefix.MatchString(prefix) && labelName.MatchString(name)
 }

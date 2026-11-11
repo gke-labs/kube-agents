@@ -265,6 +265,18 @@ func (m *MultiAdapter) ShowsTaskStatus(conversation string) bool {
 	return ok && shower.ShowsTaskStatus(conversation)
 }
 
+// AnswersOnLine answers for the backend that owns the conversation
+// (LineAnswerer); one that does not implement it keeps the post and the
+// terminal edit.
+func (m *MultiAdapter) AnswersOnLine(conversation string) bool {
+	a, err := m.pick(conversation)
+	if err != nil {
+		return false
+	}
+	answerer, ok := a.(LineAnswerer)
+	return ok && answerer.AnswersOnLine(conversation)
+}
+
 func (m *MultiAdapter) InboundVerified(conversation, messageID string, verified bool) {
 	if a, err := m.pick(conversation); err == nil {
 		if observer, ok := a.(VerifiedObserver); ok {
@@ -332,10 +344,28 @@ func (m *MultiAdapter) SetBoardActor(actor BoardActor) {
 	}
 }
 
+func (m *MultiAdapter) SetBoardAdmits(admits BoardAdmits) {
+	for _, a := range m.byPrefix {
+		if sink, ok := a.(BoardAdmitSink); ok {
+			sink.SetBoardAdmits(admits)
+		}
+	}
+}
+
 func (m *MultiAdapter) SetSessionLookup(lookup SessionLookup, idleTTL time.Duration) {
 	for _, a := range m.byPrefix {
 		if sink, ok := a.(SessionLookupSink); ok {
 			sink.SetSessionLookup(lookup, idleTTL)
+		}
+	}
+}
+
+// SetSenderAdmission hands the gateway's admission gate to every backend
+// that reads it (SenderAdmissionSink), as SetSessionLookup does.
+func (m *MultiAdapter) SetSenderAdmission(admits SenderAdmission) {
+	for _, a := range m.byPrefix {
+		if sink, ok := a.(SenderAdmissionSink); ok {
+			sink.SetSenderAdmission(admits)
 		}
 	}
 }

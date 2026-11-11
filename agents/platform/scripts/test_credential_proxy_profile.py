@@ -688,6 +688,27 @@ class ProfileRouteTest(unittest.TestCase):
                 status, body = self.post({"argv": argv})
                 self.assert_refused(status, body, task_confinement.RULE_TASK_TARGET)
 
+    def test_a_task_whose_target_the_install_excludes_is_refused_metadata_reads_included(self):
+        import scope_exclude
+        import tempfile
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        scope_file = Path(directory.name) / "scope.json"
+        scope_file.write_text(json.dumps({"exclude": {"projects": [], "clusters": [
+            {"projectId": TARGET.project, "location": TARGET.location, "clusterName": TARGET.cluster}]}}),
+            encoding="utf-8")
+        self.addCleanup(self._restore, "exclusions", "exclusions" in CredentialProxyHandler.__dict__,
+                        CredentialProxyHandler.__dict__.get("exclusions"))
+        CredentialProxyHandler.exclusions = scope_exclude.Exclusions(path=lambda: str(scope_file))
+        for argv in (
+            ["kubectl", "get", "pods"],
+            ["gcloud", "container", "clusters", "describe", TARGET.cluster],
+        ):
+            with self.subTest(argv=argv):
+                status, body = self.post({"argv": argv})
+                self.assert_refused(status, body, scope_exclude.RULE_EXCLUDED_CLUSTER)
+
     def test_a_kubeconfig_context_outside_the_target_is_refused(self):
         status, body = self.post({"argv": ["kubectl", "get", "pods"], "kubeconfigContext": OTHER_CONTEXT})
         self.assert_refused(status, body, task_confinement.RULE_TASK_TARGET)

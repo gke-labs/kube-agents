@@ -128,7 +128,7 @@ LOGS="$(kubectl --context="$CONTEXT" logs -n "$NAMESPACE" deployment/platform-ag
 # deduplicated alert — the two outcomes this script exists to catch. Match on what the
 # adapter DID instead.
 ROUTE_LOGS="$(printf '%s\n' "$LOGS" | grep -i -- "$ROUTE_NAME" || true)"
-saw() { printf '%s\n' "$ROUTE_LOGS" | grep -qi -- "$1"; }
+saw() { grep -qi -- "$1" <<<"$ROUTE_LOGS"; }
 
 STATUS=1
 echo ""

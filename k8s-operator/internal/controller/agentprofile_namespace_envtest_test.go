@@ -251,7 +251,7 @@ func TestLiteLLMAdmitsProfilePodsOnlyWhenTheyAreFenced(t *testing.T) {
 func chartProfileNamespace(agent *agentv1alpha1.PlatformAgent) *corev1.Namespace {
 	return &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
 		Name:        profileNamespaceName(agent),
-		Labels:      map[string]string{profileNamespaceComponentLabel: profileNamespaceComponent},
+		Labels:      map[string]string{profileNamespaceComponentLabel: profileNamespaceComponent, labelPartOf: partOfKubeAgents},
 		Annotations: map[string]string{helmReleaseNamespaceAnnotation: agent.Namespace},
 	}}
 }

@@ -49,7 +49,10 @@ ensures the drift report focuses on out-of-band changes to infrastructure.
 An install whose state predates this capability (it is published as an `image_tag`
 Terraform output) falls back to the running cluster tag and notes this in the job log;
 the first subsequent atomic reconcile records the tag into state, after which all plans
-are clean.
+are clean. The `sizing_profile` and `node_pool_shape_inputs` outputs, which `lifecycle.sh`'s
+node-pool shape guard reads, have the same shape: an environment whose state predates them
+plans those two output additions and nothing else, which the report opens an issue for, until
+the next reconcile records them and the clean plan closes the issue.
 
 ## Deploying and reconciling long-lived environments
 
@@ -228,6 +231,13 @@ Optional, and copied through when set: `CLUSTER_MODE`, `MODEL_DEFAULT_NAME`,
 `HELM_UPGRADE_INSTALL`. Secrets: `GH_APP_ID`,
 `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `SLACK_BOT_TOKEN`,
 `SLACK_APP_TOKEN`.
+
+With `GH_APP_ID` set and `KMS_KEYRING` or `KMS_KEY` unset, the rendered file
+names the project-wide minter key ring, key and GSA (`github-token-minter-keyring`,
+`github-token-minter-key`, `kubeagents-github-minter-gsa`), the names environments
+have always run on. A rebuild has no minter in its state, so the installer would
+otherwise derive per-install names. Named explicitly, a key with no owner labels
+is adopted as the environment's own and labelled at the apply.
 
 `HELM_UPGRADE_INSTALL=true` makes the composition create the `kube-agents` Helm
 release with `helm upgrade --install` (the release's `upgrade_install`). The Helm

@@ -156,8 +156,8 @@ spec:
           # Deployments, StatefulSets, Services, ServiceAccounts, ConfigMaps,
           # PersistentVolumeClaims, NetworkPolicies and PodDisruptionBudgets;
           # ClusterRoles, ClusterRoleBindings, Roles and RoleBindings; and the
-          # three custom resources themselves (PlatformAgent always,
-          # AgentPlugin and AgentProfile where their CRDs are installed and
+          # custom resources themselves (PlatformAgent always, AgentPlugin,
+          # AgentProfile and Tier where their CRDs are installed and
           # readable). Deployments, StatefulSets, Services and
           # PersistentVolumeClaims grow with the cluster's workloads, a
           # Deployment carrying a whole pod template, so a cluster with
@@ -169,21 +169,28 @@ spec:
           # 3.7 MiB of live heap, in a process of 22 MiB RSS. Keep in step
           # with charts/kube-agents/values.yaml's operator.resources.
           #
-          # requests.cpu is 50m rather than the 10m the manager needs: GKE
-          # Autopilot admits a pod unchanged only at 50m or more and between
-          # 1 and 6.5 GiB of memory per vCPU on the requests pair, and raises
-          # the smaller request into that band, so 10m beside 128Mi was
-          # admitted at 50m whatever this line said. Autopilot without
-          # bursting also raises the pod to 250m CPU and 512 MiB and sets the
-          # limits equal to the requests; the manager reads the admitted
-          # limit through OPERATOR_MEMORY_LIMIT_BYTES.
+          # The requests are sized to be livable as the limits: GKE Autopilot
+          # without Pod bursting (a cluster or compute class with bursting
+          # off) sets each limit equal to its request, so the request is
+          # what the manager then runs under, and 128Mi, right for the
+          # measurement above, left no room for the cache to grow with the
+          # cluster before the manager was OOM-killed. 256Mi holds a cluster
+          # several times the measured one; the manager reads whichever limit
+          # was admitted through OPERATOR_MEMORY_LIMIT_BYTES. requests.cpu is
+          # 100m rather than the 10m the manager needs because Autopilot
+          # admits a pod unchanged only at 50m or more and between 1 and
+          # 6.5 GiB of memory per vCPU on the requests pair, and raises the
+          # smaller request into that band; 100m beside 256Mi is 2.5 GiB per
+          # vCPU, inside it. Where Autopilot raises a pod to its per-pod
+          # minimums (250m CPU, 512 MiB) the admitted pod is still larger
+          # than this manifest; where it does not, this is the pod it admits.
           resources:
             limits:
               cpu: 500m
               memory: 512Mi
             requests:
-              cpu: 50m
-              memory: 128Mi
+              cpu: 100m
+              memory: 256Mi
           volumeMounts:
             - mountPath: /tmp/k8s-webhook-server/serving-certs
               name: cert

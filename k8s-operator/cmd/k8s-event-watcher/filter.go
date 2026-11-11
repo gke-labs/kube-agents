@@ -19,13 +19,55 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
+// configConnectorReasons are the Event.Reason values Config Connector's
+// controller records against a managed resource whose reconcile did not
+// succeed, as its monitoring guide lists them
+// (docs.cloud.google.com/config-connector/docs/how-to/monitoring-your-resources).
+// They are on the shipped reason lists, here and in the entrypoint's --reason,
+// because a managed resource that cannot apply is otherwise silent: the
+// controller does not crash, logs only on the object, and the resource's
+// Ready=False stands until an audit reads it. Updating, UpToDate, Deleting and
+// Deleted are the controller's normal states and stay off the list. Two of
+// them, configConnectorSettleReasons, are transient by the guide's own
+// account and sit in the settle family; the rest are verdicts and fire on
+// their first sighting (settleApplies).
+var configConnectorReasons = []string{
+	"UpdateFailed",
+	"DeleteFailed",
+	"DependencyNotReady",
+	"DependencyNotFound",
+	"DependencyInvalid",
+	"ManagementConflict",
+	"Unmanaged",
+	"PreActuationTransformFailed",
+	"PostActuationTransformFailed",
+}
+
+// configConnectorSettleReasons are the two Config Connector reasons that are
+// the normal state of an ordered apply for a while: DependencyNotReady while
+// a referenced resource is still being created, and Unmanaged, which the guide
+// says can appear transiently when a resource and its namespace's
+// ConfigConnectorContext are created together. Held for the settle period, so
+// one that clears on the next reconcile is not forwarded. The other seven are
+// verdicts (an API refused the change, a reference is missing or malformed,
+// another resource owns the Google Cloud resource) and fire at once: a settle
+// period measured on one Event object's stamps would otherwise hold a failure
+// whose message changes between reconciles forever, since each sighting is
+// then a new object with no span.
+var configConnectorSettleReasons = stringSet([]string{
+	"DependencyNotReady",
+	"Unmanaged",
+})
+
 // defaultReasons lists the standard Event.Reason values that trigger investigations.
-// These cover typical Kubernetes workload and node failures, but operators can
-// override this list via the --reason flag.
-var defaultReasons = []string{
+// These cover typical Kubernetes workload and node failures and Config
+// Connector's reconcile failures, but operators can override this list via
+// the --reason flag.
+var defaultReasons = append([]string{
 	"CrashLoopBackOff",
 	"ImagePullBackOff",
 	"ErrImagePull",
@@ -37,7 +79,7 @@ var defaultReasons = []string{
 	"NetworkNotReady",
 	"NodeNotReady",
 	"Evicted",
-}
+}, configConnectorReasons...)
 
 // filterConfig holds the configuration for event filtering rules.
 // Loaded from command-line flags and injected to allow independent unit testing.
@@ -51,9 +93,10 @@ type filterConfig struct {
 	// excludedNamespaces suppresses events from these namespaces.
 	// Exclude rules take precedence over allowedNamespaces rules.
 	excludedNamespaces map[string]struct{}
-	// alertExclude holds the --alert-exclude rules: an event any of them
-	// matches opens no incident (gateAlertExcluded). Set after
-	// newFilterConfig, from parseAlertExclude.
+	// alertExclude holds the alert-exclude rules in force at start: an event
+	// any of them matches opens no incident (gateAlertExcluded). Set after
+	// newFilterConfig, from parseAlertExclude. The filter holds its own copy,
+	// which --alert-exclude-file replaces (see filter.alertExclude).
 	alertExclude []alertExcludeRule
 	// unhealthyMinCount specifies the minimum repeat threshold count for "Unhealthy"
 	// events before they pass. This prevents transient probe failures from triggering alerts.
@@ -263,6 +306,28 @@ const (
 	// around it, and a substring match would also hold an event from some
 	// other writer that quoted it.
 	noNodesAvailableMessage = "no nodes available to schedule pods"
+	// reasonFailed is kubelet's reason for a container it could not create
+	// and for one it created but could not start (events.FailedToCreateContainer
+	// and events.FailedToStartContainer are both "Failed").
+	reasonFailed = "Failed"
+	// hostIPUnknownMessage opens kubelet's event when building a container's
+	// config needs the node's IP (a status.hostIP env var) and the Node
+	// carries no InternalIP or ExternalIP: "Error: " (kuberuntime's
+	// startContainer) around pkg/util/node's GetNodeHostIPs error. A node the
+	// autoscaler is deleting loses its addresses while its DaemonSet pods are
+	// still being started. Matched as a prefix so another writer that quotes
+	// the text mid-message does not match.
+	hostIPUnknownMessage = "Error: host IP unknown; known addresses:"
+	// podEtcHostsOpenPrefix and podEtcHostsMissingSuffix bound kubelet's event
+	// when building a container's config writes the pod's managed hosts file
+	// (makeHostsMount, <root-dir>/pods/<uid>/etc-hosts) after the pod's
+	// directory has been removed: os.WriteFile's PathError, "open <path>: no
+	// such file or directory", inside startContainer's "Error: ". A pod deleted
+	// while kubelet is still starting it, as Autopilot's balloon pods are. The
+	// path between is left open because kubelet's --root-dir moves it; the
+	// suffix names the pod's etc-hosts, not a host-network pod's /etc/hosts.
+	podEtcHostsOpenPrefix    = "Error: open "
+	podEtcHostsMissingSuffix = "/etc-hosts: no such file or directory"
 )
 
 // newFilterConfig creates a new filterConfig, applying defaults for missing values.
@@ -401,10 +466,26 @@ type filter struct {
 	fsLogMu     sync.Mutex
 	fsLogged    boundedEntries[filterGate]
 	fsLastSweep time.Time
+	// alertExclude is the alert-exclude rules in force: cfg.alertExclude at
+	// start, replaced whole when --alert-exclude-file changes (see
+	// reloadAlertExcludeFile). Read from every cluster's delivery goroutine.
+	alertExclude atomic.Pointer[[]alertExcludeRule]
 }
 
 func newFilter(cfg filterConfig) *filter {
-	return &filter{cfg: cfg, fsLogged: newBoundedEntries[filterGate](failedSchedulingLogEvery, maxFailedSchedulingLogEntries)}
+	f := &filter{cfg: cfg, fsLogged: newBoundedEntries[filterGate](failedSchedulingLogEvery, maxFailedSchedulingLogEntries)}
+	f.setAlertExclude(cfg.alertExclude)
+	return f
+}
+
+// alertExcludeRules is the alert-exclude rules in force.
+func (f *filter) alertExcludeRules() []alertExcludeRule {
+	return *f.alertExclude.Load()
+}
+
+// setAlertExclude puts rules in force for every event decided after it.
+func (f *filter) setAlertExclude(rules []alertExcludeRule) {
+	f.alertExclude.Store(&rules)
 }
 
 func (f *filter) clock() time.Time {
@@ -509,7 +590,7 @@ func (f *filter) Decide(ev TriageEvent) filterGate {
 			return gateNamespaceNotAllowed
 		}
 	}
-	if scaleUpVerdictFor(ev.Key.Reason) == scaleUpNone && alertExcluded(f.cfg.alertExclude, ev) {
+	if scaleUpVerdictFor(ev.Key.Reason) == scaleUpNone && alertExcluded(f.alertExcludeRules(), ev) {
 		return gateAlertExcluded
 	}
 	if ev.Key.Reason == "Unhealthy" && belowMinCount(ev.Count, f.cfg.unhealthyMinCount) {
@@ -542,7 +623,7 @@ func (f *filter) Decide(ev TriageEvent) filterGate {
 	// both and the count intact. The cost is the next sighting after the
 	// period, up to kubelet's 5m back-off ceiling on a long-running crash
 	// loop. Zero timestamps fail open, as an unknown count does.
-	if f.cfg.settle > 0 && settleApplies(canonicalizeReason(ev.Key.Reason, ev.Message)) && !settled(ev, f.cfg.settle) {
+	if f.cfg.settle > 0 && settleApplies(canonicalizeReason(ev.Key.Reason, ev.Message), ev.Message) && !settled(ev, f.cfg.settle) {
 		return gateSettle
 	}
 	if scaleUpVerdictFor(ev.Key.Reason) != scaleUpNone {
@@ -812,7 +893,8 @@ func autopilotScaleToZero(ev TriageEvent) bool {
 		strings.TrimSpace(ev.Message) == noNodesAvailableMessage
 }
 
-// settleApplies reports whether the canonical reason is in the settle family:
+// settleApplies reports whether the canonical reason, and for Failed the
+// message, is in the settle family:
 // the reasons Autopilot's node churn emits routinely, that clear on their own
 // more often than not, and that are re-emitted while they last. The
 // crash-loop family is the motivating one (a kubelet object-cache warm-up on
@@ -825,14 +907,41 @@ func autopilotScaleToZero(ev TriageEvent) bool {
 // image-pull family, whose transient half has its own gate and whose
 // terminal half (a bad tag) should fire at once; FailedScheduling, which the
 // autoscaler gate reads with a better signal than time; and FailedToDrainNode.
-// The family is read on the canonical reason so kubelet's Reason=BackOff
-// crash loop is in it and its image-pull BackOff is not.
-func settleApplies(canonicalReason string) bool {
+// Of Config Connector's reconcile failures only configConnectorSettleReasons
+// are in it: a DependencyNotReady during an ordinary apply of several
+// resources clears inside the period, while UpdateFailed and the other
+// verdicts fire at once. The family is read on the canonical reason so
+// kubelet's Reason=BackOff crash loop is in it and its image-pull BackOff is
+// not.
+//
+// A plain Failed joins it only when the message is one of kubelet's config
+// errors (retriedConfigError). A start error stays out because a container
+// that was created and failed to start is retried only as its pod's
+// restartPolicy allows, so under Never it fails once and a span would never
+// reach the period; the other config errors stay out only because the list
+// holds the messages seen as noise, and kubelet would retry them too.
+func settleApplies(canonicalReason, message string) bool {
 	switch canonicalReason {
 	case "CrashLoopBackOff", "FailedMount", "Unhealthy":
 		return true
+	case reasonFailed:
+		return retriedConfigError(message)
 	}
-	return false
+	_, configConnector := configConnectorSettleReasons[canonicalReason]
+	return configConnector
+}
+
+// retriedConfigError reports whether a Failed event's message is a config
+// error kubelet raises before any container exists. ShouldContainerBeRestarted
+// starts a container with no status whatever the restartPolicy, so kubelet
+// retries such an error on every pod sync while it lasts and stops only when
+// the pod is deleted: a lasting one crosses the settle period, and one whose
+// pod went with its node, or was deleted before it started, is never sighted
+// again. A list of known messages rather than "every Failed but the start
+// errors", so a message not on it still fires on its first sighting.
+func retriedConfigError(message string) bool {
+	return strings.HasPrefix(message, hostIPUnknownMessage) ||
+		(strings.HasPrefix(message, podEtcHostsOpenPrefix) && strings.HasSuffix(message, podEtcHostsMissingSuffix))
 }
 
 // settled reports whether the event's own sightings span the settle period.

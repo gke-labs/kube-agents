@@ -62,6 +62,11 @@ locals {
   run_wait  = 900
   poll      = 15
   inventory = "${local.home}/INVENTORY.raw.md ${local.home}/INVENTORY.md"
+  # The sweep worker's collector leaves one file per audited cluster here on
+  # the sandbox and the hand-off reads them (bootstrap_handoff.SWEEP_DIR). The
+  # hand-off refuses a file stamped with another sweep, but a leftover still
+  # costs a read and a Gaps line, so the directory goes with the raw file.
+  sweep_dir = "${local.home}/INVENTORY.sweep"
   # The longest one run of the gate can
   # take at the default scope cap, which is what this stack installs:
   # bootstrap_scan_gate.py's RECONCILE_TIMEOUT_SECONDS (390) plus one cron
@@ -121,6 +126,7 @@ resource "null_resource" "sweep" {
     python            = local.python
     key_like          = local.key_like
     inventory         = local.inventory
+    sweep_dir         = local.sweep_dir
     cap_file          = local.cap_file
     cards_cap         = local.cards_cap
     cap_mark          = local.cap_mark
@@ -294,7 +300,7 @@ resource "null_resource" "sweep" {
         clear_status=0
         if sandbox_pods="$(kubectl get pods -n "${var.agent_namespace}" -l "${var.sandbox_selector}" -o name)"; then
           for pod in $sandbox_pods; do
-            kubectl exec -n "${var.agent_namespace}" "$pod" -c "${var.sandbox_container}" -- rm -f ${local.inventory} || clear_status=1
+            kubectl exec -n "${var.agent_namespace}" "$pod" -c "${var.sandbox_container}" -- sh -c "rm -f ${local.inventory} && rm -rf ${local.sweep_dir}" || clear_status=1
           done
         else
           clear_status=1
@@ -591,7 +597,7 @@ resource "null_resource" "sweep" {
       if sandbox_pods="$(kubectl get pods -n "$ns" -l "${self.triggers.sandbox_selector}" -o name)"; then
         for pod in $sandbox_pods; do
           kubectl exec -n "$ns" "$pod" -c "${self.triggers.sandbox_container}" -- \
-            rm -f ${self.triggers.inventory} || failed="$failed, remove the INVENTORY files from $pod"
+            sh -c "rm -f ${self.triggers.inventory} && rm -rf ${self.triggers.sweep_dir}" || failed="$failed, remove the INVENTORY files from $pod"
         done
       else
         failed="$failed, list the sandbox pods"

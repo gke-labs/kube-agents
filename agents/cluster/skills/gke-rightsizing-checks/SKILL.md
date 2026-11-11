@@ -13,6 +13,8 @@ The skill is read-only. It produces checks and arithmetic, and a proposal the pe
 
 Run all five checks for each workload or pool you propose to change, and show each one in the answer: what you checked, the command, and what it returned. A check you could not run is reported as not run, with the reason, and you propose no number for the dimension it governs. Every effect claim (nodes freed, CPU or memory freed, a percentage, "fits without scale-up") carries its calculation, with the inputs it used. Give no prices: this deployment has no price data, and a dollar figure here is a guess.
 
+On GKE Autopilot, `kube-system/gke-system-balloon-pod` pods and GKE system reservation pods in `kube-system` or `gke-managed-*` hold low-priority spare scheduling headroom that GKE preempts automatically when user pods need CPU or memory. Never run these checks on them, never query or describe `balloon` pods, and never propose lowering or deleting them; scope rightsizing checks strictly to non-system user namespaces.
+
 Set the context once:
 
 ```bash
@@ -85,7 +87,7 @@ Pass `rightsizing` to `kanban_complete`, one entry per workload or pool:
 - `dependency`: one sentence on what the dependency means for a cut, for example "a lower request adds replicas" or "a lower request is also a lower limit".
 - `checks`: one finding each for `hpa`, `qos`, `sharing`, `source` and `packing`, with the command or reading behind it. "No HPA targets it" is a finding. Not needed for `not_on_cluster`.
 
-Each field is one line of at most 200 characters, with no code fence. The tool renders these entries in your `result`, and the Platform Agent's summary gets the same lines, so the person sees each dependency whatever the summary says. `kanban_complete` refuses, once, a completion without them on a card that names this skill.
+Pass at most 8 entries. Each field is one line of at most 200 characters, with no code fence. The tool renders these entries in your `result`, and the Platform Agent's summary gets the same lines, so the person sees each dependency whatever the summary says. `kanban_complete` refuses, once, a completion without them on a card that names this skill.
 
 In `result` itself, after at most one bold sentence, for each workload or pool:
 

@@ -16,9 +16,11 @@ var (
 	validRefsHeadsPrefixPattern = regexp.MustCompile(`^refs/heads/[A-Za-z0-9]`)
 	validForgeNamePattern       = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
 	allowedForgeProviders       = map[string]bool{
-		"github": true,
-		"gitlab": true,
-		"gitea":  true,
+		"github":               true,
+		"gitlab":               true,
+		"gitea":                true,
+		"bitbucket":            true,
+		"bitbucket-datacenter": true,
 	}
 )
 
@@ -32,6 +34,12 @@ const (
 	categoryIAM       = "iam"
 	categoryContext   = "context"
 	categoryCustom    = "custom"
+
+	// The providers the PlatformAgent CRD's forge enum registers, as the
+	// errors name them.
+	allowedForgeProvidersText = "github, gitlab, gitea, bitbucket, or bitbucket-datacenter"
+	// The provider a forge with no provider reads as.
+	defaultForgeProvider = "github"
 
 	maxRepositoriesCount = 50
 	maxBaseBranchLength  = 200
@@ -174,7 +182,11 @@ func generateHelmValuesYAML(forges []forgeInfo, repos []repositoryInfo) string {
 		sb.WriteString("      - name: github\n        provider: github\n")
 	} else {
 		for _, f := range forges {
-			sb.WriteString(fmt.Sprintf("      - name: %s\n        provider: %s\n", f.Name, f.Provider))
+			provider := f.Provider
+			if provider == "" {
+				provider = defaultForgeProvider
+			}
+			sb.WriteString(fmt.Sprintf("      - name: %s\n        provider: %s\n", f.Name, provider))
 			if f.Host != "" {
 				sb.WriteString(fmt.Sprintf("        host: %q\n", f.Host))
 			}
@@ -382,6 +394,16 @@ func (s *server) handleRepositoriesSet(w http.ResponseWriter, r *http.Request) {
 	categories := make(map[string]string)
 	validatedRepos := make([]repositoryInfo, 0, len(req.Repositories))
 	forgesNeeded := make(map[string]forgeInfo)
+	// forgeOrder holds each name in the order it first went into forgesNeeded:
+	// the cluster's forges first, as declared, then new ones. The first GitHub
+	// forge sets the install's GitHub host, so the save must not reorder them.
+	var forgeOrder []string
+	needForge := func(f forgeInfo) {
+		if _, seen := forgesNeeded[f.Name]; !seen {
+			forgeOrder = append(forgeOrder, f.Name)
+		}
+		forgesNeeded[f.Name] = f
+	}
 
 	s.reposMu.RLock()
 	cachedForges := make([]forgeInfo, len(s.cachedForges))
@@ -390,7 +412,7 @@ func (s *server) handleRepositoriesSet(w http.ResponseWriter, r *http.Request) {
 
 	for _, cf := range cachedForges {
 		if cf.Name != "" {
-			forgesNeeded[cf.Name] = cf
+			needForge(cf)
 		}
 	}
 
@@ -408,10 +430,10 @@ func (s *server) handleRepositoriesSet(w http.ResponseWriter, r *http.Request) {
 			f.Provider = "github"
 		}
 		if !allowedForgeProviders[f.Provider] {
-			writeError(w, http.StatusBadRequest, "invalid_provider", fmt.Sprintf("Provider %q is invalid; must be github, gitlab, or gitea.", f.Provider))
+			writeError(w, http.StatusBadRequest, "invalid_provider", fmt.Sprintf("Provider %q is invalid; must be %s.", f.Provider, allowedForgeProvidersText))
 			return
 		}
-		forgesNeeded[f.Name] = f
+		needForge(f)
 	}
 
 	usedForgeNames := make(map[string]bool)
@@ -462,7 +484,7 @@ func (s *server) handleRepositoriesSet(w http.ResponseWriter, r *http.Request) {
 			r.Provider = "github"
 		}
 		if !allowedForgeProviders[r.Provider] {
-			writeError(w, http.StatusBadRequest, "invalid_provider", fmt.Sprintf("Repository %q has invalid provider %q; must be github, gitlab, or gitea.", r.Repository, r.Provider))
+			writeError(w, http.StatusBadRequest, "invalid_provider", fmt.Sprintf("Repository %q has invalid provider %q; must be %s.", r.Repository, r.Provider, allowedForgeProvidersText))
 			return
 		}
 		r.Forge = strings.TrimSpace(r.Forge)
@@ -489,10 +511,10 @@ func (s *server) handleRepositoriesSet(w http.ResponseWriter, r *http.Request) {
 				r.Host = existingForge.Host
 			}
 		} else {
-			forgesNeeded[r.Forge] = forgeInfo{
+			needForge(forgeInfo{
 				Name:     r.Forge,
 				Provider: r.Provider,
-			}
+			})
 		}
 		usedForgeNames[r.Forge] = true
 
@@ -516,9 +538,9 @@ func (s *server) handleRepositoriesSet(w http.ResponseWriter, r *http.Request) {
 			usedForgeNames[fName] = true
 		}
 	}
-	for name, f := range forgesNeeded {
+	for _, name := range forgeOrder {
 		if usedForgeNames[name] {
-			forgesList = append(forgesList, f)
+			forgesList = append(forgesList, forgesNeeded[name])
 		}
 	}
 	if len(forgesList) == 0 {
@@ -530,7 +552,8 @@ func (s *server) handleRepositoriesSet(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), repositoriesTimeout)
 	defer cancel()
 
-	if err := s.saveRepositoriesToCluster(ctx, topology, validatedRepos, forgesList, categories); err != nil {
+	saved, err := s.saveRepositoriesToCluster(ctx, topology, validatedRepos, forgesList, categories)
+	if err != nil {
 		log.Printf(logPrefix+"could not patch PlatformAgent repositories: %v", err)
 		writeError(w, http.StatusInternalServerError, "patch_failed", fmt.Sprintf("Failed to update PlatformAgent in cluster: %v", err))
 		return
@@ -539,20 +562,23 @@ func (s *server) handleRepositoriesSet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, repositoriesResponse{
 		Topology:       topology,
 		Repositories:   validatedRepos,
-		Forges:         forgesList,
-		HelmValuesYAML: generateHelmValuesYAML(forgesList, validatedRepos),
+		Forges:         saved,
+		HelmValuesYAML: generateHelmValuesYAML(saved, validatedRepos),
 	})
 }
 
-func (s *server) saveRepositoriesToCluster(ctx context.Context, topology string, validatedRepos []repositoryInfo, forgesList []forgeInfo, categories map[string]string) error {
+// saveRepositoriesToCluster patches the PlatformAgent and returns the forges
+// in the order it wrote them, which is the cluster's.
+func (s *server) saveRepositoriesToCluster(ctx context.Context, topology string, validatedRepos []repositoryInfo, forgesList []forgeInfo, categories map[string]string) ([]forgeInfo, error) {
 	if s.kube != nil {
 		path := fmt.Sprintf(platformAgentsAPIPath, s.cfg.PodNamespace, s.cfg.PlatformAgentName)
 		existingForges := map[string]map[string]any{}
+		var clusterForgeOrder []string
 		existingRepos := map[string]map[string]any{}
 		hasGitHubAlias := false
 		var rawCR map[string]any
 		if err := s.kube.get(ctx, path, &rawCR); err != nil {
-			return fmt.Errorf("read PlatformAgent before patch: %w", err)
+			return nil, fmt.Errorf("read PlatformAgent before patch: %w", err)
 		}
 		if spec, ok := rawCR["spec"].(map[string]any); ok {
 			if integ, ok := spec["integration"].(map[string]any); ok {
@@ -564,6 +590,7 @@ func (s *server) saveRepositoriesToCluster(ctx context.Context, topology string,
 						if fm, ok := item.(map[string]any); ok {
 							if name, _ := fm["name"].(string); name != "" {
 								existingForges[name] = fm
+								clusterForgeOrder = append(clusterForgeOrder, name)
 							}
 						}
 					}
@@ -585,6 +612,27 @@ func (s *server) saveRepositoriesToCluster(ctx context.Context, topology string,
 			}
 		}
 
+		// The forges the cluster declares keep its order, as read just now, and
+		// new ones follow in the order given: the first GitHub forge sets the
+		// install's GitHub host, and the console's cache can be older.
+		pending := make(map[string]forgeInfo, len(forgesList))
+		for _, f := range forgesList {
+			pending[f.Name] = f
+		}
+		ordered := make([]forgeInfo, 0, len(forgesList))
+		for _, name := range clusterForgeOrder {
+			if f, ok := pending[name]; ok {
+				ordered = append(ordered, f)
+				delete(pending, name)
+			}
+		}
+		for _, f := range forgesList {
+			if _, ok := pending[f.Name]; ok {
+				ordered = append(ordered, f)
+			}
+		}
+		forgesList = ordered
+
 		mergedForges := make([]map[string]any, 0, len(forgesList))
 		for _, f := range forgesList {
 			fm := map[string]any{}
@@ -594,7 +642,11 @@ func (s *server) saveRepositoriesToCluster(ctx context.Context, topology string,
 				}
 			}
 			fm["name"] = f.Name
-			fm["provider"] = f.Provider
+			// A forge cached from the cluster with no provider has none to
+			// write; the CRD refuses "", and an absent provider reads as github.
+			if f.Provider != "" {
+				fm["provider"] = f.Provider
+			}
 			if f.Host != "" {
 				fm["host"] = f.Host
 			}
@@ -647,7 +699,7 @@ func (s *server) saveRepositoriesToCluster(ctx context.Context, topology string,
 		}
 
 		if _, err := s.kube.doJSON(ctx, http.MethodPatch, path, patch, nil); err != nil {
-			return err
+			return nil, err
 		}
 	}
 
@@ -656,7 +708,7 @@ func (s *server) saveRepositoriesToCluster(ctx context.Context, topology string,
 	s.cachedTopology = topology
 	s.cachedForges = forgesList
 	s.reposMu.Unlock()
-	return nil
+	return forgesList, nil
 }
 
 type repoConnectRequest struct {
@@ -747,7 +799,7 @@ func (s *server) handleRepositoriesConnect(w http.ResponseWriter, r *http.Reques
 		provider = "github"
 	}
 	if !allowedForgeProviders[provider] {
-		writeError(w, http.StatusBadRequest, "invalid_provider", fmt.Sprintf("Provider %q is invalid; must be github, gitlab, or gitea.", provider))
+		writeError(w, http.StatusBadRequest, "invalid_provider", fmt.Sprintf("Provider %q is invalid; must be %s.", provider, allowedForgeProvidersText))
 		return
 	}
 	if forge == "" || forge == provider {
@@ -780,6 +832,16 @@ func (s *server) handleRepositoriesConnect(w http.ResponseWriter, r *http.Reques
 		category = inferCategory(repoName, role)
 	}
 
+	// The browse link is built on the declared forge's host, as a refresh
+	// builds it: Gitea and Bitbucket Data Center have no default host.
+	forgeHost := ""
+	for _, f := range forges {
+		if f.Name == forge {
+			forgeHost = f.Host
+			break
+		}
+	}
+
 	// If making this repo 'gitops', demote any previous gitops repo to 'managed'
 	if role == "gitops" {
 		for i := range existingList {
@@ -800,6 +862,7 @@ func (s *server) handleRepositoriesConnect(w http.ResponseWriter, r *http.Reques
 			existingList[i].BaseBranch = baseBranch
 			existingList[i].Provider = provider
 			existingList[i].Forge = forge
+			existingList[i].Host = forgeHost
 			existingList[i].URL = repositoryURL(existingList[i])
 			found = true
 			break
@@ -809,6 +872,7 @@ func (s *server) handleRepositoriesConnect(w http.ResponseWriter, r *http.Reques
 		newInfo := repositoryInfo{
 			Forge:      forge,
 			Provider:   provider,
+			Host:       forgeHost,
 			Repository: repoName,
 			Role:       role,
 			BaseBranch: baseBranch,
@@ -836,7 +900,8 @@ func (s *server) handleRepositoriesConnect(w http.ResponseWriter, r *http.Reques
 		categories[r.Repository] = r.Category
 	}
 
-	if err := s.saveRepositoriesToCluster(ctx, topology, existingList, forges, categories); err != nil {
+	saved, err := s.saveRepositoriesToCluster(ctx, topology, existingList, forges, categories)
+	if err != nil {
 		log.Printf(logPrefix+"could not connect repository: %v", err)
 		writeError(w, http.StatusInternalServerError, "patch_failed", fmt.Sprintf("Failed to update repositories: %v", err))
 		return
@@ -845,8 +910,8 @@ func (s *server) handleRepositoriesConnect(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, repositoriesResponse{
 		Topology:       topology,
 		Repositories:   existingList,
-		Forges:         forges,
-		HelmValuesYAML: generateHelmValuesYAML(forges, existingList),
+		Forges:         saved,
+		HelmValuesYAML: generateHelmValuesYAML(saved, existingList),
 	})
 }
 
@@ -890,7 +955,8 @@ func (s *server) handleRepositoriesDisconnect(w http.ResponseWriter, r *http.Req
 		categories[r.Repository] = r.Category
 	}
 
-	if err := s.saveRepositoriesToCluster(ctx, topology, newList, forges, categories); err != nil {
+	saved, err := s.saveRepositoriesToCluster(ctx, topology, newList, forges, categories)
+	if err != nil {
 		log.Printf(logPrefix+"could not disconnect repository: %v", err)
 		writeError(w, http.StatusInternalServerError, "patch_failed", fmt.Sprintf("Failed to update repositories: %v", err))
 		return
@@ -899,8 +965,8 @@ func (s *server) handleRepositoriesDisconnect(w http.ResponseWriter, r *http.Req
 	writeJSON(w, http.StatusOK, repositoriesResponse{
 		Topology:       topology,
 		Repositories:   newList,
-		Forges:         forges,
-		HelmValuesYAML: generateHelmValuesYAML(forges, newList),
+		Forges:         saved,
+		HelmValuesYAML: generateHelmValuesYAML(saved, newList),
 	})
 }
 

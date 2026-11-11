@@ -60,10 +60,41 @@ type refusal struct {
 	detail string
 }
 
-// admit runs the admission checks in order, cheapest first: the tier, the
-// queue age, the parameters, then the verifier. A nil refusal admits, and
-// then adm is what the task's credentials are minted from. An error is no
-// verdict (errStopping, or a verifier that could not be reached,
+// errStopped marks a submission with a stop record (stop.go): ended
+// canceled, never run.
+var errStopped = errors.New("stopped before it started")
+
+// errHeldBack marks an admission that is neither a verdict nor a stop: the
+// submission stays queued, as over a cap, and comes back (an open breaker,
+// or a half-open one trying the oldest held task first).
+var errHeldBack = errors.New("held back at admission")
+
+// noRunner reports whether a task of prof's at tier has nothing to run on,
+// so admission refuses it at once rather than leave it queued until its
+// queue timeout: an unattended tier without Job mode for the profile (no
+// JobRunner, or no Job template, which the operator renders only where the
+// chart installed the Job admission policy) and with no pod in the tier's
+// pool, which the operator builds for the read tier only. A pool that hasn't
+// listed its pods yet says nothing, so a dispatcher just started refuses
+// nothing on it.
+func (d *Dispatcher) noRunner(prof lib.DispatchProfile, tier string) bool {
+	if !d.cfg.unattended(tier) || (d.jobs != nil && len(prof.JobTemplate) > 0) {
+		return false
+	}
+	if p, ok := d.pool.(interface{ Synced() bool }); ok && !p.Synced() {
+		return false
+	}
+	return len(d.pool.Pods(prof.Name, tier)) == 0
+}
+
+// admit runs the admission checks in order, cheapest first: the tier, a runner
+// for it, the queue age, the parameters, then the verifier. A nil refusal
+// admits, and then adm is what the task's credentials are minted from: the
+// cluster the verifier permitted the task on (nil when the task names none
+// and was checked against the namespace), the target a task credential for
+// the credential proxy confines it to (#3889), and whether a change was
+// asked for. An
+// error is no verdict (errStopping, or a verifier that could not be reached,
 // ErrVerifierUnreachable), and the submission is not refused for it. The
 // verifier's permit is reused for verifiedFor across the same submission's
 // retries over a cap, so a queue waiting on a cap doesn't call the verifier
@@ -75,9 +106,30 @@ func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.Dispa
 	if !allowsTier(prof, tier) {
 		return admitted{}, &refusal{ReasonTierNotAllowed, fmt.Sprintf("profile %s does not allow tier %s", prof.Name, tier)}, nil
 	}
+	if d.noRunner(prof, tier) {
+		return admitted{}, &refusal{ReasonNoWorker, fmt.Sprintf("no runner for %s on this install: Job mode is off for profile %s, and no %s worker pool serves it", tier, prof.Name, tier)}, nil
+	}
 	if rec := del.Received(); !rec.IsZero() {
 		if age, limit := now.Sub(rec), queueTimeout(prof); age > limit {
 			return admitted{}, &refusal{ReasonQueueTimeout, fmt.Sprintf("queued %s, over the profile's %s", age.Round(time.Second), limit)}, nil
+		}
+	}
+	if d.stopRequested(ctx, d.log, prof.Name, hk.taskID) {
+		return admitted{}, nil, errStopped
+	}
+	// After the age check: a submission a breaker holds still ends at its
+	// queue timeout.
+	queued := del.Received()
+	if queued.IsZero() {
+		queued = now
+	}
+	// A child of the current half-open probe is part of the probe's own
+	// attempt, not a fresh one: holding it would hold the probe until its
+	// deadline. Every other child waits as a top task does.
+	if !d.probesChild(prof.Name, tier, hk.kind, env.CorrelationID) {
+		if wait, _ := d.breakers.wait(prof.Name, tier, now, func() bool { return d.probing(prof.Name, tier) },
+			func() bool { return d.olderWaiting(hk, queued) }); wait {
+			return admitted{}, nil, errHeldBack
 		}
 	}
 	target, cluster, changeRequested, bad := taskTarget(env, prof, snap.Namespace)

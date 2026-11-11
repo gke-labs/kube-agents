@@ -639,10 +639,11 @@ class CallSiteTest(unittest.TestCase):
         # A failed acquisition gives back the streams already held.
         self.assertIn('release_streams "${held}"', unit)
         # Released on the gone-gateway, state-lock and infra-lock paths and
-        # after the run here, and on the mint-failure, repository-reset and
-        # kubeconfig-copy paths through skip_unit, which all hand it the streams.
+        # after the run here, and on the mint-failure, repository-reset,
+        # kubeconfig-copy and GitOps-write-token paths through skip_unit, which
+        # all hand it the streams.
         self.assertEqual(unit.count('release_streams "${streams}"'), 4)
-        self.assertEqual(unit.count('skip_unit "${task}" "${name}" "${rep}" "${streams}" "${has_stack}"'), 3)
+        self.assertEqual(unit.count('skip_unit "${task}" "${name}" "${rep}" "${streams}" "${has_stack}"'), 4)
         self.assertIn('release_streams "${streams}"', lifted("skip_unit"))
         # Before the infra lock: a stack-bearing unit waiting on its stream
         # must not hold the one tofu lane while it waits.
@@ -657,7 +658,7 @@ class CallSiteTest(unittest.TestCase):
         self.assertEqual(unit.count('"${lock_deadline}"'), 1)
         self.assertIn('"$(stream_lock_deadline "${name}" "${s}" "${streams}")"', unit)
         self.assertIn(
-            'echo $(( $(stream_case_count "$2") * ($(unit_delegation_timeout "$1") + UNIT_LOCK_ALLOWANCE_SECONDS + EVAL_INFLIGHT_GRACE_SECONDS + run_wait) + $(stream_stack_wait "$2") ))',
+            'echo $(( $(stream_case_count "$2") * ($(unit_delegation_timeout "$1") + UNIT_LOCK_ALLOWANCE_SECONDS + EVAL_INFLIGHT_GRACE_SECONDS * notes + run_wait) + $(stream_stack_wait "$2") ))',
             lifted("stream_lock_deadline"),
         )
         self.assertLess(unit.index('lock_deadline="$(stream_lock_deadline'), task_lock)

@@ -30,7 +30,8 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 #      account with a read grant on gs://kube-agents-prow (the OSS Prow
 #      project's bucket; the grant cannot be copied from here). It reads the
 #      archive there, the smoke lanes' own bucket
-#      gs://kube-agents-evals-presubmit-logs, the nightly's own bucket
+#      gs://kube-agents-evals-presubmit-logs (the release-candidate lane's
+#      too, under logs/, once it moves there), the nightly's own bucket
 #      gs://kube-agents-evals-nightly-logs and the watched periodics'
 #      gs://kube-agents-periodic-logs (all three
 #      kube-agents-owned; it holds objectViewer on each, and whichever
@@ -235,15 +236,37 @@ env:
   # and until a writers build is on record any other listing failure but a
   # hang is a note too: it has a watermark of its own.
   NIGHTLY_WRITERS_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-writers/
-  # The periodic that runs the nightly main part's second half (main-b) when
-  # that part runs as two jobs, in the same bucket; read the same way.
+  # The periodics that run the nightly main part's other shards (main-b to
+  # main-e) when that part runs as five jobs, in the same bucket, and the
+  # writers part's other thirds (writers-b, writers-c) when it runs as three;
+  # read the same way.
   NIGHTLY_MAIN_B_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-main-b/
-  # The GitLab lane's nightly (kube-agents#2832): the lane's list once a night,
-  # tier gitlab with no pull request, listed under the Brief's GitLab section.
-  GITLAB_NIGHTLY_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/
-  # The release-candidate lane's archive. A postsubmit, so logs/ rather than
-  # pr-logs/. Bounded by --rc-limit rather than by the presubmit watermark.
-  RC_GLOB: gs://kube-agents-prow/logs/post-kube-agents-eval-rc/*
+  NIGHTLY_MAIN_C_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-main-c/
+  NIGHTLY_MAIN_D_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-main-d/
+  NIGHTLY_MAIN_E_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-main-e/
+  NIGHTLY_WRITERS_B_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-writers-b/
+  NIGHTLY_WRITERS_C_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-writers-c/
+  # The GitLab lane's nightly, next mode (kube-agents#2832): the lane's list
+  # once a night, tier gitlab with no pull request, listed under the Brief's
+  # GitLab section; the job sets no gcs_configuration, so it logs to Prow's
+  # bucket.
+  GITLAB_NIGHTLY_NEXT_PREFIX: gs://kube-agents-prow/logs/ci-kube-agents-eval-nightly-gitlab-next/
+  # The self-managed forge lanes (kube-agents#3682), a tier each and one
+  # Brief section together: their presubmits log to the lanes' own bucket,
+  # their next-mode weekly jobs to Prow's. Until a job has run, its listing
+  # holds nothing, which collect.py notes and does not refuse on.
+  GHES_PR_GLOB: gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-ghes/*
+  GHES_WEEKLY_PREFIX: gs://kube-agents-prow/logs/ci-kube-agents-eval-weekly-ghes-next/
+  GITLAB_CE_PR_GLOB: gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-gitlab-ce/*
+  GITLAB_CE_WEEKLY_PREFIX: gs://kube-agents-prow/logs/ci-kube-agents-eval-weekly-gitlab-ce-next/
+  # The release-candidate lane's archives: the presubmit lanes' private
+  # bucket it moves to, and the Prow cluster's default it logs to until
+  # then, kept until the newest --rc-limit builds are all in the new one
+  # (the merge carries the recorded releases forward without it). A
+  # postsubmit, so logs/ rather than pr-logs/. Bounded by --rc-limit rather
+  # than by the presubmit watermark.
+  RC_GLOB: gs://kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/*
+  RC_GLOB_PREVIOUS: gs://kube-agents-prow/logs/post-kube-agents-eval-rc/*
   SINCE_DAYS: "14"
   STALE_AFTER_S: "2400"
   # The eval evidence store the nightly appends to (docs/designs/
@@ -386,8 +409,18 @@ jobs:
             --nightly-prefix "$NIGHTLY_PREFIX" \
             --nightly-writers-prefix "$NIGHTLY_WRITERS_PREFIX" \
             --nightly-main-b-prefix "$NIGHTLY_MAIN_B_PREFIX" \
-            --gitlab-nightly-prefix "$GITLAB_NIGHTLY_PREFIX" \
+            --nightly-main-c-prefix "$NIGHTLY_MAIN_C_PREFIX" \
+            --nightly-main-d-prefix "$NIGHTLY_MAIN_D_PREFIX" \
+            --nightly-main-e-prefix "$NIGHTLY_MAIN_E_PREFIX" \
+            --nightly-writers-b-prefix "$NIGHTLY_WRITERS_B_PREFIX" \
+            --nightly-writers-c-prefix "$NIGHTLY_WRITERS_C_PREFIX" \
+            --lane-nightly-prefix "gitlab=$GITLAB_NIGHTLY_NEXT_PREFIX" \
+            --lane-pr-glob "ghes=$GHES_PR_GLOB" \
+            --lane-nightly-prefix "ghes=$GHES_WEEKLY_PREFIX" \
+            --lane-pr-glob "gitlab-ce=$GITLAB_CE_PR_GLOB" \
+            --lane-nightly-prefix "gitlab-ce=$GITLAB_CE_WEEKLY_PREFIX" \
             --rc-glob "$RC_GLOB" \
+            --rc-glob "$RC_GLOB_PREVIOUS" \
             --merge-with work/prior-data.json \
             --since-days "$SINCE_DAYS" \
             --stale-after-s "$STALE_AFTER_S" \
@@ -486,7 +519,8 @@ jobs:
           fi
 
       # The watched Prow periodics (scripts/eval_dashboard/periodics.py:
-      # the pull sweep, the daily seeded-fleet reconcile and its postsubmit run): their latest
+      # the pull sweep, the daily seeded-fleet reconcile and its postsubmit run,
+      # the certification lane's weekly slice and the replay lane, both read from the nightlies' bucket): their latest
       # finished build each, for the note health.py carries and the poster
       # sends once when one fails or stops running. Best-effort like the
       # read above: a job that has never run writes nothing, a denied read
@@ -618,7 +652,40 @@ jobs:
           if [ -n "$clock" ]; then set -- --now "$clock"; fi
           python3 scripts/eval_dashboard/vertex_429.py --out work/vertex-429.json "$@"
 
+      # Where the bots file and read their issues (docs/ci-health.md, "The
+      # tracking issue"): this repository with the job's own token while the
+      # repository variable KUBE_AGENTS_ISSUES_REPO is unset; set to
+      # <owner>/<repo>, the issue steps below read it (ghcli.DEFAULT_REPO) and
+      # write with an installation token of the GitHub App installed there
+      # (secrets ISSUES_APP_ID, the App's client id, and
+      # ISSUES_APP_PRIVATE_KEY), scoped to that one repository's issues. The
+      # pull-request comment and the collect keep github.token: the pull
+      # requests stay here.
+      # The step never fails the job: a value that is not owner/name is a
+      # warning in the log, `valid=false`, and every consumer below then
+      # behaves as if the variable were unset.
+      - name: Split the issues repository into owner and name
+        id: issues_repo
+        if: vars.KUBE_AGENTS_ISSUES_REPO != ''
+        continue-on-error: true
+        env:
+          ISSUES_REPO: ${{ vars.KUBE_AGENTS_ISSUES_REPO }}
+        run: |
+          if printf '%s' "$ISSUES_REPO" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'; then
+            {
+              echo "valid=true"
+              echo "owner=${ISSUES_REPO%%/*}"
+              echo "name=${ISSUES_REPO#*/}"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::KUBE_AGENTS_ISSUES_REPO must be owner/name; the issues go to this repository this tick"
+            echo "valid=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Adjudicate
+        env:
+          # health.json records where the bots file (issues_repo).
+          KUBE_AGENTS_ISSUES_REPO: ${{ steps.issues_repo.outputs.valid == 'true' && vars.KUBE_AGENTS_ISSUES_REPO || '' }}
         run: |
           # --posted-state is the poster's file, read for the tracking issue
           # the bot filed so health.json can cite it, and for the pool
@@ -684,6 +751,21 @@ jobs:
             exit 1
           fi
 
+      # Best-effort: a mint that fails must not cancel the dashboard, the Chat
+      # post or the pull-request comments; the steps fall back to github.token
+      # and their cross-repository writes fail one by one as warnings.
+      - name: Mint a token for the issues repository
+        id: issues_token
+        if: steps.issues_repo.outputs.valid == 'true'
+        continue-on-error: true
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.ISSUES_APP_ID }}
+          private-key: ${{ secrets.ISSUES_APP_PRIVATE_KEY }}
+          owner: ${{ steps.issues_repo.outputs.owner }}
+          repositories: ${{ steps.issues_repo.outputs.name }}
+          permission-issues: write
+
       # The per-domain scorecard the Cases page's domain view draws
       # (scripts/eval_dashboard/understudies.py, docs/ci-health.md "The
       # domain scorecard"): each domain's seat, days uncovered, open
@@ -694,7 +776,9 @@ jobs:
         continue-on-error: true
         timeout-minutes: 2
         env:
-          GH_TOKEN: ${{ github.token }}
+          KUBE_AGENTS_ISSUES_REPO: ${{ steps.issues_repo.outputs.valid == 'true' && vars.KUBE_AGENTS_ISSUES_REPO || '' }}
+          GH_TOKEN: ${{ steps.issues_token.outputs.token || github.token }}
+          SOURCE_GH_TOKEN: ${{ github.token }}
         run: |
           store_args=()
           [ -f work/store.json ] && store_args=(--store work/store.json)
@@ -757,7 +841,9 @@ jobs:
         # cancel the post after it (JOB_TAIL_S budgets this step too).
         timeout-minutes: 3
         env:
-          GH_TOKEN: ${{ github.token }}
+          KUBE_AGENTS_ISSUES_REPO: ${{ steps.issues_repo.outputs.valid == 'true' && vars.KUBE_AGENTS_ISSUES_REPO || '' }}
+          GH_TOKEN: ${{ steps.issues_token.outputs.token || github.token }}
+          SOURCE_GH_TOKEN: ${{ github.token }}
         run: |
           mode=--dry-run
           if [ "$NIGHTLY_BUGS_LIVE" = "true" ] && [ "$CI_HEALTH_MUTE" != "true" ]; then mode=--live; fi
@@ -769,13 +855,15 @@ jobs:
       # assigned to the domain owner, kept current, closed when a roster case
       # covers the domain again (docs/ci-health.md, "Coverage gaps"). Armed
       # by the nightly bug filer's switch, not a variable of its own; the
-      # same github.token issue scope. Best-effort and bounded like the step
+      # same token and repository. Best-effort and bounded like the step
       # above, inside JOB_TAIL_S, so it cannot cancel the post.
       - name: File an issue per domain with no presubmit seat (dry run unless armed)
         continue-on-error: true
         timeout-minutes: 2
         env:
-          GH_TOKEN: ${{ github.token }}
+          KUBE_AGENTS_ISSUES_REPO: ${{ steps.issues_repo.outputs.valid == 'true' && vars.KUBE_AGENTS_ISSUES_REPO || '' }}
+          GH_TOKEN: ${{ steps.issues_token.outputs.token || github.token }}
+          SOURCE_GH_TOKEN: ${{ github.token }}
         run: |
           mode=--dry-run
           if [ "$NIGHTLY_BUGS_LIVE" = "true" ] && [ "$CI_HEALTH_MUTE" != "true" ]; then mode=--live; fi
@@ -801,7 +889,9 @@ jobs:
           CI_HEALTH_CHAT_TOKEN: ${{ steps.chat_token.outputs.token }}
           # For the tracking issue a new OUTAGE or lost_pods condition files
           # (header), and the digest's read of the nightly-red issues.
-          GH_TOKEN: ${{ github.token }}
+          KUBE_AGENTS_ISSUES_REPO: ${{ steps.issues_repo.outputs.valid == 'true' && vars.KUBE_AGENTS_ISSUES_REPO || '' }}
+          GH_TOKEN: ${{ steps.issues_token.outputs.token || github.token }}
+          SOURCE_GH_TOKEN: ${{ github.token }}
           # GitHub login -> Chat user id (JSON object) for the digest's
           # nightly section mentions; the ids are internal, so a secret. Empty
           # without one: every login is then printed as plain text.
@@ -855,7 +945,9 @@ jobs:
         continue-on-error: true
         timeout-minutes: 3
         env:
-          GH_TOKEN: ${{ github.token }}
+          KUBE_AGENTS_ISSUES_REPO: ${{ steps.issues_repo.outputs.valid == 'true' && vars.KUBE_AGENTS_ISSUES_REPO || '' }}
+          GH_TOKEN: ${{ steps.issues_token.outputs.token || github.token }}
+          SOURCE_GH_TOKEN: ${{ github.token }}
         run: |
           store_args=()
           [ -f work/store.json ] && store_args+=(--store work/store.json)

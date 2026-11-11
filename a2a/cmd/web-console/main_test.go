@@ -1670,6 +1670,25 @@ console.log(JSON.stringify([
 	}
 }
 
+// A provider select with no option for a repository's provider shows GitHub,
+// and the next save moves the repository onto a GitHub forge.
+func TestPageProviderSelectsListEveryAllowedProvider(t *testing.T) {
+	for _, start := range []string{
+		`id="repo-split-infra-provider"`,
+		`id="repo-split-iam-provider"`,
+		`id="repo-split-workloads-provider"`,
+		`id="repo-mono-provider"`,
+		`class="input-box custom-repo-provider"`,
+	} {
+		sel := pageSnippet(t, start, "</select>")
+		for provider := range allowedForgeProviders {
+			if !strings.Contains(sel, `<option value="`+provider+`"`) {
+				t.Errorf("select %s has no option for provider %q", start, provider)
+			}
+		}
+	}
+}
+
 func TestPageStreamedRepliesDoNotPileUpArtifacts(t *testing.T) {
 	script := `const SKILL_BY_NAME = {}; const skillUsage = new Map();
 ` + pageJS(t, "escapeHtml", "skillInfo", "renderInline", "artifactSeq", "artifactStore", "artifactIdByKey", "registerArtifact", "renderMarkdown") + "\n" +
@@ -1793,5 +1812,347 @@ func TestPageUpgradeDialogFetchesTheEnvironment(t *testing.T) {
 		if !strings.Contains(open, want) {
 			t.Errorf("openUpgrade is missing %q:\n%s", want, open)
 		}
+	}
+}
+
+// Local slash commands such as /feedback and /help must still run from the
+// centre and side composers when the active thread has a turn in flight,
+// while prompt commands and regular messages remain blocked until idle, and
+// side-pane local cards stay anchored to the transcript message they followed.
+func TestPageLocalSlashCommandsBypassBusyGuard(t *testing.T) {
+	fns := []string{
+		"SLASH_COMMANDS", "updateComposer", "updateSideComposer", "refreshPane",
+		"postFeedbackDraft", "handleSlashCommand", "insideCodeFence",
+		"wireAutocomplete", "useSkillInChat", "sendFromInput", "sendFromSide",
+	}
+	page := pageSource(t)
+	for _, opt := range []string{"findSlashCommand", "isLocalSlashCommand", "syncComposerButton", "markSideLocalRow", "sideLocalRows"} {
+		if strings.Contains(page, "function "+opt+"(") {
+			fns = append(fns, opt)
+		}
+	}
+	script := `const makeInput = id => {
+  const listeners = {};
+  return {
+    id, value: "", selectionStart: 0,
+    setSelectionRange(s) { this.selectionStart = s; },
+    focus() {},
+    addEventListener(ev, fn) { (listeners[ev] = listeners[ev] || []).push(fn); },
+    fire(ev, e = {}) { (listeners[ev] || []).forEach(fn => fn(e)); },
+  };
+};
+const makePopup = () => ({ hidden: true, innerHTML: "", addEventListener() {}, querySelector() { return null; } });
+const promptInput = makeInput("prompt-input");
+const sideInput = makeInput("side-input");
+const centreAc = makePopup();
+const sideAc = makePopup();
+const btnSend = { disabled: false };
+const sideSend = { disabled: false };
+const chatChildren = [];
+const sideChildren = [];
+const matchesAttr = (el, attr) => {
+  const d = el && el.dataset;
+  if (!d) return false;
+  if (attr === '[data-local-row="1"]' || attr === "[data-local-row]") return d.localRow === "1";
+  if (attr === "[data-msg-id]") return !!d.msgId;
+  if (attr === "[data-inflight-user]") return !!d.inflightUser;
+  if (attr === "[data-fallback-reply]") return !!d.fallbackReply;
+  return false;
+};
+const makeStream = arr => {
+  const stream = {
+    scrollTop: 0, scrollHeight: 100, clientHeight: 100,
+    querySelectorAll(sel) {
+      const parts = sel.split(",").map(s => s.trim());
+      return arr.filter(c => parts.some(p => matchesAttr(c, p)));
+    },
+    replaceChildren(...els) {
+      arr.forEach(c => { if (c) c.parentNode = null; });
+      arr.length = 0;
+      els.forEach(el => stream.appendChild(el));
+    },
+    appendChild(el) {
+      const prev = arr.indexOf(el);
+      if (prev >= 0) arr.splice(prev, 1);
+      el.parentNode = stream;
+      arr.push(el);
+      return el;
+    },
+    insertBefore(el, ref) {
+      const prev = arr.indexOf(el);
+      if (prev >= 0) arr.splice(prev, 1);
+      el.parentNode = stream;
+      const idx = arr.indexOf(ref);
+      if (idx >= 0) arr.splice(idx, 0, el);
+      else arr.push(el);
+      return el;
+    },
+  };
+  return stream;
+};
+const chatStream = makeStream(chatChildren);
+const sideBody = makeStream(sideChildren);
+const elems = {
+  "prompt-input": promptInput, "side-input": sideInput,
+  "centre-ac": centreAc, "side-ac": sideAc,
+  "btn-send": btnSend, "side-send": sideSend,
+  "chat-stream": chatStream, "side-body": sideBody,
+};
+const $ = id => elems[id];
+const document = { querySelectorAll: () => [] };
+let activeId = "t1", view = "thread", paneToken = 0;
+const pane = { mode: "post", id: "p1", latestId: null, lastMsgId: 0 };
+const pending = { centre: null, side: null };
+const inflight = {};
+const lastTurnMeta = {};
+const FEEDBACK_EMAIL = "kube-agents-feedback@google.com";
+const FEEDBACK_KINDS = { bug: { body: "bug body" } };
+const findThread = id => ({ id });
+const isThreadBusy = () => true;
+const startInflight = (id, text) => {
+  inflight[id] = { text, startedAt: 0, steps: [] };
+  return inflight[id];
+};
+const removePending = where => {
+  const p = pending[where];
+  if (p && p.row && p.row.parentNode) {
+    const c = where === "side" ? sideChildren : chatChildren;
+    const i = c.indexOf(p.row);
+    if (i >= 0) c.splice(i, 1);
+    p.row.parentNode = null;
+  }
+  pending[where] = null;
+};
+const pollChannels = () => {};
+let runTurnResult = null;
+const calls = [];
+const submitMessage = text => calls.push(["submit", text]);
+const runTurn = async (id, text) => {
+  if (runTurnResult) return runTurnResult;
+  calls.push(["turn", id, text]);
+  return {};
+};
+let nextTranscript = { data: { latest_id: 1, messages: [{ id: 1, role: "assistant", content: "initial", timestamp: 100 }] } };
+const fetchTranscript = async () => nextTranscript;
+const fetchEnvironment = async () => {};
+const feedbackContextMarkdown = () => "env";
+const feedbackEmailText = (k, t, b) => k + ":" + t + ":" + b;
+const feedbackMailtoHref = () => "mailto:x";
+const escapeHtml = s => String(s);
+const registerArtifact = () => "art1";
+const artifactStore = { art1: {} };
+const nearBottom = () => true;
+const recordSpecialistFromCard = () => {};
+const noteMessageActivity = () => {};
+const dayLabel = () => "";
+const messageRow = (role, text, tag, _at, _card, _meta, msg) => ({
+  role, text, tag: tag || "", msgId: msg && msg.id ? msg.id : 0,
+  dataset: {}, parentNode: null, scrolled: false,
+  scrollIntoView() { this.scrolled = true; },
+  querySelector: () => ({ innerHTML: "", querySelector: () => null }),
+});
+const appendTo = (container, role, text, tag, at, card, meta, msg) => {
+  const r = messageRow(role, text, tag, at, card, meta, msg);
+  container.appendChild(r);
+  return r;
+};
+const showPending = (where, id) => {
+  const container = where === "side" ? sideBody : chatStream;
+  const row = appendTo(container, "agent", "", "working");
+  pending[where] = { row, id };
+};
+const refreshSkillsBars = () => {};
+const closeSkillModal = () => {};
+const rowSlots = arr => arr.map(c => c.dataset && c.dataset.localRow === "1"
+  ? "local:" + c.tag
+  : c.tag ? "tag:" + c.tag
+  : c.msgId ? "msg:" + c.msgId
+  : c.role + ":" + c.text);
+` + pageJS(t, fns...) + `
+(async () => {
+  wireAutocomplete(promptInput, "centre-ac", sendFromInput);
+  wireAutocomplete(sideInput, "side-ac", sendFromSide);
+
+  promptInput.value = "";
+  updateComposer();
+  const btnBusyEmpty = btnSend.disabled;
+
+  // Typing /feedback and pressing Enter accepts autocomplete; button enables immediately.
+  promptInput.value = "/feedback";
+  promptInput.selectionStart = 9;
+  promptInput.fire("input");
+  promptInput.fire("keydown", { key: "Enter", shiftKey: false, preventDefault() {} });
+  const afterAcVal = promptInput.value;
+  const btnBusyAfterAc = btnSend.disabled;
+
+  // Clicking Send (or pressing Enter again) runs /feedback before pending.centre.row, scrolls it into view, and re-disables the button.
+  showPending("centre", "t1");
+  sendFromInput();
+  const feedbackVal = promptInput.value;
+  const btnAfterFeedback = btnSend.disabled;
+  const chatSlots = rowSlots(chatChildren);
+  const chatScrolled = !!(chatChildren[0] && chatChildren[0].scrolled);
+
+  // useSkillInChat replaces a local command with a non-local prompt and disables the button.
+  promptInput.value = "/help";
+  promptInput.selectionStart = 5;
+  promptInput.fire("input");
+  const btnBeforeSkill = btnSend.disabled;
+  pane.mode = "closed";
+  useSkillInChat("gke-audit");
+  const btnAfterSkill = btnSend.disabled;
+  pane.mode = "post";
+
+  // Prompt commands stay blocked while busy.
+  promptInput.value = "/status";
+  promptInput.selectionStart = 7;
+  promptInput.fire("input");
+  const btnBusyStatus = btnSend.disabled;
+  sendFromInput();
+  const statusVal = promptInput.value;
+
+  // Side pane: load initial message (id=1), start an in-flight reply ("fix it"),
+  // then run /help while busy. /help lands before the working spinner and stays
+  // anchored between "fix it" (id=2) and the agent reply (id=3) once completed.
+  await refreshPane(true);
+  inflight.p1 = { text: "fix it" };
+  await refreshPane(true);
+  updateSideComposer();
+
+  sideInput.value = "/help";
+  sideInput.selectionStart = 5;
+  sideInput.fire("input");
+  const sideBtnBusyHelp = sideSend.disabled;
+  await sendFromSide();
+  const sideHelpVal = sideInput.value;
+  const sideBtnAfterHelp = sideSend.disabled;
+  const slotsWhileBusy = rowSlots(sideChildren);
+
+  delete inflight.p1;
+  nextTranscript = {
+    data: {
+      latest_id: 3,
+      messages: [
+        { id: 1, role: "assistant", content: "initial", timestamp: 100 },
+        { id: 2, role: "user", content: "fix it", timestamp: 101 },
+        { id: 3, role: "assistant", content: "Done.", timestamp: 102 },
+      ],
+    },
+  };
+  await refreshPane(true);
+  const slotsAfterTurn = rowSlots(sideChildren);
+
+  // Run /feedback while idle after id=3, then simulate pollPane seeing id=4:
+  // neither local card migrates below id=4.
+  sideInput.value = "/feedback bug broken";
+  sideInput.selectionStart = sideInput.value.length;
+  sideInput.fire("input");
+  await sendFromSide();
+
+  const pollTranscript = {
+    data: {
+      latest_id: 4,
+      messages: [
+        { id: 1, role: "assistant", content: "initial", timestamp: 100 },
+        { id: 2, role: "user", content: "fix it", timestamp: 101 },
+        { id: 3, role: "assistant", content: "Done.", timestamp: 102 },
+        { id: 4, role: "assistant", content: "later update", timestamp: 103 },
+      ],
+    },
+  };
+  nextTranscript = pollTranscript;
+  await refreshPane(false);
+  const slotsAfterPoll = rowSlots(sideChildren);
+
+  // Forced error refresh preserves local rows, anchors any new local command run
+  // during the error to pane.lastMsgId (4), and restores exact positions on recovery.
+  nextTranscript = { error: "upstream 502" };
+  await refreshPane(true);
+  const slotsDuringError = rowSlots(sideChildren);
+  sideInput.value = "/help";
+  sideInput.selectionStart = 5;
+  sideInput.fire("input");
+  await sendFromSide();
+  nextTranscript = pollTranscript;
+  await refreshPane(true);
+  const slotsAfterRecovery = rowSlots(sideChildren);
+
+  // Once the 200-row transcript window advances past anchor IDs, old local cards age out.
+  nextTranscript = {
+    data: {
+      latest_id: 210,
+      messages: [{ id: 205, role: "assistant", content: "window moved", timestamp: 300 }],
+    },
+  };
+  await refreshPane(false);
+  const slotsAfterWindowAdvance = rowSlots(sideChildren);
+
+  // Zero-text session with non-zero latest_id (tool-only rows) anchors at 0 so the first text row keeps the card.
+  pane.id = "p2";
+  pane.latestId = null;
+  pane.lastMsgId = 0;
+  sideBody.replaceChildren();
+  nextTranscript = { data: { latest_id: 2, messages: [] } };
+  await refreshPane(true);
+  sideInput.value = "/help";
+  sideInput.selectionStart = 5;
+  sideInput.fire("input");
+  await sendFromSide();
+  nextTranscript = {
+    data: {
+      latest_id: 3,
+      messages: [{ id: 3, role: "assistant", content: "first text", timestamp: 400 }],
+    },
+  };
+  await refreshPane(false);
+  const slotsZeroTextThenFirst = rowSlots(sideChildren);
+
+  // When post-turn refreshPane(true) fails and sendFromSide renders the fallback reply row,
+  // a local command run below it anchors after the turn's assistant reply on poll recovery.
+  runTurnResult = { reply: "fallback ok" };
+  nextTranscript = { error: "upstream 502" };
+  sideInput.value = "fix2";
+  await sendFromSide();
+  runTurnResult = null;
+  sideInput.value = "/help";
+  sideInput.selectionStart = 5;
+  sideInput.fire("input");
+  await sendFromSide();
+  nextTranscript = {
+    data: {
+      latest_id: 5,
+      messages: [
+        { id: 3, role: "assistant", content: "first text", timestamp: 400 },
+        { id: 4, role: "user", content: "fix2", timestamp: 401 },
+        { id: 5, role: "assistant", content: "fallback ok", timestamp: 402 },
+      ],
+    },
+  };
+  await refreshPane(false);
+  const slotsAfterFallbackRecovery = rowSlots(sideChildren);
+
+  inflight.p2 = { text: "busy again" };
+  sideInput.value = "/status";
+  sideInput.selectionStart = 7;
+  sideInput.fire("input");
+  const sideBtnBusyStatus = sideSend.disabled;
+  await sendFromSide();
+  const sideStatusVal = sideInput.value;
+
+  console.log(JSON.stringify({
+    btnBusyEmpty, afterAcVal, btnBusyAfterAc, feedbackVal, btnAfterFeedback,
+    btnBeforeSkill, btnAfterSkill, btnBusyStatus, statusVal,
+    sideBtnBusyHelp, sideHelpVal, sideBtnAfterHelp,
+    slotsWhileBusy, slotsAfterTurn, slotsAfterPoll,
+    slotsDuringError, slotsAfterRecovery, slotsAfterWindowAdvance, slotsZeroTextThenFirst,
+    slotsAfterFallbackRecovery,
+    sideBtnBusyStatus, sideStatusVal,
+    chatSlots, chatScrolled,
+    calls,
+  }));
+})();`
+	want := `{"btnBusyEmpty":true,"afterAcVal":"/feedback ","btnBusyAfterAc":false,"feedbackVal":"","btnAfterFeedback":true,"btnBeforeSkill":false,"btnAfterSkill":true,"btnBusyStatus":true,"statusVal":"/status","sideBtnBusyHelp":false,"sideHelpVal":"","sideBtnAfterHelp":true,"slotsWhileBusy":["msg:1","user:fix it","local:help","tag:working"],"slotsAfterTurn":["msg:1","msg:2","local:help","msg:3"],"slotsAfterPoll":["msg:1","msg:2","local:help","msg:3","local:feedback draft","msg:4"],"slotsDuringError":["tag:error","local:help","local:feedback draft"],"slotsAfterRecovery":["msg:1","msg:2","local:help","msg:3","local:feedback draft","msg:4","local:help"],"slotsAfterWindowAdvance":["msg:205"],"slotsZeroTextThenFirst":["local:help","msg:3"],"slotsAfterFallbackRecovery":["local:help","msg:3","msg:4","msg:5","local:help"],"sideBtnBusyStatus":true,"sideStatusVal":"/status","chatSlots":["local:help","tag:working"],"chatScrolled":true,"calls":[]}`
+	if got := runPageJS(t, script); got != want {
+		t.Errorf("local slash command busy-guard result = %s, want %s", got, want)
 	}
 }

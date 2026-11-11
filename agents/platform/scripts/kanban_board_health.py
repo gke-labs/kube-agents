@@ -116,7 +116,10 @@ it has waited ("Stopped 3 days ago before finishing.", or "Paused 6 days ago."
 for a block waiting on a person's answer). No task ids, block reasons or
 commands: those stay behind ``hermes kanban list`` and ``hermes kanban show``.
 Tasks sharing a title and whether they wait on a person are one row with
-their count, and past ``MAX_STUCK_ROWS`` rows the rest are counted.
+their count, and past ``MAX_STUCK_ROWS`` rows the rest are counted. A card
+the re-check job (``kanban_block_recheck.py``) has a record for says what
+that job found, so a repeat is not bare: "Re-checked 2 hours ago, still
+blocked.", or "Retries automatically in 40 minutes." before its first check.
 
 They are said when a task first gets stuck, then once a week while any stays
 stuck (``stuck_due``); a run in between says nothing about them. The record of
@@ -154,6 +157,9 @@ import gitops_workspace
 # Grades `last_delivery_error` the way the delivery ledger does, so a note on a
 # post that landed is not read as a lost post.
 from chat_delivery_watch import GRADE_HARD, grade_error, is_delivered_note
+# The re-check job's record of a blocked card's condition (#5260): the table it
+# keeps, and the age words it shares with this report.
+import kanban_block_recheck as _recheck
 
 # Severity floor applied to what `hermes kanban diagnostics` returns. "error" on
 # purpose: the engine's warning-tier rules are useful to pull on demand but too
@@ -182,11 +188,10 @@ MAX_INVARIANT_ITEMS = 20
 MAX_REPORT_CHARS = 8500
 # The other findings' header, under the stuck tasks when both are present.
 REPORT_HEADER = "kanban board health: attention required"
-# A full data volume, in the Session KV server's words: from its warn line, every
-# board write is at risk, and at 100% each one fails with a bare "disk I/O
-# error". The line and the text are session_kv_server.py's DATA_VOLUME_WARN_PERCENT
-# and DATA_VOLUME_WARNING (a test holds them equal); that module is not imported,
-# because it brings FastAPI in.
+# A full data volume: from the warn line, every board write is at risk, and at
+# 100% each one fails with a bare "disk I/O error". session_kv_server.py imports
+# these for its home-channel warning, so the two say the same line at the same
+# figure.
 DATA_VOLUME_WARN_PERCENT = 90
 DATA_VOLUME_WARNING = (
     "The agent's data volume is {percent}% full ({used:.1f} of {total:.1f} GiB). "
@@ -321,17 +326,20 @@ GHOST_CLAIMS_SQL = """
 """
 
 # What the engine's JSON does not carry about a blocked card: its title, and
-# its kind as the last `blocked` event recorded it (`kanban_db.block_task`
-# writes `{"reason": ..., "kind": ...}` as the event payload).
+# its kind as the last block event recorded it: a `blocked` event's payload
+# (`kanban_db.block_task` writes `{"reason": ..., "kind": ...}`), or a breaker
+# trip's `gave_up`, which writes no `blocked` event and leaves `tasks.block_kind`
+# as an earlier block set it (a `needs_input` a person cleared would otherwise
+# read "Paused" on a card the breaker stopped).
 BLOCKED_TASKS_SQL = """
     SELECT id, title, block_kind
       FROM tasks
      WHERE status = 'blocked'
 """
 BLOCKED_EVENTS_SQL = """
-    SELECT task_id, payload
+    SELECT task_id, kind, payload
       FROM task_events
-     WHERE kind = 'blocked'
+     WHERE kind IN ('blocked', 'gave_up')
      ORDER BY created_at, id
 """
 BLOCKED_CHILDREN_SQL = """
@@ -340,6 +348,49 @@ BLOCKED_CHILDREN_SQL = """
       JOIN tasks c ON c.id = l.child_id
      WHERE c.status = 'todo'
      ORDER BY c.id
+"""
+# What the re-check job last found about a blocked card's condition
+# (`kanban_block_recheck.py`): when it next looks, when it last looked, and
+# what it saw. Absent on a board the job has never run on.
+RECHECK_SQL = f"""
+    SELECT task_id, check_after, expires_at, last_checked_at, last_outcome
+      FROM {_recheck.TABLE}
+"""
+# The row's second sentence when the card has a re-check record: what the
+# re-check found instead of a bare repeat. A record not yet due says when the
+# automatic retry comes; one due and not yet run says nothing more.
+RECHECKED_LINE = "Re-checked {age} ago, still blocked."
+RECHECK_PENDING_LINE = "Retries automatically in {age}."
+RECHECK_ENDED_LINE = "Re-checks ended {age} ago, still blocked."
+RECHECK_UNREAD_LINE = "Re-check {age} ago could not read the cluster."
+RECHECK_LIMIT_LINE = "Condition cleared {age} ago; already retried once, so it waits for someone."
+RECHECK_LINES = {
+    _recheck.OUTCOME_STILL_BLOCKED: RECHECKED_LINE,
+    _recheck.OUTCOME_EXPIRED: RECHECK_ENDED_LINE,
+    _recheck.OUTCOME_UNKNOWN: RECHECK_UNREAD_LINE,
+    _recheck.OUTCOME_RETRY_LIMIT: RECHECK_LIMIT_LINE,
+}
+RECHECK_FIELDS = ("check_after", "last_checked_at", "last_outcome")
+STATUS_SENTENCE_SEPARATOR = " "
+# A card the circuit breaker parked: `blocked`, with a `gave_up` event as its
+# newest block or unblock. The engine's `stuck_in_blocked` rule keys off a
+# `blocked` event, which a breaker trip never writes, and goes quiet after any
+# `unblocked` event, which the re-check job's retry writes, so these rows come
+# from here. A comment does not clear a row: the harness itself comments on
+# the card right after the trip (the failed turn's charge, the budget
+# hand-off), and a person who has dealt with it has Retry and Drop. The same
+# stale age as the engine's default.
+BLOCKED_STALE_HOURS = 24
+BREAKER_PARKED_SQL = """
+    SELECT t.id, t.title, e.created_at
+      FROM tasks t
+      JOIN task_events e ON e.id = (
+           SELECT id FROM task_events
+            WHERE task_id = t.id
+              AND kind IN ('blocked', 'gave_up', 'unblocked')
+            ORDER BY id DESC LIMIT 1)
+     WHERE t.status = 'blocked'
+       AND e.kind = 'gave_up'
 """
 # The words `session_kv_server._triage_authorize_clauses(True)` puts in a
 # triage report's `To authorize:` bullet when the install opens the Pull
@@ -427,12 +478,16 @@ def blocked_context(conn: sqlite3.Connection) -> dict:
         for row in conn.execute(BLOCKED_EVENTS_SQL):
             if row["task_id"] not in tasks:
                 continue
+            # Events arrive oldest first, so the last kind wins; a breaker trip
+            # is its own kind, as the re-check job resolves it.
+            if row["kind"] == _recheck.GAVE_UP_KIND:
+                tasks[row["task_id"]]["kind"] = _recheck.GAVE_UP_KIND
+                continue
             try:
                 payload = json.loads(row["payload"] or "{}")
             except ValueError:
                 payload = {}
             if isinstance(payload, dict):
-                # Events arrive oldest first, so the last kind wins.
                 if payload.get("kind"):
                     tasks[row["task_id"]]["kind"] = payload["kind"]
         try:
@@ -446,6 +501,12 @@ def blocked_context(conn: sqlite3.Connection) -> dict:
                 })
         except sqlite3.OperationalError:
             pass
+        try:
+            for row in conn.execute(RECHECK_SQL):
+                if row["task_id"] in tasks:
+                    tasks[row["task_id"]]["recheck"] = {field: row[field] for field in RECHECK_FIELDS}
+        except sqlite3.OperationalError:
+            pass  # the re-check job has not run on this board
     except sqlite3.OperationalError:
         return {}
     return tasks
@@ -486,13 +547,15 @@ def _take_within_budget(items: list, max_items: int, max_chars: int, line_fn=Non
     return taken
 
 
-def stuck_tasks(stuck_items: list, context: dict) -> list:
-    """One dict per stuck card: id, title, whether it waits on a person, and its age.
+def stuck_tasks(stuck_items: list, context: dict, now: float | None = None) -> list:
+    """One dict per stuck card: id, title, whether it waits on a person, its age, and its re-check line.
 
     The board's title and kind first (``blocked_context``), the CLI's title as
     the fallback, and the titles of the todo cards it holds back; the reason is
-    not carried, since chat never shows it.
+    not carried, since chat never shows it. ``now`` is epoch seconds, for the
+    re-check line's ages.
     """
+    now = time.time() if now is None else now
     tasks = []
     for task_id, diag, entry in stuck_items:
         task_id = str(task_id)
@@ -504,8 +567,24 @@ def stuck_tasks(stuck_items: list, context: dict) -> list:
             "person": info.get("kind") in PERSON_BLOCK_KINDS,
             "age_hours": _card_age_hours(diag),
             "held": [str(child.get("title") or "") for child in info.get("waiting_children") or ()],
+            "recheck": recheck_line(info.get("recheck"), now),
         })
     return tasks
+
+
+def recheck_line(recheck: dict | None, now: float) -> str | None:
+    """What the re-check job found about the card (``RECHECK_LINES``), when the
+    automatic retry comes for a record not yet due, or None: no record, or one
+    due that the job has not run on yet."""
+    if not recheck:
+        return None
+    outcome, checked_at = recheck.get("last_outcome"), recheck.get("last_checked_at")
+    if outcome in RECHECK_LINES and isinstance(checked_at, (int, float)):
+        return RECHECK_LINES[outcome].format(age=_recheck.plain_age(now - checked_at))
+    check_after = recheck.get("check_after")
+    if checked_at is None and isinstance(check_after, (int, float)) and check_after > now:
+        return RECHECK_PENDING_LINE.format(age=_recheck.plain_age(check_after - now))
+    return None
 
 
 def plain_age(age_hours: float) -> str | None:
@@ -564,16 +643,21 @@ def stuck_rows(tasks: list) -> tuple[str, list, int]:
         groups.values(),
         key=lambda group: (min(t["age_hours"] for t in group), group[0]["title"]),
     )
-    rows = [
-        {
+    rows = []
+    for group in ordered[:MAX_STUCK_ROWS]:
+        # The row is aged by its longest-waiting card, and that card's re-check
+        # line is the one it carries.
+        oldest = max(group, key=lambda t: t["age_hours"])
+        status = status_line(group[0]["person"], oldest["age_hours"])
+        if oldest.get("recheck"):
+            status += STATUS_SENTENCE_SEPARATOR + oldest["recheck"]
+        rows.append({
             "title": plain_title(group[0]["title"]),
             "count": len(group),
-            "status": status_line(group[0]["person"], max(t["age_hours"] for t in group)),
+            "status": status,
             "held": held_line(group) or "",
             "tasks": [t["task_id"] for t in group],
-        }
-        for group in ordered[:MAX_STUCK_ROWS]
-    ]
+        })
     noun = STUCK_HEADLINE[0] if len(tasks) == 1 else STUCK_HEADLINE[1]
     return noun.format(count=len(tasks)), rows, sum(len(group) for group in ordered[MAX_STUCK_ROWS:])
 
@@ -724,6 +808,24 @@ def stuck_due(tasks: list, state: dict, now: float) -> tuple[bool, dict]:
     if set(current) - said or said_at is None or now - said_at >= remind_after:
         return True, {STATE_SAID_KEY: current, STATE_SAID_AT_KEY: now}
     return False, {STATE_SAID_KEY: sorted(said & set(current)), STATE_SAID_AT_KEY: said_at}
+
+
+def breaker_parked(conn: sqlite3.Connection, now: float) -> list:
+    """The breaker-parked cards stuck for ``BLOCKED_STALE_HOURS`` or more, as
+    ``(task_id, diag, entry)`` items the engine's would have been; [] on an
+    unmigrated board."""
+    items = []
+    try:
+        rows = conn.execute(BREAKER_PARKED_SQL).fetchall()
+    except sqlite3.OperationalError:
+        return items
+    for row in rows:
+        age_hours = (now - float(row["created_at"] or 0)) / SECONDS_PER_HOUR
+        if age_hours < BLOCKED_STALE_HOURS:
+            continue
+        diag = {"kind": STUCK_IN_BLOCKED, "data": {"blocked_at": row["created_at"], "age_hours": round(age_hours, 1)}}
+        items.append((row["id"], diag, {"title": row["title"] or ""}))
+    return items
 
 
 def invariant_violations(conn: sqlite3.Connection) -> list:
@@ -890,19 +992,26 @@ def data_volume_usage(home: Path) -> tuple[int, int] | None:
     return total, st.f_bavail * st.f_frsize
 
 
+def data_volume_percent(total: int, free: int) -> int:
+    """The share of the volume in use, in whole percent, rounded down."""
+    return (total - free) * PERCENT // total
+
+
+def data_volume_text(template: str, total: int, free: int) -> str:
+    """`template` (DATA_VOLUME_WARNING, or another text with its `percent`,
+    `used` and `total` fields) for a volume of `total` bytes with `free` left."""
+    return template.format(
+        percent=data_volume_percent(total, free), used=(total - free) / BYTES_PER_GIB, total=total / BYTES_PER_GIB
+    )
+
+
 def data_volume_line(home: Path) -> str | None:
     """The full-volume line when the volume holding the board is at or above
     DATA_VOLUME_WARN_PERCENT used, else None (also when it cannot be read)."""
     usage = data_volume_usage(home)
-    if usage is None:
+    if usage is None or data_volume_percent(*usage) < DATA_VOLUME_WARN_PERCENT:
         return None
-    total, free = usage
-    percent = (total - free) * PERCENT // total
-    if percent < DATA_VOLUME_WARN_PERCENT:
-        return None
-    return DATA_VOLUME_WARNING.format(
-        percent=percent, used=(total - free) / BYTES_PER_GIB, total=total / BYTES_PER_GIB
-    )
+    return data_volume_text(DATA_VOLUME_WARNING, *usage)
 
 
 def is_disk_full_error(exc: BaseException, home: Path) -> bool:
@@ -917,7 +1026,7 @@ def is_disk_full_error(exc: BaseException, home: Path) -> bool:
     return SQLITE_IOERR_MARKER in text and usage is not None and usage[1] == 0
 
 
-def report(home: Path, *, env=None, max_chars: int | None = None, **kwargs) -> tuple[list | None, list]:
+def report(home: Path, *, env=None, max_chars: int | None = None, now: float | None = None, **kwargs) -> tuple[list | None, list]:
     """The whole check: ``(stuck tasks, other lines)``. Both empty means healthy, which means silent.
 
     The stuck tasks are ``stuck_tasks`` dicts, which ``main`` renders when
@@ -942,10 +1051,12 @@ def report(home: Path, *, env=None, max_chars: int | None = None, **kwargs) -> t
     volume = data_volume_line(home)
     if volume:
         lines.append(volume)
+    now = time.time() if now is None else now
     conn = read_only_connection(db)
     try:
         violations = invariant_violations(conn)
         context = blocked_context(conn)
+        parked = breaker_parked(conn, now)
     finally:
         conn.close()
 
@@ -980,7 +1091,9 @@ def report(home: Path, *, env=None, max_chars: int | None = None, **kwargs) -> t
         lines = []
     if any(line.startswith(DIAGNOSTICS_UNAVAILABLE) for line in diags):
         return None, lines
-    return stuck_tasks(stuck, context), lines
+    listed = {str(task_id) for task_id, _diag, _entry in stuck}
+    stuck.extend(item for item in parked if str(item[0]) not in listed)
+    return stuck_tasks(stuck, context, now), lines
 
 
 def main(argv=None, *, env=None, now=None) -> int:
@@ -994,7 +1107,7 @@ def main(argv=None, *, env=None, now=None) -> int:
     if last_post_undelivered(home, recorded[STATE_SAID_AT_KEY], env):
         state = {STATE_SAID_KEY: [], STATE_SAID_AT_KEY: None}
     try:
-        tasks, lines = report(home, env=env)
+        tasks, lines = report(home, env=env, now=now)
     except sqlite3.Error as exc:
         if state != recorded:
             save_state(path, state)
@@ -1006,6 +1119,9 @@ def main(argv=None, *, env=None, now=None) -> int:
             print("\n".join([REPORT_HEADER, BOARD_DISK_FULL.format(error=exc), volume]))
             return 0
         print(f"kanban board health: cannot read {board_path(home)}: {exc}")
+        if volume:
+            # Not said as the cause, which may be a failing disk, but true.
+            print(volume)
         return 0
     out = []
     said = []

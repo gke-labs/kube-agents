@@ -41,6 +41,9 @@ const PAGE = {
   inlineBrief: "inline-brief",
   inlineHealth: "inline-health",
   refreshMs: 60000,
+  // Rows a section of several forges lists per table (forge_lane.py caps
+  // each lane at RUNS_LISTED; this caps their merge at one lane's worth).
+  laneRowsListed: 20,
   // The ci-health workflow's cron: how old the inlined copy can be at most.
   republishMinutes: 15,
   tz: "America/Toronto",
@@ -91,6 +94,11 @@ const PAGE = {
   gcsObject: "https://storage.cloud.google.com/",
   job: "pull-kube-agents-smoke-test",
   prUrl: "https://github.com/gke-labs/kube-agents/pull",
+  // A bare "#N" is an issue of the source repository (case-notes.yaml's,
+  // the allowlist's); the bots' own issues arrive as full URLs and may live
+  // in another repository (health.json's issues_repo), which the link text
+  // then names.
+  sourceRepo: "gke-labs/kube-agents",
   issueUrl: "https://github.com/gke-labs/kube-agents/issues",
   rulesUrl: "https://github.com/gke-labs/kube-agents/blob/main/scripts/eval_dashboard/classify.py",
   rosterUrl: "https://github.com/gke-labs/kube-agents/blob/main/docs/eval-gate-roster.md",
@@ -135,7 +143,7 @@ const PAGE = {
   nightsListed: 14,
   // A night split across jobs names its parts as the digest does
   // (nightly.py's PART_WORDS).
-  nightPartWords: { main: "main part", "main-b": "main-b part", writers: "writers part" },
+  nightPartWords: { main: "main part", "main-b": "main-b part", "main-c": "main-c part", "main-d": "main-d part", "main-e": "main-e part", writers: "writers part", "writers-b": "writers-b part", "writers-c": "writers-c part" },
   // The chat-turn target the opening turn's p95 is shown beside, as advice
   // only (nightly.py's TURN1_P95_TARGET_S).
   turn1P95TargetS: 10,
@@ -484,8 +492,12 @@ const transcriptUrl = (run, kase, n = 1) => {
 // rep_n); rep 1, as the pages always linked, when the row names none.
 const repOf = (c) => (Number.isInteger(c.rep_n) && c.rep_n > 0 ? c.rep_n : 1);
 const issueLink = (issue) => {
-  const match = /^#(\d+)$/.exec(String(issue).trim());
-  return match ? `<a href="${PAGE.issueUrl}/${match[1]}">${esc(issue)}</a>` : esc(issue);
+  const text = String(issue).trim();
+  const bare = /^#(\d+)$/.exec(text);
+  if (bare) return `<a href="${PAGE.issueUrl}/${bare[1]}">${esc(text)}</a>`;
+  const full = /^https:\/\/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/issues\/(\d+)$/.exec(text);
+  if (full) return `<a href="${esc(text)}">${esc(full[1] === PAGE.sourceRepo ? `#${full[2]}` : `${full[1]}#${full[2]}`)}</a>`;
+  return esc(text);
 };
 const projectShort = (project) => (project ? String(project).replace(/^kube-agents-/, "") : "unknown");
 
@@ -1016,13 +1028,14 @@ function releasesHtml() {
   return `<div class="sec" id="releases"><h2>Release candidates</h2>${body}</div>`;
 }
 
-/* ---- the GitLab lane (SCHEMA.md: brief.json's gitlab block) ---- */
-// The lane's runs are nobody's gate verdict: tier gitlab (tiers.py) keeps
-// them out of every count above, so this section is the only place they
-// show. Each row links the build where it lives (log_url for a night,
-// gcs_base for a run that records it), else Spyglass under the lane's own job name.
-const laneBuildUrl = (run) => (run.log_url ? run.log_url : run.gcs_base ? `${PAGE.gcsBrowser}${gcsPath(run.gcs_base)}` : run.pr == null || !run.job ? null : `${PAGE.spyglass}/${enc(run.pr)}/${enc(run.job)}/${enc(run.build)}`);
-function laneRow(run) {
+/* ---- the forge lanes (SCHEMA.md: brief.json's lanes block) ---- */
+// A forge lane's runs are nobody's gate verdict: their tier (tiers.py,
+// FORGE_TIERS) keeps them out of every count above, so each lane's section
+// is the only place they show. Each row links the build where it lives (the Console for a run
+// that records its gcs_base, whose Spyglass log_url is dead; a night's log_url otherwise), else
+// Spyglass under the lane's own job name.
+const laneBuildUrl = (run) => (run.gcs_base ? `${PAGE.gcsBrowser}${gcsPath(run.gcs_base)}` : run.log_url ? run.log_url : run.pr == null || !run.job ? null : `${PAGE.spyglass}/${enc(run.pr)}/${enc(run.job)}/${enc(run.build)}`);
+function laneRow(run, withForge, withJob) {
   const url = laneBuildUrl(run);
   const build = url ? `<a href="${esc(url)}" rel="noopener">${esc(run.build)}</a>` : esc(run.build);
   const pr = run.pr == null ? "—" : `<a href="${PAGE.prUrl}/${enc(run.pr)}" rel="noopener">#${esc(run.pr)}</a>`;
@@ -1030,33 +1043,87 @@ function laneRow(run) {
   const cases = `${t.pass || 0} passed · ${t.fail || 0} failed${t.infra ? ` · ${t.infra} infra` : ""}`;
   const verdict = run.eval_verdict ? esc(run.eval_verdict) : `<span class="mut">no eval banner</span>`;
   const when = run.started ? et(parseIso(run.started)) : "—";
-  return `<tr><td>${build}</td><td>${pr}</td><td><span class="${run.green ? "p-pass" : "p-fail"}">${esc(run.result || "unknown")}</span></td><td>${verdict}</td><td>${esc(cases)}</td><td class="mut">${esc(when)}</td><td class="mut">${run.duration_s != null ? esc(minutesText(run.duration_s * 1000)) : "—"}</td></tr>`;
+  return `<tr>${withForge ? `<td>${esc(run.forge || "")}</td>` : ""}${withJob ? `<td><code>${esc(run.job || "")}</code></td>` : ""}<td>${build}</td><td>${pr}</td><td><span class="${run.green ? "p-pass" : "p-fail"}">${esc(run.result || "unknown")}</span></td><td>${verdict}</td><td>${esc(cases)}</td><td class="mut">${esc(when)}</td><td class="mut">${run.duration_s != null ? esc(minutesText(run.duration_s * 1000)) : "—"}</td></tr>`;
 }
-function gitlabLaneHtml() {
-  const lane = brief.gitlab && typeof brief.gitlab === "object" ? brief.gitlab : null;
-  const job = lane && lane.job || "pull-kube-agents-smoke-test-gitlab";
-  const runs = lane && Array.isArray(lane.runs) ? lane.runs.filter((r) => r && typeof r === "object" && r.build != null) : [];
-  const inFlight = lane && Array.isArray(lane.running) ? lane.running.length : 0;
+const laneTable = (rows, withForge, withJob) => `<table class="rel"><thead><tr>${withForge ? "<th>Forge</th>" : ""}${withJob ? "<th>Job</th>" : ""}<th>Build</th><th>PR</th><th>Prow</th><th>Eval verdict</th><th>Cases</th><th>Started</th><th>Took</th></tr></thead><tbody>${rows.map((r) => laneRow(r, withForge, withJob)).join("")}</tbody></table>`;
+const laneRows = (list) => (Array.isArray(list) ? list.filter((r) => r && typeof r === "object" && r.build != null) : []);
+function laneHtml(lane) {
+  const tier = String(lane.tier || "");
+  const title = lane.title || `${tier} lane`;
+  const noun = title.replace(/ lane$/, "");
+  const job = lane.job || "";
+  const runs = laneRows(lane.runs);
+  const inFlight = Array.isArray(lane.running) ? lane.running.length : 0;
   const flight = inFlight ? `<p class="mut small">${plural(inFlight, "build")} of the lane in flight, not yet recorded.</p>` : "";
   let body;
   if (!runs.length) {
-    body = `<p class="mut">No GitLab run on record. <code>${esc(job)}</code> runs the smoke matrix against a pool project's GitLab repository (<code>EVAL_FORGE=gitlab</code>), on demand with <code>/test ${esc(job)}</code>; its runs are listed here and counted nowhere else.</p>${flight}`;
+    body = `<p class="mut">No ${esc(noun)} run on record. <code>${esc(job)}</code> runs the lane's list (<code>EVAL_FORGE=${esc(tier)}</code>) on demand with <code>/test ${esc(job)}</code>; its runs are listed here and counted nowhere else.</p>${flight}`;
   } else {
     const c = lane.counts || {};
-    body = `<p class="mut small">${plural(c.on_record || runs.length, "run")} on record: ${c.green || 0} green, ${c.red || 0} not. These runs are the lane's own and sit outside the gate's numbers above.</p>` +
-      `<table class="rel"><thead><tr><th>Build</th><th>PR</th><th>Prow</th><th>Eval verdict</th><th>Cases</th><th>Started</th><th>Took</th></tr></thead><tbody>${runs.map(laneRow).join("")}</tbody></table>${flight}`;
+    body = `<p class="mut small">${plural(c.on_record || runs.length, "run")} on record: ${c.green || 0} green, ${c.red || 0} not. These runs are the lane's own and sit outside the gate's numbers above.</p>${laneTable(runs)}${flight}`;
   }
-  const nightlyJob = lane && lane.nightly_job || "ci-kube-agents-eval-nightly-gitlab";
-  const nights = lane && Array.isArray(lane.nights) ? lane.nights.filter((r) => r && typeof r === "object" && r.build != null) : [];
+  const jobs = Array.isArray(lane.nightly_jobs) ? lane.nightly_jobs.filter((j) => j && typeof j === "object" && j.job) : [];
+  const anyNight = jobs.some((j) => laneRows(j.nights).length);
   let nightsHtml;
-  if (!nights.length) {
-    nightsHtml = `<p class="mut small">No GitLab night on record. <code>${esc(nightlyJob)}</code> runs the same list once a night on its own leased project.</p>`;
+  if (!anyNight) {
+    const names = jobs.map((j) => `<code>${esc(j.job)}</code>`).join(" and ");
+    nightsHtml = `<p class="mut small">No ${esc(noun)} night on record.${names ? ` ${names} ${jobs.length > 1 ? "run" : "runs"} the same list once a night on ${jobs.length > 1 ? "their own leased projects" : "its own leased project"}.` : ""}</p>`;
   } else {
-    const nc = lane.night_counts || {};
-    nightsHtml = `<h3>Nights</h3><p class="mut small">${plural(nc.on_record || nights.length, "night")} on record: ${nc.green || 0} green, ${nc.red || 0} not (<code>${esc(nightlyJob)}</code>).</p>` +
-      `<table class="rel"><thead><tr><th>Build</th><th>PR</th><th>Prow</th><th>Eval verdict</th><th>Cases</th><th>Started</th><th>Took</th></tr></thead><tbody>${nights.map(laneRow).join("")}</tbody></table>`;
+    nightsHtml = `<h3>Nights</h3>` + jobs.map((j) => {
+      const nights = laneRows(j.nights);
+      if (!nights.length) return `<p class="mut small">No night of <code>${esc(j.job)}</code> on record yet.</p>`;
+      const nc = j.night_counts || {};
+      return `<p class="mut small">${plural(nc.on_record || nights.length, "night")} on record: ${nc.green || 0} green, ${nc.red || 0} not (<code>${esc(j.job)}</code>).</p>${laneTable(nights)}`;
+    }).join("");
   }
-  return `<div class="sec" id="gitlab"><h2>GitLab lane</h2>${body}${nightsHtml}</div>`;
+  return `<div class="sec" id="${esc(tier)}"><h2>${esc(title)}</h2>${body}${nightsHtml}</div>`;
+}
+// A section of several forges (the self-managed ones): one table of their
+// pull-request runs and one of their scheduled runs, newest first, each row
+// naming its forge, so a red row says which forge broke.
+const forgeName = (lane) => String(lane.title || lane.tier || "").replace(/ lane$/, "");
+const startedMs = (run) => (run.started ? parseIso(run.started) : 0) || 0;
+function forgeSectionHtml(section, lanes) {
+  const title = lanes[0].section_title || section;
+  const tagged = (pick) => lanes.flatMap((l) => pick(l).map((r) => ({ ...r, forge: forgeName(l) }))).sort((a, b) => startedMs(b) - startedMs(a));
+  const runs = tagged((l) => laneRows(l.runs));
+  const inFlight = lanes.reduce((n, l) => n + (Array.isArray(l.running) ? l.running.length : 0), 0);
+  const flight = inFlight ? `<p class="mut small">${plural(inFlight, "build")} in flight, not yet recorded.</p>` : "";
+  const tally = (key, rows) => lanes.map((l) => {
+    const c = l[key] || {};
+    return `${esc(forgeName(l))} ${plural(c.on_record || 0, rows)}, ${c.green || 0} green`;
+  }).join("; ");
+  let body;
+  if (!runs.length) {
+    const tests = lanes.map((l) => `<code>/test ${esc(l.job || "")}</code>`).join(" or ");
+    body = `<p class="mut">No run on record. Each forge's pull-request job runs on demand (${tests}); its runs are listed here and counted nowhere else.</p>${flight}`;
+  } else {
+    body = `<p class="mut small">${tally("counts", "run")}. These runs sit outside the gate's numbers above.</p>${laneTable(runs.slice(0, PAGE.laneRowsListed), true)}${flight}`;
+  }
+  const scheduled = tagged((l) => (Array.isArray(l.nightly_jobs) ? l.nightly_jobs : []).flatMap((j) => laneRows(j && j.nights)));
+  const cadence = lanes[0].cadence === "weekly" ? "week" : "night";
+  // A lane's reason its scheduled jobs are off (forge_lane.LANES' `off`), as the digest says it.
+  const offs = lanes.filter((l) => l.off).map((l) => `<p class="mut small">${esc(forgeName(l))}'s scheduled jobs are off: ${esc(l.off)}.</p>`).join("");
+  let schedHtml;
+  if (!scheduled.length) {
+    const names = lanes.flatMap((l) => (Array.isArray(l.nightly_jobs) ? l.nightly_jobs : []).map((j) => j && j.job).filter(Boolean)).map((j) => `<code>${esc(j)}</code>`).join(" and ");
+    schedHtml = `<p class="mut small">No scheduled run on record.${names ? ` ${names} run the same list once a ${cadence}.` : ""}</p>${offs}`;
+  } else {
+    // The Job column names each row's job, so a retired job's run reads as its own.
+    schedHtml = `<h3>Scheduled runs</h3>${offs}<p class="mut small">${tally("night_counts", "run")}.</p>${laneTable(scheduled.slice(0, PAGE.laneRowsListed), true, true)}`;
+  }
+  return `<div class="sec" id="${esc(section)}"><h2>${esc(title)}</h2>${body}${schedHtml}</div>`;
+}
+function lanesHtml() {
+  const lanes = Array.isArray(brief.lanes) ? brief.lanes.filter((l) => l && typeof l === "object" && l.tier) : [];
+  const sections = [];
+  for (const lane of lanes) {
+    const key = String(lane.section || lane.tier);
+    const found = sections.find((s) => s.key === key);
+    if (found) found.lanes.push(lane);
+    else sections.push({ key, lanes: [lane] });
+  }
+  return sections.map((s) => (s.lanes.length > 1 ? forgeSectionHtml(s.key, s.lanes) : laneHtml(s.lanes[0]))).join("");
 }
 
 function briefHtml(link) {
@@ -1089,7 +1156,7 @@ function briefHtml(link) {
       `<div class="sec" id="agent"><h2>Last 24 hours</h2>${numbersHtml(sinceMs, null)}</div>` +
       (healthy || noVerdict ? `<div class="sec"><h2>Last incident</h2>${lastIncidentHtml()}</div>` : "") +
       runsListHtml(windowRuns(sinceMs, null), inc, "Runs in the last 24 hours") +
-      nightlyBriefHtml() + gitlabLaneHtml() + releasesHtml() + footHtml();
+      nightlyBriefHtml() + lanesHtml() + releasesHtml() + footHtml();
   }
   const inWindow = windowRuns(incidentStartMs(inc), inc.untilMs);
   if (!inWindow.some(measured) && !inWindow.some((r) => r.setup_death || r.cls === "deadline-kill")) {
@@ -1111,7 +1178,7 @@ function briefHtml(link) {
     changedBeforeHtml(inc, inWindow) +
     beingDoneHtml(inc) +
     runsListHtml(inWindow, inc, "Runs in this window") +
-    nightlyBriefHtml() + gitlabLaneHtml() + releasesHtml() + footHtml();
+    nightlyBriefHtml() + lanesHtml() + releasesHtml() + footHtml();
 }
 
 function footHtml() {
@@ -1657,7 +1724,7 @@ function partNotes(night, cut = true) {
   const notes = cut ? nightParts(night).filter((p) => p.truncated).map((p) => `${word(p.part)} cut short after ${p.duration_s != null ? minutesText(p.duration_s * 1000) : "an unknown time"}`) : [];
   return notes.concat(list(night.missing_parts).map((p) => `${word(p)} missing`), list(night.running_parts).map((p) => `${word(p)} still running`));
 }
-// The main half (main or main-b) a night lacks, missing or still running,
+// The main shard (main, or main-b to main-e) a night lacks, missing or still running,
 // or null: its cases were never compared, so no verdict on what is newly
 // failing. nightly.py decides it once (verdict_withheld_by) for the page and
 // the digest alike.
@@ -1668,9 +1735,12 @@ const nightCutSeconds = (night) => {
   const main = nightParts(night).find((p) => p.part === "main");
   return main ? main.duration_s : night.duration_s;
 };
-// A night with a main-b part names each part cut short with its own wall
-// clock, as the digest does, rather than one wall clock for the night.
-const nightHasMainB = (night) => nightParts(night).some((p) => p.part === "main-b");
+// A night with a main shard beside the main part names each part cut short
+// with its own wall clock, as the digest does, rather than one for the night.
+// The shards are the main parts other than "main" itself, read from the one
+// list of part words the pages test pins to nightly.py's.
+const MAIN_SHARD_PARTS = Object.keys(PAGE.nightPartWords).filter((part) => part.startsWith("main-"));
+const nightHasMainShards = (night) => nightParts(night).some((p) => MAIN_SHARD_PARTS.includes(p.part));
 const nightStart = (night) => parseIso(night.started) ?? parseIso(night.finished);
 // The night's headline state, worst first: cut short, failed cases, partial
 // cases, nothing recorded or nothing graded, a pass short of the matrix
@@ -1714,11 +1784,11 @@ function nightlyBriefHtml() {
   if (!night) body = `<p class="mut">No night on record yet. Once <code>${esc(brief.nightly && brief.nightly.job || "the nightly periodic")}</code> has run, last night's report is here and one line of it goes into the 11 AM digest.</p>`;
   else {
     const c = night.counts;
-    // With a main-b part, each half cut short is named with its own wall
+    // With another main shard, each shard cut short is named with its own wall
     // clock (as on the Nightly page and in the digest), not one for the night.
-    const notes = partNotes(night, !night.truncated || nightHasMainB(night)).map((n) => ` · ${esc(n)}`).join("");
+    const notes = partNotes(night, !night.truncated || nightHasMainShards(night)).map((n) => ` · ${esc(n)}`).join("");
     const summary = night.truncated
-      ? `truncated${nightHasMainB(night) ? "" : ` after ${nightCutSeconds(night) != null ? minutesText(nightCutSeconds(night) * 1000) : "an unknown time"}`}: ${c.recorded} of ${c.expected || "?"} cases recorded${notes}`
+      ? `truncated${nightHasMainShards(night) ? "" : ` after ${nightCutSeconds(night) != null ? minutesText(nightCutSeconds(night) * 1000) : "an unknown time"}`}: ${c.recorded} of ${c.expected || "?"} cases recorded${notes}`
       : `${plural(c.recorded, "case")} · ${c.passed} passed all reps · ${c.partial} partial · ${c.failed} failed${c.infra ? ` · ${c.infra} infra` : ""}${night.newly_failing.length && !nightWithheldBy(night) ? ` · newly failing: <code>${night.newly_failing.map(esc).join("</code>, <code>")}</code>` : ""}${notes}${night.duration_s != null ? ` · ${minutesText(night.duration_s * 1000)}` : ""}`;
     body = `<p>${nightPill(night)} <b>${esc(nightDay(night))}</b> — ${summary}. <a href="${esc(nightHref(night))}">Read the report →</a></p>`;
   }
@@ -1734,6 +1804,15 @@ function nightRepText(c) {
   return c.state === "infra" ? `${plural(total, "rep")} lost` : `${reps.pass}/${reps.pass + reps.fail}${reps.infra ? ` (+${reps.infra} lost)` : ""}`;
 }
 const secOrDash = (v) => (Number.isFinite(v) ? secText(v) : "—");
+// A night's or a case's reply shape (SCHEMA.md: nightly.nights[].shape),
+// or null when no repetition carried one.
+const nightShape = (s) => (s && typeof s === "object" && Number.isFinite(s.n) && s.n > 0 ? s : null);
+function nightShapeCell(c) {
+  const s = nightShape(c.shape);
+  if (!s) return `<td class="num mut">—</td>`;
+  const words = Number.isFinite(s.answer_words_p50) ? `<br><small class="mut">${esc(plural(s.answer_words_p50, "word"))}</small>` : "";
+  return `<td class="num" title="repetitions whose answer opens on its verdict / repetitions measured, then the answer's median length; reported, never graded">${esc(`${s.opens_on_verdict}/${s.n}`)}${s.apology ? ` <small class="mut">${esc(`${s.apology} ${s.apology === 1 ? "apology" : "apologies"}`)}</small>` : ""}${words}</td>`;
+}
 
 function nightCaseRow(night, c, newly) {
   const links = [c.transcript_url ? `<a href="${esc(c.transcript_url)}">transcript</a>` : "", `<a href="${esc(caseHref(c.case))}">history</a>`,
@@ -1744,6 +1823,7 @@ function nightCaseRow(night, c, newly) {
     `<td>${nightStatePill(c)}</td>` +
     `<td class="num" title="repetitions passed / graded">${esc(nightRepText(c))}</td>` +
     `<td class="num tm" title="median opening chat turn / median agent wall clock, then the p90 of each, over the repetitions not lost to infra">${esc(secOrDash(c.turn1_p50_s))} / ${esc(secOrDash(c.agent_p50_s))}${p90}</td>` +
+    nightShapeCell(c) +
     `<td>${c.reason ? `<span class="rsn" title="${esc(c.reason)}">${esc(c.reason)}</span>` : `<span class="mut">—</span>`}</td>` +
     `<td class="mut small">${links}</td></tr>`;
 }
@@ -1755,10 +1835,10 @@ function nightCasesTable(night) {
   const rows = [];
   let domain = null;
   for (const c of cases) {
-    if (c.domain !== domain) { domain = c.domain; rows.push(`<tr class="grp"><td colspan="6"${titleAttr(domainTooltip(domain))}>${esc(domainWords(domain))}</td></tr>`); }
+    if (c.domain !== domain) { domain = c.domain; rows.push(`<tr class="grp"><td colspan="7"${titleAttr(domainTooltip(domain))}>${esc(domainWords(domain))}</td></tr>`); }
     rows.push(nightCaseRow(night, c, newly));
   }
-  return `<table class="rel night"><thead><tr><th>Case</th><th>State</th><th>Reps</th><th>Turn 1 / agent</th><th>Grader's reason</th><th></th></tr></thead><tbody>${rows.join("")}</tbody></table>`;
+  return `<table class="rel night"><thead><tr><th>Case</th><th>State</th><th>Reps</th><th>Turn 1 / agent</th><th>Opens on answer</th><th>Grader's reason</th><th></th></tr></thead><tbody>${rows.join("")}</tbody></table>`;
 }
 
 function nightChangesHtml(night) {
@@ -1831,10 +1911,10 @@ function nightlyHtml(link) {
   const took = night.duration_s != null ? minutesText(night.duration_s * 1000) : "unknown wall clock";
   // A split night's own notes (a part cut short, missing or running) lead
   // the sentence; a night of one job reads as it always has.
-  const notes = partNotes(night, !night.truncated || nightHasMainB(night));
+  const notes = partNotes(night, !night.truncated || nightHasMainShards(night));
   const notesText = notes.length ? `${esc(notes.join(" · "))}. ` : "";
   let ledeHow;
-  if (night.truncated) ledeHow = `<b>The night was cut short:</b> ${notesText}Prow ended the job${nightHasMainB(night) ? "" : ` after ${esc(nightCutSeconds(night) != null ? minutesText(nightCutSeconds(night) * 1000) : "unknown wall clock")}`} with ${c.recorded} of ${c.expected || "?"} cases recorded, so the counts below are not comparable with a full night.`;
+  if (night.truncated) ledeHow = `<b>The night was cut short:</b> ${notesText}Prow ended the job${nightHasMainShards(night) ? "" : ` after ${esc(nightCutSeconds(night) != null ? minutesText(nightCutSeconds(night) * 1000) : "unknown wall clock")}`} with ${c.recorded} of ${c.expected || "?"} cases recorded, so the counts below are not comparable with a full night.`;
   else if (!night.complete && notes.length) ledeHow = `<b>Incomplete:</b> ${notesText}${c.recorded} of the ${c.expected} cases the nightly matrix on this checkout expects are recorded.`;
   else if (!night.complete) ledeHow = `<b>Incomplete:</b> the job concluded after ${esc(took)} but recorded ${c.recorded} of the ${c.expected} cases the nightly matrix on this checkout expects.`;
   else ledeHow = `The job ran to the end in ${esc(took)}: ${c.recorded} cases recorded${c.expected ? ` of ${c.expected} expected` : ""}.`;
@@ -1848,19 +1928,23 @@ function nightlyHtml(link) {
   const head = `<div class="sec head">${nightPill(night)}<h1>${isLast ? "Last night's run" : `Night of ${esc(nightDay(night))}`}</h1>` +
     `<div class="lede">${esc(when)} · ${jobs}${night.head_sha ? ` at <code>${esc(night.head_sha)}</code>` : ""}${night.project ? ` · project ${esc(projectShort(night.project))}` : ""}${logs}</div>` +
     `<div class="lede">${ledeHow}</div>${isLast ? runningNoteHtml() : ""}</div>`;
-  // The night's opening chat turn, a sixth tile when its reps carried one.
+  // The night's opening chat turn and its reply shape, a tile each when its
+  // reps carried one.
   const turn1 = Number.isFinite(night.turn1_p50_s) && Number.isFinite(night.turn1_p95_s);
-  const tiles = `<div class="sec"><h2>In numbers</h2><div class="tiles${turn1 ? " six" : ""}">` +
+  const shape = nightShape(night.shape);
+  const extra = (turn1 ? 1 : 0) + (shape ? 1 : 0);
+  const tiles = `<div class="sec"><h2>In numbers</h2><div class="tiles${extra === 2 ? " seven" : extra ? " six" : ""}">` +
     tile("Cases", `${c.recorded}`, c.expected ? `of ${c.expected} in the nightly matrix` : "recorded") +
     tile("Passed all reps", `${c.passed}`, c.recorded ? `${pct(c.passed / c.recorded)} of recorded cases` : "no case recorded") +
     tile("Partial", `${c.partial}`, "failed some repetitions") +
     tile("Failed", `${c.failed}`, `failed every graded rep · ${plural(c.infra, "case")} lost to infra`) +
     tile("Newly failing", `${night.previous_build == null || nightWithheldBy(night) ? "—" : night.newly_failing.length}`, nightWithheldBy(night) ? `no ${PAGE.nightPartWords[nightWithheldBy(night)] || nightWithheldBy(night)} on record` : night.previous_build == null ? "first night on record" : "against the night before") +
     (turn1 ? tile("Chat turn 1", `${night.turn1_p50_s.toFixed(1)}<small>s p50</small>`, `p95 ${secText(night.turn1_p95_s)} · advisory target p95 < ${PAGE.turn1P95TargetS} s`) : "") +
+    (shape ? tile("Opens on answer", `${pct(shape.opens_on_verdict / shape.n)}`, [`of ${plural(shape.n, "rep")}`, Number.isFinite(shape.answer_words_p50) ? `answer p50 ${plural(shape.answer_words_p50, "word")}` : "", `${shape.apology} with an apology`].filter(Boolean).join(" · ")) : "") +
     `</div></div>`;
   return head + tiles +
     `<div class="sec"><h2>Against the night before</h2>${nightChangesHtml(night)}</div>` +
-    `<div class="sec"><h2>Every case, by domain</h2>${nightCasesTable(night)}<p class="mut small">States: pass = every graded rep passed · partial = some reps failed · fail = every graded rep failed · infra = nothing graded (quota or setup losses, never counted against a case). Reps read passed / graded. Turn 1 / agent are medians over the repetitions not lost to infra: the opening chat turn, then the agent's whole run, with the p90 of each under them. The transcript is the first repetition's.</p></div>` +
+    `<div class="sec"><h2>Every case, by domain</h2>${nightCasesTable(night)}<p class="mut small">States: pass = every graded rep passed · partial = some reps failed · fail = every graded rep failed · infra = nothing graded (quota or setup losses, never counted against a case). Reps read passed / graded. Turn 1 / agent are medians over the repetitions not lost to infra: the opening chat turn, then the agent's whole run, with the p90 of each under them. Opens on answer counts the repetitions whose reply opens on its verdict rather than a lead-in or a heading, out of those measured, with the answer's median length under it; it is reported, never graded. The transcript is the first repetition's.</p></div>` +
     nightTimingHtml(link) + nightsListHtml(night) + footHtml();
 }
 

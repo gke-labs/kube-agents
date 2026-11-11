@@ -93,17 +93,18 @@ readonly GITOPS_SEED_CONTENT="# GitOps Infrastructure Repo"
 # The declared-intent note the declared-intent cases read (GITOPS_INTENT_NOTE_CASES
 # in scripts/verify_ci_pool_project.py): the fleet's declared-no-pdb-workload role
 # runs without a budget or a NetworkPolicy, declared-token-workload's
-# token-reader keeps its mounted token, and declared-overrequest-workload's
-# burst-ingest keeps its headroom, all on purpose. The harness reads the
+# token-reader keeps its mounted token, declared-overrequest-workload's
+# burst-ingest keeps its headroom, and declared-single-zone-pool's
+# declared-zonal-pool stays in one zone, all on purpose. The harness reads the
 # frontmatter, not the prose.
 # What `gh api` prints on stderr for a path that is not there; any other failure
 # of the existence read stops the seed rather than writing blind.
 readonly GITOPS_NOTE_ABSENT_PATTERN="HTTP 404"
 readonly GITOPS_INTENT_NOTE_PATH="knowledge/notification-relay-no-pdb.md"
-readonly GITOPS_INTENT_NOTE_MESSAGE="Declare seeded-intent's missing PodDisruptionBudget and NetworkPolicy, token-reader's mounted token, seeded-c's missing upgrade notifications, and burst-ingest's headroom, as intended"
+readonly GITOPS_INTENT_NOTE_MESSAGE="Declare seeded-intent's missing PodDisruptionBudget and NetworkPolicy, token-reader's mounted token, seeded-c's missing upgrade notifications, burst-ingest's headroom, and declared-zonal-pool's single zone, as intended"
 readonly GITOPS_INTENT_NOTE_CONTENT='---
 type: decision
-title: seeded-intent, seeded-token, seeded-c and seeded-headroom carry five postures on purpose
+title: seeded-intent, seeded-token, seeded-c, seeded-headroom and the declared-zonal-pool of seeded-a carry six postures on purpose
 declares:
   - check: no-pdb
     namespace: seeded-intent
@@ -120,6 +121,9 @@ declares:
   - check: overrequest
     namespace: seeded-headroom
     object: Deployment/burst-ingest
+  - check: single-zone-nodepool
+    namespace: ""
+    object: NodePool/declared-zonal-pool
 ---
 
 `notification-relay` in `seeded-intent` runs two replicas with no PodDisruptionBudget by design:
@@ -129,9 +133,10 @@ in `seeded-token` runs on the default ServiceAccount of its namespace with the t
 design: it reads the API server with that identity. Its neighbour `token-sidecar` is not declared.
 `seeded-c` publishes no GKE upgrade notifications by design: this fleet learns about upgrades from
 the weekly audit. `burst-ingest` in `seeded-headroom` requests far more memory than it uses by
-design: it is sized for an ingest burst the measured week does not show. The obtainability,
-compliance, upgrade readiness and waste audits list the five postures under Declared intent rather
-than as findings.'
+design: it is sized for an ingest burst the measured week does not show. `declared-zonal-pool` on
+`seeded-a` is an autoscaling pool kept in one zone by design: the cluster is single-zone, and the
+pool stays empty until a zonal batch needs it. The obtainability, compliance, upgrade readiness,
+waste and capacity audits list the six postures under Declared intent rather than as findings.'
 # checkout-gateway's declaration, the file the remediation cases propose a
 # PodDisruptionBudget beside (GITOPS_WORKLOAD_MANIFEST_CASES in the verifier).
 # With no manifest in the repository the agent finds nothing to fix and refuses
@@ -356,8 +361,8 @@ fi
 # A bare `grep "${PROJECT_ID}"` also matches comments and any longer project ID
 # that contains this one as a prefix.
 CI_DEPLOY="${REPO_ROOT}/hack/ci-deploy.sh"
-if ! awk '/gitops_repo_for_project\(\)[[:space:]]*\{/,/^\}/' "${CI_DEPLOY}" 2>/dev/null \
-     | grep -qE "^[[:space:]]*${PROJECT_ID}\)[[:space:]]+echo[[:space:]]+\"${GITOPS_REPO}\""; then
+if ! grep -qE "^[[:space:]]*${PROJECT_ID}\)[[:space:]]+echo[[:space:]]+\"${GITOPS_REPO}\"" \
+     <<<"$(awk '/gitops_repo_for_project\(\)[[:space:]]*\{/,/^\}/' "${CI_DEPLOY}" 2>/dev/null)"; then
   echo "⚠️ ${PROJECT_ID} is not mapped in hack/ci-deploy.sh." >&2
   echo "   Add to gitops_repo_for_project():" >&2
   echo "       ${PROJECT_ID}) echo \"${GITOPS_REPO}\" ;;" >&2
@@ -389,6 +394,9 @@ gcloud services enable \
   iam.googleapis.com \
   cloudkms.googleapis.com \
   dns.googleapis.com \
+  apikeys.googleapis.com \
+  secretmanager.googleapis.com \
+  generativelanguage.googleapis.com \
   --project="${PROJECT_ID}"
 
 PROJECT_NUMBER="$(gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber)')"
@@ -614,7 +622,7 @@ seed_gitops_file() {
   local path="$1" message="$2" content="$3" what="$4" read_error
   if read_error="$(gh api "repos/${GITOPS_REPO}/contents/${path}" 2>&1 >/dev/null)"; then
     return 0
-  elif printf '%s' "${read_error}" | grep -q "${GITOPS_NOTE_ABSENT_PATTERN}"; then
+  elif grep -q "${GITOPS_NOTE_ABSENT_PATTERN}" <<<"${read_error}"; then
     echo "Seeding ${GITOPS_REPO} with ${path} (${what})..."
     gh api -X PUT "repos/${GITOPS_REPO}/contents/${path}" \
       -f message="${message}" \
@@ -698,6 +706,12 @@ if ! gcloud iam service-accounts describe "${FORGE_VM_SA}" --project="${PROJECT_
 fi
 gcloud projects add-iam-policy-binding "${PROJECT_ID}" --member="serviceAccount:${FORGE_VM_SA}" --role="${FORGE_VM_SA_ROLE}" --quiet >/dev/null
 echo "✓ Forge pieces: zone ${FORGE_DNS_ZONE}, firewall rules ${FORGE_FIREWALL_RULE} and ${FORGE_DENY_RULE}, VM identity ${FORGE_VM_SA} (${FORGE_VM_SA_ROLE})"
+
+# ─── Step 1.6: The eval nightlies' Gemini Developer API key ───────────────────
+echo -e "\n==> [Step 1.6] Minting the project's Gemini Developer API key..."
+# Per project so each leased project gets its own quota window; the same script repairs an already-registered project, which must not be re-provisioned.
+# Step 1 already enabled its three APIs (REQUIRED_APIS); the script enables them again, which is a no-op.
+"${SCRIPT_DIR}/provision_ci_pool_gemini_key.sh" "${PROJECT_ID}"
 
 # ─── Step 2: Host GKE Cluster & Seeded Fleet ──────────────────────────────────
 # One bucket per project, one prefix per stack. Versioning and uniform
@@ -866,8 +880,10 @@ if [ "${SKIP_FLEET}" != "true" ]; then
     # resources read the Gateway API CRDs at plan time, and those exist only
     # once GKE has created seeded-a with gateway_api_config. The first apply
     # creates that cluster on its own; on a project that has it, it changes
-    # nothing.
-    tofu apply -auto-approve -var="project_id=${PROJECT_ID}" -target=google_container_cluster.seeded_a
+    # nothing. The ComputeClass fixture's kubernetes_manifest (defects-c.tf)
+    # reads the ComputeClass CRD the same way, which GKE installs with
+    # seeded-c, so the first apply targets that cluster too.
+    tofu apply -auto-approve -var="project_id=${PROJECT_ID}" -target=google_container_cluster.seeded_a -target=google_container_cluster.seeded_c
     tofu apply -auto-approve -var="project_id=${PROJECT_ID}"
   )
 else

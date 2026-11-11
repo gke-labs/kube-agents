@@ -1182,6 +1182,100 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
             "have the record read as infrastructure",
         )
 
+    SUBMIT_PROBE = "a2a.submit.cluster.read.top.task-0001"
+
+    def test_A3_the_submit_subject_has_exactly_one_writer(self) -> None:
+        """A profile task's `…submit` is written by the gateway and nobody else.
+
+        The submission is where a profile task's grant enters the task plane:
+        the gateway mints it against the profile it resolved, with the
+        requester's tier and the target in scope, and the dispatcher admits
+        what arrives there. A second writer could submit a task under a grant
+        it didn't mint, or fill a profile's queue with work nobody asked for.
+        The dispatcher reads the subject through its durables and holds no
+        publish on it; no session or profile worker derives one.
+        """
+        writers = sorted(
+            builder
+            for builder, grants in self._rendered_publish_grants().items()
+            if any(self._subject_matches(g, self.SUBMIT_PROBE) for g in grants)
+        )
+        self.assertEqual(["gateway"], writers)
+        derivation = self._session_publish_derivation()
+        for spelling in self.SUBMIT_SPELLINGS:
+            self.assertNotIn(
+                spelling,
+                derivation,
+                "the callout derives an executor a publish grant on a profile's submit "
+                "subject; a worker that can write there can start tasks of its own",
+            )
+        dispatcher = self._dispatcher_identity()
+        for spelling in self.SUBMIT_SPELLINGS:
+            self.assertNotIn(spelling, dispatcher, "the dispatcher holds a grant on a profile's submit subject")
+
+    # The ways the tree spells each subject: the library helpers, their
+    # prefix constants and the literal. An executor's or the dispatcher's
+    # grant written through any of them is a second writer.
+    SUBMIT_SPELLINGS = ("TaskSubmitSubject", "SubmitSubjectPrefix", ".submit", "a2a.submit")
+    STOP_SPELLINGS = ("DispatchStopSubject", "DispatchStopPrefix", "a2a.stop")
+
+    @staticmethod
+    def _dispatcher_identity() -> str:
+        """`dispatcherIdentity`'s body: the dispatcher authenticates through
+        the callout, so no served config carries its grants."""
+        return h.go_function_body(h.text("a2a_dispatcher"), "dispatcherIdentity")
+
+    # The dispatcher's reads of the stop record: its subscription on each
+    # profile's records (the `stops` list) and the direct get it catches up
+    # with after a restart. Reads don't count as writers.
+    DISPATCHER_STOP_READS = ("$JS.API.DIRECT.GET.", "stops = append(stops,")
+
+    @classmethod
+    def _dispatcher_writes(cls) -> str:
+        """`dispatcherIdentity`'s body without its reads of the stop record
+        and without comments, so a spelling left in it is a write."""
+        lines = cls._dispatcher_identity().splitlines()
+        return "\n".join(
+            line
+            for line in lines
+            if not line.lstrip().startswith("//") and not any(read in line for read in cls.DISPATCHER_STOP_READS)
+        )
+
+    STOP_PROBE = "a2a.stop.cluster.task-0001"
+
+    def test_A3_the_stop_record_has_exactly_one_writer(self) -> None:
+        """A profile task's stop record is written by the gateway and nobody else.
+
+        The dispatcher drops a queued task, or cancels a held one, when its
+        stop record appears, without reading the task's `…in`. A second
+        writer could stop another requester's task. The dispatcher's own
+        publish on `a2a.dispatch.*.*.*` doesn't reach the record's root,
+        `a2a.stop`, and no session or profile worker derives a grant there.
+        """
+        writers = sorted(
+            builder
+            for builder, grants in self._rendered_publish_grants().items()
+            if any(self._subject_matches(g, self.STOP_PROBE) for g in grants)
+        )
+        self.assertEqual(["gateway"], writers)
+        derivation = self._session_publish_derivation()
+        for spelling in self.STOP_SPELLINGS:
+            self.assertNotIn(
+                spelling,
+                derivation,
+                "the callout derives an executor a publish grant on a stop record; "
+                "a worker that can write there can stop other requesters' tasks",
+            )
+        dispatcher = self._dispatcher_writes()
+        for spelling in self.STOP_SPELLINGS:
+            self.assertNotIn(spelling, dispatcher, "the dispatcher holds a publish grant on the stop record")
+        # The reads left out above are only reads while their list stays on
+        # the subscribe side: the stop subjects can't be spliced into the
+        # publish list.
+        body = self._dispatcher_identity()
+        publish = body[body.index("publish:") : body.index("subscribe:")]
+        self.assertNotIn("stops", publish, "the dispatcher's stop-record subscription list reaches its publish grants")
+
     NOTIFY_PROBE = "chat.notify.gchat"
     NOTIFY_SLACK_PROBE = "chat.notify.slack"
     NOTIFY_CONSOLE_PROBE = "chat.notify.console"
@@ -1716,6 +1810,139 @@ class A4DelegationAttenuates(unittest.TestCase):
                     rule.get("resourceNames"),
                     "an unrestricted bind grant reached a delivery path",
                 )
+
+    def test_A4_only_cluster_administrators_write_tiers(self) -> None:
+        """A tier is authority: whoever writes one sets what tasks at it may do.
+
+        The Tier CRD (#3659) is for cluster administrators alone, so:
+
+          - no Role or ClusterRole in the `spec.mode: today` goldens or in the
+            chart's own templates names `tiers`, by name or by a wildcard
+            group, resource or subresource, at any verb;
+          - the operator's RBAC, on both delivery paths (role.yaml plus the
+            leader-election Role for kustomize, operator-rbac.yaml for the
+            chart), reads tiers and writes their status, and nothing more,
+            counting wildcard rules;
+          - nothing in the chart or the operator's config aggregates a role
+            that reaches tiers into `admin`, `edit` or `view`, which would
+            hand tiers to every namespace admin by default.
+
+        Every rule read from a chart template must have plain apiGroups,
+        resources and verbs: a templated field would leave the predicate
+        reading a placeholder.
+
+        Not covered yet: the roles the operator mints for `spec.mode: next`
+        (buildA2AGatewayRole, buildA2ACalloutRole, buildScopePublisherRole and
+        the dispatcher roles). The goldens render only the today-mode
+        fixtures in _GOLDEN_KEYS, so those builders are outside this read.
+        """
+        def reaches_tiers(rule: dict) -> set[str]:
+            """The tier resources a rule reaches, wildcards included."""
+            groups = set(rule.get("apiGroups") or [])
+            if not groups & {"kubeagents.x-k8s.io", "*"}:
+                return set()
+            out = set()
+            for resource in rule.get("resources") or []:
+                if resource == "*":
+                    out |= {"tiers", "tiers/status"}
+                elif resource == "tiers" or resource.startswith("tiers/"):
+                    out.add(resource)
+                elif resource.startswith("*/"):
+                    # RBAC matches `*/<sub>` against that subresource of every
+                    # resource in the group: `*/finalizers` is tiers/finalizers.
+                    out.add("tiers/" + resource[2:])
+            return out
+
+        def rules_of(where: str, role: dict) -> list:
+            """A role's rules, refusing any whose fields a template filled in."""
+            rules = role.get("rules") or []
+            self.assertIsInstance(rules, list, f"{where}: rules is templated")
+            for rule in rules:
+                for field in ("apiGroups", "resources", "verbs"):
+                    # repr, as in the ceiling test above: a field that is one
+                    # whole expression parses as a scalar string.
+                    self.assertNotIn(
+                        h.HELM_PLACEHOLDER,
+                        repr(rule.get(field)),
+                        f"{where}: {field} is templated, so what this rule "
+                        "reaches depends on a value this parse cannot see",
+                    )
+            return rules
+
+        def template_documents(text: str) -> tuple[dict, ...]:
+            """A chart template read the way helm_documents reads one, after
+            dropping the multi-line {{/* */}} comments a line-based pass can't."""
+            text = re.sub(r"\{\{-?\s*/\*.*?\*/\s*-?\}\}", "", text, flags=re.S)
+            body = "\n".join(line for line in text.splitlines() if not h._HELM_DIRECTIVE.match(line))
+            return tuple(d for d in yaml.safe_load_all(h._HELM_EXPRESSION.sub(h.HELM_PLACEHOLDER, body))
+                         if isinstance(d, dict))
+
+        product_roles = []
+        for name, documents in h.golden_documents().items():
+            for kind in ("Role", "ClusterRole"):
+                product_roles += [(name, role) for role in h.objects_of_kind(documents, kind)]
+        # The chart's own roles (the web console's, the cleanup hook's). A
+        # template that declares a role and won't parse fails here rather than
+        # being skipped, since a skipped role is an unchecked one.
+        chart_templates = h.REPO_ROOT / "charts/kube-agents/templates"
+        chart_roles = 0
+        for path in sorted(chart_templates.glob("*.yaml")):
+            text = path.read_text()
+            if path.name == "operator-rbac.yaml" or not re.search(r"^kind:\s*(Cluster)?Role\s*$", text, re.M):
+                continue
+            documents = template_documents(text)
+            for kind in ("Role", "ClusterRole"):
+                roles = h.objects_of_kind(documents, kind)
+                chart_roles += len(roles)
+                product_roles += [(path.name, role) for role in roles]
+        self.assertGreater(chart_roles, 0, "no chart role was read; the chart's templates moved")
+        checked = 0
+        for name, role in product_roles:
+            for rule in rules_of(f"{name}: {role['metadata']['name']}", role):
+                checked += 1
+                with self.subTest(source=name, role=role["metadata"]["name"], rule=rule):
+                    self.assertFalse(reaches_tiers(rule), "a product role reaches tiers")
+        self.assertGreater(checked, 0, "no product role was read; the goldens or the chart moved")
+
+        # Each delivery path read whole: the chart's operator-rbac.yaml carries
+        # the leader-election Role beside the ClusterRole, so the kustomize
+        # side reads both of the files config/rbac/kustomization.yaml ships.
+        want = {"tiers": {"get", "list", "watch"}, "tiers/status": {"get", "update", "patch"}}
+        for source, documents in (("kustomize", h.yaml_documents("operator_clusterrole")
+                                   + h.yaml_documents("operator_leader_election_role")),
+                                  ("chart_operator_rbac", h.helm_documents("chart_operator_rbac"))):
+            got: dict[str, set[str]] = {}
+            for kind in ("Role", "ClusterRole"):
+                for role in h.objects_of_kind(documents, kind):
+                    for rule in rules_of(source, role):
+                        for resource in reaches_tiers(rule):
+                            got.setdefault(resource, set()).update(rule.get("verbs") or [])
+            with self.subTest(source=source):
+                self.assertEqual(got, want, f"{source}: the operator's verbs on tiers")
+
+        # A document carrying an aggregate-to label is parsed and its rules put
+        # through reaches_tiers: a wildcard resource never spells `tiers`, so a
+        # text search for the word passes the role that matters most.
+        aggregating = re.compile(r"rbac\.authorization\.k8s\.io/aggregate-to-(admin|edit|view)")
+        roots = [h.REPO_ROOT / "charts/kube-agents/templates", h.REPO_ROOT / "k8s-operator/config"]
+        scanned = 0
+        for root in roots:
+            for path in sorted(root.rglob("*.yaml")):
+                scanned += 1
+                where = str(path.relative_to(h.REPO_ROOT))
+                for document in re.split(r"^---\s*$", path.read_text(), flags=re.M):
+                    if not aggregating.search(document):
+                        continue
+                    for parsed in template_documents(document):
+                        for kind in ("Role", "ClusterRole"):
+                            for role in h.objects_of_kind((parsed,), kind):
+                                for rule in rules_of(where, role):
+                                    with self.subTest(path=where, rule=rule):
+                                        self.assertFalse(
+                                            reaches_tiers(rule),
+                                            "a role reaching tiers aggregates into admin, edit or view",
+                                        )
+        self.assertGreater(scanned, 0)
 
     def test_A4_triggering_is_covered_by_the_A3_inject_finding(self) -> None:
         """The second half of A4 has one instance in this codebase, already named.

@@ -51,14 +51,14 @@ The exposed ports:
 
 `k8s-operator/config/` holds larger Kustomize bases the operator manager uses. Notable subtrees:
 
-- `config/crd/` — the `PlatformAgent`, `AgentPlugin` and `AgentProfile` CRDs.
+- `config/crd/` — the `PlatformAgent`, `AgentPlugin`, `AgentProfile` and `Tier` CRDs.
 - `config/rbac/` — ClusterRoles + bindings for the manager.
 - `config/webhook/` — admission webhook config (validating + mutating). The Service targets port `10250` on the manager pod for the GKE firewall reason in [Admission webhooks](/kube-agents/operator/#admission-webhooks).
 - `config/manager/` — Deployment for the controller manager, plus its `PodDisruptionBudget`.
 - `config/integrations/github/` — Minty deployment and its `PodDisruptionBudget`.
 - `config/integrations/litellm/` — LiteLLM Deployment + Service (plus `PodDisruptionBudget`, `NetworkPolicy`, `PodMonitoring`, and `vertex_ai`, `anthropic` and `chatgpt` overlays).
 - `config/integrations/inference-replay/` — replay proxy Deployment, Service, PVC, and `PodDisruptionBudget`.
-- `config/integrations/hindsight/` — the Planning Agent's memory store: API Deployment, Postgres/pgvector StatefulSet, and their Service, `PodDisruptionBudget`s, `NetworkPolicy`, and `PodMonitoring`.
+- `config/integrations/hindsight/` — the Planning Agent's memory store: API Deployment, Postgres/pgvector StatefulSet, and their Service, `PodDisruptionBudget`s, `NetworkPolicy` objects (`hindsight-api` and `hindsight-postgresql`), and `PodMonitoring`.
 
 Each is built and applied on its own; there is no aggregate kustomization over
 `config/integrations/`, because every one of them needs `envsubst` over the built

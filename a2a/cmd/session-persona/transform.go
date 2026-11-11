@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 
 	"sigs.k8s.io/yaml"
@@ -50,6 +51,10 @@ const (
 	// sessionReportNote replaces a section that only the cluster agent can
 	// carry out, keeping its heading so the skill's cross-references still land.
 	sessionReportNote = "_In a session this step is your answer: give the root cause, the evidence that grounds it, and any proposed patch in your reply. The cluster agent's reporting tools don't exist here._"
+	// sessionCannotProceedClause replaces the canonical `needs_input` blocking
+	// clause in skills that delegate their reporting contract to
+	// references/reporting.md ("Cannot proceed").
+	sessionCannotProceedClause = "say what could not be read and quote the exact stderr line"
 
 	// shippedFileProse and shippedFileArg replace a reference to one of the
 	// cluster agent's scripts, example files or settings, in prose and in a
@@ -58,10 +63,11 @@ const (
 	// place would be an invitation to go looking for a file that isn't there.
 	shippedFileProse = "the cluster agent's file (not in this session)"
 	shippedFileArg   = "<file not in this session>"
-	// filePathPattern is a relative scripts/ or assets/ path, an absolute
-	// script path, or the cluster agent's settings file. filePathRE adds the
-	// left boundary it is matched under.
-	filePathPattern = `(\./)?(assets|scripts)/[\w./-]+|/opt/data/[\w./-]+|SETTINGS\.md`
+	// filePathPattern is a relative scripts/, assets/ or references/ path
+	// (within the skill or pointing at a sibling skill), a SKILL.md path, an
+	// absolute script path, or the cluster agent's settings file. filePathRE
+	// adds the left boundary it is matched under.
+	filePathPattern = `(\./|\.\./[\w-]+/|[\w-]+/)?(assets|scripts|references)/[\w./-]+|(\./|\.\./[\w-]+/|[\w-]+/)?SKILL\.md|/opt/data/[\w./-]+|SETTINGS\.md`
 
 	// sessionPreamble follows each skill's title. It says, once, what the
 	// per-block notes say locally, and covers what they can't mark: prose
@@ -70,22 +76,37 @@ const (
 >
 > - Run its ` + "`kubectl`" + ` and ` + "`gcloud`" + ` commands only when your system prompt gives you the read-only cluster view, one command per call. Without the view, use the steps to judge what the person showed you, or to say what ` + "`platform`" + ` should check when you delegate.
 > - A step that changes a cluster or a project is a proposal, never something you run. Code blocks that do are marked; a step written as prose ("edit", "apply", "enable") is a proposal too.
-> - Scripts, example files, settings files, git and tools the skill names (kanban, MCP servers, web search) are not in this session. Don't look for them; where a step describes a script's checks, make the same checks by reading the objects yourself.`
+> - Scripts, reference files, example files, settings files, git and tools the skill names (kanban, MCP servers, web search) are not in this session. Don't look for them; where a step describes a script's checks, make the same checks by reading the objects yourself.`
 )
 
 var (
-	// fileLinkRE is a Markdown link to a relative scripts/ or assets/
-	// path. filePathRE is filePathPattern starting a word: at the start of
-	// the line or after whitespace, a parenthesis, a backtick, a quote, an
-	// `=` (a flag's attached value) or a `,` (a list of paths). It
-	// captures that boundary so the replacement keeps it, and it leaves a
-	// path inside a URL alone (".../docs/scripts/setup.sh" is documentation,
-	// not the cluster agent's file).
-	fileLinkRE = regexp.MustCompile(`\[[^\]]*\]\((\./)?(assets|scripts)/[^)]*\)`)
-	filePathRE = regexp.MustCompile("(^|[\\s(`\"'=,])(" + filePathPattern + ")")
+	// fileLinkRE is a Markdown link to a relative scripts/, assets/ or
+	// references/ path. filePathRE is filePathPattern starting a word: at
+	// the start of the line or after whitespace, a parenthesis, a backtick,
+	// a quote, an `=` (a flag's attached value) or a `,` (a list of paths).
+	// It captures that boundary so the replacement keeps it, and it leaves
+	// a path inside a URL alone (".../docs/scripts/setup.sh" is
+	// documentation, not the cluster agent's file).
+	fileLinkRE = regexp.MustCompile(`\[[^\]]*\]\((\./|\.\./[\w-]+/|[\w-]+/)?(assets|scripts|references)/[^)]*\)`)
+	// crossSkillLinkRE matches a Markdown cross-link to another skill's SKILL.md
+	// so the session copy names shipped skills in backticks for the Skill tool
+	// and rewrites unshipped skills to shippedFileProse. sameSkillAnchorRE and
+	// sameSkillLinkRE handle links to the current skill's own SKILL.md.
+	crossSkillLinkRE  = regexp.MustCompile(`\[[^\]]+\]\(\.\./([\w-]+)/SKILL\.md(?:#[^)]*)?\)`)
+	sameSkillAnchorRE = regexp.MustCompile(`\[([^\]]+)\]\((?:\./)?SKILL\.md(#[^)]+)\)`)
+	sameSkillLinkRE   = regexp.MustCompile(`\[([^\]]+)\]\((?:\./)?SKILL\.md\)`)
+	filePathRE        = regexp.MustCompile("(^|[\\s(`\"'=,])(" + filePathPattern + ")")
 	// quotedFilePathRE is the same path as inline code in prose, replaced
 	// with its backticks so the replacement reads as prose.
 	quotedFilePathRE = regexp.MustCompile("`(" + filePathPattern + ")`")
+	// reportingStepJoinRE and reportingStepDirectRE match the final
+	// workflow clause in the workload skills that hands reporting off to
+	// workload-triage-scan/references/reporting.md. Replacing that clause
+	// before file-reference rewriting gives those skills sessionReportNote
+	// instead of a broken pointer to an unshipped reference file.
+	reportingStepJoinRE   = regexp.MustCompile(`(?:,\s*(?:(?:then|and|finally),?\s+)*|\s+(?:and|then)\s+(?:finally,?\s+)?)(?:[Rr]ecord|[Rr]eport) (?:the (?:finding|result)|it) as \[[^\]]*\]\((?:\./|\.\./[\w-]+/|[\w-]+/)?references/reporting\.md\) describes\.(?:\s*Stop once[^.]*\.)?`)
+	reportingStepDirectRE = regexp.MustCompile(`(^|^\s*(?:[-*]|\d+\.)\s+|[.!;:]\s+)(?:[Ff]inally,\s*)?(?:[Rr]ecord|[Rr]eport) (?:the (?:finding|result)|it) as \[[^\]]*\]\((?:\./|\.\./[\w-]+/|[\w-]+/)?references/reporting\.md\) describes\.(?:\s*Stop once[^.]*\.)?`)
+	cannotProceedStepRE   = regexp.MustCompile("block the card as `needs_input` as \\[[^\\]]*\\]\\((?:\\./|\\.\\./[\\w-]+/|[\\w-]+/)?references/reporting\\.md\\)\\s*\\(\"Cannot proceed\"\\) describes,\\s*quoting the exact stderr line")
 	// skillNameRE is the Agent Skills name rule: lowercase letters, digits
 	// and hyphens.
 	skillNameRE = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
@@ -98,28 +119,28 @@ var (
 	// other info string (yaml, json, text) marks an inert block.
 	shellLangs      = map[string]bool{"bash": true, "sh": true, "shell": true, "zsh": true}
 	transcriptLangs = map[string]bool{"": true, "console": true}
-	// The read tables below have to be a subset of what the credential
-	// broker lets a session run: agents/platform/scripts/command_policy.py
-	// (KUBECTL_READ_VERBS, KUBECTL_REFUSED_SUBCOMMANDS, GCLOUD_READ_COMMANDS),
-	// narrowed for the session role by credential_proxy.py
-	// (SESSION_KUBECTL_REFUSED_VERBS). A block left unmarked is one the
-	// preamble tells the model to run, so a read here that the broker refuses
-	// is a refusal the model walks into. TestReadTablesAreASubsetOfTheBroker
-	// reads those tables from the Python source and fails on drift.
+	// The read tables below have to be a subset of what the session pod can
+	// run: `<agent>-kube-proxy` (`read-only-dry-run` in k8s-api-proxy) for
+	// kubectl and `agents/platform/scripts/command_policy.py`
+	// (GCLOUD_READ_COMMANDS) for gcloud, kept within the broker's read tables
+	// (KUBECTL_READ_VERBS, KUBECTL_REFUSED_SUBCOMMANDS, SESSION_KUBECTL_REFUSED_VERBS).
+	// A block left unmarked is one the preamble tells the model to run, so a
+	// read here that kube-proxy or the broker refuses is a refusal the model
+	// walks into. TestReadTablesAreASubsetOfTheBroker checks subset inclusion
+	// against the Python tables and fails on drift.
 	//
 	// kubectlReadCommands are the kubectl verbs, and verb-subverb pairs, that
-	// only read. The classifier is an allowlist: a verb not named here is
-	// treated as a write, so a new skill step fails toward "propose" rather
-	// than "run". A group verb with a writing member (`auth reconcile`,
-	// `config use-context`, `rollout restart`) is listed only by its reading
-	// pairs. `config view` is not one: the broker refuses it because
-	// `--flatten` prints the token. `wait` and `rollout status` are reads the
-	// broker refuses a session, because both hold a broker slot until they
-	// finish.
+	// only read and that kube-proxy admits. The classifier is an allowlist: a
+	// verb not named here is treated as a write, so a new skill step fails
+	// toward "propose" rather than "run". A group verb with a writing member
+	// (`auth reconcile`, `config use-context`, `rollout restart`) is listed
+	// only by its reading pairs. `auth can-i` and `auth whoami` are omitted
+	// because kube-proxy refuses selfsubjectaccessreviews and
+	// selfsubjectreviews (`reviewResources` in policy.go). `config view` is
+	// omitted too, alongside `wait` and `rollout status`.
 	kubectlReadCommands = map[string]bool{
 		"api-resources": true, "api-versions": true, "cluster-info": true, "describe": true,
 		"events": true, "explain": true, "get": true, "logs": true, "top": true, "version": true,
-		"auth can-i": true, "auth whoami": true,
 		"config current-context": true, "config get-contexts": true,
 		"rollout history": true,
 	}
@@ -267,6 +288,7 @@ func transformSkill(dirName string, src []byte) ([]byte, error) {
 
 	lines := strings.Split(string(body), "\n")
 	lines = replaceClusterAgentSections(lines)
+	lines = replaceReportingSteps(lines)
 	lines = annotateBlocks(lines)
 	lines = replaceFileReferences(lines)
 	lines = insertPreamble(lines)
@@ -350,6 +372,29 @@ func replaceClusterAgentSections(lines []string) []string {
 		next = s.own
 	}
 	return append(out, lines[next:]...)
+}
+
+// replaceReportingSteps rewrites workflow steps that hand reporting off to
+// references/reporting.md into sessionReportNote before file-reference
+// rewriting runs, so skills whose reporting contract moved out of an inline
+// kanban section still tell a session how to answer.
+func replaceReportingSteps(lines []string) []string {
+	out := make([]string, len(lines))
+	inFence := false
+	for i, l := range lines {
+		if strings.HasPrefix(strings.TrimSpace(l), codeFence) {
+			inFence = !inFence
+			out[i] = l
+			continue
+		}
+		if !inFence {
+			l = reportingStepDirectRE.ReplaceAllString(l, "${1}"+sessionReportNote)
+			l = reportingStepJoinRE.ReplaceAllLiteralString(l, ". "+sessionReportNote)
+			l = cannotProceedStepRE.ReplaceAllLiteralString(l, sessionCannotProceedClause)
+		}
+		out[i] = l
+	}
+	return out
 }
 
 // annotateBlocks puts the strictest applicable note before each code block
@@ -597,6 +642,16 @@ func replaceFileReferences(lines []string) []string {
 			out[i] = l
 			continue
 		}
+		l = crossSkillLinkRE.ReplaceAllStringFunc(l, func(m string) string {
+			sub := crossSkillLinkRE.FindStringSubmatch(m)
+			slug := sub[1]
+			if slices.Contains(sessionSkills, slug) {
+				return "`" + slug + "`"
+			}
+			return shippedFileProse
+		})
+		l = sameSkillAnchorRE.ReplaceAllString(l, "[${1}](${2})")
+		l = sameSkillLinkRE.ReplaceAllString(l, "${1}")
 		l = fileLinkRE.ReplaceAllString(l, shippedFileProse)
 		l = quotedFilePathRE.ReplaceAllLiteralString(l, shippedFileProse)
 		out[i] = filePathRE.ReplaceAllString(l, "${1}"+shippedFileProse)

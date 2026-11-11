@@ -104,12 +104,13 @@ func serveDelegateConn(c net.Conn, ch chan<- delegateAsk, done <-chan struct{}, 
 	_ = enc.Encode(<-ask.reply)
 }
 
-// delegateParametersNotYet refuses a delegate request that carries task
-// parameters, which no gateway reads yet (lib.DelegateRequest.Parameters).
-const delegateParametersNotYet = "parameters are not supported by this gateway yet; delegate without them"
+// delegatePlatform is the platform agent's addressee, the one that takes no
+// parameters (the gateway's targetPlatform).
+const delegatePlatform = "platform"
 
 // validateDelegate is the adapter's share of the check; the gateway's is the
-// one that matters (allowlist, target, depth), this one keeps junk off the bus.
+// one that matters (allowlist, target, depth, and the parameters the target
+// profile declares), this one keeps junk off the bus.
 func validateDelegate(req lib.DelegateRequest) string {
 	switch {
 	case strings.TrimSpace(req.Addressee) == "":
@@ -118,13 +119,16 @@ func validateDelegate(req lib.DelegateRequest) string {
 		return "text is required"
 	case len(req.Text) > lib.DelegateTextCap:
 		return "text is too long for a delegation"
+	case strings.TrimSpace(req.Addressee) == delegatePlatform && len(req.Parameters) > 0:
+		// The platform agent takes its target from the text; parameters
+		// sent to it would be dropped, so the turn hears why instead.
+		return "platform takes no parameters; put the target in text"
 	}
-	// No gateway reads a delegate request's parameters yet, so a child
-	// would be minted without the target its parent asked for; refuse
-	// rather than drop them. The gateway's delegation to profiles lifts
-	// this, validating with lib.ValidateTaskParameters.
-	if len(req.Parameters) > 0 {
-		return delegateParametersNotYet
+	// Parameters are held to the bounds every reader holds them to; which
+	// names the target takes is the gateway's to say, from the profile's
+	// card (checkDeclaredParameters).
+	if err := lib.ValidateTaskParameters(req.Parameters); err != nil {
+		return err.Error()
 	}
 	return ""
 }
@@ -161,6 +165,34 @@ func withDelegateSocket(argv, env []string, socket string) (out, outEnv []string
 		env = os.Environ()
 	}
 	outEnv = append(slices.Clone(env), EnvDelegateSocket+"="+socket)
+	out, rewrote = withDelegateServerEnv(argv, EnvDelegateSocket, socket)
+	return out, outEnv, rewrote
+}
+
+// withDelegateTargets hands one turn's delegateTargets part to the delegate
+// MCP server, as JSON in its env inside --mcp-config. A submission with no
+// part, or one that doesn't parse, leaves argv as it is, and the server names
+// platform only. It reports whether the server's entry was found.
+func withDelegateTargets(argv []string, origin *lib.Envelope) ([]string, bool) {
+	var m lib.Message
+	if err := json.Unmarshal(origin.Payload, &m); err != nil {
+		return argv, false
+	}
+	targets, ok, err := lib.DelegateTargetsOf(m.Parts)
+	if !ok || err != nil {
+		return argv, false
+	}
+	raw, err := json.Marshal(targets)
+	if err != nil {
+		return argv, false
+	}
+	return withDelegateServerEnv(argv, EnvDelegateTargets, string(raw))
+}
+
+// withDelegateServerEnv sets key to value in the delegate MCP server's env
+// inside the --mcp-config argument, reporting whether the server's entry was
+// found. argv is not modified.
+func withDelegateServerEnv(argv []string, key, value string) (out []string, rewrote bool) {
 	out = slices.Clone(argv)
 	for i := 1; i < len(out); i++ {
 		if out[i-1] != MCPConfigFlag {
@@ -178,12 +210,12 @@ func withDelegateSocket(argv, env []string, socket string) (out, outEnv []string
 		if srvEnv == nil {
 			srvEnv = map[string]any{}
 		}
-		srvEnv[EnvDelegateSocket] = socket
+		srvEnv[key] = value
 		srv[MCPEnvKey] = srvEnv
 		if b, err := json.Marshal(cfg); err == nil {
 			out[i] = string(b)
 			rewrote = true
 		}
 	}
-	return out, outEnv, rewrote
+	return out, rewrote
 }

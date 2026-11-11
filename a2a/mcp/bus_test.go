@@ -50,8 +50,18 @@ var consoleSubscribe = []string{"a2a.>", "chat.console.*.out", "_INBOX.console-m
 // rendered. A deny the operator adds must be mirrored here, or the test server
 // would grant what the cluster refuses.
 var (
-	consolePublishDeny   []string
-	consoleSubscribeDeny = []string{"a2a.cap.>", "a2a.dispatch.>"}
+	// The TASKS durables the provision Job pre-creates (#4173).
+	consolePublishDeny = []string{
+		"$JS.API.CONSUMER.CREATE.TASKS.gateway-relay",
+		"$JS.API.CONSUMER.CREATE.TASKS.gateway-relay.>",
+		"$JS.API.CONSUMER.DURABLE.CREATE.TASKS.gateway-relay",
+		"$JS.API.CONSUMER.DELETE.TASKS.gateway-relay",
+		"$JS.API.CONSUMER.CREATE.TASKS.bridge-platform",
+		"$JS.API.CONSUMER.CREATE.TASKS.bridge-platform.>",
+		"$JS.API.CONSUMER.DURABLE.CREATE.TASKS.bridge-platform",
+		"$JS.API.CONSUMER.DELETE.TASKS.bridge-platform",
+	}
+	consoleSubscribeDeny = []string{"a2a.cap.>", "a2a.dispatch.>", "a2a.stop.>"}
 )
 
 // renderedConf is the operator's render the callout suite starts from.

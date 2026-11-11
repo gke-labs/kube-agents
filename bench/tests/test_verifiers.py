@@ -35,28 +35,36 @@ The load-bearing properties, in rough order of what they cost if wrong:
 
 from __future__ import annotations
 
+import http.client
 import io
+import importlib.util
 import json
 import os
 import re
+import socket
+import ssl
 import tempfile
 import time
 import tomllib
+import urllib.error
 from datetime import datetime, timezone
+import sys
 from pathlib import Path
+
 from unittest import mock
 
 import pytest
 import yaml
 from pydantic import ValidationError
 
-from devops_bench.verification.base import VERIFIERS
+from devops_bench.verification.base import VERIFIERS, VerificationResult
 from devops_bench.verification.runner import VerifierAgent
 from devops_bench.verification.spec import VerificationEntry, parse_node
 
-from kube_agents_bench import fleet, transcript, verifiers
+from kube_agents_bench import fleet, forges, transcript, verifiers
 from kube_agents_bench.verifiers import (
     WorkerAgentsVerifier,
+    DelegatedToVerifier,
     WorkerBudgetVerifier,
     WorkerCommandsVerifier,
     LedgerIssueContainsVerifier,
@@ -319,7 +327,10 @@ _FLEET_CATALOG = TASKS.parent / "tf" / "fleet" / "fixtures.json"
 # runner's side of the contract); the slot letters below come from the same
 # parse.
 _CATALOG = json.loads(_FLEET_CATALOG.read_text(encoding="utf-8"))
-_CATALOG_ROLES = _CATALOG["roles"]
+# The roles on a cluster slot: the runner records a slot and writes a
+# kubeconfig for these only. A project-scoped role (`cluster_slot: null`) has
+# neither, and no check reads it through a slot.
+_CATALOG_ROLES = {role: spec for role, spec in _CATALOG["roles"].items() if spec["cluster_slot"] is not None}
 
 
 def _catalog_slots() -> list[str]:
@@ -886,6 +897,123 @@ def test_worker_commands_exempt_command_does_not_satisfy_a_required_pattern():
     res = v.verify(5.0)
     assert res.status == "fail" and not res.success
     assert "across 0 command(s) (1 exempted)" in res.reason
+
+
+# The pod stores each typed terminal call through ``worker_trajectory``'s scrub (the audit
+# redactor, then ``worker_transcript.scrub_step_text``) before it reaches the trajectory, so
+# the tests store their calls the same way.
+def _pod_module(name: str, *parts: str):
+    spec = importlib.util.spec_from_file_location(name, Path(__file__).resolve().parents[2].joinpath(*parts))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_REDACTOR = _pod_module("kube_agents_audit_redactor_for_tests", "agents", "chat", "defaults", "plugins", "common", "redactor.py").AuditRedactor
+_TRANSCRIPT = _pod_module("worker_transcript_for_tests", "agents", "platform", "scripts", "worker_transcript.py")
+
+
+def _stored(command: str) -> str:
+    return json.loads(_TRANSCRIPT.scrub_step_text(_REDACTOR, "tool_call", json.dumps({"command": command}), "withheld"))["command"]
+
+
+def _grep_cut_status(rows: list[str], typed: list[str], card: str | None = "t_1", clipped: bool = False) -> str:
+    """The verdict of a grep-cut check whose forbidden word is ``route``, on one card's rows
+    and typed calls; ``card=None`` stashes the rows with no card, as an older capture did,
+    and ``clipped`` sends each call as the pod sends one whose arguments it clipped."""
+    calls = [
+        {
+            "agent": "w",
+            "name": "terminal",
+            "task": "t_1",
+            "args": {"raw": json.dumps({"command": c})[:-2] + " ...[clipped 9 chars]"} if clipped else {"command": _stored(c)},
+            "at": float(i),
+        }
+        for i, c in enumerate(typed)
+    ]
+    transcript.set("", calls, worker_commands=[{"task": card, "command": r} if card else {"command": r} for r in rows])
+    try:
+        res = WorkerCommandsVerifier(type="worker_commands", forbidden_patterns=["route"], exempt_grep_patterns=True).verify(5.0)
+    finally:
+        transcript.clear()
+    return res.status
+
+
+def test_worker_commands_grep_cut_grades_the_rows_of_a_card_with_a_multi_line_call_whole():
+    # The row joins a typed newline into a space, so a dangling grep's pattern
+    # slot can hold the next line's first word (#5237). Every spelling that got
+    # past a comparison of first words stays graded whole: a quote that spans
+    # lines, a leading redirection, a dangling value option, a redaction mark,
+    # and rows that name no card.
+    row = "grep -rn route=1 curl x"
+    assert _grep_cut_status([row], []) == "pass"
+    for rows, typed in (
+        ([row], "grep -rn\nroute=1\ncurl x"),
+        ([row], "grep -rn\n   route=1 curl x"),
+        (['grep -rn "route =1" curl x'], 'grep -rn\n"route   =1"\ncurl x'),
+        ([row], "grep -rn\n> /dev/null route=1\ncurl x"),
+        ([row], "grep -rn\n2>&1 route=1\ncurl x"),
+        (['grep -rn route=1 X=" " curl x'], 'grep -rn\nroute=1 X="\n"\ncurl x'),
+        (["grep -rn -m curl route x"], "grep -rn -m\ncurl route x"),
+        (["grep -rn U=http://u:pw@route curl x"], "grep -rn\nU=http://u:pw@route\ncurl x"),
+    ):
+        assert _grep_cut_status(rows, [typed]) == "fail", typed
+    assert _grep_cut_status([row], ["grep -rn\nroute=1\ncurl x"], card=None) == "fail"
+
+
+def test_worker_commands_grep_cut_refuses_the_rows_of_a_card_with_an_unread_call():
+    # A clip keeps a call's head, so the lines that would show the join may be
+    # gone: the card's grep rows are graded whole.
+    assert _grep_cut_status(["grep -rn route f"], ["grep -rn route f"], clipped=True) == "fail"
+    assert _grep_cut_status(["grep -rn route f"], ["grep -rn route f"], card=None, clipped=True) == "fail"
+    # The pod's scrub stores an escaped backslash at a line end as an escaped
+    # space, so a backslash before a blank may hide a line break: its card's
+    # grep rows are graded whole, an honest escaped space included.
+    assert _grep_cut_status(["grep -rn\\\\ route=1 curl x"], ["grep -rn\\\\\nroute=1\ncurl x"]) == "fail"
+    assert _grep_cut_status(["grep -rn X=\\ route=1 curl x"], ["grep -rn\nX=\\  route=1\ncurl x"]) == "fail"
+    assert _grep_cut_status(["grep -rn route f"], ["grep -rn route f", "ls my\\ file"]) == "fail"
+    assert _grep_cut_status(["grep -rn route f"], ["grep -rn route f", "ls my\\\tfile"]) == "fail"
+    # A call the shell reader cannot split has no lines to read either.
+    assert _grep_cut_status(["grep -rn route f"], ["grep -rn route f", "cat <<EOF\ndon't\nEOF"]) == "fail"
+
+
+def test_worker_commands_grep_cut_reads_no_execute_code_program_as_shell():
+    # An ``execute_code`` program is Python, so its quotes say nothing about
+    # the card's shell lines.
+    calls = [
+        {"agent": "w", "name": "terminal", "task": "t_1", "args": {"command": "grep -rn route f"}, "at": 0.0},
+        {"agent": "w", "name": "execute_code", "task": "t_1", "args": {"code": "msg = 'can\\'t parse'\nprint(msg)"}, "at": 1.0},
+    ]
+    transcript.set("", calls, worker_commands=[{"task": "t_1", "command": "grep -rn route f"}])
+    try:
+        res = WorkerCommandsVerifier(type="worker_commands", forbidden_patterns=["route"], exempt_grep_patterns=True).verify(5.0)
+    finally:
+        transcript.clear()
+    assert res.status == "pass", res.reason
+
+
+def test_worker_commands_grep_cut_keeps_the_rows_of_a_card_whose_calls_are_one_line():
+    # A grep typed on one line, piped to a pager the row drops, or continued
+    # with a backslash (the pod folds the continuation) keeps the cut.
+    for typed in ("grep -rn route f", "grep -rn route f | head -20", "grep -rn \\\nroute f", "grep -rn route f\n"):
+        assert _grep_cut_status(["grep -rn route f"], [typed]) == "pass", typed
+    # Rows that name no card, beside one-line calls only, are cut too.
+    assert _grep_cut_status(["grep -rn route f"], ["grep -rn route f"], card=None) == "pass"
+
+
+def test_worker_commands_grep_cut_grades_a_multi_line_card_whole():
+    # Any multi-line call on the card grades its grep rows whole, whatever the
+    # next line starts with: a glob, a clobber redirect, an escaped blank. An
+    # honest multi-line call on the card is a spurious red the same way.
+    for typed in (
+        "grep\n***/route list",
+        "grep -rn\n>| /dev/null route=1\ncurl x",
+        "grep -rn\nX=\\\t route=1\ncurl x",
+        "grep -rn route f\nls",
+    ):
+        row = " ".join(typed.split())
+        assert _grep_cut_status([row], [typed]) == "fail", typed
 
 
 def test_worker_commands_is_registered_under_its_type():
@@ -1555,6 +1683,65 @@ def test_replay_card_is_published_and_registered():
         eps = tomllib.load(fh)["project"]["entry-points"]["devops_bench.verifiers"]
     assert eps["replay_card"] == "kube_agents_bench.verifiers:ReplayCardVerifier"
     assert isinstance(parse_node({"type": "replay_card", "status_not_in": ["blocked"]}), ReplayCardVerifier)
+
+
+# ------------------------------------------------------------ delegated_to
+
+
+def _delegated(addressees: list[str] | None) -> None:
+    transcript.set("ok", _TRAJECTORY, child_addressees=addressees)
+
+
+def test_delegated_to_passes_when_the_chain_delegated_to_the_profile():
+    _delegated(["tse"])
+    res = DelegatedToVerifier(type="delegated_to", required_addressees=["tse"], forbidden_addressees=["platform"]).verify(5.0)
+    assert res.success, res.reason
+    assert "['tse']" in res.reason
+
+
+def test_delegated_to_fails_when_the_chain_went_to_platform():
+    _delegated(["platform"])
+    res = DelegatedToVerifier(type="delegated_to", required_addressees=["tse"], forbidden_addressees=["platform"]).verify(5.0)
+    assert not res.success
+    assert res.status != "error"
+    assert "['tse']" in res.reason and "['platform']" in res.reason
+
+
+def test_delegated_to_fails_when_nothing_was_delegated():
+    _delegated([])
+    res = DelegatedToVerifier(type="delegated_to", required_addressees=["tse"]).verify(5.0)
+    assert not res.success
+    assert res.status != "error"
+    assert "nobody" in res.reason
+
+
+def test_delegated_to_matches_the_whole_name():
+    _delegated(["tse-shadow"])
+    assert not DelegatedToVerifier(type="delegated_to", required_addressees=["tse"]).verify(5.0).success
+    _delegated(["platform", "tse"])
+    assert not DelegatedToVerifier(type="delegated_to", forbidden_addressees=["platform"]).verify(5.0).success
+
+
+def test_delegated_to_is_an_error_when_the_run_could_not_say():
+    _delegated(None)
+    res = DelegatedToVerifier(type="delegated_to", required_addressees=["tse"]).verify(5.0)
+    assert res.status == "error"
+    assert not res.success
+
+
+def test_delegated_to_needs_a_list_and_no_empty_matcher():
+    with pytest.raises(ValueError):
+        DelegatedToVerifier(type="delegated_to")
+    with pytest.raises(ValueError):
+        DelegatedToVerifier(type="delegated_to", required_addressees=[".*"])
+
+
+def test_delegated_to_is_published_and_registered():
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    with pyproject.open("rb") as fh:
+        eps = tomllib.load(fh)["project"]["entry-points"]["devops_bench.verifiers"]
+    assert eps["delegated_to"] == "kube_agents_bench.verifiers:DelegatedToVerifier"
+    assert isinstance(parse_node({"type": "delegated_to", "required_addressees": ["tse"]}), DelegatedToVerifier)
 
 
 # ------------------------------------------------------------ worker_agents
@@ -3720,6 +3907,16 @@ def github(monkeypatch):
     return type("GH", (), {"routes": routes, "calls": calls})()
 
 
+@pytest.fixture
+def minted_token(monkeypatch, tmp_path):
+    """The grading token as CI hands it over: the ledger App's, in the renewed file."""
+    minted = tmp_path / "ledger-token"
+    minted.write_text("ghs_fake\n")
+    monkeypatch.setenv(forges.GITHUB_TOKEN_FILE_ENV_VAR, str(minted))
+    monkeypatch.delenv("BENCH_GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+
+
 def _api(number: int = 42, repo: str = "kube-agents-evals-infra") -> str:
     return f"https://api.github.com/repos/gke-agentic/{repo}/issues/{number}"
 
@@ -4270,6 +4467,345 @@ def test_finding_ids_scope_without_the_complete_block_reads_the_delta_block(toke
     assert res.status == "fail"
 
 
+def _rendered_finding(
+    check: str,
+    obj: str,
+    cluster: str = "seeded-a",
+    namespace: str = "seeded-workloads",
+    impact: str = "",
+    title: str = "",
+    excerpt: str = "kind: Deployment",
+    new: bool = False,
+) -> str:
+    """One finding the way audit_report.py renders it: the anchor, the heading
+    with the agent's title and the id marker, the Where: line and the agent's
+    text under it. The default title names the object, as an agent's does, so
+    a test that must not read the title passes one that names another."""
+    fid = f"{check}.{cluster}.{namespace}.{obj.lower().replace('/', '-')}"
+    return (
+        f'<a id="user-content-finding-{fid}"></a>\n\n'
+        f"#### {title or f'{check} on {obj}'} <!-- finding:{fid} -->\n\n"
+        + ("<!-- finding-new -->\n\n" if new else "")
+        + f"- **Where:** `{cluster}` / `{namespace}` — `{obj}`\n"
+        f"- **Impact:** {impact or f'the agent\'s sentence about {obj}.'}\n"
+        f"- **Evidence:**\n\n```\n# (no command supplied)\n---\n{excerpt}\n```\n\n"
+    )
+
+
+def _finding_bound(obj: str = "Deployment/memory-unbounded-worker", check="no-memory-limit", **kw):
+    return _ledger_check(required_phrases=[obj], scope="finding", finding_check=check, **kw)
+
+
+def test_finding_scope_fails_when_the_check_and_the_object_sit_on_different_findings(token, github):
+    """The case the body and id scopes cannot tell apart: the planted workload
+    filed under another check, and the check filed on another workload."""
+    _stash_report()
+    findings = _rendered_finding("no-pdb", "Deployment/memory-unbounded-worker") + _rendered_finding(
+        "no-memory-limit", "Deployment/other-worker"
+    )
+    github.routes[_api()] = (200, _issue(_ledger_body(findings=findings)))
+    loose_body = _ledger_check(required_phrases=["Deployment/memory-unbounded-worker"]).verify(5.0)
+    assert loose_body.status == "pass"  # the hole: the object is on the ledger, under no-pdb
+    bound = _finding_bound().verify(5.0)
+    assert bound.status == "fail", bound.reason
+    assert "1 finding(s) of check 'no-memory-limit'" in bound.reason
+    assert "Deployment/memory-unbounded-worker" in bound.reason
+
+
+def test_finding_scope_passes_when_one_finding_carries_the_check_and_the_object(token, github):
+    _stash_report()
+    findings = _rendered_finding("no-pdb", "Deployment/memory-unbounded-worker") + _rendered_finding(
+        "no-memory-limit", "Deployment/memory-unbounded-worker"
+    )
+    github.routes[_api()] = (200, _issue(_ledger_body(findings=findings)))
+    res = _finding_bound().verify(5.0)
+    assert res.status == "pass", res.reason
+    assert res.raw["finding_check"] == "no-memory-limit"
+
+
+def test_finding_scope_never_reads_the_agents_text_of_a_finding(token, github):
+    """The title, the impact sentence, the evidence excerpt and the next
+    finding's anchor are the agent's or the next finding's; the planted
+    workload's name there, in any shape the renderer itself uses, binds
+    nothing."""
+    _stash_report()
+    where = "- **Where:** `seeded-a` / `seeded-workloads` — `Deployment/memory-unbounded-worker`"
+    row = (
+        "- **major** — t — `seeded-a` / `seeded-workloads` — `Deployment/memory-unbounded-worker` "
+        "(`no-memory-limit.seeded-a.seeded-workloads.deployment-memory-unbounded-worker`)"
+    )
+    shapes = {
+        "title": _rendered_finding(
+            "no-memory-limit", "Deployment/other-worker", title="no-memory-limit, cf. Deployment/memory-unbounded-worker"
+        ),
+        "impact": _rendered_finding(
+            "no-memory-limit", "Deployment/other-worker", impact="compare Deployment/memory-unbounded-worker."
+        ),
+        "where line in the impact": _rendered_finding(
+            "no-memory-limit", "Deployment/other-worker", impact=f"see\n{where}"
+        ),
+        "where line in the excerpt": _rendered_finding(
+            "no-memory-limit", "Deployment/other-worker", excerpt=where
+        ),
+        "listed row outside the brackets": _rendered_finding(
+            "no-memory-limit", "Deployment/other-worker", impact=f"see\n{row}"
+        ),
+        "listed row with the location shape in its title": (
+            "<!-- audit-listed:begin -->\n"
+            "- **major** — t — `seeded-a` / `seeded-workloads` — `Deployment/memory-unbounded-worker` (`x`) — `seeded-a` / "
+            "`seeded-workloads` — `Deployment/other-worker` "
+            "(`no-memory-limit.seeded-a.seeded-workloads.deployment-other-worker`)\n"
+            "<!-- audit-listed:end -->\n"
+        ),
+        # The title holds a newline, so the marker sits on a line the heading
+        # regex never matches; the Where: line under it must not join the
+        # no-memory-limit finding above.
+        "newline title under a finding of the check": _rendered_finding("no-memory-limit", "Deployment/other-worker")
+        + "#### no-pdb on\nDeployment/memory-unbounded-worker <!-- finding:no-pdb.seeded-a.seeded-workloads.x -->\n\n"
+        f"{where}\n\n",
+    }
+    # The delta block names the listed row's id, so the row is read as the
+    # renderer reads it, and the shape in its title is still not the object.
+    named = ["no-memory-limit.seeded-a.seeded-workloads.deployment-other-worker"]
+    for shape, other in shapes.items():
+        # The planted workload's own finding sits right under, so its anchor
+        # line (which names its id, hence its object) follows the other text.
+        findings = other + _rendered_finding("no-pdb", "Deployment/memory-unbounded-worker")
+        github.routes[_api()] = (200, _issue(_ledger_body(findings=findings, finding_ids=named)))
+        res = _finding_bound().verify(5.0)
+        assert res.status == "fail", (shape, res.reason)
+
+
+def test_finding_scope_leaves_out_held_and_not_rechecked_findings(token, github):
+    """A held row renders the same heading and Where: line as a filed finding;
+    only a finding this run filed binds."""
+    _stash_report()
+    held_row = _rendered_finding("no-memory-limit", "Deployment/memory-unbounded-worker")
+    fid = "no-memory-limit.seeded-a.seeded-workloads.deployment-memory-unbounded-worker"
+    for comment in (
+        f'<!-- audit-held-ids: ["{fid}"] -->',
+        f'<!-- audit-held-ids: [] -->\n<!-- audit-not-rechecked-ids: ["{fid}"] -->',
+    ):
+        body = _ledger_body(findings=f"{held_row}\n<!-- audit-held:begin -->\n{comment}\n<!-- audit-held:end -->\n")
+        github.routes[_api()] = (200, _issue(body))
+        res = _finding_bound().verify(5.0)
+        assert res.status == "fail", res.reason
+        assert "no finding of check 'no-memory-limit'" in res.reason
+    live = _rendered_finding("no-memory-limit", "Deployment/memory-unbounded-worker") + held_row
+    github.routes[_api()] = (200, _issue(_ledger_body(findings=live + '\n<!-- audit-held-ids: ["x.y.z.w"] -->\n')))
+    assert _finding_bound().verify(5.0).status == "pass"
+
+
+def test_finding_scope_reads_a_finding_listed_without_detail(token, github):
+    """Past the body cap the renderer names a finding on one line, the object
+    and the id in two code spans; that line is the finding's text."""
+    _stash_report()
+    findings = (
+        _rendered_finding("no-pdb", "Deployment/memory-unbounded-worker")
+        + "### Listed without detail (1)\n\n<!-- audit-listed:begin -->\n"
+        "- **major** — no-memory-limit on Deployment/memory-unbounded-worker — `seeded-a` / `seeded-workloads` — "
+        "`Deployment/memory-unbounded-worker` (`no-memory-limit.seeded-a.seeded-workloads.deployment-memory-unbounded-w-1a2b3c`)"
+        " — Fixed — https://example.invalid/pr/1\n<!-- audit-listed:end -->\n\n"
+    )
+    listed_id = ["no-memory-limit.seeded-a.seeded-workloads.deployment-memory-unbounded-w-1a2b3c"]
+    github.routes[_api()] = (200, _issue(_ledger_body(findings=findings, finding_ids=listed_id)))
+    res = _finding_bound().verify(5.0)
+    assert res.status == "pass", res.reason
+    # A listed row the delta block does not name is not a finding the run
+    # filed: the renderer's reader leaves it out, and so does the scope.
+    github.routes[_api()] = (200, _issue(_ledger_body(findings=findings)))
+    assert _finding_bound().verify(5.0).status == "fail"
+
+
+def test_finding_scope_matches_the_check_as_a_whole_id_segment(token, github):
+    _stash_report()
+    findings = _rendered_finding("no-pdbx", "Deployment/memory-unbounded-worker")
+    github.routes[_api()] = (200, _issue(_ledger_body(findings=findings)))
+    res = _finding_bound(check="no-pdb").verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "no finding of check 'no-pdb'" in res.reason
+
+
+def test_finding_scope_grades_the_nearest_finding_of_the_check(token, github):
+    """Two findings of the check: the first carries the required phrase and
+    not the any_of phrase, the second both. The second binds; alone, the
+    first does not."""
+    _stash_report()
+    first = _rendered_finding("no-memory-limit", "StatefulSet/memory-unbounded-worker")
+    second = _rendered_finding("no-memory-limit", "Deployment/memory-unbounded-worker")
+    github.routes[_api()] = (200, _issue(_ledger_body(findings=first + second)))
+    res = _finding_bound("memory-unbounded-worker", any_of_phrases=["Deployment/", "DaemonSet/"]).verify(5.0)
+    assert res.status == "pass", res.reason
+    github.routes[_api()] = (200, _issue(_ledger_body(findings=first)))
+    res = _finding_bound("memory-unbounded-worker", any_of_phrases=["Deployment/", "DaemonSet/"]).verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "Deployment/" in res.reason
+
+
+def test_finding_scope_reads_past_the_new_finding_marker(token, github):
+    """A ledger update marks a new finding with a comment line between its
+    heading and its Where: line; the object is still the Where: line's."""
+    _stash_report()
+    findings = _rendered_finding("no-memory-limit", "Deployment/memory-unbounded-worker", new=True)
+    github.routes[_api()] = (200, _issue(_ledger_body(findings=findings)))
+    res = _finding_bound().verify(5.0)
+    assert res.status == "pass", res.reason
+
+
+# A .txt, not a .md: a document the docs checks would expect a reader to reach
+# and prettier would reflow; this is a captured body a test compares byte for byte.
+_UPDATING_RUN_LEDGER = Path(__file__).parent / "fixtures" / "ledgers" / "updating_run_waste_audit.txt"
+_AUDIT_REPORT_SCRIPT = (
+    Path(__file__).resolve().parents[2] / "agents" / "platform" / "skills" / "fleet-audit" / "scripts" / "audit_report.py"
+)
+
+
+def _renderer():
+    """The fleet-audit renderer, imported by path in the full checkout (the
+    pinned grader is bench/ alone, so the verifier mirrors it instead)."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("test_verifiers_audit_report", _AUDIT_REPORT_SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["test_verifiers_audit_report"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_finding_objects_mirrors_the_renderers_reader():
+    """The verifier's reader of a finding's id and object is a copy of the
+    renderer's parse_finding_locations; on the captured updating-run body and
+    on every synthetic shape the two agree, so a renderer change that moves
+    a line fails here rather than at grading."""
+    renderer = _renderer()
+    where = "- **Where:** `seeded-a` / `seeded-workloads` — `Deployment/memory-unbounded-worker`"
+    row = (
+        "- **major** — t — `seeded-a` / `seeded-workloads` — `Deployment/memory-unbounded-worker` "
+        "(`no-memory-limit.seeded-a.seeded-workloads.deployment-memory-unbounded-worker`)"
+    )
+    named = ["no-memory-limit.seeded-a.seeded-workloads.deployment-memory-unbounded-worker"]
+    bodies = [
+        _UPDATING_RUN_LEDGER.read_text(),
+        _ledger_body(findings=_rendered_finding("no-memory-limit", "Deployment/memory-unbounded-worker", new=True)),
+        _ledger_body(findings=_rendered_finding("no-memory-limit", "Deployment/x", impact=f"see\n{where}")),
+        _ledger_body(findings=_rendered_finding("no-memory-limit", "Deployment/x", excerpt=where)),
+        _ledger_body(findings=_rendered_finding("no-memory-limit", "Deployment/x", impact=f"see\n{row}"), finding_ids=named),
+        _ledger_body(findings=f"<!-- audit-listed:begin -->\n{row}\n<!-- audit-listed:end -->\n", finding_ids=named),
+        _ledger_body(findings=f"<!-- audit-listed:begin -->\n{row}\n<!-- audit-listed:end -->\n"),
+        _ledger_body(
+            findings="#### no-pdb on\nDeployment/memory-unbounded-worker <!-- finding:no-pdb.seeded-a.seeded-workloads.x -->\n\n"
+            f"{where}\n\n"
+        ),
+        _ledger_body(findings="#### t <!-- finding:no-memory-limit.seeded-a.seeded-workloads.x -->\n\n- **Impact:** `Deployment/y`\n"),
+        _ledger_body(findings=_rendered_finding("no-memory-limit", "Deployment/x").replace("\n", "\r\n")),
+        # A heading with no Where: line, then another finding: the search is
+        # bounded by the next marker, so the next finding's object is not taken.
+        _ledger_body(
+            findings="#### t <!-- finding:no-memory-limit.seeded-a.seeded-workloads.x -->\n\n- **Impact:** none\n\n"
+            + _rendered_finding("no-pdb", "Deployment/memory-unbounded-worker")
+        ),
+        # A listed row named in the delta block and also held: the held
+        # subtraction leaves it out.
+        _ledger_body(
+            findings=f"<!-- audit-listed:begin -->\n{row}\n<!-- audit-listed:end -->\n"
+            f'<!-- audit-held:begin -->\n<!-- audit-held-ids: ["{named[0]}"] -->\n<!-- audit-held:end -->\n',
+            finding_ids=named,
+        ),
+    ]
+    for body in bodies:
+        expected = {fid: loc["object"] for fid, loc in renderer.parse_finding_locations(body).items()}
+        assert verifiers._finding_objects(body) == expected, body[:200]
+    assert any(verifiers._finding_objects(b) for b in bodies)
+
+
+def test_finding_scope_on_a_captured_ledger_of_an_updating_run(token, github):
+    """The body a second run of the waste audit wrote over its ledger (one
+    install's project renamed): 42 findings, two of them new-marked. Read
+    with the renderer's own reader, every finding has its object, the two
+    new ones bind under the scope, and the same object under another check
+    does not."""
+    _stash_report()
+    body = _UPDATING_RUN_LEDGER.read_text()
+    assert body.count("<!-- finding-new -->") == 2
+    objects = verifiers._finding_objects(body)
+    assert len(objects) == 42, sorted(objects)
+    assert all(objects.values()), [fid for fid, obj in objects.items() if not obj]
+    # The captured body is whole: its own footer and delta block, not the helper's.
+    github.routes[_api()] = (200, _issue(body, audit="fleet-wide-cost-analysis"))
+    for disk in ("Disk/us-central1-a:orphan-pd-1", "Disk/us-central1-a:orphan-pd-2"):
+        res = _ledger_check(
+            audit="fleet-wide-cost-analysis", required_phrases=[disk], scope="finding", finding_check="unattached-disk"
+        ).verify(5.0)
+        assert res.status == "pass", res.reason
+        res = _ledger_check(
+            audit="fleet-wide-cost-analysis", required_phrases=[disk], scope="finding", finding_check="idle-namespace"
+        ).verify(5.0)
+        assert res.status == "fail", res.reason
+
+
+def test_finding_scope_takes_no_object_from_a_heading_not_followed_by_a_where_line(token, github):
+    """The renderer writes the Where: line first under every heading; a
+    heading followed by anything else has no object and binds nothing."""
+    _stash_report()
+    findings = (
+        "#### no-memory-limit on something <!-- finding:no-memory-limit.seeded-a.seeded-workloads.x -->\n\n"
+        "- **Impact:** `Deployment/memory-unbounded-worker` — `Deployment/memory-unbounded-worker`\n\n"
+    )
+    github.routes[_api()] = (200, _issue(_ledger_body(findings=findings)))
+    res = _finding_bound().verify(5.0)
+    assert res.status == "fail", res.reason
+
+
+def test_finding_scope_reads_the_object_alone_not_its_cluster_or_namespace(token, github):
+    """The cluster and namespace sit on the Where: line too, but a phrase for
+    them binds nothing: a case names the object alone."""
+    _stash_report()
+    findings = _rendered_finding("no-memory-limit", "Deployment/memory-unbounded-worker")
+    github.routes[_api()] = (200, _issue(_ledger_body(findings=findings)))
+    res = _finding_bound(any_of_phrases=["seeded-workloads", "seeded-a"]).verify(5.0)
+    assert res.status == "fail", res.reason
+    res = _finding_bound("seeded-workloads").verify(5.0)
+    assert res.status == "fail", res.reason
+
+
+def test_finding_scope_with_no_finding_of_the_check_fails_and_says_so(token, github):
+    _stash_report()
+    github.routes[_api()] = (200, _issue(_ledger_body(findings=_rendered_finding("no-pdb", "Deployment/memory-unbounded-worker"))))
+    res = _finding_bound().verify(5.0)
+    assert res.status == "fail"
+    assert "no finding of check 'no-memory-limit'" in res.reason
+
+
+def test_finding_scope_accepts_any_of_several_checks(token, github):
+    """A case that accepts the SOP's slug and its synonyms lists them; a
+    finding of any one, on the object, passes, and the object under another
+    check still fails."""
+    _stash_report()
+    accepted = ["registry-auth-iam-missing", "private-registry-pull-secret", "image-pull-auth-expired"]
+    on_object = _rendered_finding("image-pull-auth-expired", "Deployment/private-image-worker")
+    github.routes[_api()] = (200, _issue(_ledger_body(findings=on_object)))
+    res = _finding_bound("Deployment/private-image-worker", accepted).verify(5.0)
+    assert res.status == "pass", res.reason
+    elsewhere = _rendered_finding("probes-liveness", "Deployment/private-image-worker") + _rendered_finding(
+        "image-pull-auth-expired", "Deployment/other-worker"
+    )
+    github.routes[_api()] = (200, _issue(_ledger_body(findings=elsewhere)))
+    res = _finding_bound("Deployment/private-image-worker", accepted).verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "registry-auth-iam-missing, private-registry-pull-secret, image-pull-auth-expired" in res.reason
+
+
+def test_finding_scope_spec_rules():
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError, match="needs finding_check"):
+        _ledger_check(required_phrases=["x"], scope="finding")
+    with _pytest.raises(ValueError, match="needs finding_check"):
+        _ledger_check(required_phrases=["x"], scope="finding", finding_check=[" "])
+    with _pytest.raises(ValueError, match="only under scope: finding"):
+        _ledger_check(required_phrases=["x"], finding_check="no-pdb")
+
+
 def test_finding_ids_scope_ignores_a_complete_block_above_the_delta_block(token, github):
     """Agent-authored text sits above the footer; a forged copy there is not the script's."""
     _stash_report()
@@ -4765,10 +5301,11 @@ def test_no_body_scoped_ledger_phrase_collides_with_a_roster_check_slug():
             if check.get("type") != "ledger_issue_contains":
                 continue
             # finding_ids is the fix, not the bug: there a slug means a filed
-            # finding. forbidden_phrases invert the direction -- a slug
-            # collision there fails a good run, which is a different defect
-            # and is not what this test is about.
-            if check.get("scope", "body") == "finding_ids":
+            # finding; under finding the text is one finding's location, which
+            # the check-evidence table never reaches. forbidden_phrases invert
+            # the direction -- a slug collision there fails a good run, which
+            # is a different defect and is not what this test is about.
+            if check.get("scope", "body") in ("finding_ids", "finding"):
                 continue
             graded += 1
             phrases = (check.get("required_phrases") or []) + (
@@ -5531,6 +6068,193 @@ def test_a_content_check_needs_a_value_for_its_op():
         _pr_check(content=[{"paths": ["x"], "op": "matches", "value": "("}])
 
 
+# ---- content: admits_disruption, a budget graded against the workload it protects
+
+_PDB_DIR = "clusters/seeded-a/seeded-reliability"
+_PDB_LABELS = {"app": "checkout-gateway"}
+
+
+def _pdb_yaml(budget: str, selector: str = "  selector:\n    matchLabels:\n      app: checkout-gateway\n") -> str:
+    return (
+        "apiVersion: policy/v1\nkind: PodDisruptionBudget\nmetadata:\n  name: checkout-gateway-pdb\n"
+        f"  namespace: seeded-reliability\nspec:\n{budget}{selector}"
+    )
+
+
+def _pdb_check(**kw):
+    return {"paths": [f"{_PDB_DIR}/*.yaml"], "kind": "PodDisruptionBudget", "op": "admits_disruption",
+            "replicas": 2, "pod_labels": _PDB_LABELS, **kw}
+
+
+def test_admits_disruption_passes_the_budget_an_eval_run_opened(token, github):
+    """The file kube-agents-evals-26-infra#1187 added, byte for byte."""
+    _content_pr(github, {f"{_PDB_DIR}/checkout-gateway-pdb.yaml": _pdb_yaml("  minAvailable: 1\n")})
+    res = _pr_check(content=[_pdb_check()]).verify(5.0)
+    assert res.status == "pass", res.reason
+
+
+def test_admits_disruption_fails_a_budget_that_blocks_every_drain(token, github):
+    _content_pr(github, {f"{_PDB_DIR}/checkout-gateway-pdb.yaml": _pdb_yaml("  minAvailable: 2\n")})
+    res = _pr_check(content=[_pdb_check()]).verify(5.0)
+    assert res.status == "fail"
+    assert "allows 0 disruptions" in res.reason
+    assert f"{_PDB_DIR}/checkout-gateway-pdb.yaml#0" in res.reason
+
+
+def test_admits_disruption_fails_when_no_budget_was_written(token, github):
+    _content_pr(github, {f"{_PDB_DIR}/hpa.yaml": "kind: HorizontalPodAutoscaler\nmetadata: {name: h}\n"})
+    res = _pr_check(content=[_pdb_check()]).verify(5.0)
+    assert res.status == "fail"
+    assert "adds no such document" in res.reason
+
+
+def test_admits_disruption_reads_a_budget_beside_other_objects(token, github):
+    """Any one good budget passes with quantifier any; all needs every budget good."""
+    good = _pdb_yaml("  maxUnavailable: 1\n")
+    bad = _pdb_yaml("  maxUnavailable: 1\n", "  selector:\n    matchLabels:\n      app: other\n")
+    _content_pr(github, {f"{_PDB_DIR}/pdbs.yaml": f"kind: Service\nmetadata: {{name: s}}\n---\n{good}---\n{bad}"})
+    assert _pr_check(content=[_pdb_check()]).verify(5.0).status == "fail"
+    _content_pr(github, {f"{_PDB_DIR}/pdbs.yaml": f"kind: Service\nmetadata: {{name: s}}\n---\n{good}---\n{bad}"})
+    res = _pr_check(content=[_pdb_check(quantifier="any")]).verify(5.0)
+    assert res.status == "pass", res.reason
+
+
+def test_admits_disruption_fails_two_budgets_over_the_same_pods(token, github):
+    """The eviction API refuses a pod two budgets select, so each good alone is no pass."""
+    files = {f"{_PDB_DIR}/a.yaml": _pdb_yaml("  minAvailable: 1\n"), f"{_PDB_DIR}/b.yaml": _pdb_yaml("  maxUnavailable: 1\n")}
+    _content_pr(github, files)
+    res = _pr_check(content=[_pdb_check(quantifier="any")]).verify(5.0)
+    assert res.status == "fail"
+    assert "more than one budget selects" in res.reason
+
+
+def test_admits_disruption_counts_an_empty_selector_as_a_second_budget(token, github):
+    """An empty selector selects every pod in the namespace, the workload's too."""
+    files = {f"{_PDB_DIR}/a.yaml": _pdb_yaml("  minAvailable: 1\n"),
+             f"{_PDB_DIR}/b.yaml": _pdb_yaml("  maxUnavailable: 1\n", "  selector: {}\n")}
+    _content_pr(github, files)
+    res = _pr_check(content=[_pdb_check(quantifier="any")]).verify(5.0)
+    assert res.status == "fail"
+    assert "more than one budget selects" in res.reason
+
+
+@pytest.mark.parametrize("value", ["\uff11", "\uff15\uff10%"])
+def test_admits_disruption_refuses_non_ascii_digits(value):
+    """Fullwidth digits read as numbers to int(); the API server refuses them."""
+    doc = yaml.load(_pdb_yaml(f"  minAvailable: {value}\n"), Loader=verifiers._ContentLoader)
+    assert "neither a whole number nor a percentage" in (verifiers._pdb_rejection(doc, 2, _PDB_LABELS) or "")
+
+
+def test_admits_disruption_grades_only_policy_v1():
+    for version in ("policy/v1beta1", None):
+        doc = yaml.load(_pdb_yaml("  minAvailable: 1\n"), Loader=verifiers._ContentLoader)
+        doc["apiVersion"] = version
+        assert "not policy/v1" in (verifiers._pdb_rejection(doc, 2, _PDB_LABELS) or "")
+
+
+@pytest.mark.parametrize(
+    ("budget", "replicas"),
+    [
+        ("  minAvailable: 1\n", 2),
+        ("  maxUnavailable: 1\n", 2),
+        ("  maxUnavailable: 50%\n", 2),
+        ("  minAvailable: 50%\n", 2),
+        ("  minAvailable: 60%\n", 3),
+        ("  maxUnavailable: 34%\n", 3),
+    ],
+)
+def test_admits_disruption_accepts_budgets_that_drain_and_protect(budget, replicas):
+    doc = yaml.load(_pdb_yaml(budget), Loader=verifiers._ContentLoader)
+    assert verifiers._pdb_rejection(doc, replicas, _PDB_LABELS) is None
+
+
+@pytest.mark.parametrize(
+    ("budget", "replicas", "why"),
+    [
+        # gke-agentic/kube-agents-autopush-infra#20: minAvailable 1 over one replica.
+        ("  minAvailable: 1\n", 1, "allows 0 disruptions"),
+        ("  minAvailable: 2\n", 2, "allows 0 disruptions"),
+        ("  minAvailable: 51%\n", 2, "allows 0 disruptions"),
+        ("  minAvailable: 100%\n", 2, "allows 0 disruptions"),
+        ("  maxUnavailable: 0\n", 2, "allows 0 disruptions"),
+        ("  maxUnavailable: 0%\n", 2, "allows 0 disruptions"),
+        ("  minAvailable: 0\n", 2, "protects nothing"),
+        ("  maxUnavailable: 2\n", 2, "protects nothing"),
+        ("  maxUnavailable: 100%\n", 2, "protects nothing"),
+        ("  minAvailable: 1\n  maxUnavailable: 1\n", 2, "sets both"),
+        ("", 2, "sets neither"),
+        ("  minAvailable: ~\n", 2, "sets neither"),
+        ("  minAvailable: one\n", 2, "neither a whole number nor a percentage"),
+        ("  maxUnavailable: 150%\n", 2, "neither a whole number nor a percentage"),
+    ],
+)
+def test_admits_disruption_refuses_budgets_that_block_or_bound_nothing(budget, replicas, why):
+    doc = yaml.load(_pdb_yaml(budget), Loader=verifiers._ContentLoader)
+    assert why in (verifiers._pdb_rejection(doc, replicas, _PDB_LABELS) or "")
+
+
+@pytest.mark.parametrize(
+    ("selector", "why"),
+    [
+        ("  selector:\n    matchLabels:\n      app: checkout\n", "does not select the workload's pods"),
+        ("  selector:\n    matchLabels:\n      app: checkout-gateway\n      tier: web\n", "tier=web"),
+        ("", "has no selector"),
+        ("  selector: {}\n", "selects every pod in the namespace"),
+        ("  selector:\n    matchLabels: {}\n", "selects every pod in the namespace"),
+        ("  selector:\n    matchExpressions:\n      - {key: app, operator: NotIn, values: [checkout-gateway]}\n",
+         "NotIn"),
+        ("  selector:\n    matchExpressions:\n      - {key: app, operator: DoesNotExist}\n", "DoesNotExist"),
+        ("  selector:\n    matchExpressions:\n      - {key: app, operator: Like, values: [x]}\n",
+         "not a Kubernetes one"),
+        ("  selector:\n    matchExpressions:\n      - {key: app, operator: Exists, values: [x]}\n",
+         "the API server refuses"),
+        ("  selector:\n    matchExpressions:\n      - {key: tier, operator: NotIn, values: []}\n",
+         "the API server refuses"),
+        ("  selector:\n    matchExpressions:\n      - {operator: Exists}\n", "names no key"),
+        ("  selector:\n    matchExpressions:\n      - {key: [app], operator: Exists}\n", "names no key"),
+        ("  selector:\n    matchExpressions:\n      - {key: app, operator: In, values: [[checkout-gateway]]}\n",
+         "not all strings"),
+        ("  selector:\n    matchExpressions:\n      - {key: app, operator: NotIn, values: [{a: b}]}\n",
+         "not all strings"),
+    ],
+)
+def test_admits_disruption_refuses_a_selector_that_misses_the_workload(selector, why):
+    doc = yaml.load(_pdb_yaml("  minAvailable: 1\n", selector), Loader=verifiers._ContentLoader)
+    assert why in (verifiers._pdb_rejection(doc, 2, _PDB_LABELS) or "")
+
+
+@pytest.mark.parametrize(
+    "selector",
+    [
+        "  selector:\n    matchExpressions:\n      - {key: app, operator: In, values: [checkout-gateway, x]}\n",
+        "  selector:\n    matchExpressions:\n      - {key: app, operator: Exists}\n      - {key: tier, operator: DoesNotExist}\n",
+        "  selector:\n    matchLabels:\n      app: checkout-gateway\n    matchExpressions:\n      - {key: tier, operator: NotIn, values: [batch]}\n",
+    ],
+)
+def test_admits_disruption_accepts_expressions_that_select_the_workload(selector):
+    doc = yaml.load(_pdb_yaml("  minAvailable: 1\n", selector), Loader=verifiers._ContentLoader)
+    assert verifiers._pdb_rejection(doc, 2, _PDB_LABELS) is None
+
+
+@pytest.mark.parametrize(
+    "check",
+    [
+        {"paths": ["x"], "kind": "PodDisruptionBudget", "op": "admits_disruption", "pod_labels": _PDB_LABELS},
+        {"paths": ["x"], "kind": "PodDisruptionBudget", "op": "admits_disruption", "replicas": 2},
+        {"paths": ["x"], "kind": "PodDisruptionBudget", "op": "admits_disruption", "replicas": 1,
+         "pod_labels": _PDB_LABELS},
+        {"paths": ["x"], "op": "admits_disruption", "replicas": 2, "pod_labels": _PDB_LABELS},
+        {"paths": ["x"], "kind": "PodDisruptionBudget", "op": "admits_disruption", "replicas": 2,
+         "pod_labels": _PDB_LABELS, "field": "spec.minAvailable"},
+        {"paths": ["x"], "kind": "PodDisruptionBudget", "op": "exists", "replicas": 2},
+        {"paths": ["x"], "kind": "PodDisruptionBudget", "op": "exists", "pod_labels": _PDB_LABELS},
+    ],
+)
+def test_an_admits_disruption_check_is_refused_without_its_workload(check):
+    with pytest.raises(ValueError):
+        _pr_check(content=[check])
+
+
 def test_a_previous_reps_pull_request_is_a_fail(token, github):
     """The defect this check exists for (#1755). The pool sweep runs between
     leases, not between reps, so rep 1's pull request is still there for rep 2
@@ -6147,6 +6871,190 @@ def test_unreadable_commits_of_the_second_proposal_are_an_error(token, github):
     assert "listing the commits of" in res.reason
     assert "pull_requests: read" in res.reason
     assert _closed_from() in [url for url, _ in github.calls]
+
+
+# #5222: a read of the spent-branch check that the forge failed transiently
+# marks the check's error, so scoring can grade it as infrastructure; a read
+# the forge answered about the run, or refused for the credential, does not.
+@pytest.mark.parametrize(
+    "answer",
+    [
+        (503, {"message": "Service Unavailable"}),
+        (429, {"message": "Too Many Requests"}),
+        (403, {"message": "API rate limit exceeded for installation ID 1."}),
+        (403, {"message": "You have exceeded a secondary rate limit."}),
+        urllib.error.URLError(TimeoutError("timed out")),
+        TimeoutError("The read operation timed out"),
+        ConnectionResetError("Connection reset by peer"),
+    ],
+    ids=["503", "429", "primary-rate-limit-403", "secondary-rate-limit-403", "url-timeout", "timeout", "reset"],
+)
+def test_a_spent_branch_read_the_forge_failed_marks_the_error(minted_token, github, answer):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    github.routes[_pr_api("pulls")] = (200, _pr_payload(as_issue=False))
+    github.routes[_closed_from()] = (200, [_closed_six()])
+    if isinstance(answer, OSError):
+        def fail():
+            raise answer
+
+        github.routes[_commits_of()] = fail
+    else:
+        github.routes[_commits_of()] = answer
+    res = _pr_check(reuses_spent_branch=True).verify(5.0)
+    assert res.status == "error"
+    assert res.reason.startswith(forges.FORGE_UNAVAILABLE_MARKER + " (")
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        (403, {"message": "Resource not accessible by integration"}),
+        (401, {"message": "Bad credentials"}),
+        (422, {"message": "Validation Failed"}),
+        urllib.error.URLError(ssl.SSLCertVerificationError("certificate verify failed")),
+        OSError("BENCH_FORGE=svn names no forge this harness grades"),
+    ],
+    ids=["permission-403", "401", "422", "certificate", "configuration"],
+)
+def test_a_spent_branch_read_refused_for_any_other_reason_leaves_the_error_plain(minted_token, github, answer):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    github.routes[_pr_api("pulls")] = (200, _pr_payload(as_issue=False))
+    github.routes[_closed_from()] = (200, [_closed_six()])
+    if isinstance(answer, OSError):
+        def fail():
+            raise answer
+
+        github.routes[_commits_of()] = fail
+    else:
+        github.routes[_commits_of()] = answer
+    res = _pr_check(reuses_spent_branch=True).verify(5.0)
+    assert res.status == "error"
+    assert forges.FORGE_UNAVAILABLE_MARKER not in res.reason
+
+
+class _NotingCheck:
+    """A check that notes the given reads and returns what it is given."""
+
+    def __init__(self, status, note=True, also_plain=False):
+        self.status, self.note, self.also_plain = status, note, also_plain
+
+    @verifiers._marks_forge_unavailable
+    def verify(self, timeout_sec):
+        if self.note:
+            verifiers._note_forge_read(True, "answered 503")
+        if self.also_plain:
+            verifiers._note_forge_read(False, "answered 403")
+        return VerificationResult(success=self.status == "pass", status=self.status, reason="the check's own reason", elapsed_time=0.0)
+
+
+def test_one_read_that_failed_for_another_reason_keeps_the_error_plain():
+    """A 503 on one candidate and a permission 403 on another: the error may be the 403's."""
+    assert _NotingCheck("error", also_plain=True).verify(5.0).reason == "the check's own reason"
+
+
+@pytest.mark.parametrize(
+    "status, note, marked",
+    [("error", True, True), ("error", False, False), ("fail", True, False), ("pass", True, False)],
+)
+def test_only_an_error_after_a_transient_read_is_marked(status, note, marked):
+    """A pass or a fail was decided on what did answer; an error with no such read is plain."""
+    res = _NotingCheck(status, note).verify(5.0)
+    assert res.status == status
+    assert res.reason.endswith("the check's own reason")
+    assert res.reason.startswith(forges.FORGE_UNAVAILABLE_MARKER) is marked
+
+
+class _TwoCandidates:
+    """pull_request_opened's shape: each candidate unresolved, A on a 503."""
+
+    def __init__(self, b_reads_503):
+        self.b_reads_503 = b_reads_503
+
+    @verifiers._marks_forge_unavailable
+    def verify(self, timeout_sec):
+        unresolved = verifiers._UnresolvedCandidates()
+        unresolved.begin()
+        verifiers._note_forge_read(True, "answered 503")
+        unresolved.append("A: unexpected GitHub response 503")
+        unresolved.begin()
+        if self.b_reads_503:
+            verifiers._note_forge_read(True, "answered 502")
+        unresolved.append("B: GitHub returned no head ref")
+        return VerificationResult(success=False, status="error", reason="; ".join(unresolved), elapsed_time=0.0)
+
+
+@pytest.mark.parametrize("b_reads_503, marked", [(False, False), (True, True)])
+def test_a_candidate_unevaluable_without_a_failed_read_keeps_the_error_plain(b_reads_503, marked):
+    """B's malformed answer is not an outage: A's 503 must not excuse it."""
+    assert _TwoCandidates(b_reads_503).verify(5.0).reason.startswith(forges.FORGE_UNAVAILABLE_MARKER) is marked
+
+
+def test_a_read_outside_a_check_notes_nothing():
+    verifiers._note_forge_read(True, "answered 503")
+    assert verifiers._forge_unavailable.get() is None
+    assert _NotingCheck("error", note=False).verify(5.0).reason == "the check's own reason"
+
+
+@pytest.mark.parametrize(
+    "raised, cause, transient",
+    [
+        (OSError("RemoteDisconnected: Remote end closed connection without response"),
+         http.client.RemoteDisconnected("closed"), True),
+        (OSError("IncompleteRead: IncompleteRead(10 bytes read)"), http.client.IncompleteRead(b"0" * 10), True),
+        (OSError("InvalidURL: nonnumeric port: 'abc'"), http.client.InvalidURL("nonnumeric port: 'abc'"), False),
+        (urllib.error.URLError(socket.gaierror(8, "nodename nor servname provided")), None, False),
+        (urllib.error.URLError(ConnectionRefusedError(61, "Connection refused")), None, False),
+        (ConnectionRefusedError(61, "Connection refused"), None, False),
+        (urllib.error.URLError(ssl.SSLCertVerificationError("certificate verify failed")), None, False),
+    ],
+    ids=["remote-disconnected", "incomplete-read", "invalid-url", "dns", "refused-url", "refused", "certificate"],
+)
+def test_which_transport_failures_are_transient(raised, cause, transient):
+    def fake(url, tok, timeout):
+        if cause is not None:
+            raise raised from cause
+        raise raised
+
+    seen: list[tuple[bool, str]] = []
+    token = verifiers._forge_unavailable.set(seen)
+    try:
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(verifiers, "_http_get_json", fake)
+            with pytest.raises(OSError):
+                verifiers._forge_get_json("https://api.github.com/x", "t", 1.0)
+    finally:
+        verifiers._forge_unavailable.reset(token)
+    assert [t for t, _ in seen] == [transient]
+
+
+@pytest.mark.parametrize(
+    "forge, token_file, noted",
+    [("github", "ghs_fake\n", True), ("github", None, False), ("github", "", False), ("gitlab", "ghs_fake\n", False)],
+    ids=["github-ci-token", "github-local-token", "github-empty-file-beside-a-local-token", "gitlab"],
+)
+def test_a_rate_limit_is_noted_only_under_the_ci_grading_token_on_github(monkeypatch, tmp_path, forge, token_file, noted):
+    """The CI token is the ledger App's, which the agent cannot spend. A local
+    token, or GitLab's (one user for both), can be the agent's own; so can
+    BENCH_GITHUB_TOKEN when the file holds no usable token and read_token
+    falls back to it."""
+    monkeypatch.setenv(forges.FORGE_ENV_VAR, forge)
+    monkeypatch.setenv("BENCH_GITHUB_TOKEN", "ghp_personal")
+    if token_file is None:
+        monkeypatch.delenv(forges.GITHUB_TOKEN_FILE_ENV_VAR, raising=False)
+    else:
+        (tmp_path / "t").write_text(token_file)
+        monkeypatch.setenv(forges.GITHUB_TOKEN_FILE_ENV_VAR, str(tmp_path / "t"))
+    sent = forges.read_token(forges.forge_name())
+    monkeypatch.setattr(verifiers, "_http_get_json", lambda url, tok, timeout: (429, {"message": "Retry later"}))
+    seen: list[tuple[bool, str]] = []
+    token = verifiers._forge_unavailable.set(seen)
+    try:
+        assert verifiers._forge_get_json("https://forge.example/x", sent, 1.0)[0] == 429
+    finally:
+        verifiers._forge_unavailable.reset(token)
+    assert seen == [(noted, "answered 429")]
 
 
 def test_the_commit_page_the_head_date_read_is_not_read_again(token, github):
@@ -10155,6 +11063,67 @@ def test_issue_state_unreadable_comments_are_an_error(token, gitops_repo, github
     res = _state_check().verify(5.0)
     assert res.status == "error"
     assert "comments of" in res.reason
+
+
+def test_issue_state_comments_the_forge_failed_mark_the_error(token, gitops_repo, github):
+    _stash_report(final_message=_TICKET_REPLY)
+    github.routes[_ticket_api()] = (200, _ticket())
+    github.routes[_ticket_comments_api()] = (502, {"message": "Bad Gateway"})
+    res = _state_check().verify(5.0)
+    assert res.status == "error"
+    assert res.reason.startswith(forges.FORGE_UNAVAILABLE_MARKER)
+
+
+def test_issue_state_already_rejected_stays_a_fail_when_its_comments_fail(token, gitops_repo, github):
+    """A fail outranks an error: the open, unlabelled ticket is a verdict, and
+    the comment read the forge failed does not make it infrastructure."""
+    _stash_report(final_message=_TICKET_REPLY)
+    github.routes[_ticket_api()] = (200, _ticket(state="open", labels=("status:in-progress",)))
+    github.routes[_ticket_comments_api()] = (503, {"message": "Service Unavailable"})
+    res = _state_check().verify(5.0)
+    assert res.status == "fail"
+    assert "is open, not closed" in res.reason
+    assert "its comments could not be read" in res.reason
+    assert forges.FORGE_UNAVAILABLE_MARKER not in res.reason
+
+
+def test_ledger_read_the_forge_failed_marks_the_error(token, github):
+    _stash_report()
+    github.routes[_api()] = (503, {"message": "Service Unavailable"})
+    res = _ledger_check(required_phrases=["debug-binding"]).verify(5.0)
+    assert res.status == "error"
+    assert res.reason.startswith(forges.FORGE_UNAVAILABLE_MARKER)
+
+
+def test_ledger_read_refused_for_permission_leaves_the_error_plain(token, github):
+    _stash_report()
+    github.routes[_api()] = (403, {"message": "Resource not accessible by integration"})
+    res = _ledger_check(required_phrases=["debug-binding"]).verify(5.0)
+    assert res.status == "error"
+    assert forges.FORGE_UNAVAILABLE_MARKER not in res.reason
+
+
+def _two_ticket_reply():
+    return f"{_TICKET_REPLY}\nAlso https://github.com/gke-agentic/{_TICKET_REPO}/issues/709"
+
+
+@pytest.mark.parametrize("second", ["issue", "comments"])
+def test_issue_state_an_earlier_candidates_outage_does_not_excuse_a_malformed_answer(
+    token, gitops_repo, github, second
+):
+    """#708 is rejected while its comment read answered 503; #709 then errors
+    on a 200 that is not the shape asked for, which no failed read explains."""
+    _stash_report(final_message=_two_ticket_reply())
+    github.routes[_ticket_api()] = (200, _ticket(state="open", labels=("status:in-progress",)))
+    github.routes[_ticket_comments_api()] = (503, {"message": "Service Unavailable"})
+    if second == "issue":
+        github.routes[_ticket_api(709)] = (200, ["not", "an", "object"])
+    else:
+        github.routes[_ticket_api(709)] = (200, _ticket() | {"number": 709})
+        github.routes[_ticket_comments_api(709)] = (200, {"message": "not a list"})
+    res = _state_check().verify(5.0)
+    assert res.status == "error"
+    assert forges.FORGE_UNAVAILABLE_MARKER not in res.reason
 
 
 def test_issue_state_missing_token_is_an_error_naming_the_variable(monkeypatch, github):

@@ -540,6 +540,8 @@ Discovery = collector_run.Discovery
 default_run = functools.partial(collector_run.default_run, timeout=DEFAULT_TIMEOUT_S)
 paged_dump = collector_run.paged_dump
 paged_command_text = collector_run.paged_command_text
+listing_fields = collector_run.listing_fields
+listed_node_pools = collector_run.listed_node_pools
 
 
 RunFn = Callable[..., Run]
@@ -725,7 +727,8 @@ def enumerate_clusters(project: str, *, run: RunFn = default_run) -> tuple[list[
     did not answer returns the clusters it has *and* an error, so the ones in
     the silent zones do not read as clusters that do not exist.
     """
-    result = run(["gcloud", "container", "clusters", "list", "--project", project, "--format", "json"])
+    listing_argv = ["gcloud", "container", "clusters", "list", "--project", project, "--format", "json"]
+    result = run(listing_argv)
     if result.rc != 0:
         if any(marker in result.stderr for marker in API_DISABLED_MARKERS):
             log(f"{project}: Kubernetes Engine API is not enabled; no cluster can exist here")
@@ -750,6 +753,9 @@ def enumerate_clusters(project: str, *, run: RunFn = default_run) -> tuple[list[
                 "location": location,
                 "project": project,
                 "autopilot": bool((c.get("autopilot") or {}).get("enabled")),
+                # The node pools this listing already returned, for the two
+                # streams that read them (`collector_run.listed_node_pools`).
+                **listing_fields(c, listing_argv),
             }
         )
     not_running = [not_running_entry(c, project) for c in clusters if c.get("status") not in AUDITABLE_STATUSES]
@@ -7364,8 +7370,11 @@ OBTAINABILITY_CHECKS: tuple[CheckSpec, ...] = (
         check_no_pdb,
         "major",
         None,
-        "Nothing constrains the eviction API, so a single node drain during "
-        "an upgrade can terminate every replica at once.",
+        "Nothing limits how many replicas the eviction API may take at once, "
+        "so the workload is unprotected during voluntary disruptions such as "
+        "node upgrades and autoscaler scale-downs: one drain evicts every "
+        "replica on that node, and back-to-back drains can evict the next "
+        "replica before its replacement is Ready.",
     ),
     CheckSpec(
         "blocking-pdb",
@@ -7967,14 +7976,22 @@ def _collect_obtainability(cluster: dict, kubeconfig: Path, checks: tuple[CheckS
             f"KUBECONFIG={kubeconfig} {shlex.join(cc_argv)}", cc_result
         )
         if cc_items:
-            np_argv = [
-                "gcloud", "container", "node-pools", "list",
-                "--cluster", cluster["name"],
-                "--location", cluster["location"],
-                "--project", cluster["project"],
-                "--format", "json",
-            ]
-            np_parsed, np_result = run_and_gate(np_argv, kubeconfig, run=run)
+            # This read records no command of its own (the check's record is
+            # the ComputeClass read above), so a listing-sourced answer adds
+            # none either.
+            np_result, unlisted = listed_node_pools(cluster)
+            if np_result is not None:
+                np_parsed = json.loads(np_result.stdout)
+            else:
+                log(f"{cluster.get('target', cluster['name'])}: {unlisted}; reading node-pools list")
+                np_argv = [
+                    "gcloud", "container", "node-pools", "list",
+                    "--cluster", cluster["name"],
+                    "--location", cluster["location"],
+                    "--project", cluster["project"],
+                    "--format", "json",
+                ]
+                np_parsed, np_result = run_and_gate(np_argv, kubeconfig, run=run)
             pools_listed = isinstance(np_parsed, list) and all(isinstance(p, dict) for p in np_parsed)
             if not pools_listed:
                 commands.pop("untargeted-compute-class-workload", None)
@@ -8484,12 +8501,21 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
         context["node_pools"] = context["cluster_describe"].get("nodePools") or []
         commands["legacy-metadata"] = describe_record
     else:
-        node_pools_argv = ["gcloud", "container", "node-pools", "list", "--cluster", name, "--location", location, "--project", project, "--format", "json"]
-        parsed, result = gated(node_pools_argv)
+        # The listing's pools when it carried them, recorded against the
+        # discovery command that returned them; else the cluster's own read.
+        result, unlisted = listed_node_pools(cluster)
+        if result is not None:
+            parsed = json.loads(result.stdout)
+            node_pools_command = shlex.join(result.argv)
+        else:
+            log(f"{cluster.get('target', name)}: {unlisted}; reading node-pools list")
+            node_pools_argv = ["gcloud", "container", "node-pools", "list", "--cluster", name, "--location", location, "--project", project, "--format", "json"]
+            parsed, result = gated(node_pools_argv)
+            node_pools_command = shlex.join(node_pools_argv)
         if parsed is None:
             raise GateFailure(f"node-pools list gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
         context["node_pools"] = parsed if isinstance(parsed, list) else []
-        commands["legacy-metadata"] = _record(shlex.join(node_pools_argv), result)
+        commands["legacy-metadata"] = _record(node_pools_command, result)
 
     # Whether the three admission premises `_COMPLIANCE_AUTOPILOT_NOT_APPLICABLE`
     # rests on are still intact on this cluster. They hold only while nothing

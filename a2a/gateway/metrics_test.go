@@ -110,6 +110,13 @@ func scrape(t *testing.T, method, url string) (int, string) {
 // base URL.
 func startMetricsServer(t *testing.T, m *Metrics) string {
 	t.Helper()
+	return startMetricsServerWith(t, m, nil)
+}
+
+// startMetricsServerWith is startMetricsServer answering ReadyzPath from
+// readiness (nil answers ready).
+func startMetricsServerWith(t *testing.T, m *Metrics, readiness func() (bool, string)) string {
+	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -118,6 +125,7 @@ func startMetricsServer(t *testing.T, m *Metrics) string {
 	if err != nil {
 		t.Fatal(err)
 	}
+	srv.SetReadiness(readiness)
 	srv.listener = ln
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -818,5 +826,21 @@ func TestTheGaugeServesNoSampleUntilTheMapLoads(t *testing.T) {
 	_, body = scrape(t, http.MethodGet, url+MetricsPath)
 	if strings.Contains(body, "people_seen") {
 		t.Fatalf("a sample after the map was unloaded:\n%s", body)
+	}
+}
+
+// TestAnswerFeedbackZeroSeriesCoverBothRatingBackends: both backends that
+// draw rating controls start with a zero series per rating, so a scrape
+// before the first rating reads 0 rather than no data.
+func TestAnswerFeedbackZeroSeriesCoverBothRatingBackends(t *testing.T) {
+	m := NewMetrics()
+	series := make(chan prometheus.Metric, 16)
+	m.answerFeedback.Collect(series)
+	close(series)
+	if got := len(series); got != 8 {
+		t.Errorf("answer_feedback_total series = %d, want 8 (2 backends x 2 ratings x 2 answers)", got)
+	}
+	if got := counterValue(t, m.answerFeedback.WithLabelValues(platformGoogleChat, FeedbackUp, answerReply)); got != 0 {
+		t.Errorf("answer_feedback_total{googlechat,up,reply} = %v, want 0", got)
 	}
 }

@@ -1,5 +1,5 @@
 {
-  "version": "901ca2ecaf5b06d8",
+  "version": "d4f1d56397168455",
   "shard": 0,
   "shards": 1,
   "identities": [
@@ -27,6 +27,7 @@
           "$JS.API.STREAM.CREATE.KV_people",
           "$JS.API.STREAM.CREATE.KV_PROFILE_LEASES",
           "$JS.API.STREAM.CREATE.PROFILE_SUBMITS",
+          "$JS.API.STREAM.CREATE.DISPATCH_STOPS",
           "$JS.API.STREAM.INFO.TASKS",
           "$JS.API.STREAM.INFO.DIRECTORY",
           "$JS.API.STREAM.INFO.TOPICS-STATE",
@@ -38,6 +39,13 @@
           "$JS.API.STREAM.INFO.KV_people",
           "$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
           "$JS.API.STREAM.INFO.PROFILE_SUBMITS",
+          "$JS.API.STREAM.INFO.DISPATCH_STOPS",
+          "$JS.API.CONSUMER.INFO.TASKS.gateway-relay",
+          "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay",
+          "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay.>",
+          "$JS.API.CONSUMER.INFO.TASKS.bridge-platform",
+          "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform",
+          "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform.>",
           "_INBOX.provision.>"
         ],
         "subscribe": [

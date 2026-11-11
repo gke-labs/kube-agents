@@ -80,21 +80,29 @@ jobs:
       # already on main's required-status-checks list and a new job name is
       # not: a check that is not required does not gate, however red it goes.
       #
-      # The release tarball rather than `apt install shellcheck`: the apt
-      # package is whatever release the runner image's Ubuntu ships (0.9.0 on
-      # 24.04, two behind what the tree is cleared against; `ubuntu-latest`
-      # moved to 26.04 in late 2026), and a rule added or tightened between
-      # releases reports differently here than on a maintainer's laptop.
-      # Pinned by version and SHA-256 for the same reason every third-party
-      # action is pinned to a commit: a moving `latest` turns a new upstream
-      # rule into a red check on a pull request that changed no shell.
-      # Bumping the pin means running `make shellcheck` with the new release
-      # first and clearing what it adds.
+      # Pinned to one release for the same reason every third-party action is
+      # pinned to a commit: a moving `latest` turns a new upstream rule into a
+      # red check on a pull request that changed no shell, and a rule added or
+      # tightened between releases reports differently here than on a
+      # maintainer's laptop. The runner image's apt package is whatever release
+      # its Ubuntu ships (0.11.0 on 26.04, which `ubuntu-latest` resolves to;
+      # 0.9.0 on 24.04), so the step uses the binary on PATH only when it
+      # reports exactly the pinned version, and otherwise downloads the release
+      # tarball and checks its SHA-256. Skipping the download keeps a GitHub
+      # download outage off this required check: on 2026-11-05 the release URL
+      # returned 504 for longer than curl retries, in four runs within 70
+      # minutes. Bumping the pin means running `make shellcheck` with the new
+      # release first and clearing what it adds; until the image ships the new
+      # release, the step downloads it.
       - name: Install shellcheck
         env:
           SHELLCHECK_VERSION: v0.11.0
           SHELLCHECK_SHA256: 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
         run: |
+          if shellcheck --version 2>/dev/null | grep -Fx "version: ${SHELLCHECK_VERSION#v}"; then
+            echo "$(command -v shellcheck) is already ${SHELLCHECK_VERSION}; skipping the download."
+            exit 0
+          fi
           archive="shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
           curl -sSfL --retry 5 --retry-all-errors -o "$RUNNER_TEMP/$archive" \
             "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/${archive}"
@@ -522,13 +530,31 @@ jobs:
           path: ~/.terraform.d/plugin-cache
           key: terraform-plugins-${{ runner.os }}-${{ hashFiles('terraform/modules/*/versions.tf', 'terraform/examples/*/providers.tf') }}
 
+      # terraform init alone retries. No directory commits a
+      # .terraform.lock.hcl, and without one init downloads every provider
+      # from the registry even when the plugin cache holds it; one connection
+      # reset there failed this step (#5142). Each directory gets four
+      # attempts with a doubling delay from five seconds, the schedule of
+      # k8s-operator/Makefile's go-install-tool. fmt and validate make no
+      # network call and run once. tests/test_third_party_download_retry.py
+      # runs the loop against stubs.
       - name: Validate Terraform Modules
         run: |
+          attempts=4; first_delay=5
           terraform fmt -check -recursive terraform/
           for dir in terraform/modules/* terraform/examples/*; do
             if [ -d "$dir" ]; then
               echo "Validating $dir..."
-              (cd "$dir" && terraform init -backend=false && terraform validate)
+              attempt=1; delay=$first_delay
+              until (cd "$dir" && terraform init -backend=false); do
+                if [ "$attempt" -ge "$attempts" ]; then
+                  echo "::error::terraform init in $dir failed after $attempts attempts."
+                  exit 1
+                fi
+                echo "::warning::terraform init in $dir: attempt $attempt of $attempts failed; retrying in ${delay}s."
+                sleep "$delay"; attempt=$((attempt + 1)); delay=$((delay * 2))
+              done
+              (cd "$dir" && terraform validate)
             fi
           done
 

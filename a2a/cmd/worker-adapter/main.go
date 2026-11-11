@@ -20,6 +20,13 @@
 //
 // Exit codes: 0 completed (or nothing to do), 1 failed, 2 rejected,
 // 3 canceled, 143 evicted (SIGTERM).
+//
+// A2A_PROFILE_WORKER=true is the AgentProfile worker instead (#3655): a pool
+// or Job pod that takes its tasks from the dispatcher (workeradapter.
+// RunProfileWorker). It needs no TASK_ID, and A2A_PROFILE_TIER names its
+// pool. It answers /readyz on lib.ProfileWorkerStatusPort once it's
+// listening. It exits 0 when it stops (at SIGTERM, or after one task with
+// PROFILE_WORKER_ONE_SHOT), and 1 if it can't start.
 package main
 
 import (
@@ -39,6 +46,7 @@ import (
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/persona"
 	workeradapter "github.com/gke-labs/kube-agents/a2a/worker-adapter"
 )
 
@@ -116,7 +124,8 @@ const (
 	delegateToolID = "mcp__" + workeradapter.DelegateMCPServer + "__" + workeradapter.DelegateToolName
 	// delegatePrompt tells the model the tool exists and when to reach for
 	// it; the tool's own schema (mcp.go) covers how to call it.
-	delegatePrompt = "You can hand a task to another agent with the `delegate` tool (addressee `platform` is the platform agent, which can read and act on the fleet). " +
+	delegatePrompt = "You can hand a task to another agent with the `delegate` tool. Its addressee field lists the agents you may use this turn: usually `platform`, the platform agent, which can read and act on the fleet, and any agent profile this conversation can reach. If it says no agent is available, don't call it. " +
+		"When the person asks for one of those agents by name, delegate to it under that name. " +
 		"The gateway checks that the user may reach that agent before anything runs. Calling `delegate` ends your turn; the agent's result arrives as your next turn, so say what you are delegating and why in one line first. " +
 		"Delegate when the ask needs the fleet, a cluster or privileges you do not have; answer yourself when you can."
 
@@ -131,17 +140,40 @@ func main() {
 	os.Exit(run())
 }
 
+// serveMCP is `worker-adapter mcp`: the delegate MCP server over in and out,
+// at the socket the adapter named and with the delegate targets it wrote into
+// this process's env for the turn.
+func serveMCP(ctx context.Context, in io.Reader, out io.Writer, log *slog.Logger) error {
+	return workeradapter.ServeDelegateMCP(ctx, in, out, workeradapter.DelegateSocketPath(), workeradapter.DelegateTargetsFromEnv(log), log)
+}
+
 func run() int {
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	slog.SetDefault(log)
 
-	// `worker-adapter mcp` is not a task run: it is the stdio MCP server the
-	// harness launches as a subprocess of itself, forwarding the session's
-	// one delegate tool call to this adapter process over a unix socket
-	// (worker-adapter/mcp.go). It has none of the task env below, so it is
-	// dispatched before configFromEnv rather than folded into it.
+	// The two subcommands are not task runs: each is a stdio MCP server the
+	// harness launches as a subprocess of itself, with none of the task env
+	// below, so they are dispatched before configFromEnv rather than folded
+	// into it.
+	//
+	// `worker-adapter mcp-relay <url>` is what a profile persona's broker
+	// servers are rendered as (worker-adapter/mcprelay.go): it carries
+	// messages to the broker's relay with the pod's credentials.
+	if len(os.Args) > 1 && os.Args[1] == workeradapter.MCPRelayCommand {
+		if len(os.Args) != 3 {
+			fmt.Fprintln(os.Stderr, "usage: worker-adapter mcp-relay <broker relay URL>")
+			return 2
+		}
+		if err := workeradapter.ServeMCPRelay(context.Background(), os.Args[2], os.Stdin, os.Stdout, log); err != nil && !errors.Is(err, io.EOF) {
+			fmt.Fprintln(os.Stderr, "mcp-relay:", err)
+			return 1
+		}
+		return 0
+	}
+	// `worker-adapter mcp` forwards the session's one delegate tool call to
+	// this adapter process over a unix socket (worker-adapter/mcp.go).
 	if len(os.Args) > 1 && os.Args[1] == "mcp" {
-		if err := workeradapter.ServeDelegateMCP(context.Background(), os.Stdin, os.Stdout, workeradapter.DelegateSocketPath(), log); err != nil && !errors.Is(err, io.EOF) {
+		if err := serveMCP(context.Background(), os.Stdin, os.Stdout, log); err != nil && !errors.Is(err, io.EOF) {
 			fmt.Fprintln(os.Stderr, "mcp:", err)
 			return 1
 		}
@@ -173,6 +205,33 @@ func run() int {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
+	if os.Getenv(lib.EnvProfileWorker) == "true" {
+		oneShot := os.Getenv(lib.EnvProfileWorkerOneShot)
+		harness := persona.Harness(os.Getenv(lib.EnvProfileHarness))
+		if harness == "" {
+			harness = persona.ClaudeCode
+		}
+		cfg = profileModeConfig(cfg)
+		pw := workeradapter.ProfileWorkerConfig{
+			Tier:       os.Getenv(lib.EnvProfileTier),
+			OneShot:    oneShot == "1" || oneShot == "true",
+			ReadyAddr:  fmt.Sprintf(":%d", lib.ProfileWorkerStatusPort),
+			PersonaDir: lib.ProfilePersonaDir,
+			Harness:    harness,
+			ConfigRoot: envOrDefault(lib.EnvProfileConfigRoot, lib.ProfileConfigRoot),
+			// The broker's task-token file (#3889's proxy confinement).
+			TaskTokenFile: os.Getenv("CREDENTIAL_PROXY_TASK_TOKEN_FILE"),
+			// The persona's MCP servers through the broker's relay (#5495).
+			Relay:      workeradapter.ProfileRelay(selfPath(), os.Getenv),
+			ResetPaths: resetPaths(os.Getenv(lib.EnvProfileResetPaths)),
+		}
+		if err := workeradapter.RunProfileWorker(ctx, cfg, pw); err != nil {
+			log.Error("profile worker failed", "err", err)
+			return 1
+		}
+		return 0
+	}
+
 	res, err := workeradapter.Run(ctx, cfg)
 	if err != nil {
 		log.Error("adapter run failed", "task", cfg.TaskID, "state", string(res.State), "err", err)
@@ -194,6 +253,30 @@ func run() int {
 	}
 }
 
+// resetPaths splits lib.EnvProfileResetPaths, dropping empty entries and any
+// that isn't absolute: a relative path would empty whatever directory the
+// worker happened to start in.
+func resetPaths(v string) []string {
+	var out []string
+	for _, p := range strings.Split(v, ":") {
+		if p != "" && filepath.IsAbs(p) && filepath.Clean(p) != "/" {
+			out = append(out, filepath.Clean(p))
+		}
+	}
+	return out
+}
+
+// profileModeConfig is cfg for a profile worker. The persona supplies the
+// tool flags, so the base argv carries none, and the delegate tool is not
+// among them, so no delegate socket is bound for a harness that would never
+// be told of it.
+func profileModeConfig(cfg workeradapter.Config) workeradapter.Config {
+	cfg.HarnessCommand = profileHarnessCommand()
+	cfg.HarnessCommandNoDelegate = nil
+	cfg.DelegateSocket = ""
+	return cfg
+}
+
 // configFromEnv is the whole environment contract in one place, split out of
 // run so a test can reach it: run's next move is to chdir and dial, so every
 // assertion about what the environment maps to had to be made against a
@@ -205,8 +288,11 @@ func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 	taskID := os.Getenv("TASK_ID")
 	profile := os.Getenv("PROFILE")
 	natsURL := os.Getenv("NATS_URL")
-	if taskID == "" || profile == "" || natsURL == "" {
-		log.Error("TASK_ID, PROFILE, and NATS_URL are required (spec-subagent-profiles.md env contract)")
+	// A profile worker learns each task from the dispatcher's offer, so it
+	// starts with no TASK_ID.
+	profileWorker := os.Getenv(lib.EnvProfileWorker) == "true"
+	if (taskID == "" && !profileWorker) || profile == "" || natsURL == "" {
+		log.Error("TASK_ID, PROFILE, and NATS_URL are required (spec-subagent-profiles.md env contract); a profile worker needs no TASK_ID")
 		return workeradapter.Config{}, false
 	}
 
@@ -380,10 +466,7 @@ func harnessCommand() []string {
 		// and speaks MCP to it over stdio; strictMCPConfigFlag above keeps a
 		// stray project or user MCP config from adding tools the gateway
 		// never vetted.
-		self, err := os.Executable()
-		if err != nil || self == "" {
-			self = "/usr/local/bin/worker-adapter"
-		}
+		self := selfPath()
 		sock := workeradapter.DelegateSocketPath()
 		mcpCfg, _ := json.Marshal(map[string]any{workeradapter.MCPServersKey: map[string]any{
 			workeradapter.DelegateMCPServer: map[string]any{
@@ -396,6 +479,43 @@ func harnessCommand() []string {
 	}
 	if len(prompts) > 0 {
 		argv = append(argv, "--append-system-prompt", strings.Join(prompts, "\n\n"))
+	}
+	if extra := os.Getenv("A2A_HARNESS_EXTRA_ARGS"); extra != "" {
+		argv = append(argv, strings.Fields(extra)...)
+	}
+	return argv
+}
+
+// profileHarnessCommand is a profile worker's base argv: the harness over the
+// headless stream-json contract, the model and the turn budget, and no tool,
+// MCP or settings flags. The worker appends the persona's rendering of those
+// for each task (worker-adapter/profile.go), and a second copy here would
+// leave the harness to pick between two allowlists. A2A_HARNESS_CMD still
+// overrides it whole, for tests.
+func profileHarnessCommand() []string {
+	if cmd := os.Getenv("A2A_HARNESS_CMD"); cmd != "" {
+		return strings.Fields(cmd)
+	}
+	path := os.Getenv("A2A_HARNESS_PATH")
+	if path == "" {
+		path = workeradapter.DefaultHarnessPath
+	}
+	model := os.Getenv("A2A_MODEL")
+	if model == "" {
+		model = defaultModel
+	}
+	maxTurns := os.Getenv("A2A_MAX_TURNS")
+	if maxTurns == "" {
+		maxTurns = defaultMaxTurns
+	}
+	argv := []string{
+		path,
+		"--print",
+		"--output-format", "stream-json",
+		"--input-format", "stream-json",
+		"--verbose",
+		"--model", model,
+		"--max-turns", maxTurns,
 	}
 	if extra := os.Getenv("A2A_HARNESS_EXTRA_ARGS"); extra != "" {
 		argv = append(argv, strings.Fields(extra)...)
@@ -574,7 +694,7 @@ func readPrimer(log *slog.Logger) string {
 	if path == "" {
 		return ""
 	}
-	b, err := os.ReadFile(path) // #nosec G304 -- the spawner's own mount path
+	b, err := os.ReadFile(path) // #nosec G304 G703 -- the spawner's own mount path (lib.EnvPrimerFile)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			log.Warn("could not read the transcript primer; this turn runs without the conversation so far", "path", path, "error", err)
@@ -582,4 +702,23 @@ func readPrimer(log *slog.Logger) string {
 		return ""
 	}
 	return string(b)
+}
+
+// envOrDefault is the variable's value, or def when it's unset.
+func envOrDefault(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+// selfPath is this binary's path, for the harness to launch it again as an
+// MCP server (`mcp`, `mcp-relay`): the image's install path when the running
+// executable can't be found.
+func selfPath() string {
+	self, err := os.Executable()
+	if err != nil || self == "" {
+		return "/usr/local/bin/worker-adapter"
+	}
+	return self
 }

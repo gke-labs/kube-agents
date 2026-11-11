@@ -25,6 +25,13 @@ STATUS_TOOL = "kanban_show"
 # kind ``kanban_block`` records for it.
 BLOCKED_STATUS = "blocked"
 NEEDS_INPUT_KIND = "needs_input"
+#: Run outcomes whose ``summary`` is a hand-off, not an answer: the worker ran
+#: out of its iteration budget (``timed_out``), or did so on the attempt that
+#: tripped the card's failure limit (``gave_up``). The image's budget hand-off
+#: (``deploy/docker/patches/kanban_guardrail_exit.py``) saves the worker's
+#: partial notes there for the next worker; the bench must not grade them as
+#: the card's delivered result.
+HANDOFF_RUN_OUTCOMES = frozenset({"timed_out", "gave_up"})
 
 RATE_LIMIT_REASON_PREFIX = "provider rate limit: API retries exhausted"
 _FAILURE_REASON_PATTERN = re.compile(r"\bfailure_reason=([a-zA-Z0-9_]+)\b")
@@ -372,6 +379,10 @@ def delivered_results(trajectory: list[dict[str, Any]], task_ids: list[str]) -> 
                 if isinstance(summary, str) and summary.strip():
                     status = str(shown.get("status") or "")
                     if status == "triage" and extract_infra_failure_reason(summary):
+                        continue
+                    # A run the budget ended carries the worker's hand-off as
+                    # its summary; the card has no answer yet.
+                    if str(last_run.get("outcome") or "") in HANDOFF_RUN_OUTCOMES:
                         continue
                     delivered[task_id] = summary
     return delivered

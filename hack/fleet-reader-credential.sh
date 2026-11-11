@@ -108,7 +108,7 @@ token="$(gcloud auth print-access-token --impersonate-service-account="$SA" 2>"$
   _die "could not mint a token for ${SA}: $(tr '\n' ' ' <"$errors")"
 
 [ -n "$token" ] || _die "gcloud returned an empty token for ${SA}"
-printf '%s' "$token" | LC_ALL=C grep -q "$TOKEN_CHARSET" &&
+LC_ALL=C grep -q "$TOKEN_CHARSET" <<<"$token" &&
   _die "what gcloud returned for ${SA} is not a bare access token; refusing to emit it"
 
 # Written to a temporary file in the cache's own directory and moved into

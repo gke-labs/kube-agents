@@ -39,6 +39,11 @@ on:
       # This job runs `make -C k8s-operator envtest-path`, so it depends on
       # that Makefile as surely as on its own sources.
       - "k8s-operator/Makefile"
+      # The gosec step builds the scanner from the operator's pin, so a gosec
+      # bump there runs the scan here, instead of leaving a new finding for
+      # the next a2a pull request to inherit.
+      - "k8s-operator/go.mod"
+      - "k8s-operator/go.sum"
       # cmd/session-persona's tests read these from outside the module: the
       # cluster skills the worker image ships a session copy of, and the
       # broker policy the session's read tables must stay a subset of. An
@@ -47,20 +52,23 @@ on:
       - "agents/platform/scripts/command_policy.py"
       - "agents/platform/scripts/credential_proxy.py"
       # lib/persona/claudecode's cluster persona tests read the persona, the
-      # cluster skills its copies must match, and the two scripts its skills
-      # carry byte-identical copies of; cmd/session-persona's
+      # cluster skills its copies must match, the two scripts its skills
+      # carry byte-identical copies of, and mcp_policy.py, whose
+      # PROFILE_SERVER_TOOLS bounds its servers; cmd/session-persona's
       # TestSourceSkillsTeachNoWrites reads the persona's skills too. An edit
       # to any of them alone has to run those tests.
       - "agents/cluster/persona/**"
       - "agents/platform/scripts/stall_report.py"
       - "agents/platform/skills/gke-workload-security/scripts/audit_cluster.sh"
+      - "agents/platform/scripts/mcp_policy.py"
       # hermes-bridge's incident_test.go reads the incident_context hook to
       # keep the bridge's copy of its frame and token list in step; an edit
       # to the hook alone has to run that test.
       - "agents/platform/plugins/incident_context/**"
-      # lib/chatmsg validates every shared chat case, so a case-only change
-      # has to run it.
+      # lib/chatmsg validates every shared chat case, and lints every shared
+      # lint case, so a case-only change has to run it.
       - "tests/conformance/chat/**"
+      - "tests/conformance/chat-ux/**"
   workflow_dispatch:
 
 # A re-push supersedes this pull request's earlier run instead of stacking a
@@ -110,14 +118,18 @@ jobs:
               - "a2a/**"
               - ".github/workflows/a2a-test.yml"
               - "k8s-operator/Makefile"
+              - "k8s-operator/go.mod"
+              - "k8s-operator/go.sum"
               - "agents/cluster/skills/**"
               - "agents/platform/scripts/command_policy.py"
               - "agents/platform/scripts/credential_proxy.py"
               - "agents/cluster/persona/**"
               - "agents/platform/scripts/stall_report.py"
               - "agents/platform/skills/gke-workload-security/scripts/audit_cluster.sh"
+              - "agents/platform/scripts/mcp_policy.py"
               - "agents/platform/plugins/incident_context/**"
               - "tests/conformance/chat/**"
+              - "tests/conformance/chat-ux/**"
 
       - name: Set up Go
         if: steps.filter.outputs.a2a == 'true'
@@ -125,7 +137,10 @@ jobs:
         with:
           go-version-file: "a2a/go.mod"
           cache: true
-          cache-dependency-path: "a2a/go.sum"
+          # Both modules: the gosec step below builds from the operator's.
+          cache-dependency-path: |
+            a2a/go.sum
+            k8s-operator/go.sum
 
       # This job fetches the same envtest binaries as the operator's, through
       # envtest-path, and on the same unretried path that failed a pull request
@@ -181,6 +196,22 @@ jobs:
             echo "go install of the nats CLI: attempt $attempt of $attempts failed; retrying in ${delay}s"
             sleep "$delay"; attempt=$((attempt + 1)); delay=$((delay * 2))
           done
+
+      # gosec runs inside this required check rather than in a workflow of its
+      # own: the `main-merge-queue` ruleset requires this check and not
+      # `Security Scanning`, so a finding here fails a check no pull request
+      # can merge around, where a red elsewhere holds nothing. This module
+      # declares no gosec of its own, so the binary is built from
+      # k8s-operator/go.mod's pin. No exclusions: every finding the scan
+      # reported on first run is annotated at its line with the reason, which
+      # keeps each rule armed for the next line. `make gosec` runs the same
+      # scan locally.
+      - name: Run gosec
+        if: steps.filter.outputs.a2a == 'true'
+        run: |
+          go -C k8s-operator build -o "$RUNNER_TEMP/gosec" github.com/securego/gosec/v2/cmd/gosec
+          cd a2a
+          "$RUNNER_TEMP/gosec" ./...
 
       - name: Run Tests
         if: steps.filter.outputs.a2a == 'true'

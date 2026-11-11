@@ -144,6 +144,13 @@ type metrics struct {
 	fleetPods            prometheus.Gauge
 	fleetMaxClusterPods  prometheus.Gauge
 	fleetShapeClusters   *prometheus.GaugeVec
+	// alertExcludeRules is the number of alert-exclude rules in force, and
+	// alertExcludeRefused is 1 when --alert-exclude, or the last change to
+	// --alert-exclude-file, was refused, which an alert can read where the
+	// ALERT log line cannot be. loadAlertExclude sets both at start, and
+	// reloadAlertExcludeFile again on each change to the file.
+	alertExcludeRules   prometheus.Gauge
+	alertExcludeRefused prometheus.Gauge
 }
 
 // newMetrics instantiates and registers all watcher metrics using a custom registry.
@@ -200,7 +207,7 @@ func newMetrics() *metrics {
 		}, []string{"cluster", "project", "location", "reason", "namespace"}),
 		settleOutcomes: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_settle_outcomes_total",
-			Help: "Settle-family keys a gate stopped (the settle gate or a count gate), by what became of them: forwarded once a later sighting was accepted, or self_resolved once the key went unsighted for the settle period plus the slack. Settle-held sightings themselves are events_filtered_total{gate=\"settle\"}.",
+			Help: "Settle-family keys a gate stopped (the settle gate or a count gate), by what became of them: forwarded once a later sighting in the family was accepted, or self_resolved once the key went unsighted for the settle period plus the slack. Settle-held sightings themselves are events_filtered_total{gate=\"settle\"}.",
 		}, []string{"cluster", "project", "location", "reason", "outcome"}),
 		followups: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_followups_total",
@@ -289,6 +296,14 @@ func newMetrics() *metrics {
 			Name: "k8s_event_watcher_fleet_max_cluster_pods",
 			Help: "The largest single cluster's pod count in the last fleet-shape probe.",
 		}),
+		alertExcludeRules: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "k8s_event_watcher_alert_exclude_rules",
+			Help: "Alert-exclude rules in force, from --alert-exclude or --alert-exclude-file: events they match open no incident. 0 with no rules and when the list at startup was refused.",
+		}),
+		alertExcludeRefused: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "k8s_event_watcher_alert_exclude_refused",
+			Help: "1 when --alert-exclude, or the last change to --alert-exclude-file, was refused as malformed: the watcher runs with no rules, or with the file's rules from before that change. 0 otherwise.",
+		}),
 		fleetShapeClusters: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "k8s_event_watcher_fleet_shape_clusters",
 			Help: "Clusters in the last fleet-shape probe by outcome: counted (every read answered; in the totals) or failed (a describe or a list failed or timed out; left out of the totals, so a failed count above 0 means the totals are partial). counted=0 and failed=0 is no probe finished yet.",
@@ -325,6 +340,8 @@ func newMetrics() *metrics {
 		m.fleetPods,
 		m.fleetMaxClusterPods,
 		m.fleetShapeClusters,
+		m.alertExcludeRules,
+		m.alertExcludeRefused,
 	)
 	return m
 }

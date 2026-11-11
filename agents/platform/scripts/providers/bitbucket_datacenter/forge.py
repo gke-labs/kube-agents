@@ -119,6 +119,9 @@ def _allowed_prefix(host: str, path: str) -> str:
 
 class BitbucketDataCenterForge(Forge):
     name = "bitbucket-datacenter"
+    # `quota_from_headers` stays the default, unknown: no quota headers for
+    # this forge are documented here, and none are guessed, so the readings
+    # sweep paces it on its hourly budget alone (#4615).
     proposal_noun = "pull request"
     verbs = (
         "proposal-create",

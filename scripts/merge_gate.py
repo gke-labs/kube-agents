@@ -89,7 +89,7 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
-from github_api import PER_PAGE, GitHubAPI, log  # noqa: E402
+from github_api import PER_PAGE, GitHubAPI, has_marker_comment, log  # noqa: E402
 
 #: The queue is `main`'s alone; a release line still merges through Tide.
 BASE = "main"
@@ -122,10 +122,25 @@ HOLD_LABELS = (
 STICKY_LGTM_TEAM = "gke-labs/Googlers"
 #: `skip_if_only_changed` of `pull-kube-agents-smoke-test` in oss-test-infra
 #: `prow/prowjobs/gke-labs/kube-agents/kube-agents-presubmits.yaml`. Keep the two identical.
+#: It names only paths the eval never reads, so a new folder runs the eval until it is added
+#: here; past the folders, only `_test.go`, `check_*.py` and `print_instructions_*.sh` match new
+#: files. `test_smoke_skip_paths.py` fails if it covers anything the presubmit reads.
 SMOKE_SKIP_RE = re.compile(
-    r"^(docs/|\.github/|examples/|tests/|scripts/release/|scripts/eval_dashboard/)"
-    r"|^scripts/test_[^/]+\.py$|^[^/]+\.md$"
-    r"|^(LICENSE|OWNERS|OWNERS_ALIASES|\.gitignore|install\.sh|upgrade\.sh|uninstall\.sh)$"
+    r"^(docs/|\.github/|\.agents/|\.claude/|examples/|tests/|admin_console/|terraform/"
+    r"|agents/contributor/|bench/cuj/|bench/dashboard/|bench/tests/"
+    r"|hack/slack-live-check/|scripts/dev/|scripts/eval_dashboard/|scripts/feedback_form/"
+    r"|scripts/release/|scripts/testdata/)"
+    r"|^scripts/test_[^/]+\.py$|_test\.go$|^[^/]+\.md$|^(hack|scripts)/[^/]+\.md$"
+    r"|^hack/(ci-dashboard-refresh\.sh|conformance-mutations\.py|pool_pressure_cron\.sh"
+    r"|slack-live-check-run\.sh)$"
+    r"|^scripts/(case_owner|check_[a-z_]+|classify_risk|domain_allowlist|domain_coverage"
+    r"|eval_rosters|generate_docs|github_api|hold_unresolved_threads|merge_gate"
+    r"|notify_broken_main|notify_flaky_check|pool_pressure|request_reviewers|rerun_failed_checks"
+    r"|skill_overlay|sync-upstream-skills)\.py$"
+    r"|^scripts/installer/(README\.md|common\.sh|installer_common\.sh|min_versions\.sh"
+    r"|print_instructions_[a-z]+\.sh)$"
+    r"|^(LICENSE|OWNERS|OWNERS_ALIASES|\.gitignore|install\.sh|upgrade\.sh|uninstall\.sh"
+    r"|install\.defaults\.env|install\.env\.example|requirements-test\.txt)$"
 )
 #: GitHub lists at most this many files for a pull request; a list that long may be cut short.
 FILES_CEILING = 3000
@@ -609,8 +624,7 @@ def comment_left_out(api, pull, line, dry_run=False):
     path = f"/repos/{api.repo}/issues/{pull['number']}/comments"
     try:
         # The marker comment is newer than the removal, so only comments since then can hold it.
-        since = f"{path}?since={removed}" if removed else path
-        if any((comment.get("body") or "").startswith(marker) for comment in api.get_all(since)):
+        if has_marker_comment(api, pull["number"], marker, since=removed):
             return f"#{pull['number']}: left-out comment already posted"
         if not dry_run:
             body = left_out_comment(pull, marker, line)

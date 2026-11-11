@@ -67,6 +67,14 @@ const (
 	sessionKVDBPath             = "/var/lib/kube-agents/session/session_kv.db"
 	defaultAgentHome            = "/opt/data"
 	defaultStorageSize          = "5Gi"
+	// incidentWorkloadDedupDefaultSeconds is the default INCIDENT_WORKLOAD_DEDUP_SECONDS:
+	// the seconds an admitted event folds its workload's later events into
+	// one incident (session_kv_server.py). Rendered into the platform
+	// container so the window is on for every install and visible on the
+	// Deployment; the daemon's own fallback is the same hour. A
+	// spec.deployment.env entry replaces it (mergeEnvVars), and "0" turns
+	// folding off.
+	incidentWorkloadDedupDefaultSeconds = "3600"
 	// credentialProxyMaxOutputBytes caps each stream a brokered command returns,
 	// and what the broker keeps of it while the command runs;
 	// credentialProxyMaxConcurrentCommands caps how many commands run at once.
@@ -154,7 +162,21 @@ const (
 	// online, where the StorageClass allows expansion. install.defaults.env and
 	// the Terraform variable carry the same default, and a test pins them equal.
 	agentDataStorageSize = "50Gi"
-	credentialProxyPort  = 8765
+	// dataVolumeBaseSize and perClusterProfileStorage size the agent's data
+	// claim by spec.storage.expectedClusterProfiles: base + N x per-profile,
+	// rounded up to whole GiB (ResolveAgentDataStorageSize). Both are measured
+	// for Hermes' session store at the default 90-day retention
+	// (hack/session_retention_sim.py; results on gke-labs/kube-agents#3704):
+	//   - per profile: a fleet-average Cluster Agent profile's ceiling, 86 MiB of
+	//     live sessions x slack 4.0 = 345 MiB (measured settled: 291 MiB), plus
+	//     Hermes' log cap for two log names (40 MiB) and the scaffold, rounded up;
+	//   - base: the Platform Agent profile's ceiling (5.45 GiB, settled 3.47 GiB),
+	//     the machine home's store, kanban and caches (about 0.14 GiB measured),
+	//     plus 25%, rounded up.
+	// Re-measure both if the session store or the retention default changes.
+	dataVolumeBaseSize       = "8Gi"
+	perClusterProfileStorage = "400Mi"
+	credentialProxyPort      = 8765
 	// The Chat consumers' broker env: the project id both carry, the legacy
 	// consumer's subscription name, and the fully qualified subscription
 	// form both consumers' env carries.
@@ -268,6 +290,20 @@ const (
 	// in bytes, so it can set the Go runtime's soft limit to a share of it. The
 	// watcher reads it under the same name (cmd/k8s-event-watcher/main.go).
 	eventWatcherMemoryLimitEnv = "EVENT_WATCHER_MEMORY_LIMIT_BYTES"
+	// watcherAlertExcludeEnv carries spec.harness.eventWatcher.alertExclude to
+	// the watcher as JSON; start-services.sh passes it as --alert-exclude when
+	// watcherAlertExcludeFileEnv is unset.
+	watcherAlertExcludeEnv = "WATCHER_ALERT_EXCLUDE"
+	// watcherAlertExcludeFileEnv names the mounted file that holds the same
+	// JSON; start-services.sh passes it as --alert-exclude-file.
+	watcherAlertExcludeFileEnv = "WATCHER_ALERT_EXCLUDE_FILE"
+	// eventWatcherAlertExcludeSuffix names the ConfigMap that holds the
+	// rules, after the agent's name; eventWatcherAlertExcludeKey is its one
+	// key, and the file's name in eventWatcherAlertExcludeMountPath.
+	eventWatcherAlertExcludeSuffix    = "-event-watcher-alert-exclude"
+	eventWatcherAlertExcludeKey       = "rules.json"
+	eventWatcherAlertExcludeVolume    = "event-watcher-alert-exclude"
+	eventWatcherAlertExcludeMountPath = "/etc/kube-agents/event-watcher"
 	// containerMemoryLimitResource is the Downward API resource selector for
 	// a container's own memory limit.
 	containerMemoryLimitResource = "limits.memory"
@@ -790,6 +826,15 @@ func renderManagedEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agentPlugins
 	// (docs/designs/spec-mode-switch.md).
 	add(kubeagentsModeEnvKey, string(renderMode(agent, "settings")))
 
+	// The earned-autonomy switches, unconditional for the reason the chat keys
+	// are: a switch left out because it is off is one the agent could turn on
+	// with a line in the PVC .env. Normalised to a value the switch knows, else
+	// "off". Pinned here rather than on the container env, as the mode is, and
+	// read from this file by agents/platform/scripts/kubeagents_switches.py.
+	for _, name := range autonomySwitchNames {
+		add(name, autonomySwitchValue(agent, name))
+	}
+
 	// The scope path, pinned for the same reason as HERMES_HOME_MODE: the container env
 	// is the layer a line in the PVC .env outranks, and the reconcile is a cron script
 	// that inherits the gateway's environment after that file is applied. Without the
@@ -1219,12 +1264,47 @@ const clusterProfileClassKey = "profileclass-cluster" + profileOverlaySuffix
 // (deploy/docker/patches/kanban_priority.py), and the four between are shared. A worker
 // measured about 430 MiB, so six are about 2.6 GiB over the 1.8 GiB idle set, under the
 // gateway's 8Gi limit (resolveResources), with room for waiting coordinators, which stay
-// resident without holding a slot. The credential proxy's 2Gi default admits nine
+// resident without holding a slot. The credential proxy's 2Gi default admits ten
 // brokered commands at once (credentialProxyAdmittedRequests; the slot cap holds it to
 // eight, shared with the listing pools).
 // TestCredentialProxyBudgetArithmeticAtTheDefaults fails if the proxy's default stops
 // admitting at least this many.
 const defaultKanbanMaxInProgress = 6
+
+// The defaults for spec.harness.tuning.admission, the memory admission the kanban
+// dispatcher applies to its own workers. resolveKanbanAdmission renders the block
+// into the managed scope on every install, so the dispatcher never runs without
+// one. The budget has no constant: unset, it is the agent container's resolved
+// memory request in MiB (agentMemoryRequestMiB), the figure the kubelet evicts the
+// pod against under node pressure, so a CR that raises the request raises the
+// budget with it.
+//
+// The worker cap is three and a half times the 430 MiB a worker measured on a live
+// install (resolveResources): a fleet-wide audit that holds a large listing fits,
+// and one worker cannot take the whole of the default 2048 MiB budget by itself.
+// The queue bound is 24 ticks at kanbanDispatchIntervalSeconds: long enough for a
+// worker that is finishing to give its slot back, short enough that the thread
+// that filed the card is told it is throttled before it gives up waiting. Closed is
+// the default for an unreadable memory sample because the counters go unreadable
+// on the installs the budget exists for: a sandbox runtime that hides the cgroup
+// files also hides the pressure, and an open tick there spawns into the eviction
+// the budget was meant to prevent.
+const (
+	defaultAdmissionWorkerRssCapMiB   = 1536
+	defaultAdmissionQueueBoundSeconds = 600
+	defaultAdmissionFailClosed        = true
+	// admissionMemoryBudgetFloorMiB is the least budget the operator renders, the
+	// CRD's Minimum on memoryBudgetMiB (common_types.go) applied to the derived
+	// figure too. A request the operator cannot read as a budget (a bare "2", a
+	// 256Mi, an explicit 0) would otherwise render 0, which the dispatcher reads
+	// as no budget and answers with upstream's meminfo guard, silently. At the
+	// floor the dispatcher still admits nothing on any measured container (the
+	// idle working set is above 512 MiB) and refuses every card after the queue
+	// bound; what the clamp buys is a refusal that names its figures in the log
+	// and in every reply, instead of a silent fallback. The CR is the place to
+	// fix the request.
+	admissionMemoryBudgetFloorMiB = 512
+)
 
 // defaultSessionRetentionDays is how long an ended session is kept when
 // spec.harness.retention.sessionDays says nothing: Hermes' own default
@@ -1242,6 +1322,18 @@ const defaultSessionRetentionDays = 90
 type managedSessionsConfig struct {
 	AutoPrune     bool `json:"auto_prune"`
 	RetentionDays int  `json:"retention_days"`
+}
+
+// managedKanbanAdmission is the `kanban.admission` block in the managed scope,
+// read by the dispatcher's spawn tick. Every key is rendered, defaults applied, so
+// the dispatcher reads one number per setting and never has to guess a default of
+// its own. No omitempty on fail_closed for the same reason: a false would drop the
+// key and read as whatever the reader falls back to.
+type managedKanbanAdmission struct {
+	MemoryBudgetMiB   int  `json:"memory_budget_mib"`
+	WorkerRssCapMiB   int  `json:"worker_rss_cap_mib"`
+	QueueBoundSeconds int  `json:"queue_bound_seconds"`
+	FailClosed        bool `json:"fail_closed"`
 }
 
 // resolveSessionRetentionDays is spec.harness.retention.sessionDays, or
@@ -1455,8 +1547,9 @@ var frontDoorPlugins = []string{
 // profile's config.yaml leaves the entrypoint's force-sync and is only back-filled, and the
 // back-fill never extends a list the live file already holds, so a plugin the image
 // enabled after that volume was first written stays off there. The front-door overlay
-// unions these in so the flag cannot hide one. pr_opened records each pull request a
-// worker opens on its card, which is what posts the thread's PR message.
+// unions these in so the flag cannot hide one. pr_opened claims each pull request record
+// through the broker, strips its token and writes the origin ledger; in a worker it also
+// records the pull request on the card, which is what posts the thread's PR message.
 var frontDoorBackfillPlugins = []string{
 	"pr_opened",
 }
@@ -1482,6 +1575,83 @@ func resolveKanbanMaxInProgress(agent *agentv1alpha1.PlatformAgent) int {
 		return *limits.MaxInProgress
 	}
 	return defaultKanbanMaxInProgress
+}
+
+// resolveKanbanAdmission is the live kanban.admission block: each field is the CR's
+// spec.harness.tuning.admission value where it sets one, else the operator's
+// default. The budget's default is derived from the agent container's resolved
+// memory request (agentMemoryRequestMiB); the others are the constants beside
+// defaultKanbanMaxInProgress. renderConfigYAML pins the block in the managed scope
+// next to max_in_progress, so it reaches every dispatch entry point the way the cap
+// does.
+func resolveKanbanAdmission(agent *agentv1alpha1.PlatformAgent) managedKanbanAdmission {
+	resolved := managedKanbanAdmission{
+		MemoryBudgetMiB:   agentMemoryRequestMiB(agent),
+		WorkerRssCapMiB:   defaultAdmissionWorkerRssCapMiB,
+		QueueBoundSeconds: defaultAdmissionQueueBoundSeconds,
+		FailClosed:        defaultAdmissionFailClosed,
+	}
+	tuning := agentTuning(agent)
+	if tuning == nil || tuning.Admission == nil {
+		return resolved
+	}
+	admission := tuning.Admission
+	if admission.MemoryBudgetMiB != nil {
+		resolved.MemoryBudgetMiB = int(*admission.MemoryBudgetMiB)
+	}
+	if admission.WorkerRssCapMiB != nil {
+		resolved.WorkerRssCapMiB = int(*admission.WorkerRssCapMiB)
+	}
+	if admission.QueueBoundSeconds != nil {
+		resolved.QueueBoundSeconds = int(*admission.QueueBoundSeconds)
+	}
+	if admission.FailClosed != nil {
+		resolved.FailClosed = *admission.FailClosed
+	}
+	return resolved
+}
+
+// agentMemoryRequestMiB is the agent container's memory request in whole MiB, as
+// the kubelet sees it: the CR's spec.deployment.resources request, else its limit
+// (a container that declares only a limit is given a request equal to it), else
+// the operator's default request (resolveResources). It is the default memory
+// budget for the dispatcher's admission because the kubelet evicts the pod under
+// node pressure once its usage passes this figure, whatever the limit says.
+func agentMemoryRequestMiB(agent *agentv1alpha1.PlatformAgent) int {
+	var deployment *agentv1alpha1.DeploymentSpec
+	if agent != nil {
+		deployment = agent.Spec.Deployment
+	}
+	resources := resolveResources(deployment)
+	mib, ok := memoryMiB(resources.Requests)
+	if !ok {
+		mib, ok = memoryMiB(resources.Limits)
+	}
+	if !ok {
+		mib, _ = memoryMiB(resolveResources(nil).Requests)
+	}
+	if mib < admissionMemoryBudgetFloorMiB {
+		name := ""
+		if agent != nil {
+			name = agent.Name
+		}
+		manifestsLog.Info("admission memory budget clamped to the floor: the agent container's memory request is below it",
+			"platformagent", name, "requestMiB", mib, "budgetMiB", admissionMemoryBudgetFloorMiB)
+		return admissionMemoryBudgetFloorMiB
+	}
+	return mib
+}
+
+// memoryMiB is the list's memory quantity in whole MiB, rounded down, and whether
+// the list carries one. An explicit zero is carried: the API defaults a request to
+// the limit only when the request is unset, so "0" is a request of zero, which the
+// floor clamp answers, not a missing one that the limit stands in for.
+func memoryMiB(list corev1.ResourceList) (int, bool) {
+	quantity, ok := list[corev1.ResourceMemory]
+	if !ok {
+		return 0, false
+	}
+	return int(quantity.Value() / bytesPerMiB), true
 }
 
 // frontDoorKanban renders the `kanban` subtree for the platform profile when the gateway
@@ -2102,9 +2272,11 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 		// declared (a2aActivityHook); absent otherwise, so a today
 		// install's config is unchanged.
 		Hooks *managedHooks `json:"hooks,omitempty"`
-		// The board-wide kanban worker cap. Always rendered; see where it is set.
+		// The board-wide kanban worker cap and the dispatcher's memory admission.
+		// Always rendered; see where they are set.
 		Kanban struct {
-			MaxInProgress int `json:"max_in_progress"`
+			MaxInProgress int                    `json:"max_in_progress"`
+			Admission     managedKanbanAdmission `json:"admission"`
 		} `json:"kanban"`
 		// Session retention, read by Hermes' own state.db auto-maintenance in every
 		// profile (cli.py and gateway/run.py: sessions.auto_prune / retention_days).
@@ -2183,6 +2355,14 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 	// became 6. A pin is applied over the persisted config on every load, whatever that
 	// file's history.
 	cfg.Kanban.MaxInProgress = resolveKanbanMaxInProgress(agent)
+	// The dispatcher's memory admission, beside the cap and pinned for the same
+	// reasons: the board is shared, every dispatch entry point reads its settings
+	// from whichever profile it runs as, and the failure it prevents (a pod evicted
+	// for passing its memory request under node pressure, workers and all) is one
+	// the agent cannot see coming. The budget follows the agent container's memory
+	// request, so a CR that raises the request raises the budget on the same
+	// reconcile.
+	cfg.Kanban.Admission = resolveKanbanAdmission(agent)
 	cfg.Sessions = managedSessionsConfig{AutoPrune: true, RetentionDays: resolveSessionRetentionDays(agent)}
 
 	cfg.Display.Platforms = map[string]map[string]any{}
@@ -2335,16 +2515,16 @@ func buildPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolumeClaim 
 			StorageClassName: storageClassName,
 			Resources: corev1.VolumeResourceRequirements{
 				Requests: corev1.ResourceList{
-					corev1.ResourceStorage: ResolveDataStorageSize(agent),
+					corev1.ResourceStorage: ResolveAgentDataStorageSize(agent),
 				},
 			},
 		},
 	}
 }
 
-// ResolveDataStorageSize is the size of the agent's data claim and of the
-// sandbox's data claim: spec.storage.size when it is set and above zero, and
-// agentDataStorageSize otherwise. The admission webhook refuses a value of zero
+// ResolveDataStorageSize is the size of the sandbox's data claim, and the floor
+// of the agent's (ResolveAgentDataStorageSize): spec.storage.size when it is
+// set and above zero, and agentDataStorageSize otherwise. The admission webhook refuses a value of zero
 // or less, but the chart ships the webhook off; the fallback keeps such a CR on
 // the default rather than on a claim the API server refuses to create.
 func ResolveDataStorageSize(agent *agentv1alpha1.PlatformAgent) resource.Quantity {
@@ -2352,6 +2532,28 @@ func ResolveDataStorageSize(agent *agentv1alpha1.PlatformAgent) resource.Quantit
 		return storage.Size.DeepCopy()
 	}
 	return resource.MustParse(agentDataStorageSize)
+}
+
+// ResolveAgentDataStorageSize is the size of the agent's own data claim:
+// ResolveDataStorageSize, raised to dataVolumeBaseSize + N x
+// perClusterProfileStorage (rounded up to whole GiB) when
+// spec.storage.expectedClusterProfiles sets N. It never comes out lower than
+// ResolveDataStorageSize, so the field can only grow the claim.
+func ResolveAgentDataStorageSize(agent *agentv1alpha1.PlatformAgent) resource.Quantity {
+	size := ResolveDataStorageSize(agent)
+	storage := agent.Spec.Storage
+	if storage == nil || storage.ExpectedClusterProfiles == nil || *storage.ExpectedClusterProfiles < 1 {
+		return size
+	}
+	base := resource.MustParse(dataVolumeBaseSize)
+	perProfile := resource.MustParse(perClusterProfileStorage)
+	need := base.Value() + int64(*storage.ExpectedClusterProfiles)*perProfile.Value()
+	const gib = int64(1) << 30
+	formula := resource.NewQuantity((need+gib-1)/gib*gib, resource.BinarySI)
+	if formula.Cmp(size) > 0 {
+		return *formula
+	}
+	return size
 }
 
 func buildSystemPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolumeClaim {
@@ -2925,6 +3127,10 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			Name:  "GITOPS_STATE_PATH",
 			Value: path.Join(gitopsStateDir, "managed_repos"),
 		},
+		{
+			Name:  "INCIDENT_WORKLOAD_DEDUP_SECONDS",
+			Value: incidentWorkloadDedupDefaultSeconds,
+		},
 	}
 
 	// Two of the three exceptions to "no credentials in the sandbox", and the
@@ -3443,12 +3649,14 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// so the agent-side callers that used to `hermes send` a proactive post
 	// route it to the gateway's chat.notify home channel instead. This names
 	// the platform they reroute; the bus identity above is what sends it.
-	// Only with a home channel the route posts to: otherwise every proactive
-	// post would be refused, and on a Chat-and-Slack install the agent would
-	// count Chat as a platform to post to ahead of Slack.
-	if a2aAgentSurface(agent) && a2aChatArmed(agent) && a2aGchatHomeSpace(agent) != "" {
+	// With a home channel the route posts; without one it refuses and keeps
+	// the post for the digest, so the route is named whenever the backend
+	// is the only platform the posts could reach (a2aGchatHomeRouted). On a
+	// Chat-and-Slack install with no Chat home the agent is not routed, so
+	// it does not count Chat as a platform to post to ahead of Slack.
+	if a2aAgentSurface(agent) && a2aGchatHomeRouted(agent) {
 		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyPlatformEnvVar, Value: a2aNotifyPlatformGchat})
-	} else if a2aAgentSurface(agent) && a2aSlackArmed(agent) && a2aSlackHomeChannel(agent) != "" {
+	} else if a2aAgentSurface(agent) && a2aSlackHomeRouted(agent) {
 		// Slack's half of the same rule: the Hermes slack platform is off
 		// when the gateway holds Slack (legacySlackConsumer), and Chat wins
 		// the single-backend gateway, so at most one platform is routed. Only
@@ -3461,7 +3669,9 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		// audit relay gates its report card on knowing a channel and records
 		// it on the incident's routing row. The Hermes slack platform is off
 		// here, so this arms nothing on the agent but those readers.
-		envVars = append(envVars, corev1.EnvVar{Name: agentSlackHomeChannelEnvVar, Value: a2aSlackHomeChannel(agent)})
+		if home := a2aSlackHomeChannel(agent); home != "" {
+			envVars = append(envVars, corev1.EnvVar{Name: agentSlackHomeChannelEnvVar, Value: home})
+		}
 	}
 	// A kanban card's report back to the gateway conversation it was filed
 	// in, and onboarding's first report into the conversation the user first
@@ -4256,22 +4466,14 @@ func asNativeSidecar(c corev1.Container) corev1.Container {
 }
 
 // resolveAgentAPIAuthResources merges the CR's spec.deployment.agentAPIAuth
-// override over the operator's defaults, one key at a time, so a CR that sets
-// only limits.memory keeps every other default. A nil override returns the
-// defaults unchanged, which the goldens and the chart's quota preflight carry.
-// ValidateAgentAPIAuthResources reads the same merged result.
-func resolveAgentAPIAuthResources(deployment *agentv1alpha1.DeploymentSpec) corev1.ResourceRequirements {
-	resolved := corev1.ResourceRequirements{
-		Requests: corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse(agentAPIAuthCPURequest),
-			corev1.ResourceMemory: resource.MustParse(agentAPIAuthMemoryRequest),
-		},
-		Limits: corev1.ResourceList{
-			corev1.ResourceCPU:              resource.MustParse(agentAPIAuthCPULimit),
-			corev1.ResourceMemory:           resource.MustParse(agentAPIAuthMemoryLimit),
-			corev1.ResourceEphemeralStorage: resource.MustParse(agentAPIAuthEphemeralStorageLimit),
-		},
-	}
+// override over the tier's row (agentAPIAuthTierResources; the small row is
+// the operator's defaults), one key at a time, so a CR that sets only
+// limits.memory keeps every other figure of the row. A nil override on the
+// small row returns the defaults unchanged, which the goldens and the chart's
+// quota preflight carry. ValidateAgentAPIAuthResources reads the same merged
+// result.
+func resolveAgentAPIAuthResources(deployment *agentv1alpha1.DeploymentSpec, tier sizingTier) corev1.ResourceRequirements {
+	resolved := agentAPIAuthTierResources(tier)
 	if deployment == nil || deployment.AgentAPIAuth == nil || deployment.AgentAPIAuth.Resources == nil {
 		return resolved
 	}
@@ -4429,7 +4631,7 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 		// delivered (watcher.go, Run). The event watcher reads the memory limit
 		// through EVENT_WATCHER_MEMORY_LIMIT_BYTES below and sets GOMEMLIMIT to
 		// half of it, so a raised limit raises the soft limit with no other change.
-		Resources: resolveAgentAPIAuthResources(agent.Spec.Deployment),
+		Resources: resolveAgentAPIAuthResources(agent.Spec.Deployment, renderedSizingTier(agent)),
 		VolumeMounts: []corev1.VolumeMount{
 			// No policy mount: the executor it configures is not built in this
 			// role, and a policy file here would only be misleading.
@@ -4445,6 +4647,9 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 			// The watchers' broker token. Here and in no other container of this
 			// Pod: the watcher role is what reaches the fleet through the broker.
 			{Name: watcherTokenVolume, MountPath: watcherTokenMountPath, ReadOnly: true},
+			// The alert-exclude rules. No subPath: a subPath mount never sees
+			// a change to the ConfigMap.
+			{Name: eventWatcherAlertExcludeVolume, MountPath: eventWatcherAlertExcludeMountPath, ReadOnly: true},
 		},
 		SecurityContext: securityContext,
 	}
@@ -4479,10 +4684,71 @@ func buildAgentAPIAuthEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 		{Name: watcherBrokerURLEnvVar, Value: credentialProxyBaseURL(agent)},
 		{Name: watcherBrokerTokenFileEnvVar, Value: watcherTokenMountPath + "/token"},
 	}
+	// The rules reach the watcher as a file from a ConfigMap, which the
+	// watcher reads again every minute, so a change to the list applies
+	// without rolling the pod (buildEventWatcherAlertExcludeConfigMap). The
+	// env takes the same key for an image whose entrypoint predates the file.
+	// Both are written whether or not the list is set, so setting the first
+	// rule or removing the last one changes no pod template either. Managed,
+	// so reserved by the merge below, except when the list is empty and
+	// spec.deployment.env sets WATCHER_ALERT_EXCLUDE: that entry, which the
+	// watcher read before this field existed, then applies as it did.
+	if eventWatcherAlertExclude(agent) != "" || !deploymentEnvSets(agent, watcherAlertExcludeEnv) {
+		envVars = append(envVars,
+			corev1.EnvVar{Name: watcherAlertExcludeEnv, ValueFrom: &corev1.EnvVarSource{ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: agent.Name + eventWatcherAlertExcludeSuffix},
+				Key:                  eventWatcherAlertExcludeKey,
+			}}},
+			corev1.EnvVar{Name: watcherAlertExcludeFileEnv, Value: eventWatcherAlertExcludeMountPath + "/" + eventWatcherAlertExcludeKey},
+		)
+	}
 	if agent.Spec.Deployment != nil {
 		envVars = mergeCredentialProxyEnv(envVars, agent.Spec.Deployment.Env)
 	}
 	return envVars
+}
+
+// deploymentEnvSets reports whether spec.deployment.env has an entry named name.
+func deploymentEnvSets(agent *agentv1alpha1.PlatformAgent, name string) bool {
+	if agent.Spec.Deployment == nil {
+		return false
+	}
+	for _, env := range agent.Spec.Deployment.Env {
+		if env.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// buildEventWatcherAlertExcludeConfigMap holds the alert-exclude rules for the
+// agent-api-auth container, as eventWatcherAlertExclude renders them, or ""
+// for none. It is mounted without subPath and is in no pod-template hash, so
+// the kubelet updates the file in place, usually within a minute, and the
+// watcher puts the change in force on its next read of the file.
+func buildEventWatcherAlertExcludeConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
+	return &corev1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      agent.Name + eventWatcherAlertExcludeSuffix,
+			Namespace: agent.Namespace,
+		},
+		Data: map[string]string{eventWatcherAlertExcludeKey: eventWatcherAlertExclude(agent)},
+	}
+}
+
+// eventWatcherAlertExclude renders spec.harness.eventWatcher.alertExclude as
+// the JSON list the watcher's --alert-exclude reads, or "" when it is empty.
+// The CRD's JSON keys are the watcher's, so the list is passed as it is.
+func eventWatcherAlertExclude(agent *agentv1alpha1.PlatformAgent) string {
+	harness := agent.Spec.Harness
+	if harness == nil || harness.EventWatcher == nil || len(harness.EventWatcher.AlertExclude) == 0 {
+		return ""
+	}
+	// A list of plain strings and one pointer to a struct of strings cannot
+	// fail to marshal.
+	rules, _ := json.Marshal(harness.EventWatcher.AlertExclude)
+	return string(rules)
 }
 
 // sessionKVApiKeySecretRef resolves the Secret key holding the bearer token for
@@ -4637,12 +4903,6 @@ func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agent
 	// listener reachable from outside its Pod with CREDENTIAL_PROXY_AUTH_MODE
 	// unset, so a broker rendered without these would crash-loop at boot rather
 	// than serve credentials to whoever reached the port.
-	//
-	// CREDENTIAL_PROXY_CONTENT_WORKSPACE has no field to turn it off. The Pods
-	// share no volume, so a working-tree clone in a directory the agent named is
-	// not something the broker can do at all — the fallback the flag guards
-	// elsewhere does not exist here, and an install that could switch it off
-	// would only be choosing to have the GitHub-writing skills fail.
 	envVars = append(envVars,
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_ROLE", Value: "broker"},
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_ENVOY_ADDRESS", Value: "0.0.0.0"},
@@ -4686,7 +4946,6 @@ func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agent
 	envVars = append(envVars,
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_KUBE_CA_FILE", Value: kubeAPIAccessMountPath + "/ca.crt"},
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_KUBE_TOKEN_FILE", Value: kubeAPIAccessMountPath + "/token"},
-		corev1.EnvVar{Name: "CREDENTIAL_PROXY_CONTENT_WORKSPACE", Value: "1"},
 	)
 	if harness := agent.Spec.Harness; harnessOnKind(harness) {
 		// kind: the proxy serves the cluster it runs in. Write its kubeconfig from the pod's service account mount --
@@ -4889,6 +5148,9 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		credentialProxyProfileIdentitiesEnvVar,
 		credentialProxyTaskSigningKeysEnvVar,
 		credentialProxyTaskCredentialMaxLifetimeEnvVar,
+		// The dispatcher's seed path, which no broker-side container
+		// reads; reserved so a CR can't hand one a seed file of its choosing.
+		a2aTaskSigningSeedFileEnvVar,
 		// One that could set the watcher audience would decide who holds the
 		// watcher role; one that could set the subscription would point the
 		// watcher relay at any subscription the broker's credential can pull;
@@ -5160,9 +5422,12 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 
 		// Seconds a workload's admitted event folds its later events into
 		// one incident (INCIDENT_WORKLOAD_DEDUP_SECONDS in
-		// session_kv_server.py). Parsed as a whole number and capped at a
-		// day, and a value that does not parse means off, so it bounds a
-		// count of chat messages and triage turns and reaches nothing else.
+		// session_kv_server.py). The container carries the default
+		// (incidentWorkloadDedupDefaultSeconds); an entry here replaces it,
+		// and "0" turns folding off. Parsed as a whole number and capped at a
+		// day, and a value that does not parse means the default, so it
+		// bounds a count of chat messages and triage turns and reaches
+		// nothing else.
 		"INCIDENT_WORKLOAD_DEDUP_SECONDS": {},
 
 		// "true" has an event triage also file a card that opens the
@@ -5172,6 +5437,13 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		// changes which cards the front door files and nothing else: the pull
 		// request still goes through submit-suggestion and a human merges it.
 		"INCIDENT_TRIAGE_OPEN_PULL_REQUEST": {},
+
+		// The most triage pull requests open or being opened at once while
+		// the switch above is on (INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS in
+		// session_kv_server.py). Parsed as a whole number, and a value that
+		// does not parse, is negative or is 0 means no limit, so it bounds a
+		// count of pull requests and reaches nothing else.
+		"INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS": {},
 
 		// How many Cluster Agent profiles one reconcile run scaffolds before it
 		// leaves the rest for the next run (MAX_CREATES_PER_RUN_ENV in
@@ -5190,6 +5462,28 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		// list_agents filter, and no value adds an agent, a path or a
 		// destination.
 		"KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD": {},
+
+		// The idle policy's two thresholds, in days
+		// (agents/chat/scripts/cron_idle_policy.py): after this many days
+		// without a chat message the dispatcher holds the Platform Agent's
+		// model-run cron jobs to once a window, and after the second it holds
+		// them until a message arrives. Each is parsed as a whole number; `0`
+		// turns its stage off and anything else means the default. A value
+		// changes only how often jobs already on the roster run, by moving
+		// their next_run_at in the profile's own store, and adds no job, path,
+		// destination or credential.
+		"CRON_IDLE_HIBERNATE_DAYS": {},
+		"CRON_IDLE_THROTTLE_DAYS":  {},
+
+		// The catch-up policy's step, in minutes
+		// (agents/chat/scripts/cron_catch_up_policy.py): after a pause the
+		// dispatcher skips a model-run cron job's catch-up when it is a whole
+		// period late and releases the rest this far apart. Parsed as a whole
+		// number; `0` turns the policy off and anything else means the
+		// default. Like the two above it changes only when jobs already on
+		// the roster run, by moving their next_run_at in the profile's own
+		// store, and adds no job, path, destination or credential.
+		"CRON_CATCH_UP_STAGGER_MINUTES": {},
 	}
 	// KAGE_SLACK_UX also gates Slack's agent-view manifest text and the
 	// default suggested prompts (`apply_slack_agent_view.py`), under the same
@@ -5254,7 +5548,7 @@ func buildCredentialProxyVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Vo
 		{Name: credentialProxyStateVolumeName, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse(credentialProxyStateSizeLimit))}}},
 		{Name: "credential-proxy-runtime", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory, SizeLimit: ptr.To(resource.MustParse("16Mi"))}}},
 		buildEventWatcherKubeconfigVolume(),
-		{Name: "credential-proxy-ksa-token", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+		{Name: brokerMinterVolume, VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
 			DefaultMode: ptr.To(int32(0400)),
 			Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
 				Audience: credentialProxyAudience, ExpirationSeconds: ptr.To(int64(3600)), Path: "token",
@@ -5978,8 +6272,28 @@ func buildDefaultVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
 	}
 }
 
+// agentAllowsSecretsRead returns false when spec.security.disallowSecretsRead is true.
+func agentAllowsSecretsRead(agent *agentv1alpha1.PlatformAgent) bool {
+	if agent != nil && agent.Spec.Security != nil && agent.Spec.Security.DisallowSecretsRead != nil {
+		return !*agent.Spec.Security.DisallowSecretsRead
+	}
+	return true
+}
+
 // buildMinimalPlatformRole generates the minimal read-only audit ClusterRole manifest
 func buildMinimalPlatformRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.ClusterRole {
+	return buildMinimalPlatformRoleWithSecrets(agent, agentAllowsSecretsRead(agent))
+}
+
+func buildMinimalPlatformRoleWithSecrets(agent *agentv1alpha1.PlatformAgent, allowSecretsRead bool) *rbacv1.ClusterRole {
+	coreResources := []string{
+		"nodes", "namespaces", "pods", "pods/log", "services", "endpoints",
+		"events", "persistentvolumes", "persistentvolumeclaims", "resourcequotas",
+		"limitranges", "configmaps", "serviceaccounts",
+	}
+	if allowSecretsRead {
+		coreResources = append(coreResources, "secrets")
+	}
 	return &rbacv1.ClusterRole{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "rbac.authorization.k8s.io/v1",
@@ -5991,7 +6305,7 @@ func buildMinimalPlatformRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Cluste
 		Rules: []rbacv1.PolicyRule{
 			{
 				APIGroups: []string{""},
-				Resources: []string{"nodes", "namespaces", "pods", "pods/log", "services", "endpoints", "events", "persistentvolumes", "persistentvolumeclaims", "resourcequotas", "limitranges", "configmaps", "serviceaccounts"},
+				Resources: coreResources,
 				Verbs:     []string{"get", "list", "watch"},
 			},
 			{

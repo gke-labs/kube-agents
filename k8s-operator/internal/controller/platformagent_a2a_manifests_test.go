@@ -24,7 +24,9 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	"maps"
 	"net"
+	"os"
 	"path"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -34,6 +36,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	sigsyaml "sigs.k8s.io/yaml"
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
@@ -48,6 +52,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	"k8s.io/client-go/tools/record"
 )
 
 func a2aTestAgent() *agentv1alpha1.PlatformAgent {
@@ -79,7 +84,7 @@ func a2aTestCreds() *corev1.Secret {
 func TestBuildA2ANATSConfig(t *testing.T) {
 	agent := a2aTestAgent()
 	keys := a2aTestCalloutKeys(t)
-	secret := buildA2ANATSConfigSecret(agent, a2aTestCreds(), keys)
+	secret := buildA2ANATSConfigSecret(agent, a2aTestCreds(), keys, nil)
 
 	if secret.Name != "test-agent-a2a-nats-config" {
 		t.Errorf("config secret name = %q", secret.Name)
@@ -275,7 +280,7 @@ func TestSystemUsersAckGrantsAreScopedPerStream(t *testing.T) {
 		}
 	}
 
-	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 	if strings.Contains(conf, `"$JS.ACK.>"`) {
 		t.Error("nats.conf still grants unscoped $JS.ACK.> to someone")
 	}
@@ -613,7 +618,7 @@ func TestHandleDeletionReapsOnlyTheLabeledJetStreamPVC(t *testing.T) {
 // reach beyond those. The read-only web rail is the consumer; kubectl
 // port-forward is the demo transport, which is why ClusterIP is enough.
 func TestBuildA2ANATSConfigWebsocketAndWebUser(t *testing.T) {
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 
 	if !strings.Contains(conf, "websocket {") {
 		t.Fatal("nats.conf has no websocket block")
@@ -662,6 +667,15 @@ func TestBuildA2ANATSConfigWebsocketAndWebUser(t *testing.T) {
 	// principals' resources. An exact list means any widening is a review
 	// conversation, which is the only control that actually holds here.
 	pub := rest[strings.Index(rest, "publish"):strings.Index(rest, "subscribe")]
+	// The deny list follows the allow list in the block (#4173): pinned on
+	// its own below, so the allow list here is the allow list alone.
+	pubDeny := ""
+	if i := strings.Index(pub, "deny"); i >= 0 {
+		pub, pubDeny = pub[:i], pub[i:]
+	}
+	if got := quotedLines(pubDeny); !reflect.DeepEqual(got, a2aTasksFixedDurableDenyPublish()) {
+		t.Errorf("publish deny-list changed.\n got: %q\nwant: %q", got, a2aTasksFixedDurableDenyPublish())
+	}
 	var got []string
 	for _, line := range strings.Split(pub, "\n") {
 		line = strings.TrimSpace(line)
@@ -713,7 +727,7 @@ func TestBuildA2ANATSConfigWebsocketAndWebUser(t *testing.T) {
 // EXACTLY for the same reason web's list is - the reach lives in request
 // bodies and wildcards, and a blocklist cannot see either.
 func TestBuildA2ANATSConfigConsoleUser(t *testing.T) {
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 
 	start := strings.Index(conf, "user: console")
 	if start < 0 {
@@ -728,6 +742,15 @@ func TestBuildA2ANATSConfigConsoleUser(t *testing.T) {
 	}
 
 	pub := rest[strings.Index(rest, "publish"):strings.Index(rest, "subscribe")]
+	// The deny list follows the allow list in the block (#4173): pinned on
+	// its own below, so the allow list here is the allow list alone.
+	pubDeny := ""
+	if i := strings.Index(pub, "deny"); i >= 0 {
+		pub, pubDeny = pub[:i], pub[i:]
+	}
+	if got := quotedLines(pubDeny); !reflect.DeepEqual(got, a2aTasksFixedDurableDenyPublish()) {
+		t.Errorf("publish deny-list changed.\n got: %q\nwant: %q", got, a2aTasksFixedDurableDenyPublish())
+	}
 	sub := rest[strings.Index(rest, "subscribe"):]
 	subDeny := ""
 	if i := strings.Index(sub, "deny"); i >= 0 {
@@ -774,8 +797,8 @@ func TestBuildA2ANATSConfigConsoleUser(t *testing.T) {
 	if !reflect.DeepEqual(gotSub, wantSub) {
 		t.Errorf("console subscribe allow-list changed.\n got: %q\nwant: %q", gotSub, wantSub)
 	}
-	// web's subtraction: `a2a.>` covers the verifier's queue group and dispatch offers.
-	if want := []string{"a2a.cap.>", "a2a.dispatch.>"}; !reflect.DeepEqual(gotSubDeny, want) {
+	// web's subtractions: `a2a.>` covers the verifier's queue group, dispatch offers and the stop records.
+	if want := []string{"a2a.cap.>", "a2a.dispatch.>", "a2a.stop.>"}; !reflect.DeepEqual(gotSubDeny, want) {
 		t.Errorf("console subscribe deny-list = %q, want %q", gotSubDeny, want)
 	}
 	// No verb on any KV_* stream, STREAM.INFO included: its subjects_filter
@@ -843,6 +866,8 @@ func TestBuildA2ANATSStatefulSetRollsOnConfigChange(t *testing.T) {
 // worker PR arms spawning. Anything more here is a finding; the pod-lifecycle
 // verbs land with their consumer in the worker PR.
 func TestBuildA2AGatewayIdentityAndOwnerWiring(t *testing.T) {
+	// The unelected Role; the Lease grant is pinned in the lease tests.
+	t.Setenv(a2aGatewayElectionEnvVar, "false")
 	agent := a2aTestAgent()
 
 	dep := buildA2AGatewayDeployment(agent)
@@ -1043,10 +1068,12 @@ func TestProbeTopicIsProvisionedAndWriterless(t *testing.T) {
 
 // Without this policy every pod in the cluster reaches 4222/8222/9222 while
 // the bus grants do the real refusing. The network layer now agrees with
-// them: 4222 from exactly the enumerated bus clients, and no pod-network
-// peer at all for 8222 (monitor) or 9222 (ws) — the demo port-forward and
-// the kubelet readiness probe both enter via the node, which NetworkPolicy
-// does not govern, and that is the decided posture rather than an accident.
+// them: 4222 from exactly the enumerated bus clients, 9222 (ws) from the
+// console server, and 8222 (monitor) from the operator's pod, and only when
+// the operator knows its own namespace, which this test's environment
+// doesn't set (TestTheMonitorPortAdmitsTheOperatorAlone covers that case).
+// The demo port-forward and the kubelet readiness probe both enter via the
+// node, which NetworkPolicy does not govern.
 func TestBuildA2ANATSNetworkPolicy(t *testing.T) {
 	np := buildA2ANATSNetworkPolicy(a2aTestAgent())
 
@@ -1309,7 +1336,7 @@ func TestGatewayIsToldAboutTheClusterViewOnlyUnderTheFlag(t *testing.T) {
 	}
 	t.Setenv(a2aSessionClusterViewEnvVar, "")
 	off := envOf()
-	for _, name := range []string{"A2A_SESSION_CLUSTER_VIEW", "A2A_CREDENTIAL_PROXY_URL"} {
+	for _, name := range []string{"A2A_SESSION_CLUSTER_VIEW", "A2A_CREDENTIAL_PROXY_URL", "A2A_KUBE_PROXY_URL", "A2A_KUBE_PROXY_CA_CONFIGMAP", "A2A_KUBE_PROXY_HOST_CONTEXT"} {
 		if _, ok := off[name]; ok {
 			t.Errorf("%s rendered with the flag off", name)
 		}
@@ -1321,6 +1348,15 @@ func TestGatewayIsToldAboutTheClusterViewOnlyUnderTheFlag(t *testing.T) {
 	}
 	if on["A2A_CREDENTIAL_PROXY_URL"].Value != credentialProxyBaseURL(agent) {
 		t.Errorf("A2A_CREDENTIAL_PROXY_URL = %+v, want %s", on["A2A_CREDENTIAL_PROXY_URL"], credentialProxyBaseURL(agent))
+	}
+	if on["A2A_KUBE_PROXY_URL"].Value != kubeProxyURL(agent) {
+		t.Errorf("A2A_KUBE_PROXY_URL = %+v, want %s", on["A2A_KUBE_PROXY_URL"], kubeProxyURL(agent))
+	}
+	if on["A2A_KUBE_PROXY_CA_CONFIGMAP"].Value != kubeProxyCABundleName(agent) {
+		t.Errorf("A2A_KUBE_PROXY_CA_CONFIGMAP = %+v, want %s", on["A2A_KUBE_PROXY_CA_CONFIGMAP"], kubeProxyCABundleName(agent))
+	}
+	if on["A2A_KUBE_PROXY_HOST_CONTEXT"].Value != hostClusterContextName(agent) {
+		t.Errorf("A2A_KUBE_PROXY_HOST_CONTEXT = %+v, want %s", on["A2A_KUBE_PROXY_HOST_CONTEXT"], hostClusterContextName(agent))
 	}
 }
 
@@ -1435,8 +1471,8 @@ func TestSessionNetworkPolicyReachesTheBrokerOnlyUnderTheFlag(t *testing.T) {
 	}
 	t.Setenv(a2aSessionClusterViewEnvVar, "true")
 	np := buildA2ASessionNetworkPolicy(agent, []string{"10.96.0.10"})
-	if len(np.Spec.Egress) != 4 {
-		t.Fatalf("flag on: %d egress rules, want 4", len(np.Spec.Egress))
+	if len(np.Spec.Egress) != 5 {
+		t.Fatalf("flag on: %d egress rules, want 5", len(np.Spec.Egress))
 	}
 	if len(np.Spec.Ingress) != 0 {
 		t.Fatalf("the view opened ingress: %+v", np.Spec.Ingress)
@@ -1448,6 +1484,14 @@ func TestSessionNetworkPolicyReachesTheBrokerOnlyUnderTheFlag(t *testing.T) {
 	if len(broker.To) != 1 || broker.To[0].PodSelector == nil ||
 		!reflect.DeepEqual(broker.To[0].PodSelector.MatchLabels, credentialProxySelector(agent)) {
 		t.Fatalf("broker rule peer = %+v, want the broker pod selector %v", broker.To, credentialProxySelector(agent))
+	}
+	kubeProxy := np.Spec.Egress[4]
+	if len(kubeProxy.Ports) != 1 || int32(kubeProxy.Ports[0].Port.IntValue()) != kubeProxyPort {
+		t.Fatalf("kube-proxy rule ports = %+v, want %d only", kubeProxy.Ports, kubeProxyPort)
+	}
+	if len(kubeProxy.To) != 1 || kubeProxy.To[0].PodSelector == nil ||
+		!reflect.DeepEqual(kubeProxy.To[0].PodSelector.MatchLabels, kubeProxySelector(agent)) {
+		t.Fatalf("kube-proxy rule peer = %+v, want the kube-proxy pod selector %v", kubeProxy.To, kubeProxySelector(agent))
 	}
 }
 
@@ -1558,18 +1602,135 @@ func TestBuildA2ASessionQuota(t *testing.T) {
 	if !ok {
 		t.Fatalf("quota does not bound pods: %v", hard)
 	}
-	// Default gateway cap 10 + the fixed headroom for the rest of the
-	// namespace (base stack, rollout surge, race overshoot).
-	if pods.Value() != 27 {
-		t.Fatalf("default quota = %d, want 27 (cap 10 + headroom 17)", pods.Value())
+	// The gateway's cap plus the derived headroom (#3848): what the operator
+	// renders for the agent, the chart's pods (the default for a CR the chart
+	// did not stamp), and the transient margin.
+	standing := a2aStandingPods(agent)
+	want := 10 + standing + a2aDefaultChartPods + a2aQuotaTransientMargin
+	if pods.Value() != want {
+		t.Fatalf("default quota = %d, want %d (cap 10 + standing %d + chart default %d + margin %d)",
+			pods.Value(), want, standing, a2aDefaultChartPods, a2aQuotaTransientMargin)
 	}
 
 	two := 2
 	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{MaxSessions: &two}}
 	pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]
-	if pods.Value() != 19 {
-		t.Fatalf("tuned quota = %d, want 19 (cap 2 + headroom 17)", pods.Value())
+	if want := 2 + standing + a2aDefaultChartPods + a2aQuotaTransientMargin; pods.Value() != want {
+		t.Fatalf("tuned quota = %d, want %d", pods.Value(), want)
 	}
+
+	// The MCP server is one more standing pod, only while its flag is on (#3869).
+	without := pods.Value()
+	t.Setenv(a2aMCPDoorEnvVar, "true")
+	if pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]; pods.Value() != without+1 {
+		t.Fatalf("tuned quota with the MCP server = %d, want %d (one more than without it)", pods.Value(), without+1)
+	}
+
+	// And the profile dispatcher, one more while its image is set (#4808).
+	t.Setenv(a2aDispatcherImageEnvVar, "example.com/dispatcher:1")
+	if pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]; pods.Value() != without+2 {
+		t.Fatalf("tuned quota with the MCP server and the dispatcher = %d, want %d (two more than without them)", pods.Value(), without+2)
+	}
+}
+
+// The chart's standing pods come from the annotation the chart stamps on the
+// CR; a CR without one, or with an unreadable one, gets the chart's default.
+func TestA2AQuotaCountsTheChartsPods(t *testing.T) {
+	base := a2aTestAgent()
+	quotaBase := int64(resolveA2AMaxSessions(base)) + a2aStandingPods(base) + a2aQuotaTransientMargin
+	for _, tc := range []struct {
+		name       string
+		annotation *string
+		want       int64
+	}{
+		{"the chart's count", ptr.To("7"), quotaBase + 7},
+		{"zero, for a chart that renders none here", ptr.To("0"), quotaBase},
+		{"trimmed", ptr.To(" 4 "), quotaBase + 4},
+		{"the default without the annotation", nil, quotaBase + a2aDefaultChartPods},
+		{"the default for an unreadable count", ptr.To("seven"), quotaBase + a2aDefaultChartPods},
+		{"the default for a negative count", ptr.To("-3"), quotaBase + a2aDefaultChartPods},
+		{"the cap itself", ptr.To(strconv.Itoa(a2aMaxChartPods)), quotaBase + a2aMaxChartPods},
+		{"the default past the cap", ptr.To(strconv.Itoa(a2aMaxChartPods + 1)), quotaBase + a2aDefaultChartPods},
+		{"the default for a figure that would wrap the quota", ptr.To("9223372036854775807"), quotaBase + a2aDefaultChartPods},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := a2aTestAgent()
+			if tc.annotation != nil {
+				agent.Annotations = map[string]string{a2aChartPodsAnnotation: *tc.annotation}
+			}
+			pods := buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]
+			if pods.Value() != tc.want {
+				t.Fatalf("quota = %d, want %d", pods.Value(), tc.want)
+			}
+		})
+	}
+}
+
+// An agent scaled to zero runs no agent pod, so it holds no slot of the
+// headroom; the rest of the stack still stands.
+func TestA2AStandingPodsDropTheAgentPodAtScaleToZero(t *testing.T) {
+	agent := a2aTestAgent()
+	running := a2aStandingPods(agent)
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{ScaleToZero: ptr.To(true)}
+	if got := a2aStandingPods(agent); got != running-1 {
+		t.Fatalf("a2aStandingPods at scaleToZero = %d, want %d", got, running-1)
+	}
+}
+
+// a2aStandingPods has to name every standing workload the operator renders in
+// next mode. The next-mode golden is the operator's own steady-state render of
+// the example CR, so a Deployment or StatefulSet added there and not here fails
+// this rather than quietly eating the session headroom (#3848).
+func TestA2AStandingPodsMatchTheNextModeGolden(t *testing.T) {
+	dir := filepath.Join("..", "testing", "testdata", "platform")
+	input, err := os.ReadFile(filepath.Join(dir, "platformagent-next.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent := &agentv1alpha1.PlatformAgent{}
+	if err := sigsyaml.Unmarshal(input, agent); err != nil {
+		t.Fatal(err)
+	}
+	golden, err := os.ReadFile(filepath.Join(dir, "expected", "platformagent-next.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rendered int64
+	var names []string
+	for _, doc := range strings.Split(string(golden), "\n---\n") {
+		var w struct {
+			Kind     string `json:"kind"`
+			Metadata struct {
+				Name string `json:"name"`
+			} `json:"metadata"`
+			Spec struct {
+				Replicas *int32 `json:"replicas"`
+			} `json:"spec"`
+		}
+		if err := sigsyaml.Unmarshal([]byte(doc), &w); err != nil {
+			t.Fatal(err)
+		}
+		if w.Kind != "Deployment" && w.Kind != "StatefulSet" {
+			continue
+		}
+		rendered += int64(ptr.Deref(w.Spec.Replicas, 1))
+		names = append(names, w.Kind+"/"+w.Metadata.Name)
+	}
+	if len(names) == 0 {
+		t.Fatal("no Deployment or StatefulSet found in the next-mode golden")
+	}
+	// The golden runs the gateway at the one replica it starts with: no pod
+	// holds the election's Lease there, so the scale-out to its standby (and a
+	// rollout's surge pod) never renders, and a2aGatewayStandbyPods counts them.
+	standby := a2aGatewayStandbyPods(agent)
+	if standby == 0 {
+		t.Fatal("the next-mode golden's CR runs no gateway standby, so this proves nothing about it")
+	}
+	if got := a2aStandingPods(agent); got != rendered+standby {
+		t.Fatalf("a2aStandingPods = %d, the next-mode golden runs %d pods across %v, plus %d for the gateway's standby",
+			got, rendered, names, standby)
+	}
+
 }
 
 // The CR field reaches the gateway as an explicit env value even when unset:
@@ -2162,16 +2323,20 @@ func remedyRecreateWidth(t *testing.T, message string) int {
 // clean pass run, and require the tree to be empty at the end rather than
 // merely error-free.
 func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
-	// With the dispatcher on, so its objects are rendered and the cleanup
-	// is held to deleting them too.
+	// With the dispatcher and the gateway's election on, so their objects
+	// are rendered and the cleanup is held to deleting them too.
 	t.Setenv(a2aDispatcherImageEnvVar, "registry.example/a2a-dispatcher:test")
+	t.Setenv(a2aGatewayElectionEnvVar, "true")
+	// And Job mode, so its objects in the profile namespace are rendered too.
+	t.Setenv(a2aDispatcherJobPolicyEnvVar, "true")
 	scheme := setupScheme()
 	agent := a2aTestAgent()
 
 	failRole := true
+	jobPolicy, jobBinding := shippedDispatcherJobPolicy(t)
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent, chartProfileNamespace(agent)).
+		WithObjects(agent, chartProfileNamespace(agent), jobPolicy, jobBinding).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(interceptor.Funcs{
 			Patch: fakeServerSideApplyInterceptors().Patch,
@@ -2204,12 +2369,45 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatalf("render: %v", err)
 	}
+	// The gateway's budget renders only once it's scaled out and both
+	// replicas are Ready, which takes a pod on its image holding the Lease,
+	// a pass to scale out, and a pass that reads the standby Ready.
+	electGateway(t, ctx, cl, agent)
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+		t.Fatalf("render after the election: %v", err)
+	}
+	gatewayReplicasReady(t, ctx, cl, agent, 2)
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+		t.Fatalf("render with the standby Ready: %v", err)
+	}
 	// Precondition: the profile namespace's half rendered, so its delete
 	// below proves something.
 	for _, obj := range []client.Object{&rbacv1.Role{}, &rbacv1.RoleBinding{}} {
 		if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-dispatcher", Namespace: "test-ns-profiles"}, obj); err != nil {
 			t.Fatalf("precondition: the dispatcher's pod-read %T in the profile namespace wasn't rendered: %v", obj, err)
 		}
+	}
+	// And Job mode's half: the Jobs Role and binding, the policy's index
+	// param, and a Job the dispatcher made (the fake runs no dispatcher).
+	for _, obj := range []client.Object{&rbacv1.Role{}, &rbacv1.RoleBinding{}} {
+		if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-dispatcher-jobs", Namespace: "test-ns-profiles"}, obj); err != nil {
+			t.Fatalf("precondition: the dispatcher's Jobs %T in the profile namespace wasn't rendered: %v", obj, err)
+		}
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Name: dispatchJobIndexName, Namespace: "test-ns-profiles"}, &agentv1alpha1.DispatchJobTemplate{}); err != nil {
+		t.Fatalf("precondition: the Job policy's index param wasn't rendered: %v", err)
+	}
+	if err := cl.Create(ctx, &batchv1.Job{ObjectMeta: metav1.ObjectMeta{
+		Name: "dispatch-1", Namespace: "test-ns-profiles", Labels: dispatchJobLabels(agent),
+	}}); err != nil {
+		t.Fatalf("precondition: create a dispatcher Job: %v", err)
+	}
+	// A Job with the marker but not this agent's labels isn't the
+	// dispatcher's, and stays.
+	if err := cl.Create(ctx, &batchv1.Job{ObjectMeta: metav1.ObjectMeta{
+		Name: "someone-elses", Namespace: "test-ns-profiles", Labels: map[string]string{dispatchJobLabel: "true"},
+	}}); err != nil {
+		t.Fatalf("precondition: create a foreign Job: %v", err)
 	}
 
 	// The render has to have produced what the cleanup is asked to remove.
@@ -2273,6 +2471,25 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 		if !errors.IsNotFound(err) {
 			t.Errorf("the dispatcher's pod-read %T in the profile namespace survived the cleanup (err=%v)", obj, err)
 		}
+	}
+	// Job mode's half, likewise unowned.
+	for _, tc := range []struct {
+		obj  client.Object
+		name string
+	}{
+		{&rbacv1.Role{}, "test-agent-a2a-dispatcher-jobs"},
+		{&rbacv1.RoleBinding{}, "test-agent-a2a-dispatcher-jobs"},
+		{&agentv1alpha1.DispatchJobTemplate{}, dispatchJobIndexName},
+		{&batchv1.Job{}, "dispatch-1"},
+	} {
+		err := cl.Get(ctx, types.NamespacedName{Name: tc.name, Namespace: "test-ns-profiles"}, tc.obj)
+		if !errors.IsNotFound(err) {
+			t.Errorf("Job mode's %T %s in the profile namespace survived the cleanup (err=%v)", tc.obj, tc.name, err)
+		}
+	}
+
+	if err := cl.Get(ctx, types.NamespacedName{Name: "someone-elses", Namespace: "test-ns-profiles"}, &batchv1.Job{}); err != nil {
+		t.Errorf("a Job without this agent's labels was deleted: %v", err)
 	}
 
 	// A third pass on the now-empty tree is the exit doing its job.
@@ -3686,7 +3903,7 @@ func TestNoAgentSidePrincipalCanPublishToTheDirectory(t *testing.T) {
 	// Third argument is this branch's: the callout's NKey seeds. #1313 wrote
 	// this test against the two-argument signature on main.
 	agent := a2aTestAgent()
-	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 	doc, err := renderA2AAuthMap(agent, nil)
 	if err != nil {
 		t.Fatalf("rendering the auth map: %v", err)
@@ -3788,8 +4005,8 @@ func TestA2AConfigRolloutHashOmitsCredentialsAndTracksRotation(t *testing.T) {
 
 	// Guard against an inert test: if the two creds rendered the same conf,
 	// an equal hash below would prove nothing.
-	confA := string(buildA2ANATSConfigSecret(agent, credsA, keys).Data["nats.conf"])
-	confB := string(buildA2ANATSConfigSecret(agent, credsB, keys).Data["nats.conf"])
+	confA := string(buildA2ANATSConfigSecret(agent, credsA, keys, nil).Data["nats.conf"])
+	confB := string(buildA2ANATSConfigSecret(agent, credsB, keys, nil).Data["nats.conf"])
 	if confA == confB {
 		t.Fatal("the two creds Secrets render the same nats.conf; the omission check below is inert")
 	}
@@ -4714,7 +4931,7 @@ func TestSeedGrantsAndProvisionScriptNameTheSameStreams(t *testing.T) {
 //     including the ones a2aSeedJetStreamGrants produced. That is the question
 //     the server asks, so a wildcard cannot grant a route without naming it.
 func TestSeedHoldsNoWholesaleJetStreamAPI(t *testing.T) {
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 
 	// Seed's publish allow-list exactly, not the span to the next user: the
 	// following block's explanatory comment names grants of its own, and a
@@ -4828,7 +5045,7 @@ func TestSeedHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 // (TestAgentHoldsOnlyTheBlackboard), and a change that gave either of them the
 // other's list would put `worker` back under a new name.
 func TestBridgeHoldsNoWholesaleJetStreamAPI(t *testing.T) {
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 	got := a2aGrantSubjects(t, conf, a2aBridgeUser, "publish")
 
 	if sub, want := a2aGrantSubjects(t, conf, a2aBridgeUser, "subscribe"), []string{
@@ -4874,7 +5091,8 @@ func TestBridgeHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		section string
 		want    []string
 	}{
-		{"publish", capDenyPublish},
+		// The cap bucket, and the pre-created TASKS durables' names (#4173).
+		{"publish", withTasksFixedDurableDeny(capDenyPublish)},
 		{"subscribe", capDenySubscribe},
 	} {
 		deny, ok := a2aGrantDenials(t, conf, a2aBridgeUser, tc.section)
@@ -4978,6 +5196,8 @@ func TestBridgeHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	allowedShapes["$JS.API.DIRECT.GET.TASKS.>"] = true
 	allowedShapes["$JS.API.CONSUMER.MSG.NEXT.TASKS.*"] = true
 	allowedShapes["$JS.API.CONSUMER.DELETE.KV_runtime-state.*"] = true
+	// The bind on its own pre-created intake (#4173), by exact name.
+	allowedShapes["$JS.API.CONSUMER.INFO.TASKS.bridge-platform"] = true
 	for _, grant := range a2aBridgeJetStreamGrants() {
 		if !allowedShapes[grant] {
 			t.Errorf("bridge holds JetStream API grant %q, which is outside the shapes a2aBridgeJetStreamGrants argues for", grant)
@@ -5145,7 +5365,7 @@ func TestBusGrantsNameStreamsTheProvisionScriptCreates(t *testing.T) {
 // $JS.API.STREAM.DELETE.TASKS, which the wildcard permitted and which was
 // measured deleting the stream on a live install.
 func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 	got := a2aGrantSubjects(t, conf, "gateway", "publish")
 
 	if sub, want := a2aGrantSubjects(t, conf, "gateway", "subscribe"), []string{
@@ -5159,6 +5379,10 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	want := []string{
 		"a2a.tasks.*.*.in",
 		"a2a.tasks.*.*.supervisor",
+		// A profile task's submission; the gateway is its one writer.
+		"a2a.submit.*.*.*.*",
+		// A profile task's stop record; the gateway is its one writer too.
+		"a2a.stop.*.*",
 		"$KV.session-state.>",
 		"$KV.feedback.>",
 		"$KV.people.>",
@@ -5172,6 +5396,9 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		"chat.board",
 	}
 	want = append(want, a2aGatewayJetStreamGrants()...)
+	// The profile cards' start-up read: the directory's subject list and a
+	// direct get per card subject, and no consumer.
+	want = append(want, "$JS.API.STREAM.INFO.DIRECTORY", "$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.*")
 	want = append(want, "$JS.ACK.TASKS.>", "$JS.FC.>", "_INBOX.gateway.>")
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("gateway publish allow-list changed.\n got: %q\nwant: %q", got, want)
@@ -5189,7 +5416,8 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		section string
 		want    []string
 	}{
-		{"publish", capDenyPublish},
+		// The cap bucket, and the pre-created TASKS durables' names (#4173).
+		{"publish", withTasksFixedDurableDeny(capDenyPublish)},
 		{"subscribe", capDenySubscribe},
 	} {
 		deny, ok := a2aGrantDenials(t, conf, "gateway", tc.section)
@@ -5229,11 +5457,10 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		forbidden = append(forbidden, "$JS.API.CONSUMER.INFO."+s+".x")
 	}
 	// Streams the gateway has no business on at all: not a read, not a
-	// consumer, not a direct get. The directory is the identity plane and
-	// the gateway reads it by subscribing to the cards; the topic streams
-	// are the blackboard, which nothing in a2a/gateway touches; the other
-	// two buckets are the bridge's and the capability envelope's.
-	for _, s := range []string{"DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL", "KV_runtime-state", "KV_cap"} {
+	// consumer, not a direct get. The topic streams are the blackboard,
+	// which nothing in a2a/gateway touches; the other two buckets are the
+	// bridge's and the capability envelope's.
+	for _, s := range []string{"TOPICS-STATE", "TOPICS-JOURNAL", "KV_runtime-state", "KV_cap"} {
 		forbidden = append(forbidden,
 			"$JS.API.STREAM.INFO."+s,
 			"$JS.API.CONSUMER.CREATE."+s+".x",
@@ -5245,6 +5472,21 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 			"$JS.API.DIRECT.GET."+s,
 		)
 	}
+	// The directory, the identity plane. The gateway follows the cards by
+	// subscribing, but subscribing alone misses cards published before it
+	// started, so it also reads them: the subject list, then DIRECT.GET on
+	// card subjects only. No consumer on it, and no direct get past the card
+	// subjects.
+	forbidden = append(forbidden,
+		"$JS.API.CONSUMER.CREATE.DIRECTORY.x",
+		"$JS.API.CONSUMER.CREATE.DIRECTORY.x.a2a.agents.platform",
+		"$JS.API.CONSUMER.DURABLE.CREATE.DIRECTORY.x",
+		"$JS.API.CONSUMER.MSG.NEXT.DIRECTORY.x",
+		"$JS.API.CONSUMER.DELETE.DIRECTORY.x",
+		"$JS.API.DIRECT.GET.DIRECTORY",
+		"$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.platform.x",
+		"$JS.API.DIRECT.GET.DIRECTORY.a2a.tasks.platform.task-0001.in",
+	)
 	forbidden = append(forbidden,
 		// A session pod's three consumers, and the bridge's durable: the
 		// gateway may create consumers on TASKS, and create-as-update
@@ -5295,6 +5537,8 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		"$JS.API.DIRECT.GET." + kvPeople + ".>":              true,
 		"$JS.API.CONSUMER.CREATE." + kvPeople + ".>":         true,
 		"$JS.API.CONSUMER.DELETE." + kvPeople + ".*":         true,
+		// The bind on its own pre-created relay (#4173), by exact name.
+		"$JS.API.CONSUMER.INFO." + a2aTasksStream + ".gateway-relay": true,
 	}
 	for _, grant := range a2aGatewayJetStreamGrants() {
 		if !allowedShapes[grant] {
@@ -5317,8 +5561,11 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 // this one is the cheap version that fails in milliseconds and says which
 // caller lost its route.
 func TestGatewayGrantCoversEveryJetStreamSubjectItsCallersEmit(t *testing.T) {
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 	grants := a2aGrantSubjects(t, conf, "gateway", "publish")
+	// A deny overrides an allow, so a subject the allow list covers and the
+	// deny list names is refused all the same.
+	denied, _ := a2aGrantDenials(t, conf, "gateway", "publish")
 
 	// The generated tokens nats.go supplies: an ordered consumer's name is
 	// nuid-derived with a serial suffix, and a KV watcher's is a hash.
@@ -5338,14 +5585,11 @@ func TestGatewayGrantCoversEveryJetStreamSubjectItsCallersEmit(t *testing.T) {
 		{"lib.TasksGet GetLastMsgForSubject (supervisor)", "$JS.API.DIRECT.GET." + a2aTasksStream + ".a2a.tasks.platform.task-0001.supervisor"},
 		{"lib.TasksGet OrderedConsumer", "$JS.API.CONSUMER.CREATE." + a2aTasksStream + "." + orderedConsumerName},
 		{"lib.TasksGet ordered Next", "$JS.API.CONSUMER.MSG.NEXT." + a2aTasksStream + "." + orderedConsumerName},
-		// gateway.Run's event relay: two filter subjects, so nats.go puts
-		// the filter in the body and the subject ends at the durable name.
-		{"lib.SubscribeDurable relay create", "$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".gateway-relay"},
+		// gateway.Run's event relay binds the durable the provision Job
+		// created (#4173): js.Consumer, an INFO on that one name, and never
+		// a create.
+		{"lib.SubscribeDurable relay bind (Precreated)", "$JS.API.CONSUMER.INFO." + a2aTasksStream + ".gateway-relay"},
 		{"relay Consume pull", "$JS.API.CONSUMER.MSG.NEXT." + a2aTasksStream + ".gateway-relay"},
-		// The same durable rebound with ONE filter subject, which is the
-		// shape every install already has on disk and the shape a rebind
-		// goes through: nats.go appends the filter to the API subject.
-		{"lib.SubscribeDurable single-filter rebind", "$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".gateway-relay." + eventsSubject},
 		// gateway.Registry, over the session-state bucket.
 		{"Registry js.KeyValue", "$JS.API.STREAM.INFO." + kvSessionState},
 		{"Registry Get / SessionForTask (kv.Get)", "$JS.API.DIRECT.GET." + kvSessionState + ".$KV." + a2aSessionStateBucket + "." + sessionKey},
@@ -5354,6 +5598,9 @@ func TestGatewayGrantCoversEveryJetStreamSubjectItsCallersEmit(t *testing.T) {
 		// gateway answer feedback, over the feedback bucket.
 		{"startFeedback js.KeyValue", "$JS.API.STREAM.INFO." + a2aKVStreamPrefix + a2aFeedbackBucket},
 		{"feedbackDesk kv.Get", "$JS.API.DIRECT.GET." + a2aKVStreamPrefix + a2aFeedbackBucket + ".$KV." + a2aFeedbackBucket + ".t1.U1"},
+		// gateway.readDirectory, the profile cards' start-up read.
+		{"readDirectory js.Stream / stream.Info", "$JS.API.STREAM.INFO." + a2aDirectoryStream},
+		{"readDirectory GetLastMsgForSubject", "$JS.API.DIRECT.GET." + a2aDirectoryStream + ".a2a.agents.cluster"},
 		{"ExportFeedback ListKeys watcher", "$JS.API.CONSUMER.CREATE." + a2aKVStreamPrefix + a2aFeedbackBucket + "." + kvWatcherName},
 		{"ExportFeedback watcher Stop", "$JS.API.CONSUMER.DELETE." + a2aKVStreamPrefix + a2aFeedbackBucket + "." + kvWatcherName},
 		// gateway people count, over the people bucket.
@@ -5376,6 +5623,11 @@ func TestGatewayGrantCoversEveryJetStreamSubjectItsCallersEmit(t *testing.T) {
 			t.Errorf("no gateway grant covers %q (%s); that call gets no reply and the caller waits out its context",
 				tc.subject, tc.caller)
 		}
+		for _, d := range denied {
+			if subjectMatches(d, tc.subject) {
+				t.Errorf("the gateway's deny %q refuses %q (%s), which its allow list covers", d, tc.subject, tc.caller)
+			}
+		}
 	}
 }
 
@@ -5392,7 +5644,7 @@ func TestGatewayGrantCoversEveryJetStreamSubjectItsCallersEmit(t *testing.T) {
 // are: a grant naming a bucket nothing creates is a call that times out on a
 // real install and nowhere else.
 func TestGatewayGrantNamesTheBucketItsDataPlaneWritesTo(t *testing.T) {
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 	grants := a2aGrantSubjects(t, conf, "gateway", "publish")
 
 	known := []string{a2aTasksStream}
@@ -5851,7 +6103,7 @@ func checkA2AUserGrants(t a2aGrantReporter, user string, row a2aGrantRow, lists 
 // widening gets.
 func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 	agent := a2aTestAgent()
-	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 
 	const (
 		bareJetStreamAPI = "$JS.API.>"
@@ -5877,8 +6129,13 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 	rows := map[string]a2aGrantRow{
 		"gateway": {
 			streams: map[string][]string{
-				a2aTasksStream: {"ACK", "STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.MSG.NEXT", "DIRECT.GET"},
+				// CONSUMER.INFO is the bind on its pre-created relay and
+				// names only that durable (TestGatewayHoldsNoWholesaleJetStreamAPI).
+				a2aTasksStream: {"ACK", "STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.INFO", "CONSUMER.MSG.NEXT", "DIRECT.GET"},
 				kvSessionState: {"KV", "STREAM.INFO", "DIRECT.GET", "CONSUMER.CREATE", "CONSUMER.DELETE"},
+				// The profile cards' start-up read: the subject list and a
+				// direct get per card, no consumer (readDirectory).
+				a2aDirectoryStream: {"STREAM.INFO", "DIRECT.GET"},
 				// The kept answer ratings: the registry's four verbs, for
 				// the same four calls (a2aGatewayJetStreamGrants).
 				a2aKVStreamPrefix + a2aFeedbackBucket: {"KV", "STREAM.INFO", "DIRECT.GET", "CONSUMER.CREATE", "CONSUMER.DELETE"},
@@ -5897,7 +6154,9 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 		},
 		a2aBridgeUser: {
 			streams: map[string][]string{
-				a2aTasksStream: {"STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.MSG.NEXT", "DIRECT.GET", "ACK"},
+				// CONSUMER.INFO is the bind on its pre-created intake and
+				// names only that durable (TestBridgeHoldsNoWholesaleJetStreamAPI).
+				a2aTasksStream: {"STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.INFO", "CONSUMER.MSG.NEXT", "DIRECT.GET", "ACK"},
 				kvRuntimeState: {"KV", "STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.DELETE"},
 			},
 		},
@@ -5933,8 +6192,15 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 			accountLevel: []string{"$JS.API.INFO"},
 		},
 		"provision": {
-			callout:      true,
-			streams:      a2aSameVerbsOn(a2aProvisionedStreams, "STREAM.CREATE", "STREAM.INFO"),
+			callout: true,
+			// Plus CONSUMER.INFO and CONSUMER.CREATE on TASKS, naming only
+			// the two durables it pre-creates (#4173,
+			// TestProvisionHoldsConsumerGrantsOnlyOnTheFixedDurables).
+			streams: func() map[string][]string {
+				m := a2aSameVerbsOn(a2aProvisionedStreams, "STREAM.CREATE", "STREAM.INFO")
+				m[a2aTasksStream] = append(m[a2aTasksStream], "CONSUMER.INFO", "CONSUMER.CREATE")
+				return m
+			}(),
 			accountLevel: []string{"$JS.API.INFO", "$JS.API.STREAM.NAMES", "$JS.API.STREAM.LIST"},
 		},
 		"session": {
@@ -6730,9 +6996,10 @@ func TestA2AInjectBackendIsRemovedWhenTheFlagGoesOff(t *testing.T) {
 }
 
 // TestA2AInjectFlagOffRemovalReadsTheSecretUncached: the flag-off path reads
-// four objects before deleting them, and the fourth is a Secret. The operator
-// ships secrets with get only, so a cached Get of one starts an informer
-// whose LIST is forbidden and blocks the single reconcile worker for good --
+// four objects before deleting them, and the fourth is a Secret. The manager
+// does not watch Secrets, so a cached Get of one starts a cluster-wide Secret
+// informer that holds every Secret in memory and blocks the single reconcile
+// worker in WaitForCacheSync wherever list/watch on secrets is trimmed --
 // the fake client cannot show that hang (its cache is the store), so this
 // test fails the cached path outright and passes only if the Secret is read
 // through the reader the other A2A Secrets use.
@@ -6753,7 +7020,7 @@ func TestA2AInjectFlagOffRemovalReadsTheSecretUncached(t *testing.T) {
 	cached := interceptor.NewClient(base, interceptor.Funcs{
 		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 			if _, ok := obj.(*corev1.Secret); ok && strict.Load() {
-				return fmt.Errorf("cached Get of Secret %s: on the shipped RBAC this starts an informer whose LIST is forbidden, and the reconcile worker blocks in WaitForCacheSync", key)
+				return fmt.Errorf("cached Get of Secret %s: starts an unwatched cluster-wide Secret informer instead of reading through APIReader", key)
 			}
 			return c.Get(ctx, key, obj, opts...)
 		},
@@ -8294,7 +8561,7 @@ func TestProvisionedJetStreamCapsFitTheStore(t *testing.T) {
 		}
 	}
 
-	conf := renderA2ANATSConf(agent, func(string) string { return "pw" }, &a2aCalloutKeys{IssuerPublic: "A", XKeyPublic: "X"})
+	conf := renderA2ANATSConf(agent, func(string) string { return "pw" }, &a2aCalloutKeys{IssuerPublic: "A", XKeyPublic: "X"}, nil)
 	m := regexp.MustCompile(`(?m)^\s*max_file_store:\s*(\d+)\s*$`).FindStringSubmatch(conf)
 	if m == nil {
 		t.Fatal("nats.conf renders no max_file_store")
@@ -8371,4 +8638,281 @@ func TestPeopleReadingEnabled_TruthTable(t *testing.T) {
 	if teamsEnabled(noIntegration) || !peopleReadingEnabled(noIntegration) {
 		t.Fatal("a CR with no spec.integration: want Teams off and the reading enabled")
 	}
+}
+
+// Each workload the operator renders only on a condition is counted when it
+// runs, in agent.Namespace: the credential proxy's exec tier (a CR field), the
+// MCP door and the dispatcher (operator flags). The golden tie cannot see
+// these, so each has a row here, and a new conditional workload needs one.
+func TestA2AStandingPodsCountTheConditionalWorkloads(t *testing.T) {
+	base := a2aStandingPods(a2aTestAgent())
+	t.Run("the exec tier, at its replicas", func(t *testing.T) {
+		agent := a2aTestAgent()
+		if agent.Spec.Deployment == nil {
+			agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{}
+		}
+		agent.Spec.Deployment.CredentialProxy = &agentv1alpha1.CredentialProxySpec{Exec: &agentv1alpha1.CredentialProxyExecSpec{Replicas: ptr.To(int32(3))}}
+		if got := a2aStandingPods(agent); got != base+3 {
+			t.Fatalf("standing pods with exec.replicas 3 = %d, want %d", got, base+3)
+		}
+	})
+	t.Run("the MCP door", func(t *testing.T) {
+		t.Setenv(a2aMCPDoorEnvVar, "true")
+		if got := a2aStandingPods(a2aTestAgent()); got != base+1 {
+			t.Fatalf("standing pods with the MCP door = %d, want %d", got, base+1)
+		}
+	})
+	t.Run("the dispatcher", func(t *testing.T) {
+		t.Setenv(a2aDispatcherImageEnvVar, "example.com/dispatcher:dev")
+		if got := a2aStandingPods(a2aTestAgent()); got != base+1 {
+			t.Fatalf("standing pods with the dispatcher = %d, want %d", got, base+1)
+		}
+	})
+}
+
+// One parse decides both the count and the discard (#4893): a value is used
+// exactly when no reason is given, an absent annotation takes the default
+// without one, and every discarded value takes the default with one.
+func TestA2AChartPodsCountAndDiscardReadOneParse(t *testing.T) {
+	absent := a2aTestAgent()
+	if n, why := a2aChartPodsCount(absent); n != a2aDefaultChartPods || why != "" {
+		t.Fatalf("absent: (%d, %q), want the default and no reason", n, why)
+	}
+	for _, c := range []struct {
+		raw  string
+		want int64
+		used bool
+	}{
+		{"0", 0, true},
+		{"7", 7, true},
+		{" 7 ", 7, true},
+		{fmt.Sprint(a2aMaxChartPods), a2aMaxChartPods, true},
+		{fmt.Sprint(a2aMaxChartPods + 1), a2aDefaultChartPods, false},
+		{"-1", a2aDefaultChartPods, false},
+		{"", a2aDefaultChartPods, false},
+		{"seven", a2aDefaultChartPods, false},
+		{"99999999999999999999", a2aDefaultChartPods, false},
+	} {
+		agent := a2aTestAgent()
+		agent.SetAnnotations(map[string]string{a2aChartPodsAnnotation: c.raw})
+		n, why := a2aChartPodsCount(agent)
+		if n != c.want || (why == "") != c.used {
+			t.Errorf("%q: (%d, %q), want %d used=%v", c.raw, n, why, c.want, c.used)
+		}
+		if a2aChartPods(agent) != n {
+			t.Errorf("%q: a2aChartPods disagrees with a2aChartPodsCount", c.raw)
+		}
+	}
+}
+
+// A PlatformAgent without the chart-pods annotation takes the chart's count
+// from the a2a-quota-chart-pods ConfigMap in its namespace (#4883): an
+// operator-only release still runs chart pods there. The annotation wins, a
+// missing ConfigMap leaves the default, a value past the cap is discarded and
+// named as the ConfigMap's, and the CR itself is not changed.
+func TestA2AQuotaAgentReadsTheChartConfigMap(t *testing.T) {
+	cm := func(v string) *corev1.ConfigMap {
+		return &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: a2aChartPodsConfigMapName, Namespace: "test-ns"},
+			Data:       map[string]string{a2aChartPodsConfigMapKey: v},
+		}
+	}
+	for _, tc := range []struct {
+		name       string
+		annotation *string
+		configMap  *corev1.ConfigMap
+		operatorNS string
+		want       int64
+		why        string
+	}{
+		{"the ConfigMap, without an annotation", nil, cm("11"), "test-ns", 11, ""},
+		{"the annotation wins over the ConfigMap", ptr.To("7"), cm("11"), "test-ns", 7, ""},
+		{"neither: the default", nil, nil, "test-ns", a2aDefaultChartPods, ""},
+		{"a ConfigMap past the cap: the default, named", nil, cm("70"), "test-ns", a2aDefaultChartPods, "ConfigMap " + a2aChartPodsConfigMapName},
+		{"an unreadable ConfigMap: the default, named", nil, cm("seven"), "test-ns", a2aDefaultChartPods, "ConfigMap " + a2aChartPodsConfigMapName},
+		// The operator reads the ConfigMap from its own namespace only.
+		{"a ConfigMap outside the operator's namespace: the default, said", nil, cm("11"), "kubeagents-system", a2aDefaultChartPods, "only from its own namespace"},
+		{"an operator with no namespace: the default, said", nil, cm("11"), "", a2aDefaultChartPods, "own namespace is unknown"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := a2aTestAgent()
+			if tc.annotation != nil {
+				agent.Annotations = map[string]string{a2aChartPodsAnnotation: *tc.annotation}
+			}
+			objs := []client.Object{agent}
+			if tc.configMap != nil {
+				objs = append(objs, tc.configMap)
+			}
+			cl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).Build()
+			r := &PlatformAgentReconciler{Client: cl, OperatorNamespace: tc.operatorNS}
+			sized, why, err := r.a2aQuotaAgent(context.Background(), agent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := a2aChartPods(sized); got != tc.want {
+				t.Errorf("chart pods = %d, want %d", got, tc.want)
+			}
+			if (why == "") != (tc.why == "") || !strings.Contains(why, tc.why) {
+				t.Errorf("why = %q, want it to name %q", why, tc.why)
+			}
+			if tc.annotation == nil && len(agent.Annotations) != 0 {
+				t.Errorf("the CR itself gained annotations %v", agent.Annotations)
+			}
+		})
+	}
+}
+
+// The reconcile sizes the applied session quota from the ConfigMap's count
+// when the CR has no annotation and the ConfigMap is in the operator's own
+// namespace, and warns, naming the ConfigMap, when it discards one or does
+// not read one from another namespace (#4883).
+func TestA2ASessionQuotaFollowsTheChartConfigMap(t *testing.T) {
+	for _, tc := range []struct {
+		value      string
+		operatorNS string
+		pods       int64
+		warns      bool
+	}{
+		{"11", "test-ns", 11, false},
+		{"70", "test-ns", a2aDefaultChartPods, true},
+		{"11", "kubeagents-system", a2aDefaultChartPods, true},
+	} {
+		t.Run(tc.value+"/"+tc.operatorNS, func(t *testing.T) {
+			agent := a2aTestAgent()
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: a2aChartPodsConfigMapName, Namespace: agent.Namespace},
+				Data:       map[string]string{a2aChartPodsConfigMapKey: tc.value},
+			}
+			scheme := setupScheme()
+			cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, discordBotSecret(agent), cm).
+				WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+				WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+			rec := record.NewFakeRecorder(256)
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: rec, OperatorNamespace: tc.operatorNS}
+			if _, err := r.reconcileA2A(context.Background(), agent, homeChannelRecord{}); err != nil {
+				t.Fatal(err)
+			}
+			quota := &corev1.ResourceQuota{}
+			if err := cl.Get(context.Background(), types.NamespacedName{Namespace: agent.Namespace, Name: a2aSessionQuotaName(agent)}, quota); err != nil {
+				t.Fatal(err)
+			}
+			want := int64(resolveA2AMaxSessions(agent)) + a2aStandingPods(agent) + tc.pods + a2aQuotaTransientMargin
+			if got := quota.Spec.Hard[corev1.ResourcePods]; got.Value() != want {
+				t.Errorf("quota pods = %d, want %d (chart pods %d)", got.Value(), want, tc.pods)
+			}
+			warned := false
+			for done := false; !done; {
+				select {
+				case e := <-rec.Events:
+					if strings.Contains(e, a2aChartPodsDiscardedReason) && strings.Contains(e, "ConfigMap "+a2aChartPodsConfigMapName) {
+						warned = true
+					}
+				default:
+					done = true
+				}
+			}
+			if warned != tc.warns {
+				t.Errorf("warned naming the ConfigMap = %v, want %v", warned, tc.warns)
+			}
+		})
+	}
+}
+
+// A chart-pods annotation the operator discards is reported, once per spec
+// generation, as a Warning event; an absent one (a CR written without the
+// chart) and a usable one are not.
+func TestA2AChartPodsDiscardWarnsOncePerGenerationAndValue(t *testing.T) {
+	warnings := func(rec *record.FakeRecorder) int {
+		n := 0
+		for {
+			select {
+			case e := <-rec.Events:
+				if strings.Contains(e, a2aChartPodsDiscardedReason) {
+					n++
+				}
+			default:
+				return n
+			}
+		}
+	}
+	for _, tc := range []struct {
+		name       string
+		annotation *string
+		want       int
+	}{
+		{"past the cap", ptr.To("70"), 1},
+		{"unreadable", ptr.To("seven"), 1},
+		{"negative", ptr.To("-3"), 1},
+		{"usable", ptr.To("5"), 0},
+		{"absent", nil, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := a2aTestAgent()
+			if tc.annotation != nil {
+				agent.Annotations = map[string]string{a2aChartPodsAnnotation: *tc.annotation}
+			}
+			if _, why := a2aChartPodsCount(agent); (why != "") != (tc.want > 0) {
+				t.Fatalf("a2aChartPodsCount's reason = %q", why)
+			}
+			scheme := setupScheme()
+			cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, discordBotSecret(agent)).
+				WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+				WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+			rec := record.NewFakeRecorder(256)
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: rec}
+			ctx := context.Background()
+			for range 2 {
+				if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got := warnings(rec); got != tc.want {
+				t.Fatalf("%d %s events over two passes of one generation, want %d", got, a2aChartPodsDiscardedReason, tc.want)
+			}
+			agent.Generation++
+			if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+				t.Fatal(err)
+			}
+			if got := warnings(rec); got != tc.want {
+				t.Fatalf("%d %s events after a new generation, want %d", got, a2aChartPodsDiscardedReason, tc.want)
+			}
+			// An annotation edit leaves the generation alone; a new bad value
+			// still warns, once.
+			agent.Annotations = map[string]string{a2aChartPodsAnnotation: "99"}
+			for range 2 {
+				if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got := warnings(rec); got != 1 {
+				t.Fatalf("%d %s events after a new bad value at the same generation, want 1", got, a2aChartPodsDiscardedReason)
+			}
+			// A usable value in between re-arms it: the same bad value again
+			// warns once more.
+			agent.Annotations = map[string]string{a2aChartPodsAnnotation: "5"}
+			if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+				t.Fatal(err)
+			}
+			agent.Annotations = map[string]string{a2aChartPodsAnnotation: "99"}
+			if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+				t.Fatal(err)
+			}
+			if got := warnings(rec); got != 1 {
+				t.Fatalf("%d %s events for a bad value back after a usable one, want 1", got, a2aChartPodsDiscardedReason)
+			}
+		})
+	}
+}
+
+// quotedLines are the quoted entries of a rendered permission list, one per
+// line, in order.
+func quotedLines(block string) []string {
+	var out []string
+	for _, line := range strings.Split(block, "\n") {
+		line = strings.TrimSuffix(strings.TrimSpace(line), ",")
+		if strings.HasPrefix(line, `"`) {
+			out = append(out, strings.Trim(line, `"`))
+		}
+	}
+	return out
 }

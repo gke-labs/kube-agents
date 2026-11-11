@@ -41,7 +41,7 @@ that eventually disagrees with it. Hindsight is the exception because it is one 
 unrelated workloads — an API server and its Postgres database — so `name` alone cannot tell them
 apart. Its objects carry `app.kubernetes.io/component: api` or `postgresql`, and those values are
 load-bearing rather than decorative: the Deployment and StatefulSet selectors, the `NetworkPolicy`
-that lets only the API reach port 5432, and the `PodMonitoring` that must scrape the API and not the
+objects that isolate the API pod and let only the API reach port 5432, and the `PodMonitoring` that must scrape the API and not the
 database are all built from them. Do not add `component` anywhere else on the strength of this.
 
 One more source stamps labels at runtime rather than at install: the a2a chatops gateway
@@ -52,7 +52,7 @@ under `spec.mode: next`, a first install's default, where the operator renders
 load-bearing the same way Hindsight's are, and for more consumers: the gateway's
 session cap counts pods and its sweeper lists them by exactly this pair, the operator's bus fence
 admits them to NATS by it, the operator's session egress policy selects them by it, and under the
-operator's `A2A_SESSION_CLUSTER_VIEW` flag the credential broker's ingress policy admits them by it — and a
+operator's `A2A_SESSION_CLUSTER_VIEW` flag the credential broker's and `<name>-kube-proxy`'s ingress policies admit them by it — and a
 NetworkPolicy that selects nothing looks exactly like one that is
 working. `part-of` is deliberately not `kube-agents`: a session pod is spawned per conversation at
 runtime rather than installed, so the `kube-agents` half of the footprint query above does not

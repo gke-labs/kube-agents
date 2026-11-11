@@ -137,6 +137,11 @@ var requiredPermissions = []requiredPermission{
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentprofiles"}, Verbs: []string{"get", "list", "watch", "update", "patch"}},
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentprofiles/status"}, Verbs: []string{"get", "update", "patch"}},
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentprofiles/finalizers"}, Verbs: []string{"update"}},
+	// tiers: the Tier reconciler reads each tier and writes its Accepted
+	// condition (#3659). Nothing else: tiers are cluster administrators' to
+	// write.
+	{Group: "kubeagents.x-k8s.io", Resources: []string{"tiers"}, Verbs: rbacReadVerbs},
+	{Group: "kubeagents.x-k8s.io", Resources: []string{"tiers/status"}, Verbs: []string{"get", "update", "patch"}},
 	{Group: "apps", Resources: []string{"deployments", "statefulsets"}, Verbs: rbacWriteVerbs},
 	{Group: "apps", Resources: []string{"daemonsets", "replicasets"}, Verbs: rbacReadVerbs},
 	{Group: "", Resources: []string{"serviceaccounts", "persistentvolumeclaims", "configmaps", "services", "pods"}, Verbs: rbacWriteVerbs},
@@ -148,15 +153,25 @@ var requiredPermissions = []requiredPermission{
 	// resourcequotas: the mode-next session-pod bound is rendered and removed
 	// by the operator, so this one is write rather than read.
 	{Group: "", Resources: []string{"resourcequotas"}, Verbs: rbacWriteVerbs},
-	// secrets: `get` for checkShellSandboxKeys; the rest for the mode-next A2A
-	// credential and config Secrets the operator generates. No list/watch --
-	// see tests/test_operator_secrets_grant.py.
-	{Group: "", Resources: []string{"secrets"}, Verbs: []string{"get", "create", "update", "patch", "delete"}},
+	// secrets: `get` for checkShellSandboxKeys and stampSecretEnvHash; write
+	// verbs for the mode-next A2A credential/config Secrets and kube-proxy TLS
+	// Secret; `list` and `watch` so `buildMinimalPlatformRole` passes RBAC
+	// escalation prevention. See tests/test_operator_secrets_grant.py.
+	{Group: "", Resources: []string{"secrets"}, Verbs: rbacWriteVerbs},
 	{Group: "metrics.k8s.io", Resources: []string{"nodes", "pods"}, Verbs: rbacReadVerbs},
 	{Group: "autoscaling", Resources: []string{"horizontalpodautoscalers"}, Verbs: rbacReadVerbs},
 	{Group: "batch", Resources: []string{"cronjobs"}, Verbs: rbacReadVerbs},
 	// jobs: the mode-next provisioning run is created and swept by the operator.
 	{Group: "batch", Resources: []string{"jobs"}, Verbs: rbacWriteVerbs},
+	// dispatchjobtemplates: the dispatcher Job admission policy's params in
+	// the profile namespace, which the operator alone writes. No watch: read
+	// uncached. podtemplates: create only, the dry run that defaults them.
+	{Group: "kubeagents.x-k8s.io", Resources: []string{"dispatchjobtemplates"}, Verbs: []string{"get", "list", "create", "update", "patch", "delete"}},
+	{Group: "", Resources: []string{"podtemplates"}, Verbs: []string{"create"}},
+	// The dispatcher Job admission policy and its binding, read by name
+	// before the dispatcher gets its Jobs Role (dispatcherJobPolicyInPlace).
+	{Group: "admissionregistration.k8s.io", Resources: []string{"validatingadmissionpolicies"}, Verbs: []string{"get"}, Name: dispatcherJobPolicyName},
+	{Group: "admissionregistration.k8s.io", Resources: []string{"validatingadmissionpolicybindings"}, Verbs: []string{"get"}, Name: dispatcherJobPolicyName},
 	{Group: "coordination.k8s.io", Resources: []string{"leases"}, Verbs: rbacWriteVerbs},
 	{Group: "node.k8s.io", Resources: []string{"runtimeclasses"}, Verbs: rbacReadVerbs},
 	// storageclasses: growDataClaim reads a data claim's class by name.
@@ -366,6 +381,23 @@ func AgentProfileAccessDenied(c *RBACChecker) []string {
 	var out []string
 	for _, tuple := range flattenRequiredPermissions() {
 		if tuple.resource == "agentprofiles" && slices.Contains(denied, tuple.label) {
+			out = append(out, tuple.label)
+		}
+	}
+	return out
+}
+
+// TierAccessDenied returns the boot probe's denials on tiers, as
+// AgentProfileAccessDenied does for agentprofiles: an operator image deployed
+// ahead of its ClusterRole skips the Tier controller rather than crashloop.
+func TierAccessDenied(c *RBACChecker) []string {
+	denied := c.Denied()
+	if len(denied) == 0 {
+		return nil
+	}
+	var out []string
+	for _, tuple := range flattenRequiredPermissions() {
+		if tuple.resource == "tiers" && slices.Contains(denied, tuple.label) {
 			out = append(out, tuple.label)
 		}
 	}

@@ -13,11 +13,13 @@ import json
 import logging
 import multiprocessing
 import os
+import re
 import socket
 import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -121,14 +123,16 @@ JOB_TRIGGER_SCRIPT = (
     "missed = [job for job in sys.argv[1:] if not trigger_job(job)]\n"
     "if missed:\n    sys.exit('not marked: ' + ' '.join(missed))\n"
 )
-# Reads a roster's run rows: per job, the latest run claimed since a time, as "job status finished".
+# Reads a roster's run rows: per job, the latest run claimed since a time, as "job status finished started".
+# The run a trigger started: the first claimed since the trigger. A tick that finds the job still
+# running writes a skip row (status 'skipped', claimed and finished at once), which is not a run.
 JOB_RUNS_SCRIPT = (
     "import os, sqlite3, sys\n"
     "db = sqlite3.connect(os.path.join(os.environ['HERMES_HOME'], 'cron', 'executions.db'))\n"
     "for job in sys.argv[2:]:\n"
-    "    row = db.execute('select status, finished_at from executions where job_id = ? and claimed_at >= ? '\n"
-    "                     'order by claimed_at desc limit 1', (job, sys.argv[1])).fetchone()\n"
-    "    print(job, *(row or ('unclaimed', None)))\n"
+    "    row = db.execute('select status, finished_at, started_at from executions where job_id = ? and claimed_at >= ? '\n"
+    "                     \"and status != 'skipped' order by claimed_at asc limit 1\", (job, sys.argv[1])).fetchone()\n"
+    "    print(job, *(row or ('unclaimed', None, None)))\n"
 )
 JOB_TIMEOUT_SECONDS = 120
 JOB_COMPLETED = "completed"
@@ -137,6 +141,9 @@ JOB_RUNNING = "running"
 JOB_CLAIMED = "claimed"
 JOB_ACTIVE = (JOB_CLAIMED, JOB_RUNNING)
 JOB_UNCLAIMED = "unclaimed"
+# A run line's fields after the job id (status, finished, started), and how Python prints a missing one.
+JOB_RUN_FIELDS = 3
+PYTHON_NONE = "None"
 # What a new install starts without: the agent's data and session metadata, the shell's data, the bus's data.
 RESET_CLAIMS = ("platform-agent-data", "system-metadata", "data-platform-agent-shell-0", "data-platform-agent-a2a-nats-0")
 RESET_STATEFUL_PODS = ("platform-agent-shell-0", "platform-agent-a2a-nats-0")
@@ -230,8 +237,23 @@ def _prompt_worker(prompt: str, env: dict[str, str]) -> dict[str, Any]:
         "tokens": dict(result.tokens or {}),
         "errors": list(result.errors or []),
         "output_chars": len(result.output or ""),
-        "preview": (result.output or "")[:ANSWER_PREVIEW_CHARS],
+        "preview": answer_preview(result.output or ""),
     }
+
+
+def answer_preview(output: str) -> str:
+    """The start of an answer, cut before a word that the bound would split.
+
+    The runner scrubs the project ID from what is stored, and it can only find
+    a whole ID: a cut inside one would store its first characters. An answer
+    whose first `ANSWER_PREVIEW_CHARS` hold no space (a long URL, compact JSON)
+    has no word to cut before, and keeps the hard cut rather than an empty
+    preview that reads as a failed prompt.
+    """
+    cut = output[:ANSWER_PREVIEW_CHARS]
+    if len(output) <= ANSWER_PREVIEW_CHARS or output[ANSWER_PREVIEW_CHARS].isspace():
+        return cut
+    return re.sub(r"\S*\Z", "", cut) or cut
 
 
 def unfinished_reason(preview: str, errors: list[str]) -> str:
@@ -415,6 +437,22 @@ def job_statuses(context: str, namespace: str, home: str, jobs: tuple[str, ...],
         job, status, *_ = line.split() + [""]
         statuses[job] = status or JOB_UNCLAIMED
     return statuses
+
+
+def job_seconds(context: str, namespace: str, home: str, jobs: tuple[str, ...], since: str) -> dict[str, float]:
+    """How long each job's run since ``since`` took, from its start to its end, for the runs that completed."""
+    pod = _gateway_pod(context, namespace)
+    if not pod:
+        raise kube.CommandError("no gateway pod to read the job runs in")
+    out = kube.kubectl(context, "exec", "-n", namespace, pod, "-c", AGENT_CONTAINER, "--", "env",
+                       f"HERMES_HOME={home}", JOB_PYTHON, "-c", JOB_RUNS_SCRIPT, since.replace("Z", ""), *jobs,
+                       timeout=JOB_TIMEOUT_SECONDS)
+    durations = {}
+    for line in out.splitlines():
+        job, status, finished, started, *_ = line.split() + [""] * JOB_RUN_FIELDS
+        if status == JOB_COMPLETED and finished not in ("", PYTHON_NONE) and started not in ("", PYTHON_NONE):
+            durations[job] = (datetime.fromisoformat(finished) - datetime.fromisoformat(started)).total_seconds()
+    return durations
 
 
 def unfinished_jobs(context: str, namespace: str, home: str, jobs: tuple[str, ...], since: str) -> list[str]:

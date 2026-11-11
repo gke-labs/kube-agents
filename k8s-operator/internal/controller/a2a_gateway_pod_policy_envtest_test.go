@@ -29,7 +29,9 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	nodev1 "k8s.io/api/node/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	schedulingv1 "k8s.io/api/scheduling/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -65,7 +67,7 @@ func TestTheGatewayPodPolicyHoldsGatewayPodsToTheSessionShape(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	applyGatewayPodPolicy(ctx, t, admin)
+	applyAdmissionPolicyFile(ctx, t, admin, gatewayPodPolicyFile)
 
 	ns := gatewayPodPolicyNamespace
 	mustCreate(ctx, t, admin, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
@@ -85,6 +87,12 @@ func TestTheGatewayPodPolicyHoldsGatewayPodsToTheSessionShape(t *testing.T) {
 			{Kind: rbacv1.ServiceAccountKind, Name: "other-a2a-gateway", Namespace: ns},
 		},
 	})
+	// A class the gateway might name to preempt other workloads, and one that
+	// preempts nothing.
+	mustCreate(ctx, t, admin, &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: "high"}, Value: 1000})
+	mustCreate(ctx, t, admin, &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: "zero"}, Value: 0})
+	// A runtime the gateway might pick; the API server refuses one that doesn't exist.
+	mustCreate(ctx, t, admin, &nodev1.RuntimeClass{ObjectMeta: metav1.ObjectMeta{Name: "gvisor"}, Handler: "runsc"})
 	gateway := impersonatedClient(t, cfg, ns, gatewayPodPolicyAgent+"-a2a-gateway")
 
 	// The policy is stored before it is enforced; wait until a pod with the
@@ -125,6 +133,14 @@ func TestTheGatewayPodPolicyHoldsGatewayPodsToTheSessionShape(t *testing.T) {
 	for name, mutate := range map[string]func(*corev1.Pod){
 		"the session pod":                   func(*corev1.Pod) {},
 		"the session pod with cluster view": withClusterViewToken,
+		// What mutating admission adds to every pod on GKE Autopilot, read off
+		// a live install's pods.
+		"the session pod as autopilot admits it": func(p *corev1.Pod) {
+			p.Spec.SchedulerName = "gke.io/optimize-utilization-scheduler"
+			p.Spec.Tolerations = autopilotTolerations()
+		},
+		"the session pod with the default scheduler": func(p *corev1.Pod) { p.Spec.SchedulerName = "default-scheduler" },
+		"the session pod under a zero-value class":   func(p *corev1.Pod) { p.Spec.PriorityClassName = "zero" },
 	} {
 		if err := gateway.Create(ctx, sessionPod(strings.ReplaceAll(name, " ", "-"), mutate)); err != nil {
 			t.Errorf("%s: refused, want admitted: %v", name, err)
@@ -141,6 +157,9 @@ func TestTheGatewayPodPolicyHoldsGatewayPodsToTheSessionShape(t *testing.T) {
 		labels     = "session labels"
 		identity   = "must run as pa-a2a-session"
 		automounts = "automountServiceAccountToken: false"
+		scheduling = "may not set a runtimeClassName"
+		selector   = "may not set a nodeSelector"
+		class      = "a default GKE ComputeClass adds to every pod"
 	)
 	csc := func(p *corev1.Pod) *corev1.SecurityContext { return p.Spec.Containers[0].SecurityContext }
 	denied := map[string]struct {
@@ -205,8 +224,53 @@ func TestTheGatewayPodPolicyHoldsGatewayPodsToTheSessionShape(t *testing.T) {
 		"envFrom a Secret": {func(p *corev1.Pod) {
 			p.Spec.Containers[0].EnvFrom = []corev1.EnvFromSource{{SecretRef: &corev1.SecretEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "x"}}}}
 		}, secretEnv},
-		"no session label": {func(p *corev1.Pod) { delete(p.Labels, "app.kubernetes.io/component") }, labels},
-		"an extra label":   {func(p *corev1.Pod) { p.Labels["app"] = "pa-gateway" }, labels},
+		"no session label":   {func(p *corev1.Pod) { delete(p.Labels, "app.kubernetes.io/component") }, labels},
+		"an extra label":     {func(p *corev1.Pod) { p.Labels["app"] = "pa-gateway" }, labels},
+		"a runtimeClassName": {func(p *corev1.Pod) { p.Spec.RuntimeClassName = ptr.To("gvisor") }, scheduling},
+		"a nodeSelector": {func(p *corev1.Pod) {
+			p.Spec.NodeSelector = map[string]string{"cloud.google.com/gke-nodepool": "system"}
+		}, selector},
+		// Named in the refusal, so an install with a default ComputeClass can
+		// find why its session pods are refused.
+		"a default ComputeClass's selector": {func(p *corev1.Pod) {
+			p.Spec.NodeSelector = map[string]string{"cloud.google.com/compute-class": "general-purpose"}
+		}, class},
+		"node affinity": {func(p *corev1.Pod) {
+			p.Spec.Affinity = &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+					MatchExpressions: []corev1.NodeSelectorRequirement{{Key: "kubernetes.io/hostname", Operator: corev1.NodeSelectorOpIn, Values: []string{"node-1"}}},
+				}}},
+			}}
+		}, scheduling},
+		"a positive priority": {func(p *corev1.Pod) { p.Spec.PriorityClassName = "high" }, scheduling},
+		"another scheduler":   {func(p *corev1.Pod) { p.Spec.SchedulerName = "my-scheduler" }, scheduling},
+		"a toleration of every taint": {func(p *corev1.Pod) {
+			p.Spec.Tolerations = []corev1.Toleration{{Operator: corev1.TolerationOpExists}}
+		}, scheduling},
+		"a toleration of another taint": {func(p *corev1.Pod) {
+			p.Spec.Tolerations = append(autopilotTolerations(), corev1.Toleration{
+				Key: "node-role.kubernetes.io/control-plane", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule,
+			})
+		}, scheduling},
+		// Only the key differs from an allowed toleration, one per allowed shape.
+		"another key in the not-ready shape": {func(p *corev1.Pod) {
+			p.Spec.Tolerations = []corev1.Toleration{{Key: "dedicated", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoExecute}}
+		}, scheduling},
+		"another key in the architecture shape": {func(p *corev1.Pod) {
+			p.Spec.Tolerations = []corev1.Toleration{{Key: "node-role.kubernetes.io/control-plane", Operator: corev1.TolerationOpEqual, Value: "", Effect: corev1.TaintEffectNoSchedule}}
+		}, scheduling},
+		"the not-ready key with another effect": {func(p *corev1.Pod) {
+			p.Spec.Tolerations = []corev1.Toleration{{Key: "node.kubernetes.io/not-ready", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule}}
+		}, scheduling},
+		"the architecture key matched by Exists": {func(p *corev1.Pod) {
+			p.Spec.Tolerations = []corev1.Toleration{{Key: "kubernetes.io/arch", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule}}
+		}, scheduling},
+		"the not-ready key matched by value": {func(p *corev1.Pod) {
+			p.Spec.Tolerations = []corev1.Toleration{{Key: "node.kubernetes.io/not-ready", Operator: corev1.TolerationOpEqual, Value: "", Effect: corev1.TaintEffectNoExecute}}
+		}, scheduling},
+		"the architecture key with another effect": {func(p *corev1.Pod) {
+			p.Spec.Tolerations = []corev1.Toleration{{Key: "kubernetes.io/arch", Operator: corev1.TolerationOpEqual, Value: "amd64", Effect: corev1.TaintEffectNoExecute}}
+		}, scheduling},
 	}
 	for name, c := range denied {
 		err := gateway.Create(ctx, sessionPod("denied", c.mutate))
@@ -230,6 +294,17 @@ func TestTheGatewayPodPolicyHoldsGatewayPodsToTheSessionShape(t *testing.T) {
 	// Not selected: the same out-of-shape pod from an identity that is not a gateway.
 	if err := admin.Create(ctx, sessionPod("admin", func(p *corev1.Pod) { p.Spec.ServiceAccountName = gatewayPodPolicyAgent })); err != nil {
 		t.Errorf("a non-gateway requester's pod was refused: %v", err)
+	}
+}
+
+// autopilotTolerations are the tolerations a GKE Autopilot install's pods carry
+// after mutating admission: the architecture's, and DefaultTolerationSeconds'
+// two.
+func autopilotTolerations() []corev1.Toleration {
+	return []corev1.Toleration{
+		{Key: "kubernetes.io/arch", Operator: corev1.TolerationOpEqual, Value: "amd64", Effect: corev1.TaintEffectNoSchedule},
+		{Key: "node.kubernetes.io/not-ready", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoExecute, TolerationSeconds: ptr.To(int64(300))},
+		{Key: "node.kubernetes.io/unreachable", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoExecute, TolerationSeconds: ptr.To(int64(300))},
 	}
 }
 
@@ -313,9 +388,11 @@ func impersonatedClient(t *testing.T, cfg *rest.Config, ns, sa string) client.Cl
 	return c
 }
 
-func applyGatewayPodPolicy(ctx context.Context, t *testing.T, c client.Client) {
+// applyAdmissionPolicyFile creates every object in a config/admission policy
+// file, as the chart applies its generated copy.
+func applyAdmissionPolicyFile(ctx context.Context, t *testing.T, c client.Client, path string) {
 	t.Helper()
-	raw, err := os.ReadFile(gatewayPodPolicyFile)
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -5,7 +5,7 @@ description: Read-only detection of controllers that stopped making progress wit
 
 # GKE Stall Detection
 
-Use this skill when a controller has gone quiet rather than red: a Gateway that never programs, a rollout that never finishes, a custom resource whose status stopped following its spec, an HTTPRoute nobody accepted. The symptom-driven skills (`gke-workload-troubleshooting`, `gke-reliability`) start from a failing pod or a bad event; this one starts from the absence of progress, which those states never show. It is read-only: it lists objects, reads their status and events, resolves referenced names, and proposes nothing beyond naming what is missing.
+Use this skill when a controller has gone quiet rather than red: a Gateway that never programs, a rollout that never finishes, a custom resource whose status stopped following its spec, an HTTPRoute nobody accepted. The symptom-driven skills (`workload-triage-scan`, the `pod-*` skills, `gke-reliability`) start from a failing pod or a bad event; this one starts from the absence of progress, which those states never show. It is read-only: it lists objects, reads their status and events, resolves referenced names, and proposes nothing beyond naming what is missing.
 
 ## When to run it
 
@@ -68,6 +68,6 @@ The same four heuristics apply without Gateway-specific code: a Deployment whose
 You work under a strict read-only boundary: no patches applied, no Pull Requests opened. Report in your final answer.
 
 - A request that gives a report format wins: format the answer exactly as it says. A stall alert raised through the Session KV server's `controller-stall` inject arrives as such a request, with the `What's wrong` / `Why` / `What to do` template and, when there is a fix, a `To authorize:` line; that shape is what gets the report saved so a reply of "apply" can act on it. Quote the scan's `stalled resources: <count>` line in `Why`.
-- Otherwise, follow the shape in `gke-workload-troubleshooting`: which objects are stalled, for how long, on which heuristic, and what each is waiting for (the missing Secret, the unmet condition), grounded in the report rows and the confirming kubectl reads; or the statement that the namespace has no stalled resources. Add YAML creating or correcting the missing reference when one is identifiable.
+- Otherwise, follow the shape in [`workload-triage-scan/references/reporting.md`](../workload-triage-scan/references/reporting.md): which objects are stalled, for how long, on which heuristic, and what each is waiting for (the missing Secret, the unmet condition), grounded in the report rows and the confirming kubectl reads; or the statement that the namespace has no stalled resources. Add YAML creating or correcting the missing reference when one is identifiable.
 
 A report with no rows is a result, not a failure to find something: say the namespace has no stalled resources and what threshold that was measured at.

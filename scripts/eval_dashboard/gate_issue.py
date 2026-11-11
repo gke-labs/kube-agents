@@ -7,8 +7,8 @@ meanwhile said "no issue yet, file one". This is the bot filing it:
 
     the state becomes OUTAGE
     and health.json names no tracking issue (case-notes.yaml has none)
-    and no OPEN issue already names the same cases
-    -> create one, labelled `presubmit-gate`, and say "Tracking #NNN"
+    and no open issue carries the marker or names the same cases
+    -> create one, labelled `presubmit-gate`, and say "Tracking #NNN" (its URL when filed elsewhere)
 
 The second shape (#1478): on 2026-09-11 five nodes of the Prow build cluster
 went NotReady and twelve runs died mid-run; nobody owning the cluster was
@@ -16,7 +16,7 @@ told. So:
 
     the condition becomes `lost_pods`
     and no OPEN issue already names every lost node
-    -> create one addressed to the cluster owner, and say "Tracking #NNN"
+    -> create one addressed to the cluster owner, and say "Tracking #NNN" (its URL when filed elsewhere)
 
 The third shape (#1550): the hourly seeded-fleet scan finds a fixture role out
 of its designed state on the same project two scans running, and every case
@@ -24,7 +24,7 @@ depending on it reds on the runs that lease those projects. So:
 
     the condition becomes `fixture_drift`
     and no OPEN issue already names every drifted role
-    -> create one addressed to the fleet owner, and say "Tracking #NNN"
+    -> create one addressed to the fleet owner, and say "Tracking #NNN" (its URL when filed elsewhere)
 
 The fourth shape (#1894): runs Prow killed at the job deadline with no
 verdict, 3+ on 2+ pull requests in 2 hours, so nothing is graded and nobody
@@ -32,7 +32,7 @@ can pass. So:
 
     the condition becomes `deadline_kill`
     and no OPEN `presubmit-gate` issue has "deadline" and "kill" in its TITLE
-    -> create one for whoever owns the gate, and say "Tracking #NNN"
+    -> create one for whoever owns the gate, and say "Tracking #NNN" (its URL when filed elsewhere)
 
 The fifth shape (#1967): the hourly pool-state scan finds the same finding on
 the same pool project two scans running, or on three projects at once. So:
@@ -45,7 +45,9 @@ The dedupe is against people: a human who filed first, with the case names
 (or the node names, or the role names) in the title or body -- or, for the
 deadline kills and the pool findings, in the title -- wins and the bot adopts
 their issue and labels it `presubmit-gate` (#3664: the open issue for a
-drifted fixture carried `bug`/`Infra` and was never found). One rule for a
+drifted fixture carried `bug`/`Infra` and was never found); the bot's own
+outage issue is re-found by its `gate-outage` marker, whose case list is the
+only place its body names the cases. One rule for a
 title: any open issue. One rule for a body: a `presubmit-gate` issue, or an
 unlabelled one whose body also carries a word the condition's own evidence
 uses ("drift", "pending" for a fixture; "NotReady", "lost" for a node), so a
@@ -79,10 +81,12 @@ import re
 import sys
 
 try:
-    from .health import parse_iso, pool_drift_split
+    from . import ghcli
+    from .health import EVIDENCE_CASE_COLLAPSE, EVIDENCE_CASES_EXPLAIN, EVIDENCE_LOST_PODS, EVIDENCE_PR_CAUSED, FIXTURE_SCAN, parse_iso, pool_drift_split, public_cause
 except ImportError:  # imported with scripts/eval_dashboard/ itself on sys.path
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-    from health import parse_iso, pool_drift_split
+    import ghcli
+    from health import EVIDENCE_CASE_COLLAPSE, EVIDENCE_CASES_EXPLAIN, EVIDENCE_LOST_PODS, EVIDENCE_PR_CAUSED, FIXTURE_SCAN, parse_iso, pool_drift_split, public_cause
 
 LABEL = "presubmit-gate"
 # Who an infrastructure issue goes to: top-level keys of domains.yaml,
@@ -120,7 +124,12 @@ NEVER_ADOPT_LABELS = frozenset({"nightly-red"})
 NEVER_ADOPT_MARKER = "<!-- kube-agents-bot:coverage-gap "
 # Who the bot's own issues are filed as (the workflow's GITHUB_TOKEN). Only
 # these are closed; anyone else's is adopted and left open.
+# Whose issue a carried one is, for the close at recovery: the bot's when
+# its body carries a bot marker or the "Filed automatically" line every bot
+# body ends with (token-independent: filed with the issues repository's App
+# token the author is `<app>[bot]`), or when the author is the workflow's.
 BOT_LOGINS = frozenset({"github-actions[bot]"})
+BOT_BODY_MARKS = ("<!-- kube-agents-bot:", "Filed automatically by the smoke health bot")
 ISSUE_STATE_OPEN = "open"
 CLOSE_PAYLOAD = {"state": "closed", "state_reason": "completed"}
 # health.json's conditions this module files for besides an OUTAGE
@@ -150,11 +159,22 @@ LOST_PODS_BODY_WORDS = ("notready", "not ready", "lost")
 # How a name is found in a title or body: not preceded by a letter, digit or
 # underscore ("kill" is not in "skill" nor in "deadline_kill").
 NAME_START_RE = r"(?<![a-z0-9_]){name}"
-# The other direction: the deadline body quotes only the deadline evidence
-# lines. health.py's evidence also carries per-case collapse lines whenever a
-# case clears the shared-break floors, and a body naming those cases would
-# be adopted as the tracker of a break that fires later.
+# The other direction: each body quotes only its own condition's evidence
+# lines, by their fixed start (public_evidence). health.py's evidence also
+# carries per-case collapse lines whenever a case clears the shared-break
+# floors (a body naming those cases would be adopted as the tracker of a
+# break that fires later) and the watched periodics' lines, which quote a
+# build log's last error line; the repository is public, and the incident
+# brief carries the rest. The fixture scan's lines start with the role
+# (health's scan loop: "<role> drifted on N pool project(s) …").
 DEADLINE_EVIDENCE_PREFIX = "deadline kills:"
+LOST_PODS_EVIDENCE_PREFIX = EVIDENCE_LOST_PODS
+FIXTURE_DRIFT_EVIDENCE_PREFIX = "{role} " + FIXTURE_SCAN.verb + " "
+# A second layer under the prefixes: the lines that grade a case
+# (health.shared_break's per-case collapse line, its coverage line and the
+# PR-caused lines, which health.assess concatenates into health["evidence"]
+# whether or not the break fires) are dropped from every body.
+PUBLIC_EVIDENCE_DROP_RE = re.compile("|".join((re.escape(EVIDENCE_CASE_COLLAPSE), "^" + re.escape(EVIDENCE_CASES_EXPLAIN), "^" + re.escape(EVIDENCE_PR_CAUSED))))
 # GitHub rejects a longer title; the node list is compacted, then dropped
 # for a count, to stay under it.
 TITLE_MAX_CHARS = 256
@@ -166,22 +186,22 @@ ISSUE_BODY_MAX_CHARS = 65536
 ADDRESSEE_RESERVE_CHARS = 256
 POOL_DRIFT_PROJECTS_OMITTED = "- … and {count} more project(s) omitted to fit the issue; pool-state.json carries every project's repair command (docs/ci-health.md, The pool-state scan)"
 
-TITLE = "Smoke gate outage: {count} {noun} failing on every PR since {since}"
-CASE_NOUN = ("case", "cases")
+# The outage issue names no failing case and quotes no evidence line: the
+# repository is public, and both are on the incident brief it links. Its
+# marker carries the case ids (sorted, comma-joined; an HTML comment does not
+# render), which is how the bot re-finds its own issue when the title or the
+# state file no longer leads to it, as the pool-drift marker does.
+OUTAGE_MARKER = "<!-- kube-agents-bot:gate-outage cases={cases} -->"
+OUTAGE_MARKER_RE = re.compile(r"<!-- kube-agents-bot:gate-outage cases=([^ >]*) -->")
+TITLE = "Smoke gate outage since {since}"
 BODY = """\
-The smoke gate (`{job}`) is in OUTAGE: the cases below fail every repetition on every pull request that runs them, so a red on an open PR is not that PR's code.
-
-**Failing cases**
-
-{cases}
+{marker}
+The smoke gate (`{job}`) is in OUTAGE: a shared break turns every pull request's run red, so a red on an open PR is not that PR's code.
 
 **Window:** since {since} ({since_iso}), {prs} PRs red so far.
 **Class:** {cause} (`{condition}`).
-**Evidence:**
 
-{evidence}
-
-Incident brief: {brief}
+The failing cases and the evidence are on the incident brief: {brief}
 
 Filed automatically by the smoke health bot; edit freely. Fix PRs: reference this issue.
 """
@@ -221,7 +241,7 @@ The smoke gate (`{job}`) is in OUTAGE: since {since} ({since_iso}), {runs} runs 
 
 The rest of the evidence (any case collapsing underneath the kills) is in the brief.
 
-**For whoever picks this up:** each killed run's `build-log.txt` shows how far its units got (on 2026-09-22 every unit reached the delegation ceiling, #1880); the gateway and dispatcher lines in the eval project's Cloud Logging say what the workers were doing. Recovery is reported after {recovery} runs with a verdict, green or red, on distinct PRs.
+**For whoever picks this up:** each killed run's `build-log.txt` shows how far its units got (on 2026-09-22 every unit reached the delegation ceiling, https://github.com/gke-labs/kube-agents/issues/1880); the gateway and dispatcher lines in the eval project's Cloud Logging say what the workers were doing. Recovery is reported after {recovery} runs with a verdict, green or red, on distinct PRs.
 
 Incident brief: {brief}
 
@@ -362,23 +382,19 @@ def as_issue(payload: dict | None, condition: str | None = None) -> dict | None:
 
 
 def render_title(health: dict, since_text: str) -> str:
-    cases = health.get("failing_cases") or []
-    return TITLE.format(count=len(cases), noun=CASE_NOUN[len(cases) != 1], since=since_text)
+    return TITLE.format(since=since_text)
 
 
 def render_body(health: dict, since_text: str, brief_link: str) -> str:
-    cases = health.get("failing_cases") or []
     incident = health.get("incident") or {}
-    evidence = [f"- {line}" for line in health.get("evidence") or []]
     return BODY.format(
+        marker=OUTAGE_MARKER.format(cases=",".join(sorted(health.get("failing_cases") or []))),
         job=JOB_NAME,
-        cases="\n".join(f"- `{case}`" for case in cases),
         since=since_text,
         since_iso=health.get("since") or "?",
         prs=len(incident.get("prs") or []),
-        cause=health.get("cause") or "shared break",
+        cause=public_cause(health),
         condition=health.get("condition") or "?",
-        evidence="\n".join(evidence) or NO_EVIDENCE,
         brief=brief_link,
     )
 
@@ -411,11 +427,32 @@ def render_lost_pods_title(health: dict, when_text: str) -> str:
     return title
 
 
+# A pull request as health.py's evidence lines write it (`_pr_list`): "#N",
+# which resolves against whichever repository the issue is filed in.
+PR_REF_RE = re.compile(r"(?<![\w/#])#(\d+)(?!\w)")
+
+
+def public_evidence(health: dict, prefixes: tuple[str, ...] | None = None) -> list[str]:
+    """``health["evidence"]`` as a public body may quote it: given
+    ``prefixes``, only the lines that start with one of them (the condition's
+    own), never a line that grades a case (PUBLIC_EVIDENCE_DROP_RE), and,
+    once the bots file in another repository, every "#N" pull request as
+    its full URL in SOURCE_REPO, where the pull requests stay (a "#N" in an
+    issue filed elsewhere would resolve there)."""
+    lines = [str(line) for line in health.get("evidence") or []]
+    if prefixes is not None:
+        lines = [line for line in lines if line.startswith(prefixes)]
+    lines = [line for line in lines if not PUBLIC_EVIDENCE_DROP_RE.search(line)]
+    if ghcli.DEFAULT_REPO == ghcli.SOURCE_REPO:
+        return lines
+    return [PR_REF_RE.sub(lambda m: ghcli.pr_url(ghcli.SOURCE_REPO, m.group(1)), line) for line in lines]
+
+
 def render_lost_pods_body(health: dict, when_text: str, window_text: str, brief_link: str) -> str:
     incident = health.get("incident") or {}
     nodes = incident.get("nodes") or {}
     prs = incident.get("prs") or []
-    evidence = [f"- {line}" for line in health.get("evidence") or []]
+    evidence = [f"- {line}" for line in public_evidence(health, (LOST_PODS_EVIDENCE_PREFIX,))]
     return LOST_PODS_BODY.format(
         job=JOB_NAME,
         when=when_text,
@@ -424,7 +461,7 @@ def render_lost_pods_body(health: dict, when_text: str, window_text: str, brief_
         nodes="\n".join(f"- `{name}` ({count} {'run' if count == 1 else 'runs'})" for name, count in sorted(nodes.items())) or f"- {UNKNOWN_NODE}",
         window=window_text,
         window_iso=f"{incident.get('window_start') or '?'} – {incident.get('window_end') or '?'}",
-        pr_list=", ".join(f"#{pr}" for pr in prs) or "none recorded",
+        pr_list=", ".join(ghcli.pr_url(ghcli.SOURCE_REPO, pr) for pr in prs) or "none recorded",
         evidence="\n".join(evidence) or NO_EVIDENCE,
         brief=brief_link,
     )
@@ -438,7 +475,7 @@ def render_deadline_kill_title(health: dict, since_text: str) -> str:
 def render_deadline_kill_body(health: dict, since_text: str, window_text: str, brief_link: str) -> str:
     incident = health.get("incident") or {}
     prs = incident.get("prs") or []
-    evidence = [f"- {line}" for line in health.get("evidence") or [] if str(line).startswith(DEADLINE_EVIDENCE_PREFIX)]
+    evidence = [f"- {line}" for line in public_evidence(health, (DEADLINE_EVIDENCE_PREFIX,))]
     return DEADLINE_KILL_BODY.format(
         job=JOB_NAME,
         since=since_text,
@@ -450,7 +487,7 @@ def render_deadline_kill_body(health: dict, since_text: str, window_text: str, b
         minutes=DEADLINE_MINUTES,
         window=window_text,
         window_iso=f"{incident.get('window_start') or '?'} – {incident.get('window_end') or '?'}",
-        pr_list=", ".join(f"#{pr}" for pr in prs) or "none recorded",
+        pr_list=", ".join(ghcli.pr_url(ghcli.SOURCE_REPO, pr) for pr in prs) or "none recorded",
         evidence="\n".join(evidence) or NO_EVIDENCE,
         recovery=RECOVERY_RUNS,
         brief=brief_link,
@@ -473,7 +510,7 @@ def render_fixture_drift_body(health: dict, since_text: str, brief_link: str) ->
     incident = health.get("incident") or {}
     roles = list(incident.get("roles") or [])
     drift = incident.get("drift") or {}
-    evidence = [f"- {line}" for line in health.get("evidence") or []]
+    evidence = [f"- {line}" for line in public_evidence(health, tuple(FIXTURE_DRIFT_EVIDENCE_PREFIX.format(role=role) for role in roles))]
     per_project = []
     for project in sorted(drift):
         per_project.append(f"- `{project}`")
@@ -533,7 +570,7 @@ def render_pool_drift_body(health: dict, since_text: str, brief_link: str) -> st
         consequence = POOL_DRIFT_REDS_RUNS
     drift = incident.get("drift") or {}
     repairs = incident.get("repairs") or {}
-    evidence = [f"- {line}" for line in _pool_evidence(health.get("evidence") or [], findings)]
+    evidence = [f"- {line}" for line in _pool_evidence(public_evidence(health), findings)]
     blocks = []
     for project in sorted(drift):
         block = [f"- `{project}`"]
@@ -577,11 +614,16 @@ def render_pool_drift_body(health: dict, since_text: str, brief_link: str) -> st
 
 class Tracker:
     def __init__(self, gh, infra: tuple[str | None, str | None] | None = None):
+        # `gh` is the issues repository: the listing, the adoption and the
+        # filing. A carried issue is addressed where its `url` says it lives
+        # (gh_for): an episode that began before the issues repository was
+        # set still carries this repository's issue.
         self.gh = gh
+        self._repo_gh = {gh.repo: gh} if gh is not None else {}
         self.infra_owner, self.infra_backup = infra if infra is not None else infra_addressees()
         # One tick's reads: the open-issue list and each carried issue, once.
         self._open_issues: list | None = None
-        self._lookups: dict[int, dict | None] = {}
+        self._lookups: dict[tuple[str, int], dict | None] = {}
         # Issue numbers the episode already carries: never adopted a second
         # time for another condition (ensure's `skip`).
         self._skip: set[int] = set()
@@ -592,16 +634,30 @@ class Tracker:
             self._open_issues = [issue for issue in issues or [] if isinstance(issue, dict) and not issue.get("pull_request")]
         return self._open_issues
 
+    def gh_for(self, issue: dict | None):
+        """The Gh for the repository a carried issue lives in (ghcli.issue_repo);
+        None when the tracker has no Gh at all."""
+        if self.gh is None:
+            return None
+        repo = ghcli.issue_repo(issue)
+        if repo not in self._repo_gh:
+            self._repo_gh[repo] = ghcli.Gh(repo, self.gh.runner, dry_run=self.gh.dry_run, binary=self.gh.binary)
+        return self._repo_gh[repo]
+
     def lookup(self, issue: dict | None) -> dict | None:
-        """The issue's current GitHub payload (state, author, closed_at); None
-        when it cannot be read this tick."""
+        """The issue's current GitHub payload (state, author, body,
+        closed_at); None when it cannot be read this tick."""
         number = (issue or {}).get("number")
         if not number:
             return None
-        if number not in self._lookups:
-            payload = self.gh.call("GET", self.gh.path(ISSUE_PATH.format(number=number)))
-            self._lookups[number] = payload if isinstance(payload, dict) and payload.get("number") else None
-        return self._lookups[number]
+        gh = self.gh_for(issue)
+        if gh is None:
+            return None
+        key = (gh.repo, number)
+        if key not in self._lookups:
+            payload = gh.call("GET", gh.path(ISSUE_PATH.format(number=number)))
+            self._lookups[key] = payload if isinstance(payload, dict) and payload.get("number") else None
+        return self._lookups[key]
 
     def is_open(self, issue: dict | None) -> bool | None:
         """True / False by the issue's state; None when it could not be read,
@@ -613,7 +669,9 @@ class Tracker:
         return parse_iso((self.lookup(issue) or {}).get("closed_at"))
 
     def bot_filed(self, issue: dict | None) -> bool:
-        return ((self.lookup(issue) or {}).get("user") or {}).get("login") in BOT_LOGINS
+        payload = self.lookup(issue) or {}
+        body = payload.get("body") if isinstance(payload.get("body"), str) else ""
+        return (payload.get("user") or {}).get("login") in BOT_LOGINS or any(mark in body for mark in BOT_BODY_MARKS)
 
     def addressed(self, payload: dict, refused: bool = False) -> dict:
         """An infrastructure issue's payload, assigned to the infra owner and
@@ -684,9 +742,9 @@ class Tracker:
         else a new one. `since_text` is the incident's start on the reader's
         clock; `window_text` the span of the losses or kills, for those two
         bodies. `skip` is the numbers the episode already carries: the bot's
-        own fixture or node issue quotes the evidence, case lines included,
-        and must not become the break's tracker as well, or its close under
-        the live break takes the break's citation with it."""
+        own fixture or node issue quotes its own evidence lines only
+        (public_evidence) and must not become the break's tracker as well, or
+        its close under the live break takes the break's citation with it."""
         self._skip = {int(number) for number in skip}
         condition = health.get("condition")
         if condition == CONDITION_LOST_PODS:
@@ -700,7 +758,9 @@ class Tracker:
         cases = list(health.get("failing_cases") or [])
         if not cases:
             return None
-        found = self.existing(cases)
+        # The bot's own by its marker (the body names no case otherwise),
+        # else a human's that names every case.
+        found = self.existing(cases, marker=OUTAGE_MARKER_RE) or self.existing(cases)
         if found:
             log(f"tracking issue: adopting open #{found['number']} (names every failing case)")
             return dict(found, condition=condition) if condition else found
@@ -805,11 +865,14 @@ class Tracker:
         number = (issue or {}).get("number")
         if not number:
             return False
-        response = self.gh.call("POST", self.gh.path(COMMENTS_PATH.format(number=number)), {"body": comment})
+        gh = self.gh_for(issue)
+        if gh is None:
+            return False
+        response = gh.call("POST", gh.path(COMMENTS_PATH.format(number=number)), {"body": comment})
         if not close:
             return response is not None
         # A dry run prints both writes; a real one closes only after the comment landed.
-        if response is None and not self.gh.dry_run:
+        if response is None and not gh.dry_run:
             return False
-        closed = self.gh.call("PATCH", self.gh.path(ISSUE_PATH.format(number=number)), dict(CLOSE_PAYLOAD))
+        closed = gh.call("PATCH", gh.path(ISSUE_PATH.format(number=number)), dict(CLOSE_PAYLOAD))
         return response is not None and closed is not None

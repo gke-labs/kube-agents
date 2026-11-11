@@ -43,15 +43,15 @@ Changing it on a running install is a mode switch rather than a setting: the ope
 
 Under `next` the operator additionally renders the A2A stack:
 
-| Component                                  | What is rendered                                                                                                                                                                                                                                                                                                                                                                                 | Notes                                                                                                                                                                                                                                                                                                                          |
-| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Bus                                        | the NATS/JetStream component and its provisioning Job, an ingress NetworkPolicy fencing the bus, an egress NetworkPolicy fencing the session pods, and a session-pod ResourceQuota                                                                                                                                                                                                               |                                                                                                                                                                                                                                                                                                                                |
-| A2A gateway                                | its Deployment, with session-pod spawning armed and the console door always on (`A2A_CONSOLE_DOOR=true`)                                                                                                                                                                                                                                                                                         | runs on the console alone when no chat backend is configured                                                                                                                                                                                                                                                                   |
-| Capability verifier                        | a Deployment of two replicas, with its own ServiceAccount, a NetworkPolicy fencing it to DNS and the bus, a PodDisruptionBudget of `maxUnavailable: 1` and a `kubernetes.io/hostname` topology spread                                                                                                                                                                                            | the only bus principal permitted to read the `cap` KV bucket, and it needs nothing else; a submission arriving while no verifier is ready is refused terminally, so a node drain must not take both replicas at once                                                                                                           |
-| Auth callout                               | the Deployment that authenticates bus clients, its Service, ServiceAccount, Role and RoleBinding, a cluster-scoped ClusterRoleBinding to `system:auth-delegator`, the identity-map ConfigMaps `<agent>-a2a-authmap-<n>`, and the keys Secret `<agent>-a2a-callout-keys`; its two replicas also carry a PodDisruptionBudget of `maxUnavailable: 1` and a `kubernetes.io/hostname` topology spread | while no callout is ready the bus refuses every new connection, so a node drain evicts one callout at a time and waits for its replacement to be ready before taking the other                                                                                                                                                 |
-| Console server                             | the Deployment and Service `<agent>-a2a-console`, which serve the A2A console page and proxy its websocket to the bus, and a deny-all ingress NetworkPolicy, `<agent>-a2a-console-netpol`                                                                                                                                                                                                        | reachable only through `kubectl port-forward`, and that port-forward is also what hands out the console credential                                                                                                                                                                                                             |
-| ServiceAccounts                            | one for the provisioning Job and one for the spawned session pods                                                                                                                                                                                                                                                                                                                                | so the callout has an identity to resolve each by                                                                                                                                                                                                                                                                              |
-| Google Chat, when that is the chat backend | the A2A gateway consumes the install's Chat subscription in place of the Planning Agent, whose Google Chat platform is then not rendered, and carries `spec.integration.googleChat.homeChannel`                                                                                                                                                                                                  | the agent's proactive messages reach that space through the gateway, which posts them as new threads there or as replies on its threads and nowhere else. With `homeChannel` unset, or not a `spaces/<id>` name, the agent posts nothing to Google Chat unprompted, and unset, the CR carries the `HomeChannelUnset` condition |
+| Component                                  | What is rendered                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | Notes                                                                                                                                                                                                                                                                                                                          |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Bus                                        | the NATS/JetStream component and its provisioning Job, an ingress NetworkPolicy fencing the bus, an egress NetworkPolicy fencing the session pods, and a session-pod ResourceQuota                                                                                                                                                                                                                                                                                                                      |                                                                                                                                                                                                                                                                                                                                |
+| A2A gateway                                | its Deployment, with session-pod spawning armed and the console door always on (`A2A_CONSOLE_DOOR=true`). Its election Lease `<agent>-a2a-gateway`, which the gateway may only read and renew (the operator's `A2A_GATEWAY_ELECTION=false` turns the election off). A PodDisruptionBudget of `maxUnavailable: 1` while more than one replica is Ready, and a zone topology spread. It runs `availability.a2aGateway.replicas` replicas once a gateway on its image holds the Lease, and one before that | runs on the console alone when no chat backend is configured                                                                                                                                                                                                                                                                   |
+| Capability verifier                        | a Deployment of two replicas, with its own ServiceAccount, a NetworkPolicy fencing it to DNS and the bus, a PodDisruptionBudget of `maxUnavailable: 1` and a `kubernetes.io/hostname` topology spread                                                                                                                                                                                                                                                                                                   | the only bus principal permitted to read the `cap` KV bucket, and it needs nothing else; a submission arriving while no verifier is ready is refused terminally, so a node drain must not take both replicas at once                                                                                                           |
+| Auth callout                               | the Deployment that authenticates bus clients, its Service, ServiceAccount, Role and RoleBinding, a cluster-scoped ClusterRoleBinding to `system:auth-delegator`, the identity-map ConfigMaps `<agent>-a2a-authmap-<n>`, and the keys Secret `<agent>-a2a-callout-keys`; its two replicas also carry a PodDisruptionBudget of `maxUnavailable: 1` and a `kubernetes.io/hostname` topology spread                                                                                                        | while no callout is ready the bus refuses every new connection, so a node drain evicts one callout at a time and waits for its replacement to be ready before taking the other                                                                                                                                                 |
+| Console server                             | the Deployment and Service `<agent>-a2a-console`, which serve the A2A console page and proxy its websocket to the bus, and a deny-all ingress NetworkPolicy, `<agent>-a2a-console-netpol`                                                                                                                                                                                                                                                                                                               | reachable only through `kubectl port-forward`, and that port-forward is also what hands out the console credential                                                                                                                                                                                                             |
+| ServiceAccounts                            | one for the provisioning Job and one for the spawned session pods                                                                                                                                                                                                                                                                                                                                                                                                                                       | so the callout has an identity to resolve each by                                                                                                                                                                                                                                                                              |
+| Google Chat, when that is the chat backend | the A2A gateway consumes the install's Chat subscription in place of the Planning Agent, whose Google Chat platform is then not rendered, and carries `spec.integration.googleChat.homeChannel`                                                                                                                                                                                                                                                                                                         | the agent's proactive messages reach that space through the gateway, which posts them as new threads there or as replies on its threads and nowhere else. With `homeChannel` unset, or not a `spaces/<id>` name, the agent posts nothing to Google Chat unprompted, and unset, the CR carries the `HomeChannelUnset` condition |
 
 The operator also renders the task-signing key Secret `<agent>-a2a-task-signing-key`. Only its public half reaches the callout, and only the dispatcher will mount its seed.
 
@@ -60,6 +60,8 @@ Both topology spreads are `ScheduleAnyway`, so a single-node install still comes
 Disabling Google Chat afterwards, with no other backend configured, leaves the gateway running on the console door alone. Flipping back to `today` tears that stack down, keeping the generated credentials Secret and the JetStream PVC. The callout's keys Secret is **not** kept: a stale issuer key would make every answer the callout gives be refused, so it is deleted with the rest. The task-signing key Secret is deleted with it.
 
 Under `next` the A2A gateway serves Prometheus counters on a metrics-only port, 9096 (container port `a2a-metrics`, set by `A2A_METRICS_PORT`), which the chart's `<name>-a2a-gateway-monitoring` `PodMonitoring` scrapes behind `platformAgent.podMonitoring`; the metrics are listed on [Observability](/kube-agents/concepts/observability/). The gateway's NetworkPolicy, `<name>-a2a-gateway-netpol`, renders wherever the gateway does, eval door or no door. It admits the `gke-gmp-system` namespace and the operator's own pods to that port and nothing else, the operator because its usage poller reads the gateway's inbound-message counter into `status.usage.chatMessagesInboundTotal`.
+
+The same port answers `/readyz`, which the gateway Deployment's readinessProbe reads every 5 seconds: 503, with the reason, until the gateway has bound its event relay, which on a fresh install waits for the provisioning Job's `TASKS` stream. The kubelet's probe comes from the node, which the policy does not govern.
 
 ## `spec.harness`
 
@@ -161,9 +163,8 @@ CRD unchanged. `make install` in `k8s-operator/` applies them the same way.
 **This is an emergency stop, not a tuning knob.** It exists for the case where events arrive faster
 than the agent can triage them — a fleet-wide rollout gone wrong, a node pool flapping — and the
 cheapest way to get the agent back is to cut the inflow rather than chase the cards it has already
-been handed. It is all-or-nothing across every watched cluster: the watcher's reason and namespace
-filters live in the sidecar's entrypoint and are not exposed on the CRD, so there is no way to
-silence one noisy namespace through this field.
+been handed. It is all-or-nothing across every watched cluster. To silence one noisy namespace,
+cluster, reason or workload while the rest still alerts, use `alertExclude` below.
 
 If the board is merely busy rather than swamped, [`tuning.maxInProgress`](#specharnesstuning) is the
 knob for that — it throttles how many cards run at once without losing the events.
@@ -186,6 +187,45 @@ Three consequences before you press it:
 Unset means enabled. The watcher is how a fleet notices its own incidents, so an install that never
 mentions the field — which is every install today — keeps watching, and only an explicit `false`
 turns it off.
+
+`alertExclude` is the narrow tool: a list of rules for events that open no incident — no alert, no
+triage card, no share of the daily alert ceiling. Their clusters stay in scope, so the agent still
+reads them when asked; [`spec.scope.exclude`](#specscope) is what hides a cluster. Each rule sets one
+or more of `cluster`, `namespace`, `reason`, `kind` and `name`, and matches an event when every part
+it sets matches. `reason` and `kind` are matched without regard to case, and `reason` also matches
+the family the watcher groups a reason in, so
+`CrashLoopBackOff` covers kubelet's `BackOff` events for a restarting container. `name` takes a
+trailing `*` as a prefix, since pod names carry generated suffixes.
+
+```yaml
+spec:
+  harness:
+    eventWatcher:
+      alertExclude:
+        - namespace: payments # every alert from this namespace, on every cluster
+        - cluster: { clusterName: staging-a } # every alert from this cluster
+        - reason: FailedScheduling
+          cluster:
+            projectId: my-project
+            location: us-central1
+            clusterName: batch
+        - namespace: shop
+          kind: Pod
+          name: inventory-api-*
+```
+
+A change is in force within about two minutes, without a pod restart: the operator writes the list
+to a ConfigMap, and the watcher reads it again every minute. If the agent image is older than the
+operator, a change applies at the next pod restart.
+
+What the rules hold back is counted in the watcher's
+`k8s_event_watcher_events_filtered_total{gate="alert_excluded"}`, and the end-of-day recap says how
+many events and workloads they held back and names the five noisiest workloads. While
+the list is set, it replaces a `WATCHER_ALERT_EXCLUDE` entry in `spec.deployment.env`, and a move
+between the two rolls the pod once. The chart
+renders the list from `platformAgent.harness.eventWatcher.alertExclude`; a `helm upgrade` that
+removes the last rule removes the whole `eventWatcher` block from the CR, `enabled: false` with it,
+so set the emergency stop again after one.
 
 ### `spec.harness.driftDetector`
 
@@ -261,8 +301,10 @@ substitutes a placeholder name for it.
 `projectId` has to be the project ID, not the project number. The detector matches it against the
 project on each audit record, which is always the ID, so a value that is nothing but digits can
 match nothing. The operator reports the detector as off rather than starting a sidecar that exits on
-every launch. Everything else reading `spec.harness` accepts a number, so an install can be healthy
-in every other respect and still be refused here.
+every launch. `ScopeUndeclared` names the project only in a form `spec.scope.projects` accepts: on
+a number it reads the ID off the host cluster's own series, and otherwise it says nothing.
+Everything else reading `spec.harness` accepts a number, so an install can be healthy in every
+other respect and still be refused here.
 
 `subscription` and `gitopsManagers` are the two knobs worth moving from a CR. Leave `subscription`
 unset unless you renamed the one the module creates.
@@ -317,14 +359,49 @@ to stall in a namespace with an open alert is added to that alert's card at once
 1440; unset or `0` alerts on the first sweep that sees the stall.
 
 `kinds` replaces the default list of resources the watch scans: Deployments, StatefulSets,
-DaemonSets, Jobs, Gateway API Gateways and HTTPRoutes, and cert-manager Certificates. Write each
-item as kubectl names the resource, in lower case: `deployments`,
-`gateways.gateway.networking.k8s.io`. The single item `all` scans every namespaced kind the cluster
-serves, with one read per kind in each namespace, which is slow on a large fleet. The API server
-refuses `all` next to another item, and refuses Secrets, ConfigMaps, Events, Endpoints,
-EndpointSlices, ControllerRevisions and Leases, which the scan reports nothing from. Up to 20
-items. A kind a cluster does not serve is left out on
-that cluster.
+DaemonSets, Jobs, Gateway API Gateways and HTTPRoutes, cert-manager Certificates, and
+`*.cnrm.cloud.google.com`, the Config Connector kinds. Write each item as kubectl names the
+resource, in lower case: `deployments`, `gateways.gateway.networking.k8s.io`. An item of the
+form `*.<suffix>` is a group wildcard for every namespaced kind whose API group ends in the
+suffix. A list you set replaces the wildcard too: name `*.cnrm.cloud.google.com` in it to keep
+the Config Connector kinds.
+
+The single item `all` scans every namespaced kind the cluster serves, with one read per kind in
+each namespace, which is slow on a large fleet. The API server refuses `all` next to another
+item, and refuses Secrets, ConfigMaps, Events, Endpoints, EndpointSlices, ControllerRevisions and
+Leases, which the scan reports nothing from. Up to 20 items. A kind a cluster does not serve is
+left out on that cluster.
+
+The Config Connector wildcard is in the default list because a managed resource that Config
+Connector cannot apply shows it in two places only. The controller does not crash and logs only on
+the object. It records at most a Warning event there, which the event watcher forwards
+([a day in the life](/kube-agents/overview/day-in-the-life/) lists the reasons), and it sets the
+object's own `Ready` condition. The `ConfigConnector` object's status reports the controller's
+health, not the health of the resources it manages. `stall_report.py` reads the `Ready` condition
+as a stale condition once it has been false for longer than the stall threshold, so a `SQLInstance`
+stuck on `UpdateFailed` is a stall like a Deployment past its progress deadline, event or no event.
+
+Two reasons are in progress, not stalled, at any age: `Updating` (a create or update under way) and
+`Deleting`. `DependencyNotReady`, which lasts as long as the referenced resource's own create, is a
+stall after 60 minutes rather than after the usual 15.
+
+The add-on serves about three hundred kinds, so the watch does not read each one in each
+namespace. On each cluster that serves them, it discovers once which kinds have objects and in
+which namespaces, with one `kubectl get` over every namespace for each batch of 10 kinds. It
+keeps the result in its ledger and reads in a namespace only the kinds it found there, 20 per
+sweep.
+
+A namespace with more is read in turns, the next 20 on the next sweep, so every kind is
+read within a few sweeps. The ledger says which kinds wait. Objects in the system namespaces, in
+`excludeNamespaces` and in exempt namespaces do not reach the record.
+
+It discovers again after 6 hours, or after 1 hour when a batch failed, on at most 2
+clusters per sweep, so a fleet's refreshes spread out.
+
+A kind that gained its first object between two discoveries is read from the next one. A kind a
+discovery could not read, or one the cluster started to serve since the last discovery, holds its
+ledger rows as unread rather than clearing them. A cluster that serves no Config Connector kind
+runs no discovery.
 
 Separate from this block, the annotation `kubeagents.x-k8s.io/stall-watch: exempt` opts out
 without a CR change. On a namespace, the watch does not read the namespace, as if
@@ -358,7 +435,7 @@ Helm install, set the block in your values file.
 
 Execution limits per agent persona, where `<persona>` is one of `default` (the Planning Agent front
 door), `platform` (the Platform Agent), or `cluster` (**every** Cluster Agent), plus the board-wide
-`maxInProgress`, the mode-next session-pod cap `maxSessions`, and the AgentProfile knobs under
+`maxInProgress` and the dispatcher's memory `admission`, the mode-next session-pod cap `maxSessions`, and the AgentProfile knobs under
 `profiles` (the ceiling and its child reserve, `warmReplicas`, and the dispatcher's intervals; see [AgentProfile](./agentprofile-crd.md)). Unset,
 `maxSessions` renders `10`, `profiles.ceiling` follows `maxInProgress` (`6` unless set) and `profiles.warmReplicas` `1`; all three are
 inert under `mode: today`.
@@ -388,11 +465,28 @@ below. Set it on the CR to raise or lower that. Either way the value is pinned i
 at `/etc/hermes`, so it applies over whatever the agent's own `config.yaml` says, and removing the
 field puts the default back.
 
+**`admission` is pinned the same way.** On every tick the dispatcher reads `kanban.admission` from
+the managed scope and counts the container's working set, its cgroup memory usage less the inactive
+file cache, against a budget. Past it the dispatcher refuses a card rather than spawn a worker: the
+card is blocked with kind `capacity` and a reason that names the figures, so the thread that filed
+it is told it is throttled. The budget is the request, not the limit, because the kubelet evicts the
+pod under node pressure once its working set passes the request. Under GKE Sandbox the limit the container can read is the sandbox's, not the
+cgroup's, so Hermes' own `/proc/meminfo` guard never fires there.
+
+Unset, `memoryBudgetMiB` is the agent container's memory request in MiB (`spec.deployment.resources`,
+`4096` at the default `4Gi`), so raising the request raises the budget. `workerRssCapMiB` (`1536`)
+stops a running worker whose process tree passes it and blocks its card the same way.
+`queueBoundSeconds` (`600`) refuses a ready card that memory pressure or a full board has held for
+that long. `failClosed` (`true`) makes a tick that cannot read the memory counters spawn nothing.
+[PlatformAgent fields](/kube-agents/operator/platformagent-fields/) lists the bounds.
+
 ```yaml
 spec:
   harness:
     tuning:
       maxInProgress: 8 # board-wide; raises the operator's default of 6
+      admission:
+        memoryBudgetMiB: 3072 # the dispatcher's budget; defaults to the container's memory request
       platform:
         apiMaxRetries: 8
         maxTurns: 200
@@ -422,6 +516,17 @@ exhausts either stops mid-task without ever calling a terminal kanban tool. The 
 for `maxTurns`, `turn_exit_reason=all_retries_exhausted_no_response` for an `apiMaxRetries`
 exhaustion that ends with no response — and retrying re-runs into the same wall, so read that text
 and the upstream error rate before suspecting the worker.
+
+A `maxTurns` exhaustion keeps what the run found. At the cap the runtime asks the model for a
+closing summary and discards any tool call in the answer, and the worker saves the summary as the
+run's hand-off. `hermes kanban show <id>` prints it as the card's latest summary, the card carries
+it as a comment that names the budget used, and the next attempt reads it in its prompt under the
+prior attempt. The card's own `result` stays empty, as for every run that does not complete.
+
+The text is the model's, cut on a word at 4000 characters. When the summary call fails, the
+worker's last written answer is saved instead, and the comment says so. A summary that names a
+GitHub pull request URL is saved on the run only, with no comment: the dispatcher holds a card whose
+recent comments name one, and the retry is what the hand-off is for.
 
 One `apiMaxRetries` exhaustion is handled differently: when the retries were spent on provider rate
 limits (429s), the worker blocks its own card instead, kind `transient`, with the provider's error
@@ -481,6 +586,18 @@ should set `maxInProgress` to fit: about 430 MiB per worker over the 1.8 GiB the
 a 4Gi limit fits about five. Raise it once you know your worker footprint and your model quota —
 that quota is the other shared resource, and for most deployments it binds before memory does.
 
+At the operator's defaults the budget and this cap are close. The budget is the container's memory
+request, 4Gi unless `spec.deployment.resources` changes it, and it counts the agent container alone.
+A tick admits one new worker per 512 MiB of headroom under the budget: from an idle set of about
+800 MiB that is six, from the 1.5 GiB a `spec.mode: next` gateway idles at, five. Six workers at
+430 MiB add about 2.6 GiB, inside the request from the smaller idle set and one worker short from
+the larger. To admit more, raise the request, not the limit: under node pressure the kubelet evicts
+the pod once its working set passes the request ([`admission`](#specharnesstuning)).
+
+[`docs/designs/safe-throttling.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/safe-throttling.md)
+is the design for admission by memory beside this count: a pressure guard on the container's own
+memory counters, a resident cap per worker, and a `capacity` refusal that names the alternatives.
+
 The cap comes from the operator, not from the image or the agent's own `config.yaml`. The operator
 pins `kanban.max_in_progress` in the managed scope at `/etc/hermes`: the CR's value, or `6` when it
 says nothing. Hermes applies that file over the agent's config on every load, so a value an existing
@@ -517,6 +634,11 @@ waits, because every slot is busy or the only free one is triage's, gets one lin
 part of a request already running (a worker's child, or a card with a parent link) waits without
 one.
 
+The wait is bounded. A card that memory pressure or a full board has held past
+`tuning.admission.queueBoundSeconds` (600 s by default) is blocked with kind `capacity`. The queued
+line settles as stopped, and the Planning Agent answers the thread with the reason and the
+alternatives ([`admission`](#specharnesstuning)).
+
 A full board is logged as what it is. When every slot is busy for six ticks in a row the gateway
 logs, at most every five minutes:
 
@@ -535,16 +657,24 @@ instead. That line is load, not a fault. The older
 `kanban dispatcher stuck: … Check profile health` warning now means what it says: slots were free
 and still nothing started.
 
+That warning waits for six ticks, so a short saturation would leave no trace. Each user card that
+waits therefore also writes one `kanban priority: <id> queued …` line to the gateway log on the tick
+it is queued. The line says how many user cards are ahead of it, names the cards that held the
+slots and ends with the same held-back clause, so the wait is readable back afterwards. The card's
+`queued` event on the board carries the holders' ids as well.
+
 The arithmetic behind `6`:
 
 - **Gateway memory.** One worker measured about 430 MiB on a live install: `hermes chat` 207 MiB,
   two Node MCP proxies about 100 MiB each, a supervisor and an ssh. Six of them are about 2.6 GiB
   over the gateway's 1.8 GiB idle set, about 4.4 GiB under the container's 8Gi limit. A coordinator
   waiting on its own children gives its slot back but stays resident, so the process count can sit
-  above six; the 8Gi limit leaves room for about fourteen workers at that size.
+  above six; the 8Gi limit leaves room for about fourteen workers at that size. That is the limit's
+  room; the room a default install uses is the request's, because the admission budget follows the
+  request (above).
 - **Credential proxy.** Every worker's `kubectl` and `gcloud` runs through the proxy, which admits a
-  request only when its children fit the proxy's memory limit: 176 MiB per request after 320 MiB of
-  fixed reserves. At its default 2Gi limit that is 9 at once
+  request only when its children fit the proxy's memory limit: 176 MiB per request after a 192 MiB
+  reserve for the broker and Envoy. At its default 2Gi limit that is 10 at once
   (`credentialProxyAdmittedRequests` in
   `k8s-operator/internal/controller/credential_proxy_manifests.go`), held to 8 by its slot cap. At
   the old 1Gi it was 4.
@@ -569,7 +699,7 @@ The cap counts running cards, not resident processes, and one case makes those d
 waiting on work it fanned out is discounted, or it would hold the slot its own children need
 ([`kanban_scheduling.py`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/patches/kanban_scheduling.py)).
 Peak memory is therefore the cap plus however many coordinators are waiting, held down by the
-dispatcher's memory-pressure guard rather than by this number.
+dispatcher's memory admission ([`tuning.admission`](#specharnesstuning)) rather than by this number.
 
 ### `spec.harness.experimental`
 
@@ -595,8 +725,9 @@ Three things change while it is on:
 - `profile-platform.overlay.yaml` gains the three profile-shaped things only the `default` profile
   carried before: the toolsets each chat platform key resolves, the ingress plugins, and the
   `kanban` block. The adapters themselves are not copied — the managed scope at `/etc/hermes` is
-  machine-global, so `platforms.*`, `display.platforms` and the board's worker cap
-  ([`tuning.maxInProgress`](#specharnesstuning)) already land on this profile. The rest of `kanban`
+  machine-global, so `platforms.*`, `display.platforms`, the board's worker cap
+  ([`tuning.maxInProgress`](#specharnesstuning)) and the dispatcher's memory admission
+  ([`tuning.admission`](#specharnesstuning)) already land on this profile. The rest of `kanban`
   does have to follow the gateway, because the dispatcher and the notifier run in the gateway
   process and read their settings from its own home. The board itself does not move — Hermes
   anchors `kanban.db` at the shared root rather than the active profile, deliberately, so the
@@ -643,7 +774,7 @@ leave the Platform Agent unable to do the work the flag exists to let it do.
   Those are `cluster-agent-reconcile`, which scaffolds a profile for a newly onboarded cluster and
   prunes one for a deleted cluster; `oobe`, which runs first-run onboarding (the
   `bootstrap-inventory-*` entries ship disabled); and `profile-cron-tick`, the only thing that ticks
-  a **named** profile's own store — so every `cluster-*` roster goes quiet with it. Nothing errors
+  a **named** profile's own store — so every `cluster-*` roster goes quiet with it, and so do the [idle-install hold](/kube-agents/concepts/autonomous-watchdogs/#idle-installs) on the Platform Agent's model-run jobs and the [catch-up policy](/kube-agents/concepts/autonomous-watchdogs/#catch-ups-after-a-pause) that thins them after a pause, which run inside that job. Nothing errors
   and nothing is logged: a job that is never ticked stays `scheduled` with a `next_run_at` in the
   past.
 
@@ -696,16 +827,16 @@ leave the Platform Agent unable to do the work the flag exists to let it do.
 #### `shellSandbox`
 
 - `enabled` — the agent's shell runs in a StatefulSet of its own, reached over SSH with the keypair in the agent's credential Secret (`SANDBOX_SSH_PRIVATE_KEY` and its public half in `<name>-shell-authorized-keys`). **This is not a toggle: `false` is refused** with `Degraded`/`ShellSandboxCannotBeDisabled`, which changes nothing about the running workload. Absent or `true` are the same thing. With no keypair the sandbox Pod cannot start at all — the Secret it mounts is not optional — so the operator reports `Degraded`/`ShellSandboxKeysMissing` rather than leaving the Pod in `ContainerCreating` with the reason only in a Pod event. `install.sh`, `upgrade.sh` and the Terraform composition generate the pair; a bare `helm install` that passes none, or a kustomize install (INSTALL.md Method 2) that skipped its Step 2, reaches that state.
-- `image` — overrides the sandbox image. Empty takes the operator's default. A pinned image must be at least as new as the operator. The operator runs the image's entrypoint in an init container that stages the image-shipped trees, and an older image does not have that mode, so the sandbox Pod never starts.
+- `image` — overrides the sandbox image. Empty takes the operator's default. A pinned image must be at least as new as the operator. The operator runs the image's entrypoint in an init container that stages the image-shipped trees, and an older image does not have that mode, so the sandbox Pod never starts. A pin also survives every upgrade, and a sandbox older than the agent fails its `kubectl` calls at the credential proxy, so the operator reports the [`ShellSandboxPinned`](#status) condition while the pin differs from its own image.
 - `runtimeClassName` — runs the sandbox Pod under a sandboxed container runtime, `gvisor` being the one GKE offers. Unset by default. Separate from [`spec.deployment.availability.runtimeClassName`](#specdeployment), which governs the agent Pod: that Pod holds SQLite databases whose WAL mode gVisor corrupts on the gofer-backed mount, and setting the agent Pod's field pins Hermes' own databases to the DELETE journal mode (the Session KV store is not covered; see `availability.runtimeClassName` under [`spec.deployment`](#specdeployment)), while the sandbox Pod holds none — so an install can sandbox the untrusted Pod without sandboxing, or slowing, the trusted one.
 
   On GKE Standard the cluster needs a node pool created with `--sandbox type=gvisor`; Autopilot ships the RuntimeClass natively. A RuntimeClass the cluster does not have leaves the CR `Degraded` naming it, rather than a Pod sitting `Pending`.
 
-- `resources` — requests and limits for the shell container. Merged over the operator's defaults per key, like `credentialProxy.resources` under [`spec.deployment`](#specdeployment): a CR that sets only the memory pair keeps the default 200m CPU request and 2 CPU limit. The defaults are a 512Mi memory request and a 2Gi memory limit. Only `cpu`, `memory` and `ephemeral-storage` are accepted.
+- `resources` — requests and limits for the shell container. Merged per key over the operator's defaults, or over the [`sizingProfile`](#specdeployment) row when one is set, like `credentialProxy.resources` under [`spec.deployment`](#specdeployment): a CR that sets only the memory pair keeps the default 200m CPU request and 2 CPU limit. The defaults are a 512Mi memory request and a 2Gi memory limit. Only `cpu`, `memory` and `ephemeral-storage` are accepted.
 
   The shell is where every model-authored command runs, so a fleet sweep that fans out many `kubectl` calls at once is bounded by this container's memory; raise it when the shell Pod is OOM-killed. On GKE Autopilot without bursting the limits are set equal to the requests, so there `requests.memory` is the figure that counts, with `limits.memory` to match. A change rolls the shell Pod, as an image change does; the image-trees init container and the gateway's sandbox sidecars keep their own figures.
 
-  The operator refuses a request above its limit, a negative quantity, a zero limit, `claims`, and any other resource name, whether or not the webhook is on. It ignores the override, renders the shell at its defaults, and reports `Degraded` with reason `InvalidShellSandboxResources` when no higher-ranked `Degraded` cause is present, the agent staying Ready. There is no memory floor. Where the [validating webhook](/kube-agents/operator/#admission-webhooks) is enabled, admission refuses the same override at apply, and warns on the GKE Autopilot memory-per-vCPU band and on a `cpu` or `memory` limit set without the same key under `requests`, for the reasons `credentialProxy.resources` gives.
+  The operator refuses a request above its limit, a negative quantity, a zero limit, `claims`, and any other resource name, whether or not the webhook is on. It ignores the override, renders the shell at the profile's row (the operator's defaults under `small`), and reports `Degraded` with reason `InvalidShellSandboxResources` when no higher-ranked `Degraded` cause is present, the agent staying Ready. There is no memory floor. Where the [validating webhook](/kube-agents/operator/#admission-webhooks) is enabled, admission refuses the same override at apply, and warns on the GKE Autopilot memory-per-vCPU band and on a `cpu` or `memory` limit set without the same key under `requests`, for the reasons `credentialProxy.resources` gives.
 
 The GitHub-writing skills hand the credential broker file content and a commit message rather than a directory both sides mount, so the agent never holds a `.git`. There is no field for it: the broker keeps the checkout on its own state volume, which closes git's config-driven exec surface — a hook, a pager, a `filter.*.clean`, an `ext::` transport — and an install that could turn that off would be choosing to keep it open.
 
@@ -742,18 +873,38 @@ Abstracts the pod/deployment configuration. The controller synthesises a `Deploy
   that isn't the current one but still has replicas) and run
   `kubectl scale rs <name> -n <namespace> --replicas=0`.
 
+- `availability.a2aGateway.replicas` — the A2A gateway's replica count under `mode: next`, default
+  2, minimum 1, maximum 5. One replica holds the gateway's Lease and does the work; the others stand by and
+  take over within the lease's 20s if it stops. The operator renders more than one only once a
+  gateway pod on the image it renders holds the Lease (the `GatewayElected` condition), and one
+  with `Recreate` until then. Two or more roll with a surge pod, so the namespace's ResourceQuota
+  needs room for one more gateway pod during a rollout; set 1 where it has none. An install upgrading from one gateway pod
+  goes to two once its new gateway holds the Lease.
+
+  The chart's quota check and the operator's own session pod quota both count the standby and
+  the surge pod.
+
+  The elected gateway depends on the API server. A leader whose renewals fail stops about 12s
+  after its last good renewal, and no replica leads until the API server answers again. Chat, the
+  console and the relay stop for the length of a control-plane outage, and a zonal cluster's
+  control-plane upgrade is several minutes of that. Run a regional control plane where the gateway
+  must stay up through one.
+
 - `availability.runtimeClassName` — pod runtime class (e.g. `gvisor`) for the agent Pod. Nested under `availability` alongside `replicas`, `nodeSelector`, `tolerations` and `affinity`. When set, the managed config also carries `database.journal_mode: delete`, and the entrypoint converts Hermes' existing databases out of WAL once at start-up — `state.db`, `kanban.db` and the cron, project, evidence, response, memory and Discord stores Hermes opens through the same journal-mode helper. A sandboxed runtime serves the data volume over a gofer mount that accepts SQLite's WAL mode and then corrupts it. The Session KV store (`session_kv.db` on the `system-metadata` volume) sets WAL itself and is not covered by either. Clearing the field drops the pin, and the databases return to WAL on their next open.
 - `env` — additional container environment variables.
-- `resources` — requests and limits for the agent container, replacing the operator's defaults as a block.
+- `resources` — requests and limits for the agent container, replacing the operator's defaults as a block. The memory request is also the dispatcher's default admission budget ([`tuning.admission`](#specharnesstuning)), so raising it admits more workers at once.
 - `credentialProxy.resources` — requests and limits for the credential-proxy container, the broker that runs every credentialed command in a pod of its own. Merged over the operator's defaults per key, unlike `resources`; [`spec.deployment.credentialProxy.resources`](#specdeploymentcredentialproxyresources) has the defaults it keeps, what the operator refuses, and what admission warns about.
-- `credentialProxy.exec.replicas` — the number of exec-tier broker pods, 0 to 32: stateless replicas beside the broker pod that answer `/v1/exec` and `/v1/gcp/` only. Unset or 0 renders none. A positive count renders the `<name>-credential-proxy-exec-tier` Deployment and Service, a ConfigMap with the count, a NetworkPolicy, and a PodDisruptionBudget from two replicas. Each replica requests and is limited to 2 CPU and 2Gi. A change between two positive counts does not restart the pods. Above 0 the agent's name must be at most 36 characters; a longer one is refused, the tier is not rendered, and `Degraded` reports `InvalidCredentialProxyExec`. The operator does not size the tier from the fleet, and the CR status reports no readiness for it.
-- `agentAPIAuth.resources` — requests and limits for the `agent-api-auth` sidecar in the gateway pod, the native container that authenticates the agent's API-server calls and also runs the event watcher and the drift detector. Merged over the operator's defaults per key, like `credentialProxy.resources`: a CR that sets only `limits.memory` keeps the default 150m CPU request, 384Mi memory request, 1 CPU limit and 2Gi ephemeral-storage limit.
+- `credentialProxy.exec.replicas` — the number of exec-tier broker pods, 0 to 32: stateless replicas beside the broker pod that answer `/v1/exec` and `/v1/gcp/` only. 0, the default, renders none. A positive count renders the `<name>-credential-proxy-exec-tier` Deployment, Service, count ConfigMap, NetworkPolicy and (from two replicas) PodDisruptionBudget, and gives the sandbox, the profile workers and the session pods its address. Each replica requests and is limited to 2 CPU and 2Gi, so each one needs a node with that much free, and the pods that turning the tier on restarts (below) need room to start again.
+
+  Turning it on or off restarts the shell sandbox and the profile warm pools, and the A2A gateway under the cluster view; changing between two positive counts restarts nothing. With a positive count the agent's name must be at most 36 characters, or it is refused and `Degraded` reports `InvalidCredentialProxyExec`. The operator does not size the tier from the fleet; [`CredentialProxyExecReady`](#status) reports its Ready replicas, and `Unschedulable` with the scheduler's message for a replica that has no room.
+
+- `agentAPIAuth.resources` — requests and limits for the `agent-api-auth` sidecar in the gateway pod, the native container that authenticates the agent's API-server calls and also runs the event watcher and the drift detector. Merged per key over the operator's defaults, or over the [`sizingProfile`](#specdeployment) row when one is set, like `credentialProxy.resources`: a CR that sets only `limits.memory` keeps the default 150m CPU request, 384Mi memory request, 1 CPU limit and 2Gi ephemeral-storage limit.
 
   The event watcher reads the memory limit through the Downward API and sets its Go soft memory limit to half of it, so raise `limits.memory` when the watcher is OOM-killed under a large fleet of watched clusters. Overriding `limits.cpu` also changes the watcher's `GOMAXPROCS`, which the Go runtime derives from the container's CPU limit, so leave `limits.cpu` at the default unless you mean to. Only `cpu`, `memory` and `ephemeral-storage` are accepted.
 
   The startup peak depends on the control plane. With the `WatchList` feature gate, on at Kubernetes 1.32 and from 1.34, the watcher holds a cluster's whole initial stream until its end, so up to four of the largest backlogs are resident at once. Without the gate the watcher reads the backlog in pages of 500 Events and holds one page per cluster. Steady state scales with the number of watched clusters and their open incidents.
 
-  The operator refuses a request above its limit, a negative quantity, a zero limit, `claims`, and any other resource name, whether or not the webhook is on. It ignores the override, renders the sidecar at its defaults, and reports `Degraded` with reason `InvalidAgentAPIAuthResources` when no higher-ranked `Degraded` cause is present, the agent staying Ready. There is no memory floor, unlike the credential proxy, because the watcher derives no admission count from the limit. Where the [validating webhook](/kube-agents/operator/#admission-webhooks) is enabled, admission refuses the same override at apply, and warns on the GKE Autopilot memory-per-vCPU band and on a `cpu` or `memory` limit set without the same key under `requests`, for the reasons `credentialProxy.resources` gives.
+  The operator refuses a request above its limit, a negative quantity, a zero limit, `claims`, and any other resource name, whether or not the webhook is on. It ignores the override, renders the sidecar at the profile's row (the operator's defaults under `small`), and reports `Degraded` with reason `InvalidAgentAPIAuthResources` when no higher-ranked `Degraded` cause is present, the agent staying Ready. There is no memory floor, unlike the credential proxy, because the watcher derives no admission count from the limit. Where the [validating webhook](/kube-agents/operator/#admission-webhooks) is enabled, admission refuses the same override at apply, and warns on the GKE Autopilot memory-per-vCPU band and on a `cpu` or `memory` limit set without the same key under `requests`, for the reasons `credentialProxy.resources` gives.
 
 - `initContainers` / `sidecars` — standard init and sidecar containers. A `volumeMounts` entry naming a reserved volume is refused at admission, the same as `extraVolumeMounts`. That is the route that needs no user-authored volume at all, and so the one the name reservation exists for; see [Reconcile behavior](#reconcile-behavior).
 
@@ -787,7 +938,46 @@ Abstracts the pod/deployment configuration. The controller synthesises a `Deploy
   the whole status write — `Ready`, the phase and every other condition with it.
 
 - `podAnnotations` — annotations applied to the generated pod template.
-- `scaleToZero` — when `true`, scales the deployment to 0 replicas (idle cost saving).
+- `scaleToZero` — when `true`, scales the gateway Deployment to 0 replicas (idle cost saving). The shell sandbox, the credential broker and, under `mode: next`, the A2A stack keep running. Once the gateway has no ready replica the `PlatformAgent` reads `phase: Paused`, with `Ready` `False` and reason `ScaledToZero`. That tells a paused install from one whose rollout never finishes. Set the field to `false` or remove it, and the normal phases return: `Provisioning` while the gateway starts, then `Ready`. [What `Ready` reports](#what-ready-reports) has the detail. On the way back the Platform Agent's scheduled audits do not all start at once: [Catch-ups after a pause](/kube-agents/concepts/autonomous-watchdogs/#catch-ups-after-a-pause).
+- `sizingProfile` — the preset row the credential-proxy container, the `agent-api-auth` sidecar and the shell container start from, before the per-key overrides above and under [`shellSandbox`](#shellsandbox) are applied over it; an explicit key always wins. One of `small` (the default, and what an absent field means: the operator's defaults as documented above), `medium`, `fleet` or `auto`. The agent container's own `resources` are not part of a profile.
+
+  | Tier     | Credential proxy                                                                                     | `agent-api-auth`   | Shell            |
+  | -------- | ---------------------------------------------------------------------------------------------------- | ------------------ | ---------------- |
+  | `small`  | the defaults above                                                                                   | the defaults above | the defaults     |
+  | `medium` | 1 CPU and 4Gi requests (2 CPU and 4Gi on GKE Autopilot), 2 CPU and 4Gi limits, 8Gi ephemeral-storage | 4Gi memory limit   | the defaults     |
+  | `fleet`  | 4 CPU and 8Gi requests, 8 CPU and 8Gi limits, 8Gi ephemeral-storage                                  | 8Gi memory limit   | 4Gi memory limit |
+
+  Figures a row does not name keep the small row's. `auto` promotes the tier from the cluster count the operator polls into `status.usage`, the larger of `clustersRegistered` and `clustersMonitored`: `medium` at 10 clusters, `fleet` at 25. It continues from the tier `status.effectiveSizingTier` holds: `small` on a CR that never named a tier, and the explicit tier on one that did. A CR moved from `fleet` to `auto` therefore stays at `fleet`; set `small` first to restart it from `small`. A promotion is upward only, latched in that status field, so a count that falls never lowers the tier, and a recreated CR starts again at `small`.
+
+  Before each step up the operator reads every ResourceQuota in the namespace. On each constrained `cpu`, `memory` and `ephemeral-storage` key, requests and limits sides alike, it compares the free quantity with what the step adds across the three containers. The difference is what admission has to find room for, because each of the three pods is replaced rather than surged. It tries the earned tier first, then each tier between it and the running one, every step measured from the running tier, and takes the highest step the quotas admit. A count that earns `fleet` with room for the `medium` step alone reaches `medium`; when every step is short the running tier stays.
+
+  With a quota or a LimitRange in the namespace, a step is measured only once the running tier's workloads have settled: each carries the tier's resources, its rollout is complete and every replica is available. A quota's used total charges a step only when admission has created its pods. So the pass after a promotion, while the broker recreates, measures nothing and leaves the tier and the condition as they are. Each such pass logs the hold and the workload it waits on.
+
+  A workload that is not there has not settled either. The quota charges nothing of it while the step is measured from its row, and a `Pod`-type LimitRange item is read against its template. So the pass that recreates it is the one that lifts the hold.
+
+  On GKE Autopilot without Pod bursting admission sets every limit equal to its request. The operator reads that clamp from Autopilot's own record, the `autopilot.gke.io/resource-adjustment` annotation on the running templates. A limit the record shows lowered to its request is read through the requests side when the settled check compares a template with the tier's figures. When any record shows the cluster clamps, every `limits.*` key of a step is compared with the requests' movement, the figure admission charges there, rather than with the rows' limits. With no such record (GKE Standard, Autopilot with bursting) limits are compared and counted as written.
+
+  Any refused step sets the `SizingCappedByQuota` condition ([`status`](#status) below) naming the quota and the key, rather than rolling out pods the quota would refuse. The message names the tier earned, the running tier the refused step was measured from, and the tier that stays. A count that earns `fleet` with room for the `medium` step therefore reads as the step up from `small` until the `medium` pods settle. The step from `medium` is then measured, the message changes once, and the Warning event carries that step's figures.
+
+  A quota whose scopes cannot select these pods is not read, as admission would not read it: `Terminating`, `BestEffort`, `CrossNamespacePodAffinity`, `VolumeAttributesClass`, or a `PriorityClass` requirement that does not match the class admission gives these pods. `NotTerminating` and `NotBestEffort` quotas bind them and are read. An explicit tier is applied as written, without the check.
+
+  That class is the one admission gives the pod a step recreates. The operator asks for it with a server-side dry-run create of a Pod built from the broker Deployment's template, which runs the API server's Priority plugin and persists nothing. The answer is none on a cluster with no `globalDefault` PriorityClass, and the default's name on one that has it, created before or after the install. A quota scoped `In` that default then binds the pods and is read. Admission is asked only when a `PriorityClass`-scoped quota constrains a cpu, memory or ephemeral-storage key. One that counts `pods` or `count/*` alone cannot refuse a step, so it asks nothing.
+
+  When the dry run is refused, the step is held: nothing is measured, the tier and any standing condition stay as written, and the pass logs the hold until admission answers. A broker Deployment that does not exist yet holds the step the same way, before admission is asked.
+
+  The check reads the quotas once, and the broker's Recreate asks admission for its new pod only after the old one has drained, so a pod the namespace admits in between can take the room the check found. When the proxy or the gateway Deployment then carries `ReplicaFailure` with admission's `exceeded quota` message, the next pass steps the latch back one tier and sets `SizingCappedByQuota` naming the quota and that message.
+
+  The refusal is read only when a key it names is one the step up to the latched tier raised on that pod, and the figure it asked for is under the row above's. A `pods` count at its cap, a key no row moves, or the old ReplicaSet's refusal lingering after a step back is left to the settled hold instead.
+
+  The lower row is rendered, and once its pods settle the step up is measured again, after a hold of ten minutes from the step back; a pod refused at the lower row too is stepped back from in turn. The shell StatefulSet carries no such condition, so its refused pod shows as the settled hold in the operator log.
+
+  The check also reads the namespace's LimitRanges, before the quotas, as admission does. Each `Container`-type item's `max`, `min` and `maxLimitRequestRatio` are compared with the three sized containers' requests and limits at the candidate row. Each `Pod`-type item's are compared with the sums of the pods those containers run in, read off the running templates with the sized container's figures swapped for the candidate row's. The limits are read through the Autopilot clamp where the running templates show one. A row that crosses a bound is refused and the condition names the LimitRange, the item's scope, the bound, the resource and the container, with reason `LimitRangeShort` and the figures in a `SizingCappedByLimitRange` Warning event.
+
+  Neither check reads node capacity. On GKE Standard the `medium` and `fleet` rows' broker requests (1 and 4 CPU) have to fit on one node before the recreated broker can start. A Standard pool therefore needs nodes that fit the `fleet` row's 4 CPU request (`e2-standard-8` or larger) before the count reaches 25 under `auto` ([the sizing guide](/kube-agents/deploy/fleet-sizing/#option-b-gke-standard)).
+
+  A change of tier recreates the proxy pod once and rolls the gateway and the shell pod, as a `resources` change does. The usage poller takes its first reading 30 seconds after the operator is elected and every five minutes after. An operator restart on a running install therefore re-reads the count within a minute; a fresh install is sized on the first poll that reads the gateway.
+
+  Admission and the reconciler validate an override against the row the CR renders: the explicit profile's, or under `auto` the tier `status.effectiveSizingTier` holds, `small` before the first pass writes one. A CR run at an explicit `fleet` with an override the fleet row admits, a 3 CPU request on the proxy, say, keeps it when switched to `auto`, since the latch stays at `fleet`. A higher row never refuses an override a lower one admitted; a step back to a lower row that refuses one renders that row and reports `Degraded` until the override is corrected, as an override that was never valid does.
 
 Default image: derived dynamically from the operator's container image at runtime via the `OPERATOR_IMAGE` env var on the controller manager (e.g. `ghcr.io/gke-labs/kube-agents/platform-agent:<version>`), overridable operator-wide via the `PLATFORM_AGENT_IMAGE` env var on the controller manager (see [Docker images § Private / custom registry](/kube-agents/deploy/docker-images/#private--custom-registry)), and falling back to `ghcr.io/gke-labs/kube-agents/platform-agent:latest` if neither is set. Rebuild with `make dev-rebuild-agent ARGS="platform"` for local iteration.
 
@@ -795,13 +985,13 @@ Default image: derived dynamically from the operator's container image at runtim
 
 ### `spec.deployment.credentialProxy.resources`
 
-`credentialProxy.resources` is merged over the operator's defaults per key, unlike `resources`: a CR that sets only `limits.memory`, at or above the default memory request, keeps the default requests, the 2 CPU limit and the 8Gi ephemeral-storage limit, which bounds the content workspace. The proxy's state emptyDir (size limit 5Gi) grows by whatever that limit is raised above the 8Gi default, and its `/tmp` emptyDir keeps its 2Gi, so the kubelet does not evict the pod at the smaller figure.
+`credentialProxy.resources` is merged over the operator's defaults per key, unlike `resources`: a CR that sets only `limits.memory`, at or above the default memory request, keeps the default requests, the 2 CPU limit and the 8Gi ephemeral-storage limit, which bounds the broker's scratch clones. The proxy's state emptyDir (size limit 5Gi) grows by whatever that limit is raised above the 8Gi default, and its `/tmp` emptyDir keeps its 2Gi, so the kubelet does not evict the pod at the smaller figure.
 
 The default requests are 500m CPU and 1Gi of memory, and on GKE Autopilot 2 CPU and 2Gi, because Autopilot without bursting clamps the limits to the requests. A `cpu` or `memory` limit set without its request, below the default request, lowers that request to the limit. On Autopilot a CPU request the CR does not set is held to at most one CPU per GiB of the memory request, so the pair does not fall under the band's 1 GiB per vCPU floor.
 
-The broker sizes how many commands it admits at once from the memory limit, so that is the key to raise when the proxy is OOM-killed under a large fleet. Only `cpu`, `memory` and `ephemeral-storage` are accepted, the quantities the container declares.
+The broker sizes how many commands it admits at once from the memory limit, so that is the key to raise when the proxy is OOM-killed under a large fleet, or pick a [`sizingProfile`](#specdeployment) row that raises it. Only `cpu`, `memory` and `ephemeral-storage` are accepted, the quantities the container declares.
 
-**What the operator refuses.** A memory limit below 672Mi (two commands at once), a request above its limit, a negative quantity, a zero limit and `claims`, which the proxy pod has no use for. A refused override, including an edit of one that was valid, renders the proxy Deployment at the operator's defaults rather than at the last accepted override until it is corrected, which restarts the proxy once (its Deployment is `Recreate`), and the agent stays Ready whether or not the webhook is on. The `Degraded` condition carries one reason, and reports `InvalidCredentialProxyResources` when no higher-ranked `Degraded` cause is present.
+**What the operator refuses.** A memory limit below 544Mi (two commands at once), a request above its limit, a negative quantity, a zero limit and `claims`, which the proxy pod has no use for. A refused override, including an edit of one that was valid, renders the proxy Deployment at the sizing profile's row (the operator's defaults under `small`) rather than at the last accepted override until it is corrected, which restarts the proxy once (its Deployment is `Recreate`), and the agent stays Ready whether or not the webhook is on. The `Degraded` condition carries one reason, and reports `InvalidCredentialProxyResources` when no higher-ranked `Degraded` cause is present.
 
 **What admission adds.** Where the [validating webhook](/kube-agents/operator/#admission-webhooks) is enabled, admission refuses the same override at apply and the running proxy is untouched. Admission also warns, using the Autopilot default requests on every cluster type, when memory per CPU on the requests pair leaves the 1 to 6.5 GiB per vCPU band GKE Autopilot admits unchanged, because Autopilot then raises the smaller request and the chart's quota preflight is short by the difference; Autopilot applies the band to requests only.
 
@@ -870,6 +1060,22 @@ keeps the last declaration's exclusions and marks nothing newly `retiring` (a pr
 block already marked `retiring` is still pruned on a clean run); an empty `projects` list in a
 present block drops the projects an earlier block declared, over two clean runs.
 
+That default reaches every cluster in the management project, the ones nobody deployed the agent
+for included. A scope with no membership list is the block absent, or present with every
+membership list empty, which is what the installer renders without `SCOPE_*` values. While
+that holds and the event watcher registers a cluster in the management project other than the
+host, the operator writes the `ScopeUndeclared` condition with the count and names of the
+adopted clusters ([Status](#status)). A profile in another project is not counted: nothing
+adopted it. To keep the adopted clusters and clear the condition, name the management project in `projects`; to
+leave a cluster unmanaged, list it under `exclude.clusters`, and the next reconcile prunes its
+profile.
+
+The condition covers a scope that names nothing. The management project stays in scope under any
+declaration, so a scope that names other projects silences it without retiring the neighbours. On
+an install made with `install.sh`, declare the scope in `install.env` (`SCOPE_PROJECTS`,
+`SCOPE_EXCLUDE_CLUSTERS`) and run `upgrade.sh`; a hand edit of the CR is refused at the next full
+upgrade, as the paragraphs above say.
+
 ```yaml
 spec:
   scope:
@@ -919,10 +1125,29 @@ spec:
   cluster name is unique only within a project and location. This replaces the
   `RECONCILE_EXCLUDE` environment variable, which matched bare names across every project and keeps
   working for one release alongside it. An excluded cluster gets no Cluster Agent, and fleet answers,
-  the onboarding sweep and the fleet-audit collectors that list clusters leave it out. Still covering
-  it: the daily upgrade-readiness watch and the Saturday `upgrade-readiness-weekly-review`, whose reports enumerate by project (the review's findings on such a cluster reach the findings queue and the weekly brief); the networking audit's
-  subnet usage, since its pods still hold their IPs; the GCE audit's instance listing; and the
-  third-party `gke` MCP server's `list_clusters`.
+  the onboarding sweep and the fleet-audit collectors that list clusters leave it out.
+
+  The credential broker and `kube-proxy` refuse every route to an excluded cluster's Kubernetes
+  API, for every caller, the agents' own commands included. That covers a kubeconfig the broker mints or uses, `gcloud container clusters get-credentials`, `kubectl` through `kube-proxy`,
+  the watchers' cluster relay and the `gke` MCP server's in-cluster tools, each refused as `scope.excluded-cluster`. While any cluster is excluded, a target that names its project by
+  number is refused too, and so is an in-cluster MCP call whose cluster the broker can't read.
+  Spell entries by project ID: an entry spelled by project number refuses its location and cluster
+  name in every project. A broker or `kube-proxy` that can't read the scope it was given reaches no
+  cluster until it can (`scope.exclude-unreadable`).
+
+  Reads of the GKE control plane stay allowed: the project's cluster list and a cluster's
+  describe. Exclusion keeps the agents out of a cluster's API and workloads, not out of the
+  project's cluster list. These still cover an excluded cluster, through those reads only:
+  - the daily upgrade-readiness watch and the Saturday `upgrade-readiness-weekly-review`, which
+    grade its versions and skip their in-cluster readiness rules;
+  - the networking audit's subnet usage, since its pods still hold their IPs;
+  - the GCE audit's instance listing;
+  - the third-party `gke` MCP server's `list_clusters`.
+
+  The upgrade-readiness watch used to read inside an excluded cluster too. It no longer does,
+  because the broker can't tell its reads from an agent's. The broker enforces the exclusion, not
+  IAM: the agent's read roles still reach the cluster. Only a project where the agent holds no
+  roles, bound there or inherited from a folder or organization, fences the service account off.
 
 ### Project outcomes
 
@@ -980,6 +1205,20 @@ A monitored project whose ID the scope cannot carry, a legacy `example.com:name`
 
 **A selector the run cannot read** is frozen exactly as a container is: the members the previous snapshot reached through it are carried under that outcome, nothing is created under them, and the scope prune stays off for the run. The `containers` array carries a row for it under its `via` name (`sharedVpcHosts/<host>`, `metricsScopes/<id>`). There is no index and no lag behind either lookup: a project detached from the host or unlinked from the scope leaves the set on that run and retires over the ordinary two clean runs. A rollback to an operator that predates these fields keeps their members, as for containers.
 
+### How the A2A gateway checks a task's target
+
+Under `spec.mode: next`, the A2A gateway checks a profile task's cluster target against this
+block before it routes the task. A project named in `projects`, or the agent's own project, is
+admitted directly. An excluded project or cluster is refused.
+
+A project that only a folder, organisation, Shared VPC host or Metrics Scope reaches is admitted
+only from the resolved scope, which the operator publishes in the `<name>-resolved-scope`
+ConfigMap. The project must be listed there as readable. The list must match this `spec.scope`
+and be refreshed within two publisher cycles: 40 minutes at the default `maxProjects`, longer at
+a higher cap. Otherwise the task is refused as not confirmed in this install's scope, with the
+reason: the resolved scope is stale, it reads too large or failed, or the project cannot be read. The `ScopeResolved`
+condition on the `PlatformAgent` says whether the resolved scope is current.
+
 ### Rolling the release back past the scope fields
 
 Remove the whole `spec.scope` block from the CR first and re-add it after. A `cluster_agent_reconcile.py` from before `folders` and `organizations`, or from before `sharedVpcHosts` and `metricsScopes`, reads the same `scope.json`, ignores those keys, and finds every container or selector member in its previous snapshot but not in its resolved set, which is the ordinary two-run retire; a CR without the block marks nothing newly `retiring`. On a default install the agent image follows the operator's, so an operator rollback is an agent rollback too.
@@ -1027,7 +1266,8 @@ Raising it expands both existing claims online, with no pod restart, where the c
 StorageClass sets `allowVolumeExpansion: true`. The shell sandbox's StatefulSet is recreated once,
 because its claim template cannot change in place; the sandbox pod keeps running. Each GiB added
 counts twice against a namespace `requests.storage` quota and against the project's disk quota,
-once for each claim.
+once for each claim, except on the agent's claim while `expectedClusterProfiles` holds it above
+`size`.
 
 Where the class cannot expand the claim (`allowVolumeExpansion` false or unset, a claim with no
 StorageClass, or a class that does not exist), the operator leaves the claim at its size and sets
@@ -1051,6 +1291,19 @@ absent.
 The chart sets it from `platformAgent.storage.size`, the Terraform composition from
 `platform_agent_storage_size` and `install.sh` from `PLATFORM_AGENT_STORAGE_SIZE` in `install.env`.
 While the value is the default, the composition passes the chart nothing, so the CR carries no field.
+
+`expectedClusterProfiles` (1 to 20000) is how many Cluster Agent profiles the install is expected
+to hold, one per cluster in scope. It raises the agent's `<name>-data` claim, and not the sandbox's,
+to at least `8Gi` plus `400Mi` per profile, rounded up to whole GiB. That's the size the session
+stores settle at under the default 90-day retention
+([Fleet sizing → The data volume](/kube-agents/deploy/fleet-sizing/#the-data-volume)). The claim
+takes the larger of that and `size` (or the default), so the field only raises it, and the formula
+passes the `50Gi` default above 107 profiles.
+
+Raising it grows the existing claim online, as a
+raised `size` does, and the `DataVolumeNotExpanded` condition covers a class that can't expand it.
+The sandbox's claim holds no session stores; the copy it takes of the agent's working directories
+leaves them out. The chart sets it from `platformAgent.storage.expectedClusterProfiles`.
 
 ## `spec.telemetry`
 
@@ -1132,7 +1385,7 @@ available as escape hatches and take precedence over `spec.networkPolicy`.
 
 Enables external integrations. Only the enabled ones need to be present.
 
-- **`googleChat`** — `enabled` (default `false`), `projectId`, `topicName`, `subscriptionName`, `allowedUsers`, `homeChannel`, and `mode` (`default` or `debug`, default `default`). When `enabled`, `projectId`, `topicName`, and `subscriptionName` are required (enforced by a CEL validation rule). Populated by the installer when Google Chat is enabled.
+- **`googleChat`** — `enabled` (default `false`), `projectId`, `topicName`, `subscriptionName`, `allowedUsers`, `homeChannel`, `mode` (`default` or `debug`, default `default`), and `answerFeedback`. `answerFeedback` defaults to `true`; under `mode: next`, `false` hides the 👍/👎 buttons under answers and keeps no rating ([Answer feedback](/kube-agents/concepts/chatops/#answer-feedback)). When `enabled`, `projectId`, `topicName`, and `subscriptionName` are required (enforced by a CEL validation rule). Populated by the installer when Google Chat is enabled.
 - **`slack`** — `enabled` (default `false`), `botTokenSecretRef` and `appTokenSecretRef` (Secret refs, required when enabled), `allowedUsers`, `homeChannel`, `homeChannelName`, `homeChannelPolicy` (`auto` or `manual`; absent means `auto`), and `answerFeedback`. `answerFeedback` defaults to `true`; under `mode: next`, `false` hides the 👍/👎 buttons under answers and keeps no rating ([Answer feedback](/kube-agents/concepts/chatops/#answer-feedback)). `homeChannelPolicy` says whether the gateway may learn the home channel from the first mention ([`spec.integration.slack` under `mode: next`](#specintegrationslack-under-mode-next) has the rule). Populated by the installer when Slack is enabled. Under `mode: next` this field arms the A2A gateway's Slack backend instead of the legacy consumer; [`spec.integration.slack` under `mode: next`](#specintegrationslack-under-mode-next) says what that changes for the home channel, `allowedUsers`, and a multi-workspace install.
 - **`teams`** — `enabled` (default `false`), `appIdSecretRef` and `appPasswordSecretRef` (Secret refs, required when enabled), `tenantId`, `allowedUsers`, `allowAllUsers`, `homeChannel`, `homeChannelName`, and `adaptiveCards` (default `true`). Set when the Microsoft Teams integration is enabled.
 - **`forges`** — the forges the agent talks to, up to 16. Each entry has a `name` (required; a DNS label that `repositories` refer to it by, unique in the list), a `provider` (`github`, `gitlab`, `gitea`, `bitbucket` or `bitbucket-datacenter`), and, with rules that depend on the provider, `host`, `scheme`, `port`, `namespace`, `credentialsRef`, `caBundleRef` and `identity`. [`spec.integration.forges`](#specintegrationforges) has each field's rules, the one-GitHub-host rule, and what the credential broker does with the Secrets.
@@ -1174,7 +1427,7 @@ Whichever backend is armed, under `mode: next` the operator renders an empty Con
 
 The operator projects the admitted channel (`homeChannel` when set, else the record) into the `<agent>-chat-home` ConfigMap, one key `slack_home`. It mounts that ConfigMap as a read-only directory in the agent pod and the gateway pod. Both read the file where it is mounted, within about a minute of a change, and no pod restarts for a learn. An agent image older than the operator reads env only and never sees a learned channel: keep the agent image at the operator's release.
 
-It admits a recorded channel under policy `auto` when the value is a channel id and no refusal is recorded beside it, and clears `HomeChannelUnset` then. Otherwise the condition says why: the policy is `manual`, the recorded value is not a channel id, or the gateway refused the channel (archived, shared through Slack Connect, the app not a member). A hand edit of the record carries the same trust as the field, and the gateway checks the channel before each post: one Slack refuses is recorded as refused, the condition names it, and the next mention replaces it.
+It admits a recorded channel under policy `auto` when the value is a channel id and no refusal is recorded beside it, and clears `HomeChannelUnset` then. Otherwise the condition says why: the policy is `manual`, the recorded value is not a channel id, or the gateway refused the channel (archived, shared through Slack Connect, the app not a member, a direct or group direct message). A hand edit of the record carries the same trust as the field, and the gateway checks the channel before each post: one Slack refuses is recorded as refused, the condition names it, and the next mention replaces it.
 
 `manual` turns the learn off. A set `homeChannel` wins; the learned channel stays in the record, so clearing the field returns to it. An allowed member moves the learned channel from the app's Home tab; the record keeps who moved it and when, and picking the previous channel there moves it back. To forget it, delete the ConfigMap: the operator re-creates it empty and the next mention learns again.
 
@@ -1264,7 +1517,7 @@ The fleet audit does not need `--repo`, because the operator also writes the val
 
 An existing entry counts as present when it names the same repository on `github.com` in another spelling — a `.git` suffix, a remote, a run of `/` after the host — but not in another case, since the agent's `--repo` checks compare the spelling (so the declared spelling is added beside it). Nor does it count on `www.github.com` or `ssh.github.com`, with or without a scheme, nor under a `type` other than the forge's provider, nor in a spelling with two `@`, nor one over 256 characters, since the agent reads none of those. Reconciliation only adds, and keeps every existing entry as written, so removing a repository means removing it from the CR _and_ editing the ConfigMap.
 
-**The two lists.** `managed_repos` is read-write. `context_repos` names repositories the agent reads for declared intent — a Terraform repository an audit consults before it reports a posture as a finding — and never writes to; an administrator may also add entries to it by hand.
+**The two lists.** `managed_repos` is read-write. `context_repos` names repositories the agent reads and never writes to. An audit consults them for declared intent before it reports a posture as a finding. A diagnosis reads them to find the file that defines a value when the fix is not in a managed repository ([Write scope shapes a diagnosis](/kube-agents/concepts/declarative-workflow/#write-scope-shapes-a-diagnosis)). An administrator may also add entries to it by hand.
 
 An entry may add `"ref": "<branch>"` to read a branch other than the remote's default. A `ref` is kept when it is made of letters, digits, `.`, `_`, `/`, `-` and, after the first character, `@`, and passes git's branch-name rules (no `..`, `@{`, `//` or `.lock` component, no leading `-`).
 
@@ -1274,7 +1527,7 @@ Any other, an empty string, a JSON `null` or a value that is not a string (a num
 
 The credential broker's repository gate reads every typed entry, keyed by its `type`, host and path, so an entry counts only for the forge whose provider it names.
 
-Each same-organization `context_repos` entry gets a read-only (`contents: read`) token minter policy, so a private context repository is readable through the credential broker's content-mode clone, provided the GitHub App is installed on it — see [Read-only tokens for context repositories](/kube-agents/deploy/token-minter/#read-only-tokens-for-context-repositories). On a `gitlab` forge, a private context repository is readable the same way when the forge's Secret holds `read-token` — see [Private context repositories](/kube-agents/install/gitlab/#private-context-repositories). Nothing that writes consults the key: a context repository stays refused by the broker's `commit` and `push`.
+Each same-organization `context_repos` entry gets a read-only (`contents: read`) token minter policy, so a private context repository is readable through the credential broker's `snapshot` read, provided the GitHub App is installed on it — see [Read-only tokens for context repositories](/kube-agents/deploy/token-minter/#read-only-tokens-for-context-repositories). On a `gitlab` forge, a private context repository is readable the same way when the forge's Secret holds `read-token` — see [Private context repositories](/kube-agents/install/gitlab/#private-context-repositories). Nothing that writes consults the key: a context repository stays refused by every version-control verb but `capabilities` and `snapshot`.
 
 ### `spec.integration.repositories[].baseBranch`
 
@@ -1295,8 +1548,8 @@ So each base has one spelling, the one the broker targets and protects. Changing
 The operator writes observed state to the `status` subresource; [PlatformAgent fields → Status](/kube-agents/operator/platformagent-fields/#status) lists every field with its type. How the `usage` counters are produced, where `inference` comes from, and what each condition reports, follows.
 
 `usage.toolExecutionsTotal`, `usage.toolExecutionsBlockedTotal`, `usage.eventsIngestedTotal`, `usage.sessionsTotal`, `usage.chatSessionsTotal`, `usage.remediationsProposedTotal`,
-`usage.chatMessagesInboundTotal`, `usage.brokerFailuresTotal`, `usage.chatTurnsErroredTotal`, `usage.backgroundTasksGaveUpTotal`, `usage.negativeFeedbackTotal`,
-`usage.lastActiveTime`, `usage.lastHumanActiveTime`, the two cluster gauges, the six proposal readings and the two people readings are produced by the operator, on the leader and off the reconcile path. Every five
+`usage.chatMessagesInboundTotal`, `usage.brokerFailuresTotal`, `usage.chatTurnsErroredTotal`, `usage.backgroundTasksGaveUpTotal`, `usage.negativeFeedbackTotal`, `usage.positiveFeedbackTotal`,
+`usage.lastActiveTime`, `usage.lastHumanActiveTime`, the two cluster gauges and the proposal, people and origin readings are produced by the operator, on the leader and off the reconcile path. Every five
 minutes it reads the credential broker's, the event watcher's, the chat plugin's and, on a `next`
 install, the A2A gateway's metrics listeners over the pod network, folds the counter series into totals it keeps with their per-pod baseline in the
 `<name>-usage-counters` ConfigMap, so the counters stay monotonic across pod, process and operator
@@ -1313,7 +1566,7 @@ operator cannot reach; the CR's events name the pod. It advances on any brokered
 those a scheduled job runs -- the Controller Stall Watch cron issues some every 30 minutes by
 default -- so a recent `lastActiveTime` is not evidence that a person used the agent; `lastHumanActiveTime` is.
 
-The six proposal fields and the two people fields are readings, not totals. A reading's source is the credential broker or the A2A gateway. Every 240 seconds the credential broker asks the forge (on GitHub with a read-only token of its own) for the proposals the install authored in each managed
+The six proposal fields, the two people fields and the nine origin fields are readings, not totals. A reading's source is the credential broker, the A2A gateway or the chat plugin. Every 240 seconds the credential broker asks the forge (on GitHub with a read-only token of its own) for the proposals the install authored in each managed
 repository and the human events on them. The operator projects the latest poll's values as they
 stand, outside the ConfigMap.
 
@@ -1343,7 +1596,31 @@ clears both. With `spec.telemetry.peopleSeen: false` the gateway serves no sampl
 clear the same way. A 0 is a reading, and neither field moves `lastActiveTime` or
 `lastHumanActiveTime`.
 
-The operator also serves every counter, cluster gauge, reading and time of this block, and `status.phase`, as Prometheus gauges on its own metrics port. A collector reads them without a query against the status; the series are on [Observability](/kube-agents/concepts/observability/#prometheus-metrics).
+`topTools` is the credential broker's five most-invoked tool and subcommand pairs since its pod
+last started, summed across the broker pods. Each row carries the pair's total and its outcomes
+(`success`, `error`, `blocked`, `busy`, `abandoned`); the rows sort by total, then by tool and
+subcommand. Every word is from the broker's own closed vocabularies, so the list carries no
+command line. A broker restart starts it over, a broker that has run nothing leaves it absent,
+and the second poll in a row that cannot read the broker clears it. It moves neither time. The
+summary script and the chat gateway's `/feedback summary` print it as the
+`tools (top 5, since broker start)` block.
+
+The origins reading (`proposalsFromChat`, `proposalsFromConsole`, `proposalsFromApi`,
+`proposalsFromEvent`, `proposalsFromDrift`, `proposalsFromAudit`, `proposalsFromScheduled`,
+`proposalsFromIssue`, `proposalsFromOther`) comes from the chat plugin's proposals ledger: the pull
+requests the agent opened and the forge confirmed, counted by the origin of the work that started
+each. The operator reads it on the gateway pod's chat metrics listener, summed over the chat
+platform. The reading is present when all nine origins resolve and the plugin's read age, when the body
+carries it, is not above two poll intervals; the plugin serves every origin, zero included, from its
+first ledger read. Until then, and while the served CRD predates them, the nine fields are absent. A
+ledger that stops answering therefore clears them about twenty minutes later.
+
+A poll that reads no body with all nine is a miss, and the second miss in a row clears them. A 0 is
+a reading, and none of the nine moves `lastActiveTime` or `lastHumanActiveTime`. A proposal the
+agent did not see itself open is not counted, so the nine usually sum to at most
+`remediationsProposedTotal`.
+
+The operator also serves every counter, cluster gauge, scalar reading and time of this block (the two lists, `activeInterfaces` and `topTools`, aside), and `status.phase`, as Prometheus gauges on its own metrics port. A collector reads them without a query against the status; the series are on [Observability](/kube-agents/concepts/observability/#prometheus-metrics).
 
 `inference.provider` and `inference.model` are the install's default model, the one LiteLLM serves
 under `model-default`. The operator reads the LiteLLM config ConfigMap the `litellm` Deployment
@@ -1374,35 +1651,79 @@ install, at once when the Ready status update next writes for any other reason. 
 writers carry the field through as they read it, so a pass that ends `Degraded` lands nothing new.
 `inference` follows the same rule under a served CRD that predates it.
 
+`profileSubmitMaxAgeSeconds` is the live `PROFILE_SUBMITS` stream's max age, as the A2A
+provision Job last read it, when it is longer than this release creates the stream with (`0` is no
+age limit). Provisioning never edits an existing stream, so a stream created by an older release
+with a longer max age, or edited by hand, keeps its own. The dispatch config's submit retention is
+the longer of the two, so a finished task's tombstone outlives its submission, up to a year: a
+stream with no age limit, or one longer than a year, gets a year.
+
+The value is read once per provision Job run, and the Job runs again a day after it finishes, so
+a stream edited by hand is picked up within a day. A Job that fails records nothing. The field is
+absent when the stream is no longer than this release's, and before the first report. Only a report
+the operator can read changes it. Under a served CRD that predates the field the write is dropped
+and the retention stays this release's own until the CRD is applied.
+
 The counters and the two times land through the poller above, which consults the same five-minute
 record. Under a served CRD that predates `status.usage` they accumulate in the
 `<name>-usage-counters` ConfigMap and land with the first patch after this release's CRD is
 applied. Under a served CRD at a previous schema, which has `status.usage` without the fields added
-later (the two cluster gauges, the proposal readings, the people readings, `chatMessagesInboundTotal`,
+later (the two cluster gauges, the proposal readings, the people readings, the origin readings, `chatMessagesInboundTotal`,
 `toolExecutionsBlockedTotal`, `brokerFailuresTotal`, `chatTurnsErroredTotal`,
-`backgroundTasksGaveUpTotal`, `negativeFeedbackTotal`, `chatSessionsTotal` and `lastHumanActiveTime`), the first-schema
+`backgroundTasksGaveUpTotal`, `negativeFeedbackTotal`, `positiveFeedbackTotal`, `chatSessionsTotal` and `lastHumanActiveTime`), the first-schema
 counters keep landing and the newer fields are probed again every five minutes until this
 release's CRD is applied. `storageStatus.capacityBytes` and `freeBytes` follow the same rule under
 a served CRD that predates them.
 
-These condition types appear in `conditions`; only `Ready` is always present:
+`effectiveSizingTier` is the tier the operator last rendered the three sized containers at,
+`small`, `medium` or `fleet`, written before the render on every pass that reaches it, whatever
+status the pass ends on. Under [`spec.deployment.sizingProfile`](#specdeployment) `auto` it is also
+the latch: the tier rises from it with the cluster count. It is stepped back one tier when
+admission refuses the pod a step recreated, and the `SizingCappedByQuota` condition then names the
+quota. Under an explicit profile it repeats that profile.
 
-| Type                    | Written                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Ready`                 | Always                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | Tracks `phase`; its `reason` and `message` carry whatever the reconcile is waiting on, including the reasons that park `phase: Degraded` (`RuntimeClassNotFound`, `ShellSandboxCannotBeDisabled`, `ForbiddenVolumeMount`, `EgressAllowlistRefused`, `ModeNotRecognized`, `ShellSandboxKeysMissing`, and under `mode: next` `A2AProvisionFailed`). [What `Ready` reports](#what-ready-reports) says what the last three mean and how a failed provisioning Job is cleared.                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| `Degraded`              | Only while degraded                                                                                                                                                                                                                                                                                                                                                                                                                                                       | Something in the spec, cluster state, or operator install cannot be honoured. `Reason` is one of `InvalidGitRepoURL`, `CorruptManagedRepos`, `MinterPruningHeld`, `InvalidCredentialProxyResources`, `InvalidAgentAPIAuthResources`, `InvalidShellSandboxResources` or `RBACIncomplete`; [What `Degraded` reports](#what-degraded-reports) says what each means. The refusals above ride the `Ready` condition instead of this one.                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| `BusCredentialsReady`   | Under `mode: next`, and while a callout Deployment exists                                                                                                                                                                                                                                                                                                                                                                                                                 | Whether every replica the callout Deployment asks for is ready, and therefore both serving an identity map and attached to the bus. `Reason: CalloutServing` (`True`), `CalloutUnavailable`, or `CalloutAbsent`. The operator's own gates do not read it, and it reads `False` with `1 of 2 replicas ready` while the gateway exists and dispatches; [What `BusCredentialsReady` reports](#what-buscredentialsready-reports) has the gate it differs from and when it is removed.                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| `A2AGateway`            | Under `mode: next`, only on an install upgraded from an operator that ran the A2A gateway at zero replicas for want of a chat backend: from the pass that scales it back to one replica until that replica is ready. Written and cleared by every pass that renders the stack, whichever phase it ends on (`Ready`, `Provisioning`, or `Degraded` for `A2AProvisionFailed` and `ShellSandboxKeysMissing`), so only a pass that stops before rendering leaves it as it was | `status: False`, `Reason: WaitingForReplica`. Every `mode: next` install runs the A2A gateway, on the console door alone when no chat backend is configured. After the upgrade the next pass renders it at one replica, `Ready` waits on it, and the condition clears once a replica is ready. [What `A2AGateway` reports](#what-a2agateway-reports) covers the older `NoChatBackend` reason and the `discord-bot` Secret.                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| `BusProvisioned`        | Under `mode: next`, from the first pass that sees the bus provisioning Job complete, whichever phase that pass ends on; kept through the Job's later re-runs and removed with the stack when the mode flips to `today`                                                                                                                                                                                                                                                    | `status: True`, `Reason: ProvisionJobComplete`. The record that lets `Ready` stop counting the Job: the finished Job is removed by its 24 h TTL and rendered again, and a spec edit renders a new one under a new digest, and neither re-run should flip a Ready install to `Provisioning` for the minute it takes. Until this condition exists the Job counts, so an install upgraded from an operator that never counted the Job (one that could read `Ready` over an unprovisioned bus) does not inherit a completion nobody saw. The message names the Job that first provisioned the bus. A re-run that fails is still reported as `A2AProvisionFailed`.                                                                                                                                                                                                                                        |
-| `EventWatcher`          | Only while `eventWatcher.enabled` is `false`                                                                                                                                                                                                                                                                                                                                                                                                                              | `status: False`, `Reason: DisabledBySpec`. The emergency stop is still pressed and no cluster events are reaching the agent.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| `DataVolumeNearlyFull`  | While the operator has a reading of the data volume                                                                                                                                                                                                                                                                                                                                                                                                                       | `True` (`NearlyFull`) from 90% used, back to `False` (`HasSpace`) only below 85%, so a volume at the line does not flap. A full volume fails every task-board and session write with a bare `disk I/O error`, so this is the early warning. It does not change `phase` or `Ready`, since the agent still answers. The message carries the figures from when the status last changed; `storageStatus.freeBytes` is current to within a hundredth of the volume. The reading comes from the event watcher, so with the watcher disabled or unreachable the condition is absent. The Session KV server in the agent container makes the same check and posts one warning to the home channel per crossing.                                                                                                                                                                                              |
-| `HomeChannelUnset`      | Under `mode: next`, while the A2A gateway holds a chat backend (Google Chat, or Slack with Google Chat off) whose `homeChannel` is empty (on Slack: and no learned channel is admitted)                                                                                                                                                                                                                                                                                   | `status: True`, `Reason: NoHomeChannel`. The gateway arms proactive posts only on a home channel, so every alert, drift report and scheduled report is dropped, while replies in a conversation still arrive. Not `Degraded`, and `Ready` is unaffected: chat works, and an install may want no proactive posts. The message names the field and its `install.env` key. Written and cleared on a pass that ends `Ready` or `Provisioning`, and on one that renders the `next` stack and then parks `Degraded` (`ShellSandboxKeysMissing`, `A2AProvisionFailed`); a refusal that returns before the render leaves it as it stands. Set `homeChannel`, or on Slack under `homeChannelPolicy` `auto` mention the agent in a channel or pick one on the Home tab ([`spec.integration`](#specintegration) has the admission rule).                                                                        |
-| `NoChatPlatform`        | Under `mode: next`, while neither Google Chat nor Slack is enabled                                                                                                                                                                                                                                                                                                                                                                                                        | `status: True`, `Reason: NoChatPlatform`. Nothing the agent raises unprompted reaches chat. Its audit findings stay in the report store on the data volume and reach the GitOps repository (ledger issues, fix pull requests) when one is registered; alerts are still triaged on the board; other scheduled reports are not delivered. Ask the agent for the audits in the console's chat pane, or read the volume with `kubectl exec`. Not `Degraded`; `Ready` is unaffected. A Discord-backed gateway carries it too, since no notifier posts to Discord. Written and cleared on the same passes as `HomeChannelUnset`. Enable one platform (`spec.integration.slack` or `spec.integration.googleChat` with `enabled: true`) to clear it.                                                                                                                                                         |
-| `A2AMCPServer`          | Under `mode: next` with the operator's `A2A_MCP_DOOR` flag on, while a ServiceAccount named `<agent>-a2a-mcp` or a Secret named `<agent>-a2a-mcp-token` exists that this PlatformAgent does not control                                                                                                                                                                                                                                                                   | `status: True`, `Reason: UnownedServiceAccount` or `UnownedTokenSecret`. Both names are reserved: an account somebody else created would run the MCP server as whatever Workload Identity it carries, and a foreign Secret would arm it with their credential. So the server is not rendered; a server and Service rendered earlier are removed, while the fence and the operator's own token stay. For an unowned account the broker's caller list and `CREDENTIAL_PROXY_MCP_CALLERS` do not name it. `Ready` is unaffected. The message names the object. Delete it; the condition clears on the next periodic pass, within 15 minutes. A controller reference is not a remedy: the operator would adopt the object as it is, annotations and contents included.                                                                                                                                   |
-| `ScopeResolved`         | Under `mode: next`, while `spec.scope` declares a folder, organization, Shared VPC host or Metrics Scope                                                                                                                                                                                                                                                                                                                                                                  | A Job named `<agent>-scope-publisher-<suffix>` (shortened for long names) resolves those members into the `<agent>-resolved-scope` ConfigMap 15 minutes after each start, or at once for a new membership when no run is active. `True`, `Resolved`: a lookup answered within twice the sum of 15 minutes and 5 minutes per started 100 of `maxProjects` (40 minutes at the default). `False` reasons: `Missing`, no readable result yet. `Stale`, no lookup answered within that bound. `HashMismatch`, the result predates the membership. `TooLarge`, the members did not fit. `Error`, read the Job's log. `UnownedServiceAccount`, somebody else owns `<agent>-scope-publisher`; delete it; it clears within 15 minutes. `ScopeRoleNotConferred`, the install has no `kube-agents-a2a-gateway-pod` admission policy from the chart, which the broker's scope role needs. `Ready` is unaffected. |
-| `VolumesDropped`        | Only after a pass that rendered the Pod template around a `hostPath` on `spec.deployment.extraVolumes` or `.sidecarVolumes`                                                                                                                                                                                                                                                                                                                                               | `status: True`, `Reason: HostPathVolumeDropped`. The render leaves the named `hostPath` entries and every mount naming them out of the Pod template the operator applies, and the message lists them by field and index. Not `Degraded`: the Pod runs without them. [What `VolumesDropped` reports](#what-volumesdropped-reports) says which passes write it and which leave it as it stands. Remove the entries to clear it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `ReplicasLimited`       | Only while `spec.deployment.availability.replicas` is above 1, after a pass that rendered the gateway                                                                                                                                                                                                                                                                                                                                                                     | `status: True`, `Reason: HighAvailabilityNotSupported`. The operator runs the gateway as a single replica, whatever the field asks for; the message names the requested count and why a second replica does not start. Not `Degraded`: the single replica runs. Written on whichever status the pass ends on, on the same terms as `VolumesDropped`: a refusal that returns before the render neither writes nor clears it. Set the field to 1, or remove it, to clear it.                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| `DataVolumeNotExpanded` | Only while a data claim is smaller than `spec.storage.size` (or the 50Gi default) and its StorageClass cannot expand it                                                                                                                                                                                                                                                                                                                                                   | `status: True`, `Reason: StorageClassCannotExpand`. The message names each blocked claim, its current request, the size asked for, and why the class cannot expand it. Not `Degraded`: the agent runs on the smaller volume. Written on whichever status the pass ends on, `Ready` or `Degraded`, and removed once the claims can grow or the size no longer asks for more. After an operator restart it is left as it stands until the next pass reads the claims. Set `allowVolumeExpansion: true` on the class to clear it.                                                                                                                                                                                                                                                                                                                                                                       |
+Under a served CRD that predates the field, the five-minute rule above applies. The operator
+notices the pruning from the write's echo, and writes and logs the tier once per interval rather
+than on every pass. It renders `auto` at `small`, since the latch cannot be stored, and lands the
+field with the first probe after this release's CRD is applied.
+
+These condition types appear in `conditions`; only `Ready` is always present. The table is
+generated from `k8s-operator/internal/controller/condition_docs.go`, and the controller's tests
+fail when it writes a condition type that has no row there:
+
+<!-- BEGIN GENERATED: crd-conditions-platformagent -->
+<!-- Regenerate with: make docs-generate -- do not edit by hand. -->
+<!-- prettier-ignore-start -->
+
+| Type | Written | Meaning |
+| ---- | ------- | ------- |
+| `Ready` | Always | Tracks `phase`; its `reason` and `message` carry whatever the reconcile is waiting on, including the reasons that park `phase: Degraded` (`RuntimeClassNotFound`, `ShellSandboxCannotBeDisabled`, `ForbiddenVolumeMount`, `EgressAllowlistRefused`, `ModeNotRecognized`, `ShellSandboxKeysMissing`, and under `mode: next` `A2AProvisionFailed`). [What `Ready` reports](#what-ready-reports) says what the last three mean and how a failed provisioning Job is cleared. Under `spec.deployment.scaleToZero: true` it reads `False` with reason `ScaledToZero` beside `phase: Paused` once the gateway has no ready replica; the same section says when. |
+| `Degraded` | Only while degraded | Something in the spec, cluster state, or operator install cannot be honoured. `Reason` is one of `InvalidGitRepoURL`, `CorruptManagedRepos`, `MinterPruningHeld`, `InvalidCredentialProxyResources`, `InvalidAgentAPIAuthResources`, `InvalidShellSandboxResources`, `InvalidCredentialProxyExec` or `RBACIncomplete`; [What `Degraded` reports](#what-degraded-reports) says what each means. The refusals above ride the `Ready` condition instead of this one. |
+| `BusCredentialsReady` | Under `mode: next`, and while a callout Deployment exists | Whether every replica the callout Deployment asks for is ready, and therefore both serving an identity map and attached to the bus. `Reason: CalloutServing` (`True`), `CalloutUnavailable`, or `CalloutAbsent`. The operator's own gates do not read it, and it reads `False` with `1 of 2 replicas ready` while the gateway exists and dispatches; [What `BusCredentialsReady` reports](#what-buscredentialsready-reports) has the gate it differs from and when it is removed. |
+| `DispatcherJobMode` | Under `mode: next`, while the operator runs the profile dispatcher (`A2A_DISPATCHER_IMAGE`) with the chart's `A2A_DISPATCHER_JOB_POLICY` signal set, from the first pass that reaches the dispatcher | Whether the dispatcher runs unattended profile tasks as Jobs. `Reason: InPlace` (`True`), `PolicyMissing`, `NamespaceNotSelected`, `NamespaceNotReady`, `ForeignJobTemplate`, or `GrantFailed`; [What `DispatcherJobMode` reports](#what-dispatcherjobmode-reports) has each. |
+| `A2AIdentityMapApplied` | Under `mode: next`, once the operator renders an identity map | Whether the auth callout took the identity map this operator rendered, read from every Ready callout pod's `/status` by pod IP, again every 30 seconds while unsettled. `True`, `Serving`: every Ready pod answered and serves it. `False`, `Refused`: a pod refused it and serves its previous map, which can be wider; the message quotes the refusal. `False`, `Pending`: a pod is still on an older map or mid-way through its shards. `Unknown`, `StatusUnreadable`: a Ready pod didn't answer and may hold a refusal, so turning to it is a Warning event (a NetworkPolicy on the callout must admit the operator). `Unknown`, `NoReadyCallout`: no pod is Ready. Removed when the A2A stack is off. |
+| `A2ACalloutRolloutStalled` | Under `mode: next`, while the auth callout Deployment's rollout is past its progress deadline | `status: True`, `Reason: ProgressDeadlineExceeded`. The bus applies a config change without waiting for every callout replica to load the current identity map, so until the rollout finishes some connections may be placed by the previous map. Check the `<agent>-a2a-callout` Deployment's rollout (`kubectl rollout status`) and its pods' events. Removed once the rollout completes. |
+| `A2AGateway` | Under `mode: next`, only on an install upgraded from an operator that ran the A2A gateway at zero replicas for want of a chat backend: from the pass that scales it back to one replica until that replica is ready. Written and cleared by every pass that renders the stack, whichever phase it ends on (`Ready`, `Provisioning`, or `Degraded` for `A2AProvisionFailed` and `ShellSandboxKeysMissing`), so only a pass that stops before rendering leaves it as it was | `status: False`, `Reason: WaitingForReplica`. Every `mode: next` install runs the A2A gateway, on the console door alone when no chat backend is configured. After the upgrade the next pass renders it at one replica, `Ready` waits on it, and the condition clears once a replica is ready. [What `A2AGateway` reports](#what-a2agateway-reports) covers the older `NoChatBackend` reason and the `discord-bot` Secret. |
+| `BusProvisioned` | Under `mode: next`, from the first pass that sees the bus provisioning Job complete, whichever phase that pass ends on; kept through the Job's later re-runs and removed with the stack when the mode flips to `today` | `status: True`, `Reason: ProvisionJobComplete`. The record that lets `Ready` stop counting the Job: the finished Job is removed by its 24 h TTL and rendered again, and a spec edit renders a new one under a new digest, and neither re-run should flip a Ready install to `Provisioning` for the minute it takes. Until this condition exists the Job counts, so an install upgraded from an operator that never counted the Job (one that could read `Ready` over an unprovisioned bus) does not inherit a completion nobody saw. The message names the Job that first provisioned the bus. A re-run that fails is still reported as `A2AProvisionFailed`. |
+| `A2AVerifier` | Under `mode: next`, while the capability verifier's Deployment exists and has no ready replica. A pass that cannot read the Deployment leaves it as it stands | `status: False`, `Reason: VerifierNotReady`. A capability check that gets no answer is refused, so every submission is refused terminally while this holds. The CR stays `Ready`: the verifier is on the request path, not the readiness path. Check the `<agent>-a2a-verifier` Deployment's pods and their logs, including the previous container's: a verifier that cannot bind its capability bucket exits, and its log says why. Removed once a replica is ready. |
+| `GatewayElected` | Under `mode: next` with the election on, from the first pass that reads a gateway pod holding the Lease. Kept while the gateway runs that image or the operator's own release. Removed on a roll to another image, with the election off, or when the mode flips to `today` | `status: True`, `Reason: LeaseHeld`. The message is the image the Lease holder runs. The operator renders `availability.a2aGateway.replicas` gateway replicas only while it is set, since a gateway from before the election would act beside an elected one. A status condition doesn't survive most restores, so a restored install runs one replica until a gateway takes the Lease again. |
+| `EventWatcher` | Only while `eventWatcher.enabled` is `false` | `status: False`, `Reason: DisabledBySpec`. The emergency stop is still pressed and no cluster events are reaching the agent. |
+| `DataVolumeNearlyFull` | While the operator has a reading of the data volume | `True` (`NearlyFull`) from 90% used, back to `False` (`HasSpace`) only below 85%, so a volume at the line does not flap. A full volume fails every task-board and session write with a bare `disk I/O error`, so this is the early warning. It does not change `phase` or `Ready`, since the agent still answers. The message carries the figures from when the status last changed; `storageStatus.freeBytes` is current to within a hundredth of the volume. The reading comes from the event watcher, so with the watcher disabled or unreachable the condition is absent. The Session KV server in the agent container makes the same check and posts to the home channel when usage crosses 90% and when it is back below 85%. |
+| `KanbanDispatcherFailing` | From the first time the task-board dispatcher fails for a whole poll | `True` (`TicksFailing`) once the dispatcher has failed 60 ticks in a row on a board, about one five-minute poll at its 5-second interval. The message names the board, the streak and the last error class. Cards on that board are not dispatched; a full data volume is a common cause. `False` (`Ticking`) at the first poll where every streak is below 60. A good tick resets a streak, and a board the dispatcher stops ticking drops out after ten minutes. It does not change `phase` or `Ready`. A poll that cannot read the gateway's chat metrics listener leaves the condition as it is. A board quarantined as corrupt is not counted. |
+| `ScopeUndeclared` | While `spec.scope` names no project, folder, organization, Shared VPC host or Metrics Scope, `spec.harness` names the host cluster, and the event watcher registers a cluster in the management project other than the host | `status: True`, `Reason: ClustersAdoptedFromProject`. Without a membership list the reconcile adopts every GKE cluster in the management project. The message counts them, names the first eight as `name (project/location)`, and points at the remedy: name the management project in `spec.scope.projects` to keep them, or list each under `spec.scope.exclude.clusters` ([`spec.scope`](#specscope)); on an installer-made install, set `SCOPE_PROJECTS` or `SCOPE_EXCLUDE_CLUSTERS` in `install.env`. The management project stays in scope under any declaration, so a scope that names other projects silences the condition without retiring the neighbours. Written by the usage poll from the watcher's `k8s_event_watcher_cluster_up` series; absent with the watcher disabled or unreachable, removed once that project registers no cluster beyond the host or a scope is declared. Not `Degraded`; `Ready` is unaffected. |
+| `HomeChannelUnset` | Under `mode: next`, while the A2A gateway holds a chat backend (Google Chat, or Slack with Google Chat off) whose `homeChannel` is empty (on Slack: and no learned channel is admitted) | `status: True`, `Reason: NoHomeChannel`. Proactive posts are refused while conversation replies still arrive. The gateway keeps them for one digest once a channel is set; with Slack on too they go to the Slack Hermes platform, which delivers them only if Slack has a home channel. The message says which. Not `Degraded`; `Ready` is unaffected. Written and cleared on a pass that ends `Ready` or `Provisioning`, and on one that renders the `next` stack and then parks `Degraded` (`ShellSandboxKeysMissing`, `A2AProvisionFailed`); a refusal that returns before the render leaves it as it stands. Set `homeChannel`, or on Slack under `homeChannelPolicy` `auto` mention the agent in a channel or pick one on the Home tab ([`spec.integration`](#specintegration) has the admission rule). |
+| `NoChatPlatform` | Under `mode: next`, while neither Google Chat nor Slack is enabled | `status: True`, `Reason: NoChatPlatform`. Nothing the agent raises unprompted reaches chat. Its audit findings stay in the report store on the data volume and reach the GitOps repository (ledger issues, fix pull requests) when one is registered; alerts are still triaged on the board; other scheduled reports are not delivered. Ask the agent for the audits in the console's chat pane, or read the volume with `kubectl exec`. Not `Degraded`; `Ready` is unaffected. A Discord-backed gateway carries it too, since no notifier posts to Discord. Written and cleared on the same passes as `HomeChannelUnset`. Enable one platform (`spec.integration.slack` or `spec.integration.googleChat` with `enabled: true`) to clear it. |
+| `ShellSandboxPinned` | While `spec.harness.experimental.shellSandbox.image` names an image other than the one the operator would run without it | `status: True`, `Reason: ImageDiffersFromOperator`. The message names both images. A pin survives operator and agent upgrades, and a sandbox older than the agent fails every `kubectl` call at the credential proxy with a policy refusal. Not `Degraded`; `Ready` is unaffected, since a pin to a mirror or a test build can be deliberate. Written and cleared on a pass that ends `Ready` or `Provisioning`, and on one that parks `Degraded` on `ShellSandboxKeysMissing` or `A2AProvisionFailed`, in either mode. Clear the field, or set it to the operator's image, to clear it. |
+| `A2AMCPServer` | Under `mode: next` with the operator's `A2A_MCP_DOOR` flag on, while a ServiceAccount named `<agent>-a2a-mcp` or a Secret named `<agent>-a2a-mcp-token` exists that this PlatformAgent does not control | `status: True`, `Reason: UnownedServiceAccount` or `UnownedTokenSecret`. Both names are reserved: an account somebody else created would run the MCP server as whatever Workload Identity it carries, and a foreign Secret would arm it with their credential. So the server is not rendered; a server and Service rendered earlier are removed, while the fence and the operator's own token stay. For an unowned account the broker's caller list and `CREDENTIAL_PROXY_MCP_CALLERS` do not name it. `Ready` is unaffected. The message names the object. Delete it; the condition clears on the next periodic pass, within 15 minutes. A controller reference is not a remedy: the operator would adopt the object as it is, annotations and contents included. |
+| `ScopeResolved` | Under `mode: next`, while `spec.scope` declares a folder, organization, Shared VPC host or Metrics Scope | A Job named `<agent>-scope-publisher-<suffix>` (shortened for long names) resolves those members into the `<agent>-resolved-scope` ConfigMap 15 minutes after each start, or at once for a new membership when no run is active. `True`, `Resolved`: a lookup answered within twice the sum of 15 minutes and 5 minutes per started 100 of `maxProjects` (40 minutes at the default). `False` reasons: `Missing`, no readable result yet. `Stale`, no lookup answered within that bound. `HashMismatch`, the result predates the membership. `TooLarge`, the members did not fit. `Error`, read the Job's log. `UnownedServiceAccount`, somebody else owns `<agent>-scope-publisher`; delete it; it clears within 15 minutes. `ScopeRoleNotConferred`, the install has no `kube-agents-a2a-gateway-pod` admission policy from the chart, which the broker's scope role needs. `Ready` is unaffected. |
+| `VolumesDropped` | Only after a pass that rendered the Pod template around a `hostPath` on `spec.deployment.extraVolumes` or `.sidecarVolumes` | `status: True`, `Reason: HostPathVolumeDropped`. The render leaves the named `hostPath` entries and every mount naming them out of the Pod template the operator applies, and the message lists them by field and index. Not `Degraded`: the Pod runs without them. [What `VolumesDropped` reports](#what-volumesdropped-reports) says which passes write it and which leave it as it stands. Remove the entries to clear it. |
+| `ReplicasLimited` | Only while `spec.deployment.availability.replicas` is above 1, after a pass that rendered the gateway | `status: True`, `Reason: HighAvailabilityNotSupported`. The operator runs the gateway as a single replica, whatever the field asks for; the message names the requested count and why a second replica does not start. Not `Degraded`: the single replica runs. Written on whichever status the pass ends on, on the same terms as `VolumesDropped`: a refusal that returns before the render neither writes nor clears it. Set the field to 1, or remove it, to clear it. |
+| `CredentialProxyExecReady` | Only while `credentialProxy.exec.replicas` is above 0 and the agent's name is accepted for the tier | `status: True`, `Reason: AllReplicasReady` when every exec-tier replica is Ready. `status: False` otherwise: `Reason: Unschedulable` when the scheduler cannot place a replica, with the pod's name and the scheduler's message (often `Insufficient cpu`); `Reason: ReplicasUnavailable` for any other shortfall. The message counts the Ready replicas against the field. Re-read every 30 s while short; a failed read leaves it as it stands. Not `Degraded`: a caller that cannot reach the tier falls back to the stateful broker. Each replica needs a node with 2 free CPU. Removed when the field is 0 or unset, or when the name is refused (`InvalidCredentialProxyExec`). A park that returns before the broker is reconciled (`ReservedServiceAccountName`, `ForbiddenVolumeMount`, `ShellSandboxCannotBeDisabled`, `RuntimeClassNotFound`) leaves it as it stands, count included, until the park clears. |
+| `SizingCappedByQuota` | Only while `spec.deployment.sizingProfile` is `auto` and the cluster count earns a higher tier than the namespace's ResourceQuota has room for, or than a LimitRange bound admits, or after a quota refused the pod a step recreated | `status: True`, `Reason: ResourceQuotaShort` or `LimitRangeShort`. The message names the tier earned, the tier the step was measured from, the tier that stays, and the short quota and key or the LimitRange, bound, resource and container; the figures go in the Warning event. Not `Degraded`: the running tier keeps running. Written before the render, so an earlier refusal neither writes nor clears it. Cleared by the pass that finds room or whose count no longer earns the step; a pass with no reading leaves it, so a gateway outage neither clears nor re-records it. The event watcher switched off by spec clears it. Raise the quota or the bound, or name the tier in `sizingProfile`. |
+| `DataVolumeNotExpanded` | Only while a data claim is smaller than `spec.storage.size` (or the 50Gi default, raised by `expectedClusterProfiles` for the agent's claim) and its StorageClass cannot expand it | `status: True`, `Reason: StorageClassCannotExpand`. The message names each blocked claim, its current request, the size asked for, and why the class cannot expand it. Not `Degraded`: the agent runs on the smaller volume. Written on whichever status the pass ends on, `Ready` or `Degraded`, and removed once the claims can grow or the size no longer asks for more. After an operator restart it is left as it stands until the next pass reads the claims. Set `allowVolumeExpansion: true` on the class to clear it. The agent's claim, when it is below that size and will not grow (its class cannot expand it, or this PlatformAgent does not control it), also gets one `DataVolumeUndersized` Warning Event per state. |
+
+<!-- prettier-ignore-end -->
+<!-- END GENERATED: crd-conditions-platformagent -->
 
 Not everything the operator learns is a condition. Under `mode: next`, one thing the bus
 provisioning Job finds about a stream it could not change is recorded as an Event on the
@@ -1457,6 +1778,10 @@ $ kubectl describe platformagent platform-agent -n kubeagents-system
 
 ### What `Ready` reports
 
+A deliberate pause is not a failure, and the condition says which it is. While `spec.deployment.scaleToZero` is `true` and the gateway Deployment has no ready replica, the phase reads `Paused`. `Ready` then reads `False` with reason `ScaledToZero`, and the message names the field and says how to resume. The pause is reported once the scale-down has converged: a replica still serving keeps the install `Ready` for the seconds the Deployment controller takes to remove it.
+
+The pod scan still runs first. A crash loop or an unpullable image in the shell sandbox, the credential broker, the A2A gateway or the verifier parks `Degraded`, as on a running install, since those workloads are not scaled with the gateway. A workload the scan names no fault in but that has no ready replica (a failing readiness probe, a StatefulSet that is gone) keeps the phase `Paused`, and the message names it after the pause. Clearing the field returns the normal phases: `Provisioning` while the gateway starts, `Ready` once it is up. A gateway at zero replicas with the field unset is the start-up wait it always was, `Provisioning` with `Waiting for deployment replicas to be ready`.
+
 Of the reasons that park `phase: Degraded`, `ModeNotRecognized` and `ShellSandboxKeysMissing` render today's stack in full and report at the end rather than returning early: `ModeNotRecognized` because it is a version skew rather than a bad spec, `ShellSandboxKeysMissing` because the objects are wanted in place so the Pod starts by itself once the Secret appears.
 
 Under `mode: next` a failed A2A provisioning Job parks the phase the same way with `A2AProvisionFailed`, naming the Job to inspect. That signal is prompt where the refusal is deterministic. The script exits 2 for a refusal a re-run cannot clear, the Job's `podFailurePolicy` matches exit 2 with `FailJob`, and the Job fails from its first pod, so the condition is written in seconds. Any other failure (NATS unreachable, an unexpected command failure) matches no rule and still spends the `backoffLimit: 20` retry budget, which is the slow path it used to take.
@@ -1478,7 +1803,9 @@ A stream edit does not clear it: `max_consumers` is the one limit nats-server wi
 
 Deleting the Job before one of those ways out is taken (the two, or the three where the fewer-workers lever is offered) helps nothing: the same script refuses again against the same stream.
 
-Recreating the stream costs one more step, and the order matters. Once `TASKS` is back, restart the A2A gateway (`kubectl rollout restart deployment/<agent>-a2a-gateway`), and the agent workload `<agent>-gateway` with it where a Hermes bridge sidecar runs. Deleting a stream deletes every consumer on it, and neither of those two durable readers re-creates one, so a gateway left running keeps accepting delegations and spawning session pods while relaying no events, the bridge dispatches nothing, and the CR reads `Ready` over both; session pods recover by themselves, which hides it. Restarting before the stream is back only fails the subscribe.
+Recreating the stream costs one more step, and the order matters. Once `TASKS` is back, restart the A2A gateway (`kubectl rollout restart deployment/<agent>-a2a-gateway`), and the agent workload `<agent>-gateway` with it where a Hermes bridge sidecar runs. Deleting a stream deletes every consumer on it, and neither of those two durable readers re-creates one, so a gateway left running keeps accepting delegations and spawning session pods while relaying no events, the bridge dispatches nothing, and the CR reads `Ready` over both; session pods recover by themselves, which hides it.
+
+A gateway restarted before the stream is back waits for it, not ready, and for its durable, which provisioning creates with the stream, then binds once both exist. A bridge restarted early is less tidy: it waits for its durable but reports ready meanwhile, and if a task was in flight when the stream went, its startup sweep fails and the pod restarts until the stream is back. So restart the bridge's workload after the stream is back.
 
 ### What `Degraded` reports
 
@@ -1489,9 +1816,9 @@ The `Degraded` condition carries one reason at a time:
 | `InvalidGitRepoURL`               | An invalid entry in `spec.integration.forges` or `spec.integration.repositories`, such as a namespace outside the provider's grammar or a repository on a host its forge's provider does not serve. Subsequent updates are rejected at admission until corrected.                                                                                                                 |
 | `CorruptManagedRepos`             | Unparseable `managed_repos` JSON in the `<agent>-gitops-state` ConfigMap; GitOps disabled.                                                                                                                                                                                                                                                                                        |
 | `MinterPruningHeld`               | A `github` entry in that ConfigMap's `managed_repos` or `context_repos` that this release cannot read. The operator prunes no minter policy while it is listed, so a repository removed from the lists keeps its write policy until the entry is corrected or removed. `Ready` and the phase are left as the workload reports them.                                               |
-| `InvalidCredentialProxyResources` | A refused `credentialProxy.resources` override under [`spec.deployment`](#specdeployment); the proxy renders at the operator's defaults until it is corrected. Written when no higher-ranked `Degraded` cause is present.                                                                                                                                                         |
-| `InvalidAgentAPIAuthResources`    | A refused `agentAPIAuth.resources` override under [`spec.deployment`](#specdeployment); the sidecar renders at its defaults until it is corrected. Written when no higher-ranked `Degraded` cause is present.                                                                                                                                                                     |
-| `InvalidShellSandboxResources`    | A refused `shellSandbox.resources` override under [`spec.harness.experimental`](#shellsandbox); the shell renders at its defaults until it is corrected. Written when no higher-ranked `Degraded` cause is present.                                                                                                                                                               |
+| `InvalidCredentialProxyResources` | A refused `credentialProxy.resources` override under [`spec.deployment`](#specdeployment); the proxy renders at the sizing profile's row (the operator's defaults under `small`) until it is corrected. Written when no higher-ranked `Degraded` cause is present.                                                                                                                |
+| `InvalidAgentAPIAuthResources`    | A refused `agentAPIAuth.resources` override under [`spec.deployment`](#specdeployment); the sidecar renders at the sizing profile's row (the operator's defaults under `small`) until it is corrected. Written when no higher-ranked `Degraded` cause is present.                                                                                                                 |
+| `InvalidShellSandboxResources`    | A refused `shellSandbox.resources` override under [`spec.harness.experimental`](#shellsandbox); the shell renders at the sizing profile's row (the operator's defaults under `small`) until it is corrected. Written when no higher-ranked `Degraded` cause is present.                                                                                                           |
 | `InvalidCredentialProxyExec`      | A positive `credentialProxy.exec.replicas` under [`spec.deployment`](#specdeployment) on an agent whose name is longer than 36 characters; the exec tier is not rendered, and every command goes to the stateful broker until it is corrected. Written when no higher-ranked `Degraded` cause is present.                                                                         |
 | `RBACIncomplete`                  | Not a spec fault but install skew: the ClusterRole bound to the operator denies a permission its RBAC markers declare, which is what an image deployed ahead of its manifests looks like. The message names the denied verbs and the fix. While any other `Degraded` reason holds the condition the RBAC reason is not written, and the operator's startup log is the only trace. |
 
@@ -1520,6 +1847,29 @@ Ready is counted against `spec.replicas`, not against the pods that exist. The c
 **When it is removed.** Removed, not set false, once the mode is not `next` **and** the callout Deployment is gone: both, so the condition never describes a callout that is still running. It is re-derived from the callout Deployment on every exit from the reconcile, not at a point in its sequence. So a pass that parks `Ready=False` for an unrelated reason (a missing shell sandbox keypair, a refused `spec.deployment`, say) still reports it, rather than leaving it absent or, worse, leaving the last value standing while the callout it named goes away.
 
 The one case it is neither written nor removed is version skew, a `spec.mode` this operator does not recognise: the bus a newer CRD rendered is deliberately left standing there, so the condition describing it is too. A CR flipped to `today` by an edit that is itself refused also keeps the condition, because the refusal withholds the teardown too and the callout is still running.
+
+### What `DispatcherJobMode` reports
+
+`DispatcherJobMode` says whether the profile dispatcher runs unattended profile tasks as Jobs. Job mode needs the dispatcher Job admission policy and its binding in the cluster as the chart renders them, the profile namespace selected by that binding, and the dispatcher holding its Jobs Role there. Without it, unattended tasks have no worker and the dispatcher refuses them at admission (`no-worker`). The operator also records a `DispatcherJobPolicyMissing` Warning Event on each pass the policy or the namespace selection fails, but Events expire; the condition stays.
+
+**Reasons.**
+
+| Reason                 | Status  | Meaning                                                                                                                                                                                                   |
+| ---------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `InPlace`              | `True`  | The last pass that settled Job mode found the policy and binding in place and granted the dispatcher its Jobs Role in the profile namespace.                                                              |
+| `PolicyMissing`        | `False` | The policy or its binding is missing, unreadable to the operator (`Forbidden`), or loosened. The message is the `DispatcherJobPolicyMissing` Event's and names which.                                     |
+| `NamespaceNotSelected` | `False` | The profile namespace lacks a label the binding selects it by, so the policy does not hold there. The message is the Event's.                                                                             |
+| `NamespaceNotReady`    | `False` | The profile namespace is absent or lacks the chart's markers, or the pass did not apply its network fence, which includes a failed fence write or a failed read of the namespace.                         |
+| `ForeignJobTemplate`   | `False` | A `DispatchJobTemplate` under one of the operator's names in the profile namespace lacks this agent's labels. The operator leaves it alone, and Job mode stays off for every profile until it is removed. |
+| `GrantFailed`          | `False` | Granting Job mode failed this pass (copying the CA bundle, writing the templates, applying the Jobs Role, or reading the profile namespace). The message carries the error.                               |
+
+Every `False` reason means the pass left the Job templates out of the dispatch config and revoked the dispatcher's Jobs Role. If the revoke itself fails, the Role can still stand; the operator logs that error, and the condition keeps the reason that triggered the revoke. Jobs already running are left to finish.
+
+**When it changes.** It follows what each pass does to the Jobs Role, written on the way out of the reconcile like `BusCredentialsReady`, so a pass that ends `Degraded` still writes it. A pass that changes nothing about the Role leaves it as it was: a read of the policy that fails for a reason other than `NotFound` or `Forbidden` (a timeout, throttling), or a pass that stops before the dispatcher step. So `True` describes the last pass that settled Job mode, not the cluster now: the operator does not watch the policy or its binding, so a policy removed since then shows on the next pass that reaches the dispatcher.
+
+**When it is removed.** Removed, not set `False`, only by a pass that tore Job mode down or found nothing of it left. With the chart's signal off, that is once the dispatcher's Jobs, Job templates and Jobs Role are deleted. With no dispatcher image, it is once the dispatcher is removed. With the mode flipped to `today`, it is once the A2A stack is torn down. A pass that stops before that teardown (a refused `spec`, say) or whose teardown fails leaves the condition as it was, because the Jobs Role and the templates are still live.
+
+Version skew, a `spec.mode` this operator does not recognise, neither writes nor removes it, as for `BusCredentialsReady`: the dispatcher a newer CRD rendered is left standing, so the condition describing it is too.
 
 ### What `A2AGateway` reports
 
@@ -1622,6 +1972,9 @@ _and_ beyond the agent's own repair:
 - `model.*`, `platforms.*`, `approvals.cron_mode` and `display.platforms`;
 - `kanban.max_in_progress`: the board is shared by every profile, and a burst of workers past it is
   lost to the OOM killer without a restart or an event;
+- `kanban.admission`: the dispatcher's memory budget, worker cap, queue bound and fail-closed
+  switch, from `spec.harness.tuning.admission`; the board is shared and an eviction is pod-wide, so
+  no profile may admit past the pod's request;
 - `terminal.*`: where the shell runs, one sandbox per Pod, reached the same way by every profile;
 - `database.journal_mode`, when the agent Pod has a runtime class: one data volume per Pod, and a
   corrupted database is found only after the sessions in it are unreadable;
@@ -1724,6 +2077,11 @@ The stall watch's three knobs from [`spec.harness.stallWatch`](#specharnessstall
 does not set them, and the watch reads an empty value as its default. Each one changes what the
 watch reads or when it alerts, so a line the agent wrote into the PVC `.env` could otherwise silence
 alerts for a namespace nobody excluded. They are not in the container env.
+
+The earned-autonomy switches `KUBEAGENTS_POST_MERGE_CHECK`, `KUBEAGENTS_AUTOMERGE` and
+`KUBEAGENTS_DIAL` are pinned the same way, on every install, from `spec.deployment.env`, each
+normalised to a value it knows or `off`. They are not in the container env; the
+[credential isolation reference](/kube-agents/reference/credential-isolation/) describes them.
 
 One consequence of the render is worth knowing: the managed overlay is a
 leaf-level merge, and a list is a leaf, so a list rendered here **replaces** the image's rather than

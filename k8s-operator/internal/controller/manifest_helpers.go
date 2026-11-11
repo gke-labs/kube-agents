@@ -487,8 +487,14 @@ func resolveDeploymentReplicasAndStrategy(deployment *agentv1alpha1.DeploymentSp
 	if deployment == nil {
 		return replicasAndStrategyFor(1, false)
 	}
-	scaleToZero := deployment.ScaleToZero != nil && *deployment.ScaleToZero
-	return replicasAndStrategyFor(min(requestedGatewayReplicas(deployment), supportedGatewayReplicas), scaleToZero)
+	return replicasAndStrategyFor(min(requestedGatewayReplicas(deployment), supportedGatewayReplicas), scaleToZeroRequested(deployment))
+}
+
+// scaleToZeroRequested reports whether the spec asks for the gateway at zero
+// replicas. The render and the status writer both read it, so the phase that
+// reports the pause keys on the same predicate as the replica count it reports.
+func scaleToZeroRequested(deployment *agentv1alpha1.DeploymentSpec) bool {
+	return deployment != nil && deployment.ScaleToZero != nil && *deployment.ScaleToZero
 }
 
 // replicasAndStrategyFor is the replica count and strategy for a gateway meant
@@ -573,11 +579,21 @@ func resolveResources(deployment *agentv1alpha1.DeploymentSpec) corev1.ResourceR
 	// kanban cap of six is about 2.6 GiB over the idle set, and 8Gi leaves room
 	// for coordinators that wait on their children while resident without
 	// holding a slot: about fourteen workers at that size in all.
-	// Requests stay at 2Gi, so scheduling is unchanged either way.
+	//
+	// The memory request is 4Gi, not the 2Gi it was, because the request is
+	// the figure that matters twice over. Under node pressure the kubelet
+	// evicts a Burstable pod whose working set is above its request, and the
+	// gateway was evicted three times in four days at 3.1 to 3.5 GiB against
+	// 2Gi. And the kanban dispatcher's memory admission takes the request as
+	// its default budget: a gateway under spec.mode next idles at about
+	// 1.5 GiB of working set, so a 2Gi budget admitted no worker at all on the
+	// presubmit install and refused every card after the queue bound. 4Gi
+	// holds the idle set and about five or six workers at 430 MiB, the count
+	// cap's worth, and is what the pod uses when it works (#4758).
 	return corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{
 			corev1.ResourceCPU:    resource.MustParse("1"),
-			corev1.ResourceMemory: resource.MustParse("2Gi"),
+			corev1.ResourceMemory: resource.MustParse("4Gi"),
 		},
 		Limits: corev1.ResourceList{
 			corev1.ResourceCPU:    resource.MustParse("3"),

@@ -1,8 +1,10 @@
 """The offline would-hit analysis over synthetic shadow logs."""
 
 import contextlib
+import hashlib
 import io
 import json
+import os
 import shutil
 import tempfile
 import unittest
@@ -11,7 +13,7 @@ import analyze_shadow
 
 
 def line(request_id, ts, kind, build, fingerprint, messages, roles=None, project="p1", tokens=100, unstorable=(),
-         pr="", latency_ms=0):
+         pr="", latency_ms=0, answer_hash="answered"):
     entry = {
         "event": "replay_shadow_request",
         "request_id": request_id,
@@ -25,6 +27,8 @@ def line(request_id, ts, kind, build, fingerprint, messages, roles=None, project
         "latency_ms": latency_ms,
         "unstorable": list(unstorable),
     }
+    if answer_hash is not None:
+        entry["answer_hash"] = answer_hash
     if messages is not None:
         entry["message_hashes"] = list(messages)
     return entry
@@ -46,16 +50,28 @@ def tearDownModule():
     shutil.rmtree(TEMP_DIR, ignore_errors=True)
 
 
-def write(lines):
-    handle = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False, dir=TEMP_DIR)
+def write_file(lines, kind):
+    """One segment under a fresh replay-shadow/<kind>/<day>/<build>/logs/, as the collector files it."""
+    logs = os.path.join(tempfile.mkdtemp(dir=TEMP_DIR), "replay-shadow", kind, "2026-11-05", "1", "logs")
+    os.makedirs(logs)
+    handle = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False, dir=logs)
     with handle:
         for entry in lines:
             handle.write((entry if isinstance(entry, str) else json.dumps(entry)) + "\n")
     return handle.name
 
 
+def write(lines):
+    """Each line into the folder its own tag names, as an honest run files it; untagged ones under presubmit/."""
+    by_kind = {}
+    for entry in lines:
+        tag = (entry.get("job") or {}).get("kind") if isinstance(entry, dict) else None
+        by_kind.setdefault(tag if tag in analyze_shadow.JOB_KINDS else "presubmit", []).append(entry)
+    return [write_file(kind_lines, kind) for kind, kind_lines in by_kind.items()] or [write_file([], "presubmit")]
+
+
 def report(lines, **kwargs):
-    records, skipped = analyze_shadow.load([write(lines)])
+    records, skipped = analyze_shadow.load(write(lines))
     return analyze_shadow.summarize(records, **kwargs), skipped
 
 
@@ -105,7 +121,7 @@ class EstimateTest(unittest.TestCase):
         rep, _ = report(lines, merged={"10": 10.0})
         self.assertEqual(rep["estimates"]["high"]["hits"], 1)
         hit_ids = [h.request.request_id for _, h in analyze_shadow.iter_hits(
-            analyze_shadow.load([write(lines)])[0], "high", merged={"10": 10.0}) if h]
+            analyze_shadow.load(write(lines))[0], "high", merged={"10": 10.0}) if h]
         self.assertEqual(hit_ids, ["p4"])
 
     def test_a_build_finishing_after_the_merge_is_not_copied(self):
@@ -117,8 +133,26 @@ class EstimateTest(unittest.TestCase):
             presubmit("p5", 21, "12", "b3", "B", ["b"]),
         ]
         hit_ids = [h.request.request_id for _, h in analyze_shadow.iter_hits(
-            analyze_shadow.load([write(lines)])[0], "high", merged={"10": 10.0}) if h]
+            analyze_shadow.load(write(lines))[0], "high", merged={"10": 10.0}) if h]
         self.assertEqual(hit_ids, ["p4"])
+
+    def test_lines_with_the_litellm_accounting_fields_read_as_before(self):
+        extra = {"reasoning_tokens": 5, "cache_write_tokens": 0, "litellm_model_name": "vertex_ai/m",
+                 "litellm_attempted_retries": 1, "litellm_cost_usd": 0.01}
+        lines = [line("n1", 1, "nightly", "b0", "fp", ["m"]),
+                 dict(presubmit("p1", 10, "7", "b1", "fp", ["m"]), **extra)]
+        r, _ = report(lines)
+        self.assertEqual(r["estimates"]["low"]["hits"], 1)
+
+    def test_schema_2_and_schema_3_lines_read_together(self):
+        # Schema 2 named the LiteLLM config checksum model_behaviour_checksum.
+        # Its fingerprints never equal schema 3's (the normalizer version
+        # changed with it), but its lines must still read rather than skip.
+        lines = [dict(line("n1", 1, "nightly", "b0", "fp2", ["m"]), schema=2, model_behaviour_checksum="c2"),
+                 dict(presubmit("p1", 10, "7", "b1", "fp3", ["m"]), schema=3, litellm_config_checksum="c3")]
+        r, skipped = report(lines)
+        self.assertEqual(sum(skipped.values()), 0)
+        self.assertEqual(r["estimates"]["low"]["hits"], 0)
 
     def test_presubmit_lines_without_a_pr_are_counted(self):
         rep, _ = report([presubmit("p1", 1, "", "b1", "A", ["a"]), presubmit("p2", 2, "10", "b2", "A", ["a"]),
@@ -163,6 +197,33 @@ class EstimateTest(unittest.TestCase):
         self.assertEqual(rep["presubmit_prompt_tokens"], 0)
         self.assertEqual(rep["estimates"]["high"]["token_weighted_hit_percent"], 0.0)
 
+    def test_a_nightly_untrusted_line_is_never_a_source(self):
+        # Written by an account presubmits also run as, so pull-request code could have forged it.
+        for pr in ("", "10"):
+            with self.subTest(pr=pr):
+                lines = [line("u1", 1, "nightly-untrusted", "u", "A", ["a", "b"], pr=pr),
+                         presubmit("p1", 2, "10", "b1", "A", ["a", "b"])]
+                rep, skipped = report(lines, merged={"10": 1.5})
+                for estimate in analyze_shadow.ESTIMATES:
+                    self.assertEqual(rep["estimates"][estimate]["hits"], 0, estimate)
+                self.assertIsNone(rep["top_misses"][0]["closest_request_id"])
+                self.assertEqual((rep["nightly_requests"], rep["nightly_untrusted_requests"]), (0, 1))
+                self.assertEqual(rep["health"]["lines_by_kind"]["nightly-untrusted"], 1)
+                self.assertEqual(skipped["untagged"], 0)
+
+    def test_a_replay_lane_line_is_counted_and_never_a_source_or_a_request(self):
+        lines = [line("r1", 1, "replay-lane", "r", "A", ["a", "b"]),
+                 presubmit("p1", 2, "10", "b1", "A", ["a", "b"])]
+        rep, skipped = report(lines, merged={"10": 1.5})
+        for estimate in analyze_shadow.ESTIMATES:
+            self.assertEqual(rep["estimates"][estimate]["hits"], 0, estimate)
+        self.assertIsNone(rep["top_misses"][0]["closest_request_id"])
+        self.assertEqual((rep["presubmit_requests"], rep["replay_lane_requests"]), (1, 1))
+        self.assertEqual(rep["health"]["lines_by_kind"]["replay-lane"], 1)
+        self.assertEqual(skipped["untagged"], 0)
+        self.assertIn("requests: 2 (1 presubmit, 0 nightly, 0 nightly-untrusted, 1 replay-lane,",
+                      analyze_shadow.render(rep, skipped), "the header's counts add up to its total")
+
     def test_cross_project_share(self):
         rep, _ = report([
             line("n1", 1, "nightly", "n", "A", ["a"], project="p9"),
@@ -189,42 +250,339 @@ class EstimateTest(unittest.TestCase):
         ]
         self.assertEqual(hits(lines, "low"), 0)
 
-    def test_simulated_estimate_ignores_earlier_assistant_messages(self):
-        roles = ["user", "assistant", "tool"]
-        lines = [
-            line("n1", 1, "nightly", "n", "A2", ["u", "ans-x", "tool"], roles=roles),
-            presubmit("p1", 2, "10", "b1", "B2", ["u", "ans-y", "tool"], roles=roles),
-        ]
-        self.assertEqual(hits(lines, "high"), 0)
-        self.assertEqual(hits(lines, "simulated"), 1)
 
-    def test_simulated_estimate_follows_the_high_sources(self):
-        roles = ["user", "assistant", "tool"]
-        lines = [
-            presubmit("p1", 1, "10", "b1", "A2", ["u", "ans-x", "tool"], roles=roles),
-            presubmit("p2", 5, "11", "b2", "B2", ["u", "ans-y", "tool"], roles=roles),
-        ]
-        self.assertEqual(hits(lines, "simulated"), 0)
+# One agent conversation: system prompt, task, then answer / tool result turns.
+TURN_ROLES = ["system", "user", "assistant", "tool", "assistant", "tool"]
 
-    def test_simulated_estimate_still_misses_on_a_different_tool_result(self):
-        roles = ["user", "assistant", "tool"]
-        lines = [
-            line("n1", 1, "nightly", "n", "A2", ["u", "ans-x", "tool-1"], roles=roles),
-            presubmit("p1", 2, "10", "b1", "B2", ["u", "ans-y", "tool-2"], roles=roles),
-        ]
-        self.assertEqual(hits(lines, "simulated"), 0)
 
-    def test_simulated_falls_back_to_the_fingerprint_without_message_hashes(self):
+def conversation(prefix, ts, kind, build, answers, results, pr="", **kwargs):
+    """The requests of one conversation, one per turn, as the proxy logs them.
+
+    Request k holds the system prompt and task, then k answer and tool result
+    pairs. `answers` and `results` are the per-turn message hashes; the
+    fingerprint covers every message, so it differs whenever any does.
+    """
+    out = []
+    messages = ["sys", "task"]
+    for turn in range(len(answers) + 1):
+        roles = TURN_ROLES[:len(messages)]
+        out.append(line(f"{prefix}{turn}", ts + turn, kind, build, "|".join(messages), list(messages), roles=roles,
+                        pr=pr, **kwargs))
+        if turn < len(answers):
+            messages = messages + [answers[turn], results[turn]]
+    return out
+
+
+def hit_ids(lines, estimate, **kwargs):
+    records, _ = analyze_shadow.load(write(lines))
+    return [h.request.request_id for _, h in analyze_shadow.iter_hits(records, estimate, **kwargs) if h]
+
+
+class ReplayedTest(unittest.TestCase):
+    def test_answers_that_differ_with_the_same_tool_results_are_hits(self):
+        lines = (conversation("a", 1, "presubmit", "b1", ["ans-1", "ans-2"], ["out-1", "out-2"], pr="10")
+                 + conversation("b", 10, "presubmit", "b2", ["ANS-1", "ANS-2"], ["out-1", "out-2"], pr="10"))
+        # Exact matching stops after the first answer; replay keeps all three.
+        self.assertEqual(hit_ids(lines, "high"), ["b0"])
+        self.assertEqual(hit_ids(lines, "replayed_high"), ["b0", "b1", "b2"])
+        rep, _ = report(lines)
+        self.assertEqual(rep["estimates"]["replayed_high"]["hits"], 3)
+        # The first build's own requests are half the presubmit tokens, and miss.
+        self.assertEqual(rep["estimates"]["replayed_high"]["token_weighted_hit_percent"], 50.0)
+        self.assertEqual(rep["estimates"]["replayed_high"]["saved_completion_tokens"], 15)
+
+    def test_a_different_tool_result_misses_from_that_request_on(self):
+        lines = (conversation("a", 1, "presubmit", "b1", ["ans-1", "ans-2"], ["out-1", "out-2"], pr="10")
+                 + conversation("b", 10, "presubmit", "b2", ["ANS-1", "ANS-2"], ["OTHER", "out-2"], pr="10"))
+        self.assertEqual(hit_ids(lines, "replayed_high"), ["b0"])
+
+    def test_replayed_low_takes_nightly_sources_only(self):
+        lines = (conversation("n", 1, "nightly", "n1", ["ans-1"], ["out-1"])
+                 + conversation("a", 3, "presubmit", "b1", ["ans-x"], ["out-x"], pr="10")
+                 + conversation("b", 10, "presubmit", "b2", ["ANS-1"], ["out-1"], pr="10")
+                 + conversation("c", 20, "presubmit", "b3", ["ANS-X"], ["out-x"], pr="10"))
+        self.assertEqual(hit_ids(lines, "replayed_low"), ["a0", "b0", "b1", "c0"])
+        self.assertEqual(hit_ids(lines, "replayed_high"), ["a0", "b0", "b1", "c0", "c1"])
+
+    def test_a_source_replay_could_not_use_never_counts(self):
+        cases = {
+            # Another pull request, with no merge time given.
+            "another pr": conversation("a", 1, "presubmit", "b1", ["ans-1"], ["out-1"], pr="11"),
+            # The same build: replay never serves a build its own answers.
+            "same build": conversation("a", 1, "presubmit", "b2", ["ans-1"], ["out-1"], pr="10"),
+            # An earlier build still running when the request was made.
+            "unfinished build": conversation("a", 1, "presubmit", "b1", ["ans-1"], ["out-1"], pr="10")
+            + [presubmit("late", 30, "10", "b1", "Z", ["z"])],
+            # A nightly whose answer came back after the request.
+            "later nightly": conversation("n", 1, "nightly", "n1", ["ans-1"], ["out-1"], latency_ms=60_000),
+            # A sighting after the request.
+            "later sighting": conversation("a", 40, "presubmit", "b1", ["ans-1"], ["out-1"], pr="10"),
+        }
+        for name, sources in cases.items():
+            with self.subTest(name):
+                lines = sources + conversation("b", 20, "presubmit", "b2", ["ANS-1"], ["out-1"], pr="10")
+                found = [i for i in hit_ids(lines, "replayed_high") if i.startswith("b")]
+                # b0 can match the same build's or a later sighting's first request
+                # only if replay could use it; none of these sources qualify.
+                self.assertEqual(found, [], name)
+
+    def test_another_prs_last_build_counts_only_once_merged(self):
+        lines = (conversation("a", 1, "presubmit", "b1", ["ans-1"], ["out-1"], pr="11")
+                 + conversation("b", 5, "presubmit", "b2", ["ANS-1"], ["out-1"], pr="10")    # before PR 11 merged
+                 + conversation("c", 20, "presubmit", "b3", ["ANS-X"], ["out-1"], pr="12"))  # after
+        self.assertEqual(hit_ids(lines, "replayed_high", merged={"11": 10.0}), ["c0", "c1"])
+        self.assertEqual(hit_ids(lines, "replayed_low", merged={"11": 10.0}), [])
+
+    def test_an_unstorable_source_is_not_a_recording(self):
+        lines = (conversation("a", 1, "presubmit", "b1", ["ans-1"], ["out-1"], pr="10",
+                              unstorable=["fallback_attempted"])
+                 + conversation("b", 10, "presubmit", "b2", ["ANS-1"], ["out-1"], pr="10"))
+        self.assertEqual(hit_ids(lines, "replayed_high"), [])
+        self.assertEqual(hit_ids(lines, "replayed_high", require_storable=False), ["b0", "b1"])
+
+    def test_settings_length_and_roles_must_match(self):
+        # Each build's request for the first answer, so the answers are generated ones.
+        asked = [presubmit("a-ask", 0.5, "10", "b1", "AQ", ["sys", "task"], roles=["system", "user"]),
+                 presubmit("b-ask", 9, "10", "b2", "BQ", ["sys", "task"], roles=["system", "user"])]
+        source = presubmit("a", 1, "10", "b1", "A", ["sys", "task", "ans", "out"],
+                           roles=["system", "user", "assistant", "tool"])
+        cases = {
+            "settings": dict(settings_hash="other-tools"),
+            "one message fewer": dict(message_hashes=["sys", "task", "ANS"], roles=["system", "user", "assistant"]),
+            "a user message where the answer was": dict(roles=["system", "user", "user", "tool"]),
+            "the same hash under another role": dict(roles=["system", "tool", "assistant", "tool"]),
+            "a different task": dict(message_hashes=["sys", "TASK", "ANS", "out"]),
+            "a different system prompt": dict(message_hashes=["SYS", "task", "ANS", "out"]),
+        }
+        for name, change in cases.items():
+            with self.subTest(name):
+                request = presubmit("b", 10, "10", "b2", "B", ["sys", "task", "ANS", "out"],
+                                    roles=["system", "user", "assistant", "tool"])
+                request.update(change)
+                self.assertNotIn("b", hit_ids(asked + [source, request], "replayed_high"))
+        request = presubmit("b", 10, "10", "b2", "B", ["sys", "task", "ANS", "out"],
+                            roles=["system", "user", "assistant", "tool"])
+        self.assertEqual(hit_ids(asked + [source, request], "replayed_high"), ["b-ask", "b"])
+
+    def test_an_exact_match_without_message_hashes_still_counts(self):
         lines = [line("n1", 1, "nightly", "n", "A", None), presubmit("p1", 2, "10", "b1", "A", None),
                  presubmit("p2", 3, "10", "b1", "B", None)]
-        self.assertEqual(hits(lines, "simulated"), 1)
+        self.assertEqual(hits(lines, "replayed_low"), 1)
+        self.assertEqual(hits(lines, "replayed_high"), 1)
 
-    def test_simulated_is_never_below_high(self):
+    def test_replayed_is_never_below_its_exact_estimate(self):
         # Same fingerprint, but message hashes that differ (lines from before a
-        # hashing change): high hits, so simulated must too.
+        # hashing change): the exact estimates hit, so the replayed ones must too.
         lines = [line("n1", 1, "nightly", "n", "A", ["x"]), presubmit("p1", 2, "10", "b1", "A", ["y"])]
-        self.assertEqual(hits(lines, "high"), 1)
-        self.assertEqual(hits(lines, "simulated"), 1)
+        for exact, replayed in (("low", "replayed_low"), ("high", "replayed_high")):
+            self.assertEqual(hits(lines, exact), 1)
+            self.assertEqual(hits(lines, replayed), 1)
+
+    def test_replayed_misses_by_first_differing_message_that_is_not_an_answer(self):
+        lines = (conversation("a", 1, "nightly", "n1", ["ans-1", "ans-2"], ["out-1", "out-2"])
+                 # A different second tool result: its last request misses at the tool.
+                 + conversation("b", 10, "presubmit", "b2", ["ANS-1", "ANS-2"], ["out-1", "OTHER"], pr="10",
+                                tokens=300)
+                 + [presubmit("c", 20, "10", "b2", "C", ["sys", "TASK"], roles=["system", "user"], tokens=40),
+                    presubmit("d", 21, "10", "b2", "D", ["SYS"], roles=["system"], tokens=5)])
+        other = presubmit("e", 22, "10", "b2", "E", ["sys"], roles=["system"], tokens=7)
+        other["settings_hash"] = "other-tools"
+        rep, _ = report(lines + [other, presubmit("f", 23, "10", "b2", "F", None, tokens=2)])
+        self.assertEqual(rep["replayed_miss_tokens_by_first_difference"],
+                         {"tool": 300, "user": 40, "settings": 7, "system": 5, "unhashed": 2})
+        # The exact breakdown names the answer that diverged first; the replayed one looks past it.
+        self.assertEqual(rep["miss_tokens_by_first_difference"]["assistant"], 600)
+
+    def test_the_breakdown_takes_the_high_sources(self):
+        roles = ["system", "user", "assistant", "tool"]
+        cases = {
+            # An earlier finished build of the same pull request.
+            "earlier build": ("10", {}),
+            # Another pull request's last build, once it merged.
+            "merge copy": ("11", {"11": 10.0}),
+        }
+        for name, (source_pr, merged) in cases.items():
+            with self.subTest(name):
+                lines = [
+                    presubmit("a-ask", 0.5, source_pr, "b1", "AQ", ["sys", "task"], roles=roles[:2]),
+                    presubmit("a", 1, source_pr, "b1", "A", ["sys", "task", "ans", "out"], roles=roles),
+                    presubmit("b-ask", 19, "10", "b2", "AQ", ["sys", "task"], roles=roles[:2]),
+                    presubmit("b", 20, "10", "b2", "B", ["sys", "task", "ANS", "OTHER"], roles=roles),
+                ]
+                rep, _ = report(lines, merged=merged)
+                # The source build's own requests have nothing earlier: settings.
+                self.assertEqual(rep["replayed_miss_tokens_by_first_difference"], {"tool": 100, "settings": 200})
+
+    def test_a_nightly_untrusted_line_is_never_a_replayed_source(self):
+        roles = ["system", "user", "assistant", "tool"]
+        lines = [
+            line("u-ask", 0, "nightly-untrusted", "n1", "AQ", ["sys", "task"], roles=roles[:2]),
+            line("u", 1, "nightly-untrusted", "n1", "A", ["sys", "task", "ans", "out"], roles=roles),
+            presubmit("b-ask", 9, "10", "b2", "BQ", ["sys", "task"], roles=roles[:2]),
+            presubmit("b", 10, "10", "b2", "B", ["sys", "task", "ANS", "out"], roles=roles),
+        ]
+        rep, _ = report(lines)
+        self.assertEqual(rep["estimates"]["replayed_low"]["hits"], 0)
+        self.assertEqual(rep["estimates"]["replayed_high"]["hits"], 0)
+        # Nor does it match any prefix in the breakdown.
+        self.assertEqual(rep["replayed_miss_tokens_by_first_difference"], {"settings": 200})
+        # The same lines under nightly/ are sources.
+        trusted = [dict(entry, job=dict(entry["job"], kind="nightly")) if entry["request_id"].startswith("u") else entry
+                   for entry in lines]
+        self.assertEqual(hit_ids(trusted, "replayed_low"), ["b-ask", "b"])
+
+    def test_a_longer_recording_with_no_request_stopping_here_is_none(self):
+        source = line("a", 1, "nightly", "n1", "A", ["sys", "task", "ans", "out"],
+                      roles=["system", "user", "assistant", "tool"])
+        request = presubmit("b", 10, "10", "b2", "B", ["sys", "task"], roles=["system", "user"])
+        rep, _ = report([source, request])
+        self.assertEqual(rep["replayed_miss_tokens_by_first_difference"], {"none": 100})
+
+    def test_the_output_names_the_replayed_rows_as_estimates(self):
+        lines = (conversation("a", 1, "presubmit", "b1", ["ans-1"], ["out-1"], pr="10")
+                 + conversation("b", 10, "presubmit", "b2", ["ANS-1"], ["out-1"], pr="10"))
+        rep, skipped = report(lines)
+        text = analyze_shadow.render(rep, skipped)
+        self.assertIn("replayed_high", text)
+        self.assertIn("replayed rows are an estimate", text)
+        self.assertIn("by role of first differing message", text)
+
+
+FEW_SHOT_ROLES = ["system", "user", "assistant", "user"]
+ANSWER_ROLES = ["system", "user", "assistant", "tool"]
+
+
+class GeneratedAnswerTest(unittest.TestCase):
+    """Only assistant messages the logs show the model gave in the conversation are held to the recording."""
+
+    def test_a_prompt_borne_assistant_message_that_differs_misses(self):
+        # A few-shot example arrives in the first request: no earlier request asked for it.
+        for example, expected in (("example-2", []), ("example-1", ["b"])):
+            with self.subTest(example):
+                lines = [presubmit("a", 1, "10", "b1", "A", ["sys", "task", "example-1", "go"], roles=FEW_SHOT_ROLES),
+                         presubmit("b", 10, "10", "b2", "B", ["sys", "task", example, "go"], roles=FEW_SHOT_ROLES)]
+                self.assertEqual(hit_ids(lines, "replayed_high"), expected)
+
+    def test_a_sources_prompt_borne_message_is_not_blanked_either(self):
+        lines = [
+            presubmit("a", 1, "10", "b1", "A", ["sys", "task", "example-1", "out"], roles=ANSWER_ROLES),
+            # In b2 the message at position 2 is a generated answer; in the source it was prompt.
+            presubmit("b-ask", 9, "10", "b2", "BQ", ["sys", "task"], roles=ANSWER_ROLES[:2]),
+            presubmit("b", 10, "10", "b2", "B", ["sys", "task", "ANS", "out"], roles=ANSWER_ROLES),
+        ]
+        self.assertEqual(hit_ids(lines, "replayed_high"), [])
+
+    def test_a_generated_answer_that_differs_is_still_a_hit(self):
+        lines = [
+            presubmit("a-ask", 0.5, "10", "b1", "AQ", ["sys", "task"], roles=ANSWER_ROLES[:2]),
+            presubmit("a", 1, "10", "b1", "A", ["sys", "task", "ans", "out"], roles=ANSWER_ROLES),
+            presubmit("b-ask", 9, "10", "b2", "AQ", ["sys", "task"], roles=ANSWER_ROLES[:2]),
+            presubmit("b", 10, "10", "b2", "B", ["sys", "task", "ANS", "out"], roles=ANSWER_ROLES),
+        ]
+        self.assertEqual(hit_ids(lines, "replayed_high"), ["b-ask", "b"])
+
+    def test_without_evidence_of_the_answer_the_message_keeps_its_hash(self):
+        source = [presubmit("a-ask", 0.5, "10", "b1", "AQ", ["sys", "task"], roles=ANSWER_ROLES[:2]),
+                  presubmit("a", 1, "10", "b1", "A", ["sys", "task", "ans", "out"], roles=ANSWER_ROLES)]
+        request = presubmit("b", 10, "10", "b2", "B", ["sys", "task", "ANS", "out"], roles=ANSWER_ROLES)
+        cases = {
+            # The request that got the answer is not in the logs.
+            "no asking request": [],
+            # Same build, length and last message, but an earlier message differs.
+            "asked a different conversation": [
+                presubmit("b-ask", 9, "10", "b2", "BQ", ["other-sys", "task"], roles=ANSWER_ROLES[:2])],
+            "asked in another build": [presubmit("c-ask", 8, "10", "b3", "CQ", ["sys", "task"], roles=ANSWER_ROLES[:2])],
+            "answer arrived after the request": [
+                presubmit("b-ask", 9, "10", "b2", "BQ", ["sys", "task"], roles=ANSWER_ROLES[:2], latency_ms=5_000)],
+            "no answer": [presubmit("b-ask", 9, "10", "b2", "BQ", ["sys", "task"], roles=ANSWER_ROLES[:2],
+                                    unstorable=["no_answer"])],
+            "client disconnected": [presubmit("b-ask", 9, "10", "b2", "BQ", ["sys", "task"], roles=ANSWER_ROLES[:2],
+                                              unstorable=["client_disconnected"])],
+            "no answer hash": [presubmit("b-ask", 9, "10", "b2", "BQ", ["sys", "task"], roles=ANSWER_ROLES[:2],
+                                         answer_hash=None)],
+            # A replay-mode answer served from the cache: the model never gave it in this run.
+            "served from the cache": [dict(presubmit("b-ask", 9, "10", "b2", "BQ", ["sys", "task"],
+                                                     roles=ANSWER_ROLES[:2]), mode="replay", served=True)],
+        }
+        for name, asked in cases.items():
+            with self.subTest(name):
+                self.assertNotIn("b", hit_ids(source + asked + [request], "replayed_high"))
+
+
+def with_diag(entry, diag):
+    entry["diag_message_hashes"] = list(diag)
+    return entry
+
+
+class DriftedEvidenceTest(unittest.TestCase):
+    """Evidence of a generated answer compares diagnosis hashes, which don't drift within a conversation."""
+
+    def drifted(self, drifted_prefix):
+        # Each build asks for the first answer, then a later request's earlier
+        # message hashes have drifted to `drifted_prefix`; its diagnosis hashes have not.
+        lines = []
+        for build, ts, answer in (("b1", 0, "ans"), ("b2", 10, "ANS")):
+            lines.append(with_diag(presubmit(f"{build}-ask", ts, "10", build, f"{build}Q", ["sys", "task"],
+                                             roles=ANSWER_ROLES[:2]), ["d-sys", "d-task"]))
+            lines.append(with_diag(presubmit(f"{build}-later", ts + 1, "10", build, f"{build}L",
+                                             drifted_prefix + [answer, "out"], roles=ANSWER_ROLES),
+                                   ["d-sys", "d-task", f"d-{answer}", "d-out"]))
+        return hit_ids(lines, "replayed_high")
+
+    def test_a_cidr_first_seen_in_a_later_tool_result_keeps_the_evidence(self):
+        # The CIDR in "out" keeps every earlier IP literal, so sys and task hash differently.
+        self.assertEqual(self.drifted(["sys-ips-literal", "task-ips-literal"]), ["b2-ask", "b2-later"])
+
+    def test_a_timestamp_crossing_a_bucket_keeps_the_evidence(self):
+        # The task's timestamp is now an hour old rather than minutes.
+        self.assertEqual(self.drifted(["sys", "task-older-bucket"]), ["b2-ask", "b2-later"])
+
+    def test_message_hashes_decide_when_a_record_lacks_diagnosis_hashes(self):
+        lines = [
+            presubmit("a-ask", 0, "10", "b1", "AQ", ["sys", "task"], roles=ANSWER_ROLES[:2]),
+            with_diag(presubmit("a", 1, "10", "b1", "A", ["sys", "task", "ans", "out"], roles=ANSWER_ROLES),
+                      ["d-sys", "d-task", "d-ans", "d-out"]),
+            presubmit("b-ask", 10, "10", "b2", "AQ", ["sys", "task"], roles=ANSWER_ROLES[:2]),
+            with_diag(presubmit("b", 11, "10", "b2", "B", ["sys", "task", "ANS", "out"], roles=ANSWER_ROLES),
+                      ["d-sys", "d-task", "d-ANS", "d-out"]),
+        ]
+        self.assertEqual(hit_ids(lines, "replayed_high"), ["b-ask", "b"])
+
+    def test_diagnosis_hashes_decide_when_both_records_carry_them(self):
+        # Equal message hashes, but the diagnosis hashes show another conversation asked.
+        lines = []
+        for build, ts, answer in (("b1", 0, "ans"), ("b2", 10, "ANS")):
+            lines.append(with_diag(presubmit(f"{build}-ask", ts, "10", build, f"{build}Q", ["sys", "task"],
+                                             roles=ANSWER_ROLES[:2]), ["d-sys", "d-other-task"]))
+            lines.append(with_diag(presubmit(f"{build}-later", ts + 1, "10", build, f"{build}L",
+                                             ["sys", "task", answer, "out"], roles=ANSWER_ROLES),
+                                   ["d-sys", "d-task", f"d-{answer}", "d-out"]))
+        self.assertEqual(hit_ids(lines, "replayed_high"), ["b2-ask"])
+
+
+class EarliestSourceTest(unittest.TestCase):
+    """Two sources in one earlier build under the same key: the earlier one is used."""
+
+    def test_the_hit_is_served_from_the_earliest_source_of_the_build(self):
+        lines = [
+            presubmit("a1", 1, "10", "b1", "A", ["a"]),
+            presubmit("a2", 2, "10", "b1", "A", ["a"]),
+            presubmit("p", 10, "10", "b2", "A", ["a"]),
+        ]
+        records, _ = analyze_shadow.load(write(lines))
+        recordings = [h.recording.request_id for r, h in analyze_shadow.iter_hits(records, "high") if h]
+        self.assertEqual(recordings, ["a1"])
+
+    def test_the_closest_request_is_the_earliest_source_of_the_build(self):
+        rep, _ = report([
+            presubmit("a1", 1, "10", "b1", "A", ["s", "u", "t1"]),
+            presubmit("a2", 2, "10", "b1", "B", ["s", "u", "t2"]),
+            presubmit("p", 10, "10", "b2", "C", ["s", "u", "t3"], tokens=500),
+        ])
+        top = rep["top_misses"][0]
+        self.assertEqual(top["request_id"], "p")
+        self.assertEqual(top["closest_request_id"], "a1")
+        self.assertEqual(top["matched_messages"], 2)
 
 
 class MissTest(unittest.TestCase):
@@ -263,7 +621,7 @@ class MissTest(unittest.TestCase):
         self.assertEqual(rep["top_misses"][0]["matched_messages"], 2)
         self.assertEqual(rep["top_misses"][0]["first_difference_role"], "tool")
         # Matching itself still uses message_hashes and the fingerprint.
-        self.assertEqual(rep["estimates"]["simulated"]["hits"], 0)
+        self.assertEqual(rep["estimates"]["replayed_high"]["hits"], 0)
 
     def test_closest_search_uses_the_diag_settings_hash(self):
         # A later message's CIDR changed settings_hash (tools mention an IP);
@@ -301,9 +659,297 @@ class MissTest(unittest.TestCase):
         self.assertEqual(p2["matched_messages"], 1)
 
 
+def build_store(segment):
+    """The store collect_shadow.py copies out beside a build's logs/: <build>/store/."""
+    return os.path.join(os.path.dirname(os.path.dirname(segment)), "store")
+
+
+def write_with_stores(lines, texts):
+    """write(lines), plus each segment's build store holding the texts of the requests in it."""
+    paths = write(lines)
+    for path in paths:
+        with open(path) as handle:
+            ids = {json.loads(l).get("request_id") for l in handle if l.strip().startswith("{")}
+        write_store({rid: texts[rid] for rid in ids if rid in texts}, build_store(path))
+    return paths
+
+
+def write_store(requests, root=None):
+    """A REPLAY_STORE_DIR holding `requests`: request_id -> list of message texts."""
+    root = root or tempfile.mkdtemp(dir=TEMP_DIR)
+    os.makedirs(os.path.join(root, "blobs"), exist_ok=True)
+    os.makedirs(os.path.join(root, "requests"), exist_ok=True)
+    for request_id, messages in requests.items():
+        blobs = []
+        for text in messages:
+            # As request_store.py writes it: the message as compact JSON.
+            blob = json.dumps({"content": text, "role": "tool"}, sort_keys=True, separators=(",", ":"))
+            digest = hashlib.sha256(blob.encode()).hexdigest()
+            with open(os.path.join(root, "blobs", digest + ".json"), "w") as handle:
+                handle.write(blob)
+            blobs.append(digest)
+        with open(os.path.join(root, "requests", request_id + ".json"), "w") as handle:
+            json.dump({"request_id": request_id, "messages": blobs}, handle)
+    return root
+
+
+class ClosestByTextTest(unittest.TestCase):
+    LINES = [
+        line("n1", 1, "nightly", "n", "A", ["s", "w", "ta"], roles=["system", "user", "tool"]),
+        line("n2", 1.5, "nightly", "n", "B", ["s", "w", "tb"], roles=["system", "user", "tool"]),
+        presubmit("p1", 2, "10", "b1", "C", ["s", "w", "tc"], roles=["system", "user", "tool"]),
+    ]
+    TEXTS = {
+        "n1": ["sys", "work kanban task", "card: list the namespaces on cluster alpha"],
+        "n2": ["sys", "work kanban task", "card: check kube-system pods on cluster beta and report restarts"],
+        "p1": ["sys", "work kanban task", "card: check kube-system pods on cluster beta and report restart counts"],
+    }
+
+    def test_without_the_store_the_earliest_request_sharing_the_prefix_is_closest(self):
+        miss = report(self.LINES)[0]["top_misses"][0]
+        self.assertEqual((miss["closest_request_id"], miss["matched_messages"]), ("n1", 2))
+
+    def test_with_the_store_the_one_whose_next_message_is_most_alike_is_closest(self):
+        texts = analyze_shadow.StoredText(write_store(self.TEXTS))
+        miss = report(self.LINES, texts=texts)[0]["top_misses"][0]
+        self.assertEqual((miss["closest_request_id"], miss["matched_messages"]), ("n2", 2))
+
+    def test_a_nightly_untrusted_request_is_never_closest(self):
+        # n1 is a real source for the prefix, so the search reaches the text ranking,
+        # where the untrusted n2 has the most alike next message. Its tags are the
+        # proxy's, so it can claim to be an earlier build of p1's pull request.
+        texts = analyze_shadow.StoredText(write_store(self.TEXTS))
+        lines = [dict(l) for l in self.LINES]
+        lines[1] = dict(lines[1], job={"kind": "nightly-untrusted", "project": "p1", "build": "b0", "pr": "10"})
+        miss = report(lines, texts=texts)[0]["top_misses"][0]
+        self.assertEqual(miss["closest_request_id"], "n1")
+
+    def _untrusted_claiming_the_pull_request(self):
+        lines = [line("u1", 1, "nightly-untrusted", "b0", "A", ["s", "w", "ta"], pr="10"),
+                 presubmit("p1", 2, "10", "b1", "C", ["s", "w", "tc"])]
+        records, _ = analyze_shadow.load(write(lines))
+        return {r.request_id: r for r in records}, analyze_shadow.PrefixSources(records, {}, True, by_text=True)
+
+    def test_usable_refuses_an_untrusted_record_on_its_own(self):
+        records, sources = self._untrusted_claiming_the_pull_request()
+        self.assertFalse(sources.usable(records["u1"], records["p1"]))
+
+    def test_an_untrusted_record_is_never_a_text_candidate(self):
+        records, sources = self._untrusted_claiming_the_pull_request()
+        self.assertTrue(sources.members, "the presubmit's own prefixes are there")
+        for key, members in sources.members.items():
+            self.assertNotIn("u1", [r.request_id for r in members], key)
+
+    def test_a_request_replay_could_not_have_used_is_never_closest(self):
+        # n2 finished after p1 started, so it was not available to p1.
+        lines = [dict(l) for l in self.LINES]
+        lines[1]["ts"] = 3
+        texts = analyze_shadow.StoredText(write_store(self.TEXTS))
+        miss = report(lines, texts=texts)[0]["top_misses"][0]
+        self.assertEqual(miss["closest_request_id"], "n1")
+
+    def test_multi_line_output_is_compared_line_by_line_not_as_json(self):
+        # The stored blob is JSON, so read raw, a word at a line break glues to
+        # the next line's first word. n1 lists the same pods in another order
+        # (identical words); n2 shares the first two lines and nothing else.
+        texts = {
+            "n1": ["sys", "work", "web-c 1/1\nweb-a 1/1\nweb-b 2/2"],
+            "n2": ["sys", "work", "web-a 1/1\nweb-b 2/2\napi-x 0/3"],
+            "p1": ["sys", "work", "web-a 1/1\nweb-b 2/2\nweb-c 1/1"],
+        }
+        lines = [dict(l) for l in self.LINES]
+        lines[0]["ts"], lines[1]["ts"] = 1.5, 1  # n2 is the earliest, so the fallback would pick it
+        miss = report(lines, texts=analyze_shadow.StoredText(write_store(texts)))[0]["top_misses"][0]
+        self.assertEqual(miss["closest_request_id"], "n1")
+
+    def test_tool_call_arguments_count_as_words(self):
+        message = {"role": "assistant", "content": None,
+                   "tool_calls": [{"id": "c1", "function": {"name": "kubectl", "arguments": "get pods -n web"}}]}
+        self.assertEqual(analyze_shadow.message_text(message), "kubectl\nget pods -n web")
+
+    def test_missing_text_falls_back_to_the_earliest(self):
+        texts = analyze_shadow.StoredText(write_store({"n1": self.TEXTS["n1"]}))
+        miss = report(self.LINES, texts=texts)[0]["top_misses"][0]
+        self.assertEqual(miss["closest_request_id"], "n1")
+
+
+class ClosestByTextRulesTest(unittest.TestCase):
+    """The text ranking never reports a request replay could not have served."""
+
+    TEXTS = {
+        "n1": ["sys", "work", "card: list the namespaces on cluster alpha"],
+        "x": ["sys", "work", "card: check kube-system pods on cluster beta and report restarts"],
+        "p1": ["sys", "work", "card: check kube-system pods on cluster beta and report restart counts"],
+    }
+
+    def closest(self, candidate, extra=(), merged=None):
+        lines = [line("n1", 1, "nightly", "n", "A", ["s", "w", "ta"]), candidate, *extra,
+                 presubmit("p1", 10, "10", "b2", "C", ["s", "w", "tc"])]
+        texts = analyze_shadow.StoredText(write_store(self.TEXTS))
+        rep, _ = report(lines, texts=texts, merged=merged or {}, top=100)
+        return next(m for m in rep["top_misses"] if m["request_id"] == "p1")["closest_request_id"]
+
+    def test_an_earlier_finished_build_of_the_same_pr_is_usable(self):
+        self.assertEqual(self.closest(presubmit("x", 2, "10", "b1", "X", ["s", "w", "tx"])), "x")
+
+    def test_an_unfinished_build_of_the_same_pr_is_not(self):
+        still_running = presubmit("x2", 12, "10", "b1", "Y", ["q"])
+        self.assertEqual(self.closest(presubmit("x", 2, "10", "b1", "X", ["s", "w", "tx"]), [still_running]), "n1")
+
+    def test_another_prs_build_is_usable_only_as_the_merge_copy_after_it_merged(self):
+        other = presubmit("x", 2, "11", "c1", "X", ["s", "w", "tx"])
+        self.assertEqual(self.closest(other), "n1")
+        self.assertEqual(self.closest(other, merged={"11": 5.0}), "x")
+        self.assertEqual(self.closest(other, merged={"11": 20.0}), "n1")
+
+    def test_the_most_recent_requests_are_compared_when_there_are_more_than_the_cap(self):
+        count = analyze_shadow.MAX_PREFIX_CANDIDATES + 6
+        lines = [line(f"n{i}", 1 + i, "nightly", "n", f"A{i}", ["s", "w", f"t{i}"]) for i in range(count)]
+        lines.append(presubmit("p1", 1000, "10", "b2", "C", ["s", "w", "tc"]))
+        texts = {f"n{i}": ["sys", "work", f"card number {i} about something else"] for i in range(count)}
+        texts[f"n{count - 1}"] = texts["p1"] = ["sys", "work", "card: check kube-system pods on cluster beta"]
+        rep, _ = report(lines, texts=analyze_shadow.StoredText(write_store(texts)))
+        self.assertEqual(rep["top_misses"][0]["closest_request_id"], f"n{count - 1}")
+
+    def test_an_unreadable_stored_file_is_skipped_and_the_readable_one_ranked(self):
+        root = write_store(self.TEXTS)
+        with open(os.path.join(root, "requests", "x.json"), "wb") as handle:
+            handle.write(b"\xff\xfe{")
+        texts = analyze_shadow.StoredText(root)
+        lines = [line("n1", 1, "nightly", "n", "A", ["s", "w", "ta"]),
+                 line("x", 1.5, "nightly", "n", "X", ["s", "w", "tx"]),
+                 presubmit("p1", 10, "10", "b2", "C", ["s", "w", "tc"])]
+        miss = report(lines, texts=texts)[0]["top_misses"][0]
+        self.assertEqual((miss["closest_request_id"], miss["closest_by"]), ("n1", "text"))
+
+    def test_an_unreadable_newest_copy_does_not_hide_an_older_readable_one(self):
+        # n_new carries the same next message as n_old but its text was never
+        # stored; the unrelated n_other sits between them.
+        lines = [line("n_old", 1, "nightly", "n", "A", ["s", "w", "tx"]),
+                 line("n_other", 1.5, "nightly", "n", "B", ["s", "w", "ty"]),
+                 line("n_new", 1.8, "nightly", "n", "A2", ["s", "w", "tx"]),
+                 presubmit("p1", 10, "10", "b2", "C", ["s", "w", "tc"])]
+        texts = analyze_shadow.StoredText(write_store({
+            "n_old": self.TEXTS["x"],
+            "n_other": ["sys", "work", "card: open a pull request bumping a node pool version for cluster beta"],
+            "p1": self.TEXTS["p1"],
+        }))
+        miss = report(lines, texts=texts)[0]["top_misses"][0]
+        self.assertEqual((miss["closest_request_id"], miss["closest_by"]), ("n_old", "text"))
+
+    def test_the_report_says_how_each_closest_request_was_chosen(self):
+        lines = [line("n1", 1, "nightly", "n", "A", ["s", "w", "ta"]),
+                 line("x", 1.5, "nightly", "n", "X", ["s", "w", "tx"]),
+                 presubmit("p1", 10, "10", "b2", "C", ["s", "w", "tc"], tokens=300),
+                 presubmit("p2", 11, "10", "b2", "D", ["s", "w", "td"], tokens=200)]
+        texts = analyze_shadow.StoredText(write_store({
+            "n1": self.TEXTS["n1"], "x": self.TEXTS["x"], "p1": self.TEXTS["p1"]}))
+        rep, _ = report(lines, texts=texts)
+        by = {m["request_id"]: (m["closest_by"], m["unranked_reason"]) for m in rep["top_misses"]}
+        self.assertEqual(by["p1"], ("text", None))
+        self.assertEqual(by["p2"], ("earliest", "own_text_missing"))
+        self.assertEqual(rep["closest_by_text"]["ranked_by_text"], 1)
+        self.assertEqual(rep["closest_by_text"]["earliest_because"]["own_text_missing"], 1)
+        self.assertNotIn("closest_by", report(lines)[0]["top_misses"][0], "without --store nothing is claimed")
+
+    def test_no_readable_candidate_is_reported_as_such(self):
+        texts = analyze_shadow.StoredText(write_store({"p1": self.TEXTS["p1"]}))
+        lines = [line("n1", 1, "nightly", "n", "A", ["s", "w", "ta"]),
+                 presubmit("p1", 10, "10", "b2", "C", ["s", "w", "tc"])]
+        miss = report(lines, texts=texts)[0]["top_misses"][0]
+        self.assertEqual((miss["closest_request_id"], miss["closest_by"], miss["unranked_reason"]),
+                         ("n1", "earliest", "no_candidate_text"))
+
+    def test_all_messages_matching_is_reported_as_nothing_to_rank(self):
+        texts = analyze_shadow.StoredText(write_store(self.TEXTS))
+        lines = [line("n1", 1, "nightly", "n", "A", ["s", "w"]), presubmit("p1", 10, "10", "b2", "B", ["s", "w"])]
+        miss = report(lines, texts=texts)[0]["top_misses"][0]
+        self.assertEqual((miss["closest_by"], miss["unranked_reason"]), ("earliest", "all_messages_matched"))
+
+    def test_the_text_output_counts_the_ranked_misses(self):
+        root = write_store(self.TEXTS)
+        lines = [line("n1", 1, "nightly", "n", "A", ["s", "w", "ta"]),
+                 line("x", 1.5, "nightly", "n", "X", ["s", "w", "tx"]),
+                 presubmit("p1", 10, "10", "b2", "C", ["s", "w", "tc"])]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            analyze_shadow.main([*write_with_stores(lines, self.TEXTS), "--by-text"])
+        self.assertIn("closest request ranked by text for 1 of 1 misses", out.getvalue())
+        self.assertRegex(out.getvalue(), r"\(nightly, by text 0\.\d+\)")
+
+    def test_no_shared_word_is_no_match(self):
+        # The only candidate with text shares no word with the miss: no text match, whatever its recency.
+        texts = analyze_shadow.StoredText(write_store({
+            "n1": ["sys", "work", "alpha beta gamma"], "p1": ["sys", "work", "delta epsilon zeta"]}))
+        lines = [line("n1", 1, "nightly", "n", "A", ["s", "w", "ta"]), presubmit("p1", 10, "10", "b2", "C", ["s", "w", "tc"])]
+        miss = report(lines, texts=texts)[0]["top_misses"][0]
+        self.assertEqual((miss["closest_by"], miss["unranked_reason"], miss["closest_score"]),
+                         ("earliest", "no_shared_words", None))
+
+    def test_an_empty_next_message_is_not_ranked(self):
+        # Two empty messages would score a perfect 1.0 against each other.
+        texts = analyze_shadow.StoredText(write_store({"n1": ["sys", "work", ""], "p1": ["sys", "work", ""]}))
+        lines = [line("n1", 1, "nightly", "n", "A", ["s", "w", "ta"]), presubmit("p1", 10, "10", "b2", "C", ["s", "w", "tc"])]
+        miss = report(lines, texts=texts)[0]["top_misses"][0]
+        self.assertEqual((miss["closest_by"], miss["unranked_reason"]), ("earliest", "own_text_empty"))
+
+    def test_a_text_pick_carries_its_score(self):
+        texts = analyze_shadow.StoredText(write_store(self.TEXTS))
+        lines = [line("x", 1, "nightly", "n", "X", ["s", "w", "tx"]), presubmit("p1", 10, "10", "b2", "C", ["s", "w", "tc"])]
+        miss = report(lines, texts=texts)[0]["top_misses"][0]
+        self.assertEqual(miss["closest_by"], "text")
+        self.assertGreater(miss["closest_score"], 0.5)
+
+    def test_an_empty_store_path_is_refused(self):
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            analyze_shadow.main([*write([line("n1", 1, "nightly", "n", "A", ["a"])]), "--kind", "nightly", "--store", ""])
+
+    def test_a_store_without_blobs_is_refused(self):
+        root = write_store(self.TEXTS)
+        shutil.rmtree(os.path.join(root, "blobs"))
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            analyze_shadow.main([*write([line("n1", 1, "nightly", "n", "A", ["a"])]), "--kind", "nightly", "--store", root])
+
+    def test_a_store_without_requests_is_refused(self):
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            analyze_shadow.main([*write([line("n1", 1, "nightly", "n", "A", ["a"])]), "--kind", "nightly", "--store",
+                                 TEMP_DIR + "/typo"])
+
+    def test_one_store_for_every_input_needs_kind_and_by_text_refuses_it(self):
+        root = write_store(self.TEXTS)
+        paths = write([line("n1", 1, "nightly", "n", "A", ["a"])])
+        for extra in (["--store", root], ["--by-text", "--kind", "nightly"], ["--by-text", "--kind", "nightly", "--store", root]):
+            with self.subTest(extra=extra):
+                err = io.StringIO()
+                with self.assertRaises(SystemExit), contextlib.redirect_stderr(err):
+                    analyze_shadow.main([*paths, *extra])
+                self.assertIn("--kind", err.getvalue())
+
+    def test_text_planted_in_another_build_never_stands_in_for_a_trusted_candidate(self):
+        # n1 and x are nightly; x's next message is the closer one. A presubmit that read the bucket
+        # plants store/requests/n1.json under its own build with p1's exact text, which a merged
+        # store would rank first.
+        lines = [line("n1", 1, "nightly", "n", "A", ["s", "w", "ta"]),
+                 line("x", 1.5, "nightly", "n", "X", ["s", "w", "tx"]),
+                 presubmit("p1", 10, "10", "b2", "C", ["s", "w", "tc"])]
+        paths = write_with_stores(lines, self.TEXTS)
+        presubmit_segment = next(p for p in paths if os.sep + "presubmit" + os.sep in p)
+        write_store({"n1": self.TEXTS["p1"]}, build_store(presubmit_segment))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(analyze_shadow.main([*paths, "--by-text", "--json"]), 0)
+        [miss] = json.loads(out.getvalue())["top_misses"]
+        self.assertEqual((miss["closest_request_id"], miss["closest_by"]), ("x", "text"))
+        # The same files with every store merged into one, as the old recipe did: the planted text wins.
+        merged = write_store({**self.TEXTS, "n1": self.TEXTS["p1"]})
+        records, _ = analyze_shadow.load(paths)
+        miss = analyze_shadow.summarize(records, texts=analyze_shadow.StoredText(merged))["top_misses"][0]
+        self.assertEqual(miss["closest_request_id"], "n1")
+
+
 class HealthTest(unittest.TestCase):
     def test_health_counts(self):
-        records, skipped = analyze_shadow.load([write([
+        records, skipped = analyze_shadow.load(write([
             line("n1", 1, "nightly", "n", "A", ["a"]),
             presubmit("p1", 2, "", "b1", "A", None, unstorable=["upstream_incomplete"]),
             presubmit("p2", 3, "10", "b1", "B", ["b"], unstorable=["observe_failed"]),
@@ -311,10 +957,10 @@ class HealthTest(unittest.TestCase):
             presubmit("p4", 4, "10", "b1", "D", ["d"], unstorable=["observe_too_large"]),
             {"event": "replay_shadow_request", "ts": 5, "error": "RuntimeError", "job": {"kind": "presubmit"}},
             {"event": "replay_shadow_request", "ts": 6, "error": "analysis_dropped", "job": {"kind": "presubmit"}},
-        ])])
+        ]))
         rep = analyze_shadow.summarize(records, skipped=skipped)
         h = rep["health"]
-        self.assertEqual(h["lines_by_kind"], {"nightly": 1, "presubmit": 4})
+        self.assertEqual(h["lines_by_kind"], {"nightly": 1, "nightly-untrusted": 0, "presubmit": 4, "replay-lane": 0})
         self.assertEqual(h["observe_too_large"], 1)
         self.assertEqual(h["error_lines"], 1)
         self.assertEqual(h["analysis_dropped"], 1)
@@ -328,34 +974,214 @@ class HealthTest(unittest.TestCase):
 
 class LoadTest(unittest.TestCase):
     def test_skips_other_lines_and_untagged_jobs(self):
-        records, skipped = analyze_shadow.load([write([
+        records, skipped = analyze_shadow.load(write([
             "not json",
             {"event": "replay_shadow_start"},
             line("x", 1, "", "b", "A", ["a"]),
             {"event": "replay_shadow_request", "ts": 1, "error": "RuntimeError", "job": {"kind": "presubmit"}},
             {"event": "replay_shadow_request", "ts": 1, "job": {"kind": "presubmit"}},
             presubmit("p", 2, "10", "b", "A", ["a"]),
-        ])])
+        ]))
         self.assertEqual([r.request_id for r in records], ["p"])
         self.assertEqual(records[0].pr, "10")
-        self.assertEqual(skipped, {"not_json": 1, "other_event": 1, "untagged": 1, "error": 1, "analysis_dropped": 0, "no_fingerprint": 1})
+        self.assertEqual(skipped, {"not_json": 1, "other_event": 1, "untagged": 1, "error": 1, "analysis_dropped": 0, "no_fingerprint": 1,
+                                   "kind_mismatch": 0, "off_layout_files": 0, "served": 0})
+
+    def test_a_served_replay_line_is_skipped_not_counted_unstorable(self):
+        # As the proxy logged served lines before it stopped judging them.
+        served = dict(presubmit("s", 2, "10", "b", "A", ["a"], unstorable=["no_model_group_header"]), mode="replay", served=True)
+        records, skipped = analyze_shadow.load(write([served, presubmit("p", 3, "10", "b", "A", ["a"])]))
+        self.assertEqual([r.request_id for r in records], ["p"])
+        self.assertEqual(skipped["served"], 1)
+        self.assertEqual(analyze_shadow.health(records, skipped)["unstorable_lines"], 0)
 
     def test_records_from_several_files_are_merged_in_time_order(self):
         a = write([presubmit("p2", 5, "10", "b2", "A", ["a"])])
         b = write([line("n1", 1, "nightly", "n", "A", ["a"])])
-        records, _ = analyze_shadow.load([a, b])
+        records, _ = analyze_shadow.load(a + b)
         self.assertEqual([r.request_id for r in records], ["n1", "p2"])
 
     def test_main_prints_text_and_json_and_reads_merge_times(self):
         path = write([presubmit("p1", 1, "10", "b", "A", ["a"]), presubmit("p2", 5, "11", "c", "A", ["a"])])
-        merged = write([])
+        merged = os.path.join(tempfile.mkdtemp(dir=TEMP_DIR), "merged.json")
         with open(merged, "w") as handle:
             json.dump({"10": 2}, handle)
-        for args in ([path, "--merged", merged], [path, "--merged", merged, "--json"]):
+        for args in ([*path, "--merged", merged], [*path, "--merged", merged, "--json"]):
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 self.assertEqual(analyze_shadow.main(args), 0)
             self.assertIn("50.0", out.getvalue())
+            self.assertIn("replayed_miss_tokens_by_first_difference" if "--json" in args else "replayed_low",
+                          out.getvalue())
+
+
+class FolderKindTest(unittest.TestCase):
+    """The folder a line was filed under is its kind; its own tag is only checked against it."""
+
+    def test_a_presubmit_line_tagged_nightly_is_never_a_nightly_source(self):
+        forged = line("f1", 1, "nightly", "n", "A", ["a"], tokens=10_000)
+        files = [write_file([forged], "presubmit"), write_file([presubmit("p1", 2, "10", "b1", "A", ["a"])], "presubmit")]
+        records, skipped = analyze_shadow.load(files)
+        self.assertEqual([r.request_id for r in records], ["p1"])
+        self.assertEqual(skipped["kind_mismatch"], 1)
+        rep = analyze_shadow.summarize(records, skipped=skipped, merged={"10": 1.5})
+        for estimate in analyze_shadow.ESTIMATES:
+            self.assertEqual(rep["estimates"][estimate]["hits"], 0, estimate)
+        self.assertEqual((rep["nightly_requests"], rep["health"]["kind_mismatch_lines"]), (0, 1))
+
+    def test_a_nightly_untrusted_line_tagged_nightly_is_dropped(self):
+        records, skipped = analyze_shadow.load([write_file([line("f1", 1, "nightly", "n", "A", ["a"])], "nightly-untrusted")])
+        self.assertEqual((records, skipped["kind_mismatch"]), ([], 1))
+
+    def test_the_kind_is_the_top_level_folder_and_a_nested_kind_folder_is_skipped(self):
+        # IAM governs only the replay-shadow/<kind>/ prefix: a presubmit names everything below it,
+        # so it uploads replay-shadow/presubmit/<day>/nightly/<day>/<build>/logs/seg.jsonl tagged nightly.
+        week = tempfile.mkdtemp(dir=TEMP_DIR)
+        honest = os.path.join(week, "presubmit", "2026-11-05", "1790", "logs")
+        forged = os.path.join(week, "presubmit", "2026-11-05", "nightly", "2026-11-05", "1790", "logs")
+        for directory, entry in ((honest, presubmit("p1", 2, "10", "b1", "A", ["a"])),
+                                 (forged, line("f1", 1, "nightly", "n", "A", ["a"], tokens=10_000))):
+            os.makedirs(directory)
+            with open(os.path.join(directory, "seg.jsonl"), "w") as handle:
+                handle.write(json.dumps(entry) + "\n")
+        for argument in (week, os.path.join(week, "presubmit")):
+            with self.subTest(argument=argument):
+                records, skipped = analyze_shadow.load([argument])
+                self.assertEqual([(r.request_id, r.kind) for r in records], [("p1", "presubmit")])
+                self.assertEqual(skipped["off_layout_files"], 1)
+                rep = analyze_shadow.summarize(records, skipped=skipped)
+                for estimate in analyze_shadow.ESTIMATES:
+                    self.assertEqual(rep["estimates"][estimate]["hits"], 0, estimate)
+                self.assertEqual(rep["health"]["off_layout_files"], 1)
+        # Named outright, the forged file is refused, not trusted.
+        with self.assertRaises(ValueError):
+            analyze_shadow.load([os.path.join(forged, "seg.jsonl")])
+
+    def test_a_kind_folder_its_parent_or_a_file_inside_one_all_work(self):
+        path = write_file([line("n1", 1, "nightly", "n", "A", ["a"])], "nightly")
+        kind_folder = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(path))))
+        for argument in (path, kind_folder, os.path.dirname(kind_folder), os.path.dirname(os.path.dirname(kind_folder))):
+            with self.subTest(argument=argument):
+                records, skipped = analyze_shadow.load([argument])
+                self.assertEqual([(r.request_id, r.kind) for r in records], [("n1", "nightly")])
+                self.assertEqual(skipped["off_layout_files"], 0)
+
+    def test_a_file_off_the_layout_inside_a_kind_folder_is_skipped(self):
+        path = write_file([presubmit("p1", 2, "10", "b1", "A", ["a"])], "presubmit")
+        kind_folder = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(path))))
+        for relative in ("stray.jsonl", "2026-11-05/stray.jsonl", "not-a-day/1/logs/seg.jsonl",
+                         "2026-11-05/1/notlogs/seg.jsonl", "2026-11-05/replay-shadow/logs/seg.jsonl"):
+            with self.subTest(relative=relative):
+                stray = os.path.join(kind_folder, relative)
+                os.makedirs(os.path.dirname(stray), exist_ok=True)
+                with open(stray, "w") as handle:
+                    handle.write(json.dumps(presubmit("s1", 1, "10", "b0", "A", ["a"])) + "\n")
+                records, skipped = analyze_shadow.load([kind_folder])
+                self.assertEqual([r.request_id for r in records], ["p1"])
+                self.assertEqual(skipped["off_layout_files"], 1)
+                os.remove(stray)
+
+    def test_a_run_with_nothing_at_the_layout_is_refused(self):
+        loose = tempfile.mkdtemp(dir=TEMP_DIR)
+        with open(os.path.join(loose, "seg.jsonl"), "w") as handle:
+            handle.write(json.dumps(presubmit("p1", 2, "10", "b1", "A", ["a"])) + "\n")
+        with contextlib.redirect_stderr(io.StringIO()), \
+                self.assertRaisesRegex(ValueError, "no log segment is at the bucket's layout"):
+            analyze_shadow.load([loose])
+        records, _ = analyze_shadow.load([loose], kind="presubmit")
+        self.assertEqual([r.request_id for r in records], ["p1"])
+        # No segments at all is an empty run, not a mistake.
+        records, skipped = analyze_shadow.load([tempfile.mkdtemp(dir=TEMP_DIR)])
+        self.assertEqual((records, skipped["off_layout_files"]), ([], 0))
+
+    def test_a_planted_folder_with_nothing_at_the_layout_does_not_stop_the_recipe(self):
+        # The reviewer's reproduction: week/nightly-untrusted holds only 2026-11-05/x.jsonl.
+        week = tempfile.mkdtemp(dir=TEMP_DIR)
+        for kind, relative, entry in (
+                ("nightly", "2026-11-05/1790/logs/seg.jsonl", line("n1", 1, "nightly", "n", "A", ["a"])),
+                ("presubmit", "2026-11-05/1791/logs/seg.jsonl", presubmit("p1", 2, "10", "b1", "A", ["a"])),
+                ("nightly-untrusted", "2026-11-05/x.jsonl", line("u1", 1, "nightly-untrusted", "u", "A", ["a"]))):
+            target = os.path.join(week, kind, relative)
+            os.makedirs(os.path.dirname(target))
+            with open(target, "w") as handle:
+                handle.write(json.dumps(entry) + "\n")
+        folders = [os.path.join(week, kind) for kind in ("nightly", "nightly-untrusted", "presubmit")]
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(analyze_shadow.main([*folders, "--json"]), 0)
+        rep = json.loads(out.getvalue())
+        self.assertEqual(rep["health"]["off_layout_files"], 1)
+        self.assertEqual((rep["requests"], rep["estimates"]["low"]["hits"]), (2, 1))
+        self.assertIn(f"note: {folders[1]} holds no log segment at the bucket's layout", err.getvalue())
+
+    def test_a_named_job_manifest_is_not_read_as_a_log(self):
+        path = write_file([presubmit("p1", 2, "10", "b1", "A", ["a"])], "presubmit")
+        manifest = os.path.join(os.path.dirname(os.path.dirname(path)), "job-1762300000000.json")
+        with open(manifest, "w") as handle:
+            json.dump({"kind": "presubmit", "build": "1"}, handle)
+        self.assertEqual(analyze_shadow.filed_kind(manifest), "presubmit")
+        for kind in (None, "presubmit"):
+            with self.subTest(kind=kind):
+                with self.assertRaisesRegex(ValueError, "is not a log segment"):
+                    analyze_shadow.load([manifest], kind=kind)
+
+    def test_a_folder_inside_a_kind_folder_keeps_that_kind(self):
+        path = write_file([presubmit("p1", 2, "10", "b1", "A", ["a"])], "presubmit")
+        records, _ = analyze_shadow.load([os.path.dirname(os.path.dirname(os.path.dirname(path)))])
+        self.assertEqual([(r.request_id, r.kind) for r in records], [("p1", "presubmit")])
+
+    def test_filed_kind_reads_segments_and_job_manifests_at_the_layout_only(self):
+        top = os.path.join(os.sep, "data", "week")
+        cases = {
+            "presubmit/2026-11-05/1790/logs/p-1-000001.jsonl": "presubmit",
+            "nightly-untrusted/2026-11-05/1790/job-1762300000000.json": "nightly-untrusted",
+            "replay-shadow/nightly/2026-11-05/1790/job-1762300000000.json": "nightly",
+            "presubmit/2026-11-05/1790/logs/job-1762300000000.json": None,
+            "presubmit/2026-11-05/1790/job-1.jsonl": None,
+            "presubmit/2026-11-05/1790/job-x.json": None,
+            "presubmit/2026-11-05/nightly/job-1762300000000.json": None,
+            "presubmit/2026-11-05/nightly/2026-11-05/1790/job-1762300000000.json": None,
+            "presubmit/2026-11-05/nightly/2026-11-05/1790/logs/seg.jsonl": None,
+            "presubmit/2026-11-05/replay-shadow/logs/seg.jsonl": None,
+        }
+        for relative, kind in cases.items():
+            with self.subTest(relative=relative):
+                self.assertEqual(analyze_shadow.filed_kind(os.path.join(top, relative)), kind)
+
+    def test_a_missing_path_is_named_with_or_without_a_kind(self):
+        missing = os.path.join(TEMP_DIR, "no-such", "presubmit")
+        for kind in (None, "presubmit"):
+            with self.subTest(kind=kind):
+                with self.assertRaisesRegex(ValueError, f"{missing} does not exist"):
+                    analyze_shadow.load([missing], kind=kind)
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as exit_:
+                    analyze_shadow.main([missing] + (["--kind", kind] if kind else []))
+                self.assertEqual(exit_.exception.code, 2)
+                self.assertIn(f"{missing} does not exist", err.getvalue())
+
+    def test_a_directory_is_searched_for_segments(self):
+        path = write_file([presubmit("p1", 2, "10", "b1", "A", ["a"])], "presubmit")
+        with open(os.path.join(os.path.dirname(path), "job-1.json"), "w") as handle:
+            handle.write("{}")
+        records, skipped = analyze_shadow.load([os.path.dirname(path)])
+        self.assertEqual([r.request_id for r in records], ["p1"])
+        self.assertEqual(skipped["not_json"], 0)
+
+    def test_a_file_under_no_kind_folder_is_refused_unless_a_kind_is_given(self):
+        handle = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False, dir=TEMP_DIR)
+        with handle:
+            handle.write(json.dumps(line("n1", 1, "nightly", "n", "A", ["a"])) + "\n")
+        with self.assertRaises(ValueError):
+            analyze_shadow.load([handle.name])
+        records, _ = analyze_shadow.load([handle.name], kind="nightly")
+        self.assertEqual([r.kind for r in records], ["nightly"])
+        records, skipped = analyze_shadow.load([handle.name], kind="presubmit")
+        self.assertEqual((records, skipped["kind_mismatch"]), ([], 1))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+            analyze_shadow.main([handle.name])
+        self.assertIn("--kind", err.getvalue())
 
 
 if __name__ == "__main__":

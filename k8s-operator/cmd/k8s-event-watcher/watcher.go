@@ -190,9 +190,12 @@ var errorHandlerOnce sync.Once
 // hold their own bounded entries), and a store would otherwise grow with the
 // event backlog of every watched cluster for no reader.
 type watcher struct {
-	client     kubernetes.Interface
-	dispatcher eventDispatcher
-	cluster    targetCluster
+	client kubernetes.Interface
+	// watchClient opens the Events watch: cluster.WatchClient, or client when
+	// that is nil (see targetCluster.WatchClient and watchConfig).
+	watchClient kubernetes.Interface
+	dispatcher  eventDispatcher
+	cluster     targetCluster
 	// forbiddenHold is the wait applied by handleWatchError after a 403 and by
 	// awaitPermitted after a denied preflight; it is forbiddenRetryInterval
 	// everywhere except tests, which shorten it.
@@ -250,8 +253,13 @@ type watcher struct {
 // newWatcher constructs a watcher. There is no resync period: a resync
 // re-fires every object a store holds, and this watcher holds none.
 func newWatcher(client kubernetes.Interface, dispatcher eventDispatcher, cluster targetCluster) *watcher {
+	watchClient := cluster.WatchClient
+	if watchClient == nil {
+		watchClient = client
+	}
 	return &watcher{
 		client:        client,
+		watchClient:   watchClient,
 		dispatcher:    dispatcher,
 		cluster:       cluster,
 		forbiddenHold: forbiddenRetryInterval,
@@ -587,7 +595,7 @@ func (w *watcher) newListWatch() cache.ListerWatcher {
 					return nil, err
 				}
 			}
-			wi, err := w.client.CoreV1().Events(metav1.NamespaceAll).Watch(ctx, opts)
+			wi, err := w.watchClient.CoreV1().Events(metav1.NamespaceAll).Watch(ctx, opts)
 			if err != nil {
 				release()
 				return wi, err
@@ -1087,11 +1095,10 @@ func toTriageEvent(ev *corev1.Event, cluster targetCluster) TriageEvent {
 	// InvolvedObject.UID is what we key dedup on.
 	uid := string(ev.InvolvedObject.UID)
 
-	// ControllerRef: for a Pod, the parent ReplicaSet /
-	// Deployment / StatefulSet is on OwnerReferences. Populating
-	// this requires an additional Pod GET which we don't have
-	// in-hand here. Left empty; the recipe includes RBAC for
-	// pod GET so the agent can enrich via MCP if needed.
+	// ControllerRef: for a Pod, the owning workload is on the Pod's
+	// OwnerReferences, which the event does not carry. It is filled
+	// after the filter and dedup admit the event (dispatcher.Dispatch,
+	// ownerResolver), so a dropped event costs no Pod read.
 	controllerRef := ""
 
 	return TriageEvent{

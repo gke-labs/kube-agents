@@ -52,7 +52,7 @@ const (
 	// envTaskCredentialMaxLifetime caps those credentials' expiry: the
 	// callout's setting of the same name, parsed by the callout's parser so
 	// the two never disagree on what a value means.
-	envTaskCredentialMaxLifetime = "A2A_TASK_CREDENTIAL_MAX_LIFETIME"
+	envTaskCredentialMaxLifetime = "A2A_TASK_CREDENTIAL_MAX_LIFETIME" // #nosec G101 -- an env var name, not a credential
 
 	// configWait bounds the wait for the first config at startup: past it
 	// the process exits and the kubelet's restart says so.
@@ -247,6 +247,12 @@ func serve(ctx context.Context, log *slog.Logger, s settings, kube kubernetes.In
 	if err != nil {
 		return err
 	}
+	// Job mode for the unattended tier. It runs only for a profile with a
+	// Job template in the config, which the operator renders (with this
+	// dispatcher's Jobs Role) only where the chart installed the Job
+	// admission policy; other profiles' unattended tasks have no worker (the
+	// operator builds warm pools for the read tier only).
+	d.UseJobs(dispatch.NewKubeJobs(kube, store.Config))
 	pr.setDispatcher(d.Ready)
 	log.Info("dispatching", "configmap", s.configMap, "profileNamespace", profileNS)
 	if err := d.Run(ctx); err != nil {

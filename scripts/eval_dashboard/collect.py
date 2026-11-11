@@ -119,11 +119,24 @@ Sources:
               other job is collected but reported as the main part, and is
               warned about.
   --nightly-main-b-prefix  the same, for the periodic that runs the
-              main part's second half (EVAL_NIGHTLY_PART=main-b; the main
+              main part's main-b shard (EVAL_NIGHTLY_PART=main-b; the main
               job runs main-a). Given without a value it is
               DEFAULT_NIGHTLY_MAIN_B_PREFIX; read, watermarked and warned
               about as the writers prefix is, against
               DEFAULT_NIGHTLY_MAIN_B_JOB.
+  --nightly-main-c-prefix, --nightly-main-d-prefix, --nightly-main-e-prefix
+              the same, for the periodics that run the main part's other
+              shards (EVAL_NIGHTLY_PART=main-c, main-d, main-e); read,
+              watermarked and warned about as the main-b prefix is, against
+              DEFAULT_NIGHTLY_MAIN_C_JOB, _D_JOB and _E_JOB.
+  --nightly-writers-b-prefix, --nightly-writers-c-prefix  the same, for
+              the two periodics that run the writers part's second and
+              third thirds (EVAL_NIGHTLY_PART=writers-b and writers-c; the
+              writers job runs writers-a). Given without a value they are
+              DEFAULT_NIGHTLY_WRITERS_B_PREFIX and
+              DEFAULT_NIGHTLY_WRITERS_C_PREFIX; read, watermarked and warned
+              about as the writers prefix is, against
+              DEFAULT_NIGHTLY_WRITERS_B_JOB and DEFAULT_NIGHTLY_WRITERS_C_JOB.
   --index-prefix  Prow's per-job directory index, gs://<bucket>/pr-logs/
               directory/<job>/: one small `<build_id>.txt` object per build
               holding the gs:// path of that build's directory (plus a
@@ -203,9 +216,10 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 try:
-    from . import nightly, tiers
+    from . import links, nightly, tiers
 except ImportError:  # run as a script: python3 scripts/eval_dashboard/collect.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    import links
     import nightly
     import tiers
 try:
@@ -222,8 +236,9 @@ SCHEMA_VERSION = 1
 # A periodic's log prefix holds one directory per build and a
 # latest-build.txt, so listing it is the directory index; there is no
 # pointer object to follow. The bucket is the nightly's own, not the
-# cluster default gs://kube-agents-prow the RC lane logs to (the presubmit
-# has its own as well): the nightly runs as an identity that cannot write that one (night one
+# cluster default gs://kube-agents-prow (the presubmit has its own as well,
+# and the RC lane moves from the cluster default into that one, under
+# logs/): the nightly runs as an identity that cannot write that one (night one
 # died in initupload on a 403), so its job overrides the bucket and
 # github-actions@kube-agents-prow reads it as objectViewer. Only the bucket
 # differs; Prow's path strategy still puts a periodic under logs/<job>/.
@@ -239,19 +254,34 @@ DEFAULT_NIGHTLY_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{DEFAULT_NIGHTLY_JOB}/"
 # over a main build the listing has not named yet.
 DEFAULT_NIGHTLY_WRITERS_JOB = "ci-kube-agents-eval-nightly-writers"
 DEFAULT_NIGHTLY_WRITERS_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{DEFAULT_NIGHTLY_WRITERS_JOB}/"
-# The nightly's third periodic when the main part runs as two halves
-# (#3384): the main job keeps its name and runs main-a, this one runs
+# The nightly's third periodic when the main part runs as shards
+# (#3384, #4238): the main job keeps its name and runs main-a, this one runs
 # main-b. Told apart and watermarked as the writers job is
 # (nightly.py, NIGHTLY_MAIN_B_JOB).
 DEFAULT_NIGHTLY_MAIN_B_JOB = "ci-kube-agents-eval-nightly-main-b"
 DEFAULT_NIGHTLY_MAIN_B_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{DEFAULT_NIGHTLY_MAIN_B_JOB}/"
+# The main part's other shards (#4238), told apart and watermarked as main-b
+# is (nightly.py, NIGHTLY_MAIN_C_JOB, NIGHTLY_MAIN_D_JOB, NIGHTLY_MAIN_E_JOB).
+DEFAULT_NIGHTLY_MAIN_C_JOB = "ci-kube-agents-eval-nightly-main-c"
+DEFAULT_NIGHTLY_MAIN_C_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{DEFAULT_NIGHTLY_MAIN_C_JOB}/"
+DEFAULT_NIGHTLY_MAIN_D_JOB = "ci-kube-agents-eval-nightly-main-d"
+DEFAULT_NIGHTLY_MAIN_D_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{DEFAULT_NIGHTLY_MAIN_D_JOB}/"
+DEFAULT_NIGHTLY_MAIN_E_JOB = "ci-kube-agents-eval-nightly-main-e"
+DEFAULT_NIGHTLY_MAIN_E_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{DEFAULT_NIGHTLY_MAIN_E_JOB}/"
+# The writers part's other two periodics when it runs as
+# three thirds (#4238): the writers job keeps its name and runs writers-a,
+# these two run writers-b and writers-c. Told apart and watermarked as the
+# writers job is (nightly.py, NIGHTLY_WRITERS_B_JOB, NIGHTLY_WRITERS_C_JOB).
+DEFAULT_NIGHTLY_WRITERS_B_JOB = "ci-kube-agents-eval-nightly-writers-b"
+DEFAULT_NIGHTLY_WRITERS_B_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{DEFAULT_NIGHTLY_WRITERS_B_JOB}/"
+DEFAULT_NIGHTLY_WRITERS_C_JOB = "ci-kube-agents-eval-nightly-writers-c"
+DEFAULT_NIGHTLY_WRITERS_C_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{DEFAULT_NIGHTLY_WRITERS_C_JOB}/"
 # The GitLab lane's nightly (kube-agents#2832): the lane's list once a night,
 # archived as a periodic beside the GitHub nightly, tier gitlab, pr null.
 DEFAULT_GITLAB_NIGHTLY_JOB = "ci-kube-agents-eval-nightly-gitlab"
 DEFAULT_GITLAB_NIGHTLY_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{DEFAULT_GITLAB_NIGHTLY_JOB}/"
-# Where Prow's Spyglass shows a build directory: the gs:// path after the
-# scheme, so a link follows the bucket the build was read from.
-SPYGLASS_VIEW = "https://oss.gprow.dev/view/gs/"
+# Where Prow's Spyglass shows a build directory (links.py).
+SPYGLASS_VIEW = links.SPYGLASS_VIEW
 # What `gcloud storage ls` says about a prefix that exists but holds nothing
 # yet ("One or more URLs matched no objects."), as distinct from a bucket or
 # a grant failing (a 403, a bucket "not found: 404", a timeout): the
@@ -291,7 +321,7 @@ INDEX_POINTER_SUFFIX = ".txt"
 
 # What a pointer must start with to be followed, and how much of one that
 # does not is quoted in the warning.
-GS_SCHEME = "gs://"
+GS_SCHEME = links.GS_SCHEME
 POINTER_EXCERPT_CHARS = 80
 
 # Every bucket read is `gcloud storage ls` or `gcloud storage cat` through
@@ -342,11 +372,12 @@ BUILD_LOG_FILE = "build-log.txt"
 # line closes the grading; a build from before the file existed parses as it
 # always did.
 EVAL_GRADING_FILE = "artifacts/eval-grading.log"
-# Buckets Deck has no read on, so Spyglass shows nothing for a build there:
-# a run read from one records its directory (runs[].gcs_base) and the pages
-# and the health bot link the Cloud Console instead. A run in any other
-# bucket keeps the Spyglass link, which still renders it.
-PRIVATE_LOG_BUCKETS = frozenset({"kube-agents-evals-presubmit-logs"})
+# Buckets Deck has no read on (links.py): the smoke lanes' and the
+# nightly's. A run read from one records its directory (runs[].gcs_base)
+# and the pages, the health bot and the nightly issues link the Cloud
+# Console instead. A run in any other bucket keeps the Spyglass link, which
+# still renders it.
+PRIVATE_LOG_BUCKETS = links.PRIVATE_LOG_BUCKETS
 # The suite's own verdict, written by `bench-gate suite --json-out` into
 # the job's artifacts and uploaded by Prow beside the log (module
 # docstring). Read only for a build whose final line carries the marker
@@ -375,7 +406,7 @@ NOT_GRADED_KEY = "not_graded"
 # an id the pages link is one the collector keeps -- and the list is cut at
 # the size a suite could name; the rest is dropped as malformed detail, the
 # way a non-string entry already is. Same idea as the log parser's `\S+`
-# task names and the excerpt scrub in gate_comment.py. Matched with
+# task names. Matched with
 # `fullmatch`: a `$` anchor under `match` admits one trailing newline.
 _CASE_ID_SHAPE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}")
 NOT_EVALUATED_MAX_CASES = 64
@@ -502,11 +533,29 @@ _REP_TIMING_KEYS = ("agent_s", "turn1_s")
 # plus `partial=1` when the record says the counts are short (the inject
 # transport's `tokens.usage_partial`, a worker in `tokens.workers.unbilled`,
 # or `tokens.workers` null: the run delegated and no worker was billed).
+# After `total` come `cached`, `cache_write` and `reasoning` when the
+# record's `input` excludes cache reads (the api transport with the front
+# door's session row read; never the inject transport), absent otherwise and
+# on every line printed before they existed.
 # Its own shape, `rep N tokens:`, so `_REP_LINE` never matches it.
 #   rep 2 tokens: input=60468 output=79 total=60547 partial=1
+#   rep 1 tokens: input=10 output=672 total=135281 cached=125204 cache_write=9395 reasoning=0
 _REP_TOKENS_LINE = re.compile(r"^\s+rep (?P<n>\d+) tokens: (?P<fields>.*)$")
 _REP_TOKENS_KEYS = ("input", "output", "total")
+_REP_TOKENS_SPLIT_KEYS = ("cached", "cache_write", "reasoning")
 _REP_TOKENS_PARTIAL = "partial=1"
+# The shape of the reply the run delivered: one optional line under the
+# tokens line, printed by `bench-gate case` from the harness's shape.json
+# (bench/kube_agents_bench/chat_shape.py): `opens_on_verdict` and `apology`
+# as 1 or 0, then three counts. Reported, never graded. Its own shape,
+# `rep N shape:`, so `_REP_LINE` never matches it.
+#   rep 2 shape: opens_on_verdict=1 apology=0 bot_messages=2 words_before_answer=0 answer_words=48
+_REP_SHAPE_LINE = re.compile(r"^\s+rep (?P<n>\d+) shape: (?P<fields>.*)$")
+_REP_SHAPE_FLAGS = ("opens_on_verdict", "apology")
+_REP_SHAPE_COUNTS = ("bot_messages", "words_before_answer", "answer_words")
+# Longer than any real count, and far inside int()'s digit limit, which a
+# forged line would otherwise trip.
+_REP_SHAPE_MAX_DIGITS = 9
 # The bracketed per-rep score dump ending most grading lines: structured
 # metrics, not reason text.
 _REP_SCORES_TAIL = re.compile(r"\s*\[OutcomeScore=[^\]]*\]\s*$")
@@ -527,8 +576,10 @@ _FINAL_VERDICT = re.compile(
 #   Tier:        nightly
 #   Verdict:     GREEN (GREEN promotes this candidate to staging)
 #   Artifacts:   https://oss.gprow.dev/view/gs/kube-agents-prow/logs/<job>/<build>
-# The Artifacts line is absent when the driver ran outside Prow (no JOB_NAME
-# or BUILD_ID), so it is optional here. The whole banner is absent when the
+# The Artifacts line is the Console's bucket browser instead for a build in a
+# private bucket (links.py); either way it is one token, taken as it is. It
+# is absent when the driver ran outside Prow (no JOB_NAME or BUILD_ID), so it
+# is optional here. The whole banner is absent when the
 # driver exited on one of its early guards, which build_release reports as a
 # release with no verdict rather than dropping -- a resolver that has been
 # broken for a month must not read as a month with no releases.
@@ -653,27 +704,55 @@ def _attach_tokens(task: dict, n: int, fields: str) -> None:
 
     ``{"input", "output", "total"}`` each an int, or None when the line did
     not carry it or its value is not a whole number at or above zero, and
-    ``partial`` true when the line says the counts are short. A line with no
-    count that parses adds no key -- absence means unknown -- and a line for
-    a repetition the log never graded is dropped.
+    ``partial`` true when the line says the counts are short. Each of
+    ``_REP_TOKENS_SPLIT_KEYS`` is added only when the line carried it as such
+    a count. A line with no count that parses adds no key -- absence means
+    unknown -- and a line for a repetition the log never graded is dropped.
     """
     words = fields.split()
     counts: dict = {key: None for key in _REP_TOKENS_KEYS}
+    split: dict = {}
     for pair in words:
         key, _, raw = pair.partition("=")
-        if key in counts and raw.isascii() and raw.isdigit():
+        target = counts if key in counts else split if key in _REP_TOKENS_SPLIT_KEYS else None
+        if target is not None and raw.isascii() and raw.isdigit():
             # int() refuses a digit run past the interpreter's limit; a
             # count that size is not one, and must not drop the build.
             try:
-                counts[key] = int(raw)
+                target[key] = int(raw)
             except ValueError:
                 pass
-    if all(value is None for value in counts.values()):
+    if all(value is None for value in counts.values()) and not split:
         return
+    counts.update(split)
     counts["partial"] = _REP_TOKENS_PARTIAL in words
     for rep in reversed(task.get("reps") or []):
         if rep["n"] == n:
             rep["tokens"] = counts
+            return
+
+
+def _attach_shape(task: dict, n: int, fields: str) -> None:
+    """Record a `rep N shape:` line as ``shape`` on the rep it follows.
+
+    A flag is kept as a bool when its value is ``1`` or ``0``, a count as an
+    int when it is a whole number at or above zero; anything else, and an
+    unknown key, is skipped, never raised on. A line with nothing that parses
+    adds no key -- absence means unknown -- and a line for a repetition the
+    log never graded is dropped.
+    """
+    shape: dict = {}
+    for pair in fields.split():
+        key, _, raw = pair.partition("=")
+        if key in _REP_SHAPE_FLAGS and raw in ("0", "1"):
+            shape[key] = raw == "1"
+        elif key in _REP_SHAPE_COUNTS and raw.isascii() and raw.isdigit() and len(raw) <= _REP_SHAPE_MAX_DIGITS:
+            shape[key] = int(raw)
+    if not shape:
+        return
+    for rep in reversed(task.get("reps") or []):
+        if rep["n"] == n:
+            rep["shape"] = shape
             return
 
 
@@ -708,8 +787,8 @@ def parse_build_log(text: str) -> dict:
     era, or a log truncated before grading) simply gets no `reps` key --
     absence means unknown, never fabricated. A `rep N report:` line under a
     grading line becomes that rep's `excerpt`, the agent's own words, a
-    `rep N timing:` line its `agent_s` and `turn1_s`, and a `rep N tokens:`
-    line its `tokens`.
+    `rep N timing:` line its `agent_s` and `turn1_s`, a `rep N tokens:`
+    line its `tokens`, and a `rep N shape:` line its `shape`.
     """
     project = None
     tasks = []
@@ -723,7 +802,7 @@ def parse_build_log(text: str) -> dict:
         # pattern below that is an unanchored `search` (the lease, the final
         # verdict) would otherwise read the report as if the log had said
         # it. A report line that follows no grading block is dropped, and so
-        # is a timing or tokens line.
+        # is a timing, tokens or shape line.
         m = _REP_REPORT_LINE.match(line)
         if m:
             if current is not None:
@@ -738,6 +817,11 @@ def parse_build_log(text: str) -> dict:
         if m:
             if current is not None:
                 _attach_tokens(current, int(m.group("n")), m.group("fields"))
+            continue
+        m = _REP_SHAPE_LINE.match(line)
+        if m:
+            if current is not None:
+                _attach_shape(current, int(m.group("n")), m.group("fields"))
             continue
         m = _LEASE.search(line)
         if m:
@@ -1609,9 +1693,7 @@ def records_location(base: str) -> bool:
     """Whether a run read from `base` carries `gcs_base`: only for a bucket
     Deck cannot read (PRIVATE_LOG_BUCKETS); elsewhere Spyglass still renders
     the build and the pages keep that link."""
-    if not isinstance(base, str) or not base.startswith(GS_SCHEME):
-        return False
-    return base[len(GS_SCHEME):].split("/", 1)[0] in PRIVATE_LOG_BUCKETS
+    return links.is_private(base)
 
 
 def spyglass_url(base: str) -> str | None:
@@ -1619,9 +1701,9 @@ def spyglass_url(base: str) -> str | None:
     for anything that is not one. The nightly's runs and pending entries
     carry it (`log_url`) so the report links follow the bucket the build was
     listed in rather than a bucket the renderer assumes."""
-    if not isinstance(base, str) or not base.startswith("gs://"):
+    if not isinstance(base, str) or not base.startswith(GS_SCHEME):
         return None
-    return SPYGLASS_VIEW + base[len("gs://"):].rstrip("/")
+    return SPYGLASS_VIEW + base[len(GS_SCHEME):].rstrip("/")
 
 
 def _read_build(
@@ -1999,31 +2081,51 @@ def releases_from_gcs(
     release is final (build_release records nothing without a finished.json),
     so re-reading one buys nothing and costs three gcloud storage calls.
     """
-    releases = []
+    # Every glob is listed before anything is read, and the trim to `limit`
+    # is taken across them all, by build id: it is the same trim the caller
+    # applies to releases[] (collect's rc_limit), so a build the caller would
+    # drop is never read. Trimming each glob on its own would re-read, on
+    # every tick, the old bucket's builds that the newer bucket's had already
+    # pushed out of releases[].
+    dirs = []
     for glob in rc_globs:
-        listing = _gcloud_storage(["ls", glob], gcloud)
+        listing, stderr = _gcloud_storage_call(["ls", glob], gcloud)
         if listing is None:
-            print(f"warning: gcloud storage ls failed for {glob}; skipping", file=sys.stderr)
+            # An empty prefix is the lane's archive before its first build
+            # lands there, or the old one once its builds are reaped: a
+            # note, not a failed listing.
+            if _NO_OBJECTS.search(stderr or ""):
+                print(f"note: {glob}: no release-candidate builds listed", file=sys.stderr)
+            else:
+                print(f"warning: gcloud storage ls failed for {glob}; skipping", file=sys.stderr)
             continue
-        dirs = sorted(_build_dirs(listing), key=lambda d: int(d[0]), reverse=True)
-        if len(dirs) > limit:
-            print(
-                f"note: {glob}: {len(dirs)} release-candidate builds listed,"
-                f" reading the newest {limit}",
-                file=sys.stderr,
-            )
-            dirs = dirs[:limit]
-        dirs = [d for d in dirs if d[0] not in known]
-        for build_id, line in dirs:
-            try:
-                release = build_release(build_id, _gcs_reader(line, gcloud))
-            except Exception as exc:  # noqa: BLE001 -- one bad build must not kill the sweep
-                print(f"warning: rc build {build_id}: {exc}; skipping", file=sys.stderr)
-                continue
-            if release is None:
-                print(f"note: rc build {build_id}: no finished.json; skipping", file=sys.stderr)
-                continue
-            releases.append(release)
+        dirs.extend(_build_dirs(listing))
+    dirs = sorted(dirs, key=lambda d: int(d[0]), reverse=True)
+    if len(dirs) > limit:
+        print(
+            f"note: {len(dirs)} release-candidate builds listed under {len(rc_globs)} prefix(es),"
+            f" reading the newest {limit}",
+            file=sys.stderr,
+        )
+        dirs = dirs[:limit]
+    dirs = [d for d in dirs if d[0] not in known]
+    releases = []
+    for build_id, line in dirs:
+        try:
+            release = build_release(build_id, _gcs_reader(line, gcloud))
+        except Exception as exc:  # noqa: BLE001 -- one bad build must not kill the sweep
+            print(f"warning: rc build {build_id}: {exc}; skipping", file=sys.stderr)
+            continue
+        if release is None:
+            print(f"note: rc build {build_id}: no finished.json; skipping", file=sys.stderr)
+            continue
+        # Where the build lives, by the same rule as runs[] (SCHEMA.md,
+        # releases[].gcs_base): only for a bucket Deck cannot read, so the
+        # Brief's row links the Console; a release in the old bucket
+        # keeps its Spyglass artifacts_url, which still renders it.
+        if records_location(line):
+            release["gcs_base"] = line
+        releases.append(release)
     return releases
 
 
@@ -2174,6 +2276,148 @@ def _pending_expired(first_seen: str, now: datetime) -> bool:
     return now - seen > timedelta(days=PENDING_RETRY_DAYS)
 
 
+def _forge_lane_sources(
+    lane_globs: dict[str, list[str]] | None,
+    lane_nightly_prefixes: dict[str, list[str]] | None,
+    gitlab_globs: list[str] | None,
+    gitlab_nightly_prefix: str | None,
+) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    """Each forge tier's pull-request globs and nightly prefixes, the GitLab
+    lane's own arguments folded in, each listed once in the order given.
+    A tier that is not a forge lane's is refused: its runs would be tagged
+    with a tier no section reads, and so be collected and shown nowhere."""
+    globs: dict[str, list[str]] = {}
+    prefixes: dict[str, list[str]] = {}
+    for target, given in ((globs, lane_globs or {}), (prefixes, lane_nightly_prefixes or {})):
+        for tier, values in given.items():
+            if tier not in tiers.FORGE_TIERS:
+                raise ValueError(f"{tier!r} is not a forge lane's tier ({', '.join(tiers.FORGE_TIERS)})")
+            for value in values or []:
+                if value not in target.setdefault(tier, []):
+                    target[tier].append(value)
+    for glob in gitlab_globs or []:
+        if glob not in globs.setdefault(tiers.TIER_GITLAB, []):
+            globs[tiers.TIER_GITLAB].append(glob)
+    if gitlab_nightly_prefix and gitlab_nightly_prefix not in prefixes.setdefault(tiers.TIER_GITLAB, []):
+        prefixes[tiers.TIER_GITLAB].append(gitlab_nightly_prefix)
+    return globs, prefixes
+
+
+def _glob_job(glob: str) -> str | None:
+    """The job a pull-request glob names (its directory before the build), or
+    None for a glob not of that shape."""
+    match = _PR_GLOB_SHAPE.match(glob)
+    return match.group("job") if match else None
+
+
+def _forge_lane_watermarks(prior: list[dict]) -> dict[tuple[str, str | None, bool], int | None]:
+    """(tier, job, night) -> the newest build on record for that forge lane
+    job, plus (tier, None, night) over the whole tier for a glob that names
+    no job. A night is a run with no pull request."""
+    groups: dict[tuple[str, str | None, bool], list[dict]] = {}
+    for run in prior:
+        if not tiers.is_forge(run):
+            continue
+        night = run.get("pr") is None
+        tier = tiers.run_tier(run)
+        groups.setdefault((tier, None, night), []).append(run)
+        if isinstance(run.get("job"), str) and run["job"]:
+            groups.setdefault((tier, run["job"], night), []).append(run)
+    return {key: newest_build_id(runs) for key, runs in groups.items()}
+
+
+def _forge_lane_pull_runs(
+    tier: str,
+    globs: list[str],
+    gcloud: str,
+    lane_after: dict[tuple[str, str | None, bool], int | None],
+    since_cutoff: datetime | None,
+    retry_builds: frozenset[str],
+    unfinished: set[str],
+    index_prefix: str | None,
+    notes: list[str] | None = None,
+) -> list[dict]:
+    """One forge lane's pull-request builds, each job above its own
+    watermark, read through the job's directory index (one per job, however
+    many globs name it), else the glob itself.
+
+    An explicit --index-prefix is the presubmit's index; a lane's is derived
+    from its own glob (an empty string still disables both). Unlike the
+    presubmit, a lane takes its index on the cold path too: the archive-wide
+    glob walks every pull request's directory (minutes, growing with the
+    archive, past the listing timeout near 1,700) on every tick until the
+    lane's first run is on record, which for an on-demand lane is
+    indefinitely, and a timeout is the refusal line. The index answers
+    "nothing yet" in one flat listing, and that is a note. A lane that has
+    not run yet, or whose index was purged or moved while a run sits on
+    record, lists nothing: a note on either path (_unlisted_is_note)."""
+    lane_index = index_prefix if index_prefix == "" else None
+    by_job: dict[str | None, tuple[list[str], list[str]]] = {}
+    for glob in globs:
+        job = _glob_job(glob)
+        indexes, glob_only = by_job.setdefault(job, ([], []))
+        prefix = discovery_index(glob, lane_index)
+        if prefix is None:
+            glob_only.append(glob)
+        elif prefix not in indexes:
+            indexes.append(prefix)
+    out: list[dict] = []
+    for job, (indexes, glob_only) in by_job.items():
+        after = lane_after.get((tier, job, False))
+        before = len(out)
+        for prefix in indexes:
+            out.extend(
+                runs_from_index(
+                    prefix, gcloud, after_build=after, since_cutoff=since_cutoff,
+                    retry_builds=retry_builds, unfinished=unfinished, tier=tier,
+                    unlisted_is_note=True,
+                )
+            )
+        if glob_only:
+            out.extend(
+                runs_from_gcs(
+                    glob_only, gcloud, after_build=after, since_cutoff=since_cutoff,
+                    retry_builds=retry_builds, unfinished=unfinished, tier=tier,
+                    unlisted_is_note=True,
+                )
+            )
+        if notes is not None:
+            named = f" {job}" if len(by_job) > 1 and job else ""
+            notes.append(f"{tier} scan{named} resumed above build {after}, {len(out) - before} new")
+    return out
+
+
+def _forge_lane_night_runs(
+    tier: str,
+    prefixes: list[str],
+    gcloud: str,
+    lane_after: dict[tuple[str, str | None, bool], int | None],
+    since_cutoff: datetime | None,
+    retry_builds: frozenset[str],
+    unfinished: set[str],
+    notes: list[str] | None = None,
+) -> list[dict]:
+    """One forge lane's nights: each nightly read as a periodic (its prefix
+    is its index, pr null, log_url set) above its own job's watermark; the
+    nightly's rule on a listing that fails (runs_from_periodic) applies, so
+    a night that has not run yet is a note."""
+    out: list[dict] = []
+    for prefix in prefixes:
+        job = _periodic_job(prefix)
+        after = lane_after.get((tier, job, True))
+        before = len(out)
+        out.extend(
+            runs_from_periodic(
+                prefix, gcloud, after_build=after,
+                since_cutoff=since_cutoff, retry_builds=retry_builds, unfinished=unfinished, tier=tier,
+            )
+        )
+        if notes is not None:
+            named = f" {job}" if len(prefixes) > 1 else ""
+            notes.append(f"{tier} nights{named} resumed above build {after}, {len(out) - before} new")
+    return out
+
+
 def newest_build_id(runs: list[dict]) -> int | None:
     """The numeric watermark the incremental GCS scan resumes above."""
     ids = [int(r["build_id"]) for r in runs if str(r.get("build_id", "")).isdigit()]
@@ -2222,11 +2466,18 @@ def collect(
     nightly_job: str | None = None,
     nightly_writers_prefix: str | None = None,
     nightly_main_b_prefix: str | None = None,
+    nightly_main_c_prefix: str | None = None,
+    nightly_main_d_prefix: str | None = None,
+    nightly_main_e_prefix: str | None = None,
+    nightly_writers_b_prefix: str | None = None,
+    nightly_writers_c_prefix: str | None = None,
     rc_globs: list[str] | None = None,
     rc_from_dir: pathlib.Path | None = None,
     rc_limit: int = RC_RELEASES_MAX,
     gitlab_globs: list[str] | None = None,
     gitlab_nightly_prefix: str | None = None,
+    lane_globs: dict[str, list[str]] | None = None,
+    lane_nightly_prefixes: dict[str, list[str]] | None = None,
 ) -> dict:
     # gh=None skips pr_merged resolution entirely (runs carry no key), which
     # keeps library callers and unit tests hermetic; the CLI passes its --gh
@@ -2237,17 +2488,25 @@ def collect(
     # the index off, anything else is listed as given. nightly_prefix is
     # what asks for the nightly periodic to be scanned at all (None: it is
     # not), the way --pr-glob asks for the presubmit; nightly_job labels
-    # the runs it yields. nightly_writers_prefix and nightly_main_b_prefix
-    # ask the same for the writers and main-b periodics, whose job is each
-    # prefix's last segment.
+    # the runs it yields. The other nightly_*_prefix arguments ask the same
+    # for the writers, main-b to main-e, writers-b and writers-c periodics,
+    # whose job is each prefix's last segment. lane_globs and lane_nightly_prefixes map a
+    # forge tier (tiers.FORGE_TIERS) to its pull-request globs and its
+    # nightlies' prefixes; gitlab_globs and gitlab_nightly_prefix are the
+    # GitLab lane's, folded in.
     now_dt = now or datetime.now(timezone.utc)
+    lane_globs, lane_nightly_prefixes = _forge_lane_sources(
+        lane_globs, lane_nightly_prefixes, gitlab_globs, gitlab_nightly_prefix
+    )
     prior: list[dict] = []
     retry: dict[str, str] = {}  # build_id -> first_seen, still worth re-reading
     # The retry ids the nightly's listing named (or the prior tagged): their
     # pending_builds entry carries the tier, so a consumer whose columns are
     # the presubmit's (the Grid) can keep a night in flight off them.
     nightly_pending: set[str] = set()
-    gitlab_pending: set[str] = set()
+    # The forge lanes' retry ids, each with its lane's tier: the lane that
+    # listed a build retries it, and its pending entry carries the tier.
+    lane_pending: dict[str, str] = {}
     # And where each of those sits, as Spyglass shows it: the prior's entry
     # when it carried one, else the prefix this scan listed the build under.
     nightly_pending_urls: dict[str, str] = {}
@@ -2256,15 +2515,29 @@ def collect(
     # is normally above every nightly id (one a day); the newest id on
     # record says what one source has seen, not the other. The nightly's
     # periodics are separate sources (DEFAULT_NIGHTLY_WRITERS_JOB,
-    # DEFAULT_NIGHTLY_MAIN_B_JOB): a nightly run of the writers or main-b
-    # job counts towards that job's watermark, every other nightly run
-    # towards the main one's, as all of them did before the split.
+    # DEFAULT_NIGHTLY_MAIN_B_JOB to DEFAULT_NIGHTLY_MAIN_E_JOB, DEFAULT_NIGHTLY_WRITERS_B_JOB,
+    # DEFAULT_NIGHTLY_WRITERS_C_JOB): a nightly run of a part's job counts
+    # towards that job's watermark, every other nightly run towards the
+    # main one's, as all of them did before the split.
     writers_job = _periodic_job(nightly_writers_prefix) if nightly_writers_prefix else DEFAULT_NIGHTLY_WRITERS_JOB
     main_b_job = _periodic_job(nightly_main_b_prefix) if nightly_main_b_prefix else DEFAULT_NIGHTLY_MAIN_B_JOB
-    for flag, prefix, job, expected in (
-        ("--nightly-writers-prefix", nightly_writers_prefix, writers_job, DEFAULT_NIGHTLY_WRITERS_JOB),
-        ("--nightly-main-b-prefix", nightly_main_b_prefix, main_b_job, DEFAULT_NIGHTLY_MAIN_B_JOB),
-    ):
+    main_c_job = _periodic_job(nightly_main_c_prefix) if nightly_main_c_prefix else DEFAULT_NIGHTLY_MAIN_C_JOB
+    main_d_job = _periodic_job(nightly_main_d_prefix) if nightly_main_d_prefix else DEFAULT_NIGHTLY_MAIN_D_JOB
+    main_e_job = _periodic_job(nightly_main_e_prefix) if nightly_main_e_prefix else DEFAULT_NIGHTLY_MAIN_E_JOB
+    writers_b_job = _periodic_job(nightly_writers_b_prefix) if nightly_writers_b_prefix else DEFAULT_NIGHTLY_WRITERS_B_JOB
+    writers_c_job = _periodic_job(nightly_writers_c_prefix) if nightly_writers_c_prefix else DEFAULT_NIGHTLY_WRITERS_C_JOB
+    # One row per part flag, in the order the flags are listed; the dedupe
+    # below rewrites a row's prefix and job in place.
+    part_sources = [
+        ["--nightly-writers-prefix", nightly_writers_prefix, writers_job, DEFAULT_NIGHTLY_WRITERS_JOB],
+        ["--nightly-main-b-prefix", nightly_main_b_prefix, main_b_job, DEFAULT_NIGHTLY_MAIN_B_JOB],
+        ["--nightly-main-c-prefix", nightly_main_c_prefix, main_c_job, DEFAULT_NIGHTLY_MAIN_C_JOB],
+        ["--nightly-main-d-prefix", nightly_main_d_prefix, main_d_job, DEFAULT_NIGHTLY_MAIN_D_JOB],
+        ["--nightly-main-e-prefix", nightly_main_e_prefix, main_e_job, DEFAULT_NIGHTLY_MAIN_E_JOB],
+        ["--nightly-writers-b-prefix", nightly_writers_b_prefix, writers_b_job, DEFAULT_NIGHTLY_WRITERS_B_JOB],
+        ["--nightly-writers-c-prefix", nightly_writers_c_prefix, writers_c_job, DEFAULT_NIGHTLY_WRITERS_C_JOB],
+    ]
+    for flag, prefix, job, expected in part_sources:
         if job != expected:
             # nightly.py tells the part by this job name alone.
             part = nightly.night_part({"job": job})
@@ -2278,25 +2551,37 @@ def collect(
     # twice and take that job's runs out of its own watermark: list each
     # job once, under the first flag that names it, and drop the later one.
     main_job = (nightly_job or _periodic_job(nightly_prefix)) if nightly_prefix else None
-    if nightly_writers_prefix and writers_job == main_job:
-        print(f"warning: --nightly-writers-prefix names job {writers_job}, as --nightly-prefix does; listing it once", file=sys.stderr)
-        nightly_writers_prefix, writers_job = None, DEFAULT_NIGHTLY_WRITERS_JOB
-    if nightly_main_b_prefix and main_b_job in (main_job, writers_job if nightly_writers_prefix else None):
-        other = "--nightly-prefix" if main_b_job == main_job else "--nightly-writers-prefix"
-        print(f"warning: --nightly-main-b-prefix names job {main_b_job}, as {other} does; listing it once", file=sys.stderr)
-        nightly_main_b_prefix, main_b_job = None, DEFAULT_NIGHTLY_MAIN_B_JOB
+    listed_by: dict[str, str] = {main_job: "--nightly-prefix"} if main_job is not None else {}
+    for source in part_sources:
+        flag, prefix, job, default = source
+        if not prefix:
+            continue
+        if job in listed_by:
+            print(f"warning: {flag} names job {job}, as {listed_by[job]} does; listing it once", file=sys.stderr)
+            source[1], source[2] = None, default
+        else:
+            listed_by[job] = flag
+    (_, nightly_writers_prefix, writers_job, _), (_, nightly_main_b_prefix, main_b_job, _), (_, nightly_main_c_prefix, main_c_job, _), (_, nightly_main_d_prefix, main_d_job, _), (_, nightly_main_e_prefix, main_e_job, _), (_, nightly_writers_b_prefix, writers_b_job, _), (_, nightly_writers_c_prefix, writers_c_job, _) = part_sources
     # The mirror case: --nightly-prefix itself naming a part's job. Its runs
     # are the main source here, so only the part jobs it does not name are
     # kept out of the main watermark; otherwise every run it lists would be.
-    part_jobs = {j for j in (writers_job, main_b_job) if j != main_job}
-    if main_job is not None and main_job in (DEFAULT_NIGHTLY_WRITERS_JOB, DEFAULT_NIGHTLY_MAIN_B_JOB):
+    part_jobs = {j for j in (writers_job, main_b_job, main_c_job, main_d_job, main_e_job, writers_b_job, writers_c_job) if j != main_job}
+    if main_job is not None and main_job in (DEFAULT_NIGHTLY_WRITERS_JOB, DEFAULT_NIGHTLY_MAIN_B_JOB, DEFAULT_NIGHTLY_MAIN_C_JOB, DEFAULT_NIGHTLY_MAIN_D_JOB, DEFAULT_NIGHTLY_MAIN_E_JOB, DEFAULT_NIGHTLY_WRITERS_B_JOB, DEFAULT_NIGHTLY_WRITERS_C_JOB):
         print(f"warning: --nightly-prefix names job {main_job}, a part's job; the report files its runs as the {nightly.night_part({'job': main_job})} part", file=sys.stderr)
     after_build = None
     nightly_after = None
     writers_after = None
     main_b_after = None
-    gitlab_after = None
-    gitlab_night_after = None
+    main_c_after = None
+    main_d_after = None
+    main_e_after = None
+    writers_b_after = None
+    writers_c_after = None
+    # Each forge lane job's own watermark, (tier, job, night) -> newest id:
+    # a lane's jobs (its pull-request job, a today and a next nightly) run on
+    # their own schedules, so one watermark per tier would skip the slower
+    # job's builds once the faster one is past them.
+    lane_after: dict[tuple[str, str | None, bool], int | None] = {}
     if merge_with is not None:
         prior_data = load_prior(merge_with, gcloud)
         if prior_data is not None:
@@ -2305,10 +2590,12 @@ def collect(
             nightly_after = newest_build_id([r for r in tiers.nightly_runs(prior) if r.get("job") not in part_jobs])
             writers_after = newest_build_id([r for r in tiers.nightly_runs(prior) if r.get("job") == writers_job])
             main_b_after = newest_build_id([r for r in tiers.nightly_runs(prior) if r.get("job") == main_b_job])
-            # The lane's pull-request builds and its nights are two sources
-            # of one tier, each above its own watermark; `pr` tells them apart.
-            gitlab_after = newest_build_id([r for r in tiers.gitlab_runs(prior) if r.get("pr") is not None])
-            gitlab_night_after = newest_build_id([r for r in tiers.gitlab_runs(prior) if r.get("pr") is None])
+            main_c_after = newest_build_id([r for r in tiers.nightly_runs(prior) if r.get("job") == main_c_job])
+            main_d_after = newest_build_id([r for r in tiers.nightly_runs(prior) if r.get("job") == main_d_job])
+            main_e_after = newest_build_id([r for r in tiers.nightly_runs(prior) if r.get("job") == main_e_job])
+            writers_b_after = newest_build_id([r for r in tiers.nightly_runs(prior) if r.get("job") == writers_b_job])
+            writers_c_after = newest_build_id([r for r in tiers.nightly_runs(prior) if r.get("job") == writers_c_job])
+            lane_after = _forge_lane_watermarks(prior)
             for build_id, first_seen in pending_from_prior(prior_data).items():
                 if _pending_expired(first_seen, now_dt):
                     print(
@@ -2324,8 +2611,8 @@ def collect(
                     nightly_pending.add(entry["build_id"])
                     if isinstance(entry.get("log_url"), str):
                         nightly_pending_urls[entry["build_id"]] = entry["log_url"]
-                elif isinstance(entry, dict) and entry.get("build_id") in retry and tiers.is_gitlab(entry):
-                    gitlab_pending.add(entry["build_id"])
+                elif isinstance(entry, dict) and entry.get("build_id") in retry and tiers.is_forge(entry):
+                    lane_pending[entry["build_id"]] = tiers.run_tier(entry)
         # No usable prior -- or a prior that yields no numeric watermark --
         # means the incremental scan cannot resume, and an unbounded cold
         # sweep is ~3 gcloud storage calls per archived build. Bound the recovery
@@ -2362,9 +2649,9 @@ def collect(
             glob_only.append(glob)
         elif prefix not in indexes:
             indexes.append(prefix)
-    # The presubmit's retries are its own pending builds; a GitLab or nightly
-    # one is retried by its source, which knows where it lives.
-    presubmit_retry = frozenset(b for b in retry if b not in gitlab_pending and b not in nightly_pending)
+    # The presubmit's retries are its own pending builds; a forge lane's or a
+    # nightly one is retried by its source, which knows where it lives.
+    presubmit_retry = frozenset(b for b in retry if b not in lane_pending and b not in nightly_pending)
     # An index that matched no objects is a note here: the lanes moved
     # buckets, so the new index holds nothing until their first run lands and
     # the old one may be purged later. Any other failure keeps the warning the
@@ -2396,82 +2683,49 @@ def collect(
                 empty_is_note=True,
             )
         )
-    # The GitLab lane: pull-request builds of its own job, read through the
-    # job's directory index above the lane's own watermark, tagged tier
-    # gitlab; its unfinished builds are tagged the same on pending_builds,
-    # so the right source retries them and they never raise the presubmit's
+    # The forge lanes (tiers.FORGE_TIERS): each lane's pull-request builds
+    # and nights, tagged with its tier, each job above its own watermark;
+    # their unfinished builds are tagged the same on pending_builds, so the
+    # lane that listed them retries them and they never raise the presubmit's
     # watermark.
-    gitlab_fresh: list[dict] = []
-    if gitlab_globs:
+    lane_notes: list[str] = []
+    for tier in tiers.FORGE_TIERS:
+        globs = lane_globs.get(tier) or []
+        prefixes = lane_nightly_prefixes.get(tier) or []
+        if not globs and not prefixes:
+            continue
+        lane_retry = frozenset(b for b in retry if lane_pending.get(b) == tier)
         listed_before = set(unfinished)
-        gitlab_retry = frozenset(b for b in retry if b in gitlab_pending)
-        gitlab_indexes: list[str] = []
-        gitlab_glob_only: list[str] = []
-        # An explicit --index-prefix is the presubmit's index; the lane's is
-        # derived from its own glob (an empty string still disables both).
-        # Unlike the presubmit, the lane takes its index on the cold path
-        # too: the archive-wide glob walks every pull request's directory
-        # (minutes, growing with the archive, past the listing timeout near
-        # 1,700) on every tick until the lane's first run is on record,
-        # which for an on-demand lane is indefinitely, and a timeout is the
-        # refusal line. The index answers "nothing yet" in one flat listing,
-        # and that is a note. The glob is listed only when no index is
-        # derivable from it.
-        lane_index = index_prefix if index_prefix == "" else None
-        for glob in gitlab_globs:
-            prefix = discovery_index(glob, lane_index)
-            if prefix is None:
-                gitlab_glob_only.append(glob)
-            elif prefix not in gitlab_indexes:
-                gitlab_indexes.append(prefix)
-        # A lane that has not run yet, or whose index was purged or moved
-        # while a run sits on record, lists nothing: a note on either path,
-        # never the refusal line (_unlisted_is_note).
-        for prefix in gitlab_indexes:
-            gitlab_fresh.extend(
-                runs_from_index(
-                    prefix, gcloud, after_build=gitlab_after, since_cutoff=since_cutoff,
-                    retry_builds=gitlab_retry, unfinished=unfinished, tier=tiers.TIER_GITLAB,
-                    unlisted_is_note=True,
-                )
-            )
-        if gitlab_glob_only:
-            gitlab_fresh.extend(
-                runs_from_gcs(
-                    gitlab_glob_only, gcloud, after_build=gitlab_after, since_cutoff=since_cutoff,
-                    retry_builds=gitlab_retry, unfinished=unfinished, tier=tiers.TIER_GITLAB,
-                    unlisted_is_note=True,
-                )
-            )
-        gitlab_pending |= unfinished - listed_before
-        fresh.extend(gitlab_fresh)
-    # The GitLab nightly: the lane's list once a night, read as a periodic
-    # (its prefix is its index, pr null, log_url set), tagged tier gitlab
-    # above the nights' own watermark; the nightly's rule on a listing that
-    # fails (runs_from_periodic) applies, so a night that has not run yet is
-    # a note.
-    gitlab_night_fresh: list[dict] = []
-    if gitlab_nightly_prefix:
-        listed_before = set(unfinished)
-        gitlab_night_fresh.extend(
-            runs_from_periodic(
-                gitlab_nightly_prefix, gcloud, after_build=gitlab_night_after, since_cutoff=since_cutoff,
-                retry_builds=frozenset(b for b in retry if b in gitlab_pending), unfinished=unfinished,
-                tier=tiers.TIER_GITLAB,
-            )
+        lane_fresh = _forge_lane_pull_runs(
+            tier, globs, gcloud, lane_after, since_cutoff, lane_retry, unfinished, index_prefix, lane_notes
         )
-        gitlab_pending |= unfinished - listed_before
-        fresh.extend(gitlab_night_fresh)
+        night_fresh = _forge_lane_night_runs(
+            tier, prefixes, gcloud, lane_after, since_cutoff, lane_retry, unfinished, lane_notes
+        )
+        for build_id in unfinished - listed_before:
+            lane_pending[build_id] = tier
+        fresh.extend(lane_fresh)
+        fresh.extend(night_fresh)
     # The nightly periodics, each above its own watermark. The shared retry
     # list is safe to hand over whole: a pending id is only re-read where
     # its source's listing names it, and no id is in two listings.
     nightly_fresh: list[dict] = []
     writers_fresh: list[dict] = []
     main_b_fresh: list[dict] = []
+    main_c_fresh: list[dict] = []
+    main_d_fresh: list[dict] = []
+    main_e_fresh: list[dict] = []
+    writers_b_fresh: list[dict] = []
+    writers_c_fresh: list[dict] = []
     for prefix, job, after, out in (
         (nightly_prefix, nightly_job, nightly_after, nightly_fresh),
         (nightly_writers_prefix, None, writers_after, writers_fresh),
         (nightly_main_b_prefix, None, main_b_after, main_b_fresh),
+        (nightly_main_c_prefix, None, main_c_after, main_c_fresh),
+        (nightly_main_d_prefix, None, main_d_after, main_d_fresh),
+        (nightly_main_e_prefix, None, main_e_after, main_e_fresh),
+        (nightly_writers_b_prefix, None, writers_b_after, writers_b_fresh),
+        (nightly_writers_c_prefix, None, writers_c_after, writers_c_fresh),
     ):
         if not prefix:
             continue
@@ -2516,17 +2770,36 @@ def collect(
                 else ""
             )
             + (
-                f"; gitlab scan resumed above build {gitlab_after},"
-                f" {len(gitlab_fresh)} new"
-                if gitlab_globs
+                f"; main-c scan resumed above build {main_c_after},"
+                f" {len(main_c_fresh)} new"
+                if nightly_main_c_prefix
                 else ""
             )
             + (
-                f"; gitlab nights resumed above build {gitlab_night_after},"
-                f" {len(gitlab_night_fresh)} new"
-                if gitlab_nightly_prefix
+                f"; main-d scan resumed above build {main_d_after},"
+                f" {len(main_d_fresh)} new"
+                if nightly_main_d_prefix
                 else ""
             )
+            + (
+                f"; main-e scan resumed above build {main_e_after},"
+                f" {len(main_e_fresh)} new"
+                if nightly_main_e_prefix
+                else ""
+            )
+            + (
+                f"; writers-b scan resumed above build {writers_b_after},"
+                f" {len(writers_b_fresh)} new"
+                if nightly_writers_b_prefix
+                else ""
+            )
+            + (
+                f"; writers-c scan resumed above build {writers_c_after},"
+                f" {len(writers_c_fresh)} new"
+                if nightly_writers_c_prefix
+                else ""
+            )
+            + "".join(f"; {note}" for note in lane_notes)
             + ")",
             file=sys.stderr,
         )
@@ -2559,7 +2832,7 @@ def collect(
             {
                 "build_id": build_id,
                 "first_seen": pending[build_id],
-                **({tiers.TIER_KEY: tiers.TIER_NIGHTLY} if build_id in nightly_pending else {tiers.TIER_KEY: tiers.TIER_GITLAB} if build_id in gitlab_pending else {}),
+                **({tiers.TIER_KEY: tiers.TIER_NIGHTLY} if build_id in nightly_pending else {tiers.TIER_KEY: lane_pending[build_id]} if build_id in lane_pending else {}),
                 **({"log_url": nightly_pending_urls[build_id]} if nightly_pending_urls.get(build_id) else {}),
             }
             for build_id in sorted(pending, key=int)
@@ -2659,6 +2932,26 @@ def main(argv: list[str] | None = None) -> int:
         " their own watermark apart from the lane's pull-request builds",
     )
     parser.add_argument(
+        "--lane-pr-glob",
+        action="append",
+        default=[],
+        metavar="TIER=GS_GLOB",
+        help="a forge lane's pull-request build dirs, as --gitlab-pr-glob is the"
+        " GitLab lane's, with the lane's tier first: one of "
+        + ", ".join(tiers.FORGE_TIERS)
+        + " (repeatable). Its runs carry that tier and count in no gate verdict",
+    )
+    parser.add_argument(
+        "--lane-nightly-prefix",
+        action="append",
+        default=[],
+        metavar="TIER=GS_PREFIX",
+        help="a forge lane's scheduled job at any cadence, as"
+        " --gitlab-nightly-prefix is the GitLab lane's nightly, with the lane's"
+        " tier first (repeatable: a lane may run a today and a next nightly)."
+        " Its runs carry that tier, pr=null and their own watermark",
+    )
+    parser.add_argument(
         "--nightly-job",
         default=None,
         metavar="NAME",
@@ -2685,10 +2978,64 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         metavar="GS_PREFIX",
         help="also collect the periodic that runs the nightly main part's"
-        " second half (main-b) from this Prow log prefix. Given without a"
+        " main-b shard from this Prow log prefix. Given without a"
         f" value: {DEFAULT_NIGHTLY_MAIN_B_PREFIX}. Omitted: no main-b scan."
         " Its runs are tier=nightly with the prefix's last segment as job, on"
         " a watermark of their own",
+    )
+    parser.add_argument(
+        "--nightly-main-c-prefix",
+        nargs="?",
+        const=DEFAULT_NIGHTLY_MAIN_C_PREFIX,
+        default=None,
+        metavar="GS_PREFIX",
+        help="also collect the periodic that runs the nightly main part's"
+        " main-c shard from this Prow log prefix. Given without a"
+        f" value: {DEFAULT_NIGHTLY_MAIN_C_PREFIX}. Omitted: no main-c scan."
+        " Its runs are tier=nightly with the prefix's last segment as job, on"
+        " a watermark of their own",
+    )
+    parser.add_argument(
+        "--nightly-main-d-prefix",
+        nargs="?",
+        const=DEFAULT_NIGHTLY_MAIN_D_PREFIX,
+        default=None,
+        metavar="GS_PREFIX",
+        help="the same for the main-d shard. Given without a value:"
+        f" {DEFAULT_NIGHTLY_MAIN_D_PREFIX}. Omitted: no main-d scan",
+    )
+    parser.add_argument(
+        "--nightly-main-e-prefix",
+        nargs="?",
+        const=DEFAULT_NIGHTLY_MAIN_E_PREFIX,
+        default=None,
+        metavar="GS_PREFIX",
+        help="the same for the main-e shard. Given without a value:"
+        f" {DEFAULT_NIGHTLY_MAIN_E_PREFIX}. Omitted: no main-e scan",
+    )
+    parser.add_argument(
+        "--nightly-writers-b-prefix",
+        nargs="?",
+        const=DEFAULT_NIGHTLY_WRITERS_B_PREFIX,
+        default=None,
+        metavar="GS_PREFIX",
+        help="also collect the periodic that runs the nightly writers part's"
+        " second third (writers-b) from this Prow log prefix. Given without a"
+        f" value: {DEFAULT_NIGHTLY_WRITERS_B_PREFIX}. Omitted: no writers-b"
+        " scan. Its runs are tier=nightly with the prefix's last segment as"
+        " job, on a watermark of their own",
+    )
+    parser.add_argument(
+        "--nightly-writers-c-prefix",
+        nargs="?",
+        const=DEFAULT_NIGHTLY_WRITERS_C_PREFIX,
+        default=None,
+        metavar="GS_PREFIX",
+        help="also collect the periodic that runs the nightly writers part's"
+        " third third (writers-c) from this Prow log prefix. Given without a"
+        f" value: {DEFAULT_NIGHTLY_WRITERS_C_PREFIX}. Omitted: no writers-c"
+        " scan. Its runs are tier=nightly with the prefix's last segment as"
+        " job, on a watermark of their own",
     )
     parser.add_argument(
         "--from-dir",
@@ -2701,7 +3048,9 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         default=[],
         metavar="GS_GLOB",
-        help="gs:// glob of release-candidate build dirs, e.g."
+        help="gs:// glob of release-candidate build dirs:"
+        " gs://kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/*"
+        " (the lane's bucket) and, for the builds from before it moved there,"
         " gs://kube-agents-prow/logs/post-kube-agents-eval-rc/* . Collected"
         " into releases[], never into runs[]: a candidate is judged against"
         " main's window, not added to it (repeatable)",
@@ -2771,19 +3120,40 @@ def main(argv: list[str] | None = None) -> int:
         and args.nightly_prefix is None
         and args.nightly_writers_prefix is None
         and args.nightly_main_b_prefix is None
+        and args.nightly_main_c_prefix is None
+        and args.nightly_main_d_prefix is None
+        and args.nightly_main_e_prefix is None
+        and args.nightly_writers_b_prefix is None
+        and args.nightly_writers_c_prefix is None
         and not args.rc_glob
         and args.rc_from_dir is None
         and not args.gitlab_pr_glob
         and args.gitlab_nightly_prefix is None
+        and not args.lane_pr_glob
+        and not args.lane_nightly_prefix
     ):
         parser.error(
             "nothing to collect: pass --pr-glob, --gitlab-pr-glob, --gitlab-nightly-prefix,"
+            " --lane-pr-glob, --lane-nightly-prefix,"
             " --nightly-prefix, --nightly-writers-prefix, --nightly-main-b-prefix,"
+            " --nightly-main-c-prefix, --nightly-main-d-prefix, --nightly-main-e-prefix,"
+            " --nightly-writers-b-prefix, --nightly-writers-c-prefix,"
             " --from-dir, --rc-glob,"
             " --rc-from-dir and/or --merge-with"
         )
     if args.rc_limit < 1:
         parser.error("--rc-limit must be at least 1")
+    lane_globs: dict[str, list[str]] = {}
+    lane_prefixes: dict[str, list[str]] = {}
+    for flag, given, target in (
+        ("--lane-pr-glob", args.lane_pr_glob, lane_globs),
+        ("--lane-nightly-prefix", args.lane_nightly_prefix, lane_prefixes),
+    ):
+        for value in given:
+            tier, sep, url = value.partition("=")
+            if not sep or not url.startswith(GS_SCHEME) or tier not in tiers.FORGE_TIERS:
+                parser.error(f"{flag} {value!r}: expected TIER=gs://..., TIER one of {', '.join(tiers.FORGE_TIERS)}")
+            target.setdefault(tier, []).append(url)
 
     data = collect(
         pr_globs=args.pr_glob,
@@ -2799,18 +3169,25 @@ def main(argv: list[str] | None = None) -> int:
         nightly_job=args.nightly_job,
         nightly_writers_prefix=args.nightly_writers_prefix,
         nightly_main_b_prefix=args.nightly_main_b_prefix,
+        nightly_main_c_prefix=args.nightly_main_c_prefix,
+        nightly_main_d_prefix=args.nightly_main_d_prefix,
+        nightly_main_e_prefix=args.nightly_main_e_prefix,
+        nightly_writers_b_prefix=args.nightly_writers_b_prefix,
+        nightly_writers_c_prefix=args.nightly_writers_c_prefix,
         rc_globs=args.rc_glob,
         rc_from_dir=args.rc_from_dir,
         rc_limit=args.rc_limit,
         gitlab_globs=args.gitlab_pr_glob,
         gitlab_nightly_prefix=args.gitlab_nightly_prefix,
+        lane_globs=lane_globs,
+        lane_nightly_prefixes=lane_prefixes,
     )
     args.out.write_text(json.dumps(data, indent=2) + "\n")
     nightly = len(tiers.nightly_runs(data["runs"]))
-    gitlab = len(tiers.gitlab_runs(data["runs"]))
+    lanes = {tier: len(tiers.forge_runs(data["runs"], tier)) for tier in tiers.FORGE_TIERS}
     print(
-        f"wrote {args.out}: {len(data['runs'])} runs ({len(data['runs']) - nightly - gitlab} presubmit,"
-        f" {nightly} nightly, {gitlab} gitlab), {len(data['cases'])} cases,"
+        f"wrote {args.out}: {len(data['runs'])} runs ({len(data['runs']) - nightly - sum(lanes.values())} presubmit,"
+        f" {nightly} nightly, " + ", ".join(f"{n} {tier}" for tier, n in lanes.items()) + f"), {len(data['cases'])} cases,"
         f" {len(data.get('releases') or [])} releases,"
         f" {data['coverage']['domains_covered']}/{data['coverage']['domains_total']}"
         " domains covered",

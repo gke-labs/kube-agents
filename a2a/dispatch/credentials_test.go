@@ -19,7 +19,7 @@ import (
 )
 
 // Per-task credentials (#3889, contract addendum 8). With a task-signing key
-// the dispatcher mints two credentials for the pod it confirms, once its
+// the dispatcher mints two credentials for the pod that accepted, before its
 // lease is recorded, and sends them on the confirm: a task credential for
 // the bus, and for a task that names a cluster a token for the credential
 // proxy carrying that cluster. Nothing else carries them, nothing else mints
@@ -449,9 +449,9 @@ func TestRenewalsDoNotMint(t *testing.T) {
 
 // A pod with no UID in the pool is not offered the task (its credentials
 // could name no UID). A pod whose UID changes between the offer and the
-// confirm (deleted and re-created under its name) is not confirmed: the
-// lease is already recorded, so the task fails when it runs out, and no
-// confirm ever goes out without credentials.
+// accept (deleted and re-created under its name, or terminating) is not
+// confirmed: the offer is withdrawn before anything is recorded, and the
+// task is offered again, to the pod as it is now, and runs.
 func TestAPodsUIDMustBeTheOneItHadAtTheOffer(t *testing.T) {
 	t.Run("no UID", func(t *testing.T) {
 		b := newBus(t, "tse-0")
@@ -479,11 +479,14 @@ func TestAPodsUIDMustBeTheOneItHadAtTheOffer(t *testing.T) {
 		waitFor(t, 10*time.Second, "the offer", func() bool { return w.offerCount() == 1 })
 		ti.pool.SetUID("tse", "read", "tse-0", "uid-0-recreated")
 		ts := b.waitTerminal("task-1", 15*time.Second)
-		if ts.state != lib.StateFailed || !hasReason(ts, ReasonLeaseExpired) {
-			t.Errorf("terminal %+v, want failed lease-expired", ts)
+		if ts.state != lib.StateCompleted {
+			t.Errorf("terminal %+v, want completed on the re-offer", ts)
 		}
-		if w.confirmCount() != 0 || ml.count() != 0 {
-			t.Errorf("%d confirms, %d mints; want none", w.confirmCount(), ml.count())
+		if w.abandonCount() == 0 {
+			t.Error("the offer to the pod whose UID changed was not withdrawn")
+		}
+		if w.confirmCount() != 1 || ml.count() != 1 {
+			t.Errorf("%d confirms, %d mints; want the re-offer's one each", w.confirmCount(), ml.count())
 		}
 	})
 }
@@ -626,9 +629,9 @@ func (b *bus) submitRawParams(profile, tier, kind, taskID, capKey string, params
 
 // With a key, a confirm never goes out without credentials that verify:
 // a mint that fails, and a credential that does not read back with the
-// configured key's public half (signed by another key), each leave the
-// recorded lease with no confirm, so the task fails lease-expired and the
-// pod never starts it.
+// configured key's public half (signed by another key), each withdraw the
+// offer before anything is recorded. The pod never starts the task, and the
+// task waits to be offered again rather than failing.
 func TestACredentialThatCannotBeMintedOrReadBackSendsNoConfirm(t *testing.T) {
 	other, _ := signingKey(t)
 	for name, mint := range map[string]func(taskcred.Claims) (string, error){
@@ -645,10 +648,15 @@ func TestACredentialThatCannotBeMintedOrReadBackSendsNoConfirm(t *testing.T) {
 			_, ml, _ := b.runKeyedWith(ti, kp, 0, &fakeVerifier{}, func(d *Dispatcher) { d.mint = mint })
 
 			b.submitWith("tse", "read", lib.SubmitKindTop, "task-1", "cap-ok", clusterParams)
-			waitFor(t, 10*time.Second, "the offer", func() bool { return w.offerCount() == 1 })
-			ts := b.waitTerminal("task-1", 15*time.Second)
-			if ts.state != lib.StateFailed || !hasReason(ts, ReasonLeaseExpired) {
-				t.Errorf("terminal %+v, want failed lease-expired", ts)
+			waitFor(t, 10*time.Second, "the task offered again", func() bool { return w.offerCount() >= 2 })
+			if w.abandonCount() == 0 {
+				t.Error("the offer was not withdrawn")
+			}
+			if ts := b.terminalsOf("task-1"); len(ts) != 0 {
+				t.Errorf("terminals %+v, want none: the task waits for a pod", ts)
+			}
+			if recs := b.records(); len(recs) != 0 {
+				t.Errorf("lease records %v, want none: nothing is written before the mint", recs)
 			}
 			if w.confirmCount() != 0 {
 				t.Errorf("%d confirms, want none", w.confirmCount())

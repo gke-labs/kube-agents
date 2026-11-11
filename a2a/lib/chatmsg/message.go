@@ -2,7 +2,8 @@
 // executor states beside its text so every chat adapter can lay out a
 // report, a question or a plan without reading prose
 // (spec-a2a-payloads.md, "Chat messages"). It holds the types, the
-// validator for every rule in that section, the text fallback each carrier
+// validator for every rule in that section but wording, the lint for
+// wording, the text fallback each carrier
 // pairs with a chat message, and the DataPart encoding. The shared cases in
 // tests/conformance/chat/ are checked against Validate here and against the
 // Python presenters' reader there.

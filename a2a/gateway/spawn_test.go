@@ -312,7 +312,11 @@ func TestClusterViewProjectsOnlyTheSessionAudience(t *testing.T) {
 	cs := k8sfake.NewSimpleClientset()
 	cfg := &Config{Namespace: "test-ns", WorkerImage: "img", SessionServiceAccount: "agent-a2a-session",
 		TaskDeadline: 15 * time.Minute, NATSURL: "nats://bus:4222",
-		SessionClusterView: true, CredentialProxyURL: "http://agent-credential-proxy.test-ns.svc.cluster.local:8765"}
+		SessionClusterView:   true,
+		CredentialProxyURL:   "http://agent-credential-proxy.test-ns.svc.cluster.local:8765",
+		KubeProxyURL:         "https://agent-kube-proxy.test-ns.svc.cluster.local:8443",
+		KubeProxyCAConfigMap: "agent-kube-proxy-ca-bundle",
+		KubeProxyHostContext: "in-cluster"}
 	s := &podSpawner{cfg: cfg, client: cs, log: slog.Default()}
 	rec := &SessionRecord{Key: "discord:g1/t", ContextID: "ctx-9", BusSession: "chat-otter-1a2b", Addressee: "chat-otter-1a2b"}
 	if _, err := s.Spawn(context.Background(), rec, "task-9", "", 1); err != nil {
@@ -349,17 +353,66 @@ func TestClusterViewProjectsOnlyTheSessionAudience(t *testing.T) {
 	}
 	if env["CREDENTIAL_PROXY_URL"] != cfg.CredentialProxyURL ||
 		env["CREDENTIAL_PROXY_TOKEN_FILE"] != credentialProxyTokenMountPath+"/"+credentialProxyTokenFile ||
+		env["KUBE_PROXY_URL"] != cfg.KubeProxyURL ||
+		env["KUBE_PROXY_CA_FILE"] != kubeProxyCAMountPath+"/"+kubeProxyCAFile ||
+		env["KUBE_PROXY_HOST_CONTEXT"] != cfg.KubeProxyHostContext ||
 		env["HERMES_HOME"] != sessionHermesHome || env[lib.EnvClusterView] != "true" {
 		t.Fatalf("cluster-view env = %v", env)
 	}
-	var mounted bool
+	var mounted, caMounted bool
 	for _, m := range c.VolumeMounts {
 		if m.MountPath == credentialProxyTokenMountPath && m.ReadOnly {
 			mounted = true
 		}
+		if m.Name == kubeProxyCAVolume && m.MountPath == kubeProxyCAMountPath && m.ReadOnly {
+			caMounted = true
+		}
 	}
 	if !mounted {
 		t.Fatal("the session token is not mounted read-only at the path the shim reads")
+	}
+	if !caMounted {
+		t.Fatal("the kube-proxy CA bundle is not mounted read-only")
+	}
+}
+
+// The exec tier's URL reaches the session pod only when the gateway has one,
+// and only under the cluster view.
+func TestClusterViewPassesTheExecTierURLWhenSet(t *testing.T) {
+	const execURL = "http://agent-credential-proxy-exec-tier.test-ns.svc.cluster.local:8765"
+	for name, tc := range map[string]struct {
+		view    bool
+		execURL string
+		want    string
+	}{
+		"view with exec tier":    {view: true, execURL: execURL, want: execURL},
+		"view without exec tier": {view: true},
+		"no view":                {execURL: execURL},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cs := k8sfake.NewSimpleClientset()
+			cfg := &Config{Namespace: "test-ns", WorkerImage: "img", SessionServiceAccount: "agent-a2a-session",
+				TaskDeadline: 15 * time.Minute, NATSURL: "nats://bus:4222", SessionClusterView: tc.view,
+				CredentialProxyURL: "http://agent-credential-proxy.test-ns.svc.cluster.local:8765", CredentialProxyExecURL: tc.execURL}
+			s := &podSpawner{cfg: cfg, client: cs, log: slog.Default()}
+			rec := &SessionRecord{Key: "discord:g1/t", ContextID: "ctx-9", BusSession: "chat-otter-1a2b", Addressee: "chat-otter-1a2b"}
+			if _, err := s.Spawn(context.Background(), rec, "task-9", "", 1); err != nil {
+				t.Fatal(err)
+			}
+			pod, err := cs.CoreV1().Pods("test-ns").Get(context.Background(), "chat-otter-1a2b", metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, set := "", false
+			for _, e := range pod.Spec.Containers[0].Env {
+				if e.Name == "CREDENTIAL_PROXY_EXEC_URL" {
+					got, set = e.Value, true
+				}
+			}
+			if got != tc.want || set != (tc.want != "") {
+				t.Errorf("CREDENTIAL_PROXY_EXEC_URL = %q (set %v), want %q", got, set, tc.want)
+			}
+		})
 	}
 }
 
@@ -579,5 +632,27 @@ func TestSpawnMountsTheTranscriptPrimerForTheWorker(t *testing.T) {
 	}
 	if envPath == "" || mountPath == "" || !fileOK {
 		t.Errorf("primer not wired: env %s=%q, mount %q, downward-API file at the env's path %v", lib.EnvPrimerFile, envPath, mountPath, fileOK)
+	}
+}
+
+// The operator renders the exec tier's URL as A2A_CREDENTIAL_PROXY_EXEC_URL;
+// FromEnv reads that name, and an unset variable leaves the field empty.
+func TestFromEnvReadsTheExecTierURL(t *testing.T) {
+	setBaseEnv(t)
+	const execURL = "http://agent-credential-proxy-exec-tier.test-ns.svc.cluster.local:8765"
+	t.Setenv("A2A_CREDENTIAL_PROXY_EXEC_URL", execURL)
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.CredentialProxyExecURL != execURL {
+		t.Errorf("CredentialProxyExecURL = %q, want %q", cfg.CredentialProxyExecURL, execURL)
+	}
+	t.Setenv("A2A_CREDENTIAL_PROXY_EXEC_URL", "")
+	if cfg, err = FromEnv(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.CredentialProxyExecURL != "" {
+		t.Errorf("CredentialProxyExecURL = %q with the variable unset, want empty", cfg.CredentialProxyExecURL)
 	}
 }

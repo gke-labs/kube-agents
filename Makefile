@@ -32,7 +32,7 @@ KUBE_PROXY_IMAGE_ARGS := $(foreach v,$(KUBE_PROXY_IMAGE_VARS),$(if $($(v)),--bui
 KUBE_AGENTS_VERSION ?= dev
 VERSION_ARG := --build-arg KUBE_AGENTS_VERSION=$(KUBE_AGENTS_VERSION)
 
-.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-build-kube-proxy docker-build-sandbox docker-smoke-sandbox dev-rebuild-agent mirror-images images-check prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests test-e2e-deps validate prompt-check skills-sync skills-continue skills-import skills-refresh skills-generate skills-check skills-status skills-verify-upstream docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-prose docs-check-context-budget docs-check-pr-template chart-sync chart-check iac-parity-check cluster-reads-check tfvar-check terraform-test tf-apply tf-destroy fleet-audit-view coverage coverage-merge coverage-check test-integration conformance
+.PHONY: default help gosec docker-build docker-build-agents docker-build-credential-proxy docker-build-kube-proxy docker-build-sandbox docker-smoke-sandbox dev-rebuild-agent mirror-images images-check prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests test-e2e-deps validate prompt-check skills-sync skills-continue skills-import skills-refresh skills-generate skills-check skills-status skills-verify-upstream docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-prose docs-check-context-budget docs-check-pr-template docs-check-upgrade-releases chart-sync chart-check iac-parity-check cluster-reads-check concurrency-check sqlite-plan-check tfvar-check terraform-test tf-apply tf-destroy fleet-audit-view coverage coverage-merge coverage-check test-integration conformance
 
 # The agent images this repository builds -- one per `--target` stage in
 # deploy/docker/Dockerfile, which is not the same thing as one per directory
@@ -117,8 +117,8 @@ prettier-write: ## Reformat all Markdown/YAML in place.
 # Every tracked shell script through shellcheck. The `validate` job in
 # .github/workflows/validate.yml runs this target on every pull request with
 # the shellcheck release it pins there, so a warning in a tracked script fails
-# the merge; run it with that release locally, since the apt package is older
-# and reports a different set. No `-s`: each shebang decides the dialect, so
+# the merge; run it with that release locally, since a different release
+# reports a different set. No `-s`: each shebang decides the dialect, so
 # deploy/shared/docker-entrypoint.sh (`#!/bin/sh`) is checked as POSIX sh.
 # SC1090 joins SC1091 in the exclude list because scripts/installer/common.sh
 # sources a runtime path that `-x` cannot follow; every other finding is fixed
@@ -189,8 +189,8 @@ lint-python: ## Run ruff's error rules over every Python file (the set tests/tes
 # flake in a young seam test could not red an already-gating job; it finished
 # that period without a single failure, and a tier nothing gates on is a tier
 # people learn to merge around. It is deterministic by construction -- real
-# components, no model calls -- so it belongs in the sweep the `test` job runs
-# rather than beside it. The one thing that costs: the injector seam shells out
+# components, no model calls -- so it belongs in the sweep the `test-shard` jobs
+# run rather than beside it. The one thing that costs: the injector seam shells out
 # to `go test`, so every job that expands this list needs a Go toolchain on
 # PATH or those tests skip themselves and the sweep reports green without them.
 PYTHON_TEST_FILES := $(sort \
@@ -437,7 +437,7 @@ endef
 # The same packages as `import` names rather than distribution names, because
 # that is what the preflight below can actually test for: python-dotenv imports
 # as `dotenv` and pyyaml as `yaml`.
-PYTHON_TEST_IMPORTS := fastapi httpx markdown_it mcp dotenv plotly pydantic streamlit uvicorn websockets yaml
+PYTHON_TEST_IMPORTS := croniter fastapi httpx markdown_it mcp dotenv plotly pydantic streamlit uvicorn websockets yaml
 
 test-python-deps: ## Install the third-party imports `make test-python` needs.
 	@python3 -m pip install -r requirements-test.txt
@@ -448,6 +448,30 @@ e2e-tests: ## Run the live E2E promotion test suite against the target GKE clust
 test-e2e-deps: ## Install dependencies required to run the E2E test suite.
 	@python3 -m pip install -r tests/e2e/requirements.txt
 
+# gosec over every Go module: the scan CI runs on each module, in one local
+# target. k8s-operator/go.mod is the one pin (its tools.go imports the
+# command), so the binary is built there once and run from each module's own
+# directory: `go -C <module> run` would scan k8s-operator, since -C is also
+# the directory the program starts in. The operator excludes G703 and G706:
+# both take os.Args and os.Getenv as taint sources, and every flag the
+# operator and k8s-event-watcher read is rendered by the operator into their
+# own Deployments, inside the trust boundary (the workflow that scans the
+# operator carries the same list and the full reasoning;
+# tests/test_gosec_in_module_checks.py holds the two lists equal). The other
+# modules exclude nothing. Not part of `verify`: a cold build and scan take
+# minutes.
+GOSEC_PIN_MODULE := k8s-operator
+GOSEC_BIN := $(CURDIR)/$(GOSEC_PIN_MODULE)/bin/gosec
+GOSEC_OPERATOR_EXCLUDE := G703,G706
+GOSEC_UNEXCLUDED_MODULES := a2a hack/ghes-proxy k8s-api-proxy
+
+gosec: ## Run gosec from k8s-operator/go.mod's pin over every Go module, the scan CI runs on each.
+	@echo "==> build gosec"; cd "$(GOSEC_PIN_MODULE)" && go build -o "$(GOSEC_BIN)" github.com/securego/gosec/v2/cmd/gosec
+	@echo "==> gosec ($(GOSEC_PIN_MODULE))"; cd "$(GOSEC_PIN_MODULE)" && "$(GOSEC_BIN)" -exclude=$(GOSEC_OPERATOR_EXCLUDE) ./...
+	@for m in $(GOSEC_UNEXCLUDED_MODULES); do \
+		echo "==> gosec ($$m)"; (cd "$$m" && "$(GOSEC_BIN)" ./...) || exit 1; \
+	done
+
 # One command for "is this branch landable": everything a PR must pass, ordered
 # so the cheapest check fails first.
 #
@@ -457,7 +481,7 @@ test-e2e-deps: ## Install dependencies required to run the E2E test suite.
 # editable, which pulls devops-bench from a pinned git SHA over the network.
 # verify stays offline-runnable; the bench suite gates in CI (bench-tests job)
 # and runs locally with `make test-bench`.
-verify: ## Run everything a PR must pass offline: go build, go vet, go test, python tests, the conformance suite, the Terraform module tests. The bench suite needs network; run `make test-bench` separately.
+verify: ## Run everything a PR must pass offline: go build, go vet, go test, python tests, the conformance suite, the Terraform module tests. gosec is separate (`make gosec`); the bench suite needs network; run `make test-bench` separately.
 	@echo "==> go build"; cd k8s-operator && go build ./...
 	@echo "==> go vet";   cd k8s-operator && go vet ./...
 	@echo "==> go test";  cd k8s-operator && go test ./...
@@ -690,7 +714,7 @@ coverage-merge: ## Join the coverage the sharded `make coverage` runs left in CO
 	fi
 
 # 55 is a deliberately loose placeholder: the real floor gets committed from the
-# first green CI run of the `test` job's coverage sweep, not from a laptop
+# first green CI run of the coverage the `test` job joins from the shards, not from a laptop
 # measurement, because CI's Python and dependency set produce a different number.
 COVERAGE_FLOOR ?= 55
 
@@ -780,7 +804,9 @@ scale-run: ## Run the harness-scale measurement in SCALE_CONFIG against the targ
 # broken are static -- an unknown domain slug, a fixture role the seeded fleet
 # never planted, a check with no assertion, a case in no TASKS entry -- so they
 # fail here in a second instead. The same rules gate in CI through
-# scripts/test_task_registration.py; this target is the fast path to them.
+# scripts/test_task_registration.py (the tree-level scans, the sanitizer and
+# the run-record guard, as assertions of their own there); this target is the
+# fast path to them.
 bench-case-check: ## Validate every bench task.yaml against the case-format contract (no cluster).
 	@python3 -c "import yaml" 2>/dev/null || { \
 		echo "bench-case-check needs PyYAML: python3 -m pip install pyyaml (or make test-python-deps)"; \
@@ -791,7 +817,7 @@ bench-case-check: ## Validate every bench task.yaml against the case-format cont
 # The integration tier: real components wired together with the agent replaced
 # by a fake -- no model calls, deterministic by construction (strategy 4.1b).
 # The tier now gates: tests/integration is in PYTHON_TEST_DIRS, so `make
-# test-python` and the CI `test` job both run it, and a red seam test is a red
+# test-python` and the CI `test-shard` jobs both run it, and a red seam test is a red
 # pull request. This target is a convenience for running that one tier while
 # you work on a seam -- seconds instead of the whole sweep -- and is not what
 # CI invokes, so do not reach for it as the definition of what must pass.
@@ -854,7 +880,7 @@ docs-generate: ## Regenerate the generated doc regions and files from their sour
 	@python3 scripts/generate_docs.py
 
 # Everything CI enforces about the docs, in one command.
-docs-check: docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-prose docs-check-context-budget docs-check-pr-template ## Run every documentation check CI runs.
+docs-check: docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-prose docs-check-context-budget docs-check-pr-template docs-check-upgrade-releases ## Run every documentation check CI runs.
 
 docs-check-generated:
 	@python3 scripts/generate_sop_geography.py --check
@@ -875,6 +901,9 @@ docs-check-prose: ## Fail when a published site page's prose is out of step with
 docs-check-context-budget:
 	@python3 scripts/check_context_budget.py
 
+docs-check-upgrade-releases: ## Fail when an upgrade-table row names a tagged release that does not contain the commit that added it (or the one scripts/upgrade_table_traces.txt names), or says pending after a release contains it (needs the full history and the release tags).
+	@python3 scripts/check_upgrade_table_releases.py
+
 docs-check-pr-template: ## Fail when a section of .github/PULL_REQUEST_TEMPLATE.md tells the author to delete it, opens with a condition and names no one-line answer for the rest, or holds a comment the description readers split on (why: .agents/rules/pre_pr_review.md).
 	@python3 scripts/check_pr_template.py
 
@@ -893,6 +922,12 @@ iac-parity-check: ## Verify DNS egress rule parity across static NetworkPolicy c
 
 cluster-reads-check: ## Fail when a file under agents/ adds a whole-cluster kubectl read, several kinds or one unpaged kind across every namespace as full objects (pinned backlog: scripts/cluster_reads_allowlist.txt; CI runs this via scripts/test_check_cluster_reads.py).
 	@python3 scripts/check_cluster_reads.py
+
+concurrency-check: ## Fail when a request handler in the broker, the KV server or the auth callout can start an unbounded thread or goroutine (CI runs this via scripts/test_check_bounded_concurrency.py).
+	@python3 scripts/check_bounded_concurrency.py
+
+sqlite-plan-check: ## Fail when a fixed SQL statement in the KV server, the findings queue, the state.db helpers or the two scripts that open session_kv.db themselves would scan a whole table the repository defines (pinned backlog and dynamic statements: scripts/sqlite_query_plan_baseline.txt; CI runs this via scripts/test_check_sqlite_query_plans.py).
+	@python3 scripts/check_sqlite_query_plans.py
 
 # The unit tests stub `terraform`, so only this puts lifecycle.sh's tfvar()
 # in front of the real binary (#1309 shipped against a stub that answered `null`

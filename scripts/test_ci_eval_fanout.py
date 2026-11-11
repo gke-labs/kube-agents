@@ -238,6 +238,9 @@ class DelegationCeilingTest(unittest.TestCase):
             "consistency-drift-outlier",
             "fleet-cost-idle-pool",
             "upgrades-audit-reports-upgrade-blocked",
+            "gce-startup-script-failure",
+            "networking-world-open-ingress",
+            "obtainability-pdb-kustomize-overlay",
         ):
             with self.subTest(unit=name):
                 self.assertEqual(self.ceiling(name, "2700"), "3000")
@@ -307,6 +310,7 @@ class DelegationCeilingTest(unittest.TestCase):
                 "INFRA_LOCK_DEADLINE=900",
                 'stream_case_count() { echo "${CASES_ON_STREAM}"; }',
                 'stream_stack_wait() { echo "${STACK_WAIT:-0}"; }',
+                "stream_note_count() { echo 1; }",
                 "CASES_ON_STREAM=1 STACK_WAIT=0 name=compliance-rbac-overgrant audit_id=compliance-audit streams=compliance-audit has_stack=\n" + computed,
                 "CASES_ON_STREAM=1 STACK_WAIT=0 name=capacity-pinned-pool-probe audit_id= streams= has_stack=\n" + computed,
                 "CASES_ON_STREAM=2 STACK_WAIT=0 name=consistency-drift-outlier audit_id=fleet-consistency-drift streams=fleet-consistency-drift has_stack=\n" + computed,
@@ -361,8 +365,10 @@ EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_
             # The one constant the unit reads from the script's top: the base
             # of its per-unit inject port.
             lifted_constant("EVAL_INJECT_LOCAL_PORT_BASE"),
-            # The name the opening turn's timing is copied in under.
+            # The names the opening turn's timing and the reply's shape
+            # are copied in under.
             lifted_constant("EVAL_TIMING_FILE"),
+            lifted_constant("EVAL_SHAPE_FILE"),
             # The unit resolves the task file it hands the bench through
             # this helper (the inject lane's copy, or the file under
             # bench/tasks/); with no lane directory set it is the identity.
@@ -408,6 +414,21 @@ EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_
         self.assertIn('rep 1: {"turn1_s": 1.5}', result.stdout, result.stdout + result.stderr)
         self.assertIn("rep 2: none", result.stdout)
         self.assertIn('rep 3: {"turn1_s": 3.5}', result.stdout)
+
+    def test_the_replys_shape_lands_beside_each_repetitions_results(self):
+        """The same contract for KUBE_AGENTS_SHAPE_FILE: rep 2 delivered no
+        reply, so the harness wrote nothing, and its stale file stays out."""
+        runs = 'RUNS="$(mktemp -d)"; : > "${STATE_DIR}/case-x.rep2.shape.json"\n'
+        bench = (
+            'uv() { mkdir -p "${RUNS}/run_${rep}"; '
+            '[ "${rep}" = 2 ] || echo "{\\"bot_messages\\": ${rep}}" > "${KUBE_AGENTS_SHAPE_FILE}"; '
+            'echo "ran 1 task(s); results: ${RUNS}/run_${rep}/results.json"; }\n'
+        )
+        check = 'for r in 1 2 3; do echo "rep ${r}: $(cat "${RUNS}/run_${r}/shape.json" 2>/dev/null || echo none)"; done'
+        result = self.run_reps(runs + bench, check)
+        self.assertIn('rep 1: {"bot_messages": 1}', result.stdout, result.stdout + result.stderr)
+        self.assertIn("rep 2: none", result.stdout)
+        self.assertIn('rep 3: {"bot_messages": 3}', result.stdout)
 
     def test_a_repetition_that_gave_up_on_its_lock_leaves_the_case_to_the_loop(self):
         # Rep 2 never gets the task lock: no state file, so the count stops at
@@ -812,6 +833,7 @@ class StateLockTest(unittest.TestCase):
                 lifted_constant("EVAL_GATEWAY_GONE_RC"),
                 lifted_constant("EVAL_INSTALL_GONE_MARKER"),
                 lifted_constant("EVAL_TIMING_FILE"),
+                lifted_constant("EVAL_SHAPE_FILE"),
                 lifted("unit_task_path"),
                 lifted("finished_rep_count"),
                 lifted("skip_unit"),
@@ -855,6 +877,7 @@ class StateLockTest(unittest.TestCase):
                 lifted_constant("EVAL_GATEWAY_GONE_RC"),
                 lifted_constant("EVAL_INSTALL_GONE_MARKER"),
                 lifted_constant("EVAL_TIMING_FILE"),
+                lifted_constant("EVAL_SHAPE_FILE"),
                 lifted("unit_task_path"),
                 lifted("finished_rep_count"),
                 lifted("skip_unit"),
@@ -897,6 +920,7 @@ class StateLockTest(unittest.TestCase):
                 lifted_constant("EVAL_GATEWAY_GONE_RC"),
                 lifted_constant("EVAL_INSTALL_GONE_MARKER"),
                 lifted_constant("EVAL_TIMING_FILE"),
+                lifted_constant("EVAL_SHAPE_FILE"),
                 lifted("unit_task_path"),
                 lifted("finished_rep_count"),
                 lifted("skip_unit"),
@@ -957,6 +981,7 @@ class StateLockTest(unittest.TestCase):
                 lifted_constant("EVAL_GATEWAY_GONE_RC"),
                 lifted_constant("EVAL_INSTALL_GONE_MARKER"),
                 lifted_constant("EVAL_TIMING_FILE"),
+                lifted_constant("EVAL_SHAPE_FILE"),
                 lifted("unit_task_path"),
                 lifted("finished_rep_count"),
                 lifted("skip_unit"),

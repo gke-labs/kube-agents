@@ -163,6 +163,11 @@ type Config struct {
 	// disables the listener, and the harness has no way to delegate.
 	DelegateSocket string
 
+	// TaskStem names the consumers of a profile worker's task connection
+	// (lib.TaskConsumerStem), which the callout grants instead of the pod's.
+	// Empty for every other run.
+	TaskStem string
+
 	Logger *slog.Logger
 }
 
@@ -181,6 +186,9 @@ func (c Config) Addressee() string {
 // (the callout's profile narrowing grants exactly <pod>-<role>). Without a pod
 // name, which is the by-hand static-credential path, it is the addressee.
 func (c Config) consumerStem() string {
+	if c.TaskStem != "" {
+		return c.TaskStem
+	}
 	if c.Session != "" {
 		return c.Session
 	}
@@ -252,6 +260,9 @@ func (c *Config) applyDefaults() {
 type Result struct {
 	State   lib.TaskState
 	Evicted bool
+	// Abandoned is a dispatched task the dispatcher took back: no terminal
+	// was published, because the dispatcher writes it.
+	Abandoned bool
 }
 
 // resultChunkSize bounds one result artifact-update well under the bus max
@@ -365,6 +376,45 @@ type adapter struct {
 	costSeen       float64
 	costKnown      bool
 	resumedSession bool
+
+	// dispatched is a task a profile worker took from the dispatcher
+	// (profile.go). The dispatcher checked the grant at admission
+	// (CheckProfileRun), and a profile pod holds no verify subject, so the
+	// executor's own capability check is skipped for it.
+	dispatched bool
+	// abandon carries the dispatcher's abandon reason. The dispatcher
+	// writes that task's terminal itself, so nothing more of the task goes
+	// out once it arrives (abandoned). Nil, which never fires, for every
+	// other task.
+	abandon <-chan string
+	// abandonSeen and abandonReason are abandon's message once something
+	// has taken it off the channel, under mu: whichever of run, supervise
+	// and finalize sees it first, they all see it after.
+	abandonSeen   bool
+	abandonReason string
+}
+
+// errAbandoned is finalize's answer for an abandoned task: no terminal went
+// out, because the dispatcher writes it.
+var errAbandoned = errors.New("the dispatcher abandoned the task and writes its terminal")
+
+// abandoned reports whether the dispatcher has abandoned the task, taking
+// the abandon off its channel if it's waiting there. It's the one check every
+// path that publishes makes, so an abandon is seen wherever it lands: during
+// setup, beside a SIGTERM, or while the harness drains.
+func (a *adapter) abandoned() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.abandonSeen {
+		return true
+	}
+	select {
+	case reason := <-a.abandon:
+		a.abandonSeen, a.abandonReason = true, reason
+		return true
+	default:
+		return false
+	}
 }
 
 // turnCostFrom is one result line's cost from the harness's running total,
@@ -450,6 +500,22 @@ type busConns struct {
 
 // dialBus opens the pod's two bus connections with its credential.
 func dialBus(ctx context.Context, cfg Config) (*busConns, func(), error) {
+	return dialBusWith(ctx, cfg, nil)
+}
+
+// dialTaskBus opens a profile worker's task connections (#3889): the pod's
+// bus token with the dispatcher's task credential, under the task's stem.
+func dialTaskBus(ctx context.Context, cfg Config, credential string) (*busConns, func(), error) {
+	auth, err := lib.TaskCredentialNATSOptions(cfg.BusTokenFile, credential, cfg.PodName, cfg.TaskID)
+	if err != nil {
+		return nil, nil, err
+	}
+	return dialBusWith(ctx, cfg, auth)
+}
+
+// dialBusWith is dialBus with auth replacing the credential cfg names, when
+// it's set.
+func dialBusWith(ctx context.Context, cfg Config, auth []nats.Option) (*busConns, func(), error) {
 	log := cfg.Logger
 	natsOpts := []nats.Option{
 		nats.Name("worker-adapter-" + cfg.Addressee()),
@@ -478,6 +544,8 @@ func dialBus(ctx context.Context, cfg Config) (*busConns, func(), error) {
 		}),
 	}
 	switch {
+	case auth != nil:
+		natsOpts = append(natsOpts, auth...)
 	case cfg.BusTokenFile != "":
 		// The pod-bound credential. The inbox owner is the pod name: for a
 		// session pod validate() has checked it against A2A_SESSION, and a
@@ -513,6 +581,12 @@ func dialBus(ctx context.Context, cfg Config) (*busConns, func(), error) {
 	// handshake (spec-nats-deployment.md); what the longer value buys is
 	// the dial, TLS and scheduling share of an attempt on a loaded host.
 	rawOpts := append(natsOpts, nats.Timeout(lib.DialTimeout))
+	// A profile worker's pod lives for days and takes task after task on
+	// this connection, so it rides out a bus outage of any length rather
+	// than closing after nats.go's default sixty attempts.
+	if cfg.ProfileExecutor {
+		rawOpts = append(rawOpts, nats.MaxReconnects(-1))
+	}
 	nc, err := nats.Connect(cfg.NATSURL, append(rawOpts, lib.TLSOptions()...)...)
 	if err != nil {
 		c.Close()
@@ -555,6 +629,10 @@ type turnPlan struct {
 	// result line prices its own turn rather than the whole session.
 	costSeen  float64
 	costKnown bool
+	// setupErr is a pod-side setup failure from before the run (the
+	// dispatched worker's persona config). The run publishes a failed
+	// terminal for it and runs nothing.
+	setupErr error
 }
 
 // turnOutcome is one task's run, as the session loop needs it: the terminal
@@ -624,17 +702,29 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 	a.exec = exec
 	a.taskID, a.contextID, a.correlationID = origin.TaskID, origin.ContextID, origin.CorrelationID
 
+	// An abandon already here ends the task before anything of it is
+	// published (the dispatcher writes its terminal); the check before
+	// working below catches one that lands during setup.
+	if a.abandoned() {
+		return done(Result{Abandoned: true}, nil)
+	}
 	if !skipSubmitted {
 		if err := exec.PublishStatus(ctx, lib.StateSubmitted, false); err != nil {
 			return done(Result{}, fmt.Errorf("publish submitted: %w", err))
 		}
 	}
 
+	if plan.setupErr != nil {
+		state := lib.StateFailed
+		ferr := a.finalize(state, "reason: harness-config-failed - "+plan.setupErr.Error(), "")
+		return broken(Result{State: state}, ferr)
+	}
+
 	// Authorization comes before content. The capability the gateway minted
 	// for this task has to permit this executor to execute it, at this
 	// executor's own scope, and the verifier is the only thing that can say
 	// so. Refused is terminal rejected, before any model spend.
-	if reason := a.capabilityRefusal(ctx, a.nc, origin); reason != "" {
+	if reason := a.dispatchedOr(a.capabilityRefusal, ctx, origin); reason != "" {
 		// A SIGTERM that lands inside the verify window is an eviction, not
 		// a refusal. Check wraps this same ctx and turns its cancellation
 		// into "the verifier could not be reached", so without this branch
@@ -677,6 +767,11 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 	}
 	defer stopIn()
 
+	// An abandon that arrived during setup ends the task here, before it
+	// is marked working after the dispatcher's terminal.
+	if a.abandoned() {
+		return done(Result{Abandoned: true}, nil)
+	}
 	if err := exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
 		return done(Result{State: lib.StateFailed}, fmt.Errorf("publish working: %w", err))
 	}
@@ -720,6 +815,13 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 		}
 	}
 
+	if delegate {
+		// The agents this turn's requester may delegate to, as the gateway
+		// listed them on the submission: per turn, so a reused pod's tool
+		// keeps up with profiles added and removed.
+		argv, _ = withDelegateTargets(argv, origin)
+	}
+
 	if cfg.SessionReuse {
 		if err := removeUserSettings(cfg.HarnessUserSettings); err != nil {
 			state := lib.StateFailed
@@ -750,6 +852,26 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 
 	res, err := a.supervise(ctx, proc, steerCh, cancelCh, delegateCh)
 	return turnOutcome{res: res, err: err, launched: true, harnessSession: a.harnessSession}
+}
+
+// evictedReason is the terminal's reason when the pod is stopped mid-task.
+// A profile worker is stopped by a rollout or a scale-down of its pool,
+// which the requester can't see, so its text says so and that the task can
+// be sent again.
+func (a *adapter) evictedReason() string {
+	if a.dispatched {
+		return "reason: worker-evicted - the task was interrupted because its worker restarted (an upgrade or a scale-down); it can be resubmitted"
+	}
+	return "reason: worker-evicted - infrastructure delivered SIGTERM before the task finished"
+}
+
+// dispatchedOr is check's refusal for a task that came through the stream,
+// and "" for a dispatched one, whose grant the dispatcher already checked.
+func (a *adapter) dispatchedOr(check func(context.Context, *nats.Conn, *lib.Envelope) string, ctx context.Context, origin *lib.Envelope) string {
+	if a.dispatched {
+		return ""
+	}
+	return check(ctx, a.nc, origin)
 }
 
 // supervise is the main loop: harness stdout events out, steering in, cancel
@@ -783,14 +905,15 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 	}()
 
 	var (
-		canceled    bool
-		deadlineHit bool
-		sawResult   bool
-		exited      bool
-		waitErr     error
-		reapTook    time.Duration
-		resultText  string
-		resultErr   string // failure subtype from the harness, if any
+		canceled      bool
+		abandonKilled bool
+		deadlineHit   bool
+		sawResult     bool
+		exited        bool
+		waitErr       error
+		reapTook      time.Duration
+		resultText    string
+		resultErr     string // failure subtype from the harness, if any
 		// delegated is set once a delegate request is published: the
 		// turn's deliverable is decided, and nothing the harness says
 		// after it changes that.
@@ -802,12 +925,33 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 		pendingTurns = 1
 	)
 
+	// stopForAbandon reports an abandon, from whichever arm finds it first,
+	// and kills the harness once. The loop still waits for it to exit and
+	// drain, as cancel does: the worker frees the pod for the next task when
+	// this returns, and nothing of this task's may still be running then.
+	stopForAbandon := func() bool {
+		if !a.abandoned() {
+			return false
+		}
+		if !abandonKilled {
+			abandonKilled = true
+			log.Info("the dispatcher abandoned the task; stopping the harness", "task", a.taskID, "reason", a.abandonReason)
+			proc.kill(0)
+		}
+		return true
+	}
+
 	events := proc.events
 	for events != nil || !exited {
 		select {
 		case ev, ok := <-events:
 			if !ok {
 				events = nil
+				continue
+			}
+			// An abandoned task's stdout is drained, not published: the
+			// dispatcher has written its terminal.
+			if stopForAbandon() {
 				continue
 			}
 			switch ev.Type {
@@ -867,6 +1011,10 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 			}
 
 		case text := <-steerCh:
+			if stopForAbandon() {
+				log.Info("steer for an abandoned task dropped", "task", a.taskID)
+				continue
+			}
 			if sawResult || exited {
 				// Post-deliverable steer: the deliverable is chosen and
 				// the harness is wrapping up, so this correction cannot be
@@ -900,7 +1048,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 			// Cancel and the deadline end the turn when they fire, not when
 			// the harness finally dies: a call in that window would publish
 			// a child and turn the canceled task into a completed one.
-			if sawResult || exited || canceled || deadlineHit {
+			if sawResult || exited || canceled || deadlineHit || stopForAbandon() {
 				ask.reply <- delegateReply{Message: "this turn has already ended"}
 				continue
 			}
@@ -926,6 +1074,16 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 			proc.closeStdin()
 			proc.kill(a.cfg.KillGrace)
 
+		case reason := <-a.abandon:
+			// The dispatcher took the task back (deadline, lease expiry, a
+			// stop) and writes its terminal. Publishing one here too would
+			// put two finals on the task, so the harness is killed and
+			// nothing more goes out.
+			a.mu.Lock()
+			a.abandonSeen, a.abandonReason = true, reason
+			a.mu.Unlock()
+			stopForAbandon()
+
 		case <-cancelCh:
 			if canceled {
 				continue
@@ -942,6 +1100,12 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 			// Eviction: kubelet SIGTERM landed. Flush what the harness
 			// already produced, state the reason honestly, exit 143.
 			proc.kill(0)
+			// The dispatcher already wrote an abandoned task's terminal,
+			// whether its abandon was taken first or is waiting beside the
+			// SIGTERM.
+			if a.abandoned() {
+				return Result{Abandoned: true}, nil
+			}
 			// A turn that delegated has its deliverable already: the
 			// one-line result. The SIGTERM is not a failure of it, and is
 			// expected: a child that ends fast wakes the session, and a
@@ -952,7 +1116,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 				return a.completeWith(resultText)
 			}
 			state := lib.StateFailed
-			err := a.finalize(state, "reason: worker-evicted - infrastructure delivered SIGTERM before the task finished", resultText)
+			err := a.finalize(state, a.evictedReason(), resultText)
 			return Result{State: state, Evicted: true}, err
 
 		case reap := <-waitDone:
@@ -967,6 +1131,8 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 	// race, legal per the payload spec), then deadline, then cancel, then
 	// failure with evidence.
 	switch {
+	case a.abandoned():
+		return Result{Abandoned: true}, nil
 	case sawResult && resultErr == "":
 		return a.completeWith(resultText)
 	case sawResult:
@@ -1210,6 +1376,9 @@ func truncateRunes(s string, n int) string {
 // travels as the status message; evidence (partial output) rides along when
 // present.
 func (a *adapter) finalize(state lib.TaskState, reason, evidence string) error {
+	if a.abandoned() {
+		return errAbandoned
+	}
 	a.mu.Lock()
 	if a.finalized {
 		defer a.mu.Unlock()
@@ -1292,7 +1461,11 @@ func (a *adapter) finalize(state lib.TaskState, reason, evidence string) error {
 // threshold has reaped it, is not an error.
 func (a *adapter) sessionConsumer(ctx context.Context, role, filter string, cfg jetstream.ConsumerConfig) (jetstream.Consumer, error) {
 	name := lib.SessionConsumerName(a.cfg.consumerStem(), role)
-	if a.cfg.SessionReuse {
+	// A reused session and a warm profile worker run task after task under
+	// one stem (a profile worker's is the pod's until its confirms carry a
+	// task credential), so the previous task's consumer goes first rather
+	// than lending this one its delivery state.
+	if a.cfg.SessionReuse || a.cfg.ProfileExecutor {
 		_ = a.js.DeleteConsumer(ctx, lib.TasksStream, name)
 	}
 	return a.js.CreateOrUpdateConsumer(ctx, lib.TasksStream, sessionConsumerConfig(name, filter, cfg))

@@ -4,7 +4,7 @@ Part of the `fleet-audit` skill (`/opt/data/profiles/platform/skills/fleet-audit
 
 ## Running a stream on demand
 
-An audit request arrives in one of three distinct forms, distinguished by the request itself:
+An audit request arrives in one of three distinct forms, distinguished by the request itself. A fleet-wide question that does not ask to run an audit and names no SOP is none of them: follow `SOUL.md`'s chat route, with no `start`, `draft` or `finish` (`SKILL.md`, "Run an audit", form 4).
 
 ### 1. Asked to run an audit stream per its SOP: Run the audit directly
 

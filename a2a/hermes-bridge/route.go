@@ -48,8 +48,11 @@ const (
 	routeMemoryTTL = 24 * time.Hour
 	// routeLostNote follows a completed answer whose route could not be
 	// recorded, so the user is told rather than left waiting for a card's
-	// answer that cannot arrive.
-	routeLostNote = "\n\n(If this turn filed a card, its answer cannot be posted back to this conversation: the conversation's route could not be recorded.)"
+	// answer that cannot arrive. Such a turn ends at its acknowledgement
+	// (only a console, MCP or A2A door turn waits on its cards,
+	// waitsForCardsInTurn),
+	// and most file no card, hence "if".
+	routeLostNote = "\n\n(If a card this turn filed is still running, its answer cannot be posted back to this conversation: the conversation's route could not be recorded.)"
 )
 
 // routePlatforms maps a gateway conversation key's prefix to the platform name
@@ -66,6 +69,47 @@ var routePlatforms = map[string]string{
 // consoleRoutePrefix is the console conversation's key prefix, the one route
 // that carries its task (conversationRoute.TaskID).
 const consoleRoutePrefix = "console:"
+
+// a2aDoorRoutePrefix is the gateway's A2A door's conversation key prefix
+// (a2a/gateway/a2adoor.go, a2aKeyPrefix): a client calling message/send,
+// which has no thread for a card's post and reads the task's answer.
+const a2aDoorRoutePrefix = "a2a:"
+
+// waitsForCardsInTurn reports whether a turn holds its task open while the
+// Kanban cards it filed run (waitForKanbanCards): a console or MCP turn, or
+// an A2A door turn (#5180). Those clients read the task's answer and have
+// no thread for a card's post. Every other turn ends at the acknowledgement,
+// as before the in-turn wait (#5170). On a chat turn with a recorded route a
+// card's answer comes back through the chat.notify route; on a turn whose
+// route was not recorded it cannot (routeLostNote says so); the eval inject
+// lane gets none from the bridge.
+func waitsForCardsInTurn(env *lib.Envelope) bool {
+	return isConsoleOrigin(env) || hasConversationPrefix(env, a2aDoorRoutePrefix)
+}
+
+// hasConversationPrefix reports whether env's authority names a
+// conversation starting with prefix.
+func hasConversationPrefix(env *lib.Envelope, prefix string) bool {
+	if env == nil {
+		return false
+	}
+	auth, err := parseRouteAuthority(env)
+	if err != nil {
+		return false
+	}
+	return strings.HasPrefix(strings.TrimSpace(auth.Audience.Conversation), prefix)
+}
+
+func isConsoleOrigin(env *lib.Envelope) bool {
+	if env == nil {
+		return false
+	}
+	auth, err := parseRouteAuthority(env)
+	if err != nil {
+		return false
+	}
+	return strings.HasPrefix(strings.TrimSpace(auth.Audience.Conversation), consoleRoutePrefix)
+}
 
 // errNoChatConversation is an authority that names no chat conversation the
 // notify route serves; nothing is recorded and nothing is wrong.
@@ -280,17 +324,32 @@ func (b *Bridge) rememberRoute(sessionID string, route conversationRoute) {
 
 // putRoute writes route against sessionID in the store.
 func (b *Bridge) putRoute(ctx context.Context, sessionID string, route conversationRoute) error {
+	return b.putSessionRecord(ctx, fmt.Sprintf(routePathFormat, url.PathEscape(sessionID)), route)
+}
+
+// storeStatusError is a non-2xx answer from the session-kv store.
+type storeStatusError struct {
+	status int
+	detail string
+}
+
+func (e *storeStatusError) Error() string {
+	return fmt.Sprintf("HTTP %d: %s", e.status, e.detail)
+}
+
+// putSessionRecord PUTs body as JSON to path under the session-kv store.
+func (b *Bridge) putSessionRecord(ctx context.Context, path string, body any) error {
 	if strings.TrimSpace(b.cfg.RouteKey) == "" {
 		return fmt.Errorf("%s is not set", RouteKeyEnv)
 	}
-	body, err := json.Marshal(route)
+	raw, err := json.Marshal(body)
 	if err != nil {
 		return err
 	}
 	ctx, cancel := context.WithTimeout(ctx, routeTimeout)
 	defer cancel()
-	target := strings.TrimRight(b.cfg.RouteURL, "/") + fmt.Sprintf(routePathFormat, url.PathEscape(sessionID))
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, target, bytes.NewReader(body))
+	target := strings.TrimRight(b.cfg.RouteURL, "/") + path
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, target, bytes.NewReader(raw))
 	if err != nil {
 		return err
 	}
@@ -302,8 +361,93 @@ func (b *Bridge) putRoute(ctx context.Context, sessionID string, route conversat
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, routeErrorTailBytes))
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+		tail, _ := io.ReadAll(io.LimitReader(resp.Body, routeErrorTailBytes))
+		return &storeStatusError{status: resp.StatusCode, detail: strings.TrimSpace(string(tail))}
 	}
 	return nil
+}
+
+// The session's origin (docs/designs/proposal-origin.md §2.1): before a task's
+// first turn the bridge records which door opened the session, once, under
+// PUT /v1/sessions/{id}/origin; session-kv answers 409 when the session
+// already has a record, as a resumed session does. The origin values are the
+// Session KV server's ORIGINS (agents/platform/scripts/session_kv_server.py),
+// held to it by TestBackendOriginsArePinnedToTheSessionKVServer.
+const (
+	originPathFormat = "/v1/sessions/%s/origin"
+	originChat       = "chat"
+	originConsole    = "console"
+	originAPI        = "api"
+
+	// The gateway's door names (a2a/gateway: gchatBackend, slackBackend, ...).
+	backendGchat     = "gchat"
+	backendSlack     = "slack"
+	backendDiscord   = "discord"
+	backendConsole   = "console"
+	backendA2A       = "a2a"
+	backendA2AGoogle = "a2a-google"
+	backendInject    = "inject"
+
+	// originPlatformGooglechat is gchat's origin platform in the chat metrics
+	// label vocabulary (agents/chat/defaults/plugins/chat_metrics/metrics.py
+	// HERMES_PLATFORM_LABELS), the one every origin writer uses.
+	originPlatformGooglechat = "googlechat"
+)
+
+// errOriginExists is a session that already has its origin record.
+var errOriginExists = errors.New("the session already has an origin record")
+
+// sessionOrigin is the origin PUT's body.
+type sessionOrigin struct {
+	Origin   string `json:"origin"`
+	Platform string `json:"platform,omitempty"`
+}
+
+// backendOrigins maps the gateway door a task came through
+// (authority.requester.backend) to the session's origin. A chat door's
+// platform is the ledger's platform label: Google Chat and Slack are spelled
+// as the chat metrics labels spell them, and Discord, which has no chat
+// metrics label, keeps its backend name.
+var backendOrigins = map[string]sessionOrigin{
+	backendGchat:     {Origin: originChat, Platform: originPlatformGooglechat},
+	backendSlack:     {Origin: originChat, Platform: backendSlack},
+	backendDiscord:   {Origin: originChat, Platform: backendDiscord},
+	backendConsole:   {Origin: originConsole},
+	backendA2A:       {Origin: originAPI},
+	backendA2AGoogle: {Origin: originAPI},
+	backendInject:    {Origin: originAPI},
+}
+
+// putOrigin writes the session's origin record; errOriginExists when it has one.
+func (b *Bridge) putOrigin(ctx context.Context, sessionID, origin, platform string) error {
+	err := b.putSessionRecord(ctx, fmt.Sprintf(originPathFormat, url.PathEscape(sessionID)),
+		sessionOrigin{Origin: origin, Platform: platform})
+	var status *storeStatusError
+	if errors.As(err, &status) && status.status == http.StatusConflict {
+		return errOriginExists
+	}
+	return err
+}
+
+// recordOrigin records the origin env's door implies against sessionID. Best
+// effort: a door with no mapping records nothing, an existing record is left,
+// and a failed write is logged and ignored.
+func (b *Bridge) recordOrigin(ctx context.Context, sessionID string, env *lib.Envelope) {
+	if b.cfg.RouteURL == "" {
+		return
+	}
+	auth, err := parseRouteAuthority(env)
+	if err != nil {
+		return
+	}
+	origin, ok := backendOrigins[strings.TrimSpace(auth.Requester.Backend)]
+	if !ok {
+		return
+	}
+	switch err := b.putOrigin(ctx, sessionID, origin.Origin, origin.Platform); {
+	case errors.Is(err, errOriginExists):
+		b.cfg.Logger.Debug("session origin already recorded", "session", sessionID)
+	case err != nil:
+		b.cfg.Logger.Warn("session origin not recorded", "session", sessionID, "err", err)
+	}
 }

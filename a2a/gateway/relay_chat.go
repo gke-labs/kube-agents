@@ -123,6 +123,59 @@ func (g *Gateway) postMessage(conversation string, m OutMessage) {
 	}
 }
 
+// answerLineFor is the live message a completed task ends on a backend
+// that answers on the line (LineAnswerer): the task's own line, or the
+// line of a delegating turn whose child took the active task; "" when the
+// backend posts its answers, the task has no line (its placeholder post
+// failed, or the backend shows the status itself), or its requester asked
+// to stop it (TaskRef.Canceled): that line says "cancel sent", a later
+// stale press rewrites it as canceled (chatStopStale), and an
+// acknowledgement there could be written over, so such a task keeps the
+// post and the terminal edit.
+func (g *Gateway) answerLineFor(rec *SessionRecord, taskID string) string {
+	answerer, ok := g.adapter.(LineAnswerer)
+	if !ok || !answerer.AnswersOnLine(rec.Key) {
+		return ""
+	}
+	ref, known := rec.TaskRefFor(taskID)
+	if known && ref.Canceled {
+		return ""
+	}
+	if active := rec.ActiveTask; active != nil && active.TaskID == taskID {
+		return active.StatusMsgID
+	}
+	if known {
+		return ref.StatusMsgID
+	}
+	return ""
+}
+
+// answerOnLine edits messageID, the task's live message, into m, the
+// acknowledgement of a turn that handed the ask to cards: laid out when m
+// carries a chat message the backend lays out, as text otherwise. The edit
+// carries no Stop, so the control comes off as at the terminal edit. It
+// reports whether the line carries the acknowledgement. An edit that does
+// not land (a refused layout retries as text first, as a refused post does)
+// posts m as postMessage would, without a layout the edit already had
+// refused, and reports false, so the caller makes the terminal edit.
+func (g *Gateway) answerOnLine(conversation, messageID string, m OutMessage) bool {
+	if m.Chat != nil && strings.TrimSpace(m.Text) != "" {
+		err := g.adapter.EditMessage(conversation, messageID, OutMessage{Text: m.Text, Chat: m.Chat})
+		if g.chatOutcome(conversation, err) {
+			return true
+		}
+		if errors.Is(err, ErrLayoutRefused) {
+			m.Chat = nil
+		}
+	}
+	if err := g.adapter.EditMessage(conversation, messageID, OutMessage{Text: m.Text}); err != nil {
+		g.log.Warn("editing the acknowledgement onto the task's line failed; posting it", "conversation", conversation, "err", err)
+		g.postMessage(conversation, m)
+		return false
+	}
+	return true
+}
+
 // chatOutcome counts what became of one chat message the adapter was handed,
 // logs a refusal, and reports whether the adapter laid it out. Anything but
 // success leaves the caller to send the text instead: the spec's "retries it
@@ -150,13 +203,15 @@ func (g *Gateway) chatOutcome(conversation string, err error) bool {
 // chat message to lay out, is the text edit the relay always made. One that
 // was laid out and has none now is replaced by its text, layout cleared. A
 // chat message the adapter will not lay out falls back to the text edit.
-func (g *Gateway) renderLine(conversation, messageID, line string, rs *relayState) bool {
+// stop is editLine's: the running task's id keeps the Stop control on its
+// line, and none takes it off at the terminal.
+func (g *Gateway) renderLine(conversation, messageID, line string, rs *relayState, stop string) bool {
 	line = truncateRunes(line, discordChunk)
 	if rs.lineTextOnly || (rs.lineChat == nil && !rs.lineLaidOut) {
-		return g.editLine(conversation, messageID, line)
+		return g.editLine(conversation, messageID, line, stop)
 	}
 	if rs.lineChat != nil {
-		err := g.adapter.EditMessage(conversation, messageID, OutMessage{Text: line, Chat: rs.lineChat})
+		err := g.adapter.EditMessage(conversation, messageID, OutMessage{Text: line, Chat: rs.lineChat, Stop: stop})
 		if g.chatOutcome(conversation, err) {
 			rs.lineLaidOut = true
 			return true
@@ -182,11 +237,11 @@ func (g *Gateway) renderLine(conversation, messageID, line string, rs *relayStat
 				// message changed, and this backend did not lay it out.
 				return true
 			}
-			return g.editLine(conversation, messageID, line)
+			return g.editLine(conversation, messageID, line, stop)
 		}
 	}
 	// The line shows a layout it should not any more: replace it whole.
-	if err := g.adapter.EditMessage(conversation, messageID, OutMessage{Text: line}); err != nil {
+	if err := g.adapter.EditMessage(conversation, messageID, OutMessage{Text: line, Stop: stop}); err != nil {
 		g.log.Warn("rolling line edit failed", "conversation", conversation, "err", err)
 		return false
 	}
