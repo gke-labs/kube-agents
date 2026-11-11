@@ -882,7 +882,7 @@ what it renders and how a client connects.
 
 ### Slack end-to-end test users (`operator.slackTestUsers`)
 
-For CI and eval installs only. `operator.slackTestUsers` lists Slack member ids (`U…`) whose
+Meant for CI and eval installs. `operator.slackTestUsers` lists Slack member ids (`U…`) whose
 posts the A2A gateway reads as theirs even though they carry an app's `bot_id`, which a post
 made with a user token through an app does; the gateway otherwise drops those as bot traffic.
 It renders as `A2A_SLACK_TEST_USERS` on the controller manager, which hands it to the gateway

@@ -261,7 +261,8 @@ type SlackAdapter struct {
 	guests map[string]bool
 	// testUsers are the end-to-end test users' member ids (SetTestUsers),
 	// whose app-attributed posts are read as theirs; set before Run,
-	// read-only after. Empty everywhere but CI and eval installs.
+	// read-only after. Meant for CI and eval installs; the allowlist still
+	// decides who is served.
 	testUsers map[string]bool
 
 	// sessionsAPI drives Agent Sessions (slack_sessions.go); nil in a test

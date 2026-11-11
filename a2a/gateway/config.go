@@ -257,7 +257,8 @@ type Config struct {
 	// workspace's member is still refused.
 	SlackAllowAllUsers bool
 	// SlackTestUsers are the Slack member ids of end-to-end test users
-	// (EnvSlackTestUsers), set only on CI and eval installs. A message such a
+	// (EnvSlackTestUsers), meant for CI and eval installs; the allowlist
+	// (A2A_SLACK_ALLOWED_USERS) is still the gate on who is served. A message such a
 	// user posts with a user token through an app carries the app's bot_id,
 	// which the Slack adapter otherwise drops as bot traffic; from a listed
 	// member it is read as theirs (SlackAdapter.SetTestUsers). Every other

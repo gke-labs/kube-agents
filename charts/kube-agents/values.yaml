@@ -170,7 +170,8 @@ operator:
   # "MCP server" reference page.
   mcpServer:
     enabled: false
-  # Slack member ids of end-to-end test users, for CI and eval installs only.
+  # Slack member ids of end-to-end test users, meant for CI and eval installs;
+  # integration.slack.allowedUsers is still the gate on who is served.
   # A post such a user makes with a user token through an app carries the
   # app's bot_id, which the A2A gateway otherwise drops as bot traffic; from a
   # listed member it is read as theirs. The allowlist still has to admit them.

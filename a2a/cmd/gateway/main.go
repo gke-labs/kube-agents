@@ -171,7 +171,8 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		if err == nil {
 			// The allowlist's T…:U… entries: other workspaces' members it serves.
 			sl.SetAllowedGuests(cfg.SlackAllowedUsers)
-			// End-to-end test users, on CI and eval installs only.
+			// End-to-end test users, meant for CI and eval installs; the
+			// allowlist still decides who is served.
 			sl.SetTestUsers(cfg.SlackTestUsers)
 			adapter = sl
 		}

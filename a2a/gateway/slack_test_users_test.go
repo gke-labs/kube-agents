@@ -2,7 +2,9 @@ package gateway
 
 import (
 	"context"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/slack-go/slack/slackevents"
 )
@@ -73,5 +75,28 @@ func TestFromEnvReadsTheSlackTestUsers(t *testing.T) {
 	}
 	if len(cfg.SlackTestUsers) != 2 || cfg.SlackTestUsers[0] != "U1" || cfg.SlackTestUsers[1] != "U2" {
 		t.Fatalf("SlackTestUsers = %v", cfg.SlackTestUsers)
+	}
+}
+
+// A listed test user's app post reaches the gateway as that member's message
+// and meets the allowlist like any other: a test user the allowlist does not
+// name is refused with the unverified-sender notice, and no task is published.
+// The list lifts the adapter's bot_id drop and widens nothing past it.
+func TestSlackTestUserOffTheAllowlistIsRefused(t *testing.T) {
+	a := newTestSlackAdapter(&fakeSlackAPI{})
+	a.SetTestUsers([]string{"U2"})
+	msg, ok := a.inbound(context.Background(), appPost("U2", "300.1"))
+	if !ok {
+		t.Fatal("the listed test user's app post was dropped by the adapter")
+	}
+	r := startSlackGateRig(t, []string{"U1"}, false)
+	r.adapter.inbox <- msg
+	waitFor(t, "the unverified-sender notice", func() bool { return len(r.adapter.postTexts()) >= 1 })
+	time.Sleep(200 * time.Millisecond)
+	if posts := r.adapter.postTexts(); !strings.Contains(posts[0], "can't verify") || !strings.Contains(posts[0], "U2") {
+		t.Errorf("notice %q should be the unverified-sender notice naming the test user", posts[0])
+	}
+	if got := len(inSubjectEnvelopes(t, r.url, "platform")); got != 0 {
+		t.Errorf("%d task envelopes published for a test user off the allowlist", got)
 	}
 }
