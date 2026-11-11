@@ -9,10 +9,11 @@ import (
 
 // The notice a conversation reads never carries the executors' plumbing:
 // the `reason:` prefix and the token stay out of user text
-// (.agents/rules/chat_ux.md): a known token reads as its plain sentence, an
-// unknown one as its detail cut before any session id, and plain text as
-// itself. One case per input class: a known and an unknown token with and
-// without detail, plain text, empty.
+// (.agents/rules/chat_ux.md): a known token reads as its plain sentence, a
+// detail-shown token as its detail cut before any session id, an unknown
+// one as nothing, and plain text as itself. One case per input class: a
+// known, a detail-shown and an unknown token with and without detail, plain
+// text, empty.
 func TestReasonInPlainWords(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
