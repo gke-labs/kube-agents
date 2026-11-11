@@ -93,7 +93,7 @@ is unset.
 ## Local Development (Fast Iteration)
 
 The operator is a standard Kubebuilder project; `make help` lists every target. `make manifests`
-writes to `config/crd/bases/`, `config/rbac/` and `config/webhook/`, then regenerates the three CRD
+writes to `config/crd/bases/`, `config/rbac/` and `config/webhook/`, then regenerates the CRD
 field reference pages under `docs/site/src/content/docs/operator/` from the API types (it needs
 `python3` and exits with an error without it), and `make test` downloads the envtest binaries to
 `bin/` on first run. `make test` also runs the event watcher's fleet soak, ten fake clusters watched
@@ -354,14 +354,19 @@ When modifying or deprecating RBAC roles or rolebindings in the operator:
    ServiceAccount and deletes any non-canonical `kubeagents*` binding.
 3. **Sync controller RBAC annotations:** make sure the `// +kubebuilder:rbac` markers on the
    reconciler include every permission the operator itself needs to grant or clean up, then run
-   `make manifests` to regenerate `config/rbac/role.yaml`.
+   `make manifests` to regenerate `config/rbac/role.yaml`. A marker that carries `namespace=`
+   renders as the Role document in that file (bound by `namespaced_role_binding.yaml`) rather
+   than into the ClusterRole; the Secret write verbs are the one such marker, and
+   `tests/test_operator_secrets_grant.py` refuses them anywhere else. Add the verbs to
+   `requiredPermissions` in `rbac_selfcheck.go` too, with `Namespaced: true` for a namespaced
+   marker, then `make chart-sync` to copy both documents into the chart.
 
 ---
 
 ## Formatting and CI
 
 `prettier.yml` enforces Markdown and YAML formatting (`**/*.{md,yaml,yml}`) in CI; the local
-targets are under `make help`. The workflows that exercise this directory: `k8s-operator-test.yml` runs `make test`, `docker-publish-ghcr.yml` publishes the manager
+targets are under `make help`. The workflows that exercise this directory: `k8s-operator-test.yml` runs gosec and then `make test`, `docker-publish-ghcr.yml` publishes the manager
 image alongside the agent images, and `e2e-gchat-test.yml` is the end-to-end Google Chat test.
 
 ---

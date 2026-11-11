@@ -94,7 +94,9 @@ Bump the SHA deliberately — the pin _is_ the contract your tasks and harness a
 Put the OpenTofu stack in `tf/prebuilt/<stack-name>/`. If several stacks need the same code, put it
 in `tf/modules/` and reference it with `source = "../../modules/<module-name>"` — relative module
 paths resolve whether the stack is applied in place (the default) or from the per-run copy of the
-whole `tf/` tree that `--parallel` makes.
+whole `tf/` tree that `--parallel` makes. A stack that reads a tree outside `tf/` (a case's
+`fixture/` directory) takes that path as a variable with a relative default, because the copy
+carries `tf/` alone; `prebuilt/context-repository-owns-the-fix` is the shape.
 
 What several stacks share is often a shell or python helper rather than Terraform, because the work
 happens inside one `local-exec`. A module directory may hold those instead, run from the same

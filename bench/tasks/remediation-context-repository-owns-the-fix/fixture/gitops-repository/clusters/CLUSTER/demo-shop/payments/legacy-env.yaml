@@ -4,6 +4,8 @@ kind: ConfigMap
 metadata:
   name: payments-legacy-env
   namespace: demo-shop
+  labels:
+    managed-by: kube-agents-bench
 data:
   PAYMENTS_LEGACY_LEDGER_URL: http://ledger-legacy.demo-shop.svc.cluster.local:8080
   PAYMENTS_LEGACY_LEDGER_TIMEOUT_SECONDS: "5"
