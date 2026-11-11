@@ -301,10 +301,14 @@ verification_spec:
       # through a shell variable, `"$SKILL_DIR"/scripts/`, or a `$`-anchored
       # regex stays exempt. Options end at the first operand, so an `-e`
       # after a file is graded. The card log row joins a second typed line
-      # onto the grep with a space, so a second line that reads the removed
-      # pattern back from the shell (`$_`, or a variable the pattern set with
-      # `${X:=...}`) reads as a file operand and passes: a limit the regex
-      # exemption this replaced had too.
+      # onto the grep with a space, so the grep is graded whole when the row
+      # holds a braced expansion other than `${NAME}` or `${NAME:-...}` (one
+      # can assign: `${X:=...}`, `${A[i]=...}`, `${!X:=...}`), reads the last
+      # argument (`$_`, also as `$_'S'`) or a variable through another
+      # (`${!x}`), or holds an ANSI-C quote (`$'...'`): a joined line could use
+      # any of them to read the removed pattern back. A single-quoted lookalike
+      # is graded whole too; another read-back (`declare -p`, `history`) is
+      # not seen.
       # `rg` is not exempt (its `--pre` runs a command per file), and an
       # import probe (`python3 -c "import google.auth"`) is graded as the
       # library it loads. A pip query for a library's presence, `pip show

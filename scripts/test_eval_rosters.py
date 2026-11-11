@@ -956,8 +956,8 @@ INJECT_LANE_SAFEGUARDS = [
     "no-github-writes-the-case-did-not-request",  # #2079: a none-wrapped github_writes, catastrophic
 ]
 # The registered cases that request a pull request -- a check of a type in
-# lane.REQUESTING_CHECK_TYPES, a `requested_pull_requests:` key of their own,
-# or a `requesting:` entry in the lane file: what hack/ci-eval-pr.sh runs in
+# lane.REQUESTING_CHECK_TYPES, or a `requested_pull_requests:` key of their
+# own: what hack/ci-eval-pr.sh runs in
 # the fan-out's second phase on both lanes, after every other unit has
 # finished. A new requesting case edits this set in the same pull request.
 INJECT_LANE_REQUESTING = [
@@ -970,8 +970,8 @@ INJECT_LANE_REQUESTING = [
     # request for checkout-gateway; its objective's pull_request_opened leaf
     # allows one.
     "obtainability-major-pdb-auto-pr",
-    # obtainability-remediation-proposal was listed in the safeguards file's
-    # `requesting:` while the persona answered its "propose a manifest" prompt
+    # obtainability-remediation-proposal held an allowance (in the lane file's
+    # former `requesting:` map) while the persona answered its "propose a manifest" prompt
     # with a pull request; the persona's rule now puts that manifest in the
     # reply (SOUL.md §3, item 3), so the allowance is gone and the lane's
     # github_writes safeguard grades the case at zero like any other.
@@ -990,8 +990,8 @@ INJECT_LANE_REQUESTING = [
     # its objective's pull_request_opened leaf allows one.
     "stop-on-permission-refusal",
     "vcs-review-feedback-read-back",
-    # Also listed in `requesting:`, for the pull request it opens and closes
-    # beside the one its check grades.
+    # Declares `requested_pull_requests: 2`, for the pull request it opens and
+    # closes beside the one its check grades.
     "vcs-spent-branch-reuse",
 ]
 LANE_SAFEGUARD_LEAF_TYPE = "github_writes"
@@ -1076,21 +1076,16 @@ class InjectLaneSafeguardsTest(unittest.TestCase):
         sys.path.insert(0, str(REPO_ROOT / "bench"))
         from kube_agents_bench import lane
 
-        listed = lane.load_lane_requesting(eval_rosters.INJECT_LANE_SAFEGUARDS_FILE)
-
         def declared(case):
             doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
             return lane.declared_pull_requests(doc)
 
-        requesting = [c for c in self.lane_cases() if lane.requested_pull_requests(self.task_spec(c)) > 0 or declared(c) > 0 or c in listed]
-        # A listed case is registered and on the lane, and neither its own
-        # checks nor its own `requested_pull_requests:` key yet request as many
-        # as it is allowed: once they do, the entry is a leftover.
-        for case, count in listed.items():
-            with self.subTest(listed=case):
-                self.assertIn(case, self.lane_cases())
-                requested = max(lane.requested_pull_requests(self.task_spec(case)), declared(case))
-                self.assertLess(requested, count, f"{case}'s own checks or key request {requested} pull request(s) now, at least the {count} `requesting:` allows it; drop the entry")
+        requesting = [c for c in self.lane_cases() if lane.requested_pull_requests(self.task_spec(c)) > 0 or declared(c) > 0]
+        # A declared count above the case's own checks is a case that opens more
+        # than its checks grade, or a placeholder for a check not yet landed; one
+        # the checks already reach is a leftover, which scripts/validate_bench_cases.py
+        # fails. The lane file carries no allowance of its own any more.
+        self.assertNotIn(lane.RETIRED_REQUESTING_KEY, yaml.safe_load(eval_rosters.INJECT_LANE_SAFEGUARDS_FILE.read_text(encoding="utf-8")))
         self.assertEqual(sorted(requesting), INJECT_LANE_REQUESTING)
         # The plain leaf walk here agrees with the module's on every lane case.
         for case in self.lane_cases():
@@ -1108,9 +1103,9 @@ class InjectLaneSafeguardsTest(unittest.TestCase):
         sys.path.insert(0, str(REPO_ROOT / "bench"))
         from kube_agents_bench import lane
 
-        listed = lane.load_lane_requesting(eval_rosters.INJECT_LANE_SAFEGUARDS_FILE)
         case = "vcs-spent-branch-reuse"
-        self.assertEqual(max(lane.requested_pull_requests(self.task_spec(case)), listed.get(case, 0)), 2)
+        doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
+        self.assertEqual(lane.requested_for(self.task_spec(case), lane.declared_pull_requests(doc)), 2)
 
     def test_the_lane_still_runs_a_case_that_requests_nothing(self):
         # The safeguard changes what a case is graded on, not whether it
@@ -1256,14 +1251,13 @@ class SeatBarTest(unittest.TestCase):
         cls.scan = load_scan_assertions(scan)
         cls.repository_roles = repository_asserted_roles(cls.scan, getattr(scan, SCAN_REPOSITORY_SUBJECT_ATTR, None))
         cls.role_slots = overlay_role_slots()
-        cls.lane_requesting = eval_rosters.parse_lane_requesting(eval_rosters.INJECT_LANE_SAFEGUARDS_FILE.read_text(encoding="utf-8"))
         cls.lane = lane
 
     def findings(self, case: str) -> list[tuple[str, str]]:
         import yaml
 
         doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
-        return self.findings_for(doc, eval_rosters.requests_a_pull_request(case, self.lane_requesting))
+        return self.findings_for(doc, eval_rosters.requests_a_pull_request(case))
 
     def findings_for(self, doc: dict, requests: bool = False, **override) -> list[tuple[str, str]]:
         kwargs = {"scan": self.scan, "repository_roles": self.repository_roles, "role_slots": self.role_slots}
@@ -1388,8 +1382,8 @@ class SeatBarTest(unittest.TestCase):
             (tasks / "plain-case").mkdir()
             (tasks / "plain-case" / "task.yaml").write_text(yaml.safe_dump({**source, "id": "plain-case"}, sort_keys=False), encoding="utf-8")
             self.assertEqual(eval_rosters.declared_pull_requests("declared-case", tasks), 1)
-            self.assertTrue(eval_rosters.requests_a_pull_request("declared-case", {}, tasks))
-            self.assertFalse(eval_rosters.requests_a_pull_request("plain-case", {}, tasks))
+            self.assertTrue(eval_rosters.requests_a_pull_request("declared-case", tasks))
+            self.assertFalse(eval_rosters.requests_a_pull_request("plain-case", tasks))
             doc = yaml.safe_load((tasks / "declared-case" / "task.yaml").read_text(encoding="utf-8"))
             self.assertEqual(self.lane.declared_pull_requests(doc), 1)
 
@@ -1398,15 +1392,12 @@ class SeatBarTest(unittest.TestCase):
         the text; hold it to lane.py's YAML read on every registered case."""
         import yaml
 
-        listed = self.lane.load_lane_requesting(eval_rosters.INJECT_LANE_SAFEGUARDS_FILE)
-        self.assertEqual(self.lane_requesting, listed)
         self.assertEqual(eval_rosters.REQUESTING_CHECK_RE.pattern.count("|") + 1, len(self.lane.REQUESTING_CHECK_TYPES))
         for case in eval_rosters.presubmit_cases() + eval_rosters.nightly_cases():
             with self.subTest(case=case):
                 doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
-                self.assertEqual(eval_rosters.requests_a_pull_request(case, self.lane_requesting),
-                                 self.lane.requested_for(doc.get("verification_spec") or [],
-                                                         max(listed.get(case, 0), self.lane.declared_pull_requests(doc))) > 0)
+                self.assertEqual(eval_rosters.requests_a_pull_request(case),
+                                 self.lane.requested_for(doc.get("verification_spec") or [], self.lane.declared_pull_requests(doc)) > 0)
 
     def test_the_validators_requesting_types_are_the_lanes(self):
         """scripts/validate_bench_cases.py counts a case's requesting leaves
@@ -1491,8 +1482,7 @@ class PresubmitWallTimeTest(unittest.TestCase):
         from unittest import mock
 
         base = eval_rosters.presubmit_wall_estimate()
-        listed = eval_rosters.parse_lane_requesting(eval_rosters.INJECT_LANE_SAFEGUARDS_FILE.read_text(encoding="utf-8"))
-        extra = next(c for c in eval_rosters.nightly_cases() if eval_rosters.requests_a_pull_request(c, listed))
+        extra = next(c for c in eval_rosters.nightly_cases() if eval_rosters.requests_a_pull_request(c))
         src = SCRIPT.read_text(encoding="utf-8")
         hints, default = eval_rosters.parse_cost_hints(src)
         settle = int(re.search(r"EVAL_GITHUB_WRITE_SETTLE_SECONDS=(\d+)", src).group(1))

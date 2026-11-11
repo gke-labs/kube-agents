@@ -81,7 +81,7 @@ func (e *Exclusions) load() (map[clusterRef]bool, map[[2]string]bool, error) {
 }
 
 func parseExclusions(path string) (map[clusterRef]bool, map[[2]string]bool, error) {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) // #nosec G304 -- the operator-set --scope-file (KUBE_PROXY_SCOPE_FILE) path, not request data
 	if err != nil {
 		return nil, nil, fmt.Errorf("the install's scope file can't be read")
 	}

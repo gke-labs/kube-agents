@@ -398,7 +398,7 @@
 # A read-only forge question that asks for `gh` by name (#2201): the answer
 # must come through the version-control verbs, which is red on any build
 # whose sandbox still carries a forge CLI that answers. Read-only, so no
-# `requesting:` entry. Priced in unit_cost_hint.
+# `requested_pull_requests:` key. Priced in unit_cost_hint.
 ./tasks/vcs-forge-cli-request-uses-the-verbs/task.yaml
 
 # ── Moved here 2026-09-22 from the presubmit file (#1023) ───────────────────

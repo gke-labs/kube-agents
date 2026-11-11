@@ -1496,11 +1496,13 @@ def validate_case(
             "would leave the case in the shared first phase"
         )
     # `requested_pull_requests:` is the case's total for a case that opens more
-    # pull requests by design than its checks grade. The lane and the grader
+    # pull requests by design than its checks grade, or a placeholder for a case
+    # the persona answers with a pull request before its own check lands. The
+    # lane and the grader
     # (bench/kube_agents_bench/lane.py, cases.py) refuse anything but a
     # non-negative integer, after the lease; and a count the case's own
-    # requesting leaves already reach is a leftover, as the roster test says
-    # of a `requesting:` entry.
+    # requesting leaves already reach is a leftover: the case's check has
+    # landed and the key has nothing left to stand in for.
     # The YAML value and scripts/eval_rosters.py's text read of the same key
     # have to agree: YAML 1.1 reads `0x2`, `+2`, `1_0` and `010` as integers
     # and `2#c` as a string, and a line at column 0 inside a quoted scalar is
