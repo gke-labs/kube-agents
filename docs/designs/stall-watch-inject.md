@@ -141,7 +141,8 @@ used only when it matches the profile-name pattern.
 ### 3.9 Credentials outlive the tick, and a short tick says what it covered
 
 Every `gcloud`, `kubectl` and `stall_report.py` call the watch makes goes through the credential
-proxy, and a `get-credentials` there is a real gcloud run each time, while kubectl is served from
+proxy, and a `get-credentials` there is a real gcloud run each time (with the kube-api proxy in use,
+one relay read instead, #5447), while kubectl is served from
 the proxy's own managed kubeconfig: of the per-cluster file only the context name crosses, and the
 proxy regenerates the rest. So the watch
 fetches a cluster's credentials once, records the time in its ledger (`credentials`), and reuses
