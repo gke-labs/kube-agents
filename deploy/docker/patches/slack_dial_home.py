@@ -18,6 +18,13 @@ only when the record's ``kinds`` turns it on; this page never sets ``kinds``, so
 the list here is read-only. Nothing reads the level yet, so the tab says it is
 recorded only.
 
+Each kind also shows its progress toward the auto-merge offer: "3 of 5 clean
+merges", read from Session KV's ``GET`` :data:`CLEAN_MERGES_PATH` (the counter in
+``agents/platform/scripts/clean_merges.py``) each time the tab is drawn. A kind
+with no records is 0; enough merges that the counter does not yet call
+``ready`` (too few days) says how many days; a read that fails says the count is
+unavailable rather than showing 0.
+
 Who sees it and who may change it
 ---------------------------------
 Only a member the adapter would answer (``_is_interactive_user_authorized``,
@@ -42,11 +49,13 @@ be read is never overwritten. Writes are atomic.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import tempfile
 import time
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -69,8 +78,17 @@ LEVEL_TITLES = {value: title for value, title, _description in LEVELS}
 DEFAULT_LEVEL = "propose"
 AUTOMERGE_LEVEL = "automerge"
 
-#: ``(kind, title, environment)`` for each kind of fix the dial lists.
-FIX_KINDS = (("missing-pdb", "Disruption budgets", "dev"),)
+#: ``(kind, title, environment)`` for each kind of fix the dial lists. The kind
+#: is the audit's check id, the key the clean-merge counter uses.
+FIX_KINDS = (("no-pdb", "Disruption budgets", "dev"),)
+
+#: The Session KV server's loopback address and key, as ``kanban_origin``
+#: spells them, and the clean-merge counter's route.
+SESSION_KV_URL = "http://127.0.0.1:8699"
+SESSION_KV_KEY_ENV = "SESSION_KV_API_KEY"
+CLEAN_MERGES_PATH = "/v1/post-merge/clean-merges"
+#: Drawing the tab waits at most this long for the count.
+CLEAN_MERGES_TIMEOUT_SECONDS = 2.0
 
 TITLE = "What it may change"
 OFF = "The autonomy dial is off on this install."
@@ -82,6 +100,9 @@ NOT_ENFORCED = "Recorded only: the agent does not act on this setting yet."
 SET_BY = "Set to *{title}* by <@{user}>"
 KIND_ON = "auto-merges"
 KIND_OFF = "off"
+PROGRESS = "{clean} of {needed} clean merges"
+PROGRESS_DAYS = "{clean} of {needed} clean merges, on {days} of {days_needed} days"
+PROGRESS_UNKNOWN = "clean merges unavailable"
 MARK_ON = "●"
 MARK_OFF = "○"
 SLACK_TIME = "<!date^{epoch}^{{date_short_pretty}} {{time}}|{fallback}>"
@@ -192,6 +213,41 @@ async def is_admin(adapter: Any, user_id: str) -> bool | None:
     return bool(user.get("is_admin") or user.get("is_owner") or user.get("is_primary_owner"))
 
 
+def read_track_record() -> dict | None:
+    """The counter's answer from Session KV; None when it cannot be read."""
+    token = (os.environ.get(SESSION_KV_KEY_ENV) or "").strip()
+    if not token:
+        logger.warning("slack_dial_home: no %s; not showing clean merges", SESSION_KV_KEY_ENV)
+        return None
+    request = urllib.request.Request(SESSION_KV_URL + CLEAN_MERGES_PATH, headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(request, timeout=CLEAN_MERGES_TIMEOUT_SECONDS) as response:
+            record = json.loads(response.read() or b"{}")
+    except Exception as exc:  # noqa: BLE001 — the tab says the count is unavailable
+        logger.warning("slack_dial_home: could not read the clean merges: %r", exc)
+        return None
+    if not (isinstance(record, dict) and isinstance(record.get("kinds"), dict)
+            and isinstance(record.get("clean_merges_needed"), int)
+            and isinstance(record.get("days_needed"), int)):
+        logger.warning("slack_dial_home: the clean merges answer has an unexpected shape")
+        return None
+    return record
+
+
+def progress(record: dict | None, kind: str) -> str:
+    """``kind``'s progress toward the offer, e.g. "3 of 5 clean merges"."""
+    if record is None:
+        return PROGRESS_UNKNOWN
+    entry = record["kinds"].get(kind)
+    entry = entry if isinstance(entry, dict) else {}
+    needed, days_needed = record["clean_merges_needed"], record["days_needed"]
+    clean = entry.get("clean") if isinstance(entry.get("clean"), int) else 0
+    days = entry.get("days") if isinstance(entry.get("days"), int) else 0
+    if clean >= needed and entry.get("ready") is not True:
+        return PROGRESS_DAYS.format(clean=needed, needed=needed, days=days, days_needed=days_needed)
+    return PROGRESS.format(clean=min(clean, needed), needed=needed)
+
+
 def _section(text: str) -> dict:
     return {"type": "section", "text": {"type": "mrkdwn", "text": text}}
 
@@ -208,8 +264,8 @@ def _option(value: str, title: str, description: str) -> dict:
     }
 
 
-def blocks(state: dict, can_change: bool, note: str = "") -> list[dict]:
-    """The dial: the levels (a radio for an admin, marks otherwise), the kinds, who set it."""
+def blocks(state: dict, can_change: bool, note: str = "", record: dict | None = None) -> list[dict]:
+    """The dial: the levels (a radio for an admin, marks otherwise), the kinds and their clean merges, who set it."""
     level = state["level"]
     out = [_section(f"*{TITLE}*")]
     if can_change:
@@ -229,7 +285,7 @@ def blocks(state: dict, can_change: bool, note: str = "") -> list[dict]:
             out.append(_section(f"{mark}  *{title}*\n{description}"))
     for kind, title, environment in FIX_KINDS:
         on = level == AUTOMERGE_LEVEL and state["kinds"].get(kind, False)
-        out.append(_context(f"{title} ({environment}) · {KIND_ON if on else KIND_OFF}"))
+        out.append(_context(f"{title} ({environment}) · {KIND_ON if on else KIND_OFF} · {progress(record, kind)}"))
     footer = [NOT_ENFORCED]
     if state["set_by"]:
         line = SET_BY.format(title=LEVEL_TITLES[level], user=state["set_by"])
@@ -281,7 +337,8 @@ async def publish(adapter: Any, team_id: str, user_id: str, note: str = "") -> N
         view_blocks = [_section(DENIED)]
     else:
         admin = await is_admin(adapter, user_id)
-        view_blocks = blocks(read_state(), admin is True, note or (NOT_CHECKED if admin is None else ""))
+        record = await asyncio.to_thread(read_track_record)
+        view_blocks = blocks(read_state(), admin is True, note or (NOT_CHECKED if admin is None else ""), record)
     try:
         await client.views_publish(user_id=user_id, view={"type": "home", "blocks": view_blocks})
     except Exception as exc:  # noqa: BLE001 — the tab stays as it was

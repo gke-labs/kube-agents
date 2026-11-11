@@ -24,8 +24,9 @@ A kind is ``ready`` with :data:`CLEAN_MERGES_NEEDED` clean merges on at least
 Records are per install, so the count is too.
 
 ``session_kv_server.py`` serves :func:`track_record` as
-``GET /v1/post-merge/clean-merges``. No HTTP here. It reads and never writes,
-and nothing user-visible depends on it until a caller does.
+``GET /v1/post-merge/clean-merges``. No HTTP here. It reads and never writes.
+The Slack autonomy dial (``deploy/docker/patches/slack_dial_home.py``, behind
+``KUBEAGENTS_DIAL``) shows each kind's count from that route.
 """
 
 from __future__ import annotations

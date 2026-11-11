@@ -112,6 +112,7 @@ class RuntimeTest(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         os.environ.pop(dial.ADMINS_ENV, None)
+        os.environ.pop(dial.SESSION_KV_KEY_ENV, None)
         dial._dm_channels.clear()
         self.adapter = verify._Adapter(
             {"UADMIN", "UMEMBER", "UOWNER", "UGUEST"},
@@ -192,10 +193,10 @@ class RuntimeTest(unittest.TestCase):
     def test_kind_auto_merges_only_at_the_auto_merge_level(self):
         path = Path(self.home) / dial.STATE_NAME
         path.parent.mkdir(parents=True)
-        path.write_text(json.dumps({"level": "propose", "kinds": {"missing-pdb": True}}))
+        path.write_text(json.dumps({"level": "propose", "kinds": {"no-pdb": True}}))
         self.assertIn("Disruption budgets (dev) · off", shown(dial.blocks(dial.read_state(), False)))
         self.pick("UADMIN", "automerge")
-        self.assertEqual(dial.read_state()["kinds"], {"missing-pdb": True})
+        self.assertEqual(dial.read_state()["kinds"], {"no-pdb": True})
         self.assertIn("Disruption budgets (dev) · auto-merges", shown(self.published()))
 
     def test_unreadable_record_is_the_default(self):
@@ -230,10 +231,10 @@ class RuntimeTest(unittest.TestCase):
     def test_pick_keeps_keys_it_does_not_own(self):
         path = Path(self.home) / dial.STATE_NAME
         path.parent.mkdir(parents=True)
-        path.write_text(json.dumps({"level": "propose", "kinds": {"missing-pdb": {"env": "dev"}}, "extra": 1}))
+        path.write_text(json.dumps({"level": "propose", "kinds": {"no-pdb": {"env": "dev"}}, "extra": 1}))
         self.pick("UADMIN", "explain")
         stored = json.loads(path.read_text())
-        self.assertEqual(stored["kinds"], {"missing-pdb": {"env": "dev"}})
+        self.assertEqual(stored["kinds"], {"no-pdb": {"env": "dev"}})
         self.assertEqual((stored["extra"], stored["level"]), (1, "explain"))
 
     def test_unreadable_record_is_never_overwritten(self):
@@ -264,6 +265,68 @@ class RuntimeTest(unittest.TestCase):
         self.pick("UADMIN", "explain")
         self.assertEqual(seen, ["D42", "D42", "D42"])
 
+
+    def test_kind_shows_its_clean_merges_from_the_counter(self):
+        record = {"kinds": {"no-pdb": {"clean": 3, "days": 2}}, "clean_merges_needed": 5, "days_needed": 2}
+        with mock.patch.object(dial, "read_track_record", return_value=record):
+            run(dial.opened(self.adapter, {"user": "UMEMBER"}))
+        self.assertIn("Disruption budgets (dev) · off · 3 of 5 clean merges", shown(self.published()))
+
+    def test_progress_wording(self):
+        needed = {"clean_merges_needed": 5, "days_needed": 2}
+        for kinds, expected in (
+            ({}, "0 of 5 clean merges"),
+            ({"no-pdb": {"clean": 5, "days": 1, "ready": False}}, "5 of 5 clean merges, on 1 of 2 days"),
+            ({"no-pdb": {"clean": 7, "days": 3, "ready": True}}, "5 of 5 clean merges"),
+            ({"no-pdb": "garbage"}, "0 of 5 clean merges"),
+        ):
+            self.assertEqual(dial.progress({"kinds": kinds, **needed}, "no-pdb"), expected, kinds)
+        self.assertEqual(dial.progress(None, "no-pdb"), dial.PROGRESS_UNKNOWN)
+
+    def test_track_record_read_from_session_kv(self):
+        answer = {"kinds": {}, "clean_merges_needed": 5, "days_needed": 2}
+        seen = []
+
+        class Response:
+            def __init__(self, body):
+                self.body = body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return self.body
+
+        def urlopen(request, timeout):
+            seen.append((request.full_url, request.get_header("Authorization"), timeout))
+            return Response(json.dumps(answer).encode())
+
+        with mock.patch.dict(os.environ, {dial.SESSION_KV_KEY_ENV: "k"}), \
+                mock.patch.object(dial.urllib.request, "urlopen", urlopen):
+            self.assertEqual(dial.read_track_record(), answer)
+            self.assertEqual(seen, [("http://127.0.0.1:8699/v1/post-merge/clean-merges", "Bearer k", 2.0)])
+            for body in (b"[]", b"{}", b'{"kinds": {}}', b"not json"):
+                with mock.patch.object(dial.urllib.request, "urlopen", lambda r, timeout: Response(body)):
+                    self.assertIsNone(dial.read_track_record(), body)
+
+            def refused(request, timeout):
+                raise OSError("connection refused")
+
+            with mock.patch.object(dial.urllib.request, "urlopen", refused):
+                self.assertIsNone(dial.read_track_record())
+
+    def test_no_key_shows_the_count_unavailable(self):
+        os.environ.pop(dial.SESSION_KV_KEY_ENV, None)
+        run(dial.opened(self.adapter, {"user": "UADMIN"}))
+        self.assertIn(dial.PROGRESS_UNKNOWN, shown(self.published()))
+
+    def test_stranger_does_not_trigger_a_count_read(self):
+        with mock.patch.object(dial, "read_track_record") as read:
+            run(dial.opened(self.adapter, {"user": "USTRANGER"}))
+        read.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()
