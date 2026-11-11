@@ -115,9 +115,11 @@ BASE64_QUANTUM_CHARS = 4
 BASE64_PADDING_CHAR = "="
 BASE64_DECODED_TEXT_WHITESPACE = "\n\r\t"
 BASE64_DECODED_TEXT_ENCODING = "utf-8"
-# The separator a `NAME=value` token is rescanned on, and the whitespace an
-# indent or a line's tail is made of.
+# The separator a `NAME=value` token is rescanned on, the blank the masking
+# fold joins an even backslash run's lines with, and the whitespace an indent
+# or a line's tail is made of.
 EQUALS_SEPARATOR = "="
+SHELL_MASK_JOIN = " "
 INDENT_CHAR = " "
 INLINE_WHITESPACE = " \t"
 LINE_BREAK = "\n"
@@ -293,6 +295,14 @@ INLINE_JSON_OBJECT_RE = re.compile(r"\{[^{}]+\}")
 # continuation is kept (group 1). A backslash before a CR escapes the CR, and
 # the LF after it still ends the command, so CRLF is no continuation either.
 SHELL_CONTINUATION_RE = re.compile(r"(?<!\\)((?:\\\\)*)\\\n")
+# The masking path reads every backslash run before a line break. An odd run
+# before an LF folds as bash does (above); an even run, or a run before CRLF,
+# folds as this file did before it counted backslashes: the last backslash,
+# the break and the indentation become a space. Bash ends the command there,
+# but a nested `bash -c "…"` halves the run inside double quotes and continues
+# the line, so the credential rules read it joined: masking a value too many is
+# harmless, and missing one is not.
+SHELL_BREAK_RUN_RE = re.compile(r"(?<!\\)(\\+)(\r?\n)([ \t]*)")
 # The tool-call argument keys that carry a shell command, in the order
 # `is_secret_read_tool_call` and `scrub_step_text` read them.
 COMMAND_ARG_KEYS = ("command", "cmd")
@@ -1007,11 +1017,19 @@ def fold_shell_continuations(command: str) -> str:
     return SHELL_CONTINUATION_RE.sub(lambda match: match.group(1), command)
 
 
+def _fold_for_masking(match: re.Match) -> str:
+    run, line_break, indent = match.groups()
+    if len(run) % 2 and line_break == "\n":
+        return run[:-1] + indent
+    return run[:-1] + SHELL_MASK_JOIN
+
+
 def fold_shell_command(command: str) -> str:
-    """A command as the shell would read it: a backslash-newline continuation
-    joined to its line, and an escaped space folded to one token character
-    (`SHELL_ESCAPED_SPACE_FOLD`, unfolded by `blank_named_values`)."""
-    return fold_shell_continuations(command).replace(SHELL_ESCAPED_SPACE, SHELL_ESCAPED_SPACE_FOLD)
+    """A command as the credential rules read it: a backslash-newline
+    continuation joined to its line (an even run or a CRLF joined with a space,
+    see `SHELL_BREAK_RUN_RE`), and an escaped space folded to one token
+    character (`SHELL_ESCAPED_SPACE_FOLD`, unfolded by `blank_named_values`)."""
+    return SHELL_BREAK_RUN_RE.sub(_fold_for_masking, command).replace(SHELL_ESCAPED_SPACE, SHELL_ESCAPED_SPACE_FOLD)
 
 
 def scrub_step_text(redactor: Any, kind: str, text: str, withheld: str) -> str:

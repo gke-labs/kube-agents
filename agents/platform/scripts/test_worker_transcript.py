@@ -163,9 +163,28 @@ class TestScrubStepText(unittest.TestCase):
         self.assertEqual(fold("a\\\\\\\n  b"), "a\\\\  b")
         self.assertEqual(fold("a\\\\\\\\\n  b"), "a\\\\\\\\\n  b")
         self.assertEqual(fold("a\\\r\nb"), "a\\\r\nb")
-        # A stored call keeps the line break after an even run.
+        # The masking fold joins an even run's lines with a space, as the file
+        # did before it counted backslashes, so the stored call shows `\ `.
         stored = json.loads(_scrub("tool_call", json.dumps({"command": "grep -rn\\\\\nU=x\ncurl \"$U\""})))["command"]
-        self.assertEqual(stored, "grep -rn\\\\\nU=x\ncurl \"$U\"")
+        self.assertEqual(stored, "grep -rn\\ U=x\ncurl \"$U\"")
+
+    def test_masking_joins_an_even_run_or_a_crlf_as_before(self):
+        # A nested `bash -c "…"` halves an even run inside double quotes and
+        # continues the line, so the credential rules read every run joined;
+        # an extra mask is harmless, and a missed one is not.
+        for cmd in (
+            'bash -c "mysql -h db --password \\\\\nhunter2"',
+            "curl -u \\\\\nadmin:hunter2 https://x",
+            "mysql --password \\\r\nhunter2",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertNotIn("hunter2", _scrub("tool_call", json.dumps({"command": cmd})))
+        # Detection still reads only an odd run before an LF as a continuation.
+        self.assertTrue(worker_transcript.command_reads_a_secret("echo done\\\\\nkubectl get secret db -o yaml"))
+        # Runs of 5 and 6 backslashes, past the pairs the other tests cover.
+        fold = worker_transcript.fold_shell_continuations
+        self.assertEqual(fold("a" + "\\" * 5 + "\nb"), "a" + "\\" * 4 + "b")
+        self.assertEqual(fold("a" + "\\" * 6 + "\nb"), "a" + "\\" * 6 + "\nb")
 
     def test_a_continuation_inside_a_word_joins_the_word(self):
         # The fold used to put a space where bash puts nothing, so a word split
