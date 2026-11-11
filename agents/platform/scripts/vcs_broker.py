@@ -62,15 +62,21 @@ forge shares and Gerrit's unit of review is a single revision.
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import os
 import re
 import subprocess
+import tarfile
 import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
+
+import yaml
+
+import okf_guard
 
 from providers import (
     CliTransport,
@@ -134,6 +140,14 @@ _SHORT_REF_PREFIXES = ("refs/heads/", "heads/")
 # `refs/heads/` so nothing here can be confused with a branch, and so a publish
 # of a leftover ref cannot happen by naming a plausible branch.
 _INCOMING = "refs/vcs/incoming"
+DECISION_MEMORY_BLOCKED = "DECISION_MEMORY_BLOCKED"
+DECISION_MEMORY_CHECK_FAILED = "DECISION_MEMORY_CHECK_FAILED"
+DECISION_MEMORY_HEADING = "### Prior decisions and lessons"
+DECISION_OVERRIDE_PREFIX = "decision-override:"
+FORBIDDEN_LABEL = "FORBIDDEN_LABEL"
+CURATOR_BIN_PATHS = ("/usr/local/bin/curator", "/opt/defaults/bin/curator")
+CURATOR_CHECK_TIMEOUT_SECONDS = 30
+DM_MAX_GUARD_FILE_BYTES = 4 << 20  # 4 MiB ceiling per inspected text/YAML file
 
 # What `git ls-remote --exit-code` exits with when the remote answered and holds
 # no matching ref; any other failure is a remote it could not ask.
@@ -1725,11 +1739,277 @@ class VcsBroker:
                     status=409,
                     code="BRANCH_DIVERGED",
                 )
+            policy_branch = (
+                self._pinned_base(bound.forge, bound.repo)
+                or self._default_branch_of_remote(git, root, self._tls_refusal)
+            )
+            policy_branch = _short_ref(policy_branch) if policy_branch else ""
+            if not policy_branch or policy_branch == target:
+                policy_base_rev = remote_target
+            else:
+                fetched_policy = git(
+                    root, "fetch", "--quiet", "--no-tags", "origin", policy_branch, check=False,
+                )
+                if fetched_policy.returncode == 0:
+                    policy_base_rev = git(root, "rev-parse", "FETCH_HEAD").stdout.strip()
+                else:
+                    policy_base_rev = remote_target
+            dm_markdown = self._check_decision_memory_on_publish(
+                git,
+                root,
+                policy_base_rev,
+                tip,
+            )
             git(root, "push", "origin", f"{_INCOMING}:refs/heads/{branch}")
         finally:
             bundle.unlink(missing_ok=True)
             self._discard_scratch(root)
-        return bound.stamp({"branch": branch, "revision": tip})
+        result: dict[str, Any] = {"branch": branch, "revision": tip}
+        if dm_markdown:
+            result["decisionMemoryMarkdown"] = dm_markdown
+        return bound.stamp(result)
+
+    def _resolve_curator_bin(self) -> str | None:
+        env_bin = os.environ.get("CURATOR_BIN", "").strip()
+        if env_bin and os.path.isfile(env_bin) and os.access(env_bin, os.X_OK):
+            return env_bin
+        for p in CURATOR_BIN_PATHS:
+            if os.path.isfile(p) and os.access(p, os.X_OK):
+                return p
+        return None
+
+    @staticmethod
+    def _extract_revision_paths_to_dir(
+        git: Callable,
+        root: Path,
+        rev: str,
+        paths: list[str],
+        out_dir: Path,
+        scratch_dir: Path,
+    ) -> dict[str, str]:
+        """Materialize `paths` at `rev` into `out_dir` via `git archive` without checkout.
+
+        Uses `git archive --output` instead of stdout capture so binary files and
+        non-UTF-8 bytes never pass through the text-mode git runner, and writes
+        `SNAPSHOT_ATTRIBUTES` to `.git/info/attributes` so repository `.gitattributes`
+        rules (`export-ignore`, `export-subst`, `working-tree-encoding`) cannot hide
+        or alter guarded manifests.
+        """
+        extracted: dict[str, str] = {}
+        if not paths:
+            return extracted
+        attrs = root / ".git" / SNAPSHOT_ATTRIBUTES_FILE
+        attrs.parent.mkdir(parents=True, exist_ok=True)
+        attrs.write_text(SNAPSHOT_ATTRIBUTES, encoding="utf-8")
+
+        tar_path = scratch_dir / "extract.tar"
+        for idx in range(0, len(paths), MAX_SNAPSHOT_PATHS):
+            chunk = paths[idx : idx + MAX_SNAPSHOT_PATHS]
+            tar_path.unlink(missing_ok=True)
+            written = git(
+                root,
+                "--literal-pathspecs",
+                "archive",
+                "--format=tar",
+                f"--output={tar_path}",
+                rev,
+                "--",
+                *chunk,
+                check=False,
+            )
+            if written.returncode != 0 or not tar_path.is_file():
+                tar_path.unlink(missing_ok=True)
+                continue
+            try:
+                with tarfile.open(tar_path, "r:") as tf:
+                    for member in tf:
+                        if not member.isfile():
+                            continue
+                        try:
+                            rel = validate_path(member.name)
+                        except WorkspaceError:
+                            continue
+                        dest = out_dir / rel
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        if member.size > DM_MAX_GUARD_FILE_BYTES:
+                            dest.write_bytes(b"")
+                            extracted[rel] = ""
+                            continue
+                        fobj = tf.extractfile(member)
+                        raw_bytes = fobj.read(DM_MAX_GUARD_FILE_BYTES) if fobj is not None else b""
+                        dest.write_bytes(raw_bytes)
+                        extracted[rel] = raw_bytes.decode("utf-8", errors="replace")
+            finally:
+                tar_path.unlink(missing_ok=True)
+        return extracted
+
+    def _check_decision_memory_on_publish(
+        self,
+        git: Callable,
+        root: Path,
+        policy_base_rev: str,
+        tip: str,
+    ) -> str:
+        """Run the out-of-sandbox OKF guard check against base-branch `knowledge/`.
+
+        Reads `knowledge/` and `.kube-agents/intent.yaml` strictly from `policy_base_rev`
+        (the operator-pinned `baseBranch` or remote default branch on `origin`, never a
+        caller-supplied `target`) via `git ls-tree` and `git archive` without checking out
+        the repository, and accepts no sandbox-supplied override parameter.
+        """
+        tree_ls = git(
+            root, "--literal-pathspecs", "ls-tree", "-r", "--name-only", policy_base_rev, "--",
+            "knowledge", ".kube-agents/intent.yaml", check=False,
+        )
+        base_knowledge_files = [
+            validate_path(line.strip())
+            for line in (tree_ls.stdout or "").splitlines()
+            if line.strip() and line.strip().endswith((".md", ".yaml", ".yml"))
+        ]
+        if not base_knowledge_files:
+            return ""
+
+        diff_ns = git(
+            root, "diff", "--no-renames", "--name-status", f"{policy_base_rev}...{tip}", check=False,
+        )
+        changed_paths: list[tuple[str, str]] = []
+        for line in (diff_ns.stdout or "").splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 2:
+                changed_paths.append((parts[0].strip(), parts[-1].strip()))
+        if not changed_paths:
+            return ""
+
+        check_dir = self._scratch("dmcheck")
+        try:
+            k_root = check_dir / "base"
+            w_root = check_dir / "head"
+            k_root.mkdir(parents=True, exist_ok=True)
+            w_root.mkdir(parents=True, exist_ok=True)
+
+            self._extract_revision_paths_to_dir(
+                git, root, policy_base_rev, base_knowledge_files, k_root, check_dir,
+            )
+
+            intent_file = k_root / ".kube-agents" / "intent.yaml"
+            if intent_file.is_file():
+                try:
+                    intent_doc = yaml.safe_load(
+                        intent_file.read_text(encoding="utf-8", errors="replace")
+                    )
+                except yaml.YAMLError:
+                    intent_doc = None
+                raw_paths = intent_doc.get("paths") if isinstance(intent_doc, dict) else None
+                if isinstance(raw_paths, list):
+                    extra_files: list[str] = []
+                    for entry in raw_paths:
+                        cleaned = str(entry or "").strip().strip("/")
+                        if not cleaned:
+                            continue
+                        try:
+                            safe_prefix = validate_path(cleaned)
+                        except WorkspaceError:
+                            continue
+                        extra_ls = git(
+                            root, "--literal-pathspecs", "ls-tree", "-r", "--name-only",
+                            policy_base_rev, "--", safe_prefix, check=False,
+                        )
+                        for erel in (extra_ls.stdout or "").splitlines():
+                            erel = erel.strip()
+                            if not erel or not erel.endswith((".md", ".yaml", ".yml")):
+                                continue
+                            try:
+                                extra_files.append(validate_path(erel))
+                            except WorkspaceError:
+                                continue
+                    if extra_files:
+                        self._extract_revision_paths_to_dir(
+                            git, root, policy_base_rev, extra_files, k_root, check_dir,
+                        )
+
+            rel_args: list[str] = []
+            non_deleted: list[str] = []
+            deleted_set: set[str] = set()
+            for status, raw_rel in changed_paths:
+                rel = validate_path(raw_rel)
+                rel_args.append(rel)
+                if status.startswith("D"):
+                    deleted_set.add(rel)
+                else:
+                    non_deleted.append(rel)
+
+            extracted_head = self._extract_revision_paths_to_dir(
+                git, root, tip, non_deleted, w_root, check_dir,
+            )
+            changed_map: dict[str, str | None] = {}
+            for rel in rel_args:
+                if rel in deleted_set:
+                    changed_map[rel] = None
+                else:
+                    changed_map[rel] = extracted_head.get(rel)
+
+            curator_bin = self._resolve_curator_bin()
+            if curator_bin:
+                cmd = [
+                    curator_bin,
+                    "check",
+                    "--repo",
+                    str(w_root),
+                    "--knowledge-repo",
+                    str(k_root),
+                    "--",
+                    *rel_args,
+                ]
+                res = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=CURATOR_CHECK_TIMEOUT_SECONDS,
+                )
+                if res.returncode not in (0, 2) or not (res.stdout or "").strip():
+                    detail = (res.stderr or res.stdout or f"exit code {res.returncode}").strip()
+                    raise WorkspaceError(
+                        f"Decision Memory Overseer check failed against base branch: {detail}",
+                        status=409,
+                        code=DECISION_MEMORY_CHECK_FAILED,
+                    )
+                try:
+                    out = json.loads(res.stdout)
+                except ValueError as exc:
+                    raise WorkspaceError(
+                        f"Decision Memory Overseer returned invalid JSON: {exc}",
+                        status=500,
+                        code=DECISION_MEMORY_CHECK_FAILED,
+                    ) from exc
+            else:
+                try:
+                    out = okf_guard.check_changed_files(k_root, changed_map)
+                except ValueError as exc:
+                    raise WorkspaceError(
+                        f"Decision Memory Overseer check failed against base branch: {exc}",
+                        status=409,
+                        code=DECISION_MEMORY_CHECK_FAILED,
+                    ) from exc
+
+            markdown = str(out.get("markdown") or "") if out.get("findings") else ""
+            if out.get("verdict") == "block":
+                msg = (
+                    "DECISION MEMORY OVERSEER BLOCKED THIS CHANGE:\n\n"
+                    f"{markdown}\n\n"
+                    "Do NOT open this Pull Request. In your final response, quote the "
+                    "record IDs (DEC-... / LES-...), Breaking PR (#...), Incident Issue (#...), "
+                    "Revert/Fix PR (#...), and the technical root-cause details verbatim."
+                )
+                raise WorkspaceError(
+                    msg,
+                    status=409,
+                    code=DECISION_MEMORY_BLOCKED,
+                    detail=markdown,
+                )
+            return markdown
+        finally:
+            self._discard_scratch(check_dir)
 
     def branch_view(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Whether `branch` exists on the remote, and at which revision.
@@ -2283,7 +2563,26 @@ class VcsBroker:
         method = getattr(bound.forge, verb.replace("-", "_"))
         return bound.stamp(method(bound.api, bound.repo, payload))
 
+    @staticmethod
+    def _refuse_decision_override_labels(payload: dict[str, Any]) -> None:
+        """Refuse agent attempts to create or apply `decision-override:*` labels."""
+        candidates: list[Any] = []
+        if "name" in payload:
+            candidates.append(payload.get("name"))
+        for field in ("labels", "labelsAdd"):
+            vals = payload.get(field)
+            if isinstance(vals, list):
+                candidates.extend(vals)
+        for item in candidates:
+            if isinstance(item, str) and item.strip().casefold().startswith(DECISION_OVERRIDE_PREFIX):
+                raise WorkspaceError(
+                    f"label {item.strip()!r} is reserved for human reviewers on the forge and cannot be set by an agent.",
+                    status=403,
+                    code=FORBIDDEN_LABEL,
+                )
+
     def proposal_create(self, payload):
+        self._refuse_decision_override_labels(payload)
         return self._forge_verb("proposal-create", payload, pinned_target=True)
 
     def proposal_claim(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -2347,6 +2646,7 @@ class VcsBroker:
         return self._forge_verb("proposal-comment", payload)
 
     def issue_create(self, payload):
+        self._refuse_decision_override_labels(payload)
         return self._forge_verb("issue-create", payload)
 
     def issue_list(self, payload):
@@ -2363,6 +2663,7 @@ class VcsBroker:
         # `target` that reaches one is held to the same pinned base as
         # `proposal-create`, and the rule stays true the day an adapter learns
         # to retarget.
+        self._refuse_decision_override_labels(payload)
         return self._forge_verb(
             "proposal-update", payload,
             pinned_target=payload.get("target") is not None,
@@ -2378,12 +2679,14 @@ class VcsBroker:
         return self._forge_verb("proposal-acknowledge", payload)
 
     def issue_update(self, payload):
+        self._refuse_decision_override_labels(payload)
         return self._forge_verb("issue-update", payload)
 
     def issue_close(self, payload):
         return self._forge_verb("issue-close", payload)
 
     def label_ensure(self, payload):
+        self._refuse_decision_override_labels(payload)
         return self._forge_verb("label-ensure", payload)
 
     def identity(self, payload: dict[str, Any]) -> dict[str, Any]:
