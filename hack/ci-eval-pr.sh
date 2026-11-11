@@ -4449,11 +4449,13 @@ unit_cost_hint() {
     gce-startup-script-failure | networking-world-open-ingress) echo 900 ;;
     obtainability-pdb-kustomize-overlay) echo 900 ;;
     # The stockout audit of stockout-pinned-pool, registered 2026-11-10
-    # unmeasured, in that case's band. Its stack plants one Config Connector
-    # object and one GitOps file; the plant and the teardown can wait up to
-    # about 15 minutes together (CONTEXT_WAIT_S, READY_WAIT_S,
-    # DELETE_TIMEOUT_S and NAMESPACE_WAIT_S in its plant.py).
-    fleet-audit-manifest-fix-names-stalled-config-connector) echo 900 ;;
+    # unmeasured, plus a stack that plants one Config Connector object and
+    # one GitOps file. The plant and the teardown can wait up to about 15
+    # minutes together (CONTEXT_WAIT_S, READY_WAIT_S, DELETE_TIMEOUT_S and
+    # NAMESPACE_WAIT_S in its plant.py), so the hint is the 900s band plus
+    # those 900s. writes_alone, so it orders the case only among the second
+    # phase's units.
+    fleet-audit-manifest-fix-names-stalled-config-connector) echo 1800 ;;
     fleet-cost-idle-pool) echo 900 ;;
     # A plain chat request that runs the compliance collector's sweep (#2386):
     # the audit band, without the ledger write.

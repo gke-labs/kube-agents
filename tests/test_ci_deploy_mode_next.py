@@ -937,7 +937,7 @@ class TasksBudgetSizingTest(unittest.TestCase):
         self.assertNotIn("alertExclude", block.group(1), "set on every lane, not the next lane alone")
         root = _CI_DEPLOY.parent.parent
         self.assertIn('kcc_namespace: "eval-kcc-stalled"', (root / "bench/tasks/fleet-audit-manifest-fix-names-stalled-config-connector/task.yaml").read_text())
-        self.assertIn('"DependencyNotFound",', (root / "k8s-operator/cmd/k8s-event-watcher/filter.go").read_text())
+        self.assertIn('"DependencyNotFound"', (root / "k8s-operator/cmd/k8s-event-watcher/filter.go").read_text())
         self.assertIn("DependencyNotFound", (root / "deploy/shared/start-services.sh").read_text())
 
     def test_the_first_change_carries_the_mode_and_the_sized_max_sessions_before_the_first_job_wait(self) -> None:

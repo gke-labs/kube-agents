@@ -32,11 +32,11 @@ What goes, and what stays:
   keeps branches in.
 * a file in planted_stack_files() on the default branch that carries the
   stack label (`managed-by: kube-agents-bench` on a line of its own, as YAML
-  or as a JSON member). There are two entries. One is the Kustomize root that
+  or as a JSON member). planted_stack_files() names the Kustomize root that
   bench/tf/prebuilt/kustomize-overlay-declaration plants for
   obtainability-pdb-kustomize-overlay; a leftover makes
   obtainability-major-pdb-auto-pr's fix manual on that project at every run.
-  The other is the Config Connector declaration that
+  It also names the Config Connector declaration that
   bench/tf/prebuilt/kcc-stalled-declaration plants for
   fleet-audit-manifest-fix-names-stalled-config-connector, at
   clusters/<seeded-a cluster>/provisioning/pinned-inference-pool.yaml; a

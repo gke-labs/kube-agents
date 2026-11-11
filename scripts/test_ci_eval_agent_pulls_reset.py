@@ -455,7 +455,9 @@ class PlantedConfigConnectorDeclarationTest(unittest.TestCase):
         self.assertEqual(helper.KCC_DECLARATION_PATH, "clusters/{cluster}/provisioning/pinned-inference-pool.yaml")
         self.assertEqual(helper.planted_stack_files(), (PLANTED, KCC_PLANTED))
         self.assertIn('KCC_FLEET_SLOT="a"', SCRIPT.read_text(encoding="utf-8"))
-        self.assertIn('default     = "seeded"', (REPO_ROOT / "bench" / "tf" / "fleet" / "variables.tf").read_text())
+        prefix = re.search(r'variable "cluster_prefix" \{(.*?)\n\}', (REPO_ROOT / "bench" / "tf" / "fleet" / "variables.tf").read_text(), re.DOTALL)
+        self.assertIsNotNone(prefix, "the fleet's cluster_prefix variable")
+        self.assertRegex(prefix.group(1), r'default\s*=\s*"seeded"')
 
 
 class RetryTest(unittest.TestCase):

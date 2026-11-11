@@ -3,8 +3,9 @@
 # role, bench/tf/fleet/config-connector.tf), and the stack below plants on
 # that cluster. The fixture-state scan of 2026-11-10 read the role healthy on
 # all 40 pool projects. provisioning-kcc-cluster-without-crds-stops keeps
-# slot a out of its scope, so it still sees no Config Connector. A tofu case,
-# listed in hack/eval/nightly-main-d.txt.
+# slot a out of its scope, so it still sees no Config Connector. A tofu case
+# that declares writes_alone (below), so it runs in the nightly's writers
+# part (writers-a, on neither writers list).
 #
 # WHAT THIS GRADES. That a fix of a pool whose declaration Config Connector
 # does not apply says so in the ledger. The stockout collector reads Config
@@ -49,6 +50,16 @@
 # Isolation class: one namespace on the Config Connector cluster, one file on
 # the GitOps repository's default branch, read-only fleet sweep, GitOps-repo
 # write (the ledger).
+#
+# writes_alone. The stack writes the declaration to the GitOps repository's
+# default branch for the run. The lane runs this case alone in its second
+# phase, so no other unit's collector reads the planted file while it is
+# live, and the repository reset runs before each repetition and deletes a
+# declaration that a failed or killed teardown left
+# (hack/ci_reset_agent_pulls.py, planted_stack_files). A pull request that
+# the reply does not name is still charged to the case by the write
+# safeguard.
+writes_alone: true
 id: fleet-audit-manifest-fix-names-stalled-config-connector
 name: A stockout fix of a pool whose declaration Config Connector is not applying says so in the ledger
 prompt: >-
@@ -91,8 +102,8 @@ owner: dshnayder
 
 # The pool the declaration names is the hpa-saturated role's. The stack plants
 # on the cluster of the config-connector-namespaced role. The drift gate
-# (bench/kube_agents_bench/fixture_drift.py) reads the singular fixture_role
-# of the last check, hpa-saturated; when Config Connector is not on seeded-a,
+# (bench/kube_agents_bench/fixture_drift.py) reads the singular fixture_role,
+# hpa-saturated; when Config Connector is not on seeded-a,
 # the plant stops at apply.
 fixtures:
   - hpa-saturated

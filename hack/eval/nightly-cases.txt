@@ -1133,9 +1133,12 @@
 # declaration to the GitOps repository with the stack write token; it removes
 # both at destroy. Fixture: hpa-saturated. The fixture-state scan of
 # 2026-11-10 reads config-connector-namespaced healthy on all 40 pool
-# projects. It has a stack and is not in infra_lock_exempt, so it holds the
-# infra lock; listed in nightly-main-d.txt, the shortest stack chain then.
-# Priced in the stockout audit's band. It has no FIXTURE_NOT_READY entry.
+# projects. writes_alone, because the stack writes to the GitOps repository's
+# default branch: it runs alone in the writers part (writers-a), after a
+# repository reset that deletes a declaration a failed teardown left. It has
+# a stack and is not in infra_lock_exempt, so it also holds the infra lock.
+# Priced at the stockout audit's band plus the stack's waits. It has no
+# FIXTURE_NOT_READY entry.
 ./tasks/fleet-audit-manifest-fix-names-stalled-config-connector/task.yaml
 
 # An on-demand audit that moved nothing still reports its ledger URL (#1929).
