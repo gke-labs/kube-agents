@@ -910,7 +910,7 @@ def headline_for(cases: list[dict], run: dict, incident: bool, has_incident: boo
                 "The harness stopped waiting before any worker delivered; that is the eval's wait, not a verdict on your change." + held_note,
                 VERDICT_INFRA,
             )
-        if ungraded and not any(c["cls"] == CLS_STORM for c in ungraded):
+        if ungraded and all(c["cls"] in (CLS_CEILING, CLS_FIXTURE_DRIFT, CLS_FORGE) for c in ungraded):
             return (
                 "Nothing was graded: the repetitions hit the delegation ceiling, a drifted fixture or a forge outage.",
                 "None of them was lost to the quota storm, and none is a verdict on your change." + held_note,

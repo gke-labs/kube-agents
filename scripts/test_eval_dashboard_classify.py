@@ -281,6 +281,14 @@ class RepAndOutcomeTest(unittest.TestCase):
         self.assertNotIn("quota storm's shape", verdict["lede"])
         self.assertIn("forge outage", verdict["headline"])
 
+    def test_a_few_storm_reps_below_the_signature_keep_the_storm_headline(self):
+        """Unclassed ungraded cases (no storm signature, no declared storm) are
+        not the ceiling's, a fixture's or the forge's: the never-ran headline."""
+        names = sorted(ADMITTED)[:2]
+        target = run(1, 1, T0, tasks=[task(n, "i") for n in names], result="FAILURE")
+        verdict = classify_run(target, [target])
+        self.assertIn("lost before the agent ran", verdict["headline"])
+
     def test_nothing_graded_because_of_a_forge_outage_says_so(self):
         target = run(1, 1, T0, tasks=[task(n, "ggg") for n in sorted(ADMITTED)], result="FAILURE")
         verdict = classify_run(target, [target])

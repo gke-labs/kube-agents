@@ -1247,10 +1247,13 @@ function ungradedText(reps) {
   if (reps.fixture && !reps.infra && !reps.ceiling && !reps.forge) return `all ${total} not run: a seeded-fleet fixture this case needs had drifted on the leased project`;
   if (reps.ceiling && !reps.infra && !reps.forge) return `all ${total} hit the delegation ceiling with the worker still running`;
   if (reps.forge && !reps.infra && !reps.ceiling && !reps.fixture) return `all ${total} not graded: a forge read failed during grading`;
-  const fixture = reps.fixture ? `, ${reps.fixture} not run, fixture drifted` : "";
-  const forge = reps.forge ? `, ${reps.forge} not graded, forge unavailable` : "";
-  if (reps.ceiling) return `all ${total} ungraded: ${reps.infra} lost before grading, ${reps.ceiling} at the delegation ceiling${fixture}${forge}`;
-  if (reps.fixture || reps.forge) return `all ${total} ungraded: ${reps.infra} lost before grading${fixture}${forge}`;
+  // A mix: each kind that has repetitions, in lostText's order.
+  const parts = [];
+  if (reps.infra) parts.push(`${reps.infra} lost before grading`);
+  if (reps.ceiling) parts.push(`${reps.ceiling} at the delegation ceiling`);
+  if (reps.fixture) parts.push(`${reps.fixture} not run, fixture drifted`);
+  if (reps.forge) parts.push(`${reps.forge} not graded, forge unavailable`);
+  if (parts.length > 1) return `all ${total} ungraded: ${parts.join(", ")}`;
   return `all ${total} lost before grading`;
 }
 
