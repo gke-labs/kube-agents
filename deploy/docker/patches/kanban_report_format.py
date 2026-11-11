@@ -159,7 +159,8 @@ written), and splits anything past 4000 characters across messages:
   paragraph it may add one pipe table, a row per cluster, holding the finding
   each one rests on, with the sentences above it still inside the ceilings.
   Use `##` for sections only when the card asks for a list or a report's
-  sections; none of those three endings is that ask.
+  sections; on a yes-or-no or status card, none of those three endings is
+  that ask.
   Never `#` — the chat message already shows the card title, so an H1 renders
   as a second, duplicate banner — and no `###`: Google Chat flattens every
   level to bold, so a sub-level is invisible there. If you are triaging an

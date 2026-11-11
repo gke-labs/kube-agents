@@ -247,6 +247,8 @@ class StanzaTest(unittest.TestCase):
             flat,
         )
         self.assertNotIn("even when it ends", flat)
+        # A root-cause card ending "Report the findings." keeps its sections.
+        self.assertIn("on a yes-or-no or status card, none of those three endings is that ask.", flat)
 
     def test_the_question_budget_is_the_cases(self):
         """The stanza's question rule and ``chat-voice-answer-first`` name one budget.
