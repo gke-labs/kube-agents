@@ -185,7 +185,8 @@ WHITESPACE = re.compile(r"\s+")
 PARAM_DESCRIPTION = (
     "Optional. Every claim you present as verified, checked or confirmed, with "
     f"the command that proves it: at most {MAX_CLAIMS} claims. On a yes-or-no question or "
-    "a status check, leave it out and call nothing verified, unless the card asks for verified claims: "
+    'a status check, however the card ends ("report the findings", "report a summary", '
+    '"summarize"), leave it out and call nothing verified, unless the card asks for verified claims: '
     "the evidence it adds is a report's shape, not an answer's. "
     "Each item is "
     f"{{claim, command, excerpt}}: ``claim`` is one sentence (at most "

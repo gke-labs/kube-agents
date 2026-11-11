@@ -235,8 +235,18 @@ class StanzaTest(unittest.TestCase):
         # The same condition as verified_claims' tool description; a why-question keeps its claims.
         flat = " ".join(REPORT_FORMAT_STANZA.split())
         self.assertIn("On a yes-or-no question or a status check, leave `verified_claims` empty", flat)
-        self.assertIn('list of the commands you ran, even when it ends "report a summary of the findings"', flat)
         self.assertIn("unless the card asks for verified claims", flat)
+
+    def test_a_question_stays_a_question_however_the_card_ends(self):
+        # A status card ending "Report the findings." drew claims and a Sources list; no ending earns them.
+        flat = " ".join(REPORT_FORMAT_STANZA.split())
+        self.assertIn(
+            'A card of yes-or-no or status questions is still a question however it ends: "report the findings", '
+            '"report a summary" and "summarize" ask for the answer, not for a report\'s sections, claims or a '
+            "Sources list.",
+            flat,
+        )
+        self.assertNotIn("even when it ends", flat)
 
     def test_the_question_budget_is_the_cases(self):
         """The stanza's question rule and ``chat-voice-answer-first`` name one budget.
