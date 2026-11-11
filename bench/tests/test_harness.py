@@ -5800,6 +5800,38 @@ def test_settle_records_cards_closed_with_no_worker_call(
     assert harness.worker_trajectory.NO_WORKER_CALLS_ENTRY in harness._FRONT_DOOR_NON_ACTION_TOOLS
 
 
+@pytest.mark.parametrize(
+    "statuses, logs, expected",
+    [
+        ({"t_1": "done", "t_2": "done"}, {"t_1": "", "t_2": ""}, True),
+        ({"t_1": "done", "t_2": "running"}, {"t_1": "", "t_2": ""}, False),
+        ({"t_1": "done", "t_2": "done"}, {"t_1": "", "t_2": None}, False),
+    ],
+    ids=["both-closed", "one-open", "one-log-unread"],
+)
+def test_settle_records_no_worker_calls_only_when_every_card_closed_and_every_log_read(
+    statuses, logs, expected, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#5371: with two awaited cards, one card still open or one worker log
+    unread keeps ``worker_trajectory.NO_WORKER_CALLS_ENTRY`` off the trajectory."""
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: dict(logs))
+    monkeypatch.setattr(harness, "_worker_commands", lambda logs: [])
+    monkeypatch.setattr(
+        harness.worker_trajectory,
+        "capture",
+        lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(entries=[], summary={}),
+    )
+    on_board = {t: harness.board.BoardCard(s) for t, s in statuses.items()}
+    monkeypatch.setattr(harness.board, "read_board_cards", lambda shell, ids, to: on_board)
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1", "t_2"])
+
+    marked = [e for e in res.trajectory if e.get("name") == harness.worker_trajectory.NO_WORKER_CALLS_ENTRY]
+    assert marked == ([harness.worker_trajectory.no_worker_calls_entry(["t_1", "t_2"])] if expected else [])
+
+
 @pytest.mark.parametrize("awaited", [["t_1"], []], ids=["delegated", "no-card"])
 def test_settle_records_a_read_that_did_not_complete(awaited: list[str], monkeypatch: pytest.MonkeyPatch) -> None:
     """A turn that delegated and whose read returned nothing leaves the gap

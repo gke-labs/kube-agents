@@ -811,7 +811,7 @@ transport cannot show"). No roster edit is involved. The half of the rule for a 
 `tool_called` without a `result` pattern retires on a record whose door showed the whole trace (the transport's `a2a.activity` marker,
 reporting no loss), whether or not the run made a call. The worker half retires on a record that
 carries the workers' tagged entries and no `harness_worker_capture_gaps` entry (#5236), and a
-`workers`-scope `tool_called` also on one carrying `harness_no_worker_calls` and no worker entry.
+`workers`-scope `tool_called` with no `result` pattern also on one carrying `harness_no_worker_calls` and no worker entry.
 
 A premise the transport removes is the lane's exclusion list,
 `hack/eval/inject-lane-exclusions.txt`. The front door's delegation cases are not on it: the

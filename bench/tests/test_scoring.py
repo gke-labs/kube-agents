@@ -3147,6 +3147,45 @@ def test_the_worker_calls_set_holds_only_workers_scope_tool_called(worker_calls_
     assert worker_calls_spec.worker_blind_checks == {WORKER_CALLS_CHECK, WORKER_ONLY_CHECK}
 
 
+_WORKERS_CALL = {"type": "tool_called", "tool_names": ["kanban_complete"], "scope": "workers"}
+
+
+@pytest.mark.parametrize(
+    "check, graded",
+    [
+        (_WORKERS_CALL, True),
+        ({"type": "all", "checks": [_WORKERS_CALL, dict(_WORKERS_CALL, tool_names=["kanban_block"])]}, True),
+        (dict(_WORKERS_CALL, result="spilled"), False),
+        (dict(_WORKERS_CALL, scope="all"), False),
+        ({"type": "all", "checks": [_WORKERS_CALL, {"type": "worker_commands", "required_patterns": ["kubectl"]}]}, False),
+    ],
+    ids=["workers-leaf", "workers-compound", "result-pattern", "all-scope", "mixed-compound"],
+)
+def test_the_worker_calls_set_holds_a_check_only_when_every_leaf_qualifies(write_task, check, graded):
+    """A worker-reading check joins ``worker_calls_checks`` only when every
+    leaf is a workers-scope ``tool_called`` with no ``result`` pattern, the
+    leaves the verifier also grades on the entry, so both transports agree."""
+    spec = load_case(
+        write_task(
+            "worker-calls-membership",
+            {
+                "id": "worker-calls-membership",
+                "name": "Worker calls membership",
+                "verification_spec": [
+                    {
+                        "name": ANSWER_CHECK,
+                        "role": "objective",
+                        "check": {"type": "report_contains", "required_phrases": ["seeded"]},
+                    },
+                    {"name": WORKER_CALLS_CHECK, "role": "objective", "check": check},
+                ],
+            },
+        )
+    )
+    assert WORKER_CALLS_CHECK in spec.worker_blind_checks
+    assert (WORKER_CALLS_CHECK in spec.worker_calls_checks) == graded
+
+
 def test_a_workers_calls_check_grades_when_the_cards_closed_with_no_worker_call(worker_calls_spec, inject_run):
     """#5371: the harness writes ``worker_trajectory.NO_WORKER_CALLS_ENTRY``
     when every awaited card was closed and a clean capture holds no worker
