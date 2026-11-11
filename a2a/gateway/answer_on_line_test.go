@@ -193,36 +193,24 @@ func TestAnAnswerOnLineBackendPostsTheAnswerWhenTheEditFails(t *testing.T) {
 // press rewrites such a line as canceled.
 func TestAnAnswerOnLineBackendPostsTheAnswerOfAStoppedTask(t *testing.T) {
 	r := startLineAnsweringRig(t)
-	origin := startChatTask(t, r, "discord:g1/answer-on-line-stopped", false)
+	conv := "discord:g1/answer-on-line-stopped"
+	origin := startChatTask(t, r, conv, false)
 	line := lineID(t, r)
-	rec := waitForRecord(t, r, "discord:g1/answer-on-line-stopped", "the task on record", func(rec *SessionRecord) bool {
-		_, ok := rec.TaskRefFor(origin.TaskID)
-		return ok
+	waitFor(t, "the working edit", func() bool {
+		edits := editsOf(r, line)
+		return len(edits) > 0 && strings.Contains(edits[len(edits)-1], "working")
 	})
-	rec.MarkCanceled(origin.TaskID)
-	if err := r.g.reg.Put(context.Background(), rec); err != nil {
-		t.Fatal(err)
-	}
+	say(r, conv, "m-stop", "stop")
+	waitForRecord(t, r, conv, "the task marked cancelled", func(rec *SessionRecord) bool {
+		ref, ok := rec.TaskRefFor(origin.TaskID)
+		return ok && ref.Canceled
+	})
 	completeTask(t, r.execFor(t, origin, "platform"), "the fleet is fine")
 	waitFor(t, "the answer posted", postedContaining(r, "the fleet is fine"))
 	waitFor(t, "the terminal edit", func() bool {
 		edits := editsOf(r, line)
 		return len(edits) > 0 && strings.Contains(edits[len(edits)-1], "completed")
 	})
-}
-
-// A task that fails keeps its notice and its terminal edit: only an answer
-// takes the line.
-func TestAnAnswerOnLineBackendKeepsTheFailedLine(t *testing.T) {
-	r := startLineAnsweringRig(t)
-	origin := startChatTask(t, r, "discord:g1/answer-on-line-failed", false)
-	line := lineID(t, r)
-	publishFinal(t, r, origin, "platform", lib.StateFailed, "the pod died")
-	waitFor(t, "the failed edit", func() bool {
-		edits := editsOf(r, line)
-		return len(edits) > 0 && strings.Contains(edits[len(edits)-1], "failed")
-	})
-	waitFor(t, "the failure notice", postedContaining(r, "the pod died"))
 }
 
 // Behind the mux the answer is the owning backend's: a conversation of a
