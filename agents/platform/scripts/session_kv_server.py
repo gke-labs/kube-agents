@@ -1905,7 +1905,9 @@ def init_db() -> None:
                     human_edited    INTEGER,
                     reverted_at     TEXT,
                     outcome         TEXT,
-                    outcome_at      TEXT
+                    outcome_at      TEXT,
+                    outcome_detail  TEXT,
+                    reported_at     TEXT
                 )
                 """
             )

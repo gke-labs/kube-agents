@@ -14108,7 +14108,7 @@ class TestProposalOrigin(unittest.TestCase):
         )
         for column in ("environment", "merged_at", "merge_commit", "closed_at", "merge_checked_at", "applied_at",
                        "sync_state", "health_baseline", "health_result", "health_detail", "health_at", "health_checked_at", "human_edited",
-                       "reverted_at", "outcome", "outcome_at"):
+                       "reverted_at", "outcome", "outcome_at", "outcome_detail", "reported_at"):
             self.assertIn(column, row)
         self.assertIsNone(row["outcome"])
 
