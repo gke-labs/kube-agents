@@ -10,10 +10,21 @@ from cron_risk_gate import (
     cron_content_block,
     cron_execute_code_block,
     find_lookalike_domain,
+    _TOOL_MUTATE_VERBS,
+    _TOOL_READ_VERBS,
 )
 
 
 class CronRiskGateTest(unittest.TestCase):
+    #: The tools the gate classifies by verb. A tool absent here is unknown
+    #: and refused under high risk; a tool added here is admitted by its read
+    #: verbs, so the roster is pinned rather than left to the tables' shape.
+    SHIPPED_TOOLS = frozenset({"kubectl", "oc", "gcloud", "gh", "helm", "bq"})
+
+    def test_the_tool_roster_is_exactly_the_shipped_tools(self):
+        self.assertEqual(frozenset(_TOOL_READ_VERBS), self.SHIPPED_TOOLS)
+        self.assertEqual(frozenset(_TOOL_MUTATE_VERBS), self.SHIPPED_TOOLS)
+
     def test_cron_command_policy_block_allows_read_only_commands_under_high_risk(self):
         reads = [
             "kubectl get nodes -o wide",
@@ -241,8 +252,6 @@ class CronRiskGateTest(unittest.TestCase):
             "helm uninstall my-release",
             "helm uninstall list",
             "helm --post-renderer list uninstall my-release",
-            "gsutil rm gs://bucket/obj",
-            "gsutil cp gs://bucket/obj /tmp/",
             "gcloud compute instances delete prod",
             "gcloud compute instances DELETE prod",
             'gcloud compute instances delete foo --filter="status=list"',
@@ -261,8 +270,6 @@ class CronRiskGateTest(unittest.TestCase):
             "bq ls",
             "helm list",
             "helm get values my-release",
-            "gsutil ls gs://bucket",
-            "gsutil stat gs://bucket/obj",
             "gcloud compute instances list",
             "gcloud container clusters describe prod",
         ):
@@ -719,10 +726,6 @@ class CronRiskGateTest(unittest.TestCase):
             "helm search repo nginx",
             "helm version",
             "bq head -n 10 my_dataset.my_table",
-            "gsutil ls -l gs://my-bucket/prefix/",
-            "gsutil du -sh gs://my-bucket",
-            "gsutil hash gs://my-bucket/file.txt",
-            "gsutil version",
         ]
         for cmd in allowed:
             with self.subTest(cmd=cmd):
@@ -753,13 +756,6 @@ class CronRiskGateTest(unittest.TestCase):
             "bq extract my_dataset.my_table gs://bucket/data.csv",
             "bq rm show",
             "bq mk ls",
-            "gsutil mv gs://my-bucket/file1 gs://my-bucket/file2",
-            "gsutil rsync -r /local gs://my-bucket/",
-            "gsutil mb gs://new-bucket",
-            "gsutil rb gs://old-bucket",
-            "gsutil acl set public-read gs://my-bucket/file.txt",
-            "gsutil rm ls",
-            "gsutil cp file ls",
         ]
         for cmd in refused:
             with self.subTest(cmd=cmd):
@@ -1054,17 +1050,12 @@ class CronRiskGateTest(unittest.TestCase):
                 self.assertIsNotNone(block, f"{cmd} must be refused under high risk")
                 self.assertFalse(block["approved"])
 
-    def test_bq_and_gsutil_deep_operations(self):
+    def test_bq_deep_operations(self):
         allowed = [
             "bq ls -j",
             "bq ls -p my-project",
             "bq show --format=prettyjson my_dataset.table1",
             "bq head -n 25 my_dataset.table1",
-            "gsutil ls -r gs://my-bucket/dir/",
-            "gsutil stat gs://my-bucket/data/file.json",
-            "gsutil cat -h gs://my-bucket/report.txt",
-            "gsutil du -ch gs://my-bucket/logs/",
-            "gsutil hash -h gs://my-bucket/app.tar.gz",
         ]
         for cmd in allowed:
             with self.subTest(cmd=cmd):
@@ -1082,19 +1073,6 @@ class CronRiskGateTest(unittest.TestCase):
             "bq rm ls",
             "bq mk head",
             "bq load show gs://b/f.csv",
-            "gsutil rm -r gs://my-bucket/logs/",
-            "gsutil cp /dev/null gs://my-bucket/deleted",
-            "gsutil mv gs://my-bucket/a gs://my-bucket/b",
-            "gsutil setmeta -h 'Content-Type:text/plain' gs://my-bucket/file",
-            "gsutil acl set private gs://my-bucket/file",
-            "gsutil defacl set private gs://my-bucket",
-            "gsutil lifecycle set lc.json gs://my-bucket",
-            "gsutil cors set cors.json gs://my-bucket",
-            "gsutil notification create -t top1 gs://my-bucket",
-            "gsutil rm ls",
-            "gsutil rm stat",
-            "gsutil cp src ls",
-            "gsutil mv src ls",
         ]
         for cmd in refused:
             with self.subTest(cmd=cmd):
@@ -1207,7 +1185,6 @@ class CronRiskGateTest(unittest.TestCase):
             "gcloud compute instances describe $(cat /tmp/target)",
             "gh issue view $(whoami)",
             "helm get values $(cat /tmp/release)",
-            "gsutil stat $(cat /tmp/uri)",
             "bq show $(cat /tmp/table)",
         ]
         for cmd in refused:
@@ -1225,7 +1202,6 @@ class CronRiskGateTest(unittest.TestCase):
             "/usr/bin/gh issue list",
             "/usr/bin/helm list",
             "/usr/bin/bq ls",
-            "/usr/bin/gsutil ls gs://my-bucket",
             "/usr/bin/jq . /tmp/data.json",
             "/bin/cat /etc/os-release",
             "/bin/grep error /var/log/syslog",
@@ -1709,7 +1685,6 @@ class CronRiskGateTest(unittest.TestCase):
             "gcloud compute instances delete vm1 --dry-run",
             "helm uninstall my-release --dry-run",
             "gh issue close 123 --dry-run",
-            "gsutil rm -r gs://bucket --dry-run",
             "bq rm -f dataset.table --dry-run",
         ]
         for cmd in refused:
