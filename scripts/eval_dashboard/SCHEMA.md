@@ -508,7 +508,7 @@ Additive, optional, and safe to omit — consumers must default them.
   "finished": "<iso8601>",
   "duration_s": 15006,
   "project": "kube-agents-evals-10",
-  "artifacts_url": "https://oss.gprow.dev/view/gs/...",
+  "artifacts_url": "https://oss.gprow.dev/view/gs/... | https://console.cloud.google.com/storage/browser/...",
   "pass_rate": 0.9,
   "baseline_rate": null,
   "margin": null,
@@ -529,6 +529,15 @@ Additive, optional, and safe to omit — consumers must default them.
   from before the gate landed carry a `staging_` tag, the deploy tag the job
   then triggered on, and records after it carry the `evalcand_` tag the
   nightly now pushes ahead of the deploy. Nothing reads the prefix.
+- `releases[].gcs_base` — the build directory the release was read from, as
+  `runs[].gcs_base`: present only on a release read from a bucket Deck
+  cannot read, which the lane's own archive is once it moves to
+  `gs://kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/`
+  (`--rc-glob` names it and the old `gs://kube-agents-prow` archive both,
+  the old one until the newest `--rc-limit` builds are all in the new
+  one). The Brief's row links the Cloud Console for such a
+  release, and for an `artifacts_url` whose Spyglass link points into a
+  private bucket; a release from the old bucket keeps its Spyglass link.
 - `verdict` — the eval's, which is still not the job's, though they now
   mostly agree: the job runs the driver bare, so a `RED` candidate leaves a
   `FAILURE` in `result`. They part on `NOT RUN`, which is written on three
@@ -609,6 +618,7 @@ what the renderer does with them.
   nightly issues link such a run's build and transcripts in the Cloud
   Console; a run without the field, in `gs://kube-agents-prow` or from
   before the field, keeps its Spyglass link, which still renders it.
+  `releases[].gcs_base` is the same field for the release-candidate lane.
 - `runs[].has_build_log`, `runs[].pod_*` — a zero-task `FAILURE` with
   `pod_last_event: "NodeNotReady"` or `has_build_log: false` is a **lost
   pod**: `classify.py` gives it its own run-level headline (`infra`, never
@@ -729,8 +739,9 @@ what the renderer does with them.
   prefix's last segment (or `--nightly-job`). Given without a value it is
   `gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly/`
   (the nightly's own bucket; the presubmit has its own,
-  `gs://kube-agents-evals-presubmit-logs`, and the RC lane stays on the
-  cluster default `gs://kube-agents-prow`); omitted, no
+  `gs://kube-agents-evals-presubmit-logs`, which the RC lane moves to as
+  well, under `logs/`, its builds from before the move in the cluster
+  default `gs://kube-agents-prow`); omitted, no
   nightly scan happens (`--merge-with` alone still recomputes without
   touching the bucket). A prefix that does not list is read three ways. A
   prefix with no objects (`gcloud storage ls` says "matched no objects") is a job
@@ -1043,8 +1054,9 @@ is a build that never finished, not one still running. `releases[]` is `data.jso
 at most `RELEASES_MAX_ROWS`, each reduced to `{build, rc_tag, commit, tier,
 verdict, result, started, duration_s, artifacts_url, pass_rate,
 baseline_rate, margin, cases{passed, graded, infra}}` — `artifacts_url`
-only when it is `https://`, else `null`; `cases` `null` when no task
-parsed. `catches` is `events.yaml`'s `catches` block or `null`. `health` is
+only when it is `https://`, else `null`, and the Cloud Console's bucket
+browser for a release with `gcs_base` or a Spyglass link into a private
+bucket; `cases` `null` when no task parsed. `catches` is `events.yaml`'s `catches` block or `null`. `health` is
 the current verdict, `history` the ticks and the incidents derived from
 them, `merges` the recent first-parent commits of the checkout (`null`
 when the checkout is shallow or has no git; the Brief then omits "what
@@ -1318,7 +1330,13 @@ read is final.
 `state` (`GREEN|DEGRADED|OUTAGE`), `condition`
 (`shared_break|storm|setup_deaths|lost_pods|fixture_drift|pool_drift|delegation_ceiling|deadline_kill`), `since`, `cause`, `advice`,
 `failing_cases`, `tracking_issues`, `incident`, `recovering`, `stale`,
-`slow`, `near_deadline`, `pool`, `generated_at`, `tick`. Any other state, or an unreadable file, means no
+`slow`, `near_deadline`, `pool`, `generated_at`, `tick`. A `tracking_issues`
+entry is `#N` for an issue of this repository (one `case-notes.yaml` names,
+or one the bot filed here) and the full URL of one the bot filed or adopted
+in the issues repository; `issues_repo` names that repository
+(`ghcli.DEFAULT_REPO`, `KUBE_AGENTS_ISSUES_REPO` when set) and is
+informational: the pages read nothing from it, a reference carries its own
+repository. Any other state, or an unreadable file, means no
 verdict: the Brief says no verdict is published and shows the last 24
 hours in numbers and the runs, the PR view classifies from the runs alone
 and shows no gate banner. Only a `GREEN` verdict reads as healthy. For
@@ -1576,8 +1594,10 @@ release-candidate job, which is a postsubmit, so its `started.json` carries no
 | 2097891568546484224 | `staging_2609092307_5b5ad10` — GREEN, no baseline yet |
 
 Captured from
-`https://oss.gprow.dev/view/gs/kube-agents-prow/logs/post-kube-agents-eval-rc/2097891568546484224`
-— which is also where the job name the collector globs for is verifiable, since
+`https://oss.gprow.dev/view/gs/kube-agents-prow/logs/post-kube-agents-eval-rc/2097891568546484224`,
+the archive the lane logs to before it moves to
+`gs://kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/` — either
+prefix is where the job name the collector globs for is verifiable, since
 nothing in this repository declares it (the job lives in
 `GoogleCloudPlatform/oss-test-infra`). A wrong name degrades to an empty
 `releases[]` rather than an error, so check the path before changing it.

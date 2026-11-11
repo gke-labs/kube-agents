@@ -6,18 +6,30 @@ name: GHES Proxy Tests
 # cluster, no network past the module download and no credential.
 #
 # Not a required check, so the `paths:` filters on the triggers decide whether
-# it runs: a change that does not touch the proxy starts no run.
+# it runs: a change that does not touch the proxy starts no run. The gosec
+# step builds the scanner from k8s-operator/go.mod's pin (the module declares
+# none), so that module's go.mod and go.sum are inputs of this check too.
+# Because the check is not required, a gosec finding here reds the check but
+# holds no merge until an owner adds `Run GHES Proxy Tests` to the ruleset.
+# That also means giving this workflow the required-check shape
+# a2a-test.yml's header describes: start on every pull request and filter in
+# a step, since a required check that a trigger `paths:` list skips never
+# reports and the queue holds the pull request.
 on:
   pull_request:
     branches: [main, "release/**"]
     paths:
       - "hack/ghes-proxy/**"
       - ".github/workflows/ghes-proxy-test.yml"
+      - "k8s-operator/go.mod"
+      - "k8s-operator/go.sum"
   push:
     branches: [main]
     paths:
       - "hack/ghes-proxy/**"
       - ".github/workflows/ghes-proxy-test.yml"
+      - "k8s-operator/go.mod"
+      - "k8s-operator/go.sum"
   workflow_dispatch:
 
 concurrency:
@@ -44,6 +56,10 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: "hack/ghes-proxy/go.mod"
+          # No cache: this module is standard library only, and the gosec
+          # build below is the one download this job makes. A check outside
+          # the merge queue pays that cold build, and no cache restore can
+          # stall it.
           cache: false
 
       - name: Check formatting
@@ -51,6 +67,13 @@ jobs:
 
       - name: Vet
         run: go vet ./...
+
+      # `-C` is also the directory the program starts in, so the scanner is
+      # built in one step and run from this module's directory in the next.
+      - name: Run gosec
+        run: |
+          go -C ../../k8s-operator build -o "$RUNNER_TEMP/gosec" github.com/securego/gosec/v2/cmd/gosec
+          "$RUNNER_TEMP/gosec" ./...
 
       - name: Test
         run: go test -race -count=1 ./...

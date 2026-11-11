@@ -101,11 +101,13 @@ The chart's quota check counts the `spec.mode: next` additions in the capacity r
 
 Two next-mode workloads run only behind an operator flag, and the check counts each while its flag is set. With `A2A_MCP_DOOR=true` (the chart's `operator.mcpServer.enabled`, or an `operator.extraEnv` entry), the MCP server adds one pod. With `A2A_DISPATCHER_IMAGE` set through `operator.extraEnv`, the profile dispatcher adds one pod. The footprint's per-pod table gives both. Both run in the release namespace. AgentProfile workers don't: they run in the profile namespace, `<release-namespace>-profiles`, under a pod quota the operator renders there.
 
+With `platformAgent.deployment.credentialProxy.exec.replicas` above 0, each exec-tier replica is one more pod with 2 CPU and 2 GiB in requests and limits, plus the broker's ephemeral storage, and the chart's check counts them. It does not check node room. On a Standard cluster whose nodes lack 2 free CPU, a replica stays `Pending`. Turning the tier on also restarts the shell sandbox, which then needs its own room again.
+
 The scope publisher's Job runs in the release namespace too, one pod at a time every 15 minutes. It runs where the gateway pod admission policy is on and `platformAgent.scope` names a folder, organization, Shared VPC host or Metrics Scope, and the check counts it then.
 
 The `install.sh` pre-flight summary prints the release's requested CPU, memory, pods and persistent storage, with a monthly cost modeled from us-central1 list prices, model tokens excluded, before anything is applied. The apply shows no chart notes; `helm get notes kube-agents -n <NAMESPACE>` prints the same figures afterwards.
 
-A quota is more than CPU and memory, and so is the check: it also counts pods, persistent volume claims, `requests.storage` and ephemeral storage, which [Footprint](#footprint) gives for each profile. Two of the claims, the agent's data claim and the shell sandbox's, follow [`spec.storage.size`](/kube-agents/operator/platformagent-crd/#specstorage), so each GiB added to it adds 2 GiB of `requests.storage`, and the chart's check counts it. A namespace quota that caps pod or claim counts below what the release needs refuses the install the same way; note that constraining ephemeral storage additionally requires every container to declare it (or a `LimitRange` to default it), as the chart README explains. Under `spec.mode: next`, each NATS server adds a JetStream persistent volume claim, and the operator renders a namespace-wide `ResourceQuota` on `pods`, the footprint's session quota, sized for the session pods plus the rest of the release; anything else you run in
+A quota is more than CPU and memory, and so is the check: it also counts pods, persistent volume claims, `requests.storage` and ephemeral storage, which [Footprint](#footprint) gives for each profile. Two of the claims, the agent's data claim and the shell sandbox's, follow [`spec.storage.size`](/kube-agents/operator/platformagent-crd/#specstorage), so each GiB added to it adds 2 GiB of `requests.storage`, and the chart's check counts it. [`spec.storage.expectedClusterProfiles`](/kube-agents/operator/platformagent-crd/#specstorage) raises the agent's claim alone, and the check counts that too. A namespace quota that caps pod or claim counts below what the release needs refuses the install the same way; note that constraining ephemeral storage additionally requires every container to declare it (or a `LimitRange` to default it), as the chart README explains. Under `spec.mode: next`, each NATS server adds a JetStream persistent volume claim, and the operator renders a namespace-wide `ResourceQuota` on `pods`, the footprint's session quota, sized for the session pods plus the rest of the release; anything else you run in
 the namespace counts against it. The claims
 are also disks: on GKE's default `standard-rwo` class they are balanced persistent
 disks, which count against the project's regional SSD quota (`SSD_TOTAL_GB`) with the
@@ -136,9 +138,9 @@ Totals by install profile, as the chart's quota preflight sums them (the operato
 | ------- | ---- | ------------ | --------------- | ---------- | ------------- | ----------------------------------- | ------ | ------------------ | -------------------- |
 | `today`, GKE Standard | 9 | 2756m | 12096Mi | 13200m | 25472Mi | 14912Mi / 14912Mi | 4 | 102Gi | — |
 | `today`, GKE Autopilot | 9 | 4256m | 13120Mi | 13200m | 25472Mi | 14912Mi / 14912Mi | 4 | 102Gi | — |
-| `next`, GKE Standard | 18 | 3706m | 13696Mi | 18900m | 30080Mi | 15040Mi / 15040Mi | 5 | 142Gi | 36 |
-| `next`, GKE Autopilot | 18 | 5206m | 14720Mi | 18900m | 30080Mi | 15040Mi / 15040Mi | 5 | 142Gi | 36 |
-| `next` with Hindsight and the GitHub minter, GKE Standard | 22 | 4556m | 16128Mi | 24900m | 35712Mi | 16192Mi / 16192Mi | 6 | 150Gi | 42 |
+| `next`, GKE Standard | 18 | 3716m | 13712Mi | 18950m | 30112Mi | 15104Mi / 15104Mi | 5 | 142Gi | 36 |
+| `next`, GKE Autopilot | 18 | 5216m | 14736Mi | 18950m | 30112Mi | 15104Mi / 15104Mi | 5 | 142Gi | 36 |
+| `next` with Hindsight and the GitHub minter, GKE Standard | 22 | 4566m | 16144Mi | 24950m | 35744Mi | 16256Mi / 16256Mi | 6 | 150Gi | 42 |
 
 The session quota is `spec.harness.tuning.maxSessions` (10 by default) plus the pods the operator runs for the agent, the chart's pods in the namespace with their rollout surges (5 when the operator cannot read the chart's count), and a margin of 7 for the operator's rollout surges, its Jobs and the gateway's count-then-create overshoot.
 
@@ -146,7 +148,7 @@ Under `spec.mode: next`, per pod:
 
 | Workload | Pods | CPU request | Memory request | CPU limit | Memory limit | Ephemeral storage request / limit | Runs |
 | -------- | ---- | ----------- | -------------- | --------- | ------------ | --------------------------------- | ---- |
-| NATS server | 1 | 250m | 512Mi | 1 | 1Gi | — | Standing, one JetStream claim each (40Gi) |
+| NATS server | 1 | 260m | 528Mi | 1050m | 1056Mi | 64Mi / 64Mi | Standing, one JetStream claim each (40Gi) |
 | Auth callout | 2 | 50m | 64Mi | 500m | 256Mi | — | Standing |
 | Capability verifier | 2 | 50m | 64Mi | 500m | 256Mi | — | Standing |
 | A2A gateway | 2 | 50m | 64Mi | 500m | 512Mi | — | Standing; one fewer with the operator's `A2A_GATEWAY_ELECTION=false` |

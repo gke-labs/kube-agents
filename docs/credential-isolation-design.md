@@ -127,8 +127,9 @@ are rejected. One name goes to the shell Pod
 instead: `KUBEAGENTS_AUDIT_AUTO_PROMOTE`, the fleet audits' auto-promotion switch, which the
 operator normalises to `true` or `false` before it reaches that Pod. The three
 earned-autonomy switches (`KUBEAGENTS_POST_MERGE_CHECK`, `KUBEAGENTS_AUTOMERGE`,
-`KUBEAGENTS_DIAL`) go to both, the shell Pod's copy normalised to a value the switch
-knows or `off`; the site's credential-isolation reference describes them. A name earns a
+`KUBEAGENTS_DIAL`) reach both: the shell Pod as variables normalised to a value
+the switch knows or `off`, and the agent pinned in its managed `.env` rather than
+through this list; the site's credential-isolation reference describes them. A name earns a
 place on that list only if an arbitrary value for it cannot redirect state,
 grant access, or run code the image does not already ship. The list is
 `safeSandboxEnvOverrides` in
@@ -301,7 +302,7 @@ than in the Pod's status.
 
 | Data                             | Sandbox                                                    | Credential runtime          |
 | -------------------------------- | ---------------------------------------------------------- | --------------------------- |
-| `spec.deployment.env`            | Four switches only, normalised to known values (see below) | Yes                         |
+| `spec.deployment.env`            | `KUBEAGENTS_AUDIT_AUTO_PROMOTE` only, as `true` or `false` | Yes                         |
 | Slack tokens                     | No                                                         | Yes, Secret-backed env      |
 | PlatformAgent external API key   | No                                                         | Yes, Secret-backed env      |
 | Session KV API key and HMAC salt | Yes, Secret-backed env                                     | Yes, API key only           |

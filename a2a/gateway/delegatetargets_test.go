@@ -157,6 +157,27 @@ func TestDelegateTargetsCarryParametersAndStayInsideTheBytes(t *testing.T) {
 	}
 }
 
+// A profile pinned to a cluster takes its target from the pin, so the list
+// offers none of project, location and cluster for it, only what else it takes.
+func TestAPinnedProfileOffersNoTargetParameters(t *testing.T) {
+	d := newProfileDirectory()
+	extra := lib.ProfileParameter{Name: "namespace"}
+	d.put("pinned", &lib.AgentCard{Name: "pinned", ClusterRef: &lib.ClusterRef{ProjectID: "p1", Location: "us-east1", Cluster: "web-1"},
+		Parameters: append(append([]lib.ProfileParameter{}, clusterParams...), extra)})
+	d.put("unpinned", &lib.AgentCard{Name: "unpinned", Parameters: clusterParams})
+	got := (&Gateway{}).delegateTargets(TaskRequester{Backend: "discord", Subject: "u1"}, nil, false, d)
+	params := map[string][]lib.ProfileParameter{}
+	for _, target := range got.Targets {
+		params[target.Name] = target.Parameters
+	}
+	if want := []lib.ProfileParameter{extra}; !reflect.DeepEqual(params["pinned"], want) {
+		t.Fatalf("pinned offers %+v, want %+v", params["pinned"], want)
+	}
+	if !reflect.DeepEqual(params["unpinned"], clusterParams) {
+		t.Fatalf("unpinned offers %+v, want %+v", params["unpinned"], clusterParams)
+	}
+}
+
 // Everyone whose text reached the session is held to the target's lists, as
 // the delegation holds them: an off-list author takes a listed profile out,
 // and an incomplete set leaves nothing.

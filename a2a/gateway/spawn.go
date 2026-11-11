@@ -129,9 +129,9 @@ const (
 	// 1000 (the shell sandbox's buildShellSandboxCredentialProxyTokenVolume
 	// argues the same). Spelled identically in credential_proxy.py and the
 	// operator's platformagent_broker_split.go.
-	credentialProxySessionAudience        = "kubeagents-credential-proxy-session" // #nosec G101 -- audience name
-	credentialProxyTokenVolume            = "credential-proxy-token"              // #nosec G101 -- volume name
-	credentialProxyTokenMountPath         = "/var/run/secrets/kubeagents/credential-proxy"
+	credentialProxySessionAudience        = "kubeagents-credential-proxy-session"          // #nosec G101 -- audience name
+	credentialProxyTokenVolume            = "credential-proxy-token"                       // #nosec G101 -- volume name
+	credentialProxyTokenMountPath         = "/var/run/secrets/kubeagents/credential-proxy" // #nosec G101 -- mount path
 	credentialProxyTokenFile              = "token"
 	credentialProxyTokenMode              = 0444
 	credentialProxyTokenExpirationSeconds = 3600
@@ -139,6 +139,10 @@ const (
 	// get-credentials returns ($HERMES_HOME/.kubeconfigs); the pod's
 	// scratch emptyDir, the one writable place.
 	sessionHermesHome = "/scratch"
+
+	kubeProxyCAVolume    = "kube-proxy-ca"
+	kubeProxyCAMountPath = "/var/run/secrets/kubeagents/kube-proxy-ca"
+	kubeProxyCAFile      = "ca.crt"
 
 	labelPartOf = "app.kubernetes.io/part-of"
 	partOfValue = "a2a-next"
@@ -588,6 +592,23 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 				}}},
 			}},
 		})
+		if s.cfg.KubeProxyURL != "" {
+			c.Env = append(c.Env, corev1.EnvVar{Name: "KUBE_PROXY_URL", Value: s.cfg.KubeProxyURL})
+			if s.cfg.KubeProxyHostContext != "" {
+				c.Env = append(c.Env, corev1.EnvVar{Name: "KUBE_PROXY_HOST_CONTEXT", Value: s.cfg.KubeProxyHostContext})
+			}
+		}
+		if s.cfg.KubeProxyCAConfigMap != "" {
+			c.Env = append(c.Env, corev1.EnvVar{Name: "KUBE_PROXY_CA_FILE", Value: kubeProxyCAMountPath + "/" + kubeProxyCAFile})
+			c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{Name: kubeProxyCAVolume, MountPath: kubeProxyCAMountPath, ReadOnly: true})
+			pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
+				Name: kubeProxyCAVolume,
+				VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{Name: s.cfg.KubeProxyCAConfigMap},
+					Items:                []corev1.KeyToPath{{Key: kubeProxyCAFile, Path: kubeProxyCAFile}},
+				}},
+			})
+		}
 	}
 	created, err := s.client.CoreV1().Pods(s.cfg.Namespace).Create(ctx, pod, metav1.CreateOptions{})
 	if err != nil {
