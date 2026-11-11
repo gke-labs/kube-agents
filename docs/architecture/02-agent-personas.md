@@ -127,8 +127,8 @@ watches, alert/GitHub webhooks) with a periodic **heartbeat as the backstop** ([
 | **Declarative / infra** | Desired infrastructure state; the shared source of truth                                                       | **GitOps repository** — agents propose (read-only, via PR); the customer's CI/CD pipeline applies               |
 | **Curated knowledge**   | Durable, shareable know-how: SOPs, cluster blueprints, runbooks, metric/tenancy definitions, cross-agent notes | **OKF** (Open Knowledge Format) — markdown + YAML frontmatter in git; agents read/update, humans curate as code |
 
-A third layer — **semantic/cognitive recall (mem0/Qdrant)** — is **deferred post-v1** (see the note
-below); v1 coordinates on GitOps + OKF alone.
+A third layer — **cross-tier semantic/cognitive recall (mem0/Qdrant)** — is **deferred post-v1** (see the note
+below); v1 coordinates across tiers on GitOps + OKF.
 
 **What makes a substrate acceptable, rather than which ones are named.** The rule is about the
 _properties_ of the channel, not its implementation. An interaction must be:
@@ -204,11 +204,9 @@ at request time.
 
 > **Why OKF for v1 (mem0 deferred):** OKF is the durable, human-curatable, git-backed _knowledge_
 > layer — a natural fit for read-only agents that propose via PR and humans who review as code, and it
-> adds no new infrastructure. A **semantic-recall layer (mem0/Qdrant) is deferred post-v1**: it is a
-> stateful vector store whose value (embedding retrieval a flat markdown corpus can't do) is
-> speculative until git/grep/embedding-over-OKF is shown insufficient — add it only on evidence. (The
-> memory provider choice was about **per-user session isolation in the shared gateway**,
-> a separate concern from these coordination layers.)
+> adds no required infrastructure. Cross-tier **mem0/Qdrant coordination remains deferred post-v1** (optional single-install Hindsight verbatim indexing of `knowledge/` into `kube-agents-decisions` under `--memory=hindsight` is specified in [`docs/designs/memory.md`](../designs/memory.md) and [06](06-api-and-data-contracts.md) §5–§6; `--memory=file` and `--memory=off` evaluate OKF directly from Git). (The
+> conversational memory provider choice handles **per-user session isolation in the shared gateway**,
+> separate from cross-tier coordination.)
 
 ### 2.4 How humans address agents (the ChatOps gateway)
 

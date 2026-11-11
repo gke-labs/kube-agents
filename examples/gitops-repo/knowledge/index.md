@@ -23,6 +23,8 @@ hard enum — add new types by PR):
 | `metric-definition` | Named metric/KPI definition           |
 | `escalation`        | A cross-tier request not yet a change |
 | `observation`       | A durable finding worth sharing       |
+| `decision`          | Forward-looking architectural choice  |
+| `lesson`            | Verified incident / PR outcome lesson |
 
 An entry of any type may also carry `declares:`, a list of `{check, namespace, object}` items (`namespace: ""`
 written out for a cluster-scoped object; plus `cluster` for a one-cluster choice, as the qualified `<project>/<location>/<name>` every stream's

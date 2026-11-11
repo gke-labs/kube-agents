@@ -15,7 +15,7 @@
 The sequence to build kube-agents from its current state (direct-mutation agents, only
 `PlatformAgent`) to the end state (three read-only, scope-bounded personas — each an **`Agent` CR**
 running the **Hermes** harness, reconciled by the **kube-agents controller** on **Scion**'s verified
-per-pod model — coordinating via GitOps + OKF; semantic-recall/mem0 deferred post-v1). Eight phases,
+per-pod model — coordinating via GitOps + OKF; cross-tier mem0/Qdrant deferred post-v1). Eight phases,
 each with **acceptance criteria** that gate advancement. Every design decision a builder needs lives
 in the specs (01–06, 08); this doc is sequencing only. The **Definition of Done** makes
 [01](01-vision-scope.md) §7 concrete.
@@ -30,7 +30,7 @@ in the specs (01–06, 08); this doc is sequencing only. The **Definition of Don
 | Mutation path      | Direct API / KCC CR written by agent                                                                                                                           | GitOps PR → **customer's CI/CD pipeline** applies (KCC YAML or Terraform HCL)                                                                                                                                      |
 | Agent runtime      | single `PlatformAgent` CRD + Kubebuilder operator (mints RBAC)                                                                                                 | **kube-agents controller** (the operator, generalized to a tier-discriminated `Agent` CRD) reconciles each agent (Hermes) into an isolated pod on **Scion**'s verified per-pod model; controller mints **no** RBAC |
 | Actuation          | external (customer's existing CI/CD, outside this repo); not yet wired to the agent loop                                                                       | **Customer CI/CD** (GitHub Actions / CircleCI / …); unopinionated, no bundled GitOps engine                                                                                                                        |
-| Coordination       | ad-hoc / per-user memory                                                                                                                                       | GitOps repo + OKF, indirect (mem0 deferred post-v1)                                                                                                                                                                |
+| Coordination       | ad-hoc / per-user memory                                                                                                                                       | GitOps repo + OKF, indirect (cross-tier mem0/Qdrant deferred post-v1)                                                                                                                                              |
 | Human→agent access | anyone who can reach the agent                                                                                                                                 | **Trusted-human access** (authenticated + `AllowedUsers`) + **read-only agent ceiling**; per-request user down-scoping deferred ([08](08-agent-runtime-and-identity.md) §5)                                        |
 | Chat routing       | single Hermes gateway → the one Platform Agent                                                                                                                 | **ChatOps gateway** resolves `(tier,scope)` by slash / `@handle` / NL and dispatches to per-tier pods, enforcing each target's `allowedUsers` ([06](06-api-and-data-contracts.md) §2b)                             |
 | Proactivity        | scheduled (cron) tasks + heartbeat polling                                                                                                                     | **push-first** — K8s watches + alert/GitHub webhooks (Pub/Sub); cron for genuinely scheduled work; heartbeat backstop ([04](04-workflow-model.md) §4)                                                              |
@@ -146,14 +146,14 @@ acceptance criteria pass.
 
 ### Phase 4 — Coordination & knowledge
 
-- **Goal:** turn on indirect coordination (GitOps + OKF; no vector store in v1).
+- **Goal:** turn on indirect coordination (GitOps + OKF; cross-tier mem0/Qdrant deferred post-v1, optional Hindsight `kube-agents-decisions` index under `--memory=hindsight` per [06](06-api-and-data-contracts.md) §6).
 - **Work:** wire OKF read/update into all tiers ([06](06-api-and-data-contracts.md) §5); **wire the
   push-first event triggers** ([04](04-workflow-model.md) §4) — Kubernetes watches/informers on each
   agent's read-only SA (the `k8s-event-watcher` binary already built into the agent image, `deploy/docker/`)
   plus alert + GitHub webhooks delivered over **Pub/Sub** (the Google Chat ingress already uses Pub/Sub,
   `INSTALL.md`) — keeping the heartbeat only as a backstop; define per-tier heartbeat SOPs for Cluster
   Admin + Developer Team, **including the Platform Agent's drift-detection SOP that opens a corrective PR
-  unprompted**. (Semantic recall / mem0 is **deferred post-v1** — [02](02-agent-personas.md) §2.3.)
+  unprompted**. (Cross-tier semantic recall / mem0 is **deferred post-v1** — [02](02-agent-personas.md) §2.3.)
 - **Accept:** a Kubernetes watch fires an agent reaction (e.g. a crash-looping workload) **without**
   waiting for the next heartbeat poll; an escalation written by a lower tier is picked up by its parent
   (no synchronous call); an agent retrieves a runbook via OKF; per-tier heartbeats run scoped audits; **inject
@@ -250,9 +250,8 @@ Built end-to-end means all of these pass — the concrete form of [01](01-vision
   - Minty ([05](05-system-architecture.md) §5); a missing egress-allowlist entry or VPC-peering gap
     silently pauses a spoke's agents (reconciled state keeps running). Validate hub connectivity as an
     explicit step of the Phase-2 spoke bootstrap, not an afterthought.
-- **mem0/Qdrant operational cost (deferred)** — a stateful vector store was the cost concern; v1
-  **defers mem0 entirely** and coordinates on GitOps + OKF, removing this footprint. Revisit only with
-  evidence that semantic recall over OKF is insufficient.
+- **mem0/Qdrant operational cost (deferred)** — cross-tier Qdrant was the cost concern; v1
+  **defers mem0/Qdrant** and coordinates across tiers on GitOps + OKF (with `--memory=file` default requiring zero extra database pods, and optional Hindsight indexing under `--memory=hindsight` documented in [`docs/designs/memory.md`](../designs/memory.md)).
 - **Hub is a shared-fate dependency for agent reasoning** — inference + Minty are hub-hosted
   ([05](05-system-architecture.md) §3), so a hub outage pauses spoke _agents_ (reconciled cluster
   state keeps running). Phase 6 chaos tests must assert the honest property ([04](04-workflow-model.md)
