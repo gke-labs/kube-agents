@@ -20,13 +20,13 @@ A public post about a run may carry:
 - the install, the commit, the run's wall clock, and infrastructure facts (the lease, the pool
   project, the Prow state).
 
-It carries nothing from inside the record: what the run produced (per-repetition results, counts
-or ratios, check reasons, scores, report and transcript text) and how the run was configured. It
-names no internal group or access detail: who can open the record is not for the post. A reader
-who needs the detail opens the record. A run on a dev install has no record anyone else can open:
-the pull request cites the run directory by name, and the author shares it with a reviewer who
-asks, off GitHub; a reviewer of an agent-behaviour change whose red is a dev run asks before
-approving.
+It carries nothing from inside the record: what the run produced (per-repetition results, counts or
+ratios, check reasons, scores, report and transcript text) and how the run was configured, the model
+and its provider included. It names no internal group or access detail: who can open the record is
+not for the post. A reader who needs the detail opens the record. A run on a dev install has no
+record anyone else can open: the pull request cites the run directory by name, and the author shares
+it with a reviewer who asks, off GitHub; a reviewer of an agent-behaviour change whose red is a dev
+run asks before approving.
 
 This holds for a person and for a bot alike, for a reply that quotes someone else's post, and for
 a file committed to the repository. A pull request's **Live validation** section names the failing
