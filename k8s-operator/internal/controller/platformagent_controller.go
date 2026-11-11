@@ -613,6 +613,12 @@ type PlatformAgentReconciler struct {
 	// informer would never sync.
 	agentProfilesUnreadable bool
 
+	// tiersUnreadable is the same for Tiers (TierAccessDenied): the Tier
+	// watch is skipped and the tiers file renders an empty list, which serves
+	// the compiled-in tiers, rather than listing a kind whose informer would
+	// never sync and stall every next-mode reconcile.
+	tiersUnreadable bool
+
 	// Recorder writes Events on the PlatformAgent. Nil records nothing, which
 	// is what tests and the golden harness supply (recordEvent).
 	//
@@ -6266,7 +6272,12 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// created, edited or deleted re-renders it. Registered only when the CRD
 	// is installed.
 	tierGVK := agentv1alpha1.GroupVersion.WithKind("Tier")
-	if mgr != nil && mgr.GetRESTMapper() != nil {
+	if denied := TierAccessDenied(r.RBAC); len(denied) > 0 {
+		r.tiersUnreadable = true
+		logf.Log.WithName("platformagent-controller").Info(
+			"The operator's role cannot read Tiers; skipping the Tier watch and rendering no install-defined tiers. Restart the operator after applying the current ClusterRole.",
+			"denied", denied)
+	} else if mgr != nil && mgr.GetRESTMapper() != nil {
 		if _, err := mgr.GetRESTMapper().RESTMapping(tierGVK.GroupKind(), tierGVK.Version); err == nil {
 			bld = bld.Watches(
 				&agentv1alpha1.Tier{},

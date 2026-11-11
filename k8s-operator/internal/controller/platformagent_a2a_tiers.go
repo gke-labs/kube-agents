@@ -81,8 +81,12 @@ func buildA2ATiersConfigMap(agent *agentv1alpha1.PlatformAgent, tiers []agentv1a
 // an empty list, which serves the compiled-in tiers.
 func (r *PlatformAgentReconciler) applyA2ATiers(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	var list agentv1alpha1.TierList
-	if err := r.List(ctx, &list, client.InNamespace(agent.Namespace)); err != nil && !isCRDNotInstalledError(err) {
-		return fmt.Errorf("failed to list Tiers: %w", err)
+	// A role that can't read Tiers lists nothing: a cached List would start
+	// an informer that never syncs and hold the reconcile (#1009's case).
+	if !r.tiersUnreadable {
+		if err := r.List(ctx, &list, client.InNamespace(agent.Namespace)); err != nil && !isCRDNotInstalledError(err) {
+			return fmt.Errorf("failed to list Tiers: %w", err)
+		}
 	}
 	cm, err := buildA2ATiersConfigMap(agent, list.Items)
 	if err != nil {
