@@ -106,7 +106,7 @@ for the mechanics.
 
 <!--
 Required when this PR changes what a user sees: a chat reply or card in Slack or Google Chat,
-the docs site's rendering, the admin console, or an installer prompt. Paste at least one
+the docs site's rendering, the web console or the A2A console, or an installer prompt. Paste at least one
 screenshot of the new UX, and a before shot beside it when the PR changes output that exists
 today; `scripts/pr_evidence_screenshot.sh` publishes one and prints the Markdown, or drag the
 image into the editor. Otherwise write "[x]" in the box below.

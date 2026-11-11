@@ -10,7 +10,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 import ux_evidence as ux
 
-CHAT = ("agents/*/SOUL.md", "a2a/lib/chatmsg/**", "a2a/gateway/slack_*.go")
+CHAT = ("agents/*/SOUL.md", "agents/chat/defaults/**", "a2a/lib/chatmsg/**", "a2a/gateway/slack_*.go")
 SHOT = "![slack-plan-row](https://raw.githubusercontent.com/me/kube-agents/pr-evidence/a.png)"
 
 
@@ -21,8 +21,12 @@ class GlobTest(unittest.TestCase):
 
     def test_double_star_spans_directories(self):
         self.assertTrue(ux.glob_to_regex("a2a/lib/chatmsg/**").match("a2a/lib/chatmsg/sub/lint.go"))
-        self.assertTrue(ux.glob_to_regex("**/tests/**").match("admin_console/tests/test_ui.py"))
+        self.assertTrue(ux.glob_to_regex("**/tests/**").match("a2a/web/tests/page.js"))
         self.assertTrue(ux.glob_to_regex("**/test_*.py").match("test_top.py"))
+
+    def test_unsupported_syntax_is_refused(self):
+        with self.assertRaises(ValueError):
+            ux.glob_to_regex("b/{x,y}.go")
 
     def test_whole_path_only(self):
         self.assertFalse(ux.glob_to_regex("install.sh").match("scripts/install.sh"))
@@ -41,6 +45,13 @@ class ChatGlobsTest(unittest.TestCase):
             rules.write_text('---\npaths:\n  - "a/**"\n  - b.go\ntrigger: x\n---\n# body\n  - "c"\n')
             self.assertEqual(ux.chat_globs(rules), ("a/**", "b.go"))
 
+    def test_an_unreadable_entry_is_an_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rules = pathlib.Path(tmp) / "r.md"
+            rules.write_text('---\npaths:\n  - "a/**"\n  - "c.go"  # note\n---\n')
+            with self.assertRaises(ValueError):
+                ux.chat_globs(rules)
+
     def test_no_frontmatter_is_an_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             rules = pathlib.Path(tmp) / "r.md"
@@ -58,14 +69,26 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(chat, ["a2a/gateway/slack_chat.go"])
         self.assertEqual(other, ["docs/site/src/components/Card.astro"])
 
+    def test_chat_markdown_counts(self):
+        chat, _ = ux.classify(
+            ["agents/chat/SOUL.md", "agents/platform/SOUL.md", "agents/chat/defaults/onboarding/report_filed.md"],
+            chat=CHAT,
+        )
+        self.assertEqual(len(chat), 3)
+
+    def test_real_rules_cover_a_soul(self):
+        chat, _ = ux.classify(["agents/chat/SOUL.md"])
+        self.assertEqual(chat, ["agents/chat/SOUL.md"])
+
     def test_tests_and_docs_prose_are_not_seen(self):
         chat, other = ux.classify(
             [
                 "a2a/gateway/slack_chat_test.go",
                 "a2a/lib/chatmsg/testdata/x.json",
-                "admin_console/tests/test_ui.py",
-                "admin_console/requirements.txt",
-                "admin_console/README.md",
+                "a2a/cmd/web-console/static/app_test.go",
+                "a2a/web/package-lock.json",
+                "a2a/web/README.md",
+                "admin_console/ui.py",
                 "docs/site/src/content/docs/install.md",
                 "docs/site/package.json",
             ],
@@ -73,9 +96,18 @@ class ClassifyTest(unittest.TestCase):
         )
         self.assertEqual((chat, other), ([], []))
 
-    def test_installer_front_doors_and_console(self):
-        _, other = ux.classify(["install.sh", "scripts/installer/common.sh", "admin_console/ui.py"], chat=CHAT)
-        self.assertEqual(other, ["install.sh", "scripts/installer/common.sh", "admin_console/ui.py"])
+    def test_installer_front_doors_and_consoles(self):
+        files = [
+            "install.sh",
+            "scripts/installer/common.sh",
+            "a2a/web/index.html",
+            "a2a/cmd/web-console/static/app.js",
+            "charts/kube-agents/templates/web-console.yaml",
+            "a2a/console/console.go",
+            "a2a/cmd/console/main.go",
+        ]
+        _, other = ux.classify(files, chat=CHAT)
+        self.assertEqual(other, files)
 
 
 class BodyTest(unittest.TestCase):
@@ -96,6 +128,18 @@ class BodyTest(unittest.TestCase):
 
     def test_image_in_a_fence_does_not_count(self):
         self.assertFalse(ux.has_image(f"```\n{SHOT}\n```\n"))
+
+    def test_image_in_an_indented_fence_does_not_count(self):
+        self.assertFalse(ux.has_image(f"- item\n\n    ```\n    {SHOT}\n    ```\n"))
+
+    def test_image_in_a_four_backtick_fence_does_not_count(self):
+        self.assertFalse(ux.has_image(f"````\n```\n{SHOT}\n```\n````\n"))
+
+    def test_image_in_inline_code_does_not_count(self):
+        self.assertFalse(ux.has_image(f"use `{SHOT}` like this"))
+
+    def test_comment_marker_in_code_does_not_hide_a_real_image(self):
+        self.assertTrue(ux.has_image(f"```\n<!--\n```\n\n{SHOT}\n"))
 
     def test_a_link_is_not_an_image(self):
         self.assertFalse(ux.has_image("[screenshot](https://example.com/a.png)"))
@@ -124,7 +168,7 @@ class VerdictTest(unittest.TestCase):
         self.assertEqual((passed, chat), (True, True))
 
     def test_surface_with_the_box_ticked_passes(self):
-        passed, _, _ = ux.verdict(["admin_console/ui.py"], "- [x] No user-visible change", chat=CHAT)
+        passed, _, _ = ux.verdict(["a2a/console/console.go"], "- [x] No user-visible change", chat=CHAT)
         self.assertTrue(passed)
 
     def test_none_body(self):

@@ -362,6 +362,7 @@ identifier appears, add its source here.
 | Admission webhook server port (`--webhook-port` default) | `DefaultPort` in `k8s-operator/internal/webhook/platformagent_webhook.go` |
 | Live-test lease: ConfigMap name, TTL, install-configuration keys read, which commands count as mutations | `scripts/live_test_lease.py` |
 | PR evidence screenshots: publish branch, file-name provenance, caption format | `scripts/pr_evidence_screenshot.sh` |
+| UX evidence check: the user-facing paths, what counts as an image, the no-change box, the chat-job trigger | `scripts/ux_evidence.py` (`SURFACES`, `TEST_PATHS`, `NOT_RENDERED`, `IMAGE_RES`, `NO_CHANGE_RE`), the `paths:` of `.agents/rules/chat_ux.md`, and `.github/workflows/ux-evidence.yml` |
 | Unresolved-thread hold: the label, the pool condition, the sweep interval, the ownership rule | `scripts/hold_unresolved_threads.py` and `.github/workflows/hold-unresolved-threads.yml` |
 | Merge queue gate checks: the two contexts, what each reads, the smoke skip list it copies from Prow | `scripts/merge_gate.py` and `.github/workflows/merge-gate.yml` |
 | Merge queue enqueue sweep: the label predicate, the `MERGE_QUEUE` switch, the sweep interval, the one retry after a `failed_checks` removal | `scripts/merge_gate.py` (`sweep`) and `.github/workflows/auto-enqueue.yml` |

@@ -10,8 +10,8 @@ Hygiene"; the mechanics are `.agents/rules/pre_pr_review.md`, "UX change".
 The surfaces are two lists. Chat output is the `paths:` frontmatter of
 `.agents/rules/chat_ux.md`, the list `review-chat-ux` already scopes itself
 by, read here rather than copied so the two cannot drift. Everything else a
-user sees is `SURFACES` below. Test files never count: a golden file or a
-fixture changes because a surface did.
+user sees is `SURFACES` below. Test files never count, and a surface's notes
+and pins (`NOT_RENDERED`) do not either.
 
 A chat path also sets `chat=true` in `$GITHUB_OUTPUT`, which is what starts
 the workflow's chat-rules job.
@@ -31,10 +31,15 @@ CHAT_RULES = REPO_ROOT / ".agents" / "rules" / "chat_ux.md"
 
 # What a user sees outside chat. The docs site counts for its rendering, not
 # its prose: a page's words are in the diff already, while a component or a
-# stylesheet shows only on the rendered page. The admin console counts whole,
-# bar its tests and pins, because its views and its logic share files.
+# stylesheet shows only on the rendered page. The two browser UIs an install
+# ships, the web console and the A2A console, count whole, bar their tests and
+# pins, because their pages and their handlers share files.
 SURFACES = (
-    "admin_console/**",
+    "a2a/web/**",
+    "a2a/cmd/web-console/**",
+    "charts/kube-agents/templates/web-console.yaml",
+    "a2a/console/**",
+    "a2a/cmd/console/**",
     "docs/site/astro.config.mjs",
     "docs/site/public/**",
     "docs/site/src/assets/**",
@@ -46,22 +51,36 @@ SURFACES = (
     "scripts/installer/*.sh",
 )
 
-# Paths inside a surface that are not themselves seen.
-NOT_SEEN = (
+# Tests anywhere: a golden file or a fixture changes because a surface did.
+TEST_PATHS = (
     "**/test_*.py",
     "**/*_test.go",
     "**/tests/**",
     "**/testdata/**",
-    "**/*.md",
-    "**/requirements*.txt",
 )
+
+# Files inside a SURFACES directory that never render: its notes and its pins.
+# Not applied to chat paths, where a `.md` is a SOUL or a message template.
+NOT_RENDERED = (
+    "**/*.md",
+    "**/package.json",
+    "**/package-lock.json",
+)
+
+# Glob syntax glob_to_regex does not translate; a pattern using it is refused
+# rather than matched literally.
+UNSUPPORTED_GLOB_CHARS = "{}[]!"
 
 FRONTMATTER_MARK = "---"
 PATHS_KEY = "paths:"
 LIST_ITEM_RE = re.compile(r"""^\s+-\s+["']?([^"'\s]+)["']?\s*$""")
 
+# A fenced block at any indent (list items indent theirs), closed by the same
+# run of markers or by the end of the body; then inline code; then comments.
+# Code first, so a `<!--` shown in a code block cannot swallow a real image.
+FENCE_RE = re.compile(r"^[ \t]*(`{3,}|~{3,}).*?(?:^[ \t]*\1[^\n]*$|\Z)", re.DOTALL | re.MULTILINE)
+INLINE_CODE_RE = re.compile(r"`[^`\n]+`")
 COMMENT_RE = re.compile(r"<!--.*?(-->|\Z)", re.DOTALL)
-FENCE_RE = re.compile(r"^(```|~~~).*?^\1[^\n]*$", re.DOTALL | re.MULTILINE)
 IMAGE_RES = (
     re.compile(r"!\[[^\]]*\]\(\s*\S+"),  # a Markdown image
     re.compile(r"<img\b[^>]*\bsrc\s*=", re.IGNORECASE),  # an HTML image
@@ -75,6 +94,9 @@ EXIT_MISSING = 1
 
 def glob_to_regex(pattern):
     """A glob as Claude Code reads a rule's `paths:`: `**` spans directories, `*` one segment."""
+    bad = sorted({c for c in pattern if c in UNSUPPORTED_GLOB_CHARS})
+    if bad:
+        raise ValueError(f"glob {pattern!r} uses unsupported syntax: {''.join(bad)}")
     out = []
     i = 0
     while i < len(pattern):
@@ -109,10 +131,16 @@ def chat_globs(rules_path=CHAT_RULES):
         if line.strip() == PATHS_KEY:
             in_paths = True
             continue
+        if not in_paths:
+            continue
         item = LIST_ITEM_RE.match(line)
-        if in_paths and item:
+        if item:
             globs.append(item.group(1))
-        elif in_paths and not line.startswith(" "):
+        elif line.startswith((" ", "\t")):
+            # An item this reader cannot parse (a trailing comment, say) would
+            # otherwise drop out of the list without a word.
+            raise ValueError(f"{rules_path}: cannot read paths: entry {line!r}")
+        else:
             in_paths = False
     if not globs:
         raise ValueError(f"{rules_path} lists no paths")
@@ -128,18 +156,20 @@ def classify(files, chat=None, surfaces=SURFACES):
     chat = chat_globs() if chat is None else chat
     chat_hits, surface_hits = [], []
     for path in files:
-        if _matches(path, NOT_SEEN):
+        if _matches(path, TEST_PATHS):
             continue
         if _matches(path, chat):
             chat_hits.append(path)
-        elif _matches(path, surfaces):
+        elif _matches(path, surfaces) and not _matches(path, NOT_RENDERED):
             surface_hits.append(path)
     return chat_hits, surface_hits
 
 
 def _visible(body):
-    """The body as it renders: HTML comments and fenced blocks show no image."""
-    return FENCE_RE.sub("", COMMENT_RE.sub("", body or ""))
+    """The body as it renders: code and HTML comments show no image."""
+    text = FENCE_RE.sub("", body or "")
+    text = INLINE_CODE_RE.sub("", text)
+    return COMMENT_RE.sub("", text)
 
 
 def has_image(body):

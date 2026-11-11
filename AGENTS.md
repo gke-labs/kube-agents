@@ -186,16 +186,16 @@ user" clauses here. Agents with a user in the loop follow this file.
   output changes, `review-chat-ux` on your diff **in a clean context that did not write it**
   (`/pr-preflight` spawns them). Fix confirmed findings; under **Self-Review** list every
   disposition, what you looked for and the context ([mechanics](.agents/rules/pre_pr_review.md)).
-- **Show a user-facing change:** a PR changing what a user sees (chat, docs site, console,
-  installer) carries a screenshot under **UX change**; CI checks it
-  ([mechanics](.agents/rules/pre_pr_review.md#ux-change)).
+- **Show a user-facing change:** a PR changing what a user sees carries a screenshot under **UX
+  change**; CI checks it ([mechanics](.agents/rules/pre_pr_review.md#ux-change)).
 - **Live-test the change before opening a PR:** fill in **Testing → Live validation** with how it
   ran against a running installation, the eval loop or exemption record for agent
   behaviour changes, or "Not live-tested" and why. Mechanics:
   [`pre_pr_review.md`](.agents/rules/pre_pr_review.md); what the section may carry:
   [`public_surfaces.md`](.agents/rules/public_surfaces.md).
 - **Keep `Self-Review` and `Live validation` current, not chronological:** fold later passes and
-  fixes into the sections, not appended rounds; per-round history belongs in review threads ([`pre_pr_review.md`](.agents/rules/pre_pr_review.md)).
+  fixes into the sections, not appended rounds; per-round history goes in review threads
+  ([`pre_pr_review.md`](.agents/rules/pre_pr_review.md)).
 - **The install has one engine: Terraform + Helm.** `terraform/examples/full-install` (via
   `lifecycle.sh`) owns every GCP resource and the chart every Kubernetes resource;
   `install.sh` / `uninstall.sh` / `upgrade.sh` only generate `terraform.tfvars` and drive it. Do not

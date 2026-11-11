@@ -4,7 +4,7 @@ paths:
   - ".github/PULL_REQUEST_TEMPLATE.md"
   - "docs/pull-request-workflow.md"
 trigger: model_decision
-description: "Pre-PR review and validation mechanics: running adversarial and docs-drift reviews in a clean context, live validation, bug-fix recurrence, and keeping PR sections current."
+description: "Pre-PR review and validation mechanics: running adversarial, docs-drift and chat UX reviews in a clean context, live validation, UX-change screenshots, bug-fix recurrence, and keeping PR sections current."
 ---
 
 # Pre-PR review mechanics
@@ -129,7 +129,8 @@ in `AGENTS.md` under Pull Request Hygiene.
 ## UX change
 
 A pull request that changes what a user sees shows it. That covers chat replies and cards in Slack
-and Google Chat, the docs site's rendering, the admin console, and the installer's prompts.
+and Google Chat, the docs site's rendering, the two browser UIs an install ships (the web
+console and the A2A console), and the installer's prompts.
 
 - **At least one screenshot of the new UX goes under Testing → UX change**, and a before shot
   beside it when the change alters output that exists today. Show the moment the change touches —
@@ -138,14 +139,15 @@ and Google Chat, the docs site's rendering, the admin console, and the installer
   request body renders it and prints Markdown stamped with the commit and capture time, or drag
   it into the GitHub editor. A chat screenshot is of the real client, Slack or Google Chat, talking
   to your dev install.
-- **Nothing a user sees moved** — a refactor of a renderer, a console module's backend logic —
-  and you tick **No user-visible change** instead. The reviewer holds the tick to the diff.
+- **When nothing a user sees moved** — a refactor of a renderer, a console handler's backend
+  logic — tick **No user-visible change** instead. The reviewer holds the tick to the diff.
 - **[`ux-evidence.yml`](../../.github/workflows/ux-evidence.yml) checks the body.** It fails when
   the diff changes a user-facing path and the body, outside comments and code fences, has neither
   an image nor the ticked box; editing the body re-runs it. The paths are the `paths:` of
   [`chat_ux.md`](chat_ux.md) plus `SURFACES` in
   [`scripts/ux_evidence.py`](../../scripts/ux_evidence.py); test files never count, and the docs
-  site counts for its components, styles and assets, not its prose, which the diff already shows.
+  site counts for its rendering (config, components, styles, assets, `public/`), not its prose,
+  which the diff already shows.
   The check cannot tell a before shot from an after shot; the reviewer can.
 
 ## Keeping the sections current

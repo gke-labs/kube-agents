@@ -67,7 +67,9 @@ jobs:
     needs: evidence
     # Runs when a chat path changed, even if the screenshot check failed: the
     # two answer different questions, and an author fixing one wants the other.
-    if: github.repository == 'gke-labs/kube-agents' && !cancelled() && needs.evidence.outputs.chat == 'true'
+    # Not on a body edit, which changes no code: these tests also run in the
+    # required A2A and Python suites, and this job only names them for chat.
+    if: github.repository == 'gke-labs/kube-agents' && !cancelled() && github.event.action != 'edited' && needs.evidence.outputs.chat == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
