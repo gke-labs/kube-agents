@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -555,5 +557,55 @@ func TestAgentScheduleTheRecentRunsRingKeepsTen(t *testing.T) {
 	s := f.get(t)
 	if len(s.Status.RecentRuns) != agentScheduleRecentRuns || s.Status.RecentRuns[0].TaskID != s.Status.LastTaskID {
 		t.Fatalf("ring = %d runs, newest %q, last task %q", len(s.Status.RecentRuns), s.Status.RecentRuns[0].TaskID, s.Status.LastTaskID)
+	}
+}
+
+// The CRD's schema against a real API server: defaults land, and the CEL
+// rule and enums refuse what the reconciler would otherwise have to.
+func TestAgentScheduleSchemaEnvtest(t *testing.T) {
+	cl, _ := startEnvtest(t)
+	ctx := context.Background()
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "kubeagents-system"}}
+	if err := cl.Create(ctx, ns); err != nil {
+		t.Fatal(err)
+	}
+	mk := func(name string, mutate func(*agentv1alpha1.AgentSchedule)) *agentv1alpha1.AgentSchedule {
+		s := &agentv1alpha1.AgentSchedule{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "kubeagents-system"},
+			Spec: agentv1alpha1.AgentScheduleSpec{
+				Schedule:   "20 6 * * *",
+				ProfileRef: agentv1alpha1.AgentScheduleProfileRef{Name: "fleet-audit"},
+				Prompt:     "Run the compliance audit.",
+			},
+		}
+		if mutate != nil {
+			mutate(s)
+		}
+		return s
+	}
+	ok := mk("valid", nil)
+	if err := cl.Create(ctx, ok); err != nil {
+		t.Fatalf("a valid schedule was refused: %v", err)
+	}
+	if ok.Spec.ConcurrencyPolicy != agentv1alpha1.AgentScheduleConcurrencyForbid || ok.Spec.StartingDeadlineSeconds == nil ||
+		*ok.Spec.StartingDeadlineSeconds != 900 || ok.Spec.Delivery.Mode != agentv1alpha1.AgentScheduleDeliveryChat ||
+		ok.Spec.ActiveDeadlineSeconds != nil {
+		t.Fatalf("defaults = %+v; want Forbid, 900, chat, and no active deadline (the profile's applies)", ok.Spec)
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*agentv1alpha1.AgentSchedule)
+	}{
+		{"four-fields", func(s *agentv1alpha1.AgentSchedule) { s.Spec.Schedule = "0 * * *" }},
+		{"time-zone", func(s *agentv1alpha1.AgentSchedule) { s.Spec.Schedule = "CRON_TZ=UTC 0 * * * *" }},
+		{"seconds", func(s *agentv1alpha1.AgentSchedule) { s.Spec.Schedule = "0 0 * * * *" }},
+		{"allow", func(s *agentv1alpha1.AgentSchedule) { s.Spec.ConcurrencyPolicy = "Allow" }},
+		{"delivery", func(s *agentv1alpha1.AgentSchedule) { s.Spec.Delivery.Mode = "slack" }},
+		{"no-prompt", func(s *agentv1alpha1.AgentSchedule) { s.Spec.Prompt = "" }},
+		{"short-deadline", func(s *agentv1alpha1.AgentSchedule) { s.Spec.StartingDeadlineSeconds = ptr.To[int64](5) }},
+	} {
+		if err := cl.Create(ctx, mk(tc.name, tc.mutate)); err == nil || !apierrors.IsInvalid(err) {
+			t.Errorf("%s: create = %v, want refused as invalid", tc.name, err)
+		}
 	}
 }
