@@ -1068,10 +1068,12 @@ func TestProbeTopicIsProvisionedAndWriterless(t *testing.T) {
 
 // Without this policy every pod in the cluster reaches 4222/8222/9222 while
 // the bus grants do the real refusing. The network layer now agrees with
-// them: 4222 from exactly the enumerated bus clients, and no pod-network
-// peer at all for 8222 (monitor) or 9222 (ws) — the demo port-forward and
-// the kubelet readiness probe both enter via the node, which NetworkPolicy
-// does not govern, and that is the decided posture rather than an accident.
+// them: 4222 from exactly the enumerated bus clients, 9222 (ws) from the
+// console server, and 8222 (monitor) from the operator's pod, and only when
+// the operator knows its own namespace, which this test's environment
+// doesn't set (TestTheMonitorPortAdmitsTheOperatorAlone covers that case).
+// The demo port-forward and the kubelet readiness probe both enter via the
+// node, which NetworkPolicy does not govern.
 func TestBuildA2ANATSNetworkPolicy(t *testing.T) {
 	np := buildA2ANATSNetworkPolicy(a2aTestAgent())
 

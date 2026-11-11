@@ -526,23 +526,25 @@ class NextModeFootprintTest(unittest.TestCase):
         self.assertEqual(cli["cpuMillisRequest"], gcf.parse_cpu_millis(agent["resources"]["requests"]["cpu"]))
         self.assertEqual(cli["memoryBytesLimit"], gcf.parse_bytes(agent["resources"]["limits"]["memory"]))
 
-    def test_each_workload_is_its_golden_container_times_its_replicas(self):
-        for key, (kind, name, container) in gcf._A2A_WORKLOADS.items():
+    def test_each_workload_is_its_golden_containers_times_its_replicas(self):
+        for key, (kind, name, names) in gcf._A2A_WORKLOADS.items():
             with self.subTest(key=key):
                 doc = _find_doc(self.docs, kind, name)
                 replicas = doc["spec"].get("replicas", 1)
-                (found,) = [
+                found = [
                     c for c in doc["spec"]["template"]["spec"]["containers"]
-                    if c["name"] == container
+                    if c["name"] in names
                 ]
-                requests = found["resources"]["requests"]
+                self.assertEqual(len(found), len(names))
                 entry = self.following[key]
                 self.assertEqual(entry["pods"], replicas)
                 self.assertEqual(
-                    entry["cpuMillisRequest"], gcf.parse_cpu_millis(requests["cpu"]) * replicas
+                    entry["cpuMillisRequest"],
+                    sum(gcf.parse_cpu_millis(c["resources"]["requests"]["cpu"]) for c in found) * replicas,
                 )
                 self.assertEqual(
-                    entry["memoryBytesRequest"], gcf.parse_bytes(requests["memory"]) * replicas
+                    entry["memoryBytesRequest"],
+                    sum(gcf.parse_bytes(c["resources"]["requests"]["memory"]) for c in found) * replicas,
                 )
 
     def test_surges_follows_each_workloads_strategy(self):
@@ -579,8 +581,8 @@ class NextModeFootprintTest(unittest.TestCase):
         self.assertEqual(self.data["operatorRendered"]["storage"]["persistentVolumeClaims"], 4)
 
     def test_the_standing_delta_is_the_documented_figure(self):
-        """The A2A stack's standing requests, provisioning Job aside: 1350m and 2496Mi,
-        with the default three NATS servers (850m and 1472Mi with one)."""
+        """The A2A stack's standing requests, provisioning Job aside: 1380m and 2544Mi,
+        with the default three NATS servers (860m and 1488Mi with one)."""
         standing = [k for k in self.following if k not in ("storage", "a2aProvision")]
         cpu = sum(
             self.following[k]["hermesBridge"]["cpuMillisRequest"] if k == "agentPod"
@@ -592,7 +594,7 @@ class NextModeFootprintTest(unittest.TestCase):
             else self.following[k]["memoryBytesRequest"]
             for k in standing
         )
-        self.assertEqual((cpu, memory), (1350, 2496 * _MIB))
+        self.assertEqual((cpu, memory), (1380, 2544 * _MIB))
 
     def test_replicas_scale_a_workload(self):
         with _goldens_with(following=_scale_callout_deployment):
