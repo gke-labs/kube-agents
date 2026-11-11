@@ -81,7 +81,7 @@ const (
 	// (the `secret_env` of the hooks.outbound entry); the bridge sets it per
 	// child. In a single-profile CLI process hermes's secret scope falls
 	// through to the process environment, which is what makes this work.
-	ActivitySecretEnv = "A2A_ACTIVITY_SECRET"
+	ActivitySecretEnv = "A2A_ACTIVITY_SECRET" // #nosec G101 -- an env var name, not a credential
 	// ActivityURLEnv tells the child where its deliveries go. hermes reads
 	// the URL from the managed config the bridge writes; the variable is for
 	// the record and for test stubs standing in for hermes.
@@ -1125,7 +1125,7 @@ func (b *Bridge) childManagedScope(taskID string) (dir string, err error) {
 	var env []byte
 	src := b.cfg.ManagedScopeDir
 	if src != "" {
-		raw, rerr := os.ReadFile(filepath.Join(src, managedConfigFile))
+		raw, rerr := os.ReadFile(filepath.Join(src, managedConfigFile)) // #nosec G304 -- the operator-set managed scope directory, not task data
 		switch {
 		case rerr == nil:
 			// UseNumber: the copy has to carry the operator's pins as written,
@@ -1140,7 +1140,7 @@ func (b *Bridge) childManagedScope(taskID string) (dir string, err error) {
 		case !errors.Is(rerr, os.ErrNotExist):
 			return "", fmt.Errorf("managed config %s: %w", src, rerr)
 		}
-		raw, rerr = os.ReadFile(filepath.Join(src, managedEnvFile))
+		raw, rerr = os.ReadFile(filepath.Join(src, managedEnvFile)) // #nosec G304 -- same directory as above
 		switch {
 		case rerr == nil:
 			env = raw
