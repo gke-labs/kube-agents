@@ -1211,7 +1211,10 @@ func TestARejectedTaskPostsTheReasonTheExecutorGave(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	const reason = "reason: capability-refused - the verifier could not be reached"
+	// The notice carries the detail and never the token or the prefix
+	// (.agents/rules/chat_ux.md, "No plumbing in user text").
+	const detail = "the verifier could not be reached"
+	const reason = "reason: capability-refused - " + detail
 	payload, err := json.Marshal(lib.StatusUpdate{
 		TaskID: origin.TaskID, ContextID: origin.ContextID,
 		Status: lib.TaskStatus{State: lib.StateRejected, Message: &lib.Message{
@@ -1233,12 +1236,17 @@ func TestARejectedTaskPostsTheReasonTheExecutorGave(t *testing.T) {
 
 	waitFor(t, "the refusal posts with its reason", func() bool {
 		for _, p := range r.adapter.postTexts() {
-			if strings.Contains(p, reason) {
+			if strings.Contains(p, detail) {
 				return true
 			}
 		}
 		return false
 	})
+	for _, p := range r.adapter.postTexts() {
+		if strings.Contains(p, reasonPrefix) || strings.Contains(p, "capability-refused") {
+			t.Fatalf("the notice carries the executor's plumbing: %q", p)
+		}
+	}
 }
 
 func TestLongFailureReasonIsChunkedUnderTheCap(t *testing.T) {

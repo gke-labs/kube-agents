@@ -128,7 +128,11 @@ re-route, when there is one, is a button.
 Why: a failure is where trust is won or lost, and a promise nothing keeps loses it twice.
 
 Today: [`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §2 step 5 owns the agent's wording. The
-gateway's own failure lines follow the same shape: `slackStopCouldntReply` in
+gateway's own failure lines follow the same shape: `terminalNotice` in `a2a/gateway/relay.go` posts
+a failed task's end as `❌ failed — <why>` and a rejected one as `🚫 the executor rejected the
+task — <why>`, where `<why>` is one plain sentence per executor token (`reasonSentences`), or the
+detail the dispatcher or the verifier wrote for the person (`reasonDetailShown`), never the
+`reason:` token or an operator's detail (`reasonInPlainWords`); `slackStopCouldntReply` in
 `a2a/gateway/slack_stop.go` offers "Press Stop again" only where a second press can work, and
 `slackStopCouldntFinalReply` drops it where it cannot.
 
