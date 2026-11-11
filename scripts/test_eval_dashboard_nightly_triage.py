@@ -603,6 +603,26 @@ class ReviewFindingsTest(Harness):
         out, _ = self.route(issues, None, None, extra=["--no-model", "--stale-only"], now=now)
         self.assertIn("1 issues", out)
         self.assertEqual({p.split("/issues/")[1].split("/")[0] for m, p, b in issues.writes()}, {"37"})
+        [comment] = issues.posted()
+        self.assertIn("the triage job did not route this issue in the 2 hours since filing", comment)
+        self.assertNotIn("switched off", comment)
+
+    def test_the_evidence_is_the_streak_that_filed_the_issue(self):
+        def v(day, outcome):
+            return {"date": f"2026-11-{day:02d}", "outcome": outcome}
+        passed, failed, partial = nightly_triage.classify.OUTCOME_PASSED, nightly_triage.classify.OUTCOME_FAILED, nightly_triage.classify.OUTCOME_PARTIAL
+        # Red 6-8 (the filed streak), clear 9, red once more on 10.
+        nights = [v(5, passed), v(6, failed), v(7, failed), v(8, failed), v(9, passed), v(10, failed)]
+        red, green = nightly_triage.last_red_block(nights)
+        self.assertEqual([n["date"][-2:] for n in red], ["06", "07", "08"])
+        self.assertEqual(green["date"], "2026-11-05")
+        nights[4] = v(9, partial)
+        red, green = nightly_triage.last_red_block(nights)
+        self.assertEqual([n["date"][-2:] for n in red], ["06", "07", "08"])
+        self.assertEqual(green["date"], "2026-11-05")
+        # No streak long enough on record: the newest failing run.
+        red, green = nightly_triage.last_red_block([v(5, passed), v(6, failed), v(7, passed), v(8, failed)])
+        self.assertEqual(([n["date"][-2:] for n in red], green["date"]), (["08"], "2026-11-07"))
 
     def test_a_grader_fault_whose_author_cannot_be_read_goes_to_the_infra_owner(self):
         out = nightly_triage.route({"classification": "grader_or_harness", "suspected_pr": CULPRIT, "confidence": "high"}, None, {"prs": {}}, ["carol"], "ivan")

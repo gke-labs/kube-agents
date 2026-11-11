@@ -255,15 +255,24 @@ def gcs_tail(path: str, nbytes: int = TRANSCRIPT_TAIL_BYTES) -> str | None:
 
 
 def last_red_block(verdicts: list[dict]) -> tuple[list[dict], dict | None]:
-    """``(red nights, last green before them)``: the newest run of failing
-    nights in the window (current or since recovered), oldest first, and the
-    newest passing night before it, None when the window holds none."""
-    last = max((i for i, v in enumerate(verdicts) if v["outcome"] == classify.OUTCOME_FAILED), default=None)
-    if last is None:
+    """``(red nights, last green before them)``: the newest run of at least
+    STREAK_NIGHTS failing nights in the window (the streak that filed the
+    issue, even when a later night failed once more after a recovery), else
+    the newest run of failing nights; oldest first, and the newest passing
+    night before it, None when the window holds none."""
+    runs, i = [], 0
+    while i < len(verdicts):
+        if verdicts[i]["outcome"] != classify.OUTCOME_FAILED:
+            i += 1
+            continue
+        j = i
+        while j + 1 < len(verdicts) and verdicts[j + 1]["outcome"] == classify.OUTCOME_FAILED:
+            j += 1
+        runs.append((i, j))
+        i = j + 1
+    if not runs:
         return [], None
-    first = last
-    while first > 0 and verdicts[first - 1]["outcome"] == classify.OUTCOME_FAILED:
-        first -= 1
+    first, last = next((r for r in reversed(runs) if r[1] - r[0] + 1 >= nightly_bugs.STREAK_NIGHTS), runs[-1])
     green = next((v for v in reversed(verdicts[:first]) if v["outcome"] == classify.OUTCOME_PASSED), None)
     return verdicts[first:last + 1], green
 
@@ -677,8 +686,11 @@ def label_names(issue: dict) -> list[str]:
 class Router:
     """The route phase for one run (module docstring)."""
 
-    def __init__(self, gh: ghcli.Gh, model, model_name: str, repo_root: pathlib.Path = REPO_ROOT, live: bool = False, now=None):
+    def __init__(self, gh: ghcli.Gh, model, model_name: str, repo_root: pathlib.Path = REPO_ROOT, live: bool = False, now=None, stale_only: bool = False):
         self.gh, self.model, self.model_name, self.live = gh, model, model_name, live
+        # The tick's backstop (--stale-only): triage is on, and did not route
+        # these issues in time.
+        self.stale_only = stale_only
         self.infra_owner, _ = gate_issue.infra_addressees(repo_root / nightly_bugs.case_owner.DOMAINS_PATH)
         self.now = now or datetime.datetime.now(datetime.timezone.utc)
 
@@ -708,7 +720,8 @@ class Router:
             # got there first): no second opinion to pair with that assignee.
             failure = "already assigned"
         elif self.model is None:
-            failure = "triage is switched off (NIGHTLY_TRIAGE_LIVE is not true)"
+            failure = (f"the triage job did not route this issue in the {int(PENDING_MAX_AGE.total_seconds() // 3600)} hours since filing" if self.stale_only
+                       else "triage is switched off (NIGHTLY_TRIAGE_LIVE is not true)")
         elif bundle is None and opened and self.now - opened > PENDING_MAX_AGE:
             failure = f"no evidence was gathered in the {int(PENDING_MAX_AGE.total_seconds() // 3600)} hours since filing"
         elif bundle is None:
@@ -893,7 +906,7 @@ def main(argv=None, gh_runner=None, source_runner=None, model=None, git=None, gc
         client = None
     else:
         client = model or VertexModel(args.project, args.model)
-    router = Router(gh, client, args.model, args.repo_root, live=not args.dry_run, now=now)
+    router = Router(gh, client, args.model, args.repo_root, live=not args.dry_run, now=now, stale_only=args.stale_only)
     print(f"nightly triage ({'live' if not args.dry_run else 'dry run'}, {'no model' if client is None else args.model}): {len(issues)} issues", flush=True)
     # One line as each issue finishes, so a step killed at its timeout still
     # says what it routed.
