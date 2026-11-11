@@ -19,7 +19,7 @@ endpoint and ``inject`` enters the A2A gateway through its side door. This one
 goes the way a person does. A test user mentions the install's bot in a CI
 channel with ``chat.postMessage`` and a user token, Slack delivers it over
 Socket Mode, and the transport reads the thread back until the turn settles.
-What it grades is the thread's final bot message, and it times each Slack leg:
+What it grades is the report the thread delivered (split_thread; the harness folds it), and it times each Slack leg:
 post to the bot's first reaction, to its first reply (the ack), and to the
 answer.
 
@@ -45,6 +45,7 @@ import http.client
 import json
 import math
 import os
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -54,6 +55,16 @@ from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 
 SLACK_API_BASE = "https://slack.com/api/"
+# The gateway's progress posts, which carry no content of the turn's own: the
+# status line's placeholder and its "<icon> *<state>*[ — <progress>]" edits
+# (relay.go statusLine, terminalLine), and a non-final status note (relay.go,
+# "ℹ️ " + note). hack/slack-live-check/harness.py reads the same grammar.
+STATUS_PLACEHOLDER = "⏳ submitted…"
+STATUS_LINE_PATTERN = re.compile(r"\S+ \*[a-z-]+\*(?: — .*)?", re.DOTALL)
+STATUS_NOTE_PREFIX = "ℹ️ "
+# The id a thread post stands under in a delivered section: Slack shows no
+# task id, so the post's own timestamp names it.
+POST_ID_PREFIX = "slack-"
 # The three values the transport needs, from the environment; the lane script
 # reads the token from Secret Manager into the process and never onto disk.
 USER_TOKEN_ENV = "BENCH_SLACK_USER_TOKEN"
@@ -164,6 +175,29 @@ def has_buttons(msg: dict) -> bool:
         if block.get("type") == "actions" and any(e.get("type") == "button" for e in block.get("elements") or []):
             return True
     return False
+
+
+def is_progress(msg: dict) -> bool:
+    """Whether a bot post is the gateway's progress rather than content: the
+    status line, its placeholder, or a status note."""
+    text = msg.get("text", "").strip()
+    return (text == STATUS_PLACEHOLDER or text.startswith(STATUS_NOTE_PREFIX)
+            or STATUS_LINE_PATTERN.fullmatch(text) is not None)
+
+
+def post_id(msg: dict) -> str:
+    return POST_ID_PREFIX + str(msg.get("ts", "")).replace(".", "")
+
+
+def split_thread(posts: list[dict]) -> tuple[dict | None, list[dict]]:
+    """The thread's content posts as the ack and the card posts after it.
+
+    The router's first content post is its reply to the ask (the ack, or the
+    whole answer when nothing was delegated); every later content post is a
+    delegated card's delivery, a question when it carries buttons.
+    """
+    content = [p for p in posts if not is_progress(p)]
+    return (content[0], content[1:]) if content else (None, [])
 
 
 @dataclass

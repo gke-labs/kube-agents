@@ -70,7 +70,7 @@ def _turn(fake, clock):
                            poll_seconds=1.0, quiet_seconds=3.0)
 
 
-STATUS = {"ts": "1800000001.000200", "user": BOT, "bot_id": "B1", "text": "⏳ working"}
+STATUS = {"ts": "1800000001.000200", "user": BOT, "bot_id": "B1", "text": "⚙️ *working*"}
 ANSWER = {"ts": "1800000009.000300", "user": BOT, "bot_id": "B1", "text": "*Three clusters.*",
           "blocks": [{"type": "actions", "elements": [{"type": "button", "text": {"type": "plain_text", "text": "More"}}]}]}
 
@@ -224,3 +224,33 @@ def test_an_inject_only_directive_is_refused_before_anything_is_posted(monkeypat
     monkeypatch.setattr(harness, "_execute_slack", posted)
     result = harness.KubeAgentsHarness()._execute(f"{stop_hook.STOP_DIRECTIVE} observe=60\nscale it", opening_turn=True)
     assert result.has_errors() and "needs AGENT_TRANSPORT=inject" in result.errors[0]
+
+
+ACK = {"ts": "1800000002.000100", "user": BOT, "text": "I've asked the seeded-b cluster agent; it will post here."}
+CARD = {"ts": "1800000005.000100", "user": BOT, "text": "checkout-gateway runs 3 replicas on seeded-b."}
+QUESTION = {"ts": "1800000006.000100", "user": BOT, "text": "Which cluster should I scale?",
+            "blocks": [{"type": "actions", "elements": [{"type": "button", "text": {"type": "plain_text", "text": "seeded-a"}}]}]}
+NOTE = {"ts": "1800000003.000100", "user": BOT, "text": "ℹ️ looking at seeded-b"}
+
+
+def test_the_slack_report_is_the_report_the_other_transports_build(monkeypatch):
+    """The same thread content folds to the same report _append_delivered builds on api and inject."""
+    posts = [STATUS, ACK, NOTE, CARD, QUESTION]
+    got = harness._slack_report(posts)
+
+    card_id, question_id = slack.post_id(CARD), slack.post_id(QUESTION)
+    monkeypatch.setattr(harness, "delivered_results", lambda observed, ids: {card_id: CARD["text"]})
+    monkeypatch.setattr(harness, "paused_questions", lambda observed, ids: {question_id: QUESTION["text"]})
+    reference = harness.AgentResult(output=ACK["text"], trajectory=[], tokens={}, errors=[],
+                                    metadata={"final_message": ACK["text"]})
+    harness._append_delivered(reference, [], [card_id, question_id])
+
+    assert got == reference.output == reference.metadata["final_message"]
+    assert got.startswith(ACK["text"])
+    assert f"Result of delegated task {card_id}:\n{CARD['text']}" in got
+    assert f"Question from delegated task {question_id}:\n{QUESTION['text']}" in got
+    assert "looking at" not in got and "working" not in got
+
+
+def test_a_direct_answer_is_the_whole_report():
+    assert harness._slack_report([STATUS, ANSWER]) == ANSWER["text"]

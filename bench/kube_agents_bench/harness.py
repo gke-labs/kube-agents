@@ -2841,7 +2841,15 @@ def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> Agent
 
 
 def _execute_slack(prompt: str) -> AgentResult:
-    """The Slack transport: one ask as the test user, graded on the thread's last bot message.
+    """The Slack transport: one ask as the test user, graded on the report the thread delivered.
+
+    The report is built the way the other transports build theirs
+    (:func:`_append_delivered`): the router's first content post, then each
+    later card post as a "Result of delegated task" section, or a "Question
+    from delegated task" section when it carries buttons, folded with
+    :func:`_fold_sections`. Slack shows no task id, so a section names its post
+    by timestamp (``slack-<ts>``). No trajectory is recorded, so a case that
+    checks a worker's tool calls cannot pass here.
 
     Missing configuration is infrastructure, never graded, so the lane script's
     skip and a half-configured run cannot read as the agent's failure. The
@@ -2869,14 +2877,15 @@ def _execute_slack(prompt: str) -> AgentResult:
     if exchange.outcome == "no_reply":
         return _infra_failure(f"slack: no bot reply in the thread within {timeout:g}s")
     errors = [] if exchange.outcome == "settled" else [f"slack: the turn had not settled by {timeout:g}s"]
+    report = _slack_report(exchange.posts)
     return AgentResult(
-        output=exchange.deliverable,
+        output=report,
         trajectory=[],
         tokens={},
         errors=errors,
         metadata={
             "transport": TRANSPORT_SLACK,
-            "final_message": exchange.deliverable,
+            "final_message": report,
             "outcome": exchange.outcome,
             "window_posts": len(exchange.posts),
             "slack_ask_ts": exchange.ask_ts,
@@ -2886,6 +2895,18 @@ def _execute_slack(prompt: str) -> AgentResult:
             **timing,
         },
     )
+
+
+def _slack_report(posts: list[dict[str, Any]]) -> str:
+    """The thread's delivered report: the ack, then a section per card post."""
+    ack, cards = slack.split_thread(posts)
+    sections = [
+        (_QUESTION_SECTION if slack.has_buttons(p) else _RESULT_SECTION).format(
+            tid=slack.post_id(p), text=p.get("text", "")
+        )
+        for p in cards
+    ]
+    return _fold_sections(str((ack or {}).get("text", "")), sections)
 
 
 class _DelegationTransportExhausted(Exception):
