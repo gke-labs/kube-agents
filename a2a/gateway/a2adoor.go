@@ -97,7 +97,11 @@ const (
 	// conversations evict the oldest idle one (see conversationLocked); a client that wants a task after eviction is told it is
 	// not found, which is the protocol's own answer for a task the server
 	// no longer holds.
-	a2aMaxTasks         = 4096
+	a2aMaxTasks = 4096
+	// a2aMaxEvictedIDs bounds the ids the door remembers having evicted,
+	// so a caller asking after one is told it was evicted, not that the
+	// door never held it (a2aTaskNotHeld).
+	a2aMaxEvictedIDs    = a2aMaxTasks
 	a2aMaxConversations = 1024
 	// a2aMaxResultBytes bounds the artifact the door keeps. A longer
 	// deliverable is cut at a rune boundary and the Task says so in
@@ -294,6 +298,13 @@ type A2ADoor struct {
 	convOrder     []string
 	tasks         map[string]*a2aTask
 	taskOrder     []string
+	// evicted is each task id the door dropped to stay inside its bounds,
+	// with its caller, oldest first in evictedOrder; servingSince is when
+	// this gateway's door started serving. Together they tell a caller why
+	// a task isn't held (a2aTaskNotHeld).
+	evicted      map[string]string
+	evictedOrder []string
+	servingSince time.Time
 	// retainedBytes is the tasks' bytes summed, for the budget.
 	retainedBytes int
 	submissions   map[string]*a2aOutcome
@@ -407,6 +418,9 @@ func (d *A2ADoor) Run(ctx context.Context, handler func(InboundMessage)) error {
 	d.handlerMu.Lock()
 	d.handler = handler
 	d.handlerMu.Unlock()
+	d.mu.Lock()
+	d.servingSince = time.Now()
+	d.mu.Unlock()
 	defer func() {
 		d.handlerMu.Lock()
 		d.handler = nil
@@ -681,7 +695,7 @@ func (d *A2ADoor) send(r *http.Request, verified string, handler func(InboundMes
 		// caller's own and still running.
 		task, ok := d.taskFor(msg.TaskID, caller)
 		if !ok {
-			return rpcFail(req.ID, a2aErrTaskNotFound, "no such task for this caller: "+msg.TaskID, nil)
+			return d.a2aTaskNotHeld(req.ID, msg.TaskID, caller)
 		}
 		if task.terminal {
 			return rpcFail(req.ID, rpcInvalidParams, "task "+msg.TaskID+" is over; start a new one", nil)
@@ -825,7 +839,7 @@ func (d *A2ADoor) get(r *http.Request, verified string, req rpcRequest) rpcRespo
 		return rpcFail(req.ID, rpcInvalidParams, "id is required", nil)
 	}
 	if _, ok := d.taskFor(params.ID, caller); !ok {
-		return rpcFail(req.ID, a2aErrTaskNotFound, "no such task for this caller: "+params.ID, nil)
+		return d.a2aTaskNotHeld(req.ID, params.ID, caller)
 	}
 	obj := d.taskObject(params.ID)
 	if params.HistoryLength != nil && *params.HistoryLength >= 0 && *params.HistoryLength < len(obj.History) {
@@ -852,7 +866,7 @@ func (d *A2ADoor) cancel(r *http.Request, verified string, handler func(InboundM
 	}
 	task, ok := d.taskFor(params.ID, caller)
 	if !ok {
-		return rpcFail(req.ID, a2aErrTaskNotFound, "no such task for this caller: "+params.ID, nil)
+		return d.a2aTaskNotHeld(req.ID, params.ID, caller)
 	}
 	if task.terminal {
 		return rpcFail(req.ID, a2aErrTaskNotCancelable, "task "+params.ID+" is already "+string(task.state), nil)
@@ -1423,8 +1437,69 @@ func (d *A2ADoor) evictOldestTaskLocked(keep *a2aTask) {
 	if old := d.tasks[oldest]; old != nil && old != keep {
 		d.retainedBytes -= old.bytes
 		delete(d.tasks, oldest)
+		d.rememberEvictedLocked(oldest, old.caller)
 	}
 	d.taskOrder = d.taskOrder[1:]
+}
+
+// rememberEvictedLocked records an evicted task's id and caller, dropping
+// the oldest record past a2aMaxEvictedIDs. Caller holds d.mu.
+func (d *A2ADoor) rememberEvictedLocked(taskID, caller string) {
+	if d.evicted == nil {
+		d.evicted = map[string]string{}
+	}
+	if _, ok := d.evicted[taskID]; !ok {
+		d.evictedOrder = append(d.evictedOrder, taskID)
+	}
+	d.evicted[taskID] = caller
+	for len(d.evictedOrder) > a2aMaxEvictedIDs {
+		delete(d.evicted, d.evictedOrder[0])
+		d.evictedOrder = d.evictedOrder[1:]
+	}
+}
+
+// The reasons in a not-found error's data (a2aTaskNotHeld), which a client
+// reads to know it should resubmit instead of parsing the message.
+const (
+	// a2aNotHeldEvicted: the door held the caller's task and evicted it to
+	// stay inside its bounds.
+	a2aNotHeldEvicted = "evicted"
+	// a2aNotHeldSinceServing: this gateway holds no record of the id. The
+	// door keeps tasks in the active gateway's memory only, so a task
+	// submitted before servingSince was lost to a gateway restart or
+	// failover. Also the answer for an id that is another caller's or that
+	// no door minted, so it confirms nothing about ids the caller can't read.
+	a2aNotHeldSinceServing = "not-held-since-serving"
+)
+
+// a2aNotHeldData is the data of a door not-found error: why the task isn't
+// held, when this gateway started serving the door, and that the caller
+// should resubmit the task if it wants it done.
+type a2aNotHeldData struct {
+	Reason       string `json:"reason"`
+	ServingSince string `json:"servingSince"`
+	Resubmit     bool   `json:"resubmit"`
+}
+
+// a2aTaskNotHeld is the protocol's task-not-found error (-32001) for a
+// task the door doesn't hold for this caller, with a2aNotHeldData saying
+// why. Only the caller's own evicted task is told it was evicted; every
+// other miss reads the same, so the answer confirms no id another caller
+// holds.
+func (d *A2ADoor) a2aTaskNotHeld(id json.RawMessage, taskID, caller string) rpcResponse {
+	d.mu.Lock()
+	evictedCaller, wasEvicted := d.evicted[taskID]
+	since := d.servingSince
+	d.mu.Unlock()
+	data := a2aNotHeldData{Reason: a2aNotHeldSinceServing, ServingSince: since.UTC().Format(time.RFC3339), Resubmit: true}
+	if wasEvicted && evictedCaller == caller {
+		data.Reason = a2aNotHeldEvicted
+		return rpcFail(id, a2aErrTaskNotFound, "no such task for this caller: "+taskID+
+			"; the door held it and has since evicted it to stay inside its bounds: resubmit it if it still needs doing", data)
+	}
+	return rpcFail(id, a2aErrTaskNotFound, "no such task for this caller: "+taskID+
+		"; the A2A door keeps tasks in the active gateway's memory only, and this gateway has served the door since "+
+		data.ServingSince+": a task submitted before then was lost to a gateway restart or failover and has to be resubmitted", data)
 }
 
 // CancelPublished records that a cancel reached the bus.
