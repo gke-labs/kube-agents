@@ -2107,8 +2107,8 @@ is `A2A_SLACK_TEST_USERS`, set only on CI and eval installs (the operator render
 from its own environment, the chart's `operator.slackTestUsers`): a `bot_id` message
 whose `user` is a listed member id is read as that member's, logged each time, and
 meets every other gate as theirs; the bot's own member id is refused whatever the list
-says. That is what lets `tests/e2e/slack_agent_test.py` and the bench's Slack transport
-post as a test user. Group DMs
+says. That is what lets a scripted test user, posting through an app with a user token,
+reach a turn. Group DMs
 (mpim) are group spaces here, not DMs - they have threads, so the mention affordance
 applies; Discord's group DMs read as DMs, and the asymmetry is deliberate. The bot
 only sees channels it has been invited to, so the invitation is the trust boundary for
