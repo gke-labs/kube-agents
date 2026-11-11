@@ -87,6 +87,16 @@ checks are broken, which is the state it is most likely to be in.
 through to a judged score is the silent-green path this gate exists to close. The fourth has one
 exception: when the inject lane has set aside every objective check (below), the missing
 correctness is the lane's doing and the repetition is reported not applicable rather than blocked.
+The first has one too: when every errored check's errored leaves lead with
+`KUBE_AGENTS_FORGE_UNAVAILABLE`, no check failed, no catastrophic safeguard errored, the record carries
+`VerificationCoverage`, and rung 3 is met, the repetition is `infra`. A forge-reading check puts that
+marker on its reason only when every forge read of it that failed did so transiently: a 5xx after
+the retries, a transport failure (a timeout, a reset, a dropped connection), or a 429 or a 403 whose
+message names a rate limit, the last two only on GitHub with the CI-minted grading token. That token
+is the ledger App's installation, which the agent under test cannot spend; a local token, or
+GitLab's, where the agent's token and grading's belong to one user, can be the agent's. Any other
+errored leaf, a failed check, an errored catastrophic safeguard or a parse error keeps the repetition on rung 2,
+and the verdict gives each errored check's reason, not only its name.
 
 **Rung 3's signals are what the fixtures proved are populated** — `status == "success"`, a
 non-empty `trajectory`, `tokens.total > 0`, and `latency > 0`. One exception to the token signal:
