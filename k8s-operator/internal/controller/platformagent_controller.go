@@ -414,12 +414,22 @@ const (
 	dataVolumeExpansionBlockedReason = "StorageClassCannotExpand"
 	// dataVolumeExpansionMessageFormat takes the claim, its current request,
 	// the resolved size and one of the three sentences below that say why.
-	dataVolumeExpansionMessageFormat = "Claim %s requests %s, and the data volume size (spec.storage.size, or the " +
-		"operator default) is %s. %s The operator leaves the claim at its current size."
+	dataVolumeExpansionMessageFormat = "Claim %s requests %s, and the data volume size (spec.storage.size or the " +
+		"operator default, raised for spec.storage.expectedClusterProfiles on the agent's claim) is %s. %s The " +
+		"operator leaves the claim at its current size."
 	dataVolumeNoStorageClassReason  = "The claim names no StorageClass, so it cannot expand."
 	dataVolumeStorageClassGoneFmt   = "StorageClass %q does not exist, so the claim cannot expand."
 	dataVolumeStorageClassFixedFmt  = "StorageClass %q does not allow volume expansion. Set allowVolumeExpansion: true on the class to let the claim grow."
 	dataVolumeExpansionMsgSeparator = " "
+	// The Warning Event for an agent data claim below
+	// ResolveAgentDataStorageSize that will not grow: a claim the operator does
+	// not control (made or adopted by hand), or one whose StorageClass cannot
+	// expand it, which DataVolumeNotExpanded also reports. An Event rather than
+	// a second condition reason, so the condition's API is unchanged.
+	dataVolumeUndersizedReason   = "DataVolumeUndersized"
+	dataVolumeUndersizedFormat   = "Claim %s requests %s, below the %s the data volume should have (spec.storage.size or the operator default, raised for spec.storage.expectedClusterProfiles). %s"
+	dataVolumeUnownedSentence    = "The claim is not controlled by this PlatformAgent, so the operator leaves its size to whoever made it; resize it by hand."
+	dataVolumeCannotGrowSentence = "Its StorageClass cannot expand it; see the DataVolumeNotExpanded condition."
 
 	conditionReasonInvalidGitRepoURL   = "InvalidGitRepoURL"
 	conditionReasonCorruptManagedRepos = "CorruptManagedRepos"
@@ -585,6 +595,13 @@ type PlatformAgentReconciler struct {
 	// then leave the condition as it stands. Cleared when the CR is deleted.
 	dataVolumeExpansion sync.Map
 
+	// dataVolumeUndersizedWarned records, per data claim, the
+	// DataVolumeUndersized Event this process last wrote, so a claim that stays
+	// in the same state is warned about once rather than on every pass. Keyed by
+	// the claim's ObjectKey, value string; removed when the claim is no longer
+	// undersized and cleared when the CR is deleted.
+	dataVolumeUndersizedWarned sync.Map
+
 	// gatewayLeaseSeen records each A2A gateway Lease this process has seen
 	// exist, and gatewayLeaseGoneAt when it first saw a seen one missing:
 	// a deletion's recreate is held back from then (ensureA2AGatewayLease).
@@ -630,6 +647,10 @@ type PlatformAgentReconciler struct {
 	// in the ClusterRole, which the RBAC self-check names when an image runs
 	// ahead of its role.
 	Recorder record.EventRecorder
+
+	// busConfigLoadTime stands in for reading the A2A bus's config_load_time
+	// from its monitoring endpoint (a2aBusConfigLoadTime). Nil reads it.
+	busConfigLoadTime func(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, error)
 
 	// clusterImageVolumes caches the cluster-wide ImageVolume capability. Server
 	// version cannot change without an API server restart, so resolving it once
@@ -1370,6 +1391,10 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if a2aState.leaseRequeue > 0 {
 			requeue = min(requeue, a2aState.leaseRequeue)
 		}
+		// So can a pending bus reload's recheck (planA2ABusReload).
+		if a2aState.busReloadRequeue > 0 {
+			requeue = min(requeue, a2aState.busReloadRequeue)
+		}
 		return ctrl.Result{RequeueAfter: requeue}, nil
 	}
 
@@ -1385,6 +1410,10 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// So is a stuck bus pod's replacement (replaceStuckA2ANATSPod).
 		if a2aState.busPodRequeue > 0 {
 			requeue = min(requeue, a2aState.busPodRequeue)
+		}
+		// And a bus config reload still pending (planA2ABusReload).
+		if a2aState.busReloadRequeue > 0 {
+			requeue = min(requeue, a2aState.busReloadRequeue)
 		}
 		if credentialProxyExecShort(instance) {
 			requeue = min(requeue, credentialProxyExecShortRequeue)
@@ -1439,6 +1468,11 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// that replaces it has to be asked for, since pods are not watched.
 	if a2aNext && a2aState.busPodRequeue > 0 {
 		requeueAfter = min(requeueAfter, a2aState.busPodRequeue)
+	}
+	// A bus config reload not yet confirmed: nothing watched moves when the
+	// bus's config_load_time does.
+	if a2aNext && a2aState.busReloadRequeue > 0 {
+		requeueAfter = min(requeueAfter, a2aState.busReloadRequeue)
 	}
 	// An exec tier short of its count: the scheduler's verdict lands on a pod,
 	// which is not watched, so the pass that reads it has to be asked for.
@@ -1646,18 +1680,22 @@ func (r *PlatformAgentReconciler) reconcilePVC(ctx context.Context, agent *agent
 			return err
 		}
 	}
-	// The data claim follows ResolveDataStorageSize on an existing install too.
+	// The data claim follows ResolveAgentDataStorageSize on an existing install too.
 	// reconcilePersistentVolumeClaim is create-only, so without this a size
 	// raised to stop the volume filling would reach new installs only, and
 	// every install that already had the problem would keep it.
 	//
 	// The sandbox's claim grows first. It is the destination of the mirror, so
-	// a park, an error or a refusal between the two grows leaves the sandbox
-	// claim the larger one, never the smaller. This also runs before
+	// a park, an error or a refusal between the two grows leaves it at its full
+	// size before the agent's grows. The agent's claim can be the larger one by
+	// spec.storage.expectedClusterProfiles: that budget is for the session
+	// stores, which the mirror does not copy. This also runs before
 	// reconcileShellSandbox applies the StatefulSet.
 	r.growShellSandboxDataClaim(ctx, agent)
 	key := client.ObjectKeyFromObject(dataClaim)
-	r.noteDataClaimGrowth(key, r.growDataClaim(ctx, key, dataClaim.Spec.Resources.Requests[corev1.ResourceStorage], agent))
+	growth := r.growDataClaim(ctx, key, dataClaim.Spec.Resources.Requests[corev1.ResourceStorage], agent)
+	r.noteDataClaimGrowth(key, growth)
+	r.warnUndersizedDataClaim(agent, key, growth)
 	return nil
 }
 
@@ -3005,7 +3043,9 @@ func (r *PlatformAgentReconciler) ungatedDNSClusterIPs(ctx context.Context, agen
 	return r.resolveNetpolProfile(ctx, ungated).DNSClusterIPs
 }
 
-// growShellSandboxDataClaim widens the sandbox's data claim to match the agent's.
+// growShellSandboxDataClaim widens the sandbox's data claim to ResolveDataStorageSize:
+// the agent's claim without the per-profile budget, which covers session stores
+// the mirror does not copy.
 //
 // A StatefulSet's volumeClaimTemplate sizes only the claims it creates, so an
 // install from before the current ResolveDataStorageSize keeps the size it was
@@ -3026,6 +3066,9 @@ func (r *PlatformAgentReconciler) growShellSandboxDataClaim(ctx context.Context,
 type dataClaimGrowth struct {
 	claim      string
 	have, want resource.Quantity
+	// unowned is true for a claim the owner passed to growDataClaim does not
+	// control, which growDataClaim leaves at its size.
+	unowned bool
 	// cannotExpand is "" unless the claim is below want and its StorageClass
 	// cannot expand it. Then it is the sentence that says why.
 	cannotExpand string
@@ -3073,11 +3116,42 @@ func (r *PlatformAgentReconciler) dataVolumeExpansionMessage(agent *agentv1alpha
 func (r *PlatformAgentReconciler) forgetDataVolumeExpansion(agent *agentv1alpha1.PlatformAgent) {
 	for _, key := range dataClaimKeys(agent) {
 		r.dataVolumeExpansion.Delete(key)
+		r.dataVolumeUndersizedWarned.Delete(key)
 	}
 }
 
-// dataClaimKeys are the two claims ResolveDataStorageSize sizes: the agent's
-// own data claim and the sandbox's.
+// warnUndersizedDataClaim writes one DataVolumeUndersized Warning Event when
+// the agent's data claim is below the size it should have and will not grow,
+// and again only when what it says changes. A nil growth (the claim could not
+// be read) leaves the record alone; a claim that is not undersized, or that
+// growDataClaim patched, clears it, so a later shortfall is warned about anew.
+func (r *PlatformAgentReconciler) warnUndersizedDataClaim(agent *agentv1alpha1.PlatformAgent, key client.ObjectKey, growth *dataClaimGrowth) {
+	if growth == nil {
+		return
+	}
+	var why string
+	switch {
+	case growth.have.IsZero() || growth.have.Cmp(growth.want) >= 0:
+	case growth.unowned:
+		why = dataVolumeUnownedSentence
+	case growth.cannotExpand != "":
+		why = dataVolumeCannotGrowSentence
+	}
+	if why == "" {
+		r.dataVolumeUndersizedWarned.Delete(key)
+		return
+	}
+	msg := fmt.Sprintf(dataVolumeUndersizedFormat, growth.claim, growth.have.String(), growth.want.String(), why)
+	if previous, ok := r.dataVolumeUndersizedWarned.Load(key); ok && previous.(string) == msg {
+		return
+	}
+	r.dataVolumeUndersizedWarned.Store(key, msg)
+	r.recordEvent(agent, corev1.EventTypeWarning, dataVolumeUndersizedReason, msg)
+}
+
+// dataClaimKeys are the two data claims: the agent's own, which
+// ResolveAgentDataStorageSize sizes, and the sandbox's, which
+// ResolveDataStorageSize sizes.
 func dataClaimKeys(agent *agentv1alpha1.PlatformAgent) []client.ObjectKey {
 	return []client.ObjectKey{
 		client.ObjectKeyFromObject(buildPVC(agent)),
@@ -3184,13 +3258,14 @@ func (r *PlatformAgentReconciler) growDataClaim(ctx context.Context, key client.
 		}
 		return growth
 	}
+	have := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
+	growth.have = have
 	if owner != nil && !metav1.IsControlledBy(pvc, owner) {
 		log.Info("the data claim is not the operator's; leaving its size alone", "claim", key.Name)
+		growth.unowned = true
 		return growth
 	}
 
-	have := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
-	growth.have = have
 	if have.Cmp(want) >= 0 {
 		// The spec asks for enough. Whether the volume has it is a different
 		// question: the API server admits a resize on the StorageClass alone, and

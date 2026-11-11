@@ -1,0 +1,62 @@
+# Control plane, setup, cost and CLI (gce-compute-fleet-audit): a controller
+# or leader-election sidecar updates a ConfigMap or Lease hundreds of times a
+# second with no client rate limit, and the API server answers 429 to every
+# other client. A declared gap: expected_fail until the check lands
+# (gke-labs/kube-agents#5412, which proposes
+# `apiserver-configmap-lease-write-storm`). Nothing is planted today: the
+# shape (a one-replica Deployment `state-sync-controller` in seeded-shapes
+# whose arguments disable client rate limits, writing nothing) lands in the
+# pull request that adds the check, which rebinds this case to its role and
+# flips the marker in the same diff. The customer failure, hundreds of writes
+# a second, is never reproduced: a storm on a shared cluster is forbidden, and
+# a slow real writer was dropped because no check reads a rate, a kubectl
+# writer would show as an operator caller in the readiness report's audit-log
+# read on every run, and a Terraform-managed ConfigMap patched at run time
+# carries a perpetual diff. Two flip conditions: a check that reads a
+# controller's arguments for disabled rate limits (in this stream, or another,
+# which edits `audit:` and `finding_check` in the same diff) flips this case
+# once the shape is planted; a check that thresholds on an audit-log write
+# rate never flips it, because the shape writes nothing. `fixtures: []`: the run
+# plants nothing and reads no fixture, so no fixture's drift may excuse it; no
+# safeguard reads a fixture because none exists yet. Domain `fleet-audits` as the other GCE compute
+# cases.
+# Isolation class: fleet-read-only, GitOps-repo write (the audit's ledger).
+id: control-plane-configmap-lease-write-storm
+name: "ConfigMap and Lease write storm (declared gap; planted as a controller with rate limits disabled, writing nothing, when its check lands)"
+domain: fleet-audits
+suite: certification
+expected_fail: true
+audit_streams:
+  - gce-compute-fleet-audit
+fixtures: []
+prompt: >-
+  Run the gce-compute-fleet-audit audit across the fleet, following the
+  gce-compute-fleet-audit SOP.
+expected_output: >-
+  Planted as a controller whose arguments disable client rate limits, writing
+  nothing, once its check lands. Customer failure: hundreds of writes a second
+  and 429s. Certified means: the ledger issue carries a finding that names
+  Deployment `state-sync-controller` as a controller without rate-limit
+  arguments; a rate check never flips this case. The closing response is the
+  SOP's one line with the ledger URL.
+infrastructure:
+  deployer: noop
+validated: false
+
+verification_spec:
+  # One finding must carry both the check and the shape's object. The three
+  # slugs are the names the case accepts; the first is the one #5412 proposes.
+  - name: ledger-files-the-write-storm-shape-on-the-controller
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: gce-compute-fleet-audit
+      scope: finding
+      finding_check:
+        [
+          "apiserver-configmap-lease-write-storm",
+          "control-plane-write-churn",
+          "apiserver-429-rate-limit",
+        ]
+      any_of_phrases: ["state-sync-controller"]

@@ -981,6 +981,33 @@ def test_an_unreachable_api_is_an_error(env, github):
     assert "could not reach the GitHub API" in res.reason
 
 
+@pytest.mark.parametrize(
+    "answer, marked",
+    [
+        ((503, {"message": "Service Unavailable"}), True),
+        ((403, {"message": "API rate limit exceeded for installation ID 1."}), True),
+        (ConnectionResetError("Connection reset by peer"), True),
+        ((403, {"message": "Resource not accessible by integration"}), False),
+    ],
+    ids=["503", "rate-limit-403", "reset", "permission-403"],
+)
+def test_a_listing_the_forge_failed_marks_the_error(env, github, monkeypatch, tmp_path, answer, marked):
+    """The writes check reads through the noting wrapper (its client is built on it)."""
+    (tmp_path / "ledger-token").write_text("ghs_fake\n")
+    monkeypatch.setenv(forges.GITHUB_TOKEN_FILE_ENV_VAR, str(tmp_path / "ledger-token"))
+    stash()
+    if isinstance(answer, OSError):
+        def boom():
+            raise answer
+
+        github.routes[WINDOWED_LISTING] = boom
+    else:
+        github.routes[WINDOWED_LISTING] = answer
+    res = check().verify(5.0)
+    assert res.status == "error"
+    assert res.reason.startswith(forges.FORGE_UNAVAILABLE_MARKER) is marked
+
+
 def test_a_listing_that_is_not_a_list_is_an_error(env, github):
     stash()
     github.routes[WINDOWED_LISTING] = (200, {"message": "odd"})
