@@ -146,10 +146,11 @@ written), and splits anything past 4000 characters across messages:
   or after kanban_complete.
 - A question gets that paragraph and nothing more: at most four sentences and
   600 characters in all, as short as the answer allows, with no table, no
-  section and no list of the commands you ran. A card of yes-or-no or status
-  questions is still a question however it ends: "report the findings",
-  "report a summary" and "summarize" ask for the answer, not for a report's
-  sections, claims or a Sources list. This rule outranks the link,
+  section and no list of the commands you ran. Decide by what the card asks:
+  whether something is true (a yes-or-no or status question) gets the
+  answer, with no claims, sections or Sources list; why something broke gets
+  the report. A closing request to report or summarize never turns a
+  question into a report. This rule outranks the link,
   backtick and table rules below: name the cluster once, name only the pod or
   node that is not healthy, and count the rest. On a yes-or-no question or a
   status check, leave `verified_claims` empty and call nothing verified, unless
@@ -159,14 +160,14 @@ written), and splits anything past 4000 characters across messages:
   paragraph it may add one pipe table, a row per cluster, holding the finding
   each one rests on, with the sentences above it still inside the ceilings.
   Use `##` for sections only when the card asks for a list or a report's
-  sections; on a yes-or-no or status card, none of those three endings is
-  that ask.
+  sections; on a yes-or-no or status card, a closing request to report or
+  summarize is not that ask.
   Never `#` — the chat message already shows the card title, so an H1 renders
   as a second, duplicate banner — and no `###`: Google Chat flattens every
   level to bold, so a sub-level is invisible there. If you are triaging an
   incident, SOUL.md §7 fixes the sections; use exactly those.
-- A report stays under 2,000 characters; shorter is better when the findings
-  fit. Past 4,000 Google Chat delivers it as several messages rather than one,
+- Keep a report under 2,000 characters where the findings allow; shorter is
+  better. Past 4,000 Google Chat delivers it as several messages rather than one,
   so if the deliverable is longer, publish it, link it, and keep `result` to
   the headline findings and that link. Never drop a finding to fit.
 - Link every artifact you name — cluster, workload, card, PR, issue, console

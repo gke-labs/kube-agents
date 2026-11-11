@@ -237,18 +237,18 @@ class StanzaTest(unittest.TestCase):
         self.assertIn("On a yes-or-no question or a status check, leave `verified_claims` empty", flat)
         self.assertIn("unless the card asks for verified claims", flat)
 
-    def test_a_question_stays_a_question_however_the_card_ends(self):
-        # A status card ending "Report the findings." drew claims and a Sources list; no ending earns them.
+    def test_whether_or_why_decides_not_how_the_card_ends(self):
+        # A status card ending "Report the findings." drew claims and a Sources list; no closing earns them.
         flat = " ".join(REPORT_FORMAT_STANZA.split())
         self.assertIn(
-            'A card of yes-or-no or status questions is still a question however it ends: "report the findings", '
-            '"report a summary" and "summarize" ask for the answer, not for a report\'s sections, claims or a '
-            "Sources list.",
+            "Decide by what the card asks: whether something is true (a yes-or-no or status question) gets the "
+            "answer, with no claims, sections or Sources list; why something broke gets the report. A closing "
+            "request to report or summarize never turns a question into a report.",
             flat,
         )
         self.assertNotIn("even when it ends", flat)
         # A root-cause card ending "Report the findings." keeps its sections.
-        self.assertIn("on a yes-or-no or status card, none of those three endings is that ask.", flat)
+        self.assertIn("on a yes-or-no or status card, a closing request to report or summarize is not that ask.", flat)
 
     def test_the_question_budget_is_the_cases(self):
         """The stanza's question rule and ``chat-voice-answer-first`` name one budget.
@@ -273,7 +273,7 @@ class StanzaTest(unittest.TestCase):
             f"{max_chars} characters in all",
             bullet,
         )
-        self.assertIn("A report stays under 2,000 characters", REPORT_FORMAT_STANZA)
+        self.assertIn("Keep a report under 2,000 characters where the findings allow", " ".join(REPORT_FORMAT_STANZA.split()))
 
     def test_the_stanza_itself_is_clean(self):
         """Self-consistency: the instructions must not violate their own rules."""
