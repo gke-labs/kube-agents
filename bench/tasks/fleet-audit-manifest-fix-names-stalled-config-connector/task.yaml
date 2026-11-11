@@ -31,7 +31,10 @@
 # with Ready=False and makes no GCP call. When Config Connector runs in
 # namespaced mode, the plant first creates a ConfigConnectorContext in that
 # namespace with the service account in kcc_google_service_account (it needs
-# no IAM role), because no controller watches a namespace without one. The same declaration, committed to
+# no IAM role), because no controller watches a namespace without one. The
+# namespace carries kubeagents.x-k8s.io/stall-watch: exempt, so the install's
+# stall watch raises no alert on the object; the audits do not read that
+# annotation. The same declaration, committed to
 # the GitOps repository at clusters/<seeded-a>/provisioning/pinned-inference-pool.yaml,
 # is the file the SOP's fix for the capped, single-zone pool edits. The
 # teardown closes the pull request the run opened on that file (only from the
@@ -81,9 +84,14 @@ domain: fleet-audits
 # Who answers when this case flakes -- see bench/CONTRIBUTING.md.
 owner: dshnayder
 
-# The pool the declaration names is the hpa-saturated role's.
+# The pool the declaration names is the hpa-saturated role's. The stack plants
+# on the cluster of the config-connector-namespaced role. The drift gate
+# (bench/kube_agents_bench/fixture_drift.py) reads the singular fixture_role
+# of the last check, hpa-saturated; when Config Connector is not on seeded-a,
+# the plant stops at apply.
 fixtures:
   - hpa-saturated
+  - config-connector-namespaced
 
 verification_spec:
   # The deciding check: the object as the note names it, the planted

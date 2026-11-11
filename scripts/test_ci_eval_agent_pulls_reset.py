@@ -142,10 +142,10 @@ class FakeGitHub:
 import urllib.parse  # noqa: E402  (after the module load, like the helper's own)
 
 
-def run_reset(github, dry_run=False, repo=REPO, project=PROJECT):
+def run_reset(github, dry_run=False, repo=REPO, project=PROJECT, kcc_cluster=""):
     out, err = io.StringIO(), io.StringIO()
     with mock.patch.object(helper.ledgers, "api", github), mock.patch.object(helper, "pause", lambda s: None), redirect_stdout(out), redirect_stderr(err):
-        record = helper.reset(repo, project, BUILD, "before pdb-remediation-pr rep 2", "tok", dry_run)
+        record = helper.reset(repo, project, BUILD, "before pdb-remediation-pr rep 2", "tok", dry_run, kcc_cluster=kcc_cluster)
     return record, out.getvalue(), err.getvalue()
 
 
@@ -342,12 +342,12 @@ class PlantedStackFileTest(unittest.TestCase):
         self.assertTrue(record["clean"])
         self.assertEqual([m for m, _, _ in github.calls if m == "DELETE"], [])
 
-    def test_no_file_is_a_quiet_clean_and_only_the_one_path_is_read(self):
+    def test_no_file_is_a_quiet_clean_and_only_the_stack_paths_are_read(self):
         github = FakeGitHub()
         record, _, err = run_reset(github)
         self.assertTrue(record["clean"])
         contents = [path for m, path, _ in github.calls if "/contents/" in path]
-        self.assertEqual(contents, [f"/repos/{REPO}/contents/{PLANTED}?ref=main"] * 2)
+        self.assertEqual(contents, [f"/repos/{REPO}/contents/{path}?ref=main" for path in (PLANTED, KCC_PLANTED)] * 2)
         self.assertEqual(err, "")
 
     def test_a_delete_github_refuses_leaves_the_repository_not_clean(self):
@@ -373,6 +373,89 @@ class PlantedStackFileTest(unittest.TestCase):
         self.assertIn(f'MANAGED_BY_KEY = "{helper.STACK_LABEL_KEY}"', plant)
         self.assertIn(f'MANAGED_BY = "{helper.STACK_LABEL_VALUE}"', plant)
         self.assertIn(f'KUSTOMIZATION_FILE = "{PLANTED.rsplit("/", 1)[1]}"', plant)
+
+
+KCC_PLANTED = "clusters/seeded-a/provisioning/pinned-inference-pool.yaml"
+# The file as kcc-stalled-declaration/plant.py commits it: JSON, indent 2.
+STACK_DECLARATION = json.dumps(
+    {
+        "apiVersion": "container.cnrm.cloud.google.com/v1beta1",
+        "kind": "ContainerNodePool",
+        "metadata": {
+            "name": "pinned-inference-pool",
+            "namespace": "eval-kcc-stalled",
+            "labels": {"managed-by": "kube-agents-bench"},
+            "annotations": {"cnrm.cloud.google.com/deletion-policy": "abandon"},
+        },
+        "spec": {"clusterRef": {"name": "seeded-a"}},
+    },
+    indent=2,
+) + "\n"
+FOREIGN_DECLARATION = STACK_DECLARATION.replace('"managed-by": "kube-agents-bench"', '"team": "capacity"')
+
+
+class PlantedConfigConnectorDeclarationTest(unittest.TestCase):
+    """The backstop for the Config Connector declaration that a killed unit of
+    fleet-audit-manifest-fix-names-stalled-config-connector left on the
+    default branch: every other stockout audit on that project would then
+    read a declaration for pinned-inference-pool."""
+
+    def test_the_stacks_declaration_is_deleted_and_the_repository_is_clean(self):
+        github = FakeGitHub(files={KCC_PLANTED: STACK_DECLARATION})
+        record, out, _ = run_reset(github)
+        self.assertNotIn(KCC_PLANTED, github.files)
+        self.assertEqual(record["stack_files_deleted"], [KCC_PLANTED])
+        self.assertTrue(record["clean"])
+        self.assertIn(KCC_PLANTED, out)
+
+    def test_a_declaration_without_the_stacks_label_stays(self):
+        github = FakeGitHub(files={KCC_PLANTED: FOREIGN_DECLARATION})
+        record, _, _ = run_reset(github)
+        self.assertIn(KCC_PLANTED, github.files)
+        self.assertEqual(record["stack_files_deleted"], [])
+        self.assertEqual(record["stack_files_kept"], [KCC_PLANTED])
+        self.assertTrue(record["clean"])
+        self.assertEqual([m for m, _, _ in github.calls if m == "DELETE"], [])
+
+    def test_the_label_quoted_inside_a_value_does_not_count(self):
+        text = FOREIGN_DECLARATION.replace('"team": "capacity"', '"note": "\\"managed-by\\": \\"kube-agents-bench\\""')
+        github = FakeGitHub(files={KCC_PLANTED: text})
+        record, _, _ = run_reset(github)
+        self.assertIn(KCC_PLANTED, github.files)
+        self.assertEqual(record["stack_files_kept"], [KCC_PLANTED])
+
+    def test_the_path_follows_a_non_default_cluster_prefix(self):
+        path = "clusters/evalfleet-a/provisioning/pinned-inference-pool.yaml"
+        github = FakeGitHub(files={path: STACK_DECLARATION, KCC_PLANTED: STACK_DECLARATION})
+        record, _, _ = run_reset(github, kcc_cluster="evalfleet-a")
+        self.assertNotIn(path, github.files)
+        # The default name is not the fleet's here, so its path is not read.
+        self.assertIn(KCC_PLANTED, github.files)
+        self.assertEqual(record["stack_files_deleted"], [path])
+        self.assertNotIn(KCC_PLANTED, " ".join(p for _, p, _ in github.calls))
+
+    def test_main_passes_the_cluster_name_to_the_reset(self):
+        path = "clusters/evalfleet-a/provisioning/pinned-inference-pool.yaml"
+        github = FakeGitHub(files={path: STACK_DECLARATION})
+        with mock.patch.dict(os.environ, {helper.TOKEN_ENV: "tok"}), mock.patch.object(helper.ledgers, "api", github), mock.patch.object(helper, "pause", lambda s: None), redirect_stdout(io.StringIO()):
+            rc = helper.main(["--repo", REPO, "--project", PROJECT, "--build", BUILD, "--kcc-cluster", "evalfleet-a"])
+        self.assertEqual(rc, 0)
+        self.assertNotIn(path, github.files)
+
+    def test_the_path_the_label_and_the_slot_are_the_stacks(self):
+        stack = REPO_ROOT / "bench" / "tf" / "prebuilt" / "kcc-stalled-declaration"
+        plant = (stack / "plant.py").read_text()
+        self.assertIn(f'MANAGED_BY_KEY = "{helper.STACK_LABEL_KEY}"', plant)
+        self.assertIn(f'MANAGED_BY = "{helper.STACK_LABEL_VALUE}"', plant)
+        self.assertIn('DECLARATION_PATH = "clusters/{cluster}/provisioning/{pool}.yaml"', plant)
+        self.assertIn("return json.dumps(manifest, indent=2)", plant)
+        task = (REPO_ROOT / "bench" / "tasks" / "fleet-audit-manifest-fix-names-stalled-config-connector" / "task.yaml").read_text()
+        self.assertIn('seeded_pool: "pinned-inference-pool"', task)
+        self.assertIn('seeded_slot: "a"', task)
+        self.assertEqual(helper.KCC_DECLARATION_PATH, "clusters/{cluster}/provisioning/pinned-inference-pool.yaml")
+        self.assertEqual(helper.planted_stack_files(), (PLANTED, KCC_PLANTED))
+        self.assertIn('KCC_FLEET_SLOT="a"', SCRIPT.read_text(encoding="utf-8"))
+        self.assertIn('default     = "seeded"', (REPO_ROOT / "bench" / "tf" / "fleet" / "variables.tf").read_text())
 
 
 class RetryTest(unittest.TestCase):
@@ -568,7 +651,14 @@ class ResetStepTest(unittest.TestCase):
         (self.dir / "ci_reset_agent_pulls.py").write_text(STUB_HELPER)
         self.body_file = self.dir / "mint-body"
 
-    def run_step(self, label, key_file="/etc/ledger-app-key/key.pem", repo=REPO, mint_rc=None, helper_rc=0):
+    def run_step(self, label, key_file="/etc/ledger-app-key/key.pem", repo=REPO, mint_rc=None, helper_rc=0, fleet_context=None):
+        fleet = ""
+        if fleet_context is not None:
+            fleet_dir = self.dir / "fleet"
+            fleet_dir.mkdir(exist_ok=True)
+            (fleet_dir / ".fleet-context").write_text(fleet_context)
+            fleet = f'BENCH_FLEET_KUBECONFIG_DIR="{fleet_dir}"'
+
         mint = "\n".join(
             [
                 "_ledger_token_mint() {",
@@ -585,6 +675,8 @@ class ResetStepTest(unittest.TestCase):
                 lifted_line(r"^LEDGER_RESET_MINT_ATTEMPTS=\d+$"),
                 lifted_line(r"^LEDGER_RESET_MINT_RETRY_DELAY=\d+$"),
                 lifted_line(r"^AGENT_PULLS_RESET_PERMISSIONS=.*$"),
+                lifted_line(r"^KCC_FLEET_SLOT=.*$"),
+                fleet,
                 f'EVAL_LEDGER_APP_ID=4739812; EVAL_LEDGER_APP_KEY_FILE="{key_file}"',
                 'EVAL_FORGE="github"',  # the GitHub path, whatever the shell exports
                 f'EVAL_LEDGER_REPO="{repo}"; PROJECT_ID="{PROJECT}"; BUILD_ID={BUILD}',
@@ -592,6 +684,7 @@ class ResetStepTest(unittest.TestCase):
                 mint,
                 lifted("ledger_reset_token"),
                 lifted("forge_write_token"),
+                lifted("fleet_context_value"),
                 lifted("reset_agent_pulls"),
                 f'reset_agent_pulls "{label}"',
                 'echo "RC=$?"',
@@ -620,6 +713,17 @@ class ResetStepTest(unittest.TestCase):
         self.assertIn("HELPER token=tok-write", result.stdout)
         self.assertIn("Agent pulls reset (pdb-remediation-pr rep 2): HELPER argv=", result.stdout)
         self.assertNotIn("BENCH_GITHUB_TOKEN", lifted("reset_agent_pulls"))
+
+    def test_the_helper_is_told_the_config_connector_cluster_from_the_fleet_context(self):
+        result = self.run_step("lease", fleet_context="cluster.b=evalfleet-b\ncluster.a=evalfleet-a\nlocation.a=us-central1\n")
+        self.assertIn("RC=0", result.stdout, result.stderr)
+        argv = json.loads(re.search(r"HELPER argv=(.*)", result.stdout).group(1))
+        self.assertEqual(argv[argv.index("--kcc-cluster") + 1], "evalfleet-a")
+
+    def test_no_fleet_context_passes_no_cluster_and_the_helper_uses_the_default(self):
+        result = self.run_step("lease", fleet_context="")
+        argv = json.loads(re.search(r"HELPER argv=(.*)", result.stdout).group(1))
+        self.assertNotIn("--kcc-cluster", argv)
 
     def test_pat_mode_and_an_unmapped_project_skip_out_loud(self):
         for kwargs, needle in (({"key_file": ""}, "EVAL_LEDGER_APP_KEY_FILE is unset"), ({"repo": ""}, "maps to no GitOps repository")):

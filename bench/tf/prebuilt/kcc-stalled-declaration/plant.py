@@ -109,6 +109,16 @@ KIND = "ContainerNodePool"
 DELETION_POLICY_KEY = "cnrm.cloud.google.com/deletion-policy"
 DELETION_POLICY = "abandon"
 PROJECT_ANNOTATION = "cnrm.cloud.google.com/project-id"
+# The install's stall watch (agents/platform/scripts/stall_watch.py,
+# EXEMPT_ANNOTATION) does not read a namespace that carries this annotation.
+# The planted object stays Ready=False for the whole run, and without it a
+# watch tick could raise a controller-stall alert and start an agent turn in
+# the middle of the case. The fleet audits that the case grades
+# (kcc_health.py, fleet_stockout.py) do not read it, so they still see the
+# object. It goes on the namespace and not on the object, so the declaration
+# file stays the same as the object.
+STALL_WATCH_ANNOTATION = "kubeagents.x-k8s.io/stall-watch"
+STALL_WATCH_EXEMPT = "exempt"
 # The labels hack/fleet-kubeconfigs.sh discovers the seeded clusters by.
 SEEDED_FILTER = "resourceLabels.environment=seeded AND resourceLabels.managed-by=kube-agents-seeded-fleet"
 # Where the declaration goes: the gcp-config-connector skill's layout.
@@ -451,7 +461,7 @@ class Plant:
             "metadata": {
                 "name": self.settings.namespace,
                 "labels": {MANAGED_BY_KEY: MANAGED_BY},
-                "annotations": {PROJECT_ANNOTATION: self.settings.project},
+                "annotations": {PROJECT_ANNOTATION: self.settings.project, STALL_WATCH_ANNOTATION: STALL_WATCH_EXEMPT},
             },
         }
         manifest = node_pool_manifest(self.settings, target)

@@ -2050,7 +2050,8 @@ probe_gitlab_ledger_path() { # <label>
 # would not come clean both stay 1, as does a GitLab agent token that is not
 # in hand.
 reset_agent_pulls() { # <label>  -> 0 when the repository is clean, non-zero when a unit must not run on it
-  local label="$1" token out rc=0 slug record diagnostics mint_rc=0
+  local label="$1" token out rc=0 slug record diagnostics mint_rc=0 kcc_cluster
+  local kcc_args=()
   if [ "${EVAL_FORGE_KIND:-github}" != "gitlab" ] && [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
     echo "Agent pulls reset (${label}): skipped, EVAL_LEDGER_APP_KEY_FILE is unset and the mounted PAT is a read credential; the repository keeps whatever the agent left"
     return 0
@@ -2082,10 +2083,19 @@ reset_agent_pulls() { # <label>  -> 0 when the repository is clean, non-zero whe
   # carries its own proof of what each unit started on.
   slug="$(printf '%s' "${label}" | tr -c 'A-Za-z0-9._-' '_')"
   record="${ARTIFACT_DIR}/agent-pulls-reset/${slug}.json"
+  # The Config Connector stack's declaration is under the real name of the
+  # KCC_FLEET_SLOT cluster, read from the .fleet-context as the stack's own
+  # inputs are (export_writing_stack_inputs); without it, the helper uses the
+  # name of the fleet's default prefix. GitHub only: the GitLab path deletes
+  # no file.
+  kcc_cluster="$(fleet_context_value "cluster.${KCC_FLEET_SLOT}")"
+  if [ -n "${kcc_cluster}" ] && [ "${EVAL_FORGE_KIND:-github}" != "gitlab" ]; then
+    kcc_args=(--kcc-cluster "${kcc_cluster}")
+  fi
   # The token rides in the environment of this one process, never on argv.
   out="$(AGENT_PULLS_RESET_TOKEN="${token}" python3 "${SCRIPT_DIR}/ci_reset_agent_pulls.py" \
     --repo "${EVAL_LEDGER_REPO}" --project "${PROJECT_ID}" --build "${BUILD_ID:-local}" \
-    --scope "${label}" --record "${record}" ${EVAL_FORGE_HELPER_ARGS[@]+"${EVAL_FORGE_HELPER_ARGS[@]}"} 2>&1)" || rc=$?
+    --scope "${label}" --record "${record}" ${kcc_args[@]+"${kcc_args[@]}"} ${EVAL_FORGE_HELPER_ARGS[@]+"${EVAL_FORGE_HELPER_ARGS[@]}"} 2>&1)" || rc=$?
   [ -n "${out}" ] && printf '%s\n' "${out}" | sed "s/^/Agent pulls reset (${label}): /"
   if [ "${rc}" -ne 0 ]; then
     echo "WARNING: Agent pulls reset (${label}): the helper exited ${rc}; the repository is not clean (${record}), and a unit that requests a pull request does not run on it." >&2
@@ -4439,8 +4449,10 @@ unit_cost_hint() {
     gce-startup-script-failure | networking-world-open-ingress) echo 900 ;;
     obtainability-pdb-kustomize-overlay) echo 900 ;;
     # The stockout audit of stockout-pinned-pool, registered 2026-11-10
-    # unmeasured, after a stack that plants one Config Connector object and
-    # one GitOps file in seconds; that case's band.
+    # unmeasured, in that case's band. Its stack plants one Config Connector
+    # object and one GitOps file; the plant and the teardown can wait up to
+    # about 15 minutes together (CONTEXT_WAIT_S, READY_WAIT_S,
+    # DELETE_TIMEOUT_S and NAMESPACE_WAIT_S in its plant.py).
     fleet-audit-manifest-fix-names-stalled-config-connector) echo 900 ;;
     fleet-cost-idle-pool) echo 900 ;;
     # A plain chat request that runs the compliance collector's sweep (#2386):

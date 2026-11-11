@@ -3,7 +3,7 @@
 # and what scripts/test_ci_eval_nightly.py holds the lists to.
 #
 # Dealt on 2026-11-06 (#4238) by unit_cost_hint, largest first into the
-# shortest chain: 6600s here.
+# shortest chain: 6600s here at the deal.
 autoops-controller-stall-triage
 autoops-missing-service-triage
 findings-decision-leaves-unnamed-open
