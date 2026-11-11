@@ -813,8 +813,7 @@ func (a *GoogleChatAdapter) EditNotifyMessage(space, _, messageID string, m OutM
 // layout is refused forgets the earlier answer, since the notifier's text
 // edit follows and must not carry the answer's line; one that fails with the
 // message left as it was keeps the answer the message still shows. A
-// running task's line (m.Stop) takes the Stop button after its own buttons,
-// and a rated answer (m.Feedback) the rating buttons, as a posted one does.
+// running task's line (m.Stop) takes the Stop button after its own buttons.
 // A text line Chat refuses with the button is patched once more without it;
 // a laid-out line's refusal is the layout's, answered as any refused layout
 // is (the relay edits the text instead, which then takes this path).
@@ -840,17 +839,6 @@ func (a *GoogleChatAdapter) editLaidOut(conversation, messageID string, m OutMes
 	if m.Stop != "" {
 		layout = gchatStopButtons(layout, conversation, m.Stop)
 	}
-	// A rated answer edited onto the task's line (Gateway.answerOnLine)
-	// ends with the rating buttons, as a posted one does (createLaidOut,
-	// postRatedText); a message already rated keeps the buttons
-	// answeredLayout drew. When Chat refuses the layout with them the edit
-	// is made once more without them, as a post is.
-	var rating gchatRating
-	if conversation != "" && a.rates(m) && a.ratingOf(messageID).task == "" {
-		rating.task = m.Feedback
-	}
-	unrated := layout
-	layout.Widgets = gchatWithRating(layout.Widgets, rating)
 	patch := func(layout gchatChatLayout) error {
 		return a.apiCall([]string{"spaces", "messages"}, "patch", map[string]any{
 			"name":       messageID,
@@ -859,11 +847,6 @@ func (a *GoogleChatAdapter) editLaidOut(conversation, messageID string, m OutMes
 		}, nil)
 	}
 	err := patch(layout)
-	if err != nil && rating.task != "" && errors.Is(gchatLayoutError(err, true), ErrLayoutRefused) {
-		a.log.Warn("gchat: the rating buttons were refused; patching the answer without them", "conversation", conversation, "err", err)
-		rating, layout = gchatRating{}, unrated
-		err = patch(layout)
-	}
 	if err != nil && m.Stop != "" && m.Chat == nil && errors.Is(gchatLayoutError(err, true), ErrLayoutRefused) {
 		// The text line once more without the button, under the same
 		// lock: a second entry here would wait on it for good.
@@ -878,9 +861,6 @@ func (a *GoogleChatAdapter) editLaidOut(conversation, messageID string, m OutMes
 			a.forgetAnswer(messageID)
 		}
 		return err
-	}
-	if rating.task != "" {
-		a.rememberRating(messageID, rating)
 	}
 	a.trackQuestion(messageID, conversation, m.Chat)
 	a.trackLayout(messageID, m.Chat, layout)
@@ -966,9 +946,9 @@ func (a *GoogleChatAdapter) Roster(conversation string) ([]string, bool, error) 
 
 // AnswersOnLine is true for every Google Chat conversation (LineAnswerer):
 // the adapter draws no reaction and no Working… status, so the task's line
-// is the ask's one receipt, and the answer is what ends it. The proxy
-// refuses to delete a message (its destructive-method rule), so the line
-// cannot go; it becomes the answer instead.
+// is the ask's one receipt, and it ends as the reaction would come off. The
+// proxy refuses to delete a message (its destructive-method rule), so the
+// line cannot go; it becomes the hand-off acknowledgement, or a bare mark.
 func (a *GoogleChatAdapter) AnswersOnLine(string) bool { return true }
 
 // React and RemoveReaction draw no mark on Google Chat: its relay holds app

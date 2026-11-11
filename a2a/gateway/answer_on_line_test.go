@@ -50,10 +50,10 @@ func editsOf(r *rig, messageID string) []string {
 	return out
 }
 
-// On a backend that answers on the line, a completed task's answer is the
-// last edit of its live message, with its rating controls, and no post: the
-// line never reads "✅ completed" under the ask, above the answer.
-func TestAnAnswerOnLineBackendGetsTheAnswerOnTheLine(t *testing.T) {
+// On a backend that answers on the line, a direct answer posts, with its
+// rating mark, so it notifies, and the task's live message ends as the bare
+// mark: nothing reads "completed" under the ask.
+func TestAnAnswerOnLineBackendEndsTheLineWithTheBareMarkAfterTheAnswerPosts(t *testing.T) {
 	r := startLineAnsweringRig(t)
 	origin := startChatTask(t, r, "discord:g1/answer-on-line", false)
 	line := lineID(t, r)
@@ -62,53 +62,44 @@ func TestAnAnswerOnLineBackendGetsTheAnswerOnTheLine(t *testing.T) {
 		return len(edits) > 0 && strings.Contains(edits[len(edits)-1], "working")
 	})
 	completeTask(t, r.execFor(t, origin, "platform"), "the fleet is fine")
-	waitFor(t, "the answer on the line", func() bool {
+	waitFor(t, "the answer posted", postedContaining(r, "the fleet is fine"))
+	waitFor(t, "the bare mark on the line", func() bool {
 		edits := editsOf(r, line)
-		return len(edits) > 0 && edits[len(edits)-1] == "the fleet is fine"
+		return len(edits) > 0 && edits[len(edits)-1] == lineDoneMark
 	})
-	for _, p := range r.adapter.postTexts() {
-		if strings.Contains(p, "the fleet is fine") {
-			t.Fatalf("posts = %q, want the answer on the line, not posted", r.adapter.postTexts())
-		}
-	}
 	for _, e := range r.adapter.editTexts() {
-		if strings.Contains(e, "completed") {
-			t.Fatalf("edits = %q, want no terminal edit after the answer", r.adapter.editTexts())
+		if strings.Contains(e, "completed") || strings.Contains(e, "the fleet is fine") {
+			t.Fatalf("edits = %q, want neither the word completed nor the answer on the line", r.adapter.editTexts())
 		}
 	}
 	r.adapter.mu.Lock()
-	feedbacks, marked := append([]string(nil), r.adapter.feedbacks...), append([]string(nil), r.adapter.markedTexts...)
+	marked := append([]string(nil), r.adapter.markedTexts...)
 	r.adapter.mu.Unlock()
-	if len(feedbacks) != 1 || len(marked) != 1 || marked[0] != "the fleet is fine" {
-		t.Fatalf("feedback marks = %q on %q, want one on the answer's edit", feedbacks, marked)
+	if len(marked) != 1 || marked[0] != "the fleet is fine" {
+		t.Fatalf("marked texts = %q, want the posted answer rated", marked)
 	}
 }
 
-// A laid-out answer is laid out on the line, as it would have been posted.
-func TestAnAnswerOnLineBackendLaysTheAnswerOutOnTheLine(t *testing.T) {
+// A laid-out answer posts laid out, as on any backend, and the line ends as
+// the bare mark.
+func TestAnAnswerOnLineBackendPostsALaidOutAnswer(t *testing.T) {
 	r := startLineAnsweringRig(t)
 	origin := startChatTask(t, r, "discord:g1/answer-on-line-laid-out", true)
 	line := lineID(t, r)
 	publishArtifactUpdate(t, r, origin, lib.ArtifactResult, []lib.Part{{Kind: "text", Text: testReportText}, chatPart(t, testReport)}, false, true)
 	publishFinal(t, r, origin, "platform", lib.StateCompleted, "")
-	waitFor(t, "the laid-out answer on the line", func() bool {
+	waitFor(t, "the laid-out answer posted", func() bool { return len(r.adapter.chatPostsCopy()) == 1 })
+	waitFor(t, "the bare mark on the line", func() bool {
 		edits := editsOf(r, line)
-		return len(edits) > 0 && edits[len(edits)-1] == testReportText
+		return len(edits) > 0 && edits[len(edits)-1] == lineDoneMark
 	})
-	chatEdits := r.adapter.chatEditsCopy()
-	if len(chatEdits) == 0 || chatEdits[len(chatEdits)-1] == nil || chatEdits[len(chatEdits)-1].Headline != testReport.Headline {
-		t.Fatalf("chat edits = %+v, want the report last", chatEdits)
-	}
-	if posts := r.adapter.chatPostsCopy(); len(posts) != 0 {
-		t.Fatalf("chat posts = %+v, want none: the answer is on the line", posts)
-	}
-	if got := chatCount(t, r, chatRendered); got != 1 {
-		t.Fatalf("rendered = %v, want 1", got)
+	if got := r.adapter.chatPostsCopy()[0]; got.Headline != testReport.Headline {
+		t.Fatalf("chat post = %+v, want the report", got)
 	}
 }
 
 // A turn that handed the ask to cards puts its acknowledgement on the line,
-// unrated: the card's report is the answer that is rated.
+// unrated, and no post follows: the card's plan and report do.
 func TestAnAnswerOnLineBackendGetsTheHandOffLineOnTheLine(t *testing.T) {
 	r := startLineAnsweringRig(t)
 	origin := startChatTask(t, r, "discord:g1/answer-on-line-cards", false)
@@ -125,6 +116,11 @@ func TestAnAnswerOnLineBackendGetsTheHandOffLineOnTheLine(t *testing.T) {
 	if hasPost(r.adapter, "checking the fleet.") {
 		t.Fatalf("posts = %q, want the acknowledgement on the line", r.adapter.postTexts())
 	}
+	for _, e := range r.adapter.editTexts() {
+		if strings.Contains(e, "completed") || e == lineDoneMark {
+			t.Fatalf("edits = %q, want no terminal edit after the acknowledgement", r.adapter.editTexts())
+		}
+	}
 	r.adapter.mu.Lock()
 	feedbacks := append([]string(nil), r.adapter.feedbacks...)
 	r.adapter.mu.Unlock()
@@ -133,37 +129,9 @@ func TestAnAnswerOnLineBackendGetsTheHandOffLineOnTheLine(t *testing.T) {
 	}
 }
 
-// A long text answer goes on the line whole: the line is one message, and
-// the backend's own cap, not the chunk size, bounds it.
-func TestAnAnswerOnLineBackendPutsALongAnswerOnTheLineWhole(t *testing.T) {
-	r := startLineAnsweringRig(t)
-	origin := startChatTask(t, r, "discord:g1/answer-on-line-long", false)
-	line := lineID(t, r)
-	long := strings.Repeat("the fleet is fine, cluster by cluster.\n", 120)
-	if len(chatChunks(long, discordChunk)) < 3 {
-		t.Fatalf("want an answer of several chunks")
-	}
-	completeTask(t, r.execFor(t, origin, "platform"), long)
-	waitFor(t, "the whole answer on the line", func() bool {
-		edits := editsOf(r, line)
-		return len(edits) > 0 && edits[len(edits)-1] == long
-	})
-	for _, p := range r.adapter.postTexts() {
-		if strings.Contains(p, "cluster by cluster") {
-			t.Fatalf("posts = %d, want no part of the answer posted", len(r.adapter.postTexts()))
-		}
-	}
-	r.adapter.mu.Lock()
-	marked := append([]string(nil), r.adapter.markedTexts...)
-	r.adapter.mu.Unlock()
-	if len(marked) != 1 || marked[0] != long {
-		t.Fatalf("marked texts = %d, want the one edit", len(marked))
-	}
-}
-
-// An edit that does not land leaves the answer to be posted as on any
-// backend, with its rating controls, and the line takes the terminal edit.
-func TestAnAnswerOnLineBackendPostsTheAnswerWhenTheEditFails(t *testing.T) {
+// An acknowledgement edit that does not land is posted as on any backend,
+// and the line ends as the bare mark.
+func TestAnAnswerOnLineBackendPostsTheAcknowledgementWhenTheEditFails(t *testing.T) {
 	r := startLineAnsweringRig(t)
 	origin := startChatTask(t, r, "discord:g1/answer-on-line-fails", false)
 	line := lineID(t, r)
@@ -171,27 +139,40 @@ func TestAnAnswerOnLineBackendPostsTheAnswerWhenTheEditFails(t *testing.T) {
 		edits := editsOf(r, line)
 		return len(edits) > 0 && strings.Contains(edits[len(edits)-1], "working")
 	})
+	exec := r.execFor(t, origin, "platform")
+	if err := exec.PublishArtifact(context.Background(), lib.Artifact{Name: lib.ArtifactHandoff, Parts: []lib.Part{{Kind: "text", Text: lib.HandoffCards}}}); err != nil {
+		t.Fatal(err)
+	}
 	r.adapter.mu.Lock()
 	r.adapter.failEdits = 1
 	r.adapter.mu.Unlock()
-	completeTask(t, r.execFor(t, origin, "platform"), "the fleet is fine")
-	waitFor(t, "the answer posted", postedContaining(r, "the fleet is fine"))
-	waitFor(t, "the terminal edit", func() bool {
+	completeTask(t, exec, "checking the fleet.")
+	waitFor(t, "the acknowledgement posted", postedContaining(r, "checking the fleet."))
+	waitFor(t, "the bare mark on the line", func() bool {
 		edits := editsOf(r, line)
-		return len(edits) > 0 && strings.Contains(edits[len(edits)-1], "completed")
+		return len(edits) > 0 && edits[len(edits)-1] == lineDoneMark
 	})
-	r.adapter.mu.Lock()
-	marked := append([]string(nil), r.adapter.markedTexts...)
-	r.adapter.mu.Unlock()
-	if len(marked) != 2 || marked[1] != "the fleet is fine" {
-		t.Fatalf("marked texts = %q, want the failed edit's mark and then the post's", marked)
-	}
+}
+
+// A task that fails keeps its notice and its terminal edit: only a
+// completed task ends as the bare mark.
+func TestAnAnswerOnLineBackendKeepsTheFailedLine(t *testing.T) {
+	r := startLineAnsweringRig(t)
+	origin := startChatTask(t, r, "discord:g1/answer-on-line-failed", false)
+	line := lineID(t, r)
+	publishFinal(t, r, origin, "platform", lib.StateFailed, "the pod died")
+	waitFor(t, "the failed edit", func() bool {
+		edits := editsOf(r, line)
+		return len(edits) > 0 && strings.Contains(edits[len(edits)-1], "failed")
+	})
+	waitFor(t, "the failure notice", postedContaining(r, "the pod died"))
 }
 
 // A task its requester asked to stop, which completed anyway, keeps the
-// post and the terminal edit: its line said "cancel sent", and a stale
-// press rewrites such a line as canceled.
-func TestAnAnswerOnLineBackendPostsTheAnswerOfAStoppedTask(t *testing.T) {
+// terminal edit it had: its line said "cancel sent", and a stale press
+// rewrites such a line as canceled, so neither an acknowledgement nor the
+// bare mark is written there.
+func TestAnAnswerOnLineBackendKeepsTheTerminalEditOfAStoppedTask(t *testing.T) {
 	r := startLineAnsweringRig(t)
 	conv := "discord:g1/answer-on-line-stopped"
 	origin := startChatTask(t, r, conv, false)
@@ -200,13 +181,17 @@ func TestAnAnswerOnLineBackendPostsTheAnswerOfAStoppedTask(t *testing.T) {
 		edits := editsOf(r, line)
 		return len(edits) > 0 && strings.Contains(edits[len(edits)-1], "working")
 	})
+	exec := r.execFor(t, origin, "platform")
+	if err := exec.PublishArtifact(context.Background(), lib.Artifact{Name: lib.ArtifactHandoff, Parts: []lib.Part{{Kind: "text", Text: lib.HandoffCards}}}); err != nil {
+		t.Fatal(err)
+	}
 	say(r, conv, "m-stop", "stop")
 	waitForRecord(t, r, conv, "the task marked cancelled", func(rec *SessionRecord) bool {
 		ref, ok := rec.TaskRefFor(origin.TaskID)
 		return ok && ref.Canceled
 	})
-	completeTask(t, r.execFor(t, origin, "platform"), "the fleet is fine")
-	waitFor(t, "the answer posted", postedContaining(r, "the fleet is fine"))
+	completeTask(t, exec, "checking the fleet.")
+	waitFor(t, "the acknowledgement posted", postedContaining(r, "checking the fleet."))
 	waitFor(t, "the terminal edit", func() bool {
 		edits := editsOf(r, line)
 		return len(edits) > 0 && strings.Contains(edits[len(edits)-1], "completed")
@@ -252,7 +237,8 @@ func TestTheSideDoorKeepsTheTerminalEditForItsDoors(t *testing.T) {
 }
 
 // The Google Chat adapter answers on the line: it draws no reaction and no
-// Working… status, so the line is its receipt, and the answer is its end.
+// Working… status, so the line is its receipt, and it ends as a reaction
+// would come off.
 func TestGchatAnswersOnTheLine(t *testing.T) {
 	a := newTestGchatAdapterWithRelay(t, newFakeChatRelay(t))
 	var answerer LineAnswerer = a

@@ -35,7 +35,7 @@ var errSessionWatchClosed = errors.New("session-state watch closed before its in
 // rendered the way statusLine renders the relay's states (icon, bold label,
 // a dash, the detail). It replaces the "⏳ submitted…" placeholder rather than
 // following it as a post of its own, so the relay's next edit (working, the
-// terminal, or on Google Chat the answer) replaces it in turn and it is never
+// terminal, or on Google Chat the acknowledgement) replaces it in turn and it is never
 // left under a "completed" header, where it read as the output of some
 // earlier command. On a backend
 // that keeps no line (StatusShower: Slack with Agent Sessions) there is none

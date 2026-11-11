@@ -334,10 +334,6 @@ func (a *fakeAdapter) stopLinesCopy() []fakePost {
 
 func (a *fakeAdapter) EditMessage(conversation, messageID string, m OutMessage) error {
 	a.mu.Lock()
-	if m.Feedback != "" {
-		a.feedbacks = append(a.feedbacks, m.Feedback)
-		a.markedTexts = append(a.markedTexts, m.Text)
-	}
 	rendersChat, refuseChat := a.rendersChat, a.refuseChat
 	transient := m.Chat != nil && a.failChatEdits > 0
 	if transient {
