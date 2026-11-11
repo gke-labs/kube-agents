@@ -269,6 +269,14 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(self.published(), [dial._section(dial.OFF)])
         self.assertFalse((Path(self.home) / dial.STATE_NAME).exists())
 
+    def test_picking_the_default_level_is_recorded_or_says_not_saved(self):
+        self.pick("UADMIN", "propose")
+        self.assertEqual(json.loads((Path(self.home) / dial.STATE_NAME).read_text())["set_by"], "UADMIN")
+        (Path(self.home) / dial.STATE_NAME).write_text("{broken")
+        self.pick("UADMIN", "propose")
+        self.assertIn(dial.NOT_SAVED, shown(self.published()))
+        self.assertEqual((Path(self.home) / dial.STATE_NAME).read_text(), "{broken")
+
     def test_open_with_the_switch_off_clears_a_stale_dial(self):
         run(dial.opened(self.adapter, {"user": "UADMIN", "channel": "D1", "tab": "home"}))
         self.assertIn("actions", [b["type"] for b in self.published()])

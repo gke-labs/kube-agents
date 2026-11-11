@@ -681,8 +681,8 @@ Mutation(
     Mutation(
         "C3-management-project-unpinned",
         "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
-        ("    RECONCILE_PROJECT=\n    GKE_PROJECT_ID=example-project\n",
-         "    RECONCILE_PROJECT=\n"),
+        ("    KUBEAGENTS_DIAL_ADMINS=\n    GKE_PROJECT_ID=example-project\n",
+         "    KUBEAGENTS_DIAL_ADMINS=\n"),
         "test_C3_the_management_project_cannot_come_from_the_agents_env_file",
         "drop the GKE_PROJECT_ID pin as a duplicate of the container env -- one "
         "line in the agent-writable PVC .env then re-points the management "

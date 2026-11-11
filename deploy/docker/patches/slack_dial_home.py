@@ -331,13 +331,15 @@ async def on_level(adapter: Any, ack: Any, body: dict, action: dict) -> None:
     else:
         admin = await is_admin(adapter, user_id)
         if admin is True:
-            if read_state()["level"] != level:
-                try:
+            # Compared with the stored record, not read_state(): that reads a
+            # missing or unreadable file as Propose, which would skip the write.
+            try:
+                if _read_raw().get("level") != level:
                     write_level(level, user_id)
                     logger.info("slack_dial_home: dial set to %s by %s", level, user_id)
-                except (UnreadableRecord, OSError) as exc:
-                    logger.warning("slack_dial_home: not recording %s by %s: %s", level, user_id, exc)
-                    note = NOT_SAVED
+            except (UnreadableRecord, OSError) as exc:
+                logger.warning("slack_dial_home: not recording %s by %s: %s", level, user_id, exc)
+                note = NOT_SAVED
         else:
             logger.warning("slack_dial_home: ignoring a dial pick of %s by %s, who is not an install admin", level, user_id)
             note = READ_ONLY if admin is False else NOT_CHECKED
