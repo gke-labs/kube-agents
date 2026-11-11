@@ -112,10 +112,23 @@ type AgentProfileSpec struct {
 	// refuses one whose tier is not listed here; a pinned production profile
 	// might allow only read. Tier is authority, so it lives on the CR, never
 	// in the persona. Absent means read alone (AllowedTierList).
+	//
+	// Each is a tier: the built-in read or unattended, or a Tier resource in
+	// the install's namespace (#3659). A name with neither is refused by the
+	// operator, which reports TierUnknown. A tier name listed here is at most
+	// 10 characters, the length of "unattended": it becomes part of the
+	// profile's bus identity, profile-<name>-<tier>, which must fit one
+	// 63-character label beside the profile's name, and of its pools' and
+	// Jobs' names and labels, whose budgets assume no longer tier. It has no
+	// hyphen either: the profile's durables are named
+	// profile-<name>-<tier>-<kind>, and a hyphen would let profile a with tier
+	// b-c and profile a-b with tier c share one. A longer or hyphenated Tier
+	// resource can exist but can't be listed.
 	// +listType=set
 	// +kubebuilder:validation:MinItems=1
-	// +kubebuilder:validation:MaxItems=2
-	// +kubebuilder:validation:items:Enum=read;unattended
+	// +kubebuilder:validation:MaxItems=4
+	// +kubebuilder:validation:items:MaxLength=10
+	// +kubebuilder:validation:items:Pattern=`^[a-z0-9]+$`
 	// +optional
 	AllowedTiers []string `json:"allowedTiers,omitempty"`
 
@@ -335,10 +348,13 @@ type AgentProfileStatus struct {
 // it, but not an update to a profile that already broke it. A profile named
 // under 0.19.0's flat 55 would otherwise be refused every write after the
 // upgrade, its status and finalizer removal included, and hang Terminating.
-// The operator still drops such a profile from the identity map. The old
-// object's unattended test reads the set by size and index, not exists():
-// through the optional oldSelf, exists() blows the CEL cost budget.
-// +kubebuilder:validation:XValidation:rule="self.metadata.name.size() <= (has(self.spec.allowedTiers) && self.spec.allowedTiers.exists(t, t == 'unattended') ? 44 : 50) || (oldSelf.hasValue() && oldSelf.value().metadata.name.size() > ((has(oldSelf.value().spec.allowedTiers) && (size(oldSelf.value().spec.allowedTiers) == 2 || oldSelf.value().spec.allowedTiers[0] == 'unattended')) ? 44 : 50))",optionalOldSelf=true,message="AgentProfile name is too long for its tiers: each tier's bus identity is profile-<name>-<tier>, which must fit one 63-character label, so a name is at most 50 characters, or 44 if allowedTiers includes unattended"
+// The operator still drops such a profile from the identity map. With tiers
+// as data (#3659) the bound is per listed tier: the name plus the tier at most
+// 54, so the map user profile-<name>-<tier> fits 63. allowedTiers' items are
+// at most 10 characters and at most 4. The rule reads each of the four by
+// index rather than iterating: all() or exists() over the list, through the
+// optional oldSelf, is estimated far over the CEL cost budget even at 4.
+// +kubebuilder:validation:XValidation:rule="(!has(self.spec.allowedTiers) ? self.metadata.name.size() <= 50 : (self.metadata.name.size() + self.spec.allowedTiers[0].size() <= 54 && (size(self.spec.allowedTiers) < 2 || self.metadata.name.size() + self.spec.allowedTiers[1].size() <= 54) && (size(self.spec.allowedTiers) < 3 || self.metadata.name.size() + self.spec.allowedTiers[2].size() <= 54) && (size(self.spec.allowedTiers) < 4 || self.metadata.name.size() + self.spec.allowedTiers[3].size() <= 54))) || (oldSelf.hasValue() && !(!has(oldSelf.value().spec.allowedTiers) ? oldSelf.value().metadata.name.size() <= 50 : (oldSelf.value().metadata.name.size() + oldSelf.value().spec.allowedTiers[0].size() <= 54 && (size(oldSelf.value().spec.allowedTiers) < 2 || oldSelf.value().metadata.name.size() + oldSelf.value().spec.allowedTiers[1].size() <= 54) && (size(oldSelf.value().spec.allowedTiers) < 3 || oldSelf.value().metadata.name.size() + oldSelf.value().spec.allowedTiers[2].size() <= 54) && (size(oldSelf.value().spec.allowedTiers) < 4 || oldSelf.value().metadata.name.size() + oldSelf.value().spec.allowedTiers[3].size() <= 54))))",optionalOldSelf=true,message="AgentProfile name is too long for its tiers: each tier's bus identity is profile-<name>-<tier>, which must fit one 63-character label, so the name plus its longest allowed tier is at most 54 characters (50 with read alone, 44 with a 10-character tier such as unattended)"
 
 // AgentProfile is the Schema for the agentprofiles API.
 type AgentProfile struct {
