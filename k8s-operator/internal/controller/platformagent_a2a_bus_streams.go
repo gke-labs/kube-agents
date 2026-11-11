@@ -343,12 +343,18 @@ type busReprovisionAttempt struct {
 	// Job with another UID is the attempt's re-run.
 	JobUID types.UID `json:"jobUID,omitempty"`
 	// Settled is set by the first poll that judges the bus after the re-run,
-	// and Restored then says whether every stream the attempt named was back.
+	// and Restored says whether every stream the attempt named has been seen
+	// back since: on that poll, or on any later one that finds none of them
+	// missing, such as after a fix by hand. An unrestored settled attempt
+	// stops the re-runs for its names; seeing them back lifts the stop.
 	Settled  bool `json:"settled,omitempty"`
 	Restored bool `json:"restored,omitempty"`
-	// Restarted is set once the clients holding a TASKS durable have been
-	// restarted after the re-run.
-	Restarted bool `json:"restarted,omitempty"`
+	// RestartOwed is set on the settling poll when the re-run brought TASKS
+	// back, and Restarted once the clients holding a TASKS durable have been
+	// restarted. Owed and not yet restarted is retried on every poll that
+	// finds TASKS present, and holds the condition back from AllPresent.
+	RestartOwed bool `json:"restartOwed,omitempty"`
+	Restarted   bool `json:"restarted,omitempty"`
 }
 
 func readBusReprovisionRecord(agent *agentv1alpha1.PlatformAgent) busReprovisionRecord {
@@ -503,9 +509,11 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 				a2aNATSImageEnvVar, a2aNATSExporterImageEnvVar, a2aNATSExporterImageEnvVar))
 	}
 	if _, _, ok := operatorBusPrincipal(); !ok {
-		// The bus fence admits the operator to the exporter only by the
-		// namespace and service account it runs as (a2aOperatorNATSPeers);
-		// without them it renders no such peer, and every scrape would fail.
+		// The bus fence admits the operator to the exporter by its namespace
+		// and its pod's bus-client label (a2aOperatorNATSPeers), and renders
+		// that peer only when the operator knows its namespace and service
+		// account; without them there is no such peer, and every scrape
+		// would fail.
 		delete(p.streaks, agent.UID)
 		return p.writeCondition(ctx, agent, metav1.ConditionUnknown, busStreamsReasonDetectionUnavailable,
 			fmt.Sprintf("The operator does not know its own namespace and service account (%s, %s), so the A2A bus fence admits it to no exporter and it cannot see whether the provisioned streams are still on the bus.",
@@ -547,31 +555,41 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 	// The attempt in flight, if any, is settled on the first poll that judges
 	// the bus after its re-run, the provision Job that replaced the one the
 	// attempt deleted (told apart by UID: a creation time in whole seconds
-	// can't be ordered against the attempt's own clock). The record is
-	// written before anything it guards, so a write that fails leaves the
-	// pods and the Job alone, and one that succeeds before a failed action
-	// overcounts, which is the safe direction.
+	// can't be ordered against the attempt's own clock). The settlement is
+	// written before the restart it owes, and the restart is marked done
+	// only after its deletes succeed: a write that fails leaves the pods
+	// alone, and a restart that fails stays owed and is retried below on the
+	// next poll, before anything can read AllPresent.
 	last := record.last()
 	reRan := last != nil && !last.Settled && jobState == busJobComplete && job.UID != last.JobUID
 	if reRan {
-		tasksBack := slices.Contains(last.Missing, a2aTasksStream) && !slices.Contains(verdict.missing, a2aTasksStream)
-		restart := tasksBack
-		last.Restarted = restart
+		// TASKS is back whatever else still isn't: its two durable readers
+		// need restarting now, not once every stream returns.
+		last.RestartOwed = slices.Contains(last.Missing, a2aTasksStream) && !slices.Contains(verdict.missing, a2aTasksStream)
 		last.Restored = !overlaps(last.Missing, verdict.missing)
 		last.Settled = true
 		if err := p.writeRecord(ctx, agent, record.pruned(now)); err != nil {
 			return err
 		}
-		if restart {
-			// TASKS is back whatever else still isn't: its two durable
-			// readers need restarting now, not once every stream returns.
-			if err := p.restartTasksClients(ctx, agent); err != nil {
-				return err
-			}
-		}
 		if last.Restored {
 			p.r.recordEvent(agent, corev1.EventTypeNormal, busStreamsRestoredEventReason,
 				fmt.Sprintf("Re-running the A2A provision Job restored %s.", strings.Join(last.Missing, ", ")))
+		}
+	} else if last != nil && last.Settled && !last.Restored && !overlaps(last.Missing, verdict.missing) {
+		// The names a re-run did not bring back are back now (a fix by hand,
+		// say): lift the stop, so a later loss of them is re-provisioned.
+		last.Restored = true
+		if err := p.writeRecord(ctx, agent, record.pruned(now)); err != nil {
+			return err
+		}
+	}
+	if last != nil && last.Settled && last.RestartOwed && !last.Restarted && !slices.Contains(verdict.missing, a2aTasksStream) {
+		if err := p.restartTasksClients(ctx, agent); err != nil {
+			return err
+		}
+		last.Restarted = true
+		if err := p.writeRecord(ctx, agent, record.pruned(now)); err != nil {
+			return err
 		}
 	}
 
@@ -804,20 +822,27 @@ func (p *BusStreamPoller) scrapeServers(ctx context.Context, agent *agentv1alpha
 // sidecar), so their Deployments recreate them and they subscribe to the
 // recreated consumers. Neither re-creates its subscription on its own once the
 // stream it consumed was deleted (lib.Client.SubscribeDurable). Each delete
-// names the pod's UID.
+// names the pod's UID. Only each client's own pods are deleted: those its
+// workload controls, as the bus servers' pods are read.
 func (p *BusStreamPoller) restartTasksClients(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	// The bridge is always in the agent pod by now: the operator renders it
 	// once the bus is provisioned (a2aBridgeInPod), unless the CR declares
 	// its own, which is in the same pod.
-	selectors := []map[string]string{a2aGatewayPodSelector(agent), gatewayPodSelector(agent)}
+	clients := []struct {
+		name     string
+		selector map[string]string
+	}{
+		{a2aGatewayName(agent), a2aGatewayPodSelector(agent)},
+		{agent.Name + gatewayAppSuffix, gatewayPodSelector(agent)},
+	}
 	var restarted []string
-	for _, selector := range selectors {
-		var pods corev1.PodList
-		if err := p.r.podReader().List(ctx, &pods, client.InNamespace(agent.Namespace), client.MatchingLabels(selector)); err != nil {
+	for _, c := range clients {
+		pods, err := p.tasksClientPods(ctx, agent, c.name, c.selector)
+		if err != nil {
 			return err
 		}
-		for i := range pods.Items {
-			pod := &pods.Items[i]
+		for i := range pods {
+			pod := &pods[i]
 			if pod.DeletionTimestamp != nil {
 				continue
 			}
@@ -836,6 +861,55 @@ func (p *BusStreamPoller) restartTasksClients(ctx context.Context, agent *agentv
 			fmt.Sprintf("Restarted %s after the provision Job recreated TASKS, so their TASKS consumers are recreated.", strings.Join(restarted, ", ")))
 	}
 	return nil
+}
+
+// tasksClientPods lists one TASKS client's pods: those with its app label that
+// its workload of that name, controlled by the CR, controls. A StatefulSet
+// controls its pods directly, a Deployment through its ReplicaSets. A pod that
+// only carries the label is left alone.
+func (p *BusStreamPoller) tasksClientPods(ctx context.Context, agent *agentv1alpha1.PlatformAgent, name string, selector map[string]string) ([]corev1.Pod, error) {
+	reader := p.r.a2aReader()
+	key := types.NamespacedName{Namespace: agent.Namespace, Name: name}
+	inNamespace := []client.ListOption{client.InNamespace(agent.Namespace), client.MatchingLabels(selector)}
+	owners := map[types.UID]bool{}
+	var dep appsv1.Deployment
+	if err := reader.Get(ctx, key, &dep); err == nil {
+		if metav1.IsControlledBy(&dep, agent) {
+			var sets appsv1.ReplicaSetList
+			if err := reader.List(ctx, &sets, inNamespace...); err != nil {
+				return nil, err
+			}
+			for i := range sets.Items {
+				if metav1.IsControlledBy(&sets.Items[i], &dep) {
+					owners[sets.Items[i].UID] = true
+				}
+			}
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return nil, err
+	}
+	var sts appsv1.StatefulSet
+	if err := reader.Get(ctx, key, &sts); err == nil {
+		if metav1.IsControlledBy(&sts, agent) {
+			owners[sts.UID] = true
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return nil, err
+	}
+	if len(owners) == 0 {
+		return nil, nil
+	}
+	var pods corev1.PodList
+	if err := p.r.podReader().List(ctx, &pods, inNamespace...); err != nil {
+		return nil, err
+	}
+	var own []corev1.Pod
+	for _, pod := range pods.Items {
+		if ref := metav1.GetControllerOf(&pod); ref != nil && owners[ref.UID] {
+			own = append(own, pod)
+		}
+	}
+	return own, nil
 }
 
 // writeRecord stores the re-run record on the CR's annotation, on a fresh read.

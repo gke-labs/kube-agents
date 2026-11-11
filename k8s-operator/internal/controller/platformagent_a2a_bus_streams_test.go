@@ -218,6 +218,8 @@ type busStreamsRig struct {
 	deleted  []string
 	now      time.Time
 	patchErr error
+	// podDeleteErr, when set, fails every pod delete.
+	podDeleteErr error
 }
 
 func busStreamsAgent(replicas int) *agentv1alpha1.PlatformAgent {
@@ -294,6 +296,22 @@ func clientPod(agent *agentv1alpha1.PlatformAgent, name string, selector map[str
 	return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: agent.Namespace, Labels: selector, UID: types.UID(name)}}
 }
 
+func controlledBy(owner client.Object, kind, apiVersion string) []metav1.OwnerReference {
+	return []metav1.OwnerReference{{APIVersion: apiVersion, Kind: kind, Name: owner.GetName(), UID: owner.GetUID(), Controller: ptr.To(true)}}
+}
+
+// deploymentClient is one TASKS client as the cluster has it: the CR's
+// Deployment, its ReplicaSet, and one pod of that ReplicaSet named pod.
+func deploymentClient(agent *agentv1alpha1.PlatformAgent, name, pod string, selector map[string]string) []client.Object {
+	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: agent.Namespace, UID: types.UID(name + "-dep"),
+		OwnerReferences: controlledBy(agent, "PlatformAgent", agentv1alpha1.GroupVersion.String())}}
+	rs := &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Name: name + "-5d9c", Namespace: agent.Namespace, UID: types.UID(name + "-rs"), Labels: selector,
+		OwnerReferences: controlledBy(dep, "Deployment", "apps/v1")}}
+	p := clientPod(agent, pod, selector)
+	p.OwnerReferences = controlledBy(rs, "ReplicaSet", "apps/v1")
+	return []client.Object{dep, rs, p}
+}
+
 func newBusStreamsRig(t *testing.T, replicas int, objs ...client.Object) *busStreamsRig {
 	t.Helper()
 	// The operator's own identity, which the fence admits it by.
@@ -305,9 +323,8 @@ func newBusStreamsRig(t *testing.T, replicas int, objs ...client.Object) *busStr
 	for i := 0; i < replicas; i++ {
 		all = append(all, busStreamsPod(agent, i))
 	}
-	all = append(all,
-		clientPod(agent, "test-agent-a2a-gateway-abc", a2aGatewayPodSelector(agent)),
-		clientPod(agent, "test-agent-gateway-xyz", gatewayPodSelector(agent)))
+	all = append(all, deploymentClient(agent, a2aGatewayName(agent), "test-agent-a2a-gateway-abc", a2aGatewayPodSelector(agent))...)
+	all = append(all, deploymentClient(agent, agent.Name+gatewayAppSuffix, "test-agent-gateway-xyz", gatewayPodSelector(agent))...)
 	all = append(all, objs...)
 	rig.cl = fake.NewClientBuilder().
 		WithScheme(setupScheme()).
@@ -315,6 +332,9 @@ func newBusStreamsRig(t *testing.T, replicas int, objs ...client.Object) *busStr
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(interceptor.Funcs{
 			Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+				if _, isPod := obj.(*corev1.Pod); isPod && rig.podDeleteErr != nil {
+					return rig.podDeleteErr
+				}
 				rig.deleted = append(rig.deleted, obj.GetName())
 				return c.Delete(ctx, obj, opts...)
 			},
@@ -1083,5 +1103,187 @@ func TestTheNewestProvisionJobDecides(t *testing.T) {
 	rig.poll()
 	if !slices.Contains(rig.deleted, newer.Name) {
 		t.Errorf("deleted %v, want the newest, completed Job %s re-run", rig.deleted, newer.Name)
+	}
+}
+
+// A stop for names a re-run did not bring back lasts only until they are back:
+// fixed by hand, the bus reads AllPresent, and a later loss of the same name
+// is re-provisioned rather than stopped.
+func TestAStopIsLiftedOnceItsStreamsAreBack(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	rig.serve(1, allStreamsBut("DIRECTORY")...)
+	rig.poll()
+	rig.poll()
+	rig.poll()
+	rig.recreateJob(batchv1.JobComplete)
+	for i := 0; i < 4; i++ {
+		rig.poll()
+	}
+	if c := rig.condition(); c == nil || c.Reason != busStreamsReasonDidNotRestore {
+		t.Fatalf("condition = %+v, want %s before the fix", c, busStreamsReasonDidNotRestore)
+	}
+
+	// Fixed by hand.
+	rig.serve(1, a2aProvisionedStreams...)
+	rig.poll()
+	if c := rig.condition(); c == nil || c.Status != metav1.ConditionTrue || c.Reason != busStreamsReasonAllPresent {
+		t.Fatalf("condition after the fix = %+v, want True/AllPresent", c)
+	}
+	if last := readBusReprovisionRecord(rig.agent()).last(); last == nil || !last.Restored {
+		t.Fatalf("record's last attempt = %+v, want it marked restored once its streams were back", last)
+	}
+
+	// Lost again, past the gap but inside the window the attempt is kept in.
+	rig.now = rig.now.Add(time.Hour)
+	rig.serve(1, allStreamsBut("DIRECTORY")...)
+	rig.poll()
+	rig.poll()
+	rig.poll()
+	if rig.jobExists() {
+		t.Fatalf("the later loss was stopped by the lifted stop; condition %+v", rig.condition())
+	}
+	if c := rig.condition(); c == nil || c.Reason != busStreamsReasonReprovisioning {
+		t.Errorf("condition = %+v, want %s", c, busStreamsReasonReprovisioning)
+	}
+}
+
+// A restart whose deletes fail stays owed: the condition doesn't go
+// True/AllPresent over clients still without their TASKS consumer, and the
+// next poll retries it.
+func TestAFailedRestartIsRetriedBeforeTheBusReadsPresent(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	rig.serve(1, allStreamsBut("TASKS")...)
+	rig.poll()
+	rig.poll()
+	rig.poll()
+	rig.recreateJob(batchv1.JobComplete)
+	rig.serve(1, a2aProvisionedStreams...)
+
+	rig.podDeleteErr = errors.New("etcdserver: request timed out")
+	for i := 0; i < 2; i++ {
+		if err := rig.poller.pollAgent(context.Background(), rig.agent()); err == nil {
+			t.Fatalf("poll %d succeeded with the restart failing", i+1)
+		}
+		rig.now = rig.now.Add(busStreamsPollInterval)
+		if c := rig.condition(); c != nil && c.Status == metav1.ConditionTrue {
+			t.Fatalf("condition = %+v with the restart still owed, want not True", c)
+		}
+		if last := readBusReprovisionRecord(rig.agent()).last(); last == nil || !last.Settled || !last.RestartOwed || last.Restarted {
+			t.Fatalf("record's last attempt = %+v, want settled, restart owed, not restarted", last)
+		}
+	}
+
+	rig.podDeleteErr = nil
+	rig.poll()
+	for _, pod := range []string{"test-agent-a2a-gateway-abc", "test-agent-gateway-xyz"} {
+		if !slices.Contains(rig.deleted, pod) {
+			t.Errorf("deleted %v, want %s restarted on the retry", rig.deleted, pod)
+		}
+	}
+	if c := rig.condition(); c == nil || c.Status != metav1.ConditionTrue || c.Reason != busStreamsReasonAllPresent {
+		t.Errorf("condition after the retry = %+v, want True/AllPresent", c)
+	}
+	if last := readBusReprovisionRecord(rig.agent()).last(); last == nil || !last.Restarted {
+		t.Errorf("record's last attempt = %+v, want restarted", last)
+	}
+	before := len(rig.deleted)
+	rig.poll()
+	if len(rig.deleted) != before {
+		t.Errorf("a poll after the restart deleted %v again", rig.deleted[before:])
+	}
+}
+
+// Only each client's own pods are restarted: a pod that carries a client's app
+// label without its workload controlling it is left alone, and so is a
+// look-alike Deployment the CR doesn't control.
+func TestOnlyTheClientsOwnPodsAreRestarted(t *testing.T) {
+	agent := busStreamsAgent(1)
+	stray := clientPod(agent, "test-agent-a2a-gateway-stray", a2aGatewayPodSelector(agent))
+	foreignRS := &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Name: "other-rs", Namespace: agent.Namespace, UID: "other-rs", Labels: gatewayPodSelector(agent),
+		OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "Deployment", Name: "other", UID: "other-dep", Controller: ptr.To(true)}}}}
+	foreign := clientPod(agent, "test-agent-gateway-foreign", gatewayPodSelector(agent))
+	foreign.OwnerReferences = controlledBy(foreignRS, "ReplicaSet", "apps/v1")
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete), stray, foreignRS, foreign)
+	rig.serve(1, allStreamsBut("TASKS")...)
+	rig.poll()
+	rig.poll()
+	rig.poll()
+	rig.recreateJob(batchv1.JobComplete)
+	rig.serve(1, a2aProvisionedStreams...)
+	rig.poll()
+	for _, pod := range []string{"test-agent-a2a-gateway-abc", "test-agent-gateway-xyz"} {
+		if !slices.Contains(rig.deleted, pod) {
+			t.Errorf("deleted %v, want %s restarted", rig.deleted, pod)
+		}
+	}
+	for _, pod := range []string{stray.Name, foreign.Name} {
+		if slices.Contains(rig.deleted, pod) {
+			t.Errorf("deleted %s, which no client workload of the CR controls", pod)
+		}
+	}
+}
+
+// The agent pod can run under a StatefulSet; its pods are its own directly.
+func TestAStatefulSetClientsPodsAreRestarted(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	ctx := context.Background()
+	// Swap the agent gateway's Deployment for a StatefulSet.
+	if err := rig.cl.Delete(ctx, &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + gatewayAppSuffix, Namespace: agent.Namespace}}); err != nil {
+		t.Fatal(err)
+	}
+	sts := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + gatewayAppSuffix, Namespace: agent.Namespace, UID: "agent-gw-sts",
+		OwnerReferences: controlledBy(agent, "PlatformAgent", agentv1alpha1.GroupVersion.String())}}
+	pod := clientPod(agent, "test-agent-gateway-0", gatewayPodSelector(agent))
+	pod.OwnerReferences = controlledBy(sts, "StatefulSet", "apps/v1")
+	for _, obj := range []client.Object{sts, pod} {
+		if err := rig.cl.Create(ctx, obj); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rig.deleted = nil
+	rig.serve(1, allStreamsBut("TASKS")...)
+	rig.poll()
+	rig.poll()
+	rig.poll()
+	rig.recreateJob(batchv1.JobComplete)
+	rig.serve(1, a2aProvisionedStreams...)
+	rig.poll()
+	if !slices.Contains(rig.deleted, "test-agent-gateway-0") {
+		t.Errorf("deleted %v, want the StatefulSet's pod restarted", rig.deleted)
+	}
+	if slices.Contains(rig.deleted, "test-agent-gateway-xyz") {
+		t.Errorf("deleted the old ReplicaSet's pod, whose Deployment is gone")
+	}
+}
+
+// A client Deployment of the expected name that the CR doesn't control is not
+// the client's: its pods are left alone.
+func TestALookAlikeDeploymentsPodsAreNotRestarted(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	ctx := context.Background()
+	dep := &appsv1.Deployment{}
+	if err := rig.cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aGatewayName(agent)}, dep); err != nil {
+		t.Fatal(err)
+	}
+	dep.OwnerReferences = []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "Deployment", Name: "someone-else", UID: "someone-else", Controller: ptr.To(true)}}
+	if err := rig.cl.Update(ctx, dep); err != nil {
+		t.Fatal(err)
+	}
+	rig.serve(1, allStreamsBut("TASKS")...)
+	rig.poll()
+	rig.poll()
+	rig.poll()
+	rig.recreateJob(batchv1.JobComplete)
+	rig.serve(1, a2aProvisionedStreams...)
+	rig.poll()
+	if slices.Contains(rig.deleted, "test-agent-a2a-gateway-abc") {
+		t.Errorf("deleted the pod of a Deployment the CR doesn't control")
+	}
+	if !slices.Contains(rig.deleted, "test-agent-gateway-xyz") {
+		t.Errorf("deleted %v, want the agent pod still restarted", rig.deleted)
 	}
 }
