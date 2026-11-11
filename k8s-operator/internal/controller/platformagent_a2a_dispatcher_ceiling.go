@@ -18,10 +18,14 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
 	"slices"
 	"strings"
+	"sync"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -58,8 +62,12 @@ const (
 // shard: the shard budget less the envelope every shard carries.
 const a2aDispatcherCeilingBytes = a2aAuthMapShardByteBudget - a2aAuthMapShardEnvelopeBytes
 
-// a2aDispatcherWarnBytes is four fifths of it: past this the condition warns.
-const a2aDispatcherWarnBytes = a2aDispatcherCeilingBytes * 4 / 5
+// dispatcherCeilingWarnPercent is how full either budget gets before the
+// condition warns.
+const dispatcherCeilingWarnPercent = 80
+
+// a2aDispatcherWarnBytes is that share of the identity's ceiling.
+const a2aDispatcherWarnBytes = a2aDispatcherCeilingBytes * dispatcherCeilingWarnPercent / 100
 
 // a2aDispatcherDrainingReserve is what the profile cut leaves for the
 // grants of profiles that have left and still drain: two subjects and a stop
@@ -112,30 +120,38 @@ func a2aDispatcherMapEntry(agent *agentv1alpha1.PlatformAgent, profiles []agentv
 // entry's arrays never empty, so a profile's lines add exactly, and the entry
 // for any set of them is base plus their shares.
 func a2aDispatcherProfileShares(agent *agentv1alpha1.PlatformAgent, profiles []*agentv1alpha1.AgentProfile) (base int, shares []int, err error) {
-	measure := func(names, durables []string) (int, error) {
-		id := dispatcherIdentity(agent, agent.Namespace, names, durables)
-		return a2aAuthMapEntryBytes(a2aAuthMapIdentity{
-			ServiceAccount: id.serviceAccount, User: id.user, Account: id.account,
-			Grants: a2aAuthMapGrants{Publish: id.publish, Subscribe: id.subscribe},
-		})
-	}
-	if base, err = measure(nil, nil); err != nil {
+	if base, err = dispatcherIdentityBytes(agent, nil, nil); err != nil {
 		return 0, nil, err
 	}
 	for _, p := range profiles {
-		var durables []string
-		for _, tier := range p.AllowedTierList() {
-			for _, kind := range a2aSubmitKinds {
-				durables = append(durables, profileDurableName(p.Name, tier, kind))
-			}
-		}
-		n, err := measure([]string{p.Name}, durables)
+		n, err := dispatcherIdentityShare(agent, base, p)
 		if err != nil {
 			return 0, nil, err
 		}
-		shares = append(shares, n-base)
+		shares = append(shares, n)
 	}
 	return base, shares, nil
+}
+
+func dispatcherIdentityBytes(agent *agentv1alpha1.PlatformAgent, names, durables []string) (int, error) {
+	id := dispatcherIdentity(agent, agent.Namespace, names, durables)
+	return a2aAuthMapEntryBytes(a2aAuthMapIdentity{
+		ServiceAccount: id.serviceAccount, User: id.user, Account: id.account,
+		Grants: a2aAuthMapGrants{Publish: id.publish, Subscribe: id.subscribe},
+	})
+}
+
+// dispatcherIdentityShare is the bytes p adds to the dispatcher's identity
+// entry over base, its size with no profiles.
+func dispatcherIdentityShare(agent *agentv1alpha1.PlatformAgent, base int, p *agentv1alpha1.AgentProfile) (int, error) {
+	var durables []string
+	for _, tier := range p.AllowedTierList() {
+		for _, kind := range a2aSubmitKinds {
+			durables = append(durables, profileDurableName(p.Name, tier, kind))
+		}
+	}
+	n, err := dispatcherIdentityBytes(agent, []string{p.Name}, durables)
+	return n - base, err
 }
 
 // a2aDispatchConfigShares is the dispatch config's size with no profiles,
@@ -147,37 +163,61 @@ func a2aDispatcherProfileShares(agent *agentv1alpha1.PlatformAgent, profiles []*
 // one more byte for the comma it takes in the array: exact for every entry
 // after the first, one over for the first, never under.
 func a2aDispatchConfigShares(agent *agentv1alpha1.PlatformAgent, profiles []*agentv1alpha1.AgentProfile) (base int, shares []int, err error) {
-	jobMode := dispatcherJobPolicyRendered()
-	header := dispatchConfigHeader(agent)
-	header.Version = strings.Repeat("0", 16)
-	if jobMode {
-		header.JobLabels = dispatchJobLabels(agent)
-	}
-	measure := func(entries []a2aDispatchProfile) (int, error) {
-		cfg := header
-		cfg.Profiles = entries
-		body, err := json.Marshal(cfg)
-		return len(body), err
-	}
-	if base, err = measure([]a2aDispatchProfile{}); err != nil {
+	m := newDispatchConfigMeasure(agent)
+	if base, err = m.bytes(nil); err != nil {
 		return 0, nil, err
 	}
 	for _, p := range profiles {
-		var tmpl *corev1.PodTemplateSpec
-		if jobMode && slices.Contains(p.AllowedTierList(), agentv1alpha1.AgentProfileTierUnattended) {
-			with, without := buildProfileJobTemplate(agent, p, true), buildProfileJobTemplate(agent, p, false)
-			tmpl = with
-			if a, b := jsonLen(with), jsonLen(without); b > a {
-				tmpl = without
-			}
-		}
-		n, err := measure([]a2aDispatchProfile{dispatchProfileEntry(agent, p, tmpl)})
+		n, err := m.share(base, p)
 		if err != nil {
 			return 0, nil, err
 		}
-		shares = append(shares, n-base+1)
+		shares = append(shares, n)
 	}
 	return base, shares, nil
+}
+
+// dispatchConfigMeasure measures dispatch configs for one agent: the header
+// every config carries, and whether its profiles carry Job templates.
+type dispatchConfigMeasure struct {
+	agent   *agentv1alpha1.PlatformAgent
+	header  a2aDispatchConfig
+	jobMode bool
+}
+
+func newDispatchConfigMeasure(agent *agentv1alpha1.PlatformAgent) dispatchConfigMeasure {
+	m := dispatchConfigMeasure{agent: agent, header: dispatchConfigHeader(agent), jobMode: dispatcherJobPolicyRendered()}
+	// The Version is a fixed-width hex digest (desiredDispatchConfigWith).
+	m.header.Version = strings.Repeat("0", 2*dispatchConfigVersionBytes)
+	if m.jobMode {
+		m.header.JobLabels = dispatchJobLabels(agent)
+	}
+	return m
+}
+
+// bytes is the config's size with these entries.
+func (m dispatchConfigMeasure) bytes(entries []a2aDispatchProfile) (int, error) {
+	cfg := m.header
+	cfg.Profiles = entries
+	if cfg.Profiles == nil {
+		cfg.Profiles = []a2aDispatchProfile{}
+	}
+	body, err := json.Marshal(cfg)
+	return len(body), err
+}
+
+// share is the bytes p's entry adds over base, with its comma.
+func (m dispatchConfigMeasure) share(base int, p *agentv1alpha1.AgentProfile) (int, error) {
+	var tmpl *corev1.PodTemplateSpec
+	if m.jobMode && slices.Contains(p.AllowedTierList(), agentv1alpha1.AgentProfileTierUnattended) {
+		with, without := buildProfileJobTemplate(m.agent, p, true), buildProfileJobTemplate(m.agent, p, false)
+		tmpl = with
+		if a, b := jsonLen(with), jsonLen(without); b > a {
+			tmpl = without
+		}
+	}
+	n, err := m.bytes([]a2aDispatchProfile{dispatchProfileEntry(m.agent, p, tmpl)})
+	return n - base + 1, err
 }
 
 func jsonLen(v any) int {
@@ -185,31 +225,93 @@ func jsonLen(v any) int {
 	return len(b)
 }
 
+// dispatcherCut is where the cut falls: how many of the bound profiles fit,
+// which limit stopped it ("" when all fit), and the dispatch config's size for
+// the ones that fit.
+type dispatcherCut struct {
+	fit         int
+	limit       string
+	configBytes int
+}
+
+// dispatcherCutCache holds recent cuts by their inputs' fingerprint. Every
+// identity resolution makes the cut, and callers resolve many times a
+// reconcile, so without it each would rebuild and marshal every profile's Job
+// template again.
+var dispatcherCutCache = struct {
+	sync.Mutex
+	cuts map[string]dispatcherCut
+}{cuts: map[string]dispatcherCut{}}
+
+// dispatcherCutCacheSize bounds the cache; past it, it starts over.
+const dispatcherCutCacheSize = 64
+
+// dispatcherCutKey fingerprints what decides a cut: the agent's spec and
+// place, each bound profile's name, creation time and spec, in order, and the
+// operator's environment, which picks the images and Job mode.
+func dispatcherCutKey(agent *agentv1alpha1.PlatformAgent, bound []*agentv1alpha1.AgentProfile) string {
+	h := sha256.New()
+	enc := json.NewEncoder(h)
+	_ = enc.Encode([]any{agent.Namespace, agent.Name, agent.Spec, os.Environ()})
+	for _, p := range bound {
+		_ = enc.Encode([]any{p.Name, p.CreationTimestamp, p.Spec})
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
 // dispatcherCeilingCut is how many of bound, oldest first, fit under both the
-// dispatcher's identity budget and the dispatch config's, and which limit
-// stopped it ("" when all fit). Once one doesn't fit, every newer one is cut
-// too, even a smaller one that would: a later profile never jumps an earlier.
-func dispatcherCeilingCut(agent *agentv1alpha1.PlatformAgent, bound []*agentv1alpha1.AgentProfile) (fit int, limit string, err error) {
-	idBase, idShares, err := a2aDispatcherProfileShares(agent, bound)
+// dispatcher's identity budget and the dispatch config's. Once one doesn't
+// fit, every newer one is cut too, even a smaller one that would: a later
+// profile never jumps an earlier. Shares are measured as the walk goes, so
+// nothing past the cut is measured.
+func dispatcherCeilingCut(agent *agentv1alpha1.PlatformAgent, bound []*agentv1alpha1.AgentProfile) (dispatcherCut, error) {
+	key := dispatcherCutKey(agent, bound)
+	dispatcherCutCache.Lock()
+	cut, ok := dispatcherCutCache.cuts[key]
+	dispatcherCutCache.Unlock()
+	if ok {
+		return cut, nil
+	}
+	idUsed, err := dispatcherIdentityBytes(agent, nil, nil)
 	if err != nil {
-		return 0, "", err
+		return dispatcherCut{}, err
 	}
-	cfgBase, cfgShares, err := a2aDispatchConfigShares(agent, bound)
+	idBase := idUsed
+	m := newDispatchConfigMeasure(agent)
+	cfgUsed, err := m.bytes(nil)
 	if err != nil {
-		return 0, "", err
+		return dispatcherCut{}, err
 	}
-	idUsed, cfgUsed := idBase, cfgBase
-	for i := range bound {
-		if idUsed+idShares[i] > a2aDispatcherProfileBudget {
-			return i, dispatcherCeilingLimitIdentity, nil
+	cfgBase := cfgUsed
+	cut = dispatcherCut{fit: len(bound)}
+	for i, p := range bound {
+		idShare, err := dispatcherIdentityShare(agent, idBase, p)
+		if err != nil {
+			return dispatcherCut{}, err
 		}
-		if cfgUsed+cfgShares[i] > a2aDispatchConfigProfileBudget {
-			return i, dispatcherCeilingLimitConfig, nil
+		if idUsed+idShare > a2aDispatcherProfileBudget {
+			cut.fit, cut.limit = i, dispatcherCeilingLimitIdentity
+			break
 		}
-		idUsed += idShares[i]
-		cfgUsed += cfgShares[i]
+		cfgShare, err := m.share(cfgBase, p)
+		if err != nil {
+			return dispatcherCut{}, err
+		}
+		if cfgUsed+cfgShare > a2aDispatchConfigProfileBudget {
+			cut.fit, cut.limit = i, dispatcherCeilingLimitConfig
+			break
+		}
+		idUsed += idShare
+		cfgUsed += cfgShare
 	}
-	return len(bound), "", nil
+	cut.configBytes = cfgUsed
+	dispatcherCutCache.Lock()
+	if len(dispatcherCutCache.cuts) >= dispatcherCutCacheSize {
+		dispatcherCutCache.cuts = map[string]dispatcherCut{}
+	}
+	dispatcherCutCache.cuts[key] = cut
+	dispatcherCutCache.Unlock()
+	return cut, nil
 }
 
 // dispatcherCeilingLimitPhrase says, in a message, what a cut at limit ran into.
@@ -233,10 +335,11 @@ func refuseOverDispatcherCeiling(agent *agentv1alpha1.PlatformAgent, sorted []ag
 			bound = append(bound, &sorted[i])
 		}
 	}
-	fit, limit, err := dispatcherCeilingCut(agent, bound)
+	cut, err := dispatcherCeilingCut(agent, bound)
 	if err != nil {
 		return // the map's and the apply's own checks refuse what can't be measured
 	}
+	fit, limit := cut.fit, cut.limit
 	for _, p := range bound[fit:] {
 		out[p.Name] = agentProfileResolution{
 			refused: fmt.Errorf("the profile dispatcher serves the %d oldest profiles %s, "+
@@ -279,18 +382,11 @@ func dispatcherCeilingStanding(agent *agentv1alpha1.PlatformAgent, profiles []ag
 			bound = append(bound, &sorted[i])
 		}
 	}
-	if fit, limit, err = dispatcherCeilingCut(agent, bound); err != nil {
-		return 0, "", 0, err
-	}
-	base, shares, err := a2aDispatchConfigShares(agent, bound[:fit])
+	cut, err := dispatcherCeilingCut(agent, bound)
 	if err != nil {
 		return 0, "", 0, err
 	}
-	configBytes = base
-	for _, n := range shares {
-		configBytes += n
-	}
-	return fit, limit, configBytes, nil
+	return cut.fit, cut.limit, cut.configBytes, nil
 }
 
 // a2aDispatcherCeiling measures the dispatcher's entry as a shard carries it
@@ -311,6 +407,12 @@ func a2aDispatcherCeiling(agent *agentv1alpha1.PlatformAgent, profiles []agentv1
 		return metav1.Condition{}, false, fmt.Errorf("measuring the dispatch config: %w", err)
 	}
 	configPct := configBytes * 100 / a2aDispatchConfigLimitBytes
+	// The draining profiles' entries go into the config as well as their
+	// grants into the identity, and the cut leaves them only a reserve.
+	withDraining := configBytes
+	for _, d := range draining {
+		withDraining += jsonLen(d) + 1
+	}
 	switch {
 	case size > a2aDispatcherCeilingBytes:
 		over = true
@@ -319,13 +421,20 @@ func a2aDispatcherCeiling(agent *agentv1alpha1.PlatformAgent, profiles []agentv1
 		condition.Message = fmt.Sprintf("the profile dispatcher's identity entry for %d profiles, %d of them draining, is %d bytes, over the %d bytes one identity-map shard can carry, "+
 			"so the operator runs no dispatcher, and profile tasks aren't dispatched, until those drains run out. Lifting the ceiling is %s",
 			n, len(draining), size, a2aDispatcherCeilingBytes, dispatcherCeilingIssue)
+	case withDraining > a2aDispatchConfigLimitBytes-a2aDispatchConfigEnvelopeBytes:
+		over = true
+		condition.Status = metav1.ConditionFalse
+		condition.Reason = dispatcherCeilingReasonOver
+		condition.Message = fmt.Sprintf("the profile dispatcher's config for %d profiles and %d draining ones is %d bytes, over the %d bytes one ConfigMap can hold, "+
+			"so the operator runs no dispatcher, and profile tasks aren't dispatched, until those drains run out. Lifting the ceiling is %s",
+			fit, len(draining), withDraining, a2aDispatchConfigLimitBytes, dispatchConfigCeilingIssue)
 	case len(refused) > 0:
 		condition.Status = metav1.ConditionFalse
 		condition.Reason = dispatcherCeilingReasonRefused
 		condition.Message = fmt.Sprintf("the profile dispatcher serves %d profiles %s; "+
 			"the %d newer ones aren't bound (the newest refused: %s), and the dispatcher serves the rest. Lifting the ceiling is %s",
 			fit, dispatcherCeilingLimitPhrase(limit), len(refused), refused[len(refused)-1], dispatcherCeilingIssueFor(limit))
-	case configPct >= 80 && configPct >= pct:
+	case configPct >= dispatcherCeilingWarnPercent && configPct >= pct:
 		condition.Status = metav1.ConditionTrue
 		condition.Reason = dispatcherCeilingReasonNear
 		condition.Message = fmt.Sprintf("the profile dispatcher's config for %d profiles is %d bytes, %d%% of the %d bytes one ConfigMap can hold; "+
@@ -348,8 +457,8 @@ func a2aDispatcherCeiling(agent *agentv1alpha1.PlatformAgent, profiles []agentv1
 // syncDispatcherCeiling writes the DispatcherCeiling condition on the
 // way out of Reconcile, as syncDispatcherJobMode does and for its reasons:
 // nil leaves it as it was, dispatcherCeilingRemoved takes it away, anything
-// else is its new value. A move into NearBudget or OverBudget is also a
-// Warning event, once per transition.
+// else is its new value. A move into NearBudget, ProfilesRefused or
+// OverBudget is also a Warning event, once per transition.
 func (r *PlatformAgentReconciler) syncDispatcherCeiling(ctx context.Context, agent *agentv1alpha1.PlatformAgent, verdict *metav1.Condition) error {
 	switch verdict {
 	case nil:

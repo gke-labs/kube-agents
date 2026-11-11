@@ -33,6 +33,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -47,12 +48,9 @@ import (
 // only reader of the profiles' shared durables and the only writer of
 // PROFILE_LEASES. This file renders what it runs on. The binary is PR 3's.
 const (
-	// a2aDispatcherImageEnvVar names the dispatcher's image, and setting it
-	// is the only way to turn the dispatcher on. Unset, the operator renders
-	// no dispatcher at all, not its identity, its grants nor its
-	// Deployment: until profiles dispatch end to end (the worker's side is
-	// #3655's PR 5) it would be an idle component that costs every next
-	// install a principal and a pod.
+	// a2aDispatcherImageEnvVar overrides the dispatcher's image. Unset, the
+	// operator runs the release set's, derived as its other A2A images are
+	// (a2aDispatcherReleaseImage); a2aProfileDispatcherEnvVar is the switch.
 	// a2aDispatcherImageName is its name in the release set, which it is
 	// built and published under already; a2aDispatcherReleaseImage resolves
 	// it.
@@ -265,6 +263,16 @@ func a2aTaskSigningKeyHash(public string) string {
 // two at once would each hold their own share of every durable's in-flight
 // count and enforce the ceiling against half the picture. The gap Recreate
 // leaves is what restartGraceSeconds covers.
+// a2aDispatcherResources adds an ephemeral-storage request and equal limit,
+// for the container's own log, to its CPU and memory, as the bus's config
+// reloader does: the dispatcher writes nothing else to disk.
+func a2aDispatcherResources() corev1.ResourceRequirements {
+	resources := a2aResources(a2aDispatcherCPURequest, a2aDispatcherMemoryRequest, a2aDispatcherCPULimit, a2aDispatcherMemoryLimit)
+	resources.Requests[corev1.ResourceEphemeralStorage] = resource.MustParse(emptyDirLogsAllowance)
+	resources.Limits[corev1.ResourceEphemeralStorage] = resource.MustParse(emptyDirLogsAllowance)
+	return resources
+}
+
 func buildA2ADispatcherDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deployment {
 	name := a2aDispatcherName(agent)
 	selector := a2aDispatcherPodSelector(agent)
@@ -331,8 +339,7 @@ func buildA2ADispatcherDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.De
 							PeriodSeconds:    10,
 							FailureThreshold: 6,
 						},
-						Resources: a2aResources(a2aDispatcherCPURequest, a2aDispatcherMemoryRequest,
-							a2aDispatcherCPULimit, a2aDispatcherMemoryLimit),
+						Resources:       a2aDispatcherResources(),
 						SecurityContext: hardenedSecurityContext(),
 					}},
 					Volumes: []corev1.Volume{a2aBusTokenVolumeSource(), a2aNATSCABundleVolume(agent), a2aTaskSigningSeedVolumeSource(agent)},
@@ -637,7 +644,7 @@ func desiredDispatchConfigWith(agent *agentv1alpha1.PlatformAgent, profiles []ag
 		return cfg, err
 	}
 	sum := sha256.Sum256(body)
-	cfg.Version = hex.EncodeToString(sum[:8])
+	cfg.Version = hex.EncodeToString(sum[:dispatchConfigVersionBytes])
 	return cfg, nil
 }
 
@@ -683,6 +690,10 @@ func dispatchProfileEntry(agent *agentv1alpha1.PlatformAgent, p *agentv1alpha1.A
 	}
 	return dp
 }
+
+// dispatchConfigVersionBytes is how much of the config's digest its Version
+// keeps.
+const dispatchConfigVersionBytes = 8
 
 // a2aDrainingMargin is how long past the longest task deadline a profile that
 // has left the install stays draining: the dispatcher fails a task still held
@@ -843,10 +854,10 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcherWithJobMode(ctx context.
 	// Past the size one identity-map shard can carry, the map leaves the
 	// dispatcher's entry out, so it is torn down as though switched off; the
 	// DispatcherCeiling condition says why (gke-labs/kube-agents#5381). The
-	// dispatch config is still written: the draining profiles are read from
-	// it, with their deadlines, so the teardown lasts until those drains run
-	// out rather than one pass, and a profile that leaves meanwhile gets a
-	// deadline too.
+	// dispatch config is still written, with the draining profiles alone: they
+	// are read from it, with their deadlines, so the teardown lasts until those
+	// drains run out rather than one pass. The live profiles stay out, so the
+	// write fits whichever limit was passed; nothing dispatches for them.
 	overCeiling := false
 	if a2aDispatcherEnabled() {
 		_, over, cerr := a2aDispatcherCeiling(agent, profiles, draining)
@@ -858,7 +869,10 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcherWithJobMode(ctx context.
 	if !a2aDispatcherEnabled() || overCeiling {
 		profileErr, err = r.removeA2ADispatcher(ctx, agent, overCeiling)
 		if overCeiling && err == nil {
-			cm, berr := buildA2ADispatchConfigMap(agent, profiles, draining)
+			cm, berr := buildA2ADispatchConfigMap(agent, nil, draining)
+			if berr == nil {
+				berr = ctrl.SetControllerReference(agent, cm, r.Scheme)
+			}
 			if berr == nil {
 				berr = r.applyManaged(ctx, agent, cm)
 			}

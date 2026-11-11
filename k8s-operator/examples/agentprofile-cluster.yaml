@@ -16,8 +16,8 @@
 #
 # Both run the same persona, so both declare its parameters, in its order: the
 # design has the worker refuse a task when the CR's list and the persona's
-# differ (docs/designs/spec-subagent-profiles.md). Neither runs a pod until the
-# profile dispatcher, worker and pool land and the operator runs them.
+# differ (docs/designs/spec-subagent-profiles.md). The profile dispatcher, on
+# by default, runs their workers.
 apiVersion: kubeagents.x-k8s.io/v1alpha1
 kind: AgentProfile
 metadata:

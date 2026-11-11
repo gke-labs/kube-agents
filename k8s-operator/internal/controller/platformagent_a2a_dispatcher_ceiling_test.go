@@ -457,3 +457,91 @@ func TestUnderJobModeTheConfigLimitCutsFirst(t *testing.T) {
 		t.Errorf("%d profiles: %s: %s", fit*9/10, near.Reason, near.Message)
 	}
 }
+
+// The draining profiles' entries go into the dispatch config as well as their
+// grants into the identity. With the live profiles at the config's cut, enough
+// of them push the config past what one ConfigMap holds while the identity is
+// still well under its ceiling: that is OverBudget too, and the teardown
+// writes a config, with the drains alone, that fits and that the agent owns.
+func TestDrainingPastTheConfigLimitTearsDownWithAConfigThatFits(t *testing.T) {
+	withOperatorBusPrincipal(t)
+	t.Setenv(a2aProfileDispatcherEnvVar, "")
+	t.Setenv(a2aDispatcherJobPolicyEnvVar, "true")
+	t.Setenv(a2aDispatcherImageEnvVar, testDispatcherImage)
+	agent := a2aTestAgent()
+	profiles := twoTierProfiles(agent, 400)
+	until := time.Now().Add(a2aDrainingWindow).Truncate(time.Second).UTC()
+	var draining []a2aDispatchProfile
+	for i := 0; i < 600; i++ {
+		draining = append(draining, a2aDispatchProfile{Name: fmt.Sprintf("gone-%04d", i), Tiers: []string{agentv1alpha1.AgentProfileTierRead}, DrainingUntil: until})
+	}
+	entry, _ := a2aDispatcherMapEntry(agent, profiles, draining)
+	if size, _ := a2aAuthMapEntryBytes(entry); size > a2aDispatcherCeilingBytes {
+		t.Fatalf("the identity entry is %d bytes, over its own ceiling: the fixture no longer isolates the config side", size)
+	}
+	cond, over, err := a2aDispatcherCeiling(agent, profiles, draining)
+	if err != nil || !over {
+		t.Fatalf("over=%v err=%v: 600 draining entries past the config's reserve didn't read as over", over, err)
+	}
+	if cond.Reason != dispatcherCeilingReasonOver || !strings.Contains(cond.Message, "ConfigMap") || !strings.Contains(cond.Message, "#5479") {
+		t.Errorf("condition %s: %s", cond.Reason, cond.Message)
+	}
+
+	scheme := setupScheme()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, chartProfileNamespace(agent)).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+	r := &PlatformAgentReconciler{Client: c, Scheme: scheme}
+	ctx := context.Background()
+	if profileErr, err := r.reconcileA2ADispatcherDraining(ctx, agent, profiles, true, draining); err != nil || profileErr != nil {
+		t.Fatalf("past the config limit: %v / %v", err, profileErr)
+	}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aDispatcherName(agent)}, &appsv1.Deployment{}); !apierrors.IsNotFound(err) {
+		t.Errorf("the dispatcher's Deployment survived a config past the limit: %v", err)
+	}
+	cm := &corev1.ConfigMap{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aDispatchConfigName(agent)}, cm); err != nil {
+		t.Fatalf("the teardown wrote no dispatch config: %v", err)
+	}
+	if n := len(cm.Data[a2aDispatchConfigKey]); n > a2aDispatchConfigLimitBytes {
+		t.Errorf("the teardown's dispatch config is %d bytes, over one ConfigMap", n)
+	}
+	if !metav1.IsControlledBy(cm, agent) {
+		t.Error("the teardown's dispatch config has no controller reference to the agent, so cleanup would leave it")
+	}
+	// The drains alone: live entries would grow it with the profile count,
+	// past one ConfigMap at fleet scale, and nothing dispatches for them.
+	var applied a2aDispatchConfig
+	if err := json.Unmarshal([]byte(cm.Data[a2aDispatchConfigKey]), &applied); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range applied.Profiles {
+		if p.DrainingUntil.IsZero() {
+			t.Fatalf("the teardown's dispatch config lists live profile %s; it should carry the drains alone", p.Name)
+		}
+	}
+	next, err := r.dispatchDraining(ctx, agent, profiles)
+	if err != nil || len(next) != len(draining) {
+		t.Errorf("the next pass reads %d draining profiles (%v), want %d", len(next), err, len(draining))
+	}
+}
+
+// The cut is cached by what decides it, a profile's spec among it, so a spec
+// change moves the cut even where nothing bumps the generation.
+func TestTheCutFollowsAProfileSpecChange(t *testing.T) {
+	withOperatorBusPrincipal(t)
+	t.Setenv(a2aProfileDispatcherEnvVar, "")
+	agent := a2aTestAgent()
+	profiles := twoTierProfiles(agent, 800)
+	before := a2aDispatcherCeilingRefused(agent, profiles)
+	if len(before) == 0 {
+		t.Fatal("800 profiles fit; the fixture no longer crosses the ceiling")
+	}
+	// The ten oldest drop a tier, so their shares shrink and newer ones fit.
+	for i := 0; i < 10; i++ {
+		profiles[i].Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead}
+	}
+	after := a2aDispatcherCeilingRefused(agent, profiles)
+	if slices.Equal(before, after) {
+		t.Errorf("the cut didn't move when the ten oldest profiles dropped a tier (%d refused both times): a cached cut outlived the spec it was made for", len(after))
+	}
+}

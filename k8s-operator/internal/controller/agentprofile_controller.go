@@ -513,6 +513,26 @@ func (r *AgentProfileReconciler) deleteProfileServiceAccounts(ctx context.Contex
 // labelled with a profile's name, to that profile in the agent's namespace.
 // Anything else maps to nothing. A label someone copied only costs a
 // reconcile, which checks ownership by UID.
+// profileServiceAccountRequests is what a ServiceAccount event in a profile
+// namespace re-reconciles: its own profile when it carries the name label,
+// and every profile in the agent's namespace when it doesn't, since an
+// unlabeled one may be a ServiceAccount a profile would land on and doesn't
+// own (agentProfileServiceAccountIsForeign), which moves the dispatcher
+// ceiling's cut for every newer profile.
+func profileServiceAccountRequests(ctx context.Context, c client.Reader, obj client.Object) []reconcile.Request {
+	if reqs := profileServiceAccountRequest(obj); reqs != nil {
+		return reqs
+	}
+	if obj.GetLabels()[agentProfileNameLabel] != "" {
+		return nil
+	}
+	agentNS, ok := agentNamespaceOfProfileServiceAccount(obj.GetNamespace())
+	if !ok {
+		return nil
+	}
+	return agentProfileRequestsIn(ctx, c, agentNS)
+}
+
 func profileServiceAccountRequest(obj client.Object) []reconcile.Request {
 	name := obj.GetLabels()[agentProfileNameLabel]
 	agentNS, ok := agentNamespaceOfProfileServiceAccount(obj.GetNamespace())
@@ -656,11 +676,14 @@ func (r *AgentProfileReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// The legacy agent-namespace ServiceAccount (deleteOwnServiceAccount).
 		Owns(&corev1.ServiceAccount{}).
 		// The per-tier ServiceAccounts carry no owner reference, so they map
-		// back to their profile by name label and namespace.
+		// back to their profile by name label and namespace. One without the
+		// label may be a ServiceAccount a profile would land on and doesn't own,
+		// which refuses that profile and so moves the dispatcher ceiling's cut
+		// for every newer one: it re-reconciles every profile in the namespace.
 		Watches(
 			&corev1.ServiceAccount{},
-			handler.EnqueueRequestsFromMapFunc(func(_ context.Context, obj client.Object) []reconcile.Request {
-				return profileServiceAccountRequest(obj)
+			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+				return profileServiceAccountRequests(ctx, mgr.GetClient(), obj)
 			}),
 		).
 		Watches(

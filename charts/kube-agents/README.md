@@ -1320,7 +1320,7 @@ AgentProfiles that allow `unattended` under Job mode (the default on Kubernetes 
 carries its Job template in the dispatch config), about 650 at two tiers otherwise. The operator binds
 profiles oldest first while the dispatcher's identity and its config both fit, leaves newer ones
 unbound (`IdentityReady` reads `DispatcherCeiling`), and the PlatformAgent's `DispatcherCeiling`
-condition says so (#5479 and #5381 lift the two limits). Adding a tier to an older profile can
+condition says so. Adding a tier to an older profile can
 leave the newest one out. A flag set in a form the chart cannot read (a `valueFrom`, a non-string value) counts
 as on. An operator test holds that file to the operator's own list and sizes. It counts the A2A gateway at two pods, the operator's default under its
 election, with one gateway pod of surge room for a rollout, unless `operator.extraEnv` sets
@@ -1486,7 +1486,7 @@ controlling its `AgentProfile` spec. When bound, the operator passes
 scaffolds `/opt/data/profiles/tse` from `/opt/tse-template` on startup.
 Its default persona image is still a placeholder with no persona payload, and the
 profile dispatcher, on by default, gives every bound profile a warm worker. So until
-#3842 gives tse a real persona image, enabling `profiles.tse` leaves a tse warm pod
+tse ships a real persona image, enabling `profiles.tse` leaves a tse warm pod
 crash-looping at its persona step. Handing work to tse through Kanban still works,
 since that runs in the scaffolded profile, not in the worker.
 
@@ -1497,9 +1497,9 @@ Its persona is the `persona-cluster` image, built from `agents/cluster/persona`,
 and its harness is `a2a-worker`. `profiles.cluster.{description,persona.image,harness,allowedTiers,lifecycle,concurrency,resources}`
 control its spec. The parameters are fixed, in the persona's order, because
 the design has the worker refuse a task when they differ from the persona's.
-No pod runs it until the profile dispatcher, worker and pool land and the
-operator runs them, though enabling it already gets the profile its
-ServiceAccounts, bus identity and agent card. A cluster that needs its own
+Enabled, it gets its ServiceAccounts, bus identity and agent card, and the
+profile dispatcher, on by default, runs its warm worker pool and its
+unattended Jobs. A cluster that needs its own
 persona or tier gets a second `AgentProfile` with `clusterRef` set (`k8s-operator/examples/agentprofile-cluster.yaml`).
 
 ## Uninstalling

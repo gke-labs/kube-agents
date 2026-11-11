@@ -138,9 +138,9 @@ Totals by install profile, as the chart's quota preflight sums them (the operato
 | ------- | ---- | ------------ | --------------- | ---------- | ------------- | ----------------------------------- | ------ | ------------------ | -------------------- |
 | `today`, GKE Standard | 9 | 2756m | 12096Mi | 13200m | 25472Mi | 14912Mi / 14912Mi | 4 | 102Gi | — |
 | `today`, GKE Autopilot | 9 | 4256m | 13120Mi | 13200m | 25472Mi | 14912Mi / 14912Mi | 4 | 102Gi | — |
-| `next`, GKE Standard | 19 | 3766m | 13776Mi | 19450m | 30368Mi | 15104Mi / 15104Mi | 5 | 142Gi | 37 |
-| `next`, GKE Autopilot | 19 | 5266m | 14800Mi | 19450m | 30368Mi | 15104Mi / 15104Mi | 5 | 142Gi | 37 |
-| `next` with Hindsight and the GitHub minter, GKE Standard | 23 | 4616m | 16208Mi | 25450m | 36000Mi | 16256Mi / 16256Mi | 6 | 150Gi | 43 |
+| `next`, GKE Standard | 19 | 3766m | 13776Mi | 19450m | 30368Mi | 15168Mi / 15168Mi | 5 | 142Gi | 37 |
+| `next`, GKE Autopilot | 19 | 5266m | 14800Mi | 19450m | 30368Mi | 15168Mi / 15168Mi | 5 | 142Gi | 37 |
+| `next` with Hindsight and the GitHub minter, GKE Standard | 23 | 4616m | 16208Mi | 25450m | 36000Mi | 16320Mi / 16320Mi | 6 | 150Gi | 43 |
 
 The session quota is `spec.harness.tuning.maxSessions` (10 by default) plus the pods the operator runs for the agent, the chart's pods in the namespace with their rollout surges (5 when the operator cannot read the chart's count), and a margin of 7 for the operator's rollout surges, its Jobs and the gateway's count-then-create overshoot.
 
@@ -153,7 +153,7 @@ Under `spec.mode: next`, per pod:
 | Capability verifier | 2 | 50m | 64Mi | 500m | 256Mi | — | Standing |
 | A2A gateway | 2 | 50m | 64Mi | 500m | 512Mi | — | Standing; one fewer with the operator's `A2A_GATEWAY_ELECTION=false` |
 | Console | 1 | 100m | 128Mi | 500m | 256Mi | — | Standing |
-| Profile dispatcher | 1 | 50m | 64Mi | 500m | 256Mi | — | Standing, unless `operator.profileDispatcher.enabled` is `false`, when the quota check still counts it |
+| Profile dispatcher | 1 | 50m | 64Mi | 500m | 256Mi | 64Mi / 64Mi | Standing, unless `operator.profileDispatcher.enabled` is `false`, when the quota check still counts it |
 | Bus provisioning Job | 1 | 50m | 64Mi | 200m | 256Mi | 128Mi / 128Mi | At install, again whenever its spec changes, and about daily |
 | `hermes-bridge` container | in the agent pod | 250m | 512Mi | 1 | 1Gi | — | Under the default `api` executor; `A2A_BRIDGE_EXECUTOR=cli` raises it to 1 CPU and 4Gi memory (limits 3 and 8Gi), and `A2A_BRIDGE_RESOURCES` overrides either |
 | MCP server | 1 | 100m | 128Mi | 500m | 256Mi | — | With the operator's `A2A_MCP_DOOR=true` |

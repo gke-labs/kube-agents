@@ -1482,6 +1482,35 @@ func TestAProfileServiceAccountChangeWakesItsProfile(t *testing.T) {
 	}
 }
 
+// An unlabeled ServiceAccount in a profile namespace may be one a profile
+// would land on and doesn't own, which refuses that profile and moves the
+// dispatcher ceiling's cut for every newer one: its event re-reconciles every
+// profile in the agent's namespace. A labeled one still wakes only its own.
+func TestAnUnlabeledProfileServiceAccountWakesEveryProfile(t *testing.T) {
+	agent := a2aTestAgent()
+	a, b := testAgentProfile(agent.Namespace, "auditor"), testAgentProfile(agent.Namespace, "triage")
+	c := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(&a, &b).Build()
+	sa := func(ns string, labels map[string]string) *corev1.ServiceAccount {
+		return &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "agentprofile-auditor-read", Namespace: ns, Labels: labels}}
+	}
+	ctx := context.Background()
+	got := profileServiceAccountRequests(ctx, c, sa(agent.Namespace+"-profiles", nil))
+	names := []string{}
+	for _, r := range got {
+		names = append(names, r.Name)
+	}
+	slices.Sort(names)
+	if !slices.Equal(names, []string{"auditor", "triage"}) {
+		t.Errorf("an unlabeled ServiceAccount woke %v, want every profile", names)
+	}
+	if got := profileServiceAccountRequests(ctx, c, sa(agent.Namespace+"-profiles", map[string]string{agentProfileNameLabel: "auditor"})); len(got) != 1 || got[0].Name != "auditor" {
+		t.Errorf("a labeled ServiceAccount woke %v, want its own profile", got)
+	}
+	if got := profileServiceAccountRequests(ctx, c, sa(agent.Namespace, nil)); len(got) != 0 {
+		t.Errorf("a ServiceAccount outside a profile namespace woke %v", got)
+	}
+}
+
 // Two tiers get two ServiceAccounts in the profile namespace, and dropping a
 // tier deletes its ServiceAccount and leaves the other.
 func TestEachTierGetsAServiceAccountAndADroppedTierLosesIt(t *testing.T) {

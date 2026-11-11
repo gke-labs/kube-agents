@@ -66,7 +66,7 @@ var platformAgentConditionDocs = []conditionDoc{
 	{
 		Type:    dispatcherCeilingCondition,
 		Written: "Under `mode: next`, while the profile dispatcher is switched on",
-		Meaning: "How the dispatcher's identity-map entry and its config compare with what one shard and one ConfigMap can hold. `WithinBudget` (`True`); `NearBudget` (`True`), past four fifths of either, with a Warning event; `ProfilesRefused` (`False`): the newest profiles aren't bound and the dispatcher serves the rest; `OverBudget` (`False`), only from draining profiles: no dispatcher until their drains run out. About 200 profiles that allow `unattended` under Job mode, about 650 at two tiers otherwise.",
+		Meaning: "How the dispatcher's identity-map entry and its config compare with what one shard and one ConfigMap can hold. `WithinBudget` (`True`); `NearBudget` (`True`), past four fifths of either, with a Warning event; `ProfilesRefused` (`False`), with a Warning event: the newest profiles aren't bound and the dispatcher serves the rest; `OverBudget` (`False`), with a Warning event, only from draining profiles: no dispatcher until their drains run out. About 200 profiles that allow `unattended` under Job mode, about 650 at two tiers otherwise.",
 	},
 	{
 		Type:    a2aIdentityMapAppliedConditionType,

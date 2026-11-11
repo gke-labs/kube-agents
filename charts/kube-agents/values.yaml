@@ -182,7 +182,7 @@ operator:
   # 200 AgentProfiles that allow unattended under Job mode, about 650 at two
   # tiers otherwise: the operator binds them oldest first while the
   # dispatcher's identity and config fit, leaves newer ones unbound, and says
-  # so in the PlatformAgent's DispatcherCeiling condition (#5479, #5381).
+  # so in the PlatformAgent's DispatcherCeiling condition.
   profileDispatcher:
     enabled: true
   # The manager's own metrics listener, port 8080, plain HTTP on the pod
@@ -2067,8 +2067,8 @@ profiles:
         memory: 2Gi
   # The generic cluster agent (#3658): a read-only SRE for one GKE cluster,
   # which each task names by its project, location and cluster parameters
-  # (`agents/cluster/persona`). Its workers come from the profile dispatcher, so
-  # no pod runs it until the operator runs one. The credential broker holds each
+  # (`agents/cluster/persona`). Its workers come from the profile dispatcher,
+  # which runs by default. The credential broker holds each
   # task's kubectl and gcloud calls to the task's target.
   cluster:
     enabled: false
