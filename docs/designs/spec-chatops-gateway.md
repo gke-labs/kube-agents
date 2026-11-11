@@ -669,9 +669,15 @@ leaves the record as it was:
    over IDs, with a project number matching only an equal entry. The install's own project
    (`A2A_MANAGEMENT_PROJECT`, from `spec.harness.projectId`) is always in scope, and an
    `exclude.projects` entry matching it is ignored. A declared project list admits only its
-   projects. Under a folder or organization
-   scope the gateway can't resolve membership yet, so a target whose project the list
-   doesn't name is refused: "not excluded" isn't "in scope". An install that declares no scope
+   projects. A target whose project only a folder, organization, Shared VPC host or Metrics
+   Scope reaches is confirmed against the resolved scope: the ConfigMap the scope publisher
+   writes (`A2A_RESOLVED_SCOPE_CONFIGMAP`), read through the API and cached for 30 seconds.
+   It is admitted only from a current document (known version, state `ok`, the hash of the
+   `scope.json` the gateway reads) whose `resolvedAt` and the project's `confirmedAt` are both
+   within two publisher cycles, and only when the project's row reads `ok`. Anything else is
+   refused: as excluded when the publisher excluded the project, as stale when the document is
+   missing, old or for another declaration, and as unconfirmed otherwise. "Not excluded" isn't
+   "in scope". An install that declares no scope
    (`present: false`) draws no boundary, as the platform agent reads it, so only exclusions
    apply; a missing or unreadable file refuses every target.
 3. **Mint.** The grant names the resolved profile, the requester's tier and the target as its
@@ -1870,7 +1876,9 @@ and the buttons as one accessory button list, choices before links, the primary 
 plain field the schema caps but does not hold to one line (a table cell, a column name, a plan
 item's title, a fold's title) is flattened onto the line it is drawn on.
 In a progress message the plan takes the rows' place, one line per item led by a status
-glyph with its steps under it. It is text and not a card because Chat's card text has no
+glyph with its steps under it; a running or failed item's last step is left out when its
+title holds that note whole, since the steps are in the open here and not behind a task
+card's arrow, and a step the title clipped stays. It is text and not a card because Chat's card text has no
 monospace and no code, which a table or a command in an answer needs, while a text message
 carries every form the schema uses and accessory widgets draw the same buttons under it
 with app authentication. Every markdown field goes through the adapter's text translation,
