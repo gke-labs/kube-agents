@@ -93,6 +93,23 @@ operatorRendered:
     dataClaims: 2
     dataClaimRequest: 50Gi
     dataClaimBytesRequest: 53687091200
+operatorRenderedPerReplica:
+  credentialProxyExecTier:
+    requests:
+      cpu: "2"
+      memory: 2Gi
+      ephemeral-storage: 8Gi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+      ephemeral-storage: 8Gi
+    cpuMillisRequest: 2000
+    cpuMillisLimit: 2000
+    memoryBytesRequest: 2147483648
+    memoryBytesLimit: 2147483648
+    ephemeralStorageBytesRequest: 8589934592
+    ephemeralStorageBytesLimit: 8589934592
+    pods: 1
 nextMode:
   agentPod:
     hermesBridge:

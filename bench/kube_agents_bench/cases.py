@@ -288,12 +288,13 @@ class CaseSpec:
     requesting checks ask for (leaves of a type in
     ``lane.REQUESTING_CHECK_TYPES``) and the count it declares at its top
     level under ``requested_pull_requests``, for a case that opens more pull
-    requests by design than its checks grade. The write-safeguard carve-outs
-    in ``scoring.classify_rep`` fire only when this is non-zero, and hold the
-    charged writes to it: on a case that requested none a write is a genuine
-    forbidden action and still blocks. The lane file's ``requesting:`` map is
-    not read here -- the scorer is pinned to the ``bench/`` tree -- so a count
-    that lives only there is not seen; the task key is where it belongs."""
+    requests by design than its checks grade or a placeholder for a case the
+    persona answers with a pull request before its own check lands. The
+    write-safeguard carve-outs in ``scoring.classify_rep`` fire only when this
+    is non-zero, and hold the charged writes to it: on a case that requested
+    none a write is a genuine forbidden action and still blocks. Both counts
+    are in the task file, which is why they live there: the scorer is pinned
+    to the ``bench/`` tree and cannot read the lane file under ``hack/``."""
 
 
 def _leaves(node: Any) -> list[dict[str, Any]]:
@@ -463,8 +464,6 @@ def load_case(task_yaml: str | Path) -> CaseSpec:
 
     The case's ``requested_pull_requests`` is the larger of the count of its
     own requesting checks and the top-level ``requested_pull_requests`` key.
-    The lane file's ``requesting:`` map is not read here; see that field's
-    note.
     """
     path = Path(task_yaml)
     if not path.is_file():

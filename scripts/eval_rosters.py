@@ -311,9 +311,8 @@ SETTLE_RE = re.compile(r"^readonly EVAL_GITHUB_WRITE_SETTLE_SECONDS=(\d+)$", re.
 REPETITIONS_RE = re.compile(r'^EVAL_REPETITIONS="\$\{EVAL_REPETITIONS:-(\d+)\}"', re.MULTILINE)
 # The check types that request a pull request, as
 # bench/kube_agents_bench/lane.py's REQUESTING_CHECK_TYPES names them. A
-# case with such a leaf, with a `requested_pull_requests:` key of its own, or
-# with an allowance in the safeguards file's `requesting:` map, runs in the
-# fan-out's serial second phase.
+# case with such a leaf, or with a `requested_pull_requests:` key of its own,
+# runs in the fan-out's serial second phase.
 # scripts/test_eval_rosters.py holds this text read to lane.py's YAML one.
 REQUESTING_CHECK_RE = re.compile(r"\btype:\s*[\"']?(pull_request_opened|pull_request_diff_contains)\b")
 # Build, deploy and lease, outside the fan-out: "~15min of build and deploy
@@ -351,23 +350,6 @@ def _script_number(pattern: re.Pattern, script_text: str, what: str) -> int:
     if not m:
         raise ValueError(f"no {what} in the script")
     return int(m.group(1))
-
-
-def parse_lane_requesting(text: str) -> dict[str, int]:
-    """The safeguards file's top-level ``requesting:`` map, read as text."""
-    out: dict[str, int] = {}
-    inside = False
-    for raw in text.splitlines():
-        line = raw.split("#", 1)[0].rstrip()
-        if not line:
-            continue
-        if not line[0].isspace():
-            inside = line == "requesting:"
-            continue
-        if inside:
-            key, _, value = line.strip().partition(":")
-            out[key.strip()] = int(value.strip())
-    return out
 
 
 # The first prompt lines that make a case a stopped ask
@@ -427,10 +409,10 @@ def declared_pull_requests(case: str, tasks_dir: pathlib.Path = TASKS_DIR) -> in
     return declared_pull_requests_in((tasks_dir / case / "task.yaml").read_text(encoding="utf-8"))
 
 
-def requests_a_pull_request(case: str, lane_requesting: dict[str, int], tasks_dir: pathlib.Path = TASKS_DIR) -> bool:
-    """Whether the case requests a pull request: its own checks, its own
-    ``requested_pull_requests`` key, or the lane file's ``requesting:`` allowance."""
-    if lane_requesting.get(case, 0) > 0 or declared_pull_requests(case, tasks_dir) > 0:
+def requests_a_pull_request(case: str, tasks_dir: pathlib.Path = TASKS_DIR) -> bool:
+    """Whether the case requests a pull request: its own checks, or its own
+    ``requested_pull_requests`` key."""
+    if declared_pull_requests(case, tasks_dir) > 0:
         return True
     text = (tasks_dir / case / "task.yaml").read_text(encoding="utf-8")
     return any(REQUESTING_CHECK_RE.search(line.split("#", 1)[0]) for line in text.splitlines())
@@ -461,10 +443,9 @@ def presubmit_wall_estimate() -> dict[str, object]:
     hints, default = parse_cost_hints(script)
     parallelism = _script_number(PARALLELISM_RE, script, "EVAL_TASK_PARALLELISM default")
     settle = _script_number(SETTLE_RE, script, "EVAL_GITHUB_WRITE_SETTLE_SECONDS")
-    lane_requesting = parse_lane_requesting(INJECT_LANE_SAFEGUARDS_FILE.read_text(encoding="utf-8"))
     first, second = [], []
     for case in presubmit_cases():
-        serial = requests_a_pull_request(case, lane_requesting) or runs_alone(case)
+        serial = requests_a_pull_request(case) or runs_alone(case)
         (second if serial else first).append(case)
     chain = {case: hints.get(case, default) * repetitions for case in presubmit_cases()}
     phase_one = max(-(-sum(chain[c] for c in first) // parallelism), max((chain[c] for c in first), default=0))

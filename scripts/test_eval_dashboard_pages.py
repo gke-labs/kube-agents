@@ -1824,7 +1824,15 @@ class CasesAndGridPagesTest(unittest.TestCase):
         data["generated_at"] = NOW
         data["cases"] = [{"name": n, "domain": "cluster-debugging", "active": True} for n in CRASHLOOP_TRIO]
         data["cases"].append({"name": "retired-probe", "domain": "cost", "active": False})
-        data["releases"] = [RC_RELEASE, dict(RC_RELEASE, build_id="7", rc_tag="hostile", artifacts_url="javascript:alert(1)", verdict=None, started="2026-09-09T03:35:01+00:00")]
+        data["releases"] = [
+            RC_RELEASE,
+            dict(RC_RELEASE, build_id="7", rc_tag="hostile", artifacts_url="javascript:alert(1)", verdict=None, started="2026-09-09T03:35:01+00:00"),
+            # A release read from the lane's private bucket (SCHEMA.md,
+            # releases[].gcs_base): its row links the Console, not Spyglass.
+            dict(RC_RELEASE, build_id="2097891568546484225", rc_tag="evalcand_2611100000_5b5ad10", started="2026-09-09T01:35:01+00:00",
+                 gcs_base="gs://kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/2097891568546484225/",
+                 artifacts_url="https://oss.gprow.dev/view/gs/kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/2097891568546484225"),
+        ]
         data["pending_builds"] = [{"build_id": "2097300000000000000", "first_seen": "2026-09-08T14:00:00+00:00"}]
         # A green run that recorded no cases (the gate revalidated the
         # branch's earlier run) sits inside the live window: no Grid column.
@@ -2009,6 +2017,8 @@ class CasesAndGridPagesTest(unittest.TestCase):
         app = dom_text(self.out / "index.html")
         self.assertIn("Release candidates", app)
         self.assertIn('href="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/post-kube-agents-eval-rc/2097891568546484224"', app)
+        self.assertIn('href="https://console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/2097891568546484225"', app)
+        self.assertNotIn("oss.gprow.dev/view/gs/kube-agents-evals-presubmit-logs", app)
         self.assertIn('<span class="pill p-pass">GREEN</span>', app)
         self.assertIn("90.0%", app)
         self.assertIn("baselines maturing", app)
