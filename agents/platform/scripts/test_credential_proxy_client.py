@@ -3232,6 +3232,30 @@ class GetCredentialsAnsweredInTheShimTest(unittest.TestCase):
             credential_proxy_client.GET_CREDENTIALS_CHECK_TIMEOUT_SECONDS,
             sent["relay"]._get_once.call_args.kwargs["timeout"],
         )
+        # The header that lets the broker refuse an excluded cluster's read.
+        self.assertEqual(
+            {credential_proxy_client.GET_CREDENTIALS_CHECK_HEADER: "1"},
+            sent["relay"]._get_once.call_args.kwargs["headers"],
+        )
+
+    def test_get_once_sends_the_extra_headers_beside_the_credential(self):
+        http = Mock()
+        http.get.return_value = Mock(status_code=200)
+        with patch.dict("os.environ", self.env, clear=False):
+            session = credential_proxy_client.ApiSession(self.ENDPOINT, http=http)
+            session._get_once("https://container.googleapis.com/v1/projects/p/locations/l/clusters/c",
+                              timeout=5, headers={"X-Extra": "1"})
+        sent = http.get.call_args.kwargs["headers"]
+        self.assertEqual("1", sent["X-Extra"])
+        self.assertEqual("Bearer caller-token", sent["Authorization"])
+
+    def test_an_excluded_cluster_refusal_goes_to_the_broker(self):
+        # The broker refuses the checked read for a cluster the install
+        # excludes; its get-credentials then refuses the cluster itself (#5305).
+        refusal = {"status": "blocked", "code": "SECURITY_POLICY_BLOCKED", "rule": "scope.excluded-cluster"}
+        sent = self.run_shim(self.BASE + self.FULL, status=403, body=refusal)
+        sent["broker"].assert_called_once()
+        self.assertNotIn("kubeconfig entry generated", sent["stderr"])
 
     def test_the_kubeconfig_is_the_one_a_broker_answer_is_rewritten_to(self):
         broker_shaped = (

@@ -808,7 +808,12 @@ the cluster exists and is running. Then the shim writes the same kube-proxy
 kubeconfig it builds from a broker answer. No broker command runs, so there is
 no command audit line (the relay's line names the principal and the path) and
 no managed kubeconfig is filed for that cluster. Any other answer, any other
-argv, and a profile task's call go to the broker as above.
+argv, and a profile task's call go to the broker as above. The read carries the
+`X-Kube-Agents-Get-Credentials-Check` header, and the broker refuses it for a
+cluster `spec.scope.exclude.clusters` names, so the call goes to the broker's
+`get-credentials`, which refuses that cluster itself. The header only narrows:
+without it the read is unchanged, so other control-plane reads of an excluded
+cluster stay allowed.
 
 Consequences:
 

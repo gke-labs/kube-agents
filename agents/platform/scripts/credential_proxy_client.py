@@ -251,6 +251,12 @@ GET_CREDENTIALS_LOCAL_BARE_FLAGS = frozenset({"--internal-ip", "--dns-endpoint",
 # well under a second; past this bound the broker answers instead.
 GET_CREDENTIALS_CHECK_URL = "https://container.googleapis.com/v1/projects/{project}/locations/{location}/clusters/{cluster}"
 GET_CREDENTIALS_CHECK_TIMEOUT_SECONDS = 5
+# Sent on that read so the broker refuses it for a cluster the install's
+# spec.scope.exclude.clusters names (credential_proxy.GET_CREDENTIALS_CHECK_HEADER,
+# held equal by a test). It only narrows: the refusal sends the call to the
+# broker's get-credentials, which refuses an excluded cluster itself (#5305);
+# the sandbox has no scope file to check against.
+GET_CREDENTIALS_CHECK_HEADER = "X-Kube-Agents-Get-Credentials-Check"
 GET_CREDENTIALS_RUNNING_STATUS = "RUNNING"
 # What gcloud prints on stderr for a get-credentials of a running cluster; the
 # shim prints the same, so a caller reads the same lines.
@@ -1493,7 +1499,9 @@ def answer_get_credentials_locally(
     when the kube-api proxy is not in use, the argv does not name the cluster
     in full (`get_credentials_local_target`), or the relay answers anything but
     a running cluster or cannot be reached. A 404 is one of those: gcloud's own
-    error names the cluster and, for a wrong location, the right one.
+    error names the cluster and, for a wrong location, the right one. So is
+    the broker's refusal of an excluded cluster (GET_CREDENTIALS_CHECK_HEADER):
+    the broker's get-credentials then refuses it with its own message.
 
     The check is one attempt at `endpoint`, the broker `execute` sends the
     command to: no retry of a busy or draining refusal and no fallback of its
@@ -1507,7 +1515,9 @@ def answer_get_credentials_locally(
         return None
     url = GET_CREDENTIALS_CHECK_URL.format(project=target.project, location=target.location, cluster=target.cluster)
     try:
-        response = ApiSession(endpoint)._get_once(url, timeout=GET_CREDENTIALS_CHECK_TIMEOUT_SECONDS)
+        response = ApiSession(endpoint)._get_once(
+            url, timeout=GET_CREDENTIALS_CHECK_TIMEOUT_SECONDS, headers={GET_CREDENTIALS_CHECK_HEADER: "1"}
+        )
         if response.status_code != http.HTTPStatus.OK:
             return None
         cluster = response.json()
@@ -2223,8 +2233,11 @@ class ApiSession:
             return False
         return busy_reply_retryable(self._json_body(response))
 
-    def _get_once(self, url: str, *, params=None, timeout=None):
-        """One relayed GET, moved to the stateful broker when the exec tier cannot be reached."""
+    def _get_once(self, url: str, *, params=None, timeout=None, headers=None):
+        """One relayed GET, moved to the stateful broker when the exec tier cannot be reached.
+
+        `headers` are sent beside the caller's credential (the get-credentials
+        check's GET_CREDENTIALS_CHECK_HEADER)."""
         caller_timeout = timeout
         started = time.monotonic()
         with self._lock:
@@ -2239,7 +2252,7 @@ class ApiSession:
             return self._http.get(
                 self.relay_url(url, endpoint),
                 params=params,
-                headers=authorization_headers(),
+                headers={**authorization_headers(), **(headers or {})},
                 timeout=timeout,
             )
         except _connection_errors() as exc:
@@ -2260,7 +2273,7 @@ class ApiSession:
             left = _time_left(caller_timeout, time.monotonic() - started)
             if left is False:
                 raise
-            return self._get_once(url, params=params, timeout=left)
+            return self._get_once(url, params=params, timeout=left, headers=headers)
 
 
 def _exec_connect_bound(timeout):
