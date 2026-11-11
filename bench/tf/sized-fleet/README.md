@@ -12,7 +12,7 @@ For one size:
 - the clusters, `sized-<size>-01` and on, zonal, with private nodes and a public control-plane endpoint;
 - one node pool a cluster, of `n1-standard-1` nodes, so the count of node pools is the count of clusters.
 
-Every resource carries `managed-by=kube-agents-sized-fleet`, apart from the bench clusters' and the seeded fleet's labels, and `kube-agents-scale-size` and `kube-agents-scale-run`, by which a run's cost record finds its resources. The workloads are not in the stack: `hack/sized_fleet.py` applies them with `kubectl`, because they number in the thousands.
+The clusters and their nodes carry `managed-by=kube-agents-sized-fleet`, apart from the bench clusters' and the seeded fleet's labels, and `kube-agents-scale-size` and `kube-agents-scale-run`, by which a run's cost record finds its instances and clusters. The network, its subnets and its router are named `sized-fleet-<size>`; they carry no labels, because Compute Engine networks take none. Each cluster holds a 24-hour no-upgrades maintenance exclusion from its creation, so no upgrade replaces nodes during a run. The workloads are not in the stack: `hack/sized_fleet.py` applies them with `kubectl`, because they number in the thousands.
 
 ## Running it
 

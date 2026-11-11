@@ -3,6 +3,7 @@
 import collections
 import re
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from kube_agents_bench.scale import sized_fleet as sf
@@ -150,3 +151,15 @@ class CheckTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EpochTest(unittest.TestCase):
+    def test_a_kubernetes_timestamp_is_utc_in_any_local_zone(self):
+        import os
+        import time
+        expected = 1783715427.0  # 2026-07-10T20:30:27Z
+        for zone in ("UTC", "America/Los_Angeles", "Australia/Sydney"):
+            with self.subTest(zone=zone), unittest.mock.patch.dict(os.environ, {"TZ": zone}):
+                time.tzset()
+                self.assertEqual(sf.epoch("2026-07-10T20:30:27Z"), expected)
+        time.tzset()

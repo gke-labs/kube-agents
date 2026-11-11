@@ -55,12 +55,24 @@ DEFAULT_HOST_LOCATION = "us-central1-c"
 DEFAULT_NAMESPACE = "kubeagents-system"
 KUBECONFIG_FORMAT = "sized-fleet-{size}.kubeconfig"
 NETWORK_FORMAT = "sized-fleet-{size}"
+VERDICT_FILE = "scale-verdict.json"
+MEASUREMENTS_FILE = "scale-measurements.json"
+COST_FILE = "scale-cost.json"
 PRIVATE_MODE = 0o600
 # Clusters and their node pools are created in parallel; the google provider's own
 # default of 10 would build an L fleet's 16 clusters in two waves.
 TOFU_PARALLELISM = 32
 TOFU_APPLY_TIMEOUT_SECONDS = 90 * 60
 TOFU_INIT_TIMEOUT_SECONDS = 10 * 60
+TOFU_PLAN_TIMEOUT_SECONDS = 15 * 60
+FIREWALL_DELETE_TIMEOUT_SECONDS = 10 * 60
+TOFU_ARGS_LOGGED = 3
+STDERR_TAIL_CHARS = 2000
+SIGNAL_EXIT_BASE = 128
+# The error a destroy gives when rules outside the stack still use the network.
+NETWORK_IN_USE = "is already being used by"
+FIREWALL_RESOURCE = "/firewalls/"
+ZONE_SUFFIX_SEPARATOR = "-"
 READY_TIMEOUT_SECONDS = 30 * 60
 READY_POLL_SECONDS = 30
 CHURN_POLL_SECONDS = 20
@@ -71,13 +83,23 @@ EXIT_UNSOUND = 1
 POD_FAILING_REASONS = ("ImagePullBackOff", "ErrImagePull", "CrashLoopBackOff", "Error")
 
 
+class TofuFailed(Exception):
+    """tofu exited non-zero; ``output`` is its stderr when it was captured."""
+
+    def __init__(self, command: str, code: int, output: str = "") -> None:
+        super().__init__(f"tofu {command} failed ({code}){': ' + output[-STDERR_TAIL_CHARS:] if output else ''}")
+        self.output = output
+
+
 def tofu(args: list[str], *, timeout: int, capture: bool = False) -> str:
     env = {**os.environ, **TOFU_ENV}
-    LOG.info("tofu %s", " ".join(args[:3]))
+    LOG.info("tofu %s", " ".join(args[:TOFU_ARGS_LOGGED]))
     proc = subprocess.run([TOFU, *args], cwd=STACK_DIR, env=env, timeout=timeout, check=False, text=True,
                           capture_output=capture)
+    if capture and proc.stdout:
+        sys.stderr.write(proc.stdout)
     if proc.returncode != 0:
-        raise SystemExit(f"tofu {args[0]} failed ({proc.returncode}){': ' + proc.stderr[-2000:] if capture else ''}")
+        raise TofuFailed(args[0], proc.returncode, (proc.stderr or "") if capture else "")
     return proc.stdout if capture else ""
 
 
@@ -88,8 +110,13 @@ def init(project: str, size: str) -> None:
          timeout=TOFU_INIT_TIMEOUT_SECONDS)
 
 
+def region_of(zone: str) -> str:
+    return zone.rsplit(ZONE_SUFFIX_SEPARATOR, 1)[0]
+
+
 def tofu_vars(args: argparse.Namespace) -> list[str]:
     return [f"-var=project_id={args.project}", f"-var=size={args.size}", f"-var=zone={args.zone}",
+            f"-var=region={region_of(args.zone)}",
             f"-var=node_service_account={args.node_sa or NODE_SA_FORMAT.format(project=args.project)}",
             f"-var=run_id={args.run_id}"]
 
@@ -182,7 +209,7 @@ def measure_churn(args: argparse.Namespace, fleet: sf.Fleet, minutes: int) -> fl
         pods = kube.kubectl_json(context, "get", "pods", "-A", "-l", selector)["items"]
         out = set()
         for p in pods:
-            created = time.mktime(time.strptime(p["metadata"]["creationTimestamp"], "%Y-%m-%dT%H:%M:%SZ")) - time.timezone
+            created = sf.epoch(p["metadata"]["creationTimestamp"])
             if created >= start:
                 out.add(f"{context}/{p['metadata']['namespace']}/{p['metadata']['name']}")
         return out
@@ -199,7 +226,7 @@ def measure_churn(args: argparse.Namespace, fleet: sf.Fleet, minutes: int) -> fl
 def cmd_plan(args: argparse.Namespace) -> int:
     init(args.project, args.size)
     tofu(["plan", "-input=false", "-no-color", f"-parallelism={TOFU_PARALLELISM}", *tofu_vars(args)],
-         timeout=TOFU_INIT_TIMEOUT_SECONDS)
+         timeout=TOFU_PLAN_TIMEOUT_SECONDS)
     return 0
 
 
@@ -238,19 +265,46 @@ def cmd_verify(args: argparse.Namespace) -> int:
     return 0 if result["sound"] else EXIT_UNSOUND
 
 
+def leftover_clusters(args: argparse.Namespace) -> list[str]:
+    """The run's clusters still in the project, by its run label."""
+    out = kube.gcloud("container", "clusters", "list", f"--filter=resourceLabels.{sized_records.RUN_LABEL}={args.run_id}",
+                      "--format=value(name)", project=args.project)
+    return out.split()
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     if not args.down:
-        return run_once(args)
+        return run_once(args)[0]
     # A run that stops for any reason, an exception or a closed session's signal, still
     # deletes the fleet: a fleet left standing costs its whole size every hour.
+    rc, out = EXIT_UNSOUND, None
     try:
-        return run_once(args)
+        rc, out = run_once(args)
     finally:
+        # A second signal must not cut the destroy short: that leaves tofu's state lock held
+        # and the fleet standing.
+        for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            signal.signal(sig, signal.SIG_IGN)
         LOG.info("deleting the fleet (--down)")
         cmd_down(args)
+    left = leftover_clusters(args)
+    if out is not None:
+        verdict_path = out / VERDICT_FILE
+        verdict = json.loads(verdict_path.read_text())
+        verdict["checks"]["teardown"] = {"passed": not left, "failures": [f"{name} still exists" for name in left]}
+        verdict["green"] = verdict["green"] and not left
+        verdict_path.write_text(json.dumps(verdict, indent=2) + "\n")
+        LOG.info("%s: %s", VERDICT_FILE, summary(VERDICT_FILE, verdict))
+        if args.results_bucket:
+            kube.run([kube.GCLOUD, "storage", "cp", str(verdict_path), results_prefix(args)])
+    return EXIT_UNSOUND if left else rc
 
 
-def run_once(args: argparse.Namespace) -> int:
+def results_prefix(args: argparse.Namespace) -> str:
+    return f"{args.results_bucket.rstrip('/')}/{args.size.lower()}/{args.run_id}/"
+
+
+def run_once(args: argparse.Namespace) -> tuple[int, Path]:
     fleet = sf.fleet(args.size)
     credentials(args, fleet)
     kube.gcloud("container", "clusters", "get-credentials", args.host_cluster, f"--location={args.host_location}",
@@ -269,9 +323,10 @@ def run_once(args: argparse.Namespace) -> int:
     cost = sized_records.safe(lambda: sized_records.cost_record(args.project, args.run_id, record.windows),
                               record.errors, "cost record")
     records = {
-        "scale-verdict.json": {"size": args.size, "run_id": args.run_id, "fleet": record.fleet_check, **result},
-        "scale-measurements.json": {"size": args.size, "run_id": args.run_id, "windows": record.windows},
-        "scale-cost.json": cost,
+        VERDICT_FILE: {"size": args.size, "run_id": args.run_id, "fleet": record.fleet_check, **result,
+                       "notes": list(record.errors)},
+        MEASUREMENTS_FILE: {"size": args.size, "run_id": args.run_id, "windows": record.windows},
+        COST_FILE: cost,
     }
     out = Path(args.out or tempfile.mkdtemp(prefix=f"sized-run-{args.run_id}-"))
     out.mkdir(parents=True, exist_ok=True)
@@ -279,19 +334,18 @@ def run_once(args: argparse.Namespace) -> int:
         (out / name).write_text(json.dumps(body, indent=2) + "\n")
         LOG.info("%s: %s", name, summary(name, body))
     if args.results_bucket:
-        kube.run(["gcloud", "storage", "cp", *[str(out / n) for n in records],
-                  f"{args.results_bucket.rstrip('/')}/{args.size.lower()}/{args.run_id}/"])
-    print(json.dumps(records["scale-verdict.json"], indent=2))
+        kube.run([kube.GCLOUD, "storage", "cp", *[str(out / n) for n in records], results_prefix(args)])
+    print(json.dumps(records[VERDICT_FILE], indent=2))
     LOG.info("records in %s", out)
-    return 0 if result["green"] else EXIT_UNSOUND
+    return (0 if result["green"] else EXIT_UNSOUND), out
 
 
 def summary(name: str, body: dict) -> str:
     """The one line a record prints to the log."""
-    if name == "scale-verdict.json":
+    if name == VERDICT_FILE:
         failed = [c for c, v in body.get("checks", {}).items() if not v["passed"]]
         return f"{'green' if body.get('green') else 'red'}; failed: {', '.join(failed) or 'none'}"
-    if name == "scale-cost.json":
+    if name == COST_FILE:
         return f"${body.get('usd', '?')} (infrastructure ${body.get('infrastructure', {}).get('usd', '?')})"
     windows = body.get("windows", {})
     return "; ".join(f"{w}: {len(v.get('containers', {}))} containers, tokens {v.get('tokens', {})}"
@@ -310,7 +364,7 @@ def delete_network_firewalls(args: argparse.Namespace) -> list[str]:
                         "--format=value(name)", project=args.project).split()
     if names:
         kube.gcloud("compute", "firewall-rules", "delete", *names, "--quiet", project=args.project,
-                    timeout=TOFU_INIT_TIMEOUT_SECONDS)
+                    timeout=FIREWALL_DELETE_TIMEOUT_SECONDS)
     return names
 
 
@@ -320,12 +374,15 @@ def cmd_down(args: argparse.Namespace) -> int:
     destroy = ["destroy", "-input=false", "-no-color", "-auto-approve", f"-parallelism={TOFU_PARALLELISM}",
                *tofu_vars(args)]
     try:
-        tofu(destroy, timeout=TOFU_APPLY_TIMEOUT_SECONDS)
-    except SystemExit:
-        # The usual cause: firewall rules created on the network outside the stack.
+        tofu(destroy, timeout=TOFU_APPLY_TIMEOUT_SECONDS, capture=True)
+    except TofuFailed as exc:
+        # Only the failure firewall rules outside the stack cause: anything else (a held state
+        # lock, an API error) must not touch the rules GKE manages on a fleet that may be live.
+        if NETWORK_IN_USE not in exc.output or FIREWALL_RESOURCE not in exc.output:
+            raise
         removed = delete_network_firewalls(args)
-        LOG.warning("destroy failed; deleted %d firewall rule(s) on the fleet's network, destroying again", len(removed))
-        tofu(destroy, timeout=TOFU_APPLY_TIMEOUT_SECONDS)
+        LOG.warning("a firewall rule outside the stack held the network; deleted %d, destroying again", len(removed))
+        tofu(destroy, timeout=TOFU_APPLY_TIMEOUT_SECONDS, capture=True)
     LOG.info("fleet %s down in %.0fs", args.size, time.time() - started)
     return 0
 
@@ -361,7 +418,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--kubeconfig", help="where to keep the fleet's credentials; default a file in the temp directory")
     parser.add_argument("--churn-minutes", type=int, default=DEFAULT_CHURN_MINUTES,
                         help="verify: how long to measure the churn; 0 skips it")
-    parser.add_argument("--report", help="verify, run: also write the result to this file")
+    parser.add_argument("--report", help="verify: also write the result to this file")
     parser.add_argument("--host-cluster", default=DEFAULT_HOST_CLUSTER, help="run: the install's cluster")
     parser.add_argument("--host-location", default=DEFAULT_HOST_LOCATION)
     parser.add_argument("--namespace", default=DEFAULT_NAMESPACE, help="run: the install's namespace")
@@ -375,7 +432,7 @@ def main(argv: list[str] | None = None) -> int:
     use_ca_bundle()
     # SIGTERM and SIGHUP (a closed terminal) end the run through the same finally as an error does.
     for sig in (signal.SIGTERM, signal.SIGHUP):
-        signal.signal(sig, lambda signum, _frame: sys.exit(128 + signum))
+        signal.signal(sig, lambda signum, _frame: sys.exit(SIGNAL_EXIT_BASE + signum))
     return COMMANDS[args.command](args)
 
 

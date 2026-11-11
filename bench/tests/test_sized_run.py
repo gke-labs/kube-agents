@@ -127,3 +127,37 @@ class RemarkTest(unittest.TestCase):
 
     def test_no_more_than_five_attempts(self):
         self.assertEqual(sr.to_remark({"a": (0.0, 5)}, {}, 7000), [])
+
+
+class VerdictTimingTest(unittest.TestCase):
+    wanted = ("a", "b")
+    first = ("a",)
+
+    def record(self):
+        record = sr.RunRecord(started=0.0)
+        record.pods_before = record.pods_after = {"gw": sr.PodState()}
+        record.fleet_check = {"findings": []}
+        return record
+
+    def test_an_audit_that_ends_only_in_the_soak_window_still_fails(self):
+        record = self.record()
+        record.burst_statuses = {"a": "completed", "b": "running"}
+        record.statuses = {"a": "completed", "b": "completed"}
+        checks = sr.verdict(record, self.wanted, self.first)["checks"]
+        self.assertEqual(checks["every_audit_finishes"]["failures"], ["b: running"])
+
+    def test_a_failed_first_run_audit_still_ends_the_flow(self):
+        record = self.record()
+        record.burst_statuses = {"a": "failed", "b": "completed"}
+        checks = sr.verdict(record, self.wanted, self.first)["checks"]
+        self.assertTrue(checks["first_run_flow_ends"]["passed"])
+        self.assertFalse(checks["every_audit_finishes"]["passed"])
+
+    def test_a_fault_the_run_recovered_from_is_a_note_not_a_failure(self):
+        record = self.record()
+        record.burst_statuses = {"a": "completed", "b": "completed"}
+        record.errors = ["could not mark every job due: transient"]
+        result = sr.verdict(record, self.wanted, self.first)
+        self.assertTrue(result["green"])
+        self.assertEqual(result["errors"], record.errors)
+        self.assertIsNot(result["errors"], record.errors)

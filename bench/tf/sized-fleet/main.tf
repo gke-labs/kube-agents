@@ -138,6 +138,28 @@ resource "google_container_cluster" "fleet" {
     channel = "REGULAR"
   }
 
+  # No upgrade during a run: a node pool upgrade replaces nodes under the measurement, and the
+  # cost record prices the nodes that exist when it is taken. The window is set apart from the
+  # 00:00 UTC run; the exclusion covers the run whatever the window.
+  maintenance_policy {
+    daily_maintenance_window {
+      start_time = "12:00"
+    }
+    maintenance_exclusion {
+      exclusion_name = "sized-fleet-run"
+      start_time     = timestamp()
+      end_time       = timeadd(timestamp(), "24h")
+      exclusion_options {
+        scope = "NO_UPGRADES"
+      }
+    }
+  }
+
+  lifecycle {
+    # timestamp() moves on every plan; the exclusion is set once, when the cluster is created.
+    ignore_changes = [maintenance_policy]
+  }
+
   workload_identity_config {
     workload_pool = "${var.project_id}.svc.id.goog"
   }

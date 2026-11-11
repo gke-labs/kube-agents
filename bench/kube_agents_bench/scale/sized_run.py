@@ -48,7 +48,8 @@ UNCLAIMED = "unclaimed"
 # Right after a reset the cron store has no executions table until the first tick.
 NO_TABLE = "no such table"
 # A run that ended, whatever its outcome; the verdict reads the outcome separately.
-ENDED = ("completed", "failed", "error", "unknown", "skipped")
+COMPLETED = "completed"
+ENDED = (COMPLETED, "failed", "error", "unknown", "skipped")
 OOM_KILLED = "OOMKilled"
 ISO = "%Y-%m-%dT%H:%M:%SZ"
 LOG_READ_LIMIT = 50
@@ -100,6 +101,9 @@ class RunRecord:
     started: float
     burst_seconds: float = 0.0
     statuses: dict[str, str] = field(default_factory=dict)
+    # The audits' statuses when the burst window ended: the verdict judges on these, so an
+    # audit that ends only during the soak window still fails.
+    burst_statuses: dict[str, str] = field(default_factory=dict)
     job_seconds: dict[str, float] = field(default_factory=dict)
     pods_before: dict[str, PodState] = field(default_factory=dict)
     pods_after: dict[str, PodState] = field(default_factory=dict)
@@ -122,21 +126,27 @@ def verdict(record: RunRecord, wanted: tuple[str, ...], first_run: tuple[str, ..
     crashes += [f"SandboxChanged: {e}" for e in record.sandbox_changed]
     crashes += [f"node OOM kill: {e}" for e in record.node_oom_kills]
 
-    def unfinished(jobs: tuple[str, ...]) -> list[str]:
-        return [f"{job}: {record.statuses.get(job, 'not run')}" for job in jobs if record.statuses.get(job) != "completed"]
+    statuses = record.burst_statuses or record.statuses
+
+    def not_in(jobs: tuple[str, ...], accepted: tuple[str, ...]) -> list[str]:
+        return [f"{job}: {statuses.get(job, 'not run')}" for job in jobs if statuses.get(job) not in accepted]
 
     checks = {
         "no_crash": crashes,
-        "every_audit_finishes": unfinished(wanted),
-        "first_run_flow_ends": unfinished(first_run),
-        "run_sound": list(record.fleet_check.get("findings", ["the fleet was not checked"])) + record.errors,
+        # Every audit's run completed by the end of the burst window, 3 hours at most.
+        "every_audit_finishes": not_in(wanted, (COMPLETED,)),
+        # The first-run flow ends when each of its audits has an ended run, whatever the outcome
+        # (a failed one already fails the check above).
+        "first_run_flow_ends": not_in(first_run, ENDED),
+        # The fleet was in its designed state. Faults the run recovered from are notes, not this.
+        "run_sound": list(record.fleet_check.get("findings", ["the fleet was not checked"])),
     }
     return {
         "green": not any(checks.values()),
         "checks": {name: {"passed": not failures, "failures": failures} for name, failures in checks.items()},
         "burst_seconds": round(record.burst_seconds),
         "audit_seconds": {job: round(s) for job, s in record.job_seconds.items()},
-        "errors": record.errors,
+        "errors": list(record.errors),
     }
 
 
@@ -220,6 +230,7 @@ def run(
             break
         sleep(POLL_SECONDS)
     record.burst_seconds = clock() - record.started
+    record.burst_statuses = dict(record.statuses)
     LOG.info("burst window over after %.0fs: %s", record.burst_seconds, record.statuses)
     soak_start = clock()
     snap_burst = _snapshot(install, record.errors)
@@ -229,9 +240,18 @@ def run(
     snap_soak = _snapshot(install, record.errors)
     record.windows["soak"] = _window(install, soak_start, clock(), snap_burst, snap_soak, record.errors)
 
-    record.statuses = operations.job_statuses(host_context, namespace, PLATFORM_HOME, wanted, since)
-    record.job_seconds = operations.job_seconds(host_context, namespace, PLATFORM_HOME, wanted, since)
-    record.pods_after = pod_states(host_context, namespace)
+    # A read that fails here, a gateway pod missing or restarting, is the kind of failure the run
+    # exists to catch: it is recorded, and the verdict is still written.
+    try:
+        record.statuses = operations.job_statuses(host_context, namespace, PLATFORM_HOME, wanted, since)
+        record.job_seconds = operations.job_seconds(host_context, namespace, PLATFORM_HOME, wanted, since)
+    except kube.CommandError as exc:
+        record.errors.append(f"could not read the audits' runs at the end: {exc}")
+    try:
+        record.pods_after = pod_states(host_context, namespace)
+    except kube.CommandError as exc:
+        record.errors.append(f"could not read the install's pods at the end: {exc}")
+        record.pods_after = {"(unread)": PodState(restarts=1)}
     try:
         record.sandbox_changed = log_lines(
             project, f'logName="projects/{project}/logs/events" AND jsonPayload.reason="SandboxChanged" '

@@ -10,7 +10,9 @@ churn, not CPU.
 
 from __future__ import annotations
 
+import calendar
 import math
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -43,6 +45,7 @@ REQUEST_TIMEOUT_SECONDS = 5
 BROKEN_KINDS = ("image", "crash")
 # The churn check passes within this share of the designed rate.
 CHURN_TOLERANCE = 0.10
+KUBE_TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 
 @dataclass(frozen=True)
@@ -81,6 +84,15 @@ class Fleet:
     def churn_per_minute(self) -> float:
         """Client Pods started a minute across the fleet, by design."""
         return self.cronjobs / self.shape["cronjob_period_minutes"]
+
+
+def epoch(timestamp: str) -> float:
+    """A Kubernetes timestamp (``2026-11-10T20:30:27Z``, always UTC) as seconds since the epoch.
+
+    ``calendar.timegm``, not ``time.mktime``: mktime reads the local zone, and under
+    daylight saving time it is off by an hour.
+    """
+    return float(calendar.timegm(time.strptime(timestamp, KUBE_TIME_FORMAT)))
 
 
 def load_sizes(path: Path = SIZES_FILE) -> dict[str, Any]:
