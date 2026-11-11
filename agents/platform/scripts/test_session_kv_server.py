@@ -14132,6 +14132,30 @@ class TestProposalOrigin(unittest.TestCase):
             got = conn.execute("SELECT project, location FROM post_merge_records WHERE number IN (14, 15)").fetchall()
         self.assertEqual(got, [("", ""), ("", "")])
 
+    def test_post_merge_record_resolves_the_audits_qualified_cluster_name(self):
+        import sqlite3
+
+        profiles = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, profiles)
+        for name, project in (("a", "acme-prod"), ("b", "acme-dev")):
+            (profiles / name).mkdir()
+            (profiles / name / "config.yaml").write_text(
+                f"cluster_identity: {{project: {project}, cluster: shared, location: us-east1}}\n"
+            )
+        body = {"finding_id": "no-pdb.x", "object": "Deployment/x", "origin": "audit"}
+        cases = ((16, "acme-prod/us-east1/shared", ("acme-prod", "us-east1")),
+                 (17, "acme-prod/europe-west1/shared", ("", "")),
+                 (18, "acme-prod//shared", ("", "")))
+        with patch.object(session_kv_server.board_snapshot, "PROFILES_DIR", profiles):
+            for n, cluster, _ in cases:
+                url = f"https://github.com/example/fleet/pull/{n}"
+                response = self.client.post("/v1/post-merge/records", json=dict(body, url=url, cluster=cluster))
+                self.assertEqual(response.status_code, 200, response.text)
+        with sqlite3.connect(temp_db_path) as conn:
+            got = dict((n, (p, l)) for n, p, l in conn.execute(
+                "SELECT number, project, location FROM post_merge_records WHERE number IN (16, 17, 18)"))
+        self.assertEqual(got, {n: want for n, _, want in cases})
+
     def test_post_merge_kinds_match_the_pr_opened_plugin(self):
         spec = importlib.util.spec_from_file_location(
             "pr_opened_for_kinds", Path(__file__).resolve().parents[1] / "plugins" / "pr_opened" / "__init__.py"
@@ -14154,6 +14178,7 @@ class TestProposalOrigin(unittest.TestCase):
             {"origin": "eval"},
             {"number": 0},
             {"number": "13"},
+            {"number": 14},
             {"thread_id": "x" * 300},
         ):
             with self.subTest(change=change):
