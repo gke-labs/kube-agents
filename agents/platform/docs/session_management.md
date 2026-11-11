@@ -399,7 +399,9 @@ removes it once it is older than `STAMP_TICKET_TTL_SECONDS` (300). The card's st
 ```sql
 CREATE TABLE post_merge_records(    -- POST /v1/post-merge/records
   url TEXT PRIMARY KEY,
-  repo TEXT, number INTEGER, kind TEXT, environment TEXT,
+  repo TEXT, number INTEGER, kind TEXT,
+  finding_id TEXT, project TEXT, location TEXT, cluster TEXT, namespace TEXT, object TEXT,
+  environment TEXT,
   origin TEXT, origin_platform TEXT, opened_at TEXT,
   task_id TEXT, thread_platform TEXT, thread_chat_id TEXT, thread_id TEXT,
   merged_at TEXT, merge_commit TEXT, closed_at TEXT, merge_checked_at TEXT,
@@ -408,15 +410,17 @@ CREATE TABLE post_merge_records(    -- POST /v1/post-merge/records
 ```
 
 One row per fix pull request the post-merge check follows, the first record of a url standing. The
-`pr_opened` plugin writes it when it claims a proposal whose record names a kind of fix the check
-knows (`POST_MERGE_KINDS` in `session_kv_server.py`, mirrored in the plugin; today the fleet audit's
-`no-pdb`) and the install's `KUBEAGENTS_POST_MERGE_CHECK` switch is not `off`; with the switch off
-nothing is written. The kind is the opener's word, not the forge's, so the check verifies the fix
-rather than trusting it. `repo` is read off the pull request url, and the thread is the one the
-opening card reports to: empty outside a kanban worker, which includes the scheduled audits. The
-environment, merge, edit, revert and outcome columns are left for the check to fill.
-`cleanup_old_records` leaves the table: each row is a durable record of a fix pull request, not
-idle-session state.
+`pr_opened` plugin writes it when it claims a proposal whose record names the finding it fixes (the
+fleet audit sets it for a one-workload `no-pdb` fix) and the install's `KUBEAGENTS_POST_MERGE_CHECK`
+switch is not `off`; with the switch off nothing is written. The server derives `kind` from the
+finding id's first segment (`POST_MERGE_KINDS` in `session_kv_server.py`, mirrored in the plugin)
+and ignores any kind the caller sends; `project` and `location` come from the Cluster Agent profile
+whose `cluster_identity` names that cluster, empty when none or several do. The finding itself is
+still the opener's word, so the check verifies the fix rather than trusting the row. `repo` is read
+off the pull request url, and the thread is the one the opening card reports to: empty outside a
+kanban worker, which includes the scheduled audits. The environment, merge, edit, revert and
+outcome columns are left for the check to fill. `cleanup_old_records` leaves the table: each row is
+a durable record of a fix pull request, not idle-session state.
 
 #### `incidents`
 

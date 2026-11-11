@@ -1351,7 +1351,7 @@ class TestSessionKvServerAuth(unittest.TestCase):
         ("GET", "/v1/cron/jobs/j-1/origin", None),
         ("POST", "/v1/proposals/opened", {"url": "https://example.invalid/pull/1", "origin": "other"}),
         ("GET", "/v1/proposals/opened/counts", None),
-        ("POST", "/v1/post-merge/records", {"url": "https://github.com/a/b/pull/1", "kind": "no-pdb", "origin": "audit"}),
+        ("POST", "/v1/post-merge/records", {"url": "https://github.com/a/b/pull/1", "finding_id": "no-pdb.c.n.D/x", "cluster": "c", "object": "D/x", "origin": "audit"}),
         ("POST", "/v1/board/stamp-tickets", {"origin": "issue"}),
         ("POST", "/v1/board/stamp-tickets/tk-1/redeem", None),
     )
@@ -14074,16 +14074,24 @@ class TestProposalOrigin(unittest.TestCase):
     def test_post_merge_record_is_written_once_per_url_with_its_fields(self):
         import sqlite3
 
+        profiles = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, profiles)
+        (profiles / "cluster-prod").mkdir()
+        (profiles / "cluster-prod" / "config.yaml").write_text(
+            "cluster_identity: {project: acme-prod, cluster: prod, location: us-central1}\n"
+        )
         url = "https://github.com/example/fleet/pull/12"
         body = {
-            "url": url, "kind": "no-pdb", "origin": "audit", "platform": "", "opened_at": "2026-11-10T10:00:00+00:00",
+            "url": url, "finding_id": "no-pdb.prod.shop.Deployment/checkout", "cluster": "prod", "namespace": "shop",
+            "object": "Deployment/checkout", "origin": "audit", "platform": "", "opened_at": "2026-11-10T10:00:00+00:00",
             "task_id": "t_1", "thread_platform": "slack", "thread_chat_id": "C1", "thread_id": "17.1",
-            "repo": "https://evil.example/forged",
+            "repo": "https://evil.example/forged", "kind": "something-else",
         }
-        first = self.client.post("/v1/post-merge/records", json=body)
+        with patch.object(session_kv_server.board_snapshot, "PROFILES_DIR", profiles):
+            first = self.client.post("/v1/post-merge/records", json=body)
+            second = self.client.post("/v1/post-merge/records", json=dict(body, thread_chat_id="C2"))
         self.assertEqual(first.status_code, 200, first.text)
         self.assertEqual(first.json(), {"recorded": True})
-        second = self.client.post("/v1/post-merge/records", json=dict(body, thread_chat_id="C2"))
         self.assertEqual(second.json(), {"recorded": False})
         with sqlite3.connect(temp_db_path) as conn:
             conn.row_factory = sqlite3.Row
@@ -14091,15 +14099,36 @@ class TestProposalOrigin(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         row = rows[0]
         self.assertEqual(
-            (row["repo"], row["number"], row["kind"], row["origin"], row["opened_at"], row["task_id"],
-             row["thread_platform"], row["thread_chat_id"], row["thread_id"]),
-            ("https://github.com/example/fleet", 12, "no-pdb", "audit", "2026-11-10T10:00:00+00:00", "t_1",
-             "slack", "C1", "17.1"),
+            (row["repo"], row["number"], row["kind"], row["finding_id"], row["project"], row["location"], row["cluster"],
+             row["namespace"], row["object"], row["origin"], row["opened_at"], row["task_id"], row["thread_platform"],
+             row["thread_chat_id"], row["thread_id"]),
+            ("https://github.com/example/fleet", 12, "no-pdb", "no-pdb.prod.shop.Deployment/checkout", "acme-prod",
+             "us-central1", "prod", "shop", "Deployment/checkout", "audit", "2026-11-10T10:00:00+00:00", "t_1", "slack",
+             "C1", "17.1"),
         )
         for column in ("environment", "merged_at", "merge_commit", "closed_at", "merge_checked_at", "human_edited",
                        "reverted_at", "outcome", "outcome_at"):
             self.assertIn(column, row)
         self.assertIsNone(row["outcome"])
+
+    def test_post_merge_record_leaves_project_empty_for_an_unknown_or_ambiguous_cluster(self):
+        import sqlite3
+
+        profiles = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, profiles)
+        for name, project in (("a", "p1"), ("b", "p2")):
+            (profiles / name).mkdir()
+            (profiles / name / "config.yaml").write_text(
+                f"cluster_identity: {{project: {project}, cluster: dup, location: l}}\n"
+            )
+        body = {"finding_id": "no-pdb.dup.ns.Deployment/x", "cluster": "dup", "object": "Deployment/x", "origin": "audit"}
+        with patch.object(session_kv_server.board_snapshot, "PROFILES_DIR", profiles):
+            for n, cluster in ((14, "dup"), (15, "nowhere")):
+                url = f"https://github.com/example/fleet/pull/{n}"
+                self.assertEqual(self.client.post("/v1/post-merge/records", json=dict(body, url=url, cluster=cluster)).status_code, 200)
+        with sqlite3.connect(temp_db_path) as conn:
+            got = conn.execute("SELECT project, location FROM post_merge_records WHERE number IN (14, 15)").fetchall()
+        self.assertEqual(got, [("", ""), ("", "")])
 
     def test_post_merge_kinds_match_the_pr_opened_plugin(self):
         spec = importlib.util.spec_from_file_location(
@@ -14111,12 +14140,15 @@ class TestProposalOrigin(unittest.TestCase):
         self.assertEqual(plugin.POST_MERGE_PATH, "/v1/post-merge/records")
 
     def test_post_merge_record_refuses_what_is_not_a_known_fix_pull_request(self):
-        good = {"url": "https://github.com/example/fleet/pull/13", "kind": "no-pdb", "origin": "audit"}
+        good = {"url": "https://github.com/example/fleet/pull/13", "finding_id": "no-pdb.c.ns.Deployment/x",
+                "cluster": "c", "object": "Deployment/x", "origin": "audit"}
         for change in (
             {"url": "https://github.com/example/fleet/issues/13"},
             {"url": ""},
-            {"kind": "no-hpa"},
-            {"kind": None},
+            {"finding_id": "no-hpa.c.ns.Deployment/x"},
+            {"finding_id": None, "kind": "no-pdb"},
+            {"cluster": ""},
+            {"object": ""},
             {"origin": "eval"},
             {"number": 0},
             {"number": "13"},

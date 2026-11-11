@@ -25,8 +25,8 @@ proposal counts: it is written to the Session KV ledger
 as a ``pr_opened`` event, carrying the forge's fields and never the line's, and
 the line is taken out of the output. Outside a worker the line stays, without
 its token. While the install's ``POST_MERGE_CHECK`` switch is not ``off``, a
-claimed proposal whose record names a kind of fix the post-merge check knows
-(``kind``, set by the fleet audit for a ``no-pdb`` fix) is also written to
+claimed proposal whose record names a finding of a kind the post-merge check
+knows (``target``, set by the fleet audit for a one-workload ``no-pdb`` fix) is also written to
 ``POST /v1/post-merge/records`` with the thread its card reports to
 (:func:`write_post_merge_record`). The gateway's notifier claims the event kind and, with
 ``KAGE_SLACK_UX`` on, posts the PR as its own message in the thread the card
@@ -92,7 +92,7 @@ logger = logging.getLogger(__name__)
 #: path. ``test_pr_opened.py`` fails when the two drift.
 PROPOSAL_OPENED_KEY = "kube-agents.event"
 PROPOSAL_OPENED_EVENT = "proposal-opened"
-PROPOSAL_OPENED_FIELDS = ("url", "number", "title", "claim", "repo", "kind")
+PROPOSAL_OPENED_FIELDS = ("url", "number", "title", "claim", "repo", "target")
 
 #: The record's field that holds the broker's one-time claim token
 #: (``vcs_client.CLAIM_TOKEN_FIELD``).
@@ -231,11 +231,13 @@ LEDGER_PATH = "/v1/proposals/opened"
 LEDGER_TIMEOUT_SECONDS = 2.0
 
 #: The post-merge check's record route (design gke-labs/kube-agents#5054,
-#: step 1), the kinds of fix it records (the record's ``kind``, the fleet audit's
-#: check id, ``vcs_client.KIND_FIELD``), and the install switch that turns it on
-#: (``kubeagents_switches``). The record is written only for a claimed proposal
-#: of a known kind while the switch is not ``off``. The kind is the opener's
-#: word, not the forge's: the check must verify the fix, never trust the kind.
+#: step 1), the kinds of fix it records, and the install switch that turns it on
+#: (``kubeagents_switches``). The record's ``target`` (``vcs_client.TARGET_FIELD``)
+#: names the finding the proposal fixes; Session KV derives the kind from the
+#: finding id's check segment and the cluster's project and location from the
+#: Cluster Agent profiles, so the kind is never read from the opener's word. The
+#: record is written only for a claimed proposal whose finding is of a known kind
+#: while the switch is not ``off``; the check still verifies the fix itself.
 #: ``session_kv_server.POST_MERGE_KINDS`` is the server's copy; a test pins them.
 POST_MERGE_PATH = "/v1/post-merge/records"
 POST_MERGE_KINDS = frozenset({"no-pdb"})
@@ -246,6 +248,8 @@ POST_MERGE_SWITCH = "POST_MERGE_CHECK"
 POST_MERGE_COST_SECONDS = 2.5
 CARD_THREAD_BUSY_MS = 500
 POST_MERGE_TIMEOUT_SECONDS = 2.0
+#: The target fields forwarded, each a string.
+TARGET_KEYS = ("finding_id", "cluster", "namespace", "object")
 
 #: The chat thread a card reports to (Hermes' ``kanban_notify_subs``): the
 #: thread a post-merge outcome goes back to. The first subscription stands.
@@ -276,7 +280,7 @@ def _record_of(line):
 
 
 def opened(line):
-    """The ``{url, number, title, claim, repo, kind}`` a proposal-opened record on ``line`` names, else None.
+    """The ``{url, number, title, claim, repo, target}`` a proposal-opened record on ``line`` names, else None.
 
     ``claim`` is None when the line carries no token (a broker older than the
     token); ``repo`` is None when the line names no repository (an older client).
@@ -484,19 +488,30 @@ def card_thread(task_id):
     return tuple(str(value or "") for value in row) if row else NO_THREAD
 
 
-def write_post_merge_record(confirmed, kind, origin, task_id):
+def post_merge_target(target):
+    """``target``'s :data:`TARGET_KEYS` when it names a finding of a kind the check knows, else None."""
+    if not isinstance(target, dict) or not all(isinstance(target.get(key), str) for key in TARGET_KEYS):
+        return None
+    if target["finding_id"].split(".", 1)[0] not in POST_MERGE_KINDS or not target["object"]:
+        return None
+    return {key: target[key] for key in TARGET_KEYS}
+
+
+def write_post_merge_record(confirmed, target, origin, task_id):
     """Record the claimed fix at ``confirmed`` for the post-merge check. Logged, never raised.
 
-    Nothing is written unless ``kind`` is one the check knows and the switch is on.
-    A scheduled run is not a kanban worker, so its record has no thread.
+    Nothing is written unless ``target`` names a finding of a kind the check
+    knows and the switch is on. A scheduled run is not a kanban worker, so its
+    record has no thread.
     """
-    if not isinstance(kind, str) or kind not in POST_MERGE_KINDS or not post_merge_check_on():
+    found = post_merge_target(target)
+    if found is None or not post_merge_check_on():
         return
     platform, chat_id, thread_id = card_thread(task_id)
     payload = {
         "url": confirmed["url"],
         "number": confirmed.get("number"),
-        "kind": kind,
+        **found,
         "origin": origin[0],
         "platform": origin[1],
         "task_id": task_id,
@@ -590,8 +605,8 @@ def _claim_output(output):
                 origin = origin or resolve_origin()
                 write_ledger(confirmed["url"], origin)
                 if answer_by - time.monotonic() >= POST_MERGE_COST_SECONDS:
-                    write_post_merge_record(confirmed, proposal.get("kind"), origin, task_id)
-                elif proposal.get("kind"):
+                    write_post_merge_record(confirmed, proposal.get("target"), origin, task_id)
+                elif proposal.get("target"):
                     logger.warning("pr_opened: no time left to record %s for the post-merge check", confirmed["url"])
                 if task_id and _recorded(task_id, confirmed):
                     removed.add(proposal["url"])

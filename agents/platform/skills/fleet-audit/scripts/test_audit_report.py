@@ -716,8 +716,8 @@ class Recorder:
         self.cwds: list[str | None] = []
         # The payload each forge call carried, None for a command.
         self.payloads: list[dict | None] = []
-        # The (verb, kind) of each forge call: the post-merge kind it named.
-        self.kinds: list[tuple[str, str | None]] = []
+        # The (verb, target) of each forge call: the finding it named for the post-merge check.
+        self.targets: list[tuple[str, dict | None]] = []
         self.replies = replies or {}
         self.failures = failures or {}
         # What `identity` answers for each comment author, filled from the
@@ -759,9 +759,9 @@ class Recorder:
                 return CompletedProcess(cmd, 0, payload, "")
         return CompletedProcess(cmd, 0, "", "")
 
-    def forge(self, verb, payload, repository=None, kind=None):
-        """`vcs_client.forge`, answered from `replies` and `failures`; a `kind` lands in `kinds`."""
-        self.kinds.append((verb, kind))
+    def forge(self, verb, payload, repository=None, target=None):
+        """`vcs_client.forge`, answered from `replies` and `failures`; a `target` lands in `targets`."""
+        self.targets.append((verb, target))
         payload = {k: v for k, v in dict(payload).items() if v is not None}
         if repository is not None:
             payload["repository"] = repository
@@ -1102,12 +1102,12 @@ class BaseTestCase(unittest.TestCase):
         self.patch_attr("SCRATCH_DIR", str(self.tmp_path / "scratch"))
 
     @staticmethod
-    def forge_through_recorder(verb, payload, repository=None, kind=None):
+    def forge_through_recorder(verb, payload, repository=None, target=None):
         recorder = audit_report.run_cmd
         if not isinstance(recorder, Recorder):
             raise AssertionError(f"forge {verb} called with no Recorder installed")
-        if kind:
-            return recorder.forge(verb, payload, repository=repository, kind=kind)
+        if target:
+            return recorder.forge(verb, payload, repository=repository, target=target)
         return recorder.forge(verb, payload, repository=repository)
 
     def issue_list(self, number=42, url="https://github.com/acme/fleet/issues/42"):
@@ -12645,22 +12645,26 @@ class TestOpenRemediationPr(HarnessTestCase):
         # whatever survived the forced checkout.
         self.assertEqual((self.workspace / self.path).read_bytes(), b"# fix\n")
 
-    def test_create_names_the_no_pdb_kind_only_for_an_all_no_pdb_group(self):
+    def test_create_names_the_finding_of_a_one_finding_no_pdb_group(self):
         self.harness.replies = {"proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8")}
-        self.group = [dict(f, check=audit_report.GENERATED_FIX_CHECK) for f in self.group]
+        self.group = [dict(f, check=audit_report.GENERATED_FIX_CHECK, object="Deployment/web") for f in self.group]
         self.open_it()
-        self.assertIn(("proposal-create", "no-pdb"), self.harness.kinds)
+        [target] = [t for verb, t in self.harness.targets if verb == "proposal-create"]
+        self.assertEqual(target, {"finding_id": self.group[0]["id"], "cluster": "prod-us-east",
+                                  "namespace": "payments", "object": "Deployment/web"})
 
-    def test_create_names_no_kind_for_another_check(self):
+    def test_create_names_no_target_for_another_check(self):
         self.harness.replies = {"proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8")}
         self.group = [dict(f, check="no-hpa") for f in self.group]
         self.open_it()
-        self.assertIn(("proposal-create", None), self.harness.kinds)
+        self.assertIn(("proposal-create", None), self.harness.targets)
 
-    def test_remediation_kind_of_a_mixed_group_is_none(self):
-        self.assertEqual(audit_report.remediation_kind([{"check": "no-pdb"}, {"check": "no-pdb"}]), "no-pdb")
-        self.assertIsNone(audit_report.remediation_kind([{"check": "no-pdb"}, {"check": "no-hpa"}]))
-        self.assertIsNone(audit_report.remediation_kind([]))
+    def test_remediation_target_only_for_one_no_pdb_finding(self):
+        one = {"id": "no-pdb.c.ns.Deployment/x", "check": "no-pdb", "cluster": "c", "namespace": "ns", "object": "Deployment/x"}
+        self.assertEqual(audit_report.remediation_target([one])["finding_id"], "no-pdb.c.ns.Deployment/x")
+        self.assertIsNone(audit_report.remediation_target([one, dict(one, id="no-pdb.c.ns.Deployment/y")]))
+        self.assertIsNone(audit_report.remediation_target([dict(one, check="no-hpa")]))
+        self.assertIsNone(audit_report.remediation_target([]))
 
     def test_create_carries_all_four_labels(self):
         self.harness.replies = {"proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8")}

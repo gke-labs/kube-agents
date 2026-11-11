@@ -86,8 +86,10 @@ PROPOSAL_OPENED_AT_MAX_CHARS = 64
 # The post-merge check's records (design gke-labs/kube-agents#5054, step 1,
 # "Record it"): one row per fix pull request, written when its proposal is
 # claimed and the install's POST_MERGE_CHECK switch is not off. The kinds of
-# fix the check knows, by the fleet audit's check id; the pr_opened plugin holds
-# a copy (POST_MERGE_KINDS), which a test pins to this one.
+# fix the check knows, by the fleet audit's check id, which is the first segment
+# of its finding id (`<check>.<cluster>.<namespace>.<object>`); the kind is
+# derived from that id here, never taken from the caller. The pr_opened plugin
+# holds a copy (POST_MERGE_KINDS), which a test pins to this one.
 POST_MERGE_KINDS = ("no-pdb",)
 POST_MERGE_FIELD_MAX_CHARS = 256
 # The upward compression walk `_session_origin` takes, as
@@ -1875,6 +1877,12 @@ def init_db() -> None:
                     repo            TEXT,
                     number          INTEGER,
                     kind            TEXT,
+                    finding_id      TEXT,
+                    project         TEXT,
+                    location        TEXT,
+                    cluster         TEXT,
+                    namespace       TEXT,
+                    object          TEXT,
                     environment     TEXT,
                     origin          TEXT,
                     origin_platform TEXT,
@@ -8398,13 +8406,38 @@ def _bounded_text(request_data: Dict[str, Any], field: str) -> str:
     return value.strip()
 
 
+def _cluster_coordinates(cluster: str) -> tuple[str, str]:
+    """``(project, location)`` of the managed cluster named ``cluster``; empty when no profile, or more than one, names it.
+
+    Read from the Cluster Agent profiles' ``cluster_identity`` stamp, the fleet's
+    own record of each cluster, rather than from the caller.
+    """
+    import cluster_agent_profile
+
+    found = set()
+    profiles = board_snapshot.PROFILES_DIR
+    if not cluster or not profiles.is_dir():
+        return "", ""
+    for home in sorted(profiles.iterdir()):
+        try:
+            identity = cluster_agent_profile.read_cluster_identity(home)
+        except Exception:  # noqa: BLE001 — an unreadable profile names no cluster
+            continue
+        if identity and identity["cluster"] == cluster:
+            found.add((identity["project"], identity["location"]))
+    return found.pop() if len(found) == 1 else ("", "")
+
+
 @app.post("/v1/post-merge/records", dependencies=[Depends(verify_api_key)])
 def post_post_merge_record(request_data: Dict[str, Any]) -> Dict[str, bool]:
     """Record one fix pull request for the post-merge check; the first record of a url stands.
 
-    The url must be a pull request url (PROPOSAL_URL_RE) and the kind one the
-    check knows (POST_MERGE_KINDS). 200 either way, so a retry after a lost
-    answer is not told it failed.
+    The url must be a pull request url (PROPOSAL_URL_RE). The finding it fixes
+    (``finding_id``, ``cluster``, ``namespace``, ``object``) must be of a kind
+    the check knows: the kind is the finding id's first segment (POST_MERGE_KINDS),
+    and a ``kind`` the caller sends is ignored. The cluster's project and location
+    come from the Cluster Agent profiles (:func:`_cluster_coordinates`). 200 either
+    way, so a retry after a lost answer is not told it failed.
     """
     url = request_data.get("url")
     match = PROPOSAL_URL_RE.match(url.strip()) if isinstance(url, str) and len(url) <= PROPOSAL_URL_MAX_CHARS else None
@@ -8415,20 +8448,34 @@ def post_post_merge_record(request_data: Dict[str, Any]) -> Dict[str, bool]:
         number = int(match.group(2))
     if not isinstance(number, int) or isinstance(number, bool) or number < 1:
         raise HTTPException(status_code=400, detail="number must be a positive integer")
-    kind = request_data.get("kind")
+    finding_id = _bounded_text(request_data, "finding_id")
+    kind = finding_id.split(".", 1)[0]
     if kind not in POST_MERGE_KINDS:
-        raise HTTPException(status_code=400, detail=f"kind must be one of {list(POST_MERGE_KINDS)}")
+        raise HTTPException(
+            status_code=400, detail=f"finding_id must name a finding of one of {list(POST_MERGE_KINDS)}"
+        )
+    cluster = _bounded_text(request_data, "cluster")
+    workload = _bounded_text(request_data, "object")
+    if not cluster or not workload:
+        raise HTTPException(status_code=400, detail="cluster and object must name the workload the fix is for")
     origin, platform = _origin_fields(request_data)
     opened_at = request_data.get("opened_at") or datetime.now(timezone.utc).isoformat()
     if not isinstance(opened_at, str) or len(opened_at) > PROPOSAL_OPENED_AT_MAX_CHARS:
         raise HTTPException(
             status_code=400, detail=f"opened_at must be a string of at most {PROPOSAL_OPENED_AT_MAX_CHARS} characters"
         )
+    project, location = _cluster_coordinates(cluster)
     row = (
         url.strip(),
         match.group(1),
         number,
         kind,
+        finding_id,
+        project,
+        location,
+        cluster,
+        _bounded_text(request_data, "namespace"),
+        workload,
         _bounded_text(request_data, "environment"),
         origin,
         platform,
@@ -8441,9 +8488,9 @@ def post_post_merge_record(request_data: Dict[str, Any]) -> Dict[str, bool]:
     with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=ORIGIN_DB_TIMEOUT_SECONDS)) as conn:
         with conn:
             cursor = conn.execute(
-                "INSERT OR IGNORE INTO post_merge_records (url, repo, number, kind, environment, origin, "
-                "origin_platform, opened_at, task_id, thread_platform, thread_chat_id, thread_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT OR IGNORE INTO post_merge_records (url, repo, number, kind, finding_id, project, location, "
+                "cluster, namespace, object, environment, origin, origin_platform, opened_at, task_id, "
+                "thread_platform, thread_chat_id, thread_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 row,
             )
     return {"recorded": cursor.rowcount > 0}

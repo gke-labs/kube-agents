@@ -472,7 +472,9 @@ class ProposalOpenedRecordTest(unittest.TestCase):
                     {"url": self.URL, "number": 4, "title": "Raise replicas", "claim": self.CLAIM, **expected},
                 )
 
-    def test_a_kind_goes_on_the_record_and_never_to_the_broker(self):
+    TARGET = {"finding_id": "no-pdb.c.ns.Deployment/x", "cluster": "c", "namespace": "ns", "object": "Deployment/x"}
+
+    def test_a_target_goes_on_the_record_and_never_to_the_broker(self):
         sent = []
         stderr = io.StringIO()
 
@@ -481,9 +483,9 @@ class ProposalOpenedRecordTest(unittest.TestCase):
             return dict(self.OPENED)
 
         with mock.patch.object(vcs_client, "_call", broker), mock.patch("sys.stderr", stderr):
-            vcs_client.forge("proposal-create", {"title": "t"}, repository="acme/infra", kind="no-pdb")
+            vcs_client.forge("proposal-create", {"title": "t"}, repository="acme/infra", target=self.TARGET)
         [record] = [json.loads(line) for line in stderr.getvalue().splitlines()]
-        self.assertEqual(record["proposal"]["kind"], "no-pdb")
+        self.assertEqual(record["proposal"]["target"], self.TARGET)
         self.assertEqual(sent, [{"title": "t", "repository": "acme/infra"}])
 
     def test_the_returned_answer_has_no_claim_field(self):
