@@ -8793,6 +8793,33 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     assert _shell_argvs_with_exit_propagation("nice -n 10 ./f.py --readiness --out /tmp/setsid") == [
         (["nice", "-n", "10", "./f.py", "--readiness", "--out", "/tmp/setsid"], True),
     ]
+    assert _shell_argvs_with_exit_propagation("env -C /tmp setsid python3 f.py --readiness") == [
+        (["env", "-C", "/tmp", "setsid", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("env -C /tmp ./f.py --readiness") == [
+        (["env", "-C", "/tmp", "./f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("timeout 1.5 setsid python3 f.py --readiness") == [
+        (["timeout", "1.5", "setsid", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("timeout 1.5 python3 f.py --readiness") == [
+        (["timeout", "1.5", "python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("chroot /mnt setsid python3 f.py --readiness") == [
+        (["chroot", "/mnt", "setsid", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("stdbuf -o /tmp/x setsid python3 f.py --readiness") == [
+        (["stdbuf", "-o", "/tmp/x", "setsid", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("command 2>/dev/null -v python3 /opt/security_auditor/collect.py compliance-audit") == [
+        (["command", "2", ">", "/dev/null", "-v", "python3", "/opt/security_auditor/collect.py", "compliance-audit"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("command 2>/dev/null python3 f.py --readiness") == [
+        (["command", "2", ">", "/dev/null", "python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("command 2>/dev/null -p python3 f.py --readiness") == [
+        (["command", "2", ">", "/dev/null", "-p", "python3", "f.py", "--readiness"], True),
+    ]
     assert _shell_argvs_with_exit_propagation("command -v python3 /opt/security_auditor/collect.py compliance-audit") == [
         (["command", "-v", "python3", "/opt/security_auditor/collect.py", "compliance-audit"], False),
     ]

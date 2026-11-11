@@ -2808,8 +2808,17 @@ def _has_detaching_wrapper(seg: list[str]) -> bool:
             continue
         elif base == "command":
             idx += 1
+            inner_redirect_target = False
             while idx < len(seg):
                 w = seg[idx]
+                if inner_redirect_target:
+                    inner_redirect_target = False
+                    idx += 1
+                    continue
+                if _is_redirect(w) or (w.isdigit() and idx + 1 < len(seg) and _is_redirect(seg[idx + 1])):
+                    inner_redirect_target = not w.isdigit()
+                    idx += 1
+                    continue
                 if w == "--":
                     idx += 1
                     break
@@ -2846,14 +2855,6 @@ def _has_detaching_wrapper(seg: list[str]) -> bool:
                 if w == "--":
                     idx += 1
                     break
-                w_base = os.path.basename(w)
-                if (
-                    w_base in _SHELL_PROGRAMS_WITH_COMMAND_STRING
-                    or bool(_INTERPRETER_RE.match(w_base))
-                    or w == _SHELL_EVAL
-                    or (not w.startswith("-") and not _SHELL_ASSIGNMENT_RE.match(w) and ("." in w_base or "/" in w))
-                ):
-                    break
                 if w.startswith(_SHELL_FLAG_PREFIX):
                     if base in _GENERIC_WRAPPER_VAL_OPTS:
                         if w.startswith("--"):
@@ -2881,6 +2882,14 @@ def _has_detaching_wrapper(seg: list[str]) -> bool:
                 if _SHELL_ASSIGNMENT_RE.match(w):
                     idx += 1
                     continue
+                w_base = os.path.basename(w)
+                if (
+                    w_base in _SHELL_PROGRAMS_WITH_COMMAND_STRING
+                    or bool(_INTERPRETER_RE.match(w_base))
+                    or w == _SHELL_EVAL
+                    or (not w.startswith("-") and not _SHELL_ASSIGNMENT_RE.match(w) and ("." in w_base or "/" in w))
+                ):
+                    break
                 break
             continue
         else:
