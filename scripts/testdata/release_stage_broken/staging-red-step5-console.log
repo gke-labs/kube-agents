@@ -1,0 +1,10 @@
+2026-11-04T05:02:11.4123001Z ##[group]Run ./scripts/release/poll_rc_eval_verdict.py
+2026-11-04T05:02:11.4201117Z shell: /usr/bin/bash -e {0}
+2026-11-04T05:02:11.4201733Z env:
+2026-11-04T05:02:11.4202410Z   COMMIT_SHA: 73894c0e2b1d6a5f4c3e8d9a0b7f6e5d4c3b2a19
+2026-11-04T05:02:11.4203018Z   EVALCAND_TAG: evalcand_2611040011_73894c0
+2026-11-04T05:02:11.4203655Z ##[endgroup]
+2026-11-04T05:02:14.0088121Z build 1985733102944374784 is running at 73894c0e2b1d6a5f4c3e8d9a0b7f6e5d4c3b2a19: https://console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/1985733102944374784
+2026-11-04T07:48:02.7710345Z verdict=red settled=true build_id=1985733102944374784 https://console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/1985733102944374784
+2026-11-04T07:48:03.1020551Z red_cases={"cases":[{"case":"compliance-rbac-overgrant","rung":4,"rung_name":"COLLAPSE"}],"partial":false}
+2026-11-04T07:48:02.7792209Z ##[error]Process completed with exit code 1.

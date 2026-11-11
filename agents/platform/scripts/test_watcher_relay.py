@@ -305,6 +305,30 @@ class WatcherRelayOverTheSocketTest(unittest.TestCase):
         self.assertEqual(len(self.k8s_requests), 2)
         self.assertEqual(sum("/clusters/" in p for _, p, _, _ in self.google_requests), 1)
 
+    def test_an_excluded_cluster_is_refused_before_its_endpoint_or_api_is_reached(self):
+        import os
+        import tempfile
+
+        import scope_exclude
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        scope_file = os.path.join(directory.name, "scope.json")
+        with open(scope_file, "w", encoding="utf-8") as stream:
+            json.dump({"exclude": {"projects": [], "clusters": [
+                {"projectId": "kagents-dev", "location": "us-east4", "clusterName": "fleet-a"}]}}, stream)
+        original = CredentialProxyHandler.__dict__.get("exclusions")
+        self.addCleanup(setattr, CredentialProxyHandler, "exclusions", original)
+        CredentialProxyHandler.exclusions = scope_exclude.Exclusions(path=lambda: scope_file)
+        for path in ("/v1/k8s/kagents-dev/us-east4/fleet-a/api/v1/events?limit=500",
+                     "/v1/k8s/kagents-dev/us-east4/fleet-a/api/v1/events?watch=true"):
+            with self.subTest(path=path):
+                status, body = self._request("GET", path)
+                self.assertEqual(status, 403, body)
+                self.assertIn(scope_exclude.RULE_EXCLUDED_CLUSTER, json.loads(body)["message"])
+        self.assertEqual(self.k8s_requests, [])
+        self.assertEqual(sum("/clusters/" in p for _, p, _, _ in self.google_requests), 0)
+
     def test_a_watch_streams_each_event_as_it_arrives(self):
         connection = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=10)
         connection.request("GET", "/v1/k8s/kagents-dev/us-east4/fleet-a/api/v1/events?watch=true",

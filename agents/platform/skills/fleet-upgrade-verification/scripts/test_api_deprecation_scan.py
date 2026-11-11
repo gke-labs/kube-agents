@@ -565,6 +565,7 @@ class InPartsTest(unittest.TestCase):
         self.assertEqual(scan.CEILING_ENV, vcs_broker.MAX_SNAPSHOT_BYTES_ENV)
         self.assertEqual(scan.MANIFEST_SUFFIXES, vcs_broker.SNAPSHOT_MANIFEST_SUFFIXES)
         self.assertEqual(scan.ENTRY_TREE, vcs_broker.SNAPSHOT_ENTRY_TREE)
+        self.assertEqual(scan.ENTRY_UNNAMED, vcs_broker.SNAPSHOT_ENTRY_UNNAMED)
 
     def test_a_refused_tree_with_no_manifest_names_its_commit_and_says_so(self):
         fake = FakeParts(self.TREE, {None: [entry("charts", 5000, manifests=0)]}, refused_revision="fedcba9")
@@ -616,6 +617,113 @@ class InPartsTest(unittest.TestCase):
         self.assertEqual([None, ("clusters",), ("top.yaml",)], fake.calls)
         self.assertEqual(["top.yaml"], sorted(read.files))
         self.assertEqual([{"path": "clusters", "reason": "a path in `paths` names nothing in acme/infra at main"}], read.unread)
+
+    FOUR = {
+        "a/one.yaml": PDB_V1BETA1,
+        "b/two.yaml": CRONJOB_V1BETA1,
+        "c/three.yaml": PDB_V1BETA1,
+        "d/four.yaml": CRONJOB_V1BETA1,
+    }
+    FOUR_ENTRIES = [entry("a", 100), entry("b", 100), entry("c", 100), entry("d", 100)]
+
+    def refusing(self, fake, refuse):
+        """``fake``, refusing each request ``refuse(paths)`` returns a VcsError for."""
+        real = fake.__call__
+
+        def snapshot(repo, into=None, paths=None, **kwargs):
+            refused = refuse(paths) if paths else None
+            if refused is not None:
+                fake.calls.append(tuple(paths))
+                raise refused
+            return real(repo, into=into, paths=paths, **kwargs)
+
+        return snapshot
+
+    def test_a_batch_refused_for_one_missing_path_lists_only_that_path(self):
+        fake = FakeParts(self.FOUR, {None: self.FOUR_ENTRIES})
+        gone = "a path in `paths` names nothing in acme/infra at main"
+        snapshot = self.refusing(fake, lambda paths: (
+            scan.vcs_client.VcsError(gone, code=scan.PATH_NOT_FOUND) if "c" in paths else None))
+        read = scan.read_repo_content("acme/infra", snapshot=snapshot)
+        self.assertEqual([None, ("a", "b", "c", "d"), ("a", "b"), ("c", "d"), ("c",), ("d",)], fake.calls)
+        self.assertEqual(["a/one.yaml", "b/two.yaml", "d/four.yaml"], sorted(read.files))
+        self.assertEqual([{"path": "c", "reason": gone}], read.unread)
+
+    def test_a_batch_refused_as_too_large_with_no_entries_is_asked_for_in_halves(self):
+        fake = FakeParts(self.FOUR, {None: self.FOUR_ENTRIES, ("a", "b", "c", "d"): None})
+        read = scan.read_repo_content("acme/infra", snapshot=fake)
+        self.assertEqual([None, ("a", "b", "c", "d"), ("a", "b"), ("c", "d")], fake.calls)
+        self.assertEqual(4, len(read.files))
+        self.assertEqual([], read.unread)
+
+    def test_a_batch_refused_for_a_reason_not_about_one_entry_is_not_split(self):
+        fake = FakeParts(self.FOUR, {None: self.FOUR_ENTRIES})
+        snapshot = self.refusing(fake, lambda paths: scan.vcs_client.VcsError("the broker is not answering", code="BROKER_UNAVAILABLE"))
+        read = scan.read_repo_content("acme/infra", snapshot=snapshot)
+        self.assertEqual([None, ("a", "b", "c", "d")], fake.calls)
+        self.assertEqual({}, read.files)
+        self.assertEqual(["a", "b", "c", "d"], [unread["path"] for unread in read.unread])
+        self.assertTrue(all(unread["reason"] == "the broker is not answering" for unread in read.unread))
+
+    def test_the_snapshot_cap_holds_while_a_batch_is_halved(self):
+        fake = FakeParts(self.FOUR, {None: self.FOUR_ENTRIES})
+        snapshot = self.refusing(fake, lambda paths: (
+            scan.vcs_client.VcsError("gone", code=scan.PATH_NOT_FOUND) if "c" in paths else None))
+        with patch.object(scan, "NARROW_SNAPSHOT_CAP", 3):
+            read = scan.read_repo_content("acme/infra", snapshot=snapshot)
+        # The whole tree, then three parts: the batch, (a, b), (c, d).
+        self.assertEqual([None, ("a", "b", "c", "d"), ("a", "b"), ("c", "d")], fake.calls)
+        self.assertEqual(["a/one.yaml", "b/two.yaml"], sorted(read.files))
+        past = scan.UNREAD_PAST_CAP.format(cap=3)
+        self.assertEqual([{"path": "c", "reason": past}, {"path": "d", "reason": past}], read.unread)
+
+    def test_the_batches_not_yet_asked_for_are_read_before_a_refused_one_is_halved(self):
+        # Two batches under the 1000-byte ceiling: (a, b) and (c, d).
+        fake = FakeParts(self.FOUR, {None: [entry("a", 400), entry("b", 400), entry("c", 400), entry("d", 400)]})
+        snapshot = self.refusing(fake, lambda paths: (
+            scan.vcs_client.VcsError("gone", code=scan.PATH_NOT_FOUND) if "a" in paths else None))
+        with patch.object(scan, "NARROW_SNAPSHOT_CAP", 3):
+            read = scan.read_repo_content("acme/infra", snapshot=snapshot)
+        self.assertEqual([None, ("a", "b"), ("c", "d"), ("a",)], fake.calls)
+        self.assertEqual(["c/three.yaml", "d/four.yaml"], sorted(read.files))
+        self.assertEqual(
+            [{"path": "a", "reason": "gone"}, {"path": "b", "reason": scan.UNREAD_PAST_CAP.format(cap=3)}], read.unread
+        )
+
+    def test_a_subtree_a_refusal_lists_is_read_before_a_refused_batch_is_halved(self):
+        tree = {"a/one.yaml": PDB_V1BETA1, "b/two.yaml": CRONJOB_V1BETA1, "big/x/three.yaml": PDB_V1BETA1}
+        fake = FakeParts(tree, {
+            None: [entry("a", 100), entry("b", 100), entry("big", 2000)],
+            ("big",): [entry("big/x", 100)],
+        })
+        snapshot = self.refusing(fake, lambda paths: (
+            scan.vcs_client.VcsError("gone", code=scan.PATH_NOT_FOUND) if "a" in paths else None))
+        with patch.object(scan, "NARROW_SNAPSHOT_CAP", 3):
+            read = scan.read_repo_content("acme/infra", snapshot=snapshot)
+        self.assertEqual([None, ("a", "b"), ("big",), ("big/x",)], fake.calls)
+        self.assertEqual(["big/x/three.yaml"], sorted(read.files))
+        past = scan.UNREAD_PAST_CAP.format(cap=3)
+        self.assertEqual([{"path": "a", "reason": past}, {"path": "b", "reason": past}], read.unread)
+
+    def test_halves_still_queued_when_the_scan_stops_are_listed_with_their_refusal(self):
+        # Two batches: (a, b) is refused for "a" and split; (c, d) fills the file cap.
+        fake = FakeParts(self.FOUR, {None: [entry("a", 400), entry("b", 400), entry("c", 400), entry("d", 400)]})
+        snapshot = self.refusing(fake, lambda paths: (
+            scan.vcs_client.VcsError("gone", code=scan.PATH_NOT_FOUND) if "a" in paths else None))
+        read = scan.read_repo_content("acme/infra", max_files=2, snapshot=snapshot)
+        self.assertEqual([None, ("a", "b"), ("c", "d")], fake.calls)
+        self.assertEqual(scan.STOPPED_MAX_FILES, read.stopped)
+        self.assertEqual(["c/three.yaml", "d/four.yaml"], sorted(read.files))
+        self.assertEqual([{"path": "a", "reason": "gone"}, {"path": "b", "reason": "gone"}], read.unread)
+
+    def test_an_entry_the_broker_marks_as_unnamed_is_listed_with_its_reason_and_never_asked_for(self):
+        why = "its name is not UTF-8, so a snapshot cannot ask for it"
+        fake = FakeParts(self.TREE, {None: [
+            {**entry("odd", 20), scan.ENTRY_UNNAMED: why}, entry("top.yaml", 20, kind="blob"),
+        ]})
+        read = scan.read_repo_content("acme/infra", snapshot=fake)
+        self.assertEqual([None, ("top.yaml",)], fake.calls)
+        self.assertEqual([{"path": "odd", "reason": why}], read.unread)
 
     def test_a_batch_refused_as_too_large_continues_from_the_entries_its_refusal_names(self):
         tree = {**self.TREE, "apps/web.yaml": PDB_V1BETA1}
