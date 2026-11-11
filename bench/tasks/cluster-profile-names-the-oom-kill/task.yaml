@@ -8,10 +8,10 @@
 # fixture: the `api` container is OOM-killed under its 64Mi limit.
 #
 # It exercises the cluster persona's model-facing edits without grading them
-# separately: the persona has no `gke` MCP server (#5446), so it reads the
-# cluster with `kubectl` and `gcloud`, and reaches `developer_knowledge`
-# through the worker's relay (#5498). A diagnosis that needed `gke` would fail
-# here.
+# separately: the worker reaches `developer_knowledge` through the broker's
+# relay (#5498), and once #5446 removes the persona's `gke` MCP server, which
+# the broker refuses to profile workers, it reads the cluster with `kubectl`
+# and `gcloud` alone.
 #
 # The prompt names the fixture's cluster through the harness's
 # {{FLEET_CLUSTER_*:<role>}} placeholders, resolved from the context

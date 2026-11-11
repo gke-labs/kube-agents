@@ -364,6 +364,15 @@ Placeholders are substituted in the prompt, the expected output, and the verific
 `{{PROJECT_ID}}`, `{{CLUSTER_NAME}}`, `{{APP_LOCATION}}`, `{{TARGET_DEPLOYMENT_NAME}}`,
 `{{NAMESPACE}}`.
 
+The prompt, and only the prompt, may also name a cluster the harness fills in before sending it.
+`{{AGENT_CLUSTER_PROJECT}}`, `{{AGENT_CLUSTER_LOCATION}}` and `{{AGENT_CLUSTER_NAME}}` are the
+agent's own cluster, from `AGENT_CLUSTER_CONTEXT`. `{{FLEET_CLUSTER_PROJECT:<role>}}`,
+`{{FLEET_CLUSTER_LOCATION:<role>}}` and `{{FLEET_CLUSTER_NAME:<role>}}` are the seeded-fleet
+cluster that carries a fixture role, from the context `hack/fleet-kubeconfigs.sh` writes; the role
+must be in the case's `fixtures:`, which `scripts/validate_bench_cases.py` checks. A placeholder the
+harness can't resolve is recorded as an infrastructure failure, never the model's. A single-cluster
+agent profile has to be told its target, which is what these are for.
+
 ### 4. Write the verification spec
 
 The judge grades prose, which makes it the wrong instrument for "did the deployment actually come
@@ -931,7 +940,8 @@ it discovers the leased project's seeded clusters by their labels
 records each role's slot in `.fleet-context` before it reads anything, writes
 `$BENCH_FLEET_KUBECONFIG_DIR/clusters/<slot>.kubeconfig` for each cluster it reached (recording
 the cluster's name and location beside the slot), and writes `<role>.kubeconfig` once the role's
-objects are confirmed. `kube_agents_bench.fleet.kubeconfig_for_role` does the last hop, role name
+objects are confirmed. The harness's `{{FLEET_CLUSTER_*:<role>}}` prompt placeholders read the
+names and locations it records. `kube_agents_bench.fleet.kubeconfig_for_role` does the last hop, role name
 to file path; `slot_kubeconfig_for_role` does the other one, for a `report_contains` check whose
 `fixture_roles` only need the role's cluster to have been reached. Adding a
 fixture means adding a role there; a task.yaml naming a role the catalog lacks, or a check whose
