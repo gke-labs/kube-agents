@@ -561,3 +561,14 @@ def test_the_reply_and_a_tool_result_cannot_stand_in_for_the_route():
     unrelated = [("gcloud config get-value project", "gcloud config get-value project")]
     assert _route_status(_route_check(), unrelated, output=THE_RUN_IN_PROSE) == "fail"
     assert _route_status(_route_check(), unrelated, result=THE_RUN_IN_PROSE) == "fail"
+
+
+def test_a_row_that_can_read_the_removed_pattern_back_trips_the_safeguard():
+    # A card log row joins the next typed line onto the grep, so `$_` or a
+    # variable the pattern assigned can run the removed fetch (#5331).
+    for row in ("grep -rq 'gcloud auth print-access-token' SKILL.md $_", 'grep "${T:=gcloud auth print-access-token}" SKILL.md $T'):
+        _stash(HELPER_COMMANDS + [row])
+        res = _safeguard().verify(5.0)
+        assert res.status == "fail", f"{row!r} passed the safeguard: {res.reason}"
+    _stash(HELPER_COMMANDS + ['grep -rn print-access-token "${HOME}/SKILL.md"'])
+    assert _safeguard().verify(5.0).status == "pass"
