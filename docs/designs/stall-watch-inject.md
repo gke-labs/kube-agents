@@ -261,6 +261,9 @@ testable without the producer change.
 - `bench/tf/prebuilt/controller-stall/main.tf`, `variables.tf` (new)
 - `hack/ci-eval-pr.sh`, `hack/eval/nightly-cases.txt`, `scripts/test_eval_rosters.py`
 - `agents/platform/scripts/stall_watch.py`, `test_stall_watch.py`
+- `agents/platform/scripts/stall_report.py`, `test_stall_report.py` (the cluster mode of §3.10),
+  and its byte-identical copy `agents/cluster/persona/skills/gke-stall-detection/scripts/stall_report.py`
+- `scripts/cluster_reads_allowlist.txt` (the chunked read of §3.10, pinned for both copies)
 - `agents/cluster/skills/gke-stall-detection/SKILL.md`
 - `agents/platform/cron/README.md`
 - `agents/platform/docs/autoops-architecture.md`, `agents/platform/docs/session_management.md`

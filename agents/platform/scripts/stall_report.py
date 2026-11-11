@@ -160,10 +160,14 @@ EXIT_OUTPUT_TRUNCATED = 74
 NO_HEADERS_FLAG = "--no-headers"
 NAME_COLUMNS = "custom-columns=NAMESPACE:.metadata.namespace,NAME:.metadata.name"
 NAME_COLUMN_COUNT = 2
-# The cluster report's keys, read by stall_watch.py.
+# The cluster report's keys, read by stall_watch.py, and the per-namespace
+# report's, which the cluster report nests one of per namespace.
 REPORT_NAMESPACES_KEY = "namespaces"
 REPORT_FALLBACK_KEY = "fallback"
 REPORT_EVENTS_FALLBACK_KEY = "events_fallback"
+REPORT_NAMESPACE_KEY = "namespace"
+REPORT_COUNT_KEY = "stalled_resources"
+REPORT_FINDINGS_KEY = "findings"
 # `--extra-kinds <namespace>=<kinds>`: the kinds one namespace is asked about
 # beyond the list every namespace gets.
 EXTRA_KINDS_SEPARATOR = "="
@@ -1176,7 +1180,7 @@ def report_cluster(
         # by kind as asked, each kind in the order the server gave.
         here = [o for r in asked[namespace] if r in objects for o in objects[r].get(namespace, [])]
         findings = analyze(here, events.get(namespace, []) if events is not None else [], resolver, now, override_minutes, scale)
-        reports[namespace] = {"namespace": namespace, "stalled_resources": stalled_object_count(findings), "findings": findings}
+        reports[namespace] = {REPORT_NAMESPACE_KEY: namespace, REPORT_COUNT_KEY: stalled_object_count(findings), REPORT_FINDINGS_KEY: findings}
     return {REPORT_NAMESPACES_KEY: reports, REPORT_FALLBACK_KEY: fallback, REPORT_EVENTS_FALLBACK_KEY: events is None}
 
 

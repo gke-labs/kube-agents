@@ -779,16 +779,20 @@ def now_iso() -> str:
 
 
 def run_sandbox(
-    argv: list[str], *, timeout: float, kubeconfig: str | None = None, stdin: str | None = None
+    argv: list[str], *, timeout: float, kubeconfig: str | None = None, stdin: str | None = None, deadline: float | None = None
 ) -> subprocess.CompletedProcess:
     """One hop into the shell sandbox. Only KUBECONFIG and the shim's retry
     deadline cross; the rest of this process's environment has no business on
-    the other side."""
+    the other side. `deadline`, a `time.monotonic` reading, is the budget's
+    end: the timeout is cut to it once the slot is held, so a wait for the
+    slot is not added on top of a timeout sized before the wait."""
     remote_env = {credential_proxy_client.RETRY_DEADLINE_ENV: str(SHIM_RETRY_DEADLINE_SECONDS)}
     if kubeconfig:
         remote_env["KUBECONFIG"] = kubeconfig
     # One of SCAN_WORKERS brokered commands at a time, whichever pool asks.
     with BROKER_SLOTS:
+        if deadline is not None:
+            timeout = min(timeout, max(SCAN_TIMEOUT_FLOOR_SECONDS, deadline - time.monotonic()))
         return sandbox_exec.run(argv, remote_env=remote_env, timeout=timeout, check=False, stdin=stdin)
 
 
@@ -1314,11 +1318,11 @@ def resource_names_kind(resource: str, kind: str) -> bool:
     return kind.lower() in singulars
 
 
-def scan_namespace(kubeconfig: str, namespace: str, source: str, kinds: str | None, timeout: float = NAMESPACE_SCAN_TIMEOUT_SECONDS) -> tuple[list[dict], set[str]]:
+def scan_namespace(kubeconfig: str, namespace: str, source: str, kinds: str | None, timeout: float = NAMESPACE_SCAN_TIMEOUT_SECONDS, deadline: float | None = None) -> tuple[list[dict], set[str]]:
     """The findings stall_report.py reports for one namespace, and the
     resources it could not read. Raises when the namespace could not be read
     at all, so the caller keeps its ledger rows."""
-    r = run_sandbox(report_argv(namespace, kinds), timeout=timeout, kubeconfig=kubeconfig, stdin=source)
+    r = run_sandbox(report_argv(namespace, kinds), timeout=timeout, kubeconfig=kubeconfig, stdin=source, deadline=deadline)
     if r.returncode == REPORT_UNREADABLE_EXIT:
         raise RuntimeError(f"no kind could be read: {stderr_excerpt(r.stderr)}")
     if r.returncode != 0:
@@ -1327,7 +1331,7 @@ def scan_namespace(kubeconfig: str, namespace: str, source: str, kinds: str | No
     return report.get(CLUSTER_REPORT_FINDINGS_KEY) or [], skipped_in(r.stderr)
 
 
-def scan_cluster(kubeconfig: str, namespaces: list[str], source: str, kinds: str | None, extra_kinds: dict[str, list[str]], timeout: float, label: str) -> dict | None:
+def scan_cluster(kubeconfig: str, namespaces: list[str], source: str, kinds: str | None, extra_kinds: dict[str, list[str]], timeout: float, label: str, deadline: float | None = None) -> dict | None:
     """The cluster report stall_report.py's cluster mode gives for
     `namespaces`: each kind read once across the cluster, the findings split
     per namespace. None, with a note on stderr, when the report cannot be
@@ -1335,7 +1339,7 @@ def scan_cluster(kubeconfig: str, namespaces: list[str], source: str, kinds: str
     which case the caller reads the cluster per namespace as before; the
     cluster-wide read saves calls and never costs coverage. A timeout and a
     lost sandbox are raised, as from every other hop."""
-    r = run_sandbox(cluster_report_argv(namespaces, kinds, extra_kinds), timeout=timeout, kubeconfig=kubeconfig, stdin=source)
+    r = run_sandbox(cluster_report_argv(namespaces, kinds, extra_kinds), timeout=timeout, kubeconfig=kubeconfig, stdin=source, deadline=deadline)
     if r.returncode != 0:
         sys.stderr.write(f"stall_watch: {label} cluster read exited {r.returncode}; reading per namespace: {stderr_excerpt(r.stderr)}\n")
         return None
@@ -1809,7 +1813,17 @@ def read_cluster(ctx: SweepContext, cid: str) -> ClusterPart:
     """One cluster's sweep, on a worker: its credentials, its namespaces and
     served kinds, its wildcard discovery when due, then the cluster-wide
     read, and the per-namespace read for whatever that could not read whole.
-    Returns the part; raises only for a lost sandbox, which ends the tick."""
+    Returns the part; raises only for a lost sandbox, which ends the tick: the
+    raising worker lowers the budget flag itself, so every other worker stops
+    at its next check rather than when the main thread sees the exception."""
+    try:
+        return read_cluster_part(ctx, cid)
+    except BaseException:
+        ctx.sweep.budget_exhausted = True
+        raise
+
+
+def read_cluster_part(ctx: SweepContext, cid: str) -> ClusterPart:
     part = ClusterPart(cid)
     sweep = ctx.sweep
     if sweep.out_of_budget(ctx.started):
@@ -1908,13 +1922,14 @@ def read_cluster(ctx: SweepContext, cid: str) -> ClusterPart:
     # kinds have objects there) is read without a call, as before.
     report: dict | None = None
     wanted = [ns for ns in namespaces if join_kinds(kinds, extra_kinds.get(ns)) != ""]
+    deadline = ctx.started + TICK_BUDGET_SECONDS
     remaining = sweep.budget_remaining(ctx.started)
     if remaining <= 0:
         part.cut = True
         namespaces = []
     elif wanted:
         try:
-            report = scan_cluster(kubeconfig, wanted, ctx.source, kinds, extra_kinds, min(CLUSTER_SCAN_TIMEOUT_SECONDS, remaining), cluster_label(cid))
+            report = scan_cluster(kubeconfig, wanted, ctx.source, kinds, extra_kinds, min(CLUSTER_SCAN_TIMEOUT_SECONDS, remaining), cluster_label(cid), deadline)
         except sandbox_exec.SandboxUnavailable:
             raise
         except subprocess.TimeoutExpired as exc:
@@ -1933,9 +1948,12 @@ def read_cluster(ctx: SweepContext, cid: str) -> ClusterPart:
         # none with objects here); the kinds the cluster-wide read could not
         # read whole, of the ones this namespace asks for, when the report
         # covers the namespace; everything, when it does not.
+        covered = False  # the report has this namespace: its rows stand whatever the leftover read does
+        pending: list[str] = []
         if namespace_kinds == "":
             needed = None
         elif report is not None and not report.get(CLUSTER_REPORT_EVENTS_FALLBACK_KEY) and namespace in report[CLUSTER_REPORT_NAMESPACES_KEY]:
+            covered = True
             findings = list((report[CLUSTER_REPORT_NAMESPACES_KEY][namespace] or {}).get(CLUSTER_REPORT_FINDINGS_KEY) or [])
             asked = None if namespace_kinds is None else set(namespace_kinds.split(KINDS_SEPARATOR))
             pending = [k for k in report.get(CLUSTER_REPORT_FALLBACK_KEY) or [] if asked is None or k in asked]
@@ -1949,7 +1967,7 @@ def read_cluster(ctx: SweepContext, cid: str) -> ClusterPart:
                 part.cut_namespace = namespace
                 break
             try:
-                more, unread = scan_namespace(kubeconfig, namespace, ctx.source, needed, min(NAMESPACE_SCAN_TIMEOUT_SECONDS, remaining))
+                more, unread = scan_namespace(kubeconfig, namespace, ctx.source, needed, min(NAMESPACE_SCAN_TIMEOUT_SECONDS, remaining), deadline)
             except sandbox_exec.SandboxUnavailable:
                 raise
             except subprocess.TimeoutExpired as exc:
@@ -1962,15 +1980,25 @@ def read_cluster(ctx: SweepContext, cid: str) -> ClusterPart:
                 )
                 break
             except READ_FAILURES as exc:
-                part.unreadable[scope_key(cid, namespace)] = failure_text(exc)
-                continue
+                if not covered:
+                    part.unreadable[scope_key(cid, namespace)] = failure_text(exc)
+                    continue
+                # The leftover kinds failed here too (a kind no identity can
+                # list fails at both scopes, and a read of those kinds alone
+                # exits 2). The report's rows for the other kinds stand, the
+                # namespace was read, and the leftover kinds are held, as a
+                # kind the old single read skipped was.
+                more, unread = [], set(pending)
             findings += more
         scans += 1
         part.read_scopes.add(scope_key(cid, namespace))
         if namespace in next_turns and isinstance(record, dict):
             # The namespace was read: its window moves on for the next
-            # tick that reads it, and only then.
-            record.setdefault(DISCOVERY_TURN_KEY, {})[namespace] = next_turns[namespace]
+            # tick that reads it, and only then. On a copy: the ledger's
+            # record is the main thread's to write.
+            turns = dict(record.get(DISCOVERY_TURN_KEY) or {}) if isinstance(record.get(DISCOVERY_TURN_KEY), dict) else {}
+            turns[namespace] = next_turns[namespace]
+            record = {**record, DISCOVERY_TURN_KEY: turns}
             part.discovery = record
         # A kind the cluster does not serve holds its rows without making
         # the namespace unreadable: most clusters lack some optional CRD.
@@ -2080,8 +2108,15 @@ def sweep_fleet(
         futures = [pool.submit(read_cluster, ctx, cid) for cid in order]
         try:
             parts = [future.result() for future in futures]
-        finally:
-            pool.shutdown(wait=False, cancel_futures=True)
+        except BaseException:
+            # A worker raised (a lost sandbox): the budget flag stops every
+            # other worker at its next check, the pending clusters are
+            # dropped, and the running ones are waited for, so no worker is
+            # still reading when the tick records the failure.
+            sweep.budget_exhausted = True
+            pool.shutdown(wait=True, cancel_futures=True)
+            raise
+        pool.shutdown(wait=True)
     for part in parts:
         sweep.absorb(part)
         if part.credential == CREDENTIAL_SET:

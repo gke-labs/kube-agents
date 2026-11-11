@@ -1047,6 +1047,24 @@ class ClusterMode(unittest.TestCase):
         with patch.object(stall_report, "run_kubectl", return_value=(0, "payments   present\nbilling   cfg\n", "")):
             self.assertEqual(stall_report.kubectl_names_cluster_wide("configmaps"), {("payments", "present"), ("billing", "cfg")})
 
+    def test_the_raw_collections_are_inside_the_brokers_allowlist_and_the_cut_marker_is_the_shims(self):
+        import command_policy
+        import credential_proxy_client
+
+        for name, (path, kind, api_version) in stall_report.RAW_COLLECTIONS.items():
+            with self.subTest(name=name):
+                self.assertIn(path, command_policy.KUBECTL_RAW_COLLECTIONS, "a raw read of a path the broker does not list is refused")
+                self.assertEqual(path.rsplit("/", 1)[1], name.split(".", 1)[0])
+                self.assertEqual(path.split("/")[-2], api_version.split("/")[-1])
+        self.assertIn(stall_report.EVENTS_COLLECTION[0], command_policy.KUBECTL_RAW_COLLECTIONS)
+        self.assertLessEqual({stall_report.RAW_LIMIT_KEY, stall_report.RAW_CONTINUE_KEY, stall_report.RAW_FIELD_SELECTOR_KEY}, command_policy.KUBECTL_RAW_QUERY_KEYS)
+        self.assertNotIn("secrets", stall_report.RAW_COLLECTIONS)
+        self.assertEqual(stall_report.PROXY_TRUNCATED_TEXT, credential_proxy_client.OUTPUT_TRUNCATED_MARKER)
+        self.assertEqual(stall_report.EXIT_OUTPUT_TRUNCATED, credential_proxy_client.EXIT_OUTPUT_TRUNCATED)
+        self.assertNotIn(stall_report.EVENTS_RESOURCE, stall_report.RAW_COLLECTIONS, "events have their own collection, read with the Warning selector")
+        for excluded in stall_report.SCAN_EXCLUDED_RESOURCES:
+            self.assertNotIn(excluded, stall_report.RAW_COLLECTIONS)
+
     def test_extra_kinds_are_parsed_per_namespace(self):
         self.assertEqual(stall_report.parse_extra_kinds(["billing=a,b", "billing=c", "web=d"]), {"billing": ["a", "b", "c"], "web": ["d"]})
         with self.assertRaises(ValueError):

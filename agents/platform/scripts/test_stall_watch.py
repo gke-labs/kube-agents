@@ -88,6 +88,8 @@ REFUSED = DISCOVERY_ERROR + 'dial tcp 34.118.224.1:443: connect: connection refu
 DARK = DISCOVERY_ERROR + 'dial tcp 34.118.224.1:443: i/o timeout"\nUnable to connect to the server: dial tcp 34.118.224.1:443: i/o timeout'
 #: A discovery whose listing the proxy cut: exit 0 and the marker on stderr.
 PROXY_CUT = "cut"
+#: How long a held cluster read waits for its release before it answers anyway.
+HOLD_TIMEOUT_SECONDS = 2.0
 #: What the shim prints when the proxy refused the command at its admission bound.
 PROXY_BUSY = "the credential proxy is at its limit of 8 concurrent commands and this request waited 60s without reaching a free slot; retry shortly"
 #: What `kubectl api-resources -o name` prints for the default kinds on a cluster that serves them all.
@@ -147,7 +149,7 @@ class FakeFleet:
     exempt annotation's value a `kubectl get` of that object prints; an object
     not in it prints nothing, as a deleted one does."""
 
-    def __init__(self, fleet, namespaces_extra=(), listing_stderr="", hidden=(), served=None, sandbox_dies_at=None, api_resources_rc_one=False, namespaces_fail_once=(), listing_fails=(), listing_hangs=None, fetch_fails=(), annotations=None, namespaces_listing=None, object_annotations=None, objects=(), discovery=0, fallback=(), events_fallback=False, cluster_read=None, hold=None, release_at=None, before_release=None):
+    def __init__(self, fleet, namespaces_extra=(), listing_stderr="", hidden=(), served=None, sandbox_dies_at=None, api_resources_rc_one=False, namespaces_fail_once=(), listing_fails=(), listing_hangs=None, fetch_fails=(), annotations=None, namespaces_listing=None, object_annotations=None, objects=(), discovery=0, fallback=(), events_fallback=False, cluster_read=None, hold=None, release_at=None, before_release=None, leftover_read=None):
         # Cluster mode: the kinds the cluster-wide read reports as left to the
         # per-namespace read, whether the events were, and what the cluster
         # read itself does instead of answering: an exception to raise, an
@@ -157,10 +159,14 @@ class FakeFleet:
         self.events_fallback = events_fallback
         self.cluster_read = cluster_read
         self.hold = hold
+        # What a per-namespace read of the leftover kinds alone answers
+        # (an exit code), for a namespace whose fixture is (rows, None).
+        self.leftover_read = leftover_read
         # With `hold`: the in-flight count that sets it, after `before_release` ran.
         self.release_at = release_at
         self.before_release = before_release
         self.in_flight = 0
+        self.arrivals = 0
         self.peak_in_flight = 0
         self.flight_lock = threading.Lock()
         # Every namespace a read covered, cluster-wide or on its own, in order.
@@ -198,7 +204,7 @@ class FakeFleet:
         self.namespaces_extra = list(namespaces_extra)
         self.calls = []
 
-    def __call__(self, argv, *, timeout, kubeconfig=None, stdin=None):
+    def __call__(self, argv, *, timeout, kubeconfig=None, stdin=None, deadline=None):
         self.calls.append((argv, kubeconfig, stdin))
         if argv[:4] == ["gcloud", "container", "clusters", "list"]:
             project = argv[4].split("=", 1)[1]
@@ -265,31 +271,38 @@ class FakeFleet:
             # out of the report, which sends the watch to the per-namespace
             # read, where the fixture answers as it always did.
             cluster_name = self._cluster_from(kubeconfig)[1]
+            wanted = argv[argv.index(stall_watch.CLUSTER_NAMESPACES_FLAG) + 1].split(",")
             with self.flight_lock:
                 self.in_flight += 1
+                self.arrivals += 1
                 self.peak_in_flight = max(self.peak_in_flight, self.in_flight)
-                if self.hold is not None and self.release_at is not None and self.in_flight >= self.release_at:
+                if self.hold is not None and self.release_at is not None and self.arrivals >= self.release_at:
                     if self.before_release is not None:
                         self.before_release()
                     self.hold.set()
             try:
+                if self.sandbox_dies_at is not None and self.sandbox_dies_at[0] == cluster_name and self.sandbox_dies_at[1] in wanted:
+                    for namespace in wanted:
+                        if isinstance(namespaces.get(namespace), list):
+                            self.scanned_log.append(namespace)
+                        if namespace == self.sandbox_dies_at[1]:
+                            break
+                    raise stall_watch.sandbox_exec.SandboxUnavailable("ssh: connect to host sandbox port 22: Connection refused")
                 if self.hold is not None:
-                    self.hold.wait()
+                    self.hold.wait(timeout=HOLD_TIMEOUT_SECONDS)
                 if isinstance(self.cluster_read, Exception):
                     raise self.cluster_read
                 if isinstance(self.cluster_read, int):
                     return completed(argv, "", returncode=self.cluster_read, stderr="cluster mode fell over")
                 if isinstance(self.cluster_read, str):
                     return completed(argv, self.cluster_read)
-                wanted = argv[argv.index(stall_watch.CLUSTER_NAMESPACES_FLAG) + 1].split(",")
                 reports = {}
                 for namespace in wanted:
                     result = namespaces.get(namespace)
+                    if isinstance(result, tuple) and result[1] is None:
+                        result = result[0]
                     if isinstance(result, list):
                         self.scanned_log.append(namespace)
-                    if self.sandbox_dies_at == (cluster_name, namespace):
-                        raise stall_watch.sandbox_exec.SandboxUnavailable("ssh: connect to host sandbox port 22: Connection refused")
-                    if isinstance(result, list):
                         reports[namespace] = {"namespace": namespace, "stalled_resources": len(result), "findings": result}
                 report = {
                     stall_watch.CLUSTER_REPORT_NAMESPACES_KEY: reports,
@@ -306,6 +319,9 @@ class FakeFleet:
                 raise stall_watch.sandbox_exec.SandboxUnavailable("ssh: connect to host sandbox port 22: Connection refused")
             self.scanned_log.append(namespace)
             result = namespaces[namespace]
+            if isinstance(result, tuple) and result[1] is None:
+                # The namespace's own read, for the leftover kinds.
+                result = self.leftover_read if self.leftover_read is not None else result[0]
             if isinstance(result, Exception):
                 raise result
             if isinstance(result, int):
@@ -2036,6 +2052,25 @@ class ClusterRead(Base):
         self.assertEqual(sorted(self.ledger()["unreadable"]), [])
         self.assertEqual(self.ledger()[stall_watch.CLUSTER_TIMINGS_KEY][cid("c")][stall_watch.TIMING_SCANS_KEY], 2)
 
+    def test_a_covered_namespace_whose_leftover_read_fails_keeps_its_rows_and_holds_the_leftover_kinds(self):
+        # The cluster read left certificates over; the read of certificates
+        # alone exits 2 (a kind no identity can list fails at both scopes).
+        # The report's Deployment row stands, the namespace is read, and the
+        # Certificate row from last tick is held, not cleared.
+        certificate = finding("checkout", "Certificate/storefront-tls", "stale-condition", "Ready=False DoesNotExist")
+        self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW, certificate], "web": []}})
+        self.assertEqual(len(self.last_alerts), 1)
+        lines, fake = self.run_tick(
+            {"c": {"checkout": ([DEPLOYMENT_ROW], None), "web": ([], None)}},
+            fallback=["certificates.cert-manager.io"],
+            leftover_read=stall_watch.REPORT_UNREADABLE_EXIT,
+        )
+        self.assertEqual(fake.namespace_scans(), [("checkout", ["certificates.cert-manager.io"]), ("web", ["certificates.cert-manager.io"])])
+        self.assertEqual(lines, [])
+        self.assertEqual(sorted(e["object"] for e in self.ledger()["stalls"].values()), ["Certificate/storefront-tls", "Deployment/checkout-api"])
+        self.assertEqual(self.ledger()["unreadable"], {f"{cid('c')}/checkout": "partial: certificates.cert-manager.io not read", f"{cid('c')}/web": "partial: certificates.cert-manager.io not read"})
+        self.assertEqual(self.ledger()[stall_watch.CLUSTER_TIMINGS_KEY][cid("c")][stall_watch.TIMING_SCANS_KEY], 2, "both namespaces count as read")
+
     def test_a_kind_left_over_that_no_namespace_asked_for_costs_no_read(self):
         with patch.dict(os.environ, {stall_watch.KINDS_ENV: "deployments"}):
             _, fake = self.run_tick({"c": {"payments": []}}, fallback=["gateways.gateway.networking.k8s.io"])
@@ -2085,9 +2120,9 @@ class ClusterRead(Base):
         seen = {}
         real = stall_watch.scan_cluster
 
-        def record(kubeconfig, namespaces, source, kinds, extra_kinds, timeout, label):
+        def record(kubeconfig, namespaces, source, kinds, extra_kinds, timeout, label, deadline=None):
             seen["timeout"] = timeout
-            return real(kubeconfig, namespaces, source, kinds, extra_kinds, timeout, label)
+            return real(kubeconfig, namespaces, source, kinds, extra_kinds, timeout, label, deadline)
 
         left = 40
         with patch.object(stall_watch, "scan_cluster", record), patch.object(stall_watch.time, "monotonic", side_effect=[0, 1, stall_watch.TICK_BUDGET_SECONDS - left] + [stall_watch.TICK_BUDGET_SECONDS - left] * 8):
@@ -2188,10 +2223,20 @@ class Parallel(Base):
         self.assertIsNone(self.ledger()[stall_watch.CURSOR_KEY])
 
     def test_a_lost_sandbox_on_one_worker_is_one_sweep_failure(self):
+        # c's hop is lost on arrival, while the other readers are held (the
+        # hold is never released; they come back at its timeout, after the
+        # raising worker lowered the budget flag): the clusters no worker had
+        # started are not read, and nothing is read once the held readers
+        # come back.
         fleet = {name: {"ns": []} for name in "abcdef"}
-        lines, _ = self.run_tick(fleet, sandbox_dies_at=("c", "ns"))
+        lines, fake = self.run_tick(fleet, sandbox_dies_at=("c", "ns"), hold=threading.Event())
         self.assertEqual(len(lines), 1)
         self.assertTrue(lines[0].startswith(stall_watch.SWEEP_FAILED_PREFIX), lines[0])
+        read = sorted(fake._cluster_from(kubeconfig)[1] for argv, kubeconfig, _ in fake.calls if stall_watch.CLUSTER_NAMESPACES_FLAG in argv)
+        self.assertNotIn("e", read, "a cluster no worker had started when the hop was lost is not read")
+        self.assertNotIn("f", read)
+        self.assertIn("c", read)
+        self.assertEqual(fake.in_flight, 0, "no worker is still reading when the tick ends")
         lines, _ = self.run_tick(fleet)
         self.assertEqual(lines, [stall_watch.SWEEP_RECOVERED_LINE])
 

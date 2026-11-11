@@ -679,10 +679,11 @@ The arithmetic behind `6`:
   `k8s-operator/internal/controller/credential_proxy_manifests.go`), held to 8 by its slot cap. At
   the old 1Gi it was 4.
 
-  The 8 slots are shared: the stall watch and the cluster-agent reconcile each list four projects
-  at a time through them. With neither listing, all 8 are free for the six workers; while one
-  lists, 4 are; while both list at once, none, and a worker command waits up to 60 s for a slot and
-  is then refused busy.
+  The 8 slots are shared. The stall watch runs four commands at a time for the whole of its tick,
+  the listing and then the cluster reads, up to 25 minutes of every 30; the cluster-agent
+  reconcile lists four projects at a time. With neither running, all 8 are free for the six
+  workers; while one runs, 4 are; while both run at once, none, and a worker command waits up to
+  60 s for a slot and is then refused busy.
 
 - **Model quota.** Per-install model rate limits are not measured. A small quota may see 429s at 6;
   if worker logs show them, lower `maxInProgress`.
