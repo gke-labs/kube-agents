@@ -36,3 +36,5 @@ fleet-audit-on-demand-run-reports
 gitops-drift-deleted-policy-triage
 gitops-drift-out-of-band-triage
 upgrades-rollout-family-held-by-canary-gate
+# Added 2026-11-10 when the case joined the nightly (#5261): the shortest chain then.
+first-install-hello-filed

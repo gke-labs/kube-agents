@@ -31,7 +31,11 @@ to put in a diff otherwise. Three paths lead there:
   (`start` reports the ones that passed its gates as `pending_remediation_requests`). Fresh pull
   requests only: a finding whose pull request a human closed is reported as `superseded`, never
   re-proposed — a direct ask carries no GitHub identity, so the after-the-close escape hatch
-  ([ledger.md](ledger.md)) stays with the write-gated comment.
+  ([ledger.md](ledger.md)) stays with the write-gated comment. A task that asks you to open the
+  audit's fixes is a direct ask for each fix the ledger lists as awaiting `/remediate`, a
+  PodDisruptionBudget `finish` wrote itself included: run `remediate` for them in the same task. On
+  an install whose switch is off, that is the only way they open before a person comments, so do not
+  end the task telling the requester to comment `/remediate`.
 
 Every `/remediate` gets exactly one answer, and the answer is never silence:
 
@@ -103,6 +107,13 @@ exit 1); report that message to the user, and do not choose a repository:
   [--repo "<owner>/<repo>"] [--manifest-file <path>]
 ```
 
+A declared `no-pdb` finding that you left `manual` so that `finish` writes its PodDisruptionBudget
+is named the same way. Pass the collector's `--manifest-file`: `remediate` writes that budget beside
+the declaration, under the rules `finish` uses, and opens it. A budget it plans but cannot write
+is `refused`, with the reason on its `REFUSED` line. A budget whose selector the collector withheld
+is never planned: the command exits 2, naming the finding as not a `manifest`, and the finding stays
+`manual`.
+
 **It opens exactly what you name, and nothing else.** The auto-promotion sweep does not ride along:
 one `--finding` produces one pull request (or one, shared, for the group that path belongs to), never
 five more for findings the requester never mentioned and cannot tell apart from the one they
@@ -120,9 +131,11 @@ agent relaying an ask it cannot tie to a GitHub identity never passes that flag.
 ledger issue there is no such comment, so a human close stands until a person at the terminal
 passes that flag. There `remediate` looks up no ledger issue, and the pull request links none.
 
-`refused` names the targets whose remediation is not a readable file inside the workspace — either the
-audit promised a manifest and never wrote it, or the path does not resolve inside the repository at
-all. Both leave nothing to put in a diff; a `SECURITY:` line in the log says which one happened. A
+`refused` names the targets that cannot become a pull request. A `no-pdb` budget the command could
+not write is one; its `REFUSED` line says why. A remediation that is not a readable file inside the
+workspace is another: either the audit promised a manifest and never wrote it, or the path does not
+resolve inside the repository at all. Neither of those two leaves anything to put in a diff, and a
+`SECURITY:` line in the log says which one happened. A
 target is also refused when its fix adds a new file that its kustomization does not list, or the
 audit could not check that. Its `REFUSED` line names the `resources:` line to add when the audit saw
 the kustomization, and says what it could not check otherwise. The
@@ -135,8 +148,10 @@ opened before the broker went stands, and re-running the same `remediate` once i
 and opens the rest. Otherwise read the message before reporting why: a named id is not in
 the document at all; a named id is held by the collector (given the same `--manifest-file` `finish`
 had, the message says so instead of "not in the document"); a named target is not a `manifest`; or
-_every_ named target was refused because its file is not readable inside the workspace. The first
-three are fixed by dropping the bad id and asking again; only the last is about writing manifests.
+_every_ named target was refused because its file is not readable inside the workspace or its budget
+could not be written. The first three are fixed by dropping the bad id and asking again, except a
+`no-pdb` finding named without `--manifest-file`, where the message says to pass it; the last is
+about writing manifests, or for a budget, about the reason on its `REFUSED` line.
 
 **Findings whose remediation paths intersect share one pull request.** They have to: separate
 branches touching the same file conflict on merge. Promoting any member promotes the whole group —

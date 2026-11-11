@@ -29,7 +29,7 @@ Load and sizing measurements of the harness at fleet scale, as opposed to answer
 - `kube_agents_bench/fleet.py` — resolves a seeded-fleet fixture ROLE to the kubeconfig that reaches it. Fails loudly rather than falling back to the ambient config; see [tf/fleet/README.md](tf/fleet/README.md).
 - `kube_agents_bench/cases.py`, `scoring.py`, `baselines.py`, `gate.py` — the presubmit's verdict, described under [The gate](#the-gate) below. Nothing devops-bench calls; these read the records it writes.
 - `tasks/` — task definitions. `agent-kanban-smoke` is a no-infrastructure smoke task that exercises the whole pipeline using only toolsets the deployed agent actually ships with. The rest are the Phase 2 domain scenarios; [`tasks/DRAFTS.md`](tasks/DRAFTS.md) is their status page.
-- `baselines/` — screening evidence and `VERSIONS.json`, one append-only JSONL file per case, one batch of runs per line, each keyed on the five software versions a score depends on. Written by runs on `main`, read by every pull request. See [baselines/README.md](baselines/README.md).
+- `baselines/` — screening evidence and `VERSIONS.json`, one append-only JSONL file per case, one batch of runs per line, each keyed on the five software versions a score depends on. Written by runs on `main`, read by every pull request; the committed directory holds only `VERSIONS.json`, and the bucket is the record. See [baselines/README.md](baselines/README.md).
 - `scenarios/` — evaluation matrices using `Agent + Persona + Scenario + Goals
 -> Run -> Assertions` terminology.
 - `tests/` — offline tests: the harness against a local HTTP stub, and the gate against real run records captured from a live cluster (`tests/fixtures/runs/`).
@@ -185,7 +185,7 @@ the page, not a red. What does red a run of the lane is the same as anywhere: ru
 forbidden write, a check that never ran, inconsistent liveness) and rung 5, a case marked
 `expected_fail: true` that passes every repetition, which says its marker is stale. A case the
 suite declares as a known gap carries that marker and names its gap issue in the roster's reason
-block. The lane's record is its logs bucket, read by the page per case, release and model: the tier is
+block. The lane's record is its logs bucket, read by the page per case and release: the tier is
 kept out of the baseline evidence store and the nightly dashboard, as the GitLab and rollback
 lanes are.
 

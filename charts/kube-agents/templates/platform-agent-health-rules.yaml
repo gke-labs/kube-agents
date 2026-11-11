@@ -84,6 +84,10 @@ connected can fire after `for` alone, which for a pod that never connected is
 true.
 */}}
 {{- $jobs := list (printf "%s-gateway-monitoring" $agent) (printf "%s-gateway-chat-monitoring" $agent) (printf "%s-credential-proxy-monitoring" $agent) (printf "%s-kube-proxy-monitoring" $agent) (printf "%s-a2a-gateway-monitoring" $agent) (printf "%s-operator-monitoring" .Release.Name) }}
+{{- /* The exec tier's scrape job, while the tier renders: an exec tier no scrape reaches is as dark as a broker. */}}
+{{- if gt (include "kube-agents.credentialProxyExecReplicas" . | int) 0 }}
+{{- $jobs = append $jobs (printf "%s-credential-proxy-exec-tier-monitoring" $agent) }}
+{{- end }}
 {{- $who := "{{ $labels.agent_namespace }}/{{ $labels.agent }}" }}
 apiVersion: monitoring.googleapis.com/v1
 kind: Rules

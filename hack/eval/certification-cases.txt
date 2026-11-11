@@ -28,8 +28,8 @@
 # named workloads names the dependency each cut would change (the seeded fleet's
 # HPA-scaled inference-server in seeded-capacity and the Guaranteed-QoS
 # ledger-writer in seeded-qos; no stack). A baseline: no gap declared; moved in
-# from the nightly file on its record there: 43 of 45 repetitions pass,
-# 2026-10-23 to 2026-11-09 (the case of #3507, for #3199).
+# from the nightly file on its record there: above the bar on the nightlies
+# of 2026-10-23 to 2026-11-09 (the case of #3507, for #3199).
 ./tasks/cost-rightsizing-names-dependencies/task.yaml
 # Capability row: networking fabric, load balancers and Gateway; the
 # obtainability audit on an HTTPRoute whose Service maps to a numeric targetPort
@@ -72,12 +72,26 @@
 # reads a CA bundle's notAfter; the gap is #4960.
 ./tasks/security-expiring-node-bootstrap-and-webhook-certs/task.yaml
 # Capability row: security, Workload Identity, RBAC and CVEs; the compliance
+# audit on a fail-closed admission webhook whose backend Service does not exist
+# (the planted ValidatingWebhookConfiguration strict-policy-webhook, failurePolicy
+# Fail on an inert group, its clientConfig.service in a namespace nothing
+# creates). A declared gap, expected_fail: no compliance check reads an
+# admission webhook configuration; the gap is #5335.
+./tasks/security-webhook-blocks-config-management-system/task.yaml
+# Capability row: security, Workload Identity, RBAC and CVEs; the compliance
 # audit on a ServiceAccount whose Workload Identity annotation names a Google
 # service account with no workloadIdentityUser binding behind it (the planted
 # kms-signer-sa and the kms-signer Deployment in seeded-identity). A declared
 # gap, expected_fail: no compliance check reads the binding behind an
 # annotation; the gap is #5027.
 ./tasks/security-wi-ksa-gsa-iam-binding-missing/task.yaml
+# Capability row: storage, CSI drivers and PVCs; the obtainability audit on a
+# Deployment that mounts a bucket through the gcsfuse CSI driver with no sidecar
+# memory-limit annotation and no file-cache capacity (the planted
+# bucket-reader-app in seeded-fuse). A declared gap, expected_fail: no
+# obtainability check reads a gcsfuse volume's cache or sidecar limits; the gap
+# is item 3 of #2577.
+./tasks/storage-gcsfuse-unbounded-cache-oom/task.yaml
 # Capability row: storage, CSI drivers and PVCs; the obtainability audit names a
 # one-replica Deployment under the default RollingUpdate strategy that mounts a
 # ReadWriteOnce claim (the planted single-writer-app and single-writer-data in
@@ -109,3 +123,54 @@
 # private-image-worker in seeded-registry, pods in ErrImagePull). A declared
 # gap, expected_fail: no compliance check names it; the gap is #4809.
 ./tasks/workload-private-registry-pull-secret-expired/task.yaml
+
+# part 2
+# Class C, node OS and control-plane declared gaps (design note cert-class-c-design,
+# option c): no plant today; each shape lands with the check that reads it. A
+# section of its own so the lane's part 1 keeps its measured size; it runs when
+# a ci-kube-agents-certification-2 periodic names this part.
+# Capability row: control plane, setup, cost and CLI; the GCE compute fleet
+# audit on a controller that writes a ConfigMap or Lease without client rate
+# limits (nothing planted and no fixture declared; the shape lands with
+# its check). A declared gap,
+# expected_fail: no check reads a controller's rate-limit arguments or a
+# write rate; the gap is #5412 (the reader is planned in #2581).
+./tasks/control-plane-configmap-lease-write-storm/task.yaml
+# Capability row: control plane, setup, cost and CLI; the GCE compute fleet
+# audit on konnectivity-agent replicas against node count (nothing planted and no
+# fixture declared: a GKE-managed add-on no fixture may edit). A declared gap, expected_fail: no check reads
+# the ratio and no objective type grades a clean read; the gap is #5415 (the
+# reader is planned in #2581).
+./tasks/control-plane-konnectivity-agent-exhaustion/task.yaml
+# Capability row: control plane, setup, cost and CLI; the GCE compute fleet
+# audit on an unpaginated cluster-wide LIST caller (nothing planted and no
+# fixture declared; the shape, a suspended CronJob, lands with its check). A declared gap,
+# expected_fail: no check reads a workload's list command; the gap is #5413.
+./tasks/control-plane-unpaginated-heavy-list-oom/task.yaml
+# Capability row: node OS, kubelet and auto-repair; the GCE compute fleet
+# audit on a pool with an initialization DaemonSet and no startup taint or
+# readiness rule (nothing planted and no fixture declared; the shape lands with
+# its check). A declared gap,
+# expected_fail: no check reads pool taints against an init DaemonSet; the
+# gap is #5411.
+./tasks/node-kubelet-startup-admission-race/task.yaml
+# Capability row: node OS, kubelet and auto-repair; the GCE compute fleet
+# audit on a DaemonSet with host mount propagation (nothing planted and no
+# fixture declared; the shape lands with its check). A declared gap, expected_fail: no check reads a DaemonSet's
+# mount propagation or a node's mount count; the gap is #5408 (the reader is
+# planned in #2581).
+./tasks/node-mount-table-leak-exhaustion/task.yaml
+# Capability row: node OS, kubelet and auto-repair; the GCE compute fleet
+# audit on a node's conntrack table at 80 percent of nf_conntrack_max
+# (nothing planted, no fixture declared, and no honest plant until a
+# reader exists). A declared gap,
+# expected_fail: no stream reads node conntrack counts; the gap is #5409
+# (the reader is planned in #2581).
+./tasks/node-nf-conntrack-table-saturation/task.yaml
+# Capability row: node OS, kubelet and auto-repair; the GCE compute fleet
+# audit on a multi-process workload on a pool with no pod PID limit (the
+# fleet's multi-process-worker in seeded-shapes on slot a, role
+# multi-process-container; nothing new planted). A declared gap,
+# expected_fail: no check reads a pool's kubelet PID limit against the
+# workloads it hosts; the gap is #5410 (the reader is planned in #2581).
+./tasks/node-pid-pressure-fork-exhaustion/task.yaml
