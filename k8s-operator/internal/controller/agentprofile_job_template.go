@@ -18,6 +18,8 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	goerrors "errors"
 	"fmt"
@@ -281,16 +283,56 @@ func dispatchJobParamLabels(agent *agentv1alpha1.PlatformAgent) map[string]strin
 
 // buildDispatchJobTemplate is profile's param: its Job template, defaulted
 // as the API server defaults a pod template (defaultedJobTemplate).
-func buildDispatchJobTemplate(agent *agentv1alpha1.PlatformAgent, profile string, defaulted *corev1.PodTemplateSpec) (*agentv1alpha1.DispatchJobTemplate, error) {
+func buildDispatchJobTemplate(agent *agentv1alpha1.PlatformAgent, profile string, rendered, defaulted *corev1.PodTemplateSpec) (*agentv1alpha1.DispatchJobTemplate, error) {
 	raw, err := json.Marshal(defaulted)
 	if err != nil {
 		return nil, err
 	}
 	return &agentv1alpha1.DispatchJobTemplate{
-		TypeMeta:   metav1.TypeMeta{APIVersion: agentv1alpha1.GroupVersion.String(), Kind: "DispatchJobTemplate"},
-		ObjectMeta: metav1.ObjectMeta{Name: dispatchJobTemplatePrefix + profile, Namespace: profileNamespaceName(agent), Labels: dispatchJobParamLabels(agent)},
-		Spec:       agentv1alpha1.DispatchJobTemplateSpec{Template: &runtime.RawExtension{Raw: raw}},
+		TypeMeta: metav1.TypeMeta{APIVersion: agentv1alpha1.GroupVersion.String(), Kind: "DispatchJobTemplate"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: dispatchJobTemplatePrefix + profile, Namespace: profileNamespaceName(agent), Labels: dispatchJobParamLabels(agent),
+			Annotations: map[string]string{dispatchJobTemplateHashAnnotation: dispatchJobTemplateHash(rendered)},
+		},
+		Spec: agentv1alpha1.DispatchJobTemplateSpec{Template: &runtime.RawExtension{Raw: raw}},
 	}, nil
+}
+
+// dispatchJobTemplateResource is the DispatchJobTemplate CRD's plural, as an
+// RBAC rule names it.
+const dispatchJobTemplateResource = "dispatchjobtemplates"
+
+// dispatchJobTemplateHashAnnotation is lib.DispatchJobTemplateHashAnnotation:
+// which rendering of a profile's template its param holds, which the dispatch
+// config's reference names (the operator can't import lib).
+const dispatchJobTemplateHashAnnotation = "kubeagents.x-k8s.io/dispatch-template-hash"
+
+// dispatchJobTemplateHashLength is how many hex digits of the rendering's
+// sha256 the hash keeps: enough that two renderings don't meet, and short
+// enough for an annotation a person reads.
+const dispatchJobTemplateHashLength = 16
+
+// dispatchJobTemplateHash is a profile's rendered (not defaulted) template's
+// hash. The param and the config's reference both carry it, from the one
+// rendering, so a param the config has moved past doesn't match. Defaulting
+// is the API server's and is left out: it is the same object the policy
+// holds either way.
+func dispatchJobTemplateHash(rendered *corev1.PodTemplateSpec) string {
+	raw, err := json.Marshal(rendered)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])[:dispatchJobTemplateHashLength]
+}
+
+// dispatchJobTemplateRef is the dispatch config's reference to a profile's
+// param, or nil when it has no template.
+func dispatchJobTemplateRef(profile string, rendered *corev1.PodTemplateSpec) *a2aDispatchJobTemplateRef {
+	if rendered == nil {
+		return nil
+	}
+	return &a2aDispatchJobTemplateRef{Name: dispatchJobTemplatePrefix + profile, Hash: dispatchJobTemplateHash(rendered)}
 }
 
 // buildDispatchJobIndex is the index param: the ServiceAccounts the
@@ -345,11 +387,13 @@ func (r *PlatformAgentReconciler) defaultedJobTemplate(ctx context.Context, ns, 
 }
 
 // buildA2ADispatcherJobsRole lets the dispatcher run unattended tasks as
-// Jobs in the profile namespace: create, read and delete jobs, nothing else
-// (its pod-read Role covers pods). No update or patch, so the admission
-// policy on CREATE is the whole of what it can shape, and no podtemplate
-// verb, so it can't touch the policy's params. Marked by the agent's labels,
-// as the pod-read Role is.
+// Jobs in the profile namespace: create, read and delete jobs, and get the
+// DispatchJobTemplates the dispatch config names a profile's template by
+// (its pod-read Role covers pods). No update or patch on jobs, so the
+// admission policy on CREATE is the whole of what it can shape, and no write
+// verb on the policy's params, so it reads them and can't change them. Get
+// only, by name: it reads the one its config names when it launches a Job.
+// Marked by the agent's labels, as the pod-read Role is.
 func buildA2ADispatcherJobsRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
 	return &rbacv1.Role{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "Role"},
@@ -358,6 +402,10 @@ func buildA2ADispatcherJobsRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role
 			APIGroups: []string{"batch"},
 			Resources: []string{"jobs"},
 			Verbs:     []string{"create", "get", "list", "watch", "delete"},
+		}, {
+			APIGroups: []string{agentv1alpha1.GroupVersion.Group},
+			Resources: []string{dispatchJobTemplateResource},
+			Verbs:     []string{"get"},
 		}},
 	}
 }
@@ -435,7 +483,7 @@ func (r *PlatformAgentReconciler) reconcileDispatchJobParams(ctx context.Context
 		if err != nil {
 			return err
 		}
-		param, err := buildDispatchJobTemplate(agent, name, defaulted)
+		param, err := buildDispatchJobTemplate(agent, name, templates[name], defaulted)
 		if err != nil {
 			return err
 		}

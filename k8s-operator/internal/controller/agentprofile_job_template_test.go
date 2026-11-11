@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"slices"
 	"sort"
 	"strconv"
@@ -99,7 +100,8 @@ func TestTheIndexIsSentWithoutATemplate(t *testing.T) {
 	}
 	// A template param sends no serviceAccounts key: a null is refused as
 	// not an array (found live too).
-	param, err := buildDispatchJobTemplate(a2aTestAgent(), "tse", &corev1.PodTemplateSpec{Spec: corev1.PodSpec{ServiceAccountName: "agentprofile-tse-unattended"}})
+	tmpl := &corev1.PodTemplateSpec{Spec: corev1.PodSpec{ServiceAccountName: "agentprofile-tse-unattended"}}
+	param, err := buildDispatchJobTemplate(a2aTestAgent(), "tse", tmpl, tmpl)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,17 +152,24 @@ func TestTheJobTemplateInTheConfigIsThePolicysParam(t *testing.T) {
 	if err := json.Unmarshal([]byte(cm.Data[a2aDispatchConfigKey]), &cfg); err != nil {
 		t.Fatal(err)
 	}
-	var inConfig *corev1.PodTemplateSpec
+	var ref *a2aDispatchJobTemplateRef
 	for _, p := range cfg.Profiles {
 		switch {
 		case p.Name == "tse":
-			inConfig = p.JobTemplate
-		case p.JobTemplate != nil:
+			ref = p.JobTemplateRef
+		case p.JobTemplateRef != nil:
 			t.Errorf("profile %s, which doesn't allow the unattended tier, has a Job template", p.Name)
 		}
 	}
-	if inConfig == nil {
-		t.Fatal("the unattended profile has no Job template in the dispatch config")
+	if ref == nil {
+		t.Fatal("the unattended profile names no Job template in the dispatch config")
+	}
+	if ref.Name != dispatchJobTemplatePrefix+"tse" {
+		t.Errorf("the config names %s, want the policy's param for tse", ref.Name)
+	}
+	inConfig := dispatchJobTemplates(agent, profiles, false)["tse"]
+	if strings.Contains(cm.Data[a2aDispatchConfigKey], "containers") {
+		t.Error("the dispatch config carries a pod template; it should name the param instead")
 	}
 
 	var param agentv1alpha1.DispatchJobTemplate
@@ -170,6 +179,9 @@ func TestTheJobTemplateInTheConfigIsThePolicysParam(t *testing.T) {
 	held, ok := dispatchJobParamTemplate(&param)
 	if !ok {
 		t.Fatalf("the param holds no template: %s", param.Spec.Template.Raw)
+	}
+	if got := param.Annotations[dispatchJobTemplateHashAnnotation]; got == "" || got != ref.Hash {
+		t.Errorf("the param carries rendering %q, the config names %q: the dispatcher would hold every task", got, ref.Hash)
 	}
 	// The fake client's dry run doesn't default, so the param equals the
 	// config's template here; on a real API server it is that, defaulted.
@@ -246,9 +258,11 @@ func TestAForeignTemplateUnderAParamNameIsRefused(t *testing.T) {
 	}
 }
 
-// Param custody: no Role the dispatcher renders grants a podtemplate verb,
-// so neither the dispatcher nor a worker can write the policy's params. The
-// Jobs Role is jobs alone, with no update or patch.
+// Param custody: no Role the dispatcher renders grants a podtemplate verb
+// or a write on the policy's params, so neither the dispatcher nor a worker
+// can change them. The Jobs Role is exactly jobs, with no update or patch,
+// and get on the params, by which the dispatcher reads the template its
+// config names.
 func TestNoDispatcherRoleCanWriteThePolicysParams(t *testing.T) {
 	agent := a2aTestAgent()
 	r, c := jobTemplateTestReconciler(t, agent)
@@ -265,19 +279,18 @@ func TestNoDispatcherRoleCanWriteThePolicysParams(t *testing.T) {
 	}
 	for _, role := range roles.Items {
 		for _, rule := range role.Rules {
-			if slices.Contains(rule.Resources, "podtemplates") || slices.Contains(rule.Resources, "dispatchjobtemplates") || slices.Contains(rule.Resources, "*") {
+			if slices.Contains(rule.Resources, "podtemplates") || slices.Contains(rule.Resources, "*") ||
+				(slices.Contains(rule.Resources, "dispatchjobtemplates") && !slices.Equal(rule.Verbs, []string{"get"})) {
 				t.Errorf("Role %s/%s grants %v on %v", role.Namespace, role.Name, rule.Verbs, rule.Resources)
 			}
 		}
 	}
-	jobs := buildA2ADispatcherJobsRole(agent)
-	if len(jobs.Rules) != 1 || !slices.Equal(jobs.Rules[0].Resources, []string{"jobs"}) {
-		t.Fatalf("the Jobs Role's rules are %+v, want jobs alone", jobs.Rules)
+	want := []rbacv1.PolicyRule{
+		{APIGroups: []string{"batch"}, Resources: []string{"jobs"}, Verbs: []string{"create", "get", "list", "watch", "delete"}},
+		{APIGroups: []string{"kubeagents.x-k8s.io"}, Resources: []string{"dispatchjobtemplates"}, Verbs: []string{"get"}},
 	}
-	for _, v := range jobs.Rules[0].Verbs {
-		if v == "update" || v == "patch" || v == "*" {
-			t.Errorf("the Jobs Role grants %s: the policy checks CREATE, so a Job must not be reshaped after it", v)
-		}
+	if got := buildA2ADispatcherJobsRole(agent).Rules; !reflect.DeepEqual(got, want) {
+		t.Fatalf("the Jobs Role's rules are %+v, want exactly %+v", got, want)
 	}
 }
 
@@ -323,7 +336,7 @@ func TestNoJobModeWithoutTheAdmissionPolicy(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, p := range cfg.Profiles {
-		if p.JobTemplate != nil {
+		if p.JobTemplateRef != nil {
 			t.Errorf("profile %s has a Job template without the signal", p.Name)
 		}
 	}
@@ -332,21 +345,36 @@ func TestNoJobModeWithoutTheAdmissionPolicy(t *testing.T) {
 	}
 }
 
-// The cross-module fixture for Job mode: the dispatch config with an
-// unattended profile's Job template and the Job labels, which a2a/dispatch
-// builds a Job from (TestTheRenderedJobConfigBuildsAJob).
-const dispatchJobConfigFixturePath = "../../../a2a/dispatch/testdata/rendered-dispatch-config-jobs.json"
+// The cross-module fixtures for Job mode: the dispatch config naming an
+// unattended profile's Job template, with the Job labels, and the
+// DispatchJobTemplate it names, which a2a/dispatch builds a Job from
+// (TestTheRenderedJobConfigBuildsAJob). The param's template is the
+// rendering itself; on an API server it is that, defaulted.
+const (
+	dispatchJobConfigFixturePath = "../../../a2a/dispatch/testdata/rendered-dispatch-config-jobs.json"
+	dispatchJobParamFixturePath  = "../../../a2a/dispatch/testdata/rendered-dispatch-job-template.json"
+)
 
 func TestRenderedDispatchJobFixture(t *testing.T) {
 	withDispatcher(t)
 	t.Setenv(a2aDispatcherJobPolicyEnvVar, "true")
 	agent := a2aTestAgent()
 	profiles := []agentv1alpha1.AgentProfile{unattendedProfile(agent, "tse")}
-	cm, err := buildA2ADispatchConfigMapWith(agent, profiles, dispatchJobTemplates(agent, profiles, false), nil)
+	templates := dispatchJobTemplates(agent, profiles, false)
+	cm, err := buildA2ADispatchConfigMapWith(agent, profiles, templates, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	checkFixture(t, dispatchJobConfigFixturePath, cm.Data[a2aDispatchConfigKey])
+	param, err := buildDispatchJobTemplate(agent, "tse", templates["tse"], templates["tse"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.MarshalIndent(param, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkFixture(t, dispatchJobParamFixturePath, string(raw)+"\n")
 }
 
 // An unattended profile that leaves the install drains with no Job
@@ -363,7 +391,7 @@ func TestADrainingProfileHasNoJobTemplate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(applied.Profiles) != 1 || applied.Profiles[0].JobTemplate == nil {
+	if len(applied.Profiles) != 1 || applied.Profiles[0].JobTemplateRef == nil {
 		t.Fatalf("precondition: the live profile renders %+v, want one with a Job template", applied.Profiles)
 	}
 	body, err := json.Marshal(applied)
@@ -375,14 +403,14 @@ func TestADrainingProfileHasNoJobTemplate(t *testing.T) {
 		t.Fatal(err)
 	}
 	draining := drainingDispatchProfiles(&decoded, map[string]bool{}, time.Now())
-	if len(draining) != 1 || draining[0].JobTemplate != nil {
+	if len(draining) != 1 || draining[0].JobTemplateRef != nil {
 		t.Fatalf("the profile that left drains as %+v, want one entry with no Job template", draining)
 	}
 	cfg, err := desiredDispatchConfigWith(agent, nil, templates, draining)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cfg.Profiles) != 1 || cfg.Profiles[0].DrainingUntil.IsZero() || cfg.Profiles[0].JobTemplate != nil {
+	if len(cfg.Profiles) != 1 || cfg.Profiles[0].DrainingUntil.IsZero() || cfg.Profiles[0].JobTemplateRef != nil {
 		t.Errorf("the draining profile renders %+v, want draining with no Job template", cfg.Profiles)
 	}
 }
@@ -1217,7 +1245,7 @@ func TestAProfilePastTheToolLimitGetsNoJobTemplateWithoutImageVolumes(t *testing
 		t.Fatal(err)
 	}
 	for _, p := range cfg.Profiles {
-		if p.Name == "big" && p.JobTemplate != nil {
+		if p.Name == "big" && p.JobTemplateRef != nil {
 			t.Error("the dispatch config names a Job template for a profile past the tool limit")
 		}
 	}

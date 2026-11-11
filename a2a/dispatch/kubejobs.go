@@ -36,20 +36,78 @@ const (
 )
 
 // KubeJobs is the binary's JobRunner: one Job per unattended task in the
-// profile namespace, from the profile's JobTemplate in the dispatch config.
-// The template is used exactly as the operator rendered it, since the Job
-// admission policy admits only that; the Job gets a name, the config's
+// profile namespace, from the profile's Job template. The template is the
+// DispatchJobTemplate the config names (JobTemplateRef), read when the Job is
+// launched, or the copy inline in the config from an operator that predates
+// the reference. It is used exactly as the operator rendered it, since the
+// Job admission policy admits only that; the Job gets a name, the config's
 // jobLabels, and the shape the policy requires (backoffLimit 0, one pod, a
 // deadline, a TTL). The pod the task is offered to is the Job's own, by
 // name, so the confirm's credentials bind to that pod, never to the Job.
 type KubeJobs struct {
 	kube   kubernetes.Interface
 	config func() lib.DispatchConfig
+	// getTemplate reads a DispatchJobTemplate's JSON; getJobTemplate by
+	// default, a stand-in in tests.
+	getTemplate func(ctx context.Context, namespace, name string) ([]byte, error)
 }
 
 // NewKubeJobs returns a JobRunner reading the current config from config.
 func NewKubeJobs(kube kubernetes.Interface, config func() lib.DispatchConfig) *KubeJobs {
-	return &KubeJobs{kube: kube, config: config}
+	k := &KubeJobs{kube: kube, config: config}
+	k.getTemplate = k.getJobTemplate
+	return k
+}
+
+// dispatchJobTemplatePath is a DispatchJobTemplate's path on the API server.
+// The CRD's Go type lives in the operator's module, so it is read as JSON.
+const dispatchJobTemplatePath = "/apis/kubeagents.x-k8s.io/v1alpha1/namespaces/%s/dispatchjobtemplates/%s"
+
+// ErrJobTemplateNotCurrent marks a Launch whose profile's DispatchJobTemplate
+// is missing or holds a rendering other than the one the config names: an
+// operator pass may be under way. The task stays queued.
+var ErrJobTemplateNotCurrent = errors.New("the profile's DispatchJobTemplate is not the rendering the dispatch config names")
+
+func (k *KubeJobs) getJobTemplate(ctx context.Context, namespace, name string) ([]byte, error) {
+	return k.kube.Discovery().RESTClient().Get().AbsPath(fmt.Sprintf(dispatchJobTemplatePath, namespace, name)).DoRaw(ctx)
+}
+
+// jobTemplate is prof's pod template: from the DispatchJobTemplate its
+// reference names, only while that object carries the reference's hash, or
+// from the inline copy an older operator sends.
+func (k *KubeJobs) jobTemplate(ctx context.Context, namespace string, prof *lib.DispatchProfile) (json.RawMessage, error) {
+	ref := prof.JobTemplateRef
+	if ref == nil {
+		return prof.JobTemplate, nil
+	}
+	raw, err := k.getTemplate(ctx, namespace, ref.Name)
+	if apierrors.IsNotFound(err) {
+		return nil, fmt.Errorf("%w: profile %s's %s is not there", ErrJobTemplateNotCurrent, prof.Name, ref.Name)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read profile %s's Job template %s: %w", prof.Name, ref.Name, err)
+	}
+	var obj struct {
+		Metadata struct {
+			Annotations map[string]string `json:"annotations"`
+		} `json:"metadata"`
+		Spec struct {
+			Template json.RawMessage `json:"template"`
+		} `json:"spec"`
+	}
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return nil, fmt.Errorf("profile %s's Job template %s: %w", prof.Name, ref.Name, err)
+	}
+	if got := obj.Metadata.Annotations[lib.DispatchJobTemplateHashAnnotation]; got != ref.Hash {
+		return nil, fmt.Errorf("%w: profile %s's %s holds rendering %q, the config names %q", ErrJobTemplateNotCurrent, prof.Name, ref.Name, got, ref.Hash)
+	}
+	// Checked here, per profile, where the inline copy is checked in the
+	// config's Validate: a bad param holds its own profile's tasks, not
+	// every profile's config.
+	if !lib.PodTemplateWithContainers(obj.Spec.Template) {
+		return nil, fmt.Errorf("profile %s's %s holds no pod template with containers", prof.Name, ref.Name)
+	}
+	return obj.Spec.Template, nil
 }
 
 // JobName is the task's Job name: a hash of its key, so it is the same after
@@ -70,7 +128,20 @@ const jobPolicyName = "kube-agents-a2a-dispatcher-job"
 
 func (k *KubeJobs) Launch(ctx context.Context, profile, tier, taskID string) (time.Time, error) {
 	cfg := k.config()
-	job, err := buildJob(cfg, profile, tier, taskID)
+	var prof *lib.DispatchProfile
+	for i := range cfg.Profiles {
+		if cfg.Profiles[i].Name == profile {
+			prof = &cfg.Profiles[i]
+		}
+	}
+	if prof == nil || !prof.HasJobTemplate() {
+		return time.Time{}, fmt.Errorf("profile %s has no Job template in the dispatch config", profile)
+	}
+	tmpl, err := k.jobTemplate(ctx, cfg.ProfileNamespace, prof)
+	if err != nil {
+		return time.Time{}, err
+	}
+	job, err := buildJob(cfg, prof, tmpl, tier, taskID)
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -90,19 +161,12 @@ func (k *KubeJobs) Launch(ctx context.Context, profile, tier, taskID string) (ti
 	return time.Time{}, err
 }
 
-// buildJob is the task's Job from cfg. The template is not touched.
-func buildJob(cfg lib.DispatchConfig, profile, tier, taskID string) (*batchv1.Job, error) {
-	var prof *lib.DispatchProfile
-	for i := range cfg.Profiles {
-		if cfg.Profiles[i].Name == profile {
-			prof = &cfg.Profiles[i]
-		}
-	}
-	if prof == nil || len(prof.JobTemplate) == 0 {
-		return nil, fmt.Errorf("profile %s has no Job template in the dispatch config", profile)
-	}
+// buildJob is the task's Job from cfg and prof's template. The template is
+// not touched.
+func buildJob(cfg lib.DispatchConfig, prof *lib.DispatchProfile, template json.RawMessage, tier, taskID string) (*batchv1.Job, error) {
+	profile := prof.Name
 	var tmpl corev1.PodTemplateSpec
-	if err := json.Unmarshal(prof.JobTemplate, &tmpl); err != nil {
+	if err := json.Unmarshal(template, &tmpl); err != nil {
 		return nil, fmt.Errorf("profile %s's Job template: %w", profile, err)
 	}
 	labels := maps.Clone(cfg.JobLabels)

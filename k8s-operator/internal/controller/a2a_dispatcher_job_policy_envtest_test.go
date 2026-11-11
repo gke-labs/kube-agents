@@ -462,7 +462,7 @@ func envtestParam(ctx context.Context, t *testing.T, c client.Client, agent *age
 	if err != nil {
 		t.Fatal(err)
 	}
-	param, err := buildDispatchJobTemplate(agent, profile, defaulted)
+	param, err := buildDispatchJobTemplate(agent, profile, tmpl, defaulted)
 	if err != nil {
 		t.Fatal(err)
 	}

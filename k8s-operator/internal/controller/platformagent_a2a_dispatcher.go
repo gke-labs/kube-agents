@@ -523,6 +523,12 @@ type a2aDispatchConfig struct {
 	JobLabels map[string]string `json:"jobLabels,omitempty"`
 }
 
+// a2aDispatchJobTemplateRef is lib.DispatchJobTemplateRef.
+type a2aDispatchJobTemplateRef struct {
+	Name string `json:"name"`
+	Hash string `json:"hash"`
+}
+
 type a2aDispatchProfile struct {
 	Name                  string               `json:"name"`
 	Tiers                 []string             `json:"tiers"`
@@ -531,10 +537,13 @@ type a2aDispatchProfile struct {
 	ActiveDeadlineSeconds int                  `json:"activeDeadlineSeconds"`
 	Parameters            []a2aCardParameter   `json:"parameters,omitempty"`
 	Durables              []a2aDispatchDurable `json:"durables"`
-	// JobTemplate is the pod template the dispatcher stamps the profile's
-	// unattended Jobs from (lib.DispatchProfile.JobTemplate), set only for a
-	// profile allowing the unattended tier (agentprofile_job_template.go).
-	JobTemplate *corev1.PodTemplateSpec `json:"jobTemplate,omitempty"`
+	// JobTemplateRef names the DispatchJobTemplate the dispatcher stamps the
+	// profile's unattended Jobs from, and the rendering it holds
+	// (lib.DispatchProfile.JobTemplateRef), set only for a profile allowing
+	// the unattended tier (agentprofile_job_template.go). The template
+	// itself isn't copied in: a two-tier profile's would be most of the
+	// config's bytes, and the param already holds it.
+	JobTemplateRef *a2aDispatchJobTemplateRef `json:"jobTemplateRef,omitempty"`
 	// DrainingUntil is lib.DispatchProfile's (#5074): set on a profile that
 	// has left the install, which is listed with no durables until then.
 	DrainingUntil time.Time `json:"drainingUntil,omitzero"`
@@ -630,7 +639,7 @@ func desiredDispatchConfigWith(agent *agentv1alpha1.PlatformAgent, profiles []ag
 			QueueTimeoutSeconds:   int(p.QueueTimeout()),
 			ActiveDeadlineSeconds: func() int { d, _ := cappedTaskDeadline(agent, p); return d }(),
 			Durables:              []a2aDispatchDurable{},
-			JobTemplate:           jobTemplates[p.Name],
+			JobTemplateRef:        dispatchJobTemplateRef(p.Name, jobTemplates[p.Name]),
 		}
 		for _, param := range p.Spec.Parameters {
 			dp.Parameters = append(dp.Parameters, a2aCardParameter{Name: param.Name, Required: param.Required})

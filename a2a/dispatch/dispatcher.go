@@ -750,7 +750,7 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 	// didn't install the Job admission policy) the task goes to the (profile,
 	// tier)'s pool. The operator builds pools for the read tier only, so an
 	// unattended task with no pool pod was refused at admission (noRunner).
-	if h.unattended && d.jobs != nil && len(prof.JobTemplate) > 0 {
+	if h.unattended && d.jobs != nil && prof.HasJobTemplate() {
 		h.onJob = true
 		var ended bool
 		rec, key, ended, err = d.runJob(ctx, log, del, snap, prof, h)

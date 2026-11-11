@@ -459,6 +459,15 @@ leave open:
   is deleted, and the task fails `no-worker`. Jobs count against the same caps. The Job is
   deleted when the task's outcome is settled, never when the dispatcher stops, so a restart
   re-adopts the task.
+  The dispatch config doesn't carry the Job's pod template. It names the profile's
+  `DispatchJobTemplate` in the profile namespace, the param the Job admission policy holds each
+  Job to, and the hash of the rendering it means (`jobTemplateRef`). The dispatcher reads that
+  object when it launches the Job, with `get` alone on those objects, and uses it only while
+  the object's `kubeagents.x-k8s.io/dispatch-template-hash` annotation matches. A param that is
+  missing, behind the config, or holds no containers keeps that profile's task queued and
+  leaves every other profile alone. Copying the template into the config made a two-tier
+  unattended profile's entry about 4.4 KB, which put the config's ConfigMap past 1 MiB at about
+  240 such profiles.
   Without a Job runner or a Job template, an unattended task has no worker (the operator builds
   warm pools for the read tier only), so admission refuses it at once, `no-worker` ("no runner
   for unattended on this install: Job mode is off"), rather than leave it queued until its

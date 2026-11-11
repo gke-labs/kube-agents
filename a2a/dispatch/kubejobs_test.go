@@ -16,6 +16,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
@@ -225,7 +226,7 @@ func TestTheRenderedJobConfigBuildsAJob(t *testing.T) {
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("the rendered config doesn't validate: %v", err)
 	}
-	job, err := buildJob(cfg, "tse", "unattended", "task-1")
+	job, err := renderedFixtureJob(t, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -261,7 +262,7 @@ func TestTheBuiltJobMatchesTheAdmissionFixture(t *testing.T) {
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		t.Fatal(err)
 	}
-	job, err := buildJob(cfg, "tse", "unattended", "task-1")
+	job, err := renderedFixtureJob(t, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -348,5 +349,78 @@ func TestAPolicyRefusalIsTold(t *testing.T) {
 				t.Errorf("err %v: refused-by-policy %v, want %v", err, errors.Is(err, ErrJobRefusedByPolicy), c.want)
 			}
 		})
+	}
+}
+
+// renderedFixtureJob builds tse's Job from cfg the way Launch does, reading
+// the template from the operator's rendered DispatchJobTemplate fixture.
+func renderedFixtureJob(t *testing.T, cfg lib.DispatchConfig) (*batchv1.Job, error) {
+	t.Helper()
+	param, err := os.ReadFile("testdata/rendered-dispatch-job-template.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	k := &KubeJobs{config: func() lib.DispatchConfig { return cfg }, getTemplate: func(_ context.Context, ns, name string) ([]byte, error) {
+		if ns != cfg.ProfileNamespace || name != "kube-agents-dispatch-job-profile-tse" {
+			t.Fatalf("read %s/%s, want the param the config names", ns, name)
+		}
+		return param, nil
+	}}
+	prof := &cfg.Profiles[0]
+	tmpl, err := k.jobTemplate(context.Background(), cfg.ProfileNamespace, prof)
+	if err != nil {
+		return nil, err
+	}
+	return buildJob(cfg, prof, tmpl, "unattended", "task-1")
+}
+
+// A config that names a template reads it from the param only while the
+// param carries the rendering the config names: a param from another
+// rendering, or none, holds the launch with ErrJobTemplateNotCurrent, and no
+// Job is built. The inline copy an older operator sends is used as it is.
+func TestTheJobTemplateIsReadOnlyWhenItIsTheConfigsRendering(t *testing.T) {
+	ref := &lib.DispatchJobTemplateRef{Name: "kube-agents-dispatch-job-profile-tse", Hash: "aaaa"}
+	param := func(hash string) []byte {
+		return []byte(`{"metadata":{"annotations":{"` + lib.DispatchJobTemplateHashAnnotation + `":"` + hash + `"}},"spec":{"template":{"spec":{"containers":[{"name":"w"}]}}}}`)
+	}
+	cases := []struct {
+		name    string
+		get     func() ([]byte, error)
+		current bool
+	}{
+		{"current", func() ([]byte, error) { return param("aaaa"), nil }, true},
+		{"another rendering", func() ([]byte, error) { return param("bbbb"), nil }, false},
+		{"no hash", func() ([]byte, error) {
+			return []byte(`{"spec":{"template":{"spec":{"containers":[{"name":"w"}]}}}}`), nil
+		}, false},
+		{"no containers", func() ([]byte, error) {
+			return []byte(`{"metadata":{"annotations":{"` + lib.DispatchJobTemplateHashAnnotation + `":"aaaa"}},"spec":{"template":{"spec":{}}}}`), nil
+		}, false},
+		{"missing", func() ([]byte, error) {
+			return nil, apierrors.NewNotFound(schema.GroupResource{Group: "kubeagents.x-k8s.io", Resource: "dispatchjobtemplates"}, ref.Name)
+		}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			k := &KubeJobs{getTemplate: func(context.Context, string, string) ([]byte, error) { return c.get() }}
+			tmpl, err := k.jobTemplate(context.Background(), "ns", &lib.DispatchProfile{Name: "tse", JobTemplateRef: ref})
+			if c.current {
+				if err != nil || len(tmpl) == 0 {
+					t.Fatalf("template %s, err %v: want the param's", tmpl, err)
+				}
+				return
+			}
+			if err == nil || (c.name != "no containers" && !errors.Is(err, ErrJobTemplateNotCurrent)) {
+				t.Fatalf("err %v, want the launch held", err)
+			}
+		})
+	}
+	inline := json.RawMessage(`{"spec":{"containers":[{"name":"w"}]}}`)
+	k := &KubeJobs{getTemplate: func(context.Context, string, string) ([]byte, error) {
+		t.Fatal("an inline template was looked up")
+		return nil, nil
+	}}
+	if tmpl, err := k.jobTemplate(context.Background(), "ns", &lib.DispatchProfile{Name: "tse", JobTemplate: inline}); err != nil || string(tmpl) != string(inline) {
+		t.Fatalf("inline template %s, err %v: want it as sent", tmpl, err)
 	}
 }

@@ -1811,7 +1811,7 @@ The one case it is neither written nor removed is version skew, a `spec.mode` th
 
 ### What `DispatcherJobMode` reports
 
-`DispatcherJobMode` says whether the profile dispatcher runs unattended profile tasks as Jobs. Job mode needs the dispatcher Job admission policy and its binding in the cluster as the chart renders them, the profile namespace selected by that binding, and the dispatcher holding its Jobs Role there. Without it, unattended tasks have no worker and the dispatcher refuses them at admission (`no-worker`). The operator also records a `DispatcherJobPolicyMissing` Warning Event on each pass the policy or the namespace selection fails, but Events expire; the condition stays.
+`DispatcherJobMode` says whether the profile dispatcher runs unattended profile tasks as Jobs. Job mode needs the dispatcher Job admission policy and its binding in the cluster as the chart renders them, the profile namespace selected by that binding, and the dispatcher holding its Jobs Role there. That Role grants create, read and delete on Jobs, and `get` on the `DispatchJobTemplate` objects it builds each Job from. Without it, unattended tasks have no worker and the dispatcher refuses them at admission (`no-worker`). The operator also records a `DispatcherJobPolicyMissing` Warning Event on each pass the policy or the namespace selection fails, but Events expire; the condition stays.
 
 **Reasons.**
 
