@@ -8,8 +8,9 @@ looking at it depends on the cluster as it is when the pull request opens, not
 as the audit read it hours earlier, so this reads the workload's namespace
 once more and answers three questions:
 
-- `replicas-ready`: the workload asks for at least two replicas, all of them
-  Ready, in a status that has caught up with its spec. With one replica the
+- `replicas-ready`: the workload asks for at least two replicas (and an
+  autoscaler that owns it cannot go below two), all of them Ready, in a
+  status that has caught up with its spec. With one replica the
   budget leaves a drain taking the only pod, and pods that are not Ready count
   as already disrupted, so the budget permits no eviction and blocks drains.
 - `no-overlapping-budget`: no live PodDisruptionBudget already selects the
@@ -23,12 +24,13 @@ unanswered check makes it ineligible and nothing else: the pull request still
 opens, for a person to review. The answer is rendered into the body
 (`render_section`) and carried in a hidden marker the auto-merge path reads.
 
-The read is `recheck.read_target`, the on-demand re-check's own, pinned to the
-finding's cluster. The install's declared scope is not re-applied there:
-the caller has no scope flags, so a cluster is read only when this run's
-collector manifest shows it read (`check_fix`'s `in_manifest`). The workload
-is found by `recheck.in_scope_workload`, so the audit's workload filters
-(S1-S5) hold here too.
+The read is `recheck.read_target`, the on-demand re-check's own (plus Jobs
+and CronJobs, see `READ`), pinned to the finding's cluster. The install's
+declared scope is not re-applied there: the caller has no scope flags, so a
+cluster is read only when this run's collector manifest shows it read
+(`check_fix`'s `in_manifest`). The workload is found by
+`recheck.in_scope_workload`, so the audit's workload filters (S1-S5) hold
+here too.
 
 Nothing runs this unless the install's `KUBEAGENTS_AUTOMERGE` switch is not
 `off` (`audit_report.open_remediation_pr`).
@@ -55,6 +57,10 @@ NO_OVERLAPPING_BUDGET = "no-overlapping-budget"
 SELECTOR_MATCHES = "selector-matches"
 CHECK_NAMES = (REPLICAS_READY, NO_OVERLAPPING_BUDGET, SELECTOR_MATCHES)
 MIN_REPLICAS = 2
+# The re-check's own read plus Jobs and CronJobs: a budget that also selects a
+# Job's pods permits no evictions (`collect.check_no_pdb` withholds the
+# selector for that reason), so `selector-matches` has to see them.
+READ = recheck.RECHECKS[CHECK_ID]._replace(kinds=recheck.RECHECKS[CHECK_ID].kinds + ",cronjobs,jobs")
 SECTION_HEADING = "## Safety checks"
 # For the auto-merge path, which nothing reads yet. Written only by this
 # harness, last in its section, into a body it renders; the body's other
@@ -133,6 +139,10 @@ def judge(target: recheck.Target, selector: dict, dump: dict) -> list[dict]:
     raw = _raw_item(dump, workload)
     status = raw.get("status") or {}
     wanted = workload["spec"].get("replicas", 1) or 1
+    # An autoscaler can take the workload down to its floor after this read,
+    # so the floor is what has to reach MIN_REPLICAS (as `blocking-pdb` does).
+    hpa = collect._hpa_targeting(workload, subject.context)
+    floor = ((hpa.get("spec") or {}).get("minReplicas") or collect.DEFAULT_HPA_MIN_REPLICAS) if hpa else wanted
     ready = int(status.get("readyReplicas") or 0)
     generation = (raw.get("metadata") or {}).get("generation")
     observed = status.get("observedGeneration")
@@ -141,8 +151,9 @@ def judge(target: recheck.Target, selector: dict, dump: dict) -> list[dict]:
     results = [
         _result(
             REPLICAS_READY,
-            wanted >= MIN_REPLICAS and ready >= wanted and not stale,
+            min(wanted, floor) >= MIN_REPLICAS and ready >= wanted and not stale,
             f"{target.object}: replicas={wanted}, ready={ready}"
+            + (f", autoscaler floor={floor}" if hpa else "")
             + (f", status from generation {observed} of {generation}" if stale else ""),
         )
     ]
@@ -240,7 +251,7 @@ def check_fix(
     # The collector's read of this cluster already applied the install's scope.
     scope = collect.fleet_scope_args.DeclaredScope()
     dump, command, reason = recheck.read_target(
-        target, recheck.RECHECKS[CHECK_ID], run=run, kubeconfig=kubeconfig, kube_context=kube_context, scope=scope
+        target, READ, run=run, kubeconfig=kubeconfig, kube_context=kube_context, scope=scope
     )
     answer["command"] = command
     answer["checks"] = _unanswered(reason) if dump is None else judge(target, selector, dump)

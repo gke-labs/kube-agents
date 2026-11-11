@@ -388,7 +388,7 @@ def read_target(
             return None, "", f"get-credentials for {target.cluster} failed (rc={cred_run.rc}: {stderr}), so nothing was read"
         kubeconfig = str(fetched)
     argv = read_argv(spec, target.namespace, expected)
-    command = (f"KUBECONFIG={kubeconfig} " if kubeconfig else "") + shlex.join(argv)
+    command = (f"KUBECONFIG={shlex.quote(kubeconfig)} " if kubeconfig else "") + shlex.join(argv)
     env = {**os.environ, "KUBECONFIG": kubeconfig} if kubeconfig else dict(os.environ)
     result = (run or collect.default_run)(argv, env=env, timeout=READ_TIMEOUT_S)
     dump = _gate(result)

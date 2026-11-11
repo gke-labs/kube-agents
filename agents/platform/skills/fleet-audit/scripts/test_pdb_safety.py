@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import audit_report
 import pdb_safety
-from test_recheck import CLUSTER, CTX, LABELS, NS, FakeRun, deployment, pdb
+from test_recheck import CLUSTER, CTX, LABELS, NS, FakeRun, deployment, hpa, pdb
 
 BUDGET_TEXT = audit_report._pdb_manifest(
     {
@@ -102,6 +102,39 @@ class CheckFixTest(unittest.TestCase):
         other = deployment("checkout-canary")
         answer = checked([ready(deployment()), ready(other)])
         self.assertIn("checkout-canary", by_name(answer)[pdb_safety.SELECTOR_MATCHES]["detail"])
+
+    def test_a_selector_reaching_a_job_or_cronjob_is_not_eligible(self):
+        job = {"kind": "Job", "metadata": {"name": "migrate", "namespace": NS}, "spec": {"template": {"metadata": {"labels": LABELS}}}}
+        cron = {
+            "kind": "CronJob",
+            "metadata": {"name": "nightly", "namespace": NS},
+            "spec": {"jobTemplate": {"spec": {"template": {"metadata": {"labels": LABELS}}}}},
+        }
+        for other in (job, cron):
+            with self.subTest(kind=other["kind"]):
+                run = FakeRun([ready(deployment()), other])
+                answer = pdb_safety.check_fix(finding(), BUDGET_TEXT, in_manifest=True, run=run, kube_context=CTX)
+                self.assertIn("cronjobs,jobs", run.calls[0][0][2])
+                self.assertIn(other["metadata"]["name"], by_name(answer)[pdb_safety.SELECTOR_MATCHES]["detail"])
+                self.assertFalse(answer["eligible"])
+
+    def test_an_autoscaler_floor_below_two_is_not_eligible(self):
+        for floor, eligible in ((None, False), (1, False), (2, True)):
+            with self.subTest(floor=floor):
+                autoscaler = hpa(min_replicas=floor)
+                if floor is None:
+                    del autoscaler["spec"]["minReplicas"]
+                answer = checked([ready(deployment()), autoscaler])
+                self.assertEqual(answer["eligible"], eligible, answer)
+                self.assertIn(f"autoscaler floor={floor or 1}", by_name(answer)[pdb_safety.REPLICAS_READY]["detail"])
+
+    def test_a_kubeconfig_path_with_a_space_or_quote_is_dropped_whole(self):
+        for path in ("/home/jane doe/.kubeconfigs/kc.yaml", "/home/o'neil/kc.yaml"):
+            with self.subTest(path=path):
+                answer = pdb_safety.check_fix(finding(), BUDGET_TEXT, in_manifest=True, run=FakeRun([ready(deployment())]), kubeconfig=path)
+                shown = pdb_safety._shown_command(answer["command"])
+                self.assertTrue(shown.startswith("kubectl get "), shown)
+                self.assertNotIn("kc.yaml", shown)
 
     def test_a_missing_workload_fails_every_check(self):
         answer = checked([])
