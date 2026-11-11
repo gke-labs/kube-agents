@@ -34,7 +34,10 @@
 # no IAM role), because no controller watches a namespace without one. The
 # namespace carries kubeagents.x-k8s.io/stall-watch: exempt, so the install's
 # stall watch raises no alert on the object; the audits do not read that
-# annotation. The same declaration, committed to
+# annotation. The eval install excludes the namespace from the k8s event
+# watcher (EVAL_EVENT_WATCHER_EXCLUDED_NAMESPACE in hack/ci-deploy.sh), so a
+# DependencyNotFound event on the object opens no incident. A dev install
+# without that rule can open one. The same declaration, committed to
 # the GitOps repository at clusters/<seeded-a>/provisioning/pinned-inference-pool.yaml,
 # is the file the SOP's fix for the capped, single-zone pool edits. The
 # teardown closes the pull request the run opened on that file (only from the
@@ -71,7 +74,9 @@ infrastructure:
   # kcc_cluster_name, kcc_cluster_location and kcc_google_service_account to
   # a stack that declares bench_gitops_write_token_file (#4742); the pool's
   # Config Connector cluster is seeded-a. Each value below is repeated in the stack's
-  # variables.tf and in the checks below; change one and change all.
+  # variables.tf and in the checks below, and kcc_namespace also in
+  # hack/ci-deploy.sh (EVAL_EVENT_WATCHER_EXCLUDED_NAMESPACE); change one and
+  # change all.
   variables:
     kcc_namespace: "eval-kcc-stalled"
     seeded_slot: "a"

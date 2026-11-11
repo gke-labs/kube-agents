@@ -103,6 +103,18 @@ readonly EVAL_ALERT_DAILY_LIMIT_DRIFT="0"
 # it between them.
 readonly EVAL_INCIDENT_WORKLOAD_DEDUP_SECONDS="150"
 
+# The namespace whose events the k8s event watcher does not forward on an eval
+# install (spec.harness.eventWatcher.alertExclude, a namespace rule on every
+# cluster). bench/tf/prebuilt/kcc-stalled-declaration plants a
+# ContainerNodePool there that Config Connector holds at DependencyNotFound
+# for the whole run. DependencyNotFound is on the watcher's reason list, so
+# without this rule an event on the object opens an incident and a triage card
+# in the middle of the case, and the card can stay for later cases on the same
+# install. The stall watch has its own opt-out, an annotation the stack sets.
+# Equal to the stack's kcc_namespace; tests/test_ci_deploy_mode_next.py holds
+# the two equal.
+readonly EVAL_EVENT_WATCHER_EXCLUDED_NAMESPACE="eval-kcc-stalled"
+
 # The subscription the drift detector pulls from. The pool project's own
 # provisioning owns the resource: scripts/provision_ci_pool_project.sh sets
 # enable_drift_pubsub in the full-install tfvars, and terraform/modules/
@@ -2098,6 +2110,7 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set-string "platformAgent.deployment.env[2].value=${EVAL_INCIDENT_WORKLOAD_DEDUP_SECONDS}" \
     --set-string "platformAgent.deployment.env[3].name=CREDENTIAL_PROXY_VCS_READINGS" \
     --set-string "platformAgent.deployment.env[3].value=off" \
+    --set-string "platformAgent.harness.eventWatcher.alertExclude[0].namespace=${EVAL_EVENT_WATCHER_EXCLUDED_NAMESPACE}" \
     --set "platformAgent.harness.driftDetector.enabled=true" \
     --set-string "platformAgent.harness.driftDetector.subscription=${EVAL_DRIFT_SUBSCRIPTION}" \
     --set "plugins.pubsubPlatform.enabled=true" \

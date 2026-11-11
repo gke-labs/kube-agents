@@ -1135,8 +1135,7 @@
 # 2026-11-10 reads config-connector-namespaced healthy on all 40 pool
 # projects. It has a stack and is not in infra_lock_exempt, so it holds the
 # infra lock; listed in nightly-main-d.txt, the shortest stack chain then.
-# Priced in the stockout audit's band. Nightly from the merge that removes
-# its FIXTURE_NOT_READY entry.
+# Priced in the stockout audit's band. It has no FIXTURE_NOT_READY entry.
 ./tasks/fleet-audit-manifest-fix-names-stalled-config-connector/task.yaml
 
 # An on-demand audit that moved nothing still reports its ledger URL (#1929).

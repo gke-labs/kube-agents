@@ -116,7 +116,11 @@ PROJECT_ANNOTATION = "cnrm.cloud.google.com/project-id"
 # the middle of the case. The fleet audits that the case grades
 # (kcc_health.py, fleet_stockout.py) do not read it, so they still see the
 # object. It goes on the namespace and not on the object, so the declaration
-# file stays the same as the object.
+# file stays the same as the object. The annotation does not stop the k8s
+# event watcher, which forwards DependencyNotFound; the eval install excludes
+# this namespace from the watcher with an alertExclude rule
+# (EVAL_EVENT_WATCHER_EXCLUDED_NAMESPACE in hack/ci-deploy.sh). An install
+# without that rule can open an incident on the object.
 STALL_WATCH_ANNOTATION = "kubeagents.x-k8s.io/stall-watch"
 STALL_WATCH_EXEMPT = "exempt"
 # The labels hack/fleet-kubeconfigs.sh discovers the seeded clusters by.
