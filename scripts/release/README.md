@@ -298,6 +298,12 @@ repository code, and none of it happens automatically.
 | **Model provider**        | `GEMINI_API_KEY` on `rc`                                    | Required. Its own key, so a nightly run cannot exhaust the RC's quota.                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | **Operator plugin suite** | Not run                                                     | New. `operator/agentplugins_e2e_test.py` builds and pushes a plugin image, so the nightly project needs an Artifact Registry repository and the deploy service account needs write access to it. `setup-gcp-github-wif.sh --admin` grants the roles; the repository itself is created by `install.sh`.                                                                                                                                                                                                  |
 
+Slack runs the other way. `SLACK_ENABLED`, `SLACK_HOME_CHANNEL`, `SLACK_BOT_TOKEN`,
+`SLACK_APP_TOKEN` and the three `E2E_SLACK_*` values belong on `rc` only: they serve the optional
+`slack` suite on the RC pipeline's `next` leg
+([`tests/e2e/README.md`](../../tests/e2e/README.md#-slack-e2e-test-testse2eslack_agent_testpy)), which
+the `nightly` suite does not include.
+
 Two things this list deliberately does not cover, because they are not part of the nightly
 pipeline: the `staging` environment, which is a deploy target that nothing tests, and the GA
 release path, which runs from `release-publish.yml` against the release repository.

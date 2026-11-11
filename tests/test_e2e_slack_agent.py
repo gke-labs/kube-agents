@@ -19,9 +19,9 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _SLACK_AGENT_TEST = _REPO_ROOT / "tests" / "e2e" / "slack_agent_test.py"
 _MODULE_NAME = "e2e_slack_agent_test"
 _BOT = "UBOT"
+_TEST_USER = "UTEST"
 _CHANNEL = "C0CI"
 _ASK_TS = "1800000000.000100"
-_ACK_TS = "1800000001.000200"
 _ANSWER_TS = "1800000004.000300"
 
 
@@ -33,12 +33,17 @@ class _Failed(Exception):
     pass
 
 
+def _raise(exc_type):
+    def raiser(reason):
+        raise exc_type(reason)
+    return raiser
+
+
 def _load():
     stub = types.ModuleType("pytest")
     stub.fixture = lambda *a, **k: (lambda f: f)
-    stub.skip = lambda reason: (_ for _ in ()).throw(_Skipped(reason))
-    stub.fail = lambda reason: (_ for _ in ()).throw(_Failed(reason))
-    stub.main = lambda *a, **k: None
+    stub.skip = _raise(_Skipped)
+    stub.fail = _raise(_Failed)
     with mock.patch.dict(sys.modules, {"pytest": stub}), mock.patch.dict("os.environ", {"TEST_TIMEOUT_SEC": "5", "SLACK_POLL_INTERVAL_SEC": "0"}):
         spec = importlib.util.spec_from_file_location(_MODULE_NAME, _SLACK_AGENT_TEST)
         module = importlib.util.module_from_spec(spec)
@@ -49,15 +54,17 @@ def _load():
 MOD = _load()
 
 _HEADLINE_BLOCKS = [{"type": "rich_text", "elements": [{"type": "rich_text_section", "elements": [{"type": "text", "text": "It is 5.", "style": {"bold": True}}]}]}]
+_ANSWER = {"ts": _ANSWER_TS, "user": _BOT, "bot_id": "B1", "text": "*It is 5.*", "blocks": _HEADLINE_BLOCKS}
 
 
 class FakeSlack:
-    """Answers the four methods the test calls, turn by turn: each poll advances one step."""
+    """Answers the three methods the test calls, turn by turn: each thread read advances one step."""
 
-    def __init__(self, steps):
+    def __init__(self, steps, ask_bot_id=""):
         self.steps = steps
         self.polls = 0
         self.posted = []
+        self.ask_bot_id = ask_bot_id
 
     def call(self, method, **params):
         if method == "chat.postMessage":
@@ -69,13 +76,17 @@ class FakeSlack:
             return {"ok": True, "message": {"reactions": reactions}}
         if method == "conversations.replies":
             self.polls += 1
-            return {"ok": True, "messages": [{"ts": _ASK_TS, "user": "UTEST", "text": "ask"}, *step.get("replies", [])]}
+            ask = {"ts": _ASK_TS, "user": _TEST_USER, "text": "ask"}
+            if self.ask_bot_id:
+                ask["bot_id"] = self.ask_bot_id
+            return {"ok": True, "messages": [ask, *step.get("replies", [])]}
         raise AssertionError(method)
 
 
-def _run(fake, expect_headline="true"):
-    env = {"E2E_SLACK_EXPECT_HEADLINE": expect_headline}
-    with mock.patch.dict("os.environ", env), mock.patch.object(MOD.time, "sleep", lambda s: None):
+def _run(fake, mode="next", listed=None):
+    env = {"E2E_SLACK_MODE": mode}
+    with mock.patch.dict("os.environ", env), mock.patch.object(MOD.time, "sleep", lambda s: None), \
+            mock.patch.object(MOD, "gateway_test_users", lambda: listed):
         MOD.test_slack_agent_math_response((fake, _CHANNEL, _BOT))
 
 
@@ -85,40 +96,70 @@ class SlackAgentTestLogic(unittest.TestCase):
             MOD.slack_settings()
         self.assertIn("E2E_SLACK_USER_TOKEN", str(caught.exception))
 
-    def test_refuses_a_bot_token(self):
-        env = {"E2E_SLACK_USER_TOKEN": "xoxb-1", "E2E_SLACK_CHANNEL_ID": _CHANNEL, "E2E_SLACK_BOT_USER_ID": _BOT}
-        with mock.patch.dict("os.environ", env, clear=True), self.assertRaises(_Failed):
+    def test_refuses_a_bot_token_and_takes_a_rotating_user_token(self):
+        base = {"E2E_SLACK_CHANNEL_ID": _CHANNEL, "E2E_SLACK_BOT_USER_ID": _BOT}
+        with mock.patch.dict("os.environ", {**base, "E2E_SLACK_USER_TOKEN": "xoxb-1"}, clear=True), self.assertRaises(_Failed):
             MOD.slack_settings()
+        with mock.patch.dict("os.environ", {**base, "E2E_SLACK_USER_TOKEN": "xoxe.xoxp-1"}, clear=True):
+            _client, channel, bot = MOD.slack_settings()
+        self.assertEqual((_CHANNEL, _BOT), (channel, bot))
 
     def test_a_full_turn_passes_and_mentions_the_bot(self):
-        ack = {"ts": _ACK_TS, "user": _BOT, "bot_id": "B1", "text": "⏳ working"}
-        answer = {"ts": _ANSWER_TS, "user": _BOT, "bot_id": "B1", "text": "*It is 5.*", "blocks": _HEADLINE_BLOCKS}
-        fake = FakeSlack([{"reaction": "eyes", "replies": [ack]}, {"reaction": "eyes", "replies": [ack, answer]}])
+        fake = FakeSlack([{"reaction": "eyes"}, {"reaction": "eyes", "replies": [_ANSWER]}])
         _run(fake)
         self.assertTrue(fake.posted[0]["text"].startswith(f"<@{_BOT}> "))
 
-    def test_a_missed_reaction_fails(self):
-        answer = {"ts": _ANSWER_TS, "user": _BOT, "text": "*It is 5.*", "blocks": _HEADLINE_BLOCKS}
+    def test_no_reaction_is_the_expected_failure_on_next_and_a_failure_on_today(self):
+        step = [{"replies": [_ANSWER]}]
+        _run(FakeSlack(step), mode="next")
         with self.assertRaises(AssertionError) as caught:
-            _run(FakeSlack([{"replies": [answer]}]))
-        self.assertIn("reaction", str(caught.exception))
+            _run(FakeSlack(step), mode="today")
+        self.assertIn("reacted", str(caught.exception))
 
-    def test_a_plain_text_answer_fails_only_where_a_headline_is_expected(self):
+    def test_a_plain_text_answer_fails_only_on_next(self):
         answer = {"ts": _ANSWER_TS, "user": _BOT, "text": "It is 5."}
         step = [{"reaction": "eyes", "replies": [answer]}]
         with self.assertRaises(AssertionError) as caught:
-            _run(FakeSlack(step), expect_headline="true")
+            _run(FakeSlack(step), mode="next")
         self.assertIn("headline", str(caught.exception))
-        _run(FakeSlack(step), expect_headline="false")
+        _run(FakeSlack(step), mode="today")
 
     def test_no_answer_times_out(self):
         with mock.patch.object(MOD, "TEST_TIMEOUT_SEC", 0), self.assertRaises(AssertionError):
             _run(FakeSlack([{"reaction": "eyes"}]))
 
+    def test_preflight_fails_fast_when_the_gateway_does_not_list_the_test_user(self):
+        fake = FakeSlack([{"replies": [_ANSWER]}], ask_bot_id="BDRIVER")
+        with self.assertRaises(_Failed) as caught:
+            _run(fake, listed=[])
+        self.assertIn("operator.slackTestUsers", str(caught.exception))
+        _run(FakeSlack([{"reaction": "eyes", "replies": [_ANSWER]}], ask_bot_id="BDRIVER"), listed=[_TEST_USER])
+        # kubectl unavailable: the run goes on and says what it relies on.
+        _run(FakeSlack([{"reaction": "eyes", "replies": [_ANSWER]}], ask_bot_id="BDRIVER"), listed=None)
+
+    def test_a_refusal_as_the_first_reply_fails_at_once_quoting_it(self):
+        refusal = {"ts": _ANSWER_TS, "user": _BOT, "bot_id": "B1", "text": MOD.live.REFUSAL_NOTICE_PREFIX + " you are not on the allowlist"}
+        fake = FakeSlack([{"replies": [refusal]}, {"replies": [refusal]}, {"replies": [refusal, _ANSWER]}])
+        with self.assertRaises(_Failed) as caught:
+            _run(fake)
+        self.assertIn("refusal", str(caught.exception))
+        self.assertIn("allowlist", str(caught.exception))
+        self.assertEqual(2, fake.polls)  # the preflight's read-back, then the poll that saw it
+
+    def test_mode_comes_from_the_env_then_the_platform_agent(self):
+        with mock.patch.dict("os.environ", {"E2E_SLACK_MODE": "today"}), \
+                mock.patch.object(MOD, "_kubectl_json", lambda *a: {"items": [{"spec": {"mode": "next"}}]}):
+            self.assertEqual("today", MOD.install_mode())
+        with mock.patch.dict("os.environ", {"E2E_SLACK_MODE": ""}):
+            with mock.patch.object(MOD, "_kubectl_json", lambda *a: {"items": [{"spec": {"mode": "next"}}]}):
+                self.assertEqual("next", MOD.install_mode())
+            with mock.patch.object(MOD, "_kubectl_json", lambda *a: None):
+                self.assertEqual("", MOD.install_mode())
+
     def test_timing_legs_are_measured_from_the_post(self):
-        t = MOD.Timeline(posted=MOD.ts_value(_ASK_TS), ack=MOD.ts_value(_ACK_TS), answer=MOD.ts_value(_ANSWER_TS))
+        t = MOD.Timeline(posted=MOD.live.ts_value(_ASK_TS), first_reply=MOD.live.ts_value("1800000001.000100"), answer=MOD.live.ts_value(_ANSWER_TS))
         legs = t.legs()
-        self.assertEqual(1.0, legs["post_to_ack_s"])
+        self.assertEqual(1.0, legs["post_to_first_reply_s"])
         self.assertEqual(4.0, legs["post_to_answer_s"])
         json.dumps(legs)
 

@@ -223,11 +223,10 @@ jobs:
           GITHUB_ORG: ${{ vars.GITOPS_ORG }}
           GITHUB_REPO: ${{ vars.GITOPS_REPO }}
         # 300s for `next` and nothing for `today`, as the blocking gate does.
-        # On `next` the Slack answer is the gateway's Block Kit, so its bold
-        # headline is asserted there only.
+        # The Slack suite reads E2E_SLACK_MODE for what the answer must look like.
         run: |
           if [ "${{ steps.mode.outputs.next == 'true' }}" = true ]; then
             export TEST_TIMEOUT_SEC=300
-            export E2E_SLACK_EXPECT_HEADLINE=true
+            export E2E_SLACK_MODE=next
           fi
           ./scripts/release/run_optional_e2e_suites.sh

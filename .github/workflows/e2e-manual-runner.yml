@@ -66,6 +66,7 @@ on:
           - "audit"
           - "agent-plugin"
           - "gchat"
+          - "slack"
           - "stockout-full"
           - "all"
       stockout_scenarios:
@@ -203,6 +204,12 @@ jobs:
           E2E_CHAT_CLIENT_SECRET: ${{ secrets.E2E_CHAT_CLIENT_SECRET }}
           E2E_CHAT_REFRESH_TOKEN: ${{ secrets.E2E_CHAT_REFRESH_TOKEN }}
           CHAT_SPACE_ID: ${{ secrets.E2E_CHAT_SPACE_ID }}
+          # The `slack` suite's test user, CI channel and the install's bot
+          # (tests/e2e/README.md, "Slack E2E test"); unset, it skips. It reads
+          # the PlatformAgent's spec.mode itself.
+          E2E_SLACK_USER_TOKEN: ${{ secrets.E2E_SLACK_USER_TOKEN }}
+          E2E_SLACK_CHANNEL_ID: ${{ secrets.E2E_SLACK_CHANNEL_ID }}
+          E2E_SLACK_BOT_USER_ID: ${{ vars.E2E_SLACK_BOT_USER_ID }}
         # The wrapper rather than the .py, so this goes through the same entry
         # point as e2e-run.yml and `make test-e2e`. `--suite all` needs no special
         # case: execute_e2e_tests.py expands it into one child process per suite.
