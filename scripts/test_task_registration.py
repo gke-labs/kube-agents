@@ -286,6 +286,18 @@ class TestEveryTaskIsValid(unittest.TestCase):
             "false; bench-gate would refuse it after the cluster lease:",
         )
 
+    def test_no_run_record_is_committed(self):
+        # Tree-level like the sanitizer, so validate_all() does not carry it
+        # and this is the assertion that gates it.
+        findings = validator.committed_run_records()
+        self.assertEqual(
+            findings,
+            [],
+            "\n\nThese files sit under a case's evidence/ directory. A run's record "
+            "is not committed; cite the run by its directory name or build id:\n  "
+            + "\n  ".join(findings),
+        )
+
     def test_no_fixture_carries_a_real_address_or_credential(self):
         # The sanitization scan is tree-level rather than per case, like the
         # fixture-catalogue drift check, so validate_all() does not carry it
@@ -1262,6 +1274,33 @@ class TestTheRulesReject(unittest.TestCase):
                 }
             ),
         )
+
+
+class TestTheRunRecordGuard(unittest.TestCase):
+    """committed_run_records() on a temporary tree: any file under a case's
+    evidence/ directory is a finding; a file elsewhere in the case is not."""
+
+    def _findings(self, relatives):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            for relative in relatives:
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("{}\n")
+            return validator.committed_run_records(root)
+
+    def test_a_record_at_depth_under_evidence_is_rejected(self):
+        found = self._findings(["a-case/evidence/run_1/results.json"])
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("a-case/evidence/run_1/results.json", found[0])
+        self.assertIn("not committed", found[0])
+
+    def test_any_file_under_evidence_is_rejected(self):
+        found = self._findings(["a-case/evidence/run_1/campaign.json", "a-case/evidence/notes.md"])
+        self.assertEqual(len(found), 2, found)
+
+    def test_a_file_outside_evidence_passes(self):
+        self.assertEqual(self._findings(["a-case/fixture/results.json", "a-case/task.yaml"]), [])
 
 
 class TestTheSanitizer(unittest.TestCase):

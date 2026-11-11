@@ -616,7 +616,8 @@ def parse_args(argv):
     parser.add_argument("--data", type=pathlib.Path, required=True, help="data.json (schema v1)")
     parser.add_argument("--health", type=pathlib.Path, required=True, help="the health.json health.py wrote this tick")
     parser.add_argument("--state", required=True, help="this script's state: local path or gs:// object")
-    parser.add_argument("--repo", default=ghcli.DEFAULT_REPO, help="owner/repo the pull requests live in")
+    # The pull requests' repository, not the issues' (ghcli.DEFAULT_REPO).
+    parser.add_argument("--repo", default=ghcli.SOURCE_REPO, help="owner/repo the pull requests live in")
     parser.add_argument("--now", type=health.parse_when, help="evaluate as of this ISO 8601 time (default: data.json's generated_at, else the wall clock)")
     parser.add_argument("--admitted", help="comma-separated admitted roster (default: hack/eval/blocking-roster.txt)")
     parser.add_argument("--blocking-roster", "--ci-eval-script", dest="blocking_roster", type=pathlib.Path, default=health.BLOCKING_ROSTER_FILE, help=argparse.SUPPRESS)

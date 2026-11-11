@@ -820,12 +820,11 @@ created, because a later repetition pushes onto the branch the first one used â€
 request grades it with `pull_request_opened` and its reply names the URL; up to
 `requested_pull_requests` of the writes that reply names are the requested ones and are left out.
 Both lanes append the entry above to every case they run and set that field to the number of
-`pull_request_opened` and `pull_request_diff_contains` leaves the case declares, to the total the
-case declares under its own top-level `requested_pull_requests` key when it opens more by design,
-or to the count the file's `requesting:` list gives a case the persona answers with a pull request
-before its own checks say so, whichever is largest (`hack/eval/inject-lane-safeguards.yaml`,
-`bench/kube_agents_bench/lane.py`). The grader reads the task key too, so that is where a case's
-total belongs.
+`pull_request_opened` and `pull_request_diff_contains` leaves the case declares, or to the total
+the case declares under its own top-level `requested_pull_requests` key, whichever is larger
+(`bench/kube_agents_bench/lane.py`). The key is for a case that opens more pull requests by design
+than its checks grade, and for a case the persona answers with a pull request before its own check
+lands. The grader reads the same key, so the task file is the one home of a case's total.
 
 Two things to know. The presubmit's fan-out runs cases side by side against one repository, so
 a repetition's window also holds the writes of every repetition running beside it. A write is

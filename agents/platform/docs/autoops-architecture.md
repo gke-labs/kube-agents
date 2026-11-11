@@ -148,8 +148,8 @@ The Go event watcher marshals an `InjectPayload`, wraps it as `{"message": "<esc
 `POST`s it to `/sessions/{id}/inject` (`k8s-operator/cmd/k8s-event-watcher/injector.go`). The watcher
 sends **no prompt** — it sends facts. Noise control lives here too: namespace allow/deny rules, a
 flapping guard, a two-minute settle period for the crash-loop family, kubelet's `host IP unknown`
-config error and Config Connector's `DependencyNotReady` and `Unmanaged` (a back-off that clears sooner, or a DaemonSet pod's `host IP unknown` as its node is
-deleted, is not forwarded), and a 24h dedup window keyed on `EventKey{UID, Reason}`, so a crashlooping pod
+and missing-`etc-hosts` config errors and Config Connector's `DependencyNotReady` and `Unmanaged` (a back-off that clears sooner, or a DaemonSet pod's `host IP unknown` as its node is
+deleted, or the `etc-hosts` error of a pod deleted as it starts, is not forwarded), and a 24h dedup window keyed on `EventKey{UID, Reason}`, so a crashlooping pod
 is one incident rather than forty. Once an alerted object has been quiet for fifteen minutes the
 watcher sends a `k8s-event-followup` on the same session, which lands in the alert's thread and on its triage card (the card alone on an install without chat).
 

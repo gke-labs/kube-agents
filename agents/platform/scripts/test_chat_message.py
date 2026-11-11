@@ -179,6 +179,14 @@ class PlanTest(unittest.TestCase):
         rows = [_row("a", "in_progress", title="R&D <!here>", note="x", lines=["x"], steps=1)]
         self.assertEqual(cm.plan_text(None, rows), "R&D <!here>\n◌ x")
 
+    def test_text_draws_a_lone_row_with_nothing_to_say_once(self):
+        # One card, no note yet: the plan is titled by the card, and its row would repeat it.
+        self.assertEqual(cm.plan_text(None, [_row("a", "in_progress", title="check seeded-a")]), "◌ check seeded-a")
+        self.assertEqual(cm.plan_text("the ask", [_row("a", "in_progress", title="check seeded-a")]), "the ask\n◌ check seeded-a")
+        queued = "Queued: the system is busy. Your request will start when a worker frees up."
+        rows = [_row("a", "in_progress", title="check seeded-a", note=queued, lines=[queued], steps=1)]
+        self.assertEqual(cm.plan_text(None, rows), f"check seeded-a\n◌ {queued}")
+
 
 class ChoicesTest(unittest.TestCase):
     def test_a_report_choice_the_gateway_would_act_on_stays_in_the_detail(self):

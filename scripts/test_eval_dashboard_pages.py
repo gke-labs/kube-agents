@@ -1174,6 +1174,28 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("rca-names-the-oom", app)
         self.assertIn("Tracking <a", app)
         self.assertIn("issues/1278", app)
+
+    def test_history_lists_an_issue_once_whether_a_tick_wrote_its_number_or_its_url(self):
+        """health-history.jsonl across a rollout: the tick before wrote
+        "#1300", the tick after its URL; the incident names the issue once."""
+        ticks = [dict(health_doc("OUTAGE"), tick="2026-09-08T09:00:00Z", tracking_issues=["#1300"]),
+                 dict(health_doc("OUTAGE"), tick="2026-09-08T09:15:00Z", tracking_issues=["https://github.com/gke-labs/kube-agents/issues/1300", "#1278"])]
+        path = pathlib.Path(self.tmp.name) / "history.jsonl"
+        path.write_text("".join(json.dumps(t) + "\n" for t in ticks))
+        [incident] = render.history_incidents(render.load_health_history(path))
+        self.assertEqual(incident["tracking_issues"], ["#1300", "#1278"])
+
+    def test_a_tracking_issue_given_as_a_url_links_there_and_names_another_repository(self):
+        """health.json's tracking_issues: a bare #N is this repository's
+        (case-notes.yaml); the bot's own issues arrive as full URLs and may
+        live in the issues repository, which the link text then names."""
+        doc = health_doc("OUTAGE")
+        doc["tracking_issues"] = ["#1278", "https://github.com/gke-labs/kube-agents/issues/1300", "https://github.com/gke-labs/kube-agents-eval-triage/issues/12"]
+        out = render_to(pathlib.Path(self.tmp.name) / "issue-urls", self.data, health=doc)
+        app = dom_text(out / "index.html")
+        self.assertIn('<a href="https://github.com/gke-labs/kube-agents/issues/1278">#1278</a>', app)
+        self.assertIn('<a href="https://github.com/gke-labs/kube-agents/issues/1300">#1300</a>', app)
+        self.assertIn('<a href="https://github.com/gke-labs/kube-agents-eval-triage/issues/12">gke-labs/kube-agents-eval-triage#12</a>', app)
         self.assertIn("Runs in this window", app)
         self.assertIn('href="run.html#build=2097282860221206528"', app)
         self.assertIn('class="chip hit">cluster-agent-crashloop-debug', app)
@@ -1824,7 +1846,15 @@ class CasesAndGridPagesTest(unittest.TestCase):
         data["generated_at"] = NOW
         data["cases"] = [{"name": n, "domain": "cluster-debugging", "active": True} for n in CRASHLOOP_TRIO]
         data["cases"].append({"name": "retired-probe", "domain": "cost", "active": False})
-        data["releases"] = [RC_RELEASE, dict(RC_RELEASE, build_id="7", rc_tag="hostile", artifacts_url="javascript:alert(1)", verdict=None, started="2026-09-09T03:35:01+00:00")]
+        data["releases"] = [
+            RC_RELEASE,
+            dict(RC_RELEASE, build_id="7", rc_tag="hostile", artifacts_url="javascript:alert(1)", verdict=None, started="2026-09-09T03:35:01+00:00"),
+            # A release read from the lane's private bucket (SCHEMA.md,
+            # releases[].gcs_base): its row links the Console, not Spyglass.
+            dict(RC_RELEASE, build_id="2097891568546484225", rc_tag="evalcand_2611100000_5b5ad10", started="2026-09-09T01:35:01+00:00",
+                 gcs_base="gs://kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/2097891568546484225/",
+                 artifacts_url="https://oss.gprow.dev/view/gs/kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/2097891568546484225"),
+        ]
         data["pending_builds"] = [{"build_id": "2097300000000000000", "first_seen": "2026-09-08T14:00:00+00:00"}]
         # A green run that recorded no cases (the gate revalidated the
         # branch's earlier run) sits inside the live window: no Grid column.
@@ -2009,6 +2039,8 @@ class CasesAndGridPagesTest(unittest.TestCase):
         app = dom_text(self.out / "index.html")
         self.assertIn("Release candidates", app)
         self.assertIn('href="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/post-kube-agents-eval-rc/2097891568546484224"', app)
+        self.assertIn('href="https://console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/2097891568546484225"', app)
+        self.assertNotIn("oss.gprow.dev/view/gs/kube-agents-evals-presubmit-logs", app)
         self.assertIn('<span class="pill p-pass">GREEN</span>', app)
         self.assertIn("90.0%", app)
         self.assertIn("baselines maturing", app)

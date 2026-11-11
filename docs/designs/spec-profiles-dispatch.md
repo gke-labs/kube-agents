@@ -228,6 +228,8 @@ own children (or a coordinator's children of the same profile).
 
 Gaps on main that the build closes (#3659):
 
+- The `Tier` CRD exists, but nothing reads it: the verifier and the gateway keep their built-in
+  tiers, and `allowedTiers` is an enum of `read` and `unattended`.
 - The gateway mints every grant with the install-wide `AuthorityTier`, so the membership
   mapping has to feed the mint.
 - The capability library ranks a hard-coded tier list and refuses unknown tiers. That becomes
