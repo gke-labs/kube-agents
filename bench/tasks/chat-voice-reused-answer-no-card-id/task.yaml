@@ -18,8 +18,8 @@
 # attribution") and §1.5.
 #
 # The other chat-voice-* cases grade a fresh card's ack or result;
-# chat-routing-board-read grades the board read itself, where the ids belong.
-# None of them reaches an answer drawn from an earlier card.
+# chat-routing-board-read grades the board read itself (where §1.5 puts the
+# ids). None of them reaches an answer drawn from an earlier card.
 #
 # The prompt sends the front door to the board for the count: a bench session
 # starts with no thread history, so the earlier card the leak drew on has to
@@ -27,14 +27,17 @@
 # earlier today is fine if you already have one") had main's front door file
 # a fresh card and never look. The question is still the count, not the
 # board: the user names the board as where the count may be, and the answer
-# is about clusters, so the board-read exception does not apply. On an
+# is about clusters, so the board-read exception does not apply, and §1.5's
+# hard boundary carves out a finished card reused at the user's ask. On an
 # install whose board holds such a card (gkedemos ran several count cards the
 # day the leak was seen) the reuse path is the one taken and the id check is
-# the deciding one; on a board with no such card the front door files a fresh
-# card, and the same checks hold the answer that comes back. The case is not
-# vacuous on that path: the harness folds each delivered card's result under
-# its own "Result of delegated task t_…:" header, and only that header may
-# carry an id.
+# the deciding one. The nightly's pool installs hold no such card: the
+# harness purges each run's cards at settle (harness.py, _purge_card_state),
+# so there the front door files a fresh card every night and the record is
+# of that path, where the same checks hold the ack and the result that come
+# back (only the harness's own "Result of delegated task t_…:" header may
+# carry an id). The reuse path is measured where a count card exists: a dev
+# install, or a later case that seeds one.
 #
 # The id pattern is hermes' card id shape, "t_" + 8 hex
 # (bench/kube_agents_bench/parsing.py, _TASK_ID_RE's comment). The surface the
@@ -44,7 +47,8 @@
 # makes the underscore optional. The harness's own header lines are excluded by
 # a negative lookahead at the start of each line (harness.py, _RESULT_SECTION,
 # _QUESTION_SECTION and the artifact header), so a run that files a card is
-# graded on the agent's words alone.
+# graded on every other line: the front door's words and the specialist's
+# result, which the rule binds too.
 # bench/tests/test_chat_voice_reused_answer_patterns.py pins the patterns
 # against that surface and those headers.
 #
@@ -97,11 +101,14 @@ verification_spec:
     check:
       type: report_contains
       any_of_patterns:
-        - '\b\d{1,4} (?:\S+ ){0,3}clusters?\b'
+        - '\b\d{1,4} (?:(?!projects?\b)\S+ ){0,3}clusters?\b'
         - '\bclusters?(?: \S+){0,2}[:=] \d{1,4}\b'
-  # An answer drawn from an earlier card says when the count was taken; a
-  # fresh card's result arrives under the harness's delivered header instead,
-  # which is the other way this check is met.
+  # An answer drawn from an earlier card says when the count was taken, as a
+  # duration or a clock time ("about two hours ago", "two hours old", "at
+  # 14:02", a date); a bare "earlier" or "today" tells the reader nothing
+  # about staleness and is not accepted. A fresh card's result arrives under
+  # the harness's delivered header instead, which is the other way this
+  # check is met.
   - name: a-reused-count-says-when-it-was-taken
     role: objective
     mode: assert
@@ -109,4 +116,4 @@ verification_spec:
       type: report_contains
       any_of_patterns:
         - '(?m)^result of delegated task\b'
-        - '\b(?:ago|earlier|today|yesterday|just now|this (?:morning|afternoon|evening)|last night|at \d{1,2}:\d{2}|\d{4}-\d{2}-\d{2}|utc|(?:january|february|march|april|may|june|july|august|september|october|november|december) \d{1,2})\b'
+        - '\b(?:ago|(?:\d+|an?|one|two|three|four|five|six|seven|eight|nine|ten|twelve|half an?) (?:minutes?|hours?|days?) old|yesterday|just now|this (?:morning|afternoon|evening)|last night|(?:at|as of) \d{1,2}:\d{2}|\d{4}-\d{2}-\d{2}|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]* \d{1,2})\b'

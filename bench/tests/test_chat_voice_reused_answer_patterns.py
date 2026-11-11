@@ -60,7 +60,8 @@ GOOD = (
     "about two hours ago. That includes 1 cluster in bhoekstra-gkedemos, 8 in devops-bench-complex-evals, "
     "and 5 in each of the 40 kube-agents-evals projects.",
     "**platform counted 209 running GKE clusters across your 42 projects about an hour ago.** Want a fresh count?",
-    "**209 GKE clusters are running across the 42 projects in scope**, per platform's count earlier today.",
+    "**209 GKE clusters are running across the 42 projects in scope**, per platform's count two hours old.",
+    "**209 GKE clusters are running**, from platform's count as of 14:02.",
     "**platform's count at 14:02 UTC found 209 running GKE clusters.**",
     "**209 GKE clusters**, counted by platform on 2026-11-11.",
 )
@@ -74,10 +75,17 @@ FRESH_LEAK = (
     "checking all clusters (card t_7bd8e9a5).\n\nResult of delegated task t_7bd8e9a5:\n"
     "**209 GKE clusters are running across 42 projects.**"
 )
-# No count at all: an offer, or a refusal.
+# No count at all: an offer, or a refusal; the project count from the roster
+# block is not a cluster count.
 NO_COUNT = (
     "I don't have a count from today. Want me to have platform run one?",
     "I can't see the fleet myself.",
+    "No count from earlier today. Want platform to count the 42 projects' clusters?",
+)
+# A time of day with no staleness in it does not say when.
+VAGUE_WHEN = (
+    "platform counted 209 clusters earlier today.",
+    "209 clusters, per platform, today.",
 )
 
 
@@ -103,6 +111,11 @@ def test_a_fresh_cards_fold_passes_on_the_harness_header_alone():
 def test_an_answer_without_a_count_fails_the_count_check():
     for text in NO_COUNT:
         assert not check_passes(CASE, CHECK_COUNT, text), text
+
+
+def test_a_bare_today_does_not_say_when():
+    for text in VAGUE_WHEN:
+        assert not check_passes(CASE, CHECK_WHEN, text), text
 
 
 def test_the_id_shape_survives_the_surface():

@@ -82,7 +82,7 @@ exit code, or roster id used as a name (`cluster-foo` where "the foo cluster age
 identifier the user can act on — a cluster, a workload, a pull request as a link — is content, not
 plumbing, and so is a specialist's name where `SOUL.md` asks for attribution. A board read is the
 exception for ids: [`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §1.5 gives each card a short
-task id, because the user asked about the board and may name a card back. In the evidence section
+task id, because the user asked about their tasks and may name a card back. In the evidence section
 `kanban_complete` adds to a card's `result` from `verified_claims`, each claim's command and output
 excerpt, in their fences, are content: evidence the reader can check and run again, which
 [`agents/platform/SOUL.md`](../../agents/platform/SOUL.md) §0 and
