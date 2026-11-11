@@ -56,8 +56,8 @@ class FakeSlack:
             return {"ok": True, "ts": ASK_TS}
         step = self.steps[min(self.polls, len(self.steps) - 1)]
         if method == "reactions.get":
-            name = step.get("reaction") or ("eyes" if step.get("reacting") else "")
-            reactions = [{"name": name, "users": [BOT]}] if name else []
+            names = (["eyes"] if step.get("reacting") else []) + ([step["reaction"]] if step.get("reaction") else [])
+            reactions = [{"name": n, "users": [BOT]} for n in names]
             return {"ok": True, "message": {"reactions": reactions}}
         if method == "conversations.replies":
             self.polls += 1
@@ -102,7 +102,9 @@ def test_a_reaction_still_on_keeps_the_turn_open_until_the_deadline():
 
 @pytest.mark.parametrize("mark", ["double_vertical_bar", "x"])
 def test_a_blocked_or_failed_mark_ends_the_turn(mark):
-    fake = FakeSlack([{"reacting": True, "replies": [STATUS]}, {"reaction": mark, "replies": [STATUS, ANSWER]}])
+    # The ask's own mark stays on beside the blocked one, as the gateway leaves it.
+    fake = FakeSlack([{"reacting": True, "replies": [STATUS]},
+                      {"reacting": True, "reaction": mark, "replies": [STATUS, ANSWER]}])
     ex = _turn(fake, FakeClock()).run("q", 60)
     assert ex.outcome == "settled" and ex.deliverable == "*Three clusters.*"
 
@@ -145,6 +147,28 @@ def test_a_transient_read_error_is_polled_through():
     fake = Flaky([{"replies": [ANSWER]}])
     ex = _turn(fake, FakeClock()).run("q", 30)
     assert ex.outcome == "settled" and ex.errors == ["reactions.get: http_503"]
+
+
+def test_a_dropped_connection_is_polled_through():
+    class Dropping(FakeSlack):
+        def call(self, method, **params):
+            if method == "conversations.replies" and not getattr(self, "dropped", False):
+                self.dropped = True
+                raise slack.SlackAPIError(method, f"{slack.CONNECTION_ERROR} (ConnectionResetError)")
+            return super().call(method, **params)
+
+    ex = _turn(Dropping([{"replies": [ANSWER]}]), FakeClock()).run("q", 30)
+    assert ex.outcome == "settled" and len(ex.errors) == 1
+
+
+def test_the_client_reports_no_answer_as_a_transient_error(monkeypatch):
+    def refuse(*a, **k):
+        raise slack.urllib.error.URLError("name resolution failed")
+
+    monkeypatch.setattr(slack.urllib.request, "urlopen", refuse)
+    with pytest.raises(slack.SlackAPIError) as caught:
+        slack.SlackClient("xoxp-1").call("reactions.get", channel="C", timestamp="1")
+    assert caught.value.transient
 
 
 def test_retry_after_is_bounded():

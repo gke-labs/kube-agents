@@ -4,17 +4,17 @@
 # keeps its own nightly record on inject. Kept small so one serial run fits a
 # nightly part; the whole chat and routing set is a weekly option for later.
 #
-# Only cases graded on the answer's own text. A case that checks a delegated
-# task's section ("Result of delegated task <id>:", "Question from delegated
-# task <id>:") cannot pass here yet: the transport grades the thread's last bot
-# message, and builds no such sections. chat-voice-ack-names-target,
-# chat-routing-fleet-question and chat-question-asked-to-choose-pauses join once
-# it folds the thread's posts the way the other transports fold delegated work.
+# Only cases graded on the answer's own text. The transport grades the
+# thread's last bot message and records no trajectory, so a case that checks a
+# delegated task's section ("Result of delegated task <id>:", which
+# answer_first reads too) or a worker's tool calls cannot pass here yet:
+# chat-voice-answer-first, chat-voice-absent-answer-quotes-no-command,
+# chat-voice-ack-names-target, chat-routing-fleet-question and
+# chat-question-asked-to-choose-pauses join once it folds the thread's posts
+# the way the other transports fold delegated work.
 #
 # One case id per line; blank lines and # comments are ignored.
 
-# The answer's voice: the opening line, a quoted command, the capabilities.
-chat-voice-answer-first
-chat-voice-absent-answer-quotes-no-command
+# The answer's voice: what the agent says it can do.
 chat-voice-capabilities-names-cluster-agents
 

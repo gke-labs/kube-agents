@@ -41,6 +41,7 @@ library is used, like the inject transport and ``hack/slack-live-check``.
 
 from __future__ import annotations
 
+import http.client
 import json
 import math
 import os
@@ -77,6 +78,9 @@ SETTLE_QUIET_SECONDS = 15.0
 HTTP_TIMEOUT_SECONDS = 20
 HTTP_OK = 200
 HTTP_TOO_MANY_REQUESTS = 429
+# The error a request that never got an HTTP answer (DNS, connect, reset, read
+# timeout, a short read) is reported under; transient, so the poll goes on.
+CONNECTION_ERROR = "connection_error"
 RATE_LIMIT_DEFAULT_WAIT_SECONDS = 2.0
 RATE_LIMIT_MAX_WAIT_SECONDS = 15.0
 RATE_LIMIT_MAX_RETRIES = 3
@@ -91,7 +95,8 @@ class SlackAPIError(Exception):
 
     @property
     def transient(self) -> bool:
-        return self.error == f"http_{HTTP_TOO_MANY_REQUESTS}" or self.error.startswith("http_5")
+        return (self.error == f"http_{HTTP_TOO_MANY_REQUESTS}" or self.error.startswith("http_5")
+                or self.error.startswith(CONNECTION_ERROR))
 
 
 class SlackClient:
@@ -118,6 +123,9 @@ class SlackClient:
                 if status == HTTP_TOO_MANY_REQUESTS and attempt < RATE_LIMIT_MAX_RETRIES:
                     self._sleep(retry_after(exc.headers.get("Retry-After")))
                     continue
+            except (OSError, http.client.HTTPException) as exc:
+                # URLError, a timeout, a reset or a short read: no answer at all.
+                raise SlackAPIError(method, f"{CONNECTION_ERROR} ({type(exc).__name__})") from exc
             break
         if status != HTTP_OK:
             raise SlackAPIError(method, f"http_{status}")
@@ -226,16 +234,18 @@ class SlackTurn:
         while self._clock() < deadline:
             self._sleep(self._poll)
             try:
-                name = self._bot_reaction(ex.ask_ts)
+                names = self._bot_reactions(ex.ask_ts)
                 ex.posts = self._bot_replies(ex.ask_ts)
             except SlackAPIError as err:
                 if err.transient:
                     ex.errors.append(str(err))
                     continue
                 raise
-            if name and not ex.reaction:
-                ex.reaction, ex.reaction_seen = name, Decimal(str(self._wall()))
-            reacting = bool(name) and name not in SETTLE_REACTIONS
+            if names and not ex.reaction:
+                ex.reaction, ex.reaction_seen = names[0], Decimal(str(self._wall()))
+            # The ask's own mark stays on beside a blocked mark (the gateway adds
+            # it after the ask's), so any settle mark ends the turn.
+            reacting = bool(names) and not SETTLE_REACTIONS.intersection(names)
             shape = tuple((p.get("ts"), (p.get("edited") or {}).get("ts"), p.get("text")) for p in ex.posts)
             if shape != last_shape:
                 last_shape, quiet_since = shape, self._clock()
@@ -245,12 +255,11 @@ class SlackTurn:
         ex.outcome = "timeout" if ex.posts else "no_reply"
         return ex
 
-    def _bot_reaction(self, ts: str) -> str:
+    def _bot_reactions(self, ts: str) -> list[str]:
+        """Every reaction the bot has on the ask, in Slack's order."""
         message = self.client.call("reactions.get", channel=self.channel, timestamp=ts, full="true").get("message") or {}
-        for reaction in message.get("reactions") or []:
-            if self.bot_user in (reaction.get("users") or []):
-                return str(reaction.get("name", ""))
-        return ""
+        return [str(r.get("name", "")) for r in message.get("reactions") or []
+                if self.bot_user in (r.get("users") or [])]
 
     def _bot_replies(self, ts: str) -> list[dict]:
         messages: list[dict] = []
