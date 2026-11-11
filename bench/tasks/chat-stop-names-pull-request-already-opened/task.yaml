@@ -27,7 +27,7 @@
 # repository. No check reads GitHub for it: the answer's link is the evidence,
 # since the gateway links only a pull request session-kv read off a
 # forge-verified pr_opened event, so the case grades with no GitHub token.
-# hack/eval/inject-lane-safeguards.yaml's `requesting:` allows the lane's one
+# The task's `requested_pull_requests: 1` (below) allows the lane's one
 # write, and hack/ci-eval-pr.sh runs a stopped ask in the second phase, one
 # unit at a time.
 #
@@ -39,6 +39,13 @@
 # Eligible tier: nightly.
 id: chat-stop-names-pull-request-already-opened
 name: A stop after a card opened its pull request names that pull request
+# Its card opens the pull request the stop's answer has to name (#4061). No
+# check reads GitHub for it: the answer's link, which the gateway gives only a
+# forge-verified pull request, is the evidence. So no pull_request_opened leaf
+# declares it, and this is the case's total, read by the lane for the write
+# safeguard's allowance and by the grader for the carve-out that excuses a
+# requested pull request.
+requested_pull_requests: 1
 prompt: |-
   [bench:stop-after-first-card] cards=done wait=1800 observe=60
   Open a pull request on the GitOps repository that scales the checkout-gateway
