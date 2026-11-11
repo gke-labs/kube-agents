@@ -1125,6 +1125,7 @@ resource "helm_release" "kube_agents" {
         serviceAccountAnnotations = {
           "iam.gke.io/gcp-service-account" = module.kube_agents_iam.service_account_email
         }
+        disallowSecretsRead = var.disallow_secrets_read
         # The mapping the credential broker selects from, one row per project
         # the module provisioned a member for. It has to reach the cluster as
         # data rather than being recomputed there: the broker refuses a

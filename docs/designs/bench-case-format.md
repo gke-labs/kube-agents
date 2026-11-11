@@ -24,7 +24,7 @@ in silence — no error, no warning. The fields it reads are `id`, `name`, `prom
 means no coercion: `critical: yes` is a string, not a boolean, and fails validation.
 
 **This repository's lints** read the same file for fields devops-bench discards: `domain`,
-`fixtures`, `owner`, `expected_fail`, `tool_calls_optional`, `writes_alone`, `audit_streams` and `scope_exclude`. Those are ours. A typo in any of them cannot fail a run, which is
+`fixtures`, `owner`, `expected_fail`, `tool_calls_optional`, `writes_alone`, `requested_pull_requests`, `audit_streams`, `scope_exclude`, `suite` and `task_version`. Those are ours. A typo in any of them cannot fail a run, which is
 exactly why `scripts/validate_bench_cases.py` exists.
 
 ## The id key
@@ -149,6 +149,17 @@ boolean: `"false"` is a string, and truthy, and the validator rejects it.
 the reply never names: the lane runs it alone in its second phase and marks the write
 safeguard's window exclusive, so any write in the window is charged to it
 (`bench/kube_agents_bench/lane.py`). A bare YAML boolean, `false` by default; devops-bench
+ignores the key.
+
+`requested_pull_requests` is for a case that opens more pull requests by design than its checks
+grade: the case's total, a bare decimal integer above the count of its `pull_request_opened` and
+`pull_request_diff_contains` leaves (the validator rejects a count those leaves already reach,
+and any other spelling, because the roster script reads the key off the text). It also serves a
+case the persona answers with a pull request before its own check lands, as a placeholder the
+validator fails once the check reaches the count. The lane sets the write safeguard's allowance
+from the larger of the leaves and the key, and the grader reads the same two, so the carve-out
+that excuses a requested pull request holds the case to its total
+(`bench/kube_agents_bench/lane.py`, `cases.py`). Absent means the leaves alone; devops-bench
 ignores the key.
 
 `tool_calls_optional` is for a case a correct agent can answer without calling a tool: a
@@ -318,7 +329,9 @@ send nothing but carries a forbidden word as its argument, such as a plain
 line is still graded (`exempt_grep_patterns: true` does that by the command's
 shell words: it removes only the pattern argument of a command that is one
 grep and nothing else, and refuses a control operator, a redirect other than
-`>` to `/dev/null`, a comment, a substitution and a collapsed chain); or with `required_runs` a script by its basename and the flags that must
+`>` to `/dev/null`, a comment, a substitution, a collapsed chain, a braced expansion other than
+`${NAME}` or `${NAME:-…}`, a read of the last argument (`$_`) or of a variable through another
+(`${!NAME}`), and an ANSI-C quote); or with `required_runs` a script by its basename and the flags that must
 follow it on the same shell segment, read from the command's argv as the shell splits
 it, so a quoted mention of the invocation is one word and not a run, and a run made through a script file or a shell's standard input is not read, since the argv names the file or the shell; each flag is read as the exact word, so the script named is built with `allow_abbrev=False`; `word_patterns` are regular expressions each of which some later word of the segment must match on its own, and `forbidden_runs` is the same shape for a run no worker may make, such as a `kubectl get` of the objects a script grades; with `after_result_pattern` the commands come from the workers' tagged `terminal` and `execute_code` calls in the trajectory instead, with their results as the record stores them, a JSON string with newlines escaped, and the forbidden set applies only to the calls after the first whose result matched, failed or not, one window per delegated card and the cards its worker fanned out; `forbidden_result_patterns` then grade the later results too; a trajectory with no tagged call at all, none readable (every code-tool argument withheld), a call with no numeric time, or a capture with gaps and no hit, is `status: "error"`, where a worker whose tagged calls are all MCP calls grades as zero commands), `worker_agents` (regular expressions every one of which must match the
 profile at least one delegated worker ran as, read from the tags the harness puts on the
@@ -619,7 +632,8 @@ id that disagrees with its directory, a `domain:` that is missing or not in
 case that declares no `fixtures:` at all, a missing, empty or inline `verification_spec`,
 a check that carries no assertion and so can only pass, an `owner:` that is `maintainers`,
 written as a mention or not a login, an `expected_fail:`, `tool_calls_optional:` or `writes_alone:`
-that is not a bare YAML boolean, a `resource_property` or `fleet_resource_property` check that
+that is not a bare YAML boolean, a `requested_pull_requests:` that is not a bare decimal integer above
+the case's own requesting leaves, a `resource_property` or `fleet_resource_property` check that
 compares a known boolean field such as `spec.suspend` to the string `"true"` or `"false"` under
 `op: eq` or `ne` (the string never compares equal to the API's boolean, so the check asserts
 nothing; the judged fields are the validator's `BOOLEAN_FIELD_PAIRS` table, and a path with recursive
@@ -639,7 +653,9 @@ string matching the token-shaped subset of `AuditRedactor`'s patterns, with
 that rule — the ranges, the shapes, the skip list, the marker, and what review covers that
 the scan cannot. The scan is tree-level rather than per case, like the fixture-catalogue
 drift check, so `validate_all()` does not carry it; the lint asserts on
-`sanitization_findings()` in its own right.
+`sanitization_findings()` in its own right. The same way, it rejects any file committed under
+a case's `evidence/` directory (`committed_run_records()`): a run's record stays in the bucket
+or on the dev install, and the case cites the run by its directory name or build id.
 
 `scripts/test_task_registration.py` calls the same module in CI and asserts that it
 returned no findings at all, so the fast local check and the gating lint cannot disagree.

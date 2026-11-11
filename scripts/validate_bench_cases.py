@@ -59,7 +59,26 @@ AUDIT_STREAMS_MODULE_NAME = "bench_audit_streams"
 # The runner's reader of `scope_exclude:` (hack/ci-eval-pr.sh), loaded the same way.
 SCOPE_EXCLUDE_FILE = REPO_ROOT / "bench" / "kube_agents_bench" / "scope_exclude.py"
 SCOPE_EXCLUDE_MODULE_NAME = "bench_scope_exclude"
+# The top-level key a case declares its total of requested pull requests under
+# (bench/kube_agents_bench/lane.py's REQUESTED_KEY); the check types that request a
+# pull request, as lane.py's REQUESTING_CHECK_TYPES names them; and the keys a check
+# nests children under, as lane.py's CHECK_CHILD_KEYS. scripts/test_eval_rosters.py
+# holds the types equal and `_requesting_leaves` to lane.requested_pull_requests on
+# every shipped case (test_the_validators_requesting_types_are_the_lanes). lane.py
+# imports its package, so it is not loaded by path the way the two readers above are.
+REQUESTED_PULL_REQUESTS_KEY = "requested_pull_requests"
+REQUESTING_CHECK_TYPES = frozenset({"pull_request_opened", "pull_request_diff_contains"})
+CHECK_CHILD_KEYS = ("checks", "check")
 TASKS_DIR = REPO_ROOT / "bench" / "tasks"
+# A run's record is never committed beside a case: a public file names the run
+# and its outcome, nothing from inside the record. The harness writes runs
+# under bench/results/, which is gitignored, so nothing legitimate lands here.
+EVIDENCE_DIR_NAME = "evidence"
+RUN_RECORD_RULE = (
+    "a run's record is not committed, and nothing goes under a case's evidence/ "
+    "directory; cite the run by its directory name or build id and leave the record "
+    "in the bucket or on the dev install"
+)
 # The tag PyYAML gives a `<<:` merge key; its pairs are merged in, not repeated.
 YAML_MERGE_TAG = "tag:yaml.org,2002:merge"
 # The rosters hack/ci-eval-pr.sh reads at startup (#1546): what the presubmit
@@ -170,6 +189,14 @@ SCENARIO_BATCH_WAIT = (
 )
 
 KNOWN_UNREGISTERED = {
+    # Grades whom a /session turn delegated to (delegated_to); the cluster child
+    # it delegates to only runs where the AgentProfile dispatcher does, which the
+    # CI next lane turns on, with profiles.cluster, in the dispatcher flip (#5394). That pull request
+    # registers the case in hack/eval/nightly-cases.txt and on
+    # hack/eval/api-lane-exclusions.txt, and removes this entry.
+    "session-delegates-to-the-profile-asked-for": (
+        "#5394: needs the AgentProfile dispatcher, which the CI next lane gets from #5394; registered there"
+    ),
     # Provisions its own cluster, so registering it costs every pull request
     # a second multi-minute provision. Whether it belongs in presubmit or
     # nightly is a tier decision nobody has made; this entry is the record
@@ -1174,6 +1201,30 @@ def _path_segments(path: Any) -> list[str]:
     return segments
 
 
+def _requesting_leaves(spec: Any) -> int:
+    """How many of the spec's leaves request a pull request, under either of
+    the child keys a check nests under (lane.py's `_leaves`: a child present
+    but null is no child)."""
+
+    def leaves(node: Any) -> list[dict]:
+        if isinstance(node, list):
+            return [leaf for item in node for leaf in leaves(item)]
+        if not isinstance(node, dict):
+            return []
+        children = [node[key] for key in CHECK_CHILD_KEYS if node.get(key) is not None]
+        return [leaf for child in children for leaf in leaves(child)] if children else [node]
+
+    if not isinstance(spec, list):
+        return 0
+    return sum(
+        1
+        for entry in spec
+        if isinstance(entry, dict)
+        for leaf in leaves(entry.get("check"))
+        if leaf.get("type") in REQUESTING_CHECK_TYPES
+    )
+
+
 def _check_types(node: Any, found: set[str]) -> None:
     """Every check type used anywhere in one check subtree."""
     if not isinstance(node, dict):
@@ -1453,6 +1504,45 @@ def validate_case(
             f"'writes_alone:' {spec['writes_alone']!r} is not a YAML boolean; write a "
             "bare true or false. The lane reads only a bare true, so a quoted value "
             "would leave the case in the shared first phase"
+        )
+    # `requested_pull_requests:` is the case's total for a case that opens more
+    # pull requests by design than its checks grade, or a placeholder for a case
+    # the persona answers with a pull request before its own check lands. The
+    # lane and the grader
+    # (bench/kube_agents_bench/lane.py, cases.py) refuse anything but a
+    # non-negative integer, after the lease; and a count the case's own
+    # requesting leaves already reach is a leftover: the case's check has
+    # landed and the key has nothing left to stand in for.
+    # The YAML value and scripts/eval_rosters.py's text read of the same key
+    # have to agree: YAML 1.1 reads `0x2`, `+2`, `1_0` and `010` as integers
+    # and `2#c` as a string, and a line at column 0 inside a quoted scalar is
+    # not the key at all, while the text read sees only a bare decimal on a
+    # top-level line. The lane and the grader refuse a non-integer after the
+    # lease; this says so first, and holds the spelling to the one every
+    # reader agrees on.
+    text_count = eval_rosters.declared_pull_requests_in(path.read_text(encoding="utf-8"))
+    if REQUESTED_PULL_REQUESTS_KEY in spec:
+        declared = spec[REQUESTED_PULL_REQUESTS_KEY]
+        if isinstance(declared, bool) or not isinstance(declared, int) or declared < 0 or declared != text_count:
+            problems.append(
+                f"'requested_pull_requests:' {declared!r} is not a bare non-negative decimal "
+                "integer on its own top-level line; write `requested_pull_requests: 2`, unquoted. "
+                "The lane and bench-gate refuse a non-integer at spec-load time, after the lease, "
+                "and the roster script reads the key off the text"
+            )
+        else:
+            own = _requesting_leaves(spec.get("verification_spec"))
+            if declared <= own:
+                problems.append(
+                    f"'requested_pull_requests: {declared}' is not above the {own} the case's "
+                    "own requesting check(s) already request; drop the key, or raise it to "
+                    "the case's total"
+                )
+    elif text_count:
+        problems.append(
+            f"a line reading 'requested_pull_requests: {text_count}' sits inside another value, "
+            "not at the task's top level; the roster script reads it as the case's count while "
+            "the lane and the grader see none. Indent or reword it"
         )
 
     # Fixture roles. Cases address the seeded fleet by role, never by cluster
@@ -1832,6 +1922,19 @@ def _non_documentation_addresses(text: str) -> list[tuple[int, str]]:
     return found
 
 
+def committed_run_records(tasks_dir: pathlib.Path = TASKS_DIR) -> list[str]:
+    """Every file under any case's `evidence/` directory, each a finding."""
+    found = []
+    for case_dir in sorted(p for p in tasks_dir.iterdir() if p.is_dir()):
+        evidence = case_dir / EVIDENCE_DIR_NAME
+        if not evidence.is_dir():
+            continue
+        for path in sorted(evidence.rglob("*")):
+            if path.is_file():
+                found.append(f"{_display(path)}: {RUN_RECORD_RULE}")
+    return found
+
+
 def sanitization_findings(roots: tuple[pathlib.Path, ...] = SANITIZED_ROOTS) -> list[str]:
     """Lines under `roots` that carry a real-looking address or a credential.
 
@@ -1949,6 +2052,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.paths
             else SANITIZED_ROOTS
         )
+        # Repository-level too: a committed run record is a finding wherever it sits.
+        records = committed_run_records()
     except CaseError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -1974,6 +2079,10 @@ def main(argv: list[str] | None = None) -> int:
     for entry in unsanitized:
         failed += 1
         print(f"unsanitized fixture: {entry}")
+
+    for entry in records:
+        failed += 1
+        print(f"committed run record: {entry}")
 
     if failed:
         print(f"\n{failed} case(s) rejected out of {len(results)} checked.")

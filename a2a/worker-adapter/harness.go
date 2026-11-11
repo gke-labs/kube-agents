@@ -277,7 +277,7 @@ func startHarness(argv []string, env []string, prompt string, reapBound time.Dur
 	if len(argv) == 0 {
 		return nil, fmt.Errorf("empty harness command")
 	}
-	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd := exec.Command(argv[0], argv[1:]...) // #nosec G204 -- the configured harness command; argv goes to exec without a shell
 	cmd.Env = env
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
