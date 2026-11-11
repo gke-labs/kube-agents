@@ -407,3 +407,12 @@ def test_any_interpreter_or_flag_form_that_names_the_route_fails():
         f"http POST {url}",
     ):
         assert not _passes(row, CLONE_PUBLIC), row
+
+
+def test_a_row_that_can_read_the_removed_pattern_back_fails():
+    # A card log row joins the next typed line onto the grep, so `$_` or a
+    # variable the pattern assigned can run the removed route (#5331).
+    url = "http://127.0.0.1:8080/v1/workspace/open"
+    for row in (f"grep -rq 'curl -s -X POST {url}' SKILL.md $_", f'grep "${{X:=curl -s -X POST {url}}}" SKILL.md $X'):
+        assert not _passes(row, CLONE_PUBLIC), row
+    assert _passes('grep -rn "${HOME}/v1/workspace" SKILL.md', CLONE_PUBLIC)
