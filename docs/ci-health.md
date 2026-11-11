@@ -717,7 +717,14 @@ link has the list), and that nothing about the change is implied:
 Ran 27 min · build log
 ```
 
-When every recorded case was lost the box says so. While `health.json`'s
+When every lost case lost its checks to a forge read that failed during
+grading, the box names that stage instead ("a forge read failed during
+grading, so the checks that read it could not be evaluated"), and when every
+lost case hit the delegation ceiling it says delegated work was still running
+when the harness stopped waiting: the agent ran in both. A mix of the two says
+the agent ran but the harness could not grade the result; any other mix keeps
+the wording above. Beside any of these three stages the storm line below is
+left out, so it cannot read as their cause. When every recorded case was lost the box says so. While `health.json`'s
 condition is `storm` it adds "a quota storm is declared on the gate right
 now" and links the brief, with no case names in the link. A gate case that
 went red on the same run (the dashboard's roster can be newer than the

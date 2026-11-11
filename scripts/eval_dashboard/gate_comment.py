@@ -50,9 +50,11 @@ A run the suite itself could not evaluate (`runs[].eval_outcome`,
 SCHEMA.md: an admitted case, or every case, lost every repetition to
 infrastructure, so the job exited 2) is not a red either, whatever Prow's
 FAILURE and the final line's `Failed` word say: `is_red` is false for it,
-and it gets the same one-line shape: that some cases could not be graded
-because infrastructure failed before the agent ran, that nothing about the
-change is implied, and to retest once the environment is healthy:
+and it gets the same one-line shape: that some cases could not be graded,
+with the stage that lost them (infrastructure before the agent ran, a forge
+read during grading, or the harness's delegation wait, by the lost cases'
+class), that nothing about the change is implied, and to retest once the
+environment is healthy:
 
     ### ⚪ Smoke gate: run not evaluated
     > Some cases lost every repetition to infrastructure ...
@@ -60,8 +62,8 @@ change is implied, and to retest once the environment is healthy:
 Which words: classify.py's `classify_run` -- the same rules the dashboard's
 run.html and the incident brief use -- decides per case whether it is
 `shared` (the gate's), `only-this-pr` (yours), `storm`, `delegation-ceiling`
-(the harness's wait, nothing graded) or unexplained; this module only phrases
-it.
+(the harness's wait, nothing graded), `forge-unavailable` (a forge read failed
+during grading) or unexplained; this module only phrases it.
 
 One comment per pull request, found by a hidden marker and edited in place
 on later runs; a build already commented on is never commented on twice.
@@ -119,6 +121,8 @@ CLS_STORM = classify.CLS_STORM
 OUTCOME_PASSED = classify.OUTCOME_PASSED
 OUTCOME_PARTIAL = classify.OUTCOME_PARTIAL
 OUTCOME_FAILED = classify.OUTCOME_FAILED
+CLS_CEILING = classify.CLS_CEILING
+CLS_FORGE = classify.CLS_FORGE
 
 # Links. The run page and the brief are the dashboard's, written by
 # post_health.run_link and, for the brief, brief_link below (post_health's
@@ -222,15 +226,27 @@ CONDITION_LOST_PODS = health.LOST_PODS
 # command itself.
 HEADING_NOT_EVALUATED = "### ⚪ Smoke gate: run not evaluated"
 BOX_NOT_EVALUATED = (
-    "Some cases could not be graded: infrastructure failed before the agent ran{storm}."
+    "Some cases could not be graded: {cause}{storm}."
     " The suite could certify nothing, so Prow reports the run red; nothing was graded for them"
     " and nothing about your change is implied. Retest once the environment is healthy."
 )
 BOX_NOT_EVALUATED_EVERY = (
-    "No case could be graded: infrastructure failed before the agent ran{storm}."
+    "No case could be graded: {cause}{storm}."
     " The suite evaluated nothing, so Prow reports the run red; nothing about your change is implied."
     " Retest once the environment is healthy."
 )
+# What lost the cases, by the class classify.py gave every lost one: the
+# agent ran in both named shapes, so "before the agent ran" would blame the
+# wrong stage. Anything else, a storm case among them included, keeps the
+# never-ran wording. A stage, never a case or a reason: the PR is public.
+NOT_EVALUATED_CAUSE = "infrastructure failed before the agent ran"
+NOT_EVALUATED_CAUSE_BY_CLASS = {
+    CLS_FORGE: "a forge read failed during grading, so the checks that read it could not be evaluated",
+    CLS_CEILING: "delegated work was still running when the harness stopped waiting",
+}
+# Lost cases that all ran the agent, but not of one class: a forge outage on
+# some and the delegation ceiling on others.
+NOT_EVALUATED_CAUSE_RAN = "the agent ran, but the harness could not grade the result"
 # While health.json's condition is storm: the same line post_health.py
 # draws, so the comment and the brief agree on what the weather is.
 BOX_NOT_EVALUATED_STORM = " — a quota storm is declared on the gate right now"
@@ -478,6 +494,20 @@ def render_lost_comment(run: health.Run, health_doc: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+def not_evaluated_cause(lost: list[str], verdict: dict) -> str:
+    """The box's cause clause: the named stage when every lost case carries
+    the same class from NOT_EVALUATED_CAUSE_BY_CLASS, the ran-but-ungraded
+    wording when they carry several of those classes, the never-ran wording
+    otherwise (a lost case the verdict does not list included)."""
+    classes = {c.get("case"): c.get("cls") for c in verdict.get("cases") or []}
+    found = {classes.get(name) for name in lost}
+    if len(found) == 1:
+        return NOT_EVALUATED_CAUSE_BY_CLASS.get(found.pop(), NOT_EVALUATED_CAUSE)
+    if found and found <= set(NOT_EVALUATED_CAUSE_BY_CLASS):
+        return NOT_EVALUATED_CAUSE_RAN
+    return NOT_EVALUATED_CAUSE
+
+
 def render_not_evaluated_comment(run: health.Run, verdict: dict, health_doc: dict) -> str:
     """The not-evaluated comment: that cases the suite could not grade were
     lost to infrastructure (unnamed: the pull request is public), that
@@ -487,10 +517,15 @@ def render_not_evaluated_comment(run: health.Run, verdict: dict, health_doc: dic
     storm = BOX_NOT_EVALUATED_STORM if in_storm else ""
     lost = list(verdict.get("not_evaluated") or run.not_evaluated_cases)
     recorded = {c.get("case") for c in verdict.get("cases") or []}
+    cause = not_evaluated_cause(lost, verdict)
+    if cause != NOT_EVALUATED_CAUSE:
+        # The storm is the never-ran shape's weather; beside another stage
+        # it would read as that stage's cause.
+        storm = ""
     if lost and recorded and recorded <= set(lost):
-        box = BOX_NOT_EVALUATED_EVERY.format(storm=storm)
+        box = BOX_NOT_EVALUATED_EVERY.format(cause=cause, storm=storm)
     else:
-        box = BOX_NOT_EVALUATED.format(storm=storm)
+        box = BOX_NOT_EVALUATED.format(cause=cause, storm=storm)
     collapsed = [c for c in verdict.get("cases") or [] if c.get("outcome") == OUTCOME_FAILED and c.get("admitted", True)]
     if collapsed:
         box += BOX_NOT_EVALUATED_COLLAPSED

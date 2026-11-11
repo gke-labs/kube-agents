@@ -35,6 +35,8 @@ REP = {
     "f": {"result": "fail", "reason": GRADED_FAIL},
     "e": {"result": "fail", "reason": EMPTY},
     "i": {"result": "infra", "reason": "KUBE_AGENTS_INFRA_FAILURE"},
+    "g": {"result": "infra", "reason": "KUBE_AGENTS_FORGE_UNAVAILABLE: a forge read failed in transport or was rate limited, so these checks could not be evaluated, which says nothing about the run: a-check: answered 503"},
+    "c": {"result": "infra", "reason": "KUBE_AGENTS_DELEGATION_CEILING: the harness's delegation wait ran out before any delegated card delivered a result"},
 }
 
 
@@ -674,12 +676,14 @@ class WhenItComments(Harness):
 
 
 
-def not_evaluated(build, pr, finished, lost=("security-overgrant-probe",), every=False, minutes=27, **fields):
+def not_evaluated(build, pr, finished, lost=("security-overgrant-probe",), every=False, minutes=27, letters="iii", **fields):
     """A run the suite could not evaluate (SCHEMA.md, `eval_outcome`): the
     lost cases graded nothing, the rest passed, Prow says FAILURE, and the
     suite's list names the lost ones."""
     names = sorted(ADMITTED)
-    tasks = [task(n, "iii" if (every or n in lost) else "ppp") for n in names] + [task(HELD_OUT, "iii" if every else "ppp")]
+    if isinstance(letters, str):
+        letters = {n: letters for n in names + [HELD_OUT]}
+    tasks = [task(n, letters.get(n, "iii") if (every or n in lost) else "ppp") for n in names] + [task(HELD_OUT, letters.get(HELD_OUT, "iii") if every else "ppp")]
     raw = run(build, pr, finished, tasks=tasks, result="FAILURE", minutes=minutes)
     raw.update({"eval_outcome": "not_evaluated", "not_evaluated": names + [HELD_OUT] if every else list(lost), **fields})
     return raw
@@ -769,6 +773,46 @@ class NotEvaluatedComment(Harness):
         self.tick(data(mine, *green_others()), green_health())
         box = self.gh.bodies()[0].split("\n")[3]
         self.assertTrue(box.startswith("> No case could be graded: infrastructure failed before the agent ran. The suite evaluated nothing"), box)
+
+    def test_cases_lost_to_a_forge_outage_name_the_grading_stage(self):
+        """#5503: the agent ran; a forge read failed during grading."""
+        for every, opening in ((False, "> Some cases could not be graded: "), (True, "> No case could be graded: ")):
+            with self.subTest(every=every):
+                mine = not_evaluated(100 + every, 1300 + every, NOW - timedelta(minutes=5), every=every, letters="ggg")
+                self.tick(data(mine, *green_others()), green_health())
+                box = self.gh.bodies()[-1].split("\n")[3]
+                self.assertTrue(box.startswith(opening + "a forge read failed during grading, so the checks that read it could not be evaluated."), box)
+                self.assertNotIn("before the agent ran", box)
+
+    def test_cases_lost_to_the_delegation_ceiling_name_the_wait(self):
+        mine = not_evaluated(100, 1300, NOW - timedelta(minutes=5), letters="ccc")
+        self.tick(data(mine, *green_others()), green_health())
+        box = self.gh.bodies()[0].split("\n")[3]
+        self.assertTrue(box.startswith("> Some cases could not be graded: delegated work was still running when the harness stopped waiting."), box)
+
+    def test_a_mix_of_causes_names_one_stage_only_when_it_is_shared(self):
+        """Forge beside the ceiling: the agent ran for both. Forge beside a
+        storm case, or beside a lost case with no record: the never-ran wording."""
+        lost = ("agent-kanban-smoke", "security-overgrant-probe")
+        for n, (mix, opening) in enumerate((
+            ("ccc", "the agent ran, but the harness could not grade the result."),
+            ("iii", "infrastructure failed before the agent ran."),
+            (None, "infrastructure failed before the agent ran."),
+        )):
+            with self.subTest(beside_forge=mix):
+                mine = not_evaluated(100 + n, 1300 + n, NOW - timedelta(minutes=5), lost=lost, letters={lost[0]: "ggg", lost[1]: mix or "iii"})
+                if mix is None:
+                    mine["tasks"] = [t for t in mine["tasks"] if t["name"] != lost[1]]
+                self.tick(data(mine, *green_others()), green_health())
+                box = self.gh.bodies()[-1].split("\n")[3]
+                self.assertTrue(box.startswith("> Some cases could not be graded: " + opening), box)
+
+    def test_a_declared_storm_is_not_hung_on_a_forge_outage(self):
+        mine = not_evaluated(100, 1300, NOW - timedelta(minutes=5), letters="ggg")
+        self.tick(data(mine, *green_others()), storm_health())
+        box = self.gh.bodies()[0].split("\n")[3]
+        self.assertIn("a forge read failed during grading", box)
+        self.assertNotIn("quota storm", box)
 
     def test_inside_a_declared_storm_the_box_names_it_and_links_the_brief(self):
         mine = not_evaluated(100, 1300, NOW - timedelta(minutes=5))
