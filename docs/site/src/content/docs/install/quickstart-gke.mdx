@@ -24,8 +24,9 @@ holding its private key. Either hand the installer the `.pem` with
 (AOT); see
 [Prerequisites](/kube-agents/install/prerequisites/#gitops-repo--github-token-minter-for-submit-suggestion)
 and [Token minter](/kube-agents/deploy/token-minter/). A GitOps repository on
-GitLab needs an access token instead, and no GitHub App, minter or KMS key:
-see [GitLab as the GitOps forge](/kube-agents/install/gitlab/). For a GitOps
+GitLab or Bitbucket needs an access token instead, and no GitHub App, minter or KMS key:
+see [GitLab as the GitOps forge](/kube-agents/install/gitlab/), and for Bitbucket,
+[Bitbucket as the GitOps forge](/kube-agents/install/bitbucket/). For a GitOps
 repository on a GitHub Enterprise Server, create the App on the instance and
 add `--gitops-host` (and, for a private CA, `--gitops-ca-file`): see
 [INSTALL.md](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#github-enterprise-server).
@@ -39,7 +40,7 @@ add `--gitops-host` (and, for a private CA, `--gitops-ca-file`): see
   or AI Agent without cloning the repository manually.
 </Aside>
 
-Run the release-pinned installer (substituting `<RELEASE_VERSION>` with the desired release tag from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases), for example `0.19.0`; a GitLab install needs `0.9.0` or later):
+Run the release-pinned installer (substituting `<RELEASE_VERSION>` with the desired release tag from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases), for example `0.19.0`; a GitLab install needs `0.9.0` or later, a Bitbucket install `0.29.0` or later):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash
@@ -274,6 +275,7 @@ Once `Ready` holds, in either mode, check the install by talking to it. [First p
 
 - `--gitops-org=ORG`, `--gitops-repo=REPO`, `--github-app-id=ID`, `--github-pem-path=PATH` — configures GitOps PR automation via the in-cluster GitHub token minter (Minty). When `--github-pem-path` is provided, `install.sh` imports the private key into Cloud KMS during install; alternatively, pre-provision the key AOT beforehand (see [Token minter](/kube-agents/deploy/token-minter/)). The fleet audits put their ledger issue and their fix pull requests in the `--gitops-repo` repository, never in a context repository; see [Which repository gets the ledger](/kube-agents/concepts/declarative-workflow/#which-repository-gets-the-ledger).
 - `--gitops-forge=gitlab`, `--gitops-host=HOST`, `--gitlab-token-file=PATH`, `--gitops-ca-file=PATH` — connects a GitOps project on gitlab.com or a self-managed GitLab instead, with no token minter. `--gitops-ca-file` gives the private CA that signed a self-managed instance's certificate. See [GitLab as the GitOps forge](/kube-agents/install/gitlab/).
+- `--gitops-forge=bitbucket` or `--gitops-forge=bitbucket-datacenter`, `--gitops-host=HOST` (Data Center), `--gitops-repo=PATH`, `--gitops-token-file=PATH`, `--gitops-identity=UUID` (Cloud access tokens) — connects a GitOps repository on Bitbucket Cloud or a Bitbucket Data Center instance, with no token minter. See [Bitbucket as the GitOps forge](/kube-agents/install/bitbucket/).
 - `--gitops-host=HOST`, `--gitops-ca-file=PATH` with the GitHub flags above — connects a GitOps repository on a GitHub Enterprise Server, with the GitHub App created on the instance. See [GitHub Enterprise Server in INSTALL.md](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#github-enterprise-server).
 - `--memory=file|hindsight|off` — the agent's long-term memory store; `hindsight` deploys the Hindsight API and Postgres into the cluster.
 
