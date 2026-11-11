@@ -156,8 +156,8 @@ spec:
           # Deployments, StatefulSets, Services, ServiceAccounts, ConfigMaps,
           # PersistentVolumeClaims, NetworkPolicies and PodDisruptionBudgets;
           # ClusterRoles, ClusterRoleBindings, Roles and RoleBindings; and the
-          # three custom resources themselves (PlatformAgent always,
-          # AgentPlugin and AgentProfile where their CRDs are installed and
+          # custom resources themselves (PlatformAgent always, AgentPlugin,
+          # AgentProfile and Tier where their CRDs are installed and
           # readable). Deployments, StatefulSets, Services and
           # PersistentVolumeClaims grow with the cluster's workloads, a
           # Deployment carrying a whole pod template, so a cluster with
