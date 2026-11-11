@@ -69,7 +69,8 @@ Why: a trail of progress posts buries the answer and notifies the user for every
 Today: under `next`, the `progress` artifact is "the task's one live message, edited in place"
 ([`spec-a2a-payloads.md`](../../docs/designs/spec-a2a-payloads.md), "Chat messages"), drawn by
 `updateRollingLine` in `a2a/gateway/relay.go`; the queue notice in `a2a/gateway/busy.go` replaces
-the placeholder rather than following it. Under `today`, a card's heartbeats share one message
+the placeholder rather than following it, and on Google Chat the answer replaces the line
+(`answerOnLine` in `a2a/gateway/relay_chat.go`) rather than leaving it under the answer. Under `today`, a card's heartbeats share one message
 ([`agents/platform/SOUL.md`](../../agents/platform/SOUL.md) §0, "Show your progress"), the plan is
 one message per thread (`agents/platform/scripts/slack_status.py`), and `kanban_notifier.py`'s
 `drop_superseded` drops a held failure line, before it posts, once the card recovers.

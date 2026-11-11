@@ -236,6 +236,25 @@ type StatusShower interface {
 	ShowsTaskStatus(conversation string) bool
 }
 
+// LineAnswerer is the optional extension an Adapter implements when a
+// completed task's answer takes the place of its live message, the
+// "⏳ submitted…" line, rather than following it. A backend with no
+// reaction and no Working… status (Google Chat) has the line as its only
+// receipt of the ask, and the terminal edit left it reading "✅ completed"
+// under the question, above the answer, where Slack shows no line at all.
+// With it true the relay edits the line into the answer, laid out or as
+// text with its rating controls, or into the hand-off acknowledgement of a
+// turn that filed cards, and makes no terminal edit; an answer longer than
+// one message puts its first chunk on the line and posts the rest. An edit
+// that does not land leaves the answer to be posted as on any backend, and
+// the terminal edit follows. A failed, canceled or rejected task keeps its
+// terminal edit and its notice. Asked per conversation, so a wrapper (the
+// mux, the side door) answers for the backend that owns it, and a door
+// keeps its line, which its caller reads as data.
+type LineAnswerer interface {
+	AnswersOnLine(conversation string) bool
+}
+
 // OutMessage is one post or edit as a value: the text, and the chat message
 // that lays the same content out (spec-a2a-payloads.md, "Chat messages").
 type OutMessage struct {

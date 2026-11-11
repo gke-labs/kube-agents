@@ -766,6 +766,9 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		rec.markCardsAnswer(taskID)
 	}
 
+	// lineAnswered is set when the task's live message became the answer
+	// (answerOnLine), so the terminal edit below leaves it be.
+	lineAnswered := false
 	switch s.Status.State {
 	case lib.StateCompleted:
 		// Whole, to the adapter whose caller is a program, before the chunked
@@ -802,6 +805,10 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		if !isConsoleConversation(rec.Key) {
 			if ref.TerminalObserved && result == completedNonTextResult {
 				// The heal already posted the status card; skip completedNonTextResult.
+			} else if line := g.answerLineFor(rec, taskID); line != "" && g.answerOnLine(rec.Key, line, answer) {
+				// The task's live message is the answer now, and takes
+				// no terminal edit below (LineAnswerer).
+				lineAnswered = true
 			} else {
 				g.postMessage(rec.Key, answer)
 			}
@@ -837,7 +844,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	g.terminalMark(rec, taskID, s.Status.State, terminal)
 
 	if active := rec.ActiveTask; active != nil && active.TaskID == taskID {
-		if active.StatusMsgID != "" {
+		if active.StatusMsgID != "" && !lineAnswered {
 			// The same display gate as the rolling line: under default the
 			// terminal edit carries the state and never the narration.
 			progress := rs.progress
@@ -872,11 +879,13 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		// that kept it. Its answer ("delegated to platform") is task
 		// activity for the session-thread rule all the same; LastActivity
 		// stays the active task's business.
-		progress := rs.progress
-		if g.cfg.DisplayMode == displayModeDefault {
-			progress = ""
+		if !lineAnswered {
+			progress := rs.progress
+			if g.cfg.DisplayMode == displayModeDefault {
+				progress = ""
+			}
+			g.renderLine(rec.Key, parent.StatusMsgID, terminalLine(s.Status.State, progress), rs, "")
 		}
-		g.renderLine(rec.Key, parent.StatusMsgID, terminalLine(s.Status.State, progress), rs, "")
 		setParentLine(rec, taskID, "")
 		if source == TerminalFromExecutor {
 			rec.LastTaskActivity = time.Now().UTC()
