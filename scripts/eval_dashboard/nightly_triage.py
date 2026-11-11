@@ -418,13 +418,16 @@ class Preparer:
     def open_prs_touching(self, files: list[str], notes: list[str]) -> list[dict]:
         if not files:
             return []
+        # Only a good read is kept for the run's other issues: a failed one
+        # is tried again, and noted on every issue it failed for.
         if self._open_prs is None:
             owner, _, name = ghcli.SOURCE_REPO.partition("/")
             found = self.source_gh.call("POST", "graphql", {"query": OPEN_PRS_QUERY, "variables": {"owner": owner, "name": name}}, read=True)
             nodes = ((((found or {}).get("data") or {}).get("repository") or {}).get("pullRequests") or {}).get("nodes") if isinstance(found, dict) else None
-            self._open_prs = nodes if isinstance(nodes, list) else []
             if not isinstance(nodes, list):
                 notes.append("the open pull requests could not be read")
+                return []
+            self._open_prs = nodes
         wanted = set(files)
         out = []
         for pr in self._open_prs:
@@ -610,11 +613,24 @@ FAILED_COMMENT = """\
 {marker}
 **Agent triage did not run:** {why}. Routed by the filing rule to {routed}.{cc}
 """
+KEPT_COMMENT = """\
+{marker}
+**Agent triage did not run:** this issue already had an assignee, @{assignee} (set by an earlier triage run whose comment did not post, or by hand), and it stays theirs.{cc}
+"""
 SUSPECT_LINE = "{url} by {author}: {title}"
 SUSPECT_NONE = "none named from the commit window"
 SUSPECT_DROPPED = "none: the model named #{n}, which is not in the commit window, so it was set aside"
 FIX_LINE = "{url} is {state}"
+# Text this step does not control (a pull request's title, the model's
+# evidence, built from transcripts) loses every mention: a zero-width space
+# after each `@`, which no backtick placement can undo.
+DEFANG_RE = re.compile(r"@(?=[A-Za-z0-9])")
 FIX_NONE = "none found among open pull requests touching the same files or merged since the first red night"
+
+
+def defang(text: str) -> str:
+    """``text`` with no @-mention GitHub would link (DEFANG_RE)."""
+    return DEFANG_RE.sub("@\u200b", text)
 
 
 def render_comment(verdict: dict | None, failure: str | None, bundle: dict | None, assignee: str | None, why: str, cc: list[str], model: str) -> str:
@@ -629,7 +645,7 @@ def render_comment(verdict: dict | None, failure: str | None, bundle: dict | Non
         pr = prs.get(str(verdict["suspected_pr"])) or {}
         author = pr.get("author")
         shown = (f"@{author}" if author and author.lower() == (assignee or "").lower() else f"`{author}`") if author else "an unknown author"
-        suspect = SUSPECT_LINE.format(url=ghcli.pr_url(ghcli.SOURCE_REPO, verdict["suspected_pr"]), author=shown, title=nightly_bugs.quiet_mentions(pr.get("title") or ""))
+        suspect = SUSPECT_LINE.format(url=ghcli.pr_url(ghcli.SOURCE_REPO, verdict["suspected_pr"]), author=shown, title=defang(pr.get("title") or ""))
     elif verdict.get("dropped_suspect"):
         suspect = SUSPECT_DROPPED.format(n=verdict["dropped_suspect"])
     else:
@@ -642,7 +658,7 @@ def render_comment(verdict: dict | None, failure: str | None, bundle: dict | Non
               f"{red['head_sha'] + ' (' + red['date'] + ')' if red else 'an unknown red night'}, "
               f"{len(fix_prs(bundle or {}))} candidate fixes")
     return COMMENT.format(marker=marker, model=model, classification=CLASSES[verdict["classification"]], priority=verdict["priority"],
-                          confidence=verdict["confidence"], suspect=suspect, fix=fix, evidence=nightly_bugs.quiet_mentions(verdict["evidence"]) or "(no evidence given)",
+                          confidence=verdict["confidence"], suspect=suspect, fix=fix, evidence=defang(verdict["evidence"]) or "(no evidence given)",
                           routed=routed, cc=cc_line, inputs=inputs)
 
 
@@ -684,8 +700,13 @@ class Router:
             if comments is None:
                 return {"issue": number, "verdict": None, "ok": False, "why": "the comments could not be read"}
             posted = next((m for c in comments if isinstance(c, dict) for m in [COMMENT_MARKER_RE.search(c.get("body") or "")] if m), None)
+        current = [a.get("login") for a in issue.get("assignees") or [] if isinstance(a, dict) and a.get("login")]
         if posted:
             failure = "routed by an earlier run"
+        elif self.live and marker and current:
+            # Assigned already (an earlier run's comment failed, or a person
+            # got there first): no second opinion to pair with that assignee.
+            failure = "already assigned"
         elif self.model is None:
             failure = "triage is switched off (NIGHTLY_TRIAGE_LIVE is not true)"
         elif bundle is None and opened and self.now - opened > PENDING_MAX_AGE:
@@ -721,7 +742,13 @@ class Router:
             assignee, why = self.assign(number, candidates)
             if why is None:
                 return dict(entry, ok=False, why="the assignment call failed")
-        if not posted:
+        if not posted and current:
+            mentions = [c for c in cc if c.lower() != current[0].lower()]
+            body = KEPT_COMMENT.format(marker=COMMENT_MARKER.format(assignee=current[0]), assignee=current[0],
+                                       cc=f" cc {', '.join('@' + c for c in mentions)}" if mentions else "")
+            if self.gh.call("POST", self.gh.path(nightly_bugs.COMMENTS_PATH.format(number=number)), {"body": body}) is None:
+                return dict(entry, assignee=current[0], ok=False, why="the comment could not be posted")
+        elif not posted:
             body = render_comment(entry["verdict"], entry["failure"], bundle, assignee, why, cc, self.model_name)
             if self.gh.call("POST", self.gh.path(nightly_bugs.COMMENTS_PATH.format(number=number)), {"body": body}) is None:
                 return dict(entry, assignee=assignee, ok=False, why="the comment could not be posted")

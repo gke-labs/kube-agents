@@ -500,10 +500,15 @@ class FailSafeTest(Harness):
         self.assertEqual(issues.writes("PATCH"), [])
         issues.fail_comment = False
         issues.calls.clear()
-        self.route(issues, bundles, FakeModel(answer(suspected_pr=None, classification="case_rework")))
+        model = FakeModel(answer(suspected_pr=None, classification="case_rework"))
+        self.route(issues, bundles, model)
+        self.assertEqual(model.prompts, [], "no second opinion to pair with the first run's assignee")
         self.assertEqual(issues.writes("/assignees"), [], "an assignee already set is kept")
         [comment] = issues.posted()
-        self.assertIn("@grader-author (assigned before this run)", comment)
+        self.assertIn("<!-- kube-agents-bot:nightly-triage assignee=grader-author -->", comment)
+        self.assertIn("already had an assignee, @grader-author", comment)
+        self.assertNotIn("filing rule", comment)
+        self.assertEqual(len(issues.writes("PATCH")), 1, "and it is marked done")
 
     def test_a_comment_from_an_earlier_run_is_not_posted_again(self):
         _, issue = self.file_pending()
@@ -557,8 +562,38 @@ class ReviewFindingsTest(Harness):
         bundles.write_text(json.dumps(doc))
         self.route(issues, bundles, FakeModel(answer(evidence="Caused by @grader-author and @someone-else.")))
         [comment] = issues.posted()
-        self.assertIn("Caused by `grader-author` and `someone-else`.", comment)
-        self.assertIn("ping `everyone`", comment)
+        self.assertIn("Caused by @\u200bgrader-author and @\u200bsomeone-else.", comment)
+        self.assertIn("ping @\u200beveryone", comment)
+
+    def test_defang_survives_backticks(self):
+        for text in ("fix `@everyone", "`foo`@alice", "`cmd @bob` `@alice`"):
+            self.assertIsNone(re.search(r"@[A-Za-z0-9]", nightly_triage.defang(text)), text)
+
+    def test_a_single_case_issue_keeps_its_domain_owner_when_marked_done(self):
+        doc = nb.data(*(nb.night(d, [nb.red("case-maint")]) for d in (1, 2, 3)))
+        _, issue = self.file_pending(doc)
+        self.assertIn("Domain owner: `carol`", issue["body"])
+        issues = FakeIssues([issue])
+        self.route(issues, None, None, extra=["--no-model"])
+        [(_, _, patch)] = issues.writes("PATCH")
+        self.assertIn(nightly_triage.TRIAGED_ADDRESSEE, patch["body"])
+        self.assertIn("Domain owner: `carol`", patch["body"])
+
+    def test_a_failed_open_pr_read_is_noted_on_every_issue(self):
+        _, issue = self.file_pending()
+        issues = FakeIssues([issue, dict(issue, number=38, created_at="2026-11-09T12:20:00Z")])
+
+        class OpenPrsDown(FakeSource):
+            def __call__(self, argv, input=None, **kwargs):
+                if "pullRequests(states: OPEN" in (json.loads(input) if input else {}).get("query", ""):
+                    self.queries.append("open")
+                    return nb.GhResult(rc=1, stderr="HTTP 502")
+                return super().__call__(argv, input, **kwargs)
+        source = OpenPrsDown()
+        bundles = json.loads(self.prepare(issues, source=source).read_text())
+        for number in ("37", "38"):
+            self.assertIn("the open pull requests could not be read", bundles[number]["notes"])
+        self.assertEqual(source.queries.count("open"), 2, "a failed read is tried again")
 
     def test_the_backstop_takes_only_issues_waiting_past_the_limit(self):
         _, issue = self.file_pending()

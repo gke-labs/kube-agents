@@ -705,7 +705,9 @@ def pending_body(body: str, addressee: str, chain: list[tuple[str | None, str]],
     login, why = chain[0] if chain else (None, "")
     fallback = TRIAGE_FALLBACK_LOGIN.format(login=login, why=why) if login else TRIAGE_FALLBACK_NOBODY.format(why=why)
     marker = TRIAGE_PENDING_MARKER.format(assign=login_list(c for c, _ in chain), cc=login_list(cc))
-    return marker + "\n" + quiet_mentions(body.replace(addressee, TRIAGE_PENDING_ADDRESSEE.format(fallback=fallback), 1))
+    # On a line of its own, so the triage step's rewrite of it, to the end of
+    # its line, leaves what followed (the domain owner) in place.
+    return marker + "\n" + quiet_mentions(body.replace(addressee, TRIAGE_PENDING_ADDRESSEE.format(fallback=fallback) + "\n", 1))
 
 
 def render_issue(case: str, domain: str, domain_row: dict, assignee: str | None, why: str, streak: list[dict]) -> tuple[str, str]:
