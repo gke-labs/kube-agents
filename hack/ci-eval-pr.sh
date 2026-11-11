@@ -4416,7 +4416,7 @@ unit_cost_hint() {
     # stack case: its tofu stack plants one alert policy, about 2s to apply
     # and 1s to destroy, so the unit is the agent turn. Measured on the
     # main-b nightlies 2026-10-27 to 11-02: median 201s, 43-974s over 21
-    # repetitions (243s, 66-448s over the 15 on gemini-4-argon). Priced at
+    # repetitions (243s, 66-448s over the 15 on the newer agent model). Priced at
     # 600s rather than the 200s default it ran the nightly at: the
     # hint sets its launch order and its share of the presubmit wall estimate
     # in scripts/eval_rosters.py, and the main shards' balance test in

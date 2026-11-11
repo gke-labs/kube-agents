@@ -37,7 +37,7 @@ namespaces and events in each cluster.
 | Pods                  | 17,385 (about 435 per cluster)                                                                               |
 | Namespaces            | 1,683 (about 42 per cluster)                                                                                 |
 | Deployments, Services | 7,643 and 7,520                                                                                              |
-| Install               | `main` at `0108e59d`, `spec.mode: next`, model `vertex_ai/gemini-3.5-flash`                                  |
+| Install               | `main` at `0108e59d`, `spec.mode: next`, the install's default model on Vertex AI                            |
 | Container size        | L: agent 8 CPU / 16 GB, credential proxy 8 CPU / 8 GB, event watcher 2 CPU / 4 GB; shell fixed 2 CPU / 2 GiB |
 | Host                  | 2 × e2-standard-4                                                                                            |
 
@@ -308,7 +308,7 @@ The hourly series reproduces in Metrics Explorer with this PromQL:
 ```promql
 sum by (type) (increase(aiplatform_googleapis_com:publisher_online_serving_token_count{
   monitored_resource="aiplatform.googleapis.com/PublisherModel",
-  model_user_id="gemini-3.5-flash"}[1h]))
+  model_user_id="<the install's model>"}[1h]))
 ```
 
 ### Cost of one install at 42 clusters, steady operation

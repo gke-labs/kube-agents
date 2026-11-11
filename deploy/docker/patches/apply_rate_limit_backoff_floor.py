@@ -40,7 +40,7 @@ WAIT_ANCHOR = (
 #: Text only the retryDelay patch leaves behind; it has to be in the file first.
 RETRY_DELAY_MARKER = "_kube_retry_delay_from_error"
 
-FLOOR_INSERT = '''    # kube-agents patch: a 429 that names no reset window, as gemini-4-argon's
+FLOOR_INSERT = '''    # kube-agents patch: a 429 that names no reset window, as Vertex's
     # dynamic-shared-quota 429 does not (no Retry-After, no retry_after field,
     # no RetryInfo), would get the stock 2-6s jittered backoff and spend all
     # three retries inside a quota minute that is still closed. Wait a

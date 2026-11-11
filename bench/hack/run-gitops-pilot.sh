@@ -381,7 +381,7 @@ fi
 # devops-bench stamps AGENT_MODEL on the result row; unset, the row carried
 # the harness name in that field (runs 7 and 8). Resolve the alias the agent
 # calls to the model LiteLLM routes it to, minus the provider prefix
-# (`vertex_ai/gemini-2.5-flash` -> `gemini-2.5-flash`). Done before the
+# (`vertex_ai/<model>` -> `<model>`). Done before the
 # rollout wait below so a missing ConfigMap fails fast instead of after it.
 if [ -z "${AGENT_MODEL:-}" ]; then
   # The ConfigMap the LiteLLM Deployment mounts, not the newest one by name: a

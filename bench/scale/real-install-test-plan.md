@@ -302,7 +302,7 @@ Cost is part of the scalability answer, so each step also gives what it cost:
   XL fleet). The test clusters' own cost is the fleet's, not the install's, so the report lists it
   apart.
 - **Model tokens.** LiteLLM's input, cached and output tokens for the step, times the list price of
-  the install's model (`gemini-3.5-flash` on this install) per million tokens of each kind. The
+  the install's model per million tokens of each kind. The
   report gives the cost of the first-run flow, of each heavy question, and of a day of scheduled
   work from the overnight soak.
 - **Prices.** GKE prices come from the Cloud Billing Catalog API and the model's from the provider's

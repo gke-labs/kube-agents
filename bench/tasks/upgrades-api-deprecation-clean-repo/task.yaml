@@ -5,7 +5,7 @@
 # Still `validated: false`: its nightly record (0 of 15 through 2026-10-17)
 # predates the scan route of #1680; it is validated once that record shows it
 # both pass and fail. A dev-install loop for that route ran on a
-# gemini-3.8-flash install whose managed repository carries manifests.
+# dev install whose managed repository carries manifests.
 #
 # The Phase-4 case for the fleet-upgrade-verification skill (#1343, #1412):
 # not "which clusters lag" (upgrades-fleet-version-table asks that) but "is the

@@ -26,12 +26,12 @@
 #
 # RED: `main`, where SOUL.md reads a context repository for declared intent
 # only, and a change request whose pull request cannot be opened ends in a
-# `needs_input` block (§3 item 3). Seen three times on `main` (gemini-4-argon,
+# `needs_input` block (§3 item 3). Seen three times on `main` (the agent model,
 # 2026-11-06): the worker traced the chart and named the file, then blocked
 # the card with `result` null and asked for the chart repository to be
 # registered as managed, so the diagnosis reached the requester only as a
 # block reason. The card-ending pair below is what fails. The customer's
-# agent (chart 0.16.0, gemini-3.5-flash) failed earlier in the chain: it
+# agent (chart 0.16.0) failed earlier in the chain: it
 # edited the writable repository (an override, a second copy of an object)
 # or asked for the encrypted file's key; the path objective and the two
 # safeguards hold that ground, and passed on `main` in those three runs.

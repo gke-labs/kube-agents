@@ -38,9 +38,9 @@ page's sake; in the file a record is one line.
   "recorded_at": "2026-08-25T00:00:00Z",
   "commit": "<the main sha this batch ran on>",
   "key": {
-    "setup_id": "gemini-3-1-pro-preview-kubeagents-mcp",
+    "setup_id": "agent-a-kubeagents-mcp",
     "scoring_version": "v1",
-    "judge_model": "gemini-3.1-pro-preview",
+    "judge_model": "judge-a",
     "fleet": 1,
     "verifiers": 1
   },
@@ -173,7 +173,7 @@ key — so an object files itself under the software it was measured on:
 
 ```
 gs://kube-agents-evals-bench/evidence/agent-kanban-smoke/
-  gemini-3-1-pro-preview-kubeagents-mcp/gemini-3.1-pro-preview/v1-f1-v1/
+  agent-a-kubeagents-mcp/judge-a/v1-f1-v1/
     2026-08-01T02-03-04Z-12345.jsonl
 ```
 

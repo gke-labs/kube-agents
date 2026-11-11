@@ -924,7 +924,7 @@ fi
 
 # vertex_ai stays the default, for the presubmits' concurrency. On 2026-09-02
 # every smoke run redded on 429s from one shared Gemini Developer API key's
-# fixed paid-tier-3 quota -- 8,000,000 input tokens/minute for gemini-3.1-pro,
+# fixed paid-tier-3 quota -- 8,000,000 input tokens/minute for the model then in use,
 # named in the error body -- with five concurrent builds drawing ~94k-token
 # turns from one shared minute window (#1097; the full diagnosis with build
 # artifacts is on #1184). Vertex AI serves the same Gemini models under dynamic

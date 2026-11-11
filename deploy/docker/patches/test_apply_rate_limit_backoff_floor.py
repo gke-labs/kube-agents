@@ -104,12 +104,12 @@ class ApplierTest(unittest.TestCase):
                 retry_count=1, max_retries=3, is_zai_coding_overload=False,
                 base_url="http://inference-gateway", model="gemini",
             )
-            argon = Exception(
+            dsq = Exception(
                 "Error code: 429 - TPM quota exhausted. No spare capacity is currently "
                 "available to serve over-limit requests."
             )
             for _ in range(20):
-                wait = module.compute_error_backoff(None, argon, is_rate_limited=True, **kwargs)
+                wait = module.compute_error_backoff(None, dsq, is_rate_limited=True, **kwargs)
                 self.assertGreaterEqual(wait, FLOOR_MIN_SECONDS)
                 self.assertLessEqual(wait, FLOOR_MAX_SECONDS)
             storm = Exception('{"details": [{"retryDelay": "54s"}]}')
@@ -118,7 +118,7 @@ class ApplierTest(unittest.TestCase):
                 "a delay the body names still wins over the floor",
             )
             self.assertEqual(
-                module.compute_error_backoff(None, argon, is_rate_limited=False, **kwargs), 2.0,
+                module.compute_error_backoff(None, dsq, is_rate_limited=False, **kwargs), 2.0,
                 "a non-429 keeps the stock backoff",
             )
         finally:
