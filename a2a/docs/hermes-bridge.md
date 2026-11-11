@@ -743,6 +743,21 @@ all the same. A follow-up to a control is refused `task-ending`. A bridge older 
 control rejects it `no-text-parts`. The gateway reads each of these as "the cards could not be
 stopped".
 
+**A cancel during the in-turn card wait** (a console or A2A door turn holding for the cards it
+filed) stops the session's cards the same way, with the same POST, and holds the canceled
+terminal until session-kv answers. A2A terminals are final, so the answer has to ride the
+terminal: its `result` reads `canceled; ` followed by the control's text, with the same
+cardStop part, or `canceled; the card stop was not confirmed (<why>)` when session-kv refused,
+timed out (`BRIDGE_CARD_STOP_TIMEOUT_SECONDS`) or the bridge is shutting down, which ends the
+hold at once. A2A door `tasks/cancel` returns before the terminal, so the hold delays only when
+`tasks/get` shows `canceled`. One POST goes out per canceled run that filed cards, whichever path
+asks first. A cancel outside the wait still stops the cards in the background.
+
+session-kv's stop is single-flight per session and conversation. A stop that arrives while
+another runs, or within 60 s of one with no card filed since its first scan began, answers with
+that stop's result, marked `joined`. So the control and a typed stop's cancel, which both run when
+the gateway's card stop is armed, report the same cards rather than one of them "stopped 0".
+
 ## Sizing against the eval harness
 
 This section is the canonical statement of the sizing; the eval transport design
