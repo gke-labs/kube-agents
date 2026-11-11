@@ -455,7 +455,7 @@ func TestAShortTierRequeuesSoonerWhileTheClusterRoleIsOutOfDate(t *testing.T) {
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}, &appsv1.Deployment{}).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
 	authorizer := &fakeAuthorizer{deny: denyPDBPatch}
-	checker := NewRBACChecker(authorizer.reviews())
+	checker := NewRBACChecker(authorizer.reviews(), "")
 	if _, err := checker.Probe(context.Background()); err != nil {
 		t.Fatalf("boot probe: %v", err)
 	}

@@ -141,7 +141,8 @@ used only when it matches the profile-name pattern.
 ### 3.9 Credentials outlive the tick, and a short tick says what it covered
 
 Every `gcloud`, `kubectl` and `stall_report.py` call the watch makes goes through the credential
-proxy, and a `get-credentials` there is a real gcloud run each time, while kubectl is served from
+proxy, and a `get-credentials` there is a real gcloud run each time (with the kube-api proxy in use,
+one relay read instead, #5447), while kubectl is served from
 the proxy's own managed kubeconfig: of the per-cluster file only the context name crosses, and the
 proxy regenerates the rest. So the watch
 fetches a cluster's credentials once, records the time in its ledger (`credentials`), and reuses
@@ -189,6 +190,57 @@ last tick whose sweep ran, its listing, sweep and whole-tick seconds and its clu
 read; the whole-tick figure is `null` in a ledger saved before the tick reached its end. They live in the ledger rather than on stderr because the scheduler
 discards a script's stderr when it exits 0.
 
+### 3.10 One read per kind per cluster, clusters four at a time
+
+Those figures showed where a tick went: every call through the sandbox shim and the credential
+broker costs one to two seconds before the cluster answers, and the watch made kinds-plus-one of
+them per namespace (one `kubectl get` per kind, one for the Warning events, in `stall_report.py`),
+about 12 s a namespace. A cluster of a few hundred namespaces cost more than the whole budget on
+its own, every tick ran to the budget, and a pass over a 209-cluster fleet took six ticks. So the
+watch now runs `stall_report.py` once per cluster, in a cluster mode (`--namespaces`): each kind
+is read once across the cluster and split per namespace in Python, through the same `analyze`,
+so the rows a namespace gets are the rows its own read gave. A cluster costs kinds-plus-one reads
+plus one per referent kind the dangling-reference heuristic resolves, whatever its namespace
+count.
+
+Two shapes of read, because the broker has two rules. The kinds in the broker's raw-path
+allowlist (`command_policy.KUBECTL_RAW_COLLECTIONS`: the workload kinds, Jobs, Services and the
+like, and the events) are paged through `kubectl get --raw <collection>?limit=500`, following
+`continue`, the way the fleet collectors read: each reply is one page, and a page the broker
+cuts is asked for again at half the size, down to a floor. Every other kind, the Gateway API and
+cert-manager kinds and every Config Connector kind among them, is a raw path the broker refuses,
+so it is read with one chunked `kubectl get <kind> --all-namespaces --chunk-size=500`, which
+pages the requests kubectl makes but prints one reply the broker can cut at its output cap.
+`scripts/check_cluster_reads.py` names that read `unresolved-kinds` (its kind is the CR's, not
+a literal) and the allowlist pins it with the reason below.
+
+The cluster-wide read never costs coverage. A kind no cluster-wide read could read whole (the
+reply was cut, the read failed, or a `kind/name` that names one object) is listed under
+`fallback` in the report and read per namespace as before, in the namespaces that asked for it,
+behind the budget check and the cursor; events that could not be read whole send every namespace
+to its own read, which reads its own events; a cluster report that cannot be had at all (the
+script failed, printed no report, or timed out short of the budget) sends the cluster to the
+per-namespace path throughout. The referents of the dangling-reference heuristic are resolved
+from one name-only listing per kind across the cluster (`-o custom-columns` of namespace and
+name, never a body), a cut or failed listing leaving the kind unresolved as a failed `-o name`
+did. The cursor keeps its two grains: a tick that runs out before a cluster's read resumes at
+the cluster; one that runs out between per-namespace reads resumes at the namespace.
+
+Clusters are read `SCAN_WORKERS` (four) at a time once the listing is in. The bound is the
+broker's: it admits eight commands at once, the shell role is interactive there and admitted
+while fewer than all but one slot are taken, so seven, and four of those seven leaves three for
+the kanban workers and the reconciler, the share `LIST_WORKERS` already takes while the projects
+list. Every brokered hop the watch makes, the discovery pool's batches included, passes through
+one semaphore of that width, so nested pools never add up past it. Each worker fills a
+`ClusterPart` and shares nothing but the budget flag; the parts are folded in sweep order on the
+main thread, so the ledger reads the same whatever order the clusters finished in. The budget
+check now returns the time left and every scan's timeout is cut to it, because with four reads in
+flight the check between scans alone would let a tick run four reads past the budget; a timeout at
+the budget is the cursor's resume point, not a failed cluster. The cursor after a parallel tick
+is the first cluster in sweep order no worker started or that the budget cut inside; a cluster
+after it that a worker had begun is read whole and read again next tick, the price of reading
+several at once.
+
 ## 4. Work breakdown
 
 1. Daemon: `controller-stall` kind (advertised in `/healthz`), payload validation, ledger row,
@@ -210,6 +262,9 @@ testable without the producer change.
 - `bench/tf/prebuilt/controller-stall/main.tf`, `variables.tf` (new)
 - `hack/ci-eval-pr.sh`, `hack/eval/nightly-cases.txt`, `scripts/test_eval_rosters.py`
 - `agents/platform/scripts/stall_watch.py`, `test_stall_watch.py`
+- `agents/platform/scripts/stall_report.py`, `test_stall_report.py` (the cluster mode of §3.10),
+  and its byte-identical copy `agents/cluster/persona/skills/gke-stall-detection/scripts/stall_report.py`
+- `scripts/cluster_reads_allowlist.txt` (the chunked read of §3.10, pinned for both copies)
 - `agents/cluster/skills/gke-stall-detection/SKILL.md`
 - `agents/platform/cron/README.md`
 - `agents/platform/docs/autoops-architecture.md`, `agents/platform/docs/session_management.md`
@@ -237,7 +292,21 @@ The `Credentials` tests hold the fetch to the first tick, a day-old record and a
 the `Coverage` tests the budget entry's content and the chat line's cadence (§3.9), and the `Timings`
 tests the ledger's per-cluster and per-tick cost records: a read cluster and the tick timed, a cut
 cluster showing fewer scans than namespaces beside an unreached one keeping its record, and an
-unreadable cluster timed with no scans while a cluster gone from the listing is dropped.
+unreadable cluster timed with no scans while a cluster gone from the listing is dropped. The
+`ClusterRead` tests cover §3.10 at the watch: one call per cluster naming the watched namespaces
+(an excluded one absent), the served kinds (one api-resources does not list absent, its rows held)
+and a Config Connector kind only where discovery found it; a kind or the events left over read per
+namespace; a failed, unparseable or timed-out cluster read read per namespace; a timeout at the
+budget as the resume point; the scan timeout cut to the budget left; and the same ledger rows
+whichever path read them. `Parallel` holds four reads in flight at once and checks the width, that
+the ledger a parallel sweep leaves matches a serial one's, that clusters no worker had started when
+the budget ran out are the resume point, and that a lost sandbox on one worker is one sweep
+failure. `test_stall_report.py`'s `ClusterMode` drives the cluster mode over recorded kubectl
+output, two raw pages of Deployments without item kinds, a chunked Gateway listing, Warning events
+and name-only referent listings, and asserts each namespace's findings equal, byte for byte, what
+the namespace path gives from the same objects; and a cut chunked reply, a cut raw page halved and
+retried, a page cut at the floor, a failed raw read, cut events and a `kind/name` each landing in
+`fallback`.
 
 **Eval.** `autoops-controller-stall-triage`, modelled on `gitops-drift-out-of-band-triage`, covers the
 daemon end of the chain and everything after it, not the stall watch, which its unit tests cover. Its

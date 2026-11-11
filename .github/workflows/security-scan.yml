@@ -18,6 +18,11 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# gosec is not here. The `main-merge-queue` ruleset requires none of these
+# checks, so a red one holds no merge; gosec runs inside the required Go
+# checks instead (k8s-operator-test.yml and k8sapiproxy-test.yml, whose
+# headers say why).
+
 permissions:
   contents: read
 
@@ -29,38 +34,6 @@ env:
   SEGMENT_DOWNLOAD_TIMEOUT_MINS: "1"
 
 jobs:
-  gosec-scan:
-    name: Go Security Scan (gosec)
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: "k8s-operator/go.mod"
-          cache: true
-          cache-dependency-path: "k8s-operator/go.sum"
-      - name: Run gosec
-        working-directory: k8s-operator
-        # G703 (path traversal) and G706 (log injection) arrived in gosec
-        # 2.28.0 and take os.Args and os.Getenv as taint sources. Every flag
-        # the operator and k8s-event-watcher read is rendered by the operator
-        # into their own Deployments, so argv is inside the trust boundary
-        # rather than attacker input, and all 12 findings the pair reports
-        # today trace back to it — one of them, a log.Printf whose only
-        # argument is an int, is the analyzer being imprecise. G304 stays
-        # enabled and still catches a file path that does come from outside.
-        run: go run github.com/securego/gosec/v2/cmd/gosec -exclude=G703,G706 ./...
-      # The same gosec, built from k8s-operator/go.mod's pin, over the
-      # k8s-api-proxy module, which declares no gosec of its own. No
-      # exclusions: the G703/G706 reasoning above is about the operator's argv.
-      - name: Run gosec on k8s-api-proxy
-        run: |
-          go -C k8s-operator build -o "$RUNNER_TEMP/gosec" github.com/securego/gosec/v2/cmd/gosec
-          cd k8s-api-proxy
-          "$RUNNER_TEMP/gosec" ./...
-
   trivy-scan:
     name: Container & Manifest Scan (trivy)
     runs-on: ubuntu-latest

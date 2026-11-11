@@ -5,17 +5,24 @@
 # (`multi-kind-dump`, `unpaged-list` or `unresolved-kinds`), the count above
 # zero, the reason the rest of the line.
 #
-# The list only shrinks. The check fails when a file has more findings than
-# its entry (a rise), when it has fewer (lower the count, or remove the entry
-# once the file is clean), when an entry names a file the check does not
-# scan, repeats a file and rule, names another rule, or is not an entry. A
-# file with no entry is held at zero, so a new whole-cluster read anywhere is
-# a failure, never a new line here.
+# The list only shrinks for the `multi-kind-dump` and `unpaged-list` reads it
+# was born with. The check fails when a file has more findings than its entry
+# (a rise), when it has fewer (lower the count, or remove the entry once the
+# file is clean), when an entry names a file the check does not scan, repeats
+# a file and rule, names another rule, or is not an entry. A file with no
+# entry is held at zero, so a new whole-cluster dump anywhere is a failure,
+# never a new line here. The one addition the list takes is an
+# `unresolved-kinds` read the check cannot classify because its kind is a
+# runtime value (a configured list, a discovered CRD), when the read is one
+# kind per call and bounded or falls back when the broker cuts it; the
+# check's own hint names that route, and the entry's reason says how the
+# read is bounded.
 #
-# Every read below is one the pagination conversion of the collectors and
-# the SOPs replaces with a paged or per-kind read; an entry leaves this file
-# when its read is converted. `python3 scripts/check_cluster_reads.py --counts`
-# prints the first three fields for the tree as it stands.
+# Every `multi-kind-dump` and `unpaged-list` read below is one the pagination
+# conversion of the collectors and the SOPs replaces with a paged or per-kind
+# read; such an entry leaves this file when its read is converted.
+# `python3 scripts/check_cluster_reads.py --counts` prints the first three
+# fields for the tree as it stands.
 
 agents/platform/governance/ai_security_audit_sop.md multi-kind-dump 2 the AI-workload audit's per-cluster dump of Deployments, StatefulSets, DaemonSets, CronJobs and Pods, and the same dump as the checks_run example's command
 agents/platform/governance/ai_security_audit_sop.md unpaged-list 1 the AI-workload audit's per-cluster Service read
@@ -35,3 +42,5 @@ agents/platform/skills/fleet-audit/scripts/collect.py unpaged-list 5 the fleet-a
 agents/platform/skills/fleet-audit/scripts/fleet_stockout.py unpaged-list 1 the stockout collector's one-shot ComputeClass read, the one kind of its former five-kind dump the paged dump does not cover (a CRD outside the paged collections)
 agents/platform/skills/gitops-helm-chart/SKILL.md unpaged-list 4 the GitOps controller discovery reads (Argo CD Applications, Flux Kustomizations, Config Sync RootSyncs and RepoSyncs) the skill tells the model to run
 agents/platform/skills/submit-suggestion/SKILL.md unpaged-list 4 the same GitOps controller discovery reads, run against the target cluster's kubeconfig
+agents/platform/scripts/stall_report.py unresolved-kinds 1 the stall watch's cluster read of one configured kind per call (a CRD the broker's raw collections do not cover, so it cannot be paged), chunked; a reply the broker cuts sends that kind to the per-namespace read, so the cap costs the kind what it cost before and never the cluster
+agents/cluster/persona/skills/gke-stall-detection/scripts/stall_report.py unresolved-kinds 1 the Cluster Agent persona's byte-identical copy of agents/platform/scripts/stall_report.py (a2a/lib/persona/claudecode/cluster_persona_test.go holds the two equal), so the same one-kind-per-call chunked read with the same per-namespace fallback
