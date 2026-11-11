@@ -873,7 +873,7 @@ jobs:
           # only into a separate (private) issues repository, the only place
           # the triage comment may go.
           triage=()
-          if [ "$mode" = "--live" ] && [ "$NIGHTLY_TRIAGE_LIVE" = "true" ] && [ -n "$KUBE_AGENTS_ISSUES_REPO" ]; then triage=(--triage-pending); fi
+          if [ "$mode" = "--live" ] && [ "$NIGHTLY_TRIAGE_LIVE" = "true" ] && [ -n "$KUBE_AGENTS_ISSUES_REPO" ] && [ "$KUBE_AGENTS_ISSUES_REPO" != "gke-labs/kube-agents" ]; then triage=(--triage-pending); fi
           python3 scripts/eval_dashboard/nightly_bugs.py --data work/data.json --state "$DASHBOARD_BUCKET/nightly-bugs-state.json" "$mode" "${triage[@]}" --filed-out work/nightly-filed.json
           filed=$(python3 -c 'import json; print(" ".join(str(n) for n in json.load(open("work/nightly-filed.json"))))' 2>/dev/null || true)
           echo "filed=$filed" >> "${GITHUB_OUTPUT:-/dev/null}"
@@ -1077,13 +1077,18 @@ jobs:
         run: |
           numbers=""
           mode=--dry-run
+          # A separate issues repository, valid as the tick's split step
+          # checks it: the only kind the filer files for triage into and the
+          # route step writes to.
+          private=false
+          if printf '%s' "$ISSUES_REPO" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' && [ "$ISSUES_REPO" != "gke-labs/kube-agents" ]; then private=true; fi
           if [ -n "$TRIAGE_ISSUES" ]; then
             if ! printf '%s' "$TRIAGE_ISSUES" | grep -Eq '^ *[0-9]+( +[0-9]+)* *$'; then
               echo "::error::triage_issues must be issue numbers separated by spaces"
               exit 1
             fi
             numbers="$TRIAGE_ISSUES"
-          elif [ "$NIGHTLY_TRIAGE_LIVE" = "true" ] && [ "$NIGHTLY_BUGS_LIVE" = "true" ] && [ -n "$ISSUES_REPO" ]; then
+          elif [ "$NIGHTLY_TRIAGE_LIVE" = "true" ] && [ "$NIGHTLY_BUGS_LIVE" = "true" ] && [ "$private" = "true" ]; then
             mode=--live
           else
             numbers="$FILED"

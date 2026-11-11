@@ -205,7 +205,7 @@ class Harness(unittest.TestCase):
         path.write_text(json.dumps(doc or november()))
         out = io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
-            nightly_bugs.main(["--data", str(path), "--repo-root", str(self.root), "--live", "--triage-pending",
+            nightly_bugs.main(["--data", str(path), "--repo-root", str(self.root), "--live", "--triage-pending", "--repo", ISSUES_REPO,
                                "--filed-out", str(self.dir / "filed.json")], gh_runner=gh)
         [filed] = [b for m, p, b in gh.writes() if m == "POST" and p.endswith("/issues")]
         return filed, {"number": 37, "state": "open", "title": filed["title"], "body": filed["body"], "assignees": [],
@@ -542,6 +542,29 @@ class FailSafeTest(Harness):
 class ReviewFindingsTest(Harness):
     """The self-review's findings, pinned."""
 
+    def test_the_filer_never_files_for_triage_into_the_public_repository(self):
+        gh = nb.FakeGh()
+        path = self.dir / "data.json"
+        path.write_text(json.dumps(november()))
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            nightly_bugs.main(["--data", str(path), "--repo-root", str(self.root), "--live", "--triage-pending", "--repo", "gke-labs/kube-agents"], gh_runner=gh)
+        [filed] = [b for m, p, b in gh.writes() if m == "POST" and p.endswith("/issues")]
+        self.assertEqual(filed["assignees"], ["ivan"], "assigned as before: no triage step will write there")
+        self.assertNotIn(nightly_bugs.TRIAGE_PENDING_LABEL, filed["labels"])
+        self.assertIn("--triage-pending ignored", err.getvalue())
+
+    def test_filed_out_lists_no_infra_issue(self):
+        doc = nb.data(*(nb.night(d, [nb.red("case-maint"), nb.infra_task("case-red")]) for d in (1, 2, 3)))
+        gh = nb.FakeGh()
+        path = self.dir / "data.json"
+        path.write_text(json.dumps(doc))
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            nightly_bugs.main(["--data", str(path), "--repo-root", str(self.root), "--live", "--filed-out", str(self.dir / "filed.json")], gh_runner=gh)
+        filed = [b for m, p, b in gh.writes() if m == "POST" and p.endswith("/issues")]
+        self.assertEqual(len(filed), 2, "one domain bug, one infra issue")
+        self.assertEqual(len(json.loads((self.dir / "filed.json").read_text())), 1, "only the domain bug")
+
     def test_live_triage_refuses_the_public_repository(self):
         _, issue = self.file_pending()
         issues = FakeIssues([issue])
@@ -748,8 +771,9 @@ class WorkflowTest(unittest.TestCase):
             out, _ = self.run_step(step, {"NIGHTLY_BUGS_LIVE": bugs, "NIGHTLY_TRIAGE_LIVE": triage, "CI_HEALTH_MUTE": mute,
                                            "KUBE_AGENTS_ISSUES_REPO": ISSUES_REPO})
             self.assertEqual("--triage-pending" in out.split(), want, (bugs, triage, mute))
-        out, _ = self.run_step(step, {"NIGHTLY_BUGS_LIVE": "true", "NIGHTLY_TRIAGE_LIVE": "true", "CI_HEALTH_MUTE": "false", "KUBE_AGENTS_ISSUES_REPO": ""})
-        self.assertNotIn("--triage-pending", out.split(), "never for issues filed in the public repository")
+        for public in ("", "gke-labs/kube-agents"):
+            out, _ = self.run_step(step, {"NIGHTLY_BUGS_LIVE": "true", "NIGHTLY_TRIAGE_LIVE": "true", "CI_HEALTH_MUTE": "false", "KUBE_AGENTS_ISSUES_REPO": public})
+            self.assertNotIn("--triage-pending", out.split(), f"never for issues filed in the public repository ({public!r})")
 
     def test_the_triage_job_runs_after_the_tick_on_main_with_its_own_identities(self):
         job = self.doc["jobs"]["nightly-triage"]
@@ -766,8 +790,10 @@ class WorkflowTest(unittest.TestCase):
     def test_the_plan_is_live_only_when_armed_and_a_dispatch_is_always_dry(self):
         [step] = [s for s in self.doc["jobs"]["nightly-triage"]["steps"] if s.get("id") == "plan"]
         base = {"NIGHTLY_BUGS_LIVE": "true", "NIGHTLY_TRIAGE_LIVE": "true", "FILED": "41", "TRIAGE_ISSUES": "", "ISSUES_REPO": ISSUES_REPO}
-        _, outputs = self.run_step(step, dict(base, ISSUES_REPO=""))
-        self.assertIn("mode=--dry-run", outputs, "no private issues repository: never live")
+        for public in ("", "gke-labs/kube-agents", "not a repo"):
+            _, outputs = self.run_step(step, dict(base, ISSUES_REPO=public))
+            self.assertIn("mode=--dry-run", outputs, f"no private issues repository ({public!r}): never live")
+            self.assertIn("args= --issue 41", outputs, "and the filed issues are still dry-run")
         _, outputs = self.run_step(step, base)
         self.assertIn("mode=--live", outputs)
         self.assertIn("args=\n", outputs, "live: every pending issue")

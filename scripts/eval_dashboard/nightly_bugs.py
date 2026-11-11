@@ -1161,7 +1161,7 @@ class Filer:
         created, assignee = self.create(attempts, key)
         number = created.get("number") if isinstance(created, dict) else None
         why = WHY_INFRA_OWNER if assignee else WHY_UNASSIGNED_REFUSED.format(refused=f"`{self.infra_owner}`") if self.infra_owner else WHY_NO_INFRA_OWNER
-        entry = {"case": key, "assignee": assignee, "why": why, "mention": self.infra_backup, "labels": labels,
+        entry = {"case": key, "infra": True, "assignee": assignee, "why": why, "mention": self.infra_backup, "labels": labels,
                  "nights": [n["date"] for n in nights], "runs": [n["run_url"] for n in nights], "issue": number}
         result["filed" if number or self.gh.dry_run else "failed"].append(entry)
 
@@ -1386,12 +1386,19 @@ def main(argv=None, gh_runner=None) -> int:
         log(f"ERROR: {args.data}: {exc}")
         return 1
     gh = ghcli.Gh(args.repo, gh_runner, dry_run=args.dry_run) if gh_runner else ghcli.Gh(args.repo, dry_run=args.dry_run)
-    filer = Filer(gh, args.repo_root, triage_pending=args.triage_pending)
+    # Triage comments only into a separate (private) issues repository
+    # (nightly_triage.py refuses this one), so filing for triage here would
+    # leave every issue waiting for a step that never writes.
+    triage_pending = args.triage_pending and args.repo != ghcli.SOURCE_REPO
+    if args.triage_pending and not triage_pending:
+        log(f"warning: --triage-pending ignored: the issues repository is {ghcli.SOURCE_REPO}; filing and assigning as before")
+    filer = Filer(gh, args.repo_root, triage_pending=triage_pending)
     result = filer.run(data if isinstance(data, dict) else {})
     print(summary(result, args.dry_run))
     if args.filed_out:
         try:
-            args.filed_out.write_text(json.dumps([f["issue"] for f in result["filed"] if f.get("issue")]))
+            # Domain and group issues only: the triage takes no infra issue.
+            args.filed_out.write_text(json.dumps([f["issue"] for f in result["filed"] if f.get("issue") and not f.get("infra")]))
         except OSError as exc:
             log(f"warning: could not write {args.filed_out}: {exc}")
     # A live pass that could not read the listings at all neither trusted
