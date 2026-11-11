@@ -5273,8 +5273,8 @@ class PullRequestContentCheck(BaseModel):
     quantifier: Literal["all", "any"] = "all"
     # `admits_disruption` only: the workload the budget protects, as the case
     # planted it. Given rather than read, because the workload's manifest is a
-    # file the pull request does not add, and reading it would need
-    # `contents: read`, which the grading mint does not grant.
+    # file the pull request does not add, and this check reads only the
+    # pull request's files listing, never `/contents`.
     replicas: int | None = Field(default=None, ge=2)
     pod_labels: dict[str, str] = Field(default_factory=dict)
 
@@ -5870,9 +5870,10 @@ class PullRequestOpenedVerifier(BaseVerifier):
         Only added files are read. Any other file a glob names (modified,
         renamed, copied), or an added one GitHub left no patch for (large or
         binary), would have to come from ``/contents``, which needs
-        ``contents: read``; the grading mint (hack/ci-eval-pr.sh) does not ask
-        for it, so such a match is unevaluable rather than graded on half the
-        pull request.
+        ``contents: read``. This check makes no ``/contents`` read (the grading
+        mint carries the permission since #5519, but nothing here uses it yet),
+        so such a match is unevaluable rather than graded on half the pull
+        request.
         """
         globs = [g for check in self.content for g in check.paths]
         base = f"{forges.github_api_root()}/repos/{owner}/{repo}/pulls/{number}/files"
@@ -5908,8 +5909,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 f"{owner}/{repo}#{number}: the content globs name {named}"
                 + (f" and {more} more" if more > 0 else "")
                 + ", which the files listing does not carry whole; `content` reads only files "
-                "the pull request adds, and reading any other needs `contents: read`, which "
-                "the grading mint does not grant, so the content checks could not be evaluated"
+                "the pull request adds, and reading any other needs a `/contents` read "
+                "(`contents: read`) this check does not make, so the content checks could "
+                "not be evaluated"
             )
         return texts, None
 
@@ -6209,7 +6211,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
         file count and the commit total, and is skipped when ``_resolve``
         already fell through to it; dating the head commit needs the commits
         listing, whose last page holds it. ``/commits/{sha}`` would be one call
-        and wants ``contents: read``, which grading does not carry.
+        and wants ``contents: read``, which this check was written without.
 
         A page GitHub has not got (404, or one the head is not on) dates
         nothing, comes back ``None``, and the caller does not reject on it: an
@@ -7102,9 +7104,9 @@ class GitHubWritesVerifier(BaseVerifier):
     comes from ``BENCH_GITLAB_TOKEN`` and the host from ``BENCH_GITLAB_HOST``
     (gitlab.com unless set). ``owner`` pins the top-level group.
 
-    WHAT IT CANNOT SEE. The branch listing wants ``contents: read``, which the
-    grading credential does not carry; a listing GitHub refuses is a note in
-    the reason and ``raw``, and the check grades on pull requests alone.
+    WHAT IT MAY NOT SEE. The branch listing wants ``contents: read``, which the
+    eval's grading mint carries since #5519; a listing GitHub refuses is a
+    note in the reason and ``raw``, and the check grades on pull requests alone.
     Unreadable pull requests -- a 401, a denial, a repository the credential
     cannot see, an API it could not reach -- are ``status="error"``: the
     absence of an observation, never a pass.

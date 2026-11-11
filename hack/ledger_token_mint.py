@@ -65,7 +65,7 @@ def temporary(message):
 key_file = os.environ["EVAL_LEDGER_APP_KEY_FILE"]
 app_id = os.environ.get("EVAL_LEDGER_APP_ID") or DEFAULT_LEDGER_APP_ID
 installation_id = os.environ.get("EVAL_LEDGER_INSTALLATION_ID") or DEFAULT_LEDGER_INSTALLATION_ID
-# What the token may reach. The grading mint asks for its three reads
+# What the token may reach. The grading mint asks for its four reads
 # (LEDGER_GRADING_MINT_BODY) and the ledger reset asks for one repository and
 # `issues: write` (ledger_reset_token). An empty body would mean the
 # installation's whole grant -- issues: write on every pool repository -- so

@@ -1337,7 +1337,7 @@ export BENCH_TF_ROOT="./tf"
 #
 # EVAL_LEDGER_APP_KEY_FILE set: mint an installation token from App 4739812
 # instead, once per fan-out unit, because a token lasts an hour and units
-# launch across the whole run; grading's mint asks for its three reads
+# launch across the whole run; grading's mint asks for its four reads
 # explicitly (LEDGER_GRADING_MINT_BODY), and the ledger reset below mints its
 # own, narrowed to one repository and issues: write. Unset: the mounted PAT stands. A mint that
 # fails after its retries stops the run at preflight and costs a unit its
@@ -1374,12 +1374,13 @@ LEDGER_TOKEN_RENEW_TICK_SECONDS=10
 # After a renewal that failed, the next attempt comes this soon rather than a
 # whole period later, when the token in the file would already be dead.
 LEDGER_TOKEN_RENEW_RETRY_SECONDS=60
-# What the grading mint asks for: the three reads docs/ci-pool-projects.md 5.4
-# documents, requested explicitly so BENCH_GITHUB_TOKEN's reach is pinned at
+# What the grading mint asks for: the four reads docs/ci-pool-projects.md 5.4
+# documents (contents: read since #5519, so the github_writes safeguard can
+# list a branch pushed with no pull request behind it), requested explicitly so BENCH_GITHUB_TOKEN's reach is pinned at
 # mint rather than inherited from the installation's whole grant -- which,
 # since 2026-09-22, includes issues: write on every pool repository for the
 # ledger reset. An omitted body on this endpoint means "everything granted".
-LEDGER_GRADING_MINT_BODY='{"permissions":{"issues":"read","pull_requests":"read","metadata":"read"}}'
+LEDGER_GRADING_MINT_BODY='{"permissions":{"issues":"read","pull_requests":"read","contents":"read","metadata":"read"}}'
 # What the agent-pulls reset asks for (reset_agent_pulls, below): pull_requests
 # to close, contents to delete a branch, issues to label an audit pull request
 # before its close. Narrowed to the leased repository at mint, as the ledger

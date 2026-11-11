@@ -905,10 +905,17 @@ class LedgerMintRequestTest(unittest.TestCase):
         self.assertTrue(self.capture.exists(), "the faked urlopen was never reached: " + proc.stderr)
         return json.loads(self.capture.read_text(encoding="utf-8")), proc
 
-    def test_the_grading_mint_posts_its_three_reads(self):
+    def test_the_grading_mint_posts_its_four_reads(self):
         seen, proc = self._mint('mint_ledger_token "unit-under-test"; echo "TOKEN=${BENCH_GITHUB_TOKEN}"')
         self.assertEqual(
-            {"permissions": {"issues": "read", "pull_requests": "read", "metadata": "read"}},
+            {
+                "permissions": {
+                    "issues": "read",
+                    "pull_requests": "read",
+                    "contents": "read",
+                    "metadata": "read",
+                }
+            },
             json.loads(seen["data"]),
         )
         self.assertEqual("application/json", seen["content_type"])

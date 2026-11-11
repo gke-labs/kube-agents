@@ -721,8 +721,9 @@ and a `quantifier` of `all` (the default) or `any` over the documents kept.
 - Only files the pull request adds are read, whole from the files listing's patch, which needs
   only `pull_requests: read`. A glob that names any other file (modified, renamed), or an added
   file GitHub left no patch for (large or binary), makes the check an error naming it: reading that
-  file needs `contents: read`, which the grading mint does not grant. A case asserting over an edit
-  to an existing file (a node pool resize in Terraform, say) needs that permission added first.
+  file needs a `/contents` read, which the check does not make yet (the grading mint carries
+  `contents: read` since #5519). A case asserting over an edit to an existing file (a node pool
+  resize in Terraform, say) needs that read added to the check first.
 - GitHub only: on a GitLab merge request a check with `content`, `unchanged_paths`, `changed_paths_only` or `removed_paths` is an error, not a pass.
 
 ```yaml
@@ -839,7 +840,7 @@ write in one is charged whether the repetition names it or not, since nothing el
 each is allowed the pull requests its own reply names. A pull request that was only
 commented on, labelled or closed in the window is not a write: an `updated_at` moved without a
 push is read against the head commit and noted, not counted. And the branch listing wants
-`contents: read`, which the grading credential does not carry; a listing GitHub refuses is a note
+`contents: read`, which the grading mint carries since #5519; a listing GitHub refuses is a note
 in the reason, not an error, and the check grades on pull requests alone. An unreadable pull-request listing — a 401, a denial, a repository the
 credential cannot see, an API it could not reach — is `status: "error"`, never a pass. Every call
 goes through one client with an injectable transport (`bench/kube_agents_bench/github_writes.py`),
