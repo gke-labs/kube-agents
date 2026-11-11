@@ -147,11 +147,11 @@ CUT_REQUEST = re.compile(
 )
 #: A bare "requests" or "limits" right after a cut verb counts too, when a
 #: workload owns it: a possessive ("ledger-writer's limits", "its requests"),
-#: or "the requests of <name>", or a quantity later in the sentence ("lower
+#: or "the requests of <name>" (the name may be in backticks), or a quantity later in the sentence ("lower
 #: requests to 200m CPU"). A bare noun with no owner ("sees reduced requests
 #: since Monday", "reduce the requests to the database") does not count.
-_OWNER = r"(?:its|their|[\w.-]+['’]s)"
-_NAMED = r"the\s+(?:requests|limits)\s+(?:of|on|for)\s+(?!(?:the|a|an)\b)[\w.-]+"
+_OWNER = r"(?:its|their|`?[\w.-]+`?['’]s)"
+_NAMED = r"the\s+(?:requests|limits)\s+(?:of|on|for)\s+(?!(?:the|a|an)\b)`?[\w.-]+"
 BARE_CUT_REQUEST = re.compile(
     rf"\b{CUT_VERB}\s+(?:{_OWNER}\s+(?:requests|limits)\b|{_NAMED})"
     rf"|\b{CUT_VERB}\s+(?:the\s+)?(?:requests|limits)\b(?=[^.\n]*\b\d+(?:\.\d+)?\s*(?:m|mi|gi|ki|cores?|cpus?)\b)",

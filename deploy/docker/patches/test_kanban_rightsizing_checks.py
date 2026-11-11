@@ -376,6 +376,10 @@ class PlatformCutRequestTest(RuleTestCase):
             "Lower the requests of api-server.",
             "Reduce ledger-writer’s limits.",
             "Reduce the limits of http-echo.",
+            # A workload name in backticks, as the cards write it.
+            "Lower the requests of `inference-server`.",
+            "Reduce `ledger-writer`'s limits.",
+            "Lower `inference-server`'s requests to 200m.",
         ):
             self.assertTrue(krc.asks_for_cut("", ask), ask)
         self.assertTrue(krc.asks_for_cut("Calculate resource request reductions for api-server",
