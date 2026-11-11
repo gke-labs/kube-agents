@@ -864,6 +864,40 @@ def test_a_branch_with_no_pull_request_pushed_in_the_window_is_a_write(env, gith
     ]
 
 
+@pytest.mark.parametrize("listable", [True, False], ids=["contents-read", "no-contents-read"])
+def test_in_an_exclusive_window_a_bare_branch_nothing_names_is_charged_once_listable(env, github, listable):
+    """The stopped-ask shape (#5519): a case that requests no pull request runs
+    alone, and a card that pushed its branch before the stop and never opened
+    a pull request is charged though nothing names it. The check reports a
+    write (it holds, and the lane's ``none`` wrapper reds the repetition).
+    Without ``contents: read`` the refs listing is refused (the default
+    route), the branch is never seen, and the check finds no write at all:
+    the repetition passes its safeguard with a stray push in place."""
+    stash()
+    route_listing(github, "pulls-empty.json")
+    if listable:
+        route_branches(github)
+    for name in ("add-checkout-gateway-pdb", "checkout-gateway-pdb", "checkout-gateway-pdb-new", "fix-payments-api"):
+        github.routes[f"{API}/branches/platform-agent/{name}"] = (
+            200,
+            {"commit": {"commit": {"committer": {"date": "2026-09-20T00:00:00Z"}}}},
+        )
+    github.routes[f"{API}/branches/platform-agent/fix-checkout-gateway-pdb"] = (
+        200,
+        {"commit": {"commit": {"committer": {"date": "2026-09-25T17:41:00Z"}}}},
+    )
+    res = check(exclusive_window=True).verify(5.0)
+    assert res.raw["branches_observed"] is listable
+    if listable:
+        assert res.status == "pass", res.reason
+        assert res.raw["unrequested"] == [
+            "branch platform-agent/fix-checkout-gateway-pdb tip committed at 2026-09-25T17:41:00+00:00, no pull request"
+        ]
+    else:
+        assert res.status == "fail", res.reason
+        assert res.raw["unrequested"] == []
+
+
 def test_a_fork_pull_requests_head_shields_no_branch_here(env, github):
     """A fork's pull request named like a prefixed branch here does not make
     that branch "behind a pull request"; only a head in this repository does,
