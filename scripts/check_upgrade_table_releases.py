@@ -79,7 +79,9 @@ TABLE_LINE = re.compile(rf"^\| (?:{PENDING}|\d+\.\d+\.\d+)\s*\|\s*(?:#\d+:\s*)?(
 ADDED = "+"
 REMOVED = "-"
 RELEASE_TAG = re.compile(r"^\d+\.\d+\.\d+$")
-# The table's lines start with this; its first two are the header and the separator. A heading ends it.
+# The table's lines start with this; its first two are the header (first cells RELEASE_HEADER) and the
+# separator. The first line after it that does not start with this ends it, and so does a heading.
+RELEASE_HEADER = ("Release", "Change")
 TABLE_CELL_SEPARATOR = "|"
 TABLE_HEADER_LINES = 2
 HEADING_PREFIX = "#"
@@ -265,12 +267,26 @@ def release_cell_problems() -> list[str]:
     start = next((i for i, line in enumerate(lines) if line.strip() == TABLE_HEADING), None)
     if start is None:
         return found
+    # The table starts at its header row (first cells "Release" and "Change") and ends at the first line
+    # after it that does not start with `|`, so another table or `|` line under the same heading, before
+    # or after it, is not read. A heading with no such table is reported, so a renamed header is not skipped.
     table = []
     for number in range(start + 1, len(lines)):
-        if lines[number].startswith(HEADING_PREFIX):
+        line = lines[number]
+        if line.startswith(HEADING_PREFIX):
             break
-        if lines[number].startswith(TABLE_CELL_SEPARATOR):
+        if not table:
+            cells = tuple(cell.strip() for cell in line.split(TABLE_CELL_SEPARATOR)[1:len(RELEASE_HEADER) + 1])
+            if line.startswith(TABLE_CELL_SEPARATOR) and cells == RELEASE_HEADER:
+                table.append(number)
+        elif line.startswith(TABLE_CELL_SEPARATOR):
             table.append(number)
+        else:
+            break
+    if len(table) < TABLE_HEADER_LINES:
+        header = " | ".join(RELEASE_HEADER)
+        return [f"{UPGRADE_PAGE}:{start + 1}: no table under \"{TABLE_HEADING}\" starts with the header "
+                f"\"| {header} |\", so its Release cells cannot be checked"]
     for number in table[TABLE_HEADER_LINES:]:
         cell = lines[number].split(TABLE_CELL_SEPARATOR)[1].strip()
         if not (RELEASE_TAG.match(cell) or cell == PENDING):

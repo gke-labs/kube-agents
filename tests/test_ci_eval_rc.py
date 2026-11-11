@@ -24,14 +24,18 @@ evidence of what ran before it.
 """
 
 import pathlib
+import re
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
 
 from tests.testing.rc_eval_driver import (
     DEPLOY_RC_MARKER as _DEPLOY_RC_MARKER,
+    EXPECTED_CONSOLE_URL as _EXPECTED_CONSOLE_URL,
     EXPECTED_DECK_URL as _EXPECTED_DECK_URL,
+    PRIVATE_LOG_BUCKET as _PRIVATE_LOG_BUCKET,
     EXPECTED_RC_EVAL_TIER as _EXPECTED_RC_EVAL_TIER,
     RC_TAG as _RC_TAG,
     RcEvalDriverFixture,
@@ -444,6 +448,46 @@ class RcEvalDriverTestCase(unittest.TestCase):
         # The link is the whole of "results anyone can find" this lane is
         # allowed to ship: no credential is widened to post it anywhere.
         self.assertIn(_EXPECTED_DECK_URL, summary)
+
+    def test_a_private_log_bucket_links_the_console_not_deck(self):
+        """Deck has no read on the bucket the lane moves to, so a Spyglass link
+        there denies everyone; the banner and the summary carry the Console's
+        bucket browser instead. The bucket is the one Prow's JOB_SPEC says the
+        decoration uploads to."""
+        job_spec = '{"type":"postsubmit","decoration_config":{"gcs_configuration":{"bucket":"%s","path_strategy":"explicit"}}}' % _PRIVATE_LOG_BUCKET
+        root, _ = self.build_repo()
+        result = self.run_driver(root, JOB_SPEC=job_spec)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn(f"Artifacts:   {_EXPECTED_CONSOLE_URL}", result.stdout)
+        summary = (self.artifacts / "rc-eval-summary.md").read_text(encoding="utf-8")
+        self.assertIn(f"| Run | {_EXPECTED_CONSOLE_URL} |", summary)
+        self.assertNotIn("oss.gprow.dev", summary)
+
+    def test_the_private_bucket_list_is_the_dashboards(self):
+        """The driver's PRIVATE_LOG_BUCKETS is a copy of links.PRIVATE_LOG_BUCKETS
+        (bash cannot import it); a bucket added to one and not the other
+        would link Spyglass pages that deny everyone, or the Console for a
+        bucket Deck renders."""
+        sys.path.insert(0, str(_REPO_ROOT / "scripts"))
+        self.addCleanup(sys.path.remove, str(_REPO_ROOT / "scripts"))
+        from eval_dashboard import links
+
+        match = re.search(r'^readonly PRIVATE_LOG_BUCKETS="([^"]*)"$', _CI_EVAL_RC.read_text(encoding="utf-8"), re.MULTILINE)
+        self.assertIsNotNone(match, "hack/ci-eval-rc.sh declares no PRIVATE_LOG_BUCKETS line")
+        self.assertEqual(set(match.group(1).split()), set(links.PRIVATE_LOG_BUCKETS))
+
+    def test_a_job_spec_without_a_bucket_keeps_the_default_link(self):
+        """A JOB_SPEC that names no bucket, or is not JSON, is the default
+        bucket's Deck link rather than a failed reporting step."""
+        for job_spec in ('{"type":"postsubmit"}', "not json"):
+            with self.subTest(job_spec=job_spec):
+                self.driver = RcEvalDriverFixture()
+                self.addCleanup(self.driver.cleanup)
+                self.artifacts = self.driver.artifacts
+                root, _ = self.build_repo()
+                result = self.run_driver(root, JOB_SPEC=job_spec)
+                self.assertEqual(result.returncode, 0, result.stdout)
+                self.assertIn(f"Artifacts:   {_EXPECTED_DECK_URL}", result.stdout)
 
     def test_no_deck_link_when_prow_did_not_supply_one(self):
         """A laptop run gets a summary without a fabricated URL in it."""

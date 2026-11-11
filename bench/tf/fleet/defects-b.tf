@@ -461,10 +461,12 @@ resource "kubernetes_pod_disruption_budget_v1" "drain_blocked" {
 # 09:25:40 UTC, Compute Engine deleted it at 10:26:42, and GKE had already
 # ended the UPGRADE_NODES `Failed to update node pool` at 09:55:52, about 30
 # minutes after the flag. The pool sat in ERROR for an hour on every project
-# (#4043). At 720 the old node goes 12 minutes after the flag, so the roll
-# finishes in about 18 minutes: clear of GKE's 30-minute give-up and of the
-# provider's 30-minute node-pool update timeout. Above 600 is all the
-# readiness rule needs; the 30-minute give-up is the ceiling.
+# (#4043). At 720 the old node goes 12 minutes after the flag, so a node's
+# step finishes in about 18 minutes: clear of GKE's 30-minute give-up and of
+# the provider's 30-minute node-pool update timeout. The default pool runs two
+# nodes and surges both at once (main.tf), so the roll stays one such step.
+# Above 600 is all the readiness rule needs; the 30-minute give-up is the
+# ceiling.
 #
 # `managed_instance_group_urls` is the pool's `instanceGroups` URL, the form a
 # backend's `group` takes; `instance_group_urls` is the manager's. The

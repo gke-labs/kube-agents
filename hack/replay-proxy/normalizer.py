@@ -85,8 +85,13 @@ ID_KEY = "id"
 TOOL_CALLS_KEY = "tool_calls"
 OPAQUE_CLASS = "OPAQUE"
 
-# Keys whose numeric value is a per-run counter or row id.
-KEYED_NUMBER_KEYS = ("pid", "PID", "run_id", "id", "resourceVersion", "generation", "observedGeneration")
+# Keys whose numeric value is a per-run counter or row id. `comment_id` is the
+# row id `kanban_comment` returns: upstream's `add_comment` returns the
+# comment's `lastrowid` (deploy/docker/patches/kanban_comment_status.py), one
+# counter for the whole install's board, so it counts every comment earlier
+# runs left (the Nov 10 lane trial recorded 41 and replayed 43, 44, 45).
+KEYED_NUMBER_KEYS = ("pid", "PID", "run_id", "id", "comment_id", "resourceVersion", "generation",
+                     "observedGeneration")
 # Any key ending in this is a run id too (`current_run_id`, `parent_run_id`).
 RUN_ID_SUFFIX = "_run_id"
 # Kanban card history: heartbeat entries are liveness pings on a timer, so how
@@ -127,11 +132,20 @@ NUMBER_CLASS = "NUM"
 # (`2>&1`, "revision 1") is almost never the swapped value, and treating it as
 # one marked about one answer in seven unstorable in the dev-install dry run.
 MIN_STANDALONE_REPEAT_DIGITS = 4
-SHORT_NUMBER_KEYS = r"(?:resourceVersion|observedGeneration|generation|run_id|run|pid|PID|id)"
+SHORT_NUMBER_KEYS = r"(?:resourceVersion|observedGeneration|generation|run_id|run|comment_id|pid|PID|id)"
+# A comment id also counts next to the bare word, as "posted comment 41" names
+# it; only a value swapped from `comment_id` does, so "comment: 2 pods" next
+# to a swapped `generation: 2` stays storable.
+COMMENT_ID_KEY = "comment_id"
+COMMENT_WORD = "comment"
 SHORT_NUMBER_KEY_GAP = r"(?:\s+(?:is|was|now|of)\s+|\W{0,4})"
 DIGITS_RE = re.compile(r"^\d+$")
 KEYED_NUMBER_TEXT_RE = re.compile(
     r"(?<![A-Za-z0-9_])(resourceVersion|observedGeneration|generation|[A-Za-z0-9]*_?run_id|pid|PID|id)"
+    r"(\\?[\"']?\s*[:=]\s*\\?[\"']?)(\d+)\b"
+)
+COMMENT_ID_TEXT_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(" + COMMENT_ID_KEY + r")"
     r"(\\?[\"']?\s*[:=]\s*\\?[\"']?)(\d+)\b"
 )
 # `pid 4821`, as a process listing or a sentence names one.
@@ -586,6 +600,9 @@ class Mapping:
     # (keyed numbers) and epoch timestamps, which become an unnumbered
     # how-far-from-now time token.
     bare_numbers: set = field(default_factory=set)
+    # The bare numbers swapped from a `comment_id`, which an answer also
+    # repeats next to the word "comment".
+    comment_numbers: set = field(default_factory=set)
     # Dates swapped for a day-count token. The token can't be put back, so an
     # answer naming one is not saved: replayed on another day it would carry
     # the recording's. `today_dates` are the ones on the request's own day,
@@ -628,7 +645,7 @@ class Mapping:
 
     def copy(self) -> "Mapping":
         return Mapping(dict(self.to_placeholder), dict(self.to_value), dict(self.counts), set(self.bare_numbers),
-                       set(self.dates), set(self.today_dates), list(self.time_occurrences), set(self.ages),
+                       set(self.comment_numbers), set(self.dates), set(self.today_dates), list(self.time_occurrences), set(self.ages),
                        set(self.dropped_counts), set(self.dropped_count_keys), set(self.dropped_hex))
 
     def swappable_values(self) -> Dict[str, str]:
@@ -819,6 +836,11 @@ class Mapping:
                 pattern = r"(?<![A-Za-z0-9_])" + SHORT_NUMBER_KEYS + SHORT_NUMBER_KEY_GAP + re.escape(value) + NUMBER_AFTER
             if re.search(pattern, text):
                 return True
+        for value in self.comment_numbers:
+            # Any case: an answer often starts a sentence or bullet with it ("Comment 41 posted").
+            if re.search(r"(?<![A-Za-z0-9_])" + COMMENT_WORD + SHORT_NUMBER_KEY_GAP + re.escape(value) + NUMBER_AFTER, text,
+                         re.IGNORECASE):
+                return True
         return self.answer_repeats_dropped_count(text)
 
     def answer_repeats_dropped_count(self, text: str) -> bool:
@@ -906,6 +928,8 @@ class Normalizer:
             return lambda: self.opaque(obj)
         if key is not None and TIME_KEY_RE.match(key) and self.epoch_value(obj) is not None:
             return lambda: self.epoch_token(str(obj), self.epoch_value(obj))
+        if key == COMMENT_ID_KEY and self.is_number(obj):
+            return lambda: self.comment_id_number(str(obj))
         if (key in KEYED_NUMBER_KEYS or (key or "").endswith(RUN_ID_SUFFIX)) and self.is_number(obj):
             return lambda: self.keyed_number(str(obj))
         if key in AGE_KEYS and isinstance(obj, str) and AGE_FULL_RE.match(obj):
@@ -949,6 +973,7 @@ class Normalizer:
     def merge_unrestorable(self, other: "Mapping") -> None:
         """Add what another (throwaway) mapping noted as unrestorable to this request's."""
         self.mapping.bare_numbers |= other.bare_numbers
+        self.mapping.comment_numbers |= other.comment_numbers
         self.mapping.ages |= other.ages
         self.mapping.dates |= other.dates
         self.mapping.today_dates |= other.today_dates
@@ -1026,6 +1051,11 @@ class Normalizer:
     def keyed_number(self, value: str) -> str:
         """Swap a keyed number (any length) for a placeholder."""
         return self.mapping.placeholder(NUMBER_CLASS, value)
+
+    def comment_id_number(self, value: str) -> str:
+        """Swap a kanban comment's row id, noting it for the answer guard's bare-word check."""
+        self.mapping.comment_numbers.add(value)
+        return self.keyed_number(value)
 
     def opaque(self, value: Any) -> str:
         whole = value if isinstance(value, str) else json.dumps(value, sort_keys=True)
@@ -1109,6 +1139,7 @@ class Normalizer:
             text = self.sub_group(pattern, group, lambda v, c=cls: self.mapping.placeholder(c, v), text)
         text = self.timestamps(text)
         text = self.sub_group(KEYED_NUMBER_TEXT_RE, 3, self.keyed_number, text)
+        text = self.sub_group(COMMENT_ID_TEXT_RE, 3, self.comment_id_number, text)
         text = self.sub_group(PID_PROSE_RE, 3, self.keyed_number, text)
         text = KEYED_EPOCH_TEXT_RE.sub(self.keyed_epoch, text)
         if not self.keep_ips:

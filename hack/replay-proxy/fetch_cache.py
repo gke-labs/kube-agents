@@ -65,7 +65,7 @@ BUILDS_DIR = P.BUILDS_DIR
 RUNS_FILE = "nightly-runs.json"
 HEX = P.HEX
 # A record's key under replay-cache/.
-RECORD_KEY_RE = re.compile(rf"^builds/({P.BUILD_PATTERN})/publish-[0-9]{{1,16}}\.json$")
+RECORD_KEY_RE = re.compile(rf"^builds/({P.BUILD_PATTERN})/publish-[0-9]{{1,16}}\.json\Z")
 SAFE_HEX = P.SAFE_HEX
 # One `gcloud storage ls -l` object line: size, creation time, URL.
 LS_LINE_RE = re.compile(r"^\s*(\d+)\s+(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.\d+)?Z\s+(gs://\S+)\s*$")

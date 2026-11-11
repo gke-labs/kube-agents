@@ -1353,28 +1353,28 @@ def test_infra_ended_rep_on_a_zero_request_case_still_blocks(tofu_spec, make_run
     _assert_rung_1(_grade_requesting(tofu_spec, make_run, _infra_rep(), requested=0))
 
 
-def test_infra_ended_lane_only_placeholder_case_blocks_a_known_gap(write_task, make_run):
-    """A case that requests a pull request only through the lane ``requesting:``
-    listing, with no own PR-check, is not distinguished by the carve-out.
+def test_an_infra_ended_placeholder_case_that_declares_its_request_is_infra(write_task, make_run):
+    """A case the persona answers with a pull request before its own check
+    lands declares ``requested_pull_requests`` at its top level, so the pinned
+    grader counts the request without reading anything outside the task file,
+    and the carve-out excuses the charged pull request on an infra-ended rep.
+    Without the key the same case has no requested write to be mischarged and
+    blocks at rung 1."""
+    body = {
+        "id": "placeholder",
+        "name": "Placeholder",
+        "infrastructure": {"deployer": "tofu"},
+        "verification_spec": [{"report_contains": {"phrases": ["x"]}}],
+    }
+    declared = load_case(write_task("placeholder", {**body, "requested_pull_requests": 1}))
+    assert declared.requested_pull_requests == 1
+    verdict = grade_case(declared, [make_run(mutate=_infra_rep())], admitted=True)
+    assert verdict.rung is Rung.INFRA
+    assert verdict.reps[0].outcome == "infra"
 
-    The scorer is pinned to the ``bench/`` tree and cannot read the lane file,
-    so such a case counts zero requested pull requests and its infra-ended rep
-    blocks at rung 1. No current case is lane-only; the gap is tracked in
-    #4778. This test pins the documented behaviour so a future fix flips it.
-    """
-    task = write_task(
-        "lane-only-placeholder",
-        {
-            "id": "lane-only-placeholder",
-            "name": "Lane-only placeholder",
-            "infrastructure": {"deployer": "tofu"},
-            "verification_spec": [{"report_contains": {"phrases": ["x"]}}],
-        },
-    )
-    spec = load_case(task)
-    assert spec.requested_pull_requests == 0, "own checks request none; the lane listing is unreadable here"
-
-    _assert_rung_1(grade_case(spec, [make_run(mutate=_infra_rep())], admitted=True))
+    undeclared = load_case(write_task("placeholder-without-key", {**body, "id": "placeholder-without-key"}))
+    assert undeclared.requested_pull_requests == 0
+    _assert_rung_1(grade_case(undeclared, [make_run(mutate=_infra_rep())], admitted=True))
 
 
 def test_the_write_safeguard_constant_matches_the_lane_file():

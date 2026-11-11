@@ -382,6 +382,14 @@ GCLOUD_OUTPUT_CUT = KUBECTL_OUTPUT_CUT  # one cap, one sentence, for a kubectl l
 # row of its own under the table.
 NOTE_DIRECTORY_FAILED = "kubeconfig directory could not be created; PDBs and webhooks not graded"
 NOTE_CREDENTIALS_FAILED = "credentials for the cluster could not be fetched; PDBs and webhooks not graded"
+# A member spec.scope.exclude.clusters excludes (--scope-readiness-excluded-clusters):
+# the credential broker refuses its Kubernetes API, so the in-cluster reads don't
+# run and the rules that need them are not graded. Its versions still are.
+NOTE_EXCLUDED_CLUSTER = "excluded by spec.scope.exclude.clusters; in-cluster readiness not read"
+EXCLUDED_CLUSTER_READ = "excluded by spec.scope.exclude.clusters; the agents don't reach its Kubernetes API"
+READINESS_EXCLUDED_FLAG = "--scope-readiness-excluded-clusters"
+# The members whose in-cluster reads are skipped, as (project, location, cluster).
+readiness_excluded: frozenset[tuple[str, str, str]] = frozenset()
 NOTE_PDB_READ_FAILED = "PDB read failed; PDBs not graded"
 NOTE_WEBHOOK_READ_FAILED = "webhook read failed; webhooks not graded"
 NOTE_WEBHOOK_READ_SKIPPED = f"webhook read {WEBHOOK_READ_SKIPPED}; webhooks not graded"
@@ -1139,6 +1147,18 @@ def first_read_failed_before_the_server_answered(error: str) -> bool:
     return SERVER_ANSWERED_PREFIX not in lowered and any(marker in lowered for marker in FIRST_READ_SKIP_MARKERS)
 
 
+def excluded_read(cluster: dict, project: str, kubeconfig_dir: str) -> dict:
+    """The `read` dict for a member whose in-cluster reads don't run because the
+    install excludes it: no `get-credentials`, no kubectl, every read recorded as
+    not run, and `excluded` set so the notes say why rather than report a failure."""
+    path = kubeconfig_path(kubeconfig_dir, project, cluster.get("name", ""), cluster.get("location", ""))
+    read = {"kubeconfig": path, "items": None, "error": EXCLUDED_CLUSTER_READ, "webhook_items": None,
+            "webhook_error": EXCLUDED_CLUSTER_READ, "webhook_skipped": False, "credentials_error": None,
+            "directory_error": None, "excluded": True,
+            "read_errors": {kind: None for kind in readiness_rules.READ_KINDS}}
+    return _later_reads_skipped(read, readiness_rules.NO_READ_RAN_REASON)
+
+
 def read_cluster_objects(cluster: dict, project: str, kubeconfig_dir: str) -> dict:
     """The objects of one member, read through kubectl, as the `read` dict the per-entry rules
     take: `kubeconfig`; `items`, every object the PDB read and the reads after the webhook
@@ -1278,7 +1298,9 @@ def assess_readiness(cluster: dict, member: dict, read: dict, at: datetime, flee
     status = readiness.readiness_status(pdbs, webhooks, maintenance, skew, target is not None, rules)
 
     notes = []
-    if read.get("directory_error"):
+    if read.get("excluded"):
+        notes.append(NOTE_EXCLUDED_CLUSTER)
+    elif read.get("directory_error"):
         notes.append(NOTE_DIRECTORY_FAILED)
     elif read.get("credentials_error"):
         notes.append(NOTE_CREDENTIALS_FAILED)
@@ -1429,7 +1451,12 @@ def build_report(projects: list[str], explicit_target: str | None, readiness_opt
             found.append((project, cluster))
     for project, cluster in found:
         member = grade_member(cluster, project, explicit_target, cache)
-        if readiness_options is not None:
+        if readiness_options is not None and (project, member["location"], member["cluster"]) in readiness_excluded:
+            # Not a failure, so no error row: the install chose to keep the agents
+            # out of this cluster's API, and the note says so on the member.
+            read = excluded_read(cluster, project, readiness_options["kubeconfig_dir"])
+            member["readiness"] = assess_readiness(cluster, member, read, readiness_options["at"], fleet, project_reads.for_member(project, member["location"]), graded=[c for _, c in found])
+        elif readiness_options is not None:
             read = read_cluster_objects(cluster, project, readiness_options["kubeconfig_dir"])
             # A credentials failure fills both slots with one message; a skipped webhook read is not a failure and gets no row.
             failed = (read["error"], None if read.get("webhook_skipped") else read.get("webhook_error"))
@@ -1919,9 +1946,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--rollout-in-progress", action="store_true", help="Assert a rollout is under way, so an unchanged, behind member is flagged stalled even when no other member moved.")
     parser.add_argument("--readiness", action="store_true", help=f"Also grade each member's readiness for the upgrade: drain-blocking PDBs and fail-closed webhooks with an unreachable backend in the upgrade's path or able to refuse the control plane's bootstrap RBAC writes (ClusterRoles and ClusterRoleBindings; Roles and RoleBindings in kube-system and kube-public), maintenance exclusions and window, node-pool skew, then the per-entry rules of the upgrade-failure catalogue (readiness_rules/; {KUBECTL_READS_PER_MEMBER} kubectl reads per member in all, each after the webhook read failing on its own), whose blockers join the verdict and whose risks get a column of their own; three gcloud list reads per project (backend services, instances, operations) and the server config per location feed them, one `clusters describe` and one `operations list` for the cluster confirm a member listed not RUNNING with no RUNNING operation, and the add-on inventory follows the readiness table.")
     parser.add_argument("--at", help="RFC 3339 instant to evaluate maintenance exclusions and the window at (default: now). Only with --readiness.")
+    parser.add_argument(READINESS_EXCLUDED_FLAG, default=None, help="project/location/cluster entries, space- or comma-separated, whose versions are graded but whose in-cluster readiness reads are skipped: the clusters spec.scope.exclude.clusters keeps the agents out of. Only with --readiness.")
     parser.add_argument("--kubeconfig-dir", help="Directory for the per-member kubeconfig files --readiness writes (default: $HERMES_HOME/.kubeconfigs).")
     args = parser.parse_args(argv)
     declared_scope.set(args.scope_projects, args.scope_unread, args.scope_exclude_clusters)
+    global readiness_excluded
+    try:
+        readiness_excluded = fleet_scope_args.parse_scope_exclude_clusters(getattr(args, READINESS_EXCLUDED_FLAG[2:].replace("-", "_")))
+    except ValueError as exc:
+        sys.stderr.write(f"{READINESS_EXCLUDED_FLAG}: {exc}\n")
+        return EXIT_USAGE
 
     if args.target_version and parse_version(args.target_version) is None:
         sys.stderr.write(f"--target-version {args.target_version!r} is not MAJOR.MINOR.PATCH[-gke.BUILD]\n")

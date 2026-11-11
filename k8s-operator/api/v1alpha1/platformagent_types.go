@@ -198,16 +198,17 @@ type ScopeExcludeSpec struct {
 	// every project.
 	// An excluded cluster gets no Cluster Agent, and fleet answers, the
 	// onboarding sweep and the fleet-audit collectors that list clusters leave
-	// it out. Still covering it: the daily upgrade-readiness watch, the
-	// networking audit's subnet usage, the GCE audit's instance listing, and
-	// the third-party gke MCP server's list_clusters.
-	// Excluding a cluster narrows what the agents look at, but it is not yet
-	// enforced: the credential proxy still issues a kubeconfig for an excluded
-	// cluster, so a worker that fetches the cluster's credentials itself, or
-	// names it as a kubectl context, can still read it with the agent's read
-	// roles. Only a project where the agent holds no roles, granted there or
-	// inherited from a folder or organization above it, keeps the agent off a
-	// cluster; a cluster in the management project can't be fenced off yet.
+	// it out. The credential broker and kube-proxy refuse every route to its
+	// Kubernetes API, for every caller, the agents' own commands included: a
+	// kubeconfig, get-credentials, kube-proxy, the watchers' relay and the gke
+	// MCP server's in-cluster tools. Spell entries by project ID: one spelled
+	// by project number refuses its location and name in any project. Reads of the GKE control plane stay allowed (the project's cluster
+	// list, a cluster's describe), and these still cover it through them only:
+	// the daily upgrade-readiness watch's version table (its in-cluster
+	// readiness rules skip the cluster), the networking audit's subnet usage,
+	// the GCE audit's instance listing, and the gke MCP server's list_clusters.
+	// The broker enforces it, not IAM: the agent's roles still reach the
+	// cluster, so the service account itself is not fenced off.
 	// +kubebuilder:validation:MaxItems=100
 	// +listType=map
 	// +listMapKey=projectId

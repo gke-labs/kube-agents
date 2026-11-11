@@ -2710,6 +2710,19 @@ class Loader(unittest.TestCase):
             ["--project", "p1", "--project", "p2", "--scope-projects", "p1,p2,p3", "--readiness", "--kubeconfig-dir", watch.SANDBOX_KUBECONFIG_DIR],
         )
 
+    def test_a_readiness_run_names_the_excluded_clusters_whose_in_cluster_reads_the_report_skips(self) -> None:
+        import dataclasses
+
+        scope = dataclasses.replace(scope_targets("p1"), excluded_clusters=(("p1", "us-east4", "scratch"), ("p1", "us-central1", "old")))
+        self.assertEqual(
+            watch.report_argv(["p1"], readiness=True, scope=scope),
+            ["--project", "p1", "--scope-projects", "p1", "--readiness", "--kubeconfig-dir", watch.SANDBOX_KUBECONFIG_DIR,
+             "--scope-readiness-excluded-clusters", "p1/us-east4/scratch,p1/us-central1/old"],
+        )
+        # The version table reads nothing in-cluster, so it carries no exclusion,
+        # and the report still lists and grades the excluded clusters' versions.
+        self.assertEqual(watch.report_argv(["p1"], readiness=False, scope=scope), ["--project", "p1", "--scope-projects", "p1"])
+
     @staticmethod
     def run_loader(source: str, scratch: str, extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
         """``python3 -I -`` on the loader with a gcloud that answers no clusters."""
