@@ -1052,3 +1052,36 @@ func TestAnyRunningProvisionJobGatesTheVerdict(t *testing.T) {
 		t.Errorf("deleted %v while a provision Job was running", rig.deleted)
 	}
 }
+
+// A provision-labelled Job the CR doesn't control is not its provision Job:
+// with no Job of its own, the CR's poll waits for the reconcile.
+func TestAProvisionJobTheCRDoesNotControlIsIgnored(t *testing.T) {
+	agent := busStreamsAgent(1)
+	foreign := busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete)
+	foreign.OwnerReferences = nil
+	rig := newBusStreamsRig(t, 1, foreign)
+	rig.serve(1, allStreamsBut("TASKS")...)
+	for i := 0; i < 4; i++ {
+		rig.poll()
+	}
+	if len(rig.deleted) != 0 {
+		t.Errorf("deleted %v: a Job the CR does not control", rig.deleted)
+	}
+}
+
+// The newest of the CR's provision Jobs decides: an older failed run beside a
+// newer completed one doesn't hold the re-run.
+func TestTheNewestProvisionJobDecides(t *testing.T) {
+	agent := busStreamsAgent(1)
+	older := busStreamsJob(agent, busStreamsTestNow.Add(-3*time.Hour), batchv1.JobFailed)
+	older.Name = agent.Name + a2aProvisionJobNameInfix + "older000"
+	newer := busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete)
+	rig := newBusStreamsRig(t, 1, older, newer)
+	rig.serve(1, allStreamsBut("TASKS")...)
+	rig.poll()
+	rig.poll()
+	rig.poll()
+	if !slices.Contains(rig.deleted, newer.Name) {
+		t.Errorf("deleted %v, want the newest, completed Job %s re-run", rig.deleted, newer.Name)
+	}
+}
