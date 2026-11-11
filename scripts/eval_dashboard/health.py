@@ -152,6 +152,12 @@ REP_FIXTURE = "fixture"
 # ("... nothing to grade (fixture-drift:<role>: ...)"), as classify.py does.
 FIXTURE_DRIFT_MARKER = "(fixture-drift:"
 
+# A rung-2 block's reason: the scorer gives each errored check's reason after
+# this phrase, and a check's reason can quote a rate limit or a 429 from the
+# forge it read. The repetition was graded, and blocked, so it is a fail,
+# never a storm rep; STORM_REASON_RE is not asked about it.
+RUNG_2_ERRORED_PHRASE = "checks errored rather than ran"
+
 # How old data.json may be before health.json is flagged stale. The
 # collector writes `stale_after_s` when it knows its own cadence
 # (SCHEMA.md, optional top-level fields); this is the renderer's default for
@@ -845,6 +851,8 @@ def rep_kind(rep: dict) -> str:
         return REP_FAIL
     if result == REP_RESULT_INFRA:
         return REP_STORM
+    if RUNG_2_ERRORED_PHRASE in reason:
+        return REP_FAIL
     if STORM_REASON_RE.search(reason):
         return REP_STORM
     return REP_FAIL
