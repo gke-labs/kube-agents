@@ -222,3 +222,54 @@ func TestASlackRunEndedByItsContextDisarmsTheGauges(t *testing.T) {
 		t.Fatalf("slack_connected after the lease was lost = %v; want no sample", v)
 	}
 }
+
+// Before the socket's first event, while auth.test is still out, the gauge is
+// already armed at 0: a stalled auth.test reads as down, not as no sample.
+func TestAStalledAuthTestReadsAsDown(t *testing.T) {
+	srv, unblock := stalledSlackStub(t)
+	a := newTestSlackAdapter(&fakeSlackAPI{})
+	m := NewMetrics()
+	a.SetMetrics(m)
+	a.sm = socketmode.New(slack.New("xoxb-stub", slack.OptionAPIURL(srv.URL+"/")))
+
+	returned := make(chan error, 1)
+	go func() { returned <- a.Run(context.Background(), func(InboundMessage) {}) }()
+	waitFor(t, "the gauge to be armed while auth.test is parked", func() bool {
+		_, ok := gaugeValue(t, m, slackConnectedSeries)
+		return ok
+	})
+	if v, _ := gaugeValue(t, m, slackConnectedSeries); v != 0 {
+		t.Fatalf("slack_connected while auth.test is parked = %v; want 0", v)
+	}
+	unblock()
+	select {
+	case <-returned:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run never returned")
+	}
+}
+
+// An interactive envelope (a button tap) is Slack traffic as much as a
+// message is, so it stamps the last event's time on its own.
+func TestAnInteractiveEnvelopeStampsTheLastEvent(t *testing.T) {
+	srv, _ := stalledSlackStub(t)
+	a := newTestSlackAdapter(&fakeSlackAPI{})
+	m := NewMetrics()
+	a.SetMetrics(m)
+	a.sm = socketmode.New(slack.New("xoxb-stub", slack.OptionAPIURL(srv.URL+"/")))
+	a.sm.Events <- socketmode.Event{Type: socketmode.EventTypeInteractive}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	returned := make(chan error, 1)
+	go func() { returned <- a.Run(ctx, func(InboundMessage) {}) }()
+	waitFor(t, "the interactive envelope to stamp the last event", func() bool {
+		v, ok := gaugeValue(t, m, slackLastEventSeries)
+		return ok && v > 0
+	})
+	cancel()
+	select {
+	case <-returned:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run never returned")
+	}
+}
