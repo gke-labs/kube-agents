@@ -75,6 +75,11 @@ def data(*runs, inactive=()):
     return {"schema_version": 1, "generated_at": "2026-10-20T12:00:00+00:00", "cases": cases, "runs": list(runs)}
 
 
+def check_reason(*checks):
+    """A low-score reason naming ``checks``, as bench-gate prints it."""
+    return "VerificationCorrectness=0.0 (floor 1.0) -- " + "; ".join(f"{c}: required phrases absent" for c in checks)
+
+
 def green(name="case-green"):
     return task(name, "pass", "pass", "pass")
 
@@ -587,7 +592,8 @@ class AssigneeTest(Harness):
 
     def test_end_to_end_each_rule_lands_on_the_issue(self):
         cases = ("case-maint", "case-outsider", "case-noowner")
-        gh, _, _ = self.run_once(data(*(night(d, [red(c) for c in cases]) for d in (15, 16, 17))))
+        # Each fails a check of its own, so none is grouped (GroupTest).
+        gh, _, _ = self.run_once(data(*(night(d, [task(c, "fail", "fail", "fail", reason=check_reason(f"check-{c}")) for c in cases]) for d in (15, 16, 17))))
         by_case = {b["title"].split()[1]: b for b in self.filed(gh)}
         self.assertEqual(by_case["case-maint"]["assignees"], ["carol"])
         self.assertEqual(by_case["case-outsider"]["assignees"], ["zed"], "any login, as case_owner.py resolves it")
@@ -1290,6 +1296,234 @@ class RunAsAScript(Harness):
         self.assertIn("warning: gh api GET repos/gke-labs/kube-agents/issues?labels=nightly-red", proc.stderr)
         self.assertIn("nightly bugs (dry run): would file 0", proc.stdout)
 
+
+
+SAFEGUARD = "front-door-stays-out-of-the-worker-verbs"
+SAFEGUARD_REASON = f"VerificationCatastrophic=0.0 ({SAFEGUARD}): the agent took an action a safeguard forbids"
+# The cluster each part runs: three capacity cases on the main job, two
+# security cases on main-b.
+MAIN_CASES = ("case-red", "case-red-extended", "case-maint")
+MAIN_B_CASES = ("case-reviewer", "case-noowner")
+
+
+def tripped(name):
+    return task(name, "fail", "fail", "fail", reason=SAFEGUARD_REASON)
+
+
+class GroupTest(Harness):
+    """One change broke many cases (Nov 6-8: #4973's grader change tripped one
+    safeguard on cases across main and main-b, green after #5179): one issue
+    for the group, one all-clear comment when every case is clear."""
+
+    def cluster(self, clear=(), clear_b=(), more=()):
+        """Nights 6-8 red with the shared safeguard on both parts, then the
+        ``clear`` nights green on main and ``clear_b`` nights green on main-b."""
+        runs = []
+        for d in (6, 7, 8):
+            runs += [night(d, [tripped(c) for c in MAIN_CASES]), night(d, [tripped(c) for c in MAIN_B_CASES], job=MAIN_B_JOB)]
+        for d in clear:
+            runs.append(night(d, [green(c) for c in MAIN_CASES]))
+        for d in clear_b:
+            runs.append(night(d, [green(c) for c in MAIN_B_CASES], job=MAIN_B_JOB))
+        return data(*runs, *more)
+
+    def filed_group(self, gh):
+        return [b for b in self.filed(gh) if nightly_bugs.GROUP_MARKER_RE.search(b["body"])]
+
+    def opened(self, filed, **extra):
+        return {"number": 4000, "title": filed["title"], "body": filed["body"], "created_at": "2026-10-08T12:00:00Z", **extra}
+
+    def test_a_shared_check_across_parts_files_one_issue_to_the_infra_owner(self):
+        gh, out, _ = self.run_once(self.cluster())
+        [issue] = self.filed(gh)
+        body = issue["body"]
+        self.assertIn("<!-- kube-agents-bot:nightly-red-group night=2026-10-06 -->", body)
+        for case in MAIN_CASES + MAIN_B_CASES:
+            self.assertIn(nightly_bugs.MARKER.format(case=case), body)
+            self.assertIn(f"- `{case}` (`", body)
+        self.assertEqual(issue["title"], "Nightly: cases red together since 2026-10-06 need triage")
+        self.assertEqual(issue["assignees"], ["ivan"], "the cases span domains: the infra owner")
+        self.assertEqual(issue["labels"], ["nightly-red", "domain:capacity", "domain:security", "needs-triage"])
+        self.assertIn("Case owners: @carol, @sam, @alice, @bob.", body, "in case order, the assignee left out")
+        for day in (6, 7, 8):
+            self.assertIn(f"  - 2026-10-{day:02d} · [run](", body)
+        self.assertIn(f"/logs/{MAIN_B_JOB}/", body, "each case links the part that ran it")
+        self.assertNotIn(SAFEGUARD, body, "the check name stays off the public issue")
+        self.assertNotIn(SAFEGUARD, issue["title"])
+        self.assertNotIn(SAFEGUARD, out, "and off the public job log")
+        for text in (issue["title"], body):
+            self.assertIsNone(RESULTS_RE.search(text), text)
+        self.assertIn("filed 1,", out)
+
+    def test_the_group_recovers_with_one_comment_and_no_per_case_comments(self):
+        gh, _, _ = self.run_once(self.cluster())
+        [filed] = self.filed(gh)
+        issue = self.opened(filed)
+        gh, out, _ = self.run_once(self.cluster(clear=(9,), clear_b=(9,)), FakeGh(open_issues=[issue]))
+        comments = [body for _, body in self.comments(gh)]
+        [group] = comments
+        self.assertIn("Every case here is clear again", group)
+        self.assertIn("night=2026-10-06 clear=2026-10-09", group)
+        for case in MAIN_CASES + MAIN_B_CASES:
+            self.assertIn(f"`{case}` on the 2026-10-09 nightly ([run](", group)
+        self.assertIn("will not close", group)
+        self.assertNotIn(SAFEGUARD, group)
+        self.assertIsNone(RESULTS_RE.search(group), group)
+        self.assertEqual(self.filed(gh), [], "the group's cases are not filed again")
+        self.assertIn("recovered: every case of the group", out)
+        self.assertFalse([c for c in gh.calls if c[0] == "PATCH"], "never closes or edits the issue")
+        # The next pass reads its comments back and stays quiet.
+        again, _, _ = self.run_once(self.cluster(clear=(9,), clear_b=(9,)), FakeGh(open_issues=[issue], comments={4000: [{"body": c} for c in comments]}))
+        self.assertEqual(again.writes(), [])
+
+    def test_a_part_that_graded_nothing_is_not_a_green_night_for_the_group(self):
+        gh, _, _ = self.run_once(self.cluster())
+        [filed] = self.filed(gh)
+        issue = self.opened(filed)
+        # Night 9: main is green; main-b got no project, every rep infra.
+        lost_b = night(9, [infra_task(c) for c in MAIN_B_CASES], job=MAIN_B_JOB)
+        gh, _, _ = self.run_once(self.cluster(clear=(9,), more=(lost_b,)), FakeGh(open_issues=[issue]))
+        comments = [body for _, body in self.comments(gh)]
+        self.assertEqual(comments, [], "main-b's cases are not clear, and a group issue gets no per-case comment")
+        # Night 10: main-b runs green, and the group is clear.
+        gh, _, _ = self.run_once(self.cluster(clear=(9, 10), clear_b=(10,), more=(lost_b,)),
+                                 FakeGh(open_issues=[issue], comments={4000: [{"body": c} for c in comments]}))
+        [group] = [body for _, body in self.comments(gh) if "Every case here" in body]
+        self.assertIn("clear=2026-10-10", group)
+        self.assertIn("`case-reviewer` on the 2026-10-10 nightly", group)
+        self.assertIn("`case-red` on the 2026-10-09 nightly", group)
+
+    def test_a_case_that_cleared_before_its_red_nights_left_the_window_still_counts_clear(self):
+        gh, _, _ = self.run_once(self.cluster())
+        [filed] = self.filed(gh)
+        issue = self.opened(filed)
+        # main clears on night 9, main-b only on night 23: by then nights 6-8
+        # are past the 14-night window and the main cases show no red at all.
+        late = [night(d, [green(c) for c in MAIN_CASES]) for d in range(10, 24)]
+        late += [night(d, [tripped(c) for c in MAIN_B_CASES], job=MAIN_B_JOB) for d in range(9, 23)]
+        doc = self.cluster(clear=(9,), clear_b=(23,), more=late)
+        gh, _, _ = self.run_once(doc, FakeGh(open_issues=[issue]))
+        [group] = [body for _, body in self.comments(gh) if "Every case here" in body]
+        self.assertIn("clear=2026-10-23", group)
+        self.assertIn("`case-noowner` on the 2026-10-23 nightly", group)
+        self.assertIn("`case-red` on the 2026-10-10 nightly", group, "its first pass the window still holds")
+
+    def test_a_three_case_group_that_recovers_leaves_exactly_one_comment(self):
+        runs = [night(d, [tripped(c) for c in MAIN_CASES]) for d in (6, 7, 8)]
+        gh, _, _ = self.run_once(data(*runs))
+        [filed] = self.filed(gh)
+        cleared = data(*runs, night(9, [green(c) for c in MAIN_CASES]))
+        gh, _, _ = self.run_once(cleared, FakeGh(open_issues=[self.opened(filed)]))
+        [(path, body)] = self.comments(gh)
+        self.assertEqual(path, f"{ISSUES}/4000/comments")
+        self.assertIn("Every case here is clear again", body)
+
+    def test_a_group_issue_with_every_marker_deleted_is_not_matched_by_name(self):
+        gh, _, _ = self.run_once(self.cluster())
+        [filed] = self.filed(gh)
+        body = "\n".join(line for line in filed["body"].splitlines() if "nightly-red case=" not in line)
+        gh, _, _ = self.run_once(self.cluster(), FakeGh(open_issues=[self.opened(filed, body=body)]))
+        self.assertEqual(len(self.filed(gh)), 1, "the cases listed in its body are split off and file again, as one group")
+
+    def test_a_long_recovered_group_is_not_commented_again_as_its_nights_scroll_past(self):
+        gh, _, _ = self.run_once(self.cluster())
+        [filed] = self.filed(gh)
+        green_nights = [night(d, [green(c) for c in MAIN_CASES]) for d in range(9, 25)]
+        green_nights += [night(d, [green(c) for c in MAIN_B_CASES], job=MAIN_B_JOB) for d in range(9, 25)]
+        # The window is nights 11-24: every red night has left it.
+        gh, _, _ = self.run_once(self.cluster(more=green_nights), FakeGh(open_issues=[self.opened(filed)]))
+        self.assertEqual(self.comments(gh), [])
+
+    def test_one_domain_goes_to_its_owner_with_the_case_owners_mentioned(self):
+        runs = [night(d, [tripped(c) for c in MAIN_CASES]) for d in (6, 7, 8)]
+        gh, _, _ = self.run_once(data(*runs))
+        [issue] = self.filed(gh)
+        self.assertEqual(issue["assignees"], ["carol"])
+        self.assertEqual(issue["labels"], ["nightly-red", "domain:capacity", "needs-triage"])
+        self.assertIn("Domain: **Capacity** (`capacity`).", issue["body"])
+        self.assertIn("Case owners: @alice.", issue["body"], "carol is the assignee; alice owns two cases, mentioned once")
+
+    def test_two_cases_sharing_a_check_each_file_their_own(self):
+        runs = [night(d, [tripped(c) for c in MAIN_CASES[:2]]) for d in (6, 7, 8)]
+        gh, _, _ = self.run_once(data(*runs))
+        self.assertEqual(sorted(b["title"] for b in self.filed(gh)), ["Nightly: case-red needs triage", "Nightly: case-red-extended needs triage"])
+
+    def test_cases_that_turned_red_on_different_nights_are_not_grouped(self):
+        runs = [night(5, [tripped("case-red"), green("case-maint"), green("case-reviewer")])]
+        runs += [night(d, [tripped(c) for c in ("case-red", "case-maint", "case-reviewer")]) for d in (6, 7, 8)]
+        gh, _, _ = self.run_once(data(*runs))
+        self.assertEqual(self.filed_group(gh), [], "case-red turned red a night earlier: two left, under the bar")
+        self.assertEqual(len(self.filed(gh)), 3)
+        runs = [night(5, [tripped("case-red")] + [green(c) for c in ("case-maint", "case-reviewer", "case-noowner")])]
+        runs += [night(d, [tripped(c) for c in ("case-red", "case-maint", "case-reviewer", "case-noowner")]) for d in (6, 7, 8)]
+        gh, _, _ = self.run_once(data(*runs))
+        [group] = self.filed_group(gh)
+        self.assertIn("night=2026-10-06", group["body"])
+        self.assertNotIn(nightly_bugs.MARKER.format(case="case-red"), group["body"])
+        self.assertEqual(len(self.filed(gh)), 2, "the group and case-red's own")
+
+    def test_a_check_not_shared_by_every_failing_rep_does_not_group(self):
+        def mixed(name):
+            reps = [rep(1, "fail", check_reason("a-check")), rep(2, "fail", check_reason("b-check")), rep(3, "fail", check_reason("a-check", "b-check"))]
+            return {"name": name, "result": "fail", "reps": reps}
+        gh, _, _ = self.run_once(data(*(night(d, [mixed(c) for c in MAIN_CASES]) for d in (6, 7, 8))))
+        self.assertEqual(self.filed_group(gh), [])
+        self.assertEqual(len(self.filed(gh)), 3)
+        both = data(*(night(d, [task(c, "fail", "fail", "fail", reason=check_reason("a-check", "b-check")) for c in MAIN_CASES]) for d in (6, 7, 8)))
+        gh, _, _ = self.run_once(both)
+        self.assertEqual(len(self.filed_group(gh)), 1, "two shared checks are still one group")
+        self.assertEqual(len(self.filed(gh)), 1)
+
+    def test_a_case_named_in_an_open_group_issue_is_not_filed_again(self):
+        gh, _, _ = self.run_once(self.cluster())
+        [filed] = self.filed(gh)
+        later = [night(d, [tripped(c) for c in MAIN_CASES]) for d in (9, 10)]
+        gh, out, _ = self.run_once(self.cluster(more=later), FakeGh(open_issues=[self.opened(filed)]))
+        self.assertEqual(self.filed(gh), [])
+        self.assertIn("tracked: case-maint by #4000", out)
+
+    def test_a_closed_group_issue_holds_its_cases_as_a_closed_case_issue_does(self):
+        gh, _, _ = self.run_once(self.cluster())
+        [filed] = self.filed(gh)
+        closed = self.opened(filed, closed_at="2026-10-08T13:00:00Z", state_reason="completed")
+        gh, _, _ = self.run_once(self.cluster(), FakeGh(closed_issues=[closed]))
+        self.assertEqual(self.filed(gh), [])
+
+    def test_a_case_with_its_own_open_issue_does_not_count_toward_a_group(self):
+        own = {"number": 3990, "title": "Nightly: case-red", "body": nightly_bugs.MARKER.format(case="case-red"), "created_at": "2026-10-08T12:00:00Z"}
+        runs = [night(d, [tripped(c) for c in MAIN_CASES]) for d in (6, 7, 8)]
+        gh, out, _ = self.run_once(data(*runs), FakeGh(open_issues=[own]))
+        self.assertEqual(self.filed_group(gh), [])
+        self.assertEqual(sorted(b["title"] for b in self.filed(gh)), ["Nightly: case-maint needs triage", "Nightly: case-red-extended needs triage"])
+        self.assertIn("tracked: case-red by #3990", out)
+
+    def test_a_case_split_off_the_group_files_on_its_own(self):
+        gh, _, _ = self.run_once(self.cluster())
+        [filed] = self.filed(gh)
+        issue = self.opened(filed, body=filed["body"].replace(nightly_bugs.MARKER.format(case="case-maint") + "\n", ""))
+        gh, _, _ = self.run_once(self.cluster(), FakeGh(open_issues=[issue]))
+        self.assertEqual([b["title"] for b in self.filed(gh)], ["Nightly: case-maint needs triage"])
+
+    def test_a_refused_assignee_files_the_group_unassigned_and_says_so(self):
+        gh, _, _ = self.run_once(self.cluster(), FakeGh(refuse_assignees=("ivan",)))
+        refused, issue = self.filed(gh)
+        self.assertEqual(refused["assignees"], ["ivan"])
+        self.assertNotIn("assignees", issue)
+        self.assertIn("**Unassigned** (GitHub refused `ivan` as assignee).", issue["body"])
+
+    def test_rep_checks_reads_both_grading_shapes(self):
+        self.assertEqual(nightly_bugs.rep_checks(SAFEGUARD_REASON), {SAFEGUARD})
+        self.assertEqual(nightly_bugs.rep_checks("VerificationCatastrophic=0.0 (a-one, b.two): the agent took an action"), {"a-one", "b.two"})
+        self.assertEqual(nightly_bugs.rep_checks("VerificationCatastrophic=0.0 (<unnamed>): the agent took an action"), set())
+        self.assertEqual(nightly_bugs.rep_checks(check_reason("x-check", "y-check")), {"x-check", "y-check"})
+        self.assertEqual(nightly_bugs.rep_checks("VerificationCorrectness=0.5 (floor 1.0) -- bare-check; other-check: why [1 check(s) not applicable: z]"), {"bare-check", "other-check"})
+        self.assertEqual(nightly_bugs.rep_checks("VerificationCorrectness=0.0 (floor 1.0) -- pod-ready: got 0; want: 3; error: x"), {"pod-ready"},
+                         "a bare word after a `; ` inside a check's reason is not a check")
+        self.assertEqual(nightly_bugs.rep_checks("replay error: the recorded transcript is missing"), set())
+        self.assertEqual(nightly_bugs.rep_checks(None), set())
+        cut = ("VerificationCorrectness=0.0 (floor 1.0) -- first-check: " + "x" * 300)[:285] + "; second-cut-sh"
+        self.assertEqual(len(cut), 300)
+        self.assertEqual(nightly_bugs.rep_checks(cut), {"first-check"}, "a name at the end of a cut reason may be cut short")
 
 
 class PublicIssueCarriesNoCaseResultsTest(Harness):

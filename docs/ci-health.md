@@ -940,6 +940,32 @@ repetition on a graded night after its last failing one, and that night
 finished after the issue was opened, the bot comments with that night's run link, keyed on the night so it comments once per recovery. It
 never closes an issue; the triager does.
 
+When one change breaks many cases, they get one issue. Before filing, the
+cases that would each file are grouped by the night their current run of red
+nights began and a check that every graded failing repetition of that run
+names (read from the grading line's tripped safeguards, or the failed checks
+after a low score). Three or more cases on one such key file one issue in
+place of one each, labelled `nightly-red`, each case's `domain:<slug>` and
+`needs-triage`, and listing each case's nights as a per-case issue does. It goes to the
+domain's `owner:` when the cases share a domain, and to `infra_owner` in
+`domains.yaml` when they span domains, with each case's effective owner
+@-mentioned. The issue carries every case's marker, so the dedupe treats it as each
+case's issue (matched on those markers alone, never on a case named in its
+text); a triager who
+deletes a case's marker line splits that case off, and it files on its own if
+it stays red. Once every case it names has a recovery night after the issue
+opened (or, once a case's red nights have left the 14-night window, a pass
+after the issue opened), the bot comments once, listing each case's clear
+night; a group issue gets no per-case recovery comment. A part
+that graded nothing that night (no project, a setup death) is skipped, as for
+one case, so it does not count as clear. A case that reaches 3 red nights a
+tick after its group was filed files on its own. The issue names no check: the
+check is used to group and stays on the dashboard. Three, not two: two cases
+sharing a check from one night are often a probe and its audit in one domain,
+one owner either way, and three unrelated cases breaking the same check the
+same night are rarely a coincidence. On 2026-11-09 one grader change (#4973)
+filed ten per-case issues to five owners.
+
 Two infrastructure shapes file an issue labelled `nightly-red`, `Infra` and
 `needs-triage` instead of a domain label, assigned to `infra_owner` in
 `domains.yaml` with `infra_backup` mentioned (`nightly_infra.py` holds the
