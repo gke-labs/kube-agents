@@ -2139,7 +2139,7 @@ func seededGitOpsEntry(agent *agentv1alpha1.PlatformAgent) *agentv1alpha1.Manage
 // maps each one onto the TERMINAL_* environment variable tools/terminal_tool.py
 // reads, and tools/environments/ssh.py turns them into an ssh command line.
 //
-// Six of these keys are Hermes'. `cwd` is absent on purpose — it is per-profile,
+// Seven of these keys are Hermes'. `cwd` is absent on purpose — it is per-profile,
 // and a value here would replace each profile's own (see the note on
 // renderConfigYAML). `ssh_persistent` is absent because Hermes has no env var for
 // it, so rendering it would look like a setting and be one only for in-process
@@ -2162,7 +2162,17 @@ func seededGitOpsEntry(agent *agentv1alpha1.PlatformAgent) *agentv1alpha1.Manage
 // cleanup() no longer reaches the master either. The value stays because
 // reaping reclaims nothing here.
 //
-// `workspace_root` is the sixth and is NOT Hermes'. Hermes ignores it; the reader
+// `timeout` is the terminal tool's per-call limit for a command run without a
+// `timeout=` argument. Hermes' code default is 180s, but the image's first boot
+// seeds $HERMES_HOME/.env from Hermes' .env.example, which sets
+// TERMINAL_TIMEOUT=60, and .env beats the code default. So without this key every
+// install ran at 60s: a polling `sleep 60` with no `timeout=` raced it, and the
+// scripts that budget against 180s (cluster_preflight.sh) were cut short. A
+// seeded .env is never reseeded, so only a key that outranks it reaches an
+// existing install;
+// deploy/shared/terminal_env_pin.py copies it into each profile's .env.
+//
+// `workspace_root` is the eighth and is NOT Hermes'. Hermes ignores it; the reader
 // is agents/platform/scripts/sandbox_exec.py, which already parses this block for
 // ssh_host and needs one more fact about the far side — the directory a proxied
 // command must run in, which is shellSandboxDataPath, the sandbox's data volume.
@@ -2178,8 +2188,15 @@ type managedTerminalConfig struct {
 	SSHPort         int    `json:"ssh_port"`
 	SSHKey          string `json:"ssh_key"`
 	LifetimeSeconds int    `json:"lifetime_seconds"`
+	TimeoutSeconds  int    `json:"timeout"`
 	WorkspaceRoot   string `json:"workspace_root"`
 }
+
+// shellSandboxTerminalTimeoutSeconds is what the operator publishes as
+// terminal.timeout — see the note above. Hermes' own code default
+// (`_parse_env_var("TERMINAL_TIMEOUT", "180")` in tools/terminal_tool.py), which
+// cluster_preflight.sh mirrors as TERMINAL_TOOL_TIMEOUT_SECONDS.
+const shellSandboxTerminalTimeoutSeconds = 180
 
 // shellSandboxEnvLifetimeSeconds is what the operator publishes as
 // terminal.lifetime_seconds — see the note above. 30 days, not "off": Hermes
@@ -2319,6 +2336,7 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 		SSHPort:         shellSandboxPort,
 		SSHKey:          shellSandboxClientKeyFilePath(),
 		LifetimeSeconds: shellSandboxEnvLifetimeSeconds,
+		TimeoutSeconds:  shellSandboxTerminalTimeoutSeconds,
 		WorkspaceRoot:   shellSandboxDataPath,
 	}
 
