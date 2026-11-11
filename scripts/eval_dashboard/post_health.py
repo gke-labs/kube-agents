@@ -51,7 +51,8 @@ The digest hour is a Toronto hour too, and "once a day" is a Toronto day.
 One side effect beyond posting: on a new OUTAGE with no tracking issue --
 none in case-notes.yaml, none open under the `presubmit-gate` label naming
 the same cases -- gate_issue.py files one with the workflow's GitHub token
-(`gh api`, GH_TOKEN), the "broken" message says "Tracking #NNN", and the
+(`gh api`, GH_TOKEN), the "broken" message says "Tracking #NNN" (the full
+URL when the issue is in the issues repository, ghcli.issue_tag), and the
 recovery comments on it. A new `lost_pods` condition (the build cluster lost
 the nodes under running jobs, #1478) files one the same way, addressed to
 the cluster owner, unless an open issue already names the lost nodes. A new `fixture_drift` condition (a seeded fixture out of its
@@ -87,6 +88,7 @@ Test: cd scripts && python3 -m unittest test_eval_dashboard_post_health
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import os
 import pathlib
@@ -193,6 +195,15 @@ DEFAULT_SLOW_BASELINE_DAYS = 7
 # them rather than printing the label.
 CAUSE_CAPACITY = "CAPACITY"
 CAUSE_CONCURRENCY_CAP = "CONCURRENCY_CAP"
+# The storm sentence names each phrasing the repetitions died with
+# (health.json incident.causes), short: the harness's "the executor's own
+# failure (<token>)" shell is peeled to the token, and a sentence-shaped
+# phrasing is cut at a word boundary. Past STORM_CHAT_PHRASINGS the rest is
+# a count, so one line stays one line.
+EXECUTOR_FAILURE_SHELL_RE = re.compile(r"^the executor's own failure \(([^()]+)\)$")
+STORM_CHAT_WORDS_MAX_CHARS = 40
+STORM_CHAT_WORDS_ELLIPSIS = "…"
+STORM_CHAT_PHRASINGS = 4
 CAUSE_CONTROL_PLANE = "CONTROL_PLANE"
 # The periodic's own "I could not tell", distinct from a label added later that
 # this file has no remedy for. Both ask for nothing; only this one knows why.
@@ -685,9 +696,9 @@ def describe_cases(cases) -> str:
 
 
 def issue_tag(issue) -> str | None:
-    """"#1278" for an {number, url} the bot filed or found; None otherwise."""
-    number = (issue or {}).get("number") if isinstance(issue, dict) else None
-    return f"#{number}" if number else None
+    """ghcli.issue_tag: "#N" for this repository's issue, the URL for the
+    issues repository's; None for anything else."""
+    return ghcli.issue_tag(issue)
 
 
 def issue_for(issue, condition: str | None) -> dict | None:
@@ -706,15 +717,17 @@ def episode_issues(state: dict) -> list[dict]:
     out: list[dict] = []
     for candidate in [*(state.get("issues") or []), state.get("issue")]:
         tag = issue_tag(candidate)
-        if tag and tag not in {issue_tag(seen) for seen in out}:
+        if tag and not ghcli.has_issue([issue_tag(seen) for seen in out], tag):
             out.append(candidate)
     return out
 
 
 def tracking_text(issues, issue=None) -> str:
+    """The issues as the reader sees them: case-notes.yaml's as written
+    ("#N"), the bot's by URL, each issue once whichever form names it."""
     issues = list(issues or [])
     tag = issue_tag(issue)
-    if tag and tag not in issues:
+    if tag and not ghcli.has_issue(issues, tag):
         issues.append(tag)
     return ", ".join(issues) if issues else NO_ISSUE_TEXT
 
@@ -843,6 +856,18 @@ def pool_drift_retest(health: dict) -> str:
     return POOL_NO_RETEST if pool_drift_passes_leases(health) else POOL_RETEST
 
 
+def storm_words(words: str) -> str:
+    """One phrasing as the Chat sentence carries it: the executor-failure
+    shell peeled to its token, else the words cut at a word boundary."""
+    shell = EXECUTOR_FAILURE_SHELL_RE.match(words)
+    if shell:
+        return shell.group(1)
+    if len(words) <= STORM_CHAT_WORDS_MAX_CHARS:
+        return words
+    head = words[:STORM_CHAT_WORDS_MAX_CHARS]
+    return (head[: head.rfind(" ")] if " " in head else head).rstrip() + STORM_CHAT_WORDS_ELLIPSIS
+
+
 def cause_sentence(health: dict) -> str:
     """One sentence a reader can answer "is it me?" from."""
     incident = health.get("incident") or {}
@@ -870,7 +895,20 @@ def cause_sentence(health: dict) -> str:
     if condition == "storm":
         start, end = parse_iso(incident.get("window_start")), parse_iso(incident.get("window_end"))
         window = clock_range(start, end) if start and end else f"since {since}"
-        return f"quota storm {window} hit {prs} PRs."
+        # The repetitions' own words (health.json incident.causes), when the
+        # records carried any: "27 hermes-rate-limited, 1 delegated worker…".
+        # Counted by the form the reader sees, so two phrasings the cut makes
+        # identical are one item.
+        shown: Counter = Counter()
+        for words, n in (incident.get("causes") or []):
+            if isinstance(words, str) and words:
+                shown[storm_words(words)] += n
+        items = shown.most_common()
+        said = ", ".join(f"{n} {words}" for words, n in items[:STORM_CHAT_PHRASINGS])
+        rest = items[STORM_CHAT_PHRASINGS:]
+        if rest:
+            said += f", and {sum(n for _, n in rest)} reps in {len(rest)} other phrasings"
+        return f"quota storm {window} hit {prs} PRs" + (f"; reps: {said}." if said else ".")
     if condition == "setup_deaths":
         return f"{incident.get('runs', 0)} runs on {prs} PRs died during setup since {since}."
     if condition == CONDITION_FIXTURE_DRIFT:
@@ -1600,7 +1638,7 @@ def render_recovery(health: dict, prev: dict, now: datetime) -> str:
     issues = list(prev.get("tracking_issues") or [])
     for each in episode_issues(prev):
         tag = issue_tag(each)
-        if tag not in issues:
+        if not ghcli.has_issue(issues, tag):
             issues.append(tag)
     if issues:
         parts.append(", ".join(issues))
@@ -1916,7 +1954,7 @@ def run(
             if tracker.is_open(each) is False:
                 log(f"tracking issue: #{each['number']} is closed; dropped")
                 dropped.append(issue_tag(each))
-                health = dict(health, tracking_issues=[tag for tag in health.get("tracking_issues") or [] if tag != issue_tag(each)])
+                health = dict(health, tracking_issues=[tag for tag in health.get("tracking_issues") or [] if not ghcli.has_issue([issue_tag(each)], tag)])
                 if issue_for(each, condition) and condition_open(health, condition) is not False and evidence_after(health, condition, tracker.closed_at(each)):
                     reopen = True
                 continue
@@ -1937,7 +1975,7 @@ def run(
     issue = next((candidate for candidate in carried if issue_for(candidate, condition) and not candidate.get(UNSETTLED_KEY)), None)
     # What the readers were told, less the issues this tick found closed:
     # the recovery names the ones still carried.
-    told = prev if prev is None else dict(prev, issues=carried, issue=None if issue_tag(prev.get("issue")) in dropped else prev.get("issue"), tracking_issues=[tag for tag in prev.get("tracking_issues") or [] if tag not in dropped])
+    told = prev if prev is None else dict(prev, issues=carried, issue=None if ghcli.has_issue(dropped, issue_tag(prev.get("issue"))) else prev.get("issue"), tracking_issues=[tag for tag in prev.get("tracking_issues") or [] if not ghcli.has_issue(dropped, tag)])
     wants_issue = (
         (KIND_CHANGE in kinds or reopen)
         and (health.get("state") == OUTAGE or condition in (CONDITION_LOST_PODS, CONDITION_FIXTURE_DRIFT, CONDITION_POOL_DRIFT))

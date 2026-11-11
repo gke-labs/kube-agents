@@ -53,7 +53,8 @@ Rollout step 2):
   fetch_cache.py filled, and keeps the lines and stored requests. The last
   pass writes lane_report.py's report and uploads it under the job's prefix,
   in `report/`. `--seed-once` seeds every pod and exits, 0 only when every
-  pod took the cache, so the lane can stop before its cases.
+  pod took the cache, so the lane can stop before its cases. A pod being
+  deleted is never seeded, though its lines are still collected.
 
 It never fails the eval: every command has a timeout, an error is counted and
 retried on the next pass, and the exit status is always 0. The job's stdout
@@ -79,7 +80,7 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple
 
 import replay_cache
 
@@ -111,7 +112,7 @@ SOURCES = ((LOGS_DIR, SEGMENT_SUFFIX), (STORE_REQUESTS_DIR, JSON_SUFFIX), (STORE
 # machine or an object name: one directory from SOURCES, one plain file name.
 SAFE_NAME = re.compile(
     r"^(?:logs/[A-Za-z0-9][A-Za-z0-9._-]*\.jsonl(?:\.open)?"
-    r"|store/(?:requests|blobs)/[A-Za-z0-9][A-Za-z0-9._-]*\.json)$"
+    r"|store/(?:requests|blobs)/[A-Za-z0-9][A-Za-z0-9._-]*\.json)\Z"
 )
 
 # The proxy's saved answers, under the cache directory in the data volume
@@ -119,7 +120,7 @@ SAFE_NAME = re.compile(
 # file is one plain name under one of four directories, variants one level
 # deeper, so a name is checked like the others before it becomes a path.
 DEFAULT_CACHE_SUBDIR = "replay-cache"
-CACHE_SUBDIR_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+CACHE_SUBDIR_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 CACHE_REL_RE = replay_cache.CACHE_REL_RE
 CACHE_SEED_MARKER = ".seeded"
 # The kept copy on this machine: one directory per pod (its lines and its
@@ -127,7 +128,7 @@ CACHE_SEED_MARKER = ".seeded"
 KEEP_PODS_DIR = "pods"
 KEEP_LOGS_DIR = "logs"
 KEEP_CACHE_DIR = "cache"
-POD_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$")
+POD_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?\Z")
 DEFAULT_PUBLISH_INTERVAL_SECONDS = 300.0
 PUBLISH_THREAD_NAME = "replay-cache-publish"
 # A file being written: the store's, and the collector's own kept copies.
@@ -155,6 +156,9 @@ PASS_MAX_BYTES = 512 * 1024 * 1024
 MAX_ERROR_EVENTS_PER_KIND = 5
 MS_PER_SECOND = 1000
 POD_PHASE_RUNNING = "Running"
+# Set on a pod being deleted. Such a pod keeps running through the chart's
+# preStop drain, and can go at any moment of it.
+POD_DELETION_FIELD = "deletionTimestamp"
 NUL = b"\0"
 NEWLINE = b"\n"
 # Long hex runs: request ids, blob names, fingerprints. Masked in anything printed.
@@ -176,8 +180,8 @@ ERROR_CLASS_OTHER = "other"
 # and REPLAY_SHADOW_BUILD_RE), so no object key this writes holds a `.` or `..`
 # segment: the bucket's IAM conditions match a key's prefix as text, and a
 # downloader that resolved `presubmit/x/../../nightly/` would file it elsewhere.
-BUCKET_SHAPE = re.compile(r"^[a-z0-9][a-z0-9_.-]{1,61}[a-z0-9]$")
-BUILD_SHAPE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+BUCKET_SHAPE = re.compile(r"^[a-z0-9][a-z0-9_.-]{1,61}[a-z0-9]\Z")
+BUILD_SHAPE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 GCLOUD_ENV = {
     # A composite upload writes and deletes temporary objects, which needs a
     # delete grant the presubmit's identity should not hold.
@@ -423,6 +427,13 @@ def default_runner(cmd: Sequence[str], input: Optional[bytes] = None,
         return subprocess.CompletedProcess(list(cmd), proc.returncode, out, err)
 
 
+class ProxyPod(NamedTuple):
+    name: str
+    # Being deleted: its lines are still collected (the drain exists for them),
+    # but it is never seeded, since it can vanish mid-copy and will serve nothing.
+    draining: bool
+
+
 @dataclass
 class Totals:
     passes: int = 0
@@ -536,12 +547,17 @@ class Collector:
 
     # --- steps ------------------------------------------------------------
 
-    def pods(self) -> List[str]:
+    def pods(self) -> List[ProxyPod]:
+        """Every proxy pod whose container is running, draining ones included, by name; none when the listing failed."""
+        return self.listed_pods() or []
+
+    def listed_pods(self) -> Optional[List[ProxyPod]]:
+        """As pods(), but None when the listing itself failed (counted as an error), so a caller can tell it from no pods."""
         proc = self.run("list_pods", self.kubectl + ["get", "pods", "-l", self.selector, "-o", "json"],
                         KUBECTL_TIMEOUT_SECONDS)
         if proc is None:
-            return []
-        names = []
+            return None
+        found: Dict[str, bool] = {}
         try:
             for pod in json.loads(proc.stdout).get("items") or []:
                 status = pod.get("status") or {}
@@ -549,11 +565,12 @@ class Collector:
                     continue
                 for cs in status.get("containerStatuses") or []:
                     if cs.get("name") == self.container and (cs.get("state") or {}).get("running") is not None:
-                        names.append(str(pod["metadata"]["name"]))
+                        metadata = pod["metadata"]
+                        found[str(metadata["name"])] = bool(metadata.get(POD_DELETION_FIELD))
         except (ValueError, AttributeError, KeyError, TypeError):
             self.fail("list_pods_parse")
-            return []
-        return sorted(set(names))
+            return None
+        return [ProxyPod(name, found[name]) for name in sorted(found)]
 
     def list_files(self, pod: str, with_open: bool) -> List[Tuple[str, int]]:
         proc = self.exec_in("list_files", pod, LIST_SCRIPT,
@@ -751,9 +768,29 @@ class Collector:
         return True
 
     def seed_all(self) -> Tuple[int, int]:
-        """Seed every proxy pod now; (pods, pods that took it)."""
-        pods = self.pods()
-        return len(pods), sum(1 for pod in pods if self.seed(pod))
+        """Seed every proxy pod not draining now; (those pods, pods that took it).
+
+        A pod whose seed failed is listed again: one deleted while its copy ran
+        (an eviction, a node drain) is gone, not a pod that refused the cache,
+        so it leaves both counts. One still live counts as a failure, and so
+        does every failed pod when that listing itself fails (an unreachable
+        API server is no evidence a pod went).
+        """
+        listed = self.pods()
+        live = [pod.name for pod in listed if not pod.draining]
+        if len(live) < len(listed):
+            self.emit({"event": "seed_skipped_draining", "pods": len(listed) - len(live)})
+        failed = [pod for pod in live if not self.seed(pod)]
+        if not failed:
+            return len(live), len(live)
+        relisted = self.listed_pods()
+        if relisted is None:
+            return len(live), len(live) - len(failed)
+        still_live = {pod.name for pod in relisted if not pod.draining}
+        vanished = [pod for pod in failed if pod not in still_live]
+        if vanished:
+            self.emit({"event": "seed_skipped_vanished", "pods": len(vanished)})
+        return len(live) - len(vanished), len(live) - len(failed)
 
     def _publish(self, final: bool) -> None:
         try:
@@ -826,11 +863,11 @@ class Collector:
         """One pass over every proxy pod; `final` also takes the open segments."""
         stats = {"pods": 0, "listed": 0, "new": 0, "uploaded": 0}
         budget = PASS_MAX_BYTES
-        for pod in self.pods():
+        for pod, draining in self.pods():
             if self.cut_short(final):
                 break
             stats["pods"] += 1
-            if self.mode == MODE_REPLAY and self.seed_dir and not self.seeded(pod):
+            if self.mode == MODE_REPLAY and self.seed_dir and not draining and not self.seeded(pod):
                 self.seed(pod)
             files = self.list_files(pod, with_open=final)
             stats["listed"] += len(files)
@@ -954,7 +991,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--eval-mode-next", default="", help="record and replay: EVAL_MODE_NEXT (1 is next mode)")
     parser.add_argument("--forge", default="", help="record and replay: EVAL_FORGE (empty is github)")
     parser.add_argument("--seed-dir", default="", help="replay: the cache fetch_cache.py filled, seeded into each pod")
-    parser.add_argument("--seed-once", action="store_true", help="replay: seed every pod, then exit")
+    parser.add_argument("--seed-once", action="store_true", help="replay: seed every live proxy pod, then exit")
     parser.add_argument("--nightly-runs", default="", help="replay: fetch_cache.py's runs per recording build")
     args = parser.parse_args(argv)
     if not CACHE_SUBDIR_RE.match(args.cache_subdir) or args.cache_subdir in (LOGS_DIR, STORE_DIR):

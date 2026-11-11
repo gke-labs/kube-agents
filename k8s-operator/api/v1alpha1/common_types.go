@@ -1557,7 +1557,13 @@ type CredentialProxyExecSpec struct {
 	// positive count the shell sandbox, the profile workers and the session
 	// pods under the cluster view are given the tier's address for /v1/exec
 	// and /v1/gcp/. Each replica requests and is limited to 2 CPU and 2Gi of
-	// memory, with no override. A change between 0 and a positive value
+	// memory, with no override, so each one needs a node with that much free,
+	// and the pods that turning the tier on restarts (below) need room to start
+	// again. A replica that cannot be scheduled shows in the
+	// CredentialProxyExecReady condition (reason Unschedulable, with the
+	// scheduler's message), and callers that cannot reach the tier fall back to
+	// the stateful broker.
+	// A change between 0 and a positive value
 	// restarts the shell sandbox, the profile warm pools, and under the
 	// cluster view the A2A gateway, which read the tier's address when they
 	// start; a change between two positive values rewrites the count the pods
@@ -1890,6 +1896,18 @@ type SecuritySpec struct {
 	// Ignored for any other egressPolicy value.
 	// +optional
 	EgressAllowlist *EgressAllowlistSpec `json:"egressAllowlist,omitempty"`
+
+	// DisallowSecretsRead omits core `secrets` (`get`, `list`, `watch`) from the
+	// reader ClusterRole (`kubeagents:minimal:<ns>:<name>`).
+	//
+	// True omits `secrets` from the ClusterRole.
+	// False grants `get`, `list`, and `watch` on `secrets` (`<name>-kube-proxy`
+	// strips secret payloads from every response with `KUBE_PROXY_REDACT_SECRETS=true`).
+	// Absent (nil) grants `secrets` on a new install where the ClusterRole does
+	// not exist yet (when the operator holds `list` and `watch` on `secrets`).
+	// On an existing install, absent preserves the existing ClusterRole's `secrets` rule.
+	// +optional
+	DisallowSecretsRead *bool `json:"disallowSecretsRead,omitempty"`
 }
 
 // WorkloadIdentityFederationSpec names the pool the proxy federates through and

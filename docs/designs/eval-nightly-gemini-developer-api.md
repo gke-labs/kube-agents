@@ -9,8 +9,10 @@
 > findings blocking; sections 1, 4 and 8 keep the original plan as history. On 2026-11-06
 > `post-kube-agents-eval-rc` (GoogleCloudPlatform/oss-test-infra#2774) and the two Argon smoke
 > presubmits `pull-kube-agents-smoke-test` and `-today` (GoogleCloudPlatform/oss-test-infra#2775)
-> moved the same way, so "Presubmits stay on Vertex" below is history too: only the Claude and
-> Flash smoke jobs and the forge smoke variants stay on Vertex AI. One item stays open: the
+> moved the same way, so "Presubmits stay on Vertex" below is history too. Since then each
+> lane reads its provider and model from the build cluster's eval-model Secret
+> (`docs/ci-pool-projects.md` 5.10), and a Prow job without them stops at the deploy instead of
+> falling through to the scripts' default. One item stays open: the
 > version key does not carry the serving provider (#4932). The one precondition that could
 > have made the design moot was probed on 2026-11-04 (see "What the probe showed").
 
@@ -234,8 +236,8 @@ project, and the share of cached input tokens, come from the project's own usage
 Monitoring's quota usage for the Generative Language API, and AI Studio's usage page for the
 project, both of which report per minute. The expected result is zero 429s and a peak minute well
 under 20M for every leased project. If the peak minute is within a factor of two of the wall,
-parallelism comes down before anything else is tried. The three numbers go on the issue that
-tracks the move, beside the last Vertex night's.
+parallelism comes down before anything else is tried. The three numbers go on the dashboard digest; the
+issue that tracks the move names the night and its build id.
 
 ### 8. Documentation
 

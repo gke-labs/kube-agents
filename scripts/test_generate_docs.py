@@ -478,7 +478,7 @@ class CadenceCellTest(unittest.TestCase):
 
 
 class CRDFieldBlocksTest(unittest.TestCase):
-    """The three CRD field pages are registered, rendered as tables, and selectable."""
+    """The CRD field pages are registered, rendered as tables, and selectable."""
 
     def test_each_kind_has_a_block_on_its_own_page(self):
         for kind, page in generate_docs.CRD_KINDS.items():
@@ -606,6 +606,179 @@ class CRDFieldBlocksTest(unittest.TestCase):
                 self.assertIn("FRESH", page.read_text(encoding="utf-8"))
                 self.assertEqual(generate_docs.main(["--check"], blocks), 0)
                 self.assertEqual(generate_docs.main(["--check", "example"], blocks), 0)
+
+
+class ConditionsBlockTest(unittest.TestCase):
+    """The PlatformAgent conditions table is rendered from the controller's slice."""
+
+    def test_the_block_is_on_the_crd_guide_and_in_the_go_family(self):
+        paths, generator = generate_docs.BLOCKS[generate_docs.CONDITIONS_BLOCK]
+        self.assertEqual(paths, (generate_docs.CONDITIONS_PAGE,))
+        self.assertIs(generator, generate_docs.gen_platformagent_conditions)
+        # The operator Makefile's `manifests` refreshes the family by prefix.
+        self.assertTrue(generate_docs.CONDITIONS_BLOCK.startswith(generate_docs.CRD_FAMILY_PREFIX))
+        self.assertTrue(generate_docs.needs_go(generate_docs.CONDITIONS_BLOCK))
+        makefile = (generate_docs.REPO / "k8s-operator/Makefile").read_text(encoding="utf-8")
+        self.assertIn(f"CRD_DOC_BLOCK_PREFIX := {generate_docs.CRD_FAMILY_PREFIX}\n", makefile)
+
+    def test_reasons_render_as_a_code_spanned_list(self):
+        self.assertEqual(generate_docs.code_span_list(["A"]), "`A`")
+        self.assertEqual(generate_docs.code_span_list(["A", "B"]), "`A` or `B`")
+        self.assertEqual(generate_docs.code_span_list(["A", "B", "C"]), "`A`, `B` or `C`")
+        row = generate_docs.render_condition_row(
+            {"type": "T", "written": "When <x>", "meaning": "One of {reasons}; a|b", "reasons": ["A", "B"]}
+        )
+        self.assertEqual(row, "| `T` | When &lt;x&gt; | One of `A` or `B`; a\\|b |")
+
+    @unittest.skipIf(shutil.which(generate_docs.GO_BINARY) is None, "needs a Go toolchain")
+    def test_the_table_carries_every_row_with_its_reasons(self):
+        lines = generate_docs.gen_platformagent_conditions().split("\n")
+        self.assertEqual(tuple(lines[:2]), generate_docs.CONDITIONS_TABLE_HEADER)
+        types = [line.split(" | ")[0].removeprefix("| ") for line in lines[2:]]
+        self.assertEqual(types[0], "`Ready`")
+        self.assertIn("`A2AVerifier`", types)
+        self.assertEqual(len(types), len(set(types)))
+        degraded = next(line for line in lines if line.startswith("| `Degraded`"))
+        self.assertIn("`InvalidCredentialProxyExec` or `RBACIncomplete`", degraded)
+        self.assertNotIn(generate_docs.CONDITIONS_REASONS_PLACEHOLDER, "\n".join(lines))
+
+    @unittest.skipIf(shutil.which(generate_docs.GO_BINARY) is None, "needs a Go toolchain")
+    def test_a_hand_edited_row_fails_the_check_with_the_command_that_fixes_it(self):
+        page_text = generate_docs.CONDITIONS_PAGE.read_text(encoding="utf-8")
+        edited = page_text.replace("| `Degraded` | Only while degraded |", "| `Degraded` | Sometimes |", 1)
+        self.assertNotEqual(edited, page_text)
+        with tempfile.TemporaryDirectory() as tmp:
+            page = Path(tmp) / "platformagent-crd.md"
+            blocks = {generate_docs.CONDITIONS_BLOCK: ((page,), generate_docs.gen_platformagent_conditions)}
+            for text, want in ((page_text, 0), (edited, 1)):
+                page.write_text(text, encoding="utf-8")
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    self.assertEqual(generate_docs.main(["--check"], blocks), want)
+            self.assertIn("STALE", out.getvalue())
+            self.assertIn("Run `make docs-generate`", err.getvalue())
+
+    @unittest.skipIf(shutil.which(generate_docs.GO_BINARY) is None, "needs a Go toolchain")
+    def test_a_value_syntax_cannot_resolve_is_refused_with_its_position(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "docs.go").write_text(
+                "package controller\n\n"
+                'const knownType = "Known"\n\n'
+                "var platformAgentConditionDocs = []conditionDoc{\n"
+                '\t{Type: knownType, Written: "w", Meaning: "m"},\n'
+                '\t{Type: strings.ToUpper("x"), Written: "w", Meaning: "m"},\n'
+                "}\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(SystemExit) as caught:
+                generate_docs.run_go_generator(
+                    generate_docs.CONDITION_DOCS_GENERATOR, ["-dir", tmp], "the conditions table"
+                )
+        self.assertIn("docs.go:7", str(caught.exception))
+        self.assertIn("not a string literal or constant", str(caught.exception))
+
+
+class FootprintBlocksTest(unittest.TestCase):
+    """The install footprint is rendered from the chart, onto the page and into JSON."""
+
+    def test_the_blocks_target_the_page_and_the_json_and_need_helm(self):
+        prefix = generate_docs.FOOTPRINT_BLOCK_PREFIX
+        self.assertEqual(generate_docs.BLOCKS[prefix][0], (generate_docs.FOOTPRINT_PAGE,))
+        self.assertEqual(generate_docs.BLOCKS[f"{prefix}-profiles"][0], (generate_docs.FOOTPRINT_PROFILES_JSON,))
+        for block_id in (prefix, f"{prefix}-profiles"):
+            self.assertTrue(generate_docs.needs_helm(block_id))
+            self.assertFalse(generate_docs.needs_go(block_id))
+
+    def test_a_json_target_is_replaced_whole(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "data.json"
+            self.assertEqual(generate_docs.splice(target, "x", "{}\n"), (True, "{}\n"))
+            target.write_text("{}\n", encoding="utf-8")
+            self.assertEqual(generate_docs.splice(target, "x", "{}\n"), (False, "{}\n"))
+            self.assertEqual(generate_docs.splice(target, "x", "[]\n"), (True, "[]\n"))
+
+    def test_without_helm_a_write_run_skips_the_footprint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "data.json"
+            target.write_text("stale\n", encoding="utf-8")
+            blocks = {"install-footprint-x": ((target,), lambda: "FRESH\n")}
+            out = io.StringIO()
+            with mock.patch.object(
+                generate_docs.shutil, "which", side_effect=lambda b: None if b == generate_docs.HELM_BINARY else "/bin/x"
+            ):
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(generate_docs.main([], blocks), 0)
+            self.assertIn("skipped  [install-footprint-x]: needs `helm`", out.getvalue())
+            self.assertEqual(target.read_text(encoding="utf-8"), "stale\n")
+
+    @unittest.skipIf(shutil.which(generate_docs.HELM_BINARY) is None, "needs helm")
+    def test_a_hand_edited_figure_fails_the_check(self):
+        page_text = generate_docs.FOOTPRINT_PAGE.read_text(encoding="utf-8")
+        row = next(line for line in page_text.splitlines() if line.startswith("| `today`, GKE Standard |"))
+        cells = row.split(" | ")
+        cells[1] = str(int(cells[1]) + 1)
+        edited = page_text.replace(row, " | ".join(cells), 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            page = Path(tmp) / "prerequisites.md"
+            blocks = {"install-footprint": ((page,), generate_docs.install_footprint.render_tables)}
+            for text, want in ((page_text, 0), (edited, 1)):
+                page.write_text(text, encoding="utf-8")
+                err = io.StringIO()
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                    self.assertEqual(generate_docs.main(["--check"], blocks), want)
+            self.assertIn("Run `make docs-generate`", err.getvalue())
+
+    @unittest.skipIf(shutil.which(generate_docs.HELM_BINARY) is None, "needs helm")
+    def test_the_figures_come_from_the_chart_and_the_golden(self):
+        footprint = generate_docs.install_footprint
+        model = footprint.profiles_model()["profiles"]
+        self.assertIsNone(model["today-standard"]["sessionQuotaPods"])
+        self.assertEqual(model["next-standard"]["sessionQuotaPods"], footprint.golden_session_quota())
+        # Autopilot counts the credential proxy at its Autopilot requests.
+        self.assertGreater(
+            model["today-autopilot"]["requirements"]["requestsCpu"],
+            model["today-standard"]["requirements"]["requestsCpu"],
+        )
+        # Hindsight and the minter add chart pods, which the session quota counts.
+        self.assertGreater(model["next-hindsight-minter"]["sessionQuotaPods"], model["next-standard"]["sessionQuotaPods"])
+        self.assertEqual(footprint.cpu(2000), "2")
+        self.assertEqual(footprint.cpu(2756), "2756m")
+        self.assertEqual(footprint.memory(2 * 1024**3), "2Gi")
+        self.assertEqual(footprint.memory(10048 * 1024**2), "10048Mi")
+
+    def test_the_session_pod_reads_every_quantity_form_kubernetes_accepts(self):
+        footprint = generate_docs.install_footprint
+        constants = {
+            "workerCPURequest": "1.5",
+            "workerMemoryRequest": "1.5Gi",
+            "workerCPULimit": "2500m",
+            "workerMemoryLimit": "2G",
+            "workerEphemeralStorageRequest": "1Ti",
+        }
+        source = "\n".join(f'\t{name} = "{value}"' for name, value in constants.items())
+        with mock.patch.object(Path, "read_text", return_value=source):
+            pod = footprint._session_pod()
+        self.assertEqual(pod["cpuMillisRequest"], 1500)
+        self.assertEqual(pod["memoryBytesRequest"], 1536 * 1024**2)
+        self.assertEqual(pod["cpuMillisLimit"], 2500)
+        self.assertEqual(pod["memoryBytesLimit"], 2 * 1000**3)
+        self.assertEqual(pod["ephemeralStorageBytesRequest"], 1024**4)
+
+    def test_a_sum_that_does_not_split_evenly_over_its_pods_is_refused(self):
+        footprint = generate_docs.install_footprint
+        self.assertEqual(footprint._per_pod({"pods": 2, "cpuMillisRequest": 100, "surges": True}), {"cpuMillisRequest": 50})
+        with self.assertRaises(SystemExit) as caught:
+            footprint._per_pod({"pods": 2, "cpuMillisRequest": 101})
+        self.assertIn("cpuMillisRequest", str(caught.exception))
+
+    @unittest.skipIf(shutil.which(generate_docs.HELM_BINARY) is None, "needs helm")
+    def test_a_next_mode_workload_the_table_does_not_list_fails_the_render(self):
+        footprint = generate_docs.install_footprint
+        with mock.patch.object(footprint, "NEXT_WORKLOADS", footprint.NEXT_WORKLOADS[1:]):
+            with self.assertRaises(SystemExit) as caught:
+                footprint.workloads_rows()
+        self.assertIn("a2aNats", str(caught.exception))
+        self.assertIn("NEXT_WORKLOADS", str(caught.exception))
 
 
 class ReplayBaselineMetricsTest(unittest.TestCase):

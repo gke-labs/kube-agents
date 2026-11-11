@@ -11,6 +11,7 @@ rules:
       - persistentvolumeclaims
       - pods
       - resourcequotas
+      - secrets
       - serviceaccounts
       - services
     verbs:
@@ -50,16 +51,6 @@ rules:
       - podtemplates
     verbs:
       - create
-  - apiGroups:
-      - ""
-    resources:
-      - secrets
-    verbs:
-      - create
-      - delete
-      - get
-      - patch
-      - update
   - apiGroups:
       - admissionregistration.k8s.io
     resourceNames:
@@ -166,6 +157,7 @@ rules:
       - kubeagents.x-k8s.io
     resources:
       - agentplugins
+      - tiers
     verbs:
       - get
       - list
@@ -175,6 +167,7 @@ rules:
     resources:
       - agentplugins/status
       - agentprofiles/status
+      - tiers/status
     verbs:
       - get
       - patch

@@ -6,7 +6,7 @@
   "cluster_slots": {
     "a": "The seeded workload namespaces (each role's `namespace` names its own), plus the idle and pinned node pools, the default pool's own headroom, and the GKE Config Connector add-on in namespaced mode, the cluster the Config Connector eval cases plant on. Labelled `upgrade-family=seeded-regular`, the rollout family it shares with slots c and d.",
     "b": "Control plane held one minor behind the REGULAR channel default, plus the upgrade-readiness drain defects. Labelled `upgrade-family=seeded-held`: a rollout family of its own, so the regular family's rollout never waits on the lag.",
-    "c": "The consistency outlier: no master authorized networks, and a default pool on a 50 GB boot disk with cpuCfsQuota off where every other pool runs 20 GB and no kubelet block. Labelled `upgrade-family=seeded-regular`.",
+    "c": "The consistency outlier: no master authorized networks, and a default pool on a 50 GB boot disk with cpuCfsQuota off where every other pool runs 20 GB and no kubelet block. Also the ComputeClass cluster (defects-c.tf), the one whose only pool carries a compute-class label: ComputeClass `general-ccc` over the labelled, untainted default pool, the namespace `seeded-compute-class` with three small running workloads, NodeLocal DNSCache off, and no NetworkPolicy anywhere, because two nightly cases read this slot as the cluster with none. Labelled `upgrade-family=seeded-regular`.",
     "d": "Multi-zonal: nodes in two zones, carrying the zonal-skew fixtures. The only slot whose shape is the fixture. Labelled `upgrade-family=seeded-regular`."
   },
   "roles": {
@@ -75,6 +75,34 @@
           "op": "any_eq",
           "value": "Pending",
           "why": "the standing Pending surplus is the live shortfall stockout-pinned-pool and cluster-agent-pending-replicas-capped-pool read. It exists only while the HPA's desired count exceeds what the one-node pinned-inference-pool can place; a second node, or an HPA that never scaled, removes the defect"
+        }
+      ]
+    },
+    "declared-single-zone-pool": {
+      "cluster_slot": "a",
+      "namespace": null,
+      "probes": [],
+      "fixture": "declared-zonal-pool, a single-zone autoscaling pool held at zero nodes behind a NO_SCHEDULE taint: the stockout SOP's 3.9 zone-locked posture and nothing else, declared on purpose by the pool project's GitOps knowledge/ note, so the capacity audit lists it under Declared intent rather than as a finding. A GKE-level object with no node, so nothing in-cluster probes it; its shape is read off clusters describe",
+      "state": [
+        {
+          "subject": "cluster",
+          "path": "nodePools[?(@.name=='declared-zonal-pool')].autoscaling.enabled",
+          "op": "any_eq",
+          "value": true,
+          "why": "3.9's zone-locked arm fires on an autoscaling pool only; a pool with autoscaling off is not a candidate, and the declared-intent case has no posture to see declared"
+        },
+        {
+          "subject": "cluster",
+          "path": "nodePools[?(@.name=='declared-zonal-pool')].config.taints[*].key",
+          "op": "any_eq",
+          "value": "seeded-role",
+          "why": "the taint is what makes the pool zone-locked on a cluster whose default pool shares its zone: an untainted pool is spared when an untainted multi-zone pool of its machine type exists, and the taint also keeps the autoscaler from adding a node for a stray pod"
+        },
+        {
+          "subject": "node?cloud.google.com/gke-nodepool=declared-zonal-pool",
+          "path": "metadata.name",
+          "op": "absent",
+          "why": "a node in the pool moves it toward 3.9's at-ceiling arm (90% of maxNodeCount 2 is two nodes), which no declaration covers; the posture is the zone lock alone, so the pool stays empty"
         }
       ]
     },
@@ -1219,6 +1247,151 @@
           "op": "any_eq",
           "value": "RUNNING",
           "why": "a stopped VM has no external IP in use, and the check counts instances that hold one"
+        }
+      ]
+    },
+    "untargeted-compute-class-workload": {
+      "cluster_slot": "c",
+      "namespace": "seeded-compute-class",
+      "probes": ["deployment/app-worker-a", "computeclass/general-ccc"],
+      "fixture": "app-worker-a Deployment, three replicas, no cloud.google.com/compute-class nodeSelector and no compute-class affinity, in a namespace with no default class, on the cluster whose only untainted pool carries the general-ccc label; the untargeted workload the obtainability audit's 3.24 and the stockout audit's pre-filter check name",
+      "state": [
+        {
+          "subject": "deployment/app-worker-a",
+          "path": "status.readyReplicas",
+          "op": "ge",
+          "value": 1,
+          "why": "the pods run on the labelled node rather than sitting Pending: cluster-agent-fleet-health-triage reads slot c as a cluster with no failing workload, and the checks read the manifest, the class and the pool, never the phase"
+        },
+        {
+          "subject": "deployment/app-worker-a",
+          "path": "spec.template.spec.nodeSelector",
+          "op": "absent",
+          "why": "the defect is the missing selector; the remediation the cases forbid is adding it"
+        },
+        {
+          "subject": "computeclass/general-ccc",
+          "path": "spec.nodePoolAutoCreation.enabled",
+          "op": "eq",
+          "value": false,
+          "why": "auto-creation off is what keeps GKE from creating node pools in the pool projects on its own; with it on the class would mutate the fleet by itself"
+        }
+      ]
+    },
+    "compute-class-affinity-workload": {
+      "cluster_slot": "c",
+      "namespace": "seeded-compute-class",
+      "probes": ["deployment/app-worker-b", "computeclass/general-ccc"],
+      "fixture": "app-worker-b Deployment, one replica, naming ComputeClass general-ccc only in a required nodeAffinity term and never in nodeSelector, which the Cluster Autoscaler's ComputeClass pre-filter reads alone",
+      "state": [
+        {
+          "subject": "deployment/app-worker-b",
+          "path": "status.readyReplicas",
+          "op": "ge",
+          "value": 1,
+          "why": "the pod runs (the affinity is satisfied by the labelled node); slot c must stay a cluster with no failing workload"
+        },
+        {
+          "subject": "deployment/app-worker-b",
+          "path": "spec.template.spec.nodeSelector",
+          "op": "absent",
+          "why": "the defect is the class named in affinity instead of the selector; a selector added heals it"
+        }
+      ]
+    },
+    "compute-class-toleration-workload": {
+      "cluster_slot": "c",
+      "namespace": "seeded-compute-class",
+      "probes": ["deployment/batch-worker-a", "computeclass/general-ccc"],
+      "fixture": "batch-worker-a Deployment, one replica, nodeSelector on ComputeClass general-ccc with a hand-written toleration for the class taint that names key, value and effect and no operator (planted through a raw manifest: the provider's typed Deployment would write `operator: Equal`); the pool carries no taint, so the pod runs and the shape, not a scheduling failure, is the fixture",
+      "state": [
+        {
+          "subject": "deployment/batch-worker-a",
+          "path": "status.readyReplicas",
+          "op": "ge",
+          "value": 1,
+          "why": "the pod runs on the labelled node; it is also what keeps default-pool from reading as idle"
+        },
+        {
+          "subject": "deployment/batch-worker-a",
+          "path": "spec.template.spec.nodeSelector[\"cloud.google.com/compute-class\"]",
+          "op": "eq",
+          "value": "general-ccc",
+          "why": "the workload is targeted; the defect is in its toleration, not its selector"
+        },
+        {
+          "subject": "deployment/batch-worker-a",
+          "path": "spec.template.spec.tolerations[?(@.key=='cloud.google.com/compute-class')].operator",
+          "op": "absent",
+          "why": "the defect is the toleration without an operator; the API server stores it as written, and anyone adding `operator: Equal` heals the shape the check reads"
+        }
+      ]
+    },
+    "untainted-compute-class-pool": {
+      "cluster_slot": "c",
+      "namespace": null,
+      "probes": [
+        "node?cloud.google.com/compute-class=general-ccc",
+        "computeclass/general-ccc"
+      ],
+      "fixture": "default-pool labelled cloud.google.com/compute-class=general-ccc with no matching NoSchedule taint, so the scheduler fills it with untargeted pods before the autoscaler's pre-filter drops them; also what gives the cluster no untainted pool without a class label",
+      "state": [
+        {
+          "subject": "cluster",
+          "path": "nodePools[?(@.name=='default-pool')].config.labels[\"cloud.google.com/compute-class\"]",
+          "op": "eq",
+          "value": "general-ccc",
+          "why": "the label, read off the pool through clusters describe so a node re-creation never reads as drift; without it the cluster has general capacity again and the obtainability audit's 3.24 files nothing for the untargeted workloads"
+        },
+        {
+          "subject": "node?cloud.google.com/compute-class=general-ccc",
+          "path": "spec.taints[?(@.key=='cloud.google.com/compute-class')]",
+          "op": "absent",
+          "why": "the defect is the missing taint; a taint added heals it and makes the pool invisible to 3.24 as well"
+        },
+        {
+          "subject": "cluster",
+          "path": "autoscaling.enableNodeAutoprovisioning",
+          "op": "none_eq",
+          "value": true,
+          "why": "node auto-provisioning stays off: with it on, a Pending pod with no class selector would make GKE create a pool in every pool project; the class's own auto-creation flag does not cover that path"
+        }
+      ]
+    },
+    "manual-pools-compute-class": {
+      "cluster_slot": "c",
+      "namespace": null,
+      "probes": ["computeclass/general-ccc"],
+      "fixture": "ComputeClass general-ccc with nodePoolAutoCreation off and priority rules across the nodepools rule default-pool backs and two machine families (n4, c3) no pool backs, so a stockout on the first rule leaves pods with no fallback GKE can create",
+      "state": [
+        {
+          "subject": "computeclass/general-ccc",
+          "path": "spec.nodePoolAutoCreation.enabled",
+          "op": "eq",
+          "value": false,
+          "why": "the manual-pools defect needs auto-creation off; on is also the remediation the case forbids"
+        },
+        {
+          "subject": "computeclass/general-ccc",
+          "path": "spec.priorities[0].nodepools[*]",
+          "op": "any_eq",
+          "value": "default-pool",
+          "why": "the first rule is the one the labelled pool backs; the two family rules after it are the unbacked fallbacks"
+        }
+      ]
+    },
+    "no-nodelocal-dnscache": {
+      "cluster_slot": "c",
+      "namespace": null,
+      "probes": [],
+      "fixture": "NodeLocal DNSCache add-on off on seeded-c, where GKE turns it on by default on Standard from 1.34.1 and every other cluster in a pool project has it on; every pod DNS lookup here crosses a kube-dns conntrack entry",
+      "state": [
+        {
+          "subject": "cluster",
+          "path": "addonsConfig.dnsCacheConfig.enabled",
+          "op": "none_eq",
+          "value": true,
+          "why": "GKE omits a false boolean from clusters describe, so the off state reads as no value; the networking case that names this cluster needs the add-on off, and anyone turning it on heals the defect"
         }
       ]
     }

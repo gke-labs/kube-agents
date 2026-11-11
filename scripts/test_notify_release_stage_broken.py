@@ -434,13 +434,44 @@ class RenderTest(unittest.TestCase):
         self.assertIn(notifier.marker(STAGING["id"]), body)
         self.assertEqual(notifier.stamped_runs(body), {RUN_29["id"], RUN_30["id"]})
         self.assertEqual(notifier.stamped_stage(body), E2E_STAGE)
-        for expected in (E2E_STAGE, "Execute Blocking E2E Gate", "rc_1_abc", "a" * 40, "FAILED tests/e2e/x.py::test_y", RUN_30["html_url"], "[#29]", "[#30]", "2026-10-21 02:36 UTC"):
+        for expected in (E2E_STAGE, "Execute Blocking E2E Gate", "rc_1_abc", "a" * 40, notifier.FIRST_FAILURE_PUBLIC, RUN_30["html_url"], "[#29]", "[#30]", "2026-10-21 02:36 UTC"):
             self.assertIn(expected, body)
+        self.assertNotIn("FAILED tests/e2e/x.py::test_y", body, "the issue is public: the log line goes to Chat only")
 
     def test_log_text_cannot_break_the_code_span_or_the_table_cell(self):
-        text = notifier.failure_text({"failure": "FAILED t.py::test_x - assert 'a | b' == `c`"})
-        self.assertEqual(text, "`FAILED t.py::test_x - assert 'a \\| b' == 'c'`")
-        self.assertIn("step 'a \\| b'", notifier.failure_text({"step": "a | b"}).replace("`", "'"))
+        text = notifier.failure_text({"step": "a | `b`", "failure": "FAILED t.py::test_x - assert 'a | b' == `c`"})
+        self.assertEqual(text, f"step `a \\| 'b'` failed; {notifier.FIRST_FAILURE_PUBLIC}")
+
+    def test_the_issue_never_quotes_the_first_failure_line_and_chat_keeps_it(self):
+        """The issue is public; whatever the failing step printed (a count, a
+        verdict, a check, a score, a model, or an ordinary assertion), the
+        first-failure row and the still-failing comment name the step and
+        point at the log. Chat is internal and carries the line."""
+        lines = (
+            "##[error]rca-remediation-pr: 1/3 repetitions passed",
+            "##[error]judge gemini-3.1-pro-preview returned no verdict",
+            "ERROR: MODEL_PROVIDER=vertex_ai is not reachable",
+            "##[error]qwen3-32b on vllm did not answer",
+            "FAILED tests/e2e/test_stockout_investigation.py::test_stockout_ingress_alert_smoke - AssertionError: verify.sh failed with exit code 1",
+            "##[error]GEMINI_API_KEY missing",
+        )
+        for line in lines:
+            with self.subTest(line=line):
+                details = {"run": RUN_30, "stage": E2E_STAGE, "stage_url": None, "step": "Await", "failure": line, "candidate": {"tag": "rc_1_abc", "sha": "a" * 40}}
+                body = notifier.render_body(STAGING["name"], STAGING["id"], details, [RUN_30])
+                self.assertIn(f"| First failure | step `Await` failed; {notifier.FIRST_FAILURE_PUBLIC} |", body)
+                self.assertNotIn(line, body)
+                comment = notifier.render_still_failing(details)
+                self.assertIn(f"First failure: step `Await` failed; {notifier.FIRST_FAILURE_PUBLIC}", comment)
+                self.assertNotIn(line, comment)
+                for expected in (E2E_STAGE, "rc_1_abc", "a" * 40, RUN_30["html_url"]):
+                    self.assertIn(expected, body)
+                chat = notifier.render_chat_broken(STAGING["name"], details, 4001)
+                self.assertIn(notifier.chat_plain(line), chat)
+        no_step = {"run": RUN_30, "stage": E2E_STAGE, "stage_url": None, "step": None, "failure": lines[0], "candidate": {}}
+        body = notifier.render_body(STAGING["name"], STAGING["id"], no_step, [RUN_30])
+        self.assertIn(f"| First failure | {notifier.FIRST_FAILURE_PUBLIC} |", body)
+        self.assertNotIn(lines[0], body)
 
     def test_an_unknown_candidate_and_stage_are_said_not_omitted(self):
         details = {"run": RUN_30, "stage": None, "stage_url": None, "step": None, "failure": None, "candidate": {}}
@@ -486,7 +517,9 @@ class ReconcileTest(unittest.TestCase):
         self.assertEqual(notifier.stamped_runs(payload["body"]), {RUN_29["id"], RUN_30["id"]})
         self.assertEqual(notifier.stamped_stage(payload["body"]), E2E_STAGE)
         self.assertIn("rc_2610210024_8dc552a_validated", payload["body"])
-        self.assertIn("test_stockout_ingress_alert_smoke", payload["body"])
+        self.assertNotIn("test_stockout_ingress_alert_smoke", payload["body"], "the issue is public: the log line goes to Chat only")
+        self.assertIn(notifier.FIRST_FAILURE_PUBLIC, payload["body"])
+        self.assertIn("test_stockout_ingress_alert_smoke", chat.posted[0])
         self.assertEqual(len(github.writes), 2)
         self.assertEqual(len(chat.posted), 1)
         self.assertIn("Tracking #4001", chat.posted[0])
@@ -928,6 +961,9 @@ class ReconcileTest(unittest.TestCase):
 # replacing the last two digits with the run number.
 STEP5_BUILD = "1985733102944374784"
 SPYGLASS = "https://oss.gprow.dev/view/gs/kube-agents-prow/logs/post-kube-agents-eval-rc/"
+# The poller's link once the lane logs to the private bucket: the Console's
+# bucket browser (staging-red-step5-console.log is the same night in that form).
+CONSOLE = "https://console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/"
 SHA_31 = "e1ab9e5" + "1" * 33
 SHA_32 = "0cc8ee5" + "2" * 33
 SHA_33 = "3a8ba90" + "3" * 33
@@ -1065,6 +1101,17 @@ class StalledChainTest(unittest.TestCase):
         self.assertIn("| Night (UTC) | Promotion run | Candidate | Eval build | Red cases (rung, owner) |", body)
         self.assertTrue(body.endswith(STALL_FOOTER), body)
         self.assertEqual(chat.posted, [stall_chat(STALL_TITLE_2, CELL_1104)])
+
+    def test_the_stall_body_quotes_no_log_line(self):
+        """Documents the design rather than a path: the stall rows carry the
+        build id, its link and the poller's own case vocabulary, never a log
+        line, so there is no first-failure cell to keep out of it."""
+        body = self._opened().writes[1][2]["body"]
+        self.assertNotIn(notifier.FIRST_FAILURE_PUBLIC, body)
+        self.assertEqual(len(rows_of(body)), 2)
+        for row in rows_of(body):
+            self.assertTrue(row.endswith(f"| {CELL_1104} |"), row)
+            self.assertIn(SPYGLASS, row)
 
     def test_a_third_red_verdict_night_comments_adds_a_row_and_rewrites_the_title(self):
         github = stalled_github(night(31, 1, SHA_31), night(32, 2, SHA_32), night(33, 3, SHA_33), open_stall=[self._open_issue()])
@@ -1461,6 +1508,17 @@ class StalledChainTest(unittest.TestCase):
         self.assertEqual(github.writes, [])
         self.assertEqual(chat.posted, [])
         self.assertIn("closed #3999", err)
+
+    def test_a_console_link_in_the_verdict_line_is_read_and_linked_as_is(self):
+        """Once the lane logs to the private bucket the poller's line carries
+        the Console's bucket-browser URL; the notifier reads the link as one
+        token and links it verbatim, so the row opens the build a project
+        reader can see rather than a Spyglass page that denies everyone."""
+        text = fixture("staging-red-step5-console.log")
+        self.assertEqual(notifier.extract_red_verdict_build(text), (STEP5_BUILD, CONSOLE + STEP5_BUILD))
+        self.assertEqual(notifier.extract_red_cases(text), {"cases": CASE_1104, "partial": False})
+        row = notifier.stall_row(REPO, {"run": run_like(44, night_run_id(44)), "candidate": {"sha": SHA_31}, "build": (STEP5_BUILD, CONSOLE + STEP5_BUILD), "cases_cell": CELL_1104})
+        self.assertIn(f"[{STEP5_BUILD}]({CONSOLE}{STEP5_BUILD})", row)
 
     def test_the_poller_verdict_line_format_is_what_the_notifier_parses(self):
         line = poller.VERDICT_LINE_FORMAT.format(verdict=poller.VERDICT_RED, settled=poller.SETTLED_TRUE, build_id=build_of(40), url=SPYGLASS + build_of(40))

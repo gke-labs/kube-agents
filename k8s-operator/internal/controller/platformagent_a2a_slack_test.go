@@ -415,13 +415,13 @@ func TestChatArmedDropsTheSlackReferences(t *testing.T) {
 
 // TestNoRenderedRoleReachesASecret: the identity table is an impersonation
 // primitive, so no ServiceAccount the operator mints a Role for may hold a
-// verb on Secrets - the a2a-slack-principal-map Secret is reachable by the
-// kubelet's mount alone. Every Role builder, next stack
-// and legacy, is rendered and read; a wildcard resource counts as reaching
-// them. What this does not bound is the gateway's `create` on pods, which RBAC
-// cannot keep from mounting a Secret into a pod it builds; the admission policy
-// kube-agents-a2a-gateway-pod does, where the chart installs it
-// (buildA2AGatewayRole's comment).
+// write verb on Secrets (only `platform minimal` may hold read-only `get`,
+// `list`, and `watch` on `secrets` so `<agent>-kube-proxy` can serve redacted
+// Secret metadata). Every Role builder, next stack and legacy, is rendered and
+// read; a wildcard resource counts as reaching them. What this does not bound
+// is the gateway's `create` on pods, which RBAC cannot keep from mounting a
+// Secret into a pod it builds; the admission policy kube-agents-a2a-gateway-pod
+// does, where the chart installs it (buildA2AGatewayRole's comment).
 func TestNoRenderedRoleReachesASecret(t *testing.T) {
 	agent := a2aTestAgent()
 	roles := map[string][]rbacv1.PolicyRule{
@@ -432,14 +432,27 @@ func TestNoRenderedRoleReachesASecret(t *testing.T) {
 		"platform local":     buildPlatformLocalRole(agent).Rules,
 		"platform leader":    buildPlatformLeaderRole(agent).Rules,
 	}
+	readOnlyVerbs := map[string]bool{"get": true, "list": true, "watch": true}
 	for name, rules := range roles {
 		if len(rules) == 0 {
 			t.Errorf("%s: no rules rendered; the assertion below would hold vacuously", name)
 		}
 		for _, rule := range rules {
 			for _, res := range rule.Resources {
-				if res == "secrets" || res == "*" {
+				if res == "*" {
+					t.Errorf("%s grants %v on wildcard resource %q", name, rule.Verbs, res)
+				}
+				if res != "secrets" {
+					continue
+				}
+				if name != "platform minimal" {
 					t.Errorf("%s grants %v on %q", name, rule.Verbs, res)
+					continue
+				}
+				for _, verb := range rule.Verbs {
+					if !readOnlyVerbs[verb] {
+						t.Errorf("%s grants non-read verb %q on %q", name, verb, res)
+					}
 				}
 			}
 		}

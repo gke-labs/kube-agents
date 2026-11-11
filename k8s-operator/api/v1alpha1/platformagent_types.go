@@ -52,8 +52,8 @@ type PlatformAgentSpec struct {
 	// +optional
 	Scope *ScopeSpec `json:"scope,omitempty"`
 
-	// Storage sizes the agent's /opt/data volume and the shell sandbox's
-	// matching data volume.
+	// Storage sizes the agent's /opt/data volume and the shell sandbox's data
+	// volume.
 	// +optional
 	Storage *PlatformAgentStorageSpec `json:"storage,omitempty"`
 }
@@ -61,8 +61,9 @@ type PlatformAgentSpec struct {
 // PlatformAgentStorageSpec sizes the agent's persistent data volumes.
 type PlatformAgentStorageSpec struct {
 	// Size is the request of the <name>-data claim and of the shell sandbox's
-	// data claim. The operator requests the same size for both claims and grows
-	// the sandbox's claim first, so the sandbox mirror fits. A StorageClass or a
+	// data claim. The operator requests the same base size for both and grows
+	// the sandbox's claim first, so the sandbox mirror fits;
+	// expectedClusterProfiles can raise the agent's claim alone. A StorageClass or a
 	// quota that refuses the growth of one claim can leave the two claims at
 	// different sizes. Absent, the operator default applies (50Gi). Raising it
 	// expands both existing claims online where the StorageClass sets
@@ -72,6 +73,21 @@ type PlatformAgentStorageSpec struct {
 	// Removing the field never shrinks a claim.
 	// +optional
 	Size *resource.Quantity `json:"size,omitempty"`
+
+	// ExpectedClusterProfiles is how many Cluster Agent profiles the install is
+	// expected to hold, one per cluster in scope. It sizes the agent's own
+	// <name>-data claim to at least a base for the Platform Agent's stores plus
+	// a per-profile budget for each, 8Gi plus 400Mi per profile rounded up to
+	// whole GiB, measured at the default 90-day session retention. The claim
+	// takes the larger of that and Size, or the operator
+	// default when Size is absent, so this only ever raises it. Raising it
+	// expands the existing claim online where the StorageClass allows. The
+	// shell sandbox's claim holds no session stores and keeps Size or the
+	// default. The formula passes the 50Gi default above 107 profiles.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=20000
+	// +optional
+	ExpectedClusterProfiles *int32 `json:"expectedClusterProfiles,omitempty"`
 }
 
 // ScopeSpec is the opt-in set of projects, folders and organisations, plus the Shared
@@ -198,9 +214,17 @@ type ScopeExcludeSpec struct {
 	// every project.
 	// An excluded cluster gets no Cluster Agent, and fleet answers, the
 	// onboarding sweep and the fleet-audit collectors that list clusters leave
-	// it out. Still covering it: the daily upgrade-readiness watch, the
-	// networking audit's subnet usage, the GCE audit's instance listing, and
-	// the third-party gke MCP server's list_clusters.
+	// it out. The credential broker and kube-proxy refuse every route to its
+	// Kubernetes API, for every caller, the agents' own commands included: a
+	// kubeconfig, get-credentials, kube-proxy, the watchers' relay and the gke
+	// MCP server's in-cluster tools. Spell entries by project ID: one spelled
+	// by project number refuses its location and name in any project. Reads of the GKE control plane stay allowed (the project's cluster
+	// list, a cluster's describe), and these still cover it through them only:
+	// the daily upgrade-readiness watch's version table (its in-cluster
+	// readiness rules skip the cluster), the networking audit's subnet usage,
+	// the GCE audit's instance listing, and the gke MCP server's list_clusters.
+	// The broker enforces it, not IAM: the agent's roles still reach the
+	// cluster, so the service account itself is not fenced off.
 	// +kubebuilder:validation:MaxItems=100
 	// +listType=map
 	// +listMapKey=projectId

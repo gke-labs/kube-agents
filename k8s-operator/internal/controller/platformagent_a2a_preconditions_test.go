@@ -40,6 +40,7 @@ func everyRenderedRole(agent *agentv1alpha1.PlatformAgent) []renderedRole {
 		{"buildA2ADispatcherJobsRole", buildA2ADispatcherJobsRole(agent).Rules},
 		{"buildCredentialBrokerTokenReviewRole", buildCredentialBrokerTokenReviewRole(agent).Rules},
 		{"buildMinimalPlatformRole", buildMinimalPlatformRole(agent).Rules},
+		{"buildMinimalPlatformRoleWithSecrets", buildMinimalPlatformRoleWithSecrets(agent, true).Rules},
 		{"buildPlatformLocalRole", buildPlatformLocalRole(agent).Rules},
 		{"buildPlatformLeaderRole", buildPlatformLeaderRole(agent).Rules},
 		{"buildScopePublisherRole", buildScopePublisherRole(agent).Rules},

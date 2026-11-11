@@ -54,6 +54,7 @@ import feedback_broker
 import mcp_policy
 import providers
 import repo_ref
+import scope_exclude
 import scope_policy
 import scoped_sa_pool
 import task_confinement
@@ -440,7 +441,8 @@ WATERMARK_LEAVE_BAND_PCT = 3
 PERCENT = 100
 # The scratch volumes' caps, in bytes, as the operator renders their emptyDir
 # sizeLimits (credential_proxy_manifests.go, credentialProxyStateLimitEnv and
-# credentialProxyTmpLimitEnv; tests/test_credential_proxy_sizing_parity.py
+# credentialProxyTmpLimitEnv; on an exec pod, the tier's fixed caps from
+# credential_proxy_exec_tier.go; tests/test_credential_proxy_sizing_parity.py
 # holds the names equal). An emptyDir is a directory on the node's filesystem,
 # so statvfs on it reports the node's fill, not the cap the kubelet evicts on,
 # and the kubelet's image GC keeps a busy node's fill between its own
@@ -653,6 +655,21 @@ SHUTDOWN_DRAIN_SECONDS = 30
 # credentialProxyExecTierTerminationGraceSeconds (380 s) are literals too, and a
 # drain that followed a longer timeout would outlast them.
 EXEC_SHUTDOWN_DRAIN_SECONDS = 360
+# The variable that stops gcloud writing a log file for each command, set in
+# the commands an exec pod runs. gcloud logs under CLOUDSDK_CONFIG on the
+# state volume and keeps 30 days; at the tier's 8-slot cap that measured about
+# 386 KiB a command, some 3.3 GiB a day, past any emptyDir the pod could carry
+# (#4536). The caller still gets the command's stderr and the audit line; only
+# the pod's own log files, for debugging a gcloud failure on the pod, are lost.
+GCLOUD_FILE_LOGGING_OFF_ENV = "CLOUDSDK_CORE_DISABLE_FILE_LOGGING"
+# kubectl's disk cache under the command HOME (discovery and HTTP responses),
+# which kubectl rebuilds on the next command. On an exec pod nothing else
+# frees it: a sweep reaches every cluster on every replica, at about 0.3 MiB a
+# cluster (1.9 MiB with the OpenAPI schemas), so it is the soft watermark's
+# reclaimer there (CommandExecutor.reclaim_kubectl_cache).
+KUBECTL_CACHE_DIR_NAME = "cache"
+# The prefix a reclaimed cache is renamed to before it is removed.
+KUBECTL_CACHE_RECLAIMED_PREFIX = "cache.reclaimed-"
 # After the drain, how long the stop waits for the requests whose commands it
 # ended to write their answers: KILL_GRACE_SECONDS and KILL_SETTLE_SECONDS for
 # the process group, the poll that notices the stop, and the write. A request
@@ -872,7 +889,8 @@ EXEC_REPLICAS_MAX = 32
 EXEC_REPLICAS_RE = re.compile(r"[0-9]+")
 # Requests that keep serving while the broker or an exec pod drains
 # (SHUTDOWN_DRAIN_SECONDS, EXEC_SHUTDOWN_DRAIN_SECONDS),
-# by method and path: the health probe; a relay's settle routes, so the
+# by method and path: the health probe (which an exec pod answers 503 while it
+# drains, HEALTHZ_DRAINING_PAYLOAD); a relay's settle routes, so the
 # gateway's acks for pulls already answered land; and the event pulls. Slack's
 # and Teams' queues are in-process and already acknowledged upstream, so every
 # event taken now is one fewer lost with the pod; the Chat pulls keep their own
@@ -1071,8 +1089,18 @@ THREAD_CAP_LOG_INTERVAL_SECONDS = 60
 HEALTH_PORT_ENV = "CREDENTIAL_PROXY_HEALTH_PORT"
 DEFAULT_HEALTH_PORT = 0
 HEALTH_SERVER_HEADER = "credential-proxy-health"
-# What /healthz answers, on both listeners.
+# What /healthz answers, on both listeners, except that an exec pod that drains
+# answers HEALTHZ_DRAINING_PAYLOAD on the credentialed one (below). The
+# health-only listener is opt-in and not set on exec pods, so it keeps ok.
 HEALTHZ_PAYLOAD = {"status": "ok"}
+# What /healthz answers, with 503, on an exec pod that drains: the readiness
+# probe then marks it NotReady, so the Service sends no new connection to it,
+# and at one replica a caller fails to connect and falls back to the stateful
+# broker rather than reading `draining` for the whole drain. The requests
+# already in flight are not touched: readiness steers only new connections.
+# The broker keeps answering ok: it rolls with Recreate, so no other pod could
+# take its traffic.
+HEALTHZ_DRAINING_PAYLOAD = {"status": "draining"}
 # Metric names, and the vocabulary of every label value. Nothing served is
 # caller text: a label value is one of these strings or a member of the
 # vocabularies below, so a caller cannot grow the series set by varying what
@@ -2147,10 +2175,11 @@ CALLER_ROLE_SHELL = "shell"
 CALLER_ROLE_CHAT = "chat"
 CALLER_ROLE_A2A_CHAT = "a2a-chat"
 # The session pod the A2A gateway spawns, under the operator's
-# A2A_SESSION_CLUSTER_VIEW flag. Exec route only, and within it kubectl and
-# gcloud only (ROLE_EXECUTABLES): the pod executes model output, and the
-# read-only posture command_policy enforces is the view it gets. A demo aid
-# until declarative profiles carry a session's identity and tools.
+# A2A_SESSION_CLUSTER_VIEW flag. Exec route only, and within it gcloud only
+# (ROLE_EXECUTABLES; kubectl routes through <agent>-kube-proxy): the pod
+# executes model output, and the read-only posture command_policy enforces is
+# the view it gets. A demo aid until declarative profiles carry a session's
+# identity and tools.
 CALLER_ROLE_SESSION = "session"
 # The gateway pod's agent-api-auth container: the k8s-event-watcher and the
 # drift-detector. Its token is projected into that container only, never into
@@ -2203,14 +2232,13 @@ CALLER_ROLES = (
 )
 
 # Which executables a role may hand to /v1/exec. A role absent here keeps
-# whatever the route carries (`EXEC_ROUTE_EXECUTABLES`); the session and
-# profile roles are narrowed to the two CLIs that reach a cluster read-only,
-# and the shell and scope roles are narrowed to `gcloud` (the sandbox runs
-# stock `kubectl` against `kube-proxy`, so `/usr/local/bin/credential-proxy-exec`
-# in the sandbox cannot bypass `kube-proxy`).
+# whatever the route carries (`EXEC_ROUTE_EXECUTABLES`); the profile role keeps
+# the two CLIs that reach a cluster read-only under task-credential confinement,
+# while the shell, session, and scope roles are narrowed to `gcloud` (the
+# sandbox and session pods run stock `kubectl` against `<agent>-kube-proxy`).
 ROLE_EXECUTABLES: dict[str, frozenset[str]] = {
     CALLER_ROLE_SHELL: frozenset({"gcloud"}),
-    CALLER_ROLE_SESSION: frozenset({"kubectl", "gcloud"}),
+    CALLER_ROLE_SESSION: frozenset({"gcloud"}),
     CALLER_ROLE_PROFILE: frozenset({"kubectl", "gcloud"}),
     CALLER_ROLE_SCOPE: frozenset({"gcloud"}),
 }
@@ -8502,9 +8530,12 @@ def forge_registry() -> providers.Registry:
         return _forge_registry
 
 
-# What `/v1/exec` runs for the sandbox, enforced here because the client is
-# only a convenience: anything holding the sandbox's token can post its own
-# argv. Neither `git` nor any forge CLI is on it: a repository and a forge are
+# What `/v1/exec` runs for callers, enforced here because the client is
+# only a convenience: anything holding a caller token can post its own
+# argv. `kubectl` stays on the route for AgentProfile workers (`CALLER_ROLE_PROFILE`),
+# while `ROLE_EXECUTABLES` narrows the sandbox, session, and scope roles to
+# `gcloud` alone (`kubectl` in the sandbox and session pods routes through
+# `<agent>-kube-proxy`). Neither `git` nor any forge CLI is on it: a repository and a forge are
 # reached through the verbs, which run them on the broker's own behalf. `git`
 # here would run under the broker's credential helper, and a read such as
 # `ls-remote` is no write for a lease to fence.
@@ -8520,11 +8551,12 @@ def broker_executables() -> tuple[str, ...]:
     ask to have run on its behalf. They used to be the same four names, which
     read as one decision and was two.
 
-    `gcloud` and `kubectl` are on both: the agent names them and this process
-    runs them. `git` and any forge CLI are here for the broker's own use -- it
-    issues them on its own behalf for the verbs. `/v1/exec` refuses both
-    (`EXEC_ROUTE_EXECUTABLES`), so a sandbox caller that composes its own
-    request reaches neither. What this list
+    `gcloud` and `kubectl` are on `/v1/exec` (`ROLE_EXECUTABLES` narrows `kubectl`
+    to `CALLER_ROLE_PROFILE`, while the sandbox and session pods route `kubectl`
+    through `<agent>-kube-proxy`). `git` and any forge CLI are here for the
+    broker's own use -- it issues them on its own behalf for the verbs.
+    `/v1/exec` refuses both (`EXEC_ROUTE_EXECUTABLES`), so a caller that composes
+    its own request reaches neither. What this list
     decides on its own is the forge CLI: one is here only if some forge this
     install built declares one, so an install whose forges all speak HTTP
     grants no forge binary rather than inheriting the union of every binary
@@ -8926,8 +8958,15 @@ class CommandExecutor:
         max_concurrent_commands: int = DEFAULT_MAX_CONCURRENT_COMMANDS,
         memory_limit_bytes: int | None = None,
         metrics: "ProxyMetrics | None" = None,
+        gcloud_file_logging: bool = True,
+        exclusions: "scope_exclude.Exclusions | None" = None,
     ) -> None:
         self.timeout_seconds = timeout_seconds
+        # spec.scope.exclude.clusters, from the scope.json the operator mounts
+        # (scope_exclude). Checked wherever a target cluster is known before its
+        # Kubernetes API is reached: `_kubeconfig_for`, the no-pool ambient
+        # kubectl, and both ends of `_execute_get_credentials`.
+        self.exclusions = exclusions if exclusions is not None else scope_exclude.Exclusions()
         self.kubectl_timeout_seconds = kubectl_timeout_seconds
         # Where admission waits are observed; None in a test that wants none.
         self.metrics = metrics
@@ -9212,6 +9251,10 @@ class CommandExecutor:
         ):
             if name in os.environ:
                 self.environment[name] = os.environ[name]
+        # After the forwarded names, so the pod's environment cannot turn it
+        # back on (GCLOUD_FILE_LOGGING_OFF_ENV).
+        if not gcloud_file_logging:
+            self.environment[GCLOUD_FILE_LOGGING_OFF_ENV] = "1"
         # Read here rather than forwarded into `self.environment`: this decides
         # which kubeconfig a request resolves to, and a subprocess has no
         # business reading it or overriding it.
@@ -9315,6 +9358,28 @@ class CommandExecutor:
         slot or for room under the child memory budget."""
         with self._slot_condition:
             return len(self._slot_queue)
+
+    def reclaim_kubectl_cache(self) -> int:
+        """Remove kubectl's disk cache under the command HOME: an exec pod's
+        reclaimer for the resource watermark gate. The cache is renamed first
+        and the renamed folder removed, so a kubectl reading it on another
+        slot keeps its open files and the next command builds a new cache.
+        A renamed folder an earlier call left behind goes too. Returns how
+        many folders this call removed."""
+        kube_dir = self.home_dir / ".kube"
+        removed = 0
+        cache = kube_dir / KUBECTL_CACHE_DIR_NAME
+        if cache.is_dir():
+            target = kube_dir / f"{KUBECTL_CACHE_RECLAIMED_PREFIX}{uuid.uuid4().hex}"
+            try:
+                cache.rename(target)
+            except FileNotFoundError:
+                pass
+        if kube_dir.is_dir():
+            for stale in kube_dir.glob(f"{KUBECTL_CACHE_RECLAIMED_PREFIX}*"):
+                shutil.rmtree(stale, ignore_errors=True)
+                removed += not stale.exists()
+        return removed
 
     def admission_snapshot(self) -> "AdmissionSnapshot":
         """What is in use against each cap, read under the lock at scrape time:
@@ -9996,6 +10061,13 @@ class CommandExecutor:
             # Splitting the two identities is the change that closes that.
             kubeconfig_path = self._default_kubeconfig()
         else:
+            if executable == "kubectl":
+                # No pool and no cluster named: kubectl runs on the base
+                # KUBECONFIG, the broker's own cluster, which is the
+                # management cluster an install may exclude.
+                ambient = self._ambient_target()
+                if ambient is not None:
+                    self._refuse_excluded(ambient)
             kubeconfig_path = None
         result = self._execute(
             command,
@@ -11101,6 +11173,10 @@ class CommandExecutor:
         behind it rotates, and a file that outlives its token fails as an
         authentication error somewhere far from here.
         """
+        # Before the pool and before the cache: every kubeconfig this broker
+        # hands out or runs a command under comes through here, a cached file
+        # included, so an excluded cluster is refused whatever filled the cache.
+        self._refuse_excluded(target)
         if self.scoped_pool is None or not scoped:
             # Not scoped: a non-kubectl request that named a kubeconfig. The
             # file is still regenerated -- the name-not-content property does
@@ -11126,6 +11202,10 @@ class CommandExecutor:
         finally:
             scratch.unlink(missing_ok=True)
         return scoped
+
+    def _refuse_excluded(self, target: ClusterTarget) -> None:
+        """Raise scope_exclude.ExcludedCluster for a cluster the install excludes."""
+        self.exclusions.check(target.project, target.location, target.cluster)
 
     def _ambient_target(self) -> ClusterTarget | None:
         """The cluster a request that names none resolves to.
@@ -11464,6 +11544,9 @@ class CommandExecutor:
         # runs: `_file_managed_kubeconfig` compares against it to tell a
         # settled file that lands during the fetch from one already there.
         seen_target = _get_credentials_target(command)
+        if seen_target is not None:
+            # Before GKE is asked anything: an excluded cluster's fetch never runs.
+            self._refuse_excluded(seen_target)
         seen_mtime_ns = (_mtime_ns_or_none(self._managed_kubeconfig(seen_target))
                          if seen_target is not None else None)
         attempted, decision = self._decision_for_callers_fetch(command)
@@ -11479,6 +11562,11 @@ class CommandExecutor:
                 context = read_current_context(generated)
                 target = parse_gke_context(context) if context else None
                 if target is not None:
+                    # The fetch's target is only certain now when argv didn't
+                    # name it in full (gcloud's own defaults): an excluded
+                    # cluster's file is neither filed nor returned, and the
+                    # scratch copy goes in the finally below.
+                    self._refuse_excluded(target)
                     # Outside `_kubeconfig_lock`, as before: a scaffold never
                     # waits behind a cold read's gcloud runs. The filing step
                     # takes `_marker_lock` by itself, so the file and its
@@ -12967,7 +13055,8 @@ class HealthHandler(MetricsHandler):
     """The health-only listener: GET /healthz, and nothing else.
 
     MetricsHandler's bounds, deadline and silence, serving the answer the
-    credentialed listener's /healthz gives and nothing the process knows:
+    credentialed listener's /healthz gives outside an exec pod's drain (see
+    HEALTHZ_DRAINING_PAYLOAD), and nothing the process knows:
     unauthenticated, like that route, because the probe runs before any
     token would be available and reveals nothing. A separate port so that a
     credentialed listener at its thread cap still reads as alive.
@@ -13122,6 +13211,9 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
     scope_slots: "SessionSlots | None" = None
     # The scope role's member window: one per broker process (scope_policy).
     scope_window: scope_policy.MemberWindow = scope_policy.MemberWindow()
+    # The executor's own reader in `main`, so a profile task's target and the
+    # kubeconfig paths judge one copy of spec.scope.exclude.clusters.
+    exclusions: scope_exclude.Exclusions = scope_exclude.Exclusions()
     # The profile role's, the same way (profile_slot_limit_from_env).
     profile_slots: "SessionSlots | None" = None
     # The resource watermark gate, installed by serve() beside the executor;
@@ -13533,6 +13625,9 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         if self.path != HEALTHZ_PATH:
             self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
             return
+        if self.broker_role == EXEC_ROLE and self.draining.is_set():
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE, HEALTHZ_DRAINING_PAYLOAD)
+            return
         self._json(HTTPStatus.OK, HEALTHZ_PAYLOAD)
 
     def do_POST(self) -> None:  # noqa: N802
@@ -13850,6 +13945,15 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 )
                 return
             argv, kubeconfig_context = confined.argv, confined.kubeconfig_context
+            # A task whose target the install excludes is refused outright,
+            # metadata reads included: the gateway should never have granted it.
+            if principal.task_target is not None:
+                try:
+                    target = principal.task_target
+                    self.exclusions.check(target.project, target.location, target.cluster)
+                except scope_exclude.ExcludedCluster as exc:
+                    self._refuse_excluded_cluster(exc, request_id, audit, count)
+                    return
         # The scope role's whole surface: five lookups, each on an argument
         # scope.json declares or an earlier lookup returned (scope_policy).
         scope_admitted = None
@@ -14100,6 +14204,9 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 extra=audit(AUDIT_STATUS_BUSY),
             )
             self._busy(exc)
+            return
+        except scope_exclude.ExcludedCluster as exc:
+            self._refuse_excluded_cluster(exc, request_id, audit, count)
             return
         except scoped_sa_pool.PoolRefusal as exc:
             # A refusal, not a fault and not a caller error: the request was
@@ -14494,6 +14601,8 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             return
         message = mcp_policy.parse(self.rfile.read(content_length))
         decision, offered = mcp_relay_decision(principal, server_name, message)
+        if decision.allowed:
+            decision = self._mcp_exclusion_decision(server_name, message) or decision
         if not decision.allowed:
             LOGGER.warning("mcp blocked request_id=%s rule=%s", request_id, decision.rule_id)
             reply = mcp_policy.refusal(message, decision) if entry is not None else None
@@ -14904,6 +15013,26 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 self._busy(exc)
                 return
         target, k8s_path = watcher_policy.split_k8s_target(rest)
+        # Before the endpoint lookup or a token: an excluded cluster's API is
+        # never reached, and a watch on one is refused at its first request.
+        try:
+            self.exclusions.check(target["project"], target["location"], target["cluster"])
+        except scope_exclude.ExcludedCluster as exc:
+            LOGGER.warning("watcher k8s excluded cluster request_id=%s rule=%s", request_id, exc.rule)
+            self._json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "kind": "Status",
+                    "apiVersion": "v1",
+                    "metadata": {},
+                    "status": "Failure",
+                    "message": f"SECURITY_POLICY_BLOCKED ({exc.rule}): {exc}",
+                    "reason": "Forbidden",
+                    "details": {"causes": [{"reason": "SECURITY_POLICY_BLOCKED", "message": exc.rule}]},
+                    "code": HTTPStatus.FORBIDDEN.value,
+                },
+            )
+            return
         resolved = self._watcher_cluster_endpoint(target, request_id)
         if resolved is None:
             return
@@ -15998,6 +16127,54 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         with self._pressure_admission(), slot:
             yield
 
+    def _mcp_exclusion_decision(
+        self, server_name: str, message: dict[str, Any] | None,
+    ) -> "command_policy.Decision | None":
+        """A refusal for a gke in-cluster tool call on an excluded cluster, or None.
+
+        The tool names its cluster in its arguments (mcp_policy.k8s_tool_clusters).
+        One the broker can't tie to a cluster is refused while any is excluded.
+        """
+        clusters = mcp_policy.k8s_tool_clusters(server_name, message)
+        if clusters is None:
+            return None
+        try:
+            if not clusters:
+                self.exclusions.check_unnamed()
+            for project, location, cluster in clusters:
+                self.exclusions.check(project, location, cluster)
+        except scope_exclude.ExcludedCluster as exc:
+            return command_policy.Decision(allowed=False, rule_id=exc.rule, message=str(exc))
+        return None
+
+    def _refuse_excluded_cluster(
+        self, exc: "scope_exclude.ExcludedCluster", request_id: str, audit: Callable, count: Callable,
+    ) -> None:
+        """Answer a request whose cluster the install's scope excludes (scope_exclude).
+
+        Its own rule id, like the pool's refusal, so the agent can say the
+        cluster is out of scope rather than that a policy blocked it. The
+        message names only the target's three name parts, each already held to
+        the GKE context grammar, and the cap bounds the line regardless.
+        """
+        LOGGER.warning(
+            "excluded cluster refused request_id=%s rule=%s reason=%s",
+            request_id,
+            exc.rule,
+            _sanitize_for_logging(str(exc), max_length=POOL_REFUSAL_LOG_LENGTH),
+            extra=audit(AUDIT_STATUS_BLOCKED, rule=exc.rule),
+        )
+        count(TOOL_STATUS_BLOCKED)
+        self._json(
+            HTTPStatus.FORBIDDEN,
+            {
+                "status": "blocked",
+                "code": "SECURITY_POLICY_BLOCKED",
+                "rule": exc.rule,
+                "message": str(exc),
+            },
+        )
+
     def _busy(self, exc: CommandSlotUnavailable) -> None:
         """Answer a broker at its concurrency cap or child memory budget, or
         refusing under resource pressure, on whichever route asked.
@@ -16419,6 +16596,9 @@ def serve(args: argparse.Namespace) -> None:
         # or the cgroup file; None, and the budget is off (design §2.4).
         memory_limit_bytes=child_memory_limit_bytes(cgroup_path=CGROUP_MEMORY_MAX_PATH),
         metrics=CredentialProxyHandler.metrics,
+        # An exec pod's state volume is sized for no gcloud log files
+        # (GCLOUD_FILE_LOGGING_OFF_ENV); the other roles keep gcloud's default.
+        gcloud_file_logging=role != EXEC_ROLE,
     )
     CredentialProxyHandler.metrics.set_admission_gauges(executor.admission_snapshot)
     memory_reader = MemoryReader(executor.child_peaks)
@@ -16441,6 +16621,7 @@ def serve(args: argparse.Namespace) -> None:
     MemorySampler(memory_reader, gate=gate).start()
     executor.bootstrap(os.getenv("CREDENTIAL_PROXY_BOOTSTRAP_COMMAND", ""))
     CredentialProxyHandler.executor = executor
+    CredentialProxyHandler.exclusions = executor.exclusions
     CredentialProxyHandler.session_slots = SessionSlots(session_slot_limit_from_env())
     CredentialProxyHandler.profile_slots = SessionSlots(
         profile_slot_limit_from_env(executor.class_cap(CLASS_BACKGROUND)),
@@ -16474,11 +16655,14 @@ def serve(args: argparse.Namespace) -> None:
             pinned_bases=CredentialProxyHandler.pinned_bases,
         )
     # What the gate's soft watermark reclaims: vcs scratch no request of this
-    # process holds (the vcs broker swept a dead process's at start). An exec
-    # pod has none.
+    # process holds (the vcs broker swept a dead process's at start), and on
+    # an exec pod, whose state volume is sized for the command HOME alone,
+    # kubectl's disk cache (KUBECTL_CACHE_DIR_NAME).
     reclaimers: list[Callable[[], int]] = []
     if CredentialProxyHandler.vcs is not None:
         reclaimers.append(CredentialProxyHandler.vcs.reclaim_orphan_scratch)
+    if role == EXEC_ROLE:
+        reclaimers.append(executor.reclaim_kubectl_cache)
     gate.set_reclaimers(reclaimers)
     if role in BROKER_ROLES:
         start_readings_sweep(executor, CredentialProxyHandler.vcs)

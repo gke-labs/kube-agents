@@ -286,6 +286,36 @@ func TestFromEnvTaskDeadline(t *testing.T) {
 	}
 }
 
+// TestFromEnvResolvedScopeConfigMap: A2A_RESOLVED_SCOPE_CONFIGMAP, which the
+// operator sets on the gateway, reaches ResolvedScopeConfigMap beside the
+// other scope and credential fields; absent leaves it empty, which keeps a
+// target only the resolved scope reaches unconfirmed.
+func TestFromEnvResolvedScopeConfigMap(t *testing.T) {
+	setBaseEnv(t)
+
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ResolvedScopeConfigMap != "" {
+		t.Fatalf("default ResolvedScopeConfigMap = %q, want empty", cfg.ResolvedScopeConfigMap)
+	}
+
+	t.Setenv("A2A_RESOLVED_SCOPE_CONFIGMAP", "platform-agent-resolved-scope")
+	t.Setenv("A2A_MANAGEMENT_PROJECT", "mgmt-project")
+	t.Setenv("A2A_CREDENTIAL_PROXY_EXEC_URL", "http://exec.example:8080")
+	cfg, err = FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ResolvedScopeConfigMap != "platform-agent-resolved-scope" {
+		t.Fatalf("ResolvedScopeConfigMap = %q, want platform-agent-resolved-scope", cfg.ResolvedScopeConfigMap)
+	}
+	if cfg.ManagementProject != "mgmt-project" || cfg.CredentialProxyExecURL != "http://exec.example:8080" {
+		t.Fatalf("ManagementProject = %q, CredentialProxyExecURL = %q", cfg.ManagementProject, cfg.CredentialProxyExecURL)
+	}
+}
+
 // TestFromEnvAskTTL: the independent bound on the KV ask copy — absent
 // means 24h (under the stream's 72h retention, above any legitimate task),
 // and a sub-minute value refuses at boot.

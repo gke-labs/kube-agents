@@ -190,8 +190,9 @@ because on an install that declares no scope the report script's own fallback
 is every project the credential can list. A roster spelling with a space, a semicolon, or a
 comma inside one project's name is not a project id or number, so it fails the tick with the
 places to correct it. Within those projects the report script
-enumerates every cluster, so a cluster `spec.scope.exclude.clusters` keeps a
-Cluster Agent from is still read here. On an install that declares a scope (a
+enumerates every cluster, so a cluster `spec.scope.exclude.clusters` excludes
+still gets its versions graded here, from `gcloud` cluster metadata, but none of
+its in-cluster reads (`--scope-readiness-excluded-clusters`). On an install that declares a scope (a
 `spec.scope` block), the report script, a fleet-audit collector, refuses a bare
 `--project` in the sandbox, so the job reads the declared scope on the agent
 pod (`fleet_scope_targets.declared_scope_targets()`) and hands the script the
@@ -207,7 +208,7 @@ for the version table and, on a report day, the readiness report's read set,
 the same as a run on request: three `gcloud` list reads per project (backend
 services, instances and GKE operations, projected to the fields the rules read)
 beside the server config per location, then one `get-credentials` and six
-`kubectl get`s per cluster (budgets, Deployments and StatefulSets; webhook configurations
+`kubectl get`s per cluster not excluded (budgets, Deployments and StatefulSets; webhook configurations
 with their Services, EndpointSlices and Namespaces; DaemonSets, CronJobs,
 claims, NetworkPolicies and Namespaces; every pod; the nodes through a
 jsonpath projection; StorageClasses and PersistentVolumes), plus
@@ -579,9 +580,12 @@ is on the agent pod at `<agent home>/kanban.db`. `kanban_board_health.py` reads
 that file read-only, asks `hermes kanban diagnostics` for the shipped rule
 engine's findings, and prints only when something is wrong. One finding is
 reported whatever the severity floor says: a card `blocked` for more than a day
-with no comment or unblock since. A worker's or operator's block is sticky by
-design, nothing retries it, and #656 was a finished report parked that way for
-weeks because nothing periodically asked.
+with no comment or unblock since, and a card the circuit breaker parked (a
+`gave_up` as its newest stop, which the engine's rule cannot see) for as long.
+A `needs_input` or `capability` block is sticky by design and nothing retries
+it (a `transient` block or a breaker trip is retried once by
+`kanban-block-recheck`, below), and #656 was a finished report parked that way
+for weeks because nothing periodically asked.
 
 The stuck cards are said in plain words for whoever is in the channel: a
 headline counting them ("2 tasks are stuck and need someone to decide."), then
@@ -646,6 +650,53 @@ volume line follows it while the volume is past the warn line.
 It sits here rather than on the Chat Agent's roster because that roster delivers
 `local`. `PLATFORM_AGENT_HOME`, not `HERMES_HOME`, is how it finds the board:
 under this roster `HERMES_HOME` is `profiles/platform`, which holds no board.
+
+## `kanban-block-recheck` retries a blocked card when its condition has cleared
+
+A blocked card stays blocked until a person acts, and nothing re-reads the condition the block
+described: cards have sat blocked for days on a condition that had cleared, re-reported by the
+digest above. `kanban_block_recheck.py` (`no_agent: true`, four times an hour at :07, :22, :37
+and :52) is the re-check. It keeps one record per blocked card in the board's
+`kanban_block_rechecks` table: the condition, when to check it, when to stop, and what the last
+check found. A condition that has cleared retries the card through Hermes' `unblock_task`, the
+call Retry makes, writes a `block_rechecked` event on the card, and prints one line, which
+`deliver: "chat"` posts ("Retried **Investigate web**: it blocked 1 hour ago and the wait has
+passed."). A condition that holds leaves the card blocked and refreshes the record, which the
+digest's row reads ("Re-checked 2 hours ago, still blocked."). The two ends at which a card stays
+blocked for a person are said once each the same way: a condition that cleared on a card already
+retried once, and a Kubernetes condition past its expiry. No comment is written: the digest's rule
+goes quiet after a comment, and the daily report is deliberate.
+
+Two condition kinds. A **time** condition is derived with no record from anyone, for the blocks
+the harness files itself: a circuit-breaker trip (`gave_up`) retries an hour after the trip, and a
+`transient` block (the rate-limit exit, or a worker's `kanban_block(kind="transient")`) thirty
+minutes after the block; cards blocked before this job existed are covered on its first run. A
+`needs_input`, `capability`, `dependency` or untyped block is a question for a person, or for
+`recompute_ready`, and gets no record. A
+**Kubernetes** condition names a pod or a deployment on a cluster and clears when the pod is
+`Ready` or the deployment `Available`, read with one `kubectl get -o json` through the shell
+sandbox on the per-cluster kubeconfig `stall-watch` keeps there; the credentials are fetched by
+`stall-watch`'s rule, once a day per cluster (the stamps live in
+`profiles/platform/cron/kanban_block_recheck.json`) or when a read says the kubeconfig itself is
+the problem. The resource is stored as kubectl is given it (`deployment/web`; a plural or padded
+spelling is normalised, a second `/` or an empty name refused). Record one on the pod:
+
+```bash
+PLATFORM_AGENT_HOME=/opt/data python3 /opt/data/scripts/kanban_block_recheck.py \
+  --watch t_1234abcd \
+  --project <project> --location <location> --cluster <cluster> \
+  --namespace shop --resource deployment/web \
+  --expires-in-hours 48
+```
+
+Without `--expires-in-hours` the checks stop after a week; after the expiry the digest says
+"Re-checks ended 3 days ago, still blocked." Bounds: one automatic retry per card for its life (a
+second cleared condition is recorded as `retry_limit` and waits for a person), at most three
+retries per run so the first run after an upgrade does not start every old breaker trip at once,
+and upstream's own unblock-loop breaker, which routes a second same-kind `kanban_block` to
+`triage`. A cluster the job cannot read is recorded as `unknown` and read again on the next run.
+A worker cannot record a Kubernetes condition when it blocks; that is a tool-text change and a
+follow-up. Design: [`docs/designs/kanban-block-recheck.md`](../../../docs/designs/kanban-block-recheck.md).
 
 ## `feedback-prompt` asks once, a week after it first runs
 
@@ -952,8 +1003,9 @@ The Planning Agent is the `default` profile, which is not scaffolded: it lives
 at `$HERMES_HOME` directly and the entrypoint seeds it with
 `cp -ru /opt/defaults/. "$TARGET_DIR/"` (`deploy/shared/docker-entrypoint.sh`,
 step 2). `cron/` is in neither force-sync list — step 2a covers `SOUL.md`,
-`AGENTS.md`, `CAPABILITIES.md` and `hindsight/config.json`, step 2b covers
-`scripts/` and `plugins/bootstrap_onboarding/` — and since the
+`AGENTS.md`, `CAPABILITIES.md`, `hindsight/config.json` and the onboarding prompts, step 2b covers
+`scripts/` and every plugin directory under `/opt/defaults/plugins`
+except `hermes_otel` — and since the
 scheduler writes `last_run` into the volume's copy on every tick, that copy's
 timestamp is permanently ahead of the image's, and `cp -u` skips it for good.
 

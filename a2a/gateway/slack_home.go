@@ -73,7 +73,7 @@ const (
 
 	// slackDateToken is Slack's date formatting: rendered in the viewer's
 	// own time zone, with the fallback shown by a client that cannot.
-	slackDateToken    = "<!date^%d^%s|%s>"
+	slackDateToken    = "<!date^%d^%s|%s>" // #nosec G101 -- a Slack format string, not a credential
 	slackDateTime     = "{time}"
 	slackDateDayTime  = "{date_short_pretty} {time}"
 	slackDateFallback = "Jan 2 15:04 UTC"
