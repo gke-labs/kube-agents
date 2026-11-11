@@ -105,3 +105,12 @@ as JSON on stdout; the warnings also go to stderr. `--relay-command` is
 space-separated, and `{url}` becomes each server's relay URL; a relay with no `{url}` in its args is an error. Without the
 relay flags every broker server is dropped; the two go together, and either
 one alone is a usage error.
+
+A dispatched profile worker renders with its own relay, not `mcp-remote`:
+each broker server becomes `worker-adapter mcp-relay <broker>/v1/mcp/<server>`
+(`a2a/worker-adapter/mcprelay.go`). It sends each message to the credential
+broker with the pod's ServiceAccount token and the task's credential, read
+from their files per request, and refuses any URL outside the broker's own
+`/v1/mcp/` route, so a model that edits its MCP config can't send those
+credentials elsewhere. The broker's `mcp_policy` still decides what a profile
+worker may call.
