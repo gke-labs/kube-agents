@@ -619,6 +619,70 @@ def test_registration_skips_the_reconcile_when_the_profiles_match(monkeypatch, t
     assert reconciles == [] and run.watch_errors == []
 
 
+def _watch_reports(monkeypatch, run, reports: list[set[str]]) -> list[tuple]:
+    """Feed the watcher's reports in turn (the last repeats), on a clock that moves 30 s a look;
+    returns the gateway restarts the runner asks for."""
+    seq = iter(reports)
+    last = {}
+
+    def watched_clusters(self):
+        last["value"] = next(seq, last.get("value"))
+        return last["value"]
+
+    type(run.install).watched_clusters = watched_clusters
+    clock = iter(range(0, 100_000, 30))
+    monkeypatch.setattr(runner.time, "monotonic", lambda: next(clock))
+    restarts = []
+    monkeypatch.setattr(runner.operations, "restart", lambda *a: restarts.append(a))
+    return restarts
+
+
+def test_a_profile_written_after_the_watcher_starts_is_waited_for_not_restarted(monkeypatch, tmp_path):
+    # The watcher re-reads its profiles every minute (#4496), so a cluster registered after it
+    # started is watched within a rescan: the runner waits, and restarts nothing (#3932).
+    fleet = {"scale-01", "scale-02"}
+    run, _ = _registration_runner(monkeypatch, tmp_path, [fleet], set())
+    run.settings["watcher_wait_seconds"] = 0
+    restarts = _watch_reports(monkeypatch, run, [{"scale-01"}, {"scale-01"}, fleet])
+    run.wait_registered(2)
+    assert restarts == [] and run.watch_errors == []
+
+
+def test_a_watcher_that_never_picks_up_the_fleet_is_an_error_not_a_restart(monkeypatch, tmp_path):
+    fleet = {"scale-01", "scale-02"}
+    run, _ = _registration_runner(monkeypatch, tmp_path, [fleet], set())
+    run.settings["watcher_wait_seconds"] = 0
+    restarts = _watch_reports(monkeypatch, run, [{"scale-01"}])
+    run.wait_registered(2)
+    assert restarts == []
+    assert len(run.watch_errors) == 1 and "without a restart" in run.watch_errors[0]
+
+
+def test_the_restart_fallback_restarts_and_says_it_was_needed(monkeypatch, tmp_path):
+    fleet = {"scale-01", "scale-02"}
+    run, _ = _registration_runner(monkeypatch, tmp_path, [fleet], set())
+    run.settings["restart_unwatched_watcher"] = True
+    run.settings["watcher_wait_seconds"] = 0
+    restarts = _watch_reports(monkeypatch, run, [])
+    # The restarted watcher reads every profile at boot.
+    type(run.install).watched_clusters = lambda self: fleet if restarts else {"scale-01"}
+    run.wait_registered(2)
+    assert restarts == [("ctx", "ns")]
+    assert len(run.watch_errors) == 1 and run.watch_errors[0].startswith(runner.WATCHER_RESTARTED_NOTE)
+
+
+def test_a_restart_that_does_not_fix_the_watch_set_records_both(monkeypatch, tmp_path):
+    fleet = {"scale-01", "scale-02"}
+    run, _ = _registration_runner(monkeypatch, tmp_path, [fleet], set())
+    run.settings["restart_unwatched_watcher"] = True
+    run.settings["watcher_wait_seconds"] = 0
+    restarts = _watch_reports(monkeypatch, run, [{"scale-01"}])
+    run.wait_registered(2)
+    assert restarts == [("ctx", "ns")]
+    assert run.watch_errors[0].startswith(runner.WATCHER_RESTARTED_NOTE)
+    assert run.watch_errors[1] == "event watcher watches ['scale-01'], test fleet is ['scale-01', 'scale-02']"
+
+
 def test_a_level_that_keeps_the_fleet_skips_the_settle(monkeypatch, tmp_path):
     run = runner.Runner(load_plan(PHASE2, environ=ENV), tmp_path / "data.json")
     sleeps = []
