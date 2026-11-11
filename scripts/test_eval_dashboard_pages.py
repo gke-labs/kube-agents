@@ -1174,6 +1174,28 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("rca-names-the-oom", app)
         self.assertIn("Tracking <a", app)
         self.assertIn("issues/1278", app)
+
+    def test_history_lists_an_issue_once_whether_a_tick_wrote_its_number_or_its_url(self):
+        """health-history.jsonl across a rollout: the tick before wrote
+        "#1300", the tick after its URL; the incident names the issue once."""
+        ticks = [dict(health_doc("OUTAGE"), tick="2026-09-08T09:00:00Z", tracking_issues=["#1300"]),
+                 dict(health_doc("OUTAGE"), tick="2026-09-08T09:15:00Z", tracking_issues=["https://github.com/gke-labs/kube-agents/issues/1300", "#1278"])]
+        path = pathlib.Path(self.tmp.name) / "history.jsonl"
+        path.write_text("".join(json.dumps(t) + "\n" for t in ticks))
+        [incident] = render.history_incidents(render.load_health_history(path))
+        self.assertEqual(incident["tracking_issues"], ["#1300", "#1278"])
+
+    def test_a_tracking_issue_given_as_a_url_links_there_and_names_another_repository(self):
+        """health.json's tracking_issues: a bare #N is this repository's
+        (case-notes.yaml); the bot's own issues arrive as full URLs and may
+        live in the issues repository, which the link text then names."""
+        doc = health_doc("OUTAGE")
+        doc["tracking_issues"] = ["#1278", "https://github.com/gke-labs/kube-agents/issues/1300", "https://github.com/gke-labs/kube-agents-eval-triage/issues/12"]
+        out = render_to(pathlib.Path(self.tmp.name) / "issue-urls", self.data, health=doc)
+        app = dom_text(out / "index.html")
+        self.assertIn('<a href="https://github.com/gke-labs/kube-agents/issues/1278">#1278</a>', app)
+        self.assertIn('<a href="https://github.com/gke-labs/kube-agents/issues/1300">#1300</a>', app)
+        self.assertIn('<a href="https://github.com/gke-labs/kube-agents-eval-triage/issues/12">gke-labs/kube-agents-eval-triage#12</a>', app)
         self.assertIn("Runs in this window", app)
         self.assertIn('href="run.html#build=2097282860221206528"', app)
         self.assertIn('class="chip hit">cluster-agent-crashloop-debug', app)
