@@ -17,7 +17,11 @@ something the model reads is `session.py`'s job — see `prompts.py` for why the
 three outcomes must stay distinguishable.
 """
 
+import json
 import logging
+import os
+import shutil
+import subprocess
 from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
@@ -36,6 +40,25 @@ from .config_schema import (
 from .prompts import RECALL_PREAMBLE
 
 logger = logging.getLogger(__name__)
+
+CURATOR_BIN_ENV = "CURATOR_BIN"
+DEFAULT_CURATOR_BIN = "/usr/local/bin/curator"
+NATS_URL_ENV = "NATS_URL"
+CURATOR_RECALL_TIMEOUT_SECONDS = 4
+DEFAULT_DECISION_RECALL_MAX_RESULTS = 4
+OKF_DOC_PREFIX = "okf:"
+OKF_ID_PREFIXES = (
+    "DEC-",
+    "LES-",
+    "ADR-",
+    "RFC-",
+    "RUN-",
+    "BP-",
+    "TEN-",
+    "MET-",
+    "ESC-",
+    "OBS-",
+)
 
 # Bank config this process has already settled, so the common case costs nothing.
 # Deliberately per-process rather than persisted: it is only a cache, and
@@ -247,3 +270,107 @@ def reflect(provider: MemoryProvider, query: str, tags: List[str]) -> str:
         )
     )
     return str(getattr(response, "text", "") or "").strip()
+
+
+def _resolve_curator_bin() -> str:
+    """Return the path to the ``curator`` CLI binary if installed, else ``""``."""
+    configured = os.environ.get(CURATOR_BIN_ENV, "").strip()
+    if configured:
+        return configured
+    if os.path.isfile(DEFAULT_CURATOR_BIN) and os.access(DEFAULT_CURATOR_BIN, os.X_OK):
+        return DEFAULT_CURATOR_BIN
+    return shutil.which("curator") or ""
+
+
+def _extract_okf_id_and_status(
+    item: Dict[str, Any], records_by_id: Dict[str, Dict[str, Any]]
+) -> tuple[str, str, Dict[str, Any]]:
+    """Resolve the OKF record ID and lifecycle status from a recall result item."""
+    raw_id = str(item.get("id") or "").strip()
+    doc_id = str(item.get("document_id") or "").strip()
+    rec_id = raw_id
+    if doc_id.startswith(OKF_DOC_PREFIX) and not rec_id.startswith(OKF_ID_PREFIXES):
+        suffix = doc_id.rsplit(":", 1)[-1].strip()
+        if suffix:
+            rec_id = suffix
+    rec_meta = records_by_id.get(rec_id) or {}
+    status = str(rec_meta.get("status") or "").strip().lower()
+    if not status:
+        for tag in item.get("tags") or ():
+            tag_str = str(tag or "").strip().lower()
+            if tag_str.startswith("status:"):
+                status = tag_str.split(":", 1)[1].strip()
+                break
+    return rec_id, status, rec_meta
+
+
+def recall_decisions(
+    query: str, max_results: int = DEFAULT_DECISION_RECALL_MAX_RESULTS
+) -> List[str]:
+    """Query structured DEC-*/LES-* records over NATS via ``curator recall``.
+
+    Returns an empty list when ``NATS_URL`` is unset or ``curator`` is not
+    installed so unit tests and environments without the NATS bus are
+    unaffected.
+    """
+    q = str(query or "").strip()
+    if not q or not os.environ.get(NATS_URL_ENV, "").strip():
+        return []
+    curator_bin = _resolve_curator_bin()
+    if not curator_bin:
+        return []
+    try:
+        proc = subprocess.run(
+            [curator_bin, "recall", "--query", q],
+            capture_output=True,
+            text=True,
+            timeout=CURATOR_RECALL_TIMEOUT_SECONDS,
+            check=False,
+        )
+        if proc.returncode != 0:
+            err_detail = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()
+            logger.warning("%s: curator recall failed: %s", PROVIDER_NAME, err_detail)
+            return []
+        if not proc.stdout.strip():
+            return []
+        payload = json.loads(proc.stdout)
+    except Exception as e:
+        logger.warning("%s: NATS decision recall failed: %s", PROVIDER_NAME, e)
+        return []
+
+    records_by_id = {
+        str(rec.get("id") or ""): rec
+        for rec in (payload.get("records") or [])
+        if isinstance(rec, dict) and rec.get("id")
+    }
+    formatted: List[str] = []
+    for item in payload.get("results") or []:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text") or "").strip()
+        if not text:
+            continue
+        doc_id = str(item.get("document_id") or "").strip()
+        rec_id, status, rec_meta = _extract_okf_id_and_status(item, records_by_id)
+        is_okf = (
+            rec_id.startswith(OKF_ID_PREFIXES)
+            or doc_id.startswith(OKF_DOC_PREFIX)
+            or rec_id in records_by_id
+        )
+        if not is_okf:
+            continue
+        header = f"[{rec_id}]" if rec_id else "[Record]"
+        if status == "rejected":
+            reason = str(rec_meta.get("reviewer_reason") or "").strip()
+            note = f" (Reason: {reason})" if reason else ""
+            header = f"{header} [STATUS: REJECTED — do not enforce as active policy{note}]"
+        elif status == "proposed":
+            pr_ref = str(rec_meta.get("pull_request") or "").strip()
+            pr_note = f" in {pr_ref}" if pr_ref else ""
+            header = f"{header} [STATUS: PROPOSED — awaiting pull request review{pr_note}; not yet active policy]"
+        elif status:
+            header = f"{header} [status: {status}]"
+        formatted.append(f"{header}\n{text}")
+        if len(formatted) >= max_results:
+            break
+    return formatted

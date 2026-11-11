@@ -54,8 +54,10 @@ Neither workload reads a Secret, and that is a decision rather than an oversight
 no password in it. What keeps the database private is a ClusterIP service with no
 route in from outside the cluster, and — on clusters that enforce it —
 [`networkpolicy.yaml`](networkpolicy.yaml), which lets only the Hindsight API pod
-reach port 5432 and confines `hindsight-api` itself to same-namespace and Managed
-Prometheus ingress on port 8888 and egress to cluster DNS, `hindsight-postgresql`,
+reach port 5432 and confines `hindsight-api` itself on port 8888 to trusted
+gateway and credential-proxy pods in the same namespace (excluding shell-sandbox
+StatefulSet pods, `kube-proxy`, and session/worker pods) plus Managed Prometheus,
+and egress to cluster DNS, `hindsight-postgresql`,
 and the inference gateway. A password would add an install step (generate it, keep
 two keys in agreement, rotate it) to protect an in-cluster database from pods that
 are already trusted with the memories it holds.
@@ -90,8 +92,8 @@ http://hindsight-api.kubeagents-system.svc.cluster.local:8888
 
 Nothing bakes that URL in. The operator derives it from the agent's namespace and
 passes it as `HINDSIGHT_API_URL`; `agents/chat/defaults/hindsight/config.json`
-carries `mode`, `memory_mode` and `recall_budget` and deliberately **no**
-`api_url` key, because the plugin prefers the file over the environment and a
+carries `mode`, `memory_mode`, `recall_budget`, and `recall_types` and deliberately
+**no** `api_url` key, because the plugin prefers the file over the environment and a
 value left there would outrank the operator's silently. Installing into a
 different namespace therefore needs no edit and no image rebuild. The manifests
 are namespace-agnostic for the same reason — every in-cluster address in them is

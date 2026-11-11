@@ -189,11 +189,39 @@ class HindsightNetworkPolicyTest(unittest.TestCase):
         )
         self.assertEqual(["Ingress", "Egress"], spec["policyTypes"])
 
-        # Ingress: same-namespace pods and gke-gmp-system on TCP 8888.
+        # Ingress: trusted gateway and credential-proxy pods (blocking shell-sandbox
+        # StatefulSet pods, kube-proxy, and session/worker pods) plus gke-gmp-system on TCP 8888.
         self.assertEqual(
             [
                 {
-                    "from": [{"podSelector": {}}],
+                    "from": [
+                        {
+                            "podSelector": {
+                                "matchLabels": {
+                                    "app.kubernetes.io/name": "platform-agent",
+                                    "app.kubernetes.io/part-of": "kube-agents",
+                                },
+                                "matchExpressions": [
+                                    {
+                                        "key": "statefulset.kubernetes.io/pod-name",
+                                        "operator": "DoesNotExist",
+                                    },
+                                    {
+                                        "key": "kubeagents.x-k8s.io/component",
+                                        "operator": "NotIn",
+                                        "values": ["kube-proxy"],
+                                    },
+                                ],
+                            }
+                        },
+                        {
+                            "podSelector": {
+                                "matchLabels": {
+                                    "kubeagents.x-k8s.io/a2a-component": "gateway",
+                                }
+                            }
+                        },
+                    ],
                     "ports": [{"port": 8888, "protocol": "TCP"}],
                 },
                 {

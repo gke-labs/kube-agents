@@ -28,6 +28,7 @@ stock Hindsight provider is in `client.py`; anything the model reads is in
 """
 
 from contextlib import closing
+from datetime import datetime, timedelta, timezone
 import hashlib
 import inspect
 import json
@@ -36,6 +37,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+from types import SimpleNamespace
 from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 
 from agent.memory_provider import MemoryProvider
@@ -43,6 +45,8 @@ from tools.registry import tool_error
 
 from . import client
 from .config_schema import (
+    CHECKPOINT_STRATEGY,
+    HANDOFF_TAG,
     PERSONAL_STRATEGY,
     PROVIDER_NAME,
     SCOPES,
@@ -55,6 +59,7 @@ from .config_schema import (
 from .prompts import (
     NO_IDENTITY_NOTICE,
     NO_MATCH_GUIDANCE,
+    RECALL_PREAMBLE,
     SHARED_SESSION_NOTICE,
     UNREACHABLE_GUIDANCE,
     system_prompt_block,
@@ -69,6 +74,46 @@ MAX_PARENT_SESSION_HOPS = 256
 SQLITE_TIMEOUT_SECONDS = 2.0
 COMPRESSION_END_REASON = "compression"
 INTERACTIVE_PLATFORMS = frozenset({"google_chat", "slack", "discord", "telegram"})
+DECISIONS_SECTION_HEADING = "## Architecture Decisions & Operational Lessons\n"
+SESSION_TAG_PREFIX = "session:"
+RETAIN_KINDS = ("fact", "handoff")
+ITEM_TIMESTAMP_FIELDS = ("mentioned_at", "created_at", "timestamp", "occurred_start", "date")
+
+
+def _parse_item_timestamp(item: Any) -> Optional[datetime]:
+    """Extract a UTC ingestion or event timestamp from a recall result item."""
+    for attr in ITEM_TIMESTAMP_FIELDS:
+        raw = None
+        if isinstance(item, dict) and attr in item:
+            raw = item.get(attr)
+        elif hasattr(item, attr):
+            raw = getattr(item, attr)
+        if not raw:
+            continue
+        if isinstance(raw, datetime):
+            return raw if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
+        s = str(raw).strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(s)
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def _filter_results_since_hours(results: List[Any], since_hours: Optional[int]) -> List[Any]:
+    """Filter recall results strictly to timestamped items within ``since_hours``."""
+    if not since_hours or since_hours <= 0:
+        return results
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=int(since_hours))
+    filtered: List[Any] = []
+    for r in results:
+        ts = _parse_item_timestamp(r)
+        if ts is not None and ts >= cutoff:
+            filtered.append(r)
+    return filtered
 
 
 def _resolve_a2a_session_id(session_id: str, kwargs: Dict[str, Any]) -> str:
@@ -300,7 +345,14 @@ class KubeAgentsMemoryProvider(MemoryProvider):
         self._call("queue_prefetch", query, session_id=session_id)
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        return self._call("prefetch", query, session_id=session_id) or ""
+        base = self._call("prefetch", query, session_id=session_id) or ""
+        decisions = client.recall_decisions(query)
+        if not decisions:
+            return base
+        section = DECISIONS_SECTION_HEADING + "\n\n".join(decisions)
+        if base:
+            return f"{base.rstrip()}\n\n{section}"
+        return f"{RECALL_PREAMBLE}\n\n{section}"
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs: Any) -> None:
         self._call("on_turn_start", turn_number, message, **kwargs)
@@ -374,7 +426,26 @@ class KubeAgentsMemoryProvider(MemoryProvider):
         # which is the behaviour SOUL.md calls a safety property.
         default_scope = "both"
         if is_write:
-            default_scope = "shared" if self._unattended else "personal"
+            kind = str(args.get("kind") or "fact").strip().lower()
+            if kind not in RETAIN_KINDS:
+                return tool_error(
+                    f"Invalid kind {kind!r} for memory_retain. Use 'fact' or 'handoff'."
+                )
+            explicit_scope = str(args.get("scope") or "").strip().lower()
+            if kind == "handoff":
+                if self._user_tag and explicit_scope != "shared":
+                    return tool_error(
+                        "Handoff checkpoints are visible across shared sessions. "
+                        "In a personal DM, pass scope='shared' explicitly only when "
+                        "the checkpoint contains no private user information."
+                    )
+                if explicit_scope and explicit_scope != "shared":
+                    return tool_error(
+                        "kind='handoff' checkpoints must use scope='shared'."
+                    )
+                default_scope = "shared"
+            else:
+                default_scope = "shared" if self._unattended else "personal"
         scope = str(args.get("scope") or default_scope).strip().lower()
         if scope not in SCOPES or (is_write and scope == "both"):
             return tool_error(
@@ -405,12 +476,28 @@ class KubeAgentsMemoryProvider(MemoryProvider):
         content = str(args.get("content") or "").strip()
         if not content:
             return tool_error("Missing required parameter: content")
-        tags = self._tags_for(scope)
+        kind = str(args.get("kind") or "fact").strip().lower()
+        if kind not in RETAIN_KINDS:
+            return tool_error(f"Invalid kind {kind!r} for memory_retain. Use 'fact' or 'handoff'.")
+        if kind == "handoff":
+            scope = "shared"
+            tags = [SHARED_TAG, HANDOFF_TAG]
+            if self._session_id:
+                session_tag = f"{SESSION_TAG_PREFIX}{self._session_id}"
+                tags.append(session_tag)
+                obs_scopes: List[List[str]] = [[HANDOFF_TAG, session_tag]]
+            else:
+                obs_scopes = [[HANDOFF_TAG]]
+            strategy = CHECKPOINT_STRATEGY
+        else:
+            tags = self._tags_for(scope)
+            strategy = SHARED_STRATEGY if scope == "shared" else PERSONAL_STRATEGY
+            obs_scopes = [tags]
         item: Dict[str, Any] = {
             "content": content,
             "tags": tags,
-            "observation_scopes": [tags],
-            "strategy": SHARED_STRATEGY if scope == "shared" else PERSONAL_STRATEGY,
+            "observation_scopes": obs_scopes,
+            "strategy": strategy,
         }
         context = str(args.get("context") or "").strip()
         if context:
@@ -420,6 +507,12 @@ class KubeAgentsMemoryProvider(MemoryProvider):
         except Exception as e:
             logger.warning("%s: retain failed (scope=%s): %s", PROVIDER_NAME, scope, e)
             return tool_error(f"Failed to store the memory: {e}")
+        if kind == "handoff":
+            return json.dumps({
+                "result": "Stored investigation handoff checkpoint in shared memory.",
+                "kind": "handoff",
+                "scope": "shared",
+            })
         return json.dumps({"result": f"Stored in {scope} memory."})
 
     def _read(self, tool_name: str, args: Dict[str, Any], scope: str) -> str:
@@ -428,10 +521,27 @@ class KubeAgentsMemoryProvider(MemoryProvider):
             return tool_error("Missing required parameter: query")
         tags = self._tags_for(scope)
         if tool_name == "memory_recall":
-            return self._recall(query, scope, tags)
+            raw_since = args.get("since_hours")
+            since_hours: Optional[int] = None
+            if raw_since is not None and str(raw_since).strip() != "":
+                try:
+                    since_hours = int(raw_since)
+                except (TypeError, ValueError):
+                    return tool_error(f"Invalid since_hours {raw_since!r} for memory_recall.")
+                if since_hours <= 0:
+                    return tool_error("since_hours must be a positive integer.")
+            return self._recall(query, scope, tags, since_hours=since_hours)
         return self._reflect(query, scope, tags)
 
-    def _searched(self, tool_name: str, query: str, scope: str, tags: List[str]) -> Dict[str, Any]:
+    def _searched(
+        self,
+        tool_name: str,
+        query: str,
+        scope: str,
+        tags: List[str],
+        *,
+        since_hours: Optional[int] = None,
+    ) -> Dict[str, Any]:
         """Describe the search that was run, whatever its outcome.
 
         Returned alongside every read so that "nothing came back" is a statement
@@ -448,12 +558,21 @@ class KubeAgentsMemoryProvider(MemoryProvider):
             types = getattr(self._hindsight, "_recall_types", None)
             if types:
                 envelope["layer"] = list(types)
+            if since_hours is not None:
+                envelope["since_hours"] = since_hours
         return envelope
 
-    def _recall(self, query: str, scope: str, tags: List[str]) -> str:
-        searched = self._searched("memory_recall", query, scope, tags)
+    def _recall(
+        self,
+        query: str,
+        scope: str,
+        tags: List[str],
+        *,
+        since_hours: Optional[int] = None,
+    ) -> str:
+        searched = self._searched("memory_recall", query, scope, tags, since_hours=since_hours)
         try:
-            results = client.recall(self._hindsight, query, tags)
+            results = list(client.recall(self._hindsight, query, tags))
         except Exception as e:
             logger.warning("%s: recall failed (scope=%s): %s", PROVIDER_NAME, scope, e)
             return tool_error(
@@ -461,6 +580,12 @@ class KubeAgentsMemoryProvider(MemoryProvider):
                 status="unreachable",
                 searched=searched,
             )
+        results = _filter_results_since_hours(results, since_hours)
+        if since_hours is None and scope in ("shared", "both"):
+            for entry in client.recall_decisions(query):
+                raw_body = entry.split("\n", 1)[-1].strip()
+                if not any(raw_body and raw_body in (getattr(r, "text", "") or "") for r in results):
+                    results.append(SimpleNamespace(text=entry))
         if not results:
             return json.dumps(
                 {"status": "no_match", "searched": searched, "matches": 0,
@@ -483,6 +608,11 @@ class KubeAgentsMemoryProvider(MemoryProvider):
                 status="unreachable",
                 searched=searched,
             )
+        if scope in ("shared", "both"):
+            decisions = client.recall_decisions(query)
+            if decisions:
+                dec_section = DECISIONS_SECTION_HEADING + "\n\n".join(decisions)
+                text = f"{text}\n\n{dec_section}" if text else dec_section
         if not text:
             return json.dumps(
                 {"status": "no_match", "searched": searched, "result": NO_MATCH_GUIDANCE}

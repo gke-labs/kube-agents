@@ -31,9 +31,10 @@ each is pinned in ``client.apply_scoping`` rather than left to configuration:
   ``memory_reflect`` is implemented against the client directly, and prefetch is
   pinned to ``recall`` mode.
 
-* **Observation scopes are pinned explicitly.** Recall returns *observations*,
-  not raw facts, so isolation is only real if the observation layer is scoped
-  too. Hindsight's default (``combined``) scopes an observation by the full tag
+* **Observation scopes are pinned explicitly.** Even when ``recall_types``
+  includes raw ``world`` and ``experience`` chunks alongside ``observation``,
+  isolation is only real if the consolidated observation layer is scoped too.
+  Hindsight's default (``combined``) scopes an observation by the full tag
   set of its sources — and the stock provider attaches a ``session:<id>`` tag to
   every auto-retained turn. That would make each session its own scope, so
   nothing a user said last week would ever consolidate with what they say today.
@@ -90,6 +91,7 @@ from .config_schema import (
     BANK_MISSION,
     CHECKPOINT_STRATEGY,
     DEFAULT_BANK_ID,
+    HANDOFF_TAG,
     PERSONAL_RETAIN_MISSION,
     PERSONAL_STRATEGY,
     PROVIDER_NAME,
@@ -123,6 +125,7 @@ __all__ = [
     "BANK_MISSION",
     "CHECKPOINT_STRATEGY",
     "DEFAULT_BANK_ID",
+    "HANDOFF_TAG",
     "KubeAgentsMemoryProvider",
     "MEMORY_ABSENCE_RULE",
     "NO_IDENTITY_NOTICE",
