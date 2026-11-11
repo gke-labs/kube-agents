@@ -196,8 +196,8 @@ class HealthRulesRenderTest(unittest.TestCase):
 
     # promtool is on neither the host nor the CI image, so the gappy series is
     # held by the rule's text: the window carries the threshold and the `for`
-    # stays short, since a `for` over an instant value resets at every gap a
-    # crash-looping gateway leaves and never fires.
+    # stays short, since a `for` over an instant value resets at every gap in
+    # the series (a missed scrape, a rescheduled pod).
     def test_the_slack_alert_survives_a_gappy_series(self):
         rule = _alerts(_rules(_render(*_ON))[0])[_SLACK_ALERT]
         self.assertIn("max_over_time(", rule["expr"])

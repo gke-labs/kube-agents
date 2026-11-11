@@ -259,7 +259,7 @@ Recording rules carry the ratios: `kubeagents:platformagent:chat_turns_errored_r
 - `KubeAgentsChatTurnsErroring`: errored turns over inbound messages above 0.15 in a day, with at least 3 messages.
 - `KubeAgentsBrokerFailing`: broker failures over tool executions above 0.15 in a day, with at least 10 calls.
 - `KubeAgentsBackgroundTasksGivingUp`: 3 or more gave-ups in 7 days.
-- `KubeAgentsSlackDisconnected`: no 1 in the A2A gateway's `kubeagents_a2a_gateway_slack_connected` for 5 minutes (`slackDisconnectedFor`), so Slack messages are not reaching the agent. It reads the window's maximum, so a gateway that crash-loops on a token Slack rejects, and is scraped at 0 between restarts, still fires. It needs the gateway's `<name>-a2a-gateway-monitoring` scrape, and never fires on an install that is not on Slack under `spec.mode: next`. A gateway pod that is never scraped at all serves no sample. That is left to `KubeAgentsScrapeBroken` below, which fires only while every target of a job is down; pod restarts are not in this set (see the end of this section).
+- `KubeAgentsSlackDisconnected`: no 1 in the A2A gateway's `kubeagents_a2a_gateway_slack_connected` for 5 minutes (`slackDisconnectedFor`), so Slack messages are not reaching the agent. A rejected token reads 0 throughout, since the gateway stays up and retries Slack, and a missed scrape does not reset the window. It needs the gateway's `<name>-a2a-gateway-monitoring` scrape and fires only on Slack under `spec.mode: next`; a gateway never scraped at all is `KubeAgentsScrapeBroken`'s.
 
 `friction`, it works but people are not getting value:
 
