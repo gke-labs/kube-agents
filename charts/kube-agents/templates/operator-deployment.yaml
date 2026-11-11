@@ -123,7 +123,7 @@ spec:
             # reported success. CREDENTIAL_PROXY_IMAGE is absent by design —
             # the operator derives the broker image from the agent image by
             # swapping the trailing name, so it follows the value below. The
-            # sandbox does not: it is a separate repository, so it is named.
+            # sandbox is not derived from the agent image, so it is named.
             - name: PLATFORM_AGENT_IMAGE
               value: "{{ include "kube-agents.imageRepository" (dict "repository" .Values.platformAgent.deployment.image.repository "registry" (include "kube-agents.imageRegistry" .)) }}:{{ .Values.platformAgent.deployment.image.tag | default .Chart.AppVersion }}"
             {{- /* The operator's own image, the same expression as the

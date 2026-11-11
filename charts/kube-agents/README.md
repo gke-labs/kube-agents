@@ -171,8 +171,8 @@ operator as `PLATFORM_AGENT_IMAGE`, `AGENT_SANDBOX_IMAGE`, and
 `ghcr.io` and Docker Hub minutes after `helm install` reported success.
 `CREDENTIAL_PROXY_IMAGE` is deliberately not passed: the operator derives the
 broker image from the agent image by swapping the trailing name, so it follows
-the mirror on its own. The sandbox image cannot be derived that way — it is a
-separate repository — which is why it has to be named.
+the mirror on its own. The sandbox image is not derived from the agent image, so
+the chart names it, at the same tag as the agent.
 
 The prefix is not a per-image default — it replaces every image's registry and
 path, keeping the trailing name, because that is the flat layout

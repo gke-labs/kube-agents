@@ -967,9 +967,10 @@ resource "helm_release" "kube_agents" {
     }
     # The sandbox is built from this repository at the same commit as the
     # agent and the operator, so it takes image_tag with them. It needs its own
-    # entry because the operator does not derive it: unlike the credential
-    # broker, which comes from the agent image with the trailing name swapped,
-    # the sandbox is a separate repository the chart names in AGENT_SANDBOX_IMAGE.
+    # entry because the chart always names it in AGENT_SANDBOX_IMAGE, which
+    # wins over the operator's own derivation: unlike the credential broker,
+    # which comes from the agent image with the trailing name swapped, nothing
+    # moves the sandbox with the agent image.
     # Leaving it out pins the sandbox to Chart.appVersion while everything
     # around it moves, which fails the pull rather than running the wrong code.
     agentSandbox = {
