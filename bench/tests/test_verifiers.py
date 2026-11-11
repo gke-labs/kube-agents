@@ -8938,6 +8938,35 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     assert _shell_argvs_with_exit_propagation("./f.py --readiness --exclude watch") == [
         (["./f.py", "--readiness", "--exclude", "watch"], True),
     ]
+    assert _shell_argvs_with_exit_propagation('bash -o noexec -c "python3 f.py --readiness"') == [
+        (["bash", "-o", "noexec", "-c", "python3 f.py --readiness"], True),
+        (["python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation('bash -D -c "python3 f.py --readiness"') == [
+        (["bash", "-D", "-c", "python3 f.py --readiness"], True),
+        (["python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation('bash --dump-strings -c "python3 f.py --readiness"') == [
+        (["bash", "--dump-strings", "-c", "python3 f.py --readiness"], True),
+        (["python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation('bash -c 2>/dev/null "python3 f.py --readiness"') == [
+        (["bash", "-c", "2", ">", "/dev/null", "python3 f.py --readiness"], True),
+        (["python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs('bash -c 2>/dev/null "git push origin main"')[-1] == ["git", "push", "origin", "main"]
+    assert _command_word_index(["flock", "-w", "10", "/tmp/lock", "kubectl", "get", "pdb", "-A"], script="kubectl") == 4
+    assert _command_word_index(["flock", "-E", "0", "/tmp/lock", "python3", "f.py", "--readiness"], script="f.py") == 4
+    assert _command_word_index(["time", "-o", "/tmp/time.out", "python3", "f.py", "--readiness"], script="f.py") == 3
+    assert _command_word_index(["time", "!", "python3", "audit_report.py", "start"], script="audit_report.py") == 2
+    assert _command_word_index(["time", "-p", "!", "python3", "audit_report.py", "start"], script="audit_report.py") == 3
+    assert _shell_argvs_with_exit_propagation("time ! python3 audit_report.py start") == [
+        (["time", "!", "python3", "audit_report.py", "start"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation('eval "python3 collect.py compliance-audit"') == [
+        (["eval", "python3 collect.py compliance-audit"], True),
+        (["python3", "collect.py", "compliance-audit"], False),
+    ]
     assert _shell_argvs_with_exit_propagation("python3 f.py --readiness\n") == [
         (["python3", "f.py", "--readiness"], True),
     ]

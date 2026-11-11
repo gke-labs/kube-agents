@@ -103,25 +103,12 @@ from kube_agents_bench import (
 )
 from kube_agents_bench.parsing import DELEGATION_TOOL
 from kube_agents_bench.shell_words import (
-    _GENERIC_WRAPPER_VAL_OPTS,
     _INTERPRETER_RE,
-    _SETSID_VAL_LESS_FLAGS,
     _SHELL_ARITHMETIC_OPENER,
     _SHELL_ASSIGNMENT_RE,
-    _SHELL_COUNT_RE,
     _SHELL_EVAL,
-    _SHELL_EXEC_WRAPPERS,
-    _SHELL_EXPANSION_PREFIX,
-    _SHELL_FLAG_PREFIX,
     _SHELL_LINE_END,
-    _SHELL_OPTIONS_END,
     _SHELL_PROGRAMS_WITH_COMMAND_STRING,
-    _SHELL_RESERVED_WORDS,
-    _SHELL_WRAPPER_POSITIONALS,
-    _SUDO_LONG_VAL_LESS_OPTS,
-    _SUDO_SHORT_VAL_OPTS,
-    _SUDO_VAL_LESS_FLAGS,
-    _SUDO_VAL_OPTS,
     _command_word_index,
     _extract_shell_command_string,
     _is_control_operator,
@@ -2771,6 +2758,12 @@ def _shell_argvs_with_exit_propagation(
                     )
 
         index = _command_word_index(seg)
+        if index is not None and seg[index] == _SHELL_EVAL:
+            for inner_argv, _ in _shell_argvs_with_exit_propagation(
+                " ".join(seg[index + 1:]), outer_spans=outer_spans
+            ):
+                results.append((inner_argv, False))
+            continue
         if index is not None and os.path.basename(seg[index]) in _SHELL_PROGRAMS_WITH_COMMAND_STRING:
             cmd_string, has_noexec, has_help_or_version = _extract_shell_command_string(seg, index + 1)
             if cmd_string is not None:
@@ -3155,8 +3148,8 @@ class WorkerCommandsVerifier(BaseVerifier):
     ``--``, the one positional ``flock`` and ``chroot`` take, and a redirect with
     its target -- and a program behind one that is not the script, a shell or an
     interpreter (``sudo ls``, ``nohup echo``) is a command of its own, not a run;
-    which flags take a value is not tabled, so the word after a bare flag is
-    read as its value (``sudo -n ls <script> --readiness`` is still credited);
+    which wrapper flags take a value is tabled, so a valueless flag like
+    ``sudo -n`` does not consume the command;
     and a run made through a script file or a shell's standard input
     (``bash run.sh``, ``nohup bash /tmp/run.sh &``, ``echo "<command>" | bash``,
     ``bash -s < run.sh``) is not read as one, since the argv names the file or

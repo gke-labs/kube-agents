@@ -320,6 +320,8 @@ _GENERIC_WRAPPER_VAL_OPTS = {
     "chroot": frozenset(("--userspec", "--groups")),
     "watch": frozenset(("-n", "--interval")),
     "xargs": frozenset(("-I", "-i", "-n", "-s", "-L", "-d", "-E", "-a")),
+    "flock": frozenset(("-w", "-E", "--wait", "--timeout", "--conflict-exit-code")),
+    "time": frozenset(("-o", "-f", "--output", "--format")),
 }
 
 
@@ -344,6 +346,8 @@ def _extract_shell_command_string(
             flag_idx += 1
             continue
         if takes_val:
+            if word == "noexec":
+                has_noexec = True
             takes_val = False
             flag_idx += 1
             continue
@@ -356,10 +360,20 @@ def _extract_shell_command_string(
         if word.startswith("--"):
             if word in ("--help", "--version"):
                 has_help_or_version = True
+            elif word in ("--dump-strings", "--dump-po-strings"):
+                has_noexec = True
             elif word in ("--rcfile", "--init-file"):
                 takes_val = True
             elif word.startswith("--rcfile=") or word.startswith("--init-file="):
                 pass
+            flag_idx += 1
+            continue
+        if word == "-D":
+            has_noexec = True
+            flag_idx += 1
+            continue
+        if word.startswith(("-o", "+o")) and word[2:] == "noexec":
+            has_noexec = True
             flag_idx += 1
             continue
         if word.startswith("+") and len(word) > 1:
@@ -371,8 +385,20 @@ def _extract_shell_command_string(
             if "n" in word[1:]:
                 has_noexec = True
             if "c" in word[1:]:
-                if flag_idx + 1 < len(argv):
-                    cmd_string = argv[flag_idx + 1]
+                c_idx = flag_idx + 1
+                c_redirect_target = False
+                while c_idx < len(argv):
+                    c_word = argv[c_idx]
+                    if c_redirect_target:
+                        c_redirect_target = False
+                        c_idx += 1
+                        continue
+                    if _is_redirect(c_word) or (c_word.isdigit() and c_idx + 1 < len(argv) and _is_redirect(argv[c_idx + 1])):
+                        c_redirect_target = not c_word.isdigit()
+                        c_idx += 1
+                        continue
+                    cmd_string = c_word
+                    break
                 break
             if word[-1] in "oO":
                 takes_val = True
@@ -420,6 +446,9 @@ def _scan_command_prefix(
             continue
         if _is_redirect(word) or (word.isdigit() and idx + 1 < len(argv) and _is_redirect(argv[idx + 1])):
             redirect_target = not word.isdigit()
+            idx += 1
+            continue
+        if _SHELL_ASSIGNMENT_RE.match(word) or word in _SHELL_RESERVED_WORDS:
             idx += 1
             continue
 
