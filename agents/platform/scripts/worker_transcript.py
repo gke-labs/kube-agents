@@ -291,18 +291,17 @@ INLINE_JSON_OBJECT_RE = re.compile(r"\{[^{}]+\}")
 # with nothing between them, so the detector removes it first; every rule below
 # is segment-bounded and would otherwise see two commands. Only an odd run of
 # backslashes ends in a continuation: in an even run each pair is one literal
-# backslash, and the newline still ends the command. The even part before the
-# continuation is kept (group 1). A backslash before a CR escapes the CR, and
-# the LF after it still ends the command, so CRLF is no continuation either.
-SHELL_CONTINUATION_RE = re.compile(r"(?<!\\)((?:\\\\)*)\\\n")
-# The masking path reads every backslash run before a line break. An odd run
-# before an LF folds as bash does (above); an even run, or a run before CRLF,
-# folds as this file did before it counted backslashes: the last backslash,
-# the break and the indentation become a space. Bash ends the command there,
-# but a nested `bash -c "…"` halves the run inside double quotes and continues
-# the line, so the credential rules read it joined: masking a value too many is
-# harmless, and missing one is not.
-SHELL_BREAK_RUN_RE = re.compile(r"(?<!\\)(\\+)(\r?\n)([ \t]*)")
+# backslash, and the newline still ends the command. A backslash before a CR
+# escapes the CR, and the LF after it still ends the command, so CRLF is no
+# continuation either. The masking path (`fold_shell_command`) also joins an
+# even run, or a run before CRLF, as this file did before it counted
+# backslashes: the last backslash, the break and the indentation become a
+# space. Bash ends the command there, but a nested `bash -c "…"` halves the
+# run inside double quotes and continues the line, so the credential rules
+# read it joined: masking a value too many is harmless, and missing one is not.
+# Both folds are one pass over the command (`_fold_line_breaks`).
+SHELL_CRLF = "\r\n"
+SHELL_INDENT_CHARS = " \t"
 # The tool-call argument keys that carry a shell command, in the order
 # `is_secret_read_tool_call` and `scrub_step_text` read them.
 COMMAND_ARG_KEYS = ("command", "cmd")
@@ -1009,27 +1008,51 @@ def supplement_redact(
     return value
 
 
+def _fold_line_breaks(command: str, masking: bool) -> str:
+    """``command`` with each backslash run before a line break folded, in one pass: an odd run
+    before an LF loses its last backslash and the LF, and the indentation after it stays as the
+    blank between words; with ``masking``, an even run or a run before CRLF also loses its last
+    backslash, the break and the indentation, which become ``SHELL_MASK_JOIN``."""
+    out: list[str] = []
+    i, n = 0, len(command)
+    while i < n:
+        if command[i] != SHELL_ESCAPE:
+            out.append(command[i])
+            i += 1
+            continue
+        j = i
+        while j < n and command[j] == SHELL_ESCAPE:
+            j += 1
+        run = j - i
+        if command.startswith(LINE_BREAK, j) and run % 2:
+            out.append(SHELL_ESCAPE * (run - 1))
+            i = j + len(LINE_BREAK)
+        elif masking and (command.startswith(LINE_BREAK, j) or command.startswith(SHELL_CRLF, j)):
+            k = j + (len(LINE_BREAK) if command.startswith(LINE_BREAK, j) else len(SHELL_CRLF))
+            while k < n and command[k] in SHELL_INDENT_CHARS:
+                k += 1
+            out.append(SHELL_ESCAPE * (run - 1) + SHELL_MASK_JOIN)
+            i = k
+        else:
+            out.append(SHELL_ESCAPE * run)
+            i = j
+    return "".join(out)
+
+
 def fold_shell_continuations(command: str) -> str:
     """``command`` with each backslash-newline continuation removed, as the shell
     removes it: ``kube\\<newline>ctl`` is one word, and the indentation after a
     continuation stays as the blank between words. An escaped backslash before
     a newline is not a continuation."""
-    return SHELL_CONTINUATION_RE.sub(lambda match: match.group(1), command)
-
-
-def _fold_for_masking(match: re.Match) -> str:
-    run, line_break, indent = match.groups()
-    if len(run) % 2 and line_break == "\n":
-        return run[:-1] + indent
-    return run[:-1] + SHELL_MASK_JOIN
+    return _fold_line_breaks(command, masking=False)
 
 
 def fold_shell_command(command: str) -> str:
     """A command as the credential rules read it: a backslash-newline
     continuation joined to its line (an even run or a CRLF joined with a space,
-    see `SHELL_BREAK_RUN_RE`), and an escaped space folded to one token
+    see `_fold_line_breaks`), and an escaped space folded to one token
     character (`SHELL_ESCAPED_SPACE_FOLD`, unfolded by `blank_named_values`)."""
-    return SHELL_BREAK_RUN_RE.sub(_fold_for_masking, command).replace(SHELL_ESCAPED_SPACE, SHELL_ESCAPED_SPACE_FOLD)
+    return _fold_line_breaks(command, masking=True).replace(SHELL_ESCAPED_SPACE, SHELL_ESCAPED_SPACE_FOLD)
 
 
 def scrub_step_text(redactor: Any, kind: str, text: str, withheld: str) -> str:

@@ -186,6 +186,44 @@ class TestScrubStepText(unittest.TestCase):
         self.assertEqual(fold("a" + "\\" * 5 + "\nb"), "a" + "\\" * 4 + "b")
         self.assertEqual(fold("a" + "\\" * 6 + "\nb"), "a" + "\\" * 6 + "\nb")
 
+    def test_the_scan_folds_exactly_as_the_regexes_it_replaced(self):
+        # The two folds were regexes until CodeQL flagged them as polynomial;
+        # the one-pass scan must give the same result on every input. The old
+        # regexes live here only, as the reference.
+        import itertools
+        import random
+        import re
+
+        old_continuation = re.compile(r"(?<!\\)((?:\\\\)*)\\\n")
+        old_break_run = re.compile(r"(?<!\\)(\\+)(\r?\n)([ \t]*)")
+
+        def old_detect(command):
+            return old_continuation.sub(lambda m: m.group(1), command)
+
+        def old_mask(command):
+            def one(m):
+                run, line_break, indent = m.groups()
+                if len(run) % 2 and line_break == "\n":
+                    return run[:-1] + indent
+                return run[:-1] + " "
+            return old_break_run.sub(one, command).replace("\\ ", "\ue000")
+
+        inputs = []
+        for head, run, line_break, tail in itertools.product(
+            ("a", 'bash -c "mysql --password', "echo 'q", "x\t", ""),
+            range(9),
+            ("\n", "\r\n", ""),
+            (" b", "\tb", "  \t b", '"', "'", "", "\\"),
+        ):
+            inputs.append(head + "\\" * run + line_break + tail)
+        rng = random.Random(5450)
+        alphabet = ["\\", "\\", "\n", "\r", " ", "\t", '"', "'", "a", "-c "]
+        inputs += ["".join(rng.choice(alphabet) for _ in range(rng.randint(0, 16))) for _ in range(3000)]
+        for command in inputs:
+            with self.subTest(command=command):
+                self.assertEqual(worker_transcript.fold_shell_continuations(command), old_detect(command))
+                self.assertEqual(worker_transcript.fold_shell_command(command), old_mask(command))
+
     def test_a_continuation_inside_a_word_joins_the_word(self):
         # The fold used to put a space where bash puts nothing, so a word split
         # by a continuation hid a secret read or a credential flag.
