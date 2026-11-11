@@ -1459,26 +1459,32 @@ func (d *A2ADoor) rememberEvictedLocked(taskID, caller string) {
 }
 
 // The reasons in a not-found error's data (a2aTaskNotHeld), which a client
-// reads to know it should resubmit instead of parsing the message.
+// reads instead of parsing the message. Neither says the task failed: the
+// door forgot it, and the task may have run, or may still be running.
 const (
 	// a2aNotHeldEvicted: the door held the caller's task and evicted it to
-	// stay inside its bounds.
+	// stay inside its bounds, running or not.
 	a2aNotHeldEvicted = "evicted"
 	// a2aNotHeldSinceServing: this gateway holds no record of the id. The
 	// door keeps tasks in the active gateway's memory only, so a task
-	// submitted before servingSince was lost to a gateway restart or
-	// failover. Also the answer for an id that is another caller's or that
-	// no door minted, so it confirms nothing about ids the caller can't read.
+	// submitted before servingSince, before a restart or failover, is
+	// unknown here: its executor may have finished it or may still be
+	// running it. Also the answer for an id that is another caller's or
+	// that no door minted, so it confirms nothing about ids the caller
+	// can't read.
 	a2aNotHeldSinceServing = "not-held-since-serving"
 )
 
-// a2aNotHeldData is the data of a door not-found error: why the task isn't
-// held, when this gateway started serving the door, and that the caller
-// should resubmit the task if it wants it done.
+// a2aNotHeldData is the data of a door not-found error: why the door
+// doesn't hold the task, when this gateway started serving the door, and
+// that the task's outcome is unknown here (MayHaveRun): a caller that
+// resubmits starts it again, possibly twice. The door's messageId dedupe
+// is in the same memory, so a repeated messageId doesn't dedupe across a
+// restart either.
 type a2aNotHeldData struct {
 	Reason       string `json:"reason"`
 	ServingSince string `json:"servingSince"`
-	Resubmit     bool   `json:"resubmit"`
+	MayHaveRun   bool   `json:"mayHaveRun"`
 }
 
 // a2aTaskNotHeld is the protocol's task-not-found error (-32001) for a
@@ -1491,15 +1497,17 @@ func (d *A2ADoor) a2aTaskNotHeld(id json.RawMessage, taskID, caller string) rpcR
 	evictedCaller, wasEvicted := d.evicted[taskID]
 	since := d.servingSince
 	d.mu.Unlock()
-	data := a2aNotHeldData{Reason: a2aNotHeldSinceServing, ServingSince: since.UTC().Format(time.RFC3339), Resubmit: true}
+	data := a2aNotHeldData{Reason: a2aNotHeldSinceServing, ServingSince: since.UTC().Format(time.RFC3339Nano), MayHaveRun: true}
 	if wasEvicted && evictedCaller == caller {
 		data.Reason = a2aNotHeldEvicted
 		return rpcFail(id, a2aErrTaskNotFound, "no such task for this caller: "+taskID+
-			"; the door held it and has since evicted it to stay inside its bounds: resubmit it if it still needs doing", data)
+			"; the door held it and evicted it to stay inside its bounds, so its outcome is unknown here: "+
+			"it may have run or may still be running, and resubmitting starts it again", data)
 	}
 	return rpcFail(id, a2aErrTaskNotFound, "no such task for this caller: "+taskID+
 		"; the A2A door keeps tasks in the active gateway's memory only, and this gateway has served the door since "+
-		data.ServingSince+": a task submitted before then was lost to a gateway restart or failover and has to be resubmitted", data)
+		data.ServingSince+": a task submitted before then is unknown here and may have run or may still be running. "+
+		"Resubmitting starts it again, and a repeated messageId doesn't dedupe across a restart", data)
 }
 
 // CancelPublished records that a cancel reached the bus.

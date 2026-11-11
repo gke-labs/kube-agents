@@ -199,9 +199,10 @@ Process memory doesn't move, and the bus doesn't hold what nobody was subscribed
   blocks, the once-per-sender dropped-message notice, the Slack interaction state of a question
   someone was answering.
 - **Lost, functional:** an HTTP door's in-memory conversation. A client that submitted to the old
-  replica finds nothing on the new one. The A2A door says so: its not-found error carries
-  `reason: not-held-since-serving`, the new replica's `servingSince` and `resubmit: true`, and the
-  client resubmits (decided on #5633). Door state that survives a failover is part of the
+  replica finds nothing on the new one, though the task may have run or may still be running. The
+  A2A door says so: its not-found error carries `reason: not-held-since-serving`, the new replica's
+  `servingSince` and `mayHaveRun: true`, and a client that resubmits should expect possible
+  duplicate work, since the `messageId` dedupe doesn't survive either (decided on #5633). Door state that survives a failover is part of the
   multi-replica rebuild, #4206.
 
 ### Reaching the active replica over HTTP
@@ -386,7 +387,8 @@ door conversations in KV. Fenced writes (step 1) are the one piece phase one alr
 - **The relay's AckWait.** 30s bounds both how long a dead active replica's held events wait and
   how long the relay waits after a crash takeover. A shorter AckWait shortens both, at the cost of
   more in-progress acks per held event. Worth measuring after the build.
-- **The A2A door across a failover (answered).** The door says plainly that a failover ends its
-  in-flight requests: a task the new active replica doesn't hold is reported with a reason, when
-  that replica started serving, and `resubmit: true` (#5633). Moving the conversations to KV, so a
+- **The A2A door across a failover (answered).** The door says plainly that it lost track of a
+  task across a failover: a task the new active replica doesn't hold is reported with a reason,
+  when that replica started serving, and `mayHaveRun: true`, because the task may have finished
+  or may still be running (#5633). Moving the conversations to KV, so a
   client can poll the new active replica, is part of #4206.

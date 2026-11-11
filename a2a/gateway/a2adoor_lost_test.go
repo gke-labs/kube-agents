@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
@@ -26,22 +27,22 @@ func notHeldData(t *testing.T, resp rpcResponse) a2aNotHeldData {
 // A task accepted by one gateway and asked after on another, as after a
 // restart or a failover to the other replica: the new gateway holds no
 // record of it, and the error says so in data a client can act on, with
-// when this gateway started serving the door and that the task has to be
-// resubmitted. It keeps the protocol's task-not-found code, so a client
+// when this gateway started serving the door and that the task may have
+// run (its outcome is unknown here, so a resubmit may duplicate it). It keeps the protocol's task-not-found code, so a client
 // that reads only the code behaves as before.
-func TestATaskAskedAfterOnAFreshGatewayIsReportedLostToTheRestart(t *testing.T) {
+func TestATaskAskedAfterOnAFreshGatewayIsReportedUnknownHere(t *testing.T) {
 	before := startA2ARig(t)
 	task := taskOf(t, before.rpc(t, a2aTestCaller, a2aMethodSend, sendParams("survive this", "m-restart", "", false)))
 
-	start := time.Now().Add(-time.Second)
+	start := time.Now()
 	after := startA2ARig(t)
 	for _, method := range []string{a2aMethodGet, a2aMethodCancel} {
 		data := notHeldData(t, after.rpc(t, a2aTestCaller, method, map[string]any{"id": task.ID}))
-		if data.Reason != a2aNotHeldSinceServing || !data.Resubmit {
-			t.Errorf("%s: data = %+v, want reason %q and resubmit", method, data, a2aNotHeldSinceServing)
+		if data.Reason != a2aNotHeldSinceServing || !data.MayHaveRun {
+			t.Errorf("%s: data = %+v, want reason %q and mayHaveRun", method, data, a2aNotHeldSinceServing)
 		}
-		since, err := time.Parse(time.RFC3339, data.ServingSince)
-		if err != nil || since.Before(start.Truncate(time.Second)) {
+		since, err := time.Parse(time.RFC3339Nano, data.ServingSince)
+		if err != nil || since.Before(start) {
 			t.Errorf("%s: servingSince %q is not when the fresh gateway started serving (after %s)", method, data.ServingSince, start)
 		}
 	}
@@ -58,10 +59,15 @@ func TestATaskAskedAfterOnAFreshGatewayIsReportedLostToTheRestart(t *testing.T) 
 func TestANotHeldAnswerConfirmsNothingAboutAnotherCallersTask(t *testing.T) {
 	r := startA2ARig(t)
 	task := taskOf(t, r.rpc(t, a2aTestCaller, a2aMethodSend, sendParams("mine", "m-1", "", false)))
-	other := notHeldData(t, r.rpc(t, a2aTestOtherCaller, a2aMethodGet, map[string]any{"id": task.ID}))
-	unknown := notHeldData(t, r.rpc(t, a2aTestOtherCaller, a2aMethodGet, map[string]any{"id": "task-0000000000000000"}))
-	if other != unknown {
-		t.Errorf("another caller's task reads %+v, an unknown id %+v: the difference confirms the id", other, unknown)
+	const unknownID = "task-0000000000000000"
+	otherResp := r.rpc(t, a2aTestOtherCaller, a2aMethodGet, map[string]any{"id": task.ID})
+	unknownResp := r.rpc(t, a2aTestOtherCaller, a2aMethodGet, map[string]any{"id": unknownID})
+	other, unknown := notHeldData(t, otherResp), notHeldData(t, unknownResp)
+	if other.Reason != a2aNotHeldSinceServing || other != unknown {
+		t.Errorf("another caller's task reads %+v, an unknown id %+v: want both %q and alike", other, unknown, a2aNotHeldSinceServing)
+	}
+	if strings.ReplaceAll(otherResp.Error.Message, task.ID, "<id>") != strings.ReplaceAll(unknownResp.Error.Message, unknownID, "<id>") {
+		t.Errorf("the messages differ beyond the id:\n%s\n%s", otherResp.Error.Message, unknownResp.Error.Message)
 	}
 }
 
@@ -78,8 +84,8 @@ func TestAnEvictedTaskIsReportedEvictedToItsCallerAlone(t *testing.T) {
 	r.door.mu.Unlock()
 
 	own := notHeldData(t, r.rpc(t, a2aTestCaller, a2aMethodGet, map[string]any{"id": task.ID}))
-	if own.Reason != a2aNotHeldEvicted || !own.Resubmit {
-		t.Errorf("the owner's evicted task: data = %+v, want reason %q and resubmit", own, a2aNotHeldEvicted)
+	if own.Reason != a2aNotHeldEvicted || !own.MayHaveRun {
+		t.Errorf("the owner's evicted task: data = %+v, want reason %q and mayHaveRun", own, a2aNotHeldEvicted)
 	}
 	other := notHeldData(t, r.rpc(t, a2aTestOtherCaller, a2aMethodGet, map[string]any{"id": task.ID}))
 	if other.Reason != a2aNotHeldSinceServing {
