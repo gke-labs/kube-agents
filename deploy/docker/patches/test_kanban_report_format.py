@@ -242,7 +242,8 @@ class StanzaTest(unittest.TestCase):
         flat = " ".join(REPORT_FORMAT_STANZA.split())
         self.assertIn(
             "Decide by what the card asks: whether something is true (a yes-or-no or status question) gets the "
-            "answer, with no claims, sections or Sources list; why something broke gets the report. A closing "
+            "answer, with no claims, sections or Sources list unless the card asks for them; why something broke "
+            "gets the report. A closing "
             "request to report or summarize never turns a question into a report.",
             flat,
         )

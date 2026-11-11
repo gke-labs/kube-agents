@@ -148,8 +148,8 @@ written), and splits anything past 4000 characters across messages:
   600 characters in all, as short as the answer allows, with no table, no
   section and no list of the commands you ran. Decide by what the card asks:
   whether something is true (a yes-or-no or status question) gets the
-  answer, with no claims, sections or Sources list; why something broke gets
-  the report. A closing request to report or summarize never turns a
+  answer, with no claims, sections or Sources list unless the card asks for
+  them; why something broke gets the report. A closing request to report or summarize never turns a
   question into a report. This rule outranks the link,
   backtick and table rules below: name the cluster once, name only the pod or
   node that is not healthy, and count the rest. On a yes-or-no question or a
