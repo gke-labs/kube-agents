@@ -15,8 +15,8 @@ call. The work the model did was to notice there was no work.
 So the poll runs here instead — a ``no_agent`` script, a plain subprocess with
 no model attached — and the model is woken only for a repository that actually
 has something waiting, by filing a kanban card assigned to ``platform``. An
-idle tick costs a handful of ``gh`` calls — a few more once the pull-request
-sweep has open pull requests to read the comments of — and writes nothing at
+idle tick costs a handful of forge calls — a few more once the pull-request or
+Decision Memory sweeps have open proposals to inspect — and writes nothing at
 all. What it does not cost is a model turn, which is the whole point: API
 calls are cheap and a turn on an empty repository is not.
 
@@ -36,7 +36,7 @@ to stdout below is a fault report the relay posts to the room.
 
 One watcher, several sweeps
 ---------------------------
-Two cron jobs polling one repository through one credential is one cron job.
+Several sweeps polling one repository through one credential belong in one cron job.
 Sweeps are registered in ``SWEEPS`` and each runs inside its own ``try``, so a
 sweep that raises cannot take its siblings down with it — the isolation that
 separate jobs would have given for free, and the reason the ``except`` below is
@@ -63,8 +63,10 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -86,11 +88,19 @@ import script_log
 # Comma-separated sweep names. Unset means all of them.
 SWEEPS_ENV = "GITHUB_WATCHER_SWEEPS"
 
+# Whether proposed decisions and lessons open GitOps pull requests on
+# `platform-agent/memory/<ID>`. Defaults to True; set to "false"/"0"/"no"/"off"/"disabled"
+# on multi-cluster installations that share one GitOps repository or when humans
+# curate `knowledge/` externally and want runtime learnings kept in Hindsight.
+DECISION_MEMORY_GITOPS_PRS_ENV = "DECISION_MEMORY_GITOPS_PRS"
+_FALSEY_ENV_VALUES = frozenset({"0", "false", "no", "off", "disabled"})
+
 # Every card this job files goes to the privileged specialist: the Chat Agent's
 # toolsets are stripped to `mcp-router` + `kanban`, so it could not act on one.
 ASSIGNEE = "platform"
 # The origin each card is stamped with on the board (docs/designs/proposal-origin.md
-# §2.1): an issue card is `issue`, a pull-request follow-up card `scheduled`.
+# §2.1): an issue card is `issue`, a pull-request follow-up or Decision Memory
+# proposal card `scheduled`.
 # Passed to the board as a one-time stamp ticket minted for the create
 # (hermes_cli/kanban_origin.py), never as an argument of the create command.
 CARD_ORIGIN_ISSUE = "issue"
@@ -195,6 +205,49 @@ REPO_NAME_SEPARATOR = "/"
 # post twice: `{"owner/name#12": "GitHub didn't respond ..."}`.
 UNREADABLE_RECORD = Path("github-repo-watcher") / "unreadable-prs.json"
 WATCHER_LOG_FILE = "github_repo_watcher.log"
+
+# Decision Memory proposal sweep constants (declared above the first function per
+# .agents/rules/core_engineering.md).
+_PR_NUM_RE = re.compile(r"(?:/pull/|/-/merge_requests/|/pulls/|/pull-requests/|#)(\d+)")
+_PR_URL_REPO_RE = re.compile(
+    r"^(https?://[^/\s]+/\S+?)(?:/pull/|/-/merge_requests/|/pulls/|/pull-requests/)\d+"
+)
+DEFAULT_CURATOR_BIN = "/usr/local/bin/curator"
+CURATOR_PENDING_TIMEOUT_S = 10
+CURATOR_EMIT_TIMEOUT_S = 35
+PROPOSAL_LIST_LIMIT = 5
+PROPOSAL_COMMITS_LIMIT = 50
+MAX_REASON_CHARS = 500
+MEMORY_PR_TITLE_MAX = 120
+CARD_TITLE_MAX = 200
+DEFAULT_SOAK_WINDOW = "24h"
+MEMORY_BRANCH_PREFIX = "platform-agent/memory/"
+MIN_CODE_FENCE_TICKS = 4
+SOAK_WINDOWS_SECONDS = {
+    "10m": 10 * 60,
+    "24h": 24 * 3600,
+    "7d": 7 * 24 * 3600,
+}
+SOAK_CHECKPOINTS_SECONDS = (10 * 60, 24 * 3600, 7 * 24 * 3600)
+INTERCEPTED_EVENTS_PATH: Path | str = ""
+INTERCEPTED_EVENTS_PATH_ENV = "INTERCEPTED_EVENTS_PATH"
+SESSION_KV_URL = "http://127.0.0.1:8699"
+SESSION_KV_KEY_ENV = "SESSION_KV_API_KEY"
+SESSION_KV_EVENTS_PATH = "/v1/intercepted-events"
+SESSION_KV_EVENTS_LIMIT = 200
+SESSION_KV_EVENTS_TIMEOUT_S = 3.0
+_SITUATIONAL_CLOSE_RE = re.compile(
+    r"\b(?:"
+    r"closing\s+(?:stale|old|duplicate|superseded|obsolete)|"
+    r"stale\s+(?:pr|mr|branch|pull\s+request)|"
+    r"superseded\s+by|"
+    r"duplicate\s+of|"
+    r"change\s+freeze|code\s+freeze|holiday\s+freeze|"
+    r"merge\s+conflict|needs?\s+rebase|wrong\s+branch"
+    r")\b",
+    re.I,
+)
+_WRITE_ACCESS_INDETERMINATE = "indeterminate"
 
 
 @dataclass
@@ -942,9 +995,791 @@ def sweep_pr_comments(dry_run: bool = False) -> SweepResult:
     return SweepResult(cards=cards, warnings=warnings)
 
 
+# --------------------------------------------------------------------------
+# Sweep: Decision Memory proposals (PR creation, merge, and rejection)
+# --------------------------------------------------------------------------
+
+
+def _gitops_prs_enabled() -> bool:
+    raw = os.environ.get(DECISION_MEMORY_GITOPS_PRS_ENV, "").strip().lower()
+    if not raw:
+        return True
+    return raw not in _FALSEY_ENV_VALUES
+
+
+def _resolve_curator_bin() -> str:
+    configured = os.environ.get("CURATOR_BIN", "").strip()
+    if configured:
+        return configured
+    if os.path.isfile(DEFAULT_CURATOR_BIN) and os.access(DEFAULT_CURATOR_BIN, os.X_OK):
+        return DEFAULT_CURATOR_BIN
+    return shutil.which("curator") or ""
+
+
+def _parse_pr_number(pr_ref: str) -> int | None:
+    if not pr_ref:
+        return None
+    m = _PR_NUM_RE.search(str(pr_ref))
+    return int(m.group(1)) if m else None
+
+
+def _repo_from_pr_ref(pr_ref: str) -> str:
+    if not pr_ref:
+        return ""
+    m = _PR_URL_REPO_RE.match(str(pr_ref).strip())
+    return m.group(1) if m else ""
+
+
+def _resolve_record_repo(rec: dict, default_repo: str, managed: list[str]) -> str:
+    cand = str(rec.get("repo") or "").strip() or _repo_from_pr_ref(
+        str(rec.get("pull_request") or "")
+    )
+    if cand and managed:
+        qualified = gitops_workspace.qualify(cand, managed)
+        if qualified in managed:
+            return qualified
+        parsed = repo_ref.try_parse(cand)
+        if parsed and parsed.segments:
+            short = "/".join(parsed.segments)
+            for item in managed:
+                if item == short or item.endswith("/" + short):
+                    return item
+    if cand and not managed:
+        return cand
+    return default_repo
+
+
+def _markdown_fence(content: str) -> str:
+    longest = max((len(m.group(0)) for m in re.finditer(r"`+", content)), default=0)
+    return "`" * max(MIN_CODE_FENCE_TICKS, longest + 1)
+
+
+def _memory_pr_card(record: dict, repo: str, now: datetime | None = None) -> Card:
+    record_id = str(record.get("id") or "")
+    title = str(record.get("title") or f"Record {record_id}")
+    rel_path = str(record.get("path") or f"knowledge/decisions/{record_id}.md")
+    branch = str(record.get("branch") or f"{MEMORY_BRANCH_PREFIX}{record_id}")
+    pr_markdown = str(record.get("pr_markdown") or "").strip()
+    repo_flag = f" --repo {shlex.quote(repo)}" if repo else ""
+    raw_pr_title = f"docs(knowledge): record {record_id} ({title})"[:MEMORY_PR_TITLE_MAX]
+    raw_pr_body = (
+        f"Records {record_id} (`{rel_path}`) in Decision Memory with `status: active` upon merge."
+    )
+    fence = _markdown_fence(pr_markdown)
+    bucket = (now or datetime.now(timezone.utc)).strftime(CARD_BUCKET_FORMAT)
+    body = (
+        f"Curator synthesized **{record_id}** (`{rel_path}`) with `status: active` "
+        "in its frontmatter for team review.\n\n"
+        "Open the pull request on the GitOps repository using the **submit-suggestion** "
+        "skill (`/v1/vcs/*` + local `git` in the sandbox):\n\n"
+        "1. Prepare the workspace and read the `workspace` path:\n\n"
+        "```bash\n"
+        'python3 "$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py '
+        f"prepare{repo_flag} --branch {shlex.quote(branch)}\n"
+        "```\n\n"
+        f"2. Write the exact Markdown below to `<workspace>/{rel_path}` (creating parent "
+        "directories if needed).\n\n"
+        "3. Submit the pull request:\n\n"
+        "```bash\n"
+        'python3 "$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py '
+        f"submit{repo_flag} --branch {shlex.quote(branch)} "
+        f"--title {shlex.quote(raw_pr_title)} "
+        f"--body {shlex.quote(raw_pr_body)}\n"
+        "```\n\n"
+        f"### `{rel_path}`\n\n"
+        f"{fence}markdown\n{pr_markdown}\n{fence}\n"
+    )
+    return Card(
+        title=f"Open Decision Memory PR for {record_id}: {title}"[:CARD_TITLE_MAX],
+        body=body,
+        idempotency_key=(
+            f"memory-pr-{_slug(repo or 'default')}-{_key_part(record_id)}-{bucket}"
+        ),
+        origin=CARD_ORIGIN_SCHEDULED,
+    )
+
+
+def _comment_author_write_state(
+    comment: dict, provider: object = None, repo: str = ""
+) -> bool | None:
+    """True when collaborator write access is verified, False when denied, None when indeterminate."""
+    if not isinstance(comment, dict):
+        return False
+    if comment.get("bot") or comment.get("is_bot"):
+        return False
+    if "can_write" in comment:
+        if comment.get("can_write_known", True) is False:
+            return None
+        return comment.get("can_write") is True
+    author = str(comment.get("author") or "").strip()
+    if not author:
+        return False
+    if provider is not None and repo and hasattr(provider, "_has_write"):
+        access = provider._has_write(repo, author, bool(comment.get("bot")))
+        if access is None:
+            return None
+        return access is True
+    return False
+
+
+def _extract_reviewer_reason(
+    comments: list,
+    viewer: str,
+    *,
+    provider: object = None,
+    repo: str = "",
+) -> tuple[str, str | None]:
+    """Return ``(status, reason)`` where status is ``"ok"`` or ``_WRITE_ACCESS_INDETERMINATE``."""
+    viewer_key = forge.normalise_login(viewer) if viewer else ""
+    for comment in reversed(comments or []):
+        if not isinstance(comment, dict):
+            continue
+        author = str(comment.get("author") or "")
+        if viewer_key and forge.normalise_login(author) == viewer_key:
+            continue
+        text = str(comment.get("body") or "").strip()
+        if not text:
+            continue
+        write_state = _comment_author_write_state(comment, provider=provider, repo=repo)
+        if write_state is None:
+            return _WRITE_ACCESS_INDETERMINATE, None
+        if write_state is True:
+            return "ok", text[:MAX_REASON_CHARS]
+    return "ok", None
+
+
+def _is_situational_close_reason(reason: str | None) -> bool:
+    if not reason or not reason.strip():
+        return True
+    return bool(_SITUATIONAL_CLOSE_RE.search(reason))
+
+
+def _parse_iso_timestamp(raw: str) -> datetime | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _extract_rule_from_markdown(md: str) -> str:
+    for line in str(md or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("rule:"):
+            return stripped.split("rule:", 1)[1].strip().strip("\"'")
+    return ""
+
+
+def _extract_rule_from_diff(diff_text: str) -> str:
+    for line in str(diff_text or "").splitlines():
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        stripped = line[1:].strip()
+        if stripped.startswith("rule:"):
+            return stripped.split("rule:", 1)[1].strip().strip("\"'")
+    return ""
+
+
+def _detect_human_modification(
+    rec: dict,
+    prop: dict,
+    view_ans: dict,
+    viewer: str,
+    *,
+    provider: object = None,
+    repo: str = "",
+    pr_num: int | None = None,
+) -> dict | None:
+    """Detect whether a reviewer modified an agent PR before merging (`edit-before-merge`)."""
+    viewer_key = forge.normalise_login(viewer) if viewer else ""
+    initial_proposal = str(
+        rec.get("guard_rule")
+        or _extract_rule_from_markdown(str(rec.get("pr_markdown") or ""))
+        or rec.get("title")
+        or ""
+    ).strip()
+
+    edited_rule = str(prop.get("edited_guard_rule") or "").strip()
+    merged_md = str(prop.get("merged_markdown") or "").strip()
+    pr_md = str(rec.get("pr_markdown") or "").strip()
+    if not edited_rule and merged_md:
+        cand_rule = _extract_rule_from_markdown(merged_md)
+        if cand_rule and cand_rule != initial_proposal:
+            edited_rule = cand_rule
+
+    human_editor = ""
+    last_author = str(prop.get("last_commit_author") or "").strip()
+    head_sha = str(prop.get("head_sha") or prop.get("sourceRevision") or "").strip()
+    initial_sha = str(prop.get("initial_sha") or rec.get("initial_sha") or "").strip()
+    if last_author and (not viewer_key or forge.normalise_login(last_author) != viewer_key):
+        if initial_sha and head_sha and initial_sha != head_sha:
+            human_editor = last_author
+
+    commits = view_ans.get("commits") or prop.get("commits")
+    if commits is None and pr_num and repo:
+        try:
+            commits_ans = forge.call(
+                "proposal-commits",
+                {"number": pr_num, "limit": PROPOSAL_COMMITS_LIMIT},
+                repo,
+                retry_transient=True,
+            )
+            if isinstance(commits_ans, dict):
+                commits = commits_ans.get("commits")
+        except Exception:  # noqa: BLE001 — optional commit enrichment
+            commits = []
+
+    if not human_editor and isinstance(commits, list):
+        for c in reversed(commits):
+            if not isinstance(c, dict):
+                continue
+            if c.get("bot"):
+                continue
+            c_author = str(c.get("author") or "").strip()
+            if c_author and (not viewer_key or forge.normalise_login(c_author) != viewer_key):
+                human_editor = c_author
+                break
+
+    if (human_editor or (initial_sha and head_sha and initial_sha != head_sha)) and not edited_rule:
+        diff_text = str(view_ans.get("diff") or "")
+        if not diff_text and pr_num and repo:
+            try:
+                diff_ans = forge.call(
+                    "proposal-view",
+                    {"number": pr_num, "diff": True},
+                    repo,
+                    retry_transient=True,
+                )
+                if isinstance(diff_ans, dict):
+                    diff_text = str(diff_ans.get("diff") or "")
+            except Exception:  # noqa: BLE001 — optional diff enrichment
+                diff_text = ""
+        if diff_text:
+            cand_rule = _extract_rule_from_diff(diff_text)
+            if cand_rule and cand_rule != initial_proposal:
+                edited_rule = cand_rule
+
+    modified_flag = bool(
+        prop.get("modified_before_merge")
+        or edited_rule
+        or human_editor
+        or (merged_md and pr_md and merged_md != pr_md)
+    )
+    if not modified_flag:
+        return None
+
+    comments = view_ans.get("comments")
+    if not isinstance(comments, list):
+        comments = prop.get("comments") or []
+    reason = ""
+    if comments:
+        status_key, cand = _extract_reviewer_reason(
+            comments, viewer, provider=provider, repo=repo
+        )
+        if status_key == "ok" and cand:
+            reason = cand
+    if not reason:
+        editor_label = f" by {human_editor}" if human_editor else ""
+        if edited_rule:
+            reason = f"Reviewer modified proposal before merging{editor_label}: {edited_rule}"
+        else:
+            reason = f"Reviewer modified proposal before merging{editor_label}."
+
+    return {
+        "initial_proposal": initial_proposal,
+        "rule": edited_rule,
+        "reason": reason[:MAX_REASON_CHARS],
+    }
+
+
+def _load_intercepted_soak_events() -> list[dict]:
+    """Load recent cluster events from Session KV `/v1/intercepted-events` and optional local JSONL."""
+    collected: list[dict] = []
+    token = os.environ.get(SESSION_KV_KEY_ENV, "").strip()
+    if token:
+        url = f"{SESSION_KV_URL}{SESSION_KV_EVENTS_PATH}?limit={SESSION_KV_EVENTS_LIMIT}"
+        req = urllib.request.Request(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=SESSION_KV_EVENTS_TIMEOUT_S) as resp:
+                payload = json.loads(resp.read() or b"{}")
+                if isinstance(payload, dict) and isinstance(payload.get("events"), list):
+                    collected.extend(e for e in payload["events"] if isinstance(e, dict))
+        except Exception:  # noqa: BLE001 — best-effort loopback feed read
+            pass
+
+    events_path = str(
+        INTERCEPTED_EVENTS_PATH or os.environ.get(INTERCEPTED_EVENTS_PATH_ENV, "")
+    ).strip()
+    if events_path and Path(events_path).is_file():
+        try:
+            for line in Path(events_path).read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                ev = json.loads(line)
+                if isinstance(ev, dict):
+                    collected.append(ev)
+        except Exception:  # noqa: BLE001
+            pass
+    return collected
+
+
+def _event_matches_finding(ev: dict, finding_id: str) -> bool:
+    explicit = str(ev.get("finding_id") or "").strip()
+    if explicit and explicit == finding_id:
+        return True
+    ns = str(ev.get("namespace") or "").strip()
+    kind = str(ev.get("kind") or ev.get("object_kind") or "").strip()
+    name = str(ev.get("name") or ev.get("workload") or "").strip()
+    reason = str(ev.get("reason") or "").strip()
+    composed = f"{ns}/{kind}/{name}:{reason}"
+    return composed == finding_id or composed.casefold() == finding_id.casefold()
+
+
+def _evaluate_post_merge_soak(
+    rec: dict, prop: dict, view_ans: dict, *, now: datetime | None = None
+) -> tuple[str, str]:
+    """Evaluate post-merge soak checkpoints (`T+10m`, `T+24h`, `T+7d`) for a merged remediation PR.
+
+    Returns ``(state, reason)`` where ``state`` is one of:
+    - ``"soaking"``: merged recently (or merge timestamp unavailable); keep ``status:proposed``.
+    - ``"persists"``: failure recurred or GitOps sync degraded after merge (emit ``pr-merged-persists``).
+    - ``"resolved"``: soak window completed with healthy sync and zero recurrences (emit ``resolved-merged``).
+    """
+    post_status = str(
+        prop.get("post_merge_status") or rec.get("post_merge_status") or ""
+    ).strip().lower()
+    if post_status in ("persists", "pr-merged-persists", "failed"):
+        reason = str(
+            prop.get("persistence_reason")
+            or rec.get("reviewer_reason")
+            or "Finding recurred during post-merge soak verification."
+        ).strip()
+        return "persists", reason
+
+    sync_status = str(prop.get("sync_status") or rec.get("sync_status") or "").strip().lower()
+    if sync_status in ("degraded", "outofsync", "unhealthy"):
+        return (
+            "persists",
+            f"GitOps sync reported {sync_status} during post-merge soak verification.",
+        )
+
+    finding_id = str(rec.get("finding_id") or prop.get("finding_id") or "").strip()
+    merged_at = _parse_iso_timestamp(
+        str(
+            prop.get("merged_at")
+            or prop.get("closed")
+            or prop.get("updated")
+            or rec.get("merged_at")
+            or ""
+        )
+    )
+    if finding_id:
+        for ev in _load_intercepted_soak_events():
+            if not _event_matches_finding(ev, finding_id):
+                continue
+            ev_ts = _parse_iso_timestamp(str(ev.get("timestamp") or ev.get("at") or ""))
+            if merged_at is None or (ev_ts is not None and ev_ts > merged_at):
+                ev_reason = str(ev.get("message") or ev.get("reason") or "").strip()
+                suffix = f": {ev_reason}" if ev_reason else "."
+                return (
+                    "persists",
+                    f"Finding {finding_id} recurred in cluster events after PR merge{suffix}",
+                )
+
+    if merged_at is None:
+        return (
+            "soaking",
+            "Merge timestamp unavailable on proposal; holding in post-merge soak.",
+        )
+
+    soak_key = str(
+        rec.get("soak_window") or prop.get("soak_window") or DEFAULT_SOAK_WINDOW
+    ).strip().lower()
+    required_sec = SOAK_WINDOWS_SECONDS.get(soak_key, SOAK_WINDOWS_SECONDS[DEFAULT_SOAK_WINDOW])
+    cur_now = now or datetime.now(timezone.utc)
+    elapsed_sec = (cur_now - merged_at).total_seconds()
+    if elapsed_sec < required_sec:
+        next_cp = next(
+            (cp for cp in SOAK_CHECKPOINTS_SECONDS if cp > max(0.0, elapsed_sec)),
+            required_sec,
+        )
+        return (
+            "soaking",
+            f"Soaking post-merge ({int(max(0.0, elapsed_sec))}s / {required_sec}s; next checkpoint {next_cp}s).",
+        )
+
+    return (
+        "resolved",
+        f"Verified healthy across {soak_key} post-merge soak window.",
+    )
+
+
+def _run_curator_emit(curator_bin: str, args: list[str], rec_id: str) -> None:
+    """Invoke `curator emit ...` with bounded timeout, logging failures without aborting the sweep."""
+    cmd = [curator_bin, "emit", *args]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=CURATOR_EMIT_TIMEOUT_S,
+            check=False,
+        )
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()[:MAX_REASON_CHARS]
+            sys.stderr.write(f"github_scan_gate: curator emit for {rec_id} failed: {detail}\n")
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        sys.stderr.write(f"github_scan_gate: curator emit for {rec_id} did not complete: {exc}\n")
+
+
+def sweep_memory_proposals(
+    dry_run: bool = False, *, now: datetime | None = None
+) -> SweepResult:
+    """Reconcile ``status:proposed`` OKF records in Curator with GitOps PR states.
+
+    - If a proposed record has no PR open or closed on ``platform-agent/memory/<ID>``,
+      files an idempotent Kanban card for ``platform`` to open the PR via
+      ``submit-suggestion``.
+    - If a remediation lesson PR merged, verifies the post-merge soak checkpoints
+      (``T+10m``, ``T+24h``, ``T+7d``) before emitting ``resolved-merged`` (or
+      ``pr-merged-persists`` if the issue recurred).
+    - If a reviewer edited an agent PR before merging (``edit-before-merge``),
+      emits ``modified-merged`` with the human-corrected rule and superseded
+      initial proposal.
+    - If a decision PR merged unchanged, emits ``approved`` to Curator so
+      Hindsight updates ``okf:<repo>:<ID>`` in-place to ``status:active``.
+    - If the PR was closed unmerged (``state == "closed"``), emits ``refused``
+      with the reviewer's comment so Hindsight updates ``okf:<repo>:<ID>``
+      in-place to ``status:rejected`` (or holds when collaborator permission
+      is indeterminate).
+    """
+    curator_bin = _resolve_curator_bin()
+    if not curator_bin or not os.environ.get("NATS_URL", "").strip():
+        return SweepResult()
+
+    try:
+        proc = subprocess.run(
+            [curator_bin, "pending"],
+            capture_output=True,
+            text=True,
+            timeout=CURATOR_PENDING_TIMEOUT_S,
+            check=False,
+        )
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return SweepResult()
+        payload = json.loads(proc.stdout)
+    except Exception as exc:  # noqa: BLE001
+        sys.stderr.write(f"github_scan_gate: curator pending failed: {exc}\n")
+        return SweepResult()
+
+    records = payload.get("records") or []
+    if not records:
+        return SweepResult()
+
+    try:
+        managed = gitops_workspace.get_managed_repos()
+    except Exception as error:  # noqa: BLE001
+        return SweepResult(
+            warnings=[
+                _forge_warning(
+                    error
+                    if isinstance(error, forge.ForgeError)
+                    else forge.ForgeError("DISCOVERY_FAILED", str(error))
+                )
+            ]
+        )
+
+    default_repo = str(payload.get("repo") or "").strip()
+    if managed:
+        default_repo = (
+            gitops_workspace.qualify(default_repo, managed) if default_repo else managed[0]
+        )
+        if default_repo not in managed:
+            default_repo = managed[0]
+    if not default_repo and not managed:
+        return SweepResult()
+
+    provider = forge.BrokerProvider()
+    viewers_by_repo: dict[str, str] = {}
+
+    def _viewer_for(target_repo: str) -> str:
+        if target_repo not in viewers_by_repo:
+            try:
+                viewers_by_repo[target_repo] = provider.viewer_login(target_repo)
+            except Exception:  # noqa: BLE001
+                viewers_by_repo[target_repo] = ""
+        return viewers_by_repo[target_repo]
+
+    cards: list[Card] = []
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        rec_id = str(rec.get("id") or "").strip()
+        if not rec_id:
+            continue
+        repo = _resolve_record_repo(rec, default_repo, managed)
+        if not repo:
+            continue
+        viewer = _viewer_for(repo)
+        branch = str(rec.get("branch") or f"{MEMORY_BRANCH_PREFIX}{rec_id}").strip()
+        pr_ref = str(rec.get("pull_request") or "").strip()
+        pr_num = _parse_pr_number(pr_ref)
+
+        if pr_num is None:
+            if not _gitops_prs_enabled():
+                # Security invariant: when GitOps PR creation is disabled, records
+                # remain status:proposed (advisory warn) in Hindsight and are never
+                # auto-promoted to status:active without a merged knowledge/ PR.
+                continue
+            try:
+                ans = forge.call(
+                    "proposal-list",
+                    {"source": branch, "state": "all", "limit": PROPOSAL_LIST_LIMIT},
+                    repo,
+                    retry_transient=True,
+                )
+                proposals = ans.get("proposals") or []
+            except Exception as exc:  # noqa: BLE001
+                sys.stderr.write(f"github_scan_gate: proposal-list for {branch} failed: {exc}\n")
+                continue
+            if not proposals:
+                if rec.get("pr_markdown"):
+                    cards.append(_memory_pr_card(rec, repo, now=now))
+                continue
+            latest = proposals[0]
+            pr_num = int(latest.get("number") or 0) or None
+            pr_url = str(latest.get("url") or "").strip()
+            pr_ref = f"{pr_url} (#{pr_num})" if pr_url and pr_num else (pr_url or f"#{pr_num}")
+            if pr_num and not dry_run and latest.get("state") == "open":
+                _run_curator_emit(
+                    curator_bin,
+                    ["--kind", "proposed", "--id", rec_id, "--repo", repo, "--pr", pr_ref],
+                    rec_id,
+                )
+
+        if pr_num is None:
+            continue
+
+        try:
+            view_ans = forge.call(
+                "proposal-view",
+                {"number": pr_num, "comments": True},
+                repo,
+                retry_transient=True,
+            )
+            prop = view_ans.get("proposal") or {}
+        except Exception as exc:  # noqa: BLE001
+            sys.stderr.write(f"github_scan_gate: proposal-view #{pr_num} failed: {exc}\n")
+            continue
+
+        state = str(prop.get("state") or "").strip().lower()
+        pr_url = str(prop.get("url") or "").strip()
+        if pr_url:
+            pr_ref = f"{pr_url} (#{pr_num})"
+
+        if state == "merged":
+            already_soaked = str(rec.get("outcome") or "").strip().lower() in (
+                "resolved-merged",
+                "pr-merged-persists",
+                "modified-merged",
+            )
+            prop_source = str(
+                prop.get("source")
+                or prop.get("source_branch")
+                or prop.get("headRefName")
+                or ""
+            ).strip()
+            has_soak_signal = bool(
+                rec.get("finding_id")
+                or rec.get("soak_window")
+                or prop.get("soak_window")
+                or prop.get("post_merge_status")
+            )
+            is_knowledge_pr = bool(
+                prop.get("knowledge_pr")
+                or already_soaked
+                or (prop_source and prop_source == branch and not has_soak_signal)
+                or (
+                    not has_soak_signal
+                    and str(rec.get("type") or "").strip().lower() != "lesson"
+                    and not rec_id.startswith("LES-")
+                )
+            )
+            is_remediation_soak = not is_knowledge_pr and (
+                has_soak_signal
+                or str(rec.get("type") or "").strip().lower() == "lesson"
+                or rec_id.startswith("LES-")
+            )
+            if is_remediation_soak:
+                soak_state, soak_reason = _evaluate_post_merge_soak(
+                    rec, prop, view_ans, now=now
+                )
+                if soak_state == "soaking":
+                    if dry_run:
+                        sys.stderr.write(
+                            f"github_scan_gate: {rec_id} soaking after merge of {pr_ref}: {soak_reason}\n"
+                        )
+                    continue
+                if soak_state == "persists":
+                    if dry_run:
+                        sys.stderr.write(
+                            f"github_scan_gate: would emit pr-merged-persists for {rec_id} from {pr_ref}: {soak_reason}\n"
+                        )
+                        continue
+                    persists_args = [
+                        "--kind",
+                        "pr-merged-persists",
+                        "--id",
+                        rec_id,
+                        "--repo",
+                        repo,
+                        "--pr",
+                        pr_ref,
+                        "--reason",
+                        soak_reason,
+                    ]
+                    finding_id = str(rec.get("finding_id") or prop.get("finding_id") or "").strip()
+                    if finding_id:
+                        persists_args.extend(["--finding-id", finding_id])
+                    _run_curator_emit(curator_bin, persists_args, rec_id)
+                    continue
+
+            mod = _detect_human_modification(
+                rec, prop, view_ans, viewer, provider=provider, repo=repo, pr_num=pr_num
+            )
+            if mod is not None:
+                if dry_run:
+                    sys.stderr.write(
+                        f"github_scan_gate: would emit modified-merged for {rec_id} from {pr_ref}\n"
+                    )
+                    continue
+                mod_args = [
+                    "--kind",
+                    "modified-merged",
+                    "--id",
+                    rec_id,
+                    "--repo",
+                    repo,
+                    "--pr",
+                    pr_ref,
+                    "--reason",
+                    mod["reason"],
+                ]
+                if is_knowledge_pr:
+                    mod_args.append("--knowledge-pr")
+                if mod.get("initial_proposal"):
+                    mod_args.extend(["--initial-proposal", mod["initial_proposal"]])
+                if mod.get("rule"):
+                    mod_args.extend(["--rule", mod["rule"]])
+                _run_curator_emit(curator_bin, mod_args, rec_id)
+                continue
+
+            emit_kind = "resolved-merged" if is_remediation_soak else "approved"
+            if dry_run:
+                sys.stderr.write(
+                    f"github_scan_gate: would emit {emit_kind} for {rec_id} from merged {pr_ref}\n"
+                )
+                continue
+            emit_args = [
+                "--kind",
+                emit_kind,
+                "--id",
+                rec_id,
+                "--repo",
+                repo,
+                "--pr",
+                pr_ref,
+            ]
+            if is_knowledge_pr:
+                emit_args.append("--knowledge-pr")
+            if is_remediation_soak:
+                soak_key = str(
+                    rec.get("soak_window") or prop.get("soak_window") or DEFAULT_SOAK_WINDOW
+                ).strip()
+                emit_args.extend(["--soak-window", soak_key])
+                finding_id = str(rec.get("finding_id") or prop.get("finding_id") or "").strip()
+                if finding_id:
+                    emit_args.extend(["--finding-id", finding_id])
+            _run_curator_emit(curator_bin, emit_args, rec_id)
+        elif state == "closed":
+            if view_ans.get("commentsTruncated"):
+                sys.stderr.write(
+                    f"github_scan_gate: holding closed {repo}#{pr_num} ({rec_id}) — conversation truncated\n"
+                )
+                continue
+            comments = view_ans.get("comments")
+            if not isinstance(comments, list):
+                comments = prop.get("comments") or []
+            status_key, reason = _extract_reviewer_reason(
+                comments, viewer, provider=provider, repo=repo
+            )
+            if status_key == _WRITE_ACCESS_INDETERMINATE:
+                sys.stderr.write(
+                    f"github_scan_gate: holding closed {repo}#{pr_num} ({rec_id}) — write access indeterminate\n"
+                )
+                continue
+            if _is_situational_close_reason(reason):
+                # Administrative or uncommented closes (freeze, stale branch,
+                # merge conflict, or comments only from non-write users) retire
+                # the pending proposal rather than recording a policy rejection.
+                if dry_run:
+                    sys.stderr.write(
+                        f"github_scan_gate: would retire {rec_id} from situational/uncommented close {pr_ref}\n"
+                    )
+                    continue
+                retire_args = [
+                    "--kind",
+                    "retired",
+                    "--id",
+                    rec_id,
+                    "--repo",
+                    repo,
+                    "--pr",
+                    pr_ref,
+                ]
+                if reason:
+                    retire_args.extend(["--reason", reason])
+                _run_curator_emit(curator_bin, retire_args, rec_id)
+                continue
+            assert reason is not None
+            if dry_run:
+                sys.stderr.write(f"github_scan_gate: would refuse {rec_id} from closed {pr_ref}: {reason}\n")
+                continue
+            _run_curator_emit(
+                curator_bin,
+                [
+                    "--kind",
+                    "refused",
+                    "--id",
+                    rec_id,
+                    "--repo",
+                    repo,
+                    "--pr",
+                    pr_ref,
+                    "--reason",
+                    reason,
+                ],
+                rec_id,
+            )
+
+    return SweepResult(cards=cards)
+
+
 SWEEPS = {
     "issues": sweep_issues,
     "pr_comments": sweep_pr_comments,
+    "memory_proposals": sweep_memory_proposals,
 }
 
 # Insertion order is run order, so this is the registry read one way rather

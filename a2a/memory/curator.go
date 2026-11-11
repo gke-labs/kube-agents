@@ -503,7 +503,11 @@ func isOutcomeKind(k OutcomeKind) bool {
 }
 
 func gitopsPRsDisabled() bool {
-	return strings.EqualFold(strings.TrimSpace(os.Getenv("DECISION_MEMORY_GITOPS_PRS")), "false")
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("DECISION_MEMORY_GITOPS_PRS"))) {
+	case "0", "false", "no", "off", "disabled":
+		return true
+	}
+	return false
 }
 
 func isCrashRootCauseEvidence(ev OutcomeEvent) bool {
@@ -624,7 +628,7 @@ func (c *Curator) ProcessOutcome(ctx context.Context, ev OutcomeEvent, correlati
 		if ev.RecordID != "" {
 			if existing, ok := byID[ev.RecordID]; ok && (existing.Meta.Status == StatusProposed || existing.Meta.Status == StatusActive) {
 				prRef := formatPRRef(ev)
-				if prRef == "" || existing.Meta.Evidence.PullRequest == prRef {
+				if existing.Meta.Status == StatusActive || prRef == "" || existing.Meta.Evidence.PullRequest == prRef {
 					var branch, prMarkdown string
 					if existing.Meta.Status == StatusProposed {
 						branch = existing.ProposalBranch()

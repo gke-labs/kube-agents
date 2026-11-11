@@ -923,5 +923,82 @@ class RealBoardTest(unittest.TestCase):
         self.assertEqual([event[1] for event in kanban.events], ["pr_opened"])
 
 
+class CuratorLinkTest(unittest.TestCase):
+    """Best-effort Curator PR link notification on claimed OKF proposals."""
+
+    def test_links_short_and_dated_okf_ids_ignores_workload_prs_and_respects_deadline(self):
+        for title, expected_id in (
+            ("docs(knowledge): record DEC-2026-010 (Require ttl)", "DEC-2026-010"),
+            ("docs(knowledge): record LES-20260401-02-checkout-oom", "LES-20260401-02-checkout-oom"),
+        ):
+            calls = []
+            with mock.patch.dict(
+                os.environ,
+                {"NATS_URL": "nats://localhost:4222", "CURATOR_BIN": "/usr/local/bin/curator"},
+            ), mock.patch("subprocess.run", side_effect=lambda cmd, **kw: calls.append((cmd, kw))):
+                plugin._notify_curator_pr_opened(
+                    {
+                        "url": "https://github.com/acme/infra/pull/42",
+                        "number": 42,
+                        "title": title,
+                    },
+                    repo="acme/infra",
+                    deadline=plugin.time.monotonic() + 5.0,
+                )
+            self.assertEqual(len(calls), 1)
+            cmd, kw = calls[0]
+            self.assertIn(expected_id, cmd)
+            self.assertIn("--repo", cmd)
+            self.assertIn("acme/infra", cmd)
+            self.assertLessEqual(kw["timeout"], plugin.CURATOR_LINK_TIMEOUT_SECONDS)
+
+        # Ordinary workload PRs citing `per DEC-...` must NOT trigger `curator emit --kind proposed`.
+        with mock.patch.dict(
+            os.environ,
+            {"NATS_URL": "nats://localhost:4222", "CURATOR_BIN": "/usr/local/bin/curator"},
+        ), mock.patch("subprocess.run") as workload_mock:
+            plugin._notify_curator_pr_opened(
+                {
+                    "url": "https://github.com/acme/infra/pull/43",
+                    "number": 43,
+                    "title": "fix(checkout): set ttl-hours per DEC-2026-010",
+                },
+                repo="acme/infra",
+                deadline=plugin.time.monotonic() + 5.0,
+            )
+        workload_mock.assert_not_called()
+
+        # End-to-end `on_terminal_output` forwards `claim_repository(proposal)` into `--repo`.
+        broker = _Broker(title="docs(knowledge): record DEC-2026-010 (Require ttl)")
+        e2e_calls = []
+        with mock.patch.dict(
+            os.environ,
+            {"NATS_URL": "nats://localhost:4222", "CURATOR_BIN": "/usr/local/bin/curator"},
+            clear=True,
+        ), mock.patch.dict(sys.modules, {"forge": broker.module(), "kanban_origin": None}), \
+                mock.patch.object(plugin, "_session_kv_post", return_value={"recorded": True}), \
+                mock.patch("subprocess.run", side_effect=lambda cmd, **kw: e2e_calls.append(cmd)):
+            plugin.on_terminal_output(output=broker.line(repo="acme/infra"))
+        self.assertEqual(len(e2e_calls), 1)
+        self.assertIn("--repo", e2e_calls[0])
+        self.assertIn("acme/infra", e2e_calls[0])
+
+        # Tight deadline skips subprocess invocation so `HOOK_CALLBACK_SECONDS` is never exceeded.
+        with mock.patch.dict(
+            os.environ,
+            {"NATS_URL": "nats://localhost:4222", "CURATOR_BIN": "/usr/local/bin/curator"},
+        ), mock.patch("subprocess.run") as run_mock:
+            plugin._notify_curator_pr_opened(
+                {
+                    "url": "https://github.com/acme/infra/pull/42",
+                    "number": 42,
+                    "title": "docs(knowledge): record DEC-2026-010",
+                },
+                repo="acme/infra",
+                deadline=plugin.time.monotonic() + 0.01,
+            )
+        run_mock.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
