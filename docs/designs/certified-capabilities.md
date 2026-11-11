@@ -146,9 +146,10 @@ item with its cost.
 - **One tree.** The release's commit (the GA tag's parent: the candidate commit whose images the
   release promoted) supplies everything: the published images, the chart, the CRDs, the harness
   (`bench/`, `hack/ci-eval-pr.sh`) and the suite's cases. The job checks
-  the tree out at that commit, and the RC path in `hack/ci-deploy.sh` requires it. A release
-  whose tree has no suite case is skipped before any lease and reads "No run"; the record
-  names one commit. A release's cases grade the skills that release ships, so a certificate
+  the tree out at that commit, and the RC path in `hack/ci-deploy.sh` requires it. The job's
+  pre-lease guard reads the suite line (`suite: certification` in a task file at the release
+  commit; the retired roster file is its second test, for releases older than that line) and
+  skips a release that has neither, which reads "No run"; the record names one commit. A release's cases grade the skills that release ships, so a certificate
   never mixes `main`'s cases with an older release's skills.
 - **Repetitions.** 30 per build, two builds over two days, pooled into the release's 60-window
   (`EVAL_REPETITIONS=30`, `EVAL_TASK_PARALLELISM=1`: every scenario plants a stack, and the

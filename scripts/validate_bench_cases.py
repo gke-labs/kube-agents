@@ -1746,10 +1746,11 @@ def validate_case(
         problems.append(
             "is registered nowhere and never runs. Add it to "
             "hack/eval/nightly-cases.txt (where a new case lands; a presubmit "
-            "seat is earned on its record), or, if its fixture does not exist "
-            "yet, add a FIXTURE_NOT_READY entry in scripts/validate_bench_cases.py "
-            "naming the issue that plants it, or a reviewed KNOWN_UNREGISTERED "
-            "entry with the reason it must not run"
+            "seat is earned on its record), or, for a certification case, give "
+            "its task file the bare line 'suite: certification', or, if its "
+            "fixture does not exist yet, add a FIXTURE_NOT_READY entry in "
+            "scripts/validate_bench_cases.py naming the issue that plants it, or "
+            "a reviewed KNOWN_UNREGISTERED entry with the reason it must not run"
         )
 
     return problems
