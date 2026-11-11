@@ -168,6 +168,7 @@ readonly FOOTPRINT_TF_CLI_ARGS_EXTRA_VALUES_PATTERN='-var-file|-var[=[:space:]]+
 # terraform/examples/full-install/main.tf maps each to: tfvars key=chart value,
 # one pair per line.
 readonly FOOTPRINT_TFVARS_VALUE_MAP="platform_agent_storage_size=platformAgent.storage.size
+platform_agent_expected_cluster_profiles=platformAgent.storage.expectedClusterProfiles
 memory_provider=platformAgent.harness.memory.provider
 hermes_dashboard_enabled=platformAgent.harness.hermes.dashboardEnabled
 web_console_enabled=webConsole.enabled
@@ -955,6 +956,16 @@ is_valid_platform_agent_mode() {
 # takes. The CRD's spec.storage.size takes any quantity; this is the narrower
 # subset a disk is sized in. A number with more digits than the limit in Mi is
 # over it in every unit, which keeps the multiply inside Bash's int64.
+# PLATFORM_AGENT_EXPECTED_CLUSTERS: a whole number from 1 to 20000, what the
+# composition's platform_agent_expected_cluster_profiles validation and the CRD
+# take. Empty is valid and means unset.
+is_valid_platform_agent_expected_clusters() {
+  local value="$1"
+  [ -z "$value" ] && return 0
+  [[ "$value" =~ ^[1-9][0-9]{0,4}$ ]] || return 1
+  [ "$value" -le 20000 ]
+}
+
 is_valid_platform_agent_storage_size() {
   [[ "${1:-}" =~ ^[1-9][0-9]*(Mi|Gi|Ti)$ ]] || return 1
   local unit="${BASH_REMATCH[1]}" number mi_per_unit
@@ -2012,6 +2023,8 @@ load_install_env() {
   # grow both data claims for one run, and the next run from a clean shell
   # would drop the field again, leaving claims larger than the CR says.
   unset PLATFORM_AGENT_STORAGE_SIZE
+  # The expected cluster profile count, for the same reason.
+  unset PLATFORM_AGENT_EXPECTED_CLUSTERS
   # The GitOps forge keys too: an inherited GITOPS_FORGE=gitlab would render a
   # GitLab forge, and drop the GitHub alias and minter, for one run of an
   # install the file records as GitHub, and an inherited GITOPS_HOST would
@@ -5432,6 +5445,11 @@ write_tfvars_from_state() {
     print_error "PLATFORM_AGENT_STORAGE_SIZE='${platform_agent_storage_size}' is not a whole number of Mi, Gi or Ti above zero and at most 64Ti, for example 80Gi. Fix it in install.env, or on a first install, in the value this shell exports."
     return 1
   fi
+  local platform_agent_expected_clusters="${PLATFORM_AGENT_EXPECTED_CLUSTERS:-}"
+  if ! is_valid_platform_agent_expected_clusters "$platform_agent_expected_clusters"; then
+    print_error "PLATFORM_AGENT_EXPECTED_CLUSTERS='${platform_agent_expected_clusters}' is not a whole number from 1 to 20000, for example 200. Fix it in install.env, or on a first install, in the value this shell exports."
+    return 1
+  fi
   # Refused when the web console is on and the operator has accepted an
   # unconfined cluster: the web console holds the Platform Agent's API key with
   # no login of its own, and its deny-all-ingress NetworkPolicy is the only
@@ -5542,6 +5560,13 @@ write_tfvars_from_state() {
     echo "# The PlatformAgent's spec.storage.size (PLATFORM_AGENT_STORAGE_SIZE in"
     echo "# install.env). The composition passes the chart nothing for the default."
     echo "platform_agent_storage_size = $(hcl_str "$platform_agent_storage_size")"
+    if [ -n "$platform_agent_expected_clusters" ]; then
+      echo ""
+      echo "# The PlatformAgent's spec.storage.expectedClusterProfiles"
+      echo "# (PLATFORM_AGENT_EXPECTED_CLUSTERS in install.env): sizes the agent's data"
+      echo "# claim to 8Gi + 400Mi per profile, never below the size above."
+      echo "platform_agent_expected_cluster_profiles = ${platform_agent_expected_clusters}"
+    fi
     echo ""
     echo "# Gateway redaction (LITELLM_REDACTION_* in install.env). The composition"
     echo "# renders nothing into the chart while enabled is false."

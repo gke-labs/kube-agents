@@ -3405,12 +3405,30 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
          satMul/satAdd, as above: parseBytes clamps an oversized size to MaxInt64,
          and dataClaims times that would wrap the total negative. Both take a
          negative delta. */ -}}
-  {{- with (.Values.platformAgent.storage | default dict).size -}}
+  {{- $storageValues := .Values.platformAgent.storage | default dict -}}
+  {{- if or $storageValues.size $storageValues.expectedClusterProfiles -}}
     {{- if not (and (hasKey $storage "dataClaims") (hasKey $storage "dataClaimBytesRequest")) -}}
-      {{- fail "quota preflight: footprint.yaml has no dataClaims or dataClaimBytesRequest, so platformAgent.storage.size cannot be counted. Reinstall from an intact chart, or set quotaPreflight.enabled=false to skip the check." -}}
+      {{- fail "quota preflight: footprint.yaml has no dataClaims or dataClaimBytesRequest, so platformAgent.storage.size and platformAgent.storage.expectedClusterProfiles cannot be counted. Reinstall from an intact chart, or set quotaPreflight.enabled=false to skip the check." -}}
     {{- end -}}
-    {{- $dataClaimDelta := sub (include "kube-agents.parseBytes" . | int64) ($storage.dataClaimBytesRequest | int64) -}}
+    {{- $defaultBytes := $storage.dataClaimBytesRequest | int64 -}}
+    {{- $sizedBytes := $defaultBytes -}}
+    {{- with $storageValues.size -}}
+      {{- $sizedBytes = include "kube-agents.parseBytes" . | int64 -}}
+    {{- end -}}
+    {{- $dataClaimDelta := sub $sizedBytes $defaultBytes -}}
     {{- $reqStorage = include "kube-agents.satAdd" (dict "a" $reqStorage "b" (include "kube-agents.satMul" (dict "a" ($storage.dataClaims | int64) "b" $dataClaimDelta))) | int64 -}}
+    {{- /* expectedClusterProfiles raises the agent's claim alone, to at least base +
+           N x per-profile rounded up to whole GiB: the operator's dataVolumeBaseSize and
+           perClusterProfileStorage, which tests/test_chart_expected_cluster_profiles.py
+           pins equal to these. */ -}}
+    {{- with $storageValues.expectedClusterProfiles -}}
+      {{- $gib := 1073741824 -}}
+      {{- $need := add 8589934592 (mul (. | int64) 419430400) -}}
+      {{- $formula := mul (div (add $need (sub $gib 1)) $gib) $gib -}}
+      {{- if gt $formula $sizedBytes -}}
+        {{- $reqStorage = include "kube-agents.satAdd" (dict "a" $reqStorage "b" (sub $formula $sizedBytes)) | int64 -}}
+      {{- end -}}
+    {{- end -}}
   {{- end -}}
 {{- end -}}
 

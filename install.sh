@@ -359,6 +359,8 @@ bootstrap_install_env() {
   # grow both data claims for one run, and the next run from a clean shell
   # would drop the field again, leaving claims larger than the CR says.
   unset PLATFORM_AGENT_STORAGE_SIZE
+  # The expected cluster profile count, for the same reason.
+  unset PLATFORM_AGENT_EXPECTED_CLUSTERS
   # The GitOps forge keys likewise: an inherited GITOPS_FORGE=gitlab would
   # switch a recorded GitHub install's forge for this run. --gitops-forge is
   # the per-run way in.
@@ -2992,6 +2994,9 @@ bootstrap_install_env_file() {
   # as the lower default. Unset, later runs follow the default.
   if [ -n "${PLATFORM_AGENT_STORAGE_SIZE:-}" ]; then
     write_env_var "$tmp" PLATFORM_AGENT_STORAGE_SIZE "$PLATFORM_AGENT_STORAGE_SIZE"
+  fi
+  if [ -n "${PLATFORM_AGENT_EXPECTED_CLUSTERS:-}" ]; then
+    write_env_var "$tmp" PLATFORM_AGENT_EXPECTED_CLUSTERS "$PLATFORM_AGENT_EXPECTED_CLUSTERS"
   fi
   write_env_var "$tmp" MODEL_PROVIDER "${MODEL_PROVIDER:-}"
   write_env_var "$tmp" MODEL_DEFAULT_NAME "${MODEL_DEFAULT_NAME:-}"
