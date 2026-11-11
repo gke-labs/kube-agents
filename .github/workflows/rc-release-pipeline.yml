@@ -222,14 +222,13 @@ jobs:
       github_environment: "rc"
       commit_sha: ${{ needs.step-1-create-tag.outputs.commit_sha }}
       mode: "today"
-      # e2e-run.yml's default plus five minutes for the optional `slack`
-      # suite's wait. SiblingGatewayRolloutGatesTest holds the floor.
-      timeout_minutes: 100
       # The suites step 3 runs, split the same way, so the two legs' results
-      # read side by side. `gchat` fails this job; `rc` and `slack` are
-      # reported and tolerated, as they are on next.
+      # read side by side. `gchat` fails this job; `rc` is reported and
+      # tolerated, as it is on next. `slack` is next only: a scripted test
+      # user's post carries its app's bot_id, which only the A2A gateway's
+      # A2A_SLACK_TEST_USERS lets through, and today's Hermes path drops it.
       blocking_suite: "gchat"
-      optional_suites: "rc,slack"
+      optional_suites: "rc"
     secrets: inherit
 
   step-8-teardown-today-env:
