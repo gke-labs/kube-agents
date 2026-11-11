@@ -699,3 +699,103 @@ c.commit()
 		})
 	}
 }
+
+// A stop that lands while a console or A2A door turn holds for its cards
+// (#5407) ends the hold: the task goes canceled, and the bridge asks
+// session-kv to stop the session's cards (markSessionCanceled). The cancel
+// arrives as KindCancel on the task's .in, which is what the gateway sends
+// for a console or MCP typed stop and for an A2A door tasks/cancel. That
+// archive does not follow A2A_CARD_STOP (#4999 item 2): a stop of a turn
+// that holds for its cards always reaches them.
+func TestAPI_ACancelDuringTheInTurnCardWaitEndsTheTurnAndStopsItsCards(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 not on PATH; the kanban fixture needs it")
+	}
+	t.Setenv(slackUXEnv, "")
+	const shared = "pod-wide-activity-key"
+	for _, tc := range []struct{ name, conversation string }{
+		{"console", "console:tab-stop"},
+		{"a2a-door", "a2a:caller-1:ctx-stop"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			contextID := "ctx-stop-" + tc.name
+			sessionID := apiSessionID(contextID)
+			db := filepath.Join(t.TempDir(), "kanban.db")
+			initScript := `
+import sqlite3, sys, time
+db, sess = sys.argv[1], sys.argv[2]
+now = time.time()
+c = sqlite3.connect(db)
+c.executescript("""
+CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, status TEXT, assignee TEXT, creator_session_id TEXT,
+  result TEXT, last_failure_error TEXT, created_at REAL, updated_at REAL, parent_id TEXT);
+CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, summary TEXT, error TEXT, session_id TEXT, verdict TEXT, metadata TEXT);
+CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT);
+""")
+c.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?)",
+  ("t_stop1", "Scale checkout-gateway", "running", "platform-agent", sess, "", "", now, now, None))
+c.commit()
+`
+			if out, err := exec.Command("python3", "-c", initScript, db, sessionID).CombinedOutput(); err != nil {
+				t.Fatalf("init db: %v\n%s", err, out)
+			}
+			t.Setenv(hermesKanbanDBEnv, db)
+			_, url := startServer(t)
+			store := newRouteStore(t, http.StatusOK)
+			var door atomic.Value
+			stub := newAPIStub(t, func(w http.ResponseWriter, r *http.Request, c apiCall) {
+				u := door.Load().(string)
+				postDelivery(t, u, shared, c.sessionID, hookPreToolCall, kanbanCreateTool, "call_1")
+				postDelivery(t, u, shared, c.sessionID, hookPostToolCall, kanbanCreateTool, "call_1")
+				writeCompletion(w, c.sessionID, "Filed a card to scale checkout-gateway.")
+			})
+			b := startAPIBridge(t, url, stub, func(cfg *Config) {
+				cfg.ActivityListen = "127.0.0.1:0"
+				cfg.ActivitySecret = shared
+				cfg.RouteURL, cfg.RouteKey = store.srv.URL, "kv-key"
+			})
+			door.Store(b.ActivityURL())
+			c := gatewayClient(t, url)
+			taskID := "task-stop-" + tc.name
+			origin := submitFromEnv(t, c, taskID, contextID, tc.conversation, "scale checkout-gateway to 4")
+
+			// The turn holds: its card is still running.
+			time.Sleep(3 * time.Second)
+			held, err := c.TasksGet(testCtx(t), "platform", taskID)
+			if err != nil {
+				t.Fatalf("read the held task: %v", err)
+			}
+			if held.Final {
+				t.Fatalf("the %s turn ended before the stop: %+v", tc.name, held.State)
+			}
+
+			cancelEnv, err := lib.NewCancelEnvelope(gatewayParty, origin.TaskID, origin.ContextID,
+				origin.CorrelationID, lib.WithTo(lib.Party{Session: "platform"}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := c.Publish(testCtx(t), lib.TaskInSubject("platform", taskID), cancelEnv); err != nil {
+				t.Fatal(err)
+			}
+			task := waitTerminalFor(t, c, taskID, 10*time.Second)
+			if task.State != lib.StateCanceled {
+				t.Fatalf("state = %s, want canceled: a stop during the card wait ends the turn", task.State)
+			}
+
+			wantPath := "POST " + strings.Replace(cardStopPathFormat, "%s", sessionID, 1)
+			var stop *routePut
+			waitFor(t, 5*time.Second, "the session's card stop at session-kv", func() bool {
+				for _, p := range store.seen() {
+					if p.path == wantPath {
+						stop = &p
+						return true
+					}
+				}
+				return false
+			})
+			if stop.auth != "Bearer kv-key" {
+				t.Fatalf("card stop auth = %q, want the route key", stop.auth)
+			}
+		})
+	}
+}

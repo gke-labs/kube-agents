@@ -329,6 +329,10 @@ func (b *Bridge) stopSessionCards(sessionID string) {
 	if sessionID == "" || b.cfg.RouteURL == "" || b.closing.Load() {
 		return
 	}
+	logger := b.cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
 	route := b.recordedRoute(sessionID)
 	contextID := strings.TrimSpace(route.ContextID)
 	conversation := strings.TrimSpace(route.Conversation)
@@ -382,10 +386,29 @@ func (b *Bridge) stopSessionCards(sessionID string) {
 	}
 	resp, err := client.Do(req)
 	if err != nil {
+		logger.Warn("cancel's card stop did not reach session-kv", "session", sessionID, "err", err)
 		return
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, cardStopResponseCap))
+	data, err := io.ReadAll(io.LimitReader(resp.Body, cardStopResponseCap+1))
+	if err != nil {
+		logger.Warn("cancel's card stop: reading session-kv's answer failed", "session", sessionID, "err", err)
+		return
+	}
+	if resp.StatusCode != http.StatusOK {
+		logger.Warn("cancel's card stop refused by session-kv", "session", sessionID,
+			"status", resp.StatusCode, "body", strings.TrimSpace(tail(string(data), routeErrorTailBytes)))
+		return
+	}
+	var answer cardStopResponse
+	if len(data) > cardStopResponseCap || json.Unmarshal(data, &answer) != nil {
+		logger.Warn("cancel's card stop: session-kv's answer is unreadable", "session", sessionID, "bytes", len(data))
+		return
+	}
+	// The cancel's terminal is already written; the answer goes to the log,
+	// where a card a worker may still start for (unresolved) or an archive
+	// still running (pending) is visible to whoever reads the stop.
+	b.logCardStopAnswer("cancel's cards stopped", "", sessionID, &answer)
 }
 
 func (b *Bridge) rememberConsoleSession(sessionID string, origin *lib.Envelope) {

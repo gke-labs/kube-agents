@@ -3,6 +3,7 @@ package hermesbridge
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -185,6 +186,76 @@ func TestCancelSessionCards_CallsSessionKVCardStopEndpoint(t *testing.T) {
 	}
 	if gotReq.ContextID != "ctx-1" || gotReq.Conversation != "console:conv-1" {
 		t.Errorf("cardStopRequest = %+v, want ContextID=ctx-1 Conversation=console:conv-1", gotReq)
+	}
+}
+
+// A cancel's own card stop (markSessionCanceled) reads session-kv's answer
+// and logs it, as the card-stop control does (#5407): a card stopped
+// mid-claim, an archive still running at the deadline, a card it could not
+// stop, and a refusal all reach the log rather than being dropped.
+func TestCancelSessionCards_LogsSessionKVsAnswer(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+		want   []string
+	}{
+		{
+			name:   "caveats",
+			status: http.StatusOK,
+			body: `{"session_id":"a2a-ctx-1","stopped":[{"id":"t_a","title":"A","prior_status":"running"}],` +
+				`"failed":[{"id":"t_f","title":"F","error":"board locked"}],` +
+				`"pending":[{"id":"t_p","title":"P"}],"unresolved":[{"id":"t_u","title":"U"}]}`,
+			want: []string{
+				`msg="cancel's cards stopped"`, "stopped=1", "failed=1", "pending=1", "unresolved=1",
+				`msg="card not stopped"`, "card=t_f", `err="board locked"`,
+				`msg="card's archive still running at session-kv's deadline"`, "card=t_p",
+				`msg="card stopped mid-claim; a worker may still start for it"`, "card=t_u",
+			},
+		},
+		{
+			name:   "refused",
+			status: http.StatusServiceUnavailable,
+			body:   `{"detail":"board unavailable"}`,
+			want:   []string{`msg="cancel's card stop refused by session-kv"`, "status=503", "board unavailable"},
+		},
+		{
+			name:   "unreadable",
+			status: http.StatusOK,
+			body:   `not json`,
+			want:   []string{`msg="cancel's card stop: session-kv's answer is unreadable"`},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			done := make(chan struct{})
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+			var logs lockedBuffer
+			b := &Bridge{
+				cfg: Config{
+					RouteURL:        srv.URL,
+					RouteKey:        "session-kv-token",
+					CardStopTimeout: 5 * time.Second,
+					Logger:          slog.New(slog.NewTextHandler(&logs, nil)),
+				},
+				routeClient: srv.Client(),
+			}
+			go func() { b.stopSessionCards("a2a-ctx-1"); close(done) }()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("stopSessionCards did not return")
+			}
+			got := logs.String()
+			for _, w := range tc.want {
+				if !strings.Contains(got, w) {
+					t.Errorf("log lacks %q:\n%s", w, got)
+				}
+			}
+		})
 	}
 }
 

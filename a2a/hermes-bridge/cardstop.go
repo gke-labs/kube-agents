@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -204,26 +205,39 @@ func (b *Bridge) runCardStop(ctx context.Context, run *taskRun) {
 		b.finalizeCardStopError(run, err)
 		return
 	}
-	b.cfg.Logger.Info("cards stopped", "task", taskID, "session", sessionID, "stopped", len(resp.Stopped),
-		"settled", len(resp.Settled), "failed", len(resp.Failed), "pending", len(resp.Pending),
-		"unresolved", len(resp.Unresolved), "truncated", resp.Truncated, "deadline", resp.Deadline)
-	for _, f := range resp.Failed {
-		b.cfg.Logger.Warn("card not stopped", "task", taskID, "session", sessionID, "card", f.ID, "err", f.Error)
-	}
-	for _, c := range resp.Pending {
-		b.cfg.Logger.Warn("card's archive still running at session-kv's deadline", "task", taskID, "session", sessionID, "card", c.ID)
-	}
-	for _, c := range resp.Unresolved {
-		b.cfg.Logger.Warn("card stopped mid-claim; a worker may still start for it", "task", taskID, "session", sessionID, "card", c.ID)
-	}
-	for _, e := range resp.Errors {
-		b.cfg.Logger.Warn("session-kv board error during the card stop", "task", taskID, "session", sessionID, "err", e)
-	}
+	b.logCardStopAnswer("cards stopped", taskID, sessionID, resp)
 	// The result rides the last result chunk beside the text. A bus that
 	// refuses the two together gets the text alone (publishChunks), so a
 	// completed control can arrive with no cardStop part; the gateway must
 	// read that as a stop whose details are lost, not as nothing stopped.
 	b.finalizeData(run, lib.StateCompleted, "", cardStopText(resp), part.Data)
+}
+
+// logCardStopAnswer logs session-kv's answer to a card stop: the counts,
+// and each card it could not stop, or stopped with a caveat. The card-stop
+// control (runCardStop) and a cancel's own archive (stopSessionCards) log the
+// same way, so a stopped card a worker may still start for is in the log
+// whichever path stopped it.
+func (b *Bridge) logCardStopAnswer(msg, taskID, sessionID string, resp *cardStopResponse) {
+	logger := b.cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	logger.Info(msg, "task", taskID, "session", sessionID, "stopped", len(resp.Stopped),
+		"settled", len(resp.Settled), "failed", len(resp.Failed), "pending", len(resp.Pending),
+		"unresolved", len(resp.Unresolved), "truncated", resp.Truncated, "deadline", resp.Deadline)
+	for _, f := range resp.Failed {
+		logger.Warn("card not stopped", "task", taskID, "session", sessionID, "card", f.ID, "err", f.Error)
+	}
+	for _, c := range resp.Pending {
+		logger.Warn("card's archive still running at session-kv's deadline", "task", taskID, "session", sessionID, "card", c.ID)
+	}
+	for _, c := range resp.Unresolved {
+		logger.Warn("card stopped mid-claim; a worker may still start for it", "task", taskID, "session", sessionID, "card", c.ID)
+	}
+	for _, e := range resp.Errors {
+		logger.Warn("session-kv board error during the card stop", "task", taskID, "session", sessionID, "err", e)
+	}
 }
 
 // finalizeCardStopError ends a card stop that did not get its answer: the
