@@ -101,6 +101,47 @@ func TestResolveProfile(t *testing.T) {
 	}
 }
 
+func TestCheckDeclaredParameters(t *testing.T) {
+	withNamespace := append(append([]lib.ProfileParameter(nil), clusterParams...), lib.ProfileParameter{Name: "namespace"})
+	cases := []struct {
+		name        string
+		card        lib.AgentCard
+		params      map[string]string
+		wantRefusal string
+	}{
+		{name: "every required one", card: lib.AgentCard{Parameters: clusterParams}, params: targetParams("p1", "us-east1", "dev")},
+		{name: "an optional one too", card: lib.AgentCard{Parameters: withNamespace},
+			params: map[string]string{"project": "p1", "location": "us-east1", "cluster": "dev", "namespace": "web"}},
+		{name: "an optional one left out", card: lib.AgentCard{Parameters: withNamespace}, params: targetParams("p1", "us-east1", "dev")},
+		{name: "an undeclared name", card: lib.AgentCard{Parameters: clusterParams},
+			params:      map[string]string{"project": "p1", "location": "us-east1", "cluster": "dev", "namespace": "web"},
+			wantRefusal: `p doesn't take parameter "namespace"; it takes project (required), location (required), cluster (required)`},
+		{name: "a required one left out", card: lib.AgentCard{Parameters: withNamespace},
+			params:      map[string]string{"project": "p1", "location": "us-east1", "namespace": "web"},
+			wantRefusal: "p needs parameter cluster; it takes project (required), location (required), cluster (required), namespace"},
+		{name: "a profile that declares none", card: lib.AgentCard{}, params: map[string]string{"namespace": "web"},
+			wantRefusal: `p doesn't take parameter "namespace"; it takes none`},
+		{name: "none to a profile that declares none", card: lib.AgentCard{}},
+		{name: "a pinned profile takes its own target undeclared",
+			card:   lib.AgentCard{ClusterRef: &lib.ClusterRef{ProjectID: "p1", Location: "us-east1", Cluster: "prod"}},
+			params: targetParams("p1", "us-east1", "prod")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := checkDeclaredParameters("p", tc.card, tc.params)
+			if tc.wantRefusal == "" {
+				if err != nil {
+					t.Fatalf("refused: %v", err)
+				}
+				return
+			}
+			if got := refusalOf(t, err); got != tc.wantRefusal {
+				t.Fatalf("refusal = %q, want %q", got, tc.wantRefusal)
+			}
+		})
+	}
+}
+
 func TestResolveProfile_TwoProfilesPinnedToOneClusterIsRefused(t *testing.T) {
 	d := testDirectory()
 	d.put("prod-east-2", &lib.AgentCard{Name: "prod-east-2", Parameters: clusterParams,

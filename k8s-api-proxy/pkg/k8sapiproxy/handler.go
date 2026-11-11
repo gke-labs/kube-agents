@@ -54,6 +54,9 @@ type Config struct {
 	TracerProvider trace.TracerProvider
 	// Cache configures HTTP response caching and in-flight request coalescing; disabled when nil.
 	Cache *CacheConfig
+	// Exclusions refuses every request to a cluster spec.scope.exclude.clusters names,
+	// before policy, cache or upstream; nil excludes nothing.
+	Exclusions *Exclusions
 	// MaxInFlight caps the forwarded requests in flight; one over it is answered 429 with
 	// Retry-After. Each in-flight response holds upstream buffers in the proxy, so the cap
 	// bounds its memory. Watches and long-running subresources do not count. Zero is no cap.
@@ -65,6 +68,7 @@ type auditEventKey struct{}
 
 type handler struct {
 	authenticator  CallerAuthenticator
+	exclusions     *Exclusions
 	policy         Policy
 	audit          AuditSink
 	metrics        *Metrics
@@ -127,6 +131,7 @@ func NewHandler(cfg Config) (http.Handler, error) {
 	}
 	return &handler{
 		authenticator:  cfg.Authenticator,
+		exclusions:     cfg.Exclusions,
 		policy:         cfg.Policy,
 		audit:          audit,
 		metrics:        metrics,
@@ -267,6 +272,12 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request, ev *AuditEvent, 
 		return
 	}
 	ev.ClusterID, ev.Path = clusterID, apiPath
+	// Before anything reads the request or a cached answer: an excluded cluster's API is
+	// never reached, whatever the request asks of it.
+	if perr := h.exclusions.check(clusterID); perr != nil {
+		refuse(w, ev, perr)
+		return
+	}
 
 	out := r.Clone(r.Context())
 	out.URL.Path = apiPath

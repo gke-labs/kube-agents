@@ -1291,6 +1291,13 @@ starts from, and the operator checks the quota itself before each later promotio
 though note that if a namespace ResourceQuota restricts that compute resource (such as
 `limits.cpu` or `limits.memory`), Kubernetes quota admission requires every container to
 declare it (or a `LimitRange` to default it), and will reject the pod if omitted.
+The credential broker's exec tier is counted as `platformAgent.deployment.credentialProxy.exec.replicas`
+times one replica's footprint (`operatorRenderedPerReplica.credentialProxyExecTier`), and not at
+all at `0`. An ephemeral-storage key in `platformAgent.deployment.credentialProxy.resources`
+moves each replica too, because the operator gives the tier the broker's other resource keys; its
+cpu and memory are fixed. It needs no surge headroom: it rolls with `maxSurge: 0` and `maxUnavailable: 1`, so a
+rollout replaces a pod in place and adds none. The check counts the
+quota only; whether a node has room for each 2 CPU replica is the scheduler's.
 The two data claims are counted at `platformAgent.storage.size` when it is set: footprint.yaml
 records how many claims follow it (`dataClaims`) and their default size, and each one moves by
 the difference, so a raise of 30Gi adds 60Gi to `requests.storage`.
@@ -1610,8 +1617,9 @@ helm uninstall kube-agents -n kubeagents-system
   holds its size, its one-at-a-time count and its scope fields to the operator.
 - `files/footprint.yaml` is generated too, but from a different source: it is summed from
   the operator's **golden manifests**
-  (`k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml`, and
-  `platformagent-next.yaml` for its `nextMode` section),
+  (`k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml`,
+  `platformagent-next.yaml` for its `nextMode` section, and
+  `platformagent-exec-1.yaml` for the exec tier's per-replica entry),
   not from `k8s-operator/config/` and not from a live render. Changing the operator's
   resources therefore takes two steps in order — re-bless the goldens
   (`cd k8s-operator && go test ./internal/testing/... -update`), then `make chart-sync`.

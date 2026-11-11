@@ -1125,18 +1125,29 @@ spec:
   cluster name is unique only within a project and location. This replaces the
   `RECONCILE_EXCLUDE` environment variable, which matched bare names across every project and keeps
   working for one release alongside it. An excluded cluster gets no Cluster Agent, and fleet answers,
-  the onboarding sweep and the fleet-audit collectors that list clusters leave it out. Still covering
-  it: the daily upgrade-readiness watch and the Saturday `upgrade-readiness-weekly-review`, whose reports enumerate by project (the review's findings on such a cluster reach the findings queue and the weekly brief); the networking audit's
-  subnet usage, since its pods still hold their IPs; the GCE audit's instance listing; and the
-  third-party `gke` MCP server's `list_clusters`.
+  the onboarding sweep and the fleet-audit collectors that list clusters leave it out.
 
-  Excluding a cluster narrows what the agents look at, but it is not yet enforced. The credential
-  proxy still issues a kubeconfig for an excluded cluster. So a worker that fetches the cluster's
-  credentials itself (`gcloud container clusters get-credentials`), or names it as a `kubectl`
-  context, can still read it with the agent's read roles. Those are granted per project or inherited
-  from a declared folder or organization, and reach every cluster beneath. Only a project where the
-  agent holds no roles, bound there or inherited, keeps the agent off a cluster. A cluster in the
-  management project can't be fenced off this way yet, since that project always holds the roles.
+  The credential broker and `kube-proxy` refuse every route to an excluded cluster's Kubernetes
+  API, for every caller, the agents' own commands included. That covers a kubeconfig the broker mints or uses, `gcloud container clusters get-credentials`, `kubectl` through `kube-proxy`,
+  the watchers' cluster relay and the `gke` MCP server's in-cluster tools, each refused as `scope.excluded-cluster`. While any cluster is excluded, a target that names its project by
+  number is refused too, and so is an in-cluster MCP call whose cluster the broker can't read.
+  Spell entries by project ID: an entry spelled by project number refuses its location and cluster
+  name in every project. A broker or `kube-proxy` that can't read the scope it was given reaches no
+  cluster until it can (`scope.exclude-unreadable`).
+
+  Reads of the GKE control plane stay allowed: the project's cluster list and a cluster's
+  describe. Exclusion keeps the agents out of a cluster's API and workloads, not out of the
+  project's cluster list. These still cover an excluded cluster, through those reads only:
+  - the daily upgrade-readiness watch and the Saturday `upgrade-readiness-weekly-review`, which
+    grade its versions and skip their in-cluster readiness rules;
+  - the networking audit's subnet usage, since its pods still hold their IPs;
+  - the GCE audit's instance listing;
+  - the third-party `gke` MCP server's `list_clusters`.
+
+  The upgrade-readiness watch used to read inside an excluded cluster too. It no longer does,
+  because the broker can't tell its reads from an agent's. The broker enforces the exclusion, not
+  IAM: the agent's read roles still reach the cluster. Only a project where the agent holds no
+  roles, bound there or inherited from a folder or organization, fences the service account off.
 
 ### Project outcomes
 
