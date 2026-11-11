@@ -125,7 +125,10 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 # digest's nightly section (scripts/eval_dashboard/nightly_digest.py) reads
 # the issues it filed that tick. Armed, it counts the ticks it held for an
 # untrusted issue listing in nightly-bugs-state.json beside health.json, and
-# the digest says so once the hold has lasted about two hours. The section
+# the digest says so once the hold has lasted about two hours. With
+# NIGHTLY_TRIAGE_LIVE `true` as well, it files domain and group bugs for the
+# nightly-triage job below to assign, which comments on them in the issues
+# repository (docs/ci-health.md, "Nightly triage"). The section
 # turns owners' GitHub logins into Chat mentions through the
 # CI_HEALTH_CHAT_MENTIONS secret (a JSON object, login -> Chat user id);
 # without it the logins print as text.
@@ -168,13 +171,17 @@ on:
     # The seeded-fleet scan (header). The :00 firing of the tick's cron is a
     # separate run; the job guards below keep the two apart.
     - cron: "0 * * * *"
-  #checkov:skip=CKV_GHA_7:One boolean, fixture_state_scan, which decides whether a manual run also scans the fleet; nothing is built and no input reaches a shell
+  #checkov:skip=CKV_GHA_7:Two inputs: fixture_state_scan, a boolean deciding whether a manual run also scans the fleet, and triage_issues, issue numbers for a dry run of the nightly triage, which reaches the shell through env and is refused unless it is digits and spaces; nothing is built
   workflow_dispatch:
     inputs:
       fixture_state_scan:
         description: "Also run the hourly scans (seeded-fleet fixture state and pool-project state)"
         type: boolean
         default: false
+      triage_issues:
+        description: "Dry-run the nightly triage on these issue numbers of the issues repository (space-separated); prints its verdicts, writes nothing"
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -205,6 +212,14 @@ env:
   # The nightly bug filer's arming switch (header): anything but `true` is a
   # dry run.
   NIGHTLY_BUGS_LIVE: ${{ vars.NIGHTLY_BUGS_LIVE || 'false' }}
+  # The nightly triage's arming switch (the nightly-triage job below,
+  # docs/ci-health.md "Nightly triage"): anything but `true` leaves the filer
+  # assigning as before and the triage in dry run. Its model and the project
+  # the model call is billed to (which must grant CI_HEALTH_SA
+  # roles/aiplatform.user); repository variables override both.
+  NIGHTLY_TRIAGE_LIVE: ${{ vars.NIGHTLY_TRIAGE_LIVE || 'false' }}
+  NIGHTLY_TRIAGE_MODEL: ${{ vars.NIGHTLY_TRIAGE_MODEL || 'gemini-4-argon' }}
+  NIGHTLY_TRIAGE_PROJECT: ${{ vars.NIGHTLY_TRIAGE_PROJECT || 'kube-agents-prow' }}
   # collect.py's inputs, the same values hack/ci-dashboard-refresh.sh uses:
   # the smoke-test presubmit's archive, the nightly periodic's log prefix
   # (its own bucket, gs://kube-agents-evals-nightly-logs, since the nightly's
@@ -324,6 +339,9 @@ jobs:
       id-token: write
       issues: write
       pull-requests: write
+    # The issues the bug filer filed this tick, for the triage job's dry run.
+    outputs:
+      filed: ${{ steps.nightly_bugs.outputs.filed }}
     steps:
       # The job's wall clock, for the store read's budget below: first, so
       # the full-history checkout and the tool setups count against it
@@ -836,6 +854,7 @@ jobs:
       # the issues this tick filed. Best-effort like the comment step: never
       # reds the run.
       - name: File bugs for persistent nightly failures (dry run unless armed)
+        id: nightly_bugs
         continue-on-error: true
         # Bounded, so a slow GitHub cannot run the job into its timeout and
         # cancel the post after it (JOB_TAIL_S budgets this step too).
@@ -849,7 +868,27 @@ jobs:
           if [ "$NIGHTLY_BUGS_LIVE" = "true" ] && [ "$CI_HEALTH_MUTE" != "true" ]; then mode=--live; fi
           # --state counts the live ticks held on an untrusted issue listing,
           # for the digest's held-filing line (post step, --bugs-state).
-          python3 scripts/eval_dashboard/nightly_bugs.py --data work/data.json --state "$DASHBOARD_BUCKET/nightly-bugs-state.json" "$mode"
+          # Armed triage: domain and group bugs are filed for the
+          # nightly-triage job to assign (--triage-pending), not to a person.
+          triage=()
+          if [ "$mode" = "--live" ] && [ "$NIGHTLY_TRIAGE_LIVE" = "true" ]; then triage=(--triage-pending); fi
+          python3 scripts/eval_dashboard/nightly_bugs.py --data work/data.json --state "$DASHBOARD_BUCKET/nightly-bugs-state.json" "$mode" "${triage[@]}" --filed-out work/nightly-filed.json
+          filed=$(python3 -c 'import json; print(" ".join(str(n) for n in json.load(open("work/nightly-filed.json"))))' 2>/dev/null || true)
+          echo "filed=$filed" >> "${GITHUB_OUTPUT:-/dev/null}"
+
+      # Triage switched off with issues still waiting for it: route each by
+      # the filer's own rule, without a model call, so none stays unassigned
+      # (docs/ci-health.md, "Nightly triage"). One issue listing when there
+      # are none. Same token, repository and bound as the filer.
+      - name: Route issues left waiting for the nightly triage (when it is off)
+        if: env.NIGHTLY_TRIAGE_LIVE != 'true' && env.NIGHTLY_BUGS_LIVE == 'true' && env.CI_HEALTH_MUTE != 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          KUBE_AGENTS_ISSUES_REPO: ${{ steps.issues_repo.outputs.valid == 'true' && vars.KUBE_AGENTS_ISSUES_REPO || '' }}
+          GH_TOKEN: ${{ steps.issues_token.outputs.token || github.token }}
+          SOURCE_GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/eval_dashboard/nightly_triage.py route --no-model --live
 
       # One `presubmit-gate` issue per domain with no blocking roster seat,
       # assigned to the domain owner, kept current, closed when a roster case
@@ -985,6 +1024,161 @@ jobs:
             echo "::error::the Chat post failed (see its step); health.json was still published and the message is retried next tick"
           fi
           exit 1
+
+  # ---- The nightly triage (docs/ci-health.md, "Nightly triage") ----------
+  # After the tick, in a job of its own so a slow model call can never hold
+  # the tick's post or run it into its timeout. Armed (NIGHTLY_TRIAGE_LIVE
+  # and NIGHTLY_BUGS_LIVE both `true`), it triages every issue the filer left
+  # waiting (`triage:pending`); unarmed, it dry-runs on the issues the filer
+  # filed this tick, or on a dispatch's triage_issues, and prints one line
+  # each with no case name in it (the log is public). Two identities, as in
+  # the tick: the evidence (data.json, the nightly transcripts) is read as
+  # the archive reader, and the model is called as the publisher, whose
+  # Workload Identity needs roles/aiplatform.user on NIGHTLY_TRIAGE_PROJECT;
+  # no key or secret is involved. Every failure routes by the filer's rule
+  # (scripts/eval_dashboard/nightly_triage.py).
+  nightly-triage:
+    needs: refresh-and-adjudicate
+    if: >-
+      always() && github.repository == 'gke-labs/kube-agents' && github.ref == 'refs/heads/main'
+      && needs.refresh-and-adjudicate.result != 'skipped' && vars.CI_HEALTH_MUTE != 'true'
+      && ((vars.NIGHTLY_TRIAGE_LIVE == 'true' && vars.NIGHTLY_BUGS_LIVE == 'true')
+      || needs.refresh-and-adjudicate.outputs.filed != ''
+      || (github.event_name == 'workflow_dispatch' && inputs.triage_issues != ''))
+    runs-on: ubuntu-latest
+    # MAX_ISSUES_PER_RUN model calls at MODEL_TIMEOUT_S each, plus setup.
+    timeout-minutes: 25
+    concurrency:
+      group: ci-health-nightly-triage
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+      issues: write
+    steps:
+      # Which issues, and live or dry. A dispatch's numbers are always a dry
+      # run; they reach the shell through env and only as digits.
+      - name: Decide what this run triages
+        id: plan
+        env:
+          FILED: ${{ needs.refresh-and-adjudicate.outputs.filed }}
+          TRIAGE_ISSUES: ${{ inputs.triage_issues }}
+        run: |
+          numbers=""
+          mode=--dry-run
+          if [ -n "$TRIAGE_ISSUES" ]; then
+            if ! printf '%s' "$TRIAGE_ISSUES" | grep -Eq '^[0-9 ]+$'; then
+              echo "::error::triage_issues must be issue numbers separated by spaces"
+              exit 1
+            fi
+            numbers="$TRIAGE_ISSUES"
+          elif [ "$NIGHTLY_TRIAGE_LIVE" = "true" ] && [ "$NIGHTLY_BUGS_LIVE" = "true" ]; then
+            mode=--live
+          else
+            numbers="$FILED"
+          fi
+          args=""
+          for n in $numbers; do args="$args --issue $n"; done
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "args=$args" >> "$GITHUB_OUTPUT"
+          echo "nightly triage: $mode${numbers:+ on $numbers}"
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # git log between the last green and first red nightly commits.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version-file: ".python-version"
+
+      - name: Install pyyaml
+        run: python -m pip install --disable-pip-version-check pyyaml
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: Authenticate to Google Cloud (archive reader, for the evidence)
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.COLLECT_SA }}
+
+      # The tick's own login, for the same reason (its comment).
+      - name: Make the archive reader credential the active account
+        run: gcloud auth login --cred-file="${GOOGLE_GHA_CREDS_PATH:?the auth step exported no credential file}" --quiet
+
+      - name: Split the issues repository into owner and name
+        id: issues_repo
+        if: vars.KUBE_AGENTS_ISSUES_REPO != ''
+        continue-on-error: true
+        env:
+          ISSUES_REPO: ${{ vars.KUBE_AGENTS_ISSUES_REPO }}
+        run: |
+          if printf '%s' "$ISSUES_REPO" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'; then
+            {
+              echo "valid=true"
+              echo "owner=${ISSUES_REPO%%/*}"
+              echo "name=${ISSUES_REPO#*/}"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::KUBE_AGENTS_ISSUES_REPO must be owner/name; the issues are read in this repository"
+            echo "valid=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Mint a token for the issues repository
+        id: issues_token
+        if: steps.issues_repo.outputs.valid == 'true'
+        continue-on-error: true
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.ISSUES_APP_ID }}
+          private-key: ${{ secrets.ISSUES_APP_PRIVATE_KEY }}
+          owner: ${{ steps.issues_repo.outputs.owner }}
+          repositories: ${{ steps.issues_repo.outputs.name }}
+          permission-issues: write
+
+      # Writes nothing anywhere but the runner's disk. Best-effort: an issue
+      # it did not reach waits for the next tick (and is routed by the rule
+      # once it has waited too long).
+      - name: Gather the evidence for each issue
+        continue-on-error: true
+        timeout-minutes: 8
+        env:
+          KUBE_AGENTS_ISSUES_REPO: ${{ steps.issues_repo.outputs.valid == 'true' && vars.KUBE_AGENTS_ISSUES_REPO || '' }}
+          GH_TOKEN: ${{ steps.issues_token.outputs.token || github.token }}
+          SOURCE_GH_TOKEN: ${{ github.token }}
+          ISSUE_ARGS: ${{ steps.plan.outputs.args }}
+        run: |
+          mkdir -p work
+          gcloud storage cp "$DASHBOARD_BUCKET/data.json" work/data.json
+          # shellcheck disable=SC2086 # ISSUE_ARGS is `--issue <digits>` words
+          python3 scripts/eval_dashboard/nightly_triage.py prepare --data work/data.json --out work/triage-bundles.json $ISSUE_ARGS
+
+      - name: Authenticate to Google Cloud (publisher, for the model call)
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.CI_HEALTH_SA }}
+
+      - name: Make the publisher credential the active account
+        run: gcloud auth login --cred-file="${GOOGLE_GHA_CREDS_PATH:?the auth step exported no credential file}" --quiet
+
+      - name: Triage and route (dry run unless armed)
+        continue-on-error: true
+        timeout-minutes: 16
+        env:
+          KUBE_AGENTS_ISSUES_REPO: ${{ steps.issues_repo.outputs.valid == 'true' && vars.KUBE_AGENTS_ISSUES_REPO || '' }}
+          GH_TOKEN: ${{ steps.issues_token.outputs.token || github.token }}
+          SOURCE_GH_TOKEN: ${{ github.token }}
+          ISSUE_ARGS: ${{ steps.plan.outputs.args }}
+          MODE: ${{ steps.plan.outputs.mode }}
+        run: |
+          # shellcheck disable=SC2086 # ISSUE_ARGS is `--issue <digits>` words
+          python3 scripts/eval_dashboard/nightly_triage.py route --bundles work/triage-bundles.json $ISSUE_ARGS "$MODE"
 
   # ---- The hourly scans: seeded-fleet fixtures, then pool-project state (header)
   fixture-state-scan:

@@ -799,7 +799,8 @@ class WorkflowSwitchTest(unittest.TestCase):
             env = {"PATH": f"{tmp}{os.pathsep}{os.environ['PATH']}", "NIGHTLY_BUGS_LIVE": live, "CI_HEALTH_MUTE": mute}
             proc = subprocess.run(["bash", "-e", "-c", step["run"]], env=env, capture_output=True, text=True, check=False)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        return proc.stdout.split()[-1]
+        [mode] = [word for word in proc.stdout.split() if word in ("--live", "--dry-run")]
+        return mode
 
     def test_only_an_armed_unmuted_switch_goes_live(self):
         self.assertEqual(self.mode("true", "false"), "--live")
