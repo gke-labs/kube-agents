@@ -5172,7 +5172,7 @@ metadata:
     app.kubernetes.io/name: platform-agent
     app.kubernetes.io/part-of: a2a-next
     kubeagents.x-k8s.io/a2a-component: provision
-  name: platformagent-a2a-provision-ced7b4a3
+  name: platformagent-a2a-provision-d998c6b2
   namespace: kubeagents-system
   ownerReferences:
     - apiVersion: kubeagents.x-k8s.io/v1alpha1
@@ -5478,52 +5478,52 @@ spec:
               = \"-1\" ] || [ \"${live_subject_cap}\" = \"0\" ]; then\n  report_findings=\"\\\"tasks_subject_cap\\\":{\\\"live\\\":${live_subject_cap},\\\"want\\\":4096}\"\n
               \ echo \"NOTE: TASKS carries max_msgs_per_subject=${live_subject_cap} -
               no per-subject limit; this render creates it at 4096.\" >&2\n  echo \"  The
-              stream predates the limit and provisioning does not edit an existing stream,
-              so until\" >&2\n  echo \"  an operator applies it one task's events can
-              still evict another session's history.\" >&2\n  echo \"  Applying it evicts,
-              on every subject already over the limit, oldest first - and a task's\" >&2\n
-              \ echo \"  oldest event is its 'submitted' one, so those tasks replay opening
-              mid-history. Readers\" >&2\n  echo \"  report that rather than hiding it.
-              With that understood:\" >&2\n  echo \"    nats stream edit TASKS --max-msgs-per-subject=4096\"
+              stream predates the limit and provisioning does not change it on an existing
+              stream, so until\" >&2\n  echo \"  an operator applies it one task's events
+              can still evict another session's history.\" >&2\n  echo \"  Applying it
+              evicts, on every subject already over the limit, oldest first - and a task's\"
+              >&2\n  echo \"  oldest event is its 'submitted' one, so those tasks replay
+              opening mid-history. Readers\" >&2\n  echo \"  report that rather than hiding
+              it. With that understood:\" >&2\n  echo \"    nats stream edit TASKS --max-msgs-per-subject=4096\"
               >&2\nelif [ \"${live_subject_cap}\" != \"4096\" ]; then\n  echo \"NOTE:
               TASKS carries max_msgs_per_subject=${live_subject_cap}; this render creates
               it at 4096.\" >&2\n  echo \"  Bounded either way, so no task can evict another
               session's history - this is drift between\" >&2\n  echo \"  the stream and
-              the render, not the unbounded gap. Provisioning does not edit an existing\"
-              >&2\n  echo \"  stream and does not assume the difference is unintended.
-              To align it anyway, knowing that\" >&2\n  echo \"  lowering it evicts every
-              subject already over the new value, oldest event first:\" >&2\n  echo \"
-              \   nats stream edit TASKS --max-msgs-per-subject=4096\" >&2\nfi\n# TOPICS-STATE
-              older than this render: check that the topology-skew subject is\n# in its
-              subject list. Provisioning is create-only convergence, so an existing\n#
-              stream keeps the subject list it was created with, and a publisher of the\n#
-              new topic gets \"no stream matches subject\" until an operator appends it.\n#
-              Same stance as the TASKS extractor above: an answer with no readable\n#
-              subject list FAILS rather than passing as \"nothing to report\" (a mirror
-              or\n# sourced stream has an empty list and is not a shape this render creates).\n#
-              The finding goes to stderr for the pod log and into the report for the\n#
-              Event, like the cap gap; the subject list is quoted on stderr only, where\n#
-              an operator can copy it, and not in the report, which never steers an Event.\ntopics_state_json=\"$($NATS
-              stream info TOPICS-STATE --json | tr -d ' \\t\\r\\n')\"\ntopics_state_subjects=\"$(printf
-              '%s' \"${topics_state_json}\" \\\n  | grep -o '\"subjects\":\\[[^]]*\\]'
-              | head -n1 | sed 's/^\"subjects\":\\[//;s/\\]$//;s/\"//g' || true)\"\nif
-              [ -z \"${topics_state_subjects}\" ]; then\n  echo \"could not read subjects
-              off the TOPICS-STATE stream; refusing to report this install as provisioned\"
-              >&2\n  exit 1\nfi\nif ! printf '%s' \"${topics_state_json}\" | grep -Eq
-              '\"a2a\\.topics\\.(>|agent\\.(>|platform\\.(>|\\*|topology-skew)))\"'; then\n
-              \ report_findings=\"${report_findings}${report_findings:+,}\\\"topics_state_subject\\\":{\\\"missing\\\":1}\"\n
+              the render, not the unbounded gap. Provisioning does not change this limit
+              on an existing\" >&2\n  echo \"  stream and does not assume the difference
+              is unintended. To align it anyway, knowing that\" >&2\n  echo \"  lowering
+              it evicts every subject already over the new value, oldest event first:\"
+              >&2\n  echo \"    nats stream edit TASKS --max-msgs-per-subject=4096\" >&2\nfi\n#
+              TOPICS-STATE older than this render: check that the topology-skew subject
+              is\n# in its subject list. Provisioning is create-only convergence, so an
+              existing\n# stream keeps the subject list it was created with, and a publisher
+              of the\n# new topic gets \"no stream matches subject\" until an operator
+              appends it.\n# Same stance as the TASKS extractor above: an answer with
+              no readable\n# subject list FAILS rather than passing as \"nothing to report\"
+              (a mirror or\n# sourced stream has an empty list and is not a shape this
+              render creates).\n# The finding goes to stderr for the pod log and into
+              the report for the\n# Event, like the cap gap; the subject list is quoted
+              on stderr only, where\n# an operator can copy it, and not in the report,
+              which never steers an Event.\ntopics_state_json=\"$($NATS stream info TOPICS-STATE
+              --json | tr -d ' \\t\\r\\n')\"\ntopics_state_subjects=\"$(printf '%s' \"${topics_state_json}\"
+              \\\n  | grep -o '\"subjects\":\\[[^]]*\\]' | head -n1 | sed 's/^\"subjects\":\\[//;s/\\]$//;s/\"//g'
+              || true)\"\nif [ -z \"${topics_state_subjects}\" ]; then\n  echo \"could
+              not read subjects off the TOPICS-STATE stream; refusing to report this install
+              as provisioned\" >&2\n  exit 1\nfi\nif ! printf '%s' \"${topics_state_json}\"
+              | grep -Eq '\"a2a\\.topics\\.(>|agent\\.(>|platform\\.(>|\\*|topology-skew)))\"';
+              then\n  report_findings=\"${report_findings}${report_findings:+,}\\\"topics_state_subject\\\":{\\\"missing\\\":1}\"\n
               \ echo \"NOTE: TOPICS-STATE does not carry subject a2a.topics.agent.platform.topology-skew.\"
-              >&2\n  echo \"  Provisioning does not edit an existing stream; to append
-              the subject to its current subjects:\" >&2\n  echo \"    nats stream edit
-              TOPICS-STATE --subjects=\\\"${topics_state_subjects},a2a.topics.agent.platform.topology-skew\\\"\"
+              >&2\n  echo \"  Provisioning does not change an existing stream's subjects;
+              to append the subject to its current subjects:\" >&2\n  echo \"    nats
+              stream edit TOPICS-STATE --subjects=\\\"${topics_state_subjects},a2a.topics.agent.platform.topology-skew\\\"\"
               >&2\nfi\n#\n# PROFILE_SUBMITS older than this render: read its live max
               age back. The\n# dispatcher keeps a finished task's tombstone for the max
               age the operator\n# renders, and a submission still on the stream past its
-              tombstone would be\n# run again; provisioning never edits the stream (lowering
-              a max age evicts\n# queued submissions), so a stream an older operator created
-              longer than this\n# render's 259200s is reported, and the operator\n# renders
-              the longer one (#4948). 0 is no age limit. Same stance as the\n# extractors
-              above: an answer with no readable max_age FAILS.\nsubmits_json=\"$($NATS
+              tombstone would be\n# run again; provisioning never changes its max age
+              (lowering a max age evicts\n# queued submissions), so a stream an older
+              operator created longer than this\n# render's 259200s is reported, and the
+              operator\n# renders the longer one (#4948). 0 is no age limit. Same stance
+              as the\n# extractors above: an answer with no readable max_age FAILS.\nsubmits_json=\"$($NATS
               stream info PROFILE_SUBMITS --json | tr -d ' \\t\\r\\n')\"\nlive_submit_max_age_ns=\"$(printf
               '%s' \"${submits_json}\" \\\n  | grep -o '\"max_age\":[0-9]\\{1,\\}' | head
               -n1 | cut -d: -f2 || true)\"\nif [ -z \"${live_submit_max_age_ns}\" ]; then\n
@@ -5543,36 +5543,39 @@ spec:
               landing between the two\n# commands would have to fill the other half. A
               stream holding more is left\n# and reported with the edit to run once it
               drains. A stream at or under the\n# cap is left alone, whoever sized it.
-              An unreadable answer FAILS, like the\n# extractors above.\ncap_check() {
-              # stream want\n  cap_stream=$1\n  cap_want=$2\n  cap_over=0\n  cap_lower=0\n
-              \ cap_json=\"$($NATS stream info \"${cap_stream}\" --json | tr -d ' \\t\\r\\n')\"\n
-              \ cap_live=\"$(printf '%s' \"${cap_json}\" | grep -o '\"max_bytes\":-\\{0,1\\}[0-9]\\{1,\\}'
-              | head -n1 | cut -d: -f2 || true)\"\n  cap_held=\"$(printf '%s' \"${cap_json}\"
-              | grep -o '\"bytes\":[0-9]\\{1,\\}' | head -n1 | cut -d: -f2 || true)\"\n
-              \ if [ -z \"${cap_live}\" ] || [ -z \"${cap_held}\" ]; then\n    echo \"could
-              not read max_bytes and bytes off the ${cap_stream} stream; refusing to report
-              this install as provisioned\" >&2\n    exit 1\n  fi\n  if [ \"${cap_live}\"
-              != \"-1\" ] && [ \"${cap_live}\" -le \"${cap_want}\" ]; then\n    return
-              0\n  fi\n  cap_over=1\n  if [ \"${cap_held}\" -ge $((cap_want / 2)) ]; then\n
-              \   return 0\n  fi\n  cap_json=\"$($NATS stream info \"${cap_stream}\" --json
-              | tr -d ' \\t\\r\\n')\"\n  cap_held=\"$(printf '%s' \"${cap_json}\" | grep
-              -o '\"bytes\":[0-9]\\{1,\\}' | head -n1 | cut -d: -f2 || true)\"\n  if [
-              -z \"${cap_held}\" ]; then\n    echo \"could not re-read bytes off the ${cap_stream}
-              stream; refusing to report this install as provisioned\" >&2\n    exit 1\n
-              \ fi\n  if [ \"${cap_held}\" -lt $((cap_want / 2)) ]; then\n    cap_lower=1\n
-              \ fi\n}\ncap_check TASKS 8589934592\ncap_lowered=0\nif [ \"${cap_lower}\"
-              = \"1\" ]; then\n  if $NATS stream edit TASKS --max-bytes=8589934592 --force
-              >/dev/null; then\n    cap_lowered=1\n    echo \"NOTE: lowered TASKS max_bytes
-              from ${cap_live} to 8589934592; it held ${cap_held} bytes, so nothing was
-              evicted.\" >&2\n  else\n    echo \"WARNING: could not lower TASKS max_bytes
-              from ${cap_live} to 8589934592; it keeps its cap. The edit:\" >&2\n    echo
-              \"    nats stream edit TASKS --max-bytes=8589934592\" >&2\n  fi\nelif [
-              \"${cap_over}\" = \"1\" ]; then\n  echo \"NOTE: TASKS keeps max_bytes=${cap_live},
-              above this render's 8589934592: it holds ${cap_held} bytes, half the new
-              cap or more,\" >&2\n  echo \"  and a lower that close to what it holds could
-              evict. Once it holds less than 8589934592 bytes:\" >&2\n  echo \"    nats
-              stream edit TASKS --max-bytes=8589934592\" >&2\nfi\nif [ \"${cap_over}\"
-              = \"1\" ]; then\n  report_findings=\"${report_findings}${report_findings:+,}\\\"tasks_max_bytes\\\":{\\\"live\\\":${cap_live},\\\"held\\\":${cap_held},\\\"want\\\":8589934592,\\\"lowered\\\":${cap_lowered}}\"\nfi\ncap_check
+              An unreadable answer FAILS, like the\n# extractors above. natscli's edit
+              applies only the flags given, except\n# --compression, which it always sets
+              (none by default): the streams this\n# script creates are uncompressed,
+              so a lower changes nothing else on them,\n# but one compressed by hand would
+              be put back to none.\ncap_check() { # stream want\n  cap_stream=$1\n  cap_want=$2\n
+              \ cap_over=0\n  cap_lower=0\n  cap_json=\"$($NATS stream info \"${cap_stream}\"
+              --json | tr -d ' \\t\\r\\n')\"\n  cap_live=\"$(printf '%s' \"${cap_json}\"
+              | grep -o '\"max_bytes\":-\\{0,1\\}[0-9]\\{1,\\}' | head -n1 | cut -d: -f2
+              || true)\"\n  cap_held=\"$(printf '%s' \"${cap_json}\" | grep -o '\"bytes\":[0-9]\\{1,\\}'
+              | head -n1 | cut -d: -f2 || true)\"\n  if [ -z \"${cap_live}\" ] || [ -z
+              \"${cap_held}\" ]; then\n    echo \"could not read max_bytes and bytes off
+              the ${cap_stream} stream; refusing to report this install as provisioned\"
+              >&2\n    exit 1\n  fi\n  if [ \"${cap_live}\" != \"-1\" ] && [ \"${cap_live}\"
+              -le \"${cap_want}\" ]; then\n    return 0\n  fi\n  cap_over=1\n  if [ \"${cap_held}\"
+              -ge $((cap_want / 2)) ]; then\n    return 0\n  fi\n  cap_json=\"$($NATS
+              stream info \"${cap_stream}\" --json | tr -d ' \\t\\r\\n')\"\n  cap_held=\"$(printf
+              '%s' \"${cap_json}\" | grep -o '\"bytes\":[0-9]\\{1,\\}' | head -n1 | cut
+              -d: -f2 || true)\"\n  if [ -z \"${cap_held}\" ]; then\n    echo \"could
+              not re-read bytes off the ${cap_stream} stream; refusing to report this
+              install as provisioned\" >&2\n    exit 1\n  fi\n  if [ \"${cap_held}\" -lt
+              $((cap_want / 2)) ]; then\n    cap_lower=1\n  fi\n}\ncap_check TASKS 8589934592\ncap_lowered=0\nif
+              [ \"${cap_lower}\" = \"1\" ]; then\n  if $NATS stream edit TASKS --max-bytes=8589934592
+              --force >/dev/null; then\n    cap_lowered=1\n    echo \"NOTE: lowered TASKS
+              max_bytes from ${cap_live} to 8589934592; it held ${cap_held} bytes, so
+              nothing was evicted.\" >&2\n  else\n    echo \"WARNING: could not lower
+              TASKS max_bytes from ${cap_live} to 8589934592; it keeps its cap. The edit:\"
+              >&2\n    echo \"    nats stream edit TASKS --max-bytes=8589934592\" >&2\n
+              \ fi\nelif [ \"${cap_over}\" = \"1\" ]; then\n  echo \"NOTE: TASKS keeps
+              max_bytes=${cap_live}, above this render's 8589934592: it holds ${cap_held}
+              bytes, half the new cap or more,\" >&2\n  echo \"  and a lower that close
+              to what it holds could evict. Once it holds less than 8589934592 bytes:\"
+              >&2\n  echo \"    nats stream edit TASKS --max-bytes=8589934592\" >&2\nfi\nif
+              [ \"${cap_over}\" = \"1\" ]; then\n  report_findings=\"${report_findings}${report_findings:+,}\\\"tasks_max_bytes\\\":{\\\"live\\\":${cap_live},\\\"held\\\":${cap_held},\\\"want\\\":8589934592,\\\"lowered\\\":${cap_lowered}}\"\nfi\ncap_check
               TOPICS-JOURNAL 1073741824\ncap_lowered=0\nif [ \"${cap_lower}\" = \"1\"
               ]; then\n  if $NATS stream edit TOPICS-JOURNAL --max-bytes=1073741824 --force
               >/dev/null; then\n    cap_lowered=1\n    echo \"NOTE: lowered TOPICS-JOURNAL
@@ -5609,8 +5612,8 @@ spec:
               >&2\n  echo \"  (the replay share of that reserve is sized for 10 bridge
               workers: the operator renders the bridge, at the\" >&2\n  echo \"  A2A_BRIDGE_CONCURRENCY
               in its own environment, or 10 when that is unset, 2 when it is not a count).\"
-              >&2\n  echo \"Provisioning does not edit an existing stream, and this one
-              limit could not be\" >&2\n  echo \"edited anyway: nats-server refuses a
+              >&2\n  echo \"Provisioning does not change this limit on an existing stream,
+              and it could not be\" >&2\n  echo \"edited anyway: nats-server refuses a
               max_consumers change on a stream that exists,\" >&2\n  echo \"  \\\"stream
               configuration update can not change MaxConsumers\\\"\" >&2\n  echo \"and
               the bus this operator renders is pinned to nats:2.10, where that refusal

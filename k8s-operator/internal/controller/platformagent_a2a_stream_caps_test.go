@@ -258,3 +258,16 @@ func TestStreamCapFindingsReachThePlatformAgent(t *testing.T) {
 		t.Errorf("Job stamp = %q, want %q", got, a2aProvisionReportOutcomeReported)
 	}
 }
+
+// A stream with no byte limit reads "no limit" in the Events, not -1.
+func TestAnUnlimitedStreamReadsNoLimitInItsEvent(t *testing.T) {
+	for _, lowered := range []int{0, 1} {
+		f, err := parseA2AProvisionReport(fmt.Sprintf(`{"tasks_max_bytes":{"live":-1,"held":%d,"want":%d,"lowered":%d}}`, a2aTasksMaxBytes, a2aTasksMaxBytes, lowered))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, msg := f.tasksMaxBytes.event("job-a"); !strings.Contains(msg, "no limit") || strings.Contains(msg, "-1") {
+			t.Errorf("lowered=%d: %s", lowered, msg)
+		}
+	}
+}

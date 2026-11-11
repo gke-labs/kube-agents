@@ -770,7 +770,7 @@ const (
 	// number.
 	reasonTasksSubjectCapMissing = "TasksSubjectCapMissing"
 	tasksSubjectCapEventMessage  = "provision Job %s found the TASKS stream with max_msgs_per_subject=%d (no per-subject limit); " +
-		"this render creates it at %d and provisioning does not edit an existing stream, so one task's events can still evict another session's history. " +
+		"this render creates it at %d and provisioning does not change this limit on an existing stream, so one task's events can still evict another session's history. " +
 		"Applying the limit evicts oldest-first on every subject already over it: nats stream edit TASKS --max-msgs-per-subject=%d"
 	tasksSubjectCapRenderedDiffers = " (the Job's own script named %d as the rendered cap; the numbers above are this render's)"
 	// reasonTopicsStateSubjectMissing is the Warning Event's reason when the
@@ -789,15 +789,15 @@ const (
 	// Job name, stream, live, this render's cap, held, then the edit's
 	// stream and cap. The failed-edit form takes the same arguments.
 	reasonStreamCapLowered     = "A2ABusStreamCapLowered"
-	streamCapLoweredMessage    = "provision Job %s lowered stream %s's max_bytes from %d to %d bytes; it held %d bytes, under half the new cap, so nothing was evicted"
+	streamCapLoweredMessage    = "provision Job %s lowered stream %s's max_bytes from %s to %d bytes; it held %d bytes, under half the new cap, so nothing was evicted"
 	reasonStreamCapNotLowered  = "A2ABusStreamCapNotLowered"
-	streamCapNotLoweredMessage = "provision Job %s left stream %s at max_bytes=%d, above this render's %d bytes: it held %d bytes, half the new cap or more, " +
+	streamCapNotLoweredMessage = "provision Job %s left stream %s at max_bytes %s, above this render's %d bytes: it held %d bytes, half the new cap or more, " +
 		"and provisioning lowers a cap only while the stream holds under half of it, since a lower close to what a stream holds can evict. " +
 		"Once it holds less: nats stream edit %s --max-bytes=%d"
-	streamCapEditFailedMessage = "provision Job %s could not lower stream %s from max_bytes=%d to this render's %d bytes although it held only %d bytes; " +
+	streamCapEditFailedMessage = "provision Job %s could not lower stream %s from max_bytes %s to this render's %d bytes although it held only %d bytes; " +
 		"the edit failed (the Job's log has the error) and the stream keeps its cap. To apply it: nats stream edit %s --max-bytes=%d"
 	topicsStateSubjectEventMessage = "provision Job %s found the TOPICS-STATE stream without subject %s; " +
-		"this render creates the stream with it and provisioning does not edit an existing stream, so nothing can publish to that topic " +
+		"this render creates the stream with it and provisioning does not change an existing stream's subjects, so nothing can publish to that topic " +
 		"until an operator appends it to the stream's current subject list (read it with nats stream info TOPICS-STATE): " +
 		"nats stream edit TOPICS-STATE --subjects=\"<current subjects>,%s\""
 
@@ -1207,8 +1207,8 @@ const (
 	// TestProvisionedJetStreamCapsFitTheStore holds their sum under it. TASKS
 	// was 20 GiB and TOPICS-JOURNAL 5 GiB, which with the rest reserved
 	// 28.875 of the 32 GiB store; at 8 and 1 the reservation is 12.875. 8 GiB
-	// on TASKS is the 72h window at well above any measured load, and can be
-	// raised from a busy install's measured use (#4477). An existing stream
+	// on TASKS is not yet from a busy install's measured use; it can be raised
+	// once #4477 measures one. An existing stream
 	// above its cap is lowered by the provision script only while it holds
 	// under half the new cap (a2aProvisionCapLowerBlock).
 	a2aTasksMaxBytes         int64 = 8 << 30
@@ -3828,7 +3828,7 @@ report_findings=''
 if [ "${live_subject_cap}" = "-1" ] || [ "${live_subject_cap}" = "0" ]; then
   report_findings="\"` + a2aProvisionReportTasksSubjectCapKey + `\":{\"` + a2aProvisionReportLiveKey + `\":${live_subject_cap},\"` + a2aProvisionReportWantKey + `\":` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `}"
   echo "NOTE: TASKS carries max_msgs_per_subject=${live_subject_cap} - no per-subject limit; this render creates it at ` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `." >&2
-  echo "  The stream predates the limit and provisioning does not edit an existing stream, so until" >&2
+  echo "  The stream predates the limit and provisioning does not change it on an existing stream, so until" >&2
   echo "  an operator applies it one task's events can still evict another session's history." >&2
   echo "  Applying it evicts, on every subject already over the limit, oldest first - and a task's" >&2
   echo "  oldest event is its 'submitted' one, so those tasks replay opening mid-history. Readers" >&2
@@ -3837,7 +3837,7 @@ if [ "${live_subject_cap}" = "-1" ] || [ "${live_subject_cap}" = "0" ]; then
 elif [ "${live_subject_cap}" != "` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `" ]; then
   echo "NOTE: TASKS carries max_msgs_per_subject=${live_subject_cap}; this render creates it at ` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `." >&2
   echo "  Bounded either way, so no task can evict another session's history - this is drift between" >&2
-  echo "  the stream and the render, not the unbounded gap. Provisioning does not edit an existing" >&2
+  echo "  the stream and the render, not the unbounded gap. Provisioning does not change this limit on an existing" >&2
   echo "  stream and does not assume the difference is unintended. To align it anyway, knowing that" >&2
   echo "  lowering it evicts every subject already over the new value, oldest event first:" >&2
   echo "    nats stream edit TASKS --max-msgs-per-subject=` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `" >&2
@@ -3862,14 +3862,14 @@ fi
 if ! printf '%s' "${topics_state_json}" | grep -Eq '"a2a\.topics\.(>|agent\.(>|platform\.(>|\*|topology-skew)))"'; then
   report_findings="${report_findings}${report_findings:+,}\"` + a2aProvisionReportTopicsStateSubjectKey + `\":{\"` + a2aProvisionReportMissingKey + `\":1}"
   echo "NOTE: TOPICS-STATE does not carry subject ` + a2aTopologySkewSubject + `." >&2
-  echo "  Provisioning does not edit an existing stream; to append the subject to its current subjects:" >&2
+  echo "  Provisioning does not change an existing stream's subjects; to append the subject to its current subjects:" >&2
   echo "    nats stream edit TOPICS-STATE --subjects=\"${topics_state_subjects},` + a2aTopologySkewSubject + `\"" >&2
 fi
 #
 # PROFILE_SUBMITS older than this render: read its live max age back. The
 # dispatcher keeps a finished task's tombstone for the max age the operator
 # renders, and a submission still on the stream past its tombstone would be
-# run again; provisioning never edits the stream (lowering a max age evicts
+# run again; provisioning never changes its max age (lowering a max age evicts
 # queued submissions), so a stream an older operator created longer than this
 # render's ` + strconv.Itoa(int(a2aProfileSubmitMaxAge/time.Second)) + `s is reported, and the operator
 # renders the longer one (#4948). 0 is no age limit. Same stance as the
@@ -3896,7 +3896,10 @@ fi
 # commands would have to fill the other half. A stream holding more is left
 # and reported with the edit to run once it drains. A stream at or under the
 # cap is left alone, whoever sized it. An unreadable answer FAILS, like the
-# extractors above.
+# extractors above. natscli's edit applies only the flags given, except
+# --compression, which it always sets (none by default): the streams this
+# script creates are uncompressed, so a lower changes nothing else on them,
+# but one compressed by hand would be put back to none.
 cap_check() { # stream want
   cap_stream=$1
   cap_want=$2
@@ -3952,7 +3955,7 @@ if [ "${live_consumers}" != "-1" ] && [ "${live_consumers}" -lt "${required_cons
   echo "TASKS holds max_consumers=${live_consumers} but this PlatformAgent needs ${required_consumers}:" >&2
   echo "  spec.harness.tuning.maxSessions is ` + maxSessions + `, each session creates ` + perSession + ` consumers on TASKS," >&2
   echo "  plus ` + reserve + ` reserved for the standing durables, the web rail and tasks/get replays." >&2
-` + bridgeNote + `  echo "Provisioning does not edit an existing stream, and this one limit could not be" >&2
+` + bridgeNote + `  echo "Provisioning does not change this limit on an existing stream, and it could not be" >&2
   echo "edited anyway: nats-server refuses a max_consumers change on a stream that exists," >&2
   echo "  \"stream configuration update can not change MaxConsumers\"" >&2
   echo "and the bus this operator renders is pinned to nats:2.10, where that refusal holds." >&2
@@ -4403,15 +4406,19 @@ type streamCapFinding struct {
 // event is the finding's Event: Normal when the script lowered the cap,
 // Warning when it left it, with the edit naming this render's cap.
 func (f *streamCapFinding) event(jobName string) (string, string, string) {
+	live := strconv.FormatInt(f.live, 10)
+	if f.live == -1 {
+		live = "no limit"
+	}
 	if f.lowered {
-		return corev1.EventTypeNormal, reasonStreamCapLowered, fmt.Sprintf(streamCapLoweredMessage, jobName, f.stream, f.live, f.want, f.held)
+		return corev1.EventTypeNormal, reasonStreamCapLowered, fmt.Sprintf(streamCapLoweredMessage, jobName, f.stream, live, f.want, f.held)
 	}
 	format := streamCapNotLoweredMessage
 	if f.held < f.want/2 {
 		// Under half the cap and still not lowered: the edit itself failed.
 		format = streamCapEditFailedMessage
 	}
-	return corev1.EventTypeWarning, reasonStreamCapNotLowered, fmt.Sprintf(format, jobName, f.stream, f.live, f.render, f.held, f.stream, f.render)
+	return corev1.EventTypeWarning, reasonStreamCapNotLowered, fmt.Sprintf(format, jobName, f.stream, live, f.render, f.held, f.stream, f.render)
 }
 
 // parseStreamCapFinding reads one byte-cap finding: every field present, a
