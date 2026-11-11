@@ -6839,3 +6839,7 @@ def test_an_unresolved_fleet_role_is_a_setup_problem_not_the_models(tmp_path, mo
     expanded, problem = harness.expand_fleet_cluster_placeholders(prompt)
     assert problem is not None and "never reached" in problem
     assert expanded == prompt
+    # A reached slot with no location recorded can't name the target either.
+    _fleet_context(tmp_path, monkeypatch, "project=evals-3\nslot.crashloop-workload=b\ncluster.b=seeded-b\n")
+    _, problem = harness.expand_fleet_cluster_placeholders(prompt)
+    assert problem is not None and "never reached" in problem

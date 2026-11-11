@@ -984,6 +984,15 @@ class TestTheRulesReject(unittest.TestCase):
         with unittest.mock.patch.dict(validator.FIXTURE_NOT_READY, {"made-up-case": "#1 plants slot e"}):
             self.assertEqual([p for p in self._validate(verification_spec=self._entry(check={"type": "report_contains", "any_of_patterns": ["(?m)^{cluster:e}: ok$"]})) if "does not declare" in p], [])
 
+    def test_a_fleet_prompt_placeholder_is_well_formed_listed_and_catalogued(self):
+        # The valid case lists rbac-overgrant in fixtures:.
+        good = "on {{FLEET_CLUSTER_NAME:rbac-overgrant}} in {{FLEET_CLUSTER_PROJECT:rbac-overgrant}}"
+        self.assertEqual(self._validate(prompt=good), [])
+        self._only("malformed fleet placeholder", prompt="on {{FLEET_CLUSTER_ZONE:rbac-overgrant}}")
+        self._only("doesn't list", prompt="on {{FLEET_CLUSTER_NAME:crashloop-workload}}", fixtures=["rbac-overgrant"])
+        problems = self._validate(prompt="on {{FLEET_CLUSTER_NAME:not-a-role}}", fixtures=["rbac-overgrant", "not-a-role"])
+        self.assertTrue(any("doesn't declare" in p for p in problems), problems)
+
     def test_a_cluster_placeholder_outside_report_contains_is_rejected(self):
         # worker_commands searches its patterns as written, so the placeholder
         # there is literal text: a forbid that never fires, a requirement that

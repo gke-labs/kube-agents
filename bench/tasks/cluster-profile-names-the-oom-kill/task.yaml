@@ -7,10 +7,11 @@
 # through the credential broker. The fault is the `crashloop-workload`
 # fixture: the `api` container is OOM-killed under its 64Mi limit.
 #
-# It also stands for the cluster persona's own model-facing edits: the persona
-# has no `gke` MCP server (#5446), so it reads the cluster with `kubectl` and
-# `gcloud`, and reaches `developer_knowledge` through the worker's relay
-# (#5498).
+# It exercises the cluster persona's model-facing edits without grading them
+# separately: the persona has no `gke` MCP server (#5446), so it reads the
+# cluster with `kubectl` and `gcloud`, and reaches `developer_knowledge`
+# through the worker's relay (#5498). A diagnosis that needed `gke` would fail
+# here.
 #
 # The prompt names the fixture's cluster through the harness's
 # {{FLEET_CLUSTER_*:<role>}} placeholders, resolved from the context
@@ -70,14 +71,26 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
-      # The kill is the diagnosis, and it lives in the pod's
-      # lastState.terminated, so naming it means the pod was read. The
-      # spellings are incident-triage-oom-event-probe's, so the two cases
-      # read a correct answer alike; "137" is left out because a bare
-      # three-digit substring matches memory figures and timestamps too.
+      # The kill is the diagnosis; it lives in the pod's lastState.terminated,
+      # and the prompt says only "keeps restarting". On its own a phrase
+      # match is consistent with having read the pod, not proof of it: a
+      # hedged list of common causes would pass, which the evidence check
+      # below closes. The spellings are incident-triage-oom-event-probe's, so
+      # the two cases read a correct answer alike; "137" is left out because a
+      # bare three-digit substring matches memory figures and timestamps too.
       required_phrases: ["payments-api"]
       any_of_phrases:
         ["oomkilled", "oom-killed", "oom killed", "oomkill", "out of memory"]
+
+  - name: the-answer-cites-the-limit-it-read
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # The 64Mi limit is in the Deployment on the cluster and nowhere in the
+      # prompt, so an answer that names it read the workload rather than
+      # guessing from the symptom.
+      any_of_phrases: ["64mi", "64 mi"]
 
   # Cluster-state safeguard, as in incident-triage-oom-event-probe: the
   # planted defect survives. Raising the limit is the fix the answer is meant

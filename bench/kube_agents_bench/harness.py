@@ -2675,7 +2675,9 @@ def expand_agent_cluster_placeholders(prompt: str, context: str | None) -> tuple
 # names the fixture's cluster by role, never by name (kube_agents_bench.fleet).
 # Expanded from the context hack/fleet-kubeconfigs.sh writes
 # (:func:`expand_fleet_cluster_placeholders`).
-_FLEET_CLUSTER_PLACEHOLDER = re.compile(r"\{\{FLEET_CLUSTER_(PROJECT|LOCATION|NAME):([a-z0-9][a-z0-9-]*)\}\}")
+_FLEET_CLUSTER_PLACEHOLDER = re.compile(
+    r"\{\{FLEET_CLUSTER_(PROJECT|LOCATION|NAME):(" + fleet.ROLE_PATTERN.pattern + r")\}\}"
+)
 
 
 def expand_fleet_cluster_placeholders(prompt: str) -> tuple[str, str | None]:
@@ -2703,9 +2705,10 @@ def expand_fleet_cluster_placeholders(prompt: str) -> tuple[str, str | None]:
             slot = fleet.slot_of_role(role)
         except fleet.FleetRoleUnresolved as exc:
             return prompt, f"fleet role {role!r}: {exc}"
-        if slot not in clusters:
+        name, location = clusters.get(slot, ("", ""))
+        if not name or not location:
             return prompt, f"fleet role {role!r}: the runner never reached slot {slot!r}, so its cluster is unknown"
-        resolved[role] = clusters[slot]
+        resolved[role] = (name, location)
 
     def value(m: re.Match[str]) -> str:
         name, location = resolved[m.group(2)]

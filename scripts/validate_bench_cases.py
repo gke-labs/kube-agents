@@ -932,6 +932,39 @@ def _cluster_placeholders(node: Any, where: str, problems: list[str], slots: set
         _cluster_placeholders(child, where, problems, slots, parked)
 
 
+# `{{FLEET_CLUSTER_PROJECT|LOCATION|NAME:<role>}}` in a prompt, as
+# bench/kube_agents_bench/harness.py's _FLEET_CLUSTER_PLACEHOLDER reads it
+# (restated, as CLUSTER_PLACEHOLDER is; the harness owns it).
+FLEET_PROMPT_PLACEHOLDER = re.compile(r"\{\{FLEET_CLUSTER_(PROJECT|LOCATION|NAME):([a-z0-9]+(?:-[a-z0-9]+)*)\}\}")
+FLEET_PROMPT_OPENER = "{{FLEET_CLUSTER"
+
+
+def _fleet_prompt_placeholders(spec: dict[str, Any], problems: list[str], parked: bool) -> None:
+    """Every `{{FLEET_CLUSTER_*:<role>}}` in the prompt is well-formed, names a
+    role the case lists in `fixtures:`, and (unless parked) a catalogue role.
+    A misspelled one reaches the model as literal text and is graded as the
+    model's failure; a role the runner doesn't provision fails every run as
+    infrastructure."""
+    prompt = spec.get("prompt")
+    if not isinstance(prompt, str) or FLEET_PROMPT_OPENER not in prompt:
+        return
+    if FLEET_PROMPT_OPENER in FLEET_PROMPT_PLACEHOLDER.sub("", prompt):
+        problems.append(
+            "prompt carries a malformed fleet placeholder; the form is "
+            "{{FLEET_CLUSTER_PROJECT:<role>}}, ..._LOCATION or ..._NAME, with a lowercase role"
+        )
+    fixtures = {f for f in (spec.get("fixtures") or []) if isinstance(f, str)}
+    catalogue = set(_catalog_roles())
+    for role in sorted({m.group(2) for m in FLEET_PROMPT_PLACEHOLDER.finditer(prompt)}):
+        if role not in fixtures:
+            problems.append(f"prompt names fleet role {role!r}, which the case's 'fixtures:' doesn't list")
+        if not parked and role not in catalogue:
+            problems.append(
+                f"prompt names fleet role {role!r}, which bench/tf/fleet/fixtures.json doesn't declare; "
+                "the runner records no cluster for it"
+            )
+
+
 def _catalog_roles() -> dict[str, Any]:
     """Roles in bench/tf/fleet/fixtures.json, which owns the vocabulary."""
     try:
@@ -1325,6 +1358,7 @@ def validate_case(
     spec = _load_yaml(path)
     if not isinstance(spec, dict):
         return [f"{path}: does not parse to a mapping"]
+    _fleet_prompt_placeholders(spec, problems, name in FIXTURE_NOT_READY)
 
     # The suite. A certification case says so in its file and sits in the
     # certification roster; one without the other is a case on the wrong lane.
