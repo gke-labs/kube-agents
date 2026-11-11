@@ -58,7 +58,7 @@ misconfigurations:
     paths:
       - "k8s-operator/config/rbac/**"
 
-  # Ignore KSV-0041: three callers need a Secret verb on manager-role, and trivy
+  # Ignore KSV-0041: callers need Secret verbs on manager-role, and trivy
   # cannot scope an exemption to one rule -- `paths` globs are its whole
   # vocabulary -- so exempting either exempts the whole rbac directory.
   #
@@ -73,17 +73,22 @@ misconfigurations:
   #     Secrets read, leaves the controller, and the digest goes on an object
   #     the operator already writes.
   #   - create/update/patch/delete: under `mode: next` the operator generates
-  #     and repairs the A2A NATS credential and config Secrets, owner-referenced
-  #     to the PlatformAgent. Deliberately no `list`/`watch`: every read is by
-  #     name through a2aReader, so the operator cannot enumerate Secrets. The
-  #     digest caller added no verb -- it reuses the `get` that was already here.
+  #     and repairs the A2A NATS credential and config Secrets, and
+  #     ensureKubeProxyTLSSecret manages the `<agent>-kube-proxy-tls` Secret,
+  #     owner-referenced to the PlatformAgent.
+  #   - list/watch: held on manager-role only so the operator can grant
+  #     read-only `get`/`list`/`watch` on `secrets` in `buildMinimalPlatformRole`
+  #     (`kubeagents:minimal:<ns>:<name>`) without Kubernetes RBAC escalation
+  #     errors; the operator itself reads Secrets by name through a2aReader and
+  #     never lists or watches Secrets.
   #
   # tests/test_operator_secrets_grant.py is what replaces the check: it pins the
-  # verb set exactly, fails if a second rule names secrets, and fails if this
-  # exemption widens past the rbac directory.
+  # verb set and marker, forbids controller SecretList/watch calls, and fails if
+  # this exemption widens past the rbac and golden expected directories.
   - id: KSV-0041
     paths:
       - "k8s-operator/config/rbac/**"
+      - "k8s-operator/internal/testing/testdata/platform/expected/**"
 
   # Ignore KSV-0118: sample manifests, testdata, and kustomize overlays do not define full security contexts
   - id: KSV-0118

@@ -25,6 +25,7 @@ import gzip
 import io
 import json
 import pathlib
+import re
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -542,6 +543,124 @@ class Storm(unittest.TestCase):
         kept = dict(self.reading(0.01), read_at=health.iso(T0 - timedelta(minutes=30)), window_end=health.iso(T0 - timedelta(minutes=30)))
         result = self.judge(self.stormy([1, 2, 3], 6), kept)
         self.assertEqual((result["state"], result["vertex_429"]["read"]), ("GREEN", True))
+
+    def test_storm_cause_is_the_reps_own_words_with_the_wrappers_peeled(self):
+        wrap = "the harness recorded an infrastructure condition or exhausted its retries without reaching the agent (KUBE_AGENTS_INFRA_FAILURE): the record is scored, but there is no answer in it to grade ("
+        for reason, words in (
+            (wrap + "task task-93cb2a3275225fb7 ended failed: the executor's own failure (hermes-rate-limited) (reason: reason: he", "the executor's own failure (hermes-rate-limited)"),
+            (wrap + "task task-1 ended canceled: the bridge cancelled the task out of its queue before it ran (reason: queue-overflow))", "the bridge cancelled the task out of its queue before it ran"),
+            (wrap + "task task-2 ended rejected: the executor rejected the task before running it (reason: busy))", "the executor rejected the task before running it"),
+            (wrap + "task task-3 ended failed: the executor's own failure (bridge-died-without-terminal-event) (rea", "the executor's own failure (bridge-died-without-terminal-event)"),
+            (wrap + "delegated worker hit infrastructure failure (rate_limit): card on board recorded rate_limit: provider rate limited)", "delegated worker hit infrastructure failure (rate_limit): card on board…"),
+            (wrap + "the inject exchange on devops-bench-2dead1cad2fd/x/1 failed: URLError from http://10.1.2.3:8080 <urlopen error>)", "the inject exchange on [run]/x/[rep] failed: URLError from http://10.1.2.3:8080…"),
+            (wrap + "the inject exchange on devops-bench-0badc0ffee11/x/3 failed: URLError from http://10.1.2.3:8080 <urlopen error>)", "the inject exchange on [run]/x/[rep] failed: URLError from http://10.1.2.3:8080…"),
+            (wrap + "no reason given)", ""),
+            # Older records carry the wrapper and no detail at all.
+            ("the harness exhausted its retries without reaching the agent (KUBE_AGENTS_INFRA_FAILURE): the record is scored, but there is no answer in it to grade", ""),
+            (wrap + "the kanban board could not be read 3 times running; still waiting on: t_3f67a81e)", "the kanban board could not be read 3 times running; still waiting on: [card]"),
+            # Short, echo-less details keep nothing of the wrapper's own ")".
+            (wrap + "opening turn hit infrastructure failure (rate_limit): HTTP 429)", "opening turn hit infrastructure failure (rate_limit): HTTP 429"),
+            (wrap + "the inject exchange on devops-bench-2dead1cad2fd/x/1 failed: ConnectionResetError)", "the inject exchange on [run]/x/[rep] failed: ConnectionResetError"),
+            # The scorer's two other wrappers (scoring.py classify_rep).
+            ("KUBE_AGENTS_INFRA_FAILURE: the record holds no scored run, so there is nothing to grade (the gateway was gone before the run)", "the gateway was gone before the run"),
+            ("KUBE_AGENTS_INFRA_FAILURE: the record holds no scored run, so there is nothing to grade (no reason given)", ""),
+            ("KUBE_AGENTS_INFRA_FAILURE: the repetition ended on infrastructure and its only catastrophic trip is no-github-writes-the-case-did-not-request, charged for no more writes than the case's 1 requested pull request(s) because the empty report could not name them (task task-9 ended failed: the executor's own failure (bridge-shutdown) (reason: x))", "the executor's own failure (bridge-shutdown)"),
+            # The harness's other task phrasings carry the id mid-sentence.
+            (wrap + "task task-7a on devops-bench-2dead1cad2fd/x/1 sat queued (submitted, never working) for the whole 600s budget)", "task [id] on [run]/x/[rep] sat queued (submitted, never working) for the whole…"),
+            (wrap + "no executor took task task-7b on devops-bench-2dead1cad2fd/x/2: nothing reached its event stream)", "no executor took task [id] on [run]/x/[rep]: nothing reached its event stream"),
+            (wrap + "task task-7c was ended by the gateway rather than by an executor (state failed))", "task [id] was ended by the gateway rather than by an executor (state failed)"),
+            # The collector's cut inside the words, and inside the run id.
+            ("KUBE_AGENTS_INFRA_FAILURE: the repetition ended on infrastructure and its only catastrophic trip is no-github-writes-the-case-did-not-request, charged for no more writes than the case's 1 requested pull request(s) because the empty report could not name them (the kanban board could not be read 3 tim", "the kanban board could not be read 3…"),
+            ("KUBE_AGENTS_INFRA_FAILURE: the repetition ended on infrastructure and its only catastrophic trip is no-github-writes-the-case-did-not-request, charged for no more writes than the case's 1 requested pull request(s) because the empty report could not name them (the inject exchange on devops-bench-0d0b", "the inject exchange on…"),
+            # A cut inside a detail that had an id reduced; a whole detail that
+            # happens to end at the cap.
+            ("KUBE_AGENTS_INFRA_FAILURE: the repetition ended on infrastructure and its only catastrophic trip is no-github-writes-the-case-did-not-request, charged for no more writes than the case's 1 requested pull request(s) because the empty report could not name them (no executor took task task-7b on devops-", "no executor took task [id] on…"),
+            ("KUBE_AGENTS_INFRA_FAILURE: the repetition ended on infrastructure and its only catastrophic trip is no-github-writes-the-case-did-not-request, charged for no more writes than the case's 1 requested pull request(s) because the empty report could not name them (xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx)", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"),
+            # The cut right after a ")" of the detail's own is still a cut.
+            ('the harness recorded an infrastructure condition or exhausted its retries without reaching the agent (KUBE_AGENTS_INFRA_FAILURE): the record is scored, but there is no answer in it to grade (task task-93cb2a3275225fb7 on devops-bench-0123456789ab/case-12345678/1 sat queued (submitted, never working)', "task [id] on [run]/case-12345678/[rep] sat queued (submitted, never…"),
+            (wrap + "harness_stop_sent: the session store for a2a-ctx-0123456789abcdef could not be read 3 times running; stop sent: True (x))", "harness_stop_sent: the session store for [session] could not be read 3 times…"),
+            # "-a2a-" inside a resource name is not a session id.
+            (wrap + "the inject tunnel to svc/platform-agent-a2a-inject failed to establish 3 times running)", "the inject tunnel to svc/platform-agent-a2a-inject failed to establish 3 times…"),
+            (RETRIES, ""),
+            ("the harness exhausted its retries without reaching the agent (KUBE_AGENTS_INFRA_FAILURE): the record is scored, but there is no answer in it to grade (task task-4 ended failed: the executor's own failure (bridge-shutdown) (reason: x))", "the executor's own failure (bridge-shutdown)"),
+            (EMPTY_RECORD, "the record is not evidence of a real agent run: the trajectory is empty: the…"),
+            ("fatal: token `x` and <b>", "fatal: token 'x' and ‹b›"),
+            (None, ""),
+        ):
+            with self.subTest(reason=reason):
+                self.assertEqual(health.storm_cause({"result": "infra", "reason": reason}), words)
+
+    def test_the_wrapper_phrases_are_the_scorers_and_the_harnesss(self):
+        # The two sources' literals, read from the tree: a rewording there
+        # would make the line quote the wrapper again.
+        root = pathlib.Path(__file__).resolve().parent.parent / "bench" / "kube_agents_bench"
+        scorer = (root / "scoring.py").read_text(encoding="utf-8")
+        harness = (root / "harness.py").read_text(encoding="utf-8")
+        for fragment in (
+            '"the harness recorded an infrastructure condition or exhausted its retries without reaching the agent "',
+            'answer in it to grade ({detail or \'no reason given\'})',
+            'f"{INFRA_FAILURE_MARKER}: the record holds no scored run, so "',
+            'f"there is nothing to grade ({detail or \'no reason given\'})"',
+            '"request(s) because the empty report could not name them "',
+        ):
+            self.assertIn(fragment, scorer, fragment)
+        self.assertIn('f"task {exchange.task_id} ended {exchange.fold.terminal}: {infrastructure} "', harness)
+        for fragment in (
+            'f"task {exchange.task_id} on {exchange.conversation} sat queued (submitted, "',
+            'f"no executor took task {exchange.task_id} on {exchange.conversation}: nothing "',
+            'f"task {exchange.task_id} was ended by the gateway rather than by an executor "',
+        ):
+            self.assertIn(fragment, harness, fragment)
+        self.assertIn('f"(reason: {exchange.fold.terminal_reason or \'none given\'})"', harness)
+        self.assertIn('_RUN_ID_PREFIX = "devops-bench-"', harness)
+        self.assertIn('f"the session store for {session_id} could not be read', harness)
+        # The collector keeps 300 characters: the scorer's usual wrapper and
+        # the harness's prefix plus the longest executor token must fit, or
+        # the shell arrives cut and unpeelable. (The 260-character safeguard
+        # wrapper leaves 40, which a real task id fills; that is the
+        # collector's cap, and the words then end in "…".)
+        transport = (root / "inject_transport.py").read_text(encoding="utf-8")
+        tokens = re.findall(r'^REASON_[A-Z_]+ = "([a-z-]+)"$', transport, re.M)
+        self.assertTrue(tokens)
+        longest = max(tokens, key=len)
+        wrapper = "the harness recorded an infrastructure condition or exhausted its retries without reaching the agent (KUBE_AGENTS_INFRA_FAILURE): the record is scored, but there is no answer in it to grade ("
+        words = wrapper + "task task-" + "0" * 16 + f" ended canceled: the executor's own failure ({longest})"
+        self.assertLess(len(words), 300, f"the wrappers plus {longest} must fit the collector's cut")
+        # As the harness writes it: the "(reason: …)" echo follows, and the cut
+        # lands in the echo, not the words.
+        reason = words + f" (reason: {longest}))"
+        self.assertEqual(health.storm_cause({"result": "infra", "reason": reason[:300]}), f"the executor's own failure ({longest})")
+
+    def test_the_storm_line_quotes_the_reps_own_words(self):
+        # 2026-10-30: the reps said hermes-rate-limited, the line said "infra deaths".
+        hermes = {"result": "infra", "reason": "the harness recorded an infrastructure condition or exhausted its retries without reaching the agent (KUBE_AGENTS_INFRA_FAILURE): the record is scored, but there is no answer in it to grade (task task-93cb2a3275225fb7 ended failed: the executor's own failure (hermes-rate-limited) (reason: reason: he"}
+        retries = {"result": "infra", "reason": "the harness exhausted its retries without reaching the agent (KUBE_AGENTS_INFRA_FAILURE): the record is scored, but there is no answer in it to grade (task task-5 ended failed: the executor's own failure (bridge-shutdown) (reason: x))"}
+        def run_with(pr, i, reps):
+            tasks = [{"name": f"case-{k}", "result": "infra", "duration_s": None, "outcome_validity": None, "reps": [dict(r, n=j + 1) for j, r in enumerate(reps)]} for k in range(2)]
+            tasks += [task(name, "ppp") for name in sorted(ADMITTED)]
+            return run(100 + i, pr, T0 - timedelta(minutes=20 * i), result="SUCCESS", tasks=tasks)
+        doc = data(run_with(1, 0, [hermes] * 3), run_with(2, 1, [hermes] * 3), run_with(3, 2, [retries] * 3))
+        result = assess(doc, T0)
+        line = next(l for l in result["evidence"] if l.startswith("quota storm"))
+        self.assertIn("; the reps say: the executor's own failure (hermes-rate-limited) ×12, the executor's own failure (bridge-shutdown) ×6; unconfirmed", line)
+        self.assertTrue(line.endswith("; unconfirmed: no Vertex 429 reading"), line)
+        self.assertEqual(result["incident"]["causes"], [["the executor's own failure (hermes-rate-limited)", 12], ["the executor's own failure (bridge-shutdown)", 6]])
+        # A third phrasing is counted on the line, and the incident carries all three.
+        empty = {"result": "fail", "reason": EMPTY_RECORD}
+        third = assess(data(run_with(1, 0, [hermes] * 3), run_with(2, 1, [retries] * 3), run_with(3, 2, [empty] * 3)), T0)
+        line = next(l for l in third["evidence"] if l.startswith("quota storm"))
+        self.assertIn("×6, and 1 other phrasing(s)", line)
+        self.assertEqual([n for _, n in third["incident"]["causes"]], [6, 6, 6])
+        self.assertEqual(len(third["incident"]["causes"]), 3)
+        # Records with no words (no per-rep detail, or the scorer's "no reason
+        # given") count as reps and add no phrasing.
+        bare = run(200, 4, T0 - timedelta(minutes=5), result="SUCCESS", tasks=[{"name": "case-x", "result": "infra", "duration_s": None, "outcome_validity": None}] + [task(name, "ppp") for name in sorted(ADMITTED)])
+        wordless = {"result": "infra", "reason": RETRIES}
+        doc = data(run_with(1, 0, [hermes] * 3), run_with(2, 1, [hermes] * 3), run_with(3, 2, [wordless] * 3), bare)
+        line = next(l for l in assess(doc, T0)["evidence"] if l.startswith("quota storm"))
+        self.assertIn("quota storm: 19 infra/empty-record reps across 4 PRs", line)
+        self.assertIn("; the reps say: the executor's own failure (hermes-rate-limited) ×12; unconfirmed", line)
+        self.assertNotIn("other phrasing", line)
 
     def test_infra_verdicts_count_the_same_as_empty_records(self):
         self.assertEqual(assess(self.stormy([1, 2, 3], 6, letter="i"), T0)["state"], "DEGRADED")

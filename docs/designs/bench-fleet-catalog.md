@@ -96,12 +96,12 @@ whose own rule is that the project is registered last.
 
 ## The roles
 
-Thirty-nine fixtures: thirty-six across the four cluster slots and three project-scoped. Two of the project-scoped ones, `startup-fail-vm` and `world-open-ingress`, are catalog roles with `cluster_slot: null`, which the runner probes in the project with gcloud; `orphan-disks` is in the overlay only. Three
+Forty fixtures: thirty-seven across the four cluster slots and three project-scoped. Two of the project-scoped ones, `startup-fail-vm` and `world-open-ingress`, are catalog roles with `cluster_slot: null`, which the runner probes in the project with gcloud; `orphan-disks` is in the overlay only. Three
 more catalog roles plant nothing: `drift-peer-a`, `-b` and `-d` assert the authorized-networks
 majority `drift-outlier` is measured against. Most in-cluster
 fixtures are on slot `a`, across the thirteen seeded namespaces `seeded-debug`,
 `seeded-reliability`, `seeded-security`, `seeded-capacity`, `seeded-deprecation`, `seeded-intent`, `seeded-token`, `seeded-headroom`, `seeded-qos`, `seeded-stall`, `seeded-shapes`, `seeded-defaults` and `seeded-scaled-zero`, plus both
-defect node pools. Slot `c` carries GKE-level defects only and no workloads at all: it is the
+defect node pools and the declared zonal pool. Slot `c` carries GKE-level defects only and no workloads at all: it is the
 configuration outlier, on its control plane and on its default pool. Slot `b` is the held-back control plane, and also carries the
 upgrade-readiness drain defects, which belong with the cluster whose subject is upgrading. Slot
 `d` is the exception to "the defect is something planted in a cluster": there, the cluster's own
@@ -124,6 +124,7 @@ its roles are never published.
 | `stalled-controller`            | a       | 0   | `deployment/inventory-api` in `seeded-stall`, CreateContainerConfigError, ProgressDeadlineExceeded                                                                                                                                            |
 | `crashloop-workload`            | a       | 0   | `deployment/payments-api` in `seeded-debug`, 64Mi limit, deterministic OOMKilled loop                                                                                                                                                         |
 | `hpa-saturated`                 | a       | 0   | `pinned-inference-pool` at min = max = 1 under an HPA that wants more                                                                                                                                                                         |
+| `declared-single-zone-pool`     | a       | 0   | `declared-zonal-pool`, a single-zone autoscaling pool held at zero nodes behind a NoSchedule taint; declared on purpose in the GitOps repository's `knowledge/`, so the capacity audit lists it under Declared intent                         |
 | `deprecated-api-caller`         | a       | 0   | `cronjob/legacy-endpoints-writer` in `seeded-deprecation`, patching Endpoints v1 every ten minutes; each write audit-stamped `k8s.io/deprecated=true`, no removal, no insight                                                                 |
 | `idle-nodepool`                 | a       | 7   | `idle-batch-pool`, zero non-system pods, held by a NoSchedule taint                                                                                                                                                                           |
 | `default-pool-headroom`         | a       | 0   | seeded-a's default pool itself, three e2-standard-2 nodes asserted to keep 100m CPU unrequested each for the next planted fixture; not a defect, the room the slot's fixtures schedule into                                                   |
@@ -177,9 +178,10 @@ neither is going to be obvious from a slug.
 
 **A role slug is not the `seeded-role` label.** `bench/tf/fleet/main.tf` carries
 `seeded-role=pinned-inference` on the pinned pool's node label and taint, and
-`seeded-role=idle-batch` on the idle pool's taint, and `bench/tf/fleet/defects-b.tf`
-`seeded-role=no-surge` on the no-surge pool's — so three of the thirty-five roles are called one
-thing by the catalogue and another by the Terraform that plants them. They are
+`seeded-role=idle-batch` on the idle pool's taint, `seeded-role=declared-zonal` on the declared
+zonal pool's, and `bench/tf/fleet/defects-b.tf` `seeded-role=no-surge` on the no-surge pool's — so
+four of the roles are called one thing by the catalogue and another by the Terraform that plants
+them. They are
 different mechanisms and both are load-bearing: the label and taint are scheduling
 constraints that keep other workloads off those pools, and the role slug is what the
 runner resolves to a kubeconfig. Nothing breaks, but do not read one as the other, and do
@@ -274,8 +276,8 @@ provisioning — it is the SOPs' own age rules. A collector that filters on
 `creationTimestamp` returns nothing for a fixture younger than its window, so the audit
 correctly reports no finding and a case asserting one correctly fails.
 
-Thirty-three of the thirty-six are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`, `guaranteed-qos-workload`,
-`declared-no-pdb-workload`, `declared-token-workload`, `declared-overrequest-workload`, `stalled-controller`, `crashloop-workload`, `hpa-saturated`, `version-laggard`, `deprecated-api-caller`, the five
+Thirty-four of the thirty-seven are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`, `guaranteed-qos-workload`,
+`declared-no-pdb-workload`, `declared-token-workload`, `declared-overrequest-workload`, `declared-single-zone-pool`, `stalled-controller`, `crashloop-workload`, `hpa-saturated`, `version-laggard`, `deprecated-api-caller`, the five
 `readiness-*` roles on slot `b`, the three `zonal-skew-*` roles on slot `d` and the eleven
 upgrade-failure shapes, ten in `seeded-shapes` and one in `seeded-defaults` (`node-local-state`, `deprecated-label-selector`,
 `containerd-socket-agent`, `intree-pd-volume`, `retired-registry-image`, `moving-admission-default`,

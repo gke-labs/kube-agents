@@ -110,7 +110,7 @@ Part of the `fleet-audit` skill (`/opt/data/profiles/platform/skills/fleet-audit
 (The `declared` entry and the `declared_intent_searched` list are illustrative and cross streams: a
 real compliance document would be rejected for the `no-hpa` entry, a check outside its roster. `declared[].check` is validated
 against the stream's `declarable` set in `AUDITS` — its posture checks, a subset of the roster — and
-`obtainability-audit`, `compliance-audit`, `security-patch-orchestrator` and `fleet-wide-cost-analysis` have one today, because their SOPs have a step that writes the list. A
+`obtainability-audit`, `compliance-audit`, `security-patch-orchestrator`, `fleet-wide-cost-analysis` and `stockout-prevention` have one today, because their SOPs have a step that writes the list. A
 non-empty `declared` or `declared_intent_searched` on any other stream exits 2; `[]` validates
 everywhere.)
 
@@ -337,10 +337,14 @@ an optional `cluster` and an optional `expires` (`YYYY-MM-DD`, UTC, the last day
 case-blind lookup on `(check, cluster, namespace, object)`, then on the fleet-wide
 `(check, namespace, object)`, compared as the finding id is (`deployment/api` joins `Deployment/api`),
 the finding's `cluster` and `title` kept and the note's `repo`, `path` and title as the declaration.
-Two slugs name both a posture and a fault, and the join moves only the posture: for
+Three slugs name both a posture and a fault, and the join moves only the posture: for
 `hpa-cannot-scale` the `min == max` shape, read off the severity the SOP fixes for it (`major`); for
-`netpol-missing` the `Namespace/<ns>` shape. A declaration matching the `minor` dangling-target fault
-or an allow-all `NetworkPolicy/<name>` is reported on stderr and not applied. An item whose `expires`
+`netpol-missing` the `Namespace/<ns>` shape; for `single-zone-nodepool` the zone-locked arm, read off
+the collector's excerpt: it opens with `single-zone (` and carries no clause opening
+`at its autoscaling ceiling:` (a pool carrying both clauses keeps the ceiling arm, and a hand-written
+excerpt that opens any other way names no arm). A declaration matching the `minor` dangling-target fault, an
+allow-all `NetworkPolicy/<name>` or a pool finding that is not the zone-locked arm alone is reported on
+stderr and not applied. An item whose `expires`
 has passed moves nothing: the finding it covered stays under `findings` with a _Declared intent
 expired_ line in its ledger block naming the note and the date, unless a standing item covers it; a
 hand-written entry's `declaration.expires` is held to the format, and refused by `finish` when it had
@@ -363,9 +367,12 @@ What the shape enforces:
   the posture returns as a finding on the next run. A declaration the worker did not read is not
   one it may cite.
 - **It justifies posture, never a fault.** Which checks may move here is the stream's `declarable`
-  set in `AUDITS`, four for obtainability, two for compliance, six for the patch stream and eight for the waste audit, and the validator rejects any other check with exit 2. A
+  set in `AUDITS`, four for obtainability, two for compliance, six for the patch stream, eight for the waste audit and one for the stockout audit (3.9's zone-locked arm; the at-ceiling arm shares the slug and the join leaves it a finding), and the validator rejects any other check with exit 2. A
   drain-blocking budget declared in a repository is a declared bug and stays a finding, and a
-  document that lists it under `declared` publishes nothing.
+  document that lists it under `declared` publishes nothing. One fault the slug alone cannot
+  name is held to the manifest instead: a `single-zone-nodepool` entry written for a pool the
+  collector reports at its autoscaling ceiling exits 2 in `finish` and `remediate` when a manifest
+  is given, since the entry carries no excerpt to tell the arms apart.
 
 ### `declared_intent_searched`
 
@@ -394,8 +401,9 @@ What `finish` does with it:
   declaration covered. A run on which none of the stream's declarable checks ran anywhere owes nothing.
 - **Anything less is no search, and the postures are withheld.** A union of the worker's list and
   `start`'s that misses a repository, or no run record: `finish` — real and `--dry-run` — takes every finding whose check is
-  declarable out of the document, the dangling-target `hpa-cannot-scale` fault included because it
-  shares its slug with the `min == max` posture and nothing on this side tells them apart, and adds
+  declarable out of the document, the dangling-target `hpa-cannot-scale` fault and the at-ceiling
+  `single-zone-nodepool` arm included because each shares its slug with a posture and nothing on
+  this side tells them apart, and adds
   one `coverage_gaps` sentence naming each withheld entry and the repositories not searched. The
   faults publish, the allow-all `NetworkPolicy/<name>` shape of `netpol-missing` among them, since its
   object tells it apart; `declared[]` entries publish.

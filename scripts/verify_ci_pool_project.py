@@ -540,14 +540,14 @@ GITOPS_SEED_CONTENT = "# GitOps Infrastructure Repo"
 # declared-intent cases (GITOPS_INTENT_NOTE_CASES) fail on a project whose
 # repository lacks it.
 GITOPS_INTENT_NOTE_PATH = "knowledge/notification-relay-no-pdb.md"
-GITOPS_INTENT_NOTE_MESSAGE = "Declare seeded-intent's missing PodDisruptionBudget and NetworkPolicy, token-reader's mounted token, seeded-c's missing upgrade notifications, and burst-ingest's headroom, as intended"
+GITOPS_INTENT_NOTE_MESSAGE = "Declare seeded-intent's missing PodDisruptionBudget and NetworkPolicy, token-reader's mounted token, seeded-c's missing upgrade notifications, burst-ingest's headroom, and declared-zonal-pool's single zone, as intended"
 # The script's GITOPS_INTENT_NOTE_CONTENT, byte for byte, so the repair this
 # verifier prints is the note provisioning seeds; a test pins the two copies
 # to each other. The body read back is judged by the audit's parser, not
 # compared to this text.
 GITOPS_INTENT_NOTE_CONTENT = """---
 type: decision
-title: seeded-intent, seeded-token, seeded-c and seeded-headroom carry five postures on purpose
+title: seeded-intent, seeded-token, seeded-c, seeded-headroom and the declared-zonal-pool of seeded-a carry six postures on purpose
 declares:
   - check: no-pdb
     namespace: seeded-intent
@@ -564,6 +564,9 @@ declares:
   - check: overrequest
     namespace: seeded-headroom
     object: Deployment/burst-ingest
+  - check: single-zone-nodepool
+    namespace: ""
+    object: NodePool/declared-zonal-pool
 ---
 
 `notification-relay` in `seeded-intent` runs two replicas with no PodDisruptionBudget by design:
@@ -573,9 +576,10 @@ in `seeded-token` runs on the default ServiceAccount of its namespace with the t
 design: it reads the API server with that identity. Its neighbour `token-sidecar` is not declared.
 `seeded-c` publishes no GKE upgrade notifications by design: this fleet learns about upgrades from
 the weekly audit. `burst-ingest` in `seeded-headroom` requests far more memory than it uses by
-design: it is sized for an ingest burst the measured week does not show. The obtainability,
-compliance, upgrade readiness and waste audits list the five postures under Declared intent rather
-than as findings."""
+design: it is sized for an ingest burst the measured week does not show. `declared-zonal-pool` on
+`seeded-a` is an autoscaling pool kept in one zone by design: the cluster is single-zone, and the
+pool stays empty until a zonal batch needs it. The obtainability, compliance, upgrade readiness,
+waste and capacity audits list the six postures under Declared intent rather than as findings."""
 # The declarations the audits' parser (audit_report.py parse_declarations) must
 # find in the note's `declares` list, each with the stream whose `declarable`
 # set is the policy for it. A file that has the path but not these declares
@@ -591,6 +595,7 @@ GITOPS_INTENT_NOTE_CASES = (
     "compliance-declared-token-shields-siblings",
     "patch-declared-intent-no-finding",
     "cost-declared-intent-no-finding",
+    "stockout-declared-intent-no-finding",
 )
 GITOPS_INTENT_NOTE_DECLARATIONS = (
     ("obtainability-audit", {"check": "no-pdb", "namespace": "seeded-intent", "object": "Deployment/notification-relay"}),
@@ -598,6 +603,7 @@ GITOPS_INTENT_NOTE_DECLARATIONS = (
     ("compliance-audit", {"check": "default-sa-automount", "namespace": "seeded-token", "object": "Deployment/token-reader"}),
     ("security-patch-orchestrator", {"check": "no-notifications", "namespace": "", "object": "Cluster/seeded-c"}),
     ("fleet-wide-cost-analysis", {"check": "overrequest", "namespace": "seeded-headroom", "object": "Deployment/burst-ingest"}),
+    ("stockout-prevention", {"check": "single-zone-nodepool", "namespace": "", "object": "NodePool/declared-zonal-pool"}),
 )
 # checkout-gateway's declaration, which provisioning seeds beside the note
 # (GITOPS_WORKLOAD_MANIFEST_* in scripts/provision_ci_pool_project.sh). The

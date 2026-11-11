@@ -34,6 +34,10 @@ readonly ELF_MAGIC_HEX=7f454c46
 readonly OLD_SHIPPED_STALE_TIMEOUT_SECONDS=600
 readonly TSE_TEMPLATE="/opt/tse-template"
 readonly DEFAULTS_PLUGINS_DIR="/opt/defaults/plugins"
+# The plugins under DEFAULTS_PLUGINS_DIR that step 2b does not force-sync: installed into
+# the image from outside this repository, and the directory holds the plugin's own state
+# (hermes_otel's config.yaml carries the collector endpoint step 4 writes).
+readonly PINNED_EXTERNAL_PLUGINS="hermes_otel"
 readonly OPTIONAL_PROFILE_STAMP=".optional-profile"
 readonly DELETED_PROFILES_DIR=".deleted"
 # The boot stamp at the root of a cluster profile home: the digest of everything
@@ -517,7 +521,7 @@ fi
 # they produce: a stale copy would grade an old prompt against the image's checks.
 if [ -d "/opt/defaults" ]; then
     for f in SOUL.md AGENTS.md CAPABILITIES.md hindsight/config.json \
-        onboarding/scan_in_progress.md onboarding/scan_completed.md; do
+        onboarding/scan_in_progress.md onboarding/scan_completed.md onboarding/report_filed.md; do
         if [ -f "/opt/defaults/$f" ]; then
             # Nested paths need their parent: step 2's recursive copy creates it
             # on a fresh PVC, but the force-sync must not depend on that.
@@ -545,19 +549,48 @@ if [ -d "/opt/defaults/scripts" ]; then
         || echo "WARN: could not refresh $TARGET_DIR/scripts from the image; runtime profile scaffolding may run stale code" >&2
 fi
 
-# 2b, continued: the onboarding plugin is image-owned too, and must come from the same image
-# as the delivery script above: its pre_llm_call hook holds the first report behind the greeting
-# and its post_llm_call hook releases it. A stale plugin beside a new bootstrap_delivery.py
-# writes no hold, so the report races the greeting as before the hold existed.
+# 2b, continued: every plugin the image ships is image-owned too, and must come from the
+# same image as the scripts above. The onboarding plugin showed why first: its pre_llm_call
+# hook holds the first report behind the greeting and its post_llm_call hook releases it, so
+# a stale plugin beside a new bootstrap_delivery.py writes no hold and the report races the
+# greeting. The rest go stale the same way. A roll to an image built earlier than the files
+# on the volume — a rollback, or a shared install that rolls between branches — leaves the
+# previous image's plugin code live beside the new image's operator, gateway and scripts,
+# and a metric series the image added never appears. So every plugin directory under
+# DEFAULTS_PLUGINS_DIR is copied over the volume's, except PINNED_EXTERNAL_PLUGINS. The copy
+# adds and overwrites without pruning, so a plugin's own runtime state on the volume
+# survives, and the loop walks directories only, so the files at the top of the plugins
+# directory are left as they are. A symlinked destination is left alone, as in the cluster
+# loop. An operator-mounted default-profile plugin is a mount at this path, not a symlink;
+# its name is a Kubernetes object name, so it cannot carry the underscore the shipped
+# names do, and only `common` could collide with one.
+#
+# Each file is copied to a temporary name beside its target and renamed over it, as the
+# cluster loop in step 2.6 does: replicas share this volume, and a sibling that imports a
+# module mid-copy must find the old file whole, never a truncated one that stops the plugin
+# loading. A copy that fails part-way leaves the old file whole for the same reason.
 #
 # Reported, not fatal: `$TARGET_DIR/plugins` is root-owned on a volume where the kubelet
 # created it as the parent of a plugin mounted beneath it, and `set -e` would otherwise end
 # the container on the mkdir. The scripts block above guards only its `cp`: step 2's bulk
 # copy has already created `scripts/`, so its bare `mkdir -p` meets an existing directory.
-if [ -d "/opt/defaults/plugins/bootstrap_onboarding" ]; then
-    { mkdir -p "$TARGET_DIR/plugins/bootstrap_onboarding" \
-        && cp -rf /opt/defaults/plugins/bootstrap_onboarding/. "$TARGET_DIR/plugins/bootstrap_onboarding/"; } \
-        || echo "WARN: could not refresh $TARGET_DIR/plugins/bootstrap_onboarding from the image; the first report may post before the greeting" >&2
+if [ -d "$DEFAULTS_PLUGINS_DIR" ]; then
+    # shellcheck disable=SC3028 # falls back to $$ where HOSTNAME is unset
+    _plugin_refresh_tag="${HOSTNAME:-$$}"
+    for _image_plugin_dir in "$DEFAULTS_PLUGINS_DIR"/*/; do
+        [ -d "$_image_plugin_dir" ] || continue
+        _image_plugin=$(basename "$_image_plugin_dir")
+        case " $PINNED_EXTERNAL_PLUGINS " in *" $_image_plugin "*) continue ;; esac
+        _plugin_dst="$TARGET_DIR/plugins/$_image_plugin"
+        [ -L "$_plugin_dst" ] && continue
+        if ! (cd "$_image_plugin_dir" && find . -type f) | while IFS= read -r _file; do
+            _tmp="$_plugin_dst/$_file.refresh.$_plugin_refresh_tag"
+            { mkdir -p "$(dirname "$_plugin_dst/$_file")" && cp -p "$_image_plugin_dir$_file" "$_tmp" && mv -f "$_tmp" "$_plugin_dst/$_file"; } 2>/dev/null \
+                || { rm -f "$_tmp" 2>/dev/null; exit 1; }
+        done; then
+            echo "WARN: could not refresh $_plugin_dst from the image; each file not yet replaced keeps the previous image's copy" >&2
+        fi
+    done
 fi
 
 # 2c. Invalidate locally-hosted MCP server schemas from each profile's on-disk cache.

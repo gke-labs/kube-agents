@@ -1213,7 +1213,13 @@ spec:
                                 positive count the shell sandbox, the profile workers and the session
                                 pods under the cluster view are given the tier's address for /v1/exec
                                 and /v1/gcp/. Each replica requests and is limited to 2 CPU and 2Gi of
-                                memory, with no override. A change between 0 and a positive value
+                                memory, with no override, so each one needs a node with that much free,
+                                and the pods that turning the tier on restarts (below) need room to start
+                                again. A replica that cannot be scheduled shows in the
+                                CredentialProxyExecReady condition (reason Unschedulable, with the
+                                scheduler's message), and callers that cannot reach the tier fall back to
+                                the stateful broker.
+                                A change between 0 and a positive value
                                 restarts the shell sandbox, the profile warm pools, and under the
                                 cluster view the A2A gateway, which read the tier's address when they
                                 start; a change between two positive values rewrites the count the pods
@@ -11346,9 +11352,17 @@ spec:
                             every project.
                             An excluded cluster gets no Cluster Agent, and fleet answers, the
                             onboarding sweep and the fleet-audit collectors that list clusters leave
-                            it out. Still covering it: the daily upgrade-readiness watch, the
-                            networking audit's subnet usage, the GCE audit's instance listing, and
-                            the third-party gke MCP server's list_clusters.
+                            it out. The credential broker and kube-proxy refuse every route to its
+                            Kubernetes API, for every caller, the agents' own commands included: a
+                            kubeconfig, get-credentials, kube-proxy, the watchers' relay and the gke
+                            MCP server's in-cluster tools. Spell entries by project ID: one spelled
+                            by project number refuses its location and name in any project. Reads of the GKE control plane stay allowed (the project's cluster
+                            list, a cluster's describe), and these still cover it through them only:
+                            the daily upgrade-readiness watch's version table (its in-cluster
+                            readiness rules skip the cluster), the networking audit's subnet usage,
+                            the GCE audit's instance listing, and the gke MCP server's list_clusters.
+                            The broker enforces it, not IAM: the agent's roles still reach the
+                            cluster, so the service account itself is not fenced off.
                           items:
                             description: ScopeClusterRef identifies one GKE cluster.
                             properties:
@@ -11507,6 +11521,18 @@ spec:
                     Security configures RBAC, Pod Security, and Workload
                     Identity.
                   properties:
+                    disallowSecretsRead:
+                      description: |-
+                        DisallowSecretsRead omits core `secrets` (`get`, `list`, `watch`) from the
+                        reader ClusterRole (`kubeagents:minimal:<ns>:<name>`).
+
+                        True omits `secrets` from the ClusterRole.
+                        False grants `get`, `list`, and `watch` on `secrets` (`<name>-kube-proxy`
+                        strips secret payloads from every response with `KUBE_PROXY_REDACT_SECRETS=true`).
+                        Absent (nil) grants `secrets` on a new install where the ClusterRole does
+                        not exist yet (when the operator holds `list` and `watch` on `secrets`).
+                        On an existing install, absent preserves the existing ClusterRole's `secrets` rule.
+                      type: boolean
                     egressAllowlist:
                       description: |-
                         EgressAllowlist tunes the destinations egressPolicy: Allowlist permits.

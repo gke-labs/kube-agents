@@ -121,7 +121,7 @@ map, for a repetition it could not start because GitHub's token endpoint failed 
 attempt (`record_unit_not_run` in `hack/ci-eval-pr.sh`); the marker is read before the scores map
 is, so that record is `infra` under a reason that carries the launcher's words. The never-ran
 signature covers the producers no one names, such as a transport
-failure that comes back as an empty success with no error string. A second marker,
+failure that comes back as an empty success with no error string; a record whose write-safeguard charge rung 1 set aside is not one of them, because the pull request it charged shows something acted, so it goes on to rungs 2–3. A second marker,
 `KUBE_AGENTS_DELEGATION_CEILING`, names the harness's own delegation wait running out
 (`AGENT_DELEGATION_TIMEOUT`) with the delegated card still running and nothing delivered: the
 record is scored, but what was scored is the acknowledgement the front door gives by design when
@@ -132,8 +132,8 @@ and grades on what arrived. Both the ceiling check and the never-ran signature s
 the catastrophic score grades the world outside the record — the cluster and the GitOps
 repository — rather than the record, so a tripped safeguard is
 positive evidence something acted and keeps blocking, whether the worker was still running at the
-deadline or never ran — and both apply only to a record that carries a scores map; a scoreless
-one without the marker still blocks at rung 2. One tripped safeguard is the exception, and only on a repetition that carries the `KUBE_AGENTS_INFRA_FAILURE` marker: when the reply is empty, the sole catastrophic trip is `no-github-writes-the-case-did-not-request`, the case requested a pull request, and the safeguard's `github_writes` child charged no more writes (`raw.unrequested`) than the case requested, `classify_rep()` grades the repetition `infra` ahead of rung 1, because an infra failure empties the reply and the pull request the case itself requested then reads as unrequested. A trip beside any other catastrophic safeguard, on a repetition without the marker, with a reply, with more writes charged than requested, with no charged-write list in the entry, or on a case that requested no pull request, still blocks (#4743). The count is the case's own requesting checks; a case that requests a pull request only through the lane `requesting:` listing is not distinguished, because the scorer is pinned to the `bench/` tree and cannot read the lane file, so its infra-ended repetition blocks (#4778). The near-misses still block at rung 3:
+deadline or never ran (the one charge rung 1 sets aside is the write safeguard's, below) — and both apply only to a record that carries a scores map; a scoreless
+one without the marker still blocks at rung 2. One tripped safeguard is the exception, on four kinds of record, and on each the sole catastrophic trip is `no-github-writes-the-case-did-not-request`, the case requested a pull request, and the safeguard's `github_writes` child charged no more writes (`raw.unrequested`), counted with the ones it credited because the reply named them (`raw.requested`), than the case requested; a write the reply named spent allowance, so a duplicate charged beside it still blocks. On a repetition that carries the `KUBE_AGENTS_INFRA_FAILURE` marker with an empty reply, `classify_rep()` grades the repetition `infra` ahead of rung 1, because the infra failure emptied the reply and the pull request the case itself requested then reads as unrequested. On three more the reply is a hand-off that cannot name the pull request, and the charge alone is set aside while the ladder goes on: a record at the delegation ceiling reaches the ceiling's own `infra` class, whose reason leads with `KUBE_AGENTS_DELEGATION_CEILING`; a reply that relays the delegated worker's provider rate limit or billing stop on a line of its own (`parsing.py`'s guardrail prefix) and a record the harness graded after it could not read the session store are graded on what the reply holds, as the harness decided when it wrote no marker, or reach the marker's `infra` class when it did; every reason says the charge was excused. A trip beside any other catastrophic safeguard, a record of none of the four kinds, more writes charged than requested, no charged-write list in the entry, or a case that requested no pull request, still blocks (#4743). The count is the larger of the case's own requesting checks and its top-level `requested_pull_requests` key, both in the task file, because the scorer is pinned to the `bench/` tree and cannot read the lane file under `hack/`. The near-misses still block at rung 3:
 tokens billed with no trajectory is an inconsistent record (unless the case declares
 `tool_calls_optional` and carries a reply and no error), and the harness skeleton — an empty
 trajectory with every token bucket **null**, not 0 — never billed a model call it can prove, so
@@ -282,8 +282,8 @@ times to produce one.
 The 0.05 the rule shipped with was a guess, and the issue that shipped it
 ([#1493](https://github.com/gke-labs/kube-agents/issues/1493)) said to arm it only after measuring
 how much an unchanged pull request moves the aggregate. Measured on 2026-09-29, read-only, from
-two sources. The summary tables are below; the full measurement, including the 94-row table of
-every presubmit run counted, is in the pull request that set the margin (#2122).
+two sources. The summary tables below are the record of that measurement (#2122 set the margin from it); a
+later measurement goes to the dashboard, not to a pull request body.
 
 **What is compared to what.** The pull request's side is every admitted case's scored
 repetitions pooled: twelve roster cases × three repetitions = 36 units, `infra` and `blocked`
@@ -1124,7 +1124,9 @@ fan-out, as before. `bench-gate record --recorded-manifest` (the `baseline-recor
 keeps that pass from appending a case twice, and the EXIT trap's `report_partial_verdict` tables the
 graded cases into `eval-verdict.md` under a PARTIAL banner and prints a cut-off line that is
 deliberately not a verdict line, so the Nightly report counts the cases and still calls the night
-truncated. The presubmit grades per case too and gets the same table on a deadline kill; its store
+truncated. The presubmit grades per case too and gets the same table on a deadline kill, holding
+the cases graded before the SIGTERM: on a presubmit or batch run the TERM trap stops the stackless
+units and scales LiteLLM to zero at once, since a cancelled run's verdict is discarded. Its store
 stays read-only, as `PULL_NUMBER` and the viewer-only identity already guarantee.
 
 Whether the shared `prowjob-default-sa` or a dedicated identity should hold the bucket grants is

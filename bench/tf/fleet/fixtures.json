@@ -78,6 +78,34 @@
         }
       ]
     },
+    "declared-single-zone-pool": {
+      "cluster_slot": "a",
+      "namespace": null,
+      "probes": [],
+      "fixture": "declared-zonal-pool, a single-zone autoscaling pool held at zero nodes behind a NO_SCHEDULE taint: the stockout SOP's 3.9 zone-locked posture and nothing else, declared on purpose by the pool project's GitOps knowledge/ note, so the capacity audit lists it under Declared intent rather than as a finding. A GKE-level object with no node, so nothing in-cluster probes it; its shape is read off clusters describe",
+      "state": [
+        {
+          "subject": "cluster",
+          "path": "nodePools[?(@.name=='declared-zonal-pool')].autoscaling.enabled",
+          "op": "any_eq",
+          "value": true,
+          "why": "3.9's zone-locked arm fires on an autoscaling pool only; a pool with autoscaling off is not a candidate, and the declared-intent case has no posture to see declared"
+        },
+        {
+          "subject": "cluster",
+          "path": "nodePools[?(@.name=='declared-zonal-pool')].config.taints[*].key",
+          "op": "any_eq",
+          "value": "seeded-role",
+          "why": "the taint is what makes the pool zone-locked on a cluster whose default pool shares its zone: an untainted pool is spared when an untainted multi-zone pool of its machine type exists, and the taint also keeps the autoscaler from adding a node for a stray pod"
+        },
+        {
+          "subject": "node?cloud.google.com/gke-nodepool=declared-zonal-pool",
+          "path": "metadata.name",
+          "op": "absent",
+          "why": "a node in the pool moves it toward 3.9's at-ceiling arm (90% of maxNodeCount 2 is two nodes), which no declaration covers; the posture is the zone lock alone, so the pool stays empty"
+        }
+      ]
+    },
     "rbac-overgrant": {
       "cluster_slot": "a",
       "namespace": null,
