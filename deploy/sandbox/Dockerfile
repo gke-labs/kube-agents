@@ -764,8 +764,8 @@ RUN find /opt/defaults -name '__pycache__' -type d -prune -exec rm -rf {} + && \
 #
 # The pull-request and issue crons run in the agent pod, hold the forge
 # credential, and do their forge work by sshing in as `hermes` and running a
-# script here. The Cluster Agent reconcile does the same for its GKE reads
-# (gke_cluster_reads.py, #3703). Two of the crons cross: forge.py for every forge verb
+# script here. The Cluster Agent reconcile and stall_watch do the same for their GKE
+# reads (gke_cluster_reads.py, #3703). Two of the crons cross: forge.py for every forge verb
 # (agents/platform/scripts/forge.py, `_forward`) and resolver.py for the issues
 # sweep's `poll` (github-issue-resolver, `_forward_to_sandbox`). The copy under
 # /opt/data is root-owned and, under the operator, a read-only mount, but it

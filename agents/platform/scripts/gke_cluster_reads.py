@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The Cluster Agent reconcile's GKE reads, in one sandbox process (#3703).
+"""The GKE reads of the Cluster Agent reconcile and of stall_watch, in one sandbox process (#3703).
 
 The reconcile runs in the agent pod, but only the shell sandbox holds the token the
 broker's read-only Cloud API relay (`/v1/gcp/`) accepts. So the reconcile sends this
@@ -13,7 +13,7 @@ whose start-up on the sandbox's CPU was what made a tick grow by ~2.4 s per clus
 Input:  {"projects": ["p1", ...], "clusters": [["project", "location", "name"], ...],
          "workers": 16, "budget_seconds": 25.0}
 Output: {"lists": {"p1": {"status": 200, "clusters": [["name", "location"], ...],
-                           "missingZones": [...]}
+                           "statuses": ["RUNNING", ...], "missingZones": [...]}
                          | {"status": <int or 0>, "error": {...}}},
          "gets":  {"project/location/name": {"status": 200} | {"status": ..., "error": {...}}}}
 
@@ -116,10 +116,14 @@ def list_project(project: str, deadline: float) -> dict:
     if error is not None or body is None:
         return {"status": status, "error": error or {"text": "no body"}}
     rows = []
+    # Beside the rows, not in them: a reader that unpacks `name, location` keeps
+    # working, and one that needs the status reads it from the same position.
+    statuses = []
     for cluster in body.get("clusters") or []:
         if isinstance(cluster, dict) and isinstance(cluster.get("name"), str) and isinstance(cluster.get("location"), str):
             rows.append([cluster["name"], cluster["location"]])
-    answer = {"status": status, "clusters": rows}
+            statuses.append(cluster["status"] if isinstance(cluster.get("status"), str) else "")
+    answer = {"status": status, "clusters": rows, "statuses": statuses}
     missing = body.get("missingZones")
     if isinstance(missing, list):
         answer["missingZones"] = [z for z in missing if isinstance(z, str)]

@@ -520,6 +520,33 @@ SYSTEM_NAMESPACE_PREFIXES = ("gke-", "gke-managed-", "config-management-")
 #: goes dark mid-sweep costs one scan timeout rather than one per namespace.
 PROJECT_LOOKUP_TIMEOUT_SECONDS = 30
 CLUSTER_LIST_TIMEOUT_SECONDS = 120
+# A project's cluster list is read first through the broker's read-only Cloud API
+# relay, from one sandbox process (`gke_cluster_reads.py`, the reader
+# cluster_agent_reconcile uses), which starts no `gcloud` in the broker. The relay
+# answers name, location and status, which is all this listing keeps, and its
+# `missingZones` says when a list is partial. Any other answer, a helper that is
+# missing (a sandbox image older than this script) or cannot run, or a relay this
+# caller may not use, falls back to `gcloud container clusters list` as before; a
+# helper that could not run at all turns the relay off for the rest of the process.
+# The root-owned copy the shell may run (gke_cluster_reads.SANDBOX_GKE_READS;
+# test_stall_watch holds the two equal).
+GKE_READS_HELPER = "/opt/vcs/libexec/platform/gke_cluster_reads.py"
+# The relay read gets at most this, and at most half of the listing's budget, so a
+# helper that stalls leaves gcloud the rest.
+RELAY_LIST_TIMEOUT_SECONDS = 30
+RELAY_LIST_BUDGET_SHARE = 0.5
+# What the helper's own deadline leaves for the sandbox login and the interpreter.
+RELAY_STARTUP_SECONDS = 3.0
+RELAY_INCOMPLETE_LISTING = "the cluster list did not answer for {zones}"
+# The broker's refusals that are about the relay, not one project: a caller role it
+# does not serve, a handler with no relay, a host it does not take (a broker older
+# than the routes). The relay is off for the rest of the process. The same sets as
+# cluster_agent_reconcile's (test_stall_watch holds them equal).
+RELAY_OFF_CODES = frozenset({"CALLER_ROLE_FORBIDDEN", "API_RELAY_DISABLED"})
+RELAY_OFF_RULES = frozenset({"gcp.api.host", "gcp.api.host-refused"})
+# A project the helper may put in a URL path; anything else is listed with gcloud,
+# so a malformed name can never be read as some other path (the reconcile's rule).
+RELAY_SEGMENT = re.compile(r"[a-z0-9][a-z0-9.:-]*")
 #: The broker bounds one gcloud it runs at 300 s (its ``--timeout-seconds``
 #: default) and a one-shot kubectl at 60 s. No cap in this file holds more than
 #: one broker admission wait and one such run. The shim retries a refusal on
@@ -538,7 +565,8 @@ SHIM_RETRY_DEADLINE_SECONDS = max(0, CLUSTER_LIST_TIMEOUT_SECONDS - BROKER_GCLOU
 #: listing still running at the deadline is unlisted this tick. One at a time,
 #: a hundred projects (the scope's cap) each hanging to the gcloud timeout would
 #: outlast the whole tick.
-#: Every listing is a gcloud process the credential proxy runs. The pool was
+#: A listing the relay cannot answer (GKE_READS_HELPER) is a gcloud process the
+#: credential proxy runs; the relay's is one sandbox process and no gcloud. The pool was
 #: sized to the four requests the proxy admitted at its old 1Gi default
 #: (docs/designs/credential-proxy-child-memory-budget.md §2.2), past which a
 #: listing queues at the proxy and one still waiting at its 60 s admission
@@ -870,10 +898,75 @@ def project_id() -> str | None:
     return r.stdout.strip() or None
 
 
+_relay_off = False
+
+
+def list_clusters_by_relay(project: str, timeout: float) -> tuple[list[dict], str | None] | None:
+    """`list_clusters`'s answer read through the relay, or None for gcloud to read it."""
+    global _relay_off
+    if _relay_off or timeout < RELAY_STARTUP_SECONDS + 1:
+        return None
+    if not RELAY_SEGMENT.fullmatch(project) or ".." in project:
+        return None
+    request = {"projects": [project], "workers": 1, "budget_seconds": timeout - RELAY_STARTUP_SECONDS}
+    try:
+        result = run_sandbox(["python3", GKE_READS_HELPER], timeout=timeout, stdin=json.dumps(request))
+    except sandbox_exec.SandboxUnavailable:
+        raise
+    except subprocess.TimeoutExpired:
+        return None
+    try:
+        if result.returncode != 0:
+            raise ValueError(f"exit {result.returncode}")
+        row = json.loads(result.stdout or "")["lists"][project]
+    except (ValueError, KeyError, TypeError):
+        _relay_off = True
+        return None
+    if not isinstance(row, dict):
+        _relay_off = True
+        return None
+    error = row.get("error") if isinstance(row.get("error"), dict) else {}
+    if error.get("code") in RELAY_OFF_CODES or (
+        error.get("code") == "SECURITY_POLICY_BLOCKED" and error.get("rule") in RELAY_OFF_RULES
+    ):
+        _relay_off = True
+        return None
+    names, statuses = row.get("clusters"), row.get("statuses")
+    if row.get("status") == http.client.OK and isinstance(names, list) and statuses is None:
+        # A sandbox image whose helper predates the statuses: it will not change
+        # within this process.
+        _relay_off = True
+        return None
+    if (
+        row.get("status") != http.client.OK
+        or not isinstance(names, list)
+        or not isinstance(statuses, list)
+        or len(names) != len(statuses)
+    ):
+        return None
+    clusters = [
+        {"name": pair[0], "location": pair[1], "status": status}
+        for pair, status in zip(names, statuses)
+        if isinstance(pair, list) and len(pair) == 2 and all(isinstance(x, str) and x for x in pair)
+        and isinstance(status, str)
+    ]
+    if len(clusters) != len(names):
+        return None
+    missing = [z for z in row.get("missingZones") or [] if isinstance(z, str)]
+    return clusters, (RELAY_INCOMPLETE_LISTING.format(zones=", ".join(missing)) if missing else None)
+
+
 def list_clusters(project: str, timeout: float = CLUSTER_LIST_TIMEOUT_SECONDS) -> tuple[list[dict], str | None]:
     """Every cluster as {name, location, status}, and why the listing is
-    incomplete when gcloud said so. Raises on a list that could not be read,
-    so the caller can tell an empty project from a failed call."""
+    incomplete when gcloud (or the relay's missingZones) said so. Raises on a
+    list that could not be read, so the caller can tell an empty project from a
+    failed call. The relay is tried first (`list_clusters_by_relay`)."""
+    if not _relay_off:
+        started = time.monotonic()
+        relayed = list_clusters_by_relay(project, min(RELAY_LIST_TIMEOUT_SECONDS, timeout * RELAY_LIST_BUDGET_SHARE))
+        if relayed is not None:
+            return relayed
+        timeout = max(1.0, timeout - (time.monotonic() - started))
     r = run_sandbox(
         ["gcloud", "container", "clusters", "list", f"--project={project}", "--format=json"],
         timeout=timeout,
