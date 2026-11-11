@@ -51,7 +51,7 @@ starts it. The values, as many as the runtime can tell apart:
 | `event`     | the event watcher's triage: a `k8s-evt-*` session the Session KV server opens for a cluster event, decided by the first injected payload (`k8s-event`, `k8s-event-followup` and `controller-stall` are all `event`)                                                                                        |
 | `drift`     | the drift detector: a `k8s-evt-*` session whose first injected payload carries `kind: gitops-drift`, and the cards the drift backlog files                                                                                                                                                                 |
 | `audit`     | a scheduled fleet audit: a scheduler-started run of a job shipped in the image's `agents/platform/cron/jobs.json` whose `skills` list names `fleet-audit`                                                                                                                                                  |
-| `scheduled` | a scheduler-started run of any other shipped job, the `github-repo-watcher` gate included, and the pull-request follow-up cards that gate files; a job the model created runs under the origin of the session that created it                                                                              |
+| `scheduled` | a scheduler-started run of any other shipped job, the `github-repo-watcher` gate included, and the pull-request follow-up and Decision Memory proposal cards that gate files; a job the model created runs under the origin of the session that created it                                                 |
 | `issue`     | a claimed GitHub issue: a worker on an issue card the `github-repo-watcher` gate filed; the gate stamps the card itself, so a card the model names `issue-resolve-*` is not `issue`                                                                                                                        |
 | `other`     | work whose origin none of the above resolves, and the value a failed write defaults to                                                                                                                                                                                                                     |
 
@@ -79,7 +79,7 @@ Three kinds of unit carry the record, each written by in-pod code inside one tru
   chat stamp `issue` or `drift`. Instead the board stamps, at insert and only at insert, the creating turn's trusted context:
   the session record of the turn that files it, read by the trusted Hermes session id (`chat` with its platform, `event`, `drift`, `api`, or `console` by the id-prefix convention), a tick-started run's `audit` or `scheduled`, the dashboard's `console`; a card a worker files inherits the worker's card, and an auto-decomposed
   child inherits its parent's. The few trusted writers that know better than their own context,
-  the issue gate (`issue` on its issue cards, `scheduled` on its pull-request follow-up cards),
+  the issue gate (`issue` on its issue cards, `scheduled` on its pull-request follow-up and Decision Memory proposal cards),
   the drift backlog (`drift`) and the chat bootstrap (`chat`), pass the stamp to the insert
   through an endpoint on the Session KV server's loopback API, and the stamp applies only to a
   card that call inserted: a dedupe hit on a key someone filed first keeps the first card's
@@ -275,7 +275,7 @@ holds as it stands.
 - **Hermes scheduler patch** (beside `deploy/docker/patches/apply_cron_run_workdir.py`): the
   per-run origin context, `audit` or `scheduled` from the shipped file's `skills` for tick-started runs of jobs that match the template; the creating or editing session's origin recorded per job id in the Session KV server by the `cronjob` tool's handler and carried by that job's tick-started runs.
 - **`github_scan_gate.py`**: `issue` on its issue cards, `scheduled` on its pull-request
-  follow-up cards, passed to the insert through the loopback endpoint.
+  follow-up and Decision Memory proposal cards, passed to the insert through the loopback endpoint.
 - **`pr_opened` hook** (`agents/platform/plugins/pr_opened/__init__.py`): the claim of every
   record line in every process (the forge check moves to the broker); the origin resolution in
   the order of §2.2; the ledger write.

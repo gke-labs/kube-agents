@@ -72,6 +72,10 @@ PROTECTED_BRANCH_PREFIXES = ("run/",)
 # same reason: what the file holds is posted publicly, so a path the model
 # supplies is a way to publish any file the agent container can read.
 SCRATCH_DIR = "/opt/data/scratch"
+DECISION_MEMORY_DIRS = vcs_client.DECISION_MEMORY_DIRS
+DECISION_MEMORY_SCRIPT_REL = vcs_client.DECISION_MEMORY_SCRIPT_REL
+DECISION_MEMORY_HEADING = vcs_client.DECISION_MEMORY_HEADING
+DECISION_MEMORY_VALID_EXIT_CODES = vcs_client.DECISION_MEMORY_VALID_EXIT_CODES
 
 
 def _short_branch(branch: str) -> str:
@@ -562,20 +566,50 @@ def handle_prepare(args) -> int:
                 )
         started_from = base
 
-    print(json.dumps({
+    ws = Path(cloned["path"])
+    has_dm = any((ws / rel).is_dir() for rel in DECISION_MEMORY_DIRS) or (
+        ws / ".kube-agents" / "intent.yaml"
+    ).is_file()
+    if has_dm:
+        log(
+            "Decision Memory records exist in knowledge/. Run "
+            '`python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py '
+            f"--repo {ws} why <path>` before modifying governed files."
+        )
+    out_payload = {
         "workspace": cloned["path"],
         "repo": repo,
         "branch": branch,
         "base": base,
         "started_from": started_from,
         "proposal": (proposal or {}).get("url", ""),
-    }))
+    }
+    if has_dm:
+        out_payload["decision_memory"] = True
+    print(json.dumps(out_payload))
     return 0
 
 
 def pending_changes(session: dict) -> str:
     """What the working copy holds that its revision does not."""
     return vcs_client.local(session, ["status", "--porcelain"], "status")["stdout"].strip()
+
+
+def _resolve_decision_memory_base(session: dict, ws: Path, base: str) -> str:
+    """Return a revision in `ws` to diff against `HEAD` for Decision Memory checks."""
+    return vcs_client._resolve_decision_memory_base(session, ws, base)
+
+
+def _check_decision_memory(
+    session: dict,
+    base: str,
+    repo: str | None = None,
+    copy_key: str | None = None,
+) -> dict | None:
+    """Run Decision Memory check on the staged/committed change before publishing."""
+    return vcs_client._check_decision_memory(
+        session, base, repo=repo, copy_key=copy_key, log_fn=log
+    )
 
 
 def handle_submit(args) -> int:
@@ -800,9 +834,21 @@ def handle_submit(args) -> int:
         # of the base — the second round on an open proposal. `publish` refuses
         # to write to the branch a copy came down on otherwise, and that refusal
         # is the one that caught a worker fast-forwarding a branch it had cloned.
-        vcs_client.publish(
-            repo, target=base, advance=session["branch"] == branch, key=copy_key
+        pub_ans = vcs_client.publish(
+            repo,
+            target=base,
+            advance=session["branch"] == branch,
+            key=copy_key,
         )
+        if isinstance(pub_ans, dict) and pub_ans.get("decisionMemoryMarkdown"):
+            md_section = str(pub_ans["decisionMemoryMarkdown"])
+            if md_section:
+                log(
+                    "DECISION MEMORY CONTEXT (include the record IDs, superseding PR #, and superseded incident/PR # in your final summary):\n"
+                    f"{md_section}"
+                )
+                if not args.keep_description and DECISION_MEMORY_HEADING not in body:
+                    body = body.rstrip() + "\n\n" + md_section + "\n"
 
     url = _land_proposal(repo, branch, base, args.title, body, proposal, args.keep_description)
     log(f"PR SUBMITTED SUCCESSFULLY! 🏆 URL: {url}")
@@ -1005,7 +1051,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="The branch this merges into (default: the open proposal's, else "
              "the base the broker pins, else the branch the copy was taken of)",
     )
-
     for command in (prepare, submit):
         for flag in RETIRED:
             command.add_argument(

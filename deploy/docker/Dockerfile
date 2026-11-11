@@ -108,11 +108,10 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
     CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
     go build -ldflags="-w -s" -o /workspace/drift-detector ./cmd/drift-detector/
 
-# The a2a CLI — the topics reader/writer for the A2A bus (mode: next). Same
-# pattern as the event watcher above. The binary ships UNGATED at
-# /usr/local/bin: it is inert until something invokes it, and the thing that
-# invokes it — the a2a-topics skill — is what ships dark (see the
-# /opt/a2a-template COPY below and docker-entrypoint.sh step 2.6a-bis).
+# The a2a CLI (topics reader/writer for mode: next) and the curator CLI/daemon
+# (OKF decision and lesson memory). Same pattern as the event watcher above: both
+# ship UNGATED at /usr/local/bin and stay inert until something invokes them
+# (see /opt/a2a-template and docker-entrypoint.sh steps 2.6a-bis and 5.6b).
 FROM --platform=$BUILDPLATFORM ${GOLANG_IMAGE}:${GOLANG_VERSION} AS a2a-builder
 # Repeated for the same reason as watcher-builder above: a substituted
 # GOLANG_IMAGE must not reintroduce GOTOOLCHAIN=auto (#1138).
@@ -123,11 +122,13 @@ WORKDIR /workspace
 COPY a2a/ /workspace/a2a/
 WORKDIR /workspace/a2a
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
-    go build -ldflags="-w -s" -o /workspace/bin/a2a ./cmd/a2a/
+    go build -ldflags="-w -s" -o /workspace/bin/a2a ./cmd/a2a/ && \
+    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
+    go build -ldflags="-w -s" -o /workspace/bin/curator ./cmd/curator/
 
-# tirith joins a2a in /workspace/bin, so agent-base copies both with the one
-# COPY it already has and the image gains no layer. The download is verified
-# against the pinned sum for the target architecture before anything is kept.
+# tirith joins a2a and curator in /workspace/bin, so agent-base copies all three
+# with the one COPY it already has and the image gains no layer. The download is
+# verified against the pinned sum for the target architecture before anything is kept.
 FROM a2a-builder AS a2a-tools
 ARG TARGETARCH
 ARG TIRITH_VERSION
@@ -2335,9 +2336,9 @@ COPY --chmod=0755 deploy/shared/docker-entrypoint.sh /usr/local/bin/agent-entryp
 # of the pod, on a pod that stays Ready while it does.
 COPY --from=watcher-builder --chmod=0755 /workspace/k8s-event-watcher /workspace/drift-detector /usr/local/bin/
 
-# The a2a CLI, ungated (see the a2a-builder stage for why that is safe), and the
-# pinned tirith (see the a2a-tools stage).
-COPY --from=a2a-tools --chmod=0755 /workspace/bin/a2a /workspace/bin/tirith /usr/local/bin/
+# The a2a CLI and curator daemon, ungated (see the a2a-builder stage for why that is safe),
+# and the pinned tirith (see the a2a-tools stage).
+COPY --from=a2a-tools --chmod=0755 /workspace/bin/a2a /workspace/bin/curator /workspace/bin/tirith /usr/local/bin/
 
 # 6. Expose ports shared by all agent gateways
 EXPOSE 8642

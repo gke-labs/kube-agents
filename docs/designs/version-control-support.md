@@ -917,7 +917,7 @@ it; `ROLE_VCS_VERBS` refuses it to the `mcp` role.
 | `capabilities`                       | `{repository}`                                                       | `{forge, repo, proposalNoun, verbs, acknowledge, labels, missing, baseBranch, fileUrl?}` |
 | `clone`                              | `{repository, branch?}`                                              | `{forge, repo, branch, revision, size, bundleBase64, baseBranch}`                        |
 | `snapshot`                           | `{repository, ref?, paths?, maxBytes?}`                              | `{forge, repo, role, ref, revision, size, archiveBase64, history: "none"}`               |
-| `publish`                            | `{repository, branch, target, baseRevision, bundleBase64, advance?}` | `{forge, repo, branch, revision}`                                                        |
+| `publish`                            | `{repository, branch, target, baseRevision, bundleBase64, advance?}` | `{forge, repo, branch, revision, decisionMemoryMarkdown?}`                               |
 | `proposal-create`                    | `{repository, source, target, title, body?, draft?}`                 | `{proposal, forge, repo, claim?}`                                                        |
 | `proposal-claim`                     | `{claim, url}`                                                       | `{url, number, title}`                                                                   |
 | `proposal-list`                      | `{repository, state?, limit?, page?, labels?, source?, target?}`     | `{proposals, count, truncated}`                                                          |
@@ -1061,10 +1061,12 @@ whose name is not UTF-8 and so cannot be asked for; past 4096 entries it carries
 `maxBytes`, the bytes the caller unpacks at most, refuses a tree whose files pass it the same
 way, with the install's `ceiling`),
 400 `PATH_NOT_FOUND` (a `snapshot` path that names nothing at the ref; the refusal
-carries the `revision` it read), 409 `NOT_FAST_FORWARD`, `BASE_MOVED`, `BRANCH_DIVERGED`,
+carries the `revision` it read), 403 `FORBIDDEN_LABEL` (`decision-override:*` labels are
+reserved for human reviewers), 409 `NOT_FAST_FORWARD`, `BASE_MOVED`, `BRANCH_DIVERGED`,
 `TARGET_IS_BRANCH`, `CLONED_BRANCH`, `PROTECTED_BRANCH`, `TARGET_NOT_BASE`,
 `BASE_BRANCH_MISSING`, `BRANCH_NOT_OURS`, `OPEN_PROPOSAL`, `BRANCH_MOVED`,
-`NOT_SPENT` and `DELETE_REFUSED`, 501 `LABELS_UNSUPPORTED`, 502 `GIT_FAILED`,
+`NOT_SPENT`, `DELETE_REFUSED`, `DECISION_MEMORY_BLOCKED` and `DECISION_MEMORY_CHECK_FAILED`
+(also 500 when the checker returns malformed JSON), 501 `LABELS_UNSUPPORTED`, 502 `GIT_FAILED`,
 `FORGE_TLS_UNTRUSTED`, `FORGE_IDENTITY_UNKNOWN` and `FORGE_CALL_FAILED`.
 
 A refusal the forge itself produced is translated rather than forwarded, and it
