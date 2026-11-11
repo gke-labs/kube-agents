@@ -92,7 +92,7 @@ func (d *Dispatcher) runJob(ctx context.Context, log *slog.Logger, del lib.Deliv
 	}
 	created, err := d.jobs.Launch(ctx, h.profile, h.tier, h.taskID)
 	if err != nil {
-		if errors.Is(err, ErrJobRefusedByPolicy) {
+		if errors.Is(err, ErrJobRefusedByPolicy) || errors.Is(err, ErrJobTemplateNotCurrent) {
 			d.jobRefused(log, err)
 		}
 		return lib.LeaseRecord{}, "", false, fmt.Errorf("launch the task's Job: %w", err)
@@ -211,7 +211,7 @@ func (d *Dispatcher) dropUnconfirmedJob(ctx context.Context, log *slog.Logger, h
 
 // jobRefusedHint is what the dispatcher says when the Job admission policy
 // refuses a Job built from the operator's own template.
-const jobRefusedHint = "the Job admission policy refused a Job built from the operator's template: the policy's DispatchJobTemplate params and the dispatch config disagree (an operator pass may be under way, or a param was edited or removed), or a mutating webhook changed the Job (check the operator's events). The task stays queued."
+const jobRefusedHint = "a Job couldn't be made from the operator's template: its DispatchJobTemplate param is missing or isn't the rendering the dispatch config names (an operator pass may be under way, or a param was edited or removed), or the Job admission policy refused the Job (a param changed between the read and the create, or a mutating webhook changed the Job; check the operator's events). The task stays queued."
 
 // jobRefused records a Job the admission policy refused: reported in Health
 // and logged once as an error until a Job is admitted.

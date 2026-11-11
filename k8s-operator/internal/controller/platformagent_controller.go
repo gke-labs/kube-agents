@@ -722,8 +722,9 @@ type PlatformAgentReconciler struct {
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // `dispatchjobtemplates` are the dispatcher Job admission policy's params in
 // <ns>-profiles (agentprofile_job_template.go), which the operator alone
-// writes; no Role it renders grants the kind, and the built-in admin and edit
-// roles don't aggregate it. `podtemplates` create only: the server-side dry
+// writes; no Role it renders grants a write on the kind (the dispatcher's Jobs
+// Role grants get, to read the template its config names), and the built-in
+// admin and edit roles don't aggregate it. `podtemplates` create only: the server-side dry
 // run that defaults a Job template (defaultedJobTemplate), which stores
 // nothing. ClusterRole rules, not Roles: the profile namespace is created at
 // runtime, and RBAC escalation prevention stops the operator granting itself

@@ -59,9 +59,15 @@ func NewKubeJobs(kube kubernetes.Interface, config func() lib.DispatchConfig) *K
 	return k
 }
 
-// dispatchJobTemplatePath is a DispatchJobTemplate's path on the API server.
-// The CRD's Go type lives in the operator's module, so it is read as JSON.
-const dispatchJobTemplatePath = "/apis/kubeagents.x-k8s.io/v1alpha1/namespaces/%s/dispatchjobtemplates/%s"
+// The DispatchJobTemplate's API group path and resource. The CRD's Go type
+// lives in the operator's module, so it is read as JSON.
+const (
+	dispatchJobTemplateGroupPath = "/apis/kubeagents.x-k8s.io/v1alpha1"
+	dispatchJobTemplateResource  = "dispatchjobtemplates"
+	// dispatchJobTemplatePrefix is the operator's name for a profile's
+	// param, before the profile's name.
+	dispatchJobTemplatePrefix = "kube-agents-dispatch-job-profile-"
+)
 
 // ErrJobTemplateNotCurrent marks a Launch whose profile's DispatchJobTemplate
 // is missing or holds a rendering other than the one the config names: an
@@ -69,7 +75,8 @@ const dispatchJobTemplatePath = "/apis/kubeagents.x-k8s.io/v1alpha1/namespaces/%
 var ErrJobTemplateNotCurrent = errors.New("the profile's DispatchJobTemplate is not the rendering the dispatch config names")
 
 func (k *KubeJobs) getJobTemplate(ctx context.Context, namespace, name string) ([]byte, error) {
-	return k.kube.Discovery().RESTClient().Get().AbsPath(fmt.Sprintf(dispatchJobTemplatePath, namespace, name)).DoRaw(ctx)
+	return k.kube.Discovery().RESTClient().Get().AbsPath(dispatchJobTemplateGroupPath).
+		Namespace(namespace).Resource(dispatchJobTemplateResource).Name(name).DoRaw(ctx)
 }
 
 // jobTemplate is prof's pod template: from the DispatchJobTemplate its
@@ -79,6 +86,11 @@ func (k *KubeJobs) jobTemplate(ctx context.Context, namespace string, prof *lib.
 	ref := prof.JobTemplateRef
 	if ref == nil {
 		return prof.JobTemplate, nil
+	}
+	// A profile's template is its own param: a reference to another
+	// profile's is refused rather than followed.
+	if ref.Name != dispatchJobTemplatePrefix+prof.Name {
+		return nil, fmt.Errorf("profile %s's jobTemplateRef names %s, not its own param", prof.Name, ref.Name)
 	}
 	raw, err := k.getTemplate(ctx, namespace, ref.Name)
 	if apierrors.IsNotFound(err) {

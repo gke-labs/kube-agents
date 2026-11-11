@@ -215,6 +215,26 @@ func TestTheDispatcherJobPolicyHoldsJobsToTheRenderedTemplate(t *testing.T) {
 		t.Errorf("the Job the dispatcher builds (%s): refused, want admitted: %v", dispatcherJobFixture, err)
 	}
 
+	// The dispatcher reads its profile's param by name (its Jobs Role's
+	// get), can't list the params, and a Job built from the param's own
+	// template, the API server's defaulted form, is admitted: that is the
+	// template the dispatcher launches from in production.
+	reader := impersonatedClientWith(t, cfg, scheme, agent.Namespace, a2aDispatcherName(agent))
+	var tseParam agentv1alpha1.DispatchJobTemplate
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: pns, Name: dispatchJobTemplatePrefix + "tse"}, &tseParam); err != nil {
+		t.Fatalf("the dispatcher can't read tse's param: %v", err)
+	}
+	if err := reader.List(ctx, &agentv1alpha1.DispatchJobTemplateList{}, client.InNamespace(pns)); !apierrors.IsForbidden(err) {
+		t.Errorf("the dispatcher listing the params: %v, want forbidden", err)
+	}
+	held, ok := dispatchJobParamTemplate(&tseParam)
+	if !ok {
+		t.Fatalf("tse's param holds no template")
+	}
+	if err := dispatcher.Create(ctx, dispatcherJob("from-the-param", &held, nil)); err != nil {
+		t.Errorf("a Job from the param's defaulted template: refused, want admitted: %v", err)
+	}
+
 	// Each case its own Job name, so one wrongly admitted doesn't make
 	// the next refused as already existing.
 	for i, name := range names {

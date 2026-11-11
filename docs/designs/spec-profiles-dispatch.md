@@ -459,15 +459,21 @@ leave open:
   is deleted, and the task fails `no-worker`. Jobs count against the same caps. The Job is
   deleted when the task's outcome is settled, never when the dispatcher stops, so a restart
   re-adopts the task.
-  The dispatch config doesn't carry the Job's pod template. It names the profile's
+  The dispatch config doesn't carry the Job's pod template. It names the profile's own
   `DispatchJobTemplate` in the profile namespace, the param the Job admission policy holds each
   Job to, and the hash of the rendering it means (`jobTemplateRef`). The dispatcher reads that
   object when it launches the Job, with `get` alone on those objects, and uses it only while
-  the object's `kubeagents.x-k8s.io/dispatch-template-hash` annotation matches. A param that is
-  missing, behind the config, or holds no containers keeps that profile's task queued and
-  leaves every other profile alone. Copying the template into the config made a two-tier
-  unattended profile's entry about 4.4 KB, which put the config's ConfigMap past 1 MiB at about
-  240 such profiles.
+  the object's `kubeagents.x-k8s.io/dispatch-template-hash` annotation matches. Any mismatch, a
+  missing param, or one with no containers keeps that profile's task queued, shows on the
+  dispatcher's health as a Job admission error, and leaves every other profile alone. The
+  operator writes params before the config, so the usual transient is a param ahead of the
+  dispatcher's cached config. The hash says which rendering a param holds; it is the
+  writer's claim, not a digest of the param's contents, and only the operator and cluster
+  admins can write params. Copying the template into the config made a two-tier unattended
+  profile's entry about 4.4 KB, which put the config's ConfigMap past 1 MiB at about 240
+  such profiles. A dispatcher older than this reads only an inline template, so it refuses
+  unattended tasks `no-worker` under an operator that sends the reference: move the
+  dispatcher's image with the operator.
   Without a Job runner or a Job template, an unattended task has no worker (the operator builds
   warm pools for the read tier only), so admission refuses it at once, `no-worker` ("no runner
   for unattended on this install: Job mode is off"), rather than leave it queued until its
