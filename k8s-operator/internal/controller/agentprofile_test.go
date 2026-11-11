@@ -1486,27 +1486,37 @@ func TestAProfileServiceAccountChangeWakesItsProfile(t *testing.T) {
 // would land on and doesn't own, which refuses that profile and moves the
 // dispatcher ceiling's cut for every newer one: its event re-reconciles every
 // profile in the agent's namespace. A labeled one still wakes only its own.
-func TestAnUnlabeledProfileServiceAccountWakesEveryProfile(t *testing.T) {
+func TestAProfileNamedServiceAccountWakesEveryProfile(t *testing.T) {
 	agent := a2aTestAgent()
 	a, b := testAgentProfile(agent.Namespace, "auditor"), testAgentProfile(agent.Namespace, "triage")
 	c := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(&a, &b).Build()
-	sa := func(ns string, labels map[string]string) *corev1.ServiceAccount {
-		return &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "agentprofile-auditor-read", Namespace: ns, Labels: labels}}
+	sa := func(name, ns string, labels map[string]string) *corev1.ServiceAccount {
+		return &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, Labels: labels}}
 	}
-	ctx := context.Background()
-	got := profileServiceAccountRequests(ctx, c, sa(agent.Namespace+"-profiles", nil))
-	names := []string{}
-	for _, r := range got {
-		names = append(names, r.Name)
+	woke := func(obj *corev1.ServiceAccount) []string {
+		names := []string{}
+		for _, r := range profileServiceAccountRequests(context.Background(), c, obj) {
+			names = append(names, r.Name)
+		}
+		slices.Sort(names)
+		return names
 	}
-	slices.Sort(names)
-	if !slices.Equal(names, []string{"auditor", "triage"}) {
-		t.Errorf("an unlabeled ServiceAccount woke %v, want every profile", names)
+	profilesNS := agent.Namespace + "-profiles"
+	// Named like a profile's, it may be foreign whatever its labels say: a
+	// stale copy labelled with the profile's name but an old UID, or one
+	// labelled with another profile's name.
+	for _, labels := range []map[string]string{nil, {agentProfileNameLabel: "auditor"}, {agentProfileNameLabel: "triage"}} {
+		if got := woke(sa("agentprofile-auditor-read", profilesNS, labels)); !slices.Equal(got, []string{"auditor", "triage"}) {
+			t.Errorf("a profile-named ServiceAccount labelled %v woke %v, want every profile", labels, got)
+		}
 	}
-	if got := profileServiceAccountRequests(ctx, c, sa(agent.Namespace+"-profiles", map[string]string{agentProfileNameLabel: "auditor"})); len(got) != 1 || got[0].Name != "auditor" {
-		t.Errorf("a labeled ServiceAccount woke %v, want its own profile", got)
+	if got := woke(sa("default", profilesNS, map[string]string{agentProfileNameLabel: "auditor"})); !slices.Equal(got, []string{"auditor"}) {
+		t.Errorf("a labelled ServiceAccount with another name woke %v, want its own profile", got)
 	}
-	if got := profileServiceAccountRequests(ctx, c, sa(agent.Namespace, nil)); len(got) != 0 {
+	if got := woke(sa("default", profilesNS, nil)); len(got) != 0 {
+		t.Errorf("an unlabelled ServiceAccount with another name woke %v, want none", got)
+	}
+	if got := woke(sa("agentprofile-auditor-read", agent.Namespace, nil)); len(got) != 0 {
 		t.Errorf("a ServiceAccount outside a profile namespace woke %v", got)
 	}
 }

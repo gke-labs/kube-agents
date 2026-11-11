@@ -429,10 +429,10 @@ leave open:
   time, then name) while both fit, less a reserve for draining profiles, and refuses newer ones with
   `IdentityReady` reason `DispatcherCeiling`; the dispatcher serves the rest. The PlatformAgent's
   `DispatcherCeiling` condition warns at four fifths of either budget and reads
-  `ProfilesRefused` while any profile is left out. Past the budget anyway, which only draining
-  profiles can cause, the operator runs no dispatcher rather than write a map the API server
-  refuses. It keeps the dispatch config, with each drain's deadline, so the dispatcher comes back
-  once those drains run out. Adding a tier to an older profile can leave the newest one out. #5381 lifts the
+  `ProfilesRefused` while any profile is left out. Past either budget anyway, which only draining
+  profiles can cause, the operator runs no dispatcher rather than write a map or a ConfigMap the
+  API server refuses. It rewrites the dispatch config with the draining profiles alone and each
+  drain's deadline, so the dispatcher comes back once those drains run out. Adding a tier to an older profile can leave the newest one out. #5381 lifts the
   ceiling, by deriving the grants per connection as sessions are, and blocks the 2,500-profile
   target.
 - **Terminal notice.** A task the dispatcher ends gets a final status on its `.supervisor`

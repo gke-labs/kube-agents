@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -509,30 +510,28 @@ func (r *AgentProfileReconciler) deleteProfileServiceAccounts(ctx context.Contex
 	return nil
 }
 
+// profileServiceAccountRequests is what a ServiceAccount event in a profile
+// namespace re-reconciles. One named like a profile's (the per-tier prefix)
+// may be one a profile would land on and doesn't own, whatever its labels say
+// (agentProfileServiceAccountIsForeign checks the name label and the UID
+// annotation), and that refuses the profile and so moves the dispatcher
+// ceiling's cut for every newer one: it re-reconciles every profile in the
+// agent's namespace, as the PlatformAgent's watch re-reconciles its agent.
+// Any other name maps to its labelled profile, if any.
+func profileServiceAccountRequests(ctx context.Context, c client.Reader, obj client.Object) []reconcile.Request {
+	if strings.HasPrefix(obj.GetName(), agentProfileServiceAccountPrefix) {
+		if agentNS, ok := agentNamespaceOfProfileServiceAccount(obj.GetNamespace()); ok {
+			return agentProfileRequestsIn(ctx, c, agentNS)
+		}
+		return nil
+	}
+	return profileServiceAccountRequest(obj)
+}
+
 // profileServiceAccountRequest maps a ServiceAccount in a profile namespace,
 // labelled with a profile's name, to that profile in the agent's namespace.
 // Anything else maps to nothing. A label someone copied only costs a
 // reconcile, which checks ownership by UID.
-// profileServiceAccountRequests is what a ServiceAccount event in a profile
-// namespace re-reconciles: its own profile when it carries the name label,
-// and every profile in the agent's namespace when it doesn't, since an
-// unlabeled one may be a ServiceAccount a profile would land on and doesn't
-// own (agentProfileServiceAccountIsForeign), which moves the dispatcher
-// ceiling's cut for every newer profile.
-func profileServiceAccountRequests(ctx context.Context, c client.Reader, obj client.Object) []reconcile.Request {
-	if reqs := profileServiceAccountRequest(obj); reqs != nil {
-		return reqs
-	}
-	if obj.GetLabels()[agentProfileNameLabel] != "" {
-		return nil
-	}
-	agentNS, ok := agentNamespaceOfProfileServiceAccount(obj.GetNamespace())
-	if !ok {
-		return nil
-	}
-	return agentProfileRequestsIn(ctx, c, agentNS)
-}
-
 func profileServiceAccountRequest(obj client.Object) []reconcile.Request {
 	name := obj.GetLabels()[agentProfileNameLabel]
 	agentNS, ok := agentNamespaceOfProfileServiceAccount(obj.GetNamespace())
@@ -676,10 +675,10 @@ func (r *AgentProfileReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// The legacy agent-namespace ServiceAccount (deleteOwnServiceAccount).
 		Owns(&corev1.ServiceAccount{}).
 		// The per-tier ServiceAccounts carry no owner reference, so they map
-		// back to their profile by name label and namespace. One without the
-		// label may be a ServiceAccount a profile would land on and doesn't own,
-		// which refuses that profile and so moves the dispatcher ceiling's cut
-		// for every newer one: it re-reconciles every profile in the namespace.
+		// back to their profile by namespace; one named like a profile's may be
+		// a foreign one that refuses a profile and moves the dispatcher
+		// ceiling's cut, so it re-reconciles every profile in the namespace
+		// (profileServiceAccountRequests).
 		Watches(
 			&corev1.ServiceAccount{},
 			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {

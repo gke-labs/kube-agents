@@ -246,13 +246,14 @@ var dispatcherCutCache = struct {
 // dispatcherCutCacheSize bounds the cache; past it, it starts over.
 const dispatcherCutCacheSize = 64
 
-// dispatcherCutKey fingerprints what decides a cut: the agent's spec and
-// place, each bound profile's name, creation time and spec, in order, and the
-// operator's environment, which picks the images and Job mode.
+// dispatcherCutKey fingerprints what decides a cut: the agent's spec, place
+// and live submit retention (which sizes the config's header), each bound
+// profile's name, creation time and spec, in order, and the operator's
+// environment, which picks the images and Job mode.
 func dispatcherCutKey(agent *agentv1alpha1.PlatformAgent, bound []*agentv1alpha1.AgentProfile) string {
 	h := sha256.New()
 	enc := json.NewEncoder(h)
-	_ = enc.Encode([]any{agent.Namespace, agent.Name, agent.Spec, os.Environ()})
+	_ = enc.Encode([]any{agent.Namespace, agent.Name, agent.Spec, agent.Status.ProfileSubmitMaxAgeSeconds, os.Environ()})
 	for _, p := range bound {
 		_ = enc.Encode([]any{p.Name, p.CreationTimestamp, p.Spec})
 	}
