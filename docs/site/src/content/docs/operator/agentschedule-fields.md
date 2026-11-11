@@ -22,7 +22,7 @@ Every field of the `AgentSchedule` resource's `spec` and `status`, generated fro
 | `prompt` | `string` | yes |  | min length `1`; max length `16384` | Prompt is what each run asks. |
 | `parameters` | `map[string]string` | no |  | max properties `32` | Parameters are passed to each run as task parameters. `stream` names the run's audit report stream. |
 | `skills` | `[]string` | no |  | max items `16` | Skills the run asks the profile to use. |
-| `delivery` | `object` | no |  |  | Delivery is where each run's report goes. |
+| `delivery` | `object` | no | `{}` |  | Delivery is where each run's report goes. Omitted, it is the home channel (chat). |
 | `delivery.mode` | `string` | no | `chat` | one of `chat`, `local` | Mode is chat (the home channel) or local (kept, not posted). |
 | `delivery.silentWhenClean` | `boolean` | no |  |  | SilentWhenClean posts nothing for a run that found nothing. |
 | `delivery.jobKey` | `string` | no |  | max length `63` | JobKey groups a schedule's posts into one thread per UTC day. It defaults to the schedule's name. |

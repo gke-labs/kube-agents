@@ -124,7 +124,9 @@ type AgentScheduleSpec struct {
 	// +optional
 	Skills []string `json:"skills,omitempty"`
 
-	// Delivery is where each run's report goes.
+	// Delivery is where each run's report goes. Omitted, it is the home
+	// channel (chat).
+	// +kubebuilder:default={}
 	// +optional
 	Delivery AgentScheduleDelivery `json:"delivery,omitempty"`
 

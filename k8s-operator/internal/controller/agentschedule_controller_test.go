@@ -11,6 +11,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -591,6 +592,23 @@ func TestAgentScheduleSchemaEnvtest(t *testing.T) {
 		*ok.Spec.StartingDeadlineSeconds != 900 || ok.Spec.Delivery.Mode != agentv1alpha1.AgentScheduleDeliveryChat ||
 		ok.Spec.ActiveDeadlineSeconds != nil {
 		t.Fatalf("defaults = %+v; want Forbid, 900, chat, and no active deadline (the profile's applies)", ok.Spec)
+	}
+	// A manifest that omits delivery, as kubectl sends it (the Go client
+	// always sends delivery: {}), still defaults to the home channel.
+	raw := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": agentv1alpha1.GroupVersion.String(), "kind": "AgentSchedule",
+		"metadata": map[string]any{"name": "no-delivery", "namespace": "kubeagents-system"},
+		"spec":     map[string]any{"schedule": "0 * * * *", "profileRef": map[string]any{"name": "fleet-audit"}, "prompt": "no-op"},
+	}}
+	if err := cl.Create(ctx, raw); err != nil {
+		t.Fatalf("a schedule without delivery was refused: %v", err)
+	}
+	var noDelivery agentv1alpha1.AgentSchedule
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: "kubeagents-system", Name: "no-delivery"}, &noDelivery); err != nil {
+		t.Fatal(err)
+	}
+	if noDelivery.Spec.Delivery.Mode != agentv1alpha1.AgentScheduleDeliveryChat {
+		t.Errorf("delivery.mode with delivery omitted = %q, want chat", noDelivery.Spec.Delivery.Mode)
 	}
 	for _, tc := range []struct {
 		name   string

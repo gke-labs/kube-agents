@@ -80,7 +80,10 @@ spec:
                     - Forbid
                   type: string
                 delivery:
-                  description: Delivery is where each run's report goes.
+                  default: {}
+                  description: |-
+                    Delivery is where each run's report goes. Omitted, it is the home
+                    channel (chat).
                   properties:
                     jobKey:
                       description: |-
