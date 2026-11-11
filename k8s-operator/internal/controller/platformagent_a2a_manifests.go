@@ -726,12 +726,12 @@ const (
 	// The byte-cap findings (#4476): a stream above this render's cap, under
 	// a2aProvisionReportLiveKey (its max_bytes, -1 for none), HeldKey (the
 	// bytes it held when read, the re-read when a lower was attempted),
-	// WantKey (the cap the pod's script lowered to or would have), and
-	// LoweredKey (1 when the script lowered it, 0 when it left it).
+	// WantKey (the render's cap), and SafeKey (1 when it held under half the
+	// new cap, so lowering it evicts nothing; 0 otherwise).
 	a2aProvisionReportTasksMaxBytesKey         = "tasks_max_bytes"
 	a2aProvisionReportTopicsJournalMaxBytesKey = "topics_journal_max_bytes"
 	a2aProvisionReportHeldKey                  = "held"
-	a2aProvisionReportLoweredKey               = "lowered"
+	a2aProvisionReportSafeKey                  = "safe"
 	a2aProvisionReportMissingKey               = "missing"
 	a2aTopologySkewSubject                     = "a2a.topics.agent.platform.topology-skew"
 	// a2aProvisionContainerName is the Job pod's one container, named because
@@ -780,22 +780,19 @@ const (
 	// subject list is not quoted from the pod: the operator reads it with
 	// `nats stream info TOPICS-STATE` and appends to it, and the Event says so.
 	reasonTopicsStateSubjectMissing = "TopicsStateSubjectMissing"
-	// The byte-cap findings' Events (#4476). A lower the script made is a
-	// Normal Event naming the stream, the old and the new max_bytes and what
-	// it held, from the pod's report: that is what happened. A lower it left
-	// is a Warning whose remedy names this binary's cap, never the pod's
-	// want, on the same rule as the TASKS per-subject remedy. Format
-	// arguments, lowered: Job name, stream, live, want, held. Not lowered:
-	// Job name, stream, live, this render's cap, held, then the edit's
-	// stream and cap. The failed-edit form takes the same arguments.
-	reasonStreamCapLowered     = "A2ABusStreamCapLowered"
-	streamCapLoweredMessage    = "provision Job %s lowered stream %s's max_bytes from %s to %d bytes; it held %d bytes, under half the new cap, so nothing was evicted"
-	reasonStreamCapNotLowered  = "A2ABusStreamCapNotLowered"
-	streamCapNotLoweredMessage = "provision Job %s left stream %s at max_bytes %s, above this render's %d bytes: it held %d bytes, half the new cap or more, " +
-		"and provisioning lowers a cap only while the stream holds under half of it, since a lower close to what a stream holds can evict. " +
-		"Once it holds less: nats stream edit %s --max-bytes=%d"
-	streamCapEditFailedMessage = "provision Job %s could not lower stream %s from max_bytes %s to this render's %d bytes although it held only %d bytes; " +
-		"the edit failed (the Job's log has the error) and the stream keeps its cap. To apply it: nats stream edit %s --max-bytes=%d"
+	// The byte-cap finding's Event (#4476): a Warning naming the stream, its
+	// live max_bytes, this render's cap and what it held, and the exact edit
+	// to apply, which names this binary's cap, never the pod's want, on the
+	// same rule as the TASKS per-subject remedy. Provisioning does not edit
+	// an existing stream. The safe wording is for a stream holding under half
+	// the new cap, where the lower evicts nothing. Format arguments, both
+	// forms: Job name, stream, live, this render's cap, held, then the edit's
+	// stream and cap.
+	reasonStreamCapAboveRender = "A2ABusStreamCapAboveRender"
+	streamCapSafeMessage       = "provision Job %s found stream %s at max_bytes %s, above this render's %d bytes; it holds %d bytes, under half the new cap, " +
+		"so lowering it evicts nothing. Provisioning does not edit an existing stream; to apply it: nats stream edit %s --max-bytes=%d"
+	streamCapUnsafeMessage = "provision Job %s found stream %s at max_bytes %s, above this render's %d bytes; it holds %d bytes, half the new cap or more, " +
+		"and a lower that close to what a stream holds can evict. Provisioning does not edit an existing stream; once it holds less: nats stream edit %s --max-bytes=%d"
 	topicsStateSubjectEventMessage = "provision Job %s found the TOPICS-STATE stream without subject %s; " +
 		"this render creates the stream with it and provisioning does not change an existing stream's subjects, so nothing can publish to that topic " +
 		"until an operator appends it to the stream's current subject list (read it with nats stream info TOPICS-STATE): " +
@@ -1208,9 +1205,8 @@ const (
 	// was 20 GiB and TOPICS-JOURNAL 5 GiB, which with the rest reserved
 	// 28.875 of the 32 GiB store; at 8 and 1 the reservation is 12.875. 8 GiB
 	// on TASKS is not yet from a busy install's measured use; it can be raised
-	// once #4477 measures one. An existing stream
-	// above its cap is lowered by the provision script only while it holds
-	// under half the new cap (a2aProvisionCapLowerBlock).
+	// once #4477 measures one. An existing stream above its cap keeps it;
+	// the provision Job reports it with the edit (a2aProvisionCapLowerBlock).
 	a2aTasksMaxBytes         int64 = 8 << 30
 	a2aTopicsJournalMaxBytes int64 = 1 << 30
 )
@@ -3770,9 +3766,7 @@ $NATS stream info DISPATCH_STOPS >/dev/null 2>&1 || $NATS stream add DISPATCH_ST
 # TASKS older than this render: the limits the create above could not apply.
 #
 # Provisioning is create-only convergence - the info-then-add guards never
-# edit an existing stream, which buildA2AProvisionJob says in terms, with one
-# guarded exception: TASKS' and TOPICS-JOURNAL's byte caps are lowered while
-# the stream holds under half the new cap (cap_check, below) - so an
+# edit an existing stream, which buildA2AProvisionJob says in terms - so an
 # install whose TASKS predates a limit keeps the stream it was created with
 # and gains nothing from a re-run. Both limits this render puts on TASKS are
 # in exactly that position on every install that already has the stream, and
@@ -3887,24 +3881,18 @@ if [ "${live_submit_max_age_ns}" = "0" ] || [ "${live_submit_max_age}" -gt ` + s
   echo "NOTE: PROFILE_SUBMITS keeps submissions for ${live_submit_max_age}s (0 is no limit); this render creates it at ` + strconv.Itoa(int(a2aProfileSubmitMaxAge/time.Second)) + `s." >&2
   echo "  The dispatcher is told the longer one, so a finished task's tombstone outlives its submission." >&2
 fi
-# TASKS and TOPICS-JOURNAL above this render's byte caps (#4476): the one
-# guarded exception to provisioning never editing an existing stream. A
-# lower is safe exactly when the stream holds less than the new cap, since
-# max_bytes with discard=old evicts only what is over it; the script lowers a
-# cap only when the stream holds under HALF the new cap, read twice, the
-# second time right before the edit, so writes landing between the two
-# commands would have to fill the other half. A stream holding more is left
-# and reported with the edit to run once it drains. A stream at or under the
-# cap is left alone, whoever sized it. An unreadable answer FAILS, like the
-# extractors above. natscli's edit applies only the flags given, except
-# --compression, which it always sets (none by default): the streams this
-# script creates are uncompressed, so a lower changes nothing else on them,
-# but one compressed by hand would be put back to none.
+# TASKS and TOPICS-JOURNAL above this render's byte caps (#4476). An existing
+# stream keeps the cap it was created with: this principal cannot edit a
+# stream (no STREAM.UPDATE; see the provision identity), so the gap is
+# reported with the edit that closes it and whether applying it now is safe.
+# max_bytes with discard=old evicts only what is over it, so a lower is safe
+# while the stream holds under half the new cap, which leaves room for writes
+# between the read and the edit. A stream at or under the cap is left alone,
+# whoever sized it. An unreadable answer FAILS, like the extractors above.
 cap_check() { # stream want
   cap_stream=$1
   cap_want=$2
   cap_over=0
-  cap_lower=0
   cap_json="$($NATS stream info "${cap_stream}" --json | tr -d ' \t\r\n')"
   cap_live="$(printf '%s' "${cap_json}" | grep -o '"max_bytes":-\{0,1\}[0-9]\{1,\}' | head -n1 | cut -d: -f2 || true)"
   cap_held="$(printf '%s' "${cap_json}" | grep -o '"bytes":[0-9]\{1,\}' | head -n1 | cut -d: -f2 || true)"
@@ -3912,21 +3900,8 @@ cap_check() { # stream want
     echo "could not read max_bytes and bytes off the ${cap_stream} stream; refusing to report this install as provisioned" >&2
     exit 1
   fi
-  if [ "${cap_live}" != "-1" ] && [ "${cap_live}" -le "${cap_want}" ]; then
-    return 0
-  fi
-  cap_over=1
-  if [ "${cap_held}" -ge $((cap_want / 2)) ]; then
-    return 0
-  fi
-  cap_json="$($NATS stream info "${cap_stream}" --json | tr -d ' \t\r\n')"
-  cap_held="$(printf '%s' "${cap_json}" | grep -o '"bytes":[0-9]\{1,\}' | head -n1 | cut -d: -f2 || true)"
-  if [ -z "${cap_held}" ]; then
-    echo "could not re-read bytes off the ${cap_stream} stream; refusing to report this install as provisioned" >&2
-    exit 1
-  fi
-  if [ "${cap_held}" -lt $((cap_want / 2)) ]; then
-    cap_lower=1
+  if [ "${cap_live}" = "-1" ] || [ "${cap_live}" -gt "${cap_want}" ]; then
+    cap_over=1
   fi
 }
 ` + a2aProvisionCapLowerBlock("TASKS", a2aProvisionReportTasksMaxBytesKey, a2aTasksMaxBytes) +
@@ -4009,32 +3984,29 @@ echo "a2a provisioning complete"
 `
 }
 
-// a2aProvisionCapLowerBlock is the provision script's lower for one stream's
-// byte cap, after cap_check has read it (#4476). The edit names the stream
-// and the cap literally, not through variables, so
-// TestProvisionedJetStreamCapsFitTheStore reads it as the cap edit it is.
-// A failed edit is reported, not fatal: the bus is provisioned either way,
-// and the stream keeps the cap it had.
+// a2aProvisionCapLowerBlock is the provision script's report for one
+// stream's byte cap, after cap_check has read it (#4476). Provisioning does
+// not edit an existing stream: the provision principal holds no
+// STREAM.UPDATE, since UPDATE can tighten any limit and evict, which is the
+// PURGE that principal refuses itself (spec-nats-deployment.md). So a stream
+// above this render's cap is reported, and the report says whether lowering
+// it now is safe: under half the new cap held, the lower evicts nothing.
 func a2aProvisionCapLowerBlock(stream, key string, want int64) string {
 	w := strconv.FormatInt(want, 10)
 	return `cap_check ` + stream + ` ` + w + `
-cap_lowered=0
-if [ "${cap_lower}" = "1" ]; then
-  if $NATS stream edit ` + stream + ` --max-bytes=` + w + ` --force >/dev/null; then
-    cap_lowered=1
-    echo "NOTE: lowered ` + stream + ` max_bytes from ${cap_live} to ` + w + `; it held ${cap_held} bytes, so nothing was evicted." >&2
-  else
-    echo "WARNING: could not lower ` + stream + ` max_bytes from ${cap_live} to ` + w + `; it keeps its cap. The edit:" >&2
-    echo "    nats stream edit ` + stream + ` --max-bytes=` + w + `" >&2
-  fi
-elif [ "${cap_over}" = "1" ]; then
-  echo "NOTE: ` + stream + ` keeps max_bytes=${cap_live}, above this render's ` + w + `: it holds ${cap_held} bytes, half the new cap or more," >&2
-  echo "  and a lower that close to what it holds could evict. Once it holds less than ` + w + ` bytes:" >&2
-  echo "    nats stream edit ` + stream + ` --max-bytes=` + w + `" >&2
-fi
 if [ "${cap_over}" = "1" ]; then
+  cap_safe=0
+  if [ "${cap_held}" -lt $((` + w + ` / 2)) ]; then
+    cap_safe=1
+    echo "NOTE: ` + stream + ` carries max_bytes=${cap_live}, above this render's ` + w + `. It holds ${cap_held} bytes, under half" >&2
+    echo "  the new cap, so lowering it now evicts nothing. Provisioning does not edit an existing stream:" >&2
+  else
+    echo "NOTE: ` + stream + ` carries max_bytes=${cap_live}, above this render's ` + w + `. It holds ${cap_held} bytes, half the" >&2
+    echo "  new cap or more, and a lower that close to what it holds could evict. Once it holds less:" >&2
+  fi
+  echo "    nats stream edit ` + stream + ` --max-bytes=` + w + `" >&2
   report_findings="${report_findings}${report_findings:+,}\"` + key + `\":{\"` + a2aProvisionReportLiveKey + `\":${cap_live},\"` +
-		a2aProvisionReportHeldKey + `\":${cap_held},\"` + a2aProvisionReportWantKey + `\":` + w + `,\"` + a2aProvisionReportLoweredKey + `\":${cap_lowered}}"
+		a2aProvisionReportHeldKey + `\":${cap_held},\"` + a2aProvisionReportWantKey + `\":` + w + `,\"` + a2aProvisionReportSafeKey + `\":${cap_safe}}"
 fi
 `
 }
@@ -4079,10 +4051,9 @@ fi
 // What the digest does not cover is what is on the bus. Creation is
 // create-only convergence: the script's `info || add` lines make re-runs
 // clean but do NOT edit a stream that already exists, so a retention or
-// subject change in a later payload reaches fresh installs only. The one
-// exception is guarded: TASKS' and TOPICS-JOURNAL's byte caps are lowered to
-// the render's while the stream holds under half the new cap, which evicts
-// nothing (a2aProvisionCapLowerBlock, #4476). Migrating an
+// subject change in a later payload reaches fresh installs only. A byte cap
+// above the render's is reported with the edit and whether applying it is
+// safe (a2aProvisionCapLowerBlock, #4476). Migrating an
 // existing install is a manual `nats stream edit` — stage 1 accepts that and
 // says it here rather than implying the digest-rename re-provisions.
 func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
@@ -4391,49 +4362,45 @@ type a2aProvisionFindings struct {
 }
 
 // streamCapFinding is one stream's byte-cap finding. live is the max_bytes
-// the script read (-1 for none), held the bytes it held, want the cap the
-// pod's script lowered to or would have, lowered whether it did. render is
-// this binary's cap for the stream, which a remedy names.
+// the script read (-1 for none), held the bytes it held, want the render's
+// cap the pod's script compared against, safe whether it held under half of
+// it. render is this binary's cap for the stream, which the remedy names.
 type streamCapFinding struct {
-	stream  string
-	live    int64
-	held    int64
-	want    int64
-	lowered bool
-	render  int64
+	stream string
+	live   int64
+	held   int64
+	want   int64
+	safe   bool
+	render int64
 }
 
-// event is the finding's Event: Normal when the script lowered the cap,
-// Warning when it left it, with the edit naming this render's cap.
+// event is the finding's Warning Event, with the edit naming this render's
+// cap.
 func (f *streamCapFinding) event(jobName string) (string, string, string) {
 	live := strconv.FormatInt(f.live, 10)
 	if f.live == -1 {
 		live = "no limit"
 	}
-	if f.lowered {
-		return corev1.EventTypeNormal, reasonStreamCapLowered, fmt.Sprintf(streamCapLoweredMessage, jobName, f.stream, live, f.want, f.held)
+	format := streamCapUnsafeMessage
+	if f.safe {
+		format = streamCapSafeMessage
 	}
-	format := streamCapNotLoweredMessage
-	if f.held < f.want/2 {
-		// Under half the cap and still not lowered: the edit itself failed.
-		format = streamCapEditFailedMessage
-	}
-	return corev1.EventTypeWarning, reasonStreamCapNotLowered, fmt.Sprintf(format, jobName, f.stream, live, f.render, f.held, f.stream, f.render)
+	return corev1.EventTypeWarning, reasonStreamCapAboveRender, fmt.Sprintf(format, jobName, f.stream, live, f.render, f.held, f.stream, f.render)
 }
 
 // parseStreamCapFinding reads one byte-cap finding: every field present, a
 // live max_bytes that is none (-1) or positive, bytes held not negative, a
-// positive want, and lowered 0 or 1. Anything else is not a report the
-// script writes.
+// positive want, and safe 0 or 1. Anything else is not a report the script
+// writes.
 func parseStreamCapFinding(message, key, stream string, render int64, fields map[string]int64) (*streamCapFinding, error) {
 	live, okLive := fields[a2aProvisionReportLiveKey]
 	held, okHeld := fields[a2aProvisionReportHeldKey]
 	want, okWant := fields[a2aProvisionReportWantKey]
-	lowered, okLowered := fields[a2aProvisionReportLoweredKey]
-	if !okLive || !okHeld || !okWant || !okLowered || (live != -1 && live <= 0) || held < 0 || want <= 0 || (lowered != 0 && lowered != 1) {
+	safe, okSafe := fields[a2aProvisionReportSafeKey]
+	if !okLive || !okHeld || !okWant || !okSafe || (live != -1 && live <= 0) || held < 0 || want <= 0 || (safe != 0 && safe != 1) {
 		return nil, fmt.Errorf("the provision pod's termination message %q carries a %s finding the script does not write", message, key)
 	}
-	return &streamCapFinding{stream: stream, live: live, held: held, want: want, lowered: lowered == 1, render: render}, nil
+	return &streamCapFinding{stream: stream, live: live, held: held, want: want, safe: safe == 1, render: render}, nil
 }
 
 // parseA2AProvisionReport reads the termination message and returns the

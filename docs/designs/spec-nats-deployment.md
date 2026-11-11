@@ -90,8 +90,8 @@ and R1 loses them to a single node failure. Audit wins. The cost knob is W, not 
 
 Every stream also carries a hard `max_bytes` cap with `discard: old` alongside its age
 limit (dev defaults: 8GiB `TASKS`, 1GiB each for `TOPICS-JOURNAL`, `TOPICS-STATE`
-and `DIRECTORY`; the provision script lowers an existing stream's cap only while it holds under
-half the new one). A runaway telemetry flood drops oldest chunks early; it never fills
+and `DIRECTORY`; an existing stream keeps its cap, and the provision Job reports the edit that lowers
+it and whether that is safe yet). A runaway telemetry flood drops oldest chunks early; it never fills
 the PV and stalls the whole JetStream deployment, which would take `runtime-state`,
 `session-state`, and discovery down with it. The honest cost: under byte pressure,
 replay completeness degrades oldest-first - a running task's early events can age out of

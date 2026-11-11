@@ -5172,7 +5172,7 @@ metadata:
     app.kubernetes.io/name: platform-agent
     app.kubernetes.io/part-of: a2a-next
     kubeagents.x-k8s.io/a2a-component: provision
-  name: platformagent-a2a-provision-d998c6b2
+  name: platformagent-a2a-provision-ab53cd7e
   namespace: kubeagents-system
   ownerReferences:
     - apiVersion: kubeagents.x-k8s.io/v1alpha1
@@ -5431,9 +5431,7 @@ spec:
               --defaults\n\n# TASKS older than this render: the limits the create above
               could not apply.\n#\n# Provisioning is create-only convergence - the info-then-add
               guards never\n# edit an existing stream, which buildA2AProvisionJob says
-              in terms, with one\n# guarded exception: TASKS' and TOPICS-JOURNAL's byte
-              caps are lowered while\n# the stream holds under half the new cap (cap_check,
-              below) - so an\n# install whose TASKS predates a limit keeps the stream
+              in terms - so an\n# install whose TASKS predates a limit keeps the stream
               it was created with\n# and gains nothing from a re-run. Both limits this
               render puts on TASKS are\n# in exactly that position on every install that
               already has the stream, and\n# the two gaps are not the same kind:\n#\n#
@@ -5535,60 +5533,44 @@ spec:
               (0 is no limit); this render creates it at 259200s.\" >&2\n  echo \"  The
               dispatcher is told the longer one, so a finished task's tombstone outlives
               its submission.\" >&2\nfi\n# TASKS and TOPICS-JOURNAL above this render's
-              byte caps (#4476): the one\n# guarded exception to provisioning never editing
-              an existing stream. A\n# lower is safe exactly when the stream holds less
-              than the new cap, since\n# max_bytes with discard=old evicts only what is
-              over it; the script lowers a\n# cap only when the stream holds under HALF
-              the new cap, read twice, the\n# second time right before the edit, so writes
-              landing between the two\n# commands would have to fill the other half. A
-              stream holding more is left\n# and reported with the edit to run once it
-              drains. A stream at or under the\n# cap is left alone, whoever sized it.
-              An unreadable answer FAILS, like the\n# extractors above. natscli's edit
-              applies only the flags given, except\n# --compression, which it always sets
-              (none by default): the streams this\n# script creates are uncompressed,
-              so a lower changes nothing else on them,\n# but one compressed by hand would
-              be put back to none.\ncap_check() { # stream want\n  cap_stream=$1\n  cap_want=$2\n
-              \ cap_over=0\n  cap_lower=0\n  cap_json=\"$($NATS stream info \"${cap_stream}\"
-              --json | tr -d ' \\t\\r\\n')\"\n  cap_live=\"$(printf '%s' \"${cap_json}\"
-              | grep -o '\"max_bytes\":-\\{0,1\\}[0-9]\\{1,\\}' | head -n1 | cut -d: -f2
-              || true)\"\n  cap_held=\"$(printf '%s' \"${cap_json}\" | grep -o '\"bytes\":[0-9]\\{1,\\}'
-              | head -n1 | cut -d: -f2 || true)\"\n  if [ -z \"${cap_live}\" ] || [ -z
-              \"${cap_held}\" ]; then\n    echo \"could not read max_bytes and bytes off
-              the ${cap_stream} stream; refusing to report this install as provisioned\"
-              >&2\n    exit 1\n  fi\n  if [ \"${cap_live}\" != \"-1\" ] && [ \"${cap_live}\"
-              -le \"${cap_want}\" ]; then\n    return 0\n  fi\n  cap_over=1\n  if [ \"${cap_held}\"
-              -ge $((cap_want / 2)) ]; then\n    return 0\n  fi\n  cap_json=\"$($NATS
-              stream info \"${cap_stream}\" --json | tr -d ' \\t\\r\\n')\"\n  cap_held=\"$(printf
-              '%s' \"${cap_json}\" | grep -o '\"bytes\":[0-9]\\{1,\\}' | head -n1 | cut
-              -d: -f2 || true)\"\n  if [ -z \"${cap_held}\" ]; then\n    echo \"could
-              not re-read bytes off the ${cap_stream} stream; refusing to report this
-              install as provisioned\" >&2\n    exit 1\n  fi\n  if [ \"${cap_held}\" -lt
-              $((cap_want / 2)) ]; then\n    cap_lower=1\n  fi\n}\ncap_check TASKS 8589934592\ncap_lowered=0\nif
-              [ \"${cap_lower}\" = \"1\" ]; then\n  if $NATS stream edit TASKS --max-bytes=8589934592
-              --force >/dev/null; then\n    cap_lowered=1\n    echo \"NOTE: lowered TASKS
-              max_bytes from ${cap_live} to 8589934592; it held ${cap_held} bytes, so
-              nothing was evicted.\" >&2\n  else\n    echo \"WARNING: could not lower
-              TASKS max_bytes from ${cap_live} to 8589934592; it keeps its cap. The edit:\"
-              >&2\n    echo \"    nats stream edit TASKS --max-bytes=8589934592\" >&2\n
-              \ fi\nelif [ \"${cap_over}\" = \"1\" ]; then\n  echo \"NOTE: TASKS keeps
-              max_bytes=${cap_live}, above this render's 8589934592: it holds ${cap_held}
-              bytes, half the new cap or more,\" >&2\n  echo \"  and a lower that close
-              to what it holds could evict. Once it holds less than 8589934592 bytes:\"
-              >&2\n  echo \"    nats stream edit TASKS --max-bytes=8589934592\" >&2\nfi\nif
-              [ \"${cap_over}\" = \"1\" ]; then\n  report_findings=\"${report_findings}${report_findings:+,}\\\"tasks_max_bytes\\\":{\\\"live\\\":${cap_live},\\\"held\\\":${cap_held},\\\"want\\\":8589934592,\\\"lowered\\\":${cap_lowered}}\"\nfi\ncap_check
-              TOPICS-JOURNAL 1073741824\ncap_lowered=0\nif [ \"${cap_lower}\" = \"1\"
-              ]; then\n  if $NATS stream edit TOPICS-JOURNAL --max-bytes=1073741824 --force
-              >/dev/null; then\n    cap_lowered=1\n    echo \"NOTE: lowered TOPICS-JOURNAL
-              max_bytes from ${cap_live} to 1073741824; it held ${cap_held} bytes, so
-              nothing was evicted.\" >&2\n  else\n    echo \"WARNING: could not lower
-              TOPICS-JOURNAL max_bytes from ${cap_live} to 1073741824; it keeps its cap.
-              The edit:\" >&2\n    echo \"    nats stream edit TOPICS-JOURNAL --max-bytes=1073741824\"
-              >&2\n  fi\nelif [ \"${cap_over}\" = \"1\" ]; then\n  echo \"NOTE: TOPICS-JOURNAL
-              keeps max_bytes=${cap_live}, above this render's 1073741824: it holds ${cap_held}
-              bytes, half the new cap or more,\" >&2\n  echo \"  and a lower that close
-              to what it holds could evict. Once it holds less than 1073741824 bytes:\"
-              >&2\n  echo \"    nats stream edit TOPICS-JOURNAL --max-bytes=1073741824\"
-              >&2\nfi\nif [ \"${cap_over}\" = \"1\" ]; then\n  report_findings=\"${report_findings}${report_findings:+,}\\\"topics_journal_max_bytes\\\":{\\\"live\\\":${cap_live},\\\"held\\\":${cap_held},\\\"want\\\":1073741824,\\\"lowered\\\":${cap_lowered}}\"\nfi\nreport=\"{${report_findings}}\"\n#
+              byte caps (#4476). An existing\n# stream keeps the cap it was created with:
+              this principal cannot edit a\n# stream (no STREAM.UPDATE; see the provision
+              identity), so the gap is\n# reported with the edit that closes it and whether
+              applying it now is safe.\n# max_bytes with discard=old evicts only what
+              is over it, so a lower is safe\n# while the stream holds under half the
+              new cap, which leaves room for writes\n# between the read and the edit.
+              A stream at or under the cap is left alone,\n# whoever sized it. An unreadable
+              answer FAILS, like the extractors above.\ncap_check() { # stream want\n
+              \ cap_stream=$1\n  cap_want=$2\n  cap_over=0\n  cap_json=\"$($NATS stream
+              info \"${cap_stream}\" --json | tr -d ' \\t\\r\\n')\"\n  cap_live=\"$(printf
+              '%s' \"${cap_json}\" | grep -o '\"max_bytes\":-\\{0,1\\}[0-9]\\{1,\\}' |
+              head -n1 | cut -d: -f2 || true)\"\n  cap_held=\"$(printf '%s' \"${cap_json}\"
+              | grep -o '\"bytes\":[0-9]\\{1,\\}' | head -n1 | cut -d: -f2 || true)\"\n
+              \ if [ -z \"${cap_live}\" ] || [ -z \"${cap_held}\" ]; then\n    echo \"could
+              not read max_bytes and bytes off the ${cap_stream} stream; refusing to report
+              this install as provisioned\" >&2\n    exit 1\n  fi\n  if [ \"${cap_live}\"
+              = \"-1\" ] || [ \"${cap_live}\" -gt \"${cap_want}\" ]; then\n    cap_over=1\n
+              \ fi\n}\ncap_check TASKS 8589934592\nif [ \"${cap_over}\" = \"1\" ]; then\n
+              \ cap_safe=0\n  if [ \"${cap_held}\" -lt $((8589934592 / 2)) ]; then\n    cap_safe=1\n
+              \   echo \"NOTE: TASKS carries max_bytes=${cap_live}, above this render's
+              8589934592. It holds ${cap_held} bytes, under half\" >&2\n    echo \"  the
+              new cap, so lowering it now evicts nothing. Provisioning does not edit an
+              existing stream:\" >&2\n  else\n    echo \"NOTE: TASKS carries max_bytes=${cap_live},
+              above this render's 8589934592. It holds ${cap_held} bytes, half the\" >&2\n
+              \   echo \"  new cap or more, and a lower that close to what it holds could
+              evict. Once it holds less:\" >&2\n  fi\n  echo \"    nats stream edit TASKS
+              --max-bytes=8589934592\" >&2\n  report_findings=\"${report_findings}${report_findings:+,}\\\"tasks_max_bytes\\\":{\\\"live\\\":${cap_live},\\\"held\\\":${cap_held},\\\"want\\\":8589934592,\\\"safe\\\":${cap_safe}}\"\nfi\ncap_check
+              TOPICS-JOURNAL 1073741824\nif [ \"${cap_over}\" = \"1\" ]; then\n  cap_safe=0\n
+              \ if [ \"${cap_held}\" -lt $((1073741824 / 2)) ]; then\n    cap_safe=1\n
+              \   echo \"NOTE: TOPICS-JOURNAL carries max_bytes=${cap_live}, above this
+              render's 1073741824. It holds ${cap_held} bytes, under half\" >&2\n    echo
+              \"  the new cap, so lowering it now evicts nothing. Provisioning does not
+              edit an existing stream:\" >&2\n  else\n    echo \"NOTE: TOPICS-JOURNAL
+              carries max_bytes=${cap_live}, above this render's 1073741824. It holds
+              ${cap_held} bytes, half the\" >&2\n    echo \"  new cap or more, and a lower
+              that close to what it holds could evict. Once it holds less:\" >&2\n  fi\n
+              \ echo \"    nats stream edit TOPICS-JOURNAL --max-bytes=1073741824\" >&2\n
+              \ report_findings=\"${report_findings}${report_findings:+,}\\\"topics_journal_max_bytes\\\":{\\\"live\\\":${cap_live},\\\"held\\\":${cap_held},\\\"want\\\":1073741824,\\\"safe\\\":${cap_safe}}\"\nfi\nreport=\"{${report_findings}}\"\n#
               Written only where the kubelet has mounted the file: outside a pod there
               is\n# nothing to write to, and a copy of a report is not a reason to fail
               a fully\n# provisioned bus. Nor is a write that fails (a full or faulting

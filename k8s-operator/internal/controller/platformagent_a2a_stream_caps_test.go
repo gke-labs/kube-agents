@@ -82,44 +82,35 @@ func runCapScript(t *testing.T, files map[string]string, editExit int) (int, str
 	return exit, stderr.String(), string(report), string(calls)
 }
 
-func TestTheProvisionScriptLowersAStreamCapOnlyWithRoom(t *testing.T) {
+func TestTheProvisionScriptReportsAStreamAboveItsCap(t *testing.T) {
 	old := int64(20) << 30
 	want := a2aTasksMaxBytes
-	edit := fmt.Sprintf("stream edit TASKS --max-bytes=%d --force", want)
 	for _, tc := range []struct {
 		name       string
 		files      map[string]string
-		editExit   int
 		wantExit   int
-		wantEdit   bool
 		wantReport string
 		wantStderr string
 	}{
-		{"a near-empty stream above the cap is lowered",
-			map[string]string{"TASKS.json": streamInfoJSON("TASKS", old, 1<<20)}, 0, 0, true,
-			fmt.Sprintf(`{"tasks_max_bytes":{"live":%d,"held":%d,"want":%d,"lowered":1}}`, old, 1<<20, want),
-			"NOTE: lowered TASKS max_bytes"},
-		{"a stream holding half the new cap or more is left and reported",
-			map[string]string{"TASKS.json": streamInfoJSON("TASKS", old, want/2)}, 0, 0, false,
-			fmt.Sprintf(`{"tasks_max_bytes":{"live":%d,"held":%d,"want":%d,"lowered":0}}`, old, want/2, want),
-			fmt.Sprintf("nats stream edit TASKS --max-bytes=%d", want)},
-		{"a stream that grew between the reads is left (the re-read decides)",
-			map[string]string{"TASKS.1.json": streamInfoJSON("TASKS", old, 1<<20), "TASKS.2.json": streamInfoJSON("TASKS", old, 1<<20), "TASKS.3.json": streamInfoJSON("TASKS", old, want/2+1)}, 0, 0, false,
-			fmt.Sprintf(`{"tasks_max_bytes":{"live":%d,"held":%d,"want":%d,"lowered":0}}`, old, want/2+1, want), "keeps max_bytes"},
-		{"a stream with no byte limit is lowered when near empty",
-			map[string]string{"TASKS.json": streamInfoJSON("TASKS", -1, 0)}, 0, 0, true,
-			fmt.Sprintf(`{"tasks_max_bytes":{"live":-1,"held":0,"want":%d,"lowered":1}}`, want), "lowered TASKS"},
+		{"a near-empty stream above the cap is reported safe to lower",
+			map[string]string{"TASKS.json": streamInfoJSON("TASKS", old, 1<<20)}, 0,
+			fmt.Sprintf(`{"tasks_max_bytes":{"live":%d,"held":%d,"want":%d,"safe":1}}`, old, 1<<20, want),
+			"lowering it now evicts nothing"},
+		{"a stream holding half the new cap or more is reported not safe yet",
+			map[string]string{"TASKS.json": streamInfoJSON("TASKS", old, want/2)}, 0,
+			fmt.Sprintf(`{"tasks_max_bytes":{"live":%d,"held":%d,"want":%d,"safe":0}}`, old, want/2, want),
+			"Once it holds less"},
+		{"a stream with no byte limit is reported",
+			map[string]string{"TASKS.json": streamInfoJSON("TASKS", -1, 0)}, 0,
+			fmt.Sprintf(`{"tasks_max_bytes":{"live":-1,"held":0,"want":%d,"safe":1}}`, want), "carries max_bytes=-1"},
 		{"a stream at the cap is left alone",
-			map[string]string{"TASKS.json": streamInfoJSON("TASKS", want, 0)}, 0, 0, false, `{}`, ""},
+			map[string]string{"TASKS.json": streamInfoJSON("TASKS", want, 0)}, 0, `{}`, ""},
 		{"a stream sized under the cap is left alone",
-			map[string]string{"TASKS.json": streamInfoJSON("TASKS", want/4, 0)}, 0, 0, false, `{}`, ""},
-		{"a failed edit is reported, not fatal",
-			map[string]string{"TASKS.json": streamInfoJSON("TASKS", old, 0)}, 1, 0, true,
-			fmt.Sprintf(`{"tasks_max_bytes":{"live":%d,"held":0,"want":%d,"lowered":0}}`, old, want), "could not lower TASKS"},
+			map[string]string{"TASKS.json": streamInfoJSON("TASKS", want/4, 0)}, 0, `{}`, ""},
 		{"an answer with no max_bytes fails",
-			map[string]string{"TASKS.json": `{"config":{"name":"TASKS"},"state":{"bytes":0}}`}, 0, 1, false, "", "could not read max_bytes"},
+			map[string]string{"TASKS.json": `{"config":{"name":"TASKS"},"state":{"bytes":0}}`}, 1, "", "could not read max_bytes"},
 		{"an answer with no bytes fails",
-			map[string]string{"TASKS.json": `{"config":{"name":"TASKS","max_bytes":1}}`}, 0, 1, false, "", "could not read max_bytes"},
+			map[string]string{"TASKS.json": `{"config":{"name":"TASKS","max_bytes":1}}`}, 1, "", "could not read max_bytes"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			// The closing max_consumers and subject-cap checks read TASKS'
@@ -128,23 +119,15 @@ func TestTheProvisionScriptLowersAStreamCapOnlyWithRoom(t *testing.T) {
 			for k, v := range tc.files {
 				files[k] = strings.Replace(v, `"config":{`, fmt.Sprintf(`"config":{"max_consumers":%d,"max_msgs_per_subject":%d,`, a2aTasksConsumerBudget(a2aTestAgent()), a2aTasksMaxMsgsPerSubject), 1)
 			}
-			exit, stderr, report, calls := runCapScript(t, files, tc.editExit)
+			exit, stderr, report, calls := runCapScript(t, files, 0)
 			if exit != tc.wantExit {
 				t.Fatalf("exit %d, want %d\nstderr:\n%s", exit, tc.wantExit, stderr)
 			}
 			if tc.wantStderr != "" && !strings.Contains(stderr, tc.wantStderr) {
 				t.Errorf("stderr lacks %q:\n%s", tc.wantStderr, stderr)
 			}
-			// A stream left at its first read is read once by the cap step,
-			// after the closing checks' read: no re-read for a lower it
-			// already knows it will not make.
-			if tc.name == "a stream holding half the new cap or more is left and reported" {
-				if n := strings.Count(calls, "stream info TASKS --json"); n != 2 {
-					t.Errorf("TASKS read %d times with --json, want 2 (the closing checks', the cap step's)", n)
-				}
-			}
-			if got := strings.Contains(calls, edit); got != tc.wantEdit {
-				t.Errorf("edit called = %v, want %v\ncalls:\n%s", got, tc.wantEdit, calls)
+			if strings.Contains(calls, "stream edit") || strings.Contains(calls, "stream update") {
+				t.Errorf("the script edited a stream:\n%s", calls)
 			}
 			if tc.wantExit != 0 {
 				return
@@ -159,64 +142,67 @@ func TestTheProvisionScriptLowersAStreamCapOnlyWithRoom(t *testing.T) {
 	}
 }
 
-// TOPICS-JOURNAL goes through the same step under its own key and cap.
-func TestTheProvisionScriptLowersTheJournalCap(t *testing.T) {
+// TOPICS-JOURNAL goes through the same report under its own key and cap.
+func TestTheProvisionScriptReportsTheJournalCap(t *testing.T) {
 	old := int64(5) << 30
 	exit, stderr, report, calls := runCapScript(t, map[string]string{"TOPICS-JOURNAL.json": streamInfoJSON("TOPICS-JOURNAL", old, 4096)}, 0)
 	if exit != 0 {
 		t.Fatalf("exit %d\n%s", exit, stderr)
 	}
-	if want := fmt.Sprintf(`{"topics_journal_max_bytes":{"live":%d,"held":4096,"want":%d,"lowered":1}}`, old, a2aTopicsJournalMaxBytes); report != want {
+	if want := fmt.Sprintf(`{"topics_journal_max_bytes":{"live":%d,"held":4096,"want":%d,"safe":1}}`, old, a2aTopicsJournalMaxBytes); report != want {
 		t.Errorf("report %s, want %s", report, want)
 	}
-	if !strings.Contains(calls, fmt.Sprintf("stream edit TOPICS-JOURNAL --max-bytes=%d --force", a2aTopicsJournalMaxBytes)) {
-		t.Errorf("no journal edit:\n%s", calls)
+	if !strings.Contains(stderr, fmt.Sprintf("nats stream edit TOPICS-JOURNAL --max-bytes=%d", a2aTopicsJournalMaxBytes)) || strings.Contains(calls, "stream edit") {
+		t.Errorf("want the edit named, not run:\nstderr:\n%s\ncalls:\n%s", stderr, calls)
+	}
+}
+
+// TestTheProvisionerNeverEditsAStream pins option B (#4476): the provision
+// principal holds no stream update, delete or purge, so it cannot tighten a
+// limit and evict, and its script runs no stream edit.
+func TestTheProvisionerNeverEditsAStream(t *testing.T) {
+	for _, subject := range provisionIdentity(a2aTestAgent(), "test-ns").publish {
+		for _, verb := range []string{"STREAM.UPDATE", "STREAM.DELETE", "STREAM.PURGE"} {
+			if strings.Contains(subject, verb) || subject == "$JS.API.>" || subject == "$JS.API.STREAM.>" {
+				t.Errorf("the provisioner may %s: %s", verb, subject)
+			}
+		}
+	}
+	if strings.Contains(a2aProvisionScript(a2aTestAgent()), "$NATS stream edit") {
+		t.Error("the provision script runs a stream edit")
 	}
 }
 
 func TestStreamCapFindingsBecomeEvents(t *testing.T) {
 	old := int64(20) << 30
-	lowered := fmt.Sprintf(`{"tasks_max_bytes":{"live":%d,"held":1024,"want":%d,"lowered":1}}`, old, a2aTasksMaxBytes)
-	f, err := parseA2AProvisionReport(lowered)
+	safe := fmt.Sprintf(`{"tasks_max_bytes":{"live":%d,"held":1024,"want":%d,"safe":1}}`, old, a2aTasksMaxBytes)
+	f, err := parseA2AProvisionReport(safe)
 	if err != nil || f.tasksMaxBytes == nil {
 		t.Fatalf("findings %+v, err %v", f, err)
 	}
-	typ, reason, msg := f.tasksMaxBytes.event("job-1")
-	if typ != corev1.EventTypeNormal || reason != reasonStreamCapLowered {
-		t.Errorf("lowered: %s/%s", typ, reason)
+	typ, reason, msg := f.tasksMaxBytes.event("job-a")
+	if typ != corev1.EventTypeWarning || reason != reasonStreamCapAboveRender {
+		t.Errorf("safe: %s/%s", typ, reason)
 	}
-	for _, want := range []string{"job-1", "TASKS", fmt.Sprint(old), fmt.Sprint(a2aTasksMaxBytes), "1024"} {
+	for _, want := range []string{"job-a", "TASKS", fmt.Sprint(old), "1024", "evicts nothing", fmt.Sprintf("nats stream edit TASKS --max-bytes=%d", a2aTasksMaxBytes)} {
 		if !strings.Contains(msg, want) {
-			t.Errorf("lowered message lacks %q: %s", want, msg)
+			t.Errorf("safe message lacks %q: %s", want, msg)
 		}
 	}
 
-	// Left: a Warning with the exact edit, naming this render's cap even when
-	// the pod's want differs.
-	left := fmt.Sprintf(`{"tasks_max_bytes":{"live":%d,"held":%d,"want":123456789,"lowered":0}}`, old, a2aTasksMaxBytes)
-	f, err = parseA2AProvisionReport(left)
+	// Not safe yet: the edit to run once it holds less, naming this render's
+	// cap even when the pod's want differs.
+	unsafe := fmt.Sprintf(`{"tasks_max_bytes":{"live":%d,"held":%d,"want":123456789,"safe":0}}`, old, a2aTasksMaxBytes)
+	f, err = parseA2AProvisionReport(unsafe)
 	if err != nil {
 		t.Fatal(err)
 	}
-	typ, reason, msg = f.tasksMaxBytes.event("job-1")
-	if typ != corev1.EventTypeWarning || reason != reasonStreamCapNotLowered {
-		t.Errorf("left: %s/%s", typ, reason)
-	}
-	if want := fmt.Sprintf("nats stream edit TASKS --max-bytes=%d", a2aTasksMaxBytes); !strings.Contains(msg, want) {
-		t.Errorf("left message lacks %q: %s", want, msg)
+	_, _, msg = f.tasksMaxBytes.event("job-a")
+	if !strings.Contains(msg, "once it holds less") || !strings.Contains(msg, fmt.Sprintf("nats stream edit TASKS --max-bytes=%d", a2aTasksMaxBytes)) {
+		t.Errorf("unsafe message: %s", msg)
 	}
 	if strings.Contains(msg, "123456789") {
 		t.Errorf("the remedy took the pod's want: %s", msg)
-	}
-
-	// Under half and not lowered: the edit failed, said as such.
-	failed := fmt.Sprintf(`{"topics_journal_max_bytes":{"live":%d,"held":0,"want":%d,"lowered":0}}`, int64(5)<<30, a2aTopicsJournalMaxBytes)
-	f, err = parseA2AProvisionReport(failed)
-	if err != nil || f.topicsJournalMaxBytes == nil {
-		t.Fatalf("findings %+v, err %v", f, err)
-	}
-	if _, _, msg = f.topicsJournalMaxBytes.event("job-1"); !strings.Contains(msg, "the edit failed") || !strings.Contains(msg, "TOPICS-JOURNAL --max-bytes=1073741824") {
-		t.Errorf("failed-edit message: %s", msg)
 	}
 }
 
@@ -224,11 +210,11 @@ func TestAStreamCapFindingTheScriptCannotWriteIsNotAReport(t *testing.T) {
 	for _, message := range []string{
 		`{"tasks_max_bytes":{}}`,
 		`{"tasks_max_bytes":{"live":1,"held":0,"want":1}}`,
-		`{"tasks_max_bytes":{"live":0,"held":0,"want":1,"lowered":0}}`,
-		`{"tasks_max_bytes":{"live":-2,"held":0,"want":1,"lowered":0}}`,
-		`{"tasks_max_bytes":{"live":5,"held":-1,"want":1,"lowered":0}}`,
-		`{"tasks_max_bytes":{"live":5,"held":0,"want":0,"lowered":0}}`,
-		`{"topics_journal_max_bytes":{"live":5,"held":0,"want":1,"lowered":2}}`,
+		`{"tasks_max_bytes":{"live":0,"held":0,"want":1,"safe":0}}`,
+		`{"tasks_max_bytes":{"live":-2,"held":0,"want":1,"safe":0}}`,
+		`{"tasks_max_bytes":{"live":5,"held":-1,"want":1,"safe":0}}`,
+		`{"tasks_max_bytes":{"live":5,"held":0,"want":0,"safe":0}}`,
+		`{"topics_journal_max_bytes":{"live":5,"held":0,"want":1,"safe":2}}`,
 	} {
 		if _, err := parseA2AProvisionReport(message); err == nil {
 			t.Errorf("%s parsed as a report", message)
@@ -236,8 +222,8 @@ func TestAStreamCapFindingTheScriptCannotWriteIsNotAReport(t *testing.T) {
 	}
 }
 
-// Both byte-cap findings reach the PlatformAgent as Events through the
-// reconcile, and the Job is stamped reported.
+// Both byte-cap findings reach the PlatformAgent as Warning Events through
+// the reconcile, and the Job is stamped reported.
 func TestStreamCapFindingsReachThePlatformAgent(t *testing.T) {
 	agent := a2aTestAgent()
 	r, cl, req := a2aGateTestReconciler(t, agent)
@@ -245,11 +231,14 @@ func TestStreamCapFindingsReachThePlatformAgent(t *testing.T) {
 	r.Recorder = rec
 	ctx := context.Background()
 	provisionedInstall(t, ctx, cl, r, agent, fmt.Sprintf(
-		`{"tasks_max_bytes":{"live":%d,"held":0,"want":%d,"lowered":1},"topics_journal_max_bytes":{"live":%d,"held":%d,"want":%d,"lowered":0}}`,
+		`{"tasks_max_bytes":{"live":%d,"held":0,"want":%d,"safe":1},"topics_journal_max_bytes":{"live":%d,"held":%d,"want":%d,"safe":0}}`,
 		int64(20)<<30, a2aTasksMaxBytes, int64(5)<<30, a2aTopicsJournalMaxBytes, a2aTopicsJournalMaxBytes))
 	reconcileTwice(t, ctx, r, req)
 	joined := strings.Join(drainEvents(rec), "\n")
-	for _, want := range []string{"Normal " + reasonStreamCapLowered, "Warning " + reasonStreamCapNotLowered, "TOPICS-JOURNAL --max-bytes=1073741824"} {
+	if n := strings.Count(joined, "Warning "+reasonStreamCapAboveRender); n != 2 {
+		t.Errorf("got %d %s Events, want 2:\n%s", n, reasonStreamCapAboveRender, joined)
+	}
+	for _, want := range []string{"evicts nothing", "once it holds less", "TOPICS-JOURNAL --max-bytes=1073741824"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("Events lack %q:\n%s", want, joined)
 		}
@@ -259,15 +248,15 @@ func TestStreamCapFindingsReachThePlatformAgent(t *testing.T) {
 	}
 }
 
-// A stream with no byte limit reads "no limit" in the Events, not -1.
+// A stream with no byte limit reads "no limit" in its Event, not -1.
 func TestAnUnlimitedStreamReadsNoLimitInItsEvent(t *testing.T) {
-	for _, lowered := range []int{0, 1} {
-		f, err := parseA2AProvisionReport(fmt.Sprintf(`{"tasks_max_bytes":{"live":-1,"held":%d,"want":%d,"lowered":%d}}`, a2aTasksMaxBytes, a2aTasksMaxBytes, lowered))
+	for _, safe := range []int{0, 1} {
+		f, err := parseA2AProvisionReport(fmt.Sprintf(`{"tasks_max_bytes":{"live":-1,"held":0,"want":%d,"safe":%d}}`, a2aTasksMaxBytes, safe))
 		if err != nil {
 			t.Fatal(err)
 		}
 		if _, _, msg := f.tasksMaxBytes.event("job-a"); !strings.Contains(msg, "no limit") || strings.Contains(msg, "-1") {
-			t.Errorf("lowered=%d: %s", lowered, msg)
+			t.Errorf("safe=%d: %s", safe, msg)
 		}
 	}
 }
