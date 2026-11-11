@@ -80,17 +80,24 @@ FRONTMATTER_MARK = "---"
 PATHS_KEY = "paths:"
 LIST_ITEM_RE = re.compile(r"""^\s+-\s+["']?([^"'\s]+)["']?\s*$""")
 
-# A fenced block at any indent (list items indent theirs), closed by a line of
-# at least the same markers and nothing else (a "```python" line opens, never
-# closes); then inline code; then comments. Code first, so a `<!--` shown in a
-# code block cannot swallow a real image. An unclosed fence is left in place
-# rather than run to the end, where it would hide every image after it.
-FENCE_RE = re.compile(r"^[ \t]*(`{3,}|~{3,})[^\n]*\n.*?^[ \t]*\1[`~]*[ \t]*$", re.DOTALL | re.MULTILINE)
-INLINE_CODE_RE = re.compile(r"`[^`\n]+`")
-COMMENT_RE = re.compile(r"<!--.*?(-->|\Z)", re.DOTALL)
+# What renders no image, as one alternation so a single left-to-right pass
+# takes whichever opens first, the way a renderer reads: an HTML comment, which
+# ends at its first `-->` whatever is inside it (or runs to the end, unclosed);
+# a fenced block at any indent (list items indent theirs), closed by a line of
+# at least the same markers and nothing else, so a "```python" line opens and
+# never closes; a code span, closed by a backtick run of its own length. An
+# unclosed fence is not a block here, so it hides no image after it.
+HIDDEN_RE = re.compile(
+    r"<!--.*?(?:-->|\Z)"
+    r"|^[ \t]*(?P<fence>`{3,}|~{3,})[^\n]*\n.*?^[ \t]*(?P=fence)[`~]*[ \t]*$"
+    r"|(?P<ticks>`+)(?!`).+?(?<!`)(?P=ticks)(?!`)",
+    re.DOTALL | re.MULTILINE,
+)
 IMAGE_RES = (
-    re.compile(r"!\[[^\]]*\]\(\s*\S+"),  # a Markdown image
-    re.compile(r"<img\b[^>]*\bsrc\s*=", re.IGNORECASE),  # an HTML image
+    # A Markdown image with a non-empty target; alt text may hold one level of
+    # balanced brackets, as CommonMark allows.
+    re.compile(r"!\[(?:[^\[\]]|\[[^\]]*\])*\]\(\s*[^\s)]+"),
+    re.compile(r"""<img\b[^>]*\bsrc\s*=\s*["']?\s*[^\s"'>]+""", re.IGNORECASE),  # an HTML image
     re.compile(r"https://github\.com/user-attachments/assets/\S+"),  # a drag-and-drop upload
 )
 NO_CHANGE_RE = re.compile(r"^\s*[-*]\s+\[[xX]\]\s+No user-visible change\b", re.MULTILINE)
@@ -174,9 +181,7 @@ def classify(files, chat=None, surfaces=SURFACES):
 
 def _visible(body):
     """The body as it renders: code and HTML comments show no image."""
-    text = FENCE_RE.sub("", body or "")
-    text = INLINE_CODE_RE.sub("", text)
-    return COMMENT_RE.sub("", text)
+    return HIDDEN_RE.sub("", body or "")
 
 
 def has_image(body):

@@ -150,6 +150,23 @@ class BodyTest(unittest.TestCase):
     def test_an_info_string_line_does_not_close_a_fence(self):
         self.assertFalse(ux.has_image(f"```\n```python\n{SHOT}\n```\n"))
 
+    def test_a_comment_ends_at_its_first_close_even_inside_backticks(self):
+        self.assertTrue(ux.has_image(f"<!-- a `b -->` c\n{SHOT}\n"))
+
+    def test_a_fence_inside_a_comment_does_not_pair_with_a_later_block(self):
+        self.assertTrue(ux.has_image(f"<!--\n```\n-->\n{SHOT}\n\n```\ncode\n```\n"))
+
+    def test_a_double_backtick_span_holding_a_backtick(self):
+        self.assertTrue(ux.has_image(f"`` ` `` {SHOT} `y`"))
+
+    def test_empty_images_do_not_count(self):
+        for body in ("![]()", "![](   )", '<img src="">', "<img src=>"):
+            with self.subTest(body=body):
+                self.assertFalse(ux.has_image(body))
+
+    def test_bracketed_alt_text_counts(self):
+        self.assertTrue(ux.has_image("![chat reply [after]](https://example.com/shot.png)"))
+
     def test_a_link_is_not_an_image(self):
         self.assertFalse(ux.has_image("[screenshot](https://example.com/a.png)"))
 
