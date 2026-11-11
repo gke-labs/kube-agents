@@ -1907,7 +1907,10 @@ def init_db() -> None:
                     outcome         TEXT,
                     outcome_at      TEXT,
                     outcome_detail  TEXT,
-                    reported_at     TEXT
+                    reported_at     TEXT,
+                    followup_state  TEXT,
+                    followup_attempts INTEGER,
+                    followup_detail TEXT
                 )
                 """
             )
