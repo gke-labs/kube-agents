@@ -62,11 +62,11 @@ spec:
                 Each run is submitted through the A2A gateway as an Unattended task.
               properties:
                 activeDeadlineSeconds:
-                  default: 3600
                   description: |-
                     ActiveDeadlineSeconds bounds a run. Past it, plus a grace, a run that
                     never reported a terminal is recorded Lost and the schedule moves on.
-                    Defaults to 3600.
+                    Unset, it is the profile's lifecycle.activeDeadlineSeconds, the
+                    ceiling its Job runs under.
                   format: int64
                   maximum: 86400
                   minimum: 60

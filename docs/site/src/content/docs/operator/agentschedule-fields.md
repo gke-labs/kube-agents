@@ -28,7 +28,7 @@ Every field of the `AgentSchedule` resource's `spec` and `status`, generated fro
 | `delivery.jobKey` | `string` | no |  | max length `63` | JobKey groups a schedule's posts into one thread per UTC day. It defaults to the schedule's name. |
 | `concurrencyPolicy` | `string` | no | `Forbid` | one of `Forbid` | ConcurrencyPolicy is Forbid, the one policy: a slot that comes due while a run is still going is skipped and counted. |
 | `startingDeadlineSeconds` | `integer` | no | `900` | min `60`; max `86400` | StartingDeadlineSeconds is how late a slot may still start. A slot missed by more (an operator outage, a gateway that stayed down) is counted and skipped. Defaults to 900. |
-| `activeDeadlineSeconds` | `integer` | no | `3600` | min `60`; max `86400` | ActiveDeadlineSeconds bounds a run. Past it, plus a grace, a run that never reported a terminal is recorded Lost and the schedule moves on. Defaults to 3600. |
+| `activeDeadlineSeconds` | `integer` | no |  | min `60`; max `86400` | ActiveDeadlineSeconds bounds a run. Past it, plus a grace, a run that never reported a terminal is recorded Lost and the schedule moves on. Unset, it is the profile's lifecycle.activeDeadlineSeconds, the ceiling its Job runs under. |
 | `maxTurns` | `integer` | no |  | min `1`; max `1000` | MaxTurns caps the run's model turns. |
 
 ## Status

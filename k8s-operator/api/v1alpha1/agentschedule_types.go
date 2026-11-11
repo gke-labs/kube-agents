@@ -146,10 +146,10 @@ type AgentScheduleSpec struct {
 
 	// ActiveDeadlineSeconds bounds a run. Past it, plus a grace, a run that
 	// never reported a terminal is recorded Lost and the schedule moves on.
-	// Defaults to 3600.
+	// Unset, it is the profile's lifecycle.activeDeadlineSeconds, the
+	// ceiling its Job runs under.
 	// +kubebuilder:validation:Minimum=60
 	// +kubebuilder:validation:Maximum=86400
-	// +kubebuilder:default=3600
 	// +optional
 	ActiveDeadlineSeconds *int64 `json:"activeDeadlineSeconds,omitempty"`
 

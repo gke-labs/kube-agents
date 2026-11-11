@@ -21,10 +21,11 @@ import (
 // fakeScheduleGateway is the gateway as the reconciler sees it: the same
 // idempotency key returns the same task, as the gateway's KV record does.
 type fakeScheduleGateway struct {
-	mu    sync.Mutex
-	err   error
-	tasks map[string]string
-	sends []string
+	mu      sync.Mutex
+	err     error
+	tasks   map[string]string
+	sends   []string
+	origins []string
 	// onSubmit, when set, runs at each submission, before it is answered.
 	onSubmit func(ScheduleSubmission)
 }
@@ -36,6 +37,7 @@ func (g *fakeScheduleGateway) Submit(_ context.Context, sub ScheduleSubmission) 
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.sends = append(g.sends, sub.IdempotencyKey)
+	g.origins = append(g.origins, sub.Origin)
 	if g.err != nil {
 		return "", g.err
 	}
@@ -75,7 +77,18 @@ type scheduleFixture struct {
 // first slot is 01:00.
 var scheduleCreated = time.Date(2026, 11, 11, 0, 30, 0, 0, time.UTC)
 
+// scheduleAgent is the fixture's install: the PlatformAgent in the
+// schedules' namespace.
+func scheduleAgent() *agentv1alpha1.PlatformAgent {
+	return &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "platform-agent", Namespace: "kubeagents-system", UID: "agent-uid"}}
+}
+
 func newScheduleFixture(t *testing.T, mutate func(*agentv1alpha1.AgentSchedule), profileTiers ...string) *scheduleFixture {
+	t.Helper()
+	return newScheduleFixtureWith(t, mutate, true, profileTiers...)
+}
+
+func newScheduleFixtureWith(t *testing.T, mutate func(*agentv1alpha1.AgentSchedule), withAgent bool, profileTiers ...string) *scheduleFixture {
 	t.Helper()
 	if len(profileTiers) == 0 {
 		profileTiers = []string{agentv1alpha1.AgentProfileTierRead, agentv1alpha1.AgentProfileTierUnattended}
@@ -100,8 +113,12 @@ func newScheduleFixture(t *testing.T, mutate func(*agentv1alpha1.AgentSchedule),
 	if mutate != nil {
 		mutate(sched)
 	}
+	objs := []client.Object{&profile, sched}
+	if withAgent {
+		objs = append(objs, scheduleAgent())
+	}
 	c := fake.NewClientBuilder().WithScheme(setupScheme()).
-		WithObjects(&profile, sched).WithStatusSubresource(&agentv1alpha1.AgentSchedule{}).Build()
+		WithObjects(objs...).WithStatusSubresource(&agentv1alpha1.AgentSchedule{}).Build()
 	f := &scheduleFixture{c: c, gw: &fakeScheduleGateway{}, tracker: &fakeScheduleTracker{state: ScheduleTaskState{Found: true}},
 		key: client.ObjectKeyFromObject(sched)}
 	f.r = &AgentScheduleReconciler{Client: c, Scheme: c.Scheme(), Submitter: f.gw, Tracker: f.tracker, Now: func() time.Time { return f.clock }}
@@ -218,9 +235,10 @@ func TestAgentScheduleAGatewayDownUntilTheDeadlineCountsOnce(t *testing.T) {
 		t.Fatalf("status = %+v", s.Status)
 	}
 	f.gw.err = nil
-	f.at(t, hourAt(1, 30))
-	if s := f.get(t); s.Status.SkipCounts.MissedWindow != 0 || s.Status.ActiveTaskID != "" {
-		t.Fatalf("the abandoned slot was counted again or run late: %+v", s.Status)
+	f.at(t, hourAt(2, 0))
+	if s := f.get(t); s.Status.SkipCounts.MissedWindow != 0 || s.Status.ActiveTaskID == "" ||
+		!s.Status.LastScheduleTime.UTC().Equal(hourAt(2, 0)) {
+		t.Fatalf("after the gateway came back: %+v; want the 02:00 slot run and nothing counted again", s.Status)
 	}
 }
 
@@ -240,6 +258,10 @@ func TestAgentScheduleSuspendedSlotsAreCountedNotRun(t *testing.T) {
 	f.at(t, hourAt(1, 30))
 	if len(f.gw.sends) != 0 {
 		t.Fatalf("unsuspending ran the stale slot: %v", f.gw.sends)
+	}
+	f.at(t, hourAt(2, 0))
+	if s := f.get(t); len(f.gw.sends) != 1 || !s.Status.LastScheduleTime.UTC().Equal(hourAt(2, 0)) {
+		t.Fatalf("sends = %v, status = %+v; want the first slot after unsuspending run", f.gw.sends, s.Status)
 	}
 }
 
@@ -369,6 +391,7 @@ func TestAgentScheduleNotAcceptedFiresNothing(t *testing.T) {
 	}{
 		{"bad cron", func(s *agentv1alpha1.AgentSchedule) { s.Spec.Schedule = "61 * * * *" }, nil, agentScheduleReasonInvalidSchedule},
 		{"time zone", func(s *agentv1alpha1.AgentSchedule) { s.Spec.Schedule = "CRON_TZ=Asia/Tokyo 0 * * * *" }, nil, agentScheduleReasonInvalidSchedule},
+		{"never matches", func(s *agentv1alpha1.AgentSchedule) { s.Spec.Schedule = "0 0 30 2 *" }, nil, agentScheduleReasonInvalidSchedule},
 		{"no profile", func(s *agentv1alpha1.AgentSchedule) { s.Spec.ProfileRef.Name = "missing" }, nil, agentScheduleReasonProfileNotFound},
 		{"read only", nil, []string{agentv1alpha1.AgentProfileTierRead}, agentScheduleReasonProfileDisallowed},
 	} {
@@ -382,5 +405,155 @@ func TestAgentScheduleNotAcceptedFiresNothing(t *testing.T) {
 				t.Fatalf("sends = %v, Accepted = %+v; want none and reason %s", f.gw.sends, c, tc.reason)
 			}
 		})
+	}
+}
+
+// A schedule outside an install's namespace never fires.
+func TestAgentScheduleWithNoPlatformAgentFiresNothing(t *testing.T) {
+	f := newScheduleFixtureWith(t, nil, false)
+	f.at(t, hourAt(1, 0))
+	f.at(t, hourAt(2, 0))
+	c := meta.FindStatusCondition(f.get(t).Status.Conditions, agentv1alpha1.AgentScheduleConditionAccepted)
+	if len(f.gw.sends) != 0 || c == nil || c.Reason != agentScheduleReasonNoPlatformAgent {
+		t.Fatalf("sends = %v, Accepted = %+v", f.gw.sends, c)
+	}
+}
+
+// A schedule is builtin only when the install's PlatformAgent controls it:
+// the origin label, which its creator sets, unlocks nothing.
+func TestAgentScheduleOriginComesFromTheControllerNotTheLabel(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		controlled bool
+		want       string
+	}{
+		{"labelled builtin, not controlled", false, agentv1alpha1.AgentScheduleOriginUser},
+		{"controlled by the install", true, agentv1alpha1.AgentScheduleOriginBuiltin},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newScheduleFixture(t, func(s *agentv1alpha1.AgentSchedule) {
+				if tc.controlled {
+					s.OwnerReferences = []metav1.OwnerReference{{
+						APIVersion: agentv1alpha1.GroupVersion.String(), Kind: "PlatformAgent",
+						Name: "platform-agent", UID: "agent-uid", Controller: ptr.To(true),
+					}}
+				}
+			})
+			f.at(t, hourAt(0, 45))
+			f.at(t, hourAt(1, 0))
+			if len(f.gw.origins) != 1 || f.gw.origins[0] != tc.want {
+				t.Fatalf("origins = %v, want [%s]", f.gw.origins, tc.want)
+			}
+		})
+	}
+}
+
+// Editing the schedule moves the next slot to the new schedule's.
+func TestAgentScheduleASpecEditMovesTheNextSlot(t *testing.T) {
+	f := newScheduleFixture(t, func(s *agentv1alpha1.AgentSchedule) { s.Spec.Schedule = "0 0 1 1 *" })
+	f.at(t, hourAt(0, 45))
+	s := f.get(t)
+	s.Spec.Schedule = "*/5 * * * *"
+	s.Generation = 2
+	if err := f.c.Update(context.Background(), s); err != nil {
+		t.Fatal(err)
+	}
+	f.at(t, hourAt(0, 46))
+	if got := f.get(t).Status.NextScheduleTime.UTC(); !got.Equal(hourAt(0, 50)) {
+		t.Fatalf("next after the edit = %s, want 00:50", got)
+	}
+}
+
+// An error the reconciler doesn't know holds the claim until the starting
+// deadline, then counts the slot and moves on, rather than wedging.
+func TestAgentScheduleAnUnknownSubmitErrorDoesNotWedge(t *testing.T) {
+	f := newScheduleFixture(t, nil)
+	f.gw.err = fmt.Errorf("profile tier re-check refused: 403")
+	f.at(t, hourAt(0, 45))
+	f.at(t, hourAt(1, 1))
+	if s := f.get(t); s.Status.PendingSlot == nil {
+		t.Fatal("the claim was dropped inside the deadline")
+	}
+	f.at(t, hourAt(1, 20))
+	s := f.get(t)
+	if s.Status.PendingSlot != nil || s.Status.SkipCounts.GatewayUnavailable != 1 || !s.Status.NextScheduleTime.UTC().Equal(hourAt(2, 0)) {
+		t.Fatalf("status = %+v", s.Status)
+	}
+}
+
+type erringScheduleTracker struct{}
+
+func (erringScheduleTracker) State(context.Context, *agentv1alpha1.AgentSchedule, string) (ScheduleTaskState, error) {
+	return ScheduleTaskState{}, fmt.Errorf("bus unavailable")
+}
+
+// A tracker that keeps failing still lets the deadline settle the run.
+func TestAgentScheduleATrackerErrorStillHonoursTheDeadline(t *testing.T) {
+	f := newScheduleFixture(t, func(s *agentv1alpha1.AgentSchedule) { s.Spec.Schedule = "0 6 * * *" })
+	f.at(t, hourAt(0, 45))
+	f.at(t, hourAt(6, 0))
+	f.r.Tracker = erringScheduleTracker{}
+	f.at(t, hourAt(6, 30))
+	if s := f.get(t); s.Status.ActiveTaskID == "" {
+		t.Fatal("a tracker error settled the run inside its deadline")
+	}
+	f.at(t, hourAt(7, 6))
+	if s := f.get(t); s.Status.LastOutcome != agentv1alpha1.AgentScheduleOutcomeLost || s.Status.ActiveTaskID != "" {
+		t.Fatalf("status = %+v; want Lost past the deadline", s.Status)
+	}
+}
+
+// An outcome the status can't hold is recorded as Failed, and the status
+// write goes through.
+func TestAgentScheduleAnUnknownOutcomeIsFailed(t *testing.T) {
+	f := newScheduleFixture(t, nil)
+	f.at(t, hourAt(0, 45))
+	f.at(t, hourAt(1, 0))
+	f.tracker.state = ScheduleTaskState{Found: true, Terminal: true, Outcome: "Canceled", CompletedAt: hourAt(1, 10)}
+	f.at(t, hourAt(1, 11))
+	if s := f.get(t); s.Status.LastOutcome != agentv1alpha1.AgentScheduleOutcomeFailed || s.Status.ActiveTaskID != "" {
+		t.Fatalf("status = %+v", s.Status)
+	}
+}
+
+// Unset, the run deadline is the profile's: a profile that allows two hours
+// keeps a run alive past one, so Forbid holds.
+func TestAgentScheduleTheRunDeadlineDefaultsToTheProfiles(t *testing.T) {
+	f := newScheduleFixture(t, func(s *agentv1alpha1.AgentSchedule) {
+		s.Spec.Schedule = "0 6 * * *"
+		s.Spec.ActiveDeadlineSeconds = nil
+	})
+	var p agentv1alpha1.AgentProfile
+	if err := f.c.Get(context.Background(), types.NamespacedName{Namespace: "kubeagents-system", Name: "fleet-audit"}, &p); err != nil {
+		t.Fatal(err)
+	}
+	p.Spec.Lifecycle.ActiveDeadlineSeconds = 7200
+	if err := f.c.Update(context.Background(), &p); err != nil {
+		t.Fatal(err)
+	}
+	f.at(t, hourAt(0, 45))
+	f.at(t, hourAt(6, 0))
+	f.at(t, hourAt(7, 10))
+	if s := f.get(t); s.Status.ActiveTaskID == "" {
+		t.Fatal("the run was Lost at 70 minutes under a profile that allows two hours")
+	}
+	f.at(t, hourAt(8, 6))
+	if s := f.get(t); s.Status.LastOutcome != agentv1alpha1.AgentScheduleOutcomeLost {
+		t.Fatalf("status = %+v; want Lost past the profile's deadline plus grace", s.Status)
+	}
+}
+
+// The recent-runs ring keeps the newest ten.
+func TestAgentScheduleTheRecentRunsRingKeepsTen(t *testing.T) {
+	f := newScheduleFixture(t, func(s *agentv1alpha1.AgentSchedule) { s.Spec.Schedule = "*/5 * * * *" })
+	f.tracker.state = ScheduleTaskState{Found: true, Terminal: true, Outcome: agentv1alpha1.AgentScheduleOutcomeSucceeded}
+	f.at(t, hourAt(0, 31))
+	for m := 35; m <= 59+60; m += 5 {
+		f.at(t, hourAt(0, 0).Add(time.Duration(m)*time.Minute))
+		f.at(t, hourAt(0, 0).Add(time.Duration(m)*time.Minute+time.Minute))
+	}
+	s := f.get(t)
+	if len(s.Status.RecentRuns) != agentScheduleRecentRuns || s.Status.RecentRuns[0].TaskID != s.Status.LastTaskID {
+		t.Fatalf("ring = %d runs, newest %q, last task %q", len(s.Status.RecentRuns), s.Status.RecentRuns[0].TaskID, s.Status.LastTaskID)
 	}
 }

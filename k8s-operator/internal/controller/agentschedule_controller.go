@@ -35,6 +35,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -58,6 +59,7 @@ const (
 	agentScheduleReasonInvalidSchedule   = "InvalidSchedule"
 	agentScheduleReasonProfileNotFound   = "ProfileNotFound"
 	agentScheduleReasonProfileDisallowed = "ProfileTierDisallowed"
+	agentScheduleReasonNoPlatformAgent   = "NoPlatformAgent"
 )
 
 const (
@@ -136,6 +138,16 @@ func init() {
 	metrics.Registry.MustRegister(agentScheduleRunsTotal, agentScheduleSkipsTotal)
 }
 
+// schedulePass is one Reconcile's state: the metrics it counted, which go
+// out only once the status write that records them succeeds (a conflict's
+// retry would count them again), and the run deadline its profile sets.
+type schedulePass struct {
+	metrics        []prometheus.Counter
+	activeDeadline time.Duration
+}
+
+func (p *schedulePass) count(c prometheus.Counter) { p.metrics = append(p.metrics, c) }
+
 // AgentScheduleReconciler fires AgentSchedules: when a slot comes due it
 // claims it in status, submits an Unattended task through the gateway, and
 // records the run (docs/designs/scheduling-on-profiles.md, section 2). It runs
@@ -178,8 +190,14 @@ func AgentScheduleTriggerName(sched *agentv1alpha1.AgentSchedule) string {
 	return "schedule/" + sched.Name
 }
 
-func agentScheduleOrigin(sched *agentv1alpha1.AgentSchedule) string {
-	if sched.Labels[agentv1alpha1.AgentScheduleOriginLabel] == agentv1alpha1.AgentScheduleOriginBuiltin {
+// agentScheduleOrigin is builtin only for a schedule the operator rendered:
+// one whose controller is the install's PlatformAgent. The origin label is
+// informational and never trusted, since whoever creates a schedule sets its
+// labels, and a builtin origin unlocks a built-in audit's report stream
+// (design section 1). The gateway checks the stream against the trigger
+// again, and the set of built-in names arrives with the schedules themselves.
+func agentScheduleOrigin(sched *agentv1alpha1.AgentSchedule, agent *agentv1alpha1.PlatformAgent) string {
+	if agent != nil && metav1.IsControlledBy(sched, agent) {
 		return agentv1alpha1.AgentScheduleOriginBuiltin
 	}
 	return agentv1alpha1.AgentScheduleOriginUser
@@ -201,30 +219,58 @@ func (r *AgentScheduleReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err := r.Get(ctx, req.NamespacedName, &sched); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-	cronSched, accepted, err := r.accept(ctx, &sched)
+	pass := &schedulePass{}
+	seenGeneration := sched.Status.ObservedGeneration
+	cronSched, agent, accepted, err := r.accept(ctx, &sched, pass)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	if !accepted {
 		// Nothing fires; a profile or spec change requeues it.
-		return ctrl.Result{}, r.writeStatus(ctx, &sched)
+		return ctrl.Result{}, r.writeStatus(ctx, &sched, pass)
 	}
-	return r.fire(ctx, &sched, cronSched)
+	if seenGeneration != 0 && seenGeneration != sched.Generation && sched.Status.NextScheduleTime != nil {
+		// The spec changed (a new schedule, a re-time through the
+		// PlatformAgent's overrides): the next slot follows the new one,
+		// from now, rather than waiting out the old one's.
+		sched.Status.NextScheduleTime = ptrTime(cronSched.Next(r.now()))
+	}
+	return r.fire(ctx, &sched, cronSched, agent, pass)
 }
 
 // accept sets the Accepted condition: the schedule parses, and its profile
 // exists and allows the unattended tier. The gateway checks the tier again at
 // every submission, since a profile can change after this ran.
-func (r *AgentScheduleReconciler) accept(ctx context.Context, sched *agentv1alpha1.AgentSchedule) (cron.Schedule, bool, error) {
+func (r *AgentScheduleReconciler) accept(ctx context.Context, sched *agentv1alpha1.AgentSchedule, pass *schedulePass) (cron.Schedule, *agentv1alpha1.PlatformAgent, bool, error) {
 	cond := metav1.Condition{Type: agentv1alpha1.AgentScheduleConditionAccepted, ObservedGeneration: sched.Generation}
 	sched.Status.ObservedGeneration = sched.Generation
 	cronSched, perr := parseAgentSchedule(sched.Spec.Schedule)
+	if perr == nil && cronSched.Next(r.now()).IsZero() {
+		// A schedule no date matches (the 30th of February): the parser's
+		// Next gives up and returns the zero time, which would read as a
+		// slot that is always due.
+		perr = errors.New("no date matches it")
+	}
 	if perr != nil {
 		cond.Status, cond.Reason = metav1.ConditionFalse, agentScheduleReasonInvalidSchedule
 		cond.Message = fmt.Sprintf("schedule %q does not parse: %v", sched.Spec.Schedule, perr)
 		meta.SetStatusCondition(&sched.Status.Conditions, cond)
-		return nil, false, nil
+		return nil, nil, false, nil
 	}
+	// A schedule fires only in an install's namespace: one PlatformAgent per
+	// cluster, whose gateway takes its runs. Elsewhere it would submit as the
+	// install's trigger under a name nothing there owns.
+	var agents agentv1alpha1.PlatformAgentList
+	if err := r.List(ctx, &agents, client.InNamespace(sched.Namespace)); err != nil {
+		return nil, nil, false, err
+	}
+	if len(agents.Items) == 0 {
+		cond.Status, cond.Reason = metav1.ConditionFalse, agentScheduleReasonNoPlatformAgent
+		cond.Message = "no PlatformAgent in this namespace: schedules run only in an install's namespace"
+		meta.SetStatusCondition(&sched.Status.Conditions, cond)
+		return nil, nil, false, nil
+	}
+	agent := &agents.Items[0]
 	var profile agentv1alpha1.AgentProfile
 	err := r.Get(ctx, types.NamespacedName{Namespace: sched.Namespace, Name: sched.Spec.ProfileRef.Name}, &profile)
 	switch {
@@ -232,41 +278,42 @@ func (r *AgentScheduleReconciler) accept(ctx context.Context, sched *agentv1alph
 		cond.Status, cond.Reason = metav1.ConditionFalse, agentScheduleReasonProfileNotFound
 		cond.Message = fmt.Sprintf("AgentProfile %q does not exist in this namespace", sched.Spec.ProfileRef.Name)
 	case err != nil:
-		return nil, false, err
+		return nil, nil, false, err
 	case !slices.Contains(profile.AllowedTierList(), agentv1alpha1.AgentProfileTierUnattended):
 		cond.Status, cond.Reason = metav1.ConditionFalse, agentScheduleReasonProfileDisallowed
 		cond.Message = fmt.Sprintf("AgentProfile %q does not allow the unattended tier", profile.Name)
 	default:
 		cond.Status, cond.Reason = metav1.ConditionTrue, agentScheduleReasonValid
 		cond.Message = "the schedule parses and its profile allows the unattended tier"
+		pass.activeDeadline = durationOr(sched.Spec.ActiveDeadlineSeconds,
+			durationOr(&profile.Spec.Lifecycle.ActiveDeadlineSeconds, agentScheduleDefaultActiveDeadline))
 	}
 	meta.SetStatusCondition(&sched.Status.Conditions, cond)
-	return cronSched, cond.Status == metav1.ConditionTrue, nil
+	return cronSched, agent, cond.Status == metav1.ConditionTrue, nil
 }
 
 // fire is the slot logic. Each claim is written to status before its
 // submission, so a restart at any point re-sends the same idempotency key.
-func (r *AgentScheduleReconciler) fire(ctx context.Context, sched *agentv1alpha1.AgentSchedule, cronSched cron.Schedule) (ctrl.Result, error) {
+func (r *AgentScheduleReconciler) fire(ctx context.Context, sched *agentv1alpha1.AgentSchedule, cronSched cron.Schedule,
+	agent *agentv1alpha1.PlatformAgent, pass *schedulePass) (ctrl.Result, error) {
 	st := &sched.Status
 	now := r.now()
 	startingDeadline := durationOr(sched.Spec.StartingDeadlineSeconds, agentScheduleDefaultStartingDeadline)
 
 	// 1. A run in flight: did it end, or vanish, or outlive its deadline?
 	if st.ActiveTaskID != "" {
-		if err := r.trackActive(ctx, sched, now); err != nil {
-			return ctrl.Result{}, err
-		}
+		r.trackActive(ctx, sched, now, pass)
 	}
 
 	// 2. A claimed slot the gateway has not taken yet (a retry, or a
 	// restart between the claim and the status write after it).
 	if st.PendingSlot != nil {
-		retry, err := r.submitPending(ctx, sched, cronSched, now, startingDeadline)
+		retry, err := r.submitPending(ctx, sched, agent, cronSched, now, startingDeadline, pass)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
 		if retry {
-			return ctrl.Result{RequeueAfter: agentScheduleRetry}, r.writeStatus(ctx, sched)
+			return ctrl.Result{RequeueAfter: agentScheduleRetry}, r.writeStatus(ctx, sched, pass)
 		}
 	}
 
@@ -279,15 +326,15 @@ func (r *AgentScheduleReconciler) fire(ctx context.Context, sched *agentv1alpha1
 			st.PendingSlot = &agentv1alpha1.AgentSchedulePendingSlot{
 				SlotTime: metav1.NewTime(now), IdempotencyKey: runNowKey(sched, token), RunNow: token, ClaimedAt: metav1.NewTime(now),
 			}
-			if err := r.writeStatus(ctx, sched); err != nil {
+			if err := r.writeStatus(ctx, sched, pass); err != nil {
 				return ctrl.Result{}, err
 			}
-			retry, err := r.submitPending(ctx, sched, cronSched, now, startingDeadline)
+			retry, err := r.submitPending(ctx, sched, agent, cronSched, now, startingDeadline, pass)
 			if err != nil {
 				return ctrl.Result{}, err
 			}
 			if retry {
-				return ctrl.Result{RequeueAfter: agentScheduleRetry}, r.writeStatus(ctx, sched)
+				return ctrl.Result{RequeueAfter: agentScheduleRetry}, r.writeStatus(ctx, sched, pass)
 			}
 		}
 	}
@@ -303,10 +350,10 @@ func (r *AgentScheduleReconciler) fire(ctx context.Context, sched *agentv1alpha1
 	if next := st.NextScheduleTime.UTC(); !now.Before(next) {
 		switch {
 		case sched.Spec.Suspend:
-			r.skip(sched, "suspended", &st.SkipCounts.Suspended)
+			r.skip(pass, sched, "suspended", &st.SkipCounts.Suspended)
 			st.NextScheduleTime = ptrTime(cronSched.Next(now))
 		case st.ActiveTaskID != "" || st.PendingSlot != nil:
-			r.skip(sched, "already_running", &st.SkipCounts.AlreadyRunning)
+			r.skip(pass, sched, "already_running", &st.SkipCounts.AlreadyRunning)
 			st.NextScheduleTime = ptrTime(cronSched.Next(now))
 		default:
 			slot := next
@@ -314,7 +361,7 @@ func (r *AgentScheduleReconciler) fire(ctx context.Context, sched *agentv1alpha1
 				// Missed while the operator or the gateway was down: one
 				// count, and the latest slot still inside the deadline
 				// runs, if there is one.
-				r.skip(sched, "missed_window", &st.SkipCounts.MissedWindow)
+				r.skip(pass, sched, "missed_window", &st.SkipCounts.MissedWindow)
 				latest := latestSlot(cronSched, next, now)
 				if now.Sub(latest) > startingDeadline {
 					st.NextScheduleTime = ptrTime(cronSched.Next(now))
@@ -325,20 +372,20 @@ func (r *AgentScheduleReconciler) fire(ctx context.Context, sched *agentv1alpha1
 			st.PendingSlot = &agentv1alpha1.AgentSchedulePendingSlot{
 				SlotTime: metav1.NewTime(slot), IdempotencyKey: slotKey(sched, slot), ClaimedAt: metav1.NewTime(now),
 			}
-			if err := r.writeStatus(ctx, sched); err != nil {
+			if err := r.writeStatus(ctx, sched, pass); err != nil {
 				return ctrl.Result{}, err
 			}
-			retry, err := r.submitPending(ctx, sched, cronSched, now, startingDeadline)
+			retry, err := r.submitPending(ctx, sched, agent, cronSched, now, startingDeadline, pass)
 			if err != nil {
 				return ctrl.Result{}, err
 			}
 			if retry {
-				return ctrl.Result{RequeueAfter: agentScheduleRetry}, r.writeStatus(ctx, sched)
+				return ctrl.Result{RequeueAfter: agentScheduleRetry}, r.writeStatus(ctx, sched, pass)
 			}
 		}
 	}
 
-	if err := r.writeStatus(ctx, sched); err != nil {
+	if err := r.writeStatus(ctx, sched, pass); err != nil {
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{RequeueAfter: r.requeueAfter(sched, now)}, nil
@@ -346,27 +393,45 @@ func (r *AgentScheduleReconciler) fire(ctx context.Context, sched *agentv1alpha1
 
 // trackActive settles a run in flight that ended, vanished or outlived its
 // deadline plus grace, so a lost task never wedges the schedule.
-func (r *AgentScheduleReconciler) trackActive(ctx context.Context, sched *agentv1alpha1.AgentSchedule, now time.Time) error {
+func (r *AgentScheduleReconciler) trackActive(ctx context.Context, sched *agentv1alpha1.AgentSchedule, now time.Time, pass *schedulePass) {
 	st := &sched.Status
 	state, err := r.Tracker.State(ctx, sched, st.ActiveTaskID)
 	if err != nil {
-		return err
+		// No answer from the bus is no answer: the deadline still applies,
+		// so a bus that keeps failing cannot hold the schedule forever.
+		logf.FromContext(ctx).Error(err, "reading a scheduled run's state", "schedule", sched.Name, "task", st.ActiveTaskID)
+		state = ScheduleTaskState{Found: true}
+	}
+	deadline := pass.activeDeadline
+	if deadline <= 0 {
+		deadline = durationOr(sched.Spec.ActiveDeadlineSeconds, agentScheduleDefaultActiveDeadline)
 	}
 	switch {
 	case state.Found && state.Terminal:
-		r.settle(sched, state.Outcome, state.CompletedAt)
+		r.settle(pass, sched, state.Outcome, state.CompletedAt)
 	case !state.Found:
-		r.settle(sched, agentv1alpha1.AgentScheduleOutcomeLost, now)
-	case st.ActiveTaskStartedAt != nil &&
-		now.Sub(st.ActiveTaskStartedAt.UTC()) > durationOr(sched.Spec.ActiveDeadlineSeconds, agentScheduleDefaultActiveDeadline)+agentScheduleLostGrace:
-		r.settle(sched, agentv1alpha1.AgentScheduleOutcomeLost, now)
+		r.settle(pass, sched, agentv1alpha1.AgentScheduleOutcomeLost, now)
+	case st.ActiveTaskStartedAt != nil && now.Sub(st.ActiveTaskStartedAt.UTC()) > deadline+agentScheduleLostGrace:
+		r.settle(pass, sched, agentv1alpha1.AgentScheduleOutcomeLost, now)
 	}
-	return nil
+}
+
+// knownOutcome is outcome when the status's enum admits it, else Failed: an
+// outcome the bus spells some other way must not make every status write
+// fail validation.
+func knownOutcome(outcome string) string {
+	switch outcome {
+	case agentv1alpha1.AgentScheduleOutcomeSucceeded, agentv1alpha1.AgentScheduleOutcomeFailed,
+		agentv1alpha1.AgentScheduleOutcomeCancelled, agentv1alpha1.AgentScheduleOutcomeLost:
+		return outcome
+	}
+	return agentv1alpha1.AgentScheduleOutcomeFailed
 }
 
 // settle records a run's end and clears it from flight.
-func (r *AgentScheduleReconciler) settle(sched *agentv1alpha1.AgentSchedule, outcome string, at time.Time) {
+func (r *AgentScheduleReconciler) settle(pass *schedulePass, sched *agentv1alpha1.AgentSchedule, outcome string, at time.Time) {
 	st := &sched.Status
+	outcome = knownOutcome(outcome)
 	if at.IsZero() {
 		at = r.now()
 	}
@@ -379,21 +444,21 @@ func (r *AgentScheduleReconciler) settle(sched *agentv1alpha1.AgentSchedule, out
 			st.RecentRuns[i].Outcome = outcome
 		}
 	}
-	agentScheduleRunsTotal.WithLabelValues(sched.Name, strings.ToLower(outcome)).Inc()
+	pass.count(agentScheduleRunsTotal.WithLabelValues(sched.Name, strings.ToLower(outcome)))
 	st.ActiveTaskID = ""
 	st.ActiveTaskStartedAt = nil
 }
 
 // submitPending sends the claimed slot. It reports retry when the gateway
 // did not take it and the deadline still allows another try.
-func (r *AgentScheduleReconciler) submitPending(ctx context.Context, sched *agentv1alpha1.AgentSchedule, cronSched cron.Schedule,
-	now time.Time, startingDeadline time.Duration) (bool, error) {
+func (r *AgentScheduleReconciler) submitPending(ctx context.Context, sched *agentv1alpha1.AgentSchedule, agent *agentv1alpha1.PlatformAgent, cronSched cron.Schedule,
+	now time.Time, startingDeadline time.Duration, pass *schedulePass) (bool, error) {
 	st := &sched.Status
 	p := st.PendingSlot
 	taskID, err := r.Submitter.Submit(ctx, ScheduleSubmission{
 		IdempotencyKey: p.IdempotencyKey,
 		TriggerName:    AgentScheduleTriggerName(sched),
-		Origin:         agentScheduleOrigin(sched),
+		Origin:         agentScheduleOrigin(sched, agent),
 		SlotTime:       p.SlotTime.UTC(),
 		Schedule:       sched,
 	})
@@ -412,14 +477,20 @@ func (r *AgentScheduleReconciler) submitPending(ctx context.Context, sched *agen
 			st.LastScheduleTime = &slot
 			st.NextScheduleTime = ptrTime(cronSched.Next(now))
 		}
-		agentScheduleRunsTotal.WithLabelValues(sched.Name, "submitted").Inc()
+		pass.count(agentScheduleRunsTotal.WithLabelValues(sched.Name, "submitted"))
 		st.PendingSlot = nil
 		return false, nil
 	case errors.Is(err, ErrScheduleRateLimited):
-		r.skip(sched, "rate_limited", &st.SkipCounts.RateLimited)
+		r.skip(pass, sched, "rate_limited", &st.SkipCounts.RateLimited)
 		r.dropPending(sched, cronSched, now)
 		return false, nil
-	case errors.Is(err, ErrScheduleGatewayUnavailable):
+	default:
+		// The gateway unreachable, or an answer this reconciler doesn't
+		// know: the claim is held and retried until the starting deadline,
+		// then counted and dropped, so no error can wedge the schedule.
+		if !errors.Is(err, ErrScheduleGatewayUnavailable) {
+			logf.FromContext(ctx).Error(err, "submitting a scheduled run", "schedule", sched.Name, "key", p.IdempotencyKey)
+		}
 		claimed := p.SlotTime.UTC()
 		if p.RunNow != "" {
 			claimed = p.ClaimedAt.UTC()
@@ -427,13 +498,11 @@ func (r *AgentScheduleReconciler) submitPending(ctx context.Context, sched *agen
 		if now.Sub(claimed) > startingDeadline {
 			// Counted once here, so the next pass doesn't count the same
 			// slot again as a missed window.
-			r.skip(sched, "gateway_unavailable", &st.SkipCounts.GatewayUnavailable)
+			r.skip(pass, sched, "gateway_unavailable", &st.SkipCounts.GatewayUnavailable)
 			r.dropPending(sched, cronSched, now)
 			return false, nil
 		}
 		return true, nil
-	default:
-		return false, err
 	}
 }
 
@@ -449,9 +518,9 @@ func (r *AgentScheduleReconciler) dropPending(sched *agentv1alpha1.AgentSchedule
 	st.PendingSlot = nil
 }
 
-func (r *AgentScheduleReconciler) skip(sched *agentv1alpha1.AgentSchedule, reason string, counter *int64) {
+func (r *AgentScheduleReconciler) skip(pass *schedulePass, sched *agentv1alpha1.AgentSchedule, reason string, counter *int64) {
 	*counter++
-	agentScheduleSkipsTotal.WithLabelValues(sched.Name, reason).Inc()
+	pass.count(agentScheduleSkipsTotal.WithLabelValues(sched.Name, reason))
 }
 
 // requeueAfter is the next time the schedule needs looking at: its next
@@ -472,8 +541,17 @@ func (r *AgentScheduleReconciler) requeueAfter(sched *agentv1alpha1.AgentSchedul
 	return d
 }
 
-func (r *AgentScheduleReconciler) writeStatus(ctx context.Context, sched *agentv1alpha1.AgentSchedule) error {
-	return r.Status().Update(ctx, sched)
+// writeStatus stores the status and, once it is stored, the metrics the pass
+// counted for it.
+func (r *AgentScheduleReconciler) writeStatus(ctx context.Context, sched *agentv1alpha1.AgentSchedule, pass *schedulePass) error {
+	if err := r.Status().Update(ctx, sched); err != nil {
+		return err
+	}
+	for _, c := range pass.metrics {
+		c.Inc()
+	}
+	pass.metrics = nil
+	return nil
 }
 
 // latestSlot is the latest slot at or before now, walking from next.
@@ -481,7 +559,7 @@ func latestSlot(cronSched cron.Schedule, next, now time.Time) time.Time {
 	latest := next
 	for i := 0; i < agentScheduleMaxSlotWalk; i++ {
 		after := cronSched.Next(latest)
-		if after.After(now) {
+		if after.IsZero() || !after.After(latest) || after.After(now) {
 			return latest
 		}
 		latest = after
@@ -510,10 +588,25 @@ func (r *AgentScheduleReconciler) schedulesForProfile(ctx context.Context, obj c
 	return reqs
 }
 
+// schedulesInNamespace maps a PlatformAgent event to every schedule beside
+// it, so a schedule created before its install is accepted once it exists.
+func (r *AgentScheduleReconciler) schedulesInNamespace(ctx context.Context, obj client.Object) []reconcile.Request {
+	var list agentv1alpha1.AgentScheduleList
+	if err := r.List(ctx, &list, client.InNamespace(obj.GetNamespace())); err != nil {
+		return nil
+	}
+	reqs := make([]reconcile.Request, 0, len(list.Items))
+	for _, s := range list.Items {
+		reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: s.Namespace, Name: s.Name}})
+	}
+	return reqs
+}
+
 func (r *AgentScheduleReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&agentv1alpha1.AgentSchedule{}).
 		Watches(&agentv1alpha1.AgentProfile{}, handler.EnqueueRequestsFromMapFunc(r.schedulesForProfile)).
+		Watches(&agentv1alpha1.PlatformAgent{}, handler.EnqueueRequestsFromMapFunc(r.schedulesInNamespace)).
 		Named("agentschedule").
 		Complete(r)
 }
