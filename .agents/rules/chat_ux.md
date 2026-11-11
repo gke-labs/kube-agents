@@ -147,7 +147,10 @@ to a blocked or failed card, and `[SILENT]` when the specialist's question is al
 `deploy/docker/patches/slack_ux_moments.py`, which posts a pull request opened and a question the
 work waits on as messages of their own while every other milestone stays a plan row; and
 `completion_text` and `explained_by_wake` in `deploy/docker/patches/kanban_notifier.py`, which drop
-the head line above a report and hold a failure line the wake will explain.
+the head line above a report and hold a failure line the wake will explain. A post one reader
+alone sees, telling them a control they pressed was refused and what still works
+(`refusedPressNotice` in `a2a/gateway/stopgate.go`), is that reader's failure line and notifies
+nobody else.
 
 ## A destructive action needs the asker's confirm
 
@@ -160,7 +163,13 @@ cluster.
 Today: [`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §1.6 ("state the resolved target back to
 them and wait for a yes") and §3's `/feedback` confirmation, which shows the exact submission and waits for a yes. In the
 gateway, `mayStop` in `a2a/gateway/stopgate.go` lets only a requester of the thread press its Stop
-button, Slack's native one or the one drawn on Google Chat; a typed `stop` is not gated.
+button, Slack's native one or the one drawn on Google Chat; a typed `stop` is not gated. A refused
+press on Google Chat tells the presser alone, in the thread, by a post only they see
+(`refusedPressNotice`, `tellsRefusedPresser`): the drawn button stays until the gateway edits the
+line, so silence there is a frozen control, and a line nobody else is notified of keeps "Speak up
+only when it matters"; it names the typed word rather than offering a button, since a button is
+what the gate refuses, so "Choices are buttons" does not apply. Slack's refused press stays silent:
+its button is Slack's own and settles on its own.
 
 ## Renderers never compose
 
