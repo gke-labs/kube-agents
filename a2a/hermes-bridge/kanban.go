@@ -499,7 +499,7 @@ func resolveKanbanDBPath() string {
 			if envKey != hermesKanbanDBEnv {
 				p = filepath.Join(v, kanbanDBFilename)
 			}
-			if info, err := os.Stat(p); err == nil && !info.IsDir() {
+			if info, err := os.Stat(p); err == nil && !info.IsDir() { // #nosec G703 -- the agent's own home from HERMES_KANBAN_DB, HERMES_HOME or PLATFORM_AGENT_HOME, set by the operator
 				return p
 			}
 		}
@@ -690,7 +690,7 @@ func formatKanbanCardOutput(c kanbanCardRow) string {
 func querySessionKanbanCards(ctx context.Context, pythonBin, dbPath, sessionID string, sinceUnix int64, trackedIDs []string) ([]kanbanCardRow, error) {
 	qCtx, cancel := context.WithTimeout(ctx, kanbanQueryTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(qCtx, pythonBin, "-c", kanbanDBPyScript, "poll", dbPath, sessionID, strconv.FormatInt(sinceUnix, 10), strings.Join(trackedIDs, ","))
+	cmd := exec.CommandContext(qCtx, pythonBin, "-c", kanbanDBPyScript, "poll", dbPath, sessionID, strconv.FormatInt(sinceUnix, 10), strings.Join(trackedIDs, ",")) // #nosec G204 -- pythonBin is the resolved interpreter and the rest is argv, not a shell line
 	out, err := cmd.Output()
 	if err != nil {
 		// The script's traceback names the cause (a corrupt file, a schema

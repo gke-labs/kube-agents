@@ -145,6 +145,8 @@ class LifecycleScriptGuardTest(unittest.TestCase):
                    output_stderr_noise="",
                    output_stub=None,
                    console_fail_var="",
+                   console_transient_fails=0,
+                   console_transient_error=None,
                    apply_stub="exit 0",
                    show_rc=0,
                    untaint_stub="exit 0",
@@ -230,6 +232,11 @@ fi
     exit 1"""
 
             # Stub terraform CLI to return configured state list, state show, and console outputs
+            # The transient answer console_transient_fails gives: Terraform's own
+            # wording and the Cloud Storage JSON body, as the kube-agents#5349 job
+            # log showed them, unless a test hands in another error text.
+            if console_transient_error is None:
+                console_transient_error = self._STATE_BACKEND_503
             terraform_stub = bin_dir / "terraform"
             terraform_stub.write_text(f"""#!/usr/bin/env bash
 set -e
@@ -255,6 +262,20 @@ elif [[ "$cmd" == "output" ]]; then
     {output_stub}
 elif [[ "$cmd" == "console" ]]; then
     read -r expr
+    # One line per read, for the tests that count the attempts tfvar makes.
+    echo "console $expr" >> "${{TF_STUB_LOG:-/dev/null}}"
+    # console_transient_fails models the state backend answering a transient
+    # error -- the Cloud Storage 503 that ended kube-agents#5349's provision --
+    # for the first N console reads of the run, whichever variable they ask
+    # for; the reads after that answer normally. The count lives in
+    # TF_STUB_LOG, so a test that sets console_transient_fails runs through
+    # _run_with_stub_log; without the log every read would fail.
+    if [[ {console_transient_fails} -gt 0 && -n "${{TF_STUB_LOG:-}}" && $(grep -c "^console" "$TF_STUB_LOG") -le {console_transient_fails} ]]; then
+        cat >&2 << 'EOF'
+{console_transient_error}
+EOF
+        exit 1
+    fi
     # console_fail_var models a terraform console that cannot answer -- a state
     # lock, a missing provider, a syntax error in the configuration -- for the
     # one variable named. Checked before every other branch so it wins.
@@ -388,7 +409,12 @@ exit 0
 KUBE_AGENTS_SOURCE_ONLY=true source "{_LIFECYCLE_SH}"
 {func_call}
 """
-            env = get_isolated_test_env(bin_dir=str(bin_dir))
+            # The retry knobs come from the test line, never from a shell that
+            # has been trying them out by hand.
+            env = get_isolated_test_env(
+                bin_dir=str(bin_dir),
+                absent=["STATE_BACKEND_ATTEMPTS", "STATE_BACKEND_WAIT_SECONDS"],
+            )
             cwd = str(_REPO_ROOT / "terraform" / "examples" / "full-install")
             if stdout_path is not None:
                 # stdout a regular file, as `./lifecycle.sh apply > apply.log`
@@ -1913,6 +1939,31 @@ resource "google_service_account" "agent" {
         "has not been used in project 123 before or it is disabled."
     )
 
+    _STATE_BACKEND_503 = """╷
+│ Error: Failed to open state file at gs://test-tfstate/kube-agents/test/default.tfstate: Get "https://storage.googleapis.com/storage/v1/b/test-tfstate/o/default.tfstate?alt=json": googleapi: got HTTP response code 503 with body: {
+│   "error": {
+│     "code": 503,
+│     "message": "Authentication backend unavailable.",
+│     "status": "UNAVAILABLE"
+│   }
+│ }
+╵"""
+
+    # The Google front end answers a 502 with an HTML page, not the API's JSON.
+    _STATE_BACKEND_502_HTML = """╷
+│ Error: Failed to open state file at gs://test-tfstate/kube-agents/test/default.tfstate: Get "https://storage.googleapis.com/storage/v1/b/test-tfstate/o/default.tfstate?alt=json": googleapi: got HTTP response code 502 with body: <!DOCTYPE html>
+│ <html lang=en><title>Error 502 (Server Error)!!1</title>
+╵"""
+
+    # A 403 reads the same the second time: the identity lacks the role.
+    _STATE_BACKEND_403 = """╷
+│ Error: Failed to open state file at gs://test-tfstate/kube-agents/test/default.tfstate: googleapi: Error 403: sa@project.iam.gserviceaccount.com does not have storage.objects.get access to the Google Cloud Storage object., forbidden
+│   "error": {
+│     "code": 403,
+│     "status": "PERMISSION_DENIED"
+│   }
+╵"""
+
     def _apply_stub_failing_first(self, times, message):
         """A terraform apply that fails `times` times with `message`, then succeeds."""
         return (
@@ -1984,6 +2035,78 @@ resource "google_service_account" "agent" {
         self.assertEqual(proc.returncode, 1)
         self.assertEqual(log.count("apply -auto-approve -input=false"), 3, log)
         self.assertIn("run it again", proc.stderr)
+
+    def test_tfvar_retries_a_transient_state_backend_error(self):
+        """kube-agents#5349: the pre-apply guards read some fifty variables
+        through terraform console, each read opens the remote state, and one
+        Cloud Storage 503 ended the whole provision. A transient answer is
+        retried; the value comes back and the caller never sees the blip."""
+        proc, log = self._run_with_stub_log(
+            "STATE_BACKEND_WAIT_SECONDS=0 tfvar cluster_name",
+            tfvar_cluster_name='"platform-agent-host"',
+            console_transient_fails=2,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "platform-agent-host")
+        self.assertEqual(log.count("console var.cluster_name"), 3, log)
+        self.assertIn("attempt 2 of 4", proc.stderr)
+        self.assertIn("attempt 3 of 4", proc.stderr)
+        self.assertNotIn("could not evaluate", proc.stderr)
+
+    def test_tfvar_gives_up_after_its_attempt_budget(self):
+        """A backend that stays down is still a failure, and the terraform
+        error is printed, not swallowed: the operator reads what the backend
+        said, then how many times it was asked."""
+        proc, log = self._run_with_stub_log(
+            "STATE_BACKEND_WAIT_SECONDS=0 STATE_BACKEND_ATTEMPTS=3 tfvar cluster_name",
+            console_transient_fails=99,
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(log.count("console var.cluster_name"), 3, log)
+        self.assertIn('"code": 503', proc.stderr)
+        self.assertIn("could not evaluate var.cluster_name", proc.stderr)
+        self.assertIn("attempt 3 of 3", proc.stderr)
+        self.assertNotIn("attempt 4 of", proc.stderr)
+
+    def test_tfvar_does_not_retry_a_configuration_error(self):
+        """A console that cannot load the configuration reads the same the
+        second time; only the backend's transient answers are retried."""
+        proc, log = self._run_with_stub_log(
+            "STATE_BACKEND_WAIT_SECONDS=0 tfvar enable_drift_pubsub",
+            console_fail_var="enable_drift_pubsub",
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(log.count("console var.enable_drift_pubsub"), 1, log)
+        self.assertIn("could not evaluate var.enable_drift_pubsub", proc.stderr)
+        self.assertNotIn("attempt", proc.stderr)
+
+    def test_tfvar_retries_a_transient_error_whose_body_is_not_json(self):
+        """The Google front end serves an HTML page for a 502; only the
+        `got HTTP response code` wrapper says what happened."""
+        proc, log = self._run_with_stub_log(
+            "STATE_BACKEND_WAIT_SECONDS=0 tfvar cluster_name",
+            tfvar_cluster_name='"platform-agent-host"',
+            console_transient_fails=1,
+            console_transient_error=self._STATE_BACKEND_502_HTML,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "platform-agent-host")
+        self.assertEqual(log.count("console var.cluster_name"), 2, log)
+        self.assertIn("attempt 2 of 4", proc.stderr)
+
+    def test_tfvar_does_not_retry_a_permanent_backend_error(self):
+        """A 403 from the state bucket is the closest shape to the transient
+        answer -- same wrapper, same JSON body -- and must not be retried."""
+        proc, log = self._run_with_stub_log(
+            "STATE_BACKEND_WAIT_SECONDS=0 tfvar cluster_name",
+            console_transient_fails=99,
+            console_transient_error=self._STATE_BACKEND_403,
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(log.count("console var.cluster_name"), 1, log)
+        self.assertIn("could not evaluate var.cluster_name", proc.stderr)
+        self.assertIn("Error 403", proc.stderr)
+        self.assertNotIn("attempt", proc.stderr)
 
     def test_run_apply_keeps_a_log_file_that_stdout_points_at(self):
         """`lifecycle.sh apply > apply.log`: what the guards wrote before the
@@ -3304,7 +3427,7 @@ class LifecycleSubcommandFilterTest(unittest.TestCase):
         lines = [line for line in proc.stdout.splitlines() if line.strip()]
         self.assertTrue(lines[0].startswith("Makes `apply` and `destroy` repeatable"), lines[:1])
         self.assertIn("`plan`, `apply` and `destroy` hide helm_release's `metadata` block", proc.stdout)
-        self.assertEqual(lines[-1], "default kube-agents/<cluster_name>>. Unset, state stays local as before.")
+        self.assertEqual(lines[-1], "times STATE_BACKEND_WAIT_SECONDS (15) apart.")
         self.assertNotIn("set -euo pipefail", proc.stdout)
 
 
