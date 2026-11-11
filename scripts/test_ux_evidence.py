@@ -173,7 +173,17 @@ class BodyTest(unittest.TestCase):
 
     def test_an_unclosed_fence_hides_the_images_after_it(self):
         self.assertFalse(ux.has_image(f"```\n{SHOT}\n"))
-        self.assertFalse(ux.has_image(f"text\n\n  ~~~bash\nrun\n\n{SHOT}\n"))
+        self.assertFalse(ux.has_image(f"text\n\n~~~bash\nrun\n\n{SHOT}\n"))
+
+    def test_what_is_not_an_unclosed_fence_hides_nothing(self):
+        for body in (
+            f"``` foo ```\n\n{SHOT}\n",
+            f"```x```\n{SHOT}\n",
+            f"- step\n  ```bash\n  run\n\n{SHOT}\n",
+            f"    ```\n\n{SHOT}\n",
+        ):
+            with self.subTest(body=body):
+                self.assertTrue(ux.has_image(body))
 
     def test_a_link_is_not_an_image(self):
         self.assertFalse(ux.has_image("[screenshot](https://example.com/a.png)"))

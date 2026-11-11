@@ -65,7 +65,7 @@ jobs:
   chat-rules:
     name: Chat output follows the chat UX rules
     needs: evidence
-    # Runs when a chat path changed, even if the screenshot check failed: the
+    # Runs when a chat path or a shared chat case changed, even if the screenshot check failed: the
     # two answer different questions, and an author fixing one wants the other.
     # A body edit re-runs it too: the edit cancels the push's run for the same
     # head (the concurrency key), so skipping here would leave the head without it.

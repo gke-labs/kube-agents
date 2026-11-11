@@ -13,8 +13,9 @@ by, read here rather than copied so the two cannot drift. Everything else a
 user sees is `SURFACES` below. Test files never count, and a surface's notes
 and pins (`NOT_RENDERED`) do not either.
 
-A chat path also sets `chat=true` in `$GITHUB_OUTPUT`, which is what starts
-the workflow's chat-rules job.
+A chat path, or a change to the shared chat cases (`CHAT_CASES`), also sets
+`chat=true` in `$GITHUB_OUTPUT`, which is what starts the workflow's
+chat-rules job.
 
 Run: git diff --name-only origin/main...HEAD | python3 scripts/ux_evidence.py --body-file body.md
 Test: cd scripts && python3 -m unittest test_ux_evidence
@@ -51,7 +52,6 @@ SURFACES = (
     "scripts/installer/*.sh",
 )
 
-# Tests anywhere: a golden file or a fixture changes because a surface did.
 # The shared chat cases the chatmsg lint and the conformance tests read. A
 # change to them is a test, so it needs no screenshot, but it is exactly what
 # the chat job exists to run.
@@ -60,6 +60,7 @@ CHAT_CASES = (
     "tests/conformance/chat-ux/**",
 )
 
+# Tests anywhere: a golden file or a fixture changes because a surface did.
 TEST_PATHS = (
     "**/test_*.py",
     "**/*_test.go",
@@ -93,12 +94,16 @@ LIST_ITEM_RE = re.compile(r"""^\s+-\s+["']?([^"'\s]+)["']?\s*$""")
 # ends at its first `-->` whatever is inside it (or runs to the end, unclosed);
 # a fenced block at any indent (list items indent theirs), closed by a line of
 # at least the same markers and nothing else, so a "```python" line opens and
-# never closes; a code span, closed by a backtick run of its own length before
-# a blank line ends the paragraph. An unclosed fence runs to the end of the
-# body, as GitHub renders it, so an image after it shows as text.
+# never closes; an unclosed fence at the left margin, which runs to the end of
+# the body as GitHub renders it; a code span, closed by a backtick run of its
+# own length before a blank line ends the paragraph. A backtick opener whose
+# rest of line holds a backtick is a code span, not a fence. An unclosed fence
+# that is indented is left alone: inside a list item it ends with the item,
+# which a regular expression cannot see, and four spaces make no fence at all.
 HIDDEN_RE = re.compile(
     r"<!--.*?(?:-->|\Z)"
-    r"|^[ \t]*(?P<fence>`{3,}|~{3,})[^\n]*(?:\n.*?^[ \t]*(?P=fence)[`~]*[ \t]*$|.*\Z)"
+    r"|^[ \t]*(?P<fence>`{3,}(?=[^`\n]*$)|~{3,})[^\n]*\n.*?^[ \t]*(?P=fence)[`~]*[ \t]*$"
+    r"|^(?:`{3,}(?=[^`\n]*$)|~{3,}).*\Z"
     r"|(?P<ticks>`+)(?!`)(?:(?!\n[ \t]*\n).)+?(?<!`)(?P=ticks)(?!`)",
     re.DOTALL | re.MULTILINE,
 )

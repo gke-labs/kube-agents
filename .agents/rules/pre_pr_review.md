@@ -144,8 +144,9 @@ it is a developer tool that runs on your own machine.
 - **When nothing a user sees moved** — a refactor of a renderer, a console handler's backend
   logic — tick **No user-visible change** instead. The reviewer holds the tick to the diff.
 - **[`ux-evidence.yml`](../../.github/workflows/ux-evidence.yml) checks the body.** It fails when
-  the diff changes a user-facing path and the body, outside comments, code fences (an unclosed one runs to the end) and code spans, has neither
-  an image nor the ticked box; editing the body re-runs it. The paths are the `paths:` of
+  the diff changes a user-facing path and the body, outside comments, code fences (an unclosed
+  one at the margin runs to the end) and code spans, has neither an image nor the ticked box;
+  editing the body re-runs it. The paths are the `paths:` of
   [`chat_ux.md`](chat_ux.md) plus `SURFACES` in
   [`scripts/ux_evidence.py`](../../scripts/ux_evidence.py); test files never count, and the docs
   site counts for its rendering (config, components, styles, assets, `public/`), not its prose,
