@@ -19,7 +19,8 @@ already has, with the same caller authentication, refusal shape and audit line a
 The first table entries are the Monitoring `timeSeries` and `metricDescriptors` reads and the
 Managed Prometheus query endpoints; the Cloud Trace `traces` list and single-trace get followed,
 for the observability skill's trace helpers, and then the GKE `projects.locations.clusters` list and
-get, for the Cluster Agent reconcile (#3703), with their answers projected. A collector's one-function change is to obtain its
+get, for the Cluster Agent reconcile (#3703; the shim's `get-credentials` check reads the
+get too, #5447), with their answers projected. A collector's one-function change is to obtain its
 `requests`-shaped session from the broker client (`credential_proxy_client.ApiSession`)
 instead of from `google.auth`.
 
@@ -197,7 +198,10 @@ ApiRoute("monitoring.googleapis.com", API_READ_METHOD,
 holds the Monitoring `timeSeries` and `metricDescriptors` lists, the Managed Prometheus
 `query`, `query_range`, `series` and `labels` reads, and the Cloud Trace `traces` list and
 `traces/<id>` get (the id held to 32 lower-case hex characters), and the GKE
-`projects.locations.clusters` list and get the Cluster Agent reconcile reads (#3703; location
+`projects.locations.clusters` list and get the Cluster Agent reconcile reads (#3703; the get is
+also the shim's check that a cluster exists before it answers a `get-credentials`, #5447, sent with
+the `X-Kube-Agents-Get-Credentials-Check` header, on which the broker refuses the get for a cluster
+`spec.scope.exclude.clusters` names; the header only narrows, and a read without it is unchanged; location
 `-` or a region or zone, cluster name in GKE's grammar, both answers projected to each
 cluster's `name`, `location`, `status` and `id`, so `masterAuth` is never relayed), each with a comment saying
 which consumer needs it. `REFUSED_HOSTS` beside it names the hosts whose responses are credentials

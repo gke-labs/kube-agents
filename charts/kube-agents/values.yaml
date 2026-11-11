@@ -170,6 +170,14 @@ operator:
   # "MCP server" reference page.
   mcpServer:
     enabled: false
+  # Slack member ids of end-to-end test users, meant for CI and eval installs;
+  # integration.slack.allowedUsers is still the gate on who is served.
+  # A post such a user makes with a user token through an app carries the
+  # app's bot_id, which the A2A gateway otherwise drops as bot traffic; from a
+  # listed member it is read as theirs. The allowlist still has to admit them.
+  # Rendered as the operator's A2A_SLACK_TEST_USERS, which it hands the
+  # gateway; an A2A_SLACK_TEST_USERS entry in extraEnv wins.
+  slackTestUsers: []
   # The manager's own metrics listener, port 8080, plain HTTP on the pod
   # network: controller-runtime's series plus the operator's view of every
   # PlatformAgent, status.usage and status.phase as three gauge families
@@ -239,8 +247,8 @@ operator:
   # were. What stays: Deployments, StatefulSets,
   # Services, ServiceAccounts, ConfigMaps, PersistentVolumeClaims,
   # NetworkPolicies and PodDisruptionBudgets; ClusterRoles,
-  # ClusterRoleBindings, Roles and RoleBindings; and the three custom
-  # resources themselves (PlatformAgent always, AgentPlugin and AgentProfile
+  # ClusterRoleBindings, Roles and RoleBindings; and the custom resources
+  # themselves (PlatformAgent always, AgentPlugin, AgentProfile and Tier
   # where their CRDs are installed). Deployments, StatefulSets, Services and
   # PersistentVolumeClaims grow with the cluster's workloads, a Deployment
   # carrying a whole pod template, so a cluster with thousands of them is the

@@ -69,8 +69,12 @@
 # Before that settle the script archives every kanban card filed since the
 # fan-out began that is not settled (fence_live_cards, #4425), such as one whose
 # inject exchange was cut. The fence is not a guarantee: a task still running
-# after it can file a new card, a push that takes longer than the settle can
-# still land in the next window, and a fence that cannot run is a warning.
+# after it can file a new card, and a push that takes longer than the settle can
+# still land in the next window. A fence that ran and left a card live is a
+# warning, as before. A fence waits for a Ready gateway pod before each attempt,
+# and one that did not run to its verdict is tried again; a unit whose fence
+# still could not run is recorded as infrastructure rather than launched into a
+# window it did not clear.
 # scripts/test_eval_rosters.py pins the set of requesting cases.
 #
 # WHO APPROVES. The eval crew, as for inject-lane-exclusions.txt: an entry

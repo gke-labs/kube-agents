@@ -107,7 +107,7 @@ func startProfileRig(t *testing.T) *rig {
 		t.Fatal(err)
 	}
 	r := startRigWith(t, func(c *Config) { c.ScopeFile = scope; c.Namespace = "kubeagents-system" })
-	r.g.profiles.put("cluster", &lib.AgentCard{Name: "cluster", Parameters: clusterParams})
+	r.g.profiles.put("cluster", &lib.AgentCard{Name: "cluster", Parameters: clusterParams, YieldToPinned: true})
 	r.g.profiles.put("prod-east", &lib.AgentCard{Name: "prod-east", Parameters: clusterParams,
 		ClusterRef: &lib.ClusterRef{ProjectID: "p1", Location: "us-east1", Cluster: "prod"}})
 	return r
