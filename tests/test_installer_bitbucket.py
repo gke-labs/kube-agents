@@ -443,6 +443,43 @@ class BitbucketFlagsTest(unittest.TestCase):
         proc = self._run_install_func('parse_args --gitops-identity=svc-bot; echo "flag=$PARAM_GITOPS_IDENTITY_FROM_FLAG"')
         self.assertIn("flag=true", proc.stdout, proc.stderr)
 
+    # --- A Data Center repository URL before the host is known ---
+    def test_a_dc_clone_url_gives_the_host_when_none_is_set(self):
+        """--gitops-repo with a clone URL and no --gitops-host: the URL names
+        the host, so it is taken from there and held to the host rules."""
+        url = "https://bbdc.example.com/scm/ACME/infra.git"
+        for interactive in ("false", "true"):
+            with self.subTest(non_interactive=interactive):
+                body = "".join(f"{k}={shlex.quote(v)}; " for k, v in self._dc(
+                    PARAM_GITOPS_HOST="", PARAM_GITOPS_REPO=url, PARAM_NON_INTERACTIVE=interactive).items())
+                proc = self._run_install_func(
+                    f'has_controlling_tty() {{ return 0; }}; {body}validate_gitops_forge_flags && rc=0 || rc=$?; '
+                    'echo "rc=$rc host=$PARAM_GITOPS_HOST repo=$PARAM_GITOPS_REPO"')
+                self.assertIn("rc=0 host=bbdc.example.com repo=ACME/infra", proc.stdout, proc.stderr + proc.stdout)
+        proc = self._validate(self._dc(PARAM_GITOPS_HOST="", PARAM_GITOPS_REPO="https://acme.atlassian.net/scm/ACME/infra.git"))
+        self.assertRegex(proc.stdout, r"rc=[1-9]", proc.stderr + proc.stdout)
+        self.assertIn("hosted service", proc.stdout + proc.stderr)
+        proc = self._validate(self._dc(PARAM_GITOPS_HOST="", PARAM_GITOPS_REPO="https://bbdc.example.com:7990/scm/ACME/infra.git"))
+        self.assertRegex(proc.stdout, r"rc=[1-9]", proc.stderr + proc.stdout)
+        self.assertIn("root path on port 443", proc.stdout + proc.stderr)
+
+    def test_a_dc_path_waits_for_the_interview_host(self):
+        body = "".join(f"{k}={shlex.quote(v)}; " for k, v in self._dc(
+            PARAM_GITOPS_HOST="", PARAM_GITOPS_REPO="ACME/infra", PARAM_NON_INTERACTIVE="false").items())
+        proc = self._run_install_func(
+            f'has_controlling_tty() {{ return 0; }}; {body}validate_gitops_forge_flags && rc=0 || rc=$?; '
+            'echo "rc=$rc host=[$PARAM_GITOPS_HOST] repo=$PARAM_GITOPS_REPO"')
+        self.assertIn("rc=0 host=[] repo=ACME/infra", proc.stdout, proc.stderr + proc.stdout)
+        proc = self._interview("interview_bitbucket_forge", self._dc(
+            PARAM_GITOPS_HOST="", PARAM_GITOPS_REPO="ACME/infra", PARAM_NON_INTERACTIVE="false"),
+            {"ANSWER_REPO": "https://bbdc.example.com/scm/ACME/infra.git", "ANSWER_HOST": "bbdc.example.com"})
+        self.assertIn("repo=[ACME/infra] param=[ACME/infra]", proc.stdout, proc.stderr + proc.stdout)
+
+    def test_main_holds_no_interview_leftovers(self):
+        """The Bitbucket interview moved into interview_bitbucket_forge; its
+        label is computed there only."""
+        self.assertEqual(_INSTALL_SH.read_text().count('bb_label="$(gitops_forge_label "$PARAM_GITOPS_FORGE")"'), 1)
+
     def test_parse_args_marks_a_named_secret(self):
         proc = self._run_install_func(
             'parse_args --gitops-token-secret=s1; echo "flag=$PARAM_GITLAB_TOKEN_SECRET_FROM_FLAG"')

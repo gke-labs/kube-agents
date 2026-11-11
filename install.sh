@@ -5637,6 +5637,13 @@ validate_bitbucket_forge_flags() {
     fi
   else
     local host="${PARAM_GITOPS_HOST:-}"
+    # A clone or page URL in --gitops-repo names the instance: with no host
+    # given, it is taken from there, and held to the host rules below.
+    if [ -z "$host" ] && [[ "${PARAM_GITOPS_REPO:-}" =~ ^https://([^/@]+@)?([^/]+)/ ]]; then
+      host="${BASH_REMATCH[2]}"
+      PARAM_GITOPS_HOST="$host"
+      print_info "Taking the Bitbucket Data Center host '${host}' from --gitops-repo."
+    fi
     # An interactive run asks for the host in the interview, which comes
     # after this check; only a run that cannot ask needs the flag here.
     if [ -z "$host" ] && { [ "$PARAM_NON_INTERACTIVE" = "true" ] || ! has_controlling_tty; }; then
@@ -5670,7 +5677,11 @@ validate_bitbucket_forge_flags() {
     PARAM_GITHUB_APP_ID=""
     PARAM_GITHUB_PEM_PATH=""
   fi
-  if [ -n "${PARAM_GITOPS_REPO:-}" ]; then
+  if [ "$forge" = "bitbucket-datacenter" ] && [ -z "${PARAM_GITOPS_HOST:-}" ]; then
+    # An interactive run with no host yet: the interview asks for the host
+    # and validates again, so the repository is parsed then.
+    :
+  elif [ -n "${PARAM_GITOPS_REPO:-}" ]; then
     local path
     path="$(bitbucket_repo_path "$forge" "$PARAM_GITOPS_REPO" "${PARAM_GITOPS_HOST:-}")"
     if [ -z "$path" ]; then
@@ -8398,8 +8409,6 @@ main() {
     # As GitLab: no GitHub org and no minter. The forge itself comes from
     # --gitops-forge or install.env; the interview's forge menu does not offer
     # it, so this block asks only for what the flags left out.
-    local bb_label
-    bb_label="$(gitops_forge_label "$PARAM_GITOPS_FORGE")"
     github_org=""
     github_app_id=""
     github_pem_path=""
