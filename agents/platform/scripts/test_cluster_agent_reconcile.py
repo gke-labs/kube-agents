@@ -3260,61 +3260,80 @@ class ScopeTest(HomesMixin):
 
 
     # #3703 at scale: many clusters in one project cost that project's one list, not a
-    # describe each. The pass is timed so a change that brings back per-cluster work shows
-    # up as time as well as calls.
+    # describe each, and absence from the list is still never proof of absence. The call
+    # counts are the pins; the run is also given a loose time bound, a smoke check on the
+    # whole reconcile rather than a measurement, since every call here is a stub.
 
     PRUNE_SCALE_COUNTS = (50, 500)
 
-    def _scale_run(self, count, gone=()):
-        """Reconcile count profiles in one project whose list names all but gone. Returns
+    def _scale_run(self, count, unlisted=None):
+        """Reconcile count profiles in one project whose list names all but unlisted, a map of
+        cluster -> its describe answer (False gone, True live, None unknown). Returns
         (report, deleted, lists, describes, seconds)."""
+        unlisted = unlisted or {}
         clusters = [f"c{i:04d}" for i in range(count)]
         profiles, identities = self._profiles(*clusters)
-        listed = [(self.MGMT, c, "us-central1") for c in clusters if c not in gone]
+        listed = [(self.MGMT, c, "us-central1") for c in clusters if c not in unlisted]
         lists: list[str] = []
 
         def lister(project, timeout=None):
             lists.append(project)
             return listed, rec.OUTCOME_OK
-        asked, exists = self._describes({c: (c not in gone) for c in clusters})
+        asked, exists = self._describes({c: unlisted.get(c, True) for c in clusters})
         started = time.monotonic()
         report, _, deleted = self._run(None, lister, profiles=profiles, identities=identities, exists=exists)
         return report, deleted, lists, asked, time.monotonic() - started
+
+    @staticmethod
+    def _every_tenth(count, answer_of):
+        """Every tenth cluster, each mapped to answer_of(its position among them)."""
+        picked = [f"c{i:04d}" for i in range(0, count, 10)]
+        return {c: answer_of(k) for k, c in enumerate(picked)}
 
     def test_prune_at_scale_lists_the_project_once_and_describes_nothing(self):
         for count in self.PRUNE_SCALE_COUNTS:
             with self.subTest(clusters=count):
                 report, deleted, lists, asked, seconds = self._scale_run(count)
-                self.assertEqual(lists, [self.MGMT], "one list for the project, not one a cluster")
+                self.assertEqual(lists, [self.MGMT], "the project is listed once")
                 self.assertEqual(asked, [], "a listed cluster is not described")
                 self.assertEqual(deleted, [])
                 self.assertEqual(len(report["kept"]), count)
-                # Generous: the pass is in-process work on stubs, measured at well under
-                # this. Per-cluster subprocess work would cost seconds a cluster.
-                self.assertLess(seconds, 30, f"the prune pass over {count} clusters took {seconds:.1f}s")
+                self.assertLess(seconds, 30, f"the reconcile over {count} clusters took {seconds:.1f}s")
 
     def test_prune_at_scale_describes_only_what_the_list_left_out(self):
+        # A tenth of the clusters are missing from the list, and they answer gone, live or
+        # unknown in turn: only the gone ones are deleted. A partial list cannot delete.
+        answers = (False, True, None)
         for count in self.PRUNE_SCALE_COUNTS:
             with self.subTest(clusters=count):
-                gone = {f"c{i:04d}" for i in range(0, count, count // 5)}
-                report, deleted, lists, asked, _ = self._scale_run(count, gone=gone)
+                unlisted = self._every_tenth(count, lambda k: answers[k % 3])
+                report, deleted, lists, asked, _ = self._scale_run(count, unlisted=unlisted)
+                gone = sorted(c for c, a in unlisted.items() if a is False)
+                unsure = sorted(c for c, a in unlisted.items() if a is None)
                 self.assertEqual(lists, [self.MGMT])
-                self.assertEqual(sorted(asked), sorted(gone))
-                self.assertEqual(sorted(deleted), sorted(f"cluster-{c}" for c in gone))
-                self.assertEqual(len(report["kept"]), count - len(gone))
+                self.assertEqual(sorted(asked), sorted(unlisted))
+                self.assertEqual(sorted(deleted), [f"cluster-{c}" for c in gone])
+                self.assertEqual(sorted(report["skipped_error"]), [f"cluster-{c}" for c in unsure])
+                self.assertEqual(len(report["kept"]), count - len(gone) - len(unsure))
 
-    def test_prune_at_scale_through_the_relay_is_one_list_batch_and_no_gets(self):
+    def test_prune_at_scale_through_the_relay_is_one_list_batch_and_gets_only_the_unlisted(self):
         for count in self.PRUNE_SCALE_COUNTS:
             with self.subTest(clusters=count):
                 clusters = [f"c{i:04d}" for i in range(count)]
+                unlisted = self._every_tenth(count, lambda k: k % 2 == 0)
                 profiles, identities = self._profiles(*clusters)
-                batches, relay = self._relay(lists={self.MGMT: self._ok_list(*clusters)})
+                # A get answer for every cluster, so a regression that sends a listed one
+                # fails the assertion below rather than the stub.
+                gets = {self._key(c): ({"status": 200} if unlisted.get(c, True)
+                                        else {"status": 404, "error": self.NOT_FOUND}) for c in clusters}
+                batches, relay = self._relay(lists={self.MGMT: self._ok_list(*(c for c in clusters if c not in unlisted))},
+                                             gets=gets)
                 report, deleted, lists, describes = self._relayed_run(relay, profiles, identities)
                 self.assertEqual(([], []), (lists, describes), "no gcloud at all")
                 self.assertEqual([[self.MGMT]], [b.get("projects") for b in batches if b.get("projects")])
-                self.assertEqual([], [c for b in batches for c in b.get("clusters", [])], "no cluster get")
-                self.assertEqual(deleted, [])
-                self.assertEqual(len(report["kept"]), count)
+                self.assertEqual(sorted(unlisted), sorted(c[2] for b in batches for c in b.get("clusters", [])),
+                                 "only the unlisted clusters reach a get")
+                self.assertEqual(sorted(deleted), sorted(f"cluster-{c}" for c, live in unlisted.items() if not live))
 
 
     # #3703 step 2: the GKE reads go through the broker's relay, one sandbox process a batch.
