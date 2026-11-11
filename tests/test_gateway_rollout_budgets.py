@@ -280,10 +280,11 @@ class UpgradeRolloutGateTest(unittest.TestCase):
 # get-gke-credentials) before wait_for_gke_readiness.sh starts.
 _E2E_RUNNER_SETUP_SECONDS = 300
 # Post-readiness test execution allowance for the RC gate (blocking `gchat` plus
-# optional `rc`, where the stockout fixture claims 600s and scenario 04 watches
-# for 360s) and for `--suite all` across all five E2E test files (matching the
-# 60-minute suite budget in staging-promotion-pipeline.yml).
-_E2E_RC_SUITE_ALLOWANCE_SECONDS = 1200
+# optional `rc` and `slack`, where the stockout fixture claims 600s, scenario 04
+# watches for 360s and the Slack test waits up to 300s on `next`) and for
+# `--suite all` across all five E2E test files (matching the 60-minute suite
+# budget in staging-promotion-pipeline.yml).
+_E2E_RC_SUITE_ALLOWANCE_SECONDS = 1500
 _E2E_ALL_SUITES_ALLOWANCE_SECONDS = 3600
 # What the upgrade.sh workflows do outside the waits the floor sums. The
 # reconcile job: checkout, auth and gcloud setup, the lease and KMS checks,

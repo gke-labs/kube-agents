@@ -215,11 +215,19 @@ jobs:
           E2E_CHAT_CLIENT_ID: ${{ secrets.E2E_CHAT_CLIENT_ID }}
           E2E_CHAT_CLIENT_SECRET: ${{ secrets.E2E_CHAT_CLIENT_SECRET }}
           E2E_CHAT_REFRESH_TOKEN: ${{ secrets.E2E_CHAT_REFRESH_TOKEN }}
+          # The `slack` suite's test user, CI channel and the install's bot
+          # (tests/e2e/README.md, "Slack E2E test"); unset, it skips.
+          E2E_SLACK_USER_TOKEN: ${{ secrets.E2E_SLACK_USER_TOKEN }}
+          E2E_SLACK_CHANNEL_ID: ${{ secrets.E2E_SLACK_CHANNEL_ID }}
+          E2E_SLACK_BOT_USER_ID: ${{ vars.E2E_SLACK_BOT_USER_ID }}
           GITHUB_ORG: ${{ vars.GITOPS_ORG }}
           GITHUB_REPO: ${{ vars.GITOPS_REPO }}
         # 300s for `next` and nothing for `today`, as the blocking gate does.
+        # On `next` the Slack answer is the gateway's Block Kit, so its bold
+        # headline is asserted there only.
         run: |
           if [ "${{ steps.mode.outputs.next == 'true' }}" = true ]; then
             export TEST_TIMEOUT_SEC=300
+            export E2E_SLACK_EXPECT_HEADLINE=true
           fi
           ./scripts/release/run_optional_e2e_suites.sh
