@@ -869,26 +869,34 @@ jobs:
           # --state counts the live ticks held on an untrusted issue listing,
           # for the digest's held-filing line (post step, --bugs-state).
           # Armed triage: domain and group bugs are filed for the
-          # nightly-triage job to assign (--triage-pending), not to a person.
+          # nightly-triage job to assign (--triage-pending), not to a person;
+          # only into a separate (private) issues repository, the only place
+          # the triage comment may go.
           triage=()
-          if [ "$mode" = "--live" ] && [ "$NIGHTLY_TRIAGE_LIVE" = "true" ]; then triage=(--triage-pending); fi
+          if [ "$mode" = "--live" ] && [ "$NIGHTLY_TRIAGE_LIVE" = "true" ] && [ -n "$KUBE_AGENTS_ISSUES_REPO" ]; then triage=(--triage-pending); fi
           python3 scripts/eval_dashboard/nightly_bugs.py --data work/data.json --state "$DASHBOARD_BUCKET/nightly-bugs-state.json" "$mode" "${triage[@]}" --filed-out work/nightly-filed.json
           filed=$(python3 -c 'import json; print(" ".join(str(n) for n in json.load(open("work/nightly-filed.json"))))' 2>/dev/null || true)
           echo "filed=$filed" >> "${GITHUB_OUTPUT:-/dev/null}"
 
-      # Triage switched off with issues still waiting for it: route each by
-      # the filer's own rule, without a model call, so none stays unassigned
-      # (docs/ci-health.md, "Nightly triage"). One issue listing when there
-      # are none. Same token, repository and bound as the filer.
-      - name: Route issues left waiting for the nightly triage (when it is off)
-        if: env.NIGHTLY_TRIAGE_LIVE != 'true' && env.NIGHTLY_BUGS_LIVE == 'true' && env.CI_HEALTH_MUTE != 'true'
+      # The backstop for issues waiting on the nightly triage: with triage
+      # switched off, every one; with it on, those still waiting two hours
+      # after filing (the triage job failing before it routes, every tick).
+      # Each is routed by the filer's own rule, without a model call, so none
+      # stays unassigned (docs/ci-health.md, "Nightly triage"). One issue
+      # listing when there are none. Same token, repository and bound as the
+      # filer.
+      - name: Route issues left waiting for the nightly triage
+        if: env.NIGHTLY_BUGS_LIVE == 'true' && env.CI_HEALTH_MUTE != 'true'
         continue-on-error: true
         timeout-minutes: 2
         env:
           KUBE_AGENTS_ISSUES_REPO: ${{ steps.issues_repo.outputs.valid == 'true' && vars.KUBE_AGENTS_ISSUES_REPO || '' }}
           GH_TOKEN: ${{ steps.issues_token.outputs.token || github.token }}
           SOURCE_GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/eval_dashboard/nightly_triage.py route --no-model --live
+        run: |
+          stale=()
+          if [ "$NIGHTLY_TRIAGE_LIVE" = "true" ]; then stale=(--stale-only); fi
+          python3 scripts/eval_dashboard/nightly_triage.py route --no-model --live "${stale[@]}"
 
       # One `presubmit-gate` issue per domain with no blocking roster seat,
       # assigned to the domain owner, kept current, closed when a roster case
@@ -1051,10 +1059,12 @@ jobs:
     concurrency:
       group: ci-health-nightly-triage
       cancel-in-progress: false
+    # No issues: write. The minted token for the issues repository carries
+    # the writes; the job's own token must not be able to post a triage
+    # comment here, in the public repository.
     permissions:
       contents: read
       id-token: write
-      issues: write
     steps:
       # Which issues, and live or dry. A dispatch's numbers are always a dry
       # run; they reach the shell through env and only as digits.
@@ -1063,16 +1073,17 @@ jobs:
         env:
           FILED: ${{ needs.refresh-and-adjudicate.outputs.filed }}
           TRIAGE_ISSUES: ${{ inputs.triage_issues }}
+          ISSUES_REPO: ${{ vars.KUBE_AGENTS_ISSUES_REPO }}
         run: |
           numbers=""
           mode=--dry-run
           if [ -n "$TRIAGE_ISSUES" ]; then
-            if ! printf '%s' "$TRIAGE_ISSUES" | grep -Eq '^[0-9 ]+$'; then
+            if ! printf '%s' "$TRIAGE_ISSUES" | grep -Eq '^ *[0-9]+( +[0-9]+)* *$'; then
               echo "::error::triage_issues must be issue numbers separated by spaces"
               exit 1
             fi
             numbers="$TRIAGE_ISSUES"
-          elif [ "$NIGHTLY_TRIAGE_LIVE" = "true" ] && [ "$NIGHTLY_BUGS_LIVE" = "true" ]; then
+          elif [ "$NIGHTLY_TRIAGE_LIVE" = "true" ] && [ "$NIGHTLY_BUGS_LIVE" = "true" ] && [ -n "$ISSUES_REPO" ]; then
             mode=--live
           else
             numbers="$FILED"

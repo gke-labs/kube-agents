@@ -100,7 +100,7 @@ class FakeSource:
         if "pullRequests(states: OPEN" in query:
             return nb.GhResult(stdout=json.dumps({"data": {"repository": {"pullRequests": {"nodes": self.open_prs}}}}))
         nodes = {}
-        for n in map(int, re.findall(r"pullRequest\(number: (\d+)\)", query)):
+        for n in map(int, re.findall(r"issueOrPullRequest\(number: (\d+)\)", query)):
             nodes[f"p{n}"] = {"number": n, "title": f"pull request {n}", "author": {"login": self.authors.get(n, "x")}, "mergedAt": "2026-11-05T10:00:00Z"}
         return nb.GhResult(stdout=json.dumps({"data": {"repository": nodes}}))
 
@@ -143,11 +143,21 @@ class FakeIssues:
         if method == "PATCH":
             self.issues[number].update(body)
             return nb.GhResult(stdout=json.dumps(self.issues[number]))
+        if method == "POST" and path.endswith("/labels"):
+            self.issues[number]["labels"] = self.issues[number].get("labels", []) + [{"name": n} for n in body["labels"]]
+            return nb.GhResult(stdout=json.dumps(self.issues[number]["labels"]))
+        if method == "DELETE" and "/labels/" in path:
+            gone = path.rsplit("/", 1)[1].replace("%3A", ":")
+            self.issues[number]["labels"] = [lbl for lbl in self.issues[number].get("labels", []) if lbl["name"] != gone]
+            return nb.GhResult(stdout=json.dumps(self.issues[number]["labels"]))
         return nb.GhResult(rc=1, stderr="unexpected")
 
     def writes(self, kind=None):
         out = [(m, p, b) for m, p, b in self.calls if m != "GET"]
         return [w for w in out if kind is None or w[1].endswith(kind) or (kind == "PATCH" and w[0] == "PATCH")]
+
+    def labels(self, number):
+        return [lbl["name"] for lbl in self.issues[number].get("labels", [])]
 
     def posted(self):
         return [b["body"] for m, p, b in self.calls if m == "POST" and p.endswith("/comments")]
@@ -293,8 +303,10 @@ class NovemberTest(Harness):
         self.assertIn("**Routed to** @grader-author (author of", comment)
         self.assertIn("cc @ivan, @carol, @sam, @alice, @bob", comment, "the rule's assignee and the case owners are mentioned")
         [(_, _, patch)] = issues.writes("PATCH")
-        self.assertIn(nightly_triage.AGENT_LABEL, patch["labels"])
-        self.assertNotIn(nightly_triage.PENDING_LABEL, patch["labels"])
+        self.assertEqual(set(patch), {"body"}, "labels are added and removed one by one, not replaced")
+        self.assertIn(nightly_triage.AGENT_LABEL, issues.labels(37))
+        self.assertNotIn(nightly_triage.PENDING_LABEL, issues.labels(37))
+        self.assertIn("nightly-red", issues.labels(37))
         self.assertIn("<!-- kube-agents-bot:triage-done assign=ivan cc=carol,sam,alice,bob -->", patch["body"])
         self.assertIn(nightly_triage.TRIAGED_ADDRESSEE, patch["body"])
         self.assertNotIn("Triage pending", patch["body"])
@@ -361,7 +373,7 @@ class RoutingTableTest(unittest.TestCase):
 
     def test_no_verdict_goes_by_the_rule_and_says_why(self):
         out = self.first(None, "the model call failed (TimeoutError)")
-        self.assertEqual(out[0], ("carol", "the filing rule's assignee: triage could not decide (the model call failed (TimeoutError))"))
+        self.assertEqual(out[0], ("carol", "the filing rule's assignee: triage did not decide"))
 
     def test_the_author_who_is_also_the_rules_assignee_is_listed_once(self):
         self.assertEqual([x for x, _ in self.first(self.verdict(), chain=("grader-author", "sam"))], ["grader-author", "sam"])
@@ -394,8 +406,8 @@ class FailSafeTest(Harness):
         self.assertIn(why, comment)
         self.assertIn("Routed by the filing rule to @ivan", comment)
         self.assertEqual(len([line for line in comment.splitlines() if line.strip() and not line.startswith("<!--")]), 1, "one line")
-        [(_, _, patch)] = issues.writes("PATCH")
-        self.assertIn(nightly_triage.AGENT_LABEL, patch["labels"])
+        self.assertEqual(len(issues.writes("PATCH")), 1)
+        self.assertIn(nightly_triage.AGENT_LABEL, issues.labels(37))
 
     def test_a_failed_model_call(self):
         issues, out = self.triage_with(FakeModel(nightly_triage.ModelError("the model call failed (HTTP 403)")))
@@ -498,7 +510,9 @@ class FailSafeTest(Harness):
         earlier = {37: [{"body": "<!-- kube-agents-bot:nightly-triage assignee=grader-author -->\nAgent triage ..."}]}
         issues = FakeIssues([issue], comments=earlier)
         bundles = self.prepare(issues)
-        self.route(issues, bundles, FakeModel())
+        model = FakeModel()
+        self.route(issues, bundles, model)
+        self.assertEqual(model.prompts, [], "an issue that only needs finishing costs no model call")
         self.assertEqual(issues.posted(), [])
         self.assertEqual(issues.writes("/assignees"), [])
         self.assertEqual(len(issues.writes("PATCH")), 1)
@@ -518,6 +532,67 @@ class FailSafeTest(Harness):
         self.assertIn("transcript not readable", model.prompts[0])
         self.assertEqual([b["assignees"] for m, p, b in issues.writes("/assignees")], [["ivan"]],
                          "no author to assign: the suspected pull request's author is unknown, so the rule")
+
+
+class ReviewFindingsTest(Harness):
+    """The self-review's findings, pinned."""
+
+    def test_live_triage_refuses_the_public_repository(self):
+        _, issue = self.file_pending()
+        issues = FakeIssues([issue])
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = nightly_triage.main(["route", "--live", "--repo", "gke-labs/kube-agents", "--repo-root", str(self.root)], gh_runner=issues, model=FakeModel())
+        self.assertEqual(rc, 0)
+        self.assertEqual(issues.calls, [], "not even a read")
+        self.assertIn("public", err.getvalue())
+
+    def test_the_models_evidence_and_a_pr_title_mention_no_one(self):
+        _, issue = self.file_pending()
+        issues = FakeIssues([issue])
+        source = FakeSource()
+        bundles = self.prepare(issues, source=source)
+        doc = json.loads(bundles.read_text())
+        doc["37"]["prs"][str(CULPRIT)]["title"] = "ping @everyone"
+        bundles.write_text(json.dumps(doc))
+        self.route(issues, bundles, FakeModel(answer(evidence="Caused by @grader-author and @someone-else.")))
+        [comment] = issues.posted()
+        self.assertIn("Caused by `grader-author` and `someone-else`.", comment)
+        self.assertIn("ping `everyone`", comment)
+
+    def test_the_backstop_takes_only_issues_waiting_past_the_limit(self):
+        _, issue = self.file_pending()
+        young = dict(issue, number=38, created_at="2026-11-09T14:30:00Z")
+        issues = FakeIssues([issue, young])
+        now = nightly_triage.nightly_bugs.nightly.parse_iso("2026-11-09T15:00:00Z")
+        out, _ = self.route(issues, None, None, extra=["--no-model", "--stale-only"], now=now)
+        self.assertIn("1 issues", out)
+        self.assertEqual({p.split("/issues/")[1].split("/")[0] for m, p, b in issues.writes()}, {"37"})
+
+    def test_a_grader_fault_whose_author_cannot_be_read_goes_to_the_infra_owner(self):
+        out = nightly_triage.route({"classification": "grader_or_harness", "suspected_pr": CULPRIT, "confidence": "high"}, None, {"prs": {}}, ["carol"], "ivan")
+        self.assertEqual(out[0][0], "ivan")
+        out = nightly_triage.route({"classification": "product", "suspected_pr": CULPRIT, "confidence": "high"}, None, {"prs": {}}, ["carol"], "ivan")
+        self.assertEqual(out[0], ("carol", nightly_triage.WHY_RULE.format(why="the suspected pull request's author could not be read")))
+
+    def test_a_pr_number_that_is_an_issue_does_not_lose_the_other_authors(self):
+        self.assertIn("issueOrPullRequest(number: %(n)d) { ... on PullRequest", nightly_triage.PR_FIELD)
+
+    def test_an_edit_made_while_triage_ran_is_kept(self):
+        _, issue = self.file_pending()
+        issues = FakeIssues([dict(issue)])
+        bundles = self.prepare(issues)
+        split = nightly_bugs.MARKER.format(case="case-maint")
+
+        def meanwhile(prompt, max_output_tokens):
+            # A triager splits a case off and adds a label while the model
+            # thinks, after the step listed the issue.
+            issues.issues[37] = dict(issues.issues[37], body=issues.issues[37]["body"].replace(split + "\n", ""),
+                                     labels=[*issues.issues[37]["labels"], {"name": "P1"}])
+            return answer()
+        self.route(issues, bundles, meanwhile)
+        self.assertNotIn(split, issues.issues[37]["body"])
+        self.assertIn("P1", issues.labels(37))
 
 
 class CapsTest(Harness):
@@ -615,8 +690,11 @@ class WorkflowTest(unittest.TestCase):
         [step] = [s for s in self.doc["jobs"]["refresh-and-adjudicate"]["steps"] if s.get("id") == "nightly_bugs"]
         for bugs, triage, mute, want in (("true", "true", "false", True), ("true", "false", "false", False),
                                          ("false", "true", "false", False), ("true", "true", "true", False)):
-            out, _ = self.run_step(step, {"NIGHTLY_BUGS_LIVE": bugs, "NIGHTLY_TRIAGE_LIVE": triage, "CI_HEALTH_MUTE": mute})
+            out, _ = self.run_step(step, {"NIGHTLY_BUGS_LIVE": bugs, "NIGHTLY_TRIAGE_LIVE": triage, "CI_HEALTH_MUTE": mute,
+                                           "KUBE_AGENTS_ISSUES_REPO": ISSUES_REPO})
             self.assertEqual("--triage-pending" in out.split(), want, (bugs, triage, mute))
+        out, _ = self.run_step(step, {"NIGHTLY_BUGS_LIVE": "true", "NIGHTLY_TRIAGE_LIVE": "true", "CI_HEALTH_MUTE": "false", "KUBE_AGENTS_ISSUES_REPO": ""})
+        self.assertNotIn("--triage-pending", out.split(), "never for issues filed in the public repository")
 
     def test_the_triage_job_runs_after_the_tick_on_main_with_its_own_identities(self):
         job = self.doc["jobs"]["nightly-triage"]
@@ -632,7 +710,9 @@ class WorkflowTest(unittest.TestCase):
 
     def test_the_plan_is_live_only_when_armed_and_a_dispatch_is_always_dry(self):
         [step] = [s for s in self.doc["jobs"]["nightly-triage"]["steps"] if s.get("id") == "plan"]
-        base = {"NIGHTLY_BUGS_LIVE": "true", "NIGHTLY_TRIAGE_LIVE": "true", "FILED": "41", "TRIAGE_ISSUES": ""}
+        base = {"NIGHTLY_BUGS_LIVE": "true", "NIGHTLY_TRIAGE_LIVE": "true", "FILED": "41", "TRIAGE_ISSUES": "", "ISSUES_REPO": ISSUES_REPO}
+        _, outputs = self.run_step(step, dict(base, ISSUES_REPO=""))
+        self.assertIn("mode=--dry-run", outputs, "no private issues repository: never live")
         _, outputs = self.run_step(step, base)
         self.assertIn("mode=--live", outputs)
         self.assertIn("args=\n", outputs, "live: every pending issue")
@@ -645,15 +725,22 @@ class WorkflowTest(unittest.TestCase):
 
     def test_a_dispatch_input_that_is_not_digits_is_refused(self):
         [step] = [s for s in self.doc["jobs"]["nightly-triage"]["steps"] if s.get("id") == "plan"]
-        proc = subprocess.run(["bash", "-e", "-c", step["run"]], env={"PATH": os.environ["PATH"], "GITHUB_OUTPUT": "/dev/null", "TRIAGE_ISSUES": "1; rm -rf /"},
-                              capture_output=True, text=True, check=False)
-        self.assertNotEqual(proc.returncode, 0)
+        for bad in ("1; rm -rf /", "   "):
+            proc = subprocess.run(["bash", "-e", "-c", step["run"]], env={"PATH": os.environ["PATH"], "GITHUB_OUTPUT": "/dev/null", "TRIAGE_ISSUES": bad},
+                                  capture_output=True, text=True, check=False)
+            self.assertNotEqual(proc.returncode, 0, repr(bad))
 
-    def test_the_drain_step_routes_by_the_rule_when_triage_is_off(self):
+    def test_the_backstop_routes_every_waiting_issue_when_off_and_stale_ones_when_on(self):
         [step] = [s for s in self.doc["jobs"]["refresh-and-adjudicate"]["steps"] if s.get("name", "").startswith("Route issues left waiting")]
-        self.assertIn("env.NIGHTLY_TRIAGE_LIVE != 'true'", step["if"])
+        self.assertNotIn("NIGHTLY_TRIAGE_LIVE", step["if"], "it runs whether triage is on or off")
         self.assertTrue(step["continue-on-error"])
-        self.assertEqual(step["run"].strip(), "python3 scripts/eval_dashboard/nightly_triage.py route --no-model --live")
+        out, _ = self.run_step(step, {"NIGHTLY_TRIAGE_LIVE": "false"})
+        self.assertEqual(out.split(), ["scripts/eval_dashboard/nightly_triage.py", "route", "--no-model", "--live"])
+        out, _ = self.run_step(step, {"NIGHTLY_TRIAGE_LIVE": "true"})
+        self.assertEqual(out.split()[-1], "--stale-only")
+
+    def test_the_triage_job_cannot_write_issues_with_its_own_token(self):
+        self.assertNotIn("issues", self.doc["jobs"]["nightly-triage"]["permissions"])
 
 
 if __name__ == "__main__":

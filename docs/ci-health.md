@@ -1047,7 +1047,7 @@ with two identities:
   (`gemini-4-argon` unless the repository variable names another), billed to
   `NIGHTLY_TRIAGE_PROJECT` (`kube-agents-prow` unless set). The prompt is
   capped at 60,000 tokens (transcripts are cut first, then the oldest commits,
-  then grading lines) and the answer at 8,192. The model returns a
+  then grading lines) and the answer at 16,384, thinking included. The model returns a
   classification, a suspected pull request, an open or merged fix, a priority
   and a confidence. A pull request outside the commit window, or a fix outside
   the candidates, is set aside rather than trusted.
@@ -1073,9 +1073,14 @@ A model call that fails, times out, stops at its token cap or answers off the
 schema routes by the filer's rule, and the comment says so in one line. An
 issue whose evidence was not gathered waits for the next tick; one still
 waiting two hours after it was filed is routed by the rule without a model
-call. A failed GitHub write leaves the issue pending, and the next tick
-resumes it: an assignee already set is kept, and a comment already posted is
-not posted again.
+call, by the job or, when the job fails before routing, by a step of the tick
+itself. A failed GitHub write leaves the issue pending, and the next tick
+resumes it without another model call: an assignee already set is kept, and a
+comment already posted is not posted again. The body is marked done on a fresh
+read and the labels are added and removed one by one, so an edit a person made
+meanwhile stays. The filer files for triage only into a separate issues
+repository, the route step writes to no other, and the job's own token holds
+no issue write.
 
 Unarmed, the job dry-runs on the issues the filer filed that tick (which the
 filer assigned as before) and prints what it would assign; a manual run of the

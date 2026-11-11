@@ -92,7 +92,7 @@ PROJECT_ENV = "NIGHTLY_TRIAGE_PROJECT"
 LOCATION = "global"
 VERTEX_URL = "https://aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/google/models/{model}:generateContent"
 TOKEN_COMMAND = ("gcloud", "auth", "print-access-token")
-MODEL_TIMEOUT_S = 180
+MODEL_TIMEOUT_S = 150
 
 # --- The caps.
 MAX_ISSUES_PER_RUN = 5
@@ -101,8 +101,9 @@ MAX_ISSUES_PER_RUN = 5
 MAX_INPUT_TOKENS = 60_000
 CHARS_PER_TOKEN = 4
 # The answer's ceiling, thinking included: the verdict is a few hundred
-# tokens; the rest is room to reason before it.
-MAX_OUTPUT_TOKENS = 8_192
+# tokens; the rest is room to reason before it (a thinking model that runs
+# out stops with MAX_TOKENS, which routes by the rule).
+MAX_OUTPUT_TOKENS = 16_384
 MAX_CASES = 12
 MAX_COMMITS = 80
 MAX_LATER_COMMITS = 30
@@ -124,6 +125,8 @@ COMMENT_MARKER = "<!-- kube-agents-bot:nightly-triage assignee={assignee} -->"
 COMMENT_MARKER_RE = re.compile(r"<!-- kube-agents-bot:nightly-triage assignee=(\S+) -->")
 NOBODY = "-"
 ISSUE_PATH = "issues/{number}"
+LABELS_PATH = "issues/{number}/labels"
+LABEL_PATH = "issues/{number}/labels/{label}"
 ASSIGNEES_PATH = "issues/{number}/assignees"
 OPEN_RED_PATH = "issues?labels={label}&state=open&per_page=100"
 PR_SUBJECT_RE = re.compile(r"\(#(\d+)\)\s*$")
@@ -301,7 +304,9 @@ def parse_log(text: str | None) -> list[dict]:
 
 LOG_FORMAT = "--format=%x1e%h%x1f%an%x1f%s"
 PRS_QUERY = "query { repository(owner: %(owner)s, name: %(name)s) { %(fields)s } }"
-PR_FIELD = "p%(n)d: pullRequest(number: %(n)d) { number title author { login } mergedAt }"
+# issueOrPullRequest, not pullRequest: a `(#N)` naming an issue, or a
+# number this repository does not hold, must not fail the whole read.
+PR_FIELD = "p%(n)d: issueOrPullRequest(number: %(n)d) { ... on PullRequest { number title author { login } mergedAt } }"
 OPEN_PRS_QUERY = """\
 query($owner: String!, $name: String!) {
   repository(owner: $owner, name: $name) {
@@ -554,6 +559,7 @@ RULE_WHY = {
     "low": "triage's confidence is low",
     "no_pr": "triage named no pull request from the commit window",
     "author_bot": "the suspected pull request's author is a bot",
+    "no_author": "the suspected pull request's author could not be read",
 }
 
 
@@ -562,18 +568,17 @@ def route(verdict: dict | None, failure: str | None, bundle: dict | None, chain:
     the verdict's choice first, then the filer's ``chain``."""
     first: tuple[str, str] | None = None
     if verdict is None:
-        reason = f"triage could not decide ({failure})"
+        reason = "triage did not decide"
     elif verdict["confidence"] == "low":
         reason = RULE_WHY["low"]
     elif verdict["classification"] == "case_rework":
         reason = RULE_WHY["case_rework"]
-    elif verdict["classification"] in ("product", "grader_or_harness") and verdict["suspected_pr"]:
-        author = ((bundle or {}).get("prs") or {}).get(str(verdict["suspected_pr"]), {}).get("author")
-        if nightly_bugs.case_owner.is_person_login(author):
-            first = (author, WHY_AUTHOR.format(pr=ghcli.pr_url(ghcli.SOURCE_REPO, verdict["suspected_pr"])))
-            reason = None
-        else:
-            reason = RULE_WHY["author_bot"] if author else RULE_WHY["no_pr"]
+    elif verdict["classification"] in ("product", "grader_or_harness") and verdict["suspected_pr"] and nightly_bugs.case_owner.is_person_login(
+            ((bundle or {}).get("prs") or {}).get(str(verdict["suspected_pr"]), {}).get("author")):
+        author = bundle["prs"][str(verdict["suspected_pr"])]["author"]
+        first, reason = (author, WHY_AUTHOR.format(pr=ghcli.pr_url(ghcli.SOURCE_REPO, verdict["suspected_pr"]))), None
+    elif verdict["classification"] == "product" and verdict["suspected_pr"]:
+        reason = RULE_WHY["author_bot"] if ((bundle or {}).get("prs") or {}).get(str(verdict["suspected_pr"]), {}).get("author") else RULE_WHY["no_author"]
     elif verdict["classification"] in ("infra", "grader_or_harness") and infra_owner:
         what = "an infrastructure failure" if verdict["classification"] == "infra" else "a grading or harness fault"
         first, reason = (infra_owner, WHY_INFRA_OWNER.format(what=what)), None
@@ -624,7 +629,7 @@ def render_comment(verdict: dict | None, failure: str | None, bundle: dict | Non
         pr = prs.get(str(verdict["suspected_pr"])) or {}
         author = pr.get("author")
         shown = (f"@{author}" if author and author.lower() == (assignee or "").lower() else f"`{author}`") if author else "an unknown author"
-        suspect = SUSPECT_LINE.format(url=ghcli.pr_url(ghcli.SOURCE_REPO, verdict["suspected_pr"]), author=shown, title=pr.get("title") or "")
+        suspect = SUSPECT_LINE.format(url=ghcli.pr_url(ghcli.SOURCE_REPO, verdict["suspected_pr"]), author=shown, title=nightly_bugs.quiet_mentions(pr.get("title") or ""))
     elif verdict.get("dropped_suspect"):
         suspect = SUSPECT_DROPPED.format(n=verdict["dropped_suspect"])
     else:
@@ -637,7 +642,7 @@ def render_comment(verdict: dict | None, failure: str | None, bundle: dict | Non
               f"{red['head_sha'] + ' (' + red['date'] + ')' if red else 'an unknown red night'}, "
               f"{len(fix_prs(bundle or {}))} candidate fixes")
     return COMMENT.format(marker=marker, model=model, classification=CLASSES[verdict["classification"]], priority=verdict["priority"],
-                          confidence=verdict["confidence"], suspect=suspect, fix=fix, evidence=verdict["evidence"] or "(no evidence given)",
+                          confidence=verdict["confidence"], suspect=suspect, fix=fix, evidence=nightly_bugs.quiet_mentions(verdict["evidence"]) or "(no evidence given)",
                           routed=routed, cc=cc_line, inputs=inputs)
 
 
@@ -671,7 +676,17 @@ class Router:
         cc = logins(marker.group(2)) if marker else []
         opened = nightly_bugs.nightly.parse_iso(issue.get("created_at"))
         verdict, failure = None, None
-        if self.model is None:
+        posted = None
+        if self.live:
+            # Read first: an issue an earlier run already commented on only
+            # needs finishing, never another model call.
+            comments = self.gh.call("GET", self.gh.path(nightly_bugs.COMMENTS_READ_PATH.format(number=number)), paginate=True)
+            if comments is None:
+                return {"issue": number, "verdict": None, "ok": False, "why": "the comments could not be read"}
+            posted = next((m for c in comments if isinstance(c, dict) for m in [COMMENT_MARKER_RE.search(c.get("body") or "")] if m), None)
+        if posted:
+            failure = "routed by an earlier run"
+        elif self.model is None:
             failure = "triage is switched off (NIGHTLY_TRIAGE_LIVE is not true)"
         elif bundle is None and opened and self.now - opened > PENDING_MAX_AGE:
             failure = f"no evidence was gathered in the {int(PENDING_MAX_AGE.total_seconds() // 3600)} hours since filing"
@@ -689,18 +704,14 @@ class Router:
         if not self.live:
             entry.update(assignee=candidates[0][0] if candidates else None, why=candidates[0][1] if candidates else "no candidate", ok=True)
             return entry
-        return self.write(issue, entry, candidates, cc, bundle)
+        return self.write(issue, entry, candidates, cc, bundle, posted)
 
-    def write(self, issue: dict, entry: dict, candidates: list[tuple[str, str]], cc: list[str], bundle: dict | None) -> dict:
+    def write(self, issue: dict, entry: dict, candidates: list[tuple[str, str]], cc: list[str], bundle: dict | None, posted) -> dict:
         """Assign, comment, mark done; stop at the first failed call (the
         issue stays pending and the next tick picks it up where it stopped:
-        an assignee already set is kept, a comment already posted is not
-        posted again)."""
+        an assignee already set is kept, a comment already posted, ``posted``,
+        is not posted again)."""
         number = issue["number"]
-        comments = self.gh.call("GET", self.gh.path(nightly_bugs.COMMENTS_READ_PATH.format(number=number)), paginate=True)
-        if comments is None:
-            return dict(entry, ok=False, why="the comments could not be read")
-        posted = next((COMMENT_MARKER_RE.search(c.get("body") or "") for c in comments if isinstance(c, dict) and COMMENT_MARKER_RE.search(c.get("body") or "")), None)
         current = [a.get("login") for a in issue.get("assignees") or [] if isinstance(a, dict) and a.get("login")]
         assignee, why = (current[0], "assigned before this run") if current else (None, None)
         if posted:
@@ -714,14 +725,24 @@ class Router:
             body = render_comment(entry["verdict"], entry["failure"], bundle, assignee, why, cc, self.model_name)
             if self.gh.call("POST", self.gh.path(nightly_bugs.COMMENTS_PATH.format(number=number)), {"body": body}) is None:
                 return dict(entry, assignee=assignee, ok=False, why="the comment could not be posted")
-        marker = pending(issue)
-        text = issue.get("body") or ""
+        # Marked done on a fresh read, labels added and removed one by one,
+        # so an edit a person made while this ran (a case split off, a
+        # label) is kept.
+        fresh = self.gh.call("GET", self.gh.path(ISSUE_PATH.format(number=number)))
+        if not isinstance(fresh, dict):
+            return dict(entry, assignee=assignee, ok=False, why="the issue could not be read again")
+        marker = pending(fresh)
         if marker:
-            text = text.replace(marker.group(0), TRIAGE_DONE_MARKER.format(assign=marker.group(1), cc=marker.group(2)), 1)
-        text = re.sub(re.escape(nightly_bugs.TRIAGE_PENDING_ADDRESSEE.split("{fallback}")[0]) + r".*", TRIAGED_ADDRESSEE, text, count=1)
-        labels = [n for n in label_names(issue) if n != PENDING_LABEL] + [AGENT_LABEL]
-        if self.gh.call("PATCH", self.gh.path(ISSUE_PATH.format(number=number)), {"body": text, "labels": labels}) is None:
-            return dict(entry, assignee=assignee, ok=False, why="the issue could not be marked triaged")
+            text = (fresh.get("body") or "").replace(marker.group(0), TRIAGE_DONE_MARKER.format(assign=marker.group(1), cc=marker.group(2)), 1)
+            text = re.sub(re.escape(nightly_bugs.TRIAGE_PENDING_ADDRESSEE.split("{fallback}")[0]) + r".*", TRIAGED_ADDRESSEE, text, count=1)
+            if self.gh.call("PATCH", self.gh.path(ISSUE_PATH.format(number=number)), {"body": text}) is None:
+                return dict(entry, assignee=assignee, ok=False, why="the issue could not be marked triaged")
+        # The label swap is for people filtering; the body marker is what
+        # this step keys on, so a failed swap is a warning, not a retry.
+        if self.gh.call("POST", self.gh.path(LABELS_PATH.format(number=number)), {"labels": [AGENT_LABEL]}) is None:
+            log(f"warning: #{number}: could not add {AGENT_LABEL}")
+        if PENDING_LABEL in label_names(fresh) and self.gh.call("DELETE", self.gh.path(LABEL_PATH.format(number=number, label=PENDING_LABEL.replace(":", "%3A")))) is None:
+            log(f"warning: #{number}: could not remove {PENDING_LABEL}")
         return dict(entry, assignee=assignee, why=why, ok=True)
 
     def assign(self, number: int, candidates: list[tuple[str, str]]) -> tuple[str | None, str | None]:
@@ -768,15 +789,18 @@ def pending_issues(gh: ghcli.Gh) -> list[dict]:
     return sorted(found, key=lambda i: i.get("created_at") or "")
 
 
-def chosen_issues(gh: ghcli.Gh, numbers: list[int]) -> list[dict]:
+def chosen_issues(gh: ghcli.Gh, numbers: list[int], filed_before: datetime.datetime | None = None) -> list[dict]:
     """``numbers`` when given (each read on its own; only an open issue that
-    names a case, so not an infra issue), else the pending ones; capped at
+    names a case, so not an infra issue), else the pending ones (only those
+    filed before ``filed_before`` when it is set); capped at
     MAX_ISSUES_PER_RUN."""
     if numbers:
         issues = [gh.call("GET", gh.path(ISSUE_PATH.format(number=n))) for n in numbers]
         issues = [i for i in issues if isinstance(i, dict) and i.get("number") and i.get("state") == "open" and nightly_bugs.group_issue_cases(i)]
     else:
         issues = pending_issues(gh)
+        if filed_before:
+            issues = [i for i in issues if (nightly_bugs.nightly.parse_iso(i.get("created_at")) or filed_before) < filed_before]
     if len(issues) > MAX_ISSUES_PER_RUN:
         log(f"{len(issues)} issues to triage; the oldest {MAX_ISSUES_PER_RUN} this run, the rest next tick")
     return issues[:MAX_ISSUES_PER_RUN]
@@ -793,6 +817,8 @@ def parse_args(argv=None):
     rt.add_argument("--model", default=os.environ.get(MODEL_ENV) or DEFAULT_MODEL)
     rt.add_argument("--project", default=os.environ.get(PROJECT_ENV) or DEFAULT_PROJECT)
     rt.add_argument("--no-model", action="store_true", help="route by the filing rule without a model call")
+    rt.add_argument("--stale-only", action="store_true",
+                    help=f"only issues still pending {int(PENDING_MAX_AGE.total_seconds() // 3600)} hours after filing (the tick's backstop for a triage job that never ran)")
     mode = rt.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", dest="dry_run", action="store_true", default=True)
     mode.add_argument("--live", dest="dry_run", action="store_false")
@@ -806,7 +832,13 @@ def parse_args(argv=None):
 def main(argv=None, gh_runner=None, source_runner=None, model=None, git=None, gcs=None, now=None) -> int:
     args = parse_args(argv)
     gh = ghcli.Gh(args.repo, gh_runner) if gh_runner else ghcli.Gh(args.repo)
-    issues = chosen_issues(gh, args.issue)
+    # The comment quotes grading lines and transcripts: it goes to a private
+    # issues repository or nowhere.
+    if args.phase == "route" and not args.dry_run and args.repo == ghcli.SOURCE_REPO:
+        log(f"nightly triage: the issues repository is {ghcli.SOURCE_REPO}, which is public; writing nothing (set KUBE_AGENTS_ISSUES_REPO)")
+        return 0
+    stamp = now or datetime.datetime.now(datetime.timezone.utc)
+    issues = chosen_issues(gh, args.issue, stamp - PENDING_MAX_AGE if getattr(args, "stale_only", False) else None)
     if args.phase == "prepare":
         try:
             data = json.loads(args.data.read_text())
@@ -835,10 +867,11 @@ def main(argv=None, gh_runner=None, source_runner=None, model=None, git=None, gc
     else:
         client = model or VertexModel(args.project, args.model)
     router = Router(gh, client, args.model, args.repo_root, live=not args.dry_run, now=now)
-    lines = [f"nightly triage ({'live' if not args.dry_run else 'dry run'}, {'no model' if client is None else args.model}): {len(issues)} issues"]
+    print(f"nightly triage ({'live' if not args.dry_run else 'dry run'}, {'no model' if client is None else args.model}): {len(issues)} issues", flush=True)
+    # One line as each issue finishes, so a step killed at its timeout still
+    # says what it routed.
     for issue in issues:
-        lines.append(dry_line(router.triage(issue, bundles.get(str(issue["number"])))))
-    print("\n".join(lines))
+        print(dry_line(router.triage(issue, bundles.get(str(issue["number"])))), flush=True)
     return 0
 
 
