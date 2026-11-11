@@ -101,6 +101,16 @@ _GREP_OUTPUT_SINK = "/dev/null"
 # typed line onto it with a space, so a comment there would hide that line from the grading.
 _COMMENT_CHAR = "#"
 _COLLAPSED_CHAIN_RE = re.compile(r"\s\+\s\d+\scommand(?:s|\(s\))?\s*$")
+# The checks below read the line as the shell reader keeps it, quotes in place and line
+# continuations gone, so a quote or a backslash that ends a name in bash ends it here too.
+# A word that reads the last argument back (`$_`, `${_}`), or a variable through another
+# (`${!NAME}`, which can name `_` or a variable an assignment set).
+_READ_BACK_RE = re.compile(r"\$(?:_(?![A-Za-z0-9_])|\{_(?![A-Za-z0-9_])|\{!)")
+# The one braced expansion a grep row may hold: a plain name, or a default that assigns
+# nothing (`${HOME}`, `${DIR:-.}`). Any other `${…}` can assign (`${X:=…}`, `${A[i]=…}`,
+# `${!X:=…}`), so it is refused rather than parsed.
+_BRACED_EXPANSION_OPEN = "${"
+_PLAIN_BRACED_EXPANSION_RE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*(?:\}|:?-)")
 
 
 def _read_shell_line(command: str) -> tuple[str, list[str], list[str]]:
@@ -379,6 +389,41 @@ def _command_word_index(
     return None
 
 
+def _can_read_a_word_back(line: str) -> bool:
+    """Whether ``line``, as :func:`_read_shell_line` keeps it, can read a removed word back: an
+    ANSI-C quote, a read of the last argument or of a variable through another, or a braced
+    expansion other than a plain name or a default that assigns nothing."""
+    if _has_ansi_c_quote(line) or _READ_BACK_RE.search(line):
+        return True
+    start = line.find(_BRACED_EXPANSION_OPEN)
+    while start != -1:
+        if not _PLAIN_BRACED_EXPANSION_RE.match(line, start):
+            return True
+        start = line.find(_BRACED_EXPANSION_OPEN, start + 1)
+    return False
+
+
+def _has_ansi_c_quote(command: str) -> bool:
+    """Whether the line opens an ANSI-C quote (``$'…'``) outside other quotes: the shell reader
+    keeps its escapes undecoded, so ``$'\\x24_'`` would not read as ``$_``."""
+    quote: str | None = None
+    i = 0
+    while i < len(command):
+        char = command[i]
+        if char == _SHELL_ESCAPE_CHAR and quote != _SHELL_SINGLE_QUOTE:
+            i += 2
+            continue
+        if quote is not None:
+            if char == quote:
+                quote = None
+        elif char == _SHELL_EXPANSION_PREFIX and command.startswith(_SHELL_SINGLE_QUOTE, i + 1):
+            return True
+        elif char in _SHELL_QUOTE_CHARS:
+            quote = char
+        i += 1
+    return False
+
+
 def _without_grep_patterns(command: str) -> str | None:
     """The command line as its shell words joined by spaces, with the grep's pattern argument
     removed (the first positional word, or each ``-e``/``--regexp=`` value when one is given);
@@ -390,9 +435,9 @@ def _without_grep_patterns(command: str) -> str | None:
     (`` + N command(s)``); and no substitution anywhere on it. Options end at the first operand.
     Every other word stays: the options, the file operands and any text the rendering joined
     onto the row. Quotes come off, as the shell reads the line; a line bash refuses yields None.
-    A card log row that joined a second typed line onto the grep is one row here, so a line
-    that reads the removed word back (``$_``, a variable the pattern assigned) is read as an
-    operand: the limit ``exempt_patterns`` had too."""
+    A card log row that joined a second typed line onto the grep is one row here, so the line
+    is also refused when a later word could read the removed word back
+    (:func:`_can_read_a_word_back`)."""
     if _COLLAPSED_CHAIN_RE.search(command):
         return None
     # The reader keeps every quoted, escaped or in-word `#` and a span's text whole, so a `#` it
@@ -455,5 +500,11 @@ def _without_grep_patterns(command: str) -> str | None:
         i += 1
     removed = set(patterns) if given else set(positionals[:1])
     if not removed:
+        return None
+    # A card log row joins the next typed line onto the grep, so a word after it can be a
+    # command that reads the removed word back: from a variable the line assigned, as the last
+    # argument (`$_`), or through an ANSI-C quote whose escapes spell either. Such a row is
+    # graded whole (#5331).
+    if _can_read_a_word_back(kept):
         return None
     return " ".join(word for k, word in enumerate(words) if k not in removed)
