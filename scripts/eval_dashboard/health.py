@@ -68,11 +68,12 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 try:
-    from . import collect, fixture_state, periodics, pool_state, tiers
+    from . import collect, fixture_state, ghcli, periodics, pool_state, tiers
 except ImportError:  # run as a script: python3 scripts/eval_dashboard/health.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
     import collect
     import fixture_state
+    import ghcli
     import periodics
     import pool_state
     import tiers
@@ -150,6 +151,12 @@ REP_FIXTURE = "fixture"
 # Matched with the opening parenthesis the scorer words it with
 # ("... nothing to grade (fixture-drift:<role>: ...)"), as classify.py does.
 FIXTURE_DRIFT_MARKER = "(fixture-drift:"
+
+# A rung-2 block's reason: the scorer gives each errored check's reason after
+# this phrase, and a check's reason can quote a rate limit or a 429 from the
+# forge it read. The repetition was graded, and blocked, so it is a fail,
+# never a storm rep; STORM_REASON_RE is not asked about it.
+RUNG_2_ERRORED_PHRASE = "checks errored rather than ran"
 
 # How old data.json may be before health.json is flagged stale. The
 # collector writes `stale_after_s` when it knows its own cadence
@@ -844,6 +851,8 @@ def rep_kind(rep: dict) -> str:
         return REP_FAIL
     if result == REP_RESULT_INFRA:
         return REP_STORM
+    if RUNG_2_ERRORED_PHRASE in reason:
+        return REP_FAIL
     if STORM_REASON_RE.search(reason):
         return REP_STORM
     return REP_FAIL
@@ -2291,9 +2300,10 @@ def tracking_issues(cases: list[str], notes: dict[str, dict]) -> list[str]:
 
 
 def issue_tag(issue) -> str | None:
-    """"#1278" for the {number, url} the poster filed or adopted; None otherwise."""
-    number = issue.get("number") if isinstance(issue, dict) else None
-    return f"#{number}" if number else None
+    """ghcli.issue_tag for the {number, url} the poster filed or adopted:
+    "#N" for this repository's, the URL for the issues repository's; None
+    otherwise. case-notes.yaml's issues stay the `#N` they are written as."""
+    return ghcli.issue_tag(issue)
 
 
 def issue_for(issue, condition: str | None) -> dict | None:
@@ -2313,7 +2323,7 @@ def all_tracking(cases: list[str], notes: dict, issue) -> list[str]:
     not already among them."""
     issues = tracking_issues(cases, notes)
     tag = issue_tag(issue)
-    if tag and tag not in issues:
+    if tag and not ghcli.has_issue(issues, tag):
         issues.append(tag)
     return issues
 
@@ -3141,6 +3151,10 @@ def adjudicate(
         "periodics_since": periodics_since,
         "metrics": metrics([run for run in runs if run.finished <= now], now, fixtures, roster),
         "dashboard_url": DASHBOARD_URL,
+        # Where the bots file their issues (ghcli.DEFAULT_REPO): informational,
+        # the pages read nothing from it; a reference above is "#N" for this
+        # repository's issue and a full URL for the issues repository's.
+        "issues_repo": ghcli.DEFAULT_REPO,
         "generated_at": iso(now),
     }
     # Beside the digest's other 24h numbers, but not derived from the runs

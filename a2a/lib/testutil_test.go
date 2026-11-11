@@ -14,7 +14,12 @@ import (
 
 // runJetStreamServer starts a real nats-server with JetStream on a random port.
 // storeDir persists across restarts of the same test so the restart assertion
-// can bring the stream back.
+// can bring the stream back. The server is shut down at cleanup, and the
+// cleanup waits for it: registered after the caller's t.TempDir(), it runs
+// before that directory is removed, so JetStream is no longer writing to it.
+// A server still running there failed TempDir's RemoveAll with "directory not
+// empty". Shutting down again after a test stopped the server itself is a
+// no-op.
 func runJetStreamServer(t *testing.T, port int, storeDir string, mutate func(*natsserver.Options)) *natsserver.Server {
 	t.Helper()
 	opts := &natsserver.Options{
@@ -33,6 +38,10 @@ func runJetStreamServer(t *testing.T, port int, storeDir string, mutate func(*na
 		t.Fatalf("NewServer: %v", err)
 	}
 	go s.Start()
+	t.Cleanup(func() {
+		s.Shutdown()
+		s.WaitForShutdown()
+	})
 	if !s.ReadyForConnections(10 * time.Second) {
 		t.Fatal("nats-server not ready")
 	}
@@ -43,9 +52,7 @@ func runJetStreamServer(t *testing.T, port int, storeDir string, mutate func(*na
 // cleanup.
 func startServer(t *testing.T) *natsserver.Server {
 	t.Helper()
-	s := runJetStreamServer(t, -1, t.TempDir(), nil)
-	t.Cleanup(s.Shutdown)
-	return s
+	return runJetStreamServer(t, -1, t.TempDir(), nil)
 }
 
 // provisionTasksStream creates the TASKS stream the way W2's deployment will:
