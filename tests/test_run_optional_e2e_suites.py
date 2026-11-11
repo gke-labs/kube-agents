@@ -21,7 +21,7 @@ _CALLS_LOG = "suites.log"
 
 
 class RunOptionalE2ESuitesTest(unittest.TestCase):
-    def _run(self, optional_suites, failing_suites=()):
+    def _run(self, optional_suites, failing_suites=(), skipping_suites=()):
         """Runs the script with a mock runner that fails for the named suites."""
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -36,6 +36,7 @@ class RunOptionalE2ESuitesTest(unittest.TestCase):
         # exits non-zero for the suites this case wants to fail.
         runner = tmp_dir / "mock_runner.sh"
         failing = " ".join(failing_suites)
+        skipping = " ".join(skipping_suites)
         runner.write_text(f"""#!/usr/bin/env bash
 # Invoked as: mock_runner.sh --suite <name>
 suite="$2"
@@ -45,6 +46,13 @@ for failing in {failing or '""'}; do
     exit 1
   fi
 done
+for skipping in {skipping or '""'}; do
+  if [ "$suite" = "$skipping" ]; then
+    echo "1 skipped in 0.03s"
+    exit 0
+  fi
+done
+echo "1 passed in 0.03s"
 exit 0
 """)
         runner.chmod(0o755)
@@ -94,6 +102,15 @@ exit 0
         _, _, summary = self._run("agent-plugin,gchat", failing_suites=("gchat",))
         self.assertIn("| `agent-plugin` | ✅ passed |", summary)
         self.assertIn("| `gchat` | ❌ failed (tolerated) |", summary)
+
+    def test_a_suite_that_skipped_everything_reads_as_skipped(self):
+        """A suite skipping while its credentials are unprovisioned exits 0; it ran nothing."""
+        proc, ran, summary = self._run("gchat,slack", skipping_suites=("slack",))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(ran, ["gchat", "slack"])
+        self.assertIn("`slack` | ⏭️ skipped", summary)
+        self.assertNotIn("`slack` | ✅ passed", summary)
+        self.assertIn("`gchat` | ✅ passed", summary)
 
     def test_tolerates_whitespace_around_names(self):
         _, ran, _ = self._run(" agent-plugin , gchat ")
