@@ -121,12 +121,13 @@ import urllib.parse
 import yaml
 
 try:
-    from . import classify, forge_lane, nightly, post_health, tiers, trend
+    from . import classify, forge_lane, links, nightly, post_health, tiers, trend
     from .health import POOL_BREACH, POOL_STALE, POOL_UNMEASURED
 except ImportError:  # run as a script: python3 scripts/eval_dashboard/render.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
     import classify
     import forge_lane
+    import links
     import nightly
     import post_health
     import tiers
@@ -1296,6 +1297,15 @@ def compact_release(release: dict) -> dict:
     tasks = run_tasks(release)
     infra = sum(1 for t in tasks if t.get("result") == "infra")
     url = release.get("artifacts_url")
+    # A build in a bucket Deck cannot read links the Console (SCHEMA.md,
+    # releases[].gcs_base), as a run's does; a record from before the field
+    # whose Spyglass link points into one is converted the same way, since
+    # that link is dead. A release in the old bucket keeps its Spyglass link.
+    base = release.get("gcs_base")
+    if isinstance(base, str) and links.is_private(base):
+        url = links.console_url(base)
+    elif links.private_gcs_base(url):
+        url = links.console_url(links.private_gcs_base(url))
     return {
         "build": text("build_id"),
         "rc_tag": text("rc_tag"),
