@@ -1,4 +1,5 @@
 import abc
+import asyncio
 import dataclasses
 import enum
 import json
@@ -96,6 +97,15 @@ def _register_fake_modules():
         @abc.abstractmethod
         async def get_chat_info(self, chat_id):
             ...
+
+        splits_long_messages = False
+
+        @staticmethod
+        def truncate_message(content, max_length=4096, len_fn=None):
+            _len = len_fn or len
+            if _len(content) <= max_length:
+                return [content]
+            return [content[i : i + max_length] for i in range(0, len(content), max_length)]
 
         def set_message_handler(self, handler):
             self._message_handler = handler
@@ -530,9 +540,20 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(res.success)
             self.assertEqual(res.message_id, "msg-1")
             self.assertEqual(res.raw_response, {"response": {"id": "msg-1"}})
+            # The post waits out the broker's token leg plus its Bot Framework leg.
+            self.assertEqual(
+                mock_urlopen.call_args.kwargs["timeout"],
+                teams_relay_patch.TEAMS_RELAY_REQUEST_TIMEOUT_SECONDS,
+            )
+            self.assertGreater(teams_relay_patch.TEAMS_RELAY_REQUEST_TIMEOUT_SECONDS, 20 + 30)
 
             await adapter.send_typing(
-                "conv-123", "https://smba.trafficmanager.net/teams/"
+                "conv-123", metadata={"serviceUrl": "https://smba.trafficmanager.net/teams/"}
+            )
+            # Fire-and-forget: its worker must not block for the relay timeout.
+            self.assertEqual(
+                mock_urlopen.call_args.kwargs["timeout"],
+                teams_relay_patch.TEAMS_TYPING_REQUEST_TIMEOUT_SECONDS,
             )
             self.assertEqual(
                 await adapter.get_chat_info("19:abc@thread.tacv2"),
@@ -834,6 +855,379 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(adapter._running)
             await adapter.disconnect()
             self.assertFalse(adapter._running)
+
+        # The broker answers the empty-receipt probe 404 once its relay is up:
+        # that is the ready signal, read off the converted error's status.
+        import io
+
+        ready = urllib.error.HTTPError(
+            "http://127.0.0.1:8642/v1/chat/teams/events/ack",
+            404,
+            "Not Found",
+            {},
+            io.BytesIO(b'{"settled": false}'),
+        )
+        with (
+            mock.patch("urllib.request.urlopen", side_effect=ready) as probe,
+            mock.patch("asyncio.sleep", new=mock.AsyncMock()) as slept,
+        ):
+            self.assertTrue(await adapter.connect())
+            self.assertEqual(probe.call_count, 1)
+            slept.assert_not_awaited()
+            await adapter.disconnect()
+
+    async def test_standalone_send_returns_the_cause_and_never_raises(self):
+        """The registry's cron path expects ``success`` or ``error`` back; the
+        broker's ``teams`` object is what names the cause."""
+        import io
+        from gateway.platform_registry import platform_registry
+
+        teams_relay_patch.install()
+        sender = platform_registry.get("teams").standalone_sender_fn
+        body = json.dumps({"error": "Teams operation failed", "detail": "HTTP 403: BotNotInConversationRoster",
+                           "teams": {"status": 403, "code": "BotNotInConversationRoster", "message": "not in roster"}}).encode()
+        err = urllib.error.HTTPError("http://127.0.0.1:8642/v1/chat/teams/api", 502, "Bad Gateway", {}, io.BytesIO(body))
+        with mock.patch("urllib.request.urlopen", side_effect=err):
+            res = await sender(None, "conv-1", "hello")
+        self.assertIn("BotNotInConversationRoster", res["error"])
+        self.assertNotIn("success", res)
+
+        with mock.patch("urllib.request.urlopen") as mock_urlopen:
+            self.assertEqual(await sender(None, "conv-1", "   "), {"success": True, "platform": "teams", "skipped": "empty_text"})
+            self.assertEqual(
+                await sender(None, "conv-1", "", media_files=["/tmp/a.png"]),
+                {"success": True, "platform": "teams", "skipped": "empty_text", "media_omitted": 1},
+            )
+            mock_urlopen.assert_not_called()
+
+        # The send tool hands the files over with the last chunk after warning
+        # they are omitted: the text still posts, the files do not.
+        posted = []
+
+        def fake_urlopen(req, timeout=None):
+            del timeout
+            posted.append(json.loads(req.data)["payload"])
+            resp = mock.MagicMock()
+            resp.read.return_value = json.dumps({"id": "m-9"}).encode("utf-8")
+            resp.__enter__.return_value = resp
+            return resp
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            res = await sender(None, "conv-1", "report", media_files=["/tmp/a.png"])
+        self.assertEqual(res, {"success": True, "message_id": "m-9", "media_omitted": 1})
+        self.assertEqual(len(posted), 1)
+
+    async def test_send_drops_to_plain_text_when_the_card_is_over_the_byte_cap(self):
+        from gateway.platform_registry import PlatformRegistry
+
+        teams_relay_patch.install()
+        adapter = PlatformRegistry().create_adapter("teams")
+        self.assertEqual(adapter.MAX_MESSAGE_LENGTH, teams_relay_patch.TEAMS_MAX_MESSAGE_LENGTH)
+        self.assertTrue(adapter.splits_long_messages)
+
+        # 7000 characters as 7-character lines: a card is several times the text.
+        chunk = "\n".join(["- %04d" % i for i in range(1000)])[:7000]
+        big = teams_relay_patch.fit_activity_to_cap(
+            chunk, use_adaptive_cards=True, title="Audit", actions=None
+        )
+        self.assertNotIn("attachments", big)
+        self.assertEqual(big["text"], chunk)
+        self.assertLessEqual(
+            teams_relay_patch.activity_size_bytes(big), teams_relay_patch.TEAMS_MAX_ACTIVITY_BYTES
+        )
+
+        sent = []
+
+        def fake_urlopen(req, timeout=None):
+            del timeout
+            sent.append(json.loads(req.data))
+            resp = mock.MagicMock()
+            resp.read.return_value = json.dumps({"id": "m"}).encode("utf-8")
+            resp.__enter__.return_value = resp
+            return resp
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            await adapter.send("conv-1", "# short\n- one line")
+        self.assertIn("attachments", sent[0]["payload"])
+
+    def test_fit_truncates_text_that_no_form_can_fit_to_the_longest_prefix(self):
+        """Over 21,000 CJK characters are 63 KB of UTF-8: over the cap as a card
+        and as plain text, so the text is cut to the longest prefix that fits
+        with the marker. Newlines and quotes cost two bytes each once
+        serialized, and the reply id rides along: the cap is measured on
+        exactly what is posted."""
+        cjk = "\n".join(['集群"状态"报告。' * 5 for _ in range(460)])  # 21,159 characters
+        payload = teams_relay_patch.fit_activity_to_cap(
+            cjk,
+            use_adaptive_cards=True,
+            title=None,
+            actions=None,
+            extra={"replyToId": "1697000000000"},
+        )
+        cap = teams_relay_patch.TEAMS_MAX_ACTIVITY_BYTES
+        marker = teams_relay_patch.TEAMS_TRUNCATION_MARKER
+        self.assertNotIn("attachments", payload)
+        self.assertEqual(payload["replyToId"], "1697000000000")
+        self.assertTrue(payload["text"].endswith(marker))
+        kept = payload["text"][: -len(marker)]
+        self.assertTrue(cjk.startswith(kept))
+        self.assertLessEqual(teams_relay_patch.activity_size_bytes(payload), cap)
+        # The longest prefix: one more character would not fit.
+        one_more = dict(payload, text=cjk[: len(kept) + 1] + marker)
+        self.assertGreater(teams_relay_patch.activity_size_bytes(one_more), cap)
+
+    async def test_send_splits_a_long_reply_and_posts_every_chunk_under_the_cap(self):
+        """The final-text path hands ``send`` the whole reply; ``send`` splits
+        it at the chunk length and posts each piece, none of them cut."""
+        from gateway.platform_registry import PlatformRegistry
+
+        teams_relay_patch.install()
+        adapter = PlatformRegistry().create_adapter("teams")
+        sent = []
+
+        def fake_urlopen(req, timeout=None):
+            del timeout
+            sent.append(json.loads(req.data)["payload"])
+            resp = mock.MagicMock()
+            resp.read.return_value = json.dumps({"id": "m-%d" % len(sent)}).encode("utf-8")
+            resp.__enter__.return_value = resp
+            return resp
+
+        report = "\n".join(["finding %05d: cgroup pressure on node pool a" % i for i in range(700)])
+        self.assertGreater(len(report), 2 * teams_relay_patch.TEAMS_MAX_MESSAGE_LENGTH)
+        adapter.adaptive_cards = False
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            res = await adapter.send("conv-1", report, reply_to="1697000000000")
+        self.assertTrue(res.success)
+        self.assertEqual(res.message_id, "m-%d" % len(sent))
+        self.assertGreaterEqual(len(sent), 3)
+        for payload in sent:
+            self.assertEqual(payload["replyToId"], "1697000000000")
+            self.assertLessEqual(len(payload["text"]), teams_relay_patch.TEAMS_MAX_MESSAGE_LENGTH)
+            self.assertLessEqual(
+                teams_relay_patch.activity_size_bytes(payload),
+                teams_relay_patch.TEAMS_MAX_ACTIVITY_BYTES,
+            )
+            self.assertNotIn(teams_relay_patch.TEAMS_TRUNCATION_MARKER, json.dumps(payload))
+        # The pieces are the base splitter's own, in order and none dropped.
+        self.assertEqual(
+            [p["text"] for p in sent],
+            adapter.truncate_message(report, teams_relay_patch.TEAMS_MAX_MESSAGE_LENGTH),
+        )
+
+    async def test_send_replaces_a_lone_surrogate_instead_of_raising(self):
+        from gateway.platform_registry import PlatformRegistry
+
+        teams_relay_patch.install()
+        adapter = PlatformRegistry().create_adapter("teams")
+        sent = []
+
+        def fake_urlopen(req, timeout=None):
+            del timeout
+            sent.append(json.loads(req.data)["payload"])
+            resp = mock.MagicMock()
+            resp.read.return_value = json.dumps({"id": "m"}).encode("utf-8")
+            resp.__enter__.return_value = resp
+            return resp
+
+        adapter.adaptive_cards = False
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            res = await adapter.send("conv-1", "ok \ud83d done")
+        self.assertTrue(res.success)
+        self.assertEqual(sent[0]["text"], "ok ? done")
+        sent[0]["text"].encode("utf-8")
+
+    async def test_send_typing_skips_a_tick_while_one_is_in_flight(self):
+        """Driven as the base's typing loop drives it: cancelled at a short
+        wait while the worker is still posting. The mark outlives the
+        cancelled coroutine, so the next tick is skipped until the post ends."""
+        import threading
+        from gateway.platform_registry import PlatformRegistry
+
+        teams_relay_patch.install()
+        adapter = PlatformRegistry().create_adapter("teams")
+        release = {"conv-1": threading.Event(), "conv-2": threading.Event()}
+        release["conv-2"].set()
+        calls = []
+
+        def slow_urlopen(req, timeout=None):
+            del timeout
+            conv = json.loads(req.data)["endpoint"].split("/")[2]
+            calls.append(conv)
+            release[conv].wait(5)
+            resp = mock.MagicMock()
+            resp.read.return_value = b"{}"
+            resp.__enter__.return_value = resp
+            return resp
+
+        meta = {"serviceUrl": "https://smba.trafficmanager.net/teams/"}
+        with mock.patch("urllib.request.urlopen", side_effect=slow_urlopen):
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(adapter.send_typing("conv-1", metadata=meta), timeout=0.05)
+            self.assertIn("conv-1", adapter._typing_in_flight)
+            await adapter.send_typing("conv-1", metadata=meta)  # next tick: skipped
+            await adapter.send_typing("conv-2", metadata=meta)  # another conversation: posts
+            self.assertEqual(calls, ["conv-1", "conv-2"])
+            release["conv-1"].set()
+            for _ in range(100):  # the worker clears its own mark when the post ends
+                if not adapter._typing_in_flight:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual(adapter._typing_in_flight, {})
+            await adapter.send_typing("conv-1", metadata=meta)  # the slot is free again
+        self.assertEqual(calls, ["conv-1", "conv-2", "conv-1"])
+
+    async def test_a_typing_tick_cancelled_while_queued_does_not_silence_the_conversation(self):
+        """With the executor busy, the base cancels a tick before its worker
+        ever runs, so nothing clears the mark; it expires with the post's
+        timeout instead, and the next tick posts."""
+        import concurrent.futures
+        import threading
+        from gateway.platform_registry import PlatformRegistry
+
+        loop = asyncio.get_running_loop()
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        loop.set_default_executor(pool)
+        busy = threading.Event()
+        self.addCleanup(busy.set)
+        self.addCleanup(pool.shutdown, wait=False)
+        teams_relay_patch.install()
+        adapter = PlatformRegistry().create_adapter("teams")
+        calls = []
+
+        def fake_urlopen(req, timeout=None):
+            del timeout
+            calls.append(req.full_url)
+            resp = mock.MagicMock()
+            resp.read.return_value = b"{}"
+            resp.__enter__.return_value = resp
+            return resp
+
+        meta = {"serviceUrl": "https://smba.trafficmanager.net/teams/"}
+        loop.run_in_executor(None, busy.wait, 5)  # the only worker is taken
+        with (
+            mock.patch("urllib.request.urlopen", side_effect=fake_urlopen),
+            mock.patch.object(teams_relay_patch, "TEAMS_TYPING_REQUEST_TIMEOUT_SECONDS", 0.05),
+        ):
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(adapter.send_typing("conv-1", metadata=meta), timeout=0.02)
+            self.assertEqual(calls, [])  # cancelled while queued: the worker never ran
+            self.assertIn("conv-1", adapter._typing_in_flight)
+            await asyncio.sleep(0.1)  # the mark expires with the post's timeout
+            busy.set()
+            await adapter.send_typing("conv-1", metadata=meta)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(adapter._typing_in_flight, {})
+
+    def test_relayed_teams_error_reads_the_brokers_error_field(self):
+        import io
+
+        body = json.dumps({"error": "Teams relay refuses endpoint: v3/conversations/x/members"}).encode()
+        err = urllib.error.HTTPError("http://127.0.0.1:8642/v1/chat/teams/api", 400, "Bad Request", {}, io.BytesIO(body))
+        converted = teams_relay_patch.relayed_teams_error(err)
+        self.assertEqual(converted.status, 400)
+        self.assertEqual(str(converted), "HTTP 400: Teams relay refuses endpoint: v3/conversations/x/members")
+
+    async def test_a_full_chunk_of_four_byte_characters_is_posted_whole(self):
+        """The chunkers count characters and the cap counts bytes: a chunk of
+        ``MAX_MESSAGE_LENGTH`` four-byte characters, with a reply id, must fit
+        as plain text, or a multi-chunk non-Latin reply loses the tail of
+        every chunk."""
+        from gateway.platform_registry import PlatformRegistry
+
+        teams_relay_patch.install()
+        adapter = PlatformRegistry().create_adapter("teams")
+        sent = []
+
+        def fake_urlopen(req, timeout=None):
+            del timeout
+            sent.append(json.loads(req.data))
+            resp = mock.MagicMock()
+            resp.read.return_value = json.dumps({"id": "m"}).encode("utf-8")
+            resp.__enter__.return_value = resp
+            return resp
+
+        chunk = "\U0001F600" * adapter.MAX_MESSAGE_LENGTH
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            await adapter.send("conv-1", chunk, reply_to="1697000000000")
+        payload = sent[0]["payload"]
+        wire = json.dumps(payload, ensure_ascii=False)
+        self.assertIn(chunk, wire)  # whole, as a card or as text
+        self.assertNotIn(teams_relay_patch.TEAMS_TRUNCATION_MARKER, wire)
+        self.assertEqual(payload["replyToId"], "1697000000000")
+        self.assertLessEqual(
+            teams_relay_patch.activity_size_bytes(payload),
+            teams_relay_patch.TEAMS_MAX_ACTIVITY_BYTES,
+        )
+
+    async def test_a_typing_post_that_outlives_its_deadline_clears_only_its_own_mark(self):
+        """A dribbling broker lets a post end after its deadline; by then a
+        later tick holds the mark, and the old worker must not clear it."""
+        import threading
+        from gateway.platform_registry import PlatformRegistry
+
+        teams_relay_patch.install()
+        adapter = PlatformRegistry().create_adapter("teams")
+        releases = [threading.Event(), threading.Event()]
+        calls = []
+
+        def slow_urlopen(req, timeout=None):
+            del timeout
+            index = len(calls)
+            calls.append(req.full_url)
+            releases[index].wait(5)
+            resp = mock.MagicMock()
+            resp.read.return_value = b"{}"
+            resp.__enter__.return_value = resp
+            return resp
+
+        meta = {"serviceUrl": "https://smba.trafficmanager.net/teams/"}
+        with (
+            mock.patch("urllib.request.urlopen", side_effect=slow_urlopen),
+            mock.patch.object(teams_relay_patch, "TEAMS_TYPING_REQUEST_TIMEOUT_SECONDS", 0.05),
+        ):
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(adapter.send_typing("conv-1", metadata=meta), timeout=0.02)
+            await asyncio.sleep(0.1)  # tick A's mark expires while its worker still posts
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(adapter.send_typing("conv-1", metadata=meta), timeout=0.02)
+            self.assertEqual(len(calls), 2)  # tick B posted
+            releases[0].set()  # worker A ends after its deadline
+            await asyncio.sleep(0.02)
+            self.assertIn("conv-1", adapter._typing_in_flight)  # B's mark survives A's finally
+            await adapter.send_typing("conv-1", metadata=meta)  # tick C: skipped, B still posting
+            self.assertEqual(len(calls), 2)
+            releases[1].set()
+            for _ in range(100):
+                if not adapter._typing_in_flight:
+                    break
+                await asyncio.sleep(0.01)
+        self.assertEqual(adapter._typing_in_flight, {})
+
+    async def test_send_reports_a_failure_on_a_later_chunk_without_hiding_the_earlier_posts(self):
+        from gateway.platform_registry import PlatformRegistry
+
+        teams_relay_patch.install()
+        adapter = PlatformRegistry().create_adapter("teams")
+        adapter.adaptive_cards = False
+        sent = []
+
+        def flaky_urlopen(req, timeout=None):
+            del timeout
+            sent.append(json.loads(req.data)["payload"]["text"])
+            if len(sent) == 2:
+                raise urllib.error.URLError("connection refused")
+            resp = mock.MagicMock()
+            resp.read.return_value = json.dumps({"id": "m-%d" % len(sent)}).encode("utf-8")
+            resp.__enter__.return_value = resp
+            return resp
+
+        report = "\n".join(["line %05d" % i for i in range(2000)])  # three chunks
+        with mock.patch("urllib.request.urlopen", side_effect=flaky_urlopen):
+            res = await adapter.send("conv-1", report)
+        self.assertFalse(res.success)
+        self.assertIn("connection refused", res.error)
+        self.assertEqual(len(sent), 2)  # the first chunk posted, the second failed, the third never went
 
 
 if __name__ == "__main__":
