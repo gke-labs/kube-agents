@@ -6211,7 +6211,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
         file count and the commit total, and is skipped when ``_resolve``
         already fell through to it; dating the head commit needs the commits
         listing, whose last page holds it. ``/commits/{sha}`` would be one call
-        and wants ``contents: read``, which this check was written without.
+        and wants ``contents: read``; this check makes no such call.
 
         A page GitHub has not got (404, or one the head is not on) dates
         nothing, comes back ``None``, and the caller does not reject on it: an

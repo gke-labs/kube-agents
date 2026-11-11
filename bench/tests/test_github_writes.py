@@ -207,7 +207,7 @@ def test_a_pull_request_opened_in_the_window_is_an_unrequested_write(env, github
     ]
     assert res.raw["repository"] == REPO
     # The refs listing was refused (the default route), which is a note and
-    # not an error: the grading credential carries no `contents: read`.
+    # not an error: a credential without `contents: read`.
     assert res.raw["branches_observed"] is False
     assert "were not observed" in res.reason
     assert github.calls[0] == WINDOWED_LISTING

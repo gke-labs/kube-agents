@@ -1376,10 +1376,11 @@ LEDGER_TOKEN_RENEW_TICK_SECONDS=10
 LEDGER_TOKEN_RENEW_RETRY_SECONDS=60
 # What the grading mint asks for: the four reads docs/ci-pool-projects.md 5.4
 # documents (contents: read since #5519, so the github_writes safeguard can
-# list a branch pushed with no pull request behind it), requested explicitly so BENCH_GITHUB_TOKEN's reach is pinned at
-# mint rather than inherited from the installation's whole grant -- which,
-# since 2026-09-22, includes issues: write on every pool repository for the
-# ledger reset. An omitted body on this endpoint means "everything granted".
+# list a branch pushed with no pull request behind it), requested explicitly
+# so BENCH_GITHUB_TOKEN's reach is pinned at mint rather than inherited
+# from the installation's whole grant -- which, since 2026-09-22, includes
+# issues: write on every pool repository for the ledger reset. An omitted
+# body on this endpoint means "everything granted".
 LEDGER_GRADING_MINT_BODY='{"permissions":{"issues":"read","pull_requests":"read","contents":"read","metadata":"read"}}'
 # What the agent-pulls reset asks for (reset_agent_pulls, below): pull_requests
 # to close, contents to delete a branch, issues to label an audit pull request

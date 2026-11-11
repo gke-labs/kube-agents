@@ -5764,7 +5764,7 @@ def test_a_field_path_is_checked_when_the_case_loads():
 
 
 def test_an_added_file_is_read_from_the_listing_alone(token, github):
-    """The grading credential has no `contents: read`; a file the pull request
+    """The check makes no `/contents` read; a file the pull request
     adds is whole in its patch, so nothing else is fetched."""
     _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML})
     res = _pr_check(content=[_beta_api_check()]).verify(5.0)
