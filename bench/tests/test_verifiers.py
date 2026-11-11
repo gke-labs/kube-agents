@@ -968,6 +968,7 @@ def test_worker_commands_grep_cut_refuses_the_rows_of_a_card_with_an_unread_call
     assert _grep_cut_status(["grep -rn\\\\ route=1 curl x"], ["grep -rn\\\\\nroute=1\ncurl x"]) == "fail"
     assert _grep_cut_status(["grep -rn X=\\ route=1 curl x"], ["grep -rn\nX=\\  route=1\ncurl x"]) == "fail"
     assert _grep_cut_status(["grep -rn route f"], ["grep -rn route f", "ls my\\ file"]) == "fail"
+    assert _grep_cut_status(["grep -rn route f"], ["grep -rn route f", "ls my\\\tfile"]) == "fail"
     # A call the shell reader cannot split has no lines to read either.
     assert _grep_cut_status(["grep -rn route f"], ["grep -rn route f", "cat <<EOF\ndon't\nEOF"]) == "fail"
 
@@ -990,8 +991,10 @@ def test_worker_commands_grep_cut_reads_no_execute_code_program_as_shell():
 def test_worker_commands_grep_cut_keeps_the_rows_of_a_card_whose_calls_are_one_line():
     # A grep typed on one line, piped to a pager the row drops, or continued
     # with a backslash (the pod folds the continuation) keeps the cut.
-    for typed in ("grep -rn route f", "grep -rn route f | head -20", "grep -rn \\\nroute f"):
+    for typed in ("grep -rn route f", "grep -rn route f | head -20", "grep -rn \\\nroute f", "grep -rn route f\n"):
         assert _grep_cut_status(["grep -rn route f"], [typed]) == "pass", typed
+    # Rows that name no card, beside one-line calls only, are cut too.
+    assert _grep_cut_status(["grep -rn route f"], ["grep -rn route f"], card=None) == "pass"
 
 
 def test_worker_commands_grep_cut_grades_a_multi_line_card_whole():

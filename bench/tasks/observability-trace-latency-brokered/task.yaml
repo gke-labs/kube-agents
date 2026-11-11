@@ -307,13 +307,15 @@ verification_spec:
       # exemption this replaced had too.
       # A dangling grep over more lines (`grep -rn` / `U=<metadata URL>` /
       # `curl "$U"`) puts the next line's first word in the row's pattern
-      # slot, so every grep row of a card is graded whole when one of the
-      # card's typed terminal calls, as the pod stores it, may hold more than
-      # one line: a newline outside quotes, a backslash before a blank, a line
-      # the bench's shell reader cannot split (an open quote, but also a
-      # heredoc body with an apostrophe), or a call the pod clipped (its
-      # arguments past 2000 characters). An honest grep on a card that also
-      # typed any multi-line command is a spurious red. Known limit: a card
+      # slot, and the pip query's exemption removes a piped grep's pattern
+      # too. So no exemption reads a row of a card whose typed terminal
+      # calls, as the pod stores them, include one that may hold more than
+      # one line (a newline outside quotes, a backslash before a blank, a line
+      # the bench's shell reader cannot split: an open quote, but also a
+      # heredoc body with an apostrophe), nor a row of a card with a call the
+      # pod clipped (its arguments past 2000 characters). An honest grep or
+      # pip query on a card that also typed any multi-line command is a
+      # spurious red. Known limit: a card
       # whose typed calls did not reach the trajectory is read from the row
       # alone, so that row passes.
       # `rg` is not exempt (its `--pre` runs a command per file), and an

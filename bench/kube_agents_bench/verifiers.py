@@ -2823,16 +2823,17 @@ class WorkerCommandsVerifier(BaseVerifier):
     removed word back (``$_``) is read as a file operand, as it was by the
     regex exemptions this replaces. A dangling grep's pattern slot can also
     hold the next typed line's first word (``grep -rn`` over ``U=<url>`` and
-    ``curl "$U"``), which the cut would remove. So every grep row of a card is
-    graded whole when one of the card's tagged ``terminal`` calls, as the pod
-    stores it, may hold more than one line: a newline outside quotes, a
+    ``curl "$U"``), which the cut would remove, and so would a pattern
+    exemption that removes a piped grep's pattern. So no exemption reads a row
+    of a card whose tagged ``terminal`` calls, as the pod stores them, include
+    one that may hold more than one line: a newline outside quotes, a
     backslash before a blank (an escaped blank, or what the pod's scrub
-    leaves of an escaped backslash at a line end), a line the shell reader
-    cannot split (an open quote, but also a heredoc body with an apostrophe),
-    or a clipped call (#5237). This is a spurious red for an honest grep for a
-    forbidden word on a card that also typed any multi-line command, such as
-    a heredoc. A card whose calls did not reach the trajectory is read from
-    the row alone.
+    leaves of an escaped backslash at a line end), or a line the shell reader
+    cannot split (an open quote, but also a heredoc body with an apostrophe);
+    nor a row of a card with a clipped code-tool call (#5237). This is a
+    spurious red for an honest grep for a forbidden word, or an exempt query,
+    on a card that also typed any multi-line command, such as a heredoc. A
+    card whose calls did not reach the trajectory is read from the row alone.
     ``required_runs``: each names a script (by basename, or module stem under
     ``-m``), flags and word patterns; some command's shell segment, read as an
     argv, must run it with those flags after it, a word matching each pattern,
@@ -2960,8 +2961,12 @@ class WorkerCommandsVerifier(BaseVerifier):
 
     def _without_exempt_text(self, command: str, joined: bool = False) -> str:
         # ``joined``: the row's card typed a call the row may have joined lines of
-        # (see the grep cut), so the row keeps its grep and is graded whole (#5237).
-        if self.exempt_grep_patterns and not joined:
+        # (see the grep cut), so no exemption reads it and it is graded whole
+        # (#5237): a pattern exemption can remove a joined line as a grep's
+        # pattern too (a pip query piped into a dangling grep).
+        if joined:
+            return command
+        if self.exempt_grep_patterns:
             command = _without_grep_patterns(command) or command
         for pattern in self.exempt_patterns:
             command = re.sub(pattern, "", command)

@@ -89,18 +89,19 @@
 #     and passes; the regex exemption this replaced had the same limit.
 #   - A dangling grep over more lines, `grep -rn` / `U=…/v1/workspace/open` /
 #     `curl "$U"`, reaches a card log row as `grep -rn U=… curl "$U"`, with
-#     the assignment in the pattern slot. So every grep row of a card is
-#     graded whole when one of the card's typed terminal calls, as the pod
-#     stores it, may hold more than one line: a newline outside quotes, a
+#     the assignment in the pattern slot. So no exemption reads a row of a
+#     card whose typed terminal calls, as the pod stores them, include one
+#     that may hold more than one line: a newline outside quotes, a
 #     backslash before a blank (the pod stores an escaped backslash at a line
-#     end as an escaped space), a line the bench's shell reader cannot split
-#     (an open quote, but also a heredoc body with an apostrophe), or a call
-#     the pod clipped (its arguments past 2000 characters). An honest grep
-#     on a card that also typed any multi-line command, such as a heredoc,
-#     is a spurious red. A card whose typed calls did not reach the
-#     trajectory is read from the row alone, so its row passes. The same
-#     class: a bare `grep` over `…/inspect_repository.py list`, `grep -e`
-#     over `node -e "…" x`, and `grep -m` over `curl …`.
+#     end as an escaped space), or a line the bench's shell reader cannot
+#     split (an open quote, but also a heredoc body with an apostrophe); nor
+#     a row of a card with a call the pod clipped (its arguments past 2000
+#     characters). An honest grep on a card that also typed any multi-line
+#     command, such as a heredoc, is a spurious red. A card whose typed
+#     calls did not reach the trajectory is read from the row alone, so its
+#     row passes. The same class: a bare `grep` over
+#     `…/inspect_repository.py list`, `grep -e` over `node -e "…" x`, and
+#     `grep -m` over `curl …`.
 #   - The required run also reads each card's tagged call as typed, so a
 #     clone chained behind another command, or inside a shell heredoc
 #     (`bash <<'EOF' … clone … EOF`), is credited when the call reached the
