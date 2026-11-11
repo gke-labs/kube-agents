@@ -83,8 +83,9 @@ func TestTheDispatchConfigFitsTwentyFiveHundredTwoTierProfiles(t *testing.T) {
 	}
 }
 
-// The durables the operator creates for each profile, which the dispatcher
-// now derives instead of reading: the operator can't import a2a/lib, so this
+// The durables the operator creates for each profile (desiredProfileDurables,
+// held equal here to the config's list), which the dispatcher now derives
+// instead of reading: the operator can't import a2a/lib, so this
 // fixture, read by lib's TestTheOperatorsDurablesAreTheDerivedOnes, holds the
 // two derivations equal. It covers a one-tier profile, a two-tier one, one
 // draining a tier (#5638), and a draining profile.
@@ -116,6 +117,17 @@ func TestTheDispatchDurablesFixture(t *testing.T) {
 		DrainingUntil time.Time `json:"drainingUntil,omitzero"`
 		Durables      []string  `json:"durables"`
 	}
+	// The durables the operator actually creates on the bus come from
+	// desiredProfileDurables (the AgentProfile controller's SyncDurables),
+	// not from the config's in-memory list: hold the two equal here, so the
+	// fixture pins what is created, not only what is listed.
+	created := map[string][]string{}
+	for i := range profiles {
+		for _, d := range desiredProfileDurables(&profiles[i]) {
+			created[profiles[i].Name] = append(created[profiles[i].Name], d.name)
+		}
+		slices.Sort(created[profiles[i].Name])
+	}
 	var out []entry
 	for _, p := range cfg.Profiles {
 		e := entry{Name: p.Name, Tiers: p.Tiers, DrainingUntil: p.DrainingUntil, Durables: []string{}}
@@ -126,6 +138,9 @@ func TestTheDispatchDurablesFixture(t *testing.T) {
 			e.Durables = append(e.Durables, d.Name)
 		}
 		slices.Sort(e.Durables)
+		if want, ok := created[p.Name]; ok && !slices.Equal(want, e.Durables) {
+			t.Errorf("profile %s: the config lists durables %v, the controller creates %v", p.Name, e.Durables, want)
+		}
 		out = append(out, e)
 	}
 	body, err := json.MarshalIndent(out, "", "  ")

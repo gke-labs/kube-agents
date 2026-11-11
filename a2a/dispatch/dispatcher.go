@@ -1927,7 +1927,7 @@ func submitRetention(cfg lib.DispatchConfig) time.Duration {
 }
 
 // tierBoundLocked reports whether every durable of a (profile, tier) the
-// config lists is bound. Callers hold d.mu.
+// config derives is bound. Callers hold d.mu.
 func (d *Dispatcher) tierBoundLocked(cfg lib.DispatchConfig, profile, tier string) bool {
 	prof, ok := profileOf(cfg, profile)
 	if !ok {

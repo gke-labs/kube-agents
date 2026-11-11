@@ -118,7 +118,7 @@ func a2aDispatcherPodSelector(agent *agentv1alpha1.PlatformAgent) map[string]str
 //     $JS.ACK on them to ack, nak and send the in-progress heartbeats a held
 //     message lives on. No CONSUMER.CREATE: the durables are the operator's.
 //     Each durable is named rather than PROFILE_SUBMITS.*, so a dispatcher
-//     reads only the durables its config lists. The grants are fixed for a
+//     reads only the durables its config derives. The grants are fixed for a
 //     connection, so the dispatcher reconnects when its config adds a
 //     durable (contract on #3655).
 //   - PROFILE_LEASES, which it alone writes: put and delete on $KV, INFO and

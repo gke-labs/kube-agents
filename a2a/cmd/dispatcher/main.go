@@ -313,7 +313,7 @@ func authOptions(getenv func(string) string) ([]nats.Option, error) {
 
 // probes is the status server's view of the process. Ready means the
 // dispatch config is loaded, the bus is connected, and the dispatcher is
-// serving with every listed durable bound (dispatch.Dispatcher.Ready). The
+// serving with every derived durable bound (dispatch.Dispatcher.Ready). The
 // bus and the dispatcher arrive after the config, so until each is set it
 // reads as not ready.
 type probes struct {

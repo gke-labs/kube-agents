@@ -57,7 +57,7 @@ const (
 	// tries again: loud, bounded, never a reconnect loop.
 	DefaultRegrantCooldown = 2 * time.Minute
 	// DefaultBindRetryBase and DefaultBindRetryMax pace the retries of a
-	// durable the config lists that the bus doesn't have yet (the operator
+	// durable the config derives that the bus doesn't have yet (the operator
 	// creates durables asynchronously): not a failure, just not yet.
 	DefaultBindRetryBase = time.Second
 	DefaultBindRetryMax  = time.Minute

@@ -135,8 +135,8 @@ func TestAnUnreachableVerifierHoldsTheSubmission(t *testing.T) {
 }
 
 // A submission at a tier the profile doesn't allow is refused before
-// anything else is asked. Since #5479 a bound durable always belongs to a
-// live or draining tier, so on the bus this is only the moment between a
+// anything else is asked. A bound durable belongs to a live or draining
+// tier (as before #5479; the dispatcher now derives that set), so on the bus this is only the moment between a
 // config change and the unbind; admit is where the check lives.
 func TestAdmissionRefusesATierTheProfileDoesNotAllow(t *testing.T) {
 	v := &fakeVerifier{}

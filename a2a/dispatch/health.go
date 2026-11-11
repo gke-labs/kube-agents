@@ -189,7 +189,7 @@ func (d *Dispatcher) logHealth() {
 }
 
 // Ready reports whether the dispatcher is serving: Run holds its accept and
-// lease subscriptions, and every durable the current config lists is bound.
+// lease subscriptions, and every durable the current config derives is bound.
 // When it isn't, the string says what is missing. A durable the operator
 // hasn't created yet, or one the grants don't cover, keeps it unready, so a
 // config the dispatcher can't fully serve shows on the pod and not only in
