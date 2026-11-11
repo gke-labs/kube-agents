@@ -104,7 +104,7 @@ func (s verbSet) subsetOf(other verbSet) bool {
 
 // knownVerb reports whether any tier's set names v.
 func knownVerb(v Verb) bool {
-	for _, set := range tierVerbs {
+	for _, set := range tiers().verbs {
 		if set.has(v) {
 			return true
 		}
@@ -120,7 +120,7 @@ func Permits(e Entry, v Verb, r Scope) error {
 	if !knownVerb(v) {
 		return refuse("verb is not in the table")
 	}
-	set, ok := tierVerbs[e.Tier]
+	set, ok := tiers().verbs[e.Tier]
 	if !ok {
 		return refuse("capability carries a tier that is not a known tier")
 	}
@@ -146,7 +146,7 @@ func PermitsProfile(e Entry, profile string, tier Tier, r Scope) error {
 	if err := Permits(e, VerbProfileRun, r); err != nil {
 		return err
 	}
-	if _, ok := tierVerbs[tier]; !ok {
+	if _, ok := tiers().verbs[tier]; !ok {
 		return refuse("the request names a tier that is not a known tier")
 	}
 	if tier != e.Tier {
@@ -169,7 +169,7 @@ func PermitsProfile(e Entry, profile string, tier Tier, r Scope) error {
 // rank knew.
 func Verbs() []Verb {
 	all := verbSet{}
-	for _, set := range tierVerbs {
+	for _, set := range tiers().verbs {
 		for v := range set {
 			all[v] = struct{}{}
 		}
