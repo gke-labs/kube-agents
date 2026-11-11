@@ -10,6 +10,15 @@ same prefix) to pull them from your mirror too — see the chart README.
 cert-manager is not rendered by this chart; the composition's
 third_party_image_registry, or your own cert-manager install, covers it.
 {{- end }}
+{{- $tseDispatcher := (.Values.operator.profileDispatcher | default dict) }}
+{{- if and .Values.platformAgent.enabled (eq (toString .Values.platformAgent.mode) "next") ((.Values.profiles | default dict).tse | default dict).enabled (ne (toString (index $tseDispatcher "enabled")) "false") }}
+
+WARNING: profiles.tse.enabled is true on a next install with the profile
+dispatcher on. tse has no persona image yet (#3842), so its warm worker
+crash-loops at the persona step, and the cluster watcher files triage turns
+about it. Kanban to tse still works. Turn profiles.tse.enabled off, or set
+operator.profileDispatcher.enabled=false, until tse ships its persona.
+{{- end }}
 {{- if and .Values.litellm.enabled (ne .Release.Namespace "kubeagents-system") }}
 
 WARNING: this release is not in the kubeagents-system namespace, but the

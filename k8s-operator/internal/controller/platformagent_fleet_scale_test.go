@@ -48,8 +48,8 @@ import (
 // inverted one turns itself into the forward check at the moment the fix
 // lands. The minter policy map and the identity map are forward checks now:
 // the policies name one repository each and the map is cut into shards, every
-// one of which is gated below. The dispatch config is still over the limit and
-// stays inverted.
+// one of which is gated below. The dispatch config is a forward check too
+// now: compact JSON brings the fleet's config under the limit.
 //
 // Each check first confirms its fixture is the fleet the gate names, and does
 // so on the renderer's input (the repositories the sync parses, the profiles

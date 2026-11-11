@@ -169,8 +169,8 @@ func TestAnUnownedTaskSigningSecretIsRefused(t *testing.T) {
 
 // After a full reconcile under next: the callout carries the public half as a
 // plain value, and nothing else the operator rendered references the
-// task-signing Secret or carries the seed. Until the dispatcher exists,
-// nothing mounts it at all.
+// task-signing Secret or carries the seed, except the dispatcher, which runs
+// by default and is the one workload that mounts it.
 func TestTheTaskSigningKeyReachesTheCalloutAsItsPublicHalfOnly(t *testing.T) {
 	// The MCP door renders only with its env var set.
 	t.Setenv(a2aMCPDoorEnvVar, "true")

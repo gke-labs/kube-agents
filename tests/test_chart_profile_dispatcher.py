@@ -87,3 +87,53 @@ class ProfileDispatcherRenderTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipIf(shutil.which("helm") is None, "helm is required for chart rendering tests")
+class TseWarningInNotesTest(unittest.TestCase):
+    """NOTES.txt warns when tse is enabled on a next install with the dispatcher
+    on: tse has no persona image yet, so its warm worker crash-loops (#3842)."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import tempfile
+
+        cls._tmp = tempfile.TemporaryDirectory()
+        chart = pathlib.Path(cls._tmp.name) / "kube-agents"
+        shutil.copytree(_CHART, chart)
+        templates = chart / "templates"
+        notes = (templates / "NOTES.txt").read_text()
+        (templates / "NOTES.txt").unlink()
+        (templates / "_notes_under_test.tpl").write_text(
+            '{{- define "notes-under-test" -}}\n' + notes + "\n{{- end -}}\n"
+        )
+        (templates / "notes-under-test.yaml").write_text(
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: notes-under-test\n"
+            'data:\n  notes: {{ include "notes-under-test" . | toJson }}\n'
+        )
+        cls.chart = chart
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._tmp.cleanup()
+
+    def notes(self, *args: str) -> str:
+        cmd = [shutil.which("helm"), "template", "t", str(self.chart),
+               "--show-only", "templates/notes-under-test.yaml", *_REQUIRED, *args]
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return yaml.safe_load(proc.stdout)["data"]["notes"]
+
+    def test_tse_on_next_with_the_dispatcher_warns(self):
+        out = self.notes("--set", "platformAgent.mode=next", "--set", "profiles.tse.enabled=true")
+        self.assertIn("profiles.tse.enabled is true on a next install", out)
+        self.assertIn("operator.profileDispatcher.enabled=false", out)
+
+    def test_no_warning_without_the_combination(self):
+        for args in (
+            ["--set", "platformAgent.mode=next"],
+            ["--set", "platformAgent.mode=today", "--set", "profiles.tse.enabled=true"],
+            ["--set", "platformAgent.mode=next", "--set", "profiles.tse.enabled=true",
+             "--set", "operator.profileDispatcher.enabled=false"],
+        ):
+            with self.subTest(args=args):
+                self.assertNotIn("profiles.tse.enabled is true", self.notes(*args))

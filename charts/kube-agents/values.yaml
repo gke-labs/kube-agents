@@ -2037,9 +2037,12 @@ profiles:
       skills, returning either a grounded Root Cause Analysis with a proposed
       GitOps fix or a redacted Google Cloud Support Escalation Bundle.
     persona:
-      # Placeholder image reference required by the AgentProfile CRD schema;
-      # today the gateway scaffolds `tse` from `/opt/tse-template` in the
-      # platform-agent image until the per-profile Job dispatcher lands.
+      # Placeholder image reference required by the AgentProfile CRD schema:
+      # tse has no persona image of its own yet (#3842). On a next install the
+      # profile dispatcher (on by default) gives every bound profile a warm
+      # worker, and tse's crash-loops at its persona step until #3842 ships
+      # one; Kanban to tse still works. Leave tse off there, or switch the
+      # dispatcher off (operator.profileDispatcher.enabled: false).
       image:
         repository: ghcr.io/gke-labs/kube-agents/platform-agent
         tag: "" # defaults to platformAgent.deployment.image.tag or Chart.appVersion
