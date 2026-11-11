@@ -2008,8 +2008,11 @@ class ToolCalledVerifier(BaseVerifier):
         # The harness's NO_WORKER_CALLS_ENTRY says the workers ran and made no
         # call, on a clean capture: grade zero calls instead of an unobservable subject.
         names = {entry.get("name") for entry in entries}
+        # Only the leaves the scorer grades beside the entry (cases.worker_calls_checks):
+        # workers scope, no result pattern, so both transports agree.
         no_worker_calls = (
             self.scope == "workers"
+            and self.result is None
             and worker_trajectory.NO_WORKER_CALLS_ENTRY in names
             and worker_trajectory.GAP_ENTRY not in names
         )

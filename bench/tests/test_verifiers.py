@@ -833,6 +833,15 @@ def test_tool_called_on_the_workers_grades_zero_calls_on_the_no_worker_calls_ent
     finally:
         transcript.clear()
     assert gapped.status == "error"
+    # A result pattern is not graded beside the entry, on either transport (the scorer sets it aside).
+    transcript.set("ok", [{"name": "kanban_create"}, marker], final_message="ok", started_at=1.0)
+    try:
+        with_result = ToolCalledVerifier(
+            type="tool_called", tool_names=["kanban_complete"], scope="workers", result="done"
+        ).verify(5.0)
+    finally:
+        transcript.clear()
+    assert with_result.status == "error"
     # The ``all`` scope reads the router's calls too, which the entry does not speak for.
     transcript.set("ok", [{"name": "kanban_create"}, marker], final_message="ok", started_at=1.0)
     try:
