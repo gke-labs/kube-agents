@@ -172,6 +172,15 @@ def adjudicate(doc, now, prev=None, roster=None):
 # --------------------------------------------------------------------------- #
 
 
+# The top-level keys health.json carried before the issues repository setting
+# (`issues_repo`), frozen: the unset path writes the same document plus that
+# one key. A new key is added here on purpose, with its reader.
+GOLDEN_HEALTH_KEYS = sorted([
+    "advice", "cause", "condition", "dashboard_url", "evidence", "failing_cases", "fixture_holds", "fixture_state", "generated_at", "incident", "issue",
+    "metrics", "near_deadline", "open_conditions", "periodics", "periodics_read", "periodics_runs", "periodics_since", "periodics_streaks",
+    "periodics_superseded", "pool", "pool_state", "recovering", "schema_version", "since", "slow", "stale", "state", "tracking_issues", "vertex_429",
+])
+
 class RepKinds(unittest.TestCase):
     def test_the_harness_phrasings_are_storm_whatever_the_verdict_token(self):
         for reason in (EMPTY_RECORD, NEVER_RAN, RETRIES, "HTTP 429 from the endpoint", "RESOURCE_EXHAUSTED"):
@@ -1158,7 +1167,7 @@ class LostPods(unittest.TestCase):
         doc = self.lost_doc(3)
         outage_issue = {"number": 1300, "url": "https://github.com/gke-labs/kube-agents/issues/1300", "condition": "shared_break"}
         self.assertIsNone(health.adjudicate(doc, T0, None, health.Roster.fixed(ADMITTED), posted={"issue": outage_issue})["issue"])
-        owner_issue = dict(outage_issue, number=1301, condition="lost_pods")
+        owner_issue = dict(outage_issue, number=1301, url="https://github.com/gke-labs/kube-agents/issues/1301", condition="lost_pods")
         cited = health.adjudicate(doc, T0, None, health.Roster.fixed(ADMITTED), posted={"issue": owner_issue})
         self.assertEqual((cited["issue"], cited["tracking_issues"]), (owner_issue, ["#1301"]))
         # An issue from before the key was only ever an outage's: cited for
@@ -2527,8 +2536,13 @@ class Advice(unittest.TestCase):
         posted = {"state": "OUTAGE", "issue": {"number": 1300, "url": "https://github.com/gke-labs/kube-agents/issues/1300"}}
         first = health.adjudicate(doc, T0, None, health.Roster.fixed(ADMITTED), posted=posted)
         self.assertEqual(first["issue"], posted["issue"])
-        self.assertEqual(first["tracking_issues"], ["#1300"])
+        self.assertEqual(first["tracking_issues"], ["#1300"], "this repository's issue, as before the issues repository existed")
         self.assertEqual(first["advice"], "Don't retest yet; the failing cases share a cause. Tracking: #1300")
+        # Golden for the unset path: the document is what it was before the
+        # issues repository setting, plus the one informational key.
+        self.assertEqual(first["issues_repo"], "gke-labs/kube-agents")
+        self.assertEqual(sorted(set(first) - {"issues_repo"}), GOLDEN_HEALTH_KEYS)
+        self.assertEqual(first["issue"], {"number": 1300, "url": "https://github.com/gke-labs/kube-agents/issues/1300"}, "the poster's record, passed through as it was")
         # Carried from the previous health.json while no poster state carries `issues`...
         second = health.adjudicate(doc, T0 + timedelta(minutes=15), first, health.Roster.fixed(ADMITTED), posted={"state": "OUTAGE"})
         self.assertEqual(second["issue"], posted["issue"])
