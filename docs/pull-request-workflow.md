@@ -327,7 +327,8 @@ exception (`make gosec`, below). The per-area targets, for a faster loop while y
   live under `agents/*/defaults/skills/` instead of `agents/*/skills/`.
 - `make -C k8s-operator test` — manifests, generate, fmt, vet, the Python suite under
   `k8s-operator/internal/controller` (the gateway's leader-election wrapper; `make test-python`
-  runs it too), then the envtest download and `go test`; what the `Operator Tests` job runs.
+  runs it too), then the envtest download and `go test`; what the `Operator Tests` job runs
+  after its gosec step, which the target does not include (`make gosec`, below, does).
 - `make test-integration` — the seam tier only, for a component another one talks to across a
   process or protocol boundary. Install a Go toolchain first: the injector seam compiles the real
   Go event-watcher client, and without `go` on `PATH` its tests skip and the run still prints

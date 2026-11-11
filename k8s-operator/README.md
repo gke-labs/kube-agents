@@ -366,7 +366,7 @@ When modifying or deprecating RBAC roles or rolebindings in the operator:
 ## Formatting and CI
 
 `prettier.yml` enforces Markdown and YAML formatting (`**/*.{md,yaml,yml}`) in CI; the local
-targets are under `make help`. The workflows that exercise this directory: `k8s-operator-test.yml` runs `make test`, `docker-publish-ghcr.yml` publishes the manager
+targets are under `make help`. The workflows that exercise this directory: `k8s-operator-test.yml` runs gosec and then `make test`, `docker-publish-ghcr.yml` publishes the manager
 image alongside the agent images, and `e2e-gchat-test.yml` is the end-to-end Google Chat test.
 
 ---
