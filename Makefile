@@ -780,7 +780,9 @@ scale-run: ## Run the harness-scale measurement in SCALE_CONFIG against the targ
 # broken are static -- an unknown domain slug, a fixture role the seeded fleet
 # never planted, a check with no assertion, a case in no TASKS entry -- so they
 # fail here in a second instead. The same rules gate in CI through
-# scripts/test_task_registration.py; this target is the fast path to them.
+# scripts/test_task_registration.py (the tree-level scans, the sanitizer and
+# the run-record guard, as assertions of their own there); this target is the
+# fast path to them.
 bench-case-check: ## Validate every bench task.yaml against the case-format contract (no cluster).
 	@python3 -c "import yaml" 2>/dev/null || { \
 		echo "bench-case-check needs PyYAML: python3 -m pip install pyyaml (or make test-python-deps)"; \
