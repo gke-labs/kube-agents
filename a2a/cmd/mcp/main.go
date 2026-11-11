@@ -24,7 +24,7 @@ const (
 	exitFailure = 1
 
 	envListen       = "MCP_LISTEN"
-	envTokenFile    = "MCP_TOKEN_FILE"
+	envTokenFile    = "MCP_TOKEN_FILE" // #nosec G101 -- an env var name, not a credential
 	envBusURL       = "NATS_URL"
 	envBusUser      = "MCP_BUS_USER"
 	envPasswordFile = "MCP_BUS_PASSWORD_FILE"
@@ -39,7 +39,7 @@ const (
 	envBrokerTokenFile = "A2A_MCP_BROKER_TOKEN_FILE" // #nosec G101 -- an env var name, not a credential
 
 	defaultListen       = ":8089"
-	defaultTokenFile    = "/var/run/secrets/a2a-mcp/token"
+	defaultTokenFile    = "/var/run/secrets/a2a-mcp/token" // #nosec G101 -- a path, not a credential
 	defaultBusUser      = "console-mcp"
 	defaultPasswordFile = "/var/run/secrets/a2a-mcp-bus/console-mcp-password" // #nosec G101 -- a path, not a credential
 
@@ -130,7 +130,7 @@ func configFromEnv(getenv func(string) string) (settings, error) {
 	// keeps its name because nothing reads it into a log or an error; a
 	// log line that names it would refire the alert there.
 	busCredentialPath := or(envPasswordFile, defaultPasswordFile)
-	raw, err := os.ReadFile(busCredentialPath)
+	raw, err := os.ReadFile(busCredentialPath) // #nosec G304 -- the server's own credential mount, from MCP_BUS_PASSWORD_FILE or the default
 	if err != nil {
 		return settings{}, fmt.Errorf("%s: %w", envPasswordFile, err)
 	}
