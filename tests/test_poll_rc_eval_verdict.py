@@ -35,6 +35,10 @@ _spec.loader.exec_module(poller)
 COMMIT = "5b5ad10163cf10c73871b279518c7165c098bec9"
 OTHER_COMMIT = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
 PREFIX = "gs://kube-agents-prow/logs/post-kube-agents-eval-rc/"
+# The lane's archive after it moves to the presubmit lanes' private bucket,
+# which Deck cannot read, so a link to a build there is a Console link.
+PRIVATE_PREFIX = "gs://kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/"
+CONSOLE = "https://console.cloud.google.com/storage/browser/"
 SUMMARY_PATH = poller.ARTIFACTS_DIR + poller.RC_SUMMARY_FILE
 VERDICT_JSON_PATH = poller.ARTIFACTS_DIR + poller.RC_VERDICT_JSON_FILE
 # bench-gate's roll-up of the RED night of 2026-11-04 (Prow build
@@ -589,27 +593,90 @@ class ArtifactParsingTest(unittest.TestCase):
         self.assertIsNone(poller.spyglass_url(None))
         self.assertIsNone(poller.spyglass_url("/local/path"))
 
-    def test_the_default_prefix_is_the_bucket_the_dashboard_reads(self):
+    def test_build_url_is_the_console_for_a_private_bucket_and_spyglass_otherwise(self):
+        """Deck has no read on the private buckets, so a Spyglass link into one
+        answers "Access denied" to everyone; the Console link is the one a
+        project reader can open. The set is scripts/eval_dashboard/links.py's,
+        so the dashboard and the poller agree on which buckets those are."""
+        self.assertEqual(
+            poller.build_url(f"{PREFIX}100/"),
+            "https://oss.gprow.dev/view/gs/kube-agents-prow/logs/post-kube-agents-eval-rc/100",
+        )
+        self.assertEqual(
+            poller.build_url(f"{PRIVATE_PREFIX}100/"),
+            f"{CONSOLE}kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/100",
+        )
+        self.assertIsNone(poller.build_url(None))
+        self.assertIsNone(poller.build_url("/local/path"))
+
+    def test_the_default_prefixes_are_the_archives_the_dashboard_reads(self):
         """A wrong bucket is indistinguishable from a job that never fired.
 
         Both report NEVER_RAN, and the summary for that outcome names the tag
         shape and the `branches` regex -- so a typo here sends every morning
         after it to the wrong repository.
 
-        Pinned against the archive scripts/eval_dashboard/collect.py documents
+        Pinned against the archives scripts/eval_dashboard/collect.py documents
         for the same lane, in its --rc-glob help, which is the closest thing to
-        a structural contract there is on that side: collect.py takes its glob
-        as an argument and holds no bucket constant to compare against, so a
+        a structural contract there is on that side: collect.py takes its globs
+        as arguments and holds no bucket constant to compare against, so a
         weaker assertion here -- these words appear somewhere in that file --
         would be matched by its prose and pin nothing.
+
+        Two of them across the lane's move: the old archive first, so a
+        candidate measured before the move still answers, and the private one
+        the lane logs to afterwards.
         """
         collect = (_REPO_ROOT / "scripts" / "eval_dashboard" / "collect.py").read_text()
         self.assertEqual(
-            poller.DEFAULT_LOGS_PREFIX,
-            "gs://kube-agents-prow/logs/post-kube-agents-eval-rc/",
+            poller.DEFAULT_LOGS_PREFIXES,
+            (
+                "gs://kube-agents-prow/logs/post-kube-agents-eval-rc/",
+                "gs://kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/",
+            ),
         )
-        self.assertTrue(poller.DEFAULT_LOGS_PREFIX.endswith("/"))
-        self.assertIn(poller.DEFAULT_LOGS_PREFIX + "*", collect)
+        for prefix in poller.DEFAULT_LOGS_PREFIXES:
+            with self.subTest(prefix=prefix):
+                self.assertTrue(prefix.endswith("/"))
+                self.assertIn(prefix + "*", collect)
+
+    def test_logs_prefix_values_are_split_on_commas_and_end_in_a_slash(self):
+        """`--logs-prefix a,b` and `--logs-prefix a --logs-prefix b` are the
+        same call, and a caller passing one value keeps working."""
+        self.assertEqual(poller.logs_prefixes(None), list(poller.DEFAULT_LOGS_PREFIXES))
+        self.assertEqual(poller.logs_prefixes([]), list(poller.DEFAULT_LOGS_PREFIXES))
+        self.assertEqual(poller.logs_prefixes(["gs://a/x"]), ["gs://a/x/"])
+        self.assertEqual(
+            poller.logs_prefixes(["gs://a/x/, gs://b/y", "gs://c/z/"]),
+            ["gs://a/x/", "gs://b/y/", "gs://c/z/"],
+        )
+
+
+class ListPrefixesTest(unittest.TestCase):
+    """Two archives read as one listing, and what one failing does to it."""
+
+    def test_the_listings_are_concatenated_and_the_newest_build_wins_across_buckets(self):
+        listings = {PREFIX: f"{PREFIX}100/\n", PRIVATE_PREFIX: f"{PRIVATE_PREFIX}200/"}
+        listing = poller.list_prefixes([PREFIX, PRIVATE_PREFIX], listings.get)
+        self.assertEqual(
+            poller.build_dirs(listing),
+            [("200", f"{PRIVATE_PREFIX}200/"), ("100", f"{PREFIX}100/")],
+        )
+
+    def test_an_absent_prefix_is_empty_not_fatal(self):
+        """The private prefix lists nothing until the first build lands there,
+        and the old one lists nothing once its builds are reaped; neither may
+        stop the poll."""
+        listings = {PREFIX: f"{PREFIX}100/\n"}
+        listing = poller.list_prefixes([PREFIX, PRIVATE_PREFIX], listings.get)
+        self.assertEqual(poller.build_dirs(listing), [("100", f"{PREFIX}100/")])
+        self.assertIsNone(poller.list_prefixes([PREFIX, PRIVATE_PREFIX], lambda prefix: None))
+
+    def test_one_unreadable_prefix_makes_the_listing_unreadable(self):
+        """A listing that silently lost the new bucket would let an older
+        build in the old one answer for the candidate."""
+        listings = {PREFIX: f"{PREFIX}100/\n", PRIVATE_PREFIX: poller.UNREADABLE}
+        self.assertIs(poller.list_prefixes([PREFIX, PRIVATE_PREFIX], listings.get), poller.UNREADABLE)
 
 
 class GcloudStorageResultTest(unittest.TestCase):
@@ -621,7 +688,7 @@ class GcloudStorageResultTest(unittest.TestCase):
             self.stderr = stderr
             self.stdout = ""
 
-    def _run(self, returncode, stderr):
+    def _run(self, returncode, stderr, capture=None):
         class FakeSubprocess:
             OSError = OSError
             TimeoutExpired = subprocess.TimeoutExpired
@@ -633,8 +700,26 @@ class GcloudStorageResultTest(unittest.TestCase):
         real = poller.subprocess
         poller.subprocess = FakeSubprocess
         self.addCleanup(setattr, poller, "subprocess", real)
-        with contextlib.redirect_stderr(io.StringIO()):
+        with contextlib.redirect_stderr(capture if capture is not None else io.StringIO()):
             return poller._gcloud_storage(["cat", f"{PREFIX}100/started.json"])
+
+    def test_an_absence_is_one_note_per_run_and_never_a_warning(self):
+        """One of the two default prefixes lists nothing for the whole
+        transition, and finished.json is absent while a build runs: normal
+        states, noted once, where a warning on every poll would read as a
+        broken lane in the step log."""
+        poller._ABSENCE_NOTED.clear()
+        self.addCleanup(poller._ABSENCE_NOTED.clear)
+        captured = io.StringIO()
+        for _ in range(3):
+            self.assertIsNone(self._run(1, "ERROR: (gcloud.storage.ls) One or more URLs matched no objects.", captured))
+        lines = captured.getvalue().splitlines()
+        self.assertEqual(len(lines), 1, lines)
+        self.assertTrue(lines[0].startswith("note: "), lines[0])
+        self.assertNotIn("warning", captured.getvalue())
+        failed = io.StringIO()
+        self.assertIs(self._run(1, "ERROR: (gcloud.storage.cat) HTTPError 403: Caller lacks permission", failed), poller.UNREADABLE)
+        self.assertTrue(failed.getvalue().startswith("warning: "), failed.getvalue())
 
     def test_gcloud_storages_absence_phrasings_read_as_absent(self):
         for stderr in (
@@ -921,7 +1006,7 @@ class MainTest(unittest.TestCase):
         "0",
     )
 
-    def _run_main(self, builds, argv, expect_exit=False):
+    def _run_main(self, builds, argv, expect_exit=False, gcloud_storage=None):
         import os
         import tempfile
 
@@ -945,7 +1030,7 @@ class MainTest(unittest.TestCase):
             return builds.get(build_id, {}).get(name)
 
         real = poller._gcloud_storage
-        poller._gcloud_storage = fake_gcloud_storage
+        poller._gcloud_storage = gcloud_storage or fake_gcloud_storage
         prior = {k: os.environ.get(k) for k in ("GITHUB_OUTPUT", "GITHUB_STEP_SUMMARY")}
         os.environ["GITHUB_OUTPUT"] = str(out)
         os.environ["GITHUB_STEP_SUMMARY"] = str(summary_file)
@@ -967,6 +1052,58 @@ class MainTest(unittest.TestCase):
                 else:
                     os.environ[key] = value
         return code, out.read_text(), summary_file.read_text()
+
+    def _run_main_over(self, archives, argv):
+        """`_run_main` over several archives: `archives` maps a prefix to its
+        builds, and a prefix mapped to None is absent from the bucket."""
+        def fake_gcloud_storage(args, gcloud="gcloud"):
+            for prefix, builds in archives.items():
+                if args[0] == "ls" and args[1] == prefix:
+                    return None if builds is None else "".join(f"{prefix}{b}/\n" for b in sorted(builds))
+                if args[0] == "cat" and args[1].startswith(prefix):
+                    build_id, _, name = args[1][len(prefix):].partition("/")
+                    return (builds or {}).get(build_id, {}).get(name)
+            return None
+
+        return self._run_main({}, argv, gcloud_storage=fake_gcloud_storage)
+
+    def test_a_build_under_the_private_archive_is_found_and_linked_in_the_console(self):
+        """Across the lane's move the default lists both archives, the old
+        one empty of the candidate here, and the build found under the
+        private one is the build; its link is the Console form, since Deck
+        cannot render it."""
+        code, written, rendered = self._run_main_over(
+            {PREFIX: {"100": build(commit=OTHER_COMMIT)}, PRIVATE_PREFIX: {"200": build()}},
+            ["--commit", COMMIT],
+        )
+        self.assertEqual(code, poller.EXIT_GREEN)
+        self.assertIn("build_id=200", written)
+        self.assertIn(f"log_url={CONSOLE}kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/200", written)
+        self.assertNotIn("oss.gprow.dev", written)
+        self.assertIn(f"[Eval build 200]({CONSOLE}", rendered)
+
+    def test_a_build_under_the_old_archive_still_answers_while_the_private_one_is_empty(self):
+        """Before the first build lands in the private bucket its prefix lists
+        nothing; the candidate measured in the old one keeps its Spyglass link."""
+        code, written, _ = self._run_main_over(
+            {PREFIX: {"100": build(verdict=poller.SUMMARY_RED)}, PRIVATE_PREFIX: None},
+            ["--commit", COMMIT],
+        )
+        self.assertEqual(code, poller.EXIT_RED)
+        self.assertIn("build_id=100", written)
+        self.assertIn("log_url=https://oss.gprow.dev/view/gs/kube-agents-prow/logs/post-kube-agents-eval-rc/100", written)
+
+    def test_logs_prefix_is_repeatable_and_comma_separated(self):
+        """One value, as step 5 would pass it, narrows the poll to that archive;
+        two, either way, read both."""
+        archives = {"gs://a/x/": {"100": build(commit=OTHER_COMMIT)}, "gs://b/y/": {"200": build()}}
+        code, written, _ = self._run_main_over(archives, ["--commit", COMMIT, "--logs-prefix", "gs://a/x"])
+        self.assertEqual(code, poller.EXIT_NEVER_RAN, written)
+        for argv in (["--logs-prefix", "gs://a/x,gs://b/y"], ["--logs-prefix", "gs://a/x", "--logs-prefix", "gs://b/y"]):
+            with self.subTest(argv=argv):
+                code, written, _ = self._run_main_over(archives, ["--commit", COMMIT, *argv])
+                self.assertEqual(code, poller.EXIT_GREEN, written)
+                self.assertIn("build_id=200", written)
 
     def test_a_red_verdict_writes_the_outputs_and_summary_the_workflow_reads(self):
         code, written, rendered = self._run_main(
