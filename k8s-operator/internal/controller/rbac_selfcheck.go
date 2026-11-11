@@ -52,12 +52,14 @@ import (
 // still fail exactly as before; the difference is that the status now names
 // the cause.
 //
-// The probe never runs on the reconcile worker. It is one
+// The probe does not run on the reconcile worker, with one exception. It is one
 // SelfSubjectAccessReview per (verb, resource) — one per tuple in requiredPermissions below — and the
 // PlatformAgent controller has a single worker, so a reconcile that paid for
 // the round trips would stall every agent for their duration. The checker is
 // a manager Runnable that re-probes on its own ticker under a deadline;
-// Reconcile only reads the last answer.
+// Reconcile only reads the last answer. The exception is Observe: the first
+// reconcile of an agent in a namespace the checker has not seen probes once,
+// inline, so that reconcile can write the agent's status (see Observe).
 //
 // SelfSubjectAccessReview needs no grant of its own: every authenticated
 // subject may create one through the bootstrap system:basic-user ClusterRole,
@@ -443,11 +445,16 @@ func NewRBACChecker(reviews authorizationv1client.SelfSubjectAccessReviewInterfa
 }
 
 // Observe tells the checker a PlatformAgent lives in namespace. The first
-// time it hears of a namespace that is not the operator's it probes at once,
-// off the caller's goroutine, so the agent's first failed reconcile is
-// followed within seconds by a status that names the missing RoleBinding
-// rather than by five minutes of a bare `Reconciler error` loop; the ticker
-// covers it from then on.
+// time it hears of a namespace that is not the operator's it probes before it
+// returns, on the caller's goroutine, so the reconcile that called it reads
+// the answer on its next line and writes the status that names the missing
+// Role and RoleBinding in the same pass. A probe left running in the
+// background would hand that reconcile an empty answer; a reconcile that
+// makes no Secret write (the upgrade case, where the kube-proxy TLS Secret
+// already exists) then gets no error backoff and no status for fifteen
+// minutes. This is the one probe that runs on the reconcile worker: once per
+// new namespace, bounded by the checker's timeout; the ticker covers the
+// namespace from then on.
 func (c *RBACChecker) Observe(namespace string) {
 	if c == nil || c.reviews == nil || namespace == "" || namespace == c.namespace {
 		return
@@ -461,11 +468,9 @@ func (c *RBACChecker) Observe(namespace string) {
 	if known {
 		return
 	}
-	go func() {
-		if _, err := c.Probe(context.Background()); err != nil {
-			logf.Log.WithName(rbacProbeLogName).Error(err, "RBAC self-check could not probe a PlatformAgent's namespace; the ticker retries", "namespace", namespace)
-		}
-	}()
+	if _, err := c.Probe(context.Background()); err != nil {
+		logf.Log.WithName(rbacProbeLogName).Error(err, "RBAC self-check could not probe a PlatformAgent's namespace; the ticker retries", "namespace", namespace)
+	}
 }
 
 // Forget drops a namespace Observe added, when its PlatformAgent is deleted,
@@ -518,6 +523,17 @@ func (c *RBACChecker) Probe(ctx context.Context) ([]string, error) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// Forget runs under mu alone, so a namespace can leave agentNamespaces
+	// while this probe is in flight with a snapshot that still names it.
+	// Keep only the denials of namespaces still observed, or the probe would
+	// write the forgotten namespace's denials back over what Forget removed.
+	kept := denied[:0]
+	for _, d := range denied {
+		if _, observed := c.agentNamespaces[d.namespace]; d.namespace == "" || observed {
+			kept = append(kept, d)
+		}
+	}
+	denied = kept
 	if c.probed && !slices.Equal(c.denied, denied) {
 		logf.Log.WithName(rbacProbeLogName).Info("RBAC self-check result changed", "denied", labelsOf(denied))
 	}

@@ -20,8 +20,8 @@ import (
 	"context"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
-	"time"
 
 	authorizationv1 "k8s.io/api/authorization/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -35,10 +35,6 @@ import (
 )
 
 const (
-	// observeProbeWait bounds how long the test waits for Observe's own probe;
-	// the fake authorizer answers in microseconds, so this is generous.
-	observeProbeWait = 5 * time.Second
-	observeProbePoll = 10 * time.Millisecond
 	// concurrentProbes is how many Probe calls the race test runs at once.
 	concurrentProbes = 8
 )
@@ -164,17 +160,13 @@ func TestReconcileReportsAMissingRoleBindingInTheAgentsNamespace(t *testing.T) {
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
 	ctx := context.Background()
 
-	// The first reconcile tells the checker about team-a; Observe probes it
-	// off the worker, so the test probes once more synchronously to stand in
-	// for that goroutine before the pass that reads the answer.
+	// The first reconcile tells the checker about team-a, and the status
+	// has to follow in that same pass: an agent whose reconcile makes no
+	// Secret write (the upgrade case, where the kube-proxy TLS Secret already
+	// exists) gets no error backoff, and the next scheduled pass is fifteen
+	// minutes away. No probe between the two lines, by design of the test.
 	if _, err := r.Reconcile(ctx, req); err != nil {
 		t.Fatalf("first reconcile: %v", err)
-	}
-	if _, err := checker.Probe(ctx); err != nil {
-		t.Fatalf("probe after observe: %v", err)
-	}
-	if _, err := r.Reconcile(ctx, req); err != nil {
-		t.Fatalf("second reconcile: %v", err)
 	}
 
 	stored := &agentv1alpha1.PlatformAgent{}
@@ -213,19 +205,61 @@ func TestReconcileReportsAMissingRoleBindingInTheAgentsNamespace(t *testing.T) {
 	}
 }
 
-// Observe of a new namespace probes without waiting for the ticker: the
-// denial has to arrive on its own, with no Probe call from the test, so the
-// agent's first failed reconcile is followed by a status within seconds.
+// Observe of a new namespace probes before it returns: the reconcile that
+// called it reads DeniedFor on its next line, and a probe still in flight
+// would hand that reconcile an empty answer and a fifteen-minute requeue.
+// No Probe call and no waiting from the test, by design.
 func TestObserveProbesANewNamespaceAtOnce(t *testing.T) {
 	const operatorNamespace = "kubeagents-system"
 	checker := NewRBACChecker(secretsOnlyIn(operatorNamespace).reviews(), operatorNamespace)
 	checker.Observe("team-a")
-	deadline := time.Now().Add(observeProbeWait)
-	for len(checker.DeniedFor("team-a")) == 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("Observe did not probe the new namespace on its own; only the ticker would, up to five minutes later")
+	if got := checker.DeniedFor("team-a"); len(got) == 0 {
+		t.Fatal("Observe returned before the new namespace was probed; the reconcile that called it reads an empty answer")
+	}
+}
+
+// A probe that snapshotted a namespace before Forget removed it must not
+// write that namespace's denials back when it finishes. The authorizer holds
+// the probe open on its first team-a review, Forget runs in the gap, and the
+// stored answer is read after the probe completes.
+func TestAProbeInFlightAcrossForgetDoesNotRestoreTheNamespace(t *testing.T) {
+	const operatorNamespace = "kubeagents-system"
+	gate := make(chan struct{})
+	started := make(chan struct{})
+	var once sync.Once
+	var armed atomic.Bool
+	authorizer := &fakeAuthorizer{deny: func(attrs *authorizationv1.ResourceAttributes) bool {
+		if armed.Load() && attrs.Namespace == "team-a" {
+			once.Do(func() { close(started) })
+			<-gate
 		}
-		time.Sleep(observeProbePoll)
+		return isSecretWrite(attrs) && attrs.Namespace != operatorNamespace
+	}}
+	checker := NewRBACChecker(authorizer.reviews(), operatorNamespace)
+	checker.Observe("team-a")
+	if got := checker.DeniedFor("team-a"); len(got) == 0 {
+		t.Fatal("setup: Observe's probe recorded no team-a denial")
+	}
+
+	armed.Store(true)
+	done := make(chan error, 1)
+	go func() {
+		_, err := checker.Probe(context.Background())
+		done <- err
+	}()
+	<-started // the probe holds a snapshot that names team-a and is mid-flight
+	checker.Forget("team-a")
+	close(gate)
+	if err := <-done; err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if got := checker.DeniedFor("team-a"); len(got) != 0 {
+		t.Errorf("a probe that finished after Forget restored team-a's denials: %v", got)
+	}
+	for _, label := range checker.Denied() {
+		if strings.Contains(label, "(in namespace team-a)") {
+			t.Errorf("Denied() still names the forgotten namespace: %q", label)
+		}
 	}
 }
 
