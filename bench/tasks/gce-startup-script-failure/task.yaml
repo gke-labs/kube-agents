@@ -24,9 +24,9 @@
 # console (`serial_contains`), so a rotated buffer is fixture drift. The case
 # is recorded as infrastructure, not run, once the hourly scan has held the
 # role drifted on its last two scans and the lease-time scan sees it drifted
-# too (bench/kube_agents_bench/fixture_drift.py); otherwise it is graded. The
-# collector names a console with no startup-script run in it in the
-# target's `notes` and files nothing for it.
+# too (bench/kube_agents_bench/fixture_drift.py); otherwise it is graded. On
+# a console without the line the collector finds no failure line and files
+# nothing.
 #
 # Eval-driven development (.agents/rules/eval_driven_development.md): the
 # case was red before the collector fix. The collector knew only the markers
@@ -69,15 +69,10 @@ verification_spec:
   # there: `_shorten_id` clips an id to MAX_FINDING_ID, and the zone in
   # `ComputeInstance/<zone>/<name>` pushes the clip into the name on every pool
   # project. It is graded against the body instead, as `/startup-fail-`: the
-  # body names the VM in other places too, for example the evidence
-  # appendix's serial-read commands, a limitations sentence and the Notes
-  # cell, but always after a space, while only a finding's object path
-  # (`ComputeInstance/<zone>/startup-fail-...`, in its heading and its Where:
-  # line) puts it after a slash. A held row shows that path too, and the
-  # finding_ids block lists held ids, so neither check tells a held finding
-  # from one this run filed. They need this run's finding because each
-  # repetition starts from an empty ledger (hack/ci_reset_audit_ledgers.py),
-  # which holds nothing.
+  # body also names the VM in the evidence appendix's serial-read commands
+  # and in a limitations sentence, but always after a space, while only a
+  # finding's object path (`ComputeInstance/<zone>/startup-fail-...`, in its
+  # heading and its Where: line) puts it after a slash.
   - name: a-startup-script-finding-was-filed
     role: objective
     # assert, not converge: the ledger is written once, at `finish`.

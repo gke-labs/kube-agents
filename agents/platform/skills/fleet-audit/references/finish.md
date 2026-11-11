@@ -82,15 +82,7 @@ search (empty everywhere but on a declaring stream that skipped the step; see
 findings a clean run was refused its close over (empty on every other outcome; see
 [The clean run](clean-run.md#the-clean-run)), and `retired_unlisted` (only when not empty), the ids
 of the previous findings a clean close retired unread because their cluster was in neither scope
-list (see [The clean run](clean-run.md#the-clean-run)). On every status, the line also carries `notes` when a
-target has one: a list of `{target, note}`, each one a sentence from the collector about what a check
-read on that target but could not see. A note is not a coverage gap: `partial` does not count it,
-and it does not change `silent_ok`. Relay each note in your report on every status, and do not report
-the objects it names as clean. The one exception is a scheduled run with `silent_ok: true`: it
-answers `[SILENT]` and does not report the notes in chat, and they stay in the stored report. On
-any other scheduled run the chat relay posts the report `finish` leaves, which lists the notes too. A previous finding on such an object did not go away in this run's
-sight: report it again from the previous finding, because `finish` refuses a `resolved_because`
-entry for it. A `finish` that follows an earlier `finish` of the same
+list (see [The clean run](clean-run.md#the-clean-run)). A `finish` that follows an earlier `finish` of the same
 repository in the run also carries `refinish: true`; when that earlier `finish` wrote the report
 store, `new` and `resolved` count against it. When that earlier `finish` reported news or opened a
 pull request, the line also carries `silent_floor: true`: its `silent_ok` stays `false` and its
@@ -251,7 +243,7 @@ too: its note gives the reason and the fix, and the JSON line carries it under
 does not exist. `silent_ok` decides silence as usual: on a scheduled run, `silent_ok: true` → exactly
 `[SILENT]`. Otherwise, and on every on-demand run (where `silent_ok` is always `false`), your final response is `summary` verbatim. It
 names the most severe findings, one short line each with its cluster and the object it is about,
-counts the rest, and gives the ids held for the collector, the targets' notes, the coverage gaps, and that no GitOps
+counts the rest, and gives the ids held for the collector, the coverage gaps, and that no GitOps
 repository is connected or which repository could not be reached. Do not report the run as
 failed, and do not invent an issue URL.
 
@@ -297,5 +289,5 @@ follows it. A `capabilities` answer that cannot be read keeps the ledger issue.
   the ids they name ([remediation.md](remediation.md)).
 
 **Report.** As for `NO_FORGE`: `silent_ok` decides silence, and otherwise your final response is
-`summary` verbatim. It names the findings, the pull request links, the targets' notes, and why the
-ledger is in the report store. Do not invent an issue URL.
+`summary` verbatim. It names the findings, the pull request links, and why the ledger is in the
+report store. Do not invent an issue URL.

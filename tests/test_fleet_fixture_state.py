@@ -141,7 +141,7 @@ print(json.dumps(value))
 
 # The startup-fail VM's console around a boot, and the same console after
 # three weeks of guest-agent output pushed that boot out of the buffer; both
-# shortened from real reads (the collector's testdata holds the long forms).
+# shortened from real reads of the planted VM.
 _FRESH_SERIAL = (
     "2026-10-07T02:18:03.055302+00:00 startup-fail-seeded google_metadata_script_runner[845]: "
     'Running metadata script runner (version 20260715.00) for "startup" event\n'

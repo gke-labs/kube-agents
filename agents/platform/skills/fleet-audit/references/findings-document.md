@@ -284,10 +284,6 @@ such as a `project/<id>` target, is not checked against it.
 `limitations` is optional, and non-empty when present. The rendered scope table grows a
 `limitations` column only when at least one cluster carries one.
 
-`notes` on a `scope.clusters` entry is optional too. It is not a coverage gap: it says what a check
-read but could not see. When `--manifest-file` is given, for a target the collector marks `collected`,
-`finish` replaces it with the collector's note, or removes it when the collector has none.
-
 **`checks_run` is not optional, and it is what the scope table counts.** Every cluster carries the
 list of checks that ran against it; the table renders it as `7/11`, marked `⚠` where it falls short,
 on every run whether or not anything was missed — a column that only appears on bad days is a column

@@ -128,7 +128,6 @@ Run every script by its full path. A kanban worker starts in its card's workspac
 5. **Report.** On a scheduled run with `silent_ok: true`, the final response is exactly
    `[SILENT]`; a run `precheck` closed is reported from its line the same way. Otherwise report `issue_url` in full and every URL in `prs_opened` and
    `prs_still_open`; on `status: "NO_FORGE"` or `"STORE_LEDGER"` the report is `summary` verbatim.
-   Relay each entry of `notes` on the JSON line, except on a `[SILENT]` run.
    An on-demand run is never silent. Zero findings, `HELD` and `silent_ok`: `references/clean-run.md`.
 
 ## Reference files

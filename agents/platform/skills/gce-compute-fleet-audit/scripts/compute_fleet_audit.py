@@ -63,15 +63,7 @@ Field contracts assumed of `gcloud ... --format=json` output:
   cost the project its other check — but it does subtract from coverage: the
   instances that could not be read are named in the target's `limitations`,
   and a project where *every* RUNNING instance refused the read lists the slug
-  in `checks_unevaluated` rather than reporting a clean fleet. The body is
-  what is left in a ring buffer of about 1 MiB, and the guest prints its
-  startup-script lines once per boot, so a console that holds no line opening
-  a run (`STARTUP_RUN_PATTERN`) on an instance known to run a script is not
-  a clean result. It is not a coverage gap either, because every VM that runs
-  for some weeks reaches that state: the target's `notes` names it
-  (`ROTATED_SERIAL_NOTE`), which `finish` shows and does not count as a gap,
-  and `noted_objects` lists it, so `finish` refuses to resolve a previous
-  finding on it.
+  in `checks_unevaluated` rather than reporting a clean fleet.
 - `compute disks list` items carry `name` and `selfLink`; a snapshot's
   `sourceDisk` appears in the wild in both forms, so both are indexed.
 - `compute snapshots list` items carry `sourceDisk`, `creationTimestamp`
@@ -254,23 +246,9 @@ STARTUP_FAILURE_PATTERN = re.compile(
     r"|startup-script(?:-url)? exit status [1-9]\d*"
     r"|Finished running startup scripts with error"
 )
-# The lines that open one startup-script run. The guest agent on the fleet
-# stack's Debian 12 VM (20260715.00, its 2026-10-07 boot read 2026-11-09) prints
-# `Running metadata script runner (version <v>) for "startup" event`; the
-# older agents print `Starting startup scripts`; and systemd prints `Starting
-# google-startup-scripts.service` before the unit's runner starts, whichever
-# agent runs in it.
-STARTUP_RUN_PATTERN = re.compile(
-    r"Starting startup scripts"
-    r'|Running metadata script runner \(version [^)]*\) for "startup" event'
-    r"|Starting google-startup-scripts\.service"
-)
-# systemd's line, the one start marker the runner does not print. As the last
-# start with no runner output after it, it means the run is in progress
-# (`_run_starts`). The runner tags its lines with its name; older agents
-# tagged them `GCEMetadataScripts`.
-SYSTEMD_START_MARKER = "Starting google-startup-scripts.service"
-RUNNER_OUTPUT_PATTERN = re.compile(r"google_metadata_script_runner|GCEMetadataScripts")
+# What `google_metadata_script_runner` prints as each startup-script run
+# begins, on old and current guest agents alike.
+STARTUP_RUN_MARKER = "Starting startup scripts"
 
 # §2.5's threshold. Measured against the snapshot's own `creationTimestamp`,
 # which is what this collector can see; §2.5 words the condition as the source
@@ -475,32 +453,6 @@ UNREAD_SERIAL_LIMITATION = (
     "enumerated, not examined."
 )
 
-# A console was read, but it holds no line that opens a startup-script run
-# (`STARTUP_RUN_PATTERN`) and no failure line: the boot that ran the script
-# has rotated out of the ring buffer (`startup_run_visible`). That is the
-# ordinary state of any VM that has run for some weeks, so it is neither a
-# limitation nor an unevaluated check: either would be a coverage gap that
-# holds every GCE finding open until someone reboots the VM. It is a note,
-# which `finish` shows on the target and does not count as a gap, so the run
-# never claims these instances were cleared. At most ROTATED_NOTE_NAMES names.
-ROTATED_SERIAL_NOTE = (
-    "gce-startup-script-status: the startup-script status of {count} RUNNING "
-    "instance(s) that run a startup script is not visible. Their serial "
-    "console was read, but the boot that ran the script has rotated out of "
-    "the serial buffer (about 1 MiB), so neither a failure nor a clean run "
-    "could be seen: {names}."
-)
-ROTATED_NOTE_NAMES = 10
-ROTATED_NOTE_MORE = ", and {more} more"
-# The manifest key that holds the target's notes.
-NOTES_KEY = "notes"
-# The manifest key that lists every instance the note covers, with no limit,
-# as `{check, object, command}`, `command` being the instance's own read. `finish` refuses a `resolved_because` for one of
-# them: the audit did not see that finding go away.
-NOTED_OBJECTS_KEY = "noted_objects"
-# An instance's finding identity (`check_startup_script`).
-INSTANCE_OBJECT_FORMAT = "ComputeInstance/{zone}/{name}"
-
 # §2.1's Do-NOT-flag limb is a GKE-node exclusion this collector does not
 # apply, and §2.5's is a legal-hold exclusion it cannot see. `needs_triage` is
 # how a candidate says which judgment it is handing back — it is not read by
@@ -512,9 +464,6 @@ TRIAGE_RETENTION_HOLD = "retention-hold"
 
 # Both GKE node-pool MIG spellings: `gke-` for Standard, `gk3-` for Autopilot.
 GKE_MIG_PREFIXES = ("gke-", "gk3-")
-# A GKE node instance carries its node pool's MIG prefix. §2.1's universe
-# excludes GKE nodes, so a rotated console on one is not noted.
-GKE_INSTANCE_PREFIXES = GKE_MIG_PREFIXES
 
 REDACTED = "[REDACTED]"
 # Serial console output is untrusted text from inside the guest, and §2.1's
@@ -833,11 +782,11 @@ def check_startup_script(instance_name: str, zone: str, serial_text: str) -> dic
     lines = serial_text.splitlines()
     # The console buffer outlives a guest reboot, so a failure an operator has
     # since fixed is still in it. Only the last startup-script run counts.
-    starts = _run_starts(lines)
+    starts = [index for index, line in enumerate(lines) if STARTUP_RUN_MARKER in line]
     for line in lines[starts[-1] if starts else 0 :]:
         if STARTUP_FAILURE_PATTERN.search(line):
             return {
-                "object": INSTANCE_OBJECT_FORMAT.format(zone=zone, name=instance_name),
+                "object": f"ComputeInstance/{zone}/{instance_name}",
                 "excerpt": redact(line.strip()),
                 "impact": (
                     f"Instance {instance_name} failed initialization and may be in a "
@@ -846,38 +795,6 @@ def check_startup_script(instance_name: str, zone: str, serial_text: str) -> dic
                 "needs_triage": TRIAGE_GKE_NODE,
             }
     return None
-
-
-def startup_run_visible(serial_text: str) -> bool:
-    """Does the console still hold the start of a startup-script run?
-
-    `get-serial-port-output` returns what is left in a ring buffer of about
-    1 MiB, and the guest prints its startup-script lines once, at boot. A VM
-    that logs every few minutes pushes them out: the fleet's planted VM, which
-    prints two guest-agent errors an hour because it has no service account,
-    lost its boot lines about three weeks after it booted. A console with no
-    run marker and no failure line is therefore no evidence of a clean run.
-    The caller lists such an instance as passed over, not cleared.
-    """
-    return bool(_run_starts(serial_text.splitlines()))
-
-
-def _run_starts(lines: list[str]) -> list[int]:
-    """The indices of the lines that open a startup-script run.
-
-    Less a last start that is systemd's line with no runner output after it:
-    a read in the boot window, after systemd starts the unit and before the
-    runner prints, holds no run yet, so it is not the visible run. The
-    previous run counts instead.
-    """
-    starts = [index for index, line in enumerate(lines) if STARTUP_RUN_PATTERN.search(line)]
-    if (
-        starts
-        and SYSTEMD_START_MARKER in lines[starts[-1]]
-        and not any(RUNNER_OUTPUT_PATTERN.search(line) for line in lines[starts[-1] + 1 :])
-    ):
-        starts.pop()
-    return starts
 
 
 def _metadata_keys(payload: dict, field: str) -> set[str]:
@@ -1262,11 +1179,6 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
     not_applicable: list[dict] = []
     unevaluated: list[dict] = []
     limitations: list[str] = []
-    # Information for the reader that is not a coverage gap
-    # (ROTATED_SERIAL_NOTE); the manifest's `notes`.
-    notes: list[str] = []
-    # The objects the notes cover (NOTED_OBJECTS_KEY).
-    noted_objects: list[dict] = []
 
     def gated(argv: list[str], slug: str) -> list:
         parsed, result = run_and_gate(argv, run=run)
@@ -1327,16 +1239,7 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
             if project_wide
             else running_instances(instances, require_startup_script=True)
         )
-        scripted = set(running_instances(instances, require_startup_script=True))
-        # The instances a script is known to run on: its own metadata sets
-        # one, or the common metadata read succeeded and sets one. Only on
-        # these does a console with no run marker mean the run rotated out.
-        # The fallback after a failed `project-info` read also reads consoles
-        # with no script behind them, where no marker is the expected shape.
-        common_script = isinstance(info_parsed, dict) and project_wide
         unread: list[str] = []
-        rotated: list[str] = []
-        rotated_objects: list[tuple[str, str]] = []
         for instance_name, zone in targets:
             argv = _serial_argv(instance_name, zone, project)
             result = run(argv)
@@ -1351,18 +1254,6 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
             reads.setdefault(STARTUP_SLUG, SlugReads()).add(shlex.join(argv), result)
             if hit:
                 candidates.append(_emit(STARTUP_SLUG, hit, shlex.join(argv)))
-            elif (
-                (common_script or (instance_name, zone) in scripted)
-                and not instance_name.startswith(GKE_INSTANCE_PREFIXES)
-                and not startup_run_visible(result.stdout)
-            ):
-                # The console was read, but the boot that ran the script is
-                # no longer in it. No failure line here proves nothing, so the
-                # note below says so; GKE nodes are outside §2.1's universe.
-                rotated.append(f"{instance_name} ({zone})")
-                rotated_objects.append(
-                    (INSTANCE_OBJECT_FORMAT.format(zone=zone, name=instance_name), shlex.join(argv))
-                )
 
         if not instances:
             not_applicable.append(
@@ -1401,18 +1292,6 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
                     names=", ".join(sorted(unread)),
                 )
             )
-        if rotated:
-            shown = sorted(rotated)[:ROTATED_NOTE_NAMES]
-            names = ", ".join(shown)
-            if len(rotated) > len(shown):
-                names += ROTATED_NOTE_MORE.format(more=len(rotated) - len(shown))
-            notes.append(ROTATED_SERIAL_NOTE.format(count=len(rotated), names=names))
-            # Each with its own read: the slug's joined `commands` record can
-            # be clipped before this instance's read.
-            noted_objects += [
-                {"check": STARTUP_SLUG, "object": obj, "command": command}
-                for obj, command in sorted(rotated_objects)
-            ]
 
         # --- 2.2 MIG convergence -------------------------------------------- #
         migs = gated(
@@ -1560,10 +1439,6 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
         entry["checks_unevaluated"] = unevaluated
     if limitations:
         entry["limitations"] = "; ".join(limitations)
-    if notes:
-        entry[NOTES_KEY] = "; ".join(notes)
-    if noted_objects:
-        entry[NOTED_OBJECTS_KEY] = noted_objects
     return entry
 
 

@@ -102,8 +102,6 @@ is `started_at`: `finish` reads it only to give the `collect_s` timer, and no de
 | `clusters[].commands[]`                    | **read**         | One record per check per target: the check slug, the literal command, its exit code. `rc == 0` is what makes a check "run" for the rules below. `duration_s` and `output_sha256` are carried, not read.                                                                                                                                                                                                                                                                                    |
 | `clusters[].checks_not_applicable[]`       | **read**         | Checks the collector itself dispositioned as having nothing to run against on this target. The collector is the authority on applicability; §3.1 holds the document to it in both directions.                                                                                                                                                                                                                                                                                              |
 | `clusters[].checks_unevaluated[]`          | **read**         | `{check, reason}` for a check whose own read failed or whose inputs could not decide it on this target, so it neither ran nor was found inapplicable. The document may list it in neither `checks_run` nor `checks_not_applicable`, and must carry `limitations` on that target, which makes the run partial.                                                                                                                                                                              |
-| `clusters[].notes`                         | **read**         | A sentence for the reader about what a check read on this target but could not see, which is not a coverage gap: the GCE collector's rotated serial consoles, the state a VM that logs often reaches within weeks. `finish` copies it onto the document's target of the same name, puts it under `notes` on its JSON line on every status, and shows it in the ledger's scope table and in the clean and held comments; `coverage_gaps` never reads it.                                    |
-| `clusters[].noted_objects[]`               | **read**         | `{check, object}` (and `namespace` where the check has one, and optionally `command`, the object's own read, which a held row shows) for each object that the target's `notes` names, with no limit on the count. `finish` refuses a `resolved_because` entry for one of them, because the run did not see that finding go away; the worker carries the finding forward instead.                                                                                                           |
 | `clusters[].clusters_listed`               | **read**         | `0` on a `project/<id>` entry whose `clusters list` completed and came back empty, or was refused by that project's own disabled Kubernetes Engine API. Copied verbatim onto that `scope.clusters` entry, it lifts the gap for enumerating no cluster (§5); absent on a failed, zone-incomplete or unreached list.                                                                                                                                                                         |
 | `clusters[].candidates[]`                  | **read**         | What the collector would flag: `(check, namespace, object)` plus `excerpt` and `impact`. `cluster` is optional and defaults to the enclosing entry's `name`. `command`, `impact_authoritative` and `needs_triage` are optional and read in §3. `severity` is read only by the `major` sweep (§3.4); the stream's SOP says if the model copies it or re-judges it from fleet context.                                                                                                       |
 | `clusters[].kcc_unready`, `.kcc_unread`    | **read**         | Config Connector on that cluster: `kcc_unready` lists the objects it does not apply, `kcc_unread` says why the read gave no answer (unknown, never healthy), and `kcc_kinds_read` names the kinds a partial read listed. `cluster_status` (read) skips a cluster that is not running; `config_connector_addon` (carried) orders the reads. The paragraph below the table has the rules.                                                                                                    |
@@ -324,13 +322,6 @@ collector_ and says what releases it — the collector no longer emitting it, or
 This is a hold, not a rejection: the model is allowed to reject a candidate as a false positive, so
 a dropped candidate cannot be refused the way a dropped cluster is.
 
-A noted object (`clusters[].noted_objects`, a check the collector ran but whose result it could not
-see) is held the same way, but only where the previous ledger carries a finding on it: the run
-cannot see that finding go away. A noted object that no previous finding names holds nothing, and a
-dry run, which reads no ledger, previews none. The held rows, the held comment, the `/remediate`
-deferral and the no-forge summary say that the collector could not see the result, not that it
-still flags the object; the held comment marks such a finding _not visible to the collector_.
-
 The ledger body is the persistence: `previous_ids` is parsed out of the hidden marker of the body
 the previous run published — the copy the report store kept
 ([report store design](fleet-audit-report-store.md)), not the issue fetched back from GitHub, except
@@ -341,8 +332,7 @@ longer named the finding, and a clean run closed the ledger over it with its pul
 the held set for a run is defined on the marker: the previous body's marker ids ∩ `still_flagged_ids`,
 less the ids the document carries. The identity of each held entry — check, cluster, namespace,
 object, and the command that produced it — comes from the manifest candidate that still emits it,
-which is what the collector vouches for, or for a noted object from its `noted_objects` entry, with
-the object's own read as the command; the title is the previous body's where its heading
+which is what the collector vouches for; the title is the previous body's where its heading
 survived and is otherwise built from the check and the object. That set drives the `HELD` merge on
 a clean run, the exclusion from `resolved`, and the carried rows on a findings run.
 
@@ -509,9 +499,6 @@ Sets that withhold auto-promotion and nothing else. An explicit `/remediate <id>
   it could not measure. Named in its own paragraph, worded differently from the one above because
   the two say opposite things about the collector, each row followed by the marker and the
   consequence it stands for (`TRIAGE_REASONS`).
-- **Noted:** a finding on an object in a target's `noted_objects` is not auto-promoted and is not
-  uncorroborated, because the collector read the object but could not see the result. It is in no
-  sweep block; an explicit `/remediate` still opens it.
 
 The severity floor reads the manifest too. A finding is held to `AUTO_PROMOTION_FLOOR` (`major`)
 only when its check is in `MAJOR_SWEEP_CHECKS` and a candidate graded at least `major` stands behind
@@ -550,8 +537,7 @@ no sweep. Every id on the line, `unpublished_candidates[].id` included, is the l
 (`published_id`: derived, then clipped at `MAX_FINDING_ID`).
 
 They are absent, not empty, on a run without the flag, so the line a stream without a collector
-prints is unchanged. A run whose targets carry `notes` (adopted from the manifest, §2) also has
-`notes`, a list of `{target, note}`, on every status. A run that `precheck` closed (§3.7) carries one more, `precheck: "unchanged"`;
+prints is unchanged. A run that `precheck` closed (§3.7) carries one more, `precheck: "unchanged"`;
 a `finish` a worker ran never does.
 
 ### 3.7 The precheck — `manifest_delta`, `precheck`
@@ -575,7 +561,7 @@ says which arm fired (§3.2), and on `single-zone-nodepool`, `public-control-pla
 be closed with the previous arm's title and remediation under this arm's sentence.
 Everything else is in it — every cluster's `outcome`, candidates by identity, severity and their
 route and triage fields,
-`checks_not_applicable`, `checks_unevaluated`, `limitations`, `notes`, `noted_objects`, `clusters_listed`, the Config
+`checks_not_applicable`, `checks_unevaluated`, `limitations`, `clusters_listed`, the Config
 Connector keys, and the top-level `checks_revision`, so a new collector build is a changed fleet — as a
 drop-list rather than a keep-list, so a key a collector adds later counts as a change until this
 module names it volatile. Cluster and command order do not count. `manifest_delta.should_run_llm_synthesis(audit_id,

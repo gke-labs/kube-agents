@@ -10,8 +10,7 @@ to put in a diff otherwise. Three paths lead there:
 - **Auto-promotion.** A finding graded `critical` — or `major` on one of the checks in
   `MAJOR_SWEEP_CHECKS` (`no-pdb`, `unbound-sa-automount`, `ccc-no-ondemand-floor`) where the
   collector's candidate is at least `major` — that is a `manifest`, has no live pull request on its branch — and, on a run that passed
-  `--manifest-file`, is neither uncorroborated nor triage-marked by the collector nor on an object in
-  a target's `noted_objects` — is promoted
+  `--manifest-file`, is neither uncorroborated nor triage-marked by the collector — is promoted
   automatically by `finish` — **at most five per run** — unless the install's
   `KUBEAGENTS_AUDIT_AUTO_PROMOTE` switch is `false`, when `finish` opens only what `/remediate` named. Every other `major` finding is held to the `critical` floor:
   a SOP's grade says how bad the finding is, not whether its fix is safe to open unasked. The collector marks a fix that scales a controller to zero, writes a
@@ -19,9 +18,7 @@ to put in a diff otherwise. Three paths lead there:
   `major` to the Autopilot bump, turns off a namespace's default ServiceAccount token, rewrites
   or deletes a Service, or enforces spreading; the ledger names each with its marker and reason.
   The surplus is named in the ledger as awaiting `/remediate`, and so is every manifest finding
-  the floor passed over, as below the floor. A finding on a noted object is the one exception: it
-  is in no block, because the collector could not see its result; the ledger shows it in the
-  findings table, and `/remediate` still opens it. "Live" excludes a pull
+  the floor passed over, as below the floor, so nothing is silently dropped. "Live" excludes a pull
   request the harness itself closed as stale (that one is re-openable) and includes one a human
   closed or merged (those are not).
 - **`/remediate <finding-id>`**, or `/remediate all`, commented on the ledger by someone with write
@@ -61,10 +58,7 @@ Every `/remediate` gets exactly one answer, and the answer is never silence:
   never carried is named only on
   the run's JSON line as an unpublished candidate; and an id under _Not re-checked this run_ is
   held until a run checks its target, and the reply says the run did not read or did not check
-  that target. An id the collector still flags gets the collector's wording. An id held because a
-  target's `noted_objects` names it gets its own wording: the collector ran the check but could not
-  see the result, so the run cannot see the finding go away, and the id is held until the collector
-  can see the object again. Either way there is no finding to open a pull
+  that target. An id the collector still flags gets the collector's wording. Either way there is no finding to open a pull
   request from — on the findings branch and on the clean branch alike, since "no longer reproduces"
   would be false there. A run whose report store has no trusted record of the open ledger and that passed no manifest cannot
   know which ids are held, so it answers no `/remediate` at all; the next run with a trusted record answers
@@ -153,8 +147,7 @@ Exit 2 means nothing was published, unless the line is `BROKER UNAVAILABLE`: the
 opened before the broker went stands, and re-running the same `remediate` once it answers adopts it
 and opens the rest. Otherwise read the message before reporting why: a named id is not in
 the document at all; a named id is held by the collector (given the same `--manifest-file` `finish`
-had, the message says so instead of "not in the document", and for a noted object it says that the
-collector could not see the result); a named target is not a `manifest`; or
+had, the message says so instead of "not in the document"); a named target is not a `manifest`; or
 _every_ named target was refused because its file is not readable inside the workspace or its budget
 could not be written. The first three are fixed by dropping the bad id and asking again, except a
 `no-pdb` finding named without `--manifest-file`, where the message says to pass it; the last is

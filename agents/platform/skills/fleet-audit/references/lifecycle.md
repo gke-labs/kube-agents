@@ -295,7 +295,7 @@ cannot make: write them, and `finish` has nothing else to reject.
 runs after the collector command and before the drafting by hand, where the SOP puts it (two
 SOPs' collector command writes the `draft` itself; the step still follows it). It digests what the
 manifest says about the fleet (every cluster's outcome, its checks and their exit codes, its
-candidates by identity and severity, its limitations, `notes` and `noted_objects` (with each object's read command, a string that does not change from run to run), `checks_not_applicable`,
+candidates by identity and severity, its limitations, `checks_not_applicable`,
 `checks_unevaluated` and the collector's `checks_revision`; not its timestamps, durations, output
 hashes, command strings, or a candidate's excerpt and impact text, which carry ages and counts and
 which `finish` takes from the fresh manifest on a close, except an impact the collector marks
@@ -318,8 +318,7 @@ document to `findings_path`, with each remediation's note as the worker wrote it
 notes, without the previous run's search record and with each `declared[]` entry's declaration as
 this run's `start` filed it, and runs `finish --scheduled` on it with this run's manifest, so the cross-check,
 the ledger comparison and `silent_ok` are `finish`'s own: the line is then `finish`'s, plus
-`precheck: unchanged`, and the run is over. Relay its `notes`, when it has them, as
-[`finish`](finish.md) says. In every other case the line says `closed: false` and
+`precheck: unchanged`, and the run is over. In every other case the line says `closed: false` and
 why, the findings file is as it was, and the SOP continues; a close that dies puts the file back
 too, and the run's in-flight note stays until the SOP's own `finish`. Without the flag it never
 closes a run: an on-demand run is answered by the person who asked for it, in full.

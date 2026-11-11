@@ -15086,75 +15086,6 @@ class TestCoverageGaps(unittest.TestCase):
     def test_a_complete_run_has_no_gaps(self):
         self.assertEqual(audit_report.coverage_gaps(make_doc()), [])
 
-    def test_a_note_is_never_a_gap(self):
-        """`notes` says what a check read but could not see on a target whose
-        checks all ran: the GCE collector's rotated serial consoles, the state
-        of every VM that has run for some weeks. Counted as a gap, it would
-        hold a healthy stream's ledger open for good."""
-        doc = make_doc(
-            clusters=[
-                {
-                    "name": "prod-us-east",
-                    "location": "us-east1",
-                    "project": "acme-prod",
-                    "notes": "startup-script status of 1 instance(s) is not visible: web-1",
-                }
-            ]
-        )
-        self.assertEqual(audit_report.coverage_gaps(doc), [])
-        self.assertEqual(
-            audit_report.scope_notes(doc),
-            ["prod-us-east: startup-script status of 1 instance(s) is not visible: web-1"],
-        )
-
-    def test_a_note_must_be_a_string(self):
-        doc = make_doc(clusters=[{"name": "prod-us-east", "location": "us-east1", "project": "acme-prod", "notes": ["x"]}])
-        with self.assertRaisesRegex(audit_report.ValidationError, "notes"):
-            audit_report.validate_findings(doc, AUDIT)
-
-    def test_notes_are_adopted_from_collected_manifest_targets_only(self):
-        doc = make_doc(
-            clusters=[
-                {"name": "a", "location": "l", "project": "p", "notes": "the model's draft"},
-                {"name": "b", "location": "l", "project": "p"},
-            ]
-        )
-        manifest = {
-            "clusters": [
-                {"name": "a", "outcome": audit_report.MANIFEST_OUTCOME_COLLECTED, "notes": "the collector's note"},
-                {"name": "b", "outcome": "gate-failed", "notes": "not adopted"},
-            ]
-        }
-        self.assertEqual(audit_report.adopt_collector_notes(doc, manifest), ["a"])
-        clusters = {c["name"]: c for c in doc["scope"]["clusters"]}
-        self.assertEqual(clusters["a"]["notes"], "the collector's note")
-        self.assertNotIn("notes", clusters["b"])
-        self.assertEqual(audit_report.adopt_collector_notes(doc, None), [])
-
-    def test_a_stale_note_is_cleared_when_the_collector_has_none(self):
-        """A precheck replays a stored document, so its note can be from an
-        earlier collection. A collected target with no note in this manifest
-        loses it; a target with no collected entry keeps its own."""
-        doc = make_doc(
-            clusters=[
-                {"name": "a", "location": "l", "project": "p", "notes": "an earlier collection's note"},
-                {"name": "b", "location": "l", "project": "p", "notes": "kept: gate-failed"},
-                {"name": "c", "location": "l", "project": "p", "notes": "kept: no entry"},
-            ]
-        )
-        manifest = {
-            "clusters": [
-                {"name": "a", "outcome": audit_report.MANIFEST_OUTCOME_COLLECTED},
-                {"name": "b", "outcome": "gate-failed"},
-            ]
-        }
-        self.assertEqual(audit_report.adopt_collector_notes(doc, manifest), ["a"])
-        clusters = {c["name"]: c for c in doc["scope"]["clusters"]}
-        self.assertNotIn("notes", clusters["a"])
-        self.assertEqual(clusters["b"]["notes"], "kept: gate-failed")
-        self.assertEqual(clusters["c"]["notes"], "kept: no entry")
-        self.assertEqual(audit_report.scope_notes(doc), ["b: kept: gate-failed", "c: kept: no entry"])
-
     def test_an_unrun_check_is_a_gap_even_with_no_limitations(self):
         """The gap prose cannot catch a run that never admits to one."""
         gaps = audit_report.coverage_gaps(
@@ -26427,312 +26358,6 @@ class TestCollectorStreamsRequireAManifest(HarnessTestCase):
         self.assertEqual(rc, 0, self.err)
 
 
-# A target's note, as the GCE collector writes one when a serial console
-# has rotated past the last startup-script run.
-ROTATED_NOTE = "netpol-missing: the status of 1 object is not visible: Namespace/a."
-# The noted object's own read, as the collector records it on the entry.
-NOTED_READ = "kubectl --context prod-us-east get networkpolicy -n payments -o json"
-
-
-class TestScopeNotesReachTheReader(HarnessTestCase):
-    """A collector's `notes` on a target reaches the worker on every status,
-    and a previous finding on a noted object cannot be written as resolved."""
-
-    def manifest_file(self, manifest):
-        path = self.tmp_path / "manifest.json"
-        path.write_text(json.dumps(manifest), encoding="utf-8")
-        return str(path)
-
-    def noted_manifest(self, noted_objects=True):
-        manifest = _full_manifest()
-        manifest["clusters"][0]["notes"] = ROTATED_NOTE
-        if noted_objects:
-            manifest["clusters"][0][audit_report.NOTED_OBJECTS_KEY] = [
-                {"check": "netpol-missing", "namespace": "payments", "object": "Namespace/a", "command": NOTED_READ}
-            ]
-        return manifest
-
-    def previous_a(self):
-        """An open ledger whose last body carried finding `a`."""
-        previous_body = published_body(make_doc(findings=[make_finding(fid="a", title="Alpha finding")]), generated_at=NOW)
-        self.harness.replies = {
-            "issue-list": self.issue_list(),
-            "issue-view !comments": issue_view({"body": previous_body}),
-        }
-        return previous_body
-
-    def test_a_clean_run_with_no_ledger_carries_the_notes_on_its_line(self):
-        """No issue is opened, closed or commented on, so the JSON line is
-        the only place the note can reach anyone."""
-        self.harness.replies = {"issue-list": issues_view([])}
-        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(self.noted_manifest())])
-        self.assertEqual(rc, 0, self.err)
-        payload = self.stdout_json()
-        self.assertEqual(payload["status"], "CLEAN")
-        self.assertEqual(payload["notes"], [{"target": "prod-us-east", "note": ROTATED_NOTE}])
-        self.assertEqual(payload["coverage_gaps"], [])
-
-    def test_a_findings_run_carries_the_notes_on_its_line(self):
-        self.harness.replies = {"issue-list": issues_view([]), "issue-create": created("issue", "https://github.com/acme/fleet/issues/7")}
-        self.touch("clusters/prod-us-east/payments-netpol.yaml")
-        rc = self.run_finish(make_doc(), ["--manifest-file", self.manifest_file(self.noted_manifest())])
-        self.assertEqual(rc, 0, self.err)
-        payload = self.stdout_json()
-        self.assertEqual(payload["status"], "OPENED")
-        self.assertEqual(payload["notes"], [{"target": "prod-us-east", "note": ROTATED_NOTE}])
-
-    def test_the_short_held_note_does_not_claim_a_candidate_for_a_noted_entry(self):
-        entry = {"id": "x", "title": "t", "check": "c", "cluster": "k", "namespace": "", "object": "o", "commands": ["cmd"], audit_report.NOTED_HELD_KEY: True}
-        text = "\n".join(audit_report._render_held_note([entry]))
-        self.assertIn("For 1 of them the collector does not flag the object", text)
-        self.assertNotIn("still emits a candidate", text)
-
-    def test_a_dry_run_previews_no_noted_object_as_held(self):
-        """The dry run reads no ledger, so it cannot know that a noted object
-        is carried; it does not preview one as still flagged."""
-        self.harness.replies = {"issue-list": issues_view([])}
-        self.touch("clusters/prod-us-east/payments-netpol.yaml")
-        doc = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
-        rc = self.run_finish(doc, ["--dry-run", "--manifest-file", self.manifest_file(self.noted_manifest())])
-        self.assertEqual(rc, 0, self.err)
-        self.assertNotIn(derived_id(fid="a"), self.out)
-
-    def test_a_run_without_notes_prints_no_notes_key(self):
-        self.harness.replies = {"issue-list": issues_view([])}
-        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(_full_manifest())])
-        self.assertEqual(rc, 0, self.err)
-        self.assertNotIn("notes", self.stdout_json())
-
-    def test_the_held_comment_does_not_call_a_noted_object_flagged(self):
-        self.previous_a()
-        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(self.noted_manifest())])
-        self.assertEqual(rc, 0, self.err)
-        self.assertEqual(self.stdout_json()["status"], "HELD")
-        comment = self.harness.bodies_for("issue-comment")[-1]
-        self.assertIn("_not visible to the collector_", comment)
-        self.assertIn("1 of these the collector does not flag", comment)
-        self.assertNotIn("still flagged by the collector", comment)
-        self.assertNotIn("the collector itself still flags", comment)
-        self.assertIn(f"NOT VISIBLE: {derived_id(fid='a')}", self.err)
-        self.assertNotIn("STILL FLAGGED:", self.err)
-
-    def test_a_remediate_on_a_noted_object_gets_its_own_reason(self):
-        self.previous_a()
-        target = derived_id(fid="a")
-        self.harness.replies["*-view comments"] = comments_view({"comments": [comment(f"/remediate {target}")]})
-        self.touch("clusters/prod-us-east/payments-netpol.yaml")
-        doc = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
-        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(self.noted_manifest())])
-        self.assertEqual(rc, 0, self.err)
-        answers = [b for b in self.harness.bodies_for("issue-comment") if target in b]
-        self.assertTrue(answers)
-        self.assertIn("could not see the result", answers[-1])
-        self.assertNotIn("still emits a candidate", answers[-1])
-
-    def test_the_held_comment_and_line_show_the_notes(self):
-        self.previous_a()
-        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(self.noted_manifest(noted_objects=False))])
-        self.assertEqual(rc, 0, self.err)
-        payload = self.stdout_json()
-        self.assertEqual(payload["status"], "HELD")
-        self.assertEqual(payload["notes"], [{"target": "prod-us-east", "note": ROTATED_NOTE}])
-        comment = self.harness.bodies_for("issue-comment")[-1]
-        self.assertIn("Read but not visible, which is not a coverage gap (1)", comment)
-        self.assertIn(f"prod-us-east: {ROTATED_NOTE}", comment)
-
-    def test_a_resolve_on_a_noted_object_is_refused(self):
-        """The collector could not see `a`, so the run did not see it go
-        away; the worker carries it forward instead."""
-        previous_body = self.previous_a()
-        doc = make_doc(findings=[])
-        doc["resolved_because"] = resolved_for(previous_body)
-        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(self.noted_manifest())])
-        self.assertEqual(rc, 2)
-        self.assertIn("resolved_because[0]", self.err)
-        self.assertIn("Carry it forward", self.err)
-        self.assertEqual(self.harness.forge_calls("issue-close"), [])
-        # The preview refuses it too.
-        rc = self.run_finish(doc, ["--dry-run", "--manifest-file", self.manifest_file(self.noted_manifest())])
-        self.assertEqual(rc, 2)
-        self.assertIn("Carry it forward", self.err)
-
-    def test_a_resolve_on_an_object_no_note_names_closes(self):
-        previous_body = self.previous_a()
-        doc = make_doc(findings=[])
-        doc["resolved_because"] = resolved_for(previous_body)
-        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(self.noted_manifest(noted_objects=False))])
-        self.assertEqual(rc, 0, self.err)
-        self.assertEqual(self.stdout_json()["status"], "CLEAN")
-
-    def test_a_carried_finding_on_a_noted_object_publishes(self):
-        """Reported again, the finding stays on the ledger."""
-        self.previous_a()
-        self.touch("clusters/prod-us-east/payments-netpol.yaml")
-        doc = make_doc(findings=[make_finding(fid="a", title="Alpha finding")])
-        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(self.noted_manifest())])
-        self.assertEqual(rc, 0, self.err)
-        payload = self.stdout_json()
-        self.assertEqual((payload["status"], payload["new"], payload["resolved"]), ("UPDATED", 0, 0))
-
-
-    def run_omitting_a(self, noted_objects):
-        """A run that reports `b` and omits the previous `a`, which a pull
-        request carries. Returns the JSON line."""
-        self.harness = Recorder()
-        self.harness.listed_body = self.stored_ledger_body
-        self.patch_attr("run_cmd", self.harness)
-        previous_body = published_body(
-            make_doc(findings=[make_finding(fid="a", title="Alpha finding"), make_finding(fid="b", title="Bravo finding")]),
-            generated_at=NOW,
-        )
-        self.harness.replies = {
-            "issue-list": self.issue_list(),
-            "issue-view !comments": issue_view({"body": previous_body}),
-            "proposal-list": proposals_view(
-                [pr(8, "platform-agent/fix-a", body=audit_report.delta_block([derived_id(fid="a")]))]
-            ),
-        }
-        self.touch("clusters/prod-us-east/payments-netpol.yaml")
-        doc = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
-        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(self.noted_manifest(noted_objects))])
-        self.assertEqual(rc, 0, self.err)
-        return self.stdout_json()
-
-    def test_a_carried_noted_finding_is_not_uncorroborated_and_not_swept(self):
-        """The collector read the object but could not see it, so it did not
-        pass it: the finding is not uncorroborated. Nothing this run backs an
-        unattended fix either, so the sweep opens none."""
-        self.previous_a()
-        self.touch("clusters/prod-us-east/payments-netpol.yaml")
-        doc = make_doc(findings=[make_finding(fid="a", title="Alpha finding")])
-        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(self.noted_manifest())])
-        self.assertEqual(rc, 0, self.err)
-        payload = self.stdout_json()
-        self.assertNotIn(derived_id(fid="a"), payload["uncorroborated_findings"])
-        self.assertEqual(payload["prs_opened"], [])
-        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
-
-    def chat_report_text(self):
-        record = json.loads(Path(audit_report.chat_report_path_for(AUDIT)).read_text(encoding="utf-8"))
-        return "\n".join(str(part.get("text") or "") for part in record["parts"])
-
-    def test_the_chat_report_carries_the_notes_with_the_ledger_line_last(self):
-        """The relay posts this report on a scheduled run, not the model's
-        message, so the notes have to be in it."""
-        self.harness.replies = {"issue-list": issues_view([]), "issue-create": created("issue", "https://github.com/acme/fleet/issues/7")}
-        self.touch("clusters/prod-us-east/payments-netpol.yaml")
-        rc = self.run_finish(make_doc(), ["--manifest-file", self.manifest_file(self.noted_manifest())])
-        self.assertEqual(rc, 0, self.err)
-        lines = self.chat_report_text().splitlines()
-        self.assertIn(f"- {audit_report.NOTES_LEAD}: prod-us-east: {ROTATED_NOTE}", lines)
-        self.assertIn("issues/7", lines[-1])
-
-    def test_a_clean_chat_report_with_no_ledger_carries_the_notes(self):
-        self.harness.replies = {"issue-list": issues_view([])}
-        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(self.noted_manifest())])
-        self.assertEqual(rc, 0, self.err)
-        self.assertIn(f"- {audit_report.NOTES_LEAD}: prod-us-east: {ROTATED_NOTE}", self.chat_report_text())
-
-    def test_a_carried_noted_finding_owes_no_remediation_file(self):
-        """The sweep will not open it, so `finish` does not demand its file."""
-        self.previous_a()
-        doc = make_doc(findings=[make_finding(fid="a", title="Alpha finding")])
-        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(self.noted_manifest())])
-        self.assertEqual(rc, 0, self.err)
-
-    def test_a_noted_finding_the_body_cut_for_space_keeps_its_fix_open(self):
-        """The previous body cut `a` for space: its id is in the complete
-        block, not the rendered one. A noted `a` is still carried, so its
-        pull request stays open."""
-        previous_body = published_body(make_doc(findings=[make_finding(fid="b", title="Bravo finding")]), generated_at=NOW)
-        previous_body += f'\n<!-- audit-findings-all: {json.dumps([derived_id(fid="a"), derived_id(fid="b")])} -->\n'
-        self.harness.replies = {
-            "issue-list": self.issue_list(),
-            "issue-view !comments": issue_view({"body": previous_body}),
-            "proposal-list": proposals_view(
-                [pr(8, "platform-agent/fix-a", body=audit_report.delta_block([derived_id(fid="a")]))]
-            ),
-        }
-        self.touch("clusters/prod-us-east/payments-netpol.yaml")
-        doc = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
-        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(self.noted_manifest())])
-        self.assertEqual(rc, 0, self.err)
-        self.assertEqual(self.stdout_json()["prs_closed"], [])
-        self.assertEqual(self.harness.forge_calls("proposal-close"), [])
-        # The rewritten body keeps `a` in its block, so the next run still
-        # carries it.
-        body = self.harness.bodies_for("issue-update")[0]
-        self.assertIn(derived_id(fid="a"), audit_report.parse_delta_block(body))
-
-    def test_a_clean_run_does_not_close_over_a_noted_finding_the_body_cut(self):
-        previous_body = published_body(make_doc(findings=[make_finding(fid="b", title="Bravo finding")]), generated_at=NOW)
-        previous_body += f'\n<!-- audit-findings-all: {json.dumps([derived_id(fid="a"), derived_id(fid="b")])} -->\n'
-        self.harness.replies = {
-            "issue-list": self.issue_list(),
-            "issue-view !comments": issue_view({"body": previous_body}),
-        }
-        doc = make_doc(findings=[])
-        doc["resolved_because"] = resolved_for(previous_body)
-        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(self.noted_manifest(noted_objects=True))])
-        self.assertEqual(rc, 0, self.err)
-        self.assertEqual(self.stdout_json()["status"], "HELD")
-        self.assertEqual(self.harness.forge_calls("issue-close"), [])
-
-    def test_an_omitted_finding_on_a_noted_object_is_held_not_resolved(self):
-        """The collector could not see `a`, so a run with other findings does
-        not announce it as resolved, and its pull request stays open."""
-        payload = self.run_omitting_a(noted_objects=True)
-        self.assertEqual((payload["status"], payload["resolved"]), ("UPDATED", 0))
-        self.assertEqual(payload["prs_closed"], [])
-        self.assertEqual(self.harness.forge_calls("proposal-close"), [])
-        body = self.harness.bodies_for("issue-update")[0]
-        self.assertIn(derived_id(fid="a"), audit_report.parse_delta_block(body))
-        # A noted object has its own wording: the collector does not flag it.
-        # Every held entry here is noted, so the opening does not claim a
-        # candidate for each.
-        self.assertIn("For 1 of them the collector does not flag the object", body)
-        self.assertNotIn("still emits a candidate for each", body)
-        self.assertNotIn("still emits a candidate:", body)
-        self.assertIn("could not see the result; the target's notes say why", body)
-        # The row shows the object's own read, not the check's joined record.
-        self.assertIn(f"`{NOTED_READ}`", body)
-        self.assertNotIn("there this run and still flags this object", body)
-        # The control: with no noted object, `a` is resolved and its pull
-        # request is closed.
-        payload = self.run_omitting_a(noted_objects=False)
-        self.assertEqual(payload["resolved"], 1)
-        self.assertTrue(self.harness.forge_calls("proposal-close"))
-
-
-    def test_a_clean_run_keeps_the_pull_request_of_a_noted_object(self):
-        """The clean branch holds a noted finding the ledger carries, and its
-        stale-close pass reads the same held set."""
-        self.previous_a()
-        self.harness.replies["proposal-list"] = proposals_view(
-            [pr(8, "platform-agent/fix-a", body=audit_report.delta_block([derived_id(fid="a")]))]
-        )
-        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(self.noted_manifest())])
-        self.assertEqual(rc, 0, self.err)
-        payload = self.stdout_json()
-        self.assertEqual((payload["status"], payload["prs_closed"]), ("HELD", []))
-        self.assertEqual(self.harness.forge_calls("proposal-close"), [])
-
-
-class TestScopeNotesFitTheBody(unittest.TestCase):
-    def test_sixty_projects_with_long_notes_fit_the_body(self):
-        """The Notes cell is clipped as the Limitations cell is. A cell of
-        the full note on every row of a large fleet is over the body limit."""
-        clusters = [
-            {"name": f"project/p-{i:02d}", "notes": f"n{i:02d} " + "x" * audit_report.MAX_NOTE_CHARS}
-            for i in range(audit_report.MAX_SCOPE_ROWS)
-        ]
-        doc = make_doc(findings=[], audit="gce-compute-fleet-audit", clusters=clusters)
-        body = audit_report.render_issue_body(doc, generated_at=NOW, audit_id="gce-compute-fleet-audit").body
-        self.assertIn("| Notes |", body)
-        self.assertIn("n59 x", body)
-        self.assertNotIn("x" * (audit_report.MAX_CELL_CHARS + 1), body)
-
-
 class TestFinishManifestFlag(HarnessTestCase):
     """The `--manifest-file` / `--no-collector-manifest` wiring in `handle_finish`.
 
@@ -28019,21 +27644,6 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertIn("collector still emits", deferrals[0])
         self.assertFalse([b for b in posted if "no longer reproduces" in b])
 
-    def test_remediate_refuses_a_noted_id_with_its_own_reason(self):
-        a_id = derived_id(fid="a")
-        findings_file = self.write_findings(make_doc(findings=[make_finding(fid="b", title="Bravo finding")]))
-        manifest = _full_manifest()
-        manifest["clusters"][0][audit_report.NOTED_OBJECTS_KEY] = [
-            {"check": "netpol-missing", "namespace": "payments", "object": "Namespace/a"}
-        ]
-        rc = self.run_main(
-            ["remediate", "--audit", AUDIT, "--findings-file", findings_file,
-             "--finding", a_id, "--manifest-file", self.manifest_file(manifest)]
-        )
-        self.assertEqual(rc, 2, self.err)
-        self.assertIn("could not see the result", self.err)
-        self.assertNotIn("still emits", self.err)
-
     def test_remediate_refuses_a_held_id_as_held_not_as_unknown(self):
         """The CLI path: with the manifest it names the hold; without it the
         id is simply not in the file, as before."""
@@ -28415,22 +28025,6 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertIn(audit_report.LOST_MEMORY_UNGUARDED_GAP, payload["coverage_gaps"])
         self.assertEqual(self.harness.forge_calls("issue-close"), [])
         self.assertEqual(payload["prs_closed"], [])
-
-    def test_a_noted_object_no_ledger_carries_is_not_a_flagged_lost_memory(self):
-        """No record shows that the ledger has a finding on the noted object,
-        so it holds nothing: the gap is the one with the way out, not one that
-        says the collector still flags something."""
-        self.replay_lost_store()
-        manifest = _full_manifest()
-        manifest["clusters"][0][audit_report.NOTED_OBJECTS_KEY] = [
-            {"check": "netpol-missing", "namespace": "payments", "object": "Namespace/a"}
-        ]
-        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(manifest)])
-        self.assertEqual(rc, 0, self.err)
-        payload = self.stdout_json()
-        self.assertIn(audit_report.LOST_MEMORY_UNGUARDED_GAP, payload["coverage_gaps"])
-        self.assertNotIn(audit_report.LOST_MEMORY_GAP, payload["coverage_gaps"])
-        self.assertEqual(self.harness.forge_calls("issue-close"), [])
 
     def test_a_remediate_over_a_lost_store_is_told_the_record_was_lost(self):
         """The target is one the collector does not flag, but the lost record
@@ -33084,33 +32678,6 @@ class TestNoForge(BaseTestCase):
         self.assertEqual(code, 0, self.err)
         return self.stdout_json()
 
-    def finish_with_manifest(self, doc, manifest):
-        self.start()
-        path = audit_report.findings_path_for(AUDIT)
-        Path(path).write_text(json.dumps(doc), encoding="utf-8")
-        manifest_path = self.tmp_path / "manifest.json"
-        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-        code = self.run_main(["finish", "--audit", AUDIT, "--findings-file", path, "--manifest-file", str(manifest_path)])
-        self.assertEqual(code, 0, self.err)
-        return self.stdout_json()
-
-    def test_the_summary_carries_the_scope_notes_and_a_noted_hold(self):
-        """The worker sends `summary` verbatim, so it carries the notes, and a
-        previous finding on a noted object is kept on its own line."""
-        self.finish(make_doc(findings=[make_finding(fid="a"), make_finding(fid="b")]))
-        manifest = _full_manifest()
-        manifest["clusters"][0]["notes"] = ROTATED_NOTE
-        manifest["clusters"][0][audit_report.NOTED_OBJECTS_KEY] = [
-            {"check": "netpol-missing", "namespace": "payments", "object": "Namespace/a"}
-        ]
-        out = self.finish_with_manifest(make_doc(findings=[make_finding(fid="b")]), manifest)
-        self.assertEqual(out["status"], audit_report.NO_FORGE_STATUS)
-        self.assertIn(f"Read but not visible, which is not a coverage gap: prod-us-east: {ROTATED_NOTE}", out["summary"])
-        self.assertIn(f"Kept, because {audit_report.NOTED_HOLD_CAUSE}", out["summary"])
-        self.assertIn(derived_id(fid="a"), out["summary"])
-        self.assertNotIn("Still flagged by the collector", out["summary"])
-        self.assertEqual(out["resolved"], 0)
-
     def test_start_hands_over_an_empty_workspace_and_says_no_forge(self):
         workspace = Path(audit_report.SCRATCH_DIR) / f"workspace_{AUDIT}"
         workspace.mkdir(parents=True)
@@ -33371,7 +32938,7 @@ class TestNoForge(BaseTestCase):
     def test_a_withheld_posture_is_not_reported_as_held(self):
         self.finish(make_doc())
         (fid,) = json.loads((self.store() / "latest.json").read_text())["current_ids"]
-        self.patch_attr("still_flagged_ids", lambda manifest, data, carried=(): {fid})
+        self.patch_attr("still_flagged_ids", lambda manifest, data: {fid})
         doc = make_doc()
         doc.pop(audit_report.DECLARED_INTENT_SEARCHED_KEY, None)
         self.record_run(repo=audit_report.NO_FORGE_REPO, context=["acme/context"], audit=AUDIT)
@@ -33388,7 +32955,7 @@ class TestNoForge(BaseTestCase):
         kept = make_doc(findings=THREE_SEVERITIES[1:])
         kept_ids = set(audit_report.finding_ids(audit_report.load_findings(self.write_findings(kept), AUDIT)["findings"]))
         (left_out,) = previous - kept_ids
-        self.patch_attr("still_flagged_ids", lambda manifest, data, carried=(): {left_out})
+        self.patch_attr("still_flagged_ids", lambda manifest, data: {left_out})
 
         out = self.finish(kept)
 
@@ -35985,52 +35552,6 @@ class TestStoreLedger(HarnessTestCase):
         self.assertNotIn("labelsAdd", update)
         self.assertEqual(1, len(self.harness.forge_calls("proposal-close")))
         self.assertIn(proposal["url"], out["summary"])
-
-    def test_a_noted_finding_the_stored_ledger_carries_keeps_its_fix_open(self):
-        """The store-ledger path holds a noted object the stored ledger
-        carries, as the forge path does: its fix is not closed as stale."""
-        self.claim()
-        self.touch(self.NETPOL)
-        self.run_once(make_doc(findings=[make_finding(fid="a"), make_finding(fid="b")]))
-        validated = audit_report.load_findings(audit_report.findings_path_for(AUDIT), AUDIT)
-        only_a = {**validated, "findings": [f for f in validated["findings"] if f["object"] == "Namespace/a"]}
-        proposal = self.open_proposal(8, only_a)
-        self.harness.replies["proposal-list"] = {"proposals": [proposal], "truncated": False}
-        manifest = _full_manifest()
-        manifest["clusters"][0][audit_report.NOTED_OBJECTS_KEY] = [
-            {"check": "netpol-missing", "namespace": "payments", "object": "Namespace/a"}
-        ]
-        manifest_path = self.tmp_path / "manifest.json"
-        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-        self.start()
-        path = audit_report.findings_path_for(AUDIT)
-        Path(path).write_text(json.dumps(make_doc(findings=[make_finding(fid="b")])), encoding="utf-8")
-        self.new_process()
-        rc = self.run_main(["finish", "--audit", AUDIT, "--findings-file", path, "--manifest-file", str(manifest_path)])
-        self.assertEqual(rc, 0, self.err)
-        out = self.stdout_json()
-        self.assertEqual(out["status"], audit_report.STORE_LEDGER_STATUS)
-        self.assertEqual(out["prs_closed"], [])
-        self.assertEqual([], self.harness.forge_calls("proposal-close"))
-
-    def test_a_clean_run_logs_a_noted_finding_as_not_visible(self):
-        self.claim()
-        self.touch(self.NETPOL)
-        self.run_once(make_doc(findings=[make_finding(fid="a")]))
-        manifest = _full_manifest()
-        manifest["clusters"][0][audit_report.NOTED_OBJECTS_KEY] = [
-            {"check": "netpol-missing", "namespace": "payments", "object": "Namespace/a"}
-        ]
-        manifest_path = self.tmp_path / "manifest.json"
-        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-        self.start()
-        path = audit_report.findings_path_for(AUDIT)
-        Path(path).write_text(json.dumps(make_doc(findings=[])), encoding="utf-8")
-        self.new_process()
-        rc = self.run_main(["finish", "--audit", AUDIT, "--findings-file", path, "--manifest-file", str(manifest_path)])
-        self.assertEqual(rc, 0, self.err)
-        self.assertIn(f"NOT VISIBLE: {derived_id(fid='a')}", self.err)
-        self.assertNotIn("STILL FLAGGED:", self.err)
 
     def test_a_scoped_install_leaves_another_installs_unlabelled_fix_on_the_store_path(self):
         # The store ledger on a forge with proposals and labels but no issue
