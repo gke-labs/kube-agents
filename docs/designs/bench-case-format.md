@@ -148,8 +148,10 @@ boolean: `"false"` is a string, and truthy, and the validator rejects it.
 `writes_alone` is for a case that requests no pull request but whose wrong answer may open one
 the reply never names: the lane runs it alone in its second phase and marks the write
 safeguard's window exclusive, so any write in the window is charged to it
-(`bench/kube_agents_bench/lane.py`). A bare YAML boolean, `false` by default; devops-bench
-ignores the key.
+(`bench/kube_agents_bench/lane.py`). A case whose stack writes a file to the default branch of
+the GitOps repository uses it too, so that no other unit sees the file and the repository reset
+runs before each of its units. A bare YAML boolean, `false` by default; devops-bench ignores
+the key.
 
 `requested_pull_requests` is for a case that opens more pull requests by design than its checks
 grade: the case's total, a bare decimal integer above the count of its `pull_request_opened` and
