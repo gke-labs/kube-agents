@@ -945,7 +945,24 @@ def _cluster_placeholders(node: Any, where: str, problems: list[str], slots: set
 # bench/kube_agents_bench/harness.py's _FLEET_CLUSTER_PLACEHOLDER reads it
 # (restated, as CLUSTER_PLACEHOLDER is; the harness owns it).
 FLEET_PROMPT_PLACEHOLDER = re.compile(r"\{\{FLEET_CLUSTER_(PROJECT|LOCATION|NAME):([a-z0-9]+(?:-[a-z0-9]+)*)\}\}")
-FLEET_PROMPT_OPENER = "{{FLEET_CLUSTER"
+# Any spelling an author may have meant as one (one brace, inner spaces, any
+# case), as CLUSTER_PLACEHOLDER_LOOSE reads `{cluster:`: the opener a
+# malformed placeholder and one outside the prompt are caught by.
+FLEET_PLACEHOLDER_LOOSE = re.compile(r"\{+\s*fleet_cluster", re.IGNORECASE)
+
+
+def _strings_outside_prompt(node: Any, path: str, out: list[tuple[str, str]]) -> None:
+    """Every string in a case spec but its top-level prompt, with where it is."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if path == "" and key == "prompt":
+                continue
+            _strings_outside_prompt(value, f"{path}.{key}" if path else str(key), out)
+    elif isinstance(node, list):
+        for i, value in enumerate(node):
+            _strings_outside_prompt(value, f"{path}[{i}]", out)
+    elif isinstance(node, str):
+        out.append((path, node))
 
 
 def _fleet_prompt_placeholders(spec: dict[str, Any], problems: list[str], parked: bool) -> None:
@@ -954,22 +971,32 @@ def _fleet_prompt_placeholders(spec: dict[str, Any], problems: list[str], parked
     A misspelled one reaches the model as literal text and is graded as the
     model's failure; a role the runner doesn't provision fails every run as
     infrastructure."""
+    # Only the prompt is expanded (harness.py's run()); anywhere else the
+    # placeholder stays literal text.
+    elsewhere: list[tuple[str, str]] = []
+    _strings_outside_prompt(spec, "", elsewhere)
+    for where, value in elsewhere:
+        if FLEET_PLACEHOLDER_LOOSE.search(value):
+            problems.append(f"{where} carries a fleet placeholder, which only the prompt expands")
     prompt = spec.get("prompt")
-    if not isinstance(prompt, str) or FLEET_PROMPT_OPENER not in prompt:
+    if not isinstance(prompt, str) or not FLEET_PLACEHOLDER_LOOSE.search(prompt):
         return
-    if FLEET_PROMPT_OPENER in FLEET_PROMPT_PLACEHOLDER.sub("", prompt):
+    if FLEET_PLACEHOLDER_LOOSE.search(FLEET_PROMPT_PLACEHOLDER.sub("", prompt)):
         problems.append(
             "prompt carries a malformed fleet placeholder; the form is "
             "{{FLEET_CLUSTER_PROJECT:<role>}}, ..._LOCATION or ..._NAME, with a lowercase role"
         )
-    fixtures = {f for f in (spec.get("fixtures") or []) if isinstance(f, str)}
-    catalogue = set(_catalog_roles())
+    raw_fixtures = spec.get("fixtures")
+    fixtures = {f for f in raw_fixtures if isinstance(f, str)} if isinstance(raw_fixtures, list) else set()
+    # A project-scoped role (cluster_slot: null) has no cluster for the
+    # runner to record, so a placeholder naming it fails every run.
+    slot_roles = _catalog_slot_roles()
     for role in sorted({m.group(2) for m in FLEET_PROMPT_PLACEHOLDER.finditer(prompt)}):
         if role not in fixtures:
             problems.append(f"prompt names fleet role {role!r}, which the case's 'fixtures:' doesn't list")
-        if not parked and role not in catalogue:
+        if not parked and role not in slot_roles:
             problems.append(
-                f"prompt names fleet role {role!r}, which bench/tf/fleet/fixtures.json doesn't declare; "
+                f"prompt names fleet role {role!r}, which has no cluster slot in bench/tf/fleet/fixtures.json; "
                 "the runner records no cluster for it"
             )
 

@@ -1003,7 +1003,33 @@ class TestTheRulesReject(unittest.TestCase):
         self._only("malformed fleet placeholder", prompt="on {{FLEET_CLUSTER_ZONE:rbac-overgrant}}")
         self._only("doesn't list", prompt="on {{FLEET_CLUSTER_NAME:crashloop-workload}}", fixtures=["rbac-overgrant"])
         problems = self._validate(prompt="on {{FLEET_CLUSTER_NAME:not-a-role}}", fixtures=["rbac-overgrant", "not-a-role"])
-        self.assertTrue(any("doesn't declare" in p for p in problems), problems)
+        self.assertTrue(any("has no cluster slot" in p for p in problems), problems)
+
+    def test_a_fleet_placeholder_naming_a_project_scoped_role_is_rejected(self):
+        # world-open-ingress is in the catalogue with cluster_slot: null: the
+        # runner records no cluster for it, so every run would fail.
+        problems = self._validate(prompt="on {{FLEET_CLUSTER_NAME:world-open-ingress}}", fixtures=["rbac-overgrant", "world-open-ingress"])
+        self.assertTrue(any("has no cluster slot" in p for p in problems), problems)
+
+    def test_a_misspelled_fleet_opener_is_rejected(self):
+        for prompt in (
+            "on {FLEET_CLUSTER_NAME:rbac-overgrant}}",
+            "on {{ FLEET_CLUSTER_NAME:rbac-overgrant }}",
+            "on {{fleet_cluster_name:rbac-overgrant}}",
+        ):
+            with self.subTest(prompt=prompt):
+                self._only("malformed fleet placeholder", prompt=prompt)
+
+    def test_a_fleet_placeholder_outside_the_prompt_is_rejected(self):
+        problem = self._only(
+            "which only the prompt expands",
+            verification_spec=self._entry(check={"type": "report_contains", "any_of_patterns": ["{{FLEET_CLUSTER_NAME:rbac-overgrant}}"]}),
+        )
+        self.assertIn("verification_spec", problem)
+
+    def test_a_scalar_fixtures_beside_a_fleet_placeholder_is_reported_not_raised(self):
+        problems = self._validate(prompt="on {{FLEET_CLUSTER_NAME:rbac-overgrant}}", fixtures=True)
+        self.assertTrue(problems, "a scalar fixtures: passed")
 
     def test_a_cluster_placeholder_outside_report_contains_is_rejected(self):
         # worker_commands searches its patterns as written, so the placeholder
