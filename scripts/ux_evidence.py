@@ -85,12 +85,13 @@ LIST_ITEM_RE = re.compile(r"""^\s+-\s+["']?([^"'\s]+)["']?\s*$""")
 # ends at its first `-->` whatever is inside it (or runs to the end, unclosed);
 # a fenced block at any indent (list items indent theirs), closed by a line of
 # at least the same markers and nothing else, so a "```python" line opens and
-# never closes; a code span, closed by a backtick run of its own length. An
-# unclosed fence is not a block here, so it hides no image after it.
+# never closes; a code span, closed by a backtick run of its own length before
+# a blank line ends the paragraph. An unclosed fence is not a block here, so it
+# hides no image after it.
 HIDDEN_RE = re.compile(
     r"<!--.*?(?:-->|\Z)"
     r"|^[ \t]*(?P<fence>`{3,}|~{3,})[^\n]*\n.*?^[ \t]*(?P=fence)[`~]*[ \t]*$"
-    r"|(?P<ticks>`+)(?!`).+?(?<!`)(?P=ticks)(?!`)",
+    r"|(?P<ticks>`+)(?!`)(?:(?!\n[ \t]*\n).)+?(?<!`)(?P=ticks)(?!`)",
     re.DOTALL | re.MULTILINE,
 )
 IMAGE_RES = (

@@ -159,6 +159,10 @@ class BodyTest(unittest.TestCase):
     def test_a_double_backtick_span_holding_a_backtick(self):
         self.assertTrue(ux.has_image(f"`` ` `` {SHOT} `y`"))
 
+    def test_a_stray_backtick_does_not_span_paragraphs(self):
+        self.assertTrue(ux.has_image(f"a stray ` here\n\n## UX change\n\n{SHOT}\n\ncaption `path`\n"))
+        self.assertTrue(ux.no_change_ticked("stray `\n\n```\ncode\n```\n\n- [x] No user-visible change `x`"))
+
     def test_empty_images_do_not_count(self):
         for body in ("![]()", "![](   )", '<img src="">', "<img src=>"):
             with self.subTest(body=body):
