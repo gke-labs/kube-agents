@@ -4821,14 +4821,9 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	sandboxResourcesRefusal, _ := shellSandboxResourcesRefusal(agent)
 	execRefusal := ValidateCredentialProxyExec(agent, nil)
 	// The A2A gateway still waiting for TASKS on a provisioned bus
-	// (a2aGatewayTasksWaitMessage). Asked only while that Deployment has no
-	// ready replica, so a settled install lists no pods for it.
-	a2aTasksWaitMsg := ""
-	for _, w := range splitWorkloads {
-		if w.name == a2aGatewayName(agent) && w.ready == 0 {
-			a2aTasksWaitMsg = r.a2aGatewayTasksWaitMessage(ctx, agent)
-		}
-	}
+	// (a2aGatewayTasksWaitMessage, which lists pods only while that
+	// Deployment has no ready replica and the bus is up).
+	a2aTasksWaitMsg := r.a2aGatewayTasksWaitMessage(ctx, agent)
 
 	degradedStatus := metav1.ConditionFalse
 	degradedReason := ""

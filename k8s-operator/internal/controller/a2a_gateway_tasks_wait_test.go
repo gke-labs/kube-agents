@@ -18,15 +18,18 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -194,11 +197,27 @@ func settledA2AInstall(t *testing.T) (*PlatformAgentReconciler, *agentv1alpha1.P
 		t.Fatal("precondition: the install did not record the bus provisioned")
 	}
 	provisionedAt(stored, time.Now().Add(-time.Hour))
+	setNATSReady(t, r, stored, 1)
 	state, err := r.reconcileA2A(ctx, stored, homeChannelRecord{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return r, stored, state
+}
+
+// setNATSReady reports the bus StatefulSet's ready replicas; the fake client
+// runs no StatefulSet controller.
+func setNATSReady(t *testing.T, r *PlatformAgentReconciler, agent *agentv1alpha1.PlatformAgent, ready int32) {
+	t.Helper()
+	ctx := context.Background()
+	sts := &appsv1.StatefulSet{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aNATSName(agent)}, sts); err != nil {
+		t.Fatalf("the bus StatefulSet: %v", err)
+	}
+	sts.Status.ReadyReplicas = ready
+	if err := r.Status().Update(ctx, sts); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestAGatewayStillWaitingForTasksReadsDegraded(t *testing.T) {
@@ -300,5 +319,97 @@ func TestTheTasksWaitPointsAtBusStreamsPresent(t *testing.T) {
 	meta.SetStatusCondition(&stored.Status.Conditions, metav1.Condition{Type: a2aBusStreamsPresentConditionType, Status: metav1.ConditionTrue, Reason: "AllPresent"})
 	if msg := r.a2aGatewayTasksWaitMessage(ctx, stored); strings.Contains(msg, "BusStreamsPresent") {
 		t.Errorf("a True BusStreamsPresent was named: %q", msg)
+	}
+}
+
+// TestABusThatIsDownIsNotBlamedOnTheGateway: with the NATS server not
+// ready, the gateway waits on its connection, not on TASKS, and this reason
+// would point at the wrong thing; it is not written, and no pod is read.
+func TestABusThatIsDownIsNotBlamedOnTheGateway(t *testing.T) {
+	r, stored, _ := settledA2AInstall(t)
+	ctx := context.Background()
+	started := time.Now().Add(-10 * time.Minute)
+	if err := r.Create(ctx, a2aGatewayPod(stored, a2aGatewayName(stored)+"-abc", &started, false)); err != nil {
+		t.Fatal(err)
+	}
+	setNATSReady(t, r, stored, 0)
+	if msg := r.a2aGatewayTasksWaitMessage(ctx, stored); msg != "" {
+		t.Errorf("a bus with no ready server produced %q", msg)
+	}
+	if due := r.a2aGatewayTasksWaitRequeue(ctx, stored); due != 24*time.Hour {
+		t.Errorf("requeue = %v with the bus down, want none", due)
+	}
+}
+
+// TestAHigherDegradedReasonStopsTheRequeue: past the threshold under a
+// reason that ranks above this one, the pass writes nothing, so a short
+// requeue would spin; the requeue backs off instead.
+func TestAHigherDegradedReasonStopsTheRequeue(t *testing.T) {
+	r, stored, _ := settledA2AInstall(t)
+	ctx := context.Background()
+	started := time.Now().Add(-10 * time.Minute)
+	if err := r.Create(ctx, a2aGatewayPod(stored, a2aGatewayName(stored)+"-abc", &started, false)); err != nil {
+		t.Fatal(err)
+	}
+	if due := r.a2aGatewayTasksWaitRequeue(ctx, stored); due != time.Second {
+		t.Fatalf("precondition: requeue = %v for a due, unwritten reason", due)
+	}
+	meta.SetStatusCondition(&stored.Status.Conditions, metav1.Condition{Type: degradedConditionType, Status: metav1.ConditionTrue, Reason: conditionReasonMinterPruningHeld})
+	if due := r.a2aGatewayTasksWaitRequeue(ctx, stored); due != 24*time.Hour {
+		t.Errorf("requeue = %v under a higher reason, want none", due)
+	}
+}
+
+// TestAFailedPodReadKeepsTheReason: a pod list that fails keeps the reason
+// the CR carries rather than clearing it, as the pod fault scan does.
+func TestAFailedPodReadKeepsTheReason(t *testing.T) {
+	r, stored, _ := settledA2AInstall(t)
+	ctx := context.Background()
+	refusing := interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{
+		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*corev1.PodList); ok {
+				return fmt.Errorf("the API server refused the list")
+			}
+			return c.List(ctx, list, opts...)
+		},
+	})
+	blind := &PlatformAgentReconciler{Client: refusing, APIReader: refusing, Scheme: r.Scheme}
+	if msg := blind.a2aGatewayTasksWaitMessage(ctx, stored); msg != "" {
+		t.Errorf("a failed read with no reason held produced %q", msg)
+	}
+	meta.SetStatusCondition(&stored.Status.Conditions, metav1.Condition{Type: degradedConditionType, Status: metav1.ConditionTrue,
+		Reason: conditionReasonA2AGatewayWaitingForTasks, Message: "held message"})
+	if msg := blind.a2aGatewayTasksWaitMessage(ctx, stored); msg != "held message" {
+		t.Errorf("a failed read cleared the held reason: %q", msg)
+	}
+}
+
+// TestAReadyGatewayCostsNoPodList: the cached gate keeps a settled install
+// from listing pods for this on every pass, for the message and the requeue.
+func TestAReadyGatewayCostsNoPodList(t *testing.T) {
+	r, stored, _ := settledA2AInstall(t)
+	ctx := context.Background()
+	gw := &appsv1.Deployment{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: stored.Namespace, Name: a2aGatewayName(stored)}, gw); err != nil {
+		t.Fatal(err)
+	}
+	gw.Status.ReadyReplicas = 1
+	if err := r.Status().Update(ctx, gw); err != nil {
+		t.Fatal(err)
+	}
+	lists := 0
+	counting := interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{
+		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*corev1.PodList); ok {
+				lists++
+			}
+			return c.List(ctx, list, opts...)
+		},
+	})
+	counted := &PlatformAgentReconciler{Client: counting, APIReader: counting, Scheme: r.Scheme}
+	_ = counted.a2aGatewayTasksWaitMessage(ctx, stored)
+	_ = counted.a2aGatewayTasksWaitRequeue(ctx, stored)
+	if lists != 0 {
+		t.Errorf("a ready gateway cost %d pod lists", lists)
 	}
 }

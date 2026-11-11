@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -64,10 +65,11 @@ const (
 	// a2aGatewayTasksWaitMsgFmt takes the gateway Deployment's name and the
 	// threshold. No elapsed time: the Degraded write is gated on the
 	// message, so a figure that moved would write status on every pass.
-	a2aGatewayTasksWaitMsgFmt = "A2A gateway Deployment %s has not bound its event relay on the TASKS stream for more than %s " +
-		"since the bus was recorded provisioned (BusProvisioned=True), so the stream the provision Job created is not visible to it. " +
-		"Likely causes: the gateway's NATS identity lands in a different account than the streams, its credentials are wrong, " +
-		"or a JetStream domain or prefix does not match. Read the gateway's /readyz body on its metrics port and its log"
+	a2aGatewayTasksWaitMsgFmt = "A2A gateway Deployment %s has not turned ready for more than %s since the bus was recorded " +
+		"provisioned (BusProvisioned=True), with the NATS server up. Its readiness is its event relay binding the TASKS stream, " +
+		"which the provision Job created, so the gateway most likely cannot see that stream: its NATS identity lands in a " +
+		"different account than the streams, its credentials are wrong, or a JetStream domain or prefix does not match. " +
+		"Read the gateway's /readyz body on its metrics port, which names what it waits on, and its log"
 	// a2aGatewayTasksWaitStreamsSuffixFmt is added when BusStreamsPresent
 	// is on the CR and not True, naming its reason: that condition then
 	// says whether the stream is there at all.
@@ -130,6 +132,27 @@ func a2aGatewayTasksWaitDue(since, now time.Time) (bool, time.Duration) {
 	return false, left
 }
 
+// a2aGatewayTasksWaitApplies is the cached precondition for reading the
+// gateway's pods at all: the stack renders, BusProvisioned is True, the NATS
+// StatefulSet has a ready replica (a bus that is down is a different fault,
+// and the gateway would wait on its connection, not on TASKS), and the A2A
+// gateway Deployment exists with no ready replica. Read from the cache, so a
+// settled install pays no live pod list for this on any pass.
+func (r *PlatformAgentReconciler) a2aGatewayTasksWaitApplies(ctx context.Context, agent *agentv1alpha1.PlatformAgent) bool {
+	if !a2aStackRendering(agent) || !busProvisioned(agent) {
+		return false
+	}
+	nats := &appsv1.StatefulSet{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aNATSName(agent)}, nats); err != nil || nats.Status.ReadyReplicas == 0 {
+		return false
+	}
+	gateway := &appsv1.Deployment{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aGatewayName(agent)}, gateway); err != nil {
+		return false
+	}
+	return gateway.Status.ReadyReplicas == 0
+}
+
 // a2aGatewayTasksWaitPods lists the A2A gateway's pods from the live reader
 // the pod fault scan uses, or reports the read failed.
 func (r *PlatformAgentReconciler) a2aGatewayTasksWaitPods(ctx context.Context, agent *agentv1alpha1.PlatformAgent) ([]corev1.Pod, error) {
@@ -141,14 +164,13 @@ func (r *PlatformAgentReconciler) a2aGatewayTasksWaitPods(ctx context.Context, a
 }
 
 // a2aGatewayTasksWaitMessage is the Degraded message for a gateway past the
-// threshold, or "" when it is not. Read only when the status pass already
-// found the A2A gateway Deployment with no ready replica, so a settled
-// install lists no pods for it. A failed pod read keeps the reason the CR
+// threshold, or "" when it is not. It lists pods only past
+// a2aGatewayTasksWaitApplies, so a settled install lists none. A failed pod read keeps the reason the CR
 // already carries, as the pod fault scan keeps a fault it wrote: finding
 // nothing is not evidence of nothing, and a cleared reason re-asserted on
 // the next pass would write status twice for an apiserver blip.
 func (r *PlatformAgentReconciler) a2aGatewayTasksWaitMessage(ctx context.Context, agent *agentv1alpha1.PlatformAgent) string {
-	if !a2aStackRendering(agent) || !busProvisioned(agent) {
+	if !r.a2aGatewayTasksWaitApplies(ctx, agent) {
 		return ""
 	}
 	pods, err := r.a2aGatewayTasksWaitPods(ctx, agent)
@@ -177,14 +199,17 @@ func (r *PlatformAgentReconciler) a2aGatewayTasksWaitMessage(ctx context.Context
 // a2aGatewayTasksWaitRequeue is when the pass that turns a waiting gateway
 // Degraded is due: pods are not watched, so nothing else wakes it at the
 // threshold. A day (past any requeue it is min'd with) when no gateway is
-// waiting short of it, including once the reason is already written.
+// waiting short of it, and whenever Degraded is already True: with this
+// reason there is nothing left to write, and with a reason that ranks above
+// it the pass would write nothing either, so a short requeue would spin.
+// When that reason clears, its status write re-enqueues the CR and the pass
+// it triggers reads this one.
 func (r *PlatformAgentReconciler) a2aGatewayTasksWaitRequeue(ctx context.Context, agent *agentv1alpha1.PlatformAgent) time.Duration {
 	const none = 24 * time.Hour
-	if !a2aStackRendering(agent) || !busProvisioned(agent) {
+	if meta.IsStatusConditionTrue(agent.Status.Conditions, degradedConditionType) {
 		return none
 	}
-	if held := meta.FindStatusCondition(agent.Status.Conditions, degradedConditionType); held != nil &&
-		held.Status == metav1.ConditionTrue && held.Reason == conditionReasonA2AGatewayWaitingForTasks {
+	if !r.a2aGatewayTasksWaitApplies(ctx, agent) {
 		return none
 	}
 	pods, err := r.a2aGatewayTasksWaitPods(ctx, agent)
