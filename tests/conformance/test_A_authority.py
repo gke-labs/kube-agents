@@ -14,6 +14,7 @@ mechanism is different, because these assertions run without a cluster.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import re
 import textwrap
 import unittest
@@ -469,10 +470,30 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
                     h.task_confinement.confine(argv, None, None)
         self.assertTrue(h.task_confinement.confine(["kubectl", "version", "--client"], None, None).isolated)
 
-    def test_A3_the_profile_role_reaches_exec_and_the_mcp_relay_alone(self) -> None:
+    def test_A3_the_profile_role_reaches_exec_mcp_and_vcs_alone(self) -> None:
         profile = h.credential_proxy.CALLER_ROLE_PROFILE
         reached = sorted(prefix for prefix, roles in h.credential_proxy.ROUTE_ROLES if profile in roles)
-        self.assertEqual(sorted(["/v1/exec", h.mcp_policy.MCP_RELAY_PREFIX]), reached)
+        self.assertEqual(sorted(["/v1/exec", h.mcp_policy.MCP_RELAY_PREFIX, "/v1/vcs/"]), reached)
+
+    def test_A3_a_profile_caller_publishes_a_change_only_under_the_permit(self) -> None:
+        # #3993: the profile role reaches the forge credential only with a
+        # task credential, and the three writes that put a change up only
+        # when that credential carries the permit the dispatcher mints after a
+        # structured confirm. Every other write is outside the role's verbs.
+        cp = h.credential_proxy
+        principal = cp.Principal(workload="system:serviceaccount:ns:profile", role=cp.CALLER_ROLE_PROFILE)
+        task = type("Task", (), {"permits": frozenset()})()
+        permitted = type("Task", (), {"permits": frozenset({cp.VCS_PROPOSAL_CREATE_PERMIT})})()
+        writes = cp.PROFILE_PERMIT_GATED_VCS_VERBS
+        self.assertEqual(frozenset({"publish", "proposal-create", "proposal-update"}), writes)
+        for verb in sorted(cp.ROLE_VCS_VERBS[cp.CALLER_ROLE_PROFILE]):
+            with self.subTest(verb=verb):
+                self.assertIsNotNone(cp.profile_vcs_refusal(principal, verb), "no credential, yet admitted")
+                with_task = dataclasses.replace(principal, task=task)
+                self.assertEqual(verb in writes, cp.profile_vcs_refusal(with_task, verb) is not None)
+                self.assertIsNone(cp.profile_vcs_refusal(dataclasses.replace(principal, task=permitted), verb))
+        others = cp.vcs_broker.WRITE_VERBS - writes
+        self.assertEqual(frozenset(), others & cp.ROLE_VCS_VERBS[cp.CALLER_ROLE_PROFILE])
 
     def test_A3_a_profile_worker_reaches_no_cluster_through_mcp(self) -> None:
         # The relay has no per-task target check, so a profile worker reaches

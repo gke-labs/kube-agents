@@ -1,6 +1,7 @@
 package dispatch
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"slices"
@@ -665,5 +666,185 @@ func TestACredentialThatCannotBeMintedOrReadBackSendsNoConfirm(t *testing.T) {
 			}
 			noCredentials(t, w)
 		})
+	}
+}
+
+// submitChange publishes a submission whose task parameters say the
+// requester asked for a change (lib.TaskParameters.ChangeRequested).
+func (b *bus) submitChange(profile, tier, kind, taskID string, params map[string]string) {
+	b.t.Helper()
+	env := submissionEnv(b.t, profile, taskID, "cap-ok", nil)
+	var msg lib.Message
+	if err := json.Unmarshal(env.Payload, &msg); err != nil {
+		b.t.Fatal(err)
+	}
+	part, err := lib.TaskParametersPart(lib.TaskParameters{Parameters: params, ChangeRequested: true})
+	if err != nil {
+		b.t.Fatal(err)
+	}
+	msg.Parts = append(msg.Parts, part)
+	payload, err := json.Marshal(msg)
+	if err != nil {
+		b.t.Fatal(err)
+	}
+	env.Payload = payload
+	if err := b.gateway.Publish(b.ctx, lib.TaskSubmitSubject(profile, tier, kind, taskID), env); err != nil {
+		b.t.Fatalf("submit %s: %v", taskID, err)
+	}
+}
+
+// natsClaimKeys is the set of keys in a token's nats claim block, read from
+// the raw payload: what the token carries, not what Verify reads out of it.
+func natsClaimKeys(t *testing.T, token string) []string {
+	t.Helper()
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		t.Fatalf("not a JWT: %d segments", len(parts))
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var top struct {
+		Nats map[string]json.RawMessage `json:"nats"`
+	}
+	if err := json.Unmarshal(raw, &top); err != nil {
+		t.Fatal(err)
+	}
+	var keys []string
+	for k := range top.Nats {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	return keys
+}
+
+// A submission that asked for a change gets the vcs:proposal-create permit
+// on its credential-proxy token, and nowhere else: the bus credential
+// carries no permits claim.
+func TestAChangeRequestPutsThePermitOnTheProxyTokenOnly(t *testing.T) {
+	b := newBus(t, "tse-0")
+	b.ensure("tse", 2, 0, "read")
+	w := b.worker("tse", "read", "tse-0", answerAccept, time.Second)
+	ti := oneProfile("tse", 2, "tse-0")
+	ti.pool.SetUID("tse", "read", "tse-0", "uid-0")
+	kp, pub := signingKey(t)
+	b.runKeyed(ti, kp, 0)
+
+	b.submitChange("tse", "read", lib.SubmitKindTop, "task-1", clusterParams)
+	if ts := b.waitTerminal("task-1", 10*time.Second); ts.state != lib.StateCompleted {
+		t.Fatalf("terminal %+v", ts)
+	}
+	confirm := confirmsOf(w)[0]
+	proxyC := verifyAs(t, confirm.ProxyToken, pub, taskcred.AudienceCredentialProxy)
+	if !slices.Equal(proxyC.Permits, []taskcred.Permit{taskcred.PermitVCSProposalCreate}) {
+		t.Errorf("the proxy token's permits = %v, want [%s]", proxyC.Permits, taskcred.PermitVCSProposalCreate)
+	}
+	if natsC := verifyAs(t, confirm.TaskCredential, pub, taskcred.AudienceNATS); natsC.Permits != nil {
+		t.Errorf("the bus credential carries permits %v", natsC.Permits)
+	}
+	if keys := natsClaimKeys(t, confirm.TaskCredential); slices.Contains(keys, "permits") {
+		t.Errorf("the bus credential's claims %v include permits", keys)
+	}
+}
+
+// A submission that did not ask for a change gets a proxy token with no
+// permits key at all, never an empty list: exactly the claim keys a token
+// had before the claim existed, so a broker one image behind accepts it.
+func TestNoChangeRequestMintsNoPermitsClaim(t *testing.T) {
+	b := newBus(t, "tse-0")
+	b.ensure("tse", 2, 0, "read")
+	w := b.worker("tse", "read", "tse-0", answerAccept, time.Second)
+	ti := oneProfile("tse", 2, "tse-0")
+	ti.pool.SetUID("tse", "read", "tse-0", "uid-0")
+	kp, pub := signingKey(t)
+	b.runKeyed(ti, kp, 0)
+
+	b.submitWith("tse", "read", lib.SubmitKindTop, "task-1", "cap-ok", clusterParams)
+	if ts := b.waitTerminal("task-1", 10*time.Second); ts.state != lib.StateCompleted {
+		t.Fatalf("terminal %+v", ts)
+	}
+	confirm := confirmsOf(w)[0]
+	want := []string{"pod", "pod_uid", "profile", "target", "task", "tier", "type", "version"}
+	if got := natsClaimKeys(t, confirm.ProxyToken); !slices.Equal(got, want) {
+		t.Errorf("the proxy token's nats claims = %v, want exactly %v", got, want)
+	}
+	if c := verifyAs(t, confirm.ProxyToken, pub, taskcred.AudienceCredentialProxy); c.Permits != nil {
+		t.Errorf("the proxy token carries permits %v", c.Permits)
+	}
+}
+
+// A change request on a task that names no cluster gets no proxy token, so
+// no permit either: the credential proxy refuses such a task at its
+// version-control routes (a known limit; the token needs a target).
+func TestAChangeRequestWithNoClusterGetsNoProxyToken(t *testing.T) {
+	b := newBus(t, "tse-0")
+	b.ensure("tse", 2, 0, "read")
+	w := b.worker("tse", "read", "tse-0", answerAccept, time.Second)
+	ti := oneProfile("tse", 2, "tse-0")
+	ti.pool.SetUID("tse", "read", "tse-0", "uid-0")
+	kp, pub := signingKey(t)
+	_, ml, _ := b.runKeyed(ti, kp, 0)
+
+	b.submitChange("tse", "read", lib.SubmitKindTop, "task-1", map[string]string{})
+	if ts := b.waitTerminal("task-1", 10*time.Second); ts.state != lib.StateCompleted {
+		t.Fatalf("terminal %+v", ts)
+	}
+	confirm := confirmsOf(w)[0]
+	if confirm.ProxyToken != "" {
+		t.Error("a task with no cluster got a proxy token")
+	}
+	if keys := natsClaimKeys(t, confirm.TaskCredential); slices.Contains(keys, "permits") {
+		t.Errorf("the bus credential's claims %v include permits", keys)
+	}
+	verifyAs(t, confirm.TaskCredential, pub, taskcred.AudienceNATS)
+	if ml.count() != 1 {
+		t.Errorf("%d mints, want 1", ml.count())
+	}
+}
+
+// A retry whose replacement submission turns ChangeRequested off gets no
+// permit, even though the verifier's cached permit for the same capability
+// and cluster still applies and admission does not ask the verifier again:
+// whether a change is asked for is read from the delivery being admitted,
+// never from what was cached with the permit.
+func TestARetryThatDropsTheChangeRequestMintsNoPermit(t *testing.T) {
+	b := newBus(t, "tse-0")
+	b.ensure("tse", 2, 0, "read")
+	w := b.worker("tse", "read", "tse-0", answerAccept, 3*time.Second)
+	ti := oneProfile("tse", 1, "tse-0")
+	ti.pool.SetUID("tse", "read", "tse-0", "uid-0")
+	kp, pub := signingKey(t)
+	v := &fakeVerifier{}
+	b.runKeyedWith(ti, kp, 0, v, nil)
+
+	b.submitWith("tse", "read", lib.SubmitKindTop, "task-1", "cap-ok", clusterParams)
+	waitFor(t, 10*time.Second, "task-1 confirmed", func() bool { return w.confirmCount() == 1 })
+	// task-2 asks for a change, is admitted, and waits over the profile's
+	// concurrency of 1 while task-1 runs.
+	b.submitChange("tse", "read", lib.SubmitKindTop, "task-2", clusterParams)
+	waitFor(t, 10*time.Second, "task-2 admitted", func() bool { return len(v.callList()) == 2 })
+	// Replaced by the same capability and cluster, no longer asking.
+	b.submitWith("tse", "read", lib.SubmitKindTop, "task-2", "cap-ok", clusterParams)
+
+	if ts := b.waitTerminal("task-2", 15*time.Second); ts.state != lib.StateCompleted {
+		t.Fatalf("task-2 terminal %+v, want completed", ts)
+	}
+	if calls := v.callList(); len(calls) != 2 {
+		t.Fatalf("verifier calls %v; want two, so the replacement was admitted on the cached permit", calls)
+	}
+	confirms := confirmsOf(w)
+	if len(confirms) != 2 {
+		t.Fatalf("%d confirms, want two", len(confirms))
+	}
+	c := verifyAs(t, confirms[1].ProxyToken, pub, taskcred.AudienceCredentialProxy)
+	if c.Task != "task-2" {
+		t.Fatalf("second confirm is for %s", c.Task)
+	}
+	if c.Permits != nil {
+		t.Errorf("task-2's proxy token carries permits %v after its replacement dropped the change request", c.Permits)
+	}
+	if keys := natsClaimKeys(t, confirms[1].ProxyToken); slices.Contains(keys, "permits") {
+		t.Errorf("task-2's proxy token claims %v include permits", keys)
 	}
 }
