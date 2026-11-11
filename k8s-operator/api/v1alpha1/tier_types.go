@@ -55,9 +55,8 @@ type TierSpec struct {
 	Mode string `json:"mode"`
 
 	// WriteMode is what a task at this tier may do with a change it finds:
-	// propose it (the default), or explain only (none). Not enforced yet:
-	// the VCS broker reads it in a later change (#3659), and until then the
-	// install-level setting is the only one that applies.
+	// propose it (the default), or explain only (none). It has no effect
+	// yet: the VCS broker reads it in a later change (#3659).
 	// +kubebuilder:validation:Enum=none;propose
 	// +kubebuilder:default=propose
 	// +optional

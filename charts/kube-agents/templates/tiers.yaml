@@ -1,5 +1,5 @@
 {{- /*
-The two tiers every install starts with (#3659; docs/designs/spec-profiles-dispatch.md,
+The two tiers an install with the platform agent starts with (#3659; docs/designs/spec-profiles-dispatch.md,
 "Tiers and identity"): read, which people's tasks run at, and unattended, a
 trigger's. The chart owns these two, so an edit to either is reverted on the next
 upgrade; an install's own tiers go under other names.

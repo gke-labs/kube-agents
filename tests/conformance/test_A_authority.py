@@ -1795,38 +1795,69 @@ class A4DelegationAttenuates(unittest.TestCase):
 
         The Tier CRD (#3659) is for cluster administrators alone, so:
 
-          - no Role or ClusterRole the product mints names `tiers`, by name or
-            by a wildcard resource, at any verb;
+          - no Role or ClusterRole the product mints or the chart ships names
+            `tiers`, by name or by a wildcard group or resource, at any verb;
           - the operator's ClusterRole, on both delivery paths, reads tiers and
-            writes their status, and nothing more;
+            writes their status, and nothing more, counting wildcard rules;
           - nothing in the chart or the operator's config aggregates a role
             naming `tiers` into `admin`, `edit` or `view`, which would hand
             tiers to every namespace admin by default.
         """
-        checked = 0
+        def reaches_tiers(rule: dict) -> set[str]:
+            """The tier resources a rule reaches, wildcards included."""
+            groups = set(rule.get("apiGroups") or [])
+            if not groups & {"kubeagents.x-k8s.io", "*"}:
+                return set()
+            out = set()
+            for resource in rule.get("resources") or []:
+                if resource == "*":
+                    out |= {"tiers", "tiers/status"}
+                elif resource == "tiers" or resource.startswith("tiers/"):
+                    out.add(resource)
+                elif resource == "*/status":
+                    out.add("tiers/status")
+            return out
+
+        product_roles = []
         for name, documents in h.golden_documents().items():
             for kind in ("Role", "ClusterRole"):
-                for role in h.objects_of_kind(documents, kind):
-                    for rule in role.get("rules") or []:
-                        checked += 1
-                        resources = set(rule.get("resources") or [])
-                        with self.subTest(fixture=name, role=role["metadata"]["name"], rule=rule):
-                            self.assertFalse(resources & {"tiers", "tiers/status"},
-                                             "a product role reaches tiers")
-                            if "kubeagents.x-k8s.io" in (rule.get("apiGroups") or []) or "*" in (rule.get("apiGroups") or []):
-                                self.assertNotIn("*", resources, "a wildcard resource reaches tiers")
-        self.assertGreater(checked, 0, "no product role was read; the goldens moved")
+                product_roles += [(name, role) for role in h.objects_of_kind(documents, kind)]
+        # The chart's own roles (the web console's, the cleanup hook's), read
+        # the way helm_documents reads a template, after dropping the
+        # multi-line {{/* */}} comments a line-based pass can't. A template
+        # that declares a role and won't parse fails here rather than being
+        # skipped, since a skipped role is an unchecked one.
+        chart_templates = h.REPO_ROOT / "charts/kube-agents/templates"
+        chart_roles = 0
+        for path in sorted(chart_templates.glob("*.yaml")):
+            text = path.read_text()
+            if path.name == "operator-rbac.yaml" or not re.search(r"^kind:\s*(Cluster)?Role\s*$", text, re.M):
+                continue
+            text = re.sub(r"\{\{-?\s*/\*.*?\*/\s*-?\}\}", "", text, flags=re.S)
+            body = "\n".join(line for line in text.splitlines() if not h._HELM_DIRECTIVE.match(line))
+            documents = tuple(d for d in yaml.safe_load_all(h._HELM_EXPRESSION.sub(h.HELM_PLACEHOLDER, body))
+                              if isinstance(d, dict))
+            for kind in ("Role", "ClusterRole"):
+                roles = h.objects_of_kind(documents, kind)
+                chart_roles += len(roles)
+                product_roles += [(path.name, role) for role in roles]
+        self.assertGreater(chart_roles, 0, "no chart role was read; the chart's templates moved")
+        checked = 0
+        for name, role in product_roles:
+            for rule in role.get("rules") or []:
+                checked += 1
+                with self.subTest(source=name, role=role["metadata"]["name"], rule=rule):
+                    self.assertFalse(reaches_tiers(rule), "a product role reaches tiers")
+        self.assertGreater(checked, 0, "no product role was read; the goldens or the chart moved")
 
         want = {"tiers": {"get", "list", "watch"}, "tiers/status": {"get", "update", "patch"}}
         for source, documents in (("operator_clusterrole", h.yaml_documents("operator_clusterrole")),
                                   ("chart_operator_rbac", h.helm_documents("chart_operator_rbac"))):
             got: dict[str, set[str]] = {}
-            for role in h.objects_of_kind(documents, "ClusterRole"):
-                for rule in role.get("rules") or []:
-                    if "kubeagents.x-k8s.io" not in (rule.get("apiGroups") or []):
-                        continue
-                    for resource in rule.get("resources") or []:
-                        if resource.startswith("tiers"):
+            for kind in ("Role", "ClusterRole"):
+                for role in h.objects_of_kind(documents, kind):
+                    for rule in role.get("rules") or []:
+                        for resource in reaches_tiers(rule):
                             got.setdefault(resource, set()).update(rule.get("verbs") or [])
             with self.subTest(source=source):
                 self.assertEqual(got, want, f"{source}: the operator's verbs on tiers")

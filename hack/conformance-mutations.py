@@ -318,6 +318,33 @@ MUTATIONS: list[Mutation] = [
         "tasks may do instead of a cluster administrator",
     ),
     Mutation(
+        "A4-operator-writes-tiers-wildcard-group",
+        "charts/kube-agents/templates/operator-rbac.yaml",
+        ("  # END GENERATED RULES",
+         "  # END GENERATED RULES\n  - apiGroups:\n      - '*'\n"
+         "    resources:\n      - tiers\n    verbs:\n      - create"),
+        "test_A4_only_cluster_administrators_write_tiers",
+        "reach tiers through a wildcard API group, which a group-name match misses",
+    ),
+    Mutation(
+        "A4-operator-writes-tiers-wildcard-resource",
+        "charts/kube-agents/templates/operator-rbac.yaml",
+        ("  # END GENERATED RULES",
+         "  # END GENERATED RULES\n  - apiGroups:\n      - kubeagents.x-k8s.io\n"
+         "    resources:\n      - '*'\n    verbs:\n      - create"),
+        "test_A4_only_cluster_administrators_write_tiers",
+        "reach tiers through a wildcard resource, which a resource-name match misses",
+    ),
+    Mutation(
+        "A4-web-console-reads-tiers",
+        "charts/kube-agents/templates/web-console.yaml",
+        ('    resources: ["nodes", "namespaces", "pods"]\n    verbs: ["list"]',
+         '    resources: ["nodes", "namespaces", "pods"]\n    verbs: ["list"]\n'
+         '  - apiGroups: ["kubeagents.x-k8s.io"]\n    resources: ["tiers"]\n    verbs: ["update"]'),
+        "test_A4_only_cluster_administrators_write_tiers",
+        "give a chart-shipped product role a verb on tiers, outside the operator's goldens",
+    ),
+    Mutation(
         # The chart half was three literal string scans until #1319; this is
         # the spelling that walked past them. Flow style is not exotic -- it is
         # what `helm create` scaffolds and what a hand-edit reaches for.

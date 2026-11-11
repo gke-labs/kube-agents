@@ -16,7 +16,7 @@ Every field of the `Tier` resource's `spec` and `status`, generated from the ope
 | Field | Type | Required | Default | Constraints | Description |
 | ----- | ---- | -------- | ------- | ----------- | ----------- |
 | `mode` | `string` | yes |  | one of `interactive`, `unattended` | Mode is whether people or triggers run at this tier. Once tiers are enforced, interactive will run interactive profile tasks and unattended will only start profile tasks. |
-| `writeMode` | `string` | no | `propose` | one of `none`, `propose` | WriteMode is what a task at this tier may do with a change it finds: propose it (the default), or explain only (none). Not enforced yet: the VCS broker reads it in a later change, and until then the install-level setting is the only one that applies. |
+| `writeMode` | `string` | no | `propose` | one of `none`, `propose` | WriteMode is what a task at this tier may do with a change it finds: propose it (the default), or explain only (none). It has no effect yet: the VCS broker reads it in a later change. |
 
 ## Status
 
