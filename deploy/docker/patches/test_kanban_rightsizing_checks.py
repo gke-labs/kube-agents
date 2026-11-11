@@ -146,6 +146,16 @@ class OwnEntriesTest(RuleTestCase):
         self.assertEqual([e["workload"] for e in metadata[krc.METADATA_KEY]], ["queue-worker"])
         self.assertNotIn("`api-server`", result)
 
+    def test_entries_past_the_limit_are_counted_on_the_retry_and_the_limit_is_stated(self):
+        many = [{**HPA_ENTRY, "workload": f"w{i}"} for i in range(krc.MAX_ENTRIES + 2)]
+        self.assertTrue(self.rule(CHILD, many)[0])
+        with self.assertLogs(krc.logger, "WARNING"):
+            reasons, result, _ = self.rule(CHILD, many, retry=True)
+        self.assertEqual(reasons, [])
+        self.assertEqual(result.count(": dependency: "), krc.MAX_ENTRIES)
+        self.assertIn(f"- 2 of this card's entries past the limit of {krc.MAX_ENTRIES} not shown.", result)
+        self.assertIn(f"At most {krc.MAX_ENTRIES} entries.", krc.PARAM_DESCRIPTION)
+
     def test_not_on_cluster_needs_no_checks(self):
         gone = {"workload": "api-server", "dependency_kind": "not_on_cluster", "dependency": "No such deployment here."}
         reasons, result, _ = self.rule(CHILD, [gone])
@@ -260,6 +270,22 @@ class InheritedEntriesTest(RuleTestCase):
         self.assertEqual(result.count(": dependency: "), krc.MAX_SHOWN)
         self.assertIn("- 3 more entries not shown;", result)
 
+    def test_two_cards_that_report_the_same_words_render_two_lines(self):
+        self.card("t_seeded_b", body=SKILL_BODY, creator=PARENT, stored=[HPA_ENTRY])
+        result = self.rule(PARENT)[1]
+        self.assertIn(f"- `api-server` (card {CHILD}): dependency: HPA.", result)
+        self.assertIn("- `api-server` (card t_seeded_b): dependency: HPA.", result)
+
+    def test_own_and_inherited_drops_are_counted_apart(self):
+        legs = [{**HPA_ENTRY, "workload": f"hpa{i}"} for i in range(krc.MAX_SHOWN)]
+        self.card("t_aaaa", body=SKILL_BODY, creator=PARENT, stored=legs)
+        own = [{"workload": "mine", "dependency_kind": "none", "dependency": "Nothing blocks a cut.", "checks": dict(CHECKS)}]
+        with self.assertLogs(krc.logger, "WARNING"):
+            result = self.rule(PARENT, own)[1]
+        self.assertIn("- 1 more of this card's entries not shown.", result)
+        self.assertIn("more entries not shown; the cards below this one hold them.", result)
+        self.assertNotIn("`mine`", result)
+
     def test_the_shown_entries_are_capped(self):
         many = [{**HPA_ENTRY, "workload": f"w{i}"} for i in range(krc.MAX_SHOWN + 2)]
         self.card("t_many", body=SKILL_BODY, creator=PARENT, stored=many)
@@ -291,6 +317,11 @@ class PlatformCutRequestTest(RuleTestCase):
             "Propose resource request reductions for inference-server.",
             "Can we reduce the memory limit on api-server?",
             "Shrink the pool's machine type to e2-standard-2.",
+            # A bare noun a workload owns, or with a quantity (#4051).
+            "Lower the requests of inference-server.",
+            "Reduce ledger-writer's limits.",
+            "Lower inference-server's requests to 200m CPU.",
+            "Cut its limits to 512Mi.",
         ):
             self.assertTrue(krc.asks_for_cut("", ask), ask)
         self.assertTrue(krc.asks_for_cut("Calculate resource request reductions for api-server",
@@ -306,6 +337,9 @@ class PlatformCutRequestTest(RuleTestCase):
             "Investigate why checkout sees reduced requests since Monday.",
             "We are hitting reduced API limits on the ingress.",
             "Lower the request latency of checkout.",
+            "Reduce the HTTP requests of the frontend.",
+            "Lower the rate limits of the API gateway.",
+            "Lower the limits of the quota for team-a.",
             f"Why is payments-api crashlooping?\n\n{krc.FORMAT_MARKER}\n\nLower the requests if needed.",
             "A report of cost opportunities (e.g., underutilized nodes, right-sizing recommendations, idle resources).",
         ):

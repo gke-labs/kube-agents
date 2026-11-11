@@ -29,7 +29,8 @@ What it does
   missing field, an unknown kind or a blank check is refused once. The gate
   stores the accepted entries in ``metadata.rightsizing``.
 - **A Platform card whose request asks to cut requests or limits**
-  (:data:`CUT_REQUEST`, read in its title and in the body above the
+  (:data:`CUT_REQUEST`, or a bare "requests"/"limits" a workload owns,
+  :data:`BARE_CUT_REQUEST`, read in its title and in the body above the
   report-format stanza)
   and that created no card is refused once when it passed no entries, so a
   Platform Agent that checked the cluster itself passes the field or
@@ -129,8 +130,8 @@ FORMAT_MARKER = "## Report format"
 #: never on an answer. No "right-sizing": the front door writes it into plain
 #: fleet cost questions too.
 CUT_VERB = r"(?:lower|reduc|cut|shrink|decreas|downsiz|trim)\w*"
-#: "requests" and "limits" count only after a resource word, so a pull
-#: request, request traffic or an API rate limit does not.
+#: "requests" and "limits" count after a resource word, so a pull request,
+#: request traffic or an API rate limit does not.
 CUT_OBJECT = (
     r"(?:(?:cpu|memory|resource|container)\s+(?:and\s+(?:cpu|memory)\s+)?(?:requests?|limits?)"
     r"|machine[- ]types?|node[- ]counts?|pool sizes?)"
@@ -138,6 +139,20 @@ CUT_OBJECT = (
 CUT_REQUEST = re.compile(
     rf"\b{CUT_VERB}\b[^.\n]{{0,60}}?\b{CUT_OBJECT}\b|\b{CUT_OBJECT}\b[^.\n]{{0,30}}?\b{CUT_VERB}\b",
     re.IGNORECASE,
+)
+#: A bare "requests" or "limits" after a cut verb counts too, when a workload
+#: owns it ("the requests of inference-server", "ledger-writer's limits") or
+#: the sentence holds a quantity ("to 200m CPU"), and the sentence names no
+#: pull request, HTTP, API, rate or traffic sense. A bare noun with nothing
+#: that owns it ("sees reduced requests since Monday") does not count.
+BARE_CUT_REQUEST = re.compile(
+    rf"\b{CUT_VERB}\b[^.\n]{{0,60}}?(?:\b(?:the|its|their)\s+|[\w.-]+'s\s+)(?:requests|limits)\b"
+    rf"|\b{CUT_VERB}\b[^.\n]{{0,60}}?\b(?:requests|limits)\b(?=[^.\n]*\b\d+(?:\.\d+)?\s*(?:m|mi|gi|ki|cores?|cpus?)\b)",
+    re.IGNORECASE,
+)
+#: The senses of "requests" and "limits" a cut verb does not make a resource cut.
+NOT_A_RESOURCE_SENSE = re.compile(
+    r"\b(?:pull\s+requests?|PRs?|HTTP|https?|API|rate\s+limits?|traffic|latency|quotas?)\b", re.IGNORECASE
 )
 
 PARAM_DESCRIPTION = (
@@ -147,8 +162,8 @@ PARAM_DESCRIPTION = (
     "dependency means for a cut), and `checks` with one finding each for hpa, qos, sharing, source and "
     "packing (not needed for not_on_cluster). If several kinds apply, pick the first of "
     f"{', '.join(KIND_PRIORITY)} and name the others in `dependency`. Each field is one line with no "
-    "code fence (``` or ~~~). The tool checks each entry and renders them in `result`; an entry that fails is refused, "
-    "and dropped on the retry."
+    f"code fence (``` or ~~~). At most {MAX_ENTRIES} entries. The tool checks each entry and renders them in "
+    "`result`; an entry that fails is refused, and dropped on the retry."
 )
 
 PARAM_SCHEMA = {
@@ -216,14 +231,24 @@ def _line(entry: dict, card: bool = True) -> str:
     )
 
 
-def render(entries: list[dict], hidden: int = 0) -> str:
-    """The section added to ``result``: one line per workload, its checks under it, and a count of any not shown."""
+def render(entries: list[dict], hidden: int = 0, own_hidden: int = 0, past_limit: int = 0) -> str:
+    """The section added to ``result``: one line per workload, its checks under it, and a count of any not shown.
+
+    ``hidden`` counts the cards below this one's entries the cut past
+    :data:`MAX_SHOWN` dropped, ``own_hidden`` this card's own, and
+    ``past_limit`` this card's entries past :data:`MAX_ENTRIES`, dropped on
+    the retry.
+    """
     parts = [HEADING]
     for entry in entries:
         parts.append(_line(entry))
         for key, label in CHECK_KEYS.items():
             if key in entry.get("checks", {}):
                 parts.append(f"  - {label}: {entry['checks'][key]}")
+    if past_limit:
+        parts.append(f"- {past_limit} of this card's entries past the limit of {MAX_ENTRIES} not shown.")
+    if own_hidden:
+        parts.append(f"- {own_hidden} more of this card's entries not shown.")
     if hidden:
         parts.append(f"- {hidden} more entries not shown; the cards below this one hold them.")
     return "\n".join(parts)
@@ -262,7 +287,11 @@ def descendant_entries(conn, task_id: object) -> list[dict]:
 
 def asks_for_cut(title: str, body: str) -> bool:
     """Whether a card's title, or its request above the report-format stanza, asks to cut requests or limits."""
-    return bool(CUT_REQUEST.search(f"{title}\n{body.split(FORMAT_MARKER, 1)[0]}"))
+    text = f"{title}\n{body.split(FORMAT_MARKER, 1)[0]}"
+    if CUT_REQUEST.search(text):
+        return True
+    sentences = re.split(r"(?<=[.!?])\s+|\n", text)
+    return any(BARE_CUT_REQUEST.search(s) and not NOT_A_RESOURCE_SENSE.search(s) for s in sentences)
 
 
 def _read_board(connect, task_id: str) -> tuple[bool, bool, list[dict]]:
@@ -330,27 +359,35 @@ def rightsizing_rule(
             safe["checks"] = {key: redact(value) for key, value in entry["checks"].items()}
         stored.append(safe)
     body = str(result).rstrip() if result else ""
+    past_limit = max(0, len(items) - MAX_ENTRIES)
+    own_plain = {_line(entry, card=False) for entry in stored}
     shown, seen = [], set()
     for entry in stored + inherited:
         plain = _line(entry, card=False)
         # A line the text already quotes (the front door relaying the Platform
-        # card's answer), or one already shown, is not rendered again.
-        if plain in seen or plain in body or _line(entry) in body:
+        # card's answer), or one already shown, is not rendered again. Two
+        # cards that report the same words are two lines (each with its card);
+        # an inherited line that repeats one of this card's own is one.
+        if _line(entry) in seen or plain in body or _line(entry) in body or ("card" in entry and plain in own_plain):
             continue
-        seen.add(plain)
+        seen.add(_line(entry))
         shown.append(entry)
-    hidden = max(0, len(shown) - MAX_SHOWN)
-    if hidden:
-        logger.warning("[kanban] card %s: %d rightsizing entries not shown past %d", task_id, hidden, MAX_SHOWN)
-        shown = _cap(shown)
+    hidden = own_hidden = 0
+    if len(shown) > MAX_SHOWN:
+        logger.warning("[kanban] card %s: %d rightsizing entries not shown past %d", task_id, len(shown) - MAX_SHOWN, MAX_SHOWN)
+        capped = _cap(shown)
+        dropped = [entry for entry in shown if entry not in capped]
+        own_hidden = sum(1 for entry in dropped if "card" not in entry)
+        hidden = len(dropped) - own_hidden
+        shown = capped
     if stored:
         if metadata is not None and not isinstance(metadata, dict):
             # Upstream's _require_dict_metadata refuses this next; nothing to add to.
             return [], result, metadata
         metadata = {**(metadata or {}), METADATA_KEY: stored}
-    if not shown:
+    if not shown and not past_limit:
         return [], result, metadata
-    return [], gate.append_section(result, render(shown, hidden)), metadata
+    return [], gate.append_section(result, render(shown, hidden, own_hidden, past_limit)), metadata
 
 
 def apply_schema(schema: dict) -> dict:
