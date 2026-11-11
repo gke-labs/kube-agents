@@ -823,6 +823,10 @@ spec:
               value: "true"
             - name: OTEL_RESOURCE_ATTRIBUTES
               value: service.namespace=kubeagents-system,k8s.namespace.name=kubeagents-system,kubeagents.agent_type=platform,kubeagents.agent_name=platformagent
+            - name: KUBE_PROXY_SCOPE_FILE
+              value: /etc/kube-agents/scope/scope.json
+            - name: KUBE_PROXY_EXCLUDE_HOST_CLUSTER_ID
+              value: gke_example-project_us-central1-a_cluster-a
           image: ghcr.io/gke-labs/kube-agents/kube-proxy:latest
           imagePullPolicy: IfNotPresent
           lifecycle:
@@ -866,6 +870,9 @@ spec:
             - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
               name: event-watcher-ksa-token
               readOnly: true
+            - mountPath: /etc/kube-agents/scope
+              name: platform-agent-scope-vol
+              readOnly: true
       securityContext:
         fsGroup: 10000
         runAsNonRoot: true
@@ -884,6 +891,14 @@ spec:
           topologyKey: kubernetes.io/hostname
           whenUnsatisfiable: ScheduleAnyway
       volumes:
+        - configMap:
+            defaultMode: 292
+            items:
+              - key: scope.json
+                path: scope.json
+            name: platformagent-config
+            optional: true
+          name: platform-agent-scope-vol
         - name: kube-proxy-tls
           secret:
             defaultMode: 288

@@ -182,6 +182,8 @@ A first deployment in a live environment will find read-only commands nobody ant
 
 The exception is `gcp.scoped-sa.unmapped-scope`, which is not a verb problem at all. It means the request named a cluster in a project the [scoped service account pool](/kube-agents/reference/security-and-iam/#the-scoped-service-account-pool) has no account for; the refusal names the project and the cluster. The fix is one of the three the refusal and this page name. Declare that project in the scope and apply so the pool derives its account; exclude the cluster from the fleet; or leave the pool disarmed. A project created under a declared folder since the last apply is refused until the next apply lists it.
 
+`scope.excluded-cluster` isn't a verb problem either. The install's [`spec.scope.exclude.clusters`](/kube-agents/operator/platformagent-crd/#specscope) names that cluster, so the refusal is the exclusion working; remove the entry to let the agents back in. `scope.exclude-unreadable` means the broker can't read the scope file the operator mounts, and it reaches no cluster until it can.
+
 ## Credential placement
 
 | Data                             | `<name>-shell`                                             | `platform-agent`                                  | Credential broker                                                                                                                                                                                                                                                                             |
