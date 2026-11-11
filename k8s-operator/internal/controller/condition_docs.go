@@ -105,8 +105,8 @@ var platformAgentConditionDocs = []conditionDoc{
 	},
 	{
 		Type:    kanbanDispatcherFailingCondition,
-		Written: "From the first time the task-board dispatcher fails for a whole poll",
-		Meaning: "`True` (`TicksFailing`) once a board's dispatcher fails 60 ticks in a row (about one five-minute poll), or 3 in a streak at least a poll old, as on a locked board. A fully locked board fails only every 20 to 36 minutes, so there it turns `True` after about an hour. The message names the board, the streak and the last error class. Cards on that board are not dispatched; a full data volume is a common cause. `False` (`Ticking`) at the first poll where no board meets either rule. A good tick resets a streak; a board the dispatcher stops trying drops out after ten minutes. It does not change `phase` or `Ready`. A poll that cannot read the gateway's chat metrics listener leaves it as it is. A board quarantined as corrupt is not counted.",
+		Written: "From the first time the task-board dispatcher fails for a whole poll, or a tick on a board runs past 300 s or fails on a database lock after a busy timeout",
+		Meaning: "`True` (`TicksFailing`) once a board's dispatcher fails 60 ticks in a row (about one five-minute poll), or 3 in a streak at least a poll old, or once a board's tick runs past 300 s or fails on a database lock after waiting a 120 s busy timeout, as on a locked board; a good tick that runs past 300 s can set it for one poll. The message names the board and either the streak with the last error class, or the stuck tick. Cards on that board are not dispatched; a full data volume is a common cause. `False` (`Ticking`) at the first poll where no board meets any rule. A good tick resets a streak and a stuck board; a board the dispatcher stops trying drops out after ten minutes. It does not change `phase` or `Ready`. A poll that cannot read the gateway's chat metrics listener leaves it as it is. A board quarantined as corrupt is not counted.",
 	},
 	{
 		Type:    scopeUndeclaredCondition,

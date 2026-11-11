@@ -15,6 +15,8 @@ one import, in ``gateway/kanban_watchers_dispatcher.py``'s
    and is not counted.
 3. The tick's start, after the quarantine check and before ``connect()``,
    which on a locked board waits the busy timeout once per statement it runs.
+   Marked as the tick, so the registry can tell a tick that runs long (a
+   locked board) from the other tries.
 4. The tick's end, first in the ``finally`` block, on every way out.
 5-8. The same start and end around ``ready_nonempty``'s and
    ``auto_decompose_tick``'s per-board connects, which the loop runs beside the
@@ -61,8 +63,10 @@ FAILED_TICK_PATCHED = FAILED_TICK_ANCHOR + f"            _kage_dispatch_failures
 
 # The tick's start, after the quarantine check (a quarantined board's skipped tick is no try) and
 # before connect(), which on a locked board waits the busy timeout once per statement it runs.
+# Marked as the tick: a tick that runs long says the board is locked, where a long auto-decompose
+# try can be a model call.
 TICK_START_ANCHOR = '        kwargs = {k: v for k, v in asdict(self.settings).items() if k != "interval"}\n'
-TICK_START_PATCHED = f"        _kage_dispatch_failures.record_tick_start(slug)  # {MARKER}\n" + TICK_START_ANCHOR
+TICK_START_PATCHED = f"        _kage_dispatch_failures.record_tick_start(slug, tick=True)  # {MARKER}\n" + TICK_START_ANCHOR
 
 # ready_nonempty and auto_decompose_tick connect to each board too, in the same loop iteration as
 # the tick, and on a locked board each waits the busy timeout per statement as well (ready_nonempty
