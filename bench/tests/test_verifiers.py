@@ -8350,8 +8350,8 @@ def _run_objective(command: str) -> str:
         (f'eval "python3 {_SCRIPT_PATH} --readiness"', True),
         (f'eval "echo python3 {_SCRIPT_PATH} --readiness"', False),
         (f"xargs ls {_SCRIPT_PATH} --readiness", False),
-        # which flags take a value is not tabled, so the word after a bare flag is read as its value: the stated limit
-        ("sudo -n ls fleet_upgrade_report.py --readiness", True),
+        # which flags take a value is tabled, so a valueless flag like sudo -n does not eat the command
+        ("sudo -n ls fleet_upgrade_report.py --readiness", False),
         # a program behind a wrapper that is not the script, a shell or an interpreter is the command the wrapper runs
         (f"sudo ls {_SCRIPT_PATH} --readiness", False),
         (f"sudo -- ls {_SCRIPT_PATH} --readiness", False),
@@ -8375,6 +8375,7 @@ def test_webhook_readiness_run_objective_reads_the_argv(command, matches):
 
 
 def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
+    from kube_agents_bench.shell_words import _command_word_index
     from kube_agents_bench.verifiers import WorkerRun, _argv_runs, _shell_argvs
 
     assert _shell_argvs('cd /x && python3 "/a b/f.py" --readiness; echo done') == [
@@ -8836,6 +8837,65 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     assert _shell_argvs_with_exit_propagation("env -C /tmp ./f.py --readiness") == [
         (["env", "-C", "/tmp", "./f.py", "--readiness"], True),
     ]
+    assert _shell_argvs_with_exit_propagation('bash +o errexit -c "python3 f.py --readiness"') == [
+        (["bash", "+o", "errexit", "-c", "python3 f.py --readiness"], True),
+        (["python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation('bash +O extglob -c "python3 f.py --readiness"') == [
+        (["bash", "+O", "extglob", "-c", "python3 f.py --readiness"], True),
+        (["python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation('bash +e -c "python3 f.py --readiness"') == [
+        (["bash", "+e", "-c", "python3 f.py --readiness"], True),
+        (["python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation('bash --init-file /tmp/rc -c "python3 f.py --readiness"') == [
+        (["bash", "--init-file", "/tmp/rc", "-c", "python3 f.py --readiness"], True),
+        (["python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation('bash 2>/dev/null -c "python3 f.py --readiness"') == [
+        (["bash", "2", ">", "/dev/null", "-c", "python3 f.py --readiness"], True),
+        (["python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation('bash >/tmp/out -c "python3 f.py --readiness"') == [
+        (["bash", ">", "/tmp/out", "-c", "python3 f.py --readiness"], True),
+        (["python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("timeout -- 30 setsid python3 f.py --readiness") == [
+        (["timeout", "--", "30", "setsid", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("chroot -- /mnt setsid python3 f.py --readiness") == [
+        (["chroot", "--", "/mnt", "setsid", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("chroot /tmp/time python3 /opt/chat-collector/collect.py compliance-audit") == [
+        (["chroot", "/tmp/time", "python3", "/opt/chat-collector/collect.py", "compliance-audit"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("env -C/tmp/u ./collect.py --out /tmp/setsid compliance-audit") == [
+        (["env", "-C/tmp/u", "./collect.py", "--out", "/tmp/setsid", "compliance-audit"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("env -C/tmp/u setsid python3 collect.py compliance-audit") == [
+        (["env", "-C/tmp/u", "setsid", "python3", "collect.py", "compliance-audit"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("env -ufoo setsid python3 collect.py compliance-audit") == [
+        (["env", "-ufoo", "setsid", "python3", "collect.py", "compliance-audit"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("env -C /tmp setsid python3 f.py --readiness") == [
+        (["env", "-C", "/tmp", "setsid", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("exec -a collect.py /bin/true compliance-audit") == [
+        (["exec", "-a", "collect.py", "/bin/true", "compliance-audit"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("env -u python3 /bin/true collect.py compliance-audit") == [
+        (["env", "-u", "python3", "/bin/true", "collect.py", "compliance-audit"], True),
+    ]
+    assert _command_word_index(["exec", "-a", "collect.py", "/bin/true", "compliance-audit"], script="collect.py") is None
+    assert _command_word_index(["env", "-u", "python3", "/bin/true", "collect.py", "compliance-audit"], script="collect.py") is None
+    assert _command_word_index(["env", "-u", "python3", "/bin/true", "collect.py", "compliance-audit"]) is None
+    assert _shell_argvs('bash +o errexit -c "git push origin main"')[-1] == ["git", "push", "origin", "main"]
+    assert _shell_argvs('bash +O extglob -c "git push origin main"')[-1] == ["git", "push", "origin", "main"]
+    assert _shell_argvs('bash --init-file /tmp/rc -c "git push origin main"')[-1] == ["git", "push", "origin", "main"]
+    assert _shell_argvs('bash 2>/dev/null -c "git push origin main"')[-1] == ["git", "push", "origin", "main"]
+    assert _shell_argvs('bash >/tmp/out -c "git push origin main"')[-1] == ["git", "push", "origin", "main"]
     assert _shell_argvs_with_exit_propagation("timeout 1.5 setsid python3 f.py --readiness") == [
         (["timeout", "1.5", "setsid", "python3", "f.py", "--readiness"], False),
     ]

@@ -103,7 +103,9 @@ from kube_agents_bench import (
 )
 from kube_agents_bench.parsing import DELEGATION_TOOL
 from kube_agents_bench.shell_words import (
+    _GENERIC_WRAPPER_VAL_OPTS,
     _INTERPRETER_RE,
+    _SETSID_VAL_LESS_FLAGS,
     _SHELL_ARITHMETIC_OPENER,
     _SHELL_ASSIGNMENT_RE,
     _SHELL_COUNT_RE,
@@ -116,9 +118,15 @@ from kube_agents_bench.shell_words import (
     _SHELL_PROGRAMS_WITH_COMMAND_STRING,
     _SHELL_RESERVED_WORDS,
     _SHELL_WRAPPER_POSITIONALS,
+    _SUDO_LONG_VAL_LESS_OPTS,
+    _SUDO_SHORT_VAL_OPTS,
+    _SUDO_VAL_LESS_FLAGS,
+    _SUDO_VAL_OPTS,
     _command_word_index,
+    _extract_shell_command_string,
     _is_control_operator,
     _is_redirect,
+    _scan_command_prefix,
     _shell_argvs,
     _shell_words_and_spans,
     _substitution_commands,
@@ -2671,236 +2679,11 @@ def _has_leading_negation(seg: list[str]) -> bool:
     return False
 
 
-_SUDO_VAL_OPTS = {
-    "-u", "-g", "-p", "-C", "-D", "-R", "-T", "-U", "-h", "-r", "-t",
-    "--user", "--group", "--prompt", "--close-from", "--chdir", "--chroot",
-    "--command-timeout", "--other-user", "--host", "--role", "--type",
-}
-_SUDO_SHORT_VAL_OPTS = {opt[1:] for opt in _SUDO_VAL_OPTS if opt.startswith("-") and not opt.startswith("--")}
-_SUDO_VAL_LESS_FLAGS = set("AbBEHinNPSsv")
-_SUDO_LONG_VAL_LESS_OPTS = {
-    "--askpass", "--bell", "--login",
-    "--non-interactive", "--stdin", "--shell", "--validate",
-    "--set-home", "--preserve-groups", "--no-update",
-}
-_SETSID_VAL_LESS_FLAGS = set("cwf")
-_GENERIC_WRAPPER_VAL_OPTS = {
-    "env": frozenset(("-u", "-C", "-S", "--unset", "--chdir", "--split-string")),
-    "nice": frozenset(("-n", "--adjustment")),
-    "timeout": frozenset(("-s", "-k", "--signal", "--kill-after")),
-    "exec": frozenset(("-a",)),
-    "stdbuf": frozenset(("-i", "-o", "-e", "--input", "--output", "--error")),
-    "ionice": frozenset(("-c", "-n", "-p", "--class", "--classdata", "--pid")),
-    "chroot": frozenset(("--userspec", "--groups")),
-}
-
-
 def _has_detaching_wrapper(seg: list[str]) -> bool:
     """True if seg invokes an exec wrapper with options that detach the process
     or do not guarantee exit propagation (see :class:`WorkerRun` for wrapper and operator rules)."""
-    idx = 0
-    redirect_target = False
-    while idx < len(seg):
-        word = seg[idx]
-        if redirect_target:
-            redirect_target = False
-            idx += 1
-            continue
-        if _is_redirect(word) or (word.isdigit() and idx + 1 < len(seg) and _is_redirect(seg[idx + 1])):
-            redirect_target = not word.isdigit()
-            idx += 1
-            continue
-        if _SHELL_ASSIGNMENT_RE.match(word) or word in _SHELL_RESERVED_WORDS:
-            idx += 1
-            continue
-        base = os.path.basename(word)
-        if base in ("watch", "xargs", "flock", "time"):
-            return True
-        if base == "setsid":
-            idx += 1
-            saw_w = False
-            inner_redirect_target = False
-            while idx < len(seg):
-                w = seg[idx]
-                if inner_redirect_target:
-                    inner_redirect_target = False
-                    idx += 1
-                    continue
-                if _is_redirect(w) or (w.isdigit() and idx + 1 < len(seg) and _is_redirect(seg[idx + 1])):
-                    inner_redirect_target = not w.isdigit()
-                    idx += 1
-                    continue
-                if w == "--":
-                    idx += 1
-                    break
-                if w in ("-w", "--wait") or ("--wait".startswith(w) and len(w) >= 3):
-                    saw_w = True
-                    idx += 1
-                    continue
-                elif w.startswith("-") and not w.startswith("--") and len(w) > 1:
-                    if all(c in _SETSID_VAL_LESS_FLAGS for c in w[1:]):
-                        if "w" in w[1:]:
-                            saw_w = True
-                        idx += 1
-                        continue
-                    return True
-                elif w.startswith("-"):
-                    return True
-                if not w.startswith("-") and not _SHELL_ASSIGNMENT_RE.match(w):
-                    break
-                idx += 1
-            if not saw_w:
-                return True
-            continue
-        elif base == "sudo":
-            idx += 1
-            prev_opt_takes_val = False
-            inner_redirect_target = False
-            while idx < len(seg):
-                w = seg[idx]
-                if inner_redirect_target:
-                    inner_redirect_target = False
-                    idx += 1
-                    continue
-                if prev_opt_takes_val:
-                    prev_opt_takes_val = False
-                    idx += 1
-                    continue
-                if _is_redirect(w) or (w.isdigit() and idx + 1 < len(seg) and _is_redirect(seg[idx + 1])):
-                    inner_redirect_target = not w.isdigit()
-                    idx += 1
-                    continue
-                if w == "--":
-                    idx += 1
-                    break
-                if not w.startswith("-") and not _SHELL_ASSIGNMENT_RE.match(w):
-                    break
-                if w.startswith("--"):
-                    opt_name, _, _ = w.partition("=")
-                    if opt_name in _SUDO_VAL_OPTS:
-                        if "=" not in w:
-                            prev_opt_takes_val = True
-                        idx += 1
-                        continue
-                    if opt_name in _SUDO_LONG_VAL_LESS_OPTS or opt_name == "--preserve-env":
-                        idx += 1
-                        continue
-                    return True
-                elif w.startswith("-") and len(w) > 1:
-                    for ci, c in enumerate(w[1:]):
-                        if c == "b":
-                            return True
-                        if c in _SUDO_VAL_LESS_FLAGS:
-                            continue
-                        if c in _SUDO_SHORT_VAL_OPTS:
-                            rest = w[1 + ci + 1:]
-                            if not rest:
-                                prev_opt_takes_val = True
-                            break
-                        return True
-                    idx += 1
-                    continue
-                elif _SHELL_ASSIGNMENT_RE.match(w):
-                    idx += 1
-                    continue
-                else:
-                    return True
-            continue
-        elif base == "command":
-            idx += 1
-            inner_redirect_target = False
-            while idx < len(seg):
-                w = seg[idx]
-                if inner_redirect_target:
-                    inner_redirect_target = False
-                    idx += 1
-                    continue
-                if _is_redirect(w) or (w.isdigit() and idx + 1 < len(seg) and _is_redirect(seg[idx + 1])):
-                    inner_redirect_target = not w.isdigit()
-                    idx += 1
-                    continue
-                if w == "--":
-                    idx += 1
-                    break
-                if w.startswith("-") and not w.startswith("--"):
-                    if any(c in "vV" for c in w[1:]):
-                        return True
-                    if all(c == "p" for c in w[1:]):
-                        idx += 1
-                        continue
-                    return True
-                elif w.startswith("-"):
-                    return True
-                if not w.startswith("-") and not _SHELL_ASSIGNMENT_RE.match(w):
-                    break
-                idx += 1
-            continue
-        elif base in _SHELL_EXEC_WRAPPERS:
-            idx += 1
-            takes_val = False
-            positionals = _SHELL_WRAPPER_POSITIONALS.get(base, 0)
-            inner_redirect_target = False
-            while idx < len(seg):
-                w = seg[idx]
-                if inner_redirect_target:
-                    inner_redirect_target = False
-                    idx += 1
-                    continue
-                if _is_redirect(w) or (w.isdigit() and idx + 1 < len(seg) and _is_redirect(seg[idx + 1])):
-                    inner_redirect_target = not w.isdigit()
-                    idx += 1
-                    continue
-                if takes_val:
-                    takes_val = False
-                    idx += 1
-                    continue
-                if os.path.basename(w) in _SHELL_EXEC_WRAPPERS:
-                    break
-                if w == "--":
-                    idx += 1
-                    break
-                if w.startswith(_SHELL_FLAG_PREFIX):
-                    if base in _GENERIC_WRAPPER_VAL_OPTS:
-                        if w.startswith("--"):
-                            opt_name, _, _ = w.partition("=")
-                            takes_val = (opt_name in _GENERIC_WRAPPER_VAL_OPTS[base] and "=" not in w)
-                        elif len(w) >= 2 and f"-{w[-1]}" in _GENERIC_WRAPPER_VAL_OPTS[base]:
-                            takes_val = True
-                        else:
-                            takes_val = False
-                    else:
-                        takes_val = False
-                    idx += 1
-                    continue
-                if positionals:
-                    positionals -= 1
-                    idx += 1
-                    continue
-                if _SHELL_COUNT_RE.match(w):
-                    idx += 1
-                    continue
-                w_base = os.path.basename(w)
-                if (
-                    w_base in _SHELL_PROGRAMS_WITH_COMMAND_STRING
-                    or bool(_INTERPRETER_RE.match(w_base))
-                    or w == _SHELL_EVAL
-                    or (not w.startswith("-") and not _SHELL_ASSIGNMENT_RE.match(w) and ("." in w_base or "/" in w))
-                ):
-                    break
-                if w.startswith(_SHELL_EXPANSION_PREFIX):
-                    idx += 1
-                    continue
-                if _SHELL_ASSIGNMENT_RE.match(w):
-                    idx += 1
-                    continue
-                break
-            continue
-        else:
-            # Word is not an assignment, not reserved, not a redirect, and not an exec wrapper.
-            # It is the command word itself (unknown script, binary, or interpreter).
-            # The wrapper prefix ends here.
-            break
-    return False
+    wrappers, _ = _scan_command_prefix(seg)
+    return any(detaches for _, _, detaches in wrappers)
 
 
 def _shell_argvs_with_exit_propagation(
@@ -2989,39 +2772,7 @@ def _shell_argvs_with_exit_propagation(
 
         index = _command_word_index(seg)
         if index is not None and os.path.basename(seg[index]) in _SHELL_PROGRAMS_WITH_COMMAND_STRING:
-            flag_idx = index + 1
-            has_noexec = False
-            has_help_or_version = False
-            takes_val = False
-            cmd_string = None
-            while flag_idx < len(seg):
-                word = seg[flag_idx]
-                if takes_val:
-                    takes_val = False
-                    flag_idx += 1
-                    continue
-                if word == "--":
-                    break
-                if word.startswith("--"):
-                    if word in ("--help", "--version"):
-                        has_help_or_version = True
-                    if word == "--rcfile":
-                        takes_val = True
-                    flag_idx += 1
-                    continue
-                if word.startswith("-") and len(word) > 1:
-                    if "n" in word[1:]:
-                        has_noexec = True
-                    if "c" in word[1:]:
-                        if flag_idx + 1 < len(seg):
-                            cmd_string = seg[flag_idx + 1]
-                        break
-                    if word[-1] in "oO":
-                        takes_val = True
-                    flag_idx += 1
-                    continue
-                break
-
+            cmd_string, has_noexec, has_help_or_version = _extract_shell_command_string(seg, index + 1)
             if cmd_string is not None:
                 shell_carries = carries_exit and not has_noexec and not has_help_or_version
                 for inner_argv, inner_carries in _shell_argvs_with_exit_propagation(

@@ -297,6 +297,278 @@ def _is_control_operator(word: str) -> bool:
     return isinstance(word, _ShellOperator) and (word == _SHELL_LINE_END or set(word) <= _SHELL_OPERATOR_CHARS)
 
 
+_SUDO_VAL_OPTS = {
+    "-u", "-g", "-p", "-C", "-D", "-R", "-T", "-U", "-h", "-r", "-t",
+    "--user", "--group", "--prompt", "--close-from", "--chdir", "--chroot",
+    "--command-timeout", "--other-user", "--host", "--role", "--type",
+}
+_SUDO_SHORT_VAL_OPTS = {opt[1:] for opt in _SUDO_VAL_OPTS if opt.startswith("-") and not opt.startswith("--")}
+_SUDO_VAL_LESS_FLAGS = set("AbBEHinNPSsv")
+_SUDO_LONG_VAL_LESS_OPTS = {
+    "--askpass", "--bell", "--login",
+    "--non-interactive", "--stdin", "--shell", "--validate",
+    "--set-home", "--preserve-groups", "--no-update",
+}
+_SETSID_VAL_LESS_FLAGS = set("cwf")
+_GENERIC_WRAPPER_VAL_OPTS = {
+    "env": frozenset(("-u", "-C", "-S", "--unset", "--chdir", "--split-string")),
+    "nice": frozenset(("-n", "--adjustment")),
+    "timeout": frozenset(("-s", "-k", "--signal", "--kill-after")),
+    "exec": frozenset(("-a",)),
+    "stdbuf": frozenset(("-i", "-o", "-e", "--input", "--output", "--error")),
+    "ionice": frozenset(("-c", "-n", "-p", "--class", "--classdata", "--pid")),
+    "chroot": frozenset(("--userspec", "--groups")),
+    "watch": frozenset(("-n", "--interval")),
+    "xargs": frozenset(("-I", "-i", "-n", "-s", "-L", "-d", "-E", "-a")),
+}
+
+
+def _extract_shell_command_string(
+    argv: list[str], start_index: int
+) -> tuple[str | None, bool, bool]:
+    """Extract a shell's -c command string and flags from argv starting at start_index.
+    Returns (cmd_string, has_noexec, has_help_or_version).
+    Handles options starting with '-' or '+', options with values (-o, -O, +o, +O, --rcfile, --init-file),
+    and skips redirects anywhere on the command line before -c."""
+    flag_idx = start_index
+    takes_val = False
+    redirect_target = False
+    has_noexec = False
+    has_help_or_version = False
+    cmd_string = None
+
+    while flag_idx < len(argv):
+        word = argv[flag_idx]
+        if redirect_target:
+            redirect_target = False
+            flag_idx += 1
+            continue
+        if takes_val:
+            takes_val = False
+            flag_idx += 1
+            continue
+        if _is_redirect(word) or (word.isdigit() and flag_idx + 1 < len(argv) and _is_redirect(argv[flag_idx + 1])):
+            redirect_target = not word.isdigit()
+            flag_idx += 1
+            continue
+        if word == "--":
+            break
+        if word.startswith("--"):
+            if word in ("--help", "--version"):
+                has_help_or_version = True
+            elif word in ("--rcfile", "--init-file"):
+                takes_val = True
+            elif word.startswith("--rcfile=") or word.startswith("--init-file="):
+                pass
+            flag_idx += 1
+            continue
+        if word.startswith("+") and len(word) > 1:
+            if word[-1] in "oO":
+                takes_val = True
+            flag_idx += 1
+            continue
+        if word.startswith("-") and len(word) > 1:
+            if "n" in word[1:]:
+                has_noexec = True
+            if "c" in word[1:]:
+                if flag_idx + 1 < len(argv):
+                    cmd_string = argv[flag_idx + 1]
+                break
+            if word[-1] in "oO":
+                takes_val = True
+            flag_idx += 1
+            continue
+        break
+
+    return cmd_string, has_noexec, has_help_or_version
+
+
+def _scan_command_prefix(
+    argv: list[str],
+) -> tuple[list[tuple[str, int, bool]], int | None]:
+    """Scan the wrapper prefix of an argv, tracking each exec wrapper and whether it detaches or
+    breaks exit propagation. Returns (wrappers, command_index), where wrappers is a list of
+    (wrapper_name, wrapper_index, detaches), and command_index is the index of the wrapped command word
+    in argv, or None if no command word follows."""
+    idx = 0
+    redirect_target = False
+
+    # Step 1: skip leading redirects, assignments, and reserved words
+    while idx < len(argv):
+        word = argv[idx]
+        if redirect_target:
+            redirect_target = False
+            idx += 1
+            continue
+        if _is_redirect(word) or (word.isdigit() and idx + 1 < len(argv) and _is_redirect(argv[idx + 1])):
+            redirect_target = not word.isdigit()
+            idx += 1
+            continue
+        if _SHELL_ASSIGNMENT_RE.match(word) or word in _SHELL_RESERVED_WORDS:
+            idx += 1
+            continue
+        break
+
+    wrappers: list[tuple[str, int, bool]] = []
+
+    # Step 2: iterate through wrapper chain
+    while idx < len(argv):
+        word = argv[idx]
+        if redirect_target:
+            redirect_target = False
+            idx += 1
+            continue
+        if _is_redirect(word) or (word.isdigit() and idx + 1 < len(argv) and _is_redirect(argv[idx + 1])):
+            redirect_target = not word.isdigit()
+            idx += 1
+            continue
+
+        base = os.path.basename(word)
+        if base not in _SHELL_EXEC_WRAPPERS:
+            # Reached the wrapped command word!
+            return wrappers, idx
+
+        # Parsing wrapper `base`
+        wrapper_name = base
+        wrapper_idx = idx
+        idx += 1  # advance past wrapper name
+
+        options_ended = False
+        positionals = _SHELL_WRAPPER_POSITIONALS.get(wrapper_name, 0)
+        duration_needed = (wrapper_name == "timeout")
+        saw_w = False
+        detaches = (wrapper_name in ("watch", "xargs", "flock", "time"))
+
+        while idx < len(argv):
+            # Skip redirects
+            if redirect_target:
+                redirect_target = False
+                idx += 1
+                continue
+            if _is_redirect(argv[idx]) or (argv[idx].isdigit() and idx + 1 < len(argv) and _is_redirect(argv[idx + 1])):
+                redirect_target = not argv[idx].isdigit()
+                idx += 1
+                continue
+
+            w = argv[idx]
+
+            # Environment assignments (e.g. `env FOO=BAR ...`)
+            if _SHELL_ASSIGNMENT_RE.match(w):
+                idx += 1
+                continue
+
+            # Options parsing before options end
+            if not options_ended and w.startswith("-") and w != "-" and not _is_redirect(w):
+                if w == "--":
+                    options_ended = True
+                    idx += 1
+                    continue
+
+                takes_val = False
+                if wrapper_name == "setsid":
+                    if w in ("-w", "--wait") or ("--wait".startswith(w) and len(w) >= 3):
+                        saw_w = True
+                    elif w.startswith("-") and not w.startswith("--") and len(w) > 1:
+                        if all(c in _SETSID_VAL_LESS_FLAGS for c in w[1:]):
+                            if "w" in w[1:]:
+                                saw_w = True
+                        else:
+                            detaches = True
+                    else:
+                        detaches = True
+                elif wrapper_name == "sudo":
+                    if w.startswith("--"):
+                        opt_name, _, _ = w.partition("=")
+                        if opt_name in _SUDO_VAL_OPTS:
+                            if "=" not in w:
+                                takes_val = True
+                        elif opt_name in _SUDO_LONG_VAL_LESS_OPTS or opt_name == "--preserve-env":
+                            pass
+                        else:
+                            detaches = True
+                    elif w.startswith("-") and len(w) > 1:
+                        for ci, c in enumerate(w[1:]):
+                            if c == "b":
+                                detaches = True
+                            elif c in _SUDO_VAL_LESS_FLAGS:
+                                continue
+                            elif c in _SUDO_SHORT_VAL_OPTS:
+                                rest = w[1 + ci + 1:]
+                                if not rest:
+                                    takes_val = True
+                                break
+                            else:
+                                detaches = True
+                                break
+                    else:
+                        detaches = True
+                elif wrapper_name == "command":
+                    if w.startswith("-") and not w.startswith("--"):
+                        if any(c in "vV" for c in w[1:]):
+                            detaches = True
+                        elif all(c == "p" for c in w[1:]):
+                            pass
+                        else:
+                            detaches = True
+                    else:
+                        detaches = True
+                else:
+                    # Generic wrappers (_GENERIC_WRAPPER_VAL_OPTS)
+                    val_opts = _GENERIC_WRAPPER_VAL_OPTS.get(wrapper_name, frozenset())
+                    if w.startswith("--"):
+                        opt_name, _, _ = w.partition("=")
+                        if opt_name in val_opts and "=" not in w:
+                            takes_val = True
+                    elif w.startswith("-") and len(w) > 1:
+                        for ci, c in enumerate(w[1:]):
+                            if f"-{c}" in val_opts:
+                                rest = w[1 + ci + 1:]
+                                if not rest:
+                                    takes_val = True
+                                break
+
+                idx += 1
+                if takes_val:
+                    # Consume next non-redirect argument as value
+                    while idx < len(argv):
+                        if redirect_target:
+                            redirect_target = False
+                            idx += 1
+                            continue
+                        if _is_redirect(argv[idx]) or (argv[idx].isdigit() and idx + 1 < len(argv) and _is_redirect(argv[idx + 1])):
+                            redirect_target = not argv[idx].isdigit()
+                            idx += 1
+                            continue
+                        # Found option value
+                        idx += 1
+                        break
+                continue
+
+            # Non-option argument for wrapper
+            options_ended = True
+
+            if positionals > 0:
+                positionals -= 1
+                idx += 1
+                continue
+
+            if duration_needed:
+                if _SHELL_COUNT_RE.match(w) or w.startswith(_SHELL_EXPANSION_PREFIX):
+                    duration_needed = False
+                    idx += 1
+                    continue
+
+            # All wrapper options, positionals, and durations consumed!
+            break
+
+        if wrapper_name == "setsid" and not saw_w:
+            detaches = True
+
+        wrappers.append((wrapper_name, wrapper_idx, detaches))
+
+    return wrappers, None
+
+
 def _shell_argvs(command: str) -> list[list[str]]:
     """Each segment of a command line as an argv: comments come off and the line is tokenised
     first, so a quoted path is one word and a quoted sentence one word whatever it contains,
@@ -323,31 +595,9 @@ def _shell_argvs(command: str) -> list[list[str]]:
             continue
         if index is None or os.path.basename(argv[index]) not in _SHELL_PROGRAMS_WITH_COMMAND_STRING:
             continue
-        flag_idx = index + 1
-        takes_val = False
-        while flag_idx < len(argv):
-            word = argv[flag_idx]
-            if takes_val:
-                takes_val = False
-                flag_idx += 1
-                continue
-            if word == "--":
-                break
-            if word.startswith("--"):
-                if word == "--rcfile":
-                    takes_val = True
-                flag_idx += 1
-                continue
-            if word.startswith("-") and len(word) > 1:
-                if "c" in word[1:]:
-                    if flag_idx + 1 < len(argv):
-                        argvs.extend(_shell_argvs(argv[flag_idx + 1]))
-                    break
-                if word[-1] in "oO":
-                    takes_val = True
-                flag_idx += 1
-                continue
-            break
+        cmd_string, _, _ = _extract_shell_command_string(argv, index + 1)
+        if cmd_string is not None:
+            argvs.extend(_shell_argvs(cmd_string))
     for span in spans:
         inner = _substitution_commands(span)
         if inner is not None:
@@ -364,51 +614,26 @@ def _command_word_index(
     create a branch or a pull request this way). Leading ``NAME=value``
     assignments and reserved words are skipped, and so is a redirect with its target, which bash
     takes anywhere on the line. After an exec wrapper (``timeout``, ``sudo``, ``env`` ...) only
-    the wrapper's own words are transparent: a flag, the word after a flag (its value, ``-u user``
-    or ``-s KILL``, unless that word is a flag itself, ``sudo -E -u``; which flags take one is not tabled, so the word after a bare flag is read as
-    its value even when it is a command, the one over-credit this leaves), a duration or count
-    (``timeout 600``), an expansion the reader never resolves (``timeout $T``), ``--``, which
-    ends its options, and the one positional ``flock`` and ``chroot`` take ahead of their command
-    (``_SHELL_WRAPPER_POSITIONALS``). The first word that is none of those is the command the wrapper runs: a
-    shell, an interpreter or the script is returned, and any other word (``ls``, ``echo``,
-    ``find``, ``grep``) is a command of its own, behind a wrapper as at the front of the argv,
+    the wrapper's own words are transparent: its flags and their tabled values (attached or separate),
+    durations or counts (``timeout 600``), expansions the reader never resolves (``timeout $T``), ``--``,
+    which ends options, and positionals (``flock``, ``chroot``). The first word that is none of those is
+    the command the wrapper runs: a shell, an interpreter or the script is returned, and any other word
+    (``ls``, ``echo``, ``find``, ``grep``) is a command of its own, behind a wrapper as at the front of the argv,
     and None is returned: nothing it names as an argument runs."""
-    after_wrapper = False
-    takes_value = False
-    positionals = 0
-    for index, word in enumerate(argv):
-        base = os.path.basename(word)
-        if matches is not None and matches(argv, index):
-            return index
-        if base in _SHELL_PROGRAMS_WITH_COMMAND_STRING or _INTERPRETER_RE.match(base) or (script and base == script) or word == _SHELL_EVAL:
-            return index
-        if _SHELL_ASSIGNMENT_RE.match(word) or word in _SHELL_RESERVED_WORDS:
-            takes_value = False
-            continue
-        if base in _SHELL_EXEC_WRAPPERS:
-            after_wrapper, takes_value = True, False
-            positionals = _SHELL_WRAPPER_POSITIONALS.get(base, 0)
-            continue
-        if _is_redirect(word) or (word.isdigit() and index + 1 < len(argv) and _is_redirect(argv[index + 1])):
-            # A redirect takes the next word as its target; a bare fd number ahead of one is its own.
-            takes_value = not word.isdigit()
-            continue
-        if after_wrapper and word.startswith(_SHELL_FLAG_PREFIX):
-            # A flag in its own right, never the previous flag's value (`sudo -E -u hermes`); `--`
-            # ends the options and takes nothing.
-            takes_value = word != _SHELL_OPTIONS_END
-            continue
-        if takes_value:
-            takes_value = False
-            continue
-        if not after_wrapper:
-            return None
-        if _SHELL_COUNT_RE.match(word) or word.startswith(_SHELL_EXPANSION_PREFIX):
-            continue
-        if positionals:
-            positionals -= 1
-            continue
+    _, cmd_index = _scan_command_prefix(argv)
+    if cmd_index is None:
         return None
+    word = argv[cmd_index]
+    base = os.path.basename(word)
+    if matches is not None and matches(argv, cmd_index):
+        return cmd_index
+    if (
+        base in _SHELL_PROGRAMS_WITH_COMMAND_STRING
+        or _INTERPRETER_RE.match(base)
+        or (script and base == script)
+        or word == _SHELL_EVAL
+    ):
+        return cmd_index
     return None
 
 

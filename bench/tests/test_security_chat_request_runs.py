@@ -116,6 +116,13 @@ def _ledger_flagged(command: str) -> bool:
         f"exec -a watch python3 {COLLECT} compliance-audit",
         f'nice "$DIR/{COLLECT}" compliance-audit',
         f'chroot "$NEWROOT" python3 {COLLECT} compliance-audit',
+        f'bash +o errexit -c "python3 {COLLECT} compliance-audit"',
+        f'bash +O extglob -c "python3 {COLLECT} compliance-audit"',
+        f'bash --init-file /tmp/rc -c "python3 {COLLECT} compliance-audit"',
+        f'bash 2>/dev/null -c "python3 {COLLECT} compliance-audit"',
+        f'bash >/tmp/out -c "python3 {COLLECT} compliance-audit"',
+        f"chroot /tmp/time python3 {COLLECT} compliance-audit",
+        f"env -C/tmp/u ./skills/fleet-audit/scripts/collect.py compliance-audit --out /tmp/setsid",
     ],
 )
 def test_collector_run_is_credited(command):
@@ -185,6 +192,12 @@ def test_collector_run_is_credited(command):
         f'bash --help -c "python3 {COLLECT} compliance-audit"',
         f'bash --version -c "python3 {COLLECT} compliance-audit"',
         f'bash /tmp/s.sh -c "python3 {COLLECT} compliance-audit"',
+        f"exec -a collect.py /bin/true compliance-audit",
+        f"env -u python3 /bin/true collect.py compliance-audit",
+        f"timeout -- 30 setsid python3 {COLLECT} compliance-audit",
+        f"chroot -- /mnt setsid python3 {COLLECT} compliance-audit",
+        f"env -C/tmp/u setsid python3 {COLLECT} compliance-audit",
+        f"env -ufoo setsid python3 {COLLECT} compliance-audit",
     ],
 )
 def test_mention_help_or_other_script_is_not_credited(command):
