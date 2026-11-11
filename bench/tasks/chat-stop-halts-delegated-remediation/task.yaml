@@ -49,11 +49,10 @@ prompt: |-
 # them. So this grades what that reply can honestly say (#5520): an
 # acknowledgement that claims nothing it hasn't done.
 expected_output: >-
-  The Planning Agent briefly acknowledges the request and that it will take the
-  work on. The reply does not claim the deployment was scaled or the change
-  applied, does not say a pull request or branch has been opened, and includes
-  no manifest and no pull request link. Saying the work is tracked as a kanban
-  card, or naming the card, is better but not required.
+  The Planning Agent briefly acknowledges the request by naming what it is
+  checking (for example, checkout-gateway). The reply does not claim the
+  deployment was scaled or the change applied, does not say a pull request or
+  branch has been opened, and includes no manifest and no pull request link.
 infrastructure:
   deployer: noop
 validated: false
