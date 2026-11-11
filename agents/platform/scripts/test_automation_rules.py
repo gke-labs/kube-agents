@@ -94,6 +94,11 @@ class TestParse(unittest.TestCase):
                 self.assertEqual((rules.allow, rules.deny), ((), ()))
                 self.assertFalse(ar.decide(rules, "no-pdb", "dev").allowed)
 
+    def test_a_key_too_large_to_print_refuses_the_file(self):
+        huge = ":".join(["59"] * 2600)
+        for text in (f"version: 1\n? {huge}\n: x\n", f"version: 1\nautomerge:\n  ? {huge}\n  : x\n"):
+            self.assertEqual(ar.parse(text).status, ar.INVALID)
+
     def test_merge_key_named_in_error(self):
         rules = ar.parse("version: 1\nautomerge: {allow: [{<<: {fix: no-pdb}, environments: [dev]}]}\n")
         self.assertEqual(rules.status, ar.INVALID)

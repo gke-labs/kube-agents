@@ -205,6 +205,10 @@ def parse(text: str) -> Rules:
             )
     except RulesError as exc:
         return Rules(status=INVALID, error=str(exc))
+    except ValueError as exc:
+        # A key too large to print (a YAML 1.1 base-60 integer past Python's
+        # 4300-digit str limit) fails while the error message is built.
+        return Rules(status=INVALID, error=f"not a rules file ({exc})")
     return Rules(status=LOADED, allow=parsed["allow"], deny=parsed["deny"], warnings=tuple(warnings))
 
 
