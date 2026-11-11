@@ -1795,13 +1795,25 @@ class A4DelegationAttenuates(unittest.TestCase):
 
         The Tier CRD (#3659) is for cluster administrators alone, so:
 
-          - no Role or ClusterRole the product mints or the chart ships names
-            `tiers`, by name or by a wildcard group or resource, at any verb;
-          - the operator's ClusterRole, on both delivery paths, reads tiers and
-            writes their status, and nothing more, counting wildcard rules;
+          - no Role or ClusterRole in the `spec.mode: today` goldens or in the
+            chart's own templates names `tiers`, by name or by a wildcard
+            group, resource or subresource, at any verb;
+          - the operator's RBAC, on both delivery paths (role.yaml plus the
+            leader-election Role for kustomize, operator-rbac.yaml for the
+            chart), reads tiers and writes their status, and nothing more,
+            counting wildcard rules;
           - nothing in the chart or the operator's config aggregates a role
-            naming `tiers` into `admin`, `edit` or `view`, which would hand
-            tiers to every namespace admin by default.
+            that reaches tiers into `admin`, `edit` or `view`, which would
+            hand tiers to every namespace admin by default.
+
+        Every rule read from a chart template must have plain apiGroups,
+        resources and verbs: a templated field would leave the predicate
+        reading a placeholder.
+
+        Not covered yet: the roles the operator mints for `spec.mode: next`
+        (buildA2AGatewayRole, buildA2ACalloutRole, buildScopePublisherRole and
+        the dispatcher roles). The goldens render only the today-mode
+        fixtures in _GOLDEN_KEYS, so those builders are outside this read.
         """
         def reaches_tiers(rule: dict) -> set[str]:
             """The tier resources a rule reaches, wildcards included."""
@@ -1814,29 +1826,50 @@ class A4DelegationAttenuates(unittest.TestCase):
                     out |= {"tiers", "tiers/status"}
                 elif resource == "tiers" or resource.startswith("tiers/"):
                     out.add(resource)
-                elif resource == "*/status":
-                    out.add("tiers/status")
+                elif resource.startswith("*/"):
+                    # RBAC matches `*/<sub>` against that subresource of every
+                    # resource in the group: `*/finalizers` is tiers/finalizers.
+                    out.add("tiers/" + resource[2:])
             return out
+
+        def rules_of(where: str, role: dict) -> list:
+            """A role's rules, refusing any whose fields a template filled in."""
+            rules = role.get("rules") or []
+            self.assertIsInstance(rules, list, f"{where}: rules is templated")
+            for rule in rules:
+                for field in ("apiGroups", "resources", "verbs"):
+                    # repr, as in the ceiling test above: a field that is one
+                    # whole expression parses as a scalar string.
+                    self.assertNotIn(
+                        h.HELM_PLACEHOLDER,
+                        repr(rule.get(field)),
+                        f"{where}: {field} is templated, so what this rule "
+                        "reaches depends on a value this parse cannot see",
+                    )
+            return rules
+
+        def template_documents(text: str) -> tuple[dict, ...]:
+            """A chart template read the way helm_documents reads one, after
+            dropping the multi-line {{/* */}} comments a line-based pass can't."""
+            text = re.sub(r"\{\{-?\s*/\*.*?\*/\s*-?\}\}", "", text, flags=re.S)
+            body = "\n".join(line for line in text.splitlines() if not h._HELM_DIRECTIVE.match(line))
+            return tuple(d for d in yaml.safe_load_all(h._HELM_EXPRESSION.sub(h.HELM_PLACEHOLDER, body))
+                         if isinstance(d, dict))
 
         product_roles = []
         for name, documents in h.golden_documents().items():
             for kind in ("Role", "ClusterRole"):
                 product_roles += [(name, role) for role in h.objects_of_kind(documents, kind)]
-        # The chart's own roles (the web console's, the cleanup hook's), read
-        # the way helm_documents reads a template, after dropping the
-        # multi-line {{/* */}} comments a line-based pass can't. A template
-        # that declares a role and won't parse fails here rather than being
-        # skipped, since a skipped role is an unchecked one.
+        # The chart's own roles (the web console's, the cleanup hook's). A
+        # template that declares a role and won't parse fails here rather than
+        # being skipped, since a skipped role is an unchecked one.
         chart_templates = h.REPO_ROOT / "charts/kube-agents/templates"
         chart_roles = 0
         for path in sorted(chart_templates.glob("*.yaml")):
             text = path.read_text()
             if path.name == "operator-rbac.yaml" or not re.search(r"^kind:\s*(Cluster)?Role\s*$", text, re.M):
                 continue
-            text = re.sub(r"\{\{-?\s*/\*.*?\*/\s*-?\}\}", "", text, flags=re.S)
-            body = "\n".join(line for line in text.splitlines() if not h._HELM_DIRECTIVE.match(line))
-            documents = tuple(d for d in yaml.safe_load_all(h._HELM_EXPRESSION.sub(h.HELM_PLACEHOLDER, body))
-                              if isinstance(d, dict))
+            documents = template_documents(text)
             for kind in ("Role", "ClusterRole"):
                 roles = h.objects_of_kind(documents, kind)
                 chart_roles += len(roles)
@@ -1844,34 +1877,50 @@ class A4DelegationAttenuates(unittest.TestCase):
         self.assertGreater(chart_roles, 0, "no chart role was read; the chart's templates moved")
         checked = 0
         for name, role in product_roles:
-            for rule in role.get("rules") or []:
+            for rule in rules_of(f"{name}: {role['metadata']['name']}", role):
                 checked += 1
                 with self.subTest(source=name, role=role["metadata"]["name"], rule=rule):
                     self.assertFalse(reaches_tiers(rule), "a product role reaches tiers")
         self.assertGreater(checked, 0, "no product role was read; the goldens or the chart moved")
 
+        # Each delivery path read whole: the chart's operator-rbac.yaml carries
+        # the leader-election Role beside the ClusterRole, so the kustomize
+        # side reads both of the files config/rbac/kustomization.yaml ships.
         want = {"tiers": {"get", "list", "watch"}, "tiers/status": {"get", "update", "patch"}}
-        for source, documents in (("operator_clusterrole", h.yaml_documents("operator_clusterrole")),
+        for source, documents in (("kustomize", h.yaml_documents("operator_clusterrole")
+                                   + h.yaml_documents("operator_leader_election_role")),
                                   ("chart_operator_rbac", h.helm_documents("chart_operator_rbac"))):
             got: dict[str, set[str]] = {}
             for kind in ("Role", "ClusterRole"):
                 for role in h.objects_of_kind(documents, kind):
-                    for rule in role.get("rules") or []:
+                    for rule in rules_of(source, role):
                         for resource in reaches_tiers(rule):
                             got.setdefault(resource, set()).update(rule.get("verbs") or [])
             with self.subTest(source=source):
                 self.assertEqual(got, want, f"{source}: the operator's verbs on tiers")
 
+        # A document carrying an aggregate-to label is parsed and its rules put
+        # through reaches_tiers: a wildcard resource never spells `tiers`, so a
+        # text search for the word passes the role that matters most.
         aggregating = re.compile(r"rbac\.authorization\.k8s\.io/aggregate-to-(admin|edit|view)")
         roots = [h.REPO_ROOT / "charts/kube-agents/templates", h.REPO_ROOT / "k8s-operator/config"]
         scanned = 0
         for root in roots:
             for path in sorted(root.rglob("*.yaml")):
                 scanned += 1
+                where = str(path.relative_to(h.REPO_ROOT))
                 for document in re.split(r"^---\s*$", path.read_text(), flags=re.M):
-                    with self.subTest(path=str(path.relative_to(h.REPO_ROOT))):
-                        self.assertFalse(aggregating.search(document) and re.search(r"\btiers\b", document),
-                                         "a role naming tiers aggregates into admin, edit or view")
+                    if not aggregating.search(document):
+                        continue
+                    for parsed in template_documents(document):
+                        for kind in ("Role", "ClusterRole"):
+                            for role in h.objects_of_kind((parsed,), kind):
+                                for rule in rules_of(where, role):
+                                    with self.subTest(path=where, rule=rule):
+                                        self.assertFalse(
+                                            reaches_tiers(rule),
+                                            "a role reaching tiers aggregates into admin, edit or view",
+                                        )
         self.assertGreater(scanned, 0)
 
     def test_A4_triggering_is_covered_by_the_A3_inject_finding(self) -> None:
