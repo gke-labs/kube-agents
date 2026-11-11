@@ -31,9 +31,11 @@ _OPERATOR_CONTAINER_RE = re.compile(
 _WATCHER_LOG_READ_RE = re.compile(
     r'kubectl logs\b(?:[^\n]|\\\n)*?-c "\$\{var\.agent_container\}"'
 )
+#: `[^}]*?` keeps the search inside the block: with `.*?` under DOTALL a block
+#: with no default would hand back the next variable's default instead of None.
 _AGENT_CONTAINER_DEFAULT_RE = re.compile(
-    r'variable "agent_container" \{.*?^\s*default\s*=\s*"([^"]+)"',
-    re.DOTALL | re.MULTILINE,
+    r'variable "agent_container" \{[^}]*?^\s*default\s*=\s*"([^"]+)"',
+    re.MULTILINE,
 )
 
 
@@ -65,6 +67,14 @@ class WatcherContainerDefaultTest(unittest.TestCase):
             {},
             f"these stacks read the watcher's log from a container the gateway Pod does not run it in (operator: {operator.group(1)!r})",
         )
+
+    def test_a_block_without_a_default_reads_as_none_not_the_next_variable(self):
+        text = (
+            'variable "agent_container" {\n  type        = string\n'
+            '  description = "no default here"\n}\n\n'
+            'variable "later" {\n  type        = string\n  default     = "agent-api-auth"\n}\n'
+        )
+        self.assertIsNone(_AGENT_CONTAINER_DEFAULT_RE.search(text))
 
 
 if __name__ == "__main__":
