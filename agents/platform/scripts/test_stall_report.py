@@ -1081,6 +1081,11 @@ class ClusterMode(unittest.TestCase):
         with redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 stall_report.main(["--namespaces", NAMESPACE])
+            for empty in ("", ","):
+                with self.subTest(namespaces=empty), patch.object(stall_report, "report_cluster") as untouched:
+                    with self.assertRaises(SystemExit):
+                        stall_report.main(["--namespaces", empty, "--json"])
+                    untouched.assert_not_called()
             with self.assertRaises(SystemExit):
                 stall_report.main(["--namespace", NAMESPACE, "--extra-kinds", "a=b", "--json"])
         with patch.object(stall_report, "report_cluster", side_effect=RuntimeError("kubectl api-resources failed")):

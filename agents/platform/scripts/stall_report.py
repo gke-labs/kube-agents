@@ -1215,6 +1215,8 @@ def main(argv: list[str] | None = None) -> int:
         if not args.json:
             parser.error("--namespaces prints one JSON report per namespace; pass --json")
         namespaces = [n for n in args.namespaces.split(NAMESPACES_SEPARATOR) if n]
+        if not namespaces:
+            parser.error("--namespaces names no namespace")
         try:
             extra = parse_extra_kinds(args.extra_kinds)
             report = report_cluster(namespaces, args.kind, extra, datetime.now(timezone.utc), args.threshold_minutes)
