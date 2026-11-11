@@ -96,11 +96,12 @@ const (
 	fleetScaleProject           = "fleet-project"
 	fleetScaleLocation          = "us-central1"
 	fleetScaleProfileNameFormat = "cluster-" + fleetScaleProject + "-cluster-%04d-" + fleetScaleLocation
-	// The fix issue the one inverted check names. #4431 shrank the minter
-	// policy map and the identity map; the dispatch config, rendered only
-	// when the dispatcher image is set, is the part it left, and the issue
-	// that takes it moves this constant.
-	dispatchConfigMapFixIssue = "#4431"
+	// The fix issue the dispatch config's size check names, empty now that it
+	// is under the limit at N: #4431 shrank the minter policy map and the
+	// identity map, and #5479 the dispatch config (compact, with the durables
+	// and the Job template name derived by the dispatcher). Empty, the gate
+	// holds the config under the limit from here on.
+	dispatchConfigMapFixIssue = ""
 )
 
 // configMapDataSize is what the API server measures a ConfigMap by: the sum of
@@ -383,7 +384,7 @@ func TestTheIdentityMapConfigMapAtFleetScale(t *testing.T) {
 
 // The dispatch config at N=2,500, rendered only when the dispatcher image is
 // set (no release sets it yet): one profile block per profile with its tiers,
-// parameters and a durable per (tier, kind), indented.
+// parameters, written compact with no durables (#5479).
 func TestTheDispatchConfigMapAtFleetScale(t *testing.T) {
 	withDispatcher(t)
 	agent := a2aTestAgent()

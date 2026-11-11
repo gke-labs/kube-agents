@@ -203,7 +203,7 @@ func (d *Dispatcher) Ready() (bool, string) {
 	defer d.mu.Unlock()
 	var unbound []string
 	for _, p := range cfg.Profiles {
-		for _, dur := range p.Durables {
+		for _, dur := range p.DerivedDurables() {
 			if d.subs[dur.Name] == nil {
 				unbound = append(unbound, dur.Name)
 			}

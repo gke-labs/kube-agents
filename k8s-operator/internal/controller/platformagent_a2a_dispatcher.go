@@ -525,7 +525,10 @@ type a2aDispatchConfig struct {
 
 // a2aDispatchJobTemplateRef is lib.DispatchJobTemplateRef.
 type a2aDispatchJobTemplateRef struct {
-	Name string `json:"name"`
+	// Name is the param's name, kept here for the operator's own use and not
+	// written (#5479): it is always the profile's own param, which the
+	// dispatcher derives (lib.DispatchJobTemplateName).
+	Name string `json:"-"`
 	Hash string `json:"hash"`
 }
 
@@ -534,12 +537,17 @@ type a2aDispatchProfile struct {
 	Tiers []string `json:"tiers"`
 	// UnattendedTier is lib.DispatchProfile's: the profile's unattended-mode
 	// tier when it is a Tier resource, not the built-in (#3659).
-	UnattendedTier        string               `json:"unattendedTier,omitempty"`
-	Concurrency           int                  `json:"concurrency"`
-	QueueTimeoutSeconds   int                  `json:"queueTimeoutSeconds"`
-	ActiveDeadlineSeconds int                  `json:"activeDeadlineSeconds"`
-	Parameters            []a2aCardParameter   `json:"parameters,omitempty"`
-	Durables              []a2aDispatchDurable `json:"durables"`
+	UnattendedTier        string             `json:"unattendedTier,omitempty"`
+	Concurrency           int                `json:"concurrency"`
+	QueueTimeoutSeconds   int                `json:"queueTimeoutSeconds"`
+	ActiveDeadlineSeconds int                `json:"activeDeadlineSeconds"`
+	Parameters            []a2aCardParameter `json:"parameters,omitempty"`
+	// Durables are the shared durables the operator creates for the profile,
+	// one per (tier, kind), which its grant names list
+	// (dispatcherGrantNames). They aren't written (#5479): the dispatcher
+	// derives the same set from tiers and drainingTiers, pinned by the
+	// shared fixture a2a/lib/testdata/rendered-dispatch-durables.json.
+	Durables []a2aDispatchDurable `json:"-"`
 	// JobTemplateRef names the DispatchJobTemplate the dispatcher stamps the
 	// profile's unattended Jobs from, and the rendering it holds
 	// (lib.DispatchProfile.JobTemplateRef), set only for a profile allowing
@@ -810,7 +818,9 @@ func buildA2ADispatchConfigMapWith(agent *agentv1alpha1.PlatformAgent, profiles 
 	if err != nil {
 		return nil, err
 	}
-	body, err := json.MarshalIndent(cfg, "", "  ")
+	// Compact: indented, the config roughly doubled, and it has to fit one
+	// ConfigMap at the 2,500-profile target (#5479).
+	body, err := json.Marshal(cfg)
 	if err != nil {
 		return nil, err
 	}

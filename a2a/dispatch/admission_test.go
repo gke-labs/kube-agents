@@ -31,12 +31,10 @@ func TestAdmissionRefusalsAreVisibleAndTerminal(t *testing.T) {
 	time.Sleep(2500 * time.Millisecond)
 	v := &fakeVerifier{refuse: map[string]bool{"cap-bad": true}}
 	b.runDispatcher(testConfig(), ti, v)
-	// The profile drops unattended from its tiers while the operator still
-	// lists the durable (the config moved under a bound durable).
 	waitFor(t, 10*time.Second, "the stale task refused", func() bool { return len(b.terminalsOf("task-stale")) == 1 })
-	ti.update(func(c *lib.DispatchConfig) { c.Profiles[0].Tiers = []string{"read"} })
-
-	b.submitWith("tse", "unattended", lib.SubmitKindTop, "task-tier", "cap-ok", map[string]string{"repo": "r"})
+	// A tier that leaves the profile is now listed draining, so its queued
+	// submissions end tier-withdrawn (drain_tier_test.go); tier-not-allowed
+	// is TestAdmissionRefusesATierTheProfileDoesNotAllow's (#5479).
 	b.submitWith("tse", "read", lib.SubmitKindTop, "task-refused", "cap-bad", map[string]string{"repo": "r"})
 	b.submitWith("tse", "read", lib.SubmitKindTop, "task-nocap", "", map[string]string{"repo": "r"})
 	b.submitWith("tse", "read", lib.SubmitKindTop, "task-missing", "cap-ok", map[string]string{"note": "x"})
@@ -45,7 +43,6 @@ func TestAdmissionRefusalsAreVisibleAndTerminal(t *testing.T) {
 
 	want := map[string]string{
 		"task-stale":    ReasonQueueTimeout,
-		"task-tier":     ReasonTierNotAllowed,
 		"task-refused":  ReasonVerifierRefused,
 		"task-nocap":    ReasonVerifierRefused,
 		"task-missing":  ReasonParametersInvalid,
@@ -134,5 +131,25 @@ func TestAnUnreachableVerifierHoldsTheSubmission(t *testing.T) {
 	}
 	if tomb := b.tombstones()[lib.ProfileLeaseKey("tse", "read", lib.ProfileLeaseRefusedPod, "task-1")]; tomb.Finished() {
 		t.Errorf("the outage left a refusal's tombstone: %+v", tomb)
+	}
+}
+
+// A submission at a tier the profile doesn't allow is refused before
+// anything else is asked. Since #5479 a bound durable always belongs to a
+// live or draining tier, so on the bus this is only the moment between a
+// config change and the unbind; admit is where the check lives.
+func TestAdmissionRefusesATierTheProfileDoesNotAllow(t *testing.T) {
+	v := &fakeVerifier{}
+	d := &Dispatcher{verifier: v, verified: map[holdKey]permit{}}
+	prof := testProfile("tse", 1, "read")
+	snap := lib.DispatchConfig{Namespace: "kubeagents-system", Profiles: []lib.DispatchProfile{prof}}
+	hk := holdKey{"tse", "unattended", lib.SubmitKindTop, "task-tier"}
+	del := &envDelivery{env: submissionEnv(t, "tse", "task-tier", "cap-ok", map[string]string{"repo": "r"})}
+	_, ref, err := d.admit(context.Background(), del, snap, prof, hk, time.Now())
+	if err != nil || ref == nil || ref.reason != ReasonTierNotAllowed {
+		t.Fatalf("refusal %+v, err %v; want %s", ref, err, ReasonTierNotAllowed)
+	}
+	if n := len(v.callList()); n != 0 {
+		t.Errorf("%d verifier calls; want none before the tier check", n)
 	}
 }

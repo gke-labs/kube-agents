@@ -313,7 +313,7 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 	// The connection was made against the config as it stands now.
 	for _, p := range d.src.Config().Profiles {
 		d.grantedProfiles[p.Name] = true
-		for _, dur := range p.Durables {
+		for _, dur := range p.DerivedDurables() {
 			d.granted[dur.Name] = true
 		}
 	}
@@ -422,7 +422,7 @@ func (d *Dispatcher) syncBindings(ctx context.Context) {
 		if !d.grantedProfiles[p.Name] {
 			addedProfiles = append(addedProfiles, p.Name)
 		}
-		for _, dur := range p.Durables {
+		for _, dur := range p.DerivedDurables() {
 			want[dur.Name], durables[dur.Name] = p.Name, dur
 			if !d.granted[dur.Name] {
 				added = append(added, dur.Name)
@@ -1934,7 +1934,7 @@ func (d *Dispatcher) tierBoundLocked(cfg lib.DispatchConfig, profile, tier strin
 		return false
 	}
 	n := 0
-	for _, dur := range prof.Durables {
+	for _, dur := range prof.DerivedDurables() {
 		if dur.Tier != tier {
 			continue
 		}

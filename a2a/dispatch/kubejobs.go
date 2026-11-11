@@ -64,9 +64,6 @@ func NewKubeJobs(kube kubernetes.Interface, config func() lib.DispatchConfig) *K
 const (
 	dispatchJobTemplateGroupPath = "/apis/kubeagents.x-k8s.io/v1alpha1"
 	dispatchJobTemplateResource  = "dispatchjobtemplates"
-	// dispatchJobTemplatePrefix is the operator's name for a profile's
-	// param, before the profile's name.
-	dispatchJobTemplatePrefix = "kube-agents-dispatch-job-profile-"
 )
 
 // ErrJobTemplateNotCurrent marks a Launch whose profile's DispatchJobTemplate
@@ -89,15 +86,17 @@ func (k *KubeJobs) jobTemplate(ctx context.Context, namespace string, prof *lib.
 	}
 	// A profile's template is its own param: a reference to another
 	// profile's is refused rather than followed.
-	if ref.Name != dispatchJobTemplatePrefix+prof.Name {
-		return nil, fmt.Errorf("profile %s's jobTemplateRef names %s, not its own param", prof.Name, ref.Name)
+	// A hash-only reference (#5479) names the profile's own param.
+	name := ref.NameFor(prof.Name)
+	if name != lib.DispatchJobTemplateName(prof.Name) {
+		return nil, fmt.Errorf("profile %s's jobTemplateRef names %s, not its own param", prof.Name, name)
 	}
-	raw, err := k.getTemplate(ctx, namespace, ref.Name)
+	raw, err := k.getTemplate(ctx, namespace, name)
 	if apierrors.IsNotFound(err) {
-		return nil, fmt.Errorf("%w: profile %s's %s is not there", ErrJobTemplateNotCurrent, prof.Name, ref.Name)
+		return nil, fmt.Errorf("%w: profile %s's %s is not there", ErrJobTemplateNotCurrent, prof.Name, name)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("read profile %s's Job template %s: %w", prof.Name, ref.Name, err)
+		return nil, fmt.Errorf("read profile %s's Job template %s: %w", prof.Name, name, err)
 	}
 	var obj struct {
 		Metadata struct {
@@ -108,16 +107,16 @@ func (k *KubeJobs) jobTemplate(ctx context.Context, namespace string, prof *lib.
 		} `json:"spec"`
 	}
 	if err := json.Unmarshal(raw, &obj); err != nil {
-		return nil, fmt.Errorf("profile %s's Job template %s: %w", prof.Name, ref.Name, err)
+		return nil, fmt.Errorf("profile %s's Job template %s: %w", prof.Name, name, err)
 	}
 	if got := obj.Metadata.Annotations[lib.DispatchJobTemplateHashAnnotation]; got != ref.Hash {
-		return nil, fmt.Errorf("%w: profile %s's %s holds rendering %q, the config names %q", ErrJobTemplateNotCurrent, prof.Name, ref.Name, got, ref.Hash)
+		return nil, fmt.Errorf("%w: profile %s's %s holds rendering %q, the config names %q", ErrJobTemplateNotCurrent, prof.Name, name, got, ref.Hash)
 	}
 	// Checked here, per profile, where the inline copy is checked in the
 	// config's Validate: a bad param holds its own profile's tasks, not
 	// every profile's config.
 	if !lib.PodTemplateWithContainers(obj.Spec.Template) {
-		return nil, fmt.Errorf("profile %s's %s holds no pod template with containers", prof.Name, ref.Name)
+		return nil, fmt.Errorf("profile %s's %s holds no pod template with containers", prof.Name, name)
 	}
 	return obj.Spec.Template, nil
 }
