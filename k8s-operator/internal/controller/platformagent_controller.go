@@ -2724,7 +2724,7 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 	}
 	opts.heldGitHubOrg = held
 	if a2aStackRendering(agent) && !r.agentProfilesUnreadable {
-		profiles, err := boundAgentProfiles(ctx, r.Client, agent)
+		profiles, err := boundAgentProfiles(ctx, r.Client, agent, r.tiersUnreadable)
 		if err != nil {
 			return err
 		}
@@ -6369,8 +6369,11 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
 					return enqueueAgentsInNamespace(ctx, obj.GetNamespace())
 				}),
-				// The AgentProfile reconciler writes status; only spec
-				// changes, creates and deletes change the map.
+				// The AgentProfile reconciler writes status. Spec changes,
+				// creates and deletes change the map; status.renderedTiers
+				// also picks the incumbent unattended tier, but it changes
+				// only on a pass that a spec or Tier change started, which
+				// enqueues this controller too.
 				builder.WithPredicates(predicate.GenerationChangedPredicate{}),
 			).Watches(
 				// Whether a profile gets a map entry also depends on its

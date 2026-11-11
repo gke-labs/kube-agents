@@ -58,7 +58,8 @@ Every field of the `AgentProfile` resource's `spec` and `status`, generated from
 | ----- | ---- | -------- | ------- | ----------- | ----------- |
 | `observedGeneration` | `integer` | no |  |  | ObservedGeneration is the .metadata.generation the status was last computed from. |
 | `agentRef` | `string` | no |  |  | AgentRef is the PlatformAgent this profile is bound to: the one in its namespace. |
-| `serviceAccountName` | `string` | no |  |  | ServiceAccountName lists the ServiceAccounts the profile's pods run as, in the profile namespace: one per allowed tier, comma-separated, or the one named in spec.identity. |
+| `serviceAccountName` | `string` | no |  |  | ServiceAccountName lists the ServiceAccounts the profile's pods run as, in the profile namespace: one per rendered tier, comma-separated, or the one named in spec.identity. |
+| `renderedTiers` | `[]string` | no |  | max items `4`; items max length `10`; items pattern `^[a-z0-9]+$` | RenderedTiers are the tiers the operator last rendered this profile's identities, durables and pools for, kept through a pass whose identities aren't ready. The operator reads it to tell an incumbent unattended-mode tier from a newcomer. It is a hint, not authority: a tier here never creates anything the spec and the Tier catalog don't, cleanup still acts only on objects carrying this profile's labels, and when it is absent (a restore that dropped status) the operator derives it once from the profile's own objects. |
 | `conditions` | `[]metav1.Condition` | no |  |  | Conditions represent the latest available observations of the profile. |
 
 <!-- prettier-ignore-end -->

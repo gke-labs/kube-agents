@@ -442,10 +442,27 @@ spec:
                     computed from.
                   format: int64
                   type: integer
+                renderedTiers:
+                  description: |-
+                    RenderedTiers are the tiers the operator last rendered this profile's
+                    identities, durables and pools for (#3659), kept through a pass whose
+                    identities aren't ready. The operator reads it to tell an incumbent
+                    unattended-mode tier from a newcomer. It is a hint, not authority: a tier here never creates
+                    anything the spec and the Tier catalog don't, cleanup still acts only on
+                    objects carrying this profile's labels, and when it is absent (a
+                    restore that dropped status) the operator derives it once from the
+                    profile's own objects.
+                  items:
+                    maxLength: 10
+                    pattern: ^[a-z0-9]+$
+                    type: string
+                  maxItems: 4
+                  type: array
+                  x-kubernetes-list-type: set
                 serviceAccountName:
                   description: |-
                     ServiceAccountName lists the ServiceAccounts the profile's pods run as,
-                    in the profile namespace: one per allowed tier, comma-separated, or the
+                    in the profile namespace: one per rendered tier, comma-separated, or the
                     one named in spec.identity.
                   type: string
               type: object

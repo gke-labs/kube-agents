@@ -387,6 +387,11 @@ type DispatchConfig struct {
 type DispatchProfile struct {
 	Name  string   `json:"name"`
 	Tiers []string `json:"tiers"`
+	// UnattendedTier names the profile's unattended-mode tier when it isn't
+	// the built-in unattended: a Tier resource of that mode (#3659). The
+	// dispatcher treats it as it treats unattended (Job mode, the
+	// unattended side of the interactive reserve). Empty for the built-in.
+	UnattendedTier string `json:"unattendedTier,omitempty"`
 	// Concurrency is the profile's own ceiling (spec.concurrency).
 	Concurrency           int                `json:"concurrency"`
 	QueueTimeoutSeconds   int                `json:"queueTimeoutSeconds"`

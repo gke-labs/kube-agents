@@ -304,6 +304,11 @@ const (
 	// then no longer equal their template, so the Job admission policy refuses
 	// them there.
 	AgentProfileConditionJobResourcesFit = "JobResourcesFit"
+	// AgentProfileConditionTiersRendered is False when allowedTiers lists a
+	// name with no tier (reason TierUnknown) or a second unattended-mode tier
+	// beside the one the profile serves (TierModeConflict); those tiers
+	// render nothing, and the rest render as usual (#3659).
+	AgentProfileConditionTiersRendered = "TiersRendered"
 )
 
 // AgentProfileStatus defines the observed state of AgentProfile.
@@ -319,10 +324,25 @@ type AgentProfileStatus struct {
 	AgentRef string `json:"agentRef,omitempty"`
 
 	// ServiceAccountName lists the ServiceAccounts the profile's pods run as,
-	// in the profile namespace: one per allowed tier, comma-separated, or the
+	// in the profile namespace: one per rendered tier, comma-separated, or the
 	// one named in spec.identity.
 	// +optional
 	ServiceAccountName string `json:"serviceAccountName,omitempty"`
+
+	// RenderedTiers are the tiers the operator last rendered this profile's
+	// identities, durables and pools for (#3659), kept through a pass whose
+	// identities aren't ready. The operator reads it to tell an incumbent
+	// unattended-mode tier from a newcomer. It is a hint, not authority: a tier here never creates
+	// anything the spec and the Tier catalog don't, cleanup still acts only on
+	// objects carrying this profile's labels, and when it is absent (a
+	// restore that dropped status) the operator derives it once from the
+	// profile's own objects.
+	// +listType=set
+	// +kubebuilder:validation:MaxItems=4
+	// +kubebuilder:validation:items:MaxLength=10
+	// +kubebuilder:validation:items:Pattern=`^[a-z0-9]+$`
+	// +optional
+	RenderedTiers []string `json:"renderedTiers,omitempty"`
 
 	// Conditions represent the latest available observations of the profile.
 	// +listType=map

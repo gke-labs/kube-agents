@@ -524,8 +524,11 @@ type a2aDispatchConfig struct {
 }
 
 type a2aDispatchProfile struct {
-	Name                  string               `json:"name"`
-	Tiers                 []string             `json:"tiers"`
+	Name  string   `json:"name"`
+	Tiers []string `json:"tiers"`
+	// UnattendedTier is lib.DispatchProfile's: the profile's unattended-mode
+	// tier when it is a Tier resource, not the built-in (#3659).
+	UnattendedTier        string               `json:"unattendedTier,omitempty"`
 	Concurrency           int                  `json:"concurrency"`
 	QueueTimeoutSeconds   int                  `json:"queueTimeoutSeconds"`
 	ActiveDeadlineSeconds int                  `json:"activeDeadlineSeconds"`
@@ -623,9 +626,14 @@ func desiredDispatchConfigWith(agent *agentv1alpha1.PlatformAgent, profiles []ag
 		if resolved[p.Name].refused != nil {
 			continue
 		}
+		unattendedTier := unattendedTierOf(p)
+		if unattendedTier == agentv1alpha1.AgentProfileTierUnattended {
+			unattendedTier = "" // the built-in, which the dispatcher knows
+		}
 		dp := a2aDispatchProfile{
 			Name:                  p.Name,
 			Tiers:                 p.AllowedTierList(),
+			UnattendedTier:        unattendedTier,
 			Concurrency:           int(p.Spec.Concurrency),
 			QueueTimeoutSeconds:   int(p.QueueTimeout()),
 			ActiveDeadlineSeconds: func() int { d, _ := cappedTaskDeadline(agent, p); return d }(),

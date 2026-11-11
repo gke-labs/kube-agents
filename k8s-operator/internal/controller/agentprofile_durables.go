@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
@@ -35,9 +37,17 @@ const (
 	a2aHeldAckWait = 2 * time.Minute
 )
 
-// a2aAllProfileTiers are every tier a profile can allow, so a dropped tier's
-// durables can be found by name without listing consumers.
-var a2aAllProfileTiers = []string{agentv1alpha1.AgentProfileTierRead, agentv1alpha1.AgentProfileTierUnattended}
+// profileDurableOf parses a durable name as profile-<name>-<tier>-<kind>
+// for one profile: allowedTiers holds no hyphen, so the split is unambiguous
+// (profile a with tier b-c and profile a-b with tier c can't both exist).
+func profileDurableOf(profile, name string) bool {
+	rest, ok := strings.CutPrefix(name, "profile-"+profile+"-")
+	if !ok {
+		return false
+	}
+	tier, kind, ok := strings.Cut(rest, "-")
+	return ok && allowedTierNameRE.MatchString(tier) && slices.Contains(a2aSubmitKinds, kind)
+}
 
 // profileDurable is one durable as the operator wants it.
 type profileDurable struct {
@@ -69,15 +79,29 @@ func desiredProfileDurables(p *agentv1alpha1.AgentProfile) []profileDurable {
 	return out
 }
 
-// allProfileDurableNames is every durable name a profile could have.
-func allProfileDurableNames(profile string) []string {
+// profileDurableNames lists the durables on the submit stream that are this
+// profile's by name, whatever tier they were made for: a dropped tier, a
+// built-in or a Tier resource since deleted (#3659). deleteDurable still
+// deletes only one carrying the operator's held marker.
+func profileDurableNames(ctx context.Context, js jetstream.JetStream, profile string) ([]string, error) {
+	stream, err := js.Stream(ctx, a2aProfileSubmitStream)
+	if errors.Is(err, jetstream.ErrStreamNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("listing the profile's durables: %w", err)
+	}
+	lister := stream.ConsumerNames(ctx)
 	var out []string
-	for _, tier := range a2aAllProfileTiers {
-		for _, kind := range a2aSubmitKinds {
-			out = append(out, profileDurableName(profile, tier, kind))
+	for name := range lister.Name() {
+		if profileDurableOf(profile, name) {
+			out = append(out, name)
 		}
 	}
-	return out
+	if err := lister.Err(); err != nil {
+		return nil, fmt.Errorf("listing the profile's durables: %w", err)
+	}
+	return out, nil
 }
 
 // ensureDurable creates the durable, or updates an existing one's
@@ -207,7 +231,11 @@ func syncDurables(ctx context.Context, js jetstream.JetStream, profile string, w
 	}
 	// Dropped names first: on a stream with no spare consumer slot, a tier
 	// swap needs the old tier's slots before the new tier's durables fit.
-	for _, name := range allProfileDurableNames(profile) {
+	existing, err := profileDurableNames(ctx, js, profile)
+	if err != nil {
+		return err
+	}
+	for _, name := range existing {
 		if keep[name] {
 			continue
 		}

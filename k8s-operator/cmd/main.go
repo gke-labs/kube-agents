@@ -383,6 +383,9 @@ func main() {
 			Client:    mgr.GetClient(),
 			Scheme:    mgr.GetScheme(),
 			APIReader: mgr.GetAPIReader(),
+			// A role that can't read Tiers lists none: a cached list would
+			// start an informer that never syncs (#3659, #1009's case).
+			TiersUnreadable: len(controller.TierAccessDenied(rbacChecker)) > 0,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to create controller", "controller", "agentprofile")
 			os.Exit(1)

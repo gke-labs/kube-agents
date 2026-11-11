@@ -86,8 +86,9 @@ const (
 	// have their own (contract addendum 7), so only the operator can make a
 	// consumer on it.
 	DefaultStream = lib.ProfileSubmitStream
-	// DefaultUnattendedTier is the one unattended tier until tier CRs say
-	// which tiers are.
+	// DefaultUnattendedTier is the built-in unattended tier, unattended for
+	// every profile. A profile's own unattended-mode Tier comes in its
+	// DispatchProfile.UnattendedTier (#3659).
 	DefaultUnattendedTier = "unattended"
 	// selfSession and selfAgentType are the `from` of the terminals the
 	// dispatcher writes.
@@ -189,3 +190,10 @@ func (c Config) Validate() error {
 }
 
 func (c Config) unattended(tier string) bool { return slices.Contains(c.UnattendedTiers, tier) }
+
+// unattendedFor is whether tier is on the unattended side for prof: one of
+// the process's UnattendedTiers, or the profile's own unattended-mode tier
+// (#3659).
+func (c Config) unattendedFor(prof lib.DispatchProfile, tier string) bool {
+	return c.unattended(tier) || (prof.UnattendedTier != "" && prof.UnattendedTier == tier)
+}

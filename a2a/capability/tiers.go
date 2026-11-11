@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"reflect"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -62,6 +64,22 @@ type tierTable struct {
 
 var activeTiers atomic.Pointer[tierTable]
 
+// tierWatchers are called after each LoadTiers that changes the table.
+var (
+	tierWatchersMu sync.Mutex
+	tierWatchers   []func()
+)
+
+// OnTiersChanged registers fn to run after every LoadTiers that changes the
+// table, on the loader's goroutine. The callout uses it to re-validate an
+// identity map whose profile entries name a tier that loaded after the map
+// did (#3659).
+func OnTiersChanged(fn func()) {
+	tierWatchersMu.Lock()
+	defer tierWatchersMu.Unlock()
+	tierWatchers = append(tierWatchers, fn)
+}
+
 func init() { activeTiers.Store(builtinTierTable()) }
 
 func builtinTierTable() *tierTable {
@@ -114,7 +132,15 @@ func LoadTiers(defs []TierDefinition) []string {
 		}
 		seen[d.Name] = true
 	}
-	activeTiers.Store(t)
+	old := activeTiers.Swap(t)
+	if old == nil || !reflect.DeepEqual(old.verbs, t.verbs) || !reflect.DeepEqual(old.profile, t.profile) {
+		tierWatchersMu.Lock()
+		fns := append([]func(){}, tierWatchers...)
+		tierWatchersMu.Unlock()
+		for _, fn := range fns {
+			fn()
+		}
+	}
 	return skipped
 }
 
