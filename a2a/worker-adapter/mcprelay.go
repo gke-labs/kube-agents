@@ -42,10 +42,10 @@ const (
 
 	// The broker's address and the pod's two credential files, as the
 	// kubectl and gcloud shims read them (credential_proxy_client.py).
-	EnvCredentialProxyURL       = "CREDENTIAL_PROXY_URL"
-	EnvCredentialProxyTokenFile = "CREDENTIAL_PROXY_TOKEN_FILE"
-	EnvCredentialProxyTaskToken = "CREDENTIAL_PROXY_TASK_TOKEN_FILE"
-	taskCredentialHeader        = "X-Kube-Agents-Task-Credential"
+	EnvCredentialProxyURL       = "CREDENTIAL_PROXY_URL"             // #nosec G101 -- an env var name, not a credential
+	EnvCredentialProxyTokenFile = "CREDENTIAL_PROXY_TOKEN_FILE"      // #nosec G101 -- an env var name, not a credential
+	EnvCredentialProxyTaskToken = "CREDENTIAL_PROXY_TASK_TOKEN_FILE" // #nosec G101 -- an env var name, not a credential
+	taskCredentialHeader        = "X-Kube-Agents-Task-Credential"    // #nosec G101 -- a header name, not a credential
 	// The broker's ceiling on a task credential (task_credential.MAX_TOKEN_BYTES).
 	maxTaskCredentialBytes = 8192
 
@@ -271,7 +271,7 @@ func relayCredentials() (map[string]string, error) {
 	if tokenFile == "" {
 		return nil, errors.New(EnvCredentialProxyTokenFile + " is not set, so the broker can't tell who is calling")
 	}
-	token, err := os.ReadFile(tokenFile)
+	token, err := os.ReadFile(tokenFile) // #nosec G304 G703 -- the pod's own projected token mount, from CREDENTIAL_PROXY_TOKEN_FILE
 	if err != nil {
 		return nil, fmt.Errorf("reading the broker token: %w", err)
 	}
@@ -284,7 +284,7 @@ func relayCredentials() (map[string]string, error) {
 	if taskFile == "" {
 		return headers, nil
 	}
-	task, err := os.ReadFile(taskFile)
+	task, err := os.ReadFile(taskFile) // #nosec G304 G703 -- the pod's own task credential mount, from CREDENTIAL_PROXY_TASK_TOKEN_FILE
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 		return headers, nil
