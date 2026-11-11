@@ -366,8 +366,8 @@ form `*.<suffix>` is a group wildcard for every namespaced kind whose API group 
 suffix. A list you set replaces the wildcard too: name `*.cnrm.cloud.google.com` in it to keep
 the Config Connector kinds.
 
-The single item `all` scans every namespaced kind the cluster serves, with one read per kind in
-each namespace, which is slow on a large fleet. The API server refuses `all` next to another
+The single item `all` scans every namespaced kind the cluster serves, with one read per kind per
+cluster, which is slow on a large fleet. The API server refuses `all` next to another
 item, and refuses Secrets, ConfigMaps, Events, Endpoints, EndpointSlices, ControllerRevisions and
 Leases, which the scan reports nothing from. Up to 20 items. A kind a cluster does not serve is
 left out on that cluster.
@@ -690,7 +690,7 @@ The arithmetic behind `6`:
 
 If you raise `maxInProgress`, check your model quota, and know where the credential proxy stops it.
 The proxy's default 2Gi already admits more than its slot cap of 8, so up to about eight workers'
-worth of commands fit, fewer while a listing runs. Past that the slot cap binds, and the operator
+worth of commands fit, fewer while the stall watch's tick or a listing runs. Past that the slot cap binds, and the operator
 owns it. No CR field moves it, so raising the proxy's memory in
 `spec.deployment.credentialProxy.resources` does not help, and a command beyond eight waits up to
 60 s for a slot and is then refused busy. Keep that limit at 2Gi or more, because below it the

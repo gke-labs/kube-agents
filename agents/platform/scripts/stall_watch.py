@@ -1948,19 +1948,22 @@ def read_cluster_part(ctx: SweepContext, cid: str) -> ClusterPart:
         # none with objects here); the kinds the cluster-wide read could not
         # read whole, of the ones this namespace asks for, when the report
         # covers the namespace; everything, when it does not.
+        # `needed` is the --kind value of the namespace's own read: "" when
+        # there is nothing left to read here, None for every kind (the
+        # `all` list), as join_kinds spells them.
         covered = False  # the report has this namespace: its rows stand whatever the leftover read does
         pending: list[str] = []
         if namespace_kinds == "":
-            needed = None
+            needed = ""
         elif report is not None and not report.get(CLUSTER_REPORT_EVENTS_FALLBACK_KEY) and namespace in report[CLUSTER_REPORT_NAMESPACES_KEY]:
             covered = True
             findings = list((report[CLUSTER_REPORT_NAMESPACES_KEY][namespace] or {}).get(CLUSTER_REPORT_FINDINGS_KEY) or [])
             asked = None if namespace_kinds is None else set(namespace_kinds.split(KINDS_SEPARATOR))
             pending = [k for k in report.get(CLUSTER_REPORT_FALLBACK_KEY) or [] if asked is None or k in asked]
-            needed = KINDS_SEPARATOR.join(pending) if pending else None
+            needed = KINDS_SEPARATOR.join(pending)
         else:
             needed = namespace_kinds
-        if needed is not None:
+        if needed != "":
             remaining = sweep.budget_remaining(ctx.started)
             if remaining <= 0:
                 part.cut = True

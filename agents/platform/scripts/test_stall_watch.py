@@ -2071,6 +2071,22 @@ class ClusterRead(Base):
         self.assertEqual(self.ledger()["unreadable"], {f"{cid('c')}/checkout": "partial: certificates.cert-manager.io not read", f"{cid('c')}/web": "partial: certificates.cert-manager.io not read"})
         self.assertEqual(self.ledger()[stall_watch.CLUSTER_TIMINGS_KEY][cid("c")][stall_watch.TIMING_SCANS_KEY], 2, "both namespaces count as read")
 
+    def test_every_kind_falls_back_to_the_per_namespace_read_too(self):
+        # STALL_WATCH_KINDS=all hands the script no --kind (None): a cluster
+        # read that fails, or leaves the events over, still sends every
+        # namespace to its own read, and a stall seen last tick is not
+        # judged absent on a namespace nothing read.
+        with patch.dict(os.environ, {stall_watch.KINDS_ENV: "all"}):
+            self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW], "web": []}})
+            self.assertEqual(len(self.last_alerts), 1)
+            for broken in ({"cluster_read": 1}, {"events_fallback": True}):
+                with self.subTest(**broken):
+                    lines, fake = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW], "web": []}}, **broken)
+                    self.assertEqual(fake.namespace_scans(), [("checkout", None), ("web", None)], "every namespace read on its own, every kind")
+                    self.assertEqual(lines, [])
+                    self.assertEqual([e["object"] for e in self.ledger()["stalls"].values()], ["Deployment/checkout-api"], "the row stands")
+                    self.assertEqual(self.ledger()["unreadable"], {})
+
     def test_a_kind_left_over_that_no_namespace_asked_for_costs_no_read(self):
         with patch.dict(os.environ, {stall_watch.KINDS_ENV: "deployments"}):
             _, fake = self.run_tick({"c": {"payments": []}}, fallback=["gateways.gateway.networking.k8s.io"])
@@ -2128,6 +2144,19 @@ class ClusterRead(Base):
         with patch.object(stall_watch, "scan_cluster", record), patch.object(stall_watch.time, "monotonic", side_effect=[0, 1, stall_watch.TICK_BUDGET_SECONDS - left] + [stall_watch.TICK_BUDGET_SECONDS - left] * 8):
             self.run_tick({"c": {"payments": []}})
         self.assertEqual(seen["timeout"], left)
+
+    def test_a_hops_timeout_is_cut_to_the_deadline_once_it_holds_a_slot_and_never_below_the_floor(self):
+        seen = []
+
+        def fake_run(argv, *, remote_env=None, timeout=None, check=False, stdin=None):
+            seen.append(timeout)
+            return completed(argv)
+
+        with patch.object(stall_watch.sandbox_exec, "run", fake_run), patch.object(stall_watch.time, "monotonic", return_value=1000.0):
+            stall_watch.run_sandbox(["kubectl", "version"], timeout=300)
+            stall_watch.run_sandbox(["kubectl", "version"], timeout=300, deadline=1000.0 + 40)
+            stall_watch.run_sandbox(["kubectl", "version"], timeout=300, deadline=1000.0 - 5)
+        self.assertEqual(seen, [300, 40, stall_watch.SCAN_TIMEOUT_FLOOR_SECONDS], "no deadline: as asked; a deadline: the time left to it; past it: the floor")
 
     def test_the_ledger_rows_are_the_same_whichever_path_read_them(self):
         now = "2026-11-10T12:00:00+00:00"

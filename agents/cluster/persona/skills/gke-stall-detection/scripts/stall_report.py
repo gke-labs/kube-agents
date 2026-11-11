@@ -113,8 +113,6 @@ RAW_PAGE_HALVING = 2
 # A server that keeps handing out continue tokens is stopped here; the fleet
 # collectors stop at the same count.
 RAW_MAX_PAGES = 10000
-# The raw list's `kind` is the item kind with this suffix (`DeploymentList`).
-LIST_KIND_SUFFIX = "List"
 # A raw collection: its path, the item kind, the apiVersion the items carry.
 # Keyed by the bare plural and by the api-resources name with its group, the
 # two spellings a kind list carries.
