@@ -40,7 +40,7 @@ CACHE_HEX = r"[0-9a-f]{16,64}"
 VARIANT_JOINER = "<variant-joiner>"
 CACHE_LAYOUT_PATTERN = (
     rf"^(?:(?:{re.escape(ANSWERS_DIR)}|{re.escape(SLOTS_DIR)}|{re.escape(MESSAGES_DIR)})/{CACHE_HEX}{re.escape(JSON_SUFFIX)}"
-    rf"|{re.escape(VARIANTS_DIR)}/{CACHE_HEX}{VARIANT_JOINER}{CACHE_HEX}{re.escape(JSON_SUFFIX)})$"
+    rf"|{re.escape(VARIANTS_DIR)}/{CACHE_HEX}{VARIANT_JOINER}{CACHE_HEX}{re.escape(JSON_SUFFIX)})\Z"
 )
 DISK_VARIANT_JOINER = "/"
 CACHE_REL_RE = re.compile(CACHE_LAYOUT_PATTERN.replace(VARIANT_JOINER, re.escape(DISK_VARIANT_JOINER)))

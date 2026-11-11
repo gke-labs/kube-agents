@@ -192,6 +192,14 @@ SOURCES: dict[str, Source] = {
         ("buildCredentialBrokerTokenReviewRole", "tokenreviews", "mcpRelayURLEnvVar", "mcpRelayPath =",
          "driftDetectorDefaultSubscription =", "credentialProxyWatcherAudience ="),
     ),
+    "kube_proxy_manifests_go": Source(
+        "k8s-operator/internal/controller/kube_proxy_manifests.go",
+        ("func buildKubeProxyDeployment(", "CREDENTIAL_PROXY_SESSION_AUDIENCE", "CREDENTIAL_PROXY_SESSION_CALLERS"),
+    ),
+    "k8s_api_proxy_main_go": Source(
+        "k8s-api-proxy/cmd/k8s-api-proxy/main.go",
+        ("sessionAudienceEnv", "sessionCallersEnv", "func parseSessionAudienceCallers("),
+    ),
     "manifest_helpers_go": Source(
         "k8s-operator/internal/controller/manifest_helpers.go",
         ("DefaultPlatformAgentVersion",),
@@ -390,18 +398,26 @@ SOURCES: dict[str, Source] = {
         "a2a/gateway/spawn.go",
         ("partOfValue", "sessionRole", "AutomountServiceAccountToken", "credentialProxySessionAudience"),
     ),
-    # The broker's shim, which the worker image carries as kubectl/gcloud and
-    # the spawner configures through three env names it spells itself.
+    # The broker's shim, which the worker image carries as gcloud (alongside
+    # stock kubectl wired to kube-proxy) and the spawner configures through env
+    # names it spells itself.
     "credential_proxy_client": Source(
         "agents/platform/scripts/credential_proxy_client.py",
-        ("CREDENTIAL_PROXY_URL", "CREDENTIAL_PROXY_TOKEN_FILE", "HERMES_HOME"),
+        ("CREDENTIAL_PROXY_URL", "CREDENTIAL_PROXY_TOKEN_FILE", "HERMES_HOME", "KUBE_PROXY_URL", "KUBE_PROXY_CA_FILE", "KUBE_PROXY_HOST_CONTEXT"),
     ),
     # The gateway's env contract with the operator (module a2a reading what
     # module k8s-operator renders). C1 pins the cluster-view names across the
-    # boundary; the anchors are the two names and a long-standing neighbour.
+    # boundary; the anchors are the cluster-view names and a long-standing neighbour.
     "a2a_gateway_config": Source(
         "a2a/gateway/config.go",
-        ("A2A_DEFAULT_ADDRESSEE", "A2A_SESSION_CLUSTER_VIEW", "A2A_CREDENTIAL_PROXY_URL"),
+        (
+            "A2A_DEFAULT_ADDRESSEE",
+            "A2A_SESSION_CLUSTER_VIEW",
+            "A2A_CREDENTIAL_PROXY_URL",
+            "A2A_KUBE_PROXY_URL",
+            "A2A_KUBE_PROXY_CA_CONFIGMAP",
+            "A2A_KUBE_PROXY_HOST_CONTEXT",
+        ),
     ),
     # The platform agent's allowlists as the gateway reads them: the per-target
     # check a session's delegation is held to. The names cross the module

@@ -1025,8 +1025,8 @@ class C1IsolationIsStructural(unittest.TestCase):
         """The premise the fence's rule set rests on.
 
         The fence grants DNS, the bus and LiteLLM and nothing else (plus, under
-        the operator's cluster-view flag, the credential broker on its one
-        port) -- no API-server rule, no 443, no metadata rule beyond DNS -- and that is
+        the operator's cluster-view flag, kube-proxy on 8443 and the credential
+        broker on 8765) -- no API-server rule, no 443, no metadata rule beyond DNS -- and that is
         only safe while a session pod holds no credential it could use against
         the API server if it found a route.
 
@@ -1042,11 +1042,11 @@ class C1IsolationIsStructural(unittest.TestCase):
           server accepts -- is never mounted.
         - Every token that is mounted is a projected token naming an audience
           that is not the API server's: the bus, and, under the operator's
-          A2A_SESSION_CLUSTER_VIEW flag, the credential broker's session
-          audience. The API server refuses both for anything else, so neither
-          is a cluster credential even though both are Kubernetes ones; the
-          broker token reaches one pod on one port, where TokenReview and the
-          broker's role table decide what it may run.
+          A2A_SESSION_CLUSTER_VIEW flag, the session audience accepted by
+          kube-proxy and the credential broker. The API server refuses both for
+          anything else, so neither is a cluster credential even though both
+          are Kubernetes ones; TokenReview and each proxy's per-audience policy
+          decide what the session token may run.
         - The ServiceAccount it is minted for is bound to nothing, so even a
           token that reached the API server would authenticate as a principal
           holding no permissions.
@@ -1566,22 +1566,25 @@ class C1IsolationIsStructural(unittest.TestCase):
     ) -> None:
         """The cluster view's contract, which sits astride the same boundary.
 
-        The operator renders `credentialProxySessionAudience` into the broker's
-        CREDENTIAL_PROXY_SESSION_AUDIENCE and the gateway projects its own
+        The operator renders `credentialProxySessionAudience` into both the
+        broker's and kube-proxy's CREDENTIAL_PROXY_SESSION_AUDIENCE (alongside
+        CREDENTIAL_PROXY_SESSION_CALLERS) and the gateway projects its own
         constant of the same name as the audience of every session pod's
-        broker token; the two modules cannot import each other, and each one's
-        tests compare its constant to itself. A rename on either side ships
-        with both Go suites green and every session pod's `kubectl` answered
-        401, because the token names an audience the broker never asks the
-        TokenReview about. The two env names the operator renders onto the
-        gateway and the gateway reads back are the same kind of pair, and a
-        drift there is quieter still: the view reads as off and nothing says
-        so. Both pairs are pinned here. The broker has no constant to pin: it
-        reads CREDENTIAL_PROXY_SESSION_AUDIENCE raw, so the operator's render
-        is the only spelling it ever sees.
+        broker/kube-proxy token; the three Go modules cannot import each other,
+        and each one's tests compare its constant to itself. A rename on any
+        side ships with every Go suite green and every session pod's `kubectl`
+        or `gcloud` answered 401, because the token names an audience the proxy
+        never asks TokenReview about. The env names the operator renders onto
+        the gateway and kube-proxy are the same kind of pair, and a drift there
+        is quieter still: the view or session auth reads as off and nothing says
+        so. All pairs are pinned here. The Python broker reads
+        CREDENTIAL_PROXY_SESSION_AUDIENCE raw, while k8s-api-proxy reads
+        sessionAudienceEnv and sessionCallersEnv.
         """
         operator = h.text("broker_split_go")
         manifests = h.text("manifests_go")
+        kube_proxy_manifests = h.text("kube_proxy_manifests_go")
+        kube_proxy_main = h.text("k8s_api_proxy_main_go")
         a2a_manifests = h.text("a2a_session_fence")
         spawner = h.text("a2a_spawner")
         config = h.text("a2a_gateway_config")
@@ -1606,23 +1609,61 @@ class C1IsolationIsStructural(unittest.TestCase):
             "the broker env render of the session audience",
         )
         self._one_match(
+            r'Name:\s*"CREDENTIAL_PROXY_SESSION_AUDIENCE",\s*Value:\s*credentialProxySessionAudience',
+            kube_proxy_manifests,
+            "kube-proxy's env render of the session audience",
+        )
+        self._one_match(
             r"Audience:\s+credentialProxySessionAudience,",
             spawner,
             "the spawner's projection of the session audience",
         )
+        for const_name, env_literal in (
+            ("sessionAudienceEnv", "CREDENTIAL_PROXY_SESSION_AUDIENCE"),
+            ("sessionCallersEnv", "CREDENTIAL_PROXY_SESSION_CALLERS"),
+        ):
+            with self.subTest(kube_proxy_env=const_name):
+                self._one_match(
+                    r'Name:\s*"%s"' % env_literal,
+                    kube_proxy_manifests,
+                    "kube-proxy's operator render of %s" % env_literal,
+                )
+                read_name = self._one_match(
+                    r'%s\s*=\s*"([^"]+)"' % const_name,
+                    kube_proxy_main,
+                    "k8s-api-proxy's %s" % const_name,
+                )
+                self.assertEqual(
+                    env_literal,
+                    read_name,
+                    "kube-proxy manifests render %r while k8s-api-proxy reads %r" % (env_literal, read_name),
+                )
 
-        for name in ("A2A_SESSION_CLUSTER_VIEW", "A2A_CREDENTIAL_PROXY_URL"):
+        for name in (
+            "A2A_SESSION_CLUSTER_VIEW",
+            "A2A_CREDENTIAL_PROXY_URL",
+            "A2A_KUBE_PROXY_URL",
+            "A2A_KUBE_PROXY_CA_CONFIGMAP",
+            "A2A_KUBE_PROXY_HOST_CONTEXT",
+        ):
             with self.subTest(env=name):
                 self._one_match(r'Name:\s*"%s"' % name, a2a_manifests, "the operator's render of %s" % name)
                 self._one_match(r'os\.Getenv\("%s"\)' % name, config, "the gateway's read of %s" % name)
 
-        # The shim's half: the spawner sets three names and the client reads
-        # three names, in a Go module and a Python script that share nothing.
-        # A rename on either side ships green and the first kubectl of the
-        # first flag-on session fails with "CREDENTIAL_PROXY_URL is not
-        # configured", a 401, or a kubeconfig filed under /opt/data.
+        # The shim's half: the spawner sets the broker and kube-proxy names and
+        # the client reads them, in a Go module and a Python script that share
+        # nothing. A rename on either side ships green and the first gcloud or
+        # kubectl of the first flag-on session fails with "CREDENTIAL_PROXY_URL
+        # is not configured", a 401, or a kubeconfig filed under /opt/data.
         shim = h.text("credential_proxy_client")
-        for name in ("CREDENTIAL_PROXY_URL", "CREDENTIAL_PROXY_TOKEN_FILE", "HERMES_HOME"):
+        for name in (
+            "CREDENTIAL_PROXY_URL",
+            "CREDENTIAL_PROXY_TOKEN_FILE",
+            "HERMES_HOME",
+            "KUBE_PROXY_URL",
+            "KUBE_PROXY_CA_FILE",
+            "KUBE_PROXY_HOST_CONTEXT",
+        ):
             with self.subTest(env=name):
                 self._one_match(r'Name:\s*"%s"' % name, spawner, "the spawner's render of %s" % name)
                 self.assertTrue(

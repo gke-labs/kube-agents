@@ -1,0 +1,61 @@
+# Control plane, setup, cost and CLI (gce-compute-fleet-audit): a poller
+# issues unpaginated cluster-wide LIST calls against large resource types,
+# and the API server serializes hundreds of megabytes per call until it is
+# OOM-killed. A declared gap: expected_fail until the check lands
+# (gke-labs/kube-agents#5413, which proposes `apiserver-heavy-list-call`).
+# Nothing is planted today: the shape (a suspended CronJob
+# `legacy-inventory-poller` in seeded-shapes whose command lists pods and
+# events cluster-wide with --chunk-size=0, no RBAC, never run) lands in the
+# pull request that adds the check, which rebinds this case to its role and
+# flips the marker in the same diff. The customer failure, an API server out
+# of memory, is never reproduced; Data Access logs of LIST calls are off by
+# default on GKE and API server metrics are not enabled on the fleet, so the
+# spec is the only readable signal. Two flip conditions: a check that reads a
+# CronJob's or Deployment's command for an unpaginated cluster-wide list (in
+# this stream, or another whose collector already dumps workloads, which
+# edits `audit:` and `finding_check` in the same diff) flips this case once
+# the shape is planted; a check keyed on audit-log LIST entries or list
+# metrics reads nothing here. `fixtures: []`: the run plants nothing and reads
+# no fixture, so no fixture's drift may excuse it; no safeguard reads a fixture
+# because none exists yet.
+# Domain `fleet-audits` as the other GCE compute cases.
+# Isolation class: fleet-read-only, GitOps-repo write (the audit's ledger).
+id: control-plane-unpaginated-heavy-list-oom
+name: "Unpaginated cluster-wide LIST caller (declared gap; planted as a suspended CronJob with --chunk-size=0 when its check lands)"
+domain: fleet-audits
+suite: certification
+expected_fail: true
+audit_streams:
+  - gce-compute-fleet-audit
+fixtures: []
+prompt: >-
+  Run the gce-compute-fleet-audit audit across the fleet, following the
+  gce-compute-fleet-audit SOP.
+expected_output: >-
+  Planted as a suspended CronJob whose command lists cluster-wide without
+  pagination, once its check lands. Customer failure: an API server out of
+  memory. Certified means: the ledger issue carries a finding that names
+  CronJob `legacy-inventory-poller` as an unpaginated cluster-wide lister
+  from its spec. The closing response is the SOP's one line with the ledger
+  URL.
+infrastructure:
+  deployer: noop
+validated: false
+
+verification_spec:
+  # One finding must carry both the check and the shape's object. The three
+  # slugs are the names the case accepts; the first is the one #5413 proposes.
+  - name: ledger-files-the-unpaginated-list-shape-on-the-cronjob
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: gce-compute-fleet-audit
+      scope: finding
+      finding_check:
+        [
+          "apiserver-heavy-list-call",
+          "unpaginated-list-overload",
+          "apiserver-memory-list",
+        ]
+      any_of_phrases: ["legacy-inventory-poller"]
