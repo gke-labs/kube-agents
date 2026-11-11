@@ -3041,7 +3041,7 @@ class ResourcePressureRouteTest(unittest.TestCase):
 
     def test_a_session_caller_is_admitted_at_the_hard_watermark_and_everyone_under_it(self):
         self.as_role(credential_proxy.CALLER_ROLE_SESSION)
-        status, headers, body = self.post({"argv": ["kubectl", "get", "pods"]})
+        status, headers, body = self.post({"argv": ["gcloud", "container", "clusters", "list"]})
         self.assertEqual(200, status, body)
         self.assertNotIn("Retry-After", headers)
         self.set_memory_percent(50)
@@ -4097,12 +4097,20 @@ class SessionRoleExecutableTest(unittest.TestCase):
                 with error:
                     return error.code, json.loads(error.read())
 
+    def _with_session_kubectl_admitted(self):
+        return mock.patch.dict(
+            credential_proxy.ROLE_EXECUTABLES,
+            {credential_proxy.CALLER_ROLE_SESSION: frozenset({"kubectl", "gcloud"})},
+        )
+
     def test_the_table(self):
         for role, executable, want in (
-            (credential_proxy.CALLER_ROLE_SESSION, "kubectl", True),
+            (credential_proxy.CALLER_ROLE_SESSION, "kubectl", False),
             (credential_proxy.CALLER_ROLE_SESSION, "gcloud", True),
             (credential_proxy.CALLER_ROLE_SESSION, "git", False),
             (credential_proxy.CALLER_ROLE_SESSION, "gh", False),
+            (credential_proxy.CALLER_ROLE_PROFILE, "kubectl", True),
+            (credential_proxy.CALLER_ROLE_PROFILE, "gcloud", True),
             (credential_proxy.CALLER_ROLE_SHELL, "gcloud", True),
             (credential_proxy.CALLER_ROLE_SHELL, "kubectl", False),
             (credential_proxy.CALLER_ROLE_SHELL, "git", False),
@@ -4152,15 +4160,20 @@ class SessionRoleExecutableTest(unittest.TestCase):
         self.assertEqual(credential_proxy.RULE_EXECUTABLE_ALLOWLIST, body["rule"])
 
     def test_the_role_check_stands_behind_the_route(self):
-        # Widen the route the way the git-routing tests do and the session is
-        # still held to its two CLIs (and the shell to gcloud), with the rule
-        # the shim prints, while a roleless caller runs what the route now
-        # carries. This is what the role check buys once the route list and the
-        # session list are the same two names.
+        # Widen the route the way the git-routing tests do and both the session
+        # and the shell stay held to gcloud (while profile keeps kubectl+gcloud),
+        # with the rule the shim prints, while a roleless caller runs what the
+        # route now carries.
         routed = (*credential_proxy.EXEC_ROUTE_EXECUTABLES, "git")
         with mock.patch.object(credential_proxy, "EXEC_ROUTE_EXECUTABLES", routed):
             with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
                 status, body = self.post_as(credential_proxy.CALLER_ROLE_SESSION, {"argv": ["git", "status"]})
+            self.assertEqual(403, status)
+            self.assertEqual("SECURITY_POLICY_BLOCKED", body["code"])
+            self.assertEqual(credential_proxy.RULE_CALLER_EXECUTABLE, body["rule"])
+            self.assertIn("session", body["message"])
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                status, body = self.post_as(credential_proxy.CALLER_ROLE_SESSION, {"argv": ["kubectl", "get", "pods"]})
             self.assertEqual(403, status)
             self.assertEqual("SECURITY_POLICY_BLOCKED", body["code"])
             self.assertEqual(credential_proxy.RULE_CALLER_EXECUTABLE, body["rule"])
@@ -4176,12 +4189,13 @@ class SessionRoleExecutableTest(unittest.TestCase):
             self.assertEqual(200, status, body)
 
     def test_a_read_from_a_session_runs(self):
-        status, body = self.post_as(credential_proxy.CALLER_ROLE_SESSION, {"argv": ["kubectl", "get", "pods"]})
+        with self._with_session_kubectl_admitted():
+            status, body = self.post_as(credential_proxy.CALLER_ROLE_SESSION, {"argv": ["kubectl", "get", "pods"]})
         self.assertEqual(200, status, body)
         self.assertEqual(0, body["exitCode"])
 
     def test_a_mutation_from_a_session_is_refused_read_only(self):
-        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+        with self._with_session_kubectl_admitted(), self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
             status, body = self.post_as(
                 credential_proxy.CALLER_ROLE_SESSION, {"argv": ["kubectl", "delete", "pod", "x"]}
             )
@@ -4277,7 +4291,7 @@ class SessionRoleExecutableTest(unittest.TestCase):
                 self.assertEqual(want, credential_proxy.session_kubectl_flag_refusal(role, argv))
 
     def test_a_clustered_file_flag_from_a_session_is_refused_before_it_reaches_kubectl(self):
-        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+        with self._with_session_kubectl_admitted(), self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
             status, body = self.post_as(
                 credential_proxy.CALLER_ROLE_SESSION,
                 {"argv": ["kubectl", "get", "-Af", "/etc/credential-proxy/policy.json"]},
@@ -4288,7 +4302,7 @@ class SessionRoleExecutableTest(unittest.TestCase):
         self.assertIn("-f", body["message"])
 
     def test_a_file_backed_output_format_from_a_session_is_refused(self):
-        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+        with self._with_session_kubectl_admitted(), self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
             status, body = self.post_as(
                 credential_proxy.CALLER_ROLE_SESSION,
                 {"argv": ["kubectl", "get", "ns", "-o", "go-template-file=/etc/credential-proxy/policy.json"]},
@@ -4310,15 +4324,16 @@ class SessionRoleExecutableTest(unittest.TestCase):
     def test_a_metrics_read_from_a_session_is_refused_as_a_flag_before_the_policy(self):
         # The raw-path rule admits /metrics for every caller; the walker keeps
         # it from the session, plain or percent-encoded, under the flag rule.
-        for path in ("/metrics", "/%6detrics"):
-            with self.subTest(path=path), self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
-                status, body = self.post_as(
-                    credential_proxy.CALLER_ROLE_SESSION, {"argv": ["kubectl", "get", "--raw", path]}
-                )
-                self.assertEqual(403, status)
-                self.assertEqual("SECURITY_POLICY_BLOCKED", body["code"])
-                self.assertEqual(credential_proxy.RULE_CALLER_KUBECTL_FLAG, body["rule"])
-                self.assertIn("--raw", body["message"])
+        with self._with_session_kubectl_admitted():
+            for path in ("/metrics", "/%6detrics"):
+                with self.subTest(path=path), self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                    status, body = self.post_as(
+                        credential_proxy.CALLER_ROLE_SESSION, {"argv": ["kubectl", "get", "--raw", path]}
+                    )
+                    self.assertEqual(403, status)
+                    self.assertEqual("SECURITY_POLICY_BLOCKED", body["code"])
+                    self.assertEqual(credential_proxy.RULE_CALLER_KUBECTL_FLAG, body["rule"])
+                    self.assertIn("--raw", body["message"])
 
 
 class GetCredentialsFlagsBetweenWordsTest(unittest.TestCase):
@@ -21387,6 +21402,141 @@ class SessionToolBudgetRouteTest(unittest.TestCase):
         self.assertEqual(credential_proxy.LOOP_BREAKER_CODE, credential_proxy_client.LOOP_BREAKER_CODE)
         self.assertIn(credential_proxy.SESSION_BUDGET_EXCEEDED_CODE, credential_proxy_client.POLICY_BLOCKED_CODES)
         self.assertIn(credential_proxy.LOOP_BREAKER_CODE, credential_proxy_client.POLICY_BLOCKED_CODES)
+
+
+class ExcludedClusterPathTest(unittest.TestCase):
+    """spec.scope.exclude.clusters at the broker: every route to a cluster's API.
+
+    The same stubbed gcloud and kubectl as ScopedServiceAccountPathTest, borrowed
+    rather than copied, so a refused fetch is asserted by an empty call log and
+    not only by the exception. `EXCLUDED` and `ALLOWED` share a project and
+    location: the exclusion is a cluster's, not its project's.
+    """
+
+    PROJECT = "kagents-dev"
+    LOCATION = "us-east4"
+    EXCLUDED = "excluded-cluster"
+    ALLOWED = "allowed-cluster"
+
+    fake_gcloud = ScopedServiceAccountPathTest.fake_gcloud
+    fake_kubectl = ScopedServiceAccountPathTest.fake_kubectl
+    gke_calls = ScopedServiceAccountPathTest.gke_calls
+    pool = ScopedServiceAccountPathTest.pool
+    EMAIL = ScopedServiceAccountPathTest.EMAIL
+    OTHER_EMAIL = ScopedServiceAccountPathTest.OTHER_EMAIL
+    OTHER_PROJECT = ScopedServiceAccountPathTest.OTHER_PROJECT
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.minted = []
+        self.get_credentials_log = Path(self.temp_dir.name) / "get-credentials.log"
+        self.scope_file = Path(self.temp_dir.name) / "scope.json"
+        self.exclude()
+
+    def exclude(self, *clusters):
+        """Rewrite scope.json, as an edit to spec.scope lands in the ConfigMap mount."""
+        text = json.dumps({"present": True, "projects": [], "exclude": {"projects": [], "clusters": [
+            {"projectId": self.PROJECT, "location": self.LOCATION, "clusterName": cluster} for cluster in clusters
+        ]}})
+        self.scope_file.write_text(text, encoding="utf-8")
+        stamp = time.time_ns() + 1_000_000 * len(clusters)
+        os.utime(self.scope_file, ns=(stamp, stamp))
+
+    def executor(self, scoped_pool=None):
+        import scope_exclude
+
+        executor = CommandExecutor(
+            timeout_seconds=30,
+            max_output_bytes=1 << 16,
+            state_dir=str(Path(self.temp_dir.name) / "state"),
+            scoped_pool=scoped_pool,
+            exclusions=scope_exclude.Exclusions(path=lambda: str(self.scope_file)),
+        )
+        executor.environment["GET_CREDENTIALS_LOG"] = str(self.get_credentials_log)
+        self.fake_gcloud(executor)
+        self.fake_kubectl(executor)
+        return executor
+
+    def context(self, cluster):
+        return f"gke_{self.PROJECT}_{self.LOCATION}_{cluster}"
+
+    def get_credentials(self, cluster):
+        return ["gcloud", "container", "clusters", "get-credentials", cluster,
+                f"--project={self.PROJECT}", f"--location={self.LOCATION}"]
+
+    def assert_excluded(self, call):
+        import scope_exclude
+
+        with self.assertRaises(scope_exclude.ExcludedCluster) as caught:
+            call()
+        self.assertEqual(scope_exclude.RULE_EXCLUDED_CLUSTER, caught.exception.rule)
+
+    def test_a_kubectl_naming_an_excluded_cluster_is_refused_before_gke_is_asked(self):
+        self.exclude(self.EXCLUDED)
+        executor = self.executor()
+        self.assert_excluded(lambda: executor.execute(
+            ["kubectl", "get", "pods"], kubeconfig_context=self.context(self.EXCLUDED)))
+        self.assertEqual([], self.gke_calls())
+        result = executor.execute(["kubectl", "get", "pods"], kubeconfig_context=self.context(self.ALLOWED))
+        self.assertEqual(0, result.exit_code, result.stderr)
+        self.assertEqual([self.context(self.ALLOWED)], self.gke_calls())
+
+    def test_a_cluster_excluded_after_its_kubeconfig_was_cached_is_refused(self):
+        executor = self.executor()
+        result = executor.execute(["kubectl", "get", "pods"], kubeconfig_context=self.context(self.EXCLUDED))
+        self.assertEqual(0, result.exit_code, result.stderr)
+        self.exclude(self.EXCLUDED)
+        self.assert_excluded(lambda: executor.execute(
+            ["kubectl", "get", "pods"], kubeconfig_context=self.context(self.EXCLUDED)))
+
+    def test_the_kubeconfig_flag_naming_an_excluded_cluster_is_refused(self):
+        self.exclude(self.EXCLUDED)
+        executor = self.executor()
+        self.assert_excluded(lambda: executor.execute(
+            ["kubectl", "get", "pods", f"--kubeconfig={self.context(self.EXCLUDED)}"]))
+        self.assertEqual([], self.gke_calls())
+
+    def test_get_credentials_for_an_excluded_cluster_never_runs(self):
+        self.exclude(self.EXCLUDED)
+        executor = self.executor()
+        self.assert_excluded(lambda: executor.execute(self.get_credentials(self.EXCLUDED), wants_kubeconfig=True))
+        self.assertEqual([], self.gke_calls())
+        result = executor.execute(self.get_credentials(self.ALLOWED), wants_kubeconfig=True)
+        self.assertEqual(0, result.exit_code, result.stderr)
+        self.assertIn(self.context(self.ALLOWED), result.kubeconfig)
+
+    def test_get_credentials_on_gcloud_defaults_is_refused_once_its_context_names_the_cluster(self):
+        """No --location in argv: the target is only known from what gcloud wrote."""
+        self.exclude(self.EXCLUDED)
+        executor = self.executor()
+        stub = Path(executor.executables["gcloud"])
+        stub.write_text(stub.read_text(encoding="utf-8").replace(
+            'location=""', f'location="{self.LOCATION}"'), encoding="utf-8")
+        argv = ["gcloud", "container", "clusters", "get-credentials", self.EXCLUDED, f"--project={self.PROJECT}"]
+        self.assert_excluded(lambda: executor.execute(argv, wants_kubeconfig=True))
+        self.assertFalse(executor._managed_kubeconfig(
+            credential_proxy_client.parse_gke_context(self.context(self.EXCLUDED))).exists(),
+            "an excluded cluster's kubeconfig was filed")
+
+    def test_a_kubectl_naming_no_cluster_is_refused_when_the_broker_s_own_cluster_is_excluded(self):
+        for scoped_pool in (None, "pool"):
+            with self.subTest(pool=scoped_pool is not None):
+                self.exclude(self.EXCLUDED)
+                executor = self.executor(self.pool() if scoped_pool else None)
+                executor.host_context = self.context(self.EXCLUDED)
+                self.assert_excluded(lambda: executor.execute(["kubectl", "get", "pods"]))
+                self.exclude()
+                result = executor.execute(["kubectl", "get", "pods"])
+                self.assertNotIn("ExcludedCluster", result.stderr)
+
+    def test_a_gcloud_metadata_read_of_an_excluded_cluster_is_allowed(self):
+        """Control-plane reads are the project's, and stay allowed."""
+        self.exclude(self.EXCLUDED)
+        executor = self.executor()
+        result = executor.execute(["gcloud", "container", "clusters", "describe", self.EXCLUDED,
+                                   f"--project={self.PROJECT}", f"--location={self.LOCATION}"])
+        self.assertEqual(0, result.exit_code, result.stderr)
 
 
 if __name__ == "__main__":
