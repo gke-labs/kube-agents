@@ -888,7 +888,8 @@ EXEC_REPLICAS_MAX = 32
 EXEC_REPLICAS_RE = re.compile(r"[0-9]+")
 # Requests that keep serving while the broker or an exec pod drains
 # (SHUTDOWN_DRAIN_SECONDS, EXEC_SHUTDOWN_DRAIN_SECONDS),
-# by method and path: the health probe; a relay's settle routes, so the
+# by method and path: the health probe (which an exec pod answers 503 while it
+# drains, HEALTHZ_DRAINING_PAYLOAD); a relay's settle routes, so the
 # gateway's acks for pulls already answered land; and the event pulls. Slack's
 # and Teams' queues are in-process and already acknowledged upstream, so every
 # event taken now is one fewer lost with the pod; the Chat pulls keep their own
@@ -1087,8 +1088,18 @@ THREAD_CAP_LOG_INTERVAL_SECONDS = 60
 HEALTH_PORT_ENV = "CREDENTIAL_PROXY_HEALTH_PORT"
 DEFAULT_HEALTH_PORT = 0
 HEALTH_SERVER_HEADER = "credential-proxy-health"
-# What /healthz answers, on both listeners.
+# What /healthz answers, on both listeners, except that an exec pod that drains
+# answers HEALTHZ_DRAINING_PAYLOAD on the credentialed one (below). The
+# health-only listener is opt-in and not set on exec pods, so it keeps ok.
 HEALTHZ_PAYLOAD = {"status": "ok"}
+# What /healthz answers, with 503, on an exec pod that drains: the readiness
+# probe then marks it NotReady, so the Service sends no new connection to it,
+# and at one replica a caller fails to connect and falls back to the stateful
+# broker rather than reading `draining` for the whole drain. The requests
+# already in flight are not touched: readiness steers only new connections.
+# The broker keeps answering ok: it rolls with Recreate, so no other pod could
+# take its traffic.
+HEALTHZ_DRAINING_PAYLOAD = {"status": "draining"}
 # Metric names, and the vocabulary of every label value. Nothing served is
 # caller text: a label value is one of these strings or a member of the
 # vocabularies below, so a caller cannot grow the series set by varying what
@@ -2163,10 +2174,11 @@ CALLER_ROLE_SHELL = "shell"
 CALLER_ROLE_CHAT = "chat"
 CALLER_ROLE_A2A_CHAT = "a2a-chat"
 # The session pod the A2A gateway spawns, under the operator's
-# A2A_SESSION_CLUSTER_VIEW flag. Exec route only, and within it kubectl and
-# gcloud only (ROLE_EXECUTABLES): the pod executes model output, and the
-# read-only posture command_policy enforces is the view it gets. A demo aid
-# until declarative profiles carry a session's identity and tools.
+# A2A_SESSION_CLUSTER_VIEW flag. Exec route only, and within it gcloud only
+# (ROLE_EXECUTABLES; kubectl routes through <agent>-kube-proxy): the pod
+# executes model output, and the read-only posture command_policy enforces is
+# the view it gets. A demo aid until declarative profiles carry a session's
+# identity and tools.
 CALLER_ROLE_SESSION = "session"
 # The gateway pod's agent-api-auth container: the k8s-event-watcher and the
 # drift-detector. Its token is projected into that container only, never into
@@ -2219,14 +2231,13 @@ CALLER_ROLES = (
 )
 
 # Which executables a role may hand to /v1/exec. A role absent here keeps
-# whatever the route carries (`EXEC_ROUTE_EXECUTABLES`); the session and
-# profile roles are narrowed to the two CLIs that reach a cluster read-only,
-# and the shell and scope roles are narrowed to `gcloud` (the sandbox runs
-# stock `kubectl` against `kube-proxy`, so `/usr/local/bin/credential-proxy-exec`
-# in the sandbox cannot bypass `kube-proxy`).
+# whatever the route carries (`EXEC_ROUTE_EXECUTABLES`); the profile role keeps
+# the two CLIs that reach a cluster read-only under task-credential confinement,
+# while the shell, session, and scope roles are narrowed to `gcloud` (the
+# sandbox and session pods run stock `kubectl` against `<agent>-kube-proxy`).
 ROLE_EXECUTABLES: dict[str, frozenset[str]] = {
     CALLER_ROLE_SHELL: frozenset({"gcloud"}),
-    CALLER_ROLE_SESSION: frozenset({"kubectl", "gcloud"}),
+    CALLER_ROLE_SESSION: frozenset({"gcloud"}),
     CALLER_ROLE_PROFILE: frozenset({"kubectl", "gcloud"}),
     CALLER_ROLE_SCOPE: frozenset({"gcloud"}),
 }
@@ -8518,9 +8529,12 @@ def forge_registry() -> providers.Registry:
         return _forge_registry
 
 
-# What `/v1/exec` runs for the sandbox, enforced here because the client is
-# only a convenience: anything holding the sandbox's token can post its own
-# argv. Neither `git` nor any forge CLI is on it: a repository and a forge are
+# What `/v1/exec` runs for callers, enforced here because the client is
+# only a convenience: anything holding a caller token can post its own
+# argv. `kubectl` stays on the route for AgentProfile workers (`CALLER_ROLE_PROFILE`),
+# while `ROLE_EXECUTABLES` narrows the sandbox, session, and scope roles to
+# `gcloud` alone (`kubectl` in the sandbox and session pods routes through
+# `<agent>-kube-proxy`). Neither `git` nor any forge CLI is on it: a repository and a forge are
 # reached through the verbs, which run them on the broker's own behalf. `git`
 # here would run under the broker's credential helper, and a read such as
 # `ls-remote` is no write for a lease to fence.
@@ -8536,11 +8550,12 @@ def broker_executables() -> tuple[str, ...]:
     ask to have run on its behalf. They used to be the same four names, which
     read as one decision and was two.
 
-    `gcloud` and `kubectl` are on both: the agent names them and this process
-    runs them. `git` and any forge CLI are here for the broker's own use -- it
-    issues them on its own behalf for the verbs. `/v1/exec` refuses both
-    (`EXEC_ROUTE_EXECUTABLES`), so a sandbox caller that composes its own
-    request reaches neither. What this list
+    `gcloud` and `kubectl` are on `/v1/exec` (`ROLE_EXECUTABLES` narrows `kubectl`
+    to `CALLER_ROLE_PROFILE`, while the sandbox and session pods route `kubectl`
+    through `<agent>-kube-proxy`). `git` and any forge CLI are here for the
+    broker's own use -- it issues them on its own behalf for the verbs.
+    `/v1/exec` refuses both (`EXEC_ROUTE_EXECUTABLES`), so a caller that composes
+    its own request reaches neither. What this list
     decides on its own is the forge CLI: one is here only if some forge this
     install built declares one, so an install whose forges all speak HTTP
     grants no forge binary rather than inheriting the union of every binary
@@ -13010,7 +13025,8 @@ class HealthHandler(MetricsHandler):
     """The health-only listener: GET /healthz, and nothing else.
 
     MetricsHandler's bounds, deadline and silence, serving the answer the
-    credentialed listener's /healthz gives and nothing the process knows:
+    credentialed listener's /healthz gives outside an exec pod's drain (see
+    HEALTHZ_DRAINING_PAYLOAD), and nothing the process knows:
     unauthenticated, like that route, because the probe runs before any
     token would be available and reveals nothing. A separate port so that a
     credentialed listener at its thread cap still reads as alive.
@@ -13575,6 +13591,9 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             return
         if self.path != HEALTHZ_PATH:
             self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
+            return
+        if self.broker_role == EXEC_ROLE and self.draining.is_set():
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE, HEALTHZ_DRAINING_PAYLOAD)
             return
         self._json(HTTPStatus.OK, HEALTHZ_PAYLOAD)
 

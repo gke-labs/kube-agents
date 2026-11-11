@@ -26,6 +26,7 @@ rules:
       - persistentvolumeclaims
       - pods
       - resourcequotas
+      - secrets
       - serviceaccounts
       - services
     verbs:
@@ -65,16 +66,6 @@ rules:
       - podtemplates
     verbs:
       - create
-  - apiGroups:
-      - ""
-    resources:
-      - secrets
-    verbs:
-      - create
-      - delete
-      - get
-      - patch
-      - update
   - apiGroups:
       - admissionregistration.k8s.io
     resourceNames:

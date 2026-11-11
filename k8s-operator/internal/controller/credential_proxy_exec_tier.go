@@ -59,6 +59,24 @@ const (
 	credentialProxyExecTierEphemeralStorageLimit = "2Gi"
 )
 
+// The exec pods' readiness probe, tighter than the stateful broker's (10s
+// period, 5s timeout, 3 failures). A draining exec pod answers /healthz with
+// 503 (HEALTHZ_DRAINING_PAYLOAD in credential_proxy.py), at once, so three
+// failures 3s apart take it out of its Service in about 9s: at one replica a
+// caller's connect then fails over to the stateful broker instead of reading
+// `draining` until the replacement is Ready. Three failures, not one, so a
+// single slow probe on a healthy pod does not eject it: at one replica an
+// ApiSession whose connect fails stays on the stateful broker for the rest of
+// the session (credential_proxy_client.py), and CredentialProxyExecReady would
+// flip on each miss. The 2s timeout is ample for a handler that returns a
+// constant. The stateful broker keeps its own probe: it rolls with Recreate,
+// so no other pod could take its traffic.
+const (
+	credentialProxyExecTierReadinessPeriodSeconds    int32 = 3
+	credentialProxyExecTierReadinessTimeoutSeconds   int32 = 2
+	credentialProxyExecTierReadinessFailureThreshold int32 = 3
+)
+
 // How long an exec pod may take to stop (credential-broker-exec-tier.md §9
 // step 0). RollingUpdate keeps another replica serving while one rolls, so the
 // exec role drains for as long as the longest command it admits
@@ -251,10 +269,10 @@ func credentialProxyExecTierLimitBytes(size string) string {
 //     0: no exec call keeps state across calls, a second replica serves while
 //     one rolls, and a rollout needs no surge Pod. A stopping pod keeps its cpu
 //     and quota until it exits, so a step whose replacement has no room waits
-//     for it. At one replica a stopping pod refuses new requests as draining
-//     until its replacement is Ready (for the whole drain when the replacement
-//     has no room); the callers fall back to the stateful broker only once it
-//     stops accepting connections;
+//     for it. A stopping pod fails its readiness probe and leaves the Service
+//     in about 9s (credentialProxyExecTierReadinessPeriodSeconds and the
+//     threshold), so at one replica callers fall back to the stateful broker
+//     until the replacement is Ready;
 //   - the grace period (credentialProxyExecTierTerminationGraceSeconds): the
 //     exec role drains on SIGTERM for as long as the longest command it
 //     admits, not for the broker's bounded drain;
@@ -342,6 +360,11 @@ func buildCredentialProxyExecTierDeployment(agent *agentv1alpha1.PlatformAgent, 
 		c := &spec.Containers[i]
 		if c.Name != credentialProxyContainerName {
 			continue
+		}
+		if c.ReadinessProbe != nil {
+			c.ReadinessProbe.PeriodSeconds = credentialProxyExecTierReadinessPeriodSeconds
+			c.ReadinessProbe.TimeoutSeconds = credentialProxyExecTierReadinessTimeoutSeconds
+			c.ReadinessProbe.FailureThreshold = credentialProxyExecTierReadinessFailureThreshold
 		}
 		env := c.Env[:0]
 		for _, e := range c.Env {

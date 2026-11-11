@@ -669,7 +669,7 @@ spec:
       then, for the reason the resources block is: 0 is the operator's default,
       and an empty block on every CR is noise a reader takes for a setting.
     */}}
-    {{- $execReplicas := dig "exec" "replicas" 0 (.Values.platformAgent.deployment.credentialProxy | default dict) | int }}
+    {{- $execReplicas := include "kube-agents.credentialProxyExecReplicas" . | int }}
     {{- if $proxyQuantities }}
     {{- include "kube-agents.crdFieldGuard" (dict "value" "platformAgent.deployment.credentialProxy.resources" "path" (list "deployment" "credentialProxy") "field" "resources") }}
     {{- end }}
@@ -775,6 +775,10 @@ spec:
     workloadIdentityFederation:
       audience: {{ $wif.audience | quote }}
       serviceAccountEmail: {{ $wif.serviceAccountEmail | quote }}
+    {{- end }}
+    {{- if kindIs "bool" .Values.platformAgent.security.disallowSecretsRead }}
+    {{- include "kube-agents.crdFieldGuard" (dict "value" "platformAgent.security.disallowSecretsRead" "path" (list "security") "field" "disallowSecretsRead") }}
+    disallowSecretsRead: {{ .Values.platformAgent.security.disallowSecretsRead }}
     {{- end }}
   {{- /*
     Rendered whenever the install carries the value, empty lists included, and never

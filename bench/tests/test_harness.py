@@ -6767,3 +6767,37 @@ def test_a_pull_request_run_skips_the_report_only_judges(
     assert METRICS["outcome_validity"]().applies(ctx)
     assert {"tool_invocation", "checklist"} <= set(METRICS)
     assert "judge scores are off for this run" in capsys.readouterr().err
+
+
+# ------------------------------------------------ the agent's own cluster in a prompt
+
+
+def test_the_agent_cluster_placeholders_expand_from_the_context():
+    prompt = "ask the cluster agent about {{AGENT_CLUSTER_NAME}} ({{AGENT_CLUSTER_PROJECT}}, {{AGENT_CLUSTER_LOCATION}})"
+    expanded, problem = harness.expand_agent_cluster_placeholders(prompt, "gke_kagents-dev_us-east4_ka-next-4")
+    assert problem is None
+    assert expanded == "ask the cluster agent about ka-next-4 (kagents-dev, us-east4)"
+
+
+def test_a_prompt_without_the_placeholders_is_left_alone_whatever_the_context():
+    assert harness.expand_agent_cluster_placeholders("list the pods", None) == ("list the pods", None)
+    assert harness.expand_agent_cluster_placeholders("list the pods", "in-cluster") == ("list the pods", None)
+
+
+def test_the_placeholders_need_a_gke_context():
+    for context in (None, "", "in-cluster", "kind-dev", "gke_p_l"):
+        expanded, problem = harness.expand_agent_cluster_placeholders("about {{AGENT_CLUSTER_NAME}}", context)
+        assert problem is not None and "AGENT_CLUSTER_CONTEXT" in problem, context
+        assert expanded == "about {{AGENT_CLUSTER_NAME}}"
+
+
+def test_a_run_whose_prompt_names_the_agent_cluster_without_a_context_is_a_setup_failure(monkeypatch):
+    # A setup error, not a model failure: the marker scoring reads, no output to
+    # judge, and nothing sent (the transport would need a context to reach).
+    monkeypatch.delenv("AGENT_CLUSTER_CONTEXT", raising=False)
+    result = harness.KubeAgentsHarness().run("ask about {{AGENT_CLUSTER_NAME}}")
+    assert result.output == ""
+    assert result.errors and result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "AGENT_CLUSTER_CONTEXT" in result.errors[0]
+    snap = transcript.get()
+    assert snap is not None and snap.output == ""

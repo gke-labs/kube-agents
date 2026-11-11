@@ -21,7 +21,8 @@
 #
 # WHY THESE THREE. The GitLab lane's list, unchanged: the cases grade the
 # forge and not where it is, and all three passed on this lane on the dev
-# project on 2026-10-22 (3/3, 3/3, 2/3 with one quota miss). The GHES-only
+# project on 2026-10-22 (one quota miss set aside, an infra class). The
+# GHES-only
 # case bench/tasks/ghes-pdb-remediation-pr (the same task plus a writes
 # safeguard the inject lane appends anyway) is not registered: a nightly
 # registration would run it on the github.com nightly as a second copy of

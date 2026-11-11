@@ -90,6 +90,8 @@ Today: [`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §1 ("Don't re-say wha
 says", "Handle pure conversation yourself") and §2 steps 4 and 5. In code,
 `deploy/docker/patches/slack_boilerplate.py` strips Hermes' cron wrapper and its job id from Slack,
 and `busyNotice*` in `a2a/gateway/busy.go` is worded without a task id.
+[`agents/cluster/SOUL.md`](../../agents/cluster/SOUL.md) §6 ("Absent is an answer when presence was the
+question") keeps the command out of a one-line presence finding and sends it to `verified_claims`.
 
 ## Choices are buttons
 
@@ -146,8 +148,8 @@ cluster.
 
 Today: [`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §1.6 ("state the resolved target back to
 them and wait for a yes") and §3's `/feedback` confirmation, which shows the exact submission and waits for a yes. In the
-gateway, `mayStop` in `a2a/gateway/stopgate.go` lets only a requester of the thread press Slack's
-Stop button; a typed `stop`, and Stop on other backends, are not gated.
+gateway, `mayStop` in `a2a/gateway/stopgate.go` lets only a requester of the thread press its Stop
+button, Slack's native one or the one drawn on Google Chat; a typed `stop` is not gated.
 
 ## Renderers never compose
 

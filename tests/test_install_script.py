@@ -8010,7 +8010,7 @@ class PlatformAgentModeTest(unittest.TestCase):
         warning = text.index('if [ "$platform_agent_mode" = "next" ] && [ -n "$third_party_registry_prefix" ]; then', main_start)
         self.assertLess(text.index('local third_party_registry_prefix=', main_start), warning)
         self.assertLess(exported, warning)
-        self.assertIn("A2A_NATS_IMAGE and A2A_PROVISION_IMAGE", text[warning : warning + 900])
+        self.assertIn("A2A_NATS_IMAGE, A2A_PROVISION_IMAGE and A2A_NATS_RELOADER_IMAGE", text[warning : warning + 900])
 
     def test_a_bad_value_from_the_shell_on_a_first_install_names_the_shell(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -11513,6 +11513,7 @@ class DomainScopedFlagsTest(unittest.TestCase):
         "--enable-hermes-dashboard": "PARAM_ENABLE_WEBUI",
         "--enable-web-console": "PARAM_ENABLE_WEB_CONSOLE",
         "--enable-gke-backup-plan": "PARAM_ENABLE_GKE_BACKUP_PLAN",
+        "--disallow-secrets-read": "PARAM_DISALLOW_SECRETS_READ",
         "--enable-pubsub-platform": "PARAM_ENABLE_PUBSUB_PLATFORM",
         "--enable-stockout-investigator": "PARAM_ENABLE_STOCKOUT_INVESTIGATOR",
         "--enable-drift-detector": "PARAM_ENABLE_DRIFT_DETECTOR",
@@ -13283,6 +13284,7 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
         "--enable-google-chat",
         "--enable-slack",
         "--enable-gke-backup-plan",
+        "--disallow-secrets-read",
         "--enable-pubsub-platform",
         "--enable-stockout-investigator",
         "--enable-drift-detector",
@@ -13339,6 +13341,7 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
         "--enable-google-chat": "GOOGLE_CHAT_ENABLED",
         "--enable-slack": "SLACK_ENABLED",
         "--enable-gke-backup-plan": "ENABLE_GKE_BACKUP_PLAN",
+        "--disallow-secrets-read": "DISALLOW_SECRETS_READ",
         "--enable-pubsub-platform": "ENABLE_PUBSUB_PLATFORM",
         "--enable-stockout-investigator": "ENABLE_STOCKOUT_INVESTIGATOR",
         "--enable-drift-detector": "ENABLE_DRIFT_DETECTOR",
@@ -13402,6 +13405,7 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
             "PARAM_ENABLE_GOOGLE_CHAT",
             "PARAM_ENABLE_SLACK",
             "PARAM_ENABLE_GKE_BACKUP_PLAN",
+            "PARAM_DISALLOW_SECRETS_READ",
             "PARAM_ENABLE_PUBSUB_PLATFORM",
             "PARAM_ENABLE_STOCKOUT_INVESTIGATOR",
             "PARAM_ENABLE_DRIFT_DETECTOR",
