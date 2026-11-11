@@ -5,39 +5,32 @@ import (
 	"strings"
 )
 
-// The origins an unattended trigger may name (#4685): a schedule the operator
-// ships, or one a person created.
-const (
-	TriggerOriginBuiltin = "builtin"
-	TriggerOriginUser    = "user"
-)
+// TriggerOriginBuiltin is the one origin an unattended trigger may name today
+// (#4685): a schedule or collector the operator ships. A user's schedule runs
+// at its creator's tier and carries no trigger, so the origin field stays on
+// the wire for a later source but admits nothing else yet.
+const TriggerOriginBuiltin = "builtin"
 
-// TriggerUserStreamPrefix is the one stream path an origin-user schedule's
-// report stream may take: user/<schedule-name>.
-const TriggerUserStreamPrefix = "user/"
+// triggerScheduleSource is the source whose triggers name a schedule, and the
+// only one that may bind a report stream.
+const triggerScheduleSource = "schedule"
 
-// ValidateTrigger is the shape check every holder of an unattended trigger
-// shares: the capability grant that binds it and the task credential that
-// carries it to the broker. name is <source> or <source>/<name>, each a
-// single subject token; origin is builtin or user; stream is empty, a single
-// subject token, or user/<token>.
-//
-// It checks shape only. Whether a stream belongs to its trigger, and whether
-// a user schedule may name it, is the gateway's rule at mint and the broker's
-// at write.
+// ValidateTrigger is the check every holder of an unattended trigger shares:
+// the capability grant that binds it, the authority block that claims it, and
+// the task credential that carries it to the broker. name is <source> or
+// <source>/<name>, each a single subject token; origin is builtin; stream is
+// empty or the schedule's own name, so a trigger can bind no report stream but
+// its own: a stream is allowed only on schedule/<stream>.
 func ValidateTrigger(name, origin, stream string) error {
 	source, rest, hasRest := strings.Cut(name, "/")
 	if !ValidSubjectToken(source) || (hasRest && !ValidSubjectToken(rest)) {
 		return fmt.Errorf("trigger name %q is not <source> or <source>/<name> of dot-free DNS-1123 labels", name)
 	}
-	if origin != TriggerOriginBuiltin && origin != TriggerOriginUser {
-		return fmt.Errorf("trigger origin %q is not %q or %q", origin, TriggerOriginBuiltin, TriggerOriginUser)
+	if origin != TriggerOriginBuiltin {
+		return fmt.Errorf("trigger origin %q is not %q", origin, TriggerOriginBuiltin)
 	}
-	if stream != "" {
-		bare, _ := strings.CutPrefix(stream, TriggerUserStreamPrefix)
-		if !ValidSubjectToken(bare) {
-			return fmt.Errorf("trigger stream %q is not a dot-free DNS-1123 label or %s<label>", stream, TriggerUserStreamPrefix)
-		}
+	if stream != "" && (source != triggerScheduleSource || rest != stream) {
+		return fmt.Errorf("trigger stream %q is not the trigger's own schedule name (%s/<stream>)", stream, triggerScheduleSource)
 	}
 	return nil
 }

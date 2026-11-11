@@ -108,10 +108,11 @@ NATS_REQUIRED = frozenset({"type", "version", "task", "profile", "tier", "pod", 
 TARGET_CLAIMS = frozenset({"project", "location", "cluster"})
 TRIGGER_CLAIMS = frozenset({"name", "origin", "stream"})
 TRIGGER_REQUIRED = frozenset({"name", "origin"})
-# taskcred.TriggerOriginBuiltin and TriggerOriginUser.
-TRIGGER_ORIGINS = frozenset({"builtin", "user"})
-# The one path an origin-user schedule's stream may take: user/<name>.
-USER_STREAM_PREFIX = "user/"
+# taskcred.TriggerOriginBuiltin: the one origin a trigger may name today (#4685).
+TRIGGER_ORIGINS = frozenset({"builtin"})
+# The one source whose triggers may bind a report stream, and only their own:
+# lib.ValidateTrigger's schedule/<stream> rule.
+TRIGGER_SCHEDULE_SOURCE = "schedule"
 HEADER_KEYS = frozenset({"typ", "alg"})
 
 # int64, the width of jwt/v2's time claims. A JSON integer outside it fails
@@ -154,9 +155,8 @@ class TaskTrigger:
     """The unattended trigger the grant binds (taskcred.Trigger).
 
     ``name`` is ``schedule/<name>`` or a bare source, ``origin`` is
-    ``builtin`` or ``user``, and ``stream`` is the report stream the grant
-    binds, "" when it binds none. The shape is checked here; whether the
-    stream belongs to the trigger is the broker's rule at write.
+    ``builtin``, and ``stream`` is the report stream the grant binds, which can
+    only be the schedule's own name, "" when it binds none.
     """
 
     name: str
@@ -520,12 +520,12 @@ def _trigger(claim: Any) -> TaskTrigger:
         raise TaskCredentialError("task credential trigger name is not <source> or <source>/<name> of labels")
     origin = _string(claim, "origin", "nats.trigger")
     if origin not in TRIGGER_ORIGINS:
-        raise TaskCredentialError("task credential trigger origin is not builtin or user")
+        raise TaskCredentialError("task credential trigger origin is not builtin")
     stream = _string(claim, "stream", "nats.trigger") if "stream" in claim else ""
-    if stream:
-        bare = stream[len(USER_STREAM_PREFIX):] if stream.startswith(USER_STREAM_PREFIX) else stream
-        if not _is_label(bare):
-            raise TaskCredentialError("task credential trigger stream is not a label or user/<label>")
+    # A stream is only ever the trigger's own schedule name, compared whole: no
+    # prefix stripping, so nothing but schedule/<stream> can bind <stream>.
+    if stream and (source != TRIGGER_SCHEDULE_SOURCE or rest != stream):
+        raise TaskCredentialError("task credential trigger stream is not the trigger's own schedule name")
     return TaskTrigger(name=name, origin=origin, stream=stream)
 
 

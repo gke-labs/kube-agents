@@ -19,8 +19,7 @@ func TestATriggerRoundTripsOnAProxyCredential(t *testing.T) {
 	now := time.Now()
 	for _, trig := range []Trigger{
 		{Name: "schedule/compliance-audit", Origin: "builtin", Stream: "compliance-audit"},
-		{Name: "schedule/nightly-check", Origin: "user", Stream: "user/nightly-check"},
-		{Name: "schedule/nightly-check", Origin: "user"},
+		{Name: "schedule/compliance-audit", Origin: "builtin"},
 		{Name: "stall-watch", Origin: "builtin"},
 	} {
 		c := proxyClaims(now)
@@ -66,25 +65,27 @@ func TestMalformedTriggersAreRefused(t *testing.T) {
 	now := time.Now()
 	long := strings.Repeat("a", 64)
 	for name, trig := range map[string]map[string]any{
-		"no name":                {"origin": "builtin"},
-		"an empty name":          {"name": "", "origin": "builtin"},
-		"a dotted name":          {"name": "schedule/a.b", "origin": "builtin"},
-		"a wildcard name":        {"name": "schedule/*", "origin": "builtin"},
-		"three name segments":    {"name": "schedule/a/b", "origin": "builtin"},
-		"an empty name segment":  {"name": "schedule/", "origin": "builtin"},
-		"an upper-case name":     {"name": "Schedule/a", "origin": "builtin"},
-		"an over-long name part": {"name": "schedule/" + long, "origin": "builtin"},
-		"no origin":              {"name": "schedule/a"},
-		"an unknown origin":      {"name": "schedule/a", "origin": "admin"},
-		"an upper-case origin":   {"name": "schedule/a", "origin": "Builtin"},
-		"a dotted stream":        {"name": "schedule/a", "origin": "builtin", "stream": "a.b"},
-		"a deep stream":          {"name": "schedule/a", "origin": "user", "stream": "user/a/b"},
-		"a foreign stream path":  {"name": "schedule/a", "origin": "user", "stream": "team/a"},
-		"an empty user stream":   {"name": "schedule/a", "origin": "user", "stream": "user/"},
-		"an unknown trigger key": {"name": "schedule/a", "origin": "builtin", "scope": "fleet"},
-		"a non-string origin":    {"name": "schedule/a", "origin": 1},
-		"a null name":            {"name": nil, "origin": "builtin"},
-		"a case-folded key":      {"NAME": "schedule/a", "origin": "builtin"},
+		"no name":                   {"origin": "builtin"},
+		"an empty name":             {"name": "", "origin": "builtin"},
+		"a dotted name":             {"name": "schedule/a.b", "origin": "builtin"},
+		"a wildcard name":           {"name": "schedule/*", "origin": "builtin"},
+		"three name segments":       {"name": "schedule/a/b", "origin": "builtin"},
+		"an empty name segment":     {"name": "schedule/", "origin": "builtin"},
+		"an upper-case name":        {"name": "Schedule/a", "origin": "builtin"},
+		"an over-long name part":    {"name": "schedule/" + long, "origin": "builtin"},
+		"no origin":                 {"name": "schedule/a"},
+		"an unknown origin":         {"name": "schedule/a", "origin": "admin"},
+		"a user origin":             {"name": "schedule/a", "origin": "user"},
+		"another schedule's stream": {"name": "schedule/a", "origin": "builtin", "stream": "b"},
+		"a stream on a bare source": {"name": "stall-watch", "origin": "builtin", "stream": "stall-watch"},
+		"an upper-case origin":      {"name": "schedule/a", "origin": "Builtin"},
+		"a dotted stream":           {"name": "schedule/a", "origin": "builtin", "stream": "a.b"},
+		"a stream with a path":      {"name": "schedule/a", "origin": "builtin", "stream": "user/a"},
+		"a doubled user prefix":     {"name": "schedule/x", "origin": "builtin", "stream": "user/user/x"},
+		"an unknown trigger key":    {"name": "schedule/a", "origin": "builtin", "scope": "fleet"},
+		"a non-string origin":       {"name": "schedule/a", "origin": 1},
+		"a null name":               {"name": nil, "origin": "builtin"},
+		"a case-folded key":         {"NAME": "schedule/a", "origin": "builtin"},
 	} {
 		tok := handMint(t, kp, now, func(gc *jwt.GenericClaims) {
 			gc.Audience = string(AudienceCredentialProxy)

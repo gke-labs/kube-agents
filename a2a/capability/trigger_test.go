@@ -126,6 +126,18 @@ func TestTriggerFromAuthority(t *testing.T) {
 		"an unknown key":       `{"trigger":{"name":"schedule/a","origin":"builtin","scope":"fleet"}}`,
 		"an unknown origin":    `{"trigger":{"name":"schedule/a","origin":"root"}}`,
 		"the block isn't JSON": `{`,
+		// What encoding/json would quietly accept: another reader of the block
+		// could then see a different trigger from the one the dispatcher checked.
+		"a case-variant outer key":   `{"Trigger":{"name":"schedule/a","origin":"builtin"}}`,
+		"a case-folded outer key":    `{"trigger":{"name":"schedule/a","origin":"builtin"},"TRIGGER":null}`,
+		"a duplicate outer key":      `{"trigger":{"name":"schedule/a","origin":"builtin"},"trigger":null}`,
+		"a case-variant inner key":   `{"trigger":{"NAME":"schedule/a","origin":"builtin"}}`,
+		"a long-s inner key":         "{\"trigger\":{\"name\":\"schedule/a\",\"origin\":\"builtin\",\"\u017ftream\":\"a\"}}",
+		"a duplicate inner key":      `{"trigger":{"name":"schedule/a","name":"schedule/b","origin":"builtin"}}`,
+		"a null inner value":         `{"trigger":{"name":"schedule/a","origin":"builtin","stream":null}}`,
+		"a user origin":              `{"trigger":{"name":"schedule/a","origin":"user"}}`,
+		"another schedule's stream":  `{"trigger":{"name":"schedule/a","origin":"builtin","stream":"b"}}`,
+		"trailing data in the block": `{"trigger":{"name":"schedule/a","origin":"builtin"}} {}`,
 	} {
 		if _, err := TriggerFromAuthority(json.RawMessage(raw)); err == nil {
 			t.Errorf("%s: accepted", name)

@@ -170,11 +170,16 @@ func buildProxyFixtures(t *testing.T) proxyFixtureFile {
 	builtinClaims.Trigger = &builtin
 	add(proxyFixture{Name: "a builtin schedule trigger", Token: withTrigger(`{"name":"schedule/compliance-audit","origin":"builtin","stream":"compliance-audit"}`),
 		Now: fixtureNow, GoOK: true, ProxyOK: true, Claims: &builtinClaims})
-	user := Trigger{Name: "schedule/nightly", Origin: TriggerOriginUser}
-	userClaims := *wantClaims
-	userClaims.Trigger = &user
-	add(proxyFixture{Name: "a user schedule trigger with no stream", Token: withTrigger(`{"name":"schedule/nightly","origin":"user"}`),
-		Now: fixtureNow, GoOK: true, ProxyOK: true, Claims: &userClaims})
+	collector := Trigger{Name: "stall-watch", Origin: TriggerOriginBuiltin}
+	collectorClaims := *wantClaims
+	collectorClaims.Trigger = &collector
+	add(proxyFixture{Name: "a collector trigger with no stream", Token: withTrigger(`{"name":"stall-watch","origin":"builtin"}`),
+		Now: fixtureNow, GoOK: true, ProxyOK: true, Claims: &collectorClaims})
+	noStream := Trigger{Name: "schedule/compliance-audit", Origin: TriggerOriginBuiltin}
+	noStreamClaims := *wantClaims
+	noStreamClaims.Trigger = &noStream
+	add(proxyFixture{Name: "a schedule trigger with an explicit empty stream", Token: withTrigger(`{"name":"schedule/compliance-audit","origin":"builtin","stream":""}`),
+		Now: fixtureNow, GoOK: true, ProxyOK: true, Claims: &noStreamClaims})
 	mintedTrigger, err := Mint(kp, Claims{
 		Task: "task-1", Profile: "auditor", Tier: "read", Pod: "auditor-read-x7k2p",
 		PodUID: "0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0", Audience: AudienceCredentialProxy,
@@ -195,7 +200,8 @@ func buildProxyFixtures(t *testing.T) proxyFixtureFile {
 	add(proxyFixture{Name: "a null name", Token: edited(`"sub":"fixturenonce"`, `"sub":"fixturenonce","name":null`), Now: fixtureNow, GoOK: true})
 	add(proxyFixture{Name: "a header key beyond typ and alg", Token: signWithHeader(t, kp, `{"typ":"JWT","alg":"ed25519-nkey","kid":"x"}`, base),
 		Now: fixtureNow, GoOK: true})
-	add(proxyFixture{Name: "a null trigger stream", Token: withTrigger(`{"name":"schedule/nightly","origin":"user","stream":null}`), Now: fixtureNow, GoOK: true})
+	add(proxyFixture{Name: "a null trigger stream", Token: withTrigger(`{"name":"schedule/nightly","origin":"builtin","stream":null}`), Now: fixtureNow, GoOK: true})
+	add(proxyFixture{Name: "a null trigger", Token: withTrigger(`null`), Now: fixtureNow, GoOK: true})
 	add(proxyFixture{Name: "a non-canonical base64url signature", Token: nonCanonicalSignature(t, sign(base)), Now: fixtureNow, GoOK: true})
 
 	// Signature and issuer.
@@ -273,7 +279,15 @@ func buildProxyFixtures(t *testing.T) proxyFixtureFile {
 	add(refused("a trigger name with three segments", withTrigger(`{"name":"schedule/a/b","origin":"builtin"}`)))
 	add(refused("a trigger with an unknown origin", withTrigger(`{"name":"schedule/a","origin":"admin"}`)))
 	add(refused("a trigger with no origin", withTrigger(`{"name":"schedule/a"}`)))
-	add(refused("a trigger stream under another path", withTrigger(`{"name":"schedule/a","origin":"user","stream":"team/a"}`)))
+	add(refused("a trigger stream under another path", withTrigger(`{"name":"schedule/a","origin":"builtin","stream":"team/a"}`)))
+	add(refused("a trigger with a user origin", withTrigger(`{"name":"schedule/a","origin":"user"}`)))
+	add(refused("a trigger naming another schedule's stream", withTrigger(`{"name":"schedule/compliance-audit","origin":"builtin","stream":"ai-security-audit"}`)))
+	add(refused("a trigger stream on a bare source", withTrigger(`{"name":"stall-watch","origin":"builtin","stream":"stall-watch"}`)))
+	add(refused("a trigger stream with a doubled user prefix", withTrigger(`{"name":"schedule/x","origin":"builtin","stream":"user/user/x"}`)))
+	add(refused("a trigger name with an empty schedule", withTrigger(`{"name":"schedule/","origin":"builtin"}`)))
+	add(refused("a trigger name past 63 bytes", withTrigger(`{"name":"schedule/`+strings.Repeat("a", 64)+`","origin":"builtin"}`)))
+	add(refused("an uppercase trigger name", withTrigger(`{"name":"Schedule/a","origin":"builtin"}`)))
+	add(refused("a non-ASCII trigger name", withTrigger(`{"name":"schedule/caf\u00e9","origin":"builtin"}`)))
 	add(refused("a trigger origin as a number", withTrigger(`{"name":"schedule/a","origin":1}`)))
 	add(refused("an empty target field", edited(`"cluster":"cluster-a"`, `"cluster":""`)))
 

@@ -229,8 +229,12 @@ task a human turn started.
 
 `authority.trigger` (added 11/11, #4685) is the unattended trigger that submitted the task:
 `{"name": "schedule/compliance-audit", "origin": "builtin", "stream": "compliance-audit"}`.
-`name` is `schedule/<name>` or a bare trigger source, `origin` is `builtin` or `user`, and
-`stream` is the report stream the grant binds, absent when it binds none. The gateway writes it
+`name` is `schedule/<name>` or a bare trigger source, `origin` is `builtin` (the only origin
+today, since a user's schedule runs at its creator's tier and carries no trigger), and `stream` is
+the report stream the grant binds, absent when it binds none. A stream is only ever the
+schedule's own name: `schedule/<stream>`, nothing else. The block is read strictly: a key twice,
+a key that matches `trigger` or one of its fields only under case folding, or a null inside the
+trigger is refused. The gateway writes it
 on a trigger's submission and nowhere else; it is absent on every other task. It is a claim,
 not authority: the dispatcher passes it to the verifier with `profile.run`
 (`capability.TriggerFromAuthority`), and the verifier permits only when it equals the trigger

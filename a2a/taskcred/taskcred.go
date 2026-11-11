@@ -156,8 +156,8 @@ type Target struct {
 
 // Trigger is the unattended trigger that started a task, as the grant the
 // verifier checked binds it (#4685): Name is "schedule/<name>" or a bare
-// source ("stall-watch"), Origin is "builtin" or "user", and Stream is the
-// report stream the grant binds, empty when it binds none. The broker reads it
+// source ("stall-watch"), Origin is "builtin", and Stream is the report stream
+// the grant binds (only ever the schedule's own name), empty when it binds none. The broker reads it
 // to decide which audit stream a task may write. Only AudienceCredentialProxy
 // carries one.
 type Trigger struct {
@@ -166,11 +166,8 @@ type Trigger struct {
 	Stream string `json:"stream,omitempty"`
 }
 
-// The trigger origins a credential may name, lib's.
-const (
-	TriggerOriginBuiltin = lib.TriggerOriginBuiltin
-	TriggerOriginUser    = lib.TriggerOriginUser
-)
+// TriggerOriginBuiltin is the one trigger origin a credential may name, lib's.
+const TriggerOriginBuiltin = lib.TriggerOriginBuiltin
 
 // Claims is a task credential's content.
 type Claims struct {
