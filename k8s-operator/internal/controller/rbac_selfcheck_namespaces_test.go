@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -49,13 +50,14 @@ func probeLabels(ctx context.Context, reviews authorizationv1client.SelfSubjectA
 	return labelsOf(denied), nil
 }
 
-// secretsOnlyIn is an authorizer that grants the Secret write verbs in the
-// named namespaces and nowhere else, which is what a RoleBinding to the
-// operator's namespaced Role looks like from a SelfSubjectAccessReview. The
-// Secret reads are the ClusterRole's and are granted everywhere.
+// secretsOnlyIn is an authorizer that grants the namespaced write verbs
+// (Secrets and every other rendered kind) in the named namespaces and nowhere
+// else, which is what a RoleBinding to the operator's namespaced Role looks
+// like from a SelfSubjectAccessReview. The reads are the ClusterRole's and are
+// granted everywhere.
 func secretsOnlyIn(namespaces ...string) *fakeAuthorizer {
 	return &fakeAuthorizer{deny: func(attrs *authorizationv1.ResourceAttributes) bool {
-		if !isSecretWrite(attrs) {
+		if !isNamespacedWrite(attrs) {
 			return false
 		}
 		for _, ns := range namespaces {
@@ -70,8 +72,8 @@ func secretsOnlyIn(namespaces ...string) *fakeAuthorizer {
 // The namespaced Role is bound in the install namespace and nowhere else, so
 // a PlatformAgent in another namespace is the one install shape the
 // operator-namespace probe cannot see. Once the checker has heard of that
-// namespace it probes the Secret write verbs there too, labels the denial with the
-// namespace, and reports it to that agent only.
+// namespace it probes the namespaced write verbs there too, labels the denial
+// with the namespace, and reports it to that agent only.
 func TestTheProbeCoversEveryAgentNamespaceItHasHeardOf(t *testing.T) {
 	const operatorNamespace = "kubeagents-system"
 	authorizer := secretsOnlyIn(operatorNamespace)
@@ -92,9 +94,45 @@ func TestTheProbeCoversEveryAgentNamespaceItHasHeardOf(t *testing.T) {
 		t.Fatal("an agent namespace with no RoleBinding must be a denial once observed")
 	}
 	for _, d := range denied {
-		if d.namespace != "team-a" || !strings.Contains(d.label, "secrets") || !strings.HasSuffix(d.label, "(in namespace team-a)") {
-			t.Errorf("denied %+v; want only Secret write verbs, labelled for and attributed to team-a", d)
+		if d.namespace != "team-a" || !strings.HasSuffix(d.label, "(in namespace team-a)") {
+			t.Errorf("denied %+v; want only namespaced write verbs, labelled for and attributed to team-a", d)
 		}
+	}
+	if !slices.ContainsFunc(denied, func(d deniedPermission) bool { return strings.HasPrefix(d.label, "create secrets ") }) ||
+		!slices.ContainsFunc(denied, func(d deniedPermission) bool { return strings.HasPrefix(d.label, "create deployments.apps ") }) {
+		t.Errorf("the team-a denials must cover the Secret writes and the other rendered kinds; got %v", labelsOf(denied))
+	}
+}
+
+// The profile namespace is the second namespace the chart binds the Role in.
+// reconcileProfileFence observes it once it exists; from then on its denials
+// are the agent's own (DeniedFor takes both namespaces), labelled with the
+// profile namespace, and handleDeletion forgets it with the agent's.
+func TestDeniedForCoversTheProfileNamespace(t *testing.T) {
+	const operatorNamespace = "kubeagents-system"
+	const profileNamespace = operatorNamespace + profileNamespaceSuffix
+	checker := NewRBACChecker(secretsOnlyIn(operatorNamespace).reviews(), operatorNamespace)
+	checker.Observe(profileNamespace)
+	if got := checker.DeniedFor(operatorNamespace); len(got) != 0 {
+		t.Errorf("the agent's own namespace alone must not carry the profile namespace's denials; got %v", got)
+	}
+	got := checker.DeniedFor(operatorNamespace, profileNamespace)
+	if len(got) == 0 {
+		t.Fatal("an unbound profile namespace must be a denial once observed")
+	}
+	for _, label := range got {
+		if !strings.HasSuffix(label, "(in namespace "+profileNamespace+")") {
+			t.Errorf("denied %q; want it labelled for the profile namespace", label)
+		}
+	}
+	if !slices.ContainsFunc(got, func(label string) bool {
+		return strings.HasPrefix(label, "create dispatchjobtemplates.kubeagents.x-k8s.io ")
+	}) {
+		t.Errorf("the profile namespace's denials must include the dispatcher's params kind; got %v", got)
+	}
+	checker.Forget(profileNamespace)
+	if got := checker.DeniedFor(operatorNamespace, profileNamespace); len(got) != 0 {
+		t.Errorf("Forget must drop the profile namespace's denials; got %v", got)
 	}
 }
 
@@ -233,7 +271,7 @@ func TestAProbeInFlightAcrossForgetDoesNotRestoreTheNamespace(t *testing.T) {
 			once.Do(func() { close(started) })
 			<-gate
 		}
-		return isSecretWrite(attrs) && attrs.Namespace != operatorNamespace
+		return isNamespacedWrite(attrs) && attrs.Namespace != operatorNamespace
 	}}
 	checker := NewRBACChecker(authorizer.reviews(), operatorNamespace)
 	checker.Observe("team-a")

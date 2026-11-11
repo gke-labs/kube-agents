@@ -213,9 +213,10 @@ SOURCES: dict[str, Source] = {
         # that bind is bounded rather than about its absence. Deleting the
         # scoping is the mutation this anchor exists to make loud.
         #
-        # "kind: Role" is the second document: the operator's Secret write
-        # verbs, rendered as a namespaced Role by the one marker that carries
-        # `namespace=`. C5 asserts the ClusterRole grants no Secret write verb,
+        # "kind: Role" is the second document: the operator's write verbs on
+        # every namespaced kind it renders, rendered as a namespaced Role by
+        # the markers that carry `namespace=`. C5 asserts the ClusterRole
+        # grants no write verb on any of them,
         # and that assertion is vacuous the day the Role document disappears
         # with the grant moved back.
         "k8s-operator/config/rbac/role.yaml",
@@ -237,7 +238,7 @@ SOURCES: dict[str, Source] = {
         # block -- the one `make chart-sync` does not manage and a
         # block-scoped parse never reached.
         # The namespaced block is the chart's copy of role.yaml's Role
-        # document (the Secret write verbs); C5 reads it.
+        # document (the write verbs on every rendered kind); C5 reads it.
         ("END GENERATED RULES", "operator-leader-election-role", "END GENERATED NAMESPACED RULES"),
     ),
     "admission_policy": Source(

@@ -361,6 +361,11 @@ func (r *PlatformAgentReconciler) reconcileProfileFence(ctx context.Context, age
 		}
 		return false, err
 	}
+	// The namespace exists, so the operator's writes there are about to
+	// start: the RBAC self-check probes the namespaced Role's verbs in it
+	// from now on (once inline, then on the ticker), and reportRBACSkew
+	// reads the denials as this agent's. handleDeletion forgets it.
+	r.RBAC.Observe(profileNamespaceName(agent))
 	if err := r.applyManaged(ctx, agent, buildProfileNetworkPolicy(agent, dnsClusterIPs)); err != nil {
 		return false, fmt.Errorf("failed to apply the profile NetworkPolicy: %w", err)
 	}

@@ -23,49 +23,23 @@ rules:
       - ""
     resources:
       - configmaps
-      - persistentvolumeclaims
-      - pods
-      - resourcequotas
-      - serviceaccounts
-      - services
-    verbs:
-      - create
-      - delete
-      - get
-      - list
-      - patch
-      - update
-      - watch
-  - apiGroups:
-      - ""
-    resources:
       - endpoints
+      - events
       - limitranges
       - namespaces
       - nodes
+      - persistentvolumeclaims
       - persistentvolumes
+      - pods
       - pods/log
+      - resourcequotas
       - secrets
+      - serviceaccounts
+      - services
     verbs:
       - get
       - list
       - watch
-  - apiGroups:
-      - ""
-    resources:
-      - events
-    verbs:
-      - create
-      - get
-      - list
-      - patch
-      - watch
-  - apiGroups:
-      - ""
-    resources:
-      - podtemplates
-    verbs:
-      - create
   - apiGroups:
       - admissionregistration.k8s.io
     resourceNames:
@@ -87,23 +61,12 @@ rules:
       - apps
     resources:
       - daemonsets
-      - replicasets
-    verbs:
-      - get
-      - list
-      - watch
-  - apiGroups:
-      - apps
-    resources:
       - deployments
+      - replicasets
       - statefulsets
     verbs:
-      - create
-      - delete
       - get
       - list
-      - patch
-      - update
       - watch
   - apiGroups:
       - argoproj.io
@@ -131,21 +94,10 @@ rules:
       - batch
     resources:
       - cronjobs
-    verbs:
-      - get
-      - list
-      - watch
-  - apiGroups:
-      - batch
-    resources:
       - jobs
     verbs:
-      - create
-      - delete
       - get
       - list
-      - patch
-      - update
       - watch
   - apiGroups:
       - configsync.gke.io
@@ -161,12 +113,8 @@ rules:
     resources:
       - leases
     verbs:
-      - create
-      - delete
       - get
       - list
-      - patch
-      - update
       - watch
   - apiGroups:
       - kubeagents.x-k8s.io
@@ -208,17 +156,6 @@ rules:
   - apiGroups:
       - kubeagents.x-k8s.io
     resources:
-      - dispatchjobtemplates
-    verbs:
-      - create
-      - delete
-      - get
-      - list
-      - patch
-      - update
-  - apiGroups:
-      - kubeagents.x-k8s.io
-    resources:
       - platformagents
     verbs:
       - create
@@ -250,32 +187,17 @@ rules:
     resources:
       - fqdnnetworkpolicies
     verbs:
-      - create
-      - delete
       - get
       - list
-      - patch
-      - update
       - watch
   - apiGroups:
       - networking.k8s.io
     resources:
       - ingresses
-    verbs:
-      - get
-      - list
-      - watch
-  - apiGroups:
-      - networking.k8s.io
-    resources:
       - networkpolicies
     verbs:
-      - create
-      - delete
       - get
       - list
-      - patch
-      - update
       - watch
   - apiGroups:
       - node.k8s.io
@@ -290,20 +212,14 @@ rules:
     resources:
       - poddisruptionbudgets
     verbs:
-      - create
-      - delete
       - get
       - list
-      - patch
-      - update
       - watch
   - apiGroups:
       - rbac.authorization.k8s.io
     resources:
       - clusterrolebindings
       - clusterroles
-      - rolebindings
-      - roles
     verbs:
       - create
       - delete
@@ -320,6 +236,15 @@ rules:
       - clusterroles
     verbs:
       - bind
+  - apiGroups:
+      - rbac.authorization.k8s.io
+    resources:
+      - rolebindings
+      - roles
+    verbs:
+      - get
+      - list
+      - watch
   - apiGroups:
       - source.toolkit.fluxcd.io
     resources:
@@ -352,26 +277,130 @@ subjects:
   - kind: ServiceAccount
     name: {{ .Release.Name }}-operator-sa
     namespace: {{ .Release.Namespace }}
----
 # The namespaced half of the operator's generated RBAC: the Role document in
-# k8s-operator/config/rbac/role.yaml, which carries the Secret write verbs. The
-# operator writes Secrets only in the namespace of the PlatformAgent it
-# reconciles, which this chart places in the release namespace, so the grant
-# is bound here and the ClusterRole above holds the Secret reads alone.
+# k8s-operator/config/rbac/role.yaml, which carries the write verbs on every
+# namespaced kind the operator renders (Secrets, Deployments, ConfigMaps,
+# Roles, ...). The operator writes them in the namespace of the PlatformAgent
+# it reconciles, which this chart places in the release namespace, and in that
+# namespace's profile namespace under mode next (profiles-namespace.yaml
+# creates it), so the Role and its RoleBinding render once per namespace from
+# the one rules block `make chart-sync` splices. The ClusterRole above holds
+# the reads alone. docs/designs/operator-namespaced-write-verbs.md.
+{{- $operatorRoleNamespaces := list .Release.Namespace }}
+{{- if and .Values.platformAgent.enabled (eq (toString .Values.platformAgent.mode) "next") }}
+{{- $operatorRoleNamespaces = append $operatorRoleNamespaces (printf "%s-profiles" .Release.Namespace) }}
+{{- end }}
+{{- range $operatorRoleNamespace := $operatorRoleNamespaces }}
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: {{ .Release.Name }}-operator-namespaced-role
-  namespace: {{ .Release.Namespace }}
+  name: {{ $.Release.Name }}-operator-namespaced-role
+  namespace: {{ $operatorRoleNamespace }}
   labels:
-    app.kubernetes.io/name: {{ .Chart.Name }}-operator
-    {{- include "kube-agents.labels" . | nindent 4 }}
+    app.kubernetes.io/name: {{ $.Chart.Name }}-operator
+    {{- include "kube-agents.labels" $ | nindent 4 }}
 rules:
   # BEGIN GENERATED NAMESPACED RULES from k8s-operator/config/rbac/role.yaml — do not edit by hand; run `make chart-sync`.
   - apiGroups:
       - ""
     resources:
+      - configmaps
+      - persistentvolumeclaims
+      - pods
+      - resourcequotas
       - secrets
+      - serviceaccounts
+      - services
+    verbs:
+      - create
+      - delete
+      - patch
+      - update
+  - apiGroups:
+      - ""
+    resources:
+      - events
+    verbs:
+      - create
+      - patch
+  - apiGroups:
+      - ""
+    resources:
+      - podtemplates
+    verbs:
+      - create
+  - apiGroups:
+      - apps
+    resources:
+      - deployments
+      - statefulsets
+    verbs:
+      - create
+      - delete
+      - patch
+      - update
+  - apiGroups:
+      - batch
+    resources:
+      - jobs
+    verbs:
+      - create
+      - delete
+      - patch
+      - update
+  - apiGroups:
+      - coordination.k8s.io
+    resources:
+      - leases
+    verbs:
+      - create
+      - delete
+      - patch
+      - update
+  - apiGroups:
+      - kubeagents.x-k8s.io
+    resources:
+      - dispatchjobtemplates
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+  - apiGroups:
+      - networking.gke.io
+    resources:
+      - fqdnnetworkpolicies
+    verbs:
+      - create
+      - delete
+      - patch
+      - update
+  - apiGroups:
+      - networking.k8s.io
+    resources:
+      - networkpolicies
+    verbs:
+      - create
+      - delete
+      - patch
+      - update
+  - apiGroups:
+      - policy
+    resources:
+      - poddisruptionbudgets
+    verbs:
+      - create
+      - delete
+      - patch
+      - update
+  - apiGroups:
+      - rbac.authorization.k8s.io
+    resources:
+      - rolebindings
+      - roles
     verbs:
       - create
       - delete
@@ -382,26 +411,26 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: {{ .Release.Name }}-operator-namespaced-rolebinding
-  namespace: {{ .Release.Namespace }}
+  name: {{ $.Release.Name }}-operator-namespaced-rolebinding
+  namespace: {{ $operatorRoleNamespace }}
   labels:
-    app.kubernetes.io/name: {{ .Chart.Name }}-operator
-    {{- include "kube-agents.labels" . | nindent 4 }}
+    app.kubernetes.io/name: {{ $.Chart.Name }}-operator
+    {{- include "kube-agents.labels" $ | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: {{ .Release.Name }}-operator-namespaced-role
+  name: {{ $.Release.Name }}-operator-namespaced-role
 subjects:
   - kind: ServiceAccount
-    name: {{ .Release.Name }}-operator-sa
-    namespace: {{ .Release.Namespace }}
+    name: {{ $.Release.Name }}-operator-sa
+    namespace: {{ $.Release.Namespace }}
+{{- end }}
 ---
 # Namespaced counterpart of config/rbac/leader_election_role.yaml: the lease
-# verbs are already in the ClusterRole above, and so is create/patch on
-# events (the ClusterRole grants it for the PlatformAgent Events the
-# controller records, which also covers the leader-election recorder).
-# Kept namespaced to match the kustomize install's scope, where the
-# leader-election Role is its own object.
+# write verbs and create/patch on events are in the operator's namespaced
+# Role above, bound in the release namespace, which is where the controller
+# runs its election and where its recorder writes. Kept as its own object to
+# match the kustomize install's scope, where the leader-election Role is one.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:

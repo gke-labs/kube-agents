@@ -1,0 +1,21 @@
+# Binds the operator's namespaced Role (the Role document of config/rbac/role.yaml,
+# rendered here into the profile namespace) to the controller's ServiceAccount,
+# which lives in the install namespace. The subject is written out in full: the
+# ServiceAccount is not part of this kustomization, so neither the name prefix
+# nor the namespace transformer reaches it, and the install namespace is the
+# literal config/default resolves `system` to.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/name: kube-agents-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: manager-namespaced-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: manager-role
+subjects:
+  - kind: ServiceAccount
+    name: kubeagents-controller
+    namespace: kubeagents-system

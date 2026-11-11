@@ -64,7 +64,8 @@ misconfigurations:
   # read verbs stay on the ClusterRole, and KSV-0041 flags a ClusterRole that
   # names secrets with any of them. The write verbs are the namespaced Role
   # document in role.yaml (the marker carries `namespace=`), bound in the
-  # install namespace; a Role is KSV-0113 (MEDIUM), under the scan's threshold.
+  # install namespace and the profile namespace (config/profiles/role.yaml is
+  # its copy); a Role is KSV-0113 (MEDIUM), under the scan's threshold.
   #
   #   - `get`: checkShellSandboxKeys asks whether the sandbox's authorized-keys
   #     Secret exists, so the CR can report a missing one instead of leaving the

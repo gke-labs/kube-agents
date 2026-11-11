@@ -356,13 +356,15 @@ When modifying or deprecating RBAC roles or rolebindings in the operator:
 3. **Sync controller RBAC annotations:** make sure the `// +kubebuilder:rbac` markers on the
    reconciler include every permission the operator itself needs to grant or clean up, then run
    `make manifests` to regenerate `config/rbac/role.yaml`. A marker that carries `namespace=`
-   renders as the Role document in that file (bound by `namespaced_role_binding.yaml`) rather
-   than into the ClusterRole; the Secret write verbs are the one such marker, and
-   `tests/test_operator_secrets_grant.py` refuses them anywhere else. Add the verbs to
-   `requiredPermissions` in `rbac_selfcheck.go` too, with `Namespaced: true` for a namespaced
-   marker, then `make chart-sync` to copy both documents into the chart. Which other write verbs
-   can leave the ClusterRole for a namespaced grant, and in what object, is
-   [`docs/designs/operator-namespaced-write-verbs.md`](../docs/designs/operator-namespaced-write-verbs.md).
+   renders as the Role document in that file (bound by `namespaced_role_binding.yaml` in the
+   install namespace and by `config/profiles` in the profile namespace) rather than into the
+   ClusterRole. Every write verb on a namespaced kind the operator renders is such a marker; the
+   reads stay cluster-scoped for the informers and for escalation prevention, and
+   `tests/test_operator_secrets_grant.py` refuses a write verb on those kinds anywhere else
+   ([`docs/designs/operator-namespaced-write-verbs.md`](../docs/designs/operator-namespaced-write-verbs.md)
+   is the inventory). Add the verbs to `requiredPermissions` in `rbac_selfcheck.go` too, with
+   `Namespaced: true` for a namespaced marker, then `make chart-sync` to copy both documents
+   into the chart and the Role document into `config/profiles/role.yaml`.
 
 ---
 

@@ -233,15 +233,35 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         # The operator's Secret write verbs are a namespaced Role, the second
         # document in role.yaml; the ClusterRole holds the reads only. This
-        # puts `secrets` on the ClusterRole's core-group write rule as well,
-        # which is the pre-#4906 shape: write of every Secret on the cluster.
+        # adds `create` to the ClusterRole's core read rule, the one that
+        # names secrets, configmaps, pods and serviceaccounts together, which
+        # is the pre-#4906 shape for every kind in it: write of every Secret
+        # on the cluster. The anchor is that rule's last resource and its
+        # first verb, a pair no other rule in either document has (the Role
+        # document's core rule ends in `services` too, but its first verb is
+        # `create`), so the first-occurrence replace lands on the ClusterRole.
         "C5-operator-secrets-cluster-wide",
         "k8s-operator/config/rbac/role.yaml",
+        ("      - services\n    verbs:\n      - get\n",
+         "      - services\n    verbs:\n      - create\n      - get\n"),
+        "test_C5_the_operators_write_verbs_are_namespaced",
+        "add create to the operator ClusterRole's core read rule, the rule that already names "
+        "secrets and pods, so one marker edit makes the operator cluster-admin in effect",
+    ),
+    Mutation(
+        # The positive half of the same test: the Role document must name
+        # every namespaced kind the operator renders, so dropping one is a
+        # write the operator can no longer do and the equality assertion is
+        # what says so. `configmaps` is followed by `persistentvolumeclaims`
+        # only in the Role document (the ClusterRole's read rule has
+        # `endpoints` between them), so the anchor is unique.
+        "C5-operator-role-drops-configmaps",
+        "k8s-operator/config/rbac/role.yaml",
         ("      - configmaps\n      - persistentvolumeclaims\n",
-         "      - configmaps\n      - persistentvolumeclaims\n      - secrets\n"),
-        "test_C5_the_operators_secret_grant_is_namespaced",
-        "add secrets to the operator ClusterRole's core write rule, beside the "
-        "configmaps it manages, so one marker edit makes the operator cluster-admin in effect",
+         "      - persistentvolumeclaims\n"),
+        "test_C5_the_operators_write_verbs_are_namespaced",
+        "drop configmaps from the operator's namespaced Role, the shape of a marker split that "
+        "forgot a kind, which the self-check would report only once an install ran it",
     ),
     Mutation(
         "A1-refusal-emptied",

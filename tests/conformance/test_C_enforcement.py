@@ -2827,27 +2827,66 @@ class C5PrivilegedControllersAreBounded(unittest.TestCase):
     OPERATOR_SECRET_READ_VERBS = frozenset({"get", "list", "watch"})
     OPERATOR_SECRET_WRITE_VERBS = frozenset({"create", "update", "patch", "delete"})
 
-    def test_C5_the_operators_secret_grant_is_namespaced(self) -> None:
-        """The operator writes Secrets in its install namespace and nowhere else.
+    # Every namespaced kind the operator renders, as (apiGroup, resource): the
+    # Secret split applied to all of them. The ClusterRole holds the reads of
+    # each (the informers, escalation prevention) and no write verb; the Role
+    # document names exactly this set. dispatchjobtemplates is read uncached
+    # in the profile namespace by the operator alone, so its reads are in the
+    # Role document too. docs/designs/operator-namespaced-write-verbs.md.
+    OPERATOR_NAMESPACED_WRITE_KINDS = frozenset({
+        ("", "configmaps"),
+        ("", "events"),
+        ("", "persistentvolumeclaims"),
+        ("", "pods"),
+        ("", "podtemplates"),
+        ("", "resourcequotas"),
+        ("", "secrets"),
+        ("", "serviceaccounts"),
+        ("", "services"),
+        ("apps", "deployments"),
+        ("apps", "statefulsets"),
+        ("batch", "jobs"),
+        ("coordination.k8s.io", "leases"),
+        ("kubeagents.x-k8s.io", "dispatchjobtemplates"),
+        ("networking.gke.io", "fqdnnetworkpolicies"),
+        ("networking.k8s.io", "networkpolicies"),
+        ("policy", "poddisruptionbudgets"),
+        ("rbac.authorization.k8s.io", "rolebindings"),
+        ("rbac.authorization.k8s.io", "roles"),
+    })
+    OPERATOR_NAMESPACED_READ_KINDS = frozenset({("kubeagents.x-k8s.io", "dispatchjobtemplates")})
+
+    def test_C5_the_operators_write_verbs_are_namespaced(self) -> None:
+        """The operator writes in its install namespace and its profile namespace, and nowhere else.
 
         The operator is the most privileged identity an install puts on a
-        cluster, and the Secret write verbs on its ClusterRole were one of the
-        rules that made it cluster-admin in effect: `create`, `update`, `patch`
-        and `delete` on every Secret in every namespace is every ServiceAccount
-        token and every credential on the cluster. Every Secret the operator
-        writes is in the namespace of the PlatformAgent it reconciles, so the
-        write verbs are a Role there. The reads stay cluster-wide, because the
-        agent's `minimal` ClusterRole grants them and the API server refuses a
-        grant the grantor does not hold; the operator itself reads by name.
+        cluster, and the write verbs on its ClusterRole were what made it
+        cluster-admin in effect: `create`, `update`, `patch` and `delete` on
+        every Secret in every namespace is every ServiceAccount token and every
+        credential on the cluster, and `create` on every Pod or ServiceAccount
+        is the same by another route. Every object the operator writes is in
+        the namespace of the PlatformAgent it reconciles or that namespace's
+        profile namespace, so the write verbs are a Role, bound in each. The
+        reads stay cluster-wide, because the informers watch every rendered
+        kind for drift and the agent's `minimal` ClusterRole grants reads the
+        API server will not let the operator grant without holding them.
 
         Asserted on both delivery paths, as the refusal rather than the
         presence of the control: no ClusterRole in `role.yaml` or in the
-        chart's RBAC template grants a Secret verb beyond the three reads, or
-        a wildcard that reaches it, and the one Role that names `secrets`
-        carries exactly the four write verbs. The positive half keeps the test
-        from passing on an operator that lost the grant altogether, which
-        would be a different bug.
+        chart's RBAC template grants a verb beyond the three reads on any kind
+        in OPERATOR_NAMESPACED_WRITE_KINDS, or a wildcard that reaches one; and
+        the one Role that names `secrets` names exactly that set of kinds,
+        with write verbs only (dispatchjobtemplates keeps its reads). Equality
+        rather than a subset, so a kind dropped from the Role is red here and
+        not first at runtime; the Secret rule's verbs are pinned as before.
         """
+
+        def rule_kinds(rule: dict) -> set[tuple[str, str]]:
+            return {
+                (group, resource)
+                for group in (rule.get("apiGroups") or [])
+                for resource in (rule.get("resources") or [])
+            }
 
         def secret_rules(role: dict) -> list[dict]:
             return [
@@ -2865,12 +2904,16 @@ class C5PrivilegedControllersAreBounded(unittest.TestCase):
                 cluster_roles = h.objects_of_kind(documents, "ClusterRole")
                 self.assertTrue(cluster_roles, f"{source} renders no ClusterRole")
                 for role in cluster_roles:
-                    for rule in secret_rules(role):
+                    for rule in role.get("rules") or []:
                         self.assertNotIn("*", rule.get("resources") or [])
+                        self.assertNotIn("*", rule.get("apiGroups") or [])
+                        reached = rule_kinds(rule) & self.OPERATOR_NAMESPACED_WRITE_KINDS
+                        if not reached:
+                            continue
                         self.assertTrue(
-                            set(rule.get("verbs") or []) <= self.OPERATOR_SECRET_READ_VERBS,
+                            set(rule.get("verbs") or []) <= self.READ_VERBS,
                             f"{source}: ClusterRole {role['metadata']['name']} grants "
-                            f"{sorted(set(rule.get('verbs') or []) - self.OPERATOR_SECRET_READ_VERBS)} on secrets "
+                            f"{sorted(set(rule.get('verbs') or []) - self.READ_VERBS)} on {sorted(reached)} "
                             "cluster-wide; the write verbs belong in the namespaced Role",
                         )
                 granting = [
@@ -2890,8 +2933,22 @@ class C5PrivilegedControllersAreBounded(unittest.TestCase):
                     f"{source}: the Role granting secrets carries no namespace",
                 )
                 self.assertEqual(1, len(rules), f"{source}: secrets appear in more than one rule")
-                self.assertEqual(["secrets"], rules[0].get("resources"))
                 self.assertEqual(self.OPERATOR_SECRET_WRITE_VERBS, set(rules[0].get("verbs") or []))
+                self.assertEqual(
+                    self.OPERATOR_NAMESPACED_WRITE_KINDS,
+                    {kind for rule in role.get("rules") or [] for kind in rule_kinds(rule)},
+                    f"{source}: the Role document must name exactly the namespaced kinds",
+                )
+                for rule in role.get("rules") or []:
+                    kinds = rule_kinds(rule)
+                    allowed = self.OPERATOR_SECRET_WRITE_VERBS | (
+                        self.READ_VERBS if kinds <= self.OPERATOR_NAMESPACED_READ_KINDS else frozenset()
+                    )
+                    self.assertTrue(
+                        set(rule.get("verbs") or []) <= allowed,
+                        f"{source}: the Role document grants {sorted(set(rule.get('verbs') or []) - allowed)} "
+                        f"on {sorted(kinds)}; reads stay in the ClusterRole",
+                    )
 
     def test_C5_no_minted_role_grants_a_write_verb(self) -> None:
         """The agent-side half of A2's intersection, asserted on rendered output.

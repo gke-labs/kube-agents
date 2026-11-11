@@ -736,25 +736,28 @@ type PlatformAgentReconciler struct {
 }
 
 // The markers below are the operator's whole Kubernetes authority: controller-gen renders them
-// into config/rbac/role.yaml, and hack/sync-chart-manifests.sh copies that into the chart. Every
-// rule is cluster-scoped unless it carries `namespace=`, and each cluster-scoped rule is here for
-// one of four reasons, named on the rule or the group it sits in:
+// into config/rbac/role.yaml, and hack/sync-chart-manifests.sh copies that into the chart. A
+// marker without `namespace=` lands in the ClusterRole; one with it lands in the Role document
+// beside it, which both install paths bind in the install namespace and, under mode next, in the
+// profile namespace. Each cluster-scoped rule is here for one of four reasons, named on the rule
+// or the group it sits in:
 //
 //   - CR: the PlatformAgent, AgentPlugin and AgentProfile resources, which the manager watches
 //     in every namespace because nothing fixes the namespace a CR is created in.
 //   - render: an object kind the operator creates for an agent, in that agent's namespace or
 //     the profile namespace beside it, and watches through a cluster-wide informer for drift.
+//     The reads stay cluster-scoped for that informer; the writes are namespaced.
 //   - escalation prevention: a read the operator never does itself but must hold, because
 //     buildMinimalPlatformRole grants it to the agent's audit ClusterRole and the API server
 //     refuses to let a subject grant a permission it does not hold.
 //   - operator read: something the operator reads by name or lists for itself.
 //
-// Secrets are split: the read verbs stay cluster-scoped, because the agent's audit ClusterRole
-// grants them and escalation prevention needs the operator to hold what it grants; the write
-// verbs are a namespaced Role (the last marker below), because the operator only ever writes a
-// Secret in the namespace of the PlatformAgent it is reconciling. The ClusterRole carries no
-// Secret write verb. tests/test_operator_secrets_grant.py and the C5 conformance test pin that
-// shape.
+// Every rendered kind is split the same way Secrets are: `get`, `list` and `watch` cluster-wide,
+// `create`, `update`, `patch` and `delete` in the Role document, because the operator writes each
+// of them only in the namespace of the PlatformAgent it reconciles or that namespace's profile
+// namespace. The ClusterRole carries no write verb on a namespaced kind other than the custom
+// resources. tests/test_operator_secrets_grant.py and the C5 conformance test pin that shape;
+// docs/designs/operator-namespaced-write-verbs.md is the inventory and the reasoning.
 //
 // CR.
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents,verbs=get;list;watch;create;update;patch;delete
@@ -762,29 +765,38 @@ type PlatformAgentReconciler struct {
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents/finalizers,verbs=update
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentplugins,verbs=get;list;watch
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentplugins/status,verbs=get;update;patch
-// Render: the agent, broker, gateway and bus workloads; escalation prevention for the reads.
-// +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=get;list;watch;create;update;patch;delete
+// Render: the agent, broker, gateway and bus workloads, and the profile pools. Reads cluster-wide
+// (the informers; escalation prevention); writes namespaced.
+// +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=create;update;patch;delete,namespace=kubeagents-system
 // Escalation prevention, with two operator reads on the same grant: resolveNetpolProfile
 // reads the gke-metadata-server DaemonSet to discover its port (issue #747 B4), and
 // a2aCalloutHasOlderPods lists ReplicaSets to tell an old callout pod from a new one.
 // +kubebuilder:rbac:groups=apps,resources=daemonsets;replicasets,verbs=get;list;watch
 // Render: the agent's ServiceAccounts, data claims, config, Services and (mode next) session
-// pods; escalation prevention for the reads.
-// +kubebuilder:rbac:groups="",resources=serviceaccounts;persistentvolumeclaims;configmaps;services;pods,verbs=get;list;watch;create;update;patch;delete
-// Render: full `jobs` verbs for the mode-next provisioning Job.
-// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
+// pods; escalation prevention for the reads. The pod writes are a dry-run create (the sizing
+// probe), the stuck-NATS-pod delete, and what the gateway Role grants. Reads cluster-wide; writes
+// namespaced.
+// +kubebuilder:rbac:groups="",resources=serviceaccounts;persistentvolumeclaims;configmaps;services;pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=serviceaccounts;persistentvolumeclaims;configmaps;services;pods,verbs=create;update;patch;delete,namespace=kubeagents-system
+// Render: `jobs` for the mode-next provisioning Job and the scope publisher, and what the
+// dispatcher's Jobs Role grants in the profile namespace. Reads cluster-wide; writes namespaced.
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=create;update;patch;delete,namespace=kubeagents-system
 // `dispatchjobtemplates` are the dispatcher Job admission policy's params in
 // <ns>-profiles (agentprofile_job_template.go), which the operator alone
 // writes; no Role it renders grants the kind, and the built-in admin and edit
 // roles don't aggregate it. `podtemplates` create only: the server-side dry
 // run that defaults a Job template (defaultedJobTemplate), which stores
-// nothing. ClusterRole rules, not Roles: the profile namespace is created at
-// runtime, and RBAC escalation prevention stops the operator granting itself
-// a Role there with verbs it does not already hold. No watch: every read goes
-// through a2aReader(), uncached. Approved by @bnaylor, 2026-10-30 and
-// 2026-10-31 (#3655 PR 6).
-// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=dispatchjobtemplates,verbs=get;list;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=podtemplates,verbs=create
+// nothing. Both are namespaced, reads included: no informer watches a
+// DispatchJobTemplate (every read goes through a2aReader(), uncached, in the
+// profile namespace) and no Role the operator renders grants the kind, so
+// nothing needs the grant cluster-wide. The chart creates the profile
+// namespace and binds the namespaced Role there in the same release, which
+// is what lets a namespaced grant reach it (the ClusterRole form approved by
+// @bnaylor on 2026-10-30 and 2026-10-31, #3655 PR 6, predates that binding).
+// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=dispatchjobtemplates,verbs=get;list;create;update;patch;delete,namespace=kubeagents-system
+// +kubebuilder:rbac:groups="",resources=podtemplates,verbs=create,namespace=kubeagents-system
 // `get` on the dispatcher Job admission policy and its binding: before the
 // dispatcher gets its Jobs Role, the operator checks both are in the cluster
 // as rendered (dispatcherJobPolicyInPlace). Read by name, uncached; no list,
@@ -797,11 +809,15 @@ type PlatformAgentReconciler struct {
 // the egress policy).
 // +kubebuilder:rbac:groups="",resources=namespaces;nodes;events;persistentvolumes;limitranges;endpoints;pods/log,verbs=get;list;watch
 // events create;patch: the Recorder's writes (see the field); patch is what
-// the recorder uses to bump the count on a repeat of the same Event.
-// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
-// Render: full `resourcequotas` verbs exist for the mode-next session-pod quota (the
-// enforcement half of the session cap); everything else only reads quotas.
-// +kubebuilder:rbac:groups="",resources=resourcequotas,verbs=get;list;watch;create;update;patch;delete
+// the recorder uses to bump the count on a repeat of the same Event. An Event
+// lands in the namespace of the PlatformAgent it is about, or the operator's
+// own for the leader-election recorder, so the grant is namespaced.
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch,namespace=kubeagents-system
+// Render: the `resourcequotas` writes exist for the mode-next session-pod quota (the
+// enforcement half of the session cap) and the profile quota; everything else only
+// reads quotas. Reads cluster-wide; writes namespaced.
+// +kubebuilder:rbac:groups="",resources=resourcequotas,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=resourcequotas,verbs=create;update;patch;delete,namespace=kubeagents-system
 // Operator read. storageclasses get: growDataClaim reads a data claim's class by name, around
 // the cache, to learn whether the claim can expand. Read-only, and no list or
 // watch, so a cached read cannot be added by accident.
@@ -814,22 +830,32 @@ type PlatformAgentReconciler struct {
 // +kubebuilder:rbac:groups=node.k8s.io,resources=runtimeclasses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch
 // Render: the agent's leader Role grants `leases` in its namespace, so the operator must hold
-// the verbs it grants; the operator's own election lease is in its namespace too.
-// +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
-// Render: the agent's egress and ingress policies and its disruption budget.
-// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=networking.gke.io,resources=fqdnnetworkpolicies,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
+// the verbs it grants there; the gateway lease and the operator's own election lease are in the
+// same namespaces. Reads cluster-wide (the Lease informer); writes namespaced.
+// +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch
+// +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=create;update;patch;delete,namespace=kubeagents-system
+// Render: the agent's egress and ingress policies, the profile fence and the disruption
+// budgets. Reads cluster-wide; writes namespaced.
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=create;update;patch;delete,namespace=kubeagents-system
+// +kubebuilder:rbac:groups=networking.gke.io,resources=fqdnnetworkpolicies,verbs=get;list;watch
+// +kubebuilder:rbac:groups=networking.gke.io,resources=fqdnnetworkpolicies,verbs=create;update;patch;delete,namespace=kubeagents-system
+// +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=create;update;patch;delete,namespace=kubeagents-system
 // Render: the agent's RBAC. The cluster-scoped objects are the audit ClusterRole and its
 // binding (kubeagents:minimal:<ns>:<name>), the broker's TokenReview ClusterRole and binding
 // (kubeagents:tokenreview:<ns>:<name>) and, under mode next, the callout's binding
 // (kubeagents:a2a-callout-tokenreview:<ns>:<name>); the namespaced ones are the local, leader,
 // gateway, callout, dispatcher and scope-publisher Roles. Every name carries the agent's
 // namespace and name, so `resourceNames` cannot pin them, and the informers that watch them for
-// drift need unscoped `list` and `watch`. What bounds this grant is the API server's escalation
-// check: the operator holds no `escalate`, so no role it authors or binds can carry a
-// permission the operator does not itself hold, and the one `bind` below is scoped by name.
-// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings;roles;rolebindings,verbs=get;list;watch;create;update;patch;delete
+// drift need unscoped `list` and `watch`. The Role and RoleBinding writes are namespaced: the
+// operator renders them in the agent's namespace and the profile namespace and nowhere else.
+// What bounds the cluster-scoped grant is the API server's escalation check: the operator holds
+// no `escalate`, so no role it authors or binds can carry a permission the operator does not
+// itself hold, and the one `bind` below is scoped by name.
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,verbs=get;list;watch
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,verbs=create;update;patch;delete,namespace=kubeagents-system
 // The split credential broker verifies its callers with a TokenReview. The operator has to
 // hold that permission in order to grant it; it confers no read access and cannot mint a token.
 // +kubebuilder:rbac:groups=authentication.k8s.io,resources=tokenreviews,verbs=create
@@ -877,8 +903,9 @@ type PlatformAgentReconciler struct {
 // PlatformAgent it reconciles (every call site builds its key from agent.Namespace), so the
 // write verbs are a Role in the install namespace: `namespace=` makes controller-gen render a
 // Role beside the ClusterRole in role.yaml, the kustomize overlay rewrites the literal to the
-// deployed namespace, and the chart renders the same rules as a Role in the release namespace.
-// A PlatformAgent in any other namespace needs that Role and a RoleBinding there. The writers:
+// deployed namespace, and the chart renders the same rules as a Role in the release namespace
+// and in the profile namespace. A PlatformAgent in any other namespace needs that Role and a
+// RoleBinding there. The writers:
 // ensureKubeProxyTLSSecret creates and renews the kube-proxy TLS Secret on every install; the
 // mode-next A2A stack creates, repairs, patches and deletes the NATS credentials, config, TLS,
 // callout-key, inject-token, door-token and MCP-access Secrets it generates. Because the Role
@@ -1630,10 +1657,11 @@ func pluginStatusNeedsRecheck(plugins []*agentv1alpha1.AgentPlugin, agentReady b
 
 func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (ctrl.Result, error) {
 	if controllerutil.ContainsFinalizer(agent, platformAgentFinalizer) {
-		// The self-check stops probing this agent's namespace: once the agent
-		// is gone its RoleBinding may go too, and that must not stand as a
-		// denial on the agents that remain.
+		// The self-check stops probing this agent's namespace and its profile
+		// namespace: once the agent is gone their RoleBindings may go too, and
+		// that must not stand as a denial on the agents that remain.
 		r.RBAC.Forget(agent.Namespace)
+		r.RBAC.Forget(profileNamespaceName(agent))
 		// Delete the credential broker's TokenReview grant, if the split ever
 		// created one. cleanupAgentRBAC's label-driven pass also reaps it under
 		// deleteAll, but only when the grant carries the instance labels — one
