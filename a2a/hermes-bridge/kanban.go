@@ -302,32 +302,60 @@ func cardStep(c kanbanCardRow, settled, total int, parentTaskID string) stepmsg.
 	}
 }
 
+// markSessionCanceled records the session as canceled and stops its cards in
+// the background, with no run to dedupe on.
 func (b *Bridge) markSessionCanceled(sessionID string) {
+	b.markRunCanceled(nil, sessionID)
+}
+
+// markRunCanceled records the session as canceled and, unless this run's
+// card stop was already sent (run.cardStopSent), asks session-kv to stop the
+// session's cards in the background. The dedupe is per run, not per session:
+// a later turn on the same conversation, canceled before it reached its card
+// wait, still stops the cards it filed (#5528).
+func (b *Bridge) markRunCanceled(run *taskRun, sessionID string) {
 	if sessionID == "" {
 		return
 	}
 	b.kanban.mu.Lock()
 	b.kanban.ensureMapsLocked()
-	_, alreadyCanceled := b.kanban.canceledSessions[sessionID]
-	if !alreadyCanceled {
+	if _, seen := b.kanban.canceledSessions[sessionID]; !seen {
 		b.kanban.canceledOrder = append(b.kanban.canceledOrder, sessionID)
 	}
 	b.kanban.canceledSessions[sessionID] = kanbanNow().Unix()
 	pruneKanbanTimestampMap(b.kanban.canceledSessions, &b.kanban.canceledOrder, kanbanNow().Unix()-kanbanTrackedRetentionSecs)
 	b.kanban.mu.Unlock()
 
-	if !alreadyCanceled {
-		go b.abortCanceledSessionKanbanCards(sessionID)
+	if run != nil && !run.cardStopSent.CompareAndSwap(false, true) {
+		return
 	}
+	go b.abortCanceledSessionKanbanCards(sessionID)
 }
 
 func (b *Bridge) abortCanceledSessionKanbanCards(sessionID string) {
-	b.stopSessionCards(sessionID)
+	_, _ = b.stopSessionCards(sessionID)
 }
 
-func (b *Bridge) stopSessionCards(sessionID string) {
-	if sessionID == "" || b.cfg.RouteURL == "" || b.closing.Load() {
-		return
+// Why a cancel's card stop has no answer, as the canceled terminal says it.
+const (
+	cardStopNoRoute       = "no route to session-kv"
+	cardStopShuttingDown  = "the bridge is shutting down"
+	cardStopUnreachable   = "session-kv could not be reached"
+	cardStopTimedOutFmt   = "session-kv did not answer in %s"
+	cardStopRefusedFmt    = "session-kv refused it (HTTP %d)"
+	cardStopUnreadableWhy = "session-kv's answer was unreadable"
+)
+
+// stopSessionCards asks session-kv to stop the session's cards and returns
+// its answer, or, with no answer, why: the canceled terminal of a turn that
+// held for its cards says one or the other (finalizeWaitCanceled). Every
+// outcome is also logged.
+func (b *Bridge) stopSessionCards(sessionID string) (*cardStopResponse, string) {
+	if sessionID == "" || b.cfg.RouteURL == "" {
+		return nil, cardStopNoRoute
+	}
+	if b.closing.Load() {
+		return nil, cardStopShuttingDown
 	}
 	logger := b.cfg.Logger
 	if logger == nil {
@@ -358,7 +386,7 @@ func (b *Bridge) stopSessionCards(sessionID string) {
 		Conversation: conversation,
 	})
 	if err != nil {
-		return
+		return nil, cardStopUnreadableWhy
 	}
 	parent := b.stopping
 	if parent == nil {
@@ -374,7 +402,7 @@ func (b *Bridge) stopSessionCards(sessionID string) {
 	target := strings.TrimRight(b.cfg.RouteURL, "/") + fmt.Sprintf(cardStopPathFormat, url.PathEscape(sessionID))
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(raw))
 	if err != nil {
-		return
+		return nil, cardStopUnreachable
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if key := strings.TrimSpace(b.cfg.RouteKey); key != "" {
@@ -386,31 +414,73 @@ func (b *Bridge) stopSessionCards(sessionID string) {
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		if !b.closing.Load() { // a shutdown ends the request; that is not a failure to report
-			logger.Warn("cancel's card stop did not reach session-kv", "session", sessionID, "err", err)
+		switch {
+		case b.closing.Load(): // a shutdown ends the request; that is not a failure to report
+			return nil, cardStopShuttingDown
+		case ctx.Err() == context.DeadlineExceeded:
+			logger.Warn("cancel's card stop: session-kv did not answer in time", "session", sessionID, "timeout", timeout)
+			return nil, fmt.Sprintf(cardStopTimedOutFmt, timeout)
 		}
-		return
+		logger.Warn("cancel's card stop did not reach session-kv", "session", sessionID, "err", err)
+		return nil, cardStopUnreachable
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, cardStopResponseCap+1))
 	if err != nil {
 		logger.Warn("cancel's card stop: reading session-kv's answer failed", "session", sessionID, "err", err)
-		return
+		if b.closing.Load() {
+			return nil, cardStopShuttingDown
+		}
+		return nil, cardStopUnreadableWhy
 	}
 	if resp.StatusCode != http.StatusOK {
 		logger.Warn("cancel's card stop refused by session-kv", "session", sessionID,
 			"status", resp.StatusCode, "body", strings.TrimSpace(tail(string(data), routeErrorTailBytes)))
-		return
+		return nil, fmt.Sprintf(cardStopRefusedFmt, resp.StatusCode)
 	}
 	var answer cardStopResponse
 	if len(data) > cardStopResponseCap || json.Unmarshal(data, &answer) != nil {
 		logger.Warn("cancel's card stop: session-kv's answer is unreadable", "session", sessionID, "bytes", len(data))
+		return nil, cardStopUnreadableWhy
+	}
+	// A card a worker may still start for (unresolved) or an archive still
+	// running (pending) is logged here, and, for a turn that held for its
+	// cards, also said in the canceled terminal.
+	b.logCardStopAnswer("cancel's cards stopped", "", sessionID, &answer)
+	return &answer, ""
+}
+
+// finalizeWaitCanceled ends a run whose cancel landed during the in-turn
+// card wait. When the run filed cards and its card stop wasn't sent yet, it
+// asks session-kv synchronously and writes the canceled terminal with the
+// answer: "canceled; stopped N cards…" and the CardStop part the card-stop
+// control's answer carries, or why there is no answer. A2A terminals are
+// final, so the result has to ride the terminal itself (#5528). The hold is
+// bounded by CardStopTimeout and ends at once on shutdown. Anything else
+// (no cancel, no cards, a stop already sent) ends as finalizeAPIError does.
+func (b *Bridge) finalizeWaitCanceled(run *taskRun, taskCtx context.Context, err error, turn int, sessionID string, filedCards bool) {
+	if !run.canceled.Load() || !filedCards || !run.cardStopSent.CompareAndSwap(false, true) {
+		b.finalizeAPIError(run, taskCtx, err, turn)
 		return
 	}
-	// The cancel's terminal is already written; the answer goes to the log,
-	// where a card a worker may still start for (unresolved) or an archive
-	// still running (pending) is visible to whoever reads the stop.
-	b.logCardStopAnswer("cancel's cards stopped", "", sessionID, &answer)
+	answer, why := b.stopSessionCards(sessionID)
+	text, data := canceledCardStopResult(answer, why)
+	b.finalizeData(run, lib.StateCanceled, "reason: canceled-by-request", text, data)
+}
+
+// canceledCardStopResult is the canceled terminal's result for a turn that
+// held for its cards: the card-stop text and CardStop part when session-kv
+// answered, else a text saying the stop was not confirmed and why.
+func canceledCardStopResult(answer *cardStopResponse, why string) (string, []byte) {
+	if answer == nil {
+		return "canceled; the card stop was not confirmed (" + why + ")", nil
+	}
+	text := "canceled; " + cardStopText(answer)
+	part, err := lib.CardStopPart(lib.CardStop{CardStopResult: cardStopResult(answer)})
+	if err != nil {
+		return text, nil
+	}
+	return text, part.Data
 }
 
 func (b *Bridge) rememberConsoleSession(sessionID string, origin *lib.Envelope) {
@@ -737,9 +807,18 @@ func (b *Bridge) waitForKanbanCards(run *taskRun, taskCtx context.Context, act *
 	var trackedIDs []string
 	turnFiledCards := act != nil && act.cardsFiled.Load()
 	b.beginKanbanWait(sessionID)
+	filedCards := func() bool {
+		return turnFiledCards || (act != nil && act.cardsFiled.Load()) || len(trackedIDs) > 0
+	}
+	// A cancel that ends the wait holds the terminal for the card stop's
+	// answer (finalizeWaitCanceled); the defer below then finds the run's
+	// stop already sent.
+	endCanceled := func(err error) {
+		b.finalizeWaitCanceled(run, taskCtx, err, turn, sessionID, filedCards())
+	}
 	defer func() {
-		if run != nil && run.canceled.Load() && (turnFiledCards || (act != nil && act.cardsFiled.Load()) || len(trackedIDs) > 0) {
-			b.markSessionCanceled(sessionID)
+		if run != nil && run.canceled.Load() && filedCards() {
+			b.markRunCanceled(run, sessionID)
 		}
 		b.endKanbanWait(sessionID)
 	}()
@@ -885,7 +964,7 @@ poll:
 							// the answers in hand (the joined reports when the
 							// synthesis did not finish); a cancel ends canceled.
 							if taskCtx.Err() != nil && run.canceled.Load() {
-								b.finalizeAPIError(run, taskCtx, taskCtx.Err(), turn)
+								endCanceled(taskCtx.Err())
 								return "", false
 							}
 							if trimmedAck := strings.TrimSpace(ackText); trimmedAck != "" && !isSilentAnswer(trimmedAck) {
@@ -903,7 +982,7 @@ poll:
 								act.cardsFiled.Store(false)
 							}
 							if taskCtx.Err() != nil && run.canceled.Load() {
-								b.finalizeAPIError(run, taskCtx, taskCtx.Err(), turn)
+								endCanceled(taskCtx.Err())
 								return "", false
 							}
 						}
@@ -917,7 +996,7 @@ poll:
 			if waitEnded() {
 				break
 			}
-			b.finalizeAPIError(run, taskCtx, taskCtx.Err(), turn)
+			endCanceled(taskCtx.Err())
 			return "", false
 		} else {
 			queryFailures++
@@ -948,7 +1027,7 @@ poll:
 			if waitEnded() {
 				break poll
 			}
-			b.finalizeAPIError(run, taskCtx, taskCtx.Err(), turn)
+			endCanceled(taskCtx.Err())
 			return "", false
 		case <-ticker.C:
 		}

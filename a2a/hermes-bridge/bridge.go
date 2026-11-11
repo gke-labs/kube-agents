@@ -372,6 +372,11 @@ type taskRun struct {
 
 	canceled    atomic.Bool
 	deadlineHit atomic.Bool
+	// cardStopSent is set by whichever path first asks session-kv to stop
+	// this run's cards on a cancel: the in-turn wait's held terminal
+	// (finalizeWaitCanceled) or a deferred markRunCanceled. One POST per
+	// canceled run, and one on every canceled run that filed cards.
+	cardStopSent atomic.Bool
 
 	// act is the task's side of the activity door (activity.go): its
 	// signing key, the calls seen, the heartbeat's lifecycle. Stored before
