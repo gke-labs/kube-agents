@@ -315,7 +315,7 @@ func TestAPrunedUsageStatusIsLoggedOncePerRecord(t *testing.T) {
 	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme}
 	settle := func() {
 		t.Helper()
-		if _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aProvisionState{}); err != nil {
+		if _, _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aProvisionState{}); err != nil {
 			t.Fatalf("updateStatusReady: %v", err)
 		}
 	}

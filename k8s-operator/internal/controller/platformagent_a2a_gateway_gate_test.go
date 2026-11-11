@@ -929,7 +929,7 @@ func TestAHeldProvisionJobReadsProvisioningNamingTheCallout(t *testing.T) {
 	if !state.jobHeld {
 		t.Fatal("precondition: the re-rendered Job is not held with no callout replica ready")
 	}
-	phase, err := r.updateStatusReady(ctx, stored, "", otlpSourceNone, r.resolveNetpolProfile(ctx, stored), state)
+	phase, _, err := r.updateStatusReady(ctx, stored, "", otlpSourceNone, r.resolveNetpolProfile(ctx, stored), state)
 	if err != nil {
 		t.Fatal(err)
 	}

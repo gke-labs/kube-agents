@@ -161,7 +161,7 @@ func settleStatus(t *testing.T, agent *agentv1alpha1.PlatformAgent, objects ...c
 	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme}
 
 	ctx := context.Background()
-	phase, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aStateFrom(t, ctx, r, agent))
+	phase, _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aStateFrom(t, ctx, r, agent))
 	if err != nil {
 		t.Fatalf("updateStatusReady failed: %v", err)
 	}
@@ -647,7 +647,7 @@ func TestBusProvisionedIsPersistedWhenNothingElseChanged(t *testing.T) {
 	// Settle the rest of the status the writer compares, then take the
 	// record away and persist that, so the record is the only thing the
 	// next pass finds different.
-	if _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aStateFrom(t, ctx, r, agent)); err != nil {
+	if _, _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aStateFrom(t, ctx, r, agent)); err != nil {
 		t.Fatal(err)
 	}
 	meta.RemoveStatusCondition(&agent.Status.Conditions, busProvisionedConditionType)
@@ -659,7 +659,7 @@ func TestBusProvisionedIsPersistedWhenNothingElseChanged(t *testing.T) {
 		t.Fatalf("precondition: the settled CR is not Ready: %+v", ready)
 	}
 
-	phase, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aStateFrom(t, ctx, r, agent))
+	phase, _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aStateFrom(t, ctx, r, agent))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -697,7 +697,7 @@ func TestTheStatusWriterReadsTheReadyCountItself(t *testing.T) {
 	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme}
 	ctx := context.Background()
 	decided := a2aProvisionState{done: true, jobName: buildA2AProvisionJob(agent).Name, gatewayWaking: true}
-	phase, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), decided)
+	phase, _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), decided)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -738,7 +738,7 @@ func TestALegacyConditionClearsEvenWhenTheReadyMessageDoesNot(t *testing.T) {
 		Build()
 	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme}
 	ctx := context.Background()
-	if _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aStateFrom(t, ctx, r, agent)); err != nil {
+	if _, _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aStateFrom(t, ctx, r, agent)); err != nil {
 		t.Fatal(err)
 	}
 	// The legacy condition lands on the settled CR; nothing else changes.
@@ -748,7 +748,7 @@ func TestALegacyConditionClearsEvenWhenTheReadyMessageDoesNot(t *testing.T) {
 	if err := cl.Status().Update(ctx, agent); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aStateFrom(t, ctx, r, agent)); err != nil {
+	if _, _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aStateFrom(t, ctx, r, agent)); err != nil {
 		t.Fatal(err)
 	}
 	persisted := &agentv1alpha1.PlatformAgent{}
@@ -884,7 +884,7 @@ func TestTheVerifierConditionMovesOnASettledCR(t *testing.T) {
 
 	settle := func() {
 		t.Helper()
-		if _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone,
+		if _, _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone,
 			r.resolveNetpolProfile(ctx, agent), a2aStateFrom(t, ctx, r, agent)); err != nil {
 			t.Fatal(err)
 		}

@@ -107,7 +107,7 @@ func TestAPrunedUsageStatusOnAServedCRDEnvtest(t *testing.T) {
 	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme}
 	settle := func(pass string) {
 		t.Helper()
-		if _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aProvisionState{}); err != nil {
+		if _, _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aProvisionState{}); err != nil {
 			t.Fatalf("updateStatusReady (%s): %v", pass, err)
 		}
 	}

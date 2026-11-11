@@ -377,7 +377,7 @@ func TestDataVolumeNotExpandedFollowsTheStorageClass(t *testing.T) {
 
 			// The condition is in the unchanged comparison as well as the write.
 			settled := got.ResourceVersion
-			if _, err := r.updateStatusReady(ctx, got, "", otlpSourceNone, r.resolveNetpolProfile(ctx, got), a2aProvisionState{}); err != nil {
+			if _, _, err := r.updateStatusReady(ctx, got, "", otlpSourceNone, r.resolveNetpolProfile(ctx, got), a2aProvisionState{}); err != nil {
 				t.Fatalf("updateStatusReady (settled): %v", err)
 			}
 			again := &agentv1alpha1.PlatformAgent{}

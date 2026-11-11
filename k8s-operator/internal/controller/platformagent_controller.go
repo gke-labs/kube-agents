@@ -1349,7 +1349,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
-	phase, err := r.updateStatusReady(ctx, instance, otlpEndpoint, otlpSource, netpolProf, a2aState)
+	phase, tasksWaitRequeue, err := r.updateStatusReady(ctx, instance, otlpEndpoint, otlpSource, netpolProf, a2aState)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -1455,9 +1455,9 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	requeueAfter = min(requeueAfter, r.sizingStepBackRequeue(instance))
 	// An A2A gateway waiting for TASKS on a provisioned bus turns Degraded at
 	// a threshold, and pods are not watched, so the pass that writes it is
-	// scheduled for then (a2aGatewayTasksWaitRequeue).
-	if a2aNext {
-		requeueAfter = min(requeueAfter, r.a2aGatewayTasksWaitRequeue(ctx, instance))
+	// scheduled, from the status pass's own read (a2aGatewayTasksWaitMessage).
+	if tasksWaitRequeue > 0 {
+		requeueAfter = min(requeueAfter, tasksWaitRequeue)
 	}
 	// The scope publisher's next run, or the moment its document goes stale:
 	// Jobs are not watched, so the pass that starts the run and the pass
@@ -4636,13 +4636,14 @@ func (r *PlatformAgentReconciler) liveAgentSatisfies(ctx context.Context, agent 
 }
 
 // updateStatusReady writes the agent's status and returns the phase it settled on, so
-// the caller can decide whether the agent is still converging. otlpEndpoint, otlpSource,
+// the caller can decide whether the agent is still converging, and the requeue the
+// A2A gateway's TASKS wait needs (0 for none; a2aGatewayTasksWaitMessage). otlpEndpoint, otlpSource,
 // and netpolProfile are the resolved telemetry and network policy wiring; they are reported
 // rather than derived because discovery is otherwise invisible to anyone reading the CR.
 // a2a is what reconcileA2A found this pass (zero on a today install): whether the
 // provisioning Job is complete and what it is called, so the status write neither
 // re-reads the Job nor re-renders it to learn its name.
-func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *agentv1alpha1.PlatformAgent, otlpEndpoint, otlpSource string, netpolProfile netpolProfile, a2a a2aProvisionState) (string, error) {
+func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *agentv1alpha1.PlatformAgent, otlpEndpoint, otlpSource string, netpolProfile netpolProfile, a2a a2aProvisionState) (string, time.Duration, error) {
 	newDeploymentStatusName := ""
 	newDeploymentStatusReadyReplicas := int32(0)
 	var errWorkload error
@@ -4671,7 +4672,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		sts := &appsv1.StatefulSet{}
 		errWorkload = r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-gateway"}, sts)
 		if errWorkload != nil && !errors.IsNotFound(errWorkload) {
-			return "", fmt.Errorf("failed to get StatefulSet for status update: %w", errWorkload)
+			return "", 0, fmt.Errorf("failed to get StatefulSet for status update: %w", errWorkload)
 		}
 		if errWorkload == nil {
 			newDeploymentStatusName = sts.Name
@@ -4685,7 +4686,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		dep := &appsv1.Deployment{}
 		errWorkload = r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-gateway"}, dep)
 		if errWorkload != nil && !errors.IsNotFound(errWorkload) {
-			return "", fmt.Errorf("failed to get Deployment for status update: %w", errWorkload)
+			return "", 0, fmt.Errorf("failed to get Deployment for status update: %w", errWorkload)
 		}
 		if errWorkload == nil {
 			newDeploymentStatusName = dep.Name
@@ -4698,7 +4699,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	pvc := &corev1.PersistentVolumeClaim{}
 	errPVC := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-data"}, pvc)
 	if errPVC != nil && !errors.IsNotFound(errPVC) {
-		return "", fmt.Errorf("failed to get PVC for status update: %w", errPVC)
+		return "", 0, fmt.Errorf("failed to get PVC for status update: %w", errPVC)
 	}
 	newStorageStatusBound := false
 	if errPVC == nil {
@@ -4709,7 +4710,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	svc := &corev1.Service{}
 	errSvc := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name}, svc)
 	if errSvc != nil && !errors.IsNotFound(errSvc) {
-		return "", fmt.Errorf("failed to get Service for status update: %w", errSvc)
+		return "", 0, fmt.Errorf("failed to get Service for status update: %w", errSvc)
 	}
 	newServiceStatusEndpoint := ""
 	newAddress := ""
@@ -4723,7 +4724,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// gateway alone.
 	splitWorkloads, a2aGatewayMsg, errSplit := r.readSplitWorkloads(ctx, agent, a2a)
 	if errSplit != nil {
-		return "", errSplit
+		return "", 0, errSplit
 	}
 	notReady := make([]string, 0, len(splitWorkloads))
 	brokerNotReady := false
@@ -4821,9 +4822,11 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	sandboxResourcesRefusal, _ := shellSandboxResourcesRefusal(agent)
 	execRefusal := ValidateCredentialProxyExec(agent, nil)
 	// The A2A gateway still waiting for TASKS on a provisioned bus
-	// (a2aGatewayTasksWaitMessage, which lists pods only while that
-	// Deployment has no ready replica and the bus is up).
-	a2aTasksWaitMsg := r.a2aGatewayTasksWaitMessage(ctx, agent)
+	// (a2aGatewayTasksWaitMessage): read once per pass, only while that
+	// Deployment is short of ready replicas and the bus is up. The requeue
+	// it needs goes back to Reconcile with the phase, so the pass that
+	// writes the reason is scheduled without a second read.
+	a2aTasksWaitMsg, a2aTasksWaitRequeue := r.a2aGatewayTasksWaitMessage(ctx, agent)
 
 	degradedStatus := metav1.ConditionFalse
 	degradedReason := ""
@@ -5065,7 +5068,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		dataVolumeExpansionUnchanged &&
 		existingCond != nil && existingCond.Status == condStatus && existingCond.Reason == condReason && existingCond.Message == condMsg &&
 		existingCond.ObservedGeneration == agent.Generation {
-		return newPhase, nil
+		return newPhase, a2aTasksWaitRequeue, nil
 	}
 
 	// Apply updates
@@ -5156,11 +5159,11 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		wroteInference = &inferenceModel{Provider: newInference.Provider, Model: newInference.Model}
 	}
 	if err := r.Status().Update(ctx, agent); err != nil {
-		return newPhase, err
+		return newPhase, a2aTasksWaitRequeue, err
 	}
 	r.noteUsageStatusEcho(ctx, agent, newActiveInterfaces)
 	r.noteInferenceEcho(ctx, agent, wroteInference)
-	return newPhase, nil
+	return newPhase, a2aTasksWaitRequeue, nil
 }
 
 // heldUsageFields is the usage gauges' view of the served-CRD skew for one

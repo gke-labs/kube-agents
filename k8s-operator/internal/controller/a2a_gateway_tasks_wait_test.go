@@ -30,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
@@ -222,6 +223,17 @@ func setNATSReady(t *testing.T, r *PlatformAgentReconciler, agent *agentv1alpha1
 	}
 }
 
+// waitMsg and waitRequeue are a2aGatewayTasksWaitMessage's two answers.
+func waitMsg(r *PlatformAgentReconciler, agent *agentv1alpha1.PlatformAgent) string {
+	msg, _ := r.a2aGatewayTasksWaitMessage(context.Background(), agent)
+	return msg
+}
+
+func waitRequeue(r *PlatformAgentReconciler, agent *agentv1alpha1.PlatformAgent) time.Duration {
+	_, requeue := r.a2aGatewayTasksWaitMessage(context.Background(), agent)
+	return requeue
+}
+
 // waitingLeader creates an A2A gateway pod, started ago, not ready, and makes
 // it the Lease holder from the same moment: the elected gateway waiting.
 func waitingLeader(t *testing.T, r *PlatformAgentReconciler, agent *agentv1alpha1.PlatformAgent, ago time.Duration) *corev1.Pod {
@@ -263,7 +275,7 @@ func TestAGatewayStillWaitingForTasksReadsDegraded(t *testing.T) {
 	r, stored, state := settledA2AInstall(t)
 	ctx := context.Background()
 	waitingLeader(t, r, stored, 10*time.Minute)
-	if _, err := r.updateStatusReady(ctx, stored, "", otlpSourceNone, r.resolveNetpolProfile(ctx, stored), state); err != nil {
+	if _, _, err := r.updateStatusReady(ctx, stored, "", otlpSourceNone, r.resolveNetpolProfile(ctx, stored), state); err != nil {
 		t.Fatal(err)
 	}
 	degraded := meta.FindStatusCondition(stored.Status.Conditions, degradedConditionType)
@@ -289,7 +301,7 @@ func TestAGatewayStillWaitingForTasksReadsDegraded(t *testing.T) {
 	if err := r.Status().Update(ctx, pod); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.updateStatusReady(ctx, stored, "", otlpSourceNone, r.resolveNetpolProfile(ctx, stored), state); err != nil {
+	if _, _, err := r.updateStatusReady(ctx, stored, "", otlpSourceNone, r.resolveNetpolProfile(ctx, stored), state); err != nil {
 		t.Fatal(err)
 	}
 	if d := meta.FindStatusCondition(stored.Status.Conditions, degradedConditionType); d != nil && d.Reason == conditionReasonA2AGatewayWaitingForTasks {
@@ -301,13 +313,16 @@ func TestAGatewayWaitingUnderTheThresholdIsNotDegraded(t *testing.T) {
 	r, stored, state := settledA2AInstall(t)
 	ctx := context.Background()
 	waitingLeader(t, r, stored, time.Minute)
-	if _, err := r.updateStatusReady(ctx, stored, "", otlpSourceNone, r.resolveNetpolProfile(ctx, stored), state); err != nil {
+	if _, _, err := r.updateStatusReady(ctx, stored, "", otlpSourceNone, r.resolveNetpolProfile(ctx, stored), state); err != nil {
 		t.Fatal(err)
 	}
 	if d := meta.FindStatusCondition(stored.Status.Conditions, degradedConditionType); d != nil && d.Reason == conditionReasonA2AGatewayWaitingForTasks {
 		t.Fatalf("Degraded %s a minute in", d.Reason)
 	}
-	due := r.a2aGatewayTasksWaitRequeue(ctx, stored)
+	_, due, err := r.updateStatusReady(ctx, stored, "", otlpSourceNone, r.resolveNetpolProfile(ctx, stored), state)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if due <= 3*time.Minute || due > a2aGatewayTasksWaitThreshold {
 		t.Errorf("requeue = %v, want the ~4 minutes left", due)
 	}
@@ -321,7 +336,7 @@ func TestTheTasksWaitRanksBelowTheReasonsAboveIt(t *testing.T) {
 	stored.Spec.Deployment = &agentv1alpha1.DeploymentSpec{CredentialProxy: &agentv1alpha1.CredentialProxySpec{
 		Resources: &corev1.ResourceRequirements{Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1Mi")}},
 	}}
-	if _, err := r.updateStatusReady(ctx, stored, "", otlpSourceNone, r.resolveNetpolProfile(ctx, stored), state); err != nil {
+	if _, _, err := r.updateStatusReady(ctx, stored, "", otlpSourceNone, r.resolveNetpolProfile(ctx, stored), state); err != nil {
 		t.Fatal(err)
 	}
 	if d := meta.FindStatusCondition(stored.Status.Conditions, degradedConditionType); d == nil || d.Reason != conditionReasonA2AGatewayWaitingForTasks {
@@ -334,17 +349,16 @@ func TestTheTasksWaitRanksBelowTheReasonsAboveIt(t *testing.T) {
 // stream is there at all; True or absent adds nothing.
 func TestTheTasksWaitPointsAtBusStreamsPresent(t *testing.T) {
 	r, stored, _ := settledA2AInstall(t)
-	ctx := context.Background()
 	waitingLeader(t, r, stored, 10*time.Minute)
-	if msg := r.a2aGatewayTasksWaitMessage(ctx, stored); msg == "" || strings.Contains(msg, "BusStreamsPresent") {
+	if msg := waitMsg(r, stored); msg == "" || strings.Contains(msg, "BusStreamsPresent") {
 		t.Fatalf("message without the condition = %q", msg)
 	}
 	meta.SetStatusCondition(&stored.Status.Conditions, metav1.Condition{Type: a2aBusStreamsPresentConditionType, Status: metav1.ConditionFalse, Reason: "DetectionUnavailable"})
-	if msg := r.a2aGatewayTasksWaitMessage(ctx, stored); !strings.Contains(msg, "BusStreamsPresent reads False (DetectionUnavailable)") {
+	if msg := waitMsg(r, stored); !strings.Contains(msg, "BusStreamsPresent reads False (DetectionUnavailable)") {
 		t.Errorf("message = %q", msg)
 	}
 	meta.SetStatusCondition(&stored.Status.Conditions, metav1.Condition{Type: a2aBusStreamsPresentConditionType, Status: metav1.ConditionTrue, Reason: "AllPresent"})
-	if msg := r.a2aGatewayTasksWaitMessage(ctx, stored); strings.Contains(msg, "BusStreamsPresent") {
+	if msg := waitMsg(r, stored); strings.Contains(msg, "BusStreamsPresent") {
 		t.Errorf("a True BusStreamsPresent was named: %q", msg)
 	}
 }
@@ -354,30 +368,89 @@ func TestTheTasksWaitPointsAtBusStreamsPresent(t *testing.T) {
 // would point at the wrong thing; it is not written, and no pod is read.
 func TestABusThatIsDownIsNotBlamedOnTheGateway(t *testing.T) {
 	r, stored, _ := settledA2AInstall(t)
-	ctx := context.Background()
 	waitingLeader(t, r, stored, 10*time.Minute)
 	setNATSReady(t, r, stored, 0)
-	if msg := r.a2aGatewayTasksWaitMessage(ctx, stored); msg != "" {
+	if msg := waitMsg(r, stored); msg != "" {
 		t.Errorf("a bus with no ready server produced %q", msg)
 	}
-	if due := r.a2aGatewayTasksWaitRequeue(ctx, stored); due != 24*time.Hour {
+	if due := waitRequeue(r, stored); due != 0 {
 		t.Errorf("requeue = %v with the bus down, want none", due)
 	}
 }
 
-// TestAHigherDegradedReasonStopsTheRequeue: past the threshold under a
-// reason that ranks above this one, the pass writes nothing, so a short
-// requeue would spin; the requeue backs off instead.
-func TestAHigherDegradedReasonStopsTheRequeue(t *testing.T) {
+// TestADueWaitSchedulesNothing: past the threshold the reason is written,
+// or a higher one wins and writes nothing new, so a short requeue would
+// spin; the wait asks for none, whatever Degraded holds.
+func TestADueWaitSchedulesNothing(t *testing.T) {
 	r, stored, _ := settledA2AInstall(t)
-	ctx := context.Background()
 	waitingLeader(t, r, stored, 10*time.Minute)
-	if due := r.a2aGatewayTasksWaitRequeue(ctx, stored); due != time.Second {
-		t.Fatalf("precondition: requeue = %v for a due, unwritten reason", due)
+	if msg, due := r.a2aGatewayTasksWaitMessage(context.Background(), stored); msg == "" || due != 0 {
+		t.Fatalf("due wait: message %q, requeue %v; want the message and none", msg, due)
 	}
 	meta.SetStatusCondition(&stored.Status.Conditions, metav1.Condition{Type: degradedConditionType, Status: metav1.ConditionTrue, Reason: conditionReasonMinterPruningHeld})
-	if due := r.a2aGatewayTasksWaitRequeue(ctx, stored); due != 24*time.Hour {
+	if due := waitRequeue(r, stored); due != 0 {
 		t.Errorf("requeue = %v under a higher reason, want none", due)
+	}
+}
+
+// TestALowerDegradedReasonDoesNotDelayTheWait: a refusal that this reason
+// outranks, already on the CR, does not stop the wait being scheduled for
+// its threshold, so the promotion lands on time.
+func TestALowerDegradedReasonDoesNotDelayTheWait(t *testing.T) {
+	r, stored, _ := settledA2AInstall(t)
+	waitingLeader(t, r, stored, time.Minute)
+	meta.SetStatusCondition(&stored.Status.Conditions, metav1.Condition{Type: degradedConditionType, Status: metav1.ConditionTrue, Reason: conditionReasonInvalidCredentialProxyResources})
+	if due := waitRequeue(r, stored); due <= 3*time.Minute || due > a2aGatewayTasksWaitThreshold {
+		t.Errorf("requeue = %v under a lower reason, want the ~4 minutes left", due)
+	}
+}
+
+// TestAWaitThatHasNotStartedIsPolled: past the gate, a leader whose
+// container has not started yet, or no holder yet, is not waiting, and no
+// watched object changes when it starts to; the pass polls.
+func TestAWaitThatHasNotStartedIsPolled(t *testing.T) {
+	r, stored, _ := settledA2AInstall(t)
+	ctx := context.Background()
+	pod := a2aGatewayPod(stored, a2aGatewayName(stored)+"-starting", nil, false)
+	if err := r.Create(ctx, pod); err != nil {
+		t.Fatal(err)
+	}
+	holdLease(t, r, stored, pod.Name, time.Now())
+	if msg, due := r.a2aGatewayTasksWaitMessage(ctx, stored); msg != "" || due != a2aGatewayTasksWaitPoll {
+		t.Errorf("a starting leader: message %q, requeue %v; want none and the poll", msg, due)
+	}
+	holdLease(t, r, stored, "", time.Now())
+	if due := waitRequeue(r, stored); due != a2aGatewayTasksWaitPoll {
+		t.Errorf("no holder: requeue %v, want the poll", due)
+	}
+}
+
+// TestTheWaitReadsThePodsOnce: one call is one live pod read, the message
+// and the requeue from the same read.
+func TestTheWaitReadsThePodsOnce(t *testing.T) {
+	r, stored, _ := settledA2AInstall(t)
+	waitingLeader(t, r, stored, time.Minute)
+	reads := 0
+	counting := interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{
+		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*corev1.PodList); ok {
+				reads++
+			}
+			return c.List(ctx, list, opts...)
+		},
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*corev1.Pod); ok {
+				reads++
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+	counted := &PlatformAgentReconciler{Client: counting, APIReader: counting, Scheme: r.Scheme}
+	if _, due := counted.a2aGatewayTasksWaitMessage(context.Background(), stored); due <= 0 {
+		t.Fatalf("precondition: requeue %v, want the time left", due)
+	}
+	if reads != 1 {
+		t.Errorf("one call read pods %d times, want 1", reads)
 	}
 }
 
@@ -385,7 +458,6 @@ func TestAHigherDegradedReasonStopsTheRequeue(t *testing.T) {
 // the CR carries rather than clearing it, as the pod fault scan does.
 func TestAFailedPodReadKeepsTheReason(t *testing.T) {
 	r, stored, _ := settledA2AInstall(t)
-	ctx := context.Background()
 	refusing := interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{
 		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
 			if _, ok := list.(*corev1.PodList); ok {
@@ -402,12 +474,12 @@ func TestAFailedPodReadKeepsTheReason(t *testing.T) {
 	})
 	waitingLeader(t, r, stored, 10*time.Minute)
 	blind := &PlatformAgentReconciler{Client: refusing, APIReader: refusing, Scheme: r.Scheme}
-	if msg := blind.a2aGatewayTasksWaitMessage(ctx, stored); msg != "" {
-		t.Errorf("a failed read with no reason held produced %q", msg)
+	if msg, due := blind.a2aGatewayTasksWaitMessage(context.Background(), stored); msg != "" || due != a2aGatewayTasksWaitPoll {
+		t.Errorf("a failed read with no reason held: message %q, requeue %v; want none and the poll", msg, due)
 	}
 	meta.SetStatusCondition(&stored.Status.Conditions, metav1.Condition{Type: degradedConditionType, Status: metav1.ConditionTrue,
 		Reason: conditionReasonA2AGatewayWaitingForTasks, Message: "held message"})
-	if msg := blind.a2aGatewayTasksWaitMessage(ctx, stored); msg != "held message" {
+	if msg := waitMsg(blind, stored); msg != "held message" {
 		t.Errorf("a failed read cleared the held reason: %q", msg)
 	}
 }
@@ -441,8 +513,7 @@ func TestAReadyGatewayCostsNoPodList(t *testing.T) {
 		},
 	})
 	counted := &PlatformAgentReconciler{Client: counting, APIReader: counting, Scheme: r.Scheme}
-	_ = counted.a2aGatewayTasksWaitMessage(ctx, stored)
-	_ = counted.a2aGatewayTasksWaitRequeue(ctx, stored)
+	_ = waitMsg(counted, stored)
 	if lists != 0 {
 		t.Errorf("a ready gateway cost %d pod reads", lists)
 	}
@@ -461,7 +532,7 @@ func TestTheElectedLeaderIsTheGatewayThatIsRead(t *testing.T) {
 	if err := r.Create(ctx, standby); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.updateStatusReady(ctx, stored, "", otlpSourceNone, r.resolveNetpolProfile(ctx, stored), state); err != nil {
+	if _, _, err := r.updateStatusReady(ctx, stored, "", otlpSourceNone, r.resolveNetpolProfile(ctx, stored), state); err != nil {
 		t.Fatal(err)
 	}
 	d := meta.FindStatusCondition(stored.Status.Conditions, degradedConditionType)
@@ -474,7 +545,7 @@ func TestTheElectedLeaderIsTheGatewayThatIsRead(t *testing.T) {
 
 	// The standby is what reads not ready instead: nothing to report.
 	holdLease(t, r, stored, standby.Name, started)
-	if msg := r.a2aGatewayTasksWaitMessage(ctx, stored); msg != "" {
+	if msg := waitMsg(r, stored); msg != "" {
 		t.Errorf("a ready leader produced %q", msg)
 	}
 }
@@ -483,18 +554,17 @@ func TestTheElectedLeaderIsTheGatewayThatIsRead(t *testing.T) {
 // holder whose pod is gone.
 func TestNoLeaderIsNoTasksWait(t *testing.T) {
 	r, stored, _ := settledA2AInstall(t)
-	ctx := context.Background()
 	waitingLeader(t, r, stored, 10*time.Minute)
 	holdLease(t, r, stored, "", time.Now().Add(-time.Hour))
-	if msg := r.a2aGatewayTasksWaitMessage(ctx, stored); msg != "" {
+	if msg := waitMsg(r, stored); msg != "" {
 		t.Errorf("no holder produced %q", msg)
 	}
 	holdLease(t, r, stored, a2aGatewayName(stored)+"-gone", time.Now().Add(-time.Hour))
-	if msg := r.a2aGatewayTasksWaitMessage(ctx, stored); msg != "" {
+	if msg := waitMsg(r, stored); msg != "" {
 		t.Errorf("a stale holder produced %q", msg)
 	}
-	if due := r.a2aGatewayTasksWaitRequeue(ctx, stored); due != 24*time.Hour {
-		t.Errorf("requeue = %v with a stale holder, want none", due)
+	if due := waitRequeue(r, stored); due != a2aGatewayTasksWaitPoll {
+		t.Errorf("requeue = %v with a stale holder, want the poll (the wait can start without a watched change)", due)
 	}
 }
 
@@ -502,13 +572,12 @@ func TestNoLeaderIsNoTasksWait(t *testing.T) {
 // however long its container has run.
 func TestAFreshlyElectedLeaderGetsTheThresholdFromItsElection(t *testing.T) {
 	r, stored, _ := settledA2AInstall(t)
-	ctx := context.Background()
 	pod := waitingLeader(t, r, stored, time.Hour)
 	holdLease(t, r, stored, pod.Name, time.Now().Add(-30*time.Second))
-	if msg := r.a2aGatewayTasksWaitMessage(ctx, stored); msg != "" {
+	if msg := waitMsg(r, stored); msg != "" {
 		t.Errorf("a leader elected 30s ago produced %q", msg)
 	}
-	if due := r.a2aGatewayTasksWaitRequeue(ctx, stored); due <= 4*time.Minute || due > a2aGatewayTasksWaitThreshold {
+	if due := waitRequeue(r, stored); due <= 4*time.Minute || due > a2aGatewayTasksWaitThreshold {
 		t.Errorf("requeue = %v, want ~4.5 minutes from the election", due)
 	}
 }
@@ -523,7 +592,7 @@ func TestWithoutElectionEveryPodIsRead(t *testing.T) {
 	if err := r.Create(ctx, a2aGatewayPod(stored, a2aGatewayName(stored)+"-only", &started, false)); err != nil {
 		t.Fatal(err)
 	}
-	if msg := r.a2aGatewayTasksWaitMessage(ctx, stored); !strings.Contains(msg, a2aGatewayName(stored)+"-only") {
+	if msg := waitMsg(r, stored); !strings.Contains(msg, a2aGatewayName(stored)+"-only") {
 		t.Errorf("message = %q, want the one pod named", msg)
 	}
 }
@@ -531,13 +600,12 @@ func TestWithoutElectionEveryPodIsRead(t *testing.T) {
 // No leader clears a reason the CR holds: it is evidence, not a failed read.
 func TestNoLeaderClearsAHeldReason(t *testing.T) {
 	r, stored, _ := settledA2AInstall(t)
-	ctx := context.Background()
 	waitingLeader(t, r, stored, 10*time.Minute)
 	meta.SetStatusCondition(&stored.Status.Conditions, metav1.Condition{Type: degradedConditionType, Status: metav1.ConditionTrue,
 		Reason: conditionReasonA2AGatewayWaitingForTasks, Message: "held message"})
 	for name, holder := range map[string]string{"no holder": "", "a stale holder": a2aGatewayName(stored) + "-gone"} {
 		holdLease(t, r, stored, holder, time.Now().Add(-time.Hour))
-		if msg := r.a2aGatewayTasksWaitMessage(ctx, stored); msg != "" {
+		if msg := waitMsg(r, stored); msg != "" {
 			t.Errorf("%s kept %q", name, msg)
 		}
 	}
@@ -553,7 +621,28 @@ func TestACrashLoopingLeaderIsTheFaultScans(t *testing.T) {
 	if err := r.Status().Update(ctx, pod); err != nil {
 		t.Fatal(err)
 	}
-	if msg := r.a2aGatewayTasksWaitMessage(ctx, stored); msg != "" {
+	if msg := waitMsg(r, stored); msg != "" {
 		t.Errorf("a crash-looping leader produced %q", msg)
+	}
+}
+
+// TestReconcileSchedulesTheWaitsThreshold: the requeue the status pass
+// returns reaches Reconcile's result, so the pass that writes the reason
+// runs at the threshold rather than at the steady-state interval.
+func TestReconcileSchedulesTheWaitsThreshold(t *testing.T) {
+	r, stored, _ := settledA2AInstall(t)
+	ctx := context.Background()
+	if err := r.Status().Update(ctx, stored); err != nil {
+		t.Fatal(err)
+	}
+	// Ten seconds short of the threshold: shorter than any other requeue a
+	// settled install schedules, so only the wait can bring the result here.
+	waitingLeader(t, r, stored, a2aGatewayTasksWaitThreshold-10*time.Second)
+	res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(stored)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.RequeueAfter <= 0 || res.RequeueAfter > 11*time.Second {
+		t.Errorf("RequeueAfter = %v, want the ~10 s left on the wait", res.RequeueAfter)
 	}
 }

@@ -37,14 +37,15 @@ import (
 //
 // Since #4624 a gateway whose event relay finds no TASKS stream waits for it
 // rather than exiting: its pod reads not ready (the readinessProbe on
-// /readyz is the relay bind and nothing else), and the CR reads
-// Provisioning, naming the gateway Deployment. That is right while the
-// provision Job has yet to run. Once BusProvisioned is True the Job has
-// created the stream, so a gateway still waiting is not seeing a stream
-// that exists, or one that was lost since: its NATS identity lands in
-// another account, its credentials are wrong, or a JetStream domain does not
-// match. Provisioning then points the reader at the one thing that is done,
-// so past a threshold the CR reads Degraded with this reason as well.
+// /readyz is the relay bind and nothing else). The gateway is leader-elected
+// and only the leader binds, so with two replicas the standby reads Ready
+// while the leader waits, and the CR reads Ready over a gateway relaying
+// nothing (whether Ready should follow the leader is #5593). Once
+// BusProvisioned is True the Job has created the stream, so a leader still
+// waiting is not seeing a stream that exists, or one that was lost since:
+// its NATS identity lands in another account, its credentials are wrong, or
+// a JetStream domain does not match. Past a threshold the CR reads Degraded
+// with this reason, naming the leader pod.
 //
 // A lost stream is also what BusStreamsPresent reports, once confirmed
 // (A2ABusStreamsMissing, which ranks above this in the Degraded chain). The
@@ -64,8 +65,16 @@ const (
 	// not going to without someone looking.
 	a2aGatewayTasksWaitThreshold = 5 * time.Minute
 
-	// a2aGatewayTasksWaitMsgFmt takes the gateway Deployment's name and the
-	// threshold. No elapsed time: the Degraded write is gated on the
+	// a2aGatewayTasksWaitPoll is how soon the status pass looks again while
+	// the gateway is short of ready replicas on a provisioned bus but not
+	// waiting yet, or its read failed (a2aGatewayTasksWaitMessage). The
+	// A2A stack's own pending requeue: the gate that leads here is cached and
+	// false on a settled install, so a settled install never polls.
+	a2aGatewayTasksWaitPoll = a2aPendingRequeue
+
+	// a2aGatewayTasksWaitMsgFmt takes the gateway Deployment's name, the pod
+	// that binds the relay (the elected leader, or with election off the
+	// gateway's pod), and the threshold. No elapsed time: the Degraded write is gated on the
 	// message, so a figure that moved would write status on every pass.
 	a2aGatewayTasksWaitMsgFmt = "A2A gateway Deployment %s: pod %s, the one that binds the event relay, has not turned ready for more than %s " +
 		"since the bus was recorded provisioned (BusProvisioned=True), with the NATS server up. Its readiness is its event relay binding the TASKS stream, " +
@@ -295,61 +304,46 @@ func (r *PlatformAgentReconciler) a2aGatewayTasksWaitPods(ctx context.Context, a
 	return podList.Items, nil
 }
 
-// a2aGatewayTasksWaitMessage is the Degraded message for a gateway past the
-// threshold, or "" when it is not. It lists pods only past
-// a2aGatewayTasksWaitApplies, so a settled install lists none. A failed pod read keeps the reason the CR
-// already carries, as the pod fault scan keeps a fault it wrote: finding
-// nothing is not evidence of nothing, and a cleared reason re-asserted on
-// the next pass would write status twice for an apiserver blip.
-func (r *PlatformAgentReconciler) a2aGatewayTasksWaitMessage(ctx context.Context, agent *agentv1alpha1.PlatformAgent) string {
+// a2aGatewayTasksWaitMessage is the status pass's one read of the wait: the
+// Degraded message for a gateway past the threshold ("" when it is not), and
+// the requeue the wait needs (0 when none). Pods and Lease updates do not
+// wake Reconcile, so the pass that writes the reason has to be scheduled:
+//   - past a2aGatewayTasksWaitApplies, with the gateway waiting short of the
+//     threshold, the time left;
+//   - past it, with the gateway not waiting yet (its leader's pod still
+//     starting, no holder yet) or a read that failed, a poll at
+//     a2aGatewayTasksWaitPoll, since the wait can start without any watched
+//     object changing;
+//   - due (the message is returned) or not applying (a settled install, the
+//     bus down, the stack not rendering), none.
+//
+// A due wait schedules nothing whatever reason the Degraded chain picks: one
+// that ranks above this writes nothing new when it wins, and its clearing is
+// a status write that re-enqueues the CR. A failed read keeps the reason the
+// CR already carries, as the pod fault scan keeps a fault it wrote: finding
+// nothing is not evidence of nothing.
+func (r *PlatformAgentReconciler) a2aGatewayTasksWaitMessage(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, time.Duration) {
 	if !r.a2aGatewayTasksWaitApplies(ctx, agent) {
-		return ""
+		return "", 0
 	}
 	pod, since, waiting, err := r.a2aGatewayTasksWaitRead(ctx, agent)
 	if err != nil {
 		logf.FromContext(ctx).Error(err, "could not read the A2A gateway's pods for the TASKS wait; the Degraded reason is left as the CR last reported it")
 		if held := meta.FindStatusCondition(agent.Status.Conditions, degradedConditionType); held != nil &&
 			held.Status == metav1.ConditionTrue && held.Reason == conditionReasonA2AGatewayWaitingForTasks {
-			return held.Message
+			return held.Message, 0
 		}
-		return ""
+		return "", a2aGatewayTasksWaitPoll
 	}
 	if !waiting {
-		return ""
+		return "", a2aGatewayTasksWaitPoll
 	}
-	if due, _ := a2aGatewayTasksWaitDue(since, time.Now()); !due {
-		return ""
+	if due, left := a2aGatewayTasksWaitDue(since, time.Now()); !due {
+		return "", left
 	}
 	msg := fmt.Sprintf(a2aGatewayTasksWaitMsgFmt, a2aGatewayName(agent), pod, a2aGatewayTasksWaitThreshold)
 	if streams := meta.FindStatusCondition(agent.Status.Conditions, a2aBusStreamsPresentConditionType); streams != nil && streams.Status != metav1.ConditionTrue {
 		msg += fmt.Sprintf(a2aGatewayTasksWaitStreamsSuffixFmt, streams.Status, streams.Reason)
 	}
-	return msg
-}
-
-// a2aGatewayTasksWaitRequeue is when the pass that turns a waiting gateway
-// Degraded is due: pods are not watched, so nothing else wakes it at the
-// threshold. A day (past any requeue it is min'd with) when no gateway is
-// waiting short of it, and whenever Degraded is already True: with this
-// reason there is nothing left to write, and with a reason that ranks above
-// it the pass would write nothing either, so a short requeue would spin.
-// When that reason clears, its status write re-enqueues the CR and the pass
-// it triggers reads this one.
-func (r *PlatformAgentReconciler) a2aGatewayTasksWaitRequeue(ctx context.Context, agent *agentv1alpha1.PlatformAgent) time.Duration {
-	const none = 24 * time.Hour
-	if meta.IsStatusConditionTrue(agent.Status.Conditions, degradedConditionType) {
-		return none
-	}
-	if !r.a2aGatewayTasksWaitApplies(ctx, agent) {
-		return none
-	}
-	_, since, waiting, err := r.a2aGatewayTasksWaitRead(ctx, agent)
-	if err != nil || !waiting {
-		return none
-	}
-	if due, left := a2aGatewayTasksWaitDue(since, time.Now()); !due {
-		return left
-	}
-	// Due already and not yet written: the next pass writes it.
-	return time.Second
+	return msg, 0
 }
