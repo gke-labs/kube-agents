@@ -212,9 +212,9 @@ func TestTheExporterSupervisorDerivesGoMemLimitFromTheCgroup(t *testing.T) {
 	}{
 		{"a 96Mi limit (Autopilot without bursting)", "echo 100663296", "GOMEMLIMIT=80530636"},
 		{"the rendered 192Mi limit", "echo 201326592", "GOMEMLIMIT=161061272"},
-		{"no limit", "echo max", "GOMEMLIMIT=160MiB"},
-		{"no cgroup v2 file", "exit 1", "GOMEMLIMIT=160MiB"},
-		{"an empty read", "exit 0", "GOMEMLIMIT=160MiB"},
+		{"no limit", "echo max", "GOMEMLIMIT=153MiB"},
+		{"no cgroup v2 file", "exit 1", "GOMEMLIMIT=153MiB"},
+		{"an empty read", "exit 0", "GOMEMLIMIT=153MiB"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("GOMEMLIMIT", a2aNATSExporterGoMemLimit)
@@ -236,7 +236,7 @@ func TestTheExporterSupervisorDerivesGoMemLimitFromTheCgroup(t *testing.T) {
 // GOMEMLIMIT has to sit below the container's limit to do anything: at or
 // above it, the kernel kills the container before the runtime collects.
 func TestTheExporterGoMemLimitSitsBelowTheContainerLimit(t *testing.T) {
-	soft := strings.TrimSuffix(a2aNATSExporterGoMemLimit, "B") // 160MiB -> 160Mi, the quantity spelling
+	soft := strings.TrimSuffix(a2aNATSExporterGoMemLimit, "B") // 153MiB -> 153Mi, the quantity spelling
 	got, err := resource.ParseQuantity(soft)
 	if err != nil {
 		t.Fatalf("GOMEMLIMIT %q does not parse: %v", a2aNATSExporterGoMemLimit, err)

@@ -132,6 +132,7 @@ spec:
     - port: 8444
       path: /metrics
       interval: 30s
+{{- if include "kube-agents.a2aNATSExporterRendered" . }}
 ---
 {{- /*
 The NATS exporter sidecar (a2aNATSMetricsPort in the operator), in each pod of
@@ -164,6 +165,7 @@ spec:
         - sourceLabels: [__name__]
           regex: jetstream_consumer_.*
           action: drop
+{{- end }}
 {{- end }}
 {{- if and .Values.platformAgent.enabled (include "kube-agents.platformAgentServiceMonitor" .) }}
 ---

@@ -212,6 +212,26 @@ keeps the container's env free of a duplicate name. `| default dict` because
 {{- end }}
 
 {{/*
+Whether the A2A bus's pods carry the NATS exporter sidecar, so its PodMonitoring and
+scrape-alert job render: "true" unless the operator omits the sidecar, which it does when
+operator.extraEnv sets A2A_NATS_IMAGE and not A2A_NATS_EXPORTER_IMAGE
+(a2aNATSExporterOmitted). An entry counts as set when it has a non-empty value or a
+valueFrom. Without the sidecar the scrape would only ever read down.
+*/}}
+{{- define "kube-agents.a2aNATSExporterRendered" -}}
+{{- $set := dict -}}
+{{- range $e := (.Values.operator.extraEnv | default list) -}}
+{{- $e = $e | default dict -}}
+{{- if or (ne (toString (index $e "value" | default "")) "") (index $e "valueFrom") -}}
+{{- $_ := set $set (toString (index $e "name")) true -}}
+{{- end -}}
+{{- end -}}
+{{- if or (not (hasKey $set "A2A_NATS_IMAGE")) (hasKey $set "A2A_NATS_EXPORTER_IMAGE") -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
 Whether the web console's PlatformAgent policy renders: the admissionPolicy values
 gate, on Kubernetes >= 1.30, where the console's ServiceAccount and its Role on the
 CR render (webConsole.enabled and webConsole.environment.enabled).

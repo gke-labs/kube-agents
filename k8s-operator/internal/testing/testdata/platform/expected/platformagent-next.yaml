@@ -4212,7 +4212,7 @@ spec:
             - /prometheus-nats-exporter
           env:
             - name: GOMEMLIMIT
-              value: 160MiB
+              value: 153MiB
           image: natsio/prometheus-nats-exporter:0.20.3@sha256:4b8ddc1c86fec360b5cd3d5e1fbc6fb52bdafd5805bba3901cc52926538af255
           name: nats-exporter
           ports:

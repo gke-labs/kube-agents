@@ -233,9 +233,10 @@ const (
 	// collects garbage before the kernel kills the container (which the
 	// supervisor loop cannot survive). The loop replaces it with 80% of the
 	// limit it reads from its cgroup (a2aNATSExporterSupervisor); this is
-	// the value where it can't read one, 80% of the rendered limit.
-	// GOMEMLIMIT takes a byte count with an IEC suffix.
-	a2aNATSExporterGoMemLimit = "160MiB"
+	// the value where it can't read one, 80% of the rendered limit (192Mi
+	// gives 153.6MiB, rounded down to a whole MiB). GOMEMLIMIT takes a byte
+	// count with an IEC suffix.
+	a2aNATSExporterGoMemLimit = "153MiB"
 
 	a2aGatewayCPURequest    = "50m"
 	a2aGatewayMemoryRequest = "64Mi"
