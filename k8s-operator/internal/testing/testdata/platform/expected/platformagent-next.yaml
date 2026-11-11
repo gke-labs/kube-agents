@@ -3353,6 +3353,8 @@ subjects:
 apiVersion: v1
 kind: Secret
 metadata:
+  annotations:
+    kubeagents.x-k8s.io/a2a-config-profiles: ""
   labels:
     app.kubernetes.io/instance: kubeagents-system-platformagent
     app.kubernetes.io/managed-by: platformagent-controller
@@ -4134,6 +4136,7 @@ spec:
     metadata:
       annotations:
         kubeagents.x-k8s.io/a2a-config-hash: <SHA256_FOR_TESTS>
+        kubeagents.x-k8s.io/a2a-config-profiles: ""
       labels:
         app: platformagent-a2a-nats
         app.kubernetes.io/instance: kubeagents-system-platformagent
