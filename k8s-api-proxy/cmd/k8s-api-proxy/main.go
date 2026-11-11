@@ -27,6 +27,8 @@ const (
 	metricsUnavailableAlert = "ALERT metrics listener unavailable; kube-proxy serves no /metrics until it restarts, and API proxying is unaffected"
 	metricsPortEnv          = "KUBE_PROXY_METRICS_PORT"
 	metricsPortFlag         = "metrics-port"
+	sessionAudienceEnv      = "CREDENTIAL_PROXY_SESSION_AUDIENCE"
+	sessionCallersEnv       = "CREDENTIAL_PROXY_SESSION_CALLERS"
 	maxInFlightEnv          = "KUBE_PROXY_MAX_IN_FLIGHT"
 
 	// defaultMaxInFlight keeps a replica under its 512Mi limit (kubeProxyMemoryLimit in
@@ -143,6 +145,18 @@ func parseAllowedCallers(raw string) ([]string, error) {
 	return callers, nil
 }
 
+func parseSessionAudienceCallers(sessionAud, sessionCallersRaw string) (map[string][]string, error) {
+	aud := strings.TrimSpace(sessionAud)
+	if aud == "" {
+		return nil, nil
+	}
+	callers, err := parseAllowedCallers(sessionCallersRaw)
+	if err != nil {
+		return nil, errors.New(sessionCallersEnv + " is required when " + sessionAudienceEnv + " is set")
+	}
+	return map[string][]string{aud: callers}, nil
+}
+
 func main() {
 	var (
 		listenAddr               = flag.String("listen-addr", envOrDefault("KUBE_PROXY_LISTEN_ADDR", ":8443"), "TCP address to listen on")
@@ -192,10 +206,16 @@ func main() {
 
 	inCluster := inClusterConfig(*kubeAPIServer, *kubeCAFile, *kubeTokenFile)
 
+	audienceCallers, err := parseSessionAudienceCallers(os.Getenv(sessionAudienceEnv), os.Getenv(sessionCallersEnv))
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	authn, err := k8sapiproxy.NewTokenReviewAuthenticator(k8sapiproxy.TokenReviewConfig{
-		Kubernetes:     inCluster,
-		Audience:       *audience,
-		AllowedCallers: callers,
+		Kubernetes:      inCluster,
+		Audience:        *audience,
+		AllowedCallers:  callers,
+		AudienceCallers: audienceCallers,
 	})
 	if err != nil {
 		log.Fatalf("failed to initialize TokenReview authenticator: %v", err)

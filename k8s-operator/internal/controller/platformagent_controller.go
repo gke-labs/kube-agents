@@ -631,6 +631,10 @@ type PlatformAgentReconciler struct {
 	// ahead of its role.
 	Recorder record.EventRecorder
 
+	// busConfigLoadTime stands in for reading the A2A bus's config_load_time
+	// from its monitoring endpoint (a2aBusConfigLoadTime). Nil reads it.
+	busConfigLoadTime func(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, error)
+
 	// clusterImageVolumes caches the cluster-wide ImageVolume capability. Server
 	// version cannot change without an API server restart, so resolving it once
 	// avoids a discovery round-trip on every reconcile of every agent. Only an
@@ -1370,6 +1374,10 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if a2aState.leaseRequeue > 0 {
 			requeue = min(requeue, a2aState.leaseRequeue)
 		}
+		// So can a pending bus reload's recheck (planA2ABusReload).
+		if a2aState.busReloadRequeue > 0 {
+			requeue = min(requeue, a2aState.busReloadRequeue)
+		}
 		return ctrl.Result{RequeueAfter: requeue}, nil
 	}
 
@@ -1385,6 +1393,10 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// So is a stuck bus pod's replacement (replaceStuckA2ANATSPod).
 		if a2aState.busPodRequeue > 0 {
 			requeue = min(requeue, a2aState.busPodRequeue)
+		}
+		// And a bus config reload still pending (planA2ABusReload).
+		if a2aState.busReloadRequeue > 0 {
+			requeue = min(requeue, a2aState.busReloadRequeue)
 		}
 		if credentialProxyExecShort(instance) {
 			requeue = min(requeue, credentialProxyExecShortRequeue)
@@ -1439,6 +1451,11 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// that replaces it has to be asked for, since pods are not watched.
 	if a2aNext && a2aState.busPodRequeue > 0 {
 		requeueAfter = min(requeueAfter, a2aState.busPodRequeue)
+	}
+	// A bus config reload not yet confirmed: nothing watched moves when the
+	// bus's config_load_time does.
+	if a2aNext && a2aState.busReloadRequeue > 0 {
+		requeueAfter = min(requeueAfter, a2aState.busReloadRequeue)
 	}
 	// An exec tier short of its count: the scheduler's verdict lands on a pod,
 	// which is not watched, so the pass that reads it has to be asked for.
