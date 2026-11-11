@@ -125,7 +125,11 @@ idle-install hold on model-run cron jobs, the `CRON_CATCH_UP_STAGGER_MINUTES` st
 catch-up policy on the same jobs, and the `KAGE_SLACK_UX` flag — but only as literal values; all `valueFrom` sources
 are rejected. One name goes to the shell Pod
 instead: `KUBEAGENTS_AUDIT_AUTO_PROMOTE`, the fleet audits' auto-promotion switch, which the
-operator normalises to `true` or `false` before it reaches that Pod. A name earns a
+operator normalises to `true` or `false` before it reaches that Pod. The three
+earned-autonomy switches (`KUBEAGENTS_POST_MERGE_CHECK`, `KUBEAGENTS_AUTOMERGE`,
+`KUBEAGENTS_DIAL`) reach both: the shell Pod as variables normalised to a value
+the switch knows or `off`, and the agent pinned in its managed `.env` rather than
+through this list; the site's credential-isolation reference describes them. A name earns a
 place on that list only if an arbitrary value for it cannot redirect state,
 grant access, or run code the image does not already ship. The list is
 `safeSandboxEnvOverrides` in
@@ -1233,7 +1237,8 @@ needs the same treatment.
 CI and deployment tests should assert that:
 
 1. the sandbox has no `spec.deployment.env` (bar `KUBEAGENTS_AUDIT_AUTO_PROMOTE`,
-   normalised to `true` or `false`), secret volume, credential-state
+   normalised to `true` or `false`, and the three earned-autonomy switches,
+   normalised to a known value), secret volume, credential-state
    volume, and no Secret-backed env other than the two pod-scoped Session KV
    values named above — the assertion enumerates them, so a third one cannot
    be added without amending this list. The `platform-agent` container and the

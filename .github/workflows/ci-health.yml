@@ -652,7 +652,40 @@ jobs:
           if [ -n "$clock" ]; then set -- --now "$clock"; fi
           python3 scripts/eval_dashboard/vertex_429.py --out work/vertex-429.json "$@"
 
+      # Where the bots file and read their issues (docs/ci-health.md, "The
+      # tracking issue"): this repository with the job's own token while the
+      # repository variable KUBE_AGENTS_ISSUES_REPO is unset; set to
+      # <owner>/<repo>, the issue steps below read it (ghcli.DEFAULT_REPO) and
+      # write with an installation token of the GitHub App installed there
+      # (secrets ISSUES_APP_ID, the App's client id, and
+      # ISSUES_APP_PRIVATE_KEY), scoped to that one repository's issues. The
+      # pull-request comment and the collect keep github.token: the pull
+      # requests stay here.
+      # The step never fails the job: a value that is not owner/name is a
+      # warning in the log, `valid=false`, and every consumer below then
+      # behaves as if the variable were unset.
+      - name: Split the issues repository into owner and name
+        id: issues_repo
+        if: vars.KUBE_AGENTS_ISSUES_REPO != ''
+        continue-on-error: true
+        env:
+          ISSUES_REPO: ${{ vars.KUBE_AGENTS_ISSUES_REPO }}
+        run: |
+          if printf '%s' "$ISSUES_REPO" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'; then
+            {
+              echo "valid=true"
+              echo "owner=${ISSUES_REPO%%/*}"
+              echo "name=${ISSUES_REPO#*/}"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::KUBE_AGENTS_ISSUES_REPO must be owner/name; the issues go to this repository this tick"
+            echo "valid=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Adjudicate
+        env:
+          # health.json records where the bots file (issues_repo).
+          KUBE_AGENTS_ISSUES_REPO: ${{ steps.issues_repo.outputs.valid == 'true' && vars.KUBE_AGENTS_ISSUES_REPO || '' }}
         run: |
           # --posted-state is the poster's file, read for the tracking issue
           # the bot filed so health.json can cite it, and for the pool
@@ -718,6 +751,21 @@ jobs:
             exit 1
           fi
 
+      # Best-effort: a mint that fails must not cancel the dashboard, the Chat
+      # post or the pull-request comments; the steps fall back to github.token
+      # and their cross-repository writes fail one by one as warnings.
+      - name: Mint a token for the issues repository
+        id: issues_token
+        if: steps.issues_repo.outputs.valid == 'true'
+        continue-on-error: true
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.ISSUES_APP_ID }}
+          private-key: ${{ secrets.ISSUES_APP_PRIVATE_KEY }}
+          owner: ${{ steps.issues_repo.outputs.owner }}
+          repositories: ${{ steps.issues_repo.outputs.name }}
+          permission-issues: write
+
       # The per-domain scorecard the Cases page's domain view draws
       # (scripts/eval_dashboard/understudies.py, docs/ci-health.md "The
       # domain scorecard"): each domain's seat, days uncovered, open
@@ -728,7 +776,9 @@ jobs:
         continue-on-error: true
         timeout-minutes: 2
         env:
-          GH_TOKEN: ${{ github.token }}
+          KUBE_AGENTS_ISSUES_REPO: ${{ steps.issues_repo.outputs.valid == 'true' && vars.KUBE_AGENTS_ISSUES_REPO || '' }}
+          GH_TOKEN: ${{ steps.issues_token.outputs.token || github.token }}
+          SOURCE_GH_TOKEN: ${{ github.token }}
         run: |
           store_args=()
           [ -f work/store.json ] && store_args=(--store work/store.json)
@@ -791,7 +841,9 @@ jobs:
         # cancel the post after it (JOB_TAIL_S budgets this step too).
         timeout-minutes: 3
         env:
-          GH_TOKEN: ${{ github.token }}
+          KUBE_AGENTS_ISSUES_REPO: ${{ steps.issues_repo.outputs.valid == 'true' && vars.KUBE_AGENTS_ISSUES_REPO || '' }}
+          GH_TOKEN: ${{ steps.issues_token.outputs.token || github.token }}
+          SOURCE_GH_TOKEN: ${{ github.token }}
         run: |
           mode=--dry-run
           if [ "$NIGHTLY_BUGS_LIVE" = "true" ] && [ "$CI_HEALTH_MUTE" != "true" ]; then mode=--live; fi
@@ -803,13 +855,15 @@ jobs:
       # assigned to the domain owner, kept current, closed when a roster case
       # covers the domain again (docs/ci-health.md, "Coverage gaps"). Armed
       # by the nightly bug filer's switch, not a variable of its own; the
-      # same github.token issue scope. Best-effort and bounded like the step
+      # same token and repository. Best-effort and bounded like the step
       # above, inside JOB_TAIL_S, so it cannot cancel the post.
       - name: File an issue per domain with no presubmit seat (dry run unless armed)
         continue-on-error: true
         timeout-minutes: 2
         env:
-          GH_TOKEN: ${{ github.token }}
+          KUBE_AGENTS_ISSUES_REPO: ${{ steps.issues_repo.outputs.valid == 'true' && vars.KUBE_AGENTS_ISSUES_REPO || '' }}
+          GH_TOKEN: ${{ steps.issues_token.outputs.token || github.token }}
+          SOURCE_GH_TOKEN: ${{ github.token }}
         run: |
           mode=--dry-run
           if [ "$NIGHTLY_BUGS_LIVE" = "true" ] && [ "$CI_HEALTH_MUTE" != "true" ]; then mode=--live; fi
@@ -835,7 +889,9 @@ jobs:
           CI_HEALTH_CHAT_TOKEN: ${{ steps.chat_token.outputs.token }}
           # For the tracking issue a new OUTAGE or lost_pods condition files
           # (header), and the digest's read of the nightly-red issues.
-          GH_TOKEN: ${{ github.token }}
+          KUBE_AGENTS_ISSUES_REPO: ${{ steps.issues_repo.outputs.valid == 'true' && vars.KUBE_AGENTS_ISSUES_REPO || '' }}
+          GH_TOKEN: ${{ steps.issues_token.outputs.token || github.token }}
+          SOURCE_GH_TOKEN: ${{ github.token }}
           # GitHub login -> Chat user id (JSON object) for the digest's
           # nightly section mentions; the ids are internal, so a secret. Empty
           # without one: every login is then printed as plain text.
@@ -889,7 +945,9 @@ jobs:
         continue-on-error: true
         timeout-minutes: 3
         env:
-          GH_TOKEN: ${{ github.token }}
+          KUBE_AGENTS_ISSUES_REPO: ${{ steps.issues_repo.outputs.valid == 'true' && vars.KUBE_AGENTS_ISSUES_REPO || '' }}
+          GH_TOKEN: ${{ steps.issues_token.outputs.token || github.token }}
+          SOURCE_GH_TOKEN: ${{ github.token }}
         run: |
           store_args=()
           [ -f work/store.json ] && store_args+=(--store work/store.json)
