@@ -209,6 +209,12 @@ keeps the container's env free of a duplicate name. `| default dict` because
 - name: A2A_MCP_DOOR
   value: "true"
 {{- end -}}
+{{- with (.Values.operator.slackTestUsers | default list) }}
+{{- if not (hasKey $named "A2A_SLACK_TEST_USERS") }}
+- name: A2A_SLACK_TEST_USERS
+  value: {{ join "," . | quote }}
+{{- end -}}
+{{- end -}}
 {{- end }}
 
 {{/*

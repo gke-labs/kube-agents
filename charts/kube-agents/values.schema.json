@@ -110,6 +110,10 @@
             }
           }
         },
+        "slackTestUsers": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^[A-Z0-9]+$" }
+        },
         "webhooks": {
           "type": "object",
           "additionalProperties": false,

@@ -2100,7 +2100,15 @@ not a TTL of its own counting - and asks again. Two subtypes count as turns besi
 plain messages: `thread_broadcast` (a
 thread reply with "also send to channel" checked - dropping it would eat a steer
 silently) and `file_share` (an ask with an attachment). Everything else drops in the
-adapter: bots, our own posts, edits and other subtypes, socket redeliveries. Group DMs
+adapter: bots, our own posts, edits and other subtypes, socket redeliveries. "Bots" is
+any message with a `bot_id`, and Slack sets one on a post a person makes with a user
+token through an app, so a scripted test user's ask drops with them. The one exception
+is `A2A_SLACK_TEST_USERS`, set only on CI and eval installs (the operator renders it
+from its own environment, the chart's `operator.slackTestUsers`): a `bot_id` message
+whose `user` is a listed member id is read as that member's, logged each time, and
+meets every other gate as theirs; the bot's own member id is refused whatever the list
+says. That is what lets `tests/e2e/slack_agent_test.py` and the bench's Slack transport
+post as a test user. Group DMs
 (mpim) are group spaces here, not DMs - they have threads, so the mention affordance
 applies; Discord's group DMs read as DMs, and the asymmetry is deliberate. The bot
 only sees channels it has been invited to, so the invitation is the trust boundary for

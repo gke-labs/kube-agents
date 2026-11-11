@@ -849,6 +849,15 @@ still works and wins over the value. The
 [MCP server page](https://gke-labs.github.io/kube-agents/reference/a2a-mcp/) is canonical for
 what it renders and how a client connects.
 
+### Slack end-to-end test users (`operator.slackTestUsers`)
+
+For CI and eval installs only. `operator.slackTestUsers` lists Slack member ids (`U…`) whose
+posts the A2A gateway reads as theirs even though they carry an app's `bot_id`, which a post
+made with a user token through an app does; the gateway otherwise drops those as bot traffic.
+It renders as `A2A_SLACK_TEST_USERS` on the controller manager, which hands it to the gateway
+under `next`. Empty by default, and an `operator.extraEnv` entry of that name wins. A listed
+user still has to be on `integration.slack.allowedUsers`.
+
 ### Data volume size (`platformAgent.storage.size`)
 
 `platformAgent.storage.size` is the CR's `spec.storage.size`: the request of the agent's
