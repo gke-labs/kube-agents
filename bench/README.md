@@ -240,6 +240,16 @@ validator check lands with the first stack that needs it:
    the sweeps never read it. A plant without its mark survives a killed run until someone
    deletes it by hand.
 
+Each case record of the lane (`case-<id>.json`) names the gateway's model setup it was graded
+under: an `agent` object with the provider the gateway routes to, the model the records name and,
+when one was asked for, the reasoning effort (`low`, `medium` or `high`; no field means the model's
+default). `bench-gate case` reads `MODEL_PROVIDER` and `EVAL_REASONING_EFFORT` from the environment,
+the same variables `hack/ci-deploy.sh` passed to the chart, and leaves the object out when the
+provider or the model is unknown. The lane runs the release's own scripts, so its case files carry
+the stamp from the first release cut after this change. Two limits: a request's own
+`reasoning_effort` wins over the gateway's at LiteLLM, which the gateway's trace record shows per
+request; and on a Gemini model an effort also replaces the thinking key the chart renders.
+
 ## Portal CUJ evaluations
 
 The portal evaluator is the black-box path for conversational CUJs with
