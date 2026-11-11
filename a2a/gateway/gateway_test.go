@@ -234,6 +234,15 @@ type fakeAdapter struct {
 	// nil, and a text edit of a text line is not.
 	stopLines []fakePost
 	laidOut   map[string]bool
+	// privates records every PostPrivate (privatePosts), the posts one
+	// viewer alone sees; they are not in posts.
+	privates []fakePrivatePost
+}
+
+type fakePrivatePost struct {
+	Conversation string
+	Viewer       string
+	Text         string
 }
 
 type fakeTerminal struct {
@@ -396,6 +405,19 @@ func (a *fakeAdapter) InboundVerified(_, messageID string, verified bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.verified = append(a.verified, fmt.Sprintf("%s:%t", messageID, verified))
+}
+
+func (a *fakeAdapter) PostPrivate(conversation, viewer, text string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.privates = append(a.privates, fakePrivatePost{conversation, viewer, text})
+	return nil
+}
+
+func (a *fakeAdapter) privatePosts() []fakePrivatePost {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]fakePrivatePost(nil), a.privates...)
 }
 
 func (a *fakeAdapter) verifiedCalls() []string {

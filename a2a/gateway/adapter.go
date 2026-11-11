@@ -118,6 +118,14 @@ type InboundMessage struct {
 	// channel reads; the adapter tells them privately. False on every other
 	// path, and on every backend but Slack.
 	Shortcut bool
+	// Viewer is the sender as the backend addresses a message to one reader
+	// alone: Google Chat's `users/<id>` resource name, which a click's event
+	// carries beside the email in AuthorID, and which a private post names
+	// (PrivatePoster). The gateway posts a refused Stop press's notice to
+	// it (stopgate.go). Empty when the event named the sender by no such
+	// name, so nothing is addressed to a name that is not a user's; empty
+	// on a typed message, and on every backend but Google Chat.
+	Viewer string
 }
 
 // IntentCancel is the only Intent today: stop the conversation's running
@@ -235,6 +243,23 @@ type VerifiedObserver interface {
 type StatusShower interface {
 	ShowsTaskStatus(conversation string) bool
 }
+
+// PrivatePoster is the optional extension an Adapter implements when its
+// backend can post a message in a conversation that one member alone sees:
+// Google Chat's privateMessageViewer, the Chat adapter's note card
+// mechanism (gchat_feedback.go). The gateway uses it for the one line a
+// refused Stop press tells its presser (stopgate.go, refusedPressNotice),
+// with viewer the presser as InboundMessage.Viewer named them. Asked per
+// conversation, so a wrapper (the mux, the side door) forwards it to the
+// backend that owns it, and answers errNoPrivatePosts for one that has no
+// private post, which the caller logs.
+type PrivatePoster interface {
+	PostPrivate(conversation, viewer, text string) error
+}
+
+// errNoPrivatePosts is PostPrivate's answer from a wrapper whose owning
+// backend implements no PrivatePoster.
+var errNoPrivatePosts = errors.New("the conversation's backend posts no private message")
 
 // OutMessage is one post or edit as a value: the text, and the chat message
 // that lays the same content out (spec-a2a-payloads.md, "Chat messages").

@@ -1381,9 +1381,16 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		!mayStop(rec, backend, TaskRequester{Backend: backend, Subject: requesterSubject(g.ps, backend, msg.AuthorID)}):
 		// Only the people who asked for work in a thread may press its Stop
 		// button, Slack's native one or the one drawn on Google Chat
-		// (stopgate.go). Anyone else's press cancels nothing and posts
-		// nothing. A typed `stop` keeps the rule below.
+		// (stopgate.go). Anyone else's press cancels nothing; on Google
+		// Chat, in a space, the presser alone is told so. A typed `stop`
+		// keeps the rule below.
 		g.log.Info("stop press refused: not a requester in this conversation", "backend", backend, "conversation", rec.Key)
+		// A task a requester has already asked to stop (Detached) is
+		// settling: its line reads "cancel sent", and a line telling the
+		// presser to type stop would be stale advice, so nothing is said.
+		if active := rec.ActiveTask; active == nil || !active.Detached {
+			g.tellRefusedPresser(rec.Key, msg, backend)
+		}
 	case stopping && isSlackStop(msg, backend) && g.cardStopWanted(rec, msg):
 		g.slackStop(ctx, rec, authority, backend)
 	case stopping && isChatStopPress(msg, backend) && msg.TaskID != "":
@@ -2604,6 +2611,27 @@ func artifactParts(task *lib.Task, name string) []lib.Part {
 func (g *Gateway) showsTaskStatus(conversation string) bool {
 	shower, ok := g.adapter.(StatusShower)
 	return ok && shower.ShowsTaskStatus(conversation)
+}
+
+// tellRefusedPresser posts refusedPressNotice to the presser of msg alone,
+// in conversation, where tellsRefusedPresser says so (stopgate.go), through
+// the backend's private post (PrivatePoster). A post that fails is logged
+// and nothing more: the press cancelled nothing either way, and the typed
+// stop the notice names still works.
+func (g *Gateway) tellRefusedPresser(conversation string, msg InboundMessage, backend string) {
+	if !tellsRefusedPresser(msg, backend) {
+		return
+	}
+	poster, ok := g.adapter.(PrivatePoster)
+	if !ok {
+		g.log.Warn("refused stop press: the adapter posts no private message", "backend", backend, "conversation", conversation)
+		return
+	}
+	if err := poster.PostPrivate(conversation, msg.Viewer, refusedPressNotice); err != nil {
+		g.log.Warn("refused stop press: the presser's notice was not posted", "backend", backend, "conversation", conversation, "err", err)
+		return
+	}
+	g.log.Info("refused stop press: the presser was told privately", "backend", backend, "conversation", conversation)
 }
 
 // observeTaskStarted and observeTaskTerminal tell an adapter that implements
