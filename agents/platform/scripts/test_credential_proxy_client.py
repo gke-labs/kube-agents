@@ -879,6 +879,35 @@ class TestShellAncestry(unittest.TestCase):
         )
 
 
+class TestClusterTargetRecord(unittest.TestCase):
+    """`ClusterTarget` keeps the frozen dataclass's behaviour it replaced (#5578)."""
+
+    def test_it_is_an_immutable_value(self):
+        import copy
+        import pickle
+
+        target = credential_proxy_client.ClusterTarget("proj-a", "us-central1", "cluster-a")
+        same = credential_proxy_client.ClusterTarget(cluster="cluster-a", project="proj-a", location="us-central1")
+        self.assertEqual(target, same)
+        self.assertEqual(hash(target), hash(same))
+        self.assertEqual(1, len({target, same}))
+        self.assertNotEqual(target, credential_proxy_client.ClusterTarget("proj-a", "us-central1", "cluster-b"))
+        self.assertNotEqual(target, ("proj-a", "us-central1", "cluster-a"))
+        self.assertEqual(
+            "ClusterTarget(project='proj-a', location='us-central1', cluster='cluster-a')", repr(target)
+        )
+        self.assertEqual("gke_proj-a_us-central1_cluster-a", target.context_name)
+        for name in ("project", "context_name", "other"):
+            with self.subTest(name=name), self.assertRaises(AttributeError):
+                setattr(target, name, "x")
+        with self.assertRaises(AttributeError):
+            del target.project
+        for clone in (copy.copy(target), copy.deepcopy(target), pickle.loads(pickle.dumps(target))):
+            self.assertEqual(target, clone)
+        with self.assertRaises(TypeError):
+            credential_proxy_client.ClusterTarget("proj-a", "us-central1")
+
+
 class TestContextGrammar(unittest.TestCase):
     """The grammar both sides hold the name to, tested where it now lives."""
 
@@ -2203,6 +2232,31 @@ class TestShimEntryRouting(unittest.TestCase):
         )
         self.assertEqual(1, named.returncode)
         self.assertIn("credential proxy unavailable", named.stderr, "no fallback for a named endpoint")
+
+    def test_a_call_through_a_tool_name_does_not_import_what_it_does_not_use(self):
+        """Each import is on every brokered call's clock (#5578)."""
+        completed = self.run_shim(
+            ["-I", "-X", "importtime", str(self.root / "kubectl"), "get", "pods"],
+            {"CREDENTIAL_PROXY_URL": self.live},
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        imported = {line.rsplit("|", 1)[-1].strip() for line in completed.stderr.splitlines() if line.startswith("import time:")}
+        self.assertIn("http.client", imported, "the check reads the import list")
+        for module in ("argparse", "dataclasses", "inspect"):
+            with self.subTest(module=module):
+                self.assertNotIn(module, imported)
+
+    def test_the_explicit_form_still_parses_its_arguments(self):
+        """`argparse` is imported in `parse_args`, the explicit form's only use of it."""
+        completed = self.run_shim(
+            [str(self.shim), "--endpoint", self.live, "gcloud", "config", "get-value", "project"],
+            {},
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual(["gcloud", "config", "get-value", "project"], self.requests[-1]["argv"])
+        refused = self.run_shim([str(self.shim), "--endpoint", self.live, "rm", "-rf", "/"], {})
+        self.assertEqual(2, refused.returncode)
+        self.assertIn("invalid choice", refused.stderr)
 
 
 @unittest.skipUnless(Path("/proc/self/stat").exists() and shutil.which("bash"), "needs /proc and bash")

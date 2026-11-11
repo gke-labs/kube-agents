@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import argparse
 import http.client
 import json
 import math
@@ -19,8 +18,13 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from dataclasses import dataclass
 from pathlib import Path
+
+# Every brokered call starts this script as a new process, so its imports are
+# on the caller's clock (#5578). `argparse` is imported in `parse_args`, and
+# `ClusterTarget` is a plain class, not a dataclass: `dataclasses` pulls in
+# `inspect`. A call through the `gcloud` or `kubectl` name uses neither.
+# (`tempfile` stays: `urllib.request` imports it anyway.)
 
 
 # What this client may be invoked *as*, which is a different list from what the
@@ -595,13 +599,42 @@ def reads_stdin(argv: list[str]) -> bool:
     return False
 
 
-@dataclass(frozen=True)
 class ClusterTarget:
-    """A GKE cluster identified well enough to re-fetch credentials for it."""
+    """A GKE cluster identified well enough to re-fetch credentials for it.
 
-    project: str
-    location: str
-    cluster: str
+    Immutable, compared and hashed by its three fields, as the frozen dataclass
+    it replaces (see the note at the imports).
+    """
+
+    __slots__ = ("project", "location", "cluster")
+
+    def __init__(self, project: str, location: str, cluster: str) -> None:
+        object.__setattr__(self, "project", project)
+        object.__setattr__(self, "location", location)
+        object.__setattr__(self, "cluster", cluster)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError(f"cannot assign to field {name!r}")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError(f"cannot delete field {name!r}")
+
+    def _fields(self) -> tuple[str, str, str]:
+        return (self.project, self.location, self.cluster)
+
+    def __eq__(self, other: object) -> bool:
+        if other.__class__ is self.__class__:
+            return self._fields() == other._fields()
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash(self._fields())
+
+    def __repr__(self) -> str:
+        return f"ClusterTarget(project={self.project!r}, location={self.location!r}, cluster={self.cluster!r})"
+
+    def __reduce__(self):
+        return (self.__class__, self._fields())
 
     @property
     def context_name(self) -> str:
@@ -2186,6 +2219,8 @@ def read_stdin_if_requested(argv: list[str]) -> str | None:
 
 
 def parse_args() -> argparse.Namespace:
+    import argparse
+
     parser = argparse.ArgumentParser()
     # No default: a named endpoint is used as given, with no exec routing and
     # no fallback, and an unnamed one is resolved by `exec_endpoints`. Read from
