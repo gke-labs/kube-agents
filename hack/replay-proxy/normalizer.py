@@ -75,7 +75,8 @@ PLACEHOLDER_RE = re.compile(re.escape(OPEN) + r"[^" + re.escape(CLOSE) + r"]+" +
 # `tool_call_id` still names the same call as the assistant's `id`. The
 # forwarded request is never modified; this is the key only.
 OPAQUE_KEY_RE = re.compile(r"signature|provider_specific_fields", re.I)
-OPAQUE_ALWAYS_KEYS = ("tool_call_id",)
+TOOL_CALL_ID_KEY = "tool_call_id"
+OPAQUE_ALWAYS_KEYS = (TOOL_CALL_ID_KEY,)
 # `id` is opaque only as the `id` of an item in a `tool_calls` list, whatever
 # the provider's prefix (`call_…` from Gemini through LiteLLM, `toolu_…` from
 # Claude). Any other string `id` -- a kanban card, a cluster, a resource --
@@ -125,6 +126,16 @@ LINE_BREAK = "\n"
 # A line that opens a JSON document, and an indented line continuing a warning.
 JSON_LINE_RE = re.compile(r"^[{\[]", re.M)
 CONTINUATION_PREFIXES = (" ", "\t")
+# Hermes' skill_view result lists a skill's files per support directory as
+# glob/rglob returns them, in directory order, which differs from pod to pod:
+# `linked_files` (tools/skills_tool.py `_skill_linked_files`) and, when the
+# asked-for file is missing, `available_files` (tools/skills_tool_plugin.py
+# `_available_skill_files`). Each group's list is sorted for the key
+# (sorted_skill_listings); nothing else in the result is reordered. Read only
+# in a tool message answering a skill_view call, found by its tool_call_id.
+TOOL_ROLE = "tool"
+SKILL_VIEW_TOOL = "skill_view"
+SKILL_LISTING_KEYS = ("linked_files", "available_files")
 NUMBER_CLASS = "NUM"
 # A swapped number with at least this many digits counts as repeated wherever an
 # answer has it as a whole token (`kill 4821`). A shorter one counts only next
@@ -492,6 +503,26 @@ def warnings_last(text: str) -> str:
             return LINE_BREAK.join([text[opener.start(): end]] + before + after)
         return text
     return text
+
+
+def sorted_skill_listings(text: str) -> str:
+    """A skill_view result with each SKILL_LISTING_KEYS group's file list sorted; any other text as it is.
+
+    Returns `text` itself when nothing moved, so a result already in order keeps its exact text.
+    """
+    parsed = Normalizer.parse_json_document(text)
+    if not isinstance(parsed, dict):
+        return text
+    moved = False
+    for key in SKILL_LISTING_KEYS:
+        groups = parsed.get(key)
+        if not isinstance(groups, dict):
+            continue
+        for group, files in groups.items():
+            if isinstance(files, list) and all(isinstance(f, str) for f in files) and files != sorted(files):
+                groups[group] = sorted(files)
+                moved = True
+    return json.dumps(parsed, ensure_ascii=False) if moved else text
 
 
 def time_bucket(when: float, now: float) -> str:
@@ -888,6 +919,8 @@ class Normalizer:
         self.timed_strings: Dict[str, bool] = {}
         self.timed_containers: Dict[Tuple[int, Optional[str], bool], bool] = {}
         self.time_indexes: Dict[str, TimeIndex] = {}
+        # The tool_call ids of the skill_view calls walked so far (walk_message).
+        self.skill_view_calls: Set[str] = set()
 
     # -- structure ---------------------------------------------------------
     #
@@ -914,13 +947,36 @@ class Normalizer:
         return obj
 
     def walk_message(self, message: Any) -> Any:
-        """Walk one request message; an assistant message's text also gets the answer-only swaps (text)."""
+        """Walk one request message; an assistant message's text also gets the answer-only swaps (text).
+
+        An assistant message's skill_view calls are noted, so the tool message
+        answering one is walked with its file listings sorted (sorted_skill_listings).
+        """
         outer = self.in_answer
         self.in_answer = isinstance(message, dict) and message.get(ROLE_FIELD) == ASSISTANT_ROLE
+        if self.in_answer:
+            self.note_skill_view_calls(message)
         try:
-            return self.walk(message)
+            return self.walk(self.skill_listings_sorted(message))
         finally:
             self.in_answer = outer
+
+    def note_skill_view_calls(self, message: Dict[str, Any]) -> None:
+        calls = message.get(TOOL_CALLS_KEY)
+        for call in calls if isinstance(calls, list) else []:
+            function = call.get(FUNCTION_FIELD) if isinstance(call, dict) else None
+            if isinstance(function, dict) and function.get(NAME_FIELD) == SKILL_VIEW_TOOL:
+                if isinstance(call.get(ID_KEY), str):
+                    self.skill_view_calls.add(call[ID_KEY])
+
+    def skill_listings_sorted(self, message: Any) -> Any:
+        """`message`, with its content's file listings sorted when it is the result of a noted skill_view call."""
+        if not (isinstance(message, dict) and message.get(ROLE_FIELD) == TOOL_ROLE
+                and isinstance(message.get(TOOL_CALL_ID_KEY), str) and message[TOOL_CALL_ID_KEY] in self.skill_view_calls
+                and isinstance(message.get(CONTENT_FIELD), str)):
+            return message
+        content = sorted_skill_listings(message[CONTENT_FIELD])
+        return message if content is message[CONTENT_FIELD] else dict(message, **{CONTENT_FIELD: content})
 
     def replacement(self, obj: Any, key: Optional[str], in_tool_call: bool) -> Optional[Callable[[], Any]]:
         """What `walk` swaps `obj` for whole (a placeholder or token), as a call, or None when it walks into it."""

@@ -402,6 +402,34 @@ class BoundValueTest(AnalyzeCase):
         self.assertEqual(line["unstorable"], [])
 
 
+class SkillViewOrderTest(AnalyzeCase):
+    """A skill_view result listing the skill's files in another directory order still matches its recording."""
+
+    @staticmethod
+    def body(references):
+        call = {"id": "call_1__thought__c2ln", "type": "function",
+                "function": {"name": "skill_view", "arguments": json.dumps({"name": "fleet-audit"})}}
+        result = json.dumps({"success": True, "name": "fleet-audit", "content": "# fleet-audit",
+                             "linked_files": {"references": references}})
+        return {"model": "m", "messages": [
+            {"role": "user", "content": "audit the fleet"},
+            {"role": "assistant", "content": "", "tool_calls": [call]},
+            {"role": "tool", "tool_call_id": "call_1__thought__c2ln", "content": result},
+        ]}
+
+    def test_the_turn_after_skill_view_is_served_from_another_pods_order(self):
+        answer = {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "call_2__thought__eHl6", "type": "function", "function": {
+                "name": "skill_view", "arguments": json.dumps({"name": "fleet-audit", "file_path": "references/ledger.md"})}}]}
+        recorded = self.body(["references/ledger.md", "references/finish.md"])
+        self.assertEqual(self.recorded(recorded, answer)["unstorable"], [])
+        hit, refused = self.proxy().lookup(self.body(["references/finish.md", "references/ledger.md"]), time.time())
+        self.assertIsNone(refused)
+        self.assertEqual(hit[3], "exact")
+        self.assertEqual(json.loads(hit[0]["tool_calls"][0]["function"]["arguments"])["file_path"],
+                         "references/ledger.md")
+
+
 class RunNameTest(AnalyzeCase):
     """The eval pool project, a repository commit, a clone directory and a GKE operation are bound like ids."""
 

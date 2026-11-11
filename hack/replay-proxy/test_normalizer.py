@@ -274,6 +274,84 @@ class StderrOrderTest(unittest.TestCase):
         self.assertEqual(norm(warning), warning)
 
 
+def skill_result(references, scripts, **extra):
+    """A skill_view result as Hermes writes one (tools/skills_tool.py), with its linked files in the order given."""
+    result = {"success": True, "name": "fleet-audit", "tags": ["audit", "fleet"], "related_skills": ["submit-suggestion"],
+              "content": "---\nname: fleet-audit\n---\n# fleet-audit", "path": "fleet-audit/SKILL.md",
+              "linked_files": {"references": references, "scripts": scripts}}
+    result.update(extra)
+    return json.dumps(result)
+
+
+def tool_conversation(tool_name, content, call_id="call_1__thought__QUJD"):
+    """A request whose last message is `content`, returned by a call to `tool_name`."""
+    call = {"id": call_id, "type": "function",
+            "function": {"name": tool_name, "arguments": json.dumps({"name": "fleet-audit"})}}
+    return {"model": "m", "messages": [
+        {"role": "user", "content": "audit the fleet"},
+        {"role": "assistant", "content": "", "tool_calls": [call]},
+        {"role": "tool", "tool_call_id": call_id, "content": content},
+    ]}
+
+
+class SkillViewListingTest(unittest.TestCase):
+    def test_linked_files_in_another_order_key_the_same(self):
+        recorded = skill_result(["references/ledger.md", "references/finish.md"], ["scripts/b.py", "scripts/a.py"])
+        replayed = skill_result(["references/finish.md", "references/ledger.md"], ["scripts/a.py", "scripts/b.py"])
+        self.assertEqual(fp(tool_conversation("skill_view", recorded)), fp(tool_conversation("skill_view", replayed)))
+
+    def test_available_files_in_another_order_key_the_same(self):
+        def missing(files):
+            return json.dumps({"success": False, "error": "File 'x.md' not found in skill 'fleet-audit'.",
+                               "available_files": {"references": files}})
+        self.assertEqual(fp(tool_conversation("skill_view", missing(["references/b.md", "references/a.md"]))),
+                         fp(tool_conversation("skill_view", missing(["references/a.md", "references/b.md"]))))
+
+    def test_a_different_set_of_files_keys_differently(self):
+        one = skill_result(["references/ledger.md", "references/finish.md"], ["scripts/a.py"])
+        other = skill_result(["references/ledger.md", "references/clean-run.md"], ["scripts/a.py"])
+        self.assertNotEqual(fp(tool_conversation("skill_view", one)), fp(tool_conversation("skill_view", other)))
+        moved = skill_result(["references/ledger.md"], ["scripts/a.py", "references/finish.md"])
+        self.assertNotEqual(fp(tool_conversation("skill_view", one)), fp(tool_conversation("skill_view", moved)),
+                            "a file in another group is another listing")
+
+    def test_another_tools_listing_keeps_its_order(self):
+        recorded = skill_result(["references/ledger.md", "references/finish.md"], ["scripts/b.py", "scripts/a.py"])
+        replayed = skill_result(["references/finish.md", "references/ledger.md"], ["scripts/a.py", "scripts/b.py"])
+        self.assertNotEqual(fp(tool_conversation("read_file", recorded)), fp(tool_conversation("read_file", replayed)))
+
+    def test_a_result_answering_no_skill_view_call_keeps_its_order(self):
+        # The call is matched by id: a tool message naming another call is not read as skill_view's.
+        recorded = skill_result(["references/ledger.md", "references/finish.md"], ["scripts/a.py"])
+        replayed = skill_result(["references/finish.md", "references/ledger.md"], ["scripts/a.py"])
+
+        def answering_other(content):
+            body = tool_conversation("skill_view", content)
+            body["messages"][-1] = dict(body["messages"][-1], tool_call_id="call_2")
+            return body
+        self.assertNotEqual(fp(answering_other(recorded)), fp(answering_other(replayed)))
+
+    def test_the_results_other_fields_are_unchanged(self):
+        content = skill_result(["references/ledger.md", "references/finish.md"], ["scripts/b.py", "scripts/a.py"])
+        walked = normalizer.normalize_request(tool_conversation("skill_view", content), NOW).messages[-1]
+        expected = json.loads(content)
+        expected["linked_files"] = {"references": ["references/finish.md", "references/ledger.md"],
+                                    "scripts": ["scripts/a.py", "scripts/b.py"]}
+        self.assertEqual(json.loads(walked["content"]), expected)
+        self.assertEqual(json.loads(walked["content"])["tags"], ["audit", "fleet"], "tags keep their order")
+        flipped = skill_result(["references/ledger.md", "references/finish.md"], ["scripts/b.py", "scripts/a.py"],
+                               tags=["fleet", "audit"])
+        self.assertNotEqual(fp(tool_conversation("skill_view", content)), fp(tool_conversation("skill_view", flipped)))
+
+    def test_a_result_already_in_order_keeps_its_text(self):
+        content = skill_result(["references/a.md"], ["scripts/a.py"])
+        message = {"role": "tool", "tool_call_id": "call_1", "content": content}
+        walker = normalizer.Normalizer(NOW, keep_ips=False)
+        walker.skill_view_calls.add("call_1")
+        self.assertIs(walker.skill_listings_sorted(message), message)
+        self.assertEqual(normalizer.sorted_skill_listings("<persisted-output>"), "<persisted-output>")
+
+
 class AnswerSlotTest(unittest.TestCase):
     CONTEXT = normalizer.KeyContext("c", "i")
 
