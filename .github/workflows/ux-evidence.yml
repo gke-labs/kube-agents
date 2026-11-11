@@ -1,0 +1,103 @@
+name: UX Evidence
+
+# A pull request that changes what a user sees carries a screenshot of it
+# (AGENTS.md, "Pull Request Hygiene"; mechanics in .agents/rules/pre_pr_review.md,
+# "UX change"). `scripts/ux_evidence.py` holds the list of user-facing paths
+# and the body check; this file only feeds it the diff and the body.
+#
+# The body comes from the event payload through `env:`, never interpolated into
+# a script, and the job needs no token: it reads nothing from the API. `edited`
+# is in the list so that adding a screenshot to the body re-runs the check
+# without a push, which is also why the concurrency key carries the head SHA
+# (.agents/rules/github_actions.md, "Collapse superseded pull-request runs").
+#
+# A merge-queue run reports success without checking: the body was checked on
+# the head, and the queue commit has none. It is listed so the check can be
+# made required without stalling the queue.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+  merge_group:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}-${{ github.event.pull_request.head.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  # setup-go restores a module cache in the chat job. The rule and its test:
+  # .agents/rules/github_actions.md, "Cap the Actions cache segment download wait".
+  SEGMENT_DOWNLOAD_TIMEOUT_MINS: "1"
+
+jobs:
+  evidence:
+    name: UX change has a screenshot
+    if: github.repository == 'gke-labs/kube-agents'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      chat: ${{ steps.check.outputs.chat }}
+    steps:
+      - name: Checkout code
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The merge commit and its first parent, the base it merges onto:
+          # the diff between them is exactly this pull request's change.
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Check the body against the changed paths
+        id: check
+        # Dependabot cannot edit a body; its bumps touch no surface the script
+        # lists (pins and lockfiles are excluded), and this keeps it that way.
+        if: github.event_name == 'pull_request' && github.event.pull_request.user.login != 'dependabot[bot]'
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          printf '%s' "$PR_BODY" > "$RUNNER_TEMP/body.md"
+          git diff --name-only HEAD^1 HEAD > "$RUNNER_TEMP/files.txt"
+          python3 scripts/ux_evidence.py --body-file "$RUNNER_TEMP/body.md" --files "$RUNNER_TEMP/files.txt"
+
+  chat-rules:
+    name: Chat output follows the chat UX rules
+    needs: evidence
+    # Runs when a chat path changed, even if the screenshot check failed: the
+    # two answer different questions, and an author fixing one wants the other.
+    # A body edit re-runs it too: the edit cancels the push's run for the same
+    # head (the concurrency key), so skipping here would leave the head without it.
+    if: github.repository == 'gke-labs/kube-agents' && !cancelled() && needs.evidence.outputs.chat == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The emitters' side: the chat message builder, the shared conformance
+      # cases, and every presenter laid out against them. Standard library only.
+      - name: Run the Python chat conformance tests
+        run: |
+          (cd agents/platform/scripts && python3 -m unittest test_chat_message test_chat_cases)
+          (cd deploy/docker/patches && python3 -m unittest test_chat_conformance)
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: "a2a/go.mod"
+          cache: true
+          cache-dependency-path: a2a/go.sum
+
+      # The renderers' side: chatmsg's validator and lint (the chat UX rules
+      # code can check, run over tests/conformance/chat-ux), the bridge's port
+      # of the presenter, and the Slack and Google Chat golden layouts.
+      - name: Run the Go chat lint and golden tests
+        working-directory: a2a
+        run: |
+          go test ./lib/chatmsg/...
+          go test ./hermes-bridge/ -run 'Presenter|SharedCases|AnswerChat'
+          go test ./gateway/ -run 'ChatGolden'
